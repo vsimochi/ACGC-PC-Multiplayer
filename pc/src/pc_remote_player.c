@@ -1,5 +1,5 @@
-/* pc_remote_player.c - Stage 2/3/4A: visible, movement-synchronized, real-model representation
- * of a connected remote player.
+/* pc_remote_player.c - Stage 2/3/4A/4B: visible, movement-synchronized, real-model, animated
+ * representation of a connected remote player.
  *
  * See pc_remote_player.h for scope. Design notes carried forward from Stage 2/3 (see those
  * investigations for the full reasoning -- summarized here so this file is self-contained):
@@ -37,6 +37,12 @@
  * used here is already declared extern in m_player_lib.h / c_keyframe.h. See
  * pc_remote_player_visual_init()/pc_remote_player_dw() below for exactly which calls are made and
  * why each is safe to make independently of the local player's own state machine.
+ *
+ * Stage 4B drives that skeleton through IDLE/WALK/RUN/DASH using the already-synchronized Stage 3
+ * move_state/speed fields -- no protocol change. It reuses the real player's own verified
+ * animation-selection and playback-speed formulas (see pc_remote_player_mv()'s Stage 4B block for
+ * exact citations); AIRBORNE/TUMBLE/ITEM_USE/OTHER, held items, and appearance sync are explicitly
+ * out of scope and fall back to WAIT1.
  */
 #include "pc_remote_player.h"
 
@@ -50,6 +56,7 @@
 #include "libultra/libultra.h"
 #include "pc_lowaddr.h" /* PC_LOWADDR_LIMIT -- see the guard in pc_remote_player_poll() */
 
+#include <math.h> /* sqrtf() -- see the Stage 4B animation-speed formula in pc_remote_player_mv() */
 #include <string.h>
 #include <stdio.h>
 
@@ -87,12 +94,19 @@ extern cKF_Skeleton_R_c cKF_bs_r_grl_1;
 typedef struct PCRemotePlayerVisual {
     int                   initialized; /* 0 until pc_remote_player_visual_init() has run */
     cKF_SkeletonInfo_R_c  keyframe0;   /* lower-body/main animation layer */
-    cKF_SkeletonInfo_R_c  keyframe1;   /* upper-body/item animation layer (also WAIT1 for now --
-                                        * see pc_remote_player_visual_init()) */
+    cKF_SkeletonInfo_R_c  keyframe1;   /* upper-body/item animation layer (kept in lockstep with
+                                        * keyframe0 -- see pc_remote_player_mv()'s Stage 4B block) */
     s_xyz                 joint_data[mPlayer_JOINT_NUM + 1];  /* shared by both layers, matching
                                                                 * PLAYER_ACTOR's own layout */
     s_xyz                 morph_data[mPlayer_JOINT_NUM + 1];
     s8                    part_table[mPlayer_JOINT_NUM + 1];
+    int                   current_anim_idx; /* Stage 4B: mPlayer_ANIM_* currently playing on both
+                                              * layers -- per-instance, never static/shared (see
+                                              * pc_remote_player_mv()). Zero-initialized by
+                                              * Actor_init_actor_class()'s mem_clear at creation,
+                                              * which is exactly mPlayer_ANIM_WAIT1's value (0), so
+                                              * a freshly (re)created actor already starts correctly
+                                              * "on WAIT1" without needing an explicit reset here. */
 } PCRemotePlayerVisual;
 
 /* A remote-player actor is just the generic ACTOR base plus which network player it stands in
@@ -103,10 +117,10 @@ typedef struct PCRemotePlayerVisual {
 typedef struct PCRemotePlayerActor {
     ACTOR                 actor_class;
     PCNetPlayerId         peer;
-    float                 cosmetic_speed;      /* last-interpolated speed; not yet used to drive
-                                                 * animation selection (that's Stage 4B) */
-    uint8_t               cosmetic_move_state; /* last-interpolated PCMoveState; stored, not yet
-                                                 * used -- Stage 4A always shows WAIT1 */
+    float                 cosmetic_speed;      /* last-interpolated speed; Stage 4B uses this to
+                                                 * drive WALK/RUN/DASH animation playback speed */
+    uint8_t               cosmetic_move_state; /* last-interpolated PCMoveState; Stage 4B uses this
+                                                 * to select the IDLE/WALK/RUN/DASH animation */
     int8_t                cosmetic_item_kind;  /* last-interpolated item_kind; stored correctly,
                                                  * but Stage 4A does not render a held item */
     PCRemotePlayerVisual  visual;
@@ -366,6 +380,9 @@ static void pc_remote_player_visual_init(PCRemotePlayerVisual* visual) {
                                                                      0.0f);
 
     visual->initialized = 1;
+    visual->current_anim_idx = mPlayer_ANIM_WAIT1; /* explicit, even though this matches the
+                                                     * zero-init default -- see the struct's doc
+                                                     * comment */
     printf("[NET][REMOTE][DIAG] visual initialized: model=%s num_shown_joints=%d\n",
            (model == &cKF_bs_r_boy_1) ? "boy" : "girl", (int)model->num_shown_joints);
 }
@@ -421,6 +438,74 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
     }
 
     if (self->visual.initialized) {
+        /* Stage 4B: pick the animation for the interpolated (or, absent movement data yet,
+         * last-known/default-zero i.e. IDLE) move_state. self->cosmetic_move_state was already
+         * updated above from render.move_state when interpolation succeeded, so this always
+         * reflects the same value the investigation traced -- no separate lookup of `render`
+         * needed here. Mapping verified against pc_net_game.c's own PCMoveState classifier, which
+         * already sources move_state from the real player's mPlayer_INDEX_WAIT/WALK/RUN/DASH
+         * constants (see the Stage 4B investigation). Anything outside the four basic states
+         * (AIRBORNE/TUMBLE/ITEM_USE/OTHER) deliberately falls back to WAIT1 -- no dedicated remote
+         * animation exists for those, and none should be added here. */
+        int desired_anim_idx;
+        switch (self->cosmetic_move_state) {
+            case PC_MOVE_STATE_WALK: desired_anim_idx = mPlayer_ANIM_WALK1; break;
+            case PC_MOVE_STATE_RUN:  desired_anim_idx = mPlayer_ANIM_RUN1;  break;
+            case PC_MOVE_STATE_DASH: desired_anim_idx = mPlayer_ANIM_DASH1; break;
+            default:                 desired_anim_idx = mPlayer_ANIM_WAIT1; break;
+        }
+
+        if (desired_anim_idx != self->visual.current_anim_idx) {
+            /* State changed -- (re)start both layers on the new clip at frame 0, the same call
+             * the real player's own Player_actor_InitAnimation_Base1() makes on every state entry
+             * (src/game/m_player_common.c_inc). The keyframe structs themselves were already
+             * cKF_SkeletonInfo_R_ct()'d once, in pc_remote_player_visual_init(), and never need
+             * that again -- only this call, which rebinds the animation pointer/frame/speed
+             * without touching the joint/morph buffer wiring cKF_SkeletonInfo_R_ct() set up. */
+            cKF_Animation_R_c* new_anim = mPlib_Get_Pointer_Animation(desired_anim_idx);
+            printf("[NET][REMOTE][DIAG] player %d: animation %d -> %d (move_state=%d)\n", (int)self->peer,
+                   self->visual.current_anim_idx, desired_anim_idx, (int)self->cosmetic_move_state);
+            cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&self->visual.keyframe0, new_anim, NULL,
+                                                                             0.0f, 1.0f, 0.0f);
+            cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&self->visual.keyframe1, new_anim, NULL,
+                                                                             0.0f, 1.0f, 0.0f);
+            self->visual.current_anim_idx = desired_anim_idx;
+        }
+
+        /* Stage 4B: retune playback tempo every frame regardless of whether the state just
+         * changed -- exactly like the real player's Player_actor_CulcAnimation_Walk() does
+         * (shared verbatim by Walk/Run/Dash, src/game/m_player_main_walk.c_inc): never
+         * reinitializes the animation, just updates frame_control.speed so
+         * cKF_SkeletonInfo_R_combine_play() below advances at the right tempo. WAIT1 is excluded:
+         * the real player never runs this formula for Wait either, and cosmetic speed is not a
+         * meaningful tempo for an idle loop. */
+        if (self->visual.current_anim_idx != mPlayer_ANIM_WAIT1) {
+            float raw_speed = self->cosmetic_speed;
+            float sp;
+
+            if (!(raw_speed > 0.0f)) {
+                /* Guards zero, any unexpected negative value, and NaN (all fail `> 0.0f`) --
+                 * sqrtf() of a negative input is undefined, and a legitimate WALK/RUN/DASH state
+                 * always carries positive speed, so this is strictly a defensive floor. */
+                raw_speed = 0.0f;
+            }
+
+            /* Verified real-player formula (src/game/m_player_main_walk.c_inc's
+             * Player_actor_CulcAnimation_Walk()), normalize == 1.0f: the real player's
+             * terrain/slope normalization factor is derived from local collision data that is
+             * never network-synced (see the Stage 4B investigation) -- an intentional,
+             * cosmetic-only approximation. */
+            sp = (raw_speed * 1.0f) / 7.5f;
+            sp = sqrtf(sp);
+            sp = 0.59999996f * sp;
+            if (sp < 0.22f) {
+                sp = 0.22f;
+            }
+
+            self->visual.keyframe0.frame_control.speed = sp;
+            self->visual.keyframe1.frame_control.speed = sp;
+        }
+
         cKF_SkeletonInfo_R_combine_play(&self->visual.keyframe0, &self->visual.keyframe1, self->visual.part_table);
     }
 }
