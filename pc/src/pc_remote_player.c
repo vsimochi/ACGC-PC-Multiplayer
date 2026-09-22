@@ -55,6 +55,9 @@
 #include "m_rcp.h"
 #include "libultra/libultra.h"
 #include "pc_lowaddr.h" /* PC_LOWADDR_LIMIT -- see the guard in pc_remote_player_poll() */
+#include "audio.h" /* Stage 4B.1: sAdo_OngenTrgStart() -- see the TURN_DASH skid sound in
+                     * pc_remote_player_mv(). Already #include'd elsewhere in pc/ (e.g.
+                     * pc_nes_fixnes.c) and compiles cleanly in the PC build. */
 
 #include <math.h> /* sqrtf() -- see the Stage 4B animation-speed formula in pc_remote_player_mv() */
 #include <string.h>
@@ -449,10 +452,14 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
          * animation exists for those, and none should be added here. */
         int desired_anim_idx;
         switch (self->cosmetic_move_state) {
-            case PC_MOVE_STATE_WALK: desired_anim_idx = mPlayer_ANIM_WALK1; break;
-            case PC_MOVE_STATE_RUN:  desired_anim_idx = mPlayer_ANIM_RUN1;  break;
-            case PC_MOVE_STATE_DASH: desired_anim_idx = mPlayer_ANIM_DASH1; break;
-            default:                 desired_anim_idx = mPlayer_ANIM_WAIT1; break;
+            case PC_MOVE_STATE_WALK:      desired_anim_idx = mPlayer_ANIM_WALK1;     break;
+            case PC_MOVE_STATE_RUN:       desired_anim_idx = mPlayer_ANIM_RUN1;      break;
+            case PC_MOVE_STATE_DASH:      desired_anim_idx = mPlayer_ANIM_DASH1;     break;
+            /* Stage 4B.1: the real player's sprint sharp-turn/skid state (mPlayer_INDEX_TURN_DASH)
+             * -- see pc_net_game.c's classifier, which now reports this separately from ordinary
+             * DASH. Confirmed by source: uses mPlayer_ANIM_RUN_SLIP1, NOT DASH1. */
+            case PC_MOVE_STATE_TURN_DASH: desired_anim_idx = mPlayer_ANIM_RUN_SLIP1; break;
+            default:                      desired_anim_idx = mPlayer_ANIM_WAIT1;    break;
         }
 
         if (desired_anim_idx != self->visual.current_anim_idx) {
@@ -470,16 +477,42 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
             cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&self->visual.keyframe1, new_anim, NULL,
                                                                              0.0f, 1.0f, 0.0f);
             self->visual.current_anim_idx = desired_anim_idx;
+
+            if (desired_anim_idx == mPlayer_ANIM_RUN_SLIP1) {
+                /* Stage 4B.1: RUN_SLIP1 does not use the movement-speed formula below -- the real
+                 * player's own Player_actor_setup_main_Turn_dash_common() (m_player_main_turn_dash.c_inc)
+                 * passes a fixed frame_speed=0.5f into its InitAnimation_Base1() call, and its
+                 * per-frame advance is Player_actor_CulcAnimation_Base() (plain advance), never
+                 * Player_actor_CulcAnimation_Walk() (the formula below). Set once, here, at the
+                 * same state-entry point the animation itself is (re)bound, and never touched
+                 * again while RUN_SLIP1 remains current -- see the exclusion below. */
+                self->visual.keyframe0.frame_control.speed = 0.5f;
+                self->visual.keyframe1.frame_control.speed = 0.5f;
+
+                /* Fire the skid sound exactly once, on this same state-change edge -- never
+                 * per-frame, never re-fired while RUN_SLIP1 remains current (this whole block only
+                 * runs when desired_anim_idx just changed), and never retriggered by a stale or
+                 * reordered packet (those are already rejected in pc_remote_player_on_move()
+                 * before ever reaching the snapshot ring, so they cannot produce a "new"
+                 * cosmetic_move_state value here). sAdo_OngenTrgStart() is the same generic,
+                 * actor-agnostic, positional one-shot trigger the real Player_actor_sound_slip()/
+                 * set_sound_common2() ultimately call (src/game/m_player_sound.c_inc) -- it only
+                 * reads world.position, a base ACTOR field, so it is safe to call directly with
+                 * this remote actor's own position; no new event/dedup system needed. */
+                sAdo_OngenTrgStart(0x4129, &actor->world.position);
+            }
         }
 
         /* Stage 4B: retune playback tempo every frame regardless of whether the state just
          * changed -- exactly like the real player's Player_actor_CulcAnimation_Walk() does
          * (shared verbatim by Walk/Run/Dash, src/game/m_player_main_walk.c_inc): never
          * reinitializes the animation, just updates frame_control.speed so
-         * cKF_SkeletonInfo_R_combine_play() below advances at the right tempo. WAIT1 is excluded:
-         * the real player never runs this formula for Wait either, and cosmetic speed is not a
-         * meaningful tempo for an idle loop. */
-        if (self->visual.current_anim_idx != mPlayer_ANIM_WAIT1) {
+         * cKF_SkeletonInfo_R_combine_play() below advances at the right tempo. WAIT1 and
+         * RUN_SLIP1 are excluded: the real player never runs this formula for Wait, and
+         * RUN_SLIP1 uses a fixed 0.5x speed set once at entry above (see the Stage 4B.1
+         * investigation) rather than a continuously-recalculated movement-speed tempo. */
+        if (self->visual.current_anim_idx != mPlayer_ANIM_WAIT1 &&
+            self->visual.current_anim_idx != mPlayer_ANIM_RUN_SLIP1) {
             float raw_speed = self->cosmetic_speed;
             float sp;
 

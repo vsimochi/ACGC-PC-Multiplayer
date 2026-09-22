@@ -215,8 +215,13 @@ static PCMoveState pcnetgame_classify_move_state(int now_main_index) {
             return PC_MOVE_STATE_RUN;
 
         case mPlayer_INDEX_DASH:
-        case mPlayer_INDEX_TURN_DASH:
             return PC_MOVE_STATE_DASH;
+
+        /* Stage 4B.1: previously folded into PC_MOVE_STATE_DASH above -- split out so remote
+         * clients can play mPlayer_ANIM_RUN_SLIP1 + the skid sound instead of continuing DASH1
+         * (see pc_remote_player.c's animation-selection switch). */
+        case mPlayer_INDEX_TURN_DASH:
+            return PC_MOVE_STATE_TURN_DASH;
 
         case mPlayer_INDEX_FALL:
         case mPlayer_INDEX_READY_PITFALL:
@@ -324,7 +329,19 @@ static void pcnetgame_sample_local_move(PLAYER_ACTOR* local, PCNetMoveMsg* msg) 
     msg->pos_x = actor->world.position.x;
     msg->pos_y = actor->world.position.y;
     msg->pos_z = actor->world.position.z;
-    msg->facing_angle = actor->world.angle.y;
+    /* Stage 4B.1 fix: mPlayer_INDEX_TURN_DASH (the sprint sharp-turn/skid state) eases the
+     * player's visual facing on shape_info.rotation.y every frame (Player_actor_ChangeDirection_Turn_dash(),
+     * src/game/m_player_main_turn_dash.c_inc) but leaves world.angle.y frozen until the state
+     * exits, where Player_actor_settle_main_Turn_dash() snaps it to match in one step (called once,
+     * from the state-dispatch in src/game/m_player.c, only when leaving the state). Sending
+     * world.angle.y during TURN_DASH therefore transmits a frozen value for the whole skid
+     * followed by a single discontinuous jump, which Stage 3's (correct) interpolation then blends
+     * across just one send interval -- reading as a near-instant snap instead of the original's
+     * gradual turn. Every other state keeps these two fields in lockstep every frame (e.g.
+     * m_player_main_walk.c_inc:155's `world.angle.y = shape_info.rotation.y = target`), so this
+     * only changes behavior for TURN_DASH specifically. */
+    msg->facing_angle = (local->now_main_index == mPlayer_INDEX_TURN_DASH) ? actor->shape_info.rotation.y
+                                                                            : actor->world.angle.y;
     msg->speed = actor->speed;
 }
 

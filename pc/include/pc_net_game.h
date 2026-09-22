@@ -96,6 +96,13 @@ typedef enum PCMoveState {
     PC_MOVE_STATE_TUMBLE,
     PC_MOVE_STATE_ITEM_USE,
     PC_MOVE_STATE_OTHER,
+    /* Stage 4B.1: mPlayer_INDEX_TURN_DASH (the real player's sprint sharp-turn/skid state) was
+     * previously folded into PC_MOVE_STATE_DASH -- see pc_net_game.c's classifier. Split out into
+     * its own value so a remote client can distinguish "still dashing" from "skidding to a stop"
+     * and play the correct mPlayer_ANIM_RUN_SLIP1 animation + skid sound instead of continuing
+     * DASH1. Appended at the end so existing values keep their numeric encoding; still fits the
+     * wire's existing uint8_t move_state field -- no packet layout/size change. */
+    PC_MOVE_STATE_TURN_DASH,
 } PCMoveState;
 
 /* A network-safe, already-decoded movement sample -- built from / unpacked into the wire-format
