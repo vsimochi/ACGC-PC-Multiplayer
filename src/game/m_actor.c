@@ -775,6 +775,55 @@ extern ACTOR* Actor_info_make_actor(Actor_info* actor_info, GAME* game, s16 prof
     return actor;
 }
 
+#ifdef TARGET_PC
+/* pc_actor_make_from_profile: PC-only. Identical to Actor_info_make_actor()'s body, except the
+ * caller supplies an ACTOR_PROFILE/ACTOR_DLFTBL pair directly instead of a profile_no index
+ * into the decomp's fixed actor_dlftbls[] table. Actor_info_make_actor() cannot be reused
+ * as-is for this: it does `dlftbl = actor_dlftbls + profile_no`, an unchecked pointer offset
+ * into that fixed-size array, so there is no in-range profile_no that means "a PC-only actor
+ * type the original game never had a table entry for." This exists so PC-only actor kinds
+ * (e.g. a Stage 2 multiplayer remote-player placeholder) can still go through the real
+ * allocation/init/link/construct pipeline byte-for-byte, without adding a new entry to
+ * mAc_PROFILE_* / actor_dlftbls[] (which would touch decomp-accuracy-sensitive data shared by
+ * every real actor type) and without duplicating that pipeline's logic.
+ *
+ * block_x/block_z/move_actor_list_idx/npc_info_idx/data_bank_idx are hardcoded to -1, matching
+ * how the local PLAYER_ACTOR, demo actors and control actors are already spawned by
+ * Actor_info_ct() above -- i.e. "not tied to the block/field-persistence system", which is
+ * also a prerequisite for reliably avoiding Actor_delete_check()'s block-distance deletion
+ * (the caller must additionally set ACTOR_STATE_NO_MOVE_WHILE_CULLED |
+ * ACTOR_STATE_NO_DRAW_WHILE_CULLED in the profile's initial_flags_state for that; this
+ * function does not add or check any flags itself). */
+extern ACTOR* pc_actor_make_from_profile(Actor_info* actor_info, GAME* game, ACTOR_PROFILE* profile,
+                                         ACTOR_DLFTBL* dlftbl, f32 x, f32 y, f32 z, s16 rot_x, s16 rot_y, s16 rot_z,
+                                         mActor_name_t name_id, s16 arg) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    ACTOR* actor;
+    int data_bank_idx = -1;
+
+    if (actor_info->total_num > mAc_MAX_ACTORS) {
+        return NULL;
+    }
+    if (profile == NULL || dlftbl == NULL || profile->class_size == 0) {
+        return NULL;
+    }
+    if (Actor_data_bank_regist_check(&data_bank_idx, profile, dlftbl, play, name_id) == FALSE) {
+        return NULL;
+    }
+    if (Actor_malloc_actor_class(&actor, profile, dlftbl, "", name_id) == FALSE) {
+        return NULL;
+    }
+
+    dlftbl->num_actors++;
+    Actor_init_actor_class(actor, profile, dlftbl, play, data_bank_idx, x, y, z, rot_x, rot_y, rot_z, -1, -1, -1,
+                           name_id, arg);
+    Actor_info_part_new(actor_info, actor, profile->part);
+    Actor_ct(actor, game);
+
+    return actor;
+}
+#endif
+
 extern ACTOR* Actor_info_make_child_actor(Actor_info* actor_info, ACTOR* parent_actor, GAME* game, s16 profile, f32 x,
                                           f32 y, f32 z, s16 rot_x, s16 rot_y, s16 rot_z, s16 move_actor_list_idx,
                                           mActor_name_t name_id, s16 arg, int data_bank_idx) {

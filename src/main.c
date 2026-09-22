@@ -98,6 +98,8 @@ extern void mainproc(void* val) {
     OSReport("[PC] mainproc: graph_proc returned\n");
     {
         extern void pc_platform_shutdown(void);
+        extern void pc_net_game_shutdown(void); /* no-op if networking was never started (single-player) */
+        pc_net_game_shutdown();
 #ifdef PC_LOW_ADDRESS_64
         extern int pc_lowaddr_report(void); /* final post-gameplay category/reserved-range summary --
              * this exit(0) is the game's only real quit path, so pc_main.c's own trailing

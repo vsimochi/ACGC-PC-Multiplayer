@@ -1198,6 +1198,13 @@ extern ACTOR* Actor_info_make_actor(Actor_info* actor_info, GAME* game, s16 prof
 extern ACTOR* Actor_info_make_child_actor(Actor_info* actor_info, ACTOR* parent_actor, GAME* game, s16 profile, f32 x,
                                           f32 y, f32 z, s16 rot_x, s16 rot_y, s16 rot_z, s16 move_actor_list_idx,
                                           mActor_name_t name_id, s16 arg, int data_bank_idx);
+#ifdef TARGET_PC
+/* PC-only: see the definition in src/game/m_actor.c for why this exists alongside
+ * Actor_info_make_actor(). */
+extern ACTOR* pc_actor_make_from_profile(Actor_info* actor_info, GAME* game, ACTOR_PROFILE* profile,
+                                         ACTOR_DLFTBL* dlftbl, f32 x, f32 y, f32 z, s16 rot_x, s16 rot_y, s16 rot_z,
+                                         mActor_name_t name_id, s16 arg);
+#endif
 extern void restore_fgdata_all(GAME_PLAY* play);
 extern void Actor_info_save_actor(GAME_PLAY* play);
 extern ACTOR* Actor_info_delete(Actor_info* actor_info, ACTOR* actor, GAME* game);

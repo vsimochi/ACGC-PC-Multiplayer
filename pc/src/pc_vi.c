@@ -1,6 +1,8 @@
 /* pc_vi.c - video interface → SDL window swap + frame pacing */
 #include "pc_platform.h"
 #include "pc_profiler.h"
+#include "pc_net_game.h"
+#include "pc_remote_player.h"
 
 #define VI_TVMODE_NTSC_INT    0
 #define VI_TVMODE_NTSC_DS     1
@@ -49,6 +51,15 @@ void VIWaitForRetrace(void) {
         return;
     }
     pc_profiler_add_time(PC_PROF_TIMER_POLL_EVENTS, t_before_poll);
+
+    /* Stage 1: once-per-frame, non-blocking. No-op if networking was never started. Placed here
+     * (a pure PC-layer function, called unconditionally every frame regardless of game state --
+     * menus, loading, gameplay) rather than in any decomp game-loop file. */
+    pc_net_game_poll();
+
+    /* Stage 2: retries deferred remote-player actor creation once gamePT/the local player actor
+     * are valid. Also unconditional every frame; a no-op whenever nothing is pending. */
+    pc_remote_player_poll();
 
     /* Drain the frame's last deferred batch here so its cost bills to
      * gx_flush instead of inflating the swap timer. */

@@ -10,6 +10,7 @@
 #include "pc_pause_menu.h"
 #include "pc_settings_menu.h"
 #include "pc_profiler.h"
+#include "pc_net_game.h"
 #include "m_kankyo.h"
 
 /* prefer discrete GPU on laptops */
@@ -261,6 +262,12 @@ static int pc_parse_rain_intensity(const char* text) {
 static int g_pc_lowaddr_selftest = 0; /* --lowaddr-selftest: exercise the real allocators without a ROM */
 #endif
 
+/* --host / --connect: Stage 1 role selection. No settings.ini persistence (matches --time/
+ * --date/--rain: a per-launch dev override, not a saved preference), no UI yet. */
+static int      g_pc_net_role = 0; /* 0 = none/single-player, 1 = host, 2 = client */
+static uint16_t g_pc_net_port = 7777;
+static char     g_pc_net_host_ip[64] = "127.0.0.1";
+
 int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -274,6 +281,8 @@ int main(int argc, char* argv[]) {
             printf("  --date M/D[/Y]      Override in-game date (e.g. 7/4, 12/24/2026)\n");
             printf("  --rain [intensity]  Force rainy weather; intensity is light, normal, or heavy\n");
             printf("  --uber-shader       Disable shader specialization (single uber shader)\n");
+            printf("  --host [port]       Start hosting (default port 7777); game plays normally while waiting\n");
+            printf("  --connect ip[:port] Connect to a host (default port 7777); game plays normally while connecting\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -336,6 +345,25 @@ int main(int argc, char* argv[]) {
                     i++;
                 }
             }
+        } else if (strcmp(argv[i], "--host") == 0) {
+            g_pc_net_role = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                int p = atoi(argv[i + 1]);
+                if (p > 0 && p <= 65535) g_pc_net_port = (uint16_t)p;
+                i++;
+            }
+        } else if (strcmp(argv[i], "--connect") == 0 && i + 1 < argc) {
+            char* colon;
+            g_pc_net_role = 2;
+            strncpy(g_pc_net_host_ip, argv[i + 1], sizeof(g_pc_net_host_ip) - 1);
+            g_pc_net_host_ip[sizeof(g_pc_net_host_ip) - 1] = '\0';
+            colon = strchr(g_pc_net_host_ip, ':');
+            if (colon) {
+                int p = atoi(colon + 1);
+                *colon = '\0';
+                if (p > 0 && p <= 65535) g_pc_net_port = (uint16_t)p;
+            }
+            i++;
         }
     }
 
@@ -391,6 +419,16 @@ int main(int argc, char* argv[]) {
     SDL_SetMainReady();
     pc_settings_load();
     pc_keybindings_load();
+
+    /* Stage 1: role selection only. A failure here (bad port, bad address, Winsock
+     * unavailable) is logged inside pc_net_game_start_*() and just leaves g_pc_net_role's
+     * request unfulfilled -- single-player continues exactly as if neither flag was passed. */
+    if (g_pc_net_role == 1) {
+        pc_net_game_start_host(g_pc_net_port);
+    } else if (g_pc_net_role == 2) {
+        pc_net_game_start_client(g_pc_net_host_ip, g_pc_net_port);
+    }
+
     pc_platform_init();
 #ifdef PC_LOW_ADDRESS_64
     if (g_pc_lowaddr_selftest) {
