@@ -1,14 +1,14 @@
-/* pc_remote_player.c - Stage 2: minimal visible representation of a connected remote player.
+/* pc_remote_player.c - Stage 2/3/4A: visible, movement-synchronized, real-model representation
+ * of a connected remote player.
  *
- * See pc_remote_player.h for scope. Design notes (see the Stage 2 investigation for the full
- * reasoning -- summarized here so this file is self-contained):
+ * See pc_remote_player.h for scope. Design notes carried forward from Stage 2/3 (see those
+ * investigations for the full reasoning -- summarized here so this file is self-contained):
  *
  *   - Actor part: ACTOR_PART_UNUSED, not ACTOR_PART_PLAYER. get_player_actor_withoutCheck()
  *     reads actor_info->list[ACTOR_PART_PLAYER].actor[0], and Actor_info_part_new() prepends new
  *     actors to a part's list -- putting a remote player in ACTOR_PART_PLAYER risks it being
  *     picked up as *the* local player by that lookup. ACTOR_PART_UNUSED is an existing,
- *     correctly-sized Actor_info list slot (part of the fixed-size actor_info->list[ACTOR_PART_NUM]
- *     array every GAME_PLAY already has) whose only other reader in the whole codebase is
+ *     correctly-sized Actor_info list slot whose only other reader in the whole codebase is
  *     ac_insect_move.c_inc's insect "stress" calculation, which just treats anything in it like a
  *     nearby moving NPC/player for scaring insects away -- a harmless, even mildly thematic, side
  *     effect for an actor that stands in for another player.
@@ -26,19 +26,17 @@
  *     actor_dlftbls[] table (which has no slot for a PC-only actor type).
  *   - Destruction: Actor_delete() only nulls mv_proc/dw_proc; the actor system reaps the memory
  *     later during its normal per-frame sweep. This file never frees an ACTOR directly.
- *   - Rendering: a small hand-emitted flat-colored pyramid marker using the *runtime* GBI macros
- *     (gSPVertex/gSP1Triangle/etc., which resolve real PC pointers via pc_gbi_pack_runtime_ptr()
- *     at call time) rather than a precompiled static display list, so nothing here needs C++
- *     compilation the way a static Gfx array's _GBI_STATIC_PTR initializer would under
- *     PC_LOW_ADDRESS_64. It reuses the real player's model/profile in no way -- that pipeline is
- *     wired to the local PLAYER_ACTOR's own animation/skeleton state -- and does not reuse
- *     ac_sample.c's Sample_Profile either (skeleton-animation-dependent, and has a documented
- *     pre-existing rendering bug); a self-contained marker was judged substantially safer for a
- *     prototype whose only job is to prove the pipeline end-to-end.
- *   - Position: NOT network-synchronized. Each remote actor's mv_proc recomputes its own position
- *     every frame as "the local player's current position plus a small fixed per-peer offset" --
- *     purely a local rendering anchor to prove connection -> identity -> actor creation ->
- *     rendering, exactly as scoped for Stage 2.
+ *   - Position: NOT network-synchronized *from* this file -- it comes from Stage 3's delayed
+ *     interpolation over the per-peer snapshot ring buffer, unchanged in Stage 4A.
+ *
+ * Stage 4A replaces the flat-colored pyramid marker with the actual player skeleton/model,
+ * reusing the same exported mPlib_ and cKF_ pipeline the inventory-overlay player preview uses
+ * (src/game/m_inventory_ovl.c's mIV_pl_shape_init/mIV_pl_shape_draw) -- i.e. composition, not a
+ * fake PLAYER_ACTOR: none of Player_actor_ct, Player_actor_move, the per-state main functions, or
+ * the CulcAnimation helpers is ever called, no controller is read, and every mPlib_/cKF_ symbol
+ * used here is already declared extern in m_player_lib.h / c_keyframe.h. See
+ * pc_remote_player_visual_init()/pc_remote_player_dw() below for exactly which calls are made and
+ * why each is safe to make independently of the local player's own state machine.
  */
 #include "pc_remote_player.h"
 
@@ -46,13 +44,21 @@
 #include "m_play.h"
 #include "m_player_lib.h"
 #include "m_name_table.h"
-#include "sys_matrix.h"
+#include "m_common_data.h" /* Common_Get(player_actor_exists), Now_Private -- see
+                             * pc_remote_player_visual_init()'s readiness gate */
 #include "m_rcp.h"
 #include "libultra/libultra.h"
 #include "pc_lowaddr.h" /* PC_LOWADDR_LIMIT -- see the guard in pc_remote_player_poll() */
 
 #include <string.h>
 #include <stdio.h>
+
+/* Same two decomp-owned skeleton globals m_player_lib.c's own mPlib_get_player_mdl_p() selects
+ * between (src/data/model/boy_model.c / girl_model.c) -- declared extern here purely for the
+ * diagnostic model-name print below; the actual selection always goes through
+ * mPlib_get_player_mdl_p() itself, never this pointer directly. */
+extern cKF_Skeleton_R_c cKF_bs_r_boy_1;
+extern cKF_Skeleton_R_c cKF_bs_r_grl_1;
 
 /* Stage 3: one extra slot past the real 0..PC_NET_MAX_PEERS-1 client-peer-id range, reserved for
  * the host itself (PC_NETGAME_HOST_PLAYER_ID == PC_NET_MAX_PEERS) -- see pc_net_game.h's doc on
@@ -72,20 +78,38 @@
                                                               * this is treated as a teleport/
                                                               * loading-zone jump, not a slide */
 
+/* Stage 4A: a remote player's own PC-owned skeleton/animation state, mirroring exactly what
+ * src/game/m_inventory_ovl.c's mIV_pl_shape_init()/mIV_pl_shape_draw() already do for the
+ * inventory's player preview -- two combine-played keyframe layers sharing one joint/morph work
+ * buffer pair, plus a part table. Every field here is per-instance (never shared between remote
+ * players); the skeleton/animation data each keyframe *points to* (cKF_bs_r_boy_1/grl_1, the
+ * mPlib_Get_Pointer_Animation() table) is shared, read-only, compiled-in decomp data. */
+typedef struct PCRemotePlayerVisual {
+    int                   initialized; /* 0 until pc_remote_player_visual_init() has run */
+    cKF_SkeletonInfo_R_c  keyframe0;   /* lower-body/main animation layer */
+    cKF_SkeletonInfo_R_c  keyframe1;   /* upper-body/item animation layer (also WAIT1 for now --
+                                        * see pc_remote_player_visual_init()) */
+    s_xyz                 joint_data[mPlayer_JOINT_NUM + 1];  /* shared by both layers, matching
+                                                                * PLAYER_ACTOR's own layout */
+    s_xyz                 morph_data[mPlayer_JOINT_NUM + 1];
+    s8                    part_table[mPlayer_JOINT_NUM + 1];
+} PCRemotePlayerVisual;
+
 /* A remote-player actor is just the generic ACTOR base plus which network player it stands in
- * for, and a little bit of purely cosmetic Stage 3 state. ACTOR must be the first member: the
- * whole actor pipeline (Actor_init_actor_class, Actor_info_part_new, generic mv_proc/dw_proc
- * dispatch, ...) only ever knows about ACTOR*. */
+ * for, the last-interpolated cosmetic values Stage 3 already tracked, and (new in Stage 4A) its
+ * own player visual state. ACTOR must be the first member: the whole actor pipeline
+ * (Actor_init_actor_class, Actor_info_part_new, generic mv_proc/dw_proc dispatch, ...) only ever
+ * knows about ACTOR*. */
 typedef struct PCRemotePlayerActor {
-    ACTOR          actor_class;
-    PCNetPlayerId  peer;
-    float          cosmetic_speed;      /* last-interpolated speed; drives the visual spin below */
-    uint8_t        cosmetic_move_state; /* last-interpolated PCMoveState; stored, not yet used to
-                                          * change the marker's appearance beyond the spin */
-    int8_t         cosmetic_item_kind;  /* last-interpolated item_kind; stored correctly, but
-                                          * Stage 3 does not attempt to render an actual item */
-    float          spin_angle;          /* free-running cosmetic Y-axis spin, radians-ish units
-                                          * consumed only by Matrix_RotateY in the draw function */
+    ACTOR                 actor_class;
+    PCNetPlayerId         peer;
+    float                 cosmetic_speed;      /* last-interpolated speed; not yet used to drive
+                                                 * animation selection (that's Stage 4B) */
+    uint8_t               cosmetic_move_state; /* last-interpolated PCMoveState; stored, not yet
+                                                 * used -- Stage 4A always shows WAIT1 */
+    int8_t                cosmetic_item_kind;  /* last-interpolated item_kind; stored correctly,
+                                                 * but Stage 4A does not render a held item */
+    PCRemotePlayerVisual  visual;
 } PCRemotePlayerActor;
 
 typedef struct PCRemotePlayerOffset {
@@ -99,35 +123,6 @@ static const PCRemotePlayerOffset s_offset_table[PC_REMOTE_PLAYER_SLOT_COUNT] = 
     { 60.0f, 0.0f },   { -60.0f, 0.0f },  { 0.0f, 60.0f },   { 0.0f, -60.0f },
     { 60.0f, 60.0f },  { -60.0f, 60.0f }, { 60.0f, -60.0f }, { -60.0f, -60.0f },
     { 0.0f, 100.0f },
-};
-
-typedef struct PCRemotePlayerColor {
-    u8 r, g, b;
-} PCRemotePlayerColor;
-
-/* Purely cosmetic: lets Test G (two clients on one host) tell the two remote markers apart at a
- * glance. Also indexed like s_slots. */
-static const PCRemotePlayerColor s_marker_colors[PC_REMOTE_PLAYER_SLOT_COUNT] = {
-    { 0, 200, 255 }, { 255, 120, 0 },  { 0, 255, 120 }, { 255, 0, 160 },
-    { 255, 220, 0 }, { 160, 0, 255 },  { 0, 255, 255 }, { 255, 255, 255 },
-    { 200, 200, 200 },
-};
-
-/* Flat-colored pyramid: apex + 4-vertex square base, 4 side triangles, no bottom cap (never seen
- * from below in practice for a floating marker). Model-space units only -- world placement is
- * done every frame via Matrix_translate() in the draw function, matching the rest of the
- * codebase's convention (see e.g. ef_coin.c's eCoin_dw()). Plain data, no pointers, so this is a
- * perfectly ordinary static const initializer -- the C++-only static-GBI-pointer restriction
- * under PC_LOW_ADDRESS_64 applies to static *display list* (Gfx) arrays, not plain Vtx data. It is
- * referenced directly (not copied into a per-frame GRAPH_ALLOC scratch buffer): gSPVertex's
- * runtime macro packs whatever real PC pointer it is given, static or not. */
-#define PC_REMOTE_PLAYER_VTX_COUNT 5
-static const Vtx s_marker_verts[PC_REMOTE_PLAYER_VTX_COUNT] = {
-    { .v = { { 0, 120, 0 }, 0, { 0, 0 }, { 255, 255, 255, 255 } } },    /* 0: apex */
-    { .v = { { -40, 0, -40 }, 0, { 0, 0 }, { 255, 255, 255, 255 } } },  /* 1 */
-    { .v = { { 40, 0, -40 }, 0, { 0, 0 }, { 255, 255, 255, 255 } } },   /* 2 */
-    { .v = { { 40, 0, 40 }, 0, { 0, 0 }, { 255, 255, 255, 255 } } },    /* 3 */
-    { .v = { { -40, 0, 40 }, 0, { 0, 0 }, { 255, 255, 255, 255 } } },   /* 4 */
 };
 
 /* One accepted movement sample, timestamped in THIS process's own local clock -- never the
@@ -150,6 +145,9 @@ typedef struct PCRemotePlayerSlot {
                                              * see pc_remote_player_on_move()); only such slots are
                                              * ever cleaned up by the liveness timeout in poll() */
     ACTOR*             actor;              /* NULL until pc_actor_make_from_profile() succeeds */
+    uint32_t           scene_generation;   /* s_scene_generation at the moment `actor` was created --
+                                             * see pc_remote_player_poll()'s staleness check. Meaningless
+                                             * while actor == NULL. */
     PCNetGameIdentity  identity;           /* captured at READY, if any; not yet displayed anywhere */
 
     int                has_sender_frame;
@@ -166,6 +164,32 @@ static PCRemotePlayerSlot s_slots[PC_REMOTE_PLAYER_SLOT_COUNT];
 static ACTOR_PROFILE s_remote_player_profile;
 static ACTOR_DLFTBL  s_remote_player_dlftbl;
 static int           s_profile_ready = 0;
+
+/* Stage 4A lifecycle fix: title<->town<->house transitions each fully destroy and reconstruct the
+ * whole GAME_PLAY object (Actor_info_dt() unconditionally sweeps and frees every actor in every
+ * part list, including ACTOR_PART_UNUSED -- see src/game/m_actor.c -- immediately followed by a
+ * fresh Actor_info_ct() for the newly-allocated GAME_PLAY; see src/game/m_play.c's
+ * play_cleanup()/play_init()). Any ACTOR* created in the old scene is gone -- not just unlinked,
+ * genuinely freed -- once that happens; Actor_delete() must never be called on it again.
+ *
+ * Detecting this by watching for an observable `gamePT == NULL` window (game_dt() clears it at
+ * the very end of tearing down the old scene, before the next game_ct() sets it to the new one)
+ * was tried and found unreliable by live testing: the free-old/malloc-new/construct-new sequence
+ * (src/graph.c's graph_proc()) can complete between two consecutive pc_remote_player_poll() calls
+ * without this code ever observing gamePT as NULL in between -- confirmed live, where a real
+ * play_cleanup()/play_init() cycle (visible via mCD_toNextLand()'s own log line) produced a stale
+ * dw_proc/mv_proc read one second later with zeroed-then-poisoned field values, despite gamePT
+ * never appearing NULL to this poll loop.
+ *
+ * Instead, every poll() call while gamePT is non-NULL directly compares the CURRENT GAME_PLAY
+ * object's own identity against what was last observed: its pointer value, and its
+ * `frame_counter` (reset to 0 by game_ct() for every newly constructed GAME, src/game.c). Either
+ * one changing unexpectedly -- a different pointer, or a frame_counter that went backwards --
+ * proves the object was replaced, even in the case a straight pointer comparison alone would miss
+ * (the allocator handing back the exact same address for the new GAME_PLAY). */
+static uint32_t s_scene_generation = 0;
+static GAME*    s_last_seen_game = NULL;
+static uint32_t s_last_seen_frame_counter = 0;
 
 static void pc_remote_player_mv(ACTOR* actor, GAME* game);
 static void pc_remote_player_dw(ACTOR* actor, GAME* game);
@@ -306,6 +330,46 @@ static void pc_remote_player_init_profile(void) {
     s_profile_ready = 1;
 }
 
+/* Stage 4A: bring up a remote visual's skeleton/animation state. Mirrors
+ * src/game/m_inventory_ovl.c's mIV_pl_shape_init() exactly: construct BOTH keyframe layers
+ * against the SAME joint_data/morph_data buffers (this is what lets
+ * cKF_SkeletonInfo_R_combine_play() later merge the two layers' contributions per part_table),
+ * copy the "normal" part table row, then init both layers to a standing, looping WAIT1 pose.
+ *
+ * Every symbol called here is declared extern in m_player_lib.h / c_keyframe.h -- no PLAYER_ACTOR
+ * is created, no Player_actor_ct, per-state main function, or CulcAnimation helper runs, no
+ * controller is read.
+ *
+ * Safety: called only once player readiness has already been confirmed by the caller (see the
+ * player_actor_exists gate in pc_remote_player_mv()). mPlib_get_player_mdl_p() itself only reads
+ * Now_Private->gender, so it is additionally guarded here against Now_Private being NULL --
+ * belt-and-suspenders, since player_actor_exists should not be TRUE without a loaded save, but
+ * this file never assumes that without checking. */
+static void pc_remote_player_visual_init(PCRemotePlayerVisual* visual) {
+    cKF_Skeleton_R_c* model;
+    cKF_Animation_R_c* wait_anim;
+
+    if (Now_Private == NULL) {
+        return; /* not actually ready despite the caller's check -- retry next frame */
+    }
+
+    model = mPlib_get_player_mdl_p();
+    wait_anim = mPlib_Get_Pointer_Animation(mPlayer_ANIM_WAIT1);
+
+    cKF_SkeletonInfo_R_ct(&visual->keyframe0, model, NULL, visual->joint_data, visual->morph_data);
+    cKF_SkeletonInfo_R_ct(&visual->keyframe1, model, NULL, visual->joint_data, visual->morph_data);
+    mPlib_DMA_player_Part_Table(visual->part_table, mPlayer_PART_TABLE_NORMAL);
+
+    cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&visual->keyframe0, wait_anim, NULL, 1.0f, 0.5f,
+                                                                     0.0f);
+    cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&visual->keyframe1, wait_anim, NULL, 1.0f, 0.5f,
+                                                                     0.0f);
+
+    visual->initialized = 1;
+    printf("[NET][REMOTE][DIAG] visual initialized: model=%s num_shown_joints=%d\n",
+           (model == &cKF_bs_r_boy_1) ? "boy" : "girl", (int)model->num_shown_joints);
+}
+
 static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
     PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
@@ -324,64 +388,94 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
      * the unknown. */
     target_time = graph_dt_frame_time(game) - PC_REMOTE_PLAYER_INTERP_DELAY_FRAMES;
 
-    if (!pc_remote_player_interpolate(slot, target_time, &render)) {
-        return; /* no movement data yet -- hold at the creation-time spawn position */
+    if (pc_remote_player_interpolate(slot, target_time, &render)) {
+        actor->world.position = render.pos;
+        actor->world.angle.y = render.angle;
+        actor->shape_info.rotation.y = render.angle; /* mirrors how the local player's own
+                                                       * main-state functions keep these two in
+                                                       * sync, e.g. Player_actor_Movement_Walk() */
+
+        self->cosmetic_speed = render.speed;
+        self->cosmetic_move_state = render.move_state;
+        self->cosmetic_item_kind = render.item_kind;
+    }
+    /* else: no movement data yet -- hold at the creation-time spawn position. Visual bring-up
+     * below still proceeds regardless, so the idle model is ready as soon as possible rather than
+     * waiting for the first network sample. */
+
+    /* Stage 4A: bring up the real skeleton/animation once the LOCAL player's own appearance
+     * resources are known-good. common_data.player_actor_exists is set at the very start of
+     * Player_actor_ct() (src/game/m_player.c), which is itself only invoked from within this
+     * same per-frame Actor_info_call_actor() sweep -- and ACTOR_PART_UNUSED (this actor's part)
+     * is processed before ACTOR_PART_PLAYER in that sweep's part loop, so on the one frame where
+     * the local player's ct_proc actually runs, THIS check still sees the pre-frame (FALSE)
+     * value; it only reads TRUE starting the frame after Player_actor_ct() (and the face-texture
+     * bank fill inside it, mPlib_change_player_face()) has fully completed. That is exactly the
+     * ordering pc_remote_player_dw() below depends on for mPlib_get_player_face_p()/
+     * mPlib_get_player_tex_p() to return non-stale data. This does not touch gamePT/Actor_info
+     * directly and does not replace the existing low-address guard in pc_remote_player_poll() --
+     * it is an additional, independent readiness signal for player *appearance* resources
+     * specifically, as recommended by the Stage 4 investigation. */
+    if (!self->visual.initialized && Common_Get(player_actor_exists)) {
+        pc_remote_player_visual_init(&self->visual);
     }
 
-    actor->world.position = render.pos;
-    actor->world.angle.y = render.angle;
-    actor->shape_info.rotation.y = render.angle; /* mirrors how the local player's own main-state
-                                                   * functions keep these two in sync, e.g.
-                                                   * Player_actor_Movement_Walk() */
-
-    self->cosmetic_speed = render.speed;
-    self->cosmetic_move_state = render.move_state;
-    self->cosmetic_item_kind = render.item_kind;
-
-    /* Purely cosmetic: a faster-moving remote player spins its placeholder marker faster, so
-     * `speed` visibly does something even though Stage 3 draws no real animation. Accumulated
-     * here (the "movement" function) rather than in the draw function, and scaled by dt so it
-     * doesn't depend on the render/frame rate either. */
-    self->spin_angle += self->cosmetic_speed * 1500.0f * (f32)game->graph->dt_num_60fps_frames;
+    if (self->visual.initialized) {
+        cKF_SkeletonInfo_R_combine_play(&self->visual.keyframe0, &self->visual.keyframe1, self->visual.part_table);
+    }
 }
 
 static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
     GRAPH* graph = game->graph;
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
-    int color_idx = (self->peer >= 0 && self->peer < PC_REMOTE_PLAYER_SLOT_COUNT) ? self->peer : 0;
-    const PCRemotePlayerColor* color = &s_marker_colors[color_idx];
+    Mtx* mtx;
+    u8* eye_tex_p;
+    u8* mouth_tex_p;
     Gfx* gfx;
 
+    if (!self->visual.initialized) {
+        return; /* not ready yet (see pc_remote_player_mv()) -- draw nothing this frame, retried
+                  * automatically next frame */
+    }
+
+    /* Per-frame scratch matrices, exactly like the inventory preview (mIV_pl_shape_draw) --
+     * never a persistent per-instance buffer like PLAYER_ACTOR's own work_mtx[2][13]. */
+    mtx = (Mtx*)GRAPH_ALLOC_TYPE(graph, Mtx, self->visual.keyframe0.skeleton->num_shown_joints);
+    if (mtx == NULL) {
+        return;
+    }
+
+    /* Stage 4A appearance: the LOCAL player's own eye/mouth/cloth/face resources, exactly as
+     * instructed -- every remote player currently looks identical to the local one. Pattern 0 is
+     * simply "not blinking, default mouth"; Stage 4A does not animate eye/mouth texture patterns
+     * (that is tied to now_main_index-driven texture-animation tables this stage does not use). */
+    eye_tex_p = mPlib_Get_eye_tex_p(0);
+    mouth_tex_p = mPlib_Get_mouth_tex_p(0);
+
     /* Reset RDP/RSP mode (texture/z/light/fog/prim) to a known baseline before emitting our own
-     * commands -- the same call every other actor's draw function makes first (see e.g.
-     * ef_coin.c's eCoin_dw()), since whatever actor drew immediately before us may have left the
-     * pipe in an arbitrary state (XLU cycle type, some tile bound, lighting on, ...). */
+     * commands -- the same call the real player's own Player_actor_draw_Normal() makes first. */
     _texture_z_light_fog_prim(graph);
 
     OPEN_DISP(graph);
     gfx = NOW_POLY_OPA_DISP;
 
-    Matrix_translate(actor->world.position.x, actor->world.position.y, actor->world.position.z, MTX_LOAD);
-    Matrix_RotateY((s16)self->spin_angle, MTX_MULT);
-    gSPMatrix(gfx++, _Matrix_to_Mtx_new(graph), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
-
-    gDPPipeSync(gfx++);
-    gSPTexture(gfx++, 0, 0, 0, 0, G_OFF);
-    /* Explicit, not inherited: no lighting (we supply a flat primitive color), no backface
-     * culling (a small hand-built marker with unverified winding is safer visible from both
-     * sides than possibly invisible), zbuffer on so it sorts correctly against everything else. */
-    gSPLoadGeometryMode(gfx++, G_ZBUFFER);
-    gDPSetCombineMode(gfx++, G_CC_PRIMITIVE, G_CC_PRIMITIVE);
-    gDPSetPrimColor(gfx++, 0, 0, color->r, color->g, color->b, 255);
-
-    gSPVertex(gfx++, s_marker_verts, PC_REMOTE_PLAYER_VTX_COUNT, 0);
-    gSP1Triangle(gfx++, 0, 1, 2, 0);
-    gSP1Triangle(gfx++, 0, 2, 3, 0);
-    gSP1Triangle(gfx++, 0, 3, 4, 0);
-    gSP1Triangle(gfx++, 0, 4, 1, 0);
+    /* Same five segments Player_actor_draw_Normal() binds, same local accessors -- Stage 4A
+     * intentionally reuses the local player's own singleton texture/palette banks rather than
+     * introducing any remote-appearance resources (that is Stage 4C). */
+    gSPSegment(gfx++, ANIME_1_TXT_SEG, eye_tex_p);
+    gSPSegment(gfx++, ANIME_2_TXT_SEG, mouth_tex_p);
+    gSPSegment(gfx++, ANIME_3_TXT_SEG, mPlib_get_player_tex_p(game));
+    gSPSegment(gfx++, ANIME_4_TXT_SEG, mPlib_get_player_pallet_p(game));
+    gSPSegment(gfx++, ANIME_5_TXT_SEG, mPlib_get_player_face_pallet_p(game));
 
     SET_POLY_OPA_DISP(gfx);
     CLOSE_DISP(graph);
+
+    /* No Matrix_translate/gSPMatrix here on purpose: the generic Actor_draw() (src/game/m_actor.c)
+     * already loaded the root matrix from actor->world.position/shape_info.rotation/actor->scale
+     * before calling this dw_proc, exactly like it does for the real PLAYER_ACTOR. Overriding it
+     * (as the Stage 2/3 pyramid marker used to) would discard that and is not needed here. */
+    cKF_Si3_draw_R_SV(game, &self->visual.keyframe0, mtx, NULL, NULL, actor);
 }
 
 static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot) {
@@ -521,6 +615,16 @@ void pc_remote_player_poll(void) {
          * explanation), which otherwise reads a non-NULL but garbage ACTOR* here. */
         return;
     }
+    /* Only reached once `local`'s low-address check has confirmed this GAME_PLAY's actor_info (and
+     * therefore everything game_ct()/play_init() sets up before it, including frame_counter) is
+     * genuinely constructed -- see s_scene_generation's doc comment above for why this check must
+     * not run any earlier than this. */
+    if (gamePT != s_last_seen_game || gamePT->frame_counter < s_last_seen_frame_counter) {
+        s_scene_generation++;
+    }
+    s_last_seen_game = gamePT;
+    s_last_seen_frame_counter = gamePT->frame_counter;
+
     play = (GAME_PLAY*)gamePT;
     now = graph_dt_frame_time(gamePT);
     dump_now = graph_dt_period_elapsed(gamePT, &s_diag_dump_accum, PC_REMOTE_PLAYER_DIAG_DUMP_PERIOD_60FPS_FRAMES);
@@ -537,6 +641,23 @@ void pc_remote_player_poll(void) {
             continue;
         }
 
+        /* Stage 4A lifecycle fix: this slot's actor (if any) was created in an earlier scene that
+         * Actor_info_dt() has since fully torn down -- see s_scene_generation's doc comment above.
+         * That teardown already deleted and freed the ACTOR; it must NOT be passed to
+         * Actor_delete() again (it is not merely unlinked, it no longer exists). Just drop the
+         * stale reference and re-arm creation -- the existing pending_create handling below
+         * (unchanged) recreates it in the current scene at the current local player's position.
+         * Peer/network state (in_use, identity, the snapshot ring) is untouched, so movement sync
+         * resumes immediately once the new actor exists, and since a freshly-allocated
+         * PCRemotePlayerActor's embedded `visual` comes back zeroed (Actor_init_actor_class()'s
+         * mem_clear), pc_remote_player_mv()'s existing player_actor_exists gate transparently
+         * reinitializes the Stage 4A visual too -- no separate visual-recreation code needed. */
+        if (slot->actor != NULL && slot->scene_generation != s_scene_generation) {
+            printf("[NET][REMOTE] player %d: scene changed -- remote-player actor was replaced, recreating\n", i);
+            slot->actor = NULL;
+            slot->pending_create = 1;
+        }
+
         /* Liveness timeout: only for relay-discovered peers (see pc_remote_player_on_move()) --
          * a directly-tracked peer (host: a real client; client: the host) is already destroyed
          * promptly and unconditionally by the real PC_NET_EVENT_PEER_DISCONNECTED via
@@ -548,7 +669,10 @@ void pc_remote_player_poll(void) {
             continue;
         }
 
-        if (dump_now && slot->actor != NULL) {
+        /* Stage 4A lifecycle fix: belt-and-suspenders low-address liveness check, matching the one
+         * already used for `local` above -- defends this direct dereference against any stale
+         * slot->actor the scene-generation check (above) hasn't already caught. */
+        if (dump_now && slot->actor != NULL && (uint64_t)(uintptr_t)slot->actor < PC_LOWADDR_LIMIT) {
             printf("[NET][REMOTE][DIAG] player %d actor pos=(%.1f,%.1f,%.1f) angle=%d snapshots=%d "
                    "speed=%.2f move_state=%d item_kind=%d\n",
                    i, slot->actor->world.position.x, slot->actor->world.position.y, slot->actor->world.position.z,
@@ -576,7 +700,18 @@ void pc_remote_player_poll(void) {
 
         ((PCRemotePlayerActor*)actor)->peer = (PCNetPlayerId)i;
         ((PCRemotePlayerActor*)actor)->cosmetic_item_kind = -1;
+
+        /* Stage 4A: same scale/ofs_y the real player uses (Player_actor_init_value()/
+         * Player_actor_ct(), src/game/m_player.c) -- required for the generic Actor_draw()'s
+         * root-matrix setup (Matrix_softcv3_load/Matrix_scale) to place the shared player
+         * skeleton correctly, since it's the same skeleton at the same model-space scale. No
+         * shadow is set up (shape_info.shadow_proc stays NULL from Actor_init_actor_class()'s
+         * mem_clear) -- out of scope for Stage 4A. */
+        actor->scale.x = actor->scale.y = actor->scale.z = 0.01f;
+        actor->shape_info.ofs_y = 200.0f;
+
         slot->actor = actor;
+        slot->scene_generation = s_scene_generation;
         slot->pending_create = 0;
         printf("[NET][REMOTE] created remote-player actor for player %d at (%.1f, %.1f, %.1f)\n", i, x, y, z);
     }

@@ -1,15 +1,22 @@
-/* pc_remote_player.h - Stage 2/3: visible, movement-synchronized representation of a remote
- * player.
+/* pc_remote_player.h - Stage 2/3/4A: visible, movement-synchronized, real-model representation
+ * of a remote player.
  *
  * Stage 2 scope: once pc_net_game's per-peer handshake reaches READY, each side creates a
  * lightweight placeholder ACTOR for the *other* side so the connection is visibly proven
  * end-to-end (connect -> identity -> actor creation -> rendering).
  *
- * Stage 3 scope: the placeholder actor's position/facing now follow the real remote player via
+ * Stage 3 scope: the placeholder actor's position/facing follow the real remote player via
  * delayed two-snapshot interpolation over a small per-peer ring buffer (see pc_remote_player.c).
- * Still no real PLAYER_ACTOR animation, no player-vs-player collision, and no input/inventory/
- * world-state sync of any kind -- only position, facing, speed, a coarse move-state, and
- * item_kind are ever received, and only as cosmetic cues.
+ * No player-vs-player collision and no input/inventory/world-state sync of any kind -- only
+ * position, facing, speed, a coarse move-state, and item_kind are ever received.
+ *
+ * Stage 4A scope: the placeholder is now the actual player skeleton/model (the shared
+ * cKF_bs_r_boy_1/grl_1 resources, selected by the LOCAL player's gender), shown in a looping
+ * WAIT1 idle pose using the LOCAL player's own appearance textures. This is composition, not a
+ * PLAYER_ACTOR: none of Player_actor_ct, Player_actor_move, the per-state main functions, or the
+ * CulcAnimation helpers ever run for a remote player, no
+ * controller is read, move_state/item_kind are still tracked but not yet used to change the
+ * animation or draw a held item (that is Stage 4B/4D).
  *
  * This module never sends or receives network traffic itself; pc_net_game.c is the only caller,
  * at the points where a peer's link state transitions to READY or away from it, and once per
