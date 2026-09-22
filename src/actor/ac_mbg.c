@@ -5,28 +5,11 @@
 #include "sys_matrix.h"
 #include "m_name_table.h"
 
-#ifdef TARGET_PC
-static Vtx mbg_v[0x80 / sizeof(Vtx)];
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/ac_mbg_split.h"
 #else
-static Vtx mbg_v[] = {
-#include "assets/mbg_v.inc"
-};
+#include "../src/actor/ac_mbg_gfx.c_inc"
 #endif
-
-static Gfx mbg_model[] = {
-    gsDPPipeSync(),
-    gsDPSetRenderMode(G_RM_FOG_SHADE_A, G_RM_AA_ZB_OPA_SURF2),
-    gsDPSetCombineLERP(PRIMITIVE, 0, SHADE, 0, 0, 0, 0, 1, 0, 0, 0, COMBINED, 0, 0, 0, COMBINED),
-    gsDPSetPrimColor(0, 128, 255, 255, 0, 255),
-    gsSPLoadGeometryMode(G_ZBUFFER | G_SHADE | G_FOG | G_LIGHTING | G_SHADING_SMOOTH),
-    gsSPVertex(&mbg_v[0], 8, 0),
-    gsSP2Triangles(5, 6, 7, 0, 4, 5, 7, 0),
-    gsSP2Triangles(7, 6, 2, 0, 7, 2, 3, 0),
-    gsSP2Triangles(5, 1, 6, 0, 6, 1, 2, 0),
-    gsSP2Triangles(4, 0, 5, 0, 5, 0, 1, 0),
-    gsSP2Triangles(4, 7, 0, 0, 0, 7, 3, 0),
-    gsSPEndDisplayList(),
-};
 
 static void Mbg_Actor_ct(ACTOR* actorx, GAME* game);
 static void Mbg_Actor_dt(ACTOR* actorx, GAME* game);
@@ -98,9 +81,3 @@ static void Mbg_Actor_move(ACTOR* actorx, GAME* game) {
     actorx->shape_info.rotation.y += DEG2SHORT_ANGLE(0.258179f); // 0x002F
 }
 
-#ifdef TARGET_PC
-extern void pc_load_asset(const char*, void*, unsigned int, unsigned int, int, int);
-void _pc_load_src_actor_ac_mbg_c(void) {
-    pc_load_asset("assets/mbg_v.bin", mbg_v, 0x80, 0x3149F0, 0, 2);
-}
-#endif

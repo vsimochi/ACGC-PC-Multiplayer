@@ -17,6 +17,7 @@ CtrlGroup_* CGRP_ARRAY[16];
  * Size:	000038
  */
 
+#ifndef PC_LOW_ADDRESS_64 /* the PC_LOW_ADDRESS_64 build uses the PcLowPtr template in bx.h */
 static void PTconvert(void** pointer, u32 base_address)
 {
 	if (*pointer == NULL) {
@@ -28,6 +29,7 @@ static void PTconvert(void** pointer, u32 base_address)
 	}
 	*pointer = *(char**)pointer + base_address;
 }
+#endif
 
 /*
  * --INFO--
@@ -47,10 +49,16 @@ CtrlGroup_* Wave_Test(u8* data)
 	WaveArchiveBank_* arcBank;
 	WaveArchive_* arc;
 
-	PTconvert((void**)&((Wsys_*)data)->waveArcBank, base_addr);
-	PTconvert((void**)&((Wsys_*)data)->ctrlGroup, base_addr);
+	PTCONVERT(&((Wsys_*)data)->waveArcBank, base_addr);
+	PTCONVERT(&((Wsys_*)data)->ctrlGroup, base_addr);
+#ifdef PC_LOW_ADDRESS_64
+	/* Wsys_::waveArcBank/ctrlGroup are the 4-byte file fields at +0x10/+0x14; a pointer-sized load would span both */
+	arcBank       = ((Wsys_*)data)->waveArcBank;
+	group         = ((Wsys_*)data)->ctrlGroup;
+#else
 	arcBank       = *(WaveArchiveBank_**)(data + 0x10);
 	group         = *(CtrlGroup_**)(data + 0x14);
+#endif
 	CGRP_ARRAY[0] = group;
 
 	if (arcBank->magic != 'WINF') {
@@ -61,27 +69,27 @@ CtrlGroup_* Wave_Test(u8* data)
 	}
 
 	for (i = 0; i < arcBank->count; i++) {
-		PTconvert((void**)&arcBank->waveGroups[i], base_addr);
+		PTCONVERT(&arcBank->waveGroups[i], base_addr);
 		arc     = arcBank->waveGroups[i];
 		Jac_InitHeap(&arc->heap);
 		arc->heap.startAddress = 0;
 
 		for (j = 0; j < arc->waveCount; j++) {
-			PTconvert((void**)&arc->waves[j], base_addr);
+			PTCONVERT(&arc->waves[j], base_addr);
 		}
 	}
 
 	for (i = 0; i < group->count; i++) {
-		PTconvert((void**)&group->scenes[i], base_addr);
+		PTCONVERT(&group->scenes[i], base_addr);
 		scene = group->scenes[i];
-		PTconvert((void**)&scene->cdf, base_addr);
-		PTconvert((void**)&scene->cex, base_addr);
-		PTconvert((void**)&scene->cst, base_addr);
+		PTCONVERT(&scene->cdf, base_addr);
+		PTCONVERT(&scene->cex, base_addr);
+		PTCONVERT(&scene->cst, base_addr);
 
 		cdf = scene->cdf;
 		if (cdf && cdf->magic == 'C-DF') {
 			for (j = 0; j < cdf->count; j++) {
-				PTconvert((void**)&cdf->waveIDs[j], base_addr);
+				PTCONVERT(&cdf->waveIDs[j], base_addr);
 				Jac_InitHeap(&cdf->waveIDs[j]->heap);
 				cdf->waveIDs[j]->heap.startAddress = 0;
 			}
@@ -90,7 +98,7 @@ CtrlGroup_* Wave_Test(u8* data)
 		cex = scene->cex;
 		if (cex && cex->magic == 'C-EX') {
 			for (j = 0; j < cex->count; j++) {
-				PTconvert((void**)&cex->waveIDs[j], base_addr);
+				PTCONVERT(&cex->waveIDs[j], base_addr);
 				Jac_InitHeap(&cex->waveIDs[j]->heap);
 				cex->waveIDs[j]->heap.startAddress = 0;
 			}
@@ -99,7 +107,7 @@ CtrlGroup_* Wave_Test(u8* data)
 		cst = scene->cst;
 		if (cst && cst->magic == 'C-ST') {
 			for (j = 0; j < cst->count; j++) {
-				PTconvert((void**)&cst->waveIDs[j], base_addr);
+				PTCONVERT(&cst->waveIDs[j], base_addr);
 				Jac_InitHeap(&cst->waveIDs[j]->heap);
 				cst->waveIDs[j]->heap.startAddress = 0;
 			}

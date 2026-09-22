@@ -18,6 +18,7 @@
 
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_lowaddr.h"
 
 /* Font buffer loaded from DOL at runtime (replaces .s file's .incbin) */
 __attribute__((aligned(32)))
@@ -113,7 +114,26 @@ void JFWSystem::firstInit() {
     OSInit();
     DVDInit();
     rootHeap = JKRExpHeap::createRoot(CSetUpParam::maxStdHeaps, false);
+#ifdef PC_LOW_ADDRESS_64
+    /* JW_Init sizes the system heap as (arena size - 0xD0), where 0xD0 is the space the root heap's own object,
+     * its 0x10-byte block header and the OSInitAlloc table take on the GameCube. With 8-byte pointers
+     * sizeof(JKRExpHeap) is 0x100 instead of the GC size, so that request no longer fits in the root heap,
+     * JKRExpHeap::create() returns null and everything that uses the system heap crashes. Keep the requested
+     * size when it fits (same as GC), otherwise use what the root heap actually has free. */
+    {
+        u32 sysHeapSize = CSetUpParam::sysHeapSize;
+        u32 rootFree = (u32)rootHeap->getFreeSize();
+        u32 fitSize = rootFree & ~0xFu;
+        if (sysHeapSize > fitSize) {
+            pc_lowaddr_log("[JFWSystem] system heap request 0x%X does not fit in root heap (free 0x%X); using 0x%X\n", sysHeapSize, rootFree, fitSize);
+            sysHeapSize = fitSize;
+        }
+        systemHeap = JKRExpHeap::create(sysHeapSize, rootHeap, false);
+        pc_lowaddr_log("[JFWSystem] root heap %p free before=0x%X, system heap %p size=0x%X, root free after=0x%X\n", (void*)rootHeap, rootFree, (void*)systemHeap, sysHeapSize, (u32)rootHeap->getFreeSize());
+    }
+#else
     systemHeap = JKRExpHeap::create(CSetUpParam::sysHeapSize, rootHeap, false);
+#endif
 }
 
 void JFWSystem::init() {

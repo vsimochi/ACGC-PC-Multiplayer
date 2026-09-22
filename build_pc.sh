@@ -12,9 +12,8 @@
 
 set -e
 
-if [ "$MSYSTEM" != "MINGW32" ]; then
-    echo "Error: Must run from MSYS2 MINGW32 shell (not MINGW64 or MSYS)"
-    echo "Open 'MSYS2 MINGW32' from your Start menu, then run this script again."
+if [ "$MSYSTEM" != "UCRT64" ]; then
+    echo "Error: Must run from MSYS2 UCRT64 shell."
     exit 1
 fi
 

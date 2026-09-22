@@ -3,6 +3,13 @@
 #include "jaudio_NES/bx.h"
 #include "jaudio_NES/aramcall.h"
 
+/* Wave_::data is a 4-byte file-image address; 0xFFFFFFFF marks "load failed". Read it as a 32-bit value. */
+#ifdef PC_LOW_ADDRESS_64
+#define JA_WAVE_DATA_INT(w) ((int)(intptr_t)(Wave_*)(w)->data)
+#else
+#define JA_WAVE_DATA_INT(w) ((int)(w)->data)
+#endif
+
 static s16 WS_V2P_TABLE[0x100];
 static s16 BNK_V2P_TABLE[0x100];
 
@@ -52,7 +59,7 @@ static BOOL UpdateWave_Extern(WaveArchiveBank_* bank, CtrlGroup_* group, Ctrl_* 
 		}
 
 		if (index != cdf->count) {
-			WaveID_** wave2 = &cdf->waveIDs[index];
+			JA_FPTR(WaveID_)* wave2 = &cdf->waveIDs[index];
 			if ((*wave2)->heap.startAddress) {
 				wave->data = (*wave2)->data;
 				Jac_SelfInitHeap(&wave->heap, (*wave2)->heap.startAddress, 0, (*wave2)->heap.memoryType);
@@ -174,7 +181,7 @@ WaveID_* __GetSoundHandle(CtrlGroup_* group, u32 id, u32 id2)
 	ctrl = scene->cdf;
 	if (ctrl) {
 		WaveID_* wave = SearchWave(ctrl, wId);
-		if (wave && wave->data && (int)wave->data != 0xffffffff) {
+		if (wave && wave->data && JA_WAVE_DATA_INT(wave) != 0xffffffff) {
 			return wave;
 		}
 	}
@@ -182,14 +189,14 @@ WaveID_* __GetSoundHandle(CtrlGroup_* group, u32 id, u32 id2)
 	ctrl = scene->cex;
 	if (ctrl) {
 		WaveID_* wave = SearchWave(ctrl, wId);
-		if (wave && wave->data && (int)wave->data != 0xffffffff) {
+		if (wave && wave->data && JA_WAVE_DATA_INT(wave) != 0xffffffff) {
 			return wave;
 		}
 	}
 
 	for (u32 i = 0; i < scene->_08; i++) {
 		WaveID_* wave = __GetSoundHandle(group, id, scene->_18[i]);
-		if (wave && wave->data && (int)wave->data != 0xffffffff) {
+		if (wave && wave->data && JA_WAVE_DATA_INT(wave) != 0xffffffff) {
 			return wave;
 		}
 	}
@@ -252,6 +259,10 @@ u16 Jac_BnkVirtualToPhysical(u16 vID)
 u16 Jac_BnkPhysicalToVirtual(u16 bnk)
 {
 	// UNUSED FUNCTION
+#ifdef PC_LOW_ADDRESS_64
+	/* C++ (unlike C) makes flowing off the end of a non-void function undefined behaviour */
+	return 0;
+#endif
 }
 
 /*
@@ -262,6 +273,10 @@ u16 Jac_BnkPhysicalToVirtual(u16 bnk)
 u16 Jac_WsPhysicalToVirtual(u16 ws)
 {
 	// UNUSED FUNCTION
+#ifdef PC_LOW_ADDRESS_64
+	/* C++ (unlike C) makes flowing off the end of a non-void function undefined behaviour */
+	return 0;
+#endif
 }
 
 /*

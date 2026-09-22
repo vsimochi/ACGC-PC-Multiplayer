@@ -552,7 +552,7 @@ bool JKRExpHeap::check() {
                 ok = false;
                 JUTWarningConsole_f(":::addr %08x: bad previous pointer (%08x)\n", block->mNext, block->mNext->mPrev);
             }
-            if ((u32)block + block->mAllocatedSpace + sizeof(CMemBlock) > (u32)block->mNext) {
+            if ((u32)block + block->mAllocatedSpace + sizeof(CMemBlock) > (u32)(CMemBlock*)block->mNext) {
                 ok = false;
                 JUTWarningConsole_f(":::addr %08x: bad block size (%08x)\n", block, block->mAllocatedSpace);
             }

@@ -12,6 +12,7 @@
 #include <dolphin/os.h>
 #ifdef TARGET_PC
 #include <dolphin/ar.h>
+#include "jaudio_NES/dummyrom.h" /* C linkage for the function-local "extern u32 GetNeosRomTop(void)" below (this file is C++ under PC_LOW_ADDRESS_64) */
 #endif
 
 #define MK_BGLOAD_MSG(retData, tableType, id, loadStatus) \
@@ -1095,14 +1096,14 @@ static void Nas_BankOfsToAddr_Inner(s32 bank_id, u8* ctrl_p, WaveMedia* wave_med
 #endif
 
         for (i = 0; i < n_perc_inst; i++) {
-            inst_ofs = (u32)((perctable**)*BANK_ENTRY(ctrl_p, 0))[i];
+            inst_ofs = JA_FPTR_U32(((JA_FPTR(perctable)*)*BANK_ENTRY(ctrl_p, 0))[i]);
             if (inst_ofs == 0) {
                 continue; // empty percussion/drum entry
             }
 
             inst_ofs += (u32)ctrl_p; // OFS2RAM(ctrl_p, ofs);
             percvt = (perctable*)inst_ofs;
-            ((perctable**)*BANK_ENTRY(ctrl_p, 0))[i] = percvt;
+            ((JA_FPTR(perctable)*)*BANK_ENTRY(ctrl_p, 0))[i] = percvt;
 
             // Percussion may already have been relocated since percussion
             // can appear in list multiple times
@@ -1114,7 +1115,7 @@ static void Nas_BankOfsToAddr_Inner(s32 bank_id, u8* ctrl_p, WaveMedia* wave_med
             pc_swap_perctable(percvt);
 #endif
             __WaveTouch(&percvt->tuned_sample, (u32)ctrl_p, wave_media);
-            inst_ofs = (u32)percvt->envelope;
+            inst_ofs = JA_FPTR_U32(percvt->envelope);
             percvt->envelope = (envdat*)OFS2RAM(ctrl_p, inst_ofs);
 #ifdef TARGET_PC
             pc_swap_envdat(percvt->envelope);
@@ -1178,7 +1179,7 @@ static void Nas_BankOfsToAddr_Inner(s32 bank_id, u8* ctrl_p, WaveMedia* wave_med
                     __WaveTouch(&inst->high_pitch_tuned_sample, (u32)ctrl_p, wave_media);
                 }
 
-                inst_ofs = (u32)inst->envelope;
+                inst_ofs = JA_FPTR_U32(inst->envelope);
                 inst->envelope = (envdat*)OFS2RAM(ctrl_p, inst_ofs);
 #ifdef TARGET_PC
                 pc_swap_envdat(inst->envelope);
@@ -1189,9 +1190,9 @@ static void Nas_BankOfsToAddr_Inner(s32 bank_id, u8* ctrl_p, WaveMedia* wave_med
         }
     }
 
-    AG.voice_info[bank_id].percussion = (perctable**)*BANK_ENTRY(ctrl_p, 0);
+    AG.voice_info[bank_id].percussion = (JA_FPTR(perctable)*)*BANK_ENTRY(ctrl_p, 0);
     AG.voice_info[bank_id].effects = (percvoicetable*)*BANK_ENTRY(ctrl_p, 1);
-    AG.voice_info[bank_id].instruments = (voicetable**)BANK_ENTRY(ctrl_p, 2);
+    AG.voice_info[bank_id].instruments = (JA_FPTR(voicetable)*)BANK_ENTRY(ctrl_p, 2);
 }
 
 #undef OFS2RAM
@@ -1655,7 +1656,7 @@ s32 VoiceLoad(s32 bank_id, u32 inst_id, s8* done_p) {
     cache->status = LPS_CACHE_STATE_START;
     cache->bytes_remaining = ALIGN_NEXT(wavetable->size, 32);
     cache->ram_addr = cache->current_ram_addr;
-    cache->current_device_addr = (u32)wavetable->sample;
+    cache->current_device_addr = JA_FPTR_U32(wavetable->sample);
     cache->medium = wavetable->medium;
     cache->seq_or_bank_id = bank_id;
     cache->inst_id = inst_id;
@@ -2036,7 +2037,7 @@ static void __WaveTouch(wtstr* wavetouch_str, u32 ram_addr, WaveMedia* wave_medi
      * pointers are < OS_BASE_CACHED (0x80000000), so use a simpler check:
      * if the offset is small enough to be a valid offset, relocate it. */
     {
-        u32 wt_ofs = (u32)wavetouch_str->wavetable;
+        u32 wt_ofs = JA_FPTR_U32(wavetouch_str->wavetable);
         if (wt_ofs != 0 && wt_ofs < 0x10000000) {
             /* Not yet relocated — relocate now */
             reloc = (void*)(wt_ofs + ram_addr);
@@ -2068,22 +2069,22 @@ static void __WaveTouch(wtstr* wavetouch_str, u32 ram_addr, WaveMedia* wave_medi
             pc_swap_smzwavetable(wavetable);
 
             if (wavetable->size != 0) {
-                reloc = (void*)((u32)wavetable->loop + ram_addr);
+                reloc = (void*)(JA_FPTR_U32(wavetable->loop) + ram_addr);
                 wavetable->loop = (adpcmloop*)reloc;
                 pc_swap_adpcmloop(wavetable->loop);
 
-                reloc = (void*)((u32)wavetable->book + ram_addr);
+                reloc = (void*)(JA_FPTR_U32(wavetable->book) + ram_addr);
                 wavetable->book = (adpcmbook*)reloc;
                 pc_swap_adpcmbook(wavetable->book);
 
                 switch (wavetable->medium) {
                     case MEDIUM_RAM:
-                        reloc = (void*)((u32)wavetable->sample + (u32)wave_media->wave0_p);
+                        reloc = (void*)(JA_FPTR_U32(wavetable->sample) + (u32)wave_media->wave0_p);
                         wavetable->sample = (u8*)reloc;
                         wavetable->medium = wave_media->wave0_media;
                         break;
                     case MEDIUM_DISK:
-                        reloc = (void*)((u32)wavetable->sample + (u32)wave_media->wave1_p);
+                        reloc = (void*)(JA_FPTR_U32(wavetable->sample) + (u32)wave_media->wave1_p);
                         wavetable->sample = (u8*)reloc;
                         wavetable->medium = wave_media->wave1_media;
                         break;
@@ -2103,27 +2104,27 @@ static void __WaveTouch(wtstr* wavetouch_str, u32 ram_addr, WaveMedia* wave_medi
         (void)0; /* label needs a statement */
     }
 #else /* !TARGET_PC */
-    if ((u32)wavetouch_str->wavetable <= OS_BASE_CACHED) {
+    if (JA_FPTR_U32(wavetouch_str->wavetable) <= OS_BASE_CACHED) {
         // wave is not relocated
-        reloc = (void*)((u32)wavetouch_str->wavetable + ram_addr);
+        reloc = (void*)(JA_FPTR_U32(wavetouch_str->wavetable) + ram_addr);
         wavetouch_str->wavetable = (smzwavetable*)reloc;
         wavetable = wavetouch_str->wavetable;
 
         if (wavetable->size != 0 && wavetable->is_relocated != TRUE) {
-            reloc = (void*)((u32)wavetable->loop + ram_addr);
+            reloc = (void*)(JA_FPTR_U32(wavetable->loop) + ram_addr);
             wavetable->loop = (adpcmloop*)reloc;
 
-            reloc = (void*)((u32)wavetable->book + ram_addr);
+            reloc = (void*)(JA_FPTR_U32(wavetable->book) + ram_addr);
             wavetable->book = (adpcmbook*)reloc;
 
             switch (wavetable->medium) {
                 case MEDIUM_RAM:
-                    reloc = (void*)((u32)wavetable->sample + (u32)wave_media->wave0_p);
+                    reloc = (void*)(JA_FPTR_U32(wavetable->sample) + (u32)wave_media->wave0_p);
                     wavetable->sample = (u8*)reloc;
                     wavetable->medium = wave_media->wave0_media;
                     break;
                 case MEDIUM_DISK:
-                    reloc = (void*)((u32)wavetable->sample + (u32)wave_media->wave1_p);
+                    reloc = (void*)(JA_FPTR_U32(wavetable->sample) + (u32)wave_media->wave1_p);
                     wavetable->sample = (u8*)reloc;
                     wavetable->medium = wave_media->wave1_media;
                     break;
@@ -2237,7 +2238,7 @@ s32 Nas_BankOfsToAddr(s32 bank_id, u8* ctrl_p, WaveMedia* wave_media, s32 async)
                 preload->ram_addr = wave_ram_p;
                 preload->encoded_info = (AG.num_requested_samples << 24) | 0x00FFFFFF;
                 preload->is_free = FALSE;
-                preload->end_and_medium_key = (u32)wavetable->sample + wavetable->size + wavetable->medium;
+                preload->end_and_medium_key = JA_FPTR_U32(wavetable->sample) + wavetable->size + wavetable->medium;
                 AG.num_requested_samples++;
                 break;
         }
@@ -2257,6 +2258,11 @@ s32 Nas_BankOfsToAddr(s32 bank_id, u8* ctrl_p, WaveMedia* wave_media, s32 async)
     // @BUG - this function clearly has no return value
     // it must have been declared with a return value because
     // mwcceppc has prevented r3 as a temp where possible
+#ifdef PC_LOW_ADDRESS_64
+    /* callers ignore the result; flowing off the end of a non-void function is undefined behaviour in C++ (GCC
+     * emits ud2 / falls into the next function), and this file is C++ under PC_LOW_ADDRESS_64 */
+    return 0;
+#endif
 }
 
 s32 Nas_CheckBgWave(s32 reset_status) {
@@ -2282,7 +2288,7 @@ s32 Nas_CheckBgWave(s32 reset_status) {
 
         if (!preload->is_free) {
             wavetable = preload->sample;
-            key = (u32)wavetable->sample + wavetable->size + wavetable->medium;
+            key = JA_FPTR_U32(wavetable->sample) + wavetable->size + wavetable->medium;
 
             if (preload->end_and_medium_key == key) {
                 wavetable->sample = preload->ram_addr;
@@ -2306,7 +2312,7 @@ s32 Nas_CheckBgWave(s32 reset_status) {
             wavetable = preload->sample;
             n_chunks = 1;
             n_chunks += (wavetable->size / 0x1000);
-            key = (u32)wavetable->sample + wavetable->size + wavetable->medium;
+            key = JA_FPTR_U32(wavetable->sample) + wavetable->size + wavetable->medium;
             if (preload->end_and_medium_key != key) {
                 preload->is_free = TRUE;
                 AG.num_requested_samples--;
@@ -2453,7 +2459,7 @@ void WaveReload(s32 bank_id, s32 async, WaveMedia* wavemedia) {
                 preload->ram_addr = addr;
                 preload->encoded_info = (AG.num_requested_samples << 24) | 0x00FFFFFF;
                 preload->is_free = FALSE;
-                preload->end_and_medium_key = (u32)wavetable->sample + wavetable->size + wavetable->medium;
+                preload->end_and_medium_key = JA_FPTR_U32(wavetable->sample) + wavetable->size + wavetable->medium;
                 AG.num_requested_samples++;
                 break;
         }

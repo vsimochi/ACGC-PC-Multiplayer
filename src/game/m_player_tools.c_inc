@@ -1,3 +1,5 @@
+#include "pc_split.h"
+
 
 #ifdef TARGET_PC
 static Vtx tol_sponge_1_v[0xA0 / sizeof(Vtx)];
@@ -24,7 +26,7 @@ static u8 tol_sponge_1_main1_tex_txt[] ATTRIBUTE_ALIGN(32) = {
 #endif
 
 // clang-format off
-static const Gfx tol_sponge_1_model[] = {
+PC_SPLIT_STATIC const Gfx tol_sponge_1_model[] = {
     gsSPTexture(0, 0, 0, 0, G_ON),
     gsDPSetRenderMode(G_RM_FOG_SHADE_A, G_RM_AA_ZB_TEX_EDGE2),
     gsDPSetCombineLERP(TEXEL0, 0, SHADE, 0, 0, 0, 0, TEXEL0, PRIMITIVE, 0, COMBINED, 0, 0, 0, 0, COMBINED),

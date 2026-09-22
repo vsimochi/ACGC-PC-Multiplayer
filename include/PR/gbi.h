@@ -31,7 +31,9 @@
 #ifdef TARGET_PC
 #ifndef _GBI_RUNTIME_PTR_HELPERS
 #define _GBI_RUNTIME_PTR_HELPERS
+#ifndef PC_LOW_ADDRESS_64
 _GBI_STATIC_ASSERT(sizeof(void*) == sizeof(unsigned int), "GBI pointer packing requires 32-bit pointers");
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -257,6 +257,10 @@ static int pc_parse_rain_intensity(const char* text) {
     return -1;
 }
 
+#ifdef PC_LOW_ADDRESS_64
+static int g_pc_lowaddr_selftest = 0; /* --lowaddr-selftest: exercise the real allocators without a ROM */
+#endif
+
 int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -289,6 +293,10 @@ int main(int argc, char* argv[]) {
             g_pc_uber_shader_only = 1;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             g_pc_verbose = 1;
+#ifdef PC_LOW_ADDRESS_64
+        } else if (strcmp(argv[i], "--lowaddr-selftest") == 0) {
+            g_pc_lowaddr_selftest = 1;
+#endif
         } else if (strcmp(argv[i], "--profile") == 0) {
             g_pc_profile_enabled = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -352,7 +360,7 @@ int main(int argc, char* argv[]) {
         HMODULE exe = GetModuleHandle(NULL);
         IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)exe;
         IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((char*)exe + dos->e_lfanew);
-        pc_image_base = (unsigned int)(uintptr_t)exe;
+        pc_image_base = PC_PTR32("executable image base", exe);
         pc_image_end = pc_image_base + nt->OptionalHeader.SizeOfImage;
     }
 #else
@@ -379,10 +387,19 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    pc_lowaddr_init(); /* no-op unless built with PC_LOW_ADDRESS_64 */
     SDL_SetMainReady();
     pc_settings_load();
     pc_keybindings_load();
     pc_platform_init();
+#ifdef PC_LOW_ADDRESS_64
+    if (g_pc_lowaddr_selftest) {
+        int failures = pc_lowaddr_selftest();
+        int violations = pc_lowaddr_report();
+        pc_platform_shutdown();
+        return failures + violations;
+    }
+#endif
     pc_disc_init();
     if (!pc_assets_init()) {
         const char* msg =
@@ -390,16 +407,23 @@ int main(int argc, char* argv[]) {
             "Animal Crossing needs the original GameCube ROM to run.\n"
             "Place a disc image (.iso, .gcm, or .ciso) to the \"rom\" subfolder.";
         fprintf(stderr, "[PC] %s\n", msg);
+        pc_lowaddr_report();
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
                                  "Animal Crossing - Missing ROM", msg, g_pc_window);
         pc_platform_shutdown();
         return 1;
     }
 
+    pc_lowaddr_report();
     ac_entry();                         /* sets HotStartEntry = &entry */
     boot_main(argc, (const char**)argv); /* full init → HotStartEntry → game loop */
 
+    /* NOTE: boot_main() never actually returns here on TARGET_PC -- mainproc() (src/main.c) calls
+     * exit(0) directly once graph_proc() returns (the game's only quit path), so the report below is
+     * unreachable in practice. The real final report is emitted from src/main.c right before that
+     * exit(0); kept here too in case a future code path restores a normal return from boot_main(). */
     pc_disc_shutdown();
     pc_platform_shutdown();
+    pc_lowaddr_report();
     return 0;
 }

@@ -1,0 +1,27 @@
+/* Static display-list/vertex/texture data (and asset loader) split out of ac_mailbox.c so that the
+ * PC_LOW_ADDRESS_64 build can compile it as C++ (see src/data/pc_split/ac_mailbox.c). In every other
+ * build this file is #included in place and behaves exactly like the original text. */
+#include "pc_split.h"
+
+static Gfx post_flag_saki_common_DL[] = {
+    gsSPTexture(65535, 65535, 0, 0, G_ON),
+    gsDPSetRenderMode(G_RM_FOG_SHADE_A, G_RM_AA_ZB_TEX_EDGE2),
+    gsDPSetPrimColor(0, 128, 255, 255, 255, 255),
+    gsSPLoadGeometryMode(G_ZBUFFER | G_SHADE | G_FOG | G_SHADING_SMOOTH),
+    gsSPEndDisplayList(),
+};
+
+PC_SPLIT_STATIC Gfx post_flag_saki_model_type0[] = {
+    gsSPDisplayList(post_flag_saki_common_DL),
+    gsDPSetCombineLERP(0, 0, 0, TEXEL0, 0, 0, 0, TEXEL0, PRIMITIVE, 0, COMBINED, 0, 0, 0, 0, COMBINED),
+    gsDPLoadTextureBlock_4b_Dolphin(anime_1_txt, G_IM_FMT_CI, 16, 32, 15, GX_MIRROR, GX_CLAMP, 0, 0),
+    gsDPSetTileSize(0, 0, 0, 124, 124),
+    gsSPEndDisplayList(),
+};
+
+PC_SPLIT_STATIC Gfx post_flag_saki_model_type1[] = {
+    gsSPDisplayList(post_flag_saki_common_DL),
+    gsDPSetCombineLERP(TEXEL0, 0, SHADE, 0, 0, 0, 0, TEXEL0, PRIMITIVE, 0, COMBINED, 0, 0, 0, 0, COMBINED),
+    gsDPLoadTextureBlock_4b_Dolphin(anime_2_txt, G_IM_FMT_CI, 16, 32, 15, GX_MIRROR, GX_CLAMP, 0, 0),
+    gsSPEndDisplayList(),
+};

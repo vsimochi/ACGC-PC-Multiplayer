@@ -520,7 +520,14 @@ static int aNPC_setupActor_proc(GAME_PLAY* play, mActor_name_t name, s8 idx, int
 
 #ifndef aNPC_NPC2
 #ifdef TARGET_PC
+#ifdef PC_LOW_ADDRESS_64
+/* 64-bit: pointers are 8 bytes, so NPC actors are larger. Measured on x64: sizeof(NPC_ACTOR) == 0xBA8 and the
+ * largest NPC-derived class (NPC_SUPER_MASTER/SHOP_MASTER/... _ACTOR) is 0xC28. Slots also lose up to 15 bytes to
+ * the 16-byte alignment of the buffer start, so keep headroom. Slot capacity only; it does not change any actor. */
+#define aNPC_ACTOR_CLASS_SLOT_SIZE 0xD00
+#else
 #define aNPC_ACTOR_CLASS_SLOT_SIZE 0xA50
+#endif
 #else
 #define aNPC_ACTOR_CLASS_SLOT_SIZE 0x9D0
 #endif

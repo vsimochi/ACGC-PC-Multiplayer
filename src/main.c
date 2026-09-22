@@ -98,6 +98,14 @@ extern void mainproc(void* val) {
     OSReport("[PC] mainproc: graph_proc returned\n");
     {
         extern void pc_platform_shutdown(void);
+#ifdef PC_LOW_ADDRESS_64
+        extern int pc_lowaddr_report(void); /* final post-gameplay category/reserved-range summary --
+             * this exit(0) is the game's only real quit path, so pc_main.c's own trailing
+             * pc_lowaddr_report() call (after boot_main() returns) is unreachable code; call it here
+             * instead so the full-session summary (JKR heap, ARAM, emu64, actors, jaudio, ...) is not
+             * silently skipped every normal run. */
+        pc_lowaddr_report();
+#endif
         pc_platform_shutdown();
         exit(0);
     }

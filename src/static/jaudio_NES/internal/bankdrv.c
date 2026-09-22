@@ -142,6 +142,10 @@ Vmap_* Bank_GetPercVmap(Perc_* perc, u8 keyIdx, u8 vel)
 int Bank_GetVoiceMap(Voice_* voice, u16 id)
 {
 	// UNUSED FUNCTION
+#ifdef PC_LOW_ADDRESS_64
+	/* C++ (unlike C) makes flowing off the end of a non-void function undefined behaviour */
+	return 0;
+#endif
 }
 
 /*

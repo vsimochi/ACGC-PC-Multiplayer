@@ -202,7 +202,7 @@ void GXInitTexObj(void* obj, void* image_ptr, u16 width, u16 height, u32 format,
                   u32 wrap_s, u32 wrap_t, u8 mipmap) {
     u32* o = (u32*)obj;
     memset(o, 0, TEXOBJ_SIZE * sizeof(u32));
-    o[TEXOBJ_IMAGE_PTR] = (u32)(uintptr_t)image_ptr;
+    o[TEXOBJ_IMAGE_PTR] = PC_PTR32("GX texobj image", image_ptr);
     o[TEXOBJ_WIDTH] = width;
     o[TEXOBJ_HEIGHT] = height;
     o[TEXOBJ_FORMAT] = format;
@@ -223,7 +223,7 @@ void GXInitTexObjCI(void* obj, void* image_ptr, u16 width, u16 height, u32 forma
 
 void GXInitTexObjData(void* obj, void* image_ptr) {
     u32* o = (u32*)obj;
-    o[TEXOBJ_IMAGE_PTR] = (u32)(uintptr_t)image_ptr;
+    o[TEXOBJ_IMAGE_PTR] = PC_PTR32("GX texobj image", image_ptr);
 }
 
 void GXInitTexObjLOD(void* obj, u32 min_filt, u32 mag_filt, f32 min_lod, f32 max_lod,
@@ -616,7 +616,7 @@ static void pc_gx_load_tex_obj_impl(void* obj, u32 id) {
     if (format == GX_TF_C4 || format == GX_TF_C8) {
         int tlut_name = (int)o[TEXOBJ_TLUT_NAME];
         if (tlut_name >= 0 && tlut_name < 16 && g_gx.tlut[tlut_name].data) {
-            tlut_ptr_key = (u32)(uintptr_t)g_gx.tlut[tlut_name].data;
+            tlut_ptr_key = PC_PTR32("GX TLUT", g_gx.tlut[tlut_name].data);
             tlut_hash_key = tlut_content_hash(g_gx.tlut[tlut_name].data,
                                               g_gx.tlut[tlut_name].format,
                                               g_gx.tlut[tlut_name].n_entries,
@@ -851,7 +851,7 @@ void GXInvalidateTexRegion(void* region) { (void)region; }
 void GXInitTlutObj(void* obj, void* lut, u32 fmt, u16 n_entries) {
     u32* o = (u32*)obj;
     memset(o, 0, 4 * sizeof(u32));
-    o[TLUTOBJ_DATA] = (u32)(uintptr_t)lut;
+    o[TLUTOBJ_DATA] = PC_PTR32("GX TLUT", lut);
     o[TLUTOBJ_FORMAT] = fmt;
     o[TLUTOBJ_N_ENTRIES] = n_entries;
 }

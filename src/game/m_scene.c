@@ -399,7 +399,7 @@ static void Scene_Proc_Player_Ptr(GAME_PLAY* play, Scene_Word_u* scene_data) {
         DEG2SHORT_ANGLE(-45.0f)   /* 0xE000 */
     };
 
-    Actor_data* data = scene_data->actor.data_p;
+    Actor_data* data = mSc_SCENE_PTR_GET(Actor_data, scene_data->actor.data_p);
 
     play->player_data = data;
 
@@ -415,14 +415,14 @@ static void Scene_Proc_Player_Ptr(GAME_PLAY* play, Scene_Word_u* scene_data) {
 }
 
 static void Scene_Proc_Ctrl_Actor_Ptr(GAME_PLAY* play, Scene_Word_u* scene_data) {
-    s16* data = scene_data->control_actor.ctrl_actor_profile_p;
+    s16* data = mSc_SCENE_PTR_GET(s16, scene_data->control_actor.ctrl_actor_profile_p);
 
     play->ctrl_actor_data_num = scene_data->control_actor.num_ctrl_actors;
     play->ctrl_actor_data = data;
 }
 
 static void Scene_Proc_Actor_Ptr(GAME_PLAY* play, Scene_Word_u* scene_data) {
-    Actor_data* data_p = scene_data->actor.data_p;
+    Actor_data* data_p = mSc_SCENE_PTR_GET(Actor_data, scene_data->actor.data_p);
 
     play->actor_data_num = scene_data->actor.num_actors;
     play->actor_data = data_p;
@@ -430,11 +430,11 @@ static void Scene_Proc_Actor_Ptr(GAME_PLAY* play, Scene_Word_u* scene_data) {
 
 static void Scene_Proc_Object_Exchange_Bank_Ptr(GAME_PLAY* play, Scene_Word_u* scene_data) {
     play->obj_bank_data_num = scene_data->object_bank.num_banks;
-    play->obj_bank_data = scene_data->object_bank.banks_p;
+    play->obj_bank_data = mSc_SCENE_PTR_GET(s16, scene_data->object_bank.banks_p);
 }
 
 static void Scene_Proc_Door_Data_Ptr(GAME_PLAY* play, Scene_Word_u* scene_data) {
-    Door_data_c* data_p = scene_data->door_data.door_data_p;
+    Door_data_c* data_p = mSc_SCENE_PTR_GET(Door_data_c, scene_data->door_data.door_data_p);
 
     play->door_info.num_doors = scene_data->door_data.num_doors;
     play->door_info.door_data_p = data_p;

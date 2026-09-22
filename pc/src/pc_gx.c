@@ -2101,7 +2101,7 @@ static void pc_gx_copy_tex_execute_impl(void* dest, GXBool clear) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        pc_gx_efb_capture_store((u32)(uintptr_t)dest, efb_tex);
+        pc_gx_efb_capture_store(PC_PTR32("EFB copy dest", dest), efb_tex);
         glBindTexture(GL_TEXTURE_2D, 0);
         pc_profiler_add_count_texture_bind();
         pc_gx_texture_bind_cache_invalidate();

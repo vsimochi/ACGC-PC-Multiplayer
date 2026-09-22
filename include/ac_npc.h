@@ -342,7 +342,7 @@ struct ac_npc_clip_s {
     /* 0x0F0 */ void* _0F0;
     /* 0x0F4 */ aNPC_DRAW_PROC draw_proc;
     /* 0x0F8 */ aNPC_REBUILD_DMA_PROC rebuild_dma_proc;
-    /* 0x0FC */ void* _0FC[(0x108 - 0x0FC) / sizeof(void*)];
+    /* 0x0FC */ void* _0FC[3]; /* 3 pointers = 12 bytes on GC; sizeof(void*)-derived counts shrink on 64-bit */
     /* 0x108 */ aNPC_SET_REQUEST_ACT_PROC set_request_act_proc;
     /* 0x10C */ aNPC_SET_HEAD_REQUEST_PROC set_head_request_act_proc;
     /* 0x110 */ aNPC_TALK_DEMO_PROC talk_demo_proc;

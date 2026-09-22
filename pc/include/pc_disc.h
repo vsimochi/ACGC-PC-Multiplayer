@@ -4,6 +4,10 @@
 
 #include "types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Initialize disc image reader. Searches for .ciso/.iso/.gcm in
  * current dir, orig/, rom/. Parses GCM filesystem into lookup table.
  * Returns 1 on success, 0 if no disc image found. */
@@ -25,5 +29,9 @@ u8* pc_disc_extract_rel(void); /* handles Yaz0 decompression */
 
 /* Close disc image and free resources. */
 void pc_disc_shutdown(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PC_DISC_H */

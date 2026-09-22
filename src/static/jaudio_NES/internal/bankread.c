@@ -11,6 +11,7 @@ static Bank_* bankp[BANKP_SIZE];
  * Address:	8000BE00
  * Size:	000024
  */
+#ifndef PC_LOW_ADDRESS_64 /* the PC_LOW_ADDRESS_64 build uses the PcLowPtr template in bx.h */
 static void PTconvert(void** pointer, u32 base_address)
 {
 	if (*pointer >= (void*)base_address || *pointer == NULL) {
@@ -18,6 +19,7 @@ static void PTconvert(void** pointer, u32 base_address)
 	}
 	*pointer = *(char**)pointer + base_address;
 }
+#endif
 
 /*
  * --INFO--
@@ -34,7 +36,7 @@ Bank_* Bank_Test(u8* ibnk_address)
 	}
 
 	for (i = 0; i < BANK_TEST_INST_COUNT; ++i) {
-		PTconvert((void**)&startBank->mInstruments[i], base_addr);
+		PTCONVERT(&startBank->mInstruments[i], base_addr);
 
 		Inst_* inst = (Inst_*)startBank->mInstruments[i];
 		if (!inst) {
@@ -43,62 +45,62 @@ Bank_* Bank_Test(u8* ibnk_address)
 
 		// each instrument has two oscillators, effects, and sensors
 		for (j = 0; j < 2; j++) {
-			PTconvert((void**)&inst->mOscillators[j], base_addr);
-			PTconvert((void**)&inst->mEffects[j], base_addr);
-			PTconvert((void**)&inst->mSensors[j], base_addr);
+			PTCONVERT(&inst->mOscillators[j], base_addr);
+			PTCONVERT(&inst->mEffects[j], base_addr);
+			PTCONVERT(&inst->mSensors[j], base_addr);
 
 			if (inst->mOscillators[j]) {
-				PTconvert((void**)&inst->mOscillators[j]->attackVecOffset, base_addr);
-				PTconvert((void**)&inst->mOscillators[j]->releaseVecOffset, base_addr);
+				PTCONVERT(&inst->mOscillators[j]->attackVecOffset, base_addr);
+				PTCONVERT(&inst->mOscillators[j]->releaseVecOffset, base_addr);
 			}
 		}
 
 		// each instrument also has a certain number of key regions
 		for (j = 0; j < inst->mKeyRegionCount; j++) {
-			PTconvert((void**)&inst->mKeyRegions[j], base_addr);
+			PTCONVERT(&inst->mKeyRegions[j], base_addr);
 
 			for (k = 0; k < inst->mKeyRegions[j]->mVelocityCount; k++) {
-				PTconvert((void**)&inst->mKeyRegions[j]->mVelocities[k], base_addr);
+				PTCONVERT(&inst->mKeyRegions[j]->mVelocities[k], base_addr);
 			}
 		}
 	}
 
 	// treat the next block of 100 as voices (for some reason)
 	for (i = 0; i < BANK_TEST_VOICE_COUNT; i++) {
-		PTconvert((void**)&(startBank->mInstruments + BANK_TEST_VOICE_OFFSET)[i], base_addr);
+		PTCONVERT(&(startBank->mInstruments + BANK_TEST_VOICE_OFFSET)[i], base_addr);
 
-		Voice_* voice = (Voice_*)(startBank->mInstruments + BANK_TEST_VOICE_OFFSET)[i];
+		Voice_* voice = (Voice_*)(void*)(startBank->mInstruments + BANK_TEST_VOICE_OFFSET)[i];
 		if (!voice) {
 			continue;
 		}
 
 		for (j = 0; j < voice->size; j++) {
-			PTconvert(&voice->_0C[j], base_addr);
+			PTCONVERT(&voice->_0C[j], base_addr);
 		}
 	}
 
 	// treat the next block of 12 as percussion (for some reason)
 	for (i = 0; i < BANK_TEST_PERC_COUNT; i++) {
-		PTconvert((void**)&(startBank->mInstruments + BANK_TEST_PERC_OFFSET)[i], base_addr);
+		PTCONVERT(&(startBank->mInstruments + BANK_TEST_PERC_OFFSET)[i], base_addr);
 
-		Perc_* perc = (Perc_*)(startBank->mInstruments + BANK_TEST_PERC_OFFSET)[i];
+		Perc_* perc = (Perc_*)(void*)(startBank->mInstruments + BANK_TEST_PERC_OFFSET)[i];
 		if (!perc) {
 			continue;
 		}
 
 		for (j = 0; j < 128; j++) {
-			PTconvert((void**)&perc->mKeyRegions[j], base_addr);
+			PTCONVERT(&perc->mKeyRegions[j], base_addr);
 
 			PercKeymap_* key = perc->mKeyRegions[j];
 			if (!key) {
 				continue;
 			}
 
-			PTconvert(&key->_08, base_addr);
-			PTconvert(&key->_0C, base_addr);
+			PTCONVERT(&key->_08, base_addr);
+			PTCONVERT(&key->_0C, base_addr);
 
 			for (k = 0; k < key->mVelocityCount; k++) {
-				PTconvert((void**)&key->mVelocities[k], base_addr);
+				PTCONVERT(&key->mVelocities[k], base_addr);
 			}
 		}
 	}

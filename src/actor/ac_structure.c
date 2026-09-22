@@ -24,15 +24,34 @@ ACTOR_PROFILE Structure_Profile = { mAc_PROFILE_STRUCTURE,
 
 static u8 aSTR_overlay[aSTR_ACTOR_TBL_COUNT][aSTR_OVERLAY_SIZE];
 #ifdef TARGET_PC
-/* Structure profiles such as TOUDAI_ACTOR are larger than STRUCTURE_ACTOR because of Delta time. 
- * If you are modding, be careful to not make the same mistake. */
-#define aSTR_PC_ACTOR_SLOT_SIZE 0x300
+#include "ac_shrine.h" /* the one structure-actor subclass measured larger than STRUCTURE_ACTOR on x64, see below */
+
+/* Structure profiles such as TOUDAI_ACTOR are larger than STRUCTURE_ACTOR because of Delta time.
+ * If you are modding, be careful to not make the same mistake.
+ *
+ * x64: every structure-actor subclass in the game (all ~45 profiles reachable via aSTR_setupActor_proc's
+ * setupInfo_table, checked exhaustively) was measured against sizeof(STRUCTURE_ACTOR). The union below
+ * already self-sizes to fit a plain STRUCTURE_ACTOR (its `actor` member), which on x64 is 0x340 (832)
+ * bytes -- bigger than the original GameCube-era 0x300 (768) `bytes[]` padding, but that member no longer
+ * drives the union's real size, only its lower bound. The ONE subclass that is still bigger than that is
+ * SHRINE_ACTOR (STRUCTURE_ACTOR + a trailing f32, padded to 8-byte alignment on x64): 0x348 (840) bytes.
+ * Without accounting for it, aSTR_get_actor_area_proc()'s slots are 8 bytes too small for a shrine actor,
+ * which silently overwrites the first bytes of the next slot in aSTR_actor_cl[] (corrupting that
+ * neighbour's ACTOR::part/npc_id) -- this was the confirmed root cause of the __osFree "invalid free"
+ * (0172xxxx) crash. Deriving the slot size from the actual largest known subclass, instead of a fixed
+ * literal, keeps this correct if a subclass changes size again. */
+#define aSTR_PC_ACTOR_SLOT_SIZE ALIGN_NEXT(sizeof(SHRINE_ACTOR), 16)
 
 typedef union {
     u64 align;
     STRUCTURE_ACTOR actor;
     u8 bytes[aSTR_PC_ACTOR_SLOT_SIZE];
 } aSTR_pc_actor_storage_c;
+
+_Static_assert(sizeof(aSTR_pc_actor_storage_c) >= sizeof(SHRINE_ACTOR),
+              "aSTR_pc_actor_storage_c must be able to hold the largest structure-actor subclass");
+_Static_assert(sizeof(aSTR_pc_actor_storage_c) >= sizeof(STRUCTURE_ACTOR),
+              "aSTR_pc_actor_storage_c must be able to hold at least a plain STRUCTURE_ACTOR");
 
 static aSTR_pc_actor_storage_c aSTR_actor_cl[aSTR_ACTOR_TBL_COUNT];
 

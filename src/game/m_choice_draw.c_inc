@@ -58,51 +58,11 @@ static void mChoice_UnSetMatrixDisplay(GAME* game, int type) {
     CLOSE_DISP(graph);
 }
 
-#ifdef TARGET_PC
-static u8 con_waku_swaku3_tex[0x1000] ATTRIBUTE_ALIGN(32);
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/m_choice_split.h"
 #else
-static u8 con_waku_swaku3_tex[] ATTRIBUTE_ALIGN(32) = {
-#include "assets/con_waku_swaku3_tex.inc"
-};
+#include "../src/game/m_choice_gfx.c_inc"
 #endif
-
-#ifdef TARGET_PC
-static Vtx con_sentaku2_v[0x40 / sizeof(Vtx)];
-#else
-static Vtx con_sentaku2_v[] = {
-#include "assets/con_sentaku2_v.inc"
-};
-#endif
-
-static Gfx con_sentaku2_modelT[] = {
-    gsSPTexture(0, 0, 0, 0, G_ON),
-    gsDPSetPrimColor(0, 255, 255, 255, 155, 255),
-    gsDPLoadTextureBlock_4b_Dolphin(con_waku_swaku3_tex, G_IM_FMT_I, 128, 64, 15, GX_MIRROR, GX_MIRROR, 0, 0),
-    gsSPVertex(&con_sentaku2_v[0], 4, 0),
-    gsSPNTrianglesInit_5b(2,       // tri count
-                          0, 1, 2, // tri0
-                          0, 2, 3, // tri1
-                          0, 0, 0  // tri2
-                          ),
-    gsSPEndDisplayList(),
-};
-
-static Gfx mChoice_init_disp[] = {
-    gsDPPipeSync(),
-    gsSPClearGeometryMode(G_ZBUFFER | G_SHADE | G_CULL_BOTH | G_FOG | G_LIGHTING | G_TEXTURE_GEN |
-                          G_TEXTURE_GEN_LINEAR | G_LOD | G_SHADING_SMOOTH),
-    gsDPSetTextureLOD(G_TL_TILE),
-    gsDPSetTextureConvert(G_TC_FILT),
-    gsDPSetTextureFilter(G_TF_BILERP),
-    gsDPSetCycleType(G_CYC_1CYCLE),
-    gsDPSetTexturePersp(G_TP_PERSP),
-    gsDPSetAlphaDither(G_AD_DISABLE),
-    gsDPSetColorDither(G_CD_DISABLE),
-    gsDPSetCombineKey(G_CK_NONE),
-    gsDPSetCombineLERP(0, 0, 0, PRIMITIVE, 0, 0, 0, TEXEL0, 0, 0, 0, PRIMITIVE, 0, 0, 0, TEXEL0),
-    gsDPSetRenderMode(G_RM_XLU_SURF, G_RM_XLU_SURF2),
-    gsSPEndDisplayList(),
-};
 
 static void mChoice_DrawWindowBody(mChoice_c* choice, GAME* game, int type) {
     GRAPH* graph = game->graph;
@@ -150,10 +110,3 @@ static void mChoice_DrawFont(mChoice_c* choice, GAME* game, int type) {
     }
 }
 
-#ifdef TARGET_PC
-extern void pc_load_asset(const char*, void*, unsigned int, unsigned int, int, int);
-void _pc_load_src_game_m_choice_draw_c_inc(void) {
-    pc_load_asset("assets/con_waku_swaku3_tex.bin", con_waku_swaku3_tex, 0x1000, 0x2DF6C0, 0, 0);
-    pc_load_asset("assets/con_sentaku2_v.bin", con_sentaku2_v, 0x40, 0x2E06C0, 0, 2);
-}
-#endif

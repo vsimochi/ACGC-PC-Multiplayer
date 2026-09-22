@@ -996,7 +996,7 @@ jc_* Play_1shot_Perc(jcs_* jcs, SOUNDID_ sound, u32 id)
 	}
 	chan->panMatrices[2].values[0] = 0.0f;
 	chan->panMatrices[3].values[0] = 0.0f;
-	EffecterInit_Perc(chan, (Pmap_*)perc->mKeyRegions[sound.bytes[2]], flag);
+	EffecterInit_Perc(chan, (Pmap_*)(void*)perc->mKeyRegions[sound.bytes[2]], flag);
 	chan->soundId = 0;
 
 	return __Oneshot_Play_Start(jcs, chan, id);

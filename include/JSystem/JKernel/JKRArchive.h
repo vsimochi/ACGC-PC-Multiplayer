@@ -5,6 +5,7 @@
 #include "JSystem/JKernel/JKRFileLoader.h"
 #include "JSystem/JKernel/JKRHeap.h"
 #include "types.h"
+#include "pc_lowptr.h"
 
 #ifdef __cplusplus
 // NOTE: Vtable offsets are off
@@ -111,8 +112,15 @@ class JKRArchive : public JKRFileLoader {
         u32 mFlag;       // _04
         u32 mDataOffset; // _08
         u32 mSize;       // _0C
+#ifdef PC_LOW_ADDRESS_64
+        PcLowPtr<void> mData; // _10 (4 bytes: the on-disc entry stays 0x14 bytes)
+#else
         void* mData;     // _10
+#endif
     };
+#ifdef PC_LOW_ADDRESS_64
+    static_assert(sizeof(SDIFileEntry) == 0x14, "SDIFileEntry is a fixed 0x14-byte on-disc RARC record");
+#endif
 
     struct SDirEntry {
         u8 mFlags;   // _00

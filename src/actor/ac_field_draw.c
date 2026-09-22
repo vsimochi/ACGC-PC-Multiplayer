@@ -304,34 +304,11 @@ static void Bg_Draw_Actor_move(ACTOR* actorx, GAME* game) {
     }
 }
 
-/* Culling box which is aproximately 128:25 (5.12:1) on the xz plane */
-/* NOTE: these vertices are only included because they are not used in any art asset */
-static Vtx aFD_culling_vtx[] ATTRIBUTE_ALIGN(32) = {
-    // clang-format off
-    {     0,    0,     0,  0,  0, 0,  0, 0, 0, 0 },
-    {     0,    0, 10240,  0,  0, 0,  0, 0, 0, 0 },
-    { 10240,    0, 10240,  0,  0, 0,  0, 0, 0, 0 },
-    { 10240,    0,     0,  0,  0, 0,  0, 0, 0, 0 },
-    {     0, 2000,     0,  0,  0, 0,  0, 0, 0, 0 },
-    {     0, 2000, 10240,  0,  0, 0,  0, 0, 0, 0 },
-    { 10240, 2000, 10240,  0,  0, 0,  0, 0, 0, 0 },
-    { 10240, 2000,     0,  0,  0, 0,  0, 0, 0, 0 },
-    // clang-format on
-};
-
-static Gfx aFD_cull_set_gfx[] ATTRIBUTE_ALIGN(32) = {
-    gsSPClearGeometryMode(G_FOG | G_LIGHTING),
-    gsSPVertex(&aFD_culling_vtx[0], 8, 0),
-    gsSPCullDisplayList(0, 7),
-    gsSPSetGeometryMode(G_FOG | G_LIGHTING),
-    gsSPEndDisplayList(),
-};
-
-static Gfx aFD_cull_set_model[] ATTRIBUTE_ALIGN(32) = {
-    gsSPDisplayList(aFD_cull_set_gfx),
-    gsSPDisplayList(SEGMENT_ADDR(G_MWO_SEGMENT_A, 0)), /* Dynamic segment 0x0A */
-    gsSPEndDisplayList(),
-};
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/ac_field_draw_split.h"
+#else
+#include "../src/actor/ac_field_draw_gfx.c_inc"
+#endif
 
 static EVW_ANIME_SCROLL aFD_texture_scroll2_data[2] = { { 1, -1, 32, 32 }, { -1, -2, 32, 32 } };
 

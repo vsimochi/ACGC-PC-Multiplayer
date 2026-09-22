@@ -4,7 +4,9 @@
 
 /* 32-bit required: decomp code (JSystem, emu64) casts pointers to u32 */
 #include <stdint.h>
-#if UINTPTR_MAX != 0xFFFFFFFFu
+/* PC_LOW_ADDRESS_64 (experimental, set by CMake via -DPC_ALLOW_64BIT=ON) builds a 64-bit
+ * process linked so every game pointer stays below 4 GB; see pc_lowaddr.h. */
+#if UINTPTR_MAX != 0xFFFFFFFFu && !defined(PC_LOW_ADDRESS_64)
 #error "This project must be compiled as 32-bit (pointer size != 4 bytes)"
 #endif
 
@@ -21,6 +23,7 @@
 #include <time.h>
 
 #include "pc_types.h"
+#include "pc_lowaddr.h"
 
 /* --- Configuration --- */
 #define PC_GC_WIDTH       640

@@ -1163,6 +1163,10 @@ int Nas_Init_Single(s32 a, s32 b) {
     }
     AG.emem_persistent_wave_heap.num_entries = 0;
     AG.emem_temporary_wave_heap.num_entries = 0;
+#ifdef PC_LOW_ADDRESS_64
+    /* the original has no return value (callers ignore it); flowing off the end is undefined behaviour in C++ */
+    return 0;
+#endif
 }
 
 /*

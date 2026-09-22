@@ -647,7 +647,7 @@ static s32 Nap_SilenceCheck_Inner(s32 flags) {
                         continue;
                     }
 
-                    if (tuned_sample->wavetable->medium == MEDIUM_RAM) {
+                    if (JA_FPTR_GET(smzwavetable, tuned_sample->wavetable)->medium == MEDIUM_RAM) {
                         continue;
                     }
                 }

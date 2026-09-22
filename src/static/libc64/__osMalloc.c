@@ -3,6 +3,9 @@
 #include <dolphin/os.h>
 #include "libultra/libultra.h"
 #include "terminal.h"
+#ifdef TARGET_PC
+#include "pc_lowaddr.h"
+#endif
 
 #define OS_MALLOC_MAGIC (s16)'ss' // magic number for an OSMemBlock
 #define OS_MALLOC_BLOCK_OK(block) ((block) != NULL && (block)->magic == OS_MALLOC_MAGIC) // check if OSMemBlock structure is OK
@@ -89,6 +92,9 @@ extern void __osMallocAddBlock(OSArena* arena, u8* base, s32 size) {
     OSMemBlock* last;
     
     if (base != NULL) {
+#ifdef TARGET_PC
+        PC_LOWADDR_CHECK("game heap (__osMalloc arena)", base, size);
+#endif
         block = (OSMemBlock*)ALIGN_NEXT((u32)base, 32);
         align_size = ALIGN_PREV(size - ((u32)block - (u32)base), 32);
 

@@ -137,14 +137,14 @@ typedef struct smzwavetable_ {
     /* 0x00 */ u32 is_relocated : 1;
     /* 0x00 */ u32 size : 24;
 #endif
-    /* 0x04 */ u8* sample;
-    /* 0x08 */ adpcmloop* loop;
-    /* 0x0C */ adpcmbook* book;
+    /* 0x04 */ JA_FPTR(u8) sample;
+    /* 0x08 */ JA_FPTR(adpcmloop) loop;
+    /* 0x0C */ JA_FPTR(adpcmbook) book;
 } smzwavetable;
 
 /* sizeof(wtstr) == 0x08 */
 typedef struct wtstr_ {
-    /* 0x00 */ smzwavetable* wavetable;
+    /* 0x00 */ JA_FPTR(smzwavetable) wavetable;
     /* 0x04 */ f32 tuning;
 } wtstr;
 
@@ -372,7 +372,7 @@ typedef struct voicetable_ {
     /* 0x01 */ u8 normal_range_low;
     /* 0x02 */ u8 normal_range_high;
     /* 0x03 */ u8 adsr_decay_idx;
-    /* 0x04 */ envdat* envelope;
+    /* 0x04 */ JA_FPTR(envdat) envelope;
     /* 0x08 */ wtstr low_pitch_tuned_sample;
     /* 0x10 */ wtstr normal_pitch_tuned_sample;
     /* 0x18 */ wtstr high_pitch_tuned_sample;
@@ -384,13 +384,42 @@ typedef struct perctable_ {
     /* 0x01 */ u8 pan;
     /* 0x02 */ u8 is_relocated;
     /* 0x04 */ wtstr tuned_sample;
-    /* 0x0C */ envdat* envelope;
+    /* 0x0C */ JA_FPTR(envdat) envelope;
 } perctable;
 
 /* sizeof(percvoicetable) == 0x08 */
 typedef struct percvoicetable_ {
     /* 0x00 */ wtstr tuned_sample;
 } percvoicetable;
+
+/* ---- bank-table file format (voice/percussion/sfx tables inside a bank control block): the layout must be the
+ * GameCube one on every build. Their 32-bit offset fields are JA_FPTR (4 bytes), see jaudio_NES/ja_fileptr.h. ---- */
+JA_LAYOUT_SIZE(adpcmloop, 0x30); /* 0x10 without predictor_state (count == 0), 0x30 with it; no pointers */
+JA_LAYOUT_OFF(adpcmloop, predictor_state, 0x10);
+JA_LAYOUT_SIZE(adpcmbook, 0x08);
+JA_LAYOUT_OFF(adpcmbook, codebook, 0x08);
+JA_LAYOUT_SIZE(envdat, 0x04);
+JA_LAYOUT_OFF(envdat, value, 0x02);
+JA_LAYOUT_SIZE(smzwavetable, 0x10);
+JA_LAYOUT_OFF(smzwavetable, sample, 0x04);
+JA_LAYOUT_OFF(smzwavetable, loop, 0x08);
+JA_LAYOUT_OFF(smzwavetable, book, 0x0C);
+JA_LAYOUT_SIZE(wtstr, 0x08);
+JA_LAYOUT_OFF(wtstr, wavetable, 0x00);
+JA_LAYOUT_OFF(wtstr, tuning, 0x04);
+JA_LAYOUT_SIZE(voicetable, 0x20);
+JA_LAYOUT_OFF(voicetable, normal_range_high, 0x02);
+JA_LAYOUT_OFF(voicetable, adsr_decay_idx, 0x03);
+JA_LAYOUT_OFF(voicetable, envelope, 0x04);
+JA_LAYOUT_OFF(voicetable, low_pitch_tuned_sample, 0x08);
+JA_LAYOUT_OFF(voicetable, normal_pitch_tuned_sample, 0x10);
+JA_LAYOUT_OFF(voicetable, high_pitch_tuned_sample, 0x18);
+JA_LAYOUT_SIZE(perctable, 0x10);
+JA_LAYOUT_OFF(perctable, is_relocated, 0x02);
+JA_LAYOUT_OFF(perctable, tuned_sample, 0x04);
+JA_LAYOUT_OFF(perctable, envelope, 0x0C);
+JA_LAYOUT_SIZE(percvoicetable, 0x08);
+JA_LAYOUT_OFF(percvoicetable, tuned_sample, 0x00);
 
 /* sizeof(voiceinfo) == 0x14 */
 typedef struct voiceinfo_ {
@@ -399,8 +428,8 @@ typedef struct voiceinfo_ {
     /* 0x02 */ u8 wave_bank_id0;
     /* 0x03 */ u8 wave_bank_id1;
     /* 0x04 */ u16 num_sfx;
-    /* 0x08 */ voicetable** instruments;
-    /* 0x0C */ perctable** percussion;
+    /* 0x08 */ JA_FPTR(voicetable)* instruments; /* points at an array of 4-byte file slots (bank ctrl block + 8) */
+    /* 0x0C */ JA_FPTR(perctable)* percussion;    /* points at an array of 4-byte file slots */
     /* 0x10 */ percvoicetable* effects;
 } voiceinfo;
 

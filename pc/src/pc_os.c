@@ -240,6 +240,7 @@ void OSInit(void) {
             exit(1);
         }
         memset(arena_memory, 0, PC_MAIN_MEMORY_SIZE);
+        PC_LOWADDR_CHECK("OS arena (24 MB)", arena_memory, PC_MAIN_MEMORY_SIZE);
 
         /* GC system info at phys addr 0; offset 0x28 = mem size for JKRHeap */
         *(u32*)(arena_memory + 0x28) = PC_MAIN_MEMORY_SIZE;
@@ -443,7 +444,11 @@ void* OSInitAlloc(void* arenaStart, void* arenaEnd, int maxHeaps) {
     return (void*)newStart;
 }
 
-void* OSAllocFromHeap(int heap, u32 size) { return malloc(size); }
+void* OSAllocFromHeap(int heap, u32 size) {
+    void* p = malloc(size);
+    PC_LOWADDR_CHECK("OSAllocFromHeap (malloc)", p, size);
+    return p;
+}
 void OSFreeToHeap(int heap, void* ptr) { free(ptr); }
 int OSCreateHeap(void* lo, void* hi) { return 0; }
 int OSSetCurrentHeap(int heap) { return 0; }

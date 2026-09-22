@@ -2,6 +2,7 @@
 #define _JAUDIO_HEAPCTRL_H
 
 #include "types.h"
+#include "jaudio_NES/ja_fileptr.h"
 
 typedef struct jaheap_ jaheap_;
 typedef struct jaheap_ jaheap;
@@ -14,13 +15,22 @@ struct jaheap_ {
 	u32 startAddress;          // _08
 	u32 usedSize;              // _0C
 	u32 size;                  // _10
-	jaheap_* firstChild;       // _14
-	jaheap_* parent;           // _18
-	jaheap_* nextSibling;      // _1C
-	jaheap_* groupOwner;       // _20
-	jaheap_* firstGroupedHeap; // _24
-	jaheap_* nextGroupedHeap;  // _28
+	JA_FPTR(jaheap_) firstChild;       // _14
+	JA_FPTR(jaheap_) parent;           // _18
+	JA_FPTR(jaheap_) nextSibling;      // _1C
+	JA_FPTR(jaheap_) groupOwner;       // _20
+	JA_FPTR(jaheap_) firstGroupedHeap; // _24
+	JA_FPTR(jaheap_) nextGroupedHeap;  // _28
 };
+
+/* jaheap_ is embedded in file images (WaveID_ / WaveArchive_): its size and offsets are part of the format */
+JA_LAYOUT_SIZE(jaheap_, 0x2C);
+JA_LAYOUT_OFF(jaheap_, firstChild, 0x14);
+JA_LAYOUT_OFF(jaheap_, parent, 0x18);
+JA_LAYOUT_OFF(jaheap_, nextSibling, 0x1C);
+JA_LAYOUT_OFF(jaheap_, groupOwner, 0x20);
+JA_LAYOUT_OFF(jaheap_, firstGroupedHeap, 0x24);
+JA_LAYOUT_OFF(jaheap_, nextGroupedHeap, 0x28);
 
 #ifdef __cplusplus
 extern "C" {

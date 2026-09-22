@@ -1,5 +1,8 @@
 #include "JSystem/JUtility/JUTAssertion.h"
 #include "JSystem/JKernel/JKRHeap.h"
+#ifdef TARGET_PC
+#include "pc_lowaddr.h"
+#endif
 #include "dolphin/os.h"
 #include "dolphin/os/OSArena.h"
 #include "dolphin/os/OSAlloc.h"
@@ -25,6 +28,9 @@ JKRHeap::JKRHeap(void* data, u32 size, JKRHeap* heap, bool errorFlag)
     mSize = size;
     mStart = (u8*)data;
     mEnd = ((u8*)data + size);
+#ifdef TARGET_PC
+    PC_LOWADDR_CHECK("JKR heap", data, size);
+#endif
     if (heap == nullptr) {
         becomeSystemHeap();
         becomeCurrentHeap();
@@ -69,6 +75,9 @@ bool JKRHeap::initArena(char** outUserRamStart, u32* outUserRamSize, int numHeap
     mMemorySize = *(u32*)((start + 0x28));
     OSSetArenaLo(arenaHi);
     OSSetArenaHi(arenaHi);
+#ifdef TARGET_PC
+    PC_LOWADDR_CHECK("JKR arena (initArena)", arenaLo, (u8*)arenaHi - (u8*)arenaLo);
+#endif
     *outUserRamStart = (char*)arenaLo;
     *outUserRamSize = (u32)arenaHi - (u32)arenaLo;
     return true;

@@ -4,6 +4,8 @@
 #include "JSystem/JKernel/JKRHeap.h"
 #include "types.h"
 
+#include "pc_lowptr.h" /* PcLowPtr: keeps CMemBlock a 0x10-byte header on x64 (PC_LOW_ADDRESS_64) */
+
 #ifdef __cplusplus
 class JKRExpHeap : public JKRHeap {
   public:
@@ -43,16 +45,24 @@ class JKRExpHeap : public JKRHeap {
             return mGroupID;
         }
         static CMemBlock* getBlock(void* data) {
-            return (CMemBlock*)((u32)data + -0x10);
+            return (CMemBlock*)((u8*)data - 0x10);
         }
 
         u16 mUsageHeader;    // _00
         u8 mFlags;           // _02, a|bbbbbbb = a=temp, b=aln
         u8 mGroupID;         // _03
         int mAllocatedSpace; // _04
+#ifdef PC_LOW_ADDRESS_64
+        PcLowPtr<CMemBlock> mPrev; // _08
+        PcLowPtr<CMemBlock> mNext; // _0C
+#else
         CMemBlock* mPrev;    // _08
         CMemBlock* mNext;    // _0C
+#endif
     };
+#ifdef PC_LOW_ADDRESS_64
+    static_assert(sizeof(CMemBlock) == 0x10, "JKRExpHeap::CMemBlock must stay 0x10 bytes (getBlock() and the allocator assume it)");
+#endif
 
     JKRExpHeap(void*, u32, JKRHeap*, bool);
 

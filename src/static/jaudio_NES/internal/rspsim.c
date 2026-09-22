@@ -10,6 +10,20 @@ static u32 ADPCM_BOOKBUF_SIZE = 0;
 static s16 ADPCM_BOOKBUF[8][16] ATTRIBUTE_ALIGN(32);
 static s16 FINALR_STATE_BUF[16] ATTRIBUTE_ALIGN(32);
 
+/* RspStart() processes one RSP command buffer per call, but these represent the RSP's own persistent
+ * DMA-window/register state (which command buffer of a streaming sample it's currently reading, and
+ * where the ADPCM history for the *next* call should come from). On real hardware this state lives in
+ * the RSP's registers/DMEM and survives between separate microcode task dispatches, so a command buffer
+ * is allowed to issue A_SETBUFF/A_ADPCM without its own A_CMD_LOADCACHE and rely on a LOADCACHE from an
+ * earlier call still being in effect. They must therefore persist across calls exactly like DMEM,
+ * ADPCM_BOOKBUF and FINALR_STATE_BUF above, not be re-initialized on every call. */
+static u16 DMEMCount = 0;
+static u16 DMEMIn = 0;
+static u16 DMEMOut = 0;
+static void* loop_point = nullptr;
+static u16 sp12C = 0;
+static u8* sp128 = nullptr;
+
 static s16 RES_FILTER[64][4] ATTRIBUTE_ALIGN(32) = {
     0x0C39, 0x66AD, 0x0D46, 0xFFDF, 0x0B39, 0x6696, 0x0E5F, 0xFFD8, 0x0A44, 0x6669, 0x0F83, 0xFFD0, 0x095A, 0x6626,
     0x10B4, 0xFFC8, 0x087D, 0x65CD, 0x11F0, 0xFFBF, 0x07AB, 0x655E, 0x1338, 0xFFB6, 0x06E4, 0x64D9, 0x148C, 0xFFAC,
@@ -66,24 +80,20 @@ extern s32 RspStart(u32* pTaskCmds, s32 allTasks) {
     s32 i; // r30
     u32 cmdLo; // r29
     u32 cmdHi;
-    u16 DMEMCount; // r28
-    u16 DMEMIn; // r27
-    u16 DMEMOut; // r26
     s32 temp0;
     u32 temp1;
     u32 temp2;
-    void* loop_point; // r1+0x134
     s16 envParam1_1;
     s16 envParam1_2;
     s16 envParam1_3;
     u16 envParam1_0;
     u16 envParam2_0;
     u16 envParam2_1;
-    u16 sp12C;
-    u8* sp128;
     s16 sp9C[16];
     s32 sp7C[8];
     s32 sp5C[8];
+    /* DMEMCount, DMEMIn, DMEMOut, loop_point, sp12C, sp128: persistent RSP/DMA-window state, declared
+     * static at file scope above -- must not be re-declared/reset here (see the comment there). */
 
     if (init) {
         init = FALSE;

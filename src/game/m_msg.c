@@ -41,7 +41,11 @@ static void mMsg_sound_MessageStatus(u8 status);
 #include "../src/game/m_msg_wait.c_inc"
 #include "../src/game/m_msg_disappear_wait.c_inc"
 
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/m_msg_split.h"
+#else
 #include "../src/game/m_msg_data.c_inc"
+#endif
 #include "../src/game/m_msg_draw_window.c_inc"
 #include "../src/game/m_msg_draw_font.c_inc"
 

@@ -1,5 +1,8 @@
 #include "libforest/emu64/emu64.hpp"
 #include "libforest/emu64.h"
+#ifdef TARGET_PC
+#include "pc_lowaddr.h"
+#endif
 
 // #include "MSL_C/w_math.h"
 #include "libultra/libultra.h"
@@ -623,6 +626,11 @@ static void emu64_init2(GXRenderModeObj* render_mode) {
 
 void emu64::emu64_init() {
     bzero(this, sizeof(emu64));
+#ifdef TARGET_PC
+    PC_LOWADDR_CHECK("emu64 instance", this, sizeof(emu64));
+    PC_LOWADDR_CHECK("emu64 texture cache (.data)", texture_buffer_data, sizeof(texture_buffer_data));
+    PC_LOWADDR_CHECK("emu64 texture cache (.bss)", texture_buffer_bss, sizeof(texture_buffer_bss));
+#endif
     GXSetCurrentGXThread();
     emu64_init2(&GXNtsc480IntDf);
     GXSetAlphaUpdate(GX_FALSE);

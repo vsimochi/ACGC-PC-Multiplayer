@@ -1,4 +1,7 @@
 #include "m_actor.h"
+#ifdef TARGET_PC
+#include "pc_lowaddr.h"
+#endif
 
 #include "m_play.h"
 #include "m_player_lib.h"
@@ -628,6 +631,9 @@ extern void Actor_get_overlay_area(ACTOR_DLFTBL* dlftbl, int unused, size_t allo
     } else {
         dlftbl->alloc_buf = (u8*)zelda_malloc(alloc_size);
     }
+#ifdef TARGET_PC
+    PC_LOWADDR_ASSERT("actor overlay buffer", dlftbl->alloc_buf);
+#endif
 }
 
 static int Actor_data_bank_regist_check_npc(int* bank_id, ACTOR_PROFILE* profile, ACTOR_DLFTBL* dlftbl, GAME_PLAY* play,
@@ -686,6 +692,9 @@ static int Actor_malloc_actor_class(ACTOR** actor_pp, ACTOR_PROFILE* profile, AC
         }
     }
 
+#ifdef TARGET_PC
+    PC_LOWADDR_ASSERT("actor allocation", *actor_pp);
+#endif
     if (*actor_pp == NULL) {
         actor_free_check(dlftbl, id);
         return FALSE;

@@ -120,28 +120,11 @@ static void aMBX_actor_dt(ACTOR* actorx, GAME* game) {
 
 #include "../src/actor/ac_mailbox_move.c_inc"
 
-static Gfx post_flag_saki_common_DL[] = {
-    gsSPTexture(65535, 65535, 0, 0, G_ON),
-    gsDPSetRenderMode(G_RM_FOG_SHADE_A, G_RM_AA_ZB_TEX_EDGE2),
-    gsDPSetPrimColor(0, 128, 255, 255, 255, 255),
-    gsSPLoadGeometryMode(G_ZBUFFER | G_SHADE | G_FOG | G_SHADING_SMOOTH),
-    gsSPEndDisplayList(),
-};
-
-static Gfx post_flag_saki_model_type0[] = {
-    gsSPDisplayList(post_flag_saki_common_DL),
-    gsDPSetCombineLERP(0, 0, 0, TEXEL0, 0, 0, 0, TEXEL0, PRIMITIVE, 0, COMBINED, 0, 0, 0, 0, COMBINED),
-    gsDPLoadTextureBlock_4b_Dolphin(anime_1_txt, G_IM_FMT_CI, 16, 32, 15, GX_MIRROR, GX_CLAMP, 0, 0),
-    gsDPSetTileSize(0, 0, 0, 124, 124),
-    gsSPEndDisplayList(),
-};
-
-static Gfx post_flag_saki_model_type1[] = {
-    gsSPDisplayList(post_flag_saki_common_DL),
-    gsDPSetCombineLERP(TEXEL0, 0, SHADE, 0, 0, 0, 0, TEXEL0, PRIMITIVE, 0, COMBINED, 0, 0, 0, 0, COMBINED),
-    gsDPLoadTextureBlock_4b_Dolphin(anime_2_txt, G_IM_FMT_CI, 16, 32, 15, GX_MIRROR, GX_CLAMP, 0, 0),
-    gsSPEndDisplayList(),
-};
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/ac_mailbox_split.h"
+#else
+#include "../src/actor/ac_mailbox_gfx.c_inc"
+#endif
 
 static int aMBX_actor_draw_before(GAME* game, cKF_SkeletonInfo_R_c* keyframe, int joint_idx, Gfx** joint_shape,
                                   u8* joint_flags, void* arg, s_xyz* joint_rot, xyz_t* joint_pos) {

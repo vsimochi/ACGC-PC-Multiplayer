@@ -357,8 +357,11 @@ static int Player_actor_request_main_demo_geton_boat_wait_all(GAME* game, int pr
 static int Player_actor_request_main_demo_getoff_boat_all(GAME* game, const xyz_t* pos_p, s16 angle_y, int prio);
 
 /* Tool Models */
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/m_player_tools_split.h"
+#else
 #include "../src/game/m_player_tools.c_inc"
-
+#endif
 /* Common */
 #include "../src/game/m_player_controller.c_inc"
 #include "../src/game/m_player_vibration.c_inc"

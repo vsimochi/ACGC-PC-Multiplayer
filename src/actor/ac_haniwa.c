@@ -84,10 +84,14 @@ static void aHNW_actor_dt(ACTOR* actor, GAME* game) {
 #include "../src/actor/ac_haniwa_move.c_inc"
 
 static void aHNW_actor_draw(ACTOR* actor, GAME* game) {
+#ifdef PC_LOW_ADDRESS_64
+    extern Gfx hnw_tex_model[]; /* defined in src/data/pc_split/ac_haniwa.c (static GBI pointer, compiled as C++) */
+#else
     static Gfx hnw_tex_model[] = {
         gsDPLoadTLUT_Dolphin(15, 16, 1, hnw_face),
         gsSPEndDisplayList(),
     };
+#endif
 
     HANIWA_ACTOR* haniwa = (HANIWA_ACTOR*)actor;
     cKF_SkeletonInfo_R_c* keyframe = &haniwa->common_actor_class.anime.keyframe;

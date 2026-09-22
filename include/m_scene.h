@@ -6,6 +6,7 @@
 #include "m_lib.h"
 #include "famicom_emu.h"
 #include "m_scene_table.h"
+#include "jaudio_NES/ja_fileptr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -109,28 +110,35 @@ enum {
     mSc_SCENE_DATA_TYPE_NUM
 };
 
+/* Scene words are 8-byte records (0x00 type, 0x01 count, 0x04 32-bit pointer to the table's data). The pointer field is
+ * part of the record layout, so it must stay 4 bytes and at +0x04 on a 64-bit build: mSc_SCENE_PTR(T) is T* everywhere
+ * except PC_LOW_ADDRESS_64, where it is a 4-byte slot (PcLowPtr<T> in C++, an opaque 4-byte slot in C - C code reads it
+ * with mSc_SCENE_PTR_GET). The mSc_DATA_* macros below fill the record through Scene_Word_Data_Misc_c::param3 (u32). */
+#define mSc_SCENE_PTR(T) JA_FPTR(T)
+#define mSc_SCENE_PTR_GET(T, slot) JA_FPTR_GET(T, slot)
+
 typedef struct {
     /* 0x00 */ u8 type;
     /* 0x01 */ u8 num_actors;
-    /* 0x04 */ Actor_data* data_p;
+    /* 0x04 */ mSc_SCENE_PTR(Actor_data) data_p;
 } Scene_Word_Data_Actor_c;
 
 typedef struct {
     /* 0x00 */ u8 type;
     /* 0x01 */ u8 num_ctrl_actors;
-    /* 0x04 */ s16* ctrl_actor_profile_p;
+    /* 0x04 */ mSc_SCENE_PTR(s16) ctrl_actor_profile_p;
 } Scene_Word_Data_Ctrl_Actor_c;
 
 typedef struct {
     /* 0x00 */ u8 type;
     /* 0x01 */ u8 num_banks;
-    /* 0x04 */ s16* banks_p;
+    /* 0x04 */ mSc_SCENE_PTR(s16) banks_p;
 } Scene_Word_Data_Object_Bank_c;
 
 typedef struct {
     /* 0x00 */ u8 type;
     /* 0x01 */ u8 num_doors;
-    /* 0x04 */ Door_data_c* door_data_p;
+    /* 0x04 */ mSc_SCENE_PTR(Door_data_c) door_data_p;
 } Scene_Word_Data_Door_Data_c;
 
 typedef struct {
@@ -164,6 +172,24 @@ typedef union scene_word_u {
     Scene_Word_Data_FieldCt_c field_ct;
     Scene_Word_Data_ArrangeFurniture_ct_c arrange_ftr_ct;
 } Scene_Word_u;
+
+/* GameCube layout: every scene word is 8 bytes and the pointer/data field is at +0x04 (checked in PC_LOW_ADDRESS_64) */
+JA_LAYOUT_SIZE(Scene_Word_Data_Misc_c, 0x8);
+JA_LAYOUT_OFF(Scene_Word_Data_Misc_c, param3, 0x4);
+JA_LAYOUT_SIZE(Scene_Word_Data_Actor_c, 0x8);
+JA_LAYOUT_OFF(Scene_Word_Data_Actor_c, data_p, 0x4);
+JA_LAYOUT_SIZE(Scene_Word_Data_Ctrl_Actor_c, 0x8);
+JA_LAYOUT_OFF(Scene_Word_Data_Ctrl_Actor_c, ctrl_actor_profile_p, 0x4);
+JA_LAYOUT_SIZE(Scene_Word_Data_Object_Bank_c, 0x8);
+JA_LAYOUT_OFF(Scene_Word_Data_Object_Bank_c, banks_p, 0x4);
+JA_LAYOUT_SIZE(Scene_Word_Data_Door_Data_c, 0x8);
+JA_LAYOUT_OFF(Scene_Word_Data_Door_Data_c, door_data_p, 0x4);
+JA_LAYOUT_SIZE(Scene_Word_Data_FieldCt_c, 0x8);
+JA_LAYOUT_OFF(Scene_Word_Data_FieldCt_c, bg_disp_size, 0x4);
+JA_LAYOUT_OFF(Scene_Word_Data_FieldCt_c, room_type, 0x6);
+JA_LAYOUT_OFF(Scene_Word_Data_FieldCt_c, draw_type, 0x7);
+JA_LAYOUT_SIZE(Scene_Word_Data_ArrangeFurniture_ct_c, 0x2);
+JA_LAYOUT_SIZE(Scene_Word_u, 0x8);
 
 #define mSc_DATA_PLAYER(actor_data_p)                               \
     {                                                               \
