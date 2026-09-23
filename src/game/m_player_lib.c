@@ -1297,6 +1297,46 @@ extern void mPlib_change_player_face(GAME* game) {
     mPlib_change_player_face_pallet(game);
 }
 
+/* PC multiplayer (Stage 4C-1): explicit-parameter counterpart to mPlib_change_player_face() +
+ * mPlib_Get_UseFacePalletRom_p(), for building a face texture/palette pair for a player OTHER
+ * than Now_Private (a remote multiplayer peer) without touching Now_Private, gamePT, or any
+ * Object_Exchange_c bank. This is a byte-for-byte transcription of those two functions' existing
+ * logic -- see mPlib_Get_UseFaceTexRom_p()/mPlib_Get_UseFacePalletRom_p() above -- parameterized on
+ * explicit (sex, face_type, sunburn_rank, swell, decoy) instead of reading
+ * Now_Private->gender/face/sunburn.rank and Common_Get(player_bee_swell_flag)/
+ * Common_Get(player_decoy_flag). swell/decoy are exposed only for parameter parity with the
+ * functions this mirrors; ordinary remote appearance sync passes FALSE/FALSE for both (bee-sting
+ * swelling and NPC-decoy disguise are per-frame transient local states, not yet synchronized).
+ * Writes exactly 0xE00 bytes to face_tex_p and mNW_PALETTE_SIZE bytes to face_pallet_p; both must
+ * be caller-owned, non-NULL buffers of at least that size -- no-op if either is NULL. */
+extern void mPlib_Load_FaceTexAndPallet(void* face_tex_p, void* face_pallet_p, int sex, int face_type,
+                                        int sunburn_rank, int swell, int decoy) {
+    u32 tex_rom_p;
+    u32 pallet_rom_p;
+
+    if (face_tex_p == NULL || face_pallet_p == NULL) {
+        return;
+    }
+
+    tex_rom_p = mPlib_Get_UseFaceTexRom_p_common(sex, face_type, swell, decoy);
+    _JW_GetResourceAram(tex_rom_p, (u8*)face_tex_p, 0xE00);
+    DCStoreRangeNoSync(face_tex_p, 0xE00);
+
+    if (sunburn_rank > 0 && decoy == FALSE) {
+        u32 idx = mPlib_Get_UseFaceRom_index(sex, face_type, swell, FALSE, mPlayer_USE_FACE_ROM_TYPE_PAL);
+        u32 base = mPlib_Get_UseFaceTexRom_p_common(mPr_SEX_FEMALE, mPr_FACE_TYPE7, TRUE, TRUE);
+        pallet_rom_p = base + 0xE00 + (sunburn_rank + idx) * 0x20;
+    } else {
+        pallet_rom_p = tex_rom_p + 0xE00;
+    }
+
+    _JW_GetResourceAram(pallet_rom_p, (u8*)face_pallet_p, mNW_PALETTE_SIZE);
+#ifdef TARGET_PC
+    mPlib_ByteSwapPlayerPalette((u16*)face_pallet_p);
+#endif
+    DCStoreRangeNoSync(face_pallet_p, mNW_PALETTE_SIZE);
+}
+
 extern PLAYER_ACTOR* get_player_actor_withoutCheck(GAME_PLAY* play) {
     return (PLAYER_ACTOR*)&play->actor_info.list[ACTOR_PART_PLAYER].actor[0];
 }

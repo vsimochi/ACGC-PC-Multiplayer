@@ -45,6 +45,8 @@ extern void mPlib_DMA_player_Part_Table(s8* part_table_p, int idx);
 extern void mPlib_change_player_cloth_info(mPr_cloth_c* cloth_p, mActor_name_t item);
 extern void mPlib_change_player_cloth_info_lv2(Private_c* priv, mActor_name_t item);
 extern void mPlib_Load_PlayerTexAndPallet(void* tex_p, void* pal_p, int idx);
+extern void mPlib_Load_FaceTexAndPallet(void* face_tex_p, void* face_pallet_p, int sex, int face_type,
+                                        int sunburn_rank, int swell, int decoy);
 extern mPlayer_change_data_from_submenu_c* mPlib_Get_change_data_from_submenu_p(void);
 extern void mPlib_Clear_change_data_from_submenu(void);
 extern void mPlib_request_main_give_from_submenu(mActor_name_t item, int after_mode, int present_flag,

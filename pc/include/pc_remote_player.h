@@ -59,6 +59,30 @@ void pc_remote_player_on_disconnect(PCNetPlayerId player_id);
  * internally; see pc_remote_player.c. Safe to call for an out-of-range player_id (no-op). */
 void pc_remote_player_on_move(PCNetPlayerId player_id, const PCNetMoveSample* sample);
 
+/* Stage 4C-1: called by pc_net_game.c once a peer's appearance data arrives (see
+ * PC_NETGAME_MSG_APPEARANCE, pc_net_game.c) -- currently sent exactly once, alongside
+ * READY/identity. Safe to call before or after on_ready()/on_move(): appearance, identity, and
+ * movement are each tracked independently per slot, and this may arrive in any order relative to
+ * the others (e.g. a relayed client's appearance can arrive before this process ever directly
+ * handshakes with them). Resolves the remote player's own render-ready texture/palette buffers
+ * immediately (skeleton selection, face, and clothing -- see pc_remote_player.c) -- never touches
+ * Now_Private, gamePT, or any Object_Exchange_c bank. Calling this again for an already-known
+ * player_id is safe (Stage 4C-2 will use this same entry point for live appearance changes; Stage
+ * 4C-1 only ever calls it once, at READY). Safe to call for an out-of-range player_id (no-op). */
+void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAppearance* appearance);
+
+/* Stage 4C-1 (backfill/resend fix): reads back this player's last-known appearance, exactly as
+ * captured by the most recent pc_remote_player_on_appearance() call for it -- the same canonical
+ * per-slot storage pc_remote_player.c already keeps, not a second cache. Used by pc_net_game.c to
+ * resend a peer's already-known appearance to a newly-READY peer (backfill) and, periodically, to
+ * every READY peer (loss mitigation) -- see pc_net_game.c's pcnetgame_handle_host_data() and
+ * pc_net_game_poll(). Returns 1 and fills *out if the slot exists and holds a valid appearance
+ * (i.e. pc_remote_player_on_appearance() has been called for it since its last disconnect), 0
+ * otherwise (out is left untouched on failure). Never returns a pointer into internal storage and
+ * never modifies the stored appearance -- purely a read. Safe to call for an out-of-range or
+ * never-seen player_id (returns 0). */
+int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearance* out);
+
 /* Call once per frame, unconditionally, regardless of game/menu/networking state (see
  * pc/src/pc_vi.c, right after pc_net_game_poll()). Retries any actor creation that was deferred
  * because the game/actor system wasn't in a valid state yet. Never blocks, never allocates

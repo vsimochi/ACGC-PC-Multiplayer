@@ -30,6 +30,11 @@
                             * (transitively, via m_actor.h -> game.h) gamePT/GAME/
                             * graph_dt_period_elapsed()/graph_dt_frame_time(). Read-only: this
                             * file only ever *samples* the local player, never writes to it. */
+#include "m_name_table.h"  /* Stage 4C-1: RSV_CLOTH, CLOTH_NUM -- see pcnetgame_build_appearance_msg() */
+#include "m_needlework.h"  /* Stage 4C-1: mNW_original_design_c -- see pcnetgame_build_appearance_msg().
+                            * Read-only here too: only ever copies out of Now_Private->my_org[],
+                            * never writes to it (mPr_ORIGINAL_DESIGN_IDX_VALID comes from the
+                            * already-included m_private.h). */
 #include "pc_lowaddr.h"    /* PC_LOWADDR_LIMIT -- see pcnetgame_is_real_player_actor() */
 
 #include <stdio.h>
@@ -47,6 +52,10 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_REJECT       = 3, /* host -> client, sent instead of ACK if rejected */
     PC_NETGAME_MSG_MOVE         = 4, /* Stage 3: client -> host (own movement), host -> client
                                        * (its own movement, or a relay of another client's) */
+    PC_NETGAME_MSG_APPEARANCE   = 5, /* Stage 4C-1: client -> host (own appearance, sent once
+                                       * alongside IDENTITY), host -> client (its own appearance,
+                                       * sent once alongside IDENTITY_ACK, or a relay of another
+                                       * client's) -- see pcnetgame_build_appearance_msg() */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -119,6 +128,36 @@ typedef struct PCNetMoveMsg {
 } PCNetMoveMsg;
 _Static_assert(sizeof(PCNetMoveMsg) == 28, "PCNetMoveMsg wire size drifted");
 
+/* Stage 4C-1: a player's visible appearance -- sent once, reliably, alongside IDENTITY/
+ * IDENTITY_ACK (never as part of the 20Hz movement stream: this is much larger than a movement
+ * sample and changes far less often -- see the Stage 4C investigation's explicit guidance against
+ * enlarging PCNetMoveMsg). net_player_id follows PCNetMoveMsg's exact convention: ignored on a
+ * client's send to the host (the host uses its own transport-verified peer id, matching
+ * pcnetgame_handle_host_move()'s precedent), meaningful on every host -> client send
+ * (PC_NETGAME_HOST_PLAYER_ID for the host's own appearance, or the true originating client's peer
+ * id for a relay).
+ *
+ * `design` is the decomp's own mNW_original_design_c, embedded directly (verified POD, no
+ * pointers, already designed to be DMA'd/copied as raw bytes in the original engine -- see the
+ * Stage 4C investigation) -- always present on the wire so this stays one fixed-size message with
+ * no variable-length branch, but only meaningful when is_custom_design is set; zeroed otherwise.
+ * The struct's own ATTRIBUTE_ALIGN(32) (on its nested texture field) is why _reserved0 pads the
+ * header out to exactly 32 bytes before it -- see the _Static_assert below. */
+typedef struct PCNetGameAppearanceMsg {
+    uint8_t  msg_type;             /* PC_NETGAME_MSG_APPEARANCE */
+    uint8_t  net_player_id;
+    uint8_t  gender;
+    uint8_t  face;
+    uint16_t cloth_item;
+    uint8_t  sunburn_rank;
+    uint8_t  is_custom_design;
+    uint8_t  _reserved0[24];
+    mNW_original_design_c design;  /* only meaningful when is_custom_design; zeroed otherwise */
+} PCNetGameAppearanceMsg;
+_Static_assert(sizeof(PCNetGameAppearanceMsg) == 576, "PCNetGameAppearanceMsg wire size drifted");
+_Static_assert(sizeof(mNW_original_design_c) == PC_NETGAME_DESIGN_RECORD_SIZE,
+              "mNW_original_design_c size no longer matches PC_NETGAME_DESIGN_RECORD_SIZE (pc_net_game.h)");
+
 /* ---- module state ---- */
 
 static PCNetGameRole s_role = PC_NETGAME_ROLE_NONE;
@@ -152,6 +191,23 @@ static float s_move_rate_log_accum = 0.0f;
 static int   s_move_send_count_this_window = 0;
 #define PC_NETGAME_MOVE_RATE_LOG_PERIOD_60FPS_FRAMES 60.0f /* ~1s */
 
+/* Stage 4C-1 (one-shot-UDP-loss fix): low-frequency periodic appearance resend. PC_NET_RELIABLE
+ * does not actually retransmit (see pc_net.h) -- appearance is otherwise sent only a handful of
+ * times total (once at READY, once per newcomer backfill), so a single lost datagram would
+ * otherwise leave a peer's appearance unresolved for the rest of the session with no recovery.
+ * This is deliberately NOT a generic reliability layer: no ack, no sequence number, no per-message
+ * retry/timeout bookkeeping -- just an unconditional, idempotent full resend every few seconds,
+ * exactly like a coarse heartbeat. Appearance is logically static for Stage 4C-1 (no live-change
+ * support yet -- see pc_remote_player_on_appearance()'s own doc), so a duplicate is always byte-
+ * identical to what was already applied and is safe to reapply (see pc_remote_player_on_appearance()'s
+ * doc comment: allocation-free, fixed-size buffer overwrite). 3 seconds is conservative relative to
+ * the 20Hz movement stream and the ~500ms transport heartbeat (PCNET_HEARTBEAT_INTERVAL_MS,
+ * pc_net.c) -- frequent enough that a lost packet is corrected within a couple of seconds of
+ * joining, infrequent enough that it never meaningfully adds to network load (worst case, 8
+ * clients, is a handful of 576-byte sends every 3 seconds). */
+#define PC_NETGAME_APPEARANCE_RESEND_PERIOD_60FPS_FRAMES 180.0f /* ~3s */
+static float s_appearance_resend_accum = 0.0f;
+
 static void pcnetgame_capture_local_identity(uint8_t* player_name, uint8_t* land_name, uint16_t* player_id,
                                               uint16_t* land_id, uint8_t* has_save) {
     /* Now_Private is NULL until a save slot is actually loaded (e.g. still at the title/select
@@ -177,6 +233,73 @@ static void pcnetgame_build_identity_msg(PCNetGameIdentityMsg* msg) {
     msg->protocol_version = PC_NETGAME_PROTOCOL_VERSION;
     pcnetgame_capture_local_identity(msg->player_name, msg->land_name, &msg->player_id, &msg->land_id,
                                       &msg->has_save);
+}
+
+/* Stage 4C-1: read-only sample of the local player's visible appearance, for sending once at
+ * READY (see pc_net_game_poll()/pcnetgame_handle_host_data()). Never writes to Now_Private/
+ * Private_c::my_org[] -- only ever copies out of them. If no save is loaded yet (Now_Private ==
+ * NULL, mirroring pcnetgame_capture_local_identity()'s own has_save=0 case), sends a harmless
+ * all-zero placeholder (gender=mPr_SEX_MALE, face=0, no sunburn, catalog item 0). */
+static void pcnetgame_build_appearance_msg(PCNetGameAppearanceMsg* msg, uint8_t net_player_id) {
+    memset(msg, 0, sizeof(*msg));
+    msg->msg_type = (uint8_t)PC_NETGAME_MSG_APPEARANCE;
+    msg->net_player_id = net_player_id;
+
+    if (Now_Private != NULL) {
+        msg->gender = (uint8_t)Now_Private->gender;
+        msg->face = (uint8_t)Now_Private->face;
+        msg->sunburn_rank = (uint8_t)Now_Private->sunburn.rank;
+        msg->cloth_item = (uint16_t)Now_Private->cloth.item;
+
+        /* RSV_CLOTH is the sentinel Private_c::cloth.item carries when the worn shirt is one of
+         * the player's own custom designs rather than a catalog item (see m_hand_ovl.c's
+         * item==RSV_CLOTH branch) -- the same check the original game itself uses, not an
+         * invented classification. cloth.idx (never sent -- meaningless on another machine) then
+         * encodes which of the 8 my_org[] slots via CLOTH_NUM+1 + (slot & 7); see
+         * mPlib_Get_PlayerTexRom_p(), src/game/m_player_lib.c. */
+        if (Now_Private->cloth.item == RSV_CLOTH) {
+            int org_idx = Now_Private->cloth.idx - (CLOTH_NUM + 1);
+            if (!mPr_ORIGINAL_DESIGN_IDX_VALID(org_idx)) {
+                org_idx = 0;
+            }
+            msg->is_custom_design = 1;
+            msg->design = Now_Private->my_org[org_idx & 7];
+        }
+    }
+}
+
+/* Stage 4C-1: unpack a received PCNetGameAppearanceMsg into the decomp-independent
+ * PCNetPlayerAppearance pc_remote_player.c consumes. design_record is a raw byte copy of the
+ * decomp mNW_original_design_c -- see PCNetPlayerAppearance's doc (pc_net_game.h). */
+static void pcnetgame_appearance_msg_to_state(const PCNetGameAppearanceMsg* in, PCNetPlayerAppearance* out) {
+    out->gender = in->gender;
+    out->face = in->face;
+    out->sunburn_rank = in->sunburn_rank;
+    out->is_custom_design = in->is_custom_design;
+    out->cloth_item = in->cloth_item;
+    memcpy(out->design_record, &in->design, sizeof(out->design_record));
+}
+
+/* Stage 4C-1 (backfill/resend fix): the reverse of pcnetgame_appearance_msg_to_state() -- packs an
+ * already-known PCNetPlayerAppearance (read back via pc_remote_player_get_appearance() for a peer
+ * whose appearance the host already received, or freshly captured by pcnetgame_build_appearance_msg()
+ * for this process's own appearance) into wire format, addressed to whichever net_player_id
+ * actually owns it. Used by both the newcomer backfill pass and the periodic resend below -- no
+ * new wire message type, no change to PCNetGameAppearanceMsg's layout/size. Same zero-init
+ * discipline as pcnetgame_build_appearance_msg(): no uninitialized bytes ever go on the wire. */
+static void pcnetgame_pack_appearance_msg(PCNetGameAppearanceMsg* msg, uint8_t net_player_id,
+                                          const PCNetPlayerAppearance* state) {
+    memset(msg, 0, sizeof(*msg));
+    msg->msg_type = (uint8_t)PC_NETGAME_MSG_APPEARANCE;
+    msg->net_player_id = net_player_id;
+    msg->gender = state->gender;
+    msg->face = state->face;
+    msg->sunburn_rank = state->sunburn_rank;
+    msg->is_custom_design = state->is_custom_design;
+    msg->cloth_item = state->cloth_item;
+    if (state->is_custom_design) {
+        memcpy(&msg->design, state->design_record, sizeof(msg->design));
+    }
 }
 
 static void pcnetgame_send_reject(PCNetPeerId peer, PCNetGameRejectReason reason) {
@@ -393,6 +516,68 @@ static void pcnetgame_handle_client_move(const PCNetMoveMsg* in) {
     pc_remote_player_on_move((PCNetPlayerId)in->net_player_id, &sample);
 }
 
+/* Host side: a client's appearance -- same READY-gating and relay pattern as
+ * pcnetgame_handle_host_move(), just for the (much rarer, reliable) appearance message instead of
+ * the 20Hz movement stream. */
+static void pcnetgame_handle_host_appearance(PCNetPeerId peer, const PCNetGameAppearanceMsg* in) {
+    PCNetPlayerAppearance state;
+    int i;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+
+    pcnetgame_appearance_msg_to_state(in, &state);
+    pc_remote_player_on_appearance((PCNetPlayerId)peer, &state); /* the host's own view of this client */
+
+    /* Relay to every OTHER ready client, tagging net_player_id with the TRUE originating peer id
+     * -- never back to the sender -- exactly like pcnetgame_handle_host_move()'s own relay. */
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (i != peer && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            PCNetGameAppearanceMsg out = *in;
+            out.net_player_id = (uint8_t)peer;
+            pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
+        }
+    }
+}
+
+/* Host side (Stage 4C-1 backfill/resend fix): sends `dest` the host's own appearance plus the
+ * last-known appearance of every OTHER currently-READY peer -- i.e. everything `dest` needs to
+ * render every currently-visible player. Used both for the one-shot newcomer backfill (right after
+ * a peer reaches READY) and for the periodic full-roster resend below; kept as one function so the
+ * two call sites can never drift apart. Reads peer appearances back from pc_remote_player.c's own
+ * canonical per-slot storage via pc_remote_player_get_appearance() -- no second appearance cache.
+ * Skips `dest` itself and any peer that is not READY (disconnected or still mid-handshake), so a
+ * disconnected player's old appearance can never be sent out by this function. */
+static void pcnetgame_host_send_full_roster(PCNetPeerId dest) {
+    PCNetGameAppearanceMsg amsg;
+    int i;
+
+    pcnetgame_build_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID);
+    pc_net_send(dest, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
+
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        PCNetPlayerAppearance state;
+        if (i == dest || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (pc_remote_player_get_appearance((PCNetPlayerId)i, &state)) {
+            PCNetGameAppearanceMsg out;
+            pcnetgame_pack_appearance_msg(&out, (uint8_t)i, &state);
+            pc_net_send(dest, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
+        }
+    }
+}
+
+/* Client side: an appearance message from the host -- either the host's own appearance
+ * (net_player_id == PC_NETGAME_HOST_PLAYER_ID) or another client's, relayed. Mirrors
+ * pcnetgame_handle_client_move()'s exact pattern. */
+static void pcnetgame_handle_client_appearance(const PCNetGameAppearanceMsg* in) {
+    PCNetPlayerAppearance state;
+    pcnetgame_appearance_msg_to_state(in, &state);
+    pc_remote_player_on_appearance((PCNetPlayerId)in->net_player_id, &state);
+}
+
 /* Host side: a peer's raw PC_NET_EVENT_DATA payload. Anything that isn't a well-formed
  * IDENTITY message is ignored -- a peer is only ever marked READY by successfully validating
  * one, never merely by having sent *some* UDP packet. */
@@ -403,6 +588,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         PCNetMoveMsg mv;
         memcpy(&mv, data, sizeof(mv));
         pcnetgame_handle_host_move(peer, &mv);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameAppearanceMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_APPEARANCE) {
+        PCNetGameAppearanceMsg ap;
+        memcpy(&ap, data, sizeof(ap));
+        pcnetgame_handle_host_appearance(peer, &ap);
         return;
     }
 
@@ -437,6 +629,12 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     if (peer >= 0 && peer < PC_NET_MAX_PEERS) s_host_peer_link[peer] = PC_NETGAME_LINK_READY;
     printf("[NET] host: peer %d -> READY\n", (int)peer);
 
+    /* Stage 4C-1 (3+ player backfill fix): give this now-READY client the host's own appearance
+     * AND the last-known appearance of every other already-READY peer -- otherwise anyone who
+     * joined before this peer would stay permanently invisible to it (the original Stage 4C-1
+     * bug; see the investigation). See pcnetgame_host_send_full_roster()'s own doc comment. */
+    pcnetgame_host_send_full_roster(peer);
+
     {
         /* Stage 2: give the host a visible representation of this now-READY client. */
         PCNetGameIdentity remote_identity;
@@ -458,6 +656,13 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == sizeof(PCNetGameAppearanceMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_APPEARANCE) {
+        PCNetGameAppearanceMsg ap;
+        memcpy(&ap, data, sizeof(ap));
+        pcnetgame_handle_client_appearance(&ap);
+        return;
+    }
+
     if (size == sizeof(PCNetGameIdentityAckMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_ACK) {
         PCNetGameIdentityAckMsg in;
         memcpy(&in, data, sizeof(in));
@@ -472,6 +677,17 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
 
         s_client_link = PC_NETGAME_LINK_READY;
         printf("[NET] client: handshake complete (assigned peer id %u) -> READY\n", (unsigned)in.assigned_peer_id);
+
+        {
+            /* Stage 4C-1 (ordering-race fix): send our own appearance now, right after reaching
+             * READY, instead of at transport-connect time -- see the PC_NET_EVENT_PEER_CONNECTED
+             * case above for why. The host can only have sent this ACK after already processing
+             * our IDENTITY and marking this peer READY (see pcnetgame_handle_host_data()), so its
+             * own pre-READY appearance guard can no longer discard what we're about to send. */
+            PCNetGameAppearanceMsg amsg;
+            pcnetgame_build_appearance_msg(&amsg, 0);
+            pc_net_send(0, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
+        }
 
         /* Stage 2: give the client a visible representation of the host. Tracked under the
          * reserved PC_NETGAME_HOST_PLAYER_ID (a PCNetPlayerId), NOT the client's own transport
@@ -600,6 +816,16 @@ void pc_net_game_poll(void) {
                     printf("[NET] client: transport-connected to host, sending identity\n");
                     pcnetgame_build_identity_msg(&msg);
                     pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+                    /* Stage 4C-1 (ordering-race fix): appearance is NOT sent here any more. Sending
+                     * it immediately alongside IDENTITY raced against the host's own IDENTITY
+                     * processing -- if this process's APPEARANCE datagram was dequeued by the host
+                     * before its IDENTITY was, pcnetgame_handle_host_appearance()'s pre-READY guard
+                     * silently discarded it with no recovery (see the Stage 4C-1 investigation).
+                     * Appearance is now sent from the PC_NETGAME_MSG_IDENTITY_ACK handler below,
+                     * once this process's own link reaches PC_NETGAME_LINK_READY: by the time that
+                     * ACK exists, the host has -- by construction, see pcnetgame_handle_host_data()
+                     * -- already processed this peer's IDENTITY and marked it READY, so the
+                     * host-side gate can no longer race against it. */
                     break;
                 }
                 case PC_NET_EVENT_PEER_DISCONNECTED:
@@ -645,6 +871,33 @@ void pc_net_game_poll(void) {
         printf("[NET][DIAG] movement send rate: %d Hz (target %.0f Hz)\n", s_move_send_count_this_window,
                (double)PC_NETGAME_MOVE_SEND_RATE_HZ);
         s_move_send_count_this_window = 0;
+    }
+
+    /* Stage 4C-1 (one-shot-UDP-loss fix): low-frequency appearance resend -- see
+     * PC_NETGAME_APPEARANCE_RESEND_PERIOD_60FPS_FRAMES's doc above for why this exists and why the
+     * interval is conservative. Same gamePT-may-not-exist-yet reasoning as the movement throttle
+     * above: if there is no active GAME_PLAY there is no frame-time source to drive the timer, so
+     * this simply does not tick yet (never blocks single-player, never fires before a session
+     * actually exists). Client: resend only this process's own appearance, and only once actually
+     * READY (mirrors the movement throttle's own client-side gate). Host: reuse
+     * pcnetgame_host_send_full_roster() for every currently-READY peer, exactly the same call the
+     * one-shot newcomer backfill uses -- so a peer that missed its original appearance delivery
+     * (lost datagram, or the identity/appearance ordering race) receives a fresh, complete copy
+     * within one interval, with no reconnect required. */
+    if (gamePT != NULL && graph_dt_period_elapsed(gamePT, &s_appearance_resend_accum,
+                                                  PC_NETGAME_APPEARANCE_RESEND_PERIOD_60FPS_FRAMES)) {
+        if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY) {
+            PCNetGameAppearanceMsg amsg;
+            pcnetgame_build_appearance_msg(&amsg, 0);
+            pc_net_send(0, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
+        } else if (s_role == PC_NETGAME_ROLE_HOST) {
+            int i;
+            for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+                if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+                    pcnetgame_host_send_full_roster((PCNetPeerId)i);
+                }
+            }
+        }
     }
 }
 

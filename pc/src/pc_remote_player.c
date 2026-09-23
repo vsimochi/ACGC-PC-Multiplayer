@@ -50,6 +50,8 @@
 #include "m_play.h"
 #include "m_player_lib.h"
 #include "m_name_table.h"
+#include "m_needlework.h" /* Stage 4C-1: mNW_original_design_c, mNW_CopyOriginalTexture(),
+                            * mNW_CopyOriginalPalette() -- see pc_remote_player_apply_appearance() */
 #include "m_common_data.h" /* Common_Get(player_actor_exists), Now_Private -- see
                              * pc_remote_player_visual_init()'s readiness gate */
 #include "m_rcp.h"
@@ -87,6 +89,13 @@ extern cKF_Skeleton_R_c cKF_bs_r_grl_1;
                                                               * consecutive snapshots; farther than
                                                               * this is treated as a teleport/
                                                               * loading-zone jump, not a slide */
+
+/* Stage 4C-1: the local player's own face-texture bank is exactly 8 eye slots + 6 mouth slots at
+ * 256 bytes each (mPlayer_EYE_TEX_NUM/mPlayer_MOUTH_TEX_NUM, include/m_player.h) -- verified via
+ * src/game/m_player_lib.c's mPlib_change_player_face() (a bare 0xE00 literal there; no named
+ * decomp macro exists for it, so this file names its own copy). Every remote player's own face-tex
+ * buffer uses this exact same layout, filled by mPlib_Load_FaceTexAndPallet(). */
+#define PC_REMOTE_PLAYER_FACE_TEX_SIZE 0xE00
 
 /* Stage 4A: a remote player's own PC-owned skeleton/animation state, mirroring exactly what
  * src/game/m_inventory_ovl.c's mIV_pl_shape_init()/mIV_pl_shape_draw() already do for the
@@ -154,6 +163,77 @@ typedef struct PCRemoteMoveSnapshot {
     int8_t  item_kind;
 } PCRemoteMoveSnapshot;
 
+/* Stage 4C-1: raw appearance data as received over the network for this remote player (see
+ * PCNetPlayerAppearance, pc_net_game.h). Lives in the slot -- not the ACTOR-embedded `visual` --
+ * for exactly the same reason `identity` and the snapshot ring do: it is a function of the network
+ * message, not of any ACTOR, so it must survive scene transitions (Actor_info_dt() sweeping the
+ * ACTOR away) untouched. See pc_remote_player_on_appearance(). */
+typedef struct PCRemotePlayerAppearance {
+    int      valid;              /* 0 until pc_remote_player_on_appearance() has been called */
+    uint8_t  gender;              /* mirrors Private_c::gender (mPr_SEX_MALE/FEMALE) */
+    uint8_t  face;                 /* mirrors Private_c::face (mPr_FACE_TYPE0..7) */
+    uint8_t  sunburn_rank;         /* mirrors Private_c::sunburn.rank (0-8) */
+    uint8_t  is_custom_design;     /* 1 if cloth_item is the RSV_CLOTH "one of my own designs" sentinel */
+    uint16_t cloth_item;           /* mirrors Private_c::cloth.item (mActor_name_t) */
+    mNW_original_design_c design;  /* only meaningful when is_custom_design; the real decomp type
+                                     * (verified POD, no pointers) -- reused directly by
+                                     * mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() below,
+                                     * rather than hand-copied field by field. */
+} PCRemotePlayerAppearance;
+
+/* Stage 4C-1: this player's fully-resolved, render-ready appearance resources -- built once by
+ * pc_remote_player_apply_appearance() when `appearance` above first arrives (Stage 4C-2 will
+ * re-invoke it on live changes; Stage 4C-1 only ever calls it once). Never touched per-frame or on
+ * scene transitions -- like `appearance`, this lives in the slot specifically so a recreated ACTOR
+ * (see pc_remote_player_poll()'s scene-generation handling) never needs to rebuild it, only to
+ * re-point its own keyframe skeleton at `skeleton` below (see pc_remote_player_visual_init()).
+ *
+ * face_tex/face_pallet/cloth_tex/cloth_pallet are each a DMA destination for
+ * _JW_GetResourceAram() (see pc_remote_player_apply_appearance(), mPlib_Load_FaceTexAndPallet(),
+ * mPlib_Load_PlayerTexAndPallet()), which -- like every other ARAM/DMA destination in the original
+ * decomp (mNW_original_tex_c, include/m_needlework.h; OthersSave_c's keep_mail/keep_original/
+ * keep_diary members, include/m_card.h) -- requires 32-byte alignment. `ready`/`skeleton` above are
+ * ordinary, unaligned fields, so each buffer below gets its OWN ATTRIBUTE_ALIGN(32) rather than
+ * relying on the struct's own (whole-struct) alignment: aligning only the struct type would still
+ * leave each individual member at whatever offset the preceding fields happen to add up to (here,
+ * 16 bytes past a 32-byte boundary from `ready`+padding+`skeleton`) -- exactly what let this slip
+ * through unnoticed until a live runtime appearance test actually exercised the ARAM path (see the
+ * _Static_assert block right after the struct, which now catches this at compile time instead).
+ * This mirrors OthersSave_c's own established pattern (include/m_card.h) of mixing ordinary fields
+ * with several independently ATTRIBUTE_ALIGN(32)'d members in one struct -- the compiler inserts
+ * whatever padding each one individually needs. */
+typedef struct PCRemotePlayerResolvedAppearance {
+    int                ready;                         /* 0 until fully resolved */
+    cKF_Skeleton_R_c*  skeleton;                       /* &cKF_bs_r_boy_1 or &cKF_bs_r_grl_1 --
+                                                         * shared, read-only, compiled-in */
+    u8                 face_tex[PC_REMOTE_PLAYER_FACE_TEX_SIZE] ATTRIBUTE_ALIGN(32);  /* own copy:
+                                                                    * 8 eye slots then 6 mouth
+                                                                    * slots, 256B each -- the exact
+                                                                    * layout mPlib_Get_eye_tex_p()/
+                                                                    * mPlib_Get_mouth_tex_p() slice
+                                                                    * out of the (singleton) local
+                                                                    * bank */
+    u16                face_pallet[mNW_PALETTE_COUNT] ATTRIBUTE_ALIGN(32);
+    u8                 cloth_tex[mNW_DESIGN_TEX_SIZE] ATTRIBUTE_ALIGN(32);
+    u16                cloth_pallet[mNW_PALETTE_COUNT] ATTRIBUTE_ALIGN(32);
+} PCRemotePlayerResolvedAppearance;
+
+/* Compile-time proof, not just an assumption from the ATTRIBUTE_ALIGN annotations above -- verifies
+ * the actual resulting offset of each DMA-destination member is a multiple of 32, exactly what
+ * checkOkAddress()/JKR_ISALIGNED32() (src/static/JSystem/JKernel/JKRAram.cpp,
+ * src/static/JSystem/JKernel/JKRAramPiece.cpp) require of any address passed through
+ * _JW_GetResourceAram(). This is a per-member check because a struct instance's own base address
+ * (s_slots[], a static array -- see below) is not otherwise known to be 32-byte aligned by any
+ * other guarantee in this file. */
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, face_tex) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.face_tex is not 32-byte aligned -- ARAM DMA requires it");
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, face_pallet) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.face_pallet is not 32-byte aligned -- ARAM DMA requires it");
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, cloth_tex) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.cloth_tex is not 32-byte aligned -- ARAM DMA requires it");
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, cloth_pallet) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.cloth_pallet is not 32-byte aligned -- ARAM DMA requires it");
+
 typedef struct PCRemotePlayerSlot {
     int                in_use;             /* tracked at all (pending creation, or actor already live) */
     int                pending_create;     /* READY/discovered but actor creation hasn't succeeded yet */
@@ -174,6 +254,9 @@ typedef struct PCRemotePlayerSlot {
     PCRemoteMoveSnapshot snapshots[PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
     int                  snapshot_count; /* 0..PC_REMOTE_PLAYER_SNAPSHOT_COUNT, valid entries */
     int                  snapshot_head;  /* index the NEXT snapshot will be written to */
+
+    PCRemotePlayerAppearance         appearance;          /* Stage 4C-1: see pc_remote_player_on_appearance() */
+    PCRemotePlayerResolvedAppearance resolved_appearance; /* Stage 4C-1: see pc_remote_player_apply_appearance() */
 } PCRemotePlayerSlot;
 
 static PCRemotePlayerSlot s_slots[PC_REMOTE_PLAYER_SLOT_COUNT];
@@ -347,6 +430,64 @@ static void pc_remote_player_init_profile(void) {
     s_profile_ready = 1;
 }
 
+/* Stage 4C-1: resolve this slot's raw `appearance` into `resolved_appearance`'s render-ready
+ * buffers. Called exactly once, when appearance data first arrives (see
+ * pc_remote_player_on_appearance()) -- never per-frame, and never again on a scene transition (the
+ * resolved buffers live in the slot, not the ACTOR, so a recreated ACTOR needs no rebuilding here,
+ * only re-pointing its own keyframe skeleton -- see pc_remote_player_visual_init()).
+ *
+ * Never touches Now_Private, gamePT, or any Object_Exchange_c bank -- every resource is written
+ * directly into this slot's own buffers via explicit-parameter decomp helpers (see the Stage 4C
+ * investigation): mPlib_Load_FaceTexAndPallet() for the face (a new, small, additive decomp
+ * function -- src/game/m_player_lib.c -- that mirrors mPlib_change_player_face()/
+ * mPlib_Get_UseFacePalletRom_p()'s existing logic with explicit parameters instead of Now_Private
+ * reads), mPlib_Load_PlayerTexAndPallet() (already exported) for catalog clothing, and
+ * mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() (already exported) for a custom design. */
+static void pc_remote_player_apply_appearance(PCRemotePlayerSlot* slot) {
+    PCRemotePlayerAppearance* a = &slot->appearance;
+    PCRemotePlayerResolvedAppearance* r = &slot->resolved_appearance;
+    int face = a->face;
+    int sunburn_rank = a->sunburn_rank;
+
+    /* Defensive clamps: a malformed/out-of-range network value must never reach ROM-address
+     * arithmetic. Gender needs no clamp -- mPlib_get_player_mdl_p()'s own real logic already
+     * treats "anything not mPr_SEX_MALE" as female, so any value is inherently safe here too. */
+    if (face < 0 || face >= mPr_FACE_TYPE_NUM) {
+        face = 0;
+    }
+    if (sunburn_rank < 0 || sunburn_rank > mPr_SUNBURN_RANK8) {
+        sunburn_rank = 0;
+    }
+
+    r->skeleton = (a->gender == mPr_SEX_MALE) ? &cKF_bs_r_boy_1 : &cKF_bs_r_grl_1;
+
+    mPlib_Load_FaceTexAndPallet(r->face_tex, r->face_pallet, a->gender, face, sunburn_rank, FALSE, FALSE);
+
+    memset(r->cloth_tex, 0, sizeof(r->cloth_tex));
+    memset(r->cloth_pallet, 0, sizeof(r->cloth_pallet));
+
+    if (a->is_custom_design) {
+        /* Custom design: the pixel data travels over the network verbatim (it is arbitrary,
+         * player-drawn content that cannot be derived from an id alone -- see the Stage 4C
+         * investigation). mPlib_Load_PlayerTexAndPallet() must NOT be called here: its
+         * custom-design branch reads Now_Private->my_org[], which is the LOCAL player's own
+         * designs, not this remote player's. mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette()
+         * (src/game/m_needlework.c) take the design record directly and need no Now_Private
+         * access at all. */
+        mNW_CopyOriginalTexture(r->cloth_tex, &a->design);
+        mNW_CopyOriginalPalette(r->cloth_pallet, &a->design);
+    } else {
+        /* Catalog item: every instance already has the same compiled-in catalog ROM data, so only
+         * the 2-byte item id needs to have been sent -- resolve it locally via the exact same
+         * pure, Now_Private-independent helper the original game uses. */
+        mPr_cloth_c scratch_cloth;
+        mPlib_change_player_cloth_info(&scratch_cloth, (mActor_name_t)a->cloth_item);
+        mPlib_Load_PlayerTexAndPallet(r->cloth_tex, r->cloth_pallet, scratch_cloth.idx);
+    }
+
+    r->ready = 1;
+}
+
 /* Stage 4A: bring up a remote visual's skeleton/animation state. Mirrors
  * src/game/m_inventory_ovl.c's mIV_pl_shape_init() exactly: construct BOTH keyframe layers
  * against the SAME joint_data/morph_data buffers (this is what lets
@@ -357,24 +498,28 @@ static void pc_remote_player_init_profile(void) {
  * is created, no Player_actor_ct, per-state main function, or CulcAnimation helper runs, no
  * controller is read.
  *
+ * Stage 4C-1: the skeleton now comes from this remote player's OWN resolved appearance
+ * (`appearance->skeleton`, selected from its own synchronized gender -- see
+ * pc_remote_player_apply_appearance()) instead of mPlib_get_player_mdl_p() (the LOCAL player's
+ * singleton). The caller (pc_remote_player_mv()) only invokes this once `appearance->ready` is
+ * already true, so `appearance` is guaranteed valid here.
+ *
  * Safety: called only once player readiness has already been confirmed by the caller (see the
- * player_actor_exists gate in pc_remote_player_mv()). mPlib_get_player_mdl_p() itself only reads
- * Now_Private->gender, so it is additionally guarded here against Now_Private being NULL --
- * belt-and-suspenders, since player_actor_exists should not be TRUE without a loaded save, but
- * this file never assumes that without checking. */
-static void pc_remote_player_visual_init(PCRemotePlayerVisual* visual) {
-    cKF_Skeleton_R_c* model;
+ * player_actor_exists gate in pc_remote_player_mv()). Still additionally guarded here against
+ * Now_Private being NULL -- belt-and-suspenders, since player_actor_exists should not be TRUE
+ * without a loaded save, but this file never assumes that without checking. */
+static void pc_remote_player_visual_init(PCRemotePlayerVisual* visual,
+                                         const PCRemotePlayerResolvedAppearance* appearance) {
     cKF_Animation_R_c* wait_anim;
 
     if (Now_Private == NULL) {
         return; /* not actually ready despite the caller's check -- retry next frame */
     }
 
-    model = mPlib_get_player_mdl_p();
     wait_anim = mPlib_Get_Pointer_Animation(mPlayer_ANIM_WAIT1);
 
-    cKF_SkeletonInfo_R_ct(&visual->keyframe0, model, NULL, visual->joint_data, visual->morph_data);
-    cKF_SkeletonInfo_R_ct(&visual->keyframe1, model, NULL, visual->joint_data, visual->morph_data);
+    cKF_SkeletonInfo_R_ct(&visual->keyframe0, appearance->skeleton, NULL, visual->joint_data, visual->morph_data);
+    cKF_SkeletonInfo_R_ct(&visual->keyframe1, appearance->skeleton, NULL, visual->joint_data, visual->morph_data);
     mPlib_DMA_player_Part_Table(visual->part_table, mPlayer_PART_TABLE_NORMAL);
 
     cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&visual->keyframe0, wait_anim, NULL, 1.0f, 0.5f,
@@ -387,7 +532,7 @@ static void pc_remote_player_visual_init(PCRemotePlayerVisual* visual) {
                                                      * zero-init default -- see the struct's doc
                                                      * comment */
     printf("[NET][REMOTE][DIAG] visual initialized: model=%s num_shown_joints=%d\n",
-           (model == &cKF_bs_r_boy_1) ? "boy" : "girl", (int)model->num_shown_joints);
+           (appearance->skeleton == &cKF_bs_r_boy_1) ? "boy" : "girl", (int)appearance->skeleton->num_shown_joints);
 }
 
 static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
@@ -432,12 +577,23 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
      * value; it only reads TRUE starting the frame after Player_actor_ct() (and the face-texture
      * bank fill inside it, mPlib_change_player_face()) has fully completed. That is exactly the
      * ordering pc_remote_player_dw() below depends on for mPlib_get_player_face_p()/
-     * mPlib_get_player_tex_p() to return non-stale data. This does not touch gamePT/Actor_info
-     * directly and does not replace the existing low-address guard in pc_remote_player_poll() --
-     * it is an additional, independent readiness signal for player *appearance* resources
-     * specifically, as recommended by the Stage 4 investigation. */
-    if (!self->visual.initialized && Common_Get(player_actor_exists)) {
-        pc_remote_player_visual_init(&self->visual);
+     * mPlib_get_player_tex_p() to return non-stale data (Stage 4A's own local-appearance reads,
+     * now superseded for rendering purposes -- see below -- but this readiness signal is still a
+     * reasonable proxy for "the game/actor system is far enough along to build a skeleton" and is
+     * kept for Stage 4C-1 too). This does not touch gamePT/Actor_info directly and does not
+     * replace the existing low-address guard in pc_remote_player_poll() -- it is an additional,
+     * independent readiness signal for player *appearance* resources specifically, as recommended
+     * by the Stage 4 investigation.
+     *
+     * Stage 4C-1: additionally gated on slot->resolved_appearance.ready -- this remote player's
+     * OWN appearance (gender/face/clothing) must have already arrived and been resolved (see
+     * pc_remote_player_on_appearance()/pc_remote_player_apply_appearance()) before a skeleton is
+     * selected for it, otherwise pc_remote_player_visual_init() would have nothing valid to read
+     * appearance->skeleton from. Until then this actor simply stays un-visualized (no draw, see
+     * pc_remote_player_dw()'s own initialized check) -- never falls back to the local player's
+     * skeleton/appearance. */
+    if (!self->visual.initialized && Common_Get(player_actor_exists) && slot->resolved_appearance.ready) {
+        pc_remote_player_visual_init(&self->visual, &slot->resolved_appearance);
     }
 
     if (self->visual.initialized) {
@@ -546,6 +702,8 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
 static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
     GRAPH* graph = game->graph;
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
+    const PCRemotePlayerResolvedAppearance* appearance;
     Mtx* mtx;
     u8* eye_tex_p;
     u8* mouth_tex_p;
@@ -556,6 +714,14 @@ static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
                   * automatically next frame */
     }
 
+    if (slot == NULL || !slot->resolved_appearance.ready) {
+        return; /* extremely defensive: pc_remote_player_mv() never sets visual.initialized until
+                  * resolved_appearance.ready is true, so this should be unreachable -- but this
+                  * dw_proc must never fall back to the local player's own segments, so it draws
+                  * nothing rather than guessing. */
+    }
+    appearance = &slot->resolved_appearance;
+
     /* Per-frame scratch matrices, exactly like the inventory preview (mIV_pl_shape_draw) --
      * never a persistent per-instance buffer like PLAYER_ACTOR's own work_mtx[2][13]. */
     mtx = (Mtx*)GRAPH_ALLOC_TYPE(graph, Mtx, self->visual.keyframe0.skeleton->num_shown_joints);
@@ -563,12 +729,15 @@ static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
         return;
     }
 
-    /* Stage 4A appearance: the LOCAL player's own eye/mouth/cloth/face resources, exactly as
-     * instructed -- every remote player currently looks identical to the local one. Pattern 0 is
-     * simply "not blinking, default mouth"; Stage 4A does not animate eye/mouth texture patterns
-     * (that is tied to now_main_index-driven texture-animation tables this stage does not use). */
-    eye_tex_p = mPlib_Get_eye_tex_p(0);
-    mouth_tex_p = mPlib_Get_mouth_tex_p(0);
+    /* Stage 4C-1 appearance: THIS remote player's own eye/mouth/cloth/face resources, resolved
+     * once at pc_remote_player_on_appearance() time into slot->resolved_appearance (see
+     * pc_remote_player_apply_appearance()) -- no longer the local singleton banks Stage 4A used,
+     * so each connected player now renders with their own gender/face/clothing. Pattern 0 (the
+     * first 0x100-byte eye slot / first mouth slot within appearance->face_tex) is simply "not
+     * blinking, default mouth"; blink/mouth-pattern animation is not synchronized, same as Stage
+     * 4A. */
+    eye_tex_p = (u8*)appearance->face_tex + 0 * 0x100;
+    mouth_tex_p = (u8*)appearance->face_tex + mPlayer_EYE_TEX_NUM * 0x100;
 
     /* Reset RDP/RSP mode (texture/z/light/fog/prim) to a known baseline before emitting our own
      * commands -- the same call the real player's own Player_actor_draw_Normal() makes first. */
@@ -577,14 +746,18 @@ static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
     OPEN_DISP(graph);
     gfx = NOW_POLY_OPA_DISP;
 
-    /* Same five segments Player_actor_draw_Normal() binds, same local accessors -- Stage 4A
-     * intentionally reuses the local player's own singleton texture/palette banks rather than
-     * introducing any remote-appearance resources (that is Stage 4C). */
+    /* Same five segments Player_actor_draw_Normal() binds, but now sourced from THIS remote
+     * player's own resolved buffers instead of the local singleton getters -- see the struct doc
+     * comment on PCRemotePlayerResolvedAppearance. Kept immediately adjacent to the draw call
+     * below within this same function, per the Stage 4C investigation: the local player's next
+     * dw_proc call later this same frame rebinds these same segment registers to its own
+     * resources before drawing itself, so a remote player's bindings must never be separated from
+     * its own draw by any other actor's dw_proc or by a frame boundary. */
     gSPSegment(gfx++, ANIME_1_TXT_SEG, eye_tex_p);
     gSPSegment(gfx++, ANIME_2_TXT_SEG, mouth_tex_p);
-    gSPSegment(gfx++, ANIME_3_TXT_SEG, mPlib_get_player_tex_p(game));
-    gSPSegment(gfx++, ANIME_4_TXT_SEG, mPlib_get_player_pallet_p(game));
-    gSPSegment(gfx++, ANIME_5_TXT_SEG, mPlib_get_player_face_pallet_p(game));
+    gSPSegment(gfx++, ANIME_3_TXT_SEG, (u8*)appearance->cloth_tex);
+    gSPSegment(gfx++, ANIME_4_TXT_SEG, (u16*)appearance->cloth_pallet);
+    gSPSegment(gfx++, ANIME_5_TXT_SEG, (u16*)appearance->face_pallet);
 
     SET_POLY_OPA_DISP(gfx);
     CLOSE_DISP(graph);
@@ -614,6 +787,15 @@ static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot) {
     slot->newest_sender_frame = 0;
     slot->snapshot_count = 0;
     slot->snapshot_head = 0;
+
+    /* Stage 4C-1: a genuine disconnect (unlike a scene-generation staleness event, which never
+     * calls this function) means whoever reconnects into this slot next -- possibly a completely
+     * different player -- must not start out able to render with the PREVIOUS occupant's
+     * appearance. resolved_appearance.ready gates pc_remote_player_visual_init() (see
+     * pc_remote_player_mv()), so clearing it here guarantees a freshly (re)connected peer always
+     * waits for its own real PC_NETGAME_MSG_APPEARANCE before ever becoming visible. */
+    slot->appearance.valid = 0;
+    slot->resolved_appearance.ready = 0;
 }
 
 void pc_remote_player_on_ready(PCNetPlayerId player_id, const PCNetGameIdentity* identity) {
@@ -704,6 +886,66 @@ void pc_remote_player_on_move(PCNetPlayerId player_id, const PCNetMoveSample* sa
         slot->snapshot_count++;
     }
     slot->last_move_recv_local_frame = now;
+}
+
+void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAppearance* appearance) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+
+    if (slot == NULL || appearance == NULL) {
+        return;
+    }
+
+    /* Deliberately no `slot->in_use` gate here, matching pc_remote_player_on_move()'s own
+     * lazy-discovery pattern above: appearance is tracked independently of the handshake/movement
+     * bookkeeping (see this function's own doc comment in pc_remote_player.h), so it must be
+     * captured whichever of on_ready()/on_move()/on_appearance() happens to arrive first for this
+     * player_id. */
+    slot->appearance.valid = 1;
+    slot->appearance.gender = appearance->gender;
+    slot->appearance.face = appearance->face;
+    slot->appearance.sunburn_rank = appearance->sunburn_rank;
+    slot->appearance.is_custom_design = appearance->is_custom_design;
+    slot->appearance.cloth_item = appearance->cloth_item;
+    if (appearance->is_custom_design) {
+        /* Only copied when actually meaningful -- design_record is otherwise unpacked but unused
+         * padding on the wire for a catalog-clothing player (see PCNetPlayerAppearance's doc). */
+        memcpy(&slot->appearance.design, appearance->design_record, sizeof(slot->appearance.design));
+    }
+
+    pc_remote_player_apply_appearance(slot);
+
+    printf("[NET][REMOTE][DIAG] player %d: appearance received (gender=%d face=%d sunburn=%d cloth_item=%d %s)\n",
+           (int)player_id, (int)appearance->gender, (int)appearance->face, (int)appearance->sunburn_rank,
+           (int)appearance->cloth_item, appearance->is_custom_design ? "custom-design" : "catalog");
+}
+
+int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearance* out) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+
+    if (slot == NULL || out == NULL || !slot->appearance.valid) {
+        return 0;
+    }
+
+    /* Zero first: `design_record` must never carry stale bytes onto the wire. If this slot was
+     * previously occupied by a custom-design-wearing player and is now occupied by a
+     * catalog-clothing one, slot->appearance.design still physically holds the PREVIOUS
+     * occupant's design bytes (pc_remote_player_on_appearance() only overwrites `design` when the
+     * NEW appearance itself is custom -- see its own doc comment) -- zeroing here, then copying it
+     * out only when is_custom_design is set, matches the exact "only meaningful when
+     * is_custom_design" convention PCNetPlayerAppearance/PCNetGameAppearanceMsg already use, and
+     * guarantees a resent/backfilled catalog-clothing appearance never leaks anyone else's
+     * leftover design pixels. */
+    memset(out, 0, sizeof(*out));
+    out->gender = slot->appearance.gender;
+    out->face = slot->appearance.face;
+    out->sunburn_rank = slot->appearance.sunburn_rank;
+    out->is_custom_design = slot->appearance.is_custom_design;
+    out->cloth_item = slot->appearance.cloth_item;
+    if (slot->appearance.is_custom_design) {
+        memcpy(out->design_record, &slot->appearance.design, sizeof(out->design_record));
+    }
+
+    return 1;
 }
 
 /* Stage 3 diagnostic: periodically logs each tracked remote player's current (interpolated)

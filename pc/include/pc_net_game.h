@@ -126,6 +126,32 @@ typedef struct PCNetMoveSample {
     int8_t   item_kind;    /* mirrors PLAYER_ACTOR::item_kind; -1 = none */
 } PCNetMoveSample;
 
+/* Stage 4C-1: a network-safe, already-decoded snapshot of a player's visible appearance -- see
+ * pc_net_game.c for the wire message this is built from/unpacked into. Deliberately NOT the raw
+ * decomp mNW_original_design_c/Private_c (kept decomp-independent at this header level, matching
+ * PCNetGameIdentity/PCNetMoveSample's own convention above) -- pc_remote_player.c is the only
+ * consumer, and it already includes the real decomp headers directly where it needs them.
+ *
+ * Sent exactly once, when a peer becomes READY (see pc_net_game.c's pc_net_game_poll()/
+ * pcnetgame_handle_host_data()) -- Stage 4C-1 does not yet resynchronize this if the sender's
+ * appearance changes afterward (that is Stage 4C-2).
+ *
+ * design_record is an opaque, byte-exact copy of the decomp's mNW_original_design_c (verified POD,
+ * no pointers -- see the Stage 4C investigation) and is only meaningful when is_custom_design is
+ * set; pc_remote_player.c reinterprets it as a real mNW_original_design_c to reuse the existing
+ * mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() decomp functions directly. */
+#define PC_NETGAME_DESIGN_RECORD_SIZE 544 /* mirrors sizeof(mNW_original_design_c); pc_net_game.c
+                                            * _Static_assert's this matches exactly */
+typedef struct PCNetPlayerAppearance {
+    uint8_t gender;             /* mirrors Private_c::gender (mPr_SEX_MALE/FEMALE) */
+    uint8_t face;               /* mirrors Private_c::face (mPr_FACE_TYPE0..7) */
+    uint8_t sunburn_rank;       /* mirrors Private_c::sunburn.rank (0-8) */
+    uint8_t is_custom_design;   /* 1 if cloth_item is the "wearing one of my own designs" sentinel
+                                  * (RSV_CLOTH) and design_record below is meaningful */
+    uint16_t cloth_item;        /* mirrors Private_c::cloth.item (mActor_name_t) */
+    uint8_t design_record[PC_NETGAME_DESIGN_RECORD_SIZE]; /* only meaningful when is_custom_design */
+} PCNetPlayerAppearance;
+
 /* --- lifecycle --- */
 
 /* Starts hosting on `port`. Returns 1 on success, 0 on failure (logged; caller should just
