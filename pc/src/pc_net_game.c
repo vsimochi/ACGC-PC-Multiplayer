@@ -197,16 +197,26 @@ static int   s_move_send_count_this_window = 0;
  * otherwise leave a peer's appearance unresolved for the rest of the session with no recovery.
  * This is deliberately NOT a generic reliability layer: no ack, no sequence number, no per-message
  * retry/timeout bookkeeping -- just an unconditional, idempotent full resend every few seconds,
- * exactly like a coarse heartbeat. Appearance is logically static for Stage 4C-1 (no live-change
- * support yet -- see pc_remote_player_on_appearance()'s own doc), so a duplicate is always byte-
- * identical to what was already applied and is safe to reapply (see pc_remote_player_on_appearance()'s
- * doc comment: allocation-free, fixed-size buffer overwrite). 3 seconds is conservative relative to
+ * exactly like a coarse heartbeat. Whether or not the appearance actually changed since the last
+ * resend, resending it is always safe -- a duplicate is byte-identical to what was already applied
+ * and is safe to reapply (see pc_remote_player_on_appearance()'s doc comment: allocation-free,
+ * fixed-size buffer overwrite). This remains the loss-recovery safety net even after Stage 4C-2
+ * added immediate sends on detected change (see s_last_local_appearance below) -- an immediate
+ * send can itself be lost, same as any other datagram. 3 seconds is conservative relative to
  * the 20Hz movement stream and the ~500ms transport heartbeat (PCNET_HEARTBEAT_INTERVAL_MS,
  * pc_net.c) -- frequent enough that a lost packet is corrected within a couple of seconds of
  * joining, infrequent enough that it never meaningfully adds to network load (worst case, 8
  * clients, is a handful of 576-byte sends every 3 seconds). */
 #define PC_NETGAME_APPEARANCE_RESEND_PERIOD_60FPS_FRAMES 180.0f /* ~3s */
 static float s_appearance_resend_accum = 0.0f;
+
+/* Stage 4C-2: this process's own last-known-transmitted appearance, for detecting a local change
+ * as soon as it happens (see pc_net_game_poll()) instead of waiting for the periodic resend above
+ * (which remains unchanged and still runs as the loss-recovery safety net). s_last_local_appearance
+ * is only meaningful once s_last_local_appearance_valid is set -- mirrors this file's own existing
+ * s_client_host_identity_valid convention (a plain int flag, not a separate optional/maybe type). */
+static PCNetPlayerAppearance s_last_local_appearance;
+static int                   s_last_local_appearance_valid = 0;
 
 static void pcnetgame_capture_local_identity(uint8_t* player_name, uint8_t* land_name, uint16_t* player_id,
                                               uint16_t* land_id, uint8_t* has_save) {
@@ -235,21 +245,24 @@ static void pcnetgame_build_identity_msg(PCNetGameIdentityMsg* msg) {
                                       &msg->has_save);
 }
 
-/* Stage 4C-1: read-only sample of the local player's visible appearance, for sending once at
- * READY (see pc_net_game_poll()/pcnetgame_handle_host_data()). Never writes to Now_Private/
- * Private_c::my_org[] -- only ever copies out of them. If no save is loaded yet (Now_Private ==
- * NULL, mirroring pcnetgame_capture_local_identity()'s own has_save=0 case), sends a harmless
- * all-zero placeholder (gender=mPr_SEX_MALE, face=0, no sunburn, catalog item 0). */
-static void pcnetgame_build_appearance_msg(PCNetGameAppearanceMsg* msg, uint8_t net_player_id) {
-    memset(msg, 0, sizeof(*msg));
-    msg->msg_type = (uint8_t)PC_NETGAME_MSG_APPEARANCE;
-    msg->net_player_id = net_player_id;
+/* Stage 4C-1/4C-2: read-only sample of the local player's current visible appearance, into the
+ * decomp-independent PCNetPlayerAppearance shape (not the wire message directly) -- this is the
+ * ONE place that ever reads Now_Private for this purpose. pcnetgame_build_appearance_msg() (the
+ * one-shot/periodic-resend wire-message builder) and pc_net_game_poll()'s per-frame local-change
+ * comparison (Stage 4C-2) both funnel through this exact function, so there is never a second,
+ * subtly different place that decides what "the current local appearance" is. Never writes to
+ * Now_Private/Private_c::my_org[] -- only ever copies out of them. If no save is loaded yet
+ * (Now_Private == NULL, mirroring pcnetgame_capture_local_identity()'s own has_save=0 case),
+ * yields a harmless all-zero placeholder (gender=mPr_SEX_MALE, face=0, no sunburn, catalog item
+ * 0). */
+static void pcnetgame_capture_local_appearance(PCNetPlayerAppearance* out) {
+    memset(out, 0, sizeof(*out));
 
     if (Now_Private != NULL) {
-        msg->gender = (uint8_t)Now_Private->gender;
-        msg->face = (uint8_t)Now_Private->face;
-        msg->sunburn_rank = (uint8_t)Now_Private->sunburn.rank;
-        msg->cloth_item = (uint16_t)Now_Private->cloth.item;
+        out->gender = (uint8_t)Now_Private->gender;
+        out->face = (uint8_t)Now_Private->face;
+        out->sunburn_rank = (uint8_t)Now_Private->sunburn.rank;
+        out->cloth_item = (uint16_t)Now_Private->cloth.item;
 
         /* RSV_CLOTH is the sentinel Private_c::cloth.item carries when the worn shirt is one of
          * the player's own custom designs rather than a catalog item (see m_hand_ovl.c's
@@ -262,8 +275,8 @@ static void pcnetgame_build_appearance_msg(PCNetGameAppearanceMsg* msg, uint8_t 
             if (!mPr_ORIGINAL_DESIGN_IDX_VALID(org_idx)) {
                 org_idx = 0;
             }
-            msg->is_custom_design = 1;
-            msg->design = Now_Private->my_org[org_idx & 7];
+            out->is_custom_design = 1;
+            memcpy(out->design_record, &Now_Private->my_org[org_idx & 7], sizeof(out->design_record));
         }
     }
 }
@@ -300,6 +313,17 @@ static void pcnetgame_pack_appearance_msg(PCNetGameAppearanceMsg* msg, uint8_t n
     if (state->is_custom_design) {
         memcpy(&msg->design, state->design_record, sizeof(msg->design));
     }
+}
+
+/* Stage 4C-1: builds this process's own current appearance directly into wire format -- used for
+ * the one-shot send at READY and the existing periodic full-roster resend. Stage 4C-2 additionally
+ * reuses pcnetgame_capture_local_appearance() directly (not this wrapper) for its own per-frame
+ * change comparison in pc_net_game_poll(), so this function and that comparison can never
+ * disagree about what "the current local appearance" is -- there is exactly one capture routine. */
+static void pcnetgame_build_appearance_msg(PCNetGameAppearanceMsg* msg, uint8_t net_player_id) {
+    PCNetPlayerAppearance state;
+    pcnetgame_capture_local_appearance(&state);
+    pcnetgame_pack_appearance_msg(msg, net_player_id, &state);
 }
 
 static void pcnetgame_send_reject(PCNetPeerId peer, PCNetGameRejectReason reason) {
@@ -897,6 +921,66 @@ void pc_net_game_poll(void) {
                     pcnetgame_host_send_full_roster((PCNetPeerId)i);
                 }
             }
+        }
+    }
+
+    /* Stage 4C-2: per-frame local appearance change detection. Deliberately NOT throttled like the
+     * timers above -- a clothing change is a rare, human-triggered event (per the Stage 4C-2
+     * investigation, gender/face are effectively fixed after character creation; only clothing and,
+     * occasionally, sunburn rank ever change mid-session), so comparing a PCNetPlayerAppearance
+     * (a handful of scalar fields, plus a fixed 544-byte comparison only meaningful when wearing a
+     * custom design) once per frame costs nothing worth optimizing away, and detecting the change
+     * the moment it happens -- rather than waiting for the periodic resend above -- is the entire
+     * point of this stage. Gated on gamePT the same as the throttles above: no active GAME_PLAY
+     * means no meaningful local appearance to capture yet either.
+     *
+     * First observation after this cache has never been established (s_last_local_appearance_valid
+     * == 0, e.g. right after this process starts, or the moment Now_Private first becomes
+     * available) is deliberately NOT treated as a change: the existing READY handshake already
+     * sends the initial appearance unconditionally on its own (the client's IDENTITY_ACK handler
+     * above, and pcnetgame_host_send_full_roster() on the host side), so silently adopting whatever
+     * is currently captured as the baseline -- without sending anything -- avoids ever racing that
+     * with a redundant immediate duplicate. From then on the cache simply persists across
+     * disconnects/reconnects/scene transitions (nothing here ever clears it): if this process's own
+     * appearance genuinely didn't change while briefly disconnected, the comparison correctly finds
+     * no difference; if it did, the one extra immediate send is harmless (duplicates are already
+     * proven safe -- see pc_remote_player_on_appearance()'s doc) and the existing unconditional
+     * initial-READY-send has already delivered the current, correct appearance regardless. */
+    if (gamePT != NULL) {
+        PCNetPlayerAppearance current;
+        pcnetgame_capture_local_appearance(&current);
+
+        if (!s_last_local_appearance_valid) {
+            s_last_local_appearance = current;
+            s_last_local_appearance_valid = 1;
+        } else if (memcmp(&current, &s_last_local_appearance, sizeof(current)) != 0) {
+            if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY) {
+                /* Client: send straight to the host, exactly like the periodic resend does --
+                 * the host's existing, unmodified appearance receive handler
+                 * (pcnetgame_handle_host_appearance()) already applies it locally and relays it
+                 * to every other READY peer, so no further action is needed here. */
+                PCNetGameAppearanceMsg amsg;
+                pcnetgame_pack_appearance_msg(&amsg, 0, &current);
+                pc_net_send(0, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
+            } else if (s_role == PC_NETGAME_ROLE_HOST) {
+                /* Host: there is no equivalent "someone else relays my own change" path -- a
+                 * client's changed appearance reaches other clients because the host itself
+                 * receives and relays it, but the host never "receives" its own appearance over
+                 * the network. Broadcast directly to every READY peer instead. Deliberately just
+                 * the host's own appearance (net_player_id = PC_NETGAME_HOST_PLAYER_ID, never a
+                 * peer index) -- NOT the full pcnetgame_host_send_full_roster() roster resend,
+                 * which would needlessly retransmit every other peer's already-unchanged
+                 * appearance too. */
+                PCNetGameAppearanceMsg amsg;
+                int i;
+                pcnetgame_pack_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &current);
+                for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+                    if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+                        pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
+                    }
+                }
+            }
+            s_last_local_appearance = current;
         }
     }
 }

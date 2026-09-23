@@ -170,6 +170,15 @@ typedef struct PCRemoteMoveSnapshot {
  * ACTOR away) untouched. See pc_remote_player_on_appearance(). */
 typedef struct PCRemotePlayerAppearance {
     int      valid;              /* 0 until pc_remote_player_on_appearance() has been called */
+    int      pending_resolve;    /* 1 whenever these raw fields hold data that resolved_appearance
+                                   * does not yet (or no longer) reflect. Set unconditionally by
+                                   * pc_remote_player_on_appearance() on every arrival, cleared only
+                                   * by a SUCCESSFUL pc_remote_player_apply_appearance() (one that
+                                   * ran with gamePT != NULL). Deliberately independent of
+                                   * resolved_appearance.ready: `ready` can still be 1 from an
+                                   * earlier, different appearance, so pc_remote_player_poll()'s
+                                   * retry must key off THIS flag, never "!ready" -- see
+                                   * pc_remote_player_apply_appearance()'s doc comment. */
     uint8_t  gender;              /* mirrors Private_c::gender (mPr_SEX_MALE/FEMALE) */
     uint8_t  face;                 /* mirrors Private_c::face (mPr_FACE_TYPE0..7) */
     uint8_t  sunburn_rank;         /* mirrors Private_c::sunburn.rank (0-8) */
@@ -431,23 +440,55 @@ static void pc_remote_player_init_profile(void) {
 }
 
 /* Stage 4C-1: resolve this slot's raw `appearance` into `resolved_appearance`'s render-ready
- * buffers. Called exactly once, when appearance data first arrives (see
- * pc_remote_player_on_appearance()) -- never per-frame, and never again on a scene transition (the
- * resolved buffers live in the slot, not the ACTOR, so a recreated ACTOR needs no rebuilding here,
- * only re-pointing its own keyframe skeleton -- see pc_remote_player_visual_init()).
+ * buffers. Invoked every time new appearance data arrives (see pc_remote_player_on_appearance())
+ * and, if that attempt was deferred, retried from pc_remote_player_poll() once resources become
+ * available -- see the gamePT gate and `pending_resolve` below. Never per-frame otherwise, and
+ * never again on a scene transition (the resolved buffers live in the slot, not the ACTOR, so a
+ * recreated ACTOR needs no rebuilding here, only re-pointing its own keyframe skeleton -- see
+ * pc_remote_player_visual_init()).
  *
- * Never touches Now_Private, gamePT, or any Object_Exchange_c bank -- every resource is written
- * directly into this slot's own buffers via explicit-parameter decomp helpers (see the Stage 4C
+ * Never touches Now_Private or any Object_Exchange_c bank -- every resource is written directly
+ * into this slot's own buffers via explicit-parameter decomp helpers (see the Stage 4C
  * investigation): mPlib_Load_FaceTexAndPallet() for the face (a new, small, additive decomp
  * function -- src/game/m_player_lib.c -- that mirrors mPlib_change_player_face()/
  * mPlib_Get_UseFacePalletRom_p()'s existing logic with explicit parameters instead of Now_Private
  * reads), mPlib_Load_PlayerTexAndPallet() (already exported) for catalog clothing, and
- * mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() (already exported) for a custom design. */
+ * mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() (already exported) for a custom design.
+ *
+ * gamePT gate (real-client crash fix): mPlib_Load_FaceTexAndPallet()/mPlib_Load_PlayerTexAndPallet()
+ * both eventually call JW_GetAramAddress(), which dereferences forest_arc_aram_p -- mounted only by
+ * JW_Init2() (src/static/boot.c, src/static/jsyswrap.cpp). An appearance message can be received
+ * and dispatched here (via pc_net_game_poll(), called unconditionally every VIWaitForRetrace())
+ * during the game's one-time early boot sequence, strictly before JW_Init2() has run -- confirmed
+ * live via GDB as a NULL-`this` crash inside JKRArchive::findTypeResource(). gamePT is the
+ * established, already-relied-upon signal that is only ever non-NULL after JW_Init2() has already
+ * completed (see pc_remote_player_poll()'s own gate), so it is read here purely as a readiness
+ * check -- never written, and Now_Private is still never touched, so this is a deferral, not a
+ * behavior change. mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() never touch ARAM (a plain
+ * bcopy() from the wire-provided design bytes), so they are not actually at risk, but are kept
+ * behind the same gate for simplicity: this function either fully resolves an appearance or leaves
+ * it exactly as it was, never half of one.
+ *
+ * If gamePT is NULL, the raw `appearance` fields (already updated by the caller) are left
+ * untouched and `a->pending_resolve` (set by every caller before invoking this -- see
+ * pc_remote_player_on_appearance()) is left set, so pc_remote_player_poll() retries this same slot
+ * once gamePT becomes non-NULL -- see its own comment. `pending_resolve`, not
+ * resolved_appearance.ready, is the retry condition specifically because `ready` can already be 1
+ * from a PREVIOUS, different, successful resolution: a slot whose appearance changes again while
+ * gamePT is momentarily NULL must not be mistaken for "up to date" just because it was ready
+ * before. */
 static void pc_remote_player_apply_appearance(PCRemotePlayerSlot* slot) {
     PCRemotePlayerAppearance* a = &slot->appearance;
     PCRemotePlayerResolvedAppearance* r = &slot->resolved_appearance;
-    int face = a->face;
-    int sunburn_rank = a->sunburn_rank;
+    int face;
+    int sunburn_rank;
+
+    if (gamePT == NULL) {
+        return; /* deferred -- see doc comment above; pc_remote_player_poll() retries */
+    }
+
+    face = a->face;
+    sunburn_rank = a->sunburn_rank;
 
     /* Defensive clamps: a malformed/out-of-range network value must never reach ROM-address
      * arithmetic. Gender needs no clamp -- mPlib_get_player_mdl_p()'s own real logic already
@@ -486,6 +527,7 @@ static void pc_remote_player_apply_appearance(PCRemotePlayerSlot* slot) {
     }
 
     r->ready = 1;
+    a->pending_resolve = 0;
 }
 
 /* Stage 4A: bring up a remote visual's skeleton/animation state. Mirrors
@@ -795,6 +837,7 @@ static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot) {
      * pc_remote_player_mv()), so clearing it here guarantees a freshly (re)connected peer always
      * waits for its own real PC_NETGAME_MSG_APPEARANCE before ever becoming visible. */
     slot->appearance.valid = 0;
+    slot->appearance.pending_resolve = 0;
     slot->resolved_appearance.ready = 0;
 }
 
@@ -912,6 +955,12 @@ void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAp
         memcpy(&slot->appearance.design, appearance->design_record, sizeof(slot->appearance.design));
     }
 
+    /* Set unconditionally on every arrival, BEFORE attempting to resolve -- pc_remote_player_poll()
+     * uses this (never resolved_appearance.ready) to know a retry is needed, since `ready` can
+     * still be 1 from an earlier, different appearance. See pc_remote_player_apply_appearance()'s
+     * doc comment. */
+    slot->appearance.pending_resolve = 1;
+
     pc_remote_player_apply_appearance(slot);
 
     printf("[NET][REMOTE][DIAG] player %d: appearance received (gender=%d face=%d sunburn=%d cloth_item=%d %s)\n",
@@ -996,6 +1045,18 @@ void pc_remote_player_poll(void) {
         ACTOR* actor;
         const PCRemotePlayerOffset* ofs;
         f32 x, y, z;
+
+        /* Real-client crash fix: retry resolving any appearance that arrived while gamePT was NULL
+         * (see pc_remote_player_apply_appearance()'s doc comment). Deliberately NOT gated on
+         * slot->in_use -- pc_remote_player_on_appearance() can populate `appearance` before
+         * on_ready()/on_move() ever mark this slot in_use (see its own comment above) -- and
+         * deliberately keyed on `pending_resolve`, never `!resolved_appearance.ready`, since
+         * `ready` may still be 1 from an earlier, unrelated successful resolution. gamePT is
+         * already confirmed non-NULL by this function's own check above, so this call is
+         * guaranteed to actually resolve (and clear pending_resolve) rather than defer again. */
+        if (slot->appearance.valid && slot->appearance.pending_resolve) {
+            pc_remote_player_apply_appearance(slot);
+        }
 
         if (!slot->in_use) {
             continue;

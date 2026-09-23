@@ -132,9 +132,13 @@ typedef struct PCNetMoveSample {
  * PCNetGameIdentity/PCNetMoveSample's own convention above) -- pc_remote_player.c is the only
  * consumer, and it already includes the real decomp headers directly where it needs them.
  *
- * Sent exactly once, when a peer becomes READY (see pc_net_game.c's pc_net_game_poll()/
- * pcnetgame_handle_host_data()) -- Stage 4C-1 does not yet resynchronize this if the sender's
- * appearance changes afterward (that is Stage 4C-2).
+ * Sent once when a peer becomes READY (see pc_net_game.c's pc_net_game_poll()/
+ * pcnetgame_handle_host_data()), again immediately whenever pc_net_game_poll()'s per-frame
+ * comparison detects the sender's own appearance has changed (Stage 4C-2), and periodically as a
+ * loss-recovery safety net (PC_NETGAME_APPEARANCE_RESEND_PERIOD_60FPS_FRAMES, pc_net_game.c) --
+ * every send is a complete, self-contained snapshot, never a partial/delta update, so a receiver
+ * always treats the latest one as the current authoritative appearance for that owner regardless
+ * of which of these three triggers produced it.
  *
  * design_record is an opaque, byte-exact copy of the decomp's mNW_original_design_c (verified POD,
  * no pointers -- see the Stage 4C investigation) and is only meaningful when is_custom_design is
