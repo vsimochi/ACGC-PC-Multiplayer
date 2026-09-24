@@ -190,6 +190,28 @@ int pc_net_game_host_ready_peer_count(void);
  * 0 if not yet available. */
 int pc_net_game_get_host_identity(PCNetGameIdentity* out);
 
+/* Stage 5A: called from the decomp pickup state (see m_player_main_pickup.c_inc) instead of
+ * mutating the field/inventory locally -- this process is a network client, so the host (not the
+ * local save) is the authority on the field tile at (ut_x, ut_z) and whatever it currently holds.
+ * Sends a PICKUP_REQUEST; the actual field clear and inventory grant only happen later, if/when
+ * the host's PICKUP_RESULT/FIELD_UPDATE arrive (see pc_net_game.c's pcnetgame_handle_client_data()).
+ *
+ * Returns 1 if this process is a connected, READY client -- meaning the caller must NOT perform
+ * the normal local mutation, whether or not a request was actually queued this call (e.g. one was
+ * already pending). Returns 0 if this process is not a client (single-player or host), in which
+ * case the caller should proceed exactly as before, unmodified. Never blocks. Safe to call with
+ * out-of-range ut_x/ut_z (rejected internally, same as a malformed network message would be). */
+int pc_net_game_request_pickup(int ut_x, int ut_z);
+
+/* Stage 5A.1: called from the decomp pickup state (see m_player_main_pickup.c_inc) immediately
+ * after the HOST's OWN local pickup has already mutated the field tile through the existing,
+ * unmodified single-player code -- never before that mutation, and never as a substitute for it.
+ * Broadcasts a FIELD_UPDATE for (ut_x, ut_z) to every connected client so they converge on the
+ * same now-empty tile, exactly as they already do for a client-initiated pickup. A no-op for
+ * single-player and (defensively) for a client -- see pc_net_game.c's own doc on this function.
+ * Never blocks. Safe to call with out-of-range ut_x/ut_z (rejected internally). */
+void pc_net_game_notify_local_field_pickup(int ut_x, int ut_z);
+
 #ifdef __cplusplus
 }
 #endif

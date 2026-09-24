@@ -52,6 +52,35 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
         aSIGN_erase_white_sign(game, target_pos_p);
     }
 
+#ifdef TARGET_PC
+    /* Stage 5A: this process does not own field/inventory truth as a network client -- defer the
+     * actual mutation to the host instead of running it locally (see
+     * pc_net_game_request_pickup()'s doc, pc/src/pc_net_game.c). Money-bag items are excluded
+     * from Stage 5A's network path entirely: do nothing, so the bag stays exactly where it is --
+     * single-player and the host are unaffected, since this branch only ever runs when
+     * pc_net_game_role() == PC_NETGAME_ROLE_CLIENT. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        int is_money_bag = FALSE;
+        int ut_x, ut_z;
+#ifdef PC_ENHANCEMENTS
+        is_money_bag = mPr_GetAmountForMoneyItem(item) > 0;
+#endif
+        if (!is_money_bag && mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
+            pc_net_game_request_pickup(ut_x, ut_z);
+        }
+    } else
+#endif
+    {
+#ifdef TARGET_PC
+        /* Stage 5A.1: this slot's tile in ut_x/ut_z form, computed once regardless of which
+         * mutation branch below actually runs -- see pc_net_game_notify_local_field_pickup()'s
+         * doc (pc/include/pc_net_game.h) for why this is safe to call unconditionally here: it
+         * internally no-ops for single-player and for a client, so this file never needs to check
+         * pc_net_game_role() itself. Only announces a mutation that has ALREADY happened via the
+         * unmodified code below -- never mutates anything itself. */
+        int host_ut_x = 0, host_ut_z = 0;
+        int host_ut_ok = mFI_Wpos2UtNum(&host_ut_x, &host_ut_z, *target_pos_p);
+#endif
 #ifdef PC_ENHANCEMENTS
     /* bells go straight to wallet when the whole amount fits; otherwise the bag is picked up normally */
     {
@@ -60,16 +89,40 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
             sAdo_SysTrgStart(SE_REGISTER);
             if (target_pos_p != NULL) {
                 mFI_SetFG_common(EMPTY_NO, *target_pos_p, TRUE);
+#ifdef TARGET_PC
+                if (host_ut_ok) pc_net_game_notify_local_field_pickup(host_ut_x, host_ut_z);
+#endif
             }
             putaway_money = TRUE;
         } else {
             Player_actor_putin_item(slot_idx, item, target_pos_p);
+#ifdef TARGET_PC
+            if (host_ut_ok) pc_net_game_notify_local_field_pickup(host_ut_x, host_ut_z);
+#endif
         }
     }
 #else
     Player_actor_putin_item(slot_idx, item, target_pos_p);
+#ifdef TARGET_PC
+    if (host_ut_ok) pc_net_game_notify_local_field_pickup(host_ut_x, host_ut_z);
 #endif
+#endif
+    }
 
+#ifdef TARGET_PC
+    /* Stage 5A: force the vanilla "pockets full, choose swap/drop" submenu off for a network
+     * client -- that flow (Player_actor_setup_main_Pickup_exchange(),
+     * m_player_main_pickup_exchange.c_inc) assumes the item is already, unconditionally, in the
+     * world/in hand, which is not true here: nothing has actually moved yet, the grant (if any)
+     * only happens later if/when pc_net_game.c's PICKUP_RESULT arrives
+     * (pcnetgame_handle_client_pickup_result()). A network client whose pockets are already full
+     * when that result arrives simply does not receive the item (logged there, never fabricated)
+     * -- the safest available Stage 5A fallback rather than reimplementing the swap/drop submenu
+     * against network-pending state. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        main_pickup_p->exchange_flag = FALSE;
+    } else
+#endif
 #ifdef PC_ENHANCEMENTS
     /* the bells never entered a pocket, so the pockets-full exchange must not offer them again. money duplication otherwise. */
     if (putaway_money) {

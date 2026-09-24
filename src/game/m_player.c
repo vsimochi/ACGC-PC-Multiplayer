@@ -27,6 +27,10 @@
 #include "ac_set_ovl_gyoei.h"
 #include "m_vibctl.h"
 #include "m_debug.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 5A: pc_net_game_role()/pc_net_game_request_pickup() -- see
+                           * m_player_main_pickup.c_inc's Setup_main_Pickup seam. */
+#endif
 
 static int l_skip_other_func_set_wade = FALSE;
 static xyz_t l_wade_end_pos = { 0.0f, 0.0f, 0.0f };

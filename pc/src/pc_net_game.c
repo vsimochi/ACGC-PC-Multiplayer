@@ -1,10 +1,13 @@
 /* pc_net_game.c - Stage 1: in-game networking integration (role selection + identity handshake).
  *
  * See pc_net_game.h for the design summary. This file is the ONLY place that mixes the
- * Stage 0 transport (pc_net.h) with decomp game state -- it reads (never writes) a handful of
- * plain-integer/fixed-byte-array fields out of the currently active save slot (Now_Private) to
- * build an explicit, hand-written wire message. It never touches an ACTOR, never reads pad
- * state, and never calls into rendering/audio.
+ * Stage 0 transport (pc_net.h) with decomp game state -- for identity/appearance/movement it only
+ * ever reads a handful of plain-integer/fixed-byte-array fields out of the currently active save
+ * slot (Now_Private) to build an explicit, hand-written wire message. Stage 5A adds the first
+ * exception: a client that receives an authoritative PICKUP_RESULT grant writes the resulting item
+ * into Now_Private's own pockets via the real, unmodified mPr_SetFreePossessionItem() (see
+ * pcnetgame_handle_client_pickup_result()) -- everywhere else in this file remains read-only. This
+ * file never touches an ACTOR, never reads pad state, and never calls into rendering/audio.
  *
  * Why not just serialize Private_c/PersonalID_c directly: PersonalID_c (m_personal_id.h)
  * happens to already be flat/POD (no pointers), but "flat today" is not a wire-format
@@ -30,13 +33,19 @@
                             * (transitively, via m_actor.h -> game.h) gamePT/GAME/
                             * graph_dt_period_elapsed()/graph_dt_frame_time(). Read-only: this
                             * file only ever *samples* the local player, never writes to it. */
-#include "m_name_table.h"  /* Stage 4C-1: RSV_CLOTH, CLOTH_NUM -- see pcnetgame_build_appearance_msg() */
+#include "m_name_table.h"  /* Stage 4C-1: RSV_CLOTH, CLOTH_NUM -- see pcnetgame_build_appearance_msg().
+                            * Stage 5A: also EMPTY_NO/ITM_* -- see pcnetgame_resolve_pickup_item(). */
 #include "m_needlework.h"  /* Stage 4C-1: mNW_original_design_c -- see pcnetgame_build_appearance_msg().
                             * Read-only here too: only ever copies out of Now_Private->my_org[],
                             * never writes to it (mPr_ORIGINAL_DESIGN_IDX_VALID comes from the
                             * already-included m_private.h). */
+#include "m_field_info.h"  /* Stage 5A: mFI_UtNum2UtFG()/mFI_UtNumtoFGSet_common()/mFI_UtNumCheck()/
+                            * mFI_UtNum2CenterWpos() -- see pcnetgame_handle_host_pickup_request()
+                            * and pcnetgame_apply_field_update_or_defer(). */
 #include "pc_lowaddr.h"    /* PC_LOWADDR_LIMIT -- see pcnetgame_is_real_player_actor() */
+#include "pc_platform.h"   /* Stage 5A.1: g_pc_pickup_test_seed -- see pcnetgame_run_pickup_test_seed() */
 
+#include <math.h>   /* fabsf() -- see pcnetgame_validate_and_resolve_pickup() */
 #include <stdio.h>
 #include <string.h>
 
@@ -56,6 +65,15 @@ typedef enum PCNetGameMsgType {
                                        * alongside IDENTITY), host -> client (its own appearance,
                                        * sent once alongside IDENTITY_ACK, or a relay of another
                                        * client's) -- see pcnetgame_build_appearance_msg() */
+    PC_NETGAME_MSG_PICKUP_REQUEST = 6, /* Stage 5A: client -> host only. See
+                                         * pcnetgame_handle_host_pickup_request(). */
+    PC_NETGAME_MSG_PICKUP_RESULT  = 7, /* Stage 5A: host -> the one requesting client only (never
+                                         * broadcast -- see PC_NETGAME_MSG_FIELD_UPDATE for what
+                                         * every OTHER client needs). */
+    PC_NETGAME_MSG_FIELD_UPDATE   = 8, /* Stage 5A: host -> every READY client (including the
+                                         * requester). Carries only the resulting tile value, never
+                                         * a request id -- it is a plain fact about the shared
+                                         * world, not tied to any one request. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -158,6 +176,72 @@ _Static_assert(sizeof(PCNetGameAppearanceMsg) == 576, "PCNetGameAppearanceMsg wi
 _Static_assert(sizeof(mNW_original_design_c) == PC_NETGAME_DESIGN_RECORD_SIZE,
               "mNW_original_design_c size no longer matches PC_NETGAME_DESIGN_RECORD_SIZE (pc_net_game.h)");
 
+/* Stage 5A: client -> host. ut_x/ut_z are global field-tile coordinates (see
+ * mFI_Wpos2UtNum()/mFI_UtNum2UtFG(), m_field_info.c) -- the same addressing the field's own
+ * mActor_name_t grid already uses, not a world position (never trust a client's claimed float
+ * position for this; the host re-derives the tile's true center itself when validating, see
+ * pcnetgame_handle_host_pickup_request()). request_id is this connection's own monotonically
+ * advancing counter (see s_next_pickup_request_id) -- meaningful only paired with the sender's
+ * PCNetPeerId, never compared across different peers. */
+typedef struct PCNetGamePickupRequestMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_PICKUP_REQUEST */
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint8_t  _reserved0;
+    uint32_t request_id;
+} PCNetGamePickupRequestMsg;
+_Static_assert(sizeof(PCNetGamePickupRequestMsg) == 8, "PCNetGamePickupRequestMsg wire size drifted");
+
+/* Stage 5A: host -> the one requesting client. Deliberately carries no slot number -- the client
+ * chooses its own free pocket slot via the real mPr_SetFreePossessionItem() on receipt (see
+ * pcnetgame_handle_client_pickup_result()); the host never tracks a remote client's real pocket
+ * contents (see the Stage 5A inventory-architecture audit). granted_item is the host's fully
+ * resolved, authoritative item -- never the raw field value the client may have glimpsed, and
+ * never a present/dummy sentinel (see pcnetgame_resolve_pickup_item()). Meaningless when
+ * accepted == 0. */
+typedef struct PCNetGamePickupResultMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_PICKUP_RESULT */
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint32_t request_id;
+    uint16_t granted_item;
+    uint16_t _reserved0;
+} PCNetGamePickupResultMsg;
+_Static_assert(sizeof(PCNetGamePickupResultMsg) == 12, "PCNetGamePickupResultMsg wire size drifted");
+
+/* Stage 5A: host -> every READY client. The authoritative new value of one field tile -- always a
+ * complete, self-contained fact (never a delta), so a receiver just overwrites its own local copy
+ * (see pcnetgame_handle_client_field_update()/pcnetgame_apply_field_update_or_defer()). No
+ * request_id: this is a statement about shared world state, not an answer to any one client's
+ * request (every READY client receives the same message, including the original requester, who
+ * also gets the separate, unicast PICKUP_RESULT above). */
+typedef struct PCNetGameFieldUpdateMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_FIELD_UPDATE */
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint8_t  _reserved0;
+    uint16_t new_fg_value;
+    uint16_t _reserved1;
+} PCNetGameFieldUpdateMsg;
+_Static_assert(sizeof(PCNetGameFieldUpdateMsg) == 8, "PCNetGameFieldUpdateMsg wire size drifted");
+
+/* Stage 5A: how close a requesting peer's own last-synced position must be to a target tile's
+ * center. Vanilla's own reach check (Player_actor_Search_putin_item/CheckItemPosition_forPickup,
+ * m_player_common.c_inc) tries hand-offset positions up to 35 world units in front of the player,
+ * each then accepting a target within a further 15-unit radius -- so the farthest a legitimately
+ * reachable tile's center can ever be from the player's own ROOT position is 35+15=50 units in the
+ * colinear case. This deliberately validates against that generous envelope from the player's
+ * root position, not vanilla's exact 3-offset hand-reach geometry, for two reasons: (1) the
+ * "requester's position" available here is their last-synced movement snapshot, not their true
+ * current position, so some slack is required anyway; (2) exactly replicating the hand-offset
+ * search would require simulating facing/rotation math this file has no other reason to touch.
+ * This is intentionally a coarse anti-cheat/sanity bound (catches "claims to be on the other side
+ * of the map"), not a pixel-accurate reach check -- see the Stage 5A implementation report. */
+#define PC_NETGAME_PICKUP_MAX_REACH_SQ (50.0f * 50.0f)
+#define PC_NETGAME_PICKUP_MAX_REACH_Y 40.0f /* one field tile's worth (mFI_UNIT_BASE_SIZE) of
+                                               vertical slack for terrain/sync staleness */
+
 /* ---- module state ---- */
 
 static PCNetGameRole s_role = PC_NETGAME_ROLE_NONE;
@@ -217,6 +301,73 @@ static float s_appearance_resend_accum = 0.0f;
  * s_client_host_identity_valid convention (a plain int flag, not a separate optional/maybe type). */
 static PCNetPlayerAppearance s_last_local_appearance;
 static int                   s_last_local_appearance_valid = 0;
+
+/* Stage 5A: host-only, one slot per pc_net peer (same indexing as s_host_peer_link). This is
+ * deliberately NOT a queue -- a player can only ever have one pickup animation in flight (the
+ * decomp state machine itself serializes this; see m_player_main_pickup.c_inc), so "the most
+ * recently PROCESSED request from this peer, and exactly what we decided" is all that's ever
+ * needed. This is what makes a retry safe: if the same request_id arrives again (its original
+ * PICKUP_RESULT was lost, not the request), the host must replay the SAME decision rather than
+ * re-validating against now-changed ground truth (by the time a retry arrives, a successful
+ * original attempt has already cleared the tile, so a naive re-check would wrongly see it as
+ * already-empty and reject a request that actually succeeded the first time). Reset whenever the
+ * peer disconnects AND defensively the moment a peer freshly reaches READY (see
+ * pcnetgame_reset_host_pickup_state()) so a reused pc_net peer slot never inherits a previous,
+ * unrelated connection's cached result. */
+typedef struct PCNetGameHostPickupState {
+    int      valid;         /* 0 until this peer's first PICKUP_REQUEST has been processed */
+    uint32_t request_id;    /* the request_id this cached result answers */
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t granted_item;
+} PCNetGameHostPickupState;
+static PCNetGameHostPickupState s_host_pickup_state[PC_NET_MAX_PEERS];
+
+/* Stage 5A: client-only. Exactly one outstanding pickup request at a time, for the same reason as
+ * s_host_pickup_state above -- the local pickup animation state can't request a second one before
+ * the first resolves. request_id is this connection's own counter, reset to 1 on every fresh
+ * pc_net_game_start_client() (see there) so it can never collide with a previous, unrelated
+ * connection's in-flight id on the host side. */
+typedef struct PCNetGamePickupPending {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    float    timeout_accum;  /* frames-as-60fps-units since this attempt (send or last retry) --
+                               * see PC_NETGAME_PICKUP_TIMEOUT_60FPS_FRAMES */
+    int      retry_count;    /* number of retries already sent for this request_id */
+} PCNetGamePickupPending;
+static PCNetGamePickupPending s_pickup_pending;
+static uint32_t               s_next_pickup_request_id = 1;
+
+/* ~500ms: generous relative to a LAN round-trip (movement/appearance already prove typical
+ * latency is well under this), but short enough that a genuinely lost request/result is retried
+ * quickly rather than leaving the pickup animation waiting. 3 retries -> worst case ~2s of total
+ * waiting before giving up, safely under pc_net.c's own 5s transport disconnect timeout, so a
+ * pickup that can never succeed does not itself look like a dead connection. */
+#define PC_NETGAME_PICKUP_TIMEOUT_60FPS_FRAMES 30.0f /* ~500ms */
+#define PC_NETGAME_PICKUP_MAX_RETRIES 3
+
+/* Stage 5A: client-only. A FIELD_UPDATE that arrived before the local field data was ready to
+ * accept it (mFI_UtNumtoFGSet_common() returns FALSE -- see pcnetgame_apply_field_update_or_defer())
+ * is retried here every frame once gamePT is available, mirroring the exact
+ * gamePT-gate-plus-per-frame-retry pattern already proven for deferred appearance resolution (see
+ * pc_remote_player.c's `pending_resolve`). A small fixed array, not a single slot: this is a
+ * genuine authoritative fact about the shared world and must never be silently dropped (unlike a
+ * movement/appearance sample, there is no periodic resend to fall back on for a one-shot
+ * FIELD_UPDATE), so several tiles updated in quick succession while not yet ready must each be
+ * preserved. Deduplicated by tile: a second deferred update for the same (ut_x, ut_z) overwrites
+ * the first rather than growing the array, since only the latest value for a given tile is ever
+ * meaningful. */
+#define PC_NETGAME_PENDING_FIELD_UPDATE_MAX 8
+typedef struct PCNetGamePendingFieldUpdate {
+    int      valid;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t new_fg_value;
+} PCNetGamePendingFieldUpdate;
+static PCNetGamePendingFieldUpdate s_pending_field_updates[PC_NETGAME_PENDING_FIELD_UPDATE_MAX];
 
 static void pcnetgame_capture_local_identity(uint8_t* player_name, uint8_t* land_name, uint16_t* player_id,
                                               uint16_t* land_id, uint8_t* has_save) {
@@ -602,6 +753,307 @@ static void pcnetgame_handle_client_appearance(const PCNetGameAppearanceMsg* in)
     pc_remote_player_on_appearance((PCNetPlayerId)in->net_player_id, &state);
 }
 
+/* Stage 5A: clears one peer's cached pickup dedup/replay state -- see s_host_pickup_state's own
+ * doc comment for why this exists and why it must run on disconnect (a reused pc_net peer slot
+ * must never answer a new connection's request with a previous, unrelated connection's cached
+ * result). Safe to call for an out-of-range peer (no-op). */
+static void pcnetgame_reset_host_pickup_state(PCNetPeerId peer) {
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+        return;
+    }
+    memset(&s_host_pickup_state[peer], 0, sizeof(s_host_pickup_state[peer]));
+}
+
+/* Stage 5A: is `item` one of the wallet-crediting money-bag sentinels Setup_main_Pickup's own
+ * PC_ENHANCEMENTS branch special-cases (m_player_main_pickup.c_inc)? Explicitly excluded from
+ * this stage's network path -- see pc_net_game_request_pickup()'s doc and the Stage 5A
+ * architecture audit ("do not invent wallet synchronization yet"). mPr_GetAmountForMoneyItem()
+ * itself is only declared under PC_ENHANCEMENTS (m_private.h) -- in a build without it, money
+ * bags are not wallet-special at all (Setup_main_Pickup's #else branch treats them as an
+ * ordinary pocket item), so there is nothing to exclude in that configuration either. */
+static int pcnetgame_is_money_bag_item(mActor_name_t item) {
+#ifdef PC_ENHANCEMENTS
+    return mPr_GetAmountForMoneyItem(item) > 0;
+#else
+    (void)item;
+    return 0;
+#endif
+}
+
+/* Stage 5A: mirrors mPr_SetPossessionItem()'s own sentinel switch (src/game/m_private.c) MINUS
+ * the priv-writing side effects -- the host never holds a Private_c for a remote player (see the
+ * Stage 5A inventory-architecture audit), so this resolves just the ITEM VALUE, authoritatively,
+ * exactly once, here. The requesting client applies the result with mPr_ITEM_COND_NORMAL (see
+ * pcnetgame_handle_client_pickup_result()) rather than the mPr_ITEM_COND_PRESENT the real function
+ * would also set for these same sentinels -- a deliberate Stage 5A simplification: the granted
+ * item arrives already resolved and immediately usable, not as a still-wrapped gift needing its
+ * own local unwrap step. mPr_DummyPresentToTruePresent() includes genuine runtime randomness (a
+ * chance of a random non-native fruit) -- calling it here, once, on the host, and sending only the
+ * result is exactly why two clients (or the same client retried) can never disagree about what a
+ * present resolved to. */
+static mActor_name_t pcnetgame_resolve_pickup_item(mActor_name_t raw_item) {
+    switch (raw_item) {
+        case ITM_PRESENT:              return mPr_DummyPresentToTruePresent();
+        case ITM_GOLDEN_NET_PRESENT:   return ITM_GOLDEN_NET;
+        case ITM_GOLDEN_AXE_PRESENT:   return ITM_GOLDEN_AXE;
+        case ITM_GOLDEN_SHOVEL_PRESENT: return ITM_GOLDEN_SHOVEL;
+        case ITM_GOLDEN_ROD_PRESENT:   return ITM_GOLDEN_ROD;
+        default:                       return raw_item;
+    }
+}
+
+/* Stage 5A: does `item` classify as an "ordinary ground item" for this stage's pickup path?
+ * Mirrors Player_actor_CheckItem_fromPosition()'s own classification (m_player_common.c_inc)
+ * with two deliberate differences: (1) grass/weeds are rejected here even though that function
+ * accepts them -- a grass tile routes to the entirely different mPlayer_INDEX_REMOVE_GRASS state
+ * client-side (see m_player_common.c_inc's master trigger, Player_actor_CheckAndRequest_main_pickup_all),
+ * which never reaches pc_net_game_request_pickup() in the first place, so this is pure defense in
+ * depth against a request that could never legitimately arrive this way, not a real gameplay
+ * restriction; (2) the original function's outdoor-only check for NAME_TYPE_FTR0/FTR1
+ * (`Common_Get(field_type) == mFI_FIELDTYPE2_FG`) is intentionally NOT replicated -- that check
+ * exists to distinguish an outdoor-grid lookup from an indoor room's separate layer-2 storage, but
+ * every tile this function is ever asked about already came from mFI_UtNum2UtFG() (the primary,
+ * outdoor-only grid -- see pcnetgame_validate_and_resolve_pickup()), so that distinction is
+ * already structurally guaranteed by which grid was read, without needing any process's local
+ * field_type (which, on the HOST, would describe the HOST's own current scene, not the requesting
+ * client's -- exactly the kind of single-player-singleton assumption this stage must not carry
+ * over uncritically). */
+static int pcnetgame_is_pickupable_field_item(mActor_name_t item) {
+    if (item == (mActor_name_t)EMPTY_NO || IS_ITEM_GRASS(item)) {
+        return 0;
+    }
+    switch (ITEM_NAME_GET_TYPE(item)) {
+        case NAME_TYPE_FTR0:
+        case NAME_TYPE_FTR1:
+        case NAME_TYPE_ITEM1:
+            return 1;
+        default:
+            return ITEM_IS_SIGNBOARD(item) != 0;
+    }
+}
+
+/* Stage 5A: every read-only validation step for one pickup request, in sequence, stopping at the
+ * first failure -- never mutates anything, so pcnetgame_handle_host_pickup_request() can call this
+ * freely without side effects. Returns 1 and fills *out_granted_item with the host's fully
+ * resolved, authoritative item if this request should be granted; returns 0 (leaving
+ * *out_granted_item untouched) otherwise. `peer` identifies whose last-synced position to validate
+ * proximity against (see pc_remote_player_get_last_position()) -- never any claim from `in`
+ * itself. */
+static int pcnetgame_validate_and_resolve_pickup(PCNetPeerId peer, uint8_t ut_x, uint8_t ut_z,
+                                                 mActor_name_t* out_granted_item) {
+    mActor_name_t* fg_p;
+    mActor_name_t raw_item;
+    xyz_t center;
+    float px, py, pz;
+
+    if (mFI_UtNumCheck((int)ut_x, (int)ut_z, mFI_GetBlockXMax(), mFI_GetBlockZMax()) == FALSE) {
+        return 0; /* out-of-range coordinate -- never trust it, whatever the client intended */
+    }
+    if (mFI_UtNum2DepositGet((int)ut_x, (int)ut_z)) {
+        return 0; /* buried/reserved tile -- never an ordinary pickupable ground item */
+    }
+
+    fg_p = mFI_UtNum2UtFG((int)ut_x, (int)ut_z);
+    if (fg_p == NULL) {
+        return 0; /* out of range, or that acre's data is not currently resident on the host */
+    }
+    raw_item = *fg_p; /* the host's own authoritative read, taken now -- never the client's claim,
+                        * and never cached from any earlier moment */
+
+    if (!pcnetgame_is_pickupable_field_item(raw_item) || pcnetgame_is_money_bag_item(raw_item)) {
+        return 0; /* wrong classification, or explicitly excluded for Stage 5A */
+    }
+
+    if (mFI_UtNum2CenterWpos(&center, (int)ut_x, (int)ut_z) == FALSE ||
+        !pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+        return 0; /* can't resolve the tile's center, or no movement sample from this peer yet */
+    }
+    {
+        float dx = center.x - px;
+        float dz = center.z - pz;
+        float dy = center.y - py;
+        if ((dx * dx + dz * dz) > PC_NETGAME_PICKUP_MAX_REACH_SQ || fabsf(dy) > PC_NETGAME_PICKUP_MAX_REACH_Y) {
+            return 0; /* too far from this peer's last-known position -- see the reach macros' doc */
+        }
+    }
+
+    *out_granted_item = pcnetgame_resolve_pickup_item(raw_item);
+    return 1;
+}
+
+/* Host side: broadcasts a FIELD_UPDATE for one tile to every currently-READY client. The single
+ * choke point for this message -- used both when a client's own PICKUP_REQUEST is accepted
+ * (pcnetgame_handle_host_pickup_request()) and when the HOST's OWN local pickup mutates the field
+ * (pc_net_game_notify_local_field_pickup(), Stage 5A.1) -- so the two paths can never disagree
+ * about what a "field update broadcast" looks like on the wire. Never sends to the host itself
+ * (there is no such peer -- see pc_net_send()'s own semantics): the host already applied this
+ * mutation directly, synchronously, before calling this, so there is nothing to loop back. */
+static void pcnetgame_broadcast_field_update(uint8_t ut_x, uint8_t ut_z, uint16_t new_fg_value) {
+    int i;
+    PCNetGameFieldUpdateMsg fu;
+    memset(&fu, 0, sizeof(fu));
+    fu.msg_type = (uint8_t)PC_NETGAME_MSG_FIELD_UPDATE;
+    fu.ut_x = ut_x;
+    fu.ut_z = ut_z;
+    fu.new_fg_value = new_fg_value;
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &fu, (uint16_t)sizeof(fu));
+        }
+    }
+}
+
+/* Host side: a client's pickup request. Deliberately NOT Player_actor_setup_main_Pickup() run on
+ * the remote player's behalf -- this never touches any ACTOR, any PLAYER_ACTOR, or Now_Private
+ * (the host's OWN save is never read or written by another player's pickup); it only reads/writes
+ * the shared field grid and sends back small, self-contained network messages. See the Stage 5A
+ * inventory-architecture audit for why this is deliberately not a full remote-player
+ * Private_c/inventory simulation. */
+static void pcnetgame_handle_host_pickup_request(PCNetPeerId peer, const PCNetGamePickupRequestMsg* in) {
+    PCNetGameHostPickupState* cache;
+    PCNetGamePickupResultMsg out;
+    mActor_name_t granted_item = (mActor_name_t)EMPTY_NO;
+    int accepted;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not a known, handshake-complete peer -- never process on their behalf */
+    }
+
+    cache = &s_host_pickup_state[peer];
+
+    if (cache->valid && cache->request_id == in->request_id) {
+        /* Duplicate/retry: the client's original PICKUP_RESULT was lost, not its request -- reply
+         * with the SAME decision rather than re-validating against now-changed ground truth (by
+         * now, a successful original attempt has already cleared the tile, so a fresh re-check
+         * would wrongly see "already empty" and reject a request that actually succeeded). See
+         * s_host_pickup_state's own doc comment. */
+        memset(&out, 0, sizeof(out));
+        out.msg_type = (uint8_t)PC_NETGAME_MSG_PICKUP_RESULT;
+        out.accepted = cache->accepted;
+        out.ut_x = cache->ut_x;
+        out.ut_z = cache->ut_z;
+        out.request_id = cache->request_id;
+        out.granted_item = cache->granted_item;
+        pc_net_send(peer, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
+        return;
+    }
+
+    accepted = pcnetgame_validate_and_resolve_pickup(peer, in->ut_x, in->ut_z, &granted_item);
+    if (accepted) {
+        /* The one authoritative mutation -- the exact same underlying grid write
+         * Player_actor_putin_item() (m_player_common.c_inc) already performs for a local pickup,
+         * just addressed by tile coordinate instead of world position since that is what the wire
+         * already carries (see mFI_UtNumtoFGSet_common(), src/game/m_field_info.c). */
+        mFI_UtNumtoFGSet_common((mActor_name_t)EMPTY_NO, (int)in->ut_x, (int)in->ut_z, TRUE);
+    }
+
+    cache->valid = 1;
+    cache->request_id = in->request_id;
+    cache->accepted = (uint8_t)accepted;
+    cache->ut_x = in->ut_x;
+    cache->ut_z = in->ut_z;
+    cache->granted_item = (uint16_t)granted_item;
+
+    memset(&out, 0, sizeof(out));
+    out.msg_type = (uint8_t)PC_NETGAME_MSG_PICKUP_RESULT;
+    out.accepted = (uint8_t)accepted;
+    out.ut_x = in->ut_x;
+    out.ut_z = in->ut_z;
+    out.request_id = in->request_id;
+    out.granted_item = (uint16_t)granted_item;
+    pc_net_send(peer, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
+
+    if (accepted) {
+        pcnetgame_broadcast_field_update(in->ut_x, in->ut_z, (uint16_t)EMPTY_NO);
+    }
+}
+
+/* Client side: the host's authoritative answer to our own pending pickup request -- see
+ * pc_net_game_request_pickup()'s doc for the overall flow. */
+static void pcnetgame_handle_client_pickup_result(const PCNetGamePickupResultMsg* in) {
+    if (!s_pickup_pending.valid || s_pickup_pending.request_id != in->request_id) {
+        return; /* not our current pending request -- already resolved, already given up after
+                  * timing out, or a stale duplicate from an earlier retry cycle. Ignore rather
+                  * than re-apply anything. */
+    }
+
+    s_pickup_pending.valid = 0; /* resolved either way -- never retried or re-applied again */
+
+    if (!in->accepted) {
+        printf("[NET][PICKUP] request %u rejected by host (tile %d,%d)\n", (unsigned)in->request_id,
+               (int)in->ut_x, (int)in->ut_z);
+        return;
+    }
+
+    /* Stage 5A: the one place this file ever writes to Now_Private (see this file's own header
+     * comment) -- via the real, unmodified mPr_SetFreePossessionItem(), exactly as
+     * Player_actor_setup_main_Pickup() would have called it locally in single-player (see the
+     * Stage 5A inventory-architecture audit, Parts 4/6). No slot number is sent by the host (see
+     * PCNetGamePickupResultMsg's doc) -- this client's own real pocket contents are the only
+     * correct basis for choosing one. */
+    if (Now_Private == NULL) {
+        printf("[NET][PICKUP] request %u accepted (item=%u) but no save is loaded -- item lost\n",
+               (unsigned)in->request_id, (unsigned)in->granted_item);
+        return;
+    }
+    if (!mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)in->granted_item, mPr_ITEM_COND_NORMAL)) {
+        /* Pockets filled up between sending the request and this result arriving, or were already
+         * full when the request was sent (see this stage's Setup_main_Pickup seam, which forces
+         * exchange_flag off for a network client for exactly this reason). Per the Stage 5A
+         * inventory-architecture audit: never fabricate a slot, never grant twice -- log and let
+         * the item be lost from this client's perspective rather than reimplementing the vanilla
+         * swap/drop submenu against network-pending state. The field tile itself is unaffected:
+         * it was already cleared, authoritatively, for every client, by the FIELD_UPDATE this
+         * same PICKUP_RESULT is paired with. */
+        printf("[NET][PICKUP] request %u accepted (item=%u) but local pockets are full -- item lost\n",
+               (unsigned)in->request_id, (unsigned)in->granted_item);
+    }
+}
+
+/* Stage 5A: applies a FIELD_UPDATE if the local field data can accept it right now, otherwise
+ * queues it for pc_net_game_poll() to retry -- see s_pending_field_updates's own doc comment for
+ * why this must never simply be dropped on failure. */
+static void pcnetgame_apply_field_update_or_defer(uint8_t ut_x, uint8_t ut_z, uint16_t new_fg_value) {
+    int i, target_slot;
+
+    if (mFI_UtNumtoFGSet_common((mActor_name_t)new_fg_value, (int)ut_x, (int)ut_z, TRUE)) {
+        return; /* applied immediately -- the common case */
+    }
+
+    target_slot = -1;
+    for (i = 0; i < PC_NETGAME_PENDING_FIELD_UPDATE_MAX; i++) {
+        if (s_pending_field_updates[i].valid && s_pending_field_updates[i].ut_x == ut_x &&
+            s_pending_field_updates[i].ut_z == ut_z) {
+            target_slot = i; /* an existing pending update for this SAME tile -- overwrite it,
+                                * only the latest value for a tile is ever meaningful */
+            break;
+        }
+        if (target_slot == -1 && !s_pending_field_updates[i].valid) {
+            target_slot = i;
+        }
+    }
+    if (target_slot == -1) {
+        /* Every slot holds a DIFFERENT still-pending tile -- extremely unlikely (would need this
+         * many distinct field mutations to arrive while the local field data genuinely isn't
+         * ready, e.g. during the same early-boot window the appearance crash fix already covers),
+         * but overwrite the oldest rather than drop the newest so recent activity wins. */
+        target_slot = 0;
+        printf("[NET][PICKUP] pending field-update queue full -- overwriting oldest deferred update\n");
+    }
+    s_pending_field_updates[target_slot].valid = 1;
+    s_pending_field_updates[target_slot].ut_x = ut_x;
+    s_pending_field_updates[target_slot].ut_z = ut_z;
+    s_pending_field_updates[target_slot].new_fg_value = new_fg_value;
+}
+
+/* Client side: the host's authoritative statement about one field tile -- see
+ * PCNetGameFieldUpdateMsg's own doc comment. Applies to every client, including the one whose own
+ * request caused it (that client separately gets a unicast PICKUP_RESULT, handled above; this
+ * message is what makes every OTHER client's world converge). */
+static void pcnetgame_handle_client_field_update(const PCNetGameFieldUpdateMsg* in) {
+    pcnetgame_apply_field_update_or_defer(in->ut_x, in->ut_z, in->new_fg_value);
+}
+
 /* Host side: a peer's raw PC_NET_EVENT_DATA payload. Anything that isn't a well-formed
  * IDENTITY message is ignored -- a peer is only ever marked READY by successfully validating
  * one, never merely by having sent *some* UDP packet. */
@@ -619,6 +1071,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         PCNetGameAppearanceMsg ap;
         memcpy(&ap, data, sizeof(ap));
         pcnetgame_handle_host_appearance(peer, &ap);
+        return;
+    }
+
+    if (size == sizeof(PCNetGamePickupRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PICKUP_REQUEST) {
+        PCNetGamePickupRequestMsg pr;
+        memcpy(&pr, data, sizeof(pr));
+        pcnetgame_handle_host_pickup_request(peer, &pr);
         return;
     }
 
@@ -651,6 +1110,12 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     }
 
     if (peer >= 0 && peer < PC_NET_MAX_PEERS) s_host_peer_link[peer] = PC_NETGAME_LINK_READY;
+    pcnetgame_reset_host_pickup_state(peer); /* Stage 5A: defensive -- see
+                                                * pcnetgame_reset_host_pickup_state()'s own doc;
+                                                * belt-and-suspenders alongside the disconnect-time
+                                                * reset in case this exact peer slot somehow became
+                                                * READY again without this file observing the
+                                                * PC_NET_EVENT_PEER_DISCONNECTED in between */
     printf("[NET] host: peer %d -> READY\n", (int)peer);
 
     /* Stage 4C-1 (3+ player backfill fix): give this now-READY client the host's own appearance
@@ -684,6 +1149,20 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCNetGameAppearanceMsg ap;
         memcpy(&ap, data, sizeof(ap));
         pcnetgame_handle_client_appearance(&ap);
+        return;
+    }
+
+    if (size == sizeof(PCNetGamePickupResultMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PICKUP_RESULT) {
+        PCNetGamePickupResultMsg pr;
+        memcpy(&pr, data, sizeof(pr));
+        pcnetgame_handle_client_pickup_result(&pr);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameFieldUpdateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_FIELD_UPDATE) {
+        PCNetGameFieldUpdateMsg fu;
+        memcpy(&fu, data, sizeof(fu));
+        pcnetgame_handle_client_field_update(&fu);
         return;
     }
 
@@ -771,6 +1250,15 @@ int pc_net_game_start_client(const char* host_ip, uint16_t port) {
     s_role = PC_NETGAME_ROLE_CLIENT;
     s_client_link = PC_NETGAME_LINK_CONNECTING;
     s_client_host_identity_valid = 0;
+
+    /* Stage 5A: a fresh connection must never carry over a previous one's pickup state -- reset
+     * the request-id counter (so it can never collide with a value the NEW host's dedup cache
+     * might coincidentally still associate with a totally different prior connection) and drop
+     * any pending/deferred pickup bookkeeping outright. */
+    memset(&s_pickup_pending, 0, sizeof(s_pickup_pending));
+    s_next_pickup_request_id = 1;
+    memset(s_pending_field_updates, 0, sizeof(s_pending_field_updates));
+
     printf("[NET] connecting to %s:%u...\n", host_ip, (unsigned)port);
     return 1;
 }
@@ -805,6 +1293,53 @@ void pc_net_game_shutdown(void) {
     pc_remote_player_shutdown();
 }
 
+/* Stage 5A.1: --pickup-test-seed (see pc_main.c/pc_platform.h). Host-only, and a complete no-op
+ * unless that flag was passed on the command line -- normal single-player and normal hosted play
+ * (without the flag) never execute anything in this function beyond the flag check itself.
+ *
+ * Exists because this project's own test save has zero naturally-occurring loose field items
+ * anywhere in the addressable town (confirmed by an exhaustive scan during the Stage 5A
+ * implementation pass), and Stage 5A's protocol deliberately gives a client no way to read raw
+ * field truth (see pc_net_game_request_pickup()'s doc) -- so test_pickup_sync.py's own live
+ * discovery scan has nothing to find without a fixture. This is that fixture: one candidate tile
+ * per acre (30 total, spread evenly so at least some land on acres the host has actually streamed
+ * in), each written with mFI_UtNumtoFGSet_common() -- the identical primitive real pickup already
+ * uses -- and each retried every frame ONLY until it individually succeeds once, never again after
+ * that (so a real, later pickup of a seeded tile stays genuinely empty for the rest of the
+ * session, rather than this function fighting it back to non-empty). There is deliberately no
+ * overall timeout: different acres were observed (during implementation) to become writable at
+ * different, unpredictable times after boot, and this is test-only code where waiting a few extra
+ * seconds costs nothing. */
+static void pcnetgame_run_pickup_test_seed(void) {
+    static const int s_seed_tiles[30][2] = {
+        { 8, 8 },   { 24, 8 },  { 40, 8 },  { 56, 8 },  { 72, 8 },
+        { 8, 24 },  { 24, 24 }, { 40, 24 }, { 56, 24 }, { 72, 24 },
+        { 8, 40 },  { 24, 40 }, { 40, 40 }, { 56, 40 }, { 72, 40 },
+        { 8, 56 },  { 24, 56 }, { 40, 56 }, { 56, 56 }, { 72, 56 },
+        { 8, 72 },  { 24, 72 }, { 40, 72 }, { 56, 72 }, { 72, 72 },
+        { 8, 88 },  { 24, 88 }, { 40, 88 }, { 56, 88 }, { 72, 88 },
+    };
+    static int s_seed_done[30] = { 0 };
+    static int s_logged = 0;
+    int i;
+
+    if (!g_pc_pickup_test_seed || s_role != PC_NETGAME_ROLE_HOST || gamePT == NULL) {
+        return;
+    }
+    if (!s_logged) {
+        s_logged = 1;
+        printf("[NET][PICKUP] --pickup-test-seed active: seeding up to 30 fixture tiles\n");
+    }
+    for (i = 0; i < 30; i++) {
+        if (!s_seed_done[i] &&
+            mFI_UtNumtoFGSet_common((mActor_name_t)ITM_FOOD_APPLE, s_seed_tiles[i][0], s_seed_tiles[i][1], TRUE)) {
+            s_seed_done[i] = 1;
+            printf("[NET][PICKUP] --pickup-test-seed: fixture item placed at tile (%d,%d)\n", s_seed_tiles[i][0],
+                   s_seed_tiles[i][1]);
+        }
+    }
+}
+
 void pc_net_game_poll(void) {
     PCNetEvent ev;
 
@@ -826,6 +1361,10 @@ void pc_net_game_poll(void) {
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_DISCONNECTED;
                     }
                     printf("[NET] host: peer %d disconnected\n", (int)ev.peer);
+                    pcnetgame_reset_host_pickup_state(ev.peer); /* Stage 5A: never let a reused
+                                                                   * peer slot answer a future
+                                                                   * connection with this one's
+                                                                   * cached pickup result */
                     pc_remote_player_on_disconnect(ev.peer);
                     break;
                 case PC_NET_EVENT_DATA:
@@ -856,6 +1395,12 @@ void pc_net_game_poll(void) {
                     s_client_link = PC_NETGAME_LINK_DISCONNECTED;
                     s_client_host_identity_valid = 0;
                     printf("[NET] client: host connection lost\n");
+                    if (s_pickup_pending.valid) {
+                        /* Stage 5A: nothing left to retry to -- drop it immediately rather than
+                         * waiting for the timeout to notice (see Phase 9's "client disconnecting
+                         * with a request in flight" race). */
+                        s_pickup_pending.valid = 0;
+                    }
                     pc_remote_player_on_disconnect(PC_NETGAME_HOST_PLAYER_ID);
                     break;
                 case PC_NET_EVENT_DATA:
@@ -983,6 +1528,60 @@ void pc_net_game_poll(void) {
             s_last_local_appearance = current;
         }
     }
+
+    /* Stage 5A: pending pickup-request timeout/retry, client-only. Gated on gamePT exactly like
+     * every other per-frame timer above (graph_dt_period_elapsed() needs a valid GAME* to read a
+     * frame-time delta from) -- a pickup can only ever be initiated from within active gameplay
+     * (see m_player_main_pickup.c_inc), so this can never need to fire before a GAME_PLAY exists,
+     * and simply pauses -- rather than misfiring -- across a scene transition where gamePT is
+     * briefly NULL, resuming once the new scene's GAME_PLAY exists. See
+     * PC_NETGAME_PICKUP_TIMEOUT_60FPS_FRAMES/PC_NETGAME_PICKUP_MAX_RETRIES' own doc for the exact
+     * values and reasoning. */
+    if (gamePT != NULL && s_pickup_pending.valid &&
+        graph_dt_period_elapsed(gamePT, &s_pickup_pending.timeout_accum, PC_NETGAME_PICKUP_TIMEOUT_60FPS_FRAMES)) {
+        if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+            /* Disconnected (or somehow no longer the client role) while a request was pending --
+             * nothing left to retry to. The disconnect-event handler above already clears this in
+             * the common case; this only catches an edge not routed through that event. */
+            s_pickup_pending.valid = 0;
+        } else if (s_pickup_pending.retry_count >= PC_NETGAME_PICKUP_MAX_RETRIES) {
+            printf("[NET][PICKUP] request %u timed out after %d retries -- giving up (tile %d,%d)\n",
+                   (unsigned)s_pickup_pending.request_id, s_pickup_pending.retry_count,
+                   (int)s_pickup_pending.ut_x, (int)s_pickup_pending.ut_z);
+            s_pickup_pending.valid = 0;
+        } else {
+            PCNetGamePickupRequestMsg msg;
+            s_pickup_pending.retry_count++;
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_type = (uint8_t)PC_NETGAME_MSG_PICKUP_REQUEST;
+            msg.ut_x = s_pickup_pending.ut_x;
+            msg.ut_z = s_pickup_pending.ut_z;
+            msg.request_id = s_pickup_pending.request_id; /* SAME id -- a retry of the same
+                                                              logical request, not a new one, so
+                                                              the host's dedup cache recognizes it */
+            pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+        }
+    }
+
+    /* Stage 5A: retry any FIELD_UPDATE that arrived before the local field data was ready to
+     * accept it -- see s_pending_field_updates's own doc comment for why this must never simply
+     * be dropped. Gated on gamePT for the same reason as every other per-frame block here: there
+     * is nothing meaningful to write into before a GAME_PLAY exists. */
+    if (gamePT != NULL) {
+        int i;
+        for (i = 0; i < PC_NETGAME_PENDING_FIELD_UPDATE_MAX; i++) {
+            if (s_pending_field_updates[i].valid &&
+                mFI_UtNumtoFGSet_common((mActor_name_t)s_pending_field_updates[i].new_fg_value,
+                                        (int)s_pending_field_updates[i].ut_x,
+                                        (int)s_pending_field_updates[i].ut_z, TRUE)) {
+                s_pending_field_updates[i].valid = 0;
+            }
+        }
+    }
+
+    /* Stage 5A.1: see pcnetgame_run_pickup_test_seed()'s own doc -- a complete no-op unless
+     * --pickup-test-seed was passed on the command line. */
+    pcnetgame_run_pickup_test_seed();
 }
 
 PCNetGameRole pc_net_game_role(void) {
@@ -1006,4 +1605,64 @@ int pc_net_game_get_host_identity(PCNetGameIdentity* out) {
     if (s_role != PC_NETGAME_ROLE_CLIENT || !s_client_host_identity_valid || out == NULL) return 0;
     *out = s_client_host_identity;
     return 1;
+}
+
+int pc_net_game_request_pickup(int ut_x, int ut_z) {
+    PCNetGamePickupRequestMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0; /* single-player or host -- caller should proceed with the normal local
+                     mutation, unmodified */
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1; /* malformed input from the caller -- still "handled" (this process has no
+                     authority to mutate locally as a client), just nothing is sent */
+    }
+    if (s_pickup_pending.valid) {
+        /* One already in flight. The decomp state machine itself can't normally trigger a second
+         * Setup_main_Pickup before the first one's animation state exits (see
+         * m_player_main_pickup.c_inc), so this is a defensive no-op, not an expected path -- still
+         * return 1 so the caller never falls through to a local mutation regardless. */
+        return 1;
+    }
+
+    s_pickup_pending.valid = 1;
+    s_pickup_pending.request_id = s_next_pickup_request_id++;
+    s_pickup_pending.ut_x = (uint8_t)ut_x;
+    s_pickup_pending.ut_z = (uint8_t)ut_z;
+    s_pickup_pending.timeout_accum = 0.0f;
+    s_pickup_pending.retry_count = 0;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_PICKUP_REQUEST;
+    msg.ut_x = s_pickup_pending.ut_x;
+    msg.ut_z = s_pickup_pending.ut_z;
+    msg.request_id = s_pickup_pending.request_id;
+    pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+    return 1;
+}
+
+/* Stage 5A.1: called from the decomp pickup state (see m_player_main_pickup.c_inc) right after
+ * the HOST's OWN local pickup has already mutated the field tile through the existing, completely
+ * unmodified single-player code (Player_actor_putin_item()/the PC_ENHANCEMENTS money-bag branch,
+ * both in m_player_common.c_inc/m_player_main_pickup.c_inc) -- never before, and never as a
+ * substitute for it. This function does not touch the field itself (no mFI_* call) -- it only
+ * announces a mutation that has already happened, using the exact same wire message and broadcast
+ * helper (pcnetgame_broadcast_field_update()) the client-request path already uses, so the two
+ * paths can never disagree about what "the field changed" looks like to a connected client.
+ *
+ * A no-op for single-player (s_role != HOST) and, defensively, for a client (a client is never
+ * itself authoritative for the field -- see pc_net_game_request_pickup() -- so it must never
+ * broadcast this regardless of how it might be called). No self-send: the host is not its own
+ * peer, so there is no feedback loop to guard against -- see pcnetgame_broadcast_field_update()'s
+ * own doc comment. */
+void pc_net_game_notify_local_field_pickup(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return; /* malformed input from the caller -- defensive; real decomp callers always pass a
+                   value freshly computed by mFI_Wpos2UtNum() */
+    }
+    pcnetgame_broadcast_field_update((uint8_t)ut_x, (uint8_t)ut_z, (uint16_t)EMPTY_NO);
 }

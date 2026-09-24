@@ -262,6 +262,14 @@ static int pc_parse_rain_intensity(const char* text) {
 static int g_pc_lowaddr_selftest = 0; /* --lowaddr-selftest: exercise the real allocators without a ROM */
 #endif
 
+/* Stage 5A.1: --pickup-test-seed. Test-only, off by default, never active in normal single-player
+ * or hosted play -- see pc_net_game.c's own use of this flag (pcnetgame_run_pickup_test_seed())
+ * for exactly what it does and why it exists (this save's field data has no naturally-occurring
+ * loose items, and the pickup accept-path regression test has no other way to establish one
+ * without a fixture). Global (not static), matching g_pc_verbose's own exact pattern
+ * (pc_platform.h), so pc_net_game.c can read it without any new coupling to pc_main.c. */
+int g_pc_pickup_test_seed = 0;
+
 /* --host / --connect: Stage 1 role selection. No settings.ini persistence (matches --time/
  * --date/--rain: a per-launch dev override, not a saved preference), no UI yet. */
 static int      g_pc_net_role = 0; /* 0 = none/single-player, 1 = host, 2 = client */
@@ -283,6 +291,9 @@ int main(int argc, char* argv[]) {
             printf("  --uber-shader       Disable shader specialization (single uber shader)\n");
             printf("  --host [port]       Start hosting (default port 7777); game plays normally while waiting\n");
             printf("  --connect ip[:port] Connect to a host (default port 7777); game plays normally while connecting\n");
+            printf("  --pickup-test-seed  Host-only test fixture: seeds a few field tiles with an ordinary\n");
+            printf("                      item for the pickup regression test. Never touches gameplay\n");
+            printf("                      otherwise; see pc_net_game.c.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -306,6 +317,8 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--lowaddr-selftest") == 0) {
             g_pc_lowaddr_selftest = 1;
 #endif
+        } else if (strcmp(argv[i], "--pickup-test-seed") == 0) {
+            g_pc_pickup_test_seed = 1;
         } else if (strcmp(argv[i], "--profile") == 0) {
             g_pc_profile_enabled = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {

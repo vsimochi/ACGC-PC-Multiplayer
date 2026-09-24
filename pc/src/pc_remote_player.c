@@ -997,6 +997,27 @@ int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearan
     return 1;
 }
 
+/* Stage 5A: see the doc comment in pc_remote_player.h. Reads the NEWEST entry of the same
+ * snapshot ring pc_remote_player_interpolate() already consumes for rendering -- `snapshot_head`
+ * is "the index the NEXT snapshot will be written to" (see its own field doc above), so the most
+ * recent one is always one slot behind it. Deliberately does not interpolate/predict: this is an
+ * authorization check, not a render position, so the exact last-confirmed sample is the right
+ * thing to validate against, not a smoothed guess. */
+int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    int newest;
+
+    if (slot == NULL || out_x == NULL || out_y == NULL || out_z == NULL || slot->snapshot_count == 0) {
+        return 0;
+    }
+
+    newest = (slot->snapshot_head - 1 + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    *out_x = slot->snapshots[newest].pos_x;
+    *out_y = slot->snapshots[newest].pos_y;
+    *out_z = slot->snapshots[newest].pos_z;
+    return 1;
+}
+
 /* Stage 3 diagnostic: periodically logs each tracked remote player's current (interpolated)
  * actor position, purely so movement replication can be verified from stdout/log output alone --
  * there is no other way to observe a remote actor's live state without a graphical session. Not

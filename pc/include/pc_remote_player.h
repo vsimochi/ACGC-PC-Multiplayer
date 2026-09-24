@@ -83,6 +83,17 @@ void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAp
  * never-seen player_id (returns 0). */
 int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearance* out);
 
+/* Stage 5A: reads this player's most recently accepted movement sample position (the same data
+ * pc_remote_player_on_move() already stores for interpolation/rendering) -- used by the host's
+ * authoritative pickup handler (pc_net_game.c) to validate a remote client's claimed proximity to
+ * a field tile without needing any new tracking of its own. Plain floats, not xyz_t, so this
+ * header never needs a decomp include (matching pc_net_game.h's own PCNetMoveSample convention).
+ * Returns 1 and fills *out_x/*out_y/*out_z if at least one movement sample has ever been accepted
+ * for this player_id, 0 otherwise (outputs left untouched on failure -- e.g. a peer that reached
+ * READY but hasn't sent its first movement sample yet). Safe to call for an out-of-range or
+ * never-seen player_id (returns 0). */
+int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z);
+
 /* Call once per frame, unconditionally, regardless of game/menu/networking state (see
  * pc/src/pc_vi.c, right after pc_net_game_poll()). Retries any actor creation that was deferred
  * because the game/actor system wasn't in a valid state yet. Never blocks, never allocates
