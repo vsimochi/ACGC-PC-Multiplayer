@@ -1,3 +1,8 @@
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 5B-3: pc_net_game_notify_local_drop_landing() -- see this file's
+                           * two bIT_actor_drop_move_fly*() landing sites, below. */
+#endif
+
 static void bit_cmn_single_drawS(GAME* game, bg_item_common_info_c* common_info, mActor_name_t fg_item, xyz_t* pos,
                                  s_xyz* angle, xyz_t* scale, u8 alpha, bIT_DRAW_BF_PROC draw_bf,
                                  bIT_DRAW_AF_PROC draw_af, rgba_t* col);
@@ -704,6 +709,18 @@ static void bIT_actor_drop_move_fly_destruct(bg_item_drop_c* drop) {
                 bIT_common_hole_throw(drop->fg_item, *fg_item_p, &drop->target_position, 1);
             } else {
                 mFI_SetFG_common(drop->fg_item, drop->target_position, FALSE);
+#ifdef TARGET_PC
+                /* Stage 5B-3: forced-completion landing (scene/actor teardown mid-animation) -- the
+                 * real field write is the mFI_SetFG_common() just above; announce it the same way
+                 * the natural-completion site does, only if this is the tile a host-local ordinary
+                 * drop is actually watching. */
+                {
+                    int ut_x, ut_z;
+                    if (mFI_Wpos2UtNum(&ut_x, &ut_z, drop->target_position)) {
+                        pc_net_game_notify_local_drop_landing(ut_x, ut_z, (int)drop->fg_item);
+                    }
+                }
+#endif
             }
         }
 
@@ -1761,6 +1778,22 @@ static void bIT_actor_drop_move_fly(bg_item_drop_c* drop) {
 
             if ((drop->flags & 4) == 0) {
                 mFI_SetFG_common(drop->fg_item, drop->target_position, TRUE);
+#ifdef TARGET_PC
+                /* Stage 5B-3: natural-completion landing -- the real field write is the
+                 * mFI_SetFG_common() just above (note this branch is only reached on the SECOND
+                 * time the landing condition is met: an ordinary drop bounces once first, via the
+                 * drop->_6E branch above, which does not reach here). Announce it only if this is
+                 * the tile a host-local ordinary drop is actually watching -- see
+                 * pc_net_game_notify_local_drop_landing()'s own doc for why every other drop-table
+                 * user (money-rock, get-scoop, pickup-exchange, putin-scoop, a client's own Stage
+                 * 5B-1 drop) safely falls through as a no-op here. */
+                {
+                    int ut_x, ut_z;
+                    if (mFI_Wpos2UtNum(&ut_x, &ut_z, drop->target_position)) {
+                        pc_net_game_notify_local_drop_landing(ut_x, ut_z, (int)drop->fg_item);
+                    }
+                }
+#endif
             }
         }
     } else {

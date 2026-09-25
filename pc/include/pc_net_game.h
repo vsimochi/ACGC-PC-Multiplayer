@@ -212,6 +212,55 @@ int pc_net_game_request_pickup(int ut_x, int ut_z);
  * Never blocks. Safe to call with out-of-range ut_x/ut_z (rejected internally). */
 void pc_net_game_notify_local_field_pickup(int ut_x, int ut_z);
 
+/* Stage 5B-1: called from the decomp drop seam (see m_tag_ovl.c's mTG_field_put_proc) instead of
+ * mutating the field/inventory locally -- this process is a network client, so the host (not the
+ * local save) is the authority on whether (ut_x, ut_z) may receive this item. Sends a
+ * DROP_REQUEST; the pocket slot is only cleared later, if/when the host's DROP_RESULT accepts it
+ * (see pc_net_game.c's pcnetgame_handle_client_drop_result()) -- never at send time.
+ *
+ * pocket_slot_idx/claimed_item are an explicit TRUST BOUNDARY: the host cannot verify either (it
+ * holds no shadow/mirror of any remote player's inventory -- see the Stage 5B audit's
+ * "Inventory/Authority Architecture"). Every OTHER aspect of the request (target tile emptiness,
+ * terrain legality, requester reach, item classification, duplicate/retry) is independently
+ * re-validated host-side; see pcnetgame_validate_and_resolve_drop().
+ *
+ * Returns 1 if this process is a connected, READY client -- meaning the caller must NOT perform the
+ * normal local mutation, whether or not a request was actually queued this call (e.g. one was
+ * already pending). Returns 0 if this process is not a client (single-player or host), in which case
+ * the caller should proceed exactly as before, unmodified. Never blocks. Safe to call with
+ * out-of-range pocket_slot_idx/ut_x/ut_z (rejected internally). */
+int pc_net_game_request_drop(int pocket_slot_idx, int claimed_item, int ut_x, int ut_z);
+
+/* Stage 5B-3: called from the decomp drop-menu seam (see m_tag_ovl.c's mTG_field_put_proc) right
+ * after the HOST's OWN local, vanilla Drop action successfully queues its delayed, animated field
+ * mutation -- i.e. right after the existing mTG_common_throw_put_field() call returns success,
+ * never before it, and never as a substitute for it. Arms a one-shot watch for (ut_x, ut_z): the
+ * next drop that actually lands on that exact tile (see pc_net_game_notify_local_drop_landing(),
+ * called from bg_item_common.c_inc's two landing sites) is announced to clients. Does not touch
+ * the field itself and does not send anything by itself. A no-op for single-player and for a
+ * client (a client's own drop landings are never host-authoritative -- see
+ * pc_net_game_request_drop()). Safe to call with out-of-range ut_x/ut_z (rejected internally). */
+void pc_net_game_arm_local_drop_landing(int ut_x, int ut_z);
+
+/* Stage 5B-3: called from the decomp drop-landing seam (see bg_item_common.c_inc's
+ * bIT_actor_drop_move_fly() and bIT_actor_drop_move_fly_destruct()) immediately AFTER the real
+ * field write already happened -- never before, and never as a substitute for it. If a host-local
+ * drop is currently armed (see pc_net_game_arm_local_drop_landing()) for exactly this tile,
+ * consumes the watch and broadcasts the item that just landed; otherwise a no-op, since the
+ * landing belongs to something else this stage doesn't track (money-rock, get-scoop, pickup-
+ * exchange, putin-scoop, a client's own Stage 5B-1 drop, etc.). A no-op for single-player and for
+ * a client. */
+void pc_net_game_notify_local_drop_landing(int ut_x, int ut_z, int item);
+
+/* Stage 5B-1: does `item` classify as a plain, ordinary outdoor pocket item this stage supports
+ * dropping over the network? Used by the decomp drop seam (m_tag_ovl.c) to give the SAME immediate,
+ * synchronous "can't place that" feedback vanilla's own failure path already gives, rather than
+ * silently sending a request the host is guaranteed to reject. See pc_net_game.c's
+ * pcnetgame_is_droppable_item() for the exact, source-cited classification this wraps -- kept as a
+ * plain int here (not mActor_name_t) to keep this header decomp-independent, matching every other
+ * function in this header. */
+int pc_net_game_is_droppable_item(int item);
+
 #ifdef __cplusplus
 }
 #endif

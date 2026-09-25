@@ -42,6 +42,9 @@
 #include "m_field_info.h"  /* Stage 5A: mFI_UtNum2UtFG()/mFI_UtNumtoFGSet_common()/mFI_UtNumCheck()/
                             * mFI_UtNum2CenterWpos() -- see pcnetgame_handle_host_pickup_request()
                             * and pcnetgame_apply_field_update_or_defer(). */
+#include "m_collision_bg.h" /* Stage 5B-1: mCoBG_CheckPlace() -- see
+                             * pcnetgame_validate_and_resolve_drop(). Already extern-declared
+                             * (include/m_collision_bg.h:440); no decomp changes needed to reach it. */
 #include "pc_lowaddr.h"    /* PC_LOWADDR_LIMIT -- see pcnetgame_is_real_player_actor() */
 #include "pc_platform.h"   /* Stage 5A.1: g_pc_pickup_test_seed -- see pcnetgame_run_pickup_test_seed() */
 
@@ -74,6 +77,11 @@ typedef enum PCNetGameMsgType {
                                          * requester). Carries only the resulting tile value, never
                                          * a request id -- it is a plain fact about the shared
                                          * world, not tied to any one request. */
+    PC_NETGAME_MSG_DROP_REQUEST   = 9,  /* Stage 5B-1: client -> host only. See
+                                          * pcnetgame_handle_host_drop_request(). */
+    PC_NETGAME_MSG_DROP_RESULT    = 10, /* Stage 5B-1: host -> the one requesting client only (never
+                                          * broadcast -- PC_NETGAME_MSG_FIELD_UPDATE, reused
+                                          * unchanged, is what every OTHER client needs). */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -226,6 +234,53 @@ typedef struct PCNetGameFieldUpdateMsg {
 } PCNetGameFieldUpdateMsg;
 _Static_assert(sizeof(PCNetGameFieldUpdateMsg) == 8, "PCNetGameFieldUpdateMsg wire size drifted");
 
+/* Stage 5B-1: client -> host. Mirrors PCNetGamePickupRequestMsg's shape/conventions, with two
+ * additions the Stage 5B protocol audit found required (see the Stage 5B audit's "Proposed Network
+ * Protocol"): an explicit pocket slot index (inventory removal in this codebase is ALWAYS by slot,
+ * never by item-id scan -- confirmed against ~90 mPr_SetPossessionItem call sites in
+ * src/game/m_private.c) and a claimed_item.
+ *
+ * claimed_item is an EXPLICIT TRUST BOUNDARY: the host holds no shadow/mirror of any remote
+ * player's Private_c/inventory (unchanged since the Stage 5A inventory-architecture audit) and
+ * therefore cannot verify this field independently -- see pcnetgame_validate_and_resolve_drop()'s
+ * own doc comment. The host only ever uses it as the value to place, and only after every check it
+ * CAN perform has already passed. This is the same trust posture already accepted for movement sync
+ * (no anti-cheat, Stage 3) -- not a gap introduced here.
+ *
+ * ut_x/ut_z: for Stage 5B-1 this must be exactly the requester's own current field tile (vanilla's
+ * mTG_search_put_pos2 self-tile candidate, src/game/m_tag_ovl.c:2761-2775) -- the host
+ * independently re-derives this from the requester's own last-synced position and requires an
+ * EXACT tile match (not a radius like pickup's reach check -- see
+ * pcnetgame_validate_and_resolve_drop()'s own doc for why). Stage 5B-2 will extend this once
+ * vanilla's own 8-neighbor fallback search is supported over the network. */
+typedef struct PCNetGameDropRequestMsg {
+    uint8_t  msg_type;         /* PC_NETGAME_MSG_DROP_REQUEST */
+    uint8_t  pocket_slot_idx;  /* 0..mPr_POCKETS_SLOT_COUNT-1 */
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t claimed_item;     /* TRUST BOUNDARY -- see doc above */
+    uint16_t _reserved0;
+    uint32_t request_id;
+} PCNetGameDropRequestMsg;
+_Static_assert(sizeof(PCNetGameDropRequestMsg) == 12, "PCNetGameDropRequestMsg wire size drifted");
+
+/* Stage 5B-1: host -> the one requesting client. Mirrors PCNetGamePickupResultMsg's exact shape.
+ * placed_item echoes what the host actually wrote -- normally identical to the request's
+ * claimed_item, since (unlike pickup's granted_item) the host has no independent item truth to
+ * resolve it against; still sent explicitly rather than leaving the client to assume its own claim
+ * was honored verbatim, so the host remains the one stated authority for what is actually now on
+ * the field. Meaningless when accepted == 0. */
+typedef struct PCNetGameDropResultMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_DROP_RESULT */
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint32_t request_id;
+    uint16_t placed_item;
+    uint16_t _reserved0;
+} PCNetGameDropResultMsg;
+_Static_assert(sizeof(PCNetGameDropResultMsg) == 12, "PCNetGameDropResultMsg wire size drifted");
+
 /* Stage 5A: how close a requesting peer's own last-synced position must be to a target tile's
  * center. Vanilla's own reach check (Player_actor_Search_putin_item/CheckItemPosition_forPickup,
  * m_player_common.c_inc) tries hand-offset positions up to 35 world units in front of the player,
@@ -241,6 +296,16 @@ _Static_assert(sizeof(PCNetGameFieldUpdateMsg) == 8, "PCNetGameFieldUpdateMsg wi
 #define PC_NETGAME_PICKUP_MAX_REACH_SQ (50.0f * 50.0f)
 #define PC_NETGAME_PICKUP_MAX_REACH_Y 40.0f /* one field tile's worth (mFI_UNIT_BASE_SIZE) of
                                                vertical slack for terrain/sync staleness */
+
+/* Stage 5B-1: vertical slack for the current-tile-only check below -- see
+ * pcnetgame_validate_and_resolve_drop()'s own doc for why this stage uses an EXACT tile-match
+ * check (not a radius envelope like pickup's PC_NETGAME_PICKUP_MAX_REACH_SQ): "current tile only"
+ * is a precise, discrete concept, not a fuzzy hand-reach one, and a radius sized around one tile
+ * width would sit ambiguously close to the orthogonal-neighbor distance (exactly 40 units) --
+ * discovered while designing this stage's own test coverage. This constant only guards against a
+ * requester whose last-synced Y is wildly stale (e.g. a scene transition mid-flight), not normal
+ * terrain height variation within one tile. */
+#define PC_NETGAME_DROP_MAX_REACH_Y 40.0f
 
 /* ---- module state ---- */
 
@@ -368,6 +433,47 @@ typedef struct PCNetGamePendingFieldUpdate {
     uint16_t new_fg_value;
 } PCNetGamePendingFieldUpdate;
 static PCNetGamePendingFieldUpdate s_pending_field_updates[PC_NETGAME_PENDING_FIELD_UPDATE_MAX];
+
+/* Stage 5B-1: host-only, one slot per pc_net peer -- same purpose, shape, and reasoning as
+ * s_host_pickup_state above (see its own doc comment): the most recently PROCESSED drop request
+ * from this peer, and exactly what was decided, so a retry (original DROP_RESULT lost, not the
+ * request) replays the SAME decision rather than re-validating against now-changed ground truth (a
+ * successful original attempt has already occupied the tile, so a naive re-check would wrongly see
+ * "no longer empty" and reject a request that actually succeeded the first time -- the mirror image
+ * of pickup's own stale-recheck hazard). Kept entirely SEPARATE from s_host_pickup_state rather than
+ * overloading it: a peer could have one pickup and one drop resolve in close succession, and
+ * conflating the two caches would let a retry of one replay the other's decision. Reset on
+ * disconnect and defensively on fresh READY, exactly mirroring pcnetgame_reset_host_pickup_state(). */
+typedef struct PCNetGameHostDropState {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t placed_item;
+} PCNetGameHostDropState;
+static PCNetGameHostDropState s_host_drop_state[PC_NET_MAX_PEERS];
+
+/* Stage 5B-1: client-only. Exactly one outstanding drop request at a time, for the same reason as
+ * s_pickup_pending -- kept as a wholly separate instance (not reused/overloaded) for the same
+ * "don't conflate pickup and drop state" reason as s_host_drop_state above. claimed_item is stored
+ * so a retry resends byte-for-byte the same request the host's dedup cache expects, rather than
+ * relying on the host's replay path happening to ignore it. */
+typedef struct PCNetGameDropPending {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  pocket_slot_idx;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t claimed_item;
+    float    timeout_accum;
+    int      retry_count;
+} PCNetGameDropPending;
+static PCNetGameDropPending s_drop_pending;
+static uint32_t             s_next_drop_request_id = 1;
+
+#define PC_NETGAME_DROP_TIMEOUT_60FPS_FRAMES 30.0f /* ~500ms, mirrors pickup's own budget */
+#define PC_NETGAME_DROP_MAX_RETRIES 3
 
 static void pcnetgame_capture_local_identity(uint8_t* player_name, uint8_t* land_name, uint16_t* player_id,
                                               uint16_t* land_id, uint8_t* has_save) {
@@ -764,6 +870,17 @@ static void pcnetgame_reset_host_pickup_state(PCNetPeerId peer) {
     memset(&s_host_pickup_state[peer], 0, sizeof(s_host_pickup_state[peer]));
 }
 
+/* Stage 5B-1: see s_host_drop_state's own doc comment for why this exists and why it must run on
+ * disconnect and defensively on fresh READY -- exact mirror of pcnetgame_reset_host_pickup_state(),
+ * kept separate for the same "don't conflate pickup and drop state" reason. Safe to call for an
+ * out-of-range peer (no-op). */
+static void pcnetgame_reset_host_drop_state(PCNetPeerId peer) {
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+        return;
+    }
+    memset(&s_host_drop_state[peer], 0, sizeof(s_host_drop_state[peer]));
+}
+
 /* Stage 5A: is `item` one of the wallet-crediting money-bag sentinels Setup_main_Pickup's own
  * PC_ENHANCEMENTS branch special-cases (m_player_main_pickup.c_inc)? Explicitly excluded from
  * this stage's network path -- see pc_net_game_request_pickup()'s doc and the Stage 5A
@@ -832,6 +949,47 @@ static int pcnetgame_is_pickupable_field_item(mActor_name_t item) {
     }
 }
 
+/* Stage 5B-1: does `item` classify as a plain, ordinary outdoor pocket item this stage supports
+ * dropping? A narrow, evidence-based exclusion list rather than a broad guessed allowlist -- see
+ * the Stage 5B audit's "Recommended Stage 5B Scope". Mirrors pcnetgame_is_pickupable_field_item()'s
+ * own NAME_TYPE classification above -- confirmed symmetric during the Stage 5B-1 preflight: the
+ * same FTR0/FTR1/ITEM1 types Stage 5A already treats as ordinary enough to pick up land via the
+ * identical bare mFI_SetFG_common() write when dropped too (bIT_actor_drop_move_fly's ordinary
+ * landing branch, src/bg_item/bg_item_common.c_inc:1758-1764) -- with two additional exclusions
+ * beyond what pickup needed, each confirmed by reading the exact landing code, not guessed:
+ *   - ITM_SIGNBOARD: mTG_common_throw_put_field() special-cases this into a completely different,
+ *     two-phase actor (aSIGN_set_white_sign/src/actor/ac_sign.c) carrying design-pattern data this
+ *     stage's protocol has no field for -- deferred, see the Stage 5B audit.
+ *   - HONEYCOMB: bIT_actor_drop_move_fly's landing code (bg_item_common.c_inc:1755-1757) diverts
+ *     this into a bee-attack event instead of a plain field placement -- placing it via a bare
+ *     mFI_SetFG_common() would silently skip that event, a real behavioral divergence from vanilla,
+ *     not merely a missing enhancement.
+ * NAME_TYPE_ITEM0 ("Scenery items") is excluded by the switch's default case, matching pickup's own
+ * classification -- these never legitimately reach a pocket in the first place (Stage 5A's own
+ * pickup path already never grants one). */
+static int pcnetgame_is_droppable_item(mActor_name_t item) {
+    if (item == (mActor_name_t)EMPTY_NO || item == ITM_SIGNBOARD || item == (mActor_name_t)HONEYCOMB) {
+        return 0;
+    }
+    switch (ITEM_NAME_GET_TYPE(item)) {
+        case NAME_TYPE_FTR0:
+        case NAME_TYPE_FTR1:
+        case NAME_TYPE_ITEM1:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* Stage 5B-1: public wrapper around pcnetgame_is_droppable_item() -- see pc_net_game.h's own doc.
+ * Lets the decomp drop seam (m_tag_ovl.c) give the SAME immediate, synchronous "can't place that"
+ * feedback vanilla's own failure path already gives for an unsupported item, rather than silently
+ * sending a request the host is guaranteed to reject. Plain int, not mActor_name_t, to keep
+ * pc_net_game.h decomp-independent (matching every other function in that header). */
+int pc_net_game_is_droppable_item(int item) {
+    return pcnetgame_is_droppable_item((mActor_name_t)item);
+}
+
 /* Stage 5A: every read-only validation step for one pickup request, in sequence, stopping at the
  * first failure -- never mutates anything, so pcnetgame_handle_host_pickup_request() can call this
  * freely without side effects. Returns 1 and fills *out_granted_item with the host's fully
@@ -868,6 +1026,11 @@ static int pcnetgame_validate_and_resolve_pickup(PCNetPeerId peer, uint8_t ut_x,
         !pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
         return 0; /* can't resolve the tile's center, or no movement sample from this peer yet */
     }
+    /* mFI_UtNum2CenterWpos() only ever writes center.x/center.z -- it never touches center.y, which
+       would otherwise be read uninitialized just below via `dy`. Seed it from the requester's own
+       last-synced height so the vertical-distance check compares against a defined value instead of
+       indeterminate stack memory, without changing what the check is actually guarding against. */
+    center.y = py;
     {
         float dx = center.x - px;
         float dz = center.z - pz;
@@ -878,6 +1041,87 @@ static int pcnetgame_validate_and_resolve_pickup(PCNetPeerId peer, uint8_t ut_x,
     }
 
     *out_granted_item = pcnetgame_resolve_pickup_item(raw_item);
+    return 1;
+}
+
+/* Stage 5B-1: every HOST-VERIFIABLE check for one drop request, in sequence, stopping at the first
+ * failure -- never mutates anything (mirrors pcnetgame_validate_and_resolve_pickup()'s own
+ * discipline exactly). `peer` identifies whose last-synced position to validate proximity against
+ * (see pc_remote_player_get_last_position()) -- never any claim from `in` itself.
+ *
+ * TRUST BOUNDARY (see PCNetGameDropRequestMsg's own doc and the Stage 5B audit's
+ * "Inventory/Authority Architecture"): this function has NO WAY to verify in->pocket_slot_idx or
+ * in->claimed_item actually reflect the requester's real Private_c -- the host holds no
+ * shadow/mirror of any remote inventory (unchanged since Stage 5A) and this stage deliberately does
+ * not introduce one. Every check below is a check this function CAN actually perform independently
+ * (bounds, tile emptiness, terrain legality, current-tile-only reach, item classification, and --
+ * via the caller's dedup cache -- duplicate/replay detection); slot/item POSSESSION is deliberately
+ * not one of them, and this function must never be extended to pretend otherwise.
+ *
+ * Reach check: unlike pickup's PC_NETGAME_PICKUP_MAX_REACH_SQ radius (approximating a fuzzy hand-
+ * reach geometry), Stage 5B-1's own design deliberately supports the requester's CURRENT TILE ONLY
+ * -- a precise, discrete concept -- so this derives the requester's actual current tile from their
+ * last-synced position (mFI_Wpos2UtNum()) and requires an EXACT match against (in->ut_x, in->ut_z),
+ * rather than a radius that would sit ambiguously close to the orthogonal-neighbor distance (also
+ * exactly one tile width). Stage 5B-2 (vanilla's 8-neighbor fallback) will need to widen this. */
+static int pcnetgame_validate_and_resolve_drop(PCNetPeerId peer, const PCNetGameDropRequestMsg* in,
+                                               mActor_name_t* out_placed_item) {
+    mActor_name_t* fg_p;
+    xyz_t center;
+    xyz_t requester_pos;
+    float px, py, pz;
+    int requester_ux, requester_uz;
+
+    if (in->pocket_slot_idx >= mPr_POCKETS_SLOT_COUNT) {
+        return 0; /* not a real pocket slot -- never trust it */
+    }
+    if (!pcnetgame_is_droppable_item((mActor_name_t)in->claimed_item)) {
+        return 0; /* outside Stage 5B-1's supported item classification */
+    }
+    if (mFI_UtNumCheck((int)in->ut_x, (int)in->ut_z, mFI_GetBlockXMax(), mFI_GetBlockZMax()) == FALSE) {
+        return 0; /* out-of-range coordinate -- never trust it, whatever the client intended */
+    }
+    if (mFI_UtNum2DepositGet((int)in->ut_x, (int)in->ut_z)) {
+        return 0; /* buried/reserved tile -- never a legal plain-drop target this stage (bury is
+                     deferred, see the Stage 5B audit) */
+    }
+
+    fg_p = mFI_UtNum2UtFG((int)in->ut_x, (int)in->ut_z);
+    if (fg_p == NULL || *fg_p != (mActor_name_t)EMPTY_NO) {
+        return 0; /* out of range, that acre isn't resident, or -- the common case -- already
+                     occupied (by another item, or RSV_NO/a hole sentinel) */
+    }
+
+    if (mFI_UtNum2CenterWpos(&center, (int)in->ut_x, (int)in->ut_z) == FALSE) {
+        return 0; /* can't resolve the tile's center */
+    }
+    if (mCoBG_CheckPlace(center) == FALSE) {
+        return 0; /* illegal terrain -- water/river/sea/waterfall/diagonal cliff-bridge-bank
+                     corners, mirroring mTG_put_place_check()'s own mCoBG_CheckPlace() call */
+    }
+
+    if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+        return 0; /* no movement sample from this peer yet */
+    }
+    /* mFI_UtNum2CenterWpos() (see its own doc, m_field_info.c) only ever writes center.x/center.z --
+       it never touches center.y, which would otherwise be read uninitialized by the vertical-distance
+       check just below. Seed it from the requester's own last-synced height so that check compares
+       against a defined value instead of indeterminate stack memory, without changing what the check
+       is actually guarding against (a wildly stale vertical position, e.g. mid scene-transition). */
+    center.y = py;
+    if (fabsf(center.y - py) > PC_NETGAME_DROP_MAX_REACH_Y) {
+        return 0; /* wildly stale vertical position (e.g. mid scene-transition) */
+    }
+    requester_pos.x = px;
+    requester_pos.y = py;
+    requester_pos.z = pz;
+    if (!mFI_Wpos2UtNum(&requester_ux, &requester_uz, requester_pos) || requester_ux != (int)in->ut_x ||
+        requester_uz != (int)in->ut_z) {
+        return 0; /* not standing on the claimed tile right now -- see this function's own doc on
+                     why this is an exact match, not a radius */
+    }
+
+    *out_placed_item = (mActor_name_t)in->claimed_item;
     return 1;
 }
 
@@ -968,6 +1212,76 @@ static void pcnetgame_handle_host_pickup_request(PCNetPeerId peer, const PCNetGa
     }
 }
 
+/* Host side: a client's drop request. Exact structural mirror of
+ * pcnetgame_handle_host_pickup_request() (dedup-cache replay, then validate-and-mutate-and-reply,
+ * then broadcast) -- see that function's own doc for the shared reasoning. Never touches any ACTOR,
+ * any PLAYER_ACTOR, or Now_Private; only the shared field grid and small, self-contained network
+ * messages. */
+static void pcnetgame_handle_host_drop_request(PCNetPeerId peer, const PCNetGameDropRequestMsg* in) {
+    PCNetGameHostDropState* cache;
+    PCNetGameDropResultMsg out;
+    mActor_name_t placed_item = (mActor_name_t)EMPTY_NO;
+    int accepted;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not a known, handshake-complete peer -- never process on their behalf */
+    }
+
+    cache = &s_host_drop_state[peer];
+
+    if (cache->valid && cache->request_id == in->request_id) {
+        /* Duplicate/retry: replay the SAME decision rather than re-validating against now-changed
+           ground truth -- see s_host_drop_state's own doc comment for why this matters even more
+           for drop than for pickup (a stale re-check here would see the request's OWN successful
+           mutation and wrongly reject it as "no longer empty"). */
+        memset(&out, 0, sizeof(out));
+        out.msg_type = (uint8_t)PC_NETGAME_MSG_DROP_RESULT;
+        out.accepted = cache->accepted;
+        out.ut_x = cache->ut_x;
+        out.ut_z = cache->ut_z;
+        out.request_id = cache->request_id;
+        out.placed_item = cache->placed_item;
+        pc_net_send(peer, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
+        return;
+    }
+
+    accepted = pcnetgame_validate_and_resolve_drop(peer, in, &placed_item);
+    if (accepted) {
+        /* The one authoritative mutation. Deliberately a direct mFI_UtNumtoFGSet_common() write,
+           NOT a reproduction of vanilla's local ~14-26+ frame physics-drop actor -- confirmed safe
+           during the Stage 5B-1 preflight: for the ordinary-item subset this function's own
+           validation already guarantees (never a hole target -- see the deposit/EMPTY_NO checks
+           above), that actor's only authoritative effect at landing is this exact same bare write
+           (bIT_actor_drop_move_fly's ordinary landing branch, bg_item_common.c_inc:1758-1764); the
+           RSV_NO reservation and the arc animation are transient, local-only presentation state
+           with no persistent effect once the (bypassed, on a network client) animation would have
+           completed. See the Stage 5B audit's "Proposed Network Protocol"/"Host-Local Path". */
+        mFI_UtNumtoFGSet_common(placed_item, (int)in->ut_x, (int)in->ut_z, TRUE);
+    }
+
+    cache->valid = 1;
+    cache->request_id = in->request_id;
+    cache->accepted = (uint8_t)accepted;
+    cache->ut_x = in->ut_x;
+    cache->ut_z = in->ut_z;
+    cache->placed_item = (uint16_t)placed_item;
+
+    memset(&out, 0, sizeof(out));
+    out.msg_type = (uint8_t)PC_NETGAME_MSG_DROP_RESULT;
+    out.accepted = (uint8_t)accepted;
+    out.ut_x = in->ut_x;
+    out.ut_z = in->ut_z;
+    out.request_id = in->request_id;
+    out.placed_item = (uint16_t)placed_item;
+    pc_net_send(peer, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
+
+    if (accepted) {
+        /* Reuses the exact same broadcast helper and PC_NETGAME_MSG_FIELD_UPDATE wire shape pickup
+           already established -- unmodified, see pcnetgame_broadcast_field_update()'s own doc. */
+        pcnetgame_broadcast_field_update(in->ut_x, in->ut_z, (uint16_t)placed_item);
+    }
+}
+
 /* Client side: the host's authoritative answer to our own pending pickup request -- see
  * pc_net_game_request_pickup()'s doc for the overall flow. */
 static void pcnetgame_handle_client_pickup_result(const PCNetGamePickupResultMsg* in) {
@@ -1008,6 +1322,43 @@ static void pcnetgame_handle_client_pickup_result(const PCNetGamePickupResultMsg
         printf("[NET][PICKUP] request %u accepted (item=%u) but local pockets are full -- item lost\n",
                (unsigned)in->request_id, (unsigned)in->granted_item);
     }
+}
+
+/* Client side: the host's authoritative answer to our own pending drop request -- see
+ * pc_net_game_request_drop()'s doc for the overall flow. The field side of an accepted drop arrives
+ * separately via the ordinary FIELD_UPDATE this same acceptance is paired with (see
+ * pcnetgame_handle_host_drop_request()) -- this function's only job is the inventory side: clearing
+ * the exact pocket slot this client itself chose when it sent the request. No slot number travels
+ * on the wire (see PCNetGameDropResultMsg's doc) -- s_drop_pending.pocket_slot_idx, this client's
+ * own already-known choice, is authoritative for which slot to clear. */
+static void pcnetgame_handle_client_drop_result(const PCNetGameDropResultMsg* in) {
+    if (!s_drop_pending.valid || s_drop_pending.request_id != in->request_id) {
+        return; /* not our current pending request -- already resolved, already given up after
+                   timing out, or a stale duplicate from an earlier retry cycle. Ignore rather than
+                   re-apply anything. */
+    }
+
+    s_drop_pending.valid = 0; /* resolved either way -- never retried or re-applied again */
+
+    if (!in->accepted) {
+        printf("[NET][DROP] request %u rejected by host (tile %d,%d)\n", (unsigned)in->request_id,
+               (int)in->ut_x, (int)in->ut_z);
+        return; /* item stays exactly where it was -- never removed locally before this point, so
+                   there is nothing to undo */
+    }
+
+    /* The one place this file writes to Now_Private for a drop -- via the real, unmodified
+       mPr_SetPossessionItem(), exactly as mTG_field_put_proc() would have called it locally in
+       single-player. The field tile itself is handled by the accompanying FIELD_UPDATE, not here. */
+    if (Now_Private == NULL) {
+        printf("[NET][DROP] request %u accepted (item=%u) but no save is loaded -- pocket not cleared\n",
+               (unsigned)in->request_id, (unsigned)in->placed_item);
+        return;
+    }
+    mPr_SetPossessionItem(Now_Private, (int)s_drop_pending.pocket_slot_idx, (mActor_name_t)EMPTY_NO,
+                          mPr_ITEM_COND_NORMAL);
+    printf("[NET][DROP] request %u accepted (item=%u) -- cleared pocket slot %d\n", (unsigned)in->request_id,
+           (unsigned)in->placed_item, (int)s_drop_pending.pocket_slot_idx);
 }
 
 /* Stage 5A: applies a FIELD_UPDATE if the local field data can accept it right now, otherwise
@@ -1081,6 +1432,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGameDropRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_DROP_REQUEST) {
+        PCNetGameDropRequestMsg dr;
+        memcpy(&dr, data, sizeof(dr));
+        pcnetgame_handle_host_drop_request(peer, &dr);
+        return;
+    }
+
     if (size != sizeof(PCNetGameIdentityMsg) || data[0] != (uint8_t)PC_NETGAME_MSG_IDENTITY) {
         return; /* malformed, short, or not an IDENTITY message -- ignore rather than misinterpret */
     }
@@ -1116,6 +1474,8 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
                                                 * reset in case this exact peer slot somehow became
                                                 * READY again without this file observing the
                                                 * PC_NET_EVENT_PEER_DISCONNECTED in between */
+    pcnetgame_reset_host_drop_state(peer);   /* Stage 5B-1: same belt-and-suspenders reasoning,
+                                                * kept separate from the pickup reset above */
     printf("[NET] host: peer %d -> READY\n", (int)peer);
 
     /* Stage 4C-1 (3+ player backfill fix): give this now-READY client the host's own appearance
@@ -1156,6 +1516,13 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCNetGamePickupResultMsg pr;
         memcpy(&pr, data, sizeof(pr));
         pcnetgame_handle_client_pickup_result(&pr);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameDropResultMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_DROP_RESULT) {
+        PCNetGameDropResultMsg dr;
+        memcpy(&dr, data, sizeof(dr));
+        pcnetgame_handle_client_drop_result(&dr);
         return;
     }
 
@@ -1258,6 +1625,11 @@ int pc_net_game_start_client(const char* host_ip, uint16_t port) {
     memset(&s_pickup_pending, 0, sizeof(s_pickup_pending));
     s_next_pickup_request_id = 1;
     memset(s_pending_field_updates, 0, sizeof(s_pending_field_updates));
+
+    /* Stage 5B-1: same reasoning as the pickup reset immediately above, kept as a separate
+       instance -- see s_drop_pending's own doc comment. */
+    memset(&s_drop_pending, 0, sizeof(s_drop_pending));
+    s_next_drop_request_id = 1;
 
     printf("[NET] connecting to %s:%u...\n", host_ip, (unsigned)port);
     return 1;
@@ -1365,6 +1737,9 @@ void pc_net_game_poll(void) {
                                                                    * peer slot answer a future
                                                                    * connection with this one's
                                                                    * cached pickup result */
+                    pcnetgame_reset_host_drop_state(ev.peer);   /* Stage 5B-1: same reasoning,
+                                                                   * kept separate -- see
+                                                                   * s_host_drop_state's own doc */
                     pc_remote_player_on_disconnect(ev.peer);
                     break;
                 case PC_NET_EVENT_DATA:
@@ -1400,6 +1775,11 @@ void pc_net_game_poll(void) {
                          * waiting for the timeout to notice (see Phase 9's "client disconnecting
                          * with a request in flight" race). */
                         s_pickup_pending.valid = 0;
+                    }
+                    if (s_drop_pending.valid) {
+                        /* Stage 5B-1: same reasoning as the pickup case immediately above -- the
+                           item was never removed locally, so there is nothing to lose or restore. */
+                        s_drop_pending.valid = 0;
                     }
                     pc_remote_player_on_disconnect(PC_NETGAME_HOST_PLAYER_ID);
                     break;
@@ -1563,6 +1943,35 @@ void pc_net_game_poll(void) {
         }
     }
 
+    /* Stage 5B-1: pending drop-request timeout/retry, client-only. Exact structural mirror of the
+       pickup retry block above -- see its own doc comment for the shared reasoning (gamePT gate,
+       timeout/retry budget). Kept as a separate block against a separate pending instance rather
+       than merged with pickup's, for the same "don't conflate pickup and drop state" reason as
+       s_drop_pending's own doc comment. */
+    if (gamePT != NULL && s_drop_pending.valid &&
+        graph_dt_period_elapsed(gamePT, &s_drop_pending.timeout_accum, PC_NETGAME_DROP_TIMEOUT_60FPS_FRAMES)) {
+        if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+            s_drop_pending.valid = 0;
+        } else if (s_drop_pending.retry_count >= PC_NETGAME_DROP_MAX_RETRIES) {
+            printf("[NET][DROP] request %u timed out after %d retries -- giving up (tile %d,%d)\n",
+                   (unsigned)s_drop_pending.request_id, s_drop_pending.retry_count,
+                   (int)s_drop_pending.ut_x, (int)s_drop_pending.ut_z);
+            s_drop_pending.valid = 0;
+        } else {
+            PCNetGameDropRequestMsg msg;
+            s_drop_pending.retry_count++;
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_type = (uint8_t)PC_NETGAME_MSG_DROP_REQUEST;
+            msg.pocket_slot_idx = s_drop_pending.pocket_slot_idx;
+            msg.ut_x = s_drop_pending.ut_x;
+            msg.ut_z = s_drop_pending.ut_z;
+            msg.claimed_item = s_drop_pending.claimed_item;
+            msg.request_id = s_drop_pending.request_id; /* SAME id -- see the pickup retry block's
+                                                            own comment */
+            pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+        }
+    }
+
     /* Stage 5A: retry any FIELD_UPDATE that arrived before the local field data was ready to
      * accept it -- see s_pending_field_updates's own doc comment for why this must never simply
      * be dropped. Gated on gamePT for the same reason as every other per-frame block here: there
@@ -1665,4 +2074,90 @@ void pc_net_game_notify_local_field_pickup(int ut_x, int ut_z) {
                    value freshly computed by mFI_Wpos2UtNum() */
     }
     pcnetgame_broadcast_field_update((uint8_t)ut_x, (uint8_t)ut_z, (uint16_t)EMPTY_NO);
+}
+
+/* Stage 5B-3: host-local drop landing tracker. Single slot, not an array: the host has exactly one
+ * local player, and this is only ever armed by, and consumed after, one synchronous
+ * mTG_field_put_proc() menu action -- never reentrant within a frame (mirrors s_drop_pending's own
+ * single-slot reasoning). Populated by pc_net_game_arm_local_drop_landing() (called from the
+ * decomp drop-menu seam, m_tag_ovl.c) and consumed by pc_net_game_notify_local_drop_landing()
+ * (called from the decomp drop-landing seam, bg_item_common.c_inc) -- see both functions' doc
+ * comments in pc_net_game.h for exactly when each side fires. */
+typedef struct {
+    int valid;
+    int ut_x;
+    int ut_z;
+} PCHostLocalDropLanding;
+static PCHostLocalDropLanding s_host_local_drop_landing = {0};
+
+/* Stage 5B-3: see the doc comment in pc_net_game.h. */
+void pc_net_game_arm_local_drop_landing(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return; /* malformed input from the caller -- defensive; real decomp callers always pass a
+                   value freshly computed by mFI_Wpos2UtNum() */
+    }
+    s_host_local_drop_landing.valid = 1;
+    s_host_local_drop_landing.ut_x = ut_x;
+    s_host_local_drop_landing.ut_z = ut_z;
+}
+
+/* Stage 5B-3: see the doc comment in pc_net_game.h. */
+void pc_net_game_notify_local_drop_landing(int ut_x, int ut_z, int item) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!s_host_local_drop_landing.valid || s_host_local_drop_landing.ut_x != ut_x ||
+        s_host_local_drop_landing.ut_z != ut_z) {
+        return; /* not the tile we're watching (or nothing armed) -- some other drop-table user
+                   landed, or a client's own Stage 5B-1 drop already announced itself */
+    }
+    s_host_local_drop_landing.valid = 0;
+    pcnetgame_broadcast_field_update((uint8_t)ut_x, (uint8_t)ut_z, (uint16_t)item);
+}
+
+/* Stage 5B-1: see the doc comment in pc_net_game.h. Exact structural mirror of
+ * pc_net_game_request_pickup() -- see that function's own doc for the shared reasoning
+ * (client-only, one-in-flight, defensive bounds checks). */
+int pc_net_game_request_drop(int pocket_slot_idx, int claimed_item, int ut_x, int ut_z) {
+    PCNetGameDropRequestMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0; /* single-player or host -- caller should proceed with the normal local
+                     mutation, unmodified */
+    }
+    if (pocket_slot_idx < 0 || pocket_slot_idx >= mPr_POCKETS_SLOT_COUNT || ut_x < 0 || ut_x > 255 ||
+        ut_z < 0 || ut_z > 255) {
+        return 1; /* malformed input from the caller -- still "handled" (this process has no
+                     authority to mutate locally as a client), just nothing is sent */
+    }
+    if (s_drop_pending.valid) {
+        /* One already in flight -- defensive no-op, same posture as pickup's own equivalent check
+           (see pc_net_game_request_pickup()'s doc). Unlike pickup, a menu-driven drop COULD in
+           principle be re-triggered by the player before the first result arrives (the menu closes
+           optimistically on send -- see the client seam in m_tag_ovl.c), so this is a real, not
+           purely defensive, guard for Stage 5B-1. */
+        return 1;
+    }
+
+    s_drop_pending.valid = 1;
+    s_drop_pending.request_id = s_next_drop_request_id++;
+    s_drop_pending.pocket_slot_idx = (uint8_t)pocket_slot_idx;
+    s_drop_pending.ut_x = (uint8_t)ut_x;
+    s_drop_pending.ut_z = (uint8_t)ut_z;
+    s_drop_pending.claimed_item = (uint16_t)claimed_item;
+    s_drop_pending.timeout_accum = 0.0f;
+    s_drop_pending.retry_count = 0;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_DROP_REQUEST;
+    msg.pocket_slot_idx = s_drop_pending.pocket_slot_idx;
+    msg.ut_x = s_drop_pending.ut_x;
+    msg.ut_z = s_drop_pending.ut_z;
+    msg.claimed_item = s_drop_pending.claimed_item;
+    msg.request_id = s_drop_pending.request_id;
+    pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+    return 1;
 }

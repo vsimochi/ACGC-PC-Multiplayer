@@ -27,6 +27,11 @@
 #include "m_roll_lib.h"
 #include "m_house.h"
 
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 5B-1: pc_net_game_role()/pc_net_game_request_drop()/
+                           * pc_net_game_is_droppable_item() -- see mTG_field_put_proc's seam. */
+#endif
+
 static void mTG_mark_main_CLR(Submenu* submenu, const mSM_MenuInfo_c* menu_info);
 
 enum {
@@ -3942,6 +3947,17 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         int put_cnt = 0;
         int bad_famicom_cnt = 0;
 
+#ifdef TARGET_PC
+        /* Stage 5B-1: "Drop All" (multiple marked items at once) is not yet a supported network
+         * operation -- only a single-item, current-tile-only drop is (see mTG_field_put_proc's
+         * other branch, below). Skip the loop entirely for a network client so put_cnt/
+         * bad_famicom_cnt both stay 0, which already falls through to the existing
+         * mWR_WARNING_PUT_ITEM warning below -- no new UI path needed. Never let a network client
+         * reach mTG_common_throw_put_field()/mPr_SetPossessionItem() here: both would mutate this
+         * client's own local field/inventory with no host round-trip, a real desync. Single-player
+         * and host are completely unaffected -- this loop runs exactly as before for them. */
+        if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT)
+#endif
         for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
             if ((inv_ovl->item_mark_bitfield & (1 << i)) != 0) {
                 mActor_name_t item = Now_Private->inventory.pockets[i];
@@ -3980,10 +3996,73 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                     mSP_SearchItemCategoryPriority(put_item, mSP_KIND_FURNITURE, mSP_LISTTYPE_SPECIALPRESENT, NULL)) &&
                    mFI_CheckInIsland()) {
             mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_FAMI);
-        } else {
+        }
+#ifdef TARGET_PC
+        else if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            /* Stage 5B-1: a network client never runs the vanilla mutation below directly -- the
+             * host is the authority on the shared field. This still lets vanilla's own,
+             * byte-for-byte-unchanged mTG_search_put_pos() resolve the target tile (reusing its
+             * self-tile/terrain/occupancy logic exactly, per the Stage 5B audit's "Client Path"),
+             * then narrows to Stage 5B-1's supported case afterward:
+             *   - menu_info->data0 == 13 is the pickup-exchange "swap" case (drop the old item AND
+             *     fill this slot with a new one, m_player_main_pickup_exchange.c_inc) -- a
+             *     different inventory effect than a plain clear-to-EMPTY_NO, and not reachable in
+             *     practice for a network client anyway (Stage 5A already forces exchange_flag off
+             *     for clients) -- excluded defensively.
+             *   - put_item must pass pc_net_game_is_droppable_item() (mirrors the host's own
+             *     authoritative classification exactly -- see pc_net_game.c).
+             *   - the resolved target must be the player's OWN current tile, never one of
+             *     mTG_search_put_pos()'s 8-neighbor fallback candidates: Stage 5B-1 deliberately
+             *     supports current-tile-only targeting (Stage 5B-2 will extend this). */
+            int ok = FALSE;
+
+            if ((menu_info->data0 != 13) && pc_net_game_is_droppable_item((int)put_item) &&
+                mTG_search_put_pos(player, &pos, FALSE, FALSE, FALSE, FALSE, FALSE)) {
+                xyz_t current_center;
+                int cur_ux, cur_uz, found_ux, found_uz;
+                int center_ok = mFI_Wpos2UtCenterWpos(&current_center, player->world.position);
+                int cur_ok = center_ok && mFI_Wpos2UtNum(&cur_ux, &cur_uz, current_center);
+                int found_ok = mFI_Wpos2UtNum(&found_ux, &found_uz, pos);
+
+                if (center_ok && cur_ok && found_ok && cur_ux == found_ux && cur_uz == found_uz) {
+                    ok = pc_net_game_request_drop(idx, (int)put_item, found_ux, found_uz);
+                }
+            }
+
+            if (ok) {
+                /* Request sent (or an equivalent request was already in flight) -- do NOT clear the
+                 * pocket, do NOT call mTG_common_throw_put_field(): the host is authoritative now.
+                 * mPr_SetPossessionItem() only happens later, if/when an accepted DROP_RESULT
+                 * arrives (pcnetgame_handle_client_drop_result(), pc_net_game.c) -- see the Stage 5B
+                 * audit's "Inventory Mutation Ordering". The menu still closes immediately here,
+                 * exactly like vanilla's own success path below -- this stage does not add a
+                 * "waiting on the host" UI state; see the Stage 5B-1 implementation report for why. */
+                mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+                mTG_close_window(submenu, menu_info, FALSE);
+            } else {
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+            }
+        }
+#endif
+        else {
             if (mTG_search_put_pos(player, &pos, put_item == ITM_SIGNBOARD, FALSE, put_item == ITM_SIGNBOARD,
                                    put_item == ITM_SIGNBOARD, put_item == ITM_SIGNBOARD) &&
                 mTG_common_throw_put_field(play, put_item, &pos, mCoBG_LAYER0)) {
+#ifdef TARGET_PC
+                /* Stage 5B-3: this ordinary item drop just queued a delayed drop animation (see
+                 * bg_item_common.c_inc) -- the real field write happens several frames from now, so
+                 * arm a watch for this tile instead of announcing anything yet; the two landing
+                 * hooks in bg_item_common.c_inc fire the actual broadcast once it really lands.
+                 * Excludes signboards: those take a completely different, immediate field write
+                 * (aSIGN_set_white_sign(), inside mTG_common_throw_put_field) that never touches
+                 * the drop table at all, so arming here would watch a tile nothing was queued for. */
+                if (put_item != ITM_SIGNBOARD && pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                    int host_ut_x, host_ut_z;
+                    if (mFI_Wpos2UtNum(&host_ut_x, &host_ut_z, pos)) {
+                        pc_net_game_arm_local_drop_landing(host_ut_x, host_ut_z);
+                    }
+                }
+#endif
                 if (menu_info->data0 == 13) {
                     mPr_SetPossessionItem(Now_Private, idx, (mActor_name_t)menu_info->data1, mPr_ITEM_COND_NORMAL);
                     mPlib_request_main_wait_from_submenu();
