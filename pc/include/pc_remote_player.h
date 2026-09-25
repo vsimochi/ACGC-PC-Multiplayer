@@ -94,6 +94,18 @@ int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearan
  * never-seen player_id (returns 0). */
 int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z);
 
+/* Stage 5B-2: reads this player's most recently accepted movement sample facing angle -- the same
+ * PCNetMoveSample.facing_angle (native signed 16-bit engine angle units) pc_remote_player_on_move()
+ * already stores for interpolation/rendering, from the SAME newest snapshot
+ * pc_remote_player_get_last_position() reads. Used by the host's authoritative drop handler
+ * (pc_net_game.c) to reproduce vanilla's facing-dependent neighbor-tile search for a remote client
+ * without any new tracking of its own. Plain int16_t, not s16, so this header never needs a decomp
+ * include (matching pc_remote_player_get_last_position()'s own convention). Returns 1 and fills
+ * *out_angle if at least one movement sample has ever been accepted for this player_id, 0 otherwise
+ * (output left untouched on failure). Safe to call for an out-of-range or never-seen player_id
+ * (returns 0). */
+int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out_angle);
+
 /* Call once per frame, unconditionally, regardless of game/menu/networking state (see
  * pc/src/pc_vi.c, right after pc_net_game_poll()). Retries any actor creation that was deferred
  * because the game/actor system wasn't in a valid state yet. Never blocks, never allocates

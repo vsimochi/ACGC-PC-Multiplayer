@@ -1018,6 +1018,24 @@ int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, fl
     return 1;
 }
 
+/* Stage 5B-2: see the doc comment in pc_remote_player.h. Exact sibling of
+ * pc_remote_player_get_last_position() above -- same slot lookup, same "newest = one behind
+ * snapshot_head" index, same no-interpolation reasoning (an authorization input, not a render
+ * value) -- so a caller reading both back-to-back in one synchronous step always gets the position
+ * and facing of the SAME accepted sample. */
+int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out_angle) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    int newest;
+
+    if (slot == NULL || out_angle == NULL || slot->snapshot_count == 0) {
+        return 0;
+    }
+
+    newest = (slot->snapshot_head - 1 + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    *out_angle = slot->snapshots[newest].facing_angle;
+    return 1;
+}
+
 /* Stage 3 diagnostic: periodically logs each tracked remote player's current (interpolated)
  * actor position, purely so movement replication can be verified from stdout/log output alone --
  * there is no other way to observe a remote actor's live state without a graphical session. Not

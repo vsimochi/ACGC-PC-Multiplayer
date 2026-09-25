@@ -3949,9 +3949,9 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 
 #ifdef TARGET_PC
         /* Stage 5B-1: "Drop All" (multiple marked items at once) is not yet a supported network
-         * operation -- only a single-item, current-tile-only drop is (see mTG_field_put_proc's
-         * other branch, below). Skip the loop entirely for a network client so put_cnt/
-         * bad_famicom_cnt both stay 0, which already falls through to the existing
+         * operation -- only a single-item drop is (see mTG_field_put_proc's other branch, below).
+         * Skip the loop entirely for a network client so put_cnt/bad_famicom_cnt both stay 0,
+         * which already falls through to the existing
          * mWR_WARNING_PUT_ITEM warning below -- no new UI path needed. Never let a network client
          * reach mTG_common_throw_put_field()/mPr_SetPossessionItem() here: both would mutate this
          * client's own local field/inventory with no host round-trip, a real desync. Single-player
@@ -4011,20 +4011,25 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
              *     for clients) -- excluded defensively.
              *   - put_item must pass pc_net_game_is_droppable_item() (mirrors the host's own
              *     authoritative classification exactly -- see pc_net_game.c).
-             *   - the resolved target must be the player's OWN current tile, never one of
-             *     mTG_search_put_pos()'s 8-neighbor fallback candidates: Stage 5B-1 deliberately
-             *     supports current-tile-only targeting (Stage 5B-2 will extend this). */
+             * Stage 5B-2: whatever single tile mTG_search_put_pos() resolves -- the player's own
+             * current tile, or (only when that one is occupied/illegal) the first of its 8-neighbor
+             * zigzag candidates to pass (mTG_search_put_pos2(), above) -- is sent as-is. num_pos is 1
+             * (mTG_search_put_pos()'s own fixed argument), so vanilla has ALREADY collapsed the
+             * choice to exactly one concrete tile here; there is nothing left to enumerate or choose
+             * client-side. The host does not trust this choice: it independently re-runs the same
+             * search from this player's own last-synced position/facing against its own
+             * authoritative field and requires the claim to equal ITS answer (see
+             * pcnetgame_validate_and_resolve_drop(), pc_net_game.c). The arguments below are
+             * deliberately the exact non-signboard arguments vanilla's own drop call uses (see the
+             * `else` branch below with put_item != ITM_SIGNBOARD) -- the host's reproduction is
+             * specialized to exactly this argument set, so they must never drift apart. */
             int ok = FALSE;
 
             if ((menu_info->data0 != 13) && pc_net_game_is_droppable_item((int)put_item) &&
                 mTG_search_put_pos(player, &pos, FALSE, FALSE, FALSE, FALSE, FALSE)) {
-                xyz_t current_center;
-                int cur_ux, cur_uz, found_ux, found_uz;
-                int center_ok = mFI_Wpos2UtCenterWpos(&current_center, player->world.position);
-                int cur_ok = center_ok && mFI_Wpos2UtNum(&cur_ux, &cur_uz, current_center);
-                int found_ok = mFI_Wpos2UtNum(&found_ux, &found_uz, pos);
+                int found_ux, found_uz;
 
-                if (center_ok && cur_ok && found_ok && cur_ux == found_ux && cur_uz == found_uz) {
+                if (mFI_Wpos2UtNum(&found_ux, &found_uz, pos)) {
                     ok = pc_net_game_request_drop(idx, (int)put_item, found_ux, found_uz);
                 }
             }
