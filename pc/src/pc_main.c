@@ -41,10 +41,59 @@ int           g_pc_widescreen_stretch = 0;
 unsigned int pc_image_base = 0;
 unsigned int pc_image_end  = 0;
 
+#ifdef _WIN32
+#include <signal.h>
+
+/* Stage M1-2: headless graceful termination. Sets the SAME shutdown flag the existing SDL_QUIT
+ * handling already uses (pc_platform_poll_events, below) -- the actual final save still only
+ * ever runs later, on the normal single-threaded shutdown path in src/main.c, once graph_proc()
+ * notices g_pc_running==0 and returns. Neither callback below touches the save path, the network
+ * layer, game state, printf, malloc, or file I/O -- each sets exactly one existing int and
+ * returns immediately.
+ *
+ * SetConsoleCtrlHandler is the authoritative Windows mechanism for exactly this: its callback
+ * fires (per Windows' own documented behavior, on a separate OS-created thread -- not a POSIX
+ * signal context) for CTRL_C_EVENT (Ctrl+C), CTRL_BREAK_EVENT (Ctrl+Break), CTRL_CLOSE_EVENT
+ * (console window closed / an ordinary, non-forceful stop request), and CTRL_LOGOFF_EVENT /
+ * CTRL_SHUTDOWN_EVENT (user logoff / system shutdown) -- covering every realistic headless-server
+ * stop request in one place. plain SIGINT/SIGTERM are also registered via the C runtime's own
+ * signal(), for the rarer case something raises those directly rather than going through the
+ * console control mechanism; both call the exact same minimal flag-set.
+ *
+ * g_pc_running is deliberately left a plain int (not volatile/atomic) here: a single aligned-word
+ * write from one other thread, observed by a poll loop that already crosses several OS-call
+ * memory barriers every frame (SDL_PollEvent et al.), is the same accepted idiom this file's own
+ * existing SDL_QUIT handling already relies on just below -- adding a new synchronization
+ * primitive, or changing this variable's declared type across the files that already declare it
+ * extern, was explicitly out of scope for this checkpoint. */
+static BOOL WINAPI pc_console_ctrl_handler(DWORD ctrl_type) {
+    switch (ctrl_type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            g_pc_running = 0;
+            return TRUE; /* handled: suppress the default action (immediate termination) so the
+                          * normal shutdown path gets a chance to run first */
+        default:
+            return FALSE;
+    }
+}
+
+static void pc_signal_handler(int sig) {
+    (void)sig;
+    g_pc_running = 0;
+}
+#endif
+
 void pc_platform_init(void) {
 #ifdef _WIN32
     SetProcessDPIAware();
     SDL_SetHint(SDL_HINT_WINDOWS_INTRESOURCE_ICON, "1");
+    SetConsoleCtrlHandler(pc_console_ctrl_handler, TRUE);
+    signal(SIGINT, pc_signal_handler);
+    signal(SIGTERM, pc_signal_handler);
 #endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -270,6 +319,15 @@ static int g_pc_lowaddr_selftest = 0; /* --lowaddr-selftest: exercise the real a
  * (pc_platform.h), so pc_net_game.c can read it without any new coupling to pc_main.c. */
 int g_pc_pickup_test_seed = 0;
 
+/* Stage 0: --bootstrap-resident N. Non-interactively binds an EXISTING resident from save slot N
+ * (0..PLAYER_NUM-1) and transitions into gameplay (SCENE_FG), without driving the interactive
+ * Rover/player-select flow. Off by default (-1); never active in normal single-player or hosted
+ * play unless explicitly requested. See pc_m_card.c's pc_bootstrap_resident_poll() for exactly
+ * what it does and why (reuses mSDI_StartDataInit()/goto_other_scene() verbatim -- see the Stage 0
+ * bootstrap audit). Global (not static), matching g_pc_pickup_test_seed's own exact pattern, so
+ * pc_m_card.c/pc_vi.c can read it without any new coupling to pc_main.c. */
+int g_pc_bootstrap_resident = -1;
+
 /* --host / --connect: Stage 1 role selection. No settings.ini persistence (matches --time/
  * --date/--rain: a per-launch dev override, not a saved preference), no UI yet. */
 static int      g_pc_net_role = 0; /* 0 = none/single-player, 1 = host, 2 = client */
@@ -294,6 +352,8 @@ int main(int argc, char* argv[]) {
             printf("  --pickup-test-seed  Host-only test fixture: seeds a few field tiles with an ordinary\n");
             printf("                      item for the pickup regression test. Never touches gameplay\n");
             printf("                      otherwise; see pc_net_game.c.\n");
+            printf("  --bootstrap-resident N  Non-interactively bind existing resident slot N and enter\n");
+            printf("                      gameplay, bypassing the Rover/player-select flow. See pc_m_card.c.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -319,6 +379,9 @@ int main(int argc, char* argv[]) {
 #endif
         } else if (strcmp(argv[i], "--pickup-test-seed") == 0) {
             g_pc_pickup_test_seed = 1;
+        } else if (strcmp(argv[i], "--bootstrap-resident") == 0 && i + 1 < argc) {
+            g_pc_bootstrap_resident = atoi(argv[i + 1]);
+            i++;
         } else if (strcmp(argv[i], "--profile") == 0) {
             g_pc_profile_enabled = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {

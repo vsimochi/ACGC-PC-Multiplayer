@@ -29,6 +29,8 @@
 #include "m_cockroach.h"
 #include "m_all_grow_ovl.h"
 #include "m_home.h"
+#include "m_house.h"
+#include "m_play.h"
 #include "lb_rtc.h"
 #include "game.h"
 
@@ -442,6 +444,54 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
 
     OSReport("[PC] GCI save: written successfully to %s (backups rotated)\n", gci_path);
     return TRUE;
+}
+
+/* Stage 0.5C: the smallest possible callable surface for the existing Card-A GCI writer, for
+ * future server-persistence code that must not route through mCD_SaveHome_bg()/
+ * mCD_InitGameStart_bg()/mCD_SaveStation_NextLand_bg() -- all three carry gameplay-specific side
+ * effects (mCD_SaveHome_bg's pc_save_pre_write_side_effects() alone clears held Wisp items and
+ * rewrites reset_code/copy_protect/travel_hard_time; the other two carry their own bind/travel
+ * side effects) that are inappropriate for a headless persistence operation.
+ *
+ * This calls pc_save_write_gci() -- not pc_save_write_gci_to() -- because it is already the
+ * existing zero-logic selector for the canonical Card-A path (PC_GCI_PATH/PC_GCI_TMP_PATH); using
+ * it means this wrapper never constructs or duplicates a path itself. pc_save_write_gci_to() is
+ * used elsewhere only for the Card-B travel case, which does not apply here: a bootstrapped
+ * resident is always a Card-A resident (pcfa_save_ready() already excludes player_no >=
+ * mPr_FOREIGNER, per the Stage 0.5 persistence audit).
+ *
+ * Introduces no new serialization, Save_t manipulation, inventory/field mutation, network
+ * behavior, timing, or shutdown behavior -- it is exactly one call to the existing writer, whose
+ * own pc_save_ready gate and tmp/backup/rename mechanics are entirely unchanged. Returns whatever
+ * pc_save_write_gci() returns (TRUE/FALSE), unchanged.
+ *
+ * Stage M1-1: every INTERACTIVE save trigger reaches the writer only via Actor_info_save_actor()
+ * (src/game/m_actor.c:899-915), which settles transient live-actor field placeholders
+ * (DUMMY_* / RSV_NO / RSV_SIGNBOARD) via restore_fgdata_all(play) before serializing. This wrapper's
+ * periodic/shutdown callers never went through that function (by design -- see above), so this
+ * settling step was missing for M1's own triggers. Call the SAME existing decomp function
+ * directly -- restore_fgdata_all(GAME_PLAY* play), declared include/m_actor.h:1208 -- not
+ * Actor_info_save_actor() itself, since that also runs every live actor's one-shot sv_proc
+ * callback and permanently clears it (m_actor.c:907-910), a broader, non-idempotent side effect
+ * this checkpoint is not scoped to introduce.
+ *
+ * Guarded on gamePT != NULL because the two callers reach this function in genuinely different
+ * states: pc_vi.c's periodic call runs mid-frame with a live GAME_PLAY (SCENE_FG loaded, actors
+ * alive, exactly when a transient placeholder could exist) -- restore_fgdata_all runs and settles
+ * it, as intended. src/main.c's shutdown call runs AFTER graph_proc() has already returned, and
+ * graph_proc's own frame-loop exit already tore the scene down first: game_dt() (src/game.c:239-
+ * 250) calls the current game's cleanup (play_cleanup, src/game/m_play.c:355) BEFORE returning,
+ * which calls Actor_info_dt() (m_play.c:377) -> Actor_info_delete() per actor (m_actor.c:917-932),
+ * itself already calling restore_fgdata_one() (m_actor.c:922) for every actor as it is destroyed
+ * -- so by shutdown-save time every transient placeholder is already settled by ordinary teardown,
+ * and game_dt() has already set gamePT = NULL (src/game.c:249). Calling restore_fgdata_all(NULL)
+ * would dereference play->actor_info unconditionally (m_actor.c:883) and crash; the NULL guard
+ * correctly and safely skips a call that has nothing left to do. */
+int pc_save_write_authoritative(void) {
+    if (gamePT != NULL) {
+        restore_fgdata_all((GAME_PLAY*)gamePT);
+    }
+    return pc_save_write_gci();
 }
 
 /* Read a GCI file into common_data (for home town / Card A) */
@@ -902,6 +952,138 @@ int mCD_InitGameStart_bg(int player_no, int card_private_idx, int start_cond, s3
 
     if (mounted_chan) *mounted_chan = mCD_SLOT_A;
     return mCD_TRANS_ERR_NONE;
+}
+
+/* Stage 0: --bootstrap-resident N (see pc_main.c). Non-interactive town bootstrap: binds an
+ * EXISTING resident from a config-selected slot and transitions into SCENE_FG, without going
+ * through the interactive Rover/player-select flow. Fires at most once per process, from
+ * pc_vi.c's per-frame poll, the first time gamePT is a live "play" GAME_PLAY -- i.e. after the
+ * normal first_game -> second_game -> trademark boot chain has already run, so RNG seeding
+ * (init_rnd(), only called from second_game_init()) and the ARAM mail/pattern/diary buffer
+ * allocation (mCD_save_data_aram_malloc(), only called from first_game_init()) are unaffected;
+ * this bootstrap never bypasses that chain (see the Stage 0 bootstrap audit's risk register).
+ *
+ * Deliberately narrow: this reaches gameplay init only. It does NOT set pc_save_ready (saving
+ * under --bootstrap-resident is a no-op for now -- pc_save_ready is armed only inside
+ * mCD_InitGameStart_bg above) and does NOT run mCD_InitGameStart_bg's Resetti reset-code
+ * bookkeeping. Both are out of scope for this stage. */
+void pc_bootstrap_resident_poll(void) {
+    extern int g_pc_bootstrap_resident; /* pc_main.c; -1 = disabled (default) */
+    static int l_done = 0;
+    int player_no = g_pc_bootstrap_resident;
+    Private_c* priv;
+    GAME_PLAY* play;
+    Door_data_c door_data;
+    int arrange_idx;
+    static const s16 homeX[] = { 2128, 2352, 2128, 2352 };
+    static const s16 homeZ[] = { 1488, 1488, 1768, 1768 };
+    static const u8 drt[] = { mSc_DIRECT_SOUTH_EAST, mSc_DIRECT_SOUTH_WEST, mSc_DIRECT_SOUTH_EAST,
+                              mSc_DIRECT_SOUTH_WEST };
+
+    if (l_done || player_no < 0) {
+        return; /* disabled (default), or already attempted -- fires at most once per process */
+    }
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return; /* wait for a live "play" GAME_PLAY (any scene -- matches the production NPC's own
+                  * precondition: mSDI_StartDataInit only needs game->event to be valid) */
+    }
+    if (((GAME_PLAY*)gamePT)->fb_wipe_mode != WIPE_MODE_NONE) {
+        return; /* wait for the scene's own entrance wipe/fade to settle -- goto_other_scene()
+                  * below refuses (returns "already changing scenes") while this is anything but
+                  * WIPE_MODE_NONE; play_init sets it to NONE, but the scene's first play_main
+                  * frame(s) can still be mid-transition when this poll first observes exec ==
+                  * play_main, so wait for it explicitly rather than guessing a frame count */
+    }
+    l_done = 1; /* never retried, whether what follows succeeds or fails */
+
+    if (player_no >= PLAYER_NUM) {
+        OSReport("[PC] --bootstrap-resident %d: slot out of range (valid: 0..%d)\n", player_no,
+                 PLAYER_NUM - 1);
+        return;
+    }
+    if (mFRm_CheckSaveData() == FALSE) {
+        OSReport("[PC] --bootstrap-resident %d: no valid town save is loaded\n", player_no);
+        return;
+    }
+    priv = Save_GetPointer(private_data[player_no]);
+    if (mPr_CheckPrivate(priv) != TRUE) {
+        OSReport("[PC] --bootstrap-resident %d: slot has no resident\n", player_no);
+        return;
+    }
+    /* Stage 0.5A safety checkpoint: mSDI_StartInitFrom's own exists==FALSE branch
+     * (src/game/m_start_data_init.c:426-450) is vanilla decomp logic for "this resident was away
+     * travelling when the save was last written" -- confirmed by its own comment ("Player loaded
+     * their player data while 'out travelling'") and by every priv->exists=FALSE assignment site
+     * (src/game/m_card.c, src/save_menu.c) all being outgoing-travel paths. That branch does not
+     * refuse the bind; it silently PUNISHES the resident instead -- bzero'ing pockets, zeroing the
+     * wallet/lottery-ticket fields, and clearing deliveries/errands -- before still binding them.
+     * A human hitting this in the interactive flow is a real, intended penalty for quitting mid-
+     * travel. A non-interactively *chosen* resident hitting it is not a player being punished for
+     * their own choice; it is silent data destruction picked by whoever configured
+     * --bootstrap-resident. Refuse before mSDI_StartDataInit ever runs, so Now_Private/player_no
+     * are never bound and none of mSDI_StartInitFrom's side effects (including this one) execute at
+     * all -- Save_t and the resident are left completely untouched, matching this function's
+     * existing fail-closed style for mFRm_CheckSaveData()/mPr_CheckPrivate() above. */
+    if (priv->exists != TRUE) {
+        OSReport("[PC] --bootstrap-resident %d: resident is marked away/travelling "
+                 "(Private_c.exists == FALSE) -- refusing to bind to avoid the vanilla "
+                 "\"loaded while out travelling\" pocket/wallet/quest wipe in "
+                 "mSDI_StartInitFrom\n", player_no);
+        return;
+    }
+
+    /* The exact call site the plan specifies: reuse mSDI_StartDataInit verbatim, the same
+     * function/mode mCD_InitGameStart_bg already uses for "continue an existing resident"
+     * (start_cond == mCD_START_COND_1 above). Its own guards (mFRm_CheckSaveData/mPr_CheckPrivate)
+     * are checked again above so a failure here is unexpected, but its return value is still
+     * checked -- the bootstrap must not continue as though the bind succeeded if it did not. */
+    if (mSDI_StartDataInit(gamePT, player_no, mSDI_INIT_MODE_FROM) != TRUE) {
+        OSReport("[PC] --bootstrap-resident %d: mSDI_StartDataInit failed\n", player_no);
+        return;
+    }
+
+    /* Stage 0.5B: arm the same file-static disk-write gate mCD_InitGameStart_bg arms on its own
+     * equivalent branch (pc_save_ready = 1;, above, inside the pc_save_loaded/mCD_START_COND_1
+     * path) -- same variable, same value, same semantics; pc_save_write_gci_to()'s only gate
+     * ("if (!pc_save_ready) return TRUE;") does not distinguish how it was armed. Unlike that
+     * branch, which arms unconditionally right after calling mSDI_StartDataInit without checking
+     * its return value, this arms ONLY after the bind above has already been confirmed to return
+     * TRUE -- the bootstrap must not mark the save writer live for a resident it never actually
+     * bound. Does not call mCD_InitGameStart_bg/mCD_SaveHome_bg and does not touch the writer
+     * itself; still no new call site invokes it (that remains Stage 0.5C's scope). */
+    pc_save_ready = 1;
+
+    /* mSDI_StartDataInit binds Now_Private/player_no but never sets Save_t.scene_no (confirmed by
+     * the Stage 0 audit). Reach SCENE_FG exactly the way the production continue-town NPC does --
+     * this mirrors ac_npc_restart_schedule.c_inc's aNRST_think_door field-for-field (an ordinary
+     * in-game door transition to this resident's own home, via the same goto_other_scene() every
+     * other door in the game uses), skipping only that NPC's own cosmetic BGM/wipe flourishes
+     * (mBGMPsComp_make_ps_wipe, FADE_TYPE_DEMO), which are not needed to reach a valid play_main. */
+    play = (GAME_PLAY*)gamePT;
+    arrange_idx = mHS_get_arrange_idx(player_no);
+
+    door_data.next_scene_id = SCENE_FG;
+    door_data.exit_type = 1;
+    door_data.extra_data = 1;
+    door_data.exit_position.x = homeX[arrange_idx];
+    door_data.exit_position.y = 0;
+    door_data.exit_position.z = homeZ[arrange_idx];
+    door_data.exit_orientation = drt[arrange_idx];
+    door_data.door_actor_name = HOUSE0 + arrange_idx;
+    door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
+
+    {
+        int scene_res = goto_other_scene(play, &door_data, TRUE);
+        if (scene_res != TRUE) {
+            OSReport("[PC] --bootstrap-resident %d: goto_other_scene to SCENE_FG failed (res=%d)\n",
+                     player_no, scene_res);
+            return;
+        }
+    }
+    Common_Get(transition).wipe_type = WIPE_TYPE_TRIFORCE;
+
+    OSReport("[PC] --bootstrap-resident %d: resident bound, transitioning to town (SCENE_FG)\n",
+             player_no);
 }
 
 void mCD_LoadLand(void) {

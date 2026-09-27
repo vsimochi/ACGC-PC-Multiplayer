@@ -10,6 +10,17 @@
 #define VI_TVMODE_MPAL_INT    8
 #define VI_TVMODE_EURGB60_INT 20
 
+/* Stage 0.5D: periodic authoritative-town save interval (see the periodic-save block in
+ * VIWaitForRetrace() below). No existing save-interval convention was found anywhere in the repo
+ * to reuse (the Stage 0.5 persistence audit confirmed no autosave/periodic-save mechanism existed
+ * before this stage) -- 60 seconds is a conservative, development-testing value chosen for this
+ * initial M1 implementation: frequent enough to bound data loss to a short, easily-observed window
+ * during testing, infrequent enough that the synchronous whole-Save_t write (a few ms, measured in
+ * the Stage 0.5D report) never has a realistic chance of coinciding with another one. Named
+ * constant, not a magic number, matching this codebase's own PCNET_HEARTBEAT_INTERVAL_MS-style
+ * naming (pc_net.c). Not user-configurable yet -- out of scope for this stage. */
+#define PC_SAVE_INTERVAL_MS 60000u
+
 static u32 retrace_count = 0;
 u32 pc_frame_counter = 0;
 static Uint64 frame_start_time = 0;
@@ -60,6 +71,84 @@ void VIWaitForRetrace(void) {
     /* Stage 2: retries deferred remote-player actor creation once gamePT/the local player actor
      * are valid. Also unconditional every frame; a no-op whenever nothing is pending. */
     pc_remote_player_poll();
+
+    /* Stage 0: --bootstrap-resident N (see pc_main.c/pc_m_card.c). Unconditional every frame,
+     * matching pc_net_game_poll()'s own placement; a no-op unless the flag was passed, and fires
+     * at most once per process (pc_bootstrap_resident_poll() tracks its own one-shot state). */
+    {
+        extern void pc_bootstrap_resident_poll(void);
+        pc_bootstrap_resident_poll();
+    }
+
+    /* Stage 0.5D: periodic authoritative-town save. Fires only while BOTH:
+     *   - this process is the host (pc_net_game_role() == PC_NETGAME_ROLE_HOST) -- an M1 hardening
+     *     correction: the original Stage 0.5D condition below gated on readiness alone, which meant
+     *     an ordinary single-player launch (no --host/--connect at all) silently picked up this same
+     *     background autosave the moment a resident was in town, even though M1 is specifically
+     *     about the hosted-server's persistent town, not vanilla single-player. Deliberately a ROLE
+     *     check, not a peer-count/ready-peer-count/human-presence check: a host with zero connected
+     *     clients must keep saving exactly as before -- this only excludes PC_NETGAME_ROLE_NONE
+     *     (plain single-player) and PC_NETGAME_ROLE_CLIENT (a client never owns the authoritative
+     *     Save_t it's rendering -- the host is the only correct writer of it).
+     *   - the field-authority readiness predicate (pcfa_save_ready(), pc_field_authority.h -- the
+     *     same one every world mutation pcfa_set_tile()/pcfa_set_deposit() already gates on: a bound
+     *     resident, a valid land id, and a live town scene) is true -- independent of network peer
+     *     *count*, player input, NPC dialogue, UI, or scene-transition state, so this behaves
+     *     identically with zero clients connected as with several, for as long as this process is
+     *     hosting. Reuses the existing public accessors as-is; no change to pc_field_authority.c or
+     *     pc_net_game.c, and no second readiness system invented.
+     *
+     * Timing reuses this file's own existing wall-clock source (SDL_GetPerformanceCounter()/
+     * perf_freq, already computed every frame above for frame-time diagnostics) rather than
+     * pc_frame_counter, since the frame counter's real-time rate varies with g_frame_limiter (an
+     * uncapped/--no-framelimit server would otherwise save far more often than intended). No new
+     * thread, timer, or async I/O: a single synchronous comparison, plus (at most once per
+     * PC_SAVE_INTERVAL_MS) one synchronous call into the existing writer, on this same frame-loop
+     * thread, right alongside pc_net_game_poll()/pc_bootstrap_resident_poll() above.
+     *
+     * Writes unconditionally on each elapsed interval rather than only-if-changed: the existing
+     * field-authority dirty-acre mask exists solely for network-delta encoding (Stage 0.5
+     * persistence audit, confirmed no general-purpose "needs saving" indicator exists anywhere in
+     * the repo); building one would be exactly the dirty-state subsystem this stage is not meant
+     * to add. Re-serializing an unchanged Save_t every interval is the simplest correct behavior --
+     * harmless, since the writer already performs a full atomic write regardless of whether
+     * contents actually differ.
+     *
+     * Failure handling: the wrapper's return value is checked and logged; a failed save is neither
+     * retried nor treated as fatal -- the next interval simply tries again on its own schedule. */
+    {
+        extern int pcfa_save_ready(void);
+        extern int pc_save_write_authoritative(void);
+        static Uint64 l_last_save_time = 0;
+
+        if (pc_net_game_role() == PC_NETGAME_ROLE_HOST && pcfa_save_ready()) {
+            if (l_last_save_time == 0) {
+                /* World just became ready (or this is the first ready frame) -- wait one full
+                 * interval before the first periodic save rather than saving immediately. */
+                l_last_save_time = vi_enter;
+            } else {
+                double since_last_ms = (double)(vi_enter - l_last_save_time) * 1000.0 / (double)perf_freq;
+                if (since_last_ms >= (double)PC_SAVE_INTERVAL_MS) {
+                    Uint64 t_save_begin = SDL_GetPerformanceCounter();
+                    int save_ok = pc_save_write_authoritative();
+                    double save_ms =
+                        (double)(SDL_GetPerformanceCounter() - t_save_begin) * 1000.0 / (double)perf_freq;
+                    if (!save_ok) {
+                        printf("[PC] periodic save FAILED after %.1fms (frame %lu)\n", save_ms,
+                               (unsigned long)pc_frame_counter);
+                    } else {
+                        printf("[PC] periodic save OK (%.1fms, frame %lu)\n", save_ms,
+                               (unsigned long)pc_frame_counter);
+                    }
+                    l_last_save_time = vi_enter;
+                }
+            }
+        } else {
+            /* Not ready (startup, scene transition, no bound resident, etc.) -- reset so the
+             * "wait one interval" grace period re-applies whenever the world next becomes ready. */
+            l_last_save_time = 0;
+        }
+    }
 
     /* Drain the frame's last deferred batch here so its cost bills to
      * gx_flush instead of inflating the swap timer. */

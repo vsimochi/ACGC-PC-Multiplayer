@@ -96,6 +96,29 @@ extern void mainproc(void* val) {
     OSReport("[PC] mainproc: calling graph_proc directly (single-threaded)...\n");
     graph_proc(val);
     OSReport("[PC] mainproc: graph_proc returned\n");
+    /* Stage 0.5E: one final authoritative-town save on the normal graceful shutdown path (this is
+     * the game's only quit path -- reached identically whether the window was closed or the game
+     * itself requested exit, since both simply return from graph_proc's loop, per pc_vi.c's
+     * g_pc_running check). Reuses pc_save_write_authoritative() (Stage 0.5C) and the same
+     * pcfa_save_ready() readiness predicate periodic saving already gates on (Stage 0.5D) -- no new
+     * save mechanism, no serialization duplication, no signal handler (this path already runs
+     * synchronously and unconditionally on every graceful exit; nothing about it requires one).
+     * Skipped entirely if pcfa_save_ready() is false (no resident ever bound, still on the title/
+     * select screen, etc.) so this never fires during early startup. No existing shutdown save
+     * exists to integrate with instead -- confirmed absent in the Stage 0.5 persistence audit and
+     * re-verified directly in this file before adding this. */
+    {
+        extern int pcfa_save_ready(void);
+        extern int pc_save_write_authoritative(void);
+        if (pcfa_save_ready()) {
+            OSReport("[PC] mainproc: final authoritative save before shutdown...\n");
+            if (!pc_save_write_authoritative()) {
+                OSReport("[PC] mainproc: final shutdown save FAILED\n");
+            } else {
+                OSReport("[PC] mainproc: final shutdown save OK\n");
+            }
+        }
+    }
     {
         extern void pc_platform_shutdown(void);
         extern void pc_net_game_shutdown(void); /* no-op if networking was never started (single-player) */
