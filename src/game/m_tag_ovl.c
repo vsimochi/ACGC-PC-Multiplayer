@@ -2897,6 +2897,26 @@ static int mTG_common_throw_put_field(GAME_PLAY* play, mActor_name_t item, xyz_t
     return res;
 }
 
+#ifdef TARGET_PC
+/* Host-local guard for the vanilla (host / single-player) field drop: FALSE iff the resolved target tile is
+ * currently RESERVED by a network client's pending pickup/drop on this host (pc_net_game_field_tile_reserved()
+ * is 0 for single-player, clients, indoors and out-of-range tiles, so this is always TRUE for them). Callers
+ * fold it into vanilla's own "can we place here" condition, so a reserved tile takes the same failure path
+ * (the mWR_WARNING_PUT_* warning window) as any other unplaceable tile and nothing is mutated. */
+static int mTG_host_put_tile_free(const xyz_t* pos_p) {
+    int ut_x;
+    int ut_z;
+
+    if (mFI_Wpos2UtNum(&ut_x, &ut_z, *pos_p)) {
+        return !pc_net_game_field_tile_reserved(ut_x, ut_z);
+    }
+
+    return TRUE;
+}
+#else
+#define mTG_host_put_tile_free(pos_p) TRUE
+#endif
+
 static int mTG_common_throw_put_room(GAME_PLAY* play, mActor_name_t item, xyz_t* pos_p, int layer, int delay_timer) {
     int ux;
     int uz;
@@ -3894,7 +3914,8 @@ static void mTG_plant_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         return;
     } else {
         if (mTG_search_put_pos(player, &pos, TRUE, plant_item == ITM_SIGNBOARD, plant_item == ITM_SIGNBOARD, FALSE,
-                               FALSE)) {
+                               FALSE) &&
+            mTG_host_put_tile_free(&pos)) {
             mActor_name_t item = Now_Private->inventory.pockets[idx];
             mActor_name_t throw_item;
 
@@ -3909,7 +3930,7 @@ static void mTG_plant_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 
             if (mTG_common_throw_put_field(play, throw_item, &pos, mCoBG_LAYER0)) {
                 mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
-                pos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
+                pos.y =mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
                 sAdo_OngenTrgStart(NA_SE_2A, &pos);
                 mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
                 mTG_close_window(submenu, menu_info, FALSE);
@@ -3965,7 +3986,7 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                 if (mTG_check_island_famicom(item)) {
                     if (mTG_search_put_pos(player, &pos, item == ITM_SIGNBOARD, FALSE, item == ITM_SIGNBOARD,
                                            item == ITM_SIGNBOARD, item == ITM_SIGNBOARD) &&
-                        mTG_common_throw_put_field(play, item, &pos, put_cnt)) {
+                        mTG_host_put_tile_free(&pos) && mTG_common_throw_put_field(play, item, &pos, put_cnt)) {
                         mPr_SetPossessionItem(Now_Private, i, EMPTY_NO, mPr_ITEM_COND_NORMAL);
                         put_cnt++;
                     }
@@ -4052,7 +4073,7 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         else {
             if (mTG_search_put_pos(player, &pos, put_item == ITM_SIGNBOARD, FALSE, put_item == ITM_SIGNBOARD,
                                    put_item == ITM_SIGNBOARD, put_item == ITM_SIGNBOARD) &&
-                mTG_common_throw_put_field(play, put_item, &pos, mCoBG_LAYER0)) {
+                mTG_host_put_tile_free(&pos) && mTG_common_throw_put_field(play, put_item, &pos, mCoBG_LAYER0)) {
 #ifdef TARGET_PC
                 /* Stage 5B-3: this ordinary item drop just queued a delayed drop animation (see
                  * bg_item_common.c_inc) -- the real field write happens several frames from now, so
@@ -5120,7 +5141,7 @@ static void mTG_exchange_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                  !mSP_SearchItemCategoryPriority(item, mSP_KIND_FURNITURE, mSP_LISTTYPE_SPECIALPRESENT, NULL))) {
                 if (mTG_search_put_pos(player, &pos, item == ITM_SIGNBOARD, 0, item == ITM_SIGNBOARD, FALSE,
                                        item == ITM_SIGNBOARD) &&
-                    mTG_common_throw_put_field(play, item, &pos, mCoBG_LAYER0)) {
+                    mTG_host_put_tile_free(&pos) && mTG_common_throw_put_field(play, item, &pos, mCoBG_LAYER0)) {
                     if (demo_gold_scoop) {
                         mPlib_request_main_demo_get_golden_item_from_submenu();
                     } else {

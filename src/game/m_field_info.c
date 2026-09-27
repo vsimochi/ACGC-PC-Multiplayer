@@ -9,6 +9,12 @@
 #include "m_player_lib.h"
 #include "m_bg_type.h"
 #include "m_fg_type.h"
+#ifdef TARGET_PC
+#include "pc_field_authority.h" /* multiplayer: pcfa_note_tile_write()/pcfa_note_deposit_write() --
+                                 * dirty-tracking hooks only (they set bits / log, never change a
+                                 * write); see mFI_BlockUtNumtoFGSet, mFI_UtNumtoFGSet_common,
+                                 * mFI_ClearDeposit and mFI_SetDeposit below. */
+#endif
 
 static mCoBG_Collision_u l_edge_ut = { { 0, 31, 31, 31, 31, 31, mCoBG_ATTRIBUTE_GRASS0 } };
 
@@ -1312,9 +1318,15 @@ extern int mFI_BlockUtNumtoFGSet(mActor_name_t item, int bx, int bz, int ut_x, i
 
     if (fg_p != NULL && (ut_x >= 0 && ut_x < UT_X_NUM) && (ut_z >= 0 && ut_z < UT_Z_NUM)) {
         int ut_num = mFI_GetUtNum(ut_x, ut_z);
+#ifdef TARGET_PC
+        mActor_name_t pcfa_old = fg_p[ut_num];
+#endif
 
         res = TRUE;
         fg_p[ut_num] = item;
+#ifdef TARGET_PC
+        pcfa_note_tile_write(&fg_p[ut_num], pcfa_old, item);
+#endif
     }
 
     return res;
@@ -1351,7 +1363,13 @@ extern int mFI_UtNumtoFGSet_common(mActor_name_t item, int ut_x, int ut_z, int u
     }
 #endif
 
+#ifdef TARGET_PC
+    mActor_name_t pcfa_old = g_fdinfo->block_info[block_num].fg_info.items_p[ut_num];
+#endif
     g_fdinfo->block_info[block_num].fg_info.items_p[ut_num] = item;
+#ifdef TARGET_PC
+    pcfa_note_tile_write(&g_fdinfo->block_info[block_num].fg_info.items_p[ut_num], pcfa_old, item);
+#endif
     
     if (update) {
         mFI_SetFGUpData();
@@ -2123,7 +2141,13 @@ extern void mFI_ClearDeposit(int bx, int bz) {
         int i;
 
         for (i = 0; i < UT_Z_NUM; i++) {
+#ifdef TARGET_PC
+            u16 pcfa_old = deposit_p[0];
+#endif
             deposit_p[0] = 0;
+#ifdef TARGET_PC
+            pcfa_note_deposit_write(deposit_p, pcfa_old, 0);
+#endif
             deposit_p++;
         }
     }
@@ -2165,7 +2189,14 @@ static int mFI_SetDeposit(u16* deposit, int ut_x, int ut_z, int type) {
     int res = FALSE;
 
     if (deposit != NULL && ut_x >= 0 && ut_x < UT_X_NUM && ut_z >= 0 && ut_z < UT_Z_NUM) {
+#ifdef TARGET_PC
+        u16 pcfa_old = deposit[ut_z];
+#endif
         res = (*control_proc[type])(deposit + ut_z, ut_x);
+#ifdef TARGET_PC
+        /* mFI_DEPOSIT_GET never changes the row, so old == new and the hook is a no-op for it. */
+        pcfa_note_deposit_write(deposit + ut_z, pcfa_old, deposit[ut_z]);
+#endif
     }
 
     return res;

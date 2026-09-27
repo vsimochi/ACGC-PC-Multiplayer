@@ -1,9 +1,7 @@
-/* pc_net.h - minimal PC-native networking layer (Winsock/UDP). Stage 0: standalone foundation.
+/* pc_net.h - minimal PC-native networking layer (Winsock/UDP).
  *
- * This is a brand-new PC-only module. It is NOT wired into the game loop yet -- nothing in
- * src/ or pc/src/pc_main.c calls into this header. It exists to be built and exercised by a
- * standalone test harness (pc/tools/net_spike/) before any gameplay code depends on it, the
- * same way pc_lowaddr.c/pc_lowaddr_selftest.cpp were proven standalone before being trusted.
+ * This is a PC-only module (decomp-independent: no game header is included here). It was first
+ * proven standalone by pc/tools/net_spike/ and is driven in-game by pc_net_game.c.
  *
  * Design summary
  * ---------------
@@ -12,18 +10,57 @@
  *     or pc_net_client_connect() at most once between pc_net_init()/pc_net_shutdown().
  *   - UDP has no real connection state, so a tiny HELLO / HELLO_ACK handshake plus periodic
  *     heartbeats let each side detect "peer connected" and "peer disconnected (timed out or
- *     said goodbye)" without inventing anything heavier.
- *   - Two message kinds exist, PC_NET_UNRELIABLE and PC_NET_RELIABLE, so callers can already
- *     express intent (e.g. position updates vs. inventory changes). PC_NET_UNRELIABLE is a
- *     complete, real plain-UDP send. PC_NET_RELIABLE is *not* a full ack/retransmit/ordering
- *     protocol yet -- see the comment on pc_net_send() below. That is deliberately left as a
- *     documented placeholder for a later stage rather than a half-working implementation.
- *   - No dynamic allocation on the packet path: a fixed-size peer table and a fixed-size event
- *     ring buffer are the module's only state, all owned internally (never exposed).
- *   - This header never includes <windows.h>/winsock. No Windows-specific type appears here
- *     or needs to appear in any game header that might one day include this one.
- *   - No thread is created by this module. Call pc_net_poll() from whatever thread should
- *     drive networking (intended to eventually be the main/game thread, once integrated).
+ *     said goodbye)" without inventing anything heavier. A client's HELLO carries a random
+ *     32-bit nonce; a HELLO from an already-connected address with a DIFFERENT nonce means the
+ *     remote process restarted, and is reported as DISCONNECTED (old logical peer) followed by
+ *     CONNECTED (fresh logical peer, possibly the same slot index).
+ *   - Legacy (protocol v1) builds have no reliable transport and would hang against this one, so
+ *     they are refused at the handshake: a HELLO without a nonce (size 0) is never accepted (the
+ *     host allocates no slot, raises no event, and answers with a DISCONNECT), and a size-0
+ *     HELLO_ACK to a nonce HELLO (a v1 host) makes the client give up (see
+ *     pc_net_client_connect()).
+ *   - Two message kinds exist:
+ *       PC_NET_UNRELIABLE: one plain UDP datagram, fire-and-forget. May be lost, duplicated or
+ *         reordered by the network. Never waits on anything (movement lives here).
+ *       PC_NET_RELIABLE: reliable + ordered, per peer, per direction. Every reliable payload
+ *         sent to a peer is delivered to that peer's game layer exactly once and in send order,
+ *         or the link is torn down (a normal PC_NET_EVENT_PEER_DISCONNECTED on both sides) after
+ *         a bounded retransmit budget. See "Reliability" below.
+ *     Reliable and unreliable traffic are NOT ordered relative to each other.
+ *   - No dynamic allocation anywhere: a fixed-size peer table, fixed per-peer reliable send /
+ *     receive windows and a fixed-size event ring are the module's only state, all owned
+ *     internally (never exposed).
+ *   - This header never includes <windows.h>/winsock. No Windows-specific type appears here.
+ *   - No thread is created by this module and nothing ever blocks or sleeps. Call pc_net_poll()
+ *     from the thread that drives networking (the main/game thread).
+ *
+ * Reliability (PC_NET_RELIABLE)
+ * -----------------------------
+ *   - Each reliable payload gets a per-peer u32 sequence number (first one of every new
+ *     connection, each direction, is 0) and is transmitted IMMEDIATELY inside pc_net_send(), so
+ *     a reliable message sent right before pc_net_disconnect() still gets one transmission.
+ *   - The receiver acknowledges with a cumulative "next expected seq" plus a 32-bit selective-ack
+ *     bitfield, coalesced to at most one ACK per peer per pc_net_poll() (duplicates re-trigger an
+ *     ACK so a lost ACK is repaired by the sender's retransmit).
+ *   - The sender retransmits every unacknowledged payload on a per-payload timer (initial RTO
+ *     derived from a smoothed RTT estimate, never below 150 ms; doubles per retransmit, capped at
+ *     1000 ms), at most 8 retransmits per peer per poll. A payload that is still unacknowledged
+ *     after 10 retransmits (roughly 9 s at the default RTO) means the reliable contract is
+ *     broken: the peer is disconnected (DISCONNECT notice sent, local
+ *     PC_NET_EVENT_PEER_DISCONNECTED queued).
+ *   - The receiver buffers out-of-order payloads (window PC_NET_RELIABLE_WINDOW), drops
+ *     duplicates, and hands payloads to the event queue strictly in sequence order. An
+ *     already-acknowledged payload is never lost to event-queue pressure: if the queue has no
+ *     room it stays buffered and is delivered on a later poll. Only unreliable data events are
+ *     ever dropped for queue pressure.
+ *   - At most PC_NET_RELIABLE_WINDOW reliable payloads may be queued-or-unacknowledged per peer.
+ *     When that window is full, pc_net_send(..., PC_NET_RELIABLE, ...) returns 0 and queues
+ *     nothing; use pc_net_reliable_backlog() to pace large bursts.
+ *   - All per-peer sequence / ack / retransmit / reorder state is reset whenever a slot is
+ *     allocated or freed (HELLO accept, nonce change, timeout, DISCONNECT, pc_net_disconnect(),
+ *     retransmit-budget exhaustion, client connect, init, shutdown).
+ *   - Heartbeat (500 ms idle) / timeout (5000 ms of silence) semantics are unchanged; any valid
+ *     packet from the peer (including RDATA and ACK) counts as liveness.
  */
 #ifndef PC_NET_H
 #define PC_NET_H
@@ -38,10 +75,14 @@ extern "C" {
 #define PC_NET_MAX_PEERS   8     /* fixed peer table size (host role); a client only ever uses 1 */
 #define PC_NET_MAX_PAYLOAD 1024  /* comfortably under a safe UDP/Ethernet MTU, no fragmentation */
 
-/* Message kind for pc_net_send()/PCNetEvent. See the reliability note on pc_net_send(). */
+/* Max reliable payloads queued-or-unacknowledged per peer (send side), and the receive-side
+ * reorder/hold window per peer. Must be a power of two and >= 64. */
+#define PC_NET_RELIABLE_WINDOW 64
+
+/* Message kind for pc_net_send()/PCNetEvent. See "Reliability" above. */
 typedef enum PCNetMsgKind {
-    PC_NET_UNRELIABLE = 0, /* fire-and-forget; may be lost or arrive out of order */
-    PC_NET_RELIABLE   = 1, /* wire-tagged for a future ack/retransmit/order layer; see pc_net_send() */
+    PC_NET_UNRELIABLE = 0, /* fire-and-forget; may be lost, duplicated or arrive out of order */
+    PC_NET_RELIABLE   = 1, /* acked + retransmitted + deduplicated + ordered per peer/direction */
 } PCNetMsgKind;
 
 /* Opaque peer handle: an index into the module's internal peer table. Never a raw socket/address. */
@@ -62,6 +103,31 @@ typedef struct PCNetEvent {
     uint16_t       size;                     /* meaningful when type == PC_NET_EVENT_DATA */
     uint8_t        data[PC_NET_MAX_PAYLOAD]; /* meaningful when type == PC_NET_EVENT_DATA */
 } PCNetEvent;
+
+/* Transport counters (process-global, cumulative since pc_net_init(); reset by init/shutdown).
+ * Diagnostics/tests only -- nothing in the game should branch on these. */
+typedef struct PCNetStats {
+    uint32_t rdata_sent;                 /* reliable payloads accepted by pc_net_send (per peer) */
+    uint32_t rdata_retransmits;          /* timer-driven retransmissions */
+    uint32_t rdata_received;             /* RDATA datagrams received from connected peers */
+    uint32_t rdata_duplicates;           /* RDATA already received/delivered (dropped, re-ACKed) */
+    uint32_t rdata_out_of_window;        /* RDATA beyond the receive window (dropped, not acked) */
+    uint32_t rdata_delivered;            /* reliable payloads handed to the event queue */
+    uint32_t rdata_delivery_deferred;    /* times in-order delivery paused because the queue was full */
+    uint32_t acks_sent;
+    uint32_t acks_received;
+    uint32_t acks_invalid;               /* ACKs acknowledging seqs never sent (ignored) */
+    uint32_t reliable_budget_disconnects;/* peers dropped for exhausting the retransmit budget */
+    uint32_t nonce_restarts;             /* same-address HELLO with a new nonce (remote restart) */
+    uint32_t legacy_reliable_dropped;    /* legacy DATA(type 4) kind=RELIABLE datagrams dropped */
+    uint32_t legacy_peers_refused;       /* size-0 HELLO (host) / size-0 HELLO_ACK (client) refused */
+    uint32_t events_dropped_unreliable;  /* unreliable data dropped for event-queue pressure */
+    uint32_t events_dropped_control;     /* CONNECTED/DISCONNECTED events lost (queue completely full) */
+    uint32_t fault_dropped_rdata;        /* fault injection counters (0 unless enabled, see pc_net.c) */
+    uint32_t fault_duplicated_rdata;
+    uint32_t fault_reordered_rdata;
+    uint32_t fault_dropped_acks;
+} PCNetStats;
 
 /* --- lifecycle --- */
 
@@ -85,36 +151,59 @@ int pc_net_host_start(uint16_t port);
 /* Creates a UDP socket and sends the first HELLO to host_ip:port. Returns 1 if the socket was
  * created and the first HELLO was sent, 0 on failure (bad address, socket error). This does NOT
  * mean the connection is established yet -- poll for a PC_NET_EVENT_PEER_CONNECTED event (or
- * check pc_net_is_connected()) once the host's HELLO_ACK arrives. */
+ * check pc_net_is_connected()) once the host's HELLO_ACK arrives.
+ *
+ * If the host turns out to be a legacy (protocol v1) build, the attempt is abandoned: the client
+ * logs "[pc_net] host speaks legacy transport (protocol v1); refusing", sends DISCONNECT, and the
+ * event queue receives exactly ONE PC_NET_EVENT_PEER_DISCONNECTED (peer 0) with NO preceding
+ * PC_NET_EVENT_PEER_CONNECTED. pc_net_is_connected() stays 0 and the socket stays open (the
+ * caller should pc_net_shutdown()). A host that never answers at all produces no event: HELLO
+ * is simply resent every 500 ms, as before. */
 int pc_net_client_connect(const char* host_ip, uint16_t port);
 
 /* --- per-frame polling --- */
 
 /* Drains whatever is waiting on the OS socket buffer (never blocks, never sleeps), runs the
- * handshake/heartbeat/timeout state machine, and appends any resulting events to the internal
- * queue. Call once per frame/tick from whichever thread owns networking. */
+ * handshake/heartbeat/timeout state machine, delivers in-order reliable payloads, retransmits
+ * overdue reliable payloads, sends coalesced ACKs, and appends any resulting events to the
+ * internal queue. Call once per frame/tick from whichever thread owns networking. */
 void pc_net_poll(void);
 
 /* Pops the next queued event into *out. Returns 1 if an event was popped, 0 if the queue is
  * empty. Typical use: `while (pc_net_next_event(&ev)) { ...handle ev... }` right after
- * pc_net_poll(). */
+ * pc_net_poll(). Draining the queue every poll keeps reliable delivery flowing; a consumer that
+ * stops draining eventually stalls its peers' reliable streams (and, past the retransmit budget,
+ * gets them disconnected). */
 int pc_net_next_event(PCNetEvent* out);
 
-/* --- sending ---
- *
- * Reliability note: PC_NET_RELIABLE currently behaves identically to PC_NET_UNRELIABLE on the
- * wire (a single UDP datagram, no ack, no retransmit, no ordering guarantee) -- only the wire
- * header's kind tag differs. This is intentional for Stage 0: implementing real reliability
- * (sequence numbers, ack tracking, retransmit timers, resequencing on the receive side) is
- * substantial, dedicated work that belongs in its own later stage once the rest of the
- * transport is proven. Do not depend on PC_NET_RELIABLE actually being reliable yet.
- */
+/* --- sending --- */
 
 /* Sends `size` bytes (must be <= PC_NET_MAX_PAYLOAD) to `peer`, or to every connected peer if
- * `peer` is PC_NET_BROADCAST_PEER. Returns 1 if handed to the OS successfully for every
- * intended recipient, 0 on failure (unknown/disconnected peer, oversized payload, socket
- * error). Never blocks. */
+ * `peer` is PC_NET_BROADCAST_PEER. Never blocks.
+ *
+ * PC_NET_UNRELIABLE: returns 1 if the datagram was handed to the OS for every intended
+ *   recipient, 0 otherwise (unknown/disconnected peer, oversized payload, socket error).
+ *   Wire bytes are exactly the Stage 0 format (8-byte header + payload).
+ *
+ * PC_NET_RELIABLE: returns 1 if the payload was accepted for reliable delivery (queued in the
+ *   peer's send window and transmitted once immediately -- an OS-level send failure of that first
+ *   transmission is repaired by the retransmit timer, not reported). Returns 0 and queues nothing
+ *   if the peer is unknown/not connected, the payload is oversized, or the peer's window
+ *   (PC_NET_RELIABLE_WINDOW) is full.
+ *   Broadcast is ALL-OR-NOTHING: if any connected peer's window is full, nothing is queued to
+ *   anyone and 0 is returned (so retrying the same broadcast can never double-deliver). Returns
+ *   0 if no peer is connected. One slow peer therefore blocks reliable broadcasts to everyone;
+ *   callers sending large bursts should send per peer and check pc_net_reliable_backlog().
+ */
 int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t size);
+
+/* Number of reliable payloads currently queued or unacknowledged to `peer` (0 ..
+ * PC_NET_RELIABLE_WINDOW); -1 for an invalid, broadcast, or not-connected peer. A reliable
+ * send to `peer` succeeds iff this is < PC_NET_RELIABLE_WINDOW. */
+int pc_net_reliable_backlog(PCNetPeerId peer);
+
+/* Copies the cumulative transport counters into *out (zeroed on non-Windows builds). */
+void pc_net_get_stats(PCNetStats* out);
 
 /* --- peer / connection queries --- */
 
@@ -122,7 +211,9 @@ int pc_net_is_host(void);      /* 1 if pc_net_host_start() succeeded and hasn't 
 int pc_net_is_connected(void); /* client: handshake with the host completed. host: currently listening. */
 int pc_net_peer_count(void);   /* number of currently-connected peers (0 or 1 for a client) */
 
-/* Host: sends a DISCONNECT notice to `peer` and immediately frees its local slot.
+/* Host: sends a DISCONNECT notice to `peer` and immediately frees its local slot (all reliable
+ * state for it is discarded, any of its DATA events not yet popped are removed from the queue,
+ * and no local DISCONNECTED event is queued -- the caller already knows).
  * Client: pass PC_NET_INVALID_PEER to leave the current host. */
 void pc_net_disconnect(PCNetPeerId peer);
 

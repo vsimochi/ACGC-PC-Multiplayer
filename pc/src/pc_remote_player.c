@@ -811,11 +811,27 @@ static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
     cKF_Si3_draw_R_SV(game, &self->visual.keyframe0, mtx, NULL, NULL, actor);
 }
 
+/* 1 only if slot->actor still belongs to the GAME_PLAY that is alive right now. game_dt() frees every
+ * actor and sets gamePT to NULL, and graph_proc() does this both between scenes and on quit (before
+ * main.c calls pc_net_game_shutdown()); pc_remote_player_poll()'s generation check has not run yet
+ * for a replaced GAME_PLAY when an event handler gets here, so compare the GAME_PLAY identity too.
+ * gamePT is also the title/player-select/logo GAME, which may reuse a freed GAME_PLAY's address, so
+ * only a GAME running play_main (the only exec a constructed GAME_PLAY has) can own live actors. */
+static int pc_remote_player_actor_is_live(const PCRemotePlayerSlot* slot) {
+    if (slot->actor == NULL || gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    if (slot->scene_generation != s_scene_generation) {
+        return 0;
+    }
+    return gamePT == s_last_seen_game && gamePT->frame_counter >= s_last_seen_frame_counter;
+}
+
 static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot) {
     if (!slot->in_use) {
         return;
     }
-    if (slot->actor != NULL) {
+    if (pc_remote_player_actor_is_live(slot)) {
         /* Two-phase, matching every other actor kind: this only nulls mv_proc/dw_proc. The actor
          * system reaps the memory and unlinks it from Actor_info during its normal per-frame
          * sweep (Actor_info_call_actor / Actor_info_delete). Never free this pointer directly. */

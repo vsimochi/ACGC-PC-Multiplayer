@@ -32,12 +32,37 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
 #ifdef PC_ENHANCEMENTS
     int putaway_money = FALSE;
 #endif
+#ifdef TARGET_PC
+    int host_pickup_blocked = FALSE;
+#endif
 
     slot_idx = req_pickup_p->inv_slot;
     item = req_pickup_p->item;
     target_pos_p = &req_pickup_p->target_pos;
     item_pos_p = &req_pickup_p->item_pos;
     signboard_flag = req_pickup_p->flag;
+
+#ifdef TARGET_PC
+    /* Host-local guard: a network client's pickup/drop of this town tile is pending on the host (the
+     * tile is reserved, the field not yet changed). The host player's own vanilla pickup must not touch
+     * it, or both could end up with the item. When blocked nothing below may mutate anything: the field
+     * clear, the pocket grant and the money-bag/pockets-full exchange are all skipped together further
+     * down (the item stays on the ground and the pickup animation just plays with no item in hand).
+     * pc_net_game_field_tile_reserved() is 0 for single-player, so only a host with a matching
+     * reservation is affected; a network client never reaches it. */
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        int guard_ut_x, guard_ut_z;
+
+        if (mFI_Wpos2UtNum(&guard_ut_x, &guard_ut_z, *target_pos_p) &&
+            pc_net_game_field_tile_reserved(guard_ut_x, guard_ut_z)) {
+            host_pickup_blocked = TRUE;
+            /* nothing is picked up: no item flying to the hand, no golden-shovel/coconut side effects,
+             * and the white sign must not be erased either */
+            item = EMPTY_NO;
+            signboard_flag = FALSE;
+        }
+    }
+#endif
 
     main_pickup_p->target_pos = *target_pos_p;
     main_pickup_p->item_pos = *item_pos_p;
@@ -80,6 +105,12 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
          * unmodified code below -- never mutates anything itself. */
         int host_ut_x = 0, host_ut_z = 0;
         int host_ut_ok = mFI_Wpos2UtNum(&host_ut_x, &host_ut_z, *target_pos_p);
+
+        /* Host-local guard (see above): reserved tile -> skip BOTH the field clear and the pocket grant
+         * (and the money-bag wallet credit) so the item neither duplicates nor disappears. */
+        if (host_pickup_blocked) {
+            /* item stays in the world, inventory untouched */
+        } else
 #endif
 #ifdef PC_ENHANCEMENTS
     /* bells go straight to wallet when the whole amount fits; otherwise the bag is picked up normally */
@@ -102,10 +133,12 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
         }
     }
 #else
+    {
     Player_actor_putin_item(slot_idx, item, target_pos_p);
 #ifdef TARGET_PC
     if (host_ut_ok) pc_net_game_notify_local_field_pickup(host_ut_x, host_ut_z);
 #endif
+    }
 #endif
     }
 
@@ -120,6 +153,13 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
      * -- the safest available Stage 5A fallback rather than reimplementing the swap/drop submenu
      * against network-pending state. */
     if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        main_pickup_p->exchange_flag = FALSE;
+    } else
+#endif
+#ifdef TARGET_PC
+    /* host-local guard blocked the pickup: the item never left the ground, so the pockets-full exchange
+     * (which would re-place / hand out the item) must not run either */
+    if (host_pickup_blocked) {
         main_pickup_p->exchange_flag = FALSE;
     } else
 #endif

@@ -15,6 +15,10 @@
 #include "m_bgm.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_net_game.h"        /* pc_net_game_world_is_host_authoritative(), pc_net_game_role() */
+#include "pc_field_authority.h" /* pcfa_mark_all_dirty() */
+#include "pc_platform.h"        /* g_pc_verbose */
+#include <stdio.h>
 /* Byte-swap all u16 fields in FG data loaded from big-endian ARAM. */
 static void mFM_ByteSwapFGData(mFM_fg_data_c* data, int count) {
     int ei, zi, xi;
@@ -1213,6 +1217,97 @@ extern void mFM_SetFieldInitData(int bg_disp_num, int bg_disp_size) {
     l_bg_disp_size = bg_disp_size;
 }
 
+#ifdef TARGET_PC
+/* Multiplayer: host-authoritative daily growth.
+ *
+ * mFM_FieldInit() runs three growth steps on every field build that write Save fg / Save deposit
+ * directly through pointers (so m_field_info.c's per-tile dirty hooks never see them), using this
+ * process's own RNG and RTC:
+ *   - mAGrw_ChangeCedar2Tree()  every scene: cedars standing on layer 0 -> TREE
+ *   - mAGrw_RenewalFgItem()     town only: weed clear (Wisp), snowman melt, and once per 6 AM
+ *                               boundary (or on a backwards clock) the full daily renewal
+ *   - mAGrw_SetXmasTree()       town only: Dec 10-25 add lights to trees, otherwise remove them
+ *
+ * Host / single-player / not-yet-READY client: run them exactly as before. Afterwards, if the
+ * town's tiles or deposit bits actually changed, mark every town acre dirty so the host's
+ * mutation flush diffs and broadcasts the result (only sets bits; no effect unless hosting).
+ *
+ * READY client (pc_net_game_world_is_host_authoritative() == 1): skip all three, because the
+ * town they mutate is the host's and arrives through the host's snapshot/deltas. Collision-only
+ * field-init work (mFM_PoorTree, mRF_CheckBeastRoad, mFM_PoorTreeUnderPlayerBlock) still runs. */
+static mFM_fg_c l_mfm_pc_grow_fg_before[FG_BLOCK_Z_NUM][FG_BLOCK_X_NUM];
+static u16 l_mfm_pc_grow_deposit_before[FG_BLOCK_X_NUM * FG_BLOCK_Z_NUM][UT_Z_NUM];
+
+typedef char mFM_pc_grow_fg_size_check[(sizeof(l_mfm_pc_grow_fg_before) == sizeof(Save_Get(fg))) ? 1 : -1];
+typedef char mFM_pc_grow_dep_size_check[(sizeof(l_mfm_pc_grow_deposit_before) == sizeof(Save_Get(deposit))) ? 1 : -1];
+
+static void mFM_PcGrowCaptureTown(void) {
+    bcopy(Save_GetPointer(fg), l_mfm_pc_grow_fg_before, sizeof(l_mfm_pc_grow_fg_before));
+    bcopy(Save_GetPointer(deposit), l_mfm_pc_grow_deposit_before, sizeof(l_mfm_pc_grow_deposit_before));
+}
+
+/* Number of town acres whose tiles or deposit bits differ from the last capture. */
+static int mFM_PcGrowCountChangedAcres(void) {
+    int changed = 0;
+    int bz;
+    int bx;
+
+    for (bz = 0; bz < FG_BLOCK_Z_NUM; bz++) {
+        for (bx = 0; bx < FG_BLOCK_X_NUM; bx++) {
+            const mActor_name_t* now_items = Save_Get(fg[bz][bx]).items[0];
+            const mActor_name_t* old_items = l_mfm_pc_grow_fg_before[bz][bx].items[0];
+            const u16* now_dep = Save_Get(deposit[bx + bz * FG_BLOCK_X_NUM]);
+            const u16* old_dep = l_mfm_pc_grow_deposit_before[bx + bz * FG_BLOCK_X_NUM];
+            int diff = FALSE;
+            int i;
+
+            for (i = 0; i < UT_TOTAL_NUM && !diff; i++) {
+                diff = now_items[i] != old_items[i];
+            }
+
+            for (i = 0; i < UT_Z_NUM && !diff; i++) {
+                diff = now_dep[i] != old_dep[i];
+            }
+
+            if (diff) {
+                changed++;
+            }
+        }
+    }
+
+    return changed;
+}
+
+static void mFM_PcFieldInitGrowth(int scene) {
+    int changed_acres;
+
+    if (pc_net_game_world_is_host_authoritative()) {
+        /* Deliberately NOT consuming Save clear_grass/haniwa_scheduled and NOT advancing
+         * all_grow_renew_time here: the host's snapshot carries the town (and its renew time). */
+        if (g_pc_verbose) {
+            printf("[NET][GROW] scene %d: client world is host-authoritative -- skipped local cedar/renewal/xmas growth\n",
+                   scene);
+        }
+        return;
+    }
+
+    mFM_PcGrowCaptureTown();
+    mAGrw_ChangeCedar2Tree();
+    mAGrw_RenewalFgItem(Common_GetPointer(time.rtc_time));
+    mAGrw_SetXmasTree();
+    changed_acres = mFM_PcGrowCountChangedAcres();
+
+    if (changed_acres > 0) {
+        pcfa_mark_all_dirty();
+
+        if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+            printf("[NET][GROW] scene %d: field-init growth changed %d town acre(s) -- marked all acres dirty\n", scene,
+                   changed_acres);
+        }
+    }
+}
+#endif
+
 extern void mFM_FieldInit(GAME_PLAY* play) {
     int bg_disp_num = l_bg_disp_num;
     int bg_disp_size = l_bg_disp_size;
@@ -1236,9 +1331,13 @@ extern void mFM_FieldInit(GAME_PLAY* play) {
     }
 
     mFM_PoorTreeUnderPlayerBlock();
+#ifdef TARGET_PC
+    mFM_PcFieldInitGrowth(scene); /* same three calls, same order; see its comment */
+#else
     mAGrw_ChangeCedar2Tree();
     mAGrw_RenewalFgItem(Common_GetPointer(time.rtc_time));
     mAGrw_SetXmasTree();
+#endif
     mFM_SetFruit_title_demo(Save_Get(scene_no));
 
     if (scene == SCENE_FG) {

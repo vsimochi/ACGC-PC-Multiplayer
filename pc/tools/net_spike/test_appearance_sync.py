@@ -29,48 +29,34 @@ performs) -- see the Stage 4C-2 implementation report for what that gap means an
 This script only sends/receives UDP packets and reports what it observed; it never touches
 rendering, a save file, or any window -- not a manual gameplay test.
 
+Foundation-phase migration: transport/handshake now come from net_spike_lib.FakeClient (HELLO+nonce,
+IDENTITY and APPEARANCE as reliable RDATA, every host RDATA ACKed, delivered once and in order).
+seen_appearances is fed by the library's per-message hook, so an APPEARANCE is recorded no matter
+which wait happened to pump it off the socket (strictly stronger than the old "stash while waiting
+for the ACK" logic). Idle-window counts (Dynamic-C) count only APPEARANCE messages that ARRIVE in
+the window (Inbox.mark()/since()). Sleeps pump the transport so bystanders stay connected. Every
+check and threshold is unchanged.
+
 Usage: python3 test_appearance_sync.py <host_ip> <port>
 """
-import socket
 import struct
 import sys
-import time
 
-PCNET_MAGIC = 0x41434E50
+import net_spike_lib as L
 
-PCNET_WIRE_HELLO = 0
-PCNET_WIRE_HELLO_ACK = 1
-PCNET_WIRE_HEARTBEAT = 2
-PCNET_WIRE_DISCONNECT = 3
-PCNET_WIRE_DATA = 4
+PC_NETGAME_MSG_APPEARANCE = L.PC_NETGAME_MSG_APPEARANCE
+PC_NETGAME_HOST_PLAYER_ID = L.PC_NETGAME_HOST_PLAYER_ID  # PC_NET_MAX_PEERS
 
-PC_NET_RELIABLE = 1
-
-PC_NETGAME_MSG_IDENTITY = 1
-PC_NETGAME_MSG_IDENTITY_ACK = 2
-PC_NETGAME_MSG_APPEARANCE = 5
-
-PC_NETGAME_PROTOCOL_VERSION = 1
-PC_NETGAME_HOST_PLAYER_ID = 8  # PC_NET_MAX_PEERS
-
-WIRE_HDR_FMT = "<IBBH"
-IDENTITY_FMT = "<B3xI8s8sHHB3x"
-ACK_FMT = "<BBHI8s8sHHB3x"
 # PCNetGameAppearanceMsg header only (msg_type, net_player_id, gender, face, cloth_item,
-# sunburn_rank, is_custom_design); the rest (_reserved0[24] + the 544-byte design) is sent/ignored
-# as raw zero padding -- this test only exercises catalog clothing (is_custom_design=0), so the
-# design payload is never meaningful here.
-APPEARANCE_HDR_FMT = "<BBBBHBB"
-APPEARANCE_MSG_SIZE = 576
+# sunburn_rank, is_custom_design); the rest (_reserved0[24] + the 544-byte design) is sent as raw
+# zero padding for catalog clothing (is_custom_design=0), or as a real design record when
+# build_custom_design_appearance() is used.
+APPEARANCE_HDR_FMT = L.APPEARANCE_HDR_FMT
+APPEARANCE_MSG_SIZE = L.APPEARANCE_MSG_SIZE
 APPEARANCE_HDR_SIZE = struct.calcsize(APPEARANCE_HDR_FMT)
 APPEARANCE_RESERVED0_SIZE = 24
 APPEARANCE_DESIGN_SIZE = APPEARANCE_MSG_SIZE - APPEARANCE_HDR_SIZE - APPEARANCE_RESERVED0_SIZE  # 544
 APPEARANCE_PAD_SIZE = APPEARANCE_MSG_SIZE - APPEARANCE_HDR_SIZE  # catalog case: reserved0 + zeroed design
-
-
-def send_hdr(sock, addr, wtype, kind, payload):
-    pkt = struct.pack(WIRE_HDR_FMT, PCNET_MAGIC, wtype, kind, len(payload)) + payload
-    sock.sendto(pkt, addr)
 
 
 def build_appearance(gender, face, cloth_item, sunburn_rank=0):
@@ -96,24 +82,27 @@ def build_custom_design_appearance(gender, face, design_fill_byte, sunburn_rank=
     return header + reserved0 + design_record
 
 
-class FakeClient:
-    """One hand-crafted client connection: HELLO -> IDENTITY -> wait ACK -> send APPEARANCE.
+APPEARANCE_PRED = L.p_game(PC_NETGAME_MSG_APPEARANCE, (L.CH_RELIABLE,))
+
+
+class FakeClient(L.FakeClient):
+    """One fake client: HELLO -> IDENTITY -> wait ACK -> send APPEARANCE.
 
     seen_appearances accumulates for the client's whole lifetime (keyed by net_player_id), fed by
-    both the ACK-wait loop and drain_appearances() -- an APPEARANCE datagram can legitimately arrive
-    interleaved with (even before) the ACK itself, since the host sends the roster immediately after
-    the ACK in the same synchronous call; this must never be silently discarded by whichever loop
-    happens to read it off the socket first.
+    the library's on_message() hook for EVERY delivered APPEARANCE -- an APPEARANCE can legitimately
+    arrive interleaved with (even before) the ACK itself, since the host sends the roster
+    immediately after the ACK in the same synchronous call; it can never be silently discarded.
     """
 
     def __init__(self, label, host_ip, port, gender, face, cloth_item):
-        self.label = label
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(3.0)
-        self.addr = (host_ip, port)
+        super().__init__(label, host_ip, port)
         self.gender, self.face, self.cloth_item = gender, face, cloth_item
-        self.assigned_peer_id = None
         self.seen_appearances = {}
+
+    def on_message(self, m):
+        super().on_message(m)
+        if m.channel == L.CH_RELIABLE:
+            self._record_if_appearance(m.payload)
 
     def _record_if_appearance(self, payload):
         if len(payload) == APPEARANCE_MSG_SIZE and payload[0] == PC_NETGAME_MSG_APPEARANCE:
@@ -128,82 +117,32 @@ class FakeClient:
         return False
 
     def send_appearance_update(self, payload):
-        """Sends a NEW appearance datagram on an already-connected/READY socket -- simulates the
-        real client's pc_net_game_poll() detecting a local Now_Private change mid-session and
-        sending immediately, without repeating the HELLO/IDENTITY/ACK handshake. `payload` is
-        whatever build_appearance()/build_custom_design_appearance() returned."""
-        send_hdr(self.sock, self.addr, PCNET_WIRE_DATA, PC_NET_RELIABLE, payload)
+        """Sends a NEW appearance on an already-connected/READY connection -- simulates the real
+        client's pc_net_game_poll() detecting a local Now_Private change mid-session and sending
+        immediately, without repeating the HELLO/IDENTITY/ACK handshake. `payload` is whatever
+        build_appearance()/build_custom_design_appearance() returned."""
+        self.send_reliable(payload)
 
     def connect_and_ready(self):
-        send_hdr(self.sock, self.addr, PCNET_WIRE_HELLO, 0, b"")
-        data, _ = self.sock.recvfrom(2048)
-        magic, wtype, _wkind, _wsize = struct.unpack(WIRE_HDR_FMT, data[:8])
-        if magic != PCNET_MAGIC or wtype != PCNET_WIRE_HELLO_ACK:
-            raise RuntimeError(f"{self.label}: expected HELLO_ACK, got type={wtype}")
-
-        identity = struct.pack(
-            IDENTITY_FMT, PC_NETGAME_MSG_IDENTITY, PC_NETGAME_PROTOCOL_VERSION, b"\x00" * 8, b"\x00" * 8, 0, 0, 0
-        )
-        send_hdr(self.sock, self.addr, PCNET_WIRE_DATA, PC_NET_RELIABLE, identity)
-
-        for _ in range(20):
-            data, _ = self.sock.recvfrom(2048)
-            magic, wtype, _wkind, wsize = struct.unpack(WIRE_HDR_FMT, data[:8])
-            if magic != PCNET_MAGIC or wtype != PCNET_WIRE_DATA:
-                continue
-            payload = data[8 : 8 + wsize]
-            if self._record_if_appearance(payload):
-                continue  # stashed; keep waiting for the ACK specifically
-            if len(payload) >= 1 and payload[0] == PC_NETGAME_MSG_IDENTITY_ACK:
-                ack = struct.unpack(ACK_FMT, payload[: struct.calcsize(ACK_FMT)])
-                self.assigned_peer_id = ack[2]
-                break
-        else:
-            raise RuntimeError(f"{self.label}: no IDENTITY_ACK received -- not READY")
-
-        print(f"[{self.label}] READY (assigned_peer_id={self.assigned_peer_id})")
-
+        super().connect_and_ready()
         # Ordering-race fix under test: appearance is sent ONLY here, after the ACK -- never
         # earlier (mirrors the real client's PC_NETGAME_MSG_IDENTITY_ACK-handler send site).
-        amsg = build_appearance(self.gender, self.face, self.cloth_item)
-        send_hdr(self.sock, self.addr, PCNET_WIRE_DATA, PC_NET_RELIABLE, amsg)
+        self.send_reliable(build_appearance(self.gender, self.face, self.cloth_item))
         print(f"[{self.label}] sent own appearance (gender={self.gender} face={self.face} cloth_item={self.cloth_item:#x})")
-
-    def ping(self):
-        """Bare keepalive with no wait -- see drain_appearances()'s doc comment for why this is
-        needed at all; used here where we need to stay alive without also blocking on a read."""
-        send_hdr(self.sock, self.addr, PCNET_WIRE_HEARTBEAT, 0, b"")
-
-    def disconnect(self):
-        """Sends the fast-path PCNET_WIRE_DISCONNECT (pc_net.c frees the slot immediately and
-        fires PC_NET_EVENT_PEER_DISCONNECTED -- no need to wait out the ~5s idle timeout)."""
-        send_hdr(self.sock, self.addr, PCNET_WIRE_DISCONNECT, 0, b"")
+        return self
 
     def drain_appearances(self, timeout=1.0):
-        # PCNET_TIMEOUT_MS is 5000ms of total silence from this peer (pc_net.c) -- this script's
-        # own multi-second sleeps between steps would otherwise time this fake client out exactly
-        # like a real dead connection, which is correct host behavior but not what this test is
-        # measuring. A real client's own 20Hz movement stream naturally prevents this; a HEARTBEAT
-        # is the equivalent minimal "still here" for a client that sends nothing else.
-        send_hdr(self.sock, self.addr, PCNET_WIRE_HEARTBEAT, 0, b"")
-        self.sock.settimeout(timeout)
-        end = time.time() + timeout
-        while time.time() < end:
-            try:
-                data, _ = self.sock.recvfrom(2048)
-            except socket.timeout:
-                break
-            magic, wtype, _wkind, wsize = struct.unpack(WIRE_HDR_FMT, data[:8])
-            if magic != PCNET_MAGIC or wtype != PCNET_WIRE_DATA:
-                continue
-            self._record_if_appearance(data[8 : 8 + wsize])
-        self.sock.settimeout(3.0)
+        """Pumps every client for `timeout` (appearances are recorded by on_message as they arrive),
+        then discards the already-recorded APPEARANCE messages from the inbox. The explicit
+        HEARTBEAT is kept from the original (harmless; the library also heartbeats when idle)."""
+        self.send_heartbeat()
+        L.pump_sleep(timeout)
+        self.inbox.take_all(APPEARANCE_PRED)
         return dict(self.seen_appearances)
 
 
 def check(label, condition, results):
-    print(f"{'PASS' if condition else 'FAIL'} - {label}")
-    results.append(condition)
+    L.check(label, condition, results)
 
 
 def main():
@@ -216,13 +155,13 @@ def main():
     # --- Test A: 2 players -------------------------------------------------------------------
     a = FakeClient("A", host_ip, port, gender=0, face=1, cloth_item=0x2401)
     a.connect_and_ready()
-    time.sleep(0.3)
+    L.pump_sleep(0.3)
     a.drain_appearances(timeout=1.0)
     check("Test A: A received host appearance", PC_NETGAME_HOST_PLAYER_ID in a.seen_appearances, results)
 
     b = FakeClient("B", host_ip, port, gender=1, face=2, cloth_item=0x2402)
     b.connect_and_ready()
-    time.sleep(0.3)
+    L.pump_sleep(0.3)
     b.drain_appearances(timeout=1.0)
     check("Test A: B received host appearance", PC_NETGAME_HOST_PLAYER_ID in b.seen_appearances, results)
     check("Test A: B received A's appearance (backfill)", a.assigned_peer_id in b.seen_appearances, results)
@@ -233,7 +172,7 @@ def main():
     # --- Test B: 3 players, sequential join (the mandatory regression test) ------------------
     c = FakeClient("C", host_ip, port, gender=0, face=3, cloth_item=0x2403)
     c.connect_and_ready()
-    time.sleep(0.3)
+    L.pump_sleep(0.3)
     c.drain_appearances(timeout=1.5)
     check("Test B: C received host appearance", PC_NETGAME_HOST_PLAYER_ID in c.seen_appearances, results)
     check("Test B: C received A's appearance (backfill)", a.assigned_peer_id in c.seen_appearances, results)
@@ -259,13 +198,13 @@ def main():
     b.disconnect()
     a.ping()
     c.ping()
-    time.sleep(0.5)  # let PC_NET_EVENT_PEER_DISCONNECTED reach the host and clear the slot
+    L.pump_sleep(0.5)  # let PC_NET_EVENT_PEER_DISCONNECTED reach the host and clear the slot
 
     b2 = FakeClient("B2(reconnected)", host_ip, port, gender=0, face=7, cloth_item=0x2410)
     b2.connect_and_ready()
     a.ping()
     c.ping()
-    time.sleep(0.3)
+    L.pump_sleep(0.3)
     a.drain_appearances(timeout=1.5)
     c.drain_appearances(timeout=1.5)
 
@@ -335,20 +274,9 @@ def main():
     # peer gets the host's own appearance plus every OTHER READY peer's appearance once), whereas a
     # genuine every-frame flood bug would produce dozens of duplicate packets for the SAME peer in
     # this window -- the two are trivially distinguishable by count. ---------------------------------
-    idle_events = []
-    idle_deadline = time.time() + 2.0  # well under the 3s periodic-resend period, but generous
-    c.sock.settimeout(0.5)
-    while time.time() < idle_deadline:
-        try:
-            data, _ = c.sock.recvfrom(2048)
-        except socket.timeout:
-            continue
-        magic, wtype, _wkind, wsize = struct.unpack(WIRE_HDR_FMT, data[:8])
-        if magic == PCNET_MAGIC and wtype == PCNET_WIRE_DATA:
-            payload = data[8 : 8 + wsize]
-            if len(payload) == APPEARANCE_MSG_SIZE and payload[0] == PC_NETGAME_MSG_APPEARANCE:
-                idle_events.append(payload)
-    c.sock.settimeout(3.0)
+    mark = c.inbox.mark()
+    L.pump_sleep(2.0)  # well under the 3s periodic-resend period, but generous
+    idle_events = c.inbox.peek_all(APPEARANCE_PRED, since=mark)
     check(
         "Dynamic-C: no unprompted appearance FLOOD while nothing changed (saw "
         f"{len(idle_events)} packet(s) in a 2s idle window; a handful from one legitimate periodic "
@@ -391,12 +319,12 @@ def main():
     print(f"[B2] disconnecting (peer {b2.assigned_peer_id})")
     b2.disconnect()
     a.ping()
-    time.sleep(0.5)
+    L.pump_sleep(0.5)
 
     b3 = FakeClient("B3(reconnected again)", host_ip, port, gender=1, face=4, cloth_item=0x2406)
     b3.connect_and_ready()
     a.ping()
-    time.sleep(0.3)
+    L.pump_sleep(0.3)
     a.drain_appearances(timeout=1.0)
     check(
         "Dynamic-E: A receives B3's fresh initial appearance after a second reconnect",
@@ -414,9 +342,7 @@ def main():
         results,
     )
 
-    print("-" * 60)
-    print(f"{sum(results)}/{len(results)} checks passed")
-    return 0 if all(results) else 1
+    return L.summary_and_exit_code(results)
 
 
 if __name__ == "__main__":
