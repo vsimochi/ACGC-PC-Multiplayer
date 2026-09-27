@@ -68,7 +68,25 @@ extern "C" {
 /* --- Global state --- */
 extern SDL_Window*   g_pc_window;
 extern SDL_GLContext  g_pc_gl_context;
+/* g_pc_running is written from the SetConsoleCtrlHandler thread and from signal(SIGINT/SIGTERM)
+ * handlers (pc/src/pc_main.c) and read every frame by the main loop (graph_proc(), src/graph.c).
+ * It is declared atomic_int (C11 <stdatomic.h>) so that ordinary reads and plain `= 0` writes at
+ * every existing call site compile to atomic load/store with no source changes required anywhere
+ * except this header, the definition in pc_main.c, and graph.c's own separate extern.
+ *
+ * C++ translation units (pc_stubs_cpp.cpp, which includes this header transitively) never read or
+ * write this flag; it is declared here as plain `int` under __cplusplus only because this header
+ * must still parse under C++, which has no <stdatomic.h> in the C++17 mode this project builds
+ * with. On this toolchain (GCC/MinGW-w64, x86/x64) a lock-free atomic_int -- guaranteed lock-free
+ * for int-sized objects on this target -- has the same size, alignment, and object representation
+ * as a plain int (there is no wrapper struct), so this declaration stays ABI-compatible with the
+ * atomic_int definition it refers to via extern "C" linkage. */
+#ifdef __cplusplus
 extern int           g_pc_running;
+#else
+#include <stdatomic.h>
+extern atomic_int    g_pc_running;
+#endif
 extern int           g_pc_verbose;
 extern int           g_pc_pickup_test_seed; /* Stage 5A.1: --pickup-test-seed -- see pc_net_game.c */
 extern int           g_pc_frame_limit_override;

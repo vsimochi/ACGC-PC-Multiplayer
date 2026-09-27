@@ -31,7 +31,14 @@
 #include "pc_platform.h"
 #include "pc_pause_menu.h"
 #include "pc_profiler.h"
-extern int g_pc_running;
+/* Local extern matching the atomic_int definition in pc/src/pc_main.c (see pc_platform.h for the
+ * full rationale). This TARGET_PC-only block above already includes pc_platform.h (for other PC
+ * helpers used below), whose own extern already brings g_pc_running into scope with this exact
+ * type; this declaration is a harmless, identically-typed redeclaration kept for clarity at the
+ * actual read sites below and to match this project's established convention elsewhere of giving
+ * Nintendo-side files their own local extern for PC globals they read. */
+#include <stdatomic.h>
+extern atomic_int g_pc_running;
 #endif
 
 GRAPH graph_class;

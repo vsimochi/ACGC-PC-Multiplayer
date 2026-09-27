@@ -106,11 +106,28 @@ extern void mainproc(void* val) {
      * Skipped entirely if pcfa_save_ready() is false (no resident ever bound, still on the title/
      * select screen, etc.) so this never fires during early startup. No existing shutdown save
      * exists to integrate with instead -- confirmed absent in the Stage 0.5 persistence audit and
-     * re-verified directly in this file before adding this. */
+     * re-verified directly in this file before adding this.
+     *
+     * M1 hardening correction: also gated on this process NOT being a network CLIENT
+     * (pc_net_game_role_is_client(), pc/src/pc_m_card.c), matching pc_vi.c's periodic-save gate
+     * (which already excludes CLIENT -- see that file's doc comment). A client never owns the
+     * authoritative Save_t it is rendering; only the host may write it. This is deliberately NOT
+     * a simple "== HOST" check: ordinary single-player (PC_NETGAME_ROLE_NONE) must keep getting
+     * this exact shutdown-save behavior unchanged (this mechanism predates any multiplayer
+     * concern), so the condition below saves for HOST and for single-player alike, and refuses
+     * only for CLIENT. pc_net_game_role_is_client() is a tiny extern wrapper around
+     * pc_net_game_role() == PC_NETGAME_ROLE_CLIENT so this file does not need pc_net_game.h's
+     * PCNetGameRole enum visible here -- same locally-declared-extern idiom as
+     * pcfa_save_ready()/pc_save_write_authoritative() just below, matching this file's existing
+     * convention of not #including PC-only headers to stay close to the original decomp source. */
     {
         extern int pcfa_save_ready(void);
         extern int pc_save_write_authoritative(void);
-        if (pcfa_save_ready()) {
+        extern int pc_net_game_role_is_client(void);
+        if (pc_net_game_role_is_client()) {
+            OSReport("[PC] mainproc: final shutdown save SKIPPED (this process is a network "
+                     "CLIENT; only the HOST may write the authoritative town)\n");
+        } else if (pcfa_save_ready()) {
             OSReport("[PC] mainproc: final authoritative save before shutdown...\n");
             if (!pc_save_write_authoritative()) {
                 OSReport("[PC] mainproc: final shutdown save FAILED\n");

@@ -21,7 +21,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 SDL_Window*   g_pc_window = NULL;
 SDL_GLContext  g_pc_gl_context = NULL;
-int           g_pc_running = 1;
+atomic_int    g_pc_running = 1;
 int           g_pc_frame_limit_override = -1;
 int           g_pc_speedhack_enabled = 0;
 int           g_pc_verbose = 0;
@@ -60,12 +60,15 @@ unsigned int pc_image_end  = 0;
  * signal(), for the rarer case something raises those directly rather than going through the
  * console control mechanism; both call the exact same minimal flag-set.
  *
- * g_pc_running is deliberately left a plain int (not volatile/atomic) here: a single aligned-word
- * write from one other thread, observed by a poll loop that already crosses several OS-call
- * memory barriers every frame (SDL_PollEvent et al.), is the same accepted idiom this file's own
- * existing SDL_QUIT handling already relies on just below -- adding a new synchronization
- * primitive, or changing this variable's declared type across the files that already declare it
- * extern, was explicitly out of scope for this checkpoint. */
+ * g_pc_running is declared atomic_int (C11 <stdatomic.h>, see pc_platform.h) rather than a plain
+ * int: the console-ctrl callback above is a genuine cross-thread write (a real second OS thread,
+ * not merely signal-context reentrancy on the main thread), so this needs real cross-thread
+ * visibility, not just signal-safety. atomic_int gives that -- a sequentially-consistent load/store
+ * on every read (graph_proc()'s loop condition) and write (here, and in the SDL_QUIT handling just
+ * below) -- while remaining an ordinary lock-free int-sized access on this toolchain (GCC/MinGW-w64,
+ * x86/x64), so no source changes are needed at any of the existing plain `g_pc_running = 0;` call
+ * sites elsewhere in the codebase (pc_os.c, pc_pause_menu.c, pc_vi.c, ac_animal_logo.c) -- ordinary
+ * assignment and read syntax on an atomic_int compiles to the atomic operation automatically. */
 static BOOL WINAPI pc_console_ctrl_handler(DWORD ctrl_type) {
     switch (ctrl_type) {
         case CTRL_C_EVENT:

@@ -33,6 +33,7 @@
 #include "m_play.h"
 #include "lb_rtc.h"
 #include "game.h"
+#include "pc_net_game.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -486,12 +487,57 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
  * -- so by shutdown-save time every transient placeholder is already settled by ordinary teardown,
  * and game_dt() has already set gamePT = NULL (src/game.c:249). Calling restore_fgdata_all(NULL)
  * would dereference play->actor_info unconditionally (m_actor.c:883) and crash; the NULL guard
- * correctly and safely skips a call that has nothing left to do. */
+ * correctly and safely skips a call that has nothing left to do.
+ *
+ * M1 hardening: guarded on pc_net_game_role() != PC_NETGAME_ROLE_CLIENT as a defense-in-depth
+ * invariant, independent of what any caller already checked. A network CLIENT never owns the
+ * authoritative Save_t it is rendering (the host is the only correct writer of it -- see
+ * pc_vi.c's periodic-save doc comment); today's two callers (pc_vi.c's periodic block and
+ * src/main.c's shutdown block) already gate on this themselves before calling in, but this check
+ * makes the invariant hold for ANY future caller too, without relying on every call site
+ * remembering to re-derive it. Rejects by returning FALSE without touching gamePT,
+ * restore_fgdata_all(), or pc_save_write_gci() at all -- no partial work, no serialization
+ * duplication, no change to the GCI format/Save_t/checksum/backup-rotation/atomic-rename
+ * behavior of the existing writer. Single-player (PC_NETGAME_ROLE_NONE) and the host
+ * (PC_NETGAME_ROLE_HOST) are both unaffected and fall through exactly as before.
+ * s_pc_save_authoritative_client_reject_count / pc_save_authoritative_client_reject_count()
+ * exist purely as deterministic test instrumentation (see the accessor below) so this rejection
+ * can be observed/asserted on without inferring it from log timestamps. */
+static int s_pc_save_authoritative_client_reject_count = 0;
+
 int pc_save_write_authoritative(void) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        s_pc_save_authoritative_client_reject_count++;
+        OSReport("[PC] pc_save_write_authoritative: REJECTED -- this process is a network CLIENT "
+                 "and must never write the authoritative town (the host is the only valid writer)\n");
+        return FALSE;
+    }
     if (gamePT != NULL) {
         restore_fgdata_all((GAME_PLAY*)gamePT);
     }
     return pc_save_write_gci();
+}
+
+/* Test/diagnostic accessor for s_pc_save_authoritative_client_reject_count above -- how many
+ * times pc_save_write_authoritative() has rejected a call because this process was a network
+ * CLIENT, since process start. Deliberately a real extern function (not static) so it resolves
+ * by name for out-of-process inspection (e.g. via gdb -p PID -batch -ex "print (int)
+ * pc_save_authoritative_client_reject_count()"), the same technique this project's net_spike
+ * tooling already uses elsewhere. Never mutates anything. */
+int pc_save_authoritative_client_reject_count(void) {
+    return s_pc_save_authoritative_client_reject_count;
+}
+
+/* M1 hardening: a tiny role predicate exposed for non-PC-only translation units (namely
+ * src/main.c) that cannot #include pc_net_game.h (it is a Nintendo-side file kept close to the
+ * original decomp, which by this file's own established convention declares whatever externs it
+ * needs locally rather than including PC-only headers). Wraps pc_net_game_role() ==
+ * PC_NETGAME_ROLE_CLIENT -- the exact same semantics pc_vi.c's periodic-save block and
+ * pc_save_write_authoritative() above both already check -- so src/main.c's shutdown-save block
+ * can gate on "am I a network CLIENT?" without needing the real PCNetGameRole enum visible in
+ * that translation unit, and without inventing any new role/authority concept of its own. */
+int pc_net_game_role_is_client(void) {
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT;
 }
 
 /* Read a GCI file into common_data (for home town / Card A) */
