@@ -291,6 +291,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gbi_runtime.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr_selftest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_rng_domains_selftest.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_os.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dvd.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_pad.c

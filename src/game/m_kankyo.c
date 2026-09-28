@@ -8,6 +8,10 @@
 #include "m_npc_schedule.h"
 #include "m_player_lib.h"
 #include "libultra/libultra.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"          /* pc_net_game_world_is_host_authoritative() */
+#include "libc64/qrand_domains.h" /* QRAND_DOMAIN_WEATHER: authoritative weather-type roll only */
+#endif
 
 #define mEnv_TIME_TO_SECS(hour, min, sec) ((hour) * mTM_SECONDS_IN_HOUR + (min) * mTM_SECONDS_IN_MINUTE + (sec))
 

@@ -519,10 +519,39 @@ _Static_assert(sizeof(PCNetGameFieldBlockMsg) == 588, "PCNetGameFieldBlockMsg wi
 _Static_assert(sizeof(PCNetGameFieldBlockMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameFieldBlockMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
+/* Weather + Stalk Market milestone: the smallest wire representation of both domains' shared,
+ * persistent, host-authoritative state -- reused as-is by both PCNetGameWorldMetaMsg (change
+ * notification) and PCNetGameSnapshotEndMsg (initial/late-join/reconnect sync), exactly like
+ * renew_time (PCNetGameRtcWire) already is above. Weather is Common_Get(weather) and
+ * Common_Get(weather_intensity) (mEnv_WEATHER_... and mEnv_WEATHER_INTENSITY_... values -- see
+ * m_kankyo_weather.c_inc); the Stalk Market fields mirror Save_Get(kabu_price_schedule) (Kabu_price_c,
+ * m_kabu_manager.h) field-for-field, including its own kabu_update_time so a client's
+ * Kabu_manager()-style "has this week already been set" question (never asked directly -- clients
+ * never call Kabu_manager() at all, see its host-authority gate) is still answerable from the state
+ * this carries. Deliberately NOT a new persisted representation: both sides are the exact same
+ * Save_t/Common_t fields the vanilla single-player code already reads and writes -- see
+ * pcnetgame_client_apply_weather_state()/pcnetgame_client_apply_market_state() below. Turnip
+ * INVENTORY (a player's own held turnips) is never part of this -- it stays in that player's own
+ * private Save_t, exactly as before; only the shared market PRICE schedule is here. */
+typedef struct PCNetGameWorldStateWire {
+    uint16_t daily_price[7];        /* Kabu_price_c.daily_price[lbRTC_SUNDAY..lbRTC_SATURDAY] */
+    uint16_t trade_market;          /* Kabu_price_c.trade_market (Kabu_TRADE_MARKET_TYPE_*) */
+    PCNetGameRtcWire kabu_update_time; /* Kabu_price_c.update_time */
+    uint8_t  weather;               /* Common_Get(weather), an mEnv_WEATHER_... value */
+    uint8_t  weather_intensity;     /* Common_Get(weather_intensity), an mEnv_WEATHER_INTENSITY_... value */
+    uint8_t  _reserved0[2];
+} PCNetGameWorldStateWire;
+_Static_assert(sizeof(PCNetGameWorldStateWire) == 28, "PCNetGameWorldStateWire wire size drifted");
+
 /* v2: host -> one client, reliable. Closes snapshot `epoch`; the client applies renew_time (the
  * host's Save all_grow_renew_time, read at send time) atomically here, then counts the world as
- * synced. world_seq = host world_seq at send time. */
+ * synced. world_seq = host world_seq at send time. Weather + Stalk Market milestone: also carries
+ * world_state (WEATHER_VALID/MARKET_VALID in flags) so a fresh or late-joining client gets both
+ * domains' current authoritative state in the same message that already closes its snapshot --
+ * see the "initial state on join" / "late join" requirements this satisfies. */
 #define PC_NETGAME_META_FLAG_RENEW_TIME_VALID 0x01u
+#define PC_NETGAME_META_FLAG_WEATHER_VALID    0x02u
+#define PC_NETGAME_META_FLAG_MARKET_VALID     0x04u
 typedef struct PCNetGameSnapshotEndMsg {
     uint8_t  msg_type;      /* PC_NETGAME_MSG_SNAPSHOT_END */
     uint8_t  grid;          /* PC_NETGAME_GRID_TOWN */
@@ -531,23 +560,34 @@ typedef struct PCNetGameSnapshotEndMsg {
     uint32_t epoch;
     uint32_t world_seq;
     PCNetGameRtcWire renew_time;
+    PCNetGameWorldStateWire world_state;
 } PCNetGameSnapshotEndMsg;
-_Static_assert(sizeof(PCNetGameSnapshotEndMsg) == 20, "PCNetGameSnapshotEndMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameSnapshotEndMsg) == 48, "PCNetGameSnapshotEndMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameSnapshotEndMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameSnapshotEndMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
 /* v2: host -> every READY client that is NOT mid-snapshot, reliable, when the host's Save
- * all_grow_renew_time changes (daily renewal). world_seq is a committed seq (incremented for this
- * change); the client applies it iff world_seq > its last applied meta seq (a SNAPSHOT_END with
- * world_seq >= that also applies). */
+ * all_grow_renew_time changes (daily renewal), OR (weather + Stalk Market milestone) when
+ * Common_Get(weather)/Common_Get(weather_intensity) or Save_Get(kabu_price_schedule) changes.
+ * world_seq is the SAME shared committed sequence counter already used for renew time (and for
+ * FIELD_UPDATE/FIELD_BLOCK) -- a change to any of renew time/weather/market bumps it once and
+ * (re)sends this message with only the sub-state(s) that actually changed VALID-flagged, but always
+ * carrying every sub-state's current value (so a client that applies it also picks up anything it
+ * had missed). The client applies each VALID sub-state iff world_seq > its single last-applied
+ * s_client_meta_seq (a SNAPSHOT_END with world_seq >= that also applies, same as today). Reusing one
+ * counter (rather than inventing a second/third per sub-state) keeps this exactly the same
+ * "monotonic seq, missed packet self-corrects on the next update" shape the field-update/renew-time
+ * protocol already established, without a bigger generic multi-stream sequencing abstraction that
+ * only these three fields would ever use. */
 typedef struct PCNetGameWorldMetaMsg {
     uint8_t  msg_type;      /* PC_NETGAME_MSG_WORLD_META */
     uint8_t  flags;         /* PC_NETGAME_META_FLAG_* */
     uint16_t _reserved0;
     uint32_t world_seq;
     PCNetGameRtcWire renew_time;
+    PCNetGameWorldStateWire world_state;
 } PCNetGameWorldMetaMsg;
-_Static_assert(sizeof(PCNetGameWorldMetaMsg) == 16, "PCNetGameWorldMetaMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWorldMetaMsg) == 44, "PCNetGameWorldMetaMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameWorldMetaMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameWorldMetaMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
@@ -1012,6 +1052,8 @@ static uint32_t              s_world_seq = 0;         /* host-global, per hostin
 static uint32_t              s_snapshot_epoch_counter = 0;
 static PCNetGameRtcWire      s_host_meta_renew;       /* last committed all_grow_renew_time */
 static int                   s_host_meta_valid = 0;
+static PCNetGameWorldStateWire s_host_meta_world_state; /* last committed weather + market state */
+static int                   s_host_meta_world_state_valid = 0;
 
 /* Outgoing world messages of one flush (materialized once, sent per peer). */
 typedef struct PCNetGameOutMsg {
@@ -1218,6 +1260,24 @@ static void pcnetgame_rtc_to_wire(const lbRTC_time_c* t, PCNetGameRtcWire* w) {
 
 static void pcnetgame_capture_renew_time(PCNetGameRtcWire* w) {
     pcnetgame_rtc_to_wire(Save_GetPointer(all_grow_renew_time), w);
+}
+
+/* Weather + Stalk Market milestone: read-only sample of both domains' current shared,
+ * host-authoritative state into PCNetGameWorldStateWire. Only ever called host-side (see
+ * pcnetgame_host_check_world_meta() below) -- mirrors pcnetgame_capture_renew_time()'s own
+ * read-only, no-side-effects convention exactly. */
+static void pcnetgame_capture_world_state(PCNetGameWorldStateWire* w) {
+    Kabu_price_c* kabu = Save_GetPointer(kabu_price_schedule);
+    int i;
+
+    memset(w, 0, sizeof(*w));
+    for (i = 0; i < lbRTC_WEEKDAYS_MAX; i++) {
+        w->daily_price[i] = kabu->daily_price[i];
+    }
+    w->trade_market = kabu->trade_market;
+    pcnetgame_rtc_to_wire(&kabu->update_time, &w->kabu_update_time);
+    w->weather = (uint8_t)Common_Get(weather);
+    w->weather_intensity = (uint8_t)Common_Get(weather_intensity);
 }
 
 /* Stage 4C-1/4C-2: read-only sample of the local player's current visible appearance, into the
@@ -2414,6 +2474,8 @@ static void pcnetgame_host_init_shadow(void) {
     (void)pcfa_take_dirty_acres(); /* bits accumulated before the session: the snapshot covers them */
     pcnetgame_capture_renew_time(&s_host_meta_renew);
     s_host_meta_valid = 1;
+    pcnetgame_capture_world_state(&s_host_meta_world_state);
+    s_host_meta_world_state_valid = 1;
     s_host_shadow_valid = 1;
 }
 
@@ -2624,34 +2686,75 @@ static void pcnetgame_host_commit_town_ut(int ut_x, int ut_z) {
     pcnetgame_host_flush_mask((uint32_t)1u << acre);
 }
 
-/* Renew-time watch (Workstream D): the host's Save all_grow_renew_time changes on the daily renewal
- * (same frame as D's pcfa_mark_all_dirty()). Runs AFTER the field flush in each poll, so the field
- * results precede the new renew time on the wire. Peers mid-snapshot are skipped: their END is built
- * at send time and will carry the current value. */
+/* Renew-time / weather / Stalk-Market watch (Workstream D, extended by the weather + Stalk Market
+ * milestone): the host's Save all_grow_renew_time, Common_Get(weather)/Common_Get(weather_intensity)
+ * or Save_Get(kabu_price_schedule) changed since the last poll. Runs AFTER the field flush in each
+ * poll, so the field results precede the new renew time on the wire. Peers mid-snapshot are skipped:
+ * their END is built at send time and will carry the current value (see pcnetgame_host_pump_snapshots()
+ * below). Deliberately polled here rather than hooked into mEnv_DecideWeather_NormalGameStart()/
+ * Kabu_manager() directly: those already run unconditionally on the host (or solo) every relevant
+ * frame/day-check with no network awareness, so comparing their resulting Save/Common state
+ * before-vs-after -- exactly like the pre-existing renew_time watch already does -- needs no new hook
+ * into either system and can never miss a change regardless of which code path produced it. This
+ * function runs with zero, one, or many connected clients; with zero it still updates
+ * s_host_meta_renew/s_host_meta_world_state and s_world_seq so a client that joins later gets the
+ * accumulated result via SNAPSHOT_END, exactly like the field shadow does. */
 static void pcnetgame_host_check_world_meta(void) {
-    PCNetGameRtcWire cur;
+    PCNetGameRtcWire cur_renew;
+    PCNetGameWorldStateWire cur_state;
     PCNetGameWorldMetaMsg wm;
+    uint8_t changed_flags = 0;
     int i;
 
     if (!s_host_world_ready) {
         return;
     }
-    pcnetgame_capture_renew_time(&cur);
-    if (s_host_meta_valid && memcmp(&cur, &s_host_meta_renew, sizeof(cur)) == 0) {
+    pcnetgame_capture_renew_time(&cur_renew);
+    pcnetgame_capture_world_state(&cur_state);
+
+    if (!s_host_meta_valid || memcmp(&cur_renew, &s_host_meta_renew, sizeof(cur_renew)) != 0) {
+        changed_flags |= (uint8_t)PC_NETGAME_META_FLAG_RENEW_TIME_VALID;
+    }
+    if (!s_host_meta_world_state_valid ||
+        cur_state.weather != s_host_meta_world_state.weather ||
+        cur_state.weather_intensity != s_host_meta_world_state.weather_intensity) {
+        changed_flags |= (uint8_t)PC_NETGAME_META_FLAG_WEATHER_VALID;
+    }
+    if (!s_host_meta_world_state_valid ||
+        memcmp(cur_state.daily_price, s_host_meta_world_state.daily_price, sizeof(cur_state.daily_price)) != 0 ||
+        cur_state.trade_market != s_host_meta_world_state.trade_market ||
+        memcmp(&cur_state.kabu_update_time, &s_host_meta_world_state.kabu_update_time, sizeof(cur_state.kabu_update_time)) != 0) {
+        changed_flags |= (uint8_t)PC_NETGAME_META_FLAG_MARKET_VALID;
+    }
+    if (changed_flags == 0) {
         return;
     }
-    s_host_meta_renew = cur;
+
+    s_host_meta_renew = cur_renew;
     s_host_meta_valid = 1;
+    s_host_meta_world_state = cur_state;
+    s_host_meta_world_state_valid = 1;
     ++s_world_seq;
 
     memset(&wm, 0, sizeof(wm));
     wm.msg_type = (uint8_t)PC_NETGAME_MSG_WORLD_META;
-    wm.flags = (uint8_t)PC_NETGAME_META_FLAG_RENEW_TIME_VALID;
+    wm.flags = changed_flags;
     wm.world_seq = s_world_seq;
-    wm.renew_time = cur;
-    printf("[NET][WORLD] host: all_grow_renew_time changed -> %04u-%02u-%02u %02u:%02u:%02u (world_seq %u)\n",
-           (unsigned)cur.year, (unsigned)cur.month, (unsigned)cur.day, (unsigned)cur.hour, (unsigned)cur.min,
-           (unsigned)cur.sec, (unsigned)s_world_seq);
+    wm.renew_time = cur_renew;
+    wm.world_state = cur_state;
+    if (changed_flags & PC_NETGAME_META_FLAG_RENEW_TIME_VALID) {
+        printf("[NET][WORLD] host: all_grow_renew_time changed -> %04u-%02u-%02u %02u:%02u:%02u (world_seq %u)\n",
+               (unsigned)cur_renew.year, (unsigned)cur_renew.month, (unsigned)cur_renew.day, (unsigned)cur_renew.hour,
+               (unsigned)cur_renew.min, (unsigned)cur_renew.sec, (unsigned)s_world_seq);
+    }
+    if (changed_flags & PC_NETGAME_META_FLAG_WEATHER_VALID) {
+        printf("[NET][WORLD] host: weather changed -> type %u intensity %u (world_seq %u)\n",
+               (unsigned)cur_state.weather, (unsigned)cur_state.weather_intensity, (unsigned)s_world_seq);
+    }
+    if (changed_flags & PC_NETGAME_META_FLAG_MARKET_VALID) {
+        printf("[NET][WORLD] host: Stalk Market schedule changed -> trend %u sunday %u (world_seq %u)\n",
+               (unsigned)cur_state.trade_market, (unsigned)cur_state.daily_price[0], (unsigned)s_world_seq);
+    }
 
     for (i = 0; i < PC_NET_MAX_PEERS; i++) {
         int backlog;
@@ -2731,10 +2834,12 @@ static void pcnetgame_host_pump_snapshots(void) {
                 e.msg_type = (uint8_t)PC_NETGAME_MSG_SNAPSHOT_END;
                 e.grid = (uint8_t)PC_NETGAME_GRID_TOWN;
                 e.acre_count = (uint8_t)st->snap_blocks_sent;
-                e.flags = (uint8_t)PC_NETGAME_META_FLAG_RENEW_TIME_VALID;
+                e.flags = (uint8_t)(PC_NETGAME_META_FLAG_RENEW_TIME_VALID | PC_NETGAME_META_FLAG_WEATHER_VALID |
+                                    PC_NETGAME_META_FLAG_MARKET_VALID);
                 e.epoch = st->snap_epoch;
                 e.world_seq = s_world_seq;
                 e.renew_time = s_host_meta_renew; /* == the Save value: the meta check ran this poll */
+                e.world_state = s_host_meta_world_state; /* == current weather + market: same guarantee */
                 if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &e, (uint16_t)sizeof(e))) {
                     break;
                 }
@@ -3604,6 +3709,47 @@ static void pcnetgame_client_apply_renew_time(const PCNetGameRtcWire* w) {
     t->year = w->year;
 }
 
+/* Weather + Stalk Market milestone: mirrors the host's broadcast weather into this client's own
+ * Common_t exactly (Common_Get(weather)/Common_Get(weather_intensity), read by every rendering/
+ * gameplay site via mEnv_NowWeather() etc. -- see m_kankyo_weather.c_inc), and into the packed
+ * Save_Get(weather) byte too, purely so that a later call into vanilla weather code (e.g.
+ * mEnv_DecideWeather_NormalGameStart()'s else-branch, which still reads Save_Get(weather) when this
+ * client's own local mTM_check_renew_time flag is NOT set) sees a value consistent with what was just
+ * applied here -- never persisted to disk (pc_save_write_authoritative() already refuses every write
+ * from a network CLIENT process, so this in-memory mirror can never reach the client's own save
+ * file). A client never independently rolls a new value (see mEnv_DecideWeather_NormalGameStart()'s
+ * host-authority gate) -- this function is the ONLY place a client's weather ever changes. */
+static void pcnetgame_client_apply_weather_state(const PCNetGameWorldStateWire* w) {
+    Common_Set(weather, (s16)w->weather);
+    Common_Set(weather_intensity, (s16)w->weather_intensity);
+    Save_Set(weather, (u8)(w->weather_intensity | (w->weather << 4)));
+}
+
+/* Weather + Stalk Market milestone: mirrors the host's broadcast Stalk Market schedule into this
+ * client's own Save_Get(kabu_price_schedule) field-for-field, so Kabu_get_price() (m_kabu_manager.c,
+ * reads Save_Get(kabu_price_schedule) directly, unchanged) returns the host's authoritative price on
+ * this client too. Not persisted to disk for the same reason noted on
+ * pcnetgame_client_apply_weather_state() above. A client never independently regenerates a schedule
+ * (see Kabu_manager()'s host-authority gate) -- this function is the ONLY place a client's Stalk
+ * Market state ever changes. Player-private turnip INVENTORY is untouched here -- it is not part of
+ * PCNetGameWorldStateWire at all (see that struct's own doc comment). */
+static void pcnetgame_client_apply_market_state(const PCNetGameWorldStateWire* w) {
+    Kabu_price_c* kabu = Save_GetPointer(kabu_price_schedule);
+    int i;
+
+    for (i = 0; i < lbRTC_WEEKDAYS_MAX; i++) {
+        kabu->daily_price[i] = w->daily_price[i];
+    }
+    kabu->trade_market = w->trade_market;
+    kabu->update_time.sec = w->kabu_update_time.sec;
+    kabu->update_time.min = w->kabu_update_time.min;
+    kabu->update_time.hour = w->kabu_update_time.hour;
+    kabu->update_time.day = w->kabu_update_time.day;
+    kabu->update_time.weekday = w->kabu_update_time.weekday;
+    kabu->update_time.month = w->kabu_update_time.month;
+    kabu->update_time.year = w->kabu_update_time.year;
+}
+
 /* Client side: the host's authoritative statement about one field tile (v2) -- see
  * PCNetGameFieldUpdateMsg. Applies to every client, including the requester (which also gets its
  * own PICKUP/DROP_RESULT). */
@@ -3676,8 +3822,16 @@ static void pcnetgame_handle_client_snapshot_end(const PCNetGameSnapshotEndMsg* 
     if (!pcnetgame_client_can_apply_world()) {
         return; /* blocks were discarded too; the resync fetches a complete one */
     }
-    if ((in->flags & PC_NETGAME_META_FLAG_RENEW_TIME_VALID) && in->world_seq >= s_client_meta_seq) {
-        pcnetgame_client_apply_renew_time(&in->renew_time);
+    if (in->world_seq >= s_client_meta_seq) {
+        if (in->flags & PC_NETGAME_META_FLAG_RENEW_TIME_VALID) {
+            pcnetgame_client_apply_renew_time(&in->renew_time);
+        }
+        if (in->flags & PC_NETGAME_META_FLAG_WEATHER_VALID) {
+            pcnetgame_client_apply_weather_state(&in->world_state);
+        }
+        if (in->flags & PC_NETGAME_META_FLAG_MARKET_VALID) {
+            pcnetgame_client_apply_market_state(&in->world_state);
+        }
         s_client_meta_seq = in->world_seq;
     }
     if (s_client_snap_blocks != (int)in->acre_count) {
@@ -3708,13 +3862,28 @@ static void pcnetgame_handle_client_world_meta(const PCNetGameWorldMetaMsg* in) 
     if (!pcnetgame_client_can_apply_world()) {
         return;
     }
-    if (!(in->flags & PC_NETGAME_META_FLAG_RENEW_TIME_VALID) || in->world_seq <= s_client_meta_seq) {
+    if (in->flags == 0 || in->world_seq <= s_client_meta_seq) {
         return;
     }
-    pcnetgame_client_apply_renew_time(&in->renew_time);
+    if (in->flags & PC_NETGAME_META_FLAG_RENEW_TIME_VALID) {
+        pcnetgame_client_apply_renew_time(&in->renew_time);
+        printf("[NET][WORLD] client: host renew time -> %04u-%02u-%02u (world_seq %u)\n",
+               (unsigned)in->renew_time.year, (unsigned)in->renew_time.month, (unsigned)in->renew_time.day,
+               (unsigned)in->world_seq);
+    }
+    if (in->flags & PC_NETGAME_META_FLAG_WEATHER_VALID) {
+        pcnetgame_client_apply_weather_state(&in->world_state);
+        printf("[NET][WORLD] client: host weather -> type %u intensity %u (world_seq %u)\n",
+               (unsigned)in->world_state.weather, (unsigned)in->world_state.weather_intensity,
+               (unsigned)in->world_seq);
+    }
+    if (in->flags & PC_NETGAME_META_FLAG_MARKET_VALID) {
+        pcnetgame_client_apply_market_state(&in->world_state);
+        printf("[NET][WORLD] client: host Stalk Market schedule -> trend %u sunday %u (world_seq %u)\n",
+               (unsigned)in->world_state.trade_market, (unsigned)in->world_state.daily_price[0],
+               (unsigned)in->world_seq);
+    }
     s_client_meta_seq = in->world_seq;
-    printf("[NET][WORLD] client: host renew time -> %04u-%02u-%02u (world_seq %u)\n", (unsigned)in->renew_time.year,
-           (unsigned)in->renew_time.month, (unsigned)in->renew_time.day, (unsigned)in->world_seq);
 }
 
 /* v2 host side: validate a parked IDENTITY against the host's own town, then either reject+drop or

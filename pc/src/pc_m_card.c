@@ -1078,6 +1078,23 @@ void pc_bootstrap_resident_poll(void) {
         return;
     }
 
+    /* Diagnosed while testing host-authoritative weather/Stalk Market sync (2026-09-27): normal
+     * interactive play sets Common_Get(time.rtc_enabled) = TRUE from the title-demo scene
+     * (src/game/m_titledemo.c:265) well before a player ever reaches gameplay; this bootstrap
+     * deliberately skips the entire trademark/title-demo chain, so rtc_enabled is still FALSE
+     * (src/game/m_trademark.c:97's boot-time default) the first time mSDI_StartDataInit ->
+     * mSDI_StartInitAfter -> Kabu_manager()/mEnv_DecideWeather_NormalGameStart() run. With
+     * rtc_enabled FALSE, mTM_time_init()'s TARGET_PC clock path (src/game/m_time.c:414) is never
+     * taken -- Common_Get(time.rtc_time) never re-reads the OS/--date/--time clock at all, so it
+     * stays at Common_t's zeroed boot default indefinitely (observed as a frozen ~2001-04-06
+     * reading even minutes into a run, and even under --date), and any date-driven renewal (Stalk
+     * Market week rollover, daily weather renewal) can never fire. Matches this same file's own
+     * existing temporary-toggle precedent (mCD_ReCheckLoadLand above: "Common_Set(time.rtc_enabled,
+     * TRUE)"), made permanent here (not save/restored) because this bootstrap path never returns
+     * to a scene that would toggle it back off. Test-only: g_pc_bootstrap_resident is -1 (disabled)
+     * unless --bootstrap-resident is explicitly passed, so this never touches normal play. */
+    Common_Set(time.rtc_enabled, TRUE);
+
     /* The exact call site the plan specifies: reuse mSDI_StartDataInit verbatim, the same
      * function/mode mCD_InitGameStart_bg already uses for "continue an existing resident"
      * (start_cond == mCD_START_COND_1 above). Its own guards (mFRm_CheckSaveData/mPr_CheckPrivate)

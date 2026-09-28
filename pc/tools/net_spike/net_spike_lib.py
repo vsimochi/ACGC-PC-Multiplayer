@@ -1046,6 +1046,8 @@ PC_NETGAME_FU_FLAG_DEPOSIT_VALID = 0x01
 PC_NETGAME_FU_FLAG_DEPOSIT_ON = 0x02
 PC_NETGAME_FB_FLAG_IN_SNAPSHOT = 0x01
 PC_NETGAME_META_FLAG_RENEW_TIME_VALID = 0x01
+PC_NETGAME_META_FLAG_WEATHER_VALID = 0x02      # weather + Stalk Market milestone
+PC_NETGAME_META_FLAG_MARKET_VALID = 0x04       # weather + Stalk Market milestone
 PC_NETGAME_RESYNC_REASON_SAVE_RELOADED = 1
 
 # INTERACT_CONFIRM (hardening contract): PICKUP_RESULT/DROP_RESULT accepted=1 is now a PROVISIONAL accept (the
@@ -1093,8 +1095,17 @@ RTC_FMT = "BBBBBBH"                     # PCNetGameRtcWire (sec,min,hour,day,wee
 SNAPSHOT_BEGIN_FMT = "<BBBBII"          # 12 bytes
 FIELD_BLOCK_HDR_FMT = "<BBBBII"         # 12-byte header of PCNetGameFieldBlockMsg
 FIELD_BLOCK_SIZE = 588                  # header + u16 items[256] + u16 deposit[16] + u16 valid[16]
-SNAPSHOT_END_FMT = "<BBBBII" + RTC_FMT  # 20 bytes
-WORLD_META_FMT = "<BBHI" + RTC_FMT      # 16 bytes
+# Weather + Stalk Market milestone: PCNetGameWorldStateWire, 28 bytes -- 7 daily prices (Sunday..
+# Saturday), trade_market, the Kabu update_time (an RTC_FMT), weather, weather_intensity, and 2
+# reserved pad bytes (see pc_net_game.c's own PCNetGameWorldStateWire doc comment).
+WORLD_STATE_FMT = "<7HH" + RTC_FMT + "BB2x"  # 28 bytes
+_WORLD_STATE_FIELDS = ["kabu_daily_price_sun", "kabu_daily_price_mon", "kabu_daily_price_tue",
+                       "kabu_daily_price_wed", "kabu_daily_price_thu", "kabu_daily_price_fri",
+                       "kabu_daily_price_sat", "kabu_trade_market", "kabu_update_sec", "kabu_update_min",
+                       "kabu_update_hour", "kabu_update_day", "kabu_update_weekday", "kabu_update_month",
+                       "kabu_update_year", "weather", "weather_intensity"]
+SNAPSHOT_END_FMT = "<BBBBII" + RTC_FMT + WORLD_STATE_FMT[1:]  # 48 bytes
+WORLD_META_FMT = "<BBHI" + RTC_FMT + WORLD_STATE_FMT[1:]      # 44 bytes
 RESYNC_REQUEST_FMT = "<BBBB"            # 4 bytes
 INTERACT_CONFIRM_FMT = "<BBBBI"         # 8 bytes: type, kind, outcome, reason, request_id
 
@@ -1212,9 +1223,11 @@ FIELD_BLOCK_SPEC = build_msg_spec(  # header only; decode_world_msg() unpacks th
     "FieldBlockHdrFields", total_size=FIELD_BLOCK_SIZE)
 SNAPSHOT_END_SPEC = build_msg_spec(
     PC_NETGAME_MSG_SNAPSHOT_END, SNAPSHOT_END_FMT,
-    ["msg_type", "grid", "acre_count", "flags", "epoch", "world_seq"] + _RTC_FIELDS, "SnapshotEndFields")
+    ["msg_type", "grid", "acre_count", "flags", "epoch", "world_seq"] + _RTC_FIELDS + _WORLD_STATE_FIELDS,
+    "SnapshotEndFields")
 WORLD_META_SPEC = build_msg_spec(
-    PC_NETGAME_MSG_WORLD_META, WORLD_META_FMT, ["msg_type", "flags", "reserved0", "world_seq"] + _RTC_FIELDS,
+    PC_NETGAME_MSG_WORLD_META, WORLD_META_FMT,
+    ["msg_type", "flags", "reserved0", "world_seq"] + _RTC_FIELDS + _WORLD_STATE_FIELDS,
     "WorldMetaFields")
 RESYNC_REQUEST_SPEC = build_msg_spec(
     PC_NETGAME_MSG_RESYNC_REQUEST, RESYNC_REQUEST_FMT, ["msg_type", "grid", "reason", "reserved0"],
@@ -1232,7 +1245,7 @@ GAME_SPECS = {
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
-assert SNAPSHOT_END_SPEC.size == 20 and WORLD_META_SPEC.size == 16 and RESYNC_REQUEST_SPEC.size == 4
+assert SNAPSHOT_END_SPEC.size == 48 and WORLD_META_SPEC.size == 44 and RESYNC_REQUEST_SPEC.size == 4
 assert INTERACT_CONFIRM_SPEC.size == 8 and PICKUP_REQUEST_SPEC.size == 8
 assert FIELD_BLOCK_SPEC.size + 2 * (256 + 16 + 16) == FIELD_BLOCK_SIZE
 
@@ -1835,13 +1848,31 @@ def _rtc(g):
     return (g.rtc_year, g.rtc_month, g.rtc_day, g.rtc_hour, g.rtc_min, g.rtc_sec)
 
 
+def _world_state(g):
+    """Weather + Stalk Market milestone: PCNetGameWorldStateWire fields already decoded onto g
+    (SNAPSHOT_END/WORLD_META both embed it) -> a plain dict, kabu_daily_price in Sunday..Saturday
+    order (matching Kabu_price_c.daily_price / lbRTC_SUNDAY..lbRTC_SATURDAY)."""
+    return {
+        "kabu_daily_price": [g.kabu_daily_price_sun, g.kabu_daily_price_mon, g.kabu_daily_price_tue,
+                             g.kabu_daily_price_wed, g.kabu_daily_price_thu, g.kabu_daily_price_fri,
+                             g.kabu_daily_price_sat],
+        "kabu_trade_market": g.kabu_trade_market,
+        "kabu_update_time": (g.kabu_update_year, g.kabu_update_month, g.kabu_update_day, g.kabu_update_hour,
+                             g.kabu_update_min, g.kabu_update_sec),
+        "weather": g.weather,
+        "weather_intensity": g.weather_intensity,
+    }
+
+
 def decode_world_msg(payload):
     """B's v2 world messages -> (kind, obj):
          (WORLD_BLOCK, FieldBlock)      FIELD_BLOCK (in-snapshot or live flush block)
          (WORLD_DELTA, FieldDelta)      FIELD_UPDATE v2
          (WORLD_SNAPSHOT_BEGIN, dict)   {"grid", "acre_count", "epoch", "world_seq"}
-         (WORLD_SNAPSHOT_END, dict)     {"grid", "acre_count", "flags", "epoch", "world_seq", "renew_time"}
-         (WORLD_META, dict)             {"flags", "world_seq", "renew_time"}
+         (WORLD_SNAPSHOT_END, dict)     {"grid", "acre_count", "flags", "epoch", "world_seq", "renew_time",
+                                          + weather/Stalk-Market fields, see _world_state()}
+         (WORLD_META, dict)             {"flags", "world_seq", "renew_time",
+                                          + weather/Stalk-Market fields, see _world_state()}
        or None."""
     g = decode_game(payload)
     if g is None:
@@ -1860,10 +1891,14 @@ def decode_world_msg(payload):
         return WORLD_SNAPSHOT_BEGIN, {"grid": g.grid, "acre_count": g.acre_count, "epoch": g.epoch,
                                       "world_seq": g.world_seq}
     if t == PC_NETGAME_MSG_SNAPSHOT_END:
-        return WORLD_SNAPSHOT_END, {"grid": g.grid, "acre_count": g.acre_count, "flags": g.flags, "epoch": g.epoch,
-                                    "world_seq": g.world_seq, "renew_time": _rtc(g)}
+        d = {"grid": g.grid, "acre_count": g.acre_count, "flags": g.flags, "epoch": g.epoch,
+             "world_seq": g.world_seq, "renew_time": _rtc(g)}
+        d.update(_world_state(g))
+        return WORLD_SNAPSHOT_END, d
     if t == PC_NETGAME_MSG_WORLD_META:
-        return WORLD_META, {"flags": g.flags, "world_seq": g.world_seq, "renew_time": _rtc(g)}
+        d = {"flags": g.flags, "world_seq": g.world_seq, "renew_time": _rtc(g)}
+        d.update(_world_state(g))
+        return WORLD_META, d
     return None
 
 

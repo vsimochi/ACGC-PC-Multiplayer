@@ -110,8 +110,22 @@ extern void mEnv_RandomWeather(s16* next_weather, s16* next_intensity) {
   #else
   c5 = (weather >>  0) & 0xF; // light cherry blossoms
   #endif
-  
+
+  /* This is the one gameplay-significant weather roll: it decides the persistent weather type/
+   * intensity that gets written to Save_Get(weather) and broadcast to every client (see
+   * pcnetgame_host_check_world_state() / PC_NETGAME_MSG_WORLD_META in pc_net_game.c). On TARGET_PC
+   * it draws from QRAND_DOMAIN_WEATHER (its own independent stream, see qrand_domains.h) instead of
+   * the shared legacy qrand() stream, so consuming it can never perturb -- or be perturbed by --
+   * unrelated systems (villagers, fish, bugs, ...) still drawing from the legacy stream. This
+   * function only ever runs on the host or on a non-networked (solo) PC process: a READY client
+   * never reaches here at all (see mEnv_DecideWeather_NormalGameStart's host-authority gate below),
+   * so there is no risk of a client independently rolling a conflicting value. The original GameCube
+   * target is completely untouched -- it keeps using the legacy global stream exactly as before. */
+#ifdef TARGET_PC
+  selected = RANDOM_D_F(QRAND_DOMAIN_WEATHER, 10.0f);
+#else
   selected = RANDOM_F(10.0f);
+#endif
 
   if (selected < c0) {
     next_weather[0] = mEnv_WEATHER_CLEAR;
@@ -447,6 +461,21 @@ extern void mEnv_DecideWeather_GameStart() {
   s16 event_weather;
   s16 event_intensity;
 
+#ifdef TARGET_PC
+  /* Reseed QRAND_DOMAIN_WEATHER once per call from this save's town identity + the existing
+   * all_grow_renew_time day anchor (see qrand_domain_make_seed()'s doc in qrand_domains.h) so the
+   * authoritative roll below is reproducible for a given town/day rather than depending on
+   * process-launch-order LCG state. This function only ever runs host-side or solo (see the
+   * host-authority gate in mEnv_DecideWeather_NormalGameStart), so this never runs on a READY
+   * client. No new Save_t field is added -- both inputs already exist. */
+  {
+    u32 town_hash = qrand_domain_hash_town(Save_Get(land_info).id, Save_Get(land_info).name, LAND_NAME_SIZE);
+    u32 day_epoch = qrand_domain_day_epoch(Save_Get(all_grow_renew_time).year, Save_Get(all_grow_renew_time).month,
+                                            Save_Get(all_grow_renew_time).day);
+    sqrand_d(QRAND_DOMAIN_WEATHER, qrand_domain_make_seed(town_hash, day_epoch, QRAND_DOMAIN_WEATHER));
+  }
+#endif
+
   mEnv_RandomWeather(&weather, &intensity);
   mEv_GetEventWeather(&event_weather, &event_intensity);
 
@@ -489,7 +518,20 @@ extern void mEnv_DecideWeather_NormalGameStart() {
   u8 weather;
   u8 intensity;
 
-  if (mTM_check_renew_time(mTM_RENEW_TIME_WEATHER)) {
+  if (mTM_check_renew_time(mTM_RENEW_TIME_WEATHER)
+#ifdef TARGET_PC
+      /* READY client: never independently roll a new weather value -- mTM_check_renew_time is a
+       * per-process local flag (not networked), so without this gate two connected processes would
+       * each roll their own, differing, weather the moment their local clocks cross the renewal
+       * boundary. The host is the sole authority; this client's weather instead arrives via
+       * PC_NETGAME_MSG_WORLD_META / SNAPSHOT_END and is mirrored into Common_Get(weather)/
+       * Save_Get(weather) by pcnetgame_client_apply_weather_state() (pc_net_game.c). Falling through
+       * to the else-branch below re-reads whatever the host most recently broadcast -- exactly the
+       * same idiom already established by mFM_PcFieldInitGrowth() in m_field_make.c: deliberately
+       * NOT consuming the renew flag and NOT rolling locally. */
+      && !pc_net_game_world_is_host_authoritative()
+#endif
+  ) {
     u8 save_weather;
     
     mEnv_DecideWeather_GameStart();

@@ -11,6 +11,7 @@
 #include "pc_settings_menu.h"
 #include "pc_profiler.h"
 #include "pc_net_game.h"
+#include "pc_rng_domains_selftest.h"
 #include "m_kankyo.h"
 
 /* prefer discrete GPU on laptops */
@@ -314,6 +315,12 @@ static int pc_parse_rain_intensity(const char* text) {
 static int g_pc_lowaddr_selftest = 0; /* --lowaddr-selftest: exercise the real allocators without a ROM */
 #endif
 
+/* --rng-selftest: regression test for the RNG-domain-separation foundation (libc64/qrand_domains.h)
+ * and for the pre-existing global qrand()/fqrand() stream (libc64/qrand.h), without needing a ROM.
+ * Not gated behind PC_LOW_ADDRESS_64 -- unlike --lowaddr-selftest this exercises plain game-side
+ * RNG code, unrelated to the 64-bit low-address-space experiment. */
+static int g_pc_rng_selftest = 0;
+
 /* Stage 5A.1: --pickup-test-seed. Test-only, off by default, never active in normal single-player
  * or hosted play -- see pc_net_game.c's own use of this flag (pcnetgame_run_pickup_test_seed())
  * for exactly what it does and why it exists (this save's field data has no naturally-occurring
@@ -380,6 +387,8 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--lowaddr-selftest") == 0) {
             g_pc_lowaddr_selftest = 1;
 #endif
+        } else if (strcmp(argv[i], "--rng-selftest") == 0) {
+            g_pc_rng_selftest = 1;
         } else if (strcmp(argv[i], "--pickup-test-seed") == 0) {
             g_pc_pickup_test_seed = 1;
         } else if (strcmp(argv[i], "--bootstrap-resident") == 0 && i + 1 < argc) {
@@ -517,6 +526,11 @@ int main(int argc, char* argv[]) {
         return failures + violations;
     }
 #endif
+    if (g_pc_rng_selftest) {
+        int failures = pc_rng_domains_selftest();
+        pc_platform_shutdown();
+        return failures;
+    }
     pc_disc_init();
     if (!pc_assets_init()) {
         const char* msg =

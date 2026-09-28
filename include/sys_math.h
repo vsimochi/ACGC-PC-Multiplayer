@@ -31,6 +31,13 @@ extern u32 __float_max[];
 #define FLT_MAX (3.4028235e+38f)
 #endif
 
+/* NOTE: RANDOM()/RANDOM_F()/RANDOM2()/RANDOM2_F() below all draw from the single global qrand()
+ * stream shared by every system in the game (see libc64/qrand.h). They are unchanged by, and
+ * unrelated to, the independent per-domain streams added in libc64/qrand_domains.h
+ * (RANDOM_D()/RANDOM_D_F()/RANDOM_D_CENTER_F()) -- those are additive infrastructure for future
+ * world-authoritative domains (weather, Stalk Market, ...) and are not used by any existing call
+ * site below. */
+
 /* Macro to generate a random float in the range of [0, n) */
 #define RANDOM_F(n) (fqrand() * (f32)(n))
 

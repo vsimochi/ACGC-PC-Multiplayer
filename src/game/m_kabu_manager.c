@@ -3,6 +3,13 @@
 #include "lb_rtc.h"
 #include "m_common_data.h"
 #include "libc64/qrand.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"          /* pc_net_game_world_is_host_authoritative() */
+#include "libc64/qrand_domains.h" /* QRAND_DOMAIN_STALK_MARKET */
+#define kfqrand() fqrand_d(QRAND_DOMAIN_STALK_MARKET)
+#else
+#define kfqrand() fqrand()
+#endif
 
 #define TRADE_MARKET_ODDS_NUM (Kabu_TRADE_MARKET_TYPE_NUM - 1)
 
@@ -52,7 +59,7 @@ static void Kabu_decide_trade_market() {
   };
 
   f32* next_type_market = next_trade_market[Save_Get(kabu_price_schedule.trade_market)];
-  f32 chosen = fqrand(); /* [0.0f, 1.0f) */
+  f32 chosen = kfqrand(); /* [0.0f, 1.0f) */
   int i;
 
   /* Subtract odds from chosen until we're below the current odds, or reach the last market type */
@@ -94,7 +101,7 @@ static void Kabu_decide_price_schedule_typeA() {
 
   /* determine spike price & spike day */
   spike_price = Save_Get(kabu_price_schedule.daily_price[lbRTC_SUNDAY]) * TRADE_MARKET_A_SPIKE_MULTIPLIER;
-  spike_day = fqrand() * TRADE_MARKET_A_SPIKE_DAYS;
+  spike_day = kfqrand() * TRADE_MARKET_A_SPIKE_DAYS;
   spike_day += lbRTC_MONDAY;
   Save_Set(kabu_price_schedule.daily_price[spike_day], spike_price);
 }
@@ -120,7 +127,7 @@ static void Kabu_decide_price_schedule_typeB() {
 
   for (day = lbRTC_MONDAY; day <= lbRTC_SATURDAY; day++) {
     /* check if rng roll is less than our decrease chance */
-    if (fqrand() < price_decrease_percent) {
+    if (kfqrand() < price_decrease_percent) {
       current_price *= TRADE_MARKET_B_PRICE_DECREASE_RATE; /* decrease price */
       if (current_price > min_price) {
           /* if decreased price is greater than the minimum decrease price, clamp it */
@@ -156,7 +163,7 @@ static void Kabu_decide_price_schedule_typeC() {
   int day;
 
   for (day = lbRTC_MONDAY; day <= lbRTC_SATURDAY; day++) {
-    current_price *= (TRADE_MARKET_C_ADJUST_MULT_BASE + TRADE_MARKET_C_ADJUST_MULT_SPREAD * fqrand()); /* [80%, 95%) */
+    current_price *= (TRADE_MARKET_C_ADJUST_MULT_BASE + TRADE_MARKET_C_ADJUST_MULT_SPREAD * kfqrand()); /* [80%, 95%) */
     *price++ = current_price;
   }
 }
@@ -169,7 +176,7 @@ static void Kabu_decide_price_schedule_typeC() {
  * Prices will always been in the range of [70, 129] bells.
  **/
 static void Kabu_decide_price_sunday() {
-  f32 price = 1.0f + (fqrand() - 0.5f) * 0.6f;
+  f32 price = 1.0f + (kfqrand() - 0.5f) * 0.6f;
   Save_Set(kabu_price_schedule.daily_price[lbRTC_SUNDAY], price * TRADE_MARKET_SUNDAY_BASE_PRICE); /* [0.7, 1.3) * 100.0f = [70, 130) bells */
 }
 
@@ -217,7 +224,34 @@ extern u16 Kabu_get_price() {
 extern void Kabu_manager() {
   lbRTC_time_c* rtc_time = Common_GetPointer(time.rtc_time);
   lbRTC_time_c* kabu_update_time = Save_GetPointer(kabu_price_schedule.update_time);
-  
+
+#ifdef TARGET_PC
+  /* READY client: never independently reroll the Stalk Market. Kabu_manager() is called every real
+   * day-change with no host-role gate in the original code (this file has none at all -- unlike
+   * m_field_make.c's mFM_PcFieldInitGrowth, there was no existing precedent here to reuse, only to
+   * mirror), so two connected processes would otherwise each generate their own, differing, weekly
+   * trend/prices the moment their local clocks cross a day boundary. The host is the sole authority;
+   * this client's Save_Get(kabu_price_schedule) instead arrives via PC_NETGAME_MSG_WORLD_META /
+   * SNAPSHOT_END and is mirrored in by pcnetgame_client_apply_market_state() (pc_net_game.c).
+   * Returning here (rather than falling through) is correct because -- unlike weather, which still
+   * needs its else-branch to re-read the persisted value for rendering -- Kabu_get_price() already
+   * reads Save_Get(kabu_price_schedule) directly and needs no local mirroring step here. */
+  if (pc_net_game_world_is_host_authoritative()) {
+    return;
+  }
+
+  /* Host or solo PC process only (a READY client already returned above): reseed
+   * QRAND_DOMAIN_STALK_MARKET from this save's town identity + the existing all_grow_renew_time day
+   * anchor (see qrand_domain_make_seed()'s doc in qrand_domains.h), so a day's schedule generation is
+   * reproducible for a given town/day rather than depending on process-launch-order LCG state. No new
+   * Save_t field is added -- both inputs already exist. */
+  {
+    u32 town_hash = qrand_domain_hash_town(Save_Get(land_info).id, Save_Get(land_info).name, LAND_NAME_SIZE);
+    u32 day_epoch = qrand_domain_day_epoch(rtc_time->year, rtc_time->month, rtc_time->day);
+    sqrand_d(QRAND_DOMAIN_STALK_MARKET, qrand_domain_make_seed(town_hash, day_epoch, QRAND_DOMAIN_STALK_MARKET));
+  }
+#endif
+
   /* Check if being called on the Sunday where the Stalk Market has already been set */
   if (lbRTC_IsEqualDate(
       rtc_time->year, rtc_time->month, rtc_time->day,
