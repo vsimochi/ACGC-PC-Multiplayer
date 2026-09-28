@@ -431,6 +431,22 @@ extern int mNpc_GetNpcSoundSpec(ACTOR* actor);
 extern void mNpc_InitNpcAllInfo(int malloc_flag);
 extern void mNpc_Grow();
 extern void mNpc_ForceRemove();
+#ifdef TARGET_PC
+/* Villager population/is_home milestone (m_npc.c): client-side apply for
+ * PC_NETGAME_MSG_VILLAGER_ARRIVAL/_DEPARTURE and the initial join snapshot -- see pc_net_game.c and
+ * the doc comments on these functions' definitions in m_npc.c for the full contract. Never re-rolls
+ * any RNG; reproduces the host's already-resolved, deterministic result. */
+extern void mNpc_PcApplyVillagerArrival(int slot, u16 npc_id, u8 reserved_block_x, u8 reserved_block_z,
+                                        u8 reserved_ut_x, u8 reserved_ut_z, u8 new_now_npc_max);
+extern void mNpc_PcApplyVillagerSnapshotSlot(int slot, u16 npc_id, u8 home_block_x, u8 home_block_z, u8 home_ut_x,
+                                             u8 home_ut_z, u8 is_home, u8 new_now_npc_max);
+extern void mNpc_PcApplyVillagerDeparture(int slot, u8 new_now_npc_max);
+/* TEST-ONLY (see pc_main.c's --force-villager-grow/--force-villager-remove and pc_net_game.c's
+ * pcnetgame_run_villager_test_triggers()). See the doc comments on these functions' definitions in
+ * m_npc.c for the full contract. */
+extern void mNpc_DebugForceGrow(void);
+extern void mNpc_DebugForceRemove(void);
+#endif
 extern int mNpc_DecideMaskNpc_summercamp(mActor_name_t* npc_id);
 extern int mNpc_RegistMaskNpc_summercamp(mActor_name_t mask_id, mActor_name_t npc_id, mActor_name_t cloth_id);
 extern int mNpc_CheckNpcSet_fgcol(mActor_name_t fg_item, u32 attribute);

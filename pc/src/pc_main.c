@@ -329,6 +329,11 @@ static int g_pc_rng_selftest = 0;
  * (pc_platform.h), so pc_net_game.c can read it without any new coupling to pc_main.c. */
 int g_pc_pickup_test_seed = 0;
 
+/* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
+ * See pc_platform.h's own doc comment on these two globals. */
+int g_pc_force_villager_grow = 0;
+int g_pc_force_villager_remove = 0;
+
 /* Stage 0: --bootstrap-resident N. Non-interactively binds an EXISTING resident from save slot N
  * (0..PLAYER_NUM-1) and transitions into gameplay (SCENE_FG), without driving the interactive
  * Rover/player-select flow. Off by default (-1); never active in normal single-player or hosted
@@ -364,6 +369,12 @@ int main(int argc, char* argv[]) {
             printf("                      otherwise; see pc_net_game.c.\n");
             printf("  --bootstrap-resident N  Non-interactively bind existing resident slot N and enter\n");
             printf("                      gameplay, bypassing the Rover/player-select flow. See pc_m_card.c.\n");
+            printf("  --force-villager-grow    Host-only test hook: force a villager to grow in once the\n");
+            printf("                      world is ready, bypassing the real (multi-day) trigger condition\n");
+            printf("                      only -- see pc_net_game.c.\n");
+            printf("  --force-villager-remove  Host-only test hook: force a villager to be removed once the\n");
+            printf("                      world is ready, bypassing the real (multi-day) trigger condition\n");
+            printf("                      only -- see pc_net_game.c.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -391,6 +402,10 @@ int main(int argc, char* argv[]) {
             g_pc_rng_selftest = 1;
         } else if (strcmp(argv[i], "--pickup-test-seed") == 0) {
             g_pc_pickup_test_seed = 1;
+        } else if (strcmp(argv[i], "--force-villager-grow") == 0) {
+            g_pc_force_villager_grow = 1;
+        } else if (strcmp(argv[i], "--force-villager-remove") == 0) {
+            g_pc_force_villager_remove = 1;
         } else if (strcmp(argv[i], "--bootstrap-resident") == 0 && i + 1 < argc) {
             g_pc_bootstrap_resident = atoi(argv[i + 1]);
             i++;

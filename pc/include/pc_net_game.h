@@ -388,6 +388,19 @@ void pc_net_game_notify_local_drop_landing(int ut_x, int ut_z, int item);
  * function in this header. */
 int pc_net_game_is_droppable_item(int item);
 
+/* Villager population/is_home milestone: called from mNpc_Grow()/mNpc_InitNpcData() and
+ * mNpc_ForceRemove() (m_npc.c) right after the HOST's OWN local mutation has fully completed --
+ * never before, and never as a substitute for it. `slot` is the Save_t.animals[] index
+ * (0..ANIMAL_NUM_MAX-1) that changed. A no-op for single-player and for a client (mirrors
+ * pc_net_game_notify_local_field_pickup()'s own pattern) -- the vanilla call site is unconditional,
+ * so the role guard lives here rather than requiring the decomp caller to check first. Never blocks.
+ * Safe with an out-of-range slot (rejected internally, logged, no send). Broadcasts
+ * PC_NETGAME_MSG_VILLAGER_ARRIVAL / PC_NETGAME_MSG_VILLAGER_DEPARTURE to every READY client, stamped
+ * with the current world_seq for the same stale/duplicate/reorder protection FIELD_UPDATE/WORLD_META
+ * already use. */
+void pc_net_game_notify_villager_arrival(int slot);
+void pc_net_game_notify_villager_departure(int slot);
+
 #ifdef __cplusplus
 }
 #endif

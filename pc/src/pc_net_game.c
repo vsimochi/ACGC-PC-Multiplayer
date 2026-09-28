@@ -171,6 +171,8 @@
                             * v2: g_pc_verbose (chatty-log gate), SDL_GetPerformanceCounter()
                             * (pcnetgame_now_ms()) */
 #include "m_play.h"        /* v2: play_main -- see pcnetgame_update_local_world_ready() */
+#include "m_npc.h"         /* villager population/is_home milestone: Animal_c, ANIMAL_NUM_MAX,
+                            * mNpc_PcApplyVillagerArrival()/mNpc_PcApplyVillagerDeparture() */
 
 #include <math.h>   /* fabsf(), isfinite() -- see pcnetgame_pos_valid() and the reach checks */
 #include <stddef.h> /* offsetof() */
@@ -229,6 +231,17 @@ typedef enum PCNetGameMsgType {
                                            * PCNetGameInteractConfirmMsg and the "Shared-world
                                            * interactions" block above. Dispatched by exact size + type
                                            * (other 8-byte messages differ in the type byte). */
+    /* ---- villager population / is_home milestone ---- */
+    PC_NETGAME_MSG_VILLAGER_ARRIVAL    = 18, /* host -> every READY client, reliable: mNpc_Grow() +
+                                              * mNpc_SetNpcHome() resolved a new villager into a slot.
+                                              * See PCNetGameVillagerArrivalMsg. */
+    PC_NETGAME_MSG_VILLAGER_DEPARTURE  = 19, /* host -> every READY client, reliable: mNpc_ForceRemove()
+                                              * cleared a slot (and its house footprint). See
+                                              * PCNetGameVillagerDepartureMsg. */
+    PC_NETGAME_MSG_VILLAGER_SNAPSHOT   = 20, /* host -> one client, reliable: full villager population
+                                              * sent once per snapshot (initial join / RESYNC_REQUEST /
+                                              * reconnect), between the last FIELD_BLOCK and
+                                              * SNAPSHOT_END. See PCNetGameVillagerSnapshotMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -565,6 +578,121 @@ typedef struct PCNetGameSnapshotEndMsg {
 _Static_assert(sizeof(PCNetGameSnapshotEndMsg) == 48, "PCNetGameSnapshotEndMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameSnapshotEndMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameSnapshotEndMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* Villager population/is_home milestone.
+ *
+ * is_home design note (Part 2/6 of the milestone): Animal_c.is_home's ~8 runtime write sites
+ * (ac_set_npc_manager.c, ac_npc_action.c_inc, ac_npc2_action.c_inc, ac_npc2_think_into_room.c_inc,
+ * ac_npc_act_leave_house.c_inc) are all inside the per-NPC_ACTOR schedule/AI state machine -- the
+ * SAME unsynced, explicitly out-of-scope "villager movement/animation" system this milestone must
+ * NOT touch. That AI already runs independently and unsynced on host and every client (matching
+ * vanilla single-player; no prior milestone changed this), so is_home's live, continuously-oscillating
+ * value cannot be kept authoritatively in sync without also syncing the schedule/position state that
+ * drives it -- doing so here would silently become a movement-sync feature. Two things make this
+ * safe to scope down rather than a blocking problem: (1) pc_save_write_authoritative()
+ * (pc_m_card.c) already unconditionally rejects every save write from a network CLIENT, so a
+ * client's locally-AI-driven is_home value can NEVER reach persisted Save_t regardless of what this
+ * module does; (2) the only is_home write sites that ARE genuine population-lifecycle state (not AI
+ * schedule) are mNpc_ClearAnimalInfo()'s/mNpc_ClearIslandAnimalInfo()'s `is_home = TRUE` reset
+ * (m_npc.c), which both ARRIVAL and a fresh/late-join snapshot already reproduce deterministically
+ * (mNpc_PcApplyVillagerArrival() calls mNpc_ClearAnimalInfo() first). So: is_home is synchronized
+ * host->client at population-change time (implicitly, via the deterministic TRUE reset) and at
+ * snapshot/join time (explicitly, PCNetGameVillagerSlotWire.is_home, a best-effort read of the
+ * host's current value at snapshot-build time) -- but is NOT a live, continuously-updated channel.
+ * This is the full extent of what "host-authoritative is_home" can mean without expanding this
+ * milestone into villager movement sync. */
+
+/* v2: host -> every READY client, reliable, world_seq-stamped. A new villager grew into `slot` via
+ * mNpc_Grow()+mNpc_SetNpcHome() (m_npc.c) -- see mNpc_PcApplyVillagerArrival() for the exact,
+ * deterministic client-side replay this drives (no RNG re-rolled). reserved_ut_x/reserved_ut_z are
+ * the RAW reserved-house-slot coordinates (Anmhome_c, before mNpc_SetNpcHome()'s ut_z+1 adjustment),
+ * matching exactly what the host itself passed into mNpc_BuildHouseBeforeFieldct(). now_npc_max is
+ * the authoritative Save_t.now_npc_max value AFTER this arrival (applied directly, never
+ * incremented client-side, to rule out counter drift from a missed/duplicate message). */
+typedef struct PCNetGameVillagerArrivalMsg {
+    uint8_t  msg_type;          /* PC_NETGAME_MSG_VILLAGER_ARRIVAL */
+    uint8_t  slot;               /* Save_t.animals[] index, 0..ANIMAL_NUM_MAX-1 */
+    uint8_t  reserved_block_x;
+    uint8_t  reserved_block_z;
+    uint8_t  reserved_ut_x;
+    uint8_t  reserved_ut_z;
+    uint8_t  now_npc_max;
+    uint8_t  _reserved0;
+    uint16_t npc_id;              /* mActor_name_t: the host-chosen villager identity */
+    uint16_t _reserved1;
+    uint32_t world_seq;
+} PCNetGameVillagerArrivalMsg;
+_Static_assert(sizeof(PCNetGameVillagerArrivalMsg) == 16, "PCNetGameVillagerArrivalMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameVillagerArrivalMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameVillagerArrivalMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* v2: host -> every READY client, reliable, world_seq-stamped. mNpc_ForceRemove() (m_npc.c) cleared
+ * `slot` -- both its Animal_c reset AND its 3x3 house-footprint teardown (Save_t.fg, via
+ * mNpc_DestroyHouse()) are already complete on the host by the time this is sent (see
+ * pc_net_game_notify_villager_departure()'s call site in m_npc.c). mNpc_PcApplyVillagerDeparture()
+ * reproduces both mutations, in the same order, from the slot's own (still-present) home_info --
+ * never a separate tile-diff protocol; see the field-atomicity note on that function. now_npc_max is
+ * the authoritative Save_t.now_npc_max value AFTER this departure (applied directly, never
+ * decremented client-side). */
+typedef struct PCNetGameVillagerDepartureMsg {
+    uint8_t  msg_type;    /* PC_NETGAME_MSG_VILLAGER_DEPARTURE */
+    uint8_t  slot;
+    uint8_t  now_npc_max;
+    uint8_t  _reserved0;
+    uint32_t world_seq;
+} PCNetGameVillagerDepartureMsg;
+_Static_assert(sizeof(PCNetGameVillagerDepartureMsg) == 8, "PCNetGameVillagerDepartureMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameVillagerDepartureMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameVillagerDepartureMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* One Save_t.animals[] slot's minimal reconstructable state, as carried inside
+ * PCNetGameVillagerSnapshotMsg. occupied = 0 means every other field is meaningless (the client
+ * clears/leaves the slot empty). is_home is a best-effort read of the host's current value at
+ * snapshot-build time -- see the is_home design note above, this is NOT a live channel.
+ * home_block_x/home_block_z/home_ut_x/home_ut_z mirror Animal_c.home_info directly (the FINAL,
+ * already-adjusted values, i.e. AFTER mNpc_SetNpcHome()'s ut_z+1) -- unlike
+ * PCNetGameVillagerArrivalMsg's reserved_ut_x/reserved_ut_z, which are the RAW pre-adjustment
+ * Anmhome_c values because that message must also drive mNpc_BuildHouseBeforeFieldct() on the
+ * client. The snapshot never needs to rebuild a house (see pcnetgame_build_villager_snapshot(): a
+ * snapshot never runs mNpc_BuildHouseBeforeFieldct() again, since the house already exists in the
+ * persistent field this same snapshot's FIELD_BLOCKs cover), so it carries the simpler,
+ * already-final form; the client applies it by subtracting 1 before calling
+ * mNpc_PcApplyVillagerArrival() -- see pcnetgame_handle_client_villager_snapshot(). */
+typedef struct PCNetGameVillagerSlotWire {
+    uint16_t npc_id;
+    uint8_t  occupied;
+    uint8_t  is_home;
+    uint8_t  home_block_x;
+    uint8_t  home_block_z;
+    uint8_t  home_ut_x;
+    uint8_t  home_ut_z;
+} PCNetGameVillagerSlotWire;
+_Static_assert(sizeof(PCNetGameVillagerSlotWire) == 8, "PCNetGameVillagerSlotWire wire size drifted");
+
+/* v2: host -> one client, reliable. Sent once per snapshot sequence (initial join / RESYNC_REQUEST /
+ * reconnect), between the last FIELD_BLOCK and SNAPSHOT_END (see pcnetgame_host_pump_snapshots()'s
+ * snap_stage 2) -- late-join/reconnect coverage for Save_t.animals[], which FIELD_BLOCK/SNAPSHOT_END
+ * never carry (they cover Save_t.fg only). world_seq/epoch follow the exact same semantics as every
+ * other snapshot message; the client applies this iff world_seq >= its single last-applied
+ * s_client_population_seq (matching FIELD_BLOCK's >= rule, since a full snapshot always supersedes
+ * anything older, not WORLD_META's strict >). now_npc_max is the authoritative population count at
+ * snapshot-build time. */
+typedef struct PCNetGameVillagerSnapshotMsg {
+    uint8_t  msg_type;   /* PC_NETGAME_MSG_VILLAGER_SNAPSHOT */
+    uint8_t  grid;       /* PC_NETGAME_GRID_TOWN */
+    uint8_t  now_npc_max;
+    uint8_t  _reserved0;
+    uint32_t epoch;
+    uint32_t world_seq;
+    PCNetGameVillagerSlotWire slots[15]; /* ANIMAL_NUM_MAX; spelled out numerically to keep this
+                                          * header/struct decomp-independent like every other wire
+                                          * struct in this file -- pcnetgame_build_villager_snapshot()
+                                          * _Static_assert's this matches ANIMAL_NUM_MAX exactly. */
+} PCNetGameVillagerSnapshotMsg;
+_Static_assert(sizeof(PCNetGameVillagerSnapshotMsg) == 132, "PCNetGameVillagerSnapshotMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameVillagerSnapshotMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameVillagerSnapshotMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+_Static_assert(ANIMAL_NUM_MAX == 15, "PCNetGameVillagerSnapshotMsg.slots[15] no longer matches ANIMAL_NUM_MAX");
 
 /* v2: host -> every READY client that is NOT mid-snapshot, reliable, when the host's Save
  * all_grow_renew_time changes (daily renewal), OR (weather + Stalk Market milestone) when
@@ -1029,7 +1157,9 @@ typedef struct PCNetGameHostPeerState {
     PCNetPlayerContext   ctx;
     /* snapshot progress */
     int                  snap_active;
-    int                  snap_stage;      /* 0 = BEGIN next, 1 = blocks, 2 = END next */
+    int                  snap_stage;      /* 0 = BEGIN next, 1 = FIELD_BLOCKs, 2 = VILLAGER_SNAPSHOT next,
+                                            * 3 = END next (villager population/is_home milestone: inserted
+                                            * stage 2 between the field blocks and SNAPSHOT_END) */
     int                  snap_next_acre;
     int                  snap_blocks_sent;
     uint32_t             snap_epoch;
@@ -1075,6 +1205,14 @@ static PCNetGameTownIdentity s_client_claimed_town;     /* what our IDENTITY cla
 static uint16_t              s_client_assigned_peer_id = 0;
 static uint32_t              s_client_acre_seq[PCFA_ACRE_NUM];
 static uint32_t              s_client_meta_seq = 0;
+/* Villager population/is_home milestone: strictly-monotonic last-applied world_seq for
+ * VILLAGER_ARRIVAL/VILLAGER_DEPARTURE/VILLAGER_SNAPSHOT, exactly mirroring s_client_meta_seq's own
+ * generation/stale-event-protection contract (no new sequencing scheme). ARRIVAL/DEPARTURE apply iff
+ * world_seq > s_client_population_seq (stale/duplicate/reordered reliable delivery is dropped, same
+ * strict rule as WORLD_META); VILLAGER_SNAPSHOT applies iff world_seq >= s_client_population_seq
+ * (same relaxed rule as a fresh snapshot always superseding older state, matching FIELD_BLOCK/
+ * SNAPSHOT_END's own >= rule). */
+static uint32_t              s_client_population_seq = 0;
 static int                   s_client_snap_active = 0;
 static uint32_t              s_client_snap_epoch = 0;
 static int                   s_client_snap_blocks = 0;
@@ -2777,6 +2915,10 @@ static void pcnetgame_host_check_world_meta(void) {
  * built at send time: its acre is flushed first (committing -- and broadcasting to everyone,
  * including this peer, ahead of the block -- anything that changed), then the block is the
  * committed shadow at the current world_seq. Only runs while the host world is ready (save loaded). */
+/* Forward-declared: defined near the other villager-population host-side functions, below; used here
+ * (snap_stage 2) before that point in the file. */
+static void pcnetgame_build_villager_snapshot(PCNetGameVillagerSnapshotMsg* vs, uint32_t epoch);
+
 static void pcnetgame_host_pump_snapshots(void) {
     int i;
 
@@ -2828,6 +2970,16 @@ static void pcnetgame_host_pump_snapshots(void) {
                 if (st->snap_next_acre >= PCFA_ACRE_NUM) {
                     st->snap_stage = 2;
                 }
+            } else if (st->snap_stage == 2) {
+                /* Villager population/is_home milestone: one-shot full population snapshot, sent
+                 * after every FIELD_BLOCK (so the villagers' house footprints are already correct in
+                 * the persistent field by the time the client applies this) and before SNAPSHOT_END. */
+                static PCNetGameVillagerSnapshotMsg vs; /* 132 B, built and sent synchronously */
+                pcnetgame_build_villager_snapshot(&vs, st->snap_epoch);
+                if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &vs, (uint16_t)sizeof(vs))) {
+                    break;
+                }
+                st->snap_stage = 3;
             } else {
                 PCNetGameSnapshotEndMsg e;
                 memset(&e, 0, sizeof(e));
@@ -3886,6 +4038,86 @@ static void pcnetgame_handle_client_world_meta(const PCNetGameWorldMetaMsg* in) 
     s_client_meta_seq = in->world_seq;
 }
 
+/* Villager population/is_home milestone, client side. Strict `>` staleness rule (matches WORLD_META,
+ * not the `>=` snapshot rule) -- an ARRIVAL/DEPARTURE is a one-shot delta, not a full resync, so a
+ * duplicate or reordered-behind delivery of the SAME world_seq must never be re-applied (re-applying
+ * an ARRIVAL would re-clear-then-regrow the slot, losing nothing but wastefully rebuilding npclist;
+ * re-applying a DEPARTURE is a harmless no-op via mNpc_PcApplyVillagerDeparture()'s own
+ * mNpc_CheckFreeAnimalInfo() guard -- but the seq check makes the intent explicit and cheap rather
+ * than relying on that incidental idempotency). All fields are validated again inside
+ * mNpc_PcApplyVillagerArrival()/mNpc_PcApplyVillagerDeparture() themselves (slot range, npc_id shape)
+ * as defense in depth -- a malformed or adversarial message can never crash or corrupt Save_t. */
+static void pcnetgame_handle_client_villager_arrival(const PCNetGameVillagerArrivalMsg* in) {
+    if (!pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->world_seq <= s_client_population_seq) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] client: stale VILLAGER_ARRIVAL slot %u world_seq %u <= %u ignored\n",
+                   (unsigned)in->slot, (unsigned)in->world_seq, (unsigned)s_client_population_seq);
+        }
+        return;
+    }
+    mNpc_PcApplyVillagerArrival((int)in->slot, in->npc_id, in->reserved_block_x, in->reserved_block_z,
+                                in->reserved_ut_x, in->reserved_ut_z, in->now_npc_max);
+    s_client_population_seq = in->world_seq;
+    printf("[NET][NPC] client: villager arrived slot %u npc_id 0x%04X (world_seq %u, now_npc_max %u)\n",
+           (unsigned)in->slot, (unsigned)in->npc_id, (unsigned)in->world_seq, (unsigned)in->now_npc_max);
+}
+
+static void pcnetgame_handle_client_villager_departure(const PCNetGameVillagerDepartureMsg* in) {
+    if (!pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->world_seq <= s_client_population_seq) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] client: stale VILLAGER_DEPARTURE slot %u world_seq %u <= %u ignored\n",
+                   (unsigned)in->slot, (unsigned)in->world_seq, (unsigned)s_client_population_seq);
+        }
+        return;
+    }
+    mNpc_PcApplyVillagerDeparture((int)in->slot, in->now_npc_max);
+    s_client_population_seq = in->world_seq;
+    printf("[NET][NPC] client: villager departed slot %u (world_seq %u, now_npc_max %u)\n", (unsigned)in->slot,
+           (unsigned)in->world_seq, (unsigned)in->now_npc_max);
+}
+
+/* Villager population/is_home milestone, client side: full late-join/reconnect population sync.
+ * `>=` rule (matches FIELD_BLOCK/SNAPSHOT_END, not WORLD_META's strict `>`): a full snapshot always
+ * supersedes whatever came before, including one at the same world_seq (e.g. a RESYNC_REQUEST
+ * re-fetch after no population change occurred). Applies every slot unconditionally (occupied or not)
+ * so a slot the client thinks is occupied but the host's snapshot says is empty gets correctly
+ * cleared too -- never a partial/merge apply. */
+static void pcnetgame_handle_client_villager_snapshot(const PCNetGameVillagerSnapshotMsg* in) {
+    int i;
+
+    if (in->grid != PC_NETGAME_GRID_TOWN) {
+        return;
+    }
+    if (!s_client_snap_active || !pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->world_seq < s_client_population_seq) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] client: stale VILLAGER_SNAPSHOT world_seq %u < %u ignored\n",
+                   (unsigned)in->world_seq, (unsigned)s_client_population_seq);
+        }
+        return;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        const PCNetGameVillagerSlotWire* slot = &in->slots[i];
+        if (slot->occupied) {
+            mNpc_PcApplyVillagerSnapshotSlot(i, slot->npc_id, slot->home_block_x, slot->home_block_z,
+                                             slot->home_ut_x, slot->home_ut_z, slot->is_home, in->now_npc_max);
+        } else {
+            mNpc_PcApplyVillagerDeparture(i, in->now_npc_max);
+        }
+    }
+    s_client_population_seq = in->world_seq;
+    printf("[NET][NPC] client: villager population snapshot applied (world_seq %u, now_npc_max %u)\n",
+           (unsigned)in->world_seq, (unsigned)in->now_npc_max);
+}
+
 /* v2 host side: validate a parked IDENTITY against the host's own town, then either reject+drop or
  * accept (ACK -> READY -> roster -> snapshot). Only called with the host world ready. */
 static void pcnetgame_host_process_identity(PCNetPeerId peer) {
@@ -4173,6 +4405,30 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == sizeof(PCNetGameVillagerArrivalMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_VILLAGER_ARRIVAL) {
+        PCNetGameVillagerArrivalMsg va;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&va, data, sizeof(va));
+        pcnetgame_handle_client_villager_arrival(&va);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameVillagerDepartureMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_VILLAGER_DEPARTURE) {
+        PCNetGameVillagerDepartureMsg vd;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&vd, data, sizeof(vd));
+        pcnetgame_handle_client_villager_departure(&vd);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameVillagerSnapshotMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_VILLAGER_SNAPSHOT) {
+        static PCNetGameVillagerSnapshotMsg vs; /* 132 B: static, handled synchronously */
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&vs, data, sizeof(vs));
+        pcnetgame_handle_client_villager_snapshot(&vs);
+        return;
+    }
+
     if (size == sizeof(PCNetGameIdentityAckMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_ACK) {
         PCNetGameIdentityAckMsg in;
         PCNetGameTownIdentity host_town;
@@ -4280,6 +4536,7 @@ static void pcnetgame_reset_client_session_state(void) {
 
     memset(s_client_acre_seq, 0, sizeof(s_client_acre_seq));
     s_client_meta_seq = 0;
+    s_client_population_seq = 0;
     s_client_snap_active = 0;
     s_client_snap_epoch = 0;
     s_client_snap_blocks = 0;
@@ -4509,6 +4766,47 @@ void pc_net_game_shutdown(void) {
  * overall timeout: different acres were observed (during implementation) to become writable at
  * different, unpredictable times after boot, and this is test-only code where waiting a few extra
  * seconds costs nothing. */
+/* Villager population/is_home milestone, TEST-ONLY: fires mNpc_DebugForceGrow()/
+ * mNpc_DebugForceRemove() (m_npc.c) exactly once each, as soon as the host world is ready -- see
+ * pc_platform.h's doc comment on g_pc_force_villager_grow/g_pc_force_villager_remove. Mirrors
+ * pcnetgame_run_pickup_test_seed()'s own gating (host role, gamePT loaded, world ready). */
+static void pcnetgame_run_villager_test_triggers(void) {
+    static int s_grow_done = 0;
+    static int s_remove_done = 0;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || gamePT == NULL || !s_host_world_ready) {
+        return;
+    }
+    /* Verification-pass addition: wait for at least one READY client whose initial snapshot has
+     * already COMPLETED (not merely connected) before firing, so a real connected client observes
+     * the LIVE PC_NETGAME_MSG_VILLAGER_ARRIVAL/_DEPARTURE broadcast itself (proving the client's own
+     * receive-and-apply path for the delta messages, not just its initial join snapshot picking up
+     * the already-changed state). A no-op (never fires) if run with zero clients, e.g. the earlier
+     * host-only smoke checks, or while every connected peer is still mid-snapshot. */
+    {
+        int i, have_settled_peer = 0;
+        for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+            if (s_host_peer_link[i] == PC_NETGAME_LINK_READY && !s_host_peer[i].snap_active) {
+                have_settled_peer = 1;
+                break;
+            }
+        }
+        if (!have_settled_peer) {
+            return;
+        }
+    }
+    if (g_pc_force_villager_grow && !s_grow_done) {
+        s_grow_done = 1;
+        printf("[NET][NPC] --force-villager-grow active: forcing a villager to grow in\n");
+        mNpc_DebugForceGrow();
+    }
+    if (g_pc_force_villager_remove && !s_remove_done) {
+        s_remove_done = 1;
+        printf("[NET][NPC] --force-villager-remove active: forcing a villager to be removed\n");
+        mNpc_DebugForceRemove();
+    }
+}
+
 static void pcnetgame_run_pickup_test_seed(void) {
     static const int s_seed_tiles[30][2] = {
         { 8, 8 },   { 24, 8 },  { 40, 8 },  { 56, 8 },  { 72, 8 },
@@ -4866,6 +5164,10 @@ void pc_net_game_poll(void) {
     /* Stage 5A.1: see pcnetgame_run_pickup_test_seed()'s own doc -- a complete no-op unless
      * --pickup-test-seed was passed on the command line. */
     pcnetgame_run_pickup_test_seed();
+
+    /* Villager population/is_home milestone: see pcnetgame_run_villager_test_triggers()'s own doc --
+     * a complete no-op unless --force-villager-grow/--force-villager-remove was passed. */
+    pcnetgame_run_villager_test_triggers();
 }
 
 PCNetGameRole pc_net_game_role(void) {
@@ -5150,4 +5452,127 @@ int pc_net_game_request_drop(int pocket_slot_idx, int claimed_item, int ut_x, in
         s_drop_pending.timeout_accum = PC_NETGAME_DROP_TIMEOUT_60FPS_FRAMES;
     }
     return 1;
+}
+
+/* Villager population/is_home milestone: broadcasts `msg` (already fully built, including
+ * world_seq) to every READY client, exactly mirroring pcnetgame_host_check_world_meta()'s own
+ * broadcast loop -- peers mid-snapshot are skipped (their snapshot, built at send time from current
+ * Save_t.animals[], already carries this result; see pcnetgame_build_villager_snapshot()) and a send
+ * failure (reliable window full) falls back to a full resync for that one peer rather than leaving it
+ * silently behind. */
+static void pcnetgame_broadcast_villager_msg(const void* msg, size_t msg_size) {
+    int i;
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        int backlog;
+        if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || s_host_peer[i].snap_active) {
+            continue;
+        }
+        backlog = pc_net_reliable_backlog((PCNetPeerId)i);
+        if (backlog < 0) {
+            continue;
+        }
+        if (backlog + 1 > PC_NET_RELIABLE_WINDOW - PC_NETGAME_WINDOW_HEADROOM ||
+            !pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, msg, (uint16_t)msg_size)) {
+            pcnetgame_host_start_snapshot((PCNetPeerId)i, "villager population send failed");
+        }
+    }
+}
+
+/* See pc_net_game.h. Called from mNpc_InitNpcData() (m_npc.c), right after mNpc_SetNpcHome() has
+ * finished assigning `slot`'s home_info -- Save_t.animals[slot] is fully populated by the time this
+ * runs. A no-op for single-player and for a client (mirrors every other pc_net_game_notify_local_*()
+ * function's own pattern) -- the vanilla call site in m_npc.c is unconditional. */
+void pc_net_game_notify_villager_arrival(int slot) {
+    Animal_c* animal;
+    PCNetGameVillagerArrivalMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return; /* malformed input from the caller -- defensive */
+    }
+    animal = Save_GetPointer(animals[slot]);
+    if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC) {
+        return; /* defensive: mNpc_Grow() always fills the slot before this fires */
+    }
+
+    ++s_world_seq;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_VILLAGER_ARRIVAL;
+    msg.slot = (uint8_t)slot;
+    msg.reserved_block_x = animal->home_info.block_x;
+    msg.reserved_block_z = animal->home_info.block_z;
+    msg.reserved_ut_x = animal->home_info.ut_x;
+    msg.reserved_ut_z = (uint8_t)(animal->home_info.ut_z - 1); /* undo mNpc_SetNpcHome()'s ut_z+1 */
+    msg.now_npc_max = (uint8_t)Save_Get(now_npc_max);
+    msg.npc_id = (uint16_t)animal->id.npc_id;
+    msg.world_seq = s_world_seq;
+
+    printf("[NET][NPC] host: villager arrived slot %d npc_id 0x%04X home(%u,%u,%u,%u) (world_seq %u, now_npc_max %u)\n",
+           slot, (unsigned)msg.npc_id, (unsigned)msg.reserved_block_x, (unsigned)msg.reserved_block_z,
+           (unsigned)msg.reserved_ut_x, (unsigned)msg.reserved_ut_z, (unsigned)s_world_seq,
+           (unsigned)msg.now_npc_max);
+    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+}
+
+/* See pc_net_game.h. Called from mNpc_ForceRemove() (m_npc.c) right after BOTH Save_t mutations
+ * (Animal_c slot reset + the 3x3 house-footprint teardown via mNpc_DestroyHouse()) are complete --
+ * `slot` is already empty by the time this runs, so nothing is read from Save_t.animals[slot] here;
+ * only the slot index and the already-updated now_npc_max are needed. A no-op for single-player and
+ * for a client. */
+void pc_net_game_notify_villager_departure(int slot) {
+    PCNetGameVillagerDepartureMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+
+    ++s_world_seq;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_VILLAGER_DEPARTURE;
+    msg.slot = (uint8_t)slot;
+    msg.now_npc_max = (uint8_t)Save_Get(now_npc_max);
+    msg.world_seq = s_world_seq;
+
+    printf("[NET][NPC] host: villager departed slot %d (world_seq %u, now_npc_max %u)\n", slot,
+           (unsigned)s_world_seq, (unsigned)msg.now_npc_max);
+    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+}
+
+/* Villager population/is_home milestone: builds the one-shot full population snapshot sent during
+ * snap_stage 2 (see pcnetgame_host_pump_snapshots()), directly from the host's current
+ * Save_t.animals[] -- never from any cached/shadow copy (there is no shadow for population, unlike
+ * the field: ANIMAL_NUM_MAX (15) slots is cheap enough to always send in full). is_home is read
+ * as-is at build time (best-effort; see the is_home design note above PCNetGameVillagerSlotWire). */
+static void pcnetgame_build_villager_snapshot(PCNetGameVillagerSnapshotMsg* vs, uint32_t epoch) {
+    int i;
+
+    memset(vs, 0, sizeof(*vs));
+    vs->msg_type = (uint8_t)PC_NETGAME_MSG_VILLAGER_SNAPSHOT;
+    vs->grid = (uint8_t)PC_NETGAME_GRID_TOWN;
+    vs->now_npc_max = (uint8_t)Save_Get(now_npc_max);
+    vs->epoch = epoch;
+    vs->world_seq = s_world_seq;
+
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        Animal_c* animal = Save_GetPointer(animals[i]);
+        PCNetGameVillagerSlotWire* slot = &vs->slots[i];
+
+        if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC) {
+            continue; /* occupied already 0 from the memset above */
+        }
+        slot->occupied = 1;
+        slot->npc_id = (uint16_t)animal->id.npc_id;
+        slot->is_home = animal->is_home ? 1 : 0;
+        slot->home_block_x = animal->home_info.block_x;
+        slot->home_block_z = animal->home_info.block_z;
+        slot->home_ut_x = animal->home_info.ut_x;
+        slot->home_ut_z = animal->home_info.ut_z;
+    }
 }

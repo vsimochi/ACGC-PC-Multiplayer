@@ -15,8 +15,21 @@
 #include "libultra/libultra.h"
 #include "jsyswrap.h"
 #include "ac_npc.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* pc_net_game_world_is_host_authoritative() -- villager population/home authority gating */
+#endif
 
 static int mNpc_CheckIslandAnimalID(AnmPersonalID_c* anm_id);
+
+#ifdef TARGET_PC
+/* Villager population milestone: set by mNpc_Grow() when it grows a new villager into a slot; the
+ * PC_NETGAME_MSG_VILLAGER_ARRIVAL broadcast is deferred until mNpc_InitNpcData() (called a few
+ * statements later in mSDI_StartInitAfter) has finished assigning that villager's home_info --
+ * mNpc_Grow() never calls mNpc_SetNpcHome() itself, so home_info is still 0xFF/unassigned right after
+ * it returns. -1 means "no grow pending". Host/single-player only (both mNpc_Grow() and
+ * mNpc_InitNpcData() return early on a READY client, so this is never set there). */
+static int s_pc_pending_grow_slot = -1;
+#endif
 
 extern mNpc_Default_Data_c npc_def_list[];
 extern s8 npc_grow_list[];
@@ -2771,8 +2784,30 @@ extern void mNpc_InitNpcData() {
 
     u8 reserved_num = 0;
 
+#ifdef TARGET_PC
+    /* READY client: never independently roll a new villager's house-slot assignment. This function
+     * runs every real day-change via mSDI_StartInitAfter with no host-role gate in the original code,
+     * and mNpc_SetNpcHome()'s mNpc_MakeRandTable() call is genuine RNG -- two connected processes would
+     * otherwise assign a freshly-grown villager a different house position. The host is the sole
+     * authority; a connected client's home_info for any villager instead arrives via
+     * PC_NETGAME_MSG_VILLAGER_ARRIVAL (mNpc_PcApplyVillagerArrival(), pc_net_game.c) or the initial
+     * join snapshot. In practice a READY client's animals[] never has a 0xFF (unassigned) home_info
+     * entry to find here anyway, since mNpc_Grow() is gated the same way below -- this return is
+     * defense-in-depth against that invariant, matching Kabu_manager()'s idiom exactly. */
+    if (pc_net_game_world_is_host_authoritative()) {
+        return;
+    }
+#endif
+
     mNpc_MakeReservedListBeforeFieldct(reserved, ARRAY_COUNT(reserved), &reserved_num);
     mNpc_SetNpcHome(Save_Get(animals), reserved, reserved_num);
+
+#ifdef TARGET_PC
+    if (s_pc_pending_grow_slot != -1) {
+        pc_net_game_notify_villager_arrival(s_pc_pending_grow_slot);
+        s_pc_pending_grow_slot = -1;
+    }
+#endif
 }
 
 extern void mNpc_InitNpcList(mNpc_NpcList_c* npclist, int count) {
@@ -4404,6 +4439,19 @@ extern void mNpc_Grow() {
     int selected;
     int grow_idx;
 
+#ifdef TARGET_PC
+    /* READY client: never independently grow a new villager. mNpc_Grow() is called every real
+     * day-change via mSDI_StartInitAfter with no host-role gate in the original code (same call site
+     * as Kabu_manager(), same reasoning) -- two connected processes would otherwise each roll their
+     * own new villager identity from mNpc_GrowLooksNpcIdx()'s/this function's own RANDOM() calls,
+     * producing two different towns. The host is the sole authority; a connected client instead
+     * receives the concrete result via PC_NETGAME_MSG_VILLAGER_ARRIVAL
+     * (mNpc_PcApplyVillagerArrival(), pc_net_game.c) or the initial join snapshot. */
+    if (pc_net_game_world_is_host_authoritative()) {
+        return;
+    }
+#endif
+
     if (mNpc_CheckGrow() == TRUE) {
         lbRTC_time_c* rtc_time = Common_GetPointer(time.rtc_time);
         lbRTC_time_c* last_grow_time = Save_GetPointer(last_grow_time);
@@ -4464,6 +4512,13 @@ extern void mNpc_Grow() {
             mNpc_SetNpcNameID(Save_GetPointer(animals[grow_idx]), 1);
             mNpc_AddNowNpcMax(Save_GetPointer(now_npc_max));
             mNpc_RenewRemoveHistory();
+#ifdef TARGET_PC
+            /* Deferred, not sent here: home_info is still unassigned (0xFF) at this point --
+             * mNpc_Grow() never calls mNpc_SetNpcHome() itself. mNpc_InitNpcData(), called a few
+             * statements later in mSDI_StartInitAfter (immediately after this function), finishes the
+             * job and sends PC_NETGAME_MSG_VILLAGER_ARRIVAL once home_info is final. */
+            s_pc_pending_grow_slot = grow_idx;
+#endif
         }
     }
 }
@@ -4477,6 +4532,20 @@ extern void mNpc_ForceRemove() {
     int animal_num = mNpc_GetAnimalNum();
     int ignored_idx = -1;
     int idx;
+
+#ifdef TARGET_PC
+    /* READY client: never independently force-remove a villager. mNpc_ForceRemove() is called every
+     * real day-change via mSDI_StartInitAfter with no host-role gate in the original code (same call
+     * site pattern as Kabu_manager()/mNpc_Grow()) -- two connected processes would otherwise each
+     * independently pick a (possibly different) "goodbye" villager via mNpc_GetGoodbyAnimalIdx() and
+     * tear down its house, desyncing both the population and the field. The host is the sole
+     * authority; a connected client instead receives the departure via
+     * PC_NETGAME_MSG_VILLAGER_DEPARTURE (mNpc_PcApplyVillagerDeparture(), pc_net_game.c) or the
+     * initial join snapshot. */
+    if (pc_net_game_world_is_host_authoritative()) {
+        return;
+    }
+#endif
 
     if (animal_num == ANIMAL_NUM_MAX && force_remove_date->year != 0xFFFF && force_remove_date->month != 0xFF &&
         force_remove_date->day != 0xFF) {
@@ -4505,11 +4574,210 @@ extern void mNpc_ForceRemove() {
                     mNpc_ClearAnimalInfo(animal);
                     mNpc_SubNowNpcMax(Save_GetPointer(now_npc_max));
                     mNpc_RenewRemoveHistory();
+#ifdef TARGET_PC
+                    /* Sent here (not deferred): unlike growth, both Save_t mutations (Animal_c slot +
+                     * the 3x3 house-footprint teardown in Save_t.fg via mNpc_DestroyHouse(), already
+                     * called above) are complete by this point. */
+                    pc_net_game_notify_villager_departure(idx);
+#endif
                 }
             }
         }
     }
 }
+
+#ifdef TARGET_PC
+/* Client-apply for PC_NETGAME_MSG_VILLAGER_ARRIVAL (pc_net_game.c). Reproduces, in order, exactly the
+ * mutations mNpc_SetGrowNpc()+mNpc_SetNpcHome() perform on the host for a newly-grown villager --
+ * Animal_c slot reset/identity/home_info, then the deterministic mNpc_BuildHouseBeforeFieldct() house
+ * footprint write -- from the authoritative fields the host already resolved (chosen npc identity,
+ * chosen house-slot), never by re-rolling any RNG locally (mNpc_Grow()/mNpc_SetNpcHome() are both
+ * host-authority-gated and never run on a READY client). `reserved_ut_x`/`reserved_ut_z` are the raw
+ * reserved-house-slot coordinates (matching Anmhome_c's `reserved[idx]` on the host, i.e. BEFORE the
+ * ut_z+1 adjustment mNpc_SetNpcHome() applies when writing animal->home_info) -- this mirrors that same
+ * adjustment here so animal->home_info and the mNpc_BuildHouseBeforeFieldct() call both match the host
+ * exactly. Finishes by rebuilding the whole npclist (cheap: ANIMAL_NUM_MAX <= 15 entries) so the
+ * existing, unmodified Set_Npc_Manager/NPC_ACTOR lifecycle naturally spawns the new villager's actor
+ * the next time its block is loaded -- no actor is created here directly. Validates slot range and
+ * npc_id shape; a malformed/out-of-range message is silently ignored (never crashes, never corrupts
+ * Save_t). */
+extern void mNpc_PcApplyVillagerArrival(int slot, u16 npc_id, u8 reserved_block_x, u8 reserved_block_z,
+                                         u8 reserved_ut_x, u8 reserved_ut_z, u8 new_now_npc_max) {
+    Animal_c* animal;
+    int npc_idx = npc_id & 0x0FFF;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+
+    if (ITEM_NAME_GET_TYPE(npc_id) != NAME_TYPE_NPC || npc_idx >= NPC_NUM) {
+        return;
+    }
+
+    animal = Save_GetPointer(animals[slot]);
+
+    mNpc_ClearAnimalInfo(animal);
+    mNpc_SetAnimalInfoNpcIdx(animal, npc_idx);
+    mNpc_SetHaveAppeared(animal->id.npc_id);
+    animal->moved_in = TRUE;
+    mNpc_SetNpcNameID(animal, 1);
+
+    animal->home_info.block_x = reserved_block_x;
+    animal->home_info.block_z = reserved_block_z;
+    animal->home_info.ut_x = reserved_ut_x;
+    animal->home_info.ut_z = reserved_ut_z + 1;
+    mNpc_BuildHouseBeforeFieldct(animal->id.npc_id, animal->home_info.block_x - 1, animal->home_info.block_z - 1,
+                                 animal->home_info.ut_x, reserved_ut_z);
+
+    Save_Set(now_npc_max, new_now_npc_max);
+
+    mNpc_InitNpcList(Common_Get(npclist), ANIMAL_NUM_MAX);
+    mNpc_SetNpcList(Common_Get(npclist), Save_Get(animals), ANIMAL_NUM_MAX, FALSE);
+}
+
+/* Client-apply for one slot of PC_NETGAME_MSG_VILLAGER_SNAPSHOT (pc_net_game.c, initial join /
+ * RESYNC_REQUEST / reconnect). Deliberately distinct from mNpc_PcApplyVillagerArrival(): a snapshot's
+ * FIELD_BLOCKs (sent earlier in the same snapshot sequence, see pcnetgame_host_pump_snapshots()) are
+ * the persistent field's authoritative source for this acre, including this villager's already-built
+ * house footprint -- calling mNpc_BuildHouseBeforeFieldct() again here would redundantly re-run
+ * mPB_keep_item() over tiles the FIELD_BLOCK already set correctly, risking an unwanted
+ * lost-and-found side effect. This function therefore sets only Animal_c (identity, home_info,
+ * is_home, moved_in) and never touches Save_t.fg. `home_block_x/z/home_ut_x/z` are the FINAL,
+ * already-adjusted Animal_c.home_info values (unlike mNpc_PcApplyVillagerArrival()'s
+ * reserved_block_x/z/reserved_ut_x/z, which are pre-adjustment). is_home is applied as given
+ * (best-effort snapshot-time value; see the is_home design note in pc_net_game.c). */
+extern void mNpc_PcApplyVillagerSnapshotSlot(int slot, u16 npc_id, u8 home_block_x, u8 home_block_z, u8 home_ut_x,
+                                             u8 home_ut_z, u8 is_home, u8 new_now_npc_max) {
+    Animal_c* animal;
+    int npc_idx = npc_id & 0x0FFF;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+
+    if (ITEM_NAME_GET_TYPE(npc_id) != NAME_TYPE_NPC || npc_idx >= NPC_NUM) {
+        return;
+    }
+
+    animal = Save_GetPointer(animals[slot]);
+
+    mNpc_ClearAnimalInfo(animal);
+    mNpc_SetAnimalInfoNpcIdx(animal, npc_idx);
+    mNpc_SetHaveAppeared(animal->id.npc_id);
+    animal->moved_in = TRUE;
+    mNpc_SetNpcNameID(animal, 1);
+
+    animal->home_info.block_x = home_block_x;
+    animal->home_info.block_z = home_block_z;
+    animal->home_info.ut_x = home_ut_x;
+    animal->home_info.ut_z = home_ut_z;
+    animal->is_home = is_home ? TRUE : FALSE;
+
+    Save_Set(now_npc_max, new_now_npc_max);
+
+    mNpc_InitNpcList(Common_Get(npclist), ANIMAL_NUM_MAX);
+    mNpc_SetNpcList(Common_Get(npclist), Save_Get(animals), ANIMAL_NUM_MAX, FALSE);
+}
+
+/* Client-apply for PC_NETGAME_MSG_VILLAGER_DEPARTURE (pc_net_game.c). Reproduces, in the same order as
+ * the host's mNpc_ForceRemove(), both Save_t mutations that must never be seen half-applied: the 3x3
+ * house-footprint teardown (mNpc_DestroyHouse(), Save_t.fg) THEN the Animal_c slot reset
+ * (mNpc_ClearAnimalInfo()) -- both purely deterministic given the slot's current home_info, no RNG
+ * involved. A slot that is already empty (duplicate/stale/reordered DEPARTURE) is a silent no-op, not
+ * an error -- see pc_net_game.c's generation/dedup handling for why this can legitimately happen.
+ * Rebuilds the whole npclist afterward so the existing NPC_ACTOR lifecycle naturally despawns the
+ * villager. Validates slot range; never crashes or corrupts Save_t on a malformed message. */
+extern void mNpc_PcApplyVillagerDeparture(int slot, u8 new_now_npc_max) {
+    Animal_c* animal;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+
+    animal = Save_GetPointer(animals[slot]);
+
+    if (mNpc_CheckFreeAnimalInfo(animal) == FALSE) {
+        mNpc_DestroyHouse(&animal->home_info);
+        mNpc_ClearAnimalInfo(animal);
+    }
+
+    Save_Set(now_npc_max, new_now_npc_max);
+
+    mNpc_InitNpcList(Common_Get(npclist), ANIMAL_NUM_MAX);
+    mNpc_SetNpcList(Common_Get(npclist), Save_Get(animals), ANIMAL_NUM_MAX, FALSE);
+}
+
+/* TEST-ONLY (see pc_main.c's --force-villager-grow, pc_net_game.c's
+ * pcnetgame_run_villager_test_triggers()). Exercises the exact same host-authority gate, notify
+ * path (s_pc_pending_grow_slot -> pc_net_game_notify_villager_arrival()), and ARRIVAL wire message
+ * a real mNpc_Grow() firing would, WITHOUT waiting for mNpc_CheckGrow()'s real (multi-day, RNG-timed)
+ * trigger condition. Reuses mNpc_SetGrowNpc() (and therefore mNpc_GrowLooksNpcIdx()'s real RANDOM()
+ * identity roll) and mNpc_InitNpcData() (and therefore mNpc_SetNpcHome()'s real RANDOM()-driven house
+ * assignment) completely unmodified -- only mNpc_CheckGrow()'s gate condition itself is skipped. A
+ * no-op on a READY client, exactly like mNpc_Grow() (the gate is checked first, before anything
+ * else) -- this is by design: the debug hook must prove the gate holds, not bypass it. */
+extern void mNpc_DebugForceGrow(void) {
+    u8 min_looks_bitfield;
+    int min_looks_num;
+    u8 min_looks;
+    u8 selected_looks;
+    int grow_idx;
+
+    if (pc_net_game_world_is_host_authoritative()) {
+        return;
+    }
+
+    min_looks = mNpc_GetMinLooks(&min_looks_bitfield, &min_looks_num);
+    selected_looks = (min_looks == mNpc_LOOKS_UNSET) ? 0 : min_looks;
+
+    grow_idx = mNpc_SetGrowNpc(selected_looks);
+    if (grow_idx >= 0 && grow_idx < ANIMAL_NUM_MAX) {
+        mNpc_SetNpcNameID(Save_GetPointer(animals[grow_idx]), 1);
+        mNpc_AddNowNpcMax(Save_GetPointer(now_npc_max));
+        mNpc_RenewRemoveHistory();
+        s_pc_pending_grow_slot = grow_idx;
+        /* Real mNpc_Grow() only sets s_pc_pending_grow_slot; the broadcast normally waits for the
+         * NEXT mNpc_InitNpcData() call in mSDI_StartInitAfter (which may be a full day away in a
+         * short test run). Call it directly here so the test gets its ARRIVAL immediately -- this
+         * mirrors production ordering exactly (Grow then InitNpcData, back to back), just without
+         * waiting for the next real day-change to reach the second call. */
+        mNpc_InitNpcData();
+    } else {
+        printf("[NET][NPC] mNpc_DebugForceGrow: no free slot/candidate available (town may be full or "
+               "every non-islander already appeared) -- nothing grown\n");
+    }
+}
+
+/* TEST-ONLY (see pc_main.c's --force-villager-remove). Exercises the exact same host-authority gate,
+ * both Save_t mutations (house teardown then Animal_c clear, same order as mNpc_ForceRemove()), and
+ * the DEPARTURE wire message a real mNpc_ForceRemove() firing would, WITHOUT requiring the town to be
+ * full (ANIMAL_NUM_MAX) or the real 10-day-minimum interval to have elapsed. Reuses
+ * mNpc_GetGoodbyAnimalIdx() (the real, deterministic, non-RNG "who should leave" selection)
+ * unmodified. A no-op on a READY client, exactly like mNpc_ForceRemove(). */
+extern void mNpc_DebugForceRemove(void) {
+    int idx;
+
+    if (pc_net_game_world_is_host_authoritative()) {
+        return;
+    }
+
+    idx = mNpc_GetGoodbyAnimalIdx(-1);
+    if (idx != -1) {
+        Animal_c* animal = Save_Get(animals) + idx;
+        if (mNpc_CheckFreeAnimalInfo(animal) == FALSE) {
+            mNpc_DestroyHouse(&animal->home_info);
+            mNpc_SetGoodbyAnimalMail(&l_mnpc_goodby_mail, &animal->id);
+            mNpc_SendRegisteredGoodbyMail();
+            mNpc_ClearAnimalInfo(animal);
+            mNpc_SubNowNpcMax(Save_GetPointer(now_npc_max));
+            mNpc_RenewRemoveHistory();
+            pc_net_game_notify_villager_departure(idx);
+            return;
+        }
+    }
+    printf("[NET][NPC] mNpc_DebugForceRemove: no removable villager found -- nothing removed\n");
+}
+#endif
 
 extern int mNpc_DecideMaskNpc_summercamp(mActor_name_t* npc_id) {
     static int looks_table[mNpc_LOOKS_NUM];

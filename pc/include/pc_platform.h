@@ -89,6 +89,14 @@ extern atomic_int    g_pc_running;
 #endif
 extern int           g_pc_verbose;
 extern int           g_pc_pickup_test_seed; /* Stage 5A.1: --pickup-test-seed -- see pc_net_game.c */
+/* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
+ * Fire mNpc_DebugForceGrow()/mNpc_DebugForceRemove() (m_npc.c) once, as soon as the host world is
+ * ready -- see pc_net_game.c's pcnetgame_run_villager_test_triggers(). Off by default; never active
+ * in normal single-player or hosted play. Bypasses only mNpc_CheckGrow()'s/mNpc_ForceRemove()'s real
+ * (multi-day) trigger CONDITIONS, never the RNG selection logic itself, and never the host-authority
+ * gate -- exercises the exact same gate/notify/wire path a real (rare) trigger would. */
+extern int           g_pc_force_villager_grow;
+extern int           g_pc_force_villager_remove;
 extern int           g_pc_frame_limit_override;
 extern int           g_pc_speedhack_enabled;
 extern int           g_pc_time_override;

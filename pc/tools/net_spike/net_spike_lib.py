@@ -1031,6 +1031,10 @@ PC_NETGAME_MSG_RESYNC_REQUEST = 15
 PC_NETGAME_MSG_WORLD_META = 16
 PC_NETGAME_MSG_INTERACT_CONFIRM = 17  # client -> host, 8 bytes: the second phase of pickup/drop (reserve -> confirm -> commit)
 PC_NETGAME_MSG_WORLD_SNAPSHOT = PC_NETGAME_MSG_SNAPSHOT_BEGIN  # phase-1 name, kept as an alias
+# Villager population/is_home milestone (host -> READY client(s), reliable, world_seq-stamped):
+PC_NETGAME_MSG_VILLAGER_ARRIVAL = 18    # a new villager grew into a slot (mNpc_Grow()+mNpc_SetNpcHome())
+PC_NETGAME_MSG_VILLAGER_DEPARTURE = 19  # a villager was force-removed (mNpc_ForceRemove()); slot + house footprint gone
+PC_NETGAME_MSG_VILLAGER_SNAPSHOT = 20   # one-shot full population, sent once per snapshot (join/resync/reconnect)
 
 PC_NETGAME_PROTOCOL_VERSION = 2
 
@@ -1108,6 +1112,17 @@ SNAPSHOT_END_FMT = "<BBBBII" + RTC_FMT + WORLD_STATE_FMT[1:]  # 48 bytes
 WORLD_META_FMT = "<BBHI" + RTC_FMT + WORLD_STATE_FMT[1:]      # 44 bytes
 RESYNC_REQUEST_FMT = "<BBBB"            # 4 bytes
 INTERACT_CONFIRM_FMT = "<BBBBI"         # 8 bytes: type, kind, outcome, reason, request_id
+
+# Villager population/is_home milestone: PCNetGameVillagerArrivalMsg/PCNetGameVillagerDepartureMsg/
+# PCNetGameVillagerSnapshotMsg (pc_net_game.c). Mirrors the exact field layout/padding of the C
+# structs -- see that file's own doc comments for the wire contract.
+VILLAGER_ARRIVAL_FMT = "<BBBBBBBBHHI"   # 16 bytes
+VILLAGER_DEPARTURE_FMT = "<BBBBI"       # 8 bytes
+VILLAGER_SLOT_FMT = "<HBBBBBB"          # PCNetGameVillagerSlotWire, 8 bytes
+VILLAGER_SNAPSHOT_HDR_FMT = "<BBBBII"   # 12-byte header of PCNetGameVillagerSnapshotMsg
+ANIMAL_NUM_MAX = 15                     # mirrors include/m_npc.h; pc_net_game.c _Static_assert's this
+VILLAGER_SNAPSHOT_SIZE = struct.calcsize(VILLAGER_SNAPSHOT_HDR_FMT) + ANIMAL_NUM_MAX * struct.calcsize(
+    VILLAGER_SLOT_FMT)  # 12 + 15*8 = 132 bytes
 
 EMPTY_NO = 0x0000
 RSV_NO = 0xFFFF
@@ -1235,24 +1250,43 @@ RESYNC_REQUEST_SPEC = build_msg_spec(
 INTERACT_CONFIRM_SPEC = build_msg_spec(
     PC_NETGAME_MSG_INTERACT_CONFIRM, INTERACT_CONFIRM_FMT, ["msg_type", "kind", "outcome", "reason", "request_id"],
     "InteractConfirmFields")
+VILLAGER_ARRIVAL_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_VILLAGER_ARRIVAL, VILLAGER_ARRIVAL_FMT,
+    ["msg_type", "slot", "reserved_block_x", "reserved_block_z", "reserved_ut_x", "reserved_ut_z", "now_npc_max",
+     "reserved0", "npc_id", "reserved1", "world_seq"],
+    "VillagerArrivalFields")
+VILLAGER_DEPARTURE_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_VILLAGER_DEPARTURE, VILLAGER_DEPARTURE_FMT,
+    ["msg_type", "slot", "now_npc_max", "reserved0", "world_seq"], "VillagerDepartureFields")
+VILLAGER_SNAPSHOT_SPEC = build_msg_spec(  # header only; decode_world_msg() unpacks the slots[] array
+    PC_NETGAME_MSG_VILLAGER_SNAPSHOT, VILLAGER_SNAPSHOT_HDR_FMT,
+    ["msg_type", "grid", "now_npc_max", "reserved0", "epoch", "world_seq"], "VillagerSnapshotHdrFields",
+    total_size=VILLAGER_SNAPSHOT_SIZE)
+VillagerSlotFields = namedtuple("VillagerSlotFields",
+                                 ["npc_id", "occupied", "is_home", "home_block_x", "home_block_z", "home_ut_x",
+                                  "home_ut_z"])
 
 GAME_SPECS = {
     s.msg_type: s
     for s in (IDENTITY_SPEC, IDENTITY_ACK_SPEC, REJECT_SPEC, MOVE_SPEC, APPEARANCE_SPEC, PICKUP_REQUEST_SPEC,
               PICKUP_RESULT_SPEC, FIELD_UPDATE_SPEC, DROP_REQUEST_SPEC, DROP_RESULT_SPEC, PLAYER_CONTEXT_SPEC,
               SNAPSHOT_BEGIN_SPEC, FIELD_BLOCK_SPEC, SNAPSHOT_END_SPEC, WORLD_META_SPEC, RESYNC_REQUEST_SPEC,
-              INTERACT_CONFIRM_SPEC)
+              INTERACT_CONFIRM_SPEC, VILLAGER_ARRIVAL_SPEC, VILLAGER_DEPARTURE_SPEC, VILLAGER_SNAPSHOT_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
 assert SNAPSHOT_END_SPEC.size == 48 and WORLD_META_SPEC.size == 44 and RESYNC_REQUEST_SPEC.size == 4
 assert INTERACT_CONFIRM_SPEC.size == 8 and PICKUP_REQUEST_SPEC.size == 8
 assert FIELD_BLOCK_SPEC.size + 2 * (256 + 16 + 16) == FIELD_BLOCK_SIZE
+assert VILLAGER_ARRIVAL_SPEC.size == 16 and VILLAGER_DEPARTURE_SPEC.size == 8
+assert VILLAGER_SNAPSHOT_SPEC.size + ANIMAL_NUM_MAX * struct.calcsize(VILLAGER_SLOT_FMT) == VILLAGER_SNAPSHOT_SIZE
+assert VILLAGER_SNAPSHOT_SIZE == 132
 
 # Messages that answer a request, keyed by msg_type -> result spec (used for rid matching).
 RESULT_SPECS = {PC_NETGAME_MSG_PICKUP_RESULT: PICKUP_RESULT_SPEC, PC_NETGAME_MSG_DROP_RESULT: DROP_RESULT_SPEC}
 WORLD_MSG_TYPES = (PC_NETGAME_MSG_FIELD_UPDATE, PC_NETGAME_MSG_SNAPSHOT_BEGIN, PC_NETGAME_MSG_FIELD_BLOCK,
-                   PC_NETGAME_MSG_SNAPSHOT_END, PC_NETGAME_MSG_WORLD_META)
+                   PC_NETGAME_MSG_SNAPSHOT_END, PC_NETGAME_MSG_WORLD_META, PC_NETGAME_MSG_VILLAGER_ARRIVAL,
+                   PC_NETGAME_MSG_VILLAGER_DEPARTURE, PC_NETGAME_MSG_VILLAGER_SNAPSHOT)
 
 
 def decode_game(payload):
@@ -1444,6 +1478,15 @@ class FakeClient(TransportClient):
         self.superseded_blocks = []  # in-snapshot blocks whose epoch != the latest BEGIN (ignored)
         self.live_blocks = []     # flush FIELD_BLOCKs (flags 0) applied outside a snapshot
         self.meta_log = []        # WORLD_META dicts
+        # Villager population/is_home milestone: every ARRIVAL/DEPARTURE dict ever applied, in
+        # delivery order, plus a believed per-slot view (slot -> dict, or absent if empty/unknown)
+        # built the same way the real client would (VILLAGER_SNAPSHOT replaces the whole view;
+        # ARRIVAL/DEPARTURE update one slot; all three obey world_seq staleness exactly like the C
+        # client -- see _apply_world() below).
+        self.villager_log = []
+        self.villager_snapshot_log = []
+        self.villager_slots = {}
+        self._villager_seq = 0
 
     def _current_snapshot(self):
         return self.snapshots[-1] if self.snapshots and self.snapshots[-1]["end"] is None else None
@@ -1479,6 +1522,32 @@ class FakeClient(TransportClient):
             self.world.apply_delta(obj)
         elif kind == WORLD_META:
             self.meta_log.append(obj)
+        elif kind == WORLD_VILLAGER_ARRIVAL:
+            self.villager_log.append(("arrival", obj))
+            if obj["world_seq"] > self._villager_seq:
+                self._villager_seq = obj["world_seq"]
+                self.villager_slots[obj["slot"]] = {"npc_id": obj["npc_id"], "is_home": True,
+                                                    "home_block_x": obj["reserved_block_x"],
+                                                    "home_block_z": obj["reserved_block_z"],
+                                                    "home_ut_x": obj["reserved_ut_x"],
+                                                    "home_ut_z": obj["reserved_ut_z"] + 1}
+        elif kind == WORLD_VILLAGER_DEPARTURE:
+            self.villager_log.append(("departure", obj))
+            if obj["world_seq"] > self._villager_seq:
+                self._villager_seq = obj["world_seq"]
+                self.villager_slots.pop(obj["slot"], None)
+        elif kind == WORLD_VILLAGER_SNAPSHOT:
+            self.villager_snapshot_log.append(obj)
+            if cur is None or obj["epoch"] != cur["epoch"]:
+                return  # part of a superseded snapshot -- the real client discards it the same way
+            if obj["world_seq"] >= self._villager_seq:
+                self._villager_seq = obj["world_seq"]
+                self.villager_slots = {}
+                for i, s in enumerate(obj["slots"]):
+                    if s.occupied:
+                        self.villager_slots[i] = {"npc_id": s.npc_id, "is_home": bool(s.is_home),
+                                                  "home_block_x": s.home_block_x, "home_block_z": s.home_block_z,
+                                                  "home_ut_x": s.home_ut_x, "home_ut_z": s.home_ut_z}
 
     def snapshot_complete(self):
         return bool(self.snapshots) and self.snapshots[-1]["conn"] == self.connect_count \
@@ -1842,6 +1911,10 @@ WORLD_DELTA = "DELTA"
 WORLD_SNAPSHOT_BEGIN = "SNAPSHOT_BEGIN"
 WORLD_SNAPSHOT_END = "SNAPSHOT_END"
 WORLD_META = "WORLD_META"
+# Villager population/is_home milestone:
+WORLD_VILLAGER_ARRIVAL = "VILLAGER_ARRIVAL"
+WORLD_VILLAGER_DEPARTURE = "VILLAGER_DEPARTURE"
+WORLD_VILLAGER_SNAPSHOT = "VILLAGER_SNAPSHOT"
 
 
 def _rtc(g):
@@ -1899,6 +1972,22 @@ def decode_world_msg(payload):
         d = {"flags": g.flags, "world_seq": g.world_seq, "renew_time": _rtc(g)}
         d.update(_world_state(g))
         return WORLD_META, d
+    if t == PC_NETGAME_MSG_VILLAGER_ARRIVAL:
+        return WORLD_VILLAGER_ARRIVAL, {
+            "slot": g.slot, "npc_id": g.npc_id, "reserved_block_x": g.reserved_block_x,
+            "reserved_block_z": g.reserved_block_z, "reserved_ut_x": g.reserved_ut_x,
+            "reserved_ut_z": g.reserved_ut_z, "now_npc_max": g.now_npc_max, "world_seq": g.world_seq,
+        }
+    if t == PC_NETGAME_MSG_VILLAGER_DEPARTURE:
+        return WORLD_VILLAGER_DEPARTURE, {"slot": g.slot, "now_npc_max": g.now_npc_max, "world_seq": g.world_seq}
+    if t == PC_NETGAME_MSG_VILLAGER_SNAPSHOT:
+        slots = []
+        off = VILLAGER_SNAPSHOT_SPEC.size
+        slot_size = struct.calcsize(VILLAGER_SLOT_FMT)
+        for i in range(ANIMAL_NUM_MAX):
+            slots.append(VillagerSlotFields._make(struct.unpack_from(VILLAGER_SLOT_FMT, payload, off + i * slot_size)))
+        return WORLD_VILLAGER_SNAPSHOT, {"grid": g.grid, "now_npc_max": g.now_npc_max, "epoch": g.epoch,
+                                         "world_seq": g.world_seq, "slots": slots}
     return None
 
 
