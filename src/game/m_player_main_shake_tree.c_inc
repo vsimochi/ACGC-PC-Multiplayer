@@ -67,9 +67,28 @@ static void Player_actor_SetEffect_Shake_tree(ACTOR* actorx, GAME* game) {
                 if (Common_Get(clip).bg_item_clip != NULL &&
                     Common_Get(clip).bg_item_clip->item_tree_fruit_drop_proc != NULL) {
                     if (!IS_ITEM_BEE_TREE(item)) {
-                        xyz_t drop_pos;
+#ifdef TARGET_PC
+                        /* World Ecology T1 (TREE_SHAKE): only an item that would actually mutate the
+                         * field (see pc_net_game_is_tree_fruit_drop_source()'s own doc, pc_net_game.h)
+                         * needs to go through the network -- a plain TREE/CEDAR_TREE/GOLD_TREE (or any
+                         * other non-fruit-bearing shake) only triggers the local insect visual inside
+                         * bg_item_tree_fruit_drop()'s own TREE/CEDAR_TREE/GOLD_TREE branch, which has no
+                         * shared-state concern and must keep running vanilla, unmodified, for EVERY
+                         * role (including a host-authoritative client) -- hence the plain, ungated call
+                         * still below for that case. */
+                        if (pc_net_game_is_tree_fruit_drop_source((int)item) &&
+                            pc_net_game_world_is_host_authoritative()) {
+                            pc_net_game_request_tree_shake(ut_x, ut_z);
+                        } else if (pc_net_game_is_tree_fruit_drop_source((int)item) &&
+                                   pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                            pc_net_game_host_local_tree_shake(ut_x, ut_z);
+                        } else
+#endif
+                        {
+                            xyz_t drop_pos;
 
-                        Common_Get(clip).bg_item_clip->item_tree_fruit_drop_proc(item, ut_x, ut_z, &drop_pos);
+                            Common_Get(clip).bg_item_clip->item_tree_fruit_drop_proc(item, ut_x, ut_z, &drop_pos);
+                        }
                     } else if (mPlib_able_birth_bee()) {
                         main_shake_tree_p->bee_spawn_timer = 5.0f;
                     }

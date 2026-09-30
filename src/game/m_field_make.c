@@ -1304,6 +1304,17 @@ static void mFM_PcFieldInitGrowth(int scene) {
             printf("[NET][GROW] scene %d: field-init growth changed %d town acre(s) -- marked all acres dirty\n", scene,
                    changed_acres);
         }
+
+        /* World Ecology P2 audit fix: growth just changed at least one tile, which can change a
+         * tree's species/stage (e.g. sapling -> full tree, needing a different hit count to fell).
+         * Clear the host's transient tree-cut cut-count table so a stale pre-growth entry for that
+         * tile can never carry over into the new tree's state -- see
+         * pc_net_game_notify_field_growth()'s own doc. Host-only (this function already returned
+         * early above for a host-authoritative CLIENT, so reaching here on PC_NETGAME_ROLE_HOST means
+         * this process just ran real growth itself); a no-op for single-player. */
+        if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            pc_net_game_notify_field_growth();
+        }
     }
 }
 #endif

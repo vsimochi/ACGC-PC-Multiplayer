@@ -1035,8 +1035,22 @@ PC_NETGAME_MSG_WORLD_SNAPSHOT = PC_NETGAME_MSG_SNAPSHOT_BEGIN  # phase-1 name, k
 PC_NETGAME_MSG_VILLAGER_ARRIVAL = 18    # a new villager grew into a slot (mNpc_Grow()+mNpc_SetNpcHome())
 PC_NETGAME_MSG_VILLAGER_DEPARTURE = 19  # a villager was force-removed (mNpc_ForceRemove()); slot + house footprint gone
 PC_NETGAME_MSG_VILLAGER_SNAPSHOT = 20   # one-shot full population, sent once per snapshot (join/resync/reconnect)
+# Friendship/mail sync milestone:
+PC_NETGAME_MSG_FRIENDSHIP_REQUEST = 21         # client -> host only: local delta for THIS connection's identity
+PC_NETGAME_MSG_FRIENDSHIP_UPDATE = 22          # host -> every READY client, world_seq-stamped: resulting value
+PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY = 23  # host -> one client: one occupied Anmmem_c entry (late-join/reconnect)
+PC_NETGAME_MSG_MAIL_REQUEST = 24               # client -> host only: raw Mail_c the local player sent
+PC_NETGAME_MSG_MAIL_DELIVERED = 25             # host -> every READY client, world_seq-stamped: delivery outcome
+# World Ecology T3 (host-authoritative bury): client -> host two-phase reserve/INTERACT_CONFIRM, mirroring
+# PICKUP_REQUEST/DROP_REQUEST -- see PCNetGameBuryRequestMsg/PCNetGameBuryResultMsg (pc_net_game.c).
+PC_NETGAME_MSG_BURY_REQUEST = 31
+PC_NETGAME_MSG_BURY_RESULT = 32
+PC_NETGAME_BURY_FLAG_RECONCILE_VALID = 0x01
+PC_NETGAME_BURY_FLAG_DEPOSIT_ON = 0x02
 
-PC_NETGAME_PROTOCOL_VERSION = 2
+PC_NETGAME_PROTOCOL_VERSION = 4  # World Ecology T3: real bury-item logic (BuryRequest/ResultMsg layout
+                                  # unchanged from T0 scaffolding -- bumped so a pre-T3 build can never
+                                  # silently interoperate while masking the missing feature)
 
 PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1  # 8-byte REJECT
 PC_NETGAME_REJECT_SERVER_FULL = 2        # reserved, never sent
@@ -1059,6 +1073,7 @@ PC_NETGAME_RESYNC_REASON_SAVE_RELOADED = 1
 # mutates the field ONLY on COMMIT. accepted=0 stays a final rejection (no reservation).
 CONFIRM_KIND_PICKUP = 1
 CONFIRM_KIND_DROP = 2
+CONFIRM_KIND_BURY = 3   # World Ecology T3 -- see PC_NETGAME_MSG_BURY_REQUEST/RESULT
 CONFIRM_OUTCOME_ABORT = 0   # the client did NOT do its inventory step and will not
 CONFIRM_OUTCOME_COMMIT = 1  # the client did its inventory step
 CONFIRM_REASON_NONE = 0
@@ -1094,22 +1109,35 @@ PICKUP_RESULT_FMT = "<BBBBIHH"          # 12 bytes
 FIELD_UPDATE_FMT = "<BBBBBBHI"          # PCNetGameFieldUpdateMsg v2, 12 bytes
 DROP_REQUEST_FMT = "<BBBBHHI"           # 12 bytes
 DROP_RESULT_FMT = "<BBBBIHH"            # 12 bytes
+# World Ecology T3: PCNetGameBuryRequestMsg/PCNetGameBuryResultMsg (pc_net_game.c), both 12 bytes.
+# Request: msg_type,pocket_slot_idx,ut_x,ut_z,claimed_item,hole_variant,_reserved0,request_id.
+# Result:  msg_type,accepted,ut_x,ut_z,request_id,buried_item,flags,reason (flags/reason replaced the
+# old 16-bit _reserved0 -- see PCNetGameBuryResultMsg's own doc comment).
+BURY_REQUEST_FMT = "<BBBBHBBI"          # 12 bytes
+BURY_RESULT_FMT = "<BBBBIHBB"           # 12 bytes
 PLAYER_CONTEXT_FMT = "<BBBBhh"          # 8 bytes
 RTC_FMT = "BBBBBBH"                     # PCNetGameRtcWire (sec,min,hour,day,weekday,month,year), 8 bytes
 SNAPSHOT_BEGIN_FMT = "<BBBBII"          # 12 bytes
 FIELD_BLOCK_HDR_FMT = "<BBBBII"         # 12-byte header of PCNetGameFieldBlockMsg
 FIELD_BLOCK_SIZE = 588                  # header + u16 items[256] + u16 deposit[16] + u16 valid[16]
-# Weather + Stalk Market milestone: PCNetGameWorldStateWire, 28 bytes -- 7 daily prices (Sunday..
-# Saturday), trade_market, the Kabu update_time (an RTC_FMT), weather, weather_intensity, and 2
-# reserved pad bytes (see pc_net_game.c's own PCNetGameWorldStateWire doc comment).
-WORLD_STATE_FMT = "<7HH" + RTC_FMT + "BB2x"  # 28 bytes
+# Weather + Stalk Market + World Ecology (fish/bug term) milestone: PCNetGameWorldStateWire, 30 bytes
+# -- 7 daily prices (Sunday..Saturday), trade_market, the Kabu update_time (an RTC_FMT), weather,
+# weather_intensity, gyoei_term, gyoei_term_transition_offset, insect_term,
+# insect_term_transition_offset (see pc_net_game.c's own PCNetGameWorldStateWire doc comment). Grew
+# from 28 to 30 bytes in the World Ecology Stage 1 milestone (Item 4): the struct's own 2 reserved pad
+# bytes became 2 of the 4 new term bytes, so the struct's LOGICAL size only grew by 2 -- but embedding
+# it pushes both composite messages below off 4-byte alignment, so the C compiler now adds 2 bytes of
+# IMPLICIT trailing padding to each (52/48 instead of 50/46) that this format must reproduce
+# explicitly via a trailing "2x" (see each FMT's own comment below).
+WORLD_STATE_FMT = "<7HH" + RTC_FMT + "BBBBBB"  # 30 bytes
 _WORLD_STATE_FIELDS = ["kabu_daily_price_sun", "kabu_daily_price_mon", "kabu_daily_price_tue",
                        "kabu_daily_price_wed", "kabu_daily_price_thu", "kabu_daily_price_fri",
                        "kabu_daily_price_sat", "kabu_trade_market", "kabu_update_sec", "kabu_update_min",
                        "kabu_update_hour", "kabu_update_day", "kabu_update_weekday", "kabu_update_month",
-                       "kabu_update_year", "weather", "weather_intensity"]
-SNAPSHOT_END_FMT = "<BBBBII" + RTC_FMT + WORLD_STATE_FMT[1:]  # 48 bytes
-WORLD_META_FMT = "<BBHI" + RTC_FMT + WORLD_STATE_FMT[1:]      # 44 bytes
+                       "kabu_update_year", "weather", "weather_intensity", "gyoei_term",
+                       "gyoei_term_transition_offset", "insect_term", "insect_term_transition_offset"]
+SNAPSHOT_END_FMT = "<BBBBII" + RTC_FMT + WORLD_STATE_FMT[1:] + "2x"  # 52 bytes (50 logical + 2 implicit pad)
+WORLD_META_FMT = "<BBHI" + RTC_FMT + WORLD_STATE_FMT[1:] + "2x"      # 48 bytes (46 logical + 2 implicit pad)
 RESYNC_REQUEST_FMT = "<BBBB"            # 4 bytes
 INTERACT_CONFIRM_FMT = "<BBBBI"         # 8 bytes: type, kind, outcome, reason, request_id
 
@@ -1123,6 +1151,24 @@ VILLAGER_SNAPSHOT_HDR_FMT = "<BBBBII"   # 12-byte header of PCNetGameVillagerSna
 ANIMAL_NUM_MAX = 15                     # mirrors include/m_npc.h; pc_net_game.c _Static_assert's this
 VILLAGER_SNAPSHOT_SIZE = struct.calcsize(VILLAGER_SNAPSHOT_HDR_FMT) + ANIMAL_NUM_MAX * struct.calcsize(
     VILLAGER_SLOT_FMT)  # 12 + 15*8 = 132 bytes
+
+# Friendship/mail sync milestone: PCNetGameFriendshipRequestMsg/PCNetGameFriendshipUpdateMsg/
+# PCNetGameFriendshipSnapshotEntryMsg/PCNetGameMailRequestMsg/PCNetGameMailDeliveredMsg
+# (pc_net_game.c). ANIMAL_MEMORY_NUM=7 (m_npc.h); Anmplmail_c is 258 bytes as actually compiled
+# (the decomp's own doc comment says 0x104=260, but the real compiled layout -- verified against a
+# live build, see the milestone's build notes -- is 258; PCNetGame*Msg.letter[] mirrors that real
+# value, not the doc comment).
+ANMPLMAIL_SIZE = 258
+FRIENDSHIP_REQUEST_FMT = "<BBbB"                             # 4 bytes
+FRIENDSHIP_UPDATE_FMT = "<BBbB8s8sHHI"                       # 28 bytes
+# 292 bytes: C's natural struct alignment adds 2 trailing pad bytes after letter[258] (290 -> next
+# multiple of 4); Python's "<" format never auto-pads, so that padding is spelled out explicitly
+# with a trailing "2x" -- verified against the real compiled sizeof() (see PCNetGameFriendshipSnapshotEntryMsg's
+# _Static_assert in pc_net_game.c), not just hand-computed.
+FRIENDSHIP_SNAPSHOT_ENTRY_FMT = f"<BBbB8s8sHHIB3x{ANMPLMAIL_SIZE}s2x"  # 292 bytes
+MAIL_REQUEST_FMT = "<B3x298s"                                # 302 bytes; 298 == sizeof(Mail_c)
+# 288 bytes: same trailing-pad reasoning as FRIENDSHIP_SNAPSHOT_ENTRY_FMT above (286 -> 288).
+MAIL_DELIVERED_FMT = f"<BBbB8s8sHHI{ANMPLMAIL_SIZE}s2x"      # 288 bytes
 
 EMPTY_NO = 0x0000
 RSV_NO = 0xFFFF
@@ -1227,6 +1273,14 @@ DROP_RESULT_SPEC = build_msg_spec(
     PC_NETGAME_MSG_DROP_RESULT, DROP_RESULT_FMT,
     ["msg_type", "accepted", "ut_x", "ut_z", "request_id", "placed_item", "reserved"],
     "DropResultFields")
+BURY_REQUEST_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_BURY_REQUEST, BURY_REQUEST_FMT,
+    ["msg_type", "pocket_slot_idx", "ut_x", "ut_z", "claimed_item", "hole_variant", "reserved", "request_id"],
+    "BuryRequestFields")
+BURY_RESULT_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_BURY_RESULT, BURY_RESULT_FMT,
+    ["msg_type", "accepted", "ut_x", "ut_z", "request_id", "buried_item", "flags", "reason"],
+    "BuryResultFields")
 PLAYER_CONTEXT_SPEC = build_msg_spec(
     PC_NETGAME_MSG_PLAYER_CONTEXT, PLAYER_CONTEXT_FMT,
     ["msg_type", "player_no", "destiny_type", "flags", "money_power", "goods_power"], "PlayerContextFields")
@@ -1266,27 +1320,57 @@ VillagerSlotFields = namedtuple("VillagerSlotFields",
                                  ["npc_id", "occupied", "is_home", "home_block_x", "home_block_z", "home_ut_x",
                                   "home_ut_z"])
 
+# Friendship/mail sync milestone specs.
+FRIENDSHIP_REQUEST_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_FRIENDSHIP_REQUEST, FRIENDSHIP_REQUEST_FMT, ["msg_type", "slot", "delta", "reserved0"],
+    "FriendshipRequestFields")
+FRIENDSHIP_UPDATE_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_FRIENDSHIP_UPDATE, FRIENDSHIP_UPDATE_FMT,
+    ["msg_type", "slot", "friendship", "reserved0", "player_name", "land_name", "player_id", "land_id", "world_seq"],
+    "FriendshipUpdateFields")
+FRIENDSHIP_SNAPSHOT_ENTRY_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY, FRIENDSHIP_SNAPSHOT_ENTRY_FMT,
+    ["msg_type", "slot", "friendship", "letter_info", "player_name", "land_name", "player_id", "land_id",
+     "world_seq", "has_letter", "letter"],
+    "FriendshipSnapshotEntryFields")
+MAIL_REQUEST_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_MAIL_REQUEST, MAIL_REQUEST_FMT, ["msg_type", "mail"], "MailRequestFields")
+MAIL_DELIVERED_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_MAIL_DELIVERED, MAIL_DELIVERED_FMT,
+    ["msg_type", "slot", "friendship", "letter_info", "player_name", "land_name", "player_id", "land_id",
+     "world_seq", "letter"],
+    "MailDeliveredFields")
+
 GAME_SPECS = {
     s.msg_type: s
     for s in (IDENTITY_SPEC, IDENTITY_ACK_SPEC, REJECT_SPEC, MOVE_SPEC, APPEARANCE_SPEC, PICKUP_REQUEST_SPEC,
               PICKUP_RESULT_SPEC, FIELD_UPDATE_SPEC, DROP_REQUEST_SPEC, DROP_RESULT_SPEC, PLAYER_CONTEXT_SPEC,
               SNAPSHOT_BEGIN_SPEC, FIELD_BLOCK_SPEC, SNAPSHOT_END_SPEC, WORLD_META_SPEC, RESYNC_REQUEST_SPEC,
-              INTERACT_CONFIRM_SPEC, VILLAGER_ARRIVAL_SPEC, VILLAGER_DEPARTURE_SPEC, VILLAGER_SNAPSHOT_SPEC)
+              INTERACT_CONFIRM_SPEC, VILLAGER_ARRIVAL_SPEC, VILLAGER_DEPARTURE_SPEC, VILLAGER_SNAPSHOT_SPEC,
+              FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
+              MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
-assert SNAPSHOT_END_SPEC.size == 48 and WORLD_META_SPEC.size == 44 and RESYNC_REQUEST_SPEC.size == 4
+assert SNAPSHOT_END_SPEC.size == 52 and WORLD_META_SPEC.size == 48 and RESYNC_REQUEST_SPEC.size == 4
 assert INTERACT_CONFIRM_SPEC.size == 8 and PICKUP_REQUEST_SPEC.size == 8
 assert FIELD_BLOCK_SPEC.size + 2 * (256 + 16 + 16) == FIELD_BLOCK_SIZE
 assert VILLAGER_ARRIVAL_SPEC.size == 16 and VILLAGER_DEPARTURE_SPEC.size == 8
 assert VILLAGER_SNAPSHOT_SPEC.size + ANIMAL_NUM_MAX * struct.calcsize(VILLAGER_SLOT_FMT) == VILLAGER_SNAPSHOT_SIZE
 assert VILLAGER_SNAPSHOT_SIZE == 132
+assert FRIENDSHIP_REQUEST_SPEC.size == 4 and FRIENDSHIP_UPDATE_SPEC.size == 28
+assert FRIENDSHIP_SNAPSHOT_ENTRY_SPEC.size == 292 and MAIL_REQUEST_SPEC.size == 302
+assert MAIL_DELIVERED_SPEC.size == 288
+assert BURY_REQUEST_SPEC.size == 12 and BURY_RESULT_SPEC.size == 12
 
 # Messages that answer a request, keyed by msg_type -> result spec (used for rid matching).
-RESULT_SPECS = {PC_NETGAME_MSG_PICKUP_RESULT: PICKUP_RESULT_SPEC, PC_NETGAME_MSG_DROP_RESULT: DROP_RESULT_SPEC}
+RESULT_SPECS = {PC_NETGAME_MSG_PICKUP_RESULT: PICKUP_RESULT_SPEC, PC_NETGAME_MSG_DROP_RESULT: DROP_RESULT_SPEC,
+                PC_NETGAME_MSG_BURY_RESULT: BURY_RESULT_SPEC}
 WORLD_MSG_TYPES = (PC_NETGAME_MSG_FIELD_UPDATE, PC_NETGAME_MSG_SNAPSHOT_BEGIN, PC_NETGAME_MSG_FIELD_BLOCK,
                    PC_NETGAME_MSG_SNAPSHOT_END, PC_NETGAME_MSG_WORLD_META, PC_NETGAME_MSG_VILLAGER_ARRIVAL,
-                   PC_NETGAME_MSG_VILLAGER_DEPARTURE, PC_NETGAME_MSG_VILLAGER_SNAPSHOT)
+                   PC_NETGAME_MSG_VILLAGER_DEPARTURE, PC_NETGAME_MSG_VILLAGER_SNAPSHOT,
+                   PC_NETGAME_MSG_FRIENDSHIP_UPDATE, PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY,
+                   PC_NETGAME_MSG_MAIL_DELIVERED)
 
 
 def decode_game(payload):
@@ -1400,6 +1484,30 @@ def build_drop_request(pocket_slot_idx, claimed_item, ut_x, ut_z, request_id):
                        claimed_item & 0xFFFF, 0, request_id & U32_MASK)
 
 
+def build_bury_request(pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, hole_variant=0xFF):
+    """World Ecology T3: PC_NETGAME_MSG_BURY_REQUEST (31, 12 bytes). hole_variant defaults to the 0xFF
+    ("no valid hole shape") sentinel -- pass 0..24 for the one sub-case where it is authoritative
+    (a pitfall buried into a HOLE_SHINE tile -- see PCNetGameBuryRequestMsg's own doc)."""
+    return struct.pack(BURY_REQUEST_FMT, PC_NETGAME_MSG_BURY_REQUEST, pocket_slot_idx & 0xFF, ut_x & 0xFF,
+                       ut_z & 0xFF, claimed_item & 0xFFFF, hole_variant & 0xFF, 0, request_id & U32_MASK)
+
+
+def build_friendship_request(slot, delta):
+    """PC_NETGAME_MSG_FRIENDSHIP_REQUEST (21, 4 bytes): client -> host only. `delta` is a signed
+    byte (matches Anmmem_c.friendship's own s8 storage)."""
+    return struct.pack(FRIENDSHIP_REQUEST_FMT, PC_NETGAME_MSG_FRIENDSHIP_REQUEST, slot & 0xFF, delta & 0xFF, 0)
+
+
+def build_mail_request(mail_bytes):
+    """PC_NETGAME_MSG_MAIL_REQUEST (24, 302 bytes): client -> host only. `mail_bytes` must be
+    exactly 298 bytes (sizeof(Mail_c)); this is a raw/opaque copy, never decoded here -- a test that
+    needs a specific recipient/sender should build those 298 bytes itself (see
+    test_friendship_mail_sync.py for a minimal fixture) or just exercise malformed-size rejection."""
+    if len(mail_bytes) != 298:
+        raise ValueError(f"build_mail_request: mail_bytes must be exactly 298 bytes, got {len(mail_bytes)}")
+    return struct.pack(MAIL_REQUEST_FMT, PC_NETGAME_MSG_MAIL_REQUEST, mail_bytes)
+
+
 def build_player_context(flags=DEFAULT_CONTEXT_FLAGS, player_no=0, destiny_type=0, money_power=0, goods_power=0):
     return struct.pack(PLAYER_CONTEXT_FMT, PC_NETGAME_MSG_PLAYER_CONTEXT, player_no & 0xFF, destiny_type & 0xFF,
                        flags & 0xFF, money_power, goods_power)
@@ -1487,6 +1595,14 @@ class FakeClient(TransportClient):
         self.villager_snapshot_log = []
         self.villager_slots = {}
         self._villager_seq = 0
+        # Friendship/mail sync milestone: every FRIENDSHIP_UPDATE/FRIENDSHIP_SNAPSHOT_ENTRY/
+        # MAIL_DELIVERED ever applied, in delivery order, plus a believed per-(slot, player_id,
+        # land_id) view -- world_seq staleness mirrors the C client exactly (strict `>` for
+        # UPDATE/MAIL_DELIVERED, `>=` for SNAPSHOT_ENTRY -- see _apply_world() below).
+        self.friendship_log = []
+        self.mail_log = []
+        self.friendship_memory = {}  # (slot, player_id, land_id) -> {"friendship", "letter_info", "letter"}
+        self._friendship_seq = 0
 
     def _current_snapshot(self):
         return self.snapshots[-1] if self.snapshots and self.snapshots[-1]["end"] is None else None
@@ -1548,6 +1664,33 @@ class FakeClient(TransportClient):
                         self.villager_slots[i] = {"npc_id": s.npc_id, "is_home": bool(s.is_home),
                                                   "home_block_x": s.home_block_x, "home_block_z": s.home_block_z,
                                                   "home_ut_x": s.home_ut_x, "home_ut_z": s.home_ut_z}
+        elif kind == WORLD_FRIENDSHIP_UPDATE:
+            self.friendship_log.append(obj)
+            if obj["world_seq"] > self._friendship_seq:
+                self._friendship_seq = obj["world_seq"]
+                key = (obj["slot"], obj["player_id"], obj["land_id"])
+                entry = self.friendship_memory.setdefault(key, {})
+                entry["friendship"] = obj["friendship"]
+        elif kind == WORLD_FRIENDSHIP_SNAPSHOT_ENTRY:
+            self.friendship_log.append(obj)
+            if obj["world_seq"] >= self._friendship_seq:
+                if obj["world_seq"] > self._friendship_seq:
+                    self._friendship_seq = obj["world_seq"]
+                key = (obj["slot"], obj["player_id"], obj["land_id"])
+                entry = self.friendship_memory.setdefault(key, {})
+                entry["friendship"] = obj["friendship"]
+                entry["letter_info"] = obj["letter_info"]
+                if obj["has_letter"]:
+                    entry["letter"] = obj["letter"]
+        elif kind == WORLD_MAIL_DELIVERED:
+            self.mail_log.append(obj)
+            if obj["world_seq"] > self._friendship_seq:
+                self._friendship_seq = obj["world_seq"]
+                key = (obj["slot"], obj["player_id"], obj["land_id"])
+                entry = self.friendship_memory.setdefault(key, {})
+                entry["friendship"] = obj["friendship"]
+                entry["letter_info"] = obj["letter_info"]
+                entry["letter"] = obj["letter"]
 
     def snapshot_complete(self):
         return bool(self.snapshots) and self.snapshots[-1]["conn"] == self.connect_count \
@@ -1667,6 +1810,22 @@ class FakeClient(TransportClient):
             self.confirm_policy[(CONFIRM_KIND_DROP, request_id & U32_MASK)] = bool(auto_confirm)
         return self.send_reliable(build_drop_request(pocket_slot_idx, claimed_item, ut_x, ut_z, request_id))
 
+    def send_bury_request(self, pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, hole_variant=0xFF,
+                          auto_confirm=None):
+        if auto_confirm is not None:
+            self.confirm_policy[(CONFIRM_KIND_BURY, request_id & U32_MASK)] = bool(auto_confirm)
+        return self.send_reliable(
+            build_bury_request(pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, hole_variant))
+
+    def send_friendship_request(self, slot, delta):
+        """Raw protocol-level FRIENDSHIP_REQUEST (bypasses the real game's mNpc_AddFriendship() --
+        useful for malformed-slot/stale-style protocol tests; see test_friendship_mail_sync.py)."""
+        return self.send_reliable(build_friendship_request(slot, delta))
+
+    def send_mail_request(self, mail_bytes):
+        """Raw protocol-level MAIL_REQUEST (bypasses the real game's mNpc_SendMailtoNpc())."""
+        return self.send_reliable(build_mail_request(mail_bytes))
+
     def confirm(self, kind, request_id, outcome=CONFIRM_OUTCOME_COMMIT, reason=CONFIRM_REASON_NONE):
         """Explicit INTERACT_CONFIRM (reliable). Returns the transport seq."""
         self.confirms_sent.append((kind, request_id & U32_MASK, outcome, reason, self.connect_count))
@@ -1696,7 +1855,12 @@ class FakeClient(TransportClient):
         """An accepted RESULT is PROVISIONAL: answer it with CONFIRM(COMMIT) unless this request opted out."""
         if not g.accepted or getattr(self, "state", None) != self.STATE_CONNECTED or m.conn != self.connect_count:
             return
-        kind = CONFIRM_KIND_PICKUP if m.msg_type == PC_NETGAME_MSG_PICKUP_RESULT else CONFIRM_KIND_DROP
+        if m.msg_type == PC_NETGAME_MSG_PICKUP_RESULT:
+            kind = CONFIRM_KIND_PICKUP
+        elif m.msg_type == PC_NETGAME_MSG_BURY_RESULT:
+            kind = CONFIRM_KIND_BURY
+        else:
+            kind = CONFIRM_KIND_DROP
         rid = g.request_id
         want = self.__dict__.get("confirm_policy", {}).get((kind, rid), self.auto_confirm)
         key = (kind, rid, m.conn)
@@ -1757,6 +1921,21 @@ class FakeClient(TransportClient):
             self.claim_position(*tile_center(*claim_at), facing=facing)
         self.send_drop_request(pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, auto_confirm=auto_confirm)
         return self.wait_result(PC_NETGAME_MSG_DROP_RESULT, request_id, timeout)
+
+    def recv_bury_result(self, timeout=1.0, expect_request_id=None):
+        """(accepted, ut_x, ut_z, request_id, buried_item, flags, reason) or None."""
+        f = self._recv_typed(BURY_RESULT_SPEC, timeout, expect_request_id)
+        return None if f is None else (f.accepted, f.ut_x, f.ut_z, f.request_id, f.buried_item, f.flags, f.reason)
+
+    def bury(self, pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, hole_variant=0xFF, timeout=0.6,
+             claim=True, auto_confirm=None):
+        """World Ecology T3: request + wait for the (provisional) BURY_RESULT; auto_confirm as in
+        pickup()/drop() (an accepted result is immediately CONFIRMed(COMMIT) unless opted out)."""
+        if claim:
+            self.claim_position(*tile_center(ut_x, ut_z))
+        self.send_bury_request(pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, hole_variant,
+                               auto_confirm=auto_confirm)
+        return self.wait_result(PC_NETGAME_MSG_BURY_RESULT, request_id, timeout)
 
     def quiet_for(self, pred, seconds, since=None):
         """Pump for `seconds`; True iff NO message matching `pred` arrived (in the window, or since the given
@@ -1915,6 +2094,10 @@ WORLD_META = "WORLD_META"
 WORLD_VILLAGER_ARRIVAL = "VILLAGER_ARRIVAL"
 WORLD_VILLAGER_DEPARTURE = "VILLAGER_DEPARTURE"
 WORLD_VILLAGER_SNAPSHOT = "VILLAGER_SNAPSHOT"
+# Friendship/mail sync milestone:
+WORLD_FRIENDSHIP_UPDATE = "FRIENDSHIP_UPDATE"
+WORLD_FRIENDSHIP_SNAPSHOT_ENTRY = "FRIENDSHIP_SNAPSHOT_ENTRY"
+WORLD_MAIL_DELIVERED = "MAIL_DELIVERED"
 
 
 def _rtc(g):
@@ -1934,6 +2117,10 @@ def _world_state(g):
                              g.kabu_update_min, g.kabu_update_sec),
         "weather": g.weather,
         "weather_intensity": g.weather_intensity,
+        "gyoei_term": g.gyoei_term,
+        "gyoei_term_transition_offset": g.gyoei_term_transition_offset,
+        "insect_term": g.insect_term,
+        "insect_term_transition_offset": g.insect_term_transition_offset,
     }
 
 
@@ -1988,6 +2175,23 @@ def decode_world_msg(payload):
             slots.append(VillagerSlotFields._make(struct.unpack_from(VILLAGER_SLOT_FMT, payload, off + i * slot_size)))
         return WORLD_VILLAGER_SNAPSHOT, {"grid": g.grid, "now_npc_max": g.now_npc_max, "epoch": g.epoch,
                                          "world_seq": g.world_seq, "slots": slots}
+    if t == PC_NETGAME_MSG_FRIENDSHIP_UPDATE:
+        return WORLD_FRIENDSHIP_UPDATE, {
+            "slot": g.slot, "friendship": g.friendship, "player_name": g.player_name, "land_name": g.land_name,
+            "player_id": g.player_id, "land_id": g.land_id, "world_seq": g.world_seq,
+        }
+    if t == PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY:
+        return WORLD_FRIENDSHIP_SNAPSHOT_ENTRY, {
+            "slot": g.slot, "friendship": g.friendship, "letter_info": g.letter_info, "player_name": g.player_name,
+            "land_name": g.land_name, "player_id": g.player_id, "land_id": g.land_id, "world_seq": g.world_seq,
+            "has_letter": bool(g.has_letter), "letter": g.letter,
+        }
+    if t == PC_NETGAME_MSG_MAIL_DELIVERED:
+        return WORLD_MAIL_DELIVERED, {
+            "slot": g.slot, "friendship": g.friendship, "letter_info": g.letter_info, "player_name": g.player_name,
+            "land_name": g.land_name, "player_id": g.player_id, "land_id": g.land_id, "world_seq": g.world_seq,
+            "letter": g.letter,
+        }
     return None
 
 
@@ -2259,6 +2463,11 @@ class HostProcess:
         return self.wait_for_log(r"\[NET\] hosting on UDP port %d" % self.port, timeout) is not None
 
     WORLD_READY_RX = r"\[NET\]\[WORLD\] host: world ready \(land_id=0x([0-9A-Fa-f]+) hash=0x([0-9A-Fa-f]+)"
+    # Client-side analogue of WORLD_READY_RX, for ClientProcess.boot_to_field()'s default ready_rx:
+    # there is no "client: world ready" line, but "snapshot epoch N applied" (pc_net_game.c) is the
+    # client's own equivalent readiness signal -- the initial SNAPSHOT_END from the host has been
+    # fully applied to the client's local field/world state.
+    CLIENT_SNAPSHOT_APPLIED_RX = r"\[NET\]\[WORLD\] client: snapshot epoch \d+ applied"
     SEED_RX = r"--pickup-test-seed: fixture item placed at tile \((\d+),(\d+)\)"
 
     def world_ready(self):
@@ -2289,6 +2498,96 @@ class HostProcess:
         if verbose:
             print(f"[host] boot_to_town: {'world ready' if ok else 'FAILED'} after START + {presses} x A")
         return ok
+
+    # --- direct-bootstrap readiness (P1 real-gameplay verification) --------------------------------
+    #
+    # boot_to_town() above is for the interactive title-screen path (protocol v2 tests) and injects
+    # keystrokes via game_input.py. boot_to_field() is for `--bootstrap-resident N` launches: it uses
+    # NO keystrokes at all and fixes a false-positive that boot_to_town()'s own world_ready() has
+    # against this path -- world_ready() greps the ENTIRE log for the "world ready" line, but that
+    # exact line is also printed transiently during the title-screen demo reload (pre-existing
+    # behavior, unrelated to bootstrap), so a naive whole-log search can report success before the
+    # real, bootstrapped world is actually playable. boot_to_field() instead anchors its readiness
+    # search to start strictly AFTER the bootstrap's own "resident bound, transitioning to town"
+    # line (pc_m_card.c), so only a "world ready" that happens after the real bootstrap counts.
+    BOOTSTRAP_BOUND_RX_FMT = r"\[PC\] --bootstrap-resident %d: resident bound, transitioning to town \(SCENE_FG\)"
+    BOOTSTRAP_FAIL_RX_FMT = (r"\[PC\] --bootstrap-resident %d: (slot out of range|slot has no resident|"
+                             r"no valid town save is loaded|resident is marked away/travelling|"
+                             r"mSDI_StartDataInit failed|goto_other_scene to SCENE_FG failed)")
+    LOCAL_SAVE_NOT_LOADED_RX = r"\[NET\]\[WORLD\] (?:host|client): local save not loaded"
+
+    def _wait_bootstrap_bound(self, slot, timeout, verbose):
+        """Waits for pc_m_card.c's own bootstrap outcome line (success OR a known failure) --
+        independent of host/client role, since --bootstrap-resident is handled before net role
+        matters. Returns the absolute log-byte-offset right after the SUCCESS line, or None."""
+        bound_rx = re.compile(self.BOOTSTRAP_BOUND_RX_FMT % slot)
+        fail_rx = re.compile(self.BOOTSTRAP_FAIL_RX_FMT % slot)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            text = self.log_text()
+            mo = bound_rx.search(text)
+            if mo:
+                return mo.end()
+            fmo = fail_rx.search(text)
+            if fmo:
+                if verbose:
+                    print(f"[boot_to_field] bootstrap failure: {fmo.group(0)!r}")
+                return None
+            if self.proc is not None and self.proc.poll() is not None:
+                if verbose:
+                    print("[boot_to_field] process exited before any bootstrap outcome line")
+                return None
+            time.sleep(0.1)
+        if verbose:
+            print("[boot_to_field] timed out waiting for the bootstrap resident-bound line")
+        return None
+
+    def boot_to_field(self, timeout=60.0, slot=0, ready_rx=None, settle=2.5, verbose=True):
+        """Non-interactive readiness check for a process launched with `--bootstrap-resident <slot>`.
+        Uses NO game_input/keystrokes. Steps (see module docstring section above for why):
+          1. Wait for pc_m_card.c's bootstrap outcome line for `slot` (success or a known failure);
+             fail fast on a known failure line or early process exit.
+          2. Wait for `ready_rx` (default: HostProcess.WORLD_READY_RX) to match STRICTLY AFTER the
+             success line's offset -- not anywhere in the whole log.
+          3. Sleep `settle` seconds for the entrance wipe/house-exit animation.
+          4. Confirm no "local save not loaded" line appears after the step-2 match, and the process
+             is still alive.
+        Returns True only if all of the above pass within `timeout`."""
+        if ready_rx is None:
+            ready_rx = self.WORLD_READY_RX
+        deadline = time.monotonic() + timeout
+        bound_offset = self._wait_bootstrap_bound(slot, timeout, verbose)
+        if bound_offset is None:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if verbose:
+                print("[boot_to_field] timed out before the readiness wait could start")
+            return False
+        mo = self.wait_for_log(ready_rx, remaining, since_offset=bound_offset)
+        if mo is None:
+            if verbose:
+                print("[boot_to_field] timed out waiting for readiness AFTER the bootstrap-bound line "
+                      "(this is the false-positive fix: a match earlier in the log, e.g. from the "
+                      "title-screen demo reload, does not count)")
+            return False
+        ready_offset = bound_offset + mo.end()
+        if settle > 0:
+            time.sleep(settle)
+        if self.proc is not None and self.proc.poll() is not None:
+            if verbose:
+                print("[boot_to_field] process exited during the post-readiness settle period")
+            return False
+        text_after = self.log_text()[ready_offset:]
+        if re.search(self.LOCAL_SAVE_NOT_LOADED_RX, text_after):
+            if verbose:
+                print("[boot_to_field] 'local save not loaded' seen AFTER readiness -- the readiness "
+                      "line was a false positive")
+            return False
+        if verbose:
+            print("[boot_to_field] genuine field-ready (bootstrap-bound -> readiness, no post-readiness "
+                  "'local save not loaded')")
+        return True
 
     def host_town_from_log(self):
         mo = re.search(self.WORLD_READY_RX, self.log_text())
@@ -2333,3 +2632,35 @@ class HostProcess:
     def __exit__(self, *exc):
         self.stop()
         return False
+
+
+class ClientProcess(HostProcess):
+    """Launches `AnimalCrossing.exe --connect <ip:port> --verbose [extra...]` -- the second REAL game
+    process for two-real-process P1 gameplay verification. Same log-file/boot_to_field/stop plumbing
+    as HostProcess (which it subclasses); only the launched command line differs (no --host, no
+    wait_listening -- that is a host-only log line)."""
+
+    def __init__(self, connect_to, extra_args=(), log_path=None, bin_dir=None, env=None, label="client"):
+        self.connect_to = connect_to
+        super().__init__(port=0, extra_args=extra_args, log_path=log_path, bin_dir=bin_dir, env=env)
+        self.log_path = log_path or os.path.join(self.bin_dir, f"net_spike_{label}.log")
+
+    def start(self):
+        if not os.path.isfile(self.exe):
+            raise FileNotFoundError(self.exe)
+        self._log_fp = open(self.log_path, "wb")
+        env = dict(os.environ)
+        if self.env:
+            env.update(self.env)
+        self.proc = subprocess.Popen(
+            [self.exe, "--connect", self.connect_to, "--verbose"] + self.extra_args,
+            cwd=self.bin_dir, stdout=self._log_fp, stderr=subprocess.STDOUT, env=env)
+        return self
+
+    def boot_to_field(self, timeout=60.0, slot=0, ready_rx=None, settle=2.5, verbose=True):
+        """Same contract as HostProcess.boot_to_field(), defaulting `ready_rx` to the CLIENT
+        readiness signal (CLIENT_SNAPSHOT_APPLIED_RX) instead of the host's WORLD_READY_RX."""
+        if ready_rx is None:
+            ready_rx = self.CLIENT_SNAPSHOT_APPLIED_RX
+        return super().boot_to_field(timeout=timeout, slot=slot, ready_rx=ready_rx, settle=settle,
+                                     verbose=verbose)

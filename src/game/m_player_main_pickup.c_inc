@@ -80,18 +80,20 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
 #ifdef TARGET_PC
     /* Stage 5A: this process does not own field/inventory truth as a network client -- defer the
      * actual mutation to the host instead of running it locally (see
-     * pc_net_game_request_pickup()'s doc, pc/src/pc_net_game.c). Money-bag items are excluded
-     * from Stage 5A's network path entirely: do nothing, so the bag stays exactly where it is --
-     * single-player and the host are unaffected, since this branch only ever runs when
+     * pc_net_game_request_pickup()'s doc, pc/src/pc_net_game.c).
+     * World Ecology Stage 1, Item 2 / Bug 4 fix: money-bag items are no longer blanket-excluded here.
+     * A money bag dropped by a money-rock hit is now an entirely ORDINARY field item, so the request
+     * is always sent and the host validates/grants it through the completely ordinary pickup path
+     * (pcnetgame_validate_and_resolve_pickup()) -- no host-side per-tile allow-list needed any more.
+     * Single-player and the host are unaffected, since this branch only ever runs when
      * pc_net_game_role() == PC_NETGAME_ROLE_CLIENT. */
     if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
-        int is_money_bag = FALSE;
         int ut_x, ut_z;
-#ifdef PC_ENHANCEMENTS
-        is_money_bag = mPr_GetAmountForMoneyItem(item) > 0;
-#endif
-        if (!is_money_bag && mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
-            pc_net_game_request_pickup(ut_x, ut_z);
+        if (mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
+            /* `item` (already resolved above from req_pickup_p->item -- this client's own local
+             * knowledge of the target tile) lets pc_net_game_request_pickup() still attempt a
+             * wallet-fitting money bag even with full pockets. See its own doc, pc_net_game.h. */
+            pc_net_game_request_pickup(ut_x, ut_z, item);
         }
     } else
 #endif

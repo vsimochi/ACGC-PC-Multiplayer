@@ -89,6 +89,11 @@ extern atomic_int    g_pc_running;
 #endif
 extern int           g_pc_verbose;
 extern int           g_pc_pickup_test_seed; /* Stage 5A.1: --pickup-test-seed -- see pc_net_game.c */
+extern int           g_pc_field_action_test_seed; /* World Ecology Stage 1: --field-action-test-seed --
+                                                     * see pc_net_game.c's
+                                                     * pcnetgame_run_field_action_test_seed() */
+extern int           g_pc_bury_test_seed; /* World Ecology T3: --bury-test-seed -- see pc_net_game.c's
+                                             * pcnetgame_run_bury_test_seed() */
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * Fire mNpc_DebugForceGrow()/mNpc_DebugForceRemove() (m_npc.c) once, as soon as the host world is
  * ready -- see pc_net_game.c's pcnetgame_run_villager_test_triggers(). Off by default; never active
@@ -97,6 +102,57 @@ extern int           g_pc_pickup_test_seed; /* Stage 5A.1: --pickup-test-seed --
  * gate -- exercises the exact same gate/notify/wire path a real (rare) trigger would. */
 extern int           g_pc_force_villager_grow;
 extern int           g_pc_force_villager_remove;
+/* Friendship/mail sync milestone, TEST-ONLY: --force-friendship-delta N / --force-mail-send. Fire
+ * mNpc_DebugForceFriendshipDelta()/mNpc_DebugForceMailSend() (m_npc.c) once, as soon as this
+ * process's own local world is ready (and, on a CLIENT, its link is READY) -- see pc_net_game.c's
+ * pcnetgame_run_friendship_mail_test_triggers(). Unlike the villager-population hooks above, these
+ * are NOT host-only: they exercise mNpc_AddFriendship()/mNpc_SendMailtoNpc()'s real
+ * client-intercept-and-request path exactly as well as the host-apply-and-broadcast path, on
+ * whichever role this process is. Off by default; never active in normal single-player or hosted
+ * play. g_pc_force_friendship_delta is the signed delta to apply (0 = not requested). */
+extern int           g_pc_force_friendship_delta;
+extern int           g_pc_force_mail_send;
+/* World Ecology Stage 1 money-rock review, TEST-ONLY: --force-money-rock-hit / --force-money-bag-pickup.
+ * Give REAL C-executable coverage to the two money-rock paths no other test hook can reach: the HOST's
+ * own local hit (pc_net_game_host_local_money_rock_hit()) and the real CLIENT-side wallet-credit/
+ * pocket-grant handler (pcnetgame_handle_client_pickup_result()'s money-bag branch). Mirror
+ * g_pc_force_villager_grow/g_pc_force_friendship_delta's own exact pattern: off by default, never
+ * active in normal single-player or hosted play, fire exactly once as soon as their own precondition
+ * is met -- see pc_net_game.c's pcnetgame_run_money_rock_test_triggers().
+ *   g_pc_force_money_rock_hit    HOST-only. Once the host world is ready, calls
+ *                                 pc_net_game_host_local_money_rock_hit() directly at the
+ *                                 --field-action-test-seed fixture's own money-rock tile (24,104) --
+ *                                 exactly the real decomp hit seam a local player's tool swing would
+ *                                 call, bypassing only the swing/animation itself. Requires
+ *                                 --field-action-test-seed too (no seeded rock, no tile to hit).
+ *   g_pc_force_money_bag_pickup  CLIENT-only. Once this client's world is synced, scans the fixed
+ *                                 9-tile neighborhood around (24,104) (pcnetgame_find_money_rock_drop_tile()'s
+ *                                 own candidate set) via the client's own already-applied local field
+ *                                 copy (pcfa_get_tile() -- kept current by real FIELD_UPDATE messages,
+ *                                 the same data this client's real vanilla pickup targeting would read)
+ *                                 for a money-bag item, and calls pc_net_game_request_pickup() on it --
+ *                                 the exact real seam m_player_main_pickup.c_inc uses, bypassing only
+ *                                 the player's own walk-up-and-swing input. Retries every poll until a
+ *                                 bag is found (the host-side hit may not have landed yet). */
+extern int           g_pc_force_money_rock_hit;
+extern int           g_pc_force_money_bag_pickup;
+/* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY: --force-dig-hole. CLIENT-only,
+ * mirrors g_pc_force_money_bag_pickup's own exact pattern (off by default, fires exactly once as soon
+ * as its own precondition is met -- see pc_net_game.c's pcnetgame_run_dig_hole_test_trigger()). Unlike
+ * every other force-* hook above, this one does NOT call an existing pc_net_game_*() seam directly --
+ * it calls PC_Test_ForceRequestDigScoop() (m_player.c, declared in m_player_lib.h), a thin exported
+ * wrapper around the REAL, completely unmodified static Player_actor_request_main_dig_scoop_all()
+ * (m_player_main_dig_scoop.c_inc) -- the same request-boundary entry point genuine controller input
+ * reaches via Player_actor_CheckAndRequest_main_scoop_all(). Once the request is accepted, the
+ * player's own ordinary per-frame main-index update takes over completely (unmodified
+ * Player_actor_setup_main_Dig_scoop() / Player_actor_main_Dig_scoop() / Player_actor_Put_Hole_Dig_scoop()),
+ * driving the real animation state machine to its real commit point, which (for a host-authoritative
+ * client) calls the real pc_net_game_request_dig_hole() network seam exactly as it would from a real
+ * shovel swing. Targets the --field-action-test-seed fixture's own DIG_HOLE tile (56,105) -- requires
+ * --field-action-test-seed too. Bypasses only raw controller polling and shovel-equip state (this
+ * request path does not require a shovel to be out), never any part of the dig/fill/commit logic
+ * itself. */
+extern int           g_pc_force_dig_hole;
 extern int           g_pc_frame_limit_override;
 extern int           g_pc_speedhack_enabled;
 extern int           g_pc_time_override;

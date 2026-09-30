@@ -4349,6 +4349,36 @@ static int Player_actor_Search_STONE_TC(ACTOR* actorx, xyz_t* target_pos_p) {
 
     if (fg_p != NULL && IS_ITEM_STONE_TC(*fg_p) != FALSE && Common_Get(clip).bg_item_clip != NULL &&
         Common_Get(clip).bg_item_clip->ten_coin_entry_ex_proc != NULL) {
+#ifdef TARGET_PC
+        /* World Ecology Stage 1, Item 2 (MONEY_ROCK_HIT): gate the WHOLE ten_coin_entry_ex_proc()
+         * entry point for a host-authoritative client -- see pc_net_game_request_money_rock_hit()'s
+         * own doc (pc_net_game.h) for why a partial gate (only some of bIT_actor_ten_coin_entryR()'s
+         * own fg-writing calls) is unsafe. Stage 1 simplification: no local wobble animation plays on
+         * this client for this hit (see that same doc) -- the tile visibly updates moments later via
+         * the ordinary FIELD_UPDATE broadcast instead. */
+        if (pc_net_game_world_is_host_authoritative()) {
+            int ut_x, ut_z;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
+                pc_net_game_request_money_rock_hit(ut_x, ut_z);
+            }
+            return TRUE;
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            /* Bug 1 fix: single ownership -- the HOST's own local money-rock hit must also go through
+             * the host's own bookkeeping (s_host_money_rock, pc_net_game.c), exactly like a remote
+             * client's hit does, rather than running vanilla's ten_coin_entry_ex_proc() directly. Two
+             * independent writers (vanilla's own local mutation AND the host bookkeeping mirroring a
+             * client's hit on the same tile) could otherwise both revert/advance the same window,
+             * corrupting it (double-revert, wrong hit_count, a tile left on MONEY_FLOWER_SEED). Routing
+             * the host's own hit through the identical bookkeeping makes it single-owner: every hit on
+             * every money rock, from every source, updates exactly one place. Single-player
+             * (PC_NETGAME_ROLE_NONE) is NOT affected -- it falls through below, unmodified. */
+            int ut_x, ut_z;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
+                pc_net_game_host_local_money_rock_hit(ut_x, ut_z);
+            }
+            return TRUE;
+        }
+#endif
         Common_Get(clip).bg_item_clip->ten_coin_entry_ex_proc(target_pos_p, actorx->shape_info.rotation.y);
         return TRUE;
     }
@@ -4383,6 +4413,61 @@ static int Player_actor_CheckAndRequest_main_scoop_all(GAME* game, int priority)
                 return TRUE;
             }
         } else if (scoop_request_index == mPlayer_INDEX_GET_SCOOP) {
+#ifdef TARGET_PC
+            /* World Ecology Stage 1, Item 1 (DIG_BURIED): the audited-safe interception point -- see
+             * pc_net_game_request_dig_buried()'s own doc (pc_net_game.h) for why this must happen
+             * HERE, before mPlayer_INDEX_GET_SCOOP is ever entered, rather than inside that state's
+             * own setup/settle callbacks (m_player_main_get_scoop.c_inc). `item` above is this
+             * client's own local read (via mPlib_Check_scoop_after()) -- used only to decide whether
+             * this looks like a dig worth asking about; the host resolves and grants the real,
+             * authoritative item, never this local value.
+             *
+             * World Ecology T-dig (D / A-2): mFI_GetDigStatus() (m_field_info.c) can also route TWO
+             * other, unrelated interactions through this SAME mPlayer_INDEX_GET_SCOOP branch:
+             *   - digging up a SHINE_SPOT (raw field tile == SHINE_SPOT; `item` has already been
+             *     converted to the actual bell amount by mFI_CheckDigGetItem()'s own
+             *     bg_item_fg_sub_dig2take_conv() call -- this client's own private, already-rolled
+             *     luck, not something the host ever sees) -- this is DIG_SHINE (kind 8), NOT
+             *     DIG_BURIED (kind 1): the underlying tile is not deposit-flagged.
+             *   - the golden-shovel 10% ITM_MONEY_100 bonus (raw field tile == EMPTY_NO, `item` ==
+             *     ITM_MONEY_100): this resolves to an ordinary DIG_HOLE (kind 5) on the wire -- the
+             *     host only ever writes a plain hole; the bonus bells are a private client-side grant
+             *     on top, exactly like DIG_SHINE's own bell roll.
+             * Both must be detected and diverted BEFORE falling into the plain DIG_BURIED call below,
+             * which the host would otherwise (correctly) reject for a non-buried-item tile, silently
+             * losing the interaction. Neither path plays a local animation (matches the established
+             * DIG_BURIED precedent: wait for the RESULT before any visual), and both require a free
+             * pocket slot up front, exactly like DIG_BURIED's own check -- if none is free, the action
+             * is swallowed for this frame with nothing sent, matching vanilla's own "can't dig, no
+             * room" behavior for this case. */
+            if (pc_net_game_world_is_host_authoritative()) {
+                int ut_x, ut_z;
+                mActor_name_t* raw_fg_p = mFI_GetUnitFG(target_pos);
+                mActor_name_t raw_fg = raw_fg_p != NULL ? *raw_fg_p : (mActor_name_t)EMPTY_NO;
+                int have_free_slot = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) >= 0;
+
+                if (raw_fg == (mActor_name_t)SHINE_SPOT) {
+                    if (have_free_slot && mFI_Wpos2UtNum(&ut_x, &ut_z, target_pos)) {
+                        pc_net_game_request_dig_shine_with_grant(ut_x, ut_z, (int)item);
+                    }
+                    return TRUE;
+                } else if (gold_shovel && raw_fg == (mActor_name_t)EMPTY_NO && item == ITM_MONEY_100) {
+                    /* mCoBG_GetHoleNumber() is safe to read here at input time, for the same reason
+                     * DIG_HOLE's own commit-point read is safe (see Player_actor_Put_Hole_Dig_scoop(),
+                     * m_player_main_dig_scoop.c_inc): nothing between the preceding classification and
+                     * this point writes collision data for this tile. */
+                    int hn = mCoBG_GetHoleNumber(target_pos);
+                    if (have_free_slot && hn >= 0 && mFI_Wpos2UtNum(&ut_x, &ut_z, target_pos)) {
+                        pc_net_game_request_dig_hole_with_grant(ut_x, ut_z, hn, (int)ITM_MONEY_100);
+                    }
+                    return TRUE;
+                } else if (mFI_Wpos2UtNum(&ut_x, &ut_z, target_pos)) {
+                    if (pc_net_game_request_dig_buried(ut_x, ut_z)) {
+                        return TRUE;
+                    }
+                }
+            } else
+#endif
             if (Player_actor_request_main_get_scoop_all(game, &target_pos, item, priority)) {
                 return TRUE;
             }
@@ -6749,7 +6834,31 @@ static int Player_actor_Check_BirthBee_common(ACTOR* actorx, mActor_name_t item,
             if (IS_ITEM_BEE_TREE(item)) {
                 xyz_t item_drop_pos;
 
-                Common_Get(clip).bg_item_clip->item_tree_fruit_drop_proc(item, tree_ut_x, tree_ut_z, &item_drop_pos);
+#ifdef TARGET_PC
+                /* World Ecology T1 (TREE_SHAKE, bee-birth): gate the WHOLE mutating entry point
+                 * (item_tree_fruit_drop_proc -> drop_fruit() -> fruit_set() plus the TREE_BEES-># TREE
+                 * destination-tree conversion write) for a host-authoritative client/host, exactly like
+                 * the SHAKE/CHOP seams' own gates (m_player_main_shake_tree.c_inc,
+                 * m_player_main_swing_axe.c_inc) -- see pc_net_game_request_tree_shake()'s own doc
+                 * (pc_net_game.h). This is called from BOTH the shake bee-timer branch and the axe
+                 * felling branch, so gating it here covers both call sites at once. The visible bee
+                 * actor and its honeycomb-drop ANIMATION still need to play locally on every role, host
+                 * or client (purely cosmetic) -- see pc_tree_birth_bee_visual()'s own doc
+                 * (bg_item_common.c_inc) -- so this always calls that PC-only, visual-only helper
+                 * instead of the real mutating proc when networked, reporting the exact same
+                 * success/failure shape (a valid vs. -1-sentinel *item_drop_pos) so the angle-aim math
+                 * below is unaffected either way. */
+                if (pc_net_game_world_is_host_authoritative()) {
+                    pc_net_game_request_tree_shake(tree_ut_x, tree_ut_z);
+                    pc_tree_birth_bee_visual(tree_ut_x, tree_ut_z, &item_drop_pos);
+                } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                    pc_net_game_host_local_tree_shake(tree_ut_x, tree_ut_z);
+                    pc_tree_birth_bee_visual(tree_ut_x, tree_ut_z, &item_drop_pos);
+                } else
+#endif
+                {
+                    Common_Get(clip).bg_item_clip->item_tree_fruit_drop_proc(item, tree_ut_x, tree_ut_z, &item_drop_pos);
+                }
                 if (item_drop_pos.x >= 0.0f && item_drop_pos.z >= 0.0f) {
                     if (angle_y_p != NULL) {
                         f32 dx = item_drop_pos.x - actorx->world.position.x;

@@ -51,6 +51,30 @@ static BOOL l_lbRTC_isInitial = TRUE;
 static lbRTC_time_c l_lbRTC_Time;
 static BOOL l_lbRTC_IsSampled;
 
+#ifdef TARGET_PC
+/* N-clock milestone: see the doc comment on pc_lb_rtc_set_net_clock_offset()/
+ * pc_lb_rtc_get_net_clock_offset() in lb_rtc.h. Deliberately NOT Save_t (never persisted -- a client's
+ * own save file must never gain a host-derived value) and NOT rtc_time (overwritten wholesale every
+ * frame by lbRTC_GetGameTime()'s own OSTicksToCalendarTime() recomputation, so storing a correction
+ * there would be clobbered before the next frame could use it). Always 0 on a host process -- the
+ * setter is only ever called client-side -- and always 0 for a ROLE_NONE (single-player) process:
+ * pc_net_game.c's pc_net_game_shutdown() -- the one place s_role actually reverts to ROLE_NONE --
+ * explicitly forces it back to 0 there (clock hardening concern #1), so a subsequent single-player
+ * session (even on a different local save) never inherits a stale host clock correction. An ordinary
+ * mid-session disconnect that leaves the process still a CLIENT (just with its link down, hoping to
+ * reconnect) deliberately does NOT reset it -- see pcnetgame_reset_client_session_state()'s own doc
+ * comment in pc_net_game.c. */
+static s64 s_pc_net_clock_offset = 0;
+
+void pc_lb_rtc_set_net_clock_offset(s64 offset) {
+  s_pc_net_clock_offset = offset;
+}
+
+s64 pc_lb_rtc_get_net_clock_offset(void) {
+  return s_pc_net_clock_offset;
+}
+#endif
+
 /**
  * @brief Get the current hardware time in ticks.
  *
@@ -149,6 +173,14 @@ static void lbRTC_GetGameTime(lbRTC_time_c* time) {
   OSCalendarTime ctime;
   OSTime t = lbRTC_GetHardTime();
   t += Save_Get(time_delta);
+#ifdef TARGET_PC
+  /* N-clock milestone: fold in the network clock-sync correction, if any (always 0 on a host or
+   * single-player process -- see pc_lb_rtc_get_net_clock_offset()'s doc comment, lb_rtc.h). This is
+   * the ONE read site that makes a READY client's Common(time.rtc_time)/now_sec agree with the host's:
+   * every consumer of those (mTM_time(), Kabu_get_price(), mNPS_schedule_manager_sub(), etc.) reads
+   * through here with no per-consumer change needed. */
+  t += pc_lb_rtc_get_net_clock_offset();
+#endif
 
   OSTicksToCalendarTime(t, &ctime);
   lbRTC_CalenderTimeToRTCTime(&ctime, time);
@@ -238,11 +270,23 @@ extern void lbRTC_Sampling() {
  * If the RTC feature is enabled and not crashed, it updates the time delta.
  * Otherwise, it copies the given time to the appropriate rtc_time location.
  *
+ * A player's clock edit (in-game clock-adjust menu, Rover's confirm dialog, the debug select
+ * screen, or a year-clamp/RTC-crash-recovery re-store) is always a relative shift of the delta
+ * anchor: new_delta = (target_ticks - hard_ticks). On TARGET_PC, lbRTC_GetGameTime() also adds
+ * pc_lb_rtc_get_net_clock_offset() on top of hard_ticks + time_delta (always 0 on a host or
+ * ROLE_NONE process -- see that function's own doc comment), so subtracting the same offset back
+ * out of new_delta here keeps OSGetTime()+time_delta+offset consistent with the target time the
+ * caller just computed, instead of double-counting the offset on the very next read.
+ *
  * @param time Pointer to the lbRTC_time_c structure containing the time to be set.
  */
 extern void lbRTC_SetTime(lbRTC_time_c* time) {
   if (Common_Get(time.rtc_enabled) == TRUE && !Common_Get(time.rtc_crashed)) {
-    Save_Set(time_delta, lbRTC_RTCTimeToTicks(time) - lbRTC_GetHardTime());
+    OSTime new_delta = lbRTC_RTCTimeToTicks(time) - lbRTC_GetHardTime();
+#ifdef TARGET_PC
+    new_delta -= pc_lb_rtc_get_net_clock_offset();
+#endif
+    Save_Set(time_delta, new_delta);
   }
   else {
     lbRTC_TimeCopy(Common_GetPointer(time.rtc_time), time);

@@ -173,6 +173,22 @@
 #include "m_play.h"        /* v2: play_main -- see pcnetgame_update_local_world_ready() */
 #include "m_npc.h"         /* villager population/is_home milestone: Animal_c, ANIMAL_NUM_MAX,
                             * mNpc_PcApplyVillagerArrival()/mNpc_PcApplyVillagerDeparture() */
+#include "m_field_assessment.h" /* World Ecology Stage 1, Item 4: mFAs_SetFieldRank() -- see
+                                  * pcnetgame_handle_client_snapshot_end()/pcnetgame_handle_client_world_meta() */
+#include "m_npc_schedule.h" /* N3 Channel B snapshot extension: mNPS_get_schedule_area(), mNPS_schedule_c
+                            * (forced_type/forced_timer) -- see pcnetgame_build_villager_snapshot() */
+#include "m_shop.h"         /* World Ecology T1: mSP_SelectRandomItem_New(), mSP_LISTTYPE_xxx, and
+                            * mSP_KIND_FURNITURE -- see pcnetgame_resolve_tree_drop_item(), the exact
+                            * furniture-roll vanilla's own drop_fruit() (bg_item_common.c_inc) uses */
+#include "libc64/qrand.h"   /* World Ecology T1: fqrand() -- see pcnetgame_resolve_tree_drop_item() */
+#include "m_snowman.h"      /* World Ecology: snowmen -- mSN_snowman_data_c/mSN_SAVE_COUNT/mSN_snowman_save_c
+                            * and SNOWMAN0/SNOWMAN8 (m_name_table.h, already reachable). */
+#include "ac_psnowman.h"    /* World Ecology: snowmen -- PSNOWMAN_ACTOR's own npc_id/home fields are just
+                            * ACTOR's, but this is included for parity with the actor this milestone's
+                            * host-side live-actor overlay walks (see
+                            * pcnetgame_host_resolve_snowman_tile_overlay()). */
+#include "m_police_box.h"   /* World Ecology: snowmen -- mPB_keep_item(), mirroring m_police_box.c:76-94's
+                            * own ITEM1/FTR-only lost-and-found classification for a displaced tile item */
 
 #include <math.h>   /* fabsf(), isfinite() -- see pcnetgame_pos_valid() and the reach checks */
 #include <stddef.h> /* offsetof() */
@@ -242,6 +258,83 @@ typedef enum PCNetGameMsgType {
                                               * sent once per snapshot (initial join / RESYNC_REQUEST /
                                               * reconnect), between the last FIELD_BLOCK and
                                               * SNAPSHOT_END. See PCNetGameVillagerSnapshotMsg. */
+    /* ---- friendship/mail sync milestone ---- */
+    PC_NETGAME_MSG_FRIENDSHIP_REQUEST = 21, /* client -> host only, reliable: a local dialogue/mail
+                                             * interaction changed Anmmem_c.friendship by `delta` for
+                                             * THIS connection's own identity (never sent by/applied
+                                             * to any other player). See PCNetGameFriendshipRequestMsg
+                                             * and mNpc_AddFriendship()'s doc comment (m_npc.c). */
+    PC_NETGAME_MSG_FRIENDSHIP_UPDATE  = 22, /* host -> every READY client, reliable, world_seq-stamped:
+                                             * the resulting (already-clamped) friendship value for one
+                                             * (villager slot, PersonalID) pair. See
+                                             * PCNetGameFriendshipUpdateMsg. */
+    PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY = 23, /* host -> one client, reliable: one occupied
+                                             * Anmmem_c memory entry (late-join/reconnect coverage),
+                                             * sent once per occupied entry between VILLAGER_SNAPSHOT
+                                             * and SNAPSHOT_END. Also carries mail-sync's letter/
+                                             * letter_info (see PCNetGameFriendshipSnapshotEntryMsg). */
+    PC_NETGAME_MSG_MAIL_REQUEST       = 24, /* client -> host only, reliable: this connection's own
+                                             * local player sent Mail_c `mail` to an NPC via the post
+                                             * office. See PCNetGameMailRequestMsg and
+                                             * mNpc_SendMailtoNpc()'s doc comment (m_npc.c). */
+    PC_NETGAME_MSG_MAIL_DELIVERED     = 25, /* host -> every READY client, reliable, world_seq-stamped:
+                                             * the resulting villager-memory outcome of a delivered
+                                             * letter (letter content + letter_info + friendship). See
+                                             * PCNetGameMailDeliveredMsg. */
+    PC_NETGAME_MSG_NPC_MOVE           = 26, /* N2: host -> every READY client, UNRELIABLE, ~20 Hz:
+                                             * one on-screen villager NPC_ACTOR's resolved
+                                             * position/facing for this frame. See
+                                             * PCNetGameNpcMoveMsg and pc_net_game.h's design note
+                                             * above pc_net_game_notify_npc_move(). */
+    PC_NETGAME_MSG_CLOCK_SYNC         = 27, /* N-clock milestone: host -> every READY client,
+                                             * RELIABLE, low-rate: the host's authoritative wall/game
+                                             * clock, so a client's Common(time.rtc_time)/now_sec
+                                             * (lbRTC_GetGameTime(), see lb_rtc.c) can be corrected to
+                                             * agree with the host's rather than free-running from
+                                             * this process's own OSInit() seed. See
+                                             * PCNetGameClockSyncMsg and
+                                             * pcnetgame_host_check_clock_sync()/
+                                             * pcnetgame_handle_client_clock_sync() below. Deliberately
+                                             * its own message, NOT an extension of WORLD_META: renew_time
+                                             * there is Save_t.all_grow_renew_time, an unrelated
+                                             * daily-growth/weather/Kabu RNG day-epoch anchor -- folding
+                                             * a clock correction into that field would corrupt it, and
+                                             * WORLD_META's reliable+world_seq-churning shape is a poor
+                                             * fit for a periodic clock ping anyway. */
+    PC_NETGAME_MSG_NPC_STATE          = 28, /* N3 Channel B: host -> every READY client, RELIABLE,
+                                             * sent on CHANGE (not every frame): a villager's
+                                             * is_home/hide/forced_type/forced_timer, applied
+                                             * atomically client-side. See PCNetGameNpcStateMsg and
+                                             * pc_net_game.h's design note above
+                                             * pc_net_game_notify_npc_state(). */
+    PC_NETGAME_MSG_FIELD_ACTION_REQUEST = 29, /* World Ecology Stage 1: client -> host only, reliable.
+                                             * One shot (no separate CONFIRM phase -- see
+                                             * PCNetGameFieldActionRequestMsg's own doc for why this
+                                             * differs from PICKUP/DROP's two-phase shape). See
+                                             * pc_net_game_request_dig_buried()/
+                                             * pc_net_game_request_money_rock_hit(). */
+    PC_NETGAME_MSG_FIELD_ACTION_RESULT  = 30, /* World Ecology Stage 1: host -> the one requesting
+                                             * client only, reliable. See
+                                             * PCNetGameFieldActionResultMsg. */
+    PC_NETGAME_MSG_BURY_REQUEST         = 31, /* World Ecology T3 (host-authoritative bury): client ->
+                                             * host only, reliable. Mirrors PICKUP/DROP's two-phase
+                                             * reserve -> INTERACT_CONFIRM shape
+                                             * (PC_NETGAME_INTERACT_KIND_BURY), not
+                                             * FIELD_ACTION_REQUEST's one-shot shape. See
+                                             * PCNetGameBuryRequestMsg and
+                                             * pcnetgame_handle_host_bury_request(). */
+    PC_NETGAME_MSG_BURY_RESULT          = 32, /* World Ecology T3: host -> the one requesting client
+                                             * only, reliable. See PCNetGameBuryResultMsg. */
+    PC_NETGAME_MSG_SNOWMAN_BUILD_REQUEST = 33, /* World Ecology: snowmen. Client -> host only,
+                                             * reliable. See PCNetGameSnowmanBuildRequestMsg /
+                                             * pc_net_game_request_snowman_build(). */
+    PC_NETGAME_MSG_SNOWMAN_BUILD_RESULT  = 34, /* World Ecology: snowmen. Host -> the one requesting
+                                             * client only, reliable. See
+                                             * PCNetGameSnowmanBuildResultMsg. */
+    PC_NETGAME_MSG_SNOWMAN_STATE         = 35, /* World Ecology: snowmen. Host -> every READY client,
+                                             * reliable, world_seq-stamped (its OWN sequence,
+                                             * s_snowman_world_seq -- independent of s_world_seq). See
+                                             * PCNetGameSnowmanStateMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -546,15 +639,32 @@ _Static_assert(sizeof(PCNetGameFieldBlockMsg) <= PC_NET_MAX_PAYLOAD,
  * pcnetgame_client_apply_weather_state()/pcnetgame_client_apply_market_state() below. Turnip
  * INVENTORY (a player's own held turnips) is never part of this -- it stays in that player's own
  * private Save_t, exactly as before; only the shared market PRICE schedule is here. */
+/* World Ecology milestone (Stage 1, Item 4): fish/bug TERM MIRRORING. gyoei_term (Save_t, 0..23 --
+ * an unchecked r_month[term>>1][term&1] index, see ac_set_ovl_gyoei.c's aSOG_gyoei_make_*_range_data())
+ * and insect_term (Save_t, 0..11 -- an unchecked l_insect_month[month][...] index, see
+ * ac_set_ovl_insect.c's aSOI_ins_make_insect_normal_range_data()) are NOT gated (aSOG_gyoei_renew_term_info()/
+ * aSOI_ins_renew_term_info() keep running everywhere -- gating them would only cause host/client fish
+ * and bug spawn-table DIVERGENCE, with no safety benefit: see the World Ecology audit). Instead the
+ * host's 4 term bytes are mirrored here, exactly like weather/market above, and the client applies them
+ * verbatim -- EXCEPT it must clamp/reject any received gyoei_term/insect_term outside its valid range
+ * BEFORE storing it (pcnetgame_client_apply_term_state(), below), because those two fields are used as
+ * unchecked table indices client-side. The two *_transition_offset bytes are cosmetic day-arithmetic
+ * inputs only (never an index), but are clamped to their own valid 0..aSO{G,I}_TERM_TRANSITION_MAX_DAYS
+ * range too, purely for belt-and-suspenders sanity. Grows this struct by 2 bytes (28 -> 30): the 2
+ * bytes of prior padding plus 2 new ones -- see PC_NET_MAX_PAYLOAD's headroom (1024 bytes; this struct
+ * is embedded in two ~50-byte messages, nowhere close). */
 typedef struct PCNetGameWorldStateWire {
     uint16_t daily_price[7];        /* Kabu_price_c.daily_price[lbRTC_SUNDAY..lbRTC_SATURDAY] */
     uint16_t trade_market;          /* Kabu_price_c.trade_market (Kabu_TRADE_MARKET_TYPE_*) */
     PCNetGameRtcWire kabu_update_time; /* Kabu_price_c.update_time */
     uint8_t  weather;               /* Common_Get(weather), an mEnv_WEATHER_... value */
     uint8_t  weather_intensity;     /* Common_Get(weather_intensity), an mEnv_WEATHER_INTENSITY_... value */
-    uint8_t  _reserved0[2];
+    uint8_t  gyoei_term;                    /* Save_t.gyoei_term, valid range 0..23 -- see doc above */
+    uint8_t  gyoei_term_transition_offset;  /* Save_t.gyoei_term_transition_offset, valid range 0..5 */
+    uint8_t  insect_term;                   /* Save_t.insect_term, valid range 0..11 -- see doc above */
+    uint8_t  insect_term_transition_offset; /* Save_t.insect_term_transition_offset, valid range 0..5 */
 } PCNetGameWorldStateWire;
-_Static_assert(sizeof(PCNetGameWorldStateWire) == 28, "PCNetGameWorldStateWire wire size drifted");
+_Static_assert(sizeof(PCNetGameWorldStateWire) == 30, "PCNetGameWorldStateWire wire size drifted");
 
 /* v2: host -> one client, reliable. Closes snapshot `epoch`; the client applies renew_time (the
  * host's Save all_grow_renew_time, read at send time) atomically here, then counts the world as
@@ -565,6 +675,8 @@ _Static_assert(sizeof(PCNetGameWorldStateWire) == 28, "PCNetGameWorldStateWire w
 #define PC_NETGAME_META_FLAG_RENEW_TIME_VALID 0x01u
 #define PC_NETGAME_META_FLAG_WEATHER_VALID    0x02u
 #define PC_NETGAME_META_FLAG_MARKET_VALID     0x04u
+#define PC_NETGAME_META_FLAG_TERM_VALID       0x08u /* World Ecology Stage 1: gyoei_term/insect_term
+                                                       * + their transition offsets, in world_state */
 typedef struct PCNetGameSnapshotEndMsg {
     uint8_t  msg_type;      /* PC_NETGAME_MSG_SNAPSHOT_END */
     uint8_t  grid;          /* PC_NETGAME_GRID_TOWN */
@@ -575,7 +687,9 @@ typedef struct PCNetGameSnapshotEndMsg {
     PCNetGameRtcWire renew_time;
     PCNetGameWorldStateWire world_state;
 } PCNetGameSnapshotEndMsg;
-_Static_assert(sizeof(PCNetGameSnapshotEndMsg) == 48, "PCNetGameSnapshotEndMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameSnapshotEndMsg) == 52, "PCNetGameSnapshotEndMsg wire size drifted"); /* 50
+    logical bytes padded to 52 for uint32_t alignment (struct alignment 4) -- see PCNetGameWorldStateWire's
+    +2-byte growth, World Ecology Stage 1 Item 4 */
 _Static_assert(sizeof(PCNetGameSnapshotEndMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameSnapshotEndMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
@@ -666,8 +780,22 @@ typedef struct PCNetGameVillagerSlotWire {
     uint8_t  home_block_z;
     uint8_t  home_ut_x;
     uint8_t  home_ut_z;
+    uint8_t  hide;                   /* N3 Channel B extension: best-effort, same caveat as is_home
+                                       * above -- when the host has no live NPC_ACTOR for this slot (S1
+                                       * limitation: out of the host's own local player's spawn scope),
+                                       * there is no actor-level hide_flg to read, so this is
+                                       * approximated as == is_home (a villager that is home is hidden
+                                       * the overwhelming majority of the time; the brief into/out-of-
+                                       * house door animation window is the only place this can be
+                                       * momentarily wrong, and a subsequent live NPC_STATE broadcast --
+                                       * or the villager's own actor being created near this joining
+                                       * client -- corrects it immediately, same self-healing property
+                                       * NPC_MOVE already relies on). */
+    uint8_t  forced_type;            /* mNPS_schedule_c.forced_type at snapshot-build time, or 0 if this
+                                       * slot has no registered schedule area yet (see FIX S3) */
+    uint16_t forced_timer_remaining; /* mNPS_schedule_c.forced_timer, clamped to uint16_t range, or 0 */
 } PCNetGameVillagerSlotWire;
-_Static_assert(sizeof(PCNetGameVillagerSlotWire) == 8, "PCNetGameVillagerSlotWire wire size drifted");
+_Static_assert(sizeof(PCNetGameVillagerSlotWire) == 12, "PCNetGameVillagerSlotWire wire size drifted");
 
 /* v2: host -> one client, reliable. Sent once per snapshot sequence (initial join / RESYNC_REQUEST /
  * reconnect), between the last FIELD_BLOCK and SNAPSHOT_END (see pcnetgame_host_pump_snapshots()'s
@@ -689,10 +817,250 @@ typedef struct PCNetGameVillagerSnapshotMsg {
                                           * struct in this file -- pcnetgame_build_villager_snapshot()
                                           * _Static_assert's this matches ANIMAL_NUM_MAX exactly. */
 } PCNetGameVillagerSnapshotMsg;
-_Static_assert(sizeof(PCNetGameVillagerSnapshotMsg) == 132, "PCNetGameVillagerSnapshotMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameVillagerSnapshotMsg) == 192,
+               "PCNetGameVillagerSnapshotMsg wire size drifted (N3 Channel B extended "
+               "PCNetGameVillagerSlotWire by 4 bytes/slot: hide, forced_type, forced_timer_remaining)");
 _Static_assert(sizeof(PCNetGameVillagerSnapshotMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameVillagerSnapshotMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 _Static_assert(ANIMAL_NUM_MAX == 15, "PCNetGameVillagerSnapshotMsg.slots[15] no longer matches ANIMAL_NUM_MAX");
+
+/* N2 villager movement sync: host -> every READY client, UNRELIABLE, ~20 Hz. One on-screen villager
+ * NPC_ACTOR's resolved position/facing for the frame it was sampled on. See pc_net_game.h's design
+ * note above pc_net_game_notify_npc_move()/pc_net_game_get_npc_move_pose() for full scope/identity
+ * rationale -- summarized here: `slot`+`npc_id` reuse the EXACT identity pairing the villager
+ * population-sync messages above already use (never a new scheme), and `frame` is this stream's own
+ * sender-local monotonic counter, following PCNetMoveMsg.frame's exact convention (only ever
+ * comparable against another sample from this same stream, never this process's own frame/time
+ * domain -- see PCNetMoveMsg's doc comment). Still excludes speed/move_state (position is applied
+ * directly each frame, never integrated from a speed model). N3 Channel A repurposed the byte that
+ * was `_reserved0` into `action_type` -- the host's real, unmodified aNPC_action_proc()-selected
+ * coarse action/animation type, sampled at the same point as pos/facing -- so walk-vs-idle (and other
+ * coarse actions) are now host-authoritative rather than purely inferred client-side from position
+ * deltas; see pcnetgame_npc_move_interpolate()/pc_net_game_get_npc_move_pose() for how the two are
+ * combined. */
+typedef struct PCNetGameNpcMoveMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_NPC_MOVE */
+    uint8_t  slot;          /* Save_t.animals[] index, 0..ANIMAL_NUM_MAX-1 */
+    uint8_t  action_type;   /* N3 Channel A: repurposes what was _reserved0. Host's
+                              * NPC_ACTOR::condition_info.action (aNPC_ACTION_TYPE_*, ac_npc.h) at the
+                              * same sample point as pos/facing below -- the coarse action/animation
+                              * type the real, unmodified host aNPC_action_proc()/aNPC_setupAction()
+                              * just selected. Applied client-side via the existing aNPC_setupAction()
+                              * call (see aNPC_pc_client_consume_move(), ac_npc_move.c_inc), now given a
+                              * real host-authoritative value instead of inferring walk-vs-idle purely
+                              * from position deltas. No wire size change -- still 28 bytes; see the
+                              * _Static_assert below. */
+    uint8_t  _reserved1;
+    uint16_t npc_id;        /* Animal_c.id.npc_id at sample time -- slot-reuse identity guard */
+    uint16_t _reserved2;
+    uint32_t frame;         /* sender's own monotonically increasing per-send counter (shared across
+                              * every slot -- see pc_net_game_notify_npc_move()'s doc) */
+    float    pos_x;
+    float    pos_y;
+    float    pos_z;
+    int16_t  facing_angle;  /* world.angle.y, native engine angle units */
+    int16_t  _reserved3;
+} PCNetGameNpcMoveMsg;
+_Static_assert(sizeof(PCNetGameNpcMoveMsg) == 28,
+               "PCNetGameNpcMoveMsg wire size drifted -- N3 Channel A repurposed _reserved0 as "
+               "action_type in place, no size change intended");
+_Static_assert(sizeof(PCNetGameNpcMoveMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameNpcMoveMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* N-clock milestone: host -> every READY client, RELIABLE. clock_seq is monotonic HOST-side (one
+ * shared counter across the initial per-peer send and every periodic/discontinuity broadcast --
+ * see s_host_clock_seq) -- a client applies a received sync only if clock_seq > its own last-applied
+ * value (pcnetgame_handle_client_clock_sync()), exactly mirroring s_client_meta_seq's own
+ * strict-monotonic contract (WORLD_META) rather than inventing a new one.
+ *
+ * host_game_ticks is the RAW OSGetTime()+Save_Get(time_delta) tick value at send time -- deliberately
+ * NOT a PCNetGameRtcWire (calendar fields): the client's correction is a single subtraction
+ * (host_game_ticks - (OSGetTime()+Save_Get(time_delta)) on the client's own clock read at receipt) that
+ * preserves sub-second precision, rather than a lossy round-trip through calendar-second fields. See
+ * lb_rtc.c's pc_lb_rtc_set_net_clock_offset()/lbRTC_GetGameTime() for exactly how the resulting offset
+ * is folded back in.
+ *
+ * flags bit 0 (DISCONTINUITY) means the host itself detected its own Save_Get(time_delta) change
+ * between two polls (a manual clock-adjust via the in-game menu, lbRTC_SetTime()) -- see
+ * pcnetgame_host_check_clock_sync()'s time_delta watch. A client always re-applies immediately on this
+ * flag regardless of the normal drift-tolerance check (see PC_NETGAME_CLOCK_SYNC_TOLERANCE_SEC below),
+ * since a manual adjust is a deliberate, large, intentional change, not clock jitter. */
+#define PC_NETGAME_CLOCK_SYNC_FLAG_DISCONTINUITY 0x01u
+typedef struct PCNetGameClockSyncMsg {
+    uint8_t  msg_type;       /* PC_NETGAME_MSG_CLOCK_SYNC */
+    uint8_t  flags;          /* PC_NETGAME_CLOCK_SYNC_FLAG_* */
+    uint16_t _reserved0;
+    uint32_t clock_seq;      /* monotonic, host-side; client applies only if > last applied */
+    int64_t  host_game_ticks; /* OSGetTime() + Save_Get(time_delta) at send time -- raw ticks */
+} PCNetGameClockSyncMsg;
+_Static_assert(sizeof(PCNetGameClockSyncMsg) == 16, "PCNetGameClockSyncMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameClockSyncMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameClockSyncMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* N-clock milestone tuning constants -- see the design note above PC_NETGAME_MSG_CLOCK_SYNC and
+ * pcnetgame_host_check_clock_sync()/pcnetgame_handle_client_clock_sync() below. */
+#define PC_NETGAME_CLOCK_SYNC_INTERVAL_MS    30000u /* periodic host broadcast cadence (real ms) */
+#define PC_NETGAME_CLOCK_SYNC_TOLERANCE_SEC  2      /* client re-applies only past this much drift */
+#define PC_NETGAME_CLOCK_SYNC_LOUD_LOG_SEC   3600   /* log loudly above this many seconds of correction */
+
+/* N3 Channel B: host -> every READY client, RELIABLE, sent only on CHANGE (never every frame). Carries
+ * the small cluster of villager schedule/home state the audit found is written together and must
+ * never be observed by a client in a contradictory intermediate combination: is_home, hide (the
+ * actor's hide_flg/hide_request state), forced_type/forced_timer_remaining (mNPS_schedule_c's forced
+ * schedule override -- see ac_npc_think_sleep.c_inc's aNPC_think_sleep_set_force_schedule(), the
+ * actual site that sets forced_type together with forced_timer; aNPC_setup_stay_my_house() and
+ * aNPC_act_leave_house_wait() (ac_npc_action.c_inc / ac_npc_act_leave_house.c_inc) are the is_home
+ * transition points, sourced this way rather than hooked individually because forced_timer counts
+ * down continuously outside any single write site -- see pc_net_game_notify_npc_state()'s own doc
+ * comment for why a per-frame dirty-check against a host-side shadow is used instead of hooking every
+ * call site individually).
+ *
+ * `slot`/`npc_id` reuse the exact identity pairing every other villager message already uses.
+ * `state_seq` is a single, global (not per-slot) monotonic counter -- mirroring WORLD_META's
+ * s_client_meta_seq strict-`>` convention -- incremented once per host broadcast of ANY slot; a client
+ * applies a received NPC_STATE only if state_seq > its own s_client_npc_state_seq[slot] (per-slot last-
+ * applied value, so one slot's broadcast can never suppress another's). forced_timer_remaining is
+ * uint16_t: mNPS_schedule_c.forced_timer is only ever set to 7200 (aNPC_think_sleep_set_force_schedule)
+ * and only ever decremented from there, so it never exceeds 7200 -- see m_npc_schedule_h.h's
+ * declaration (`int forced_timer`) and m_npc_schedule.c's mNPS_schedule_manager_sub() clamp-at-0 logic;
+ * pc_net_game_notify_npc_state() clamps defensively anyway before narrowing. */
+typedef struct PCNetGameNpcStateMsg {
+    uint8_t  msg_type;               /* PC_NETGAME_MSG_NPC_STATE */
+    uint8_t  slot;                   /* Save_t.animals[] index */
+    uint16_t npc_id;                 /* Animal_c.id.npc_id at sample time -- slot-reuse identity guard */
+    uint8_t  is_home;
+    uint8_t  hide;
+    uint8_t  forced_type;
+    uint8_t  _reserved0;
+    uint16_t forced_timer_remaining; /* mNPS_schedule_c.forced_timer, clamped to uint16_t range */
+    uint16_t _reserved1;
+    uint32_t state_seq;              /* global monotonic; client applies only if > its own per-slot last */
+} PCNetGameNpcStateMsg;
+_Static_assert(sizeof(PCNetGameNpcStateMsg) == 16, "PCNetGameNpcStateMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameNpcStateMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameNpcStateMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* Friendship/mail sync milestone.
+ *
+ * Design note: Anmmem_c.memories[] is NOT a fixed per-player slot -- it is a small (7-entry, see
+ * ANIMAL_MEMORY_NUM) content-addressed cache keyed by PersonalID_c, searched by
+ * mNpc_GetAnimalMemoryIdx()/allocated by mNpc_ForceGetFreeAnimalMemoryIdx() (m_npc.c). A network
+ * CLIENT has exactly ONE PersonalID_c for its whole connection (established once at IDENTITY
+ * handshake and cached in PCNetGameHostPeerState -- see pcnetgame_handle_host_identity()), so a
+ * FRIENDSHIP_REQUEST never needs to say WHICH player it's for: the host resolves (find-or-create)
+ * the memory slot from the SENDING PEER's own cached identity, exactly mirroring how
+ * mNpc_SetAnimalLastTalk() resolves it from Common_Get(now_private) for a same-machine interaction
+ * (see mNpc_PcHostResolveAndApplyFriendshipDelta(), m_npc.c). player_name/land_name/player_id/
+ * land_id in the broadcasts below are the exact same 4 PersonalID_c fields PCNetGameIdentity already
+ * puts on the wire today (see this file's top-of-file design note) -- not new exposure, every
+ * connected peer already learns every other peer's identity at READY (pc_remote_player_on_ready()).
+ * A remote client never receives more than that: not the human-readable letter TEXT of another
+ * player's mail beyond what mNpc_SendMailtoNpc() itself would already reveal to anyone who later
+ * reads that same in-game letter from the villager. */
+
+/* client -> host only, reliable. Sent from mNpc_AddFriendship()'s client-intercept branch INSTEAD
+ * OF applying `delta` locally. `slot` is the Save_t.animals[] index owning the Anmmem_c the caller
+ * resolved via mNpc_FindAnimalSlotForMemory(). No sequencing needed on the request itself -- pc_net's
+ * reliable transport is already ordered per peer per direction, and the host applies deltas as they
+ * arrive against its own live, authoritative Anmmem_c (there is nothing to reorder against). */
+typedef struct PCNetGameFriendshipRequestMsg {
+    uint8_t msg_type; /* PC_NETGAME_MSG_FRIENDSHIP_REQUEST */
+    uint8_t slot;
+    int8_t  delta;
+    uint8_t _reserved0;
+} PCNetGameFriendshipRequestMsg;
+_Static_assert(sizeof(PCNetGameFriendshipRequestMsg) == 4, "PCNetGameFriendshipRequestMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameFriendshipRequestMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameFriendshipRequestMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* host -> every READY client, reliable, world_seq-stamped (the SAME shared s_world_seq counter
+ * ARRIVAL/DEPARTURE/WORLD_META already use -- see this file's design note above
+ * PCNetGameVillagerArrivalMsg for why one counter, not a new per-feature scheme). Sent after the
+ * host has ALREADY applied the resulting, already-clamped (0..127) friendship value to its own
+ * Anmmem_c -- never before. A client applies this iff world_seq > its own last-applied
+ * s_client_friendship_seq (strict `>`, exactly mirroring ARRIVAL/DEPARTURE's own rule: this is a
+ * one-shot delta result, not a full resync that a same-or-later value should always supersede). */
+typedef struct PCNetGameFriendshipUpdateMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_FRIENDSHIP_UPDATE */
+    uint8_t  slot;
+    int8_t   friendship; /* final, already-clamped 0..127 value */
+    uint8_t  _reserved0;
+    uint8_t  player_name[PC_NETGAME_NAME_LEN];
+    uint8_t  land_name[PC_NETGAME_LAND_LEN];
+    uint16_t player_id;
+    uint16_t land_id;
+    uint32_t world_seq;
+} PCNetGameFriendshipUpdateMsg;
+_Static_assert(sizeof(PCNetGameFriendshipUpdateMsg) == 28, "PCNetGameFriendshipUpdateMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameFriendshipUpdateMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameFriendshipUpdateMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* host -> one client, reliable. Sent once per OCCUPIED Anmmem_c entry (late-join/reconnect coverage
+ * for memories[], which VILLAGER_SNAPSHOT never carries), between VILLAGER_SNAPSHOT and
+ * SNAPSHOT_END (see pcnetgame_host_pump_snapshots()'s snap_stage 3) -- iterated flat over
+ * (ANIMAL_NUM_MAX * ANIMAL_MEMORY_NUM) = 105 (slot, memory_idx) pairs, empty ones skipped (never
+ * sent) rather than padding out a fixed-size batch, since most villagers have far fewer than 7
+ * remembered players. `>=` rule (matches FIELD_BLOCK/VILLAGER_SNAPSHOT, not WORLD_META/
+ * FRIENDSHIP_UPDATE's strict `>`): a snapshot entry always supersedes whatever came before, at the
+ * same or a later world_seq. has_letter/letter mirror mail-sync's outcome (Anmplmail_c, raw bytes,
+ * opaque here -- decoded by mNpc_PcApplyFriendshipUpdate()/its snapshot counterpart in m_npc.c,
+ * exactly like PCNetPlayerAppearance's design_record is an opaque blob at this layer). */
+typedef struct PCNetGameFriendshipSnapshotEntryMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY */
+    uint8_t  slot;
+    int8_t   friendship;
+    uint8_t  letter_info; /* raw Anmlet_c byte */
+    uint8_t  player_name[PC_NETGAME_NAME_LEN];
+    uint8_t  land_name[PC_NETGAME_LAND_LEN];
+    uint16_t player_id;
+    uint16_t land_id;
+    uint32_t world_seq;
+    uint8_t  has_letter;
+    uint8_t  _reserved0[3];
+    uint8_t  letter[258]; /* raw Anmplmail_c bytes; meaningful only when has_letter */
+} PCNetGameFriendshipSnapshotEntryMsg;
+_Static_assert(sizeof(PCNetGameFriendshipSnapshotEntryMsg) == 292,
+               "PCNetGameFriendshipSnapshotEntryMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameFriendshipSnapshotEntryMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameFriendshipSnapshotEntryMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* client -> host only, reliable. Sent from mNpc_SendMailtoNpc()'s client-intercept branch INSTEAD
+ * OF running the real function locally (which would mutate this client's own copy of the shared
+ * villager's Anmmem_c out of authority). `mail` is a raw, opaque copy of the decomp Mail_c the
+ * player composed at the post office (flat/POD, no pointers -- verified against m_mail.h, same
+ * "safe to transmit, not decoded here" treatment PCNetGameIdentity's player_name/land_name and
+ * PCNetPlayerAppearance's design_record already get in this file). */
+typedef struct PCNetGameMailRequestMsg {
+    uint8_t msg_type; /* PC_NETGAME_MSG_MAIL_REQUEST */
+    uint8_t _reserved0[3];
+    uint8_t mail[298]; /* raw Mail_c bytes; sizeof(Mail_c) _Static_assert'd in m_npc.c's PC helper */
+} PCNetGameMailRequestMsg;
+_Static_assert(sizeof(PCNetGameMailRequestMsg) == 302, "PCNetGameMailRequestMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameMailRequestMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameMailRequestMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* host -> every READY client, reliable, world_seq-stamped (same shared s_world_seq counter, same
+ * strict `>` rule as FRIENDSHIP_UPDATE -- a one-shot delta result). Sent after the host has already
+ * run the real mail-delivery logic (mNpc_PcApplyMailToVillagerMemory(), m_npc.c) against its own
+ * authoritative Anmmem_c. friendship is redundant with any FRIENDSHIP_UPDATE the same delivery also
+ * triggers (mNpc_SendMailtoNpc() calls mNpc_AddFriendship() internally) -- included anyway so a
+ * client that applies this message alone (e.g. one that joins between the two broadcasts) still ends
+ * up fully consistent, matching WORLD_META's "always carry every sub-state's current value" policy. */
+typedef struct PCNetGameMailDeliveredMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_MAIL_DELIVERED */
+    uint8_t  slot;
+    int8_t   friendship;
+    uint8_t  letter_info;
+    uint8_t  player_name[PC_NETGAME_NAME_LEN];
+    uint8_t  land_name[PC_NETGAME_LAND_LEN];
+    uint16_t player_id;
+    uint16_t land_id;
+    uint32_t world_seq;
+    uint8_t  letter[258];
+} PCNetGameMailDeliveredMsg;
+_Static_assert(sizeof(PCNetGameMailDeliveredMsg) == 288, "PCNetGameMailDeliveredMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameMailDeliveredMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameMailDeliveredMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
 /* v2: host -> every READY client that is NOT mid-snapshot, reliable, when the host's Save
  * all_grow_renew_time changes (daily renewal), OR (weather + Stalk Market milestone) when
@@ -715,7 +1083,8 @@ typedef struct PCNetGameWorldMetaMsg {
     PCNetGameRtcWire renew_time;
     PCNetGameWorldStateWire world_state;
 } PCNetGameWorldMetaMsg;
-_Static_assert(sizeof(PCNetGameWorldMetaMsg) == 44, "PCNetGameWorldMetaMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWorldMetaMsg) == 48, "PCNetGameWorldMetaMsg wire size drifted"); /* 46
+    logical bytes padded to 48 for uint32_t alignment -- see PCNetGameSnapshotEndMsg's assert above */
 _Static_assert(sizeof(PCNetGameWorldMetaMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameWorldMetaMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
@@ -790,6 +1159,285 @@ _Static_assert(sizeof(PCNetGameDropResultMsg) == 12, "PCNetGameDropResultMsg wir
 _Static_assert(sizeof(PCNetGameDropResultMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameDropResultMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
+/* World Ecology milestone (Stage 1): client -> host only. Deliberately ONE ROUND TRIP -- unlike
+ * PICKUP/DROP's two-phase (provisional accept + separate CONFIRM), both actions below commit their
+ * field write synchronously, inside the SAME host function call that validates the request and
+ * before it replies -- see pcnetgame_handle_host_field_action_request(). This is safe without a
+ * provisional-reservation window because the host processes one incoming message to completion
+ * before the next: a second request for the same tile (a retry, or two players racing) is validated
+ * against whatever the FIRST request already committed, so it naturally fails closed (deposit
+ * already cleared / hit-count window already advanced) with no explicit reservation table needed.
+ * PICKUP's two-phase design exists for a DIFFERENT reason this stage's two actions don't share: an
+ * accepted pickup could still fail client-side (pockets full) after the field already appeared to
+ * commit, so it needs the client's own confirmation before the host actually removes the item. Both
+ * actions here either need no client-side step at all (MONEY_ROCK_HIT), or the caller already
+ * verified a free pocket slot BEFORE ever sending the request (DIG_BURIED -- see
+ * pc_net_game_request_dig_buried()'s own doc) or by the same 5A pattern.
+ * ut_x/ut_z are global town-tile coordinates, exactly like PCNetGamePickupRequestMsg's own.
+ * request_id is this connection's own monotonically advancing counter (shared across both kinds --
+ * see s_next_field_action_request_id), meaningful only paired with the sender's PCNetPeerId. */
+#define PC_NETGAME_FIELD_ACTION_KIND_DIG_BURIED   1u
+#define PC_NETGAME_FIELD_ACTION_KIND_MONEY_ROCK_HIT 2u
+/* World Ecology T1: tree shake (fruit/furniture/bells/bee-birth drop, or a bee-tree's destination-tree
+ * conversion only) and tree chop (host-tracked cut-count decrement, drop resolution, eventual stump) --
+ * see pc_net_game_request_tree_shake()/pc_net_game_request_tree_chop() (pc_net_game.h) and
+ * pcnetgame_host_commit_tree_shake()/pcnetgame_host_commit_tree_chop() below. */
+#define PC_NETGAME_FIELD_ACTION_KIND_TREE_SHAKE 3u
+#define PC_NETGAME_FIELD_ACTION_KIND_TREE_CHOP  4u
+/* World Ecology T-dig (dig/pitfall/shine family): kinds 5-8. DIG_BURIED (kind 1, above) is EXTENDED --
+ * not replaced -- to also accept the "buried pitfall being dug up" signature (deposit OFF, tile in
+ * BURIED_PITFALL_HOLE00..24) and resolve it to ITM_PITFALL; see pcnetgame_validate_and_resolve_dig()'s
+ * own updated doc. The four kinds below are genuinely new outcomes DIG_BURIED's own shape cannot
+ * express (no item granted, or a fundamentally different tile transition):
+ *   DIG_HOLE        digging a brand-new hole into EMPTY_NO ground, or removing a flower/stump/sapling/
+ *                    grass tuft (mFI_CheckDigRemoveItem()'s own list, m_field_info.c) -- grants NOTHING
+ *                    (a removed plant flies off and fades; it is never placed in a pocket -- see
+ *                    pcnetgame_fa_validate_adapter_dig_hole()'s own doc for the historical confusion
+ *                    this corrects). Commits tile -> HOLE_START + the client-supplied, RANGE-VALIDATED
+ *                    hole_variant (0..24), deposit OFF.
+ *   FILL_HOLE       filling an existing EMPTY hole (deposit OFF) back in. Commits tile -> EMPTY_NO.
+ *   PITFALL_CONSUME a player/villager falling INTO an already-buried pitfall (a *trigger*, distinct
+ *                    from DIGGING one up, which stays on the extended DIG_BURIED path above). Commits
+ *                    tile -> EMPTY_NO directly (skips vanilla's transient HOLE_n stage -- safe since no
+ *                    item is ever granted on this path). Client plays its fall animation optimistically,
+ *                    unconditionally, before the RESULT ever arrives (see
+ *                    pc_net_game_request_pitfall_consume()'s own doc).
+ *   DIG_SHINE       digging up an UNBURIED SHINE_SPOT (deposit OFF). Commits tile -> HOLE_SHINE
+ *                    unconditionally; hole_variant is ignored for this kind (a shine hole is not
+ *                    variant-shaped). Grants NOTHING host-side -- the digging CLIENT rolls its own bell
+ *                    amount locally and grants it privately on accept (matches vanilla's per-digger-luck
+ *                    design; no duplication risk since only one digger can win the tile-consumption
+ *                    race). */
+#define PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE        5u
+#define PC_NETGAME_FIELD_ACTION_KIND_FILL_HOLE       6u
+#define PC_NETGAME_FIELD_ACTION_KIND_PITFALL_CONSUME 7u
+#define PC_NETGAME_FIELD_ACTION_KIND_DIG_SHINE       8u
+/* World Ecology: snowmen -- breaking an existing snowman (kind 9) reuses this SAME
+ * FIELD_ACTION_REQUEST/FIELD_ACTION_RESULT pair; granted_item is always 0 (nothing is granted --
+ * see aPSM_actor_move(), ac_psnowman.c). Building a NEW snowman is a separate, dedicated
+ * request/result pair (PCNetGameSnowmanBuildRequestMsg/PCNetGameSnowmanBuildResultMsg below), not a
+ * FIELD_ACTION kind, because unlike every kind above it needs no reach/IN_TOWN precondition at all
+ * (see pc_net_game_request_snowman_build()'s own doc, pc_net_game.h). */
+#define PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK 9u
+/* Protocol v3: widened from 8 to 12 bytes to add `hole_variant` -- the CLIENT's own proposed hole-shape
+ * pick (0..24, mirroring HOLE_START..HOLE_END's own range), used ONLY by DIG_HOLE (kind 5) and the
+ * pitfall-dig sub-case of the extended DIG_BURIED (kind 1); every other kind (2/3/4/6/7/8/9) ignores it
+ * and every sender explicitly sets it to 0 for those kinds (see each pc_net_game_request_*() below).
+ * TRUST BOUNDARY: this is authoritative, persisted tile-shape state once committed, NOT a cosmetic
+ * hint -- the host MUST range-check it (0..24) before ever using it to compute HOLE_START + variant;
+ * an out-of-range value is rejected outright rather than clamped, so a forged/corrupted value can never
+ * write an unintended tile value (see pcnetgame_validate_hole_variant()). kind/ut_x/ut_z/request_id
+ * keep their EXACT pre-v3 offsets/meanings -- only `hole_variant` + 3 bytes of trailing padding were
+ * appended; a v2 hole-variant-unaware kind (1-4, 9) still reads correctly as long as both ends agree on
+ * the (now 12-byte) size, which is exactly why the protocol version bump forces that agreement instead
+ * of letting an old 8-byte peer silently misparse the new layout. */
+typedef struct PCNetGameFieldActionRequestMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_FIELD_ACTION_REQUEST */
+    uint8_t  kind;          /* PC_NETGAME_FIELD_ACTION_KIND_* */
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint32_t request_id;
+    uint8_t  hole_variant;  /* 0..24 -- DIG_HOLE / DIG_BURIED's pitfall sub-case only; 0 for every other
+                                kind. TRUST BOUNDARY -- see this struct's own doc above. */
+    uint8_t  _reserved0;
+    uint16_t _reserved1;
+} PCNetGameFieldActionRequestMsg;
+_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 12, "PCNetGameFieldActionRequestMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameFieldActionRequestMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* World Ecology milestone (Stage 1): host -> the one requesting client only. accepted == 0 is a
+ * final rejection (nothing was committed, nothing to undo). accepted == 1 means the host ALREADY
+ * committed the field write(s) for this action (see PCNetGameFieldActionRequestMsg's own doc) --
+ * every client, including the requester, also converges on the tile via the ordinary FIELD_UPDATE
+ * broadcast pcfa_set_tile() already triggers; this message additionally carries whatever the
+ * REQUESTER alone needs to finish its own side:
+ *   DIG_BURIED       granted_item is the item to grant into a free pocket slot (never re-derived
+ *                    locally -- see pcnetgame_handle_client_field_action_result()). Never a
+ *                    present/dummy sentinel (resolved once, host-side, exactly like
+ *                    pcnetgame_resolve_pickup_item()).
+ *   MONEY_ROCK_HIT   granted_item is unused (always 0) -- the dropped money bag is an entirely
+ *                    ordinary field item (Bug 4 fix) and is picked up later through the completely
+ *                    ordinary pickup path, exactly like any other dropped item. */
+typedef struct PCNetGameFieldActionResultMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_FIELD_ACTION_RESULT */
+    uint8_t  kind;          /* PC_NETGAME_FIELD_ACTION_KIND_* */
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint32_t request_id;
+    uint16_t granted_item;
+    uint8_t  ut_z;
+    uint8_t  _reserved0;
+} PCNetGameFieldActionResultMsg;
+_Static_assert(sizeof(PCNetGameFieldActionResultMsg) == 12, "PCNetGameFieldActionResultMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameFieldActionResultMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameFieldActionResultMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* World Ecology T3 (host-authoritative bury): client -> host only, reliable, 12 bytes. Mirrors
+ * PICKUP_REQUEST/DROP_REQUEST's two-phase shape (reserve -> the client does its own inventory step ->
+ * INTERACT_CONFIRM), not FIELD_ACTION_REQUEST's synchronous one-shot shape, because
+ * bIT_common_bury_after()/bIT_common_hole_throw() (bg_item_common.c_inc) show burying removes an item
+ * from a POCKET SLOT first -- exactly PICKUP/DROP's own "client must confirm its local inventory step
+ * actually happened before the host commits the field" problem, not DIG_BURIED/MONEY_ROCK_HIT's
+ * "nothing client-side can fail" one.
+ * pocket_slot_idx/claimed_item are a TRUST BOUNDARY exactly like DROP_REQUEST's own (the host holds no
+ * shadow of any remote player's inventory) -- the host never assumes claimed_item is actually in the
+ * requester's pocket; pcnetgame_is_buryable_item() classifies it on its own claimed value alone.
+ * hole_variant is the client's own locally-computed mCoBG_GetHoleNumber(shovel_pos) result (0..24), or
+ * 0xFF for that function's -1 ("no valid hole shape") sentinel. UNLIKE the T0 scaffolding's original
+ * claim, this field is NOT purely cosmetic: it is AUTHORITATIVE for exactly one sub-case -- burying
+ * ITM_PITFALL into a HOLE_SHINE tile (the host can derive the hole's shape itself from the tile value
+ * for an ordinary HOLE00..24 target, but a HOLE_SHINE tile carries no shape information of its own, so
+ * the client's own locally-computed hole_variant is trusted there; see the BURY commit branch in
+ * pcnetgame_handle_host_confirm() for the exact rule). Every OTHER bury outcome discards this field
+ * entirely (the host derives the hole shape itself from its own re-read tile, or the outcome doesn't
+ * need one at all) -- so "never trusted for gameplay outcome" remains true for every case except that
+ * one, which is called out explicitly at its own point of use. request_id is this connection's own
+ * counter, mirroring DROP_REQUEST's own retry/dedup pattern. */
+typedef struct PCNetGameBuryRequestMsg {
+    uint8_t  msg_type;         /* PC_NETGAME_MSG_BURY_REQUEST */
+    uint8_t  pocket_slot_idx;  /* 0..mPr_POCKETS_SLOT_COUNT-1 -- mirrors PCNetGameDropRequestMsg's own */
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t claimed_item;     /* TRUST BOUNDARY -- mirrors PCNetGameDropRequestMsg's own claimed_item */
+    uint8_t  hole_variant;     /* AUTHORITATIVE for PITFALL-into-HOLE_SHINE only -- see doc above */
+    uint8_t  _reserved0;       /* always sent 0 */
+    uint32_t request_id;
+} PCNetGameBuryRequestMsg;
+_Static_assert(sizeof(PCNetGameBuryRequestMsg) == 12, "PCNetGameBuryRequestMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameBuryRequestMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameBuryRequestMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* World Ecology T3: host -> the one requesting client only, reliable, 12 bytes. Mirrors
+ * PCNetGameDropResultMsg's exact shape: accepted == 1 is PROVISIONAL (reserve; the client must still
+ * answer INTERACT_CONFIRM), accepted == 0 is a final rejection.
+ *   buried_item  on ACCEPT: echoes the client's own claimed_item back (a cross-check against the
+ *                client's own pending record, mirroring DROP_RESULT's placed_item echo -- never the
+ *                RESOLVED outcome tile: the resolved sapling/flower/pitfall/plain-bury tile value is
+ *                delivered to every client, including this one, through the ordinary ambient
+ *                FIELD_UPDATE broadcast the commit triggers, exactly like every other two-phase
+ *                interaction). On REJECT: the HOST's CURRENT actual tile value at (ut_x, ut_z),
+ *                re-read fresh at send time (never a value captured earlier) -- the reconciliation
+ *                echo, following the same pattern already proven for PITFALL_CONSUME's reject echo
+ *                (pcnetgame_fa_pitfall_consume_echo_current()). Meaningful only when flags'
+ *                RECONCILE_VALID bit is set.
+ *   flags        bit0 PC_NETGAME_BURY_FLAG_RECONCILE_VALID: set whenever buried_item on a REJECT is a
+ *                genuine current-tile echo (vs. simply 0 because the tile couldn't even be resolved).
+ *                bit1 PC_NETGAME_BURY_FLAG_DEPOSIT_ON: the CURRENT deposit-bit state of that tile --
+ *                needed because, unlike PITFALL_CONSUME (whose reject post-states are always deposit
+ *                OFF), a bury race can leave deposit ON (another peer's bury already committed there),
+ *                and the client must apply it via the same (value, dep_valid, dep_on) triple
+ *                pcnetgame_client_apply_tile() already uses for FIELD_UPDATE, not just the raw value.
+ *   reason       diagnostic only, PC_NETGAME_BURY_REASON_* (0 = unused/none); never load-bearing --
+ *                the client's accept/reject branch already fully determines its own behavior from
+ *                accepted/flags/buried_item alone. */
+#define PC_NETGAME_BURY_FLAG_RECONCILE_VALID 0x01u
+#define PC_NETGAME_BURY_FLAG_DEPOSIT_ON      0x02u
+#define PC_NETGAME_BURY_REASON_NONE 0u
+typedef struct PCNetGameBuryResultMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_BURY_RESULT */
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint32_t request_id;
+    uint16_t buried_item;
+    uint8_t  flags;         /* PC_NETGAME_BURY_FLAG_* -- see doc above (was _reserved0's low byte) */
+    uint8_t  reason;        /* PC_NETGAME_BURY_REASON_* -- diagnostic only (was _reserved0's high byte) */
+} PCNetGameBuryResultMsg;
+_Static_assert(sizeof(PCNetGameBuryResultMsg) == 12, "PCNetGameBuryResultMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameBuryResultMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameBuryResultMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* World Ecology: snowmen. Client -> host only, reliable, 12 bytes. Sent from
+ * aSNOWMAN_Set_PSnowman_info() (ac_snowman.c) -- see pc_net_game_request_snowman_build()'s own doc
+ * (pc_net_game.h) for why this has no reach/IN_TOWN precondition on the sender. head_size/body_size/
+ * score are the exact 0..255 (0..3 for score) fields mSN_snowman_info_c.data (m_snowman.h) already
+ * carries -- a TRUST BOUNDARY like every other claimed/raw client-asserted field in this file
+ * (score is clamped, not rejected, if it somehow arrives above 3 -- see
+ * pcnetgame_handle_host_snowman_build_request()'s own doc). request_id is this connection's own
+ * counter (shares s_next_field_action_request_id's space -- meaningful only paired with the sender's
+ * PCNetPeerId, never persisted). */
+typedef struct PCNetGameSnowmanBuildRequestMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_SNOWMAN_BUILD_REQUEST */
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint8_t  head_size;
+    uint8_t  body_size;
+    uint8_t  score;
+    uint16_t _reserved0;
+    uint32_t request_id;
+} PCNetGameSnowmanBuildRequestMsg;
+_Static_assert(sizeof(PCNetGameSnowmanBuildRequestMsg) == 12, "PCNetGameSnowmanBuildRequestMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameSnowmanBuildRequestMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameSnowmanBuildRequestMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* World Ecology: snowmen. Host -> the one requesting client only, reliable, 12 bytes. accepted == 1
+ * means the host already committed Save_t.snowmen/the field tile/the completion dates (see
+ * pcnetgame_handle_host_snowman_build_request()) -- every client, including the requester, also
+ * converges via the ordinary FIELD_UPDATE broadcast pcfa_set_tile() triggers PLUS the dedicated
+ * PC_NETGAME_MSG_SNOWMAN_STATE broadcast (slot/head/body/score/dates -- data a bare tile value can't
+ * carry). `slot` is the Save_t.snowmen.snowmen_data[] index the host actually used (0xFF when
+ * rejected). `reason` is only meaningful when accepted == 0: SLOTS_FULL (1, every slot already
+ * occupied -- matches vanilla's own silent-drop-on-full, no queueing), TILE_INVALID (2, the target
+ * tile could not host a new snowman), NOT_READY (3, host world/save not ready). The client has nothing
+ * to visually undo on a rejection -- the local two-half snowman actor is already gone (Actor_delete()
+ * already ran) by the time this arrives; it is only ever logged (see
+ * pcnetgame_handle_client_snowman_build_result()). */
+#define PC_NETGAME_SNOWMAN_REASON_NONE         0u
+#define PC_NETGAME_SNOWMAN_REASON_SLOTS_FULL   1u
+#define PC_NETGAME_SNOWMAN_REASON_TILE_INVALID 2u
+#define PC_NETGAME_SNOWMAN_REASON_NOT_READY    3u
+typedef struct PCNetGameSnowmanBuildResultMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_SNOWMAN_BUILD_RESULT */
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint32_t request_id;
+    uint8_t  slot;
+    uint8_t  reason;
+    uint16_t _reserved0;
+} PCNetGameSnowmanBuildResultMsg;
+_Static_assert(sizeof(PCNetGameSnowmanBuildResultMsg) == 12, "PCNetGameSnowmanBuildResultMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameSnowmanBuildResultMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameSnowmanBuildResultMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* World Ecology: snowmen. Host -> every READY client, reliable, world_seq-stamped like WORLD_META --
+ * but stamped with its OWN independent sequence (s_snowman_world_seq / s_client_snowman_seq), never
+ * s_world_seq, because this carries off-tile snowman data (size/score/dates) that changes on a
+ * completely different cadence (build/break/melt) than the ordinary field diff. UNLIKE WORLD_META (and
+ * pcnetgame_broadcast_villager_msg()'s own convention), this deliberately does NOT skip a peer whose
+ * snap_active is set: it is a full, idempotent, self-contained snapshot of ALL THREE slots + all 4
+ * date bytes, with no SNAPSHOT_END fallback ever carrying it, so a peer mid-snapshot still needs every
+ * broadcast to converge (see pcnetgame_broadcast_snowman_state()'s own doc). `flags` bit 0
+ * (IN_SNAPSHOT) is set only on the one copy sent as part of a peer's own late-join/RESYNC_REQUEST
+ * snapshot sequence (pcnetgame_host_pump_snapshots()) -- purely informational, never checked on
+ * receipt. `snowmen[12]` is Save_t.snowmen.snowmen_data[3] (mSN_snowman_data_c, 4 bytes each: exists,
+ * head_size, body_size, score), copied element-wise, byte-for-byte -- no byte-swap needed, every field
+ * is u8. year/month/day/hour are Save_t.snowman_year/month/day/hour -- NOT contiguous with
+ * snowmen_data in Save_t (m_common_data.h), so these 16 bytes are gathered by hand, never memcpy'd as
+ * one block (see pcnetgame_build_snowman_state_bytes()). The client applies iff received world_seq >=
+ * its own s_client_snowman_seq, after independently re-validating every field against the exact same
+ * rules sChk_snowman_save_check() (save_check_take.c_inc) already enforces for a loaded save --
+ * dropped and logged, never applied, on failure (see pcnetgame_handle_client_snowman_state()). */
+#define PC_NETGAME_SNOWMAN_STATE_FLAG_IN_SNAPSHOT 0x01u
+typedef struct PCNetGameSnowmanStateMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_SNOWMAN_STATE */
+    uint8_t  flags;         /* PC_NETGAME_SNOWMAN_STATE_FLAG_* */
+    uint16_t _reserved0;
+    uint32_t world_seq;
+    uint8_t  snowmen[12];   /* Save_t.snowmen.snowmen_data[3], 4 bytes/slot: exists, head, body, score */
+    uint8_t  year;
+    uint8_t  month;
+    uint8_t  day;
+    uint8_t  hour;
+} PCNetGameSnowmanStateMsg;
+_Static_assert(sizeof(PCNetGameSnowmanStateMsg) == 24, "PCNetGameSnowmanStateMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameSnowmanStateMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameSnowmanStateMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+_Static_assert(sizeof(((PCNetGameSnowmanStateMsg*)0)->snowmen) == 12 &&
+                   sizeof(mSN_snowman_data_c) == 4 && mSN_SAVE_COUNT == 3,
+               "PCNetGameSnowmanStateMsg.snowmen size drifted from Save_t.snowmen.snowmen_data[3]");
+
 /* Two-phase interactions: client -> host, reliable, exactly 8 bytes (little-endian, natural
  * alignment). Answers a provisional RESULT (accepted == 1) -- or withdraws from a request the client
  * gave up on / lost state for. The host only acts on it if (peer READY, kind matches, request_id ==
@@ -802,6 +1450,14 @@ _Static_assert(sizeof(PCNetGameDropResultMsg) <= PC_NET_MAX_PAYLOAD,
  *   reason   PC_NETGAME_CONFIRM_REASON_* (informational; 0 for a COMMIT) */
 #define PC_NETGAME_INTERACT_KIND_PICKUP 1u
 #define PC_NETGAME_INTERACT_KIND_DROP   2u
+#define PC_NETGAME_INTERACT_KIND_BURY   3u /* World Ecology T3 -- see PCNetGameBuryRequestMsg's doc. The
+                                            * generic INTERACT_CONFIRM dispatch
+                                            * (pcnetgame_handle_host_confirm()) still finds this kind's
+                                            * PENDING record via pcnetgame_host_interaction() exactly
+                                            * like PICKUP/DROP, but COMMIT for this kind branches into
+                                            * its own bury-specific outcome resolution/tile write instead
+                                            * of the generic pickup/drop logic -- see that function's own
+                                            * BURY branch. */
 #define PC_NETGAME_CONFIRM_ABORT  0u
 #define PC_NETGAME_CONFIRM_COMMIT 1u
 #define PC_NETGAME_CONFIRM_REASON_NONE          0u
@@ -855,6 +1511,19 @@ _Static_assert(sizeof(PCNetGameInteractConfirmMsg) <= PC_NET_MAX_PAYLOAD,
  * terrain height variation within one tile. */
 #define PC_NETGAME_DROP_MAX_REACH_Y 40.0f
 
+/* World Ecology T1: tree shake/chop's own reach bound -- deliberately a SEPARATE constant/check from
+ * pickup's PC_NETGAME_PICKUP_MAX_REACH_SQ (see pcnetgame_tree_reach_check(), further down, which is a
+ * full standalone duplicate of pcnetgame_field_action_reach_check()'s math, not a refactor of it, so
+ * DIG_BURIED/MONEY_ROCK_HIT's existing reach check is left completely untouched -- this milestone runs
+ * concurrently with other workstreams touching this same file). Vanilla's own tree collision
+ * (mCoBG_CheckPlace() against a full-size tree's hit volume) keeps a player's ROOT position noticeably
+ * farther from a trunk's own center than pickup's ~50-unit envelope already assumes for a hand-reach
+ * pickup -- 80 is a deliberately generous starting bound with the same anti-cheat intent (catch "claims
+ * to be on the other side of the map"), not a pixel-accurate reach model; see this task's own design
+ * brief for the reasoning and the note that it should be tuned via a focused test if one becomes
+ * practical in this sandbox. */
+#define PC_NETGAME_TREE_REACH_SQ (80.0f * 80.0f)
+
 /* Any peer-supplied world coordinate must be finite and within +/- this many world units. The whole
  * town is ~6400 x ~7680 units, so 100000 is generous slack for a legitimate sample while making NaN/
  * Inf/1e30 (which make a naive `dist > MAX` reach check FAIL OPEN, since every comparison with NaN
@@ -900,6 +1569,115 @@ static uint32_t s_local_move_send_counter = 0; /* this process's own per-send co
 static float s_move_rate_log_accum = 0.0f;
 static int   s_move_send_count_this_window = 0;
 #define PC_NETGAME_MOVE_RATE_LOG_PERIOD_60FPS_FRAMES 60.0f /* ~1s */
+
+/* N2 villager movement sync tuning constants (named so they're easy to find and retune later, same
+ * convention as the Stage 3 player-movement constants above -- see pc_net_game.h's design note above
+ * pc_net_game_notify_npc_move() for the full rationale).
+ *
+ * Send rate: matches the player stream exactly (PC_NETGAME_MOVE_SEND_RATE_HZ) -- no reason for
+ * villager walking, which is slower and smoother than player dashing, to need a HIGHER rate, and
+ * matching it keeps one throttle mental model for the whole file.
+ *
+ * Interpolation delay: shorter than the player's PC_REMOTE_PLAYER_INTERP_DELAY_FRAMES (9.0, ~150ms,
+ * pc_remote_player.c) because a villager's presentation has much lower stakes than another player's
+ * avatar (no interactive collision with the local player driven by this position, no aim/reach
+ * checks) -- 6 frames (~100ms) still comfortably covers one full send period (3 frames at 20Hz) plus
+ * slack for jitter, while shaving visible lag off what is, after all, a background character.
+ *
+ * Teleport threshold: PC_REMOTE_PLAYER_TELEPORT_DIST_SQ (400^2) is sized for the player's dash speed;
+ * a villager's fastest real gait (aNPC_spd_data's RUN entry) is far slower, so one real 1/20s tick of
+ * villager movement is a much shorter hop than for a dashing player. 150 world units is roughly
+ * triple a plausible single-tick run-speed displacement -- generous slack against jitter/latency
+ * spikes while still catching the actual discontinuities N2 needs to snap across (see Part 8: an
+ * acre/scene/house-entry teleport, or the off-screen-simulation handoff described in
+ * PCNetGameNpcMoveMsg's own doc comment above). */
+#define PC_NETGAME_NPC_MOVE_SEND_RATE_HZ 20.0f
+#define PC_NETGAME_NPC_MOVE_SEND_PERIOD_60FPS_FRAMES (60.0f / PC_NETGAME_NPC_MOVE_SEND_RATE_HZ)
+#define PC_NETGAME_NPC_MOVE_INTERP_DELAY_FRAMES 6.0
+#define PC_NETGAME_NPC_MOVE_TELEPORT_DIST_SQ (150.0f * 150.0f)
+#define PC_NETGAME_NPC_MOVE_RING_SIZE 4
+/* Below this squared per-straddling-pair displacement, treat the villager as stationary for
+ * walk-vs-idle animation purposes -- small enough to never mistake real walking for idle, large
+ * enough to absorb float noise/near-zero jitter from a villager that is genuinely standing still. */
+#define PC_NETGAME_NPC_MOVE_MOVING_DIST_SQ (0.25f * 0.25f)
+
+/* One accepted movement sample for one villager slot, timestamped in THIS process's own
+ * graph_dt_frame_time() domain at the moment it was accepted -- exactly PCRemoteMoveSnapshot's own
+ * convention (pc_remote_player.c), reused here rather than duplicating a third representation. */
+typedef struct PCNetNpcMoveSnapshot {
+    double  recv_local_frame;
+    float   pos_x, pos_y, pos_z;
+    int16_t facing_angle;
+} PCNetNpcMoveSnapshot;
+
+/* Per-Save_t.animals[]-slot receive-side state (client only; the host never populates this). */
+typedef struct PCNetNpcMoveSlot {
+    uint16_t cached_npc_id;       /* npc_id carried by the most recently ACCEPTED sample for this
+                                    * slot -- pc_net_game_get_npc_move_pose()'s slot-reuse guard
+                                    * compares the CALLER's live Save_t.animals[slot].id.npc_id
+                                    * against this at consume time; see pc_net_game.h's doc. */
+    uint32_t last_accepted_frame;
+    int      have_frame;          /* 0 until the first sample for this slot ever arrives (frame 0 is
+                                    * a legitimate value, so this can't be inferred from frame alone) */
+    uint8_t  last_action_type;    /* N3 Channel A: latest accepted action_type for this slot -- coarse
+                                    * and deliberately NOT interpolated between snapshots (an action
+                                    * type has no "halfway" value); applied as-is the instant a new
+                                    * sample is accepted. */
+    int      snapshot_count;
+    int      snapshot_head;
+    PCNetNpcMoveSnapshot snapshots[PC_NETGAME_NPC_MOVE_RING_SIZE];
+} PCNetNpcMoveSlot;
+
+static PCNetNpcMoveSlot s_npc_move_slot[ANIMAL_NUM_MAX];       /* client-side receive/interpolation state */
+static float            s_npc_move_send_accum[ANIMAL_NUM_MAX]; /* host-side per-slot send throttle */
+static uint32_t         s_npc_move_send_counter = 0;           /* host-side: this process's own
+                                                                 * per-send counter, shared across every
+                                                                 * slot -- see PCNetGameNpcMoveMsg.frame's
+                                                                 * doc comment above */
+
+/* N3 Channel B: host-side per-slot shadow of the last BROADCAST is_home/hide/forced_type/
+ * forced_active, used by pc_net_game_notify_npc_state()'s dirty-check (see its own doc comment for
+ * why forced_timer's continuous countdown is tracked as forced_active -- active/inactive -- rather
+ * than by exact value, to avoid broadcasting every single frame). have_sent is 0 until the first
+ * check for a slot (so the very first observed state, even if it happens to equal the struct's
+ * zero-init, is still sent once). */
+/* N3 finalization pass (Bug 2 fix): the shadow used to be keyed by slot ONLY, with no record of which
+ * npc_id it represented. That meant: villager A (slot N) broadcasts state X, departs, and villager B
+ * (slot N) arrives with state that happens to equal X byte-for-byte -- the dirty-check below saw "no
+ * change" and silently never broadcast B's initial state, leaving the client stuck on stale/default
+ * values until some later real change. cached_npc_id fixes this: a sample whose npc_id doesn't match
+ * the shadow's stored npc_id is unconditionally treated as dirty regardless of value equality. The
+ * shadow is also explicitly reset (have_sent=0) at every population-changing event -- see
+ * pc_net_game_notify_villager_arrival()/_departure() -- and at full session reset (already existing,
+ * see pc_net_game_host_start()). */
+typedef struct PCNetNpcStateShadow {
+    int      have_sent;
+    uint16_t cached_npc_id;
+    uint8_t  is_home;
+    uint8_t  hide;
+    uint8_t  forced_type;
+    uint8_t  forced_active; /* forced_timer_remaining > 0 */
+} PCNetNpcStateShadow;
+static PCNetNpcStateShadow s_npc_state_shadow[ANIMAL_NUM_MAX]; /* host-side only */
+static uint32_t            s_npc_state_seq_counter = 0;        /* host-side: global monotonic, shared
+                                                                 * across every slot (see
+                                                                 * PCNetGameNpcStateMsg.state_seq's doc) */
+
+/* Client-side: latest APPLIED NPC_STATE per slot, plus the per-slot last-applied state_seq for the
+ * strict-`>` staleness/slot-reuse guard (see pc_net_game_get_npc_move_pose()'s own identity-guard
+ * doc comment for the established pattern this mirrors -- npc_id is re-checked at CONSUME time
+ * against the caller's own live Save_t.animals[slot].id.npc_id, never trusted from receive time
+ * alone). */
+typedef struct PCNetNpcStateSlot {
+    int      have_state;
+    uint16_t cached_npc_id;
+    uint32_t last_applied_seq;
+    uint8_t  is_home;
+    uint8_t  hide;
+    uint8_t  forced_type;
+    uint16_t forced_timer_remaining;
+} PCNetNpcStateSlot;
+static PCNetNpcStateSlot s_npc_state_slot[ANIMAL_NUM_MAX]; /* client-side receive state */
 
 /* Stage 4C-1 (one-shot-UDP-loss fix): low-frequency periodic appearance resend. (Originally added
  * when PC_NET_RELIABLE did not retransmit; the transport is now reliable + ordered per peer, so
@@ -973,14 +1751,23 @@ typedef enum PCNetGameHostPhase {
 typedef struct PCNetGameHostInteraction {
     uint32_t request_id;        /* the request this record answers */
     uint32_t reserved_since_ms; /* pcnetgame_now_ms() when it became PENDING (unsigned, wrap-safe compare) */
-    uint16_t item;              /* pickup: resolved granted item; drop: item to place */
-    uint16_t raw_item;          /* pickup: the raw field value observed at reservation; drop: unused */
+    uint16_t item;              /* pickup: resolved granted item; drop: item to place; bury: the
+                                    requester's claimed_item (the item being buried) */
+    uint16_t raw_item;          /* pickup: the raw field value observed at reservation; drop: unused;
+                                    bury: the target tile's raw value observed AT RESERVATION time (a
+                                    HOLE00..24 or HOLE_SHINE value) -- re-checked unchanged at COMMIT */
     uint8_t  phase;             /* PCNetGameHostPhase */
     uint8_t  accepted;          /* the cached provisional/final decision (1 = accepted) */
     uint8_t  ut_x;
     uint8_t  ut_z;
     uint8_t  acre;              /* persistent address of the reserved tile (meaningful when accepted) */
     uint8_t  tile;
+    uint8_t  hole_variant;      /* World Ecology T3: bury only -- the requester's own claimed
+                                    hole_variant (0..24, or 0xFF), captured at reservation time and
+                                    consumed at COMMIT for the PITFALL-into-HOLE_SHINE sub-case (see
+                                    PCNetGameBuryRequestMsg's doc). Memory-only: never echoed back on
+                                    the wire except via the general reconciliation mechanism. Always 0
+                                    for PICKUP/DROP records. */
     uint8_t  prev_valid;        /* 1: prev_request_id is the request this record REPLACED after that one's
                                  * reservation was released (ABORTED/EXPIRED). A retry of exactly that id is
                                  * answered accepted=0 instead of being processed as a new request -- so a
@@ -1065,6 +1852,82 @@ _Static_assert((PC_NETGAME_PICKUP_MAX_RETRIES + 1) * 500u < PC_NETGAME_CONFIRM_T
  * pcnetgame_reset_host_pickup_state(). */
 static PCNetGameHostInteraction s_host_drop_state[PC_NET_MAX_PEERS];
 
+/* World Ecology T3: host-only BURY record per peer -- same type, phases and reasoning as
+ * s_host_pickup_state/s_host_drop_state above (see PCNetGameHostInteraction's doc), kept in its own
+ * array for the same "don't conflate different kinds' retries" reason: a peer may have a pickup, a
+ * drop, AND a bury pending simultaneously, fully independently. item/raw_item/hole_variant are set by
+ * pcnetgame_handle_host_bury_request() at reservation time and consumed by the BURY branch of
+ * pcnetgame_handle_host_confirm() at COMMIT. Reset on disconnect and defensively on fresh READY via
+ * pcnetgame_reset_host_bury_state(), exactly mirroring the pickup/drop precedent. */
+static PCNetGameHostInteraction s_host_bury_state[PC_NET_MAX_PEERS];
+
+/* World Ecology milestone (Stage 1): host-only, per-peer dedup for the last PROCESSED
+ * FIELD_ACTION_REQUEST (both kinds share one slot per peer -- a peer only ever has one field action
+ * animation/interaction active client-side at a time, exactly like s_host_pickup_state's own single-
+ * slot reasoning). Unlike PICKUP/DROP there is no PENDING phase (see
+ * PCNetGameFieldActionRequestMsg's doc) -- this exists purely so a retried request_id (the sender's
+ * own reliable-window retry, or a duplicate delivery) replays the SAME already-decided outcome
+ * instead of re-validating (and, for MONEY_ROCK_HIT, re-incrementing hit_count) a second time. */
+typedef struct PCNetGameFieldActionDedup {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  kind;
+    uint8_t  accepted;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t granted_item;
+} PCNetGameFieldActionDedup;
+static PCNetGameFieldActionDedup s_host_field_action_dedup[PC_NET_MAX_PEERS];
+
+/* World Ecology: snowmen -- host-only, per-peer dedup for the last PROCESSED
+ * SNOWMAN_BUILD_REQUEST, mirroring PCNetGameFieldActionDedup's own single-slot reasoning (BUILD is not
+ * a FIELD_ACTION kind, so it needs its own dedup record rather than sharing that table). */
+typedef struct PCNetGameSnowmanBuildDedup {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  accepted;
+    uint8_t  slot;
+    uint8_t  reason;
+} PCNetGameSnowmanBuildDedup;
+static PCNetGameSnowmanBuildDedup s_host_snowman_build_dedup[PC_NET_MAX_PEERS];
+
+/* World Ecology milestone (Stage 1, Item 2): host-only per-tile "money rock hit window" bookkeeping
+ * -- deliberately separate from (and much simpler than) the vanilla bg_item_ten_coin_c runtime array
+ * (bg_item.h) that drives the LOCAL wobble animation: the host needs none of that graphics/timing
+ * state, only hit_count and an expiry, both purely deterministic (see
+ * bIT_actor_ten_coin_entryR()'s reward switch, bg_item_common.c_inc -- hit_count/destiny_type only,
+ * no RNG). Sized bIT_TEN_COIN_NUM (5) to match vanilla's own concurrent-money-rock limit. money_power
+ * is captured from whichever request OPENED the window (first hit) and reused for every hit in that
+ * window, matching vanilla's own "swing_time set once, at the first hit" behavior
+ * (bIT_actor_ten_coin_entryR() only reads mPr_GetMoneyPower() in its mode!=2 branch); destiny_type is
+ * re-read from the REQUESTING player's context on every hit, matching vanilla's own per-hit
+ * Common_Get(now_private)->destiny.type read.
+ *
+ * Bug 4 fix: the dropped money bag itself carries NO special-case tracking any more (no drop_acre/
+ * drop_tile/drop_valid/drop_pickup_seq, no pc_net_game_is_money_bag_pickup_allowed()). Once
+ * pcfa_set_tile() writes the reward item onto its chosen tile, it is an entirely ORDINARY field item,
+ * pickupable by anyone through the completely ordinary reserve/validate/commit pickup path
+ * (pcnetgame_validate_and_resolve_pickup()) -- the same path every other dropped item already uses.
+ * That also means it survives the window's own expiry, is covered by the ordinary dirty-flush/
+ * snapshot/late-join mechanisms for free, and multiple simultaneous bags (from separate hits/windows)
+ * are all independently trackable, because none of them are tracked here at all any more. */
+typedef struct PCNetGameMoneyRockState {
+    int      active;
+    int      acre;
+    int      tile;
+    mActor_name_t orig_item;    /* the MONEY_ROCK_x/MONEY_FLOWER_SEED value at window-open, for the
+                                  * eventual revert (orig_item - 7), mirroring
+                                  * bIT_actor_ten_coin_move()'s own `ten_coin->fg_item - 7` exactly */
+    int      hit_count;
+    int16_t  money_power;       /* captured once, at window-open -- see doc above */
+    float    expire_accum;      /* frames-as-60fps-units since window-open; see
+                                  * PC_NETGAME_MONEY_ROCK_EXPIRE_60FPS_FRAMES-style per-window target
+                                  * below (expire_target_frames) */
+    float    expire_target_frames;
+} PCNetGameMoneyRockState;
+#define PC_NETGAME_MONEY_ROCK_SLOTS 5 /* == bIT_TEN_COIN_NUM (bg_item.h) */
+static PCNetGameMoneyRockState s_host_money_rock[PC_NETGAME_MONEY_ROCK_SLOTS];
+
 /* Stage 5B-1: client-only. Exactly one outstanding drop request at a time, for the same reason as
  * s_pickup_pending -- kept as a wholly separate instance (not reused/overloaded) for the same
  * "don't conflate pickup and drop state" reason as s_host_drop_state above. claimed_item is stored
@@ -1089,6 +1952,85 @@ static uint32_t             s_next_drop_request_id = 1;
 #define PC_NETGAME_DROP_MAX_RETRIES 30 /* see PC_NETGAME_PICKUP_MAX_RETRIES for the budget reasoning */
 _Static_assert((PC_NETGAME_DROP_MAX_RETRIES + 1) * 500u < PC_NETGAME_CONFIRM_TIMEOUT_MS,
                "the host's reservation timeout must exceed the client's drop retry budget (30 x 500 ms + last interval)");
+
+/* World Ecology T3: client-only. Exactly one outstanding bury request at a time -- exact structural
+ * mirror of PCNetGameDropPending (see its own doc for the shared reasoning), plus hole_variant (this
+ * client's own locally-computed mCoBG_GetHoleNumber() result, or 0xFF -- resent byte-for-byte on every
+ * retry, same reasoning as claimed_item). Kept as a wholly separate instance from pickup/drop for the
+ * same "don't conflate different kinds' retries" reason. */
+typedef struct PCNetGameBuryPending {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  pocket_slot_idx;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint8_t  hole_variant;
+    PCNetGameOwnerStamp owner; /* the local player at send time (see PCNetGameOwnerStamp) */
+    uint16_t claimed_item;
+    float    timeout_accum;
+    int      retry_count;
+    int      unsent;         /* 1: the FIRST send failed (window full) -- see PCNetGamePickupPending.unsent */
+} PCNetGameBuryPending;
+static PCNetGameBuryPending s_bury_pending;
+static uint32_t             s_next_bury_request_id = 1;
+
+#define PC_NETGAME_BURY_TIMEOUT_60FPS_FRAMES 30.0f /* ~500ms, mirrors pickup/drop's own budget */
+#define PC_NETGAME_BURY_MAX_RETRIES 30 /* see PC_NETGAME_PICKUP_MAX_RETRIES for the budget reasoning */
+_Static_assert((PC_NETGAME_BURY_MAX_RETRIES + 1) * 500u < PC_NETGAME_CONFIRM_TIMEOUT_MS,
+               "the host's reservation timeout must exceed the client's bury retry budget (30 x 500 ms + last interval)");
+
+/* World Ecology milestone (Stage 1 / T0-C): client-only. One entry describes one outstanding or
+ * queued field-action request, SHARED across both existing kinds (DIG_BURIED / MONEY_ROCK_HIT) and any
+ * future kind. No provisional/CONFIRM phase (see PCNetGameFieldActionRequestMsg's doc). */
+typedef struct PCNetGameFieldActionPending {
+    int      valid;
+    uint8_t  kind;
+    uint32_t request_id;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint8_t  hole_variant; /* protocol v3 -- see PCNetGameFieldActionRequestMsg's own doc; 0 for every
+                               kind that doesn't use it */
+    PCNetGameOwnerStamp owner; /* the local player at send time (see PCNetGameOwnerStamp) */
+    float    timeout_accum;
+    int      retry_count;
+    int      unsent;
+    uint16_t local_grant; /* World Ecology T-dig (D / A-2): a PRIVATE, client-rolled item id to grant to a
+                              free pocket slot on ACCEPT only -- used by DIG_SHINE's own bell roll and
+                              DIG_HOLE's golden-shovel ITM_MONEY_100 bonus, both of which the host never
+                              rolls/knows about (see pc_net_game_request_dig_shine_with_grant()'s /
+                              pc_net_game_request_dig_hole_with_grant()'s own doc). 0 means "no grant" --
+                              every existing kind/caller leaves this zeroed via memset(). */
+} PCNetGameFieldActionPending;
+
+/* T0-C: was a single instance (s_field_action_pending) through Stage 1 -- a local player can only ever
+ * be mid-dig or mid-swing for ONE interaction at once, so DIG_BURIED/MONEY_ROCK_HIT never legitimately
+ * needed more than one in flight (mirrors s_pickup_pending's own single-slot reasoning), and
+ * pc_net_game_request_dig_buried()/pc_net_game_request_money_rock_hit() still enforce exactly that by
+ * refusing to enqueue while ANYTHING is already queued (see their own "one already in flight" guard) --
+ * so for those two kinds this queue can still never hold more than 1 entry, byte-for-byte the same
+ * behavior as before this change.
+ * Widened into a small bounded FIFO (depth PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH) because a FUTURE kind
+ * (T1: tree chops in particular) will legitimately want several DISTINCT field actions in flight
+ * client-side without dropping a request purely because one is already outstanding, the way the old
+ * single-slot design forced every caller to. Compacted at index 0 (the head): index 0 is the ONLY
+ * entry ever actually on the wire (see pcnetgame_field_action_queue_kick_head()) -- this is what keeps
+ * the host's per-peer dedup (a single slot, request_id-keyed) correct: it still only ever needs to
+ * remember one in-flight request per peer at a time, exactly as before. A later queued entry is sent
+ * only once the one ahead of it is popped (its RESULT arrived, or it gave up after
+ * PC_NETGAME_FIELD_ACTION_MAX_RETRIES) -- see pcnetgame_field_action_queue_pop_head(). */
+#define PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH 4
+static PCNetGameFieldActionPending s_field_action_queue[PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH];
+static int                         s_field_action_queue_len = 0; /* occupied entries, compacted at [0..len-1] */
+static uint32_t                    s_next_field_action_request_id = 1;
+
+#define PC_NETGAME_FIELD_ACTION_TIMEOUT_60FPS_FRAMES 30.0f /* ~500ms, mirrors pickup's own budget */
+#define PC_NETGAME_FIELD_ACTION_MAX_RETRIES 30 /* see PC_NETGAME_PICKUP_MAX_RETRIES for the budget reasoning.
+    NOTE: unlike PICKUP/DROP there is no host-side reservation this must stay under -- this stage's
+    field actions commit synchronously with no provisional phase (see
+    PCNetGameFieldActionRequestMsg's own doc), so this budget only bounds how long a client waits
+    before giving up on a send that keeps failing (reliable window full), not a host expiry. This
+    budget applies only to the QUEUE HEAD (the one entry actually in flight on the wire) -- a queued
+    entry behind it does not start its own timeout/retry clock until it becomes the head. */
 
 /* ---- v2 tuning ---- */
 
@@ -1155,14 +2097,33 @@ typedef struct PCNetGameHostPeerState {
     /* PLAYER_CONTEXT */
     int                  ctx_valid;
     PCNetPlayerContext   ctx;
+    /* Friendship/mail sync milestone: this peer's own PersonalID_c fields, captured once at READY
+     * from the same IDENTITY payload pc_remote_player_on_ready() already receives (see
+     * pcnetgame_handle_host_identity()) -- retained for the lifetime of the connection (unlike
+     * pending_identity, which is cleared right after the handshake) so a later FRIENDSHIP_REQUEST/
+     * MAIL_REQUEST never needs the peer to re-assert who it is. */
+    int                  ready_identity_valid;
+    uint8_t              ready_player_name[PC_NETGAME_NAME_LEN];
+    uint8_t              ready_land_name[PC_NETGAME_LAND_LEN];
+    uint16_t             ready_player_id;
+    uint16_t             ready_land_id;
     /* snapshot progress */
     int                  snap_active;
     int                  snap_stage;      /* 0 = BEGIN next, 1 = FIELD_BLOCKs, 2 = VILLAGER_SNAPSHOT next,
-                                            * 3 = END next (villager population/is_home milestone: inserted
-                                            * stage 2 between the field blocks and SNAPSHOT_END) */
+                                            * 3 = FRIENDSHIP_SNAPSHOT_ENTRYs (friendship/mail sync
+                                            * milestone: inserted between the villager population
+                                            * snapshot and SNAPSHOT_END), 4 = END next */
     int                  snap_next_acre;
+    int                  snap_next_friendship_idx; /* flat 0..(ANIMAL_NUM_MAX*ANIMAL_MEMORY_NUM)-1 */
     int                  snap_blocks_sent;
     uint32_t             snap_epoch;
+    /* World Ecology: snowmen -- one-shot PC_NETGAME_MSG_SNOWMAN_STATE sent right after SNAPSHOT_BEGIN
+     * succeeds (stage 0 -> 1), before the first FIELD_BLOCK, so a late-joiner's SNOWMAN_STATE always
+     * arrives before the FIELD_UPDATE/FIELD_BLOCK carrying the matching tile (see
+     * pcnetgame_host_pump_snapshots()'s own doc). Reset to 0 by pcnetgame_host_start_snapshot() (a
+     * fresh epoch always resends it) and by the whole-struct memset in
+     * pcnetgame_reset_all_host_peer_state(). */
+    int                  snap_snowman_sent;
 } PCNetGameHostPeerState;
 static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];
 
@@ -1184,6 +2145,15 @@ static PCNetGameRtcWire      s_host_meta_renew;       /* last committed all_grow
 static int                   s_host_meta_valid = 0;
 static PCNetGameWorldStateWire s_host_meta_world_state; /* last committed weather + market state */
 static int                   s_host_meta_world_state_valid = 0;
+/* N-clock milestone: host-side clock broadcast state. s_host_clock_seq is the ONE shared monotonic
+ * counter for every CLOCK_SYNC this hosting session ever sends (initial per-peer sends at
+ * SNAPSHOT_END, periodic broadcasts, and discontinuity broadcasts alike) -- a client's
+ * strictly-greater-than check (s_client_clock_seq_applied) is what makes a stale/reordered/duplicate
+ * reliable delivery a no-op, exactly like s_world_seq/s_client_meta_seq for WORLD_META. */
+static uint32_t               s_host_clock_seq = 0;
+static uint32_t               s_host_clock_sync_last_ms = 0; /* pcnetgame_now_ms() of the last periodic broadcast */
+static OSTime                 s_host_clock_last_delta;       /* last-seen Save_Get(time_delta), to detect a manual clock adjust */
+static int                    s_host_clock_last_delta_valid = 0;
 
 /* Outgoing world messages of one flush (materialized once, sent per peer). */
 typedef struct PCNetGameOutMsg {
@@ -1213,6 +2183,28 @@ static uint32_t              s_client_meta_seq = 0;
  * (same relaxed rule as a fresh snapshot always superseding older state, matching FIELD_BLOCK/
  * SNAPSHOT_END's own >= rule). */
 static uint32_t              s_client_population_seq = 0;
+/* Friendship/mail sync milestone: strictly-monotonic last-applied world_seq for
+ * FRIENDSHIP_UPDATE/MAIL_DELIVERED (strict `>`) and FRIENDSHIP_SNAPSHOT_ENTRY (`>=`, only ever
+ * advances it) -- same shared s_world_seq generation, same contract shape as
+ * s_client_population_seq immediately above, just its own counter (a friendship/mail event and a
+ * population event are unrelated deltas; comparing them against the same counter would make an
+ * unrelated population change spuriously "supersede" a pending friendship/mail one or vice versa). */
+static uint32_t              s_client_friendship_seq = 0;
+/* N-clock milestone: last-applied host s_host_clock_seq (strict `>` rule, matching s_client_meta_seq/
+ * s_client_population_seq/s_client_friendship_seq's own contract shape exactly). Reset to 0 on every
+ * fresh connection/reconnect by pcnetgame_reset_client_session_state() below (Rule 2 of the design: a
+ * reconnect is treated like a fresh join, so the first post-reconnect CLOCK_SYNC is always accepted).
+ * The actual clock OFFSET this drives (pc_lb_rtc_set_net_clock_offset(), lb_rtc.c) is DELIBERATELY NOT
+ * reset here and has no variable in this file at all -- it lives in lb_rtc.c precisely so a disconnect
+ * never resets it to 0 and visibly jumps the displayed clock backward while the connection is down
+ * (Rule 2). ROLE reverts on disconnect, so pc_net_game_world_is_host_authoritative() naturally goes
+ * false and every host-gated consumer stops caring what the (now stale but frozen) offset says. */
+static uint32_t              s_client_clock_seq_applied = 0;
+/* World Ecology: snowmen -- this connection's last-applied SNOWMAN_STATE world_seq (its OWN sequence,
+ * independent of s_client_meta_seq/s_world_seq -- see PCNetGameSnowmanStateMsg's own doc). Reset to 0
+ * on (re)connect by pcnetgame_reset_client_session_state(), exactly like every other *_seq_applied /
+ * *_seq tracker in this file, so a reconnect's first SNOWMAN_STATE is always accepted. */
+static uint32_t              s_client_snowman_seq = 0;
 static int                   s_client_snap_active = 0;
 static uint32_t              s_client_snap_epoch = 0;
 static int                   s_client_snap_blocks = 0;
@@ -1416,6 +2408,10 @@ static void pcnetgame_capture_world_state(PCNetGameWorldStateWire* w) {
     pcnetgame_rtc_to_wire(&kabu->update_time, &w->kabu_update_time);
     w->weather = (uint8_t)Common_Get(weather);
     w->weather_intensity = (uint8_t)Common_Get(weather_intensity);
+    w->gyoei_term = (uint8_t)Save_Get(gyoei_term);
+    w->gyoei_term_transition_offset = (uint8_t)Save_Get(gyoei_term_transition_offset);
+    w->insect_term = (uint8_t)Save_Get(insect_term);
+    w->insect_term_transition_offset = (uint8_t)Save_Get(insect_term_transition_offset);
 }
 
 /* Stage 4C-1/4C-2: read-only sample of the local player's current visible appearance, into the
@@ -1839,7 +2835,13 @@ static void pcnetgame_handle_client_appearance(const PCNetGameAppearanceMsg* in)
 
 /* Log tag / record accessor for one interaction kind (PC_NETGAME_INTERACT_KIND_*). */
 static const char* pcnetgame_kind_tag(int kind) {
-    return kind == (int)PC_NETGAME_INTERACT_KIND_DROP ? "DROP" : "PICKUP";
+    if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
+        return "DROP";
+    }
+    if (kind == (int)PC_NETGAME_INTERACT_KIND_BURY) {
+        return "BURY"; /* World Ecology T0 scaffolding -- see PC_NETGAME_INTERACT_KIND_BURY's doc */
+    }
+    return "PICKUP";
 }
 
 static PCNetGameHostInteraction* pcnetgame_host_interaction(PCNetPeerId peer, int kind) {
@@ -1851,6 +2853,13 @@ static PCNetGameHostInteraction* pcnetgame_host_interaction(PCNetPeerId peer, in
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
         return &s_host_drop_state[peer];
+    }
+    if (kind == (int)PC_NETGAME_INTERACT_KIND_BURY) {
+        return &s_host_bury_state[peer]; /* World Ecology T0 scaffolding -- see s_host_bury_state's doc.
+                                            * pcnetgame_handle_host_confirm() can therefore already
+                                            * dispatch a BURY INTERACT_CONFIRM through this generic
+                                            * accessor, but it is a provable no-op until T3 ever sets
+                                            * this record's phase to PENDING. */
     }
     return NULL;
 }
@@ -1894,18 +2903,40 @@ static void pcnetgame_reset_host_drop_state(PCNetPeerId peer) {
     memset(&s_host_drop_state[peer], 0, sizeof(s_host_drop_state[peer]));
 }
 
-/* Returns the peer (0..PC_NET_MAX_PEERS-1) whose PENDING pickup/drop currently reserves persistent
- * tile (acre, tile), or -1 if none does. A PENDING record whose age already reached
- * PC_NETGAME_CONFIRM_TIMEOUT_MS does not count (expiry proper runs at the top of every poll; this
- * keeps the answer exact between polls). */
+/* World Ecology T0: PROTOCOL SCAFFOLDING ONLY -- exact mirror of pcnetgame_reset_host_drop_state(),
+ * for s_host_bury_state (see its own doc). Safe to call for an out-of-range peer (no-op); a no-op in
+ * practice today either way, since s_host_bury_state is never PENDING until T3. Registered in
+ * pcnetgame_reset_all_host_peer_state() now so T3 does not also have to remember to wire this up. */
+static void pcnetgame_reset_host_bury_state(PCNetPeerId peer) {
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+        return;
+    }
+    pcnetgame_host_release(peer, (int)PC_NETGAME_INTERACT_KIND_BURY, &s_host_bury_state[peer],
+                           PC_NETGAME_PHASE_ABORTED, "peer reset/disconnect");
+    memset(&s_host_bury_state[peer], 0, sizeof(s_host_bury_state[peer]));
+}
+
+/* The three PENDING-reservation interaction kinds pcnetgame_host_tile_reserved_by()/
+ * pcnetgame_host_expire_reservations() scan across every peer: PICKUP, DROP, and (since T3) BURY --
+ * a bury reservation must block a competing pickup/drop/bury of the SAME tile exactly like pickup and
+ * drop already block each other, so it shares this same table rather than a separate one. */
+static const int s_host_reservation_kinds[3] = { (int)PC_NETGAME_INTERACT_KIND_PICKUP,
+                                                  (int)PC_NETGAME_INTERACT_KIND_DROP,
+                                                  (int)PC_NETGAME_INTERACT_KIND_BURY };
+
+/* Returns the peer (0..PC_NET_MAX_PEERS-1) whose PENDING pickup/drop(/bury -- see
+ * s_host_reservation_kinds's doc) currently reserves persistent tile (acre, tile), or -1 if none does.
+ * A PENDING record whose age already reached PC_NETGAME_CONFIRM_TIMEOUT_MS does not count (expiry
+ * proper runs at the top of every poll; this keeps the answer exact between polls). */
 static int pcnetgame_host_tile_reserved_by(int acre, int tile) {
     uint32_t now = 0;
     int i, k;
 
     for (i = 0; i < PC_NET_MAX_PEERS; i++) {
-        for (k = 0; k < 2; k++) {
-            const PCNetGameHostInteraction* it = (k == 0) ? &s_host_pickup_state[i] : &s_host_drop_state[i];
-            if (it->phase != (uint8_t)PC_NETGAME_PHASE_PENDING || it->acre != (uint8_t)acre || it->tile != (uint8_t)tile) {
+        for (k = 0; k < 3; k++) {
+            const PCNetGameHostInteraction* it = pcnetgame_host_interaction((PCNetPeerId)i, s_host_reservation_kinds[k]);
+            if (it == NULL || it->phase != (uint8_t)PC_NETGAME_PHASE_PENDING || it->acre != (uint8_t)acre ||
+                it->tile != (uint8_t)tile) {
                 continue;
             }
             if (now == 0) {
@@ -1936,10 +2967,10 @@ static void pcnetgame_host_expire_reservations(void) {
     int i, k;
 
     for (i = 0; i < PC_NET_MAX_PEERS; i++) {
-        for (k = 0; k < 2; k++) {
-            int kind = (k == 0) ? (int)PC_NETGAME_INTERACT_KIND_PICKUP : (int)PC_NETGAME_INTERACT_KIND_DROP;
-            PCNetGameHostInteraction* it = (k == 0) ? &s_host_pickup_state[i] : &s_host_drop_state[i];
-            if (it->phase != (uint8_t)PC_NETGAME_PHASE_PENDING) {
+        for (k = 0; k < 3; k++) { /* T0-D: PICKUP/DROP/BURY -- see s_host_reservation_kinds's doc */
+            int kind = s_host_reservation_kinds[k];
+            PCNetGameHostInteraction* it = pcnetgame_host_interaction((PCNetPeerId)i, kind);
+            if (it == NULL || it->phase != (uint8_t)PC_NETGAME_PHASE_PENDING) {
                 continue;
             }
             if (now == 0) {
@@ -1974,11 +3005,19 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
      * peer's reservations disappear). Never touches the field. */
     pcnetgame_reset_host_pickup_state(peer);
     pcnetgame_reset_host_drop_state(peer);
+    pcnetgame_reset_host_bury_state(peer); /* World Ecology T0 scaffolding -- see its own doc */
     if (peer >= 0 && peer < PC_NET_MAX_PEERS) {
         /* v2: identity deferral, PLAYER_CONTEXT, snapshot progress/epoch. v2 additionally calls this
          * on PC_NET_EVENT_PEER_CONNECTED (a freshly allocated transport slot starts clean even if a
          * disconnect was somehow never observed) and on every host-initiated reject/drop. */
         memset(&s_host_peer[peer], 0, sizeof(s_host_peer[peer]));
+        /* World Ecology Stage 1: this peer's field-action dedup record -- a dead/reused peer's last
+         * decision must never be replayed against a NEW connection's request_id space (request ids
+         * are not shared across peers, so this cheaply avoids any chance of stale cross-peer replay). */
+        memset(&s_host_field_action_dedup[peer], 0, sizeof(s_host_field_action_dedup[peer]));
+        /* World Ecology: snowmen -- same reasoning as the field-action dedup record just above, for
+         * SNOWMAN_BUILD_REQUEST's own separate dedup table. */
+        memset(&s_host_snowman_build_dedup[peer], 0, sizeof(s_host_snowman_build_dedup[peer]));
     }
 }
 
@@ -2072,22 +3111,28 @@ static int pcnetgame_is_pickupable_field_item(mActor_name_t item) {
  * classification -- these never legitimately reach a pocket in the first place (Stage 5A's own
  * pickup path already never grants one).
  *
- * Money bags are excluded too, by the same pcnetgame_is_money_bag_item() test that pickup already
- * uses to reject them (pcnetgame_validate_and_resolve_pickup()), so pickup and drop take the same
- * position. Without this, a money item would pass the NAME_TYPE_ITEM1 case below just like any
- * ordinary pocket item: the money bags (0x2100-0x2103, ITEM1_CAT_MONEY) and ITM_MONEY1000BELL
- * (0x250D, ITEM1_CAT_ETC) are the only entries mNT_get_itemTableNo() maps to mNT_ITEM_TYPE_BAG
- * (src/game/m_name_table.c:100,127). Note that a money bag CAN reach a pocket slot through
- * vanilla's own UI. The wallet's "make a sack" action (mTG_make_money_sack(), src/game/m_tag_ovl.c)
- * puts one in the hand for pocketing, and PC_ENHANCEMENTS' full-wallet pickup fallback
- * (m_player_main_pickup.c_inc) pockets one too. ITEM1_CAT_MONEY also gets the ordinary
- * mTG_TYPE_FIELD_DEFAULT tag menu, which includes "put on ground". So before this check, a
- * client's money-bag drop was accepted and placed as a plain field item. Stage 5A never made that
- * a deliberate path. It also leaves the bag stranded: no CLIENT can ever pick it back up, because
- * the client pickup seam skips money bags (m_player_main_pickup.c_inc:62-70) and
- * pcnetgame_validate_and_resolve_pickup() rejects them. Only the host's own local player could
- * retrieve it. Rejecting the drop instead gives the client vanilla's own local "can't place that"
- * feedback (the m_tag_ovl.c drop seam calls pc_net_game_is_droppable_item() before sending), and
+ * Money bags are excluded here too, by the same pcnetgame_is_money_bag_item() test, but this is now a
+ * DROP-only policy -- pickup no longer mirrors it. Historically pickup used the identical test to
+ * reject a money bag outright (pcnetgame_validate_and_resolve_pickup() used to refuse it), so pickup
+ * and drop took the same position; the World Ecology Stage 1 Bug 4 fix removed that pickup-side
+ * exclusion (a money-rock-dropped bag, and any other field money bag, is now an ordinary
+ * NAME_TYPE_ITEM1 field item any client can pick up through the normal path -- see
+ * pcnetgame_validate_and_resolve_pickup()'s own "Bug 4 fix" comment). Drop deliberately still refuses
+ * money bags for the reasons below: without this, a money item would pass the NAME_TYPE_ITEM1 case
+ * below just like any ordinary pocket item: the money bags (0x2100-0x2103, ITEM1_CAT_MONEY) and
+ * ITM_MONEY1000BELL (0x250D, ITEM1_CAT_ETC) are the only entries mNT_get_itemTableNo() maps to
+ * mNT_ITEM_TYPE_BAG (src/game/m_name_table.c:100,127). Note that a money bag CAN reach a pocket slot
+ * through vanilla's own UI. The wallet's "make a sack" action (mTG_make_money_sack(),
+ * src/game/m_tag_ovl.c) puts one in the hand for pocketing, and PC_ENHANCEMENTS' full-wallet pickup
+ * fallback (m_player_main_pickup.c_inc) pockets one too. ITEM1_CAT_MONEY also gets the ordinary
+ * mTG_TYPE_FIELD_DEFAULT tag menu, which includes "put on ground". So without this drop-side check, a
+ * client's money-bag drop would be accepted and placed as a plain field item, which is still not a
+ * deliberate path here even after Bug 4: dropping one back onto the field would let it re-enter the
+ * ordinary pickup path above and be picked up by anyone (including crediting a DIFFERENT client's
+ * wallet than the one that originally received it), which is not something this protocol's simple
+ * field-value model is designed to arbitrate. Rejecting the drop instead gives the client vanilla's
+ * own local "can't place that" feedback (the m_tag_ovl.c drop seam calls
+ * pc_net_game_is_droppable_item() before sending), and
  * the bag stays in their pocket. This affects only network CLIENTS. Single-player and the host's
  * own local drops never go through this classifier. It also means the ordinary-item field-value
  * protocol can never become a way to move money. Money sync needs its own wallet-aware protocol
@@ -2133,6 +3178,48 @@ static int pcnetgame_is_droppable_item(mActor_name_t item) {
  * pc_net_game.h decomp-independent (matching every other function in that header). */
 int pc_net_game_is_droppable_item(int item) {
     return pcnetgame_is_droppable_item((mActor_name_t)item);
+}
+
+/* World Ecology T3: does `item` classify as an item this build's host-authoritative bury path will
+ * accept as claimed_item? Deliberately NOT pcnetgame_is_droppable_item() reused -- bury has its own
+ * distinct rule set (see this milestone's design brief): REJECT EMPTY_NO, RSV_NO (via
+ * mNT_check_unknown() for any ITEM1/FTR1 id outside the game's tables -- REQUIRED, not decoration,
+ * for the exact out-of-bounds-read reason pcnetgame_is_droppable_item() already documents),
+ * ITM_SIGNBOARD, any ITEM1_CAT_INSECT item, any ITEM1_CAT_FISH item, and HONEYCOMB. ACCEPT money-bag
+ * items (ITM_MONEY_*), FTR0/FTR1 furniture, and every other ITEM1 item -- unlike drop, bury does NOT
+ * exclude money bags (burying one into a HOLE_SHINE tile is the money-tree mechanic itself; see the
+ * BURY commit branch in pcnetgame_handle_host_confirm()). Present-wrapped/quest-flagged items never
+ * reach this path per vanilla's own menu gating (mTG_bury_proc()/mTG_plant_proc() only offer this menu
+ * entry for an already-unwrapped pocket item), so condition bits are not re-checked here. */
+static int pcnetgame_is_buryable_item(mActor_name_t item) {
+    if (item == (mActor_name_t)EMPTY_NO || item == ITM_SIGNBOARD || item == (mActor_name_t)HONEYCOMB) {
+        return 0;
+    }
+    if (mNT_check_unknown(item)) {
+        return 0; /* ITEM1/FTR1 id outside the game's tables (incl. RSV_NO): never written into the field */
+    }
+    if (ITEM_NAME_GET_TYPE(item) == NAME_TYPE_ITEM1 &&
+        (ITEM_NAME_GET_CAT(item) == ITEM1_CAT_INSECT || ITEM_NAME_GET_CAT(item) == ITEM1_CAT_FISH)) {
+        return 0; /* live catches are never buryable -- see this function's own doc */
+    }
+    switch (ITEM_NAME_GET_TYPE(item)) {
+        case NAME_TYPE_FTR0:
+        case NAME_TYPE_FTR1:
+        case NAME_TYPE_ITEM1:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* World Ecology T3: TRUST BOUNDARY range check for a bury request's hole_variant -- unlike
+ * pcnetgame_validate_hole_variant() (dig-family: 0..24 only), bury's own valid set ALSO includes the
+ * 0xFF sentinel (mCoBG_GetHoleNumber()'s own -1 "no valid hole shape" case -- see
+ * PCNetGameBuryRequestMsg's doc). A separate function rather than extending
+ * pcnetgame_validate_hole_variant() itself: that function's existing 0..24-only contract is relied on
+ * verbatim by every dig-family validator, and must not change. */
+static int pcnetgame_validate_bury_hole_variant(uint8_t v) {
+    return v <= 24u || v == 0xFFu;
 }
 
 /* Stage 5A: every read-only validation step for one pickup request, in sequence, stopping at the
@@ -2190,10 +3277,15 @@ static int pcnetgame_validate_and_resolve_pickup(PCNetPeerId peer, uint8_t ut_x,
     raw_item = (mActor_name_t)raw_value; /* the host's own authoritative read, taken now -- never the
                                            * client's claim, and never cached from any earlier moment */
 
-    if (!pcnetgame_is_pickupable_field_item(raw_item) || mNT_check_unknown(raw_item) ||
-        pcnetgame_is_money_bag_item(raw_item)) {
-        return 0; /* wrong classification (incl. transient RSV_NO), or explicitly excluded for Stage 5A */
+    if (!pcnetgame_is_pickupable_field_item(raw_item) || mNT_check_unknown(raw_item)) {
+        return 0; /* wrong classification (incl. transient RSV_NO) */
     }
+    /* Bug 4 fix: a field money-bag (e.g. one a money-rock hit dropped) is no longer specially
+       excluded here -- it is an ordinary NAME_TYPE_ITEM1 field item, already accepted above by
+       pcnetgame_is_pickupable_field_item(), and pickupable by any client through this same ordinary
+       path. pcnetgame_is_money_bag_item() remains in use elsewhere: DROP still refuses money bags
+       (pcnetgame_is_droppable_item(), a separate deliberate policy), and the client pickup-result
+       handler still uses it to detect a wallet-creditable item. */
 
     if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
         return 0; /* no movement sample from this peer yet */
@@ -2573,6 +3665,7 @@ static void pcnetgame_host_start_snapshot(PCNetPeerId peer, const char* why) {
     st->snap_stage = 0;
     st->snap_next_acre = 0;
     st->snap_blocks_sent = 0;
+    st->snap_snowman_sent = 0;
     st->snap_epoch = ++s_snapshot_epoch_counter;
     printf("[NET][WORLD] host: peer %d snapshot epoch %u queued (%s)\n", (int)peer, (unsigned)st->snap_epoch, why);
 }
@@ -2643,6 +3736,152 @@ static void pcnetgame_build_field_block(PCNetGameFieldBlockMsg* fb, int acre, ui
     memcpy(fb->valid, s_shadow_known[acre], sizeof(fb->valid));
 }
 
+/* ==================== World Ecology: snowmen (host-authoritative build/break/melt sync) ==================== */
+
+/* Finding A fix / shared helper: ac_birth_control.c's own SNOWMAN0..8 special-case
+ * (aBC_setupOtherActor(), m_actor.c) sets clear_item = EMPTY_NO for a SNOWMAN0..8 tile the moment its
+ * PSNOWMAN actor spawns, and only restores the real tile value at that actor's OWN destruction
+ * (restore_fgdata(), m_actor.c:841-844,922, gated on actor->restore_fg -- set TRUE at spawn,
+ * m_actor.c:922-ish). So for as long as a snowman's actor is alive, Save_t.fg itself reads EMPTY_NO at
+ * that tile -- reading it directly (as pcnetgame_host_diff_commit_acre()'s own pcfa_read_acre() does)
+ * would broadcast EMPTY_NO as if it were the host's own authoritative value, making that snowman
+ * flicker/vanish for every OTHER client while the host's own actor is alive. This resolves what tile
+ * (acre, tile) should actually be treated as holding: if *value is EMPTY_NO and a live PSNOWMAN actor's
+ * home position maps to this exact (acre, tile), overlays *value with that actor's own npc_id (its
+ * SNOWMAN0+slot*3+age tile value). A no-op (0) unless the HOST's own process actually has the town
+ * scene loaded right now (gamePT->exec == play_main, pcfa_scene_is_town()) -- which is also the only
+ * time ac_birth_control.c's EMPTY_NO substitution is even in effect for THIS host's own Save_t.fg.
+ * Shared verbatim by pcnetgame_host_diff_commit_acre() (this fix), and by the SNOWMAN_BUILD/
+ * SNOWMAN_BREAK validators below (so a rejected-looking-free tile that is actually still a live
+ * actor's home is never misread as free, and a break target still recognizes its own live actor). */
+static int pcnetgame_host_resolve_snowman_tile_overlay(int acre, int tile, uint16_t* value) {
+    GAME_PLAY* play;
+    ACTOR* actor;
+
+    if (*value != (uint16_t)EMPTY_NO) {
+        return 0;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main || !pcfa_scene_is_town()) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    for (actor = play->actor_info.list[ACTOR_PART_BG].actor; actor != NULL; actor = actor->next_actor) {
+        int ut_x, ut_z, home_acre, home_tile;
+
+        if (!actor->restore_fg) {
+            continue;
+        }
+        if (actor->npc_id < (mActor_name_t)SNOWMAN0 || actor->npc_id > (mActor_name_t)SNOWMAN8) {
+            continue;
+        }
+        if (!mFI_Wpos2UtNum(&ut_x, &ut_z, actor->home.position)) {
+            continue;
+        }
+        if (!pcfa_town_ut_to_acre_tile(ut_x, ut_z, &home_acre, &home_tile)) {
+            continue;
+        }
+        if (home_acre == acre && home_tile == tile) {
+            *value = (uint16_t)actor->npc_id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Host-only: this stream's own world_seq (independent of s_world_seq -- see PCNetGameSnowmanStateMsg's
+ * own doc) and the last-broadcast 16 bytes (12 bytes of Save_t.snowmen.snowmen_data[3] + 4 date bytes),
+ * used purely to detect a change worth broadcasting (pcnetgame_host_check_snowman_state_diff()). Not
+ * valid (cache_valid == 0) until the first check ever runs, so that first check always broadcasts once
+ * (matching every other "first sample always sends" cache in this file, e.g. s_host_meta_valid). */
+static uint32_t s_snowman_world_seq = 0;
+static uint8_t  s_snowman_state_cache[16];
+static int      s_snowman_state_cache_valid = 0;
+
+/* Gathers the current 16 bytes this stream tracks -- Save_t.snowmen.snowmen_data[3] (12 bytes, 4/slot:
+ * exists, head_size, body_size, score) followed by snowman_year/month/day/hour (4 bytes) -- BY HAND,
+ * never as one memcpy: these fields are not contiguous in Save_t (m_common_data.h:109,132-135). */
+static void pcnetgame_build_snowman_state_bytes(uint8_t out[16]) {
+    mSN_snowman_data_c* data = Save_GetPointer(snowmen.snowmen_data[0]);
+    int i;
+
+    for (i = 0; i < mSN_SAVE_COUNT; i++) {
+        out[i * 4 + 0] = data[i].exists;
+        out[i * 4 + 1] = data[i].head_size;
+        out[i * 4 + 2] = data[i].body_size;
+        out[i * 4 + 3] = data[i].score;
+    }
+    out[12] = Save_Get(snowman_year);
+    out[13] = Save_Get(snowman_month);
+    out[14] = Save_Get(snowman_day);
+    out[15] = Save_Get(snowman_hour);
+}
+
+/* Broadcasts one freshly-built PC_NETGAME_MSG_SNOWMAN_STATE (world_seq == the CURRENT
+ * s_snowman_world_seq, `flags` as given by the caller) to every READY peer. Deliberately mirrors
+ * pcnetgame_broadcast_villager_msg()'s send-failure handling (a full window / failed send falls back
+ * to a full resync for that one peer) but NOT its snap_active skip -- see PCNetGameSnowmanStateMsg's
+ * own doc for why a peer mid-snapshot must still receive every one of these. */
+static void pcnetgame_broadcast_snowman_state(uint8_t flags) {
+    PCNetGameSnowmanStateMsg msg;
+    uint8_t bytes[16];
+    int i;
+
+    pcnetgame_build_snowman_state_bytes(bytes);
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_SNOWMAN_STATE;
+    msg.flags = flags;
+    msg.world_seq = s_snowman_world_seq;
+    memcpy(msg.snowmen, bytes, sizeof(msg.snowmen));
+    msg.year = bytes[12];
+    msg.month = bytes[13];
+    msg.day = bytes[14];
+    msg.hour = bytes[15];
+
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        int backlog;
+        if (s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        backlog = pc_net_reliable_backlog((PCNetPeerId)i);
+        if (backlog < 0) {
+            continue;
+        }
+        if (backlog + 1 > PC_NET_RELIABLE_WINDOW - PC_NETGAME_WINDOW_HEADROOM ||
+            !pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+            pcnetgame_host_start_snapshot((PCNetPeerId)i, "snowman state send failed");
+        }
+    }
+}
+
+/* THE generic snowman-state commit function: called explicitly, right after BOTH the BUILD and BREAK
+ * commits below (so SNOWMAN_STATE reaches clients as promptly as their own tile change), AND once per
+ * pcnetgame_host_world_poll() call, immediately BEFORE that poll's pcnetgame_host_flush_mask() -- this
+ * second call site is what catches melt (mAGrw_MeltSnowman()/mAGrw_AllMeltSnowman(), m_all_grow_ovl.c,
+ * already host-gated by mFM_PcFieldInitGrowth()) and any other cause of a Save_t.snowmen/date change,
+ * with no per-cause plumbing needed. memcmp against the cached last-broadcast bytes; a genuine
+ * difference (or the very first call, cache_valid == 0) increments s_snowman_world_seq and broadcasts.
+ * No-op until the host world is ready (save loaded) -- mirrors pcnetgame_host_flush_mask()'s own gate. */
+static void pcnetgame_host_check_snowman_state_diff(void) {
+    uint8_t bytes[16];
+
+    if (!s_host_world_ready || !pcfa_save_ready()) {
+        return;
+    }
+    pcnetgame_build_snowman_state_bytes(bytes);
+    if (s_snowman_state_cache_valid && memcmp(bytes, s_snowman_state_cache, sizeof(bytes)) == 0) {
+        return;
+    }
+    memcpy(s_snowman_state_cache, bytes, sizeof(bytes));
+    s_snowman_state_cache_valid = 1;
+    ++s_snowman_world_seq;
+    pcnetgame_broadcast_snowman_state(0);
+    if (g_pc_verbose) {
+        printf("[NET][SNOWMAN] host: state changed -- broadcast SNOWMAN_STATE (snowman_world_seq %u)\n",
+               (unsigned)s_snowman_world_seq);
+    }
+}
+
 /* Diffs one acre of the persistent field against the shadow and COMMITS every stable change:
  * shadow updated (and marked known), world_seq incremented (per tile for FIELD_UPDATEs, once for a
  * FIELD_BLOCK), message appended to the out list (or s_out_overflow set -- the commit still
@@ -2671,6 +3910,10 @@ static void pcnetgame_host_diff_commit_acre(int acre) {
     pcfa_read_acre(acre, items, deposit);
     for (t = 0; t < PCFA_TILE_NUM; t++) {
         uint16_t v = items[t];
+        if (v == (uint16_t)EMPTY_NO && pcnetgame_host_resolve_snowman_tile_overlay(acre, t, &v)) {
+            items[t] = v; /* Finding A fix: a live PSNOWMAN actor still owns this tile -- see
+                              pcnetgame_host_resolve_snowman_tile_overlay()'s own doc */
+        }
         int d = pcnetgame_dep_bit(deposit, t);
         int known = pcnetgame_dep_bit(s_shadow_known[acre], t);
         int same = known && v == s_shadow_items[acre][t] && d == pcnetgame_dep_bit(s_shadow_deposit[acre], t);
@@ -2864,6 +4107,13 @@ static void pcnetgame_host_check_world_meta(void) {
         memcmp(&cur_state.kabu_update_time, &s_host_meta_world_state.kabu_update_time, sizeof(cur_state.kabu_update_time)) != 0) {
         changed_flags |= (uint8_t)PC_NETGAME_META_FLAG_MARKET_VALID;
     }
+    if (!s_host_meta_world_state_valid ||
+        cur_state.gyoei_term != s_host_meta_world_state.gyoei_term ||
+        cur_state.gyoei_term_transition_offset != s_host_meta_world_state.gyoei_term_transition_offset ||
+        cur_state.insect_term != s_host_meta_world_state.insect_term ||
+        cur_state.insect_term_transition_offset != s_host_meta_world_state.insect_term_transition_offset) {
+        changed_flags |= (uint8_t)PC_NETGAME_META_FLAG_TERM_VALID;
+    }
     if (changed_flags == 0) {
         return;
     }
@@ -2893,6 +4143,10 @@ static void pcnetgame_host_check_world_meta(void) {
         printf("[NET][WORLD] host: Stalk Market schedule changed -> trend %u sunday %u (world_seq %u)\n",
                (unsigned)cur_state.trade_market, (unsigned)cur_state.daily_price[0], (unsigned)s_world_seq);
     }
+    if (changed_flags & PC_NETGAME_META_FLAG_TERM_VALID) {
+        printf("[NET][WORLD] host: fish/bug term changed -> gyoei_term=%u insect_term=%u (world_seq %u)\n",
+               (unsigned)cur_state.gyoei_term, (unsigned)cur_state.insect_term, (unsigned)s_world_seq);
+    }
 
     for (i = 0; i < PC_NET_MAX_PEERS; i++) {
         int backlog;
@@ -2910,6 +4164,113 @@ static void pcnetgame_host_check_world_meta(void) {
     }
 }
 
+/* N-clock milestone: builds one CLOCK_SYNC message from the CURRENT host clock (OSGetTime() +
+ * Save_Get(time_delta), read fresh at call time -- never cached) and the given flags. Does not touch
+ * s_host_clock_seq; callers own bumping it exactly once per distinct broadcast/send event (see the
+ * two send helpers below), matching s_world_seq's own "caller bumps, builder just stamps" convention. */
+static void pcnetgame_build_clock_sync_msg(PCNetGameClockSyncMsg* msg, uint8_t flags) {
+    memset(msg, 0, sizeof(*msg));
+    msg->msg_type = (uint8_t)PC_NETGAME_MSG_CLOCK_SYNC;
+    msg->flags = flags;
+    msg->clock_seq = s_host_clock_seq;
+    msg->host_game_ticks = (int64_t)(OSGetTime() + Save_Get(time_delta));
+}
+
+/* N-clock milestone: the initial sync for ONE peer, sent right after its SNAPSHOT_END (join/late-join/
+ * reconnect) -- see the call site in pcnetgame_host_pump_snapshots() below. Always its own fresh
+ * clock_seq (the shared counter is bumped here), so it is unconditionally newer than that peer's
+ * freshly-reset s_client_clock_seq_applied (0, or whatever an earlier peer's unrelated broadcast last
+ * left it at -- either way this send's clock_seq is greater) and therefore always applied by the
+ * client's Rule 1 gate the moment it is READY with world latched. Not gated on backlog/snap_active
+ * (the snapshot for this exact peer just finished) -- a dropped send here is not fatal since the next
+ * periodic broadcast (<=30s later) or a future reconnect will cover it. */
+static void pcnetgame_host_send_clock_sync_initial(PCNetPeerId peer) {
+    PCNetGameClockSyncMsg msg;
+    ++s_host_clock_seq;
+    pcnetgame_build_clock_sync_msg(&msg, 0);
+    if (!pc_net_send(peer, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+        if (g_pc_verbose) {
+            printf("[NET][CLOCK] host: initial CLOCK_SYNC to peer %d could not be queued (window full)\n",
+                   (int)peer);
+        }
+        return;
+    }
+    if (g_pc_verbose) {
+        OSCalendarTime cal;
+        OSTicksToCalendarTime((OSTime)msg.host_game_ticks, &cal);
+        printf("[NET][CLOCK] host: initial CLOCK_SYNC sent to peer %d (clock_seq %u) -- host time "
+               "%04d-%02d-%02d %02d:%02d:%02d weekday=%d Kabu price (from schedule)=%u\n",
+               (int)peer, (unsigned)msg.clock_seq, cal.year, cal.mon + 1, cal.mday, cal.hour, cal.min,
+               cal.sec, cal.wday, (unsigned)Save_Get(kabu_price_schedule.daily_price[cal.wday]));
+    }
+}
+
+/* N-clock milestone: one broadcast event (periodic cadence or a detected manual clock-adjust
+ * discontinuity) -- ONE clock_seq bump, ONE host_game_ticks sample, sent identically to every READY
+ * peer. Peers with an active snapshot are skipped (mirroring pcnetgame_host_check_world_meta()'s own
+ * convention exactly): they get their own initial sync moments later, right when their SNAPSHOT_END
+ * goes out (see pcnetgame_host_send_clock_sync_initial() above), so skipping them here never leaves a
+ * peer permanently uncovered. Runs with zero, one, or many READY peers -- with zero this still bumps
+ * s_host_clock_seq and updates the host's own free-running clock is unaffected either way (the host is
+ * never offset -- see s_pc_net_clock_offset's doc comment, lb_rtc.c). */
+static void pcnetgame_host_broadcast_clock_sync(uint8_t flags) {
+    PCNetGameClockSyncMsg msg;
+    int i;
+
+    ++s_host_clock_seq;
+    pcnetgame_build_clock_sync_msg(&msg, flags);
+    if (flags & PC_NETGAME_CLOCK_SYNC_FLAG_DISCONTINUITY) {
+        printf("[NET][CLOCK] host: manual clock adjustment detected -- broadcasting CLOCK_SYNC "
+               "(discontinuity, clock_seq %u, host_game_ticks %lld)\n",
+               (unsigned)s_host_clock_seq, (long long)msg.host_game_ticks);
+    } else if (g_pc_verbose) {
+        printf("[NET][CLOCK] host: periodic CLOCK_SYNC broadcast (clock_seq %u, host_game_ticks %lld)\n",
+               (unsigned)s_host_clock_seq, (long long)msg.host_game_ticks);
+    }
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || s_host_peer[i].snap_active) {
+            continue;
+        }
+        if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg)) && g_pc_verbose) {
+            printf("[NET][CLOCK] host: CLOCK_SYNC to peer %d could not be queued (window full)\n", i);
+        }
+    }
+}
+
+/* N-clock milestone, host side: watches Save_Get(time_delta) for a change between polls (mirroring
+ * pcnetgame_host_check_world_meta()'s own before-vs-after watch pattern exactly -- no new hook into
+ * lbRTC_SetTime() needed) to detect a manual clock adjustment via the in-game menu, and otherwise
+ * broadcasts on a plain PC_NETGAME_CLOCK_SYNC_INTERVAL_MS real-time cadence. Runs once per
+ * pcnetgame_host_world_poll() call, after the renew-time/weather/market watch. The very first call
+ * after the host world becomes ready only records the current time_delta/timer baseline and sends
+ * nothing here -- every already-READY-or-about-to-be-READY peer gets its own initial sync via
+ * pcnetgame_host_send_clock_sync_initial() at its SNAPSHOT_END, so no peer is ever left waiting up to
+ * a full 30s for its first clock correction. */
+static void pcnetgame_host_check_clock_sync(void) {
+    OSTime cur_delta;
+
+    if (!s_host_world_ready) {
+        return;
+    }
+    cur_delta = Save_Get(time_delta);
+    if (!s_host_clock_last_delta_valid) {
+        s_host_clock_last_delta = cur_delta;
+        s_host_clock_last_delta_valid = 1;
+        s_host_clock_sync_last_ms = pcnetgame_now_ms();
+        return;
+    }
+    if (cur_delta != s_host_clock_last_delta) {
+        s_host_clock_last_delta = cur_delta;
+        pcnetgame_host_broadcast_clock_sync((uint8_t)PC_NETGAME_CLOCK_SYNC_FLAG_DISCONTINUITY);
+        s_host_clock_sync_last_ms = pcnetgame_now_ms();
+        return;
+    }
+    if ((uint32_t)(pcnetgame_now_ms() - s_host_clock_sync_last_ms) >= PC_NETGAME_CLOCK_SYNC_INTERVAL_MS) {
+        pcnetgame_host_broadcast_clock_sync(0);
+        s_host_clock_sync_last_ms = pcnetgame_now_ms();
+    }
+}
+
 /* Sends queued snapshot messages to every READY peer with an active snapshot, a few per poll and
  * only while that peer's reliable backlog is under PC_NETGAME_SNAPSHOT_BACKLOG_LIMIT. Each block is
  * built at send time: its acre is flushed first (committing -- and broadcasting to everyone,
@@ -2918,6 +4279,10 @@ static void pcnetgame_host_check_world_meta(void) {
 /* Forward-declared: defined near the other villager-population host-side functions, below; used here
  * (snap_stage 2) before that point in the file. */
 static void pcnetgame_build_villager_snapshot(PCNetGameVillagerSnapshotMsg* vs, uint32_t epoch);
+/* Forward-declared: defined near the other friendship-sync host-side functions, below; used here
+ * (snap_stage 3) before that point in the file. */
+static int pcnetgame_build_friendship_snapshot_entry(PCNetGameFriendshipSnapshotEntryMsg* fe, int slot,
+                                                      int memory_idx);
 
 static void pcnetgame_host_pump_snapshots(void) {
     int i;
@@ -2950,6 +4315,29 @@ static void pcnetgame_host_pump_snapshots(void) {
                 st->snap_stage = 1;
                 st->snap_next_acre = 0;
                 st->snap_blocks_sent = 0;
+            } else if (st->snap_stage == 1 && !st->snap_snowman_sent) {
+                /* World Ecology: snowmen -- one-shot, sent right after SNAPSHOT_BEGIN succeeds, before
+                 * the first FIELD_BLOCK (see PCNetGameHostPeerState.snap_snowman_sent's own doc for
+                 * why: a late-joiner must never see a SNOWMAN0..8 tile arrive before the slot/size/
+                 * score/date data that explains it). Retried next poll on a failed send, exactly like
+                 * every other snapshot sub-stage here. */
+                PCNetGameSnowmanStateMsg sm;
+                uint8_t bytes[16];
+
+                pcnetgame_build_snowman_state_bytes(bytes);
+                memset(&sm, 0, sizeof(sm));
+                sm.msg_type = (uint8_t)PC_NETGAME_MSG_SNOWMAN_STATE;
+                sm.flags = (uint8_t)PC_NETGAME_SNOWMAN_STATE_FLAG_IN_SNAPSHOT;
+                sm.world_seq = s_snowman_world_seq;
+                memcpy(sm.snowmen, bytes, sizeof(sm.snowmen));
+                sm.year = bytes[12];
+                sm.month = bytes[13];
+                sm.day = bytes[14];
+                sm.hour = bytes[15];
+                if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &sm, (uint16_t)sizeof(sm))) {
+                    break;
+                }
+                st->snap_snowman_sent = 1;
             } else if (st->snap_stage == 1) {
                 static PCNetGameFieldBlockMsg fb; /* 588 B, built and sent synchronously */
                 uint32_t epoch_before = st->snap_epoch;
@@ -2980,6 +4368,34 @@ static void pcnetgame_host_pump_snapshots(void) {
                     break;
                 }
                 st->snap_stage = 3;
+                st->snap_next_friendship_idx = 0;
+            } else if (st->snap_stage == 3) {
+                /* Friendship/mail sync milestone: one PCNetGameFriendshipSnapshotEntryMsg per
+                 * OCCUPIED Anmmem_c entry, flat-iterated over (slot, memory_idx) pairs; empty
+                 * entries are skipped without sending (see the struct's own doc comment). */
+                static PCNetGameFriendshipSnapshotEntryMsg fe; /* 292 B, built and sent synchronously */
+                int found = 0;
+                while (st->snap_next_friendship_idx < ANIMAL_NUM_MAX * ANIMAL_MEMORY_NUM) {
+                    int slot = st->snap_next_friendship_idx / ANIMAL_MEMORY_NUM;
+                    int memory_idx = st->snap_next_friendship_idx % ANIMAL_MEMORY_NUM;
+                    if (pcnetgame_build_friendship_snapshot_entry(&fe, slot, memory_idx)) {
+                        found = 1;
+                        break;
+                    }
+                    st->snap_next_friendship_idx++;
+                }
+                if (!found) {
+                    st->snap_stage = 4;
+                    sent++; /* still counts against the budget -- a fully-empty town must not spin */
+                    continue;
+                }
+                if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &fe, (uint16_t)sizeof(fe))) {
+                    break;
+                }
+                st->snap_next_friendship_idx++;
+                if (st->snap_next_friendship_idx >= ANIMAL_NUM_MAX * ANIMAL_MEMORY_NUM) {
+                    st->snap_stage = 4;
+                }
             } else {
                 PCNetGameSnapshotEndMsg e;
                 memset(&e, 0, sizeof(e));
@@ -2987,7 +4403,7 @@ static void pcnetgame_host_pump_snapshots(void) {
                 e.grid = (uint8_t)PC_NETGAME_GRID_TOWN;
                 e.acre_count = (uint8_t)st->snap_blocks_sent;
                 e.flags = (uint8_t)(PC_NETGAME_META_FLAG_RENEW_TIME_VALID | PC_NETGAME_META_FLAG_WEATHER_VALID |
-                                    PC_NETGAME_META_FLAG_MARKET_VALID);
+                                    PC_NETGAME_META_FLAG_MARKET_VALID | PC_NETGAME_META_FLAG_TERM_VALID);
                 e.epoch = st->snap_epoch;
                 e.world_seq = s_world_seq;
                 e.renew_time = s_host_meta_renew; /* == the Save value: the meta check ran this poll */
@@ -2996,6 +4412,12 @@ static void pcnetgame_host_pump_snapshots(void) {
                     break;
                 }
                 st->snap_active = 0;
+                /* N-clock milestone: this peer's snapshot (initial join, late-join/RESYNC_REQUEST, or
+                 * reconnect) just closed -- send its initial CLOCK_SYNC now, unconditionally, per the
+                 * design's "always applied unconditionally (first sync)" rule. See
+                 * pcnetgame_host_send_clock_sync_initial()'s doc comment above for why this is always
+                 * newer than the peer's just-reset s_client_clock_seq_applied. */
+                pcnetgame_host_send_clock_sync_initial((PCNetPeerId)i);
                 int known = 0, a, t;
                 for (a = 0; a < PCFA_ACRE_NUM; a++) {
                     for (t = 0; t < PCFA_TILE_NUM; t++) {
@@ -3093,6 +4515,10 @@ static void pcnetgame_host_closing_tick(void) {
  *     through the normal flush (a big difference becomes a snapshot resync of every peer);
  *   - different town: every READY peer is dropped with REJECT(LAND_MISMATCH) and the shadow is
  *     rebuilt for the new town (peers still in HANDSHAKE are validated against it normally). */
+/* Forward-declared: defined near the other World Ecology T1 tree-cut host-side state, below; used here
+ * (town-change branch) before that point in the file -- see s_host_tree_cut_count's own doc. */
+static void pcnetgame_reset_host_tree_cut_state(void);
+
 static void pcnetgame_host_world_tick(int local_ready) {
     PCNetGameTownIdentity cur;
 
@@ -3119,6 +4545,21 @@ static void pcnetgame_host_world_tick(int local_ready) {
         }
         s_host_shadow_valid = 0;
         s_host_world_ready = 0;
+        /* World Ecology Stage 1, Item 2 / review finding: a money-rock bookkeeping slot stores
+         * acre/tile indices into the OLD town's field data. Without this, the SAME running host
+         * process could carry stale s_host_money_rock[] entries into a genuinely different town
+         * (this branch is reached precisely because the town changed without a process restart --
+         * e.g. the host travelled through a friend's gate or loaded a different save), where those
+         * acre/tile indices could coincidentally alias real tiles in the new town's field and later
+         * be wrongly reverted/expired against them. Matches pcnetgame_reset_host_world_state()'s own
+         * full-session-reset clear of this same table. */
+        memset(s_host_money_rock, 0, sizeof(s_host_money_rock));
+        /* World Ecology T1 review fix: the tree-cut cut-count table has the exact same stale-town
+         * hazard as s_host_money_rock above (a per-tile in-progress hit count surviving into a
+         * genuinely different town's field, where its acre/tile indices could coincidentally alias a
+         * real tile and wrongly resume mid-chop instead of requiring the full hit count again). Reset
+         * alongside the money-rock table, in this same branch. */
+        pcnetgame_reset_host_tree_cut_state();
     }
     s_host_town = cur;
     s_host_town_valid = 1;
@@ -3148,8 +4589,14 @@ static void pcnetgame_host_world_poll(void) {
     mask = pcfa_take_dirty_acres() | s_host_carry_dirty | ((uint32_t)1u << s_host_scan_cursor);
     s_host_carry_dirty = 0;
     s_host_scan_cursor = (s_host_scan_cursor + 1) % PCFA_ACRE_NUM;
+    /* World Ecology: snowmen -- runs BEFORE this poll's flush so a melt/other off-tile Save_t.snowmen
+     * change is always broadcast no later than the tile change it may accompany (see
+     * pcnetgame_host_check_snowman_state_diff()'s own doc for why this catches melt with no per-cause
+     * plumbing; BUILD/BREAK additionally call it directly, right after their own commit). */
+    pcnetgame_host_check_snowman_state_diff();
     pcnetgame_host_flush_mask(mask);
     pcnetgame_host_check_world_meta();
+    pcnetgame_host_check_clock_sync();
     pcnetgame_host_pump_snapshots();
 }
 
@@ -3191,6 +4638,45 @@ static void pcnetgame_host_send_drop_result(PCNetPeerId peer, uint32_t request_i
     pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "DROP_RESULT");
 }
 
+/* World Ecology T3: sends a BURY_RESULT. `buried_item` on accept is the claimed_item echo (see
+ * PCNetGameBuryResultMsg's own doc); on reject it is the reconciliation echo (the host's CURRENT tile
+ * value) and `flags`/`reason` carry the reconciliation bits -- callers pass 0 for a plain, no-echo
+ * rejection (nothing valid could be read) or the result of pcnetgame_bury_echo_current() otherwise. */
+static void pcnetgame_host_send_bury_result(PCNetPeerId peer, uint32_t request_id, uint8_t ut_x, uint8_t ut_z,
+                                            int accepted, uint16_t buried_item, uint8_t flags, uint8_t reason) {
+    PCNetGameBuryResultMsg out;
+    memset(&out, 0, sizeof(out));
+    out.msg_type = (uint8_t)PC_NETGAME_MSG_BURY_RESULT;
+    out.accepted = (uint8_t)(accepted != 0);
+    out.ut_x = ut_x;
+    out.ut_z = ut_z;
+    out.request_id = request_id;
+    out.buried_item = buried_item;
+    out.flags = flags;
+    out.reason = reason;
+    pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "BURY_RESULT");
+}
+
+/* Forward-declared: defined further down alongside pcnetgame_validate_and_resolve_bury() (needs
+   pcnetgame_tree_reach_check(), which is itself defined after this point in the file); used here. */
+static int pcnetgame_bury_echo_current(uint8_t ut_x, uint8_t ut_z, uint16_t* out_value, int* out_dep_on);
+
+/* World Ecology T3: builds a reject BURY_RESULT's reconciliation fields from the host's CURRENT tile
+ * state at (ut_x, ut_z) -- shared by every BURY reject path (validate-time and commit-time alike) so
+ * the echo logic lives in exactly one place. */
+static void pcnetgame_host_send_bury_reject(PCNetPeerId peer, uint32_t request_id, uint8_t ut_x, uint8_t ut_z) {
+    uint16_t value = 0;
+    int dep_on = 0;
+    uint8_t flags = 0;
+    if (pcnetgame_bury_echo_current(ut_x, ut_z, &value, &dep_on)) {
+        flags = (uint8_t)PC_NETGAME_BURY_FLAG_RECONCILE_VALID;
+        if (dep_on) {
+            flags |= (uint8_t)PC_NETGAME_BURY_FLAG_DEPOSIT_ON;
+        }
+    }
+    pcnetgame_host_send_bury_result(peer, request_id, ut_x, ut_z, 0, value, flags, (uint8_t)PC_NETGAME_BURY_REASON_NONE);
+}
+
 /* Answers a repeated request_id from the peer's cached record, per phase (see
  * PCNetGameHostInteraction's doc): PENDING replays the provisional accept (reservation and timer
  * untouched), DONE replays what was cached, ABORTED/EXPIRED answer accepted=0 so a released
@@ -3201,6 +4687,13 @@ static void pcnetgame_host_replay(PCNetPeerId peer, int kind, const PCNetGameHos
                        : 0;
     if (kind == (int)PC_NETGAME_INTERACT_KIND_PICKUP) {
         pcnetgame_host_send_pickup_result(peer, rec->request_id, rec->ut_x, rec->ut_z, accepted, rec->item);
+    } else if (kind == (int)PC_NETGAME_INTERACT_KIND_BURY) {
+        /* World Ecology T3: a replayed BURY reject carries no fresh reconciliation echo (this is a
+           retry of an ALREADY-decided request, not a new rejection) -- accepted=0/buried_item=0/flags=0
+           is correct here; a genuine reject always goes through pcnetgame_host_send_bury_reject()
+           instead, at the point the decision is actually made. */
+        pcnetgame_host_send_bury_result(peer, rec->request_id, rec->ut_x, rec->ut_z, accepted, accepted ? rec->item : 0,
+                                        0, (uint8_t)PC_NETGAME_BURY_REASON_NONE);
     } else {
         pcnetgame_host_send_drop_result(peer, rec->request_id, rec->ut_x, rec->ut_z, accepted, rec->item);
     }
@@ -3351,6 +4844,2164 @@ static void pcnetgame_handle_host_drop_request(PCNetPeerId peer, const PCNetGame
     pcnetgame_host_send_drop_result(peer, in->request_id, in->ut_x, in->ut_z, accepted, (uint16_t)placed_item);
 }
 
+/* World Ecology Stage 1, Item 1: read-only validation for one DIG_BURIED request, mirroring
+ * pcnetgame_validate_and_resolve_pickup()'s own shape (reservation check, reach check) but keyed off
+ * the DEPOSIT bit being SET (a buried item) rather than clear. The granted item is the host's own
+ * pcfa_get_tile() read at the target tile, resolved through the same pcnetgame_resolve_pickup_item()
+ * pickup already uses (handles the present/golden-tool sentinels uniformly; a no-op passthrough for
+ * every ordinary buried item) -- never RNG, never the client's claim. */
+/* T0-A: the reach-check block previously duplicated verbatim at TWO call sites --
+ * pcnetgame_validate_and_resolve_dig() and pcnetgame_validate_money_rock_hit() -- extracted here with
+ * ZERO behavioral change: identical tile-center formula, identical PC_NETGAME_PICKUP_MAX_REACH_SQ/_Y
+ * constants, identical `center.y = py` convention (see pcnetgame_validate_and_resolve_pickup()'s own
+ * doc on why that's deliberate). Returns 1 iff (ut_x, ut_z)'s tile center is within reach of
+ * (px, py, pz) -- the requester's own last-synced position. Both callers already validated
+ * pcnetgame_pos_valid(px, py, pz) before calling this. */
+static int pcnetgame_field_action_reach_check(uint8_t ut_x, uint8_t ut_z, float px, float py, float pz) {
+    xyz_t center;
+    float dx, dz, dy;
+
+    center.x = (f32)ut_x * mFI_UT_WORLDSIZE_X_F + mFI_UT_WORLDSIZE_HALF_X_F;
+    center.z = (f32)ut_z * mFI_UT_WORLDSIZE_Z_F + mFI_UT_WORLDSIZE_HALF_Z_F;
+    center.y = py;
+    dx = center.x - px;
+    dz = center.z - pz;
+    dy = center.y - py;
+    return (dx * dx + dz * dz) <= PC_NETGAME_PICKUP_MAX_REACH_SQ && fabsf(dy) <= PC_NETGAME_PICKUP_MAX_REACH_Y;
+}
+
+/* World Ecology T1: standalone tree-specific reach check -- see PC_NETGAME_TREE_REACH_SQ's own doc for
+ * why this is a full, deliberate duplicate of pcnetgame_field_action_reach_check()'s math above (not a
+ * refactor of it) rather than a shared parameterized helper. */
+static int pcnetgame_tree_reach_check(uint8_t ut_x, uint8_t ut_z, float px, float py, float pz) {
+    xyz_t center;
+    float dx, dz, dy;
+
+    center.x = (f32)ut_x * mFI_UT_WORLDSIZE_X_F + mFI_UT_WORLDSIZE_HALF_X_F;
+    center.z = (f32)ut_z * mFI_UT_WORLDSIZE_Z_F + mFI_UT_WORLDSIZE_HALF_Z_F;
+    center.y = py;
+    dx = center.x - px;
+    dz = center.z - pz;
+    dy = center.y - py;
+    return (dx * dx + dz * dz) <= PC_NETGAME_TREE_REACH_SQ && fabsf(dy) <= PC_NETGAME_PICKUP_MAX_REACH_Y;
+}
+
+/* World Ecology T3: every read-only validation step for one BURY request/host-local action, in
+ * sequence, stopping at the first failure -- never mutates anything. `is_host_local` skips the reach
+ * and PLAYER_CONTEXT/IN_TOWN checks (the host's own real local targeting already guarantees those),
+ * mirroring pcnetgame_fa_validate_adapter_money_rock()'s own is_host_local exemption pattern; `peer` is
+ * only read when !is_host_local. Uses PC_NETGAME_TREE_REACH_SQ (~80 units), NOT
+ * PC_NETGAME_PICKUP_MAX_REACH_SQ (~50 units) -- a shovel bury target can legitimately be up to ~63.25
+ * units from the player (same shovel-range reasoning PC_NETGAME_TREE_REACH_SQ's own doc already
+ * establishes for tree targets), so the tighter pickup envelope would falsely reject legitimate buries.
+ * On success, fills *out_acre/*out_tile (the persistent address of the reserved tile) and
+ * *out_raw_item (the tile's raw value observed now -- HOLE00..24 or HOLE_SHINE; the COMMIT re-checks
+ * this is still exactly that value before writing anything). */
+static int pcnetgame_validate_and_resolve_bury(int is_host_local, PCNetPeerId peer, uint8_t pocket_slot_idx,
+                                               uint8_t ut_x, uint8_t ut_z, mActor_name_t claimed_item,
+                                               uint8_t hole_variant, int* out_acre, int* out_tile,
+                                               uint16_t* out_raw_item) {
+    uint16_t raw_value;
+    int acre, tile;
+    int holder;
+
+    if (!s_host_world_ready) {
+        return 0; /* host save not loaded (title / save scene) -- nothing authoritative to read */
+    }
+    if (!is_host_local) {
+        if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            return 0; /* requester is not (known to be) in the town scene */
+        }
+    }
+    if (pocket_slot_idx >= mPr_POCKETS_SLOT_COUNT) {
+        return 0; /* not a real pocket slot -- never trust it (the host cannot verify actual
+                     possession any more than pickup/drop already can -- see their own doc) */
+    }
+    if (!pcnetgame_is_buryable_item(claimed_item)) {
+        return 0; /* outside this build's supported bury item classification */
+    }
+    if (!pcnetgame_validate_bury_hole_variant(hole_variant)) {
+        return 0; /* TRUST BOUNDARY -- out-of-range hole_variant is rejected, never clamped */
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0; /* not a persistent town tile -- never trust it, whatever the client intended */
+    }
+    holder = pcnetgame_host_tile_reserved_by(acre, tile);
+    if (holder >= 0) {
+        if (g_pc_verbose) {
+            printf("[NET][BURY] host: peer %d bury at tile (%d,%d) rejected: tile reserved by peer %d\n",
+                   is_host_local ? -1 : (int)peer, (int)ut_x, (int)ut_z, holder);
+        }
+        return 0; /* another peer's pending pickup/drop/bury holds this tile */
+    }
+    if (pcfa_get_deposit(acre, tile) != 0) {
+        return 0; /* already buried -- never a legal bury target */
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    if (!ITEM_IS_HOLE(raw_value) && raw_value != (uint16_t)HOLE_SHINE) {
+        return 0; /* not a hole at all -- only a HOLE00..24 or HOLE_SHINE tile can receive a bury */
+    }
+
+    if (!is_host_local) {
+        float px, py, pz;
+        if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+            return 0; /* no movement sample from this peer yet */
+        }
+        if (!pcnetgame_pos_valid(px, py, pz)) {
+            return 0;
+        }
+        if (!pcnetgame_tree_reach_check(ut_x, ut_z, px, py, pz)) {
+            return 0; /* too far from this peer's last-known position -- see this function's own doc
+                         for why the tree envelope, not the tighter pickup one, is used here */
+        }
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *out_raw_item = raw_value;
+    return 1;
+}
+
+/* World Ecology T3: best-effort re-read of the host's CURRENT tile value + deposit bit at (ut_x, ut_z)
+ * for a BURY_RESULT reject echo -- mirrors pcnetgame_fa_pitfall_consume_echo_current()'s own doc
+ * exactly (pure address-space reads, safe even when s_host_world_ready is false or the tile can't be
+ * resolved -- *out_value/*out_dep_on are simply left at their caller-supplied defaults then). Unlike
+ * PITFALL_CONSUME, a bury race can leave deposit ON (another peer's bury already committed), so this
+ * also reports the deposit bit -- see PCNetGameBuryResultMsg's own DEPOSIT_ON flag doc. Returns 1 iff
+ * both reads succeeded (a genuine echo the client should trust -- RECONCILE_VALID). */
+static int pcnetgame_bury_echo_current(uint8_t ut_x, uint8_t ut_z, uint16_t* out_value, int* out_dep_on) {
+    int acre, tile;
+    uint16_t value;
+
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile) || !pcfa_get_tile(acre, tile, &value)) {
+        return 0;
+    }
+    /* Bug 2 fix: a TRANSIENT (or AMBIGUOUS) current value -- e.g. RSV_NO mid another player's
+     * bury-commit -- must never be echoed as a hard reconciliation value. A client that applies it via
+     * pcnetgame_client_apply_tile() would then treat the tile as "not overwritable while in town"
+     * (see that function's own doc), parking/blocking future legitimate updates for it. Fall back to
+     * the existing "nothing valid to echo" behavior (return 0, caller sends flags=0 / no
+     * RECONCILE_VALID) exactly like an unreadable tile already does above. */
+    if (pcfa_transient_kind(value) != PCFA_VALUE_STABLE) {
+        return 0;
+    }
+    *out_value = value;
+    *out_dep_on = pcfa_get_deposit(acre, tile) != 0;
+    return 1;
+}
+
+static int pcnetgame_validate_and_resolve_dig(PCNetPeerId peer, uint8_t ut_x, uint8_t ut_z,
+                                              mActor_name_t* out_granted_item, int* out_acre, int* out_tile) {
+    uint16_t raw_value;
+    mActor_name_t raw_item;
+    float px, py, pz;
+    int acre, tile;
+
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+        return 0;
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+        return 0; /* another peer's pending pickup/drop reservation holds this tile */
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    raw_item = (mActor_name_t)raw_value;
+
+    if (pcfa_get_deposit(acre, tile) != 0) {
+        /* Ordinary buried item (case 5a, unchanged): fail closed on EMPTY_NO/unknown. */
+        if (raw_item == (mActor_name_t)EMPTY_NO || mNT_check_unknown(raw_item)) {
+            return 0;
+        }
+        *out_granted_item = pcnetgame_resolve_pickup_item(raw_item);
+    } else if (ITEM_IS_BURIED_PITFALL_HOLE(raw_value)) {
+        /* World Ecology T-dig, case 5b: deposit OFF but the tile is a BURIED_PITFALL_HOLE00..24 value --
+         * this is DIGGING UP an already-buried pitfall (distinct from PITFALL_CONSUME, kind 7, which is
+         * a player/villager falling INTO one) -- folded into this same extended DIG_BURIED validator per
+         * this task's design brief rather than given its own kind, since the host resolves the item
+         * either way. Always grants ITM_PITFALL, never RNG, never the client's claim. */
+        *out_granted_item = (mActor_name_t)ITM_PITFALL;
+    } else {
+        return 0; /* neither an ordinary buried item nor a buried-pitfall-dig signature */
+    }
+
+    if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+        return 0;
+    }
+    if (!pcnetgame_pos_valid(px, py, pz)) {
+        return 0;
+    }
+    if (!pcnetgame_field_action_reach_check(ut_x, ut_z, px, py, pz)) {
+        return 0;
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    return 1;
+}
+
+/* World Ecology T-dig fix: HOLE_START + a HOST-VALIDATED hole_variant (0..24, see
+ * pcnetgame_validate_hole_variant()) is now committed as the dig-hole graphic, instead of the previous
+ * Stage 1 simplification of always hardcoding HOLE_START -- the caller (pcnetgame_fa_commit_adapter_dig())
+ * has already range-checked req->hole_variant via the adapter's own validate step before this is ever
+ * called, so hole_variant here is trusted to be in range. Used for BOTH of DIG_BURIED's (kind 1) two
+ * outcomes (ordinary buried item AND the pitfall-dig sub-case) as well as DIG_HOLE (kind 5) -- all three
+ * commit the exact same tile transition. */
+static void pcnetgame_host_commit_dig_buried(int acre, int tile, uint8_t hole_variant) {
+    pcfa_set_tile(acre, tile, (uint16_t)(HOLE_START + hole_variant));
+    pcfa_set_deposit(acre, tile, 0);
+}
+
+/* World Ecology Stage 1, Item 2: finds a free (EMPTY_NO) neighbor tile for a money-rock drop, exactly
+ * like mFI_search_unit_around_high(pos, EMPTY_NO, cur_pos) does in bg_item_common.c_inc, but entirely
+ * in persistent ut/acre/tile space via pcfa_get_tile() -- never mFI_GetUnitFG()/mCoBG_* scene-relative
+ * calls, which would read the HOST's own currently-loaded scene rather than the persistent town (the
+ * host may be indoors). Deliberate simplifications versus vanilla: no height/collision fit check
+ * (mCoBG_CheckPlace(), mCoBG_GetBgY_OnlyCenter_FromWpos2()'s +/-40 band) -- cosmetic-only concerns
+ * that need a loaded collision mesh (see below); and neighbor SEARCH ORDER need not match vanilla's exact
+ * BI_chk_pos table since any free neighbor is an equally valid drop spot. Center tile (the rock's own
+ * tile) is checked last, matching vanilla's own fallback-to-origin order. Returns 1 and fills
+ * *out_acre/*out_tile on success, 0 if every candidate is occupied, RESERVED, or off the town grid.
+ *
+ * Bug 2 fix: a candidate tile currently RESERVED by another peer's pending pickup/drop
+ * (pcnetgame_host_tile_reserved_by() >= 0) is skipped too -- that peer's own pending COMMIT is about
+ * to write that exact tile, and dropping a money bag onto it first would either corrupt that peer's
+ * own commit re-validation or silently destroy the freshly dropped bag. If NO candidate tile is valid
+ * (all occupied/deposited/reserved, or off-grid), this hit's drop is skipped entirely by the caller --
+ * matching vanilla's own bIT_actor_ten_coin_entryR() behavior, which still advances hit_count/window
+ * state regardless and only skips the drop+sound when no valid position was found. No retry, no
+ * deferral, no queue: the hit still counts.
+ *
+ * Review finding, investigated and accepted as a documented limitation (no fix possible without new
+ * persistent data): this search has no water/river/cliff exclusion, so a reward bag could rarely land
+ * on genuinely unplaceable terrain even for the HOST's own local hit. A field-data-only equivalent was
+ * traced and confirmed NOT to exist -- pcfa_get_tile()/pcfa_get_deposit() only ever read Save_t.fg
+ * (the per-tile item/actor-name array) and Save_t.deposit (the buried-tile bitmap); nothing in Save_t
+ * records terrain shape. Water/river/cliff/waterfall/diagonal-corner legality is determined solely by
+ * mCoBG_CheckPlace() against the CURRENTLY LOADED scene's collision mesh (g_fdinfo->block_info[...]
+ * .bg_info.collision, populated per BG block only while that acre's model is resident) -- there is no
+ * per-acre/per-tile terrain-type table anywhere in the save to consult instead. Since this same search
+ * also runs for a REMOTE peer's money-rock hit while the HOST may be indoors or elsewhere in the town
+ * (i.e. with no relevant collision loaded at all), it cannot conditionally call mCoBG_CheckPlace()
+ * either: that would make the outcome depend on where the host's own local camera happens to be,
+ * a much worse, non-deterministic behavior than simply never checking terrain. Impact is limited to a
+ * rare cosmetic inconvenience (a bag occasionally lands somewhere unreachable), never item loss,
+ * duplication, or corruption -- the hit-count/window bookkeeping above is entirely unaffected, and
+ * this mirrors vanilla's own documented fallback-to-origin behavior when a search finds no valid
+ * neighbor at all. */
+static int pcnetgame_find_money_rock_drop_tile(int center_ut_x, int center_ut_z, int* out_acre, int* out_tile) {
+    static const int dxs[9] = { -1, -1, 1, 1, -1, 0, 1, 0, 0 };
+    static const int dzs[9] = { -1, 1, 1, -1, 0, 1, 0, -1, 0 };
+    int i;
+
+    for (i = 0; i < 9; i++) {
+        int ut_x = center_ut_x + dxs[i];
+        int ut_z = center_ut_z + dzs[i];
+        int acre, tile;
+        uint16_t value;
+
+        if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+            continue;
+        }
+        if (!pcfa_town_ut_to_acre_tile(ut_x, ut_z, &acre, &tile)) {
+            continue;
+        }
+        if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+            continue; /* another peer's pending pickup/drop holds this tile -- Bug 2 fix, see doc above */
+        }
+        if (pcfa_get_deposit(acre, tile) != 0) {
+            continue; /* a buried tile is never a valid drop spot */
+        }
+        if (!pcfa_get_tile(acre, tile, &value) || value != (uint16_t)EMPTY_NO) {
+            continue;
+        }
+        *out_acre = acre;
+        *out_tile = tile;
+        return 1;
+    }
+    return 0;
+}
+
+/* ==================== World Ecology T1: tree shake / chop / bee-birth ==================== */
+
+/* World Ecology T1: generalizes pcnetgame_find_money_rock_drop_tile()'s free-neighbor search to an
+ * arbitrary center -- a NEW function; money-rock's own search and its call site above are completely
+ * untouched. Candidate order: origin, then the 4 orthogonal neighbors (N/E/S/W), then the 4 diagonals --
+ * origin FIRST (unlike money-rock's own order, which checks its rock's own tile LAST) because a tree
+ * drop's most natural landing spot is at/around the tree's own tile itself, per this task's design
+ * brief. Same filters as money-rock's search: on-grid, not reserved by another peer's pending pickup/
+ * drop (pcnetgame_host_tile_reserved_by()), not a buried tile, and EMPTY_NO. Returns 1 and fills
+ * *out_acre/*out_tile on success, 0 if every candidate is occupied/reserved/off-grid -- the caller
+ * (pcnetgame_host_place_tree_drops()) simply loses that one dropped copy, exactly like vanilla's own
+ * fallback-to-origin behavior and money-rock's own documented loss-on-no-space precedent. */
+static int pcnetgame_find_free_tile_around(int center_ut_x, int center_ut_z, int* out_acre, int* out_tile) {
+    static const int dxs[9] = { 0, 0, 1, 0, -1, -1, 1, 1, -1 };
+    static const int dzs[9] = { 0, -1, 0, 1, 0, -1, -1, 1, 1 };
+    int i;
+
+    for (i = 0; i < 9; i++) {
+        int ut_x = center_ut_x + dxs[i];
+        int ut_z = center_ut_z + dzs[i];
+        int acre, tile;
+        uint16_t value;
+
+        if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+            continue;
+        }
+        if (!pcfa_town_ut_to_acre_tile(ut_x, ut_z, &acre, &tile)) {
+            continue;
+        }
+        if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+            continue;
+        }
+        if (pcfa_get_deposit(acre, tile) != 0) {
+            continue;
+        }
+        if (!pcfa_get_tile(acre, tile, &value) || value != (uint16_t)EMPTY_NO) {
+            continue;
+        }
+        *out_acre = acre;
+        *out_tile = tile;
+        return 1;
+    }
+    return 0;
+}
+
+/* World Ecology T1: a byte-exact duplicate of drop_fruit()'s own 21-row fg_ytable
+ * (bg_item_common.c_inc) -- duplicated here (rather than shared) because the original is `static` inside
+ * a different translation unit, exactly the same reason pc_net_game.c already duplicates
+ * bIT_actor_ten_coin_entryR()'s reward switch for MONEY_ROCK_HIT instead of calling it. Keep this in
+ * sync with drop_fruit()'s own table by hand if that table ever changes -- there is no way to enforce
+ * this at compile time across translation units. */
+typedef struct PCNetGameTreeDropRow {
+    mActor_name_t src_tree_item;
+    mActor_name_t dropped_item;
+    mActor_name_t dst_tree_item;
+    s16            drop_count;
+} PCNetGameTreeDropRow;
+
+static const PCNetGameTreeDropRow s_tree_drop_tbl[] = {
+    { TREE_APPLE_FRUIT, ITM_FOOD_APPLE, TREE_APPLE_NOFRUIT_0, 3 },
+    { TREE_ORANGE_FRUIT, ITM_FOOD_ORANGE, TREE_ORANGE_NOFRUIT_0, 3 },
+    { TREE_PEACH_FRUIT, ITM_FOOD_PEACH, TREE_PEACH_NOFRUIT_0, 3 },
+    { TREE_PEAR_FRUIT, ITM_FOOD_PEAR, TREE_PEAR_NOFRUIT_0, 3 },
+    { TREE_CHERRY_FRUIT, ITM_FOOD_CHERRY, TREE_CHERRY_NOFRUIT_0, 3 },
+    { TREE_1000BELLS, ITM_MONEY_1000, TREE, 3 },
+    { TREE_10000BELLS, ITM_MONEY_10000, TREE, 3 },
+    { TREE_30000BELLS, ITM_MONEY_30000, TREE, 3 },
+    { TREE_100BELLS, ITM_MONEY_100, TREE, 3 },
+    { TREE_FTR, FTR_START(FTR_NOG_FAN01), TREE, 1 },
+    { TREE_BEES, HONEYCOMB, TREE, 1 },
+    { TREE_PRESENT, ITM_PRESENT, TREE, 1 },
+    { TREE_BELLS, ITM_MONEY_100, TREE, 1 },
+    { TREE_PALM_FRUIT, ITM_FOOD_COCONUT, TREE_PALM_NOFRUIT_0, 2 },
+    { CEDAR_TREE_BELLS, ITM_MONEY_100, CEDAR_TREE, 1 },
+    { CEDAR_TREE_FTR, FTR_START(FTR_NOG_FAN01), CEDAR_TREE, 1 },
+    { CEDAR_TREE_BEES, HONEYCOMB, CEDAR_TREE, 1 },
+    { GOLD_TREE_BELLS, ITM_MONEY_100, GOLD_TREE, 1 },
+    { GOLD_TREE_FTR, FTR_START(FTR_NOG_FAN01), GOLD_TREE, 1 },
+    { GOLD_TREE_BEES, HONEYCOMB, GOLD_TREE, 1 },
+    { GOLD_TREE_SHOVEL, ITM_GOLDEN_SHOVEL, GOLD_TREE, 1 },
+};
+#define PC_NETGAME_TREE_DROP_TBL_COUNT (sizeof(s_tree_drop_tbl) / sizeof(s_tree_drop_tbl[0]))
+
+static const PCNetGameTreeDropRow* pcnetgame_find_tree_drop_row(mActor_name_t item) {
+    size_t i;
+    for (i = 0; i < PC_NETGAME_TREE_DROP_TBL_COUNT; i++) {
+        if (s_tree_drop_tbl[i].src_tree_item == item) {
+            return &s_tree_drop_tbl[i];
+        }
+    }
+    return NULL;
+}
+
+/* See pc_net_game.h's own doc. */
+int pc_net_game_is_tree_fruit_drop_source(int item) {
+    return pcnetgame_find_tree_drop_row((mActor_name_t)item) != NULL;
+}
+
+/* World Ecology T1: a byte-exact duplicate of bIT_common_clear_treeatr()'s own 80-row tree_cut_tbl
+ * (bg_item_common.c_inc) -- same "original is static in a different translation unit" reason as
+ * s_tree_drop_tbl above. Returns the vanilla hit-count for `item` (1/2/3, matching *_S0/*_S1/*_S2 or a
+ * full-size/special tree exactly), or -1 if `item` is not a choppable tree at all (a sapling stage
+ * below S0, a stump, or any non-tree item) -- TREE_CHOP's own validators reject on -1. */
+typedef struct PCNetGameTreeCutHitsRow {
+    mActor_name_t tree;
+    s16            cut_count;
+} PCNetGameTreeCutHitsRow;
+
+static const PCNetGameTreeCutHitsRow s_tree_cut_hits_tbl[] = {
+    { TREE_S0, 1 }, { TREE_S1, 2 }, { TREE_S2, 3 }, { TREE, 3 },
+    { TREE_APPLE_S0, 1 }, { TREE_APPLE_S1, 2 }, { TREE_APPLE_S2, 3 },
+    { TREE_APPLE_NOFRUIT_0, 3 }, { TREE_APPLE_NOFRUIT_1, 3 }, { TREE_APPLE_NOFRUIT_2, 3 },
+    { TREE_APPLE_FRUIT, 3 },
+    { TREE_ORANGE_S0, 1 }, { TREE_ORANGE_S1, 2 }, { TREE_ORANGE_S2, 3 },
+    { TREE_ORANGE_NOFRUIT_0, 3 }, { TREE_ORANGE_NOFRUIT_1, 3 }, { TREE_ORANGE_NOFRUIT_2, 3 },
+    { TREE_ORANGE_FRUIT, 3 },
+    { TREE_PEACH_S0, 1 }, { TREE_PEACH_S1, 2 }, { TREE_PEACH_S2, 3 },
+    { TREE_PEACH_NOFRUIT_0, 3 }, { TREE_PEACH_NOFRUIT_1, 3 }, { TREE_PEACH_NOFRUIT_2, 3 },
+    { TREE_PEACH_FRUIT, 3 },
+    { TREE_PEAR_S0, 1 }, { TREE_PEAR_S1, 2 }, { TREE_PEAR_S2, 3 },
+    { TREE_PEAR_NOFRUIT_0, 3 }, { TREE_PEAR_NOFRUIT_1, 3 }, { TREE_PEAR_NOFRUIT_2, 3 },
+    { TREE_PEAR_FRUIT, 3 },
+    { TREE_CHERRY_S0, 1 }, { TREE_CHERRY_S1, 2 }, { TREE_CHERRY_S2, 3 },
+    { TREE_CHERRY_NOFRUIT_0, 3 }, { TREE_CHERRY_NOFRUIT_1, 3 }, { TREE_CHERRY_NOFRUIT_2, 3 },
+    { TREE_CHERRY_FRUIT, 3 },
+    { TREE_1000BELLS_S0, 1 }, { TREE_1000BELLS_S1, 2 }, { TREE_1000BELLS_S2, 3 }, { TREE_1000BELLS, 3 },
+    { TREE_10000BELLS_S0, 1 }, { TREE_10000BELLS_S1, 2 }, { TREE_10000BELLS_S2, 3 }, { TREE_10000BELLS, 3 },
+    { TREE_30000BELLS_S0, 1 }, { TREE_30000BELLS_S1, 2 }, { TREE_30000BELLS_S2, 3 }, { TREE_30000BELLS, 3 },
+    { TREE_BEES, 3 }, { TREE_FTR, 3 }, { TREE_LIGHTS, 3 }, { TREE_PRESENT, 3 }, { TREE_BELLS, 3 },
+    { TREE_100BELLS_S0, 1 }, { TREE_100BELLS_S1, 2 }, { TREE_100BELLS_S2, 3 }, { TREE_100BELLS, 3 },
+    { TREE_PALM_S0, 1 }, { TREE_PALM_S1, 2 }, { TREE_PALM_S2, 3 },
+    { TREE_PALM_NOFRUIT_0, 3 }, { TREE_PALM_NOFRUIT_1, 3 }, { TREE_PALM_NOFRUIT_2, 3 },
+    { TREE_PALM_FRUIT, 3 },
+    { CEDAR_TREE_S0, 1 }, { CEDAR_TREE_S1, 2 }, { CEDAR_TREE_S2, 3 }, { CEDAR_TREE, 3 },
+    { CEDAR_TREE_BELLS, 3 }, { CEDAR_TREE_FTR, 3 }, { CEDAR_TREE_BEES, 3 }, { CEDAR_TREE_LIGHTS, 3 },
+    { GOLD_TREE_S0, 1 }, { GOLD_TREE_S1, 2 }, { GOLD_TREE_S2, 3 }, { GOLD_TREE_SHOVEL, 3 },
+    { GOLD_TREE, 3 }, { GOLD_TREE_BELLS, 3 }, { GOLD_TREE_FTR, 3 }, { GOLD_TREE_BEES, 3 },
+};
+#define PC_NETGAME_TREE_CUT_HITS_TBL_COUNT (sizeof(s_tree_cut_hits_tbl) / sizeof(s_tree_cut_hits_tbl[0]))
+
+static int pcnetgame_tree_cut_hits_for(mActor_name_t item) {
+    size_t i;
+    for (i = 0; i < PC_NETGAME_TREE_CUT_HITS_TBL_COUNT; i++) {
+        if (s_tree_cut_hits_tbl[i].tree == item) {
+            return (int)s_tree_cut_hits_tbl[i].cut_count;
+        }
+    }
+    return -1;
+}
+
+/* World Ecology T1: resolves drop_fruit()'s own per-row special cases -- the furniture roll
+ * (mSP_SelectRandomItem_New(), keyed on the requester's own destiny_type exactly like vanilla's
+ * Common_Get(now_private)->destiny.type read) and the TREE_BELLS/CEDAR_TREE_BELLS/GOLD_TREE_BELLS
+ * MONEY_LUCK upgrade (ITM_MONEY_100 -> ITM_MONEY_1000, deterministic, no roll) -- verbatim mirroring
+ * drop_fruit()'s own switch (bg_item_common.c_inc). Every other row's dropped_item passes through
+ * unchanged (the TREE_1000/10000/30000/100BELLS "money tree" rows already carry a fixed amount in the
+ * table itself and are never adjusted by destiny). */
+static mActor_name_t pcnetgame_resolve_tree_drop_item(const PCNetGameTreeDropRow* row, const PCNetPlayerContext* ctx) {
+    if (row->dropped_item == (mActor_name_t)FTR_START(FTR_NOG_FAN01)) {
+        int list = mSP_LISTTYPE_ABC;
+        mActor_name_t ftr_item;
+
+        if ((int)ctx->destiny_type == mPr_DESTINY_GOODS_LUCK) {
+            list = (fqrand() >= 0.5f) ? mSP_LISTTYPE_EVENT : mSP_LISTTYPE_LOTTERY;
+        }
+        mSP_SelectRandomItem_New(NULL, &ftr_item, 1, NULL, 0, mSP_KIND_FURNITURE, list, FALSE);
+        return ftr_item;
+    }
+    if ((row->src_tree_item == (mActor_name_t)TREE_BELLS || row->src_tree_item == (mActor_name_t)CEDAR_TREE_BELLS ||
+         row->src_tree_item == (mActor_name_t)GOLD_TREE_BELLS) &&
+        (int)ctx->destiny_type == mPr_DESTINY_MONEY_LUCK) {
+        return (mActor_name_t)ITM_MONEY_1000;
+    }
+    return row->dropped_item;
+}
+
+/* World Ecology T1: places up to `drop_count` copies of `resolved_item` on free neighbor tiles around
+ * (ut_x, ut_z), using pcnetgame_find_free_tile_around() from a tree-relative offset per copy (mirroring
+ * fruit_set()'s own per-index unit_offset_part table, bg_item_common.c_inc, though purely for PLACEMENT
+ * here -- this file has no collision mesh to reproduce fruit_set()'s own visual drop-arc positions, see
+ * pcnetgame_find_money_rock_drop_tile()'s own doc on that same limitation). Guards: never places
+ * EMPTY_NO, HONEYCOMB (bees are handled purely client-side visually -- see pc_tree_birth_bee_visual()'s
+ * own doc, bg_item_common.c_inc -- and must never reach the host commit path), or anything
+ * mNT_check_unknown() rejects; the furniture "no list" dummy id vanilla can legitimately roll is NOT
+ * filtered by this (only a truly empty/unknown result is). If no free tile is found for a given copy,
+ * that copy is simply lost, exactly matching vanilla's/money-rock's own documented loss-on-no-space
+ * behavior. */
+static void pcnetgame_host_place_tree_drops(int ut_x, int ut_z, mActor_name_t resolved_item, int drop_count) {
+    static const int kOffX[3] = { -1, 1, 0 };
+    static const int kOffZ[3] = { 0, 0, 1 };
+    int i;
+
+    if (resolved_item == (mActor_name_t)EMPTY_NO || resolved_item == (mActor_name_t)HONEYCOMB ||
+        mNT_check_unknown(resolved_item)) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] host: tree drop at tile (%d,%d) resolved to invalid item 0x%04X -- skipped\n",
+                   ut_x, ut_z, (unsigned)resolved_item);
+        }
+        return;
+    }
+
+    for (i = 0; i < drop_count; i++) {
+        int off = i % 3;
+        int center_x = ut_x + kOffX[off];
+        int center_z = ut_z + kOffZ[off];
+        int drop_acre, drop_tile;
+
+        if (pcnetgame_find_free_tile_around(center_x, center_z, &drop_acre, &drop_tile)) {
+            pcfa_set_tile(drop_acre, drop_tile, (uint16_t)resolved_item);
+        } else if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] host: tree drop copy %d/%d at tile (%d,%d) lost -- no free neighbor tile\n",
+                   i + 1, drop_count, ut_x, ut_z);
+        }
+    }
+}
+
+/* World Ecology T1: read-only core validation for TREE_SHAKE -- the target tile must currently be one
+ * of s_tree_drop_tbl's own 21 rows (this is what makes S1's own pc_net_game_is_tree_fruit_drop_source()
+ * pre-filter client-side safe to trust loosely: the host re-derives the SAME classification here, fresh,
+ * from its own authoritative tile, never from anything the client claims). Shared by both the peer-
+ * request path and the host's own local shake/bee-birth. */
+static int pcnetgame_validate_tree_shake_core(uint8_t ut_x, uint8_t ut_z, int* out_acre, int* out_tile,
+                                              mActor_name_t* out_item) {
+    uint16_t raw_value;
+    mActor_name_t raw_item;
+    int acre, tile;
+
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    raw_item = (mActor_name_t)raw_value;
+    if (pcnetgame_find_tree_drop_row(raw_item) == NULL) {
+        return 0;
+    }
+    *out_acre = acre;
+    *out_tile = tile;
+    *out_item = raw_item;
+    return 1;
+}
+
+/* World Ecology T1: shared peer-only requirement for both TREE_SHAKE and TREE_CHOP -- a valid, in-town
+ * network context, and the peer's last-synced position must reach the target tile within the tree-
+ * specific envelope (pcnetgame_tree_reach_check(), wider than pickup's own). Never called for an
+ * is_host_local requester (see PCNetGameRequester's own doc: the host's own real local targeting already
+ * guarantees correctness, exactly like MONEY_ROCK_HIT's own precedent). */
+static int pcnetgame_validate_tree_peer_reach(PCNetPeerId peer, uint8_t ut_x, uint8_t ut_z) {
+    float px, py, pz;
+
+    if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+        return 0;
+    }
+    if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+        return 0;
+    }
+    if (!pcnetgame_pos_valid(px, py, pz)) {
+        return 0;
+    }
+    return pcnetgame_tree_reach_check(ut_x, ut_z, px, py, pz);
+}
+
+/* World Ecology T1: commits one already-validated TREE_SHAKE -- re-reads the tile FRESH (never trusting
+ * *inout_item's validate-time value) to close the staleness window between a client's own shake-frame-10
+ * item capture (or, for a bee-birth request, up to ~5 more frames of Check_BirthBee_Shake_tree's own
+ * retry timer) and this request actually reaching the host; see this task's own design brief. If the
+ * fresh tile no longer matches any s_tree_drop_tbl row (another commit already changed it -- e.g. a
+ * felling TREE_CHOP raced ahead of a queued bee-birth TREE_SHAKE for the same tile), this rejects with
+ * no mutation, exactly the "stump already committed" ordering guarantee the brief calls for.
+ * A bee-tree row (TREE_BEES/CEDAR_TREE_BEES/GOLD_TREE_BEES) writes ONLY the destination tree -- no item
+ * drop -- because bee-birth's honeycomb is handled purely client-side, visually, by every role via
+ * pc_tree_birth_bee_visual() (bg_item_common.c_inc); every other row resolves its drop via
+ * pcnetgame_resolve_tree_drop_item()/pcnetgame_host_place_tree_drops() before writing the destination
+ * tree. granted_item (via *inout_item on return) becomes the resulting tree-tile value, so the
+ * requester's own client can play whatever cue it likes off it (optional polish; not required for
+ * correctness -- see PCNetGameFieldActionResultMsg's own doc). */
+static void pcnetgame_host_commit_tree_shake(const PCNetPlayerContext* ctx, uint8_t ut_x, uint8_t ut_z, int acre,
+                                             int tile, mActor_name_t* inout_item) {
+    uint16_t fresh_value;
+    mActor_name_t fresh_item;
+    const PCNetGameTreeDropRow* row;
+
+    if (!pcfa_get_tile(acre, tile, &fresh_value)) {
+        *inout_item = (mActor_name_t)EMPTY_NO;
+        return;
+    }
+    fresh_item = (mActor_name_t)fresh_value;
+    row = pcnetgame_find_tree_drop_row(fresh_item);
+    if (row == NULL) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] host: TREE_SHAKE at tile (%d,%d) rejected at commit -- tile 0x%04X no "
+                   "longer matches any tree-drop row (raced by another commit)\n",
+                   (int)ut_x, (int)ut_z, (unsigned)fresh_item);
+        }
+        *inout_item = (mActor_name_t)EMPTY_NO;
+        return;
+    }
+
+    if (IS_ITEM_BEE_TREE(row->src_tree_item)) {
+        pcfa_set_tile(acre, tile, (uint16_t)row->dst_tree_item);
+        *inout_item = row->dst_tree_item;
+        return;
+    }
+
+    {
+        mActor_name_t resolved = pcnetgame_resolve_tree_drop_item(row, ctx);
+        pcnetgame_host_place_tree_drops((int)ut_x, (int)ut_z, resolved, (int)row->drop_count);
+    }
+    pcfa_set_tile(acre, tile, (uint16_t)row->dst_tree_item);
+    *inout_item = row->dst_tree_item;
+}
+
+/* World Ecology T1: the host's own transient, per-session cut-count table for TREE_CHOP -- mirrors
+ * vanilla's own BIT_actor_tree_cutcount_check() (bg_item_common.c_inc), which decrements a per-BLOCK
+ * table only covering blocks the CALLING process currently has loaded, and therefore cannot serve a
+ * remote peer's chop (the host may have a different set of blocks loaded, or none, if indoors). No
+ * persistence needed -- like vanilla's own table, this is meant to reset across a session boundary. A
+ * small fixed slot count is enough: normally only the tile(s) actively being chopped right now are
+ * ever tracked; an idle slot (no hit for PC_NETGAME_TREE_CUT_IDLE_60FPS_FRAMES) is forgotten so a
+ * long-idle tile doesn't permanently pin a slot, and re-validates from scratch (pcnetgame_tree_cut_hits_for())
+ * on its next hit. */
+#define PC_NETGAME_TREE_CUT_SLOTS 16
+#define PC_NETGAME_TREE_CUT_IDLE_60FPS_FRAMES (60.0f * 30.0f) /* 30 seconds idle -> forgotten */
+typedef struct PCNetGameTreeCutSlot {
+    int   active;
+    int   acre;
+    int   tile;
+    int   hits_remaining;
+    float idle_accum;
+} PCNetGameTreeCutSlot;
+static PCNetGameTreeCutSlot s_host_tree_cut_count[PC_NETGAME_TREE_CUT_SLOTS];
+
+static PCNetGameTreeCutSlot* pcnetgame_find_tree_cut_slot(int acre, int tile) {
+    int i;
+    for (i = 0; i < PC_NETGAME_TREE_CUT_SLOTS; i++) {
+        if (s_host_tree_cut_count[i].active && s_host_tree_cut_count[i].acre == acre &&
+            s_host_tree_cut_count[i].tile == tile) {
+            return &s_host_tree_cut_count[i];
+        }
+    }
+    return NULL;
+}
+
+/* Allocates a free slot, or evicts the most-idle occupied one if every slot is busy -- a legitimate
+ * chop should never be rejected purely for lack of bookkeeping space; losing the LEAST-recently-hit
+ * tile's in-progress count (it simply restarts counting from this hit) is a far smaller behavioral
+ * hiccup than refusing to track a chop at all. */
+static PCNetGameTreeCutSlot* pcnetgame_alloc_tree_cut_slot(int acre, int tile) {
+    PCNetGameTreeCutSlot* victim = NULL;
+    int i;
+
+    for (i = 0; i < PC_NETGAME_TREE_CUT_SLOTS; i++) {
+        if (!s_host_tree_cut_count[i].active) {
+            victim = &s_host_tree_cut_count[i];
+            break;
+        }
+    }
+    if (victim == NULL) {
+        victim = &s_host_tree_cut_count[0];
+        for (i = 1; i < PC_NETGAME_TREE_CUT_SLOTS; i++) {
+            if (s_host_tree_cut_count[i].idle_accum > victim->idle_accum) {
+                victim = &s_host_tree_cut_count[i];
+            }
+        }
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->active = 1;
+    victim->acre = acre;
+    victim->tile = tile;
+    return victim;
+}
+
+/* World Ecology T1: per-poll idle-expiry tick, host-only, mirroring
+ * pcnetgame_host_check_field_action_money_rock()'s own "run once per poll" placement/gamePT gate. Only
+ * ever forgets a slot -- never mutates the field (the tile's own value is untouched either way; a
+ * forgotten slot simply re-derives its hit count fresh from pcnetgame_tree_cut_hits_for() next hit). */
+static void pcnetgame_host_check_tree_cut_idle(void) {
+    int i;
+    float dt;
+
+    if (gamePT == NULL || !s_host_world_ready) {
+        return;
+    }
+    dt = (f32)gamePT->graph->dt_num_60fps_frames;
+    for (i = 0; i < PC_NETGAME_TREE_CUT_SLOTS; i++) {
+        PCNetGameTreeCutSlot* slot = &s_host_tree_cut_count[i];
+        if (!slot->active) {
+            continue;
+        }
+        slot->idle_accum += dt;
+        if (slot->idle_accum >= PC_NETGAME_TREE_CUT_IDLE_60FPS_FRAMES) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+}
+
+/* World Ecology T1: read-only core validation for TREE_CHOP -- the target tile must currently be a
+ * choppable tree per s_tree_cut_hits_tbl (pcnetgame_tree_cut_hits_for() >= 0); unlike TREE_SHAKE this
+ * deliberately accepts EVERY choppable stage (saplings included), not just the 21 fruit-drop rows --
+ * a chop on an already-NOFRUIT tree or a young sapling is still a legitimate hit that must decrement
+ * the host's own cut-count. */
+static int pcnetgame_validate_tree_chop_core(uint8_t ut_x, uint8_t ut_z, int* out_acre, int* out_tile,
+                                             mActor_name_t* out_item) {
+    uint16_t raw_value;
+    mActor_name_t raw_item;
+    int acre, tile;
+
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    raw_item = (mActor_name_t)raw_value;
+    if (pcnetgame_tree_cut_hits_for(raw_item) < 0) {
+        return 0;
+    }
+    *out_acre = acre;
+    *out_tile = tile;
+    *out_item = raw_item;
+    return 1;
+}
+
+/* World Ecology T1: commits one already-validated TREE_CHOP hit. Re-reads the tile FRESH (same
+ * staleness-window reasoning as TREE_SHAKE's own commit) and re-validates it is STILL choppable --
+ * if not (e.g. a racing hit already felled it into a stump, or converted it some other way), any
+ * stale cut-count slot for this tile is dropped and the hit is rejected with no mutation, which is
+ * exactly the ordering guarantee this task's design brief calls out: "a bee conversion requested after
+ * a felling hit should find a stump already committed and be rejected on re-validation, not
+ * overwritten" -- the symmetric case (a chop hit arriving after a bee-birth TREE_SHAKE already
+ * converted the tile) is handled the same way, generically, by this same fresh re-validate.
+ * Finds or allocates this tile's host-owned cut-count slot, decrements it, then -- unless this is a
+ * bee-tree row (no drop/conversion; see pcnetgame_host_commit_tree_shake()'s own doc on why bee-birth
+ * is a separate, later TREE_SHAKE request, never part of an ordinary chop hit) -- runs the SAME drop
+ * resolution TREE_SHAKE uses and writes the row's destination tree (a hit on a tile with no matching
+ * drop row, e.g. an already-NOFRUIT tree or a sapling stage, produces no drop/conversion at all, which
+ * is correct: vanilla's own Get_TreeNoToStumpNo() only converts a tile item_tree_fruit_drop_proc()
+ * actually has a table row for). If this hit exhausts the counter, computes the stump via the real,
+ * unmodified bg_item_fg_sub() from the ORIGINAL pre-hit tile value (mirroring vanilla's own
+ * Get_TreeNoToStumpNo(), which stumps the axe_common.item captured at swing start, never a
+ * mid-swing-converted value) and writes it LAST, so it overrides any fruit-conversion write earlier in
+ * this same commit -- matching vanilla's own ordering and closing the same-frame bee/stump race the
+ * brief identifies. */
+static void pcnetgame_host_commit_tree_chop(const PCNetPlayerContext* ctx, uint8_t ut_x, uint8_t ut_z, int acre,
+                                            int tile, mActor_name_t* inout_item) {
+    uint16_t fresh_value;
+    mActor_name_t fresh_item;
+    int hits;
+    PCNetGameTreeCutSlot* slot;
+    const PCNetGameTreeDropRow* row;
+
+    if (!pcfa_get_tile(acre, tile, &fresh_value)) {
+        *inout_item = (mActor_name_t)EMPTY_NO;
+        return;
+    }
+    fresh_item = (mActor_name_t)fresh_value;
+    hits = pcnetgame_tree_cut_hits_for(fresh_item);
+    if (hits < 0) {
+        slot = pcnetgame_find_tree_cut_slot(acre, tile);
+        if (slot != NULL) {
+            memset(slot, 0, sizeof(*slot));
+        }
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] host: TREE_CHOP at tile (%d,%d) rejected at commit -- tile 0x%04X no "
+                   "longer choppable (raced by another commit)\n",
+                   (int)ut_x, (int)ut_z, (unsigned)fresh_item);
+        }
+        *inout_item = (mActor_name_t)EMPTY_NO;
+        return;
+    }
+
+    slot = pcnetgame_find_tree_cut_slot(acre, tile);
+    if (slot == NULL) {
+        slot = pcnetgame_alloc_tree_cut_slot(acre, tile);
+        slot->hits_remaining = hits;
+    }
+    slot->idle_accum = 0.0f;
+    slot->hits_remaining--;
+
+    *inout_item = fresh_item; /* provisional -- overwritten below by any conversion/stump write */
+
+    row = pcnetgame_find_tree_drop_row(fresh_item);
+    if (row != NULL && !IS_ITEM_BEE_TREE(row->src_tree_item)) {
+        mActor_name_t resolved = pcnetgame_resolve_tree_drop_item(row, ctx);
+        pcnetgame_host_place_tree_drops((int)ut_x, (int)ut_z, resolved, (int)row->drop_count);
+        pcfa_set_tile(acre, tile, (uint16_t)row->dst_tree_item);
+        *inout_item = row->dst_tree_item;
+    }
+
+    if (slot->hits_remaining <= 0) {
+        mActor_name_t stump = bg_item_fg_sub(fresh_item, 0);
+        if (IS_ITEM_TREE_STUMP(stump)) {
+            pcfa_set_tile(acre, tile, (uint16_t)stump); /* LAST write -- overrides any conversion write above */
+            *inout_item = stump;
+        } else if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] host: TREE_CHOP felled tile (%d,%d) but bg_item_fg_sub(0x%04X) did not "
+                   "yield a stump (0x%04X) -- leaving the last conversion write in place\n",
+                   (int)ut_x, (int)ut_z, (unsigned)fresh_item, (unsigned)stump);
+        }
+        memset(slot, 0, sizeof(*slot));
+    }
+}
+
+/* World Ecology T1: per-poll idle-expiry tick, host-only -- see pcnetgame_host_check_tree_cut_idle()'s
+ * own doc. Called from pc_net_game_poll() alongside pcnetgame_host_check_field_action_money_rock(). */
+static void pcnetgame_host_check_tree_cut(void) {
+    pcnetgame_host_check_tree_cut_idle();
+}
+
+/* World Ecology T1 review fix: clears every tree-cut cut-count slot -- called at the same two sites
+ * (and under the exact same conditions) as s_host_money_rock's own reset: a detected town change on an
+ * already-running host (pcnetgame_host_world_tick()), and a fresh hosting session's full state reset
+ * (pcnetgame_reset_host_world_state()). Forward-declared above pcnetgame_host_world_tick() since this
+ * table is defined later in the file than that function. */
+static void pcnetgame_reset_host_tree_cut_state(void) {
+    memset(s_host_tree_cut_count, 0, sizeof(s_host_tree_cut_count));
+}
+
+/* World Ecology P2 audit fix: called from mFM_PcFieldInitGrowth() (m_field_make.c) whenever the
+ * host's own daily-growth pass actually changed at least one town acre (mFM_PcGrowCountChangedAcres()
+ * > 0). Growth can change a tile's tree species/stage (e.g. a sapling growing into a full tree, which
+ * needs a different hit count to fell) -- s_host_tree_cut_count is keyed only by acre/tile and a stale
+ * entry for that tile from a hit shortly before growth ran (within its own 30s idle window, see
+ * PC_NETGAME_TREE_CUT_IDLE_60FPS_FRAMES above) would otherwise wrongly carry over into the NEW tree's
+ * state, letting it fall in fewer hits than it should. Vanilla itself avoids this because its own
+ * per-block cut-count table (BIT_actor_tree_cutcount_check(), bg_item_common.c_inc) is naturally
+ * re-derived fresh whenever a field block loads, which happens to coincide with growth timing; this
+ * host-authoritative table has no such reload to piggyback on, so growth must clear it explicitly.
+ * Just a thin wrapper around pcnetgame_reset_host_tree_cut_state() (same table, same reset as the
+ * existing town-change/session-reset call sites) -- a no-op for single-player and for a client, since
+ * only the host ever populates or consults this table. */
+void pc_net_game_notify_field_growth(void) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    pcnetgame_reset_host_tree_cut_state();
+}
+
+/* World Ecology Stage 1, Item 2: finds this host's money-rock slot for (acre, tile) -- an ACTIVE
+ * window that has not yet expired (see pcnetgame_host_check_field_action_money_rock()'s own tick).
+ * NULL if none. */
+static PCNetGameMoneyRockState* pcnetgame_find_active_money_rock(int acre, int tile) {
+    int i;
+    for (i = 0; i < PC_NETGAME_MONEY_ROCK_SLOTS; i++) {
+        if (s_host_money_rock[i].active && s_host_money_rock[i].acre == acre && s_host_money_rock[i].tile == tile) {
+            return &s_host_money_rock[i];
+        }
+    }
+    return NULL;
+}
+
+/* World Ecology Stage 1, Item 2 / Bug 1 fix: the CORE, source-independent half of MONEY_ROCK_HIT
+ * validation -- world-ready, resolves acre/tile, confirms a genuine IS_ITEM_STONE_TC tile
+ * (MONEY_ROCK_A..E, or MONEY_FLOWER_SEED for a tile already mid-window -- see
+ * bIT_actor_ten_coin_entryR()'s own money_stone_flag test, bg_item_common.c_inc, which this mirrors
+ * exactly), and confirms either an already-tracked active window or a free s_host_money_rock slot.
+ * Shared verbatim by both the peer-request path (pcnetgame_validate_money_rock_hit() below) and the
+ * host's own local hit (pc_net_game_host_local_money_rock_hit()) -- neither adds or removes anything
+ * from this half. Never mutates -- see pcnetgame_host_commit_money_rock_hit() for the actual commit. */
+static int pcnetgame_validate_money_rock_hit_core(uint8_t ut_x, uint8_t ut_z, int* out_acre, int* out_tile,
+                                                  mActor_name_t* out_raw_item) {
+    uint16_t raw_value;
+    mActor_name_t raw_item;
+    int acre, tile;
+    int i;
+    int has_free_slot;
+
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    raw_item = (mActor_name_t)raw_value;
+    if (!IS_ITEM_STONE_TC(raw_item)) {
+        return 0; /* not a money rock (or an active money-rock window) tile */
+    }
+
+    if (pcnetgame_find_active_money_rock(acre, tile) == NULL) {
+        has_free_slot = 0;
+        for (i = 0; i < PC_NETGAME_MONEY_ROCK_SLOTS; i++) {
+            if (!s_host_money_rock[i].active) {
+                has_free_slot = 1;
+                break;
+            }
+        }
+        if (!has_free_slot) {
+            return 0; /* every slot is busy with a different money rock -- deterministic rejection,
+                         mirrors vanilla's own bIT_TEN_COIN_NUM concurrency limit */
+        }
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *out_raw_item = raw_item;
+    return 1;
+}
+
+/* World Ecology Stage 1, Item 2: read-only validation for one REMOTE PEER's MONEY_ROCK_HIT request --
+ * the core check above, plus this request's own PEER-specific requirements: a valid, in-town network
+ * context, and the peer's last-synced position must actually reach this tile. Never mutates -- see
+ * pcnetgame_host_commit_money_rock_hit() for the actual commit. */
+static int pcnetgame_validate_money_rock_hit(PCNetPeerId peer, uint8_t ut_x, uint8_t ut_z, int* out_acre,
+                                             int* out_tile, mActor_name_t* out_raw_item) {
+    float px, py, pz;
+    int acre, tile;
+    mActor_name_t raw_item;
+
+    if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+        return 0;
+    }
+    if (!pcnetgame_validate_money_rock_hit_core(ut_x, ut_z, &acre, &tile, &raw_item)) {
+        return 0;
+    }
+
+    if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+        return 0;
+    }
+    if (!pcnetgame_pos_valid(px, py, pz)) {
+        return 0;
+    }
+    if (!pcnetgame_field_action_reach_check(ut_x, ut_z, px, py, pz)) {
+        return 0;
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *out_raw_item = raw_item;
+    return 1;
+}
+
+/* World Ecology Stage 1, Item 2: commits one already-validated money-rock hit -- opens a new window
+ * (mode 1) or advances an existing one (mode 2), exactly mirroring bIT_actor_ten_coin_entryR()'s own
+ * two branches (bg_item_common.c_inc), then computes the deterministic reward
+ * (hit_count/destiny_type only, no RNG) and drops it on a free neighbor tile if one exists. Returns
+ * the granted... nothing (see PCNetGameFieldActionResultMsg's doc: MONEY_ROCK_HIT's granted_item is
+ * always 0 -- the bag is picked up later through the ordinary pickup path).
+ *
+ * Bug 1 fix: takes a PCNetPlayerContext directly (destiny_type/money_power only), rather than a peer
+ * index -- this is now called for BOTH a remote peer's request (passing that peer's own stored
+ * context, &s_host_peer[peer].ctx) and the HOST's OWN local hit (passing a context filled fresh from
+ * pcnetgame_capture_local_context(), via pc_net_game_host_local_money_rock_hit() below). destiny_type
+ * is read fresh from `ctx` on every hit (matching vanilla's own per-hit
+ * Common_Get(now_private)->destiny.type read); money_power is only read (and only matters) when this
+ * call opens a brand new window. */
+static void pcnetgame_host_commit_money_rock_hit(const PCNetPlayerContext* ctx, int acre, int tile,
+                                                  mActor_name_t raw_item) {
+    PCNetGameMoneyRockState* slot = pcnetgame_find_active_money_rock(acre, tile);
+    int destiny_type = (int)ctx->destiny_type;
+    mActor_name_t reward_item;
+    int ut_x = 0, ut_z = 0;
+
+    if (slot == NULL) {
+        int i;
+        for (i = 0; i < PC_NETGAME_MONEY_ROCK_SLOTS; i++) {
+            if (!s_host_money_rock[i].active) {
+                slot = &s_host_money_rock[i];
+                break;
+            }
+        }
+        if (slot == NULL) {
+            return; /* validated moments ago, but defensively bail rather than corrupt another window */
+        }
+
+        /* Bug 1 fix: if this tile is already MONEY_FLOWER_SEED (mid-window graphic) with no active
+         * bookkeeping slot for it (an orphaned/leftover state -- e.g. left over from before this fix
+         * existed, or some other edge case), sanitize orig_item to a safe, always-valid MONEY_ROCK_A
+         * rather than storing the already-wrong raw value: this guarantees the eventual revert
+         * (orig_item - 7) always produces a real ROCK_x tile, never FLOWER_SEED. */
+        {
+            mActor_name_t stored_orig_item =
+                (raw_item == (mActor_name_t)MONEY_FLOWER_SEED) ? (mActor_name_t)MONEY_ROCK_A : raw_item;
+            int16_t money_power = ctx->money_power;
+            int swing_time = (int)money_power;
+            if (destiny_type == mPr_DESTINY_MONEY_LUCK) {
+                swing_time -= 100;
+            }
+            if (swing_time > 100) {
+                swing_time = 100;
+            }
+            slot->active = 1;
+            slot->acre = acre;
+            slot->tile = tile;
+            slot->orig_item = stored_orig_item;
+            slot->hit_count = 0;
+            slot->money_power = money_power;
+            slot->expire_accum = 0.0f;
+            slot->expire_target_frames = 386.0f + ((f32)swing_time) * 0.59999999f;
+        }
+        pcfa_set_tile(acre, tile, (uint16_t)MONEY_FLOWER_SEED);
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] host: player %u opened money-rock window at acre %d tile %d (orig=0x%04X)\n",
+                   (unsigned)ctx->player_no, acre, tile, (unsigned)raw_item);
+        }
+    } else {
+        slot->hit_count++;
+    }
+
+    /* Deterministic reward -- verbatim mirror of bIT_actor_ten_coin_entryR()'s own switch
+       (bg_item_common.c_inc), keyed on THIS request's player context. */
+    switch (slot->hit_count) {
+        case 0:
+        case 1:
+        case 2:
+            reward_item = (destiny_type == mPr_DESTINY_MONEY_LUCK) ? (mActor_name_t)ITM_MONEY_1000
+                                                                    : (mActor_name_t)ITM_MONEY_100;
+            break;
+        case 3:
+        case 4:
+        case 5:
+            reward_item = (destiny_type == mPr_DESTINY_MONEY_LUCK) ? (mActor_name_t)ITM_MONEY_10000
+                                                                    : (mActor_name_t)ITM_MONEY_1000;
+            break;
+        default:
+            reward_item = (destiny_type == mPr_DESTINY_MONEY_LUCK) ? (mActor_name_t)ITM_MONEY_30000
+                                                                    : (mActor_name_t)ITM_MONEY_10000;
+            break;
+    }
+
+    /* Bug 4 fix: no bookkeeping slot for the drop any more -- pcfa_set_tile() below is the exact same
+     * ordinary field-write path a regular dropped item already uses (dirty-flush, FIELD_UPDATE
+     * broadcast, snapshot coverage, late-join coverage all inherited for free). If no valid neighbor
+     * tile is found, this hit's drop is skipped entirely (matches vanilla: the hit-count/window state
+     * above is still updated regardless, only the drop+sound is skipped -- see
+     * pcnetgame_find_money_rock_drop_tile()'s own doc). */
+    if (pcfa_acre_tile_to_town_ut(acre, tile, &ut_x, &ut_z)) {
+        int drop_acre, drop_tile;
+        if (pcnetgame_find_money_rock_drop_tile(ut_x, ut_z, &drop_acre, &drop_tile)) {
+            pcfa_set_tile(drop_acre, drop_tile, (uint16_t)reward_item);
+            if (g_pc_verbose) {
+                printf("[NET][FIELD_ACTION] host: money-rock hit_count=%d dropped item=0x%04X at acre %d tile %d\n",
+                       slot->hit_count, (unsigned)reward_item, drop_acre, drop_tile);
+            }
+        }
+    }
+}
+
+/* Bug 1 fix: called from the decomp money-rock hit seam (Player_actor_Search_STONE_TC(),
+ * m_player_common.c_inc) INSTEAD of vanilla's ten_coin_entry_ex_proc() -- but for the HOST's OWN LOCAL
+ * hit, not a remote peer's request. Single ownership: every money-rock hit, from every source, must
+ * update the SAME s_host_money_rock bookkeeping, or two independent writers (vanilla's own local
+ * mutation and this table, both touching the same tile) could corrupt a window -- double-revert, a
+ * miscounted hit, or a tile stranded on MONEY_FLOWER_SEED. Routing the host's own hit through this
+ * table instead makes vanilla's bg_item_ten_coin_c path structurally unreachable for a HOST on a
+ * money-rock tile (see Player_actor_Search_STONE_TC()'s own doc).
+ * Runs ONLY the source-independent core validation (pcnetgame_validate_money_rock_hit_core()) plus
+ * confirming this process is genuinely the host and genuinely in the town scene -- no reach/distance
+ * check of its own, because vanilla's own targeting already guarantees this is the host's own real
+ * local player standing at this exact tile (unlike a remote peer's unverified claim). No-op (and safe)
+ * for single-player or a client, and for any tile that fails validation.
+ *
+ * Review finding, verified safe: this silently no-ops when s_host_world_ready (checked inside
+ * pcnetgame_validate_money_rock_hit_core()) is false. That is unreachable for a genuine player swing:
+ * this function is only ever called from Player_actor_Search_STONE_TC()'s own hit-detection, which
+ * requires a live, controllable player actor already running in the town scene -- the same
+ * precondition (a loaded local save) that also drives pcfa_save_ready()/s_host_world_ready. Vanilla
+ * itself blocks player control and actor interaction entirely during a scene/travel transition (no
+ * player actor is ticking to call this seam at all), so there is no window where a real swing could
+ * reach here while s_host_world_ready is still 0. No fix needed.
+ *
+ * T0-A: now routes through the GENERIC pcnetgame_host_dispatch_local_field_action() (defined further
+ * below, forward-declared here) instead of calling pcnetgame_validate_money_rock_hit_core()/
+ * pcnetgame_host_commit_money_rock_hit() directly -- this is a PURE refactor with zero behavioral
+ * change: the generic dispatch's is_host_local branch for MONEY_ROCK_HIT (see
+ * pcnetgame_fa_validate_adapter_money_rock()) calls the exact same core-validate function this
+ * function used to call inline, and its commit adapter calls the exact same commit function with a
+ * freshly captured local context, exactly as this function used to do itself. This exists so a FUTURE
+ * kind (e.g. T1's tree shake/chop) can get its own host-local entry point for free, by adding one more
+ * thin wrapper like this one, instead of hand-rolling its own bespoke validate+commit call pair. */
+static int pcnetgame_host_dispatch_local_field_action(uint8_t kind, uint8_t ut_x, uint8_t ut_z);
+
+void pc_net_game_host_local_money_rock_hit(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return; /* the host itself is indoors -- ut_x/ut_z from a room are not town coordinates */
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    pcnetgame_host_dispatch_local_field_action((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_MONEY_ROCK_HIT,
+                                               (uint8_t)ut_x, (uint8_t)ut_z);
+}
+
+/* See pc_net_game.h's own doc. Mirrors pc_net_game_host_local_money_rock_hit()'s own shape exactly. */
+void pc_net_game_host_local_tree_shake(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    pcnetgame_host_dispatch_local_field_action((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_SHAKE, (uint8_t)ut_x,
+                                               (uint8_t)ut_z);
+}
+
+/* See pc_net_game.h's own doc. Mirrors pc_net_game_host_local_money_rock_hit()'s own shape exactly. */
+void pc_net_game_host_local_tree_chop(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    pcnetgame_host_dispatch_local_field_action((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_CHOP, (uint8_t)ut_x,
+                                               (uint8_t)ut_z);
+}
+
+/* World Ecology Stage 1, Item 2: per-poll expiry tick, host-only, mirroring
+ * pcnetgame_host_expire_reservations()'s own "run once per poll before this poll's events" placement.
+ * Gated on gamePT exactly like the pickup/drop retry timers (needs a valid GAME* for a frame-time
+ * delta) -- money rocks can only ever be hit from within active gameplay. On expiry, reverts the tile
+ * to orig_item - 7 (ROCK_x), verbatim matching bIT_actor_ten_coin_move()'s own revert
+ * (bg_item_common.c_inc) -- deliberately NOT gated on the vanilla oscillator-settle sub-state (mode
+ * 1 -> 2 transition), which is a pure LOCAL animation-timing detail this host-side table never
+ * models; the host simply reverts once its own deterministic expire_target_frames elapses.
+ *
+ * Bug 1 fix: before writing the revert, re-check that the tile still actually holds MONEY_FLOWER_SEED
+ * (pcfa_get_tile()). With single ownership (all hits, including the host's own, now go through this
+ * same bookkeeping) this should always be true, but it costs nothing to verify rather than assume, and
+ * it guards against any remaining edge case (e.g. some other path having already changed the tile):
+ * if the tile no longer holds MONEY_FLOWER_SEED, the bookkeeping slot is simply cleared without
+ * writing anything, rather than clobbering whatever is there now. */
+static void pcnetgame_host_check_field_action_money_rock(void) {
+    int i;
+    float dt;
+
+    if (gamePT == NULL || !s_host_world_ready) {
+        return;
+    }
+    dt = (f32)gamePT->graph->dt_num_60fps_frames;
+    for (i = 0; i < PC_NETGAME_MONEY_ROCK_SLOTS; i++) {
+        PCNetGameMoneyRockState* slot = &s_host_money_rock[i];
+        if (!slot->active) {
+            continue;
+        }
+        slot->expire_accum += dt;
+        if (slot->expire_accum >= slot->expire_target_frames) {
+            uint16_t cur_value;
+            if (pcfa_get_tile(slot->acre, slot->tile, &cur_value) && cur_value == (uint16_t)MONEY_FLOWER_SEED) {
+                pcfa_set_tile(slot->acre, slot->tile, (uint16_t)(slot->orig_item - 7));
+                if (g_pc_verbose) {
+                    printf("[NET][FIELD_ACTION] host: money-rock window at acre %d tile %d expired -- reverted to 0x%04X\n",
+                           slot->acre, slot->tile, (unsigned)(slot->orig_item - 7));
+                }
+            } else if (g_pc_verbose) {
+                printf("[NET][FIELD_ACTION] host: money-rock window at acre %d tile %d expired -- tile no longer "
+                       "MONEY_FLOWER_SEED (0x%04X), bookkeeping cleared without writing\n",
+                       slot->acre, slot->tile, (unsigned)cur_value);
+            }
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+}
+
+/* ==================== T0-A: generic field-action validate/commit dispatch table ==================== */
+
+/* World Ecology T0: identifies who is asking for a field-action validate/commit -- either a remote
+ * peer (is_host_local == 0; peer/ctx are that peer's own PCNetPeerId/stored PCNetPlayerContext) or the
+ * HOST's OWN local action (is_host_local == 1; peer is meaningless, ctx is freshly captured via
+ * pcnetgame_capture_local_context()). Exists so a validate/commit function's own body never needs its
+ * own bespoke "am I serving a network request or the host's own local action" branch -- see
+ * pc_net_game_host_local_money_rock_hit()'s pre-T0 form for why that distinction already existed for
+ * MONEY_ROCK_HIT alone, and pcnetgame_host_dispatch_local_field_action() below for how a FUTURE kind
+ * (e.g. T1's tree shake/chop) can reuse the same local-dispatch path without inventing its own
+ * pc_net_game_host_local_*() function from scratch. */
+typedef struct PCNetGameRequester {
+    int                is_host_local;
+    PCNetPeerId        peer; /* meaningful only when !is_host_local */
+    PCNetPlayerContext ctx;  /* the peer's own stored ctx, or the host's own freshly captured local ctx */
+    uint8_t            hole_variant; /* protocol v3 -- the requester's own claimed hole_variant (0..24
+                                         expected, but NOT YET range-validated here -- see
+                                         pcnetgame_validate_hole_variant(), which every validator that
+                                         actually consumes this field must call before using it). 0 for
+                                         every kind that doesn't use it (see PCNetGameFieldActionRequestMsg's
+                                         own doc). */
+} PCNetGameRequester;
+
+/* World Ecology T-dig: TRUST BOUNDARY range check for hole_variant (see PCNetGameFieldActionRequestMsg's
+ * own doc) -- 1 iff v is a valid HOLE_START offset (0..24, i.e. HOLE00..HOLE24). Any validator that
+ * commits HOLE_START + hole_variant to a tile MUST call this first and reject (never clamp) on failure,
+ * so a forged/corrupted out-of-range value can never write an unintended tile value. */
+static int pcnetgame_validate_hole_variant(uint8_t v) {
+    return v <= 24u;
+}
+
+/* On entry, *inout_item is unused input (reserved for a future kind that needs one); on a successful
+ * (1) return, *inout_item is this kind's own private per-request payload for `commit` to consume
+ * (DIG_BURIED: unused; MONEY_ROCK_HIT: the raw_item pcnetgame_validate_money_rock_hit_core() resolved).
+ * `commit` then overwrites *inout_item with whatever PCNetGameFieldActionResultMsg.granted_item should
+ * actually carry back to the requester (see that struct's own doc: DIG_BURIED's real grant;
+ * MONEY_ROCK_HIT's always-0) -- exactly the transformation pcnetgame_handle_host_field_action_request()
+ * used to do inline per kind before this table existed. */
+typedef int  (*PCNetGameFAValidateFn)(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                       mActor_name_t* inout_item, int* out_acre, int* out_tile);
+typedef void (*PCNetGameFACommitFn)(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z, int acre, int tile,
+                                     mActor_name_t* inout_item);
+
+typedef struct PCNetGameFAHandler {
+    uint8_t                kind;
+    PCNetGameFAValidateFn  validate; /* never NULL, even for a stub -- see pcnetgame_fa_validate_stub() */
+    PCNetGameFACommitFn    commit;   /* NULL for every stub kind: validate always fails, so commit is
+                                         never actually reached for one, but stays NULL defensively */
+    const char*            tag;
+} PCNetGameFAHandler;
+
+/* T0-A pure-refactor adapters: DIG_BURIED and MONEY_ROCK_HIT. Each calls the SAME, UNMODIFIED
+ * validate/commit function this file had before this table existed -- see the SAFETY RULE this
+ * milestone's own doc requires (every existing DIG_BURIED/MONEY_ROCK_HIT test must still pass,
+ * byte-identically, after this refactor). */
+static int pcnetgame_fa_validate_adapter_dig(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                             mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    if (req->is_host_local) {
+        return 0; /* no host-local DIG_BURIED path exists yet -- reserved for a future stage */
+    }
+    if (!pcnetgame_validate_hole_variant(req->hole_variant)) {
+        return 0; /* protocol v3 TRUST BOUNDARY -- out-of-range hole_variant is rejected, never clamped */
+    }
+    return pcnetgame_validate_and_resolve_dig(req->peer, ut_x, ut_z, inout_item, out_acre, out_tile);
+}
+
+static void pcnetgame_fa_commit_adapter_dig(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z, int acre,
+                                            int tile, mActor_name_t* inout_item) {
+    pcnetgame_host_commit_dig_buried(acre, tile, req->hole_variant);
+    printf("[NET][FIELD_ACTION] host: peer %d DIG_BURIED at tile (%d,%d) granted item=0x%04X\n",
+           req->is_host_local ? -1 : (int)req->peer, (int)ut_x, (int)ut_z, (unsigned)*inout_item);
+}
+
+static int pcnetgame_fa_validate_adapter_money_rock(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                    mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    if (req->is_host_local) {
+        /* Mirrors pc_net_game_host_local_money_rock_hit()'s pre-T0 form exactly: core validation only,
+           no reach/ctx check (the host's own real local targeting already guarantees this is correct --
+           see that function's own doc). */
+        return pcnetgame_validate_money_rock_hit_core(ut_x, ut_z, out_acre, out_tile, inout_item);
+    }
+    return pcnetgame_validate_money_rock_hit(req->peer, ut_x, ut_z, out_acre, out_tile, inout_item);
+}
+
+static void pcnetgame_fa_commit_adapter_money_rock(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                    int acre, int tile, mActor_name_t* inout_item) {
+    (void)ut_x;
+    (void)ut_z;
+    /* Bug 1 fix precedent, unchanged: commit takes a context pointer, not a peer index -- req->ctx is
+       either the peer's own stored PCNetPlayerContext or the host's own freshly captured local one (see
+       PCNetGameRequester's doc). *inout_item on entry is the raw_item validate resolved. */
+    pcnetgame_host_commit_money_rock_hit(&req->ctx, acre, tile, *inout_item);
+    *inout_item = (mActor_name_t)EMPTY_NO; /* see PCNetGameFieldActionResultMsg's doc: MONEY_ROCK_HIT's
+                                               granted_item is always 0 */
+}
+
+/* World Ecology T1: TREE_SHAKE/TREE_CHOP adapters -- placed here (after PCNetGameRequester exists),
+ * unwrapping req->ctx/req->is_host_local/req->peer exactly like the MONEY_ROCK_HIT adapters above, and
+ * calling the plain-ctx core validate/commit functions defined earlier in this file (alongside
+ * s_tree_drop_tbl/s_tree_cut_hits_tbl). */
+static int pcnetgame_fa_validate_adapter_tree_shake(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                    mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    mActor_name_t item;
+
+    if (!pcnetgame_validate_tree_shake_core(ut_x, ut_z, out_acre, out_tile, &item)) {
+        return 0;
+    }
+    if (!req->is_host_local && !pcnetgame_validate_tree_peer_reach(req->peer, ut_x, ut_z)) {
+        return 0;
+    }
+    *inout_item = item;
+    return 1;
+}
+
+static void pcnetgame_fa_commit_adapter_tree_shake(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                    int acre, int tile, mActor_name_t* inout_item) {
+    pcnetgame_host_commit_tree_shake(&req->ctx, ut_x, ut_z, acre, tile, inout_item);
+}
+
+static int pcnetgame_fa_validate_adapter_tree_chop(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                   mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    mActor_name_t item;
+
+    if (!pcnetgame_validate_tree_chop_core(ut_x, ut_z, out_acre, out_tile, &item)) {
+        return 0;
+    }
+    if (!req->is_host_local && !pcnetgame_validate_tree_peer_reach(req->peer, ut_x, ut_z)) {
+        return 0;
+    }
+    *inout_item = item;
+    return 1;
+}
+
+static void pcnetgame_fa_commit_adapter_tree_chop(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                   int acre, int tile, mActor_name_t* inout_item) {
+    pcnetgame_host_commit_tree_chop(&req->ctx, ut_x, ut_z, acre, tile, inout_item);
+}
+
+/* ==================== World Ecology T-dig: DIG_HOLE / FILL_HOLE / PITFALL_CONSUME / DIG_SHINE ==================== */
+
+/* Byte-exact duplicate of mFI_CheckDigRemoveItem()'s own classification (m_field_info.c) -- duplicated
+ * here rather than shared for the same reason MONEY_ROCK_HIT/TREE_SHAKE already duplicate their own
+ * vanilla tables in this file: the original is `static` inside a different translation unit. Keep this
+ * in sync BY HAND with mFI_CheckDigRemoveItem() if that list ever changes. Per this task's design brief
+ * (and mFI_GetDigStatus()'s own T0 doc comment above, m_field_info.c), digging one of these up grants
+ * NOTHING -- the removed plant flies off and fades, it is never placed in a pocket. */
+static int pcnetgame_is_dig_removable_plant(mActor_name_t item) {
+    return (item >= FLOWER_LEAVES_PANSIES0 && item <= FLOWER_TULIP2) ||
+           (item >= TREE_STUMP001 && item <= TREE_STUMP004) || (item >= GRASS_A && item <= GRASS_C) ||
+           (item == TREE_SAPLING) || (item == TREE_APPLE_SAPLING) || (item == TREE_ORANGE_SAPLING) ||
+           (item == TREE_PEACH_SAPLING) || (item == TREE_PEAR_SAPLING) || (item == TREE_CHERRY_SAPLING) ||
+           (item == TREE_1000BELLS_SAPLING) || (item == TREE_10000BELLS_SAPLING) ||
+           (item == TREE_30000BELLS_SAPLING) || (item == TREE_100BELLS_SAPLING) || (item == DEAD_SAPLING) ||
+           (item >= TREE_PALM_STUMP001 && item <= TREE_PALM_STUMP004) || (item == TREE_PALM_SAPLING) ||
+           (item == DEAD_PALM_SAPLING) || (item >= CEDAR_TREE_STUMP001 && item <= CEDAR_TREE_STUMP004) ||
+           (item == CEDAR_TREE_SAPLING) || (item == DEAD_CEDAR_SAPLING) ||
+           (item >= GOLD_TREE_STUMP001 && item <= GOLD_TREE_STUMP004) || (item == GOLD_TREE_SAPLING) ||
+           (item == DEAD_GOLD_SAPLING);
+}
+
+/* DIG_HOLE (kind 5): tile == EMPTY_NO (a brand-new hole) OR a removable plant (see
+ * pcnetgame_is_dig_removable_plant() above). Rejects any hole-type value (HOLE00..24/HOLE_SHINE -- those
+ * are FILL_HOLE's or DIG_BURIED's job), RSV_NO, and anything else. hole_variant is TRUST-BOUNDARY range
+ * validated by the caller (see PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE's own handler-table entry). No
+ * host-local path is wired to a decomp caller by this task (see this task's own report for the
+ * documented client-seam scope decision) but the entry point exists via
+ * pc_net_game_host_local_dig_hole() for a future caller, exactly like every other kind's precedent. */
+static int pcnetgame_fa_validate_adapter_dig_hole(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                  mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    uint16_t raw_value;
+    mActor_name_t raw_item;
+    int acre, tile;
+
+    if (!pcnetgame_validate_hole_variant(req->hole_variant)) {
+        return 0; /* TRUST BOUNDARY -- see PCNetGameFieldActionRequestMsg's own doc */
+    }
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!req->is_host_local) {
+        if (!s_host_peer[req->peer].ctx_valid || !(req->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            return 0;
+        }
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    raw_item = (mActor_name_t)raw_value;
+    if (raw_item != (mActor_name_t)EMPTY_NO && !pcnetgame_is_dig_removable_plant(raw_item)) {
+        return 0; /* not plain ground and not a removable plant -- includes every hole-type value */
+    }
+
+    if (!req->is_host_local) {
+        float px, py, pz;
+        if (!pc_remote_player_get_last_position((PCNetPlayerId)req->peer, &px, &py, &pz)) {
+            return 0;
+        }
+        if (!pcnetgame_pos_valid(px, py, pz)) {
+            return 0;
+        }
+        if (!pcnetgame_field_action_reach_check(ut_x, ut_z, px, py, pz)) {
+            return 0;
+        }
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *inout_item = raw_item; /* the PRE-commit tile value -- informational only, see PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE's own doc */
+    return 1;
+}
+
+static void pcnetgame_fa_commit_adapter_dig_hole(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z, int acre,
+                                                 int tile, mActor_name_t* inout_item) {
+    (void)ut_x;
+    (void)ut_z;
+    pcnetgame_host_commit_dig_buried(acre, tile, req->hole_variant); /* same tile transition as DIG_BURIED's
+                                                                         own commit -- tile -> HOLE_START +
+                                                                         hole_variant, deposit OFF */
+    /* *inout_item already holds the pre-commit tile value on entry -- left as-is, purely informational
+       (see PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE's own doc: nothing is granted). */
+}
+
+/* FILL_HOLE (kind 6): tile is a hole-type value (HOLE00..24 or HOLE_SHINE) with deposit OFF -- filling
+ * an EMPTY hole back in. A hole-type value with deposit ON is a CANCEL/reflect per this task's design
+ * brief (the client already reflects locally; no request should ever be sent for that case, but this
+ * validator rejects it defensively regardless, matching "never trust the client's own classification"). */
+static int pcnetgame_fa_validate_adapter_fill_hole(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                    mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    uint16_t raw_value;
+    int acre, tile;
+
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!req->is_host_local) {
+        if (!s_host_peer[req->peer].ctx_valid || !(req->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            return 0;
+        }
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+        return 0;
+    }
+    if (pcfa_get_deposit(acre, tile) != 0) {
+        return 0; /* a hole with a deposit is CANCEL, not FILL -- see this function's own doc */
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    if (!ITEM_IS_HOLE(raw_value) && raw_value != (uint16_t)HOLE_SHINE) {
+        return 0; /* not a hole at all */
+    }
+
+    if (!req->is_host_local) {
+        float px, py, pz;
+        if (!pc_remote_player_get_last_position((PCNetPlayerId)req->peer, &px, &py, &pz)) {
+            return 0;
+        }
+        if (!pcnetgame_pos_valid(px, py, pz)) {
+            return 0;
+        }
+        if (!pcnetgame_field_action_reach_check(ut_x, ut_z, px, py, pz)) {
+            return 0;
+        }
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *inout_item = (mActor_name_t)EMPTY_NO;
+    return 1;
+}
+
+static void pcnetgame_fa_commit_adapter_fill_hole(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                   int acre, int tile, mActor_name_t* inout_item) {
+    (void)req;
+    (void)ut_x;
+    (void)ut_z;
+    pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO); /* HOLE_SHINE also just becomes EMPTY_NO -- filling it
+                                                       destroys the shine spot, correct vanilla behavior,
+                                                       not a bug (see this task's design brief) */
+    *inout_item = (mActor_name_t)EMPTY_NO;
+}
+
+/* PITFALL_CONSUME (kind 7): a player/villager falling INTO an already-buried pitfall -- a TRIGGER,
+ * distinct from DIGGING one up (which stays on the extended DIG_BURIED path, kind 1). Validates tile is
+ * BURIED_PITFALL_HOLE00..24 with deposit OFF and not reserved; commits tile -> EMPTY_NO directly
+ * (deliberately skipping vanilla's transient HOLE_n stage -- safe, no item is ever granted here). On
+ * REJECT (another peer already consumed it, or DIG_BURIED already dug it up), granted_item in the RESULT
+ * carries the host's OWN CURRENT tile value so the client can reconcile its optimistic local fall
+ * animation against reality without a full resync -- see pcnetgame_handle_client_field_action_result()'s
+ * own PITFALL_CONSUME branch and pc_net_game_request_pitfall_consume()'s own doc. No reach check beyond
+ * the ordinary field-action envelope: unlike a deliberate dig, a fall's positional legitimacy is already
+ * governed by the actor simply being on that tile (the host does not additionally verify this -- a
+ * forged PITFALL_CONSUME at worst clears a pitfall the sender wasn't actually standing on, which is a
+ * bounded, non-duplicating, non-crashing outcome no worse than an ordinary out-of-reach pickup attempt). */
+/* Best-effort re-read of the host's CURRENT tile value at (ut_x,ut_z) for a PITFALL_CONSUME reject
+ * echo -- see pcnetgame_fa_validate_adapter_pitfall_consume()'s own doc: on ANY reject, not only the
+ * "tile no longer a pitfall" case, the client needs the host's actual current tile value to reconcile
+ * its optimistic local fall animation. A fresh, independent pcfa_town_ut_to_acre_tile()/pcfa_get_tile()
+ * pair -- never reuses any value captured earlier in the caller. Pure address-space reads (no state
+ * mutation), safe to attempt even when s_host_world_ready is false or the requester's context hasn't
+ * been validated yet: pcfa_town_ut_to_acre_tile() is bounds-checked arithmetic and pcfa_get_tile() only
+ * ever reads the always-resident Save_t tile grid (see pc_field_authority.c). Silently leaves *out_item
+ * at its EMPTY_NO initializer if the tile can't be resolved/read at all (nothing valid to echo). */
+static void pcnetgame_fa_pitfall_consume_echo_current(uint8_t ut_x, uint8_t ut_z, mActor_name_t* out_item) {
+    int acre, tile;
+    uint16_t value;
+
+    if (pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile) && pcfa_get_tile(acre, tile, &value)) {
+        /* Bug 2 fix: a TRANSIENT or AMBIGUOUS current value (e.g. RSV_NO mid another player's pitfall-
+         * fall/bury-commit) must never be echoed as a hard reconciliation value -- the client applies
+         * granted_item unconditionally via pcnetgame_client_apply_tile() on a PITFALL_CONSUME reject
+         * (unlike a FIELD_UPDATE broadcast, which drops TRANSIENT but still lets AMBIGUOUS through and
+         * then treats it as "not overwritable" until it settles, per that function's own doc). Silently
+         * leave *out_item at its EMPTY_NO initializer instead, matching this function's own documented
+         * "nothing valid to echo" behavior for an unresolvable tile. */
+        if (pcfa_transient_kind(value) == PCFA_VALUE_STABLE) {
+            *out_item = (mActor_name_t)value;
+        }
+    }
+}
+
+static int pcnetgame_fa_validate_adapter_pitfall_consume(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                          mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    uint16_t raw_value;
+    int acre, tile;
+
+    if (!s_host_world_ready) {
+        /* Reject-reconciliation fix (Opus T2 review): echo the host's current tile value on EVERY
+           reject path, not only the "no longer a pitfall" case below -- see
+           pcnetgame_fa_pitfall_consume_echo_current()'s own doc. */
+        pcnetgame_fa_pitfall_consume_echo_current(ut_x, ut_z, inout_item);
+        return 0;
+    }
+    if (!req->is_host_local) {
+        if (!s_host_peer[req->peer].ctx_valid || !(req->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            pcnetgame_fa_pitfall_consume_echo_current(ut_x, ut_z, inout_item);
+            return 0;
+        }
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0; /* can't even resolve an acre/tile for this ut -- nothing valid to echo */
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+        pcnetgame_fa_pitfall_consume_echo_current(ut_x, ut_z, inout_item);
+        return 0;
+    }
+    if (pcfa_get_deposit(acre, tile) != 0) {
+        pcnetgame_fa_pitfall_consume_echo_current(ut_x, ut_z, inout_item);
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0; /* the read itself failed -- nothing valid to echo */
+    }
+    if (!ITEM_IS_BURIED_PITFALL_HOLE(raw_value)) {
+        /* Already consumed by a racing peer, or already dug up -- reject, and hand back the host's own
+           current value so the client can reconcile its optimistic fall (see this function's own doc).
+           Bug 2 fix: only when that current value is STABLE -- a TRANSIENT/AMBIGUOUS raw_value (e.g.
+           RSV_NO mid another player's own racing pitfall-consume/bury-commit) must not be handed to the
+           client as a hard reconciliation value (see pcnetgame_fa_pitfall_consume_echo_current()'s own
+           doc); leave *inout_item at its EMPTY_NO initializer instead. */
+        if (pcfa_transient_kind(raw_value) == PCFA_VALUE_STABLE) {
+            *inout_item = (mActor_name_t)raw_value;
+        }
+        return 0;
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *inout_item = (mActor_name_t)EMPTY_NO;
+    return 1;
+}
+
+static void pcnetgame_fa_commit_adapter_pitfall_consume(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                         int acre, int tile, mActor_name_t* inout_item) {
+    (void)req;
+    (void)ut_x;
+    (void)ut_z;
+    pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO);
+    *inout_item = (mActor_name_t)EMPTY_NO;
+}
+
+/* DIG_SHINE (kind 8): tile == SHINE_SPOT (unburied) -- deposit is always OFF for a shine spot in
+ * practice, checked anyway for defense-in-depth. hole_variant is IGNORED for this kind (a shine hole is
+ * not variant-shaped) -- commits tile -> HOLE_SHINE unconditionally. Grants NOTHING host-side: the
+ * digging client rolls its own bell amount locally and grants it privately on accept (see this task's
+ * own design brief and PC_NETGAME_FIELD_ACTION_KIND_DIG_SHINE's own doc). */
+static int pcnetgame_fa_validate_adapter_dig_shine(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                    mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    uint16_t raw_value;
+    int acre, tile;
+
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!req->is_host_local) {
+        if (!s_host_peer[req->peer].ctx_valid || !(req->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            return 0;
+        }
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+        return 0;
+    }
+    if (pcfa_get_deposit(acre, tile) != 0) {
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 0;
+    }
+    if (raw_value != (uint16_t)SHINE_SPOT) {
+        return 0;
+    }
+
+    if (!req->is_host_local) {
+        float px, py, pz;
+        if (!pc_remote_player_get_last_position((PCNetPlayerId)req->peer, &px, &py, &pz)) {
+            return 0;
+        }
+        if (!pcnetgame_pos_valid(px, py, pz)) {
+            return 0;
+        }
+        if (!pcnetgame_field_action_reach_check(ut_x, ut_z, px, py, pz)) {
+            return 0;
+        }
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *inout_item = (mActor_name_t)EMPTY_NO;
+    return 1;
+}
+
+static void pcnetgame_fa_commit_adapter_dig_shine(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                   int acre, int tile, mActor_name_t* inout_item) {
+    (void)req;
+    (void)ut_x;
+    (void)ut_z;
+    pcfa_set_tile(acre, tile, (uint16_t)HOLE_SHINE); /* hole_variant ignored -- see this kind's own doc */
+    *inout_item = (mActor_name_t)EMPTY_NO;
+}
+
+/* World Ecology: snowmen -- SNOWMAN_BREAK (kind 9) adapters. No host-local path: the HOST's own local
+ * break already goes through vanilla's aPSM_actor_move()/mSN_ClearSnowman() completely unmodified
+ * (single ownership is preserved not by routing it through here, but because
+ * pcnetgame_host_check_snowman_state_diff() picks up that local Save_t.snowmen write on its own, the
+ * same way it picks up melt -- see this task's own doc). `*inout_item` carries the resolved
+ * SNOWMANx tile value (the private per-request payload validate hands to commit); the RESULT's own
+ * granted_item is always 0 (see PCNetGameFieldActionResultMsg's doc -- nothing is ever granted by a
+ * break), so commit clears it before returning. */
+static int pcnetgame_fa_validate_adapter_snowman_break(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                        mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    uint16_t value;
+    int acre, tile, slot;
+    float px, py, pz;
+    mSN_snowman_data_c* data;
+
+    if (req->is_host_local) {
+        return 0; /* see this function's own doc: the host's own local break stays on vanilla's path */
+    }
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!s_host_peer[req->peer].ctx_valid || !(req->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+        return 0;
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &value)) {
+        return 0;
+    }
+    pcnetgame_host_resolve_snowman_tile_overlay(acre, tile, &value);
+    if (value < (uint16_t)SNOWMAN0 || value > (uint16_t)SNOWMAN8) {
+        return 0; /* not (or no longer) a snowman tile -- nothing to break */
+    }
+    slot = (int)(value - (uint16_t)SNOWMAN0) / mSN_SAVE_COUNT;
+    if (slot < 0 || slot >= mSN_SAVE_COUNT) {
+        return 0;
+    }
+    data = Save_GetPointer(snowmen.snowmen_data[slot]);
+    if (!data->exists) {
+        return 0; /* the tile still shows a SNOWMANx value but the slot itself is already gone */
+    }
+
+    /* Lenient reach check -- reuses the SAME envelope DIG_BURIED/MONEY_ROCK_HIT/tree shake/chop already
+       share (pcnetgame_field_action_reach_check()), not a tight exact-tile match: players break
+       snowmen at ordinary melee range, same as trees (see this task's own brief). */
+    if (!pc_remote_player_get_last_position((PCNetPlayerId)req->peer, &px, &py, &pz)) {
+        return 0;
+    }
+    if (!pcnetgame_pos_valid(px, py, pz)) {
+        return 0;
+    }
+    if (!pcnetgame_field_action_reach_check(ut_x, ut_z, px, py, pz)) {
+        return 0;
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *inout_item = (mActor_name_t)value;
+    return 1;
+}
+
+static void pcnetgame_fa_commit_adapter_snowman_break(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                       int acre, int tile, mActor_name_t* inout_item) {
+    int slot = (int)((uint16_t)*inout_item - (uint16_t)SNOWMAN0) / mSN_SAVE_COUNT;
+    int cleared_via_actor = 0;
+
+    memset(Save_GetPointer(snowmen.snowmen_data[slot]), 0, sizeof(mSN_snowman_data_c));
+
+    /* If the HOST's own process still has a live PSNOWMAN actor for this exact snowman, clear its
+       npc_id to EMPTY_NO and delete it through the ordinary actor path -- its own restore-on-destroy
+       (restore_fgdata(), m_actor.c) then writes nothing back (name == EMPTY_NO), exactly mirroring what
+       a client applying this same break via SNOWMAN_STATE does on ITS side (see
+       pcnetgame_handle_client_snowman_state()). Otherwise the field write below is the only thing that
+       needs to happen -- no live actor is straddling this tile on the host. */
+    if (gamePT != NULL && gamePT->exec == play_main && pcfa_scene_is_town()) {
+        GAME_PLAY* play = (GAME_PLAY*)gamePT;
+        ACTOR* actor;
+        for (actor = play->actor_info.list[ACTOR_PART_BG].actor; actor != NULL; actor = actor->next_actor) {
+            if (actor->restore_fg && actor->npc_id == (mActor_name_t)*inout_item) {
+                actor->npc_id = (mActor_name_t)EMPTY_NO;
+                /* Safety: if this actor is the local player's live dialogue partner right now
+                 * (m_demo.c sets ACTOR_STATE_IN_DEMO on demo->current.actor for the duration of the
+                 * talk and writes through that same pointer when the talk ends), do NOT delete it out
+                 * from under the open dialogue -- that would leave m_demo.c holding a dangling
+                 * actor pointer (use-after-free on dialogue-close). npc_id is already severed above,
+                 * so the actor is already "gone" for every save/tile purpose; its own per-frame
+                 * mRlib_PSnowman_NormalTalk() check (aPSM_actor_move(), ac_psnowman.c) will call
+                 * Actor_delete() itself the moment the talk actually ends, exactly like vanilla's
+                 * own end-of-conversation cleanup. */
+                if (!(actor->state_bitfield & ACTOR_STATE_IN_DEMO)) {
+                    Actor_delete(actor);
+                }
+                cleared_via_actor = 1;
+                break;
+            }
+        }
+    }
+    if (!cleared_via_actor) {
+        pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO);
+    }
+
+    printf("[NET][SNOWMAN] host: peer %d SNOWMAN_BREAK at tile (%d,%d) slot %d\n",
+           req->is_host_local ? -1 : (int)req->peer, (int)ut_x, (int)ut_z, slot);
+
+    pcnetgame_host_check_snowman_state_diff();
+    *inout_item = (mActor_name_t)EMPTY_NO; /* granted_item is always 0 for a break */
+}
+
+/* T0-A: stub validate for every FIELD_ACTION kind reserved for a FUTURE task (T1 trees, T2 dig-
+ * classification fixes, T3 bury, T5 snowmen -- see this milestone's own scope doc) but not yet
+ * implemented in this build. Always rejects -- a request carrying one of these kinds (none of which
+ * any caller in this build ever sends) gets an ordinary RESULT(accepted=0), the same shape DIG_BURIED/
+ * MONEY_ROCK_HIT's own validators already produce for a request that fails their real checks. */
+static int pcnetgame_fa_validate_stub(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                      mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    (void)req;
+    (void)ut_x;
+    (void)ut_z;
+    (void)inout_item;
+    (void)out_acre;
+    (void)out_tile;
+    return 0;
+}
+
+/* T0-A: the FIELD_ACTION_REQUEST dispatch table -- replaces the previous if/else kind chain in
+ * pcnetgame_handle_host_field_action_request(). Kinds 3-10 are placeholders: a future task (T1/T2/T3/
+ * T5) implements its kind by replacing its stub `validate`/`commit` pair here, never by touching this
+ * table's shape or pcnetgame_handle_host_field_action_request() itself. A kind with NO entry here at
+ * all (e.g. 0, or 11+) is still silently ignored with no reply at all, exactly like the pre-refactor
+ * if/else's final `else { return; }` branch -- see pcnetgame_find_field_action_handler(). */
+static const PCNetGameFAHandler s_field_action_handlers[] = {
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_BURIED, pcnetgame_fa_validate_adapter_dig,
+      pcnetgame_fa_commit_adapter_dig, "DIG_BURIED" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_MONEY_ROCK_HIT, pcnetgame_fa_validate_adapter_money_rock,
+      pcnetgame_fa_commit_adapter_money_rock, "MONEY_ROCK_HIT" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_SHAKE, pcnetgame_fa_validate_adapter_tree_shake,
+      pcnetgame_fa_commit_adapter_tree_shake, "TREE_SHAKE" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_CHOP, pcnetgame_fa_validate_adapter_tree_chop,
+      pcnetgame_fa_commit_adapter_tree_chop, "TREE_CHOP" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE, pcnetgame_fa_validate_adapter_dig_hole,
+      pcnetgame_fa_commit_adapter_dig_hole, "DIG_HOLE" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_FILL_HOLE, pcnetgame_fa_validate_adapter_fill_hole,
+      pcnetgame_fa_commit_adapter_fill_hole, "FILL_HOLE" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_PITFALL_CONSUME, pcnetgame_fa_validate_adapter_pitfall_consume,
+      pcnetgame_fa_commit_adapter_pitfall_consume, "PITFALL_CONSUME" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_SHINE, pcnetgame_fa_validate_adapter_dig_shine,
+      pcnetgame_fa_commit_adapter_dig_shine, "DIG_SHINE" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK, pcnetgame_fa_validate_adapter_snowman_break,
+      pcnetgame_fa_commit_adapter_snowman_break, "SNOWMAN_BREAK" },
+    { 10, pcnetgame_fa_validate_stub, NULL, "RESERVED_10" },
+};
+#define PC_NETGAME_FIELD_ACTION_HANDLER_COUNT \
+    (sizeof(s_field_action_handlers) / sizeof(s_field_action_handlers[0]))
+
+static const PCNetGameFAHandler* pcnetgame_find_field_action_handler(uint8_t kind) {
+    size_t i;
+    for (i = 0; i < PC_NETGAME_FIELD_ACTION_HANDLER_COUNT; i++) {
+        if (s_field_action_handlers[i].kind == kind) {
+            return &s_field_action_handlers[i];
+        }
+    }
+    return NULL;
+}
+
+/* T0-A: generic host-local dispatch -- given a FIELD_ACTION kind and the HOST's own local ut_x/ut_z,
+ * builds a host-local PCNetGameRequester and runs that kind's table entry exactly as if a peer had
+ * requested it, without ever touching the network. Mirrors pc_net_game_host_local_money_rock_hit()'s
+ * own pre-T0 reasoning (single ownership: every hit/dig/etc., from every source, must update the same
+ * host-side bookkeeping through the same validate/commit pair) but generically, for any kind in the
+ * table. Returns 1 iff the action was accepted and committed. No result message is sent (there is no
+ * peer to send one to); a committed field mutation still reaches every client the ordinary way, via
+ * the commit function's own pcfa_set_tile() plus the caller's later dirty-flush/pcnetgame_host_flush_mask()
+ * pass. NOT wired to any new caller in T0 -- only pc_net_game_host_local_money_rock_hit() below uses it,
+ * exactly reproducing its own pre-T0 behavior. */
+static int pcnetgame_host_dispatch_local_field_action_ex(uint8_t kind, uint8_t ut_x, uint8_t ut_z,
+                                                          uint8_t hole_variant) {
+    const PCNetGameFAHandler* h;
+    PCNetGameRequester req;
+    mActor_name_t item = (mActor_name_t)EMPTY_NO;
+    int acre = 0, tile = 0;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    h = pcnetgame_find_field_action_handler(kind);
+    if (h == NULL) {
+        return 0;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.is_host_local = 1;
+    req.peer = -1;
+    req.hole_variant = hole_variant;
+    pcnetgame_capture_local_context(&req.ctx);
+
+    if (!h->validate(&req, ut_x, ut_z, &item, &acre, &tile)) {
+        return 0;
+    }
+    if (h->commit != NULL) {
+        h->commit(&req, ut_x, ut_z, acre, tile, &item);
+    }
+    return 1;
+}
+
+/* Pre-v3 call shape, kept for every EXISTING caller (MONEY_ROCK_HIT, TREE_SHAKE, TREE_CHOP) unmodified --
+ * none of these kinds use hole_variant. */
+static int pcnetgame_host_dispatch_local_field_action(uint8_t kind, uint8_t ut_x, uint8_t ut_z) {
+    return pcnetgame_host_dispatch_local_field_action_ex(kind, ut_x, ut_z, 0);
+}
+
+/* World Ecology Stage 1: client -> host FIELD_ACTION_REQUEST, dispatched by kind through the T0-A
+ * table above. No two-phase reservation (see PCNetGameFieldActionRequestMsg's own doc) -- each kind
+ * validates and commits synchronously in this same call before replying, so a retried/duplicate
+ * request_id is answered from s_host_field_action_dedup[peer] instead of being re-validated (which for
+ * MONEY_ROCK_HIT would otherwise double-count a hit). */
+static void pcnetgame_handle_host_field_action_request(PCNetPeerId peer, const PCNetGameFieldActionRequestMsg* in) {
+    PCNetGameFieldActionDedup* dedup;
+    const PCNetGameFAHandler* h;
+    PCNetGameRequester req;
+    int accepted = 0;
+    mActor_name_t item = (mActor_name_t)EMPTY_NO;
+    int acre = 0, tile = 0;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+
+    dedup = &s_host_field_action_dedup[peer];
+    if (dedup->valid && dedup->request_id == in->request_id && dedup->kind == in->kind) {
+        PCNetGameFieldActionResultMsg out;
+        memset(&out, 0, sizeof(out));
+        out.msg_type = (uint8_t)PC_NETGAME_MSG_FIELD_ACTION_RESULT;
+        out.kind = dedup->kind;
+        out.accepted = dedup->accepted;
+        out.ut_x = dedup->ut_x;
+        out.ut_z = dedup->ut_z;
+        out.request_id = dedup->request_id;
+        out.granted_item = dedup->granted_item;
+        pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "FIELD_ACTION_RESULT (replay)");
+        return;
+    }
+
+    h = pcnetgame_find_field_action_handler(in->kind);
+    if (h == NULL) {
+        return; /* unknown kind -- ignore rather than misinterpret (identical to the pre-refactor
+                    if/else's own final `else { return; }` branch) */
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.is_host_local = 0;
+    req.peer = peer;
+    req.ctx = s_host_peer[peer].ctx;
+    req.hole_variant = in->hole_variant; /* protocol v3 -- TRUST BOUNDARY, see PCNetGameFieldActionRequestMsg's
+                                             own doc; each validator that actually uses this must range-check
+                                             it itself via pcnetgame_validate_hole_variant() */
+
+    accepted = h->validate(&req, in->ut_x, in->ut_z, &item, &acre, &tile);
+    if (accepted && h->commit != NULL) {
+        h->commit(&req, in->ut_x, in->ut_z, acre, tile, &item);
+    }
+
+    dedup->valid = 1;
+    dedup->request_id = in->request_id;
+    dedup->kind = in->kind;
+    dedup->accepted = (uint8_t)(accepted != 0);
+    dedup->ut_x = in->ut_x;
+    dedup->ut_z = in->ut_z;
+    /* World Ecology T-dig: on REJECT, `item` is still propagated (not forced to EMPTY_NO) -- every
+       validator except PITFALL_CONSUME's leaves it at its EMPTY_NO initializer on a reject anyway, so
+       this is a no-op for them; PITFALL_CONSUME's own validator (see
+       pcnetgame_fa_validate_adapter_pitfall_consume()) deliberately sets it to the host's CURRENT tile
+       value on reject so the client can reconcile its optimistic local fall (see that function's own
+       doc and pc_net_game_request_pitfall_consume()'s own doc). */
+    dedup->granted_item = (uint16_t)item;
+
+    {
+        PCNetGameFieldActionResultMsg out;
+        memset(&out, 0, sizeof(out));
+        out.msg_type = (uint8_t)PC_NETGAME_MSG_FIELD_ACTION_RESULT;
+        out.kind = in->kind;
+        out.accepted = dedup->accepted;
+        out.ut_x = in->ut_x;
+        out.ut_z = in->ut_z;
+        out.request_id = in->request_id;
+        out.granted_item = dedup->granted_item;
+        pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "FIELD_ACTION_RESULT");
+    }
+}
+
+/* World Ecology: snowmen. Host side: client -> host SNOWMAN_BUILD_REQUEST. NOT a FIELD_ACTION kind
+ * (see PCNetGameSnowmanBuildRequestMsg's own doc for why) -- its own dedicated request/result pair,
+ * dispatched directly from pcnetgame_handle_host_data(), with its own per-peer dedup record
+ * (s_host_snowman_build_dedup) mirroring s_host_field_action_dedup's own replay-on-retry shape.
+ * Deliberately does NOT check reach or IN_TOWN for the requester (see this function's own header doc,
+ * pc_net_game.h) -- acceptance is judged purely from the HOST's own field/slot state. Mirrors
+ * mSN_regist_snowman_society() (m_snowman.c) in Save-space: on acceptance, stamps
+ * Save_t.snowmen.snowmen_data[slot], keeps a displaced ITEM1/FTR item via mPB_keep_item() (matching
+ * m_police_box.c:76-94's own classification -- anything else is simply lost on this path, same as
+ * vanilla), writes the SNOWMANx tile, and stamps the completion dates from the host's OWN currently-
+ * synced clock (Common_Get(time.rtc_time...), exactly like aSMAN_process_combine_head_jump_init()'s own
+ * vanilla stamp, ac_snowman.c) -- the host is the sole clock authority (see the N-clock milestone).
+ * Calls pcnetgame_host_check_snowman_state_diff() itself, right after the write, so SNOWMAN_STATE
+ * reaches every client no later than the ordinary FIELD_UPDATE the tile write also triggers. */
+static void pcnetgame_handle_host_snowman_build_request(PCNetPeerId peer, const PCNetGameSnowmanBuildRequestMsg* in) {
+    PCNetGameSnowmanBuildDedup* dedup;
+    PCNetGameSnowmanBuildResultMsg out;
+    int acre = 0, tile = 0;
+    uint16_t value = (uint16_t)EMPTY_NO;
+    int slot = 0xFF;
+    uint8_t reason = (uint8_t)PC_NETGAME_SNOWMAN_REASON_NONE;
+    int accepted = 0;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+
+    dedup = &s_host_snowman_build_dedup[peer];
+    if (dedup->valid && dedup->request_id == in->request_id) {
+        memset(&out, 0, sizeof(out));
+        out.msg_type = (uint8_t)PC_NETGAME_MSG_SNOWMAN_BUILD_RESULT;
+        out.accepted = dedup->accepted;
+        out.ut_x = in->ut_x;
+        out.ut_z = in->ut_z;
+        out.request_id = in->request_id;
+        out.slot = dedup->slot;
+        out.reason = dedup->reason;
+        pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "SNOWMAN_BUILD_RESULT (replay)");
+        return;
+    }
+
+    if (!s_host_world_ready || !pcfa_save_ready()) {
+        reason = (uint8_t)PC_NETGAME_SNOWMAN_REASON_NOT_READY;
+    } else if (!pcfa_town_ut_to_acre_tile((int)in->ut_x, (int)in->ut_z, &acre, &tile) ||
+               !pcfa_get_tile(acre, tile, &value)) {
+        reason = (uint8_t)PC_NETGAME_SNOWMAN_REASON_TILE_INVALID;
+    } else {
+        pcnetgame_host_resolve_snowman_tile_overlay(acre, tile, &value);
+
+        if ((value >= (uint16_t)SNOWMAN0 && value <= (uint16_t)SNOWMAN8) || value == (uint16_t)RSV_NO ||
+            value == (uint16_t)RSV_WALL_NO || pcfa_is_transient_value(value) ||
+            ITEM_NAME_GET_TYPE((mActor_name_t)value) == NAME_TYPE_STRUCT ||
+            ITEM_NAME_GET_TYPE((mActor_name_t)value) == NAME_TYPE_PROPS ||
+            pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+            reason = (uint8_t)PC_NETGAME_SNOWMAN_REASON_TILE_INVALID;
+        } else {
+            mSN_snowman_data_c* snowmen = Save_GetPointer(snowmen.snowmen_data[0]);
+            int free_slot = -1;
+            int i;
+
+            for (i = 0; i < mSN_SAVE_COUNT; i++) {
+                if (!snowmen[i].exists) {
+                    free_slot = i;
+                    break;
+                }
+            }
+            if (free_slot < 0) {
+                reason = (uint8_t)PC_NETGAME_SNOWMAN_REASON_SLOTS_FULL;
+            } else {
+                uint16_t prior = value;
+                uint8_t score = in->score;
+
+                if (score > 3) {
+                    printf("[NET][SNOWMAN] host: peer %d BUILD_REQUEST score %u clamped to 3\n", (int)peer,
+                           (unsigned)score);
+                    score = 3;
+                }
+
+                snowmen[free_slot].exists = 1;
+                snowmen[free_slot].head_size = in->head_size;
+                snowmen[free_slot].body_size = in->body_size;
+                snowmen[free_slot].score = score;
+
+                if (prior != (uint16_t)EMPTY_NO) {
+                    mPB_keep_item((mActor_name_t)prior); /* no-op unless ITEM1/FTR -- see doc above */
+                    pcfa_set_deposit(acre, tile, 0);
+                }
+                pcfa_set_tile(acre, tile, (uint16_t)(SNOWMAN0 + free_slot * mSN_SAVE_COUNT));
+
+                Save_Set(snowman_year, (u8)(Common_Get(time.rtc_time.year) % 100));
+                Save_Set(snowman_month, Common_Get(time.rtc_time.month));
+                Save_Set(snowman_day, Common_Get(time.rtc_time.day));
+                Save_Set(snowman_hour, Common_Get(time.rtc_time.hour));
+
+                slot = free_slot;
+                accepted = 1;
+                reason = (uint8_t)PC_NETGAME_SNOWMAN_REASON_NONE;
+
+                pcnetgame_host_check_snowman_state_diff();
+
+                printf("[NET][SNOWMAN] host: peer %d BUILD accepted at tile (%d,%d) slot %d\n", (int)peer,
+                       (int)in->ut_x, (int)in->ut_z, slot);
+            }
+        }
+    }
+
+    dedup->valid = 1;
+    dedup->request_id = in->request_id;
+    dedup->accepted = (uint8_t)accepted;
+    dedup->slot = (uint8_t)slot;
+    dedup->reason = reason;
+
+    memset(&out, 0, sizeof(out));
+    out.msg_type = (uint8_t)PC_NETGAME_MSG_SNOWMAN_BUILD_RESULT;
+    out.accepted = (uint8_t)accepted;
+    out.ut_x = in->ut_x;
+    out.ut_z = in->ut_z;
+    out.request_id = in->request_id;
+    out.slot = (uint8_t)slot;
+    out.reason = reason;
+    pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "SNOWMAN_BUILD_RESULT");
+    if (!accepted) {
+        printf("[NET][SNOWMAN] host: peer %d BUILD rejected at tile (%d,%d) reason %u\n", (int)peer, (int)in->ut_x,
+               (int)in->ut_z, (unsigned)reason);
+    }
+}
+
+/* Bug 4 fix: pc_net_game_is_money_bag_pickup_allowed() and its per-tile drop bookkeeping are gone --
+ * a money-rock-dropped bag is now an entirely ordinary field item (see PCNetGameMoneyRockState's own
+ * doc above and pcnetgame_validate_and_resolve_pickup()), so no special allow-list is needed to pick
+ * one up any more. */
+
+/* World Ecology T3: bury outcome kinds -- exact duplicate of bIT_common_bury_after()'s own
+ * bIT_BURY_ACTION_* enum (bg_item_common.c_inc, `static` in a different translation unit) -- see
+ * pcnetgame_resolve_bury_outcome()'s own doc for why this file duplicates the table instead, mirroring
+ * T1's already-proven pattern for MONEY_ROCK_HIT's/TREE_SHAKE/CHOP's own vanilla-table duplicates. */
+enum {
+    PC_NETGAME_BURY_ACTION_BURY,
+    PC_NETGAME_BURY_ACTION_PLANT,
+    PC_NETGAME_BURY_ACTION_PITFALL
+};
+
+/* World Ecology T3: resolves ONE bury commit's outcome. EXACT duplicate of bIT_common_bury_after()'s
+ * own table (bg_item_common.c_inc), checked in the SAME order, using `item` (the requester's own
+ * claimed/stored item -- already vetted by pcnetgame_is_buryable_item() at reserve time) and
+ * `hole_tile` (the HOST's own freshly re-read tile value -- HOLE00..24 or HOLE_SHINE, never the
+ * client's claim) as bIT_common_bury_after()'s own fg_bury_item/fg_hole_item parameters. `ctx` is the
+ * REQUESTER's own stored PCNetPlayerContext (never the host's local one for a remote peer) for the
+ * money-tree roll; `claimed_hole_variant` is consulted ONLY for the PITFALL-into-HOLE_SHINE sub-case
+ * (see PCNetGameBuryRequestMsg's own doc) -- every other outcome derives everything from item/hole_tile
+ * alone, exactly like vanilla. Returns one PC_NETGAME_BURY_ACTION_* and fills *out_tile_value (the
+ * tile's new persistent value); the caller decides the deposit bit purely from the returned action
+ * (BURY -> ON, PLANT/PITFALL -> OFF), matching bIT_common_hole_throw()'s own mode!=1 (the "resolved
+ * outcome", not the "restore the raw item" mode 1 branch a DIFFERENT vanilla call site uses -- see that
+ * function's own doc; every bury this protocol handles is the mode!=1 case). This function is READ-ONLY
+ * except for its own RNG draw (fqrand(), for the money-tree case) -- it never touches Save_t/the field
+ * itself; the caller writes the result. */
+static int pcnetgame_resolve_bury_outcome(const PCNetPlayerContext* ctx, mActor_name_t item, uint16_t hole_tile,
+                                          uint8_t claimed_hole_variant, mActor_name_t* out_tile_value) {
+    int action = PC_NETGAME_BURY_ACTION_BURY;
+    *out_tile_value = item;
+
+    if (item == ITM_FOOD_APPLE || item == ITM_FOOD_CHERRY || item == ITM_FOOD_PEAR || item == ITM_FOOD_PEACH ||
+        item == ITM_FOOD_ORANGE || item == ITM_FOOD_COCONUT) {
+        static const struct {
+            mActor_name_t fruit;
+            mActor_name_t tree;
+        } fr2tr[] = {
+            { ITM_FOOD_APPLE, TREE_APPLE_SAPLING },   { ITM_FOOD_CHERRY, TREE_CHERRY_SAPLING },
+            { ITM_FOOD_PEAR, TREE_PEAR_SAPLING },     { ITM_FOOD_PEACH, TREE_PEACH_SAPLING },
+            { ITM_FOOD_ORANGE, TREE_ORANGE_SAPLING }, { ITM_FOOD_COCONUT, TREE_PALM_SAPLING },
+        };
+        size_t i;
+        *out_tile_value = (mActor_name_t)EMPTY_NO;
+        for (i = 0; i < sizeof(fr2tr) / sizeof(fr2tr[0]); i++) {
+            if (item == fr2tr[i].fruit) {
+                *out_tile_value = fr2tr[i].tree;
+                return PC_NETGAME_BURY_ACTION_PLANT;
+            }
+        }
+    } else if (item == (mActor_name_t)ITM_MONEY_1000 || item == (mActor_name_t)ITM_MONEY_10000 ||
+               item == (mActor_name_t)ITM_MONEY_30000 || item == (mActor_name_t)ITM_MONEY_100) {
+        if (hole_tile == (uint16_t)HOLE_SHINE) {
+            /* EXACT duplicate of bIT_common_moneytree_check() (bg_item_common.c_inc: rnd =
+               RANDOM_F(100.0f) i.e. fqrand()*100.0f; rnd <= 50 + money_power*0.5 || destiny ==
+               MONEY_LUCK) -- the RNG draw happens UNCONDITIONALLY first, then the destiny
+               short-circuit is checked, exactly vanilla's own order, using the REQUESTER's own ctx. */
+            float rnd = fqrand() * 100.0f;
+            int win = (rnd <= (50.0f + (float)(int)ctx->money_power * 0.5f)) ||
+                      ((int)ctx->destiny_type == mPr_DESTINY_MONEY_LUCK);
+            if (win) {
+                static const struct {
+                    mActor_name_t money;
+                    mActor_name_t tree;
+                } fr2tr[] = {
+                    { ITM_MONEY_1000, TREE_1000BELLS_SAPLING },
+                    { ITM_MONEY_10000, TREE_10000BELLS_SAPLING },
+                    { ITM_MONEY_30000, TREE_30000BELLS_SAPLING },
+                    { ITM_MONEY_100, TREE_100BELLS_SAPLING },
+                };
+                size_t i;
+                *out_tile_value = TREE_SAPLING;
+                for (i = 0; i < sizeof(fr2tr) / sizeof(fr2tr[0]); i++) {
+                    if (item == fr2tr[i].money) {
+                        *out_tile_value = fr2tr[i].tree;
+                        break;
+                    }
+                }
+            } else {
+                *out_tile_value = TREE_SAPLING;
+            }
+            action = PC_NETGAME_BURY_ACTION_PLANT;
+        }
+        /* else: not a shine hole -- falls through untouched: action stays BURY, *out_tile_value stays
+           `item` (the money bag itself) -- byte-for-byte what bIT_common_bury_after() does too (its own
+           money branch only ever touches buried_item_p/res inside the `fg_hole_item == HOLE_SHINE`
+           check). */
+    } else if (item >= (mActor_name_t)ITM_WHITE_PANSY_BAG && item <= (mActor_name_t)ITM_YELLOW_TULIP_BAG) {
+        *out_tile_value = (mActor_name_t)(FLOWER_PANSIES0 + (item - ITM_WHITE_PANSY_BAG));
+        action = PC_NETGAME_BURY_ACTION_PLANT;
+    } else if (item == (mActor_name_t)ITM_SAPLING) {
+        *out_tile_value = TREE_SAPLING;
+        action = PC_NETGAME_BURY_ACTION_PLANT;
+    } else if (item == (mActor_name_t)ITM_CEDAR_SAPLING) {
+        *out_tile_value = CEDAR_TREE_SAPLING;
+        action = PC_NETGAME_BURY_ACTION_PLANT;
+    } else if (item == (mActor_name_t)ITM_PITFALL) {
+        if (ITEM_IS_HOLE(hole_tile)) {
+            /* The host derives the hole shape itself from its own re-read tile -- see
+               PCNetGameBuryRequestMsg's own doc: this HOLE00..24 sub-case does NOT consult
+               claimed_hole_variant at all, unlike the HOLE_SHINE sub-case below. */
+            *out_tile_value = (mActor_name_t)(BURIED_PITFALL_HOLE_START + (hole_tile - (uint16_t)HOLE_START));
+        } else {
+            /* HOLE_SHINE: the host has no collision data to derive a shape from -- the client's own
+               locally-computed hole_variant IS authoritative here (the ONE genuinely-trusted case --
+               see PCNetGameBuryRequestMsg's own doc). 0xFF is mCoBG_GetHoleNumber()'s own -1 sentinel. */
+            if (claimed_hole_variant <= 24u) {
+                *out_tile_value = (mActor_name_t)(BURIED_PITFALL_HOLE_START + claimed_hole_variant);
+            } else {
+                *out_tile_value = (mActor_name_t)EMPTY_NO;
+            }
+        }
+        action = PC_NETGAME_BURY_ACTION_PITFALL;
+    } else if (item == (mActor_name_t)ITM_SHOVEL) {
+        if (hole_tile == (uint16_t)HOLE_SHINE) {
+            *out_tile_value = GOLD_TREE_SAPLING;
+            action = PC_NETGAME_BURY_ACTION_PLANT;
+        }
+        /* else: falls through untouched -- action stays BURY, *out_tile_value stays ITM_SHOVEL itself,
+           matching vanilla (bIT_common_bury_after()'s own ITM_SHOVEL branch only acts inside the
+           HOLE_SHINE check too). */
+    }
+    /* else: any other item pcnetgame_is_buryable_item() already classified as buryable -- action stays
+       BURY, *out_tile_value stays `item` itself, matching vanilla's own default case. */
+
+    return action;
+}
+
 /* Host side: INTERACT_CONFIRM from a peer. Acts ONLY if (peer READY [closing peers never reach here],
  * kind matches, outcome is COMMIT or ABORT, the peer's record of that kind is PENDING, and
  * request_id equals that record's request_id); anything else is stale/duplicate/forged: ignored, no
@@ -3400,6 +7051,69 @@ static void pcnetgame_handle_host_confirm(PCNetPeerId peer, const PCNetGameInter
         char why[64];
         snprintf(why, sizeof(why), "aborted by client (reason=%u)", (unsigned)in->reason);
         pcnetgame_host_release(peer, (int)in->kind, rec, PC_NETGAME_PHASE_ABORTED, why);
+        return;
+    }
+
+    if (in->kind == (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) {
+        /* World Ecology T3: BURY commit -- deliberately NOT the generic pickup/drop logic below (that
+         * logic assumes DROP semantics: it requires an empty destination and never sets the deposit
+         * bit, confirmed unsuitable for bury by direct trace of pcnetgame_handle_host_confirm()'s own
+         * pre-T3 body -- see this milestone's design brief). Re-validates the tile is STILL exactly the
+         * raw hole value observed at reservation time (nothing else mutated it in between) and deposit
+         * is still 0, resolves the outcome via pcnetgame_resolve_bury_outcome() (an exact duplicate of
+         * bIT_common_bury_after()'s own table, checked in the same order), writes the tile then the
+         * deposit bit (ON only for a BURY-action outcome), and replies. Any failure aborts with NO
+         * partial mutation and the same reconciliation echo the reserve-phase reject already uses. */
+        uint16_t bury_cur = 0;
+        int bury_dep = 0;
+        const char* bury_fail = NULL;
+
+        if (!s_host_world_ready) {
+            bury_fail = "host world not ready";
+        } else if (!pcfa_get_tile(rec->acre, rec->tile, &bury_cur)) {
+            bury_fail = "tile unreadable";
+        } else {
+            bury_dep = pcfa_get_deposit(rec->acre, rec->tile);
+            if (bury_dep != 0) {
+                bury_fail = "tile deposit bit set";
+            } else if (bury_cur != rec->raw_item) {
+                bury_fail = "tile no longer holds the reserved hole value";
+            }
+        }
+        if (bury_fail != NULL) {
+            printf("[NET][BURY] host: peer %d request %u COMMIT FAILED (%s): tile (%d,%d) found 0x%04X dep %d "
+                   "expected 0x%04X -- no mutation, reservation released\n",
+                   (int)peer, (unsigned)rec->request_id, bury_fail, (int)rec->ut_x, (int)rec->ut_z,
+                   (unsigned)bury_cur, bury_dep, (unsigned)rec->raw_item);
+            rec->phase = (uint8_t)PC_NETGAME_PHASE_ABORTED;
+            pcnetgame_host_send_bury_reject(peer, rec->request_id, rec->ut_x, rec->ut_z);
+            return;
+        }
+        {
+            mActor_name_t resolved = (mActor_name_t)EMPTY_NO;
+            int action = pcnetgame_resolve_bury_outcome(&s_host_peer[peer].ctx, (mActor_name_t)rec->item, bury_cur,
+                                                        rec->hole_variant, &resolved);
+            int dep_on = (action == PC_NETGAME_BURY_ACTION_BURY);
+
+            if (!pcfa_set_tile(rec->acre, rec->tile, (uint16_t)resolved)) {
+                printf("[NET][BURY] host: peer %d request %u COMMIT FAILED (pcfa_set_tile refused): tile (%d,%d) "
+                       "-- no mutation, reservation released\n",
+                       (int)peer, (unsigned)rec->request_id, (int)rec->ut_x, (int)rec->ut_z);
+                rec->phase = (uint8_t)PC_NETGAME_PHASE_ABORTED;
+                pcnetgame_host_send_bury_reject(peer, rec->request_id, rec->ut_x, rec->ut_z);
+                return;
+            }
+            if (dep_on) {
+                pcfa_set_deposit(rec->acre, rec->tile, 1);
+            }
+            rec->phase = (uint8_t)PC_NETGAME_PHASE_DONE;
+            printf("[NET][BURY] host: peer %d request %u committed tile (%d,%d) 0x%04X -> 0x%04X (action=%d dep=%d)\n",
+                   (int)peer, (unsigned)rec->request_id, (int)rec->ut_x, (int)rec->ut_z, (unsigned)bury_cur,
+                   (unsigned)resolved, action, dep_on);
+            pcnetgame_host_flush_mask((uint32_t)1u << rec->acre); /* shadow + world_seq + FIELD_UPDATE to every READY peer */
+            pcnetgame_host_send_bury_result(peer, rec->request_id, rec->ut_x, rec->ut_z, 1, rec->item, 0,
+                                            (uint8_t)PC_NETGAME_BURY_REASON_NONE);
+        }
         return;
     }
 
@@ -3490,6 +7204,12 @@ static void pcnetgame_client_cancel_pending(int need_stamp_mismatch, const char*
                                       (uint8_t)PC_NETGAME_CONFIRM_REASON_STATE_CHANGED, s_drop_pending.request_id);
         s_drop_pending.valid = 0;
     }
+    if (s_bury_pending.valid && (!need_stamp_mismatch || !pcnetgame_owner_stamp_matches(&s_bury_pending.owner))) {
+        printf("[NET][BURY] request %u cancelled: %s\n", (unsigned)s_bury_pending.request_id, why);
+        pcnetgame_client_send_confirm((uint8_t)PC_NETGAME_INTERACT_KIND_BURY, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
+                                      (uint8_t)PC_NETGAME_CONFIRM_REASON_STATE_CHANGED, s_bury_pending.request_id);
+        s_bury_pending.valid = 0;
+    }
 }
 
 /* Client side: the host's answer to our own pending pickup request -- see
@@ -3502,16 +7222,24 @@ static void pcnetgame_client_cancel_pending(int need_stamp_mismatch, const char*
  * replay of a RESULT we already handled) is answered ABORT(STALE) so the host releases at once. The
  * pending record is cleared the moment a RESULT for it arrives, so no retry can follow it.
  *
- * Validation before touching the inventory (never grant outside this path): the RESULT's tile must be
- * the one we asked for, the owner stamp must be unchanged (same save/player), and a free pocket must
- * exist -- otherwise ABORT (STATE_CHANGED / POCKETS_FULL; the item stays in the world). The COMMIT is
- * queued BEFORE the inventory is written: if it cannot be queued (window full) we do nothing to the
- * inventory (the host's reservation just expires), so the two sides can never diverge on a send
- * failure. Everything here is one synchronous step, so the free slot found cannot vanish before the
- * write. */
+ * Bug 3 fix: BOTH possible destinations for the granted item -- the wallet (money bag) and a pocket
+ * slot -- are checked BEFORE the COMMIT is ever sent, exactly like the plain pocket-only check already
+ * did for an ordinary item. wallet_fits and pocket_free are computed here, read-only, from
+ * Now_Private->inventory.wallet / mPr_GetPossessionItemIdx() -- nothing is mutated yet. Only if
+ * NEITHER destination has room do we ABORT(POCKETS_FULL) and return without ever sending COMMIT: the
+ * bag is left completely untouched on the field, nothing is granted, nothing is lost. Otherwise COMMIT
+ * is sent, and then (synchronously, nothing else can run in between and mutate wallet/pocket state
+ * before this) the item is granted: mPr_GivePossessionBells() if the wallet has room, otherwise
+ * mPr_SetFreePossessionItem() -- and step 2's pre-check guarantees pocket_free is true whenever the
+ * pocket branch runs, so that call cannot fail for this item. There is no remaining "item lost" path
+ * for a money bag: either the wallet takes it, or a pocket slot (already proven free) does. */
 static void pcnetgame_handle_client_pickup_result(const PCNetGamePickupResultMsg* in) {
     const uint8_t kind = (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP;
     int matches = s_pickup_pending.valid && s_pickup_pending.request_id == in->request_id;
+    int is_money_bag;
+    u32 bell_amount;
+    int wallet_fits;
+    int pocket_free;
 
     if (!in->accepted) {
         if (!matches) {
@@ -3548,9 +7276,28 @@ static void pcnetgame_handle_client_pickup_result(const PCNetGamePickupResultMsg
                                       (uint8_t)PC_NETGAME_CONFIRM_REASON_STATE_CHANGED, in->request_id);
         return;
     }
-    /* Owner stamp matched, so Now_Private is non-NULL and the save is loaded. */
-    if (mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) < 0) {
-        printf("[NET][PICKUP] request %u accepted (item=%u) but local pockets are full -- pickup aborted, the item stays in the world\n",
+    /* Owner stamp matched, so Now_Private is non-NULL and the save is loaded.
+     * Bug 3 fix: compute both possible destinations, read-only, before anything is sent or mutated.
+     * is_money_bag/bell_amount detect a wallet-creditable item exactly as before
+     * (mPr_GetAmountForMoneyItem() > 0 -- covers a money-rock-dropped bag, which is now an ordinary
+     * field item per Bug 4, same as any other money bag this path could ever legitimately see). */
+    is_money_bag = 0;
+    bell_amount = 0;
+#ifdef PC_ENHANCEMENTS
+    bell_amount = mPr_GetAmountForMoneyItem((mActor_name_t)in->granted_item);
+    is_money_bag = bell_amount > 0;
+#endif
+
+    wallet_fits = 0;
+#ifdef PC_ENHANCEMENTS
+    wallet_fits = is_money_bag && Now_Private->inventory.wallet <= mPr_WALLET_MAX &&
+                  bell_amount <= (mPr_WALLET_MAX - Now_Private->inventory.wallet);
+#endif
+    pocket_free = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) >= 0;
+
+    if (!wallet_fits && !pocket_free) {
+        printf("[NET][PICKUP] request %u accepted (item=%u) but neither the wallet nor local pockets have room -- pickup "
+               "aborted, the item stays in the world\n",
                (unsigned)in->request_id, (unsigned)in->granted_item);
         pcnetgame_client_send_confirm(kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
                                       (uint8_t)PC_NETGAME_CONFIRM_REASON_POCKETS_FULL, in->request_id);
@@ -3564,19 +7311,32 @@ static void pcnetgame_handle_client_pickup_result(const PCNetGamePickupResultMsg
         return;
     }
 
-    /* Stage 5A: the one place this file grants an item -- via the real, unmodified
+    /* Bug 3 fix: one of these two is now GUARANTEED to succeed -- wallet_fits was proven against the
+     * current wallet value above, and whenever wallet_fits is false, step 2's precondition
+     * (!wallet_fits && !pocket_free -> abort, above) guarantees pocket_free is true. Nothing runs
+     * between that check and this application (one synchronous handler call), so neither fact can go
+     * stale. There is no remaining failure/"item lost" path for this item. */
+#ifdef PC_ENHANCEMENTS
+    if (wallet_fits) {
+        mPr_GivePossessionBells(bell_amount);
+        printf("[NET][PICKUP] request %u accepted (item=%u) -- credited %u bells straight to the wallet, CONFIRM(COMMIT) sent\n",
+               (unsigned)in->request_id, (unsigned)in->granted_item, (unsigned)bell_amount);
+        return;
+    }
+#endif
+
+    /* Stage 5A: the one place this file grants an ordinary item -- via the real, unmodified
      * mPr_SetFreePossessionItem(), exactly as Player_actor_setup_main_Pickup() would have called it
      * locally in single-player (see the Stage 5A inventory-architecture audit, Parts 4/6). No slot
      * number is sent by the host (see PCNetGamePickupResultMsg's doc) -- this client's own real pocket
-     * contents are the only correct basis for choosing one. The free slot was verified above and
-     * nothing runs in between, so this cannot fail. */
-    if (mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)in->granted_item, mPr_ITEM_COND_NORMAL)) {
-        printf("[NET][PICKUP] request %u accepted (item=%u) -- granted to a free pocket slot, CONFIRM(COMMIT) sent\n",
-               (unsigned)in->request_id, (unsigned)in->granted_item);
-    } else {
-        printf("[NET][PICKUP] request %u accepted (item=%u) -- INTERNAL ERROR: free slot vanished after CONFIRM(COMMIT)\n",
-               (unsigned)in->request_id, (unsigned)in->granted_item);
-    }
+     * contents are the only correct basis for choosing one.
+     * Bug 3 fix: this call is now GUARANTEED to succeed whenever it runs -- either this item was never
+     * a money bag (pocket_free was verified above, unchanged since), or it was a money bag whose
+     * wallet_fits was false, which (per the pre-check above) means pocket_free was proven true before
+     * COMMIT was ever sent. There is no remaining "item lost" outcome to log for this item. */
+    mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)in->granted_item, mPr_ITEM_COND_NORMAL);
+    printf("[NET][PICKUP] request %u accepted (item=%u) -- granted to a free pocket slot, CONFIRM(COMMIT) sent\n",
+           (unsigned)in->request_id, (unsigned)in->granted_item);
 }
 
 /* Client side: the host's answer to our own pending drop request -- see
@@ -3656,6 +7416,385 @@ static void pcnetgame_handle_client_drop_result(const PCNetGameDropResultMsg* in
     mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)EMPTY_NO, mPr_ITEM_COND_NORMAL);
     printf("[NET][DROP] request %u accepted (item=%u) -- cleared pocket slot %d\n", (unsigned)in->request_id,
            (unsigned)in->placed_item, slot);
+}
+
+/* Forward-declared here too (see the canonical forward-declare comment further down, above
+   pcnetgame_handle_client_field_action_result()) -- a duplicate prototype is harmless in C and lets
+   this function use it before its own definition. */
+static void pcnetgame_client_apply_tile(int acre, int tile, uint16_t value, int dep_valid, int dep_on);
+
+/* World Ecology T3 (bugfix): client side of the host's answer to our own pending bury request -- see
+ * pc_net_game_request_bury()'s doc for the overall flow. Structural mirror of
+ * pcnetgame_handle_client_drop_result() -- pocket-clear timing was deliberately moved HERE (to
+ * provisional-accept-confirmed time, gated on a slot-still-holds-the-claimed-item re-check) instead of
+ * happening synchronously at menu-action time in the m_tag_ovl.c bury seam. Naively matching vanilla's
+ * own immediate-clear timing would have been misleading to call "vanilla-matching": vanilla can never
+ * fail once its menu action closes, so its immediate clear is truly a point of no return, but the
+ * NETWORKED path can genuinely fail for reasons that have nothing to do with vanilla's own risk shape --
+ * a lost network race, the pending request's own retry timeout expiring, an owner-stamp mismatch, or an
+ * outright host reject -- and clearing the pocket before any of those are ruled out would destroy the
+ * item with zero chance of it ever landing. So:
+ *   accepted == 1   the caller's pocket slot is STILL INTACT at this point (the m_tag_ovl.c seam left it
+ *                   untouched). Re-verify the tile/item echo, the owner stamp, and that the slot still
+ *                   holds exactly the claimed item (mirrors pcnetgame_handle_client_drop_result()'s own
+ *                   checks); only once INTERACT_CONFIRM(COMMIT) is actually queued do we clear the
+ *                   pocket slot here. The resolved outcome (sapling/flower/pitfall/plain-bury tile,
+ *                   deposit bit) arrives to EVERY client, including this one, through the ordinary
+ *                   ambient FIELD_UPDATE the host's commit triggers -- this function's clear is purely
+ *                   the inventory side, same division of labor as drop's own handler.
+ *   accepted == 0   the item is still in this client's pockets (never cleared before this point) --
+ *                   there is nothing to restore. What CAN and MUST still be corrected is the shared
+ *                   WORLD tile: buried_item/flags carry the host's CURRENT tile value + deposit state
+ *                   (see PCNetGameBuryResultMsg's own doc), applied via the same
+ *                   pcnetgame_client_apply_tile() primitive FIELD_UPDATE uses, so this client's local
+ *                   view of (ut_x, ut_z) converges immediately instead of waiting for the next ambient
+ *                   update. */
+static void pcnetgame_handle_client_bury_result(const PCNetGameBuryResultMsg* in) {
+    const uint8_t kind = (uint8_t)PC_NETGAME_INTERACT_KIND_BURY;
+    int matches = s_bury_pending.valid && s_bury_pending.request_id == in->request_id;
+    int slot;
+
+    if (!in->accepted) {
+        if ((in->flags & (uint8_t)PC_NETGAME_BURY_FLAG_RECONCILE_VALID) != 0) {
+            int acre, tile;
+            if (pcfa_town_ut_to_acre_tile((int)in->ut_x, (int)in->ut_z, &acre, &tile)) {
+                pcnetgame_client_apply_tile(acre, tile, in->buried_item, 1,
+                                            (in->flags & (uint8_t)PC_NETGAME_BURY_FLAG_DEPOSIT_ON) != 0);
+            }
+        }
+        if (!matches) {
+            return; /* not our current pending request -- already resolved, given up, or a stale duplicate */
+        }
+        s_bury_pending.valid = 0; /* resolved -- never retried or re-applied again */
+        printf("[NET][BURY] request %u rejected by host (tile %d,%d) -- item was never cleared from pockets, "
+               "nothing to restore; world tile reconciled\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z);
+        return;
+    }
+
+    if (!matches) {
+        printf("[NET][BURY] provisional accept for request %u has no matching pending request -- sending ABORT(STALE)\n",
+               (unsigned)in->request_id);
+        pcnetgame_client_send_confirm(kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
+                                      (uint8_t)PC_NETGAME_CONFIRM_REASON_STALE, in->request_id);
+        return;
+    }
+
+    s_bury_pending.valid = 0; /* the RESULT arrived: no retry may follow, whatever happens next */
+    slot = (int)s_bury_pending.pocket_slot_idx;
+
+    if (in->ut_x != s_bury_pending.ut_x || in->ut_z != s_bury_pending.ut_z ||
+        in->buried_item != s_bury_pending.claimed_item || slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT) {
+        printf("[NET][BURY] request %u accepted but the RESULT disagrees with the request (tile %d,%d item=%u) -- "
+               "aborting, nothing cleared\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->buried_item);
+        pcnetgame_client_send_confirm(kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
+                                      (uint8_t)PC_NETGAME_CONFIRM_REASON_STATE_CHANGED, in->request_id);
+        return;
+    }
+    if (!pcnetgame_owner_stamp_matches(&s_bury_pending.owner)) {
+        printf("[NET][BURY] request %u accepted (item=%u) but the local player/save changed -- aborting, nothing "
+               "cleared\n",
+               (unsigned)in->request_id, (unsigned)in->buried_item);
+        pcnetgame_client_send_confirm(kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
+                                      (uint8_t)PC_NETGAME_CONFIRM_REASON_STATE_CHANGED, in->request_id);
+        return;
+    }
+    /* Owner stamp matched, so Now_Private is non-NULL and the save is loaded. */
+    if (Now_Private->inventory.pockets[slot] != (mActor_name_t)s_bury_pending.claimed_item) {
+        printf("[NET][BURY] request %u accepted (item=%u) but pocket slot %d no longer holds it (now 0x%04X) -- "
+               "aborting, nothing cleared\n",
+               (unsigned)in->request_id, (unsigned)in->buried_item, slot,
+               (unsigned)Now_Private->inventory.pockets[slot]);
+        pcnetgame_client_send_confirm(kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
+                                      (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED, in->request_id);
+        return;
+    }
+
+    if (!pcnetgame_client_send_confirm(kind, (uint8_t)PC_NETGAME_CONFIRM_COMMIT, (uint8_t)PC_NETGAME_CONFIRM_REASON_NONE,
+                                       in->request_id)) {
+        printf("[NET][BURY] request %u accepted (item=%u) but the CONFIRM could not be queued -- cancelled, "
+               "nothing cleared (the host's reservation will expire)\n",
+               (unsigned)in->request_id, (unsigned)in->buried_item);
+        return;
+    }
+
+    /* The one place this file writes to Now_Private for a bury -- via the real, unmodified
+       mPr_SetPossessionItem(), exactly as mTG_bury_proc()/mTG_plant_proc() would have called it locally
+       in single-player, after the slot was verified above. The field tile itself is handled by the
+       ordinary FIELD_UPDATE the host sends on COMMIT, not here. */
+    mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)EMPTY_NO, mPr_ITEM_COND_NORMAL);
+    printf("[NET][BURY] request %u accepted (item=%u) -- CONFIRM(COMMIT) sent, cleared pocket slot %d; the "
+           "resolved outcome arrives via the ordinary FIELD_UPDATE broadcast\n",
+           (unsigned)in->request_id, (unsigned)in->buried_item, slot);
+}
+
+/* T0-C: sends (or resends) the QUEUE HEAD (index 0) -- the only entry ever placed on the wire. Returns
+ * pc_net_send()'s result, exactly like the pre-queue code's own inline send did. */
+static int pcnetgame_field_action_queue_send(const PCNetGameFieldActionPending* e) {
+    PCNetGameFieldActionRequestMsg msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_FIELD_ACTION_REQUEST;
+    msg.kind = e->kind;
+    msg.ut_x = e->ut_x;
+    msg.ut_z = e->ut_z;
+    msg.request_id = e->request_id; /* SAME id on a retry -- the host's dedup cache recognizes it, see
+                                        s_host_field_action_dedup */
+    msg.hole_variant = e->hole_variant; /* protocol v3 -- 0 for every kind that doesn't use it */
+    return pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+}
+
+/* T0-C: (re)kicks the current head -- called whenever a NEW entry becomes the head (freshly enqueued
+ * into an empty queue, or promoted after the previous head was popped). Mirrors the pre-queue code's
+ * own initial-send failure handling exactly: a failed send (window full) is retried on the very next
+ * timeout tick rather than waiting a whole interval. */
+static void pcnetgame_field_action_queue_kick_head(void) {
+    if (s_field_action_queue_len <= 0) {
+        return;
+    }
+    if (!pcnetgame_field_action_queue_send(&s_field_action_queue[0])) {
+        s_field_action_queue[0].unsent = 1;
+        s_field_action_queue[0].timeout_accum = PC_NETGAME_FIELD_ACTION_TIMEOUT_60FPS_FRAMES;
+    }
+}
+
+/* T0-C: removes the head entry (its RESULT arrived, or it gave up after MAX_RETRIES) and, if another
+ * request is queued behind it, promotes and sends that one now -- preserving "only one request
+ * outstanding on the wire at a time" even though several may now be queued client-side. */
+static void pcnetgame_field_action_queue_pop_head(void) {
+    int i;
+    if (s_field_action_queue_len <= 0) {
+        return;
+    }
+    for (i = 1; i < s_field_action_queue_len; i++) {
+        s_field_action_queue[i - 1] = s_field_action_queue[i];
+    }
+    s_field_action_queue_len--;
+    if (s_field_action_queue_len > 0) {
+        s_field_action_queue[0].timeout_accum = 0.0f;
+        s_field_action_queue[0].retry_count = 0;
+        s_field_action_queue[0].unsent = 0;
+        pcnetgame_field_action_queue_kick_head();
+    }
+}
+
+/* World Ecology Stage 1: client side, the host's answer to our own pending FIELD_ACTION_REQUEST. No
+ * provisional phase and no CONFIRM to send back (see PCNetGameFieldActionRequestMsg's own doc) -- the
+ * host already committed everything on its own side before replying, so this function's only jobs
+ * are (1) pop the queue head (T0-C: so the caller's every-frame recheck can send a new request, and so
+ * the next QUEUED request, if any, is promoted and sent), and (2) for an accepted DIG_BURIED, grant the
+ * item straight into a free pocket slot, exactly like pcnetgame_handle_client_pickup_result() already
+ * does -- never re-deriving the item locally. MONEY_ROCK_HIT needs no client-side inventory step at
+ * all: the dropped bag is picked up later through the ordinary pickup path.
+ * T0-C: only the QUEUE HEAD can ever match an incoming RESULT -- identical in effect to the pre-queue
+ * code's single s_field_action_pending, since that was likewise the only entry ever placed on the
+ * wire. */
+/* Forward-declared for the PITFALL_CONSUME reconciliation branch below -- defined later in this file
+   alongside the rest of the client-side v2 world-apply machinery. */
+static void pcnetgame_client_apply_tile(int acre, int tile, uint16_t value, int dep_valid, int dep_on);
+
+static void pcnetgame_handle_client_field_action_result(const PCNetGameFieldActionResultMsg* in) {
+    PCNetGameFieldActionPending saved;
+    int matches;
+
+    if (s_field_action_queue_len <= 0) {
+        matches = 0;
+    } else {
+        const PCNetGameFieldActionPending* head = &s_field_action_queue[0];
+        matches = head->valid && head->request_id == in->request_id && head->kind == in->kind;
+    }
+
+    if (!matches) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] client: RESULT for request %u (kind %u) has no matching pending request -- ignored\n",
+                   (unsigned)in->request_id, (unsigned)in->kind);
+        }
+        return;
+    }
+    saved = s_field_action_queue[0]; /* copy out before popping -- pop_head() shifts the array */
+    pcnetgame_field_action_queue_pop_head(); /* the RESULT arrived: no retry may follow, whatever happens
+                                                 next; also promotes+sends the next queued request, if any */
+
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_PITFALL_CONSUME) {
+        /* World Ecology T-dig: PITFALL_CONSUME is handled BEFORE the generic accepted/reject branch
+           below, since it needs to act on a REJECT too (unlike every other kind, where a reject means
+           "nothing happened, nothing to do") -- see pc_net_game_request_pitfall_consume()'s own doc. The
+           caller already played its local fall animation optimistically, before this RESULT ever
+           arrived, so there is nothing to undo visually either way. */
+        if (in->accepted) {
+            printf("[NET][FIELD_ACTION] client: request %u PITFALL_CONSUME accepted at tile (%d,%d)\n",
+                   (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z);
+        } else {
+            /* Reconcile: granted_item carries the host's OWN CURRENT tile value (see
+               pcnetgame_fa_validate_adapter_pitfall_consume()'s own doc) -- applied directly through the
+               same client-side apply primitive FIELD_UPDATE uses, rather than forcing a full resync for
+               one already-known stale tile. Deposit is always OFF for every legitimate post-state here
+               (a fresh EMPTY_NO after a racing peer's consume, or a HOLE_START+variant after a racing
+               DIG_BURIED dig-up -- both deposit-OFF outcomes). */
+            int acre, tile;
+            if (pcfa_town_ut_to_acre_tile((int)in->ut_x, (int)in->ut_z, &acre, &tile)) {
+                pcnetgame_client_apply_tile(acre, tile, in->granted_item, 1, 0);
+            }
+            printf("[NET][FIELD_ACTION] client: request %u PITFALL_CONSUME rejected at tile (%d,%d) -- "
+                   "reconciled local tile to host's own value 0x%04X\n",
+                   (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->granted_item);
+        }
+        return;
+    }
+
+    if (!in->accepted) {
+        printf("[NET][FIELD_ACTION] client: request %u (kind %u) rejected by host (tile %d,%d)\n",
+               (unsigned)in->request_id, (unsigned)in->kind, (int)in->ut_x, (int)in->ut_z);
+        return;
+    }
+
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE) {
+        /* World Ecology T-dig: the tile (HOLE_START + this client's own requested hole_variant) already
+           updated, or will moments later, via the ordinary FIELD_UPDATE broadcast the host's own commit
+           triggers. Nothing is granted host-side (see this kind's own doc) -- EXCEPT a private, locally-
+           rolled golden-shovel ITM_MONEY_100 bonus (A-2), carried in `saved.local_grant` by
+           pc_net_game_request_dig_hole_with_grant() and applied here, on ACCEPT only, exactly like
+           DIG_BURIED's own grant below. granted_item here is still the PRE-commit tile value (EMPTY_NO or
+           the removed plant's id), carried purely as optional polish. */
+        printf("[NET][FIELD_ACTION] client: request %u DIG_HOLE accepted at tile (%d,%d) (pre-dig tile was "
+               "0x%04X)\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->granted_item);
+        if (saved.local_grant != 0) {
+            if (in->ut_x != saved.ut_x || in->ut_z != saved.ut_z) {
+                printf("[NET][FIELD_ACTION] client: request %u DIG_HOLE golden-shovel bonus (item=%u) skipped -- "
+                       "RESULT tile disagrees with the request\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            } else if (!pcnetgame_owner_stamp_matches(&saved.owner)) {
+                printf("[NET][FIELD_ACTION] client: request %u DIG_HOLE golden-shovel bonus (item=%u) skipped -- "
+                       "local player/save changed\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            } else if (mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)saved.local_grant, mPr_ITEM_COND_NORMAL)) {
+                printf("[NET][FIELD_ACTION] client: request %u DIG_HOLE golden-shovel bonus (item=%u) granted to a "
+                       "free pocket slot\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            } else {
+                /* Accepted gap, same shape as DIG_BURIED's own: the pocket filled up between send and
+                   this RESULT arriving. Documented, not solved with new mechanism (see this task's own
+                   design brief). */
+                printf("[NET][FIELD_ACTION] client: request %u DIG_HOLE golden-shovel bonus (item=%u) LOST -- free "
+                       "slot vanished before it could be granted\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            }
+        }
+        return;
+    }
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_FILL_HOLE) {
+        printf("[NET][FIELD_ACTION] client: request %u FILL_HOLE accepted at tile (%d,%d)\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z);
+        return;
+    }
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_SHINE) {
+        /* World Ecology T-dig (D): the tile (now HOLE_SHINE) already updated, or will moments later, via
+           the ordinary FIELD_UPDATE broadcast. Per this kind's own doc, the digging client rolls and
+           grants its own bell amount locally -- carried in `saved.local_grant` by
+           pc_net_game_request_dig_shine_with_grant() and applied here, on ACCEPT only, exactly mirroring
+           DIG_HOLE's own golden-shovel bonus handling above. */
+        printf("[NET][FIELD_ACTION] client: request %u DIG_SHINE accepted at tile (%d,%d)\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z);
+        if (saved.local_grant != 0) {
+            if (in->ut_x != saved.ut_x || in->ut_z != saved.ut_z) {
+                printf("[NET][FIELD_ACTION] client: request %u DIG_SHINE bell grant (item=%u) skipped -- RESULT "
+                       "tile disagrees with the request\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            } else if (!pcnetgame_owner_stamp_matches(&saved.owner)) {
+                printf("[NET][FIELD_ACTION] client: request %u DIG_SHINE bell grant (item=%u) skipped -- local "
+                       "player/save changed\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            } else if (mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)saved.local_grant, mPr_ITEM_COND_NORMAL)) {
+                printf("[NET][FIELD_ACTION] client: request %u DIG_SHINE bell grant (item=%u) granted to a free "
+                       "pocket slot\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            } else {
+                printf("[NET][FIELD_ACTION] client: request %u DIG_SHINE bell grant (item=%u) LOST -- free slot "
+                       "vanished before it could be granted\n",
+                       (unsigned)in->request_id, (unsigned)saved.local_grant);
+            }
+        }
+        return;
+    }
+
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_SHAKE) {
+        /* World Ecology T1: nothing further to do here -- the field (dropped item(s) and/or the
+           destination tree conversion) already updated, or will moments later, via the ordinary
+           FIELD_UPDATE broadcast the host's own commit triggers. granted_item is the resulting
+           tree-tile value, carried purely as optional polish (see PCNetGameFieldActionResultMsg's own
+           doc) -- no client-side mutation depends on it. */
+        printf("[NET][FIELD_ACTION] client: request %u TREE_SHAKE accepted at tile (%d,%d) -> tree=0x%04X\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->granted_item);
+        return;
+    }
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_CHOP) {
+        printf("[NET][FIELD_ACTION] client: request %u TREE_CHOP accepted at tile (%d,%d) -> tree=0x%04X\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->granted_item);
+        return;
+    }
+
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK) {
+        /* World Ecology: snowmen -- nothing to undo (the local two-half snowman actor is already gone;
+           see pc_net_game_request_snowman_break()'s own doc). The tile update and the accompanying
+           SNOWMAN_STATE (slot cleared) arrive moments later via their own ordinary broadcasts. */
+        printf("[NET][FIELD_ACTION] client: request %u SNOWMAN_BREAK accepted at tile (%d,%d)\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z);
+        return;
+    }
+
+    if (in->kind != (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_BURIED) {
+        /* MONEY_ROCK_HIT (or any other kind not yet given its own branch above): nothing further to do
+           here -- the field already updated (or will, moments later) via the ordinary FIELD_UPDATE
+           broadcast. */
+        printf("[NET][FIELD_ACTION] client: request %u MONEY_ROCK_HIT accepted at tile (%d,%d)\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z);
+        return;
+    }
+
+    if (in->ut_x != saved.ut_x || in->ut_z != saved.ut_z || in->granted_item == (uint16_t)EMPTY_NO) {
+        printf("[NET][FIELD_ACTION] client: request %u DIG_BURIED accepted but the RESULT disagrees with the request "
+               "(tile %d,%d item=%u) -- no inventory change\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->granted_item);
+        return;
+    }
+    if (!pcnetgame_owner_stamp_matches(&saved.owner)) {
+        printf("[NET][FIELD_ACTION] client: request %u DIG_BURIED accepted (item=%u) but the local player/save changed "
+               "-- no inventory change\n",
+               (unsigned)in->request_id, (unsigned)in->granted_item);
+        return;
+    }
+    /* Owner stamp matched, so Now_Private is non-NULL and the save is loaded. The free slot was
+       already verified before the request was sent (see pc_net_game_request_dig_buried()); a race
+       that fills it in the meantime is the same rare, logged-not-fabricated edge case
+       pcnetgame_handle_client_pickup_result() already accepts. */
+    if (mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)in->granted_item, mPr_ITEM_COND_NORMAL)) {
+        printf("[NET][FIELD_ACTION] client: request %u DIG_BURIED accepted (item=%u) -- granted to a free pocket slot\n",
+               (unsigned)in->request_id, (unsigned)in->granted_item);
+    } else {
+        printf("[NET][FIELD_ACTION] client: request %u DIG_BURIED accepted (item=%u) -- INTERNAL ERROR: free slot "
+               "vanished before it could be granted\n",
+               (unsigned)in->request_id, (unsigned)in->granted_item);
+    }
+}
+
+/* World Ecology: snowmen. Client side: the host's answer to our own SNOWMAN_BUILD_REQUEST. Purely
+ * informational -- there is nothing to visually undo on a rejection (the local two-half snowman actor
+ * is already gone; Actor_delete() already ran by the time this arrives -- see
+ * pc_net_game_request_snowman_build()'s own doc for the accepted gap this implies). No pending-state
+ * tracking needed (unlike DIG_BURIED/PICKUP/DROP, nothing here needs to be matched against a queue
+ * entry to finish a client-side inventory step). */
+static void pcnetgame_handle_client_snowman_build_result(const PCNetGameSnowmanBuildResultMsg* in) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (in->accepted) {
+        printf("[NET][SNOWMAN] client: BUILD request %u accepted at tile (%d,%d) slot %d\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (int)in->slot);
+    } else {
+        printf("[NET][SNOWMAN] client: BUILD request %u rejected at tile (%d,%d) reason %u\n",
+               (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->reason);
+    }
 }
 
 /* =============================== v2 client world apply =============================== */
@@ -3902,6 +8041,46 @@ static void pcnetgame_client_apply_market_state(const PCNetGameWorldStateWire* w
     kabu->update_time.year = w->kabu_update_time.year;
 }
 
+/* World Ecology Stage 1, Item 4: mirrors the host's broadcast fish/bug term state into this client's
+ * own Save_t.gyoei_term/insect_term (+ their transition offsets) -- see PCNetGameWorldStateWire's own
+ * doc comment for why this is a straight mirror rather than a gate (aSOG_gyoei_renew_term_info()/
+ * aSOI_ins_renew_term_info() are NOT gated -- gating them would cause spawn-table divergence with no
+ * safety benefit). CRITICAL: gyoei_term/insect_term are used as UNCHECKED array indices deep in
+ * ac_set_ovl_gyoei.c/ac_set_ovl_insect.c (r_month[term>>1][term&1], l_insect_month[month][...]) --
+ * a corrupted or malicious wire value must never be written into Save_t verbatim, so every field here
+ * is clamped to its own real valid range before being stored: gyoei_term to 0..23 (12 months x 2
+ * half-month terms, see r_month's [lbRTC_MONTHS_MAX][aSOG_TERM_NUM] declaration), insect_term to
+ * 0..11 (a month index into l_insect_month's first dimension), and both *_transition_offset bytes to
+ * 0..5 (aSOG_TERM_TRANSITION_MAX_DAYS/aSOI_TERM_TRANSITION_MAX_DAYS, used only in date arithmetic --
+ * never an index -- but bounded here too as cheap insurance). Not persisted to disk for the same
+ * reason noted on pcnetgame_client_apply_weather_state() above. */
+static void pcnetgame_client_apply_term_state(const PCNetGameWorldStateWire* w) {
+    uint8_t gyoei_term = w->gyoei_term;
+    uint8_t gyoei_offset = w->gyoei_term_transition_offset;
+    uint8_t insect_term = w->insect_term;
+    uint8_t insect_offset = w->insect_term_transition_offset;
+
+    if (gyoei_term > 23u) {
+        printf("[NET][WORLD] client: received out-of-range gyoei_term=%u -- clamped to 23\n", (unsigned)gyoei_term);
+        gyoei_term = 23u;
+    }
+    if (gyoei_offset > 5u) {
+        gyoei_offset = 5u;
+    }
+    if (insect_term > 11u) {
+        printf("[NET][WORLD] client: received out-of-range insect_term=%u -- clamped to 11\n", (unsigned)insect_term);
+        insect_term = 11u;
+    }
+    if (insect_offset > 5u) {
+        insect_offset = 5u;
+    }
+
+    Save_Set(gyoei_term, gyoei_term);
+    Save_Set(gyoei_term_transition_offset, gyoei_offset);
+    Save_Set(insect_term, insect_term);
+    Save_Set(insect_term_transition_offset, insect_offset);
+}
+
 /* Client side: the host's authoritative statement about one field tile (v2) -- see
  * PCNetGameFieldUpdateMsg. Applies to every client, including the requester (which also gets its
  * own PICKUP/DROP_RESULT). */
@@ -3925,6 +8104,131 @@ static void pcnetgame_handle_client_field_update(const PCNetGameFieldUpdateMsg* 
     if (g_pc_verbose) {
         printf("[NET][WORLD] client: FIELD_UPDATE acre %u tile %u = 0x%04X (seq %u)\n", (unsigned)in->acre,
                (unsigned)in->tile, (unsigned)in->value, (unsigned)in->world_seq);
+    }
+}
+
+/* World Ecology: snowmen. Client side: applies one PC_NETGAME_MSG_SNOWMAN_STATE broadcast. Own
+ * strict `>=` staleness rule against s_client_snowman_seq (its own independent sequence -- see
+ * PCNetGameSnowmanStateMsg's own doc), THEN independently re-validates every field against the exact
+ * same rules sChk_snowman_save_check() (save_check_take.c_inc) already enforces for a loaded save --
+ * a failure is dropped and logged, never applied, never a disconnect. On success: memcpy's the 12
+ * snowmen_data bytes and the 4 date bytes into Save_t, then for every slot whose `exists` just went
+ * 1 -> 0 (a build this client didn't see accepted, break, or melt happened host-side while this slot
+ * still looked occupied here), mirrors the host's own BREAK commit locally: scans the loaded field for
+ * a tile still holding that slot's SNOWMANx value and clears it (via pcnetgame_client_apply_tile(),
+ * which already handles "not currently overwritable"/parking correctly), and deletes any live local
+ * PSNOWMAN actor for that slot (clearing its npc_id to EMPTY_NO first) so its own restore-on-destroy
+ * never resurrects the tile. */
+static void pcnetgame_handle_client_snowman_state(const PCNetGameSnowmanStateMsg* in) {
+    mSN_snowman_data_c prev[mSN_SAVE_COUNT];
+    mSN_snowman_data_c* cur;
+    int i;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (!pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->world_seq < s_client_snowman_seq) {
+        if (g_pc_verbose) {
+            printf("[NET][SNOWMAN] client: stale SNOWMAN_STATE seq %u < %u ignored\n", (unsigned)in->world_seq,
+                   (unsigned)s_client_snowman_seq);
+        }
+        return;
+    }
+
+    /* Save-validity rules mirrored from sChk_snowman_save_check() (save_check_take.c_inc) -- dropped
+       and logged, never applied. */
+    if (in->year > (uint8_t)(GAME_YEAR_MAX - 1) || in->month > (uint8_t)lbRTC_DECEMBER || in->day > 31 ||
+        in->hour >= 24) {
+        printf("[NET][SNOWMAN] client: SNOWMAN_STATE (seq %u) failed date validity (y=%u m=%u d=%u h=%u) -- "
+               "dropped\n",
+               (unsigned)in->world_seq, (unsigned)in->year, (unsigned)in->month, (unsigned)in->day,
+               (unsigned)in->hour);
+        return;
+    }
+    for (i = 0; i < mSN_SAVE_COUNT; i++) {
+        const uint8_t* d = &in->snowmen[i * 4];
+        if (d[3] >= 4 || d[0] > 1) {
+            printf("[NET][SNOWMAN] client: SNOWMAN_STATE (seq %u) slot %d failed validity (exists=%u score=%u) -- "
+                   "dropped\n",
+                   (unsigned)in->world_seq, i, (unsigned)d[0], (unsigned)d[3]);
+            return;
+        }
+    }
+    if (!pcfa_save_ready()) {
+        return;
+    }
+
+    s_client_snowman_seq = in->world_seq;
+
+    cur = Save_GetPointer(snowmen.snowmen_data[0]);
+    for (i = 0; i < mSN_SAVE_COUNT; i++) {
+        prev[i] = cur[i];
+    }
+    for (i = 0; i < mSN_SAVE_COUNT; i++) {
+        const uint8_t* d = &in->snowmen[i * 4];
+        cur[i].exists = d[0];
+        cur[i].head_size = d[1];
+        cur[i].body_size = d[2];
+        cur[i].score = d[3];
+    }
+    Save_Set(snowman_year, in->year);
+    Save_Set(snowman_month, in->month);
+    Save_Set(snowman_day, in->day);
+    Save_Set(snowman_hour, in->hour);
+
+    for (i = 0; i < mSN_SAVE_COUNT; i++) {
+        uint16_t lo, hi;
+        int acre, tile;
+
+        if (!prev[i].exists || cur[i].exists) {
+            continue; /* only a 1 -> 0 transition needs any field/actor cleanup */
+        }
+        lo = (uint16_t)(SNOWMAN0 + i * mSN_SAVE_COUNT);
+        hi = (uint16_t)(lo + mSN_SAVE_COUNT - 1);
+
+        for (acre = 0; acre < PCFA_ACRE_NUM; acre++) {
+            int found = 0;
+            for (tile = 0; tile < PCFA_TILE_NUM; tile++) {
+                uint16_t v;
+                if (!pcfa_get_tile(acre, tile, &v) || v < lo || v > hi) {
+                    continue;
+                }
+                pcnetgame_client_apply_tile(acre, tile, (uint16_t)EMPTY_NO, 1, 0);
+                found = 1;
+                break;
+            }
+            if (found) {
+                break;
+            }
+        }
+
+        if (gamePT != NULL && gamePT->exec == play_main && pcfa_scene_is_town()) {
+            GAME_PLAY* play = (GAME_PLAY*)gamePT;
+            ACTOR* actor;
+            for (actor = play->actor_info.list[ACTOR_PART_BG].actor; actor != NULL; actor = actor->next_actor) {
+                if (actor->restore_fg && actor->npc_id >= (mActor_name_t)lo && actor->npc_id <= (mActor_name_t)hi) {
+                    actor->npc_id = (mActor_name_t)EMPTY_NO;
+                    /* Safety: same ACTOR_STATE_IN_DEMO guard as the host's own BREAK commit
+                     * (pcnetgame_fa_commit_adapter_snowman_break()) -- if this actor is this
+                     * client's own live dialogue partner right now, deleting it here would leave
+                     * m_demo.c holding a dangling pointer when the talk closes (use-after-free).
+                     * npc_id is already cleared above; the actor's own per-frame NormalTalk check
+                     * (aPSM_actor_move(), ac_psnowman.c) deletes it for us once the talk actually
+                     * ends. */
+                    if (!(actor->state_bitfield & ACTOR_STATE_IN_DEMO)) {
+                        Actor_delete(actor);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if (g_pc_verbose) {
+        printf("[NET][SNOWMAN] client: applied SNOWMAN_STATE (seq %u)\n", (unsigned)in->world_seq);
     }
 }
 
@@ -3984,8 +8288,17 @@ static void pcnetgame_handle_client_snapshot_end(const PCNetGameSnapshotEndMsg* 
         if (in->flags & PC_NETGAME_META_FLAG_MARKET_VALID) {
             pcnetgame_client_apply_market_state(&in->world_state);
         }
+        if (in->flags & PC_NETGAME_META_FLAG_TERM_VALID) {
+            pcnetgame_client_apply_term_state(&in->world_state);
+        }
         s_client_meta_seq = in->world_seq;
     }
+    /* World Ecology Stage 1, Item 4: field rank (Save.dust_flag, good_field) goes stale on a client --
+     * it is derived purely from already-synced fg data (mFAs_GetFieldGoodBlockNum() reads Save_Get(fg)
+     * directly, no scene dependency -- verified against m_field_assessment.c), so recomputing it here,
+     * redundantly, after every full snapshot apply is harmless and keeps fish/bug spawn-weight
+     * multipliers (which read good_field) correct on this client. */
+    mFAs_SetFieldRank();
     if (s_client_snap_blocks != (int)in->acre_count) {
         printf("[NET][WORLD] client: snapshot epoch %u ended with %d/%u blocks applied\n", (unsigned)in->epoch,
                s_client_snap_blocks, (unsigned)in->acre_count);
@@ -4022,6 +8335,10 @@ static void pcnetgame_handle_client_world_meta(const PCNetGameWorldMetaMsg* in) 
         printf("[NET][WORLD] client: host renew time -> %04u-%02u-%02u (world_seq %u)\n",
                (unsigned)in->renew_time.year, (unsigned)in->renew_time.month, (unsigned)in->renew_time.day,
                (unsigned)in->world_seq);
+        /* World Ecology Stage 1, Item 4: RENEW_TIME_VALID signals a daily growth renewal (see this
+         * flag's own doc above) -- the field rank derived from fg goes stale across one, so recompute
+         * it on this client too (see the matching call in pcnetgame_handle_client_snapshot_end()). */
+        mFAs_SetFieldRank();
     }
     if (in->flags & PC_NETGAME_META_FLAG_WEATHER_VALID) {
         pcnetgame_client_apply_weather_state(&in->world_state);
@@ -4035,7 +8352,117 @@ static void pcnetgame_handle_client_world_meta(const PCNetGameWorldMetaMsg* in) 
                (unsigned)in->world_state.trade_market, (unsigned)in->world_state.daily_price[0],
                (unsigned)in->world_seq);
     }
+    if (in->flags & PC_NETGAME_META_FLAG_TERM_VALID) {
+        pcnetgame_client_apply_term_state(&in->world_state);
+        printf("[NET][WORLD] client: host fish/bug term -> gyoei_term=%u insect_term=%u (world_seq %u)\n",
+               (unsigned)in->world_state.gyoei_term, (unsigned)in->world_state.insect_term,
+               (unsigned)in->world_seq);
+    }
     s_client_meta_seq = in->world_seq;
+}
+
+/* N-clock milestone, client side. Rule 1 (apply only once READY AND the local world is latched -- see
+ * pcnetgame_client_can_apply_world()) and the strict `>` monotonic clock_seq rule (matching
+ * s_client_meta_seq's own contract shape) are both checked before anything else, exactly like every
+ * other WORLD-message handler above.
+ *
+ * The offset itself: candidate_offset = host_game_ticks - (this process's own OSGetTime()+time_delta,
+ * read fresh right here, NOT any previously cached value) -- a single subtraction, matching
+ * lbRTC_GetGameTime()'s own single-addition use of it (lb_rtc.c). This automatically absorbs whatever
+ * this client's own --date/--time CLI overrides and its own Save_t.time_delta contributed to its local
+ * clock: both already fed into the OSGetTime()+time_delta term being subtracted here, so nothing about
+ * them needs special-casing.
+ *
+ * Tolerance (PC_NETGAME_CLOCK_SYNC_TOLERANCE_SEC): a periodic re-sync that only confirms the offset is
+ * still correct to within ~2 real seconds is deliberately NOT re-applied, so tiny drift/rounding
+ * between periodic syncs can never cause a visible back-and-forth jitter in Common(time.now_sec). The
+ * DISCONTINUITY flag (a detected host-side manual clock adjustment) always forces an immediate
+ * re-apply regardless of this tolerance -- see PC_NETGAME_MSG_CLOCK_SYNC's own doc comment. The very
+ * first sync this client ever applies (s_client_clock_seq_applied == 0, including right after a
+ * reconnect -- see Rule 2 / pcnetgame_reset_client_session_state()) is likewise always applied
+ * unconditionally, matching the design's "initial sync ... always applied unconditionally" rule.
+ *
+ * No separate backward-jump guard is needed here: CLOCK_SYNC is sent PC_NET_RELIABLE (see
+ * PCNetGameClockSyncMsg's send sites above), and pc_net.h documents that reliable transport as
+ * delivering every payload to a peer's game layer "exactly once and in send order" per peer/
+ * direction -- combined with the strict `clock_seq >` staleness check just above, any packet that
+ * reaches this point is by construction the host's genuinely newer state, never a stale/reordered/
+ * duplicate one. A resulting backward correction is therefore always either legitimate oscillator-
+ * drift correction or a legitimate host-side clock change (DISCONTINUITY), and both must be applied,
+ * not blocked. */
+static void pcnetgame_handle_client_clock_sync(const PCNetGameClockSyncMsg* in) {
+    OSTime local_now;
+    int64_t candidate_offset;
+    int64_t current_offset;
+    int64_t diff;
+    int discontinuity;
+
+    if (!pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->clock_seq <= s_client_clock_seq_applied) {
+        return;
+    }
+
+    /* Edge case (see lb_rtc.h's design note): when this process's RTC is disabled/crashed, mTM_time()
+     * takes the add_sec fallback branch (m_time.c) which treats Common(time.rtc_time) as the source of
+     * truth directly and never re-derives it from lbRTC_GetGameTime()'s OSGetTime()+time_delta+offset
+     * sum -- so the offset we are about to (still) record has no observable effect on this client's
+     * clock at all. --bootstrap-resident force-enables rtc_enabled, so this is a narrow edge case in
+     * practice; detect and log loudly rather than attempting a fix (per the design's explicit scoping). */
+    if (Common_Get(time.rtc_enabled) != TRUE || Common_Get(time.rtc_crashed)) {
+        printf("[NET][CLOCK] client: WARNING -- received CLOCK_SYNC but this process's RTC is "
+               "disabled/crashed (rtc_enabled=%d rtc_crashed=%d); the clock-sync offset will be recorded "
+               "but has NO EFFECT until the RTC add_sec fallback path is no longer active\n",
+               (int)Common_Get(time.rtc_enabled), (int)Common_Get(time.rtc_crashed));
+    }
+
+    discontinuity = (in->flags & PC_NETGAME_CLOCK_SYNC_FLAG_DISCONTINUITY) != 0;
+    local_now = OSGetTime() + Save_Get(time_delta);
+    candidate_offset = in->host_game_ticks - (int64_t)local_now;
+    current_offset = (int64_t)pc_lb_rtc_get_net_clock_offset();
+    diff = candidate_offset - current_offset;
+    if (diff < 0) {
+        diff = -diff;
+    }
+
+    if (s_client_clock_seq_applied == 0 || discontinuity ||
+        diff > (int64_t)PC_NETGAME_CLOCK_SYNC_TOLERANCE_SEC * (int64_t)GC_TIMER_CLOCK) {
+        int64_t drift_sec = diff / (int64_t)GC_TIMER_CLOCK;
+        /* Test/diagnostic evidence: log the actual PRE- and POST-correction calendar time (not just
+         * the raw tick delta) so a real two-process run can show convergence in the log directly. */
+        OSCalendarTime before_cal, after_cal;
+        OSTime before_ticks = local_now + current_offset;
+        OSTime after_ticks = local_now + candidate_offset;
+        OSTicksToCalendarTime(before_ticks, &before_cal);
+        OSTicksToCalendarTime(after_ticks, &after_cal);
+        pc_lb_rtc_set_net_clock_offset((s64)candidate_offset);
+        /* OSCalendarTime.year is an ABSOLUTE proleptic-Gregorian year (e.g. 2027), not
+         * years-since-1900 -- see pc_os.c's GetDates()/BIAS -- so no +1900 offset here. mon is
+         * 0-based (January == 0), mday is already 1-based. */
+        printf("[NET][CLOCK] client: applying host clock correction (clock_seq %u%s, drift ~%lld sec) "
+               "local time %04d-%02d-%02d %02d:%02d:%02d -> %04d-%02d-%02d %02d:%02d:%02d\n",
+               (unsigned)in->clock_seq, discontinuity ? ", DISCONTINUITY" : "", (long long)drift_sec,
+               before_cal.year, before_cal.mon + 1, before_cal.mday, before_cal.hour, before_cal.min,
+               before_cal.sec, after_cal.year, after_cal.mon + 1, after_cal.mday, after_cal.hour,
+               after_cal.min, after_cal.sec);
+        /* Diagnostic only (test/log evidence, no functional purpose): Common(time.rtc_time) itself is
+         * NOT updated here -- it is only recomputed once per frame by mTM_time()'s own
+         * lbRTC_GetTime() call, so calling the real Kabu_get_price() (which reads Common_Get directly)
+         * at this exact instant would report last frame's STALE pre-correction value. Instead, derive
+         * the weekday from after_cal (the calendar time this correction implies, computed above) and
+         * index Save_Get(kabu_price_schedule.daily_price[...]) directly -- the exact same schedule
+         * array Kabu_get_price() reads, exactly mirroring pcnetgame_capture_world_state()'s own
+         * precedent for reading it here. This is what Kabu_get_price() will itself return, starting
+         * next frame, once Common(time.rtc_time.weekday) catches up. */
+        printf("[NET][CLOCK] client: post-correction weekday=%d Kabu price (from schedule)=%u\n",
+               after_cal.wday, (unsigned)Save_Get(kabu_price_schedule.daily_price[after_cal.wday]));
+        if (drift_sec > (int64_t)PC_NETGAME_CLOCK_SYNC_LOUD_LOG_SEC) {
+            printf("[NET][CLOCK] client: WARNING -- clock correction implies ~%lld seconds of divergence "
+                   "from the host\n", (long long)drift_sec);
+        }
+    }
+    s_client_clock_seq_applied = in->clock_seq;
 }
 
 /* Villager population/is_home milestone, client side. Strict `>` staleness rule (matches WORLD_META,
@@ -4109,8 +8536,33 @@ static void pcnetgame_handle_client_villager_snapshot(const PCNetGameVillagerSna
         if (slot->occupied) {
             mNpc_PcApplyVillagerSnapshotSlot(i, slot->npc_id, slot->home_block_x, slot->home_block_z,
                                              slot->home_ut_x, slot->home_ut_z, slot->is_home, in->now_npc_max);
+            /* N3 Channel B late-join coverage: seed this slot's NPC_STATE shadow directly from the
+             * snapshot (rather than routing hide/forced_type/forced_timer through
+             * mNpc_PcApplyVillagerSnapshotSlot(), which only ever touches Save_t/Animal_c -- these are
+             * actor-runtime/network-layer concerns, same separation NPC_MOVE's own snapshot-vs-Animal_c
+             * split already keeps). last_applied_seq stays 0 (below any real state_seq, which starts at
+             * 1 -- see s_npc_state_seq_counter's pre-increment in pc_net_game_notify_npc_state()), so a
+             * genuine NPC_STATE broadcast the host sends later always supersedes this seed, never the
+             * reverse. aNPC_pc_client_consume_state() (ac_npc_move.c_inc) applies this the first frame
+             * this villager's NPC_ACTOR exists on this client, whenever that ends up being. */
+            {
+                PCNetNpcStateSlot* seed = &s_npc_state_slot[i];
+                seed->have_state = 1;
+                seed->cached_npc_id = slot->npc_id;
+                seed->last_applied_seq = 0;
+                seed->is_home = slot->is_home;
+                seed->hide = slot->hide;
+                seed->forced_type = slot->forced_type;
+                seed->forced_timer_remaining = slot->forced_timer_remaining;
+            }
         } else {
             mNpc_PcApplyVillagerDeparture(i, in->now_npc_max);
+            /* N3 Channel B / slot-reuse: an unoccupied snapshot slot must also discard any stale
+             * NPC_STATE this client happened to have for it (e.g. from a PREVIOUS occupant, before a
+             * RESYNC_REQUEST/reconnect rebuilt this snapshot) -- same slot-reuse discipline
+             * pc_net_game_get_npc_move_pose() already applies at consume time, applied proactively here
+             * since a full snapshot is authoritative over the whole slot. */
+            memset(&s_npc_state_slot[i], 0, sizeof(s_npc_state_slot[i]));
         }
     }
     s_client_population_seq = in->world_seq;
@@ -4172,6 +8624,14 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     }
     s_host_peer_link[peer] = PC_NETGAME_LINK_READY;
     printf("[NET] host: peer %d identity OK (player_id=%u, %s) -> READY\n", (int)peer, (unsigned)in.player_id, peer_buf);
+
+    /* Friendship/mail sync milestone: cache this peer's own PersonalID_c fields for the lifetime of
+     * the connection (see PCNetGameHostPeerState's doc comment on ready_identity_valid). */
+    memcpy(s_host_peer[peer].ready_player_name, in.player_name, PC_NETGAME_NAME_LEN);
+    memcpy(s_host_peer[peer].ready_land_name, in.land_name, PC_NETGAME_LAND_LEN);
+    s_host_peer[peer].ready_player_id = in.player_id;
+    s_host_peer[peer].ready_land_id = in.land_id;
+    s_host_peer[peer].ready_identity_valid = 1;
 
     /* Stage 4C-1 (3+ player backfill fix): give this now-READY client the host's own appearance
      * AND the last-known appearance of every other already-READY peer -- otherwise anyone who
@@ -4270,6 +8730,82 @@ static void pcnetgame_handle_host_player_context(PCNetPeerId peer, const PCNetGa
 /* Host side: a peer's raw PC_NET_EVENT_DATA payload. Anything that isn't a well-formed message of
  * a known type/size is ignored -- a peer is only ever marked READY by successfully validating an
  * IDENTITY, never merely by having sent *some* UDP packet. */
+/* Forward-declared: defined near the other friendship/mail-sync host-side functions, below; used
+ * here (pcnetgame_handle_host_data()) before that point in the file. */
+static void pcnetgame_handle_host_friendship_request(PCNetPeerId peer, const PCNetGameFriendshipRequestMsg* in);
+static void pcnetgame_handle_host_mail_request(PCNetPeerId peer, const PCNetGameMailRequestMsg* in);
+
+/* World Ecology T3: host side of a client's bury request. Exact structural mirror of
+ * pcnetgame_handle_host_drop_request() (replay per phase, abort the peer's pending BURY only -- a
+ * pending pickup/drop of the same peer is independent --, validate, reserve-or-record, reply) -- see
+ * that function's own doc for the shared reasoning. Never touches any ACTOR, any PLAYER_ACTOR, or
+ * Now_Private; only reads the shared field and sends small, self-contained network messages. The field
+ * write happens only on COMMIT (pcnetgame_handle_host_confirm()'s own BURY branch), where the actual
+ * bury/plant/pitfall outcome table runs. A rejection here (unlike a rejection from the drop validator)
+ * carries the reconciliation echo (pcnetgame_host_send_bury_reject()) -- a bury client applies it via
+ * the same tile+deposit reconciliation path it uses for a COMMIT-time reject, so both reject points
+ * share one client-side code path. */
+static void pcnetgame_handle_host_bury_request(PCNetPeerId peer, const PCNetGameBuryRequestMsg* in) {
+    PCNetGameHostInteraction* rec;
+    int accepted;
+    int acre = 0, tile = 0;
+    uint16_t raw_item = 0;
+    int prev_valid;
+    uint32_t prev_rid;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not a known, handshake-complete peer -- never process on their behalf */
+    }
+
+    rec = &s_host_bury_state[peer];
+
+    if (rec->phase != (uint8_t)PC_NETGAME_PHASE_NONE && rec->request_id == in->request_id) {
+        pcnetgame_host_replay(peer, (int)PC_NETGAME_INTERACT_KIND_BURY, rec);
+        return;
+    }
+    if (rec->prev_valid && rec->prev_request_id == in->request_id) {
+        pcnetgame_host_send_bury_reject(peer, in->request_id, in->ut_x, in->ut_z);
+        return;
+    }
+
+    pcnetgame_host_abort_pending_of_peer(peer, (int)PC_NETGAME_INTERACT_KIND_BURY,
+                                         "replaced by a newer request from the same peer");
+
+    accepted = pcnetgame_validate_and_resolve_bury(0, peer, in->pocket_slot_idx, in->ut_x, in->ut_z,
+                                                   (mActor_name_t)in->claimed_item, in->hole_variant, &acre, &tile,
+                                                   &raw_item);
+
+    prev_valid = (rec->phase == (uint8_t)PC_NETGAME_PHASE_ABORTED || rec->phase == (uint8_t)PC_NETGAME_PHASE_EXPIRED);
+    prev_rid = rec->request_id;
+    memset(rec, 0, sizeof(*rec));
+    rec->prev_valid = (uint8_t)prev_valid;
+    rec->prev_request_id = prev_rid;
+    rec->request_id = in->request_id;
+    rec->ut_x = in->ut_x;
+    rec->ut_z = in->ut_z;
+    if (accepted) {
+        /* RESERVE. The field is NOT touched: it changes only on the client's COMMIT. */
+        rec->phase = (uint8_t)PC_NETGAME_PHASE_PENDING;
+        rec->accepted = 1;
+        rec->item = in->claimed_item;
+        rec->raw_item = raw_item;
+        rec->acre = (uint8_t)acre;
+        rec->tile = (uint8_t)tile;
+        rec->hole_variant = in->hole_variant;
+        rec->reserved_since_ms = pcnetgame_now_ms();
+        printf("[NET][BURY] host: peer %d request %u reserved tile (%d,%d) claimed_item=0x%04X hole_variant=%u "
+               "(field unchanged until CONFIRM)\n",
+               (int)peer, (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->claimed_item,
+               (unsigned)in->hole_variant);
+        pcnetgame_host_send_bury_result(peer, in->request_id, in->ut_x, in->ut_z, 1, in->claimed_item, 0,
+                                        (uint8_t)PC_NETGAME_BURY_REASON_NONE);
+    } else {
+        rec->phase = (uint8_t)PC_NETGAME_PHASE_DONE; /* final rejection; replayed verbatim on a retry */
+        rec->accepted = 0;
+        pcnetgame_host_send_bury_reject(peer, in->request_id, in->ut_x, in->ut_z);
+    }
+}
+
 static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || size == 0) {
         return;
@@ -4332,10 +8868,54 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGameFieldActionRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_FIELD_ACTION_REQUEST) {
+        PCNetGameFieldActionRequestMsg far;
+        memcpy(&far, data, sizeof(far));
+        pcnetgame_handle_host_field_action_request(peer, &far);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameBuryRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BURY_REQUEST) {
+        PCNetGameBuryRequestMsg br;
+        memcpy(&br, data, sizeof(br));
+        pcnetgame_handle_host_bury_request(peer, &br);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameFriendshipRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_FRIENDSHIP_REQUEST) {
+        PCNetGameFriendshipRequestMsg fr;
+        memcpy(&fr, data, sizeof(fr));
+        pcnetgame_handle_host_friendship_request(peer, &fr);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameMailRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_MAIL_REQUEST) {
+        PCNetGameMailRequestMsg mr;
+        memcpy(&mr, data, sizeof(mr));
+        pcnetgame_handle_host_mail_request(peer, &mr);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameSnowmanBuildRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_SNOWMAN_BUILD_REQUEST) {
+        PCNetGameSnowmanBuildRequestMsg sr;
+        memcpy(&sr, data, sizeof(sr));
+        pcnetgame_handle_host_snowman_build_request(peer, &sr);
+        return;
+    }
+
     /* malformed / short / unrecognized: ignore rather than misinterpret */
 }
 
 /* Client side: the host's raw PC_NET_EVENT_DATA payload. */
+/* Forward-declared: defined near the other friendship/mail-sync client-side functions, below; used
+ * here (pcnetgame_handle_client_data()) before that point in the file. */
+static void pcnetgame_handle_client_friendship_update(const PCNetGameFriendshipUpdateMsg* in);
+static void pcnetgame_handle_client_friendship_snapshot_entry(const PCNetGameFriendshipSnapshotEntryMsg* in);
+static void pcnetgame_handle_client_mail_delivered(const PCNetGameMailDeliveredMsg* in);
+static void pcnetgame_handle_client_npc_move(const PCNetGameNpcMoveMsg* in);
+static void pcnetgame_handle_client_npc_state(const PCNetGameNpcStateMsg* in);
+static void pcnetgame_handle_client_field_action_result(const PCNetGameFieldActionResultMsg* in);
+
 static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
     if (size == sizeof(PCNetMoveMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_MOVE) {
         PCNetMoveMsg mv;
@@ -4362,6 +8942,20 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCNetGameDropResultMsg dr;
         memcpy(&dr, data, sizeof(dr));
         pcnetgame_handle_client_drop_result(&dr);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameFieldActionResultMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_FIELD_ACTION_RESULT) {
+        PCNetGameFieldActionResultMsg far;
+        memcpy(&far, data, sizeof(far));
+        pcnetgame_handle_client_field_action_result(&far);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameBuryResultMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BURY_RESULT) {
+        PCNetGameBuryResultMsg br;
+        memcpy(&br, data, sizeof(br));
+        pcnetgame_handle_client_bury_result(&br);
         return;
     }
 
@@ -4426,6 +9020,70 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         if (s_client_link != PC_NETGAME_LINK_READY) return;
         memcpy(&vs, data, sizeof(vs));
         pcnetgame_handle_client_villager_snapshot(&vs);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameFriendshipUpdateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_FRIENDSHIP_UPDATE) {
+        PCNetGameFriendshipUpdateMsg fu;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&fu, data, sizeof(fu));
+        pcnetgame_handle_client_friendship_update(&fu);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameFriendshipSnapshotEntryMsg) &&
+        data[0] == (uint8_t)PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY) {
+        static PCNetGameFriendshipSnapshotEntryMsg fe; /* 292 B: static, handled synchronously */
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&fe, data, sizeof(fe));
+        pcnetgame_handle_client_friendship_snapshot_entry(&fe);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameMailDeliveredMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_MAIL_DELIVERED) {
+        static PCNetGameMailDeliveredMsg md; /* 288 B: static, handled synchronously */
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&md, data, sizeof(md));
+        pcnetgame_handle_client_mail_delivered(&md);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameNpcMoveMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_MOVE) {
+        PCNetGameNpcMoveMsg nm;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&nm, data, sizeof(nm));
+        pcnetgame_handle_client_npc_move(&nm);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameNpcStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_STATE) {
+        PCNetGameNpcStateMsg ns;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&ns, data, sizeof(ns));
+        pcnetgame_handle_client_npc_state(&ns);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameSnowmanBuildResultMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_SNOWMAN_BUILD_RESULT) {
+        PCNetGameSnowmanBuildResultMsg br;
+        memcpy(&br, data, sizeof(br));
+        pcnetgame_handle_client_snowman_build_result(&br);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameSnowmanStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_SNOWMAN_STATE) {
+        PCNetGameSnowmanStateMsg ss;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&ss, data, sizeof(ss));
+        pcnetgame_handle_client_snowman_state(&ss);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameClockSyncMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_CLOCK_SYNC) {
+        PCNetGameClockSyncMsg cs;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&cs, data, sizeof(cs));
+        pcnetgame_handle_client_clock_sync(&cs);
         return;
     }
 
@@ -4533,10 +9191,27 @@ static void pcnetgame_reset_client_session_state(void) {
     s_next_pickup_request_id = 1;
     memset(&s_drop_pending, 0, sizeof(s_drop_pending));
     s_next_drop_request_id = 1;
+    memset(&s_bury_pending, 0, sizeof(s_bury_pending));
+    s_next_bury_request_id = 1;
+    memset(s_field_action_queue, 0, sizeof(s_field_action_queue)); /* T0-C: whole queue, not one slot */
+    s_field_action_queue_len = 0;
+    s_next_field_action_request_id = 1;
 
     memset(s_client_acre_seq, 0, sizeof(s_client_acre_seq));
     s_client_meta_seq = 0;
     s_client_population_seq = 0;
+    s_client_friendship_seq = 0;
+    /* N-clock milestone, Rule 2: reset the sequence tracker (a reconnect is a fresh join -- the first
+     * post-reconnect CLOCK_SYNC must always be accepted) but deliberately do NOT touch the clock
+     * offset itself (pc_lb_rtc_get/set_net_clock_offset(), lb_rtc.c) here -- it is process-memory-only,
+     * has no variable here, and must survive an ordinary disconnect (s_role stays
+     * PC_NETGAME_ROLE_CLIENT, only s_client_link changes -- e.g. PC_NET_EVENT_PEER_DISCONNECTED) so
+     * the displayed clock stays smooth rather than snapping back to this process's own free-running
+     * local clock while a reconnect might still restore the same host relationship. Clock hardening
+     * (concern #1): the offset IS explicitly reset, but only in pc_net_game_shutdown() -- the one
+     * place s_role actually reverts to PC_NETGAME_ROLE_NONE -- never here. */
+    s_client_clock_seq_applied = 0;
+    s_client_snowman_seq = 0; /* World Ecology: snowmen -- see this variable's own doc */
     s_client_snap_active = 0;
     s_client_snap_epoch = 0;
     s_client_snap_blocks = 0;
@@ -4550,6 +9225,21 @@ static void pcnetgame_reset_client_session_state(void) {
     s_client_deferred_acres = 0;
     memset(s_client_deferred_mask, 0, sizeof(s_client_deferred_mask));
     s_client_dummy_skip_logged = 0;
+
+    /* N2: drop every buffered villager-movement sample/identity across a disconnect/reconnect --
+     * otherwise a slot's stale ring from the PREVIOUS session (a fresh session's villager population
+     * for that same slot index may well be a completely different npc_id, or none at all) could
+     * satisfy pc_net_game_get_npc_move_pose()'s identity check by sheer coincidence in the tiny
+     * window before this session's own first NPC_MOVE/ARRIVAL/SNAPSHOT for that slot arrives.
+     * memset-zero is the correct empty state: cached_npc_id 0 is never a real mActor_name_t NPC id
+     * (see ITEM_NAME_GET_TYPE(...) != NAME_TYPE_NPC's use elsewhere in this file), and
+     * snapshot_count/have_frame 0 already mean "no data yet" everywhere they're read. */
+    memset(s_npc_move_slot, 0, sizeof(s_npc_move_slot));
+
+    /* N3 Channel B: same reasoning as the NPC_MOVE ring reset just above -- a previous session's
+     * slot-indexed is_home/hide/forced_type state must never survive into a fresh session where that
+     * same slot index may hold a different villager (or none). */
+    memset(s_npc_state_slot, 0, sizeof(s_npc_state_slot));
 }
 
 /* v2: clears every piece of host world state (start_host / shutdown). */
@@ -4570,6 +9260,37 @@ static void pcnetgame_reset_host_world_state(void) {
     s_snapshot_epoch_counter = 0;
     s_host_meta_valid = 0;
     pcnetgame_out_reset();
+
+    /* N2: reset every per-slot host send-throttle timer and the shared send counter across a
+     * start_host/shutdown boundary, so a fresh hosting session never inherits a mid-cycle throttle
+     * phase or a huge previous-session frame counter value in its very first log line. */
+    memset(s_npc_move_send_accum, 0, sizeof(s_npc_move_send_accum));
+    s_npc_move_send_counter = 0;
+
+    /* N3 Channel B: fresh hosting session starts every slot's dirty-check shadow and the shared
+     * state_seq counter clean, so it never suppresses this session's genuinely-first broadcast for a
+     * slot by comparing against a previous session's shadow, and a client's own per-slot
+     * last_applied_seq (reset above/on connect) is always < this session's first state_seq. */
+    memset(s_npc_state_shadow, 0, sizeof(s_npc_state_shadow));
+    s_npc_state_seq_counter = 0;
+
+    /* N-clock milestone: fresh hosting session starts its own clock_seq at 0 (a client's own
+     * s_client_clock_seq_applied is reset to 0 on (re)connect too, so the first CLOCK_SYNC of any
+     * hosting session is always accepted) and re-arms the manual-adjust watch/periodic timer so a
+     * stale reading from a PREVIOUS hosting session in this same process can never be compared
+     * against. A host process is never itself offset (s_pc_net_clock_offset defaults to, and stays,
+     * 0 unless pc_lb_rtc_set_net_clock_offset() is called -- which only ever happens client-side). */
+    s_host_clock_seq = 0;
+    s_host_clock_sync_last_ms = 0;
+    s_host_clock_last_delta_valid = 0;
+
+    /* World Ecology Stage 1, Item 2: a fresh hosting session starts with every money-rock window
+     * closed -- a stale window from a previous session must never be judged against, or reverted
+     * into, this session's (possibly freshly loaded/regenerated) field. */
+    memset(s_host_money_rock, 0, sizeof(s_host_money_rock));
+    /* World Ecology T1 review fix: a fresh hosting session likewise starts with every tree-cut
+     * cut-count slot cleared -- see pcnetgame_reset_host_tree_cut_state()'s own doc. */
+    pcnetgame_reset_host_tree_cut_state();
 }
 
 /* v2 client, once per poll after events: deferred IDENTITY send, save pause/resume + resync,
@@ -4743,6 +9464,18 @@ void pc_net_game_shutdown(void) {
     pcnetgame_reset_client_session_state();
     pcnetgame_reset_host_world_state(); /* also clears s_host_peer_link[] and every per-peer cache */
 
+    /* Clock hardening (concern #1): this is the ONE place the process genuinely stops being a
+     * network client and returns to ROLE_NONE (single-player) -- see the doc comment on
+     * pcnetgame_reset_client_session_state() above for why that function itself deliberately does
+     * NOT touch the offset (an ordinary disconnect that leaves s_role == PC_NETGAME_ROLE_CLIENT,
+     * e.g. PC_NET_EVENT_PEER_DISCONNECTED while still hoping to reconnect, must keep the last-known
+     * host offset so the displayed clock stays smooth). Once we are actually back to ROLE_NONE,
+     * though, lb_rtc.h's contract ("always exactly 0 for ROLE_NONE") must hold: reset it here so a
+     * subsequent single-player session -- including on a different local save the player loads next
+     * -- never silently inherits a stale host clock correction. A host process never set this
+     * non-zero in the first place, so this is a harmless no-op on host shutdown. */
+    pc_lb_rtc_set_net_clock_offset(0);
+
     /* A local, voluntary shutdown never generates a PC_NET_EVENT_PEER_DISCONNECTED for
      * ourselves (that event is how the *other* side learns we left) -- destroy our own tracked
      * remote-player actors explicitly so a manual disconnect/quit doesn't leak one. */
@@ -4807,6 +9540,184 @@ static void pcnetgame_run_villager_test_triggers(void) {
     }
 }
 
+/* Friendship/mail sync milestone, TEST-ONLY: fires mNpc_DebugForceFriendshipDelta()/
+ * mNpc_DebugForceMailSend() (m_npc.c) exactly once each, on WHICHEVER role this process is -- see
+ * pc_platform.h's doc comment on g_pc_force_friendship_delta/g_pc_force_mail_send. Unlike
+ * pcnetgame_run_villager_test_triggers() (host-only: population growth is inherently host-
+ * authoritative), these deliberately run for a CLIENT too, since the whole point is to exercise
+ * mNpc_AddFriendship()/mNpc_SendMailtoNpc()'s client-intercept-and-request path for real, not just
+ * the host-apply-and-broadcast path. */
+static void pcnetgame_run_friendship_mail_test_triggers(void) {
+    static int s_friendship_done = 0;
+    static int s_mail_done = 0;
+    int world_ready;
+
+    if (s_role == PC_NETGAME_ROLE_NONE || gamePT == NULL) {
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        world_ready = s_host_world_ready;
+    } else {
+        world_ready = (s_client_link == PC_NETGAME_LINK_READY) && s_local_world_latched;
+    }
+    if (!world_ready) {
+        return;
+    }
+
+    if (g_pc_force_friendship_delta != 0 && !s_friendship_done) {
+        s_friendship_done = 1;
+        mNpc_DebugForceFriendshipDelta(g_pc_force_friendship_delta);
+    }
+    if (g_pc_force_mail_send && !s_mail_done) {
+        s_mail_done = 1;
+        mNpc_DebugForceMailSend();
+    }
+}
+
+/* World Ecology Stage 1 money-rock review, TEST-ONLY: fires --force-money-rock-hit /
+ * --force-money-bag-pickup exactly once each -- see pc_platform.h's doc comment on these two globals.
+ * Mirrors pcnetgame_run_villager_test_triggers()/pcnetgame_run_friendship_mail_test_triggers()'s own
+ * exact gating pattern. Both target the fixed (24,104) money-rock tile --field-action-test-seed seeds
+ * (pcnetgame_run_field_action_test_seed()), and the 9-candidate neighborhood
+ * pcnetgame_find_money_rock_drop_tile() itself searches from that same center. */
+static void pcnetgame_run_money_rock_test_triggers(void) {
+    static int s_hit_done = 0;
+    static int s_pickup_done = 0;
+
+    if (gamePT == NULL) {
+        return;
+    }
+
+    if (g_pc_force_money_rock_hit && !s_hit_done && s_role == PC_NETGAME_ROLE_HOST && s_host_world_ready) {
+        /* Wait for the tile to ACTUALLY be a money rock before hitting it -- --field-action-test-seed's
+         * own fixture write is itself retried every poll until it succeeds (see its own doc: a
+         * candidate tile it declines is retried, with no fixed timing), so this must not assume the
+         * seed has already landed on the very first world-ready poll. Retried every poll, no timeout,
+         * same reasoning as the seed fixture itself: test-only code where waiting costs nothing. */
+        int acre, tile;
+        uint16_t value;
+        if (pcfa_town_ut_to_acre_tile(24, 104, &acre, &tile) && pcfa_get_tile(acre, tile, &value) &&
+            IS_ITEM_STONE_TC((mActor_name_t)value)) {
+            s_hit_done = 1;
+            printf("[NET][FIELD_ACTION] --force-money-rock-hit active: forcing the host's own local money-rock hit "
+                   "at tile (24,104)\n");
+            pc_net_game_host_local_money_rock_hit(24, 104);
+        }
+    }
+
+    if (g_pc_force_money_bag_pickup && !s_pickup_done && s_role == PC_NETGAME_ROLE_CLIENT &&
+        s_client_link == PC_NETGAME_LINK_READY && s_local_world_latched && pcfa_scene_is_town()) {
+        /* Same 9-tile candidate order pcnetgame_find_money_rock_drop_tile() searches, centered on the
+         * --field-action-test-seed fixture's own money-rock tile (24,104) -- read from this client's
+         * own already-applied local field copy (see pc_platform.h's doc: kept current by real
+         * FIELD_UPDATE messages, the same data a real player's vanilla pickup targeting would see). */
+        static const int dxs[9] = { -1, -1, 1, 1, -1, 0, 1, 0, 0 };
+        static const int dzs[9] = { -1, 1, 1, -1, 0, 1, 0, -1, 0 };
+        int i;
+        for (i = 0; i < 9; i++) {
+            int ut_x = 24 + dxs[i];
+            int ut_z = 104 + dzs[i];
+            int acre, tile;
+            uint16_t value;
+            if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+                continue;
+            }
+            if (!pcfa_town_ut_to_acre_tile(ut_x, ut_z, &acre, &tile) || !pcfa_get_tile(acre, tile, &value)) {
+                continue;
+            }
+            if (pcnetgame_is_money_bag_item((mActor_name_t)value)) {
+                s_pickup_done = 1;
+                printf("[NET][PICKUP] --force-money-bag-pickup active: forcing a real pickup attempt at tile "
+                       "(%d,%d) (item=0x%04X)\n",
+                       ut_x, ut_z, (unsigned)value);
+                pc_net_game_request_pickup(ut_x, ut_z, (mActor_name_t)value);
+                break;
+            }
+        }
+        /* No matching tile found yet (the host's hit may not have landed/been seeded yet) -- retried
+         * every poll until s_pickup_done, no timeout: test-only code where waiting costs nothing, same
+         * reasoning as pcnetgame_run_pickup_test_seed()'s own doc. */
+    }
+}
+
+/* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY: fires --force-dig-hole exactly once
+ * -- see pc_platform.h's doc comment on g_pc_force_dig_hole. Mirrors
+ * pcnetgame_run_money_rock_test_triggers()'s own exact gating pattern (CLIENT-only, retried every poll
+ * with no timeout until it succeeds, same reasoning as that function's own doc).
+ *
+ * Unlike every other test trigger in this file, this one does not call a pc_net_game_*() seam directly
+ * -- it calls PC_Test_ForceRequestDigScoop() (m_player.c/m_player_lib.h), a thin pass-through to the
+ * REAL, unmodified Player_actor_request_main_dig_scoop_all(). Everything from there on (the real
+ * dig-scoop animation state machine, and -- once it reaches its real commit point -- the real
+ * pc_net_game_request_dig_hole() network seam m_player_main_dig_scoop.c_inc's own P1 wiring calls) runs
+ * via the ordinary, unmodified per-frame player update; this function's only job is the one-time
+ * request. Targets the --field-action-test-seed fixture's own DIG_HOLE tile (56,105) -- requires
+ * --field-action-test-seed too, same precondition pc_net_game_host_local_money_rock_hit()'s own trigger
+ * has on its money-rock fixture.
+ *
+ * Stage 0 first teleports the local player's own actor next to the fixture tile. This is NOT part of
+ * the dig-scoop request/commit chain being verified -- it only satisfies
+ * pcnetgame_fa_validate_adapter_dig_hole()'s own, unmodified pcnetgame_field_action_reach_check() call,
+ * which (correctly) trusts only this client's own last-synced MOVE position
+ * (pc_remote_player_get_last_position()) and rejects a request from anywhere else, exactly as it must
+ * for a real player. Only x/z are moved; y is left for the game's own ground collision to resolve on
+ * the next frame, same as any other teleport-style warp -- and the reach check itself only ever
+ * compares y to itself (see pcnetgame_field_action_reach_check()'s own math), so this is harmless to
+ * the check either way. Stage 1 then waits ~1.5s (comfortably more than
+ * PC_NETGAME_MOVE_SEND_PERIOD_60FPS_FRAMES) for the throttled MOVE send to actually carry the new
+ * position to the host before requesting -- otherwise the host would reach-check against the player's
+ * stale pre-teleport position and (correctly) reject. */
+static void pcnetgame_run_dig_hole_test_trigger(void) {
+    static int s_stage = 0; /* 0 = not yet teleported, 1 = teleported/waiting for move-sync, 2 = done */
+    static int s_wait_frames = 0;
+    xyz_t pos;
+
+    if (!g_pc_force_dig_hole || s_stage >= 2 || gamePT == NULL) {
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !s_local_world_latched) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+
+    /* mFI_UtNum2CenterWpos() ignores pos.y (see its own definition) -- mFI_Wpos2UtNum(), the function
+       the real commit point uses to recover (ut_x, ut_z) from this position, only ever reads x/z. */
+    if (!mFI_UtNum2CenterWpos(&pos, 56, 105)) {
+        return; /* out of range -- should never happen for this fixed fixture tile */
+    }
+
+    if (s_stage == 0) {
+        PLAYER_ACTOR* local = GET_PLAYER_ACTOR_NOW();
+        if (!pcnetgame_is_real_player_actor(local)) {
+            return; /* no local save/actor yet -- retried next poll */
+        }
+        local->actor_class.world.position.x = pos.x;
+        local->actor_class.world.position.z = pos.z;
+        printf("[NET][FIELD_ACTION] --force-dig-hole: teleported the local player to tile (56,105) so the "
+               "host's real reach check will accept the upcoming request\n");
+        s_stage = 1;
+        s_wait_frames = 0;
+        return;
+    }
+
+    /* s_stage == 1 */
+    s_wait_frames++;
+    if (s_wait_frames < 90) {
+        return;
+    }
+
+    printf("[NET][FIELD_ACTION] --force-dig-hole active: forcing a real Player_actor_request_main_dig_scoop_all() "
+           "request at tile (56,105)\n");
+    if (PC_Test_ForceRequestDigScoop(gamePT, &pos, (mActor_name_t)EMPTY_NO)) {
+        s_stage = 2;
+    }
+    /* else: rejected by Player_actor_check_request_main_able() -- e.g. a higher-priority main index is
+       already pending, or a reset is in progress. Not fatal: retried every poll, still at stage 1, same
+       reasoning as every other test-only trigger in this file. */
+}
+
 static void pcnetgame_run_pickup_test_seed(void) {
     static const int s_seed_tiles[30][2] = {
         { 8, 8 },   { 24, 8 },  { 40, 8 },  { 56, 8 },  { 72, 8 },
@@ -4856,6 +9767,169 @@ static void pcnetgame_run_pickup_test_seed(void) {
     }
 }
 
+/* World Ecology Stage 1, TEST-ONLY: --field-action-test-seed. Mirrors
+ * pcnetgame_run_pickup_test_seed()'s own exact structure/reasoning -- this save's field data has no
+ * guaranteed naturally-occurring buried item or money rock, so the DIG_BURIED/MONEY_ROCK_HIT
+ * regression tests need a fixture the same way the pickup test does. Seeds exactly two tiles, once
+ * each, at fixed coordinates deliberately distinct from --pickup-test-seed's own 30-tile grid (so
+ * both flags may be combined without collision): (40, 104) gets a buried ITM_FOOD_APPLE (deposit
+ * ON), (24, 104) gets a MONEY_ROCK_A. Never touches gameplay unless explicitly passed. A candidate
+ * tile that mFI_UtNumtoFGSet_common() declines (a structure footprint it refuses to overwrite -- it
+ * does NOT force-overwrite like pcnetgame_run_pickup_test_seed() does) is simply retried every poll
+ * until it succeeds; acceptable for a test-only, off-by-default fixture.
+ *
+ * World Ecology T1 review follow-up: also seeds three tree fixtures, on this SAME flag (no new CLI
+ * flag needed) and the same off-by-default/retry-until-success pattern, since T1's TREE_SHAKE/
+ * TREE_CHOP live host+fake-client regression tests have no other way to reach a guaranteed
+ * furniture/fruit/bee tree -- (56, 104): TREE_APPLE_FRUIT for the TREE_SHAKE race test, (72, 104): a
+ * second, independent TREE_APPLE_FRUIT for the alternating-chop test (kept distinct from the shake
+ * tile so the two tests never contend for the same tree/slot), (88, 104): TREE_BEES for the
+ * bee-birth-after-felling-chop ordering test -- same z=104 row/acre neighborhood as the dig/rock/other
+ * two tree fixtures (all of which land successfully, i.e. that acre row is loaded from bootstrap), one
+ * acre column further out than the chop fixture (mFI_UtNumtoFGSet_common() only writes into an
+ * ALREADY-LOADED block -- see m_field_info.c -- so a tile in an unloaded acre is silently skipped and
+ * retried forever; (8,104)/(8,120) were tried first and never landed, apparently unloaded acres). */
+/* World Ecology T-dig review follow-up: extends this SAME flag/pattern (no new CLI flag) with five more
+ * fixtures needed by the DIG_HOLE/FILL_HOLE/PITFALL_CONSUME/DIG_SHINE regression tests. Placed at z=105
+ * (one tile off the existing z=104 row) directly UNDER the SAME four already-confirmed-loaded acre
+ * columns the dig/rock/tree fixtures above use (24/40/56/72) -- every tile within an already-loaded acre
+ * loads together, so this avoids the unloaded-acre landing failure this file's own T1 doc already flags
+ * for any untried column (see the T1 doc just above): (24,105) a BURIED_PITFALL_HOLE00 fixture (deposit
+ * OFF) for the extended DIG_BURIED pitfall-dig-up sub-case test; (40,105) a SECOND, independent
+ * BURIED_PITFALL_HOLE00 fixture (deposit OFF) dedicated to the PITFALL_CONSUME race test (kept distinct
+ * from (24,105) so the two tests never contend for the same tile); (56,105) EMPTY_NO (explicit,
+ * force-set like every other fixture here) for the DIG_HOLE test; (72,105) an existing HOLE_START
+ * (deposit OFF) for the FILL_HOLE test; (88,105) a SHINE_SPOT for the DIG_SHINE test. */
+static void pcnetgame_run_field_action_test_seed(void) {
+    static int s_dig_seed_done = 0;
+    static int s_rock_seed_done = 0;
+    static int s_tree_shake_seed_done = 0;
+    static int s_tree_chop_seed_done = 0;
+    static int s_tree_bee_seed_done = 0;
+    static int s_pitfall_dig_seed_done = 0;
+    static int s_pitfall_consume_seed_done = 0;
+    static int s_dig_hole_seed_done = 0;
+    static int s_fill_hole_seed_done = 0;
+    static int s_dig_shine_seed_done = 0;
+    static int s_logged = 0;
+
+    if (!g_pc_field_action_test_seed || s_role != PC_NETGAME_ROLE_HOST || gamePT == NULL || !s_host_world_ready ||
+        !pcfa_scene_is_town()) {
+        return;
+    }
+    if (!s_logged) {
+        s_logged = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed active: seeding a buried item + a money rock + "
+               "3 tree fixtures + 5 dig-family fixtures\n");
+    }
+    if (!s_dig_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)ITM_FOOD_APPLE, 40, 104, TRUE)) {
+        mFI_UtNum2DepositON(40, 104);
+        s_dig_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: buried fixture item placed at tile (40,104)\n");
+    }
+    if (!s_rock_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)MONEY_ROCK_A, 24, 104, TRUE)) {
+        s_rock_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: money rock fixture placed at tile (24,104)\n");
+    }
+    if (!s_tree_shake_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)TREE_APPLE_FRUIT, 56, 104, TRUE)) {
+        s_tree_shake_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: TREE_APPLE_FRUIT (shake) fixture placed at tile "
+               "(56,104)\n");
+    }
+    if (!s_tree_chop_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)TREE_APPLE_FRUIT, 72, 104, TRUE)) {
+        s_tree_chop_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: TREE_APPLE_FRUIT (chop) fixture placed at tile "
+               "(72,104)\n");
+    }
+    if (!s_tree_bee_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)TREE_BEES, 88, 104, TRUE)) {
+        s_tree_bee_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: TREE_BEES fixture placed at tile (88,104)\n");
+    }
+    if (!s_pitfall_dig_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)BURIED_PITFALL_HOLE00, 24, 105, TRUE)) {
+        s_pitfall_dig_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: BURIED_PITFALL_HOLE00 (dig-up) fixture placed at "
+               "tile (24,105)\n");
+    }
+    if (!s_pitfall_consume_seed_done &&
+        mFI_UtNumtoFGSet_common((mActor_name_t)BURIED_PITFALL_HOLE00, 40, 105, TRUE)) {
+        s_pitfall_consume_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: BURIED_PITFALL_HOLE00 (consume race) fixture "
+               "placed at tile (40,105)\n");
+    }
+    if (!s_dig_hole_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)EMPTY_NO, 56, 105, TRUE)) {
+        s_dig_hole_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: EMPTY_NO (DIG_HOLE) fixture placed at tile "
+               "(56,105)\n");
+    }
+    if (!s_fill_hole_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)HOLE_START, 72, 105, TRUE)) {
+        s_fill_hole_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: HOLE_START (FILL_HOLE) fixture placed at tile "
+               "(72,105)\n");
+    }
+    if (!s_dig_shine_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)SHINE_SPOT, 88, 105, TRUE)) {
+        s_dig_shine_seed_done = 1;
+        printf("[NET][FIELD_ACTION] --field-action-test-seed: SHINE_SPOT (DIG_SHINE) fixture placed at tile "
+               "(88,105)\n");
+    }
+}
+
+/* World Ecology T3, TEST-ONLY: --bury-test-seed. Mirrors pcnetgame_run_field_action_test_seed()'s own
+ * exact structure/reasoning -- this save's field data has no guaranteed naturally-occurring hole/shine
+ * tile, and the BURY_REQUEST/RESULT regression tests need one the same way the dig-family tests do.
+ * Placed at z=106/107, one/two tiles off the existing z=104/105 rows, directly under the SAME
+ * already-confirmed-loaded acre columns (24/40/56/72/88) the fixtures above use -- see that function's
+ * own doc for why this avoids the unloaded-acre landing failure. All deposit OFF (holes, not buried
+ * items): (24,106)/(40,106)/(56,106) HOLE_START (variant 0) for the generic-item-bury+dig-up-round-trip,
+ * pitfall-into-hole, and same-tile-race tests respectively (kept on separate tiles so no two tests ever
+ * contend for a tile they don't mean to); (72,106)/(88,106) HOLE_SHINE for the pitfall-into-shine
+ * (valid hole_variant / 0xFF sentinel) tests; (24,107) a further, independent HOLE_SHINE for the
+ * money-bury-into-shine test. */
+static void pcnetgame_run_bury_test_seed(void) {
+    static int s_generic_seed_done = 0;
+    static int s_pitfall_hole_seed_done = 0;
+    static int s_race_seed_done = 0;
+    static int s_shine_variant_seed_done = 0;
+    static int s_shine_sentinel_seed_done = 0;
+    static int s_money_shine_seed_done = 0;
+    static int s_logged = 0;
+
+    if (!g_pc_bury_test_seed || s_role != PC_NETGAME_ROLE_HOST || gamePT == NULL || !s_host_world_ready ||
+        !pcfa_scene_is_town()) {
+        return;
+    }
+    if (!s_logged) {
+        s_logged = 1;
+        printf("[NET][BURY] --bury-test-seed active: seeding 3 HOLE00 tiles + 3 HOLE_SHINE tiles\n");
+    }
+    if (!s_generic_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)HOLE_START, 24, 106, TRUE)) {
+        s_generic_seed_done = 1;
+        printf("[NET][BURY] --bury-test-seed: HOLE_START (generic bury + dig-up round trip) fixture placed at "
+               "tile (24,106)\n");
+    }
+    if (!s_pitfall_hole_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)HOLE_START, 40, 106, TRUE)) {
+        s_pitfall_hole_seed_done = 1;
+        printf("[NET][BURY] --bury-test-seed: HOLE_START (pitfall-into-hole) fixture placed at tile (40,106)\n");
+    }
+    if (!s_race_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)HOLE_START, 56, 106, TRUE)) {
+        s_race_seed_done = 1;
+        printf("[NET][BURY] --bury-test-seed: HOLE_START (same-tile race) fixture placed at tile (56,106)\n");
+    }
+    if (!s_shine_variant_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)HOLE_SHINE, 72, 106, TRUE)) {
+        s_shine_variant_seed_done = 1;
+        printf("[NET][BURY] --bury-test-seed: HOLE_SHINE (pitfall, valid hole_variant) fixture placed at tile "
+               "(72,106)\n");
+    }
+    if (!s_shine_sentinel_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)HOLE_SHINE, 88, 106, TRUE)) {
+        s_shine_sentinel_seed_done = 1;
+        printf("[NET][BURY] --bury-test-seed: HOLE_SHINE (pitfall, 0xFF sentinel) fixture placed at tile "
+               "(88,106)\n");
+    }
+    if (!s_money_shine_seed_done && mFI_UtNumtoFGSet_common((mActor_name_t)HOLE_SHINE, 24, 107, TRUE)) {
+        s_money_shine_seed_done = 1;
+        printf("[NET][BURY] --bury-test-seed: HOLE_SHINE (money-tree roll) fixture placed at tile (24,107)\n");
+    }
+}
+
 void pc_net_game_poll(void) {
     PCNetEvent ev;
 
@@ -4869,6 +9943,14 @@ void pc_net_game_poll(void) {
             /* Two-phase interactions: release timed-out reservations BEFORE this poll's events are
                handled, so a late CONFIRM / a competing request is judged against the up-to-date table. */
             pcnetgame_host_expire_reservations();
+            /* World Ecology Stage 1, Item 2: same "before this poll's events" placement -- a money-rock
+               window that just expired must revert before a same-tile hit arriving this poll is judged. */
+            pcnetgame_host_check_field_action_money_rock();
+            /* World Ecology T1: same "before this poll's events" placement -- an idle tree cut-count
+               slot that just expired must be forgotten before a same-tile chop arriving this poll is
+               judged (it simply re-derives its hit count fresh either way, but this keeps the ordering
+               consistent with every other per-poll expiry tick in this function). */
+            pcnetgame_host_check_tree_cut();
         }
     }
 
@@ -5158,6 +10240,77 @@ void pc_net_game_poll(void) {
         }
     }
 
+    /* World Ecology T3: pending bury-request timeout/retry, client-only. Exact structural mirror of
+       the pickup/drop retry blocks above -- see their own doc comments for the shared reasoning (gamePT
+       gate, timeout/retry budget). Kept as a separate block against a separate pending instance for the
+       same "don't conflate different kinds' retries" reason as s_bury_pending's own doc comment. */
+    if (gamePT != NULL && s_bury_pending.valid &&
+        graph_dt_period_elapsed(gamePT, &s_bury_pending.timeout_accum, PC_NETGAME_BURY_TIMEOUT_60FPS_FRAMES)) {
+        if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+            s_bury_pending.valid = 0;
+        } else if (s_bury_pending.retry_count >= PC_NETGAME_BURY_MAX_RETRIES) {
+            printf("[NET][BURY] request %u timed out after %d retries -- giving up (tile %d,%d)\n",
+                   (unsigned)s_bury_pending.request_id, s_bury_pending.retry_count,
+                   (int)s_bury_pending.ut_x, (int)s_bury_pending.ut_z);
+            pcnetgame_client_send_confirm((uint8_t)PC_NETGAME_INTERACT_KIND_BURY, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
+                                          (uint8_t)PC_NETGAME_CONFIRM_REASON_CANCELLED, s_bury_pending.request_id);
+            s_bury_pending.valid = 0;
+        } else {
+            PCNetGameBuryRequestMsg msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_type = (uint8_t)PC_NETGAME_MSG_BURY_REQUEST;
+            msg.pocket_slot_idx = s_bury_pending.pocket_slot_idx;
+            msg.ut_x = s_bury_pending.ut_x;
+            msg.ut_z = s_bury_pending.ut_z;
+            msg.claimed_item = s_bury_pending.claimed_item;
+            msg.hole_variant = s_bury_pending.hole_variant;
+            msg.request_id = s_bury_pending.request_id; /* SAME id -- see the pickup retry block's own comment */
+            if (pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+                if (s_bury_pending.unsent) {
+                    s_bury_pending.unsent = 0; /* this was the FIRST send, not a retry: not counted */
+                } else {
+                    s_bury_pending.retry_count++;
+                }
+            } else {
+                s_bury_pending.timeout_accum = PC_NETGAME_BURY_TIMEOUT_60FPS_FRAMES; /* not a retry */
+            }
+        }
+    }
+
+    /* World Ecology Stage 1 / T0-C: pending field-action (DIG_BURIED/MONEY_ROCK_HIT, and any future
+       kind) request timeout/retry, client-only, operating on the QUEUE HEAD only -- the only entry
+       ever actually in flight on the wire (see s_field_action_queue's own doc). Structural mirror of
+       the pickup/drop retry blocks above -- same gamePT gate, same timeout/retry budget shape
+       (PC_NETGAME_FIELD_ACTION_TIMEOUT_60FPS_FRAMES/_MAX_RETRIES). No ABORT to send on giving up
+       (unlike pickup/drop) -- there is no host-side reservation to release (see
+       PCNetGameFieldActionRequestMsg's own doc): giving up here just pops the head (abandoning that one
+       request) so the caller's next frame can try again from scratch, and promotes whatever is queued
+       behind it, if anything (pcnetgame_field_action_queue_pop_head()). */
+    if (gamePT != NULL && s_field_action_queue_len > 0 &&
+        graph_dt_period_elapsed(gamePT, &s_field_action_queue[0].timeout_accum,
+                                PC_NETGAME_FIELD_ACTION_TIMEOUT_60FPS_FRAMES)) {
+        PCNetGameFieldActionPending* head = &s_field_action_queue[0];
+        if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+            /* The connection itself is gone -- every queued request is moot, not just the head. */
+            s_field_action_queue_len = 0;
+        } else if (head->retry_count >= PC_NETGAME_FIELD_ACTION_MAX_RETRIES) {
+            printf("[NET][FIELD_ACTION] request %u (kind %u) timed out after %d retries -- giving up (tile %d,%d)\n",
+                   (unsigned)head->request_id, (unsigned)head->kind, head->retry_count, (int)head->ut_x,
+                   (int)head->ut_z);
+            pcnetgame_field_action_queue_pop_head();
+        } else {
+            if (pcnetgame_field_action_queue_send(head)) {
+                if (head->unsent) {
+                    head->unsent = 0;
+                } else {
+                    head->retry_count++;
+                }
+            } else {
+                head->timeout_accum = PC_NETGAME_FIELD_ACTION_TIMEOUT_60FPS_FRAMES;
+            }
+        }
+    }
+
     /* (v2: the Stage 5A deferred FIELD_UPDATE retry loop that lived here is gone -- see the note
      * where s_pending_field_updates used to be declared.) */
 
@@ -5165,9 +10318,30 @@ void pc_net_game_poll(void) {
      * --pickup-test-seed was passed on the command line. */
     pcnetgame_run_pickup_test_seed();
 
+    /* World Ecology Stage 1: see pcnetgame_run_field_action_test_seed()'s own doc -- a complete no-op
+     * unless --field-action-test-seed was passed on the command line. */
+    pcnetgame_run_field_action_test_seed();
+
+    /* World Ecology T3: see pcnetgame_run_bury_test_seed()'s own doc -- a complete no-op unless
+     * --bury-test-seed was passed on the command line. */
+    pcnetgame_run_bury_test_seed();
+
     /* Villager population/is_home milestone: see pcnetgame_run_villager_test_triggers()'s own doc --
      * a complete no-op unless --force-villager-grow/--force-villager-remove was passed. */
     pcnetgame_run_villager_test_triggers();
+
+    /* Friendship/mail sync milestone: see pcnetgame_run_friendship_mail_test_triggers()'s own doc --
+     * a complete no-op unless --force-friendship-delta/--force-mail-send was passed. Unlike the
+     * villager-population trigger above, this one is NOT host-only. */
+    pcnetgame_run_friendship_mail_test_triggers();
+
+    /* World Ecology Stage 1 money-rock review: see pcnetgame_run_money_rock_test_triggers()'s own doc --
+     * a complete no-op unless --force-money-rock-hit/--force-money-bag-pickup was passed. */
+    pcnetgame_run_money_rock_test_triggers();
+
+    /* P1 (World Ecology T-dig) real-gameplay verification: see pcnetgame_run_dig_hole_test_trigger()'s
+     * own doc -- a complete no-op unless --force-dig-hole was passed. */
+    pcnetgame_run_dig_hole_test_trigger();
 }
 
 PCNetGameRole pc_net_game_role(void) {
@@ -5232,7 +10406,7 @@ int pc_net_game_client_world_synced(void) {
     return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_client_world_synced;
 }
 
-int pc_net_game_request_pickup(int ut_x, int ut_z) {
+int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
     PCNetGamePickupRequestMsg msg;
     PCNetGameOwnerStamp stamp;
 
@@ -5266,11 +10440,35 @@ int pc_net_game_request_pickup(int ut_x, int ut_z) {
         return 1; /* (a client with a READY link always has one; defensive) */
     }
     if (mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) < 0) {
-        /* No free pocket: vanilla leaves the item where it is when the pockets are full, so send
-           nothing and change nothing (the host never reserves/removes an item nobody can receive). One
-           line per attempt (the pickup animation starts once per attempt). */
-        printf("[NET][PICKUP] pockets full -- pickup at (%d,%d) not sent (the item stays in the world)\n", ut_x, ut_z);
-        return 1;
+        /* No free pocket: vanilla leaves the item where it is when the pockets are full, so ordinarily
+         * send nothing and change nothing (the host never reserves/removes an item nobody can receive).
+         *
+         * Review finding fix: EXCEPT a money bag the WALLET might still have room for -- vanilla/
+         * PC_ENHANCEMENTS allows a money bag to bypass the pocket check entirely via direct wallet
+         * credit (see Player_actor_setup_main_Pickup(), m_player_main_pickup.c_inc), so a client with
+         * full pockets must still be allowed to ATTEMPT collecting a wallet-fitting money bag -- refusing
+         * to even send the request made that impossible for any network client, full pockets or not.
+         * `item` is only this client's own local guess at what the tile holds (see this function's own
+         * doc, pc_net_game.h); it decides only whether to still try, never the actual outcome. The real
+         * safety net is unchanged: pcnetgame_handle_client_pickup_result()'s own Bug 3 pre-check
+         * re-verifies wallet_fits/pocket_free against the host's actual granted_item before ever sending
+         * INTERACT_CONFIRM, so a wrong local guess here can only cause a harmless rejection/abort, never
+         * an incorrect grant or a lost bag. */
+        int wallet_might_fit = 0;
+#ifdef PC_ENHANCEMENTS
+        {
+            u32 possible_bell_amount = mPr_GetAmountForMoneyItem((mActor_name_t)item);
+            wallet_might_fit = possible_bell_amount > 0 && Now_Private->inventory.wallet <= mPr_WALLET_MAX &&
+                               possible_bell_amount <= (mPr_WALLET_MAX - Now_Private->inventory.wallet);
+        }
+#endif
+        if (!wallet_might_fit) {
+            printf("[NET][PICKUP] pockets full -- pickup at (%d,%d) not sent (the item stays in the world)\n", ut_x, ut_z);
+            return 1;
+        }
+        printf("[NET][PICKUP] pockets full but item=0x%04X may still fit the wallet -- pickup at (%d,%d) sent anyway; the "
+               "host's own granted item and this client's Bug 3 pre-check are the real authority on the outcome\n",
+               (unsigned)item, ut_x, ut_z);
     }
 
     s_pickup_pending.valid = 1;
@@ -5294,6 +10492,437 @@ int pc_net_game_request_pickup(int ut_x, int ut_z) {
         s_pickup_pending.timeout_accum = PC_NETGAME_PICKUP_TIMEOUT_60FPS_FRAMES;
     }
     return 1;
+}
+
+/* World Ecology Stage 1 / T0-C: shared ENQUEUE helper for both pc_net_game_request_dig_buried() and
+ * pc_net_game_request_money_rock_hit() -- the two functions differ only in their pocket-space
+ * precondition (DIG_BURIED needs a free slot; MONEY_ROCK_HIT needs none), which each checks itself
+ * before calling this, and both still refuse to call this at all while anything is already queued (see
+ * their own "one already in flight" guard) -- so for these two kinds the queue this appends to can
+ * still never hold more than 1 entry, exactly as before T0-C. Appends to s_field_action_queue and, if
+ * the queue was empty (this is now the head), sends it immediately -- exactly like the pre-queue code's
+ * own single-slot send. A FUTURE caller (e.g. T1) that enqueues without that same guard can rely on
+ * this appending behind whatever is already queued instead of being dropped, up to
+ * PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH. */
+static int pcnetgame_send_field_action_request_ex_grant(uint8_t kind, int ut_x, int ut_z, uint8_t hole_variant,
+                                                          uint16_t local_grant) {
+    PCNetGameOwnerStamp stamp;
+    PCNetGameFieldActionPending* e;
+
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        printf("[NET][FIELD_ACTION] no gameplay save loaded -- kind %u at (%d,%d) not sent\n", (unsigned)kind, ut_x,
+               ut_z);
+        return 1;
+    }
+    if (s_field_action_queue_len >= PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH) {
+        printf("[NET][FIELD_ACTION] queue full (%d) -- kind %u at (%d,%d) dropped\n",
+               PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH, (unsigned)kind, ut_x, ut_z);
+        return 1;
+    }
+
+    e = &s_field_action_queue[s_field_action_queue_len];
+    memset(e, 0, sizeof(*e));
+    e->valid = 1;
+    e->kind = kind;
+    e->request_id = s_next_field_action_request_id++;
+    e->owner = stamp;
+    e->ut_x = (uint8_t)ut_x;
+    e->ut_z = (uint8_t)ut_z;
+    e->hole_variant = hole_variant;
+    e->timeout_accum = 0.0f;
+    e->retry_count = 0;
+    e->unsent = 0;
+    e->local_grant = local_grant;
+    s_field_action_queue_len++;
+
+    if (s_field_action_queue_len == 1) {
+        /* This is now the head -- the only in-flight slot -- send it immediately, exactly like the
+           pre-queue code's own single-slot send did for its one-and-only pending request. */
+        pcnetgame_field_action_queue_kick_head();
+    }
+    return 1;
+}
+
+static int pcnetgame_send_field_action_request_ex(uint8_t kind, int ut_x, int ut_z, uint8_t hole_variant) {
+    return pcnetgame_send_field_action_request_ex_grant(kind, ut_x, ut_z, hole_variant, 0);
+}
+
+/* World Ecology T-dig (D / A-2): single-flight guard for the two grant-carrying kinds, mirroring
+ * DIG_BURIED's/MONEY_ROCK_HIT's own "one already in flight" precedent (see their own request functions'
+ * doc) -- unlike plain DIG_HOLE/DIG_SHINE, a player must never have more than one privately-rolled grant
+ * outstanding at once (stacking two would risk a double-grant if both somehow got accepted). Scans the
+ * whole queue, not just the head, since an earlier grant-carrying request may still be queued behind
+ * something else. */
+static int pcnetgame_field_action_grant_already_pending(void) {
+    int i;
+    for (i = 0; i < s_field_action_queue_len; i++) {
+        if (s_field_action_queue[i].valid && s_field_action_queue[i].local_grant != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Pre-v3 call shape, kept for every EXISTING caller (DIG_BURIED, MONEY_ROCK_HIT, TREE_SHAKE, TREE_CHOP,
+ * SNOWMAN_BREAK) unmodified -- none of these kinds use hole_variant, so this thin wrapper just pins it
+ * to 0, exactly matching PCNetGameFieldActionRequestMsg's own doc ("every sender explicitly sets it to 0
+ * for those kinds"). */
+static int pcnetgame_send_field_action_request(uint8_t kind, int ut_x, int ut_z) {
+    return pcnetgame_send_field_action_request_ex(kind, ut_x, ut_z, 0);
+}
+
+/* See pc_net_game.h's own doc. */
+int pc_net_game_request_dig_buried(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0; /* single-player or host -- caller proceeds with the normal local dig, unmodified */
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- DIG_BURIED at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    if (s_field_action_queue_len > 0) {
+        return 1; /* one already in flight/queued -- see s_field_action_queue's own doc: this guard
+                     keeps DIG_BURIED's own queue usage at exactly 1 entry, byte-for-byte like the
+                     pre-T0-C single-slot behavior */
+    }
+    if (mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) < 0) {
+        /* No free pocket: vanilla leaves the buried item where it is (see
+           Player_actor_setup_main_Get_scoop()'s own free_space check, m_player_main_get_scoop.c_inc) --
+           the real granted item is not known yet, so this is a plain EMPTY_NO check, exactly like
+           pc_net_game_request_pickup()'s own (see this function's doc in pc_net_game.h). */
+        printf("[NET][FIELD_ACTION] pockets full -- DIG_BURIED at (%d,%d) not sent\n", ut_x, ut_z);
+        return 1;
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_BURIED, ut_x, ut_z);
+}
+
+/* See pc_net_game.h's own doc. */
+int pc_net_game_request_money_rock_hit(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- MONEY_ROCK_HIT at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    if (s_field_action_queue_len > 0) {
+        return 1; /* one already in flight/queued -- see s_field_action_queue's own doc */
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_MONEY_ROCK_HIT, ut_x, ut_z);
+}
+
+/* See pc_net_game.h's own doc. Unlike pc_net_game_request_dig_buried()/_money_rock_hit() above,
+ * deliberately has NO "one already in flight/queued" guard -- several distinct tree tiles may
+ * legitimately have a shake/bee-birth request outstanding at once, and the shared 4-deep
+ * s_field_action_queue FIFO (T0-C) already exists to support exactly this (see that queue's own doc). */
+int pc_net_game_request_tree_shake(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- TREE_SHAKE at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_SHAKE, ut_x, ut_z);
+}
+
+/* See pc_net_game.h's own doc. No "one already in flight" guard either -- repeated axe swings need the
+ * 4-deep FIFO so a chop-spam sequence is not silently dropped down to one hit (see
+ * pc_net_game_request_tree_shake()'s own doc, just above). */
+int pc_net_game_request_tree_chop(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- TREE_CHOP at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_CHOP, ut_x, ut_z);
+}
+
+/* See pc_net_game.h's own doc. Deliberately no reach/IN_TOWN precondition on the sender -- the host
+ * alone judges acceptance -- and no free-pocket-slot-style check either (nothing is granted back to
+ * the caller on success). request_id shares s_next_field_action_request_id's space (see
+ * PCNetGameSnowmanBuildRequestMsg's own doc); a send failure (reliable window full) is simply dropped
+ * and logged, not retried -- this is a documented, accepted gap (see this function's own header doc,
+ * pc_net_game.h): a lost BUILD leaves the host never learning this particular snowman. */
+int pc_net_game_request_snowman_build(int ut_x, int ut_z, int head_size, int body_size, int score) {
+    PCNetGameSnowmanBuildRequestMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_SNOWMAN_BUILD_REQUEST;
+    msg.ut_x = (uint8_t)ut_x;
+    msg.ut_z = (uint8_t)ut_z;
+    msg.head_size = (uint8_t)head_size;
+    msg.body_size = (uint8_t)body_size;
+    msg.score = (uint8_t)score;
+    msg.request_id = s_next_field_action_request_id++;
+    if (!pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+        printf("[NET][SNOWMAN] client: BUILD request %u at (%d,%d) could not be queued (window full) -- dropped, "
+               "not retried (see pc_net_game_request_snowman_build()'s own accepted-gap doc)\n",
+               (unsigned)msg.request_id, ut_x, ut_z);
+    }
+    return 1;
+}
+
+/* See pc_net_game.h's own doc. Deliberately no "one already in flight" guard -- uses the full 4-deep
+ * FIFO like TREE_SHAKE/TREE_CHOP above, not DIG_BURIED/MONEY_ROCK_HIT's single-slot emulation. */
+int pc_net_game_request_snowman_break(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- SNOWMAN_BREAK at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK, ut_x, ut_z);
+}
+
+/* World Ecology T-dig: DIG_HOLE (kind 5) -- digging a brand-new hole into EMPTY_NO ground, or removing a
+ * flower/stump/sapling/grass tuft. `hole_variant` is THIS client's own proposed hole-shape pick (0..24,
+ * e.g. from mCoBG_GetHoleNumber()'s own local collision-mesh-driven choice) -- the host range-validates
+ * it (see pcnetgame_validate_hole_variant()) and, if in range, commits EXACTLY that shape; out-of-range
+ * is rejected outright, never clamped (see PCNetGameFieldActionRequestMsg's own TRUST BOUNDARY doc).
+ * Nothing is granted back on accept (a removed plant is never placed in a pocket -- see this kind's own
+ * doc above); the caller may still use a locally-rolled golden-shovel bonus (see this task's own design
+ * brief) after a free-pocket-slot pre-check, entirely independent of this request. No "one already in
+ * flight" guard -- shares the same 4-deep FIFO as tree shake/chop. */
+int pc_net_game_request_dig_hole(int ut_x, int ut_z, int hole_variant) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- DIG_HOLE at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    if (hole_variant < 0 || hole_variant > 24) {
+        hole_variant = 0; /* a malformed LOCAL value is simply normalized before sending -- the host
+                              re-validates independently regardless, this is not the trust boundary */
+    }
+    return pcnetgame_send_field_action_request_ex((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE, ut_x, ut_z,
+                                                   (uint8_t)hole_variant);
+}
+
+/* World Ecology T-dig (A-2): identical to pc_net_game_request_dig_hole() above, EXCEPT the resulting
+ * queue entry also carries `local_grant` -- a PRIVATE, client-rolled item id (ITM_MONEY_100 for the
+ * golden-shovel 10% bonus) granted to a free pocket slot via mPr_SetFreePossessionItem() if and only if
+ * this exact request is later ACCEPTED (see pcnetgame_handle_client_field_action_result()'s DIG_HOLE
+ * branch). The host is never told about the grant and never rolls or validates it -- it only ever sees an
+ * ordinary DIG_HOLE request and commits an ordinary hole, exactly like pc_net_game_request_dig_hole()'s
+ * own doc. On REJECT, the pending grant is simply dropped with the rest of the queue entry (the caller
+ * never played any local animation for this path, so there is nothing to undo). */
+int pc_net_game_request_dig_hole_with_grant(int ut_x, int ut_z, int hole_variant, int local_grant) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- DIG_HOLE(grant) at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    if (hole_variant < 0 || hole_variant > 24) {
+        hole_variant = 0;
+    }
+    if (local_grant != 0 && pcnetgame_field_action_grant_already_pending()) {
+        return 1; /* one grant already in flight/queued -- see this guard's own doc */
+    }
+    return pcnetgame_send_field_action_request_ex_grant((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE, ut_x, ut_z,
+                                                         (uint8_t)hole_variant, (uint16_t)local_grant);
+}
+
+/* World Ecology T-dig: FILL_HOLE (kind 6) -- filling an existing EMPTY hole back in. No hole_variant
+ * needed (filling always yields plain EMPTY_NO). No "one already in flight" guard, same as DIG_HOLE. */
+int pc_net_game_request_fill_hole(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- FILL_HOLE at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_FILL_HOLE, ut_x, ut_z);
+}
+
+/* World Ecology T-dig: PITFALL_CONSUME (kind 7) -- a player (or, on the host, a villager) falling INTO
+ * an already-buried pitfall. Deliberately OPTIMISTIC: unlike every other kind in this family, the
+ * caller plays its local fall animation immediately and unconditionally, WITHOUT waiting for this
+ * request's RESULT (the animation itself has no gameplay consequence -- see this task's own design
+ * brief) -- this function only sends the request so the host can authoritatively consume the tile and
+ * resolve any duplicate-fall race. On REJECT (someone else already consumed it, or it was already dug
+ * up), pcnetgame_handle_client_field_action_result() reconciles by applying the host's own current tile
+ * value, echoed in the RESULT's granted_item field (chosen over a full-resync trigger: this is a single,
+ * already-known tile, so echoing its value is simpler than forcing a resync for one stale write). */
+int pc_net_game_request_pitfall_consume(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- PITFALL_CONSUME at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_PITFALL_CONSUME, ut_x, ut_z);
+}
+
+/* World Ecology T-dig: DIG_SHINE (kind 8) -- digging up an unburied SHINE_SPOT. hole_variant is ignored
+ * host-side for this kind (a shine hole is not variant-shaped) -- always sent as 0. Grants NOTHING
+ * host-side: the caller rolls its own bell amount locally (after its own free-pocket-slot pre-check) and
+ * grants it privately on accept, matching vanilla's per-digger-luck design. No "one already in flight"
+ * guard. */
+int pc_net_game_request_dig_shine(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- DIG_SHINE at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_SHINE, ut_x, ut_z);
+}
+
+/* World Ecology T-dig (D): identical to pc_net_game_request_dig_shine() above, EXCEPT the resulting queue
+ * entry also carries `local_grant` -- THIS client's own privately-rolled bell amount (1000/10000/30000),
+ * granted to a free pocket slot via mPr_SetFreePossessionItem() if and only if this exact request is
+ * later ACCEPTED (see pcnetgame_handle_client_field_action_result()'s DIG_SHINE branch). The host never
+ * rolls or knows the bell amount -- matching vanilla's per-digger-luck design (see this kind's own doc).
+ * On REJECT, the pending grant is simply dropped with the rest of the queue entry (no local animation
+ * was played for this path, so there is nothing to undo). */
+int pc_net_game_request_dig_shine_with_grant(int ut_x, int ut_z, int local_grant) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][FIELD_ACTION] not in the town scene -- DIG_SHINE(grant) at (%d,%d) not sent\n", ut_x, ut_z);
+        }
+        return 1;
+    }
+    if (local_grant != 0 && pcnetgame_field_action_grant_already_pending()) {
+        return 1; /* one grant already in flight/queued -- see pcnetgame_field_action_grant_already_pending()'s own doc */
+    }
+    return pcnetgame_send_field_action_request_ex_grant((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_SHINE, ut_x, ut_z,
+                                                         0, (uint16_t)local_grant);
+}
+
+/* World Ecology T-dig: HOST-LOCAL wrappers, mirroring pc_net_game_host_local_money_rock_hit()'s/
+ * pc_net_game_host_local_tree_shake()'s own precedent exactly -- routes the HOST's own local dig/fill/
+ * pitfall/shine action through the SAME validate/commit adapters a remote peer's request uses, via
+ * pcnetgame_host_dispatch_local_field_action(), so there is exactly one owner per tile action. */
+void pc_net_game_host_local_dig_hole(int ut_x, int ut_z, int hole_variant) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    if (hole_variant < 0 || hole_variant > 24) {
+        hole_variant = 0;
+    }
+    pcnetgame_host_dispatch_local_field_action_ex((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_HOLE, (uint8_t)ut_x,
+                                                  (uint8_t)ut_z, (uint8_t)hole_variant);
+}
+
+void pc_net_game_host_local_fill_hole(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    pcnetgame_host_dispatch_local_field_action((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_FILL_HOLE, (uint8_t)ut_x,
+                                               (uint8_t)ut_z);
+}
+
+void pc_net_game_host_local_pitfall_consume(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    pcnetgame_host_dispatch_local_field_action((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_PITFALL_CONSUME, (uint8_t)ut_x,
+                                               (uint8_t)ut_z);
+}
+
+void pc_net_game_host_local_dig_shine(int ut_x, int ut_z) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    pcnetgame_host_dispatch_local_field_action((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_SHINE, (uint8_t)ut_x,
+                                               (uint8_t)ut_z);
 }
 
 /* Host-local guard API (see pc_net_game.h): 1 iff town tile (ut_x, ut_z) is currently reserved by any
@@ -5454,6 +11083,154 @@ int pc_net_game_request_drop(int pocket_slot_idx, int claimed_item, int ut_x, in
     return 1;
 }
 
+/* World Ecology T3 (bugfix): see pc_net_game.h's own doc for the full contract -- the caller must NOT
+ * clear the pocket based on this function's return value; that now happens in
+ * pcnetgame_handle_client_bury_result() upon provisional accept, after a slot-still-holds-the-item
+ * re-check, exactly like pc_net_game_request_drop()/pcnetgame_handle_client_drop_result(). Structural
+ * mirror of pc_net_game_request_drop() -- same client-only/one-in-flight/defensive-bounds/owner-stamp/
+ * slot-still-holds-claimed-item shape -- plus hole_variant, which is simply carried along (never itself
+ * validated client-side beyond its own 0..24-or-0xFF range: the host is the one that actually
+ * enforces/consumes it). */
+int pc_net_game_request_bury(int pocket_slot_idx, int claimed_item, int ut_x, int ut_z, int hole_variant) {
+    PCNetGameBuryRequestMsg msg;
+    PCNetGameOwnerStamp stamp;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0; /* single-player or host -- caller should proceed with the normal local
+                     mutation, unmodified */
+    }
+    if (pocket_slot_idx < 0 || pocket_slot_idx >= mPr_POCKETS_SLOT_COUNT || ut_x < 0 || ut_x > 255 ||
+        ut_z < 0 || ut_z > 255 || (hole_variant < 0 || (hole_variant > 24 && hole_variant != 0xFF))) {
+        return 1; /* malformed input from the caller -- still "handled", just nothing is sent */
+    }
+    if (!pcfa_scene_is_town()) {
+        return 0; /* the m_tag_ovl.c client seam shows vanilla's "can't do that" warning */
+    }
+    if (s_bury_pending.valid) {
+        return 1; /* one already in flight -- defensive no-op, same posture as drop's own equivalent */
+    }
+
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        printf("[NET][BURY] no gameplay save loaded -- bury at (%d,%d) not sent\n", ut_x, ut_z);
+        return 0;
+    }
+    if (Now_Private->inventory.pockets[pocket_slot_idx] != (mActor_name_t)claimed_item) {
+        printf("[NET][BURY] pocket slot %d holds 0x%04X, not the claimed 0x%04X -- bury not sent\n", pocket_slot_idx,
+               (unsigned)Now_Private->inventory.pockets[pocket_slot_idx], (unsigned)claimed_item);
+        return 0;
+    }
+
+    s_bury_pending.valid = 1;
+    s_bury_pending.request_id = s_next_bury_request_id++;
+    s_bury_pending.owner = stamp;
+    s_bury_pending.pocket_slot_idx = (uint8_t)pocket_slot_idx;
+    s_bury_pending.ut_x = (uint8_t)ut_x;
+    s_bury_pending.ut_z = (uint8_t)ut_z;
+    s_bury_pending.claimed_item = (uint16_t)claimed_item;
+    s_bury_pending.hole_variant = (uint8_t)hole_variant;
+    s_bury_pending.timeout_accum = 0.0f;
+    s_bury_pending.retry_count = 0;
+    s_bury_pending.unsent = 0;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_BURY_REQUEST;
+    msg.pocket_slot_idx = s_bury_pending.pocket_slot_idx;
+    msg.ut_x = s_bury_pending.ut_x;
+    msg.ut_z = s_bury_pending.ut_z;
+    msg.claimed_item = s_bury_pending.claimed_item;
+    msg.hole_variant = s_bury_pending.hole_variant;
+    msg.request_id = s_bury_pending.request_id;
+    if (!pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+        s_bury_pending.unsent = 1;
+        s_bury_pending.timeout_accum = PC_NETGAME_BURY_TIMEOUT_60FPS_FRAMES;
+    }
+    return 1;
+}
+
+/* World Ecology T3: see pc_net_game.h's own doc. Single-ownership host-local bury -- routes the host's
+ * own local bury action through the SAME pcnetgame_validate_and_resolve_bury()/
+ * pcnetgame_resolve_bury_outcome() logic a remote peer's request uses (is_host_local=1: skips the
+ * reach/IN_TOWN checks), runs synchronously (no reservation/CONFIRM round trip needed for a local call),
+ * and on success clears the HOST's OWN pocket slot itself. Returns 1 iff it actually handled the bury
+ * (whether or not it turned out to be a legal one -- the caller must NOT fall back to vanilla's local
+ * mutation on a 0..1 either way once this returns 1 for a genuine HOST role, mirroring
+ * pc_net_game_request_bury()'s own "returns 1 == handled" convention); returns 0 for single-player or a
+ * client, or for malformed input, in which case the caller falls back to vanilla, unmodified. */
+int pc_net_game_host_local_bury(int pocket_slot_idx, int ut_x, int ut_z, int claimed_item, int hole_variant) {
+    PCNetPlayerContext ctx;
+    int acre = 0, tile = 0;
+    uint16_t raw_item = 0;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    if (!pcfa_scene_is_town()) {
+        return 0; /* the host itself is indoors -- ut_x/ut_z from a room are not town coordinates */
+    }
+    if (pocket_slot_idx < 0 || pocket_slot_idx >= mPr_POCKETS_SLOT_COUNT || ut_x < 0 || ut_x > 255 || ut_z < 0 ||
+        ut_z > 255 || (hole_variant < 0 || (hole_variant > 24 && hole_variant != 0xFF))) {
+        return 0;
+    }
+    if (Now_Private == NULL) {
+        /* no gameplay save loaded -- defensive; a host-local bury can only ever be requested from live
+           gameplay, so this should be unreachable in practice */
+        return 0;
+    }
+    if (Now_Private->inventory.pockets[pocket_slot_idx] != (mActor_name_t)claimed_item) {
+        return 0; /* the slot does not hold what the caller claims -- never trust stale menu state */
+    }
+
+    pcnetgame_capture_local_context(&ctx);
+    /* peer is unused whenever is_host_local (the first argument) is 1 -- see
+       pcnetgame_validate_and_resolve_bury()'s own doc -- so (PCNetPeerId)0 here is a meaningless
+       placeholder, never actually read. */
+    if (!pcnetgame_validate_and_resolve_bury(1, (PCNetPeerId)0, (uint8_t)pocket_slot_idx, (uint8_t)ut_x,
+                                             (uint8_t)ut_z, (mActor_name_t)claimed_item, (uint8_t)hole_variant, &acre,
+                                             &tile, &raw_item)) {
+        return 0; /* not a legal bury -- caller falls back to vanilla's own "can't do that" handling */
+    }
+
+    {
+        mActor_name_t resolved = (mActor_name_t)EMPTY_NO;
+        int action = pcnetgame_resolve_bury_outcome(&ctx, (mActor_name_t)claimed_item, raw_item, (uint8_t)hole_variant,
+                                                    &resolved);
+        int dep_on = (action == PC_NETGAME_BURY_ACTION_BURY);
+
+        if (!pcfa_set_tile(acre, tile, (uint16_t)resolved)) {
+            return 0;
+        }
+        if (dep_on) {
+            pcfa_set_deposit(acre, tile, 1);
+        }
+        mPr_SetPossessionItem(Now_Private, pocket_slot_idx, (mActor_name_t)EMPTY_NO, mPr_ITEM_COND_NORMAL);
+        pcnetgame_host_flush_mask((uint32_t)1u << acre);
+        printf("[NET][BURY] host: local bury at tile (%d,%d) 0x%04X -> 0x%04X (action=%d dep=%d)\n", ut_x, ut_z,
+               (unsigned)raw_item, (unsigned)resolved, action, dep_on);
+    }
+    return 1;
+}
+
+/* Bug 3 fix: see this function's own doc in pc_net_game.h. Mirrors the tile-validity half of
+ * pcnetgame_validate_and_resolve_bury() exactly (raw tile value must be HOLE00..24 or HOLE_SHINE) --
+ * deliberately NOT the reservation check (the caller already has its own precedent for that, see
+ * mTG_host_put_tile_free()) and NOT any of the other bury-specific checks (pocket slot, claimed item,
+ * deposit state) that don't depend on the tile's own current value. */
+int pc_net_game_host_bury_tile_is_valid(int ut_x, int ut_z) {
+    int acre, tile;
+    uint16_t raw_value;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return 1; /* single-player/client: never this function's business, caller proceeds as before */
+    }
+    if (!pcfa_town_ut_to_acre_tile(ut_x, ut_z, &acre, &tile)) {
+        return 1; /* can't resolve -- fail open, exactly like every other best-effort read in this file */
+    }
+    if (!pcfa_get_tile(acre, tile, &raw_value)) {
+        return 1;
+    }
+    return ITEM_IS_HOLE(raw_value) || raw_value == (uint16_t)HOLE_SHINE;
+}
+
 /* Villager population/is_home milestone: broadcasts `msg` (already fully built, including
  * world_seq) to every READY client, exactly mirroring pcnetgame_host_check_world_meta()'s own
  * broadcast loop -- peers mid-snapshot are skipped (their snapshot, built at send time from current
@@ -5499,6 +11276,14 @@ void pc_net_game_notify_villager_arrival(int slot) {
 
     ++s_world_seq;
 
+    /* N3 finalization pass (Bug 2 fix): invalidate this slot's NPC_STATE dirty-check shadow so the
+     * new occupant's first state sample is always broadcast, even if its is_home/hide/forced_type
+     * values happen to coincidentally equal whatever the previous occupant last had. cached_npc_id
+     * also gets reset here in case the arrival's own npc_id somehow matched an even-older shadow entry
+     * (harmless belt-and-suspenders; the npc_id mismatch check in pc_net_game_notify_npc_state()
+     * would already catch that case). */
+    memset(&s_npc_state_shadow[slot], 0, sizeof(s_npc_state_shadow[slot]));
+
     memset(&msg, 0, sizeof(msg));
     msg.msg_type = (uint8_t)PC_NETGAME_MSG_VILLAGER_ARRIVAL;
     msg.slot = (uint8_t)slot;
@@ -5533,6 +11318,12 @@ void pc_net_game_notify_villager_departure(int slot) {
     }
 
     ++s_world_seq;
+
+    /* N3 finalization pass (Bug 2 fix): invalidate this slot's NPC_STATE dirty-check shadow now that
+     * it no longer represents a live occupant, so whichever villager takes this slot next always gets
+     * its initial state broadcast (see pc_net_game_notify_villager_arrival()'s matching reset, and
+     * pc_net_game_notify_npc_state()'s doc comment for the full Bug 2 rationale). */
+    memset(&s_npc_state_shadow[slot], 0, sizeof(s_npc_state_shadow[slot]));
 
     memset(&msg, 0, sizeof(msg));
     msg.msg_type = (uint8_t)PC_NETGAME_MSG_VILLAGER_DEPARTURE;
@@ -5574,5 +11365,684 @@ static void pcnetgame_build_villager_snapshot(PCNetGameVillagerSnapshotMsg* vs, 
         slot->home_block_z = animal->home_info.block_z;
         slot->home_ut_x = animal->home_info.ut_x;
         slot->home_ut_z = animal->home_info.ut_z;
+
+        /* N3 Channel B: best-effort hide (see PCNetGameVillagerSlotWire's own doc comment on this
+         * approximation) and the current forced-schedule override, if this slot has a registered
+         * schedule area (see FIX S3 -- it might not, in the narrow window before the very first
+         * ARRIVAL/SNAPSHOT-apply's re-registration call has run on THIS host, which cannot happen for
+         * a slot the host itself is about to snapshot since the host applied its own arrival
+         * synchronously long before any snapshot could be built for it). */
+        slot->hide = slot->is_home;
+        {
+            mNPS_schedule_c* sched_p = mNPS_get_schedule_area(&animal->id);
+            if (sched_p != NULL) {
+                int forced_timer = sched_p->forced_timer;
+                slot->forced_type = sched_p->forced_type;
+                slot->forced_timer_remaining =
+                    (uint16_t)((forced_timer < 0) ? 0 : (forced_timer > 65535 ? 65535 : forced_timer));
+            }
+        }
     }
+}
+
+/* ---- N2 villager movement sync ---- */
+
+/* Host side. See pc_net_game.h's doc comment on pc_net_game_notify_npc_move() for full scope and
+ * identity rationale. Called from ac_npc_move.c_inc once per frame per currently-instantiated,
+ * on-screen villager NPC_ACTOR, right after the unmodified host physics/AI has already finished
+ * resolving this frame's position/facing -- this function only ever SAMPLES and (throttled) SENDS,
+ * never mutates anything decomp-side. */
+void pc_net_game_notify_npc_move(int slot, uint16_t npc_id, float pos_x, float pos_y, float pos_z,
+                                 int16_t facing_angle, uint8_t action_type) {
+    PCNetGameNpcMoveMsg msg;
+    int i;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return; /* malformed input from the caller -- defensive */
+    }
+    if (pc_net_game_host_ready_peer_count() == 0) {
+        return; /* nobody to send to -- skip the throttle tick too, so a peer that joins later gets
+                 * this slot's very first sample promptly rather than mid-cycle */
+    }
+    if (gamePT == NULL || !graph_dt_period_elapsed(gamePT, &s_npc_move_send_accum[slot],
+                                                    PC_NETGAME_NPC_MOVE_SEND_PERIOD_60FPS_FRAMES)) {
+        return; /* not this slot's turn yet */
+    }
+    if (!pcnetgame_pos_valid(pos_x, pos_y, pos_z)) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC][DIAG] host: dropped invalid NPC_MOVE sample slot %d pos=(%g,%g,%g)\n", slot,
+                   (double)pos_x, (double)pos_y, (double)pos_z);
+        }
+        return;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_NPC_MOVE;
+    msg.slot = (uint8_t)slot;
+    msg.action_type = action_type;
+    msg.npc_id = npc_id;
+    msg.frame = ++s_npc_move_send_counter;
+    msg.pos_x = pos_x;
+    msg.pos_y = pos_y;
+    msg.pos_z = pos_z;
+    msg.facing_angle = facing_angle;
+
+    {
+        static uint8_t s_logged_send[ANIMAL_NUM_MAX];
+        if (!s_logged_send[slot]) {
+            s_logged_send[slot] = 1;
+            printf("[NET][NPC] host: NPC_MOVE stream started slot %d npc_id 0x%04X frame %u pos=(%.1f,%.1f,%.1f)\n",
+                   slot, (unsigned)npc_id, (unsigned)msg.frame, (double)pos_x, (double)pos_y, (double)pos_z);
+        }
+    }
+
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
+        }
+    }
+}
+
+/* Client side: ingest one NPC_MOVE. Stale/duplicate/reordered (frame <= last accepted for this slot)
+ * is dropped -- exactly PCNetMoveMsg.frame's own convention (see pcnetgame_handle_host_move()'s
+ * sibling doc comment). Identity (npc_id vs. the receiver's own live population state) is
+ * DELIBERATELY NOT checked here -- see pc_net_game_get_npc_move_pose()'s doc comment for why the
+ * authoritative check belongs at consume time, against the caller's live Save_t.animals[slot], not
+ * at receive time against whatever this ring cell happens to already hold. */
+static void pcnetgame_handle_client_npc_move(const PCNetGameNpcMoveMsg* in) {
+    PCNetNpcMoveSlot* ns;
+    PCNetNpcMoveSnapshot* dst;
+
+    if (in->slot >= ANIMAL_NUM_MAX) {
+        return; /* malformed */
+    }
+    if (!pcnetgame_pos_valid(in->pos_x, in->pos_y, in->pos_z)) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC][DIAG] client: dropped invalid NPC_MOVE sample slot %u\n", (unsigned)in->slot);
+        }
+        return;
+    }
+
+    ns = &s_npc_move_slot[in->slot];
+    if (ns->have_frame && in->frame <= ns->last_accepted_frame) {
+        return; /* stale, duplicate, or reordered relative to this slot's own stream */
+    }
+    if (!ns->have_frame) {
+        printf("[NET][NPC] client: NPC_MOVE first sample accepted slot %u npc_id 0x%04X frame %u pos=(%.1f,%.1f,%.1f)\n",
+               (unsigned)in->slot, (unsigned)in->npc_id, (unsigned)in->frame, (double)in->pos_x, (double)in->pos_y,
+               (double)in->pos_z);
+    }
+    ns->have_frame = 1;
+    ns->last_accepted_frame = in->frame;
+    ns->cached_npc_id = in->npc_id;
+    ns->last_action_type = in->action_type;
+
+    if (gamePT == NULL) {
+        return; /* no frame-time source to timestamp this sample with -- drop rather than mistimestamp
+                 * (should not happen for an already-READY client, but never crash on it) */
+    }
+
+    dst = &ns->snapshots[ns->snapshot_head];
+    dst->recv_local_frame = graph_dt_frame_time(gamePT);
+    dst->pos_x = in->pos_x;
+    dst->pos_y = in->pos_y;
+    dst->pos_z = in->pos_z;
+    dst->facing_angle = in->facing_angle;
+
+    ns->snapshot_head = (ns->snapshot_head + 1) % PC_NETGAME_NPC_MOVE_RING_SIZE;
+    if (ns->snapshot_count < PC_NETGAME_NPC_MOVE_RING_SIZE) {
+        ns->snapshot_count++;
+    }
+}
+
+/* Delayed two-snapshot interpolation over one slot's ring -- the SAME algorithm/contract as
+ * pc_remote_player_interpolate() (pc_remote_player.c): target_time and every snapshot's
+ * recv_local_frame share this process's own graph_dt_frame_time() domain; returns 0 if the slot has
+ * no snapshots yet, else fills *out_pos_x/y/z, *out_facing_angle and *out_moving and returns 1
+ * (interpolated between straddling snapshots, held at the newest if target_time is past all of them,
+ * held at the oldest if target_time is before all of them, snapped straight to the newer position on
+ * an implausible jump). Deliberately re-implemented locally (not shared with pc_remote_player.c)
+ * since that function is `static` to a different translation unit and operates on
+ * PCRemoteMoveSnapshot, a distinct type with a different ring-size constant -- duplicating this small,
+ * self-contained algorithm is clearer here than introducing a cross-file generic. */
+static int pcnetgame_npc_move_interpolate(const PCNetNpcMoveSlot* ns, double target_time, float* out_pos_x,
+                                          float* out_pos_y, float* out_pos_z, int16_t* out_facing_angle,
+                                          int* out_moving) {
+    int oldest, i, n;
+    const PCNetNpcMoveSnapshot* s0 = NULL;
+    const PCNetNpcMoveSnapshot* s1 = NULL;
+
+    n = ns->snapshot_count;
+    if (n == 0) {
+        return 0;
+    }
+
+    oldest = (ns->snapshot_head - n + PC_NETGAME_NPC_MOVE_RING_SIZE) % PC_NETGAME_NPC_MOVE_RING_SIZE;
+    for (i = 0; i < n; i++) {
+        int idx = (oldest + i) % PC_NETGAME_NPC_MOVE_RING_SIZE;
+        const PCNetNpcMoveSnapshot* snap = &ns->snapshots[idx];
+        if (snap->recv_local_frame <= target_time) {
+            s0 = snap;
+        } else if (s1 == NULL) {
+            s1 = snap;
+        }
+    }
+
+    *out_moving = 0;
+
+    if (s0 != NULL && s1 != NULL) {
+        double span = s1->recv_local_frame - s0->recv_local_frame;
+        float t = (span > 0.0) ? (float)((target_time - s0->recv_local_frame) / span) : 1.0f;
+        float dx = s1->pos_x - s0->pos_x;
+        float dy = s1->pos_y - s0->pos_y;
+        float dz = s1->pos_z - s0->pos_z;
+        float dist_sq = dx * dx + dy * dy + dz * dz;
+        s16 angle_delta;
+
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+
+        if (dist_sq > PC_NETGAME_NPC_MOVE_TELEPORT_DIST_SQ) {
+            *out_pos_x = s1->pos_x;
+            *out_pos_y = s1->pos_y;
+            *out_pos_z = s1->pos_z;
+            *out_moving = 0; /* a teleport/discontinuity, not a walk -- see Part 8 of the design */
+        } else {
+            *out_pos_x = s0->pos_x + dx * t;
+            *out_pos_y = s0->pos_y + dy * t;
+            *out_pos_z = s0->pos_z + dz * t;
+            *out_moving = dist_sq > PC_NETGAME_NPC_MOVE_MOVING_DIST_SQ;
+        }
+
+        /* Shortest-path angle interpolation -- same (s16) wraparound idiom as
+         * pc_remote_player_interpolate() / Actor_player_look_direction_check(). */
+        angle_delta = (s16)(s1->facing_angle - s0->facing_angle);
+        *out_facing_angle = (s16)(s0->facing_angle + (s16)((f32)angle_delta * t));
+    } else if (s0 != NULL) {
+        *out_pos_x = s0->pos_x;
+        *out_pos_y = s0->pos_y;
+        *out_pos_z = s0->pos_z;
+        *out_facing_angle = s0->facing_angle;
+    } else { /* s1 != NULL */
+        *out_pos_x = s1->pos_x;
+        *out_pos_y = s1->pos_y;
+        *out_pos_z = s1->pos_z;
+        *out_facing_angle = s1->facing_angle;
+    }
+
+    return 1;
+}
+
+/* See pc_net_game.h's doc comment for the full contract, in particular the slot-reuse guard. */
+int pc_net_game_get_npc_move_pose(int slot, uint16_t expected_npc_id, float* out_pos_x, float* out_pos_y,
+                                  float* out_pos_z, int16_t* out_facing_angle, int* out_moving,
+                                  uint8_t* out_action_type) {
+    PCNetNpcMoveSlot* ns;
+    double target_time;
+    int ok;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return 0;
+    }
+
+    ns = &s_npc_move_slot[slot];
+    if (!ns->have_frame) {
+        return 0; /* nothing received yet for this slot */
+    }
+    if (ns->cached_npc_id != expected_npc_id) {
+        /* Slot-reuse guard: the identity this ring cell was last filled under no longer matches the
+         * caller's own live population state (a departure/arrival already applied this slot
+         * differently). Discard the stale data now, so a coincidental future npc_id match can never
+         * resurrect it. */
+        printf("[NET][NPC] client: rejected NPC_MOVE pose slot %d -- identity mismatch (cached npc_id "
+               "0x%04X, current 0x%04X) -- slot reused, discarding stale ring\n",
+               slot, (unsigned)ns->cached_npc_id, (unsigned)expected_npc_id);
+        memset(ns, 0, sizeof(*ns));
+        return 0;
+    }
+    if (gamePT == NULL) {
+        return 0; /* no frame-time source to build a presentation timeline from */
+    }
+
+    target_time = graph_dt_frame_time(gamePT) - PC_NETGAME_NPC_MOVE_INTERP_DELAY_FRAMES;
+    ok = pcnetgame_npc_move_interpolate(ns, target_time, out_pos_x, out_pos_y, out_pos_z, out_facing_angle,
+                                        out_moving);
+    if (ok && out_action_type != NULL) {
+        /* N3 Channel A: action_type is coarse and carried as-is from the latest accepted sample --
+         * never interpolated (see PCNetNpcMoveSlot::last_action_type's doc comment). */
+        *out_action_type = ns->last_action_type;
+    }
+    return ok;
+}
+
+/* ---- N3 Channel B: villager is_home/hide/forced-schedule sync ---- */
+
+/* Host side. Called UNCONDITIONALLY (no caller-side role check needed, matching
+ * pc_net_game_notify_villager_arrival()'s own established pattern) once per frame per real,
+ * Save_t.animals[]-backed villager NPC_ACTOR -- from BOTH aNPC_actor_move_show_before() (visible) and
+ * aNPC_actor_move_hide() (hidden/culled), since this state must be tracked and broadcast regardless of
+ * hide status (see ac_npc_move.c_inc's aNPC_pc_host_check_state()). A no-op for single-player/client.
+ * Internally dirty-checks against s_npc_state_shadow[slot] and only sends on an actual is_home/hide/
+ * forced_type/forced-active change -- NOT on forced_timer's continuous per-frame countdown, which
+ * would otherwise make this fire every single frame while any forced override is active. A client that
+ * needs the exact forced_timer_remaining (e.g. a late joiner) gets it from the extended
+ * VILLAGER_SNAPSHOT instead (see pcnetgame_build_villager_snapshot()), which always carries the
+ * CURRENT value regardless of this change-detector. */
+void pc_net_game_notify_npc_state(int slot, uint16_t npc_id, uint8_t is_home, uint8_t hide, uint8_t forced_type,
+                                  int forced_timer) {
+    PCNetNpcStateShadow* sh;
+    PCNetGameNpcStateMsg msg;
+    uint8_t forced_active;
+    uint16_t timer_clamped;
+    int i;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return; /* malformed input from the caller -- defensive */
+    }
+
+    is_home = is_home ? 1 : 0;
+    hide = hide ? 1 : 0;
+    forced_active = (forced_timer > 0) ? 1 : 0;
+    timer_clamped = (forced_timer < 0) ? 0 : (forced_timer > 65535 ? 65535 : (uint16_t)forced_timer);
+
+    sh = &s_npc_state_shadow[slot];
+    if (sh->have_sent && sh->cached_npc_id == npc_id && sh->is_home == is_home && sh->hide == hide &&
+        sh->forced_type == forced_type && sh->forced_active == forced_active) {
+        return; /* unchanged since the last broadcast for this slot AND same occupant -- nothing to send */
+    }
+
+    sh->have_sent = 1;
+    sh->cached_npc_id = npc_id;
+    sh->is_home = is_home;
+    sh->hide = hide;
+    sh->forced_type = forced_type;
+    sh->forced_active = forced_active;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_NPC_STATE;
+    msg.slot = (uint8_t)slot;
+    msg.npc_id = npc_id;
+    msg.is_home = is_home;
+    msg.hide = hide;
+    msg.forced_type = forced_type;
+    msg.forced_timer_remaining = timer_clamped;
+    msg.state_seq = ++s_npc_state_seq_counter;
+
+    if (g_pc_verbose) {
+        printf("[NET][NPC] host: NPC_STATE change slot %d npc_id 0x%04X is_home=%d hide=%d forced_type=%d "
+               "forced_timer=%u seq=%u\n",
+               slot, (unsigned)npc_id, is_home, hide, forced_type, (unsigned)timer_clamped,
+               (unsigned)msg.state_seq);
+    }
+
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+        }
+    }
+}
+
+/* Client side: ingest one NPC_STATE. Applies the strict per-slot `state_seq > last_applied` guard
+ * (mirrors WORLD_META's own s_client_meta_seq convention) -- identity (npc_id) is deliberately NOT
+ * checked here, same rationale as pcnetgame_handle_client_npc_move(): the authoritative check belongs
+ * at CONSUME time (pc_net_game_get_npc_state()) against the caller's live Save_t.animals[slot].id.npc_id,
+ * never at receive time against whatever this cell happens to already hold. */
+static void pcnetgame_handle_client_npc_state(const PCNetGameNpcStateMsg* in) {
+    PCNetNpcStateSlot* ns;
+
+    if (in->slot >= ANIMAL_NUM_MAX) {
+        return; /* malformed */
+    }
+
+    ns = &s_npc_state_slot[in->slot];
+    if (ns->have_state && in->state_seq <= ns->last_applied_seq) {
+        return; /* stale, duplicate, or reordered relative to this slot's own stream */
+    }
+
+    ns->have_state = 1;
+    ns->last_applied_seq = in->state_seq;
+    ns->cached_npc_id = in->npc_id;
+    ns->is_home = in->is_home;
+    ns->hide = in->hide;
+    ns->forced_type = in->forced_type;
+    ns->forced_timer_remaining = in->forced_timer_remaining;
+
+    if (g_pc_verbose) {
+        printf("[NET][NPC] client: NPC_STATE applied slot %u npc_id 0x%04X is_home=%d hide=%d forced_type=%d "
+               "forced_timer=%u seq=%u\n",
+               (unsigned)in->slot, (unsigned)in->npc_id, in->is_home, in->hide, in->forced_type,
+               (unsigned)in->forced_timer_remaining, (unsigned)in->state_seq);
+    }
+}
+
+/* Client only: fills the out params with the latest applied NPC_STATE for slot, gated by the SAME
+ * slot-reuse identity guard pc_net_game_get_npc_move_pose() uses (expected_npc_id is the caller's own
+ * live Save_t.animals[slot].id.npc_id). Returns 1 if a state was written, 0 -- meaning the caller must
+ * not touch is_home/hide/forced_type/forced_timer at all -- if: not a READY client, out-of-range slot,
+ * nothing received yet for this slot, or an npc_id mismatch (slot-reuse; the stale cached state is
+ * discarded so it can never resurrect under a coincidental future match). */
+int pc_net_game_get_npc_state(int slot, uint16_t expected_npc_id, uint8_t* out_is_home, uint8_t* out_hide,
+                              uint8_t* out_forced_type, uint16_t* out_forced_timer_remaining) {
+    PCNetNpcStateSlot* ns;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return 0;
+    }
+
+    ns = &s_npc_state_slot[slot];
+    if (!ns->have_state) {
+        return 0;
+    }
+    if (ns->cached_npc_id != expected_npc_id) {
+        printf("[NET][NPC] client: rejected NPC_STATE slot %d -- identity mismatch (cached npc_id 0x%04X, "
+               "current 0x%04X) -- slot reused, discarding stale state\n",
+               slot, (unsigned)ns->cached_npc_id, (unsigned)expected_npc_id);
+        memset(ns, 0, sizeof(*ns));
+        return 0;
+    }
+
+    *out_is_home = ns->is_home;
+    *out_hide = ns->hide;
+    *out_forced_type = ns->forced_type;
+    *out_forced_timer_remaining = ns->forced_timer_remaining;
+    return 1;
+}
+
+/* Friendship/mail sync milestone: builds a PCNetGameFriendshipSnapshotEntryMsg for one (slot,
+ * memory_idx) pair directly from the host's current Save_t.animals[] -- returns 0 (nothing built)
+ * if that Anmmem_c entry is currently free (mNpc_CheckFreeAnimalMemory()), 1 otherwise. `slot` is
+ * NOT range-checked here (both call sites already keep it in [0, ANIMAL_NUM_MAX)). */
+static int pcnetgame_build_friendship_snapshot_entry(PCNetGameFriendshipSnapshotEntryMsg* fe, int slot,
+                                                      int memory_idx) {
+    Animal_c* animal = Save_GetPointer(animals[slot]);
+    Anmmem_c* memory = &animal->memories[memory_idx];
+
+    if (mNpc_CheckFreeAnimalMemory(memory) == TRUE) {
+        return 0;
+    }
+
+    memset(fe, 0, sizeof(*fe));
+    fe->msg_type = (uint8_t)PC_NETGAME_MSG_FRIENDSHIP_SNAPSHOT_ENTRY;
+    fe->slot = (uint8_t)slot;
+    fe->friendship = (int8_t)memory->friendship;
+    memcpy(&fe->letter_info, &memory->letter_info, sizeof(fe->letter_info));
+    memcpy(fe->player_name, memory->memory_player_id.player_name, PC_NETGAME_NAME_LEN);
+    memcpy(fe->land_name, memory->memory_player_id.land_name, PC_NETGAME_LAND_LEN);
+    fe->player_id = memory->memory_player_id.player_id;
+    fe->land_id = memory->memory_player_id.land_id;
+    fe->world_seq = s_world_seq;
+    fe->has_letter = memory->letter_info.exists ? 1 : 0;
+    _Static_assert(sizeof(fe->letter) == sizeof(memory->letter), "PCNetGameFriendshipSnapshotEntryMsg.letter size drifted from Anmplmail_c");
+    memcpy(fe->letter, &memory->letter, sizeof(fe->letter));
+    return 1;
+}
+
+/* Host side: FRIENDSHIP_REQUEST from a READY peer -- see mNpc_AddFriendship()'s doc comment
+ * (m_npc.c) for the full contract. Resolves (find-or-create) the memory slot from the SENDING
+ * PEER's own cached identity (never anything the peer's payload claims about who it is), applies
+ * the SAME mNpc_AddFriendship() the host's own local interactions use, then broadcasts the result
+ * to every READY client including the requester. Ignored (no reply) for a non-READY peer, an
+ * out-of-range slot, an unoccupied villager slot, or if this peer's identity was somehow never
+ * cached (defensive only -- ready_identity_valid is set unconditionally at READY). */
+static void pcnetgame_handle_host_friendship_request(PCNetPeerId peer, const PCNetGameFriendshipRequestMsg* in) {
+    PersonalID_c pid;
+    int friendship;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (!s_host_peer[peer].ready_identity_valid) {
+        return; /* should not happen -- set unconditionally at READY */
+    }
+    if (in->slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+
+    memcpy(pid.player_name, s_host_peer[peer].ready_player_name, PC_NETGAME_NAME_LEN);
+    memcpy(pid.land_name, s_host_peer[peer].ready_land_name, PC_NETGAME_LAND_LEN);
+    pid.player_id = s_host_peer[peer].ready_player_id;
+    pid.land_id = s_host_peer[peer].ready_land_id;
+
+    friendship = mNpc_PcHostResolveAndApplyFriendshipDelta((int)in->slot, &pid, (int)in->delta);
+    if (friendship < 0) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] host: peer %d FRIENDSHIP_REQUEST slot %u could not be applied (bad/unoccupied slot "
+                   "or no free memory)\n", (int)peer, (unsigned)in->slot);
+        }
+        return;
+    }
+
+    /* mNpc_PcHostResolveAndApplyFriendshipDelta() calls the real mNpc_AddFriendship() internally,
+     * which (running here on the HOST) already broadcasts PC_NETGAME_MSG_FRIENDSHIP_UPDATE itself
+     * via its own post-apply pc_net_game_notify_local_friendship_change() call -- see that
+     * function's doc comment. Calling it again here would just double-send the same result. */
+    printf("[NET][NPC] host: peer %d friendship slot %u delta %d -> %d\n", (int)peer, (unsigned)in->slot,
+           (int)in->delta, friendship);
+}
+
+/* Client side: FRIENDSHIP_UPDATE from the host. Strict `>` staleness rule -- see
+ * PCNetGameFriendshipUpdateMsg's own doc comment. */
+static void pcnetgame_handle_client_friendship_update(const PCNetGameFriendshipUpdateMsg* in) {
+    PersonalID_c pid;
+
+    if (!pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->world_seq <= s_client_friendship_seq) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] client: stale FRIENDSHIP_UPDATE slot %u world_seq %u <= %u ignored\n",
+                   (unsigned)in->slot, (unsigned)in->world_seq, (unsigned)s_client_friendship_seq);
+        }
+        return;
+    }
+    memcpy(pid.player_name, in->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(pid.land_name, in->land_name, PC_NETGAME_LAND_LEN);
+    pid.player_id = in->player_id;
+    pid.land_id = in->land_id;
+    mNpc_PcApplyFriendshipUpdate((int)in->slot, &pid, (int)in->friendship);
+    s_client_friendship_seq = in->world_seq;
+    printf("[NET][NPC] client: friendship slot %u -> %d (world_seq %u)\n", (unsigned)in->slot,
+           (int)in->friendship, (unsigned)in->world_seq);
+}
+
+/* Client side: one FRIENDSHIP_SNAPSHOT_ENTRY (late-join/reconnect). `>=` rule -- see the struct's
+ * own doc comment. Only advances s_client_friendship_seq (never regresses it), matching
+ * VILLAGER_SNAPSHOT's own convention. */
+static void pcnetgame_handle_client_friendship_snapshot_entry(const PCNetGameFriendshipSnapshotEntryMsg* in) {
+    PersonalID_c pid;
+
+    if (!s_client_snap_active || !pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->world_seq < s_client_friendship_seq) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] client: stale FRIENDSHIP_SNAPSHOT_ENTRY slot %u world_seq %u < %u ignored\n",
+                   (unsigned)in->slot, (unsigned)in->world_seq, (unsigned)s_client_friendship_seq);
+        }
+        return;
+    }
+    memcpy(pid.player_name, in->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(pid.land_name, in->land_name, PC_NETGAME_LAND_LEN);
+    pid.player_id = in->player_id;
+    pid.land_id = in->land_id;
+    mNpc_PcApplyFriendshipUpdate((int)in->slot, &pid, (int)in->friendship);
+    if (in->has_letter) {
+        mNpc_PcApplyMailSnapshotEntry((int)in->slot, &pid, in->letter_info, in->letter, sizeof(in->letter));
+    }
+    if (in->world_seq > s_client_friendship_seq) {
+        s_client_friendship_seq = in->world_seq;
+    }
+}
+
+/* Host side: MAIL_REQUEST from a READY peer -- see mNpc_SendMailtoNpc()'s doc comment (m_npc.c)
+ * for the full contract. Ignored for a non-READY peer (defensive only; the caller already checks
+ * pc_net_game_role() == CLIENT before ever sending one). */
+static void pcnetgame_handle_host_mail_request(PCNetPeerId peer, const PCNetGameMailRequestMsg* in) {
+    Mail_c mail;
+    int slot;
+    int friendship = 0;
+    uint8_t letter_info = 0;
+    uint8_t letter[258];
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+
+    _Static_assert(sizeof(in->mail) == sizeof(Mail_c), "PCNetGameMailRequestMsg.mail size drifted from Mail_c");
+    memcpy(&mail, in->mail, sizeof(mail));
+
+    slot = mNpc_PcApplyMailToVillagerMemory(&mail, &friendship, &letter_info, letter, sizeof(letter));
+    if (slot < 0) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] host: peer %d MAIL_REQUEST could not be delivered (unresolvable recipient)\n",
+                   (int)peer);
+        }
+        return;
+    }
+
+    printf("[NET][NPC] host: peer %d mail delivered to slot %d (friendship now %d)\n", (int)peer, slot, friendship);
+    pc_net_game_notify_local_mail_delivered(slot, mail.header.sender.personalID.player_name,
+                                            mail.header.sender.personalID.land_name,
+                                            mail.header.sender.personalID.player_id,
+                                            mail.header.sender.personalID.land_id, friendship, letter_info, letter);
+}
+
+/* Client side: MAIL_DELIVERED from the host. Strict `>` staleness rule, exactly mirroring
+ * FRIENDSHIP_UPDATE. */
+static void pcnetgame_handle_client_mail_delivered(const PCNetGameMailDeliveredMsg* in) {
+    PersonalID_c pid;
+
+    if (!pcnetgame_client_can_apply_world()) {
+        return;
+    }
+    if (in->world_seq <= s_client_friendship_seq) {
+        if (g_pc_verbose) {
+            printf("[NET][NPC] client: stale MAIL_DELIVERED slot %u world_seq %u <= %u ignored\n",
+                   (unsigned)in->slot, (unsigned)in->world_seq, (unsigned)s_client_friendship_seq);
+        }
+        return;
+    }
+    memcpy(pid.player_name, in->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(pid.land_name, in->land_name, PC_NETGAME_LAND_LEN);
+    pid.player_id = in->player_id;
+    pid.land_id = in->land_id;
+    mNpc_PcApplyFriendshipUpdate((int)in->slot, &pid, (int)in->friendship);
+    mNpc_PcApplyMailSnapshotEntry((int)in->slot, &pid, in->letter_info, in->letter, sizeof(in->letter));
+    s_client_friendship_seq = in->world_seq;
+    printf("[NET][NPC] client: mail delivered to slot %u (friendship now %d, world_seq %u)\n", (unsigned)in->slot,
+           (int)in->friendship, (unsigned)in->world_seq);
+}
+
+/* See pc_net_game.h. Called from mNpc_AddFriendship()'s client-intercept branch. */
+void pc_net_game_request_friendship_delta(int slot, int delta) {
+    PCNetGameFriendshipRequestMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+    if (delta < -127 || delta > 127) {
+        return; /* malformed input from the caller -- defensive */
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_FRIENDSHIP_REQUEST;
+    msg.slot = (uint8_t)slot;
+    msg.delta = (int8_t)delta;
+    pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+}
+
+/* See pc_net_game.h. Called from mNpc_AddFriendship() (m_npc.c) AFTER it has already applied
+ * `friendship` locally on the host (or in single-player, where this is a no-op). */
+void pc_net_game_notify_local_friendship_change(int slot, const uint8_t* player_name, const uint8_t* land_name,
+                                                uint16_t player_id, uint16_t land_id, int friendship) {
+    PCNetGameFriendshipUpdateMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+
+    ++s_world_seq;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_FRIENDSHIP_UPDATE;
+    msg.slot = (uint8_t)slot;
+    msg.friendship = (int8_t)friendship;
+    memcpy(msg.player_name, player_name, PC_NETGAME_NAME_LEN);
+    memcpy(msg.land_name, land_name, PC_NETGAME_LAND_LEN);
+    msg.player_id = player_id;
+    msg.land_id = land_id;
+    msg.world_seq = s_world_seq;
+    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+}
+
+/* See pc_net_game.h. Called from mNpc_SendMailtoNpc()'s client-intercept branch. The host
+ * re-resolves the recipient from `mail`'s own header -- `recipient_anm_idx` is accepted only for a
+ * cheap early "does this even look like a villager" check by the caller and is otherwise unused.
+ * `mail_size` must be exactly sizeof(Mail_c) (the caller passes sizeof(*mail)); kept as a plain
+ * (void pointer, size) pair, not Mail_c*, so pc_net_game.h's declaration of this function stays
+ * decomp-independent, matching every other function in that header. */
+void pc_net_game_request_mail_delivery(int recipient_anm_idx, const void* mail, size_t mail_size) {
+    PCNetGameMailRequestMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    (void)recipient_anm_idx;
+    if (mail_size != sizeof(msg.mail)) {
+        return; /* defensive: caller/decomp Mail_c size mismatch -- never send a truncated/garbage mail */
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_MAIL_REQUEST;
+    memcpy(msg.mail, mail, mail_size);
+    pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+}
+
+/* See pc_net_game.h. Called from mNpc_PcApplyMailToVillagerMemory() (m_npc.c) AFTER the host has
+ * already applied the delivery locally (or, in single-player, never -- mNpc_SendMailtoNpc()'s own
+ * unmodified body runs directly and this notify function is simply never reached). */
+void pc_net_game_notify_local_mail_delivered(int slot, const uint8_t* player_name, const uint8_t* land_name,
+                                             uint16_t player_id, uint16_t land_id, int friendship,
+                                             uint8_t letter_info, const uint8_t* letter) {
+    PCNetGameMailDeliveredMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+
+    ++s_world_seq;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_MAIL_DELIVERED;
+    msg.slot = (uint8_t)slot;
+    msg.friendship = (int8_t)friendship;
+    msg.letter_info = letter_info;
+    memcpy(msg.player_name, player_name, PC_NETGAME_NAME_LEN);
+    memcpy(msg.land_name, land_name, PC_NETGAME_LAND_LEN);
+    msg.player_id = player_id;
+    msg.land_id = land_id;
+    msg.world_seq = s_world_seq;
+    memcpy(msg.letter, letter, sizeof(msg.letter));
+    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
 }

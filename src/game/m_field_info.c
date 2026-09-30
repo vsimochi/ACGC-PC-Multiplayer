@@ -14,6 +14,9 @@
                                  * dirty-tracking hooks only (they set bits / log, never change a
                                  * write); see mFI_BlockUtNumtoFGSet, mFI_UtNumtoFGSet_common,
                                  * mFI_ClearDeposit and mFI_SetDeposit below. */
+#include "pc_net_game.h" /* World Ecology T3: pc_net_game_field_tile_reserved() -- see
+                          * mFI_ClearHoleBlock_sub()'s own doc for why a block-clear must not wipe a
+                          * tile a bury commit is mid-flight through. */
 #endif
 
 static mCoBG_Collision_u l_edge_ut = { { 0, 31, 31, 31, 31, 31, mCoBG_ATTRIBUTE_GRASS0 } };
@@ -2394,6 +2397,69 @@ static int mFI_CheckDigDiffPosArea(xyz_t wpos0, xyz_t wpos1) {
 
 typedef int (*mFI_DIG_CHECK_PROC)(mActor_name_t*, xyz_t);
 
+/* World Ecology T0 (reference for the FUTURE T2 dig/buried-item networking task) -- DOCUMENTATION
+ * ONLY, zero behavioral change. dig_check[]/mFI_GetDigStatus() below classify what a shovel swing at
+ * `wpos` does; the mFI_DIGSTATUS_* names (m_field_info.h) do NOT line up 1:1 with what each check
+ * function's name suggests (flagged by the World Ecology consolidation audit), so this table is the
+ * verified ground truth T2 needs to avoid missing one of these paths. Checked in dig_check[] ARRAY
+ * ORDER (mFI_GetDigStatus() takes the FIRST match; mCoBG_CheckHole(wpos) must ALSO be true, i.e. a
+ * hole-shaped collision volume already exists at wpos, or none of these ever run and status stays
+ * mFI_DIGSTATUS_CANCEL from the function's own initializer):
+ *   [0] mFI_DIGSTATUS_MISS     mFI_CheckNothing()       -- always FALSE; never actually selects.
+ *   [1] mFI_DIGSTATUS_CANCEL   mFI_CheckDigHole()       -- TRUE iff *item is a hole-type value
+ *                              (HOLE_START..HOLE_END or HOLE_SHINE -- mFI_CheckItemNoHole()) AND the
+ *                              tile's deposit bit is ON: an ALREADY-BURIED hole (ordinary buried item,
+ *                              buried pitfall, or shine spot -- see [5] below) that ANOTHER dig check
+ *                              would otherwise classify. Despite the CANCEL name this is not "abort the
+ *                              dig": mFI_GetDigStatus() still returns this status to its caller, which
+ *                              decides what CANCEL means (in practice: nothing further extracted here).
+ *   [2] mFI_DIGSTATUS_FILLIN   mFI_CheckDigHoleFillin() -- TRUE iff *item is a hole-type value AND the
+ *                              deposit bit is OFF: an EMPTY hole with nothing buried in it -- filling
+ *                              a hole back in. World Ecology's existing DIG_BURIED (Stage 1, kind 1)
+ *                              never reaches this path: it only ever accepts a tile whose deposit bit
+ *                              is ON (pcnetgame_validate_and_resolve_dig(), pc_net_game.c).
+ *                              MUTATION: fills the hole (not modeled by any existing network path).
+ *                              T2's job.
+ *   [3] mFI_DIGSTATUS_DIG      mFI_CheckDigNoItem()     -- TRUE iff *item == EMPTY_NO: ordinary ground,
+ *                              digging a BRAND NEW hole. MUTATION: creates a hole where none existed.
+ *                              Not modeled by any existing network path (DIG_BURIED only handles a tile
+ *                              that is ALREADY buried). T2's job.
+ *   [4] mFI_DIGSTATUS_PUT_ITEM mFI_CheckDigRemoveItem() -- TRUE iff *item is one of: a flower
+ *                              (FLOWER_LEAVES_PANSIES0..FLOWER_TULIP2), a tree stump (TREE_STUMP001..4,
+ *                              TREE_PALM_STUMP001..4, CEDAR_TREE_STUMP001..4, GOLD_TREE_STUMP001..4), a
+ *                              grass tuft (GRASS_A..C), or a sapling (TREE_SAPLING and every fruit/
+ *                              species/DEAD_* sapling variant). Despite the "PUT_ITEM" name this is a
+ *                              REMOVAL: digging up a flower/stump/sapling/grass and (per the actual
+ *                              caller, not this classifier) granting it into the digger's pockets. This
+ *                              is the ADDITIONAL active shared-mutation path the World Ecology
+ *                              consolidation audit flagged beyond ordinary buried-item digging -- NOT
+ *                              covered by DIG_BURIED (Stage 1, kind 1), which requires the deposit bit
+ *                              to be ON; none of these values are ever buried-flagged. T2 must add its
+ *                              own handling for this case or player-planted flowers/saplings/stumps
+ *                              silently desync between host and clients.
+ *   [5] mFI_DIGSTATUS_GET_ITEM mFI_CheckDigGetItem()    -- two sub-cases: (a) deposit bit ON and *item
+ *                              is NOT a hole-type value: an ordinary BURIED ITEM -- this is exactly
+ *                              World Ecology's existing DIG_BURIED (Stage 1, kind 1;
+ *                              pcnetgame_validate_and_resolve_dig()/pcnetgame_host_commit_dig_buried(),
+ *                              pc_net_game.c) and needs no new T2 work. (b) deposit bit OFF and *item is
+ *                              a BURIED_PITFALL_HOLE_START..END or SHINE_SPOT value: a buried PITFALL or
+ *                              a SHINE SPOT -- converts *item via bg_item_fg_sub_dig2take_conv() before
+ *                              returning TRUE. NEITHER of these two are covered by the existing
+ *                              DIG_BURIED validator (which requires the deposit bit ON AND rejects any
+ *                              value that fails mNT_check_unknown()/EMPTY_NO, but never specifically
+ *                              recognizes BURIED_PITFALL_HOLE_START..END or SHINE_SPOT under a CLEAR
+ *                              deposit bit).
+ *                              T2's job: pitfall triggers/shine-spot digging are a DISTINCT case from
+ *                              ordinary DIG_BURIED and must be classified and networked separately.
+ * Not reached through dig_check[] at all (mCoBG_CheckHole(wpos) FALSE): a tile with no hole-shaped
+ * collision -- status stays mFI_DIGSTATUS_CANCEL with *item left at whatever mFI_GetUnitFG() read (or
+ * EMPTY_NO if dig_item_p was NULL). This is the ordinary "nothing to dig here" case and needs no T2
+ * networking of its own.
+ * No new classifier function is added here: pcfa_get_tile()/pcfa_get_deposit() (pc_net_game.c) already
+ * expose everything dig_check[]'s checks read (raw item value + deposit bit) in persistent town-tile
+ * space, so a future T2 equivalent of pcnetgame_validate_and_resolve_dig() can reproduce each branch
+ * above directly against those two host-authoritative reads without needing a shared helper -- adding
+ * one now, unused, would be speculative code this milestone's own scope explicitly warns against. */
 extern int mFI_GetDigStatus(mActor_name_t* item, xyz_t wpos, int golden_shovel) {
     int status = mFI_DIGSTATUS_CANCEL;
     mActor_name_t* dig_item_p = mFI_GetUnitFG(wpos);
@@ -2446,7 +2512,21 @@ extern int mFI_GetDigStatus(mActor_name_t* item, xyz_t wpos, int golden_shovel) 
     return status;
 }
 
-static void mFI_ClearHoleBlock_sub(mActor_name_t* fg_items_p) {
+/* World Ecology T3 residual-risk fix: vanilla wipes every HOLE/HOLE_SHINE tile in a block
+ * unconditionally on block construction/scroll, bypassing pc_field_authority's write hook entirely and
+ * ignoring any in-flight reservation -- this could destroy an item mid-flight through a legitimate bury
+ * commit (a client already cleared its own pocket, and the host's tile gets wiped out from under the
+ * reservation before COMMIT ever runs). Guarded with `bx`/`bz` (this function's own block coordinates)
+ * so each entry's GLOBAL ut_x/ut_z can be recovered (mFI_GetUtNum()'s own inverse: entry i is local
+ * (i % UT_X_NUM, i / UT_X_NUM) within the block, so global ut_x = bx*UT_X_NUM + i%UT_X_NUM, ut_z =
+ * bz*UT_Z_NUM + i/UT_X_NUM) and checked against pc_net_game_field_tile_reserved() -- host-only by that
+ * function's own gating (always 0 for single-player/a client, so this is a complete no-op for every
+ * role except HOST, exactly the role where the race is possible). A reserved tile is left untouched
+ * this pass; it converges to its final value once the reservation resolves (COMMIT writes it, or the
+ * reservation expires/aborts and the tile is unchanged) and the ordinary FIELD_UPDATE/dirty-flush
+ * machinery picks it up from there -- no different from any other tile this function would have left
+ * alone anyway (a non-hole value). */
+static void mFI_ClearHoleBlock_sub(mActor_name_t* fg_items_p, int bx, int bz) {
     int i;
 
     if (fg_items_p == NULL) {
@@ -2454,10 +2534,20 @@ static void mFI_ClearHoleBlock_sub(mActor_name_t* fg_items_p) {
     }
 
     for (i = 0; i < UT_TOTAL_NUM; i++) {
-        if (*fg_items_p >= HOLE_START && *fg_items_p <= HOLE_END) {
+        if ((*fg_items_p >= HOLE_START && *fg_items_p <= HOLE_END) || *fg_items_p == HOLE_SHINE) {
+#ifdef TARGET_PC
+            /* Bug 1 fix: a client must never locally mutate this shared state -- hole expiry is
+             * host-authoritative. Without this, a connected client would silently wipe its own copy of
+             * a still-live shared hole tile (this function runs on every process, not just the host),
+             * diverging from the host/other clients until a resync. HOST and single-player are
+             * unaffected: pc_net_game_world_is_host_authoritative() is false for both. */
+            if (!pc_net_game_world_is_host_authoritative() &&
+                !pc_net_game_field_tile_reserved(bx * UT_X_NUM + (i % UT_X_NUM), bz * UT_Z_NUM + (i / UT_X_NUM))) {
+                fg_items_p[0] = EMPTY_NO;
+            }
+#else
             fg_items_p[0] = EMPTY_NO;
-        } else if (*fg_items_p == HOLE_SHINE) {
-            fg_items_p[0] = EMPTY_NO;
+#endif
         }
 
         fg_items_p++;
@@ -2465,7 +2555,7 @@ static void mFI_ClearHoleBlock_sub(mActor_name_t* fg_items_p) {
 }
 
 extern void mFI_ClearHoleBlock(int bx, int bz) {
-    mFI_ClearHoleBlock_sub(mFI_BkNumtoUtFGTop(bx, bz));
+    mFI_ClearHoleBlock_sub(mFI_BkNumtoUtFGTop(bx, bz), bx, bz);
 }
 
 extern void mFI_ClearBeecomb(int bx, int bz) {

@@ -3907,6 +3907,74 @@ static void mTG_plant_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         inv_ovl->shovel_flag == TRUE) {
         mTG_island_check_plant_plant(plant_item);
         mTG_island_check_fruit_plant(plant_item);
+#ifdef TARGET_PC
+        /* World Ecology T3 (bugfix): same treatment as mTG_bury_proc()'s own shovel-into-hole seam
+         * below (this IS the same bury mechanic -- the shovel branch of the plant menu action, just
+         * reached via a different tag) -- see that seam's own doc for the shared reasoning, including
+         * why pocket-clear timing is deliberately deferred to pcnetgame_handle_client_bury_result()
+         * rather than cleared here at menu-action time. */
+        if (pc_net_game_world_is_host_authoritative()) {
+            int ut_x, ut_z, hole_no;
+            int ok = FALSE;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos)) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                ok = pc_net_game_request_bury(idx, (int)plant_item, ut_x, ut_z, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (ok) {
+                /* Request sent (or coalesced with one already in flight) -- do NOT clear the pocket
+                 * here; pcnetgame_handle_client_bury_result() clears it once the provisional accept is
+                 * confirmed and the slot is re-verified to still hold this item. item == EMPTY_NO below
+                 * only suppresses Setup_main_Putin_scoop's own local field-mutation branch for the
+                 * animation -- it never touches Now_Private. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+                mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+                mTG_close_window(submenu, menu_info, TRUE);
+            } else {
+                /* Nothing was sent (malformed input / not in town / no save loaded / stale claimed
+                 * item) -- the pocket was never touched, so there is nothing to undo; just show the
+                 * normal "can't do that" feedback instead of closing the menu on a no-op. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_PLANT);
+            }
+            return;
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            int ut_x = 0, ut_z = 0, hole_no;
+            int handled = FALSE;
+            int ut_resolved = mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos);
+            if (ut_resolved) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                handled = pc_net_game_host_local_bury(idx, ut_x, ut_z, (int)plant_item, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (handled) {
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+            } else if (mTG_host_put_tile_free(&inv_ovl->shovel_pos) &&
+                       (!ut_resolved || pc_net_game_host_bury_tile_is_valid(ut_x, ut_z))) {
+                /* Not a legal bury per the host's own authoritative validation, and NOT currently
+                 * reserved by a peer's in-flight drop/pickup/bury either -- fall back to vanilla's own
+                 * local mutation + pocket clear exactly as single-player would.
+                 * Bug 3 fix: also re-confirm the tile is STILL a valid hole target right here,
+                 * immediately before this vanilla mutation -- pc_net_game_host_local_bury() returning 0
+                 * is ambiguous (could be "not a hole" OR any other unrelated validation failure), and a
+                 * racing peer's BURY may have committed into this exact hole between menu-open and this
+                 * commit attempt. Without this re-check, vanilla's own placement could then fail (tile no
+                 * longer a valid hole) while the pocket is cleared unconditionally below -- a real item
+                 * loss. ut_x/ut_z here are the same coordinates mFI_Wpos2UtNum() just resolved above for
+                 * this same shovel_pos, so this call needs no extra resolution. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, Now_Private->inventory.pockets[idx],
+                                                            FALSE);
+                mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+            } else {
+                /* The tile is currently reserved by a peer's in-flight action -- refuse the host's own
+                 * local bury outright rather than risk landing on top of / overwriting whatever that
+                 * peer's commit is about to write (mirrors mTG_host_put_tile_free()'s own reservation
+                 * gate for the ordinary field-drop path). Nothing is mutated; the item stays put. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_PLANT);
+                return;
+            }
+            mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+            mTG_close_window(submenu, menu_info, TRUE);
+            return;
+        }
+#endif
         mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, Now_Private->inventory.pockets[idx], FALSE);
         mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
         mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
@@ -4992,6 +5060,88 @@ static void mTG_bury_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     if (!mFI_CheckInIsland() ||
         (!mSP_SearchItemCategoryPriority(item, mSP_KIND_FURNITURE, mSP_LISTTYPE_HOMEPAGE, NULL) &&
          !mSP_SearchItemCategoryPriority(item, mSP_KIND_FURNITURE, mSP_LISTTYPE_SPECIALPRESENT, NULL))) {
+#ifdef TARGET_PC
+        /* World Ecology T3 (bugfix): on a host-authoritative client, the real field mutation
+         * (mPlib_request_main_putin_scoop_from_submenu() with the real item eventually reaches
+         * player_drop_entry_proc() via Player_actor_setup_main_Putin_scoop() --
+         * m_player_main_putin_scoop.c_inc) is replaced by a BURY_REQUEST; the animation still plays
+         * (item == EMPTY_NO so Setup_main_Putin_scoop's own local-mutation branch is simply never
+         * entered -- see the defensive choke gate there too).
+         *
+         * Pocket-clear timing is deliberately DEFERRED to pcnetgame_handle_client_bury_result(),
+         * matching DROP's proven-safe pattern (pc_net_game_request_drop() /
+         * pcnetgame_handle_client_drop_result()) instead of vanilla's own immediate-clear-at-menu-time
+         * timing. Vanilla can never fail once this menu action closes, so its immediate clear is truly
+         * a point of no return there; the NETWORKED path can genuinely fail for reasons that have
+         * nothing to do with vanilla's own risk shape -- a lost network race, the pending request's own
+         * retry timeout expiring, an owner-stamp mismatch, or an outright host reject -- so naively
+         * matching vanilla's timing here would introduce a NEW, network-only way to lose the item with
+         * no chance of recovery. See pc_net_game_request_bury()'s own doc for the full contract.
+         *
+         * On the HOST's own local bury, pc_net_game_host_local_bury() does the ENTIRE action (field
+         * write + pocket clear) itself -- so it must NOT also fall through to the plain single-player
+         * path below, which would clear the pocket a second time and could re-enter the outcome table
+         * against a tile the host-local call already mutated. */
+        if (pc_net_game_world_is_host_authoritative()) {
+            int ut_x, ut_z, hole_no;
+            int ok = FALSE;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos)) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                ok = pc_net_game_request_bury(idx, (int)item, ut_x, ut_z, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (ok) {
+                /* Request sent (or coalesced with one already in flight) -- do NOT clear the pocket
+                 * here; see the doc above. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+                mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+                mTG_close_window(submenu, menu_info, TRUE);
+            } else {
+                /* Nothing was sent (malformed input / not in town / no save loaded / stale claimed
+                 * item) -- the pocket was never touched, so there is nothing to undo; just show the
+                 * normal "can't do that" feedback instead of closing the menu on a no-op. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+            }
+            return;
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            int ut_x = 0, ut_z = 0, hole_no;
+            int handled = FALSE;
+            int ut_resolved = mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos);
+            if (ut_resolved) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                handled = pc_net_game_host_local_bury(idx, ut_x, ut_z, (int)item, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (handled) {
+                /* pc_net_game_host_local_bury() already performed the ENTIRE action (field write +
+                   pocket clear) itself -- only the presentation-only animation is still needed here. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+            } else if (mTG_host_put_tile_free(&inv_ovl->shovel_pos) &&
+                       (!ut_resolved || pc_net_game_host_bury_tile_is_valid(ut_x, ut_z))) {
+                /* Not a legal bury per the host's own authoritative validation (e.g. the shovel_pos
+                   tile is not actually a hole), and NOT currently reserved by a peer's in-flight
+                   drop/pickup/bury either -- fall back to vanilla's own local mutation + pocket clear
+                   exactly as single-player would, since pc_net_game_host_local_bury() performed no
+                   mutation at all in this case.
+                   Bug 3 fix: pc_net_game_host_bury_tile_is_valid() re-confirms, right before this
+                   vanilla mutation, that the tile is STILL a valid hole -- a 0 return from
+                   pc_net_game_host_local_bury() is ambiguous (any of several unrelated validation
+                   failures), and a racing peer's BURY may have committed into this exact hole between
+                   menu-open and this commit attempt; without this re-check, vanilla's own placement
+                   could fail while the pocket is still cleared unconditionally below. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, item, FALSE);
+                mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+            } else {
+                /* The tile is currently reserved by a peer's in-flight action -- refuse the host's own
+                   local bury outright rather than risk landing on top of / overwriting whatever that
+                   peer's commit is about to write (mirrors mTG_host_put_tile_free()'s own reservation
+                   gate for the ordinary field-drop path). Nothing is mutated; the item stays put. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+                return;
+            }
+            mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+            mTG_close_window(submenu, menu_info, TRUE);
+            return;
+        }
+#endif
         mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, item, FALSE);
         mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
         mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
@@ -5154,7 +5304,26 @@ static void mTG_exchange_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                         (ITEM_IS_SCOOP(Now_Private->equipment) || ITEM_IS_GOLD_SCOOP(Now_Private->equipment))) {
                         mTG_island_check_plant_plant(item);
                         mTG_island_check_fruit_plant(item);
-                        mPlib_request_main_putin_scoop_from_submenu((xyz_t*)menu_info->data2, item, demo_gold_scoop);
+#ifdef TARGET_PC
+                        /* World Ecology T3: DEFENSIVE gate only -- this path (GET_SCOOP's own
+                         * full-pockets overflow-to-hole flow) is not reachable by a network client in
+                         * this build (clients never enter mPlayer_INDEX_GET_SCOOP locally -- see
+                         * pc_net_game_request_dig_buried()'s own doc), so there is no bury_seam
+                         * network request wired here yet. Added purely for correctness/future-proofing
+                         * so a host-authoritative client can never reach this real local mutation with a
+                         * nonzero item if this path ever DOES become reachable later -- matching the
+                         * defensive choke gate in Player_actor_setup_main_Putin_scoop() (belt-and-
+                         * suspenders, per this milestone's own design brief). The item is presentation-
+                         * only here; if this path is ever wired for real, it needs its own
+                         * pc_net_game_request_bury()-style call with a genuine pocket_slot_idx. */
+                        if (pc_net_game_world_is_host_authoritative()) {
+                            mPlib_request_main_putin_scoop_from_submenu((xyz_t*)menu_info->data2, EMPTY_NO,
+                                                                        demo_gold_scoop);
+                        } else
+#endif
+                        {
+                            mPlib_request_main_putin_scoop_from_submenu((xyz_t*)menu_info->data2, item, demo_gold_scoop);
+                        }
                     } else if (item == ITM_SIGNBOARD) {
                         mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_SIGN);
                         return;

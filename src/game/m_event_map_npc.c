@@ -7,6 +7,10 @@
 #include "m_field_info.h"
 #include "m_common_data.h"
 #include "ac_set_npc_manager.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* N3 finalization pass: pc_net_game_world_is_host_authoritative() -- gates
+                          * the RNG-bearing event-joint-NPC-selection functions below (N3-D). */
+#endif
 
 // clang-format off
 static int l_event_map_type_table[] = {
@@ -214,6 +218,22 @@ static void mEvMN_GetNpcIdxRandom(u8* animal_idx, int max) {
     u16 animal_bitfield = 0;
     int i;
 
+#ifdef TARGET_PC
+    /* N3 finalization pass (N3-D, event authority): this function's RANDOM(count) picks (below)
+     * choose WHICH villagers join an event -- an authoritative, RNG-bearing decision that a
+     * host-authoritative client must never independently roll from the shared RANDOM() stream (this
+     * is the deeper event-arrangement layer the original N3 audit deferred; gating it host-only is the
+     * minimum fix this finalization pass requires -- see this pass's own N3-D write-up for why
+     * synchronizing the RESULT is deferred rather than attempted here). Returns without writing
+     * *animal_idx at all, leaving the caller's buffer untouched -- callers (mEvMN_GetNpcJointEv()) only
+     * ever read entries this function is expected to have filled, and on a client the event-arrangement
+     * system itself is not yet network-authoritative, so an unfilled buffer here does not aggravate the
+     * existing deferred-authority gap in any new way. */
+    if (pc_net_game_world_is_host_authoritative()) {
+        return;
+    }
+#endif
+
     for (i = 0; i < ANIMAL_NUM_MAX; i++) {
         if (mNpc_CheckFreeAnimalPersonalID(&animal->id) == FALSE) {
             animal_count++;
@@ -327,6 +347,16 @@ static void mEvMN_SetNpcJointEvRandom(u8* animal_idx, int max) {
     int req_count = 0;
     int i;
     int j;
+
+#ifdef TARGET_PC
+    /* N3 finalization pass (N3-D, event authority): same RNG-authority reasoning as
+     * mEvMN_GetNpcIdxRandom() above -- this function's RANDOM(count) picks (below) choose which
+     * villagers backfill required event joint-NPC slots, an authoritative decision a
+     * host-authoritative client must not independently roll. Returns without modifying animal_idx. */
+    if (pc_net_game_world_is_host_authoritative()) {
+        return;
+    }
+#endif
 
     for (i = 0; i < ANIMAL_NUM_MAX; i++) {
         if (mNpc_CheckFreeAnimalPersonalID(&animal[i].id) == FALSE) {
@@ -590,9 +620,12 @@ extern int mEvMN_GetJointEventRandomNpc(mActor_name_t* npc_name_p) {
     if (mEvMN_GetNpcIdxListJointEvent(&animal_idx_p, &npc_max) == TRUE) {
         sel_idx = RANDOM(npc_max);
         sel_npc_idx = animal_idx_p[sel_idx];
-        animal = Save_GetPointer(animals[sel_npc_idx]);
-        *npc_name_p = animal->id.npc_id;
-        res = TRUE;
+
+        if (sel_npc_idx != 0xFF && sel_npc_idx < ANIMAL_NUM_MAX) {
+            animal = Save_GetPointer(animals[sel_npc_idx]);
+            *npc_name_p = animal->id.npc_id;
+            res = TRUE;
+        }
     }
 
     return res;

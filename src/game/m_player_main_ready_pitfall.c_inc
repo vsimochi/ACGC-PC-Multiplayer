@@ -19,6 +19,25 @@ static void Player_actor_setup_main_Ready_pitfall(ACTOR* actorx, GAME* game) {
     int part_table_idx;
 
     player->pitfall_flag = FALSE;
+
+#ifdef TARGET_PC
+    /* World Ecology T-dig fix (C): this is the TRUE point of no return for a pitfall fall -- vanilla can
+     * still roll back a pending fall request before Player_actor_setup_main_Ready_pitfall() actually
+     * runs (see Player_actor_check_pitfall()'s own call site), but once this setup executes, the fall
+     * WILL happen (Player_actor_request_proc_index_fromReady_pitfall() unconditionally chains into
+     * Player_actor_request_main_fall_pitfall_all() on end_flag). Deliberately does NOT return early: per
+     * pc_net_game_request_pitfall_consume()'s own doc, the local fall animation/lifecycle stays fully
+     * vanilla and optimistic regardless of the request's outcome -- there is no grant and no resource, so
+     * nothing needs to be gated on the network round trip here. A reject is reconciled later via the
+     * RESULT's echoed tile value. */
+    if (pc_net_game_world_is_host_authoritative()) {
+        int ux, uz;
+        if (mFI_Wpos2UtNum(&ux, &uz, req_ready_pifall_p->pos)) {
+            pc_net_game_request_pitfall_consume(ux, uz);
+        }
+    }
+#endif
+
     Player_actor_SetupItem_Base1(actorx, mPlayer_ANIM_GURATUKU1, -5.0f, &anim1_idx, &part_table_idx);
     cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(kf0_p, 0.0f, 1000.0f, 0.0f, 0, 0, DEG2SHORT_ANGLE2(90.0f));
     cKF_SkeletonInfo_R_AnimationMove_ct_base(&actorx->world.position, &req_ready_pifall_p->pos,

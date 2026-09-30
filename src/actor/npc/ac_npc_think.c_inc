@@ -520,9 +520,27 @@ static void aNPC_think_demo_allways(NPC_ACTOR* nactorx, GAME_PLAY* play) {
     }
 }
 
+/* World Ecology T-dig fix: on a host-authoritative CLIENT (pc_net_game_world_is_host_authoritative()),
+ * this process's own simulated villagers must never independently trigger a pitfall -- the HOST alone
+ * is authoritative over the shared field (Save_t.fg/deposit), and a client-side pit_fall_proc() call
+ * would both play a local visual for a pitfall the host may not agree still exists AND (via
+ * pcnetgame_host_tile_reserved_by()-less vanilla code) never actually reach the host's own committed
+ * tile write at all -- a silent desync source distinct from ac_npc_move.c_inc's own movement-authority
+ * gate (aNPC_move_common() there gates POSITION application; this gates the pitfall MUTATION path,
+ * which is a separate think()-time decision that can fire independently of movement). This mirrors the
+ * existing N3 pattern of disabling client-side NPC world-mutation elsewhere in this file (see
+ * ac_npc_move.c_inc:669's own doc for the movement-authority precedent this generalizes). The HOST's own
+ * villagers are unaffected (pc_net_game_world_is_host_authoritative() is FALSE on a host and in
+ * single-player) and still trigger pitfalls through this same unmodified vanilla path. */
 static int aNPC_chk_pitfall(NPC_ACTOR* nactorx) {
     mActor_name_t* fg_p = nactorx->condition_info.under_fg_p;
     int ret = FALSE;
+
+#ifdef TARGET_PC
+    if (pc_net_game_world_is_host_authoritative()) {
+        return FALSE;
+    }
+#endif
 
     if (fg_p != NULL) {
         if (ITEM_IS_BURIED_PITFALL_HOLE(*fg_p) && aNPC_IS_NRM_NPC(nactorx)) {

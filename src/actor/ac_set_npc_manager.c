@@ -8,6 +8,17 @@
 #include "m_random_field.h"
 #include "m_event_map_npc.h"
 
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* N3 finalization pass: pc_net_game_world_is_host_authoritative() -- used to
+                          * gate the single authoritative Save_t field write (Animal_c::is_home) in
+                          * aSNMgr_set_stay_home_status() below. The safe-spawn-tile RNG picks
+                          * (aSNMgr_get_safe_utnum_in_block/_guest) are NOT gated: a design review found
+                          * the tile they pick is purely a transient spawn position that N2's NPC_MOVE
+                          * stream immediately overrides, and the global qrand()/RANDOM() stream was
+                          * never synchronized between host and client in the first place, so consuming
+                          * it here does not create or worsen any divergence. */
+#endif
+
 static void aSNMgr_actor_ct(ACTOR* actorx, GAME* game);
 static void aSNMgr_actor_dt(ACTOR* actorx, GAME* game);
 static void aSNMgr_actor_move(ACTOR* actorx, GAME* game);
@@ -487,6 +498,18 @@ static int aSNMgr_get_safe_utnum_in_block(int* safe_ux, int* safe_uz, int bx, in
     int i;
     int j;
 
+    /* N3 finalization pass (Bug 1 fix): this function's RANDOM(candidate_num) pick below used to be
+     * gated off on a host-authoritative client (returning FALSE unconditionally), on the theory that
+     * a client must never independently consume RNG entropy that could diverge from the host. A
+     * design review found that reasoning does not hold here: the global RANDOM()/qrand() stream is
+     * never synchronized between host and client anywhere in this codebase, so this draw cannot
+     * diverge anything that was ever in sync; and the *ux/*uz tile it picks is only a transient
+     * spawn position (aSNMgr_set_make_npc -> setupActor_proc) that gets overwritten the instant N2's
+     * NPC_MOVE position stream delivers a real authoritative position for this actor. Gating this
+     * call caused a regression: guest villagers never spawned on clients and some regular spawns
+     * silently dropped (this function returning FALSE == "no safe tile found"). Left ungated,
+     * restoring original behavior. */
+
     if (col_p != NULL && fg_p != NULL) {
         bzero(candidate_ut, sizeof(candidate_ut));
         for (i = 0; i < UT_Z_NUM; i++) {
@@ -550,6 +573,12 @@ static int aSNMgr_get_safe_utnum_guest(int* safe_ux, int* safe_uz, int bx, int b
     u8 type = mFI_BkNum2BlockType(bx, bz);
     int gate_count;
     mRF_gate_c* gate_p = mRF_BlockTypeDirect2GateData(&gate_count, type, l_gate_direct[way]);
+
+    /* N3 finalization pass (Bug 1 fix): see aSNMgr_get_safe_utnum_in_block() above -- this function's
+     * RANDOM(gate_count) pick of which town-edge gate tile a guest villager appears at was previously
+     * gated off on a host-authoritative client, which meant guest villagers never spawned there at
+     * all. Same reasoning applies: the tile is a transient spawn position N2 immediately overrides,
+     * and the global RNG stream was never synchronized in the first place. Left ungated. */
 
     if (gate_p != NULL) {
         int idx = RANDOM(gate_count);
@@ -638,12 +667,25 @@ static void aSNMgr_move_event_arrange(SET_NPC_MANAGER_ACTOR* manager, int bx, in
         set_ret = mEvMN_GetEventSetUtInBlockMapIdx(&ux, &uz, info_p->event_map_idx, i);
         if (set_ret == TRUE) {
             idx = *idx_p;
-            mFI_BkandUtNum2Wpos(&list_p[idx].position, bx, bz, ux, uz);
-            info_p->pos[i].x = list_p[idx].position.x;
-            info_p->pos[i].y = list_p[idx].position.y;
-            info_p->pos[i].z = list_p[idx].position.z;
-            animal_p[idx].is_home = FALSE;
-            joint_event |= 1 << idx;
+
+            /* N3 safety fix: on a host-authoritative client the participant-selection RNG
+             * (mEvMN_GetNpcIdxRandom()/mEvMN_SetNpcJointEvRandom()) is gated and never fills in
+             * real indices, so every entry of info_p->save_p->animal_idx stays at its 0xFF
+             * sentinel (see aSNMgr_set_event_info() above). Without this guard idx==0xFF would be
+             * used unchecked below to index list_p[idx]/animal_p[idx] and to build 1 << idx,
+             * corrupting Save_t.animals[255].is_home and invoking UB. This can also occur in
+             * vanilla single-player when fewer eligible villagers exist than the event needs
+             * (same latent issue mEvMN_GetJointEventRandomNpc() already guards against), so the
+             * guard applies unconditionally, without #ifdef TARGET_PC. Skip just this slot and
+             * keep processing the rest. */
+            if (idx != 0xFF && idx < ANIMAL_NUM_MAX) {
+                mFI_BkandUtNum2Wpos(&list_p[idx].position, bx, bz, ux, uz);
+                info_p->pos[i].x = list_p[idx].position.x;
+                info_p->pos[i].y = list_p[idx].position.y;
+                info_p->pos[i].z = list_p[idx].position.z;
+                animal_p[idx].is_home = FALSE;
+                joint_event |= 1 << idx;
+            }
         }
 
         idx_p++;
@@ -1036,7 +1078,18 @@ static void aSNMgr_set_stay_home_status(SET_NPC_MANAGER_ACTOR* manager, int anm_
     u32* count_p;
 
     list_p->position = list_p->house_position;
-    animal_p->is_home = TRUE;
+#ifdef TARGET_PC
+    /* N3 finalization pass: is_home is an authoritative Save_t field now owned by the host's
+     * NPC_STATE (msg 28) channel. On a host-authoritative client this event-start fallback must not
+     * locally decide the villager is home -- the host will deliver the real is_home/hide/forced_type
+     * state atomically via NPC_STATE. The position write above stays unconditional: it's presentational
+     * (keeps the villager from visually lingering in the event plaza on a client too) and has no
+     * authoritative meaning of its own. */
+    if (!pc_net_game_world_is_host_authoritative())
+#endif
+    {
+        animal_p->is_home = TRUE;
+    }
     if (winfo_p != NULL) {
         mNpcW_ClearNpcWalkInfo(winfo_p, 1);
         count_p = manager->npc_info.count_p[anm_idx];
@@ -1180,6 +1233,16 @@ static void aSNMgr_set_npc_regular(SET_NPC_MANAGER_ACTOR* manager) {
                         if (make_flag == TRUE &&
                             aSNMgr_set_make_npc(manager->npc_info.make, animal_p->id.npc_id, bx, bz, ux, uz, info_p, i) != -1) {
                             manager->npc_info.appear |= 1 << i;
+#ifdef TARGET_PC
+                            {
+                                extern int g_pc_verbose;
+                                if (g_pc_verbose) {
+                                    printf("[NPC] regular villager actor spawned slot %d npc_id 0x%04X block (%d,%d) "
+                                           "tile (%d,%d)\n",
+                                           i, (unsigned)animal_p->id.npc_id, bx, bz, ux, uz);
+                                }
+                            }
+#endif
                         }
                     }
                 }
@@ -1224,6 +1287,16 @@ static void aSNMgr_set_npc_guest(SET_NPC_MANAGER_ACTOR* manager) {
                         aSNMgr_get_safe_utnum(&ux, &uz, bx, bz, *winfo_p) == TRUE &&
                         aSNMgr_set_make_npc(manager->npc_info.make, animal_p->id.npc_id, bx, bz, ux, uz, info_p, i) != -1) {
                         manager->npc_info.appear |= 1 << i;
+#ifdef TARGET_PC
+                        {
+                            extern int g_pc_verbose;
+                            if (g_pc_verbose) {
+                                printf("[NPC] guest villager actor spawned slot %d npc_id 0x%04X block (%d,%d) "
+                                       "tile (%d,%d)\n",
+                                       i, (unsigned)animal_p->id.npc_id, bx, bz, ux, uz);
+                            }
+                        }
+#endif
                     }
                 }
             }

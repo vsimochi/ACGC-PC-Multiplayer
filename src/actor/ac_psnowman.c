@@ -12,6 +12,10 @@
 #include "m_quest.h"
 #include "sys_matrix.h"
 #include "m_rcp.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* World Ecology: snowmen -- pc_net_game_world_is_host_authoritative(),
+                          * pc_net_game_request_snowman_break() */
+#endif
 
 static void aPSM_actor_ct(ACTOR* actor, GAME* game);
 static void aPSM_actor_dt(ACTOR* actor, GAME* game);
@@ -114,8 +118,26 @@ static void aPSM_actor_move(ACTOR* actor, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
 
     if (mRlib_PSnowman_NormalTalk(actor, play, &snowman->speed, aPSM_set_talk_info) == FALSE) {
-        if (mFI_GetUnitFG(actor->world.position) != NULL) {
-            mSN_ClearSnowman(&actor->npc_id);
+#ifdef TARGET_PC
+        /* World Ecology: snowmen -- send SNOWMAN_BREAK and deliberately leave actor->npc_id (and the
+         * field) untouched: if the host REJECTS this break, this actor's own restore-on-destroy
+         * (restore_fgdata(), m_actor.c, still gated on restore_fg == TRUE, unchanged) heals the tile
+         * back on its own the moment Actor_delete() below runs it -- no special-case rollback needed.
+         * If the host ACCEPTS it, the incoming FIELD_UPDATE(EMPTY_NO) and SNOWMAN_STATE (slot cleared)
+         * converge to the exact same end state moments later. Uses the 4-deep client queue (NOT a
+         * single-in-flight guard) -- see pc_net_game_request_snowman_break()'s own doc. */
+        if (pc_net_game_world_is_host_authoritative()) {
+            int ut_x, ut_z;
+
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, actor->world.position)) {
+                pc_net_game_request_snowman_break(ut_x, ut_z);
+            }
+        } else
+#endif
+        {
+            if (mFI_GetUnitFG(actor->world.position) != NULL) {
+                mSN_ClearSnowman(&actor->npc_id);
+            }
         }
         aPSMAN_MakeBreakEffect(snowman, game);
         mQst_BackSnowman(actor->world.position);

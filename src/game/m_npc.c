@@ -385,6 +385,27 @@ extern void mNpc_AddFriendship(Anmmem_c* memory, int amount) {
     }
 #endif
 
+#ifdef TARGET_PC
+    /* Friendship/mail sync milestone: on a network CLIENT, this function must never mutate `memory`
+     * itself -- the host is the single authority for every player's friendship value (mood/
+     * best-friend logic reads ACROSS every player's memory slots, so a client-local mutation here
+     * would silently diverge from the host's and every OTHER client's view of this villager; see the
+     * design note above PCNetGameFriendshipRequestMsg in pc_net_game.c). Instead, resolve which
+     * Save_t.animals[] slot owns `memory` and hand the delta off to the network layer; the host's own
+     * PC_NETGAME_MSG_FRIENDSHIP_UPDATE broadcast (applied by mNpc_PcApplyFriendshipUpdate()) is the
+     * only thing that will ever actually change this client's copy of `memory->friendship`. Single-
+     * player and the host itself fall through to the original vanilla logic below unchanged -- the
+     * host's OWN local interactions (its own now_private) still resolve `memory` exactly as they
+     * always have; only its RESULT gets broadcast (see the notify call at the end of this function). */
+    if (memory != NULL && pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        int slot = mNpc_FindAnimalSlotForMemory(memory);
+        if (slot != -1) {
+            pc_net_game_request_friendship_delta(slot, amount);
+        }
+        return;
+    }
+#endif
+
     friendship = memory->friendship + amount;
 
 #ifndef BUGFIXES
@@ -400,6 +421,20 @@ extern void mNpc_AddFriendship(Anmmem_c* memory, int amount) {
     } else {
         memory->friendship = friendship;
     }
+
+#ifdef TARGET_PC
+    /* Single-player and host-local-interaction path: notify the network layer of the RESULT (a
+     * no-op for single-player -- see pc_net_game_notify_local_friendship_change()'s own guard). */
+    if (memory != NULL) {
+        int slot = mNpc_FindAnimalSlotForMemory(memory);
+        if (slot != -1) {
+            pc_net_game_notify_local_friendship_change(slot, memory->memory_player_id.player_name,
+                                                       memory->memory_player_id.land_name,
+                                                       memory->memory_player_id.player_id,
+                                                       memory->memory_player_id.land_id, memory->friendship);
+        }
+    }
+#endif
 }
 
 extern int mNpc_CheckFreeAnimalMemory(Anmmem_c* memory) {
@@ -1354,6 +1389,38 @@ extern int mNpc_SendMailtoNpc(Mail_c* mail) {
     Anmplmail_c* plmail;
     int letter_rank;
     Animal_c* anm;
+
+#ifdef TARGET_PC
+    /* Friendship/mail sync milestone: on a network CLIENT, this function must never mutate the
+     * shared villager's Anmmem_c itself -- see mNpc_PcApplyMailToVillagerMemory()'s doc comment for
+     * why (the host is the single authority; a client-local mutation would diverge from the host's
+     * and every OTHER client's view of this villager). The ONE piece of this function that IS safe
+     * (and correct) to run locally is mNpc_SetMailCondOtherLand()'s PRIVATE now_private->remail
+     * bookkeeping -- it is about THIS process's own local player, so it belongs here, not on the
+     * host (see mNpc_PcApplyMailToVillagerMemory()'s doc comment on why the host path skips it).
+     * The rest of the send (letter storage, friendship, quest/contest progress) is sent to the host
+     * as a PC_NETGAME_MSG_MAIL_REQUEST; the host's resulting PC_NETGAME_MSG_MAIL_DELIVERED broadcast
+     * (applied by mNpc_PcApplyMailSnapshotEntry()/mNpc_PcApplyFriendshipUpdate()) is the only thing
+     * that will ever mutate this client's own copy of that villager's memory. Single-player and the
+     * host's own local send fall through to the original vanilla body below, unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        AnmPersonalID_c client_anm_id;
+
+        if (mMl_get_npcinfo_from_mail_name(&client_anm_id, &mail->header.recipient) == TRUE) {
+            int client_anm_idx = mNpc_SearchAnimalPersonalID(&client_anm_id);
+
+            if (client_anm_idx != -1) {
+                Animal_c* client_animal = Save_Get(animals) + client_anm_idx;
+
+                if (mLd_PlayerManKindCheck() == TRUE) {
+                    mNpc_SetMailCondOtherLand(client_animal, mail->content.body);
+                }
+                pc_net_game_request_mail_delivery(client_anm_idx, mail, sizeof(*mail));
+            }
+        }
+        return TRUE; /* return value is unused at every call site -- see m_post_office.c */
+    }
+#endif
 
     if (mMl_get_npcinfo_from_mail_name(&anm_id, &mail->header.recipient) == TRUE) {
         anm = Save_Get(animals);
@@ -2942,15 +3009,28 @@ static void mNpc_AddNpc_inKamakura(mFM_move_actor_c* move_actor, int move_actor_
 
     if (kamakura_event != NULL) {
         int idx = *kamakura_event;
-        mActor_name_t npc_id = Save_Get(animals[idx]).id.npc_id;
 
-        mEvMN_GetEventNpcName(&npc_id, mEv_EVENT_KAMAKURA, idx, 0);
-        move_actor->name_id = npc_id;
-        move_actor->ut_x = 4;
-        move_actor->ut_z = 7;
-        move_actor->npc_info_idx = idx;
-        move_actor->arg = -1;
-        mFI_SetMoveActorBitData_ON(move_actor_idx, bx, bz);
+        /* N3 safety fix: on a host-authoritative client the participant-selection RNG
+         * (mEvMN_GetNpcIdxRandom()/mEvMN_SetNpcJointEvRandom()) is gated and never fills in a real
+         * index, so this buffer's single entry (see aSNMgr_set_event_info(), src/actor/ac_set_npc_manager.c)
+         * stays at its 0xFF sentinel. Without this guard idx==0xFF would be used unchecked below to
+         * index Save_Get(animals[idx]) -- a large struct read far out of bounds -- and would propagate
+         * the invalid index into move_actor->npc_info_idx. This can also occur in vanilla single-player
+         * under the same latent-shortage conditions mEvMN_GetJointEventRandomNpc() and
+         * aSNMgr_move_event_arrange() already guard against, so the guard applies unconditionally,
+         * without #ifdef TARGET_PC. Skip creating this Kamakura NPC's move-actor entry entirely rather
+         * than fabricate one from a garbage index. */
+        if (idx != 0xFF && idx < ANIMAL_NUM_MAX) {
+            mActor_name_t npc_id = Save_Get(animals[idx]).id.npc_id;
+
+            mEvMN_GetEventNpcName(&npc_id, mEv_EVENT_KAMAKURA, idx, 0);
+            move_actor->name_id = npc_id;
+            move_actor->ut_x = 4;
+            move_actor->ut_z = 7;
+            move_actor->npc_info_idx = idx;
+            move_actor->arg = -1;
+            mFI_SetMoveActorBitData_ON(move_actor_idx, bx, bz);
+        }
     }
 }
 
@@ -4631,6 +4711,12 @@ extern void mNpc_PcApplyVillagerArrival(int slot, u16 npc_id, u8 reserved_block_
 
     Save_Set(now_npc_max, new_now_npc_max);
 
+    /* N3 FIX S3: mNpc_ClearAnimalInfo() above cleared this slot's schedule-area registration
+     * (mNPS_reset_schedule_area()); re-register it now that animal->id (in particular id.looks, just
+     * set by mNpc_SetAnimalInfoNpcIdx() above) is final for this arrival, or mNPS_schedule_manager()
+     * would silently skip this villager forever. */
+    mNPS_pc_register_schedule_area(&animal->id);
+
     mNpc_InitNpcList(Common_Get(npclist), ANIMAL_NUM_MAX);
     mNpc_SetNpcList(Common_Get(npclist), Save_Get(animals), ANIMAL_NUM_MAX, FALSE);
 }
@@ -4674,6 +4760,12 @@ extern void mNpc_PcApplyVillagerSnapshotSlot(int slot, u16 npc_id, u8 home_block
     animal->is_home = is_home ? TRUE : FALSE;
 
     Save_Set(now_npc_max, new_now_npc_max);
+
+    /* N3 FIX S3: same re-registration as mNpc_PcApplyVillagerArrival() above -- mNpc_ClearAnimalInfo()
+     * just cleared this slot's schedule-area entry, and a snapshot-applied slot needs it back just as
+     * much as an ARRIVAL-applied one (both leave the slot occupied indefinitely without a subsequent
+     * mNPS_set_all_schedule_area() pass, which only runs at save/start-data init). */
+    mNPS_pc_register_schedule_area(&animal->id);
 
     mNpc_InitNpcList(Common_Get(npclist), ANIMAL_NUM_MAX);
     mNpc_SetNpcList(Common_Get(npclist), Save_Get(animals), ANIMAL_NUM_MAX, FALSE);
@@ -4776,6 +4868,346 @@ extern void mNpc_DebugForceRemove(void) {
         }
     }
     printf("[NET][NPC] mNpc_DebugForceRemove: no removable villager found -- nothing removed\n");
+}
+
+/* Friendship/mail sync milestone: which Save_t.animals[] slot owns `memory` (an Anmmem_c* already
+ * resolved by ordinary decomp code, e.g. a talk/quest manager's memory pointer) -- a small linear
+ * scan by pointer RANGE (memory falls inside that slot's own memories[ANIMAL_MEMORY_NUM] array),
+ * mirroring how aNPC_get_animal_idx() (ac_npc_action.c_inc) already finds a slot by Animal_c*
+ * pointer identity for animal_relations[]. Returns -1 if `memory` is NULL or does not point inside
+ * any slot's memories[] (should not happen for a pointer that came from decomp memory-resolution
+ * code, but defensive). */
+extern int mNpc_FindAnimalSlotForMemory(Anmmem_c* memory) {
+    Animal_c* animal = Save_Get(animals);
+    int i;
+
+    if (memory == NULL) {
+        return -1;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        if (memory >= animal->memories && memory < animal->memories + ANIMAL_MEMORY_NUM) {
+            return i;
+        }
+        animal++;
+    }
+    return -1;
+}
+
+/* Friendship/mail sync milestone, host side: resolve (find-or-create, exactly mirroring
+ * mNpc_SetAnimalLastTalk()'s own find-or-create pattern) the Anmmem_c slot for `pid` on villager
+ * `slot`, then apply the real mNpc_AddFriendship() to it -- used for a delta that arrived from a
+ * remote peer's local interaction (pc_net_game.c's pcnetgame_handle_host_friendship_request()),
+ * with `pid` being THAT PEER's own cached identity, never anything the request itself claims.
+ * Returns the finalized (already-clamped 0..127) friendship value, or -1 if `slot` is out of range,
+ * unoccupied, or no free memory slot could be found/evicted. Never rolls any RNG. */
+extern int mNpc_PcHostResolveAndApplyFriendshipDelta(int slot, PersonalID_c* pid, int delta) {
+    Animal_c* animal;
+    Anmmem_c* memory;
+    int memory_idx;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || pid == NULL) {
+        return -1;
+    }
+    animal = Save_GetPointer(animals[slot]);
+    if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC) {
+        return -1; /* no villager occupies this slot */
+    }
+
+    memory_idx = mNpc_GetAnimalMemoryIdx(pid, animal->memories, ANIMAL_MEMORY_NUM);
+    if (memory_idx == -1) {
+        memory_idx = mNpc_ForceGetFreeAnimalMemoryIdx(animal, animal->memories, ANIMAL_MEMORY_NUM);
+        if (memory_idx == -1) {
+            return -1;
+        }
+        memory = animal->memories + memory_idx;
+        mNpc_SetAnimalMemory(pid, &animal->id, memory);
+    } else {
+        memory = animal->memories + memory_idx;
+    }
+
+    mNpc_AddFriendship(memory, delta); /* host path: also broadcasts FRIENDSHIP_UPDATE itself */
+    return memory->friendship;
+}
+
+/* Friendship/mail sync milestone, client side: applies a host-broadcast absolute friendship value
+ * (FRIENDSHIP_UPDATE, or one FRIENDSHIP_SNAPSHOT_ENTRY/MAIL_DELIVERED's own friendship field) to
+ * this client's own local Anmmem_c for `slot`, resolving (find-or-create) the memory entry by `pid`
+ * exactly like the host does -- never via mNpc_AddFriendship() (which would treat `friendship` as a
+ * DELTA and/or re-enter the client-intercept network path). Silently ignored if `slot` is out of
+ * range or currently unoccupied on this client (can legitimately race a DEPARTURE this client has
+ * not applied yet; the next VILLAGER_SNAPSHOT/DEPARTURE clears the whole slot including memories
+ * anyway) or if no free memory slot could be found/evicted. */
+extern void mNpc_PcApplyFriendshipUpdate(int slot, PersonalID_c* pid, int friendship) {
+    Animal_c* animal;
+    Anmmem_c* memory;
+    int memory_idx;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || pid == NULL) {
+        return;
+    }
+    animal = Save_GetPointer(animals[slot]);
+    if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC) {
+        return;
+    }
+
+    memory_idx = mNpc_GetAnimalMemoryIdx(pid, animal->memories, ANIMAL_MEMORY_NUM);
+    if (memory_idx == -1) {
+        memory_idx = mNpc_ForceGetFreeAnimalMemoryIdx(animal, animal->memories, ANIMAL_MEMORY_NUM);
+        if (memory_idx == -1) {
+            return;
+        }
+        memory = animal->memories + memory_idx;
+        mNpc_SetAnimalMemory(pid, &animal->id, memory);
+    } else {
+        memory = animal->memories + memory_idx;
+    }
+
+    if (friendship < 0) {
+        friendship = 0;
+    } else if (friendship > 127) {
+        friendship = 127;
+    }
+    memory->friendship = (s8)friendship;
+}
+
+/* Friendship/mail sync milestone, client side: applies a host-broadcast letter/letter_info outcome
+ * (FRIENDSHIP_SNAPSHOT_ENTRY's has_letter branch, or MAIL_DELIVERED) to this client's own local
+ * Anmmem_c for `slot` -- resolves the memory entry by `pid` exactly like
+ * mNpc_PcApplyFriendshipUpdate() (call that first for the friendship value; this only handles the
+ * letter/letter_info fields). `letter`/`letter_size` must describe exactly sizeof(Anmplmail_c) bytes
+ * (a size mismatch is dropped defensively -- never a partial copy into Anmplmail_c). Silently
+ * ignored under the same conditions as mNpc_PcApplyFriendshipUpdate(). */
+extern void mNpc_PcApplyMailSnapshotEntry(int slot, PersonalID_c* pid, u8 letter_info, const u8* letter,
+                                          int letter_size) {
+    Animal_c* animal;
+    Anmmem_c* memory;
+    int memory_idx;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || pid == NULL || letter == NULL ||
+        (size_t)letter_size != sizeof(memory->letter)) {
+        return;
+    }
+    animal = Save_GetPointer(animals[slot]);
+    if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC) {
+        return;
+    }
+
+    memory_idx = mNpc_GetAnimalMemoryIdx(pid, animal->memories, ANIMAL_MEMORY_NUM);
+    if (memory_idx == -1) {
+        memory_idx = mNpc_ForceGetFreeAnimalMemoryIdx(animal, animal->memories, ANIMAL_MEMORY_NUM);
+        if (memory_idx == -1) {
+            return;
+        }
+        memory = animal->memories + memory_idx;
+        mNpc_SetAnimalMemory(pid, &animal->id, memory);
+    } else {
+        memory = animal->memories + memory_idx;
+    }
+
+    memcpy(&memory->letter_info, &letter_info, sizeof(memory->letter_info));
+    memcpy(&memory->letter, letter, sizeof(memory->letter));
+}
+
+/* Friendship/mail sync milestone, host side: host-authoritative counterpart of
+ * mNpc_SendMailtoNpc() for mail that arrived over the network from a remote peer (see
+ * pc_net_game.c's pcnetgame_handle_host_mail_request()).
+ *
+ * Mirrors mNpc_SendMailtoNpc()'s original body exactly, with ONE deliberate narrowing: it always
+ * takes mNpc_SetMailCondThisLand() (which only writes the shared `memory`) instead of going through
+ * mNpc_SetRemailCond()'s land check, which can also call mNpc_SetMailCondOtherLand() -- that
+ * function writes Common_Get(now_private)->remail, i.e. THIS PROCESS's own local player's PRIVATE
+ * save. On the HOST, "this process's local player" is whoever is physically playing on the host
+ * machine, NOT the remote sender -- calling it here would silently attribute a remote player's mail
+ * action to the host's own save. This is an intentional, narrow scope cut: the "other land"
+ * remail-reply-awareness feature (a minor convenience for a letter sent to a villager from a
+ * DIFFERENT town) is not networked -- the SENDING client's own mNpc_SendMailtoNpc() client-intercept
+ * branch already runs that bookkeeping correctly, locally, against ITS OWN now_private, before this
+ * request is even sent (see that function below). Every other side effect (letter storage,
+ * friendship, first-job/contest quest progress) is preserved exactly, unabridged, including the
+ * internal mNpc_AddFriendship() call (which, running here on the HOST, broadcasts its own
+ * FRIENDSHIP_UPDATE -- see that function's doc comment). In practice mLd_PlayerManKindCheck() is
+ * FALSE for every villager the population-sync milestone manages (multiplayer here is multiple
+ * humans sharing ONE host town), so this narrowing is moot for ordinary shared-town mail.
+ *
+ * Returns the recipient's Save_t.animals[] index on success (filling *out_friendship and
+ * *out_letter_info, and *out_letter if letter_buf_size == sizeof(Anmplmail_c)), or -1 if the
+ * recipient cannot be resolved (bad/missing AnmPersonalID match, no free memory slot). */
+extern int mNpc_PcApplyMailToVillagerMemory(Mail_c* mail, int* out_friendship, u8* out_letter_info, u8* out_letter,
+                                            int letter_buf_size) {
+    Animal_c* animal;
+    AnmPersonalID_c anm_id;
+    int anm_idx;
+    int memory_idx;
+    Anmmem_c* memory;
+    Anmplmail_c* plmail;
+    int letter_rank;
+    Animal_c* anm;
+
+    if (out_friendship != NULL) {
+        *out_friendship = 0;
+    }
+    if (out_letter_info != NULL) {
+        *out_letter_info = 0;
+    }
+
+    if (mMl_get_npcinfo_from_mail_name(&anm_id, &mail->header.recipient) != TRUE) {
+        return -1;
+    }
+    anm = Save_Get(animals);
+    anm_idx = mNpc_SearchAnimalPersonalID(&anm_id);
+    if (anm_idx == -1) {
+        return -1;
+    }
+
+    animal = anm + anm_idx;
+    memory_idx = mNpc_GetAnimalMemoryIdx(&mail->header.sender.personalID, animal->memories, ANIMAL_MEMORY_NUM);
+
+    if (memory_idx == -1) {
+        memory_idx = mNpc_ForceGetFreeAnimalMemoryIdx(animal, animal->memories, ANIMAL_MEMORY_NUM);
+        if (memory_idx < 0) {
+            return -1;
+        }
+        mPr_CopyPersonalID(&animal->memories[memory_idx].memory_player_id, &mail->header.sender.personalID);
+    } else {
+        mNpc_SetPresentCloth(animal, &mail->header.sender.personalID, mail->present);
+    }
+
+    memory = animal->memories + memory_idx;
+    plmail = &memory->letter;
+    memory->letter_info.exists = TRUE;
+    mNpc_ClearAnimalMail(plmail);
+    mNpc_Mail2AnimalMail(plmail, mail);
+    letter_rank = mNpc_SetMailCondThisLand(memory, mail->content.body);
+
+    if (mEv_CheckFirstJob() == TRUE) {
+        mQst_errand_c* first_job = mQst_GetFirstJobData();
+
+        if ((first_job->base.quest_kind == mQst_ERRAND_FIRSTJOB_SEND_LETTER ||
+             first_job->base.quest_kind == mQst_ERRAND_FIRSTJOB_SEND_LETTER2) &&
+            first_job->base.progress != 0) {
+            first_job->base.progress = 3;
+            memory->letter_info.send_reply = FALSE;
+        }
+    } else {
+        int friendship = 0;
+
+        if (mLd_PlayerManKindCheck() == FALSE) {
+            int occur_idx = mQst_GetOccuredContestIdx(mQst_CONTEST_KIND_LETTER);
+            if (occur_idx == anm_idx) {
+                mQst_SetReceiveLetter(&animal->contest_quest, &mail->header.sender.personalID, mail->content.body,
+                                      mail->present);
+                memory->letter_info.send_reply = FALSE;
+            }
+        }
+
+        friendship += 3;
+        if (letter_rank == mNpc_LETTER_RANK_BAD) {
+            friendship += -5;
+        }
+        if (mail->present != EMPTY_NO) {
+            friendship += 3;
+        }
+
+        mNpc_AddFriendship(memory, friendship);
+    }
+
+    if (out_friendship != NULL) {
+        *out_friendship = memory->friendship;
+    }
+    if (out_letter_info != NULL) {
+        memcpy(out_letter_info, &memory->letter_info, sizeof(*out_letter_info));
+    }
+    if (out_letter != NULL && (size_t)letter_buf_size == sizeof(*plmail)) {
+        memcpy(out_letter, plmail, sizeof(*plmail));
+    }
+
+    return anm_idx;
+}
+
+/* TEST-ONLY (see pc_main.c's --force-friendship-delta and pc_net_game.c's
+ * pcnetgame_run_friendship_mail_test_triggers()). Finds the first occupied Save_t.animals[] slot
+ * and applies `delta` via the REAL mNpc_AddFriendship() (its own TARGET_PC branch dispatches
+ * correctly whether this process is a network client -- sends a request -- or the host/single-
+ * player -- applies + broadcasts) for the CURRENT local player's own memory entry, found/created
+ * exactly like mNpc_SetAnimalLastTalk() does (never a separate, test-only resolution path). No-op
+ * if there is no occupied villager slot or no local save loaded. */
+extern void mNpc_DebugForceFriendshipDelta(int delta) {
+    Animal_c* anm = Save_Get(animals);
+    Private_c* priv = Common_Get(now_private);
+    int i;
+
+    if (priv == NULL) {
+        return;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        Animal_c* animal = anm + i;
+        int memory_idx;
+        Anmmem_c* memory;
+
+        if (mNpc_CheckFreeAnimalInfo(animal) == TRUE) {
+            continue; /* slot empty */
+        }
+
+        memory_idx = mNpc_GetAnimalMemoryIdx(&priv->player_ID, animal->memories, ANIMAL_MEMORY_NUM);
+        if (memory_idx == -1) {
+            memory_idx = mNpc_ForceGetFreeAnimalMemoryIdx(animal, animal->memories, ANIMAL_MEMORY_NUM);
+            if (memory_idx == -1) {
+                printf("[NET][NPC] mNpc_DebugForceFriendshipDelta: no free memory slot on villager %d\n", i);
+                return;
+            }
+            memory = animal->memories + memory_idx;
+            mNpc_SetAnimalMemory(&priv->player_ID, &animal->id, memory);
+        } else {
+            memory = animal->memories + memory_idx;
+        }
+
+        printf("[NET][NPC] --force-friendship-delta active: villager slot %d delta %d\n", i, delta);
+        mNpc_AddFriendship(memory, delta);
+        return;
+    }
+    printf("[NET][NPC] mNpc_DebugForceFriendshipDelta: no occupied villager slot found -- nothing applied\n");
+}
+
+/* TEST-ONLY (see pc_main.c's --force-mail-send and pc_net_game.c's
+ * pcnetgame_run_friendship_mail_test_triggers()). Builds a minimal but well-formed Mail_c (sender =
+ * the current local player, recipient = the first occupied villager slot, encoded via the REAL
+ * mMl_set_mail_name_npcinfo() -- mNpc_SendMailtoNpc()'s own mMl_get_npcinfo_from_mail_name()
+ * counterpart, never a hand-rolled encoding) and sends it through the REAL mNpc_SendMailtoNpc()
+ * (its own TARGET_PC branch dispatches correctly for either role, exactly like
+ * mNpc_DebugForceFriendshipDelta() above). No-op if there is no occupied villager slot or no local
+ * save loaded. */
+extern void mNpc_DebugForceMailSend(void) {
+    Animal_c* anm = Save_Get(animals);
+    Private_c* priv = Common_Get(now_private);
+    int i;
+
+    if (priv == NULL) {
+        return;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        Animal_c* animal = anm + i;
+        Mail_c mail;
+
+        if (mNpc_CheckFreeAnimalInfo(animal) == TRUE) {
+            continue; /* slot empty */
+        }
+
+        memset(&mail, 0, sizeof(mail));
+        mMl_set_mail_name_npcinfo(&mail.header.recipient, &animal->id);
+        mail.header.sender.type = mMl_NAME_TYPE_PLAYER;
+        mPr_CopyPersonalID(&mail.header.sender.personalID, &priv->player_ID);
+        mail.present = EMPTY_NO;
+        mail.content.font = mMl_FONT_SEND;
+        mail.content.mail_type = mMl_TYPE_MAIL;
+        mem_clear(mail.content.header, MAIL_HEADER_LEN, CHAR_SPACE);
+        mem_clear(mail.content.body, MAIL_BODY_LEN, CHAR_SPACE);
+        mem_clear(mail.content.footer, MAIL_FOOTER_LEN, CHAR_SPACE);
+
+        printf("[NET][NPC] --force-mail-send active: sending a test letter to villager slot %d\n", i);
+        mNpc_SendMailtoNpc(&mail);
+        return;
+    }
+    printf("[NET][NPC] mNpc_DebugForceMailSend: no occupied villager slot found -- nothing sent\n");
 }
 #endif
 

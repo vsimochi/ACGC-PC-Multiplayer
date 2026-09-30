@@ -207,6 +207,52 @@ static int bIT_actor_hole_effect_entry(bg_item_hole_c* hole, mActor_name_t fg_it
 #include "../src/bg_item/bg_item_clip.c_inc"
 #include "../src/bg_item/bg_item_common.c_inc"
 
+#ifdef TARGET_PC
+/* World Ecology T1: see this function's own declaration (bg_item_h.h) and Check_BirthBee_common()'s
+ * own doc (m_player_common.c_inc) for why this exists. Mirrors bg_item_tree_fruit_drop()'s own
+ * TREE_BEES/CEDAR_TREE_BEES/GOLD_TREE_BEES branch (actor creation + fruit_set(HONEYCOMB, ...), in
+ * bg_item_common.c_inc) almost exactly, with drop_type passed as 0 -- matching drop_fruit()'s own
+ * literal 0 for every fruit_set() call it makes, honeycomb included; NOT the value "1" this task's own
+ * design brief mentions, which does not match anything drop_fruit() actually passes (verified against
+ * its source) and appears to be a transcription slip in that brief, not a real vanilla behavior.
+ * DELIBERATELY never calls drop_fruit()/bg_item_tree_fruit_drop() -- only fruit_set() directly -- so it
+ * can never reach drop_fruit()'s own trailing mFI_SetFG_common(dst_tree_item, ...) tree-conversion
+ * write. Under host authority that conversion write belongs solely to the host's own TREE_SHAKE commit
+ * path (pcnetgame_host_commit_tree_shake(), pc_net_game.c) -- never to this helper, which runs
+ * identically and unconditionally on every role (host AND every client) purely for the bee actor's own
+ * cosmetic honeycomb-drop animation. fruit_set(HONEYCOMB, ...) itself already writes nothing to the
+ * field for HONEYCOMB regardless (see fruit_set()'s own `drop.fg_item != HONEYCOMB` guard around its
+ * mFI_SetFG_common(RSV_NO, ...) call) -- the only thing this helper must avoid relative to vanilla's
+ * own TREE_BEES branch is that trailing drop_fruit() conversion write, which it structurally cannot
+ * reach.
+ * Returns 1 and a valid *out_drop_pos (x,z >= 0) on success; 0 with the -1 sentinel pos on transient
+ * bee-actor-allocation failure, exactly like bg_item_tree_fruit_drop()'s own TREE_BEES branch's own
+ * wait_pos retry convention -- the caller (Check_BirthBee_common()) already retries via its existing
+ * bee_spawn_timer/bee_counter loop exactly as it does for the real drop.
+ * Defined here (rather than in the shared bg_item_common.c_inc, which is #include'd into four separate
+ * translation units) so it compiles into exactly one object file despite needing external linkage --
+ * see bg_item_common.c_inc's own note at the removed definition site for why. */
+int pc_tree_birth_bee_visual(int ut_x, int ut_z, xyz_t* out_drop_pos) {
+    ACTOR* actor;
+    static xyz_t wait_pos = { -1.0f, -1.0f, -1.0f };
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+
+    actor = Actor_info_make_actor(&play->actor_info, (GAME*)play, mAc_PROFILE_BEE, wait_pos.x, wait_pos.y,
+                                  wait_pos.z, 0, 0, 0, play->block_table.block_x, play->block_table.block_z, -1,
+                                  EMPTY_NO, 0, -1, -1);
+    if (actor != NULL) {
+        fruit_set(HONEYCOMB, ut_x, ut_z, 1, 0, out_drop_pos, actor);
+        if (out_drop_pos->x == -1.0f && out_drop_pos->y == -1.0f && out_drop_pos->z == -1.0f) {
+            Actor_delete(actor);
+            return 0;
+        }
+        return 1;
+    }
+    xyz_t_move(out_drop_pos, &wait_pos);
+    return 0;
+}
+#endif
+
 extern u16 obj_g_hole_pal[];
 extern u16 obj_b_hole_pal[];
 

@@ -8,6 +8,11 @@
 #include "m_roll_lib.h"
 #include "m_handbill.h"
 #include "m_malloc.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* World Ecology: snowmen -- pc_net_game_world_is_host_authoritative(),
+                          * pc_net_game_request_snowman_build() */
+#include "m_field_info.h" /* World Ecology: snowmen -- mFI_Wpos2UtNum() */
+#endif
 
 enum {
     aSMAN_PART0,
@@ -156,7 +161,46 @@ static void aSNOWMAN_Set_PSnowman_info(SNOWMAN_ACTOR* actor) {
     sman_info.data.score = actor->result;
     mCoBG_SetPlussOffset(actor->actor_class.world.position, 0, mCoBG_ATTRIBUTE_NONE);
     if ((actor->flags & aSMAN_FLAG_DELETE) == 0) {
-        mSN_regist_snowman_society(&sman_info);
+#ifdef TARGET_PC
+        /* World Ecology: snowmen -- this destructor-time seam (not the earlier visual-completion
+         * callback at MSG_2209 time) is the correct place to intercept: only here is it certain this
+         * snowman will actually be registered (aSMAN_FLAG_DELETE, checked just above, can still be set
+         * between that earlier moment and this one if the snowman is broken first). Deliberately no
+         * reach/IN_TOWN precondition on the request (the player may already be walking away, or the
+         * scene may be mid-transition) -- see pc_net_game_request_snowman_build()'s own doc. Known,
+         * accepted gap: if this request is lost, rejected, or never sent (broken before this destructor
+         * runs), the host never learns this build's completion-time dates, which were already written
+         * locally back at MSG_2209 time (see aSMAN_process_combine_head_jump_init(), left completely
+         * unmodified/local) -- documented, not engineered around. */
+        if (pc_net_game_world_is_host_authoritative()) {
+            int ut_x, ut_z;
+
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, sman_info.pos)) {
+                pc_net_game_request_snowman_build(ut_x, ut_z, sman_info.data.head_size, sman_info.data.body_size,
+                                                  sman_info.data.score);
+            }
+        } else
+#endif
+        {
+#ifdef TARGET_PC
+            /* Bug 4 fix: matches the existing dig-scoop host-local guard pattern
+             * (m_player_main_dig_scoop.c_inc's own seam) -- the HOST's own local snowman registration must
+             * not overwrite a tile another peer's pending network pickup/drop/bury has reserved.
+             * pc_net_game_field_tile_reserved() is 0 for single-player and for a network client, so only a
+             * HOST with a matching reservation is ever affected. Skips the vanilla registration entirely on
+             * a reserved tile, same posture as the dig-scoop precedent (the visual/animation side has
+             * already played by this point; only the field/society mutation is skipped). */
+            {
+                int guard_ut_x, guard_ut_z;
+                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT &&
+                    mFI_Wpos2UtNum(&guard_ut_x, &guard_ut_z, sman_info.pos) &&
+                    pc_net_game_field_tile_reserved(guard_ut_x, guard_ut_z)) {
+                    return;
+                }
+            }
+#endif
+            mSN_regist_snowman_society(&sman_info);
+        }
     }
 }
 
@@ -1269,8 +1313,19 @@ static void aSMAN_process_combine_head_jump_init(ACTOR* actorx, GAME* game) {
     xyz_t_mult_v(&actor->combine_dist, 1.0f / 60.0f);
     actorx->shape_info.draw_shadow = FALSE;
     actor->result = aSMAN_decide_scale_result(actorx->scale.x, oc_actorx->scale.x);
-    actor->msg_no =
-        MSG_2209 + ((Common_Get(snowman_msg_id) + aSMAN_get_snowman_indx()) % mSN_SAVE_COUNT) + actor->result * 3;
+    {
+        /* Sentinel fix: aSMAN_get_snowman_indx() can return -1 (every slot occupied) -- reachable in
+         * multiplayer when several players build on the same day across different processes, unlike in
+         * vanilla single-player. The following '%' on a negative int is implementation-defined/
+         * surprising in C; clamp it so this only ever picks a message index, never affects gameplay
+         * state (the eventual mSN_regist_snowman_society()/pc_net_game_request_snowman_build() call is
+         * unaffected either way). */
+        int indx = aSMAN_get_snowman_indx();
+        if (indx < 0) {
+            indx = 0;
+        }
+        actor->msg_no = MSG_2209 + ((Common_Get(snowman_msg_id) + indx) % mSN_SAVE_COUNT) + actor->result * 3;
+    }
     actor->body_scale = oc_actor->normalized_scale;
 
     if (actor->result == mSN_RESULT_PERFECT) {

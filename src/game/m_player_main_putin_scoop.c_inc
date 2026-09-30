@@ -46,7 +46,20 @@ static void Player_actor_setup_main_Putin_scoop(ACTOR* actor, GAME* game) {
 
         mFI_Wpos2UtNum(&ut_x, &ut_z, main_scoop->target_pos);
         if (item) {
+#ifdef TARGET_PC
+            /* World Ecology T3: defensive choke gate, belt-and-suspenders on top of the bury seams in
+             * m_tag_ovl.c (mTG_bury_proc()/mTG_plant_proc()'s shovel branch/mTG_exchange_proc()'s hole
+             * branch), which already pass item == EMPTY_NO here for a host-authoritative client (so
+             * this branch is not normally even reached with a nonzero item in that case). If some other
+             * path ever does reach here with a nonzero item while host-authoritative, this prevents the
+             * real local field mutation (player_drop_entry_proc()) from running at all -- a
+             * host-authoritative client must never write the shared field directly. */
+            if (!pc_net_game_world_is_host_authoritative()) {
+                Common_Get(clip).bg_item_clip->player_drop_entry_proc(game, item, ut_x, ut_z, 0);
+            }
+#else
             Common_Get(clip).bg_item_clip->player_drop_entry_proc(game, item, ut_x, ut_z, 0);
+#endif
         }
     }
     Player_actor_setup_main_Base(actor, game);

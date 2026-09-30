@@ -329,10 +329,38 @@ static int g_pc_rng_selftest = 0;
  * (pc_platform.h), so pc_net_game.c can read it without any new coupling to pc_main.c. */
 int g_pc_pickup_test_seed = 0;
 
+/* World Ecology Stage 1: --field-action-test-seed. Test-only, off by default, never active in normal
+ * single-player or hosted play -- mirrors g_pc_pickup_test_seed's own exact pattern/reasoning above,
+ * for the same reason: this save's field data has no guaranteed naturally-occurring buried item or
+ * money rock, and the DIG_BURIED/MONEY_ROCK_HIT regression tests have no other way to establish one
+ * without a fixture. See pc_net_game.c's pcnetgame_run_field_action_test_seed(). */
+int g_pc_field_action_test_seed = 0;
+
+/* World Ecology T3: --bury-test-seed. Test-only, off by default, never active in normal single-player
+ * or hosted play -- mirrors g_pc_field_action_test_seed's own exact pattern/reasoning above: the
+ * BURY_REQUEST/RESULT regression tests need a guaranteed HOLE00../HOLE_SHINE tile the same way the
+ * dig-family tests need a guaranteed hole/pitfall/rock. See pc_net_game.c's
+ * pcnetgame_run_bury_test_seed(). */
+int g_pc_bury_test_seed = 0;
+
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * See pc_platform.h's own doc comment on these two globals. */
 int g_pc_force_villager_grow = 0;
 int g_pc_force_villager_remove = 0;
+
+/* Friendship/mail sync milestone, TEST-ONLY: --force-friendship-delta N / --force-mail-send. See
+ * pc_platform.h's own doc comment on these two globals. */
+int g_pc_force_friendship_delta = 0;
+int g_pc_force_mail_send = 0;
+
+/* World Ecology Stage 1 money-rock review, TEST-ONLY: --force-money-rock-hit / --force-money-bag-pickup.
+ * See pc_platform.h's own doc comment on these two globals. */
+int g_pc_force_money_rock_hit = 0;
+int g_pc_force_money_bag_pickup = 0;
+
+/* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY: --force-dig-hole. See
+ * pc_platform.h's own doc comment on this global. */
+int g_pc_force_dig_hole = 0;
 
 /* Stage 0: --bootstrap-resident N. Non-interactively binds an EXISTING resident from save slot N
  * (0..PLAYER_NUM-1) and transitions into gameplay (SCENE_FG), without driving the interactive
@@ -367,6 +395,12 @@ int main(int argc, char* argv[]) {
             printf("  --pickup-test-seed  Host-only test fixture: seeds a few field tiles with an ordinary\n");
             printf("                      item for the pickup regression test. Never touches gameplay\n");
             printf("                      otherwise; see pc_net_game.c.\n");
+            printf("  --field-action-test-seed  Host-only test fixture: seeds one buried item and one\n");
+            printf("                      money rock tile for the DIG_BURIED/MONEY_ROCK_HIT regression\n");
+            printf("                      tests. Never touches gameplay otherwise; see pc_net_game.c.\n");
+            printf("  --bury-test-seed    Host-only test fixture: seeds HOLE00.. and HOLE_SHINE tiles for\n");
+            printf("                      the BURY_REQUEST/RESULT regression tests. Never touches gameplay\n");
+            printf("                      otherwise; see pc_net_game.c.\n");
             printf("  --bootstrap-resident N  Non-interactively bind existing resident slot N and enter\n");
             printf("                      gameplay, bypassing the Rover/player-select flow. See pc_m_card.c.\n");
             printf("  --force-villager-grow    Host-only test hook: force a villager to grow in once the\n");
@@ -375,6 +409,22 @@ int main(int argc, char* argv[]) {
             printf("  --force-villager-remove  Host-only test hook: force a villager to be removed once the\n");
             printf("                      world is ready, bypassing the real (multi-day) trigger condition\n");
             printf("                      only -- see pc_net_game.c.\n");
+            printf("  --force-friendship-delta N  Test hook (host OR client): apply friendship delta N to\n");
+            printf("                      the local player's memory of the first occupied villager once the\n");
+            printf("                      world/link is ready -- see pc_net_game.c.\n");
+            printf("  --force-mail-send   Test hook (host OR client): send a test letter to the first\n");
+            printf("                      occupied villager once the world/link is ready -- see pc_net_game.c.\n");
+            printf("  --force-money-rock-hit  Host-only test hook: force this host's own local\n");
+            printf("                      pc_net_game_host_local_money_rock_hit() at the\n");
+            printf("                      --field-action-test-seed fixture's money-rock tile (24,104) --\n");
+            printf("                      see pc_net_game.c.\n");
+            printf("  --force-money-bag-pickup  Client-only test hook: force a real pc_net_game_request_pickup()\n");
+            printf("                      attempt at whichever neighbor tile of (24,104) holds a money bag --\n");
+            printf("                      see pc_net_game.c.\n");
+            printf("  --force-dig-hole    Client-only test hook: force a real Player_actor_request_main_dig_scoop_all()\n");
+            printf("                      request at the --field-action-test-seed fixture's DIG_HOLE tile\n");
+            printf("                      (56,105), driving the REAL unmodified dig-scoop gameplay chain to its\n");
+            printf("                      real network commit point -- see pc_net_game.c and m_player.c.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -402,10 +452,25 @@ int main(int argc, char* argv[]) {
             g_pc_rng_selftest = 1;
         } else if (strcmp(argv[i], "--pickup-test-seed") == 0) {
             g_pc_pickup_test_seed = 1;
+        } else if (strcmp(argv[i], "--field-action-test-seed") == 0) {
+            g_pc_field_action_test_seed = 1;
+        } else if (strcmp(argv[i], "--bury-test-seed") == 0) {
+            g_pc_bury_test_seed = 1;
         } else if (strcmp(argv[i], "--force-villager-grow") == 0) {
             g_pc_force_villager_grow = 1;
         } else if (strcmp(argv[i], "--force-villager-remove") == 0) {
             g_pc_force_villager_remove = 1;
+        } else if (strcmp(argv[i], "--force-friendship-delta") == 0 && i + 1 < argc) {
+            g_pc_force_friendship_delta = atoi(argv[i + 1]);
+            i++;
+        } else if (strcmp(argv[i], "--force-mail-send") == 0) {
+            g_pc_force_mail_send = 1;
+        } else if (strcmp(argv[i], "--force-money-rock-hit") == 0) {
+            g_pc_force_money_rock_hit = 1;
+        } else if (strcmp(argv[i], "--force-money-bag-pickup") == 0) {
+            g_pc_force_money_bag_pickup = 1;
+        } else if (strcmp(argv[i], "--force-dig-hole") == 0) {
+            g_pc_force_dig_hole = 1;
         } else if (strcmp(argv[i], "--bootstrap-resident") == 0 && i + 1 < argc) {
             g_pc_bootstrap_resident = atoi(argv[i + 1]);
             i++;

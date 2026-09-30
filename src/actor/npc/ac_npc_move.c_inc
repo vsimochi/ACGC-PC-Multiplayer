@@ -656,12 +656,212 @@ static void aNPC_setupAction(NPC_ACTOR* nactorx, u8 action) {
     aNPC_Animation_init((ACTOR*)nactorx, aNPC_animeSeqNoTable[(int)action], data_p->talk_flag);
 }
 
+#ifdef TARGET_PC
+/* N2 villager movement sync.
+ *
+ * TRUE iff this NPC_ACTOR is a regular, Save_t.animals[]-backed villager (aNPC_get_animal_idx()
+ * returns a real slot -- an event/island/special NPC does not, and must always keep running the
+ * unmodified decomp path) AND this process is a READY network client, i.e. the host -- not this
+ * process -- is authoritative over `nactorx`'s movement (pc_net_game_world_is_host_authoritative()).
+ * Checked once per frame per NPC_ACTOR from aNPC_actor_move_show()/_show_before(); see those
+ * functions for exactly which decomp calls this gates. */
+static int aNPC_pc_is_client_consumer(NPC_ACTOR* nactorx) {
+    if (!pc_net_game_world_is_host_authoritative()) {
+        return FALSE;
+    }
+    if (nactorx->npc_info.animal == NULL) {
+        return FALSE;
+    }
+    if (aNPC_get_animal_idx(nactorx) < 0) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Host side: report this frame's already-resolved position/facing to pc_net_game.c's throttled
+ * NPC_MOVE sender. Called once per frame per on-screen villager NPC_ACTOR immediately after
+ * aNPC_position_move()/aNPC_angle_calc() have finished for the frame (see
+ * aNPC_actor_move_show_before()/aNPC_actor_move_show() below) -- i.e. the exact values the
+ * unmodified host physics/AI just computed, sampled, never decided, by this function.
+ * pc_net_game_notify_npc_move() itself is a no-op for single-player/client and internally throttles
+ * to ~20 Hz, so this is safe and cheap to call every frame for every villager. */
+static void aNPC_pc_host_sample_move(NPC_ACTOR* nactorx) {
+    int slot;
+
+    if (nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    pc_net_game_notify_npc_move(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id,
+                                 nactorx->actor_class.world.position.x, nactorx->actor_class.world.position.y,
+                                 nactorx->actor_class.world.position.z, nactorx->actor_class.world.angle.y,
+                                 (uint8_t)nactorx->condition_info.action);
+}
+
+/* Client side: apply the host's authoritative (delay-interpolated) pose for this villager INSTEAD OF
+ * running aNPC_position_move()'s local physics integration. The position/facing are set directly
+ * (matching pc_remote_player_mv()'s own "hard set, not a chase" pattern -- pc_net_game.c's own
+ * delayed two-snapshot interpolation already provides the smoothing, so a second layer of smoothing
+ * here would only add lag). Walk-vs-idle animation is derived purely from the network layer's
+ * observed-position-delta `moving` flag -- never from aNPC_schedule_proc()/aNPC_action_proc() (this
+ * path replaces both; see aNPC_actor_move_show() below), so no RNG is ever consumed here. If nothing
+ * has been received yet for this villager (actor just created, or the host's own player has never
+ * been near it), the actor's current position/facing/animation is left completely untouched. */
+static void aNPC_pc_client_consume_move(NPC_ACTOR* nactorx, ACTOR* actorx) {
+    int slot;
+    float x, y, z;
+    s16 angle;
+    int moving;
+    uint8_t host_action;
+
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    if (!pc_net_game_get_npc_move_pose(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, &x, &y, &z, &angle,
+                                        &moving, &host_action)) {
+        return; /* nothing received yet for this slot -- hold current pose/animation */
+    }
+
+    actorx->world.position.x = x;
+    actorx->world.position.y = y;
+    actorx->world.position.z = z;
+    actorx->shape_info.rotation.y = angle;
+    actorx->world.angle.y = angle;
+    actorx->speed = 0.0f; /* N2 carries no speed field on the wire -- position is applied directly
+                           * each frame rather than integrated from a speed/acceleration model; see
+                           * the design note above pc_net_game_notify_npc_move() (pc_net_game.h). */
+
+    {
+        /* N3 Channel A: prefer the host's real, host-authoritative action_type (sampled from the
+         * unmodified host's own aNPC_action_proc()/aNPC_setupAction() selection) over the old
+         * position-delta-only derivation. Range-checked defensively -- aNPC_setupAction() indexes a
+         * fixed-size table with no bounds check of its own, and a malformed/stale action byte must
+         * never be trusted enough to index out of range. Falls back to the walk-vs-idle derivation
+         * only if the received value is out of range (should not happen from a well-behaved host). */
+        u8 desired_action;
+        if (host_action < aNPC_ACTION_TYPE_NUM) {
+            desired_action = host_action;
+        } else {
+            desired_action = (u8)(moving ? aNPC_ACTION_TYPE_WALK : aNPC_ACTION_TYPE_WAIT);
+        }
+        if (nactorx->condition_info.action != desired_action) {
+            aNPC_setupAction(nactorx, desired_action);
+        }
+    }
+}
+
+/* N3 Channel B, host side: report this villager's current is_home/hide/forced-schedule state.
+ * Called unconditionally (pc_net_game_notify_npc_state() itself is a no-op for single-player/client
+ * and internally dirty-checks) once per frame per real villager NPC_ACTOR from BOTH
+ * aNPC_actor_move_hide() and aNPC_actor_move_show_before() below -- this state must be tracked and
+ * broadcast on change regardless of hide status, unlike NPC_MOVE which only ever samples a visible
+ * actor's position. nactorx->npc_info.schedule can legitimately be NULL for a moment (e.g. the very
+ * first frame after a network arrival, before FIX S3's re-registration call has run) -- treated as
+ * "no forced override" rather than skipped, so is_home/hide are still reported even then. */
+static void aNPC_pc_host_check_state(NPC_ACTOR* nactorx) {
+    int slot;
+    mNPS_schedule_c* sched_p;
+    u8 forced_type = 0;
+    int forced_timer = 0;
+
+    if (nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    sched_p = nactorx->npc_info.schedule;
+    if (sched_p != NULL) {
+        forced_type = sched_p->forced_type;
+        forced_timer = sched_p->forced_timer;
+    }
+    pc_net_game_notify_npc_state(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id,
+                                 (uint8_t)nactorx->npc_info.animal->is_home,
+                                 (uint8_t)nactorx->condition_info.hide_flg, forced_type, forced_timer);
+}
+
+/* N3 Channel B, client side: apply the host's authoritative is_home/hide/forced-schedule state
+ * atomically -- is_home, the hide flag (via aNPC_set_hide_flg(), the existing decomp function that
+ * also handles the hide_request/morph-counter/shadow-drawing side effects together), and the
+ * schedule's forced_type/forced_timer are all set from the SAME received NPC_STATE in one place,
+ * never at separate times. Deliberately does NOT re-snap the actor's world position to the house door
+ * on a hidden transition (unlike the audit's original suggestion): while visible, N2's own NPC_MOVE
+ * stream already continuously carries the true position the host walked the villager to (including
+ * through its into-house door animation) before hide ever fires, so the position is already correct
+ * by the time this applies hide=TRUE; for a villager already hidden at snapshot/late-join time, its
+ * exact indoor position has no visible effect on a client (a hidden actor draws nothing) and self-
+ * heals the same way N2's own off-screen position already does the instant the villager is ever shown
+ * again (see PCNetGameNpcMoveMsg's design note on self-healing stale off-screen state). If nothing
+ * has been received yet for this slot, this is a no-op -- the actor's current is_home/hide/schedule
+ * state (from ARRIVAL/SNAPSHOT apply) is left untouched, not zeroed. */
+static void aNPC_pc_client_consume_state(NPC_ACTOR* nactorx) {
+    int slot;
+    uint8_t is_home, hide, forced_type;
+    uint16_t forced_timer_remaining;
+    mNPS_schedule_c* sched_p;
+
+    if (nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    if (!pc_net_game_get_npc_state(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, &is_home, &hide,
+                                   &forced_type, &forced_timer_remaining)) {
+        return; /* nothing received yet for this slot */
+    }
+
+    nactorx->npc_info.animal->is_home = is_home ? TRUE : FALSE;
+
+    sched_p = nactorx->npc_info.schedule;
+    if (sched_p != NULL) {
+        sched_p->forced_type = forced_type;
+        sched_p->forced_timer = forced_timer_remaining;
+    }
+
+    if (nactorx->condition_info.hide_flg != hide) {
+        aNPC_set_hide_flg(nactorx, hide);
+    }
+}
+#endif
+
 static void aNPC_actor_move_hide(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
+#ifdef TARGET_PC
+    int pc_client_consumer = aNPC_pc_is_client_consumer(nactorx);
 
-    aNPC_schedule_proc(nactorx, play);
-    aNPC_action_proc(nactorx, play);
+    /* N3 Channel B: is_home/hide/forced-schedule state must be tracked/broadcast (host) or applied
+     * (client) regardless of hide status -- unlike NPC_MOVE, which only ever samples a VISIBLE
+     * actor's position, this is exactly the case (a hidden/indoors villager) the audit called out as
+     * needing its own hook independent of aNPC_actor_move_show_before()'s. */
+    if (pc_client_consumer) {
+        aNPC_pc_client_consume_state(nactorx);
+    } else {
+        aNPC_pc_host_check_state(nactorx);
+    }
+#endif
+
+#ifdef TARGET_PC
+    /* N2: a hidden (culled/indoors) villager runs no position integration either way, but
+     * aNPC_schedule_proc()/aNPC_action_proc() are still the same RNG-bearing movement/behavior
+     * decision layer gated in aNPC_actor_move_show() below -- skip them here too on a host-
+     * authoritative client, for the same reason (see aNPC_pc_is_client_consumer()'s doc comment):
+     * this process must never independently consume qrand() entropy deciding what a host-owned
+     * villager would do next, visible or not. There is nothing to replace them with while hidden --
+     * no movement is sampled/consumed and no animation is selected for an actor that isn't drawn. */
+    if (!pc_client_consumer)
+#endif
+    {
+        aNPC_schedule_proc(nactorx, play);
+        aNPC_action_proc(nactorx, play);
+    }
     aNPC_check_feel_tim(nactorx);
 }
 
@@ -670,7 +870,18 @@ static void aNPC_actor_move_show_before(ACTOR* actorx, GAME* game) {
 
     aNPC_anime_proc(nactorx, game);
     aNPC_tex_anm_ctrl(nactorx);
-    aNPC_position_move(actorx);
+#ifdef TARGET_PC
+    /* N2 central client-side change: a host-authoritative client never runs the local physics
+     * integration for a synchronized villager -- it applies the host's (delay-interpolated)
+     * position/facing instead. The host is unaffected (aNPC_pc_is_client_consumer() is FALSE there)
+     * and keeps running exactly the original, unmodified aNPC_position_move(). */
+    if (aNPC_pc_is_client_consumer(nactorx)) {
+        aNPC_pc_client_consume_move(nactorx, actorx);
+    } else
+#endif
+    {
+        aNPC_position_move(actorx);
+    }
     aNPC_BGcheck(nactorx, actorx);
     aNPC_entranceCheck(nactorx);
     aNPC_circleRangeRevice(nactorx);
@@ -696,6 +907,9 @@ static void aNPC_actor_move_show_after(ACTOR* actorx, GAME* game) {
 static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
+#ifdef TARGET_PC
+    int pc_client_consumer = aNPC_pc_is_client_consumer(nactorx);
+#endif
 
     aNPC_set_over_friendship(nactorx);
     aNPC_actor_move_show_before(actorx, game);
@@ -706,12 +920,57 @@ static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
         aNPC_talk_area_check(nactorx, play);
     }
 
-    aNPC_schedule_proc(nactorx, play);
-    aNPC_action_proc(nactorx, play);
+#ifdef TARGET_PC
+    /* N2: aNPC_schedule_proc()/aNPC_action_proc() are the movement-TARGET/goal decision layer --
+     * they set movement.target/movement.mv_angl (which aNPC_angle_calc() below turns into) and are
+     * themselves RNG-bearing (greeting/wander/avoid-search behavior, ac_npc_action.c_inc). A
+     * host-authoritative client must not run either: not because their OUTPUT would be wrong to
+     * apply (it's simply never applied -- see aNPC_pc_client_consume_move() above, already called
+     * from _show_before()), but because doing so would still independently consume qrand() entropy
+     * from the single global stream this whole game shares for everything (weather, drop rates,
+     * ...) -- diverging it from the host's for reasons entirely unrelated to villager movement. See
+     * the N2 completion report for the source trace that established this; QRAND_DOMAIN_VILLAGER
+     * (libc64/qrand_domains.h) remains an unused "future" stub, so RANDOM() here still means the one
+     * shared global generator, same as everywhere else pre-N2. aNPC_angle_calc() (which chases
+     * actor_class.shape_info.rotation.y toward movement.mv_angl) is skipped for the same
+     * reason -- its target was already consumed/applied directly, as the interpolated facing, inside
+     * aNPC_pc_client_consume_move(). */
+    if (!pc_client_consumer)
+#endif
+    {
+        aNPC_schedule_proc(nactorx, play);
+        aNPC_action_proc(nactorx, play);
+    }
     aNPC_talk_request_check(actorx, game);
-    aNPC_angle_calc(nactorx);
+#ifdef TARGET_PC
+    if (!pc_client_consumer)
+#endif
+    {
+        aNPC_angle_calc(nactorx);
+    }
     aNPC_calc_fatigue(nactorx, play);
     aNPC_actor_move_show_after(actorx, game);
+
+#ifdef TARGET_PC
+    /* N2 host sampling point: after every other per-frame movement/AI call above has finished
+     * resolving actorx->world.position/angle.y for this frame exactly as it always has (this branch
+     * only runs when aNPC_pc_is_client_consumer() is FALSE, i.e. single-player or host), report the
+     * result. A no-op on single-player and internally throttled to ~20 Hz on a host -- see
+     * pc_net_game_notify_npc_move()'s doc comment (pc_net_game.h). */
+    if (!pc_client_consumer) {
+        aNPC_pc_host_sample_move(nactorx);
+    }
+
+    /* N3 Channel B: track/broadcast (host) or apply (client) is_home/hide/forced-schedule state for
+     * this VISIBLE villager too -- aNPC_actor_move_hide() above covers the hidden case; together they
+     * cover every frame regardless of hide status, per the design note above
+     * pc_net_game_notify_npc_state() (pc_net_game.h). */
+    if (pc_client_consumer) {
+        aNPC_pc_client_consume_state(nactorx);
+    } else {
+        aNPC_pc_host_check_state(nactorx);
+    }
+#endif
 }
 
 static void aNPC_actor_move(ACTOR* actorx, GAME* game) {

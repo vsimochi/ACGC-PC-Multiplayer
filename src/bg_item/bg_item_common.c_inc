@@ -828,6 +828,11 @@ static int bIT_actor_drop_entry_main(bg_item_drop_table_c* drop_info, bg_item_dr
     return res;
 }
 
+/* World Ecology T0 -- see drop_fruit()'s own doc comment below (this file) before adding ANY host-
+ * authority/network gating near this function: fruit_set() is drop_fruit()'s own low-level mutator and
+ * is reached from the SAME four call sites (tree shake, tree chop, bee-birth, and the balloon pop in
+ * ac_fuusen.c) through the same shared item_tree_fruit_drop_proc() seam -- a gate here would break the
+ * balloon path exactly like a gate inside drop_fruit() itself would. */
 static int fruit_set(mActor_name_t fg_item, int ut_x, int ut_z, s16 num, int drop_type, xyz_t* pos,
                      ACTOR* parent_actor) {
     xyz_t drop_pos;
@@ -1029,6 +1034,25 @@ typedef struct fruit_drop_s {
     s16 drop_count;
 } bIT_fruit_drop_c;
 
+/* World Ecology T0 (shared foundation for the FUTURE T1 tree task) -- READ BEFORE ADDING HOST-
+ * AUTHORITY GATING HERE: drop_fruit()/fruit_set() are reached from FOUR call sites, traced end to end
+ * for this milestone's T0 pass:
+ *   1. m_player_main_shake_tree.c_inc  (tree SHAKE  -- a player-action seam T1 will gate)
+ *   2. m_player_main_swing_axe.c_inc   (tree CHOP   -- a player-action seam T1 will gate)
+ *   3. m_player_common.c_inc           (BEE-BIRTH, ~line 6794-6799 -- a player-action seam T1 will gate)
+ *   4. ac_fuusen.c                     (BALLOON pop -- NOT a player action; must NEVER be gated)
+ * All four reach here through the SAME function pointer, Common_Get(clip).bg_item_clip->
+ * item_tree_fruit_drop_proc (-> bg_item_tree_fruit_drop() -> drop_fruit()/fruit_set(), this file) --
+ * there is no way to tell which of the four call sites is currently calling in from inside this
+ * function or bg_item_tree_fruit_drop() itself.
+ * DO NOT add a host-authority gate (or any other network check) INSIDE drop_fruit()/fruit_set()/
+ * bg_item_tree_fruit_drop() to make tree shake/chop authoritative: a blanket gate here would also
+ * silently break the balloon drop for every player, host or client, which has nothing to do with tree
+ * authority at all. T1 must gate at the THREE PLAYER-ACTION CALL SITES themselves (1-3 above, each
+ * right before it calls item_tree_fruit_drop_proc(...)), leaving ac_fuusen.c's balloon call site
+ * completely untouched -- exactly the same shape as this milestone's existing DIG_BURIED/MONEY_ROCK_HIT
+ * validators, which gate at the seam that initiates the action, never inside a shared low-level mutator.
+ * Zero behavioral change in this T0 pass: this comment is documentation only. */
 static void drop_fruit(mActor_name_t fg_item, int ut_x, int ut_z, xyz_t* drop_pos, ACTOR* parent_actor) {
     static bIT_fruit_drop_c fg_ytable[] = {
         { TREE_APPLE_FRUIT, ITM_FOOD_APPLE, TREE_APPLE_NOFRUIT_0, 3 },
@@ -1150,6 +1174,18 @@ static void bg_item_tree_fruit_drop(mActor_name_t fg_item, int ut_x, int ut_z, x
         drop_fruit(fg_item, ut_x, ut_z, drop_pos, NULL);
     }
 }
+
+/* World Ecology T1: pc_tree_birth_bee_visual() used to be defined here, but this file is #include'd
+ * into FOUR separate translation units (bg_item.c, bg_cherry_item.c, bg_winter_item.c, bg_xmas_item.c),
+ * and unlike every other TARGET_PC helper above (which are either static or, like
+ * pc_net_game_notify_local_drop_landing(), merely called from here while actually defined in a real
+ * standalone .c file), this one needs external linkage for Check_BirthBee_common()
+ * (m_player_common.c_inc, a different translation unit) to call it. Giving it external linkage while
+ * its body lived in this shared .c_inc meant it was compiled into all four object files, causing a
+ * `multiple definition of 'pc_tree_birth_bee_visual'` link error. Following the codebase's existing
+ * convention for externally-linked helpers used from this file (define once, in a real .c file; declare
+ * extern in the shared header), its definition now lives in bg_item.c, immediately after this file's
+ * own #include. See bg_item_h.h for its declaration and bg_item.c for the definition + full doc. */
 
 static int bIT_actor_dig_hole_effect_entry(mActor_name_t fg_item, xyz_t* pos, u16 frames, u16 wait_frames) {
     int ut_x;

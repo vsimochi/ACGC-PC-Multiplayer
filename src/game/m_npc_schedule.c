@@ -231,6 +231,13 @@ extern void mNPS_schedule_manager() {
   mNPS_island_schedule_manager(forced_ticks);
 }
 
+/* N3 FIX S3: see m_npc_schedule.h's doc comment. Thin extern wrapper around the existing static
+ * mNPS_set_schedule_area() so m_npc.c's network-apply paths can re-register a single slot without
+ * duplicating the (anm_id->looks -> data_table) lookup logic. */
+extern void mNPS_pc_register_schedule_area(AnmPersonalID_c* anm_id) {
+  mNPS_set_schedule_area(anm_id);
+}
+
 extern void mNPS_set_all_schedule_area() {
   Animal_c* animal = Save_Get(animals);
   int i;

@@ -51,6 +51,29 @@ static void Player_actor_Reset_Hole_Fill_scoop(ACTOR* actor) {
     if (Player_actor_Check_AnimationFrame(fc, 18.0f + mod) && Common_Get(clip).bg_item_clip != NULL) {
         mPlayer_main_fill_scoop_c* main_scoop = &player->main_data.fill_scoop;
         xyz_t* pos = &main_scoop->target_pos;
+#ifdef TARGET_PC
+        /* World Ecology T-dig fix: mirrors Player_actor_Put_Hole_Dig_scoop()'s own reservation guard
+         * (m_player_main_dig_scoop.c_inc) -- see that call site's own doc. */
+        {
+            int guard_ut_x, guard_ut_z;
+            if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT && mFI_Wpos2UtNum(&guard_ut_x, &guard_ut_z, *pos) &&
+                pc_net_game_field_tile_reserved(guard_ut_x, guard_ut_z)) {
+                return;
+            }
+        }
+
+        /* World Ecology T-dig fix (B): the actual field mutation for FILL_HOLE must be committed by the
+         * host only -- a host-authoritative client sends the request and skips its own local
+         * bury_hole_effect_entry_proc() call (the true vanilla commit point for this seam); everything
+         * before this point (animation, sound, effects) already ran unconditionally and is untouched. */
+        if (pc_net_game_world_is_host_authoritative()) {
+            int ux, uz;
+            if (mFI_Wpos2UtNum(&ux, &uz, *pos)) {
+                pc_net_game_request_fill_hole(ux, uz);
+            }
+            return;
+        }
+#endif
         Common_Get(clip).bg_item_clip->bury_hole_effect_entry_proc(EMPTY_NO, pos, 46);
     }
 }

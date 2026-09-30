@@ -3,6 +3,9 @@
 #include "libultra/libultra.h"
 #include "m_random_field.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* pc_net_game_world_is_host_authoritative() -- villager population/home authority gating */
+#endif
 
 static u32 l_arrive_stay_count[ANIMAL_NUM_MAX]; /* TODO: swap with l_goal_block when bss ordering is fixed */
 static int l_goal_block[mNpcW_GOAL_BLOCK_NUM][2];
@@ -255,6 +258,23 @@ extern int mNpcW_ChangeNpcWalk(mNpc_walk_c* walk, mNpcW_info_c* info) {
   int free_idx;
   Animal_c* animals;
   int idx = -1;
+
+#ifdef TARGET_PC
+  /* N3 FIX S4: this decision function re-rolls RANDOM() (via mNpcW_DecideNpc()'s villager-selection
+   * roll and mNpcW_SetNpcWalkInfo()'s goal-type roll) to choose which villager next occupies a free
+   * off-screen "walk" slot and where it heads -- an authoritative, RNG-bearing roster/goal decision
+   * exactly like the ones mNpcW_InitNpcWalk() below already gates, except this one is reached mid-day,
+   * any time (via aSNMgr_go_back_home_sub(), ac_set_npc_manager.c), not just once per day. A
+   * host-authoritative client must never independently consume this entropy from the single shared
+   * global RANDOM() stream: unlike a villager's visual position or is_home (which self-heal the moment
+   * a fresh host-authoritative value arrives), a diverged RNG stream never re-converges, so this one
+   * genuinely needs the N1/N2 gate-the-whole-function treatment rather than "leave it running, it's
+   * harmless" -- see the FIX S4 write-up in the N3 completion report. Returns -1, this function's own
+   * existing "nothing decided" value, without touching walk/info at all. */
+  if (pc_net_game_world_is_host_authoritative()) {
+    return -1;
+  }
+#endif
 
   mNpcW_ClearNpcWalkInfo(info, 1);
   free_idx = mNpcW_GetFreeNpcWalkInfoIdx(walk_info, mNpcW_MAX);
@@ -579,6 +599,22 @@ extern void mNpcW_InitNpcWalk(mNpc_walk_c* walk) {
   mNpcW_info_c* info = walk->info;
   int idx;
   int i;
+
+#ifdef TARGET_PC
+  /* READY client: never independently decide the daily inter-acre "walk" roster. mNpcW_InitNpcWalk()
+   * is called every real day-change via mSDI_StartInitAfter with no host-role gate in the original
+   * code (same call site as mNpc_Grow()/mNpc_ForceRemove()/Kabu_manager()) -- two connected processes
+   * would otherwise each independently roll (via mNpcW_DecideNpc()/mNpcW_SetNpcWalkInfo()'s and
+   * mNpcW_InitGoalBlockSource()'s own RANDOM() calls) a different set of villagers/goal-blocks for the
+   * day's inter-acre wandering, desyncing which acre each villager visually walks toward. The host is
+   * the sole authority for this decision; N1 adds no network message for it, so a connected client
+   * simply keeps yesterday's walk-roster/goal-block state (mNpcW_ClearNpcWalk() is skipped too) until a
+   * future milestone (N2/N3) delivers it -- villager position presentation on a client remains locally
+   * simulated in the meantime, same as it was before this gate. */
+  if (pc_net_game_world_is_host_authoritative()) {
+    return;
+  }
+#endif
 
   mNpcW_ClearNpcWalk(walk);
   bzero(l_goal_block, sizeof(l_goal_block));

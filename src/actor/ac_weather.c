@@ -16,6 +16,7 @@
 #include "graph.h"
 #ifdef TARGET_PC
 #include "pc_platform.h"
+#include "pc_net_game.h"          /* pc_net_game_world_is_host_authoritative() */
 #endif
 
 static void Weather_Actor_ct(ACTOR* actor, GAME* game);
@@ -669,6 +670,26 @@ static void aWeather_ChangeWeatherTime0(ACTOR* actorx) {
 
 #ifdef TARGET_PC
     if (g_pc_weather_override >= 0) {
+        return;
+    }
+
+    /* Clock-sync-milestone prerequisite fix (found by the Opus architecture review preceding N-clock):
+     * READY client: never independently reroll the day's weather. This function is called every real
+     * frame (Weather_Actor_move(), unconditionally, host and client alike) with no host-authority gate
+     * at all in the original code -- mTM_check_renew_time(0) trips at each PROCESS's own local day
+     * boundary, so a connected client would roll its own mEnv_RandomWeather() result, consume the
+     * renewal flag (mTM_off_renew_time(0)), write its own Save_Get(weather), and Common_Set(weather_time)
+     * -- directly contradicting the host-authoritative weather value the client is supposed to be
+     * receiving via PC_NETGAME_MSG_WORLD_META / SNAPSHOT_END (see pcnetgame_client_apply_weather_state()).
+     * This bug already exists independently of clock sync (misfiring at each client's own natural local
+     * midnight); a shared authoritative clock only makes it fire more reliably (every correction that
+     * crosses a day boundary), so it must be fixed here regardless.
+     * The whole rest of this function (everything below the demo/scene early-returns above) is
+     * exclusively weather RNG + Save(weather)/Common(weather_time) mutation with no other side effects
+     * (traced fully -- see the review), so gating the entire body here, before those early-returns, is
+     * correct and minimal: the host remains the sole authority, and a READY client keeps whatever
+     * weather value it last received from the host until the next WORLD_META/SNAPSHOT_END. */
+    if (pc_net_game_world_is_host_authoritative()) {
         return;
     }
 #endif

@@ -16,6 +16,9 @@
 #include "m_actor_shadow.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_net_game.h" /* N2 villager movement sync -- pc_net_game_world_is_host_authoritative(),
+                           * pc_net_game_notify_npc_move(), pc_net_game_get_npc_move_pose(). See
+                           * ac_npc_move.c_inc's aNPC_actor_move_show()/aNPC_actor_move_show_before(). */
 #endif
 
 extern aNPC_draw_data_c npc_draw_data_tbl[];
@@ -102,6 +105,12 @@ static void aNPC_act_get_chg_umb(NPC_ACTOR* nactorx, GAME_PLAY* play);
 static void aNPC_act_get_chg_cloth_and_umb(NPC_ACTOR* nactorx, GAME_PLAY* play);
 static void aNPC_act_umb_close_main_proc(NPC_ACTOR* nactorx, GAME_PLAY* play);
 static void aNPC_set_hide_request(NPC_ACTOR* nactorx, u8 req);
+static void aNPC_set_hide_flg(NPC_ACTOR* nactorx, u8 hide_flg); /* N3 Channel B: forward-declared so
+                                                                 * ac_npc_move.c_inc's client-apply path
+                                                                 * (included above ac_npc_schedule.c_inc,
+                                                                 * where this decomp function is
+                                                                 * defined) can call it atomically --
+                                                                 * previously defined-but-unused */
 static void aNPC_reset_out_of_door_flg(NPC_CONTROL_ACTOR* ctrl, ACTOR* actorx);
 static void aNPC_reset_umb_open_flg(NPC_CONTROL_ACTOR* ctrl, ACTOR* actorx);
 static int aNPC_setP_friendship(NPC_ACTOR* nactorx);
@@ -109,6 +118,11 @@ static void aNPC_think_in_block_chg_native_info(ACTOR* actorx, f32 home_x, f32 h
 static int aNPC_check_home_block(NPC_ACTOR* nactorx);
 static void aNPC_set_schedule(NPC_ACTOR* nactorx, GAME_PLAY* play);
 static void aNPC_dma_draw_data_proc(aNPC_draw_data_c* draw_data_p, mActor_name_t npc_name);
+static int aNPC_get_animal_idx(NPC_ACTOR* nactorx); /* defined in ac_npc_action.c_inc, included AFTER
+                                                      * ac_npc_move.c_inc -- forward-declared here so
+                                                      * the N2 movement-sync hooks in the latter can
+                                                      * call it, same pattern as
+                                                      * aNPC_schedule_proc/aNPC_action_proc above. */
 
 #include "../src/actor/npc/ac_npc_data.c_inc"
 #include "../src/actor/npc/ac_npc_cloth.c_inc"

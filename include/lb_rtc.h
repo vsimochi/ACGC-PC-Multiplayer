@@ -102,6 +102,20 @@ enum RTC_EQUALITY_FLAGS {
                     lbRTC_CHECK_YEARS
 };
 
+#ifdef TARGET_PC
+/* N-clock milestone: a process-memory-only, non-persisted offset (seconds, in OSTime tick units)
+ * applied on top of lbRTC_GetGameTime()'s OSGetTime()+Save_Get(time_delta) computation. Set by
+ * pc_net_game.c on a READY client when it accepts a PC_NETGAME_MSG_CLOCK_SYNC from the host; always
+ * exactly 0 on the host itself, and forced back to exactly 0 for ROLE_NONE (single-player) by
+ * pc_net_game_shutdown() (clock hardening concern #1) -- the one place the process actually reverts
+ * to ROLE_NONE, so a later single-player session (even on a different local save) can never inherit
+ * a stale host clock correction. Never written to Save_t -- see
+ * lb_rtc.c's lbRTC_GetGameTime()/lbRTC_SetTime() for exactly how it is folded in and subtracted back
+ * out, which is what keeps Save_t.time_delta's single-player (manual clock-adjust) meaning intact. */
+extern void pc_lb_rtc_set_net_clock_offset(s64 offset);
+extern s64 pc_lb_rtc_get_net_clock_offset(void);
+#endif
+
 extern OSTime lbRTC_HardTime();
 extern int lbRTC_IsAbnormal();
 extern void lbRTC_Sampling();

@@ -446,6 +446,23 @@ extern void mNpc_PcApplyVillagerDeparture(int slot, u8 new_now_npc_max);
  * m_npc.c for the full contract. */
 extern void mNpc_DebugForceGrow(void);
 extern void mNpc_DebugForceRemove(void);
+
+/* Friendship/mail sync milestone (m_npc.c): shared by mNpc_AddFriendship()/mNpc_SendMailtoNpc()'s
+ * own client-intercept/host-apply branches and by pc_net_game.c's request/update handlers -- see
+ * the doc comments on these functions' definitions in m_npc.c for the full contract. Never rolls
+ * any RNG mNpc_CheckNormalMail() doesn't already roll deterministically from mail content. */
+extern int mNpc_FindAnimalSlotForMemory(Anmmem_c* memory);
+extern int mNpc_PcHostResolveAndApplyFriendshipDelta(int slot, PersonalID_c* pid, int delta);
+extern void mNpc_PcApplyFriendshipUpdate(int slot, PersonalID_c* pid, int friendship);
+extern void mNpc_PcApplyMailSnapshotEntry(int slot, PersonalID_c* pid, u8 letter_info, const u8* letter,
+                                          int letter_size);
+extern int mNpc_PcApplyMailToVillagerMemory(Mail_c* mail, int* out_friendship, u8* out_letter_info, u8* out_letter,
+                                            int letter_buf_size);
+/* TEST-ONLY (see pc_main.c's --force-friendship-delta/--force-mail-send and pc_net_game.c's
+ * pcnetgame_run_friendship_mail_test_triggers()). See the doc comments on these functions'
+ * definitions in m_npc.c for the full contract. */
+extern void mNpc_DebugForceFriendshipDelta(int delta);
+extern void mNpc_DebugForceMailSend(void);
 #endif
 extern int mNpc_DecideMaskNpc_summercamp(mActor_name_t* npc_id);
 extern int mNpc_RegistMaskNpc_summercamp(mActor_name_t mask_id, mActor_name_t npc_id, mActor_name_t cloth_id);

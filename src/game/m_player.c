@@ -1797,3 +1797,31 @@ extern void Player_actor_draw(ACTOR* actorx, GAME* game) {
         }
     }
 }
+
+#ifdef TARGET_PC
+/* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY -- see pc_platform.h's doc comment on
+ * g_pc_force_dig_hole and pc_net_game.c's pcnetgame_run_dig_hole_test_trigger(), which is the only
+ * caller (gated behind --force-dig-hole, off by default, never active in normal single-player or
+ * hosted play).
+ *
+ * This is a thin, additive pass-through to the REAL, completely unmodified
+ * Player_actor_request_main_dig_scoop_all() defined above (via m_player_main_dig_scoop.c_inc, included
+ * into this same translation unit) -- the exact request-boundary entry point
+ * Player_actor_CheckAndRequest_main_scoop_all() calls for genuine mPlayer_INDEX_DIG_SCOOP controller
+ * input (see m_player_common.c_inc). Exposed here (rather than made non-static in place) so a test
+ * trigger living in pc_net_game.c -- a different translation unit, with no access to this file's static
+ * functions -- can call it without touching any of the dig/fill/pitfall gameplay files themselves.
+ *
+ * Bypasses only Player_actor_CheckController_forScoop()'s raw controller polling and
+ * Player_actor_Check_scoop_after()'s target/item resolution from the world (both irrelevant to what is
+ * being verified: whether the REAL downstream chain -- Player_actor_setup_main_Dig_scoop(),
+ * Player_actor_main_Dig_scoop(), Player_actor_Put_Hole_Dig_scoop(), and the P1 network seam it calls --
+ * executes correctly). The caller supplies pos/item directly, matching whatever
+ * Player_actor_Check_scoop_after() would have resolved for the targeted tile. Does not require a shovel
+ * to be equipped: Player_actor_request_main_dig_scoop_all() itself never checks item_kind. Once
+ * accepted, control returns entirely to the player actor's own ordinary per-frame main-index update --
+ * nothing about the dig/fill/commit logic itself is touched or bypassed from this point on. */
+int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_name_t item) {
+    return Player_actor_request_main_dig_scoop_all(game, pos, item, mPlayer_REQUEST_PRIORITY_4);
+}
+#endif

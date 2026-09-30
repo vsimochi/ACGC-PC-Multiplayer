@@ -66,6 +66,19 @@ typedef struct background_item_clip_s {
     bIT_FADE_ENTRY_PROC fade_entry_proc;
 } bIT_Clip_c;
 
+#ifdef TARGET_PC
+/* World Ecology T1 (tree shake/chop/bee-birth): PC-only, visual-only bee-birth helper -- defined in
+ * bg_item_common.c_inc, called from m_player_common.c_inc's Check_BirthBee_common() (a different
+ * translation unit). Declared here rather than in pc_net_game.h (which deliberately stays free of
+ * decomp types like xyz_t -- see that header's own convention) because bg_item_h.h is already
+ * transitively visible from both call sites via bIT_Clip_c/Common_Get(clip).bg_item_clip. Deliberately
+ * a plain extern function, NOT a new bIT_Clip_c field above -- that struct's layout mirrors the
+ * original game's own vtable-like clip structure (see its reserved void* _24/_44/_48 padding, which
+ * exist to keep every real field at its original offset) and must never be extended. See the function's
+ * own doc (bg_item_common.c_inc) for what it does and why. */
+int pc_tree_birth_bee_visual(int ut_x, int ut_z, xyz_t* out_drop_pos);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -61,6 +61,15 @@ extern void mPlib_request_main_wait_from_submenu(void);
 extern void mPlib_request_main_demo_get_golden_item_from_submenu(void);
 extern void mPlib_request_main_mail_land_from_submenu(void);
 extern void mPlib_request_main_demo_wait_from_submenu(ACTOR* speak_actor_p);
+#ifdef TARGET_PC
+/* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY (see pc_main.c's --force-dig-hole and
+ * pc_net_game.c's pcnetgame_run_dig_hole_test_trigger()). Defined in m_player.c, where the REAL,
+ * completely unmodified static Player_actor_request_main_dig_scoop_all() (m_player_main_dig_scoop.c_inc,
+ * included into that same translation unit) is in scope. See that definition's own doc comment for the
+ * full contract -- this is a thin, additive pass-through, not a reimplementation of any gameplay
+ * logic. */
+extern int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_name_t item);
+#endif
 extern void mPlib_Set_unable_wade(int v);
 extern int mPlib_Get_unable_wade(void);
 extern int mPlib_Check_able_force_speak_label(GAME* game, ACTOR* label);

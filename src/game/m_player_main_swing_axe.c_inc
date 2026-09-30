@@ -140,27 +140,61 @@ static void Player_actor_CutTree_Swing_axe(ACTOR* actor, GAME* game, mPlayer_mai
         mActor_name_t item = main_axe->axe_common.item;
 
         if (mFI_Wpos2UtNum(&ut_x, &ut_z, main_axe->axe_common.target_pos)) {
-            mActor_name_t tree = Player_actor_Get_TreeNoToStumpNo(actor, game, item, ut_x, ut_z, main_axe, flag);
-            s16 type;
-
-            if (IS_ITEM_TREE_STUMP(tree) != FALSE) {
-                mNT_offset_table_c* ofs_tbl = obj_hight_table_item0_nogrow(tree);
-
-                mCoBG_SetPlussOffset(main_axe->axe_common.target_pos, ofs_tbl->table.centerRight_offset,
-                                     ofs_tbl->table.unit_attribute);
-                mFI_SetFG_common(tree, main_axe->axe_common.target_pos, TRUE);
-
-                if (main_axe->axe_common.target_pos.x > actor->world.position.x) {
-                    type = EffectBG_EFFECT_CUT_LEFT;
-                } else {
-                    type = EffectBG_EFFECT_CUT_RIGHT;
+#ifdef TARGET_PC
+            /* World Ecology T1 (TREE_CHOP): send/route EVERY hit through the host-authoritative commit
+             * path (see pc_net_game_request_tree_chop()/pc_net_game_host_local_tree_chop()'s own doc,
+             * pc_net_game.h) instead of Get_TreeNoToStumpNo()'s local cut-count decrement + fruit drop/
+             * tree conversion + stump write -- single ownership, the same precedent as
+             * MONEY_ROCK_HIT's own gate (Player_actor_Search_STONE_TC(), m_player_common.c_inc).
+             * The bee-birth ARMING check below (main_axe->bee_counter) is a LOCAL, cosmetic pre-check --
+             * mPlib_able_birth_bee() depends on client-only chase-flag state and is never gated -- that
+             * must still run exactly like vanilla's own Get_TreeNoToStumpNo() did, regardless of network
+             * mode: it only flips a local timer Player_actor_Check_BirthBee_Swing_axe() polls every
+             * frame; the actual bee-birth mutation is requested separately, from
+             * Player_actor_Check_BirthBee_common() (m_player_common.c_inc), once that timer elapses. */
+            if (pc_net_game_world_is_host_authoritative() || pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                if (IS_ITEM_BEE_TREE(item) && flag == FALSE && mPlib_able_birth_bee()) {
+                    main_axe->bee_counter = 5.0f;
                 }
-                Player_actor_set_viblation_Axe_cut();
-            } else {
-                type = EffectBG_EFFECT_SHAKE;
+                if (pc_net_game_world_is_host_authoritative()) {
+                    pc_net_game_request_tree_chop(ut_x, ut_z);
+                } else {
+                    pc_net_game_host_local_tree_chop(ut_x, ut_z);
+                }
+                /* Keep the visual effect playing locally for feel (this task's own design brief) --
+                 * the real outcome (fruit conversion / felling into a stump) arrives moments later via
+                 * the ordinary FIELD_UPDATE broadcast the commit's own pcfa_set_tile() triggers. There is
+                 * no safe way to know synchronously here whether THIS hit felled the tree (unlike
+                 * vanilla's own local, single-process cut-count table), so the CUT_LEFT/CUT_RIGHT
+                 * felling effect never plays for a network-authoritative hit -- matches
+                 * MONEY_ROCK_HIT's own "no local wobble" Stage 1 simplification. */
                 Player_actor_set_viblation_Axe_hard();
+                Player_actor_Set_EffectBgTree(game, item, EffectBG_EFFECT_SHAKE, ut_x, ut_z);
+            } else
+#endif
+            {
+                mActor_name_t tree = Player_actor_Get_TreeNoToStumpNo(actor, game, item, ut_x, ut_z, main_axe, flag);
+                s16 type;
+
+                if (IS_ITEM_TREE_STUMP(tree) != FALSE) {
+                    mNT_offset_table_c* ofs_tbl = obj_hight_table_item0_nogrow(tree);
+
+                    mCoBG_SetPlussOffset(main_axe->axe_common.target_pos, ofs_tbl->table.centerRight_offset,
+                                         ofs_tbl->table.unit_attribute);
+                    mFI_SetFG_common(tree, main_axe->axe_common.target_pos, TRUE);
+
+                    if (main_axe->axe_common.target_pos.x > actor->world.position.x) {
+                        type = EffectBG_EFFECT_CUT_LEFT;
+                    } else {
+                        type = EffectBG_EFFECT_CUT_RIGHT;
+                    }
+                    Player_actor_set_viblation_Axe_cut();
+                } else {
+                    type = EffectBG_EFFECT_SHAKE;
+                    Player_actor_set_viblation_Axe_hard();
+                }
+                Player_actor_Set_EffectBgTree(game, item, type, ut_x, ut_z);
             }
-            Player_actor_Set_EffectBgTree(game, item, type, ut_x, ut_z);
         }
     }
 }
