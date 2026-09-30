@@ -886,6 +886,169 @@ int pc_net_game_request_snowman_build(int ut_x, int ut_z, int head_size, int bod
  * (rejected internally). */
 int pc_net_game_request_snowman_break(int ut_x, int ut_z);
 
+/* World Ecology Wildlife Sync T0/T1 opt-in gate: 1 iff --authoritative-wildlife was passed
+ * (g_pc_authoritative_wildlife, pc_platform.h/pc_main.c), 0 otherwise (the default). Off by default
+ * so that the host-authoritative wildlife adapter (pc_wildlife_authority.c), which has no
+ * client-side presentation yet, never silently replaces vanilla's local fish/bug spawning in
+ * ordinary multiplayer play. Checked by aSetMgr_move_set() (ac_set_manager.c) AS WELL AS by
+ * pc_net_game_request_wildlife_spawn_trigger()/pc_net_game_host_local_wildlife_spawn_trigger()
+ * below, in each case IN ADDITION TO (never instead of) the existing
+ * pc_net_game_world_is_host_authoritative()/pc_net_game_role() checks. */
+int pc_net_game_authoritative_wildlife_enabled(void);
+
+/* World Ecology Wildlife Sync T0 (authority seam foundation only -- see pc_wildlife_authority.h's
+ * own scope doc: NOT fish/bug catching, NOT a snapshot, NOT bee/ant capture sync). Called from the
+ * decomp wade-trigger seam (aSetMgr_move_set(), ac_set_manager.c) INSTEAD of running
+ * aSOI_insect_set()/aSOG_gyoei_set() locally, at the exact point SET_MANAGER would otherwise invoke
+ * proc_table[set_ovl_type] for the player's own next_bx/next_bz acre. `bx`/`bz` are that SAME raw
+ * block-number acre pair (SET_MANAGER's own player_pos.next_bx/next_bz convention) -- deliberately
+ * the ONLY thing sent: never a species, an RNG result, or a position, since the host alone is the
+ * source of truth for the actual decision (see pc_wildlife_authority.c). Returns 1 for a connected,
+ * READY client with --authoritative-wildlife active (caller must not run the local overlay proc for
+ * this acre this call); 0 for single-player, host, OR a client without --authoritative-wildlife, in
+ * which case the caller proceeds exactly as before, unmodified -- for the HOST role, see
+ * pc_net_game_host_local_wildlife_spawn_trigger() below. Never blocks. Safe with an out-of-range
+ * bx/bz (rejected internally, without sending). Like pc_net_game_request_tree_shake(), silently does
+ * nothing (returns 1, swallowed) if the client is not currently in the town scene
+ * (pcfa_scene_is_town()). No "one already in flight" guard, matching TREE_SHAKE's own precedent -- a
+ * wade event for a different acre may legitimately arrive while an earlier one is still being
+ * processed. */
+int pc_net_game_request_wildlife_spawn_trigger(int bx, int bz);
+
+/* World Ecology Wildlife Sync T0: called from the SAME decomp wade-trigger seam as
+ * pc_net_game_request_wildlife_spawn_trigger() above, but for the HOST's own LOCAL wade event
+ * rather than a remote peer's request -- mirrors pc_net_game_host_local_tree_shake()'s own
+ * single-ownership precedent exactly. No-op for single-player -- a single-player host still HAS a
+ * role of PC_NETGAME_ROLE_HOST once hosting is active, but this function only ever runs the
+ * network-authoritative adapter path when actually hosting a live session WITH
+ * --authoritative-wildlife active; when not hosting at all, or hosting without the flag, the
+ * caller's own vanilla proc_table invocation is left completely untouched by this seam (see the
+ * call site's own doc in ac_set_manager.c). No-op for a client (that role always goes through
+ * pc_net_game_request_wildlife_spawn_trigger() instead). Never blocks. Safe with an out-of-range
+ * bx/bz or the host's own scene not being the town (rejected internally by
+ * pcwld_host_spawn_trigger(), pc_wildlife_authority.c). */
+void pc_net_game_host_local_wildlife_spawn_trigger(int bx, int bz);
+
+/* World Ecology Wildlife Sync T-catch (ordinary fish catching only -- see this milestone's own ABSOLUTE
+ * SCOPE LIMIT: no bug catching, tournaments, or ant/bee special-case handling). Called from
+ * Player_actor_setup_main_Notice_rod() (m_player_main_notice_rod.c_inc), the exact point vanilla would
+ * otherwise call Player_actor_putin_item() unconditionally, for a CLIENT under a host-authoritative
+ * session. `entity_id` is the fish actor's own stamp (aGYO_pc_get_entity_id_stamp(), ac_gyoei.h/.c);
+ * `claimed_species` is uki->gyo_type (the bobber's own settled species); `local_grant_item` is
+ * uki->get_fish_type_proc()'s result -- the caller computes this ONCE, up front, and this function
+ * remembers it to apply later, on accept, exactly like pc_net_game_request_dig_shine_with_grant()'s own
+ * local_grant pattern (never re-derived host-side -- see PCNetGameCatchResultMsg's own doc,
+ * pc_net_game.c). Returns 1 for a connected, READY client with authoritative wildlife active (the
+ * caller must SKIP the vanilla Player_actor_putin_item() call AND the mSM_COLLECT_FISH_SET() collection-
+ * bit write for this catch -- both are deferred to the eventual CATCH_RESULT, see
+ * pcnetgame_handle_client_catch_result()'s own doc, pc_net_game.c); 0 for single-player, host, a
+ * non-authoritative client, or malformed input (entity_id == 0, no gameplay save loaded, not in the town
+ * scene) -- in every 0 case the caller must proceed with the ordinary vanilla grant, unmodified, exactly
+ * as if this milestone did not exist. Never blocks. */
+int pc_net_game_request_catch_fish(uint32_t entity_id, int claimed_species, int local_grant_item);
+
+/* World Ecology Wildlife Sync T-catch: the HOST's own local catch, from the SAME seam as
+ * pc_net_game_request_catch_fish() above -- mirrors pc_net_game_host_local_tree_shake()'s own
+ * single-ownership precedent exactly. Resolves synchronously against the SAME authoritative-table
+ * validation a remote peer's CATCH_REQUEST uses (race-safe against a peer's own simultaneous claim on
+ * the SAME entity_id -- see pcnetgame_validate_and_commit_catch()'s own race-safety doc, pc_net_game.c).
+ * Returns 1 iff accepted: the entity is already removed from the authoritative table and
+ * WILDLIFE_DESPAWN already broadcast by the time this returns -- the caller must then run the vanilla
+ * Player_actor_putin_item() grant AND the mSM_COLLECT_FISH_SET() collection-bit write UNMODIFIED, with
+ * NO network round-trip to itself. Returns 0 if rejected (a genuine race loss, a stale/unknown
+ * entity_id, or authoritative wildlife not enabled/hosting not active) -- the caller must skip BOTH the
+ * grant and the collection-bit write entirely (nothing was actually caught). Never blocks. */
+int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_species);
+
+/* World Ecology Wildlife Sync T-catch (residual review fix): tri-state query used to gate the
+ * full-pockets EXCHANGE screen's actual grant (Player_actor_request_proc_index_fromPutaway_rod(),
+ * m_player_main_putaway_rod.c_inc) against what the host actually decided about this entity_id's catch,
+ * rather than granting unconditionally to whatever slot the player picks.
+ *
+ * Why this exists: the exchange screen is a player-paced UI flow -- the player takes real time
+ * choosing "exchange" vs "release" while Player_actor_setup_main_Notice_rod() already sent (or
+ * resolved, for the host's own local catch) the CATCH_REQUEST for the SAME entity_id. Without this
+ * check, a client whose request the host later REJECTS (e.g. lost a race for the same fish to another
+ * peer, or the CATCH_REQUEST send itself silently failed -- window full) would still see the
+ * full-pockets dialogue and could still choose "exchange," locally granting itself an item the host
+ * never actually awarded it -- a genuine duplicate. The host's own local full-pockets catch has the
+ * exact same shape when a remote peer's request wins the race first (synchronous rejection).
+ *
+ * Returns:
+ *   PC_NETGAME_CATCH_STATUS_NONE     -- no host-authoritative decision is tracked for this entity_id
+ *                                        (authoritative wildlife disabled, entity_id == 0, or this
+ *                                        catch never went through the network path at all) -- the
+ *                                        caller should proceed with the ordinary vanilla grant,
+ *                                        unmodified, exactly as if this milestone did not exist.
+ *   PC_NETGAME_CATCH_STATUS_PENDING  -- (client only) the CATCH_REQUEST for this entity_id was sent
+ *                                        and is still awaiting CATCH_RESULT. Rare in practice (the
+ *                                        exchange dialogue's own player-paced timing normally lets the
+ *                                        RESULT arrive first) -- the caller's chosen policy for this
+ *                                        case is documented at its own call site (see that site's own
+ *                                        doc for why it defaults to the safer no-grant behavior rather
+ *                                        than blocking or defaulting to grant).
+ *   PC_NETGAME_CATCH_STATUS_ACCEPTED -- the host accepted this catch (client CATCH_RESULT, or the
+ *                                        host's own synchronous local catch) -- safe to grant.
+ *   PC_NETGAME_CATCH_STATUS_REJECTED -- the host rejected this catch, the CATCH_RESULT disagreed with
+ *                                        the original request (entity/owner mismatch), or the
+ *                                        CATCH_REQUEST could never be sent at all (window full) --
+ *                                        the caller MUST NOT grant anything; redirect to the same
+ *                                        no-grant completion the code already takes when no grant is
+ *                                        needed (see the call site's own doc for exactly which path).
+ *
+ * A resolved (ACCEPTED/REJECTED) entry is consumed (cleared back to NONE) the first time it is
+ * observed via this query, mirroring s_catch_pending's own "the RESULT arrived: resolved either way,
+ * never re-applied" precedent -- the putaway-rod call site is the ONLY consumer, and only ever queries
+ * once per catch. Never blocks. */
+int pc_net_game_query_catch_outcome(uint32_t entity_id);
+
+/* ================================================================================================
+ * World Ecology Wildlife Sync T4: ordinary bug catching. Reuses the EXACT SAME CATCH_REQUEST/
+ * CATCH_RESULT/WILDLIFE_DESPAWN messages and the SAME pcnetgame_validate_and_commit_catch() core T-catch
+ * already established for fish (their wire shape carries no fish-specific field -- kind is derived
+ * host-side from the authoritative record itself, never sent by the requester) -- see pc_net_game.c's
+ * own T4 top-of-section doc for the full design and pcwld_bug_species_matches_claim()/pcwld_bug_local_
+ * actor_for_entity() (pc_wildlife_authority.h) for the bug-specific pieces this reuses them alongside.
+ * ================================================================================================ */
+
+/* Client side: identical contract to pc_net_game_request_catch_fish() above, for a PC_WILDLIFE_KIND_BUG
+ * entity instead. Called from Player_actor_setup_main_Notice_net() (m_player_main_notice_net.c_inc),
+ * the exact point vanilla would otherwise call Player_actor_putin_item()/mSM_COLLECT_INSECT_SET()
+ * unconditionally, for an ORDINARY bug catch only (player->item_net_catch_type == 0 -- an ant/bee actor
+ * catch is a distinct, T5-scoped path and never reaches this function). `entity_id` comes from
+ * pc_net_game_bug_entity_id_for_label() below; `claimed_species` is the label's own insect_type;
+ * `local_grant_item` is the item this client would otherwise have granted itself (computed once, up
+ * front, exactly like the fish call site). Same return/caller contract as pc_net_game_request_catch_
+ * fish(): 1 means the caller must SKIP the vanilla grant and mSM_COLLECT_INSECT_SET() write (deferred to
+ * CATCH_RESULT); 0 means proceed with the ordinary vanilla grant, unmodified. */
+int pc_net_game_request_catch_bug(uint32_t entity_id, int claimed_species, int local_grant_item);
+
+/* Thin wrapper around pcwld_bug_entity_id_for_local_actor() (pc_wildlife_authority.h) so game files
+ * (m_player_main_notice_net.c_inc, m_player_main_putaway_net.c_inc) never need to include pc_wildlife_
+ * authority.h directly -- same separation of concerns as every other pcwld_-vs-pc_net_game_ split in this
+ * header. label_actor is player->item_net_catch_label cast back to void* (an ordinary bug catch only,
+ * player->item_net_catch_type == 0); insect_type is ((aINS_INSECT_ACTOR*)label_actor)->type. Returns 0
+ * if this exact pointer+species is not currently tracked as a live local BUG presentation entry (e.g.
+ * this bug predates T4 tracking, or an indoor round-trip invalidated the mapping -- see pcwld_bug_
+ * controller_torn_down()'s own doc) -- the caller falls through to the ordinary vanilla grant in that
+ * case, exactly like fish's own entity_id == 0 fallback. */
+uint32_t pc_net_game_bug_entity_id_for_label(const void* label_actor, int insect_type);
+
+#define PC_NETGAME_CATCH_STATUS_NONE     0
+#define PC_NETGAME_CATCH_STATUS_PENDING  1
+#define PC_NETGAME_CATCH_STATUS_ACCEPTED 2
+#define PC_NETGAME_CATCH_STATUS_REJECTED 3
+
+/* World Ecology Wildlife Sync T0: broadcasts one freshly-created authoritative wildlife record to
+ * every READY client, reliable. Called ONLY from pcwld_table_insert() (pc_wildlife_authority.c)
+ * right after a spawn decision is captured into the host's table -- never called directly from
+ * gameplay code. HOST-only (a no-op otherwise). See PCNetGameWildlifeSpawnMsg's own doc,
+ * pc_net_game.c, for the wire format. T1 UPDATE (stale as of T0): the client-side handler now
+ * materializes a REAL local vanilla fish/bug actor via pcwld_presentation_create() rather than only
+ * logging -- see pc_wildlife_authority.h/.c and pcnetgame_handle_client_wildlife_spawn() (pc_net_game.c). */
+void pc_net_game_notify_wildlife_spawn(uint32_t entity_id, int kind, int species, int bx, int bz,
+                                        float pos_x, float pos_y, float pos_z);
+
 #ifdef __cplusplus
 }
 #endif

@@ -10,6 +10,11 @@
 #include "sys_matrix.h"
 #include "m_rcp.h"
 
+#ifdef TARGET_PC
+#include "pc_wildlife_authority.h" /* World Ecology Wildlife Sync T4: pcwld_bug_controller_torn_down() --
+                                       see aINS_actor_dt()'s own doc below. ADDITIVE only. */
+#endif
+
 static aINS_CTRL_ACTOR* aINS_ctrlActor = NULL;
 static aINS_overlay_c aINS_overlay;
 static aINS_Clip_c aINS_clip;
@@ -78,4 +83,20 @@ static void aINS_actor_ct(ACTOR* actorx, GAME* game) {
 
 static void aINS_actor_dt(ACTOR* actorx, GAME* game) {
     aINS_free_clip_area();
+
+#ifdef TARGET_PC
+    /* World Ecology Wildlife Sync T4 (ordinary bug catching): aINS_ctrlActor (this file's own static
+     * global, above) is never reset to NULL here in vanilla, and the single shared aINS_CTRL_ACTOR this
+     * pointer names -- together with every one of its aINS_ACTOR_NUM insect_actor[] slots -- is torn
+     * down whenever THIS process's own town scene is unloaded (entering a house/shop/museum etc), not
+     * only on a full town change. pcwld_bug_local_actor_for_entity()/pcwld_bug_handle_wildlife_despawn()
+     * (pc_wildlife_authority.h/.c) hold raw aINS_INSECT_ACTOR* pointers into that same memory in their
+     * own bookkeeping (no unused field of aINS_INSECT_ACTOR exists to stamp an entity_id into the way
+     * fish are stamped -- see that header's own doc) -- invalidate them here, mirroring ac_gyoei.c's own
+     * `aGYO_ctrlActor = NULL` defensive fix for the exact same class of stale-pointer risk. Gated
+     * entirely behind TARGET_PC so the non-PC (matching) build is byte-for-byte unaffected; ADDITIVE
+     * only, never called from vanilla code. */
+    pcwld_bug_controller_torn_down();
+    aINS_ctrlActor = NULL;
+#endif
 }

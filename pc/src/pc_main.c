@@ -343,6 +343,12 @@ int g_pc_field_action_test_seed = 0;
  * pcnetgame_run_bury_test_seed(). */
 int g_pc_bury_test_seed = 0;
 
+/* World Ecology Wildlife Sync T0/T1 gate: --authoritative-wildlife. Off (0) by default. See
+ * pc_platform.h's own doc comment on this global for why it is a persistent MODE flag (like --host/
+ * --connect) rather than a one-shot TEST trigger, and exactly what falls through to pre-T0 vanilla
+ * behavior when it is not passed. */
+int g_pc_authoritative_wildlife = 0;
+
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * See pc_platform.h's own doc comment on these two globals. */
 int g_pc_force_villager_grow = 0;
@@ -361,6 +367,30 @@ int g_pc_force_money_bag_pickup = 0;
 /* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY: --force-dig-hole. See
  * pc_platform.h's own doc comment on this global. */
 int g_pc_force_dig_hole = 0;
+
+/* World Ecology Wildlife Sync T1 real-gameplay verification, TEST-ONLY: --force-wildlife-trigger.
+ * See pc_platform.h's own doc comment on this global. */
+int g_pc_force_wildlife_trigger = 0;
+
+/* World Ecology Wildlife Sync T-catch real-gameplay verification, TEST-ONLY: --force-fish-catch.
+ * See pc_platform.h's own doc comment on this global. */
+int g_pc_force_fish_catch = 0;
+
+/* World Ecology Wildlife Sync T4 real-gameplay verification, TEST-ONLY: --force-bug-catch.
+ * See pc_platform.h's own doc comment on this global. */
+int g_pc_force_bug_catch = 0;
+
+/* T8 audit verification, TEST-ONLY: --diag-bug-ttl-lookup <frames>. See pc_platform.h's own doc comment
+ * on this global. */
+int g_pc_diag_bug_ttl_lookup_frames = 0;
+
+/* T8 review fix verification, TEST-ONLY: --diag-bug-despawn-label-race. See pc_platform.h's own doc
+ * comment on this global. */
+int g_pc_diag_bug_despawn_label_race = 0;
+
+/* T8 audit verification, TEST-ONLY: --diag-role-link-state. See pc_platform.h's own doc comment on this
+ * global. */
+int g_pc_diag_role_link_state = 0;
 
 /* Stage 0: --bootstrap-resident N. Non-interactively binds an EXISTING resident from save slot N
  * (0..PLAYER_NUM-1) and transitions into gameplay (SCENE_FG), without driving the interactive
@@ -403,6 +433,11 @@ int main(int argc, char* argv[]) {
             printf("                      otherwise; see pc_net_game.c.\n");
             printf("  --bootstrap-resident N  Non-interactively bind existing resident slot N and enter\n");
             printf("                      gameplay, bypassing the Rover/player-select flow. See pc_m_card.c.\n");
+            printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
+            printf("                      not a one-shot test hook): activates the host-authoritative\n");
+            printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
+            printf("                      without it, every role spawns wildlife locally exactly as before\n");
+            printf("                      this milestone -- see pc_platform.h and ac_set_manager.c.\n");
             printf("  --force-villager-grow    Host-only test hook: force a villager to grow in once the\n");
             printf("                      world is ready, bypassing the real (multi-day) trigger condition\n");
             printf("                      only -- see pc_net_game.c.\n");
@@ -425,6 +460,23 @@ int main(int argc, char* argv[]) {
             printf("                      request at the --field-action-test-seed fixture's DIG_HOLE tile\n");
             printf("                      (56,105), driving the REAL unmodified dig-scoop gameplay chain to its\n");
             printf("                      real network commit point -- see pc_net_game.c and m_player.c.\n");
+            printf("  --force-wildlife-trigger  Client-only test hook: force a real\n");
+            printf("                      pc_net_game_request_wildlife_spawn_trigger() across a burst of 10\n");
+            printf("                      different acres in one frame (not a single fixed acre) --\n");
+            printf("                      requires --authoritative-wildlife -- see pc_net_game.c.\n");
+            printf("  --force-fish-catch  Host or client test hook: force a real host-local or\n");
+            printf("                      CATCH_REQUEST catch of whichever FISH entity is currently known --\n");
+            printf("                      requires --authoritative-wildlife -- see pc_net_game.c.\n");
+            printf("  --force-bug-catch   Host or client test hook: force a real host-local or\n");
+            printf("                      CATCH_REQUEST catch of whichever ordinary (non-ant) BUG entity is\n");
+            printf("                      currently known -- requires --authoritative-wildlife -- see\n");
+            printf("                      pc_net_game.c.\n");
+            printf("  --diag-bug-despawn-label-race  Host-only test hook: force this process's own\n");
+            printf("                      item_net_catch_label onto a live BUG entity's local actor, then\n");
+            printf("                      verify the entity_id<->local_actor mapping survives a raced\n");
+            printf("                      despawn (a second peer's CATCH_REQUEST for the same entity) while\n");
+            printf("                      the label is still active -- requires --authoritative-wildlife --\n");
+            printf("                      see pc_net_game.c/pc_platform.h.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -471,9 +523,24 @@ int main(int argc, char* argv[]) {
             g_pc_force_money_bag_pickup = 1;
         } else if (strcmp(argv[i], "--force-dig-hole") == 0) {
             g_pc_force_dig_hole = 1;
+        } else if (strcmp(argv[i], "--force-wildlife-trigger") == 0) {
+            g_pc_force_wildlife_trigger = 1;
+        } else if (strcmp(argv[i], "--force-fish-catch") == 0) {
+            g_pc_force_fish_catch = 1;
+        } else if (strcmp(argv[i], "--force-bug-catch") == 0) {
+            g_pc_force_bug_catch = 1;
+        } else if (strcmp(argv[i], "--diag-bug-ttl-lookup") == 0 && i + 1 < argc) {
+            g_pc_diag_bug_ttl_lookup_frames = atoi(argv[i + 1]);
+            i++;
+        } else if (strcmp(argv[i], "--diag-bug-despawn-label-race") == 0) {
+            g_pc_diag_bug_despawn_label_race = 1;
+        } else if (strcmp(argv[i], "--diag-role-link-state") == 0) {
+            g_pc_diag_role_link_state = 1;
         } else if (strcmp(argv[i], "--bootstrap-resident") == 0 && i + 1 < argc) {
             g_pc_bootstrap_resident = atoi(argv[i + 1]);
             i++;
+        } else if (strcmp(argv[i], "--authoritative-wildlife") == 0) {
+            g_pc_authoritative_wildlife = 1;
         } else if (strcmp(argv[i], "--profile") == 0) {
             g_pc_profile_enabled = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {

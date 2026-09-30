@@ -30,6 +30,9 @@
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Stage 5A: pc_net_game_role()/pc_net_game_request_pickup() -- see
                            * m_player_main_pickup.c_inc's Setup_main_Pickup seam. */
+#include "pc_wildlife_authority.h" /* T8 audit fix (Bug 3): pcwld_should_suppress_local_wildlife() --
+                                     * see m_player_main_notice_rod.c_inc / m_player_main_notice_net.c_inc's
+                                     * own catch-interception seams. */
 #endif
 
 static int l_skip_other_func_set_wade = FALSE;

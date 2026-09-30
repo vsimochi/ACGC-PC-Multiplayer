@@ -66,13 +66,68 @@ static void Player_actor_request_proc_index_fromPutaway_rod(ACTOR* actor, GAME* 
     GAME_PLAY* play = (GAME_PLAY*)game;
     mPlayer_main_putaway_rod_c* main_putaway = &player->main_data.putaway_rod;
     if (end_flag) {
-        if (main_putaway->exchange_flag) {
+        int exchange = main_putaway->exchange_flag;
+
+#ifdef TARGET_PC
+        /* World Ecology Wildlife Sync T-catch (residual review fix, post-T3 review): the player already
+         * chose "exchange" back in Notice_rod's own dialogue (state 4 there), potentially well before
+         * this frame -- during that real elapsed time, Player_actor_setup_main_Notice_rod()
+         * (m_player_main_notice_rod.c_inc) either sent a CATCH_REQUEST for this SAME fish (client under
+         * a host-authoritative session) or already resolved its own local catch synchronously (host).
+         * exchange_flag alone says nothing about whether the host actually granted this catch -- it only
+         * says the player's pockets were full and they picked "exchange" over "release." Without this
+         * check, a client whose request the host later REJECTS (lost a race for the SAME entity_id to
+         * another peer, or the CATCH_REQUEST send itself silently failed) would still reach here with
+         * exchange_flag TRUE and grant itself an item the host never actually awarded -- a genuine
+         * duplicate; the host's own local full-pockets catch has the exact same shape when a remote
+         * peer's request wins the race first. See pc_net_game_query_catch_outcome()'s own doc
+         * (pc_net_game.h) for the full status contract this reads.
+         *
+         * uki->child_actor is still safe to re-derive the entity_id from here, this many frames after
+         * Notice_rod ran: a fish this process is actively engaged with past its own point of no return
+         * (gyo_status >= 5, already guaranteed true by the time Notice_rod even ran -- see that call
+         * site's own doc) is left completely untouched by aGYO_pc_handle_wildlife_despawn(), even when
+         * some OTHER peer's catch of the SAME entity_id is broadcast in the meantime -- see that
+         * function's own "leave completely untouched" case (ac_gyoei.c). */
+        if (exchange) {
+            UKI_ACTOR* uki_check = (UKI_ACTOR*)player->fishing_rod_actor_p;
+            uint32_t entity_id = (uki_check != NULL && uki_check->child_actor != NULL)
+                                      ? aGYO_pc_get_entity_id_stamp(uki_check->child_actor)
+                                      : 0;
+            int status = pc_net_game_query_catch_outcome(entity_id);
+
+            /* REJECTED: the host never granted this catch -- must not grant here either.
+             * PENDING: no CATCH_RESULT yet (rare -- the player-paced dialogue normally outlasts the
+             * round trip, see pc_net_game_query_catch_outcome()'s own doc). Chosen policy: default to
+             * the same safe no-grant behavior as REJECTED rather than either blocking this state
+             * machine on a new wait state (a larger, riskier change for an already-rare corner case) or
+             * defaulting to grant (which is exactly the bug being fixed here).
+             * ACCEPTED or NONE (not a host-authoritative catch at all, e.g. authoritative wildlife
+             * disabled): fall through and proceed with the exchange screen exactly as before. */
+            if (status == PC_NETGAME_CATCH_STATUS_REJECTED || status == PC_NETGAME_CATCH_STATUS_PENDING) {
+                /* Log-observable for test purposes, mirroring this milestone's own established
+                   "[NET][WILDLIFE]" log-based verification convention (pc_net_game.c) -- this is the
+                   ONLY place in this file's own gameplay logic that logs, deliberately, since it is the
+                   one new decision point an automated test needs to observe without driving a real
+                   player through the full exchange-menu UI. */
+                printf("[NET][WILDLIFE] client: putaway-rod exchange screen grant suppressed for entity "
+                       "%u (outcome=%d) -- forcing no-grant completion instead\n",
+                       (unsigned)entity_id, status);
+                exchange = FALSE;
+            }
+        }
+#endif
+
+        if (exchange) {
             UKI_ACTOR* uki = (UKI_ACTOR*)player->fishing_rod_actor_p;
             mActor_name_t type = uki->get_fish_type_proc(&uki->actor_class);
 
             mSM_open_submenu_new2(&play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_EXCHANGE, type, NULL,
                                   main_putaway->angle_y);
         } else {
+            /* Not full pockets (grant already happened in Notice_rod, nothing more to do here), OR the
+             * residual-review denial above: both take this exact same completion path -- neither one
+             * needs (or, for the denial case, should perform) any grant or exchange-menu UI. */
             Player_actor_SettleRequestMainIndexPriority(actor);
             Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_1);
         }

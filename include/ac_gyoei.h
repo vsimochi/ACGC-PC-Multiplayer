@@ -165,6 +165,68 @@ extern void aGKK_actor_init(ACTOR* actorx, GAME* game); // ac_gyo_kaseki
 
 extern ACTOR_PROFILE Gyoei_Profile;
 
+#ifdef TARGET_PC
+/* World Ecology Wildlife Sync T-catch (multiplayer only -- see pc_wildlife_authority.c's own doc):
+ * these two functions are ADDITIVE, PC-only surface on top of the unmodified vanilla GYOEI actor --
+ * they never change any vanilla code path or struct layout (aGYO_CTRL_ACTOR::_1F8 is repurposed, not
+ * resized: confirmed unused anywhere else in this codebase). Defined in ac_gyoei.c, TARGET_PC-gated. */
+
+/* Stamps `entity_id` (the host-authoritative wildlife entity id -- pc_wildlife_authority.h) into a
+ * just-created fish actor's otherwise-unused _1F8 field, so a later WILDLIFE_DESPAWN can find this
+ * exact local actor again (see aGYO_pc_handle_wildlife_despawn() below). Called once, immediately
+ * after pcwld_presentation_create() recovers the newly-created actor via search_near_gyoei_proc() (both
+ * host self-presentation and a real client's WILDLIFE_SPAWN/snapshot-entry path go through that same
+ * function). A no-op if `actorx` is NULL. entity_id 0 is never stamped (0 always means "no entity"
+ * throughout this milestone, so a freshly bzero()'d, unstamped actor's _1F8 == 0 is indistinguishable
+ * from "never stamped", which is exactly the desired default). */
+void aGYO_pc_stamp_entity_id(ACTOR* actorx, u32 entity_id);
+
+/* Reads back the stamp aGYO_pc_stamp_entity_id() wrote (0 if `actorx` is NULL, is not a live fish actor,
+ * or was never stamped). Used by the client-side catch-interception seam
+ * (Player_actor_setup_main_Notice_rod(), m_player_main_notice_rod.c_inc) to recover the entity_id for
+ * `uki->child_actor` (the hooked fish actor) at the moment of catching. */
+u32 aGYO_pc_get_entity_id_stamp(ACTOR* actorx);
+
+/* WILDLIFE_DESPAWN reconciliation (World Ecology Wildlife Sync T-catch) -- see the milestone's own
+ * case doc. Finds the live fish actor (if any) THIS process itself materialized for `entity_id` (via
+ * the _1F8 stamp above) among the aGYO_MAX_GYOEI local fish slots, and applies exactly one of:
+ *   1. Not engaged by this process's own fishing rod (bobber) actor, and not even in the "approaching
+ *      the bobber" state (gyo_flags & 2, see Case 3 below): sets the SAME deferred-destroy flag
+ *      (gyo_flags |= 0x20) vanilla's own aGYO_actor_move() already checks every tick -- clean, ordinary
+ *      removal on the very next tick, no new destruction path invented.
+ *   2. Engaged by this process's own bobber, but BEFORE aUKI_bite()'s point of no return (gyo_status <
+ *      5): the exact same pair of writes vanilla's own bite-timeout escape path already uses
+ *      (ac_gyo_test.c) -- uki->gyo_command = 0 and gyo_flags |= 0x20.
+ *   3. (Bug D partial fix, post-T3 review) Not engaged by this process's own bobber, but IS in the
+ *      "approaching the bobber" state (gyo_flags & 2 set by aGTT_near_init(), before child_actor is
+ *      actually assigned to this fish actor): treated exactly like Case 1 (gyo_flags |= 0x20) -- no
+ *      bobber references it yet, so destroying it next tick is just as safe. Without this case such a
+ *      fish matched neither Case 1 nor Case 2 and was left as a harmless but visually-persisting
+ *      "ghost" until a later, unrelated cull.
+ *   4. Engaged AND at/past the point of no return (gyo_status >= 5), or the defensive
+ *      engaged-but-flag-mismatch edge case: left COMPLETELY untouched -- a catch already in progress on
+ *      this exact process (whether it is the one being accepted, or a now-moot race loser) must never
+ *      be interrupted; the host's own accept/reject decision for whichever specific request arrives is
+ *      what actually resolves the race, not this reconciliation.
+ * Returns 1 if a locally-stamped actor was found for entity_id (whether or not anything needed to
+ * change), 0 if this process never materialized one (already gone, or this entity_id was never seen
+ * here) -- informational only; never treated as an error by any caller. entity_id 0 always returns 0. */
+int aGYO_pc_handle_wildlife_despawn(u32 entity_id);
+
+/* Bug fix (post-T3 review, Bug C): zeroes the _1F8 entity_id stamp on every ctrl[] slot in the local
+ * fish-actor pool, unconditionally (whether or not that slot is currently `exist`). Needed because a
+ * generation change (pcwld_reset()/a new authoritative wildlife session -- pc_wildlife_authority.h)
+ * restarts the host's entity_id counter at 1, but does NOT itself touch any _1F8 stamp already sitting
+ * on a live actor from the PREVIOUS session -- without this call, a leftover old-session actor stamped
+ * entity_id=N could be mismatched against a brand-new session's unrelated entity that happens to also
+ * be assigned id=N. Callers MUST have already established that this process's own aGYO_ctrlActor is
+ * live (i.e. the town scene is actually loaded, pcfa_scene_is_town()) before calling this -- exactly
+ * the same precondition aGYO_pc_handle_wildlife_despawn() requires of its own callers, see that
+ * function's caller (pcwld_handle_wildlife_despawn(), pc_wildlife_authority.c) for the exact pattern.
+ * A no-op if aGYO_ctrlActor is NULL (no fish-actor pool exists at all right now). */
+void aGYO_pc_clear_all_entity_stamps(void);
+#endif /* TARGET_PC */
+
 #ifdef __cplusplus
 }
 #endif

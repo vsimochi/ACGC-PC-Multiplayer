@@ -78,7 +78,41 @@ static void Player_actor_request_proc_index_fromPutaway_net(ACTOR* actor, GAME* 
     mPlayer_main_putaway_net_c* main_putaway = &player->main_data.putaway_net;
 
     if (end_flag) {
-        if (main_putaway->exchange_flag) {
+        int exchange = main_putaway->exchange_flag;
+
+#ifdef TARGET_PC
+        /* World Ecology Wildlife Sync T4 (residual review fix, mirroring the post-T3 fish fix exactly --
+         * see Player_actor_request_proc_index_fromPutaway_rod()'s own doc, m_player_main_putaway_rod.
+         * c_inc, for the full rationale). The player already chose "exchange" back in Notice_net's own
+         * dialogue, potentially well before this frame -- during that elapsed time, Player_actor_setup_
+         * main_Notice_net() either sent a CATCH_REQUEST for this SAME bug (client under a host-
+         * authoritative session) or already resolved its own local catch synchronously (host).
+         * exchange_flag alone says nothing about whether the host actually granted this catch. Without
+         * this check, a client whose request the host later REJECTS (lost a race for the same bug to
+         * another peer, or the CATCH_REQUEST send itself silently failed) would still reach here with
+         * exchange_flag TRUE and grant itself an item the host never actually awarded -- a genuine
+         * duplicate. Ordinary bug catches only (item_net_catch_type == 0) -- an ant/bee actor catch never
+         * goes through pc_net_game_request_catch_bug() at all (T5-scoped), so it has no tracked outcome
+         * to query here and always falls through unchanged. */
+        if (exchange && player->item_net_catch_type == 0) {
+            u32 label_check = player->item_net_catch_label;
+            uint32_t entity_id =
+                (label_check != 0)
+                    ? pc_net_game_bug_entity_id_for_label((void*)label_check,
+                                                          ((aINS_INSECT_ACTOR*)label_check)->type)
+                    : 0;
+            int status = pc_net_game_query_catch_outcome(entity_id);
+
+            if (status == PC_NETGAME_CATCH_STATUS_REJECTED || status == PC_NETGAME_CATCH_STATUS_PENDING) {
+                printf("[NET][WILDLIFE] client: putaway-net exchange screen grant suppressed for entity "
+                       "%u (outcome=%d) -- forcing no-grant completion instead\n",
+                       (unsigned)entity_id, status);
+                exchange = FALSE;
+            }
+        }
+#endif
+
+        if (exchange) {
             if (player->item_net_catch_type == 0) {
                 mSM_open_submenu_new2(
                     &play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_EXCHANGE,

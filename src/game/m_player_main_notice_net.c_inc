@@ -50,6 +50,89 @@ static void Player_actor_setup_main_Notice_net(ACTOR* actor, GAME* game) {
             int i;
             int mark_check;
 
+#ifdef TARGET_PC
+            /* World Ecology Wildlife Sync T4 (ordinary bug catching only -- T8 audit comment-accuracy
+             * fix: `type != 0` is specifically a BEE catch, not "ant/bee" -- Player_actor_CatchSomething
+             * Check_common() (m_player_main_swing_net.c_inc) only sets item_net_catch_type != 0 when
+             * `label` is a distinct ACTOR profile, mAc_PROFILE_BEE, rather than an ordinary
+             * aINS_INSECT_ACTOR*; an ant is a perfectly ordinary aINS_INSECT_ACTOR (type == 0, see
+             * use_mark_insect_type[] above, which lists aINS_INSECT_TYPE_ANT alongside MOSQUITO) and
+             * already flows through the entity_id-tracked path below like any other bug. The outcome
+             * this gate produces (`type == 0` only) is, and always was, correct -- only this comment's
+             * description of WHICH species take the untouched branch was wrong. A bee catch, type != 0,
+             * is a distinct special case and is left completely untouched by this block, exactly as
+             * vanilla). Same Option A design T3 already established for fish: defer
+             * the actual grant + collection-bit write until the HOST accepts, rather than granting
+             * optimistically and trying to claw it back later. `main_notice->not_full_pocket` is still
+             * driven purely by the local free-slot check alone, exactly like vanilla -- the release-or-
+             * keep dialogue flow (Player_actor_MessageControl_Notice_net(), below) is unchanged either
+             * way.
+             *
+             * Bug fix parity (mirrors the post-T3 fish review fix, m_player_main_notice_rod.c_inc): a
+             * full-pockets catch (free_space < 0) STILL goes through the network path -- the host's
+             * authoritative record for this entity must be removed and the despawn broadcast exactly
+             * once for every successful vanilla catch regardless of pocket space, or a full-pockets catch
+             * would later be exchanged for an item at Player_actor_request_proc_index_fromNotice_net()'s
+             * own "exchange" choice with ZERO host involvement -- see pc_net_game_query_catch_outcome()'s
+             * own gate in m_player_main_putaway_net.c_inc for the other half of that same fix. */
+            {
+                int grant_handled = FALSE;
+
+                if (type == 0 && pc_net_game_authoritative_wildlife_enabled()) {
+                    uint32_t entity_id = pc_net_game_bug_entity_id_for_label((void*)label, idx);
+
+                    if (entity_id != 0 && pc_net_game_world_is_host_authoritative()) {
+                        /* Host-authoritative client: send CATCH_REQUEST; the grant + collection-bit
+                           commit happen later, on CATCH_RESULT accept (pcnetgame_handle_client_catch_
+                           result(), pc_net_game.c). Full pockets: local_item is 0 (nothing can be
+                           granted into a full pocket) -- the host is still told about the catch. */
+                        mActor_name_t local_item = (free_space >= 0) ? item : (mActor_name_t)0;
+                        if (pc_net_game_request_catch_bug(entity_id, idx, (int)local_item)) {
+                            grant_handled = TRUE;
+                        }
+                    } else if (entity_id != 0 && pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                        /* Host's own local catch: resolves synchronously against the authoritative
+                           table -- the vanilla grant + collection-bit write below run UNMODIFIED only if
+                           accepted, with NO network round-trip to itself. */
+                        if (pc_net_game_host_local_wildlife_catch(entity_id, idx)) {
+                            if (free_space >= 0) {
+                                Player_actor_putin_item(free_space, item, NULL);
+                            }
+                            if (idx != aINS_INSECT_TYPE_SPIRIT) {
+                                mSM_COLLECT_INSECT_SET(idx);
+                            }
+                        }
+                        grant_handled = TRUE;
+                    } else if (entity_id != 0 && pcwld_should_suppress_local_wildlife()) {
+                        /* T8 audit fix (Bug 3): mirrors the fish catch-seam fix (m_player_main_notice_
+                           rod.c_inc) -- a DISCONNECTED client (role still CLIENT, link no longer READY)
+                           used to fall through to the plain vanilla grant below for a bug that WAS
+                           tracked (entity_id != 0), an unauthoritative duplicate risk once reconnected.
+                           Deny locally instead, same observable outcome as a host REJECT. */
+                        printf("[NET][WILDLIFE] client: bug entity %u catch denied locally -- disconnected "
+                               "(Bug 3 fix, see pc_wildlife_authority.h's own pcwld_should_suppress_local_"
+                               "wildlife() doc)\n",
+                               (unsigned)entity_id);
+                        grant_handled = TRUE;
+                    }
+                    /* entity_id == 0 (no tracked local BUG presentation entry for this exact label -- e.g.
+                       this bug predates T4 tracking, or an indoor round-trip invalidated the mapping, see
+                       pcwld_bug_controller_torn_down()'s own doc): falls through to the plain vanilla
+                       grant below rather than silently losing a real catch. */
+                }
+
+                if (!grant_handled) {
+                    if (free_space >= 0) {
+                        Player_actor_putin_item(free_space, item, NULL);
+                    }
+                    if (idx != aINS_INSECT_TYPE_SPIRIT) {
+                        mSM_COLLECT_INSECT_SET(idx);
+                    }
+                }
+
+                main_notice->not_full_pocket = (free_space >= 0) ? TRUE : FALSE;
+            }
+#else
             if (free_space >= 0) {
                 Player_actor_putin_item(free_space, item, NULL);
                 main_notice->not_full_pocket = TRUE;
@@ -60,6 +143,7 @@ static void Player_actor_setup_main_Notice_net(ACTOR* actor, GAME* game) {
             if (idx != aINS_INSECT_TYPE_SPIRIT) {
                 mSM_COLLECT_INSECT_SET(idx);
             }
+#endif
 
             mark_check = FALSE;
             for (i = 0; i < 2; i++) {

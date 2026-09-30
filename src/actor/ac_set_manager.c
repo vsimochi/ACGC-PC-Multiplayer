@@ -6,6 +6,13 @@
 #include "libultra/libultra.h"
 #include "ac_set_ovl_insect.h"
 #include "ac_set_ovl_gyoei.h"
+#include "pc_wildlife_authority.h" /* T8 audit fix (Bug 3): pcwld_should_suppress_local_wildlife() --
+                                       see that function's own doc for why the local-fallback branch
+                                       below must not run while disconnected but still role CLIENT */
+#include "pc_net_game.h" /* World Ecology Wildlife Sync T0: pc_net_game_world_is_host_authoritative(),
+                            * pc_net_game_role(), pc_net_game_request_wildlife_spawn_trigger(),
+                            * pc_net_game_host_local_wildlife_spawn_trigger() -- see
+                            * aSetMgr_move_set()'s own doc below. */
 
 /**
  * @brief Gets the X & Z acre the player is currently in.
@@ -186,7 +193,68 @@ static int aSetMgr_move_set(GAME_PLAY* play, SET_MANAGER* set_manager) {
 
   if (aSetMgr_ovl(&set_manager->set_overlay, set_manager->set_ovl_type) == TRUE &&
       set_manager->set_overlay.ovl_proc != NULL) {
+#ifdef TARGET_PC
+      /* World Ecology Wildlife Sync T0 (authority seam foundation only -- see
+       * pc_wildlife_authority.h's own scope doc: NOT fish/bug catching, NOT a snapshot). This is the
+       * exact point SET_MANAGER invokes one overlay per call from
+       * proc_table = {aSOI_insect_set, aSOG_gyoei_set} (aSetMgr_ovl() above), advancing
+       * set_ovl_type each call -- insects fire on this tick (aSetMgr_OVERLAY_BEGIN ==
+       * aSetMgr_OVERLAY_INSECT) and fish fire on the NEXT tick of the same wade-entry sequence.
+       *
+       * OPT-IN GATE (--authoritative-wildlife, g_pc_authoritative_wildlife via
+       * pc_net_game_authoritative_wildlife_enabled() -- see pc_platform.h/pc_net_game.h): even though
+       * T1 added a real client-side presentation/rendering path (pcwld_presentation_create() in
+       * pc_wildlife_authority.c, materializing an actual vanilla actor from a network-authoritative
+       * record on host and remote clients alike), this seam must still NEVER silently replace
+       * vanilla's local wildlife spawning in ordinary multiplayer play. When
+       * the flag is OFF (the default), this whole seam is skipped and every role -- single-player,
+       * host, and client alike -- falls through to the EXACT pre-T0 behavior: a single, unmodified,
+       * unconditional aSOI_insect_set()/aSOG_gyoei_set() call on every tick, precisely as if this
+       * #ifdef block did not exist (confirmed against this file's own pre-T0 history: before this
+       * milestone touched this function, TARGET_PC took no branch here at all and called
+       * set_manager->set_overlay.ovl_proc(set_manager, play) unconditionally, identically to the
+       * #else arm below). Only when the flag is ON does the host-authoritative interception below
+       * apply.
+       *
+       * A host-authoritative client must never roll either decision locally; a host must resolve
+       * both authoritatively (through pc_wildlife_authority.c's adapter, which itself invokes BOTH
+       * aSOI_insect_set() and aSOG_gyoei_set() together for the acre -- see
+       * pcwld_host_spawn_trigger()'s own doc). Gating each of the two ticks separately would
+       * therefore send/trigger the network path twice for one wade event -- instead, the request /
+       * host-local trigger fires ONCE, on the first (INSECT) tick only; the second (GYOEI) tick for
+       * this same wade event is a pure network no-op below (already covered by the first tick's
+       * trigger). Single-player (pc_net_game_role() == PC_NETGAME_ROLE_NONE) falls through to the
+       * plain, unmodified vanilla call on BOTH ticks, exactly as before. */
+      if (!pc_net_game_authoritative_wildlife_enabled()) {
+          set_manager->set_overlay.ovl_proc(set_manager, play);
+      }
+      else if (set_manager->set_ovl_type == aSetMgr_OVERLAY_BEGIN &&
+          pc_net_game_world_is_host_authoritative()) {
+          pc_net_game_request_wildlife_spawn_trigger(set_manager->player_pos.next_bx,
+                                                     set_manager->player_pos.next_bz);
+      }
+      else if (set_manager->set_ovl_type == aSetMgr_OVERLAY_BEGIN &&
+               pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+          pc_net_game_host_local_wildlife_spawn_trigger(set_manager->player_pos.next_bx,
+                                                        set_manager->player_pos.next_bz);
+      }
+      else if (!pc_net_game_world_is_host_authoritative() && pc_net_game_role() != PC_NETGAME_ROLE_HOST &&
+               !pcwld_should_suppress_local_wildlife()) {
+          /* T8 audit fix (Bug 3): pc_net_game_world_is_host_authoritative() is FALSE both for single-
+           * player (role NONE, the intended case for this branch) AND for a DISCONNECTED client (role
+           * still CLIENT, link no longer READY) -- without the extra pcwld_should_suppress_local_
+           * wildlife() check, a disconnected client fell through to here and rolled a full LOCAL vanilla
+           * spawn decision with its own RNG, un-authoritative and liable to duplicate the host's own
+           * still-live authoritative record for the same acre once reconnected. Single-player is
+           * unaffected (pcwld_should_suppress_local_wildlife() is only ever true for role CLIENT). */
+          set_manager->set_overlay.ovl_proc(set_manager, play);
+      }
+      /* else: host or host-authoritative client on the GYOEI (second) tick of this same wade event
+       * (already handled on the INSECT tick above), OR a disconnected client (Bug 3 fix, just above) --
+       * intentionally no-op here in either case. */
+#else
       set_manager->set_overlay.ovl_proc(set_manager, play);
+#endif
       set_manager->set_ovl_type++;
   }
   else {

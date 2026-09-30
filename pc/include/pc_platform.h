@@ -94,6 +94,21 @@ extern int           g_pc_field_action_test_seed; /* World Ecology Stage 1: --fi
                                                      * pcnetgame_run_field_action_test_seed() */
 extern int           g_pc_bury_test_seed; /* World Ecology T3: --bury-test-seed -- see pc_net_game.c's
                                              * pcnetgame_run_bury_test_seed() */
+/* World Ecology Wildlife Sync T0/T1 gate: --authoritative-wildlife. UNLIKE the *_test_seed/force-*
+ * hooks above (one-shot TEST triggers), this is a persistent MODE flag -- it stays in effect for the
+ * whole process lifetime, the same way --host/--connect select a persistent role. Off (0) by
+ * default: in that default state, aSetMgr_move_set() (ac_set_manager.c) and
+ * pc_net_game_request_wildlife_spawn_trigger()/pc_net_game_host_local_wildlife_spawn_trigger()
+ * (pc_net_game.c) all fall through to EXACTLY the pre-T0 vanilla behavior (every role calls
+ * aSOI_insect_set()/aSOG_gyoei_set() locally, unmodified, on every tick) -- the new host-authoritative
+ * wildlife adapter (pc_wildlife_authority.c) is reachable ONLY when this flag is explicitly passed,
+ * since running that adapter and its T1 client-side presentation path
+ * (pcwld_presentation_create(), which materializes a REAL local vanilla fish/bug actor from a host's
+ * decision) on one side while the other side is still doing ordinary vanilla local spawning would
+ * double-spawn wildlife -- see pcnetgame_handle_host_wildlife_spawn_trigger_request()'s and
+ * pcnetgame_handle_client_wildlife_spawn()'s own gate checks (pc_net_game.c) for the enforcement.
+ * See pc_main.c's CLI parsing and ac_set_manager.c's own gate doc for the exact fallthrough shape. */
+extern int           g_pc_authoritative_wildlife;
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * Fire mNpc_DebugForceGrow()/mNpc_DebugForceRemove() (m_npc.c) once, as soon as the host world is
  * ready -- see pc_net_game.c's pcnetgame_run_villager_test_triggers(). Off by default; never active
@@ -153,6 +168,120 @@ extern int           g_pc_force_money_bag_pickup;
  * request path does not require a shovel to be out), never any part of the dig/fill/commit logic
  * itself. */
 extern int           g_pc_force_dig_hole;
+/* World Ecology Wildlife Sync T1 real-gameplay verification, TEST-ONLY: --force-wildlife-trigger.
+ * CLIENT-only, mirrors g_pc_force_dig_hole's own exact pattern (off by default, fires exactly once
+ * -- see pc_net_game.c's pcnetgame_run_wildlife_trigger_test_trigger()). Unlike force-dig-hole, no
+ * teleport or reach-check wait is needed: calls pc_net_game_request_wildlife_spawn_trigger() directly,
+ * once per acre across a fixed burst of 10 different addressable acres in a single frame (NOT a
+ * single fixed acre -- see pcnetgame_run_wildlife_trigger_test_trigger()'s own s_acres[] table,
+ * pc_net_game.c, for the exact list and why more than one acre is fired), the exact real client-side
+ * network seam a genuine wade-entry sequence (aSetMgr_move_set()/mFI_CheckPlayerWade(),
+ * ac_set_manager.c) already calls -- bypassing only the real wade/water-tile detection itself, never
+ * any part of the host decision, broadcast, or presentation logic that follows. Requires
+ * --authoritative-wildlife to have any effect. */
+extern int           g_pc_force_wildlife_trigger;
+/* World Ecology Wildlife Sync T-catch real-gameplay verification, TEST-ONLY: --force-fish-catch.
+ * BOTH roles (unlike every other force-* hook above, which is host-only or client-only) -- mirrors
+ * g_pc_force_wildlife_trigger's own "no teleport/reach-check needed" pattern, but bypasses fishing's
+ * own multi-stage cast/float/bite/hook state machine entirely (judged too complex and non-deterministic
+ * to drive via a simple force-flag the way a single dig-scoop request or wade-trigger send can be --
+ * see pcnetgame_run_fish_catch_test_trigger_host()/_client()'s own doc, pc_net_game.c, for the full
+ * rationale). HOST: once at least one live FISH entity exists in the authoritative table (typically
+ * seeded via --force-wildlife-trigger first), calls pc_net_game_host_local_wildlife_catch() directly
+ * with that record's own species and, on accept, grants the item exactly like the real
+ * Player_actor_setup_main_Notice_rod() seam would -- bypassing only the requirement that a real UKI
+ * (fishing rod/bobber) actor be cast, floated, and bitten first, never any part of the host validation,
+ * removal, or despawn-broadcast logic itself. CLIENT: once this client has observed at least one
+ * WILDLIFE_SPAWN broadcast for a FISH entity, calls the REAL pc_net_game_request_catch_fish() network
+ * seam directly with that entity's own species -- the exact same function the real client-side seam
+ * calls -- and the REAL pcnetgame_handle_client_catch_result() then grants the item on accept, exactly
+ * as a genuine catch would. Fires exactly once per role. Requires --authoritative-wildlife. */
+extern int           g_pc_force_fish_catch;
+/* World Ecology Wildlife Sync T4 real-gameplay verification, TEST-ONLY: --force-bug-catch.
+ * Faithful mirror of g_pc_force_fish_catch's own exact pattern above, adapted for ordinary BUG catching
+ * (T4's extension of the same shared pcnetgame_validate_and_commit_catch()/pcnetgame_request_catch_common()
+ * core to PC_WILDLIFE_KIND_BUG -- see pc_net_game_request_catch_bug()'s own doc, pc_net_game.h). BOTH
+ * roles, same as --force-fish-catch. HOST: once at least one live BUG entity exists in the authoritative
+ * table whose species is NOT aINS_INSECT_TYPE_ANT (ants are deliberately excluded by
+ * pcnetgame_validate_and_commit_catch() itself -- see that function's own doc, pc_net_game.c -- so the
+ * host trigger skips them rather than wasting its one-shot fire on a claim guaranteed to be rejected),
+ * calls pc_net_game_host_local_wildlife_catch() directly with that record's own species and, on accept,
+ * grants the item exactly like the real Player_actor_setup_main_Notice_net() seam would (m_player_main_
+ * notice_net.c_inc) -- bypassing only the requirement that a real net be swung and connect with a live
+ * insect actor first, never any part of the host validation, removal, or despawn-broadcast logic itself.
+ * CLIENT: once this client has observed at least one WILDLIFE_SPAWN broadcast (or late-join snapshot
+ * entry) for a non-ant BUG entity, calls the REAL pc_net_game_request_catch_bug() network seam directly
+ * with that entity's own species -- the exact same function the real client-side seam calls -- and the
+ * REAL pcnetgame_handle_client_catch_result() then grants the item on accept, exactly as a genuine catch
+ * would. Shares the exact same teleport/move-sync-wait timing --force-fish-catch's own client trigger
+ * already established (240 frames -- see pcnetgame_run_fish_catch_test_trigger_client()'s own doc for why),
+ * since this is the identical MOVE-then-CATCH_REQUEST race-timing concern, not something specific to
+ * fish. Fires exactly once per role. Requires --authoritative-wildlife. */
+extern int           g_pc_force_bug_catch;
+/* T8 audit verification, TEST-ONLY: --diag-bug-ttl-lookup <frames>. Added specifically to re-verify Bug
+ * 1's fix (pcwld_presentation_check_idle()/pcwld_presentation_reconcile(), pc_wildlife_authority.c)
+ * through the REAL net->side-table lookup path -- the audit explicitly flagged that --force-bug-catch
+ * does NOT exercise this path (its host branch reads the AUTHORITATIVE table's own entity_id directly and
+ * never calls pcwld_bug_entity_id_for_local_actor(), and its client branch never runs on the host at all).
+ * When set (frames > 0), HOST role only: (1) temporarily overrides the normally-fixed, ~10-minute
+ * PCWLD_RECORD_MAX_AGE_60FPS_FRAMES idle-expiry threshold (pc_wildlife_authority.c) to this many 60fps
+ * frames, for BOTH pcwld_host_check_idle() and pcwld_presentation_check_idle(), so a short test run can
+ * actually cross the threshold; (2) once at least one live, non-ant BUG entity exists, repeatedly calls
+ * pc_net_game_bug_entity_id_for_label() -- the EXACT SAME public wrapper around pcwld_bug_entity_id_
+ * for_local_actor() that Player_actor_setup_main_Notice_net() (m_player_main_notice_net.c_inc) calls for
+ * a real net-swing catch -- with that entity's own recorded local_actor pointer and species, and logs the
+ * result every ~0.5s until well past the (overridden) TTL. This exercises the REAL production lookup
+ * function end-to-end; it does NOT simulate an actual net-swing collision (judged impractical to automate
+ * throughout this codebase, see test_wildlife_bug_catch.py's own doc) -- reported as PROTOCOL+HOST-LOGIC
+ * TESTED, not REAL GAMEPLAY TESTED. A complete no-op when 0 (the default) or when authoritative wildlife
+ * is not enabled. */
+extern int           g_pc_diag_bug_ttl_lookup_frames;
+/* T8 review fix verification, TEST-ONLY: --diag-bug-despawn-label-race. Added specifically to reproduce
+ * and verify the fix for the regression an independent review found in Bug 2 part (b)'s original
+ * "clear local_actor immediately on despawn" change (pcwld_bug_handle_wildlife_despawn(),
+ * pc_wildlife_authority.c): vanilla deliberately keeps a netted bug's actor ALIVE while it is the local
+ * player's own current item_net_catch_label (mPlib_Get_item_net_catch_label(), ac_insect_move.c_inc's own
+ * aINS_cull_check() refuses to run aINS_destruct() on it) -- so when a DIFFERENT peer's catch on the SAME
+ * entity_id is accepted FIRST, the resulting WILDLIFE_DESPAWN can be reconciled on THIS process while its
+ * own local actor is still genuinely alive and still the active catch label. The removed part (b) would
+ * have wiped the entity_id<->local_actor mapping right then anyway, so the label-holder's own later
+ * catch-completion lookup (pc_net_game_bug_entity_id_for_label(), which Player_actor_setup_main_
+ * Notice_net()/the putaway-net exchange gate both call) would incorrectly see "untracked" (0) instead of
+ * the real, losing entity_id.
+ * HOST role only (host is the easier role to force this scenario onto a live bug actor without a second
+ * process -- the property under test, "does the despawn-time reconciliation respect a still-alive local
+ * actor", is purely local per-process bookkeeping identical on host and client, exactly like --diag-bug-
+ * ttl-lookup's own precedent): (1) once at least one live, non-ant BUG entity exists, latches its
+ * entity_id/species/local_actor, teleports THIS process's own local player directly on top of it (the same
+ * safe teleport pattern pcnetgame_run_bug_catch_test_trigger_client() already uses for --force-bug-catch)
+ * so aINS_cull_check()'s own distance/visibility cull rules never call aINS_destruct() on it during this
+ * diagnostic's race window -- keeping exist_flag genuinely TRUE regardless of the label -- and, best-
+ * effort, also calls mPlib_Change_item_net_catch_label() to point this process's own catch label at the
+ * exact actor (confirmed BY TESTING to be a harmless no-op here, since Player_actor_Get_item_net_catch_
+ * label() only ever honors that field while player->now_main_index is one of the four real net states,
+ * which this diagnostic deliberately does not force this process's own player into -- driving that FSM
+ * state directly was judged unsafe to fake outside real net-swing input); (2) waits for pcwld_find_by_id()
+ * to report the entity removed from the authoritative table (driven externally -- see test_wildlife_bug_
+ * catch.py's own TEST for this flag -- by a raced CATCH_REQUEST for the SAME entity_id from a second peer,
+ * which the host accepts since it never issued its own catch attempt); (3) the instant the removal is
+ * observed, queries pc_net_game_bug_entity_id_for_label() for the SAME (local_actor, species) pair and logs
+ * PASS (still resolves to the original entity_id -- the fix holds) or FAIL (0 -- the regression), together
+ * with the actor's own exist_flag/insect_flags.destruct at that instant (the test script cross-checks
+ * exist_flag == TRUE to confirm this run genuinely reproduced the "still alive at despawn time"
+ * precondition, not a vacuous pass against an already-dead actor). A complete no-op when 0 (the default) or
+ * when authoritative wildlife is not enabled. */
+extern int           g_pc_diag_bug_despawn_label_race;
+/* T8 audit verification, TEST-ONLY: --diag-role-link-state. Added specifically to re-verify Bug 3's fix
+ * (pcwld_should_suppress_local_wildlife(), pc_wildlife_authority.c) across a REAL host-connection-loss
+ * event. Any role: once per ~1s, prints pc_net_game_role(), pc_net_game_client_link_state(),
+ * pc_net_game_world_is_host_authoritative(), and pcwld_should_suppress_local_wildlife() together on one
+ * line. The property under test: while a real CLIENT's transport connection is lost (a real
+ * PC_NET_EVENT_PEER_DISCONNECTED, e.g. the host process dying), s_role stays PC_NETGAME_ROLE_CLIENT (only
+ * an explicit return-to-menu resets it to NONE -- confirmed by reading pc_net_game.c's own event handler)
+ * while s_client_link leaves PC_NETGAME_LINK_READY -- so pc_net_game_world_is_host_authoritative() drops
+ * to 0 (identical to single-player) but pcwld_should_suppress_local_wildlife() correctly STAYS 1 (unlike
+ * single-player, where it is always 0). A complete no-op when 0 (the default). */
+extern int           g_pc_diag_role_link_state;
 extern int           g_pc_frame_limit_override;
 extern int           g_pc_speedhack_enabled;
 extern int           g_pc_time_override;

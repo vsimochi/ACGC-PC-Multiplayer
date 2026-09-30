@@ -146,6 +146,15 @@
 #include "pc_net.h"
 #include "pc_remote_player.h"
 #include "pc_field_authority.h" /* v2: persistent town-field addressing/authority (Workstream C) */
+#include "pc_wildlife_authority.h" /* World Ecology Wildlife Sync T0: host-authoritative wildlife table */
+#include "ac_gyoei.h"       /* World Ecology Wildlife Sync T-catch: aGYO_TYPE_NUM/aGYO_TYPE_SALMON2 --
+                                see pcnetgame_validate_catch()/PCNetGameCatchRequestMsg's own doc */
+#include "ac_insect_h.h"    /* World Ecology Wildlife Sync T4: aINS_INSECT_TYPE_ANT/aINS_INSECT_TYPE_SPIRIT
+                                -- see pcnetgame_validate_and_commit_catch()/pcnetgame_handle_client_
+                                catch_result()'s own doc */
+#include "m_submenu.h"      /* World Ecology Wildlife Sync T-catch: mSM_COLLECT_FISH_SET()/
+                                mSM_COLLECT_INSECT_SET() -- see pcnetgame_handle_client_catch_result()'s
+                                own doc */
 
 #include "m_common_data.h"
 #include "m_private.h"
@@ -335,6 +344,68 @@ typedef enum PCNetGameMsgType {
                                              * reliable, world_seq-stamped (its OWN sequence,
                                              * s_snowman_world_seq -- independent of s_world_seq). See
                                              * PCNetGameSnowmanStateMsg. */
+    PC_NETGAME_MSG_WILDLIFE_SPAWN_TRIGGER_REQUEST = 36, /* World Ecology Wildlife Sync T0: client ->
+                                             * host only, reliable. Reports a genuine wade-start event
+                                             * into an acre -- carries ONLY that acre, never a
+                                             * species/RNG result/position. See
+                                             * PCNetGameWildlifeSpawnTriggerRequestMsg and
+                                             * pc_net_game_request_wildlife_spawn_trigger(). */
+    PC_NETGAME_MSG_WILDLIFE_SPAWN        = 37, /* World Ecology Wildlife Sync T0/T1: host -> every
+                                             * READY client, reliable. One freshly-created authoritative
+                                             * wildlife record. See PCNetGameWildlifeSpawnMsg and
+                                             * pc_net_game_notify_wildlife_spawn(). T1 UPDATE (stale as
+                                             * of T0): the client handler
+                                             * (pcnetgame_handle_client_wildlife_spawn()) is no longer
+                                             * log-only -- it now materializes a REAL local vanilla
+                                             * fish/bug actor via pcwld_presentation_create() (see
+                                             * pc_wildlife_authority.h/.c), gated on
+                                             * g_pc_authoritative_wildlife being enabled on this
+                                             * client. */
+    PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_BEGIN = 38, /* World Ecology Wildlife Sync T2: host -> one
+                                             * client, reliable. Late-join/reconnect coverage for the
+                                             * authoritative wildlife table (which WILDLIFE_SPAWN alone
+                                             * never gives a client that connects/reconnects AFTER
+                                             * wildlife already exists) -- sent once per snapshot pass,
+                                             * between the VILLAGER_SNAPSHOT stage and the first
+                                             * WILDLIFE_SNAPSHOT_ENTRY (see pcnetgame_host_pump_
+                                             * snapshots()'s own doc, snap_stage 3). See
+                                             * PCNetGameWildlifeSnapshotBeginMsg. */
+    PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_ENTRY = 39, /* World Ecology Wildlife Sync T2: host -> one
+                                             * client, reliable. One currently-live authoritative
+                                             * wildlife record (SAME minimum field shape as
+                                             * WILDLIFE_SPAWN -- entity_id/kind/species/acre/position,
+                                             * nothing more), sent once per active table slot, flat-
+                                             * iterated over the FULL table (every acre, never filtered
+                                             * to the joining client's own acre -- see this milestone's
+                                             * own "multi-acre snapshot" requirement). See
+                                             * PCNetGameWildlifeSnapshotEntryMsg. */
+    PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_END = 40, /* World Ecology Wildlife Sync T2: host -> one client,
+                                             * reliable. Closes one WILDLIFE_SNAPSHOT_BEGIN/ENTRY* run --
+                                             * this is the signal the client's reconciliation logic
+                                             * waits for (the correct "stale" set can only be known once
+                                             * the FULL snapshot has arrived; see pcwld_presentation_
+                                             * reconcile(), pc_wildlife_authority.h/.c). See
+                                             * PCNetGameWildlifeSnapshotEndMsg. */
+    PC_NETGAME_MSG_CATCH_REQUEST         = 41, /* World Ecology Wildlife Sync T-catch (ordinary fish
+                                             * catching only -- see this milestone's own ABSOLUTE SCOPE
+                                             * LIMIT: no bug catching, tournaments, or ant/bee handling).
+                                             * Client -> host only, reliable. Claims a catch on an
+                                             * authoritative wildlife entity_id -- the item is NEVER
+                                             * granted locally before this resolves (see
+                                             * pc_net_game_request_catch_fish()'s own doc: Option A, no
+                                             * award-then-claw-back). See PCNetGameCatchRequestMsg. */
+    PC_NETGAME_MSG_CATCH_RESULT          = 42, /* World Ecology Wildlife Sync T-catch: host -> the one
+                                             * requesting client only, reliable. See
+                                             * PCNetGameCatchResultMsg. */
+    PC_NETGAME_MSG_WILDLIFE_DESPAWN      = 43, /* World Ecology Wildlife Sync T-catch: host -> every
+                                             * READY client, reliable, sent immediately after an accepted
+                                             * CATCH_REQUEST (or an accepted host-local catch) removes an
+                                             * entity from the authoritative table. Each receiver
+                                             * (including the host's own local bookkeeping) reconciles its
+                                             * OWN local presentation actor, if any, via
+                                             * pcwld_handle_wildlife_despawn() -- see that function's own
+                                             * 3-case doc (pc_wildlife_authority.h/.c). See
+                                             * PCNetGameWildlifeDespawnMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -997,7 +1068,9 @@ _Static_assert(sizeof(PCNetGameFriendshipUpdateMsg) <= PC_NET_MAX_PAYLOAD,
 
 /* host -> one client, reliable. Sent once per OCCUPIED Anmmem_c entry (late-join/reconnect coverage
  * for memories[], which VILLAGER_SNAPSHOT never carries), between VILLAGER_SNAPSHOT and
- * SNAPSHOT_END (see pcnetgame_host_pump_snapshots()'s snap_stage 3) -- iterated flat over
+ * SNAPSHOT_END (see pcnetgame_host_pump_snapshots()'s snap_stage 4 -- World Ecology Wildlife Sync T2
+ * later inserted its own wildlife sub-pass as stage 3 between VILLAGER_SNAPSHOT and this stage,
+ * pushing FRIENDSHIP_SNAPSHOT_ENTRY from its original stage 3 to stage 4) -- iterated flat over
  * (ANIMAL_NUM_MAX * ANIMAL_MEMORY_NUM) = 105 (slot, memory_idx) pairs, empty ones skipped (never
  * sent) rather than padding out a fixed-size batch, since most villagers have far fewer than 7
  * remembered players. `>=` rule (matches FIELD_BLOCK/VILLAGER_SNAPSHOT, not WORLD_META/
@@ -1438,6 +1511,217 @@ _Static_assert(sizeof(((PCNetGameSnowmanStateMsg*)0)->snowmen) == 12 &&
                    sizeof(mSN_snowman_data_c) == 4 && mSN_SAVE_COUNT == 3,
                "PCNetGameSnowmanStateMsg.snowmen size drifted from Save_t.snowmen.snowmen_data[3]");
 
+/* World Ecology Wildlife Sync T0: client -> host only, reliable, 4 bytes. Sent from the decomp
+ * wade-trigger seam (aSetMgr_move_set(), ac_set_manager.c) -- see
+ * pc_net_game_request_wildlife_spawn_trigger()'s own doc (pc_net_game.h). bx/bz are SET_MANAGER's
+ * own raw block-number player_pos.next_bx/next_bz -- a TRUST BOUNDARY (bounds-checked host-side,
+ * see pcnetgame_handle_host_wildlife_spawn_trigger_request()) but otherwise no species/RNG
+ * result/position is ever carried: the host alone decides what (if anything) spawns. Deliberately
+ * has no request_id/reply -- unlike PICKUP/DROP/BURY's two-phase shape or even
+ * FIELD_ACTION_REQUEST's one-shot-with-RESULT shape, nothing is granted back to the requester (the
+ * eventual WILDLIFE_SPAWN broadcast, if any, reaches every READY client identically, requester
+ * included -- there is nothing requester-specific to reply with). A lost/dropped send here simply
+ * means this one wade event's acre never gets evaluated -- an accepted, low-stakes gap exactly like
+ * a real vanilla wade that happens not to roll a spawn. */
+typedef struct PCNetGameWildlifeSpawnTriggerRequestMsg {
+    uint8_t msg_type; /* PC_NETGAME_MSG_WILDLIFE_SPAWN_TRIGGER_REQUEST */
+    uint8_t bx;
+    uint8_t bz;
+    uint8_t _reserved0;
+} PCNetGameWildlifeSpawnTriggerRequestMsg;
+_Static_assert(sizeof(PCNetGameWildlifeSpawnTriggerRequestMsg) == 4,
+               "PCNetGameWildlifeSpawnTriggerRequestMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWildlifeSpawnTriggerRequestMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameWildlifeSpawnTriggerRequestMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net "
+               "would drop it");
+
+/* World Ecology Wildlife Sync T0: host -> every READY client, reliable, 24 bytes. One freshly
+ * created authoritative wildlife record -- see pc_wildlife_authority.h/.c for how entity_id/
+ * kind/species/bx,bz/position are derived (the host's own narrow adapter around the unmodified
+ * vanilla aSOI_insect_set()/aSOG_gyoei_set() decision functions). Never carries a raw pointer,
+ * internal actor structure, AI state, animation state, or camera state -- only the minimum record
+ * pc_wildlife_authority.h's PcWildlifeRecord itself holds. Wildlife Sync T1: the client-side handler
+ * (pcnetgame_handle_client_wildlife_spawn()) now materializes a real local vanilla fish/bug actor
+ * from this data via pcwld_presentation_create() (pc_wildlife_authority.h/.c) -- see that function's
+ * own doc for validation/duplicate-suppression/deferred-species (ants) details. Catching, a full
+ * late-join/reconnect snapshot, tournaments, and bee/ant/latent-bug special-case networking remain
+ * explicitly out of scope (later Wildlife Sync stages). */
+typedef struct PCNetGameWildlifeSpawnMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_WILDLIFE_SPAWN */
+    uint8_t  kind;     /* PC_WILDLIFE_KIND_* (pc_wildlife_authority.h) */
+    uint8_t  bx;
+    uint8_t  bz;
+    uint32_t entity_id;
+    int32_t  species;  /* the vanilla gyo_type/insect_type enum value, verbatim */
+    float    pos_x;
+    float    pos_y;
+    float    pos_z;
+} PCNetGameWildlifeSpawnMsg;
+_Static_assert(sizeof(PCNetGameWildlifeSpawnMsg) == 24, "PCNetGameWildlifeSpawnMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWildlifeSpawnMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameWildlifeSpawnMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* ================================================================================================
+ * World Ecology Wildlife Sync T2: late-join/reconnect snapshot (SNAPSHOT_BEGIN/.../SNAPSHOT_END
+ * pump, snap_stage 3 -- see pcnetgame_host_pump_snapshots()'s own doc). NOT a new independent packet
+ * flow: nested inside the existing outer snapshot exactly like VILLAGER_SNAPSHOT/
+ * FRIENDSHIP_SNAPSHOT_ENTRY already are. `epoch` on every one of these three messages is the SAME
+ * outer PCNetGameSnapshotBeginMsg.epoch this peer's whole snapshot pass is using -- staleness/
+ * supersession (a peer's snapshot restarting mid-pump, e.g. from a large field change or a dropped
+ * send) is therefore already fully covered by the EXISTING epoch-match rule FIELD_BLOCK itself uses
+ * (pcnetgame_handle_client_field_block()), reused verbatim rather than inventing a second, wildlife-
+ * specific staleness mechanism (see the milestone brief's own explicit guidance on this point).
+ * ================================================================================================ */
+/* host -> one client, reliable, 16 bytes. Opens one wildlife-snapshot sub-pass. `generation` is the
+ * host's pcwld_session_generation() at pass-start (pc_wildlife_authority.h) -- the signal a client
+ * uses to tell "the SAME authoritative wildlife session I already have local bookkeeping for" (any
+ * generation it already saw once) apart from "a NEW session began since I last saw one" (0 -- never
+ * seen one yet -- or a DIFFERENT value than last time): see pcnetgame_handle_client_wildlife_
+ * snapshot_begin()'s own doc for exactly what each case does. `count` is purely an advance-notice/
+ * diagnostic aid (how many WILDLIFE_SNAPSHOT_ENTRY messages will follow before END), mirroring
+ * PCNetGameSnapshotBeginMsg's own acre_count field's role for FIELD_BLOCK -- never itself load-bearing
+ * for correctness (the client's actual "snapshot complete" signal is WILDLIFE_SNAPSHOT_END, not a
+ * count reaching zero). */
+typedef struct PCNetGameWildlifeSnapshotBeginMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_BEGIN */
+    uint8_t  _reserved0[3];
+    uint32_t epoch;
+    uint32_t generation;
+    uint32_t count;
+} PCNetGameWildlifeSnapshotBeginMsg;
+_Static_assert(sizeof(PCNetGameWildlifeSnapshotBeginMsg) == 16,
+               "PCNetGameWildlifeSnapshotBeginMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWildlifeSnapshotBeginMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameWildlifeSnapshotBeginMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would "
+               "drop it");
+
+/* host -> one client, reliable, 28 bytes. One currently-live authoritative wildlife record -- the
+ * EXACT SAME minimum field shape as PCNetGameWildlifeSpawnMsg above (entity_id/kind/species/bx,bz/
+ * position; never a raw pointer, actor address, local animation/flee-timer state, or camera state --
+ * see that struct's own doc), with `epoch` appended for the staleness rule described above. Sent once
+ * per currently-active pc_wildlife_authority.c table slot, flat-iterated over the WHOLE table (every
+ * acre unconditionally -- see pcnetgame_build_wildlife_snapshot_entry()'s own doc), mirroring
+ * pcnetgame_build_friendship_snapshot_entry()'s own flat-iteration-with-skip convention exactly. The
+ * receiving client always materializes a real local actor for every one of these via the SAME
+ * pcwld_presentation_create() an ordinary WILDLIFE_SPAWN already uses (T1) -- this milestone does NOT
+ * add acre-relevance filtering on the client side, deliberately matching T1's own existing
+ * unconditional-creation behavior rather than inventing a new client-side scoping rule. */
+typedef struct PCNetGameWildlifeSnapshotEntryMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_ENTRY */
+    uint8_t  kind;     /* PC_WILDLIFE_KIND_* (pc_wildlife_authority.h) */
+    uint8_t  bx;
+    uint8_t  bz;
+    uint32_t entity_id;
+    int32_t  species;  /* the vanilla gyo_type/insect_type enum value, verbatim */
+    float    pos_x;
+    float    pos_y;
+    float    pos_z;
+    uint32_t epoch;
+} PCNetGameWildlifeSnapshotEntryMsg;
+_Static_assert(sizeof(PCNetGameWildlifeSnapshotEntryMsg) == 28,
+               "PCNetGameWildlifeSnapshotEntryMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWildlifeSnapshotEntryMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameWildlifeSnapshotEntryMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would "
+               "drop it");
+
+/* host -> one client, reliable, 16 bytes. Closes one WILDLIFE_SNAPSHOT_BEGIN/ENTRY* run.
+ * `count_sent` is the actual number of WILDLIFE_SNAPSHOT_ENTRY messages this pass sent (cross-checked
+ * only for logging/diagnostics against BEGIN's advance-notice `count` -- see that struct's own doc;
+ * the two are expected to always match since nothing else can change the authoritative table
+ * mid-pump, but a mismatch is not treated as fatal, only logged, matching this codebase's general
+ * "log and continue" posture for a diagnostic-only cross-check). Receiving this is the client's
+ * trigger to run pcwld_presentation_reconcile() (pc_wildlife_authority.h/.c) -- see
+ * pcnetgame_handle_client_wildlife_snapshot_end()'s own doc. */
+typedef struct PCNetGameWildlifeSnapshotEndMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_END */
+    uint8_t  _reserved0[3];
+    uint32_t epoch;
+    uint32_t generation;
+    uint32_t count_sent;
+} PCNetGameWildlifeSnapshotEndMsg;
+_Static_assert(sizeof(PCNetGameWildlifeSnapshotEndMsg) == 16,
+               "PCNetGameWildlifeSnapshotEndMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWildlifeSnapshotEndMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameWildlifeSnapshotEndMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would "
+               "drop it");
+
+/* ============================================================================================
+ * World Ecology Wildlife Sync T-catch (ordinary fish catching only -- see this milestone's own
+ * ABSOLUTE SCOPE LIMIT: no bug catching, no tournament sync, no ant/bee special-case handling, no
+ * general despawn policy beyond what catching itself needs).
+ * ============================================================================================ */
+
+/* client -> host only, reliable, 20 bytes. Claims a catch on an authoritative wildlife entity_id --
+ * see pc_net_game_request_catch_fish()'s own doc (pc_net_game.h) for the full client-side seam this is
+ * sent from (Player_actor_setup_main_Notice_rod(), m_player_main_notice_rod.c_inc). Deliberately NOT a
+ * FIELD_ACTION kind (there is no tile involved) -- its own dedicated request/result pair, mirroring
+ * SNOWMAN_BUILD_REQUEST/RESULT's own "not a FIELD_ACTION kind" precedent (single round trip, no
+ * INTERACT_CONFIRM phase: the host atomically removes the entity from its table before it ever answers,
+ * so there is no reservation window that a CONFIRM would need to commit or release -- see
+ * pcnetgame_handle_host_catch_request()'s own doc for the race-safety argument).
+ *   entity_id        the authoritative wildlife entity being claimed (pc_wildlife_authority.h). 0 is
+ *                    never valid and is rejected outright.
+ *   generation       this client's own last-known authoritative wildlife session generation
+ *                    (pcwld_session_generation()) at send time -- rejected if it no longer matches the
+ *                    host's CURRENT generation (closes the "stale entity_id reused by a NEW session's
+ *                    table slot" gap: entity_id values are only unique WITHIN one generation).
+ *   claimed_species  TRUST BOUNDARY -- this requester's own uki->gyo_type (the BOBBER's own settled
+ *                    species, aGYO_TYPE_* domain, already reflecting any trash substitution roll).
+ *                    Cross-checked against the authoritative record's own species by
+ *                    pcwld_fish_species_matches_claim() (pc_wildlife_authority.h/.c) -- an exact match,
+ *                    the vanilla SALMON2->SALMON conversion, or any recognized trash item are all
+ *                    accepted; anything else is rejected. Never used to look up or derive the actual
+ *                    granted ITEM id -- see PCNetGameCatchResultMsg's own doc for why. */
+typedef struct PCNetGameCatchRequestMsg {
+    uint8_t  msg_type;   /* PC_NETGAME_MSG_CATCH_REQUEST */
+    uint8_t  _reserved0[3];
+    uint32_t entity_id;
+    uint32_t generation;
+    uint32_t request_id;
+    int32_t  claimed_species;
+} PCNetGameCatchRequestMsg;
+_Static_assert(sizeof(PCNetGameCatchRequestMsg) == 20, "PCNetGameCatchRequestMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameCatchRequestMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameCatchRequestMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* host -> the one requesting client only, reliable, 12 bytes.
+ *   accepted      1: the host already atomically removed entity_id from its authoritative table and
+ *                 broadcast WILDLIFE_DESPAWN (see pcnetgame_handle_host_catch_request()'s own doc) --
+ *                 the requester must now grant the item, exactly like DIG_SHINE/DIG_HOLE's own
+ *                 client-rolled bonus grant (see pc_net_game_request_catch_fish()'s own doc for why the
+ *                 grant is applied from the CLIENT's own locally-computed item, not from this message).
+ *                 0: rejected -- nothing was mutated host-side; no item is ever granted.
+ *   granted_item  DIAGNOSTIC ECHO ONLY on accept (the requester's own claimed local item, echoed back
+ *                 for logging/cross-check symmetry with BURY_RESULT's buried_item echo) -- NEVER the
+ *                 authoritative source of the grant. The requester always applies its OWN locally
+ *                 remembered item (computed once, at request time, from uki->get_fish_type_proc()) so
+ *                 the host never needs to duplicate aUKI_get_fish_type()'s fish_data[]/trash table. 0
+ *                 on reject. */
+typedef struct PCNetGameCatchResultMsg {
+    uint8_t  msg_type;     /* PC_NETGAME_MSG_CATCH_RESULT */
+    uint8_t  accepted;
+    uint16_t granted_item;
+    uint32_t entity_id;
+    uint32_t request_id;
+} PCNetGameCatchResultMsg;
+_Static_assert(sizeof(PCNetGameCatchResultMsg) == 12, "PCNetGameCatchResultMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameCatchResultMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameCatchResultMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* host -> every READY client, reliable, 8 bytes. Sent immediately after an accepted CATCH_REQUEST (or
+ * an accepted host-local catch, pc_net_game_host_local_wildlife_catch()) removes entity_id from the
+ * authoritative table -- see pcnetgame_commit_catch_despawn()'s own doc. Each receiver (including the
+ * host's own local bookkeeping) reconciles its own local presentation actor, if any, via
+ * pcwld_handle_wildlife_despawn() (pc_wildlife_authority.h/.c) -- see that function's own 3-case doc. */
+typedef struct PCNetGameWildlifeDespawnMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_WILDLIFE_DESPAWN */
+    uint8_t  _reserved0[3];
+    uint32_t entity_id;
+} PCNetGameWildlifeDespawnMsg;
+_Static_assert(sizeof(PCNetGameWildlifeDespawnMsg) == 8, "PCNetGameWildlifeDespawnMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameWildlifeDespawnMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameWildlifeDespawnMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
 /* Two-phase interactions: client -> host, reliable, exactly 8 bytes (little-endian, natural
  * alignment). Answers a provisional RESULT (accepted == 1) -- or withdraws from a request the client
  * gave up on / lost state for. The host only acts on it if (peer READY, kind matches, request_id ==
@@ -1523,6 +1807,35 @@ _Static_assert(sizeof(PCNetGameInteractConfirmMsg) <= PC_NET_MAX_PAYLOAD,
  * brief for the reasoning and the note that it should be tuned via a focused test if one becomes
  * practical in this sandbox. */
 #define PC_NETGAME_TREE_REACH_SQ (80.0f * 80.0f)
+
+/* World Ecology Wildlife Sync T-catch: fish-catch reach bound -- another deliberately SEPARATE
+ * constant/check (pcnetgame_fish_catch_reach_check(), further down), never reused from pickup/tree.
+ * Unlike a tile-anchored dig/bury/pickup/tree target, a fish is a DYNAMIC actor the authoritative record
+ * only ever pins to its ORIGINAL spawn-decision position (PcWildlifeRecord.pos_x/z, pc_wildlife_
+ * authority.h) -- it can swim, and a cast line can legitimately be flicked well away from the player's
+ * own standing position before the bite happens. 800 units (10x pickup's ~50-unit envelope) is a
+ * deliberately generous bound reflecting that dynamic range while still catching a genuinely
+ * implausible claim (e.g. "caught" a fish on the other side of the map) -- not a tuned, pixel-accurate
+ * casting-range model. XZ-ONLY, no Y check: PcWildlifeRecord.pos_y is ALWAYS 0.0 in this milestone (see
+ * that struct's own doc -- neither aSOG_gyoei_set() nor aGYO_make_gyoei() ever touch it), so comparing
+ * against the requester's own real (non-zero) Y would incorrectly reject a legitimate catch on elevated
+ * terrain or at a waterfall. */
+#define PC_NETGAME_FISH_CATCH_REACH_SQ (800.0f * 800.0f)
+
+/* World Ecology Wildlife Sync T4 (ordinary bug catching): a SEPARATE, much tighter reach bound than
+ * fish's -- a bug never "swims off" from its spawn position the way a cast line lets a fish be hooked
+ * far from the player; it only wanders locally and is swatted from arm's/net's reach. The real vanilla
+ * geometry (verified in source): the net swing's own forward sweep is 50 units (60 for the gold net,
+ * Player_actor_CheckCapture_forNet(), m_player_main_swing_net.c_inc), and a bug's own catch-registration
+ * radius around itself is 8 units ordinarily, up to 24 for the ground-pool species that use aINS_get_
+ * catch_range_sub() (beetles, a grounded cockroach) -- ac_insect_move.c_inc. 150 units is a deliberately
+ * generous bound on top of that combined ~74-84 unit envelope (net sweep + catch radius), leaving slack
+ * for the bug's own small movement between the local player's last reported position sample and the
+ * moment of the swing, and for ordinary network position latency -- while still rejecting a genuinely
+ * implausible claim (e.g. "caught" a bug on the other side of the acre). XZ-only, same reasoning as
+ * PC_NETGAME_FISH_CATCH_REACH_SQ's own doc (PcWildlifeRecord.pos_y is always 0.0 for a bug record too --
+ * neither aSOI_insect_set() nor aINS_make_insect() ever touch it). */
+#define PC_NETGAME_BUG_CATCH_REACH_SQ (150.0f * 150.0f)
 
 /* Any peer-supplied world coordinate must be finite and within +/- this many world units. The whole
  * town is ~6400 x ~7680 units, so 100000 is generous slack for a legitimate sample while making NaN/
@@ -1891,6 +2204,19 @@ typedef struct PCNetGameSnowmanBuildDedup {
 } PCNetGameSnowmanBuildDedup;
 static PCNetGameSnowmanBuildDedup s_host_snowman_build_dedup[PC_NET_MAX_PEERS];
 
+/* World Ecology Wildlife Sync T-catch -- host-only, per-peer dedup for the last PROCESSED
+ * CATCH_REQUEST, mirroring PCNetGameSnowmanBuildDedup's own single-slot reasoning exactly (CATCH is not
+ * a FIELD_ACTION kind either -- see PCNetGameCatchRequestMsg's own doc). A replayed request_id (the
+ * client's own send failed and it never actually got the first RESULT, or the RESULT itself was lost)
+ * answers from this cache -- it never re-validates or re-removes the entity a second time. */
+typedef struct PCNetGameCatchDedup {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  accepted;
+    uint32_t entity_id;
+} PCNetGameCatchDedup;
+static PCNetGameCatchDedup s_host_catch_dedup[PC_NET_MAX_PEERS];
+
 /* World Ecology milestone (Stage 1, Item 2): host-only per-tile "money rock hit window" bookkeeping
  * -- deliberately separate from (and much simpler than) the vanilla bg_item_ten_coin_c runtime array
  * (bg_item.h) that drives the LOCAL wobble animation: the host needs none of that graphics/timing
@@ -1973,6 +2299,52 @@ typedef struct PCNetGameBuryPending {
 } PCNetGameBuryPending;
 static PCNetGameBuryPending s_bury_pending;
 static uint32_t             s_next_bury_request_id = 1;
+
+/* World Ecology Wildlife Sync T-catch: client-only. Exactly one outstanding CATCH request at a time
+ * (a player can only ever be mid-reeling-in ONE fish, via ONE fishing rod) -- no timeout/retry fields at
+ * all, deliberately: this is a fire-and-forget single round trip, mirroring
+ * pc_net_game_request_snowman_build()'s own "dropped, not retried" shape on a send failure, NOT
+ * pickup/drop/bury's own retry-queue shape (see pc_net_game_request_catch_fish()'s own doc for why a
+ * retry would be actively harmful here: a resend after the fish has already moved on/been caught by
+ * someone else has nothing useful to retry against). `local_grant` is THIS client's own
+ * uki->get_fish_type_proc() result, computed ONCE at request time and applied on ACCEPT only -- see
+ * PCNetGameCatchResultMsg's own doc for why the host never computes or re-derives this item.
+ * `claimed_species` is kept only so the mSM_COLLECT_FISH_SET() collection-bit commit can be correctly
+ * deferred to ACCEPT too (see pcnetgame_handle_client_catch_result()'s own doc). */
+typedef struct PCNetGameCatchPending {
+    int      valid;
+    uint32_t request_id;
+    uint32_t entity_id;
+    int      kind; /* T4: PC_WILDLIFE_KIND_FISH or PC_WILDLIFE_KIND_BUG -- which collection-bit commit
+                       (mSM_COLLECT_FISH_SET() vs mSM_COLLECT_INSECT_SET()) pcnetgame_handle_client_
+                       catch_result() must run on accept; see that function's own doc. A player can only
+                       ever be mid-reeling-in ONE fish OR mid-net-catching ONE bug at a time (never both --
+                       the fishing rod and net are mutually exclusive player main-index states), so this
+                       single shared struct's own "exactly one outstanding request" precedent (see this
+                       struct's own top-of-file doc) already covers both kinds safely. */
+    int      claimed_species;
+    uint16_t local_grant;
+    PCNetGameOwnerStamp owner; /* the local player at send time (see PCNetGameOwnerStamp) */
+} PCNetGameCatchPending;
+static PCNetGameCatchPending s_catch_pending;
+static uint32_t              s_next_catch_request_id = 1;
+
+/* World Ecology Wildlife Sync T-catch (residual review fix): the last RESOLVED catch decision for a
+ * given entity_id, consumed by pc_net_game_query_catch_outcome() -- see that function's own doc
+ * (pc_net_game.h). Populated by pcnetgame_handle_client_catch_result() (client: on CATCH_RESULT, or
+ * immediately on a send failure in pc_net_game_request_catch_fish() -- a dropped request can never
+ * produce a RESULT, so it is recorded as rejected right away instead of leaving the exchange screen's
+ * gate stuck reading PENDING forever) and by pc_net_game_host_local_wildlife_catch() (host: recorded
+ * synchronously, since that decision never leaves this process). Exactly one entity_id's outcome is
+ * remembered at a time -- sufficient here for the exact same "a player can only ever be mid-reeling-in
+ * ONE fish" reason PCNetGameCatchPending's own doc gives; a stale, superseded entry is simply
+ * overwritten. */
+typedef struct PCNetGameCatchOutcome {
+    int      valid;
+    uint32_t entity_id;
+    int      accepted; /* 0 = rejected/no-grant, 1 = accepted/safe-to-grant */
+} PCNetGameCatchOutcome;
+static PCNetGameCatchOutcome s_catch_last_outcome;
 
 #define PC_NETGAME_BURY_TIMEOUT_60FPS_FRAMES 30.0f /* ~500ms, mirrors pickup/drop's own budget */
 #define PC_NETGAME_BURY_MAX_RETRIES 30 /* see PC_NETGAME_PICKUP_MAX_RETRIES for the budget reasoning */
@@ -2110,9 +2482,12 @@ typedef struct PCNetGameHostPeerState {
     /* snapshot progress */
     int                  snap_active;
     int                  snap_stage;      /* 0 = BEGIN next, 1 = FIELD_BLOCKs, 2 = VILLAGER_SNAPSHOT next,
-                                            * 3 = FRIENDSHIP_SNAPSHOT_ENTRYs (friendship/mail sync
-                                            * milestone: inserted between the villager population
-                                            * snapshot and SNAPSHOT_END), 4 = END next */
+                                            * 3 = WILDLIFE_SNAPSHOT_BEGIN/ENTRYs-then-END (World Ecology
+                                            * Wildlife Sync T2: inserted between the villager population
+                                            * snapshot and the friendship snapshot), 4 = FRIENDSHIP_
+                                            * SNAPSHOT_ENTRYs (friendship/mail sync milestone: inserted
+                                            * between the wildlife sub-pass and SNAPSHOT_END), 5 = END
+                                            * next */
     int                  snap_next_acre;
     int                  snap_next_friendship_idx; /* flat 0..(ANIMAL_NUM_MAX*ANIMAL_MEMORY_NUM)-1 */
     int                  snap_blocks_sent;
@@ -2124,6 +2499,16 @@ typedef struct PCNetGameHostPeerState {
      * fresh epoch always resends it) and by the whole-struct memset in
      * pcnetgame_reset_all_host_peer_state(). */
     int                  snap_snowman_sent;
+    /* World Ecology Wildlife Sync T2: snap_stage 3 (WILDLIFE_SNAPSHOT_BEGIN/ENTRY-then-END, inserted
+     * between VILLAGER_SNAPSHOT and FRIENDSHIP_SNAPSHOT_ENTRY -- see pcnetgame_host_pump_snapshots()'s
+     * own doc). snap_wildlife_begin_sent gates the one-shot BEGIN (reset to 0 whenever this peer
+     * transitions INTO stage 3, exactly like snap_snowman_sent's own reset-on-(re)entry shape);
+     * snap_next_wildlife_idx is the flat 0..PCWLD_PUBLIC_MAX_ENTITIES-1 table-slot cursor (mirrors
+     * snap_next_friendship_idx); snap_wildlife_sent_count is the running ENTRY count, used to fill
+     * WILDLIFE_SNAPSHOT_END's diagnostic count_sent field. */
+    int                  snap_wildlife_begin_sent;
+    int                  snap_next_wildlife_idx;
+    int                  snap_wildlife_sent_count;
 } PCNetGameHostPeerState;
 static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];
 
@@ -2208,6 +2593,62 @@ static uint32_t              s_client_snowman_seq = 0;
 static int                   s_client_snap_active = 0;
 static uint32_t              s_client_snap_epoch = 0;
 static int                   s_client_snap_blocks = 0;
+/* World Ecology Wildlife Sync T2: late-join/reconnect wildlife snapshot, client side.
+ *
+ * s_client_wildlife_known_generation: the LAST authoritative wildlife session generation
+ * (pcwld_session_generation(), pc_wildlife_authority.h) this client has ever applied a snapshot
+ * from. 0 means "never applied one" (matches this module's own 0-is-reserved convention).
+ * DELIBERATELY NOT reset by pcnetgame_reset_client_session_state() -- see that function's own doc
+ * for why: this is the one piece of state that MUST survive a disconnect so a later reconnect to the
+ * SAME still-running host can tell "this is the session I already have local wildlife bookkeeping
+ * for" (reconcile against it, see pcwld_presentation_reconcile()) apart from "a genuinely new/
+ * different session began" (discard local bookkeeping first). Compared, never mutated, from
+ * pcnetgame_handle_client_wildlife_snapshot_begin() only.
+ *
+ * s_client_wildlife_snap_active / s_client_wildlife_snap_epoch: this peer's current wildlife
+ * sub-pass, gated against the SAME outer snapshot epoch FIELD_BLOCK itself uses (see
+ * PCNetGameWildlifeSnapshotBeginMsg's own doc for why no separate staleness scheme is invented) --
+ * reset on every connect/disconnect by pcnetgame_reset_client_session_state(), exactly like
+ * s_client_snap_active itself (a lost/interrupted wildlife sub-pass across a disconnect is simply
+ * abandoned; the next connection's own SNAPSHOT_BEGIN starts a fresh one).
+ *
+ * s_client_wildlife_seen / s_client_wildlife_seen_count: entity_ids actually named by the wildlife
+ * sub-pass currently in progress -- accumulated by each WILDLIFE_SNAPSHOT_ENTRY, consumed exactly
+ * once by pcwld_presentation_reconcile() at WILDLIFE_SNAPSHOT_END. Sized to
+ * PCWLD_PUBLIC_MAX_ENTITIES (pc_wildlife_authority.h), the same capacity bound the host's own
+ * authoritative table uses -- never a different, invented limit. */
+static uint32_t              s_client_wildlife_known_generation = 0;
+static int                   s_client_wildlife_snap_active = 0;
+static uint32_t              s_client_wildlife_snap_epoch = 0;
+static uint32_t              s_client_wildlife_seen[PCWLD_PUBLIC_MAX_ENTITIES];
+static int                   s_client_wildlife_seen_count = 0;
+/* World Ecology Wildlife Sync T-catch, TEST-ONLY: see pcnetgame_run_fish_catch_test_trigger_client()'s
+ * own doc for why this exists (--force-fish-catch). Updated unconditionally by
+ * pcnetgame_handle_client_wildlife_spawn() whenever it is 1) cheap, and 2) otherwise unused unless the
+ * flag is on. */
+static uint32_t              s_force_catch_last_fish_entity_id = 0;
+static int                   s_force_catch_last_fish_species = 0;
+static float                 s_force_catch_last_fish_x = 0.0f;
+static float                 s_force_catch_last_fish_z = 0.0f;
+/* World Ecology Wildlife Sync T4, TEST-ONLY: identical bookkeeping to s_force_catch_last_fish_* above,
+ * for --force-bug-catch. Only ever updated for a NON-ANT BUG record (see the two write sites' own doc,
+ * pcnetgame_handle_client_wildlife_spawn()/pcnetgame_handle_client_wildlife_snapshot_entry()) -- an ant
+ * is deliberately never latched here, since pcnetgame_validate_and_commit_catch() unconditionally rejects
+ * any claim against it and latching one would just make the client trigger waste its one-shot fire on a
+ * guaranteed rejection. */
+static uint32_t              s_force_catch_last_bug_entity_id = 0;
+static int                   s_force_catch_last_bug_species = 0;
+static float                 s_force_catch_last_bug_x = 0.0f;
+static float                 s_force_catch_last_bug_z = 0.0f;
+/* s_client_wildlife_snap_incomplete: set by pcnetgame_handle_client_wildlife_snapshot_entry() when an
+ * ENTRY arrives mid-pass while pcnetgame_client_can_apply_world() is false (e.g. a save-not-ready
+ * latch drops partway through, then recovers before WILDLIFE_SNAPSHOT_END arrives). Without this,
+ * s_client_wildlife_seen[]/seen_count would silently be missing every entity skipped during that
+ * window, and pcwld_presentation_reconcile() at END would treat those still-live entities as stale
+ * and discard their bookkeeping -- risking a duplicate actor on the next same-generation resync. When
+ * set, WILDLIFE_SNAPSHOT_END abandons the pass instead of reconciling against an incomplete list; reset
+ * at WILDLIFE_SNAPSHOT_BEGIN (a fresh pass starts clean) and at WILDLIFE_SNAPSHOT_END (consumed). */
+static int                   s_client_wildlife_snap_incomplete = 0;
 /* Diagnostics for the snapshot being applied (reset at SNAPSHOT_BEGIN and on session reset): tiles
  * whose local value/deposit bit really changed, acres that had at least one, host values parked by
  * the DUMMY/RSV rules, and valid=0 / transient tiles left alone. Only IN_SNAPSHOT blocks count. */
@@ -3018,6 +3459,9 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
         /* World Ecology: snowmen -- same reasoning as the field-action dedup record just above, for
          * SNOWMAN_BUILD_REQUEST's own separate dedup table. */
         memset(&s_host_snowman_build_dedup[peer], 0, sizeof(s_host_snowman_build_dedup[peer]));
+        /* World Ecology Wildlife Sync T-catch -- same reasoning again, for CATCH_REQUEST's own
+         * separate dedup table. */
+        memset(&s_host_catch_dedup[peer], 0, sizeof(s_host_catch_dedup[peer]));
     }
 }
 
@@ -3666,6 +4110,12 @@ static void pcnetgame_host_start_snapshot(PCNetPeerId peer, const char* why) {
     st->snap_next_acre = 0;
     st->snap_blocks_sent = 0;
     st->snap_snowman_sent = 0;
+    /* World Ecology Wildlife Sync T2: a fresh/restarted epoch always redoes stage 3 (WILDLIFE_
+     * SNAPSHOT_BEGIN/ENTRY-then-END) from scratch too, exactly like every other snapshot sub-stage
+     * here. */
+    st->snap_wildlife_begin_sent = 0;
+    st->snap_next_wildlife_idx = 0;
+    st->snap_wildlife_sent_count = 0;
     st->snap_epoch = ++s_snapshot_epoch_counter;
     printf("[NET][WORLD] host: peer %d snapshot epoch %u queued (%s)\n", (int)peer, (unsigned)st->snap_epoch, why);
 }
@@ -4280,9 +4730,14 @@ static void pcnetgame_host_check_clock_sync(void) {
  * (snap_stage 2) before that point in the file. */
 static void pcnetgame_build_villager_snapshot(PCNetGameVillagerSnapshotMsg* vs, uint32_t epoch);
 /* Forward-declared: defined near the other friendship-sync host-side functions, below; used here
- * (snap_stage 3) before that point in the file. */
+ * (snap_stage 4) before that point in the file. */
 static int pcnetgame_build_friendship_snapshot_entry(PCNetGameFriendshipSnapshotEntryMsg* fe, int slot,
                                                       int memory_idx);
+/* World Ecology Wildlife Sync T2: defined near the other wildlife-sync host-side functions, below;
+ * used here (snap_stage 3, inserted between VILLAGER_SNAPSHOT and FRIENDSHIP_SNAPSHOT_ENTRY) before
+ * that point in the file. */
+static int pcnetgame_build_wildlife_snapshot_entry(PCNetGameWildlifeSnapshotEntryMsg* we, int slot,
+                                                    uint32_t epoch);
 
 static void pcnetgame_host_pump_snapshots(void) {
     int i;
@@ -4368,8 +4823,65 @@ static void pcnetgame_host_pump_snapshots(void) {
                     break;
                 }
                 st->snap_stage = 3;
-                st->snap_next_friendship_idx = 0;
+                st->snap_wildlife_begin_sent = 0;
+                st->snap_next_wildlife_idx = 0;
+                st->snap_wildlife_sent_count = 0;
+            } else if (st->snap_stage == 3 && !st->snap_wildlife_begin_sent) {
+                /* World Ecology Wildlife Sync T2: one-shot, opens this peer's wildlife-snapshot
+                 * sub-pass -- see PCNetGameWildlifeSnapshotBeginMsg's own doc. Sent after
+                 * VILLAGER_SNAPSHOT (no ordering dependency on it, just a convenient, already-
+                 * established insertion point) and before the first WILDLIFE_SNAPSHOT_ENTRY. */
+                PCNetGameWildlifeSnapshotBeginMsg wb;
+                memset(&wb, 0, sizeof(wb));
+                wb.msg_type = (uint8_t)PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_BEGIN;
+                wb.epoch = st->snap_epoch;
+                wb.generation = pcwld_session_generation();
+                wb.count = (uint32_t)pcwld_active_count();
+                if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &wb, (uint16_t)sizeof(wb))) {
+                    break;
+                }
+                st->snap_wildlife_begin_sent = 1;
             } else if (st->snap_stage == 3) {
+                /* World Ecology Wildlife Sync T2: one PCNetGameWildlifeSnapshotEntryMsg per ACTIVE
+                 * pc_wildlife_authority.c table slot, flat-iterated over the WHOLE table (every acre
+                 * unconditionally -- see that struct's own doc), empty slots skipped without sending,
+                 * mirroring the friendship-snapshot flat-iteration-with-skip convention immediately
+                 * below exactly. */
+                static PCNetGameWildlifeSnapshotEntryMsg we; /* 28 B, built and sent synchronously */
+                int found = 0;
+                while (st->snap_next_wildlife_idx < PCWLD_PUBLIC_MAX_ENTITIES) {
+                    if (pcnetgame_build_wildlife_snapshot_entry(&we, st->snap_next_wildlife_idx, st->snap_epoch)) {
+                        found = 1;
+                        break;
+                    }
+                    st->snap_next_wildlife_idx++;
+                }
+                if (!found) {
+                    /* Every slot scanned (whole table empty, or we've reached the end) -- close this
+                     * sub-pass with WILDLIFE_SNAPSHOT_END rather than advancing snap_stage directly,
+                     * so the client always gets an END to trigger its reconciliation pass, even for a
+                     * completely empty authoritative table (0 entries is an entirely ordinary,
+                     * expected outcome -- e.g. a fresh town with nobody having waded yet). */
+                    PCNetGameWildlifeSnapshotEndMsg we_end;
+                    memset(&we_end, 0, sizeof(we_end));
+                    we_end.msg_type = (uint8_t)PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_END;
+                    we_end.epoch = st->snap_epoch;
+                    we_end.generation = pcwld_session_generation();
+                    we_end.count_sent = (uint32_t)st->snap_wildlife_sent_count;
+                    if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &we_end, (uint16_t)sizeof(we_end))) {
+                        break;
+                    }
+                    st->snap_stage = 4;
+                    st->snap_next_friendship_idx = 0;
+                    sent++; /* still counts against the budget -- a fully-empty table must not spin */
+                    continue;
+                }
+                if (!pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &we, (uint16_t)sizeof(we))) {
+                    break;
+                }
+                st->snap_wildlife_sent_count++;
+                st->snap_next_wildlife_idx++;
+            } else if (st->snap_stage == 4) {
                 /* Friendship/mail sync milestone: one PCNetGameFriendshipSnapshotEntryMsg per
                  * OCCUPIED Anmmem_c entry, flat-iterated over (slot, memory_idx) pairs; empty
                  * entries are skipped without sending (see the struct's own doc comment). */
@@ -4385,7 +4897,7 @@ static void pcnetgame_host_pump_snapshots(void) {
                     st->snap_next_friendship_idx++;
                 }
                 if (!found) {
-                    st->snap_stage = 4;
+                    st->snap_stage = 5;
                     sent++; /* still counts against the budget -- a fully-empty town must not spin */
                     continue;
                 }
@@ -4394,7 +4906,7 @@ static void pcnetgame_host_pump_snapshots(void) {
                 }
                 st->snap_next_friendship_idx++;
                 if (st->snap_next_friendship_idx >= ANIMAL_NUM_MAX * ANIMAL_MEMORY_NUM) {
-                    st->snap_stage = 4;
+                    st->snap_stage = 5;
                 }
             } else {
                 PCNetGameSnapshotEndMsg e;
@@ -4560,6 +5072,10 @@ static void pcnetgame_host_world_tick(int local_ready) {
          * real tile and wrongly resume mid-chop instead of requiring the full hit count again). Reset
          * alongside the money-rock table, in this same branch. */
         pcnetgame_reset_host_tree_cut_state();
+        /* World Ecology Wildlife Sync T0: a wildlife record's bx/bz is only meaningful for the town
+         * it was created in -- same stale-town hazard as s_host_money_rock/s_host_tree_cut_count
+         * above, reset alongside them in this same branch. */
+        pcwld_reset();
     }
     s_host_town = cur;
     s_host_town_valid = 1;
@@ -4884,6 +5400,24 @@ static int pcnetgame_tree_reach_check(uint8_t ut_x, uint8_t ut_z, float px, floa
     dz = center.z - pz;
     dy = center.y - py;
     return (dx * dx + dz * dz) <= PC_NETGAME_TREE_REACH_SQ && fabsf(dy) <= PC_NETGAME_PICKUP_MAX_REACH_Y;
+}
+
+/* World Ecology Wildlife Sync T-catch: fish-catch reach check -- see PC_NETGAME_FISH_CATCH_REACH_SQ's
+ * own doc for why this is XZ-ONLY (never Y) and uses a raw actor-position comparison rather than the
+ * tile-center formula every other reach check above uses (a fish record's position is not tile-quantized
+ * -- it is the exact xyz_t the spawn decision produced, PcWildlifeRecord.pos_x/z). */
+static int pcnetgame_fish_catch_reach_check(float rec_x, float rec_z, float px, float pz) {
+    float dx = rec_x - px;
+    float dz = rec_z - pz;
+    return (dx * dx + dz * dz) <= PC_NETGAME_FISH_CATCH_REACH_SQ;
+}
+
+/* World Ecology Wildlife Sync T4: bug-catch reach check -- same XZ-only shape as the fish check just
+ * above, using PC_NETGAME_BUG_CATCH_REACH_SQ's own tighter bound (see that constant's own doc). */
+static int pcnetgame_bug_catch_reach_check(float rec_x, float rec_z, float px, float pz) {
+    float dx = rec_x - px;
+    float dz = rec_z - pz;
+    return (dx * dx + dz * dz) <= PC_NETGAME_BUG_CATCH_REACH_SQ;
 }
 
 /* World Ecology T3: every read-only validation step for one BURY request/host-local action, in
@@ -6871,6 +7405,171 @@ static void pcnetgame_handle_host_snowman_build_request(PCNetPeerId peer, const 
     }
 }
 
+/* ==================== World Ecology Wildlife Sync T-catch (ordinary fish catching only) ==================== */
+
+/* Forward-declared: defined later in this file alongside the other broadcast-to-every-READY-client
+   helpers (pcnetgame_broadcast_villager_msg()'s own doc, further down); used here
+   (pcnetgame_commit_catch_despawn()) before that point in the file -- same forward-declaration shape
+   already used elsewhere in this file for other later-defined helpers. */
+static void pcnetgame_broadcast_villager_msg(const void* msg, size_t msg_size);
+
+/* Broadcasts WILDLIFE_DESPAWN to every READY client (pcnetgame_broadcast_villager_msg() -- see that
+ * function's own doc: peers mid-snapshot are skipped, since their own in-flight snapshot, built from the
+ * CURRENT authoritative table, already reflects this removal) AND reconciles the HOST's OWN local
+ * presentation actor, if any, via pcwld_handle_wildlife_despawn() -- the host is itself a "process" that
+ * may have materialized a local fish actor for entity_id (T1 self-presentation), so it needs exactly the
+ * same 3-case reconciliation every other receiver gets. Called ONLY after pcwld_remove_by_id() has
+ * already removed the entity from the authoritative table (both call sites below do this atomically,
+ * before calling here) -- never the other way around. */
+static void pcnetgame_commit_catch_despawn(uint32_t entity_id) {
+    PCNetGameWildlifeDespawnMsg msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_WILDLIFE_DESPAWN;
+    msg.entity_id = entity_id;
+    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+
+    pcwld_handle_wildlife_despawn(entity_id);
+}
+
+/* Every read-only validation step for one CATCH claim, in sequence, stopping at the first failure, PLUS
+ * the atomic accept-time removal itself -- see this function's own race-safety doc below. `is_host_local`
+ * skips the PLAYER_CONTEXT/IN_TOWN/reach checks for the SAME reason every other is_host_local exemption
+ * in this file does (the host's own real local targeting -- its own fishing rod actually hooking this
+ * exact fish -- already guarantees correctness); `peer` is only read when !is_host_local.
+ *
+ * RACE SAFETY (the CORE requirement for T-catch): this file's host-side message processing is single-
+ * threaded (confirmed by this milestone's own audit) -- two CATCH_REQUESTs for the SAME entity_id can
+ * therefore never be "in progress" at the same instant; whichever is processed first reaches
+ * pcwld_remove_by_id() first, which immediately makes pcwld_find_by_id() start returning 0 for that
+ * entity_id. The SECOND request (processed strictly after the first, on this same single-threaded loop)
+ * therefore fails this function's own pcwld_find_by_id() check above and is rejected -- no window ever
+ * exists where both could pass validation. This is why acceptance and removal happen TOGETHER, inside
+ * this one function, with nothing else able to run in between -- never "validate now, remove later". */
+static int pcnetgame_validate_and_commit_catch(int is_host_local, PCNetPeerId peer, uint32_t entity_id,
+                                               uint32_t generation, int claimed_species) {
+    PcWildlifeRecord rec;
+
+    if (!pc_net_game_authoritative_wildlife_enabled()) {
+        return 0; /* opt-in gate off -- never accept a catch the host itself isn't running this milestone
+                     for (mirrors every other wildlife handler's own gate, pc_net_game.c) */
+    }
+    if (!pcfa_scene_is_town()) {
+        return 0; /* the host's own loaded scene must be the town -- mirrors pcwld_host_spawn_trigger()'s
+                     own precedent for touching town-scene-only authoritative wildlife state */
+    }
+    if (entity_id == 0) {
+        return 0;
+    }
+    if (!pcwld_find_by_id(entity_id, &rec)) {
+        return 0; /* unknown/already-removed/stale -- closes Gap 1 together with the generation check
+                     below, and is also this function's OWN race-safety guarantee (see doc above) */
+    }
+    if (generation != pcwld_session_generation()) {
+        return 0; /* stale cross-session claim -- entity_id values are only unique WITHIN one session
+                     (pcwld_session_generation()'s own doc, pc_wildlife_authority.h) */
+    }
+    /* World Ecology Wildlife Sync T4: ordinary bug catching now shares this exact core with fish --
+     * see pc_net_game_request_catch_bug()'s own top-of-section doc. Ants (kind == BUG, species == ANT)
+     * are deliberately excluded: they are never materialized as a real local actor at all (pcwld_
+     * presentation_create()'s own doc) and have no ordinary net-catch path -- a T5-scoped special case,
+     * out of scope here. */
+    if (rec.kind == PC_WILDLIFE_KIND_FISH) {
+        if (!pcwld_fish_species_matches_claim(rec.species, claimed_species)) {
+            return 0;
+        }
+    } else if (rec.kind == PC_WILDLIFE_KIND_BUG) {
+        if (rec.species == aINS_INSECT_TYPE_ANT) {
+            return 0;
+        }
+        if (!pcwld_bug_species_matches_claim(rec.species, claimed_species)) {
+            return 0;
+        }
+    } else {
+        return 0; /* unknown kind -- defense in depth, should never happen (PC_WILDLIFE_KIND_NUM-bounded) */
+    }
+
+    if (!is_host_local) {
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        int reach_ok;
+
+        if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+            return 0;
+        }
+        if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            return 0;
+        }
+        if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+            return 0;
+        }
+        reach_ok = (rec.kind == PC_WILDLIFE_KIND_FISH)
+                       ? pcnetgame_fish_catch_reach_check(rec.pos_x, rec.pos_z, px, pz)
+                       : pcnetgame_bug_catch_reach_check(rec.pos_x, rec.pos_z, px, pz);
+        if (!reach_ok) {
+            return 0;
+        }
+    }
+
+    /* ACCEPT: remove from the authoritative table BEFORE anything else can observe/claim it again --
+       see this function's own race-safety doc above for why this must happen here, synchronously,
+       rather than being deferred to the caller. */
+    pcwld_remove_by_id(entity_id);
+    return 1;
+}
+
+/* Host side: client -> host CATCH_REQUEST. NOT a FIELD_ACTION kind (no tile is involved) -- its own
+ * dedicated request/result pair with its own per-peer dedup record (s_host_catch_dedup), mirroring
+ * pcnetgame_handle_host_snowman_build_request()'s own shape exactly (single round trip, no
+ * INTERACT_CONFIRM phase). On accept, broadcasts WILDLIFE_DESPAWN and reconciles the host's own local
+ * bookkeeping (pcnetgame_commit_catch_despawn()) BEFORE sending CATCH_RESULT to the requester -- so a
+ * client that immediately re-renders after receiving its own accept never races its own despawn
+ * broadcast (the broadcast + host-local reconciliation always go out first). */
+static void pcnetgame_handle_host_catch_request(PCNetPeerId peer, const PCNetGameCatchRequestMsg* in) {
+    PCNetGameCatchDedup* dedup;
+    PCNetGameCatchResultMsg out;
+    int accepted;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+
+    dedup = &s_host_catch_dedup[peer];
+    if (dedup->valid && dedup->request_id == in->request_id) {
+        memset(&out, 0, sizeof(out));
+        out.msg_type = (uint8_t)PC_NETGAME_MSG_CATCH_RESULT;
+        out.accepted = dedup->accepted;
+        out.entity_id = in->entity_id;
+        out.request_id = in->request_id;
+        pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "CATCH_RESULT (replay)");
+        return;
+    }
+
+    accepted = pcnetgame_validate_and_commit_catch(0, peer, in->entity_id, in->generation,
+                                                   (int)in->claimed_species);
+
+    dedup->valid = 1;
+    dedup->request_id = in->request_id;
+    dedup->accepted = (uint8_t)accepted;
+    dedup->entity_id = in->entity_id;
+
+    if (accepted) {
+        printf("[NET][WILDLIFE] host: peer %d CATCH entity %u (species claim %d) accepted -- removed "
+               "from authoritative table\n",
+               (int)peer, (unsigned)in->entity_id, (int)in->claimed_species);
+        pcnetgame_commit_catch_despawn(in->entity_id);
+    } else if (g_pc_verbose) {
+        printf("[NET][WILDLIFE] host: peer %d CATCH entity %u (species claim %d) rejected\n", (int)peer,
+               (unsigned)in->entity_id, (int)in->claimed_species);
+    }
+
+    memset(&out, 0, sizeof(out));
+    out.msg_type = (uint8_t)PC_NETGAME_MSG_CATCH_RESULT;
+    out.accepted = (uint8_t)accepted;
+    out.entity_id = in->entity_id;
+    out.request_id = in->request_id;
+    pcnetgame_host_send_result(peer, &out, (uint16_t)sizeof(out), "CATCH_RESULT");
+}
+
 /* Bug 4 fix: pc_net_game_is_money_bag_pickup_allowed() and its per-tile drop bookkeeping are gone --
  * a money-rock-dropped bag is now an entirely ordinary field item (see PCNetGameMoneyRockState's own
  * doc above and pcnetgame_validate_and_resolve_pickup()), so no special allow-list is needed to pick
@@ -8806,6 +9505,11 @@ static void pcnetgame_handle_host_bury_request(PCNetPeerId peer, const PCNetGame
     }
 }
 
+/* World Ecology Wildlife Sync T0: defined near the other wildlife-sync functions, below; used here
+ * (pcnetgame_handle_host_data()) before that point in the file. */
+static void pcnetgame_handle_host_wildlife_spawn_trigger_request(PCNetPeerId peer,
+                                                                 const PCNetGameWildlifeSpawnTriggerRequestMsg* in);
+
 static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || size == 0) {
         return;
@@ -8903,6 +9607,21 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGameWildlifeSpawnTriggerRequestMsg) &&
+        data[0] == (uint8_t)PC_NETGAME_MSG_WILDLIFE_SPAWN_TRIGGER_REQUEST) {
+        PCNetGameWildlifeSpawnTriggerRequestMsg wr;
+        memcpy(&wr, data, sizeof(wr));
+        pcnetgame_handle_host_wildlife_spawn_trigger_request(peer, &wr);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameCatchRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_CATCH_REQUEST) {
+        PCNetGameCatchRequestMsg cr;
+        memcpy(&cr, data, sizeof(cr));
+        pcnetgame_handle_host_catch_request(peer, &cr);
+        return;
+    }
+
     /* malformed / short / unrecognized: ignore rather than misinterpret */
 }
 
@@ -8915,6 +9634,12 @@ static void pcnetgame_handle_client_mail_delivered(const PCNetGameMailDeliveredM
 static void pcnetgame_handle_client_npc_move(const PCNetGameNpcMoveMsg* in);
 static void pcnetgame_handle_client_npc_state(const PCNetGameNpcStateMsg* in);
 static void pcnetgame_handle_client_field_action_result(const PCNetGameFieldActionResultMsg* in);
+static void pcnetgame_handle_client_wildlife_spawn(const PCNetGameWildlifeSpawnMsg* in);
+static void pcnetgame_handle_client_wildlife_snapshot_begin(const PCNetGameWildlifeSnapshotBeginMsg* in);
+static void pcnetgame_handle_client_wildlife_snapshot_entry(const PCNetGameWildlifeSnapshotEntryMsg* in);
+static void pcnetgame_handle_client_wildlife_snapshot_end(const PCNetGameWildlifeSnapshotEndMsg* in);
+static void pcnetgame_handle_client_catch_result(const PCNetGameCatchResultMsg* in);
+static void pcnetgame_handle_client_wildlife_despawn(const PCNetGameWildlifeDespawnMsg* in);
 
 static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
     if (size == sizeof(PCNetMoveMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_MOVE) {
@@ -9079,6 +9804,56 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == sizeof(PCNetGameWildlifeSpawnMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_WILDLIFE_SPAWN) {
+        PCNetGameWildlifeSpawnMsg ws;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&ws, data, sizeof(ws));
+        pcnetgame_handle_client_wildlife_spawn(&ws);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameWildlifeSnapshotBeginMsg) &&
+        data[0] == (uint8_t)PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_BEGIN) {
+        PCNetGameWildlifeSnapshotBeginMsg wb;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&wb, data, sizeof(wb));
+        pcnetgame_handle_client_wildlife_snapshot_begin(&wb);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameWildlifeSnapshotEntryMsg) &&
+        data[0] == (uint8_t)PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_ENTRY) {
+        PCNetGameWildlifeSnapshotEntryMsg we;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&we, data, sizeof(we));
+        pcnetgame_handle_client_wildlife_snapshot_entry(&we);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameWildlifeSnapshotEndMsg) &&
+        data[0] == (uint8_t)PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_END) {
+        PCNetGameWildlifeSnapshotEndMsg we_end;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&we_end, data, sizeof(we_end));
+        pcnetgame_handle_client_wildlife_snapshot_end(&we_end);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameCatchResultMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_CATCH_RESULT) {
+        PCNetGameCatchResultMsg cr;
+        memcpy(&cr, data, sizeof(cr));
+        pcnetgame_handle_client_catch_result(&cr);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameWildlifeDespawnMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_WILDLIFE_DESPAWN) {
+        PCNetGameWildlifeDespawnMsg wd;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&wd, data, sizeof(wd));
+        pcnetgame_handle_client_wildlife_despawn(&wd);
+        return;
+    }
+
     if (size == sizeof(PCNetGameClockSyncMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_CLOCK_SYNC) {
         PCNetGameClockSyncMsg cs;
         if (s_client_link != PC_NETGAME_LINK_READY) return;
@@ -9201,6 +9976,25 @@ static void pcnetgame_reset_client_session_state(void) {
     s_client_meta_seq = 0;
     s_client_population_seq = 0;
     s_client_friendship_seq = 0;
+    /* World Ecology Wildlife Sync T2 REVISION (was T1: an unconditional pcwld_presentation_reset()
+     * here -- REMOVED, see below for why): a client's local entity_id -> presentation-actor map must
+     * NOT be blindly wiped on every mere disconnect/reconnect any more. A real actor T1 already
+     * created is NEVER destroyed by anything in pc_wildlife_authority.c (see pcwld_presentation_
+     * reset()'s own doc), so if this call ran here unconditionally, a reconnect to the SAME
+     * still-running host (whose authoritative table and entity_ids never changed) would blindly
+     * forget every entity it already correctly tracked, then treat every entry in the very next
+     * WILDLIFE_SNAPSHOT_ENTRY as brand-new and materialize a SECOND, duplicate real actor for
+     * anything still alive from before the disconnect -- exactly the bug the T2 milestone brief's own
+     * "reconciliation" requirement (pcwld_presentation_reconcile()) exists to prevent. The correct
+     * "did the authoritative session actually change" check now happens precisely once, at
+     * pcnetgame_handle_client_wildlife_snapshot_begin() (comparing the host's current
+     * pcwld_session_generation() against s_client_wildlife_known_generation, which is DELIBERATELY
+     * NOT reset here -- see that variable's own doc, above) -- a genuine new/different session (host
+     * restarted, or this is truly a different host) still fully clears the local map there, just
+     * later and more precisely than an unconditional reset on every ordinary reconnect would. */
+    s_client_wildlife_snap_active = 0;
+    s_client_wildlife_snap_epoch = 0;
+    s_client_wildlife_seen_count = 0;
     /* N-clock milestone, Rule 2: reset the sequence tracker (a reconnect is a fresh join -- the first
      * post-reconnect CLOCK_SYNC must always be accepted) but deliberately do NOT touch the clock
      * offset itself (pc_lb_rtc_get/set_net_clock_offset(), lb_rtc.c) here -- it is process-memory-only,
@@ -9291,6 +10085,9 @@ static void pcnetgame_reset_host_world_state(void) {
     /* World Ecology T1 review fix: a fresh hosting session likewise starts with every tree-cut
      * cut-count slot cleared -- see pcnetgame_reset_host_tree_cut_state()'s own doc. */
     pcnetgame_reset_host_tree_cut_state();
+    /* World Ecology Wildlife Sync T0: a fresh hosting session likewise starts with an empty wildlife
+     * table and entity_id counter reset to 1 -- see pcwld_reset()'s own doc. */
+    pcwld_reset();
 }
 
 /* v2 client, once per poll after events: deferred IDENTITY send, save pause/resume + resync,
@@ -9718,6 +10515,686 @@ static void pcnetgame_run_dig_hole_test_trigger(void) {
        reasoning as every other test-only trigger in this file. */
 }
 
+/* World Ecology Wildlife Sync T1 real-gameplay verification, TEST-ONLY: --force-wildlife-trigger.
+ * CLIENT-only, fires exactly once, mirroring pcnetgame_run_dig_hole_test_trigger()'s own established
+ * pattern (this project's proven convention for reaching a real gameplay path that is impractical to
+ * drive via blind keyboard navigation -- see g_pc_force_dig_hole's own doc, pc_platform.h). Unlike
+ * dig-hole, no teleport/reach-check/wait is needed here: calls the REAL, unmodified client-side
+ * network seam pc_net_game_request_wildlife_spawn_trigger() directly, once per acre across a fixed
+ * burst of 10 different addressable acres in a single frame (see s_acres[] below -- NOT a single
+ * fixed acre; a lone acre's decision may legitimately roll "nothing spawns", which would make this
+ * test trigger unreliable for verification purposes) -- the EXACT same function a real
+ * aSetMgr_move_set()/mFI_CheckPlayerWade() wade-entry sequence calls (ac_set_manager.c), carrying no
+ * species/position/RNG result of its own (see that
+ * message's own doc, PCNetGameWildlifeSpawnTriggerRequestMsg). From there on -- the host's spawn
+ * decision (pcwld_host_spawn_trigger()), the host's own local presentation actor, the
+ * WILDLIFE_SPAWN broadcast, and this client's own presentation actor on receipt
+ * (pcnetgame_handle_client_wildlife_spawn() -> pcwld_presentation_create()) -- everything is the
+ * real, unmodified, already-shipping code path. This bypasses ONLY the real wade/water-tile
+ * detection (walking a real player actor into water) -- the same class of bypass --force-dig-hole
+ * already uses for "walk up and swing a shovel" -- never any part of the spawn decision, broadcast,
+ * or presentation logic itself. */
+static void pcnetgame_run_wildlife_trigger_test_trigger(void) {
+    /* Several addressable acres, not just one: the underlying vanilla decision may legitimately
+     * decide "nothing spawns" for any single acre (an entirely ordinary outcome, same as a real
+     * wade that rolls nothing -- see pc_wildlife_authority.c's own doc), so triggering only one acre
+     * is not a reliable way to observe an actual spawn for verification purposes. Mirrors
+     * test_wildlife_spawn_wire.py's own Test W3 approach (many acres in one pass) rather than
+     * inventing a new fake-decision shortcut. */
+    static const int s_acres[][2] = { { 1, 1 }, { 2, 2 }, { 3, 3 }, { 4, 4 }, { 5, 5 },
+                                       { 2, 4 }, { 3, 5 }, { 1, 6 }, { 5, 6 }, { 4, 2 } };
+    static int s_done = 0;
+    static int s_wait_frames = 0;
+
+    if (!g_pc_force_wildlife_trigger || s_done) {
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !s_local_world_latched) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    /* A real wade always happens well after a player has finished joining; firing this
+     * synthetic trigger on the very first eligible poll can race the host's own initial full-world
+     * SNAPSHOT_BEGIN/FIELD_BLOCK/SNAPSHOT_END send to this peer, during which
+     * pcnetgame_broadcast_villager_msg() (the same broadcast helper WILDLIFE_SPAWN uses) correctly,
+     * silently skips a peer with snap_active still set -- exactly like it would for ANY other
+     * host-broadcast message mid-snapshot, not a wildlife-specific bug. Waiting a couple of seconds
+     * avoids racing this test harness against that ordinary, unrelated snapshot window. */
+    if (s_wait_frames < 180) {
+        s_wait_frames++;
+        return;
+    }
+
+    {
+        size_t i;
+        for (i = 0; i < sizeof(s_acres) / sizeof(s_acres[0]); i++) {
+            printf("[NET][WILDLIFE] --force-wildlife-trigger active: forcing a real "
+                   "pc_net_game_request_wildlife_spawn_trigger() at acre (%d,%d)\n",
+                   s_acres[i][0], s_acres[i][1]);
+            pc_net_game_request_wildlife_spawn_trigger(s_acres[i][0], s_acres[i][1]);
+        }
+    }
+    s_done = 1;
+}
+
+/* World Ecology Wildlife Sync T-catch real-gameplay verification, TEST-ONLY: --force-fish-catch.
+ * TEST-ONLY duplicate of aUKI_get_fish_type()'s own fish_data[] table (ac_uki_move.c_inc, `static` in a
+ * different translation unit) -- same duplication precedent already established for MONEY_ROCK_HIT/
+ * TREE_SHAKE/CHOP/SNOWMAN's own vanilla-table copies in this file. Used ONLY here, to compute the item
+ * this test trigger should expect to see granted -- NEVER used by any production code path (the real
+ * client-side seam always uses the REAL uki->get_fish_type_proc(), and the real host-side validation
+ * never derives an item at all, only a species match -- see PCNetGameCatchResultMsg's own doc for why).
+ * Kept in sync BY HAND with aUKI_get_fish_type() if that table ever changes. */
+static mActor_name_t pcnetgame_test_fish_species_to_item(int species) {
+    static const mActor_name_t fish_data[] = {
+        ITM_FISH00, ITM_FISH01, ITM_FISH02, ITM_FISH03, ITM_FISH04, ITM_FISH05, ITM_FISH06, ITM_FISH07,
+        ITM_FISH08, ITM_FISH09, ITM_FISH10, ITM_FISH11, ITM_FISH12, ITM_FISH13, ITM_FISH14, ITM_FISH15,
+        ITM_FISH16, ITM_FISH17, ITM_FISH18, ITM_FISH19, ITM_FISH20, ITM_FISH21, ITM_FISH22, ITM_FISH23,
+        ITM_FISH24, ITM_FISH25, ITM_FISH26, ITM_FISH27, ITM_FISH28, ITM_FISH29, ITM_FISH30, ITM_FISH31,
+        ITM_FISH32, ITM_FISH33, ITM_FISH34, ITM_FISH35, ITM_FISH36, ITM_FISH37, ITM_FISH38, ITM_FISH39,
+        ITM_FISH39, ITM_DUST0_EMPTY_CAN, ITM_DUST1_BOOT, ITM_DUST2_OLD_TIRE, ITM_FISH22,
+    };
+    if (species >= 0 && species < (int)(sizeof(fish_data) / sizeof(fish_data[0]))) {
+        return fish_data[species];
+    }
+    return (mActor_name_t)EMPTY_NO;
+}
+
+/* World Ecology Wildlife Sync T4 real-gameplay verification, TEST-ONLY: --force-bug-catch. Unlike
+ * pcnetgame_test_fish_species_to_item() above, this is NOT a duplicate of a hidden vanilla table: an
+ * ordinary bug's item is read straight off its own aINS_INSECT_ACTOR::item field at catch time (see
+ * Player_actor_setup_main_Notice_net(), m_player_main_notice_net.c_inc), never derived from insect_type
+ * alone. m_name_table.h's own ITM_INSECT00..ITM_INSECT39 constants are, however, a direct linear mapping
+ * of enum insect_type's own 0..39 ordering (ac_insect_h.h) -- confirmed by inspection, not merely
+ * assumed -- so this table is a reasonable, clearly-labeled TEST-ONLY stand-in used only to compute the
+ * item this test trigger should expect to see granted; NEVER used by any production code path. Index 38
+ * (aINS_INSECT_TYPE_ANT) is never reached here in practice: the host trigger below skips ANT records
+ * entirely (see s_force_catch_last_bug_entity_id's own doc) and pcnetgame_validate_and_commit_catch()
+ * would reject any claim against one regardless. */
+static mActor_name_t pcnetgame_test_bug_species_to_item(int species) {
+    static const mActor_name_t insect_data[] = {
+        ITM_INSECT00, ITM_INSECT01, ITM_INSECT02, ITM_INSECT03, ITM_INSECT04, ITM_INSECT05, ITM_INSECT06,
+        ITM_INSECT07, ITM_INSECT08, ITM_INSECT09, ITM_INSECT10, ITM_INSECT11, ITM_INSECT12, ITM_INSECT13,
+        ITM_INSECT14, ITM_INSECT15, ITM_INSECT16, ITM_INSECT17, ITM_INSECT18, ITM_INSECT19, ITM_INSECT20,
+        ITM_INSECT21, ITM_INSECT22, ITM_INSECT23, ITM_INSECT24, ITM_INSECT25, ITM_INSECT26, ITM_INSECT27,
+        ITM_INSECT28, ITM_INSECT29, ITM_INSECT30, ITM_INSECT31, ITM_INSECT32, ITM_INSECT33, ITM_INSECT34,
+        ITM_INSECT35, ITM_INSECT36, ITM_INSECT37, ITM_INSECT38, ITM_INSECT39,
+    };
+    if (species >= 0 && species < (int)(sizeof(insect_data) / sizeof(insect_data[0]))) {
+        return insect_data[species];
+    }
+    return (mActor_name_t)EMPTY_NO;
+}
+
+/* HOST-only half of --force-fish-catch: see g_pc_force_fish_catch's own doc (pc_platform.h) for the
+ * full rationale (fishing's own cast/float/bite/hook state machine is judged too complex/non-
+ * deterministic for a simple force-flag, unlike a single dig-scoop request or wade-trigger send).
+ * Waits for at least one live FISH record in the authoritative table (typically seeded by
+ * --force-wildlife-trigger run on a peer, or an ordinary real wade by any connected player), then calls
+ * the REAL pc_net_game_host_local_wildlife_catch() directly with that record's own species -- the exact
+ * function the real Player_actor_setup_main_Notice_rod() seam calls for the host's own local catch --
+ * and, on accept, grants the item via the REAL mPr_SetFreePossessionItem(), exactly mirroring what that
+ * seam does immediately afterward. Fires exactly once. */
+static void pcnetgame_run_fish_catch_test_trigger_host(void) {
+    static int s_done = 0;
+    int i;
+
+    if (!g_pc_force_fish_catch || s_done || s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town() || Now_Private == NULL) {
+        return;
+    }
+
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        PcWildlifeRecord rec;
+        if (!pcwld_get_by_slot(i, &rec) || rec.kind != PC_WILDLIFE_KIND_FISH) {
+            continue;
+        }
+
+        printf("[NET][WILDLIFE] --force-fish-catch active: forcing a real "
+               "pc_net_game_host_local_wildlife_catch() for entity %u (species %d)\n",
+               (unsigned)rec.entity_id, rec.species);
+        if (pc_net_game_host_local_wildlife_catch(rec.entity_id, rec.species)) {
+            mActor_name_t item = pcnetgame_test_fish_species_to_item(rec.species);
+            if (mPr_SetFreePossessionItem(Now_Private, item, mPr_ITEM_COND_NORMAL)) {
+                printf("[NET][WILDLIFE] --force-fish-catch (host): entity %u accepted -- item 0x%04X "
+                       "granted\n",
+                       (unsigned)rec.entity_id, (unsigned)item);
+            } else {
+                printf("[NET][WILDLIFE] --force-fish-catch (host): entity %u accepted but no free "
+                       "pocket slot -- item LOST\n",
+                       (unsigned)rec.entity_id);
+            }
+        } else {
+            printf("[NET][WILDLIFE] --force-fish-catch (host): entity %u rejected\n",
+                   (unsigned)rec.entity_id);
+        }
+
+        /* Residual review fix, TEST-ONLY: immediately attempt a SECOND host-local catch on the exact
+         * SAME entity_id, which pcnetgame_validate_and_commit_catch() must now reject -- the accepted
+         * attempt just above already removed it from the authoritative table (or, if that first attempt
+         * was itself somehow rejected, entity_id was never live to begin with, and this second call is
+         * rejected for the same reason). This exercises the IDENTICAL rejection code path a genuine
+         * two-peer race produces (pcnetgame_validate_and_commit_catch() has no notion of "which peer" --
+         * only "is this entity_id still present"), fully deterministically, without depending on real
+         * cross-process timing -- then queries pc_net_game_query_catch_outcome() for the SAME entity_id,
+         * printing the result so an automated test can confirm the exact status the putaway-rod
+         * exchange-screen gate (m_player_main_putaway_rod.c_inc) would have read: REJECTED (3), never
+         * ACCEPTED (2). Safe to consume here (query_catch_outcome() clears a resolved entry once read --
+         * see its own doc) since --force-fish-catch never drives this entity_id through the real
+         * Notice_rod/Putaway_rod seam at all. */
+        {
+            int second_accepted = pc_net_game_host_local_wildlife_catch(rec.entity_id, rec.species);
+            int outcome = pc_net_game_query_catch_outcome(rec.entity_id);
+            printf("[NET][WILDLIFE] --force-fish-catch (host): SECOND local catch attempt on the SAME "
+                   "entity %u %s (as expected) -- query_catch_outcome=%d\n",
+                   (unsigned)rec.entity_id, second_accepted ? "was ACCEPTED (unexpected!)" : "was REJECTED",
+                   outcome);
+        }
+
+        s_done = 1;
+        return;
+    }
+}
+
+/* CLIENT-only half of --force-fish-catch: see g_pc_force_fish_catch's own doc (pc_platform.h). Waits
+ * for this client to have observed at least one WILDLIFE_SPAWN broadcast (or late-join snapshot entry)
+ * for a FISH entity (s_force_catch_last_fish_*, set unconditionally by
+ * pcnetgame_handle_client_wildlife_spawn()/pcnetgame_handle_client_wildlife_snapshot_entry()), teleports
+ * the local player to that entity's own recorded position -- mirroring
+ * pcnetgame_run_dig_hole_test_trigger()'s own established teleport-then-wait-for-move-sync pattern
+ * exactly (see that function's own doc for why the wait is needed: the host must see this client's NEW
+ * position via an ordinary MOVE before a CATCH_REQUEST arrives, or the real reach check would correctly
+ * reject it against the stale pre-teleport position) -- then calls the REAL
+ * pc_net_game_request_catch_fish() network seam directly with that entity's own species and its own
+ * correct item (pcnetgame_test_fish_species_to_item() above). The REAL
+ * pcnetgame_handle_client_catch_result() then grants the item on accept, exactly as a genuine catch
+ * would; nothing about the reach check, host validation, or RESULT-handling path is bypassed -- only the
+ * requirement that a real UKI (fishing rod/bobber) actor be cast, floated, and bitten first, and the
+ * requirement that the player physically walk to the fish. Fires exactly once. */
+static void pcnetgame_run_fish_catch_test_trigger_client(void) {
+    static int s_stage = 0; /* 0 = not yet teleported, 1 = teleported/waiting for move-sync,
+                                2 = request sent/waiting for CATCH_RESULT, 3 = done */
+    static int s_wait_frames = 0;
+    static int s_result_wait_frames = 0;
+    /* Latched at stage 0 -- deliberately NOT re-read from s_force_catch_last_fish_* at fire time: this
+       shared bookkeeping can legitimately be overwritten by a LATER, unrelated WILDLIFE_SPAWN/SNAPSHOT_
+       ENTRY while this trigger is still waiting out its move-sync delay (e.g. a real ambient wade by any
+       connected player), which would otherwise fire the eventual CATCH_REQUEST for a DIFFERENT entity
+       than the one the player was just teleported next to -- a self-inflicted, test-only reach-check
+       failure, not a real bug in the production catch path itself. */
+    static uint32_t s_latched_entity_id = 0;
+    static int      s_latched_species = 0;
+
+    if (!g_pc_force_fish_catch || s_stage >= 3 || s_role != PC_NETGAME_ROLE_CLIENT ||
+        s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL) {
+        return;
+    }
+    if (!g_pc_authoritative_wildlife || !pcfa_scene_is_town() || s_force_catch_last_fish_entity_id == 0) {
+        return;
+    }
+
+    if (s_stage == 0) {
+        PLAYER_ACTOR* local = GET_PLAYER_ACTOR_NOW();
+        if (!pcnetgame_is_real_player_actor(local)) {
+            return; /* no local save/actor yet -- retried next poll */
+        }
+        s_latched_entity_id = s_force_catch_last_fish_entity_id;
+        s_latched_species = s_force_catch_last_fish_species;
+        local->actor_class.world.position.x = s_force_catch_last_fish_x;
+        local->actor_class.world.position.z = s_force_catch_last_fish_z;
+        printf("[NET][WILDLIFE] --force-fish-catch: teleported the local player to entity %u's own "
+               "recorded position (%.1f,%.1f) so the host's real reach check will accept the upcoming "
+               "request\n",
+               (unsigned)s_latched_entity_id, s_force_catch_last_fish_x, s_force_catch_last_fish_z);
+        s_stage = 1;
+        s_wait_frames = 0;
+        return;
+    }
+
+    if (s_stage == 1) {
+        s_wait_frames++;
+        /* 240 frames (~4s @ 60fps -- bumped up from the original 90/~1.5s move-sync-only budget):
+           residual review fix's own TEST H (test_wildlife_catch_exchange_gate.py) needs a real wall-clock
+           window wide enough for a separate FakeClient process to win a race against this exact request,
+           which the original 90-frame budget (sized only for the move-sync wait this trigger shares with
+           pcnetgame_run_dig_hole_test_trigger()'s own precedent) left too tight to reliably automate.
+           TEST-ONLY (--force-fish-catch gates this whole function) -- never reachable from real
+           gameplay. */
+        if (s_wait_frames < 240) {
+            return;
+        }
+
+        {
+            mActor_name_t item = pcnetgame_test_fish_species_to_item(s_latched_species);
+
+            printf("[NET][WILDLIFE] --force-fish-catch active: forcing a real "
+                   "pc_net_game_request_catch_fish() for entity %u (species %d, item 0x%04X)\n",
+                   (unsigned)s_latched_entity_id, s_latched_species, (unsigned)item);
+            pc_net_game_request_catch_fish(s_latched_entity_id, s_latched_species, (int)item);
+        }
+        s_stage = 2;
+        s_result_wait_frames = 0;
+        return;
+    }
+
+    /* s_stage == 2: residual review fix, TEST-ONLY -- give pcnetgame_handle_client_catch_result() up to
+     * ~2 seconds (120 frames @ 60fps) to process the CATCH_RESULT this request should trigger, then query
+     * pc_net_game_query_catch_outcome() for the SAME entity_id and print the result, so an automated test
+     * can confirm the exact status the putaway-rod exchange-screen gate (m_player_main_putaway_rod.c_inc)
+     * would have read for this catch: ACCEPTED (2) for an ordinary unraced catch, or REJECTED (3) if a
+     * FakeClient (or another real peer) claimed the SAME entity_id first. Safe to consume here (see that
+     * function's own doc) since --force-fish-catch never drives this entity_id through the real
+     * Notice_rod/Putaway_rod seam at all. */
+    s_result_wait_frames++;
+    if (s_result_wait_frames < 120) {
+        return;
+    }
+    {
+        int outcome = pc_net_game_query_catch_outcome(s_latched_entity_id);
+        printf("[NET][WILDLIFE] --force-fish-catch (client): query_catch_outcome(entity %u) after "
+               "CATCH_RESULT wait = %d\n",
+               (unsigned)s_latched_entity_id, outcome);
+    }
+    s_stage = 3;
+}
+
+/* HOST-only half of --force-bug-catch: faithful mirror of pcnetgame_run_fish_catch_test_trigger_host()
+ * above, adapted for ordinary (non-ant) BUG catching -- see g_pc_force_bug_catch's own doc (pc_platform.h)
+ * for the full rationale. Waits for at least one live, non-ant BUG record in the authoritative table
+ * (typically seeded by a real WILDLIFE_SPAWN_TRIGGER_REQUEST burst, exactly like --force-fish-catch's own
+ * precedent), then calls the REAL pc_net_game_host_local_wildlife_catch() directly with that record's own
+ * species -- the exact function the real Player_actor_setup_main_Notice_net() seam calls for the host's
+ * own local catch -- and, on accept, grants the item via the REAL mPr_SetFreePossessionItem(), exactly
+ * mirroring what that seam does immediately afterward. Fires exactly once. */
+static void pcnetgame_run_bug_catch_test_trigger_host(void) {
+    static int s_done = 0;
+    int i;
+
+    if (!g_pc_force_bug_catch || s_done || s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town() || Now_Private == NULL) {
+        return;
+    }
+
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        PcWildlifeRecord rec;
+        if (!pcwld_get_by_slot(i, &rec) || rec.kind != PC_WILDLIFE_KIND_BUG) {
+            continue;
+        }
+        if (rec.species == aINS_INSECT_TYPE_ANT) {
+            continue; /* never a legitimate ordinary catch target -- see s_force_catch_last_bug_entity_id's
+                         own doc; skip and keep looking rather than wasting the one-shot fire */
+        }
+
+        printf("[NET][WILDLIFE] --force-bug-catch active: forcing a real "
+               "pc_net_game_host_local_wildlife_catch() for entity %u (species %d)\n",
+               (unsigned)rec.entity_id, rec.species);
+        if (pc_net_game_host_local_wildlife_catch(rec.entity_id, rec.species)) {
+            mActor_name_t item = pcnetgame_test_bug_species_to_item(rec.species);
+            if (mPr_SetFreePossessionItem(Now_Private, item, mPr_ITEM_COND_NORMAL)) {
+                printf("[NET][WILDLIFE] --force-bug-catch (host): entity %u accepted -- item 0x%04X "
+                       "granted\n",
+                       (unsigned)rec.entity_id, (unsigned)item);
+            } else {
+                printf("[NET][WILDLIFE] --force-bug-catch (host): entity %u accepted but no free "
+                       "pocket slot -- item LOST\n",
+                       (unsigned)rec.entity_id);
+            }
+        } else {
+            printf("[NET][WILDLIFE] --force-bug-catch (host): entity %u rejected\n",
+                   (unsigned)rec.entity_id);
+        }
+
+        /* Mirrors pcnetgame_run_fish_catch_test_trigger_host()'s own residual review fix exactly: a
+         * SECOND host-local catch attempt on the exact SAME entity_id, deterministically exercising the
+         * identical rejection code path a genuine two-peer race produces, then queries
+         * pc_net_game_query_catch_outcome() for the SAME entity_id -- see that function's own doc for why
+         * this is safe to consume here. */
+        {
+            int second_accepted = pc_net_game_host_local_wildlife_catch(rec.entity_id, rec.species);
+            int outcome = pc_net_game_query_catch_outcome(rec.entity_id);
+            printf("[NET][WILDLIFE] --force-bug-catch (host): SECOND local catch attempt on the SAME "
+                   "entity %u %s (as expected) -- query_catch_outcome=%d\n",
+                   (unsigned)rec.entity_id, second_accepted ? "was ACCEPTED (unexpected!)" : "was REJECTED",
+                   outcome);
+        }
+
+        s_done = 1;
+        return;
+    }
+}
+
+/* CLIENT-only half of --force-bug-catch: faithful mirror of pcnetgame_run_fish_catch_test_trigger_client()
+ * above, adapted for ordinary (non-ant) BUG catching -- see g_pc_force_bug_catch's own doc (pc_platform.h).
+ * Waits for this client to have observed at least one WILDLIFE_SPAWN broadcast (or late-join snapshot
+ * entry) for a non-ant BUG entity (s_force_catch_last_bug_*, set unconditionally by
+ * pcnetgame_handle_client_wildlife_spawn()/pcnetgame_handle_client_wildlife_snapshot_entry()), teleports
+ * the local player to that entity's own recorded position -- reusing pcnetgame_run_fish_catch_test_
+ * trigger_client()'s own established teleport-then-wait-for-move-sync pattern and its own 240-frame wait
+ * budget verbatim (the same MOVE-then-CATCH_REQUEST race-timing concern that budget was tuned for applies
+ * identically here -- nothing about bug catching makes that race window wider or narrower) -- then calls
+ * the REAL pc_net_game_request_catch_bug() network seam directly with that entity's own species and its
+ * own correct item (pcnetgame_test_bug_species_to_item() above). The REAL
+ * pcnetgame_handle_client_catch_result() then grants the item on accept, exactly as a genuine catch would.
+ * Fires exactly once per role. */
+static void pcnetgame_run_bug_catch_test_trigger_client(void) {
+    static int s_stage = 0; /* 0 = not yet teleported, 1 = teleported/waiting for move-sync,
+                                2 = request sent/waiting for CATCH_RESULT, 3 = done */
+    static int s_wait_frames = 0;
+    static int s_result_wait_frames = 0;
+    static uint32_t s_latched_entity_id = 0;
+    static int      s_latched_species = 0;
+
+    if (!g_pc_force_bug_catch || s_stage >= 3 || s_role != PC_NETGAME_ROLE_CLIENT ||
+        s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL) {
+        return;
+    }
+    if (!g_pc_authoritative_wildlife || !pcfa_scene_is_town() || s_force_catch_last_bug_entity_id == 0) {
+        return;
+    }
+
+    if (s_stage == 0) {
+        PLAYER_ACTOR* local = GET_PLAYER_ACTOR_NOW();
+        if (!pcnetgame_is_real_player_actor(local)) {
+            return; /* no local save/actor yet -- retried next poll */
+        }
+        s_latched_entity_id = s_force_catch_last_bug_entity_id;
+        s_latched_species = s_force_catch_last_bug_species;
+        local->actor_class.world.position.x = s_force_catch_last_bug_x;
+        local->actor_class.world.position.z = s_force_catch_last_bug_z;
+        printf("[NET][WILDLIFE] --force-bug-catch: teleported the local player to entity %u's own "
+               "recorded position (%.1f,%.1f) so the host's real reach check will accept the upcoming "
+               "request\n",
+               (unsigned)s_latched_entity_id, s_force_catch_last_bug_x, s_force_catch_last_bug_z);
+        s_stage = 1;
+        s_wait_frames = 0;
+        return;
+    }
+
+    if (s_stage == 1) {
+        s_wait_frames++;
+        /* 240 frames -- same budget --force-fish-catch's own client trigger already established (see
+           that function's own doc for the full rationale); reused verbatim, not re-derived, since the
+           underlying race-timing concern is identical. TEST-ONLY (--force-bug-catch gates this whole
+           function) -- never reachable from real gameplay. */
+        if (s_wait_frames < 240) {
+            return;
+        }
+
+        {
+            mActor_name_t item = pcnetgame_test_bug_species_to_item(s_latched_species);
+
+            printf("[NET][WILDLIFE] --force-bug-catch active: forcing a real "
+                   "pc_net_game_request_catch_bug() for entity %u (species %d, item 0x%04X)\n",
+                   (unsigned)s_latched_entity_id, s_latched_species, (unsigned)item);
+            pc_net_game_request_catch_bug(s_latched_entity_id, s_latched_species, (int)item);
+        }
+        s_stage = 2;
+        s_result_wait_frames = 0;
+        return;
+    }
+
+    /* s_stage == 2: mirrors pcnetgame_run_fish_catch_test_trigger_client()'s own residual review fix --
+     * give pcnetgame_handle_client_catch_result() up to ~2 seconds (120 frames @ 60fps) to process the
+     * CATCH_RESULT this request should trigger, then query pc_net_game_query_catch_outcome() for the SAME
+     * entity_id and print the result, so an automated test can confirm the exact status the putaway-net
+     * exchange-screen gate (m_player_main_putaway_net.c_inc) would have read for this catch. */
+    s_result_wait_frames++;
+    if (s_result_wait_frames < 120) {
+        return;
+    }
+    {
+        int outcome = pc_net_game_query_catch_outcome(s_latched_entity_id);
+        printf("[NET][WILDLIFE] --force-bug-catch (client): query_catch_outcome(entity %u) after "
+               "CATCH_RESULT wait = %d\n",
+               (unsigned)s_latched_entity_id, outcome);
+    }
+    s_stage = 3;
+}
+
+/* T8 audit verification, TEST-ONLY: --diag-bug-ttl-lookup <frames>. See its own doc, pc_platform.h, for
+ * the full rationale (re-verifying Bug 1's fix through the REAL pc_net_game_bug_entity_id_for_label() ->
+ * pcwld_bug_entity_id_for_local_actor() lookup, which --force-bug-catch's host branch never calls). HOST
+ * role only -- there is no client-side equivalent of this diagnostic, since the property under test
+ * (a bug's own s_presentation[] mapping surviving past the idle-expiry threshold while its actor is
+ * alive) is purely local, per-process bookkeeping identical on host and client alike (see pc_wildlife_
+ * authority.c's own top-of-file doc); the host is simply the easier role to seed a live BUG entity on
+ * without a second process. */
+static void pcnetgame_run_bug_ttl_lookup_diag_host(void) {
+    static int      s_ttl_applied  = 0;
+    static uint32_t s_latched_id   = 0;
+    static int      s_latched_species = 0;
+    static void*    s_latched_actor   = NULL;
+    static int      s_poll_frames     = 0;
+    static int      s_done            = 0;
+
+    if (g_pc_diag_bug_ttl_lookup_frames <= 0 || s_done || s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town()) {
+        return;
+    }
+
+    if (!s_ttl_applied) {
+        /* Apply the override exactly once, as early as possible -- before any bug we later latch onto
+           has a chance to accumulate real age under the normal ~10-minute constant. */
+        pcwld_test_set_ttl_override_frames((float)g_pc_diag_bug_ttl_lookup_frames);
+        printf("[NET][WILDLIFE] --diag-bug-ttl-lookup active: idle-expiry TTL overridden to %d frames "
+               "(~%.1fs @ 60fps) for this test run\n",
+               g_pc_diag_bug_ttl_lookup_frames, (double)g_pc_diag_bug_ttl_lookup_frames / 60.0);
+        s_ttl_applied = 1;
+    }
+
+    if (s_latched_id == 0) {
+        int i;
+        for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+            PcWildlifeRecord rec;
+            void* actor;
+            int species;
+
+            if (!pcwld_get_by_slot(i, &rec) || rec.kind != PC_WILDLIFE_KIND_BUG) {
+                continue;
+            }
+            if (rec.species == aINS_INSECT_TYPE_ANT) {
+                continue; /* ants are never given a local presentation actor (T1 scope) -- see
+                             pcwld_presentation_create()'s own doc; pcwld_bug_local_actor_for_entity()
+                             would just return NULL for one, uninteresting for this diagnostic */
+            }
+            actor = pcwld_bug_local_actor_for_entity(rec.entity_id, &species);
+            if (actor == NULL) {
+                continue; /* not locally materialized on THIS process (e.g. presentation queue was full) */
+            }
+            s_latched_id      = rec.entity_id;
+            s_latched_species = species;
+            s_latched_actor   = actor;
+            printf("[NET][WILDLIFE] --diag-bug-ttl-lookup: latched entity %u (species %d, local_actor "
+                   "%p) -- will re-query pc_net_game_bug_entity_id_for_label() every ~0.5s past the "
+                   "overridden TTL\n",
+                   (unsigned)s_latched_id, s_latched_species, s_latched_actor);
+            break;
+        }
+        return; /* first bug found this poll, or none yet -- either way, start querying next poll */
+    }
+
+    s_poll_frames++;
+    if (s_poll_frames % 30 != 0) {
+        return; /* ~0.5s at 60fps -- frequent enough to observe the TTL boundary, sparse enough to read */
+    }
+
+    {
+        uint32_t looked_up = pc_net_game_bug_entity_id_for_label(s_latched_actor, s_latched_species);
+        printf("[NET][WILDLIFE] --diag-bug-ttl-lookup: t+%.1fs pc_net_game_bug_entity_id_for_label("
+               "local_actor=%p, species=%d) = %u (expected %u if Bug 1's fix holds; 0 would mean the "
+               "mapping was lost while the actor is still alive -- the exact bug the audit found)\n",
+               (double)s_poll_frames / 60.0, s_latched_actor, s_latched_species, (unsigned)looked_up,
+               (unsigned)s_latched_id);
+
+        /* Run for 6x the overridden TTL so the log clearly shows the lookup surviving well past the
+           point the pre-fix code would have dropped it, not just barely past the threshold once. */
+        if (s_poll_frames >= g_pc_diag_bug_ttl_lookup_frames * 6) {
+            printf("[NET][WILDLIFE] --diag-bug-ttl-lookup: diagnostic window complete (entity %u)\n",
+                   (unsigned)s_latched_id);
+            s_done = 1;
+        }
+    }
+}
+
+/* T8 review fix verification, TEST-ONLY: --diag-bug-despawn-label-race. See its own doc, pc_platform.h,
+ * for the full rationale and the exact regression this reproduces (Bug 2 part (b)'s original "clear
+ * local_actor immediately on despawn" change, since reverted -- see pcwld_bug_handle_wildlife_despawn()'s
+ * own doc, pc_wildlife_authority.c). HOST role only. Driven together with a second peer's raced
+ * CATCH_REQUEST for the SAME entity_id (test_wildlife_bug_catch.py's own TEST for this flag sends it),
+ * since this diagnostic only forces the LABEL side of the race -- the actual despawn still has to arrive
+ * from a genuine competing catch, exactly like a real two-peer race would produce one. */
+static void pcnetgame_run_bug_despawn_label_race_diag(void) {
+    static int      s_stage         = 0; /* 0 = find+latch+teleport+force label, 1 = settle wait, 2 =
+                                             waiting for the raced despawn, 3 = done */
+    static uint32_t s_latched_id    = 0;
+    static int      s_latched_species = 0;
+    static void*    s_latched_actor   = NULL;
+    static int      s_settle_frames   = 0;
+
+    if (!g_pc_diag_bug_despawn_label_race || s_stage >= 3 || s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town()) {
+        return;
+    }
+
+    if (s_stage == 0) {
+        int i;
+        PLAYER_ACTOR* local = GET_PLAYER_ACTOR_NOW();
+
+        if (!pcnetgame_is_real_player_actor(local)) {
+            return; /* no local save/actor yet -- retried next poll, mirrors --force-bug-catch's own
+                       client-trigger precondition check */
+        }
+        for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+            PcWildlifeRecord rec;
+            void* actor;
+            int species;
+
+            if (!pcwld_get_by_slot(i, &rec) || rec.kind != PC_WILDLIFE_KIND_BUG) {
+                continue;
+            }
+            if (rec.species == aINS_INSECT_TYPE_ANT) {
+                continue; /* ants have no local presentation actor and no ordinary net-catch path -- see
+                             pcnetgame_validate_and_commit_catch()'s own doc */
+            }
+            actor = pcwld_bug_local_actor_for_entity(rec.entity_id, &species);
+            if (actor == NULL) {
+                continue; /* not locally materialized on THIS process */
+            }
+
+            s_latched_id      = rec.entity_id;
+            s_latched_species = species;
+            s_latched_actor   = actor;
+
+            /* Teleport THIS process's own local player right on top of the bug's own recorded position --
+             * same safe, already-established teleport pattern pcnetgame_run_bug_catch_test_trigger_client()
+             * uses (--force-bug-catch) -- so aINS_cull_check()'s own OTHER two cull rules (not visible on
+             * camera + actor_specific==1; too far away in a different acre) both read this actor as
+             * "right next to the player" and never call aINS_destruct() on it while this diagnostic's race
+             * window is open, keeping exist_flag genuinely TRUE regardless of the label below.
+             *
+             * ALSO best-effort force this process's own item_net_catch_label onto the exact actor backing
+             * entity_id, mirroring the real net-swing assignment (m_player_main_swing_net.c_inc) -- honest
+             * caveat: Player_actor_Get_item_net_catch_label() (m_player_common.c_inc) only ever returns a
+             * non-zero label while player->now_main_index is one of the four real net states (SWING/PULL/
+             * NOTICE/PUTAWAY), which this diagnostic deliberately does NOT force this process's own player
+             * into (doing so would drive real per-frame net-animation logic this test hook has no business
+             * running) -- so this call is confirmed-by-testing a harmless no-op outside those states, kept
+             * here only so the log accurately shows the same call a real catch would make. The actor is
+             * kept alive by the teleport above, not by this label -- see this diagnostic's own doc,
+             * pc_platform.h, for the full honest-scope note. */
+            mPlib_Change_item_net_catch_label((u32)actor, mPlayer_NET_CATCH_TYPE_INSECT);
+            local->actor_class.world.position.x = rec.pos_x;
+            local->actor_class.world.position.y = rec.pos_y;
+            local->actor_class.world.position.z = rec.pos_z;
+            printf("[NET][WILDLIFE] --diag-bug-despawn-label-race: latched entity %u (species %d, "
+                   "local_actor %p) -- teleported this process's own local player on top of it and forced "
+                   "its own item_net_catch_label onto it -- settling briefly before waiting for a raced "
+                   "CATCH_REQUEST from another peer for the SAME entity\n",
+                   (unsigned)s_latched_id, s_latched_species, s_latched_actor);
+            s_stage = 1;
+            s_settle_frames = 0;
+            return;
+        }
+        return; /* no eligible bug yet this poll -- retried next poll */
+    }
+
+    if (s_stage == 1) {
+        /* Half a second @ 60fps -- gives the engine's own per-frame block_x/block_z and camera-distance
+           bookkeeping (read by aINS_cull_check()'s own distance/acre rule) a moment to catch up with the
+           teleport above before the race is allowed to proceed. */
+        s_settle_frames++;
+        if (s_settle_frames < 30) {
+            return;
+        }
+        printf("[NET][WILDLIFE] --diag-bug-despawn-label-race: settled -- now waiting for the raced "
+               "CATCH_REQUEST\n");
+        s_stage = 2;
+        return;
+    }
+
+    /* s_stage == 2: poll every frame for the raced despawn (driven externally by a second peer's
+       CATCH_REQUEST) to actually land -- pcwld_remove_by_id() (inside pcnetgame_validate_and_commit_
+       catch()) is what makes this entity_id stop being found, and pcnetgame_commit_catch_despawn() calls
+       pcwld_handle_wildlife_despawn() synchronously in that SAME call, on this SAME host process, before
+       CATCH_RESULT is ever sent out -- so the instant pcwld_find_by_id() reports it gone, the despawn
+       reconciliation (and the property under test) has already happened. */
+    {
+        PcWildlifeRecord rec;
+        int still_present = pcwld_find_by_id(s_latched_id, &rec);
+        uint32_t looked_up;
+        const aINS_INSECT_ACTOR* insect;
+
+        if (still_present) {
+            return; /* no competing catch has landed yet -- keep waiting */
+        }
+
+        looked_up = pc_net_game_bug_entity_id_for_label(s_latched_actor, s_latched_species);
+        insect = (const aINS_INSECT_ACTOR*)s_latched_actor;
+        printf("[NET][WILDLIFE] --diag-bug-despawn-label-race: entity %u despawned by a competing catch "
+               "while this process's own label was still active -- pc_net_game_bug_entity_id_for_label("
+               "local_actor=%p, species=%d) = %u (expected %u if the fix holds; 0 would mean the mapping "
+               "was wiped despite the active label -- the exact regression this diagnostic targets); local "
+               "actor exist_flag=%d insect_flags.destruct=%d (both are expected to show the deferred-"
+               "destroy shape -- still alive, destruct flag now set -- exactly like ac_insect_move.c_inc's "
+               "own aINS_cull_check() label check keeps it alive until the label itself releases)\n",
+               (unsigned)s_latched_id, s_latched_actor, s_latched_species, (unsigned)looked_up,
+               (unsigned)s_latched_id, (int)insect->exist_flag, (int)insect->insect_flags.destruct);
+        printf("[NET][WILDLIFE] --diag-bug-despawn-label-race: RESULT %s\n",
+               (looked_up == s_latched_id) ? "PASS" : "FAIL");
+        s_stage = 3;
+    }
+}
+
+/* T8 audit verification, TEST-ONLY: --diag-role-link-state. See its own doc, pc_platform.h. Any role;
+ * a complete no-op unless the flag is set. Prints on a plain frame-count throttle (not gated on
+ * s_host_world_ready/pcfa_scene_is_town()) so the DISCONNECTED window itself -- which by definition has
+ * no live host session to be "world ready" against -- is still visible in the log. */
+static void pcnetgame_run_role_link_state_diag(void) {
+    static int s_frames = 0;
+
+    if (!g_pc_diag_role_link_state) {
+        return;
+    }
+    s_frames++;
+    if (s_frames % 60 != 0) {
+        return; /* once per second @ 60fps */
+    }
+    printf("[NET][DIAG] --diag-role-link-state: role=%d link=%d world_is_host_authoritative()=%d "
+           "pcwld_should_suppress_local_wildlife()=%d\n",
+           (int)s_role, (int)pc_net_game_client_link_state(), pc_net_game_world_is_host_authoritative(),
+           pcwld_should_suppress_local_wildlife());
+}
+
 static void pcnetgame_run_pickup_test_seed(void) {
     static const int s_seed_tiles[30][2] = {
         { 8, 8 },   { 24, 8 },  { 40, 8 },  { 56, 8 },  { 72, 8 },
@@ -9951,7 +11428,17 @@ void pc_net_game_poll(void) {
                judged (it simply re-derives its hit count fresh either way, but this keeps the ordering
                consistent with every other per-poll expiry tick in this function). */
             pcnetgame_host_check_tree_cut();
+            /* World Ecology T1 review fix: authoritative wildlife-table idle expiry -- host-only,
+             * same "before this poll's events" placement as the other per-poll expiry ticks above.
+             * See pcwld_host_check_idle()'s own doc (pc_wildlife_authority.c/.h) for the bug this
+             * closes. */
+            pcwld_host_check_idle();
         }
+        /* World Ecology T1 review fix: local presentation-map idle expiry -- ANY role (a client
+         * maintains its own local presentation map too, see pcwld_presentation_check_idle()'s own
+         * doc). Placed outside the host-only block above but still before this poll's events are
+         * handled, matching the same ordering convention. */
+        pcwld_presentation_check_idle();
     }
 
     pc_net_poll(); /* never blocks */
@@ -10342,6 +11829,37 @@ void pc_net_game_poll(void) {
     /* P1 (World Ecology T-dig) real-gameplay verification: see pcnetgame_run_dig_hole_test_trigger()'s
      * own doc -- a complete no-op unless --force-dig-hole was passed. */
     pcnetgame_run_dig_hole_test_trigger();
+
+    /* World Ecology Wildlife Sync T1 real-gameplay verification: see
+     * pcnetgame_run_wildlife_trigger_test_trigger()'s own doc -- a complete no-op unless
+     * --force-wildlife-trigger was passed. */
+    pcnetgame_run_wildlife_trigger_test_trigger();
+
+    /* World Ecology Wildlife Sync T-catch real-gameplay verification: see
+     * pcnetgame_run_fish_catch_test_trigger_host()/_client()'s own doc -- a complete no-op unless
+     * --force-fish-catch was passed. Both are safe to call unconditionally every poll, regardless of
+     * role (each checks its own role internally, mirroring every other force-* trigger pair). */
+    pcnetgame_run_fish_catch_test_trigger_host();
+    pcnetgame_run_fish_catch_test_trigger_client();
+
+    /* World Ecology Wildlife Sync T4 real-gameplay verification: see
+     * pcnetgame_run_bug_catch_test_trigger_host()/_client()'s own doc -- a complete no-op unless
+     * --force-bug-catch was passed. Both are safe to call unconditionally every poll, regardless of role
+     * (each checks its own role internally, mirroring the --force-fish-catch pair above). */
+    pcnetgame_run_bug_catch_test_trigger_host();
+    pcnetgame_run_bug_catch_test_trigger_client();
+
+    /* T8 audit verification, TEST-ONLY: see pcnetgame_run_bug_ttl_lookup_diag_host()'s own doc -- a
+     * complete no-op unless --diag-bug-ttl-lookup was passed. */
+    pcnetgame_run_bug_ttl_lookup_diag_host();
+
+    /* T8 review fix verification, TEST-ONLY: see pcnetgame_run_bug_despawn_label_race_diag()'s own doc --
+     * a complete no-op unless --diag-bug-despawn-label-race was passed. */
+    pcnetgame_run_bug_despawn_label_race_diag();
+
+    /* T8 audit verification, TEST-ONLY: see pcnetgame_run_role_link_state_diag()'s own doc -- a complete
+     * no-op unless --diag-role-link-state was passed. */
+    pcnetgame_run_role_link_state_diag();
 }
 
 PCNetGameRole pc_net_game_role(void) {
@@ -12045,4 +13563,738 @@ void pc_net_game_notify_local_mail_delivered(int slot, const uint8_t* player_nam
     msg.world_seq = s_world_seq;
     memcpy(msg.letter, letter, sizeof(msg.letter));
     pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+}
+
+/* ============================================================================================
+ * World Ecology Wildlife Sync T0 (authority seam foundation only -- see pc_wildlife_authority.h)
+ * ============================================================================================ */
+
+/* See pc_net_game.h's own doc. */
+int pc_net_game_authoritative_wildlife_enabled(void) {
+    return g_pc_authoritative_wildlife ? 1 : 0;
+}
+
+/* See pc_net_game.h's own doc. No "one already in flight" guard, matching TREE_SHAKE's own
+ * precedent -- a wade event for a different acre may legitimately arrive while an earlier one is
+ * still being processed host-side. */
+int pc_net_game_request_wildlife_spawn_trigger(int bx, int bz) {
+    PCNetGameWildlifeSpawnTriggerRequestMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (!g_pc_authoritative_wildlife) {
+        return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior, matching
+                     every other single-player/disabled-feature early-return in this file */
+    }
+    if (bx < 0 || bx > 255 || bz < 0 || bz > 255) {
+        return 1; /* swallow silently -- the caller must never run the local decision while
+                     host-authoritative, even for input the host would reject anyway */
+    }
+    if (!pcfa_scene_is_town()) {
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] not in the town scene -- SPAWN_TRIGGER_REQUEST at acre (%d,%d) not sent\n",
+                   bx, bz);
+        }
+        return 1; /* matches pc_net_game_request_tree_shake()'s own scene-check precedent */
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_WILDLIFE_SPAWN_TRIGGER_REQUEST;
+    msg.bx = (uint8_t)bx;
+    msg.bz = (uint8_t)bz;
+    if (!pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: SPAWN_TRIGGER_REQUEST at acre (%d,%d) could not be queued "
+                   "(window full) -- dropped, not retried (matches TREE_SHAKE's own accepted-gap "
+                   "precedent)\n",
+                   bx, bz);
+        }
+    }
+    return 1;
+}
+
+/* See pc_net_game.h's own doc. Mirrors pc_net_game_host_local_tree_shake()'s own shape exactly. */
+void pc_net_game_host_local_wildlife_spawn_trigger(int bx, int bz) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!g_pc_authoritative_wildlife) {
+        return; /* opt-in gate off -- caller falls through to plain vanilla behavior */
+    }
+    pcwld_host_spawn_trigger(bx, bz);
+}
+
+/* ============================================================================================
+ * World Ecology Wildlife Sync T-catch (ordinary fish catching), extended by T4 to also cover ordinary
+ * bug catching -- see pc_net_game_request_catch_bug()'s own doc (pc_net_game.h) for the T4 design.
+ * Tournaments and ant/bee special-case handling remain out of scope (T5).
+ * ============================================================================================ */
+
+/* Shared core behind pc_net_game_request_catch_fish() and pc_net_game_request_catch_bug() (pc_net_game.h)
+ * -- identical client-side seam for either kind: neither the wire message nor this function's own logic
+ * cares which domain `claimed_species` belongs to (that is resolved entirely host-side, against the
+ * authoritative record's own `kind`, by pcnetgame_validate_and_commit_catch()) -- the only thing this
+ * function itself needs `kind` for is remembering which collection-bit commit pcnetgame_handle_client_
+ * catch_result() must run later, on accept. See pc_net_game_request_catch_fish()'s own original doc
+ * (pc_net_game.h) for the full interception design (Option A: defer the grant until the host accepts,
+ * never award-then-claw-back) -- unchanged by this refactor. No "one already in flight" guard, matching
+ * pc_net_game_request_dig_shine()'s own precedent (a stale, superseded s_catch_pending is simply
+ * overwritten; the earlier request's own eventual RESULT will then fail the request_id match in the
+ * handler below and is harmlessly ignored). Fire-and-forget on a send failure (window full) --
+ * deliberately NOT retried, mirroring pc_net_game_request_snowman_build()'s own "dropped, not retried"
+ * precedent: by the time any retry could matter, the underlying fish/bug may already be gone (caught by
+ * someone else, or despawned), so resending has nothing useful to retry against. */
+static int pcnetgame_request_catch_common(uint32_t entity_id, int kind, int claimed_species,
+                                          int local_grant_item) {
+    PCNetGameCatchRequestMsg msg;
+    PCNetGameOwnerStamp stamp;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (!g_pc_authoritative_wildlife) {
+        return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior */
+    }
+    if (entity_id == 0) {
+        return 1; /* malformed input from the caller (no stamped entity_id) -- "handled" (the caller's
+                     own doc says it then falls back to the ordinary vanilla grant itself), nothing sent */
+    }
+    if (!pcfa_scene_is_town()) {
+        return 0;
+    }
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        printf("[NET][WILDLIFE] client: no gameplay save loaded -- CATCH request for entity %u not sent\n",
+               (unsigned)entity_id);
+        return 0;
+    }
+
+    s_catch_pending.valid = 1;
+    s_catch_pending.request_id = s_next_catch_request_id++;
+    s_catch_pending.entity_id = entity_id;
+    s_catch_pending.kind = kind;
+    s_catch_pending.claimed_species = claimed_species;
+    s_catch_pending.local_grant = (uint16_t)local_grant_item;
+    s_catch_pending.owner = stamp;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_CATCH_REQUEST;
+    msg.entity_id = entity_id;
+    msg.generation = s_client_wildlife_known_generation;
+    msg.request_id = s_catch_pending.request_id;
+    msg.claimed_species = (int32_t)claimed_species;
+    if (!pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+        printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) could not be queued (window full) "
+               "-- dropped, not retried\n",
+               (unsigned)s_catch_pending.request_id, (unsigned)entity_id);
+        /* Residual review fix: a dropped send can never produce a CATCH_RESULT, so leaving
+           s_catch_pending.valid set would make pc_net_game_query_catch_outcome() report PENDING
+           forever for this entity_id -- the putaway-rod exchange screen's gate would then fall
+           through to its PENDING policy only by accident of timing, never resolving. Record it as
+           rejected immediately instead, exactly like a genuine host rejection: nothing was sent, so
+           nothing can ever be granted for this catch. */
+        s_catch_pending.valid = 0;
+        s_catch_last_outcome.valid = 1;
+        s_catch_last_outcome.entity_id = entity_id;
+        s_catch_last_outcome.accepted = 0;
+    }
+    return 1;
+}
+
+/* See pc_net_game.h's own doc. Thin wrapper around pcnetgame_request_catch_common() above. */
+int pc_net_game_request_catch_fish(uint32_t entity_id, int claimed_species, int local_grant_item) {
+    return pcnetgame_request_catch_common(entity_id, PC_WILDLIFE_KIND_FISH, claimed_species,
+                                          local_grant_item);
+}
+
+/* World Ecology Wildlife Sync T4. See pc_net_game.h's own doc. Thin wrapper around pcnetgame_request_
+ * catch_common() above. */
+int pc_net_game_request_catch_bug(uint32_t entity_id, int claimed_species, int local_grant_item) {
+    return pcnetgame_request_catch_common(entity_id, PC_WILDLIFE_KIND_BUG, claimed_species,
+                                          local_grant_item);
+}
+
+/* World Ecology Wildlife Sync T4. See pc_net_game.h's own doc. Thin wrapper around pcwld_bug_entity_id_
+ * for_local_actor() (pc_wildlife_authority.h). */
+uint32_t pc_net_game_bug_entity_id_for_label(const void* label_actor, int insect_type) {
+    return pcwld_bug_entity_id_for_local_actor(label_actor, insect_type);
+}
+
+/* See pc_net_game.h's own doc. Mirrors pc_net_game_host_local_tree_shake()'s own shape: the host's own
+ * local catch is resolved synchronously against the SAME pcnetgame_validate_and_commit_catch() core a
+ * remote peer's CATCH_REQUEST uses (is_host_local=1: skips the reach/IN_TOWN checks, exactly like every
+ * other is_host_local exemption in this file). Returns 1 iff accepted (the authoritative table entry is
+ * already removed and WILDLIFE_DESPAWN already broadcast by the time this returns) -- the caller must
+ * then run the vanilla grant line UNMODIFIED, with NO network round-trip to itself (see this milestone's
+ * design brief). Returns 0 if rejected (a genuine race loss to a peer's own simultaneous request, a
+ * stale/unknown entity_id, or authoritative wildlife not enabled) -- the caller must NOT grant anything. */
+int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_species) {
+    int accepted;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    if (!g_pc_authoritative_wildlife) {
+        return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior */
+    }
+
+    accepted = pcnetgame_validate_and_commit_catch(1, (PCNetPeerId)0, entity_id, pcwld_session_generation(),
+                                                   claimed_species);
+    if (accepted) {
+        printf("[NET][WILDLIFE] host: local CATCH entity %u (species claim %d) accepted -- removed from "
+               "authoritative table\n",
+               (unsigned)entity_id, claimed_species);
+        pcnetgame_commit_catch_despawn(entity_id);
+    } else if (g_pc_verbose) {
+        printf("[NET][WILDLIFE] host: local CATCH entity %u (species claim %d) rejected (likely lost a "
+               "race to a peer's own simultaneous claim)\n",
+               (unsigned)entity_id, claimed_species);
+    }
+
+    /* Residual review fix: record this synchronous decision the same way the client records its own
+       (eventual) CATCH_RESULT, so pc_net_game_query_catch_outcome() can gate the putaway-rod exchange
+       screen for the HOST'S own local full-pockets catch exactly like it gates a client's -- see that
+       call site's own doc (m_player_main_putaway_rod.c_inc). Without this, a host that raced and LOST
+       to a peer's own simultaneous claim (free_space < 0 either way) would still see the exchange
+       dialogue and could still choose "exchange," granting itself an item for a catch it never actually
+       won. */
+    s_catch_last_outcome.valid = 1;
+    s_catch_last_outcome.entity_id = entity_id;
+    s_catch_last_outcome.accepted = accepted;
+
+    return accepted;
+}
+
+/* Host-side receive: validates peer READY, world ready, and that bx/bz names an addressable town
+ * acre BEFORE invoking the spawn adapter -- deliberately no reach/position validation (the client
+ * sends no position at all, only "I wade-entered this acre"), matching this milestone's own stated
+ * T0 scope (a full reach/position-validation system is later work). */
+static void pcnetgame_handle_host_wildlife_spawn_trigger_request(PCNetPeerId peer,
+                                                                 const PCNetGameWildlifeSpawnTriggerRequestMsg* in) {
+    if (!g_pc_authoritative_wildlife) {
+        /* Opt-in gate off -- ignore. Without this check a flag-off host would still run the full
+         * adapter (real vanilla spawn decision + real actor creation + broadcast) the moment ANY
+         * peer sends this message type, on top of its own already-running vanilla local spawning,
+         * with no rate limit -- including from a flagged client, or a malicious/crafted peer.
+         * NOTE (flag-mismatch risk): if this host has the flag on but a connected peer does not (or
+         * vice versa), there is currently no protocol-level handshake that surfaces that mismatch to
+         * either side (unlike e.g. protocol-version, which IS checked at connect time) -- a
+         * mismatched peer's wildlife requests/spawns are simply silently ignored by whichever side
+         * has the flag off. Wiring a real mismatch notice would need a new handshake field; out of
+         * scope for this fix, so it's called out here instead. */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] host: SPAWN_TRIGGER_REQUEST from peer %d ignored -- "
+                   "authoritative wildlife is disabled on this host\n",
+                   (int)peer);
+        }
+        return;
+    }
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (!s_host_world_ready || !pcfa_save_ready()) {
+        return;
+    }
+    /* Same addressable-acre bound pcwld_host_spawn_trigger() itself re-checks -- validated here too,
+     * up front, so a malformed/out-of-bounds request from a misbehaving client never even reaches
+     * the adapter (defense in depth, matching this file's own layered-validation convention). */
+    if ((int)in->bx - 1 < 0 || (int)in->bx - 1 >= PCFA_ACRE_X_NUM || (int)in->bz - 1 < 0 ||
+        (int)in->bz - 1 >= PCFA_ACRE_Z_NUM) {
+        return;
+    }
+    pcwld_host_spawn_trigger((int)in->bx, (int)in->bz);
+}
+
+/* T1 client handler: validates the message (a TRUST BOUNDARY -- this data comes straight off the
+ * wire from the host) then materializes a REAL local vanilla fish/bug actor via
+ * pcwld_presentation_create(), which does its own full range validation (kind/species/acre/
+ * position) and its own duplicate-entity_id suppression -- see that function's own doc
+ * (pc_wildlife_authority.h/.c). This client NEVER rolls RNG, NEVER runs the decision functions,
+ * NEVER chooses its own species/position, and NEVER invents an entity_id or writes back to any
+ * authoritative state -- it only constructs a local presentation actor from data the host already
+ * decided. */
+static void pcnetgame_handle_client_wildlife_spawn(const PCNetGameWildlifeSpawnMsg* in) {
+    if (!g_pc_authoritative_wildlife) {
+        /* Opt-in gate off -- ignore. Without this check a flag-off client connected to a flag-on
+         * host would still materialize the host's spawns via pcwld_presentation_create() ON TOP OF
+         * its own vanilla local spawning. See the matching comment in
+         * pcnetgame_handle_host_wildlife_spawn_trigger_request() above re: flag-mismatch risk. */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: SPAWN entity %u ignored -- authoritative wildlife is "
+                   "disabled on this client\n",
+                   (unsigned)in->entity_id);
+        }
+        return;
+    }
+    if (in->entity_id == 0) {
+        return; /* 0 is never a valid entity_id (pc_wildlife_authority.h) -- malformed, ignore */
+    }
+    if ((int)in->kind >= PC_WILDLIFE_KIND_NUM) { /* in->kind is uint8_t -- never negative */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: SPAWN entity %u rejected -- unknown kind %u\n",
+                   (unsigned)in->entity_id, (unsigned)in->kind);
+        }
+        return;
+    }
+
+    if (g_pc_verbose) {
+        printf("[NET][WILDLIFE] client: SPAWN entity %u kind %u species %d acre(%u,%u) "
+               "pos(%.1f,%.1f,%.1f)\n",
+               (unsigned)in->entity_id, (unsigned)in->kind, (int)in->species, (unsigned)in->bx,
+               (unsigned)in->bz, in->pos_x, in->pos_y, in->pos_z);
+    }
+
+    /* Remaining validation (species range, acre range, position sanity) and duplicate-entity_id
+     * suppression are pcwld_presentation_create()'s own job -- shared, byte-for-byte, with the
+     * host's own self-presentation call (pcwld_host_spawn_trigger(), pc_wildlife_authority.c) so
+     * both roles apply exactly the same rules to exactly the same data. */
+    pcwld_presentation_create(in->entity_id, (int)in->kind, (int)in->species, (int)in->bx,
+                              (int)in->bz, in->pos_x, in->pos_y, in->pos_z);
+
+    /* World Ecology Wildlife Sync T-catch, TEST-ONLY bookkeeping: remembers the most recently observed
+       FISH entity_id/species so pcnetgame_run_fish_catch_test_trigger_client() (--force-fish-catch) has
+       a real, currently-live entity to catch without needing an actual UKI (fishing rod/bobber) actor --
+       see that function's own doc. Cheap and harmless when the flag is off (a plain store, never read),
+       so it is not itself gated on g_pc_force_fish_catch. */
+    if ((int)in->kind == PC_WILDLIFE_KIND_FISH) {
+        s_force_catch_last_fish_entity_id = in->entity_id;
+        s_force_catch_last_fish_species = (int)in->species;
+        s_force_catch_last_fish_x = in->pos_x;
+        s_force_catch_last_fish_z = in->pos_z;
+    } else if ((int)in->kind == PC_WILDLIFE_KIND_BUG && (int)in->species != aINS_INSECT_TYPE_ANT) {
+        /* World Ecology Wildlife Sync T4, TEST-ONLY bookkeeping for --force-bug-catch -- see
+           s_force_catch_last_bug_entity_id's own doc for why ants are excluded here. */
+        s_force_catch_last_bug_entity_id = in->entity_id;
+        s_force_catch_last_bug_species = (int)in->species;
+        s_force_catch_last_bug_x = in->pos_x;
+        s_force_catch_last_bug_z = in->pos_z;
+    }
+}
+
+/* See pc_net_game.h's own doc. Called ONLY from pcwld_table_insert() (pc_wildlife_authority.c). */
+void pc_net_game_notify_wildlife_spawn(uint32_t entity_id, int kind, int species, int bx, int bz,
+                                        float pos_x, float pos_y, float pos_z) {
+    PCNetGameWildlifeSpawnMsg msg;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type   = (uint8_t)PC_NETGAME_MSG_WILDLIFE_SPAWN;
+    msg.kind       = (uint8_t)kind;
+    msg.bx         = (uint8_t)bx;
+    msg.bz         = (uint8_t)bz;
+    msg.entity_id  = entity_id;
+    msg.species    = (int32_t)species;
+    msg.pos_x      = pos_x;
+    msg.pos_y      = pos_y;
+    msg.pos_z      = pos_z;
+    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+}
+
+/* ============================================================================================
+ * World Ecology Wildlife Sync T2 (late-join/reconnect snapshot -- see pc_wildlife_authority.h's own
+ * T2 doc and this file's own PCNetGameWildlifeSnapshot{Begin,Entry,End}Msg doc comments for the full
+ * design). Snapshot-pump integration only -- catching, tournaments, latent-bug networking, ant/bee
+ * special-case handling, a final despawn policy, and cockroach extra_data are all still explicitly
+ * out of scope (same ABSOLUTE SCOPE LIMIT as T0/T1).
+ * ============================================================================================ */
+
+/* Host side: builds a PCNetGameWildlifeSnapshotEntryMsg for authoritative table slot `slot` --
+ * returns 0 (nothing built) if that slot is not currently active, 1 otherwise. Mirrors
+ * pcnetgame_build_friendship_snapshot_entry()'s own shape exactly (a plain build-or-skip helper the
+ * pump's flat-iteration loop calls once per slot). */
+static int pcnetgame_build_wildlife_snapshot_entry(PCNetGameWildlifeSnapshotEntryMsg* we, int slot,
+                                                    uint32_t epoch) {
+    PcWildlifeRecord rec;
+
+    if (!pcwld_get_by_slot(slot, &rec)) {
+        return 0;
+    }
+
+    memset(we, 0, sizeof(*we));
+    we->msg_type  = (uint8_t)PC_NETGAME_MSG_WILDLIFE_SNAPSHOT_ENTRY;
+    we->kind      = (uint8_t)rec.kind;
+    we->bx        = (uint8_t)rec.bx;
+    we->bz        = (uint8_t)rec.bz;
+    we->entity_id = rec.entity_id;
+    we->species   = (int32_t)rec.species;
+    we->pos_x     = rec.pos_x;
+    we->pos_y     = rec.pos_y;
+    we->pos_z     = rec.pos_z;
+    we->epoch     = epoch;
+    return 1;
+}
+
+/* Client side: WILDLIFE_SNAPSHOT_BEGIN. Gated against the SAME outer snapshot epoch FIELD_BLOCK
+ * itself uses (a superseded/restarted snapshot pass is dropped here exactly like it would be for any
+ * other in-snapshot message -- see this file's own doc on why no separate staleness scheme is
+ * invented for wildlife specifically).
+ *
+ * The core T2 decision happens here: compare the host's `generation` against
+ * s_client_wildlife_known_generation (persists across an ordinary disconnect -- see that variable's
+ * own doc). A different value (including this client's very first-ever wildlife snapshot, where the
+ * tracker is still its reserved 0) means "treat this as a brand-new authoritative wildlife session" --
+ * the local presentation/bookkeeping map is fully cleared FIRST (pcwld_presentation_reset()), so a
+ * host restart or a genuinely different host can never have its low-numbered fresh entity_ids
+ * misread as continuations of unrelated old local state (see pcwld_session_generation()'s own doc,
+ * pc_wildlife_authority.h, for the seeding choice that keeps two different host PROCESSES' own
+ * generations from colliding in practice). The SAME value means "this is the session I already have
+ * local bookkeeping for" -- nothing is cleared; pcwld_presentation_reconcile() at
+ * WILDLIFE_SNAPSHOT_END will instead precisely diff against whatever survived (the whole point of
+ * this milestone: entity 100, still alive and still authoritative, must NOT be destroyed and
+ * recreated just because the client's transport connection blipped). */
+static void pcnetgame_handle_client_wildlife_snapshot_begin(const PCNetGameWildlifeSnapshotBeginMsg* in) {
+    if (!g_pc_authoritative_wildlife) {
+        /* Opt-in gate off -- ignore. Without this check a flag-off client joining LATE (after
+         * wildlife already exists on the host) would still run the known-generation/reset logic
+         * below and flip s_client_wildlife_snap_active on, letting the ENTRY/END handlers that
+         * follow materialize real local actors via pcwld_presentation_create() -- reintroducing
+         * the exact double-spawn problem pcnetgame_handle_client_wildlife_spawn()'s own gate above
+         * was added to close, just via the snapshot path instead of the real-time WILDLIFE_SPAWN
+         * broadcast path. See the matching comment there. */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: WILDLIFE_SNAPSHOT_BEGIN ignored -- authoritative "
+                   "wildlife is disabled on this client\n");
+        }
+        return;
+    }
+    if (!s_client_snap_active || in->epoch != s_client_snap_epoch) {
+        return; /* part of a superseded outer snapshot */
+    }
+    if (!pcnetgame_client_can_apply_world()) {
+        return;
+    }
+
+    if (s_client_wildlife_known_generation == 0 || in->generation != s_client_wildlife_known_generation) {
+        printf("[NET][WILDLIFE] client: wildlife snapshot generation %u is %s (previously %u) -- "
+               "local presentation bookkeeping cleared before applying this snapshot\n",
+               (unsigned)in->generation,
+               (s_client_wildlife_known_generation == 0) ? "the FIRST this client has ever seen" : "NEW",
+               (unsigned)s_client_wildlife_known_generation);
+        pcwld_presentation_reset();
+        pcwld_clear_local_actor_stamps(); /* Bug fix (post-T3 review, Bug C): this process's own local
+                                              fish-actor pool may still hold a live actor stamped with an
+                                              entity_id from the SUPERSEDED session -- clear it here too
+                                              so it can never be mismatched against a same-numbered
+                                              entity_id in this new session (see that function's own
+                                              doc, pc_wildlife_authority.h) */
+    } else if (g_pc_verbose) {
+        printf("[NET][WILDLIFE] client: wildlife snapshot generation %u matches the previously-known "
+               "session -- reconciling against existing local bookkeeping, not clearing it\n",
+               (unsigned)in->generation);
+    }
+    s_client_wildlife_known_generation = in->generation;
+
+    s_client_wildlife_snap_active = 1;
+    s_client_wildlife_snap_epoch = in->epoch;
+    s_client_wildlife_seen_count = 0;
+    s_client_wildlife_snap_incomplete = 0; /* fresh pass -- see this flag's own doc */
+
+    printf("[NET][WILDLIFE] client: wildlife snapshot begin (generation %u, %u entries expected)\n",
+           (unsigned)in->generation, (unsigned)in->count);
+}
+
+/* Client side: one WILDLIFE_SNAPSHOT_ENTRY. Gated against both the outer snapshot epoch AND this
+ * peer's own wildlife sub-pass state (redundant with the outer check in practice, but cheap and
+ * matches this file's general layered-validation convention). Framing validation only here
+ * (entity_id != 0) -- kind/species/acre/position range validation is entirely pcwld_presentation_
+ * create()'s own job (same function, same rules, T1 already established), never duplicated. Every
+ * entry -- regardless of whether local actor creation itself succeeds -- is recorded into the
+ * "seen this snapshot" list: the ENTITY existing per the host's authoritative table is what matters
+ * for reconciliation, independent of whether THIS process could materialize a local actor for it
+ * (e.g. an ant, deliberately deferred with no actor -- see pcwld_presentation_create()'s own doc --
+ * must still count as "seen", or the very next reconciliation pass would immediately treat it as
+ * stale and discard its already-correct "handled, no actor" bookkeeping for no reason). This
+ * milestone does NOT filter by acre relevance -- every entry is unconditionally materialized via
+ * pcwld_presentation_create(), mirroring T1's own existing unconditional-creation behavior for an
+ * ordinary WILDLIFE_SPAWN (see PCNetGameWildlifeSnapshotEntryMsg's own doc). */
+static void pcnetgame_handle_client_wildlife_snapshot_entry(const PCNetGameWildlifeSnapshotEntryMsg* in) {
+    if (!g_pc_authoritative_wildlife) {
+        /* Opt-in gate off -- ignore. This is the handler that actually calls
+         * pcwld_presentation_create() and materializes a real local actor -- without this check a
+         * flag-off client would do so for every entry in a late-join snapshot, on top of its own
+         * vanilla local spawning. See the matching comment in
+         * pcnetgame_handle_client_wildlife_snapshot_begin() above and
+         * pcnetgame_handle_client_wildlife_spawn() (T1) for the original form of this bug. */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: WILDLIFE_SNAPSHOT_ENTRY entity %u ignored -- "
+                   "authoritative wildlife is disabled on this client\n",
+                   (unsigned)in->entity_id);
+        }
+        return;
+    }
+    if (!s_client_snap_active || in->epoch != s_client_snap_epoch) {
+        return;
+    }
+    if (!s_client_wildlife_snap_active || in->epoch != s_client_wildlife_snap_epoch) {
+        return;
+    }
+    if (!pcnetgame_client_can_apply_world()) {
+        /* Save-not-ready (or similar) latch dropped mid-pass -- this entry is skipped, so
+         * s_client_wildlife_seen[] will be missing it. Mark the whole pass incomplete so
+         * WILDLIFE_SNAPSHOT_END abandons the reconcile instead of treating this (and every other
+         * live entity skipped during this window) as stale. See s_client_wildlife_snap_incomplete's
+         * own doc. */
+        s_client_wildlife_snap_incomplete = 1;
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: WILDLIFE_SNAPSHOT_ENTRY entity %u skipped -- world "
+                   "cannot currently be applied; this snapshot pass is now marked incomplete\n",
+                   (unsigned)in->entity_id);
+        }
+        return;
+    }
+    if (in->entity_id == 0) {
+        return; /* malformed -- 0 is never a valid entity_id */
+    }
+    if ((int)in->kind >= PC_WILDLIFE_KIND_NUM) { /* in->kind is uint8_t -- never negative */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: WILDLIFE_SNAPSHOT_ENTRY entity %u rejected -- unknown "
+                   "kind %u\n",
+                   (unsigned)in->entity_id, (unsigned)in->kind);
+        }
+        return;
+    }
+
+    if (s_client_wildlife_seen_count < PCWLD_PUBLIC_MAX_ENTITIES) {
+        s_client_wildlife_seen[s_client_wildlife_seen_count++] = in->entity_id;
+    } else if (g_pc_verbose) {
+        printf("[NET][WILDLIFE] client: wildlife snapshot 'seen' list full (%d) -- entity %u will not "
+               "be protected from this pass's reconciliation if it was already tracked (host table is "
+               "itself bounded to the same capacity, so this should not happen in practice)\n",
+               PCWLD_PUBLIC_MAX_ENTITIES, (unsigned)in->entity_id);
+    }
+
+    /* Same validation + duplicate-suppression pcwld_presentation_create() already gives an ordinary
+     * WILDLIFE_SPAWN (T1) -- reused verbatim, never duplicated here. */
+    pcwld_presentation_create(in->entity_id, (int)in->kind, (int)in->species, (int)in->bx, (int)in->bz,
+                              in->pos_x, in->pos_y, in->pos_z);
+
+    /* World Ecology Wildlife Sync T-catch, TEST-ONLY bookkeeping -- see
+     * pcnetgame_handle_client_wildlife_spawn()'s own matching doc. A late-joining client only ever
+     * learns about a pre-existing fish through THIS handler (never the real-time WILDLIFE_SPAWN one),
+     * so --force-fish-catch needs this same bookkeeping here too. */
+    if ((int)in->kind == PC_WILDLIFE_KIND_FISH) {
+        s_force_catch_last_fish_entity_id = in->entity_id;
+        s_force_catch_last_fish_species = (int)in->species;
+        s_force_catch_last_fish_x = in->pos_x;
+        s_force_catch_last_fish_z = in->pos_z;
+    } else if ((int)in->kind == PC_WILDLIFE_KIND_BUG && (int)in->species != aINS_INSECT_TYPE_ANT) {
+        /* World Ecology Wildlife Sync T4, TEST-ONLY bookkeeping -- see
+         * pcnetgame_handle_client_wildlife_spawn()'s own matching doc. A late-joining client only ever
+         * learns about a pre-existing bug through THIS handler, so --force-bug-catch needs this same
+         * bookkeeping here too. */
+        s_force_catch_last_bug_entity_id = in->entity_id;
+        s_force_catch_last_bug_species = (int)in->species;
+        s_force_catch_last_bug_x = in->pos_x;
+        s_force_catch_last_bug_z = in->pos_z;
+    }
+}
+
+/* Client side: WILDLIFE_SNAPSHOT_END -- closes this peer's wildlife sub-pass and runs the actual
+ * reconciliation (Part 6 of the T2 milestone brief): anything currently in the local presentation map
+ * that was NOT named by this snapshot (not in s_client_wildlife_seen[]) is stale and is removed from
+ * LOCAL bookkeeping only (pcwld_presentation_reconcile() -- see that function's own doc for why it
+ * deliberately never attempts to destroy the real local actor: a full despawn policy is explicitly
+ * out of this milestone's scope). This can only ever matter for a RECONNECT to the SAME session (see
+ * pcnetgame_handle_client_wildlife_snapshot_begin()'s own doc) -- a fresh late-join's local map is
+ * already empty at this point, so the reconciliation below is a guaranteed no-op removing 0 entries,
+ * exactly as the milestone brief itself describes. */
+static void pcnetgame_handle_client_wildlife_snapshot_end(const PCNetGameWildlifeSnapshotEndMsg* in) {
+    int removed;
+
+    if (!g_pc_authoritative_wildlife) {
+        /* Opt-in gate off -- ignore. In practice s_client_wildlife_snap_active can never be 1 here
+         * when the flag is off (BEGIN's own gate above refuses to set it), so this is defense in
+         * depth / consistency with the BEGIN and ENTRY gates rather than something this path can
+         * currently reach -- but it keeps ALL of the known-generation and reconcile logic below
+         * from ever running on a flag-off client, not just the actor-creation step, per the same
+         * reasoning as the other two gates. */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: WILDLIFE_SNAPSHOT_END ignored -- authoritative wildlife "
+                   "is disabled on this client\n");
+        }
+        return;
+    }
+    if (!s_client_snap_active || in->epoch != s_client_snap_epoch) {
+        return;
+    }
+    if (!s_client_wildlife_snap_active || in->epoch != s_client_wildlife_snap_epoch) {
+        return;
+    }
+    s_client_wildlife_snap_active = 0;
+    if (!pcnetgame_client_can_apply_world()) {
+        s_client_wildlife_snap_incomplete = 0; /* whole pass discarded; nothing left to abandon */
+        return; /* entries were discarded too; the resync fetches a complete snapshot */
+    }
+    if (s_client_wildlife_snap_incomplete) {
+        /* One or more ENTRYs were skipped mid-pass while the world could not be applied (see
+         * s_client_wildlife_snap_incomplete's own doc) -- s_client_wildlife_seen[] is missing
+         * whatever was skipped, so running pcwld_presentation_reconcile() against it now would
+         * incorrectly treat those still-live entities as stale. Abandon this pass instead; the next
+         * snapshot (or a resync) will supply a complete list. */
+        s_client_wildlife_snap_incomplete = 0;
+        printf("[NET][WILDLIFE] client: wildlife snapshot end (generation %u) -- pass was incomplete "
+               "(world could not be applied for part of it), reconciliation skipped\n",
+               (unsigned)in->generation);
+        return;
+    }
+
+    if ((uint32_t)s_client_wildlife_seen_count != in->count_sent && g_pc_verbose) {
+        printf("[NET][WILDLIFE] client: WILDLIFE_SNAPSHOT_END count_sent %u != %d entries actually "
+               "seen this pass (diagnostic only, not fatal -- see this struct's own doc)\n",
+               (unsigned)in->count_sent, s_client_wildlife_seen_count);
+    }
+
+    removed = pcwld_presentation_reconcile(s_client_wildlife_seen, s_client_wildlife_seen_count);
+    printf("[NET][WILDLIFE] client: wildlife snapshot end (generation %u) -- %d entities live, %d stale "
+           "entries reconciled away\n",
+           (unsigned)in->generation, s_client_wildlife_seen_count, removed);
+}
+
+/* ============================================================================================
+ * World Ecology Wildlife Sync T-catch (ordinary fish catching only -- see this milestone's own
+ * ABSOLUTE SCOPE LIMIT).
+ * ============================================================================================ */
+
+/* Client side: the host's answer to our own pending CATCH_REQUEST. On accept, grants THIS client's own
+ * locally-remembered item (s_catch_pending.local_grant, computed once at request time from
+ * uki->get_fish_type_proc()) via mPr_SetFreePossessionItem() -- mirroring DIG_SHINE/DIG_HOLE's own
+ * client-rolled bonus grant exactly (pcnetgame_handle_client_field_action_result()'s own DIG_SHINE/
+ * DIG_HOLE branches) -- and commits the collection-bit write (mSM_COLLECT_FISH_SET()) that
+ * Player_actor_setup_main_Notice_rod() (m_player_main_notice_rod.c_inc) deliberately deferred until now.
+ * On reject, neither ever happens -- nothing was ever cleared or removed locally for a still-pending
+ * catch, so there is nothing to undo. */
+static void pcnetgame_handle_client_catch_result(const PCNetGameCatchResultMsg* in) {
+    int matches = s_catch_pending.valid && s_catch_pending.request_id == in->request_id;
+    uint32_t resolved_entity_id;
+
+    if (!matches) {
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: CATCH_RESULT for request %u (entity %u) has no matching "
+                   "pending request -- ignored\n",
+                   (unsigned)in->request_id, (unsigned)in->entity_id);
+        }
+        return;
+    }
+    resolved_entity_id = s_catch_pending.entity_id;
+    s_catch_pending.valid = 0; /* the RESULT arrived: resolved either way, never re-applied */
+
+    /* Residual review fix: EVERY early return below now also records a REJECTED outcome for
+       resolved_entity_id via s_catch_last_outcome (see its own doc just above PCNetGameCatchOutcome)
+       before returning -- not just the plain "!in->accepted" case. From the putaway-rod exchange
+       screen's point of view all three are identical: nothing was granted here, so it must not grant
+       either, regardless of which specific reason blocked the grant. */
+    if (!in->accepted) {
+        printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) rejected by host -- no item "
+               "granted\n",
+               (unsigned)in->request_id, (unsigned)in->entity_id);
+        s_catch_last_outcome.valid = 1;
+        s_catch_last_outcome.entity_id = resolved_entity_id;
+        s_catch_last_outcome.accepted = 0;
+        return;
+    }
+    if (in->entity_id != s_catch_pending.entity_id) {
+        printf("[NET][WILDLIFE] client: CATCH request %u accepted but the RESULT's entity %u disagrees "
+               "with the request's entity %u -- grant skipped\n",
+               (unsigned)in->request_id, (unsigned)in->entity_id, (unsigned)s_catch_pending.entity_id);
+        s_catch_last_outcome.valid = 1;
+        s_catch_last_outcome.entity_id = resolved_entity_id;
+        s_catch_last_outcome.accepted = 0;
+        return;
+    }
+    if (!pcnetgame_owner_stamp_matches(&s_catch_pending.owner)) {
+        printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) accepted but the local player/save "
+               "changed -- grant skipped\n",
+               (unsigned)in->request_id, (unsigned)in->entity_id);
+        s_catch_last_outcome.valid = 1;
+        s_catch_last_outcome.entity_id = resolved_entity_id;
+        s_catch_last_outcome.accepted = 0;
+        return;
+    }
+
+    s_catch_last_outcome.valid = 1;
+    s_catch_last_outcome.entity_id = resolved_entity_id;
+    s_catch_last_outcome.accepted = 1;
+
+    if (s_catch_pending.local_grant != 0) {
+        if (mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)s_catch_pending.local_grant,
+                                      mPr_ITEM_COND_NORMAL)) {
+            printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) accepted -- item 0x%04X "
+                   "granted to a free pocket slot\n",
+                   (unsigned)in->request_id, (unsigned)in->entity_id,
+                   (unsigned)s_catch_pending.local_grant);
+        } else {
+            /* Accepted gap, same shape as DIG_SHINE/DIG_HOLE's own: the free pocket slot vanished
+               between send and this RESULT arriving. Documented, not solved with new mechanism. */
+            printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) accepted but the free pocket "
+                   "slot vanished before the grant could be applied -- item LOST\n",
+                   (unsigned)in->request_id, (unsigned)in->entity_id);
+        }
+    }
+
+    /* The collection-bit commit deferred by Player_actor_setup_main_Notice_rod()/Player_actor_setup_main_
+       Notice_net() (see those call sites' own TARGET_PC doc) -- applied now, on ACCEPT only, exactly
+       mirroring vanilla's own unconditional commit timing had this been a plain local catch. Branches on
+       s_catch_pending.kind (T4) since claimed_species alone cannot distinguish the two domains (both
+       start at 0) -- see that field's own doc. */
+    if (s_catch_pending.kind == PC_WILDLIFE_KIND_FISH) {
+        /* Trash species (>= aGYO_TYPE_NUM) are never tracked in the collection log, matching vanilla's
+           own `type < aGYO_TYPE_NUM + 1` gate exactly. */
+        if (s_catch_pending.claimed_species < aGYO_TYPE_NUM + 1) {
+            mSM_COLLECT_FISH_SET(s_catch_pending.claimed_species);
+        }
+    } else if (s_catch_pending.kind == PC_WILDLIFE_KIND_BUG) {
+        /* aINS_INSECT_TYPE_SPIRIT is never tracked, matching Player_actor_setup_main_Notice_net()'s own
+           `idx != aINS_INSECT_TYPE_SPIRIT` gate exactly (m_player_main_notice_net.c_inc). */
+        if (s_catch_pending.claimed_species != aINS_INSECT_TYPE_SPIRIT) {
+            mSM_COLLECT_INSECT_SET(s_catch_pending.claimed_species);
+        }
+    }
+}
+
+/* See pc_net_game.h's own doc for the full contract and rationale. Consumes (clears back to NONE) a
+ * resolved entry the first time it is observed, mirroring s_catch_pending's own "resolved either way,
+ * never re-applied" precedent. */
+int pc_net_game_query_catch_outcome(uint32_t entity_id) {
+    if (entity_id == 0) {
+        return PC_NETGAME_CATCH_STATUS_NONE;
+    }
+    if (s_catch_pending.valid && s_catch_pending.entity_id == entity_id) {
+        return PC_NETGAME_CATCH_STATUS_PENDING;
+    }
+    if (s_catch_last_outcome.valid && s_catch_last_outcome.entity_id == entity_id) {
+        int accepted = s_catch_last_outcome.accepted;
+        s_catch_last_outcome.valid = 0;
+        return accepted ? PC_NETGAME_CATCH_STATUS_ACCEPTED : PC_NETGAME_CATCH_STATUS_REJECTED;
+    }
+    return PC_NETGAME_CATCH_STATUS_NONE;
+}
+
+/* Client side: WILDLIFE_DESPAWN -- see PCNetGameWildlifeDespawnMsg's own doc and
+ * pcwld_handle_wildlife_despawn()'s own 3-case contract (pc_wildlife_authority.h/.c, which itself wraps
+ * aGYO_pc_handle_wildlife_despawn(), ac_gyoei.h/.c). This client never decides accept/reject itself --
+ * it only reconciles whatever local fish presentation actor it may have for entity_id, exactly like
+ * every other passive wildlife broadcast receiver in this milestone. */
+static void pcnetgame_handle_client_wildlife_despawn(const PCNetGameWildlifeDespawnMsg* in) {
+    if (!g_pc_authoritative_wildlife) {
+        /* Opt-in gate off -- ignore, same defense-in-depth reasoning as every other wildlife handler's
+           own gate in this file (a flag-off client never materialized a local presentation actor to
+           begin with, so this is a no-op in practice, but keeps the invariant explicit and uniform). */
+        if (g_pc_verbose) {
+            printf("[NET][WILDLIFE] client: WILDLIFE_DESPAWN entity %u ignored -- authoritative "
+                   "wildlife is disabled on this client\n",
+                   (unsigned)in->entity_id);
+        }
+        return;
+    }
+    if (in->entity_id == 0) {
+        return; /* malformed -- 0 is never a valid entity_id */
+    }
+    if (pcwld_handle_wildlife_despawn(in->entity_id) && g_pc_verbose) {
+        printf("[NET][WILDLIFE] client: WILDLIFE_DESPAWN entity %u reconciled against this process's "
+               "own local presentation\n",
+               (unsigned)in->entity_id);
+    }
 }

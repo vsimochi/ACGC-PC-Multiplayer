@@ -32,6 +32,119 @@ static void Player_actor_setup_main_Notice_rod(ACTOR* actor, GAME* game) {
     if (uki != NULL && type >= aGYO_TYPE_CRUCIAN_CARP) {
         int free_space = mPlib_Get_space_putin_item();
 
+#ifdef TARGET_PC
+        /* World Ecology Wildlife Sync T-catch (ordinary fish catching only -- see this milestone's own
+         * ABSOLUTE SCOPE LIMIT: no bug catching, tournaments, or ant/bee special-case handling).
+         *
+         * Point of no return already passed (aUKI_bite(), ac_uki_move.c_inc: uki->gyo_status = 5) by the
+         * time this function ever runs -- the catch itself is already guaranteed; only WHO grants the
+         * item, and WHEN, changes here. Option A (see this milestone's design brief): defer the actual
+         * grant until the HOST accepts, rather than granting optimistically and trying to claw it back
+         * later (no precedent for that anywhere in this codebase). `main_notice->not_full_pocket` is
+         * still driven purely by the local free-slot check alone, exactly like vanilla -- the release-
+         * or-keep dialogue flow is completely unchanged regardless of whether the host has answered yet
+         * (see Player_actor_MessageControl_Notice_rod(), further down this file: its own release-choice
+         * default case never needed a change).
+         *
+         * Bug fix (post-T3 review): a full-pockets catch (free_space < 0) STILL goes through the network
+         * path below -- it must, because the host's authoritative record for this entity has to be
+         * removed and the despawn broadcast exactly once for every successful vanilla catch, regardless
+         * of what the player's pockets look like. An earlier revision gated the whole block on
+         * `free_space >= 0`, which meant a full-pockets catch never told the host at all; the player would
+         * then choose "exchange" from the release-or-keep dialogue (Player_actor_request_proc_index_
+         * fromPutaway_rod(), m_player_main_putaway_rod.c_inc) and be granted the item there with ZERO host
+         * involvement -- leaving the fish live and catchable by someone else too (double-award). The fix:
+         * still send CATCH_REQUEST / still run the host-local resolve when pockets are full, just with a
+         * local grant amount of 0 (nothing CAN be granted into a full pocket) -- the release-or-exchange
+         * UI choice itself stays local/vanilla either way, since no shared-world state is at risk once the
+         * request has been sent (or the host-local resolve has already run).
+         *
+         * already_collected (the READ-ONLY mSM_CHECK_LAST_FISH_GET() check) is still computed
+         * immediately below, unconditionally, so the dialogue text is correct either way; only the
+         * WRITE (mSM_COLLECT_FISH_SET()) is deferred alongside the grant -- see the branches below. */
+        {
+            int grant_handled = FALSE;
+
+            if (type < aGYO_TYPE_NUM + 1) {
+                main_notice->already_collected = mSM_CHECK_LAST_FISH_GET(type);
+            }
+
+            if (pc_net_game_authoritative_wildlife_enabled()) {
+                /* pcfa_scene_is_town()/save-loaded/etc. are re-checked internally by both
+                   pc_net_game_request_catch_fish() and pc_net_game_host_local_wildlife_catch() (see
+                   their own doc, pc_net_game.h) -- not duplicated here, since neither is otherwise
+                   reachable from this file without a new pc_field_authority.h include.
+
+                   NOTE: this branch is intentionally reached even when free_space < 0 (full pockets) --
+                   see this call site's own top-of-block doc for why (Bug fix, post-T3 review). */
+                uint32_t entity_id =
+                    (uki->child_actor != NULL) ? aGYO_pc_get_entity_id_stamp(uki->child_actor) : 0;
+
+                if (entity_id != 0 && pc_net_game_world_is_host_authoritative()) {
+                    /* Host-authoritative client: send CATCH_REQUEST; the grant + collection-bit commit
+                       happen later, on CATCH_RESULT accept (pcnetgame_handle_client_catch_result(),
+                       pc_net_game.c) -- see pc_net_game_request_catch_fish()'s own doc. Full pockets:
+                       local_item is 0 (nothing can be granted into a full pocket) -- the host is still
+                       told about the catch so its authoritative record is removed and the despawn
+                       broadcast either way; pcnetgame_handle_client_catch_result() already treats
+                       local_grant == 0 as "accepted, nothing to grant" (it still commits the
+                       collection-bit). */
+                    mActor_name_t local_item = (free_space >= 0) ? uki->get_fish_type_proc(&uki->actor_class) : 0;
+                    if (pc_net_game_request_catch_fish(entity_id, type, (int)local_item)) {
+                        grant_handled = TRUE;
+                    }
+                } else if (entity_id != 0 && pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                    /* Host's own local catch: resolves synchronously against the authoritative table
+                       (races against any peer's own simultaneous claim on the SAME entity_id) -- the
+                       vanilla grant + collection-bit write below run UNMODIFIED only if accepted, with
+                       NO network round-trip to itself. Either way (accepted or rejected) this decision
+                       is now fully resolved -- never fall through to the plain vanilla branch below,
+                       which would double-grant on acceptance. Full pockets: the entity is still removed
+                       from the authoritative table and the despawn still broadcast on accept, just
+                       without ever calling Player_actor_putin_item() (nothing can be granted into a full
+                       pocket) -- same fix rationale as the client branch above. */
+                    if (pc_net_game_host_local_wildlife_catch(entity_id, type)) {
+                        if (free_space >= 0) {
+                            Player_actor_putin_item(free_space, uki->get_fish_type_proc(&uki->actor_class), NULL);
+                        }
+                        if (type < aGYO_TYPE_NUM + 1) {
+                            mSM_COLLECT_FISH_SET(type);
+                        }
+                    }
+                    grant_handled = TRUE;
+                } else if (entity_id != 0 && pcwld_should_suppress_local_wildlife()) {
+                    /* T8 audit fix (Bug 3): a DISCONNECTED client (role still CLIENT, link no longer
+                       READY -- pc_net_game_world_is_host_authoritative() above is FALSE for exactly this
+                       reason) used to fall all the way through to the plain vanilla grant below for a
+                       fish that WAS tracked (entity_id != 0), silently handing out an item the host may
+                       still consider live and catchable by someone else -- an unauthoritative duplicate.
+                       No host to ask right now, so deny the grant locally instead (same observable outcome
+                       as a host REJECT via pcnetgame_handle_client_catch_result(): no item, no collection-
+                       bit write) rather than risk a double-award once reconnected. */
+                    printf("[NET][WILDLIFE] client: fish entity %u catch denied locally -- disconnected "
+                           "(Bug 3 fix, see pc_wildlife_authority.h's own pcwld_should_suppress_local_"
+                           "wildlife() doc)\n",
+                           (unsigned)entity_id);
+                    grant_handled = TRUE;
+                }
+                /* entity_id == 0 (no stamp -- e.g. this fish predates T-catch tracking, or its actor
+                   could not be recovered when it was materialized; see pcwld_presentation_create()'s own
+                   residual-gap doc, pc_wildlife_authority.c): falls through to the plain vanilla grant
+                   below rather than silently losing a real catch. */
+            }
+
+            if (!grant_handled) {
+                if (free_space >= 0) {
+                    Player_actor_putin_item(free_space, uki->get_fish_type_proc(&uki->actor_class), NULL);
+                }
+                if (type < aGYO_TYPE_NUM + 1) {
+                    mSM_COLLECT_FISH_SET(type);
+                }
+            }
+
+            main_notice->not_full_pocket = (free_space >= 0) ? TRUE : FALSE;
+        }
+#else
         if (free_space >= 0) {
             Player_actor_putin_item(free_space, uki->get_fish_type_proc(&uki->actor_class), NULL);
             main_notice->not_full_pocket = TRUE;
@@ -43,6 +156,7 @@ static void Player_actor_setup_main_Notice_rod(ACTOR* actor, GAME* game) {
             main_notice->already_collected = mSM_CHECK_LAST_FISH_GET(type);
             mSM_COLLECT_FISH_SET(type);
         }
+#endif
     } else {
         main_notice->not_full_pocket = FALSE;
     }

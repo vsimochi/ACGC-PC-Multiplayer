@@ -323,6 +323,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_remote_player.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_field_authority.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_wildlife_authority.c
 )
 
 # =============================================================================
