@@ -57,8 +57,13 @@ extern "C" {
  * Protocol version 5 (M9-A, scene identity / player presence): adds ONE new reliable message,
  * PC_NETGAME_MSG_PLAYER_SCENE (id 44, 12 bytes). Existing layouts are unchanged; the bump exists so a
  * v4 peer (which would silently ignore the unknown message and leave scene presence permanently empty)
- * is cleanly REJECTed at IDENTITY instead of connecting without ever being able to announce a scene. */
-#define PC_NETGAME_PROTOCOL_VERSION 5u
+ * is cleanly REJECTed at IDENTITY instead of connecting without ever being able to announce a scene.
+ *
+ * Protocol version 6 (M9-C, host-authoritative client villager-talk hold): adds ONE new reliable
+ * client -> host message, PC_NETGAME_MSG_NPC_TALK (id 45, 8 bytes): the begin/end edge of a client's local
+ * talk lease on a villager. Existing layouts are unchanged; the bump exists so a v5 host (which would silently
+ * ignore the unknown message and never hold the villager) and a v6 client can never interoperate unnoticed. */
+#define PC_NETGAME_PROTOCOL_VERSION 6u
 
 /* SHARED-WORLD INTERACTION POLICY (intentional): the TOWN field is the one shared, host-authoritative
  * world -- pickups and drops of ground items go through the two-phase protocol below. A PRIVATE HOUSE /
@@ -339,6 +344,25 @@ int pc_net_game_get_local_scene(PCNetPlayerScene* out);
  * (never announced, disconnected, or cleared). Presence only: nothing consumes this yet (puppet
  * filtering is a later M9 stage). */
 int pc_net_game_get_peer_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
+
+/* M9-C: client -> host villager talk hold. The ready client's NPC code (ac_npc_move.c_inc) calls
+ * pc_net_game_notify_local_npc_talk() exactly once per edge of its local talk lease on a regular villager
+ * (begin = 1 rising, 0 falling/destroyed). Client only; 0 (nothing sent) for single-player/host/not READY or
+ * when the reliable send fails. Never sends positions. */
+int pc_net_game_notify_local_npc_talk(int slot, uint16_t npc_id, int begin);
+/* M9-C keepalive: while a BEGIN is outstanding pc_net_game_poll() re-sends it (fresh seq, same message) every 10 s
+ * (PC_NPC_TALKHOLD_REFRESH_MS, test only; 0 disables) iff this probe -- registered by the NPC code -- still reports
+ * the local talk lease active for (slot, npc_id). A NULL probe or a 0 result stops the refreshes for that slot. */
+typedef int (*PCNetGameNpcTalkLeaseProbe)(int slot, uint16_t npc_id);
+void pc_net_game_set_npc_talk_lease_probe(PCNetGameNpcTalkLeaseProbe fn);
+/* Monotonic wall-clock milliseconds (same source the net layer uses; never 0). Test hook timing only. */
+uint32_t pc_net_game_now_ms(void);
+/* M9-C: HOST only (0 on single-player/client): 1 iff at least one validated, unexpired client talk hold exists
+ * for animal `slot` with this `npc_id`. Called every frame per villager by the host gate in ac_npc_move.c_inc. */
+int pc_net_game_host_npc_talk_held(int slot, int npc_id);
+/* M9-C: client: incremented on every client session reset (connect/disconnect/shutdown); the NPC edge code
+ * drops its per-slot "begin sent" bits when it changes. */
+int pc_net_game_npc_talk_session_epoch(void);
 
 /* This process's own town identity (see PCNetGameTownIdentity). 0 if no gameplay save is loaded
  * (the value would be meaningless -- e.g. the title-demo town). */

@@ -416,6 +416,11 @@ typedef enum PCNetGameMsgType {
                                              * peer's last known scene), and sent host -> clients with
                                              * PC_NETGAME_SCENE_FLAG_CLEARED when a peer is removed.
                                              * See PCNetGamePlayerSceneMsg. */
+    PC_NETGAME_MSG_NPC_TALK              = 45, /* M9-C (protocol v6): client -> host ONLY, RELIABLE, 8 bytes. A
+                                             * ready client reports the rising (flags=1, begin) and falling
+                                             * (flags=0, end) edge of ITS OWN local villager-talk lease so the
+                                             * host can hold that villager still (host-authoritative hold). The
+                                             * client never sends NPC positions. See PCNetGameNpcTalkMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -1761,6 +1766,25 @@ _Static_assert(sizeof(PCNetGamePlayerSceneMsg) == 12, "PCNetGamePlayerSceneMsg w
 _Static_assert(sizeof(PCNetGamePlayerSceneMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGamePlayerSceneMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 _Static_assert(SCENE_NUM <= 255, "PCNetGamePlayerSceneMsg.scene_id is a u8: SCENE_NUM must fit");
+
+/* M9-C: client -> host, reliable, 8 bytes (little-endian, natural alignment; like every other message here).
+ * `slot` is the Save_t.animals[] index, `npc_id` the Animal_c.id.npc_id identity guard (same pairing as
+ * NPC_MOVE/NPC_STATE), flags bit0: 1 = begin talking, 0 = end. `seq` is the sender's own u16 sequence (starts
+ * at 1 per session, incremented per message, begin and end share it); the host accepts a message only when
+ * it is NEWER than the last one seen from that peer, by u16 serial-number arithmetic ((int16_t)(seq-last) > 0,
+ * wrap-safe), so a stale/duplicated message can never resurrect an old hold. */
+#define PC_NETGAME_NPC_TALK_FLAG_BEGIN 0x01u
+typedef struct PCNetGameNpcTalkMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_NPC_TALK */
+    uint8_t  slot;
+    uint8_t  flags;
+    uint8_t  _reserved0;
+    uint16_t npc_id;
+    uint16_t seq;
+} PCNetGameNpcTalkMsg;
+_Static_assert(sizeof(PCNetGameNpcTalkMsg) == 8, "PCNetGameNpcTalkMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameNpcTalkMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameNpcTalkMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
 /* Two-phase interactions: client -> host, reliable, exactly 8 bytes (little-endian, natural
  * alignment). Answers a provisional RESULT (accepted == 1) -- or withdraws from a request the client
@@ -3413,6 +3437,9 @@ static void pcnetgame_host_send_scene_to_all(PCNetPeerId skip, const PCNetGamePl
     }
 }
 
+/* M9-C: defined with the host talk-hold table further down. */
+static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* why, int reset_seq);
+
 /* Host: a client's own scene. READY-gated; id taken from the transport slot; announceable/flags/owner/seq
  * validated; relayed to every OTHER READY client only when accepted (a stale/duplicate seq is dropped and
  * never relayed). */
@@ -3433,6 +3460,10 @@ static void pcnetgame_handle_host_player_scene(PCNetPeerId peer, const PCNetGame
     if (!pc_remote_player_on_scene((PCNetPlayerId)peer, &s)) {
         printf("[NET][SCENE] host: peer %d stale PLAYER_SCENE (seq %u) -- ignored\n", (int)peer, (unsigned)in->seq);
         return;
+    }
+    if (s.kind != (uint8_t)PC_NETSCENE_KIND_FIELD || (s.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0 ||
+        s.scene_id != (uint8_t)SCENE_FG) {
+        pcnetgame_host_talk_hold_clear_peer(peer, "left the town field", 0); /* M9-C */
     }
     printf("[NET][SCENE] host: peer %d now in scene %u (kind %u, owner 0x%04X, flags 0x%02X, seq %u)\n", (int)peer,
            (unsigned)s.scene_id, (unsigned)s.kind, (unsigned)s.owner, (unsigned)s.flags, (unsigned)s.seq);
@@ -3898,6 +3929,314 @@ static void pcnetgame_host_expire_reservations(void) {
     }
 }
 
+/* ---- M9-C: host-authoritative villager talk hold -------------------------------------------------------
+ * A ready client that talks to villager X takes a LOCAL talk lease (ac_npc_move.c_inc) so its local copy of X can
+ * run the talk action; it reports the lease's rising/falling edge to the host with PC_NETGAME_MSG_NPC_TALK. The
+ * host validates and keeps a per-animal-slot hold (a u16 peer bitmask: X stays held while ANY peer holds it);
+ * ac_npc_move.c_inc's host gate asks pc_net_game_host_npc_talk_held() every frame and, while held and the host
+ * itself is not talking to X, stops X's decisions and holds it still. Clients keep mirroring the host. Nothing
+ * here ever moves or authors an NPC. Expiry (default 30 s, PC_NPC_TALKHOLD_TIMEOUT_MS overrides, test only) is a
+ * safety net for a lost END only: a real dialogue longer than that releases the hold early (X resumes walking on
+ * the host and the client snaps at its lease end -- the pre-hold behaviour). */
+typedef struct PCNetGameNpcTalkHold {
+    uint16_t peer_mask; /* bit i = PCNetPeerId i currently holds this slot */
+    uint16_t npc_id;    /* identity the mask was set for */
+    uint32_t last_ms;   /* pcnetgame_now_ms() of the last valid BEGIN */
+} PCNetGameNpcTalkHold;
+static PCNetGameNpcTalkHold s_host_talk_hold[ANIMAL_NUM_MAX];
+static uint16_t s_host_talk_last_seq[PC_NET_MAX_PEERS];
+static uint8_t  s_host_talk_seq_valid[PC_NET_MAX_PEERS];
+static uint16_t s_npc_talk_seq = 0;   /* client: per-process, per-session u16 sequence of sent NPC_TALK */
+static int      s_npc_talk_epoch = 0; /* client: bumped on every client session reset (see the NPC edge code) */
+static int      s_host_talk_reject_logs = 0;
+
+/* Client keepalive: every BEGIN this client sent whose END has not been sent yet. pc_net_game_poll() (runs every VI
+ * frame, even while a submenu/message window freezes the actors) re-sends the BEGIN (same wire message, fresh seq)
+ * every refresh interval while the NPC code's probe still reports the lease active for that slot/npc. Cleared by
+ * END, by the session reset, and by a failed probe. */
+typedef struct PCNetGameNpcTalkOut {
+    uint8_t  active;
+    uint16_t npc_id;
+    uint32_t last_ms;
+} PCNetGameNpcTalkOut;
+static PCNetGameNpcTalkOut s_client_talk_out[ANIMAL_NUM_MAX];
+static PCNetGameNpcTalkLeaseProbe s_client_talk_probe = NULL;
+
+/* Refresh interval in ms; PC_NPC_TALKHOLD_REFRESH_MS overrides (test only; 0 disables the keepalive). */
+static uint32_t pcnetgame_talk_refresh_ms(void) {
+    static int s_init = 0;
+    static uint32_t s_ms = 10000u;
+    if (!s_init) {
+        const char* e = getenv("PC_NPC_TALKHOLD_REFRESH_MS");
+        s_init = 1;
+        if (e != NULL && e[0] != 0) {
+            long v = atol(e);
+            s_ms = (v > 0) ? (uint32_t)v : 0u;
+        }
+    }
+    return s_ms;
+}
+
+static int pcnetgame_talk_diag(void) {
+    static int s_diag = -1;
+    if (s_diag < 0) {
+        const char* e = getenv("PC_NPC_TALKHOLD_DIAG");
+        s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return s_diag;
+}
+
+uint32_t pc_net_game_now_ms(void) {
+    return pcnetgame_now_ms();
+}
+
+void pc_net_game_set_npc_talk_lease_probe(PCNetGameNpcTalkLeaseProbe fn) {
+    s_client_talk_probe = fn;
+}
+
+static uint32_t pcnetgame_talk_hold_timeout_ms(void) {
+    static uint32_t s_timeout = 0;
+    if (s_timeout == 0) {
+        const char* e = getenv("PC_NPC_TALKHOLD_TIMEOUT_MS");
+        long v = (e != NULL) ? atol(e) : 0;
+        s_timeout = (v > 0) ? (uint32_t)v : 30000u;
+    }
+    return s_timeout;
+}
+
+/* Clear `peer`'s bit in every slot (and, when `reset_seq`, its sequence record). */
+static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* why, int reset_seq) {
+    int slot;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+        return;
+    }
+    for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+        PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
+        if ((h->peer_mask & (uint16_t)(1u << peer)) != 0) {
+            h->peer_mask = (uint16_t)(h->peer_mask & ~(uint16_t)(1u << peer));
+            if (h->peer_mask == 0) {
+                printf("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X (peer %d %s)\n", slot, (unsigned)h->npc_id,
+                       (int)peer, why);
+            } else {
+                printf("[NPC][TALKNET] HOLD slot=%d npc=0x%04X peers=0x%04X (peer %d %s)\n", slot,
+                       (unsigned)h->npc_id, (unsigned)h->peer_mask, (int)peer, why);
+            }
+        }
+    }
+    if (reset_seq) {
+        s_host_talk_last_seq[peer] = 0;
+        s_host_talk_seq_valid[peer] = 0;
+    }
+}
+
+/* Poll-time sweep: expire holds whose last valid BEGIN is older than the timeout (so a hold on a villager with
+ * no live actor is cleared too). Cheap: 15 slots, nothing logged unless something expires. */
+static void pcnetgame_host_talk_hold_sweep(void) {
+    int slot;
+    uint32_t now = 0;
+    for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+        PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
+        if (h->peer_mask == 0) {
+            continue;
+        }
+        if (now == 0) {
+            now = pcnetgame_now_ms();
+        }
+        if ((uint32_t)(now - h->last_ms) >= pcnetgame_talk_hold_timeout_ms()) {
+            printf("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X peers=0x%04X after %u ms\n", slot, (unsigned)h->npc_id,
+                   (unsigned)h->peer_mask, (unsigned)(now - h->last_ms));
+            h->peer_mask = 0;
+        }
+    }
+}
+
+static void pcnetgame_host_talk_reject(PCNetPeerId peer, const PCNetGameNpcTalkMsg* in, const char* reason) {
+    if (s_host_talk_reject_logs < 40) {
+        s_host_talk_reject_logs++;
+        printf("[NPC][TALKNET] REJECT peer=%d slot=%u npc=0x%04X %s: %s\n", (int)peer, (unsigned)in->slot,
+               (unsigned)in->npc_id, (in->flags & PC_NETGAME_NPC_TALK_FLAG_BEGIN) ? "begin" : "end", reason);
+    }
+}
+
+/* Host: a client's talk-lease edge. READY-gated, peer identity from the transport slot. */
+static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcTalkMsg* in) {
+    PCNetGameNpcTalkHold* h;
+    int begin;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    begin = (in->flags & PC_NETGAME_NPC_TALK_FLAG_BEGIN) != 0;
+    if ((in->flags & ~PC_NETGAME_NPC_TALK_FLAG_BEGIN) != 0 || in->slot >= ANIMAL_NUM_MAX) {
+        pcnetgame_host_talk_reject(peer, in, "bad flags or slot out of range");
+        return;
+    }
+    if (s_host_talk_seq_valid[peer] && (int16_t)(uint16_t)(in->seq - s_host_talk_last_seq[peer]) <= 0) {
+        pcnetgame_host_talk_reject(peer, in, "stale/duplicate seq");
+        return;
+    }
+    s_host_talk_last_seq[peer] = in->seq;
+    s_host_talk_seq_valid[peer] = 1;
+    h = &s_host_talk_hold[in->slot];
+
+    if (!begin) {
+        /* END: idempotent; clears only THIS peer's bit; unknown slot/npc/peer is ignored. */
+        if (h->npc_id == in->npc_id && (h->peer_mask & (uint16_t)(1u << peer)) != 0) {
+            printf("[NPC][TALKNET] END peer=%d slot=%u npc=0x%04X\n", (int)peer, (unsigned)in->slot,
+                   (unsigned)in->npc_id);
+            h->peer_mask = (uint16_t)(h->peer_mask & ~(uint16_t)(1u << peer));
+            if (h->peer_mask == 0) {
+                printf("[NPC][TALKNET] RELEASE slot=%u npc=0x%04X\n", (unsigned)in->slot, (unsigned)in->npc_id);
+            } else {
+                printf("[NPC][TALKNET] HOLD slot=%u npc=0x%04X peers=0x%04X\n", (unsigned)in->slot,
+                       (unsigned)in->npc_id, (unsigned)h->peer_mask);
+            }
+        }
+        return;
+    }
+
+    {
+        Animal_c* animal = Save_GetPointer(animals[in->slot]);
+        PCNetPlayerScene sc;
+
+        if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC || (uint16_t)animal->id.npc_id != in->npc_id) {
+            pcnetgame_host_talk_reject(peer, in, "npc_id does not match the host animal table");
+            return;
+        }
+        if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) || sc.kind != (uint8_t)PC_NETSCENE_KIND_FIELD ||
+            (sc.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0 || sc.scene_id != (uint8_t)SCENE_FG) {
+            pcnetgame_host_talk_reject(peer, in, "peer is not in the town field scene");
+            return;
+        }
+    }
+    /* Distance validation intentionally skipped: the host NPC actor is not cheaply/safely resolvable from this
+     * file by animal slot, and the last known peer position lags; slot+npc_id+town-scene are the guards. */
+    if ((h->peer_mask & (uint16_t)(1u << peer)) == 0 || h->npc_id != in->npc_id) { /* a keepalive repeat logs nothing */
+        printf("[NPC][TALKNET] BEGIN peer=%d slot=%u npc=0x%04X (distance check skipped)\n", (int)peer,
+               (unsigned)in->slot, (unsigned)in->npc_id);
+    } else if (pcnetgame_talk_diag()) {
+        printf("[NPC][TALKNET][DIAG] refresh peer=%d slot=%u npc=0x%04X seq=%u\n", (int)peer, (unsigned)in->slot,
+               (unsigned)in->npc_id, (unsigned)in->seq);
+    }
+    if (h->peer_mask != 0 && h->npc_id != in->npc_id) {
+        h->peer_mask = 0; /* stale mask for a previous occupant of the slot */
+    }
+    h->npc_id = in->npc_id;
+    h->last_ms = pcnetgame_now_ms();
+    if ((h->peer_mask & (uint16_t)(1u << peer)) == 0) {
+        h->peer_mask = (uint16_t)(h->peer_mask | (uint16_t)(1u << peer));
+        printf("[NPC][TALKNET] HOLD slot=%u npc=0x%04X peers=0x%04X\n", (unsigned)in->slot, (unsigned)in->npc_id,
+               (unsigned)h->peer_mask);
+    }
+}
+
+/* See pc_net_game.h. Host-only gate query (called every frame per villager by ac_npc_move.c_inc). */
+int pc_net_game_host_npc_talk_held(int slot, int npc_id) {
+    PCNetGameNpcTalkHold* h;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return 0;
+    }
+    h = &s_host_talk_hold[slot];
+    if (h->peer_mask == 0 || (int)h->npc_id != npc_id) {
+        return 0;
+    }
+    if ((uint32_t)(pcnetgame_now_ms() - h->last_ms) >= pcnetgame_talk_hold_timeout_ms()) {
+        printf("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X peers=0x%04X\n", slot, (unsigned)h->npc_id,
+               (unsigned)h->peer_mask);
+        h->peer_mask = 0;
+        return 0;
+    }
+    return 1;
+}
+
+int pc_net_game_npc_talk_session_epoch(void) {
+    return s_npc_talk_epoch;
+}
+
+/* See pc_net_game.h. Client only; returns 1 iff the message was queued. `refresh` = keepalive re-send of a BEGIN
+ * (same wire message; silent unless PC_NPC_TALKHOLD_DIAG=1). */
+static int pcnetgame_send_npc_talk(int slot, uint16_t npc_id, int begin, int refresh) {
+    PCNetGameNpcTalkMsg msg;
+    static int s_fail_logs = 0;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return 0;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_NPC_TALK;
+    msg.slot = (uint8_t)slot;
+    msg.flags = begin ? (uint8_t)PC_NETGAME_NPC_TALK_FLAG_BEGIN : 0;
+    msg.npc_id = npc_id;
+    msg.seq = (uint16_t)(s_npc_talk_seq + 1u);
+    if (!pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+        if (s_fail_logs < 5) {
+            s_fail_logs++;
+            printf("[NPC][TALKNET] SEND %s FAILED slot=%d npc=0x%04X (will %s)\n", begin ? "begin" : "end", slot,
+                   (unsigned)npc_id, begin ? "retry" : "rely on the host timeout");
+        }
+        return 0;
+    }
+    s_npc_talk_seq = msg.seq;
+    if (!refresh) {
+        printf("[NPC][TALKNET] SEND %s slot=%d npc=0x%04X seq=%u\n", begin ? "begin" : "end", slot,
+               (unsigned)npc_id, (unsigned)msg.seq);
+    } else if (pcnetgame_talk_diag()) {
+        printf("[NPC][TALKNET][DIAG] SEND refresh slot=%d npc=0x%04X seq=%u\n", slot, (unsigned)npc_id,
+               (unsigned)msg.seq);
+    }
+    return 1;
+}
+
+int pc_net_game_notify_local_npc_talk(int slot, uint16_t npc_id, int begin) {
+    int ok = pcnetgame_send_npc_talk(slot, npc_id, begin, 0);
+    if (slot >= 0 && slot < ANIMAL_NUM_MAX) {
+        if (begin && ok) {
+            s_client_talk_out[slot].active = 1;
+            s_client_talk_out[slot].npc_id = npc_id;
+            s_client_talk_out[slot].last_ms = pcnetgame_now_ms();
+        } else if (!begin) {
+            s_client_talk_out[slot].active = 0; /* END sent (or attempted: the host timeout covers a lost END) */
+        }
+    }
+    return ok;
+}
+
+/* Client: per-poll keepalive tick (see s_client_talk_out). */
+static void pcnetgame_client_talk_refresh_tick(void) {
+    int slot;
+    uint32_t now = 0;
+    uint32_t interval = pcnetgame_talk_refresh_ms();
+    for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+        PCNetGameNpcTalkOut* o = &s_client_talk_out[slot];
+        if (!o->active) {
+            continue;
+        }
+        if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+            o->active = 0;
+            continue;
+        }
+        if (interval == 0) {
+            continue;
+        }
+        if (now == 0) {
+            now = pcnetgame_now_ms();
+        }
+        if ((uint32_t)(now - o->last_ms) < interval) {
+            continue;
+        }
+        if (s_client_talk_probe == NULL || !s_client_talk_probe(slot, o->npc_id)) {
+            o->active = 0; /* lease gone/unknown: stop refreshing (the END path or the host timeout releases) */
+            continue;
+        }
+        (void)pcnetgame_send_npc_talk(slot, o->npc_id, 1, 1);
+        o->last_ms = now; /* also on a failed send: retry one interval later, never every poll */
+    }
+}
+
 /* The ONE place every host-side per-peer cache gets cleared. It exists so the list of caches lives
  * in one spot instead of being copied at each call site. Protocol v2 calls it on PEER_CONNECTED, on
  * PEER_DISCONNECTED (the real reset, so a reused pc_net peer slot never answers a new connection
@@ -3936,6 +4275,8 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
         /* World Ecology Wildlife Sync T-catch -- same reasoning again, for CATCH_REQUEST's own
          * separate dedup table. */
         memset(&s_host_catch_dedup[peer], 0, sizeof(s_host_catch_dedup[peer]));
+        /* M9-C: this peer's villager talk holds + sequence record (a dead/reused peer must never keep X frozen). */
+        pcnetgame_host_talk_hold_clear_peer(peer, "reset", 1);
     }
 }
 
@@ -10039,6 +10380,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGameNpcTalkMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_TALK) {
+        PCNetGameNpcTalkMsg nt;
+        memcpy(&nt, data, sizeof(nt));
+        pcnetgame_handle_host_npc_talk(peer, &nt);
+        return;
+    }
+
     if (size == sizeof(PCNetGamePickupRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PICKUP_REQUEST) {
         PCNetGamePickupRequestMsg pr;
         memcpy(&pr, data, sizeof(pr));
@@ -10451,6 +10799,9 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
 static void pcnetgame_reset_client_session_state(void) {
     memset(&s_host_local_drop_landing, 0, sizeof(s_host_local_drop_landing)); /* (host-only, harmless here) */
     s_local_scene_sent = 0; /* M9-A: a new connection must re-announce the (still live) local scene */
+    s_npc_talk_seq = 0; /* M9-C: new session: sequence restarts; the NPC edge code drops its sent bits on the epoch */
+    s_npc_talk_epoch++;
+    memset(s_client_talk_out, 0, sizeof(s_client_talk_out)); /* keepalive table dies with the session */
     {
         /* M9-A: every scene this client holds for OTHER players (the host and relayed clients) came over the
          * old host link; once that link is lost or replaced it can no longer be trusted (the new connection
@@ -11920,6 +12271,10 @@ void pc_net_game_poll(void) {
 
     if (s_role == PC_NETGAME_ROLE_NONE) return;
 
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        pcnetgame_client_talk_refresh_tick(); /* M9-C: keep an outstanding talk BEGIN alive on the host */
+    }
+
     /* v2: refresh the "gameplay save loaded" latch once, before anything consults it. */
     {
         int local_ready = pcnetgame_update_local_world_ready();
@@ -11928,6 +12283,7 @@ void pc_net_game_poll(void) {
             /* Two-phase interactions: release timed-out reservations BEFORE this poll's events are
                handled, so a late CONFIRM / a competing request is judged against the up-to-date table. */
             pcnetgame_host_expire_reservations();
+            pcnetgame_host_talk_hold_sweep(); /* M9-C: expire stale villager talk holds */
             /* World Ecology Stage 1, Item 2: same "before this poll's events" placement -- a money-rock
                window that just expired must revert before a same-tile hit arriving this poll is judged. */
             pcnetgame_host_check_field_action_money_rock();

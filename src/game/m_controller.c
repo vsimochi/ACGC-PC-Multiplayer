@@ -65,6 +65,11 @@ extern void mCon_calc(MCON* mcon, f32 stick_x, f32 stick_y) {
   }
 }
 
+#ifdef TARGET_PC
+extern int pc_npc_talk_hook_force_trigger(unsigned short mask); /* ac_npc_move.c_inc, test-only */
+extern int pc_npc_talk_hook_force_stick(int* out_y);            /* ac_npc_move.c_inc, test-only */
+#endif
+
 /**
  * @brief Controller main process.
  * 
@@ -114,6 +119,12 @@ extern int chkTrigger(u16 mask) {
   if (mEv_IsTitleDemo()) {
     return FALSE;
   }
+#ifdef TARGET_PC
+  /* test-only villager-talk driver (ac_npc_move.c_inc, env PC_FORCE_TALK_VILLAGER); FALSE unless forcing */
+  if (pc_npc_talk_hook_force_trigger(mask)) {
+    return TRUE;
+  }
+#endif
 
   return (mask & (gamePT->pads[0].on.button)) == mask;
 }
@@ -153,6 +164,14 @@ extern int getJoystick_Y() {
   if (mEv_IsTitleDemo()) {
     return 0;
   }
+#ifdef TARGET_PC
+  {
+    int forced_y;
+    if (pc_npc_talk_hook_force_stick(&forced_y)) { /* test-only, see chkTrigger() */
+      return forced_y;
+    }
+  }
+#endif
 
   return gamePT->pads[0].now.stick_y;
 }

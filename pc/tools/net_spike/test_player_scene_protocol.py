@@ -16,7 +16,7 @@ Covers PC_NETGAME_MSG_PLAYER_SCENE (id 44, reliable, 12 bytes):
       is NOT told about it (no stale presence), and the departed peer's seq space restarts cleanly.
   S9  reconnect: the re-announced scene (seq 1 again) is accepted and relayed.
   S10 a peer that is not READY (never completed IDENTITY) cannot inject a scene.
-  S11 a protocol-version-4 peer is rejected with PROTOCOL_MISMATCH and the host reports version 5.
+  S11 a protocol-version-4 peer is rejected with PROTOCOL_MISMATCH and the host reports version 6.
   S12 host stays alive/READY throughout.
 
 Tier: PROTOCOL TESTED (real host binary, scripted clients). Not real two-process gameplay.
@@ -221,7 +221,7 @@ def run(port, log_dir, results):
             rejected = e.reject.reason == L.PC_NETGAME_REJECT_PROTOCOL_MISMATCH
             expected_version = e.reject.expected_protocol_version
         check("S11 protocol version 4 peer rejected with PROTOCOL_MISMATCH", rejected)
-        check("S11 host reports required protocol version 5", expected_version == 5)
+        check("S11 host reports required protocol version 6", expected_version == 6)
 
         # ---- S12 ----
         check("S12 host process still alive and clients still READY",

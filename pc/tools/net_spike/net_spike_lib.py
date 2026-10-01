@@ -1053,7 +1053,11 @@ PC_NETGAME_MSG_PLAYER_SCENE = 44
 PC_NETGAME_SCENE_FLAG_IN_TOWN = 0x01
 PC_NETGAME_SCENE_FLAG_CLEARED = 0x80
 
-PC_NETGAME_PROTOCOL_VERSION = 5  # M9-A: PLAYER_SCENE (id 44, 12 bytes) -- scene identity / player presence
+# M9-C: NPC_TALK (id 45, 8 bytes, reliable, client -> host) -- see PCNetGameNpcTalkMsg (pc_net_game.c).
+PC_NETGAME_MSG_NPC_TALK = 45
+PC_NETGAME_NPC_TALK_FLAG_BEGIN = 0x01
+
+PC_NETGAME_PROTOCOL_VERSION = 6  # M9-C: NPC_TALK (id 45, 8 bytes) -- client villager-talk hold
 
 PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1  # 8-byte REJECT
 PC_NETGAME_REJECT_SERVER_FULL = 2        # reserved, never sent
