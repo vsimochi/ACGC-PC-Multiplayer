@@ -106,6 +106,16 @@ int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, fl
  * (returns 0). */
 int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out_angle);
 
+/* M9-A: per-player scene presence (see PCNetPlayerScene, pc_net_game.h), stored in the same per-slot state as
+ * everything else about a remote player and therefore cleared by the same paths (on_ready, on_disconnect,
+ * relay-liveness timeout, shutdown). on_scene() returns 1 and stores it iff `scene` is valid and its seq is
+ * strictly newer than the stored one (or none is stored); 0 = stale/invalid, nothing changed. clear_scene()
+ * forgets it (a host CLEARED notice). get_scene() returns 1 and fills *out only while a scene is known. All
+ * are safe for an out-of-range player_id. Pure bookkeeping: no puppet is created, moved or filtered by it. */
+int  pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* scene);
+void pc_remote_player_clear_scene(PCNetPlayerId player_id);
+int  pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
+
 /* Call once per frame, unconditionally, regardless of game/menu/networking state (see
  * pc/src/pc_vi.c, right after pc_net_game_poll()). Retries any actor creation that was deferred
  * because the game/actor system wasn't in a valid state yet. Never blocks, never allocates

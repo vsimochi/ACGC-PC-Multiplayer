@@ -52,8 +52,13 @@ extern "C" {
  * every bury) can never be mistaken for a real v4 host/client that actually implements bury. A v3 peer
  * is now cleanly REJECTed at IDENTITY instead of connecting and masking the missing feature. See
  * PCNetGameBuryRequestMsg/PCNetGameBuryResultMsg's own doc for the field-semantics changes (hole_variant
- * becomes authoritative for one sub-case; the result's second uint16 _reserved0 becomes flags+reason). */
-#define PC_NETGAME_PROTOCOL_VERSION 4u
+ * becomes authoritative for one sub-case; the result's second uint16 _reserved0 becomes flags+reason).
+ *
+ * Protocol version 5 (M9-A, scene identity / player presence): adds ONE new reliable message,
+ * PC_NETGAME_MSG_PLAYER_SCENE (id 44, 12 bytes). Existing layouts are unchanged; the bump exists so a
+ * v4 peer (which would silently ignore the unknown message and leave scene presence permanently empty)
+ * is cleanly REJECTed at IDENTITY instead of connecting without ever being able to announce a scene. */
+#define PC_NETGAME_PROTOCOL_VERSION 5u
 
 /* SHARED-WORLD INTERACTION POLICY (intentional): the TOWN field is the one shared, host-authoritative
  * world -- pickups and drops of ground items go through the two-phase protocol below. A PRIVATE HOUSE /
@@ -203,6 +208,44 @@ typedef struct PCNetMoveSample {
     int8_t   item_kind;    /* mirrors PLAYER_ACTOR::item_kind; -1 = none */
 } PCNetMoveSample;
 
+/* M9-A: which scene a network player is currently in -- IDENTITY of the scene only, never gameplay state.
+ * The wire carries the decomp's RAW scene id (play->scene_id, an enum scene_table value < SCENE_NUM <= 255;
+ * both peers run the same build -- guaranteed by PC_NETGAME_PROTOCOL_VERSION and the matching-town check --
+ * so the enum is identical on both sides) plus an `owner` that is meaningful only for the shared house
+ * scenes (SCENE_NPC_HOUSE: Common.house_owner_name = villager npc id, i.e. which villager's house;
+ * the player-room scenes: Common.house_owner_name = which player house) and 0 for every other scene, plus
+ * a per-sender `seq` so stale/reordered updates are rejected. `kind` is a LOCAL classification derived from
+ * the raw id by pc_net_game_scene_kind() (never sent -- no second numbering system on the wire).
+ * Only scene ids for which pc_net_game_scene_is_announceable() is true are ever sent/stored; title,
+ * demo, player-select, test and tool scenes are never announced. */
+#define PC_NETGAME_SCENE_FLAG_IN_TOWN 0x01u /* sender's latched SCENE_FG field grid is the home town (pcfa_scene_is_town():
+                                             * every town-acre block pointer matches Save). The island is two blocks of the
+                                             * SAME SCENE_FG grid, so this does NOT distinguish island from town (it is 1
+                                             * for any normal SCENE_FG, island included); it only separates SCENE_FG from
+                                             * a not-yet-built/other field grid (0). It is 0 for every non-FIELD kind. */
+#define PC_NETGAME_SCENE_FLAG_CLEARED 0x80u /* host -> client only: "this player is gone/unknown": drop its scene */
+
+typedef enum PCNetSceneKind {
+    PC_NETSCENE_KIND_UNKNOWN = 0, /* not announceable (title/demo/player-select/test/tool/out of range) */
+    PC_NETSCENE_KIND_FIELD,       /* SCENE_FG (town AND island: one shared grid; FLAG_IN_TOWN does not tell them apart) */
+    PC_NETSCENE_KIND_SHOP,        /* Nook's Cranny/Nook 'n' Go/Nookway/Nookington's 1F+2F, Crazy Redd, Able Sisters */
+    PC_NETSCENE_KIND_POST_OFFICE,
+    PC_NETSCENE_KIND_POLICE,
+    PC_NETSCENE_KIND_MUSEUM,      /* entrance + the four museum rooms */
+    PC_NETSCENE_KIND_PLAYER_HOUSE, /* every player-room size/basement + the island cottage of the player */
+    PC_NETSCENE_KIND_VILLAGER_HOUSE, /* SCENE_NPC_HOUSE (one scene for ALL villagers; see owner) + island NPC cottage */
+    PC_NETSCENE_KIND_OTHER_INTERIOR, /* igloo, buggy, lighthouse, tent */
+} PCNetSceneKind;
+
+typedef struct PCNetPlayerScene {
+    uint8_t  valid;    /* 1 once a scene was accepted/announced; 0 = nothing known (never announced / cleared) */
+    uint8_t  scene_id; /* raw enum scene_table value */
+    uint8_t  flags;    /* PC_NETGAME_SCENE_FLAG_* (CLEARED is never stored) */
+    uint8_t  kind;     /* PCNetSceneKind, derived locally from scene_id */
+    uint16_t owner;    /* house_owner_name for SCENE_NPC_HOUSE / player rooms, else 0 */
+    uint32_t seq;      /* sender's location sequence number (newer-than check) */
+} PCNetPlayerScene;
+
 /* Stage 4C-1: a network-safe, already-decoded snapshot of a player's visible appearance -- see
  * pc_net_game.c for the wire message this is built from/unpacked into. Deliberately NOT the raw
  * decomp mNW_original_design_c/Private_c (kept decomp-independent at this header level, matching
@@ -283,6 +326,19 @@ int pc_net_game_get_player_context(PCNetPlayerId player_id, PCNetPlayerContext* 
 
 /* This process's own live PLAYER_CONTEXT. 0 if no gameplay save is loaded. */
 int pc_net_game_get_local_player_context(PCNetPlayerContext* out);
+
+/* M9-A: 1 iff the raw decomp scene id may be announced to peers (see PCNetPlayerScene). */
+int pc_net_game_scene_is_announceable(int scene_id);
+/* M9-A: local category for a raw scene id; PC_NETSCENE_KIND_UNKNOWN when not announceable. */
+PCNetSceneKind pc_net_game_scene_kind(int scene_id);
+/* M9-A: this process's own last announced scene. 0 if none announced yet (never in an announceable live
+ * scene since start). */
+int pc_net_game_get_local_scene(PCNetPlayerScene* out);
+/* M9-A: the last accepted scene of another network player (host: a READY client id; client: the host id
+ * or a relayed client id). Returns 1 and fills *out only if a scene is currently known; 0 otherwise
+ * (never announced, disconnected, or cleared). Presence only: nothing consumes this yet (puppet
+ * filtering is a later M9 stage). */
+int pc_net_game_get_peer_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
 
 /* This process's own town identity (see PCNetGameTownIdentity). 0 if no gameplay save is loaded
  * (the value would be meaningless -- e.g. the title-demo town). */

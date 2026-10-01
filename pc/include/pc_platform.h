@@ -217,6 +217,14 @@ extern int           g_pc_force_fish_catch;
  * already established (240 frames -- see pcnetgame_run_fish_catch_test_trigger_client()'s own doc for why),
  * since this is the identical MOVE-then-CATCH_REQUEST race-timing concern, not something specific to
  * fish. Fires exactly once per role. Requires --authoritative-wildlife. */
+extern int           g_pc_scene_test_enter_shop; /* M9-A TEST-ONLY: --scene-test-enter-shop. Off by default. When
+                                                  * set, once this process is announced as standing in the
+                                                  * town field it requests a REAL goto_other_scene() into
+                                                  * SCENE_SHOP0 (see pc_net_game.c's
+                                                  * pcnetgame_run_scene_test_hook()). Never active otherwise. */
+extern int           g_pc_scene_test_leave_after; /* M9-A TEST-ONLY: --scene-test-leave-after N: with the flag
+                                                   * above, leave the shop again N polls after it was announced
+                                                   * (0 = stay inside). */
 extern int           g_pc_force_bug_catch;
 /* T8 audit verification, TEST-ONLY: --diag-bug-ttl-lookup <frames>. Added specifically to re-verify Bug
  * 1's fix (pcwld_presentation_check_idle()/pcwld_presentation_reconcile(), pc_wildlife_authority.c)

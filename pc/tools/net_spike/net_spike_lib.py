@@ -1048,9 +1048,12 @@ PC_NETGAME_MSG_BURY_RESULT = 32
 PC_NETGAME_BURY_FLAG_RECONCILE_VALID = 0x01
 PC_NETGAME_BURY_FLAG_DEPOSIT_ON = 0x02
 
-PC_NETGAME_PROTOCOL_VERSION = 4  # World Ecology T3: real bury-item logic (BuryRequest/ResultMsg layout
-                                  # unchanged from T0 scaffolding -- bumped so a pre-T3 build can never
-                                  # silently interoperate while masking the missing feature)
+# M9-A: PLAYER_SCENE (id 44, 12 bytes, reliable) -- see PCNetGamePlayerSceneMsg (pc_net_game.c).
+PC_NETGAME_MSG_PLAYER_SCENE = 44
+PC_NETGAME_SCENE_FLAG_IN_TOWN = 0x01
+PC_NETGAME_SCENE_FLAG_CLEARED = 0x80
+
+PC_NETGAME_PROTOCOL_VERSION = 5  # M9-A: PLAYER_SCENE (id 44, 12 bytes) -- scene identity / player presence
 
 PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1  # 8-byte REJECT
 PC_NETGAME_REJECT_SERVER_FULL = 2        # reserved, never sent

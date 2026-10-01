@@ -406,6 +406,16 @@ typedef enum PCNetGameMsgType {
                                              * pcwld_handle_wildlife_despawn() -- see that function's own
                                              * 3-case doc (pc_wildlife_authority.h/.c). See
                                              * PCNetGameWildlifeDespawnMsg. */
+    PC_NETGAME_MSG_PLAYER_SCENE          = 44, /* M9-A (protocol v5): scene identity / player presence.
+                                             * RELIABLE, 12 bytes. client -> host (the client's own scene;
+                                             * net_player_id ignored), host -> every OTHER READY client (a
+                                             * relay, net_player_id = the TRUE originating peer id) and
+                                             * host -> every READY client (the host's own scene,
+                                             * net_player_id = PC_NETGAME_HOST_PLAYER_ID). Also replayed
+                                             * host -> one newly READY client (host + every other READY
+                                             * peer's last known scene), and sent host -> clients with
+                                             * PC_NETGAME_SCENE_FLAG_CLEARED when a peer is removed.
+                                             * See PCNetGamePlayerSceneMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -1721,6 +1731,36 @@ typedef struct PCNetGameWildlifeDespawnMsg {
 _Static_assert(sizeof(PCNetGameWildlifeDespawnMsg) == 8, "PCNetGameWildlifeDespawnMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameWildlifeDespawnMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameWildlifeDespawnMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* M9-A (protocol v5): PLAYER_SCENE, id 44, exactly 12 bytes, RELIABLE (a scene change is rare and must
+ * never be lost or it would leave a peer permanently mis-located; identity deliberately does NOT ride
+ * the 20 Hz unreliable MOVE stream).
+ *   sender   client -> host (own scene), host -> client (relay of a peer's scene, the host's own scene,
+ *            the join-time replay, or a CLEARED notice).
+ *   receiver host (validates: sender READY, exact size, announceable scene_id, flags only IN_TOWN, seq
+ *            strictly newer than the last accepted seq of that sender; overwrites net_player_id from the
+ *            transport peer slot -- a client-claimed id is NEVER trusted) / client (applies if READY).
+ *   scene_id raw enum scene_table value (play->scene_id of the sender's live GAME_PLAY).
+ *   flags    PC_NETGAME_SCENE_FLAG_IN_TOWN, or (host -> client only) PC_NETGAME_SCENE_FLAG_CLEARED, which
+ *            drops the named player's scene and bypasses the seq check (scene_id/owner/seq ignored).
+ *   owner    house_owner_name for SCENE_NPC_HOUSE / player rooms, else 0 (host forces 0 otherwise).
+ *   seq      the SENDER's own location sequence: starts at 1 per session (a reconnect re-announces with a
+ *            freshly incremented value), compared only against earlier messages of the SAME sender; a
+ *            plain `>` is sufficient (see PCNetMoveMsg's wraparound note). The ground truth is always the
+ *            sender's own live game; the host only checks what is cheaply knowable. */
+typedef struct PCNetGamePlayerSceneMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_PLAYER_SCENE */
+    uint8_t  net_player_id; /* ignored client -> host; host -> client: originating player id */
+    uint8_t  scene_id;
+    uint8_t  flags;         /* PC_NETGAME_SCENE_FLAG_* */
+    uint16_t owner;
+    uint16_t _reserved0;
+    uint32_t seq;
+} PCNetGamePlayerSceneMsg;
+_Static_assert(sizeof(PCNetGamePlayerSceneMsg) == 12, "PCNetGamePlayerSceneMsg wire size drifted");
+_Static_assert(sizeof(PCNetGamePlayerSceneMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGamePlayerSceneMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+_Static_assert(SCENE_NUM <= 255, "PCNetGamePlayerSceneMsg.scene_id is a u8: SCENE_NUM must fit");
 
 /* Two-phase interactions: client -> host, reliable, exactly 8 bytes (little-endian, natural
  * alignment). Answers a provisional RESULT (accepted == 1) -- or withdraws from a request the client
@@ -3272,6 +3312,357 @@ static void pcnetgame_handle_client_appearance(const PCNetGameAppearanceMsg* in)
     PCNetPlayerAppearance state;
     pcnetgame_appearance_msg_to_state(in, &state);
     pc_remote_player_on_appearance((PCNetPlayerId)in->net_player_id, &state);
+}
+
+/* ======================= M9-A: scene identity / player presence =======================
+ * What is announced (the ONLY whitelist -- everything else maps to "do not announce"): the scene ids a
+ * player can really be standing in during normal play (the switch below). NOT announced: SCENE_TEST1/2/3/5,
+ * WATER_TEST, FOOTPRINT_TEST, NPC_TEST, RANDOM_NPC_TEST, BG_TEST_NO_RIVER/RIVER, FIELD_TOOL,
+ * FIELD_TOOL_INSIDE, START_DEMO/2/3 (after player select), PLAYERSELECT/2/3/SAVE, TITLE_DEMO,
+ * EVENT_ANNOUNCEMENT, and any out-of-range value. There is no separate train-station scene id: the station
+ * is part of SCENE_FG, so no STATION kind exists. */
+PCNetSceneKind pc_net_game_scene_kind(int scene_id) {
+    switch (scene_id) {
+        case SCENE_FG:
+            return PC_NETSCENE_KIND_FIELD;
+        case SCENE_SHOP0:
+        case SCENE_BROKER_SHOP:
+        case SCENE_CONVENI:
+        case SCENE_SUPER:
+        case SCENE_DEPART:
+        case SCENE_DEPART_2:
+        case SCENE_NEEDLEWORK:
+            return PC_NETSCENE_KIND_SHOP;
+        case SCENE_POST_OFFICE:
+            return PC_NETSCENE_KIND_POST_OFFICE;
+        case SCENE_POLICE_BOX:
+            return PC_NETSCENE_KIND_POLICE;
+        case SCENE_MUSEUM_ENTRANCE:
+        case SCENE_MUSEUM_ROOM_PAINTING:
+        case SCENE_MUSEUM_ROOM_FOSSIL:
+        case SCENE_MUSEUM_ROOM_INSECT:
+        case SCENE_MUSEUM_ROOM_FISH:
+            return PC_NETSCENE_KIND_MUSEUM;
+        case SCENE_MY_ROOM_S:
+        case SCENE_MY_ROOM_M:
+        case SCENE_MY_ROOM_L:
+        case SCENE_MY_ROOM_LL1:
+        case SCENE_MY_ROOM_LL2:
+        case SCENE_MY_ROOM_BASEMENT_S:
+        case SCENE_MY_ROOM_BASEMENT_M:
+        case SCENE_MY_ROOM_BASEMENT_L:
+        case SCENE_MY_ROOM_BASEMENT_LL1:
+        case SCENE_COTTAGE_MY:
+            return PC_NETSCENE_KIND_PLAYER_HOUSE;
+        case SCENE_NPC_HOUSE:
+        case SCENE_COTTAGE_NPC:
+            return PC_NETSCENE_KIND_VILLAGER_HOUSE;
+        case SCENE_KAMAKURA:
+        case SCENE_BUGGY:
+        case SCENE_LIGHTHOUSE:
+        case SCENE_TENT:
+            return PC_NETSCENE_KIND_OTHER_INTERIOR;
+        default:
+            return PC_NETSCENE_KIND_UNKNOWN;
+    }
+}
+
+int pc_net_game_scene_is_announceable(int scene_id) {
+    return pc_net_game_scene_kind(scene_id) != PC_NETSCENE_KIND_UNKNOWN;
+}
+
+/* `owner` is only meaningful for the two shared house scene families (see PCNetPlayerScene). */
+static uint16_t pcnetgame_scene_owner_for(int scene_id, uint16_t raw_owner) {
+    PCNetSceneKind k = pc_net_game_scene_kind(scene_id);
+    return (k == PC_NETSCENE_KIND_PLAYER_HOUSE || scene_id == SCENE_NPC_HOUSE) ? raw_owner : 0;
+}
+
+/* The local player's own announced scene: the last scene this process saw LIVE (a real GAME_PLAY running
+ * play_main with a real player actor whose play->scene_id is announceable). valid == 0 until then. */
+static PCNetPlayerScene s_local_scene;
+static uint32_t s_local_scene_seq = 0;  /* monotonic send counter (never reset within a process run) */
+static int s_local_scene_sent = 0;      /* client: the current s_local_scene was sent in THIS session */
+
+static void pcnetgame_scene_fill(PCNetPlayerScene* out, int scene_id, uint8_t flags, uint16_t owner, uint32_t seq) {
+    memset(out, 0, sizeof(*out));
+    out->valid = 1;
+    out->scene_id = (uint8_t)scene_id;
+    out->flags = (uint8_t)(flags & PC_NETGAME_SCENE_FLAG_IN_TOWN);
+    out->kind = (uint8_t)pc_net_game_scene_kind(scene_id);
+    out->owner = pcnetgame_scene_owner_for(scene_id, owner);
+    out->seq = seq;
+}
+
+static void pcnetgame_scene_pack(PCNetGamePlayerSceneMsg* msg, uint8_t net_player_id, const PCNetPlayerScene* s) {
+    memset(msg, 0, sizeof(*msg));
+    msg->msg_type = (uint8_t)PC_NETGAME_MSG_PLAYER_SCENE;
+    msg->net_player_id = net_player_id;
+    msg->scene_id = s->scene_id;
+    msg->flags = s->flags;
+    msg->owner = s->owner;
+    msg->seq = s->seq;
+}
+
+/* Host -> every READY client except `skip` (pass -1 for none). */
+static void pcnetgame_host_send_scene_to_all(PCNetPeerId skip, const PCNetGamePlayerSceneMsg* msg) {
+    int i;
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (i != (int)skip && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, msg, (uint16_t)sizeof(*msg));
+        }
+    }
+}
+
+/* Host: a client's own scene. READY-gated; id taken from the transport slot; announceable/flags/owner/seq
+ * validated; relayed to every OTHER READY client only when accepted (a stale/duplicate seq is dropped and
+ * never relayed). */
+static void pcnetgame_handle_host_player_scene(PCNetPeerId peer, const PCNetGamePlayerSceneMsg* in) {
+    PCNetPlayerScene s;
+    PCNetGamePlayerSceneMsg out;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if ((in->flags & ~PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0 || !pc_net_game_scene_is_announceable(in->scene_id) ||
+        in->seq == 0) {
+        printf("[NET][SCENE] host: peer %d sent an invalid PLAYER_SCENE (scene=%u flags=0x%02X seq=%u) -- dropped\n",
+               (int)peer, (unsigned)in->scene_id, (unsigned)in->flags, (unsigned)in->seq);
+        return;
+    }
+    pcnetgame_scene_fill(&s, in->scene_id, in->flags, in->owner, in->seq);
+    if (!pc_remote_player_on_scene((PCNetPlayerId)peer, &s)) {
+        printf("[NET][SCENE] host: peer %d stale PLAYER_SCENE (seq %u) -- ignored\n", (int)peer, (unsigned)in->seq);
+        return;
+    }
+    printf("[NET][SCENE] host: peer %d now in scene %u (kind %u, owner 0x%04X, flags 0x%02X, seq %u)\n", (int)peer,
+           (unsigned)s.scene_id, (unsigned)s.kind, (unsigned)s.owner, (unsigned)s.flags, (unsigned)s.seq);
+    pcnetgame_scene_pack(&out, (uint8_t)peer, &s); /* TRUE originating peer id, normalized fields */
+    pcnetgame_host_send_scene_to_all(peer, &out);
+}
+
+/* Client: the host's own scene, a relayed peer's scene, a join-time replay entry, or a CLEARED notice. */
+static void pcnetgame_handle_client_player_scene(const PCNetGamePlayerSceneMsg* in) {
+    PCNetPlayerScene s;
+
+    if (s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (in->net_player_id > (uint8_t)PC_NETGAME_HOST_PLAYER_ID ||
+        (in->net_player_id != (uint8_t)PC_NETGAME_HOST_PLAYER_ID &&
+         (PCNetPlayerId)in->net_player_id == (PCNetPlayerId)s_client_assigned_peer_id)) {
+        return; /* out of range, or "about me" (the host never echoes a sender's own scene back) */
+    }
+    if (in->flags & PC_NETGAME_SCENE_FLAG_CLEARED) {
+        pc_remote_player_clear_scene((PCNetPlayerId)in->net_player_id);
+        printf("[NET][SCENE] client: player %u scene cleared\n", (unsigned)in->net_player_id);
+        return;
+    }
+    if ((in->flags & ~PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0 || !pc_net_game_scene_is_announceable(in->scene_id) ||
+        in->seq == 0) {
+        return;
+    }
+    pcnetgame_scene_fill(&s, in->scene_id, in->flags, in->owner, in->seq);
+    if (pc_remote_player_on_scene((PCNetPlayerId)in->net_player_id, &s)) {
+        printf("[NET][SCENE] client: player %u now in scene %u (kind %u, owner 0x%04X, flags 0x%02X, seq %u)\n",
+               (unsigned)in->net_player_id, (unsigned)s.scene_id, (unsigned)s.kind, (unsigned)s.owner,
+               (unsigned)s.flags, (unsigned)s.seq);
+    }
+}
+
+/* Host: `peer` was READY and is gone (disconnect/timeout/drop/reject). Its own slot is cleared by
+ * pc_remote_player_on_disconnect(); this tells every other READY client to drop the relayed entry too (a
+ * reliable, ordered CLEARED, so it always precedes the same peer's post-reconnect announcement). */
+static void pcnetgame_host_peer_scene_gone(PCNetPeerId peer) {
+    PCNetGamePlayerSceneMsg msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_PLAYER_SCENE;
+    msg.net_player_id = (uint8_t)peer;
+    msg.flags = (uint8_t)PC_NETGAME_SCENE_FLAG_CLEARED;
+    printf("[NET][SCENE] host: peer %d left -- its scene was cleared (other clients notified)\n", (int)peer);
+    pcnetgame_host_send_scene_to_all(peer, &msg);
+}
+
+/* Host: join-time replay for a newly READY `dest` (reuses the existing READY hook, like the appearance
+ * roster): the host's own scene plus the last known scene of every OTHER READY peer, read from
+ * pc_remote_player.c's canonical per-slot storage (no second cache). Nothing is sent for a player with no
+ * known scene. The late joiner's own slots are fresh, so original seqs are accepted. */
+static void pcnetgame_host_send_scene_roster(PCNetPeerId dest) {
+    PCNetGamePlayerSceneMsg msg;
+    PCNetPlayerScene s;
+    int i;
+
+    if (s_local_scene.valid) {
+        pcnetgame_scene_pack(&msg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene);
+        pc_net_send(dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+    }
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (i == (int)dest || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (pc_remote_player_get_scene((PCNetPlayerId)i, &s)) {
+            pcnetgame_scene_pack(&msg, (uint8_t)i, &s);
+            pc_net_send(dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+        }
+    }
+}
+
+/* Local scene detection, called once per pc_net_game_poll() (every VI frame), both roles.
+ * Source of truth: gamePT's own GAME_PLAY->scene_id, which is assigned by play_init() ->
+ * Gameplay_Scene_Read() when a NEW GAME_PLAY is constructed and never changes for that object's life --
+ * unlike Save.scene_no, which Game_play_change_scene_move_end() overwrites BEFORE teardown. So the old
+ * scene's last frames keep reading the old id, and the new id appears only once the new GAME_PLAY is
+ * running play_main with a real player actor (the same liveness test the movement sender uses). Wipe /
+ * teardown intermediates (gamePT NULL, exec != play_main, no real player actor) and non-announceable
+ * scenes simply produce no event. The latch also requires s_local_world_latched, so the title demo,
+ * player select and an unbound resident never announce. Detection is by VALUE change of
+ * (scene_id, owner, flags), so no new hook in m_play.c/m_scene.c is needed.
+ * Known limits (doc only): (a) a connected client cannot announce "no scene": if it moves into a live scene
+ * that is not announceable (or has no real player actor), peers keep its LAST announced scene until it
+ * announces another or disconnects. (b) a house-scene `owner` is relayed by the host without range
+ * validation (presence data only). (c) host scene sends ignore pc_net_send() failure, the same best-effort
+ * pattern as the appearance roster. */
+static void pcnetgame_scene_tick(void) {
+    if (s_local_world_latched && gamePT != NULL && gamePT->exec == play_main) {
+        GAME_PLAY* play = (GAME_PLAY*)gamePT;
+        int sid = (int)play->scene_id;
+
+        if (pc_net_game_scene_is_announceable(sid) && pcnetgame_is_real_player_actor(GET_PLAYER_ACTOR_NOW())) {
+            uint8_t flags = (sid == SCENE_FG && pcfa_scene_is_town()) ? (uint8_t)PC_NETGAME_SCENE_FLAG_IN_TOWN : 0;
+            uint16_t owner = pcnetgame_scene_owner_for(sid, (uint16_t)Common_Get(house_owner_name));
+
+            if (!s_local_scene.valid || s_local_scene.scene_id != (uint8_t)sid || s_local_scene.owner != owner ||
+                s_local_scene.flags != flags) {
+                pcnetgame_scene_fill(&s_local_scene, sid, flags, owner, s_local_scene.seq);
+                s_local_scene_sent = 0;
+                if (s_role == PC_NETGAME_ROLE_HOST) {
+                    PCNetGamePlayerSceneMsg msg;
+                    s_local_scene.seq = ++s_local_scene_seq;
+                    s_local_scene_sent = 1;
+                    printf("[NET][SCENE] local scene live: scene=%d kind=%u owner=0x%04X flags=0x%02X seq=%u "
+                           "(announcing to clients)\n",
+                           sid, (unsigned)s_local_scene.kind, (unsigned)s_local_scene.owner,
+                           (unsigned)s_local_scene.flags, (unsigned)s_local_scene.seq);
+                    pcnetgame_scene_pack(&msg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene);
+                    pcnetgame_host_send_scene_to_all((PCNetPeerId)-1, &msg);
+                }
+            }
+        }
+    }
+
+    if (s_role == PC_NETGAME_ROLE_CLIENT && s_local_scene.valid && !s_local_scene_sent &&
+        s_client_link == PC_NETGAME_LINK_READY) {
+        PCNetGamePlayerSceneMsg msg;
+        s_local_scene.seq = ++s_local_scene_seq; /* a re-announce after a reconnect also gets a fresh seq */
+        pcnetgame_scene_pack(&msg, 0, &s_local_scene);
+        if (pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+            s_local_scene_sent = 1;
+            printf("[NET][SCENE] local scene live: scene=%d kind=%u owner=0x%04X flags=0x%02X seq=%u "
+                   "(announcing to host)\n",
+                   (int)s_local_scene.scene_id, (unsigned)s_local_scene.kind, (unsigned)s_local_scene.owner,
+                   (unsigned)s_local_scene.flags, (unsigned)s_local_scene.seq);
+        }
+    }
+}
+
+/* M9-A TEST-ONLY hook: --scene-test-enter-shop [--scene-test-leave-after N]. A complete no-op unless the
+ * flag was passed (see g_pc_scene_test_enter_shop's doc, pc_platform.h). Drives a REAL scene transition
+ * through the REAL goto_other_scene() path on the already-running field, so the real scene-live detection
+ * (pcnetgame_scene_tick()) and announcement are exercised. It is NOT manual play: it replaces only the
+ * walk-into-the-door step. Stage 0: once the local player has been announced as in the IN_TOWN field and
+ * stayed there ~2 s, request the door exactly as ac_shop_move.c_inc's aSHOP_pl_into_wait() does (same
+ * Door_data_c values, same out-data rewrite as aSHOP_rewrite_out_data(), but placed at the player's own
+ * position). Stage 1: once SCENE_SHOP0 is announced, optionally (--scene-test-leave-after N polls) leave
+ * through the interior's exit data exactly as Player_actor_set_nextgoto_info_type0() does. Retries while a
+ * wipe is already running. */
+static void pcnetgame_run_scene_test_hook(void) {
+    static int s_stage = 0;
+    static int s_wait = 0;
+    GAME_PLAY* play;
+
+    if (!g_pc_scene_test_enter_shop || s_stage >= 3 || gamePT == NULL || gamePT->exec != play_main ||
+        !s_local_world_latched || !s_local_scene.valid) {
+        return;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE || !pcnetgame_is_real_player_actor(GET_PLAYER_ACTOR_NOW())) {
+        return;
+    }
+
+    if (s_stage == 0) {
+        if (s_local_scene.scene_id != (uint8_t)SCENE_FG || !(s_local_scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) ||
+            (s_role == PC_NETGAME_ROLE_CLIENT && !s_local_scene_sent)) {
+            s_wait = 0;
+            return;
+        }
+        if (++s_wait < 180) {
+            return;
+        }
+        {
+            static Door_data_c door = { SCENE_SHOP0, mSc_DIRECT_NORTH, FALSE, 0, { 160, 0, 300 }, EMPTY_NO, 1,
+                                        { 0, 0, 0 } };
+            PLAYER_ACTOR* player = GET_PLAYER_ACTOR_NOW();
+            Door_data_c* out = Common_GetPointer(structure_exit_door_data);
+            xyz_t pos = player->actor_class.world.position;
+            int res;
+
+            out->next_scene_id = Save_Get(scene_no);
+            out->exit_orientation = mSc_DIRECT_SOUTH_WEST;
+            out->exit_type = 0;
+            out->extra_data = 3;
+            out->exit_position.x = pos.x;
+            out->exit_position.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
+            out->exit_position.z = pos.z;
+            out->door_actor_name = SHOP0;
+            out->wipe_type = WIPE_TYPE_TRIFORCE;
+
+            res = goto_other_scene(play, &door, FALSE);
+            printf("[NET][SCENE][TEST] hook: goto_other_scene(SCENE_SHOP0) res=%d (hook-driven, not manual play)\n",
+                   res);
+            if (res == 1) {
+                s_stage = 1;
+                s_wait = 0;
+            }
+        }
+    } else if (s_stage == 1) {
+        if (s_local_scene.scene_id != (uint8_t)SCENE_SHOP0) {
+            return;
+        }
+        if (g_pc_scene_test_leave_after <= 0) {
+            s_stage = 3; /* stay inside */
+            return;
+        }
+        if (++s_wait < g_pc_scene_test_leave_after) {
+            return;
+        }
+        {
+            int res = goto_other_scene(play, Common_GetPointer(structure_exit_door_data), TRUE);
+            printf("[NET][SCENE][TEST] hook: goto_other_scene(exit) res=%d (hook-driven, not manual play)\n", res);
+            if (res == 1) {
+                s_stage = 3;
+            }
+        }
+    }
+}
+
+int pc_net_game_get_local_scene(PCNetPlayerScene* out) {
+    if (out == NULL || !s_local_scene.valid) {
+        return 0;
+    }
+    *out = s_local_scene;
+    return 1;
+}
+
+int pc_net_game_get_peer_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
+    if (out == NULL) {
+        return 0;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST && player_id == PC_NETGAME_HOST_PLAYER_ID) {
+        return pc_net_game_get_local_scene(out);
+    }
+    if (s_role == PC_NETGAME_ROLE_NONE) {
+        return 0;
+    }
+    return pc_remote_player_get_scene(player_id, out);
 }
 
 /* Log tag / record accessor for one interaction kind (PC_NETGAME_INTERACT_KIND_*). */
@@ -4959,6 +5350,7 @@ static void pcnetgame_host_drop_peer(PCNetPeerId peer) {
     pcnetgame_reset_all_host_peer_state(peer);
     if (was_ready) {
         pc_remote_player_on_disconnect((PCNetPlayerId)peer);
+        pcnetgame_host_peer_scene_gone(peer);
     }
 }
 
@@ -4992,6 +5384,7 @@ static void pcnetgame_host_reject_and_close(PCNetPeerId peer, int sent_ok) {
     s_host_peer_link[peer] = PC_NETGAME_LINK_HANDSHAKE;
     if (was_ready) {
         pc_remote_player_on_disconnect((PCNetPlayerId)peer);
+        pcnetgame_host_peer_scene_gone(peer);
     }
 }
 
@@ -9349,6 +9742,11 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         pc_remote_player_on_ready(peer, &remote_identity);
     }
 
+    /* M9-A late join / reconnect: tell this now-READY client where the host and every other READY peer
+     * currently are (the smallest correct mechanism: the existing READY hook + the per-slot scene storage;
+     * no snapshot machinery). The reliable channel orders this after the IDENTITY_ACK. */
+    pcnetgame_host_send_scene_roster(peer);
+
     /* v2: bootstrap the client's world (initial connect, late join and reconnect all land here). */
     pcnetgame_host_start_snapshot(peer, "joined");
 }
@@ -9551,6 +9949,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGamePlayerSceneMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_SCENE) {
+        PCNetGamePlayerSceneMsg ps;
+        memcpy(&ps, data, sizeof(ps));
+        pcnetgame_handle_host_player_scene(peer, &ps);
+        return;
+    }
+
     if (size == sizeof(PCNetGamePickupRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PICKUP_REQUEST) {
         PCNetGamePickupRequestMsg pr;
         memcpy(&pr, data, sizeof(pr));
@@ -9653,6 +10058,13 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCNetGameAppearanceMsg ap;
         memcpy(&ap, data, sizeof(ap));
         pcnetgame_handle_client_appearance(&ap);
+        return;
+    }
+
+    if (size == sizeof(PCNetGamePlayerSceneMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_SCENE) {
+        PCNetGamePlayerSceneMsg ps;
+        memcpy(&ps, data, sizeof(ps));
+        pcnetgame_handle_client_player_scene(&ps);
         return;
     }
 
@@ -9955,6 +10367,17 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
  * tiles. (Stage 5A/5B used to reset these separately in start_client and the disconnect handler.) */
 static void pcnetgame_reset_client_session_state(void) {
     memset(&s_host_local_drop_landing, 0, sizeof(s_host_local_drop_landing)); /* (host-only, harmless here) */
+    s_local_scene_sent = 0; /* M9-A: a new connection must re-announce the (still live) local scene */
+    {
+        /* M9-A: every scene this client holds for OTHER players (the host and relayed clients) came over the
+         * old host link; once that link is lost or replaced it can no longer be trusted (the new connection
+         * replays join-time scenes), and entries stored before any MOVE arrived are never reaped by the
+         * puppet liveness timeout. Only scene identity is cleared -- puppets/movement state are untouched. */
+        int scene_pid;
+        for (scene_pid = 0; scene_pid <= (int)PC_NETGAME_HOST_PLAYER_ID; scene_pid++) {
+            pc_remote_player_clear_scene((PCNetPlayerId)scene_pid);
+        }
+    }
     s_client_host_identity_valid = 0;
     memset(&s_client_host_identity, 0, sizeof(s_client_host_identity));
     s_client_identity_sent = 0;
@@ -10260,6 +10683,8 @@ void pc_net_game_shutdown(void) {
     s_client_link = PC_NETGAME_LINK_DISCONNECTED;
     pcnetgame_reset_client_session_state();
     pcnetgame_reset_host_world_state(); /* also clears s_host_peer_link[] and every per-peer cache */
+    memset(&s_local_scene, 0, sizeof(s_local_scene)); /* M9-A: back to single-player: nothing announced */
+    s_local_scene_seq = 0;
 
     /* Clock hardening (concern #1): this is the ONE place the process genuinely stops being a
      * network client and returns to ROLE_NONE (single-player) -- see the doc comment on
@@ -11457,7 +11882,11 @@ void pc_net_game_poll(void) {
                     break;
                 case PC_NET_EVENT_PEER_DISCONNECTED:
                     if (ev.peer >= 0 && ev.peer < PC_NET_MAX_PEERS) {
+                        int was_ready_peer = (s_host_peer_link[ev.peer] == PC_NETGAME_LINK_READY);
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_DISCONNECTED;
+                        if (was_ready_peer) {
+                            pcnetgame_host_peer_scene_gone(ev.peer); /* M9-A: clients drop the relayed scene */
+                        }
                     }
                     printf("[NET] host: peer %d disconnected\n", (int)ev.peer);
                     pcnetgame_reset_all_host_peer_state(ev.peer); /* Stage 5A/5B-1/v2: never let a
@@ -11496,6 +11925,17 @@ void pc_net_game_poll(void) {
                 case PC_NET_EVENT_PEER_DISCONNECTED:
                     s_client_link = PC_NETGAME_LINK_DISCONNECTED;
                     printf("[NET] client: host connection lost\n");
+                    {
+                        /* M9-A: observability for the scene clear done by pcnetgame_reset_client_session_state()
+                         * below (counted BEFORE it runs): how many other players' scenes this client was holding. */
+                        int scene_pid;
+                        int held = 0;
+                        PCNetPlayerScene scene_tmp;
+                        for (scene_pid = 0; scene_pid <= (int)PC_NETGAME_HOST_PLAYER_ID; scene_pid++) {
+                            held += pc_remote_player_get_scene((PCNetPlayerId)scene_pid, &scene_tmp) ? 1 : 0;
+                        }
+                        printf("[NET][SCENE] client: host link lost -- clearing %d stored peer scene(s)\n", held);
+                    }
                     /* Stage 5A/5B-1/v2: pending pickup/drop requests are dropped immediately (the
                      * item was never moved locally, so nothing is lost or needs restoring), and
                      * every other per-connection state goes with them. */
@@ -11523,6 +11963,10 @@ void pc_net_game_poll(void) {
             return; /* local town changed under a READY link -> shut down */
         }
     }
+
+    /* M9-A: local scene detection + announcement (both roles); then the off-by-default test hook. */
+    pcnetgame_scene_tick();
+    pcnetgame_run_scene_test_hook();
 
     /* Stage 3: throttled movement send, decoupled from the render/frame rate (see
      * PC_NETGAME_MOVE_SEND_PERIOD_60FPS_FRAMES's doc above). gamePT/the local player actor may

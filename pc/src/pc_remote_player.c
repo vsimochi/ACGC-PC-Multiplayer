@@ -266,6 +266,10 @@ typedef struct PCRemotePlayerSlot {
 
     PCRemotePlayerAppearance         appearance;          /* Stage 4C-1: see pc_remote_player_on_appearance() */
     PCRemotePlayerResolvedAppearance resolved_appearance; /* Stage 4C-1: see pc_remote_player_apply_appearance() */
+
+    PCNetPlayerScene   scene;              /* M9-A: last accepted scene identity of this player (valid == 0 when
+                                             * unknown); cleared on disconnect/ready/timeout, NOT by a local
+                                             * scene-generation change. Presence data only. */
 } PCRemotePlayerSlot;
 
 static PCRemotePlayerSlot s_slots[PC_REMOTE_PLAYER_SLOT_COUNT];
@@ -827,7 +831,18 @@ static int pc_remote_player_actor_is_live(const PCRemotePlayerSlot* slot) {
     return gamePT == s_last_seen_game && gamePT->frame_counter >= s_last_seen_frame_counter;
 }
 
-static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot) {
+/* keep_scene == 0: genuine departure paths (on_disconnect, on_ready replacing a tracked slot, shutdown) --
+ * the stored M9-A scene identity is wiped. keep_scene == 1: ONLY the client-side relay-liveness timeout
+ * (a relayed peer merely stopped sending MOVE while its transport is still up, e.g. it is inside the NES
+ * emulator or paused): the puppet presentation is torn down but the scene identity is PRESERVED, because
+ * the peer's scene dedup will not re-announce an unchanged scene when it comes back. A real departure
+ * still clears it later (host CLEARED notice, host-link loss, on_ready's own memset). */
+static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot, int keep_scene) {
+    /* M9-A: a scene can be stored for a relay-discovered player that never became in_use, so clear it
+     * BEFORE the in_use early-out: no stale interior presence may survive a disconnect. */
+    if (!keep_scene) {
+        memset(&slot->scene, 0, sizeof(slot->scene));
+    }
     if (!slot->in_use) {
         return;
     }
@@ -867,9 +882,10 @@ void pc_remote_player_on_ready(PCNetPlayerId player_id, const PCNetGameIdentity*
     if (slot->in_use) {
         /* Shouldn't normally happen (a player id isn't reused while still tracked), but don't
          * leak a stale actor if it somehow does. */
-        pc_remote_player_destroy_slot(slot);
+        pc_remote_player_destroy_slot(slot, 0);
     }
 
+    memset(&slot->scene, 0, sizeof(slot->scene)); /* M9-A: a new READY starts with no known scene */
     slot->in_use = 1;
     slot->pending_create = 1;
     slot->lazily_discovered = 0; /* a direct handshake, not a relay discovery */
@@ -891,7 +907,7 @@ void pc_remote_player_on_disconnect(PCNetPlayerId player_id) {
     if (slot->in_use) {
         printf("[NET][REMOTE] player %d disconnected -- destroying remote-player actor\n", (int)player_id);
     }
-    pc_remote_player_destroy_slot(slot);
+    pc_remote_player_destroy_slot(slot, 0);
 }
 
 void pc_remote_player_on_move(PCNetPlayerId player_id, const PCNetMoveSample* sample) {
@@ -1010,6 +1026,37 @@ int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearan
         memcpy(out->design_record, &slot->appearance.design, sizeof(out->design_record));
     }
 
+    return 1;
+}
+
+/* M9-A: see pc_remote_player.h. Accepts only a scene whose seq is strictly newer than the stored one. */
+int pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* scene) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+
+    if (slot == NULL || scene == NULL || !scene->valid) {
+        return 0;
+    }
+    if (slot->scene.valid && scene->seq <= slot->scene.seq) {
+        return 0;
+    }
+    slot->scene = *scene;
+    slot->scene.valid = 1;
+    return 1;
+}
+
+void pc_remote_player_clear_scene(PCNetPlayerId player_id) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    if (slot != NULL) {
+        memset(&slot->scene, 0, sizeof(slot->scene));
+    }
+}
+
+int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    if (slot == NULL || out == NULL || !slot->scene.valid) {
+        return 0;
+    }
+    *out = slot->scene;
     return 1;
 }
 
@@ -1140,8 +1187,9 @@ void pc_remote_player_poll(void) {
          * on_disconnect(), so this never needs to (and must not) second-guess that path. */
         if (slot->lazily_discovered && slot->has_sender_frame &&
             (now - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_TIMEOUT_FRAMES) {
-            printf("[NET][REMOTE] player %d timed out (no movement data) -- destroying remote-player actor\n", i);
-            pc_remote_player_destroy_slot(slot);
+            printf("[NET][REMOTE] player %d timed out (no movement data) -- destroying remote-player actor "
+                   "(scene identity %s)\n", i, slot->scene.valid ? "preserved" : "none");
+            pc_remote_player_destroy_slot(slot, 1); /* keep the scene: see destroy_slot's doc */
             continue;
         }
 
@@ -1196,6 +1244,6 @@ void pc_remote_player_poll(void) {
 void pc_remote_player_shutdown(void) {
     int i;
     for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
-        pc_remote_player_destroy_slot(&s_slots[i]);
+        pc_remote_player_destroy_slot(&s_slots[i], 0);
     }
 }
