@@ -67,6 +67,7 @@
 #include <math.h> /* sqrtf() -- see the Stage 4B animation-speed formula in pc_remote_player_mv() */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* Same two decomp-owned skeleton globals m_player_lib.c's own mPlib_get_player_mdl_p() selects
  * between (src/data/model/boy_model.c / girl_model.c) -- declared extern here purely for the
@@ -669,6 +670,19 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     return NULL;
 }
 
+/* M9-B: opt-in for the periodic/per-contact "[NET][COLLIDE][DIAG] player N frame=..." lines. Off by default (normal
+ * gameplay stays quiet); enabled by PC_COLLIDE_DIAG=1 in the environment (read once and cached, like
+ * PC_NPC_TALKHOLD_DIAG) or by the --collide-test-* hook flags. The ARMED/DISARMED transition lines and the rare
+ * peak / failed-setOC lines are not gated. */
+static int pc_remote_player_collide_diag(void) {
+    static int s_diag = -1;
+    if (s_diag < 0) {
+        const char* e = getenv("PC_COLLIDE_DIAG");
+        s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return s_diag;
+}
+
 /* M9-B: called at the end of pc_remote_player_mv(). Registers the puppet's pipe with the vanilla OC pass (stateless:
  * the collider table is cleared every frame, so disarming is just "don't call setOC"). The vanilla solver
  * (CollisionCheck_OC at the top of the NEXT frame's play update, m_play.c) writes status_data.collision_vec only on
@@ -708,7 +722,8 @@ static void pc_remote_player_collide_update(PCRemotePlayerActor* self, PCRemoteP
             slot->collide_armed = 1;
             printf("[NET][COLLIDE] player %d: collider ARMED\n", (int)self->peer);
         }
-        if ((test_active && (pushed || hit || dist < 60.0f)) || (pushed && (fc % 15) == 0) || (fc % 120) == 0) {
+        if ((pc_remote_player_collide_diag() || test_active) &&
+            ((test_active && (pushed || hit || dist < 60.0f)) || (pushed && (fc % 15) == 0) || (fc % 120) == 0)) {
             printf("[NET][COLLIDE][DIAG] player %d frame=%u xz_dist=%.2f push=(%.2f,%.2f) local=(%.2f,%.2f) "
                    "puppet=(%.2f,%.2f) hit=%d wt=%d main=%d peak_oc=%d failed_setoc=%d\n",
                    (int)self->peer, (unsigned)fc, (double)dist, (double)push->x, (double)push->z,

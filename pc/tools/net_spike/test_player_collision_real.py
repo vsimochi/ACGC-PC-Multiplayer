@@ -282,6 +282,8 @@ def main():
     ap.add_argument("--port", type=int, default=7830)
     ap.add_argument("--only", default="")
     args = ap.parse_args()
+    # The per-frame [NET][COLLIDE][DIAG] lines are opt-in in the game (PC_COLLIDE_DIAG=1); both processes inherit this.
+    os.environ.setdefault("PC_COLLIDE_DIAG", "1")
     results, stats = [], []
     log_dir = os.path.join(HERE, "logs", "m9b")
     os.makedirs(log_dir, exist_ok=True)
