@@ -116,6 +116,11 @@ int  pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* 
 void pc_remote_player_clear_scene(PCNetPlayerId player_id);
 int  pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
 
+/* M9-B TEST-ONLY (used by the off-by-default --collide-test-* hooks in pc_net_game.c): fills the current
+ * (interpolated) world position of the first live puppet that has snapshots, a visual and a same-scene FIELD/IN_TOWN
+ * presence (range and transient holds are ignored). Returns 0 when there is none. Read-only. */
+int pc_remote_player_collide_test_target(float* out_x, float* out_y, float* out_z);
+
 /* Call once per frame, unconditionally, regardless of game/menu/networking state (see
  * pc/src/pc_vi.c, right after pc_net_game_poll()). Retries any actor creation that was deferred
  * because the game/actor system wasn't in a valid state yet. Never blocks, never allocates

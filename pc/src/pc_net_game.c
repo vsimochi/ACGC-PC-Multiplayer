@@ -3644,6 +3644,89 @@ static void pcnetgame_run_scene_test_hook(void) {
     }
 }
 
+/* M9-B TEST-ONLY hooks: --collide-test-overlap and --collide-test-approach N. Complete no-ops unless a flag was
+ * passed (see their docs in pc_platform.h). Both only ever write the LOCAL player's actor world.position -- the same
+ * field and the same between-frames timing the --force-dig-hole teleport above uses -- and never touch the
+ * collision pipeline: the vanilla solver then sees the overlap through the player's and the puppet's normally
+ * registered pipes (the player re-registers its pipe at its new position during its next move, so the first push
+ * lands 2 game frames later) and pushes the local player via status_data.collision_vec inside the player's own
+ * Actor_position_move(), exactly as for any NPC. Gating: this process is announced in the IN_TOWN field, a real
+ * local player actor exists, no wipe is running, and a same-scene puppet with snapshots + visual has been present
+ * for ~2 s (120 polls), and the local player is in the standing state (mPlayer_INDEX_WAIT).
+ *   overlap: once, local.xz = first puppet's current position + (10, 0).
+ *   approach: from the same point on, once per NEW game frame, move the local player 2 units toward the puppet,
+ *     for N game frames, then stop (the per-game-frame step is detected via gamePT->frame_counter because the poll
+ *     runs per VI frame, not per game frame). */
+static void pcnetgame_run_collide_test_hook(void) {
+    static int s_wait = 0;
+    static int s_overlap_done = 0;
+    static int s_approach_left = -1; /* -1 = not started */
+    static uint32_t s_last_frame = 0;
+    PLAYER_ACTOR* local;
+    float px, py, pz;
+
+    if ((!g_pc_collide_test_overlap || s_overlap_done) && (g_pc_collide_test_approach <= 0 || s_approach_left == 0)) {
+        return;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main || s_role == PC_NETGAME_ROLE_NONE || !s_local_world_latched ||
+        !s_local_scene.valid || s_local_scene.scene_id != (uint8_t)SCENE_FG ||
+        !(s_local_scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) ||
+        ((GAME_PLAY*)gamePT)->fb_wipe_mode != WIPE_MODE_NONE) {
+        s_wait = 0;
+        return;
+    }
+    local = GET_PLAYER_ACTOR_NOW();
+    /* The local player must be in the plain standing state (mPlayer_INDEX_WAIT): right after the bootstrap the
+     * player is still in its house-exit mPlayer_INDEX_OUTDOOR state (immovable weight 255, a different collision
+     * routine), where no push can apply and a hook-driven overlap would prove nothing. */
+    if (!pcnetgame_is_real_player_actor(local) || local->now_main_index != mPlayer_INDEX_WAIT ||
+        !pc_remote_player_collide_test_target(&px, &py, &pz)) {
+        s_wait = 0;
+        return;
+    }
+    if (s_wait < 120) {
+        s_wait++;
+        return;
+    }
+
+    if (g_pc_collide_test_overlap && !s_overlap_done) {
+        printf("[NET][COLLIDE][TEST] --collide-test-overlap: frame=%u teleporting local (%.2f,%.2f) -> puppet+(10,0) "
+               "(%.2f,%.2f)\n", (unsigned)gamePT->frame_counter, (double)local->actor_class.world.position.x,
+               (double)local->actor_class.world.position.z, (double)(px + 10.0f), (double)pz);
+        local->actor_class.world.position.x = px + 10.0f;
+        local->actor_class.world.position.z = pz;
+        s_overlap_done = 1;
+        return;
+    }
+
+    if (g_pc_collide_test_approach > 0 && s_approach_left != 0) {
+        if (s_approach_left < 0) {
+            s_approach_left = g_pc_collide_test_approach;
+            s_last_frame = gamePT->frame_counter;
+            printf("[NET][COLLIDE][TEST] --collide-test-approach: frame=%u starting, %d steps of 2 units toward "
+                   "puppet (%.2f,%.2f) from local (%.2f,%.2f)\n", (unsigned)gamePT->frame_counter, s_approach_left,
+                   (double)px, (double)pz, (double)local->actor_class.world.position.x,
+                   (double)local->actor_class.world.position.z);
+            return;
+        }
+        if (gamePT->frame_counter != s_last_frame) {
+            float dx = px - local->actor_class.world.position.x;
+            float dz = pz - local->actor_class.world.position.z;
+            float d = sqrtf(dx * dx + dz * dz);
+
+            s_last_frame = gamePT->frame_counter;
+            if (d > 2.0f) {
+                local->actor_class.world.position.x += 2.0f * dx / d;
+                local->actor_class.world.position.z += 2.0f * dz / d;
+            }
+            if (--s_approach_left == 0) {
+                printf("[NET][COLLIDE][TEST] --collide-test-approach: frame=%u done (stopped stepping)\n",
+                       (unsigned)gamePT->frame_counter);
+            }
+        }
+    }
+}
+
 int pc_net_game_get_local_scene(PCNetPlayerScene* out) {
     if (out == NULL || !s_local_scene.valid) {
         return 0;
@@ -11967,6 +12050,7 @@ void pc_net_game_poll(void) {
     /* M9-A: local scene detection + announcement (both roles); then the off-by-default test hook. */
     pcnetgame_scene_tick();
     pcnetgame_run_scene_test_hook();
+    pcnetgame_run_collide_test_hook(); /* M9-B: off-by-default --collide-test-* hooks */
 
     /* Stage 3: throttled movement send, decoupled from the render/frame rate (see
      * PC_NETGAME_MOVE_SEND_PERIOD_60FPS_FRAMES's doc above). gamePT/the local player actor may

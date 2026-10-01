@@ -384,6 +384,10 @@ int g_pc_force_bug_catch = 0;
 int g_pc_scene_test_enter_shop = 0;
 int g_pc_scene_test_leave_after = 0;
 
+/* M9-B TEST-ONLY: --collide-test-overlap / --collide-test-approach N. See pc_platform.h. */
+int g_pc_collide_test_overlap = 0;
+int g_pc_collide_test_approach = 0;
+
 /* T8 audit verification, TEST-ONLY: --diag-bug-ttl-lookup <frames>. See pc_platform.h's own doc comment
  * on this global. */
 int g_pc_diag_bug_ttl_lookup_frames = 0;
@@ -535,6 +539,11 @@ int main(int argc, char* argv[]) {
             g_pc_scene_test_enter_shop = 1;
         } else if (strcmp(argv[i], "--scene-test-leave-after") == 0 && i + 1 < argc) {
             g_pc_scene_test_leave_after = atoi(argv[i + 1]);
+            i++;
+        } else if (strcmp(argv[i], "--collide-test-overlap") == 0) {
+            g_pc_collide_test_overlap = 1;
+        } else if (strcmp(argv[i], "--collide-test-approach") == 0 && i + 1 < argc) {
+            g_pc_collide_test_approach = atoi(argv[i + 1]);
             i++;
         } else if (strcmp(argv[i], "--force-bug-catch") == 0) {
             g_pc_force_bug_catch = 1;

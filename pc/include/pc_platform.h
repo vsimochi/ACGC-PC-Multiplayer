@@ -225,6 +225,15 @@ extern int           g_pc_scene_test_enter_shop; /* M9-A TEST-ONLY: --scene-test
 extern int           g_pc_scene_test_leave_after; /* M9-A TEST-ONLY: --scene-test-leave-after N: with the flag
                                                    * above, leave the shop again N polls after it was announced
                                                    * (0 = stay inside). */
+extern int           g_pc_collide_test_overlap;  /* M9-B TEST-ONLY: --collide-test-overlap. Off by default. Once this
+                                                   * process is READY, in the IN_TOWN field and a same-scene puppet
+                                                   * exists, teleports the LOCAL player's world position to the first
+                                                   * puppet's position + (10,0,0), exactly once (see pc_net_game.c's
+                                                   * pcnetgame_run_collide_test_hook()). Also makes the
+                                                   * [NET][COLLIDE][DIAG] line print every contact frame. */
+extern int           g_pc_collide_test_approach; /* M9-B TEST-ONLY: --collide-test-approach N (N > 0): steps the LOCAL
+                                                   * player 2 world units per game frame toward the first puppet for N
+                                                   * frames, then stops. Off (0) by default. */
 extern int           g_pc_force_bug_catch;
 /* T8 audit verification, TEST-ONLY: --diag-bug-ttl-lookup <frames>. Added specifically to re-verify Bug
  * 1's fix (pcwld_presentation_check_idle()/pcwld_presentation_reconcile(), pc_wildlife_authority.c)

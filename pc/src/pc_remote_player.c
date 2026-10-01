@@ -55,7 +55,10 @@
 #include "m_common_data.h" /* Common_Get(player_actor_exists), Now_Private -- see
                              * pc_remote_player_visual_init()'s readiness gate */
 #include "m_rcp.h"
+#include "m_collision_obj.h" /* M9-B: ClObjPipe_c, CollisionCheck_setOC() -- see pc_remote_player_collide_update() */
+#include "m_lib.h"           /* M9-B: _Game_play_isPause() */
 #include "libultra/libultra.h"
+#include "pc_platform.h"     /* M9-B: g_pc_collide_test_* (diagnostic verbosity only) */
 #include "pc_lowaddr.h" /* PC_LOWADDR_LIMIT -- see the guard in pc_remote_player_poll() */
 #include "audio.h" /* Stage 4B.1: sAdo_OngenTrgStart() -- see the TURN_DASH skid sound in
                      * pc_remote_player_mv(). Already #include'd elsewhere in pc/ (e.g.
@@ -136,7 +139,28 @@ typedef struct PCRemotePlayerActor {
     int8_t                cosmetic_item_kind;  /* last-interpolated item_kind; stored correctly,
                                                  * but Stage 4A does not render a held item */
     PCRemotePlayerVisual  visual;
+    ClObjPipe_c           col_pipe;     /* M9-B: this puppet's own player<->player collision pipe, registered
+                                          * with the vanilla OC pass from pc_remote_player_mv() (see
+                                          * pc_remote_player_collide_update()). Initialised at creation in
+                                          * pc_remote_player_poll() (the puppet's ct_proc is none_proc2). */
+    int                   collide_hold; /* M9-B: frames left during which the pipe is NOT registered (set after
+                                          * an interpolator teleport-snap to avoid a deep-overlap pop) */
 } PCRemotePlayerActor;
+
+/* M9-B: the puppet pipe. Mirrors Player_actor_OcInfoData_forStand (m_player_common.c_inc) except for the group
+ * flags: flags0 0x09 = CHECK | collides-with GROUP_PLAYER (0x08); flags1 0x10 = this puppet is GROUP_2 and NOT
+ * ClObj_FLAG2_IS_PLAYER (0x08). The local player's pipe is {0x39, 0x08}: 0x39 & 0x10 and 0x08 & 0x09 both pass
+ * CollisionCheck_Check2ClObjNoOC(), so player<->puppet pairs; puppet<->puppet fails (0x09 & 0x10 == 0), and no
+ * other actor sets the 0x08 is-player bit, so nothing else pairs with a puppet. No ClObj_FLAG_COLLISION_PRIORITY. */
+static ClObjPipeData_c s_remote_player_pipe_data = {
+    { 0x09, 0x10, ClObj_TYPE_PIPE }, /* ClObjData_c */
+    { 0x01 },                        /* ClObjElemData_c */
+    { { 20, 60, 0, { 0, 0, 0 } } },  /* ClObjPipeAttrData_c: radius 20, height 60 (same as the player's) */
+};
+
+#define PC_REMOTE_PLAYER_COLLIDE_RANGE 150.0f       /* XZ units; only nearby puppets enter the 50-entry OC table */
+#define PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST 80.0f    /* a single-frame puppet XZ jump larger than this = teleport snap */
+#define PC_REMOTE_PLAYER_COLLIDE_SNAP_HOLD_FRAMES 2 /* frames to stay unregistered after such a snap */
 
 typedef struct PCRemotePlayerOffset {
     f32 x, z;
@@ -270,7 +294,16 @@ typedef struct PCRemotePlayerSlot {
     PCNetPlayerScene   scene;              /* M9-A: last accepted scene identity of this player (valid == 0 when
                                              * unknown); cleared on disconnect/ready/timeout, NOT by a local
                                              * scene-generation change. Presence data only. */
+
+    int                collide_armed;      /* M9-B: 1 while this puppet's collider was registered on the last frame it
+                                             * was evaluated (log state only -- registration itself is stateless) */
+    int                collide_target_ok;  /* M9-B: test-hook accessor input: puppet is live, same-scene, has
+                                             * snapshots and a visual (range/hold ignored) */
 } PCRemotePlayerSlot;
+
+/* M9-B diagnostics (read-only; never influence behaviour). */
+static int s_collide_peak_colliders = 0; /* highest play->collision_check.collider_num seen at poll time */
+static int s_collide_failed_setoc = 0;   /* CollisionCheck_setOC() returned -1 for a puppet */
 
 static PCRemotePlayerSlot s_slots[PC_REMOTE_PLAYER_SLOT_COUNT];
 
@@ -581,6 +614,120 @@ static void pc_remote_player_visual_init(PCRemotePlayerVisual* visual,
            (appearance->skeleton == &cKF_bs_r_boy_1) ? "boy" : "girl", (int)appearance->skeleton->num_shown_joints);
 }
 
+/* M9-B: decides whether this puppet's collision pipe is registered this frame. Returns NULL = arm; "hold" = a
+ * transient, deliberately silent skip (pause / net-or-axe swing / post-teleport-snap hold: no log state change);
+ * otherwise a DISARMED reason string for the log. Pure read-only evaluation. *out_local is set only when a real local
+ * player actor was found. Interiors are intentionally never armed (FIELD, same scene id, IN_TOWN only). */
+static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game,
+                                                 PLAYER_ACTOR** out_local, float* out_dist) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* local;
+    float dx, dz, dist;
+    int main_index;
+
+    *out_local = NULL;
+    *out_dist = 0.0f;
+
+    if (!slot->scene.valid || slot->scene.kind != (uint8_t)PC_NETSCENE_KIND_FIELD ||
+        !(slot->scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) || slot->scene.scene_id != (uint8_t)play->scene_id ||
+        pc_net_game_scene_kind((int)play->scene_id) != PC_NETSCENE_KIND_FIELD) {
+        return "scene";
+    }
+    if (slot->snapshot_count == 0) {
+        return "no-snapshot";
+    }
+    if (!self->visual.initialized) {
+        return "no-visual";
+    }
+    local = NULL;
+    if (Common_Get(player_actor_exists)) {
+        local = GET_PLAYER_ACTOR(play);
+    }
+    if (local == NULL || (uint64_t)(uintptr_t)local >= PC_LOWADDR_LIMIT) {
+        return "no-local";
+    }
+    *out_local = local;
+    dx = self->actor_class.world.position.x - local->actor_class.world.position.x;
+    dz = self->actor_class.world.position.z - local->actor_class.world.position.z;
+    dist = sqrtf(dx * dx + dz * dz);
+    *out_dist = dist;
+    slot->collide_target_ok = 1; /* eligible for the test hooks regardless of range/hold */
+    if (!(dist < PC_REMOTE_PLAYER_COLLIDE_RANGE)) { /* also rejects NaN */
+        return "range";
+    }
+
+    /* Transient holds. Pause: CollisionCheck_setOC() itself refuses while paused. Net/axe swing: the player's
+     * item-triangle check (OCC) ignores group flags, so a registered pipe would stop/reflect the swing. */
+    main_index = local->now_main_index;
+    if (_Game_play_isPause(play) == 1 || main_index == mPlayer_INDEX_SWING_AXE || main_index == mPlayer_INDEX_SWING_NET) {
+        return "hold";
+    }
+    if (self->collide_hold > 0) {
+        self->collide_hold--;
+        return "hold";
+    }
+    return NULL;
+}
+
+/* M9-B: called at the end of pc_remote_player_mv(). Registers the puppet's pipe with the vanilla OC pass (stateless:
+ * the collider table is cleared every frame, so disarming is just "don't call setOC"). The vanilla solver
+ * (CollisionCheck_OC at the top of the NEXT frame's play update, m_play.c) writes status_data.collision_vec only on
+ * the local player (the puppet is MASSTYPE_HEAVY so a normal-weight player takes the whole push, an idle/HEAVY
+ * player half), and Actor_position_move() inside the player's own movement applies it; the player's own BG check
+ * corrects walls the same frame. The puppet's own collision_vec is cleared right after its mv (Actor_info_call_actor)
+ * and is never applied: puppet position stays purely interpolated. */
+static void pc_remote_player_collide_update(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* local = NULL;
+    float dist = 0.0f;
+    const char* reason;
+    ACTOR* actor = &self->actor_class;
+
+    slot->collide_target_ok = 0;
+    reason = pc_remote_player_collide_eval(self, slot, game, &local, &dist);
+
+    if (reason != NULL) {
+        if (strcmp(reason, "hold") != 0 && slot->collide_armed) {
+            slot->collide_armed = 0;
+            printf("[NET][COLLIDE] player %d: collider DISARMED reason=%s\n", (int)self->peer, reason);
+        }
+        return;
+    }
+
+    {
+        /* Read-only diagnostics BEFORE setOC (which clears the pipe's COLLIDED flag): the UNUSED part runs before
+         * PLAYER in Actor_info_call_actor and only the player's own clear (after its mv) zeroes its collision_vec,
+         * so collision_vec still holds the push this frame's OC pass produced. */
+        const xyz_t* push = &local->actor_class.status_data.collision_vec;
+        int hit = (self->col_pipe.collision_obj.collision_flags0 & ClObj_FLAG_COLLIDED) != 0;
+        int test_active = (g_pc_collide_test_overlap || g_pc_collide_test_approach > 0);
+        int pushed = (push->x != 0.0f || push->z != 0.0f);
+        u32 fc = game->frame_counter;
+
+        if (!slot->collide_armed) {
+            slot->collide_armed = 1;
+            printf("[NET][COLLIDE] player %d: collider ARMED\n", (int)self->peer);
+        }
+        if ((test_active && (pushed || hit || dist < 60.0f)) || (pushed && (fc % 15) == 0) || (fc % 120) == 0) {
+            printf("[NET][COLLIDE][DIAG] player %d frame=%u xz_dist=%.2f push=(%.2f,%.2f) local=(%.2f,%.2f) "
+                   "puppet=(%.2f,%.2f) hit=%d wt=%d main=%d peak_oc=%d failed_setoc=%d\n",
+                   (int)self->peer, (unsigned)fc, (double)dist, (double)push->x, (double)push->z,
+                   (double)local->actor_class.world.position.x, (double)local->actor_class.world.position.z,
+                   (double)actor->world.position.x, (double)actor->world.position.z, hit,
+                   (int)local->actor_class.status_data.weight, (int)local->now_main_index, s_collide_peak_colliders, s_collide_failed_setoc);
+        }
+    }
+
+    CollisionCheck_Uty_ActorWorldPosSetPipeC(actor, &self->col_pipe); /* interpolated render position, s16 centre */
+    if (CollisionCheck_setOC(game, &play->collision_check, &self->col_pipe.collision_obj) < 0) {
+        s_collide_failed_setoc++;
+        if (s_collide_failed_setoc == 1 || (s_collide_failed_setoc % 600) == 0) {
+            printf("[NET][COLLIDE][DIAG] setOC failed (collider table full / paused / skipped) count=%d\n",
+                   s_collide_failed_setoc);
+        }
+    }
+}
+
 static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
     PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
@@ -600,6 +747,15 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
     target_time = graph_dt_frame_time(game) - PC_REMOTE_PLAYER_INTERP_DELAY_FRAMES;
 
     if (pc_remote_player_interpolate(slot, target_time, &render)) {
+        {
+            /* M9-B: an interpolator teleport-snap (or the first placement) moves the puppet far in a single frame;
+             * keep its collider out of the OC pass for a couple of frames so it cannot deep-overlap-pop the player. */
+            float jdx = render.pos.x - actor->world.position.x;
+            float jdz = render.pos.z - actor->world.position.z;
+            if ((jdx * jdx + jdz * jdz) > (PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST * PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST)) {
+                self->collide_hold = PC_REMOTE_PLAYER_COLLIDE_SNAP_HOLD_FRAMES;
+            }
+        }
         actor->world.position = render.pos;
         actor->world.angle.y = render.angle;
         actor->shape_info.rotation.y = render.angle; /* mirrors how the local player's own
@@ -743,6 +899,9 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
 
         cKF_SkeletonInfo_R_combine_play(&self->visual.keyframe0, &self->visual.keyframe1, self->visual.part_table);
     }
+
+    /* M9-B: player<->player collision (registers the puppet's pipe when every arming condition holds). */
+    pc_remote_player_collide_update(self, slot, game);
 }
 
 static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
@@ -846,6 +1005,11 @@ static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot, int keep_sce
     if (!slot->in_use) {
         return;
     }
+    if (slot->collide_armed) { /* M9-B: the puppet (and so its collider) is going away */
+        printf("[NET][COLLIDE] player %d: collider DISARMED reason=gone\n", (int)(slot - s_slots));
+    }
+    slot->collide_armed = 0;
+    slot->collide_target_ok = 0;
     if (pc_remote_player_actor_is_live(slot)) {
         /* Two-phase, matching every other actor kind: this only nulls mv_proc/dw_proc. The actor
          * system reaps the memory and unlinks it from Actor_info during its normal per-frame
@@ -1051,6 +1215,23 @@ void pc_remote_player_clear_scene(PCNetPlayerId player_id) {
     }
 }
 
+/* M9-B TEST-ONLY accessor: see pc_remote_player.h. */
+int pc_remote_player_collide_test_target(float* out_x, float* out_y, float* out_z) {
+    int i;
+
+    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
+        PCRemotePlayerSlot* slot = &s_slots[i];
+        if (slot->in_use && slot->collide_target_ok && pc_remote_player_actor_is_live(slot) &&
+            (uint64_t)(uintptr_t)slot->actor < PC_LOWADDR_LIMIT) {
+            *out_x = slot->actor->world.position.x;
+            *out_y = slot->actor->world.position.y;
+            *out_z = slot->actor->world.position.z;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
     PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
     if (slot == NULL || out == NULL || !slot->scene.valid) {
@@ -1138,6 +1319,21 @@ void pc_remote_player_poll(void) {
 
     play = (GAME_PLAY*)gamePT;
     now = graph_dt_frame_time(gamePT);
+
+    /* M9-B diagnostic (read-only): peak size of the shared OC collider table, sampled once per poll. Poll runs
+     * between game frames, so this is the final count of the last completed frame. Logged only on a new peak
+     * and only while a remote player is tracked, so single-player logs stay quiet. */
+    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
+        if (s_slots[i].in_use) {
+            int n = play->collision_check.collider_num;
+            if (n > s_collide_peak_colliders) {
+                s_collide_peak_colliders = n;
+                printf("[NET][COLLIDE][DIAG] OC collider_num new peak=%d (table size %d) failed_setoc=%d\n", n,
+                       Cl_COLLIDER_NUM, s_collide_failed_setoc);
+            }
+            break;
+        }
+    }
     dump_now = graph_dt_period_elapsed(gamePT, &s_diag_dump_accum, PC_REMOTE_PLAYER_DIAG_DUMP_PERIOD_60FPS_FRAMES);
 
     pc_remote_player_init_profile();
@@ -1177,6 +1373,11 @@ void pc_remote_player_poll(void) {
          * reinitializes the Stage 4A visual too -- no separate visual-recreation code needed. */
         if (slot->actor != NULL && slot->scene_generation != s_scene_generation) {
             printf("[NET][REMOTE] player %d: scene changed -- remote-player actor was replaced, recreating\n", i);
+            if (slot->collide_armed) { /* M9-B: the old actor (and its collider) no longer exists */
+                printf("[NET][COLLIDE] player %d: collider DISARMED reason=scene\n", i);
+            }
+            slot->collide_armed = 0;
+            slot->collide_target_ok = 0;
             slot->actor = NULL;
             slot->pending_create = 1;
         }
@@ -1224,6 +1425,14 @@ void pc_remote_player_poll(void) {
 
         ((PCRemotePlayerActor*)actor)->peer = (PCNetPlayerId)i;
         ((PCRemotePlayerActor*)actor)->cosmetic_item_kind = -1;
+
+        /* M9-B: the puppet's own collision pipe (ct_proc is none_proc2, so it is built here, where the actor is
+         * created). ClObjPipe_dt only calls the trivial ClObj_dt/ClObjPipeAttr_dt (both just return 1), so no
+         * destructor is needed. HEAVY: a normal-weight local player takes the entire push (collision_vec) and the
+         * puppet none; an idle (also HEAVY) local player takes half. */
+        ClObjPipe_ct(gamePT, &((PCRemotePlayerActor*)actor)->col_pipe);
+        ClObjPipe_set5(gamePT, &((PCRemotePlayerActor*)actor)->col_pipe, actor, &s_remote_player_pipe_data);
+        actor->status_data.weight = MASSTYPE_HEAVY;
 
         /* Stage 4A: same scale/ofs_y the real player uses (Player_actor_init_value()/
          * Player_actor_ct(), src/game/m_player.c) -- required for the generic Actor_draw()'s
