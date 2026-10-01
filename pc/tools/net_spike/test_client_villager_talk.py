@@ -222,9 +222,33 @@ def run_hold_pair(port, name, log_dir, bin_dir, client_env, kill_when=None, post
             if info["off_end"] is None and "[NPC][TALKLEASE] end" in ctext:
                 info["off_end"] = len(host.log_text())
                 end_seen_at = time.monotonic()
-            if kill_when and not info["killed"] and re.search(kill_when, host.log_text()):
-                time.sleep(3.0)  # let the dialogue run a little while held
-                info["off_kill"] = len(host.log_text())
+            mk = re.search(kill_when, host.log_text()) if (kill_when and not info["killed"]) else None
+            if mk:
+                # H6: prove the hold is ACTIVE at the moment of the kill (not just that it began): host gate begun
+                # (TALKHOLD begin), no END/RELEASE/EXPIRE for the slot since the HOLD line, client lease still open.
+                slot = mk.groupdict().get("slot")
+                off_hold = mk.start()
+                info["off_hold"] = off_hold
+                info["slot"] = slot
+
+                def hold_active():
+                    ht, ct = host.log_text(), cl.log_text()
+                    region = ht[off_hold:]  # only this attempt's hold: from its HOLD line onward
+                    begins = [m_.start() for m_ in re.finditer(r"\[NPC\]\[TALKHOLD\] begin slot=%s " % slot, region)]
+                    ends = [m_.start() for m_ in re.finditer(r"\[NPC\]\[TALKHOLD\] end slot=%s " % slot, region)]
+                    gate = bool(begins) and (not ends or begins[-1] > ends[-1])  # last begin after last end
+                    ended = re.search(r"\[NPC\]\[TALKNET\] (?:END peer=\d+ slot=%s |RELEASE slot=%s |EXPIRE slot=%s )" %
+                                      (slot, slot, slot), region) is not None
+                    lease = ct.rfind("[NPC][TALKLEASE] begin") > ct.rfind("[NPC][TALKLEASE] end")
+                    return gate and lease and not ended, len(ht)
+                t_gate = time.monotonic() + 6.0
+                active, off = hold_active()
+                while not active and time.monotonic() < t_gate:
+                    time.sleep(0.1)
+                    active, off = hold_active()
+                active, off = hold_active()  # final check immediately before the kill
+                info["active_at_kill"] = active
+                info["off_kill"] = off
                 cl.stop()
                 info["killed"] = True
                 end_seen_at = time.monotonic()
@@ -236,7 +260,13 @@ def run_hold_pair(port, name, log_dir, bin_dir, client_env, kill_when=None, post
                 break
             time.sleep(0.2)
         if kill_when and info["killed"]:
-            host.wait_for_log(r"\[NPC\]\[TALKNET\] RELEASE slot=\d+ npc=0x[0-9A-F]+ \(peer \d+ reset\)", 60.0)
+            # condition-based wait (transport timeout is 5 s): the peer-reset RELEASE must appear AFTER the kill offset
+            t_rel = time.monotonic() + 15.0
+            while time.monotonic() < t_rel:
+                if re.search(r"\[NPC\]\[TALKNET\] RELEASE slot=\d+ npc=0x[0-9A-F]+ \(peer \d+ reset\)",
+                             host.log_text()[info["off_kill"]:]):
+                    break
+                time.sleep(0.2)
             time.sleep(post_s)
         info["host"] = host.log_text()
         info["client"] = cl.log_text()
@@ -366,19 +396,38 @@ def h1c_control(port, log_dir, bin_dir, check):
 
 def h6_killed_client(port, log_dir, bin_dir, check):
     print("=" * 72 + "\n[H6] client killed mid-talk -> the host's peer reset releases the hold")
-    info = run_hold_pair(port, "h6", log_dir, bin_dir, {"PC_FORCE_TALK_VILLAGER": "1"},
-                         kill_when=r"\[NPC\]\[TALKNET\] HOLD slot=\d+ npc=0x[0-9A-F]+ peers=0x(?!0000)[0-9A-F]+",
-                         post_s=8.0)
-    if info is None:
-        check("H6 host+client reached the field (retried boot)", False)
-        return
+    info = None
+    for attempt in range(3):  # a precondition miss (hold not provably active at the kill) is not a product failure
+        # PC_FORCE_TALK_HOLD_SECONDS keeps the client's dialogue open 25 s (< the 30 s host expiry; keepalive is 10 s),
+        # so the dialogue cannot finish by itself before the kill.
+        info = run_hold_pair(port, "h6" if attempt == 0 else "h6_r%d" % attempt, log_dir, bin_dir,
+                             {"PC_FORCE_TALK_VILLAGER": "1", "PC_FORCE_TALK_HOLD_SECONDS": "25"},
+                             kill_when=r"\[NPC\]\[TALKNET\] HOLD slot=(?P<slot>\d+) npc=0x[0-9A-F]+ peers=0x(?!0000)[0-9A-F]+",
+                             post_s=8.0)
+        if info is None:
+            check("H6 host+client reached the field (retried boot)", False)
+            return
+        print("    H6 attempt %d: hold active at kill = %s" % (attempt, info.get("active_at_kill")))
+        if info.get("active_at_kill"):
+            break
     h = info["host"]
+    check("H6 (0) PRECONDITION: hold provably active at the kill (TALKHOLD begin seen, no END/RELEASE/EXPIRE for the "
+          "slot since HOLD, client lease still open; <= 3 attempts)", bool(info.get("active_at_kill")))
     check("H6 (1) hold was established before the kill", info["killed"] and "[NPC][TALKNET] BEGIN" in h)
-    mr = re.search(r"\[NPC\]\[TALKNET\] RELEASE slot=(\d+) npc=0x[0-9A-F]+ \(peer \d+ reset\)", h)
-    check("H6 (2) host released the hold from the peer reset (RELEASE ... reset)", mr is not None)
+    off_hold, off_kill = info.get("off_hold", 0), info.get("off_kill", 0)
+    between = h[off_hold:off_kill]
+    after_kill = h[off_kill:]
+    mr = re.search(r"\[NPC\]\[TALKNET\] RELEASE slot=(\d+) npc=0x[0-9A-F]+ \(peer \d+ reset\)", after_kill)
+    check("H6 (2) host released the hold from the peer reset (RELEASE ... (peer N reset)) after the kill offset",
+          mr is not None)
+    pre_release = after_kill[:after_kill.index(mr.group(0))] if mr else after_kill
+    check("H6 (2b) the release was not a dialogue end or expiry (no TALKNET END peer= / EXPIRE between HOLD and the "
+          "peer-reset RELEASE)",
+          mr is not None and re.search(r"\[NPC\]\[TALKNET\] (?:END peer=\d+ slot=%s |EXPIRE slot=%s )" %
+                                       (info.get("slot"), info.get("slot")), between + pre_release) is None)
     if mr:
         slot = int(mr.group(1))
-        tail = h[h.index(mr.group(0)):]
+        tail = h[off_kill + after_kill.index(mr.group(0)):]
         after = diag_samples(tail, slot)
         check("H6 (3) host villager no longer held afterwards (held=0 samples, no held=1)",
               len(after) >= 1 and all(s[0] == 0 for s in after))
