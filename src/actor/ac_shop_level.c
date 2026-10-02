@@ -5,6 +5,9 @@
 #include "m_house.h"
 #include "m_handbill.h"
 #include "m_string.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#endif
 
 static void Shop_Level_Actor_ct(ACTOR* actorx, GAME* game);
 static void Shop_Level_Actor_dt(ACTOR* actorx, GAME* game);
@@ -220,6 +223,14 @@ static int aSL_RewriteShopFg(ACTOR* actorx, GAME* game, s16 level, s16 next_leve
 static void aSL_RenewShop(ACTOR* actorx, GAME* game) {
     int last_scene = Common_Get(last_scene_no);
 
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: renewal rewrites the town FG shop structure (and feeds the police box); that is host-owned
+     * shared state, so a network CLIENT never renews on its own stale shop copy. Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
+
     if (last_scene == SCENE_SHOP0 || last_scene == SCENE_CONVENI || last_scene == SCENE_SUPER ||
         last_scene == SCENE_DEPART || last_scene == SCENE_DEPART_2) {
         return;
@@ -279,6 +290,13 @@ static void Shop_Level_Actor_draw(ACTOR* actorx, GAME* game) {
 }
 
 static void aSL_JudgeRenewShop(ACTOR* actorx, GAME* game) {
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: scheduling a renewal (mEv_SAVED_RENEWSHOP, renewal_time, flyers) is the first half of
+     * aSL_RenewShop; a client that cannot renew must not start one either. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     if (Save_Get(scene_no) == SCENE_FG && mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == FALSE) {
         if (mSP_GetShopLevel() < mSP_GetRealShopLevel()) {
             lbRTC_time_c now_time = Common_Get(time.rtc_time);
@@ -355,6 +373,12 @@ static void aSL_JudgeRenewShop(ACTOR* actorx, GAME* game) {
 }
 
 static void aSL_ExchangeShopGoodsInGame(ACTOR* actorx, GAME* game, lbRTC_hour_t hour) {
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: in-session daily lineup/lottery re-roll is host-owned; a network CLIENT keeps its copy. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     lbRTC_time_c now_time = Common_Get(time.rtc_time);
     lbRTC_hour_t now_hour = now_time.hour;
 

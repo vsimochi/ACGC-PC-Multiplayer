@@ -679,6 +679,16 @@ static void aCR_msg_win_open_wait(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
             }
 
             aCR_set_item_name_str(item);
+
+#ifdef TARGET_PC
+            /* Stage 0 safe degrade: rows 16..27 are the "accept and put away" outcomes. Save_t.museum_display is
+             * host-owned and not replicated (v7), so a network CLIENT's donation would set a local bit and delete the
+             * item from its pocket for nothing. Use row 2 (the item Blathers does not take: msg 0x2F64 + return demo),
+             * so the item is handed back through the existing return path and the dialogue continues normally. */
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && act_idx >= 16) {
+                act_idx = 2;
+            }
+#endif
         }
 
         donate_act_p = &donate_act[act_idx];
@@ -862,6 +872,11 @@ static void aCR_return_demo_end_wait_init(NPC_CURATOR_ACTOR* curator, GAME_PLAY*
 static void aCR_putaway_demo_end_wait_init(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
     Submenu_Item_c* sm_item_p = play->submenu.item_p;
 
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade (defense in depth; aCR_msg_win_open_wait already routes a client to the return path):
+     * never commit a donation or empty the pocket on a network CLIENT. */
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT)
+#endif
     if (mMmd_RequestMuseumDisplay(sm_item_p->item) == TRUE) {
         mPr_SetPossessionItem(Common_Get(now_private), sm_item_p->slot_no, EMPTY_NO, mPr_ITEM_COND_NORMAL);
     }

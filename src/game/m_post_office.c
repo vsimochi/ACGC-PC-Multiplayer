@@ -15,6 +15,9 @@
 #include "libultra/libultra.h"
 #include "m_common_data.h"
 #include "m_scene_table.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#endif
 
 static int mPO_keep_contents(Mail_c* mail) {
     int res = FALSE;
@@ -494,6 +497,16 @@ static void mPO_first_delivery_proc() {
 }
 
 extern void mPO_business_proc(GAME_PLAY* play) {
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: post_office/mailbox delivery mutates Save_t.post_office and homes[].mailbox, which are
+     * host-owned and not replicated (v7); a client's independent postman would diverge from the host and could
+     * duplicate/lose attached gifts. A network CLIENT therefore never spawns the postman or delivers. Villager
+     * MAIL_REQUEST/MAIL_DELIVERED (m_npc.c mNpc_SendMailtoNpc intercept) does not pass through here. Not covered (deferred): mPO_first_work()'s load-time delivery and
+     * mPO_receipt_proc() queueing still touch the client's local copy. Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     if ((Common_Get(clip).demo_clip == NULL && Common_Get(clip).demo_clip2 == NULL) ||
         (Common_Get(clip).demo_clip != NULL && Common_Get(clip).demo_clip->type == mDemo_CLIP_TYPE_INTRO_DEMO)) {
         int scene = Save_Get(scene_no);

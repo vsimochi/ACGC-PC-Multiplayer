@@ -5,6 +5,9 @@
 #include "m_msg.h"
 #include "m_font.h"
 #include "m_string.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#endif
 
 enum {
     aPOL_ACT_TAISOU,
@@ -75,8 +78,17 @@ static void aPOL_actor_ct(ACTOR* actorx, GAME* game) {
         actorx->status_data.weight = MASSTYPE_HEAVY;
         actor->setup_action_proc = aPOL_setupAction;
         actor->exit_greeting = FALSE;
+#ifdef TARGET_PC
+        /* Stage 0 safe degrade: lost & found (Save_t.police_box) and the town FG are host-owned; a network CLIENT must
+         * neither keep the home-tile item into its local police_box nor reserve/clear the tile. Host/solo: unchanged. */
+        if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+            mPB_keep_item(*mFI_GetUnitFG(actorx->home.position));
+            mFI_SetFG_common(RSV_NO, actorx->home.position, TRUE);
+        }
+#else
         mPB_keep_item(*mFI_GetUnitFG(actorx->home.position));
         mFI_SetFG_common(RSV_NO, actorx->home.position, TRUE);
+#endif
     }
 }
 

@@ -14,6 +14,7 @@
 
 #ifdef TARGET_PC
 #include "pc_settings.h"
+#include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
 #endif
 
 extern mActor_name_t* mSP_ftr_list[];
@@ -1253,7 +1254,22 @@ extern void mSP_SetRenewalChiraswhi_AppoDay() {
     }
 }
 
+#ifdef TARGET_PC
+/* Set only while mSP_ShopGameStartCt() seeds a brand-new town's first lineup (see below). */
+static int s_shop_first_lineup = 0;
+#endif
+
 extern void mSP_ExchangeLineUp_InGame(GAME* game) {
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: Save_t.shop is host-owned shared town state and is NOT replicated (protocol v7), so a
+     * network CLIENT must not re-roll the daily lineup with its own RNG (every start-data-init caller runs at save-load
+     * time, before the link is READY, hence the role test rather than pc_net_game_world_is_host_authoritative()).
+     * A client with a loaded town keeps the stock stored in its own save copy; a brand-new town's first lineup is
+     * seeded by mSP_ShopGameStartCt() (s_shop_first_lineup). Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !s_shop_first_lineup) {
+        return;
+    }
+#endif
     if (mSP_CheckExchangeDay2()) {
         if (mSP_CheckExchangeMonth()) {
             mSP_LotteryLineUp_GameAlloc(game);
@@ -1531,7 +1547,15 @@ static void mSP_DecideGoodsCommonList() {
 extern void mSP_ShopGameStartCt(GAME* game) {
     mSP_DecideGoodsCommonList();
     mSP_InitShopSaveData();
+#ifdef TARGET_PC
+    /* A brand-new town has no stock at all (InitShopSaveData empties it) and nothing replicates Save_t.shop, so a
+     * network CLIENT must still seed its very first lineup here; every later re-roll stays gated. */
+    s_shop_first_lineup = 1;
+#endif
     mSP_ExchangeLineUp_InGame(game);
+#ifdef TARGET_PC
+    s_shop_first_lineup = 0;
+#endif
 }
 
 extern mActor_name_t mSP_GetNowShopBgNum() {
@@ -1737,6 +1761,13 @@ extern lbRTC_hour_t mSP_GetShopCloseTime_Bgm() {
 }
 
 extern int mSP_InRenewal() {
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: a client no longer runs aSL_RenewShop, so it would never leave the "in renewal" window if
+     * its save copy had mEv_SAVED_RENEWSHOP set; report "not in renewal" so its shop is never closed forever. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return FALSE;
+    }
+#endif
     if (mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == TRUE) {
         lbRTC_time_c renew_time = Save_Get(shop).renewal_time;
         lbRTC_time_c* rtc_time = Common_GetPointer(time.rtc_time);

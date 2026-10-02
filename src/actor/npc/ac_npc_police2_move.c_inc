@@ -454,6 +454,14 @@ static void aPOL2_check_answer(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
                 mActor_name_t* item_p = &Save_Get(police_box).keep_items[actor->item_idx];
                 int idx;
 
+#ifdef TARGET_PC
+                /* Stage 0 safe degrade: a network CLIENT's claim would only move the item into its local pockets and
+                 * clear its local copy of the host-owned lost & found (duplication). Take the existing "cannot take it"
+                 * (idx == -1, msg 0x0781) refusal: nothing is removed, the dialogue ends through the normal fall-through. */
+                if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                    idx = -1;
+                } else
+#endif
                 if (ITEM_NAME_GET_TYPE(*item_p) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT(*item_p) == ITEM1_CAT_TICKET) {
                     idx = mPlib_Get_space_putin_item_forTICKET(item_p);
                 } else {

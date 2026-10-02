@@ -79,6 +79,19 @@ int aPG_check_destination_mailbox(int idx) {
 int aPG_check_destination(Mail_c *mail){
     int res = 0;
     aPG_set_mail_address(mail);
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: Save_t.post_office / homes[].mailbox / museum records are host-owned and not replicated
+     * (v7). A network CLIENT's letter to another PLAYER (type 0) or a MUSEUM letter carrying a gift (type 2) would only
+     * be written into its local copy and lost together with the attached item. Return 1 ("no such address") so the
+     * existing refusal path hands the letter (and gift) back into the pocket slot. Letters to villagers (type 1,
+     * MAIL_REQUEST path) and gift-less museum letters are unaffected. Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT &&
+        (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER ||
+         (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO &&
+          mail->present != RSV_NO))) {
+        return 1;
+    }
+#endif
     switch (mail->header.recipient.type) {
     case 0:
         {

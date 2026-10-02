@@ -9,6 +9,9 @@
 #include "m_house.h"
 #include "m_home_h.h"
 #include "m_player.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#endif
 
 void aPG_Set_continue_msg_num(NPC_POSTGIRL_ACTOR *postgirl, int msg);
 void aPG_setupAction(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play, int action);

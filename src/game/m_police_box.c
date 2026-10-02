@@ -10,6 +10,9 @@
 #include "libultra/libultra.h"
 #include "m_lib.h"
 #include "m_shop.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#endif
 
 /**
  * @brief Copies an array of items to the lost and found.
@@ -74,6 +77,15 @@ extern int mPB_get_keep_item_sum() {
  * @param item_no The item to add
  **/
 extern void mPB_keep_item(mActor_name_t item_no) {
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: Save_t.police_box is host-owned and not replicated (v7). Every client-reachable adder
+     * (structure/house placement, tent, lighthouse, snowman, shop upgrade, event clean-up, grow before READY) funnels
+     * through here, so a network CLIENT never mutates its local copy (it would be lost/duplicated). The host's own
+     * snowman path (pc_net_game.c) and single-player are unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     if (ITEM_IS_ITEM1(item_no) || ITEM_IS_FTR(item_no)) {
         int keep_item_sum = mPB_get_keep_item_sum();
         if (keep_item_sum >= mPB_POLICE_BOX_ITEM_STORAGE_COUNT) {
@@ -141,6 +153,13 @@ extern void mPB_keep_all_item_in_block(int blk_x, int blk_z) {
         block_items++;
     }
 
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: tile clearing above stays as-is (town FG is host-authoritative); only the local police_box
+     * merge is skipped for a network CLIENT. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        count = 0;
+    }
+#endif
     if (count > 0) {
         int total_sum = count + keep_item_sum;
 
