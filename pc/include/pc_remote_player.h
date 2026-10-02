@@ -113,6 +113,11 @@ int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out
  * forgets it (a host CLEARED notice). get_scene() returns 1 and fills *out only while a scene is known. All
  * are safe for an out-of-range player_id. Pure bookkeeping: no puppet is created, moved or filtered by it. */
 int  pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* scene);
+
+/* M9-C Phase 5: a host-validated PLAYER_ACTION (cosmetic only). kind 1 = PICKUP: `item` was picked up from town tile
+ * (ut_x, ut_z). The event is only QUEUED (small per-puppet ring) and presented from the puppet's own move/draw when its
+ * pickup state shows up; it never touches the field, the inventory or any other state. Returns 1 if queued. */
+int  pc_remote_player_on_action(PCNetPlayerId player_id, int kind, int ut_x, int ut_z, uint16_t item, uint16_t seq);
 void pc_remote_player_clear_scene(PCNetPlayerId player_id);
 int  pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
 

@@ -578,6 +578,12 @@ static void EffectBG_object_dt(EffectBg_c* efbg, GAME* game);
 
 static EffectBg_c* efbg_start_p = NULL;
 
+#ifdef TARGET_PC
+/* M9-C Phase 4: set by the actor's ct, cleared by its dt. Make_EffectBG's CLIP pointer is never cleared (vanilla), so this
+ * flag is what tells the read-only pool accessors below that efbg_start_p still points at a live actor. */
+static int efbg_pc_alive = 0;
+#endif
+
 static void Effectbg_actor_ct(ACTOR* actorx, GAME* game) {
     EFFECTBG_ACTOR* effect_actor = (EFFECTBG_ACTOR*)actorx;
     mFM_field_pal_c* field_pal = mFI_GetFieldPal();
@@ -599,10 +605,16 @@ static void Effectbg_actor_ct(ACTOR* actorx, GAME* game) {
     }
 
     CLIP(make_effect_bg_proc) = &Make_EffectBG;
+#ifdef TARGET_PC
+    efbg_pc_alive = 1;
+#endif
 }
 
 static void Effectbg_actor_dt(ACTOR* actorx, GAME* game) {
     // nothing
+#ifdef TARGET_PC
+    efbg_pc_alive = 0;
+#endif
 }
 
 static int EfbgBgitemTreeCheck(xyz_t pos) {
@@ -1188,3 +1200,45 @@ static void Make_EffectBG(GAME* game, s16 type, s16 variant, xyz_t* pos) {
         EffectBG_object_ct(&efbg_start_p[idx], game, type, variant);
     }
 }
+
+#ifdef TARGET_PC
+/* M9-C Phase 4: read-only views of the 3-slot EffectBG pool for remote-player tree-shake presentation. Make_EffectBG
+ * evicts the OLDEST slot when all three are in use, so a puppet must be able to see the occupancy before it spawns.
+ * Touch nothing. Return -1 when the EffectBG actor does not exist (not yet ct'd / already dt'd). */
+int Effectbg_pc_count_active(void) {
+    int i;
+    int n = 0;
+
+    if (!efbg_pc_alive || efbg_start_p == NULL) {
+        return -1;
+    }
+    for (i = 0; i < EffectBg_ENTRY_NUM; i++) {
+        if ((efbg_start_p[i].status & EffectBg_STATUS_ACTIVE) != 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Number of active slots whose base position lies within `radius` (XZ) of `pos` (a tile centre is exactly the
+ * base_pos.x/z of the effect spawned for that tile). -1 when the actor does not exist. */
+int Effectbg_pc_count_near(const xyz_t* pos, f32 radius) {
+    int i;
+    int n = 0;
+
+    if (!efbg_pc_alive || efbg_start_p == NULL || pos == NULL) {
+        return -1;
+    }
+    for (i = 0; i < EffectBg_ENTRY_NUM; i++) {
+        if ((efbg_start_p[i].status & EffectBg_STATUS_ACTIVE) != 0) {
+            f32 dx = efbg_start_p[i].base_pos.x - pos->x;
+            f32 dz = efbg_start_p[i].base_pos.z - pos->z;
+
+            if (dx * dx + dz * dz <= radius * radius) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+#endif

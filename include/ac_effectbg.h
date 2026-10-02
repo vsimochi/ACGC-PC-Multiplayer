@@ -89,6 +89,13 @@ struct effectbg_actor_s {
 
 extern ACTOR_PROFILE Effectbg_Profile;
 
+#ifdef TARGET_PC
+/* M9-C Phase 4: read-only views of the 3-slot EffectBG pool (src/actor/ac_effectbg.c), used by the remote-player tree-shake
+ * presentation. -1 = the EffectBG actor does not exist. */
+extern int Effectbg_pc_count_active(void);
+extern int Effectbg_pc_count_near(const xyz_t* pos, f32 radius);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

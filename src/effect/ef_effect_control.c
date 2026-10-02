@@ -345,6 +345,25 @@ static int eEC_DistDeath(eEC_Effect_c* effect, GAME* game, s16 prog_idx) {
 static float eEC_dt_accum = 0.0f;
 float eEC_get_partial_tick(void) { return eEC_dt_accum; }
 
+#ifdef TARGET_PC
+/* M9-C Phase 6b: see ef_effect_control.h. Set/cleared by the remote-player puppet around ONE effect_make_proc call. */
+const xyz_t* eEC_pc_source_pos_override = NULL;
+
+/* M9-C Phase 3: read-only count of occupied effect slots (the pool has eEC_EFFECT_ACTIVE_MAX == 100) so remote-player
+ * cosmetics can back off before they could starve the local player's own effects. Touches nothing. */
+int eEC_pc_count_active(void) {
+    int i;
+    int n = 0;
+
+    for (i = 0; i < eEC_EFFECT_ACTIVE_MAX; i++) {
+        if (eEC_ctrl_work.effect_active_flags[i]) {
+            n++;
+        }
+    }
+    return n;
+}
+#endif
+
 /* Death check: lifetime <= 0 OR (legacy) timer <= 0. Once all effects use
  * lifetime, the timer arm goes away. */
 int eEC_ShouldEffectDie(const eEC_Effect_c* effect) {

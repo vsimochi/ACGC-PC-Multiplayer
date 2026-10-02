@@ -62,8 +62,19 @@ extern "C" {
  * Protocol version 6 (M9-C, host-authoritative client villager-talk hold): adds ONE new reliable
  * client -> host message, PC_NETGAME_MSG_NPC_TALK (id 45, 8 bytes): the begin/end edge of a client's local
  * talk lease on a villager. Existing layouts are unchanged; the bump exists so a v5 host (which would silently
- * ignore the unknown message and never hold the villager) and a v6 client can never interoperate unnoticed. */
-#define PC_NETGAME_PROTOCOL_VERSION 6u
+ * ignore the unknown message and never hold the villager) and a v6 client can never interoperate unnoticed.
+ *
+ * Protocol version 7 (M9-C, remote player action presentation): the BYTE LAYOUT and size (28 bytes) of
+ * PC_NETGAME_MSG_MOVE are UNCHANGED, but the formerly-always-zero int16 at offset 22 (`_reserved0`) now carries the
+ * sender's vanilla `now_main_index` (0..120) in its LOW byte and a 4-bit state-ENTRY COUNTER in bits 8..11 (bits
+ * 12..15 reserved, must be 0) -- see PCNetMoveMsg::action_state. A v6 peer would silently ignore the new field
+ * (and a v7 receiver would see a v6 sender's 0 as "no action info"), so the actions would never be presented and
+ * nobody would notice; the bump makes any v6 peer be cleanly REJECTed at IDENTITY instead (same convention as the
+ * v4 bury bump above). v7 ALSO includes ONE new reliable host -> client message, PC_NETGAME_MSG_PLAYER_ACTION (id 46,
+ * 10 bytes): a presentation-only "player X picked up item I at tile (ux,uz)" hint (kind 1 = PICKUP; the host emits it at
+ * its own commit, relays it to every READY client except the originator, and a client never sends one) -- the same
+ * unreleased v7, so no further bump. */
+#define PC_NETGAME_PROTOCOL_VERSION 7u
 
 /* SHARED-WORLD INTERACTION POLICY (intentional): the TOWN field is the one shared, host-authoritative
  * world -- pickups and drops of ground items go through the two-phase protocol below. A PRIVATE HOUSE /
@@ -211,6 +222,14 @@ typedef struct PCNetMoveSample {
     float    speed;
     uint8_t  move_state;   /* PCMoveState */
     int8_t   item_kind;    /* mirrors PLAYER_ACTOR::item_kind; -1 = none */
+    /* Protocol v7 (M9-C): decoded + range-checked PCNetMoveMsg::action_state. action_valid == 0 means "no action
+     * information" (v6-style zero field, main index 0 = DMA/boot, or an out-of-range value that was ignored): the
+     * receiver must then use the coarse move_state mapping only. Otherwise action_index is the sender's
+     * mPlayer_INDEX_* (1..120) and action_counter its 4-bit entry counter; receivers compare the (index, counter)
+     * PAIR by equality only (never ordering: the counter wraps every 16 entries). */
+    uint8_t  action_index;
+    uint8_t  action_counter;
+    uint8_t  action_valid;
 } PCNetMoveSample;
 
 /* M9-A: which scene a network player is currently in -- IDENTITY of the scene only, never gameplay state.
@@ -303,6 +322,13 @@ void pc_net_game_poll(void);
 /* --- queries --- */
 
 PCNetGameRole pc_net_game_role(void);
+
+/* Protocol v7 (M9-C): read-only observation hook called by the vanilla player code (src/game/m_player.c,
+ * Player_actor_change_main_index, TARGET_PC only) right after the LOCAL player actually entered a main index
+ * (including re-entry of the SAME index, which never changes now_main_index by itself, e.g. repeated swings, digs
+ * and pickups). It only bumps a 4-bit counter that pcnetgame_sample_local_move() later puts into the MOVE
+ * `action_state` field; it never writes anything the game reads and costs one increment when no session is active. */
+void pc_net_game_note_player_main_entry(int new_index);
 
 /* Client only: DISCONNECTED if not a client / not connecting. */
 PCNetGameLinkState pc_net_game_client_link_state(void);

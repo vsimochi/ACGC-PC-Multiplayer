@@ -421,6 +421,12 @@ typedef enum PCNetGameMsgType {
                                              * (flags=0, end) edge of ITS OWN local villager-talk lease so the
                                              * host can hold that villager still (host-authoritative hold). The
                                              * client never sends NPC positions. See PCNetGameNpcTalkMsg. */
+    PC_NETGAME_MSG_PLAYER_ACTION         = 46, /* M9-C (protocol v7): host -> READY clients ONLY, RELIABLE, 10 bytes.
+                                             * A cosmetic "this player just did X" presentation hint (kind 1 =
+                                             * PICKUP: the item id + tile the host committed). Host-originated and
+                                             * relayed to every READY client except the originating peer; a client
+                                             * never sends it and the host drops any that arrives. See
+                                             * PCNetGamePlayerActionMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -536,7 +542,13 @@ typedef struct PCNetMoveMsg {
     float    pos_y;
     float    pos_z;
     int16_t  facing_angle;  /* world.angle.y, native engine angle units */
-    int16_t  _reserved0;
+    uint16_t action_state;  /* protocol v7 (was `_reserved0`, always 0 before): low byte = sender's vanilla
+                             * now_main_index (mPlayer_INDEX_*, 0..mPlayer_INDEX_NUM-1 = 0..120), bits 8..11 = 4-bit
+                             * state-ENTRY COUNTER (bumped each time the sender's player ACTUALLY enters a main index,
+                             * incl. re-entry of the same index), bits 12..15 reserved = 0. Receivers compare the
+                             * (index, counter) pair by equality only. An out-of-range index or non-zero reserved bits
+                             * never reject the MOVE: the host zeroes the field before relaying, a receiver ignores
+                             * it (see pcnetgame_sanitize_move_action()). */
     float    speed;
 } PCNetMoveMsg;
 _Static_assert(sizeof(PCNetMoveMsg) == 28, "PCNetMoveMsg wire size drifted");
@@ -1785,6 +1797,41 @@ typedef struct PCNetGameNpcTalkMsg {
 _Static_assert(sizeof(PCNetGameNpcTalkMsg) == 8, "PCNetGameNpcTalkMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameNpcTalkMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameNpcTalkMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* M9-C (protocol v7): PLAYER_ACTION, id 46, exactly 10 bytes, RELIABLE, host -> client ONLY. PRESENTATION ONLY: the
+ * receiver never changes the field, inventory or any other state from it (the FIELD_UPDATE / host-authoritative
+ * pickup path is untouched and independent). Emitted by the host exactly where it already KNOWS the answer:
+ *   - a client's pickup, at the host's COMMIT (pcnetgame_handle_host_confirm: after the INTERACT_CONFIRM COMMIT was
+ *     validated and the tile cleared; an ABORTed/rejected/expired pickup therefore never produces one);
+ *   - the host's own pickup (pc_net_game_notify_local_field_pickup), item taken from the committed shadow value of the
+ *     tile (the pre-pickup content).
+ * The host sends it to every READY client EXCEPT the originating peer (that process already plays its own vanilla
+ * visuals) and presents it to its OWN puppet of a client origin through the same receiver function (no network loop).
+ *   net_player_id  the TRUE originating player id (a READY peer id, or PC_NETGAME_HOST_PLAYER_ID); host-assigned
+ *   kind           PC_NETGAME_PLAYER_ACTION_KIND_*; unknown kinds are ignored (reserved for DIG/FILL/...)
+ *   flags          reserved, must be 0 (a receiver ignores a message with unknown bits)
+ *   ut_x, ut_z     the town unit (tile) the item was on (same u8 width as PICKUP_REQUEST / the host records)
+ *   item           the raw ground item id that was picked up (what the vanilla flying item shows); non-zero
+ *   seq            host-assigned per-ORIGIN u16 sequence, monotonic for the host session (NOT reset when a peer
+ *                  reconnects: receivers keep their per-origin last value until their own session resets); a client
+ *                  accepts only (int16_t)(seq - last) > 0 (wrap-safe), so a duplicate/stale one is dropped. */
+#define PC_NETGAME_PLAYER_ACTION_KIND_PICKUP 1u
+typedef struct PCNetGamePlayerActionMsg {
+    uint8_t  msg_type;      /* PC_NETGAME_MSG_PLAYER_ACTION */
+    uint8_t  net_player_id; /* originating player id (host-assigned) */
+    uint8_t  kind;
+    uint8_t  flags;         /* reserved 0 */
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t item;
+    uint16_t seq;
+} PCNetGamePlayerActionMsg;
+_Static_assert(sizeof(PCNetGamePlayerActionMsg) == 10, "PCNetGamePlayerActionMsg wire size drifted");
+_Static_assert(offsetof(PCNetGamePlayerActionMsg, kind) == 2 && offsetof(PCNetGamePlayerActionMsg, ut_x) == 4 &&
+                   offsetof(PCNetGamePlayerActionMsg, item) == 6 && offsetof(PCNetGamePlayerActionMsg, seq) == 8,
+               "PCNetGamePlayerActionMsg field offsets drifted");
+_Static_assert(sizeof(PCNetGamePlayerActionMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGamePlayerActionMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
 /* Two-phase interactions: client -> host, reliable, exactly 8 bytes (little-endian, natural
  * alignment). Answers a provisional RESULT (accepted == 1) -- or withdraws from a request the client
@@ -3148,6 +3195,57 @@ static int pcnetgame_is_real_player_actor(PLAYER_ACTOR* local) {
     return dlftbl->profile->class_size >= sizeof(PLAYER_ACTOR);
 }
 
+/* Protocol v7: the MOVE `action_state` field. Low byte = vanilla now_main_index, bits 8..11 = entry counter. */
+#define PC_NETGAME_ACTION_INDEX_MASK 0x00FFu
+#define PC_NETGAME_ACTION_COUNTER_SHIFT 8
+#define PC_NETGAME_ACTION_COUNTER_MASK 0x0Fu
+#define PC_NETGAME_ACTION_RESERVED_MASK 0xF000u
+
+/* 4-bit state-entry counter of the LOCAL player (see pc_net_game_note_player_main_entry()). */
+static uint8_t s_local_main_entry_counter = 0;
+
+/* Read-only observation hook, called from the vanilla Player_actor_change_main_index() (src/game/m_player.c,
+ * TARGET_PC only) after the local player's setup_main_<X>() ran, i.e. the player ACTUALLY entered `new_index` --
+ * including a re-entry of the very same index (repeated swing/dig/pickup), which an edge detector on now_main_index
+ * can never see. Only the local player's change_main_index calls this (a puppet is not a PLAYER_ACTOR and never runs
+ * it). It writes nothing the game reads and is one increment when no session is active (the counter is simply
+ * unused outside a session: the receiver compares (index, counter) by equality only). */
+void pc_net_game_note_player_main_entry(int new_index) {
+    (void)new_index;
+    s_local_main_entry_counter = (uint8_t)((s_local_main_entry_counter + 1u) & PC_NETGAME_ACTION_COUNTER_MASK);
+}
+
+static uint16_t pcnetgame_encode_action_state(int now_main_index, uint8_t counter) {
+    if (now_main_index < 0 || now_main_index > (int)PC_NETGAME_ACTION_INDEX_MASK || now_main_index >= mPlayer_INDEX_NUM) {
+        return 0;
+    }
+    return (uint16_t)(((uint16_t)(counter & PC_NETGAME_ACTION_COUNTER_MASK) << PC_NETGAME_ACTION_COUNTER_SHIFT) |
+                      (uint16_t)now_main_index);
+}
+
+/* 1 if `action_state` is well formed: main index < mPlayer_INDEX_NUM (121) and the reserved bits are zero. Index 0
+ * (mPlayer_INDEX_DMA, boot) is well formed but carries no information (see pcnetgame_move_msg_to_sample()). */
+static int pcnetgame_action_state_wellformed(uint16_t action_state) {
+    return (action_state & PC_NETGAME_ACTION_RESERVED_MASK) == 0u &&
+           (int)(action_state & PC_NETGAME_ACTION_INDEX_MASK) < (int)mPlayer_INDEX_NUM;
+}
+
+/* Never rejects the MOVE: a malformed action_state is only zeroed (movement keeps working). The host does this
+ * before relaying (so no peer ever sees a malformed field from the host); a client does it on receive (a relay from
+ * the host, or the host's own MOVE). Rate-limited, verbose-only log of the first few. */
+static uint32_t s_bad_action_count = 0;
+static void pcnetgame_sanitize_move_action(PCNetMoveMsg* msg, const char* side, int id) {
+    if (pcnetgame_action_state_wellformed(msg->action_state)) {
+        return;
+    }
+    ++s_bad_action_count;
+    if (g_pc_verbose && s_bad_action_count <= 8u) {
+        printf("[NET] %s %d: MOVE action_state 0x%04x malformed (index>=%d or reserved bits) -> zeroed, MOVE kept [%u so far]\n",
+               side, id, (unsigned)msg->action_state, (int)mPlayer_INDEX_NUM, (unsigned)s_bad_action_count);
+    }
+    msg->action_state = 0;
+}
+
 /* Stage 3: read-only sample of the local player, for sending. Never writes to `local`. Caller
  * must have already verified pcnetgame_is_real_player_actor(local). */
 static void pcnetgame_sample_local_move(PLAYER_ACTOR* local, PCNetMoveMsg* msg) {
@@ -3159,6 +3257,9 @@ static void pcnetgame_sample_local_move(PLAYER_ACTOR* local, PCNetMoveMsg* msg) 
                               * PCNetMoveMsg doc comment) */
     msg->move_state = (uint8_t)pcnetgame_classify_move_state(local->now_main_index);
     msg->item_kind = (int8_t)local->item_kind;
+    /* Protocol v7: the exact vanilla main index + the entry counter (see pc_net_game_note_player_main_entry()). An
+     * out-of-range index (cannot happen for a live player actor) is sent as 0 = "no action info". */
+    msg->action_state = pcnetgame_encode_action_state(local->now_main_index, s_local_main_entry_counter);
     msg->frame = ++s_local_move_send_counter;
     msg->pos_x = actor->world.position.x;
     msg->pos_y = actor->world.position.y;
@@ -3188,6 +3289,19 @@ static void pcnetgame_move_msg_to_sample(const PCNetMoveMsg* in, PCNetMoveSample
     sample->speed = in->speed;
     sample->move_state = in->move_state;
     sample->item_kind = in->item_kind;
+    /* Protocol v7: only a well-formed, non-zero index carries action information (callers sanitize first; this
+     * re-check keeps the sample safe regardless of the caller). */
+    if (pcnetgame_action_state_wellformed(in->action_state) &&
+        (in->action_state & PC_NETGAME_ACTION_INDEX_MASK) != 0u) {
+        sample->action_index = (uint8_t)(in->action_state & PC_NETGAME_ACTION_INDEX_MASK);
+        sample->action_counter =
+            (uint8_t)((in->action_state >> PC_NETGAME_ACTION_COUNTER_SHIFT) & PC_NETGAME_ACTION_COUNTER_MASK);
+        sample->action_valid = 1;
+    } else {
+        sample->action_index = 0;
+        sample->action_counter = 0;
+        sample->action_valid = 0;
+    }
 }
 
 /* A peer-supplied world position is usable only if every coordinate is finite and within
@@ -3237,7 +3351,9 @@ static void pcnetgame_note_bad_move(const char* side, int id, const PCNetMoveMsg
  * avatar nor poison the position later read by pickup/drop validation), plus stale/duplicate
  * rejection inside pc_remote_player_on_move(). No movement/physics validation, no anti-cheat --
  * explicitly out of scope for Stage 3. */
-static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in) {
+static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_wire) {
+    PCNetMoveMsg msg = *in_wire; /* private copy: action_state may be zeroed below (never the position fields) */
+    const PCNetMoveMsg* in = &msg;
     PCNetMoveSample sample;
     int i;
 
@@ -3248,6 +3364,7 @@ static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in)
         pcnetgame_note_bad_move("host: peer", (int)peer, in);
         return;
     }
+    pcnetgame_sanitize_move_action(&msg, "host: peer", (int)peer); /* v7: zero a malformed action_state, keep the MOVE */
 
     pcnetgame_move_msg_to_sample(in, &sample);
     pc_remote_player_on_move((PCNetPlayerId)peer, &sample); /* the host's own view of this client */
@@ -3266,12 +3383,15 @@ static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in)
 /* Client side: a movement message from the host -- either the host's own movement
  * (net_player_id == PC_NETGAME_HOST_PLAYER_ID) or another client's, relayed. Both cases end up in
  * the same per-player-id tracking table; see pc_remote_player_on_move(). */
-static void pcnetgame_handle_client_move(const PCNetMoveMsg* in) {
+static void pcnetgame_handle_client_move(const PCNetMoveMsg* in_wire) {
+    PCNetMoveMsg msg = *in_wire; /* private copy: action_state may be zeroed below */
+    const PCNetMoveMsg* in = &msg;
     PCNetMoveSample sample;
     if (!pcnetgame_move_msg_valid(in)) {
         pcnetgame_note_bad_move("client: relayed player", (int)in->net_player_id, in);
         return; /* never let a non-finite/absurd position reach pc_remote_player's interpolation */
     }
+    pcnetgame_sanitize_move_action(&msg, "client: relayed player", (int)in->net_player_id); /* v7: ignore a malformed field */
     pcnetgame_move_msg_to_sample(in, &sample);
     pc_remote_player_on_move((PCNetPlayerId)in->net_player_id, &sample);
 }
@@ -3498,6 +3618,100 @@ static void pcnetgame_handle_client_player_scene(const PCNetGamePlayerSceneMsg* 
                (unsigned)in->net_player_id, (unsigned)s.scene_id, (unsigned)s.kind, (unsigned)s.owner,
                (unsigned)s.flags, (unsigned)s.seq);
     }
+}
+
+/* ---- M9-C Phase 5: PLAYER_ACTION (cosmetic pickup presentation hint, host -> client) ---- */
+static uint16_t s_action_seq_out[PC_NET_MAX_PEERS + 1];   /* host: last seq assigned per origin id (peer ids + the host) */
+static uint16_t s_action_last_seq[PC_NET_MAX_PEERS + 1];  /* client: last accepted seq per origin id */
+static uint8_t  s_action_last_valid[PC_NET_MAX_PEERS + 1];
+
+static int pcnetgame_action_diag(void) {
+    static int s_d = -1;
+    if (s_d < 0) {
+        const char* e = getenv("PC_PUPPET_DIAG");
+        s_d = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return s_d;
+}
+
+/* Host only. `origin` = a READY peer id or PC_NETGAME_HOST_PLAYER_ID. Sends to every READY client except the origin peer and
+ * presents locally for a client origin. The caller has already committed the tile; nothing here touches the field. */
+static void pcnetgame_host_emit_player_action(int origin, uint8_t kind, int ut_x, int ut_z, uint16_t item) {
+    PCNetGamePlayerActionMsg m;
+    int i, sent = 0;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || kind != (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_PICKUP) {
+        return;
+    }
+    if (origin < 0 || origin > (int)PC_NETGAME_HOST_PLAYER_ID || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 ||
+        item == 0u || item == 0xFFFFu) {
+        return;
+    }
+    if (origin < PC_NET_MAX_PEERS) {
+        if (s_host_peer_link[origin] != PC_NETGAME_LINK_READY || !s_host_peer[origin].ctx_valid ||
+            !(s_host_peer[origin].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            return; /* a peer that is not READY / not in the town field never gets a presentation event */
+        }
+    } else if (!pcfa_scene_is_town()) {
+        return;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION;
+    m.net_player_id = (uint8_t)origin;
+    m.kind = kind;
+    m.ut_x = (uint8_t)ut_x;
+    m.ut_z = (uint8_t)ut_z;
+    m.item = item;
+    s_action_seq_out[origin] = (uint16_t)(s_action_seq_out[origin] + 1u);
+    m.seq = s_action_seq_out[origin];
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (i != origin && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            if (pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+                sent++;
+            }
+        }
+    }
+    if (origin < PC_NET_MAX_PEERS) {
+        /* the host process renders this client's puppet itself: same receiver, no network loop */
+        (void)pc_remote_player_on_action((PCNetPlayerId)origin, (int)kind, ut_x, ut_z, item, m.seq);
+    }
+    if (pcnetgame_action_diag()) {
+        printf("[NET][ACTION][DIAG] host: PLAYER_ACTION kind=%u origin=%d seq=%u tile=(%d,%d) item=0x%04X relayed_to=%d\n",
+               (unsigned)kind, origin, (unsigned)m.seq, ut_x, ut_z, (unsigned)item, sent);
+    }
+}
+
+/* Client: the host's PLAYER_ACTION (about the host or a relayed peer). Presentation hint only. */
+static void pcnetgame_handle_client_player_action(const PCNetGamePlayerActionMsg* in) {
+    int origin = (int)in->net_player_id;
+    int acre = 0;
+
+    if (s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (origin > (int)PC_NETGAME_HOST_PLAYER_ID ||
+        (origin != (int)PC_NETGAME_HOST_PLAYER_ID && (PCNetPlayerId)origin == (PCNetPlayerId)s_client_assigned_peer_id)) {
+        return; /* out of range, or "about me" (the originator plays its own visuals) */
+    }
+    if (in->kind != (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_PICKUP || in->flags != 0 || in->item == 0u ||
+        in->item == 0xFFFFu || !pcfa_town_ut_to_acre_tile((int)in->ut_x, (int)in->ut_z, &acre, NULL)) {
+        if (pcnetgame_action_diag()) {
+            printf("[NET][ACTION][DIAG] client: ignored invalid PLAYER_ACTION (kind=%u flags=0x%02X tile=(%u,%u) item=0x%04X)\n",
+                   (unsigned)in->kind, (unsigned)in->flags, (unsigned)in->ut_x, (unsigned)in->ut_z, (unsigned)in->item);
+        }
+        return;
+    }
+    if (s_action_last_valid[origin] && (int16_t)(uint16_t)(in->seq - s_action_last_seq[origin]) <= 0) {
+        if (pcnetgame_action_diag()) {
+            printf("[NET][ACTION][DIAG] client: stale/duplicate PLAYER_ACTION origin=%d seq=%u (last %u) ignored\n", origin,
+                   (unsigned)in->seq, (unsigned)s_action_last_seq[origin]);
+        }
+        return;
+    }
+    s_action_last_seq[origin] = in->seq;
+    s_action_last_valid[origin] = 1;
+    (void)pc_remote_player_on_action((PCNetPlayerId)origin, (int)in->kind, (int)in->ut_x, (int)in->ut_z, in->item,
+                                     in->seq);
 }
 
 /* Host: `peer` was READY and is gone (disconnect/timeout/drop/reject). Its own slot is cleared by
@@ -8662,6 +8876,12 @@ static void pcnetgame_handle_host_confirm(PCNetPeerId peer, const PCNetGameInter
     printf("[NET][%s] host: peer %d request %u committed tile (%d,%d) 0x%04X -> 0x%04X\n", tag, (int)peer,
            (unsigned)rec->request_id, (int)rec->ut_x, (int)rec->ut_z, (unsigned)cur, (unsigned)new_value);
     pcnetgame_host_flush_mask((uint32_t)1u << rec->acre); /* the single commit path: shadow + world_seq + FIELD_UPDATE to every READY peer */
+    if (is_pickup) {
+        /* M9-C Phase 5: presentation-only hint, after the authoritative commit above (never for ABORT/failed COMMIT, which
+         * returned earlier). rec->raw_item = the ground item the pickup really took. */
+        pcnetgame_host_emit_player_action((int)peer, (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_PICKUP, (int)rec->ut_x,
+                                          (int)rec->ut_z, rec->raw_item);
+    }
 }
 
 /* ---- client side of the two-phase interactions ---- */
@@ -10387,6 +10607,15 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION) {
+        /* M9-C: PLAYER_ACTION is host -> client only; a client never originates it. Dropped, never relayed. */
+        if (pcnetgame_action_diag()) {
+            printf("[NET][ACTION][DIAG] host: peer %d sent a client-originated PLAYER_ACTION (size %u) -- dropped\n",
+                   (int)peer, (unsigned)size);
+        }
+        return;
+    }
+
     if (size == sizeof(PCNetGamePickupRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PICKUP_REQUEST) {
         PCNetGamePickupRequestMsg pr;
         memcpy(&pr, data, sizeof(pr));
@@ -10496,6 +10725,13 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCNetGamePlayerSceneMsg ps;
         memcpy(&ps, data, sizeof(ps));
         pcnetgame_handle_client_player_scene(&ps);
+        return;
+    }
+
+    if (size == sizeof(PCNetGamePlayerActionMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION) {
+        PCNetGamePlayerActionMsg pa;
+        memcpy(&pa, data, sizeof(pa));
+        pcnetgame_handle_client_player_action(&pa);
         return;
     }
 
@@ -10800,6 +11036,8 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_host_local_drop_landing, 0, sizeof(s_host_local_drop_landing)); /* (host-only, harmless here) */
     s_local_scene_sent = 0; /* M9-A: a new connection must re-announce the (still live) local scene */
     s_npc_talk_seq = 0; /* M9-C: new session: sequence restarts; the NPC edge code drops its sent bits on the epoch */
+    memset(s_action_last_seq, 0, sizeof(s_action_last_seq)); /* M9-C Phase 5: per-origin PLAYER_ACTION seq memory */
+    memset(s_action_last_valid, 0, sizeof(s_action_last_valid));
     s_npc_talk_epoch++;
     memset(s_client_talk_out, 0, sizeof(s_client_talk_out)); /* keepalive table dies with the session */
     {
@@ -10897,6 +11135,7 @@ static void pcnetgame_reset_client_session_state(void) {
 static void pcnetgame_reset_host_world_state(void) {
     int i;
     memset(&s_host_local_drop_landing, 0, sizeof(s_host_local_drop_landing)); /* no stale arm across sessions */
+    memset(s_action_seq_out, 0, sizeof(s_action_seq_out)); /* M9-C Phase 5: PLAYER_ACTION seq restarts per host session (see PCNetGamePlayerActionMsg) */
     for (i = 0; i < PC_NET_MAX_PEERS; i++) {
         s_host_peer_link[i] = PC_NETGAME_LINK_DISCONNECTED;
         pcnetgame_reset_all_host_peer_state((PCNetPeerId)i);
@@ -13373,7 +13612,27 @@ void pc_net_game_notify_local_field_pickup(int ut_x, int ut_z) {
     if (!pcfa_scene_is_town()) {
         return;
     }
-    pcnetgame_host_commit_town_ut(ut_x, ut_z);
+    {
+        /* M9-C Phase 5: the tile is already cleared here, but the committed SHADOW still holds its pre-pickup value (the
+         * flush below is what updates it), so the picked item id is read from there (no vanilla seam touched).
+         * Known edge (review R2-L2, cosmetic only, logic deliberately unchanged): if the tile changed EARLIER in the same frame
+         * before the per-poll flush (for example a host drop + pickup of the same tile in one frame), the shadow is stale: no
+         * PICKUP event is emitted (shadow EMPTY) or the event shows the previous item (stale value). */
+        int a_acre = 0, a_tile = 0;
+        uint16_t prev_item = (uint16_t)EMPTY_NO, now_item = 0;
+        int have_prev = s_host_world_ready && pcfa_town_ut_to_acre_tile(ut_x, ut_z, &a_acre, &a_tile) &&
+                        pcnetgame_dep_bit(s_shadow_known[a_acre], a_tile);
+
+        if (have_prev) {
+            prev_item = s_shadow_items[a_acre][a_tile];
+        }
+        pcnetgame_host_commit_town_ut(ut_x, ut_z);
+        if (have_prev && prev_item != (uint16_t)EMPTY_NO && pcfa_get_tile(a_acre, a_tile, &now_item) &&
+            now_item == (uint16_t)EMPTY_NO) {
+            pcnetgame_host_emit_player_action((int)PC_NETGAME_HOST_PLAYER_ID, (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_PICKUP,
+                                              ut_x, ut_z, prev_item);
+        }
+    }
 }
 
 /* (Stage 5B-3's s_host_local_drop_landing is declared with the other module state, above.) */

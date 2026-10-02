@@ -433,6 +433,18 @@ extern ACTOR_PROFILE Effect_Control_Profile;
 /* NOTE: you must include 'm_common_data.h' to use this macro */
 #define eEC_CLIP (Common_Get(clip).effect_clip)
 
+#ifdef TARGET_PC
+/* M9-C Phase 6b: remote-player (puppet) presentation of the shovel effects. ef_dig_hole.c / ef_dig_scoop.c read the LOCAL
+ * player actor's position in their init (they average the target with the point 30 units in front of the digger). The
+ * puppet sets this pointer to ITS OWN world position immediately around a single effect_make_proc call and clears it right
+ * after; the two effect inits consult it ONLY when it is non-NULL. NULL (the default, and every local/host/single-player
+ * spawn) = unchanged behaviour: the local player is read exactly as before. Nothing else uses it and nothing persists. */
+extern const xyz_t* eEC_pc_source_pos_override;
+
+/* M9-C Phase 3: read-only count of occupied effect slots (src/effect/ef_effect_control.c). */
+extern int eEC_pc_count_active(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

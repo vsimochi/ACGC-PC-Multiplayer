@@ -1057,7 +1057,13 @@ PC_NETGAME_SCENE_FLAG_CLEARED = 0x80
 PC_NETGAME_MSG_NPC_TALK = 45
 PC_NETGAME_NPC_TALK_FLAG_BEGIN = 0x01
 
-PC_NETGAME_PROTOCOL_VERSION = 6  # M9-C: NPC_TALK (id 45, 8 bytes) -- client villager-talk hold
+# M9-C Phase 5: PLAYER_ACTION (id 46, 10 bytes, reliable, HOST -> client only; presentation hint, kind 1 = PICKUP) --
+# see PCNetGamePlayerActionMsg (pc_net_game.c). A client never originates it; the host drops any that arrives.
+PC_NETGAME_MSG_PLAYER_ACTION = 46
+PC_NETGAME_PLAYER_ACTION_KIND_PICKUP = 1
+PLAYER_ACTION_FMT = "<BBBBBBHH"  # msg_type, net_player_id, kind, flags, ut_x, ut_z, item, seq
+
+PC_NETGAME_PROTOCOL_VERSION = 7  # M9-C: v6 NPC_TALK (id 45); v7 MOVE action_state (main index + entry counter), same 28-byte layout, + PLAYER_ACTION (id 46)
 
 PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1  # 8-byte REJECT
 PC_NETGAME_REJECT_SERVER_FULL = 2        # reserved, never sent
@@ -1108,7 +1114,18 @@ IDENTITY_FMT = "<BBHI8s8sHHI"           # PCNetGameIdentityMsg v2, 32 bytes (ver
 ACK_FMT = "<BBHI8s8sHHI"                # PCNetGameIdentityAckMsg v2, 32 bytes
 REJECT_FMT = "<BBHI"                    # PCNetGameRejectMsg, 8 bytes (also the prefix of the 24-byte form)
 REJECT_TOWN_FMT = "<BBHI8sHHI"          # PCNetGameRejectTownMsg, 24 bytes
-MOVE_FMT = "<BBBbIfffhhf"               # PCNetMoveMsg, 28 bytes
+MOVE_FMT = "<BBBbIfffhHf"               # PCNetMoveMsg, 28 bytes (v7: the u16 at offset 22 is action_state)
+# v7 MOVE action_state: low byte = vanilla now_main_index (0..120, NUM = 121), bits 8..11 = 4-bit state-entry counter,
+# bits 12..15 reserved (must be 0). A malformed value is zeroed by the host (never rejects the MOVE).
+MOVE_ACTION_INDEX_NUM = 121
+MOVE_ACTION_COUNTER_SHIFT = 8
+MOVE_ACTION_COUNTER_MASK = 0x0F
+
+
+def move_action_state(main_index, entry_counter=0):
+    """Encodes the v7 MOVE action_state: (counter & 0xF) << 8 | main_index (no range check on purpose, so tests can
+    send out-of-range indices; use action_state=<raw> in build_move for arbitrary reserved bits)."""
+    return ((entry_counter & MOVE_ACTION_COUNTER_MASK) << MOVE_ACTION_COUNTER_SHIFT) | (main_index & 0xFF)
 APPEARANCE_HDR_FMT = "<BBBBHBB"         # PCNetGameAppearanceMsg header
 APPEARANCE_MSG_SIZE = 576
 PICKUP_REQUEST_FMT = "<BBBBI"           # 8 bytes
@@ -1255,7 +1272,7 @@ REJECT_TOWN_SPEC = build_msg_spec(
 MOVE_SPEC = build_msg_spec(
     PC_NETGAME_MSG_MOVE, MOVE_FMT,
     ["msg_type", "net_player_id", "move_state", "item_kind", "frame", "pos_x", "pos_y", "pos_z",
-     "facing_angle", "reserved0", "speed"],
+     "facing_angle", "action_state", "speed"],
     "MoveFields")
 APPEARANCE_SPEC = build_msg_spec(
     PC_NETGAME_MSG_APPEARANCE, APPEARANCE_HDR_FMT,
@@ -1348,6 +1365,11 @@ MAIL_DELIVERED_SPEC = build_msg_spec(
      "world_seq", "letter"],
     "MailDeliveredFields")
 
+PLAYER_ACTION_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_PLAYER_ACTION, PLAYER_ACTION_FMT,
+    ["msg_type", "net_player_id", "kind", "flags", "ut_x", "ut_z", "item", "seq"], "PlayerActionFields")
+assert PLAYER_ACTION_SPEC.size == 10
+
 GAME_SPECS = {
     s.msg_type: s
     for s in (IDENTITY_SPEC, IDENTITY_ACK_SPEC, REJECT_SPEC, MOVE_SPEC, APPEARANCE_SPEC, PICKUP_REQUEST_SPEC,
@@ -1355,7 +1377,7 @@ GAME_SPECS = {
               SNAPSHOT_BEGIN_SPEC, FIELD_BLOCK_SPEC, SNAPSHOT_END_SPEC, WORLD_META_SPEC, RESYNC_REQUEST_SPEC,
               INTERACT_CONFIRM_SPEC, VILLAGER_ARRIVAL_SPEC, VILLAGER_DEPARTURE_SPEC, VILLAGER_SNAPSHOT_SPEC,
               FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
-              MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC)
+              MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
@@ -1444,9 +1466,13 @@ def field_update_tuple(fields):
 
 # --- builders --------------------------------------------------------------------------------------
 
-def build_move(frame, x, y, z, angle=0, speed=0.0, move_state=1, item_kind=-1, net_player_id=0):
+def build_move(frame, x, y, z, angle=0, speed=0.0, move_state=1, item_kind=-1, net_player_id=0, action_state=0,
+               main_index=None, entry_counter=0):
+    """PCNetMoveMsg. `action_state` is the raw u16 (v7); or pass `main_index` (+ `entry_counter`) to encode it."""
+    if main_index is not None:
+        action_state = move_action_state(main_index, entry_counter)
     return struct.pack(MOVE_FMT, PC_NETGAME_MSG_MOVE, net_player_id, move_state, item_kind, frame & U32_MASK,
-                       x, y, z, angle, 0, speed)
+                       x, y, z, angle, action_state & 0xFFFF, speed)
 
 
 class F32Bits(int):
@@ -1467,11 +1493,11 @@ def _f32_bytes(v):
     return struct.pack("<f", v)
 
 
-def build_move_any(frame, x, y, z, angle=0, speed=0.0, move_state=1, item_kind=-1, net_player_id=0):
+def build_move_any(frame, x, y, z, angle=0, speed=0.0, move_state=1, item_kind=-1, net_player_id=0, action_state=0):
     """build_move() whose x/y/z/speed may be python floats (incl. nan/inf/1e30) or F32Bits raw bit patterns.
     Byte-identical to build_move() for ordinary floats."""
     head = struct.pack("<BBBbI", PC_NETGAME_MSG_MOVE, net_player_id, move_state, item_kind, frame & U32_MASK)
-    tail = struct.pack("<hh", angle, 0)
+    tail = struct.pack("<hH", angle, action_state & 0xFFFF)
     return head + _f32_bytes(x) + _f32_bytes(y) + _f32_bytes(z) + tail + _f32_bytes(speed)
 
 
@@ -1793,8 +1819,11 @@ class FakeClient(TransportClient):
         msg = build_move(self.move_frame, x, y, z, angle=facing, speed=0.0, move_state=0, item_kind=-1)
         return self.send_reliable(msg) if CLAIM_POSITION_RELIABLE else self.send_unreliable(msg)
 
-    def send_move(self, frame, x, y, z, angle=0, speed=0.0, move_state=1, item_kind=-1, reliable=False):
-        msg = build_move(frame, x, y, z, angle=angle, speed=speed, move_state=move_state, item_kind=item_kind)
+    def send_move(self, frame, x, y, z, angle=0, speed=0.0, move_state=1, item_kind=-1, reliable=False,
+                  action_state=0, main_index=None, entry_counter=0):
+        """v7: `action_state` (raw u16) or `main_index`/`entry_counter` (encoded) fill the MOVE action field."""
+        msg = build_move(frame, x, y, z, angle=angle, speed=speed, move_state=move_state, item_kind=item_kind,
+                         action_state=action_state, main_index=main_index, entry_counter=entry_counter)
         return self.send_reliable(msg) if reliable else self.send_unreliable(msg)
 
     def send_move_any(self, x, y, z, speed=0.0, facing=0, reliable=True, frame=None, move_state=0):
@@ -1968,6 +1997,19 @@ class FakeClient(TransportClient):
         """Decoded FIELD_UPDATE v2 tuples (non-consuming) delivered at inbox index >= mark."""
         return [m.game for m in self.inbox.peek_all(p_msg_type(PC_NETGAME_MSG_FIELD_UPDATE, (CH_RELIABLE,)),
                                                      since=mark) if m.game is not None]
+
+    def player_actions_since(self, mark=None):
+        """Decoded PLAYER_ACTION (id 46) tuples (non-consuming) delivered at inbox index >= mark."""
+        return [m.game for m in self.inbox.peek_all(p_msg_type(PC_NETGAME_MSG_PLAYER_ACTION, (CH_RELIABLE,)), since=mark)
+                if m.game is not None]
+
+    def send_player_action(self, net_player_id=0, kind=PC_NETGAME_PLAYER_ACTION_KIND_PICKUP, flags=0, ut_x=40, ut_z=40,
+                           item=0x2800, seq=1, raw=None):
+        """A CLIENT-ORIGINATED PLAYER_ACTION (reliable): the host must drop it (clients never originate it)."""
+        payload = raw if raw is not None else struct.pack(PLAYER_ACTION_FMT, PC_NETGAME_MSG_PLAYER_ACTION,
+                                                          net_player_id & 0xFF, kind & 0xFF, flags & 0xFF, ut_x & 0xFF,
+                                                          ut_z & 0xFF, item & 0xFFFF, seq & 0xFFFF)
+        return self.send_reliable(payload)
 
     def take_game(self, msg_type, since=None):
         """Consume every decoded message of msg_type already received."""
@@ -2418,6 +2460,24 @@ def parse_host_port(argv, usage):
 GAME_BIN_DIR = os.environ.get("NET_SPIKE_GAME_BIN",
                               os.path.abspath(os.path.join(HERE, "..", "..", "build64", "bin")))
 GAME_EXE_NAME = "AnimalCrossing.exe"
+LIVE_GAME_BIN_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "build64", "bin"))  # holds the LIVE save
+
+
+def require_test_bin_dir():
+    """Safety guard for tests that write the game's save (M9-C review M1). Resolves the bin directory exactly as HostProcess /
+    ClientProcess do (GAME_BIN_DIR: NET_SPIKE_GAME_BIN or the pc/build64/bin default) and REFUSES (message + exit code 2) when
+    it is the live pc/build64/bin directory, unless NET_SPIKE_ALLOW_LIVE_BIN=1. Call it at the top of a test's main(); it is
+    never called at import time and changes nothing for tests that do not call it."""
+    import sys
+
+    def norm(p):
+        return os.path.normcase(os.path.realpath(os.path.abspath(p)))
+
+    if norm(GAME_BIN_DIR) == norm(LIVE_GAME_BIN_DIR) and os.environ.get("NET_SPIKE_ALLOW_LIVE_BIN") != "1":
+        print("REFUSING to run: the game bin dir resolves to the LIVE build directory (%s), which holds the live save.\n"
+              "Set NET_SPIKE_GAME_BIN to an absolute path of a test copy (e.g. pc\\build64\\bin_talkfix), or set "
+              "NET_SPIKE_ALLOW_LIVE_BIN=1 to override explicitly." % LIVE_GAME_BIN_DIR, file=sys.stderr)
+        sys.exit(2)
 
 
 class HostProcess:

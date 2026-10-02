@@ -105,15 +105,15 @@ check("12 bytes fits PC_NET_MAX_PAYLOAD (1024)", SIZE <= 1024)
 check("PLAYER_SCENE id 44 is not one of the existing ids 1..43", MSG_TYPE_PLAYER_SCENE not in EXISTING)
 check("PLAYER_SCENE id 44 is the next free id after WILDLIFE_DESPAWN (43)", MSG_TYPE_PLAYER_SCENE == 43 + 1)
 check("net_spike_lib.PC_NETGAME_MSG_PLAYER_SCENE == 44", L.PC_NETGAME_MSG_PLAYER_SCENE == 44)
-check("net_spike_lib.PC_NETGAME_PROTOCOL_VERSION == 6", L.PC_NETGAME_PROTOCOL_VERSION == 6)
+check("net_spike_lib.PC_NETGAME_PROTOCOL_VERSION == 7", L.PC_NETGAME_PROTOCOL_VERSION == 7)
 hsrc = open(os.path.join(PC_DIR, "include", "pc_net_game.h"), encoding="utf-8").read()
-check("pc_net_game.h PC_NETGAME_PROTOCOL_VERSION == 6u",
-      re.search(r"#define PC_NETGAME_PROTOCOL_VERSION 6u", hsrc) is not None)
+check("pc_net_game.h PC_NETGAME_PROTOCOL_VERSION == 7u",
+      re.search(r"#define PC_NETGAME_PROTOCOL_VERSION 7u", hsrc) is not None)
 csrc = open(os.path.join(PC_DIR, "src", "pc_net_game.c"), encoding="utf-8").read()
 check("pc_net_game.c defines PC_NETGAME_MSG_PLAYER_SCENE = 44",
       re.search(r"PC_NETGAME_MSG_PLAYER_SCENE\s*=\s*44", csrc) is not None)
 ids = [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_]+\s*=\s*(\d+)", csrc[:csrc.index("} PCNetGameMsgType;")])]
-check("all C message ids are unique and 45 (M9-C NPC_TALK) is the maximum", len(ids) == len(set(ids)) and max(ids) == 45)
+check("all C message ids are unique and 46 (M9-C PLAYER_ACTION) is the maximum", len(ids) == len(set(ids)) and max(ids) == 46)
 check("pc_net_game.c static-asserts the 12-byte size", "sizeof(PCNetGamePlayerSceneMsg) == 12" in csrc)
 
 # --- 5: raw scene-id whitelist ---------------------------------------------------------------------

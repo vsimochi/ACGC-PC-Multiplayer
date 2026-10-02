@@ -1326,6 +1326,12 @@ static int Player_actor_change_main_index(ACTOR* actorx, GAME* game) {
         Player_actor_Reset_able_force_speak_label(actorx, idx);     //
         Player_actor_change_main_index_other_func1(actorx, game);   //
         (*proc[idx])(actorx, game);
+#ifdef TARGET_PC
+        /* M9-C (protocol v7): read-only observation of a REAL main-index entry of the local player -- also when the
+         * same index is entered again (repeated swing/dig/pickup), which now_main_index alone cannot show. Only bumps
+         * a 4-bit counter in pc_net_game.c that the MOVE sampler sends along with now_main_index; changes nothing here. */
+        pc_net_game_note_player_main_entry(player->now_main_index);
+#endif
         Player_actor_change_main_index_other_func2(actorx, game); //
         return TRUE;
     }

@@ -31,10 +31,27 @@ typedef struct dig_hole_init_data_s {
 
 static void eDig_Hole_init(xyz_t pos, int prio, s16 angle, GAME* game, u16 item_name, s16 arg0, s16 arg1) {
     GAME_PLAY* play = (GAME_PLAY*)game;
+#ifdef TARGET_PC
+    const xyz_t* src_pos;
+
+    /* M9-C Phase 6b: a remote player's puppet supplies its own position for the duration of this one call (see
+     * eEC_pc_source_pos_override in ef_effect_control.h); NULL = the local player, exactly as vanilla. */
+    if (eEC_pc_source_pos_override != NULL) {
+        src_pos = eEC_pc_source_pos_override;
+    } else {
+        PLAYER_ACTOR* player = GET_PLAYER_ACTOR(play);
+
+        src_pos = &player->actor_class.world.position;
+    }
+
+    pos.x += src_pos->x + sin_s(angle) * 30.0f;
+    pos.z += src_pos->z + cos_s(angle) * 30.0f;
+#else
     PLAYER_ACTOR* player = GET_PLAYER_ACTOR(play);
 
     pos.x += player->actor_class.world.position.x + sin_s(angle) * 30.0f;
     pos.z += player->actor_class.world.position.z + cos_s(angle) * 30.0f;
+#endif
     pos.x /= 2.0f;
     pos.z /= 2.0f;
 

@@ -21,22 +21,41 @@ eEC_PROFILE_c iam_ef_dig_scoop = {
 };
 
 static void eDig_Scoop_init(xyz_t pos, int prio, s16 angle, GAME* game, u16 item_name, s16 arg0, s16 arg1) {
+#ifdef TARGET_PC
+    const xyz_t* src_pos;
+#else
     ACTOR* player_actorx = (ACTOR*)GET_PLAYER_ACTOR_GAME(game);
     PLAYER_ACTOR* player;
+#endif
     int i;
     s16 star_ef_angle;
     s16 sand_angle;
     xyz_t sand_pos;
     s16 dust_angle;
 
+#ifdef TARGET_PC
+    /* M9-C Phase 6b: a remote player's puppet supplies its own position for the duration of this one call (see
+     * eEC_pc_source_pos_override in ef_effect_control.h); NULL = the local player, exactly as vanilla. */
+    if (eEC_pc_source_pos_override != NULL) {
+        src_pos = eEC_pc_source_pos_override;
+    } else {
+        src_pos = &((ACTOR*)GET_PLAYER_ACTOR_GAME(game))->world.position;
+    }
+
+    pos.x += src_pos->x + 30.0f * sin_s(angle);
+    pos.z += src_pos->z + 30.0f * cos_s(angle);
+#else
     pos.x += player_actorx->world.position.x + 30.0f * sin_s(angle);
     pos.z += player_actorx->world.position.z + 30.0f * cos_s(angle);
+#endif
     pos.x /= 2.0f;
     pos.z /= 2.0f;
 
     if (eEC_CLIP != NULL) {
         if (arg1 == 1) {
+#ifndef TARGET_PC
             player = GET_PLAYER_ACTOR_GAME(game);
+#endif
             star_ef_angle = angle + DEG2SHORT_ANGLE2(22.5f);
 
             switch (arg0) {
@@ -44,7 +63,11 @@ static void eDig_Scoop_init(xyz_t pos, int prio, s16 angle, GAME* game, u16 item
                     int i = 4;
 
                     do {
+#ifdef TARGET_PC
+                        eEC_CLIP->effect_make_proc(eEC_EFFECT_BUSH_HAPPA, *src_pos, prio,
+#else
                         eEC_CLIP->effect_make_proc(eEC_EFFECT_BUSH_HAPPA, player->actor_class.world.position, prio,
+#endif
                                                    angle, game, item_name, arg0, 1);
                     } while (i--);
 
@@ -52,7 +75,11 @@ static void eDig_Scoop_init(xyz_t pos, int prio, s16 angle, GAME* game, u16 item
                         int j = 4;
 
                         do {
+#ifdef TARGET_PC
+                            eEC_CLIP->effect_make_proc(eEC_EFFECT_BUSH_YUKI, *src_pos, prio,
+#else
                             eEC_CLIP->effect_make_proc(eEC_EFFECT_BUSH_YUKI, player->actor_class.world.position, prio,
+#endif
                                                        angle, game, item_name, arg0, 0);
                         } while (j--);
                     }

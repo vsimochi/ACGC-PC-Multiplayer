@@ -25,7 +25,7 @@ speaking to special NPCs are NOT covered.
       same scenario: stuck in TALK, ListenAble never reached.
 
   M9-C scenarios H1/H1C/H6/H7/H7E (host-authoritative talk hold, NPC_TALK id 45) are documented above their
-  functions below; they need a build with PC_NETGAME_PROTOCOL_VERSION 6.
+  functions below; they need a build with PC_NETGAME_PROTOCOL_VERSION >= 6 (7 since M9-C Phase 2a).
 
 Usage: python test_client_villager_talk.py [--port 7811] [--only C1|C2|C3|H1|H1C|H6|H7|H7E|H8|H8C] [--bin-dir DIR]
 Exit code: 0 all checks passed, 1 otherwise.
