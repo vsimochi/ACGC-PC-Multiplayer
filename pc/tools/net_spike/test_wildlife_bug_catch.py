@@ -28,8 +28,8 @@ scheme where the coverage is directly analogous):
           must be broadcast for that entity_id (not two).
   TEST D (stale request): an unknown/never-issued entity_id, and a real entity_id with a mismatched
           generation, must both be rejected; no despawn is ever broadcast for either.
-  TEST E (out-of-range): a FakeClient parked far beyond PC_NETGAME_BUG_CATCH_REACH_SQ (150 units --
-          MUCH tighter than fish's 800) from the bug's own recorded position must be rejected; a
+  TEST E (out-of-range): a FakeClient parked far beyond PC_NETGAME_BUG_CATCH_REACH_SQ (1000 units since
+          M9-D F4 -- an acre diagonal plus net reach; fish's is 800) from the bug's own recorded position must be rejected; a
           FOLLOW-UP catch from a real in-range position must still succeed.
   TEST F (late-join after catch): after a catch, a NEW FakeClient's own initial WILDLIFE_SNAPSHOT_ENTRY
           (type 39 -- NOT WILDLIFE_SPAWN, type 37, which a late-joiner never receives for pre-existing
@@ -455,14 +455,13 @@ def test_protocol_suite(port, log_dir, results):
         check("TEST D: no WILDLIFE_DESPAWN for a mismatched-generation claim", len(despawns) == 0, results)
 
         # -----------------------------------------------------------------------------------------
-        # TEST E: out-of-range claim (beyond PC_NETGAME_BUG_CATCH_REACH_SQ == 150^2, MUCH tighter than
-        # fish's 800^2), then a legitimate in-range claim on the SAME entity succeeds.
+        # TEST E: out-of-range claim (beyond PC_NETGAME_BUG_CATCH_REACH_SQ == 1000^2, M9-D F4: was
+        # 150^2; a bug can legitimately drift up to an acre diagonal from its spawn point), then a legitimate in-range claim on the SAME entity succeeds.
         # -----------------------------------------------------------------------------------------
         print("=" * 72)
-        print("[bug-catch] TEST E: out-of-range claim (bug reach == 150 units), then in-range succeeds")
+        print("[bug-catch] TEST E: out-of-range claim (bug reach == 1000 units), then in-range succeeds")
         far_target = ordinary[0]
-        # Comfortably beyond 150 units (bug's own tighter reach) -- 100000 units is already far beyond
-        # even fish's 800-unit reach, so it is unambiguously out of range here too.
+        # Comfortably beyond 1000 units (bug reach) -- 100000 units is unambiguously out of range.
         a.send_move_any(far_target["x"] + 100000.0, 0.0, far_target["z"] + 100000.0, reliable=True)
         time.sleep(0.3)
         a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9003, far_target["species"]))
@@ -472,14 +471,25 @@ def test_protocol_suite(port, log_dir, results):
         check("TEST E: bug remains live after an out-of-range rejection (no despawn)", len(despawns) == 0,
               results)
 
-        # A position clearly within 150 units but not exactly on top of it, to prove the check is a
+        # M9-D F4: just beyond the new 1000-unit bound (1100) is still rejected (the check was kept as an
+        # anti-teleport sanity bound, not removed).
+        a.send_move_any(far_target["x"] + 1100.0, 0.0, far_target["z"], reliable=True)
+        time.sleep(0.3)
+        a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9005, far_target["species"]))
+        res = collect_catch_results(a, 0.5)
+        check("TEST E: claim from 1100 units (just beyond the 1000-unit bound) rejected",
+              len(res) == 1 and res[0]["accepted"] == 0, results)
+        despawns = collect_despawns(a, 0.2)
+        check("TEST E: bug still live after the 1100-unit rejection", len(despawns) == 0, results)
+
+        # A position clearly within the bug reach but not exactly on top of it, to prove the check is a
         # genuine radius test rather than an exact-position match.
         a.send_move_any(far_target["x"] + 50.0, 0.0, far_target["z"], reliable=True)
         time.sleep(0.3)
         a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9004, far_target["species"]))
         res = collect_catch_results(a, 0.5)
         check("TEST E: the SAME entity_id, claimed from a legitimate in-range position (50 units, well "
-              "within the 150-unit bug reach), is accepted",
+              "within the bug reach), is accepted",
               len(res) == 1 and res[0]["accepted"] == 1 and res[0]["entity_id"] == far_target["entity_id"],
               results)
         despawns = collect_despawns(a, 0.3)

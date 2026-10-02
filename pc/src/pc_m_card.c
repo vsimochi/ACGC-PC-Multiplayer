@@ -1157,6 +1157,25 @@ int mCD_SaveHome_bg(int param_1, int* chan) {
     int slot = mCD_GetThisLandSlotNo();
     int result;
 
+    /* M9-D F1: a network CLIENT never persists. Its Save_t is the mirrored HOST town plus its own
+     * pockets; writing it would overwrite the client's own offline town with the host's and make
+     * session-local inventory races permanent. Same role test as pc_save_write_authoritative() and
+     * the shutdown save (src/main.c). The vanilla save dialog (aNRST_save, ac_npc_restart_talk.c_inc)
+     * still has to complete normally, so report success: it only advances the talk state on
+     * mCD_TRANS_ERR_NONE and keeps no other 'saved' bookkeeping. Everything below (the pre-write side
+     * effects too: Wisp removal, money-rock shine clear, reset-code arming, copy-protect stamp) is
+     * skipped so the client's world/private state is untouched by the skipped save. Host and
+     * single-player (role != CLIENT) fall through exactly as before. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        static int s_client_save_skip_logged = 0;
+        if (s_client_save_skip_logged < 3) {
+            s_client_save_skip_logged++;
+            OSReport("[NET][SAVE] client save skipped (network CLIENT never persists; the host owns the "
+                     "town) -- reporting success to the save dialog\n");
+        }
+        if (chan) *chan = mCD_SLOT_A;
+        return mCD_TRANS_ERR_NONE;
+    }
 
     pc_save_pre_write_side_effects(param_1);
 
@@ -1258,6 +1277,28 @@ int mCD_CheckStation_bg(s32* chan) {
  *  - Foreigner: save visited town (Card B) + load Card A → l_keepSave. */
 int mCD_SaveStation_NextLand_bg(s32* chan) {
     int is_foreigner = mLd_PlayerManKindCheck();
+
+    /* M9-D G4-1: a network CLIENT never writes a save file here. Both branches below persist the
+     * current Save_t (the mirrored HOST town for a client) to Card A / Card B and then reload keep data,
+     * so a client that owns a second town GCI would have its own offline save overwritten with the
+     * host's town. Report an error instead of success: success would let aSTM_save_talk start the
+     * train trip (mCD_toNextLand) without l_keepSave having been loaded. mCD_TRANS_ERR_NO_TOWN_DATA is
+     * an existing vanilla result of this function: aSTM_save_talk (ac_station_clip.c_inc) answers it
+     * with the normal 'no town data' message (0x0946), sets next_think_idx to 8/9 and force-advances
+     * the message exactly as for any other save error, so the talk ends and the player stays in town.
+     * chan = Card A like the other early NO_TOWN_DATA return below. No state is touched before this
+     * guard. Host and single-player (role != CLIENT) fall through unchanged. mCD_SaveStation_Passport_bg
+     * writes nothing (in-memory passport only) and needs no guard. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        static int s_client_station_skip_logged = 0;
+        if (s_client_station_skip_logged < 3) {
+            s_client_station_skip_logged++;
+            OSReport("[NET][SAVE] client station travel save skipped (network CLIENT never persists) -- "
+                     "reporting NO_TOWN_DATA to the station talk\n");
+        }
+        if (chan) *chan = mCD_SLOT_A;
+        return mCD_TRANS_ERR_NO_TOWN_DATA;
+    }
 
     if (is_foreigner) {
         /* Record departure info (visited town) for Rover. */

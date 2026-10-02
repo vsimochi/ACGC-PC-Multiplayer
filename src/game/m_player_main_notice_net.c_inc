@@ -52,16 +52,14 @@ static void Player_actor_setup_main_Notice_net(ACTOR* actor, GAME* game) {
 
 #ifdef TARGET_PC
             /* World Ecology Wildlife Sync T4 (ordinary bug catching only -- T8 audit comment-accuracy
-             * fix: `type != 0` is specifically a BEE catch, not "ant/bee" -- Player_actor_CatchSomething
-             * Check_common() (m_player_main_swing_net.c_inc) only sets item_net_catch_type != 0 when
-             * `label` is a distinct ACTOR profile, mAc_PROFILE_BEE, rather than an ordinary
-             * aINS_INSECT_ACTOR*; an ant is a perfectly ordinary aINS_INSECT_ACTOR (type == 0, see
-             * use_mark_insect_type[] above, which lists aINS_INSECT_TYPE_ANT alongside MOSQUITO) and
-             * already flows through the entity_id-tracked path below like any other bug. The outcome
-             * this gate produces (`type == 0` only) is, and always was, correct -- only this comment's
-             * description of WHICH species take the untouched branch was wrong. A bee catch, type != 0,
-             * is a distinct special case and is left completely untouched by this block, exactly as
-             * vanilla). Same Option A design T3 already established for fish: defer
+             * fix, corrected again in M9-D: `type != 0` is a catch whose `label` is a distinct ACTOR
+             * (bee: mAc_PROFILE_BEE; ant: the ac_ant.c actor, whose net catch is registered with
+             * mPlayer_NET_CATCH_TYPE_ANT and mapped to aINS_INSECT_TYPE_ANT by m_player_main_swing_net.
+             * c_inc) rather than an ordinary aINS_INSECT_ACTOR*. Only ordinary insects (`type == 0`)
+             * take the entity_id-tracked network path below; BOTH bees and ants (type != 0) are left
+             * completely untouched by this block, exactly as vanilla (the host also rejects ANT species
+             * claims). An earlier version of this comment wrongly called ants ordinary type == 0
+             * insects; the behavior of the `type == 0` gate itself was always correct. Same Option A design T3 already established for fish: defer
              * the actual grant + collection-bit write until the HOST accepts, rather than granting
              * optimistically and trying to claw it back later. `main_notice->not_full_pocket` is still
              * driven purely by the local free-slot check alone, exactly like vanilla -- the release-or-
@@ -89,6 +87,13 @@ static void Player_actor_setup_main_Notice_net(ACTOR* actor, GAME* game) {
                         mActor_name_t local_item = (free_space >= 0) ? item : (mActor_name_t)0;
                         if (pc_net_game_request_catch_bug(entity_id, idx, (int)local_item)) {
                             grant_handled = TRUE;
+                        } else {
+                            /* M9-D L-3: a READY client with the authoritative seam ON and a tracked entity,
+                               but the request could not be sent (not in town / no owner stamp). The host
+                               still holds the entity live, so the vanilla grant would be a duplicate: deny
+                               locally, same as the disconnected-client branch below. */
+                            pc_net_game_record_local_catch_denied(entity_id);
+                            grant_handled = TRUE;
                         }
                     } else if (entity_id != 0 && pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
                         /* Host's own local catch: resolves synchronously against the authoritative
@@ -113,6 +118,9 @@ static void Player_actor_setup_main_Notice_net(ACTOR* actor, GAME* game) {
                                "(Bug 3 fix, see pc_wildlife_authority.h's own pcwld_should_suppress_local_"
                                "wildlife() doc)\n",
                                (unsigned)entity_id);
+                        /* M9-D F2: record the denial so the putaway exchange gate (full pockets) also denies
+                           the exchange; otherwise the query returns NONE and the exchange grants a duplicate. */
+                        pc_net_game_record_local_catch_denied(entity_id);
                         grant_handled = TRUE;
                     }
                     /* entity_id == 0 (no tracked local BUG presentation entry for this exact label -- e.g.

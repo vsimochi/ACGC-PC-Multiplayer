@@ -1933,20 +1933,29 @@ _Static_assert(sizeof(PCNetGameInteractConfirmMsg) <= PC_NET_MAX_PAYLOAD,
  * terrain or at a waterfall. */
 #define PC_NETGAME_FISH_CATCH_REACH_SQ (800.0f * 800.0f)
 
-/* World Ecology Wildlife Sync T4 (ordinary bug catching): a SEPARATE, much tighter reach bound than
- * fish's -- a bug never "swims off" from its spawn position the way a cast line lets a fish be hooked
- * far from the player; it only wanders locally and is swatted from arm's/net's reach. The real vanilla
+/* M9-D F4 (supersedes the original 150-unit bound described below): the host compares the claiming
+ * client's position against the bug's SPAWN position (PcWildlifeRecord.pos_x/z, set once; wildlife AI
+ * runs per process and nothing streams the bug's current position), but a bug moves after spawning.
+ * Verified in source: a butterfly (ac_ins_chou.c) wanders between flowers and flees the local player
+ * (aICH_avoid_player) while steering back toward its acre centre once outside the 1..14 unit ring
+ * (aICH_avoid_move_ctrl), so it can end up anywhere in its acre: at most one acre diagonal from its
+ * spawn, 16 units * 40 * sqrt(2) ~= 905. A banded dragonfly roams up to 12 units = 480 from its home
+ * point (ac_ins_tonbo.c aITB_ONIYAMA_MAX_RANGE), other dragonflies 6 units = 240. Add the net/catch
+ * envelope below (~74-84) and the worst case is ~990, so the bound is 1000 units. It stays an
+ * anti-teleport sanity bound (a claim from outside the acre-scale envelope is still rejected), same
+ * shape as the fish bound (800). The original rationale follows for the geometry facts. */
+/* World Ecology Wildlife Sync T4 (ordinary bug catching): a SEPARATE reach bound from fish's. The real vanilla
  * geometry (verified in source): the net swing's own forward sweep is 50 units (60 for the gold net,
  * Player_actor_CheckCapture_forNet(), m_player_main_swing_net.c_inc), and a bug's own catch-registration
  * radius around itself is 8 units ordinarily, up to 24 for the ground-pool species that use aINS_get_
- * catch_range_sub() (beetles, a grounded cockroach) -- ac_insect_move.c_inc. 150 units is a deliberately
- * generous bound on top of that combined ~74-84 unit envelope (net sweep + catch radius), leaving slack
+ * catch_range_sub() (beetles, a grounded cockroach) -- ac_insect_move.c_inc. (The ORIGINAL 150-unit bound
+ * was a deliberately generous bound on top of that combined ~74-84 unit envelope (net sweep + catch radius), leaving slack
  * for the bug's own small movement between the local player's last reported position sample and the
  * moment of the swing, and for ordinary network position latency -- while still rejecting a genuinely
- * implausible claim (e.g. "caught" a bug on the other side of the acre). XZ-only, same reasoning as
+ * implausible claim (e.g. "caught" a bug on the other side of the acre; it ignored that the bug itself moves.) XZ-only, same reasoning as
  * PC_NETGAME_FISH_CATCH_REACH_SQ's own doc (PcWildlifeRecord.pos_y is always 0.0 for a bug record too --
  * neither aSOI_insect_set() nor aINS_make_insect() ever touch it). */
-#define PC_NETGAME_BUG_CATCH_REACH_SQ (150.0f * 150.0f)
+#define PC_NETGAME_BUG_CATCH_REACH_SQ (1000.0f * 1000.0f)
 
 /* Any peer-supplied world coordinate must be finite and within +/- this many world units. The whole
  * town is ~6400 x ~7680 units, so 100000 is generous slack for a legitimate sample while making NaN/
@@ -2385,6 +2394,32 @@ typedef struct PCNetGameDropPending {
 static PCNetGameDropPending s_drop_pending;
 static uint32_t             s_next_drop_request_id = 1;
 
+/* M9-D G4-2: client-only 'deferred exchange' record for the catch-exchange menu (mSM_IV_OPEN_EXCHANGE).
+ * In that menu the item the player swaps OUT of a full pocket slot S ends up in the HAND, while the new
+ * (caught) item already sits in pockets[S]. When the hand item is then put on the ground
+ * (mTG_exchange_proc) a network client must not write it into its own local field (never synced, erased
+ * at the next resync), so the hand item is sent through the ordinary authoritative drop request instead.
+ * That request needs the hand item in a pocket, so pockets[S] temporarily holds it again and the item
+ * that was in pockets[S] (the replacement) is parked here. If the host ACCEPTS the matching request,
+ * pcnetgame_handle_client_drop_result() clears slot S as for any drop and then writes the replacement
+ * into it (one write: the record is consumed on the first matching RESULT, accepted or not).
+ * On reject / timeout / not sent / session reset / owner change / slot mismatch the pocket simply keeps
+ * the hand item and the replacement is lost -- the same posture as the 5A fallback 'a client whose
+ * pockets are full does not receive the item'. Matching is by request id only; a stale record can never
+ * apply to another request. s_exchange_swap_* remembers the pocket slot the last hand swap wrote into
+ * (set by mHD_drop_item2 via pc_net_game_exchange_note_swap, client role only). */
+typedef struct PCNetGameExchangeDeferred {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  slot;
+    uint16_t replacement;
+    uint8_t  replacement_cond;
+    PCNetGameOwnerStamp owner;
+} PCNetGameExchangeDeferred;
+static PCNetGameExchangeDeferred s_exchange_deferred;
+static int                       s_exchange_swap_slot = -1;
+static uint16_t                  s_exchange_swap_item;
+
 #define PC_NETGAME_DROP_TIMEOUT_60FPS_FRAMES 30.0f /* ~500ms, mirrors pickup's own budget */
 #define PC_NETGAME_DROP_MAX_RETRIES 30 /* see PC_NETGAME_PICKUP_MAX_RETRIES for the budget reasoning */
 _Static_assert((PC_NETGAME_DROP_MAX_RETRIES + 1) * 500u < PC_NETGAME_CONFIRM_TIMEOUT_MS,
@@ -2410,6 +2445,31 @@ typedef struct PCNetGameBuryPending {
 } PCNetGameBuryPending;
 static PCNetGameBuryPending s_bury_pending;
 static uint32_t             s_next_bury_request_id = 1;
+
+/* M9-D G2-3: client-only. The bury request whose provisional accept was acted on (COMMIT sent, pocket
+ * slot cleared) is RETAINED here, separate from s_bury_pending (which is released at the accept so no
+ * retry can follow), until its fate is known. On a SUCCESSFUL commit the host sends BURY_RESULT
+ * accepted=1 (same request_id) plus the ambient FIELD_UPDATE; the client then takes the accepted-but-
+ * unmatched path and sends ABORT(STALE), which the host ignores (request phase DONE). That accepted=1
+ * cannot be told apart from a replayed provisional accept, so the record is deliberately NOT cleared on
+ * it (comment-only; the record simply times out). The host sends a BURY reject (accepted=0) carrying the
+ * same request_id when the commit itself fails (tile rewritten / deposit set since the reservation, host
+ * world not ready). Such a reject means the host did NOT bury the item, so it is restored into the
+ * pocket (same slot if still empty, else a free slot, else logged as LOST). Discarded on: the matching
+ * reject (restored), the next bury request, session reset, owner-stamp mismatch, or a safety timeout
+ * (PC_NETGAME_BURY_COMMITTED_KEEP_60FPS_FRAMES) -- after which a stray reject is ignored as before. */
+#define PC_NETGAME_BURY_COMMITTED_KEEP_60FPS_FRAMES 900.0f /* ~15 s: far above a reliable COMMIT round trip */
+typedef struct PCNetGameBuryCommitted {
+    int      valid;
+    uint32_t request_id;
+    uint8_t  pocket_slot_idx;
+    uint8_t  ut_x;
+    uint8_t  ut_z;
+    uint16_t item;
+    PCNetGameOwnerStamp owner;
+    float    keep_accum;
+} PCNetGameBuryCommitted;
+static PCNetGameBuryCommitted s_bury_committed;
 
 /* World Ecology Wildlife Sync T-catch: client-only. Exactly one outstanding CATCH request at a time
  * (a player can only ever be mid-reeling-in ONE fish, via ONE fishing rod) -- no timeout/retry fields at
@@ -6444,7 +6504,7 @@ static int pcnetgame_fish_catch_reach_check(float rec_x, float rec_z, float px, 
 }
 
 /* World Ecology Wildlife Sync T4: bug-catch reach check -- same XZ-only shape as the fish check just
- * above, using PC_NETGAME_BUG_CATCH_REACH_SQ's own tighter bound (see that constant's own doc). */
+ * above, using PC_NETGAME_BUG_CATCH_REACH_SQ's own bound (see that constant's own doc). */
 static int pcnetgame_bug_catch_reach_check(float rec_x, float rec_z, float px, float pz) {
     float dx = rec_x - px;
     float dz = rec_z - pz;
@@ -9088,6 +9148,16 @@ static void pcnetgame_handle_client_drop_result(const PCNetGameDropResultMsg* in
     const uint8_t kind = (uint8_t)PC_NETGAME_INTERACT_KIND_DROP;
     int matches = s_drop_pending.valid && s_drop_pending.request_id == in->request_id;
     int slot;
+    /* M9-D G4-2: take the deferred-exchange record for THIS request id (if any) and consume it right
+     * away: whatever happens below it can be applied at most once, only on the success path at the end. */
+    PCNetGameExchangeDeferred deferred;
+    int have_deferred = s_exchange_deferred.valid && s_exchange_deferred.request_id == in->request_id;
+
+    memset(&deferred, 0, sizeof(deferred));
+    if (have_deferred) {
+        deferred = s_exchange_deferred;
+        s_exchange_deferred.valid = 0;
+    }
 
     if (!in->accepted) {
         if (!matches) {
@@ -9152,6 +9222,14 @@ static void pcnetgame_handle_client_drop_result(const PCNetGameDropResultMsg* in
     mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)EMPTY_NO, mPr_ITEM_COND_NORMAL);
     printf("[NET][DROP] request %u accepted (item=%u) -- cleared pocket slot %d\n", (unsigned)in->request_id,
            (unsigned)in->placed_item, slot);
+    /* M9-D G4-2: exchange-menu drop -- the item that was swapped into this slot now takes its place. The
+     * claim check above guarantees the slot held exactly the dropped item, so the slot is empty here. */
+    if (have_deferred && (int)deferred.slot == slot && pcnetgame_owner_stamp_matches(&deferred.owner) &&
+        Now_Private->inventory.pockets[slot] == (mActor_name_t)EMPTY_NO) {
+        mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)deferred.replacement, (int)deferred.replacement_cond);
+        printf("[NET][DROP] request %u (exchange): replacement item 0x%04X written to pocket slot %d\n",
+               (unsigned)in->request_id, (unsigned)deferred.replacement, slot);
+    }
 }
 
 /* Forward-declared here too (see the canonical forward-declare comment further down, above
@@ -9199,6 +9277,32 @@ static void pcnetgame_handle_client_bury_result(const PCNetGameBuryResultMsg* in
             }
         }
         if (!matches) {
+            /* M9-D G2-3: a reject for a request whose provisional accept we already acted on (COMMIT sent,
+             * pocket cleared) = the host's commit FAILED, nothing was buried: give the item back. */
+            if (s_bury_committed.valid && s_bury_committed.request_id == in->request_id) {
+                const uint16_t item = s_bury_committed.item;
+                int rslot = (int)s_bury_committed.pocket_slot_idx;
+                const int stamp_ok = pcnetgame_owner_stamp_matches(&s_bury_committed.owner);
+                s_bury_committed.valid = 0; /* one restore per request, never twice */
+                if (!stamp_ok) {
+                    printf("[NET][BURY] request %u commit rejected by host but the local player/save changed -- "
+                           "item 0x%04X not restored\n",
+                           (unsigned)in->request_id, (unsigned)item);
+                } else if (rslot >= 0 && rslot < mPr_POCKETS_SLOT_COUNT &&
+                           Now_Private->inventory.pockets[rslot] == (mActor_name_t)EMPTY_NO) {
+                    mPr_SetPossessionItem(Now_Private, rslot, (mActor_name_t)item, mPr_ITEM_COND_NORMAL);
+                    printf("[NET][BURY] request %u commit rejected by host -- RESTORED item 0x%04X to pocket "
+                           "slot %d\n",
+                           (unsigned)in->request_id, (unsigned)item, rslot);
+                } else if (mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)item, mPr_ITEM_COND_NORMAL)) {
+                    printf("[NET][BURY] request %u commit rejected by host -- RESTORED item 0x%04X to a free "
+                           "pocket slot (slot %d was taken)\n",
+                           (unsigned)in->request_id, (unsigned)item, rslot);
+                } else {
+                    printf("[NET][BURY] request %u commit rejected by host -- item 0x%04X LOST (pockets full)\n",
+                           (unsigned)in->request_id, (unsigned)item);
+                }
+            }
             return; /* not our current pending request -- already resolved, given up, or a stale duplicate */
         }
         s_bury_pending.valid = 0; /* resolved -- never retried or re-applied again */
@@ -9260,6 +9364,15 @@ static void pcnetgame_handle_client_bury_result(const PCNetGameBuryResultMsg* in
        in single-player, after the slot was verified above. The field tile itself is handled by the
        ordinary FIELD_UPDATE the host sends on COMMIT, not here. */
     mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)EMPTY_NO, mPr_ITEM_COND_NORMAL);
+    /* M9-D G2-3: retain the claim so a later commit-failure reject can restore it (see s_bury_committed). */
+    s_bury_committed.valid = 1;
+    s_bury_committed.request_id = in->request_id;
+    s_bury_committed.pocket_slot_idx = (uint8_t)slot;
+    s_bury_committed.ut_x = in->ut_x;
+    s_bury_committed.ut_z = in->ut_z;
+    s_bury_committed.item = (uint16_t)in->buried_item;
+    s_bury_committed.owner = s_bury_pending.owner;
+    s_bury_committed.keep_accum = 0.0f;
     printf("[NET][BURY] request %u accepted (item=%u) -- CONFIRM(COMMIT) sent, cleared pocket slot %d; the "
            "resolved outcome arrives via the ordinary FIELD_UPDATE broadcast\n",
            (unsigned)in->request_id, (unsigned)in->buried_item, slot);
@@ -11061,11 +11174,28 @@ static void pcnetgame_reset_client_session_state(void) {
     s_next_pickup_request_id = 1;
     memset(&s_drop_pending, 0, sizeof(s_drop_pending));
     s_next_drop_request_id = 1;
+    memset(&s_exchange_deferred, 0, sizeof(s_exchange_deferred)); /* M9-D G4-2 */
+    s_exchange_swap_slot = -1;
     memset(&s_bury_pending, 0, sizeof(s_bury_pending));
+    memset(&s_bury_committed, 0, sizeof(s_bury_committed)); /* M9-D G2-3 */
     s_next_bury_request_id = 1;
     memset(s_field_action_queue, 0, sizeof(s_field_action_queue)); /* T0-C: whole queue, not one slot */
     s_field_action_queue_len = 0;
     s_next_field_action_request_id = 1;
+
+    /* M9-D F3: the catch request in flight dies with the session too (its RESULT can never match the
+     * new connection). A still-PENDING catch is converted to a REJECTED outcome for the same entity
+     * instead of being silently dropped: the putaway exchange gate (pc_net_game_query_catch_outcome)
+     * keeps denying that catch (the host may or may not have accepted it; either way this client must
+     * not grant it), but PENDING no longer lingers across sessions. A stale outcome is cleared when the
+     * next catch request starts (pcnetgame_request_catch_common). s_next_catch_request_id is NOT reset:
+     * it stays monotonic across reconnects (see the catch request handler's id match). */
+    if (s_catch_pending.valid) {
+        s_catch_last_outcome.valid = 1;
+        s_catch_last_outcome.entity_id = s_catch_pending.entity_id;
+        s_catch_last_outcome.accepted = 0;
+    }
+    memset(&s_catch_pending, 0, sizeof(s_catch_pending));
 
     memset(s_client_acre_seq, 0, sizeof(s_client_acre_seq));
     s_client_meta_seq = 0;
@@ -12850,6 +12980,12 @@ void pc_net_game_poll(void) {
         }
     }
 
+    /* M9-D G2-3: safety timeout of the retained committed-bury claim (see s_bury_committed). */
+    if (gamePT != NULL && s_bury_committed.valid &&
+        graph_dt_period_elapsed(gamePT, &s_bury_committed.keep_accum, PC_NETGAME_BURY_COMMITTED_KEEP_60FPS_FRAMES)) {
+        s_bury_committed.valid = 0;
+    }
+
     /* World Ecology T3: pending bury-request timeout/retry, client-only. Exact structural mirror of
        the pickup/drop retry blocks above -- see their own doc comments for the shared reasoning (gamePT
        gate, timeout/retry budget). Kept as a separate block against a separate pending instance for the
@@ -13744,6 +13880,70 @@ int pc_net_game_request_drop(int pocket_slot_idx, int claimed_item, int ut_x, in
     return 1;
 }
 
+/* M9-D G4-2: see pc_net_game.h. Remembers where the last hand swap wrote into the pockets. */
+void pc_net_game_exchange_note_swap(int slot, int swapped, int new_item) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return; /* host / single-player: never records anything */
+    }
+    if (swapped && slot >= 0 && slot < mPr_POCKETS_SLOT_COUNT) {
+        s_exchange_swap_slot = slot;
+        s_exchange_swap_item = (uint16_t)new_item;
+    } else {
+        s_exchange_swap_slot = -1;
+    }
+}
+
+/* M9-D G4-2: see pc_net_game.h. Called at most once per exchange-menu close (the swap note is consumed). */
+int pc_net_game_exchange_request_drop(int hand_item, int hand_cond, int ut_x, int ut_z) {
+    const int slot = s_exchange_swap_slot;
+    mActor_name_t replacement;
+    int replacement_cond;
+    const char* why;
+
+    s_exchange_swap_slot = -1; /* consumed whatever happens below */
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return 0;
+    }
+    if (Now_Private == NULL || slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT ||
+        Now_Private->inventory.pockets[slot] != (mActor_name_t)s_exchange_swap_item) {
+        /* No (or a stale) swap note: nowhere to hold the hand item for the request. It is lost. */
+        printf("[NET][DROP] exchange: hand item 0x%04X cannot be routed (no valid swap slot) -- item lost\n",
+               (unsigned)hand_item);
+        return 0;
+    }
+    replacement = Now_Private->inventory.pockets[slot];
+    replacement_cond = mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, slot);
+
+    /* Failure posture: every failure below leaves the HAND item in pockets[slot] (the drop did not happen,
+     * so there is no room for the replacement, which is lost). Never a local field write. */
+    mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)hand_item, hand_cond);
+
+    if (hand_cond != mPr_ITEM_COND_NORMAL) {
+        why = "item is a present/quest item";
+    } else if (ut_x < 0 || ut_z < 0) {
+        why = "no legal drop tile";
+    } else if (s_drop_pending.valid) {
+        why = "another drop request is in flight";
+    } else if (!pc_net_game_is_droppable_item(hand_item)) {
+        why = "item is not droppable over the network";
+    } else if (!pc_net_game_request_drop(slot, hand_item, ut_x, ut_z) || !s_drop_pending.valid) {
+        why = "request not sent";
+    } else {
+        s_exchange_deferred.valid = 1;
+        s_exchange_deferred.request_id = s_drop_pending.request_id;
+        s_exchange_deferred.slot = (uint8_t)slot;
+        s_exchange_deferred.replacement = (uint16_t)replacement;
+        s_exchange_deferred.replacement_cond = (uint8_t)replacement_cond;
+        s_exchange_deferred.owner = s_drop_pending.owner;
+        printf("[NET][DROP] exchange: hand item 0x%04X sent as drop request %u from slot %d; replacement 0x%04X deferred\n",
+               (unsigned)hand_item, (unsigned)s_drop_pending.request_id, slot, (unsigned)replacement);
+        return 1;
+    }
+    printf("[NET][DROP] exchange: hand item 0x%04X not dropped (%s) -- kept in slot %d, replacement 0x%04X lost\n",
+           (unsigned)hand_item, why, slot, (unsigned)replacement);
+    return 0;
+}
+
 /* World Ecology T3 (bugfix): see pc_net_game.h's own doc for the full contract -- the caller must NOT
  * clear the pocket based on this function's return value; that now happens in
  * pcnetgame_handle_client_bury_result() upon provisional accept, after a slot-still-holds-the-item
@@ -13781,6 +13981,7 @@ int pc_net_game_request_bury(int pocket_slot_idx, int claimed_item, int ut_x, in
         return 0;
     }
 
+    s_bury_committed.valid = 0; /* M9-D G2-3: a new bury supersedes the retained previous claim */
     s_bury_pending.valid = 1;
     s_bury_pending.request_id = s_next_bury_request_id++;
     s_bury_pending.owner = stamp;
@@ -14812,6 +15013,8 @@ static int pcnetgame_request_catch_common(uint32_t entity_id, int kind, int clai
         return 0;
     }
 
+    s_catch_last_outcome.valid = 0; /* M9-D F3: a stale outcome (e.g. a REJECTED left by a disconnect) must not
+                                       bleed into this new catch */
     s_catch_pending.valid = 1;
     s_catch_pending.request_id = s_next_catch_request_id++;
     s_catch_pending.entity_id = entity_id;
@@ -15413,6 +15616,18 @@ int pc_net_game_query_catch_outcome(uint32_t entity_id) {
         return accepted ? PC_NETGAME_CATCH_STATUS_ACCEPTED : PC_NETGAME_CATCH_STATUS_REJECTED;
     }
     return PC_NETGAME_CATCH_STATUS_NONE;
+}
+
+/* M9-D F2: see pc_net_game.h. Records the same REJECTED outcome a host reject would, so the putaway
+ * exchange gate (pc_net_game_query_catch_outcome) denies the exchange for a catch whose grant the
+ * seam suppressed locally (disconnected client: no host to ask, entity still live on the host). */
+void pc_net_game_record_local_catch_denied(uint32_t entity_id) {
+    if (entity_id == 0) {
+        return;
+    }
+    s_catch_last_outcome.valid = 1;
+    s_catch_last_outcome.entity_id = entity_id;
+    s_catch_last_outcome.accepted = 0;
 }
 
 /* Client side: WILDLIFE_DESPAWN -- see PCNetGameWildlifeDespawnMsg's own doc and

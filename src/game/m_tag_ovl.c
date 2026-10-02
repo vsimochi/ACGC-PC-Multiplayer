@@ -3981,6 +3981,21 @@ static void mTG_plant_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         mTG_close_window(submenu, menu_info, TRUE);
         return;
     } else {
+#ifdef TARGET_PC
+        /* M9-D G2-1: the no-shovel Plant branch below writes the sapling/flower straight into this
+         * process's own field (mTG_common_throw_put_field -> player_drop_entry_proc) and clears the
+         * pocket slot, and mTG_host_put_tile_free() is always TRUE on a client. Nothing is sent to the
+         * host, so the plant would exist only locally (erased by the next resync / FIELD_BLOCK /
+         * rejoin) and the item would be lost. A network client therefore gets the same "cannot plant
+         * here" warning as any other unplaceable tile, without consuming the pocket item; it can still
+         * plant with a shovel into a hole (the authoritative BURY path above). Host / single-player
+         * are unaffected (the check is false for them). Same client check as the Drop-All block in
+         * mTG_field_put_proc(). */
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_PLANT);
+            return;
+        }
+#endif
         if (mTG_search_put_pos(player, &pos, TRUE, plant_item == ITM_SIGNBOARD, plant_item == ITM_SIGNBOARD, FALSE,
                                FALSE) &&
             mTG_host_put_tile_free(&pos)) {
@@ -5283,7 +5298,39 @@ static void mTG_exchange_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
             }
         } else if (ITEM_IS_BALLOON(item)) {
             mPlib_request_main_release_creature_balloon_from_submenu(item, demo_gold_scoop);
-        } else {
+        }
+#ifdef TARGET_PC
+        else if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            /* M9-D G4-2: a network client must never write the swapped-out item into its OWN local field
+             * (mTG_common_throw_put_field below): that field is not synced and is erased at the next
+             * resync, so the item would silently vanish. Send it through the authoritative drop request
+             * instead (same tile search / arguments as the mTG_field_put_proc client seam). The result is
+             * applied asynchronously (pcnetgame_handle_client_drop_result): on accept the pocket slot is
+             * cleared and the caught item takes its place; on any failure the hand item stays in the slot
+             * and the caught item is lost (logged). Either way the menu closes normally -- a warning
+             * window here could trap the player, whose only other options are more swaps. Creature
+             * releases (fish / insect / balloon) above are not field writes and are unchanged. */
+            xyz_t pos;
+            int ux = -1, uz = -1;
+
+            if (mTG_search_put_pos(player, &pos, FALSE, FALSE, FALSE, FALSE, FALSE) &&
+                !mFI_Wpos2UtNum(&ux, &uz, pos)) {
+                ux = -1;
+                uz = -1;
+            }
+            pc_net_game_exchange_request_drop((int)submenu->overlay->hand_ovl->info.item,
+                                              (int)submenu->overlay->hand_ovl->info.item_cond, ux, uz);
+
+            if (demo_gold_scoop) {
+                mPlib_request_main_demo_get_golden_item_from_submenu();
+            } else {
+                mPlib_request_main_wait_from_submenu();
+                sfx = -1;
+                mPlib_request_main_wait_from_submenu();
+            }
+        }
+#endif
+        else {
             xyz_t pos;
 
             if (!mFI_CheckInIsland() ||

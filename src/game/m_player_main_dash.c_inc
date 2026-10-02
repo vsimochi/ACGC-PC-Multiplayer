@@ -49,6 +49,18 @@ static int Player_actor_SetEffectRemoveFlower_Dash(ACTOR* actor, GAME* game, s16
 
             if ((IS_ITEM_FLOWER(name) ? TRUE : FALSE)) {
                 xyz_t pos;
+#ifdef TARGET_PC
+                /* M9-D G2-2: fade_entry_proc below writes EMPTY_NO into this tile (mFI_SetFG_common), a
+                 * client-local world mutation the host never hears about (the host's own trample is
+                 * broadcast because its writes mark the acre dirty). On a host-authoritative client the
+                 * trample is skipped entirely: the flower stays, the petal burst / mISL trample counters
+                 * are not played, and FALSE makes the caller spawn the ordinary dash dust instead. The
+                 * RANDOM(4) draw above has already happened exactly as before, so the local RNG stream
+                 * is unchanged. An authoritative client trample needs a new field-action kind (v8). */
+                if (pc_net_game_world_is_host_authoritative()) {
+                    return FALSE;
+                }
+#endif
                 if (mFI_Wpos2UtCenterWpos(&pos, *actor_pos)) {
                     pos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
                     Common_Get(clip).effect_clip->effect_make_proc(eEC_EFFECT_HANATIRI, pos, 2, angle, game, 0xFFFF,

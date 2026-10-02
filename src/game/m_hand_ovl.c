@@ -12,6 +12,9 @@
 #include "m_needlework_ovl.h"
 #include "sys_matrix.h"
 #include "m_rcp.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#endif
 
 static mHD_Ovl_c hand_ovl_data;
 
@@ -429,6 +432,9 @@ static void mHD_prepare_drop_paper(mHD_Ovl_c* hand_ovl, mActor_name_t* item, int
 static void mHD_drop_item2(Submenu* submenu, mTG_tag_c* tag, mActor_name_t* item, int idx) {
     mHD_Ovl_c* hand_ovl = submenu->overlay->hand_ovl;
     int cond = hand_ovl->info.item_cond;
+#ifdef TARGET_PC
+    mActor_name_t pc_old_item = *item;
+#endif
 
     if (*item != EMPTY_NO) {
         hand_ovl->info.item_cond = mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, idx);
@@ -441,6 +447,10 @@ static void mHD_drop_item2(Submenu* submenu, mTG_tag_c* tag, mActor_name_t* item
     mHD_prepare_drop_wisp(hand_ovl, item, idx);
     mHD_prepare_drop_paper(hand_ovl, item, idx);
     mHD_drop_item(submenu, tag, item, NULL);
+#ifdef TARGET_PC
+    /* M9-D G4-2: tell the net layer which pocket slot a hand swap just wrote (no-op unless network client) */
+    pc_net_game_exchange_note_swap(idx, pc_old_item != EMPTY_NO && hand_ovl->info.item == pc_old_item, (int)*item);
+#endif
 }
 
 static void mHD_open_sack(Submenu* submenu) {

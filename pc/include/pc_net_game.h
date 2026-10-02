@@ -489,6 +489,21 @@ void pc_net_game_notify_field_growth(void);
  * collision) or while the requester's PLAYER_CONTEXT does not say IN_TOWN. */
 int pc_net_game_request_drop(int pocket_slot_idx, int claimed_item, int ut_x, int ut_z);
 
+/* M9-D G4-2: catch-exchange menu (mSM_IV_OPEN_EXCHANGE) support for a network CLIENT; both functions are
+ * no-ops for the host and single-player (they return 0 / record nothing).
+ * pc_net_game_exchange_note_swap(): called by mHD_drop_item2() (m_hand_ovl.c) after every hand->pocket drop;
+ * `swapped` != 0 means the hand and pockets[slot] exchanged items, new_item is what pockets[slot] now holds.
+ * pc_net_game_exchange_request_drop(): called from mTG_exchange_proc() when the item left in the HAND
+ * (hand_item/hand_cond: the true pocket item id and its condition, before the present->field conversion) is
+ * about to be put on the ground. It puts hand_item back into the swap slot and sends it as an ordinary
+ * pc_net_game_request_drop(); on the host's ACCEPT the drop-result handler clears the slot and then writes the
+ * item that was in the slot (the caught item) into it. Returns 1 if a request is now in flight. Returns 0 if
+ * nothing was sent (not town, one-in-flight, unknown swap slot, present/quest item, not droppable ...): then
+ * the hand item stays in the slot (or is lost when there is no valid slot) and the replacement is lost.
+ * A return of 0 NEVER means 'write the field locally'. */
+void pc_net_game_exchange_note_swap(int slot, int swapped, int new_item);
+int pc_net_game_exchange_request_drop(int hand_item, int hand_cond, int ut_x, int ut_z);
+
 /* Host-local guard (used by the decomp host-local pickup and menu-drop seams): 1 iff the TOWN tile at
  * (ut_x, ut_z) is currently RESERVED by some client's pending network pickup/drop (a provisionally
  * accepted request still awaiting that client's INTERACT_CONFIRM, at most ~20 s). The host player's
@@ -1107,6 +1122,14 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
  * never re-applied" precedent -- the putaway-rod call site is the ONLY consumer, and only ever queries
  * once per catch. Never blocks. */
 int pc_net_game_query_catch_outcome(uint32_t entity_id);
+
+/* M9-D F2: record a locally-decided DENIED outcome for entity_id (same effect as a host reject: the next
+ * pc_net_game_query_catch_outcome(entity_id) returns PC_NETGAME_CATCH_STATUS_REJECTED once). Called by the
+ * catch seams (m_player_main_notice_net/rod.c_inc) when a DISCONNECTED client (role still CLIENT, link
+ * not READY) suppresses the local grant for a tracked entity: without it the putaway exchange gate would
+ * see NONE and let the full-pockets "exchange" grant an item the host still considers live (duplicate).
+ * No wire traffic. entity_id == 0 is ignored. */
+void pc_net_game_record_local_catch_denied(uint32_t entity_id);
 
 /* ================================================================================================
  * World Ecology Wildlife Sync T4: ordinary bug catching. Reuses the EXACT SAME CATCH_REQUEST/
