@@ -79,11 +79,12 @@ def main():
     build = func_body(hblk_raw, "pcnetgame_ts_build")
     check("M service 3 is built from the host's raw Save_Get(shop) (320 B) and the refresh_all / push loops cover it",
           "memcpy(blob, &Save_Get(shop), PC_NETGAME_TS_SHOP_LEN)" in build and "pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP)" in func_body(hblk_raw, "pcnetgame_ts_refresh_all")
-          and "svc <= (int)PC_NETGAME_TS_SHOP" in func_body(hblk_raw, "pcnetgame_host_ts_push_peer"))
+          and "svc <= (int)PC_NETGAME_TS_HOSTCFG" in func_body(hblk_raw, "pcnetgame_host_ts_push_peer"))  # batch A: the loop bound is now service 4 (HOST_CONFIG), which still covers the shop (3)
     check("M the host runs the CLIENT validator on its own shop blob and logs a loud warning if clients would refuse it; the validator checks every stock / lottery / rare entry, the bag count, sales_sum and the visitor flag",
           "pcnetgame_ts_valid_shop_blob(blob)" in func_body(hblk_raw, "pcnetgame_ts_refresh") and "would be REFUSED by clients" in hblk_raw
           and all(x in func_body(hblk_raw, "pcnetgame_ts_valid_shop_blob") for x in ("s.items[i]", "s.lottery_items[i]", "s.rare_item", "flowers_candy_grab_bag_count", "s.visitor_flag")))
     cl = func_body(cblk_raw, "pcnetgame_handle_client_town_svc")
+    cl = cl.replace("pcnetgame_ts_client_apply(&m); /* a session setting, not a save region: no usable save needed */", "")  # batch A (A1): the HOST_CONFIG early apply is a session setting, not a save region
     ok, miss = in_order(cl, ["s_client_link != PC_NETGAME_LINK_READY", "sizeof(m)", "svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP",
                              "m.len != expect", "pcnetgame_fnv1a32(m.blob, m.len) != m.digest", "m.seq <= s_ts_client_seq[svc]", "pcnetgame_ts_valid_shop_blob(m.blob)",
                              "pcfa_save_ready()", "pcnetgame_ts_client_apply(&m)"])

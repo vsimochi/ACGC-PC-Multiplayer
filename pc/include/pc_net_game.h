@@ -1106,6 +1106,19 @@ int pc_net_game_request_snowman_break(int ut_x, int ut_z);
  * pc_net_game_world_is_host_authoritative()/pc_net_game_role() checks. */
 int pc_net_game_authoritative_wildlife_enabled(void);
 
+/* Batch A (A1): the authoritative wildlife mode is decided by the HOST. A CLIENT adopts the mode from the host's TOWN_SVC_STATE service 4 (HOST_CONFIG,
+ * sent at READY before the snapshot); its own --authoritative-wildlife is ignored. pc_net_game_authoritative_wildlife_enabled() therefore returns, for
+ * a client, the host's announcement (0 until it arrives). pc_net_game_wildlife_mode_pending() is 1 iff this process is a CLIENT that has not received
+ * the announcement yet: local wildlife spawning (aSetMgr_move_set) is suppressed meanwhile so no local fish/bugs exist before the mode is known. */
+int pc_net_game_wildlife_mode_pending(void);
+
+/* Batch A (A2): host only. 1 iff a READY remote player in the town field scene currently stands in block (bx, bz) (mFI_Wpos2BlockNum numbering). The
+ * shell / mushroom refill skips such acres like the host player's own acre. 0 for client / solo. */
+int pc_net_game_host_remote_player_in_acre(int bx, int bz);
+
+/* Batch A (A3): 1 iff the CLIENT "not connected" notice should be drawn this frame (role CLIENT, local world loaded, link not READY for > 3 s). */
+int pc_net_game_client_notice_visible(void);
+
 /* World Ecology Wildlife Sync T0 (authority seam foundation only -- see pc_wildlife_authority.h's
  * own scope doc: NOT fish/bug catching, NOT a snapshot, NOT bee/ant capture sync). Called from the
  * decomp wade-trigger seam (aSetMgr_move_set(), ac_set_manager.c) INSTEAD of running

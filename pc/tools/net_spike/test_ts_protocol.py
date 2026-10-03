@@ -174,9 +174,15 @@ def m_mirror_at_ready(run, a, b):
     L.pump_sleep(2.5)
     ck("TS2 no spam: exactly ONE TOWN_SVC_STATE per service per client after 2.5 s idle (the digest poll sends only on a change)",
        ts_count(a, SVC_POLICE) == 1 and ts_count(a, SVC_MUSEUM) == 1 and ts_count(b, SVC_POLICE) == 1 and ts_count(b, SVC_MUSEUM) == 1)
-    ck("TS2 the shop (3) is mirrored since the shop milestone (exactly ONE push per client, 320 B, digest == FNV-1a32) and no reserved service (4+) is ever sent",
+    ck("TS2 the shop (3) is mirrored since the shop milestone (exactly ONE push per client, 320 B, digest == FNV-1a32), HOST_CONFIG (4, batch A) is pushed exactly "
+       "once per client (len 8, host WITHOUT --authoritative-wildlife -> blob[0] == 0, reserved bytes zero, digest == FNV-1a32) and no reserved service (5+) is ever sent",
        all(ts_count(c, L.PC_NETGAME_TS_SHOP) == 1 and c.ts_latest(L.PC_NETGAME_TS_SHOP)[0].len == L.PC_NETGAME_TS_SHOP_LEN for c in (a, b))
-       and not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM, L.PC_NETGAME_TS_SHOP)])
+       and all(ts_count(c, L.PC_NETGAME_TS_HOSTCFG) == 1 and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[0].len == L.PC_NETGAME_TS_HOSTCFG_LEN
+               and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[1] == bytes(8) and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[0].digest == L.fnv1a32(bytes(8)) for c in (a, b))
+       and not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM, L.PC_NETGAME_TS_SHOP, L.PC_NETGAME_TS_HOSTCFG)])
+    ck("TS3 batch A: HOST_CONFIG reaches each client BEFORE the first world SNAPSHOT_BEGIN (the wildlife mode is known before any wildlife snapshot message)",
+       all(ts_indices(c, L.PC_NETGAME_TS_HOSTCFG) and c.inbox.peek_all(L.p_msg_type(L.PC_NETGAME_MSG_SNAPSHOT_BEGIN, (L.CH_RELIABLE,)))
+           and ts_indices(c, L.PC_NETGAME_TS_HOSTCFG)[0] < c.inbox.peek_all(L.p_msg_type(L.PC_NETGAME_MSG_SNAPSHOT_BEGIN, (L.CH_RELIABLE,)))[0].index for c in (a, b)))
     return sa[SVC_POLICE], sa[SVC_MUSEUM]
 
 
@@ -540,8 +546,35 @@ def phase_kill(run):
     ck("K4 the host survived the dropped peer", run.host.alive())
 
 
+def phase_hostcfg_on(run):
+    """Batch A (A1): a host started WITH --authoritative-wildlife announces authoritative_wildlife=1 at READY (service 4, before the snapshot), once per
+    session, to every client incl. a late joiner; a same-nonce reconnect gets it again (new session)."""
+    ck = run.check
+    a = run.ready("A", run.r1)
+    ck("W setup: A READY and SYNCED", a.rec_synced and a.rec_last is not None)
+    st = latest(a, L.PC_NETGAME_TS_HOSTCFG, 1, 5.0)
+    ck("W1 client A received HOST_CONFIG (service 4): len 8, blob[0] == 1 (authoritative wildlife ON), 7 reserved bytes zero, digest == FNV-1a32 of the blob, seq >= 1",
+       st is not None and st[0].len == L.PC_NETGAME_TS_HOSTCFG_LEN and len(st[1]) == 8 and st[1][0] == 1 and st[1][1:] == bytes(7)
+       and st[0].digest == L.fnv1a32(st[1]) and st[0].seq >= 1)
+    idx = ts_indices(a, L.PC_NETGAME_TS_HOSTCFG)
+    snap = a.inbox.peek_all(L.p_msg_type(L.PC_NETGAME_MSG_SNAPSHOT_BEGIN, (L.CH_RELIABLE,)))
+    ck("W2 HOST_CONFIG precedes the first SNAPSHOT_BEGIN (and the wildlife snapshot that follows it)", len(idx) == 1 and len(snap) >= 1 and idx[0] < snap[0].index)
+    b = run.ready("B", run.r2)
+    sb = latest(b, L.PC_NETGAME_TS_HOSTCFG, 1, 5.0)
+    ck("W3 a late-joining client B also receives authoritative_wildlife=1 (same seq, same blob)", sb is not None and sb[1][0] == 1 and st is not None and sb[0].seq == st[0].seq)
+    L.pump_sleep(2.5)
+    ck("W4 no spam: exactly ONE HOST_CONFIG per client session after 2.5 s idle (the digest poll sends only on a change)",
+       ts_count(a, L.PC_NETGAME_TS_HOSTCFG) == 1 and ts_count(b, L.PC_NETGAME_TS_HOSTCFG) == 1)
+    ck("W5 the host log shows the READY push with value 1, once per peer", run.n_log(r"\[NET\]\[HOSTCFG\] host: pushed HOST_CONFIG authoritative_wildlife=1 seq \d+ to peer \d+ \(at READY") == 2)
+    a.reconnect_and_ready(timeout=8.0)
+    sa2 = a.wait_ts_state(L.PC_NETGAME_TS_HOSTCFG, 5.0, min_seq=1)
+    ck("W6 a same-nonce reconnect is announced the mode again at its new READY (value 1)", sa2 is not None and sa2[1][0] == 1)
+    ck("W7 the host survived", run.host.alive())
+
+
 PHASES = [
     ("M", [], phase_main),
+    ("W", ["--authoritative-wildlife"], phase_hostcfg_on),
     ("F-drop", ["--txn-fault=drop_result:1:1"], phase_drop),
     ("F-kill", ["--txn-fault=kill_peer_after_commit:1:1"], phase_kill),
 ]
@@ -550,7 +583,7 @@ PHASES = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=11000)
-    ap.add_argument("--only", default="", help="comma list of phase names (M, F-drop, F-kill)")
+    ap.add_argument("--only", default="", help="comma list of phase names (M, W, F-drop, F-kill)")
     args = ap.parse_args()
     L.require_test_bin_dir()
     if not os.path.basename(os.path.normpath(L.GAME_BIN_DIR)).startswith("bin_fixture4"):

@@ -3161,7 +3161,12 @@ static void mFI_ResearchShell(u8* can_set_ut_num, u8* on_shell_num, int* total_s
         int bx = l_sandy_beach_bx[i];
         int bz = l_sandy_beach_bz[i];
         /* Don't refresh shells if the player is in the acre */
-        if (bx != player_bx || bz != player_bz) {
+        if ((bx != player_bx || bz != player_bz)
+#ifdef TARGET_PC
+            /* Batch A (A2): nor in an acre a READY remote player stands in (host only; 0 for solo / client, so vanilla is unchanged) */
+            && !pc_net_game_host_remote_player_in_acre(bx, bz)
+#endif
+        ) {
             u8 can_set_num;
 
             can_set_ut_num[0] = mFI_GetCanSetShellNum(on_shell_num, bx, bz);

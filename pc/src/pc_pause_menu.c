@@ -3,6 +3,7 @@
 #include "pc_settings_menu.h"
 #include "pc_menu_util.h"
 #include "pc_text_draw.h"
+#include "pc_net_game.h" /* batch A (A3): pc_net_game_client_notice_visible() */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -249,5 +250,13 @@ void pc_pause_menu_draw(struct game_s* game) {
         else if (cur_page == PAGE_CONFIRM_QUIT) draw_confirm_page(game);
     }
 
+    mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+}
+
+void pc_net_notice_draw(struct game_s* game) {
+    if (g_pc_paused || game == NULL || game->graph == NULL || !pc_net_game_client_notice_visible()) return;
+    mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+    pc_menu_draw_centered(game, "Not connected to the host", 14.0f, 255, 90, 90, 255, 1.0f);
+    pc_menu_draw_centered(game, "Waiting for the connection...", 30.0f, 255, 255, 255, 230, 1.0f);
     mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
 }

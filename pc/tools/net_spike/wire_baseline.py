@@ -115,6 +115,8 @@ X3_SIZE_ASSERTS = ('_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 76,
                    '_Static_assert(offsetof(PCNetGameCatchRequestMsg, tag) == 20,')
 # Town services milestone 1: exact C lines (constants + size / offset asserts) that must stay as they are.
 TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM   2u", "#define PC_NETGAME_TS_SHOP     3u",
+             # batch A (A1): service 4 = HOST_CONFIG (authoritative wildlife mode), array bound 5, 8-byte blob
+             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      5u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
              "#define PC_NETGAME_TS_BLOB_MAX 340u", "#define PC_NETGAME_TS_POLICE_LEN 40u", "#define PC_NETGAME_TS_MUSEUM_LEN 63u",
              "#define PC_NETGAME_TXN_KIND_MUSEUM_DONATE 8u", "#define PC_NETGAME_TXN_KIND_POLICE_CLAIM  9u",
              '_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352,', "offsetof(PCNetGameTownSvcStateMsg, blob) == 12",
@@ -281,6 +283,8 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TS_POLICE": '1',
     "PC_NETGAME_TS_MUSEUM": '2',
     "PC_NETGAME_TS_SHOP": '3',
+    "PC_NETGAME_TS_HOSTCFG": '4',
+    "PC_NETGAME_TS_HOSTCFG_LEN": '8',
     "PC_NETGAME_TS_BLOB_MAX": '340',
     "PC_NETGAME_TS_POLICE_LEN": '40',
     "PC_NETGAME_TS_MUSEUM_LEN": '63',
@@ -517,6 +521,8 @@ def selftest(repo):
         "ts lib kind": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_KIND_POLICE_CLAIM = 9", "PC_NETGAME_TXN_KIND_POLICE_CLAIM = 10", 1)),
         "ts lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_ALREADY_DONATED = 15", "PC_NETGAME_TXN_REASON_ALREADY_DONATED = 25", 1)),
         "shop kind moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_KIND_SHOP_BUY  10u", "#define PC_NETGAME_TXN_KIND_SHOP_BUY  12u", 1)),
+        "hostcfg service id": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_HOSTCFG  5u", 1)),
+        "hostcfg lib len": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TS_HOSTCFG_LEN = 8", "PC_NETGAME_TS_HOSTCFG_LEN = 9", 1)),
         "shop blob len": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TS_SHOP_LEN   320u", "#define PC_NETGAME_TS_SHOP_LEN   321u", 1)),
         "shop stock code": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_SHOP_STOCK_RARE      0xFEu", "#define PC_NETGAME_SHOP_STOCK_RARE      0xFCu", 1)),
         "shop reason": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_REASON_NO_FUNDS        19u", "#define PC_NETGAME_TXN_REASON_NO_FUNDS        29u", 1)),

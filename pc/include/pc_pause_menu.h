@@ -26,6 +26,10 @@ int  pc_pause_menu_handle_event(const SDL_Event* e);
  * after game_main() returns. No-op if not paused. */
 void pc_pause_menu_draw(struct game_s* game);
 
+/* Batch A (A3): draws the small "not connected" notice of a network CLIENT whose link is not READY (pc_net_game_client_notice_visible()); same font
+ * path and call site as the pause overlay. No-op while the pause overlay is up or when the notice is hidden. */
+void pc_net_notice_draw(struct game_s* game);
+
 #ifdef __cplusplus
 }
 #endif

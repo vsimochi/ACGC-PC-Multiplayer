@@ -548,6 +548,8 @@ int main(int argc, char* argv[]) {
             printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
             printf("                      without it, every role spawns wildlife locally exactly as before\n");
             printf("                      this milestone -- see pc_platform.h and ac_set_manager.c.\n");
+            printf("                      HOST decides: the host announces the mode to every client at READY\n");
+            printf("                      (TOWN_SVC_STATE service 4); on a CLIENT the flag is ignored.\n");
             printf("  --force-villager-grow    Host-only test hook: force a villager to grow in once the\n");
             printf("                      world is ready, bypassing the real (multi-day) trigger condition\n");
             printf("                      only -- see pc_net_game.c.\n");

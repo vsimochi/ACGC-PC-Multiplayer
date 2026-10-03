@@ -2258,11 +2258,13 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_TS_POLICE   1u
 #define PC_NETGAME_TS_MUSEUM   2u
 #define PC_NETGAME_TS_SHOP     3u   /* milestone 2: Save_t.shop, the 320 raw bytes of Shop_c (little-endian PC image, host == client build) */
-#define PC_NETGAME_TS_NUM      4u   /* array bound: services 1..3 named (index 0 unused), 4+ reserved */
+#define PC_NETGAME_TS_HOSTCFG  4u   /* batch A (A1): HOST_CONFIG, the host's session configuration (NOT a Save_t region): blob = u8 authoritative_wildlife (0/1) + 7 reserved zero bytes */
+#define PC_NETGAME_TS_NUM      5u   /* array bound: services 1..4 named (index 0 unused), 5+ reserved */
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
 #define PC_NETGAME_TS_MUSEUM_LEN 63u
 #define PC_NETGAME_TS_SHOP_LEN   320u
+#define PC_NETGAME_TS_HOSTCFG_LEN 8u
 typedef struct PCNetGameTownSvcStateMsg {
     uint8_t  msg_type;   /* PC_NETGAME_MSG_TOWN_SVC_STATE */
     uint8_t  service;    /* PC_NETGAME_TS_* */
@@ -2282,6 +2284,7 @@ _Static_assert(PC_NETGAME_TS_POLICE_LEN == sizeof(PoliceBox_c) && PC_NETGAME_TS_
                    320u <= PC_NETGAME_TS_BLOB_MAX,
                "a town-service blob does not fit PCNetGameTownSvcStateMsg (the 320-byte shop blob is checked here too)");
 _Static_assert(PC_NETGAME_TS_SHOP_LEN == sizeof(Shop_c), "PC_NETGAME_TS_SHOP_LEN is no longer sizeof(Shop_c): the shop mirror wire image changed");
+_Static_assert(PC_NETGAME_TS_HOSTCFG_LEN <= PC_NETGAME_TS_BLOB_MAX, "the HOST_CONFIG blob does not fit PCNetGameTownSvcStateMsg");
 
 /* Mail milestone 2 (v8, unreleased): host -> the OWNING client only. One slot of the host's house mailbox. `house` = the host's homes[] index of the
  * bound resident's house, `mbox_idx` = the mailbox slot 0..9, flags bit 0 = EMPTY (the slot holds no letter: `letter` is then the canonical form of a
@@ -3041,6 +3044,18 @@ static int  pcnetgame_take_try_send_check(uint8_t mbox_idx, uint32_t want24, uin
 static void pcnetgame_take_op_resolve(uint32_t request_id, int applied);
 static uint8_t                  s_ts_last_reason; /* the PC_NETGAME_TXN_REASON_* of the last REJECTED town-service result (0 = none / a local refusal) */
 static uint32_t                 s_ts_next_rid = 0x70000000u; /* request ids only label this client's own operations (no host reservation exists) */
+/* Batch A (A1): the wildlife mode of THIS process when it is a CLIENT: -1 = the host's HOST_CONFIG has not arrived yet (local wildlife spawning is
+ * suppressed, see pc_net_game_wildlife_mode_pending()), 0 = host announced off, 1 = host announced on. Process-wide: survives an ordinary disconnect
+ * (like the pre-batch flag did); replaced by the next HOST_CONFIG (sent at every READY, before the snapshot). */
+static int8_t                   s_client_wildlife_mode = -1;
+/* The single predicate behind every wildlife authority gate in this file: a CLIENT follows the HOST's announcement (its own --authoritative-wildlife is
+ * ignored); host / solo use their own flag exactly as before. */
+static int pcnetgame_wildlife_auth_on(void) {
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        return s_client_wildlife_mode == 1;
+    }
+    return g_pc_authoritative_wildlife ? 1 : 0;
+}
 static uint32_t                 s_ts_client_seq[PC_NETGAME_TS_NUM];
 static uint8_t                  s_ts_client_have[PC_NETGAME_TS_NUM];
 static PCNetGameTownSvcStateMsg s_ts_client_stash[PC_NETGAME_TS_NUM];
@@ -14097,7 +14112,8 @@ static int pcnetgame_ts_valid_shop_blob(const uint8_t* blob) {
 }
 
 static const char* pcnetgame_ts_name(int svc) {
-    return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP" : "?";
+    return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
+           : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -14120,6 +14136,14 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
     if (svc == (int)PC_NETGAME_TS_SHOP) {
         memcpy(blob, &Save_Get(shop), PC_NETGAME_TS_SHOP_LEN); /* the raw Shop_c: stock, rare item, lottery, bag count, level, sales_sum, times */
         *len = (uint16_t)PC_NETGAME_TS_SHOP_LEN;
+        return 1;
+    }
+    if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
+        /* batch A (A1): the host's session configuration. byte 0 = authoritative wildlife mode (the HOST's --authoritative-wildlife is the single switch);
+         * bytes 1..7 reserved, zero. Not a save region: the client applies it without a usable save. */
+        memset(blob, 0, PC_NETGAME_TS_HOSTCFG_LEN);
+        blob[0] = g_pc_authoritative_wildlife ? 1u : 0u;
+        *len = (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN;
         return 1;
     }
     return 0;
@@ -14171,6 +14195,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_POLICE);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MUSEUM);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -14198,7 +14223,7 @@ static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_SHOP; svc++) {
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_HOSTCFG; svc++) {
         PCNetGameHostPeerState* st = &s_host_peer[peer];
         if (s_ts_host[svc].valid && st->ts_sent_seq[svc] != s_ts_host[svc].seq) {
             if (pcnetgame_ts_send_to_peer(peer, svc)) {
@@ -14207,6 +14232,24 @@ static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
                        (unsigned)s_ts_host[svc].seq, (int)peer);
             }
         }
+    }
+}
+
+/* Batch A (A1): HOST_CONFIG goes out at READY, BEFORE the world / wildlife snapshot is started (the reliable channel is ordered), so the client knows
+ * the wildlife mode before the first WILDLIFE_SNAPSHOT_* arrives. Only service 4 is pushed here; the other services follow from the tick as before.
+ * A failed send is retried by the tick (pcnetgame_host_ts_push_peer covers service 4 too). */
+static void pcnetgame_host_ts_push_hostcfg(PCNetPeerId peer) {
+    PCNetGameHostPeerState* st;
+    const int svc = (int)PC_NETGAME_TS_HOSTCFG;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    st = &s_host_peer[peer];
+    (void)pcnetgame_ts_refresh(svc);
+    if (s_ts_host[svc].valid && st->ts_sent_seq[svc] != s_ts_host[svc].seq && pcnetgame_ts_send_to_peer(peer, svc)) {
+        st->ts_sent_seq[svc] = s_ts_host[svc].seq;
+        printf("[NET][HOSTCFG] host: pushed HOST_CONFIG authoritative_wildlife=%d seq %u to peer %d (at READY, before the snapshot)\n",
+               (int)s_ts_host[svc].blob[0], (unsigned)s_ts_host[svc].seq, (int)peer);
     }
 }
 
@@ -17457,9 +17500,51 @@ static int pcnetgame_ts_valid_museum_blob(const uint8_t* blob) {
     return 1;
 }
 
+static int pcnetgame_ts_valid_hostcfg_blob(const uint8_t* blob) {
+    unsigned i;
+    if (blob[0] > 1u) {
+        return 0;
+    }
+    for (i = 1; i < PC_NETGAME_TS_HOSTCFG_LEN; i++) {
+        if (blob[i] != 0u) {
+            return 0; /* reserved bytes must be zero (v8 unreleased: strict) */
+        }
+    }
+    return 1;
+}
+
+/* Batch A (A1): applies the host's HOST_CONFIG wildlife mode on a CLIENT.
+ * Transition contract: -1 (unknown, boot: local wildlife spawning is SUPPRESSED, see pc_net_game_wildlife_mode_pending()) -> 0/1 needs nothing,
+ * nothing local was ever spawned. 0 -> 1 (a host restarted with the flag): pre-existing LOCAL vanilla fish/bugs cannot be destroyed safely (no
+ * destroy API, pooled actors) and live out their vanilla life / are torn down at the next scene change; the presentation bookkeeping is reset so
+ * the host's records can be materialized. 1 -> 0: the materialized records stay as ordinary actors until they expire; the bookkeeping and the
+ * snapshot state are reset so nothing authoritative is tracked any more. Only the wildlife spawn source changes, nothing about identity / economy. */
+static void pcnetgame_client_wildlife_mode_apply(int on) {
+    const int prev = (int)s_client_wildlife_mode;
+    s_client_wildlife_mode = (int8_t)(on ? 1 : 0);
+    printf("[NET][HOSTCFG] client: adopted authoritative_wildlife=%d from the host (previous %s; this client's own --authoritative-wildlife=%d is ignored)\n",
+           (int)s_client_wildlife_mode, prev < 0 ? "unknown" : prev ? "1" : "0", g_pc_authoritative_wildlife ? 1 : 0);
+    if (prev >= 0 && prev != (int)s_client_wildlife_mode) {
+        pcwld_presentation_reset();
+        pcwld_clear_local_actor_stamps();
+        s_client_wildlife_known_generation = 0;
+        s_client_wildlife_snap_active = 0;
+        printf("[NET][HOSTCFG] client: wildlife mode changed %d -> %d: presentation bookkeeping reset (already spawned actors are not destroyed; see the transition contract)\n",
+               prev, (int)s_client_wildlife_mode);
+    }
+}
+
 static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
     const int svc = (int)m->service;
     int i;
+    if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
+        pcnetgame_client_wildlife_mode_apply(m->blob[0] != 0);
+        s_ts_client_seq[svc] = m->seq;
+        s_ts_client_have[svc] = 1;
+        printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc),
+               (unsigned)m->seq, (unsigned)m->digest, (unsigned)m->len);
+        return;
+    }
     if (svc == (int)PC_NETGAME_TS_POLICE) {
         for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
             Save_Get(police_box).keep_items[i] = (mActor_name_t)((uint16_t)m->blob[2 * i] | ((uint16_t)m->blob[2 * i + 1] << 8));
@@ -17499,12 +17584,13 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     memset(&m, 0, sizeof(m));
     memcpy(&m, data, size);
     svc = (int)m.service;
-    if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP) {
+    if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
     expect = (svc == (int)PC_NETGAME_TS_POLICE) ? (uint16_t)PC_NETGAME_TS_POLICE_LEN
-             : (svc == (int)PC_NETGAME_TS_SHOP) ? (uint16_t)PC_NETGAME_TS_SHOP_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_SHOP) ? (uint16_t)PC_NETGAME_TS_SHOP_LEN
+             : (svc == (int)PC_NETGAME_TS_HOSTCFG) ? (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -17521,9 +17607,15 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
         return;
     }
     if (!(svc == (int)PC_NETGAME_TS_POLICE ? pcnetgame_ts_valid_police_blob(m.blob)
-          : svc == (int)PC_NETGAME_TS_SHOP ? pcnetgame_ts_valid_shop_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_SHOP ? pcnetgame_ts_valid_shop_blob(m.blob)
+          : svc == (int)PC_NETGAME_TS_HOSTCFG ? pcnetgame_ts_valid_hostcfg_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
-               svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop" : "museum");
+               svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
+               : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : "museum");
+        return;
+    }
+    if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
+        pcnetgame_ts_client_apply(&m); /* a session setting, not a save region: no usable save needed */
         return;
     }
     if (!pcfa_save_ready()) {
@@ -18948,6 +19040,7 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     pcnetgame_host_send_scene_roster(peer);
 
     /* v2: bootstrap the client's world (initial connect, late join and reconnect all land here). */
+    pcnetgame_host_ts_push_hostcfg(peer); /* batch A (A1): the wildlife mode is announced BEFORE any snapshot message */
     pcnetgame_host_start_snapshot(peer, "joined");
     pcnetgame_host_rec_on_ready(peer); /* D3: AWAIT_HELLO */
 }
@@ -20239,6 +20332,10 @@ int pc_net_game_start_client(const char* host_ip, uint16_t port) {
     }
     s_role = PC_NETGAME_ROLE_CLIENT;
     s_client_link = PC_NETGAME_LINK_CONNECTING;
+    s_client_wildlife_mode = -1; /* batch A (A1): unknown until the host's HOST_CONFIG arrives (local wildlife spawning is suppressed meanwhile) */
+    if (g_pc_authoritative_wildlife) {
+        printf("[NET][HOSTCFG] client: --authoritative-wildlife is IGNORED on a client: the host's HOST_CONFIG decides the wildlife mode (unknown until it arrives; local wildlife spawning suppressed meanwhile)\n");
+    }
     /* Stage 5A/5B/v2: a fresh connection never carries over a previous one's state (request ids,
      * pending requests, world seqs, snapshot progress...) -- see pcnetgame_reset_client_session_state(). */
     pcnetgame_reset_client_session_state();
@@ -20679,7 +20776,7 @@ static void pcnetgame_run_fish_catch_test_trigger_host(void) {
     if (!g_pc_force_fish_catch || s_done || s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
-    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town() || Now_Private == NULL) {
+    if (!pcnetgame_wildlife_auth_on() || !s_host_world_ready || !pcfa_scene_is_town() || Now_Private == NULL) {
         return;
     }
 
@@ -20768,7 +20865,7 @@ static void pcnetgame_run_fish_catch_test_trigger_client(void) {
         s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL) {
         return;
     }
-    if (!g_pc_authoritative_wildlife || !pcfa_scene_is_town() || s_force_catch_last_fish_entity_id == 0) {
+    if (!pcnetgame_wildlife_auth_on() || !pcfa_scene_is_town() || s_force_catch_last_fish_entity_id == 0) {
         return;
     }
     if (!pcnetgame_client_record_synced()) {
@@ -20856,7 +20953,7 @@ static void pcnetgame_run_bug_catch_test_trigger_host(void) {
     if (!g_pc_force_bug_catch || s_done || s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
-    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town() || Now_Private == NULL) {
+    if (!pcnetgame_wildlife_auth_on() || !s_host_world_ready || !pcfa_scene_is_town() || Now_Private == NULL) {
         return;
     }
 
@@ -20933,7 +21030,7 @@ static void pcnetgame_run_bug_catch_test_trigger_client(void) {
         s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL) {
         return;
     }
-    if (!g_pc_authoritative_wildlife || !pcfa_scene_is_town() || s_force_catch_last_bug_entity_id == 0) {
+    if (!pcnetgame_wildlife_auth_on() || !pcfa_scene_is_town() || s_force_catch_last_bug_entity_id == 0) {
         return;
     }
     if (!pcnetgame_client_record_synced()) {
@@ -21018,7 +21115,7 @@ static void pcnetgame_run_bug_ttl_lookup_diag_host(void) {
     if (g_pc_diag_bug_ttl_lookup_frames <= 0 || s_done || s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
-    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town()) {
+    if (!pcnetgame_wildlife_auth_on() || !s_host_world_ready || !pcfa_scene_is_town()) {
         return;
     }
 
@@ -21104,7 +21201,7 @@ static void pcnetgame_run_bug_despawn_label_race_diag(void) {
     if (!g_pc_diag_bug_despawn_label_race || s_stage >= 3 || s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
-    if (!g_pc_authoritative_wildlife || !s_host_world_ready || !pcfa_scene_is_town()) {
+    if (!pcnetgame_wildlife_auth_on() || !s_host_world_ready || !pcfa_scene_is_town()) {
         return;
     }
 
@@ -21449,10 +21546,97 @@ static void pcnetgame_run_bury_test_seed(void) {
     }
 }
 
+/* ===== BATCH A BEGIN (A2 spawn exclusion, A3 not-connected notice) ===== */
+
+/* A2: 1 iff `bx`,`bz` (the 1-based block numbering mFI_Wpos2BlockNum() returns, the same numbering the shell / mushroom refill uses for "the player's
+ * acre") is the acre a READY REMOTE player currently stands in: that peer is in the town / island field scene (PC_NETSCENE_KIND_FIELD, announced by
+ * PLAYER_SCENE) and its last synced MOVE position (finite, in range) maps to that acre. Host only (0 for client / solo: nothing changes there).
+ * The refill functions (mFI_ResearchShell, mMsr_SetMushroomNum, mMsr_ClearMushrooms) call it per candidate acre and skip such an acre exactly like the
+ * host's own player's acre, so a shell / mushroom never pops into view next to a remote player. Read-only, bounded (<= PC_NET_MAX_PEERS peers),
+ * no RNG, no writes. */
+int pc_net_game_host_remote_player_in_acre(int bx, int bz) {
+    int p;
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        PCNetPlayerScene sc;
+        float px, py, pz;
+        xyz_t pos;
+        int pbx = 0, pbz = 0;
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (!pc_remote_player_get_scene((PCNetPlayerId)p, &sc) || !sc.valid || sc.kind != (uint8_t)PC_NETSCENE_KIND_FIELD) {
+            continue;
+        }
+        if (!pc_remote_player_get_last_position((PCNetPlayerId)p, &px, &py, &pz) || !pcnetgame_pos_valid(px, py, pz)) {
+            continue;
+        }
+        pos.x = px;
+        pos.y = py;
+        pos.z = pz;
+        if (mFI_Wpos2BlockNum(&pbx, &pbz, pos) == TRUE && pbx == bx && pbz == bz) {
+            printf("[NET][SPAWN] host: acre (%d,%d) is skipped by the shell / mushroom refill: remote peer %d stands in it\n", bx, bz, p);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A3: the "not connected" notice. role CLIENT, local world loaded, link != READY continuously for > 3 s (before READY at join, and after a host
+ * loss: the client is then silently inert for world actions, see audit G7). Shown by pc_net_notice_draw() (pc_pause_menu.c: the existing PC font
+ * overlay path, drawn from graph_main right after the pause overlay's call site). A loud rate-limited (10 s) console line is printed regardless of
+ * whether anything is rendered. Host / solo: never. */
+#define PC_NETGAME_NOTICE_DELAY_MS 3000u
+#define PC_NETGAME_NOTICE_LOG_MS   10000u
+static uint32_t s_notice_since_ms = 0;
+static int      s_notice_timing = 0;
+static int      s_notice_visible = 0;
+static uint32_t s_notice_last_log_ms = 0;
+
+static void pcnetgame_client_notice_update(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    const int cond = s_role == PC_NETGAME_ROLE_CLIENT && s_local_world_latched && s_client_link != PC_NETGAME_LINK_READY;
+    if (!cond) {
+        if (s_notice_visible) {
+            printf("[NET][NOTICE] client: link is READY again -- the not-connected notice is hidden\n");
+        }
+        s_notice_timing = 0;
+        s_notice_visible = 0;
+        return;
+    }
+    if (!s_notice_timing) {
+        s_notice_timing = 1;
+        s_notice_since_ms = now;
+    }
+    if ((uint32_t)(now - s_notice_since_ms) >= PC_NETGAME_NOTICE_DELAY_MS) {
+        if (!s_notice_visible || (uint32_t)(now - s_notice_last_log_ms) >= PC_NETGAME_NOTICE_LOG_MS) {
+            s_notice_last_log_ms = now;
+            printf("[NET][NOTICE] client: NOT CONNECTED to the host (link state %d, %u s): world actions are disabled until the link is READY (on-screen notice %s)\n",
+                   (int)s_client_link, (unsigned)((now - s_notice_since_ms) / 1000u), s_notice_visible ? "still shown" : "shown");
+        }
+        s_notice_visible = 1;
+    }
+}
+
+int pc_net_game_client_notice_visible(void) {
+    return s_notice_visible;
+}
+
+/* ===== BATCH A END ===== */
+
 void pc_net_game_poll(void) {
     PCNetEvent ev;
 
-    if (s_role == PC_NETGAME_ROLE_NONE) return;
+    if (s_role == PC_NETGAME_ROLE_NONE) {
+        s_notice_visible = 0;
+        s_notice_timing = 0;
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        pcnetgame_client_notice_update();
+    }
 
     if (s_role == PC_NETGAME_ROLE_CLIENT) {
         pcnetgame_client_talk_refresh_tick(); /* M9-C: keep an outstanding talk BEGIN alive on the host */
@@ -23836,7 +24020,12 @@ void pc_net_game_notify_local_mail_delivered(int slot, const uint8_t* player_nam
 
 /* See pc_net_game.h's own doc. */
 int pc_net_game_authoritative_wildlife_enabled(void) {
-    return g_pc_authoritative_wildlife ? 1 : 0;
+    return pcnetgame_wildlife_auth_on();
+}
+
+/* Batch A (A1): see pc_net_game.h. */
+int pc_net_game_wildlife_mode_pending(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_wildlife_mode < 0;
 }
 
 /* See pc_net_game.h's own doc. No "one already in flight" guard, matching TREE_SHAKE's own
@@ -23848,7 +24037,7 @@ int pc_net_game_request_wildlife_spawn_trigger(int bx, int bz) {
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
         return 0;
     }
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior, matching
                      every other single-player/disabled-feature early-return in this file */
     }
@@ -23884,7 +24073,7 @@ void pc_net_game_host_local_wildlife_spawn_trigger(int bx, int bz) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         return; /* opt-in gate off -- caller falls through to plain vanilla behavior */
     }
     pcwld_host_spawn_trigger(bx, bz);
@@ -23917,7 +24106,7 @@ static int pcnetgame_request_catch_common(uint32_t entity_id, int kind, int clai
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
         return 0;
     }
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior */
     }
     if (pcnetgame_client_record_gate_blocks("CATCH")) {
@@ -23993,7 +24182,7 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return 0;
     }
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior */
     }
 
@@ -24030,7 +24219,7 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
  * T0 scope (a full reach/position-validation system is later work). */
 static void pcnetgame_handle_host_wildlife_spawn_trigger_request(PCNetPeerId peer,
                                                                  const PCNetGameWildlifeSpawnTriggerRequestMsg* in) {
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         /* Opt-in gate off -- ignore. Without this check a flag-off host would still run the full
          * adapter (real vanilla spawn decision + real actor creation + broadcast) the moment ANY
          * peer sends this message type, on top of its own already-running vanilla local spawning,
@@ -24073,7 +24262,7 @@ static void pcnetgame_handle_host_wildlife_spawn_trigger_request(PCNetPeerId pee
  * authoritative state -- it only constructs a local presentation actor from data the host already
  * decided. */
 static void pcnetgame_handle_client_wildlife_spawn(const PCNetGameWildlifeSpawnMsg* in) {
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         /* Opt-in gate off -- ignore. Without this check a flag-off client connected to a flag-on
          * host would still materialize the host's spawns via pcwld_presentation_create() ON TOP OF
          * its own vanilla local spawning. See the matching comment in
@@ -24205,7 +24394,7 @@ static int pcnetgame_build_wildlife_snapshot_entry(PCNetGameWildlifeSnapshotEntr
  * this milestone: entity 100, still alive and still authoritative, must NOT be destroyed and
  * recreated just because the client's transport connection blipped). */
 static void pcnetgame_handle_client_wildlife_snapshot_begin(const PCNetGameWildlifeSnapshotBeginMsg* in) {
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         /* Opt-in gate off -- ignore. Without this check a flag-off client joining LATE (after
          * wildlife already exists on the host) would still run the known-generation/reset logic
          * below and flip s_client_wildlife_snap_active on, letting the ENTRY/END handlers that
@@ -24270,7 +24459,7 @@ static void pcnetgame_handle_client_wildlife_snapshot_begin(const PCNetGameWildl
  * pcwld_presentation_create(), mirroring T1's own existing unconditional-creation behavior for an
  * ordinary WILDLIFE_SPAWN (see PCNetGameWildlifeSnapshotEntryMsg's own doc). */
 static void pcnetgame_handle_client_wildlife_snapshot_entry(const PCNetGameWildlifeSnapshotEntryMsg* in) {
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         /* Opt-in gate off -- ignore. This is the handler that actually calls
          * pcwld_presentation_create() and materializes a real local actor -- without this check a
          * flag-off client would do so for every entry in a late-join snapshot, on top of its own
@@ -24363,7 +24552,7 @@ static void pcnetgame_handle_client_wildlife_snapshot_entry(const PCNetGameWildl
 static void pcnetgame_handle_client_wildlife_snapshot_end(const PCNetGameWildlifeSnapshotEndMsg* in) {
     int removed;
 
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         /* Opt-in gate off -- ignore. In practice s_client_wildlife_snap_active can never be 1 here
          * when the flag is off (BEGIN's own gate above refuses to set it), so this is defense in
          * depth / consistency with the BEGIN and ENTRY gates rather than something this path can
@@ -24467,7 +24656,7 @@ void pc_net_game_record_local_catch_denied(uint32_t entity_id) {
  * it only reconciles whatever local fish presentation actor it may have for entity_id, exactly like
  * every other passive wildlife broadcast receiver in this milestone. */
 static void pcnetgame_handle_client_wildlife_despawn(const PCNetGameWildlifeDespawnMsg* in) {
-    if (!g_pc_authoritative_wildlife) {
+    if (!pcnetgame_wildlife_auth_on()) {
         /* Opt-in gate off -- ignore, same defense-in-depth reasoning as every other wildlife handler's
            own gate in this file (a flag-off client never materialized a local presentation actor to
            begin with, so this is a no-op in practice, but keeps the invariant explicit and uniform). */

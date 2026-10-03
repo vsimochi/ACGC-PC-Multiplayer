@@ -394,6 +394,7 @@ static void graph_main(GRAPH* this, GAME* game) {
     PC_DIAG(10, "graph_main: game_main returned, frame_counter=%d\n", this->frame_counter);
 #ifdef TARGET_PC
     pc_pause_menu_draw(game);
+    pc_net_notice_draw(game); /* batch A (A3): CLIENT "not connected" notice (no-op for host / solo / READY / paused) */
 #endif
     GRAPH_SET_DOING_POINT(this, GAME_MAIN_FINISHED);
     if (ResetStatus < IRQ_RESET_DELAY) {

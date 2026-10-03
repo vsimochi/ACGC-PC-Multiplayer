@@ -133,7 +133,9 @@ def main():
           "data[0] == (uint8_t)PC_NETGAME_MSG_TOWN_SVC_STATE" in hd and "pcnetgame_handle_client_town_svc" not in hd and "pcnetgame_ts_client_apply" not in hd
           and "pcnetgame_handle_client_town_svc" in func_body(c, "pcnetgame_handle_client_data"))
     cl = func_body(cblk_raw, "pcnetgame_handle_client_town_svc")
-    ok, miss = in_order(cl, ["s_client_link != PC_NETGAME_LINK_READY", "sizeof(m)", "svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM",
+    # batch A (A1): the HOST_CONFIG (service 4) session setting is applied BEFORE the save-ready stash by design (it is not a save region); the order below is that of the SAVE-REGION services
+    cl_regions = cl.replace("pcnetgame_ts_client_apply(&m); /* a session setting, not a save region: no usable save needed */", "")
+    ok, miss = in_order(cl_regions, ["s_client_link != PC_NETGAME_LINK_READY", "sizeof(m)", "svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM",
                              "m.len != expect", "pcnetgame_fnv1a32(m.blob, m.len) != m.digest", "m.seq <= s_ts_client_seq[svc]",
                              "pcnetgame_ts_valid_police_blob(m.blob)", "pcfa_save_ready()", "pcnetgame_ts_client_apply(&m)"])
     check("M the client validates in order: READY link, message size, service (3 SHOP and 4+ are ignored), exact len + size, digest, seq strictly above the last of this session "
@@ -147,7 +149,7 @@ def main():
     check("M the client writes the blob into its LOCAL Save_Get(police_box) / Save_Get(museum_display) ONLY in pcnetgame_ts_client_apply; that function is called only by the mirror handler "
           "and the stash tick; no other 'keep_items[..] =' / museum_display write exists on the client side",
           "Save_Get(police_box).keep_items[i] = " in ap and "memcpy(&Save_Get(museum_display), m->blob, PC_NETGAME_TS_MUSEUM_LEN)" in ap
-          and c.count("pcnetgame_ts_client_apply(") == 3  # definition + handler + stash tick
+          and c.count("pcnetgame_ts_client_apply(") == 4  # definition + handler + stash tick + the batch A HOST_CONFIG early apply (a session setting, no save needed)
           and len(re.findall(r"keep_items\[[^\]]*\]\s*=[^=]", c)) == 2 and len(re.findall(r"&Save_Get\(museum_display\)", c)) == 2)  # host build() reads it; apply writes it
     check("M a mirror that arrives before the local save is usable is STASHED (one per service) and applied by the client tick; the interiors: the police draw table is refreshed through the "
           "existing mFI_SetFGUpData() when the client stands in SCENE_POLICE_BOX, the museum rooms reflect it at the next entry (documented)",

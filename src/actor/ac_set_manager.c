@@ -225,7 +225,11 @@ static int aSetMgr_move_set(GAME_PLAY* play, SET_MANAGER* set_manager) {
        * this same wade event is a pure network no-op below (already covered by the first tick's
        * trigger). Single-player (pc_net_game_role() == PC_NETGAME_ROLE_NONE) falls through to the
        * plain, unmodified vanilla call on BOTH ticks, exactly as before. */
-      if (!pc_net_game_authoritative_wildlife_enabled()) {
+      if (pc_net_game_wildlife_mode_pending()) {
+          /* Batch A (A1): a CLIENT that has not yet received the host's wildlife mode (HOST_CONFIG arrives at READY, before the snapshot) must not
+           * roll a local spawn: no-op until the mode is known (then either the authoritative path below or the plain vanilla call as before). */
+      }
+      else if (!pc_net_game_authoritative_wildlife_enabled()) {
           set_manager->set_overlay.ovl_proc(set_manager, play);
       }
       else if (set_manager->set_ovl_type == aSetMgr_OVERLAY_BEGIN &&
