@@ -1575,6 +1575,186 @@ static int aNSC_buy_item_only_one(u32* bells, mActor_name_t itm, u8* p3, int sel
     return next;
 }
 
+#ifdef TARGET_PC
+/* ===== Town services milestone 2 (NOOK'S SHOP): the CLIENT purchase / sale seams =====
+ * On a network CLIENT the wallet, the pockets and Save_t.shop are never changed locally by a purchase or a sale: the vanilla mutations
+ * (aNSC_sell_answer0's pocket write, aNSC_sell_item_init's debit + mSP_PlusSales + mSP_ShopSaleReport, aNSC_buy_check's credit / exchange / sales
+ * accounting, aNSC_receive_check's disposal) are replaced by ONE host transaction each (TXN_COMMIT SHOP_BUY / SHOP_SELL, pc_net_game_ts_begin_shop_*
+ * + pc_net_game_ts_poll). While it is pending NOTHING changes locally and the dialogue waits in its current action; APPLIED continues the vanilla
+ * success dialogue (the pockets and wallet are already the host's post-image); a refusal takes an existing row. The sale value / price are computed
+ * by the HOST (this file only shows the player its own estimate). Deferred (still refused on a client): paint (house service), catalog orders,
+ * raffle tickets for purchases (never granted), stationery sales, bargain-day / raffle-day stock. */
+static int aNSC_pc_buy_wait;   /* 1 while a SHOP_BUY is in flight (aNSC_sell_answer0 polls it) */
+static int aNSC_pc_sell_wait;  /* 1 = a SHOP_SELL must still be begun, 2 = in flight (aNSC_buy_check / aNSC_receive_check poll it) */
+static u32 aNSC_pc_sell_mask;
+static int aNSC_pc_sell_primary;
+static mActor_name_t aNSC_pc_sell_item;
+static int aNSC_pc_sell_bags_before;
+
+#define aNSC_PC_ROW_REFUSED 11 /* aNSC_sell_answer0 row 11: a refused purchase (sold out / host refusal): the existing "cancel" text */
+
+static void aNSC_pc_reset_waits(void) {
+    aNSC_pc_buy_wait = 0;
+    aNSC_pc_sell_wait = 0;
+}
+
+/* One step of the purchase transaction. -1 = pending (nothing changed), else the aNSC_sell_answer0 row: 0 success, 3 not enough money,
+ * 4 pockets full, aNSC_PC_ROW_REFUSED. */
+static int aNSC_pc_buy_step(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    mActor_name_t item = shop_common->sell_item;
+    int r, reason;
+    if (!aNSC_pc_buy_wait) {
+        int idx = mPr_GetPossessionItemIdx(Now_Private, EMPTY_NO);
+        int code;
+        if (idx == -1) {
+            return 4;
+        }
+        code = pc_net_game_shop_buy_stock_code((int)item); /* the stock code against the MIRRORED shop; -1 = not buyable (special-day stock, paint, sold out) */
+        if (code < 0) {
+            return aNSC_PC_ROW_REFUSED;
+        }
+        r = pc_net_game_ts_begin_shop_buy(idx, (int)item, code, (int)mSP_ItemNo2ItemPrice(item));
+        if (r < 0) {
+            return -1; /* another pocket transaction is unresolved: try again next frame */
+        }
+        if (r == 0) {
+            return aNSC_PC_ROW_REFUSED;
+        }
+        aNSC_pc_buy_wait = 1;
+        return -1;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return -1;
+    }
+    aNSC_pc_buy_wait = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED) {
+        return 0;
+    }
+    reason = pc_net_game_ts_last_reject_reason();
+    if (reason == PC_NETGAME_TS_REJECT_NO_FUNDS) {
+        return 3;
+    }
+    if (reason == PC_NETGAME_TS_REJECT_NOT_AVAILABLE && CLIP(shop_design_clip) != NULL) {
+        /* the item was sold to somebody else first: take it off the floor display (client mode of the report: display only, no accounting) */
+        CLIP(shop_design_clip)->reportGoodsSale_proc(shop_common->ut_x, shop_common->ut_z);
+    }
+    return aNSC_PC_ROW_REFUSED;
+}
+
+/* The follow-up row of an APPLIED purchase: the vanilla special texts for tools / signboards. Furniture / clothes / wallpaper / carpet normally give
+ * a raffle ticket: that is deferred and never granted to a client, so they take the plain "thank you" row 0. */
+static int aNSC_pc_buy_success_row(mActor_name_t item) {
+    if (aNSC_check_item_with_ticket(item) == TRUE) {
+        return 0;
+    }
+    if (item == ITM_SIGNBOARD) {
+        return 0xa;
+    }
+    switch (item) {
+        case ITM_NET:
+            return 0x5;
+        case ITM_AXE:
+            return 0x6;
+        case ITM_SHOVEL:
+            return 0x7;
+        case ITM_ROD:
+            return 0x8;
+    }
+    return 0;
+}
+
+static int aNSC_pc_count_bags(void) {
+    int i, n = 0;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if (Now_Private->inventory.pockets[i] == ITM_MONEY_30000) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Collects the slots of the sale exactly like vanilla's sale loops (several selected items = their slots; one item with `counter` copies = the
+ * first `counter` NORMAL-condition slots holding it; one item = its slot). 0 = nothing to sell. */
+static int aNSC_pc_sell_prepare(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+    Submenu_Item_c* si = play->submenu.item_p;
+    u32 mask = 0;
+    int k, n = 0, primary = -1;
+    mActor_name_t item;
+    if (play->submenu.selected_item_num > 1) {
+        for (k = 0; k < (int)play->submenu.selected_item_num; k++) {
+            if (si[k].slot_no < mPr_POCKETS_SLOT_COUNT) {
+                mask |= 1u << si[k].slot_no;
+            }
+        }
+    } else if (shop_common->counter <= 1u) {
+        if (si->slot_no < mPr_POCKETS_SLOT_COUNT) {
+            mask = 1u << si->slot_no;
+        }
+    } else {
+        item = Now_Private->inventory.pockets[si->slot_no];
+        for (k = 0; k < mPr_POCKETS_SLOT_COUNT && n < (int)shop_common->counter; k++) {
+            if (Now_Private->inventory.pockets[k] == item && mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, k) == mPr_ITEM_COND_NORMAL) {
+                mask |= 1u << k;
+                n++;
+            }
+        }
+    }
+    for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+        if (mask & (1u << k)) {
+            primary = k;
+            break;
+        }
+    }
+    if (primary < 0) {
+        return 0;
+    }
+    aNSC_pc_sell_mask = mask;
+    aNSC_pc_sell_primary = primary;
+    aNSC_pc_sell_item = Now_Private->inventory.pockets[primary];
+    aNSC_pc_sell_bags_before = aNSC_pc_count_bags();
+    aNSC_pc_sell_wait = 1;
+    return 1;
+}
+
+/* One step of the sale transaction. -1 = pending, else aNSC_buy_check's row: 0 broke a bag, 1 normal, 2 cancelled / refused, 3 money overflow. */
+static int aNSC_pc_sell_step(void) {
+    int r, reason;
+    if (aNSC_pc_sell_wait == 1) {
+        r = pc_net_game_ts_begin_shop_sell((int)aNSC_pc_sell_mask, aNSC_pc_sell_primary, (int)aNSC_pc_sell_item);
+        if (r < 0) {
+            return -1; /* busy: retried next frame */
+        }
+        if (r == 0) {
+            aNSC_pc_sell_wait = 0;
+            return aNSC_BUY_OUTCOME_CANCEL;
+        }
+        aNSC_pc_sell_wait = 2;
+        return -1;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return -1;
+    }
+    aNSC_pc_sell_wait = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED) {
+        return aNSC_pc_count_bags() > aNSC_pc_sell_bags_before ? aNSC_BUY_OUTCOME_BREAK_BAG : aNSC_BUY_OUTCOME_NORMAL;
+    }
+    reason = pc_net_game_ts_last_reject_reason();
+    return reason == PC_NETGAME_TS_REJECT_NO_ROOM ? aNSC_BUY_OUTCOME_MONEY_OVERFLOW : aNSC_BUY_OUTCOME_CANCEL;
+}
+
+static int aNSC_pc_selection_has_paper(Submenu* menu) {
+    int k;
+    for (k = 0; k < (int)menu->selected_item_num; k++) {
+        if (ITEM_IS_PAPER(menu->item_p[k].item)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+#endif
+
 #ifdef aNSC_MAMEDANUKI
 
 static void aNSC_set_talk_info_start_wait(ACTOR* actorx) {
@@ -2169,6 +2349,12 @@ static void aNSC_msg_win_open_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
             action = aNSC_CHECK_BUY_NONE_SELECTED;
         } else {
             action = aNSC_check_buy_item(shop_common, submenu);
+#ifdef TARGET_PC
+            if (aNSC_PC_IS_CLIENT() && aNSC_pc_selection_has_paper(submenu)) {
+                /* stationery stacks (price x stack, per-stack paper accounting) are not sold through the network seam: the existing "cannot take that" row */
+                action = aNSC_CHECK_BUY_REFUSE_QUEST_COND;
+            }
+#endif
         }
         if (action == aNSC_CHECK_BUY_OFFER_BUY_ALL) {
 #ifdef aNSC_MAMEDANUKI
@@ -2223,6 +2409,19 @@ static void aNSC_buy_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) 
     int n3 = aNSC_get_msg_no(aNSC_MSG_BUY_REFUSE_PLURAL);
     int num = mMsg_Get_msg_num(msg_p);
     int next;
+#ifdef TARGET_PC
+    if (aNSC_PC_IS_CLIENT() && aNSC_pc_sell_wait) {
+        /* the sale transaction is in flight (or still to be begun): nothing local changes until the host's answer */
+        next = aNSC_pc_sell_step();
+        if (next == -1) {
+            return;
+        }
+        mMsg_Set_ForceNext(msg_p);
+        aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
+        aNSC_setupAction(shop_common, play, next_act_idx[next]);
+        return;
+    }
+#endif
     if (num == n1 || num == n2 || num == n3) {
         if (mMsg_Check_MainNormalContinue(msg_p)) {
             next = -1;
@@ -2235,7 +2434,14 @@ static void aNSC_buy_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) 
                     next = 1;
                     if (!aNSC_check_money_overflow(bells, counter)) {
                         next = aNSC_BUY_OUTCOME_MONEY_OVERFLOW;
-                    } else {
+                    }
+#ifdef TARGET_PC
+                    else if (aNSC_PC_IS_CLIENT()) {
+                        /* town services milestone 2: the host pays, credits sales_sum and empties the slots; nothing is changed here */
+                        next = aNSC_pc_sell_prepare(shop_common, play) ? aNSC_pc_sell_step() : aNSC_BUY_OUTCOME_CANCEL;
+                    }
+#endif
+                    else {
                         mActor_name_t item = Now_Private->inventory.pockets[submenu_item->slot_no];
                         mSP_PlusSales(shop_common->money / 2);
                         if (counter == 1) {
@@ -2324,11 +2530,37 @@ static void aNSC_buy_continue_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
 static void aNSC_receive_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
     int no = mMsg_Get_msg_num(msg_p);
+#ifdef TARGET_PC
+    if (aNSC_PC_IS_CLIENT() && aNSC_pc_sell_wait) {
+        /* the free disposal of a worthless item is a SHOP_SELL of value 0 and is in flight */
+        if (aNSC_pc_sell_step() == -1) {
+            return;
+        }
+        aNSC_setupAction(shop_common, play, aNSC_ACTION_REQUEST_Q_ANSWER_WAIT);
+        return;
+    }
+#endif
     if (shop_common->msg_no == no) {
         if (mMsg_Check_MainNormalContinue(msg_p)) {
             Submenu_Item_c* submenu_item = play->submenu.item_p;
             switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
                 case mChoice_CHOICE0:
+#ifdef TARGET_PC
+                    if (aNSC_PC_IS_CLIENT()) {
+                        /* town services milestone 2: the slot is emptied by the host's post-image, never here */
+                        if (submenu_item->slot_no < mPr_POCKETS_SLOT_COUNT) {
+                            aNSC_pc_sell_mask = 1u << submenu_item->slot_no;
+                            aNSC_pc_sell_primary = submenu_item->slot_no;
+                            aNSC_pc_sell_item = Now_Private->inventory.pockets[submenu_item->slot_no];
+                            aNSC_pc_sell_bags_before = aNSC_pc_count_bags();
+                            aNSC_pc_sell_wait = 1;
+                            if (aNSC_pc_sell_step() == -1) {
+                                return;
+                            }
+                        }
+                        break;
+                    }
+#endif
                     mPr_SetPossessionItem(Now_Private, submenu_item->slot_no, EMPTY_NO, mPr_ITEM_COND_NORMAL);
                     break;
             }
@@ -2431,16 +2663,32 @@ static void aNSC_sell_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
 }
 
 static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
-    static int next_act_idx[11] = { aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITH_TICKET,
+    static int next_act_idx[12] = { aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITH_TICKET,
                                     aNSC_ACTION_SELL_ITEM_WITH_TICKET,    aNSC_ACTION_SELL_ITEM_INSUFICIENT_FUNDS,
                                     aNSC_ACTION_SELL_ITEM_POCKETS_FULL,   aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET,
                                     aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET,
                                     aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET,
-                                    aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET };
-    static int msg_no[11] = { aNSC_MSG_BUY_NORMAL,         aNSC_MSG_GIVE_TICKET,  aNSC_MSG_MAIL_TICKET,
+                                    aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_INSUFICIENT_FUNDS };
+    static int msg_no[12] = { aNSC_MSG_BUY_NORMAL,         aNSC_MSG_GIVE_TICKET,  aNSC_MSG_MAIL_TICKET,
                               aNSC_MSG_INSUFFICIENT_FUNDS, aNSC_MSG_POCKETS_FULL, aNSC_MSG_SELL_NET,
                               aNSC_MSG_SELL_AXE,           aNSC_MSG_SELL_SHOVEL,  aNSC_MSG_SELL_ROD,
-                              aNSC_MSG_SELL_PAINT_CONFIRM, aNSC_MSG_SELL_SIGN };
+                              aNSC_MSG_SELL_PAINT_CONFIRM, aNSC_MSG_SELL_SIGN,    aNSC_MSG_BUY_CANCEL };
+#ifdef TARGET_PC
+    if (aNSC_PC_IS_CLIENT() && aNSC_pc_buy_wait) {
+        /* the purchase transaction is in flight: nothing local changes until the host's answer (the money check is NOT re-run: APPLIED already debited) */
+        int pc_next = aNSC_pc_buy_step(shop_common);
+        if (pc_next == -1) {
+            return;
+        }
+        if (pc_next == 0) {
+            pc_next = aNSC_pc_buy_success_row(shop_common->sell_item);
+        }
+        aNSC_Set_continue_msg_num(mMsg_Get_base_window_p(), shop_common, aNSC_get_msg_no(msg_no[pc_next]));
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+        aNSC_setupAction(shop_common, play, next_act_idx[pc_next]);
+        return;
+    }
+#endif
     if (mDemo_Get_OrderValue(mDemo_TYPE_4, 0x9)) {
         mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
         if (mMsg_Check_MainNormal(msg_p) == TRUE) {
@@ -2461,11 +2709,31 @@ static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pla
                         (item >= ITM_RED_PAINT && item <= ITM_BROWN_PAINT) ? (item - ITM_RED_PAINT) : 0;
                     next = 0x9;
                     Now_Private->state_flags |= mPr_FLAG_UPDATE_OUTLOOK_PENDING;
-                } else {
+                }
+#ifdef TARGET_PC
+                else if (aNSC_PC_IS_CLIENT()) {
+                    /* town services milestone 2: the host takes the price, marks the stock slot sold, credits sales_sum and puts the item in the
+                     * pocket slot of its post-image; this seam changes nothing locally (see aNSC_pc_buy_step) */
+                    int pc_next = aNSC_pc_buy_step(shop_common);
+                    if (pc_next == -1) {
+                        return;
+                    }
+                    next = (pc_next == 0) ? aNSC_pc_buy_success_row(item) : pc_next;
+                }
+#endif
+                else {
                     int idx = mPr_GetPossessionItemIdx(Now_Private, EMPTY_NO);
                     if (idx == -1) {
                         next = 0x4;
-                    } else {
+                    }
+#ifdef TARGET_PC
+                    else if (!pc_net_game_host_shop_can_sell((int)item)) {
+                        /* H1: a networked HOST re-checks the stock at the moment of the purchase (a client's SHOP_BUY may have sold this unique item
+                         * since the price dialogue opened): refused with the existing cancel row BEFORE the pocket write / debit */
+                        next = aNSC_PC_ROW_REFUSED;
+                    }
+#endif
+                    else {
                         mPr_SetPossessionItem(Now_Private, idx, item, mPr_ITEM_COND_NORMAL);
                         if (aNSC_check_item_with_ticket(item) == TRUE) {
                             mActor_name_t ticket = (Common_Get(time).rtc_time.month - 1) * 8 + ITM_TICKET_START;
@@ -3018,6 +3286,9 @@ static void aNSC_msg_win_open_wait_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME
 
 static void aNSC_buy_sum_check_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+#ifdef TARGET_PC
+    aNSC_pc_reset_waits(); /* a new sale starts: no stale town-service wait state */
+#endif
 }
 
 static void aNSC_buy_check_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
@@ -3063,6 +3334,9 @@ static void aNSC_order_check_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY*
 static void aNSC_sell_check_before_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
     aNSC_set_stop_spd(shop_common);
+#ifdef TARGET_PC
+    aNSC_pc_reset_waits(); /* a new purchase starts: no stale town-service wait state */
+#endif
 }
 
 static void aNSC_sell_answer0_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
@@ -3094,7 +3368,13 @@ static void aNSC_sell_answer1_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
 }
 
 static void aNSC_sell_item_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (!aNSC_PC_IS_CLIENT()) {
+        aNSC_get_sell_price(shop_common->value);
+    } /* else: a CLIENT's bells already left with the host's post-image (APPLIED); the report below only redraws the floor on a client */
+#else
     aNSC_get_sell_price(shop_common->value);
+#endif
     if (CLIP(shop_design_clip) != NULL) {
         CLIP(shop_design_clip)->reportGoodsSale_proc(shop_common->ut_x, shop_common->ut_z);
     }

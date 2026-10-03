@@ -29,6 +29,13 @@ struct shop_design_actor_s {
 
 extern ACTOR_PROFILE Shop_Design_Profile;
 
+#ifdef TARGET_PC
+/* Town services milestone 2: redraws the shop floor from Save_Get(shop): every displayed item that is no longer in the stock (sold to another player
+ * through the host) is taken off the floor exactly like a vanilla sale, WITHOUT the accounting. 0 when no shop floor is loaded / special-day stock.
+ * Returns the number of items taken off. */
+extern int aSD_PC_SyncDisplayWithStock(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

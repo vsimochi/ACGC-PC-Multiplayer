@@ -200,6 +200,8 @@
                             * pcnetgame_host_resolve_snowman_tile_overlay()). */
 #include "m_police_box.h"   /* World Ecology: snowmen -- mPB_keep_item(), mirroring m_police_box.c:76-94's
                             * own ITEM1/FTR-only lost-and-found classification for a displaced tile item */
+#include "m_kabu_manager.h" /* Town services milestone 2 (shop): Kabu_get_price() -- the sale value of a turnip bundle (SHOP_SELL) */
+#include "ac_shop_design.h" /* Town services milestone 2 (shop): aSD_PC_SyncDisplayWithStock() -- redraw the shop floor from the stock */
 
 #include <math.h>   /* fabsf(), isfinite() -- see pcnetgame_pos_valid() and the reach checks */
 #include <stddef.h> /* offsetof() */
@@ -2051,6 +2053,25 @@ _Static_assert(PC_NETGAME_REC_CHUNK_COUNT <= 16, "the per-transfer got mask is 1
  *                      index (0..19); the host verifies keep_items[aux_cond] == item, removes it and puts the item into the post-image. */
 #define PC_NETGAME_TXN_KIND_MUSEUM_DONATE 8u
 #define PC_NETGAME_TXN_KIND_POLICE_CLAIM  9u
+/* Town services milestone 2 (NOOK'S SHOP; the same reservation-less one-phase TXN_COMMIT machinery, kinds 10 / 11). The HOST computes the price
+ * and the sale value itself (mSP_ItemNo2ItemPrice / SELL_BUY_RATIO / Kabu_get_price): a client number is only ever compared, never trusted.
+ *   SHOP_BUY  (10): the player buys the item on the shop floor. tag.dest POCKET, tag.slot = a FREE pocket slot, tag.item = the item,
+ *                   tag.aux_cond = the STOCK CODE (0..38 = the index in Save_t.shop.items[]; 0xFE = Save_t.shop.rare_item; 0xFD = a counted
+ *                   candy / grab bag; 0xFF = unlimited stationery), tag.aux_item = the price the client expects (!= host price -> PRICE_MISMATCH);
+ *                   tag.flags = 0. The host verifies the stock, pays from the PRE-image (wallet, then money bags exactly like vanilla's
+ *                   mSP_money_check / mSP_get_sell_price), marks the stock slot sold with the vanilla mSP_ShopSaleReport, adds the price to
+ *                   sales_sum (mSP_PlusSales) and puts the item into the post-image.
+ *   SHOP_SELL (11): the player sells pocket items to Nook. tag.dest NONE, tag.slot = the primary pocket slot, tag.item = the item in it,
+ *                   tag.aux_item = the bit mask of EVERY slot sold (bit i = pocket slot i, bits 0..14, the primary slot's bit set),
+ *                   tag.aux_cond = 0, tag.flags = 0. The host values each slot (price / 4, turnips: Kabu_get_price() * bundle size, 0 for a
+ *                   worthless item = free disposal), refuses stationery / quest items, credits the wallet with vanilla's 30000-bag overflow
+ *                   rule (bags need free pockets: NO_ROOM) and adds value / 2 to sales_sum. */
+#define PC_NETGAME_TXN_KIND_SHOP_BUY  10u
+#define PC_NETGAME_TXN_KIND_SHOP_SELL 11u
+#define PC_NETGAME_SHOP_STOCK_COUNTED   0xFDu
+#define PC_NETGAME_SHOP_STOCK_RARE      0xFEu
+#define PC_NETGAME_SHOP_STOCK_UNLIMITED 0xFFu
+#define PC_NETGAME_SHOP_SELL_RATIO      4u /* == SELL_BUY_RATIO (include/ac_npc_shop_common.h); pinned by test_shop_src.py */
 #define PC_NETGAME_TXN_OUTCOME_APPLIED  0u
 #define PC_NETGAME_TXN_OUTCOME_REJECTED 1u
 #define PC_NETGAME_TXN_REASON_NONE          0u
@@ -2072,6 +2093,10 @@ _Static_assert(PC_NETGAME_REC_CHUNK_COUNT <= 16, "the per-transfer got mask is 1
 #define PC_NETGAME_TXN_REASON_NOT_AVAILABLE   16u /* town services: POLICE_CLAIM whose (slot, expected item) is no longer in the lost and found */
 #define PC_NETGAME_TXN_REASON_NOT_DONATABLE   17u /* town services: MUSEUM_DONATE of an item the museum never accepts (vanilla predicate) */
 #define PC_NETGAME_TXN_REASON_NO_DONOR_SLOT   18u /* town services: the bound resident has no museum donor slot (guest / extra player) */
+#define PC_NETGAME_TXN_REASON_NO_FUNDS        19u /* shop: SHOP_BUY the pre-image wallet (plus money bags) cannot pay the host-computed price */
+#define PC_NETGAME_TXN_REASON_NOT_SELLABLE    20u /* shop: SHOP_SELL of stationery / a quest item / a Sunday turnip bundle */
+#define PC_NETGAME_TXN_REASON_PRICE_MISMATCH  21u /* shop: SHOP_BUY whose expected price differs from the HOST's price (nothing is charged) */
+#define PC_NETGAME_TXN_REASON_NO_ROOM         22u /* shop: SHOP_SELL whose money-bag overflow would need more free pockets than there are */
 /* Named switch for the LEGACY INTERACT_CONFIRM(COMMIT) path. 0 (X1a): the host still processed it exactly as before and a TXN and a
  * legacy COMMIT could never both apply to one reservation. 1 (X1b, NOW: the real client sends TXN_COMMIT instead): CONFIRM(COMMIT)
  * is retired -- logged, the reservation released, nothing mutated. ABORT is never retired. */
@@ -2121,17 +2146,18 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameTxnResultMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
 /* Town services milestone 1 (v8, unreleased): the generic host -> client service mirror. Services (u8): 1 POLICE = Save_t.police_box.keep_items[20]
- * as 20 little-endian u16 (40 B); 2 MUSEUM = Save_t.museum_display, the 63 raw bytes (4-bit donor nibbles); 3 SHOP = Save_t.shop (320 B)
- * RESERVED for the next milestone (neither sent nor accepted yet); 4+ reserved. `seq` is the host's per-service counter, strictly increasing
+ * as 20 little-endian u16 (40 B); 2 MUSEUM = Save_t.museum_display, the 63 raw bytes (4-bit donor nibbles); 3 SHOP = Save_t.shop (320 B, the raw
+ * Shop_c: stock, rare item, bag count, level, sales_sum, times; milestone 2); 4+ reserved. `seq` is the host's per-service counter, strictly increasing
  * for the life of the host process (a client keeps the last accepted one per session and ignores <=); `digest` = FNV-1a32 of the blob. The
  * message on the wire is offsetof(blob) + len bytes (variable); len must equal the service's fixed length. */
 #define PC_NETGAME_TS_POLICE   1u
 #define PC_NETGAME_TS_MUSEUM   2u
-#define PC_NETGAME_TS_SHOP     3u
+#define PC_NETGAME_TS_SHOP     3u   /* milestone 2: Save_t.shop, the 320 raw bytes of Shop_c (little-endian PC image, host == client build) */
 #define PC_NETGAME_TS_NUM      4u   /* array bound: services 1..3 named (index 0 unused), 4+ reserved */
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
 #define PC_NETGAME_TS_MUSEUM_LEN 63u
+#define PC_NETGAME_TS_SHOP_LEN   320u
 typedef struct PCNetGameTownSvcStateMsg {
     uint8_t  msg_type;   /* PC_NETGAME_MSG_TOWN_SVC_STATE */
     uint8_t  service;    /* PC_NETGAME_TS_* */
@@ -2150,6 +2176,7 @@ _Static_assert(PC_NETGAME_TS_POLICE_LEN == sizeof(PoliceBox_c) && PC_NETGAME_TS_
                    PC_NETGAME_TS_POLICE_LEN <= PC_NETGAME_TS_BLOB_MAX && PC_NETGAME_TS_MUSEUM_LEN <= PC_NETGAME_TS_BLOB_MAX &&
                    320u <= PC_NETGAME_TS_BLOB_MAX,
                "a town-service blob does not fit PCNetGameTownSvcStateMsg (the 320-byte shop blob is checked here too)");
+_Static_assert(PC_NETGAME_TS_SHOP_LEN == sizeof(Shop_c), "PC_NETGAME_TS_SHOP_LEN is no longer sizeof(Shop_c): the shop mirror wire image changed");
 
 /* Two-phase interactions: client -> host, reliable, exactly 8 bytes (little-endian, natural
  * alignment). Answers a provisional RESULT (accepted == 1) -- or withdraws from a request the client
@@ -2797,7 +2824,8 @@ typedef struct PCNetGameClientTxn {
     PCNetGameTxnTag tag;       /* X3: the tag exactly as put on the wire (valid once SENT) */
     uint8_t  wire[PC_NETGAME_CTXN_WIRE_MAX]; /* X3: the exact request bytes on the wire (TXN_COMMIT / FIELD_ACTION_REQUEST / CATCH_REQUEST), resent IDENTICALLY */
     uint16_t wire_len;
-    uint8_t  ts_aux;           /* town services: POLICE_CLAIM's lost-and-found slot index (travels as tag.aux_cond) */
+    uint8_t  ts_aux;           /* town services: POLICE_CLAIM's lost-and-found slot index / SHOP_BUY's stock code (travels as tag.aux_cond) */
+    uint16_t ts_aux_item;      /* shop: SHOP_BUY's expected price / SHOP_SELL's pocket-slot mask (travels as tag.aux_item) */
     uint8_t  ut_x, ut_z, hole_variant; /* X3 DIG_*: the field-action request's target tile / hole shape */
     uint32_t entity_id;        /* X3 CATCH: the wildlife entity claimed */
     int32_t  claimed_species;  /* X3 CATCH */
@@ -2820,9 +2848,11 @@ typedef struct PCNetGameTsOp {
     uint8_t  active, done, outcome; /* outcome: 1 APPLIED, 2 REJECTED (valid once done) */
     uint8_t  kind, slot, aux;
     uint16_t item;
+    uint16_t aux_item;
     uint32_t request_id;
 } PCNetGameTsOp;
 static PCNetGameTsOp            s_ts_op;
+static uint8_t                  s_ts_last_reason; /* the PC_NETGAME_TXN_REASON_* of the last REJECTED town-service result (0 = none / a local refusal) */
 static uint32_t                 s_ts_next_rid = 0x70000000u; /* request ids only label this client's own operations (no host reservation exists) */
 static uint32_t                 s_ts_client_seq[PC_NETGAME_TS_NUM];
 static uint8_t                  s_ts_client_have[PC_NETGAME_TS_NUM];
@@ -4550,6 +4580,12 @@ static const char* pcnetgame_kind_tag(int kind) {
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_POLICE_CLAIM) {
         return "POLICE_CLAIM";
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_SHOP_BUY) {
+        return "SHOP_BUY"; /* town services milestone 2 */
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_SHOP_SELL) {
+        return "SHOP_SELL";
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
         return "DROP";
@@ -12331,6 +12367,10 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_NOT_AVAILABLE: return "NOT_AVAILABLE";
         case PC_NETGAME_TXN_REASON_NOT_DONATABLE: return "NOT_DONATABLE";
         case PC_NETGAME_TXN_REASON_NO_DONOR_SLOT: return "NO_DONOR_SLOT";
+        case PC_NETGAME_TXN_REASON_NO_FUNDS: return "NO_FUNDS";
+        case PC_NETGAME_TXN_REASON_NOT_SELLABLE: return "NOT_SELLABLE";
+        case PC_NETGAME_TXN_REASON_PRICE_MISMATCH: return "PRICE_MISMATCH";
+        case PC_NETGAME_TXN_REASON_NO_ROOM: return "NO_ROOM";
         default: return "?";
     }
 }
@@ -13155,6 +13195,33 @@ static PCNetGameTsHost s_ts_host[PC_NETGAME_TS_NUM];
 static uint32_t        s_ts_next_check_ms = 0;
 #define PC_NETGAME_TS_CHECK_MS 500u
 
+static int pcnetgame_shop_classify(mActor_name_t item, mActor_name_t* rsv_out); /* defined with the SHOP host helpers below */
+
+/* Town services milestone 2: the legal content of a mirrored Shop_c (CLIENT validator; the HOST also runs it on its own blob and logs a loud
+ * warning if its own state would be refused). A stock entry is EMPTY, a vanilla "sold" marker (RSV_SHOP_SOLD_*), or a legal pocket item. */
+static int pcnetgame_ts_shop_item_ok(uint16_t v) {
+    return v == (uint16_t)EMPTY_NO || (v >= (uint16_t)RSV_SHOP_SOLD_PAPER && v <= (uint16_t)RSV_SHOP_SOLD_SIGNBOARD) ||
+           pcnetgame_is_pocket_legal_item((mActor_name_t)v);
+}
+
+static int pcnetgame_ts_valid_shop_blob(const uint8_t* blob) {
+    Shop_c s;
+    int i;
+    memcpy(&s, blob, sizeof(s));
+    for (i = 0; i < mSP_GOODS_COUNT; i++) {
+        if (!pcnetgame_ts_shop_item_ok((uint16_t)s.items[i])) {
+            return 0;
+        }
+    }
+    for (i = 0; i < mSP_LOTTERY_ITEM_COUNT; i++) {
+        if (!pcnetgame_ts_shop_item_ok((uint16_t)s.lottery_items[i])) {
+            return 0;
+        }
+    }
+    return pcnetgame_ts_shop_item_ok((uint16_t)s.rare_item) && s.flowers_candy_grab_bag_count >= 0 &&
+           s.flowers_candy_grab_bag_count <= 64 && (s.visitor_flag == 0 || s.visitor_flag == 1);
+}
+
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP" : "?";
 }
@@ -13174,6 +13241,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
     if (svc == (int)PC_NETGAME_TS_MUSEUM) {
         memcpy(blob, &Save_Get(museum_display), PC_NETGAME_TS_MUSEUM_LEN);
         *len = (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+        return 1;
+    }
+    if (svc == (int)PC_NETGAME_TS_SHOP) {
+        memcpy(blob, &Save_Get(shop), PC_NETGAME_TS_SHOP_LEN); /* the raw Shop_c: stock, rare item, lottery, bag count, level, sales_sum, times */
+        *len = (uint16_t)PC_NETGAME_TS_SHOP_LEN;
         return 1;
     }
     return 0;
@@ -13199,12 +13271,32 @@ static int pcnetgame_ts_refresh(int svc) {
     h->valid = 1;
     printf("[NET][TS] host: service %d (%s) state -> seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)h->seq,
            (unsigned)dig, (unsigned)len);
+    if (svc == (int)PC_NETGAME_TS_SHOP) {
+        printf("[NET][TS] host: shop level %d sales_sum %u bag_count %d rare 0x%04X\n", (int)Save_Get(shop).shop_info.shop_level,
+               (unsigned)Save_Get(shop).sales_sum, (int)Save_Get(shop).flowers_candy_grab_bag_count, (unsigned)Save_Get(shop).rare_item);
+        if (!pcnetgame_ts_valid_shop_blob(blob)) {
+            printf("[NET][TS] host: *** WARNING: the host's own shop state would be REFUSED by clients (illegal content) ***\n");
+        }
+        {   /* the stock with the HOST-computed price of every entry (the protocol test reads the price table from this log) */
+            int i;
+            mActor_name_t rsv;
+            for (i = 0; i < mSP_GOODS_COUNT + 1; i++) {
+                mActor_name_t it = (i < mSP_GOODS_COUNT) ? Save_Get(shop).items[i] : Save_Get(shop).rare_item;
+                if (it != (mActor_name_t)EMPTY_NO && pcnetgame_shop_classify(it, &rsv) != 0) {
+                    printf("[NET][SHOP] host: stock[%d]=0x%04X class=%d price=%u\n", i < mSP_GOODS_COUNT ? i : 255, (unsigned)it,
+                           pcnetgame_shop_classify(it, &rsv), (unsigned)mSP_ItemNo2ItemPrice(it));
+                }
+            }
+            printf("[NET][SHOP] host: probe stationery 0x%04X price=%u\n", (unsigned)ITM_PAPER_START, (unsigned)mSP_ItemNo2ItemPrice((mActor_name_t)ITM_PAPER_START));
+        }
+    }
     return 1;
 }
 
 static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_POLICE);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MUSEUM);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -13232,7 +13324,7 @@ static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_MUSEUM; svc++) {
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_SHOP; svc++) {
         PCNetGameHostPeerState* st = &s_host_peer[peer];
         if (s_ts_host[svc].valid && st->ts_sent_seq[svc] != s_ts_host[svc].seq) {
             if (pcnetgame_ts_send_to_peer(peer, svc)) {
@@ -13292,18 +13384,283 @@ static void pcnetgame_host_ts_tick(void) {
     }
 }
 
-/* MUSEUM_DONATE / POLICE_CLAIM. `in` is the exact 72-byte TXN_COMMIT (kind 8 / 9). After the READY gate every path ends in one TXN_RESULT
+/* ---- SHOP (service 3): host helpers (milestone 2). All pure over arrays except the two vanilla mutators called by the handler. ---- */
+enum { PCNG_SHOP_CLS_NONE = 0, PCNG_SHOP_CLS_LISTED, PCNG_SHOP_CLS_COUNTED, PCNG_SHOP_CLS_UNLIMITED };
+
+/* tanuki_shop_status of THIS moment without any side effect (mSP_SetTanukiShopStatus() only runs when the host player's shop building actor
+ * runs, so Common_Get(tanuki_shop_status) can be stale; every function used here is a pure read of the clock / event save). */
+static int pcnetgame_shop_status_now(void) {
+    if (mSP_ShopOpen() == mSP_SHOP_STATUS_OPENEVENT) {
+        return mSP_TANUKI_SHOP_STATUS_EVENT;
+    }
+    if (mSP_CheckFukubikiDay()) {
+        return mSP_TANUKI_SHOP_STATUS_FUKUBIKI;
+    }
+    if (mSP_Chk_HukubukuroSail()) {
+        return mSP_TANUKI_SHOP_STATUS_HUKUBUKURO_SALE;
+    }
+    if (mSP_CheckHallowinDay()) {
+        return mSP_TANUKI_SHOP_STATUS_HALLOWEEN;
+    }
+    return mSP_TANUKI_SHOP_STATUS_NORMAL;
+}
+
+/* The "sold" marker vanilla's aSD_ReportGoodsSales() passes to mSP_ShopSaleReport() for `item` (the same sequential assignments, so the same
+ * winner), and the class of the item: LISTED (a stock slot / the rare item is marked sold), COUNTED (candy / grab bag: the vanilla function only
+ * decrements flowers_candy_grab_bag_count), UNLIMITED (stationery: never runs out), NONE (not something the shop floor ever shows). */
+static int pcnetgame_shop_classify(mActor_name_t item, mActor_name_t* rsv_out) {
+    mActor_name_t rsv = (mActor_name_t)EMPTY_NO;
+    *rsv_out = (mActor_name_t)EMPTY_NO;
+    if (item == (mActor_name_t)ITM_HUKUBUKURO_BAG || item == (mActor_name_t)ITM_FOOD_CANDY) {
+        *rsv_out = (mActor_name_t)RSV_SHOP_SOLD_PLANT;
+        return PCNG_SHOP_CLS_COUNTED;
+    }
+    if ((item >= (mActor_name_t)ITM_SAPLING && item <= (mActor_name_t)ITM_CEDAR_SAPLING) || ITEM_IS_FLOWER_BAG(item)) {
+        *rsv_out = (mActor_name_t)RSV_SHOP_SOLD_PLANT;
+        return PCNG_SHOP_CLS_LISTED;
+    }
+    if (item >= (mActor_name_t)ITM_CLOTH_START && item <= (mActor_name_t)ITM_CLOTH_END) {
+        *rsv_out = (mActor_name_t)RSV_SHOP_SOLD_CLOTH;
+        return PCNG_SHOP_CLS_LISTED;
+    }
+    if (ITEM_IS_PAPER(item)) {
+        return PCNG_SHOP_CLS_UNLIMITED;
+    }
+    if (ITEM_IS_FTR(item)) {
+        rsv = (item == Save_Get(shop).rare_item) ? (mActor_name_t)RSV_SHOP_SOLD_RARE : (mActor_name_t)RSV_SHOP_SOLD_FTR;
+    }
+    if (item >= (mActor_name_t)ITM_CARPET_START && item <= (mActor_name_t)(ITM_CARPET_END - 4)) {
+        rsv = (mActor_name_t)RSV_SHOP_SOLD_CARPET;
+    }
+    if (item >= (mActor_name_t)ITM_WALL_START && item <= (mActor_name_t)(ITM_WALL_END - 4)) {
+        rsv = (mActor_name_t)RSV_SHOP_SOLD_WALL;
+    }
+    if (item == (mActor_name_t)ITM_SIGNBOARD) {
+        rsv = (mActor_name_t)RSV_SHOP_SOLD_SIGNBOARD;
+    }
+    if (item >= (mActor_name_t)ITM_TOOL_START && item <= (mActor_name_t)ITM_TOOL_END) {
+        if (item >= (mActor_name_t)ITM_UMBRELLA_START && item <= (mActor_name_t)(ITM_UMBRELLA_END - 1)) {
+            rsv = (mActor_name_t)RSV_SHOP_SOLD_UMBRELLA;
+        } else if (ITEM_IS_PAINT(item)) {
+            rsv = (mActor_name_t)RSV_SHOP_SOLD_PAINT;
+        } else if (item == (mActor_name_t)ITM_SIGNBOARD) {
+            rsv = (mActor_name_t)RSV_SHOP_SOLD_SIGNBOARD;
+        } else {
+            rsv = (mActor_name_t)RSV_SHOP_SOLD_TOOL;
+        }
+    }
+    if (item >= (mActor_name_t)ITM_DIARY00 && item <= (mActor_name_t)ITM_DIARY15) {
+        rsv = (mActor_name_t)RSV_SHOP_SOLD_PAPER;
+    }
+    *rsv_out = rsv;
+    return rsv != (mActor_name_t)EMPTY_NO ? PCNG_SHOP_CLS_LISTED : PCNG_SHOP_CLS_NONE;
+}
+
+/* The stock code a BUY of `item` must carry against the shop state `s`, or -1 when the item is not buyable now (special-event stock, paint, an
+ * item the shop floor never shows, sold out). Used by BOTH the host validation (against its own Save_t.shop) and the client seam (against the
+ * mirrored copy, through pc_net_game_shop_buy_stock_code()). */
+static int pcnetgame_shop_stock_code(mActor_name_t item, const Shop_c* s, int status) {
+    mActor_name_t rsv;
+    int cls, i;
+    if (status == mSP_TANUKI_SHOP_STATUS_EVENT || status == mSP_TANUKI_SHOP_STATUS_FUKUBIKI) {
+        return -1; /* bargain-day stock lives in event_save_data (not mirrored) and the monthly raffle is a different flow: deferred, refused */
+    }
+    cls = pcnetgame_shop_classify(item, &rsv);
+    if (cls == PCNG_SHOP_CLS_NONE || ITEM_IS_PAINT(item)) {
+        return -1; /* paint is a house-service purchase (homes[].next_outlook_pal): deferred, refused */
+    }
+    if (cls == PCNG_SHOP_CLS_UNLIMITED) {
+        for (i = 0; i < mSP_GOODS_COUNT; i++) { /* L1: stationery is unlimited only while the shop actually stocks THAT stationery item */
+            if (s->items[i] == item) {
+                return (int)PC_NETGAME_SHOP_STOCK_UNLIMITED;
+            }
+        }
+        return -1;
+    }
+    if (cls == PCNG_SHOP_CLS_COUNTED) {
+        int ok = s->flowers_candy_grab_bag_count > 0 &&
+                 ((item == (mActor_name_t)ITM_HUKUBUKURO_BAG && status == mSP_TANUKI_SHOP_STATUS_HUKUBUKURO_SALE) ||
+                  (item == (mActor_name_t)ITM_FOOD_CANDY && status == mSP_TANUKI_SHOP_STATUS_HALLOWEEN));
+        return ok ? (int)PC_NETGAME_SHOP_STOCK_COUNTED : -1;
+    }
+    for (i = 0; i < mSP_GOODS_COUNT; i++) {
+        if (s->items[i] == item) {
+            return i;
+        }
+    }
+    if (s->rare_item == item) {
+        return (int)PC_NETGAME_SHOP_STOCK_RARE;
+    }
+    return -1;
+}
+
+/* vanilla mSP_money_check() + mSP_get_sell_price() on the PRE-image arrays: the wallet pays first; a short wallet breaks money bags (100, 1000,
+ * 10000, 30000 in that order, lowest slot first) and keeps the change. 1 = paid (arrays updated), 0 = cannot pay (arrays untouched). */
+static int pcnetgame_shop_pay(uint16_t* pockets, uint32_t* conds, uint32_t* wallet, uint32_t amount) {
+    static const uint16_t bag_item[4] = { (uint16_t)ITM_MONEY_100, (uint16_t)ITM_MONEY_1000, (uint16_t)ITM_MONEY_10000, (uint16_t)ITM_MONEY_30000 };
+    static const uint32_t bag_val[4] = { 100u, 1000u, 10000u, 30000u };
+    uint32_t money = *wallet;
+    int i, k;
+    if (money >= amount) {
+        *wallet = money - amount;
+        return 1;
+    }
+    {
+        uint32_t m2 = money;
+        int feasible = 0;
+        for (i = 0; i < 4 && !feasible; i++) {
+            for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                if (pockets[k] == bag_item[i] && mPr_GET_ITEM_COND(*conds, k) == mPr_ITEM_COND_NORMAL) {
+                    m2 += bag_val[i];
+                }
+            }
+            if (m2 >= amount) {
+                feasible = 1;
+            }
+        }
+        if (!feasible) {
+            return 0;
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+            if (pockets[k] == bag_item[i] && mPr_GET_ITEM_COND(*conds, k) == mPr_ITEM_COND_NORMAL) {
+                pockets[k] = (uint16_t)EMPTY_NO;
+                *conds = mPr_SET_ITEM_COND(*conds, k, mPr_ITEM_COND_NORMAL);
+                money += bag_val[i];
+                if (money >= amount) {
+                    *wallet = money - amount;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0; /* unreachable after the feasibility pass */
+}
+
+/* The sale value of ONE pocket item (vanilla aNSC_buy_check_init: turnips Kabu_get_price() * bundle size, spoiled turnips 0, everything else
+ * price / SELL_BUY_RATIO; 0 = worthless, accepted for free). Returns 0 and sets *why for an item Nook never buys. */
+static int pcnetgame_shop_sell_unit(uint16_t item, uint8_t cond, uint32_t* unit, const char** why) {
+    static const uint32_t kabu_sum[4] = { 10u, 50u, 100u, 0u };
+    *unit = 0;
+    if (cond == (uint8_t)mPr_ITEM_COND_QUEST) {
+        *why = "a quest item is never bought";
+        return 0;
+    }
+    if (ITEM_IS_PAPER((mActor_name_t)item)) {
+        *why = "stationery stacks are not sold through the network seam (deferred)";
+        return 0;
+    }
+    if (ITEM_NAME_GET_TYPE((mActor_name_t)item) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT((mActor_name_t)item) == ITEM1_CAT_KABU) {
+        if (item == (uint16_t)ITM_KABU_SPOILED) {
+            return 1; /* 0 bells: Nook takes it off the player's hands */
+        }
+        if (Common_Get(time).rtc_time.weekday == lbRTC_SUNDAY) {
+            *why = "Nook does not buy turnips on Sunday";
+            return 0;
+        }
+        *unit = (uint32_t)Kabu_get_price() * kabu_sum[(uint16_t)(item - (uint16_t)ITM_KABU_START) & 3u];
+        return 1;
+    }
+    *unit = mSP_ItemNo2ItemPrice((mActor_name_t)item) / PC_NETGAME_SHOP_SELL_RATIO;
+    return 1;
+}
+
+/* SHOP_SELL planning on the PRE-image: validates every slot of `mask`, totals the value and builds the post-image with vanilla's money-overflow
+ * rule (aNSC_check_money_overflow + aNSC_buy_item_only_one / _single: a wallet that reaches mPr_WALLET_MAX turns 30000 bells into a 30000 bag in
+ * the sold slot, then in free slots). Returns 0 = ok, else the TXN reason with *why. */
+static uint8_t pcnetgame_shop_sell_plan(const uint16_t* pre, uint32_t pre_conds, uint32_t pre_wallet, uint16_t mask, uint16_t* post,
+                                        uint32_t* post_conds, uint32_t* post_wallet, uint32_t* value_out, const char** why) {
+    uint32_t value = 0, bells;
+    int i, n = 0, empty = 0, bags = 0;
+    memcpy(post, pre, mPr_POCKETS_SLOT_COUNT * sizeof(uint16_t));
+    *post_conds = pre_conds;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if (pre[i] == (uint16_t)EMPTY_NO) {
+            empty++;
+        }
+        if (mask & (1u << i)) {
+            uint32_t unit = 0;
+            if (pre[i] == (uint16_t)EMPTY_NO) {
+                *why = "a slot of the sale is empty in the pre-image";
+                return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
+            if (!pcnetgame_shop_sell_unit(pre[i], (uint8_t)mPr_GET_ITEM_COND(pre_conds, i), &unit, why)) {
+                return (uint8_t)PC_NETGAME_TXN_REASON_NOT_SELLABLE;
+            }
+            value += unit;
+            n++;
+        }
+    }
+    bells = pre_wallet + value;
+    {
+        uint32_t t2 = bells;
+        bags = 0;
+        while (t2 >= (uint32_t)mPr_WALLET_MAX && bags < 4096) { /* vanilla: for (; p1 >= mPr_WALLET_MAX; p1 -= 30000) bags++ */
+            t2 -= 30000u;
+            bags++;
+        }
+    }
+    if (bags > empty + n) {
+        *why = "the money-bag overflow needs more free pockets than there are";
+        return (uint8_t)PC_NETGAME_TXN_REASON_NO_ROOM;
+    }
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if (mask & (1u << i)) {
+            if (bells >= (uint32_t)mPr_WALLET_MAX) {
+                bells -= 30000u;
+                post[i] = (uint16_t)ITM_MONEY_30000;
+            } else {
+                post[i] = (uint16_t)EMPTY_NO;
+            }
+            *post_conds = mPr_SET_ITEM_COND(*post_conds, i, mPr_ITEM_COND_NORMAL);
+        }
+    }
+    while (bells >= (uint32_t)mPr_WALLET_MAX) {
+        int f = -1;
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            if (post[i] == (uint16_t)EMPTY_NO) {
+                f = i;
+                break;
+            }
+        }
+        if (f < 0) {
+            *why = "no free pocket for a money bag";
+            return (uint8_t)PC_NETGAME_TXN_REASON_NO_ROOM;
+        }
+        bells -= 30000u;
+        post[f] = (uint16_t)ITM_MONEY_30000;
+        *post_conds = mPr_SET_ITEM_COND(*post_conds, f, mPr_ITEM_COND_NORMAL);
+    }
+    *post_wallet = bells;
+    *value_out = value;
+    return 0;
+}
+
+static int pcnetgame_shop_local_scene_is_shop(void) {
+    return s_local_scene.valid && (s_local_scene.scene_id == (uint8_t)SCENE_SHOP0 || s_local_scene.scene_id == (uint8_t)SCENE_CONVENI ||
+                                   s_local_scene.scene_id == (uint8_t)SCENE_SUPER || s_local_scene.scene_id == (uint8_t)SCENE_DEPART ||
+                                   s_local_scene.scene_id == (uint8_t)SCENE_DEPART_2);
+}
+
+/* MUSEUM_DONATE / POLICE_CLAIM / SHOP_BUY / SHOP_SELL. `in` is the exact 72-byte TXN_COMMIT (kind 8 / 9 / 10 / 11). After the READY gate every path ends in one TXN_RESULT
  * (except the TEST-ONLY injected faults). */
 static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
     const PCNetGameTxnTag* t = &in->tag;
     const int is_donate = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE);
-    const int svc = is_donate ? (int)PC_NETGAME_TS_MUSEUM : (int)PC_NETGAME_TS_POLICE;
+    const int is_buy = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY);
+    const int is_sell = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL);
+    const int is_shop = is_buy || is_sell;
+    const int svc = is_shop ? (int)PC_NETGAME_TS_SHOP : is_donate ? (int)PC_NETGAME_TS_MUSEUM : (int)PC_NETGAME_TS_POLICE;
     PCNetGameHostPeerState* st;
     PCNetGameRecSlot* slot;
     PCNetGameTxnResident* R;
     const PCNetGameTxnLog* old;
     uint16_t post[mPr_POCKETS_SLOT_COUNT];
-    uint32_t post_conds, hash, now;
+    uint32_t post_conds, post_wallet, hash, now;
+    uint32_t shop_price = 0, sell_value = 0;
+    mActor_name_t shop_rsv = (mActor_name_t)EMPTY_NO;
+    int shop_cls = PCNG_SHOP_CLS_NONE;
     uint16_t bad;
     int idx, shape_ok, pidx = -1;
     const char* fail = NULL;
@@ -13336,13 +13693,20 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 3. shape */
-    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && t->flags == 0 && t->aux_item == 0 &&
+    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && t->flags == 0 &&
                t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO;
     if (shape_ok) {
         if (is_donate) {
-            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0;
+            shape_ok = t->aux_item == 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0;
+        } else if (is_buy) {
+            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->aux_item != 0 &&
+                       (t->aux_cond < (uint8_t)mSP_GOODS_COUNT || t->aux_cond == (uint8_t)PC_NETGAME_SHOP_STOCK_COUNTED ||
+                        t->aux_cond == (uint8_t)PC_NETGAME_SHOP_STOCK_RARE || t->aux_cond == (uint8_t)PC_NETGAME_SHOP_STOCK_UNLIMITED);
+        } else if (is_sell) {
+            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0 && t->aux_item != 0 && (t->aux_item & 0x8000u) == 0 &&
+                       (t->aux_item & (1u << t->slot)) != 0;
         } else {
-            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->aux_cond < (uint8_t)mPB_POLICE_BOX_ITEM_STORAGE_COUNT;
+            shape_ok = t->aux_item == 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->aux_cond < (uint8_t)mPB_POLICE_BOX_ITEM_STORAGE_COUNT;
         }
     }
     if (!shape_ok) {
@@ -13410,8 +13774,8 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 7. kind precondition on the PRE-image (never on the mirror: it may lag the client) */
-    if (is_donate) {
-        fail = (t->pre_pockets[t->slot] != t->item) ? "pocket slot does not hold the donated item" : NULL;
+    if (is_donate || is_sell) {
+        fail = (t->pre_pockets[t->slot] != t->item) ? (is_donate ? "pocket slot does not hold the donated item" : "pocket slot does not hold the sold item") : NULL;
     } else {
         fail = (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) ? "pocket slot is not free" : NULL;
     }
@@ -13421,7 +13785,41 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 8. READ-ONLY service validation against the HOST's own copy (nothing is mutated here) */
-    if (is_donate) {
+    memcpy(post, t->pre_pockets, sizeof(post));
+    post_conds = t->pre_conds;
+    post_wallet = t->pre_wallet;
+    if (is_shop) {
+        if (idx >= PLAYER_NUM) {
+            fail = "the bound resident has no shop record slot (guests / extra players are refused until they exist)";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
+        } else if (is_buy) {
+            const mActor_name_t item = (mActor_name_t)t->item;
+            int code = pcnetgame_shop_stock_code(item, &Save_Get(shop), pcnetgame_shop_status_now());
+            shop_cls = pcnetgame_shop_classify(item, &shop_rsv);
+            shop_price = mSP_ItemNo2ItemPrice(item); /* THE HOST PRICE: the client's aux_item is only compared */
+            if (code < 0 || code != (int)t->aux_cond || shop_price == 0u) {
+                fail = "the item is not in stock at that slot (sold out / not buyable now)";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            } else if (shop_price != (uint32_t)t->aux_item) {
+                fail = "the client's expected price differs from the host price";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRICE_MISMATCH;
+            } else if (!pcnetgame_shop_pay(post, &post_conds, &post_wallet, shop_price)) {
+                fail = "the pre-image wallet (plus money bags) cannot pay the price";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_FUNDS;
+            } else {
+                post[t->slot] = t->item;
+                post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+            }
+        } else {
+            fail_reason = pcnetgame_shop_sell_plan(t->pre_pockets, t->pre_conds, t->pre_wallet, t->aux_item, post, &post_conds, &post_wallet, &sell_value, &fail);
+            if (fail_reason != 0) {
+                /* fail is set by the plan */
+            } else {
+                fail = NULL;
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
+        }
+    } else if (is_donate) {
         if (idx < 0 || idx >= PLAYER_NUM) {
             fail = "the bound resident has no museum donor slot (guests / extra players are refused until they exist)";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
@@ -13456,22 +13854,32 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 9. post-image in locals (pre-image plus the delta), validated BEFORE anything is mutated */
-    memcpy(post, t->pre_pockets, sizeof(post));
-    post_conds = t->pre_conds;
-    if (is_donate) {
-        post[t->slot] = (uint16_t)EMPTY_NO;
-    } else {
-        post[t->slot] = t->item;
+    if (!is_shop) {
+        if (is_donate) {
+            post[t->slot] = (uint16_t)EMPTY_NO;
+        } else {
+            post[t->slot] = t->item;
+        }
+        post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
     }
-    post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
-    if (pcnetgame_rec_validate_inventory(post, post_conds, t->pre_wallet) != 0 || !pcnetgame_rec_txn_idx_ok(idx)) {
+    if (pcnetgame_rec_validate_inventory(post, post_conds, post_wallet) != 0 || !pcnetgame_rec_txn_idx_ok(idx)) {
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL,
                              "post-image failed validation / resident not writable (the host's own resident is never written)");
         return;
     }
 
-    /* 10. THE host-side service commit (the only writer of museum_display / police_box in this handler path) */
-    if (is_donate) {
+    /* 10. THE host-side service commit (the only writer of museum_display / police_box / the shop stock in this handler path) */
+    if (is_buy) {
+        mSP_PlusSales(shop_price); /* vanilla order (aSD_ReportGoodsSales): sales_sum first, then the sold marker */
+        if (shop_cls != PCNG_SHOP_CLS_UNLIMITED) {
+            (void)mSP_ShopSaleReport((mActor_name_t)t->item, Save_Get(shop).items, mSP_GOODS_COUNT, shop_rsv);
+        }
+        if (pcnetgame_shop_local_scene_is_shop()) {
+            (void)aSD_PC_SyncDisplayWithStock(); /* the HOST player stands in a shop: take the sold item off the floor display */
+        }
+    } else if (is_sell) {
+        mSP_PlusSales(sell_value / 2u); /* vanilla aNSC_buy_check: half of what Nook paid counts towards the upgrade */
+    } else if (is_donate) {
         u8 saved_player_no = Common_Get(player_no);
         int ok;
         Common_Get(player_no) = (u8)idx; /* vanilla credits Common_Get(player_no) + 1: the BOUND resident, derived by the gate; restored below */
@@ -13494,13 +13902,20 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
         }
     }
     /* 11. mirror (the sanctioned raw writer; idx was validated just above), 12. bookkeeping */
-    (void)pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet);
+    (void)pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet);
     slot->rev++;
     slot->dirty_unsaved = 1;
     R->last_pocket_rev = slot->rev;
     pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
     pcnetgame_ts_refresh(svc); /* the seq the RESULT echoes */
-    if (is_donate) {
+    if (is_buy) {
+        printf("[NET][SHOP] host: peer %d resident %d SHOP_BUY item=0x%04X stock=0x%02X pocket slot=%u price=%u wallet %u -> %u sales_sum now %u committed [TXN]\n",
+               (int)peer, idx, (unsigned)t->item, (unsigned)t->aux_cond, (unsigned)t->slot, (unsigned)shop_price, (unsigned)t->pre_wallet,
+               (unsigned)post_wallet, (unsigned)Save_Get(shop).sales_sum);
+    } else if (is_sell) {
+        printf("[NET][SHOP] host: peer %d resident %d SHOP_SELL mask=0x%04X value=%u wallet %u -> %u sales_sum now %u committed [TXN]\n", (int)peer, idx,
+               (unsigned)t->aux_item, (unsigned)sell_value, (unsigned)t->pre_wallet, (unsigned)post_wallet, (unsigned)Save_Get(shop).sales_sum);
+    } else if (is_donate) {
         printf("[NET][MSM] host: peer %d resident %d MUSEUM_DONATE item=0x%04X slot=%u committed (donor slot %d) [TXN]\n", (int)peer, idx,
                (unsigned)t->item, (unsigned)t->slot, idx + 1);
     } else {
@@ -14511,7 +14926,9 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
            pcnetgame_kind_tag((int)s_ctxn.kind), (unsigned)s_ctxn.request_id, why);
     if (s_ctxn.kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && s_ctxn.kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) {
         pcnetgame_client_send_confirm(s_ctxn.kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT, reason, s_ctxn.request_id);
-    } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM) {
+    } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
+        s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* town services: no reservation to release; the UI seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
         if (s_catch_pending.valid && s_catch_pending.request_id == s_ctxn.request_id) {
@@ -14535,7 +14952,8 @@ static int pcnetgame_txn_try_send(void) {
     uint8_t flags = 0, aux_cond = 0;
     uint16_t item = T->item, aux_item = 0;
     const int is_commit_kind = (T->kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && T->kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) ||
-                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM;
+                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
+                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL;
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -14597,6 +15015,34 @@ static int pcnetgame_txn_try_send(void) {
             slot = (uint8_t)free_idx;
             aux_cond = T->ts_aux; /* the lost-and-found slot index travels in the tag's aux_cond */
             break;
+        case PC_NETGAME_TXN_KIND_SHOP_BUY:
+            /* shop: the pocket slot the dialogue chose, or the first free one of THIS moment; the item enters (and the bells leave) ONLY by APPLIED */
+            free_idx = (slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && Now_Private->inventory.pockets[slot] == (mActor_name_t)EMPTY_NO)
+                           ? (int)slot : mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+            if (free_idx < 0) {
+                pcnetgame_txn_cancel_queued("no free pocket slot for the purchase", (uint8_t)PC_NETGAME_CONFIRM_REASON_POCKETS_FULL);
+                return -1;
+            }
+            dest = (uint8_t)PC_NETGAME_TXN_DEST_POCKET;
+            slot = (uint8_t)free_idx;
+            aux_cond = T->ts_aux;       /* the stock code */
+            aux_item = T->ts_aux_item;  /* the price the player was shown */
+            break;
+        case PC_NETGAME_TXN_KIND_SHOP_SELL: {
+            int k;
+            if (slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT || Now_Private->inventory.pockets[slot] != (mActor_name_t)T->item) {
+                pcnetgame_txn_cancel_queued("the pocket slot no longer holds the item offered to Nook", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
+                return -1;
+            }
+            for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                if ((T->ts_aux_item & (1u << k)) && Now_Private->inventory.pockets[k] == (mActor_name_t)EMPTY_NO) {
+                    pcnetgame_txn_cancel_queued("a pocket slot of the sale is empty now", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
+                    return -1;
+                }
+            }
+            aux_item = T->ts_aux_item; /* the slot mask */
+            break;
+        }
         case PC_NETGAME_TXN_KIND_DIG_BURIED:
         case PC_NETGAME_TXN_KIND_DIG_HOLE:
         case PC_NETGAME_TXN_KIND_DIG_SHINE:
@@ -14767,6 +15213,95 @@ int pc_net_game_client_pocket_locked(void) {
     return s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid || pcnetgame_txn_busy();
 }
 
+/* Town services milestone 2: applies the host post-image of a SHOP_BUY / SHOP_SELL (the pockets / conditions / wallet the host computed with the
+ * vanilla payment, money-bag and overflow rules). The expected shape is verified first. If the local inventory is still the pre-image (the usual
+ * case: the pocket lock keeps the inventory UI shut during the round trip) the whole post-image is adopted; otherwise only the slots the
+ * transaction touched and the wallet DELTA are merged. Returns 1 = applied, 0 = refused (inconsistent post-image / nothing applied). */
+static int pcnetgame_txn_apply_shop(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+    const PCNetGameTxnTag* t = &T->tag;
+    const int buy = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY;
+    const uint16_t mask = buy ? (uint16_t)(1u << t->slot) : t->aux_item;
+    Private_c* np = Now_Private;
+    int i, same = 1, ok = 1;
+    if (t->slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT || in->post_wallet > (uint32_t)mPr_WALLET_MAX ||
+        (buy ? in->post_pockets[t->slot] != t->item
+             : (in->post_pockets[t->slot] != (uint16_t)EMPTY_NO && in->post_pockets[t->slot] != (uint16_t)ITM_MONEY_30000))) {
+        printf("[NET][TXN] client: *** APPLIED for request %u carries an inconsistent shop post-image -- nothing applied ***\n", (unsigned)T->request_id);
+        return 0;
+    }
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        const int in_mask = (mask & (1u << i)) != 0;
+        const uint16_t pre = t->pre_pockets[i], post = in->post_pockets[i];
+        if (!in_mask && post != pre) {
+            const int bag_in = pre == (uint16_t)EMPTY_NO && post == (uint16_t)ITM_MONEY_30000;               /* a sale overflowed into a free slot */
+            const int bag_out = post == (uint16_t)EMPTY_NO && (pre == (uint16_t)ITM_MONEY_100 || pre == (uint16_t)ITM_MONEY_1000 ||
+                                                                 pre == (uint16_t)ITM_MONEY_10000 || pre == (uint16_t)ITM_MONEY_30000); /* a purchase broke a bag */
+            if (buy ? !bag_out : !bag_in) {
+                printf("[NET][TXN] client: *** APPLIED for request %u changes slot %d outside the transaction -- nothing applied ***\n",
+                       (unsigned)T->request_id, i);
+                return 0;
+            }
+        }
+        if ((uint16_t)np->inventory.pockets[i] != pre) {
+            same = 0;
+        }
+    }
+    if (np->inventory.item_conditions != t->pre_conds || np->inventory.wallet != t->pre_wallet) {
+        same = 0;
+    }
+    if (same) {
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            np->inventory.pockets[i] = (mActor_name_t)in->post_pockets[i];
+        }
+        np->inventory.item_conditions = in->post_conds;
+        np->inventory.wallet = in->post_wallet;
+        if (buy) {
+            mPr_SetItemCollectBit((mActor_name_t)t->item); /* the vanilla side effect of putting an item into a pocket */
+        }
+    } else {
+        int64_t w = (int64_t)np->inventory.wallet + ((int64_t)in->post_wallet - (int64_t)t->pre_wallet);
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            if (in->post_pockets[i] != t->pre_pockets[i]) {
+                if ((uint16_t)np->inventory.pockets[i] == t->pre_pockets[i]) {
+                    np->inventory.pockets[i] = (mActor_name_t)in->post_pockets[i];
+                    np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, i, mPr_GET_ITEM_COND(in->post_conds, i));
+                } else if (buy && i == (int)t->slot) {
+                    int f = mPr_GetPossessionItemIdx(np, (mActor_name_t)EMPTY_NO);
+                    if (f >= 0) {
+                        np->inventory.pockets[f] = (mActor_name_t)t->item;
+                        np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, f, mPr_ITEM_COND_NORMAL);
+                    } else {
+                        ok = 0;
+                    }
+                } else {
+                    printf("[NET][TXN] client: slot %d changed locally during the round trip -- the host's value for it is NOT applied\n", i);
+                }
+            }
+        }
+        if (w < 0) {
+            w = 0;
+        }
+        if (w > (int64_t)mPr_WALLET_MAX) {
+            w = (int64_t)mPr_WALLET_MAX;
+        }
+        np->inventory.wallet = (u32)w;
+        if (buy && ok) {
+            mPr_SetItemCollectBit((mActor_name_t)t->item);
+        }
+        if (!ok) {
+            printf("[NET][TXN] client: *** the purchased item 0x%04X has no free pocket after a local inventory change -- lost (the bells were taken) ***\n",
+                   (unsigned)t->item);
+        }
+    }
+    printf("[NET][TXN] client: APPLIED request %u kind=%s -- %s: wallet now %u\n", (unsigned)T->request_id, pcnetgame_kind_tag((int)T->kind),
+           same ? "host post-image" : "delta merge (the local inventory changed during the round trip)", (unsigned)np->inventory.wallet);
+    if (in->host_session == s_crec.base_session && in->epoch == s_crec.base_epoch && in->rev > s_crec.base_rev) {
+        pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
+        s_crec.next_check_ms = 0;
+    }
+    return 1;
+}
+
 /* The ONLY writer of pockets / item_conditions / wallet for a pickup / drop / bury / dig grant / catch. Called with a copy of s_ctxn (the state
  * is already FREE) and the host's APPLIED RESULT. */
 /* Returns 1 when the host post-image was applied to the local inventory (or there is nothing to apply), 0 when it was NOT (owner changed /
@@ -14788,6 +15323,9 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
         printf("[NET][TXN] client: APPLIED for request %u but the local player/save changed -- nothing applied (the host mirror is the "
                "truth at the next join)\n", (unsigned)T->request_id);
         return 0;
+    }
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
+        return pcnetgame_txn_apply_shop(T, in); /* town services milestone 2: the shop's own post-image shape (bells, money bags, several slots) */
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH && !to_pocket) {
         /* a full-pockets catch: nothing enters the pockets (the host kept the pre-image and granted the exchange credit) */
@@ -14942,6 +15480,7 @@ static void pcnetgame_handle_client_txn_result(const PCNetGameTxnResultMsg* in) 
         printf("[NET][TXN] client: REJECTED(%s) kind=%s request=%u seq=%u (host rev %u) -- no local change%s\n",
                pcnetgame_txn_reason_name(in->reason), pcnetgame_kind_tag((int)T.kind), (unsigned)T.request_id, (unsigned)T.seq,
                (unsigned)in->rev, T.exch_valid && T.tag.flags != 0 ? "; the exchange replacement is lost" : "");
+        s_ts_last_reason = in->reason; /* shop seams pick the refusal row from it (SOLD OUT / NO_FUNDS / ...) */
         pcnetgame_ts_op_resolve(T.kind, T.request_id, 0); /* town services: the UI seam gets "rejected" (give-back / refusal path) */
         if (T.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
             pcnetgame_txn_catch_outcome(&T, 0);
@@ -15109,6 +15648,7 @@ static int pcnetgame_ts_valid_police_blob(const uint8_t* blob) {
     return 1;
 }
 
+/* (the shop blob validator pcnetgame_ts_valid_shop_blob() lives in the TS HOST block: the host runs it on its own state too) */
 static int pcnetgame_ts_valid_museum_blob(const uint8_t* blob) {
     unsigned i;
     for (i = 0; i < PC_NETGAME_TS_MUSEUM_LEN; i++) {
@@ -15126,13 +15666,20 @@ static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
         for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
             Save_Get(police_box).keep_items[i] = (mActor_name_t)((uint16_t)m->blob[2 * i] | ((uint16_t)m->blob[2 * i + 1] << 8));
         }
+    } else if (svc == (int)PC_NETGAME_TS_SHOP) {
+        memcpy(&Save_Get(shop), m->blob, PC_NETGAME_TS_SHOP_LEN); /* the host's Shop_c wholesale: stock, rare item, bag count, level, sales_sum, times */
     } else {
         memcpy(&Save_Get(museum_display), m->blob, PC_NETGAME_TS_MUSEUM_LEN);
     }
     s_ts_client_seq[svc] = m->seq;
     s_ts_client_have[svc] = 1;
-    printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : "MUSEUM",
+    printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc),
            (unsigned)m->seq, (unsigned)m->digest, (unsigned)m->len);
+    if (svc == (int)PC_NETGAME_TS_SHOP && pcnetgame_shop_local_scene_is_shop()) {
+        /* the shop floor was built from the PREVIOUS local copy: items the host has sold since come off the display (items that appeared
+         * since are NOT added in place: they show at the next entry) */
+        printf("[NET][TS] client: the shop floor display was refreshed from the mirror (%d item(s) taken off)\n", aSD_PC_SyncDisplayWithStock());
+    }
     if (svc == (int)PC_NETGAME_TS_POLICE && s_local_scene.valid && s_local_scene.scene_id == (uint8_t)SCENE_POLICE_BOX) {
         mFI_SetFGUpData(); /* the existing refresh point: bg_police_item rebuilds its draw table from keep_items on the next frame */
         printf("[NET][TS] client: the lost-and-found items on display are being redrawn from the mirror\n");
@@ -15154,11 +15701,12 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     memset(&m, 0, sizeof(m));
     memcpy(&m, data, size);
     svc = (int)m.service;
-    if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM) {
+    if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
-    expect = (svc == (int)PC_NETGAME_TS_POLICE) ? (uint16_t)PC_NETGAME_TS_POLICE_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+    expect = (svc == (int)PC_NETGAME_TS_POLICE) ? (uint16_t)PC_NETGAME_TS_POLICE_LEN
+             : (svc == (int)PC_NETGAME_TS_SHOP) ? (uint16_t)PC_NETGAME_TS_SHOP_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -15174,9 +15722,10 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
                (unsigned)(s_ts_client_stash_valid[svc] && s_ts_client_stash[svc].seq > s_ts_client_seq[svc] ? s_ts_client_stash[svc].seq : s_ts_client_seq[svc]));
         return;
     }
-    if (!(svc == (int)PC_NETGAME_TS_POLICE ? pcnetgame_ts_valid_police_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+    if (!(svc == (int)PC_NETGAME_TS_POLICE ? pcnetgame_ts_valid_police_blob(m.blob)
+          : svc == (int)PC_NETGAME_TS_SHOP ? pcnetgame_ts_valid_shop_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
-               svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : "museum");
+               svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop" : "museum");
         return;
     }
     if (!pcfa_save_ready()) {
@@ -15193,7 +15742,7 @@ static void pcnetgame_ts_client_tick(void) {
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcfa_save_ready()) {
         return;
     }
-    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_MUSEUM; svc++) {
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_SHOP; svc++) {
         if (s_ts_client_stash_valid[svc]) {
             s_ts_client_stash_valid[svc] = 0;
             if (!s_ts_client_have[svc] || s_ts_client_stash[svc].seq > s_ts_client_seq[svc]) {
@@ -15205,12 +15754,12 @@ static void pcnetgame_ts_client_tick(void) {
 
 /* Begins the transaction of the pending UI operation. Returns 1 = started, 0 = refused for good (not a READY client, bad arguments, no usable
  * player: the caller takes its give-back / refusal path), -1 = busy, retry on the next frame (another pocket transaction is unresolved). */
-static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item) {
+static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item, int aux_item) {
     PCNetGameOwnerStamp stamp;
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
         return 0;
     }
-    if (slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT || item <= 0 || item > 0xFFFF || aux < 0 || aux > 0xFF) {
+    if (slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT || item <= 0 || item > 0xFFFF || aux < 0 || aux > 0xFF || aux_item < 0 || aux_item > 0xFFFF) {
         return 0;
     }
     if (s_ts_op.active && s_ts_op.done) {
@@ -15227,13 +15776,16 @@ static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item) {
     s_ts_op.slot = (uint8_t)slot;
     s_ts_op.aux = (uint8_t)aux;
     s_ts_op.item = (uint16_t)item;
+    s_ts_op.aux_item = (uint16_t)aux_item;
     s_ts_op.request_id = s_ts_next_rid++;
+    s_ts_last_reason = 0;
     memset(&s_ctxn, 0, sizeof(s_ctxn));
     s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
     s_ctxn.kind = kind;
     s_ctxn.slot = (uint8_t)slot;
     s_ctxn.item = (uint16_t)item;
     s_ctxn.ts_aux = (uint8_t)aux;
+    s_ctxn.ts_aux_item = (uint16_t)aux_item;
     s_ctxn.request_id = s_ts_op.request_id;
     s_ctxn.owner = stamp;
     s_ctxn.first_ms = pcnetgame_now_ms();
@@ -15244,11 +15796,53 @@ static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item) {
 }
 
 int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item) {
-    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item);
+    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item, 0);
 }
 
 int pc_net_game_ts_begin_police_claim(int pocket_slot, int police_idx, int item) {
-    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM, pocket_slot, police_idx, item);
+    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM, pocket_slot, police_idx, item, 0);
+}
+
+/* Town services milestone 2 (shop). begin_shop_buy: `stock_code` from pc_net_game_shop_buy_stock_code(), `price` the player was shown. begin_shop_sell:
+ * `slot_mask` bit i = pocket slot i (bits 0..14), `primary_slot` one of its set bits, `item` the item in that slot. Same return values as the others. */
+int pc_net_game_ts_begin_shop_buy(int pocket_slot, int item, int stock_code, int price) {
+    if (stock_code < 0 || price <= 0) {
+        return 0;
+    }
+    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY, pocket_slot, stock_code, item, price);
+}
+
+int pc_net_game_ts_begin_shop_sell(int slot_mask, int primary_slot, int item) {
+    if (slot_mask <= 0 || slot_mask > 0x7FFF || primary_slot < 0 || primary_slot >= mPr_POCKETS_SLOT_COUNT || !(slot_mask & (1 << primary_slot))) {
+        return 0;
+    }
+    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL, primary_slot, 0, item, slot_mask);
+}
+
+/* The stock code a purchase of `item` must carry against the MIRRORED shop (see pcnetgame_shop_stock_code()); -1 = refuse the purchase locally
+ * (sold out in the mirror, special-event stock, paint, not a shop item). Meaningful for a READY client only. */
+int pc_net_game_shop_buy_stock_code(int item) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || item <= 0 || item > 0xFFFF) {
+        return -1;
+    }
+    return pcnetgame_shop_stock_code((mActor_name_t)item, &Save_Get(shop), pcnetgame_shop_status_now());
+}
+
+int pc_net_game_host_shop_can_sell(int item) {
+    int status;
+    if (s_role != PC_NETGAME_ROLE_HOST || item <= 0 || item > 0xFFFF) {
+        return 1;
+    }
+    status = pcnetgame_shop_status_now();
+    if (status == mSP_TANUKI_SHOP_STATUS_EVENT || status == mSP_TANUKI_SHOP_STATUS_FUKUBIKI) {
+        return 1;
+    }
+    return pcnetgame_shop_stock_code((mActor_name_t)item, &Save_Get(shop), status) >= 0;
+}
+
+/* The host's reason of the last REJECTED town-service result (PC_NETGAME_TS_REJECT_*), 0 = a local refusal / nothing. */
+int pc_net_game_ts_last_reject_reason(void) {
+    return (int)s_ts_last_reason;
 }
 
 /* PC_NETGAME_TS_OP_PENDING while the transaction is unresolved; once resolved APPLIED / REJECTED exactly once (the result is consumed). A link
@@ -15401,6 +15995,144 @@ static void pcnetgame_run_ts_test_hook(void) {
         pcnetgame_ts_test_log_state("--ts-test: final");
         printf("[NET][TS][TEST-ONLY] --ts-test-%s: final item 0x%04X museum_info=%d (1 can donate, 2 already donated)\n", donate ? "donate" : "claim",
                (unsigned)s_item, (int)mMmd_GetDisplayInfo((mActor_name_t)s_item));
+        s_stage = 5;
+    }
+}
+/* TEST-ONLY (--shop-test-buy / --shop-test-sell, client role, default OFF, never active in normal play; every step logs "[NET][SHOP][TEST-ONLY]").
+ * Drives ONE real shop purchase / sale through the REAL client request path (pc_net_game_shop_buy_stock_code() + pc_net_game_ts_begin_shop_* /
+ * _poll -> TXN_COMMIT -> TXN_RESULT -> pcnetgame_txn_apply_shop(), the entry points the Nook dialogue seams call) without GUI input.
+ * --shop-test-buy: the one LOCAL test setup write is the wallet (raised to 90000 so the cheapest stocked item of the LOCAL mirror is affordable;
+ * the D3 upload carries it after a 5 s pause); then the cheapest buyable item is purchased. --shop-test-sell: the one local write puts a
+ * sellable fish into a free slot (same pause), which is then sold. While the transaction is unresolved the pockets and wallet must not change
+ * (a loud "*** CHANGED BEFORE APPLIED ***" otherwise). */
+static void pcnetgame_run_shop_test_hook(void) {
+    static int s_stage = 0;
+    static uint32_t s_t0 = 0;
+    static int s_slot = -1, s_code = -1;
+    static uint16_t s_item = 0, s_price = 0;
+    static uint16_t s_snap[mPr_POCKETS_SLOT_COUNT];
+    static uint32_t s_wallet_snap = 0;
+    const int buy = g_pc_shop_test_buy != 0;
+    uint32_t now;
+    int i, r;
+
+    if ((!g_pc_shop_test_buy && !g_pc_shop_test_sell) || s_stage >= 5 || s_role != PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+    if (!pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_stage == 0) {
+        if ((uint32_t)(now - s_crec.adopt_ms) < 4000u || !s_ts_client_have[PC_NETGAME_TS_SHOP]) {
+            return;
+        }
+        s_slot = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+        if (s_slot < 0) {
+            printf("[NET][SHOP][TEST-ONLY] no free pocket slot -- hook gives up\n");
+            s_stage = 5;
+            return;
+        }
+        if (buy) {
+            u32 best = 0xFFFFFFFFu;
+            s_item = 0;
+            for (i = 0; i < mSP_GOODS_COUNT; i++) {
+                mActor_name_t it = Save_Get(shop).items[i];
+                int code = (it != (mActor_name_t)EMPTY_NO) ? pc_net_game_shop_buy_stock_code((int)it) : -1;
+                u32 price = (code >= 0) ? mSP_ItemNo2ItemPrice(it) : 0;
+                if (code >= 0 && price > 0 && price <= 60000u && price < best) {
+                    best = price;
+                    s_item = (uint16_t)it;
+                    s_code = code;
+                    s_price = (uint16_t)price;
+                }
+            }
+            if (s_item == 0) {
+                printf("[NET][SHOP][TEST-ONLY] --shop-test-buy: the mirrored shop has no buyable item (special-day stock?) -- hook gives up\n");
+                s_stage = 5;
+                return;
+            }
+            if (Now_Private->inventory.wallet < 90000u) {
+                Now_Private->inventory.wallet = 90000u; /* the hook's ONE local write: "the player is rich enough" (carried to the host by the D3 upload) */
+                printf("[NET][SHOP][TEST-ONLY] --shop-test-buy: wallet raised to 90000 locally (test setup, NOT active in normal play)\n");
+            }
+        } else {
+            s_item = 0;
+            for (i = (int)ITM_FISH_START; i <= (int)ITM_FISH_START + 39; i++) {
+                if (mSP_ItemNo2ItemPrice((mActor_name_t)i) / 4u > 0u) {
+                    s_item = (uint16_t)i;
+                    break;
+                }
+            }
+            if (s_item == 0) {
+                printf("[NET][SHOP][TEST-ONLY] --shop-test-sell: no sellable fish found -- hook gives up\n");
+                s_stage = 5;
+                return;
+            }
+            Now_Private->inventory.pockets[s_slot] = (mActor_name_t)s_item; /* the hook's ONE local write: "the player caught this fish" */
+            Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, s_slot, mPr_ITEM_COND_NORMAL);
+            printf("[NET][SHOP][TEST-ONLY] --shop-test-sell: placed item 0x%04X into pocket slot %d (local test setup, NOT active in normal play)\n",
+                   (unsigned)s_item, s_slot);
+        }
+        s_t0 = now;
+        s_stage = 1;
+        return;
+    }
+    if (s_stage == 1 && (uint32_t)(now - s_t0) < 5000u) {
+        return; /* let the D3 upload carry the test setup first */
+    }
+    if (s_stage == 1) {
+        if (pcnetgame_txn_busy() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+            return;
+        }
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            s_snap[i] = (uint16_t)Now_Private->inventory.pockets[i];
+        }
+        s_wallet_snap = Now_Private->inventory.wallet;
+        printf("[NET][SHOP][TEST-ONLY] --shop-test-%s: requesting item 0x%04X pocket slot %d%s wallet=%u sales_sum(mirror)=%u\n", buy ? "buy" : "sell",
+               (unsigned)s_item, s_slot, buy ? " (price/stock from the mirror)" : "", (unsigned)s_wallet_snap, (unsigned)Save_Get(shop).sales_sum);
+        r = buy ? pc_net_game_ts_begin_shop_buy(s_slot, (int)s_item, s_code, (int)s_price) : pc_net_game_ts_begin_shop_sell(1 << s_slot, s_slot, (int)s_item);
+        if (r < 0) {
+            return; /* busy: retried */
+        }
+        if (r == 0) {
+            printf("[NET][SHOP][TEST-ONLY] --shop-test: the request was refused locally -- hook gives up\n");
+            s_stage = 5;
+            return;
+        }
+        s_stage = 3;
+        return;
+    }
+    if (s_stage == 3) {
+        r = pc_net_game_ts_poll();
+        if (r == PC_NETGAME_TS_OP_PENDING) {
+            for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+                if (s_snap[i] != (uint16_t)Now_Private->inventory.pockets[i]) {
+                    printf("[NET][SHOP][TEST-ONLY] --shop-test: *** POCKET CHANGED BEFORE APPLIED *** (slot %d)\n", i);
+                    s_snap[i] = (uint16_t)Now_Private->inventory.pockets[i];
+                }
+            }
+            if (Now_Private->inventory.wallet != s_wallet_snap) {
+                printf("[NET][SHOP][TEST-ONLY] --shop-test: *** WALLET CHANGED BEFORE APPLIED ***\n");
+                s_wallet_snap = Now_Private->inventory.wallet;
+            }
+            return;
+        }
+        printf("[NET][SHOP][TEST-ONLY] --shop-test-%s: result %s item 0x%04X reason %d\n", buy ? "buy" : "sell",
+               r == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED", (unsigned)s_item, pc_net_game_ts_last_reject_reason());
+        s_t0 = now;
+        s_stage = 4;
+        return;
+    }
+    if (s_stage == 4 && (uint32_t)(now - s_t0) >= 2500u) { /* the shop mirror follows the RESULT: report the settled state */
+        char pb[15 * 5 + 1];
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            snprintf(pb + i * 5, sizeof(pb) - (size_t)i * 5, "%04X,", (unsigned)Now_Private->inventory.pockets[i]);
+        }
+        pb[sizeof(pb) - 1] = '\0';
+        printf("[NET][SHOP][TEST-ONLY] --shop-test-%s: final item 0x%04X pockets=%s wallet=%u sales_sum(mirror)=%u stock[%d]=0x%04X\n", buy ? "buy" : "sell",
+               (unsigned)s_item, pb, (unsigned)Now_Private->inventory.wallet, (unsigned)Save_Get(shop).sales_sum, buy ? s_code : -1,
+               (unsigned)(buy && s_code >= 0 && s_code < mSP_GOODS_COUNT ? Save_Get(shop).items[s_code] : 0));
         s_stage = 5;
     }
 }
@@ -15988,8 +16720,9 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     if (size == sizeof(PCNetGameTxnCommitMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_TXN_COMMIT) {
         PCNetGameTxnCommitMsg tc;
         memcpy(&tc, data, sizeof(tc)); /* X1 (v8): exact size, aligned local copy; the READY / binding gates are inside */
-        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM) {
-            pcnetgame_handle_host_ts_txn(peer, &tc); /* town services: reservation-less one-phase kinds */
+        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
+            tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
+            pcnetgame_handle_host_ts_txn(peer, &tc); /* town services: reservation-less one-phase kinds (museum, police, shop) */
         } else {
             pcnetgame_handle_host_txn_commit(peer, &tc);
         }
@@ -16451,6 +17184,7 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_ctxn, 0, sizeof(s_ctxn)); /* X1b: the transaction in flight dies with the session (no orphan retention in X1); s_txn_nonce / s_txn_next_seq are PROCESS-wide and deliberately NOT reset */
     s_next_bury_request_id = 1;
     memset(&s_ts_op, 0, sizeof(s_ts_op)); /* town services: the UI operation and the mirror's seq memory die with the session (the host's seq restarts per process) */
+    s_ts_last_reason = 0;
     memset(s_ts_client_seq, 0, sizeof(s_ts_client_seq));
     memset(s_ts_client_have, 0, sizeof(s_ts_client_have));
     memset(s_ts_client_stash_valid, 0, sizeof(s_ts_client_stash_valid));
@@ -18414,6 +19148,7 @@ void pc_net_game_poll(void) {
      * (--ts-test-donate / --ts-test-claim; complete no-ops by default, client role only). */
     pcnetgame_ts_client_tick();
     pcnetgame_run_ts_test_hook();
+    pcnetgame_run_shop_test_hook(); /* shop milestone: --shop-test-buy / --shop-test-sell (client role, default OFF) */
 
     /* World Ecology Wildlife Sync T1 real-gameplay verification: see
      * pcnetgame_run_wildlife_trigger_test_trigger()'s own doc -- a complete no-op unless

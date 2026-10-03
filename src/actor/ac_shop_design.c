@@ -2,6 +2,9 @@
 
 #include "m_common_data.h"
 #include "m_name_table.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* town services milestone 2: pc_net_game_role() -- a client's sale report is display-only */
+#endif
 
 static void Shop_Design_Actor_ct(ACTOR* actorx, GAME* game);
 static void Shop_Design_Actor_dt(ACTOR* actorx, GAME* game);
@@ -195,6 +198,50 @@ static void aSD_MakeLotteryGoodsFg(mActor_name_t* lottery_items) {
 
 static mActor_name_t aSD_UnitNum2ItemNo(int ux, int uz);
 static int aSD_ReportGoodsSales(int ux, int uz);
+static int aSD_ReportGoodsSales_ex(int ux, int uz, int accounting);
+
+#ifdef TARGET_PC
+/* 1 while `item` (an item shown on the shop floor) is still part of the stock in Save_Get(shop): stationery never runs out, candy / grab bags are
+ * counted, everything else is a stock slot or the rare item. */
+static int aSD_PC_ItemStillInStock(mActor_name_t item) {
+    int i;
+    if (ITEM_IS_PAPER(item)) {
+        return TRUE;
+    }
+    if (item == ITM_HUKUBUKURO_BAG || item == ITM_FOOD_CANDY) {
+        return Save_Get(shop).flowers_candy_grab_bag_count > 0;
+    }
+    for (i = 0; i < mSP_GOODS_COUNT; i++) {
+        if (Save_Get(shop).items[i] == item) {
+            return TRUE;
+        }
+    }
+    return Save_Get(shop).rare_item == item;
+}
+
+extern int aSD_PC_SyncDisplayWithStock(void) {
+    int ux, uz, n = 0;
+    int status;
+
+    if (Common_Get(clip).shop_design_clip == NULL) {
+        return 0;
+    }
+    status = Common_Get(tanuki_shop_status);
+    if (status == mSP_TANUKI_SHOP_STATUS_EVENT || status == mSP_TANUKI_SHOP_STATUS_FUKUBIKI) {
+        return 0; /* bargain-day stock is event_save_data (not mirrored) and the raffle floor is a different layout */
+    }
+    for (uz = 0; uz < UT_Z_NUM; uz++) {
+        for (ux = 0; ux < UT_X_NUM; ux++) {
+            mActor_name_t item = aSD_UnitNum2ItemNo(ux, uz);
+            if (item != RSV_NO && item != EMPTY_NO && !aSD_PC_ItemStillInStock(item)) {
+                (void)aSD_ReportGoodsSales_ex(ux, uz, FALSE);
+                n++;
+            }
+        }
+    }
+    return n;
+}
+#endif
 
 static void aSD_SetClipProc(ACTOR* actorx, int clear) {
     SHOP_DESIGN_ACTOR* shop_design = (SHOP_DESIGN_ACTOR*)actorx;
@@ -357,7 +404,24 @@ static mActor_name_t aSD_UnitNum2ItemNo(int ux, int uz) {
     }
 }
 
+/* Town services milestone 2: Save_t.shop (sales_sum, the stock list) is HOST state on a network client (mirrored by TOWN_SVC_STATE, changed only by the
+ * host's SHOP_BUY transaction), so a CLIENT's report only updates the floor display; `accounting` = 0 skips mSP_PlusSales / mSP_ShopSaleReport. */
+static int aSD_SaleReport(int accounting, mActor_name_t sold_item, mActor_name_t* goods_table, int goods_count, mActor_name_t rsv_item) {
+    if (!accounting) {
+        return FALSE;
+    }
+    return mSP_ShopSaleReport(sold_item, goods_table, goods_count, rsv_item);
+}
+
 static int aSD_ReportGoodsSales(int ux, int uz) {
+#ifdef TARGET_PC
+    return aSD_ReportGoodsSales_ex(ux, uz, pc_net_game_role() != PC_NETGAME_ROLE_CLIENT);
+#else
+    return aSD_ReportGoodsSales_ex(ux, uz, TRUE);
+#endif
+}
+
+static int aSD_ReportGoodsSales_ex(int ux, int uz, int accounting) {
     mActor_name_t item = aSD_UnitNum2ItemNo(ux, uz);
     u32 price = mSP_ItemNo2ItemPrice(item);
     mActor_name_t rsv_item = EMPTY_NO;
@@ -365,22 +429,26 @@ static int aSD_ReportGoodsSales(int ux, int uz) {
     if (Common_Get(clip).shop_design_clip != NULL) {
         SHOP_DESIGN_ACTOR* shop_design = Common_Get(clip).shop_design_clip->design_actor;
 
-        mSP_PlusSales(price);
+        if (accounting) {
+            mSP_PlusSales(price);
+        }
         if (item == ITM_HUKUBUKURO_BAG) {
-            mSP_ShopSaleReport(item, shop_design->goods_list, shop_design->goods_list_max, RSV_SHOP_SOLD_PLANT);
+            aSD_SaleReport(accounting, item, shop_design->goods_list, shop_design->goods_list_max, RSV_SHOP_SOLD_PLANT);
             mFI_UtNumtoFGSet_common(RSV_SHOP_SOLD_PLANT, ux, uz, FALSE);
             return FALSE;
         } else if ((item >= ITM_SAPLING && item <= ITM_CEDAR_SAPLING) ||
                    (item >= ITM_WHITE_PANSY_BAG && item <= ITM_YELLOW_TULIP_BAG) || item == ITM_FOOD_CANDY) {
-            if (mSP_ShopSaleReport(item, shop_design->goods_list, shop_design->goods_list_max, RSV_SHOP_SOLD_PLANT)) {
+            if (aSD_SaleReport(accounting, item, shop_design->goods_list, shop_design->goods_list_max, RSV_SHOP_SOLD_PLANT)) {
                 return TRUE;
             } else {
                 mFI_UtNumtoFGSet_common(RSV_SHOP_SOLD_PLANT, ux, uz, FALSE);
                 return FALSE;
             }
         } else if (item >= ITM_CLOTH_START && item <= ITM_CLOTH_END) {
-            mSP_ShopSaleReport(item, shop_design->goods_list, shop_design->goods_list_max, RSV_SHOP_SOLD_CLOTH);
-            Common_Get(clip).shop_manekin_clip->change2naked_manekin_proc(ux, uz);
+            aSD_SaleReport(accounting, item, shop_design->goods_list, shop_design->goods_list_max, RSV_SHOP_SOLD_CLOTH);
+            if (Common_Get(clip).shop_manekin_clip != NULL) {
+                Common_Get(clip).shop_manekin_clip->change2naked_manekin_proc(ux, uz);
+            }
             mFI_UtNumtoFGSet_common(RSV_NO, ux, uz, FALSE);
             return FALSE;
         } else if (ITEM_IS_FTR(item) && Common_Get(clip).my_room_clip != NULL) {
@@ -437,7 +505,7 @@ static int aSD_ReportGoodsSales(int ux, int uz) {
         }
 
         if (rsv_item != EMPTY_NO) {
-            if (mSP_ShopSaleReport(item, shop_design->goods_list, shop_design->goods_list_max, rsv_item)) {
+            if (aSD_SaleReport(accounting, item, shop_design->goods_list, shop_design->goods_list_max, rsv_item)) {
                 return TRUE;
             }
 

@@ -45,8 +45,8 @@ def func_body(src, name):
 
 
 def strip_hook_bodies(text):
-    """`text` without the bodies of the two TEST-ONLY hook functions (they read / write pockets by design)."""
-    for name in ("pcnetgame_ts_test_log_state", "pcnetgame_run_ts_test_hook"):
+    """`text` without the bodies of the TEST-ONLY hook functions (the shop hook since milestone 2) (they read / write pockets by design)."""
+    for name in ("pcnetgame_ts_test_log_state", "pcnetgame_run_ts_test_hook", "pcnetgame_run_shop_test_hook"):
         body = func_body(text, name)
         if body:
             text = text.replace(body, "")
@@ -105,7 +105,7 @@ def main():
     check("M host table: one slot per service (blob, digest, seq); police = 20 little-endian u16 of keep_items (40 B), museum = the 63 raw bytes of Save_Get(museum_display)",
           "static PCNetGameTsHost s_ts_host[PC_NETGAME_TS_NUM];" in hblk and "keep_items[i]" in build and "blob[2 * i] = (uint8_t)(v & 0xFFu);" in build
           and "blob[2 * i + 1] = (uint8_t)(v >> 8);" in build and "memcpy(blob, &Save_Get(museum_display), PC_NETGAME_TS_MUSEUM_LEN)" in build
-          and "PC_NETGAME_TS_SHOP" not in strip_comments(build))
+          and "memcpy(blob, &Save_Get(shop), PC_NETGAME_TS_SHOP_LEN)" in build)  # milestone 2: service 3 = the 320 raw bytes of Shop_c
     refresh = func_body(hblk_raw, "pcnetgame_ts_refresh")
     check("M change detection is a DIGEST compare (FNV-1a32 of the blob): the seq is bumped only when len / digest differ, never otherwise (strictly increasing, never reset)",
           "dig = pcnetgame_fnv1a32(blob, len);" in refresh and "if (h->valid && h->len == len && h->digest == dig) {\n        return 0;" in refresh
@@ -160,8 +160,9 @@ def main():
           ts != "" and not re.search(r"\b(SDL_Delay|Sleep|fopen|fwrite|pc_net_poll|usleep)\b", ts))
     order = ["s_host_peer_link[peer] != PC_NETGAME_LINK_READY", "PC_TXN_FAULT_IGNORE_COMMIT", "pcnetgame_rec_gate(peer, 0, 0)", "PC_NETGAME_RECS_SYNCED", "s_host_world_ready",
              "shape_ok = in->_rsv0 == 0", "pcnetgame_txn_nonce_fenced(", "pcnetgame_txn_journal_find(", "R->max_seq = t->txn_seq;", "pcnetgame_rec_refresh_hostfields(idx, slot)",
-             "t->base_epoch != slot->epoch", "pcnetgame_rec_validate_inventory(t->pre_pockets", "mMmd_GetDisplayInfo(", "PC_TXN_FAULT_FAIL_WORLD", "memcpy(post, t->pre_pockets",
-             "pcnetgame_rec_validate_inventory(post, post_conds", "mMmd_RequestMuseumDisplay(", "mPB_copy_itemBuf(", "pcnetgame_rec_txn_write_inventory(idx, post", "slot->rev++;",
+             "t->base_epoch != slot->epoch", "pcnetgame_rec_validate_inventory(t->pre_pockets", "memcpy(post, t->pre_pockets", "pcnetgame_shop_pay(post",
+             "pcnetgame_shop_sell_plan(t->pre_pockets", "mMmd_GetDisplayInfo(", "PC_TXN_FAULT_FAIL_WORLD",
+             "pcnetgame_rec_validate_inventory(post, post_conds", "mSP_PlusSales(shop_price);", "mSP_ShopSaleReport(", "mMmd_RequestMuseumDisplay(", "mPB_copy_itemBuf(", "pcnetgame_rec_txn_write_inventory(idx, post", "slot->rev++;",
              "slot->dirty_unsaved = 1;", "R->last_pocket_rev = slot->rev;", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED", "pcnetgame_ts_refresh(svc);",
              "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE", "pcnetgame_host_ts_push_all();\n    /* 14.",
              "pcnetgame_rec_start_push(peer, idx, st->rec_push_kind)"]
@@ -188,7 +189,7 @@ def main():
           "!pcnetgame_rec_txn_idx_ok(idx)" in ts and ts.index("!pcnetgame_rec_txn_idx_ok(idx)") < ts.index("mMmd_RequestMuseumDisplay("))
     check("H NO RNG and no mPr_ item writer on the mirror path: no RANDOM / rand / qrand / pcnetgame_rec_rand32 / mPr_Set* / mPr_Give* in the TS host block (the pocket is written raw "
           "by pcnetgame_rec_txn_write_inventory with mPr_SET_ITEM_COND values)",
-          not re.search(r"\b(RANDOM|rand|qrand|pcnetgame_rec_rand32|fqrand|mPr_Set\w*|mPr_Give\w*|mPr_Clear\w*)\s*\(", hblk) and "pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)" in ts)
+          not re.search(r"\b(RANDOM|rand|qrand|pcnetgame_rec_rand32|fqrand|mPr_Set\w*|mPr_Give\w*|mPr_Clear\w*)\s*\(", hblk) and "pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)" in ts)
     mut_tokens = ("mMmd_RequestMuseumDisplay(", "keep_items[pidx] =", "pcnetgame_rec_txn_write_inventory(", "slot->rev++", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED")
     rej_ok = []
     for m in re.finditer(r"pcnetgame_txn_reject\(", ts):
@@ -199,8 +200,8 @@ def main():
           rej_ok and all(rej_ok) and len(rej_ok) >= 12)
     check("H the shape check counts structural garbage as a violation (3 close the peer); semantic refusals never do",
           "pcnetgame_rec_violation(peer, \"malformed town-service TXN_COMMIT (BAD_SHAPE)\")" in ts and ts.count("pcnetgame_rec_violation(") == 1)
-    check("H the dispatcher routes kinds 8 / 9 to this handler after the exact-size check; the X1 shape gate still refuses them (kind 1..3 only)",
-          re.search(r"if \(tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_DONATE \|\| tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_POLICE_CLAIM\) \{\s*pcnetgame_handle_host_ts_txn\(peer, &tc\);", hd) is not None
+    check("H the dispatcher routes kinds 8 / 9 / 10 / 11 (museum, police, shop buy, shop sell) to this handler after the exact-size check; the X1 shape gate still refuses them (kind 1..3 only)",
+          re.search(r"if \(tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_DONATE \|\| tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_POLICE_CLAIM \|\|\s*tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_BUY \|\| tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_SELL\) \{\s*pcnetgame_handle_host_ts_txn\(peer, &tc\);", hd) is not None
           and "shape_ok = in->kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && in->kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY" in c)
     check("H the shared fault hooks reach the new kinds: ignore_commit, fail_world and kill_peer_after_commit have one site each in the TS handler (drop_result through the shared sender); "
           "the journal is the shared per-resident s_txn_res, never reset per peer",

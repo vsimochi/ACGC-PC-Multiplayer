@@ -414,6 +414,9 @@ int g_pc_txn_test_dig_grant = 0;
 const char* g_pc_ts_test_seed_police = NULL;
 int g_pc_ts_test_donate = 0;
 int g_pc_ts_test_claim = 0;
+/* Town services milestone 2 (shop) TEST-ONLY hooks: --shop-test-buy / --shop-test-sell. See pc_platform.h's own doc comment. */
+int g_pc_shop_test_buy = 0;
+int g_pc_shop_test_sell = 0;
 
 /* X1 host-side fault injection, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. See pc_platform.h's own doc comment on these globals. */
 int g_pc_txn_fault_mode = 0;
@@ -592,6 +595,10 @@ int main(int argc, char* argv[]) {
                    "                      through the town-service transaction path. See pc_platform.h.\n");
             printf("  --ts-test-claim     Client-only TEST hook (default off; loud logs): drive ONE real lost-and-found\n"
                    "                      claim through the town-service transaction path. See pc_platform.h.\n");
+            printf("  --shop-test-buy     Client-only TEST hook (default off; loud logs): drive ONE real shop purchase\n"
+                   "                      through the town-service transaction path. See pc_platform.h.\n");
+            printf("  --shop-test-sell    Client-only TEST hook (default off; loud logs): drive ONE real shop sale\n"
+                   "                      through the town-service transaction path. See pc_platform.h.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -686,6 +693,12 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--ts-test-claim") == 0) {
             g_pc_ts_test_claim = 1;
             printf("[NET][TS][TEST-ONLY] --ts-test-claim armed (a TEST hook: not for normal play)\n");
+        } else if (strcmp(argv[i], "--shop-test-buy") == 0) {
+            g_pc_shop_test_buy = 1;
+            printf("[NET][SHOP][TEST-ONLY] --shop-test-buy armed (a TEST hook: not for normal play)\n");
+        } else if (strcmp(argv[i], "--shop-test-sell") == 0) {
+            g_pc_shop_test_sell = 1;
+            printf("[NET][SHOP][TEST-ONLY] --shop-test-sell armed (a TEST hook: not for normal play)\n");
         } else if (strncmp(argv[i], "--txn-fault=", 12) == 0) {
             if (!pc_parse_txn_fault(argv[i] + 12)) {
                 fprintf(stderr, "[NET][TXN][TEST-ONLY] REFUSED: bad --txn-fault spec '%s' (expected MODE[:N[:K]], MODE = ignore_commit | "

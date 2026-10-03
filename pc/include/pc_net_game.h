@@ -626,6 +626,28 @@ int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item);
 int pc_net_game_ts_begin_police_claim(int pocket_slot, int police_idx, int item);
 int pc_net_game_ts_poll(void);
 
+/* Town services milestone 2 (NOOK'S SHOP): the client seams of a purchase / a sale. SHOP_BUY / SHOP_SELL are host transactions (TXN_COMMIT kind 10 / 11)
+ * on the same machinery; the HOST computes the price / the sale value, validates the stock slot, pays, marks the stock sold and credits sales_sum. Only
+ * ever called with pc_net_game_role() == PC_NETGAME_ROLE_CLIENT. begin return values as above.
+ *   pc_net_game_shop_buy_stock_code(item): the stock code a purchase of `item` must carry against the MIRRORED shop (0..38 = Save_t.shop.items[] index,
+ *                                          0xFE rare item, 0xFD counted candy / grab bag, 0xFF stationery), -1 = refuse locally (sold out in the mirror,
+ *                                          bargain / raffle day, paint, not a shop item).
+ *   pc_net_game_ts_begin_shop_buy(slot, item, code, price): a free pocket slot, the item, its stock code and the price the player was shown.
+ *   pc_net_game_ts_begin_shop_sell(mask, slot, item): bit i of `mask` = pocket slot i is sold (bits 0..14); `slot` = one of them, `item` = its item.
+ *   pc_net_game_ts_last_reject_reason(): the host's PC_NETGAME_TS_REJECT_* reason of the last REJECTED result (0 = a local refusal / none). */
+#define PC_NETGAME_TS_REJECT_NOT_AVAILABLE   16
+#define PC_NETGAME_TS_REJECT_NO_FUNDS        19
+#define PC_NETGAME_TS_REJECT_NOT_SELLABLE    20
+#define PC_NETGAME_TS_REJECT_PRICE_MISMATCH  21
+#define PC_NETGAME_TS_REJECT_NO_ROOM         22
+int pc_net_game_shop_buy_stock_code(int item);
+int pc_net_game_ts_begin_shop_buy(int pocket_slot, int item, int stock_code, int price);
+int pc_net_game_ts_begin_shop_sell(int slot_mask, int primary_slot, int item);
+int pc_net_game_ts_last_reject_reason(void);
+/* H1: 1 when the HOST's own purchase of `item` may proceed (always 1 unless this is a networked HOST whose stock no longer holds the item: a client may have
+ * bought it meanwhile). Special-day stock (bargain / raffle) and solo / client roles answer 1 (vanilla behaviour). */
+int pc_net_game_host_shop_can_sell(int item);
+
 /* World Ecology T3: HOST-LOCAL bury -- mirrors pc_net_game_host_local_money_rock_hit()'s/
  * pc_net_game_host_local_tree_shake()'s own precedent exactly: the host's own local bury action routes
  * through the SAME validate+commit logic a remote peer's BURY_REQUEST/INTERACT_CONFIRM pair uses,

@@ -1142,6 +1142,10 @@ PC_NETGAME_TXN_REASON_ALREADY_DONATED = 15   # town services: the museum already
 PC_NETGAME_TXN_REASON_NOT_AVAILABLE = 16     # town services: the lost-and-found (slot, expected item) no longer matches
 PC_NETGAME_TXN_REASON_NOT_DONATABLE = 17     # town services: not a museum donation (vanilla predicate)
 PC_NETGAME_TXN_REASON_NO_DONOR_SLOT = 18     # town services: the bound resident has no museum donor slot (guest / extra player)
+PC_NETGAME_TXN_REASON_NO_FUNDS = 19          # shop: SHOP_BUY the pre-image wallet (plus money bags) cannot pay the host price
+PC_NETGAME_TXN_REASON_NOT_SELLABLE = 20      # shop: SHOP_SELL of stationery / a quest item / a Sunday turnip bundle
+PC_NETGAME_TXN_REASON_PRICE_MISMATCH = 21    # shop: SHOP_BUY whose expected price differs from the host's price
+PC_NETGAME_TXN_REASON_NO_ROOM = 22           # shop: SHOP_SELL whose money-bag overflow needs more free pockets than there are
 PC_NETGAME_TXN_RING = 16              # host journal entries per resident
 PC_NETGAME_TXN_FENCED_NUM = 4         # fenced nonces remembered per resident
 TXN_TAG_FMT = "<IIBBHBBHII15HHII"       # PCNetGameTxnTag, 64 bytes
@@ -1149,7 +1153,8 @@ TXN_COMMIT_FMT = "<BBHIIIBBHBBHII15HHII"  # PCNetGameTxnCommitMsg, 72 bytes
 TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHII"  # PCNetGameTxnResultMsg, 76 bytes
 TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED", 4: "NOT_SYNCED", 5: "NOT_BOUND", 6: "FENCED",
                     7: "CONFLICT", 8: "BAD_IMAGE", 9: "PRECOND", 10: "STALE_IMAGE", 11: "BAD_SHAPE", 12: "BUSY", 13: "FAULT",
-                    14: "REPLAYED", 15: "ALREADY_DONATED", 16: "NOT_AVAILABLE", 17: "NOT_DONATABLE", 18: "NO_DONOR_SLOT"}
+                    14: "REPLAYED", 15: "ALREADY_DONATED", 16: "NOT_AVAILABLE", 17: "NOT_DONATABLE", 18: "NO_DONOR_SLOT", 19: "NO_FUNDS",
+                    20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM"}
 
 # --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
 # CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
@@ -1164,16 +1169,25 @@ PC_NETGAME_TXN_KIND_DIG_SHINE = 6
 PC_NETGAME_TXN_KIND_CATCH = 7
 PC_NETGAME_TXN_KIND_MUSEUM_DONATE = 8   # town services: TXN_COMMIT kind 8 (dest NONE, slot = pocket slot, item); host-authoritative museum donation
 PC_NETGAME_TXN_KIND_POLICE_CLAIM = 9    # town services: TXN_COMMIT kind 9 (dest POCKET, slot = free slot, item = expected item, aux_cond = lost-and-found index)
+PC_NETGAME_TXN_KIND_SHOP_BUY = 10       # shop (milestone 2): dest POCKET, slot = free slot, item, aux_cond = stock code, aux_item = the expected price
+PC_NETGAME_TXN_KIND_SHOP_SELL = 11      # shop (milestone 2): dest NONE, slot = primary slot, item = its item, aux_item = the bit mask of every slot sold
+PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD    # SHOP_BUY aux_cond: a counted candy / grab bag (Shop_c.flowers_candy_grab_bag_count)
+PC_NETGAME_SHOP_STOCK_RARE = 0xFE       # SHOP_BUY aux_cond: Shop_c.rare_item
+PC_NETGAME_SHOP_STOCK_UNLIMITED = 0xFF  # SHOP_BUY aux_cond: unlimited stationery
+PC_NETGAME_SHOP_GOODS_COUNT = 39        # Shop_c.items[] (aux_cond 0..38 = the index)
+PC_NETGAME_SHOP_SELL_RATIO = 4          # SELL_BUY_RATIO: a normal item sells for price / 4
 
 # --- Town services milestone 1 (same v8, extended IN PLACE): the generic host -> client service mirror TOWN_SVC_STATE (id 55, RELIABLE,
 # 12 + len bytes, variable). Ids 53 / 54 stay reserved for X2 (the C enum names them PC_NETGAME_MSG_TXN_RESERVED_53 / _54). ---
 PC_NETGAME_MSG_TOWN_SVC_STATE = 55
 PC_NETGAME_TS_POLICE = 1       # Save_t.police_box.keep_items[20] as 20 little-endian u16 (40 B)
 PC_NETGAME_TS_MUSEUM = 2       # Save_t.museum_display, 63 raw bytes (4-bit donor nibbles)
+# NOTE (shop milestone): service 3 is SENT since milestone 2 (the 320 B Shop_c mirror); the trailing text of the next line is the pinned HEAD text.
 PC_NETGAME_TS_SHOP = 3         # RESERVED for the next milestone: never sent, never accepted
 PC_NETGAME_TS_BLOB_MAX = 340
 PC_NETGAME_TS_POLICE_LEN = 40
 PC_NETGAME_TS_MUSEUM_LEN = 63
+PC_NETGAME_TS_SHOP_LEN = 320
 TOWN_SVC_STATE_FMT = "<BBHII"  # 12-byte header (msg_type, service, len, seq, digest); the blob (len bytes) follows
 FIELD_ACTION_REQUEST_FMT = "<BBBBIBBHIIBBHBBHII15HHII"  # PCNetGameFieldActionRequestMsg, 76 bytes (12 B header + the 64 B tag)
 FIELD_ACTION_RESULT_FMT = "<BBBBIHBB"                   # PCNetGameFieldActionResultMsg, 12 bytes
@@ -1543,7 +1557,7 @@ TXN_RESULT_SPEC = build_txn_spec(
 TOWN_SVC_STATE_SPEC = build_msg_spec(
     PC_NETGAME_MSG_TOWN_SVC_STATE, TOWN_SVC_STATE_FMT, ["msg_type", "service", "len", "seq", "digest"], "TownSvcStateFields", exact=False)
 assert TOWN_SVC_STATE_SPEC.size == 12 and 12 + PC_NETGAME_TS_BLOB_MAX <= PC_NET_MAX_PAYLOAD
-assert PC_NETGAME_TS_BLOB_MAX >= max(PC_NETGAME_TS_POLICE_LEN, PC_NETGAME_TS_MUSEUM_LEN, 320)
+assert PC_NETGAME_TS_BLOB_MAX >= max(PC_NETGAME_TS_POLICE_LEN, PC_NETGAME_TS_MUSEUM_LEN, PC_NETGAME_TS_SHOP_LEN)
 assert struct.calcsize(TXN_TAG_FMT) == 64 and TXN_COMMIT_SPEC.size == 72 and TXN_RESULT_SPEC.size == 76
 assert max(TXN_COMMIT_SPEC.size, TXN_RESULT_SPEC.size) <= PC_NET_MAX_PAYLOAD
 assert struct.calcsize(TXN_COMMIT_FMT) == 8 + struct.calcsize(TXN_TAG_FMT)
@@ -2534,6 +2548,25 @@ class FakeClient(TransportClient):
             pre = (tuple(0 if i == slot else p for i, p in enumerate(pockets)), conds, wallet)
         sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_POLICE_CLAIM, rid, PC_NETGAME_TXN_DEST_POCKET, slot, item, pre=pre,
                                     aux_cond=police_idx, **kw)
+        return sent, self.wait_txn_result(sent.seq, timeout)
+
+    def txn_shop_buy(self, slot, item, stock_code, price, rid=0, timeout=3.0, pre=None, **kw):
+        """SHOP_BUY: TXN_COMMIT kind 10 (dest POCKET, slot = a FREE pocket slot, item, aux_cond = the stock code, aux_item = the price the client
+        expects). Default pre-image = the local image with `slot` forced EMPTY. Returns (TxnSent, TxnResultFields or None)."""
+        if pre is None:
+            pockets, conds, wallet = self.txn_pre_image()
+            pre = (tuple(0 if i == slot else p for i, p in enumerate(pockets)), conds, wallet)
+        sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_SHOP_BUY, rid, PC_NETGAME_TXN_DEST_POCKET, slot, item, pre=pre,
+                                    aux_cond=stock_code, aux_item=price, **kw)
+        return sent, self.wait_txn_result(sent.seq, timeout)
+
+    def txn_shop_sell(self, mask, slot, item, rid=0, timeout=3.0, pre=None, **kw):
+        """SHOP_SELL: TXN_COMMIT kind 11 (dest NONE, slot = the primary slot, item = its item, aux_item = the bit mask of every slot sold).
+        Default pre-image = the local image with `item` forced into every slot of the mask. Returns (TxnSent, TxnResultFields or None)."""
+        if pre is None:
+            pockets, conds, wallet = self.txn_pre_image()
+            pre = (tuple(item if (mask >> i) & 1 else p for i, p in enumerate(pockets)), conds, wallet)
+        sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_SHOP_SELL, rid, PC_NETGAME_TXN_DEST_NONE, slot, item, pre=pre, aux_item=mask, **kw)
         return sent, self.wait_txn_result(sent.seq, timeout)
 
     def on_message(self, m):

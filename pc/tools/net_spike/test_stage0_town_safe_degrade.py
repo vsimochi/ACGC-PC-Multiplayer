@@ -3,7 +3,7 @@
 
 A network CLIENT must not independently mutate host-owned shared town state that protocol v7 does not
 replicate: shop lineup/renewal, post office delivery, player mail, police box adders and claims, museum
-donations. Host and single-player fall through unchanged. Shop purchases/sells stay local (documented).
+donations. Host and single-player fall through unchanged. Shop purchases/sells are host transactions since the shop milestone.
 
   S0-1  shop: mSP_ExchangeLineUp_InGame, aSL_RenewShop, aSL_JudgeRenewShop, aSL_ExchangeShopGoodsInGame,
         mSP_InRenewal gated on the CLIENT role before their first mutation.
@@ -86,24 +86,35 @@ def main():
     inr = func_body(shop, r"\nextern int mSP_InRenewal\(\) \{")
     gated_first(inr, ["mEv_CheckEvent(mEv_SAVED_RENEWSHOP)"], results, "S0-1 InRenewal")
     check("S0-1 InRenewal: client gets FALSE", "return FALSE;" in inr[:inr.find("mEv_CheckEvent")], results)
-    # Batch G2/G3 added client refusals to ac_npc_shop_common.c (catalog order, house loan/rehouse, paint), so the old
-    # "file has no pc_net_game" check is stale. Current truth: purchases and sells stay UNGATED -- the sell/buy bodies and
-    # ac_shop_design.c carry no role gate -- and the only role-gated spots in ac_npc_shop_common.c are the G2/G3 refusal sites.
+    # Town services milestone 2 (shop) REPLACED the Stage 0 "purchases / sells stay local" statement: a CLIENT's purchase / sale is a host transaction
+    # (SHOP_BUY / SHOP_SELL, see test_shop_src.py for the full audit). What this Stage 0 file still pins: the vanilla local mutations remain for
+    # host / solo only, the sale report is display-only for a client, and the role gates in ac_npc_shop_common.c are exactly the 7 G2/G3
+    # refusal sites + the 8 shop-transaction sites (none inside the pure value computation / the ticket wrapper).
     nsc = read("src/actor/npc/ac_npc_shop_common.c")
-    check("S0-1: shop purchase/sell paths still ungated (ac_shop_design.c has no role gate)",
-          "pc_net_game" not in read("src/actor/ac_shop_design.c"), results)
+    sd = read("src/actor/ac_shop_design.c")
+    check("S0-1 (shop milestone): ac_shop_design.c reports a sale as display-only for a client (accounting = role != CLIENT; mSP_PlusSales only under 'if (accounting)')",
+          "pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in sd and "if (accounting) {\n            mSP_PlusSales(price);" in sd
+          and "if (!accounting) {\n        return FALSE;\n    }\n    return mSP_ShopSaleReport(" in sd, results)
+    sii = func_body(nsc, r"\nstatic void aNSC_sell_item_init\(NPC_SHOP_COMMON_ACTOR\* shop_common, GAME_PLAY\* play\) \{")
+    check("S0-1 (shop milestone): aNSC_sell_item_init debits the wallet ONLY for host / solo (a client's bells already left with the host post-image)",
+          bool(sii) and "if (!aNSC_PC_IS_CLIENT()) {\n        aNSC_get_sell_price(shop_common->value);" in sii, results)
     spans = []
-    for fname in ("aNSC_sell_item_init", "aNSC_sell_item_with_ticket_init", "aNSC_buy_check_init", "aNSC_buy_check"):
-        b = func_body(nsc, r"\nstatic void %s\(NPC_SHOP_COMMON_ACTOR\* shop_common, GAME_PLAY\* play\) \{" % fname)
-        check("S0-1: %s found and contains no pc_net_game / role gate (purchase/sell stays ungated)" % fname,
-              bool(b) and "pc_net_game" not in b and "aNSC_PC_IS_CLIENT" not in b, results)
-        if b:
-            spans.append((nsc.index(b), nsc.index(b) + len(b)))
+    for fname in ("aNSC_sell_item_with_ticket_init", "aNSC_buy_check_init"):
+        b2 = func_body(nsc, r"\nstatic void %s\(NPC_SHOP_COMMON_ACTOR\* shop_common, GAME_PLAY\* play\) \{" % fname)
+        check("S0-1: %s found and contains no pc_net_game / role gate (the ticket wrapper only forwards to aNSC_sell_item_init; the value computation is pure)" % fname,
+              bool(b2) and "pc_net_game" not in b2 and "aNSC_PC_IS_CLIENT" not in b2, results)
+        if b2:
+            spans.append((nsc.index(b2), nsc.index(b2) + len(b2)))
+    bc = func_body(nsc, r"\nstatic void aNSC_buy_check\(NPC_SHOP_COMMON_ACTOR\* shop_common, GAME_PLAY\* play\) \{")
+    check("S0-1 (shop milestone): aNSC_buy_check's vanilla local sale (mSP_PlusSales + slot exchange) is the host / solo path only: it sits after the client branch "
+          "(aNSC_pc_sell_prepare) and appears once",
+          bool(bc) and bc.count("mSP_PlusSales(shop_common->money / 2);") == 1 and "aNSC_pc_sell_prepare(shop_common, play)" in bc
+          and bc.index("aNSC_pc_sell_prepare(shop_common, play)") < bc.index("mSP_PlusSales(shop_common->money / 2);"), results)
     sites = [m.start() for m in re.finditer(r"aNSC_PC_IS_CLIENT\(\)", nsc)
              if not nsc[nsc.rfind("\n", 0, m.start()) + 1:m.start()].lstrip().startswith("#define")]
-    check("S0-1: ac_npc_shop_common.c role gates are exactly the 7 G2/G3 refusal sites (paint x3, rehouse, order x2, "
-          "paint-sell) and none lies inside a purchase/sell body (found %d)" % len(sites),
-          len(sites) == 7 and not [x for x in sites if any(a <= x < b for a, b in spans)], results)
+    check("S0-1: ac_npc_shop_common.c role gates are exactly the 7 G2/G3 refusal sites (paint x3, rehouse, order x2, paint-sell) + the 8 shop-transaction sites "
+          "(answer0 x2, sell_item_init, buy_check x2, receive_check x2, paper refusal) and none lies inside the ticket wrapper / the value computation (found %d)" % len(sites),
+          len(sites) == 15 and not [x for x in sites if any(a2 <= x < b3 for a2, b3 in spans)], results)
     sl = read("src/actor/ac_shop_level.c")
     check("S0-1: ac_shop_level.c includes pc_net_game.h under TARGET_PC",
           '#ifdef TARGET_PC\n#include "pc_net_game.h"' in sl, results)

@@ -92,7 +92,7 @@ def main():
     check(f"W every PC_NETGAME_TXN_* #define of the C source (reasons, dest, outcome, ring, fence) equals the net_spike_lib constant (mismatch {mism}, missing {missing}, {len(cm)} defines)",
           len(cm) >= 25 and not mism and not missing)
     names = {v: k.replace("PC_NETGAME_TXN_REASON_", "") for k, v in pyc.items() if k.startswith("PC_NETGAME_TXN_REASON_")}
-    check("W TXN_REASON_NAMES (python) lists exactly the 19 C reasons (15 + the 4 town-services reasons), same names/values", {k: v for k, v in L.TXN_REASON_NAMES.items()} == names and len(names) == 19)
+    check("W TXN_REASON_NAMES (python) lists exactly the 23 C reasons (15 + the 4 town-services reasons + the 4 shop reasons), same names/values", {k: v for k, v in L.TXN_REASON_NAMES.items()} == names and len(names) == 23)
     sends = re.findall(r"pc_net_send\(([^()]*(?:\([^()]*\)[^()]*)*)\)", blk)
     check("W every pc_net_send in the X1 block is RELIABLE and there is exactly one (the RESULT sender)", len(sends) == 1 and all("PC_NET_RELIABLE" in s for s in sends))
     check("W the X1 block never sends a TXN_COMMIT (client -> host only) and the host dispatcher has no TXN_RESULT handling",
@@ -101,8 +101,8 @@ def main():
     disp = func_body(c_raw, "pcnetgame_handle_host_data")
     check("W dispatch: exact size check + id, aligned memcpy into a local, then the handler (and only there)",
           re.search(r"size == sizeof\(PCNetGameTxnCommitMsg\) && data\[0\] == \(uint8_t\)PC_NETGAME_MSG_TXN_COMMIT\) \{\s*PCNetGameTxnCommitMsg tc;\s*memcpy\(&tc, data, sizeof\(tc\)\);[^\n]*\n\s*"
-                    r"if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_DONATE \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_POLICE_CLAIM\) \{\s*pcnetgame_handle_host_ts_txn\(peer, &tc\);[^\n]*\n\s*\} else \{\s*pcnetgame_handle_host_txn_commit\(peer, &tc\);",
-                    disp) is not None and c.count("pcnetgame_handle_host_txn_commit(") == 2 and c.count("pcnetgame_handle_host_ts_txn(") == 2)  # town services: kinds 8 / 9 route to their own one-phase handler
+                    r"if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_DONATE \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_POLICE_CLAIM \|\|\s*tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_BUY \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_SELL\) \{\s*pcnetgame_handle_host_ts_txn\(peer, &tc\);[^\n]*\n\s*\} else \{\s*pcnetgame_handle_host_txn_commit\(peer, &tc\);",
+                    disp) is not None and c.count("pcnetgame_handle_host_txn_commit(") == 2 and c.count("pcnetgame_handle_host_ts_txn(") == 2)  # town services: kinds 8 / 9 / 10 / 11 route to their own one-phase handler
     check("W version policy: v8 (header), NO bump (wire_baseline expects 8), the header documents the in-place extension, and the STRICT equality checks are intact",
           wire_baseline.header_protocol_ok(h) and wire_baseline.EXPECTED_PROTOCOL_VERSION == 8 and "VERSION POLICY (X1" in h and "EXTENDED IN PLACE" in h
           and "NO version" in h and "STRICT equality" in h and "if (version != PC_NETGAME_PROTOCOL_VERSION) {" in c
@@ -196,9 +196,9 @@ def main():
           and "exists == TRUE" in idxok and "idx >= 0 && idx < PLAYER_NUM" in idxok)
     wr_calls = len(re.findall(r"pcnetgame_rec_txn_write_inventory\(", c))
     check("S the writer has exactly THREE callers: the X1 commit handler (after the world write), since X3 the X3 grant core (after the world commit) and, since town services, the "
-          "MUSEUM_DONATE / POLICE_CLAIM handler (after the service commit); all pass the gate index",
-          wr_calls == 4 and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)") == 1
-          and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)") == 2)
+          "MUSEUM_DONATE / POLICE_CLAIM / SHOP_BUY / SHOP_SELL handler (after the service commit; it passes its computed post_wallet since the shop milestone); all pass the gate index",
+          wr_calls == 4 and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)") == 2
+          and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)") == 1)
     direct = re.findall(r"Save_Get\(private_data\)\[[^\]]*\]\s*(?:\.\w+(?:\[[^\]]*\])?)+\s*=[^=]", blk)
     check("S the X1 block has no direct private_data assignment, memcpy/memset into it, or mPr_ writer (the txn path never calls mPr_SetPossessionItem / "
           "mPr_SetFreePossessionItem / mPr_GivePossessionBells / mPr_SetItemCollectBit)",

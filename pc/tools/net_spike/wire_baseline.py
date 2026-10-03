@@ -104,7 +104,14 @@ X3_SIZE_ASSERTS = ('_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 76,
 TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM   2u", "#define PC_NETGAME_TS_SHOP     3u",
              "#define PC_NETGAME_TS_BLOB_MAX 340u", "#define PC_NETGAME_TS_POLICE_LEN 40u", "#define PC_NETGAME_TS_MUSEUM_LEN 63u",
              "#define PC_NETGAME_TXN_KIND_MUSEUM_DONATE 8u", "#define PC_NETGAME_TXN_KIND_POLICE_CLAIM  9u",
-             '_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352,', "offsetof(PCNetGameTownSvcStateMsg, blob) == 12")
+             '_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352,', "offsetof(PCNetGameTownSvcStateMsg, blob) == 12",
+             # town services milestone 2 (shop): the mirrored Shop_c length, the two transaction kinds, the stock codes, the sale ratio, the new reasons
+             "#define PC_NETGAME_TS_SHOP_LEN   320u", '_Static_assert(PC_NETGAME_TS_SHOP_LEN == sizeof(Shop_c),',
+             "#define PC_NETGAME_TXN_KIND_SHOP_BUY  10u", "#define PC_NETGAME_TXN_KIND_SHOP_SELL 11u",
+             "#define PC_NETGAME_SHOP_STOCK_COUNTED   0xFDu", "#define PC_NETGAME_SHOP_STOCK_RARE      0xFEu",
+             "#define PC_NETGAME_SHOP_STOCK_UNLIMITED 0xFFu", "#define PC_NETGAME_SHOP_SELL_RATIO      4u",
+             "#define PC_NETGAME_TXN_REASON_NO_FUNDS        19u", "#define PC_NETGAME_TXN_REASON_NOT_SELLABLE    20u",
+             "#define PC_NETGAME_TXN_REASON_PRICE_MISMATCH  21u", "#define PC_NETGAME_TXN_REASON_NO_ROOM         22u")
 V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_BEGIN", "48"),
                 ("PC_NETGAME_MSG_RECORD_CHUNK", "49"), ("PC_NETGAME_MSG_RECORD_ACK", "50"),
                 ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52"),
@@ -114,7 +121,7 @@ _V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT
 # net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
 V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
-                           r"|PC_NETGAME_MSG_TOWN_SVC_STATE|PC_NETGAME_TS_\w+|TOWN_SVC_STATE_FMT"
+                           r"|PC_NETGAME_MSG_TOWN_SVC_STATE|PC_NETGAME_TS_\w+|PC_NETGAME_SHOP_\w+|TOWN_SVC_STATE_FMT"
                            r"|PC_NETGAME_MSG_(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)|(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)_FMT) = ")
 
 
@@ -192,6 +199,10 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_NOT_AVAILABLE": '16',
     "PC_NETGAME_TXN_REASON_NOT_DONATABLE": '17',
     "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT": '18',
+    "PC_NETGAME_TXN_REASON_NO_FUNDS": '19',
+    "PC_NETGAME_TXN_REASON_NOT_SELLABLE": '20',
+    "PC_NETGAME_TXN_REASON_PRICE_MISMATCH": '21',
+    "PC_NETGAME_TXN_REASON_NO_ROOM": '22',
     "PC_NETGAME_TXN_RING": '16',
     "PC_NETGAME_TXN_FENCED_NUM": '4',
     "TXN_TAG_FMT": '"<IIBBHBBHII15HHII"',
@@ -209,6 +220,14 @@ V8_LIB_PINNED = {
     # town services milestone 1
     "PC_NETGAME_TXN_KIND_MUSEUM_DONATE": '8',
     "PC_NETGAME_TXN_KIND_POLICE_CLAIM": '9',
+    # town services milestone 2 (shop)
+    "PC_NETGAME_TXN_KIND_SHOP_BUY": '10',
+    "PC_NETGAME_TXN_KIND_SHOP_SELL": '11',
+    "PC_NETGAME_SHOP_STOCK_COUNTED": '0xFD',
+    "PC_NETGAME_SHOP_STOCK_RARE": '0xFE',
+    "PC_NETGAME_SHOP_STOCK_UNLIMITED": '0xFF',
+    "PC_NETGAME_SHOP_GOODS_COUNT": '39',
+    "PC_NETGAME_SHOP_SELL_RATIO": '4',
     "PC_NETGAME_MSG_TOWN_SVC_STATE": '55',
     "PC_NETGAME_TS_POLICE": '1',
     "PC_NETGAME_TS_MUSEUM": '2',
@@ -216,6 +235,7 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TS_BLOB_MAX": '340',
     "PC_NETGAME_TS_POLICE_LEN": '40',
     "PC_NETGAME_TS_MUSEUM_LEN": '63',
+    "PC_NETGAME_TS_SHOP_LEN": '320',
     "TOWN_SVC_STATE_FMT": '"<BBHII"',
     "FIELD_ACTION_REQUEST_FMT": '"<BBBBIBBHIIBBHBBHII15HHII"',
     "FIELD_ACTION_RESULT_FMT": '"<BBBBIHBB"',
@@ -406,6 +426,15 @@ def selftest(repo):
         "ts lib fmt": lambda c: c.update(lib=c["lib"].replace('TOWN_SVC_STATE_FMT = "<BBHII"', 'TOWN_SVC_STATE_FMT = "<BBHIII"', 1)),
         "ts lib kind": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_KIND_POLICE_CLAIM = 9", "PC_NETGAME_TXN_KIND_POLICE_CLAIM = 10", 1)),
         "ts lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_ALREADY_DONATED = 15", "PC_NETGAME_TXN_REASON_ALREADY_DONATED = 25", 1)),
+        "shop kind moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_KIND_SHOP_BUY  10u", "#define PC_NETGAME_TXN_KIND_SHOP_BUY  12u", 1)),
+        "shop blob len": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TS_SHOP_LEN   320u", "#define PC_NETGAME_TS_SHOP_LEN   321u", 1)),
+        "shop stock code": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_SHOP_STOCK_RARE      0xFEu", "#define PC_NETGAME_SHOP_STOCK_RARE      0xFCu", 1)),
+        "shop reason": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_REASON_NO_FUNDS        19u", "#define PC_NETGAME_TXN_REASON_NO_FUNDS        29u", 1)),
+        "shop sell ratio": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_SHOP_SELL_RATIO      4u", "#define PC_NETGAME_SHOP_SELL_RATIO      5u", 1)),
+        "shop lib kind": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_KIND_SHOP_SELL = 11", "PC_NETGAME_TXN_KIND_SHOP_SELL = 12", 1)),
+        "shop lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_NO_ROOM = 22", "PC_NETGAME_TXN_REASON_NO_ROOM = 23", 1)),
+        "shop lib stock": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD", "PC_NETGAME_SHOP_STOCK_COUNTED = 0xFC", 1)),
+        "shop lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_SHOP_EXTRA = 1\n"),
         "ts lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_TS_EXTRA = 4\n"),
         "extra enum id 53 dup": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 52,\n    PC_NETGAME_MSG_EXTRA = 53,", 1)),
         "txn enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_COMMIT            = 51,", "PC_NETGAME_MSG_TXN_COMMIT            = 61,", 1)),

@@ -431,7 +431,7 @@ def t_validation(run, a, b):
               ("tag _rsv0 != 0", KP, D_POCKET, sl, dict(tag_rsv0=1)), ("nonce 0", KP, D_POCKET, sl, dict(nonce=0)),
               ("seq 0", KP, D_POCKET, sl, dict(seq=0)), ("pickup POCKET slot 15", KP, D_POCKET, 15, {}),
               ("pickup dest NONE", KP, D_NONE, sl, {}), ("pickup WALLET with slot != 0xFF", KP, D_WALLET, 3, {}),
-              ("kind 0", 0, D_POCKET, sl, {}), ("kind 4 (reserved for X3)", 4, D_POCKET, sl, {}), ("kind 10 (kind 9 is POLICE_CLAIM since the town-services milestone)", 10, D_POCKET, sl, {}),
+              ("kind 0", 0, D_POCKET, sl, {}), ("kind 4 (reserved for X3)", 4, D_POCKET, sl, {}), ("kind 12 (kinds 8..11 are town-service kinds since the town-services / shop milestones)", 12, D_POCKET, sl, {}),
               ("drop with dest POCKET", KD, D_POCKET, sl, {})]
     # X1b: a structurally malformed COMMIT (BAD_SHAPE, or a wrong-size TXN_COMMIT) now also COUNTS toward the 3-violation close policy
     # of the record protocol. So the honest client `a` (which must keep its reservation) sends only TWO malformed messages in total, the

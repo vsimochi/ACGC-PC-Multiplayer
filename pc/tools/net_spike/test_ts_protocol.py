@@ -174,7 +174,9 @@ def m_mirror_at_ready(run, a, b):
     L.pump_sleep(2.5)
     ck("TS2 no spam: exactly ONE TOWN_SVC_STATE per service per client after 2.5 s idle (the digest poll sends only on a change)",
        ts_count(a, SVC_POLICE) == 1 and ts_count(a, SVC_MUSEUM) == 1 and ts_count(b, SVC_POLICE) == 1 and ts_count(b, SVC_MUSEUM) == 1)
-    ck("TS2 shop (3) and reserved services are never sent", not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM)])
+    ck("TS2 the shop (3) is mirrored since the shop milestone (exactly ONE push per client, 320 B, digest == FNV-1a32) and no reserved service (4+) is ever sent",
+       all(ts_count(c, L.PC_NETGAME_TS_SHOP) == 1 and c.ts_latest(L.PC_NETGAME_TS_SHOP)[0].len == L.PC_NETGAME_TS_SHOP_LEN for c in (a, b))
+       and not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM, L.PC_NETGAME_TS_SHOP)])
     return sa[SVC_POLICE], sa[SVC_MUSEUM]
 
 

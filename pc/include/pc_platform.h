@@ -343,6 +343,14 @@ extern int           g_pc_txn_test_dig_grant;
 extern const char*   g_pc_ts_test_seed_police;
 extern int           g_pc_ts_test_donate;
 extern int           g_pc_ts_test_claim;
+/* Town services milestone 2 (shop) TEST-ONLY hooks (default OFF, never active in normal play, every step logs "[NET][SHOP][TEST-ONLY]"):
+ *   --shop-test-buy   CLIENT only: once the record is SYNCED and the shop mirror arrived, raise the local wallet to 90000 (the hook's one local write), wait 5 s
+ *                     for the D3 upload, then buy the cheapest buyable item of the LOCAL mirror through pc_net_game_ts_begin_shop_buy() / _poll().
+ *   --shop-test-sell  CLIENT only: place a sellable fish into a free pocket slot (the hook's one local write), wait 5 s, then sell it through
+ *                     pc_net_game_ts_begin_shop_sell() / _poll().
+ * They bypass only the Nook dialogue and the menu, never the TXN_COMMIT / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_shop_test_hook(). */
+extern int           g_pc_shop_test_buy;
+extern int           g_pc_shop_test_sell;
 /* X1 (host-transactional PICKUP/DROP/BURY commit) host-side FAULT INJECTION, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. HOST role ONLY:
  * pc_main.c refuses (exit code 2, message on stderr) any other role, and the C hook re-checks the role. OFF by default (mode 0),
  * never active in normal play; when armed the process logs "[NET][TXN][TEST-ONLY] FAULT INJECTION ENABLED mode=..." at start and
