@@ -72,7 +72,8 @@ def main():
           d.get("PC_NETGAME_MSG_TXN_COMMIT") == 51 and d.get("PC_NETGAME_MSG_TXN_RESULT") == 52
           and d.get("PC_NETGAME_MSG_TXN_RESERVED_53") == 53 and d.get("PC_NETGAME_MSG_TXN_RESERVED_54") == 54 and d.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and d.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56
-          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 57)))
+          and d.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and d.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58  # guests G1
+          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 59)))
     enum_body = c_raw[c_raw.index("typedef enum PCNetGameMsgType {"):c_raw.index("} PCNetGameMsgType;")]
     check("W the enum comment documents that 53 and 54 are reserved for X2 (TXN_QUERY / TXN_STATUS)", "53 and 54 are reserved for X2" in enum_body and "TXN_QUERY" in enum_body)
     for t, size in (("PCNetGameTxnTag", 64), ("PCNetGameTxnCommitMsg", 72), ("PCNetGameTxnResultMsg", 76)):
@@ -221,8 +222,9 @@ def main():
           "pcnetgame_rec_txn_write_inventory()" in d3_raw[:d3_raw.index("D3-0 (b)")] and "outside this one" in d3_raw[:d3_raw.index("D3-0 (b)")])
 
     # ------------------------------------------------------------------ J: journal
-    check("J the journal is a bounded ring per RESIDENT: PC_NETGAME_TXN_RING 16 entries, 4 fenced nonces, array [PLAYER_NUM], eviction by head advance",
-          "#define PC_NETGAME_TXN_RING       16" in c_raw and "#define PC_NETGAME_TXN_FENCED_NUM 4" in c_raw and "static PCNetGameTxnResident s_txn_res[PLAYER_NUM];" in c_raw
+    check("J the journal is a bounded ring per record SLOT (residents + guests, guests G1): PC_NETGAME_TXN_RING 16 entries, 4 fenced nonces, array [PC_NETGAME_REC_SLOTS] (PLAYER_NUM + PC_NETGAME_GUEST_MAX), eviction by head advance",
+          "#define PC_NETGAME_TXN_RING       16" in c_raw and "#define PC_NETGAME_TXN_FENCED_NUM 4" in c_raw and "static PCNetGameTxnResident s_txn_res[PC_NETGAME_REC_SLOTS];" in c_raw
+          and "#define PC_NETGAME_REC_SLOTS (PLAYER_NUM + PC_NETGAME_GUEST_MAX)" in c_raw
           and "PCNetGameTxnLog ring[PC_NETGAME_TXN_RING];" in blk and "R->head = (uint8_t)(((int)R->head + 1) % PC_NETGAME_TXN_RING);" in blk
           and "_Static_assert(sizeof(PCNetGameTxnLog) == 28" in blk and L.PC_NETGAME_TXN_RING == 16 and L.PC_NETGAME_TXN_FENCED_NUM == 4)
     check("J a new nonce fences the old one (FIFO memmove), wipes the ring and max_seq; replays compare the hash over the whole 72-byte message",
@@ -232,8 +234,9 @@ def main():
     check("J the journal is NOT cleared per peer: pcnetgame_reset_all_host_peer_state mentions neither s_txn_res nor the journal clear",
           "s_txn_res" not in reset and "pcnetgame_txn_journal_clear" not in reset)
     calls = {n: ("pcnetgame_txn_journal_clear(" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_rec_on_town_changed", "pcnetgame_rec_on_world_reset", "pcnetgame_rec_slot")}
-    check(f"J cleared by exactly the three spec'd events: town change, world reset, slot re-init ({calls}); no other caller",
-          all(calls.values()) and c.count("pcnetgame_txn_journal_clear(") == 5)  # declaration + definition + 3 calls
+    gcalls = {n: ("pcnetgame_txn_journal_clear(PLAYER_NUM + g)" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create")}
+    check(f"J cleared by exactly the three spec'd events: town change, world reset, slot re-init ({calls}) + the three guest-table lifecycle events (guests G1: a guest entry is installed / created / rolled back: {gcalls}); no other caller",
+          all(calls.values()) and all(gcalls.values()) and c.count("pcnetgame_txn_journal_clear(") == 8)  # declaration + definition + 3 calls + 3 guest-table calls
     check("J the journal is memory-only: nothing of it reaches the records file / GCI (no s_txn_res near pc_mp_records / store build)",
           "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_build")) and "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_write")))
     lib = open(os.path.join(HERE, "net_spike_lib.py"), encoding="utf-8").read()

@@ -163,6 +163,7 @@
 #include "m_post_office.h" /* mail milestone 1: mPO_receipt_proc / mPO_count_mail / mPO_get_keep_mail_sum / mPO_delivery_one_address */
 #include "pc_save_bswap.h" /* D3: pc_save_bswap_private() for the canonical-BE record image */
 #include "pc_mp_records.h" /* D3-4: save/mp/records.dat sidecar (pure storage module) */
+#include "pc_mp_guests.h"  /* guests: save/mp/guests.dat host table + save/mp/guest_token.dat client token file (pure storage module) */
 #include "m_personal_id.h"
 #include "m_player_lib.h" /* Stage 3: GET_PLAYER_ACTOR_NOW(), PLAYER_ACTOR, mPlayer_INDEX_*, and
                             * (transitively, via m_actor.h -> game.h) gamePT/GAME/
@@ -466,6 +467,14 @@ typedef enum PCNetGameMsgType {
                                              * increasing seq and the FNV-1a32 of the 298 bytes. Sent to a peer as soon as it is READY and whenever the host's
                                              * copy of that slot changes. The client keeps it as a SHADOW in its LOCAL Save_t homes[].mailbox (never persisted).
                                              * See PCNetGameMailboxLetterMsg. */
+    PC_NETGAME_MSG_IDENTITY_EXT          = 57, /* Guests (G1, v8, unreleased: extended in place, no bump): client -> host ONLY, RELIABLE, 42 bytes. Sent
+                                             * BEFORE the (frozen, 32-byte) IDENTITY by a client that plays a guest / extra player (a foreigner): the
+                                             * guest flag, the guest's HOME PersonalID (name, land name, player id, land id) and the host-issued token it
+                                             * holds for this host (token_present). Cached per peer until IDENTITY; a client without it behaves exactly
+                                             * as before. See PCNetGameIdentityExtMsg. */
+    PC_NETGAME_MSG_IDENTITY_TOKEN        = 58, /* Guests (G1): host -> the one admitted GUEST client ONLY, RELIABLE, 20 bytes, sent right after the (frozen,
+                                             * 32-byte) IDENTITY_ACK: the 16-byte guest token (trust on first use: minted at first contact) and the guest
+                                             * table slot. See PCNetGameIdentityTokenMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -525,6 +534,58 @@ typedef struct PCNetGameIdentityAckMsg {
 _Static_assert(sizeof(PCNetGameIdentityAckMsg) == 32, "PCNetGameIdentityAckMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameIdentityAckMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameIdentityAckMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* ===== GUESTS WIRE (G1, protocol v8 extended in place -- v8 is unreleased): messages 57 / 58, both RELIABLE =====
+ * The frozen 32-byte IDENTITY / IDENTITY_ACK cannot carry a guest's HOME PersonalID or a token, so two NEW messages do:
+ *   57 IDENTITY_EXT   client -> host, 42 bytes, sent BEFORE IDENTITY (reliable delivery is ordered, so the host holds it when the
+ *                     IDENTITY arrives). flags bit0 = GUEST claim (the client plays a foreigner / extra player); every other flag
+ *                     bit and _reserved0 / _reserved1 must be 0. home_* = the guest's HOME PersonalID (the key); token_present 0/1
+ *                     and token[16] (all zero when not present) = the token this host issued to that key earlier.
+ *   58 IDENTITY_TOKEN host -> client, 20 bytes, sent right after IDENTITY_ACK to an admitted GUEST: flags bit0 NEW (the token was
+ *                     minted now: first contact), bit1 KNOWN (the key was already known and the presented token matched);
+ *                     guest_slot = the guest table slot 0..7, table_size = 8; token[16].
+ * The HOST alone decides the identity class (RESIDENT / GUEST / refused); IDENTITY_EXT is only ever a CLAIM and is ignored for
+ * everything but the guest-admission decision. The guest token is trust-on-first-use: PersonalID is public, so the token is the only
+ * anti-impersonation secret. A host that does not know message 57 drops it, an old client never sends it. */
+#define PC_NETGAME_IDEXT_FLAG_GUEST      0x01u
+#define PC_NETGAME_IDTOKEN_FLAG_NEW      0x01u
+#define PC_NETGAME_IDTOKEN_FLAG_KNOWN    0x02u
+#define PC_NETGAME_GUEST_TOKEN_LEN       16u
+#define PC_NETGAME_GUEST_MAX             8
+typedef struct PCNetGameIdentityExtMsg {
+    uint8_t  msg_type;       /* PC_NETGAME_MSG_IDENTITY_EXT */
+    uint8_t  flags;          /* PC_NETGAME_IDEXT_FLAG_* */
+    uint16_t _reserved0;     /* 0 */
+    uint8_t  home_player_name[PC_NETGAME_NAME_LEN];
+    uint8_t  home_land_name[PC_NETGAME_LAND_LEN];
+    uint16_t home_player_id;
+    uint16_t home_land_id;
+    uint8_t  token_present;  /* 0 / 1 */
+    uint8_t  token[PC_NETGAME_GUEST_TOKEN_LEN];
+    uint8_t  _reserved1;     /* 0 */
+} PCNetGameIdentityExtMsg;
+_Static_assert(sizeof(PCNetGameIdentityExtMsg) == 42, "PCNetGameIdentityExtMsg wire size drifted");
+_Static_assert(offsetof(PCNetGameIdentityExtMsg, home_player_name) == 4 && offsetof(PCNetGameIdentityExtMsg, home_land_name) == 12 &&
+                   offsetof(PCNetGameIdentityExtMsg, home_player_id) == 20 && offsetof(PCNetGameIdentityExtMsg, home_land_id) == 22 &&
+                   offsetof(PCNetGameIdentityExtMsg, token_present) == 24 && offsetof(PCNetGameIdentityExtMsg, token) == 25 &&
+                   offsetof(PCNetGameIdentityExtMsg, _reserved1) == 41,
+               "PCNetGameIdentityExtMsg field offsets drifted");
+_Static_assert(sizeof(PCNetGameIdentityExtMsg) <= 64 && sizeof(PCNetGameIdentityExtMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameIdentityExtMsg exceeds 64 bytes / PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+typedef struct PCNetGameIdentityTokenMsg {
+    uint8_t msg_type;      /* PC_NETGAME_MSG_IDENTITY_TOKEN */
+    uint8_t flags;         /* PC_NETGAME_IDTOKEN_FLAG_* */
+    uint8_t guest_slot;    /* 0..PC_NETGAME_GUEST_MAX-1 */
+    uint8_t table_size;    /* PC_NETGAME_GUEST_MAX */
+    uint8_t token[PC_NETGAME_GUEST_TOKEN_LEN];
+} PCNetGameIdentityTokenMsg;
+_Static_assert(sizeof(PCNetGameIdentityTokenMsg) == 20, "PCNetGameIdentityTokenMsg wire size drifted");
+_Static_assert(offsetof(PCNetGameIdentityTokenMsg, token) == 4, "PCNetGameIdentityTokenMsg field offsets drifted");
+_Static_assert(sizeof(PCNetGameIdentityTokenMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameIdentityTokenMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+_Static_assert(PC_NETGAME_GUEST_MAX == PC_MP_GUEST_SLOTS && PC_NETGAME_GUEST_TOKEN_LEN == PC_MP_GUEST_TOKEN_SIZE,
+               "the guest table size / token length no longer match the pc_mp_guests.h storage format");
 
 /* Version-stable 8-byte form, used for PROTOCOL_MISMATCH so that a client of ANY version (whose
  * dispatch expects exactly this layout) can report why it was refused. */
@@ -1927,14 +1988,20 @@ _Static_assert(sizeof(PCNetGamePlayerActionMsg) <= PC_NET_MAX_PAYLOAD,
  * 51 TXN_COMMIT / 52 TXN_RESULT, see the X1 WIRE block below; 53/54 stay reserved for X2) and both
  * ends drop unknown ids, (b) BEGIN.kind 5..255 and ACK.status 11..255 are reserved (a host answers an unknown kind
  * with BAD_SHAPE + a violation; a HOST counts any client RECORD_ACK status other than 0/9/10 as a violation, while a
- * CLIENT ignores an unknown host status), (c) BEGIN.rsv is the record_class seam (0 = resident; a non-zero value from a
- * client is refused with BAD_SHAPE detail 5, not a violation) and HELLO._reserved0 / undefined flag bits must be zero
+ * CLIENT ignores an unknown host status), (c) BEGIN.rsv is the record_class (0 = resident, 1 = guest since the guests milestone;
+ * a value that differs from the class the HOST derived for the connection is refused with BAD_SHAPE detail 5, not a violation)
+ * and HELLO._reserved0 / undefined flag bits must be zero
  * (refused with BAD_SHAPE detail 6, not a violation), and
  * (d) RECORD_ACK.detail / xfer_id can carry a request id. Nothing unsafe is reserved: unused values are refused. */
 #define PC_NETGAME_REC_SIZE         0x2440u
 #define PC_NETGAME_REC_CHUNK_DATA   1000u
 #define PC_NETGAME_REC_CHUNK_COUNT  10u
 #define PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST 0x01u
+/* Guests (G1): RECORD_BEGIN.rsv IS the record_class (both directions): 0 = resident (host save record), 1 = guest (the guest table
+ * record, outside Save_t). The host answers a BEGIN whose class differs from the CONNECTION's host-derived class with BAD_SHAPE detail 5
+ * (not a violation), and stamps its own pushes to a guest with class 1. Any other value is refused the same way. */
+#define PC_NETGAME_REC_CLASS_RESIDENT 0u
+#define PC_NETGAME_REC_CLASS_GUEST    1u
 
 #define PC_NETGAME_REC_KIND_PUSH_FULL        1u /* H -> C: whole record */
 #define PC_NETGAME_REC_KIND_PUSH_HOSTFIELDS  2u /* H -> C: whole record, receiver applies only the host-owned ranges */
@@ -1971,7 +2038,7 @@ _Static_assert(sizeof(PCNetGameRecordHelloMsg) <= PC_NET_MAX_PAYLOAD,
 
 /* RECORD_BEGIN (48), 28 bytes, both directions. kind: PC_NETGAME_REC_KIND_*. xfer_id is strictly increasing per sender and
  * connection (first = 1). epoch/rev: for a push the RESULTING lineage point, for an upload the BASE the client built on.
- * host_session: host process id on a push, 0 from a client. rsv = record_class seam (0 = resident). */
+ * host_session: host process id on a push, 0 from a client. rsv = record_class (0 = resident, 1 = guest). */
 typedef struct PCNetGameRecordBeginMsg {
     uint8_t  msg_type;
     uint8_t  kind;
@@ -2004,7 +2071,7 @@ _Static_assert(sizeof(PCNetGameRecordChunkMsg) == 1012, "PCNetGameRecordChunkMsg
 _Static_assert(sizeof(PCNetGameRecordChunkMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameRecordChunkMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
-/* BAD_SHAPE detail codes: 1 total_size, 2 chunk_count, 3 host-only/unknown BEGIN kind, 4 HELLO record_size, 5 BEGIN.rsv != 0,
+/* BAD_SHAPE detail codes: 1 total_size, 2 chunk_count, 3 host-only/unknown BEGIN kind, 4 HELLO record_size, 5 BEGIN.rsv != the connection's record class,
  * 6 HELLO reserved bits / undefined flags. */
 /* RECORD_ACK (50), 20 bytes, both directions. status: PC_NETGAME_REC_ACK_*. xfer_id echoes the transfer (0 for HELLO answers).
  * epoch/rev/host_session: the host's CURRENT lineage point for its answers (the resulting one for APPLIED). */
@@ -3258,11 +3325,18 @@ typedef struct PCNetGameHostPeerState {
     uint32_t             rec_win_count;
     uint32_t             rec_rl_run;       /* consecutive RATE_LIMITED answers (5 close the peer) */
     uint32_t             rec_last_stale_push_ms;
+    uint8_t              guest_token_verified; /* M3: this guest connection presented the entry's matching token at admission (set after the per-peer reset) */
     uint8_t              exch_credit_valid;/* X3: a full-pockets catch (dest NONE) was accepted for this peer: its host-derived item is the ONE */
     uint16_t             exch_credit_item; /*     replacement a following TXN_COMMIT(DROP, EXCHANGE) of this connection may write (consumed on APPLIED) */
     uint32_t             ts_sent_seq[PC_NETGAME_TS_NUM]; /* town services: the last TOWN_SVC_STATE seq pushed to this peer, per service (0 = none yet) */
     uint32_t             mbox_sent_seq[PC_NETGAME_MBOX_SLOTS]; /* mail milestone 2: the last MAILBOX_LETTER seq pushed to this peer, per mailbox slot (0 = none yet) */
     int                  mbox_res_plus1;                       /* ... and the resident (idx + 1) those seqs refer to (0 = none); a different binding resets them */
+    /* Guests (G1): class of the binding (0 RESIDENT / 1 GUEST); a guest has bound_resident_idx -1 and bound_guest_slot 0..7 (bound_pid = the
+     * guest key). Record gates use pcnetgame_peer_rec_slot(). ext = the cached IDENTITY_EXT claim (cleared by the per-peer memset). */
+    uint8_t              bound_class;
+    int                  bound_guest_slot;
+    uint8_t              ext_valid;
+    PCNetGameIdentityExtMsg ext;
 } PCNetGameHostPeerState;
 static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];
 
@@ -3289,17 +3363,65 @@ typedef struct PCNetGameRecSlot {
     uint32_t     rev;
     uint32_t     hf_digest;       /* digest of the host-owned ranges at the last accepted state */
 } PCNetGameRecSlot;
-static PCNetGameRecSlot s_rec_slot[PLAYER_NUM];
-static uint8_t  s_rec_backup[PLAYER_NUM][PC_NETGAME_REC_SIZE]; /* BE image of the host record a MIGRATE import replaced */
+/* Guests (G1): ONE slot index space for every record / transaction site: 0..PLAYER_NUM-1 = the host save's residents
+ * (Save_Get(private_data)[slot]), PLAYER_NUM..PC_NETGAME_REC_SLOTS-1 = the guest table entries (s_guest_rec[slot - PLAYER_NUM], OUTSIDE
+ * Save_t). pcnetgame_rec_priv_ptr() is the ONE accessor that turns a slot into a record pointer; the slot itself comes only from
+ * pcnetgame_peer_rec_slot() / pcnetgame_rec_gate() (the host-derived binding), never from a message. */
+#define PC_NETGAME_REC_SLOTS (PLAYER_NUM + PC_NETGAME_GUEST_MAX)
+static PCNetGameRecSlot s_rec_slot[PC_NETGAME_REC_SLOTS];
+static uint8_t  s_rec_backup[PC_NETGAME_REC_SLOTS][PC_NETGAME_REC_SIZE]; /* BE image of the host record a MIGRATE import replaced */
+
+/* The host's GUEST TABLE (bounded, PC_NETGAME_GUEST_MAX entries; persisted in save/mp/guests.dat). An entry is created at a guest's first
+ * contact (token minted) and removed only by the M3 eviction (the OLDEST unconfirmed, data-less, idle entry when the table is full; a full table
+ * with no such entry refuses the next new guest). `key` = the guest's HOME
+ * PersonalID (public), `token` = the host-issued 16-byte secret. The guest's PERSONAL RECORD lives in s_guest_rec[] (a Private_c,
+ * never part of Save_t, never written to a GCI). */
+typedef struct PCNetGameGuest {
+    uint8_t      used;
+    PersonalID_c key;
+    uint8_t      token[PC_NETGAME_GUEST_TOKEN_LEN];
+    /* M1: the entry belongs to ONE host town: (town, key) is the table key. An entry whose town is not the host's CURRENT town is kept (the host
+     * may be switched back) but INACTIVE: pcnetgame_guest_find() never matches it, so it can neither be admitted nor leak into this town. */
+    PCNetGameTownIdentity town;
+    /* M3: UNCONFIRMED until the first authenticated record step (HELLO / BEGIN) of a connection that PRESENTED the matching token, i.e. the
+     * client demonstrably stored it. An unconfirmed entry that holds no accepted data (rev 0) and has no live peer may be re-minted for the same
+     * key or evicted (oldest first) when the table is full; a confirmed entry never is. `age` = mint order (persisted, larger = newer). */
+    uint8_t      confirmed;
+    uint32_t     age;
+} PCNetGameGuest;
+static PCNetGameGuest s_guest[PC_NETGAME_GUEST_MAX];
+static Private_c      s_guest_rec[PC_NETGAME_GUEST_MAX];
+static PCMpGuestFile     s_guest_file;            /* in-memory mirror of the last loaded / successfully written guests.dat */
+static int               s_guest_store_loaded = 0;
+static int               s_guest_untrusted = 0;   /* guests.dat existed but no generation is readable: NO guest is admitted (tokens are unknown) */
+static PCMpGuestLoadMode s_guest_store_mode = PC_MP_GST_LOAD_MISSING;
+static int               s_guest_store_last_failed = 0; /* the last guests.dat write failed: a guest's FIRST migration is refused (BUSY) until a write succeeds */
+static uint32_t          s_guest_store_fail_count = 0;
+
+/* THE accessor: the record of slot `slot` (resident or guest), or NULL for an out-of-range slot / an unused guest entry. */
+static Private_c* pcnetgame_rec_priv_ptr(int slot) {
+    if (slot >= 0 && slot < PLAYER_NUM) {
+        return &Save_Get(private_data)[slot];
+    }
+    if (slot >= PLAYER_NUM && slot < PC_NETGAME_REC_SLOTS && s_guest[slot - PLAYER_NUM].used) {
+        return &s_guest_rec[slot - PLAYER_NUM];
+    }
+    return NULL;
+}
 static uint32_t s_rec_host_session = 0;       /* random per host process (0 = not yet rolled) */
 static int      s_rec_early_save_request = 0; /* Q5: a peer with unsaved accepted uploads went away (consumer = pc_vi.c, D3-4) */
 
 /* Called from pcnetgame_reset_all_host_peer_state() BEFORE the per-peer memset: a bound peer's record has unsaved
  * accepted uploads -> ask for an early host save (coalesced flag; the consumer arrives with D3-4). */
 static void pcnetgame_rec_note_peer_gone(const PCNetGameHostPeerState* st) {
-    if (st->bound_valid && st->bound_resident_idx >= 0 && st->bound_resident_idx < PLAYER_NUM &&
-        s_rec_slot[st->bound_resident_idx].init && s_rec_slot[st->bound_resident_idx].dirty_unsaved) {
-        s_rec_early_save_request = 1;
+    int slot = -1;
+    if (st->bound_valid) {
+        slot = st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST
+                   ? (st->bound_guest_slot >= 0 && st->bound_guest_slot < PC_NETGAME_GUEST_MAX ? PLAYER_NUM + st->bound_guest_slot : -1)
+                   : st->bound_resident_idx;
+    }
+    if (slot >= 0 && slot < PC_NETGAME_REC_SLOTS && s_rec_slot[slot].init && s_rec_slot[slot].dirty_unsaved) {
+        s_rec_early_save_request = 1; /* a guest's accepted change also asks for the early host save: its guests.dat write rides the same hook */
     }
 }
 
@@ -3311,7 +3433,7 @@ void pc_net_game_record_note_saved(void) {
     int i;
     s_rec_early_save_request = 0;
     for (i = 0; i < PLAYER_NUM; i++) {
-        s_rec_slot[i].dirty_unsaved = 0;
+        s_rec_slot[i].dirty_unsaved = 0; /* residents only: a guest's marker is cleared by its own durable guests.dat write */
     }
 }
 
@@ -3358,6 +3480,8 @@ static int             s_out_overflow = 0;
 /* ---- v2 client state (all cleared by pcnetgame_reset_client_session_state()) ---- */
 
 static int                   s_client_identity_sent = 0;
+static int                   s_client_token_received = 0;  /* M2: an IDENTITY_TOKEN was already accepted on this connection (at most ONE) */
+static int                   s_client_guest_claim_sent = 0; /* guests (G1): IDENTITY_EXT went out on this connection (record_class GUEST) */
 static int                   s_client_identity_defer_logged = 0;
 static PCNetGameTownIdentity s_client_claimed_town;     /* what our IDENTITY claimed */
 static uint16_t              s_client_assigned_peer_id = 0;
@@ -5209,6 +5333,7 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
          * disconnect was somehow never observed) and on every host-initiated reject/drop. */
         memset(&s_host_peer[peer], 0, sizeof(s_host_peer[peer]));
         s_host_peer[peer].bound_resident_idx = -1; /* M9 identity Stage 1A: no resident binding */
+        s_host_peer[peer].bound_guest_slot = -1;   /* guests (G1): no guest binding */
         /* World Ecology Stage 1: this peer's field-action dedup record -- a dead/reused peer's last
          * decision must never be replayed against a NEW connection's request_id space (request ids
          * are not shared across peers, so this cheaply avoids any chance of stale cross-peer replay). */
@@ -11113,11 +11238,40 @@ static int pcnetgame_host_peer_bound_to_resident(int idx, PCNetPeerId except_pee
     int j;
     for (j = 0; j < PC_NET_MAX_PEERS; j++) {
         if (j != (int)except_peer && s_host_peer_link[j] == PC_NETGAME_LINK_READY && s_host_peer[j].bound_valid &&
-            s_host_peer[j].bound_resident_idx == idx) {
+            s_host_peer[j].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT && s_host_peer[j].bound_resident_idx == idx) {
             return j;
         }
     }
     return -1;
+}
+
+/* Guests (G1): the READY peer bound to guest-table slot `gslot` other than `except_peer` (-1 if none). */
+static int pcnetgame_host_peer_bound_to_guest(int gslot, PCNetPeerId except_peer) {
+    int j;
+    for (j = 0; j < PC_NET_MAX_PEERS; j++) {
+        if (j != (int)except_peer && s_host_peer_link[j] == PC_NETGAME_LINK_READY && s_host_peer[j].bound_valid &&
+            s_host_peer[j].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && s_host_peer[j].bound_guest_slot == gslot) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+/* THE binding -> record slot helper: -1 = not bound (or a binding that is out of range), 0..PLAYER_NUM-1 = the resident slot, PLAYER_NUM..
+ * PC_NETGAME_REC_SLOTS-1 = PLAYER_NUM + the guest table slot. Derived ONLY from the host-side binding (never from a message). */
+static int pcnetgame_peer_rec_slot(PCNetPeerId peer) {
+    const PCNetGameHostPeerState* st;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+        return -1;
+    }
+    st = &s_host_peer[peer];
+    if (!st->bound_valid) {
+        return -1;
+    }
+    if (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+        return (st->bound_guest_slot >= 0 && st->bound_guest_slot < PC_NETGAME_GUEST_MAX) ? PLAYER_NUM + st->bound_guest_slot : -1;
+    }
+    return (st->bound_resident_idx >= 0 && st->bound_resident_idx < PLAYER_NUM) ? st->bound_resident_idx : -1;
 }
 
 /* The PersonalID the peer was VALIDATED with at bind time (cached st->bound_pid, copied from the host save in the
@@ -11125,13 +11279,9 @@ static int pcnetgame_host_peer_bound_to_resident(int idx, PCNetPeerId except_pee
  * the host is mid-load that array can hold another save or zeros (peers stay READY until re-validation closes
  * them). 0 if the peer is not bound (never for a READY peer) -- callers must then ignore the request. */
 static int pcnetgame_host_bound_personal_id(PCNetPeerId peer, PersonalID_c* out) {
-    int idx;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || !s_host_peer[peer].bound_valid) {
-        return 0;
-    }
-    idx = s_host_peer[peer].bound_resident_idx;
-    if (idx < 0 || idx >= PLAYER_NUM) {
-        return 0;
+    int slot = pcnetgame_peer_rec_slot(peer);
+    if (slot < 0) {
+        return 0; /* guests (G1): bound_pid of a GUEST is the guest KEY (its host-checked home PersonalID); friendship / villager memory / MAIL_REQUEST senders are keyed by it */
     }
     mPr_CopyPersonalID(out, &s_host_peer[peer].bound_pid);
     return 1;
@@ -11168,6 +11318,26 @@ static void pcnetgame_host_refuse_identity(PCNetPeerId peer, const char* why, in
  * !ready -> ready transition of pcnetgame_host_world_tick(). Closes (existing refuse/reject-and-close path) every
  * READY peer whose bound resident is now the host's OWN resident, or whose saved record no longer matches the
  * PersonalID cached at bind time or no longer exists. Nothing differs -> no effect. */
+/* Guests (G1): does a candidate guest KEY (a full PersonalID, compared byte-wise: PersonalID_c has no padding) collide with an identity of
+ * THIS host save? Any private_data[] PersonalID (even a resident whose `exists` is FALSE, i.e. away) or any homes[].ownerID that is
+ * non-null counts: such a key is a resident / house owner of this town and can NEVER be a guest. Returns a reason string or NULL. */
+static const char* pcnetgame_guest_key_conflict(const PersonalID_c* key) {
+    int i;
+    for (i = 0; i < PLAYER_NUM; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        if (mPr_NullCheckPersonalID(p) == FALSE && memcmp(p, key, sizeof(*key)) == 0) {
+            return "the guest key equals a resident PersonalID of this town";
+        }
+    }
+    for (i = 0; i < mHS_HOUSE_NUM; i++) {
+        PersonalID_c* p = &Save_Get(homes[i]).ownerID;
+        if (mPr_NullCheckPersonalID(p) == FALSE && memcmp(p, key, sizeof(*key)) == 0) {
+            return "the guest key equals a house owner of this town";
+        }
+    }
+    return NULL;
+}
+
 static void pcnetgame_host_revalidate_bound_peers(void) {
     int i;
     int own_idx = pcnetgame_host_own_resident_idx();
@@ -11177,7 +11347,22 @@ static void pcnetgame_host_revalidate_bound_peers(void) {
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || !st->bound_valid) {
             continue;
         }
-        if (own_idx >= 0 && st->bound_resident_idx == own_idx) {
+        if (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+            /* Guests (G1): the host's save may have changed while paused: the entry must still exist for this key and the key must not
+             * (now) be an identity of the host's town. */
+            const int g = st->bound_guest_slot;
+            if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used || memcmp(&s_guest[g].key, &st->bound_pid, sizeof(st->bound_pid)) != 0) {
+                why = "bound guest table entry is gone or changed";
+            } else if (!pcnetgame_town_equal(&s_guest[g].town, &s_host_town) ||
+                       (st->bound_pid.land_id == s_host_town.land_id &&
+                        memcmp(st->bound_pid.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN) == 0)) {
+                /* L4: the host's town may have changed while paused: the entry must still be THIS town's, and the admission rule "a guest's home
+                 * land is not this town's land" is re-applied against the town as it is now (the key conflict check below covers residents) */
+                why = "bound guest entry belongs to another town now, or its home land is this town's land";
+            } else {
+                why = pcnetgame_guest_key_conflict(&st->bound_pid);
+            }
+        } else if (own_idx >= 0 && st->bound_resident_idx == own_idx) {
             why = "bound resident became the host's own resident";
         } else if (st->bound_resident_idx < 0 || st->bound_resident_idx >= PLAYER_NUM ||
                    Save_Get(private_data)[st->bound_resident_idx].exists != TRUE ||
@@ -11435,11 +11620,18 @@ static int pcnetgame_txn_log_ok(PCNetPeerId peer) {
 static void pcnetgame_txn_journal_clear(int idx); /* X1: defined in the X1 block below (idx -1 = every resident) */
 static void pcnetgame_rec_store_resolve(void); /* D3-4: defined below with the persistence glue */
 static void pcnetgame_rec_resolve_slot(int i);  /* D3-4 */
+static void pcnetgame_guest_store_load(void);   /* guests (G1): defined with the GUESTS HOST block below */
+static int  pcnetgame_guest_store_write(const char* why);
+static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer); /* M3: defined with the GUESTS HOST block */
 
 /* Slot lookup/(re)initialisation. Only called with an index that came from a validated binding. */
 static PCNetGameRecSlot* pcnetgame_rec_slot(int idx) {
     PCNetGameRecSlot* s;
     Private_c* rec;
+    if (idx >= PLAYER_NUM && idx < PC_NETGAME_REC_SLOTS) {
+        /* Guests (G1): the lineage of a guest slot is created at admission / loaded from guests.dat (never re-resolved from records.dat) */
+        return (s_guest[idx - PLAYER_NUM].used && s_rec_slot[idx].init) ? &s_rec_slot[idx] : NULL;
+    }
     if (idx < 0 || idx >= PLAYER_NUM) {
         return NULL;
     }
@@ -11469,8 +11661,8 @@ static PCNetGameRecSlot* pcnetgame_rec_slot(int idx) {
  * re-roll every epoch, so a connected client's next upload is STALE_BASE and it re-syncs from a push). */
 static int s_rec_resolved = 0; /* D3-4: slot lineage has been derived from records.dat for the CURRENT town */
 static void pcnetgame_rec_on_town_changed(void) {
-    memset(s_rec_slot, 0, sizeof(s_rec_slot));
-    memset(s_rec_backup, 0, sizeof(s_rec_backup));
+    memset(s_rec_slot, 0, PLAYER_NUM * sizeof(s_rec_slot[0])); /* residents only: a guest's record / lineage belongs to the host machine, not to a town */
+    memset(s_rec_backup, 0, PLAYER_NUM * sizeof(s_rec_backup[0]));
     pcnetgame_txn_journal_clear(-1); /* X1: another town => no journal of the previous one */
     s_rec_resolved = 0; /* re-resolve against the in-memory copy of records.dat: other town => PersonalIDs differ => rev 0 */
 }
@@ -11486,7 +11678,7 @@ static void pcnetgame_rec_on_world_reset(void) {
 
 static void pcnetgame_rec_on_save_back(void) {
     int i;
-    for (i = 0; i < PLAYER_NUM; i++) {
+    for (i = 0; i < PC_NETGAME_REC_SLOTS; i++) { /* guests too: their lineage cannot be proven across a save pause either */
         if (s_rec_slot[i].init) {
             s_rec_slot[i].epoch = pcnetgame_rec_rand32();
             s_rec_slot[i].hf_pending = 0;
@@ -11511,7 +11703,12 @@ static uint32_t pcnetgame_rec_hostfield_digest(const Private_c* r) {
 static Private_c s_rec_scratch_a;
 static Private_c s_rec_scratch_b;
 static void pcnetgame_rec_export_be(int idx, uint8_t* out) {
-    memcpy(&s_rec_scratch_a, &Save_Get(private_data)[idx], sizeof(Private_c));
+    const Private_c* src = pcnetgame_rec_priv_ptr(idx);
+    if (src == NULL) {
+        memset(out, 0, PC_NETGAME_REC_SIZE); /* cannot happen after the binding gate; never read a record that does not exist */
+        return;
+    }
+    memcpy(&s_rec_scratch_a, src, sizeof(Private_c));
     pc_save_bswap_private(&s_rec_scratch_a, PC_BSWAP_TO_BE);
     memcpy(out, &s_rec_scratch_a, PC_NETGAME_REC_SIZE);
 }
@@ -11524,10 +11721,17 @@ static int pcnetgame_rec_refresh_hostfields(int idx, PCNetGameRecSlot* s) {
     if (!s->init || s->rev == 0) {
         return 0;
     }
-    d = pcnetgame_rec_hostfield_digest(&Save_Get(private_data)[idx]);
+    if (pcnetgame_rec_priv_ptr(idx) == NULL) {
+        return 0;
+    }
+    d = pcnetgame_rec_hostfield_digest(pcnetgame_rec_priv_ptr(idx));
     if (d == s->hf_digest) {
         return 0;
     }
+    /* L3 (guests): hf_pending is only ever CONSUMED for a RESIDENT binding (host tick: bound_resident_idx >= 0). A guest slot never gets a
+     * PUSH_HOSTFIELDS: the host never consumes / rewrites host-owned fields of a guest record (digest stays at its install value), so hf_pending
+     * is dormant for slots >= PLAYER_NUM. If a future host-side consumer ever changes a guest's host-owned ranges, a guest push must be designed
+     * first (test_guest_src pins this). */
     s->hf_digest = d;
     s->rev++;
     s->hf_pending = 1;
@@ -11714,6 +11918,7 @@ static void pcnetgame_rec_resolve_slot(int i) {
 static void pcnetgame_rec_store_resolve(void) {
     int i;
     int first_untrusted_pass = 0;
+    pcnetgame_guest_store_load(); /* guests (G1): the guest table is loaded with the host world, before any client can be READY (idempotent) */
     if (s_rec_resolved) {
         return;
     }
@@ -11756,6 +11961,7 @@ void pc_net_game_record_after_gci_save(const char* gci_path) {
         return;
     }
     busy = 1;
+    (void)pcnetgame_guest_store_write("after the GCI save"); /* guests (G1): independent of the town / resident lineage; never fatal, coalesced */
     pcnetgame_capture_town_identity(&cur);
     if (!s_rec_resolved || !s_host_town_valid || !pcnetgame_town_equal(&cur, &s_host_town)) {
         s_rec_early_save_request = 0;
@@ -11823,6 +12029,17 @@ static int pcnetgame_rec_gate(PCNetPeerId peer, uint32_t xfer_id, int reply) {
             pcnetgame_rec_send_ack(peer, (uint8_t)PC_NETGAME_REC_ACK_NOT_BOUND, 0, xfer_id, 0, 0);
         }
         return -1;
+    }
+    if (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+        /* Guests (G1): the slot is PLAYER_NUM + the guest table slot of the binding; the entry must still exist for the bind-time key.
+         * The host's own resident is never a guest slot, so there is no own-resident test. */
+        idx = pcnetgame_peer_rec_slot(peer);
+        if (idx < PLAYER_NUM || !s_guest[idx - PLAYER_NUM].used || pcnetgame_rec_slot(idx) == NULL ||
+            memcmp(&s_guest[idx - PLAYER_NUM].key, &st->bound_pid, sizeof(st->bound_pid)) != 0) {
+            pcnetgame_host_refuse_identity(peer, "record: bound guest entry is invalid or changed under the peer", 0);
+            return -1;
+        }
+        return idx;
     }
     idx = st->bound_resident_idx;
     own_idx = pcnetgame_host_own_resident_idx();
@@ -11924,9 +12141,13 @@ static uint16_t pcnetgame_rec_validate_fields(const Private_c* n, const uint8_t*
 /* THE ONLY writer of Save_Get(private_data)[] in the D3 block: copy the CLIENT-owned and SHARED ranges of the validated native
  * scratch record into the host record of `idx` (immutable and host-owned ranges keep the host values). */
 static void pcnetgame_rec_merge_into_save(int idx, const Private_c* scratch_native) {
-    uint8_t* dst = (uint8_t*)&Save_Get(private_data)[idx];
+    /* Guests (G1): for idx >= PLAYER_NUM the destination is the guest table record (outside Save_t) -- same ownership rules */
+    uint8_t* dst = (uint8_t*)pcnetgame_rec_priv_ptr(idx);
     const uint8_t* src = (const uint8_t*)scratch_native;
     int i;
+    if (dst == NULL) {
+        return;
+    }
     for (i = 0; i < PC_NETGAME_REC_RANGE_NUM; i++) {
         if (s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_CLIENT || s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_SHARED) {
             memcpy(dst + s_rec_ranges[i].off, src + s_rec_ranges[i].off, s_rec_ranges[i].len);
@@ -11965,6 +12186,7 @@ static void pcnetgame_rec_pump_push(PCNetPeerId peer) {
             b.msg_type = (uint8_t)PC_NETGAME_MSG_RECORD_BEGIN;
             b.kind = st->rec_push_kind;
             b.chunk_count = (uint8_t)PC_NETGAME_REC_CHUNK_COUNT;
+            b.rsv = st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST ? (uint8_t)PC_NETGAME_REC_CLASS_GUEST : (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT;
             b.xfer_id = st->rec_push_xfer;
             b.epoch = st->rec_push_epoch;
             b.rev = st->rec_push_rev;
@@ -12020,6 +12242,7 @@ static void pcnetgame_rec_handle_hello(PCNetPeerId peer, const PCNetGameRecordHe
     if (idx < 0) {
         return;
     }
+    pcnetgame_guest_confirm_on_record_step(peer); /* M3: the first authenticated record step of a token-presenting guest confirms its entry */
     if (st->rec_state != PC_NETGAME_RECS_AWAIT_HELLO) {
         if (pcnetgame_rec_log_ok(st)) {
             printf("[NET][REC] host: peer %d duplicate/out-of-state HELLO ignored (state %u)\n", (int)peer,
@@ -12046,7 +12269,7 @@ static void pcnetgame_rec_handle_hello(PCNetPeerId peer, const PCNetGameRecordHe
     printf("[NET][REC] host: peer %d HELLO (resident %d, have_last=%u last session %u epoch %u rev %u; host rev %u)\n",
            (int)peer, idx, (unsigned)(in->flags & PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST), (unsigned)in->last_host_session,
            (unsigned)in->last_epoch, (unsigned)in->last_rev, (unsigned)slot->rev);
-    if (slot->rev == 0 && s_rec_store_last_failed) {
+    if (slot->rev == 0 && (idx >= PLAYER_NUM ? s_guest_store_last_failed : s_rec_store_last_failed)) {
         /* D3-4: the last records.dat write failed / was skipped: a first migration could not be made durable-safe -> refuse it
          * (BUSY; the peer stays AWAIT_HELLO and is closed by the HELLO deadline, the client can reconnect later). */
         printf("[NET][REC] host: peer %d resident %d first-join MIGRATE REFUSED (BUSY): the record sidecar is failing "
@@ -12199,7 +12422,7 @@ static void pcnetgame_rec_process_upload(PCNetPeerId peer) {
     /* 6. merge (client-owned ranges only), rev++, mark dirty, ACK */
     pcnetgame_rec_merge_into_save(idx, &s_rec_scratch_b);
     slot->rev++;
-    slot->hf_digest = pcnetgame_rec_hostfield_digest(&Save_Get(private_data)[idx]);
+    slot->hf_digest = pcnetgame_rec_hostfield_digest(pcnetgame_rec_priv_ptr(idx));
     slot->dirty_unsaved = 1;
     st->rec_have_accept = 1;
     st->rec_last_accept_ms = now;
@@ -12224,6 +12447,7 @@ static void pcnetgame_rec_handle_begin(PCNetPeerId peer, const PCNetGameRecordBe
     if (idx < 0) {
         return;
     }
+    pcnetgame_guest_confirm_on_record_step(peer); /* M3 (see the HELLO handler) */
     if (in->kind != PC_NETGAME_REC_KIND_UPLOAD && in->kind != PC_NETGAME_REC_KIND_MIGRATE_UPLOAD) {
         pcnetgame_rec_refuse_xfer(st, in->xfer_id);
         pcnetgame_rec_send_ack(peer, (uint8_t)PC_NETGAME_REC_ACK_BAD_SHAPE, 3, in->xfer_id, 0, 0);
@@ -12238,8 +12462,10 @@ static void pcnetgame_rec_handle_begin(PCNetPeerId peer, const PCNetGameRecordBe
     st->up_got_mask = 0;
     st->up_refused_valid = 0;
     st->up_last_xfer = in->xfer_id;
-    if (in->rsv != 0) {
-        /* record_class seam (0 = resident; guests are a later class): refused, chunks absorbed, NOT a violation (detail 5) */
+    if (in->rsv != (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST ? (uint8_t)PC_NETGAME_REC_CLASS_GUEST : (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT)) {
+        /* record_class (BEGIN.rsv) must equal the class the HOST derived for this connection (0 resident, 1 guest): any other value
+         * (a resident claiming the guest class, a guest claiming the resident class, an unknown class) is refused, chunks absorbed,
+         * NOT a violation (detail 5) */
         pcnetgame_rec_refuse_xfer(st, in->xfer_id);
         pcnetgame_rec_send_ack(peer, (uint8_t)PC_NETGAME_REC_ACK_BAD_SHAPE, 5, in->xfer_id, 0, 0);
         return;
@@ -12431,6 +12657,7 @@ static void pcnetgame_host_record_tick(void) {
             st->up_open = 0;
             st->up_got_mask = 0;
         }
+        /* L3: RESIDENT bindings only (a guest has bound_resident_idx -1): guest slots never get PUSH_HOSTFIELDS, hf_pending is dormant for them */
         if (st->rec_state == PC_NETGAME_RECS_SYNCED && !st->rec_push_active && st->bound_resident_idx >= 0 &&
             st->bound_resident_idx < PLAYER_NUM && s_rec_slot[st->bound_resident_idx].hf_pending) {
             s_rec_slot[st->bound_resident_idx].hf_pending = 0;
@@ -12440,6 +12667,414 @@ static void pcnetgame_host_record_tick(void) {
     }
 }
 /* ===== D3 END ===== */
+
+/* ===== GUESTS HOST BEGIN: the guest table (outside Save_t), its persistence (save/mp/guests.dat) and guest admission helpers =====
+ * A GUEST is a player whose home town is NOT this town (a foreigner / extra player). The HOST decides the class only at IDENTITY (see
+ * pcnetgame_host_process_identity): RESIDENT keeps strict priority and the guest path can never claim a resident. A guest's KEY is its
+ * full HOME PersonalID (public); the host-minted 16-byte TOKEN is the only anti-impersonation secret (trust on first use: the first
+ * contact mints it, every later connect of that key must present it). The guest's Private_c lives in s_guest_rec[] (NEVER in Save_t, NEVER
+ * written to a GCI), at record slot PLAYER_NUM + g of the shared slot index space; the D3 record transport (HELLO / BEGIN / CHUNK / ACK,
+ * migrate-once, uploads with the same field ownership / validation, revision lineage) runs unchanged over it with record_class = GUEST.
+ * guests.dat is written (a) immediately and durably when a token is minted (a minted token the host forgot would lock the real guest out),
+ * and (b) after every successful Card-A GCI write through pc_net_game_record_after_gci_save() (coalesced: an unchanged image is not
+ * rewritten), plus the early-save request that an accepted guest change raises like a resident's. Never fatal. */
+/* (the state variables s_guest_file / s_guest_store_loaded / s_guest_untrusted / s_guest_store_last_failed ... are declared with the guest table above) */
+
+/* Installs guest table entry `g` from a canonical BE record image + token + lineage (load path). */
+static void pcnetgame_guest_install(int g, const PCMpGuestEntry* fe) {
+    PCNetGameRecSlot* rs = &s_rec_slot[PLAYER_NUM + g];
+    const uint8_t* be_record = fe->record;
+    const uint8_t* token = fe->token;
+    const uint32_t epoch = fe->epoch;
+    const uint32_t rev = fe->rev;
+    memcpy(&s_rec_scratch_b, be_record, PC_NETGAME_REC_SIZE); /* convert a COPY, like every record conversion (never the record itself in place) */
+    pc_save_bswap_private(&s_rec_scratch_b, PC_BSWAP_FROM_BE);
+    memcpy(&s_guest_rec[g], &s_rec_scratch_b, sizeof(Private_c));
+    memset(&s_guest[g], 0, sizeof(s_guest[g]));
+    s_guest[g].used = 1;
+    mPr_CopyPersonalID(&s_guest[g].key, &s_guest_rec[g].player_ID);
+    memcpy(s_guest[g].token, token, PC_NETGAME_GUEST_TOKEN_LEN);
+    memcpy(s_guest[g].town.land_name, fe->town_land_name, PC_NETGAME_LAND_LEN);
+    s_guest[g].town.land_id = fe->town_land_id;
+    s_guest[g].town.terrain_hash = fe->town_terrain_hash;
+    s_guest[g].confirmed = fe->confirmed ? 1u : 0u;
+    s_guest[g].age = fe->age;
+    memset(rs, 0, sizeof(*rs));
+    rs->init = 1;
+    mPr_CopyPersonalID(&rs->pid, &s_guest_rec[g].player_ID);
+    rs->epoch = epoch != 0 ? epoch : 1u;
+    rs->rev = rev;
+    rs->hf_digest = pcnetgame_rec_hostfield_digest(&s_guest_rec[g]);
+    memset(s_rec_backup[PLAYER_NUM + g], 0, PC_NETGAME_REC_SIZE);
+    pcnetgame_txn_journal_clear(PLAYER_NUM + g);
+}
+
+static void pcnetgame_guest_store_load(void) {
+    PCMpGuestLoadInfo info;
+    int g, n = 0;
+    if (s_guest_store_loaded) {
+        return;
+    }
+    s_guest_store_loaded = 1;
+    s_guest_store_mode = pc_mp_guests_load(PC_MP_GUESTS_PATH, &s_guest_file, &info);
+    s_guest_untrusted = (s_guest_store_mode == PC_MP_GST_LOAD_UNTRUSTED);
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        if (s_guest_file.e[g].present) {
+            pcnetgame_guest_install(g, &s_guest_file.e[g]);
+            n++;
+        }
+    }
+    printf("[NET][GUEST] store: guests file '%s' load mode=%s (generation used %d, %d unreadable file(s) preserved), %d guest(s) restored\n",
+           PC_MP_GUESTS_PATH, s_guest_store_mode == PC_MP_GST_LOAD_MISSING ? "MISSING" : s_guest_store_mode == PC_MP_GST_LOAD_OK ? "OK" :
+           s_guest_store_mode == PC_MP_GST_LOAD_OK_BACKUP ? "OK_BACKUP" : "UNTRUSTED", info.gen_used, info.moved_aside, n);
+    if (s_guest_untrusted) {
+        printf("[NET][GUEST] store: *** UNTRUSTED MODE: guests.dat existed but no generation is readable. NO guest is admitted (their tokens "
+               "are unknown, so a squatter could not be told from the real guest); residents are unaffected. To reset deliberately remove "
+               "guests.dat, its .bak files AND the *.corrupt-* files ***\n");
+    }
+}
+
+/* Builds the file image from the live table (all-zero padding: the caller compares images with memcmp). */
+static void pcnetgame_guest_store_build(PCMpGuestFile* nf) {
+    static uint8_t be[PC_NETGAME_REC_SIZE];
+    int g;
+    memset(nf, 0, sizeof(*nf));
+    nf->generation = s_guest_file.generation + 1u;
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        PCMpGuestEntry* e = &nf->e[g];
+        if (!s_guest[g].used || !s_rec_slot[PLAYER_NUM + g].init) {
+            continue;
+        }
+        pcnetgame_rec_export_be(PLAYER_NUM + g, be);
+        e->present = 1;
+        memcpy(e->pid, be, PC_MP_GUEST_PID_SIZE);
+        memcpy(e->token, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN);
+        e->epoch = s_rec_slot[PLAYER_NUM + g].epoch;
+        e->rev = s_rec_slot[PLAYER_NUM + g].rev;
+        memcpy(e->record, be, PC_NETGAME_REC_SIZE);
+        memcpy(e->town_land_name, s_guest[g].town.land_name, PC_NETGAME_LAND_LEN);
+        e->town_land_id = s_guest[g].town.land_id;
+        e->town_terrain_hash = s_guest[g].town.terrain_hash;
+        e->confirmed = s_guest[g].confirmed ? 1u : 0u;
+        e->age = s_guest[g].age;
+    }
+}
+
+/* Writes guests.dat if the durable content would change. 1 = durable (or nothing to write / nothing loaded), 0 = failed or refused
+ * (loud log; retried at the next host save). NEVER writes while UNTRUSTED (a write would silently turn the file into a valid empty one and lift
+ * the lock the operator must lift deliberately). The epoch alone changing (a re-roll after a save pause) is not a reason to rewrite. */
+static int pcnetgame_guest_store_write(const char* why) {
+    static PCMpGuestFile nf, cmp;
+    int g, r, count = 0;
+    if (!s_guest_store_loaded || s_guest_untrusted) {
+        return 1;
+    }
+    pcnetgame_guest_store_build(&nf);
+    cmp = nf;
+    cmp.generation = s_guest_file.generation;
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        if (cmp.e[g].present && s_guest_file.e[g].present) {
+            cmp.e[g].epoch = s_guest_file.e[g].epoch;
+        }
+    }
+    if (memcmp(cmp.e, s_guest_file.e, sizeof(cmp.e)) == 0) {
+        s_guest_store_last_failed = 0;
+        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+            s_rec_slot[PLAYER_NUM + g].dirty_unsaved = 0; /* the durable image already says exactly this */
+        }
+        return 1;
+    }
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        count += nf.e[g].present ? 1 : 0;
+    }
+    r = pc_mp_guests_save(PC_MP_GUESTS_PATH, &nf);
+    if (r == PC_MP_GST_OK) {
+        s_guest_file = nf;
+        s_guest_store_last_failed = 0;
+        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+            s_rec_slot[PLAYER_NUM + g].dirty_unsaved = 0;
+        }
+        printf("[NET][GUEST] store: guests.dat written (%s; generation %u, %d guest(s))\n", why, (unsigned)nf.generation, count);
+        return 1;
+    }
+    s_guest_store_fail_count++;
+    s_guest_store_last_failed = 1;
+    printf("[NET][GUEST] store: *** guests.dat write FAILED (%s, %s); the table stays in memory, retried at the next host save "
+           "(failure #%u) ***\n", pc_mp_guests_strerror(r), why, (unsigned)s_guest_store_fail_count);
+    return 0;
+}
+
+/* The guest KEY validity (beyond the vanilla null test): real names, a real land id. */
+static int pcnetgame_guest_key_valid(const PersonalID_c* key) {
+    return mPr_NullCheckPersonalID((PersonalID_c*)key) == FALSE && key->land_id != 0xFFFFu && key->player_id != 0xFFFFu &&
+           key->player_name[0] != 0 && key->land_name[0] != 0;
+}
+
+/* M1: the table key is (the host's CURRENT town identity, the guest key): an entry of another town is never matched (kept, inactive). */
+static int pcnetgame_guest_find(const PersonalID_c* key) {
+    int g;
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        if (s_guest[g].used && pcnetgame_town_equal(&s_guest[g].town, &s_host_town) && memcmp(&s_guest[g].key, key, sizeof(*key)) == 0) {
+            return g;
+        }
+    }
+    return -1;
+}
+
+/* M3: an entry that may be re-minted / evicted: UNCONFIRMED, no accepted data (rev 0) and no live peer bound to it. */
+static int pcnetgame_guest_entry_disposable(int g) {
+    return s_guest[g].used && !s_guest[g].confirmed && s_rec_slot[PLAYER_NUM + g].rev == 0 &&
+           pcnetgame_host_peer_bound_to_guest(g, (PCNetPeerId)-1) < 0;
+}
+
+/* M3: per-address first-contact limiter (bounded memory: a ring of PC_NETGAME_GUEST_MINT_LOG recent token issuances). A new mint or a re-mint
+ * for an address that already got PC_NETGAME_GUEST_MINT_MAX tokens within PC_NETGAME_GUEST_MINT_WINDOW_MS is REFUSED (logged). ip == 0 (unknown)
+ * is not exempt: it is one shared bucket. Token-presenting known guests never pass through here. */
+#define PC_NETGAME_GUEST_MINT_LOG        16
+#define PC_NETGAME_GUEST_MINT_MAX        3
+#define PC_NETGAME_GUEST_MINT_WINDOW_MS  60000u
+static struct { uint32_t ip; uint32_t at_ms; uint8_t used; } s_guest_mint_log[PC_NETGAME_GUEST_MINT_LOG];
+static int s_guest_mint_log_next = 0;
+
+static int pcnetgame_guest_mint_allowed(uint32_t ip, uint32_t now) {
+    int i, n = 0;
+    for (i = 0; i < PC_NETGAME_GUEST_MINT_LOG; i++) {
+        if (s_guest_mint_log[i].used && s_guest_mint_log[i].ip == ip && (uint32_t)(now - s_guest_mint_log[i].at_ms) < PC_NETGAME_GUEST_MINT_WINDOW_MS) {
+            n++;
+        }
+    }
+    return n < PC_NETGAME_GUEST_MINT_MAX;
+}
+
+static void pcnetgame_guest_mint_note(uint32_t ip, uint32_t now) {
+    s_guest_mint_log[s_guest_mint_log_next].used = 1;
+    s_guest_mint_log[s_guest_mint_log_next].ip = ip;
+    s_guest_mint_log[s_guest_mint_log_next].at_ms = now;
+    s_guest_mint_log_next = (s_guest_mint_log_next + 1) % PC_NETGAME_GUEST_MINT_LOG;
+}
+
+static int pcnetgame_guest_token_fresh(uint8_t* token_out) {
+    int k, allz = 1;
+    if (!pc_mp_guests_random_bytes(token_out, PC_NETGAME_GUEST_TOKEN_LEN)) {
+        return 0;
+    }
+    for (k = 0; k < (int)PC_NETGAME_GUEST_TOKEN_LEN; k++) {
+        if (token_out[k] != 0) {
+            allz = 0;
+        }
+    }
+    return !allz; /* a zero token is the "no token" encoding of the file format: treated as an RNG failure, never used */
+}
+
+/* First contact: mints the token, creates the table entry for (this town, key) with a blank record (player_ID = key, exists = TRUE, rev 0 = never
+ * synced, so the D3 transport asks the guest for its record first), and makes the entry durable BEFORE the token is ever sent. A full table frees
+ * the OLDEST disposable (unconfirmed, data-less, idle) entry first (M3). Returns 0 and sets *out_g, token_out; -1 = table full (nothing
+ * disposable), -2 = no OS randomness (never a weak token), -3 = could not persist (rolled back). */
+static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* token_out) {
+    int g, evict = -1;
+    uint32_t age_max = 0;
+    PCNetGameRecSlot* rs;
+    PCNetGameGuest old_g;
+    Private_c old_rec;
+    PCNetGameRecSlot old_rs;
+    int evicted = 0;
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        if (!s_guest[g].used) {
+            break;
+        }
+    }
+    if (g >= PC_NETGAME_GUEST_MAX) {
+        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+            if (pcnetgame_guest_entry_disposable(g) && (evict < 0 || (int32_t)(s_guest[g].age - s_guest[evict].age) < 0)) {
+                evict = g;
+            }
+        }
+        if (evict < 0) {
+            return -1;
+        }
+        g = evict;
+        evicted = 1;
+    }
+    if (!pcnetgame_guest_token_fresh(token_out)) {
+        return -2;
+    }
+    for (evict = 0; evict < PC_NETGAME_GUEST_MAX; evict++) {
+        if (s_guest[evict].used && (int32_t)(s_guest[evict].age - age_max) > 0) {
+            age_max = s_guest[evict].age;
+        }
+    }
+    old_g = s_guest[g];
+    old_rec = s_guest_rec[g];
+    old_rs = s_rec_slot[PLAYER_NUM + g];
+    if (evicted) {
+        char who[96];
+        pcnetgame_format_town(&old_g.town, who, sizeof(who));
+        printf("[NET][GUEST] table full: evicting the OLDEST unconfirmed data-less idle entry (slot %d, town %s, age %u) for a new guest\n", g, who,
+               (unsigned)old_g.age);
+    }
+    memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
+    mPr_CopyPersonalID(&s_guest_rec[g].player_ID, (PersonalID_c*)key);
+    s_guest_rec[g].exists = TRUE;
+    memset(&s_guest[g], 0, sizeof(s_guest[g]));
+    s_guest[g].used = 1;
+    mPr_CopyPersonalID(&s_guest[g].key, (PersonalID_c*)key);
+    memcpy(s_guest[g].token, token_out, PC_NETGAME_GUEST_TOKEN_LEN);
+    s_guest[g].town = s_host_town;
+    s_guest[g].confirmed = 0;
+    s_guest[g].age = age_max + 1u;
+    rs = &s_rec_slot[PLAYER_NUM + g];
+    memset(rs, 0, sizeof(*rs));
+    rs->init = 1;
+    mPr_CopyPersonalID(&rs->pid, (PersonalID_c*)key);
+    rs->epoch = pcnetgame_rec_rand32();
+    rs->rev = 0;
+    rs->hf_digest = pcnetgame_rec_hostfield_digest(&s_guest_rec[g]);
+    memset(s_rec_backup[PLAYER_NUM + g], 0, PC_NETGAME_REC_SIZE);
+    pcnetgame_txn_journal_clear(PLAYER_NUM + g);
+    if (!pcnetgame_guest_store_write("new guest token minted")) {
+        if (evicted) {
+            s_guest[g] = old_g; /* the eviction was never made durable: the old (disposable) entry stays exactly as it was */
+            s_guest_rec[g] = old_rec;
+            s_rec_slot[PLAYER_NUM + g] = old_rs;
+        } else {
+            memset(&s_guest[g], 0, sizeof(s_guest[g]));
+            memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
+            memset(rs, 0, sizeof(*rs));
+        }
+        return -3;
+    }
+    *out_g = g;
+    return 0;
+}
+
+/* M3 re-mint: an UNCONFIRMED data-less idle entry for the same (town, key) gets a NEW token (the old one was never demonstrably stored by the
+ * client: its TOKEN message may have been lost). Durable before the token is sent; *old_token_out keeps the previous one for the rollback. Returns
+ * 0 = ok, -2 = no randomness, -3 = could not persist (the old token is restored). */
+static int pcnetgame_guest_remint(int g, uint8_t* token_out, uint8_t* old_token_out) {
+    uint32_t age_max = 0, old_age;
+    int k;
+    if (!pcnetgame_guest_token_fresh(token_out)) {
+        return -2;
+    }
+    memcpy(old_token_out, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN);
+    for (k = 0; k < PC_NETGAME_GUEST_MAX; k++) {
+        if (s_guest[k].used && (int32_t)(s_guest[k].age - age_max) > 0) {
+            age_max = s_guest[k].age;
+        }
+    }
+    memcpy(s_guest[g].token, token_out, PC_NETGAME_GUEST_TOKEN_LEN);
+    old_age = s_guest[g].age;
+    s_guest[g].age = age_max + 1u; /* a re-minted entry is the newest */
+    if (!pcnetgame_guest_store_write("unconfirmed guest re-minted")) {
+        memcpy(s_guest[g].token, old_token_out, PC_NETGAME_GUEST_TOKEN_LEN);
+        s_guest[g].age = old_age;
+        return -3;
+    }
+    return 0;
+}
+
+static void pcnetgame_guest_remint_rollback(int g, const uint8_t* old_token) {
+    if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used) {
+        return;
+    }
+    memcpy(s_guest[g].token, old_token, PC_NETGAME_GUEST_TOKEN_LEN);
+    (void)pcnetgame_guest_store_write("guest re-mint rolled back (token not deliverable)");
+}
+
+/* Removes a freshly created entry again (the ACK / token could not be queued: the real guest never received its token) and makes the removal
+ * durable. Only ever called for an entry created by the SAME admission. (An entry that EVICTED another one is not restored: the evicted entry was
+ * disposable by definition, and the new one is gone again.) */
+static void pcnetgame_guest_rollback_create(int g) {
+    if (g < 0 || g >= PC_NETGAME_GUEST_MAX) {
+        return;
+    }
+    memset(&s_guest[g], 0, sizeof(s_guest[g]));
+    memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
+    memset(&s_rec_slot[PLAYER_NUM + g], 0, sizeof(s_rec_slot[0]));
+    pcnetgame_txn_journal_clear(PLAYER_NUM + g);
+    (void)pcnetgame_guest_store_write("new guest entry rolled back (token not deliverable)");
+}
+
+/* M3: the first authenticated record step (HELLO / BEGIN, called after the record gate) of a guest connection that PRESENTED the entry's matching
+ * token confirms the entry (the client demonstrably stored it). Durable, never fatal. */
+static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    int g;
+    if (st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST || !st->guest_token_verified) {
+        return;
+    }
+    g = st->bound_guest_slot;
+    if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used || s_guest[g].confirmed) {
+        return;
+    }
+    s_guest[g].confirmed = 1;
+    printf("[NET][GUEST] guest slot %d CONFIRMED (the client presented its token and started a record exchange)\n", g);
+    (void)pcnetgame_guest_store_write("guest confirmed");
+}
+
+/* Guest-claim checks for a (UNKNOWN-class) IDENTITY with a valid IDENTITY_EXT guest flag. Returns 1 = admissible (*key = the guest key,
+ * *out_slot = the existing table slot, or -1 for a new key); 0 = REFUSED (logged, the peer is torn down through the normal refuse path). */
+static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityMsg* in, const PCNetGameIdentityExtMsg* ext, PersonalID_c* key,
+                                      int* out_slot, int* out_mode) {
+    const char* why;
+    int g;
+    memcpy(key->player_name, ext->home_player_name, PC_NETGAME_NAME_LEN);
+    memcpy(key->land_name, ext->home_land_name, PC_NETGAME_LAND_LEN);
+    key->player_id = ext->home_player_id;
+    key->land_id = ext->home_land_id;
+    *out_slot = -1;
+    *out_mode = 0; /* 0 = new key, 1 = known entry + verified token, 2 = unconfirmed data-less idle entry to RE-MINT (M3) */
+    if (memcmp(in->player_name, ext->home_player_name, PC_NETGAME_NAME_LEN) != 0 || in->player_id != ext->home_player_id) {
+        pcnetgame_host_refuse_identity(peer, "guest claim: the IDENTITY player name / id differ from the guest's home PersonalID", 0);
+        return 0;
+    }
+    if (!pcnetgame_guest_key_valid(key)) {
+        pcnetgame_host_refuse_identity(peer, "guest claim: the home PersonalID is not a valid identity", 0);
+        return 0;
+    }
+    if (ext->home_land_id == s_host_town.land_id && memcmp(ext->home_land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN) == 0) {
+        pcnetgame_host_refuse_identity(peer, "guest claim: the guest's home land is this town's land (a guest comes from another town)", 0);
+        return 0;
+    }
+    why = pcnetgame_guest_key_conflict(key);
+    if (why != NULL) {
+        pcnetgame_host_refuse_identity(peer, why, 0);
+        return 0;
+    }
+    pcnetgame_guest_store_load();
+    if (s_guest_untrusted) {
+        pcnetgame_host_refuse_identity(peer, "guest admission disabled: guests.dat is UNTRUSTED (existed but unreadable); operator reset required", 0);
+        return 0;
+    }
+    g = pcnetgame_guest_find(key);
+    if (g >= 0) {
+        /* plain memcmp: the host's answer is the same refusal either way, so response timing carries nothing a remote peer can use */
+        const int tok_ok = ext->token_present && memcmp(ext->token, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN) == 0;
+        if (tok_ok) {
+            *out_slot = g;
+            *out_mode = 1;
+            return 1;
+        }
+        if (pcnetgame_guest_entry_disposable(g)) {
+            /* M1/M3: the entry was never confirmed by a client that stored its token and holds no accepted data, and no peer is bound to it: its
+             * token may simply never have reached the real guest. The key owner (anyone claiming it: TOFU) gets a fresh token instead of a lock-out.
+             * A LIVE-bound entry never gets here: it is refused below, with no eviction of the live session. */
+            *out_slot = g;
+            *out_mode = 2;
+            return 1;
+        }
+        pcnetgame_host_refuse_identity(peer, ext->token_present ? "known guest key presented a WRONG token"
+                                                                : "known guest key presented WITHOUT a token (a squatter cannot take over a known guest; the real guest must present its token)", 0);
+        return 0;
+    }
+    if (ext->token_present) {
+        printf("[NET][IDENTITY] host: peer %d presented a guest token for a key this host has no entry for (host table reset / other host): treated as a first contact\n",
+               (int)peer);
+    }
+    return 1;
+}
+/* ===== GUESTS HOST END ===== */
+
 
 /* ===== X1 BEGIN: host-transactional PICKUP / DROP / BURY commit (protocol v8, HOST half) =====
  * Why: with the legacy INTERACT_CONFIRM(COMMIT) the client queued its COMMIT and then mutated its own pockets, and the host
@@ -12493,12 +13128,12 @@ typedef struct PCNetGameTxnResident {
     uint8_t         head, n;                             /* ring[head .. head+n) */
     PCNetGameTxnLog ring[PC_NETGAME_TXN_RING];
 } PCNetGameTxnResident;
-static PCNetGameTxnResident s_txn_res[PLAYER_NUM]; /* ~2 KB; host_session scope, NOT per peer */
+static PCNetGameTxnResident s_txn_res[PC_NETGAME_REC_SLOTS]; /* ~2 KB per slot (residents + guests, the shared slot index space); host_session scope, NOT per peer */
 
 static void pcnetgame_txn_journal_clear(int idx) {
     if (idx < 0) {
         memset(s_txn_res, 0, sizeof(s_txn_res));
-    } else if (idx < PLAYER_NUM) {
+    } else if (idx < PC_NETGAME_REC_SLOTS) {
         memset(&s_txn_res[idx], 0, sizeof(s_txn_res[idx]));
     }
 }
@@ -12622,7 +13257,11 @@ static int pcnetgame_txn_fault_fire(int mode) {
  * host-owned 0x86-0x87 lotto bytes, never an equipment or other client range). The index comes only from pcnetgame_rec_gate(). */
 static int pcnetgame_rec_txn_idx_ok(int idx) {
     int own = pcnetgame_host_own_resident_idx();
-    return idx >= 0 && idx < PLAYER_NUM && !(own >= 0 && idx == own) && Save_Get(private_data)[idx].exists == TRUE;
+    const Private_c* r = pcnetgame_rec_priv_ptr(idx); /* NULL for an out-of-range slot or an unused guest entry */
+    if (idx >= PLAYER_NUM) {
+        return r != NULL && r->exists == TRUE; /* guests (G1): a guest-table record; the host's own resident is never in this index space */
+    }
+    return idx >= 0 && idx < PLAYER_NUM && !(own >= 0 && idx == own) && r != NULL && r->exists == TRUE;
 }
 
 static int pcnetgame_rec_txn_write_inventory(int idx, const uint16_t* pockets, uint32_t item_conditions, uint32_t wallet) {
@@ -12631,7 +13270,7 @@ static int pcnetgame_rec_txn_write_inventory(int idx, const uint16_t* pockets, u
     if (!pcnetgame_rec_txn_idx_ok(idx)) {
         return 0; /* the host's OWN resident (or a bad index) is never written */
     }
-    r = &Save_Get(private_data)[idx];
+    r = pcnetgame_rec_priv_ptr(idx);
     for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
         r->inventory.pockets[i] = (mActor_name_t)pockets[i];
     }
@@ -12649,7 +13288,7 @@ static int pcnetgame_rec_txn_write_mail(int idx, int mail_slot, const Mail_c* le
     if (!pcnetgame_rec_txn_idx_ok(idx) || mail_slot < 0 || mail_slot >= mPr_INVENTORY_MAIL_COUNT) {
         return 0;
     }
-    r = &Save_Get(private_data)[idx];
+    r = pcnetgame_rec_priv_ptr(idx);
     if (letter == NULL) {
         mMl_clear_mail(&r->mail[mail_slot]);
     } else {
@@ -12714,9 +13353,12 @@ static void pcnetgame_txn_send_result(PCNetPeerId peer, int idx, const PCNetGame
 static void pcnetgame_txn_send_applied(PCNetPeerId peer, int idx, const PCNetGameTxnCommitMsg* in, const PCNetGameRecSlot* slot,
                                        uint8_t reason, const char* how) {
     static uint8_t be[PC_NETGAME_REC_SIZE];
-    const Private_c* r = &Save_Get(private_data)[idx];
+    const Private_c* r = pcnetgame_rec_priv_ptr(idx);
     uint16_t pockets[mPr_POCKETS_SLOT_COUNT];
     int i;
+    if (r == NULL) {
+        return; /* cannot happen: every caller got `idx` from the binding gate (a result for an unusable slot is simply not produced) */
+    }
     for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
         pockets[i] = (uint16_t)r->inventory.pockets[i];
     }
@@ -12730,7 +13372,7 @@ static void pcnetgame_txn_send_applied(PCNetPeerId peer, int idx, const PCNetGam
  * released; NOT_PENDING has none). */
 static void pcnetgame_txn_reject(PCNetPeerId peer, int idx, const PCNetGameRecSlot* slot, const PCNetGameTxnCommitMsg* in,
                                  uint32_t hash, uint8_t reason, int journal, PCNetGameHostInteraction* release, const char* why) {
-    if (journal && idx >= 0 && idx < PLAYER_NUM) {
+    if (journal && idx >= 0 && idx < PC_NETGAME_REC_SLOTS) {
         pcnetgame_txn_journal_add(&s_txn_res[idx], in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, reason,
                                   slot != NULL ? slot->rev : 0);
     }
@@ -12743,6 +13385,13 @@ static void pcnetgame_txn_reject(PCNetPeerId peer, int idx, const PCNetGameRecSl
     }
     pcnetgame_txn_send_result(peer, idx, in, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, reason, slot != NULL ? slot->epoch : 0,
                               slot != NULL ? slot->rev : 0, 0, NULL, 0, 0, "");
+}
+
+/* Guests (G1): the house-service refusal of a GUEST slot (idx >= PLAYER_NUM: a guest-table record, no house, no mailbox, no donor slot). One REJECTED
+ * TXN_RESULT with the existing NO_DONOR_SLOT reason (no new wire value), not journaled, nothing mutated; called BEFORE any handler derives a private_data[] /
+ * homes[] index from the slot. */
+static void pcnetgame_txn_reject_guest_no_house(PCNetPeerId peer, int idx, const PCNetGameRecSlot* slot, const PCNetGameTxnCommitMsg* in, const char* why) {
+    pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT, 0, NULL, why);
 }
 
 static void pcnetgame_handle_host_txn_commit(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
@@ -14014,10 +14663,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     post_conds = t->pre_conds;
     post_wallet = t->pre_wallet;
     if (is_shop) {
-        if (idx >= PLAYER_NUM) {
-            fail = "the bound resident has no shop record slot (guests / extra players are refused until they exist)";
-            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
-        } else if (is_buy) {
+        /* Guests (G1) are FULL participants of the shop: the purchase / sale touches only the host's Save_t.shop + the bound record of the
+         * shared slot index space (a guest's pockets / wallet live in the guest table), so no resident slot is required. */
+        if (is_buy) {
             const mActor_name_t item = (mActor_name_t)t->item;
             int code = pcnetgame_shop_stock_code(item, &Save_Get(shop), pcnetgame_shop_status_now());
             shop_cls = pcnetgame_shop_classify(item, &shop_rsv);
@@ -14046,7 +14694,7 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
         }
     } else if (is_donate) {
         if (idx < 0 || idx >= PLAYER_NUM) {
-            fail = "the bound resident has no museum donor slot (guests / extra players are refused until they exist)";
+            fail = "the bound player has no museum donor slot (a guest / extra player has no house: museum donation is refused until guests get one)";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
         } else if (t->item == (uint16_t)FTR_START(FTR_SUM_ART02) || t->item == (uint16_t)FTR_START(FTR_SUM_ART03)) {
             /* Blathers' own dialogue returns these two paintings (aCR_get_idx_to_donate_art): never a donation */
@@ -14208,6 +14856,13 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
         pcnetgame_txn_reject(peer, idx, slot, in, 0,
                              st->rec_state != PC_NETGAME_RECS_SYNCED ? (uint8_t)PC_NETGAME_TXN_REASON_NOT_SYNCED : (uint8_t)PC_NETGAME_TXN_REASON_BUSY,
                              0, NULL, st->rec_state != PC_NETGAME_RECS_SYNCED ? "resident record not SYNCED" : "host world not ready");
+        return;
+    }
+
+    /* Guests (G1) have no house: a guest slot (idx >= PLAYER_NUM, outside Save_t) is refused HERE, before anything derives a private_data[] / homes[]
+     * index from it (the same reason code as a resident without a house; nothing is journaled, nothing is mutated). */
+    if (idx >= PLAYER_NUM) {
+        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "a guest / extra player has no house: sending mail is refused until guests get one");
         return;
     }
 
@@ -14491,7 +15146,8 @@ static const uint8_t* pcnetgame_mbox_empty_be(void) {
 
 /* Re-reads the 10 slots of resident `idx`'s house mailbox; returns how many slots changed (seq bumped). A resident without a house has no mailbox. */
 static int pcnetgame_mbox_refresh_resident(int idx) {
-    const int h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
+    /* RESIDENT slots only (s_mbox_host / the house lookup are indexed by the host save's resident slot); a guest slot has no mailbox */
+    const int h = (idx >= 0 && idx < PLAYER_NUM) ? pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID) : -1;
     uint8_t be[PC_NETGAME_MAIL_WIRE_SIZE];
     int i, used = 0, changed = 0;
     if (h < 0) {
@@ -14530,6 +15186,9 @@ static int pcnetgame_mbox_refresh_resident(int idx) {
 
 static int pcnetgame_mbox_send(PCNetPeerId peer, int idx, int i) {
     PCNetGameMailboxLetterMsg m;
+    if (idx < 0 || idx >= PLAYER_NUM) {
+        return 0; /* guests (G1) have no house and no mailbox */
+    }
     const PCNetGameMboxHost* X = &s_mbox_host[idx][i];
     const int h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
     if (h < 0 || !X->valid) {
@@ -14632,6 +15291,13 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
         pcnetgame_txn_reject(peer, idx, slot, in, 0,
                              st->rec_state != PC_NETGAME_RECS_SYNCED ? (uint8_t)PC_NETGAME_TXN_REASON_NOT_SYNCED : (uint8_t)PC_NETGAME_TXN_REASON_BUSY,
                              0, NULL, st->rec_state != PC_NETGAME_RECS_SYNCED ? "resident record not SYNCED" : "host world not ready");
+        return;
+    }
+
+    /* Guests (G1) have no house and no mailbox: a guest slot (idx >= PLAYER_NUM) is refused HERE, before anything derives a private_data[] / homes[]
+     * index from it (nothing is journaled, nothing is mutated). */
+    if (idx >= PLAYER_NUM) {
+        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "a guest / extra player has no house and no mailbox: taking mail is refused until guests get one");
         return;
     }
 
@@ -14963,7 +15629,7 @@ static void pcnetgame_mail_test_seed_reply(void) {
  * overwritten by the adopt: the HOST WINS, a loss and never a duplication.
  * FORWARD COMPATIBILITY (transaction recovery D3-6, not implemented): the lineage (base_epoch/base_rev/base_session) is
  * advanced only through pcnetgame_crec_set_base(); uploads carry their own kind (BEGIN.kind 5..255 / ACK.status 11..255 are
- * reserved and ignored here); BEGIN.rsv is sent as 0 (record_class resident); pcnetgame_crec_upload_deferred() is the one
+ * reserved and ignored here); BEGIN.rsv is the record_class (0 resident, 1 when this client sent a guest claim); pcnetgame_crec_upload_deferred() is the one
  * place a later "transaction in COMMIT_SENT" condition would defer uploads. */
 #define PC_NETGAME_CREC_DIGEST_PERIOD_MS 500u
 #define PC_NETGAME_CREC_UPLOAD_GAP_MS    2000u /* min distance between two upload starts (host min gap is 1500 ms) */
@@ -15195,6 +15861,7 @@ static void pcnetgame_crec_pump_upload(void) {
             PCNetGameRecordBeginMsg b;
             memset(&b, 0, sizeof(b));
             b.msg_type = (uint8_t)PC_NETGAME_MSG_RECORD_BEGIN;
+            b.rsv = s_client_guest_claim_sent ? (uint8_t)PC_NETGAME_REC_CLASS_GUEST : (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT; /* record_class */
             b.kind = s_crec.up_kind;
             b.chunk_count = (uint8_t)PC_NETGAME_REC_CHUNK_COUNT;
             b.xfer_id = s_crec.up_xfer;
@@ -18026,12 +18693,19 @@ static void pcnetgame_run_txn_dig_test_hook(void) {
  * accept (ACK -> READY -> roster -> snapshot). Only called with the host world ready. */
 static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     PCNetGameIdentityMsg in = s_host_peer[peer].pending_identity; /* copy: the reset below clears it */
+    PCNetGameIdentityExtMsg ext = s_host_peer[peer].ext;          /* copy: the reset below clears it (guests, G1) */
+    const int ext_guest = s_host_peer[peer].ext_valid && (ext.flags & PC_NETGAME_IDEXT_FLAG_GUEST) != 0;
     PCNetGameTownIdentity peer_town;
     char host_buf[96], peer_buf[96];
     PCNetGameIdentityClass id_class;
     int resident_idx = -1;
     int own_idx;
     int other;
+    int is_guest = 0, guest_slot = -1, guest_new = 0, guest_mode = 0, guest_remint = 0, dup_key;
+    PersonalID_c guest_key;
+    uint8_t guest_token[PC_NETGAME_GUEST_TOKEN_LEN];
+    uint8_t guest_old_token[PC_NETGAME_GUEST_TOKEN_LEN];
+    const char* dup_label;
 
     s_host_peer[peer].identity_pending = 0;
 
@@ -18067,18 +18741,37 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         return;
     }
     if (id_class != PCNETGAME_IDCLASS_RESIDENT) {
-        /* Temporary Stage-1A rule: unknown identities (guests) are refused until guest admission exists. */
-        pcnetgame_host_refuse_identity(peer, "claimed identity matches no resident record of this town", 1);
+        if (!ext_guest) {
+            /* Stage-1A rule (unchanged for a client without a guest claim): unknown identities are refused. */
+            pcnetgame_host_refuse_identity(peer, "claimed identity matches no resident record of this town", 1);
+            return;
+        }
+        /* Guests (G1): UNKNOWN + a valid IDENTITY_EXT guest claim = a guest candidate. The HOST derives everything: the key is checked against
+         * the claim, this town and every resident / house owner, the token against the guest table (pcnetgame_host_guest_check). */
+        if (!pcnetgame_host_guest_check(peer, &in, &ext, &guest_key, &guest_slot, &guest_mode)) {
+            return; /* refused (logged, peer torn down) */
+        }
+        is_guest = 1;
+    } else if (ext_guest) {
+        /* A guest-flagged claim whose IDENTITY matches a resident of this town: the guest path can never claim a resident, and a resident
+         * never sends a guest claim (a client sends IDENTITY_EXT only when it plays a foreigner): refused, not bound as either. */
+        printf("[NET][IDENTITY] host: peer %d sent a GUEST claim but its IDENTITY matches resident %d\n", (int)peer, resident_idx);
+        pcnetgame_host_refuse_identity(peer, "guest-flagged claim matches a resident of this town (a guest can never claim or become a resident)", 0);
         return;
     }
-    own_idx = pcnetgame_host_own_resident_idx();
-    if (own_idx >= 0 && resident_idx == own_idx) {
-        printf("[NET][IDENTITY] host: peer %d claims resident %d, which is the host's own active resident\n", (int)peer,
-               resident_idx);
-        pcnetgame_host_refuse_identity(peer, "claimed resident is the host's own resident", 0);
-        return;
+    if (!is_guest) {
+        own_idx = pcnetgame_host_own_resident_idx();
+        if (own_idx >= 0 && resident_idx == own_idx) {
+            printf("[NET][IDENTITY] host: peer %d claims resident %d, which is the host's own active resident\n", (int)peer,
+                   resident_idx);
+            pcnetgame_host_refuse_identity(peer, "claimed resident is the host's own resident", 0);
+            return;
+        }
     }
-    other = pcnetgame_host_peer_bound_to_resident(resident_idx, peer);
+    other = is_guest ? (guest_slot >= 0 ? pcnetgame_host_peer_bound_to_guest(guest_slot, peer) : -1)
+                     : pcnetgame_host_peer_bound_to_resident(resident_idx, peer);
+    dup_key = is_guest ? PLAYER_NUM + guest_slot : resident_idx;
+    dup_label = is_guest ? "guest slot" : "resident";
     if (other >= 0) {
         /* Stage 1B. A restart from the SAME ip:port reuses its transport slot (pc_net.c) and is reset on
          * PEER_CONNECTED, so it never collides with itself (the scan excludes `peer`). Otherwise: never evict a
@@ -18086,15 +18779,15 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         PCNetGameHostPeerState* pst = &s_host_peer[peer];
         uint32_t park_now = pcnetgame_now_ms();
         int idle_ms = pc_net_peer_idle_ms((PCNetPeerId)other);
-        if (!pst->dup_park_active || pst->dup_park_resident != resident_idx) {
+        if (!pst->dup_park_active || pst->dup_park_resident != dup_key) {
             pst->dup_park_active = 1;
-            pst->dup_park_resident = resident_idx;
+            pst->dup_park_resident = dup_key; /* the record slot of the contested identity (a guest's is PLAYER_NUM + its table slot) */
             pst->dup_park_since_ms = park_now;
             pst->dup_park_logged = 0;
         }
         if (idle_ms >= (int)PC_NETGAME_STALE_PEER_IDLE_MS) {
-            printf("[NET][IDENTITY] host: evicted stale peer %d (resident %d, idle %d ms) for peer %d\n", other,
-                   resident_idx, idle_ms, (int)peer);
+            printf("[NET][IDENTITY] host: evicted stale peer %d (%s %d, idle %d ms) for peer %d\n", other,
+                   dup_label, is_guest ? guest_slot : resident_idx, idle_ms, (int)peer);
             /* Queues PEER_DISCONNECTED for `other`; the event handler runs the one normal teardown (link,
              * reservations, dedup, binding, talk holds, remote actor, scene). The newcomer stays parked and is
              * re-evaluated after that, through this same duplicate check, so it is never admitted early. */
@@ -18103,18 +18796,58 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
             return;
         }
         if ((uint32_t)(park_now - pst->dup_park_since_ms) >= PC_NETGAME_DUP_PARK_MAX_MS) {
-            printf("[NET][IDENTITY] host: peer %d claims resident %d, still bound to live peer %d after %u ms\n",
-                   (int)peer, resident_idx, other, (unsigned)PC_NETGAME_DUP_PARK_MAX_MS);
-            pcnetgame_host_refuse_identity(peer, "claimed resident is already connected on another peer", 0);
+            printf("[NET][IDENTITY] host: peer %d claims %s %d, still bound to live peer %d after %u ms\n",
+                   (int)peer, dup_label, is_guest ? guest_slot : resident_idx, other, (unsigned)PC_NETGAME_DUP_PARK_MAX_MS);
+            pcnetgame_host_refuse_identity(peer, is_guest ? "claimed guest is already connected on another peer"
+                                                          : "claimed resident is already connected on another peer", 0);
             return;
         }
         if (!pst->dup_park_logged) {
             pst->dup_park_logged = 1;
-            printf("[NET][IDENTITY] host: peer %d parked (resident %d live on peer %d, idle %d ms)\n", (int)peer,
-                   resident_idx, other, idle_ms);
+            printf("[NET][IDENTITY] host: peer %d parked (%s %d live on peer %d, idle %d ms)\n", (int)peer,
+                   dup_label, is_guest ? guest_slot : resident_idx, other, idle_ms);
         }
         pst->identity_pending = 1; /* pending_identity is kept; re-evaluated each host poll */
         return;
+    }
+
+    if (is_guest) {
+        if (guest_mode != 1) {
+            /* M3: a token ISSUANCE (first contact of a key, or the re-mint of an unconfirmed entry) is rate limited per source address, BEFORE
+             * anything is minted or evicted; bounded memory (a small ring), refused with a log. */
+            const uint32_t mint_now = pcnetgame_now_ms();
+            const uint32_t mint_ip = pc_net_peer_ip(peer);
+            if (!pcnetgame_guest_mint_allowed(mint_ip, mint_now)) {
+                printf("[NET][GUEST] host: peer %d (address %u.%u.%u.%u) exceeded the first-contact limit (%d new tokens per %u ms) -- refusing\n", (int)peer,
+                       (unsigned)(mint_ip & 0xFFu), (unsigned)((mint_ip >> 8) & 0xFFu), (unsigned)((mint_ip >> 16) & 0xFFu),
+                       (unsigned)((mint_ip >> 24) & 0xFFu), (int)PC_NETGAME_GUEST_MINT_MAX, (unsigned)PC_NETGAME_GUEST_MINT_WINDOW_MS);
+                pcnetgame_host_refuse_identity(peer, "too many new guest tokens requested from this address recently", 0);
+                return;
+            }
+            if (guest_mode == 2) {
+                const int rr = pcnetgame_guest_remint(guest_slot, guest_token, guest_old_token);
+                if (rr != 0) {
+                    pcnetgame_host_refuse_identity(peer, rr == -2 ? "no OS randomness available to mint a guest token"
+                                                               : "the re-minted guest token could not be persisted (guests.dat write failed)", 0);
+                    return;
+                }
+                guest_remint = 1;
+                pcnetgame_guest_mint_note(mint_ip, mint_now);
+            } else {
+                /* FIRST CONTACT of this (town, key): mint the token and make the table entry durable BEFORE anything is sent (trust on first use). */
+                const int cr = pcnetgame_guest_create(&guest_key, &guest_slot, guest_token);
+                if (cr != 0) {
+                    pcnetgame_host_refuse_identity(peer, cr == -1 ? "guest table is full (no room for a new guest)"
+                                                           : cr == -2 ? "no OS randomness available to mint a guest token"
+                                                                      : "the new guest could not be persisted (guests.dat write failed)", 0);
+                    return;
+                }
+                guest_new = 1;
+                pcnetgame_guest_mint_note(mint_ip, mint_now);
+            }
+        } else {
+            memcpy(guest_token, s_guest[guest_slot].token, PC_NETGAME_GUEST_TOKEN_LEN);
+        }
     }
 
     /* Accept. Reset every per-peer cache FIRST (a reused slot inherits nothing), then build state. */
@@ -18138,15 +18871,50 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         if (!pc_net_send(peer, PC_NET_RELIABLE, &ack, (uint16_t)sizeof(ack))) {
             /* Never a half-READY peer: without the ACK the client would never become READY. */
             printf("[NET] host: peer %d IDENTITY_ACK could not be queued -- dropping peer\n", (int)peer);
+            if (guest_new) {
+                pcnetgame_guest_rollback_create(guest_slot); /* the guest never got its token: forget the entry again */
+            } else if (guest_remint) {
+                pcnetgame_guest_remint_rollback(guest_slot, guest_old_token);
+            }
             pcnetgame_host_drop_peer(peer);
             return;
+        }
+        if (is_guest) {
+            PCNetGameIdentityTokenMsg tk;
+            memset(&tk, 0, sizeof(tk));
+            tk.msg_type = (uint8_t)PC_NETGAME_MSG_IDENTITY_TOKEN;
+            tk.flags = (guest_new || guest_remint) ? (uint8_t)PC_NETGAME_IDTOKEN_FLAG_NEW : (uint8_t)PC_NETGAME_IDTOKEN_FLAG_KNOWN;
+            tk.guest_slot = (uint8_t)guest_slot;
+            tk.table_size = (uint8_t)PC_NETGAME_GUEST_MAX;
+            memcpy(tk.token, guest_token, PC_NETGAME_GUEST_TOKEN_LEN);
+            if (!pc_net_send(peer, PC_NET_RELIABLE, &tk, (uint16_t)sizeof(tk))) {
+                printf("[NET] host: peer %d IDENTITY_TOKEN could not be queued -- dropping peer\n", (int)peer);
+                if (guest_new) {
+                    pcnetgame_guest_rollback_create(guest_slot);
+                } else if (guest_remint) {
+                    pcnetgame_guest_remint_rollback(guest_slot, guest_old_token);
+                }
+                pcnetgame_host_drop_peer(peer);
+                return;
+            }
         }
     }
     s_host_peer_link[peer] = PC_NETGAME_LINK_READY;
     s_host_peer[peer].bound_valid = 1;
-    s_host_peer[peer].bound_resident_idx = resident_idx;
-    mPr_CopyPersonalID(&s_host_peer[peer].bound_pid, &Save_Get(private_data)[resident_idx].player_ID);
-    printf("[NET][IDENTITY] host: peer %d bound to resident %d (host-derived)\n", (int)peer, resident_idx);
+    if (is_guest) {
+        s_host_peer[peer].bound_class = (uint8_t)PC_NETGAME_REC_CLASS_GUEST;
+        s_host_peer[peer].bound_resident_idx = -1;
+        s_host_peer[peer].bound_guest_slot = guest_slot;
+        mPr_CopyPersonalID(&s_host_peer[peer].bound_pid, &s_guest[guest_slot].key);
+        s_host_peer[peer].guest_token_verified = (guest_mode == 1) ? 1u : 0u; /* M3: only a connection that PRESENTED the matching token can confirm the entry */
+        printf("[NET][IDENTITY] host: peer %d bound to GUEST slot %d (%s; host-derived, home PersonalID is the key)\n", (int)peer, guest_slot,
+               guest_new ? "first contact: token minted" : guest_remint ? "unconfirmed entry: token re-minted" : "known guest: token verified");
+    } else {
+        s_host_peer[peer].bound_class = (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT;
+        s_host_peer[peer].bound_resident_idx = resident_idx;
+        mPr_CopyPersonalID(&s_host_peer[peer].bound_pid, &Save_Get(private_data)[resident_idx].player_ID);
+        printf("[NET][IDENTITY] host: peer %d bound to resident %d (host-derived)\n", (int)peer, resident_idx);
+    }
     printf("[NET] host: peer %d identity OK (player_id=%u, %s) -> READY\n", (int)peer, (unsigned)in.player_id, peer_buf);
 
     /* Friendship/mail sync milestone: cache this peer's own PersonalID_c fields for the lifetime of
@@ -18182,6 +18950,47 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     /* v2: bootstrap the client's world (initial connect, late join and reconnect all land here). */
     pcnetgame_host_start_snapshot(peer, "joined");
     pcnetgame_host_rec_on_ready(peer); /* D3: AWAIT_HELLO */
+}
+
+/* Guests (G1): IDENTITY_EXT (57) from a peer still in HANDSHAKE, sent BEFORE its IDENTITY. It is only a CLAIM: validated for shape, cached in
+ * the peer state (cleared by the per-peer memset), and used by pcnetgame_host_process_identity() for the guest-admission decision alone. A
+ * message after the IDENTITY (or from a READY / closing peer), a second one, or a malformed one is ignored (the client without a valid claim
+ * is treated exactly like a client that never sent one). */
+static void pcnetgame_handle_host_identity_ext(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    PCNetGameIdentityExtMsg m;
+    const char* why = NULL;
+    if (s_host_peer_link[peer] != PC_NETGAME_LINK_HANDSHAKE || st->identity_pending) {
+        printf("[NET][IDENTITY] host: peer %d IDENTITY_EXT ignored (not before IDENTITY: link state %d)\n", (int)peer, (int)s_host_peer_link[peer]);
+        return;
+    }
+    if (st->ext_valid) {
+        printf("[NET][IDENTITY] host: peer %d second IDENTITY_EXT ignored\n", (int)peer);
+        return;
+    }
+    if (size != sizeof(m)) {
+        why = "wrong size";
+    } else {
+        memcpy(&m, data, sizeof(m));
+        if ((m.flags & ~PC_NETGAME_IDEXT_FLAG_GUEST) != 0 || m._reserved0 != 0 || m._reserved1 != 0 || m.token_present > 1) {
+            why = "reserved / undefined bits set";
+        } else if (m.token_present == 0) {
+            int i;
+            for (i = 0; i < (int)PC_NETGAME_GUEST_TOKEN_LEN; i++) {
+                if (m.token[i] != 0) {
+                    why = "token bytes present without token_present";
+                }
+            }
+        }
+    }
+    if (why != NULL) {
+        printf("[NET][IDENTITY] host: peer %d malformed IDENTITY_EXT ignored (%s)\n", (int)peer, why);
+        return;
+    }
+    st->ext = m;
+    st->ext_valid = 1;
+    printf("[NET][IDENTITY] host: peer %d IDENTITY_EXT cached (guest=%d, token_present=%d)\n", (int)peer,
+           (m.flags & PC_NETGAME_IDEXT_FLAG_GUEST) != 0, (int)m.token_present);
 }
 
 /* v2 host side: an IDENTITY-typed payload from a peer still in HANDSHAKE. The protocol version is
@@ -18249,7 +19058,15 @@ static void pcnetgame_handle_host_player_context(PCNetPeerId peer, const PCNetGa
     /* M9 identity Stage 1A: the peer's claimed player_no is NOT used for anything. ctx.player_no (read only by
      * log lines) holds the HOST-DERIVED bound resident index; a differing claim is warned about once. */
     st->ctx.player_no = (uint8_t)(st->bound_valid ? st->bound_resident_idx : 0);
-    if (st->bound_valid && (int)in->player_no != st->bound_resident_idx && !st->ctx_player_no_warned) {
+    if (st->bound_valid && st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+        /* Guests (G1): a GUEST's host-derived player_no is the foreigner number (PLAYER_NUM == mPr_FOREIGNER), never a resident slot. */
+        st->ctx.player_no = (uint8_t)PLAYER_NUM;
+        if ((int)in->player_no != PLAYER_NUM && !st->ctx_player_no_warned) {
+            st->ctx_player_no_warned = 1;
+            printf("[NET][IDENTITY] host: peer %d PLAYER_CONTEXT claims player_no=%u but is bound as a GUEST (guest slot %d) -- "
+                   "claim ignored\n", (int)peer, (unsigned)in->player_no, st->bound_guest_slot);
+        }
+    } else if (st->bound_valid && (int)in->player_no != st->bound_resident_idx && !st->ctx_player_no_warned) {
         st->ctx_player_no_warned = 1;
         printf("[NET][IDENTITY] host: peer %d PLAYER_CONTEXT claims player_no=%u but is bound to resident %d -- "
                "claim ignored\n", (int)peer, (unsigned)in->player_no, st->bound_resident_idx);
@@ -18406,6 +19223,15 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     if (data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY && size >= 8) {
         pcnetgame_handle_host_identity(peer, data, size);
         return;
+    }
+
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_EXT) {
+        pcnetgame_handle_host_identity_ext(peer, data, size); /* guests (G1): a cached claim, never trusted beyond the admission check */
+        return;
+    }
+
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_TOKEN) {
+        return; /* guests (G1): IDENTITY_TOKEN is host -> client only; a client never originates it. Dropped. */
     }
 
     if (size == sizeof(PCNetGamePlayerContextMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_CONTEXT) {
@@ -18595,7 +19421,119 @@ static void pcnetgame_handle_client_wildlife_snapshot_end(const PCNetGameWildlif
 static void pcnetgame_handle_client_catch_result(const PCNetGameCatchResultMsg* in);
 static void pcnetgame_handle_client_wildlife_despawn(const PCNetGameWildlifeDespawnMsg* in);
 
+/* ===== GUESTS CLIENT BEGIN: the guest claim (IDENTITY_EXT) and the token it holds (IDENTITY_TOKEN, save/mp/guest_token.dat) =====
+ * A client that PLAYS A GUEST (its game identity is a foreigner: Common player_no >= mPr_FOREIGNER, Now_Private = its HOME private) sends
+ * IDENTITY_EXT right before its IDENTITY: the guest flag, its HOME PersonalID (Now_Private->player_ID) and the token this host issued earlier,
+ * looked up in the small client METADATA file save/mp/guest_token.dat by the host TOWN it is about to join (the town identity it already matched
+ * against its own copy of the town) and its home PersonalID. A resident client (player_no < mPr_FOREIGNER) NEVER sends it, so its wire is
+ * exactly the pre-guest one. The file is metadata only: never authoritative for inventory / currency, never a GCI.
+ * IDENTITY_TOKEN (host -> client) carries the token after the ACK: at FIRST CONTACT (no token held) it is persisted (versioned + CRC + atomic
+ * write); when a token was presented it must be IDENTICAL, otherwise this is not the host that issued our token (a reset host table, another
+ * machine hosting a copy of the town, an impostor) and the client REFUSES it: it disconnects and says how to reset. The host is the only
+ * authority on the identity class; this code never decides anything for the host. */
+static PCNetGameIdentityExtMsg s_client_ext_sent;             /* what the IDENTITY_EXT of this connection said (token_present / token) */
+static PCMpGtkFile             s_client_gtk;                  /* the token file, loaded once per process */
+static int                     s_client_gtk_loaded = 0;
+static int                     s_client_gtk_unreadable = 0;
+
+static int pcnetgame_client_is_guest_player(void) {
+    return Now_Private != NULL && (int)Common_Get(player_no) >= (int)mPr_FOREIGNER;
+}
+
+static void pcnetgame_client_gtk_load(void) {
+    if (s_client_gtk_loaded) {
+        return;
+    }
+    s_client_gtk_loaded = 1;
+    (void)pc_mp_gtoken_load(PC_MP_GUEST_TOKEN_PATH, &s_client_gtk, &s_client_gtk_unreadable);
+}
+
+static void pcnetgame_client_build_ext(PCNetGameIdentityExtMsg* m, const PCNetGameTownIdentity* town) {
+    uint8_t home_be[PC_MP_GUEST_PID_SIZE];
+    int i;
+    memset(m, 0, sizeof(*m));
+    m->msg_type = (uint8_t)PC_NETGAME_MSG_IDENTITY_EXT;
+    m->flags = (uint8_t)PC_NETGAME_IDEXT_FLAG_GUEST;
+    memcpy(m->home_player_name, Now_Private->player_ID.player_name, PC_NETGAME_NAME_LEN);
+    memcpy(m->home_land_name, Now_Private->player_ID.land_name, PC_NETGAME_LAND_LEN);
+    m->home_player_id = Now_Private->player_ID.player_id;
+    m->home_land_id = Now_Private->player_ID.land_id;
+    /* the token file keys the home PersonalID in the canonical BE form of the record (the host's file uses the same bytes) */
+    memcpy(home_be, m->home_player_name, PC_NETGAME_NAME_LEN);
+    memcpy(home_be + 8, m->home_land_name, PC_NETGAME_LAND_LEN);
+    home_be[16] = (uint8_t)(m->home_player_id >> 8);
+    home_be[17] = (uint8_t)m->home_player_id;
+    home_be[18] = (uint8_t)(m->home_land_id >> 8);
+    home_be[19] = (uint8_t)m->home_land_id;
+    pcnetgame_client_gtk_load();
+    i = pc_mp_gtoken_find(&s_client_gtk, town->land_name, town->land_id, town->terrain_hash, home_be);
+    if (i >= 0) {
+        m->token_present = 1;
+        memcpy(m->token, s_client_gtk.e[i].token, PC_NETGAME_GUEST_TOKEN_LEN);
+    }
+}
+
+static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t size) {
+    PCNetGameIdentityTokenMsg m;
+    PCMpGtkEntry e;
+    if (size != sizeof(m) || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    memcpy(&m, data, sizeof(m));
+    if (!s_client_guest_claim_sent) {
+        printf("[NET][GUEST] client: IDENTITY_TOKEN ignored (this client did not claim a guest identity)\n");
+        return;
+    }
+    if (s_client_token_received) {
+        /* M2: ONE token per connection, only after our own EXT: a second one (a replayed / injected message) can neither overwrite the stored
+         * token nor shut the client down */
+        printf("[NET][GUEST] client: a second IDENTITY_TOKEN on this connection ignored\n");
+        return;
+    }
+    s_client_token_received = 1;
+    if (s_client_ext_sent.token_present) {
+        if (memcmp(m.token, s_client_ext_sent.token, PC_NETGAME_GUEST_TOKEN_LEN) != 0) {
+            printf("[NET][GUEST] client: *** the host issued a DIFFERENT guest token than the one this client PRESENTED for this town: this is not the "
+                   "host that issued it (its guest table was reset, another machine hosts a copy of the town, or an impostor). REFUSING the host. "
+                   "To start over delete %s and ask the host owner to remove this guest from the host's save/mp/guests.dat ***\n",
+                   PC_MP_GUEST_TOKEN_PATH);
+            pc_net_game_shutdown();
+            return;
+        }
+        printf("[NET][GUEST] client: guest token verified by the host (guest slot %u)\n", (unsigned)m.guest_slot);
+        return;
+    }
+    /* first contact (also: a token from a host this client holds NO token for, e.g. its table was wiped or the entry was re-minted): persist the
+     * token for (host town, home PersonalID) BEFORE anything else depends on it. Only a DIFFERENT token answering a PRESENTED token is refused. */
+    memset(&e, 0, sizeof(e));
+    e.present = 1;
+    memcpy(e.host_land_name, s_client_claimed_town.land_name, PC_NETGAME_LAND_LEN);
+    e.host_land_id = s_client_claimed_town.land_id;
+    e.host_terrain_hash = s_client_claimed_town.terrain_hash;
+    memcpy(e.home_pid, s_client_ext_sent.home_player_name, PC_NETGAME_NAME_LEN);
+    memcpy(e.home_pid + 8, s_client_ext_sent.home_land_name, PC_NETGAME_LAND_LEN);
+    e.home_pid[16] = (uint8_t)(s_client_ext_sent.home_player_id >> 8);
+    e.home_pid[17] = (uint8_t)s_client_ext_sent.home_player_id;
+    e.home_pid[18] = (uint8_t)(s_client_ext_sent.home_land_id >> 8);
+    e.home_pid[19] = (uint8_t)s_client_ext_sent.home_land_id;
+    memcpy(e.token, m.token, PC_NETGAME_GUEST_TOKEN_LEN);
+    pcnetgame_client_gtk_load();
+    (void)pc_mp_gtoken_put(&s_client_gtk, &e);
+    if (pc_mp_gtoken_save(PC_MP_GUEST_TOKEN_PATH, &s_client_gtk) == PC_MP_GST_OK) {
+        printf("[NET][GUEST] client: first contact: guest token (slot %u) saved to %s\n", (unsigned)m.guest_slot, PC_MP_GUEST_TOKEN_PATH);
+    } else {
+        printf("[NET][GUEST] client: *** could NOT save the guest token to %s: the host will refuse this guest on the next visit until the host "
+               "owner removes it from the host's save/mp/guests.dat ***\n", PC_MP_GUEST_TOKEN_PATH);
+    }
+}
+/* ===== GUESTS CLIENT END ===== */
+
 static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
+    if (size >= 1 && data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_TOKEN) {
+        pcnetgame_handle_client_identity_token(data, size); /* guests (G1): inert unless this client sent a guest claim */
+        return;
+    }
+
     if (size >= 1 && data[0] >= (uint8_t)PC_NETGAME_MSG_RECORD_HELLO && data[0] <= (uint8_t)PC_NETGAME_MSG_RECORD_ACK) {
         if (s_client_link == PC_NETGAME_LINK_READY) {
             pcnetgame_handle_client_record(data, size); /* D3 (v8) client half */
@@ -18972,6 +19910,9 @@ static void pcnetgame_reset_client_session_state(void) {
     s_client_host_identity_valid = 0;
     memset(&s_client_host_identity, 0, sizeof(s_client_host_identity));
     s_client_identity_sent = 0;
+    s_client_guest_claim_sent = 0; /* guests (G1): the claim is per connection */
+    s_client_token_received = 0;
+    memset(&s_client_ext_sent, 0, sizeof(s_client_ext_sent));
     s_client_identity_defer_logged = 0;
     memset(&s_client_claimed_town, 0, sizeof(s_client_claimed_town));
     s_client_assigned_peer_id = 0;
@@ -19151,6 +20092,17 @@ static void pcnetgame_client_tick(void) {
             PCNetGameIdentityMsg msg;
             char buf[96];
             pcnetgame_capture_town_identity(&s_client_claimed_town);
+            if (pcnetgame_client_is_guest_player() && !s_client_guest_claim_sent) {
+                /* guests (G1): the guest claim goes out BEFORE the IDENTITY (reliable delivery is ordered); a resident client never takes this branch */
+                PCNetGameIdentityExtMsg ext;
+                pcnetgame_client_build_ext(&ext, &s_client_claimed_town);
+                if (!pc_net_send(0, PC_NET_RELIABLE, &ext, (uint16_t)sizeof(ext))) {
+                    return; /* retried next tick */
+                }
+                s_client_ext_sent = ext;
+                s_client_guest_claim_sent = 1;
+                printf("[NET][GUEST] client: playing a guest -- sent IDENTITY_EXT (token %s)\n", ext.token_present ? "held" : "not held (first contact)");
+            }
             pcnetgame_build_identity_msg(&msg, &s_client_claimed_town);
             if (pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
                 s_client_identity_sent = 1;
@@ -22723,8 +23675,13 @@ static void pcnetgame_handle_host_mail_request(PCNetPeerId peer, const PCNetGame
             return; /* should not happen -- a READY peer is always bound */
         }
         if (memcmp(&mail.header.sender.personalID, &bound_pid, sizeof(bound_pid)) != 0) {
-            printf("[NET][IDENTITY] host: peer %d MAIL_REQUEST sender PersonalID differs from its bound resident %d -- "
-                   "overwritten\n", (int)peer, s_host_peer[peer].bound_resident_idx);
+            if (s_host_peer[peer].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+                printf("[NET][IDENTITY] host: peer %d MAIL_REQUEST sender PersonalID differs from its bound GUEST key (guest slot %d) -- "
+                       "overwritten\n", (int)peer, s_host_peer[peer].bound_guest_slot);
+            } else {
+                printf("[NET][IDENTITY] host: peer %d MAIL_REQUEST sender PersonalID differs from its bound resident %d -- "
+                       "overwritten\n", (int)peer, s_host_peer[peer].bound_resident_idx);
+            }
         }
         mPr_CopyPersonalID(&mail.header.sender.personalID, &bound_pid);
     }

@@ -80,7 +80,9 @@ void VIWaitForRetrace(void) {
      * at most once per process (pc_bootstrap_resident_poll() tracks its own one-shot state). */
     {
         extern void pc_bootstrap_resident_poll(void);
+        extern void pc_bootstrap_guest_poll(void); /* guests G2: --bootstrap-guest (TEST-ONLY, CLIENT only, default off; one-shot like the resident poll) */
         pc_bootstrap_resident_poll();
+        pc_bootstrap_guest_poll();
     }
 
     /* Stage 0.5D: periodic authoritative-town save. Fires only while BOTH:

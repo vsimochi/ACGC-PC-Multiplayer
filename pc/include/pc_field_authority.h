@@ -42,7 +42,8 @@ extern "C" {
 /* 1 once a real save is loaded and Save fg/deposit hold the live town of the current gameplay
  * session. Stateless; see pc_field_authority.c for the exact conditions. Goes to 0 on the title
  * screen, in the player-select / save scenes (where the game (re)loads or (re)initialises Save),
- * and while playing as a travelling foreigner (Save is then another town). */
+ * and while playing as a travelling foreigner (Save is then another town) -- except for a network CLIENT playing a guest in the host's town
+ * (guests G2: the client never travels, its Save is the host's town copy). */
 int      pcfa_save_ready(void);
 
 /* 1 iff the currently loaded field grid aliases Save fg (outdoor town scene). Structural check:

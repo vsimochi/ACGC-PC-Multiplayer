@@ -139,8 +139,9 @@ def main():
     check("S2 the binding is set together with READY (after the ACK was queued), never earlier",
           i_ready < i_bind < i_snap and pi.count("bound_valid = 1") == 1)
     refuse_positions = [m.start() for m in re.finditer(r"pcnetgame_host_refuse_identity\(", pi)]
-    check("S2 every refusal (ambiguous, unknown, host's own, already bound) is issued before the ACK",
-          len(refuse_positions) == 4 and all(p < i_ack for p in refuse_positions))
+    check("S2 every refusal (ambiguous, unknown, guest-flagged claim on a resident, host's own, already bound, guest entry could not be created / re-minted, first-contact rate limit) is issued "
+          "before the ACK (guests G1: 8 refusal sites in process_identity; the guest-claim checks live in pcnetgame_host_guest_check, also before any ACK)",
+          len(refuse_positions) == 8 and all(p < i_ack for p in refuse_positions))
 
     # S3
     cls = func_body(src, "pcnetgame_host_classify_identity")
@@ -194,6 +195,8 @@ def main():
     stmts = [m.group(0).strip() for m in re.finditer(r"[^;{}]*\b(?:ctx\.player_no|ctx->player_no|in->player_no)\b[^;]*;", nc)]
     allowed = ("printf(", "st->ctx.player_no = (uint8_t)(st->bound_valid ? st->bound_resident_idx : 0)",
                "(int)in->player_no != st->bound_resident_idx",
+               # guests G1: a GUEST's host-derived player_no is the constant foreigner number, never a claim
+               "st->ctx.player_no = (uint8_t)PLAYER_NUM", "(int)in->player_no != PLAYER_NUM",
                # client-side capture / change detection / send of ITS OWN context (never the host handler)
                "s_client_last_ctx", "m.player_no = ctx.player_no", "out->player_no = (uint8_t)Common_Get(player_no)")
     bad = [s_[:90] for s_ in stmts if not any(a_ in s_ for a_ in allowed)]
@@ -223,9 +226,11 @@ def main():
     check("S6 MAIL_REQUEST takes the bound PersonalID from the host's own save record (not the claim cache)",
           "pcnetgame_host_bound_personal_id(peer, &bound_pid)" in mail and "ready_" not in strip_comments(mail))
     bp = func_body(src, "pcnetgame_host_bound_personal_id")
-    check("S6 the helper returns the CACHED bind-time bound_pid (no live Save_Get reread), keeps the bound_valid check",
+    slot_fn = func_body(src, "pcnetgame_peer_rec_slot")
+    check("S6 the helper returns the CACHED bind-time bound_pid (no live Save_Get reread) and keeps the bound_valid check (guests G1: through the one "
+          "binding -> slot helper pcnetgame_peer_rec_slot, which holds the bound_valid check and never reads a message)",
           "mPr_CopyPersonalID(out, &s_host_peer[peer].bound_pid)" in bp and "Save_Get" not in bp
-          and "!s_host_peer[peer].bound_valid" in bp)
+          and "pcnetgame_peer_rec_slot(peer)" in bp and "!st->bound_valid" in slot_fn and "Save_Get" not in slot_fn)
     check("S6 bound_pid is set with bound_valid/bound_resident_idx in process_identity",
           0 < pi.find("bound_valid = 1") < pi.find("mPr_CopyPersonalID(&s_host_peer[peer].bound_pid") < pi.find("pcnetgame_host_send_full_roster"))
     fr = func_body(src, "pcnetgame_handle_host_friendship_request")
@@ -321,7 +326,7 @@ def main():
     i_cmp = pi.find(">= (int)PC_NETGAME_STALE_PEER_IDLE_MS")
     i_exp = pi.find("park_now - pst->dup_park_since_ms")
     i_dupref = pi.find("claimed resident is already connected on another peer")
-    i_log_park = pi.find("parked (resident")
+    i_log_park = pi.find("parked (%s %d live")
     check("S11 the host's own-resident refusal stays immediate and precedes the duplicate/park logic",
           0 < i_own < i_dup < i_idle)
     check("S11 eviction happens ONLY inside the `idle >= PC_NETGAME_STALE_PEER_IDLE_MS` branch (one pc_net_evict call, "
@@ -339,15 +344,17 @@ def main():
     check("S11 the refusal after the park window uses the unchanged SERVER_FULL path and only after PC_NETGAME_DUP_PARK_MAX_MS",
           i_cmp < i_exp < i_dupref < i_log_park and re.search(
               r"park_now - pst->dup_park_since_ms\) >= PC_NETGAME_DUP_PARK_MAX_MS\) \{[^}]*"
-              r"pcnetgame_host_refuse_identity\(peer, \"claimed resident is already connected on another peer\", 0\)",
+              r"pcnetgame_host_refuse_identity\(peer, is_guest \? \"claimed guest is already connected on another peer\"\s*:\s*"
+              r"\"claimed resident is already connected on another peer\", 0\)",
               pi, re.S) is not None)
     check("S11 park: identity_pending stays 1 and the function returns (no ACK, no READY, no binding for the newcomer); "
           "the park window state is per peer and cleared by the single memset",
-          re.search(r"pst->identity_pending = 1;[^\n]*\n\s*return;\s*\}\s*\n\s*/\* Accept", pi) is not None
+          re.search(r"pst->identity_pending = 1;[^\n]*\n\s*return;\s*\}\s*\n\s*(?:if \(is_guest\) \{[\s\S]*?\n    \}\s*\n\s*)?/\* Accept", pi) is not None
           and all(k in src for k in ("int                  dup_park_active;", "uint32_t             dup_park_since_ms;")))
     check("S11 park/evict log lines exist; no environment/flag bypass in process_identity",
-          "host: peer %d parked (resident %d live on peer %d, idle %d ms)" in pi
-          and "host: evicted stale peer %d (resident %d, idle %d ms) for peer %d" in pi
+          "host: peer %d parked (%s %d live on peer %d, idle %d ms)" in pi
+          and "host: evicted stale peer %d (%s %d, idle %d ms) for peer %d" in pi
+          and 'dup_label = is_guest ? "guest slot" : "resident";' in pi
           and "getenv" not in pi and "g_pc_" not in pi and "PC_ENHANCEMENTS" not in pi)
     pend = func_body(src, "pcnetgame_host_process_pending_identities")
     check("S11 parked peers are re-evaluated every host poll (process_pending, host poll after the event drain) without "

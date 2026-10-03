@@ -705,28 +705,6 @@ def is_fixture_dir(bin_dir):
     return bool(bin_dir) and os.path.basename(os.path.normpath(bin_dir)).startswith("bin_fixture4")
 
 
-class FixtureSaveGuard:
-    """The 4-resident fixture save is disposable too: the whole save dir is snapshotted at entry and restored (incl. removal of
-    save/mp written by the host's sidecar / early save) on exit."""
-
-    def __init__(self, bin_dir):
-        self.save = os.path.join(bin_dir, "save")
-        self.snap = None
-
-    def __enter__(self):
-        import shutil
-        self.snap = os.path.join(os.environ.get("TEMP", "."), "villager_talk_save_snap_%d" % os.getpid())
-        shutil.copytree(self.save, self.snap)
-        return self
-
-    def __exit__(self, *exc):
-        import shutil
-        shutil.rmtree(self.save, ignore_errors=True)
-        shutil.copytree(self.snap, self.save)
-        shutil.rmtree(self.snap, ignore_errors=True)
-        return False
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7811)
@@ -737,7 +715,7 @@ def main():
     log_dir = os.path.join(HERE, "logs", "client_villager_talk")
     os.makedirs(log_dir, exist_ok=True)
     check = lambda d, c: L.check(d, c, results)
-    with (FixtureSaveGuard(args.bin_dir) if is_fixture_dir(args.bin_dir) else L.CloneSaveGuard(args.bin_dir)):  # disposable saves restored afterwards
+    with L.CloneSaveGuard(args.bin_dir):  # disposable saves restored afterwards
         for i, (name, fn) in enumerate((("C1", c1), ("C2", c2), ("C3", c3), ("H1", h1_h2_h3), ("H1C", h1c_control),
                                         ("H6", h6_killed_client), ("H7", h7_protocol), ("H7E", h7e_expiry),
                                         ("H8", h8), ("H8C", h8c))):

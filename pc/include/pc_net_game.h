@@ -172,6 +172,7 @@ typedef struct PCNetGameTownIdentity {
                                            * their ut_x/ut_z are only town coordinates when it is set */
 typedef struct PCNetPlayerContext {
     uint8_t player_no;    /* Common player_no: resident slot 0..3 (mPr_FOREIGNER etc. never reach READY) */
+    /* (guests G2: a GUEST client does reach READY with player_no == mPr_FOREIGNER; the host never reads this field, it derives the class itself) */
     uint8_t destiny_type; /* Private_c destiny.type (mPr_DESTINY_*) -- fortune/luck */
     uint8_t flags;        /* PC_NETGAME_CTX_FLAG_* */
     int16_t money_power;  /* mPr_GetMoneyPower(): Common money_power + destiny adjustment, clamped */

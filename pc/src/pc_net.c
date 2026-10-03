@@ -104,6 +104,7 @@ int pc_net_is_connected(void) { return 0; }
 int pc_net_peer_count(void) { return 0; }
 void pc_net_disconnect(PCNetPeerId peer) { (void)peer; }
 int pc_net_peer_idle_ms(PCNetPeerId peer) { (void)peer; return -1; }
+uint32_t pc_net_peer_ip(PCNetPeerId peer) { (void)peer; return 0; }
 void pc_net_evict(PCNetPeerId peer) { (void)peer; }
 
 #else /* _WIN32 */
@@ -1115,6 +1116,13 @@ int pc_net_peer_idle_ms(PCNetPeerId peer) {
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_peers[peer].state != PCNET_PEER_CONNECTED) return -1;
     idle = (uint32_t)GetTickCount() - s_peers[peer].last_recv_tick;
     return idle > 0x7FFFFFFFu ? 0 : (int)idle; /* a tick newer than `now` (wrap/ordering) reads as 0 */
+}
+
+/* Guests: the peer's IPv4 address (network byte order) for per-address admission limits; 0 = unknown / not a connected host-side peer. Read-only. */
+uint32_t pc_net_peer_ip(PCNetPeerId peer) {
+    if (s_socket == INVALID_SOCKET || !s_is_host) return 0;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_peers[peer].state != PCNET_PEER_CONNECTED) return 0;
+    return (uint32_t)s_peers[peer].addr.sin_addr.s_addr;
 }
 
 void pc_net_evict(PCNetPeerId peer) {

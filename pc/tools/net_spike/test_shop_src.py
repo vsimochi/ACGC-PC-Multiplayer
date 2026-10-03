@@ -124,9 +124,11 @@ def main():
     check("H the shop mutations exist ONLY in the handler: mSP_PlusSales( twice (buy price, sale value / 2), mSP_ShopSaleReport( once, nothing else in pc_net_game.c writes the shop stock / sales_sum",
           c.count("mSP_PlusSales(") == 2 and c.count("mSP_ShopSaleReport(") == 1 and ts.count("mSP_PlusSales(") == 2 and ts.count("mSP_ShopSaleReport(") == 1
           and "mSP_ShopSaleReport(" not in func_body(shop_region_raw, "pcnetgame_shop_classify"))
-    check("H the host's OWN resident is never written (post-image gate pcnetgame_rec_txn_idx_ok before the first shop mutation) and a guest (idx >= PLAYER_NUM) is refused with NO_DONOR_SLOT",
+    shop_branch = ts[ts.index("if (is_shop) {"):ts.index("} else if (is_donate) {")]
+    check("H the host's OWN resident is never written (post-image gate pcnetgame_rec_txn_idx_ok before the first shop mutation); guests G1: a guest (idx >= PLAYER_NUM) is a FULL participant "
+          "of the shop (NO idx >= PLAYER_NUM refusal in the shop branch; its record is written through the same gate), while the museum donation of a guest stays refused with NO_DONOR_SLOT",
           "!pcnetgame_rec_txn_idx_ok(idx)" in ts and ts.index("!pcnetgame_rec_txn_idx_ok(idx)") < ts.index("mSP_PlusSales(shop_price);")
-          and "if (idx >= PLAYER_NUM) {" in ts and "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT" in ts)
+          and "PLAYER_NUM" not in shop_branch and "idx >= PLAYER_NUM" in ts and "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT" in ts)
     check("H NO RNG and no mPr_ item writer in the SHOP host helpers / handler (the pocket is written raw by pcnetgame_rec_txn_write_inventory with mPr_SET_ITEM_COND values)",
           not re.search(r"\b(RANDOM|rand|qrand|pcnetgame_rec_rand32|fqrand|mPr_Set\w*|mPr_Give\w*|mPr_Clear\w*)\s*\(", shop_region) and "pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)" in ts)
     mut_tokens = ("mSP_PlusSales(", "mSP_ShopSaleReport(", "pcnetgame_rec_txn_write_inventory(", "slot->rev++", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED")

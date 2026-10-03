@@ -172,7 +172,13 @@ int pcfa_save_ready(void) {
     }
 
     if (Common_Get(player_no) >= mPr_FOREIGNER) {
-        return 0; /* travelling: Save currently holds another town (mCD_toNextLand) */
+        /* travelling: Save currently holds another town (mCD_toNextLand). EXCEPT a network CLIENT playing a GUEST (guests G2): a
+         * client never travels (the station save is refused for it, M9-D G4-1), so its Save is the HOST's town copy that the host's
+         * town-identity check already matched, and its Now_Private is its home (foreigner) private. A host or a single-player
+         * process stays "not ready" exactly as before. */
+        if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+            return 0;
+        }
     }
 
     return 1;

@@ -550,8 +550,9 @@ class TransportClient:
     STATE_CONNECTED = "CONNECTED"
     STATE_CLOSED = "CLOSED"
 
-    def __init__(self, label, host_ip, port, hub=None, rto=0.25, bind_port=0, recv_ahead=1024, verbose=False):
+    def __init__(self, label, host_ip, port, hub=None, rto=0.25, bind_port=0, recv_ahead=1024, verbose=False, bind_ip="0.0.0.0"):
         self.label = label
+        self.bind_ip = bind_ip  # local source address (a loopback 127.x.y.z gives the host a distinct peer IP: per-address limits of the guest table)
         self.addr = (socket.gethostbyname(host_ip), int(port))
         self.hub = hub or DEFAULT_HUB
         self.rto = rto
@@ -580,7 +581,7 @@ class TransportClient:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         except OSError:
             pass
-        s.bind(("0.0.0.0", bind_port))
+        s.bind((self.bind_ip, bind_port))
         self.sock = s
 
     @property
@@ -1205,6 +1206,20 @@ PC_NETGAME_MBOX_SLOTS = 10
 PC_NETGAME_MBOX_FLAG_EMPTY = 0x01
 PC_NETGAME_MAIL_WIRE_SIZE = 298
 MAILBOX_LETTER_FMT = "<BBBBIIHH298sH"  # msg_type, house, mbox_idx, flags, seq, digest, used_count, rsv0, letter[298], rsv1 = 316 bytes
+# --- Guests G1 (same v8, extended IN PLACE): IDENTITY_EXT (id 57, client -> host, RELIABLE, 42 B, sent BEFORE the frozen IDENTITY: the guest flag, the guest's HOME
+# PersonalID and the token it holds) and IDENTITY_TOKEN (id 58, host -> the admitted guest only, RELIABLE, 20 B, right after the frozen IDENTITY_ACK: the token + the
+# guest table slot). RECORD_BEGIN.rsv is the record_class (0 resident, 1 guest) in BOTH directions. ---
+PC_NETGAME_MSG_IDENTITY_EXT = 57
+PC_NETGAME_MSG_IDENTITY_TOKEN = 58
+PC_NETGAME_IDEXT_FLAG_GUEST = 0x01
+PC_NETGAME_IDTOKEN_FLAG_NEW = 0x01
+PC_NETGAME_IDTOKEN_FLAG_KNOWN = 0x02
+PC_NETGAME_GUEST_TOKEN_LEN = 16
+PC_NETGAME_GUEST_MAX = 8
+PC_NETGAME_REC_CLASS_RESIDENT = 0
+PC_NETGAME_REC_CLASS_GUEST = 1
+IDENTITY_EXT_FMT = "<BBH8s8sHHB16sB"   # msg_type, flags, rsv0, home_player_name[8], home_land_name[8], home_player_id, home_land_id, token_present, token[16], rsv1 = 42 B
+IDENTITY_TOKEN_FMT = "<BBBB16s"        # msg_type, flags, guest_slot, table_size, token[16] = 20 B
 FIELD_ACTION_REQUEST_FMT = "<BBBBIBBHIIBBHBBHII15HHII"  # PCNetGameFieldActionRequestMsg, 76 bytes (12 B header + the 64 B tag)
 FIELD_ACTION_RESULT_FMT = "<BBBBIHBB"                   # PCNetGameFieldActionResultMsg, 12 bytes
 CATCH_REQUEST_FMT = "<B3xIIIiIIBBHBBHII15HHII"          # PCNetGameCatchRequestMsg, 84 bytes (20 B header + the 64 B tag)
@@ -1577,6 +1592,13 @@ MAILBOX_LETTER_SPEC = build_msg_spec(
     PC_NETGAME_MSG_MAILBOX_LETTER, MAILBOX_LETTER_FMT,
     ["msg_type", "house", "mbox_idx", "flags", "seq", "digest", "used_count", "rsv0", "letter", "rsv1"], "MailboxLetterFields")
 assert MAILBOX_LETTER_SPEC.size == 316 and MAILBOX_LETTER_SPEC.size <= PC_NET_MAX_PAYLOAD
+IDENTITY_EXT_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_IDENTITY_EXT, IDENTITY_EXT_FMT,
+    ["msg_type", "flags", "reserved0", "home_player_name", "home_land_name", "home_player_id", "home_land_id", "token_present", "token",
+     "reserved1"], "IdentityExtFields")
+IDENTITY_TOKEN_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_IDENTITY_TOKEN, IDENTITY_TOKEN_FMT, ["msg_type", "flags", "guest_slot", "table_size", "token"], "IdentityTokenFields")
+assert IDENTITY_EXT_SPEC.size == 42 and IDENTITY_TOKEN_SPEC.size == 20 and max(IDENTITY_EXT_SPEC.size, IDENTITY_TOKEN_SPEC.size) <= PC_NET_MAX_PAYLOAD
 assert PC_NETGAME_TS_BLOB_MAX >= max(PC_NETGAME_TS_POLICE_LEN, PC_NETGAME_TS_MUSEUM_LEN, PC_NETGAME_TS_SHOP_LEN)
 assert struct.calcsize(TXN_TAG_FMT) == 64 and TXN_COMMIT_SPEC.size == 72 and TXN_RESULT_SPEC.size == 76
 assert max(TXN_COMMIT_SPEC.size, TXN_RESULT_SPEC.size) <= PC_NET_MAX_PAYLOAD
@@ -1591,7 +1613,7 @@ GAME_SPECS = {
               FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
               MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC, RECORD_HELLO_SPEC,
               RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC, TOWN_SVC_STATE_SPEC,
-              MAILBOX_LETTER_SPEC)
+              MAILBOX_LETTER_SPEC, IDENTITY_EXT_SPEC, IDENTITY_TOKEN_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
@@ -1861,6 +1883,15 @@ class FakeClient(TransportClient):
     record_auto = True
     record_wait = True
 
+    # Guests G1: a FakeClient with `guest` set plays a GUEST: it sends IDENTITY_EXT (guest flag, its home PersonalID, the token it holds) BEFORE its IDENTITY, claims
+    # the HOST's town + the guest's own name / player id in the IDENTITY, uses `guest_record(...)` as its local record (MIGRATE payload), stamps RECORD_BEGIN.rsv with
+    # record_class GUEST and, like the real client, remembers a token the host sends (IDENTITY_TOKEN, flag NEW) in `guest_token` -- the test double of save/mp/guest_token.dat.
+    guest = None
+    guest_token = None
+    guest_send_ext = True
+    guest_ext_flags = PC_NETGAME_IDEXT_FLAG_GUEST
+    guest_record_img = None
+
     # X1 commit path of an accepted provisional RESULT: "txn" (the DEFAULT since X1b, like the real client: PC_NETGAME_TXN_RETIRE_LEGACY_COMMIT
     # == 1) = TXN_COMMIT + the TXN_RESULT; "legacy" = INTERACT_CONFIRM(COMMIT), which the host now RETIRES (logged, reservation released,
     # nothing mutated) -- kept only so a test can prove exactly that.
@@ -1868,7 +1899,18 @@ class FakeClient(TransportClient):
     txn_pickup_dest = "pocket"   # auto-commit of a pickup in "txn" mode: "pocket" (first free slot) or "wallet"
 
     def __init__(self, label, host_ip, port, town=None, player=None, hub=None, context_flags=DEFAULT_CONTEXT_FLAGS,
-                 wait_snapshot=True, record_hello=None, record_auto=None, record_wait=None, commit_mode=None, **kw):
+                 wait_snapshot=True, record_hello=None, record_auto=None, record_wait=None, commit_mode=None, guest=None,
+                 guest_token=None, guest_record_img=None, guest_send_ext=None, **kw):
+        if guest is not None:
+            self.guest = guest
+            player = player or guest_player(guest)
+            if guest_record_img is not None:
+                self.guest_record_img = guest_record_img
+        if guest_token is not None:
+            self.guest_token = guest_token
+        if guest_send_ext is not None:
+            self.guest_send_ext = guest_send_ext
+        self.token_msgs = []            # (conn, IdentityTokenFields) for EVERY IDENTITY_TOKEN received
         if record_hello is not None:
             self.record_hello = record_hello
         if record_auto is not None:
@@ -2058,6 +2100,17 @@ class FakeClient(TransportClient):
             return resolve_host_town(self.host_ip, self.port, hub=self.hub)
         return ZERO_TOWN
 
+    @property
+    def record_class(self):
+        return PC_NETGAME_REC_CLASS_GUEST if self.guest is not None else PC_NETGAME_REC_CLASS_RESIDENT
+
+    def send_identity_ext(self, token="held", flags=None, raw=None, **kw):
+        """IDENTITY_EXT (guests G1). token: "held" = the token this client holds (guest_token), None = none, or 16 bytes."""
+        if raw is not None:
+            return self.send_reliable(raw)
+        tk = self.guest_token if token == "held" else token
+        return self.send_reliable(build_identity_ext(self.guest, tk, self.guest_ext_flags if flags is None else flags, **kw))
+
     def send_identity(self, protocol_version=None, town=None, player=None):
         payload = build_identity(town if town is not None else self.claimed_town(),
                                  player if player is not None else self.player, protocol_version)
@@ -2084,6 +2137,8 @@ class FakeClient(TransportClient):
         self.assigned_peer_id = None
         self.identity_ack = None
         self.reject = None
+        if self.guest is not None and self.guest_send_ext:
+            self.send_identity_ext()
         self.send_identity(protocol_version=protocol_version, town=self.town_claimed)
         m = self.wait_handshake_reply(timeout)
         if m is None:
@@ -2199,7 +2254,12 @@ class FakeClient(TransportClient):
     # --- D3 record protocol (client side of the wire, as a test double) --------------------------------------
 
     def own_record(self):
-        """This client's resident record as the test GCI holds it (the 'local GCI' a real client would import on MIGRATE)."""
+        """This client's resident record as the test GCI holds it (the 'local GCI' a real client would import on MIGRATE).
+        A GUEST client's is its guest_record (the home record a real foreigner client carries)."""
+        if self.guest is not None:
+            if self.guest_record_img is None:
+                self.guest_record_img = guest_record(self.guest)
+            return self.guest_record_img
         if self.rec_resident_idx is None:
             for i, ident, _ex in read_test_save_residents():
                 if ident.player_id == self.player.player_id and ident.player_name == self.player.player_name:
@@ -2227,7 +2287,9 @@ class FakeClient(TransportClient):
                                               local_digest & U32_MASK, sess, ep, rv))
 
     def send_record_begin(self, kind, xfer_id, epoch, rev, total_size=PC_NETGAME_REC_SIZE, digest=0,
-                          chunk_count=PC_NETGAME_REC_CHUNK_COUNT, rsv=0, host_session=0):
+                          chunk_count=PC_NETGAME_REC_CHUNK_COUNT, rsv=None, host_session=0):
+        if rsv is None:
+            rsv = self.record_class  # RECORD_BEGIN.rsv = record_class (0 resident, 1 guest)
         return self.send_reliable(struct.pack(RECORD_BEGIN_FMT, PC_NETGAME_MSG_RECORD_BEGIN, kind, chunk_count, rsv,
                                               xfer_id & U32_MASK, epoch & U32_MASK, rev & U32_MASK, total_size,
                                               digest & U32_MASK, host_session))
@@ -2252,7 +2314,7 @@ class FakeClient(TransportClient):
         self.rec_xfer_counter += 1
         return self.rec_xfer_counter
 
-    def upload_record(self, data, base=None, kind=PC_NETGAME_REC_KIND_UPLOAD, xfer_id=None, digest=None):
+    def upload_record(self, data, base=None, kind=PC_NETGAME_REC_KIND_UPLOAD, xfer_id=None, digest=None, rsv=None):
         """BEGIN + all chunks of `data` (BE bytes) as client -> host transfer `xfer_id` (default: next id). `base` = (epoch,
         rev) the upload builds on (default: this client's last synced point). `digest` defaults to fnv1a32(data). Returns the
         xfer_id used. Needs no ACK wait: use wait_record_ack(xfer_id)."""
@@ -2265,7 +2327,7 @@ class FakeClient(TransportClient):
         if digest is None:
             digest = fnv1a32(data)
         n = (len(data) + PC_NETGAME_REC_CHUNK_DATA - 1) // PC_NETGAME_REC_CHUNK_DATA
-        self.send_record_begin(kind, xfer_id, base[0], base[1], total_size=len(data), digest=digest, chunk_count=n)
+        self.send_record_begin(kind, xfer_id, base[0], base[1], total_size=len(data), digest=digest, chunk_count=n, rsv=rsv)
         for i in range(n):
             self.send_record_chunk(i, xfer_id, data[i * PC_NETGAME_REC_CHUNK_DATA:(i + 1) * PC_NETGAME_REC_CHUNK_DATA],
                                    length=min(PC_NETGAME_REC_CHUNK_DATA, len(data) - i * PC_NETGAME_REC_CHUNK_DATA),
@@ -2304,7 +2366,7 @@ class FakeClient(TransportClient):
         if g is None or m.conn != self.connect_count:
             return
         if t == PC_NETGAME_MSG_RECORD_BEGIN:
-            self.rec_rx = {"kind": g.kind, "xfer": g.xfer_id, "epoch": g.epoch, "rev": g.rev, "session": g.host_session,
+            self.rec_rx = {"kind": g.kind, "xfer": g.xfer_id, "epoch": g.epoch, "rev": g.rev, "session": g.host_session, "rsv": g.rsv,
                            "digest": g.digest, "count": g.chunk_count, "total": g.total_size, "chunks": {}}
         elif t == PC_NETGAME_MSG_RECORD_CHUNK:
             rx = self.rec_rx
@@ -2692,6 +2754,12 @@ class FakeClient(TransportClient):
         return next((i for i in range(REC_MAIL_COUNT) if i not in skip and record_mail(rec, i)[0x2E] == MAIL_FONT_UNUSED), None)
 
     def on_message(self, m):
+        if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_IDENTITY_TOKEN:
+            g = m.game
+            if g is not None:
+                self.token_msgs.append((m.conn, g))
+                if self.guest is not None and self.guest_token is None and (g.flags & PC_NETGAME_IDTOKEN_FLAG_NEW):
+                    self.guest_token = bytes(g.token)  # first contact: remember it (what the real client persists to save/mp/guest_token.dat)
         if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TOWN_SVC_STATE:
             g = m.game
             if g is not None:
@@ -3322,11 +3390,57 @@ def bin_dir_refusal(bin_dir):
     return None
 
 
+def is_fixture_bin_dir(bin_dir):
+    """The disposable 4-resident fixture dirs (bin_fixture4, bin_fixture4_ambig, bin_fixture4_persist, ...)."""
+    return bool(bin_dir) and os.path.basename(os.path.normpath(bin_dir)).startswith("bin_fixture4")
+
+
+_FIXTURE_AUTO_GUARDS = {}   # normalized fixture bin dir -> temp snapshot of its whole save dir (taken at the first launch from it)
+_SAVE_GUARD_DEPTH = [0]     # explicit CloneSaveGuard contexts currently active
+
+
+def _fixture_snapshot(bin_dir):
+    import shutil
+    import tempfile
+    save = os.path.join(bin_dir, "save")
+    snap = os.path.join(tempfile.gettempdir(), "net_spike_fixture_save_snap_%d_%d" % (os.getpid(), len(_FIXTURE_AUTO_GUARDS)))
+    shutil.rmtree(snap, ignore_errors=True)
+    shutil.copytree(save, snap)
+    return snap
+
+
+def _fixture_restore(bin_dir, snap):
+    """The whole save dir back to the snapshot (so save/mp written by a host / client is removed too), then the snapshot is deleted."""
+    import shutil
+    save = os.path.join(bin_dir, "save")
+    shutil.rmtree(save, ignore_errors=True)
+    shutil.copytree(snap, save)
+    shutil.rmtree(snap, ignore_errors=True)
+
+
+def _auto_fixture_guard(bin_dir):
+    """M4 safety net: the FIRST game launch from a disposable fixture dir snapshots its whole save dir and registers an at-exit restore, so a
+    test that forgot its own guard (or crashed) can no longer leave a mutated fixture behind (a host early-saves / writes save/mp). The
+    snapshot is of the state BEFORE this python process touched the dir; explicit CloneSaveGuard contexts and the tests' own snapshot/restore
+    keep working (they restore the same or an equal state first). Never applies to the live / protected dirs (refused earlier)."""
+    import atexit
+    if not is_fixture_bin_dir(bin_dir) or not os.path.isdir(os.path.join(bin_dir, "save")):
+        return
+    key = _norm_dir(bin_dir)
+    if key in _FIXTURE_AUTO_GUARDS:
+        return
+    snap = _fixture_snapshot(bin_dir)
+    _FIXTURE_AUTO_GUARDS[key] = snap
+    atexit.register(lambda: os.path.isdir(snap) and _fixture_restore(bin_dir, snap))
+
+
 def require_launchable_bin_dir(bin_dir):
-    """Raise RuntimeError (naming the dir) when a host/client game process must not be launched from bin_dir."""
+    """Raise RuntimeError (naming the dir) when a host/client game process must not be launched from bin_dir. A launch from a fixture dir also
+    arms the automatic whole-save snapshot / at-exit restore (_auto_fixture_guard)."""
     msg = bin_dir_refusal(bin_dir)
     if msg:
         raise RuntimeError(msg)
+    _auto_fixture_guard(bin_dir)
 
 
 def require_test_bin_dir():
@@ -3343,24 +3457,34 @@ def require_test_bin_dir():
 
 
 class CloneSaveGuard:
-    """Context manager for runs on the DISPOSABLE bin_talkfix_clone: snapshots its save .gci at entry and, on exit, restores it
-    byte-for-byte and removes save/mp (a host may early-save / accept a migrate upload), so runs stay reproducible. A no-op for
-    any other dir (fixture dirs keep their own handling; the protected/live dirs can never launch a game anyway)."""
+    """Context manager for runs on the DISPOSABLE dirs: bin_talkfix_clone (its save .gci is snapshotted at entry and, on exit, restored
+    byte-for-byte and save/mp removed: a host may early-save / accept a migrate upload) AND every bin_fixture4* fixture dir (M4: the WHOLE
+    save dir is snapshotted at entry and restored on exit, incl. removal of save/mp), so runs stay reproducible. A no-op for any other dir
+    (the protected/live dirs can never launch a game anyway). Replaces the former per-test FixtureSaveGuard."""
 
     def __init__(self, bin_dir=None):
         self.bin_dir = bin_dir or GAME_BIN_DIR
-        self.active = _norm_dir(self.bin_dir) == _norm_dir(CLONE_GAME_BIN_DIR)
+        self.clone = _norm_dir(self.bin_dir) == _norm_dir(CLONE_GAME_BIN_DIR)
+        self.fixture = is_fixture_bin_dir(self.bin_dir) and os.path.isdir(os.path.join(self.bin_dir, "save"))
+        self.active = self.clone or self.fixture
         self.gci = os.path.join(self.bin_dir, SAVE_GCI_REL)
         self.snap = None
+        self.snap_dir = None
 
     def __enter__(self):
-        if self.active and os.path.isfile(self.gci):
+        _SAVE_GUARD_DEPTH[0] += 1
+        if self.fixture:
+            self.snap_dir = _fixture_snapshot(self.bin_dir)
+        elif self.active and os.path.isfile(self.gci):
             with open(self.gci, "rb") as f:
                 self.snap = f.read()
         return self
 
     def __exit__(self, *exc):
-        if self.active and self.snap is not None:
+        _SAVE_GUARD_DEPTH[0] -= 1
+        if self.fixture and self.snap_dir is not None:
+            _fixture_restore(self.bin_dir, self.snap_dir)
+        elif self.active and self.snap is not None:
             import shutil
             with open(self.gci, "wb") as f:
                 f.write(self.snap)
@@ -3641,6 +3765,50 @@ def record_merge_expected(host_be, upload_be):
         if owner in (REC_OWN_CLIENT, REC_OWN_SHARED):
             out[off:off + ln] = upload_be[off:off + ln]
     return bytes(out)
+
+
+# --- Guests G1: a GUEST's identity (home PersonalID) and its record, as test doubles ---------------------------------------
+GuestIdentity = namedtuple("GuestIdentity", "player_name player_id land_name land_id")
+
+
+def guest_identity(name="GUESTA", player_id=0x4A01, land="HOMETWN", land_id=0x5B01):
+    """A guest whose HOME town is not the test town (the default land / ids never equal the fixture's resident or town ids)."""
+    return GuestIdentity(bytes(name.encode("ascii") if isinstance(name, str) else name)[:8].ljust(8, b"\x00"), player_id,
+                         bytes(land.encode("ascii") if isinstance(land, str) else land)[:8].ljust(8, b"\x00"), land_id)
+
+
+def guest_pid_be(g):
+    """The 20-byte canonical BE PersonalID of a GuestIdentity (the first 0x14 bytes of its record image, the guests.dat pid)."""
+    return (bytes(g.player_name)[:8].ljust(8, b"\x00") + bytes(g.land_name)[:8].ljust(8, b"\x00")
+            + struct.pack(">HH", g.player_id & 0xFFFF, g.land_id & 0xFFFF))
+
+
+def guest_player(g):
+    return PlayerIdentity(bytes(g.player_name)[:8].ljust(8, b"\x00"), g.player_id & 0xFFFF, 1)
+
+
+def guest_record(g, base_slot=1, bin_dir=None, base=None):
+    """A LEGAL guest record image: a resident record of the test GCI (default slot 1) re-keyed to the guest's home PersonalID
+    (player_ID replaced, exists stays 1, every other field a field the validators already accept)."""
+    rec = base if base is not None else record_from_gci(bin_dir or GAME_BIN_DIR, base_slot)
+    return guest_pid_be(g) + bytes(rec)[20:]
+
+
+def guest_blank_record(g):
+    """The record the HOST creates at a guest's first contact (rev 0): zeros, player_ID = the guest key (BE), exists = 1. A MIGRATE_UPLOAD
+    then merges the client-owned / shared ranges into it (record_merge_expected(guest_blank_record(g), upload))."""
+    r = bytearray(PC_NETGAME_REC_SIZE)
+    r[0:20] = guest_pid_be(g)
+    r[0x1086] = 1
+    return bytes(r)
+
+
+def build_identity_ext(g, token=None, flags=PC_NETGAME_IDEXT_FLAG_GUEST, rsv0=0, rsv1=0, token_present=None):
+    """IDENTITY_EXT bytes (42 B). token: 16 bytes or None (token_present 0). token_present / rsv overrides let a test send malformed ones."""
+    tp = (1 if token is not None else 0) if token_present is None else token_present
+    return struct.pack(IDENTITY_EXT_FMT, PC_NETGAME_MSG_IDENTITY_EXT, flags & 0xFF, rsv0 & 0xFFFF, bytes(g.player_name)[:8].ljust(8, b"\x00"),
+                       bytes(g.land_name)[:8].ljust(8, b"\x00"), g.player_id & 0xFFFF, g.land_id & 0xFFFF, tp & 0xFF,
+                       bytes(token if token is not None else b"")[:16].ljust(16, b"\x00"), rsv1 & 0xFF)
 
 
 def _init_default_player():

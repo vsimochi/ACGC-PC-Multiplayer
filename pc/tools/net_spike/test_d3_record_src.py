@@ -126,7 +126,7 @@ def main():
     check("I no function of the D3 block other than pcnetgame_rec_merge_into_save writes Save_Get(private_data)[] (offenders: %s)" % others, not others)
     merge = strip_comments(func_body(blk_raw, "pcnetgame_rec_merge_into_save"))
     check("I the single merge helper copies ONLY ranges whose owner == CLIENT (one memcpy, owner test present)",
-          merge.count("memcpy(") == 1 and "owner == PC_NETGAME_REC_OWN_CLIENT || s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_SHARED" in merge and "(uint8_t*)&Save_Get(private_data)[idx]" in merge)
+          merge.count("memcpy(") == 1 and "owner == PC_NETGAME_REC_OWN_CLIENT || s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_SHARED" in merge and "(uint8_t*)pcnetgame_rec_priv_ptr(idx)" in merge and "&Save_Get(private_data)" not in merge)  # guests G1: the destination comes from THE accessor (resident slot or guest-table record)
     check("I the merge is invoked exactly once, from the upload processor, after field validation and base checks",
           blk.count("pcnetgame_rec_merge_into_save(idx,") == 1 and
           func_body(blk_raw, "pcnetgame_rec_process_upload").index("pcnetgame_rec_validate_fields") <
@@ -158,7 +158,7 @@ def main():
           not re.search(r"\b(?:fopen|fwrite|fread|remove|rename|records\.dat|\.gci)\b", blk_no_glue)
           and not re.search(r"\b(?:fopen|fwrite|fread|remove|rename|fclose|_commit|fsync)\b", glue) and "pc_mp_records_load(" in glue and "pc_mp_records_save(" in glue)
     check("I the host-field watcher only reads (digest), the slot lineage lives in static memory (PCNetGameRecSlot)",
-          "static PCNetGameRecSlot s_rec_slot[PLAYER_NUM];" in c_raw and "pcnetgame_rec_hostfield_digest(const Private_c* r)" in blk)
+          "static PCNetGameRecSlot s_rec_slot[PC_NETGAME_REC_SLOTS];" in c_raw and "pcnetgame_rec_hostfield_digest(const Private_c* r)" in blk)
 
     # ------------------------------------------------------------------ O: ownership table
     rows = [(int(a, 16), int(l, 16), o) for a, l, o in re.findall(r"\{\s*(0x[0-9A-Fa-f]+)u,\s*(0x[0-9A-Fa-f]+)u,\s*PC_NETGAME_REC_OWN_(\w+)\s*\}", blk)]
@@ -280,9 +280,11 @@ def main():
                                  "(uint32_t)in->len != want", "s_crec.rx_got & (uint16_t)(1u << in->chunk_idx)", "in->xfer_id <= s_crec.rx_last_xfer",
                                  "s_crec.rx_open = 0;"))
           and "a new BEGIN aborts an open transfer" in cli_raw and "pcnetgame_fnv1a32(s_crec_rx, PC_NETGAME_REC_SIZE)" in cli and "s_crec.rx_digest" in cli)
-    check("C only push kinds accepted from the host (client-only/unknown kind dropped); client sends BEGIN with host_session 0 and rsv 0",
+    check("C only push kinds accepted from the host (client-only/unknown kind dropped); client sends BEGIN with host_session 0 and rsv = the record_class "
+          "(RESIDENT = 0 unless this client sent a guest claim: guests G1 pins that the resident wire is unchanged)",
           "in->kind != PC_NETGAME_REC_KIND_PUSH_FULL && in->kind != PC_NETGAME_REC_KIND_PUSH_HOSTFIELDS" in cli
-          and "b.host_session = 0;" in cli and "b.rsv" not in cli)
+          and "b.host_session = 0;" in cli
+          and "b.rsv = s_client_guest_claim_sent ? (uint8_t)PC_NETGAME_REC_CLASS_GUEST : (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT;" in cli)
     sends = re.findall(r"pc_net_send\(0,\s*(\w+)", cli)
     check("C every client record send is RELIABLE (%d sends)" % len(sends), len(sends) >= 4 and all(x == "PC_NET_RELIABLE" for x in sends))
     blocker = func_body(c_raw, "pcnetgame_crec_adopt_blocker")
@@ -386,16 +388,18 @@ def main():
     rf = func_body(blk_raw, "pcnetgame_rec_refresh_hostfields")
     check("R refresh: only for a synced slot (rev > 0), on a digest change rev++ + hf_pending + dirty; the merge recomputes the digest (an accepted upload never self-bumps)",
           "s->rev == 0" in rf and "s->rev++" in rf and "s->hf_pending = 1" in rf
-          and "slot->hf_digest = pcnetgame_rec_hostfield_digest(&Save_Get(private_data)[idx]);" in pu
+          and "slot->hf_digest = pcnetgame_rec_hostfield_digest(pcnetgame_rec_priv_ptr(idx));" in pu
           and pu.index("pcnetgame_rec_merge_into_save(idx,") < pu.index("slot->hf_digest = pcnetgame_rec_hostfield_digest"))
     hh = func_body(blk_raw, "pcnetgame_rec_handle_hello")
     check("R HELLO: reserved-zero rule (_reserved0 / undefined flags -> BAD_SHAPE detail 6, no violation) and the digest refresh before the continuation decision",
           "in->_reserved0 != 0 || (in->flags & ~PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST) != 0" in hh and "PC_NETGAME_REC_ACK_BAD_SHAPE, 6" in hh
           and hh.index("pcnetgame_rec_refresh_hostfields(idx, slot)") < hh.index("in->last_host_session == s_rec_host_session"))
     hb = func_body(blk_raw, "pcnetgame_rec_handle_begin")
-    check("R BEGIN.rsv != 0 is refused: refuse_xfer + BAD_SHAPE detail 5, WITHOUT a violation (record_class seam enforced)",
-          "if (in->rsv != 0) {" in hb and "PC_NETGAME_REC_ACK_BAD_SHAPE, 5" in hb
-          and "pcnetgame_rec_violation(" not in hb[hb.index("if (in->rsv != 0) {"):hb.index("if (in->rsv != 0) {") + 400])
+    rsv_at = hb.index("if (in->rsv != (st->bound_class")
+    check("R BEGIN.rsv != the connection's host-derived record_class (0 resident, 1 guest) is refused: refuse_xfer + BAD_SHAPE detail 5, WITHOUT a violation "
+          "(a resident connection sending the guest class, or vice versa, is refused)",
+          "if (in->rsv != (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST ? (uint8_t)PC_NETGAME_REC_CLASS_GUEST : (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT)) {" in hb
+          and "PC_NETGAME_REC_ACK_BAD_SHAPE, 5" in hb and "pcnetgame_rec_violation(" not in hb[rsv_at:rsv_at + 900])
     tk = func_body(blk_raw, "pcnetgame_host_record_tick")
     check("R an upload timeout calls pcnetgame_rec_refuse_xfer(st, st->up_xfer) so late chunks are absorbed, not violations",
           "pcnetgame_rec_refuse_xfer(st, st->up_xfer)" in tk and tk.index("pcnetgame_rec_refuse_xfer(st, st->up_xfer)") < tk.index("st->up_open = 0;", tk.index("timed out")))
@@ -471,8 +475,8 @@ def main():
           re.search(r"s_rec_resolved = 1;\s*if \(first_untrusted_pass\) \{[^}]*pcnetgame_rec_store_write\(\"UNTRUSTED decision persisted immediately\", NULL\)", resolve, re.S) is not None
           and "count_corrupt_siblings(path" in store_c and "inf->mode = PC_MP_REC_LOAD_UNTRUSTED;" in store_c.split("count_corrupt_siblings(path")[1])
     check("P LOW-b: while the last sidecar write failed/was skipped (s_rec_store_last_failed) a FIRST migration (rev 0 HELLO) is refused with BUSY; cleared by the next successful write",
-          "if (slot->rev == 0 && s_rec_store_last_failed) {" in func_body(blk_raw, "pcnetgame_rec_handle_hello")
-          and "PC_NETGAME_REC_ACK_BUSY" in func_body(blk_raw, "pcnetgame_rec_handle_hello").split("s_rec_store_last_failed) {")[1][:900]
+          "if (slot->rev == 0 && (idx >= PLAYER_NUM ? s_guest_store_last_failed : s_rec_store_last_failed)) {" in func_body(blk_raw, "pcnetgame_rec_handle_hello")
+          and "PC_NETGAME_REC_ACK_BUSY" in func_body(blk_raw, "pcnetgame_rec_handle_hello").split("s_rec_store_last_failed)) {")[1][:900]
           and store_write.count("s_rec_store_last_failed = 1;") == 2 and "s_rec_store_last_failed = 0;" in store_write)
     check("P latch: the coalesce branch of pcnetgame_rec_store_write clears s_rec_store_last_failed (s_rec_file mirrors the last durable write: set only by a successful load or save) so a failed write cannot stick the first-migration BUSY refusal for the whole process",
           re.search(r"memcmp\(nf\.e, s_rec_file\.e, sizeof\(nf\.e\)\) == 0\) \{[^}]*s_rec_store_last_failed = 0;[^}]*return 1;", store_write, re.S) is not None

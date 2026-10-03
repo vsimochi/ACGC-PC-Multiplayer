@@ -1165,6 +1165,156 @@ void pc_bootstrap_resident_poll(void) {
              player_no);
 }
 
+/* Guests G2: parses "NAME,LAND,PLAYER_ID,LAND_ID" (NAME / LAND 1..8 chars, space padded like every vanilla name; ids decimal or 0x hex, 1..0xFFFE). */
+static int pc_guest_parse_spec(const char* spec, PersonalID_c* out) {
+    char buf[96];
+    char* tok[4];
+    char* p;
+    int n = 0;
+    unsigned long pid, lid;
+    char* end;
+    size_t len;
+    size_t k;
+
+    if (spec == NULL || strlen(spec) >= sizeof(buf)) {
+        return 0;
+    }
+    strcpy(buf, spec);
+    p = buf;
+    tok[n++] = p;
+    while (*p != '\0') {
+        if (*p == ',') {
+            *p = '\0';
+            if (n >= 4) {
+                return 0;
+            }
+            tok[n++] = p + 1;
+        }
+        p++;
+    }
+    if (n != 4) {
+        return 0;
+    }
+    len = strlen(tok[0]);
+    if (len < 1 || len > PLAYER_NAME_LEN) {
+        return 0;
+    }
+    memset(out->player_name, ' ', PLAYER_NAME_LEN);
+    for (k = 0; k < len; k++) {
+        out->player_name[k] = (u8)tok[0][k];
+    }
+    len = strlen(tok[1]);
+    if (len < 1 || len > LAND_NAME_SIZE) {
+        return 0;
+    }
+    memset(out->land_name, ' ', LAND_NAME_SIZE);
+    for (k = 0; k < len; k++) {
+        out->land_name[k] = (u8)tok[1][k];
+    }
+    pid = strtoul(tok[2], &end, 0);
+    if (*tok[2] == '\0' || *end != '\0' || pid == 0 || pid >= 0xFFFFul) {
+        return 0;
+    }
+    lid = strtoul(tok[3], &end, 0);
+    if (*tok[3] == '\0' || *end != '\0' || lid == 0 || lid >= 0xFFFFul) {
+        return 0;
+    }
+    out->player_id = (u16)pid;
+    out->land_id = (u16)lid;
+    return 1;
+}
+
+/* Guests G2: --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID (see pc_main.c). TEST-ONLY, default off, CLIENT role only (refused otherwise): makes THIS process a
+ * GUEST -- a foreigner whose HOME PersonalID is the given one -- in the town it loaded, the state a vanilla train arrival leaves (mCD_InitGameStart_bg,
+ * start_cond INCOMING_FOREIGNER: now_private = the passport, player_no = mPr_FOREIGNER, mSDI_StartDataInit(.., MODE_PAK)), and spawns it at the station
+ * exactly like the restart NPC's type 1 / 2 entry (aNPS2_make_door_data: SCENE_FG at (1979, 760), RIDE_OFF_DEMO, circle wipe). The passport is a COPY of
+ * the first existing resident record of the loaded town, re-keyed to the guest's HOME PersonalID (a synthetic visitor: its pockets / wallet are that
+ * resident's, which is what the host's first-contact MIGRATE then imports). Same one-shot / readiness preconditions as pc_bootstrap_resident_poll().
+ * It NEVER arms pc_save_ready (a guest process can write no save at all), never touches Save_t's private_data[], and fires at most once per process. */
+void pc_bootstrap_guest_poll(void) {
+    extern const char* g_pc_bootstrap_guest; /* pc_main.c; NULL = disabled (default) */
+    static int l_done = 0;
+    PersonalID_c home;
+    Private_c* tmpl = NULL;
+    Private_c* pass;
+    GAME_PLAY* play;
+    Door_data_c door_data;
+    int i;
+
+    if (l_done || g_pc_bootstrap_guest == NULL) {
+        return;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return;
+    }
+    if (((GAME_PLAY*)gamePT)->fb_wipe_mode != WIPE_MODE_NONE) {
+        return; /* same wipe wait as the resident bootstrap (goto_other_scene refuses while a wipe runs) */
+    }
+    l_done = 1;
+
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        OSReport("[PC] --bootstrap-guest: refused (a CLIENT-only test hook)\n");
+        return;
+    }
+    if (mFRm_CheckSaveData() == FALSE) {
+        OSReport("[PC] --bootstrap-guest: no valid town save is loaded\n");
+        return;
+    }
+    if (!pc_guest_parse_spec(g_pc_bootstrap_guest, &home)) {
+        OSReport("[PC] --bootstrap-guest: bad spec '%s' (expected NAME,LAND,PLAYER_ID,LAND_ID)\n", g_pc_bootstrap_guest);
+        return;
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        Private_c* p = Save_GetPointer(private_data[i]);
+        if (mPr_CheckPrivate(p) == TRUE && p->exists == TRUE) {
+            tmpl = p;
+            break;
+        }
+    }
+    if (tmpl == NULL) {
+        OSReport("[PC] --bootstrap-guest: the loaded town has no resident record to use as the passport template\n");
+        return;
+    }
+    memset(&l_mcd_foreigner_file, 0, sizeof(l_mcd_foreigner_file));
+    pass = &l_mcd_foreigner_file.file.priv;
+    mPr_CopyPrivateInfo(pass, tmpl);
+    mPr_CopyPersonalID(&pass->player_ID, &home);
+    pass->exists = TRUE;
+    pass->reset_code = 0;
+    l_mcd_foreigner_file.file.copy_protect = (u16)Common_Get(copy_protect);
+
+    Common_Set(time.rtc_enabled, TRUE); /* see pc_bootstrap_resident_poll() */
+    Common_Set(now_private, pass);
+    Common_Set(player_no, mPr_FOREIGNER);
+    if (mSDI_StartDataInit(gamePT, mPr_FOREIGNER, mSDI_INIT_MODE_PAK) != TRUE) {
+        OSReport("[PC] --bootstrap-guest: mSDI_StartDataInit failed\n");
+        return;
+    }
+    /* pc_save_ready is deliberately NOT armed: this process can never write a save. */
+
+    play = (GAME_PLAY*)gamePT;
+    door_data.next_scene_id = SCENE_FG;
+    door_data.exit_orientation = mSc_DIRECT_SOUTH;
+    door_data.exit_type = 0;
+    door_data.extra_data = 0;
+    door_data.exit_position.x = 1979;
+    door_data.exit_position.y = 0;
+    door_data.exit_position.z = 760;
+    door_data.door_actor_name = EMPTY_NO;
+    door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
+    Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
+    Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
+    {
+        int scene_res = goto_other_scene(play, &door_data, TRUE);
+        if (scene_res != TRUE) {
+            OSReport("[PC] --bootstrap-guest: goto_other_scene to SCENE_FG (station) failed (res=%d)\n", scene_res);
+            return;
+        }
+    }
+    OSReport("[PC] --bootstrap-guest: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the station (SCENE_FG)\n",
+             (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id);
+}
+
 void mCD_LoadLand(void) {
     (void)pc_save_loaded;
 }
