@@ -289,6 +289,15 @@ static void aPOL2_set_norm_talk_info_message_ctrl(ACTOR* actorx) {
     mDemo_Set_msg_num(msg_no);
 }
 
+#ifdef TARGET_PC
+/* Town services: the client's claim transaction is begun and its answer awaited; the (lost-and-found slot, item, pocket slot) of THAT claim are
+ * remembered here because the host mirror may rewrite / compact keep_items before the answer is polled. */
+static int aPOL2_ts_waiting = FALSE;
+static mActor_name_t aPOL2_ts_item = EMPTY_NO;
+static int aPOL2_ts_idx = -1;
+static int aPOL2_ts_slot = -1;
+#endif
+
 static void aPOL2_message_ctrl(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
     ACTOR* playerx = GET_PLAYER_ACTOR_ACTOR(play);
 
@@ -308,6 +317,11 @@ static void aPOL2_message_ctrl(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
                 if (item != EMPTY_NO) {
                     mDemo_Request(mDemo_TYPE_SPEAK, actorx, aPOL2_set_force_talk_info_message_ctrl);
                     actor->item_idx = idx;
+#ifdef TARGET_PC
+                    aPOL2_ts_waiting = FALSE; /* a new claim dialogue: never inherit the wait state of an abandoned one */
+                    aPOL2_ts_idx = idx;       /* the (index, item) the player POINTED AT: the claim uses these, never a re-read of the mirror */
+                    aPOL2_ts_item = item;
+#endif
                     return;
                 }
             }
@@ -329,6 +343,9 @@ static void aPOL2_player_getout_check(GAME_PLAY* play, ACTOR* playerx) {
         if (item == EXIT_DOOR1) {
             mBGMPsComp_scene_mode(14);
             mBGMPsComp_make_ps_wipe(0x195);
+#ifdef TARGET_PC
+            if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) /* a client's keep_items is the host's mirror: compacting it would diverge from the host's indices */
+#endif
             mPB_copy_itemBuf(Save_Get(police_box).keep_items);
             goto_other_scene(play, Common_GetPointer(structure_exit_door_data), TRUE);
         }
@@ -453,13 +470,45 @@ static void aPOL2_check_answer(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
             case mChoice_CHOICE0: {
                 mActor_name_t* item_p = &Save_Get(police_box).keep_items[actor->item_idx];
                 int idx;
-
 #ifdef TARGET_PC
-                /* Stage 0 safe degrade: a network CLIENT's claim would only move the item into its local pockets and
-                 * clear its local copy of the host-owned lost & found (duplication). Take the existing "cannot take it"
-                 * (idx == -1, msg 0x0781) refusal: nothing is removed, the dialogue ends through the normal fall-through. */
+                int claimed_remote = FALSE;
+
+                /* Town services (replaces the Stage 0 refusal): on a network CLIENT the claim is a host-authoritative
+                 * transaction -- (lost-and-found slot, EXPECTED item, free pocket slot). The host verifies keep_items[slot] ==
+                 * expected (the array compacts, so an index alone is never trusted), removes it, and puts the item into the
+                 * resident's pocket post-image; the client's pocket changes ONLY on APPLIED and its local lost-and-found copy only
+                 * through the TOWN_SVC_STATE mirror. While the answer is pending this state waits (nothing changes, re-polled
+                 * every frame). REJECTED (someone else took it first / the item moved) takes the existing 0x0781 refusal. Tickets
+                 * and paper do not stack into an existing pocket stack for a client (a plain free slot is used). */
                 if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                    int ts_res = PC_NETGAME_TS_OP_REJECTED;
+
                     idx = -1;
+                    if (!aPOL2_ts_waiting) {
+                        int free_slot = mPlib_Get_space_putin_item();
+
+                        if (free_slot != -1) {
+                            int ts_begin;
+
+                            aPOL2_ts_slot = free_slot;
+                            ts_begin = pc_net_game_ts_begin_police_claim(free_slot, aPOL2_ts_idx, (int)aPOL2_ts_item);
+                            if (ts_begin < 0) {
+                                return; /* another pocket transaction is unresolved: ask again next frame */
+                            }
+                            aPOL2_ts_waiting = (ts_begin > 0) ? TRUE : FALSE;
+                        }
+                    }
+                    if (aPOL2_ts_waiting) {
+                        ts_res = pc_net_game_ts_poll();
+                        if (ts_res == PC_NETGAME_TS_OP_PENDING) {
+                            return; /* waiting for the host: no state change, no stuck UI */
+                        }
+                        aPOL2_ts_waiting = FALSE;
+                    }
+                    if (ts_res == PC_NETGAME_TS_OP_APPLIED) {
+                        claimed_remote = TRUE;
+                        idx = 0; /* not -1: take the "here you go" branch below (the pocket is already filled by the host post-image) */
+                    }
                 } else
 #endif
                 if (ITEM_NAME_GET_TYPE(*item_p) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT(*item_p) == ITEM1_CAT_TICKET) {
@@ -467,6 +516,11 @@ static void aPOL2_check_answer(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
                 } else {
                     idx = mPlib_Get_space_putin_item();
                 }
+#ifdef TARGET_PC
+                if (!claimed_remote && *item_p == EMPTY_NO) {
+                    idx = -1; /* the slot emptied under the dialogue (a client claimed it): refuse, never "here you go" for nothing */
+                }
+#endif
 
                 if (idx == -1) {
                     mMsg_Set_continue_msg_num(msg_p, 0x0781);
@@ -475,8 +529,13 @@ static void aPOL2_check_answer(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
                     ACTOR* playerx = GET_PLAYER_ACTOR_ACTOR(play);
 
                     mFI_SetFG_common(RSV_NO, dummy_pos, TRUE);
-                    mPr_SetPossessionItem(Now_Private, idx, *item_p, mPr_ITEM_COND_NORMAL);
-                    Save_Get(police_box).keep_items[actor->item_idx] = EMPTY_NO;
+#ifdef TARGET_PC
+                    if (!claimed_remote) /* a client's pocket and its lost-and-found copy were already updated by the host transaction / mirror */
+#endif
+                    {
+                        mPr_SetPossessionItem(Now_Private, idx, *item_p, mPr_ITEM_COND_NORMAL);
+                        Save_Get(police_box).keep_items[actor->item_idx] = EMPTY_NO;
+                    }
                     sAdo_OngenTrgStart(NA_SE_ITEM_GET, &playerx->world.position);
                 }
             }

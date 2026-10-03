@@ -91,8 +91,8 @@ def main():
           and len(L.build_field_action_request(1, 2, 3, 4)) == 76 and len(L.build_catch_request(1, 2, 3, 4)) == 84)
     for name, ids in (("FIELD_ACTION", (29, 30)), ("CATCH", (41, 42))):
         enum = c_raw[c_raw.index("typedef enum PCNetGameMsgType {"):c_raw.index("} PCNetGameMsgType;")]
-        check(f"W the message ids of {name} are unchanged ({ids}): no new message id was added by X3",
-              all(re.search(r"PC_NETGAME_MSG_%s_(?:REQUEST|RESULT)\s*=\s*%d," % (name, i), enum) for i in ids) and wire_baseline.EXPECTED_MAX_MSG_ID == 52)
+        check(f"W the message ids of {name} are unchanged ({ids}): no new message id was added by X3 (the max id 55 is the town-services milestone)",
+              all(re.search(r"PC_NETGAME_MSG_%s_(?:REQUEST|RESULT)\s*=\s*%d," % (name, i), enum) for i in ids) and wire_baseline.EXPECTED_MAX_MSG_ID == 55)  # X3 added no id; 53 / 54 (reserved X2) + 55 (TOWN_SVC_STATE) came with town services
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     check("W wire_baseline (pins the two grown structs EXACTLY, everything else identical to HEAD): all %d checks green" % len(wb), wb and all(x[1] for x in wb))

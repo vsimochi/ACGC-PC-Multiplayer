@@ -622,6 +622,11 @@ typedef struct {
     int talk_act;
 } aCR_donate_act_c;
 
+#ifdef TARGET_PC
+/* Town services: TRUE while this client's museum donation transaction is begun and its answer is still awaited (see aCR_msg_win_open_wait). */
+static int aCR_ts_waiting = FALSE;
+#endif
+
 static void aCR_msg_win_open_wait(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
     static aCR_donate_act_c donate_act[] = {
         { 0x2F63, aCR_TALK_END_WAIT },
@@ -681,12 +686,37 @@ static void aCR_msg_win_open_wait(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
             aCR_set_item_name_str(item);
 
 #ifdef TARGET_PC
-            /* Stage 0 safe degrade: rows 16..27 are the "accept and put away" outcomes. Save_t.museum_display is
-             * host-owned and not replicated (v7), so a network CLIENT's donation would set a local bit and delete the
-             * item from its pocket for nothing. Use row 2 (the item Blathers does not take: msg 0x2F64 + return demo),
-             * so the item is handed back through the existing return path and the dialogue continues normally. */
+            /* Town services (replaces the Stage 0 give-back): rows 16..27 are the "accept and put away" outcomes. On a
+             * network CLIENT the donation is a host-authoritative transaction: the host validates the item, credits the
+             * museum (the donor is the bound resident), removes the item from the pocket and mirrors Save_t.museum_display
+             * to every player. While the transaction is pending this state simply waits (neutral: nothing changes, the
+             * window stays up); APPLIED proceeds through the existing put-away rows (the pocket was already emptied by the
+             * host post-image, so the put-away init below stays a no-op for a client); REJECTED (already donated by someone
+             * else in the meantime, not a donation, host busy / unreachable) takes row 2, the existing give-back path, and
+             * the item stays in the pocket. */
             if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && act_idx >= 16) {
-                act_idx = 2;
+                if (!aCR_ts_waiting) {
+                    int ts_begin = pc_net_game_ts_begin_museum_donate(play->submenu.item_p->slot_no, (int)item);
+
+                    if (ts_begin < 0) {
+                        return; /* another pocket transaction is unresolved: ask again next frame */
+                    }
+                    aCR_ts_waiting = (ts_begin > 0) ? TRUE : FALSE;
+                    if (!aCR_ts_waiting) {
+                        act_idx = 2;
+                    }
+                }
+                if (aCR_ts_waiting) {
+                    int ts_res = pc_net_game_ts_poll();
+
+                    if (ts_res == PC_NETGAME_TS_OP_PENDING) {
+                        return; /* waiting for the host: no state change, no stuck UI (re-polled every frame) */
+                    }
+                    aCR_ts_waiting = FALSE;
+                    if (ts_res != PC_NETGAME_TS_OP_APPLIED) {
+                        act_idx = 2;
+                    }
+                }
             }
 #endif
         }
@@ -850,6 +880,9 @@ static void aCR_msg_win_close_wait_init(NPC_CURATOR_ACTOR* curator, GAME_PLAY* p
 }
 
 static void aCR_menu_close_wait_init(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    aCR_ts_waiting = FALSE; /* a new offer: never inherit the wait state of an abandoned dialogue */
+#endif
     mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_CURATOR, 0);
 }
 
@@ -873,8 +906,9 @@ static void aCR_putaway_demo_end_wait_init(NPC_CURATOR_ACTOR* curator, GAME_PLAY
     Submenu_Item_c* sm_item_p = play->submenu.item_p;
 
 #ifdef TARGET_PC
-    /* Stage 0 safe degrade (defense in depth; aCR_msg_win_open_wait already routes a client to the return path):
-     * never commit a donation or empty the pocket on a network CLIENT. */
+    /* Town services: a network CLIENT never commits the museum bit or empties the pocket here. Its donation already went through the
+     * host transaction in aCR_msg_win_open_wait (the host wrote museum_display and the pocket post-image; the mirror arrives as
+     * TOWN_SVC_STATE), so the vanilla local commit below would be a duplicate. */
     if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT)
 #endif
     if (mMmd_RequestMuseumDisplay(sm_item_p->item) == TRUE) {

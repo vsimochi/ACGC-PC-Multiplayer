@@ -1138,6 +1138,10 @@ PC_NETGAME_TXN_REASON_BAD_SHAPE = 11
 PC_NETGAME_TXN_REASON_BUSY = 12
 PC_NETGAME_TXN_REASON_FAULT = 13
 PC_NETGAME_TXN_REASON_REPLAYED = 14   # informational, on APPLIED replays
+PC_NETGAME_TXN_REASON_ALREADY_DONATED = 15   # town services: the museum already holds the exhibit (the client keeps the item)
+PC_NETGAME_TXN_REASON_NOT_AVAILABLE = 16     # town services: the lost-and-found (slot, expected item) no longer matches
+PC_NETGAME_TXN_REASON_NOT_DONATABLE = 17     # town services: not a museum donation (vanilla predicate)
+PC_NETGAME_TXN_REASON_NO_DONOR_SLOT = 18     # town services: the bound resident has no museum donor slot (guest / extra player)
 PC_NETGAME_TXN_RING = 16              # host journal entries per resident
 PC_NETGAME_TXN_FENCED_NUM = 4         # fenced nonces remembered per resident
 TXN_TAG_FMT = "<IIBBHBBHII15HHII"       # PCNetGameTxnTag, 64 bytes
@@ -1145,7 +1149,7 @@ TXN_COMMIT_FMT = "<BBHIIIBBHBBHII15HHII"  # PCNetGameTxnCommitMsg, 72 bytes
 TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHII"  # PCNetGameTxnResultMsg, 76 bytes
 TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED", 4: "NOT_SYNCED", 5: "NOT_BOUND", 6: "FENCED",
                     7: "CONFLICT", 8: "BAD_IMAGE", 9: "PRECOND", 10: "STALE_IMAGE", 11: "BAD_SHAPE", 12: "BUSY", 13: "FAULT",
-                    14: "REPLAYED"}
+                    14: "REPLAYED", 15: "ALREADY_DONATED", 16: "NOT_AVAILABLE", 17: "NOT_DONATABLE", 18: "NO_DONOR_SLOT"}
 
 # --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
 # CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
@@ -1158,6 +1162,19 @@ PC_NETGAME_TXN_KIND_DIG_BURIED = 4
 PC_NETGAME_TXN_KIND_DIG_HOLE = 5
 PC_NETGAME_TXN_KIND_DIG_SHINE = 6
 PC_NETGAME_TXN_KIND_CATCH = 7
+PC_NETGAME_TXN_KIND_MUSEUM_DONATE = 8   # town services: TXN_COMMIT kind 8 (dest NONE, slot = pocket slot, item); host-authoritative museum donation
+PC_NETGAME_TXN_KIND_POLICE_CLAIM = 9    # town services: TXN_COMMIT kind 9 (dest POCKET, slot = free slot, item = expected item, aux_cond = lost-and-found index)
+
+# --- Town services milestone 1 (same v8, extended IN PLACE): the generic host -> client service mirror TOWN_SVC_STATE (id 55, RELIABLE,
+# 12 + len bytes, variable). Ids 53 / 54 stay reserved for X2 (the C enum names them PC_NETGAME_MSG_TXN_RESERVED_53 / _54). ---
+PC_NETGAME_MSG_TOWN_SVC_STATE = 55
+PC_NETGAME_TS_POLICE = 1       # Save_t.police_box.keep_items[20] as 20 little-endian u16 (40 B)
+PC_NETGAME_TS_MUSEUM = 2       # Save_t.museum_display, 63 raw bytes (4-bit donor nibbles)
+PC_NETGAME_TS_SHOP = 3         # RESERVED for the next milestone: never sent, never accepted
+PC_NETGAME_TS_BLOB_MAX = 340
+PC_NETGAME_TS_POLICE_LEN = 40
+PC_NETGAME_TS_MUSEUM_LEN = 63
+TOWN_SVC_STATE_FMT = "<BBHII"  # 12-byte header (msg_type, service, len, seq, digest); the blob (len bytes) follows
 FIELD_ACTION_REQUEST_FMT = "<BBBBIBBHIIBBHBBHII15HHII"  # PCNetGameFieldActionRequestMsg, 76 bytes (12 B header + the 64 B tag)
 FIELD_ACTION_RESULT_FMT = "<BBBBIHBB"                   # PCNetGameFieldActionResultMsg, 12 bytes
 CATCH_REQUEST_FMT = "<B3xIIIiIIBBHBBHII15HHII"          # PCNetGameCatchRequestMsg, 84 bytes (20 B header + the 64 B tag)
@@ -1166,7 +1183,7 @@ FIELD_ACTION_KIND_DIG_BURIED = 1
 FIELD_ACTION_KIND_MONEY_ROCK_HIT = 2
 FIELD_ACTION_KIND_DIG_HOLE = 5
 FIELD_ACTION_KIND_DIG_SHINE = 8
-TXN_KIND_NAMES = {1: "PICKUP", 2: "DROP", 3: "BURY", 4: "DIG_BURIED", 5: "DIG_HOLE", 6: "DIG_SHINE", 7: "CATCH"}
+TXN_KIND_NAMES = {1: "PICKUP", 2: "DROP", 3: "BURY", 4: "DIG_BURIED", 5: "DIG_HOLE", 6: "DIG_SHINE", 7: "CATCH", 8: "MUSEUM_DONATE", 9: "POLICE_CLAIM"}
 assert struct.calcsize(FIELD_ACTION_REQUEST_FMT) == 76 and struct.calcsize(CATCH_REQUEST_FMT) == 84
 assert struct.calcsize(FIELD_ACTION_RESULT_FMT) == 12 and struct.calcsize(CATCH_RESULT_FMT) == 12
 
@@ -1522,7 +1539,11 @@ TXN_COMMIT_SPEC = build_txn_spec(
 TXN_RESULT_SPEC = build_txn_spec(
     PC_NETGAME_MSG_TXN_RESULT, TXN_RESULT_FMT,
     ["msg_type", "kind", "outcome", "reason", "request_id", "txn_nonce", "txn_seq", "host_session", "epoch", "rev", "cdig",
-     "dest", "slot", "item", "post_pockets", "rsv0", "post_conds", "post_wallet"], "TxnResultFields")
+     "dest", "slot", "item", "post_pockets", "svc_seq16", "post_conds", "post_wallet"], "TxnResultFields")
+TOWN_SVC_STATE_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_TOWN_SVC_STATE, TOWN_SVC_STATE_FMT, ["msg_type", "service", "len", "seq", "digest"], "TownSvcStateFields", exact=False)
+assert TOWN_SVC_STATE_SPEC.size == 12 and 12 + PC_NETGAME_TS_BLOB_MAX <= PC_NET_MAX_PAYLOAD
+assert PC_NETGAME_TS_BLOB_MAX >= max(PC_NETGAME_TS_POLICE_LEN, PC_NETGAME_TS_MUSEUM_LEN, 320)
 assert struct.calcsize(TXN_TAG_FMT) == 64 and TXN_COMMIT_SPEC.size == 72 and TXN_RESULT_SPEC.size == 76
 assert max(TXN_COMMIT_SPEC.size, TXN_RESULT_SPEC.size) <= PC_NET_MAX_PAYLOAD
 assert struct.calcsize(TXN_COMMIT_FMT) == 8 + struct.calcsize(TXN_TAG_FMT)
@@ -1535,7 +1556,7 @@ GAME_SPECS = {
               INTERACT_CONFIRM_SPEC, VILLAGER_ARRIVAL_SPEC, VILLAGER_DEPARTURE_SPEC, VILLAGER_SNAPSHOT_SPEC,
               FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
               MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC, RECORD_HELLO_SPEC,
-              RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC)
+              RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC, TOWN_SVC_STATE_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
@@ -1831,6 +1852,7 @@ class FakeClient(TransportClient):
         self.txn_seq = 0
         self.txn_results = []        # (conn, TxnResultFields) for EVERY TXN_RESULT received, arrival order
         self.txn_commits_sent = []   # (raw bytes, conn) for EVERY TXN_COMMIT this client sent
+        self.ts_states = []          # (conn, TownSvcStateFields, blob bytes) for EVERY TOWN_SVC_STATE received (town services), arrival order
         self.txn_requests = {}       # (kind, request_id) -> (slot, item): what the auto-commit needs for drop/bury
         super().__init__(label, host_ip, port, hub=hub, **kw)
         self.host_ip = host_ip
@@ -2305,7 +2327,7 @@ class FakeClient(TransportClient):
         client-owned claim); default base: what it last synced (rec_last); seq = next_txn_seq(); nonce = self.txn_nonce."""
         if pre is None:
             pockets, conds, wallet = self.txn_pre_image()
-            if kind in (CONFIRM_KIND_DROP, CONFIRM_KIND_BURY) and 0 <= slot < 15:
+            if kind in (CONFIRM_KIND_DROP, CONFIRM_KIND_BURY, PC_NETGAME_TXN_KIND_MUSEUM_DONATE) and 0 <= slot < 15:
                 pockets = tuple(item if i == slot else p for i, p in enumerate(pockets))
             pre = (pockets, conds, wallet)
         if base is None:
@@ -2476,7 +2498,49 @@ class FakeClient(TransportClient):
         self.send_reliable(raw)
         return TxnSent(raw, struct.unpack_from("<I", raw, 24)[0], struct.unpack_from("<I", raw, 20)[0])
 
+    # --- town services (milestone 1): the TOWN_SVC_STATE mirror + the MUSEUM_DONATE / POLICE_CLAIM transactions ---------------------
+
+    def ts_states_of(self, svc, current_conn_only=True):
+        """[(TownSvcStateFields, blob)] of every TOWN_SVC_STATE of service `svc` received (arrival order)."""
+        return [(g, b) for conn, g, b in self.ts_states if g.service == svc and (not current_conn_only or conn == self.connect_count)]
+
+    def ts_latest(self, svc, current_conn_only=True):
+        """(fields, blob) of the newest received TOWN_SVC_STATE of `svc`, or None."""
+        a = self.ts_states_of(svc, current_conn_only)
+        return a[-1] if a else None
+
+    def wait_ts_state(self, svc, timeout=3.0, min_seq=1, pred=None, current_conn_only=True):
+        """Waits for a TOWN_SVC_STATE of `svc` with seq >= min_seq (and pred(blob) if given); returns (fields, blob) or None."""
+        def find():
+            for g, b in reversed(self.ts_states_of(svc, current_conn_only)):
+                if g.seq >= min_seq and (pred is None or pred(b)):
+                    return g, b
+            return None
+        if not self.hub.wait_until(lambda: find() is not None, timeout):
+            return None
+        return find()
+
+    def txn_donate(self, slot, item, rid=0, timeout=3.0, **kw):
+        """MUSEUM_DONATE: TXN_COMMIT kind 8 (dest NONE, slot, item; default pre-image = the local image with `item` forced into `slot`).
+        Returns (TxnSent, TxnResultFields or None)."""
+        sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_MUSEUM_DONATE, rid, PC_NETGAME_TXN_DEST_NONE, slot, item, **kw)
+        return sent, self.wait_txn_result(sent.seq, timeout)
+
+    def txn_claim(self, slot, item, police_idx, rid=0, timeout=3.0, pre=None, **kw):
+        """POLICE_CLAIM: TXN_COMMIT kind 9 (dest POCKET, slot = a free pocket slot, item = the expected item, aux_cond = the lost-and-found
+        index). Default pre-image = the local image with `slot` forced EMPTY. Returns (TxnSent, TxnResultFields or None)."""
+        if pre is None:
+            pockets, conds, wallet = self.txn_pre_image()
+            pre = (tuple(0 if i == slot else p for i, p in enumerate(pockets)), conds, wallet)
+        sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_POLICE_CLAIM, rid, PC_NETGAME_TXN_DEST_POCKET, slot, item, pre=pre,
+                                    aux_cond=police_idx, **kw)
+        return sent, self.wait_txn_result(sent.seq, timeout)
+
     def on_message(self, m):
+        if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TOWN_SVC_STATE:
+            g = m.game
+            if g is not None:
+                self.ts_states.append((m.conn, g, bytes(m.payload[12:12 + g.len])))
         if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TXN_RESULT:
             g = m.game
             if g is not None:

@@ -9,9 +9,9 @@ donations. Host and single-player fall through unchanged. Shop purchases/sells s
         mSP_InRenewal gated on the CLIENT role before their first mutation.
   S0-2  postman: mPO_business_proc gated; villager MAIL_REQUEST markers still exist.
   S0-3  copper + lost & found adders: ac_npc_police.c spawn, mPB_keep_item, mPB_keep_all_item_in_block.
-  S0-4  museum: client donation outcome is redirected to the return row before the put-away demo; putaway
+  S0-4  museum: (town services) a client's donation runs the host transaction before the put-away demo (REJECTED -> return row); putaway
         init never calls the commit/clear for a client; gift-carrying museum mail refused at the counter.
-  S0-5  police claim: client takes the existing idx == -1 refusal before any pocket/field/slot write.
+  S0-5  police claim: (town services) a client claims through the host transaction; REJECTED / pockets full take the existing idx == -1 refusal; no local pocket/slot write.
   S0-6  player mail: aPG_check_destination refuses PLAYER (and gift MUSEUM) mail for a client with the
         existing "no such address" code; the letter is removed only after that refusal path restores it.
 
@@ -181,8 +181,16 @@ def main():
     fish = ow.find("act_idx = aCR_get_idx_to_donate_fish(item);")
     use = ow.find("donate_act_p = &donate_act[act_idx];")
     setmsg = ow.find("mMsg_Set_continue_msg_num(msg_p, donate_act_p->msg_no);")
-    check("S0-4: client redirect to row 2 after classification and before the row is used (TARGET_PC)",
-          0 <= fish < g < use < setmsg and "act_idx = 2;" in ow[g:g + 140] and "#ifdef TARGET_PC" in ow[fish:g], results)
+    beg = ow.find("pc_net_game_ts_begin_museum_donate(play->submenu.item_p->slot_no, (int)item)", g)
+    poll = ow.find("pc_net_game_ts_poll()", beg)
+    check("S0-4 (town services, replaces the give-back): a client's put-away rows (act_idx >= 16) run the host transaction after classification and before "
+          "the row is used: begin (busy -> return, refused -> row 2) -> wait (PENDING returns, no state change) -> APPLIED proceeds, anything else -> row 2",
+          0 <= fish < g < beg < poll < use < setmsg and "#ifdef TARGET_PC" in ow[fish:g]
+          and "ts_begin < 0" in ow[beg - 80:poll] and ow[g:poll].count("act_idx = 2;") == 1
+          and "PC_NETGAME_TS_OP_PENDING" in ow[poll - 80:use] and "return;" in ow[poll:use]
+          and "ts_res != PC_NETGAME_TS_OP_APPLIED" in ow[poll:use] and ow[poll:use].count("act_idx = 2;") == 1, results)
+    check("S0-4: the client branch itself never commits the museum bit or touches the pocket (the pocket changes only in the host-APPLIED apply step; the bit arrives by mirror)",
+          "mMmd_RequestMuseumDisplay" not in ow and "mPr_SetPossessionItem" not in ow and "inventory" not in ow, results)
     check("S0-4: row 2 is the existing return-demo refusal row; rows >= 16 are the put-away rows",
           "{ 0x2F64, aCR_TALK_RETURN_DEMO_START_WAIT }," in cm
           and cm.index("{ 0x2F8F, aCR_TALK_PUTAWAY_DEMO_START_WAIT2 },") > cm.index("{ 0x2F6A, aCR_TALK_RETURN_DEMO_START_WAIT2 },"),
@@ -217,8 +225,15 @@ def main():
     sfg = ca.find("mFI_SetFG_common(RSV_NO, dummy_pos, TRUE);")
     spi = ca.find("mPr_SetPossessionItem(Now_Private, idx, *item_p")
     clr = ca.find("Save_Get(police_box).keep_items[actor->item_idx] = EMPTY_NO;")
-    check("S0-5: client sets idx = -1 (existing refusal) before any pocket query, under TARGET_PC",
-          0 <= ca.find("#ifdef TARGET_PC") < g < gi < ticket < normal < refuse < sfg < spi < clr, results)
+    beg = ca.find("pc_net_game_ts_begin_police_claim(free_slot, aPOL2_ts_idx, (int)aPOL2_ts_item)")
+    poll = ca.find("pc_net_game_ts_poll()", beg)
+    check("S0-5 (town services, replaces the refusal): a client defaults to the existing refusal (idx = -1), picks its own free slot, begins the host claim with "
+          "(lost-and-found slot, EXPECTED item, pocket slot), waits while PENDING and only an APPLIED answer sets claimed_remote -- all before the vanilla host path",
+          0 <= ca.find("#ifdef TARGET_PC") < g < gi < beg < poll < ticket < normal < refuse < sfg < spi < clr
+          and "int free_slot = mPlib_Get_space_putin_item();" in ca[g:beg] and "return;" in ca[poll:poll + 160] and "PC_NETGAME_TS_OP_PENDING" in ca[poll:poll + 160]
+          and "claimed_remote = TRUE;" in ca[poll:ticket] and ca.count("claimed_remote = TRUE;") == 1, results)
+    check("S0-5: the vanilla pocket write and the local lost-and-found slot clear are skipped for a remote claim (if (!claimed_remote)); the 'here you go' branch is kept",
+          "if (!claimed_remote)" in ca[sfg:spi] and ca.index("mPr_SetPossessionItem(Now_Private, idx, *item_p") < ca.index("sAdo_OngenTrgStart(NA_SE_ITEM_GET"), results)
     check("S0-5: refusal branch uses msg 0x0781 and holds no item removal / slot clear",
           "mMsg_Set_continue_msg_num(msg_p, 0x0781);" in ca[refuse:sfg], results)
     check("S0-5: fall-through to talk-end-wait intact (item_idx = -1; aPOL2_ACT_TALK_END_WAIT)",
@@ -226,9 +241,10 @@ def main():
     check("S0-5: host/offline claim path intact",
           "mPr_SetPossessionItem(Now_Private, idx, *item_p, mPr_ITEM_COND_NORMAL);" in ca
           and "mPlib_Get_space_putin_item_forTICKET(item_p)" in ca, results)
-    check("S0-5: leave-building compaction untouched (local mPB_copy_itemBuf only)",
-          "mPB_copy_itemBuf(Save_Get(police_box).keep_items);" in p2 and "pc_net_game" not in
-          func_body(p2, r"\nstatic void aPOL2_player_getout_check\(GAME_PLAY\* play, ACTOR\* playerx\) \{"), results)
+    go = func_body(p2, r"\nstatic void aPOL2_player_getout_check\(GAME_PLAY\* play, ACTOR\* playerx\) \{")
+    check("S0-5 (review M2): leave-building compaction is the vanilla local mPB_copy_itemBuf for host / solo and is SKIPPED for a client (its copy is the host's mirror)",
+          "mPB_copy_itemBuf(Save_Get(police_box).keep_items);" in p2 and "pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in go
+          and go.index("pc_net_game_role() != PC_NETGAME_ROLE_CLIENT") < go.index("mPB_copy_itemBuf("), results)
 
     # ---- S0-6 player mail
     pg = read("src/actor/npc/ac_npc_post_girl.c_inc")

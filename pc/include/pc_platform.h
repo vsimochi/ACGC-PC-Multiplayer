@@ -332,6 +332,17 @@ extern int           g_pc_txn_test_pickup_drop;
  * pockets before the request and after the transaction resolved. Bypasses only the shovel animation / input and the roll, never the
  * request / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_txn_dig_test_hook(). */
 extern int           g_pc_txn_test_dig_grant;
+/* Town services milestone 1 TEST-ONLY hooks (all default OFF, never active in normal play, every step logs "[NET][TS][TEST-ONLY]"):
+ *   --ts-test-seed-police=<hex>[,<hex>...]  HOST only: once the host world is ready, keep each listed item in the host's lost and found through the
+ *                                           vanilla mPB_keep_item() (so the real FIFO / compaction rules apply). Refused for any other role.
+ *   --ts-test-donate                        CLIENT only: once the record is SYNCED and the museum mirror arrived, place a fish the LOCAL mirror says the
+ *                                           museum lacks into a free pocket slot (the hook's one local write), wait 5 s for the D3 upload and run ONE
+ *                                           real MUSEUM_DONATE through pc_net_game_ts_begin_museum_donate() / _poll() (the dialogue seam's entry points).
+ *   --ts-test-claim                         CLIENT only: claim the first item of the LOCAL lost-and-found mirror through pc_net_game_ts_begin_police_claim().
+ * They bypass only the Blathers / Booker dialogue and the menu, never the TXN_COMMIT / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_ts_test_hook(). */
+extern const char*   g_pc_ts_test_seed_police;
+extern int           g_pc_ts_test_donate;
+extern int           g_pc_ts_test_claim;
 /* X1 (host-transactional PICKUP/DROP/BURY commit) host-side FAULT INJECTION, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. HOST role ONLY:
  * pc_main.c refuses (exit code 2, message on stderr) any other role, and the C hook re-checks the role. OFF by default (mode 0),
  * never active in normal play; when armed the process logs "[NET][TXN][TEST-ONLY] FAULT INJECTION ENABLED mode=..." at start and

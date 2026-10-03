@@ -447,6 +447,14 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_TXN_RESULT            = 52, /* X1 (v8): host -> the one requesting client ONLY, RELIABLE, 76 bytes. The outcome of a
                                              * TXN_COMMIT (APPLIED + the post-image, or REJECTED + a reason). See
                                              * PCNetGameTxnResultMsg. */
+    PC_NETGAME_MSG_TXN_RESERVED_53       = 53, /* RESERVED for X2 (TXN_QUERY): never sent by anyone; every receiver ignores it. */
+    PC_NETGAME_MSG_TXN_RESERVED_54       = 54, /* RESERVED for X2 (TXN_STATUS): never sent by anyone; every receiver ignores it. */
+    PC_NETGAME_MSG_TOWN_SVC_STATE        = 55, /* Town services milestone 1 (v8, unreleased: extended in place, no bump): host -> READY
+                                             * clients ONLY, RELIABLE, 12 + len bytes (len <= 340). One host-owned town-service blob
+                                             * (1 POLICE keep_items, 2 MUSEUM museum_display; 3 SHOP and 4+ reserved) with a per-service
+                                             * strictly increasing seq and the FNV-1a32 of the blob. Sent to a peer as soon as it is READY
+                                             * and whenever the host's copy changes; the client writes it into its LOCAL Save_t region and
+                                             * NEVER persists it. See PCNetGameTownSvcStateMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2034,6 +2042,15 @@ _Static_assert(PC_NETGAME_REC_CHUNK_COUNT <= 16, "the per-transfer got mask is 1
 #define PC_NETGAME_TXN_KIND_DIG_HOLE   5u
 #define PC_NETGAME_TXN_KIND_DIG_SHINE  6u
 #define PC_NETGAME_TXN_KIND_CATCH      7u
+/* Town services milestone 1: two more one-phase, reservation-less kinds carried by TXN_COMMIT (51) with these kinds (the same tag, journal,
+ * TXN_RESULT and resend rules as PICKUP/DROP/BURY, but NO reservation and NO world tile -- the host mutates its OWN town-service copy and the
+ * resident mirror in one handler call).
+ *   MUSEUM_DONATE (8): tag.dest NONE, tag.slot = the pocket slot offered, tag.item = the item; aux_cond / aux_item / flags = 0. The host
+ *                      credits the donor as the BOUND resident's slot + 1 and clears the pocket slot in the post-image.
+ *   POLICE_CLAIM  (9): tag.dest POCKET, tag.slot = a FREE pocket slot, tag.item = the EXPECTED item, tag.aux_cond = the lost-and-found slot
+ *                      index (0..19); the host verifies keep_items[aux_cond] == item, removes it and puts the item into the post-image. */
+#define PC_NETGAME_TXN_KIND_MUSEUM_DONATE 8u
+#define PC_NETGAME_TXN_KIND_POLICE_CLAIM  9u
 #define PC_NETGAME_TXN_OUTCOME_APPLIED  0u
 #define PC_NETGAME_TXN_OUTCOME_REJECTED 1u
 #define PC_NETGAME_TXN_REASON_NONE          0u
@@ -2051,6 +2068,10 @@ _Static_assert(PC_NETGAME_REC_CHUNK_COUNT <= 16, "the per-transfer got mask is 1
 #define PC_NETGAME_TXN_REASON_BUSY         12u
 #define PC_NETGAME_TXN_REASON_FAULT        13u
 #define PC_NETGAME_TXN_REASON_REPLAYED     14u /* informational, on APPLIED replays */
+#define PC_NETGAME_TXN_REASON_ALREADY_DONATED 15u /* town services: MUSEUM_DONATE of an item the museum already holds (the client KEEPS the item) */
+#define PC_NETGAME_TXN_REASON_NOT_AVAILABLE   16u /* town services: POLICE_CLAIM whose (slot, expected item) is no longer in the lost and found */
+#define PC_NETGAME_TXN_REASON_NOT_DONATABLE   17u /* town services: MUSEUM_DONATE of an item the museum never accepts (vanilla predicate) */
+#define PC_NETGAME_TXN_REASON_NO_DONOR_SLOT   18u /* town services: the bound resident has no museum donor slot (guest / extra player) */
 /* Named switch for the LEGACY INTERACT_CONFIRM(COMMIT) path. 0 (X1a): the host still processed it exactly as before and a TXN and a
  * legacy COMMIT could never both apply to one reservation. 1 (X1b, NOW: the real client sends TXN_COMMIT instead): CONFIRM(COMMIT)
  * is retired -- logged, the reservation released, nothing mutated. ABORT is never retired. */
@@ -2086,7 +2107,8 @@ typedef struct PCNetGameTxnResultMsg {
     uint8_t  slot;
     uint16_t item;
     uint16_t post_pockets[15];
-    uint16_t _rsv0;
+    uint16_t svc_seq16;    /* town services: low 16 bits of the seq of the service blob this transaction produced (MUSEUM_DONATE / POLICE_CLAIM
+                            * APPLIED, replays carry the current one), else 0. The full blob follows as TOWN_SVC_STATE. */
     uint32_t post_conds;
     uint32_t post_wallet;
 } PCNetGameTxnResultMsg;
@@ -2097,6 +2119,37 @@ _Static_assert(offsetof(PCNetGameTxnResultMsg, epoch) == 20 && offsetof(PCNetGam
                "PCNetGameTxnResultMsg field offsets drifted");
 _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameTxnResultMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* Town services milestone 1 (v8, unreleased): the generic host -> client service mirror. Services (u8): 1 POLICE = Save_t.police_box.keep_items[20]
+ * as 20 little-endian u16 (40 B); 2 MUSEUM = Save_t.museum_display, the 63 raw bytes (4-bit donor nibbles); 3 SHOP = Save_t.shop (320 B)
+ * RESERVED for the next milestone (neither sent nor accepted yet); 4+ reserved. `seq` is the host's per-service counter, strictly increasing
+ * for the life of the host process (a client keeps the last accepted one per session and ignores <=); `digest` = FNV-1a32 of the blob. The
+ * message on the wire is offsetof(blob) + len bytes (variable); len must equal the service's fixed length. */
+#define PC_NETGAME_TS_POLICE   1u
+#define PC_NETGAME_TS_MUSEUM   2u
+#define PC_NETGAME_TS_SHOP     3u
+#define PC_NETGAME_TS_NUM      4u   /* array bound: services 1..3 named (index 0 unused), 4+ reserved */
+#define PC_NETGAME_TS_BLOB_MAX 340u
+#define PC_NETGAME_TS_POLICE_LEN 40u
+#define PC_NETGAME_TS_MUSEUM_LEN 63u
+typedef struct PCNetGameTownSvcStateMsg {
+    uint8_t  msg_type;   /* PC_NETGAME_MSG_TOWN_SVC_STATE */
+    uint8_t  service;    /* PC_NETGAME_TS_* */
+    uint16_t len;        /* blob bytes in use */
+    uint32_t seq;
+    uint32_t digest;     /* FNV-1a32 of blob[0..len) */
+    uint8_t  blob[PC_NETGAME_TS_BLOB_MAX];
+} PCNetGameTownSvcStateMsg;
+_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352, "PCNetGameTownSvcStateMsg wire size drifted");
+_Static_assert(offsetof(PCNetGameTownSvcStateMsg, seq) == 4 && offsetof(PCNetGameTownSvcStateMsg, digest) == 8 &&
+                   offsetof(PCNetGameTownSvcStateMsg, blob) == 12,
+               "PCNetGameTownSvcStateMsg field offsets drifted");
+_Static_assert(sizeof(PCNetGameTownSvcStateMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameTownSvcStateMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+_Static_assert(PC_NETGAME_TS_POLICE_LEN == sizeof(PoliceBox_c) && PC_NETGAME_TS_MUSEUM_LEN == sizeof(mMmd_info_c) &&
+                   PC_NETGAME_TS_POLICE_LEN <= PC_NETGAME_TS_BLOB_MAX && PC_NETGAME_TS_MUSEUM_LEN <= PC_NETGAME_TS_BLOB_MAX &&
+                   320u <= PC_NETGAME_TS_BLOB_MAX,
+               "a town-service blob does not fit PCNetGameTownSvcStateMsg (the 320-byte shop blob is checked here too)");
 
 /* Two-phase interactions: client -> host, reliable, exactly 8 bytes (little-endian, natural
  * alignment). Answers a provisional RESULT (accepted == 1) -- or withdraws from a request the client
@@ -2744,6 +2797,7 @@ typedef struct PCNetGameClientTxn {
     PCNetGameTxnTag tag;       /* X3: the tag exactly as put on the wire (valid once SENT) */
     uint8_t  wire[PC_NETGAME_CTXN_WIRE_MAX]; /* X3: the exact request bytes on the wire (TXN_COMMIT / FIELD_ACTION_REQUEST / CATCH_REQUEST), resent IDENTICALLY */
     uint16_t wire_len;
+    uint8_t  ts_aux;           /* town services: POLICE_CLAIM's lost-and-found slot index (travels as tag.aux_cond) */
     uint8_t  ut_x, ut_z, hole_variant; /* X3 DIG_*: the field-action request's target tile / hole shape */
     uint32_t entity_id;        /* X3 CATCH: the wildlife entity claimed */
     int32_t  claimed_species;  /* X3 CATCH */
@@ -2757,6 +2811,24 @@ typedef struct PCNetGameClientTxn {
 static PCNetGameClientTxn s_ctxn;
 static uint32_t           s_txn_nonce;        /* 0 = not rolled yet; per PROCESS: NEVER reset by a session reset */
 static uint32_t           s_txn_next_seq = 1; /* per PROCESS: NEVER reset by a session reset */
+
+/* Town services (client). s_ts_op: the ONE UI-seam operation (a Blathers donation / a Booker claim) whose TXN_COMMIT is in flight or whose result has not been
+ * consumed yet; the curator / police code drives it through pc_net_game_ts_begin_*() / pc_net_game_ts_poll(). The mirror state: the last
+ * TOWN_SVC_STATE seq applied per service in THIS session (reset with the session), plus a one-deep stash for a message that arrived before the
+ * local save was usable. */
+typedef struct PCNetGameTsOp {
+    uint8_t  active, done, outcome; /* outcome: 1 APPLIED, 2 REJECTED (valid once done) */
+    uint8_t  kind, slot, aux;
+    uint16_t item;
+    uint32_t request_id;
+} PCNetGameTsOp;
+static PCNetGameTsOp            s_ts_op;
+static uint32_t                 s_ts_next_rid = 0x70000000u; /* request ids only label this client's own operations (no host reservation exists) */
+static uint32_t                 s_ts_client_seq[PC_NETGAME_TS_NUM];
+static uint8_t                  s_ts_client_have[PC_NETGAME_TS_NUM];
+static PCNetGameTownSvcStateMsg s_ts_client_stash[PC_NETGAME_TS_NUM];
+static uint8_t                  s_ts_client_stash_valid[PC_NETGAME_TS_NUM];
+static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int applied);
 
 static int pcnetgame_txn_busy(void) {
     return s_ctxn.state != PC_NETGAME_CTXN_FREE;
@@ -3032,6 +3104,7 @@ typedef struct PCNetGameHostPeerState {
     uint32_t             rec_last_stale_push_ms;
     uint8_t              exch_credit_valid;/* X3: a full-pockets catch (dest NONE) was accepted for this peer: its host-derived item is the ONE */
     uint16_t             exch_credit_item; /*     replacement a following TXN_COMMIT(DROP, EXCHANGE) of this connection may write (consumed on APPLIED) */
+    uint32_t             ts_sent_seq[PC_NETGAME_TS_NUM]; /* town services: the last TOWN_SVC_STATE seq pushed to this peer, per service (0 = none yet) */
 } PCNetGameHostPeerState;
 static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];
 
@@ -4471,6 +4544,12 @@ static const char* pcnetgame_kind_tag(int kind) {
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_CATCH) {
         return "CATCH";
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_MUSEUM_DONATE) {
+        return "MUSEUM_DONATE"; /* town services milestone 1 */
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_POLICE_CLAIM) {
+        return "POLICE_CLAIM";
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
         return "DROP";
@@ -12248,6 +12327,10 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_BUSY: return "BUSY";
         case PC_NETGAME_TXN_REASON_FAULT: return "FAULT";
         case PC_NETGAME_TXN_REASON_REPLAYED: return "REPLAYED";
+        case PC_NETGAME_TXN_REASON_ALREADY_DONATED: return "ALREADY_DONATED";
+        case PC_NETGAME_TXN_REASON_NOT_AVAILABLE: return "NOT_AVAILABLE";
+        case PC_NETGAME_TXN_REASON_NOT_DONATABLE: return "NOT_DONATABLE";
+        case PC_NETGAME_TXN_REASON_NO_DONOR_SLOT: return "NO_DONOR_SLOT";
         default: return "?";
     }
 }
@@ -12310,6 +12393,10 @@ static int pcnetgame_rec_txn_write_inventory(int idx, const uint16_t* pockets, u
     return 1;
 }
 
+/* Town services: the low 16 bits of the service-blob seq the transaction being answered produced; set by pcnetgame_handle_host_ts_txn() right
+ * before it sends an APPLIED (first execution or replay) and cleared right after, 0 for every other answer. */
+static uint16_t s_txn_svc_echo = 0;
+
 /* ---- results ---- */
 static void pcnetgame_txn_send_result(PCNetPeerId peer, int idx, const PCNetGameTxnCommitMsg* in, uint8_t outcome, uint8_t reason,
                                       uint32_t epoch, uint32_t rev, uint32_t cdig, const uint16_t* post_pockets,
@@ -12330,6 +12417,7 @@ static void pcnetgame_txn_send_result(PCNetPeerId peer, int idx, const PCNetGame
     out.dest = in->tag.dest;
     out.slot = in->tag.slot;
     out.item = in->tag.item;
+    out.svc_seq16 = s_txn_svc_echo;
     if (post_pockets != NULL) {
         memcpy(out.post_pockets, post_pockets, sizeof(out.post_pockets));
     }
@@ -13040,6 +13128,402 @@ static void pcnetgame_x3_catch_request(PCNetPeerId peer, const PCNetGameCatchReq
     pcnetgame_x3_grant(peer, &synth, hash, NULL, cr);
 }
 /* ===== X3 HOST END ===== */
+
+/* ===== TS HOST BEGIN: town services milestone 1 -- the generic host -> client service MIRROR (TOWN_SVC_STATE) and the host-authoritative
+ * MUSEUM_DONATE / POLICE_CLAIM transactions (protocol v8, unreleased: extended in place) =====
+ * MIRROR. The host owns Save_t.police_box and Save_t.museum_display (and persists them in its normal GCI save). A client never persists them:
+ * it holds a LOCAL copy that the host overwrites. The host keeps one slot per service (blob, FNV-1a32 digest, seq); pcnetgame_host_ts_tick()
+ * re-reads the two regions twice a second (a digest compare, so EVERY writer -- the host's own vanilla police / museum code, a snowman, a
+ * house build, a remote client's transaction -- is covered without a hook) and bumps that service's seq when the bytes changed; every READY peer
+ * whose last pushed seq differs gets the current blob (a late joiner / reconnect has ts_sent_seq 0, so it receives every service as soon as
+ * it is READY; a failed send is simply retried on the next poll). A transaction refreshes right after its commit and pushes immediately.
+ * TRANSACTIONS. pcnetgame_handle_host_ts_txn() is the same machinery as pcnetgame_x3_grant() (READY gate -> binding gate -> SYNCED / world
+ * ready -> shape -> journal (fence / replay / CONFLICT) -> base -> pre-image -> precondition on the PRE-image) minus the reservation and the
+ * world tile; then READ-ONLY service validation, post-image validated, the host's own service copy mutated by the VANILLA function
+ * (mMmd_RequestMuseumDisplay with player_no temporarily set to the bound resident / the mPB_copy_itemBuf compaction), the resident mirror
+ * written raw by pcnetgame_rec_txn_write_inventory(), rev++, journal APPLIED, TXN_RESULT(APPLIED + post-image + svc_seq16) and then the
+ * TOWN_SVC_STATE broadcast to every peer. No RNG anywhere on the mirror. The host's OWN resident is refused by pcnetgame_rec_txn_idx_ok(). */
+
+typedef struct PCNetGameTsHost {
+    uint8_t  valid;
+    uint16_t len;
+    uint32_t seq;      /* strictly increasing for the life of the host process (never reset) */
+    uint32_t digest;
+    uint8_t  blob[PC_NETGAME_TS_BLOB_MAX];
+} PCNetGameTsHost;
+static PCNetGameTsHost s_ts_host[PC_NETGAME_TS_NUM];
+static uint32_t        s_ts_next_check_ms = 0;
+#define PC_NETGAME_TS_CHECK_MS 500u
+
+static const char* pcnetgame_ts_name(int svc) {
+    return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP" : "?";
+}
+
+/* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
+static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
+    int i;
+    if (svc == (int)PC_NETGAME_TS_POLICE) {
+        for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
+            uint16_t v = (uint16_t)Save_Get(police_box).keep_items[i];
+            blob[2 * i] = (uint8_t)(v & 0xFFu);
+            blob[2 * i + 1] = (uint8_t)(v >> 8);
+        }
+        *len = (uint16_t)PC_NETGAME_TS_POLICE_LEN;
+        return 1;
+    }
+    if (svc == (int)PC_NETGAME_TS_MUSEUM) {
+        memcpy(blob, &Save_Get(museum_display), PC_NETGAME_TS_MUSEUM_LEN);
+        *len = (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+        return 1;
+    }
+    return 0;
+}
+
+/* Re-reads one service; 1 = its bytes changed (seq bumped). */
+static int pcnetgame_ts_refresh(int svc) {
+    uint8_t blob[PC_NETGAME_TS_BLOB_MAX];
+    uint16_t len = 0;
+    uint32_t dig;
+    PCNetGameTsHost* h = &s_ts_host[svc];
+    if (!pcnetgame_ts_build(svc, blob, &len)) {
+        return 0;
+    }
+    dig = pcnetgame_fnv1a32(blob, len);
+    if (h->valid && h->len == len && h->digest == dig) {
+        return 0;
+    }
+    memcpy(h->blob, blob, len);
+    h->len = len;
+    h->digest = dig;
+    h->seq++;
+    h->valid = 1;
+    printf("[NET][TS] host: service %d (%s) state -> seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)h->seq,
+           (unsigned)dig, (unsigned)len);
+    return 1;
+}
+
+static void pcnetgame_ts_refresh_all(void) {
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_POLICE);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MUSEUM);
+}
+
+/* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
+static int pcnetgame_ts_send_to_peer(PCNetPeerId peer, int svc) {
+    PCNetGameTownSvcStateMsg m;
+    const PCNetGameTsHost* h = &s_ts_host[svc];
+    uint16_t sz;
+    if (!h->valid || h->len > PC_NETGAME_TS_BLOB_MAX) {
+        return 0;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_TOWN_SVC_STATE;
+    m.service = (uint8_t)svc;
+    m.len = h->len;
+    m.seq = h->seq;
+    m.digest = h->digest;
+    memcpy(m.blob, h->blob, h->len);
+    sz = (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + h->len);
+    return pc_net_send(peer, PC_NET_RELIABLE, &m, sz) ? 1 : 0;
+}
+
+/* Pushes every service whose seq this peer has not been sent yet. Bounded: at most 2 messages per call and peer, each only on a seq change. */
+static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
+    int svc;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_MUSEUM; svc++) {
+        PCNetGameHostPeerState* st = &s_host_peer[peer];
+        if (s_ts_host[svc].valid && st->ts_sent_seq[svc] != s_ts_host[svc].seq) {
+            if (pcnetgame_ts_send_to_peer(peer, svc)) {
+                st->ts_sent_seq[svc] = s_ts_host[svc].seq;
+                printf("[NET][TS] host: pushed service %d (%s) seq %u to peer %d\n", svc, pcnetgame_ts_name(svc),
+                       (unsigned)s_ts_host[svc].seq, (int)peer);
+            }
+        }
+    }
+}
+
+static void pcnetgame_host_ts_push_all(void) {
+    int p;
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        pcnetgame_host_ts_push_peer((PCNetPeerId)p);
+    }
+}
+
+/* TEST-ONLY (--ts-test-seed-police=<hex>[,<hex>...], HOST only, default OFF): once the host world is ready, keeps each listed item in the host's
+ * lost and found through the vanilla mPB_keep_item() (so the real compaction / FIFO rules apply), exactly once. */
+static void pcnetgame_ts_test_seed_police(void) {
+    static int done = 0;
+    const char* p = g_pc_ts_test_seed_police;
+    if (done || p == NULL || p[0] == '\0' || s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    done = 1;
+    printf("[NET][TS][TEST-ONLY] --ts-test-seed-police: seeding the host's lost and found with '%s' (NOT active in normal play)\n", p);
+    while (*p != '\0') {
+        char* end = NULL;
+        unsigned long v = strtoul(p, &end, 16);
+        if (end == p) {
+            break;
+        }
+        mPB_keep_item((mActor_name_t)v);
+        printf("[NET][TS][TEST-ONLY] --ts-test-seed-police: mPB_keep_item(0x%04lX)\n", v);
+        p = end;
+        while (*p == ',' || *p == ' ') {
+            p++;
+        }
+    }
+}
+
+static void pcnetgame_host_ts_tick(void) {
+    uint32_t now = pcnetgame_now_ms();
+    int p;
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        return;
+    }
+    pcnetgame_ts_test_seed_police();
+    if ((uint32_t)(now - s_ts_next_check_ms) >= PC_NETGAME_TS_CHECK_MS || !s_ts_host[PC_NETGAME_TS_POLICE].valid) {
+        s_ts_next_check_ms = now;
+        pcnetgame_ts_refresh_all();
+    }
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        pcnetgame_host_ts_push_peer((PCNetPeerId)p); /* a late joiner / reconnect / a failed send is covered here */
+    }
+}
+
+/* MUSEUM_DONATE / POLICE_CLAIM. `in` is the exact 72-byte TXN_COMMIT (kind 8 / 9). After the READY gate every path ends in one TXN_RESULT
+ * (except the TEST-ONLY injected faults). */
+static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
+    const PCNetGameTxnTag* t = &in->tag;
+    const int is_donate = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE);
+    const int svc = is_donate ? (int)PC_NETGAME_TS_MUSEUM : (int)PC_NETGAME_TS_POLICE;
+    PCNetGameHostPeerState* st;
+    PCNetGameRecSlot* slot;
+    PCNetGameTxnResident* R;
+    const PCNetGameTxnLog* old;
+    uint16_t post[mPr_POCKETS_SLOT_COUNT];
+    uint32_t post_conds, hash, now;
+    uint16_t bad;
+    int idx, shape_ok, pidx = -1;
+    const char* fail = NULL;
+    uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+
+    /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not READY: dropped silently, no result by design */
+    }
+    st = &s_host_peer[peer];
+    now = pcnetgame_now_ms();
+    if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_IGNORE_COMMIT)) {
+        printf("[NET][TXN][TEST-ONLY] ignore_commit: %s request=%u seq=%u discarded before validation (nothing journaled)\n",
+               pcnetgame_kind_tag((int)in->kind), (unsigned)in->request_id, (unsigned)t->txn_seq);
+        return; /* FAULT: no result by design */
+    }
+
+    /* 2. binding / record state: the resident index comes ONLY from the gate (never from the message) */
+    idx = pcnetgame_rec_gate(peer, 0, 0);
+    if (idx < 0) {
+        pcnetgame_txn_reject(peer, -1, NULL, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_NOT_BOUND, 0, NULL, "peer has no valid resident binding");
+        return;
+    }
+    slot = pcnetgame_rec_slot(idx);
+    if (st->rec_state != PC_NETGAME_RECS_SYNCED || !s_host_world_ready) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0,
+                             st->rec_state != PC_NETGAME_RECS_SYNCED ? (uint8_t)PC_NETGAME_TXN_REASON_NOT_SYNCED : (uint8_t)PC_NETGAME_TXN_REASON_BUSY,
+                             0, NULL, st->rec_state != PC_NETGAME_RECS_SYNCED ? "resident record not SYNCED" : "host world not ready");
+        return;
+    }
+
+    /* 3. shape */
+    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && t->flags == 0 && t->aux_item == 0 &&
+               t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO;
+    if (shape_ok) {
+        if (is_donate) {
+            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0;
+        } else {
+            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->aux_cond < (uint8_t)mPB_POLICE_BOX_ITEM_STORAGE_COUNT;
+        }
+    }
+    if (!shape_ok) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE, 0, NULL, "malformed town-service TXN_COMMIT");
+        pcnetgame_rec_violation(peer, "malformed town-service TXN_COMMIT (BAD_SHAPE)");
+        return;
+    }
+
+    /* 4. journal: fence, replay, conflict (identical rules to the X1 COMMIT / X3 grant) */
+    R = &s_txn_res[idx];
+    hash = pcnetgame_fnv1a32(in, sizeof(*in));
+    if (pcnetgame_txn_nonce_fenced(R, t->txn_nonce)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "nonce fenced");
+        return;
+    }
+    if (t->txn_nonce == R->nonce) {
+        old = pcnetgame_txn_journal_find(R, t->txn_nonce, t->txn_seq);
+        if (old != NULL) {
+            if (old->msg_hash != hash) {
+                printf("[NET][TXN] host: peer %d resident %d *** CONFLICT: seq %u was seen with DIFFERENT bytes -- never re-executed ***\n",
+                       (int)peer, idx, (unsigned)t->txn_seq);
+                pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_CONFLICT, 0, NULL,
+                                     "same (nonce, seq) with different bytes");
+            } else if (old->outcome == (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED) {
+                s_txn_svc_echo = (uint16_t)s_ts_host[svc].seq;
+                pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED, "replay ");
+                s_txn_svc_echo = 0;
+            } else {
+                pcnetgame_txn_send_result(peer, idx, in, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, old->reason, slot->epoch, slot->rev, 0, NULL, 0, 0,
+                                          "replay ");
+            }
+            return; /* RESULT sent (the journalled outcome; nothing executed) */
+        }
+        if (t->txn_seq <= R->max_seq) {
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "seq at or below the fence");
+            return;
+        }
+    } else {
+        if (R->nonce != 0) { /* a new client process: the old nonce is fenced completely (FIFO of 4) */
+            memmove(&R->fenced[0], &R->fenced[1], sizeof(R->fenced) - sizeof(R->fenced[0]));
+            R->fenced[PC_NETGAME_TXN_FENCED_NUM - 1] = R->nonce;
+        }
+        printf("[NET][TXN] host: peer %d resident %d new client nonce %u (previous %u fenced)\n", (int)peer, idx, (unsigned)t->txn_nonce,
+               (unsigned)R->nonce);
+        R->nonce = t->txn_nonce;
+        R->head = 0;
+        R->n = 0;
+        R->max_seq = 0;
+    }
+    R->max_seq = t->txn_seq; /* from here on every outcome is journalled */
+
+    /* 5. base: the pre-image must be built on THIS lineage, not older than the last pocket transaction, not from the future */
+    pcnetgame_rec_refresh_hostfields(idx, slot);
+    if (t->base_epoch != slot->epoch || t->base_rev < R->last_pocket_rev || t->base_rev > slot->rev) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_STALE_IMAGE, 1, NULL, "base (epoch, rev) is stale or from the future");
+        pcnetgame_rec_stale_push(peer, idx, slot, now);
+        return;
+    }
+
+    /* 6. pre-image validation (the record-upload validator) */
+    bad = pcnetgame_rec_validate_inventory(t->pre_pockets, t->pre_conds, t->pre_wallet);
+    if (bad != 0) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE, 1, NULL, "pre-image failed validation");
+        return;
+    }
+
+    /* 7. kind precondition on the PRE-image (never on the mirror: it may lag the client) */
+    if (is_donate) {
+        fail = (t->pre_pockets[t->slot] != t->item) ? "pocket slot does not hold the donated item" : NULL;
+    } else {
+        fail = (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) ? "pocket slot is not free" : NULL;
+    }
+    if (fail != NULL) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL, fail);
+        return;
+    }
+
+    /* 8. READ-ONLY service validation against the HOST's own copy (nothing is mutated here) */
+    if (is_donate) {
+        if (idx < 0 || idx >= PLAYER_NUM) {
+            fail = "the bound resident has no museum donor slot (guests / extra players are refused until they exist)";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
+        } else if (t->item == (uint16_t)FTR_START(FTR_SUM_ART02) || t->item == (uint16_t)FTR_START(FTR_SUM_ART03)) {
+            /* Blathers' own dialogue returns these two paintings (aCR_get_idx_to_donate_art): never a donation */
+            fail = "Blathers does not accept this painting";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_DONATABLE;
+        } else {
+            int info = mMmd_GetDisplayInfo((mActor_name_t)t->item); /* the vanilla predicate: fossil / art / insect / fish categories + the donor nibble */
+            if (info == mMmd_DISPLAY_CANNOT_DONATE) {
+                fail = "item is not a museum donation (not a fossil / painting / insect / fish)";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_DONATABLE;
+            } else if (info == mMmd_DISPLAY_ALREADY_DONATED) {
+                fail = "the museum already holds this exhibit";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_ALREADY_DONATED;
+            }
+        }
+    } else {
+        pidx = (int)t->aux_cond;
+        if (pidx < 0 || pidx >= mPB_POLICE_BOX_ITEM_STORAGE_COUNT || (uint16_t)Save_Get(police_box).keep_items[pidx] != t->item) {
+            fail = "the lost and found no longer holds this item at that slot";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+        }
+    }
+    if (fail == NULL && pcnetgame_txn_fault_fire(PC_TXN_FAULT_FAIL_WORLD)) {
+        fail = "TEST-ONLY injected fail_world";
+        fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_WORLD_CHANGED;
+    }
+    if (fail != NULL) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, fail_reason, 1, NULL, fail);
+        return; /* RESULT sent; nothing mutated */
+    }
+
+    /* 9. post-image in locals (pre-image plus the delta), validated BEFORE anything is mutated */
+    memcpy(post, t->pre_pockets, sizeof(post));
+    post_conds = t->pre_conds;
+    if (is_donate) {
+        post[t->slot] = (uint16_t)EMPTY_NO;
+    } else {
+        post[t->slot] = t->item;
+    }
+    post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+    if (pcnetgame_rec_validate_inventory(post, post_conds, t->pre_wallet) != 0 || !pcnetgame_rec_txn_idx_ok(idx)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL,
+                             "post-image failed validation / resident not writable (the host's own resident is never written)");
+        return;
+    }
+
+    /* 10. THE host-side service commit (the only writer of museum_display / police_box in this handler path) */
+    if (is_donate) {
+        u8 saved_player_no = Common_Get(player_no);
+        int ok;
+        Common_Get(player_no) = (u8)idx; /* vanilla credits Common_Get(player_no) + 1: the BOUND resident, derived by the gate; restored below */
+        ok = mMmd_RequestMuseumDisplay((mActor_name_t)t->item);
+        Common_Get(player_no) = saved_player_no;
+        if (!ok) {
+            /* cannot happen after the read-only check (single-threaded); nothing was set when the vanilla function answers FALSE */
+            printf("[NET][TS] host: peer %d *** INTERNAL: mMmd_RequestMuseumDisplay refused after a passing check -- nothing mutated ***\n", (int)peer);
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_ALREADY_DONATED, 1, NULL, "museum commit refused");
+            return;
+        }
+    } else {
+        Save_Get(police_box).keep_items[pidx] = (mActor_name_t)EMPTY_NO;
+        if (s_local_scene.valid && s_local_scene.scene_id == (uint8_t)SCENE_POLICE_BOX) {
+            /* the HOST player stands in the police box: its tiles / A-press index keep_items[], so DO NOT compact now (vanilla compacts when the
+             * host player leaves the building); only redraw the items on display */
+            mFI_SetFGUpData();
+        } else {
+            mPB_copy_itemBuf(Save_Get(police_box).keep_items); /* the vanilla compaction (otherwise run at the host player's building exit) */
+        }
+    }
+    /* 11. mirror (the sanctioned raw writer; idx was validated just above), 12. bookkeeping */
+    (void)pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet);
+    slot->rev++;
+    slot->dirty_unsaved = 1;
+    R->last_pocket_rev = slot->rev;
+    pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+    pcnetgame_ts_refresh(svc); /* the seq the RESULT echoes */
+    if (is_donate) {
+        printf("[NET][MSM] host: peer %d resident %d MUSEUM_DONATE item=0x%04X slot=%u committed (donor slot %d) [TXN]\n", (int)peer, idx,
+               (unsigned)t->item, (unsigned)t->slot, idx + 1);
+    } else {
+        printf("[NET][POLICE] host: peer %d resident %d POLICE_CLAIM item=0x%04X lost-and-found slot=%d -> pocket slot %u committed [TXN]\n",
+               (int)peer, idx, (unsigned)t->item, pidx, (unsigned)t->slot);
+    }
+    if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
+        printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the town-service commit, no RESULT sent\n", (int)peer);
+        pcnetgame_host_drop_peer(peer);
+        pcnetgame_host_ts_push_all(); /* the OTHER peers still learn the new service state */
+        return; /* FAULT: no result by design */
+    }
+    /* 13. the RESULT first, then the service mirror to EVERY ready peer (the requester gets it right after its APPLIED) */
+    s_txn_svc_echo = (uint16_t)s_ts_host[svc].seq;
+    pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
+    s_txn_svc_echo = 0;
+    pcnetgame_host_ts_push_all();
+    /* 14. a push in flight carries the PRE-transaction pockets: restart it so the client never adopts a stale image */
+    if (st->rec_push_active) {
+        pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);
+    }
+}
+/* ===== TS HOST END ===== */
 
 /* ===== D3 CLIENT BEGIN: host-mirrored resident record (protocol v8, CLIENT half) =====
  * What this process does for its OWN resident record (Now_Private == Save.private_data[player_no]):
@@ -14027,6 +14511,8 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
            pcnetgame_kind_tag((int)s_ctxn.kind), (unsigned)s_ctxn.request_id, why);
     if (s_ctxn.kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && s_ctxn.kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) {
         pcnetgame_client_send_confirm(s_ctxn.kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT, reason, s_ctxn.request_id);
+    } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM) {
+        pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* town services: no reservation to release; the UI seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
         if (s_catch_pending.valid && s_catch_pending.request_id == s_ctxn.request_id) {
             s_catch_pending.valid = 0;
@@ -14048,7 +14534,8 @@ static int pcnetgame_txn_try_send(void) {
     uint8_t slot = T->slot;
     uint8_t flags = 0, aux_cond = 0;
     uint16_t item = T->item, aux_item = 0;
-    const int is_commit_kind = T->kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && T->kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY;
+    const int is_commit_kind = (T->kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && T->kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) ||
+                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM;
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -14090,6 +14577,25 @@ static int pcnetgame_txn_try_send(void) {
                     T->exch_valid = 0;
                 }
             }
+            break;
+        case PC_NETGAME_TXN_KIND_MUSEUM_DONATE:
+            /* town services: the offered item must still sit in the slot the dialogue chose; the pocket is cleared ONLY by APPLIED */
+            if (slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT || Now_Private->inventory.pockets[slot] != (mActor_name_t)T->item) {
+                pcnetgame_txn_cancel_queued("the pocket slot no longer holds the item offered to the museum", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
+                return -1;
+            }
+            break;
+        case PC_NETGAME_TXN_KIND_POLICE_CLAIM:
+            /* town services: the pocket slot the dialogue chose, or the first free one of THIS moment; the item enters ONLY by APPLIED */
+            free_idx = (slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && Now_Private->inventory.pockets[slot] == (mActor_name_t)EMPTY_NO)
+                           ? (int)slot : mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+            if (free_idx < 0) {
+                pcnetgame_txn_cancel_queued("no free pocket slot for the lost-and-found item", (uint8_t)PC_NETGAME_CONFIRM_REASON_POCKETS_FULL);
+                return -1;
+            }
+            dest = (uint8_t)PC_NETGAME_TXN_DEST_POCKET;
+            slot = (uint8_t)free_idx;
+            aux_cond = T->ts_aux; /* the lost-and-found slot index travels in the tag's aux_cond */
             break;
         case PC_NETGAME_TXN_KIND_DIG_BURIED:
         case PC_NETGAME_TXN_KIND_DIG_HOLE:
@@ -14227,7 +14733,8 @@ static int pcnetgame_txn_tick(void) {
             s_ctxn.resends++;
             printf("[NET][TXN] client: no TXN_RESULT yet for request %u seq %u -- resending the identical %s (resend %u)\n",
                    (unsigned)s_ctxn.request_id, (unsigned)s_ctxn.seq,
-                   (s_ctxn.kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && s_ctxn.kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) ? "COMMIT" : "request",
+                   ((s_ctxn.kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && s_ctxn.kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) ||
+                    s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM) ? "COMMIT" : "request",
                    (unsigned)s_ctxn.resends);
         }
     }
@@ -14262,11 +14769,14 @@ int pc_net_game_client_pocket_locked(void) {
 
 /* The ONLY writer of pockets / item_conditions / wallet for a pickup / drop / bury / dig grant / catch. Called with a copy of s_ctxn (the state
  * is already FREE) and the host's APPLIED RESULT. */
-static void pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+/* Returns 1 when the host post-image was applied to the local inventory (or there is nothing to apply), 0 when it was NOT (owner changed /
+ * inconsistent post-image): the town-service dialogue then reports REJECTED (the host state is already post-op; the next push reconciles). */
+static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
     const PCNetGameTxnTag* t = &T->tag;
     const int is_pickup = T->kind == (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP;
     const int is_grant = T->kind >= (uint8_t)PC_NETGAME_TXN_KIND_DIG_BURIED && T->kind <= (uint8_t)PC_NETGAME_TXN_KIND_CATCH;
-    const int gain = is_pickup || is_grant;                       /* an item / bells ENTER the inventory */
+    const int is_claim = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM; /* town services: a lost-and-found item enters the pocket slot (a MUSEUM_DONATE behaves like a DROP) */
+    const int gain = is_pickup || is_grant || is_claim;           /* an item / bells ENTER the inventory */
     const int to_pocket = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET;
     const int is_exch = !gain && t->flags == (uint8_t)PC_NETGAME_TXN_FLAG_EXCHANGE; /* X3: a DROP whose slot takes the catch replacement */
     const uint16_t gitem = (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_DIG_BURIED) ? in->item : t->item; /* DIG_BURIED: the host-resolved item */
@@ -14277,7 +14787,7 @@ static void pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNet
     if (!pcnetgame_owner_stamp_matches(&T->owner)) {
         printf("[NET][TXN] client: APPLIED for request %u but the local player/save changed -- nothing applied (the host mirror is the "
                "truth at the next join)\n", (unsigned)T->request_id);
-        return;
+        return 0;
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH && !to_pocket) {
         /* a full-pockets catch: nothing enters the pockets (the host kept the pre-image and granted the exchange credit) */
@@ -14287,7 +14797,7 @@ static void pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNet
             pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
             s_crec.next_check_ms = 0;
         }
-        return;
+        return 1;
     }
     if ((gain && to_pocket && (t->slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT || gitem == (uint16_t)EMPTY_NO || in->post_pockets[t->slot] != gitem)) ||
         (!gain && (t->slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT ||
@@ -14295,7 +14805,7 @@ static void pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNet
         in->post_wallet > (uint32_t)mPr_WALLET_MAX) {
         printf("[NET][TXN] client: *** APPLIED for request %u carries an inconsistent post-image -- nothing applied ***\n",
                (unsigned)T->request_id);
-        return;
+        return 0;
     }
     np = Now_Private;
     for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
@@ -14402,6 +14912,7 @@ static void pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNet
         pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
         s_crec.next_check_ms = 0;
     }
+    return 1;
 }
 
 /* X3: records the resolved outcome of a catch for the putaway exchange gate (pc_net_game_query_catch_outcome): accepted only when the host
@@ -14431,6 +14942,7 @@ static void pcnetgame_handle_client_txn_result(const PCNetGameTxnResultMsg* in) 
         printf("[NET][TXN] client: REJECTED(%s) kind=%s request=%u seq=%u (host rev %u) -- no local change%s\n",
                pcnetgame_txn_reason_name(in->reason), pcnetgame_kind_tag((int)T.kind), (unsigned)T.request_id, (unsigned)T.seq,
                (unsigned)in->rev, T.exch_valid && T.tag.flags != 0 ? "; the exchange replacement is lost" : "");
+        pcnetgame_ts_op_resolve(T.kind, T.request_id, 0); /* town services: the UI seam gets "rejected" (give-back / refusal path) */
         if (T.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
             pcnetgame_txn_catch_outcome(&T, 0);
             printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) rejected by host -- no item granted\n", (unsigned)T.request_id,
@@ -14441,6 +14953,7 @@ static void pcnetgame_handle_client_txn_result(const PCNetGameTxnResultMsg* in) 
     if (in->dest != T.tag.dest || in->slot != T.tag.slot ||
         (T.kind == (uint8_t)PC_NETGAME_TXN_KIND_DIG_BURIED ? in->item == (uint16_t)EMPTY_NO : in->item != T.tag.item)) {
         printf("[NET][TXN] client: *** APPLIED for request %u does not echo what was sent -- nothing applied ***\n", (unsigned)T.request_id);
+        pcnetgame_ts_op_resolve(T.kind, T.request_id, 0);
         if (T.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
             pcnetgame_txn_catch_outcome(&T, 0);
         }
@@ -14449,7 +14962,12 @@ static void pcnetgame_handle_client_txn_result(const PCNetGameTxnResultMsg* in) 
     printf("[NET][TXN] client: TXN_RESULT APPLIED%s kind=%s request=%u seq=%u rev=%u epoch=%u (%u resends)\n",
            in->reason == (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED ? " (replayed)" : "", pcnetgame_kind_tag((int)T.kind),
            (unsigned)T.request_id, (unsigned)T.seq, (unsigned)in->rev, (unsigned)in->epoch, (unsigned)T.resends);
-    pcnetgame_txn_apply_applied(&T, in);
+    {
+        const int applied_ok = pcnetgame_txn_apply_applied(&T, in);
+        /* town services: the UI seam proceeds only when the pocket really was applied; otherwise it is told REJECTED (the host is already post-op, the
+         * client reconciles via the next push) -- the txn lifecycle (state FREE, locks released) is unchanged */
+        pcnetgame_ts_op_resolve(T.kind, T.request_id, applied_ok);
+    }
     if (T.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
         /* the exchange-gate outcome and the collection-bit commit that the notice seams deferred (formerly done on CATCH_RESULT) */
         const int mine = pcnetgame_owner_stamp_matches(&T.owner);
@@ -14560,6 +15078,333 @@ static void pcnetgame_run_txn_test_hook(void) {
     (void)pc_net_game_request_pickup(s_ux, s_uz, (int)s_item);
 }
 /* ===== X1b CLIENT END ===== */
+
+/* ===== TS CLIENT BEGIN: town services milestone 1, CLIENT half (protocol v8, unreleased) =====
+ * (1) MIRROR: TOWN_SVC_STATE is validated (service, exact len, FNV digest, seq strictly above the last applied one of THIS session, content)
+ * and written into the client's LOCAL Save_Get(police_box) / Save_Get(museum_display). Those regions are SHARED host-owned town state: the
+ * client never persists them (clients never write a save) and nothing else on a client writes them (mPB_keep_item is refused by the Stage 0
+ * guard, the museum / police UI seams below go through the host). Interiors that were built from Save_t at scene construction do not refresh
+ * by themselves: the lost-and-found item draw table is rebuilt through the existing FG-update flag when the client stands in the police
+ * box; the museum rooms (fish / insect / painting / fossil actors read the donor nibbles at construction) reflect a new donation at the
+ * NEXT ENTRY of the room (state correctness first).
+ * (2) UI SEAMS: pc_net_game_ts_begin_museum_donate() / _police_claim() start ONE transaction (TXN_COMMIT kind 8 / 9) and
+ * pc_net_game_ts_poll() reports PENDING / APPLIED / REJECTED to the vanilla dialogue state machines, which wait in a neutral state while it
+ * is pending. The pocket changes ONLY in pcnetgame_txn_apply_applied() (host post-image); a REJECTED result changes nothing. */
+
+static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int applied) {
+    if (s_ts_op.active && s_ts_op.kind == kind && s_ts_op.request_id == request_id) {
+        s_ts_op.done = 1;
+        s_ts_op.outcome = applied ? 1 : 2;
+    }
+}
+
+static int pcnetgame_ts_valid_police_blob(const uint8_t* blob) {
+    int i;
+    for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
+        uint16_t v = (uint16_t)((uint16_t)blob[2 * i] | ((uint16_t)blob[2 * i + 1] << 8));
+        if (v != (uint16_t)EMPTY_NO && !(ITEM_IS_ITEM1(v) || ITEM_IS_FTR(v))) {
+            return 0; /* mPB_keep_item only ever stores ITEM1 / FTR */
+        }
+    }
+    return 1;
+}
+
+static int pcnetgame_ts_valid_museum_blob(const uint8_t* blob) {
+    unsigned i;
+    for (i = 0; i < PC_NETGAME_TS_MUSEUM_LEN; i++) {
+        if ((blob[i] & 0x0Fu) > (unsigned)mMmd_DONATOR_DELETED_PLAYER || (blob[i] >> 4) > (unsigned)mMmd_DONATOR_DELETED_PLAYER) {
+            return 0; /* a donor nibble is 0 (none), 1..4 (a resident slot + 1) or 5 (deleted player) */
+        }
+    }
+    return 1;
+}
+
+static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
+    const int svc = (int)m->service;
+    int i;
+    if (svc == (int)PC_NETGAME_TS_POLICE) {
+        for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
+            Save_Get(police_box).keep_items[i] = (mActor_name_t)((uint16_t)m->blob[2 * i] | ((uint16_t)m->blob[2 * i + 1] << 8));
+        }
+    } else {
+        memcpy(&Save_Get(museum_display), m->blob, PC_NETGAME_TS_MUSEUM_LEN);
+    }
+    s_ts_client_seq[svc] = m->seq;
+    s_ts_client_have[svc] = 1;
+    printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : "MUSEUM",
+           (unsigned)m->seq, (unsigned)m->digest, (unsigned)m->len);
+    if (svc == (int)PC_NETGAME_TS_POLICE && s_local_scene.valid && s_local_scene.scene_id == (uint8_t)SCENE_POLICE_BOX) {
+        mFI_SetFGUpData(); /* the existing refresh point: bg_police_item rebuilds its draw table from keep_items on the next frame */
+        printf("[NET][TS] client: the lost-and-found items on display are being redrawn from the mirror\n");
+    }
+}
+
+static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size) {
+    PCNetGameTownSvcStateMsg m;
+    int svc;
+    uint16_t expect;
+    if (s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (size < (uint16_t)offsetof(PCNetGameTownSvcStateMsg, blob) || size > (uint16_t)sizeof(m)) {
+        printf("[NET][TS] client: TOWN_SVC_STATE of size %u refused (header %u .. max %u)\n", (unsigned)size,
+               (unsigned)offsetof(PCNetGameTownSvcStateMsg, blob), (unsigned)sizeof(m));
+        return;
+    }
+    memset(&m, 0, sizeof(m));
+    memcpy(&m, data, size);
+    svc = (int)m.service;
+    if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM) {
+        printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
+        return;
+    }
+    expect = (svc == (int)PC_NETGAME_TS_POLICE) ? (uint16_t)PC_NETGAME_TS_POLICE_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+    if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
+        printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
+               (unsigned)size);
+        return;
+    }
+    if (pcnetgame_fnv1a32(m.blob, m.len) != m.digest) {
+        printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: digest mismatch\n", svc, (unsigned)m.seq);
+        return;
+    }
+    if (m.seq == 0u || (s_ts_client_have[svc] && m.seq <= s_ts_client_seq[svc]) ||
+        (s_ts_client_stash_valid[svc] && m.seq <= s_ts_client_stash[svc].seq)) {
+        printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u is stale / duplicate (last %u) -- ignored\n", svc, (unsigned)m.seq,
+               (unsigned)(s_ts_client_stash_valid[svc] && s_ts_client_stash[svc].seq > s_ts_client_seq[svc] ? s_ts_client_stash[svc].seq : s_ts_client_seq[svc]));
+        return;
+    }
+    if (!(svc == (int)PC_NETGAME_TS_POLICE ? pcnetgame_ts_valid_police_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+        printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
+               svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : "museum");
+        return;
+    }
+    if (!pcfa_save_ready()) {
+        s_ts_client_stash[svc] = m; /* applied by pcnetgame_ts_client_tick() as soon as the local save is usable */
+        s_ts_client_stash_valid[svc] = 1;
+        printf("[NET][TS] client: service %d seq %u stashed (the local save is not usable yet)\n", svc, (unsigned)m.seq);
+        return;
+    }
+    pcnetgame_ts_client_apply(&m);
+}
+
+static void pcnetgame_ts_client_tick(void) {
+    int svc;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcfa_save_ready()) {
+        return;
+    }
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_MUSEUM; svc++) {
+        if (s_ts_client_stash_valid[svc]) {
+            s_ts_client_stash_valid[svc] = 0;
+            if (!s_ts_client_have[svc] || s_ts_client_stash[svc].seq > s_ts_client_seq[svc]) {
+                pcnetgame_ts_client_apply(&s_ts_client_stash[svc]);
+            }
+        }
+    }
+}
+
+/* Begins the transaction of the pending UI operation. Returns 1 = started, 0 = refused for good (not a READY client, bad arguments, no usable
+ * player: the caller takes its give-back / refusal path), -1 = busy, retry on the next frame (another pocket transaction is unresolved). */
+static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item) {
+    PCNetGameOwnerStamp stamp;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT || item <= 0 || item > 0xFFFF || aux < 0 || aux > 0xFF) {
+        return 0;
+    }
+    if (s_ts_op.active && s_ts_op.done) {
+        memset(&s_ts_op, 0, sizeof(s_ts_op)); /* the unconsumed result of an abandoned dialogue */
+    }
+    if (s_ts_op.active || pcnetgame_txn_busy() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return -1;
+    }
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        return 0;
+    }
+    s_ts_op.active = 1;
+    s_ts_op.kind = kind;
+    s_ts_op.slot = (uint8_t)slot;
+    s_ts_op.aux = (uint8_t)aux;
+    s_ts_op.item = (uint16_t)item;
+    s_ts_op.request_id = s_ts_next_rid++;
+    memset(&s_ctxn, 0, sizeof(s_ctxn));
+    s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
+    s_ctxn.kind = kind;
+    s_ctxn.slot = (uint8_t)slot;
+    s_ctxn.item = (uint16_t)item;
+    s_ctxn.ts_aux = (uint8_t)aux;
+    s_ctxn.request_id = s_ts_op.request_id;
+    s_ctxn.owner = stamp;
+    s_ctxn.first_ms = pcnetgame_now_ms();
+    printf("[NET][TS] client: begin %s request=%u pocket slot=%d item=0x%04X%s\n", pcnetgame_kind_tag((int)kind), (unsigned)s_ts_op.request_id, slot,
+           (unsigned)item, kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ? "" : "");
+    (void)pcnetgame_txn_try_send(); /* usually goes out right now; otherwise pcnetgame_txn_tick() keeps trying */
+    return 1;
+}
+
+int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item) {
+    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item);
+}
+
+int pc_net_game_ts_begin_police_claim(int pocket_slot, int police_idx, int item) {
+    return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM, pocket_slot, police_idx, item);
+}
+
+/* PC_NETGAME_TS_OP_PENDING while the transaction is unresolved; once resolved APPLIED / REJECTED exactly once (the result is consumed). A link
+ * loss or no operation reports REJECTED (nothing was removed or granted locally, so the give-back / refusal path is the safe one). */
+int pc_net_game_ts_poll(void) {
+    int r;
+    if (!s_ts_op.active) {
+        return PC_NETGAME_TS_OP_REJECTED;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        memset(&s_ts_op, 0, sizeof(s_ts_op));
+        return PC_NETGAME_TS_OP_REJECTED;
+    }
+    if (!s_ts_op.done) {
+        return PC_NETGAME_TS_OP_PENDING;
+    }
+    r = (s_ts_op.outcome == 1) ? PC_NETGAME_TS_OP_APPLIED : PC_NETGAME_TS_OP_REJECTED;
+    memset(&s_ts_op, 0, sizeof(s_ts_op));
+    return r;
+}
+
+/* TEST-ONLY (--ts-test-donate / --ts-test-claim, client role, default OFF, never active in normal play; every step logs "[NET][TS][TEST-ONLY]").
+ * Drives ONE real museum donation / lost-and-found claim through the REAL client request path (pc_net_game_ts_begin_* / _poll -> TXN_COMMIT ->
+ * TXN_RESULT -> pcnetgame_txn_apply_applied(), the same entry points the Blathers / Booker dialogue seams call) without GUI input. It bypasses
+ * ONLY the dialogue and the menu: --ts-test-donate first PUTS a donatable fish into a free local pocket slot (the one local pocket write of the
+ * hook, loudly logged, standing in for "the player caught a fish"; the species is the first one the LOCAL mirror says the museum lacks) and
+ * waits 5 s so the normal D3 upload carries it; --ts-test-claim claims the first item of the LOCAL lost-and-found mirror into the first free
+ * slot. While the transaction is unresolved the pockets must not change (a loud "*** POCKET CHANGED BEFORE APPLIED ***" otherwise). */
+static void pcnetgame_ts_test_log_state(const char* tag) {
+    char buf[15 * 5 + 1];
+    char pb[20 * 5 + 1];
+    int i;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        snprintf(buf + i * 5, sizeof(buf) - (size_t)i * 5, "%04X,", (unsigned)Now_Private->inventory.pockets[i]);
+    }
+    buf[sizeof(buf) - 1] = '\0';
+    for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
+        snprintf(pb + i * 5, sizeof(pb) - (size_t)i * 5, "%04X,", (unsigned)Save_Get(police_box).keep_items[i]);
+    }
+    pb[sizeof(pb) - 1] = '\0';
+    printf("[NET][TS][TEST-ONLY] %s pockets=%s police=%s wallet=%u\n", tag, buf, pb, (unsigned)Now_Private->inventory.wallet);
+}
+
+static void pcnetgame_run_ts_test_hook(void) {
+    static int s_stage = 0;
+    static uint32_t s_t0 = 0;
+    static int s_slot = -1, s_pidx = -1;
+    static uint16_t s_item = 0;
+    static uint16_t s_snap[mPr_POCKETS_SLOT_COUNT];
+    uint32_t now;
+    int i, r;
+    const int donate = g_pc_ts_test_donate != 0;
+
+    if ((!g_pc_ts_test_donate && !g_pc_ts_test_claim) || s_stage >= 5 || s_role != PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+    if (!pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_stage == 0) {
+        if ((uint32_t)(now - s_crec.adopt_ms) < 4000u || !s_ts_client_have[donate ? PC_NETGAME_TS_MUSEUM : PC_NETGAME_TS_POLICE]) {
+            return;
+        }
+        s_slot = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+        if (s_slot < 0) {
+            printf("[NET][TS][TEST-ONLY] no free pocket slot -- hook gives up\n");
+            s_stage = 5;
+            return;
+        }
+        if (donate) {
+            s_item = 0;
+            for (i = (int)ITM_FISH_START; i <= (int)ITM_FISH_START + 39; i++) {
+                if (mMmd_GetDisplayInfo((mActor_name_t)i) == mMmd_DISPLAY_CAN_DONATE) {
+                    s_item = (uint16_t)i;
+                    break;
+                }
+            }
+            if (s_item == 0) {
+                printf("[NET][TS][TEST-ONLY] --ts-test-donate: the mirrored museum already holds every fish -- hook gives up\n");
+                s_stage = 5;
+                return;
+            }
+            Now_Private->inventory.pockets[s_slot] = (mActor_name_t)s_item; /* the hook's ONE local pocket write: "the player caught this fish" */
+            Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, s_slot, mPr_ITEM_COND_NORMAL);
+            printf("[NET][TS][TEST-ONLY] --ts-test-donate: placed fish item 0x%04X into pocket slot %d (local test setup, NOT active in normal play)\n",
+                   (unsigned)s_item, s_slot);
+            s_t0 = now;
+            s_stage = 1;
+        } else {
+            s_pidx = -1;
+            for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
+                if (Save_Get(police_box).keep_items[i] != (mActor_name_t)EMPTY_NO) {
+                    s_pidx = i;
+                    break;
+                }
+            }
+            if (s_pidx < 0) {
+                return; /* wait until the mirror holds an item */
+            }
+            s_item = (uint16_t)Save_Get(police_box).keep_items[s_pidx];
+            s_t0 = now;
+            s_stage = 2;
+        }
+        pcnetgame_ts_test_log_state("--ts-test: stage 0 setup done");
+        return;
+    }
+    if (s_stage == 1 && (uint32_t)(now - s_t0) < 5000u) {
+        return; /* let the D3 upload carry the fish first */
+    }
+    if (s_stage == 1 || s_stage == 2) {
+        if (pcnetgame_txn_busy() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+            return;
+        }
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            s_snap[i] = (uint16_t)Now_Private->inventory.pockets[i];
+        }
+        printf("[NET][TS][TEST-ONLY] --ts-test-%s: requesting %s item 0x%04X pocket slot %d%s\n", donate ? "donate" : "claim",
+               donate ? "MUSEUM_DONATE" : "POLICE_CLAIM", (unsigned)s_item, s_slot, donate ? "" : " (lost-and-found slot given by the mirror)");
+        r = donate ? pc_net_game_ts_begin_museum_donate(s_slot, (int)s_item) : pc_net_game_ts_begin_police_claim(s_slot, s_pidx, (int)s_item);
+        if (r < 0) {
+            return; /* busy: retried */
+        }
+        if (r == 0) {
+            printf("[NET][TS][TEST-ONLY] --ts-test: the request was refused locally -- hook gives up\n");
+            s_stage = 5;
+            return;
+        }
+        s_stage = 3;
+        return;
+    }
+    if (s_stage == 3) {
+        r = pc_net_game_ts_poll();
+        if (r == PC_NETGAME_TS_OP_PENDING) {
+            for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+                if (s_snap[i] != (uint16_t)Now_Private->inventory.pockets[i]) {
+                    printf("[NET][TS][TEST-ONLY] --ts-test: *** POCKET CHANGED BEFORE APPLIED *** (slot %d)\n", i);
+                    s_snap[i] = (uint16_t)Now_Private->inventory.pockets[i];
+                }
+            }
+            return;
+        }
+        printf("[NET][TS][TEST-ONLY] --ts-test-%s: result %s item 0x%04X\n", donate ? "donate" : "claim",
+               r == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED", (unsigned)s_item);
+        s_t0 = now;
+        s_stage = 4;
+        return;
+    }
+    if (s_stage == 4 && (uint32_t)(now - s_t0) >= 2500u) { /* the service mirror follows the RESULT: report the settled state */
+        pcnetgame_ts_test_log_state("--ts-test: final");
+        printf("[NET][TS][TEST-ONLY] --ts-test-%s: final item 0x%04X museum_info=%d (1 can donate, 2 already donated)\n", donate ? "donate" : "claim",
+               (unsigned)s_item, (int)mMmd_GetDisplayInfo((mActor_name_t)s_item));
+        s_stage = 5;
+    }
+}
+/* ===== TS CLIENT END ===== */
 
 /* TEST-ONLY (--txn-test-dig-grant, client role, default OFF, never active in normal play): drives the three host-transactional dig GRANTS through the
  * REAL request functions, one after the other, against the --field-action-test-seed fixtures of the host: DIG_BURIED at (40,104) (a buried
@@ -15103,6 +15948,15 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_TOWN_SVC_STATE) {
+        /* Town services: TOWN_SVC_STATE is host -> client only; a client never originates it. Dropped, never applied (the host never
+         * overwrites its own authoritative town-service copy from a peer). */
+        if (g_pc_verbose) {
+            printf("[NET][TS] host: peer %d sent a client-originated TOWN_SVC_STATE (size %u) -- dropped\n", (int)peer, (unsigned)size);
+        }
+        return;
+    }
+
     if (size == sizeof(PCNetGamePickupRequestMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PICKUP_REQUEST) {
         PCNetGamePickupRequestMsg pr;
         memcpy(&pr, data, sizeof(pr));
@@ -15134,7 +15988,11 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     if (size == sizeof(PCNetGameTxnCommitMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_TXN_COMMIT) {
         PCNetGameTxnCommitMsg tc;
         memcpy(&tc, data, sizeof(tc)); /* X1 (v8): exact size, aligned local copy; the READY / binding gates are inside */
-        pcnetgame_handle_host_txn_commit(peer, &tc);
+        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM) {
+            pcnetgame_handle_host_ts_txn(peer, &tc); /* town services: reservation-less one-phase kinds */
+        } else {
+            pcnetgame_handle_host_txn_commit(peer, &tc);
+        }
         return;
     }
 
@@ -15269,6 +16127,15 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         memcpy(&br, data, sizeof(br));
         pcnetgame_handle_client_bury_result(&br);
         return;
+    }
+
+    if (size >= 1 && data[0] == (uint8_t)PC_NETGAME_MSG_TOWN_SVC_STATE) {
+        pcnetgame_handle_client_town_svc(data, size); /* town services: validated, then written into the LOCAL Save_t region only */
+        return;
+    }
+
+    if (size >= 1 && (data[0] == (uint8_t)PC_NETGAME_MSG_TXN_RESERVED_53 || data[0] == (uint8_t)PC_NETGAME_MSG_TXN_RESERVED_54)) {
+        return; /* reserved for X2: ignored */
     }
 
     if (size == sizeof(PCNetGameTxnResultMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_TXN_RESULT) {
@@ -15583,6 +16450,10 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_bury_pending, 0, sizeof(s_bury_pending));
     memset(&s_ctxn, 0, sizeof(s_ctxn)); /* X1b: the transaction in flight dies with the session (no orphan retention in X1); s_txn_nonce / s_txn_next_seq are PROCESS-wide and deliberately NOT reset */
     s_next_bury_request_id = 1;
+    memset(&s_ts_op, 0, sizeof(s_ts_op)); /* town services: the UI operation and the mirror's seq memory die with the session (the host's seq restarts per process) */
+    memset(s_ts_client_seq, 0, sizeof(s_ts_client_seq));
+    memset(s_ts_client_have, 0, sizeof(s_ts_client_have));
+    memset(s_ts_client_stash_valid, 0, sizeof(s_ts_client_stash_valid));
     memset(s_field_action_queue, 0, sizeof(s_field_action_queue)); /* T0-C: whole queue, not one slot */
     s_field_action_queue_len = 0;
     s_next_field_action_request_id = 1;
@@ -17210,6 +18081,7 @@ void pc_net_game_poll(void) {
         pcnetgame_host_closing_tick();
         pcnetgame_host_process_pending_identities();
         pcnetgame_host_record_tick(); /* D3: HELLO/MIGRATE deadlines, record push pump, host-field watcher */
+        pcnetgame_host_ts_tick();     /* town services: digest-poll the host's police / museum copies and push TOWN_SVC_STATE */
         pcnetgame_host_world_poll();
     } else {
         pcnetgame_client_tick();
@@ -17537,6 +18409,11 @@ void pc_net_game_poll(void) {
     /* X3 real-client dig-grant test: see pcnetgame_run_txn_dig_test_hook()'s own doc -- a complete no-op unless --txn-test-dig-grant was
      * passed (client role only). */
     pcnetgame_run_txn_dig_test_hook();
+
+    /* Town services: apply a mirror message that arrived before the local save was usable, then the TEST-ONLY real-client hooks
+     * (--ts-test-donate / --ts-test-claim; complete no-ops by default, client role only). */
+    pcnetgame_ts_client_tick();
+    pcnetgame_run_ts_test_hook();
 
     /* World Ecology Wildlife Sync T1 real-gameplay verification: see
      * pcnetgame_run_wildlife_trigger_test_trigger()'s own doc -- a complete no-op unless

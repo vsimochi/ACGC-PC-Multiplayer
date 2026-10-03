@@ -614,6 +614,18 @@ int pc_net_game_request_bury(int pocket_slot_idx, int claimed_item, int ut_x, in
  * known. It clears by itself on every matched TXN_RESULT, and on a session reset. */
 int pc_net_game_client_pocket_locked(void);
 
+/* Town services milestone 1 (protocol v8, unreleased): the client UI seams of the Blathers donation and the Booker lost-and-found claim. Both are
+ * host-authoritative transactions (TXN_COMMIT kind 8 / 9): the vanilla dialogue state machines call _begin_* once, then poll pc_net_game_ts_poll()
+ * every frame in a neutral state until it stops answering PENDING. The pocket is changed ONLY by the host's APPLIED post-image; REJECTED changes
+ * nothing. begin: 1 = started, 0 = refused for good (not a READY client / bad arguments: take the give-back / refusal path), -1 = busy, ask again on
+ * the next frame. Only ever called with pc_net_game_role() == PC_NETGAME_ROLE_CLIENT. */
+#define PC_NETGAME_TS_OP_PENDING  0
+#define PC_NETGAME_TS_OP_APPLIED  1
+#define PC_NETGAME_TS_OP_REJECTED 2
+int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item);
+int pc_net_game_ts_begin_police_claim(int pocket_slot, int police_idx, int item);
+int pc_net_game_ts_poll(void);
+
 /* World Ecology T3: HOST-LOCAL bury -- mirrors pc_net_game_host_local_money_rock_hit()'s/
  * pc_net_game_host_local_tree_shake()'s own precedent exactly: the host's own local bury action routes
  * through the SAME validate+commit logic a remote peer's BURY_REQUEST/INTERACT_CONFIRM pair uses,

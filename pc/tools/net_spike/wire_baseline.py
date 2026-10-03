@@ -32,16 +32,20 @@ import sys
 # Host/client-local state, never on the wire: PCNetGameRecRange/RecSlot/ClientRec (D3); X1: PCNetGameHostInteraction (gains the
 # reservation's pocket_slot / commit_path), PCNetGameTxnLog + PCNetGameTxnResident (the host's per-resident journal) and
 # PCNetGameClientTxn (the real client's one in-flight transaction, added by X1b).
+# Town services milestone 1: PCNetGameTsHost (the host's per-service mirror slot) and PCNetGameTsOp (the client's one UI-seam operation) are local, never on the wire.
 # X3: PCNetGameFieldActionPending (the CLIENT-only field-action queue entry, never on the wire) lost its `local_grant` member: a grant-carrying
 # dig request is now a host-transactional grant owned by PCNetGameClientTxn, no longer a queue entry.
 HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRange", "PCNetGameRecSlot", "PCNetGameClientRec",
-             "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending")
+             "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending",
+             "PCNetGameTsHost", "PCNetGameTsOp")
 # Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
 # (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
 REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
 # The highest message id of PCNetGameMsgType (ids are contiguous 1..EXPECTED_MAX_MSG_ID). Tests assert against THIS constant
 # instead of a literal, so the next deliberate id addition is one reviewed edit here.
-EXPECTED_MAX_MSG_ID = 52
+# Town services milestone 1 (deliberate, v8 still unreleased): 53 / 54 are ENUMERATED as reserved ids (X2: TXN_QUERY / TXN_STATUS, never sent) so
+# the ids stay contiguous, and 55 = TOWN_SVC_STATE (the generic host -> client service mirror).
+EXPECTED_MAX_MSG_ID = 55
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -63,6 +67,17 @@ V8_NEW_STRUCTS = {
                        "uint8_t aux_cond; uint16_t aux_item; uint32_t base_epoch; uint32_t base_rev; uint16_t pre_pockets[15]; "
                        "uint16_t _rsv0; uint32_t pre_conds; uint32_t pre_wallet;",
     "PCNetGameTxnCommitMsg": "uint8_t msg_type; uint8_t kind; uint16_t _rsv0; uint32_t request_id; PCNetGameTxnTag tag;",
+    # town services milestone 1: the result's reserved u16 became svc_seq16 (low 16 bits of the service-blob seq a MUSEUM_DONATE / POLICE_CLAIM produced)
+    "PCNetGameTxnResultMsg": "uint8_t msg_type; uint8_t kind; uint8_t outcome; uint8_t reason; uint32_t request_id; "
+                             "uint32_t txn_nonce; uint32_t txn_seq; uint32_t host_session; uint32_t epoch; uint32_t rev; "
+                             "uint32_t cdig; uint8_t dest; uint8_t slot; uint16_t item; uint16_t post_pockets[15]; "
+                             "uint16_t svc_seq16; uint32_t post_conds; uint32_t post_wallet;",
+    # town services milestone 1: the generic host -> client service mirror (variable length on the wire: offsetof(blob) + len)
+    "PCNetGameTownSvcStateMsg": "uint8_t msg_type; uint8_t service; uint16_t len; uint32_t seq; uint32_t digest; "
+                                "uint8_t blob[PC_NETGAME_TS_BLOB_MAX];",
+}
+# What HEAD may still contain for a struct whose v8 text was deliberately changed in place by a later (still unreleased) milestone.
+V8_PREV_STRUCTS = {
     "PCNetGameTxnResultMsg": "uint8_t msg_type; uint8_t kind; uint8_t outcome; uint8_t reason; uint32_t request_id; "
                              "uint32_t txn_nonce; uint32_t txn_seq; uint32_t host_session; uint32_t epoch; uint32_t rev; "
                              "uint32_t cdig; uint8_t dest; uint8_t slot; uint16_t item; uint16_t post_pockets[15]; "
@@ -85,13 +100,21 @@ X3_CHANGED_STRUCTS = {
 X3_SIZE_ASSERTS = ('_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 76,', '_Static_assert(sizeof(PCNetGameCatchRequestMsg) == 84,',
                    '_Static_assert(offsetof(PCNetGameFieldActionRequestMsg, tag) == 12,',
                    '_Static_assert(offsetof(PCNetGameCatchRequestMsg, tag) == 20,')
+# Town services milestone 1: exact C lines (constants + size / offset asserts) that must stay as they are.
+TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM   2u", "#define PC_NETGAME_TS_SHOP     3u",
+             "#define PC_NETGAME_TS_BLOB_MAX 340u", "#define PC_NETGAME_TS_POLICE_LEN 40u", "#define PC_NETGAME_TS_MUSEUM_LEN 63u",
+             "#define PC_NETGAME_TXN_KIND_MUSEUM_DONATE 8u", "#define PC_NETGAME_TXN_KIND_POLICE_CLAIM  9u",
+             '_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352,', "offsetof(PCNetGameTownSvcStateMsg, blob) == 12")
 V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_BEGIN", "48"),
                 ("PC_NETGAME_MSG_RECORD_CHUNK", "49"), ("PC_NETGAME_MSG_RECORD_ACK", "50"),
-                ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52")]
-_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT))\s*=\s*\d+,"
+                ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52"),
+                ("PC_NETGAME_MSG_TXN_RESERVED_53", "53"), ("PC_NETGAME_MSG_TXN_RESERVED_54", "54"),
+                ("PC_NETGAME_MSG_TOWN_SVC_STATE", "55")]
+_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE)\s*=\s*\d+,"
 # net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
 V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
+                           r"|PC_NETGAME_MSG_TOWN_SVC_STATE|PC_NETGAME_TS_\w+|TOWN_SVC_STATE_FMT"
                            r"|PC_NETGAME_MSG_(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)|(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)_FMT) = ")
 
 
@@ -165,6 +188,10 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_BUSY": '12',
     "PC_NETGAME_TXN_REASON_FAULT": '13',
     "PC_NETGAME_TXN_REASON_REPLAYED": '14',
+    "PC_NETGAME_TXN_REASON_ALREADY_DONATED": '15',
+    "PC_NETGAME_TXN_REASON_NOT_AVAILABLE": '16',
+    "PC_NETGAME_TXN_REASON_NOT_DONATABLE": '17',
+    "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT": '18',
     "PC_NETGAME_TXN_RING": '16',
     "PC_NETGAME_TXN_FENCED_NUM": '4',
     "TXN_TAG_FMT": '"<IIBBHBBHII15HHII"',
@@ -179,6 +206,17 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_KIND_DIG_HOLE": '5',
     "PC_NETGAME_TXN_KIND_DIG_SHINE": '6',
     "PC_NETGAME_TXN_KIND_CATCH": '7',
+    # town services milestone 1
+    "PC_NETGAME_TXN_KIND_MUSEUM_DONATE": '8',
+    "PC_NETGAME_TXN_KIND_POLICE_CLAIM": '9',
+    "PC_NETGAME_MSG_TOWN_SVC_STATE": '55',
+    "PC_NETGAME_TS_POLICE": '1',
+    "PC_NETGAME_TS_MUSEUM": '2',
+    "PC_NETGAME_TS_SHOP": '3',
+    "PC_NETGAME_TS_BLOB_MAX": '340',
+    "PC_NETGAME_TS_POLICE_LEN": '40',
+    "PC_NETGAME_TS_MUSEUM_LEN": '63',
+    "TOWN_SVC_STATE_FMT": '"<BBHII"',
     "FIELD_ACTION_REQUEST_FMT": '"<BBBBIBBHIIBBHBBHII15HHII"',
     "FIELD_ACTION_RESULT_FMT": '"<BBBBIHBB"',
     "CATCH_REQUEST_FMT": '"<B3xIIIiIIBBHBBHII15HHII"',
@@ -252,21 +290,24 @@ def audit_texts(head, cur):
                   and not (k in REMOVED_CLIENT_ONLY and k not in cb))  # a deliberately deleted client-only struct (X1b)
     add("wire: every PCNet* typedef struct/enum of pc_net_game.c identical to HEAD except the host-only %s, the deleted client-only %s and the pinned v8 "
         "structs (changed: %s) [%d blocks]" % ("/".join(HOST_ONLY), "/".join(REMOVED_CLIENT_ONLY), diff, len(cb)), not diff and len(cb) > 50)
-    add("wire: the %d v8 record + transaction structs exist with EXACTLY the documented layout (pinned) and HEAD has none or the same"
-        % len(V8_NEW_STRUCTS), all(cb.get(k) == v and hb.get(k) in (None, v) for k, v in V8_NEW_STRUCTS.items()))
+    add("wire: the %d v8 record + transaction + town-service structs exist with EXACTLY the documented layout (pinned) and HEAD has none, the same, "
+        "or the documented previous text" % len(V8_NEW_STRUCTS),
+        all(cb.get(k) == v and hb.get(k) in (None, v, V8_PREV_STRUCTS.get(k)) for k, v in V8_NEW_STRUCTS.items()))
     add("wire: X3 -- FIELD_ACTION_REQUEST (12 -> 76 B) and CATCH_REQUEST (20 -> 84 B) are the ONLY pre-existing structs that changed: EXACTLY the "
         "old layout + the trailing PCNetGameTxnTag (pinned; HEAD has the old or the same layout) and the 76 / 84 size and tag-offset asserts exist",
         all(cb.get(k) == v and hb.get(k) in (X3_OLD_STRUCTS[k], v) for k, v in X3_CHANGED_STRUCTS.items())
         and all(a in cur["game_c"] for a in X3_SIZE_ASSERTS))
+    add("wire: town services -- the service ids, blob length constants and the 352-byte / offset _Static_asserts of PCNetGameTownSvcStateMsg are pinned in pc_net_game.c",
+        all(a in cur["game_c"] for a in TS_C_PINS))
     strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
-    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT)))\s*=\s*(\d+),", b)
-    # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit) or all of them
-    head_ids_ok = ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS) if "PCNetGameMsgType" in hb else False
-    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-52 (appended, in order; 53/54 reserved)",
+    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE))\s*=\s*(\d+),", b)
+    # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52) or all of them
+    head_ids_ok = ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS) if "PCNetGameMsgType" in hb else False
+    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-55 (appended, in order; 53/54 enumerated as reserved)",
         "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
         and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
         and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
-        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_TXN_RESULT = 52"))
+        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_TOWN_SVC_STATE = 55"))
     nums = [v for _n, v in c_message_ids(cur["game_c"])]
     add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
@@ -356,14 +397,24 @@ def selftest(repo):
         "protocol version": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>9u", c["game_h"], count=1)),
         "protocol reverted": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>7u", c["game_h"], count=1)),
         "enum value": lambda c: c.update(game_c=c["game_c"].replace(msg_id.group(0), msg_id.group(0).replace(",", " + 1,"), 1)),
-        "extra enum id 53": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 52,\n    PC_NETGAME_MSG_EXTRA = 53,", 1)),
+        "extra enum id 56": lambda c: c.update(game_c=c["game_c"].replace("} PCNetGameMsgType;", "    PC_NETGAME_MSG_EXTRA = 56,\n} PCNetGameMsgType;", 1)),
+        "ts enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TOWN_SVC_STATE        = 55,", "PC_NETGAME_MSG_TOWN_SVC_STATE        = 65,", 1)),
+        "reserved 53 removed": lambda c: c.update(game_c=c["game_c"].replace("    PC_NETGAME_MSG_TXN_RESERVED_53       = 53,", "    PC_NETGAME_MSG_TXN_RESERVED_X        = 53,", 1)),
+        "ts struct field": lambda c: c.update(game_c=c["game_c"].replace("    uint8_t  blob[PC_NETGAME_TS_BLOB_MAX];\n} PCNetGameTownSvcStateMsg;", "    uint8_t  blob[PC_NETGAME_TS_BLOB_MAX];\n    uint32_t extra;\n} PCNetGameTownSvcStateMsg;", 1)),
+        "ts blob size": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TS_BLOB_MAX 340u", "#define PC_NETGAME_TS_BLOB_MAX 341u", 1)),
+        "txn result svc echo reverted": lambda c: c.update(game_c=c["game_c"].replace("    uint16_t svc_seq16;", "    uint16_t _rsv1;", 1)),
+        "ts lib fmt": lambda c: c.update(lib=c["lib"].replace('TOWN_SVC_STATE_FMT = "<BBHII"', 'TOWN_SVC_STATE_FMT = "<BBHIII"', 1)),
+        "ts lib kind": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_KIND_POLICE_CLAIM = 9", "PC_NETGAME_TXN_KIND_POLICE_CLAIM = 10", 1)),
+        "ts lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_ALREADY_DONATED = 15", "PC_NETGAME_TXN_REASON_ALREADY_DONATED = 25", 1)),
+        "ts lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_TS_EXTRA = 4\n"),
+        "extra enum id 53 dup": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 52,\n    PC_NETGAME_MSG_EXTRA = 53,", 1)),
         "txn enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_COMMIT            = 51,", "PC_NETGAME_MSG_TXN_COMMIT            = 61,", 1)),
         "txn tag field": lambda c: c.update(game_c=c["game_c"].replace("    uint32_t pre_wallet;\n} PCNetGameTxnTag;", "    uint32_t pre_wallet;\n    uint32_t extra;\n} PCNetGameTxnTag;", 1)),
         "txn result field": lambda c: c.update(game_c=c["game_c"].replace("    uint16_t post_pockets[15];", "    uint16_t post_pockets[16];", 1)),
         "txn lib fmt": lambda c: c.update(lib=c["lib"].replace('TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHII"', 'TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHIII"', 1)),
         "txn lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_FENCED = 6", "PC_NETGAME_TXN_REASON_FENCED = 66", 1)),
         "txn lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_TXN_REASON_EXTRA = 15\n"),
-        "txn max id": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 53,", 1)),
+        "txn max id": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 56,", 1)),
         "X3 fa request reverted": lambda c: c.update(game_c=c["game_c"].replace("    uint16_t _reserved1;\n    PCNetGameTxnTag tag;    /* X3: all zero = no grant; see the doc above */\n} PCNetGameFieldActionRequestMsg;", "    uint16_t _reserved1;\n} PCNetGameFieldActionRequestMsg;", 1)),
         "X3 fa request field": lambda c: c.update(game_c=c["game_c"].replace("    PCNetGameTxnTag tag;    /* X3: all zero = no grant; see the doc above */\n} PCNetGameFieldActionRequestMsg;", "    PCNetGameTxnTag tag;\n    uint8_t extra;\n} PCNetGameFieldActionRequestMsg;", 1)),
         "X3 catch request field": lambda c: c.update(game_c=c["game_c"].replace("    int32_t  claimed_species;\n    PCNetGameTxnTag tag;\n} PCNetGameCatchRequestMsg;", "    int32_t  claimed_species;\n    PCNetGameTxnTag tag;\n    uint32_t extra;\n} PCNetGameCatchRequestMsg;", 1)),

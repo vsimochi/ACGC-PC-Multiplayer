@@ -410,6 +410,11 @@ int g_pc_txn_test_pickup_drop = 0;
 /* X3 real-client grant verification, TEST-ONLY: --txn-test-dig-grant. See pc_platform.h's own doc comment on this global. */
 int g_pc_txn_test_dig_grant = 0;
 
+/* Town services milestone 1 TEST-ONLY hooks: --ts-test-seed-police / --ts-test-donate / --ts-test-claim. See pc_platform.h's own doc comment. */
+const char* g_pc_ts_test_seed_police = NULL;
+int g_pc_ts_test_donate = 0;
+int g_pc_ts_test_claim = 0;
+
 /* X1 host-side fault injection, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. See pc_platform.h's own doc comment on these globals. */
 int g_pc_txn_fault_mode = 0;
 int g_pc_txn_fault_nth = 1;
@@ -581,6 +586,12 @@ int main(int argc, char* argv[]) {
                    "                      commit. MODE = ignore_commit | fail_world | expire | drop_result |\n"
                    "                      kill_peer_after_commit; fires on the N-th visit of the mode's site (default 1),\n"
                    "                      K times (default 1). See pc_platform.h. Never use in normal play.\n");
+            printf("  --ts-test-seed-police=HEX[,HEX...]  HOST-only TEST hook (default off; loud logs): keep the listed\n"
+                   "                      items in the host's lost and found once the world is ready. See pc_platform.h.\n");
+            printf("  --ts-test-donate    Client-only TEST hook (default off; loud logs): drive ONE real museum donation\n"
+                   "                      through the town-service transaction path. See pc_platform.h.\n");
+            printf("  --ts-test-claim     Client-only TEST hook (default off; loud logs): drive ONE real lost-and-found\n"
+                   "                      claim through the town-service transaction path. See pc_platform.h.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -666,6 +677,15 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--txn-test-dig-grant") == 0) {
             g_pc_txn_test_dig_grant = 1;
             printf("[NET][TXN][TEST-ONLY] --txn-test-dig-grant armed (a TEST hook: not for normal play)\n");
+        } else if (strncmp(argv[i], "--ts-test-seed-police=", 22) == 0) {
+            g_pc_ts_test_seed_police = argv[i] + 22;
+            printf("[NET][TS][TEST-ONLY] --ts-test-seed-police=%s armed (a TEST hook: not for normal play)\n", g_pc_ts_test_seed_police);
+        } else if (strcmp(argv[i], "--ts-test-donate") == 0) {
+            g_pc_ts_test_donate = 1;
+            printf("[NET][TS][TEST-ONLY] --ts-test-donate armed (a TEST hook: not for normal play)\n");
+        } else if (strcmp(argv[i], "--ts-test-claim") == 0) {
+            g_pc_ts_test_claim = 1;
+            printf("[NET][TS][TEST-ONLY] --ts-test-claim armed (a TEST hook: not for normal play)\n");
         } else if (strncmp(argv[i], "--txn-fault=", 12) == 0) {
             if (!pc_parse_txn_fault(argv[i] + 12)) {
                 fprintf(stderr, "[NET][TXN][TEST-ONLY] REFUSED: bad --txn-fault spec '%s' (expected MODE[:N[:K]], MODE = ignore_commit | "
