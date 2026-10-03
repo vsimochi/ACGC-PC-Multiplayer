@@ -608,6 +608,13 @@ static int aEGH_talk_end_chk(ACTOR* actorx, GAME* game) {
 
   if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == FALSE && mDemo_Check(mDemo_TYPE_TALK, actorx) == FALSE) {
     if (ghost->talk_act == aEGH_TALK_CLEAR_GRASS) {
+#ifdef TARGET_PC
+      /* WEEDS: Save clear_grass is consumed by the HOST's daily growth (mAGrw_ClearGrass via mFM_PcFieldInitGrowth). A READY network client
+       * skips that growth and never sends the flag, so setting it in the client's own Save only left a stray local flag (the reward was lost
+       * anyway). Only the host / single player (not host-authoritative) sets it. The reward earned on a client is NOT delivered: documented
+       * limitation (a host-side Wisp request would need its own message). */
+      if (!pc_net_game_world_is_host_authoritative())
+#endif
       Save_Set(clear_grass, TRUE);
     }
 

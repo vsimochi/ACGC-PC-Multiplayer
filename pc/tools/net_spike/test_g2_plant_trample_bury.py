@@ -3,8 +3,9 @@
 
   G2-1  mTG_plant_proc (src/game/m_tag_ovl.c): the no-shovel Plant else-branch is blocked for a network
         client (warning mWR_WARNING_PUT_PLANT, return before mTG_common_throw_put_field / pocket clear).
-  G2-2  Player_actor_SetEffectRemoveFlower_Dash (m_player_main_dash.c_inc): on a host-authoritative client
-        the trample (fade_entry_proc) is skipped after the RANDOM(4) draw.
+  G2-2  Player_actor_SetEffectRemoveFlower_Dash (m_player_main_dash.c_inc): on a network client the local trample
+        (fade_entry_proc) is skipped after the RANDOM(4) draw. WEEDS (v8 unreleased) UPDATE: the skip now sends a host-authoritative
+        FLOWER_TRAMPLE request (kind 11) instead of silently doing nothing; this audit is updated, not weakened (test_weeds_src.py).
   G2-3  (X1b: SUPERSEDED, deliberately converted) the M9-D mechanism "retain the committed bury claim (s_bury_committed) and restore the item
         on a later host reject" is DELETED: the client no longer clears the pocket before the host's TXN_RESULT(APPLIED), so a failed bury can
         never cost the item and there is nothing to restore. The audit now asserts exactly that: the mechanism is gone, the bury result
@@ -79,8 +80,17 @@ def main():
     check("G2-2: RANDOM draw precedes the client gate; gate precedes petal effect and tile write",
           0 <= r < g < e and g < f, results)
     # G7 intentionally switched this gate from pc_net_game_world_is_host_authoritative() to the plain role test
-    check("G2-2: gate returns FALSE (dust effect, no trample) and is the role-based CLIENT gate",
-          re.search(r"PC_NETGAME_ROLE_CLIENT\) \{\s*return FALSE;", d) is not None, results)
+    # WEEDS (v8 unreleased): the G2-2 silent skip became a host-authoritative FLOWER_TRAMPLE request (kind 11); the fallback (a not-READY client,
+    # a full queue) is still FALSE = no petals / no tile write (the G2-2 behaviour). test_weeds_src.py audits the whole chain.
+    check("G2-2 (WEEDS): the role-based CLIENT gate asks pc_net_game_request_trample_flower(); result 1 (not sent) returns FALSE (dust, no trample)",
+          re.search(r"pc_net_trample = pc_net_game_request_trample_flower\(pc_ut_x, pc_ut_z\);\s*if \(pc_net_trample == 1\) \{\s*return FALSE;", d) is not None, results)
+    gz = d.find("if (pc_net_trample == 0)")
+    fz = d.find("fade_entry_proc(name, actor_pos)")
+    mz = d.find("mISL_SetNowPlayerAction(mISL_PLAYER_ACTION_TRAMPLE_FLOWER)")
+    rz = d.find("return TRUE;")
+    check("G2-2 (WEEDS): the local tile write (fade_entry_proc) and the mISL trample counters run only inside `if (pc_net_trample == 0)` (the request "
+          "function returned 0 = vanilla), once each, before the TRUE return",
+          0 <= gz < fz < mz < rz and d.count("fade_entry_proc(name, actor_pos)") == 1 and d.count("mISL_SetNowPlayerAction(mISL_PLAYER_ACTION_TRAMPLE_FLOWER)") == 1, results)
     check("G2-2: the trample gate is NOT the READY-aware host-authoritative predicate any more (G7: role-based only)",
           "world_is_host_authoritative" not in d, results)
 

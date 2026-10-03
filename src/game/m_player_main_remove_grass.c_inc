@@ -50,7 +50,25 @@ static void Player_actor_ChangeFGNumber_Remove_grass(ACTOR* actorx, GAME* game) 
             if (fg_p != NULL) {
                 if (IS_ITEM_GRASS(*fg_p) != FALSE) {
                     s16 angle_y = DEG2SHORT_ANGLE2(110.0f) + actorx->shape_info.rotation.y;
+#ifdef TARGET_PC
+                    /* WEEDS: fly_entry_proc writes EMPTY_NO into this tile (mFI_SetFG_common), a client-local world mutation the host never
+                     * heard about. A network client sends WEED_PULL instead (the host validates and writes the tile; the FIELD_UPDATE clears
+                     * it here) and skips ONLY the tile write + flying-weed actor: the mud effect, sound and vibration below still play. A
+                     * client that is not READY does nothing (G7). pc_net_game_request_remove_grass() returns 0 for a client outside the
+                     * town scene, which then runs vanilla. */
+                    int pc_net_weed_handled = 0;
 
+                    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                        int pc_ut_x, pc_ut_z;
+
+                        if (mFI_Wpos2UtNum(&pc_ut_x, &pc_ut_z, *target_pos_p)) {
+                            pc_net_weed_handled = pc_net_game_request_remove_grass(pc_ut_x, pc_ut_z);
+                        } else {
+                            pc_net_weed_handled = 1;
+                        }
+                    }
+                    if (!pc_net_weed_handled)
+#endif
                     Common_Get(clip).bg_item_clip->fly_entry_proc(*fg_p, grass_pos_p, angle_y);
                     eEC_CLIP->effect_make_proc(eEC_EFFECT_DIG_MUD, *grass_pos_p, 2, 0, game, RSV_NO,
                                                mCoBG_Wpos2Attribute(*grass_pos_p, NULL), 8);

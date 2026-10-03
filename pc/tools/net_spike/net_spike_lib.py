@@ -1232,6 +1232,8 @@ FIELD_ACTION_KIND_DIG_BURIED = 1
 FIELD_ACTION_KIND_MONEY_ROCK_HIT = 2
 FIELD_ACTION_KIND_DIG_HOLE = 5
 FIELD_ACTION_KIND_DIG_SHINE = 8
+FIELD_ACTION_KIND_WEED_PULL = 10        # WEEDS (v8 unreleased): host-validated weed pull, tag all zero, nothing granted
+FIELD_ACTION_KIND_FLOWER_TRAMPLE = 11   # WEEDS (v8 unreleased): host-validated flower trample, tag all zero, nothing granted
 TXN_KIND_NAMES = {1: "PICKUP", 2: "DROP", 3: "BURY", 4: "DIG_BURIED", 5: "DIG_HOLE", 6: "DIG_SHINE", 7: "CATCH", 8: "MUSEUM_DONATE", 9: "POLICE_CLAIM"}
 assert struct.calcsize(FIELD_ACTION_REQUEST_FMT) == 76 and struct.calcsize(CATCH_REQUEST_FMT) == 84
 assert struct.calcsize(FIELD_ACTION_RESULT_FMT) == 12 and struct.calcsize(CATCH_RESULT_FMT) == 12

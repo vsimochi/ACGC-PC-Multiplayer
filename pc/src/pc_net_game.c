@@ -1446,6 +1446,14 @@ _Static_assert(offsetof(PCNetGameTxnTag, dest) == 8 && offsetof(PCNetGameTxnTag,
  * FIELD_ACTION kind, because unlike every kind above it needs no reach/IN_TOWN precondition at all
  * (see pc_net_game_request_snowman_build()'s own doc, pc_net_game.h). */
 #define PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK 9u
+/* WEEDS (v8 unreleased, kinds appended to the SAME FIELD_ACTION_REQUEST/RESULT pair, no new message id, no layout change): outdoor
+ * ground-cover changes a CLIENT used to make only in its own memory. Both are host-validated, grant NOTHING (the request tag is all zero:
+ * a non-zero tag on these kinds is BAD_SHAPE) and are replicated by the ordinary FIELD_UPDATE of the host's own pcfa_set_tile().
+ *   WEED_PULL       (10) pulling a weed (Player_actor_ChangeFGNumber_Remove_grass: IS_ITEM_GRASS = GRASS_A..GRASS_C -> EMPTY_NO).
+ *   FLOWER_TRAMPLE  (11) a dash that tramples the flower under the player (Player_actor_SetEffectRemoveFlower_Dash: IS_ITEM_FLOWER =
+ *                         FLOWER_LEAVES_PANSIES0..FLOWER_TULIP2 -> EMPTY_NO, exactly bIT_actor_fade_entry()'s mFI_SetFG_common(EMPTY_NO)). */
+#define PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL      10u
+#define PC_NETGAME_FIELD_ACTION_KIND_FLOWER_TRAMPLE 11u
 /* Protocol v3: widened from 8 to 12 bytes to add `hole_variant` -- the CLIENT's own proposed hole-shape
  * pick (0..24, mirroring HOLE_START..HOLE_END's own range), used ONLY by DIG_HOLE (kind 5) and the
  * pitfall-dig sub-case of the extended DIG_BURIED (kind 1); every other kind (2/3/4/6/7/8/9) ignores it
@@ -9016,20 +9024,85 @@ static void pcnetgame_fa_commit_adapter_snowman_break(const PCNetGameRequester* 
     *inout_item = (mActor_name_t)EMPTY_NO; /* granted_item is always 0 for a break */
 }
 
-/* T0-A: stub validate for every FIELD_ACTION kind reserved for a FUTURE task (T1 trees, T2 dig-
- * classification fixes, T3 bury, T5 snowmen -- see this milestone's own scope doc) but not yet
- * implemented in this build. Always rejects -- a request carrying one of these kinds (none of which
- * any caller in this build ever sends) gets an ordinary RESULT(accepted=0), the same shape DIG_BURIED/
- * MONEY_ROCK_HIT's own validators already produce for a request that fails their real checks. */
-static int pcnetgame_fa_validate_stub(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
-                                      mActor_name_t* inout_item, int* out_acre, int* out_tile) {
-    (void)req;
-    (void)ut_x;
-    (void)ut_z;
-    (void)inout_item;
-    (void)out_acre;
-    (void)out_tile;
-    return 0;
+/* WEEDS: WEED_PULL (kind 10) / FLOWER_TRAMPLE (kind 11) validate + commit. No host-local path: the HOST's own pull / trample runs vanilla's
+ * code unmodified and its tile write reaches the clients through the ordinary dirty-acre flush (exactly like SNOWMAN_BREAK). The request is
+ * accepted only when, on the HOST's own world: the host world is ready, the requester's synced context says it is in the town scene, the tile
+ * is not reserved by a pending pickup / drop / bury, the tile currently holds a weed (resp. a flower: the SAME IS_ITEM_GRASS / IS_ITEM_FLOWER
+ * ranges the vanilla seams test), and the requester's last synced position is within the shared field-action reach envelope
+ * (pcnetgame_field_action_reach_check(), the one DIG_BURIED / FILL_HOLE / SNOWMAN_BREAK use). The commit is vanilla's own mapping: the tile
+ * becomes EMPTY_NO (bIT_actor_fly_entry() / bIT_actor_fade_entry() both do mFI_SetFG_common(EMPTY_NO, ..)); nothing else is touched (a pulled
+ * weed / trampled flower is neither an item nor a counter on the host: the mISL_* trample counters only count while the player is ON THE
+ * ISLAND, mISL_SetPlayerAction() -> mFI_CheckInIsland(), which is not a host-authoritative scene, so the town path never had any). A second
+ * request for the same tile finds EMPTY_NO and is rejected, so exactly one racing requester wins. */
+static int pcnetgame_fa_validate_ground_cover(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                              mActor_name_t* inout_item, int* out_acre, int* out_tile, int want_flower) {
+    uint16_t value;
+    int acre, tile;
+    float px, py, pz;
+
+    if (req->is_host_local) {
+        return 0; /* see the block doc above: the host's own pull / trample stays on vanilla's path */
+    }
+    if (!s_host_world_ready) {
+        return 0;
+    }
+    if (!s_host_peer[req->peer].ctx_valid || !(req->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+        return 0;
+    }
+    if (!pcfa_town_ut_to_acre_tile((int)ut_x, (int)ut_z, &acre, &tile)) {
+        return 0;
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+        return 0;
+    }
+    if (!pcfa_get_tile(acre, tile, &value)) {
+        return 0;
+    }
+    if (want_flower ? !IS_ITEM_FLOWER(value) : !IS_ITEM_GRASS(value)) {
+        return 0; /* not (or no longer) a flower / weed tile -- nothing to remove */
+    }
+    if (!pc_remote_player_get_last_position((PCNetPlayerId)req->peer, &px, &py, &pz)) {
+        return 0;
+    }
+    if (!pcnetgame_pos_valid(px, py, pz)) {
+        return 0;
+    }
+    if (!pcnetgame_field_action_reach_check(ut_x, ut_z, px, py, pz)) {
+        return 0;
+    }
+
+    *out_acre = acre;
+    *out_tile = tile;
+    *inout_item = (mActor_name_t)value;
+    return 1;
+}
+
+static void pcnetgame_fa_commit_ground_cover(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z, int acre, int tile,
+                                             mActor_name_t* inout_item, const char* name) {
+    printf("[NET][WEEDS] host: peer %d %s at tile (%d,%d) 0x%04X -> EMPTY_NO\n", (int)req->peer, name, (int)ut_x, (int)ut_z,
+           (unsigned)*inout_item);
+    pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO);
+    *inout_item = (mActor_name_t)EMPTY_NO; /* granted_item is always 0: nothing is granted */
+}
+
+static int pcnetgame_fa_validate_adapter_weed_pull(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                   mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    return pcnetgame_fa_validate_ground_cover(req, ut_x, ut_z, inout_item, out_acre, out_tile, 0);
+}
+
+static void pcnetgame_fa_commit_adapter_weed_pull(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z, int acre,
+                                                  int tile, mActor_name_t* inout_item) {
+    pcnetgame_fa_commit_ground_cover(req, ut_x, ut_z, acre, tile, inout_item, "WEED_PULL");
+}
+
+static int pcnetgame_fa_validate_adapter_flower_trample(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z,
+                                                        mActor_name_t* inout_item, int* out_acre, int* out_tile) {
+    return pcnetgame_fa_validate_ground_cover(req, ut_x, ut_z, inout_item, out_acre, out_tile, 1);
+}
+
+static void pcnetgame_fa_commit_adapter_flower_trample(const PCNetGameRequester* req, uint8_t ut_x, uint8_t ut_z, int acre,
+                                                       int tile, mActor_name_t* inout_item) {
+    pcnetgame_fa_commit_ground_cover(req, ut_x, ut_z, acre, tile, inout_item, "FLOWER_TRAMPLE");
 }
 
 /* T0-A: the FIELD_ACTION_REQUEST dispatch table -- replaces the previous if/else kind chain in
@@ -9057,7 +9130,10 @@ static const PCNetGameFAHandler s_field_action_handlers[] = {
       pcnetgame_fa_commit_adapter_dig_shine, "DIG_SHINE" },
     { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK, pcnetgame_fa_validate_adapter_snowman_break,
       pcnetgame_fa_commit_adapter_snowman_break, "SNOWMAN_BREAK" },
-    { 10, pcnetgame_fa_validate_stub, NULL, "RESERVED_10" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL, pcnetgame_fa_validate_adapter_weed_pull,
+      pcnetgame_fa_commit_adapter_weed_pull, "WEED_PULL" },
+    { (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_FLOWER_TRAMPLE, pcnetgame_fa_validate_adapter_flower_trample,
+      pcnetgame_fa_commit_adapter_flower_trample, "FLOWER_TRAMPLE" },
 };
 #define PC_NETGAME_FIELD_ACTION_HANDLER_COUNT \
     (sizeof(s_field_action_handlers) / sizeof(s_field_action_handlers[0]))
@@ -10348,6 +10424,14 @@ static void pcnetgame_handle_client_field_action_result(const PCNetGameFieldActi
     if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_TREE_CHOP) {
         printf("[NET][FIELD_ACTION] client: request %u TREE_CHOP accepted at tile (%d,%d) -> tree=0x%04X\n",
                (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)in->granted_item);
+        return;
+    }
+
+    if (in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL || in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_FLOWER_TRAMPLE) {
+        /* WEEDS: nothing to apply here -- the client never wrote its own tile (the vanilla seams skip fly_entry_proc / fade_entry_proc on a
+           client), the cleared tile arrives through the ordinary FIELD_UPDATE of the host's pcfa_set_tile(). Log only. */
+        printf("[NET][WEEDS] client: request %u %s accepted at tile (%d,%d)\n", (unsigned)in->request_id,
+               in->kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL ? "WEED_PULL" : "FLOWER_TRAMPLE", (int)in->ut_x, (int)in->ut_z);
         return;
     }
 
@@ -20959,6 +21043,111 @@ static void pcnetgame_run_dig_hole_test_trigger(void) {
        reasoning as every other test-only trigger in this file. */
 }
 
+/* WEEDS real-client verification, TEST-ONLY: --force-weed-pull (default off, CLIENT only, fires exactly once). Mirrors
+ * pcnetgame_run_dig_hole_test_trigger(): moves the local actor onto the --field-action-test-seed weed fixture (24,108), waits for the MOVE
+ * to reach the host and for the weed to be present in the client's own loaded grid (it replicates from the host), then calls the REAL,
+ * unmodified Player_actor_request_main_remove_grass() through PC_Test_ForceRequestRemoveGrass(): the real pull animation runs and frame 17
+ * reaches the real seam (Player_actor_ChangeFGNumber_Remove_grass -> pc_net_game_request_remove_grass()). It then watches the local tile
+ * and prints when it stops being a weed (it must stop only through the host's FIELD_UPDATE: the client never writes it itself).
+ * NEGATIVE CONTROL: it then forces a second real pull on the weed fixture (40,108) while the actor still stands on (24,108), 16 tiles (640
+ * units) away: the host's reach check rejects it, so the client's own weed at (40,108) must still be there afterwards -- if the seam had
+ * written the tile locally (as vanilla does) it would be gone on this client only. */
+static void pcnetgame_run_weed_pull_test_trigger(void) {
+    static int s_stage = 0; /* 0 = not yet teleported, 1 = waiting, 2 = requested / observing, 3 = negative control request, 4 = negative observe, 5 = done */
+    static int s_wait_frames = 0;
+    xyz_t pos, pos2;
+    mActor_name_t* fg;
+
+    if (!g_pc_force_weed_pull || s_stage >= 5 || gamePT == NULL) {
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !s_local_world_latched) {
+        return;
+    }
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (!mFI_UtNum2CenterWpos(&pos, 24, 108)) {
+        return;
+    }
+
+    if (s_stage == 0) {
+        PLAYER_ACTOR* local = GET_PLAYER_ACTOR_NOW();
+        if (!pcnetgame_is_real_player_actor(local)) {
+            return;
+        }
+        local->actor_class.world.position.x = pos.x;
+        local->actor_class.world.position.z = pos.z;
+        printf("[NET][WEEDS] --force-weed-pull: teleported the local player to tile (24,108)\n");
+        s_stage = 1;
+        s_wait_frames = 0;
+        return;
+    }
+
+    s_wait_frames++;
+    if (s_stage == 1) {
+        if (s_wait_frames < 90) {
+            return;
+        }
+        fg = mFI_GetUnitFG(pos);
+        if (fg == NULL || !IS_ITEM_GRASS(*fg)) {
+            return; /* the weed fixture has not replicated yet: retried every poll */
+        }
+        printf("[NET][WEEDS] --force-weed-pull: local tile (24,108) holds weed 0x%04X; forcing a real Player_actor_request_main_remove_grass()\n",
+               (unsigned)*fg);
+        if (PC_Test_ForceRequestRemoveGrass(gamePT, &pos, &pos)) {
+            s_stage = 2;
+            s_wait_frames = 0;
+        }
+        return;
+    }
+
+    if (s_stage == 2) {
+        fg = mFI_GetUnitFG(pos);
+        if (fg != NULL && !IS_ITEM_GRASS(*fg)) {
+            printf("[NET][WEEDS] --force-weed-pull: local tile (24,108) is now 0x%04X after %d frames (written by the host's FIELD_UPDATE only)\n",
+                   (unsigned)*fg, s_wait_frames);
+            s_stage = 3;
+            s_wait_frames = 0;
+        } else if (s_wait_frames > 1200) {
+            printf("[NET][WEEDS] --force-weed-pull: local tile (24,108) STILL a weed after %d frames\n", s_wait_frames);
+            s_stage = 3;
+            s_wait_frames = 0;
+        }
+        return;
+    }
+
+    if (!mFI_UtNum2CenterWpos(&pos2, 40, 108)) {
+        return;
+    }
+    if (s_stage == 3) {
+        if (s_wait_frames < 120) {
+            return; /* let the first pull animation finish */
+        }
+        fg = mFI_GetUnitFG(pos2);
+        if (fg == NULL || !IS_ITEM_GRASS(*fg)) {
+            return;
+        }
+        printf("[NET][WEEDS] --force-weed-pull: NEGATIVE CONTROL: local tile (40,108) holds weed 0x%04X; forcing a pull of it from 16 tiles away "
+               "(the host must reject it)\n", (unsigned)*fg);
+        if (PC_Test_ForceRequestRemoveGrass(gamePT, &pos2, &pos2)) {
+            s_stage = 4;
+            s_wait_frames = 0;
+        }
+        return;
+    }
+
+    /* stage 4: give the pull animation (frame 17) and the host's answer ample time, then report the local tile */
+    if (s_wait_frames > 360) {
+        fg = mFI_GetUnitFG(pos2);
+        printf("[NET][WEEDS] --force-weed-pull: NEGATIVE CONTROL result: local tile (40,108) = 0x%04X after %d frames\n",
+               fg != NULL ? (unsigned)*fg : 0xFFFFu, s_wait_frames);
+        s_stage = 5;
+    }
+}
+
+/* World Ecology Wildlife Sync T1 real-gameplay verification, TEST-ONLY: --force-wildlife-trigger.
+ * CLIENT-only, fires exactly once, mirroring pcnetgame_run_dig_hole_test_trigger()'s own established
 /* World Ecology Wildlife Sync T1 real-gameplay verification, TEST-ONLY: --force-wildlife-trigger.
  * CLIENT-only, fires exactly once, mirroring pcnetgame_run_dig_hole_test_trigger()'s own established
  * pattern (this project's proven convention for reaching a real gameplay path that is impractical to
@@ -21739,6 +21928,8 @@ static void pcnetgame_run_field_action_test_seed(void) {
     static int s_dig_hole_seed_done = 0;
     static int s_fill_hole_seed_done = 0;
     static int s_dig_shine_seed_done = 0;
+    static int s_weed_seed_done[3] = { 0, 0, 0 };
+    static int s_flower_seed_done[2] = { 0, 0 };
     static int s_logged = 0;
 
     if (!g_pc_field_action_test_seed || s_role != PC_NETGAME_ROLE_HOST || gamePT == NULL || !s_host_world_ready ||
@@ -21798,6 +21989,29 @@ static void pcnetgame_run_field_action_test_seed(void) {
         s_dig_shine_seed_done = 1;
         printf("[NET][FIELD_ACTION] --field-action-test-seed: SHINE_SPOT (DIG_SHINE) fixture placed at tile "
                "(88,105)\n");
+    }
+    /* WEEDS fixtures (same flag, z=108 of the same loaded acre columns): weeds at (24,108) GRASS_A, (40,108) GRASS_C, (56,108) GRASS_B and
+     * flowers at (72,108) FLOWER_PANSIES0, (88,108) FLOWER_LEAVES_PANSIES0 (the two ends of what the vanilla seams treat as weed / flower). */
+    {
+        static const int s_weed_x[3] = { 24, 40, 56 };
+        static const mActor_name_t s_weed_v[3] = { GRASS_A, GRASS_C, GRASS_B };
+        static const int s_flower_x[2] = { 72, 88 };
+        static const mActor_name_t s_flower_v[2] = { FLOWER_PANSIES0, FLOWER_LEAVES_PANSIES0 };
+        int wi;
+        for (wi = 0; wi < 3; wi++) {
+            if (!s_weed_seed_done[wi] && mFI_UtNumtoFGSet_common(s_weed_v[wi], s_weed_x[wi], 108, TRUE)) {
+                s_weed_seed_done[wi] = 1;
+                printf("[NET][WEEDS] --field-action-test-seed: weed 0x%04X fixture placed at tile (%d,108)\n", (unsigned)s_weed_v[wi],
+                       s_weed_x[wi]);
+            }
+        }
+        for (wi = 0; wi < 2; wi++) {
+            if (!s_flower_seed_done[wi] && mFI_UtNumtoFGSet_common(s_flower_v[wi], s_flower_x[wi], 108, TRUE)) {
+                s_flower_seed_done[wi] = 1;
+                printf("[NET][WEEDS] --field-action-test-seed: flower 0x%04X fixture placed at tile (%d,108)\n",
+                       (unsigned)s_flower_v[wi], s_flower_x[wi]);
+            }
+        }
     }
 }
 
@@ -22398,6 +22612,10 @@ void pc_net_game_poll(void) {
      * own doc -- a complete no-op unless --force-dig-hole was passed. */
     pcnetgame_run_dig_hole_test_trigger();
 
+    /* WEEDS real-client test: see pcnetgame_run_weed_pull_test_trigger()'s own doc -- a complete no-op unless --force-weed-pull was passed
+     * (client role only). */
+    pcnetgame_run_weed_pull_test_trigger();
+
     /* X1b real-client transaction test (R3): see pcnetgame_run_txn_test_hook()'s own doc -- a complete no-op unless
      * --txn-test-pickup-drop was passed (client role only). */
     pcnetgame_run_txn_test_hook();
@@ -22842,6 +23060,54 @@ int pc_net_game_request_snowman_break(int ut_x, int ut_z) {
         return 1;
     }
     return pcnetgame_send_field_action_request((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK, ut_x, ut_z);
+}
+
+/* WEEDS: client request seam shared by WEED_PULL (kind 10) and FLOWER_TRAMPLE (kind 11), see pc_net_game.h. Return value: 0 = the caller
+ * runs vanilla (not a network client, or a client in a scene that is not the host-authoritative town: the island / interiors are the client's
+ * own private world); 1 = handled WITHOUT a request (the caller must not mutate the tile: a disconnected / not-READY client does nothing,
+ * like every G7 gate; a bad coordinate; the queue is full); 2 = the request was sent / is already queued (the caller keeps only its cosmetic
+ * effects). The 4-deep FIFO of TREE_SHAKE / TREE_CHOP carries it; a same-kind same-tile request that is still queued is not queued twice (a
+ * dash steps over one tile several times before the FIELD_UPDATE arrives). */
+static int pcnetgame_request_ground_cover(uint8_t kind, const char* name, int ut_x, int ut_z) {
+    int i;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return 0;
+    }
+    if (!pcfa_scene_is_town()) {
+        return 0;
+    }
+    if (s_client_link != PC_NETGAME_LINK_READY) {
+        return 1;
+    }
+    if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 1;
+    }
+    for (i = 0; i < s_field_action_queue_len; i++) {
+        const PCNetGameFieldActionPending* q = &s_field_action_queue[i];
+        if (q->valid && q->kind == kind && q->ut_x == (uint8_t)ut_x && q->ut_z == (uint8_t)ut_z) {
+            return 2;
+        }
+    }
+    if (s_field_action_queue_len >= PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH) {
+        if (g_pc_verbose) {
+            printf("[NET][WEEDS] client: field-action queue full -- %s at (%d,%d) not sent\n", name, ut_x, ut_z);
+        }
+        return 1;
+    }
+    if (kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL || g_pc_verbose) {
+        printf("[NET][WEEDS] client: %s request at tile (%d,%d)\n", name, ut_x, ut_z);
+    }
+    pcnetgame_send_field_action_request(kind, ut_x, ut_z);
+    return 2;
+}
+
+int pc_net_game_request_remove_grass(int ut_x, int ut_z) {
+    return pcnetgame_request_ground_cover((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL, "WEED_PULL", ut_x, ut_z);
+}
+
+int pc_net_game_request_trample_flower(int ut_x, int ut_z) {
+    return pcnetgame_request_ground_cover((uint8_t)PC_NETGAME_FIELD_ACTION_KIND_FLOWER_TRAMPLE, "FLOWER_TRAMPLE", ut_x, ut_z);
 }
 
 /* World Ecology T-dig: DIG_HOLE (kind 5) -- digging a brand-new hole into EMPTY_NO ground, or removing a

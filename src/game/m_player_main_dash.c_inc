@@ -50,15 +50,26 @@ static int Player_actor_SetEffectRemoveFlower_Dash(ACTOR* actor, GAME* game, s16
             if ((IS_ITEM_FLOWER(name) ? TRUE : FALSE)) {
                 xyz_t pos;
 #ifdef TARGET_PC
-                /* M9-D G2-2: fade_entry_proc below writes EMPTY_NO into this tile (mFI_SetFG_common), a
-                 * client-local world mutation the host never hears about (the host's own trample is
-                 * broadcast because its writes mark the acre dirty). On a host-authoritative client the
-                 * trample is skipped entirely: the flower stays, the petal burst / mISL trample counters
-                 * are not played, and FALSE makes the caller spawn the ordinary dash dust instead. The
-                 * RANDOM(4) draw above has already happened exactly as before, so the local RNG stream
-                 * is unchanged. An authoritative client trample needs a new field-action kind (v8). */
+                /* M9-D G2-2 + WEEDS: fade_entry_proc below writes EMPTY_NO into this tile (mFI_SetFG_common), a client-local world mutation
+                 * the host never hears about (the host's own trample is broadcast because its writes mark the acre dirty). A network client
+                 * sends FLOWER_TRAMPLE instead (pc_net_game_request_trample_flower(): the host validates the tile / reach and writes it, the
+                 * FIELD_UPDATE removes the flower here) and skips ONLY the tile write and the mISL_* trample counters (they only count on the
+                 * island, never in the host-authoritative town). The RANDOM(4) draw above has already happened exactly as before, so the
+                 * local RNG stream is unchanged. Result 1 = not sent (a not-READY client, queue full): no petals, FALSE makes the caller
+                 * spawn the ordinary dash dust (the G2-2 behaviour); 2 = request sent: the petal burst below is purely cosmetic; 0 = a client
+                 * outside the town scene runs vanilla. */
+                int pc_net_trample = 0;
+
                 if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
-                    return FALSE;
+                    int pc_ut_x, pc_ut_z;
+
+                    if (!mFI_Wpos2UtNum(&pc_ut_x, &pc_ut_z, *actor_pos)) {
+                        return FALSE;
+                    }
+                    pc_net_trample = pc_net_game_request_trample_flower(pc_ut_x, pc_ut_z);
+                    if (pc_net_trample == 1) {
+                        return FALSE;
+                    }
                 }
 #endif
                 if (mFI_Wpos2UtCenterWpos(&pos, *actor_pos)) {
@@ -66,6 +77,10 @@ static int Player_actor_SetEffectRemoveFlower_Dash(ACTOR* actor, GAME* game, s16
                     Common_Get(clip).effect_clip->effect_make_proc(eEC_EFFECT_HANATIRI, pos, 2, angle, game, 0xFFFF,
                                                                    (s16)name, 0);
 
+#ifdef TARGET_PC
+                    if (pc_net_trample == 0)
+#endif
+                    {
                     if (Common_Get(clip).bg_item_clip != NULL) {
                         if (Common_Get(clip).bg_item_clip->fade_entry_proc != NULL) {
                             Common_Get(clip).bg_item_clip->fade_entry_proc(name, actor_pos);
@@ -73,6 +88,7 @@ static int Player_actor_SetEffectRemoveFlower_Dash(ACTOR* actor, GAME* game, s16
                     }
                     mISL_SetNowPlayerAction(mISL_PLAYER_ACTION_TRAMPLE_FLOWER);
                     mISL_SetNowPlayerAction(mISL_PLAYER_ACTION_TRAMPLE_ALL_FLOWERS);
+                    }
 
                     return TRUE;
                 }

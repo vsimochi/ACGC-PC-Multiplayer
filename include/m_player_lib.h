@@ -69,6 +69,9 @@ extern void mPlib_request_main_demo_wait_from_submenu(ACTOR* speak_actor_p);
  * full contract -- this is a thin, additive pass-through, not a reimplementation of any gameplay
  * logic. */
 extern int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_name_t item);
+/* WEEDS real-client verification, TEST-ONLY (--force-weed-pull): thin pass-through to the REAL Player_actor_request_main_remove_grass()
+ * (m_player_main_remove_grass.c_inc, same translation unit as the definition in m_player.c). */
+extern int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos);
 #endif
 extern void mPlib_Set_unable_wade(int v);
 extern int mPlib_Get_unable_wade(void);

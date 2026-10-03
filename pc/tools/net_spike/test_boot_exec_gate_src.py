@@ -61,6 +61,7 @@ GUARDS = {
     ("pc_net_game.c", "pcnetgame_run_dig_hole_test_trigger"): "pcnetgame_is_real_player_actor(local) right after the read (now exec-gated)",
     ("pc_net_game.c", "pcnetgame_run_money_rock_test_triggers"): "X1b: bag-pickup hook reads the actor only after pcnetgame_is_real_player_actor(bag_pl) (exec-gated)",
     ("pc_net_game.c", "pcnetgame_run_txn_test_hook"): "X1b: the actor read is followed by pcnetgame_is_real_player_actor(pl) (exec-gated) in both stages",
+    ("pc_net_game.c", "pcnetgame_run_weed_pull_test_trigger"): "WEEDS: pcnetgame_is_real_player_actor(local) right after the read (exec-gated)",
     ("pc_net_game.c", "pcnetgame_run_txn_dig_test_hook"): "X3: the actor read (phase 0) is followed by pcnetgame_is_real_player_actor(pl) (exec-gated) before any use",
     ("pc_net_game.c", "pcnetgame_run_fish_catch_test_trigger_client"): "pcnetgame_is_real_player_actor(local) right after the read (now exec-gated)",
     ("pc_net_game.c", "pcnetgame_run_bug_catch_test_trigger_client"): "pcnetgame_is_real_player_actor(local) right after the read (now exec-gated)",

@@ -882,6 +882,18 @@ int pc_net_game_request_dig_hole_with_grant(int ut_x, int ut_z, int hole_variant
  * out-of-range ut_x/ut_z (rejected internally). */
 int pc_net_game_request_fill_hole(int ut_x, int ut_z);
 
+/* WEEDS (v8 unreleased): host-authoritative weed pulling (FIELD_ACTION kind 10 WEED_PULL) and flower trampling (kind 11 FLOWER_TRAMPLE). Called
+ * by the vanilla seams Player_actor_ChangeFGNumber_Remove_grass() and Player_actor_SetEffectRemoveFlower_Dash() ONLY when pc_net_game_role() ==
+ * CLIENT; (ut_x, ut_z) is the tile the seam would have changed. Return value:
+ *   0  run vanilla (the client is not in the host-authoritative town scene: island / interiors are its own private world)
+ *   1  handled, NO request was sent: the seam must not touch the tile and keeps no gameplay effect (a not-READY / disconnected client does
+ *      nothing, like every G7 gate; also a bad coordinate or a full queue)
+ *   2  a request was sent or is already queued: the seam skips its tile write and its mISL_* counters and keeps only cosmetic effects
+ * The host validates (town scene, tile not reserved, the tile holds a weed / flower, reach from the synced position), writes EMPTY_NO with
+ * pcfa_set_tile() and the ordinary FIELD_UPDATE clears the client's tile. Nothing is granted (all-zero tag). */
+int pc_net_game_request_remove_grass(int ut_x, int ut_z);
+int pc_net_game_request_trample_flower(int ut_x, int ut_z);
+
 /* World Ecology T-dig: PITFALL_CONSUME (kind 7) -- a player (or, on the host, a villager) falling INTO
  * an already-buried pitfall; a TRIGGER, distinct from DIGGING one up (which stays on the extended
  * DIG_BURIED path, kind 1 -- see pc_net_game_request_dig_buried()'s own updated doc). Deliberately

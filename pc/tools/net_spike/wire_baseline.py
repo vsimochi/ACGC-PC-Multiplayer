@@ -146,6 +146,9 @@ GUEST_C_PINS = ("#define PC_NETGAME_IDEXT_FLAG_GUEST      0x01u", "#define PC_NE
                 '_Static_assert(sizeof(PCNetGameIdentityTokenMsg) == 20,', "offsetof(PCNetGameIdentityTokenMsg, token) == 4",
                 '_Static_assert(sizeof(PCNetGameIdentityMsg) == 32,', '_Static_assert(sizeof(PCNetGameIdentityAckMsg) == 32,',
                 '_Static_assert(offsetof(PCNetGameIdentityMsg, protocol_version) == 4,')
+# WEEDS (v8 unreleased, same FIELD_ACTION_REQUEST / RESULT pair, no layout change): the two appended FIELD_ACTION kinds.
+WEEDS_C_PINS = ("#define PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL      10u", "#define PC_NETGAME_FIELD_ACTION_KIND_FLOWER_TRAMPLE 11u",
+                "#define PC_NETGAME_FIELD_ACTION_KIND_SNOWMAN_BREAK 9u")
 V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_BEGIN", "48"),
                 ("PC_NETGAME_MSG_RECORD_CHUNK", "49"), ("PC_NETGAME_MSG_RECORD_ACK", "50"),
                 ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52"),
@@ -391,6 +394,9 @@ def audit_texts(head, cur):
     add("wire: guests G1 -- IDENTITY_EXT (42 B) / IDENTITY_TOKEN (20 B) constants + size / offset _Static_asserts are pinned in pc_net_game.c, and the "
         "frozen 32-byte IDENTITY / IDENTITY_ACK size + protocol_version offset asserts are still there",
         all(a in cur["game_c"] for a in GUEST_C_PINS))
+    add("wire: WEEDS -- FIELD_ACTION kinds 10 WEED_PULL / 11 FLOWER_TRAMPLE are pinned in pc_net_game.c (and 9 SNOWMAN_BREAK still precedes them); "
+        "the request / result structs they ride are the already pinned ones (no layout change)",
+        all(a in cur["game_c"] for a in WEEDS_C_PINS))
     strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
     ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)))\s*=\s*(\d+),", b)
     # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52), + town services (47-55), + mailbox (47-56) or all of them
@@ -505,6 +511,8 @@ def selftest(repo):
         "guest lib id": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_MSG_IDENTITY_EXT = 57", "PC_NETGAME_MSG_IDENTITY_EXT = 59", 1)),
         "guest lib class": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_REC_CLASS_GUEST = 1", "PC_NETGAME_REC_CLASS_GUEST = 2", 1)),
         "guest lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_GUEST_EXTRA = 1\n"),
+        "weed kind moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL      10u", "#define PC_NETGAME_FIELD_ACTION_KIND_WEED_PULL      12u", 1)),
+        "trample kind moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_FIELD_ACTION_KIND_FLOWER_TRAMPLE 11u", "#define PC_NETGAME_FIELD_ACTION_KIND_FLOWER_TRAMPLE 10u", 1)),
         "mailbox enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_MAILBOX_LETTER        = 56,", "PC_NETGAME_MSG_MAILBOX_LETTER        = 66,", 1)),
         "mailbox struct field": lambda c: c.update(game_c=c["game_c"].replace("    uint16_t _rsv1;\n} PCNetGameMailboxLetterMsg;", "    uint16_t _rsv1;\n    uint32_t extra;\n} PCNetGameMailboxLetterMsg;", 1)),
         "mailbox struct size assert": lambda c: c.update(game_c=c["game_c"].replace("_Static_assert(sizeof(PCNetGameMailboxLetterMsg) == 316,", "_Static_assert(sizeof(PCNetGameMailboxLetterMsg) == 314,", 1)),

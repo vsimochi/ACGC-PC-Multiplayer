@@ -1833,4 +1833,12 @@ extern void Player_actor_draw(ACTOR* actorx, GAME* game) {
 int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_name_t item) {
     return Player_actor_request_main_dig_scoop_all(game, pos, item, mPlayer_REQUEST_PRIORITY_4);
 }
+
+/* WEEDS real-client verification, TEST-ONLY -- see pc_platform.h's g_pc_force_weed_pull and pc_net_game.c's
+ * pcnetgame_run_weed_pull_test_trigger(), the only caller (--force-weed-pull, default off). A thin pass-through to the REAL, unmodified
+ * Player_actor_request_main_remove_grass(): everything after the request (the pull animation, frame 17's
+ * Player_actor_ChangeFGNumber_Remove_grass() and its network seam) is the ordinary per-frame player update. */
+int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos) {
+    return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
+}
 #endif

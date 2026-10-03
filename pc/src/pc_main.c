@@ -368,6 +368,9 @@ int g_pc_force_money_bag_pickup = 0;
  * pc_platform.h's own doc comment on this global. */
 int g_pc_force_dig_hole = 0;
 
+/* WEEDS real-client verification, TEST-ONLY: --force-weed-pull. See pc_platform.h's own doc comment on this global. */
+int g_pc_force_weed_pull = 0;
+
 /* World Ecology Wildlife Sync T1 real-gameplay verification, TEST-ONLY: --force-wildlife-trigger.
  * See pc_platform.h's own doc comment on this global. */
 int g_pc_force_wildlife_trigger = 0;
@@ -573,6 +576,9 @@ int main(int argc, char* argv[]) {
             printf("                      request at the --field-action-test-seed fixture's DIG_HOLE tile\n");
             printf("                      (56,105), driving the REAL unmodified dig-scoop gameplay chain to its\n");
             printf("                      real network commit point -- see pc_net_game.c and m_player.c.\n");
+            printf("  --force-weed-pull   Client-only test hook: force a real Player_actor_request_main_remove_grass()\n");
+            printf("                      at the --field-action-test-seed weed fixture (24,108), driving the REAL\n");
+            printf("                      pull animation to the WEED_PULL network seam -- see pc_net_game.c.\n");
             printf("  --force-wildlife-trigger  Client-only test hook: force a real\n");
             printf("                      pc_net_game_request_wildlife_spawn_trigger() across a burst of 10\n");
             printf("                      different acres in one frame (not a single fixed acre) --\n");
@@ -682,6 +688,8 @@ int main(int argc, char* argv[]) {
             g_pc_force_money_bag_pickup = 1;
         } else if (strcmp(argv[i], "--force-dig-hole") == 0) {
             g_pc_force_dig_hole = 1;
+        } else if (strcmp(argv[i], "--force-weed-pull") == 0) {
+            g_pc_force_weed_pull = 1;
         } else if (strcmp(argv[i], "--force-wildlife-trigger") == 0) {
             g_pc_force_wildlife_trigger = 1;
         } else if (strcmp(argv[i], "--force-fish-catch") == 0) {

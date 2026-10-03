@@ -172,6 +172,11 @@ extern int           g_pc_force_money_bag_pickup;
  * request path does not require a shovel to be out), never any part of the dig/fill/commit logic
  * itself. */
 extern int           g_pc_force_dig_hole;
+/* WEEDS real-client verification, TEST-ONLY: --force-weed-pull. CLIENT-only, default off, fires exactly once (pc_net_game.c's
+ * pcnetgame_run_weed_pull_test_trigger()): moves the local actor onto the --field-action-test-seed weed fixture (24,108) and forces the REAL
+ * Player_actor_request_main_remove_grass() through PC_Test_ForceRequestRemoveGrass() (m_player.c); the real pull animation then reaches the
+ * real WEED_PULL network seam. Requires --field-action-test-seed on the host. */
+extern int           g_pc_force_weed_pull;
 /* World Ecology Wildlife Sync T1 real-gameplay verification, TEST-ONLY: --force-wildlife-trigger.
  * CLIENT-only, mirrors g_pc_force_dig_hole's own exact pattern (off by default, fires exactly once
  * -- see pc_net_game.c's pcnetgame_run_wildlife_trigger_test_trigger()). Unlike force-dig-hole, no

@@ -146,7 +146,8 @@ def main():
     site(results, "S2 pitfall", pf, ["pc_net_game_request_pitfall_consume(", "Player_actor_SetupItem_Base1("])
     da = func_body(read("src/game/m_player_main_dash.c_inc"),
                    r"\nstatic int Player_actor_SetEffectRemoveFlower_Dash\(ACTOR\* actor, GAME\* game, s16 angle\) \{")
-    site(results, "S2 trample", da, ["return FALSE;\n                }\n#endif", "fade_entry_proc(name, actor_pos)",
+    # WEEDS (v8 unreleased): the G2-2 `return FALSE` guard became the host-authoritative FLOWER_TRAMPLE request (result 1 = not sent: FALSE)
+    site(results, "S2 trample", da, ["pc_net_game_request_trample_flower(", "fade_entry_proc(name, actor_pos)",
                                      "mISL_SetNowPlayerAction(mISL_PLAYER_ACTION_TRAMPLE_FLOWER)"],
          host_tail=["fade_entry_proc(name, actor_pos)"])
     check("S2 trample: RANDOM(4) draw precedes the guard (RNG stream unchanged)",
@@ -181,6 +182,7 @@ def main():
         "src/actor/ac_weather.c": 1,                     # S3
         "src/actor/npc/ac_npc_move.c_inc": 4,            # class B (talk lease / movement consumer / log)
         "src/actor/npc/ac_npc_think.c_inc": 1,           # S3 (NPC pitfall)
+        "src/actor/npc/event/ac_ev_ghost_talk.c_inc": 1, # WEEDS: Wisp clear_grass is not set on a READY client (host growth consumes it)
         "src/game/m_event_map_npc.c": 2,                 # S3
         "src/game/m_field_info.c": 1,                    # S3 (daily hole cleanup)
         "src/game/m_field_make.c": 1,                    # S3

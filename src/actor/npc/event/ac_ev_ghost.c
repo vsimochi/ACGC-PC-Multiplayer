@@ -8,6 +8,9 @@
 #include "m_player_lib.h"
 #include "m_item_name.h"
 #include "m_house.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* WEEDS: pc_net_game_world_is_host_authoritative() -- see the Wisp talk proc's clear_grass note (ac_ev_ghost_talk.c_inc) */
+#endif
 
 enum {
   aEGH_TALK_END_WAIT,
