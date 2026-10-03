@@ -132,7 +132,7 @@ def main():
           "once, after every validation, and there is no mPr_Set* / CONFIRM(COMMIT) in the handler",
           h.count("pcnetgame_txn_begin(") == 1 and "have_deferred ? &deferred : NULL" in h and "mPr_Set" not in h
           and "PC_NETGAME_CONFIRM_COMMIT" not in h and h.find("pcnetgame_txn_begin(") > h.find("SLOT_CHANGED"), results)
-    ap = func_body(net, r"\nstatic void pcnetgame_txn_apply_applied\(const PCNetGameClientTxn\* T, const PCNetGameTxnResultMsg\* in\) \{")
+    ap = func_body(net, r"\nstatic (?:void|int) pcnetgame_txn_apply_applied\(const PCNetGameClientTxn\* T, const PCNetGameTxnResultMsg\* in\) \{")
     clr = ap.find("np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;")
     app = ap.find("np->inventory.pockets[s] = (mActor_name_t)t->aux_item;")
     ts = func_body(net, r"\nstatic int pcnetgame_txn_try_send\(void\) \{")

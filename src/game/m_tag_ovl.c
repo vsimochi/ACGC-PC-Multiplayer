@@ -3476,6 +3476,11 @@ static void mTG_mailbox_change_mail_proc(Submenu* submenu, mSM_MenuInfo_c* menu_
     int idx = mMl_chk_mail_free_space(Now_Private->mail, mPr_INVENTORY_MAIL_COUNT);
 
     inv_ovl->mail_mark_bitfield2 = 0;
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        idx = -1; /* mail milestone M0: a client never takes a mailbox letter into its pockets: the vanilla "pockets full" refusal below */
+    }
+#endif
     if (idx != -1) {
         mailbox_ovl->mark_flag = 2;
         sAdo_SysTrgStart(NA_SE_MENU_EXIT);
@@ -3536,6 +3541,16 @@ static void mTG_cpmail_change_mail_proc(Submenu* submenu, mSM_MenuInfo_c* menu_i
         cpmail_cnt = (cpmail_mark_cnt - inv_mark_cnt) - inv_free_cnt;
     }
 
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && cpmail_mark_cnt > 0) {
+        /* Mail milestone M0 (D-2): an exchange that moves an ARCHIVE letter into a pocket slot is refused on a network client (the archive is the local
+         * machine's ARAM block, restored from the unchanged GCI next session while D3 would have uploaded the pocket copy: unbounded gift laundering).
+         * It takes the vanilla "cannot exchange" branch: the marks are cleared and nothing moves. Pocket -> archive only (no archive letter marked)
+         * stays allowed. */
+        inv_cnt = inv_mark_cnt;
+        cpmail_cnt = cpmail_mark_cnt;
+    }
+#endif
     if (inv_cnt == inv_mark_cnt && cpmail_cnt == cpmail_mark_cnt) {
         cpmail_ovl->mark_bitfield = 0;
         inv_ovl->mail_mark_bitfield2 = 0;
@@ -3594,9 +3609,20 @@ static void mTG_send_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     Mail_c* mail = &Now_Private->mail[idx];
     Submenu_Item_c* item_p = submenu->item_p;
 
-    mail->content.font = mMl_FONT_RECV;
-    mMl_copy_mail(&submenu->mail, mail);
-    mMl_clear_mail(mail);
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail->header.recipient.type == mMl_NAME_TYPE_PLAYER) {
+        /* Mail milestone 1: a client's letter to a PLAYER is sent through a host transaction (post girl seam), and it must stay in its mail[] slot
+         * (byte-identical, send font) until the host's APPLIED removes it: a pocket that empties here would upload an empty slot while the host
+         * still has to read the letter from its mirror. The post girl dialogue works on the copy in submenu->mail (receive font, as vanilla). */
+        mMl_copy_mail(&submenu->mail, mail);
+        submenu->mail.content.font = mMl_FONT_RECV;
+    } else
+#endif
+    {
+        mail->content.font = mMl_FONT_RECV;
+        mMl_copy_mail(&submenu->mail, mail);
+        mMl_clear_mail(mail);
+    }
     item_p->slot_no = idx;
     item_p->item = ITM_QST_LETTER;
     submenu->selected_item_num = 1;
@@ -6137,7 +6163,11 @@ static int mTG_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
 static int mTG_check_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c* tag) {
     int res = FALSE;
 
-    if (mMl_count_use_mail_space(Common_Get(now_home)->mailbox, HOME_MAILBOX_SIZE) != 0) {
+    if (mMl_count_use_mail_space(Common_Get(now_home)->mailbox, HOME_MAILBOX_SIZE) != 0
+#ifdef TARGET_PC
+        && pc_net_game_role() != PC_NETGAME_ROLE_CLIENT /* mail milestone M0: a client's mailbox yields nothing (the empty-mailbox branch below) */
+#endif
+    ) {
         res = mTG_trans_mail(submenu, menu_info, tag);
     } else {
         submenu->overlay->mailbox_ovl->open_flag = FALSE;
@@ -6150,7 +6180,11 @@ static int mTG_check_trans_mail_mark(Submenu* submenu, mSM_MenuInfo_c* menu_info
     mMB_Ovl_c* mailbox_ovl = submenu->overlay->mailbox_ovl;
     int res = FALSE;
 
-    if (mailbox_ovl->mark_bitfield != 0) {
+    if (mailbox_ovl->mark_bitfield != 0
+#ifdef TARGET_PC
+        && pc_net_game_role() != PC_NETGAME_ROLE_CLIENT /* mail milestone M0: marks are dropped, nothing is moved */
+#endif
+    ) {
         res = mTG_trans_mail_mark(submenu, menu_info, tag);
     } else {
         mailbox_ovl->open_flag = FALSE;

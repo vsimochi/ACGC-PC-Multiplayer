@@ -351,6 +351,20 @@ extern int           g_pc_ts_test_claim;
  * They bypass only the Nook dialogue and the menu, never the TXN_COMMIT / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_shop_test_hook(). */
 extern int           g_pc_shop_test_buy;
 extern int           g_pc_shop_test_sell;
+/* Mail milestone 1 TEST-ONLY hooks (default OFF, never active in normal play, every step logs "[NET][MAIL][TEST-ONLY]"):
+ *   --mail-test-send=<house>[,gift]   CLIENT only: once the record is SYNCED, write ONE send-font letter (sender = the local player, recipient = the
+ *                                     owner of local house <house>) into the first free mail slot (the hook's one local write; with ",gift" the first
+ *                                     pocket item is moved into the letter like the letter board's hand overlay does), then send it through
+ *                                     pc_net_game_mail_begin_send() / _poll() (the post girl seam's entry points: AWAIT_CLEAN -> TXN_COMMIT kind 12).
+ *   --mail-test-force-delivery        HOST only: every 2 s, while the post office holds player letters, run the vanilla mPO_delivery_one_address() for
+ *                                     every house and log what is in every mailbox (hash, font, gift), so a test can see what landed where.
+ * They bypass only the letter board / the postman's clock, never the TXN_COMMIT / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_mail_test_hook(). */
+extern const char*   g_pc_mail_test_send;
+extern int           g_pc_mail_test_force_delivery;
+/*   --mail-test-poke-museum=<resident idx>  HOST only (mail milestone R): once that resident's mirror is SYNCED, change its museum_record (stored_fossil_num + 1) the way the
+ *                                     host's day-change fossil / result mail does, so the host-field watcher -> rev + 1 -> PUSH_HOSTFIELDS path is exercised.
+ *                                     -1 = off (default). */
+extern int           g_pc_mail_test_poke_museum;
 /* X1 (host-transactional PICKUP/DROP/BURY commit) host-side FAULT INJECTION, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. HOST role ONLY:
  * pc_main.c refuses (exit code 2, message on stderr) any other role, and the C hook re-checks the role. OFF by default (mode 0),
  * never active in normal play; when armed the process logs "[NET][TXN][TEST-ONLY] FAULT INJECTION ENABLED mode=..." at start and

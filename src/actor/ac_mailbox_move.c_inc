@@ -42,7 +42,15 @@ static void aMBX_check_take_mail(MAILBOX_ACTOR* actor, GAME_PLAY* play) {
             } else if (!mPr_NullCheckPersonalID(&Save_Get(homes[arrange_idx]).ownerID)) {
                 Submenu* submenu = &play->submenu;
 
-                if (submenu->start_refuse == FALSE && submenu->start_refuse_timer == 0 && mPlib_able_submenu_type1((GAME*)play) && actor->req == 0) {
+                if (submenu->start_refuse == FALSE && submenu->start_refuse_timer == 0 && mPlib_able_submenu_type1((GAME*)play) && actor->req == 0
+#ifdef TARGET_PC
+                    /* Mail milestone M0: a network CLIENT's homes[].mailbox is its stale save copy plus letters its own load-time generators made
+                     * (random furniture presents); taking one would put it into mail[], D3 would upload it and the host would persist it (gift
+                     * laundering). Until the host-owned mailbox is delivered to the owner (M2) a client's mailbox does not open: A does nothing,
+                     * the flag stays down (aMBX_check_flag). Host / solo: unchanged. */
+                    && pc_net_game_role() != PC_NETGAME_ROLE_CLIENT
+#endif
+                ) {
                     player->a_btn_triggers_submenu = TRUE;
                     actor->req = aMBX_REQUEST_OPEN;
                 }
@@ -54,6 +62,11 @@ static void aMBX_check_take_mail(MAILBOX_ACTOR* actor, GAME_PLAY* play) {
 static void aMBX_check_flag(MAILBOX_ACTOR* actor) {
     int anime_idx = aMBX_ANIME_FLAG_DOWN;
     int mail_count = mMl_count_use_mail_space(Save_Get(homes[actor->arrange_idx]).mailbox, HOME_MAILBOX_SIZE);
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        mail_count = 0; /* mail milestone M0: the local mailbox of a client is not real (see aMBX_check_take_mail): the flag never goes up */
+    }
+#endif
 
     if (mail_count != 0) {
         if (actor->anim_idx1 == aMBX_ANIME_FLAG_UP_WAIT || actor->anim_idx1 == aMBX_ANIME_NUM) {

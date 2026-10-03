@@ -97,7 +97,7 @@ def main():
           results)
     check("G2-3 (X1b): the reject branch still reconciles the tile (pcnetgame_client_apply_tile) and restores nothing (nothing was cleared)",
           "pcnetgame_client_apply_tile(" in h_noc and "RESTORED" not in h_noc and "mPr_SetFreePossessionItem" not in h_noc, results)
-    ap = func_body(net, r"\nstatic void pcnetgame_txn_apply_applied\(const PCNetGameClientTxn\* T, const PCNetGameTxnResultMsg\* in\) \{")
+    ap = func_body(net, r"\nstatic (?:void|int) pcnetgame_txn_apply_applied\(const PCNetGameClientTxn\* T, const PCNetGameTxnResultMsg\* in\) \{")
     check("G2-3 (X1b): the bury/drop slot is cleared ONLY in pcnetgame_txn_apply_applied (host post-image, or the delta clearing the claimed slot)",
           "np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;" in ap and "in->post_pockets[i]" in ap, results)
     rst = func_body(net, r"\nstatic void pcnetgame_reset_client_session_state\(void\) \{")

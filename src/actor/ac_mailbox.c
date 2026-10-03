@@ -5,6 +5,9 @@
 #include "m_rcp.h"
 #include "m_house.h"
 #include "m_player_lib.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* mail milestone M0: pc_net_game_role() -- a network CLIENT's mailbox is closed */
+#endif
 
 enum {
     aMBX_ACT_WAIT,

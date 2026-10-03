@@ -18,6 +18,10 @@
 #include "m_room_type.h"
 #include "m_common_data.h"
 
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* mail milestone M0: pc_net_game_role() */
+#endif
+
 static Mail_c l_mpr_mail;
 Private_c g_foreigner_private;
 
@@ -863,6 +867,11 @@ static int mPr_SendMotherMailPost(PersonalID_c* pid, int player_no, mActor_name_
     mHm_hs_c* home;
     int res = FALSE;
 
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return FALSE; /* mail milestone M0: a client never writes the mother's letter (it can carry a gift) into its local mailbox; for a client resident the host does not generate it yet (open: M4) */
+    }
+#endif
     mail = &l_mpr_mail;
     home = Save_GetPointer(homes[mHS_get_arrange_idx(player_no)]);
 

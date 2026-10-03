@@ -644,6 +644,21 @@ int pc_net_game_shop_buy_stock_code(int item);
 int pc_net_game_ts_begin_shop_buy(int pocket_slot, int item, int stock_code, int price);
 int pc_net_game_ts_begin_shop_sell(int slot_mask, int primary_slot, int item);
 int pc_net_game_ts_last_reject_reason(void);
+
+/* Mail milestone 1 (protocol v8, unreleased): the client seam of a LETTER TO A PLAYER (a resident's house). The vanilla post-girl dialogue would run
+ * mPO_receipt_proc() on the client's LOCAL (dead) post office and lose the letter and its gift; a client instead asks the HOST (TXN_COMMIT kind 12
+ * MAIL_SEND: the host reads the letter from its own mirror of the resident record, so the record must be CLEAN first). The seam calls _begin_send once,
+ * then pc_net_game_mail_poll() every frame in a neutral state until it stops answering PC_NETGAME_TS_OP_PENDING (the same codes as the town services).
+ * begin: 1 = started, 0 = refused for good (not a READY + SYNCED client / not a player-addressed send-font letter in that slot: take the refusal path),
+ * -1 = busy, ask again next frame. The letter stays in its mail[] slot until the host's APPLIED removes it; every refusal leaves it there.
+ * pc_net_game_mail_last_reason() = the host's PC_NETGAME_MAIL_REJECT_* of the last REJECTED result consumed by _poll (0 = a local refusal / any other
+ * reason). Only ever called with pc_net_game_role() == PC_NETGAME_ROLE_CLIENT. */
+#define PC_NETGAME_MAIL_REJECT_NO_SUCH_ADDRESS 23
+#define PC_NETGAME_MAIL_REJECT_MAILBOX_FULL    24
+#define PC_NETGAME_MAIL_REJECT_PO_FULL         25
+int pc_net_game_mail_begin_send(int mail_slot);
+int pc_net_game_mail_poll(void);
+int pc_net_game_mail_last_reason(void);
 /* H1: 1 when the HOST's own purchase of `item` may proceed (always 1 unless this is a networked HOST whose stock no longer holds the item: a client may have
  * bought it meanwhile). Special-day stock (bargain / raffle) and solo / client roles answer 1 (vanilla behaviour). */
 int pc_net_game_host_shop_can_sell(int item);

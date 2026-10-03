@@ -158,6 +158,9 @@
 
 #include "m_common_data.h"
 #include "m_private.h"
+#include "m_house.h"   /* mail milestone 1: mHS_HOUSE_NUM (the host re-runs the vanilla address lookup over its houses) */
+#include "m_mail.h"    /* mail milestone 1: Mail_c, mMl_* (letter checks), mMl_FONT_SEND/RECV */
+#include "m_post_office.h" /* mail milestone 1: mPO_receipt_proc / mPO_count_mail / mPO_get_keep_mail_sum / mPO_delivery_one_address */
 #include "pc_save_bswap.h" /* D3: pc_save_bswap_private() for the canonical-BE record image */
 #include "pc_mp_records.h" /* D3-4: save/mp/records.dat sidecar (pure storage module) */
 #include "m_personal_id.h"
@@ -2068,6 +2071,18 @@ _Static_assert(PC_NETGAME_REC_CHUNK_COUNT <= 16, "the per-transfer got mask is 1
  *                   rule (bags need free pockets: NO_ROOM) and adds value / 2 to sales_sum. */
 #define PC_NETGAME_TXN_KIND_SHOP_BUY  10u
 #define PC_NETGAME_TXN_KIND_SHOP_SELL 11u
+/* Mail milestone 1 (the same reservation-less one-phase TXN_COMMIT machinery, kind 12; NO new message id). The letter is NEVER carried by the
+ * message: the HOST reads it from its own mirror record (private_data[bound].mail[slot]) and the transaction only names it.
+ *   MAIL_SEND (12): tag.dest NONE, tag.slot = the mail slot (0..9), tag.item = the letter's present (gift) echo (EMPTY_NO allowed for this kind),
+ *                   tag.aux_item = the LOW 16 bits and tag.aux_cond = bits 16..23 of h24 = FNV-1a-32 of the CANONICAL BE bytes of that letter as the
+ *                   client holds it (font SEND), tag.flags = 0; pre_pockets / pre_conds / pre_wallet = the real pre-image (validated; post == pre).
+ *                   The client may send it only when its record is CLEAN (digest == the acked digest, no upload in flight), so the mirror letter IS
+ *                   the client's letter and a gift cannot also sit in a mirror pocket. The host checks gate / shape / journal / base, then: the
+ *                   bound resident owns a house (NO_DONOR_SLOT), the mirror letter is used and hashes to h24 (STALE_IMAGE), is a send-font letter with
+ *                   the echoed pocket-legal gift (BAD_IMAGE), is addressed to a PLAYER (PRECOND; villagers keep MAIL_REQUEST, the museum waits for M3),
+ *                   whose house exists on the HOST (NO_SUCH_ADDRESS), has a mailbox slot (MAILBOX_FULL) and post-office room (PO_FULL); then ONE
+ *                   commit: sender := the bound identity, receive font, mPO_receipt_proc(), the mirror slot cleared, rev++. */
+#define PC_NETGAME_TXN_KIND_MAIL_SEND 12u
 #define PC_NETGAME_SHOP_STOCK_COUNTED   0xFDu
 #define PC_NETGAME_SHOP_STOCK_RARE      0xFEu
 #define PC_NETGAME_SHOP_STOCK_UNLIMITED 0xFFu
@@ -2097,6 +2112,9 @@ _Static_assert(PC_NETGAME_REC_CHUNK_COUNT <= 16, "the per-transfer got mask is 1
 #define PC_NETGAME_TXN_REASON_NOT_SELLABLE    20u /* shop: SHOP_SELL of stationery / a quest item / a Sunday turnip bundle */
 #define PC_NETGAME_TXN_REASON_PRICE_MISMATCH  21u /* shop: SHOP_BUY whose expected price differs from the HOST's price (nothing is charged) */
 #define PC_NETGAME_TXN_REASON_NO_ROOM         22u /* shop: SHOP_SELL whose money-bag overflow would need more free pockets than there are */
+#define PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS 23u /* mail: MAIL_SEND to a player who owns no house on the HOST (vanilla mMl_hunt_for_send_address) */
+#define PC_NETGAME_TXN_REASON_MAILBOX_FULL    24u /* mail: MAIL_SEND whose recipient's house mailbox has no free slot */
+#define PC_NETGAME_TXN_REASON_PO_FULL         25u /* mail: MAIL_SEND the post office cannot take (5 desk slots / 10 letters per house) */
 /* Named switch for the LEGACY INTERACT_CONFIRM(COMMIT) path. 0 (X1a): the host still processed it exactly as before and a TXN and a
  * legacy COMMIT could never both apply to one reservation. 1 (X1b, NOW: the real client sends TXN_COMMIT instead): CONFIRM(COMMIT)
  * is retired -- logged, the reservation released, nothing mutated. ABORT is never retired. */
@@ -2852,6 +2870,25 @@ typedef struct PCNetGameTsOp {
     uint32_t request_id;
 } PCNetGameTsOp;
 static PCNetGameTsOp            s_ts_op;
+
+/* Mail milestone 1 (client): the ONE UI-seam MAIL_SEND operation (the post girl's receive dialogue). Phase 1 = AWAIT_CLEAN: a PRE-transaction state
+ * that is NOT pcnetgame_txn_busy() (s_ctxn stays FREE, so the D3 uploads keep running and flush the dirty record); the tick polls the clean
+ * predicate (record digest == the acked digest, nothing in flight) and then begins the transaction (phase 2 = s_ctxn QUEUED / SENT, kind 12).
+ * pc_net_game_client_pocket_locked() covers both phases. The letter is never changed locally before the host's APPLIED. */
+#define PC_NETGAME_MAIL_CLEAN_TIMEOUT_MS 5000u
+typedef struct PCNetGameMailOp {
+    uint8_t  active, done, outcome; /* outcome: 1 APPLIED, 2 REJECTED (valid once done) */
+    uint8_t  phase;                 /* 1 AWAIT_CLEAN, 2 transaction begun (s_ctxn) */
+    uint8_t  slot, reason;          /* reason: the host's PC_NETGAME_TXN_REASON_* of a REJECTED result, 0 = a local refusal */
+    uint32_t h24;                   /* low 24 bits of the canonical-BE FNV of the letter at begin time */
+    uint32_t request_id, started_ms;
+    PCNetGameOwnerStamp owner;
+} PCNetGameMailOp;
+static PCNetGameMailOp s_mail_op;
+static uint8_t         s_mail_last_reason;
+static void pcnetgame_mail_op_resolve(uint32_t request_id, int applied);
+static void pcnetgame_mail_tick(void);
+static int  pcnetgame_mail_state_clean(void);
 static uint8_t                  s_ts_last_reason; /* the PC_NETGAME_TXN_REASON_* of the last REJECTED town-service result (0 = none / a local refusal) */
 static uint32_t                 s_ts_next_rid = 0x70000000u; /* request ids only label this client's own operations (no host reservation exists) */
 static uint32_t                 s_ts_client_seq[PC_NETGAME_TS_NUM];
@@ -2867,6 +2904,12 @@ static int pcnetgame_txn_busy(void) {
 /* 1 iff the transaction in flight is for exactly this kind + request id (a late replay of its provisional accept). */
 static int pcnetgame_txn_busy_with(uint8_t kind, uint32_t request_id) {
     return s_ctxn.state != PC_NETGAME_CTXN_FREE && s_ctxn.kind == kind && s_ctxn.request_id == request_id;
+}
+
+/* Mail milestone 1 review: ONE pocket-transaction token. A NEW transaction / grant / town-service request must not begin while a MAIL_SEND is waiting in
+ * AWAIT_CLEAN (s_mail_op, which is deliberately NOT pcnetgame_txn_busy(): the upload flush must keep running). Every request-side begin check uses this. */
+static int pcnetgame_txn_begin_blocked(void) {
+    return s_ctxn.state != PC_NETGAME_CTXN_FREE || (s_mail_op.active && !s_mail_op.done);
 }
 
 static void pcnetgame_txn_begin(uint8_t kind, uint32_t request_id, uint8_t slot, uint16_t item,
@@ -4586,6 +4629,9 @@ static const char* pcnetgame_kind_tag(int kind) {
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_SHOP_SELL) {
         return "SHOP_SELL";
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_MAIL_SEND) {
+        return "MAIL_SEND"; /* mail milestone 1 */
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
         return "DROP";
@@ -11077,11 +11123,30 @@ static uint32_t pcnetgame_fnv1a32(const void* data, size_t n) {
     return pcnetgame_fnv1a32_update(2166136261u, data, n);
 }
 
+/* ---- Mail milestone 1: the hash of ONE letter, over its CANONICAL BE bytes (the layout of the record image; a scripted test double holds exactly
+ * these bytes). Built on a zeroed scratch Private_c with the letter in mail[0] converted by the one shared byte-swap routine, so host and client
+ * (and python) agree byte for byte. MAIL_SEND carries the low 24 bits of it. ---- */
+_Static_assert(offsetof(Private_c, mail) == 0x04E0 && sizeof(Mail_c) == 0x012A && mPr_INVENTORY_MAIL_COUNT == 10,
+               "mail milestone: mail[] must be 10 x 0x12A at 0x4E0 of the record image");
+static uint32_t pcnetgame_mail_be_hash(const Mail_c* m) {
+    static Private_c s_mail_scratch;
+    memset(&s_mail_scratch, 0, sizeof(s_mail_scratch));
+    memcpy(&s_mail_scratch.mail[0], m, sizeof(Mail_c));
+    pc_save_bswap_private(&s_mail_scratch, PC_BSWAP_TO_BE);
+    return pcnetgame_fnv1a32(&s_mail_scratch.mail[0], sizeof(Mail_c));
+}
+
 /* ---- D3-0 (c): the single ownership table over the canonical BE image (== native byte offsets: pc_save_bswap swaps
  * each field in place, so a field sits at the same offset in both images). Verified against include/m_private.h. ----
  * IMMUTABLE: player_ID 0x0000 (0x14 B), exists 0x1086 (1 B): must equal the host value or the upload is INVALID_FIELD.
- * HOST-OWNED: reset_code 0x10F4 (4 B) only: the host's value is kept on upload (client bytes there are silently ignored)
- *   and the client takes it on every push.
+ * HOST-OWNED: museum_record 0x0018 (0x4E B; the 0x17 in m_private.h's comment is wrong: the struct is 2-byte aligned) and reset_code 0x10F4 (4 B): the host's value is kept on upload (client bytes there are
+ *   silently ignored) and the client takes it on every push. museum_record (Mail milestone R): every in-session writer is HOST code that
+ *   iterates all private_data[] (mMsm_SendResultMail / mMsm_SendInformationMail / mMsm_DepositFossil at the day-change grow), so as a
+ *   client-owned range the next upload would resurrect consumed fossils / results (repeated fossil letters = item duplication). The
+ *   client's own load-time writes to it (mMsm_SendInformationMail at m_start_data_init) happen BEFORE the join and are overwritten at the
+ *   adopt; nothing on a client writes it afterwards (museum gift mail is refused on clients until M3). The state_flags museum-completion
+ *   bits (mPr_FLAG_MUSEUM_COMP_HANDBILL_*) are bits inside a client-owned u32 and CANNOT be expressed by byte ranges: left as the known
+ *   open item (needs a per-bit host mask merge).
  * SHARED (client-writable AND host-consumed): lotto_ticket_expiry_month/mail_storage 0x0086-0x0087 and catalog_orders
  *   0x10A8 (5*4 = 0x14 B). Vanilla CLIENT shop code writes them on the player's own record (ac_npc_shop_common.c: catalog
  *   order, lottery-ticket mail when the pockets are full) and the HOST consumes them (m_post_office.c
@@ -11102,7 +11167,9 @@ typedef struct PCNetGameRecRange {
 } PCNetGameRecRange;
 static const PCNetGameRecRange s_rec_ranges[] = {
     { 0x0000u, 0x0014u, PC_NETGAME_REC_OWN_IMMUTABLE }, /* player_ID */
-    { 0x0014u, 0x0072u, PC_NETGAME_REC_OWN_CLIENT },    /* gender .. pockets[14] */
+    { 0x0014u, 0x0004u, PC_NETGAME_REC_OWN_CLIENT },    /* gender, face, reset_count, 1 padding byte */
+    { 0x0018u, 0x004Eu, PC_NETGAME_REC_OWN_HOST },      /* museum_record (Mail milestone R): 0x18, NOT the 0x17 of the decomp comment (u16 alignment) */
+    { 0x0066u, 0x0020u, PC_NETGAME_REC_OWN_CLIENT },    /* 2 padding bytes .. pockets[14] */
     { 0x0086u, 0x0002u, PC_NETGAME_REC_OWN_SHARED },    /* lotto_ticket_expiry_month, lotto_ticket_mail_storage */
     { 0x0088u, 0x0FFEu, PC_NETGAME_REC_OWN_CLIENT },    /* item_conditions .. backgound_texture */
     { 0x1086u, 0x0001u, PC_NETGAME_REC_OWN_IMMUTABLE }, /* exists */
@@ -11113,7 +11180,8 @@ static const PCNetGameRecRange s_rec_ranges[] = {
     { 0x10F8u, 0x1348u, PC_NETGAME_REC_OWN_CLIENT },    /* animal_memory .. unused_2412[45] */
 };
 #define PC_NETGAME_REC_RANGE_NUM ((int)(sizeof(s_rec_ranges) / sizeof(s_rec_ranges[0])))
-_Static_assert(0x0000 + 0x0014 == 0x0014 && 0x0014 + 0x0072 == 0x0086 && 0x0086 + 0x0002 == 0x0088 &&
+_Static_assert(0x0000 + 0x0014 == 0x0014 && 0x0014 + 0x0004 == 0x0018 && 0x0018 + 0x004E == 0x0066 && 0x0066 + 0x0020 == 0x0086 &&
+                   0x0086 + 0x0002 == 0x0088 &&
                    0x0088 + 0x0FFE == 0x1086 && 0x1086 + 0x0001 == 0x1087 && 0x1087 + 0x0021 == 0x10A8 &&
                    0x10A8 + 0x0014 == 0x10BC && 0x10BC + 0x0038 == 0x10F4 && 0x10F4 + 0x0004 == 0x10F8 &&
                    0x10F8 + 0x1348 == 0x2440,
@@ -11121,6 +11189,9 @@ _Static_assert(0x0000 + 0x0014 == 0x0014 && 0x0014 + 0x0072 == 0x0086 && 0x0086 
 _Static_assert(offsetof(Private_c, player_ID) == 0x0000 && sizeof(((Private_c*)0)->player_ID) == 0x14 &&
                    offsetof(Private_c, gender) == 0x0014,
                "D3 ownership: player_ID range");
+_Static_assert(offsetof(Private_c, reset_count) == 0x0016 && offsetof(Private_c, museum_record) == 0x0018 &&
+                   sizeof(((Private_c*)0)->museum_record) == 0x004E && offsetof(Private_c, inventory) == 0x0068,
+               "D3 ownership: museum_record (HOST-owned) range");
 _Static_assert(offsetof(Private_c, inventory.pockets) == 0x0068 &&
                    offsetof(Private_c, inventory.lotto_ticket_expiry_month) == 0x0086 &&
                    offsetof(Private_c, inventory.lotto_ticket_mail_storage) == 0x0087 &&
@@ -11182,6 +11253,7 @@ _Static_assert(mPlayer_DEBT4 >= mPlayer_DEBT0 && mPlayer_DEBT4 >= mPlayer_DEBT1 
 #define PC_NETGAME_REC_FIELD_ORG_TABLE   9u
 #define PC_NETGAME_REC_FIELD_CATALOG    10u /* high byte = catalog order index */
 #define PC_NETGAME_REC_FIELD_LOTTO      11u
+#define PC_NETGAME_REC_FIELD_MAIL_PRESENT 12u /* high byte = mail slot: a USED letter whose gift is neither EMPTY_NO / RSV_NO nor pocket-legal */
 
 /* Timing / policy constants. */
 #define PC_NETGAME_REC_HELLO_TIMEOUT_MS   5000u
@@ -11311,6 +11383,7 @@ static uint32_t pcnetgame_rec_hostfield_digest(const Private_c* r) {
     h = pcnetgame_fnv1a32_update(h, &r->inventory.lotto_ticket_mail_storage, 1);
     h = pcnetgame_fnv1a32_update(h, r->catalog_orders, sizeof(r->catalog_orders));
     h = pcnetgame_fnv1a32_update(h, &r->reset_code, sizeof(r->reset_code));
+    h = pcnetgame_fnv1a32_update(h, &r->museum_record, sizeof(r->museum_record)); /* Mail milestone R: HOST-owned, consumed per resident at the day-change grow */
     return h;
 }
 
@@ -11339,7 +11412,7 @@ static int pcnetgame_rec_refresh_hostfields(int idx, PCNetGameRecSlot* s) {
     s->rev++;
     s->hf_pending = 1;
     s->dirty_unsaved = 1;
-    printf("[NET][REC] host: resident %d host-consumed fields (catalog_orders/lotto/reset_code) changed -> rev %u\n", idx,
+    printf("[NET][REC] host: resident %d host-consumed fields (catalog_orders/lotto/reset_code/museum_record) changed -> rev %u\n", idx,
            (unsigned)s->rev);
     return 1;
 }
@@ -11715,6 +11788,15 @@ static uint16_t pcnetgame_rec_validate_fields(const Private_c* n, const uint8_t*
             return PC_NETGAME_REC_FIELD_ORG_TABLE;
         }
         seen |= 1u << v;
+    }
+    /* Mail milestone 1: the host DELIVERS a mail[] letter's gift to another resident on MAIL_SEND, so a used letter's `present` must be an item that can
+     * exist in a pocket (EMPTY_NO = no gift; RSV_NO is the vanilla "no gift" marker some museum flows test for and is tolerated here -- MAIL_SEND itself
+     * only accepts EMPTY_NO or a pocket-legal item). Unused slots (font 0xFF) are never read. */
+    for (i = 0; i < mPr_INVENTORY_MAIL_COUNT; i++) {
+        mActor_name_t pr = n->mail[i].present;
+        if (n->mail[i].content.font != 0xFF && pr != (mActor_name_t)EMPTY_NO && pr != (mActor_name_t)RSV_NO && !pcnetgame_is_pocket_legal_item(pr)) {
+            return (uint16_t)(PC_NETGAME_REC_FIELD_MAIL_PRESENT | ((uint16_t)i << 8));
+        }
     }
     return 0;
 }
@@ -12371,6 +12453,9 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_NOT_SELLABLE: return "NOT_SELLABLE";
         case PC_NETGAME_TXN_REASON_PRICE_MISMATCH: return "PRICE_MISMATCH";
         case PC_NETGAME_TXN_REASON_NO_ROOM: return "NO_ROOM";
+        case PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS: return "NO_SUCH_ADDRESS";
+        case PC_NETGAME_TXN_REASON_MAILBOX_FULL: return "MAILBOX_FULL";
+        case PC_NETGAME_TXN_REASON_PO_FULL: return "PO_FULL";
         default: return "?";
     }
 }
@@ -12430,6 +12515,24 @@ static int pcnetgame_rec_txn_write_inventory(int idx, const uint16_t* pockets, u
     }
     r->inventory.item_conditions = item_conditions;
     r->inventory.wallet = wallet;
+    return 1;
+}
+
+/* Mail milestone 1: the sanctioned writer of ONE mail[] slot of a mirrored resident (the only place outside the D3 merge that writes
+ * private_data[].mail[]): MAIL_SEND clears the slot whose letter the host just handed to the post office (letter == NULL). Raw / vanilla
+ * mMl_clear_mail bytes only (the client clears its own slot with the same call, so the cdig of the RESULT matches). The index comes only from
+ * pcnetgame_rec_gate(); the host's OWN resident is never written. */
+static int pcnetgame_rec_txn_write_mail(int idx, int mail_slot, const Mail_c* letter) {
+    Private_c* r;
+    if (!pcnetgame_rec_txn_idx_ok(idx) || mail_slot < 0 || mail_slot >= mPr_INVENTORY_MAIL_COUNT) {
+        return 0;
+    }
+    r = &Save_Get(private_data)[idx];
+    if (letter == NULL) {
+        mMl_clear_mail(&r->mail[mail_slot]);
+    } else {
+        memcpy(&r->mail[mail_slot], letter, sizeof(Mail_c));
+    }
     return 1;
 }
 
@@ -13940,6 +14043,294 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
 }
 /* ===== TS HOST END ===== */
 
+/* ===== MAIL HOST BEGIN: mail milestone 1 -- a client's letter to a PLAYER (TXN_COMMIT kind 12 MAIL_SEND) =====
+ * One synchronous handler, one commit point (same machinery as pcnetgame_handle_host_ts_txn): READY gate -> binding gate -> SYNCED / world ready ->
+ * shape -> journal (fence / replay / CONFLICT) -> base -> pre-image validation -> READ-ONLY letter checks on the HOST's own mirror
+ * (private_data[bound].mail[slot], NEVER bytes from the message) -> commit: sender := the bound identity, receive font, mPO_receipt_proc(), the
+ * mirror slot cleared by pcnetgame_rec_txn_write_mail(), rev++, journal -> RESULT. The gift travels inside the letter only, so no pocket
+ * changes (post == pre); delivery to the recipient's mailbox is plain vanilla on the host (mPO_business_proc / the postman). */
+static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
+    const PCNetGameTxnTag* t = &in->tag;
+    PCNetGameHostPeerState* st;
+    PCNetGameRecSlot* slot;
+    PCNetGameTxnResident* R;
+    const PCNetGameTxnLog* old;
+    const Mail_c* L;
+    Mail_c W;
+    uint32_t hash, now, lh, want24, wh;
+    uint16_t bad;
+    int idx, shape_ok, sh = -1, rh = -1, k, po_slot = -1, stale = 0;
+    const char* fail = NULL;
+    uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+
+    /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not READY: dropped silently, no result by design */
+    }
+    st = &s_host_peer[peer];
+    now = pcnetgame_now_ms();
+    if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_IGNORE_COMMIT)) {
+        printf("[NET][TXN][TEST-ONLY] ignore_commit: MAIL_SEND request=%u seq=%u discarded before validation (nothing journaled)\n",
+               (unsigned)in->request_id, (unsigned)t->txn_seq);
+        return; /* FAULT: no result by design */
+    }
+
+    /* 2. binding / record state: the resident index comes ONLY from the gate (never from the message) */
+    idx = pcnetgame_rec_gate(peer, 0, 0);
+    if (idx < 0) {
+        pcnetgame_txn_reject(peer, -1, NULL, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_NOT_BOUND, 0, NULL, "peer has no valid resident binding");
+        return;
+    }
+    slot = pcnetgame_rec_slot(idx);
+    if (st->rec_state != PC_NETGAME_RECS_SYNCED || !s_host_world_ready) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0,
+                             st->rec_state != PC_NETGAME_RECS_SYNCED ? (uint8_t)PC_NETGAME_TXN_REASON_NOT_SYNCED : (uint8_t)PC_NETGAME_TXN_REASON_BUSY,
+                             0, NULL, st->rec_state != PC_NETGAME_RECS_SYNCED ? "resident record not SYNCED" : "host world not ready");
+        return;
+    }
+
+    /* 3. shape */
+    shape_ok = in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND && in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 &&
+               t->flags == 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->slot < (uint8_t)mPr_INVENTORY_MAIL_COUNT;
+    if (!shape_ok) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE, 0, NULL, "malformed MAIL_SEND TXN_COMMIT");
+        pcnetgame_rec_violation(peer, "malformed MAIL_SEND TXN_COMMIT (BAD_SHAPE)");
+        return;
+    }
+
+    /* 4. journal: fence, replay, conflict (identical rules to the X1 COMMIT / X3 grant / town-service kinds) */
+    R = &s_txn_res[idx];
+    hash = pcnetgame_fnv1a32(in, sizeof(*in));
+    if (pcnetgame_txn_nonce_fenced(R, t->txn_nonce)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "nonce fenced");
+        return;
+    }
+    if (t->txn_nonce == R->nonce) {
+        old = pcnetgame_txn_journal_find(R, t->txn_nonce, t->txn_seq);
+        if (old != NULL) {
+            if (old->msg_hash != hash) {
+                printf("[NET][TXN] host: peer %d resident %d *** CONFLICT: seq %u was seen with DIFFERENT bytes -- never re-executed ***\n",
+                       (int)peer, idx, (unsigned)t->txn_seq);
+                pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_CONFLICT, 0, NULL,
+                                     "same (nonce, seq) with different bytes");
+            } else if (old->outcome == (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED) {
+                pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED, "replay ");
+            } else {
+                pcnetgame_txn_send_result(peer, idx, in, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, old->reason, slot->epoch, slot->rev, 0, NULL, 0, 0,
+                                          "replay ");
+            }
+            return; /* RESULT sent (the journalled outcome; nothing executed) */
+        }
+        if (t->txn_seq <= R->max_seq) {
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "seq at or below the fence");
+            return;
+        }
+    } else {
+        if (R->nonce != 0) { /* a new client process: the old nonce is fenced completely (FIFO of 4) */
+            memmove(&R->fenced[0], &R->fenced[1], sizeof(R->fenced) - sizeof(R->fenced[0]));
+            R->fenced[PC_NETGAME_TXN_FENCED_NUM - 1] = R->nonce;
+        }
+        printf("[NET][TXN] host: peer %d resident %d new client nonce %u (previous %u fenced)\n", (int)peer, idx, (unsigned)t->txn_nonce,
+               (unsigned)R->nonce);
+        R->nonce = t->txn_nonce;
+        R->head = 0;
+        R->n = 0;
+        R->max_seq = 0;
+    }
+    R->max_seq = t->txn_seq; /* from here on every outcome is journalled */
+
+    /* 5. base: the pre-image must be built on THIS lineage, not older than the last pocket transaction, not from the future */
+    pcnetgame_rec_refresh_hostfields(idx, slot);
+    if (t->base_epoch != slot->epoch || t->base_rev < R->last_pocket_rev || t->base_rev > slot->rev) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_STALE_IMAGE, 1, NULL, "base (epoch, rev) is stale or from the future");
+        pcnetgame_rec_stale_push(peer, idx, slot, now);
+        return;
+    }
+
+    /* 6. pre-image validation (the record-upload validator); a mail send changes no pocket, so post == pre */
+    bad = pcnetgame_rec_validate_inventory(t->pre_pockets, t->pre_conds, t->pre_wallet);
+    if (bad != 0) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE, 1, NULL, "pre-image failed validation");
+        return;
+    }
+
+    /* 7. READ-ONLY letter checks against the HOST's own copy: the mirror letter, the host's houses, mailboxes and post office. Nothing is mutated here. */
+    L = &Save_Get(private_data)[idx].mail[t->slot];
+    want24 = ((uint32_t)t->aux_cond << 16) | (uint32_t)t->aux_item;
+    {
+        int i;
+        for (i = 0; i < mHS_HOUSE_NUM; i++) {
+            if (mPr_CheckCmpPersonalID(&Save_Get(homes[i]).ownerID, &Save_Get(private_data)[idx].player_ID) == TRUE) {
+                sh = i; /* the sender's own house: a resident without a house (guest / extra player) cannot post */
+                break;
+            }
+        }
+    }
+    if (sh < 0) {
+        fail = "the bound resident owns no house (guests / extra players are refused until they exist)";
+        fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
+    } else if (mMl_check_not_used_mail((Mail_c*)L) == TRUE) {
+        fail = "the mirror letter slot is empty (the host's mirror does not hold the letter)";
+        fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_STALE_IMAGE;
+        stale = 1;
+    } else {
+        lh = pcnetgame_mail_be_hash(L) & 0xFFFFFFu;
+        if (lh != want24) {
+            fail = "the mirror letter does not hash to the claimed letter (the client edited it after its last upload / the mirror lags)";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_STALE_IMAGE;
+            stale = 1;
+        } else if (L->present != (mActor_name_t)t->item) {
+            fail = "the claimed gift echo does not match the mirror letter";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE;
+        } else if (!mMl_check_send_mail((Mail_c*)L)) {
+            fail = "the mirror letter is not a send-font letter";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE;
+        } else if (L->present != (mActor_name_t)EMPTY_NO && !pcnetgame_is_pocket_legal_item(L->present)) {
+            fail = "the letter's gift is not an item that can exist in a pocket";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE;
+        } else if (L->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER) {
+            fail = "the recipient is not a player (villager letters keep MAIL_REQUEST; the museum waits for the museum milestone)";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+        } else {
+            rh = mMl_hunt_for_send_address((Mail_c*)L); /* the vanilla address lookup, against the HOST's houses */
+            if (rh < 0) {
+                fail = "no house on the host belongs to the recipient";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS;
+            } else if (mMl_chk_mail_free_space(Save_Get(homes[rh]).mailbox, HOME_MAILBOX_SIZE) < 0) {
+                fail = "the recipient's mailbox has no free slot";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_MAILBOX_FULL;
+            } else if (mPO_count_mail(rh) >= HOME_MAILBOX_SIZE || mPO_get_keep_mail_sum() >= mPO_MAIL_STORAGE_SIZE ||
+                       mMl_chk_mail_free_space(Save_Get(post_office).mail, mPO_MAIL_STORAGE_SIZE) < 0) {
+                fail = "the post office cannot take another letter (desk full / quota for this house)";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PO_FULL;
+            }
+        }
+    }
+    if (fail == NULL && pcnetgame_txn_fault_fire(PC_TXN_FAULT_FAIL_WORLD)) {
+        fail = "TEST-ONLY injected fail_world";
+        fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_WORLD_CHANGED;
+    }
+    if (fail != NULL) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, fail_reason, 1, NULL, fail);
+        if (stale) {
+            pcnetgame_rec_stale_push(peer, idx, slot, now); /* the client re-syncs from a (paced) full push */
+        }
+        return; /* RESULT sent; nothing mutated */
+    }
+    if (!pcnetgame_rec_txn_idx_ok(idx)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL,
+                             "resident not writable (the host's own resident is never written)");
+        return;
+    }
+
+    /* 8. THE commit: the host's own copy of the letter, sender forced to the BOUND identity (a client-chosen sender is never trusted), receive font */
+    memcpy(&W, L, sizeof(W));
+    mPr_CopyPersonalID(&W.header.sender.personalID, &st->bound_pid);
+    W.header.sender.type = (u8)mMl_NAME_TYPE_PLAYER;
+    W.content.font = (u8)mMl_FONT_RECV;
+    wh = pcnetgame_mail_be_hash(&W);
+    if (mPO_receipt_proc(&W, mPO_SENDTYPE_MAIL) != TRUE) {
+        /* cannot happen after the read-only checks (single-threaded); mPO_receipt_check_mail mutates nothing when it answers FALSE for a PLAYER letter */
+        printf("[NET][MAIL] host: peer %d *** INTERNAL: mPO_receipt_proc refused after a passing check -- nothing mutated ***\n", (int)peer);
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PO_FULL, 1, NULL, "post office refused the letter");
+        return;
+    }
+    for (k = 0; k < mPO_MAIL_STORAGE_SIZE; k++) {
+        if (mMl_check_not_used_mail(&Save_Get(post_office).mail[k]) == FALSE && pcnetgame_mail_be_hash(&Save_Get(post_office).mail[k]) == wh) {
+            po_slot = k;
+            break;
+        }
+    }
+    (void)pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL); /* the mirror slot is cleared: the letter (and its gift) now lives ONLY in the post office */
+    slot->rev++;
+    slot->dirty_unsaved = 1;
+    R->last_pocket_rev = slot->rev;
+    pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+    printf("[NET][MAIL] host: peer %d resident %d MAIL_SEND slot %u -> house %d present 0x%04X letter_hash=0x%08X po_slot=%d po_sum=%d mirror_slot_cleared=1 committed [TXN]\n",
+           (int)peer, idx, (unsigned)t->slot, rh, (unsigned)t->item, (unsigned)wh, po_slot, (int)mPO_get_keep_mail_sum());
+    if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
+        printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the mail commit, no RESULT sent\n", (int)peer);
+        pcnetgame_host_drop_peer(peer);
+        return; /* FAULT: no result by design */
+    }
+    /* 9. the RESULT (post-image == pre-image), 10. a push in flight carries the PRE-transaction mail[]: restart it so the client never adopts a stale image */
+    pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
+    if (st->rec_push_active) {
+        pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);
+    }
+}
+
+/* TEST-ONLY (--mail-test-force-delivery, HOST only, default OFF): the postman delivers at the host's own game clock (and only while a host player is
+ * in the right acre), which a protocol test cannot wait for. While armed, every 2 s the host runs the vanilla mPO_delivery_one_address() for each
+ * house if the post office holds letters for players, and logs every used letter of every mailbox (BE hash, font, gift, sender / recipient type) so
+ * the test can prove WHAT landed in WHICH house's mailbox. It uses the real vanilla delivery function; nothing else is changed. */
+static void pcnetgame_mail_test_force_delivery(void) {
+    static uint32_t next_ms = 0;
+    uint32_t now;
+    int h, i;
+    if (!g_pc_mail_test_force_delivery || s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (next_ms != 0 && (int32_t)(now - next_ms) < 0) {
+        return;
+    }
+    next_ms = now + 2000u;
+    if (Save_Get(post_office).keep_mail_sum_players <= 0) {
+        return;
+    }
+    printf("[NET][MAIL][TEST-ONLY] force-delivery: post office holds %d player letter(s) -- running mPO_delivery_one_address() for every house (NOT active in normal play)\n",
+           (int)Save_Get(post_office).keep_mail_sum_players);
+    for (h = 0; h < mHS_HOUSE_NUM; h++) {
+        (void)mPO_delivery_one_address(h);
+    }
+    for (h = 0; h < mHS_HOUSE_NUM; h++) {
+        for (i = 0; i < HOME_MAILBOX_SIZE; i++) {
+            Mail_c* m = &Save_Get(homes[h]).mailbox[i];
+            if (mMl_check_not_used_mail(m) == FALSE) {
+                printf("[NET][MAIL][TEST-ONLY] force-delivery: house %d mailbox[%d] hash=0x%08X font=%u present=0x%04X recipient_type=%u sender_type=%u sender_pid_id=0x%04X\n",
+                       h, i, (unsigned)pcnetgame_mail_be_hash(m), (unsigned)m->content.font, (unsigned)m->present,
+                       (unsigned)m->header.recipient.type, (unsigned)m->header.sender.type, (unsigned)m->header.sender.personalID.player_id);
+            }
+        }
+    }
+    printf("[NET][MAIL][TEST-ONLY] force-delivery: done, post office keeps %d player letter(s)\n", (int)Save_Get(post_office).keep_mail_sum_players);
+}
+/* TEST-ONLY (--mail-test-poke-museum=<resident idx>, HOST only, default OFF): simulates the HOST consuming a museum_record of a mirrored resident (what
+ * mMsm_SendResultMail / mMsm_DepositFossil do at the day-change grow, which no protocol-level test can trigger): once that resident's record is
+ * SYNCED (rev > 0) and 3 s have passed, bumps its stored_fossil_num by one. The 1 Hz host-field watcher must then see the museum_record digest change,
+ * bump the lineage rev and push the host-owned ranges (PUSH_HOSTFIELDS); the client applies them over its own copy. Logs loudly, fires once. */
+static void pcnetgame_mail_test_poke_museum(void) {
+    static int done = 0;
+    static uint32_t seen_ms = 0;
+    const int r = g_pc_mail_test_poke_museum;
+    uint32_t now;
+    if (r < 0 || done || s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready || r >= PLAYER_NUM) {
+        return;
+    }
+    if (!s_rec_slot[r].init || s_rec_slot[r].rev == 0u || !pcnetgame_rec_txn_idx_ok(r)) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (seen_ms == 0u) {
+        seen_ms = now;
+        return;
+    }
+    if ((uint32_t)(now - seen_ms) < 3000u) {
+        return;
+    }
+    done = 1;
+    {
+        Private_c* p = &Save_Get(private_data)[r];
+        const unsigned before = (unsigned)p->museum_record.stored_fossil_num;
+        p->museum_record.stored_fossil_num = (u8)((before + 1u) & 0x1Fu);
+        printf("[NET][MAIL][TEST-ONLY] --mail-test-poke-museum=%d: resident %d museum_record.stored_fossil_num %u -> %u (a simulated HOST consumption; NOT active in normal play)\n",
+               r, r, before, (unsigned)p->museum_record.stored_fossil_num);
+    }
+}
+
+/* ===== MAIL HOST END ===== */
+
 /* ===== D3 CLIENT BEGIN: host-mirrored resident record (protocol v8, CLIENT half) =====
  * What this process does for its OWN resident record (Now_Private == Save.private_data[player_no]):
  *   1. right after IDENTITY_ACK (-> READY) it sends RECORD_HELLO (have_last / last_* carried from an earlier session of THIS
@@ -14927,7 +15318,8 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
     if (s_ctxn.kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && s_ctxn.kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) {
         pcnetgame_client_send_confirm(s_ctxn.kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT, reason, s_ctxn.request_id);
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
-               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL ||
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* town services: no reservation to release; the UI seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
@@ -14953,7 +15345,8 @@ static int pcnetgame_txn_try_send(void) {
     uint16_t item = T->item, aux_item = 0;
     const int is_commit_kind = (T->kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && T->kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) ||
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
-                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL;
+                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL ||
+                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -15041,6 +15434,32 @@ static int pcnetgame_txn_try_send(void) {
                 }
             }
             aux_item = T->ts_aux_item; /* the slot mask */
+            break;
+        }
+        case PC_NETGAME_TXN_KIND_MAIL_SEND: {
+            /* mail milestone 1: the letter must still be exactly the one the post girl's operation began with, and the record must still be CLEAN
+             * (uploads are deferred while this transaction is unresolved, so it stays clean; if it is not, a nudge from the lock-less window is over:
+             * cancel rather than wait, a QUEUED transaction that is not clean could never become clean). The slot is cleared ONLY by APPLIED. */
+            const Mail_c* ml;
+            uint32_t h24;
+            if (slot >= (uint8_t)mPr_INVENTORY_MAIL_COUNT) {
+                pcnetgame_txn_cancel_queued("bad mail slot", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
+                return -1;
+            }
+            ml = &Now_Private->mail[slot];
+            h24 = pcnetgame_mail_be_hash(ml) & 0xFFFFFFu;
+            if (mMl_check_not_used_mail((Mail_c*)ml) == TRUE || !mMl_check_send_mail((Mail_c*)ml) ||
+                h24 != ((((uint32_t)T->ts_aux) << 16) | (uint32_t)T->ts_aux_item)) {
+                pcnetgame_txn_cancel_queued("the mail slot no longer holds the letter being sent", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
+                return -1;
+            }
+            if (!pcnetgame_mail_state_clean()) {
+                pcnetgame_txn_cancel_queued("the record is not clean (an unsent local change)", (uint8_t)PC_NETGAME_CONFIRM_REASON_STATE_CHANGED);
+                return -1;
+            }
+            item = (uint16_t)ml->present; /* the gift echo (EMPTY_NO = no gift) */
+            aux_cond = T->ts_aux;         /* bits 16..23 of the letter hash */
+            aux_item = T->ts_aux_item;    /* bits 0..15 */
             break;
         }
         case PC_NETGAME_TXN_KIND_DIG_BURIED:
@@ -15210,7 +15629,8 @@ int pc_net_game_client_pocket_locked(void) {
     if (s_role != PC_NETGAME_ROLE_CLIENT) {
         return 0;
     }
-    return s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid || pcnetgame_txn_busy();
+    return s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid || pcnetgame_txn_busy() ||
+           (s_mail_op.active && !s_mail_op.done); /* mail milestone 1: AWAIT_CLEAN (not a txn yet) keeps the inventory shut too */
 }
 
 /* Town services milestone 2: applies the host post-image of a SHOP_BUY / SHOP_SELL (the pockets / conditions / wallet the host computed with the
@@ -15302,6 +15722,33 @@ static int pcnetgame_txn_apply_shop(const PCNetGameClientTxn* T, const PCNetGame
     return 1;
 }
 
+/* Mail milestone 1: APPLIED of a MAIL_SEND. The host delivered the letter to its post office and cleared ITS mirror slot (post-image == pre-image,
+ * pockets untouched); the client clears the same slot -- but only if it still holds EXACTLY the letter that was sent (the locks guarantee it; if not,
+ * the slot is kept and logged, the next upload / push reconciles). This is the ONLY place the client removes a letter it sent. Returns 1. */
+static int pcnetgame_txn_apply_mail(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+    const PCNetGameTxnTag* t = &T->tag;
+    const uint32_t want24 = (((uint32_t)t->aux_cond) << 16) | (uint32_t)t->aux_item;
+    if (t->slot >= (uint8_t)mPr_INVENTORY_MAIL_COUNT) {
+        printf("[NET][TXN] client: *** APPLIED MAIL_SEND for request %u names a bad slot -- nothing applied ***\n", (unsigned)T->request_id);
+        return 0;
+    }
+    if ((pcnetgame_mail_be_hash(&Now_Private->mail[t->slot]) & 0xFFFFFFu) == want24 && mMl_check_send_mail(&Now_Private->mail[t->slot])) {
+        mMl_clear_mail(&Now_Private->mail[t->slot]); /* the letter (and any gift inside it) now lives in the host's post office only */
+        printf("[NET][TXN] client: APPLIED request %u kind=MAIL_SEND -- the letter in mail slot %u was handed to the post office and removed locally\n",
+               (unsigned)T->request_id, (unsigned)t->slot);
+    } else {
+        printf("[NET][TXN] client: *** APPLIED request %u kind=MAIL_SEND but mail slot %u no longer holds the sent letter -- possible local divergence, slot kept "
+               "(the D3 base is NOT advanced: the next upload is STALE_BASE and the host push reconciles, so the kept letter cannot be re-added to the mirror) ***\n",
+               (unsigned)T->request_id, (unsigned)t->slot);
+        return 1;
+    }
+    if (in->host_session == s_crec.base_session && in->epoch == s_crec.base_epoch && in->rev > s_crec.base_rev) {
+        pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
+        s_crec.next_check_ms = 0;
+    }
+    return 1;
+}
+
 /* The ONLY writer of pockets / item_conditions / wallet for a pickup / drop / bury / dig grant / catch. Called with a copy of s_ctxn (the state
  * is already FREE) and the host's APPLIED RESULT. */
 /* Returns 1 when the host post-image was applied to the local inventory (or there is nothing to apply), 0 when it was NOT (owner changed /
@@ -15323,6 +15770,9 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
         printf("[NET][TXN] client: APPLIED for request %u but the local player/save changed -- nothing applied (the host mirror is the "
                "truth at the next join)\n", (unsigned)T->request_id);
         return 0;
+    }
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {
+        return pcnetgame_txn_apply_mail(T, in); /* mail milestone 1: the mail[] slot, never the pockets */
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
         return pcnetgame_txn_apply_shop(T, in); /* town services milestone 2: the shop's own post-image shape (bells, money bags, several slots) */
@@ -15631,6 +16081,10 @@ static void pcnetgame_run_txn_test_hook(void) {
  * is pending. The pocket changes ONLY in pcnetgame_txn_apply_applied() (host post-image); a REJECTED result changes nothing. */
 
 static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int applied) {
+    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {
+        pcnetgame_mail_op_resolve(request_id, applied); /* mail milestone 1: the post girl's operation, not a town-service op */
+        return;
+    }
     if (s_ts_op.active && s_ts_op.kind == kind && s_ts_op.request_id == request_id) {
         s_ts_op.done = 1;
         s_ts_op.outcome = applied ? 1 : 2;
@@ -15765,7 +16219,7 @@ static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item, int aux
     if (s_ts_op.active && s_ts_op.done) {
         memset(&s_ts_op, 0, sizeof(s_ts_op)); /* the unconsumed result of an abandoned dialogue */
     }
-    if (s_ts_op.active || pcnetgame_txn_busy() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+    if (s_ts_op.active || pcnetgame_txn_begin_blocked() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
         return -1;
     }
     if (!pcnetgame_capture_owner_stamp(&stamp)) {
@@ -16137,6 +16591,287 @@ static void pcnetgame_run_shop_test_hook(void) {
     }
 }
 /* ===== TS CLIENT END ===== */
+
+/* ===== MAIL CLIENT BEGIN: mail milestone 1 -- the client half of a letter to a PLAYER (TXN_COMMIT kind 12) =====
+ * Seam: ac_npc_post_girl.c_inc (aPG_check_destination / aPG_receive_menu_close_wait). The vanilla send path hands the letter to the post girl and,
+ * on acceptance, runs mPO_receipt_proc() on the LOCAL post office (dead on a client: the letter and its gift would be lost). A client therefore
+ * (1) keeps the letter in its mail[] slot (m_tag_ovl.c mTG_send_proc does not empty it for a player recipient; the post girl restores the same
+ * bytes up front as a second, idempotent guard), (2) waits until its record is CLEAN, (3) sends TXN_COMMIT kind 12 naming the slot + a hash, and
+ * (4) the letter leaves the slot ONLY when the host answers APPLIED (pcnetgame_txn_apply_mail). Any refusal leaves the letter in the slot. */
+
+/* 1 iff the record is exactly what the host last acknowledged: SYNCED, a held acked digest, no upload in flight or staged push, uploads not stopped,
+ * and the digest of the client-owned bytes of Now_Private (which includes mail[]) equals the acked digest. */
+static int pcnetgame_mail_state_clean(void) {
+    uint32_t c = 0;
+    if (s_crec.state != PC_NETGAME_CRS_SYNCED || !s_crec.acked_valid || s_crec.up_active || s_crec.up_blocked || s_crec.st_valid) {
+        return 0;
+    }
+    if (!pcnetgame_owner_stamp_matches(&s_crec.owner)) {
+        return 0;
+    }
+    if (!pcnetgame_crec_now_cdig(&c)) {
+        return 0;
+    }
+    return c == s_crec.acked_cdig;
+}
+
+static void pcnetgame_mail_op_resolve(uint32_t request_id, int applied) {
+    if (s_mail_op.active && !s_mail_op.done && s_mail_op.request_id == request_id) {
+        s_mail_op.done = 1;
+        s_mail_op.outcome = applied ? 1 : 2;
+        s_mail_op.reason = applied ? (uint8_t)0 : s_ts_last_reason;
+    }
+}
+
+static void pcnetgame_mail_reject_local(const char* why) {
+    printf("[NET][MAIL] client: MAIL_SEND request %u (mail slot %u) refused locally: %s -- the letter stays in its slot\n", (unsigned)s_mail_op.request_id,
+           (unsigned)s_mail_op.slot, why);
+    s_mail_op.done = 1;
+    s_mail_op.outcome = 2;
+    s_mail_op.reason = 0;
+}
+
+/* Begins a MAIL_SEND of the letter in mail slot `slot` (a PLAYER-addressed, send-font letter). 1 = started (phase AWAIT_CLEAN), 0 = refused for good
+ * (not a READY + SYNCED client, bad slot / letter): the caller takes its refusal path, -1 = busy (another operation / transaction is unresolved):
+ * ask again next frame. Never changes the letter. */
+int pc_net_game_mail_begin_send(int slot) {
+    PCNetGameOwnerStamp stamp;
+    const Mail_c* ml;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || Now_Private == NULL) {
+        return 0;
+    }
+    if (slot < 0 || slot >= mPr_INVENTORY_MAIL_COUNT) {
+        return 0;
+    }
+    if (s_mail_op.active && s_mail_op.done) {
+        memset(&s_mail_op, 0, sizeof(s_mail_op)); /* the unconsumed result of an abandoned dialogue */
+    }
+    if (s_mail_op.active || s_ts_op.active || pcnetgame_txn_busy() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return -1;
+    }
+    if (s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.up_blocked) {
+        return 0; /* no host mirror to send from (record not synced yet / uploads stopped) */
+    }
+    ml = &Now_Private->mail[slot];
+    if (mMl_check_not_used_mail((Mail_c*)ml) == TRUE || !mMl_check_send_mail((Mail_c*)ml) || ml->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER) {
+        return 0;
+    }
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        return 0;
+    }
+    memset(&s_mail_op, 0, sizeof(s_mail_op));
+    s_mail_op.active = 1;
+    s_mail_op.phase = 1;
+    s_mail_op.slot = (uint8_t)slot;
+    s_mail_op.h24 = pcnetgame_mail_be_hash(ml) & 0xFFFFFFu;
+    s_mail_op.request_id = s_ts_next_rid++;
+    s_mail_op.started_ms = pcnetgame_now_ms();
+    s_mail_op.owner = stamp;
+    s_mail_last_reason = 0;
+    s_crec.next_check_ms = 0; /* nudge: the dirty check (and its upload) runs on the next poll */
+    printf("[NET][MAIL] client: begin MAIL_SEND request=%u mail slot=%d present=0x%04X letter_hash24=0x%06X -- awaiting a clean record (digest == acked)\n",
+           (unsigned)s_mail_op.request_id, slot, (unsigned)ml->present, (unsigned)s_mail_op.h24);
+    return 1;
+}
+
+/* PC_NETGAME_TS_OP_PENDING while unresolved; once resolved APPLIED / REJECTED exactly once (the result is consumed; pc_net_game_mail_last_reason()
+ * then gives the host's reason, 0 = a local refusal). A link loss / no operation reports REJECTED (the letter never left its slot). */
+int pc_net_game_mail_poll(void) {
+    int r;
+    if (!s_mail_op.active) {
+        return PC_NETGAME_TS_OP_REJECTED;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        memset(&s_mail_op, 0, sizeof(s_mail_op));
+        s_mail_last_reason = 0;
+        return PC_NETGAME_TS_OP_REJECTED;
+    }
+    if (!s_mail_op.done) {
+        return PC_NETGAME_TS_OP_PENDING;
+    }
+    r = (s_mail_op.outcome == 1) ? PC_NETGAME_TS_OP_APPLIED : PC_NETGAME_TS_OP_REJECTED;
+    s_mail_last_reason = s_mail_op.reason;
+    memset(&s_mail_op, 0, sizeof(s_mail_op));
+    return r;
+}
+
+/* The host's PC_NETGAME_TXN_REASON_* of the last REJECTED mail send consumed by pc_net_game_mail_poll() (0 = a local refusal / none). */
+int pc_net_game_mail_last_reason(void) {
+    return (int)s_mail_last_reason;
+}
+
+/* Once per client poll while READY. Phase AWAIT_CLEAN: polls the clean predicate (bounded by PC_NETGAME_MAIL_CLEAN_TIMEOUT_MS), then begins the kind-12
+ * transaction on s_ctxn (from there the X1b machinery resends identical bytes and applies the result). */
+static void pcnetgame_mail_tick(void) {
+    uint32_t now;
+    const Mail_c* ml;
+    if (!s_mail_op.active || s_mail_op.done || s_mail_op.phase != 1) {
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return; /* pc_net_game_mail_poll() reports a lost link */
+    }
+    now = pcnetgame_now_ms();
+    if ((uint32_t)(now - s_mail_op.started_ms) >= PC_NETGAME_MAIL_CLEAN_TIMEOUT_MS) {
+        pcnetgame_mail_reject_local("the record did not become clean within the bounded wait"); /* also when the local save is not usable */
+        return;
+    }
+    if (Now_Private == NULL || !pcfa_save_ready()) {
+        return;
+    }
+    ml = &Now_Private->mail[s_mail_op.slot];
+    if (!pcnetgame_owner_stamp_matches(&s_mail_op.owner)) {
+        pcnetgame_mail_reject_local("the local player / save changed");
+        return;
+    }
+    if (mMl_check_not_used_mail((Mail_c*)ml) == TRUE || !mMl_check_send_mail((Mail_c*)ml) ||
+        (pcnetgame_mail_be_hash(ml) & 0xFFFFFFu) != s_mail_op.h24) {
+        pcnetgame_mail_reject_local("the letter in the slot changed while waiting");
+        return;
+    }
+    if (s_crec.up_blocked) {
+        pcnetgame_mail_reject_local("record uploads are stopped (the host refused an upload)");
+        return;
+    }
+    if (!pcnetgame_mail_state_clean() || pcnetgame_txn_busy() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return;
+    }
+    printf("[NET][MAIL] client: record is clean after %u ms -- beginning the MAIL_SEND transaction\n", (unsigned)(now - s_mail_op.started_ms));
+    s_mail_op.phase = 2;
+    memset(&s_ctxn, 0, sizeof(s_ctxn));
+    s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
+    s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;
+    s_ctxn.slot = s_mail_op.slot;
+    s_ctxn.item = (uint16_t)ml->present;
+    s_ctxn.ts_aux = (uint8_t)((s_mail_op.h24 >> 16) & 0xFFu);
+    s_ctxn.ts_aux_item = (uint16_t)(s_mail_op.h24 & 0xFFFFu);
+    s_ctxn.request_id = s_mail_op.request_id;
+    s_ctxn.owner = s_mail_op.owner;
+    s_ctxn.first_ms = now;
+    (void)pcnetgame_txn_try_send();
+}
+
+/* TEST-ONLY (--mail-test-send=<house>[,gift], client role, default OFF, never active in normal play; every step logs "[NET][MAIL][TEST-ONLY]").
+ * Drives ONE real letter to the resident of local house <house> through the REAL client path (pc_net_game_mail_begin_send() / _poll -> AWAIT_CLEAN ->
+ * TXN_COMMIT kind 12 -> TXN_RESULT -> pcnetgame_txn_apply_mail(), the entry points the post girl seam calls) without GUI input. It bypasses ONLY the
+ * letter board and the post girl dialogue: its ONE local write puts a send-font letter (sender = the local player, recipient = that house's owner) into
+ * the first free mail slot; with `,gift` it also moves the first pocket item into the letter (what the letter board's hand overlay does) so a gift
+ * travels. The begin follows at once, so the AWAIT_CLEAN wait for the upload is part of the run. While unresolved the slot and the pockets must not
+ * change (a loud "*** ... CHANGED BEFORE APPLIED ***" otherwise). */
+static void pcnetgame_run_mail_test_hook(void) {
+    static int s_stage = 0;
+    static uint32_t s_t0 = 0, s_begin_ms = 0, s_hash0 = 0;
+    static int s_slot = -1, s_house = -1, s_gift = 0;
+    static uint16_t s_snap[mPr_POCKETS_SLOT_COUNT];
+    const char* spec = g_pc_mail_test_send;
+    uint32_t now;
+    int i, r;
+
+    if (spec == NULL || spec[0] == '\0' || s_stage >= 5 || s_role != PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+    if (!pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_stage == 0) {
+        Mail_c* m;
+        char* end = NULL;
+        if ((uint32_t)(now - s_crec.adopt_ms) < 4000u) {
+            return;
+        }
+        s_house = (int)strtol(spec, &end, 10);
+        s_gift = (end != NULL && strstr(end, "gift") != NULL);
+        if (s_house < 0 || s_house >= mHS_HOUSE_NUM || mPr_NullCheckPersonalID(&Save_Get(homes[s_house]).ownerID)) {
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-send=%s: house %d does not exist / has no owner -- hook gives up\n", spec, s_house);
+            s_stage = 5;
+            return;
+        }
+        s_slot = mMl_chk_mail_free_space(Now_Private->mail, mPr_INVENTORY_MAIL_COUNT);
+        if (s_slot < 0) {
+            printf("[NET][MAIL][TEST-ONLY] no free mail slot -- hook gives up\n");
+            s_stage = 5;
+            return;
+        }
+        m = &Now_Private->mail[s_slot];
+        mMl_init_mail(m, &Now_Private->player_ID); /* send font, sender = the local player */
+        mMl_set_to_plname(m, &Save_Get(homes[s_house]).ownerID);
+        for (i = 0; i < 32; i++) {
+            m->content.body[i] = (u8)(0x30 + (i % 10)); /* a recognisable body */
+        }
+        if (s_gift) {
+            for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+                mActor_name_t it = Now_Private->inventory.pockets[i];
+                if (it != (mActor_name_t)EMPTY_NO && pcnetgame_is_pocket_legal_item(it) &&
+                    mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, i) == mPr_ITEM_COND_NORMAL) {
+                    m->present = it; /* the letter board's hand overlay moves the pocket item into the letter */
+                    Now_Private->inventory.pockets[i] = (mActor_name_t)EMPTY_NO;
+                    Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, i, mPr_ITEM_COND_NORMAL);
+                    printf("[NET][MAIL][TEST-ONLY] --mail-test-send: gift item 0x%04X moved from pocket slot %d into the letter\n", (unsigned)it, i);
+                    break;
+                }
+            }
+        }
+        s_hash0 = pcnetgame_mail_be_hash(m);
+        printf("[NET][MAIL][TEST-ONLY] --mail-test-send=%s: wrote a letter into mail slot %d for house %d present 0x%04X hash=0x%08X (local test setup, NOT active in normal play)\n",
+               spec, s_slot, s_house, (unsigned)m->present, (unsigned)s_hash0);
+        s_t0 = now;
+        s_stage = 1;
+        return;
+    }
+    if (s_stage == 1) {
+        if (pcnetgame_txn_busy() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid || s_ts_op.active) {
+            return;
+        }
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            s_snap[i] = (uint16_t)Now_Private->inventory.pockets[i];
+        }
+        r = pc_net_game_mail_begin_send(s_slot);
+        if (r < 0) {
+            return; /* busy: retried */
+        }
+        if (r == 0) {
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-send: the request was refused locally -- hook gives up\n");
+            s_stage = 5;
+            return;
+        }
+        s_begin_ms = now;
+        s_stage = 3;
+        return;
+    }
+    if (s_stage == 3) {
+        r = pc_net_game_mail_poll();
+        if (r == PC_NETGAME_TS_OP_PENDING) {
+            for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+                if (s_snap[i] != (uint16_t)Now_Private->inventory.pockets[i]) {
+                    printf("[NET][MAIL][TEST-ONLY] --mail-test-send: *** POCKET CHANGED BEFORE APPLIED *** (slot %d)\n", i);
+                    s_snap[i] = (uint16_t)Now_Private->inventory.pockets[i];
+                }
+            }
+            if (pcnetgame_mail_be_hash(&Now_Private->mail[s_slot]) != s_hash0) {
+                printf("[NET][MAIL][TEST-ONLY] --mail-test-send: *** MAIL SLOT CHANGED BEFORE APPLIED ***\n");
+                s_hash0 = pcnetgame_mail_be_hash(&Now_Private->mail[s_slot]);
+            }
+            return;
+        }
+        printf("[NET][MAIL][TEST-ONLY] --mail-test-send: result %s reason %d after %u ms\n", r == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED",
+               pc_net_game_mail_last_reason(), (unsigned)(now - s_begin_ms));
+        s_t0 = now;
+        s_stage = 4;
+        return;
+    }
+    if (s_stage == 4 && (uint32_t)(now - s_t0) >= 2500u) { /* let the next upload / push settle, then report the final state */
+        char pb[mPr_POCKETS_SLOT_COUNT * 5 + 1];
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            snprintf(pb + i * 5, sizeof(pb) - (size_t)i * 5, "%04X,", (unsigned)Now_Private->inventory.pockets[i]);
+        }
+        pb[sizeof(pb) - 1] = '\0';
+        printf("[NET][MAIL][TEST-ONLY] --mail-test-send: final mail slot %d %s (font %u) pockets=%s\n", s_slot,
+               mMl_check_not_used_mail(&Now_Private->mail[s_slot]) == TRUE ? "EMPTY" : "STILL HOLDS A LETTER", (unsigned)Now_Private->mail[s_slot].content.font, pb);
+        s_stage = 5;
+    }
+}
+/* ===== MAIL CLIENT END ===== */
 
 /* TEST-ONLY (--txn-test-dig-grant, client role, default OFF, never active in normal play): drives the three host-transactional dig GRANTS through the
  * REAL request functions, one after the other, against the --field-action-test-seed fixtures of the host: DIG_BURIED at (40,104) (a buried
@@ -16723,6 +17458,8 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
             tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
             pcnetgame_handle_host_ts_txn(peer, &tc); /* town services: reservation-less one-phase kinds (museum, police, shop) */
+        } else if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {
+            pcnetgame_handle_host_mail_txn(peer, &tc); /* mail milestone 1: a client's letter to a player, read from the host's mirror */
         } else {
             pcnetgame_handle_host_txn_commit(peer, &tc);
         }
@@ -17185,6 +17922,8 @@ static void pcnetgame_reset_client_session_state(void) {
     s_next_bury_request_id = 1;
     memset(&s_ts_op, 0, sizeof(s_ts_op)); /* town services: the UI operation and the mirror's seq memory die with the session (the host's seq restarts per process) */
     s_ts_last_reason = 0;
+    memset(&s_mail_op, 0, sizeof(s_mail_op)); /* mail milestone 1: the post girl's operation dies with the session (a local refusal) */
+    s_mail_last_reason = 0;
     memset(s_ts_client_seq, 0, sizeof(s_ts_client_seq));
     memset(s_ts_client_have, 0, sizeof(s_ts_client_have));
     memset(s_ts_client_stash_valid, 0, sizeof(s_ts_client_stash_valid));
@@ -17360,6 +18099,7 @@ static void pcnetgame_client_tick(void) {
     if (pcnetgame_txn_tick()) { /* X1b: build/send a QUEUED TXN_COMMIT, resend an unanswered one (identical bytes); never needs the local save */
         return; /* the 60 s cap left the session (M2) */
     }
+    pcnetgame_mail_tick(); /* mail milestone 1: AWAIT_CLEAN poll -> TXN_COMMIT kind 12 */
 
     if (!ready) {
         if (!s_client_paused) {
@@ -19149,6 +19889,9 @@ void pc_net_game_poll(void) {
     pcnetgame_ts_client_tick();
     pcnetgame_run_ts_test_hook();
     pcnetgame_run_shop_test_hook(); /* shop milestone: --shop-test-buy / --shop-test-sell (client role, default OFF) */
+    pcnetgame_run_mail_test_hook(); /* mail milestone: --mail-test-send=<house>[,gift] (client role, default OFF) */
+    pcnetgame_mail_test_force_delivery(); /* mail milestone: --mail-test-force-delivery (host role, default OFF) */
+    pcnetgame_mail_test_poke_museum(); /* mail milestone R: --mail-test-poke-museum=<resident> (host role, default OFF) */
 
     /* World Ecology Wildlife Sync T1 real-gameplay verification: see
      * pcnetgame_run_wildlife_trigger_test_trigger()'s own doc -- a complete no-op unless
@@ -19255,7 +19998,7 @@ int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
     if (pcnetgame_client_record_gate_blocks("PICKUP")) {
         return 1; /* D3: the resident record is not SYNCED with the host yet (adoption pending): no pocket/wallet-dependent request */
     }
-    if (pcnetgame_txn_busy()) {
+    if (pcnetgame_txn_begin_blocked()) {
         return 1; /* X1b lock (a): a pocket transaction is unresolved: handled, nothing sent, no local mutation */
     }
     if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
@@ -19370,7 +20113,7 @@ static int pcnetgame_send_field_action_request_ex_grant(uint8_t kind, int ut_x, 
             printf("[NET][FIELD_ACTION] kind %u cannot carry a grant -- not sent\n", (unsigned)kind);
             return 1;
         }
-        if (pcnetgame_txn_busy()) {
+        if (pcnetgame_txn_begin_blocked()) {
             printf("[NET][FIELD_ACTION] a pocket transaction is still unresolved -- %s grant at (%d,%d) not sent\n", pcnetgame_kind_tag((int)tkind),
                    ut_x, ut_z);
             return 1;
@@ -19418,7 +20161,7 @@ static int pcnetgame_send_field_action_request_ex(uint8_t kind, int ut_x, int ut
  * whole queue, not just the head, since an earlier grant-carrying request may still be queued behind
  * something else. */
 static int pcnetgame_field_action_grant_already_pending(void) {
-    return pcnetgame_txn_busy(); /* X3: grants are host-transactional (s_ctxn): one pocket transaction at a time */
+    return pcnetgame_txn_begin_blocked(); /* X3: grants are host-transactional (s_ctxn): one pocket transaction at a time */
 }
 
 /* Pre-v3 call shape, kept for every EXISTING caller (DIG_BURIED, MONEY_ROCK_HIT, TREE_SHAKE, TREE_CHOP,
@@ -19459,7 +20202,7 @@ int pc_net_game_request_dig_buried(int ut_x, int ut_z) {
         printf("[NET][FIELD_ACTION] pockets full -- DIG_BURIED at (%d,%d) not sent\n", ut_x, ut_z);
         return 1;
     }
-    if (pcnetgame_txn_busy()) {
+    if (pcnetgame_txn_begin_blocked()) {
         printf("[NET][FIELD_ACTION] a pocket transaction is still unresolved -- DIG_BURIED at (%d,%d) not sent\n", ut_x, ut_z);
         return 1;
     }
@@ -19917,7 +20660,7 @@ int pc_net_game_request_drop(int pocket_slot_idx, int claimed_item, int ut_x, in
     if (pcnetgame_client_record_gate_blocks("DROP")) {
         return 0; /* D3: the resident record is not SYNCED with the host yet (adoption pending): no pocket/wallet-dependent request */
     }
-    if (pcnetgame_txn_busy()) {
+    if (pcnetgame_txn_begin_blocked()) {
         printf("[NET][DROP] a pocket transaction is still unresolved -- drop refused (slot %d)\n", pocket_slot_idx);
         return 0; /* X1b lock (a): the m_tag_ovl.c seam shows vanilla's "can't place that" warning; pc_net_game_exchange_request_drop() inherits it */
     }
@@ -20064,7 +20807,7 @@ int pc_net_game_request_bury(int pocket_slot_idx, int claimed_item, int ut_x, in
     if (pcnetgame_client_record_gate_blocks("BURY")) {
         return 0; /* D3: the resident record is not SYNCED with the host yet (adoption pending): no pocket/wallet-dependent request */
     }
-    if (pcnetgame_txn_busy()) {
+    if (pcnetgame_txn_begin_blocked()) {
         printf("[NET][BURY] a pocket transaction is still unresolved -- bury refused (slot %d)\n", pocket_slot_idx);
         return 0; /* X1b lock (a): the m_tag_ovl.c seam shows vanilla's "can't do that" warning */
     }
@@ -21158,7 +21901,7 @@ static int pcnetgame_request_catch_common(uint32_t entity_id, int kind, int clai
         return 0;
     }
 
-    if (pcnetgame_txn_busy()) {
+    if (pcnetgame_txn_begin_blocked()) {
         printf("[NET][WILDLIFE] client: a pocket transaction is still unresolved -- CATCH request for entity %u not sent (denied locally)\n",
                (unsigned)entity_id);
         return 0; /* the notice seams treat 0 as a local denial (no duplicate grant); the entity stays live on the host */

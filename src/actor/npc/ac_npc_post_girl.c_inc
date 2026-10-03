@@ -80,16 +80,19 @@ int aPG_check_destination(Mail_c *mail){
     int res = 0;
     aPG_set_mail_address(mail);
 #ifdef TARGET_PC
-    /* Stage 0 safe degrade: Save_t.post_office / homes[].mailbox / museum records are host-owned and not replicated
-     * (v7). A network CLIENT's letter to another PLAYER (type 0) or a MUSEUM letter carrying a gift (type 2) would only
-     * be written into its local copy and lost together with the attached item. Return 1 ("no such address") so the
-     * existing refusal path hands the letter (and gift) back into the pocket slot. Letters to villagers (type 1,
-     * MAIL_REQUEST path) and gift-less museum letters are unaffected. Host/solo: unchanged. */
-    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT &&
-        (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER ||
-         (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO &&
-          mail->present != RSV_NO))) {
-        return 1;
+    /* Mail milestone 1: a network CLIENT's letter to another PLAYER (type 0) is sent through a host transaction (TXN_COMMIT kind 12, see
+     * aPG_client_mail_step), so the address check here only asks whether the CLIENT's own copy of the town knows that house (the same vanilla
+     * lookup the host will re-run against ITS houses); the stale local mailbox / post-office quota checks below are skipped on a client (the host
+     * runs them and answers MAILBOX_FULL / PO_FULL). A MUSEUM letter carrying a gift (type 2) is still refused (res 1 = the existing refusal path
+     * hands the letter and its gift back into the pocket slot) until the museum milestone: its host path (mMsm_SendMuseumMail) is not wired for
+     * remote senders. Letters to villagers (type 1, MAIL_REQUEST path) and gift-less museum letters are unaffected. Host / solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        if (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER) {
+            return (mMl_hunt_for_send_address(mail) == -1) ? 1 : 0;
+        }
+        if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {
+            return 1;
+        }
     }
 #endif
     switch (mail->header.recipient.type) {
@@ -117,6 +120,64 @@ int aPG_check_destination(Mail_c *mail){
     }
     return res;
 }
+
+#ifdef TARGET_PC
+/* Mail milestone 1 (client only): the in-flight MAIL_SEND of the letter in play->submenu.mail. Reset by aPG_receive_menu_close_wait_init. */
+static int s_aPG_client_mail_active = 0;
+
+/* One frame of a client's letter to a PLAYER. Returns -1 = neutral wait (nothing changes, like aCR / aNSC), 0 = the host APPLIED it (the letter
+ * is gone: pcnetgame_txn_apply_mail removed it from the mail[] slot), 1 / 2 / 3 = the existing refusal rows (no such address / mailbox full /
+ * post office full). The letter is in its mail[] slot (send font) from the first frame on: mTG_send_proc does not empty it for a client's player
+ * letter, and the restore below is the byte-identical copy of the refusal copy-back (idempotent). Rejections: NO_SUCH_ADDRESS and every other
+ * reason (stale image, no donor slot, a refused local begin, the bounded AWAIT_CLEAN timeout) -> row 1; MAILBOX_FULL -> 2; PO_FULL -> 3. */
+static int aPG_client_mail_step(GAME_PLAY *play) {
+    Mail_c *mail = &play->submenu.mail;
+    Submenu_Item_c *item_p = play->submenu.item_p;
+    int r;
+    if (!s_aPG_client_mail_active) {
+        int dest = aPG_check_destination(mail);
+        if (dest != 0) {
+            return dest;
+        }
+        {
+            /* the letter must ALREADY sit in its slot (mTG_send_proc keeps it there for a client): compare, never copy. A mismatch (cannot happen
+             * through the UI) is refused with row 1; the slot is left exactly as it is. */
+            Mail_c cmp;
+            mMl_copy_mail(&cmp, mail);
+            cmp.content.font = mMl_FONT_SEND;
+            if (item_p->slot_no < 0 || item_p->slot_no >= mPr_INVENTORY_MAIL_COUNT || memcmp(&cmp, &Now_Private->mail[item_p->slot_no], sizeof(Mail_c)) != 0) {
+                return 1;
+            }
+        }
+        r = pc_net_game_mail_begin_send(item_p->slot_no);
+        if (r < 0) {
+            return -1;
+        }
+        if (r == 0) {
+            return 1;
+        }
+        s_aPG_client_mail_active = 1;
+        return -1;
+    }
+    aPG_set_mail_address(mail);
+    r = pc_net_game_mail_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return -1;
+    }
+    s_aPG_client_mail_active = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED) {
+        return 0;
+    }
+    switch (pc_net_game_mail_last_reason()) {
+    case PC_NETGAME_MAIL_REJECT_MAILBOX_FULL:
+        return 2;
+    case PC_NETGAME_MAIL_REJECT_PO_FULL:
+        return 3;
+    default:
+        return 1;
+    }
+}
+#endif
 
 void aPG_ask_for_business(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) {
     if (mDemo_Get_OrderValue(mDemo_ORDER_NPC0, 0x9) != 0 && mMsg_Check_MainNormalContinue(mMsg_Get_base_window_p()) == TRUE) {
@@ -315,9 +376,22 @@ void aPG_receive_menu_close_wait(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) 
             postgirl->next_action = aPG_ACTION_CHECK_RECEIVE_AFTER;
             next = 0;
         } else {
-            int dest = aPG_check_destination(&play->submenu.mail);
+            int dest;
+#ifdef TARGET_PC
+            /* mail milestone 1: a client's letter to a PLAYER goes through the host (aPG_client_mail_step); every other recipient keeps the vanilla path */
+            const int client_mail = (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && play->submenu.mail.header.recipient.type == mMl_NAME_TYPE_PLAYER);
+            dest = client_mail ? aPG_client_mail_step(play) : aPG_check_destination(&play->submenu.mail);
+            if (dest < 0) {
+                return; /* neutral wait for the host's answer: no state change, no message */
+            }
+#else
+            dest = aPG_check_destination(&play->submenu.mail);
+#endif
             switch (dest) {
             case 0:
+#ifdef TARGET_PC
+                if (!client_mail) /* a client's letter was already handed to the host's post office (APPLIED removed it from the slot) */
+#endif
                 mPO_receipt_proc(&play->submenu.mail, mPO_SENDTYPE_MAIL);
                 postgirl->next_action = aPG_ACTION_RECEIVE_AFTER_MSG_END_WAIT;
                 next = 1;
@@ -327,6 +401,9 @@ void aPG_receive_menu_close_wait(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) 
             case 3:
                 submenu_item = play->submenu.item_p;
                 play->submenu.mail.content.font = mMl_FONT_SEND;
+#ifdef TARGET_PC
+                if (!client_mail) /* a client's player letter never left its slot (see aPG_client_mail_step): no copy-back */
+#endif
                 mMl_copy_mail(&Now_Private->mail[submenu_item->slot_no], &play->submenu.mail);
                 postgirl->dest = dest;
                 next = dest + 1;
@@ -490,6 +567,9 @@ void aPG_receive_menu_close_wait_init(ACTOR *actorx, GAME *game) {
     Submenu *submenu = &play->submenu;
     mSM_open_submenu(submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_SEND_MAIL, 0x0);
     mMl_clear_mail(&submenu->mail);
+#ifdef TARGET_PC
+    s_aPG_client_mail_active = 0; /* mail milestone 1: a new send dialogue starts with no operation in flight */
+#endif
 }
 
 void aPG_deposit_menu_close_wait_init(ACTOR *actorx, GAME *game) {

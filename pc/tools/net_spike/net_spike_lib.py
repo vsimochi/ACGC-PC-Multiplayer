@@ -1103,6 +1103,7 @@ PC_NETGAME_REC_FIELD_EQUIPMENT = 8
 PC_NETGAME_REC_FIELD_ORG_TABLE = 9
 PC_NETGAME_REC_FIELD_CATALOG = 10   # detail high byte = catalog order index
 PC_NETGAME_REC_FIELD_LOTTO = 11
+PC_NETGAME_REC_FIELD_MAIL_PRESENT = 12   # mail milestone 1: a USED mail[] letter whose gift is not EMPTY_NO / RSV_NO / pocket-legal; detail high byte = mail slot
 # BAD_SHAPE detail codes: 1 total_size, 2 chunk_count, 3 host-only/unknown BEGIN kind, 4 HELLO record_size, 5 BEGIN.rsv != 0,
 # 6 HELLO _reserved0 / undefined flag bits. (A host counts a client RECORD_ACK status other than 0/9/10 as a violation.)
 RECORD_HELLO_FMT = "<BBHIIIII"      # PCNetGameRecordHelloMsg, 24 bytes
@@ -1146,6 +1147,9 @@ PC_NETGAME_TXN_REASON_NO_FUNDS = 19          # shop: SHOP_BUY the pre-image wall
 PC_NETGAME_TXN_REASON_NOT_SELLABLE = 20      # shop: SHOP_SELL of stationery / a quest item / a Sunday turnip bundle
 PC_NETGAME_TXN_REASON_PRICE_MISMATCH = 21    # shop: SHOP_BUY whose expected price differs from the host's price
 PC_NETGAME_TXN_REASON_NO_ROOM = 22           # shop: SHOP_SELL whose money-bag overflow needs more free pockets than there are
+PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS = 23   # mail: MAIL_SEND to a player who owns no house on the HOST
+PC_NETGAME_TXN_REASON_MAILBOX_FULL = 24      # mail: MAIL_SEND whose recipient's house mailbox has no free slot
+PC_NETGAME_TXN_REASON_PO_FULL = 25           # mail: MAIL_SEND the post office cannot take (5 desk slots / 10 letters per house)
 PC_NETGAME_TXN_RING = 16              # host journal entries per resident
 PC_NETGAME_TXN_FENCED_NUM = 4         # fenced nonces remembered per resident
 TXN_TAG_FMT = "<IIBBHBBHII15HHII"       # PCNetGameTxnTag, 64 bytes
@@ -1154,7 +1158,7 @@ TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHII"  # PCNetGameTxnResultMsg, 76 bytes
 TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED", 4: "NOT_SYNCED", 5: "NOT_BOUND", 6: "FENCED",
                     7: "CONFLICT", 8: "BAD_IMAGE", 9: "PRECOND", 10: "STALE_IMAGE", 11: "BAD_SHAPE", 12: "BUSY", 13: "FAULT",
                     14: "REPLAYED", 15: "ALREADY_DONATED", 16: "NOT_AVAILABLE", 17: "NOT_DONATABLE", 18: "NO_DONOR_SLOT", 19: "NO_FUNDS",
-                    20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM"}
+                    20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM", 23: "NO_SUCH_ADDRESS", 24: "MAILBOX_FULL", 25: "PO_FULL"}
 
 # --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
 # CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
@@ -1171,6 +1175,7 @@ PC_NETGAME_TXN_KIND_MUSEUM_DONATE = 8   # town services: TXN_COMMIT kind 8 (dest
 PC_NETGAME_TXN_KIND_POLICE_CLAIM = 9    # town services: TXN_COMMIT kind 9 (dest POCKET, slot = free slot, item = expected item, aux_cond = lost-and-found index)
 PC_NETGAME_TXN_KIND_SHOP_BUY = 10       # shop (milestone 2): dest POCKET, slot = free slot, item, aux_cond = stock code, aux_item = the expected price
 PC_NETGAME_TXN_KIND_SHOP_SELL = 11      # shop (milestone 2): dest NONE, slot = primary slot, item = its item, aux_item = the bit mask of every slot sold
+PC_NETGAME_TXN_KIND_MAIL_SEND = 12      # mail (milestone 1): dest NONE, slot = mail slot 0..9, item = the letter's present echo, aux_item / aux_cond = low 16 / bits 16..23 of the letter's canonical-BE FNV-1a32
 PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD    # SHOP_BUY aux_cond: a counted candy / grab bag (Shop_c.flowers_candy_grab_bag_count)
 PC_NETGAME_SHOP_STOCK_RARE = 0xFE       # SHOP_BUY aux_cond: Shop_c.rare_item
 PC_NETGAME_SHOP_STOCK_UNLIMITED = 0xFF  # SHOP_BUY aux_cond: unlimited stationery
@@ -2394,6 +2399,12 @@ class FakeClient(TransportClient):
             return
         if self.rec_local is not None:
             self.rec_local = record_set_inventory(self.rec_local, g.post_pockets, g.post_conds, g.post_wallet)
+            if g.kind == PC_NETGAME_TXN_KIND_MAIL_SEND and 0 <= g.slot < REC_MAIL_COUNT:
+                # the real client's pcnetgame_txn_apply_mail: the sent letter leaves the slot (mMl_clear_mail bytes == any other unused slot)
+                empty = next((record_mail(self.rec_local, i) for i in range(REC_MAIL_COUNT)
+                              if i != g.slot and record_mail(self.rec_local, i)[0x2E] == MAIL_FONT_UNUSED), None)
+                if empty is not None:
+                    self.rec_local = record_set_mail(self.rec_local, g.slot, empty)
         self.rec_last = (g.host_session, g.epoch, g.rev)
 
     def _auto_txn_commit(self, kind, rid, g):
@@ -2568,6 +2579,52 @@ class FakeClient(TransportClient):
             pre = (tuple(item if (mask >> i) & 1 else p for i, p in enumerate(pockets)), conds, wallet)
         sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_SHOP_SELL, rid, PC_NETGAME_TXN_DEST_NONE, slot, item, pre=pre, aux_item=mask, **kw)
         return sent, self.wait_txn_result(sent.seq, timeout)
+
+    # --- mail milestone 1: MAIL_SEND (TXN_COMMIT kind 12) ------------------------------------------------------------------------------
+
+    def mail_tag_fields(self, mail_be, hash24=None):
+        """(item, aux_cond, aux_item) of a MAIL_SEND for the letter bytes `mail_be`: the gift echo and the 24-bit hash split low16 / bits 16..23."""
+        h = mail_hash24(mail_be) if hash24 is None else hash24
+        return mail_present(mail_be), (h >> 16) & 0xFF, h & 0xFFFF
+
+    def write_local_mail(self, slot, mail_be, pockets=None):
+        """Models the player writing a letter: the local record image gets `mail_be` in mail[slot] (and optionally new pockets, e.g. the gift taken out
+        of a pocket like the letter board's hand overlay does). Returns the new local image (also stored in rec_local)."""
+        rec = self.rec_local if self.rec_local is not None else self.own_record()
+        rec = record_set_mail(rec, slot, mail_be)
+        if pockets is not None:
+            _p, conds, wallet = record_inventory(rec)
+            rec = record_set_inventory(rec, pockets, conds, wallet)
+        self.rec_local = rec
+        return rec
+
+    def upload_local_record(self, timeout=4.0, wait_gap=1.7):
+        """Uploads rec_local on the current base (an ordinary D3 UPLOAD) and waits for the host's APPLIED ack; on APPLIED rec_last moves to the ack's
+        lineage point. Returns the RecordAckFields or None. `wait_gap` seconds are pumped first (the host's 1.5 s gap after an accepted upload)."""
+        if wait_gap:
+            pump_sleep(wait_gap)
+        xid = self.upload_record(self.rec_local)
+        return self.wait_record_ack(xid, timeout=timeout)
+
+    def txn_mail_send(self, slot, mail_be=None, rid=0, timeout=3.0, pre=None, upload=True, hash24=None, item=None, wait_gap=1.7, **kw):
+        """MAIL_SEND: uploads the local record first (the real client's AWAIT_CLEAN: `upload`, with `mail_be` written into mail[slot] before it),
+        then TXN_COMMIT kind 12 (dest NONE, slot, item = the letter's present, aux = the 24-bit letter hash). Default pre-image = the local image's
+        pockets. Returns (TxnSent, TxnResultFields or None, upload_ack or None)."""
+        ack = None
+        if mail_be is not None:
+            self.write_local_mail(slot, mail_be)
+        if upload:
+            ack = self.upload_local_record(wait_gap=wait_gap)
+        cur = record_mail(self.rec_local if self.rec_local is not None else self.own_record(), slot) if mail_be is None else mail_be
+        it, ac, ai = self.mail_tag_fields(cur, hash24)
+        if item is not None:
+            it = item
+        if pre is None:
+            pre = self.txn_pre_image()
+        kw.setdefault("aux_cond", ac)
+        kw.setdefault("aux_item", ai)
+        sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_MAIL_SEND, rid, PC_NETGAME_TXN_DEST_NONE, slot, it, pre=pre, **kw)
+        return sent, self.wait_txn_result(sent.seq, timeout), ack
 
     def on_message(self, m):
         if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TOWN_SVC_STATE:
@@ -3316,7 +3373,9 @@ REC_OWN_SHARED = "shared"   # client-writable AND host-consumed: merged on uploa
 REC_OWN_CLIENT = "client"
 RECORD_FIELD_RANGES = [
     ("player_ID", 0x0000, 0x0014, REC_OWN_IMMUTABLE),
-    ("client_a", 0x0014, 0x0072, REC_OWN_CLIENT),
+    ("client_a", 0x0014, 0x0004, REC_OWN_CLIENT),
+    ("museum_record", 0x0018, 0x004E, REC_OWN_HOST),   # mail milestone R (0x18: the 0x17 in m_private.h's comment is wrong, u16 alignment)
+    ("client_a2", 0x0066, 0x0020, REC_OWN_CLIENT),
     ("lotto_ticket", 0x0086, 0x0002, REC_OWN_SHARED),
     ("client_b", 0x0088, 0x0FFE, REC_OWN_CLIENT),
     ("exists", 0x1086, 0x0001, REC_OWN_IMMUTABLE),
@@ -3342,6 +3401,18 @@ REC_OFF_RESET_CODE = 0x10F4         # BE u32
 REC_OFF_CATALOG_ITEM0 = 0x10A8      # order i: BE u16 item at +4*i, u8 shop_level at +4*i+2, pad
 REC_OFF_BANK = 0x122C               # BE u32
 REC_OFF_ORG_TABLE = 0x2340          # 8 x u8
+REC_OFF_MUSEUM_RECORD = 0x0018      # 0x4E bytes, HOST-owned (mail milestone R)
+REC_MUSEUM_RECORD_SIZE = 0x004E
+REC_OFF_MAIL = 0x04E0               # 10 x Mail_c (0x12A bytes each), client-owned
+REC_MAIL_SIZE = 0x012A
+REC_MAIL_COUNT = 10
+MAIL_FONT_RECV = 0                  # mMl_FONT_RECV
+MAIL_FONT_SEND = 1                  # mMl_FONT_SEND
+MAIL_FONT_UNUSED = 0xFF             # mMl_check_not_used_mail
+MAIL_NAME_PLAYER = 0
+MAIL_NAME_NPC = 1
+MAIL_NAME_MUSEUM = 2
+MAIL_NAME_CLEAR = 0xFF
 
 
 def fnv1a32(data):
@@ -3418,6 +3489,79 @@ def record_get_u16(rec, off):
 
 def record_get_u32(rec, off):
     return struct.unpack_from(">I", rec, off)[0]
+
+
+def record_mail(rec, i):
+    """The 0x12A canonical-BE bytes of mail[i] of a record image."""
+    o = REC_OFF_MAIL + i * REC_MAIL_SIZE
+    return bytes(rec[o:o + REC_MAIL_SIZE])
+
+
+def record_set_mail(rec, i, mail):
+    """`rec` with mail[i] replaced by the 0x12A BE bytes `mail`; nothing else changes."""
+    assert len(mail) == REC_MAIL_SIZE
+    o = REC_OFF_MAIL + i * REC_MAIL_SIZE
+    return record_set_bytes(rec, o, mail)
+
+
+def mail_hash32(mail_be):
+    """The full FNV-1a32 of one letter's canonical-BE bytes (pc_net_game.c pcnetgame_mail_be_hash)."""
+    return fnv1a32(bytes(mail_be))
+
+
+def mail_hash24(mail_be):
+    """The low 24 bits of mail_hash32: MAIL_SEND's tag.aux_item (bits 0..15) + tag.aux_cond (bits 16..23)."""
+    return mail_hash32(mail_be) & 0xFFFFFF
+
+
+def mail_present(mail_be):
+    return struct.unpack_from(">H", mail_be, 0x2C)[0]
+
+
+def mail_font(mail_be):
+    return mail_be[0x2E]
+
+
+def mail_recipient(mail_be):
+    """(personalID 20 bytes, type) of the recipient of a letter's BE bytes."""
+    return bytes(mail_be[0x00:0x14]), mail_be[0x14]
+
+
+def mail_sender(mail_be):
+    return bytes(mail_be[0x16:0x2A]), mail_be[0x2A]
+
+
+def build_mail_be(recipient_pid, sender_pid, present=0, font=MAIL_FONT_SEND, recipient_type=MAIL_NAME_PLAYER, sender_type=MAIL_NAME_PLAYER,
+                  mail_type=0, paper=0, body=None):
+    """The 0x12A canonical-BE bytes of a letter (Mail_c: recipient Mail_nm_c at 0x00 = PersonalID 0x14 + type, sender at 0x16, present BE u16 at
+    0x2C, content at 0x2E: font, header_back_start, mail_type, paper_type, header[24] at 0x32, body[192] at 0x4A, footer[32] at 0x10A). The PersonalIDs are the 20 BE bytes
+    of a resident's player_ID (record bytes 0..0x13). header / footer are spaces (0x20) like a cleared letter; body defaults to a recognisable text."""
+    assert len(recipient_pid) == 0x14 and len(sender_pid) == 0x14
+    b = bytearray(REC_MAIL_SIZE)
+    b[0x00:0x14] = recipient_pid
+    b[0x14] = recipient_type & 0xFF
+    b[0x16:0x2A] = sender_pid
+    b[0x2A] = sender_type & 0xFF
+    struct.pack_into(">H", b, 0x2C, present & 0xFFFF)
+    b[0x2E] = font & 0xFF
+    b[0x2F] = 0
+    b[0x30] = mail_type & 0xFF
+    b[0x31] = paper & 0xFF
+    b[0x32:0x4A] = bytes([0x20]) * 24
+    body = bytes(body) if body is not None else bytes((0x30 + (i % 10)) for i in range(32))
+    b[0x4A:0x10A] = (body + bytes([0x20]) * 192)[:192]
+    b[0x10A:0x12A] = bytes([0x20]) * 32
+    return bytes(b)
+
+
+def mail_delivered_expected(mail_be, sender_pid):
+    """What the host must hand to the post office for a client's letter `mail_be`: the sender forced to the bound identity (type PLAYER) and the
+    RECEIVE font; everything else (recipient, gift, text) as the client wrote it."""
+    b = bytearray(mail_be)
+    b[0x16:0x2A] = sender_pid
+    b[0x2A] = MAIL_NAME_PLAYER
+    b[0x2E] = MAIL_FONT_RECV
+    return bytes(b)
 
 
 def record_merge_expected(host_be, upload_be):

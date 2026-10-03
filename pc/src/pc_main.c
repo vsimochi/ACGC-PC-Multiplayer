@@ -417,6 +417,10 @@ int g_pc_ts_test_claim = 0;
 /* Town services milestone 2 (shop) TEST-ONLY hooks: --shop-test-buy / --shop-test-sell. See pc_platform.h's own doc comment. */
 int g_pc_shop_test_buy = 0;
 int g_pc_shop_test_sell = 0;
+/* Mail milestone 1 TEST-ONLY hooks: --mail-test-send=<house>[,gift] / --mail-test-force-delivery. See pc_platform.h's own doc comment. */
+const char* g_pc_mail_test_send = NULL;
+int g_pc_mail_test_force_delivery = 0;
+int g_pc_mail_test_poke_museum = -1;
 
 /* X1 host-side fault injection, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. See pc_platform.h's own doc comment on these globals. */
 int g_pc_txn_fault_mode = 0;
@@ -599,6 +603,12 @@ int main(int argc, char* argv[]) {
                    "                      through the town-service transaction path. See pc_platform.h.\n");
             printf("  --shop-test-sell    Client-only TEST hook (default off; loud logs): drive ONE real shop sale\n"
                    "                      through the town-service transaction path. See pc_platform.h.\n");
+            printf("  --mail-test-send=HOUSE[,gift]  Client-only TEST hook (default off; loud logs): drive ONE real letter to\n"
+                   "                      the resident of local house HOUSE through the MAIL_SEND transaction path. See pc_platform.h.\n");
+            printf("  --mail-test-force-delivery  HOST-only TEST hook (default off; loud logs): run the vanilla post office\n"
+                   "                      delivery every 2 s and log the mailboxes. See pc_platform.h.\n");
+            printf("  --mail-test-poke-museum=N  HOST-only TEST hook (default off; loud logs): once resident N is synced, change its\n"
+                   "                      museum_record like the host's day-change mail does. See pc_platform.h.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -699,6 +709,15 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--shop-test-sell") == 0) {
             g_pc_shop_test_sell = 1;
             printf("[NET][SHOP][TEST-ONLY] --shop-test-sell armed (a TEST hook: not for normal play)\n");
+        } else if (strncmp(argv[i], "--mail-test-send=", 17) == 0) {
+            g_pc_mail_test_send = argv[i] + 17;
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-send=%s armed (a TEST hook: not for normal play)\n", g_pc_mail_test_send);
+        } else if (strcmp(argv[i], "--mail-test-force-delivery") == 0) {
+            g_pc_mail_test_force_delivery = 1;
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-force-delivery armed (a TEST hook: not for normal play)\n");
+        } else if (strncmp(argv[i], "--mail-test-poke-museum=", 24) == 0) {
+            g_pc_mail_test_poke_museum = atoi(argv[i] + 24);
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-poke-museum=%d armed (a TEST hook: not for normal play)\n", g_pc_mail_test_poke_museum);
         } else if (strncmp(argv[i], "--txn-fault=", 12) == 0) {
             if (!pc_parse_txn_fault(argv[i] + 12)) {
                 fprintf(stderr, "[NET][TXN][TEST-ONLY] REFUSED: bad --txn-fault spec '%s' (expected MODE[:N[:K]], MODE = ignore_commit | "
@@ -779,6 +798,16 @@ int main(int argc, char* argv[]) {
         }
         printf("[NET][TXN][TEST-ONLY] FAULT INJECTION ENABLED mode=%d nth=%d count=%d (a TEST hook: not for normal play)\n",
                g_pc_txn_fault_mode, g_pc_txn_fault_nth, g_pc_txn_fault_arg);
+    }
+
+    /* Mail milestone 1: the mail TEST hooks are role-bound like --txn-fault: refused (exit 2) for any other role. */
+    if ((g_pc_mail_test_force_delivery || g_pc_mail_test_poke_museum >= 0) && g_pc_net_role != 1) {
+        fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-force-delivery / --mail-test-poke-museum are HOST-only test hooks (use them together with --host)\n");
+        return 2;
+    }
+    if (g_pc_mail_test_send != NULL && g_pc_net_role != 2) {
+        fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-send is a CLIENT-only test hook (use it together with --connect)\n");
+        return 2;
     }
 
     /* Redirect stdout/stderr to NUL unless verbose — unbuffered terminal writes

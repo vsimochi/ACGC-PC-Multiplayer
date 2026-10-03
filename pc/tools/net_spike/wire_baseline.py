@@ -37,7 +37,7 @@ import sys
 # dig request is now a host-transactional grant owned by PCNetGameClientTxn, no longer a queue entry.
 HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRange", "PCNetGameRecSlot", "PCNetGameClientRec",
              "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending",
-             "PCNetGameTsHost", "PCNetGameTsOp")
+             "PCNetGameTsHost", "PCNetGameTsOp", "PCNetGameMailOp")
 # Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
 # (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
 REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
@@ -111,7 +111,11 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              "#define PC_NETGAME_SHOP_STOCK_COUNTED   0xFDu", "#define PC_NETGAME_SHOP_STOCK_RARE      0xFEu",
              "#define PC_NETGAME_SHOP_STOCK_UNLIMITED 0xFFu", "#define PC_NETGAME_SHOP_SELL_RATIO      4u",
              "#define PC_NETGAME_TXN_REASON_NO_FUNDS        19u", "#define PC_NETGAME_TXN_REASON_NOT_SELLABLE    20u",
-             "#define PC_NETGAME_TXN_REASON_PRICE_MISMATCH  21u", "#define PC_NETGAME_TXN_REASON_NO_ROOM         22u")
+             "#define PC_NETGAME_TXN_REASON_PRICE_MISMATCH  21u", "#define PC_NETGAME_TXN_REASON_NO_ROOM         22u",
+             # mail milestone 1: the MAIL_SEND kind (TXN_COMMIT, no new message id) and its three reasons
+             "#define PC_NETGAME_TXN_KIND_MAIL_SEND 12u", "#define PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS 23u",
+             "#define PC_NETGAME_TXN_REASON_MAILBOX_FULL    24u", "#define PC_NETGAME_TXN_REASON_PO_FULL         25u",
+             "#define PC_NETGAME_REC_FIELD_MAIL_PRESENT 12u")
 V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_BEGIN", "48"),
                 ("PC_NETGAME_MSG_RECORD_CHUNK", "49"), ("PC_NETGAME_MSG_RECORD_ACK", "50"),
                 ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52"),
@@ -203,6 +207,10 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_NOT_SELLABLE": '20',
     "PC_NETGAME_TXN_REASON_PRICE_MISMATCH": '21',
     "PC_NETGAME_TXN_REASON_NO_ROOM": '22',
+    "PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS": '23',
+    "PC_NETGAME_TXN_REASON_MAILBOX_FULL": '24',
+    "PC_NETGAME_TXN_REASON_PO_FULL": '25',
+    "PC_NETGAME_REC_FIELD_MAIL_PRESENT": '12',
     "PC_NETGAME_TXN_RING": '16',
     "PC_NETGAME_TXN_FENCED_NUM": '4',
     "TXN_TAG_FMT": '"<IIBBHBBHII15HHII"',
@@ -223,6 +231,8 @@ V8_LIB_PINNED = {
     # town services milestone 2 (shop)
     "PC_NETGAME_TXN_KIND_SHOP_BUY": '10',
     "PC_NETGAME_TXN_KIND_SHOP_SELL": '11',
+    # mail milestone 1
+    "PC_NETGAME_TXN_KIND_MAIL_SEND": '12',
     "PC_NETGAME_SHOP_STOCK_COUNTED": '0xFD',
     "PC_NETGAME_SHOP_STOCK_RARE": '0xFE',
     "PC_NETGAME_SHOP_STOCK_UNLIMITED": '0xFF',
@@ -435,6 +445,12 @@ def selftest(repo):
         "shop lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_NO_ROOM = 22", "PC_NETGAME_TXN_REASON_NO_ROOM = 23", 1)),
         "shop lib stock": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD", "PC_NETGAME_SHOP_STOCK_COUNTED = 0xFC", 1)),
         "shop lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_SHOP_EXTRA = 1\n"),
+        "mail kind moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_KIND_MAIL_SEND 12u", "#define PC_NETGAME_TXN_KIND_MAIL_SEND 13u", 1)),
+        "mail reason moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_REASON_MAILBOX_FULL    24u", "#define PC_NETGAME_TXN_REASON_MAILBOX_FULL    34u", 1)),
+        "mail lib kind": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_KIND_MAIL_SEND = 12", "PC_NETGAME_TXN_KIND_MAIL_SEND = 13", 1)),
+        "mail lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_PO_FULL = 25", "PC_NETGAME_TXN_REASON_PO_FULL = 26", 1)),
+        "mail lib field": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_REC_FIELD_MAIL_PRESENT = 12", "PC_NETGAME_REC_FIELD_MAIL_PRESENT = 13", 1)),
+        "mail lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_TXN_REASON_MAIL_EXTRA = 26\n"),
         "ts lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_TS_EXTRA = 4\n"),
         "extra enum id 53 dup": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 52,\n    PC_NETGAME_MSG_EXTRA = 53,", 1)),
         "txn enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_COMMIT            = 51,", "PC_NETGAME_MSG_TXN_COMMIT            = 61,", 1)),

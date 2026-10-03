@@ -12,8 +12,10 @@ donations. Host and single-player fall through unchanged. Shop purchases/sells a
   S0-4  museum: (town services) a client's donation runs the host transaction before the put-away demo (REJECTED -> return row); putaway
         init never calls the commit/clear for a client; gift-carrying museum mail refused at the counter.
   S0-5  police claim: (town services) a client claims through the host transaction; REJECTED / pockets full take the existing idx == -1 refusal; no local pocket/slot write.
-  S0-6  player mail: aPG_check_destination refuses PLAYER (and gift MUSEUM) mail for a client with the
-        existing "no such address" code; the letter is removed only after that refusal path restores it.
+  S0-6  player mail: (mail milestone 1) a client's letter to a PLAYER no longer takes the Stage 0 refusal: aPG_check_destination only runs the local
+        address lookup for it and the letter goes through the host transaction (aPG_client_mail_step, test_mail_src.py audits that path); gift MUSEUM mail
+        is STILL refused for a client with the existing "no such address" code (until the museum milestone); the letter is removed only after the host's
+        APPLIED (a refusal restores it).
 
 Runtime behavior is NOT TESTED. Usage: python3 test_stage0_town_safe_degrade.py
 """
@@ -268,19 +270,27 @@ def main():
           0 <= cd.find("#ifdef TARGET_PC") < g < cd.find("switch (mail->header.recipient.type)")
           and g < cd.find("mMl_hunt_for_send_address(mail)"), results)
     blk = cd[g:cd.find("#endif", g)]
-    check("S0-6: refuses PLAYER type and MUSEUM-with-gift only, returns 1 (existing 'no such address')",
-          "mMl_NAME_TYPE_PLAYER" in blk and "mMl_NAME_TYPE_MUSEUM" in blk and "mail->present != EMPTY_NO" in blk
-          and "return 1;" in blk and "mMl_NAME_TYPE_NPC" not in blk, results)
+    check("S0-6 (mail milestone 1): client + PLAYER -> only the LOCAL address lookup decides (1 'no such address' when no house, else 0; no stale local mailbox / quota check); "
+          "client + MUSEUM-with-gift is STILL refused with the existing 'no such address' code 1; NPC letters are not touched by the client block",
+          "if (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER) {" in blk
+          and "return (mMl_hunt_for_send_address(mail) == -1) ? 1 : 0;" in blk
+          and "mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO" in blk
+          and blk.count("return 1;") == 1 and "mailbox" not in re.sub(r"/\*.*?\*/", "", blk, flags=re.S) and "mPO_" not in re.sub(r"/\*.*?\*/", "", blk, flags=re.S)
+          and "mMl_NAME_TYPE_NPC" not in blk, results)
     check("S0-6: villager (case 1) validation untouched",
           "mNpc_SearchAnimalPersonalID(&anm_pid) == -1" in cd, results)
     rc = func_body(pg, r"\nvoid aPG_receive_menu_close_wait\(NPC_POSTGIRL_ACTOR \*postgirl, GAME_PLAY \*play\) \{")
     ok0 = rc.find("mPO_receipt_proc(&play->submenu.mail, mPO_SENDTYPE_MAIL);")
     rest = rc.find("mMl_copy_mail(&Now_Private->mail[submenu_item->slot_no], &play->submenu.mail);")
     chk = rc.find("aPG_check_destination(&play->submenu.mail)")
-    check("S0-6: receipt (letter removal) only in case 0 after the destination check; refusal cases restore the letter",
-          0 <= chk < ok0 < rest and "case 1:\n            case 2:\n            case 3:" in rc, results)
-    check("S0-6: no other player-mail send UI (only the post girl calls aPG_check_destination)",
-          sum(read(p).count("aPG_check_destination(") for p in ("src/actor/npc/ac_npc_post_girl.c_inc",)) == 2, results)
+    check("S0-6: receipt (letter removal) only in case 0 after the destination check (a client's player letter skips the LOCAL receipt: the host's APPLIED removes it); "
+          "refusal cases restore the letter",
+          0 <= chk < ok0 < rest and "case 1:\n            case 2:\n            case 3:" in rc
+          and "#ifdef TARGET_PC\n                if (!client_mail)" in rc and rc.index("if (!client_mail)") < ok0, results)
+    other_callers = [q for q in (str(f) for f in __import__("pathlib").Path(os.path.join(ROOT, "src")).rglob("*") if f.is_file() and f.suffix in (".c", ".c_inc", ".h"))
+                     if "aPG_check_destination(" in open(q, "rb").read().decode("utf-8", "replace") and not q.endswith("ac_npc_post_girl.c_inc")]
+    check("S0-6: no other player-mail send UI (only the post girl calls aPG_check_destination: definition + the close-wait dispatch (2 forms) + the client step = 4; no other source file calls it)",
+          pg.count("aPG_check_destination(") == 4 and not other_callers, results)
 
     # ---- protocol / wire unchanged
     hdr = read("pc/include/pc_net_game.h")

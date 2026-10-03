@@ -9,6 +9,10 @@
 #include "m_handbill.h"
 #include "libultra/libultra.h"
 
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* mail milestone M0: pc_net_game_role() */
+#endif
+
 /* TODO: fix bss ordering*/
 static u8 free_str[16];
 static Mail_c l_ml_mail;
@@ -254,6 +258,11 @@ static int mMl_send_mail_box_com(PersonalID_c* recipient_pid, int player_no, Mai
     mHm_hs_c* house;
     int res = FALSE;
 
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return FALSE; /* mail milestone M0: system letters (museum, post office gifts, ...) are made by the HOST; a client's mailbox is not real */
+    }
+#endif
     house = Save_GetPointer(homes[mHS_get_arrange_idx(player_no)]);
 
     if (mPr_CheckCmpPersonalID(recipient_pid, &house->ownerID) == TRUE) {
@@ -278,6 +287,11 @@ static int mMl_send_mail_postoffice_com(Mail_c* mail, PersonalID_c* recipient_pi
                                         u8 mail_type) {
     int res = FALSE;
 
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return FALSE; /* mail milestone M0: the same (the client's local post office is dead anyway) */
+    }
+#endif
     if (mPO_get_keep_mail_sum() < mPO_MAIL_STORAGE_SIZE) {
         mMl_get_mail_to_player_com(mail, recipient_pid, present, paper, sender_name, mail_no, proc_type, mail_type);
         res = mPO_receipt_proc(mail, mPO_SENDTYPE_MAIL);

@@ -135,9 +135,13 @@ def main():
     order = [pu.index(x) for x in ("pcnetgame_rec_gate(", "pcnetgame_fnv1a32(rx", "PC_NETGAME_REC_MIN_GAP_MS", "up_base_epoch == slot->epoch",
                                    "pcnetgame_rec_validate_fields(", "pcnetgame_rec_merge_into_save(")]
     check("I validation order of design section 5: binding -> shape/digest -> rate -> base -> fields -> merge", order == sorted(order))
-    check("I the live record is never converted in place: pc_save_bswap_private is only applied to the scratch copies",
-          len(re.findall(r"pc_save_bswap_private\(", blk)) == 2 and "pc_save_bswap_private(&s_rec_scratch_a, PC_BSWAP_TO_BE)" in blk
-          and "pc_save_bswap_private(&s_rec_scratch_b, PC_BSWAP_FROM_BE)" in blk and "pc_save_bswap_private(&Save_Get" not in c)
+    # mail milestone 1: the per-letter hash helper (pcnetgame_mail_be_hash) converts a ZEROED static scratch Private_c holding ONE letter copy: a third, equally
+    # harmless scratch conversion. The set of allowed targets stays closed: exactly these three scratch copies, never a live record.
+    check("I the live record is never converted in place: pc_save_bswap_private is only applied to the scratch copies (record scratch a / b + the mail-hash scratch)",
+          len(re.findall(r"pc_save_bswap_private\(", blk)) == 3 and "pc_save_bswap_private(&s_rec_scratch_a, PC_BSWAP_TO_BE)" in blk
+          and "pc_save_bswap_private(&s_rec_scratch_b, PC_BSWAP_FROM_BE)" in blk and "pc_save_bswap_private(&s_mail_scratch, PC_BSWAP_TO_BE)" in blk
+          and "static Private_c s_mail_scratch;" in blk and "memset(&s_mail_scratch, 0, sizeof(s_mail_scratch));" in blk
+          and "pc_save_bswap_private(&Save_Get" not in c)
     check("I the rx/tx images are static per-peer buffers; no malloc/calloc/realloc/free anywhere in the record path",
           "static uint8_t s_host_rec_rx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE];" in c_raw
           and "static uint8_t s_host_rec_tx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE];" in c_raw
@@ -157,7 +161,7 @@ def main():
     own_name = {"IMMUTABLE": L.REC_OWN_IMMUTABLE, "HOST": L.REC_OWN_HOST, "CLIENT": L.REC_OWN_CLIENT, "SHARED": L.REC_OWN_SHARED}
     pyrows = [(off, ln, owner) for _n, off, ln, owner in L.RECORD_FIELD_RANGES]
     check("O C ownership table == python RECORD_FIELD_RANGES (%d ranges)" % len(rows),
-          [(o, l, own_name[w]) for o, l, w in rows] == pyrows and len(rows) == 10)
+          [(o, l, own_name[w]) for o, l, w in rows] == pyrows and len(rows) == 12)
     check("O ranges tile 0..0x2440 with no gap/overlap (checked on both tables)",
           rows[0][0] == 0 and all(rows[i][0] + rows[i][1] == rows[i + 1][0] for i in range(len(rows) - 1))
           and rows[-1][0] + rows[-1][1] == 0x2440)
@@ -168,18 +172,24 @@ def main():
           offs.get("player_ID") == 0 and offs.get("lotto_ticket_expiry_month") == 0x86 and offs.get("lotto_ticket_mail_storage") == 0x87
           and offs.get("exists") == 0x1086 and offs.get("catalog_orders") == 0x10A8 and offs.get("reset_code") == 0x10F4)
     owner_at = lambda off: next(o for a, l, o in rows if a <= off < a + l)
-    check("O immutable = player_ID (+0x14) and exists; HOST-owned = reset_code (4) ONLY; SHARED (client-writable, host-consumed) = lotto x2 and catalog_orders (5*4); the rest CLIENT",
-          owner_at(0) == "IMMUTABLE" and owner_at(0x13) == "IMMUTABLE" and owner_at(0x14) == "CLIENT"
+    check("O immutable = player_ID (+0x14) and exists; HOST-owned = museum_record (0x18, 0x4E B; mail milestone R) and reset_code (4) ONLY; SHARED (client-writable, host-consumed) = lotto x2 and catalog_orders (5*4); the rest CLIENT",
+          owner_at(0) == "IMMUTABLE" and owner_at(0x13) == "IMMUTABLE" and owner_at(0x14) == "CLIENT" and owner_at(0x17) == "CLIENT"
+          and owner_at(0x18) == "HOST" and owner_at(0x18 + 0x4D) == "HOST" and owner_at(0x66) == "CLIENT" and owner_at(0x67) == "CLIENT"
           and owner_at(0x86) == "SHARED" and owner_at(0x87) == "SHARED" and owner_at(0x88) == "CLIENT"
           and owner_at(0x1086) == "IMMUTABLE" and owner_at(0x1087) == "CLIENT"
           and owner_at(0x10A8) == "SHARED" and owner_at(0x10A8 + 19) == "SHARED" and owner_at(0x10BC) == "CLIENT"
           and owner_at(0x10F4) == "HOST" and owner_at(0x10F7) == "HOST" and owner_at(0x10F8) == "CLIENT"
-          and sum(l for a, l, o in rows if o == "HOST") == 4 and sum(l for a, l, o in rows if o == "SHARED") == 2 + 20
+          and sum(l for a, l, o in rows if o == "HOST") == 0x4E + 4 and sum(l for a, l, o in rows if o == "SHARED") == 2 + 20
           and sum(l for a, l, o in rows if o == "IMMUTABLE") == 0x14 + 1)
     check("O offsetof-style _Static_asserts pin every boundary against the real Private_c",
           all(x in c_raw for x in ("offsetof(Private_c, inventory.lotto_ticket_expiry_month) == 0x0086", "offsetof(Private_c, exists) == 0x1086",
                                    "offsetof(Private_c, catalog_orders) == 0x10A8", "offsetof(Private_c, reset_code) == 0x10F4",
-                                   "sizeof(((Private_c*)0)->player_ID) == 0x14", "D3 ownership ranges must tile")))
+                                   "sizeof(((Private_c*)0)->player_ID) == 0x14", "D3 ownership ranges must tile",
+                                   "offsetof(Private_c, museum_record) == 0x0018", "sizeof(((Private_c*)0)->museum_record) == 0x004E",
+                                   "offsetof(Private_c, inventory) == 0x0068")))
+    check("O the museum_record range is the REAL struct member (measured offsetof 0x18 / sizeof 0x4E, NOT the 0x17 of m_private.h's comment: the struct is 2-byte aligned) and python agrees",
+          L.REC_OFF_MUSEUM_RECORD == 0x18 and L.REC_MUSEUM_RECORD_SIZE == 0x4E
+          and ("museum_record", 0x18, 0x4E, L.REC_OWN_HOST) in L.RECORD_FIELD_RANGES)
     check("O python table offsets of the named fields agree (pockets 0x68, wallet 0x8C, bank 0x122C, org table 0x2340)",
           L.REC_OFF_POCKETS == 0x68 and L.REC_OFF_WALLET == 0x8C and L.REC_OFF_BANK == 0x122C and L.REC_OFF_ORG_TABLE == 0x2340
           and re.search(r"/\* 0x0068 \*/ struct", priv_h) and re.search(r"/\* 0x122C \*/ u32 bank_account", priv_h)
@@ -363,8 +373,8 @@ def main():
           and "mPr_catalog_order_c" in priv_h and "mSP_SHOP_TYPE_NUM" in read("include/m_shop.h") and "lbRTC_MONTHS_MAX" in read("include/lb_rtc.h")
           and "#define aNSC_MAX_TICKETS 255" in read("include/ac_npc_shop_common.h"))
     hd = func_body(blk_raw, "pcnetgame_rec_hostfield_digest")
-    check("R the host-consumption digest covers lotto (month + storage), catalog_orders and reset_code (HOST + SHARED ranges)",
-          all(x in hd for x in ("lotto_ticket_expiry_month", "lotto_ticket_mail_storage", "catalog_orders", "reset_code")))
+    check("R the host-consumption digest covers lotto (month + storage), catalog_orders, reset_code and (mail milestone R) museum_record (HOST + SHARED ranges)",
+          all(x in hd for x in ("lotto_ticket_expiry_month", "lotto_ticket_mail_storage", "catalog_orders", "reset_code", "museum_record")))
     pu = func_body(blk_raw, "pcnetgame_rec_process_upload")
     check("R the upload path refreshes the host-consumption digest BEFORE the base check (stale-resurrection window closed), after the rate stage",
           "pcnetgame_rec_refresh_hostfields(idx, slot)" in pu

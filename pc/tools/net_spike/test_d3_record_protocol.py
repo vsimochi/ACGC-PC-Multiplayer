@@ -17,8 +17,8 @@ for real.
   T4  STALE_BASE: old rev, wrong epoch, replay of an old accepted upload (new xfer id, old base); the client then gets a push
   T5  INVALID_FIELD matrix (wallet, bank, loan, illegal pocket ids, cond bits 30/31, equipment, org table, player_ID, exists,
       catalog order item / shop_level, lotto month / storage); legal edge values (incl. a NEW catalog order and lotto tickets,
-      which are SHARED = client-writable) accepted and merged; invalid uploads never change rev; the ONLY host-owned range,
-      reset_code, is silently kept
+      which are SHARED = client-writable) accepted and merged; invalid uploads never change rev; the host-owned ranges
+      (museum_record since the mail milestone R, and reset_code) are silently kept
       (and the client-owned bytes of that same upload ARE merged)
   T6  RATE_LIMITED (3 uploads within 1 s) and a flood of 5 in a row closes the peer
   T7  HANDSHAKE and parked peers' record messages are ignored; a duplicate HELLO is ignored; a host-only ACK status is a violation
@@ -268,17 +268,22 @@ def run_main(args, results, ip, snap_gci):
         # legal edge values + host-owned bytes changed in the same upload
         edge = edit_record(cur, wallet=99999, bank=999999999, loan=798000, pocket=(1, 0x2000), cond=0x3FFFFFFF)
         edge = L.record_set_u32(edge, L.REC_OFF_RESET_CODE, 0xDEADBEEF)
+        # mail milestone R: museum_record (0x18, 0x4E B) is HOST-owned too: a client that "resurrects" fossils / results by uploading its own copy is ignored
+        museum_junk = bytes([0x07]) + bytes((0xA0 + i) & 0xFF for i in range(1, L.REC_MUSEUM_RECORD_SIZE))
+        edge = L.record_set_bytes(edge, L.REC_OFF_MUSEUM_RECORD, museum_junk)
         edge = L.record_set_bytes(edge, L.REC_OFF_LOTTO, b"\x07\xFF")  # month 7, 255 tickets (aNSC_MAX_TICKETS)
         edge = L.record_set_bytes(edge, L.REC_OFF_CATALOG_ORDERS,
                                   b"\x10\x04\x03\x00" + b"\x20\x05\x01\x00" + b"\x30\x08\x02\x00" + b"\x00\x00\x00\x00" * 2)
         x = a2.upload_record(edge, base=base)
         ack = a2.wait_record_ack(xfer_id=x)
-        check("T5 legal edge values (wallet 99999, bank 999999999, loan 798000, cond 0x3FFFFFFF, a NEW catalog order set, lotto month 7 / 255 tickets) + a changed reset_code -> APPLIED rev 4",
+        check("T5 legal edge values (wallet 99999, bank 999999999, loan 798000, cond 0x3FFFFFFF, a NEW catalog order set, lotto month 7 / 255 tickets) + a changed reset_code AND a changed museum_record -> APPLIED rev 4",
               ack is not None and ack.status == 0 and ack.rev == 4)
         expected = L.record_merge_expected(host_view[r1], edge)
         host_view[r1] = expected
-        check("T5 (model) the expected host record keeps ONLY reset_code (lotto/catalog_orders are SHARED = merged)",
+        check("T5 (model) the expected host record keeps ONLY reset_code and museum_record (lotto/catalog_orders are SHARED = merged)",
               expected[L.REC_OFF_RESET_CODE:L.REC_OFF_RESET_CODE + 4] == cur[L.REC_OFF_RESET_CODE:L.REC_OFF_RESET_CODE + 4]
+              and expected[L.REC_OFF_MUSEUM_RECORD:L.REC_OFF_MUSEUM_RECORD + L.REC_MUSEUM_RECORD_SIZE] == cur[L.REC_OFF_MUSEUM_RECORD:L.REC_OFF_MUSEUM_RECORD + L.REC_MUSEUM_RECORD_SIZE]
+              and cur[L.REC_OFF_MUSEUM_RECORD:L.REC_OFF_MUSEUM_RECORD + L.REC_MUSEUM_RECORD_SIZE] != museum_junk
               and expected[L.REC_OFF_CATALOG_ORDERS:L.REC_OFF_CATALOG_ORDERS + 20] == edge[L.REC_OFF_CATALOG_ORDERS:L.REC_OFF_CATALOG_ORDERS + 20]
               and expected[L.REC_OFF_LOTTO:L.REC_OFF_LOTTO + 2] == b"\x07\xFF")
         env.release(a2)
@@ -291,6 +296,12 @@ def run_main(args, results, ip, snap_gci):
               pushed[L.REC_OFF_RESET_CODE:L.REC_OFF_RESET_CODE + 4] == cur[L.REC_OFF_RESET_CODE:L.REC_OFF_RESET_CODE + 4]
               and pushed[L.REC_OFF_RESET_CODE:L.REC_OFF_RESET_CODE + 4] != b"\xDE\xAD\xBE\xEF"
               and pushed[:20] == cur[:20] and pushed[L.REC_OFF_EXISTS] == cur[L.REC_OFF_EXISTS])
+        check("T5 (mail milestone R) the host-owned museum_record was SILENTLY kept too (the push shows the host's old 0x4E bytes, never the client's junk copy), "
+              "and the bytes around it (gender .. reset_count, the 2 padding bytes, pockets) were still merged / untouched as client-owned",
+              pushed[L.REC_OFF_MUSEUM_RECORD:L.REC_OFF_MUSEUM_RECORD + L.REC_MUSEUM_RECORD_SIZE] == cur[L.REC_OFF_MUSEUM_RECORD:L.REC_OFF_MUSEUM_RECORD + L.REC_MUSEUM_RECORD_SIZE]
+              and pushed[L.REC_OFF_MUSEUM_RECORD:L.REC_OFF_MUSEUM_RECORD + L.REC_MUSEUM_RECORD_SIZE] != museum_junk
+              and pushed[0x14:0x18] == edge[0x14:0x18] and pushed[0x66:0x68] == edge[0x66:0x68]
+              and L.record_inventory(pushed) == L.record_inventory(edge))
         check("T5 the SHARED ranges were MERGED: the NEW catalog orders and the lotto tickets are on the host (a purchase is not lost)",
               pushed[L.REC_OFF_CATALOG_ORDERS:L.REC_OFF_CATALOG_ORDERS + 20] == edge[L.REC_OFF_CATALOG_ORDERS:L.REC_OFF_CATALOG_ORDERS + 20]
               and pushed[L.REC_OFF_LOTTO:L.REC_OFF_LOTTO + 2] == b"\x07\xFF")
