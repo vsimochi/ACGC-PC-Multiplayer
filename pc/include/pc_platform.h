@@ -365,6 +365,16 @@ extern int           g_pc_mail_test_force_delivery;
  *                                     host's day-change fossil / result mail does, so the host-field watcher -> rev + 1 -> PUSH_HOSTFIELDS path is exercised.
  *                                     -1 = off (default). */
 extern int           g_pc_mail_test_poke_museum;
+/* Mail milestone 2 TEST-ONLY hooks (default OFF, never active in normal play, every step logs "[NET][MAIL][TEST-ONLY]"):
+ *   --mail-test-take[=N]   CLIENT only: once the mailbox is host-fed and the record SYNCED, take up to N (default 10) letters out of the mailbox shadow, one
+ *                          after the other, through pc_net_game_mail_take_step() (the mailbox overlay's entry point: TXN_COMMIT kind 13). Writes nothing itself.
+ *   --mail-test-seed-mailbox=<resident>,<count>,<delay_ms>[,<gift hex>]   HOST only: <delay_ms> after the host world is ready, write <count> NPC-style letters
+ *                          into the free slots of that resident's house mailbox (a simulated postman delivery); the first carries the gift when given.
+ *   --mail-test-seed-reply=<resident>[,<resident>...]   HOST only: once the host world is ready, make the first villager owe each listed resident a reply
+ *                          (letter dated a year ago), so the M2r pass generates it when that resident's peer is synced. */
+extern int           g_pc_mail_test_take;
+extern const char*   g_pc_mail_test_seed_mailbox;
+extern const char*   g_pc_mail_test_seed_reply;
 /* X1 (host-transactional PICKUP/DROP/BURY commit) host-side FAULT INJECTION, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. HOST role ONLY:
  * pc_main.c refuses (exit code 2, message on stderr) any other role, and the C hook re-checks the role. OFF by default (mode 0),
  * never active in normal play; when armed the process logs "[NET][TXN][TEST-ONLY] FAULT INJECTION ENABLED mode=..." at start and

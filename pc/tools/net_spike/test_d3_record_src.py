@@ -137,8 +137,12 @@ def main():
     check("I validation order of design section 5: binding -> shape/digest -> rate -> base -> fields -> merge", order == sorted(order))
     # mail milestone 1: the per-letter hash helper (pcnetgame_mail_be_hash) converts a ZEROED static scratch Private_c holding ONE letter copy: a third, equally
     # harmless scratch conversion. The set of allowed targets stays closed: exactly these three scratch copies, never a live record.
-    check("I the live record is never converted in place: pc_save_bswap_private is only applied to the scratch copies (record scratch a / b + the mail-hash scratch)",
-          len(re.findall(r"pc_save_bswap_private\(", blk)) == 3 and "pc_save_bswap_private(&s_rec_scratch_a, PC_BSWAP_TO_BE)" in blk
+    # mail milestone 2: the letter wire helpers pcnetgame_mail_to_be / pcnetgame_mail_from_be convert ZEROED static scratch Private_c copies holding ONE letter: two more equally
+    # harmless scratch conversions. The set of allowed targets stays closed: exactly these five scratch copies, never a live record.
+    check("I the live record is never converted in place: pc_save_bswap_private is only applied to the scratch copies (record scratch a / b + the mail-hash scratch + the two letter-wire scratches)",
+          len(re.findall(r"pc_save_bswap_private\(", blk)) == 5 and "pc_save_bswap_private(&s_scratch, PC_BSWAP_TO_BE)" in blk and "pc_save_bswap_private(&s_scratch, PC_BSWAP_FROM_BE)" in blk
+          and blk.count("static Private_c s_scratch;") == 2 and blk.count("memset(&s_scratch, 0, sizeof(s_scratch));") == 2
+          and "pc_save_bswap_private(&s_rec_scratch_a, PC_BSWAP_TO_BE)" in blk
           and "pc_save_bswap_private(&s_rec_scratch_b, PC_BSWAP_FROM_BE)" in blk and "pc_save_bswap_private(&s_mail_scratch, PC_BSWAP_TO_BE)" in blk
           and "static Private_c s_mail_scratch;" in blk and "memset(&s_mail_scratch, 0, sizeof(s_mail_scratch));" in blk
           and "pc_save_bswap_private(&Save_Get" not in c)

@@ -64,10 +64,10 @@ def main():
     check("W the host's sale ratio PC_NETGAME_SHOP_SELL_RATIO (4u) equals the game's SELL_BUY_RATIO (include/ac_npc_shop_common.h = %s); the stock-code count equals mSP_GOODS_COUNT (39)" % (ratio and ratio.group(1)),
           ratio is not None and ratio.group(1) == "4" and "#define PC_NETGAME_SHOP_SELL_RATIO      4u" in c_raw
           and re.search(r"#define mSP_GOODS_COUNT 39", read("include/m_shop.h")) and L.PC_NETGAME_SHOP_GOODS_COUNT == 39)
-    check("W python formats / constants / reason names equal the C values (kinds 10 / 11, 23 reasons, stock codes, TS_SHOP_LEN, sale ratio)",
+    check("W python formats / constants / reason names equal the C values (kinds 10 / 11, 28 reasons, stock codes, TS_SHOP_LEN, sale ratio)",
           (L.PC_NETGAME_TXN_KIND_SHOP_BUY, L.PC_NETGAME_TXN_KIND_SHOP_SELL) == (10, 11)
           and (L.PC_NETGAME_SHOP_STOCK_COUNTED, L.PC_NETGAME_SHOP_STOCK_RARE, L.PC_NETGAME_SHOP_STOCK_UNLIMITED) == (0xFD, 0xFE, 0xFF)
-          and [L.TXN_REASON_NAMES[i] for i in (19, 20, 21, 22)] == ["NO_FUNDS", "NOT_SELLABLE", "PRICE_MISMATCH", "NO_ROOM"] and len(L.TXN_REASON_NAMES) == 26  # mail milestone 1: + 23 / 24 / 25
+          and [L.TXN_REASON_NAMES[i] for i in (19, 20, 21, 22)] == ["NO_FUNDS", "NOT_SELLABLE", "PRICE_MISMATCH", "NO_ROOM"] and len(L.TXN_REASON_NAMES) == 28  # mail milestone 1: + 23 / 24 / 25; mail milestone 2: + 26 / 27
           and L.PC_NETGAME_TS_SHOP_LEN == 320 and L.PC_NETGAME_SHOP_SELL_RATIO == 4)
     check("W the client-facing reject codes of pc_net_game.h equal the C reasons (NOT_AVAILABLE 16, NO_FUNDS 19, NOT_SELLABLE 20, PRICE_MISMATCH 21, NO_ROOM 22) and the new seam API is declared",
           all(re.search(r"#define PC_NETGAME_TS_REJECT_%s\s+%d" % (n, v), h) for n, v in (("NOT_AVAILABLE", 16), ("NO_FUNDS", 19), ("NOT_SELLABLE", 20), ("PRICE_MISMATCH", 21), ("NO_ROOM", 22)))

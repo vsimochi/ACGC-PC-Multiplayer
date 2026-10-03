@@ -98,9 +98,9 @@ def main():
                  "PC_NETGAME_TXN_REASON_PO_FULL": "25", "PC_NETGAME_REC_FIELD_MAIL_PRESENT": "12"}
           and L.PC_NETGAME_TXN_KIND_MAIL_SEND == 12 and (L.PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS, L.PC_NETGAME_TXN_REASON_MAILBOX_FULL, L.PC_NETGAME_TXN_REASON_PO_FULL) == (23, 24, 25)
           and L.PC_NETGAME_REC_FIELD_MAIL_PRESENT == 12 and L.TXN_REASON_NAMES[23] == "NO_SUCH_ADDRESS" and L.TXN_REASON_NAMES[24] == "MAILBOX_FULL" and L.TXN_REASON_NAMES[25] == "PO_FULL")
-    check("W NO new message id (the highest id is still wire_baseline.EXPECTED_MAX_MSG_ID = %d) and TXN_COMMIT (72 B) / TXN_RESULT (76 B) keep their exact size asserts: the letter is NEVER on the wire"
+    check("W M1 added NO message id (55 was the highest at M1; the current highest, wire_baseline.EXPECTED_MAX_MSG_ID = %d, is MAILBOX_LETTER of mail milestone 2 -- audited by test_mail2_src.py) and TXN_COMMIT (72 B) / TXN_RESULT (76 B) keep their exact size asserts: the M1 letter is NEVER on the wire"
           % wire_baseline.EXPECTED_MAX_MSG_ID,
-          wire_baseline.EXPECTED_MAX_MSG_ID == 55 and max(v for _n, v in wire_baseline.c_message_ids(c_raw)) == 55
+          wire_baseline.EXPECTED_MAX_MSG_ID == 56 and max(v for _n, v in wire_baseline.c_message_ids(c_raw)) == 56 and dict(wire_baseline.c_message_ids(c_raw)).get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and "_Static_assert(sizeof(PCNetGameTxnCommitMsg) == 72," in c_raw and "_Static_assert(sizeof(PCNetGameTxnResultMsg) == 76," in c_raw
           and not re.search(r"Mail_c\s+\w+;", c_raw[c_raw.index("typedef struct PCNetGameTxnCommitMsg"):c_raw.index("} PCNetGameTxnCommitMsg;")]))
     check("W the tag convention of the doc comment: dest NONE, slot = mail slot, item = gift echo, aux_item = low 16 / aux_cond = bits 16..23 of the 24-bit hash; python mail_hash24 is the same cut",
@@ -130,20 +130,21 @@ def main():
 
     # ------------------------------------------------------------------ O: M0
     chk_mbx = func_body(mbx, "aMBX_check_take_mail") or mbx[mbx.index("static void aMBX_check_take_mail"):mbx.index("static void aMBX_check_flag")]
-    check("O1 the mailbox actor does not open for a CLIENT: the open condition carries '&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT' under #ifdef TARGET_PC",
-          "#ifdef TARGET_PC" in chk_mbx and "&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in chk_mbx and chk_mbx.index("&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT") < chk_mbx.index("actor->req = aMBX_REQUEST_OPEN;")
+    gate_open = "&& (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || pc_net_game_client_mailbox_usable())"
+    check("O1 (M0, refined by mail milestone 2) the mailbox actor does not open for a CLIENT unless its mailbox is host-fed: the open condition carries '" + gate_open + "' under #ifdef TARGET_PC, before the open request",
+          "#ifdef TARGET_PC" in chk_mbx and gate_open in chk_mbx and chk_mbx.index(gate_open) < chk_mbx.index("actor->req = aMBX_REQUEST_OPEN;") and "&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT\n" not in chk_mbx
           and "#ifdef TARGET_PC\n#include \"pc_net_game.h\"" in mbx_c)
     flag = mbx[mbx.index("static void aMBX_check_flag"):mbx.index("static void aMBX_setup_flag_se_sub")]
-    check("O1 the mailbox flag of a client never goes up (mail_count forced to 0 for the CLIENT role, before it is used)",
-          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {\n        mail_count = 0;" in flag and flag.index("mail_count = 0;") < flag.index("if (mail_count != 0)"))
+    check("O1 the mailbox flag of a client does not go up until the mailbox is host-fed (mail_count forced to 0 for the CLIENT role while pc_net_game_client_mailbox_usable() is 0, before it is used)",
+          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_mailbox_usable()) {\n        mail_count = 0;" in flag and flag.index("mail_count = 0;") < flag.index("if (mail_count != 0)"))
     ctm = func_body(tag, "mTG_check_trans_mail")
     ctk = func_body(tag, "mTG_check_trans_mail_mark")
     cmp_ = func_body(tag, "mTG_mailbox_change_mail_proc")
-    check("O2 defense in depth: mTG_check_trans_mail (single letter -> pocket) and _mark (marked letters -> pocket) take the 'empty mailbox' branch for a client",
-          "&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in ctm and ctm.index("&& pc_net_game_role()") < ctm.index("res = mTG_trans_mail(")
-          and "&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in ctk and ctk.index("&& pc_net_game_role()") < ctk.index("res = mTG_trans_mail_mark("))
-    check("O2 the mailbox 'take marked letters' proc takes the vanilla 'pockets full' refusal branch for a client (idx = -1: marks cleared, nothing moves)",
-          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {\n        idx = -1;" in cmp_ and cmp_.index("idx = -1;") < cmp_.index("if (idx != -1) {"))
+    check("O2 defense in depth (M0, refined by mail milestone 2): mTG_check_trans_mail (single letter -> pocket) and _mark (marked letters -> pocket) take the 'empty mailbox' branch for a client unless its mailbox is host-fed",
+          gate_open in ctm and ctm.index(gate_open) < ctm.index("res = mTG_trans_mail(") and gate_open in ctk and ctk.index(gate_open) < ctk.index("res = mTG_trans_mail_mark(")
+          and "&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT /*" not in ctm + ctk)
+    check("O2 the mailbox 'take marked letters' proc takes the vanilla 'pockets full' refusal branch for a client whose mailbox is NOT host-fed (idx = -1: marks cleared, nothing moves)",
+          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_mailbox_usable()) {\n        idx = -1;" in cmp_ and cmp_.index("idx = -1;") < cmp_.index("if (idx != -1) {"))
     cpm = func_body(tag, "mTG_cpmail_change_mail_proc")
     check("O3 D-2: an archive -> pocket exchange (any archive letter marked) is refused for a client with the vanilla 'cannot exchange' branch; pocket -> archive only stays allowed (the gate needs cpmail_mark_cnt > 0)",
           "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && cpmail_mark_cnt > 0" in cpm and "inv_cnt = inv_mark_cnt;" in cpm and "cpmail_cnt = cpmail_mark_cnt;" in cpm
@@ -238,9 +239,9 @@ def main():
           sorted(re.findall(r"pcnetgame_txn_fault_fire\((PC_TXN_FAULT_\w+)\)", hd)) == ["PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"])
     wr = func_body(c_raw[x1b:x1e], "pcnetgame_rec_txn_write_mail")
     check("H the mail[] writer pcnetgame_rec_txn_write_mail (X1 block) is the ONLY writer of a mirrored mail[] slot outside the D3 merge: idx must pass pcnetgame_rec_txn_idx_ok (never the host's own resident), "
-          "slot < 10, raw mMl_clear_mail / memcpy, one caller (the handler, with NULL)",
+          "slot < 10, raw mMl_clear_mail / memcpy, two callers (the kind-12 handler with NULL, the kind-13 take handler with the host's letter: audited in test_mail2_src.py)",
           "pcnetgame_rec_txn_idx_ok(idx)" in wr and "mail_slot >= mPr_INVENTORY_MAIL_COUNT" in wr and "mMl_clear_mail(&r->mail[mail_slot]);" in wr
-          and c.count("pcnetgame_rec_txn_write_mail(") == 2 and hd.count("pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL)") == 1
+          and c.count("pcnetgame_rec_txn_write_mail(") == 3 and hd.count("pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL)") == 1
           and len(re.findall(r"(?:->|\.)mail\[[^\]]*\]\s*=[^=]", c)) == 0 and len(re.findall(r"mMl_clear_mail\(&r->mail", c)) == 1
           and "mMl_clear_mail(&Save_Get(private_data)" not in c and "Save_Get(private_data)[idx].mail" not in strip_comments(c_raw[d3b:d3e]).replace("&Save_Get(private_data)[idx].mail[t->slot]", ""))
     check("H the hash helper converts a ZEROED scratch Private_c holding one letter copy (no live record is touched); both sides use it",
@@ -270,12 +271,12 @@ def main():
                               "s_crec.up_blocked", "!pcnetgame_mail_state_clean()", "s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;", "pcnetgame_txn_try_send()"])
           and "pcnetgame_mail_tick(); /* mail milestone 1" in c_raw and c_raw.index("pcnetgame_txn_tick()) { /* X1b") < c_raw.index("pcnetgame_mail_tick(); /* mail milestone 1"))
     ts = func_body(xc_raw, "pcnetgame_txn_try_send")
-    mcase = ts[ts.index("case PC_NETGAME_TXN_KIND_MAIL_SEND: {"):ts.index("case PC_NETGAME_TXN_KIND_DIG_BURIED:")]
+    mcase = ts[ts.index("case PC_NETGAME_TXN_KIND_MAIL_SEND: {"):ts.index("case PC_NETGAME_TXN_KIND_MAIL_TAKE: {")]
     check("C try_send (QUEUED -> SENT) for kind 12 re-checks that the slot still holds the same send-font letter (hash24) and that the record is STILL clean (cancel, never wait: a non-clean QUEUED txn "
           "would block the uploads forever), echoes the gift and fills aux_cond / aux_item from the stored hash",
           "pcnetgame_mail_be_hash(ml) & 0xFFFFFFu" in mcase and "pcnetgame_mail_state_clean()" in mcase and mcase.count("pcnetgame_txn_cancel_queued(") == 3
           and "item = (uint16_t)ml->present;" in mcase and "aux_cond = T->ts_aux;" in mcase and "aux_item = T->ts_aux_item;" in mcase
-          and "|| T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;" in ts.replace("\n", " ").replace("   ", " ") or "T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;" in ts)
+          and re.search(r"T->kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND \|\| T->kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_TAKE;", ts) is not None)
     am = func_body(xc_raw, "pcnetgame_txn_apply_mail")
     check("C APPLIED of kind 12 (pcnetgame_txn_apply_mail): the sent letter leaves the slot ONLY here, and only if the slot still hashes to the sent letter (else kept + logged 'possible local divergence'); "
           "pockets / wallet are never touched; the D3 base moves forward only on the same session / epoch",
@@ -339,11 +340,12 @@ def main():
     blocked = func_body(c_raw, "pcnetgame_txn_begin_blocked")
     check("C one pocket-transaction token: every request-side begin check (pickup / drop / bury / grants / catch / field actions / town services) uses pcnetgame_txn_begin_blocked() = s_ctxn busy OR a MAIL_SEND in AWAIT_CLEAN; "
           "pcnetgame_txn_busy() itself (upload deferral, adopt blocker) is unchanged",
-          "(s_mail_op.active && !s_mail_op.done)" in blocked and "s_ctxn.state != PC_NETGAME_CTXN_FREE" in blocked and c.count("pcnetgame_txn_begin_blocked()") == 8
+          "(s_mail_op.active && !s_mail_op.done)" in blocked and "(s_take_op.active && !s_take_op.done)" in blocked and "s_ctxn.state != PC_NETGAME_CTXN_FREE" in blocked and c.count("pcnetgame_txn_begin_blocked()") == 9
           and "pcnetgame_txn_begin_blocked()" in func_body(c_raw, "pcnetgame_ts_begin") and "s_mail_op" not in func_body(c_raw, "pcnetgame_txn_busy"))
     check("T the mail test hooks are role-bound in pc_main.c like --txn-fault: --mail-test-force-delivery / --mail-test-poke-museum refuse (exit 2) unless --host, --mail-test-send unless --connect",
-          "g_pc_mail_test_force_delivery || g_pc_mail_test_poke_museum >= 0) && g_pc_net_role != 1" in main_c and "g_pc_mail_test_send != NULL && g_pc_net_role != 2" in main_c
-          and main_c.count("[NET][MAIL][TEST-ONLY] REFUSED:") == 2)
+          "g_pc_mail_test_force_delivery || g_pc_mail_test_poke_museum >= 0 || g_pc_mail_test_seed_mailbox != NULL || g_pc_mail_test_seed_reply != NULL) &&" in main_c.replace("\n        g_pc_net_role != 1", " g_pc_net_role != 1").replace("\n", " ")
+          and "(g_pc_mail_test_send != NULL || g_pc_mail_test_take != 0) && g_pc_net_role != 2" in main_c
+          and main_c.count("[NET][MAIL][TEST-ONLY] REFUSED:") == 2)  # mail milestone 2: + --mail-test-seed-mailbox / --mail-test-seed-reply (host) and --mail-test-take (client)
 
     # ------------------------------------------------------------------ T: hooks
     check("T --mail-test-send=<house>[,gift]: default NULL, exact-prefix arm with a loud [TEST-ONLY] line, documented in --help and pc_platform.h, CLIENT-gated, bypasses only the letter board "

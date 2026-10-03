@@ -46,9 +46,10 @@ static void aMBX_check_take_mail(MAILBOX_ACTOR* actor, GAME_PLAY* play) {
 #ifdef TARGET_PC
                     /* Mail milestone M0: a network CLIENT's homes[].mailbox is its stale save copy plus letters its own load-time generators made
                      * (random furniture presents); taking one would put it into mail[], D3 would upload it and the host would persist it (gift
-                     * laundering). Until the host-owned mailbox is delivered to the owner (M2) a client's mailbox does not open: A does nothing,
-                     * the flag stays down (aMBX_check_flag). Host / solo: unchanged. */
-                    && pc_net_game_role() != PC_NETGAME_ROLE_CLIENT
+                     * laundering). Mail milestone 2: the owner's mailbox is the HOST's, delivered as MAILBOX_LETTER into a shadow; a client's mailbox
+                     * opens ONLY once that shadow is host-fed (pc_net_game_client_mailbox_usable()), and its letters are taken through the host
+                     * (MAIL_TAKE). Until then A does nothing and the flag stays down (aMBX_check_flag). Host / solo: unchanged. */
+                    && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || pc_net_game_client_mailbox_usable())
 #endif
                 ) {
                     player->a_btn_triggers_submenu = TRUE;
@@ -63,8 +64,8 @@ static void aMBX_check_flag(MAILBOX_ACTOR* actor) {
     int anime_idx = aMBX_ANIME_FLAG_DOWN;
     int mail_count = mMl_count_use_mail_space(Save_Get(homes[actor->arrange_idx]).mailbox, HOME_MAILBOX_SIZE);
 #ifdef TARGET_PC
-    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
-        mail_count = 0; /* mail milestone M0: the local mailbox of a client is not real (see aMBX_check_take_mail): the flag never goes up */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_mailbox_usable()) {
+        mail_count = 0; /* mail milestone M0: the local mailbox of a client is not real until the host fed it (see aMBX_check_take_mail): the flag stays down */
     }
 #endif
 

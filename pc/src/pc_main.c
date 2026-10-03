@@ -421,6 +421,10 @@ int g_pc_shop_test_sell = 0;
 const char* g_pc_mail_test_send = NULL;
 int g_pc_mail_test_force_delivery = 0;
 int g_pc_mail_test_poke_museum = -1;
+/* Mail milestone 2 TEST-ONLY hooks: --mail-test-take[=N] (client), --mail-test-seed-mailbox=... / --mail-test-seed-reply=... (host). See pc_platform.h. */
+int g_pc_mail_test_take = 0;
+const char* g_pc_mail_test_seed_mailbox = NULL;
+const char* g_pc_mail_test_seed_reply = NULL;
 
 /* X1 host-side fault injection, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. See pc_platform.h's own doc comment on these globals. */
 int g_pc_txn_fault_mode = 0;
@@ -609,6 +613,12 @@ int main(int argc, char* argv[]) {
                    "                      delivery every 2 s and log the mailboxes. See pc_platform.h.\n");
             printf("  --mail-test-poke-museum=N  HOST-only TEST hook (default off; loud logs): once resident N is synced, change its\n"
                    "                      museum_record like the host's day-change mail does. See pc_platform.h.\n");
+            printf("  --mail-test-take[=N]  Client-only TEST hook (default off; loud logs): take up to N (default 10) letters out of the\n"
+                   "                      host-fed mailbox through the MAIL_TAKE transaction path. See pc_platform.h.\n");
+            printf("  --mail-test-seed-mailbox=RES,COUNT,DELAY_MS[,GIFTHEX]  HOST-only TEST hook (default off; loud logs): write COUNT\n"
+                   "                      letters into resident RES's house mailbox after DELAY_MS (a simulated postman). See pc_platform.h.\n");
+            printf("  --mail-test-seed-reply=RES[,RES...]  HOST-only TEST hook (default off; loud logs): make the first villager owe each\n"
+                   "                      listed resident a reply dated a year ago. See pc_platform.h.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -718,6 +728,18 @@ int main(int argc, char* argv[]) {
         } else if (strncmp(argv[i], "--mail-test-poke-museum=", 24) == 0) {
             g_pc_mail_test_poke_museum = atoi(argv[i] + 24);
             printf("[NET][MAIL][TEST-ONLY] --mail-test-poke-museum=%d armed (a TEST hook: not for normal play)\n", g_pc_mail_test_poke_museum);
+        } else if (strcmp(argv[i], "--mail-test-take") == 0) {
+            g_pc_mail_test_take = 10;
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-take armed (a TEST hook: not for normal play)\n");
+        } else if (strncmp(argv[i], "--mail-test-take=", 17) == 0) {
+            g_pc_mail_test_take = atoi(argv[i] + 17);
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-take=%d armed (a TEST hook: not for normal play)\n", g_pc_mail_test_take);
+        } else if (strncmp(argv[i], "--mail-test-seed-mailbox=", 25) == 0) {
+            g_pc_mail_test_seed_mailbox = argv[i] + 25;
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-seed-mailbox=%s armed (a TEST hook: not for normal play)\n", g_pc_mail_test_seed_mailbox);
+        } else if (strncmp(argv[i], "--mail-test-seed-reply=", 23) == 0) {
+            g_pc_mail_test_seed_reply = argv[i] + 23;
+            printf("[NET][MAIL][TEST-ONLY] --mail-test-seed-reply=%s armed (a TEST hook: not for normal play)\n", g_pc_mail_test_seed_reply);
         } else if (strncmp(argv[i], "--txn-fault=", 12) == 0) {
             if (!pc_parse_txn_fault(argv[i] + 12)) {
                 fprintf(stderr, "[NET][TXN][TEST-ONLY] REFUSED: bad --txn-fault spec '%s' (expected MODE[:N[:K]], MODE = ignore_commit | "
@@ -801,12 +823,13 @@ int main(int argc, char* argv[]) {
     }
 
     /* Mail milestone 1: the mail TEST hooks are role-bound like --txn-fault: refused (exit 2) for any other role. */
-    if ((g_pc_mail_test_force_delivery || g_pc_mail_test_poke_museum >= 0) && g_pc_net_role != 1) {
-        fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-force-delivery / --mail-test-poke-museum are HOST-only test hooks (use them together with --host)\n");
+    if ((g_pc_mail_test_force_delivery || g_pc_mail_test_poke_museum >= 0 || g_pc_mail_test_seed_mailbox != NULL || g_pc_mail_test_seed_reply != NULL) &&
+        g_pc_net_role != 1) {
+        fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-force-delivery / --mail-test-poke-museum / --mail-test-seed-mailbox / --mail-test-seed-reply are HOST-only test hooks (use them together with --host)\n");
         return 2;
     }
-    if (g_pc_mail_test_send != NULL && g_pc_net_role != 2) {
-        fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-send is a CLIENT-only test hook (use it together with --connect)\n");
+    if ((g_pc_mail_test_send != NULL || g_pc_mail_test_take != 0) && g_pc_net_role != 2) {
+        fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-send / --mail-test-take are CLIENT-only test hooks (use them together with --connect)\n");
         return 2;
     }
 

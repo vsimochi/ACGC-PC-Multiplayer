@@ -361,6 +361,7 @@ extern u8 mNpc_CheckNormalMail_nes(u8* body);
 extern int mNpc_SendMailtoNpc(Mail_c* mail);
 extern void mNpc_ClearRemail(Anmremail_c* remail);
 extern void mNpc_Remail();
+extern void mNpc_RemailFor(Private_c* priv); /* the town-villager part of mNpc_Remail() for ONE resident's record (host: every connected resident, M2r) */
 extern u8 mNpc_GetPaperType();
 extern int mNpc_SendVtdayMail();
 extern int mNpc_CheckFriendship(PersonalID_c* pid, Animal_c* animal);

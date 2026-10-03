@@ -105,7 +105,7 @@ def main():
           "memset(&s_ctxn, 0, sizeof(s_ctxn));" in rst and "memset(&s_bury_pending, 0, sizeof(s_bury_pending));" in rst, results)
     req = func_body(net, r"\nint pc_net_game_request_bury\(")
     check("G2-3 (X1b): a new bury request is refused while a pocket transaction is unresolved (return 0 = the seam shows the 'cannot' warning)",
-          "pcnetgame_txn_busy()" in req and "s_bury_committed" not in req, results)
+          "pcnetgame_txn_begin_blocked()" in req and "s_bury_committed" not in req, results)  # mail milestone 1 review: the begin check is pcnetgame_txn_begin_blocked() (a superset of pcnetgame_txn_busy())
     check("G2-3: the host still sends the tile-reconcile reject with the request id after a failed commit (legacy path AND the TXN WORLD_CHANGED step)",
           "pcnetgame_host_send_bury_reject(peer, rec->request_id, rec->ut_x, rec->ut_z);" in net, results)
 

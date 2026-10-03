@@ -91,8 +91,8 @@ def main():
           and len(L.build_field_action_request(1, 2, 3, 4)) == 76 and len(L.build_catch_request(1, 2, 3, 4)) == 84)
     for name, ids in (("FIELD_ACTION", (29, 30)), ("CATCH", (41, 42))):
         enum = c_raw[c_raw.index("typedef enum PCNetGameMsgType {"):c_raw.index("} PCNetGameMsgType;")]
-        check(f"W the message ids of {name} are unchanged ({ids}): no new message id was added by X3 (the max id 55 is the town-services milestone)",
-              all(re.search(r"PC_NETGAME_MSG_%s_(?:REQUEST|RESULT)\s*=\s*%d," % (name, i), enum) for i in ids) and wire_baseline.EXPECTED_MAX_MSG_ID == 55)  # X3 added no id; 53 / 54 (reserved X2) + 55 (TOWN_SVC_STATE) came with town services
+        check(f"W the message ids of {name} are unchanged ({ids}): no new message id was added by X3 (the max id 56 is the mail milestone 2, 55 the town-services milestone)",
+              all(re.search(r"PC_NETGAME_MSG_%s_(?:REQUEST|RESULT)\s*=\s*%d," % (name, i), enum) for i in ids) and wire_baseline.EXPECTED_MAX_MSG_ID == 56)  # X3 added no id; 53 / 54 (reserved X2) + 55 (TOWN_SVC_STATE) came with town services, 56 (MAILBOX_LETTER) with mail milestone 2
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     check("W wire_baseline (pins the two grown structs EXACTLY, everything else identical to HEAD): all %d checks green" % len(wb), wb and all(x[1] for x in wb))
@@ -249,11 +249,11 @@ def main():
     tk = func_body(c, "pcnetgame_txn_tick")
     rq = func_body(c, "pcnetgame_send_field_action_request_ex_grant")
     check("K a grant never uses the field-action queue: ex_grant diverts DIG_BURIED / any bonus to pcnetgame_txn_begin_grant BEFORE touching s_field_action_queue, one pocket transaction at a time",
-          ok_order(rq, "kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_BURIED", "pcnetgame_txn_busy()", "pcnetgame_txn_begin_grant(", "s_field_action_queue_len >= PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH")
-          and "pcnetgame_txn_busy()" in func_body(c, "pc_net_game_request_dig_buried") and "return pcnetgame_txn_busy();" in func_body(c, "pcnetgame_field_action_grant_already_pending"))
+          ok_order(rq, "kind == (uint8_t)PC_NETGAME_FIELD_ACTION_KIND_DIG_BURIED", "pcnetgame_txn_begin_blocked()", "pcnetgame_txn_begin_grant(", "s_field_action_queue_len >= PC_NETGAME_FIELD_ACTION_QUEUE_DEPTH")
+          and "pcnetgame_txn_begin_blocked()" in func_body(c, "pc_net_game_request_dig_buried") and "return pcnetgame_txn_begin_blocked();" in func_body(c, "pcnetgame_field_action_grant_already_pending"))  # mail milestone 1 review: the request-side begin check is pcnetgame_txn_begin_blocked() (s_ctxn busy OR a MAIL_SEND in AWAIT_CLEAN, a superset of pcnetgame_txn_busy())
     check("K the catch request: refused while a transaction is unresolved (return 0 = the seams' local denial), the old direct fire-and-forget pc_net_send is gone (the request is built in try_send only), "
           "the pending record keeps the outcome PENDING until the TXN_RESULT",
-          "pcnetgame_txn_busy()" in func_body(c, "pcnetgame_request_catch_common") and "pc_net_send(" not in func_body(c, "pcnetgame_request_catch_common")
+          "pcnetgame_txn_begin_blocked()" in func_body(c, "pcnetgame_request_catch_common") and "pc_net_send(" not in func_body(c, "pcnetgame_request_catch_common")
           and "pcnetgame_txn_begin_grant((uint8_t)PC_NETGAME_TXN_KIND_CATCH" in func_body(c, "pcnetgame_request_catch_common"))
     check("K try_send: the request is built ONCE with the pre-image of that moment (COMMIT / FIELD_ACTION_REQUEST / CATCH_REQUEST), the slot of a grant is the first FREE slot at send time (dest POCKET) or, "
           "for a catch with full pockets, dest NONE / slot 0xFF / item 0; its bytes are stored and the tick resends the IDENTICAL stored bytes; the tag is filled from Now_Private and the D3 base only",

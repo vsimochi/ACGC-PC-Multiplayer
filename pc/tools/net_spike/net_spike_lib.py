@@ -1150,6 +1150,8 @@ PC_NETGAME_TXN_REASON_NO_ROOM = 22           # shop: SHOP_SELL whose money-bag o
 PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS = 23   # mail: MAIL_SEND to a player who owns no house on the HOST
 PC_NETGAME_TXN_REASON_MAILBOX_FULL = 24      # mail: MAIL_SEND whose recipient's house mailbox has no free slot
 PC_NETGAME_TXN_REASON_PO_FULL = 25           # mail: MAIL_SEND the post office cannot take (5 desk slots / 10 letters per house)
+PC_NETGAME_TXN_REASON_NO_SUCH_LETTER = 26    # mail (milestone 2): MAIL_TAKE of a mailbox slot that is empty on the host
+PC_NETGAME_TXN_REASON_MAIL_CHANGED = 27      # mail (milestone 2): MAIL_TAKE of a mailbox letter whose hash differs from the claimed one
 PC_NETGAME_TXN_RING = 16              # host journal entries per resident
 PC_NETGAME_TXN_FENCED_NUM = 4         # fenced nonces remembered per resident
 TXN_TAG_FMT = "<IIBBHBBHII15HHII"       # PCNetGameTxnTag, 64 bytes
@@ -1158,7 +1160,8 @@ TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHII"  # PCNetGameTxnResultMsg, 76 bytes
 TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED", 4: "NOT_SYNCED", 5: "NOT_BOUND", 6: "FENCED",
                     7: "CONFLICT", 8: "BAD_IMAGE", 9: "PRECOND", 10: "STALE_IMAGE", 11: "BAD_SHAPE", 12: "BUSY", 13: "FAULT",
                     14: "REPLAYED", 15: "ALREADY_DONATED", 16: "NOT_AVAILABLE", 17: "NOT_DONATABLE", 18: "NO_DONOR_SLOT", 19: "NO_FUNDS",
-                    20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM", 23: "NO_SUCH_ADDRESS", 24: "MAILBOX_FULL", 25: "PO_FULL"}
+                    20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM", 23: "NO_SUCH_ADDRESS", 24: "MAILBOX_FULL", 25: "PO_FULL",
+                    26: "NO_SUCH_LETTER", 27: "MAIL_CHANGED"}
 
 # --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
 # CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
@@ -1176,6 +1179,7 @@ PC_NETGAME_TXN_KIND_POLICE_CLAIM = 9    # town services: TXN_COMMIT kind 9 (dest
 PC_NETGAME_TXN_KIND_SHOP_BUY = 10       # shop (milestone 2): dest POCKET, slot = free slot, item, aux_cond = stock code, aux_item = the expected price
 PC_NETGAME_TXN_KIND_SHOP_SELL = 11      # shop (milestone 2): dest NONE, slot = primary slot, item = its item, aux_item = the bit mask of every slot sold
 PC_NETGAME_TXN_KIND_MAIL_SEND = 12      # mail (milestone 1): dest NONE, slot = mail slot 0..9, item = the letter's present echo, aux_item / aux_cond = low 16 / bits 16..23 of the letter's canonical-BE FNV-1a32
+PC_NETGAME_TXN_KIND_MAIL_TAKE = 13      # mail (milestone 2): dest NONE, slot = MAILBOX slot 0..9, flags = the destination mail[] slot, item = the letter's present echo, aux_item / aux_cond = low 16 / bits 16..23 of its canonical-BE FNV-1a32
 PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD    # SHOP_BUY aux_cond: a counted candy / grab bag (Shop_c.flowers_candy_grab_bag_count)
 PC_NETGAME_SHOP_STOCK_RARE = 0xFE       # SHOP_BUY aux_cond: Shop_c.rare_item
 PC_NETGAME_SHOP_STOCK_UNLIMITED = 0xFF  # SHOP_BUY aux_cond: unlimited stationery
@@ -1194,6 +1198,13 @@ PC_NETGAME_TS_POLICE_LEN = 40
 PC_NETGAME_TS_MUSEUM_LEN = 63
 PC_NETGAME_TS_SHOP_LEN = 320
 TOWN_SVC_STATE_FMT = "<BBHII"  # 12-byte header (msg_type, service, len, seq, digest); the blob (len bytes) follows
+# --- Mail milestone 2 (same v8, extended IN PLACE): MAILBOX_LETTER (id 56, host -> the OWNING client only, RELIABLE, 316 B): ONE slot of the host-held house
+# mailbox as its 298 canonical BE bytes (or an "empty" indication, flags bit 0), per-(resident, slot) seq, FNV-1a32 of the 298 bytes. ---
+PC_NETGAME_MSG_MAILBOX_LETTER = 56
+PC_NETGAME_MBOX_SLOTS = 10
+PC_NETGAME_MBOX_FLAG_EMPTY = 0x01
+PC_NETGAME_MAIL_WIRE_SIZE = 298
+MAILBOX_LETTER_FMT = "<BBBBIIHH298sH"  # msg_type, house, mbox_idx, flags, seq, digest, used_count, rsv0, letter[298], rsv1 = 316 bytes
 FIELD_ACTION_REQUEST_FMT = "<BBBBIBBHIIBBHBBHII15HHII"  # PCNetGameFieldActionRequestMsg, 76 bytes (12 B header + the 64 B tag)
 FIELD_ACTION_RESULT_FMT = "<BBBBIHBB"                   # PCNetGameFieldActionResultMsg, 12 bytes
 CATCH_REQUEST_FMT = "<B3xIIIiIIBBHBBHII15HHII"          # PCNetGameCatchRequestMsg, 84 bytes (20 B header + the 64 B tag)
@@ -1562,6 +1573,10 @@ TXN_RESULT_SPEC = build_txn_spec(
 TOWN_SVC_STATE_SPEC = build_msg_spec(
     PC_NETGAME_MSG_TOWN_SVC_STATE, TOWN_SVC_STATE_FMT, ["msg_type", "service", "len", "seq", "digest"], "TownSvcStateFields", exact=False)
 assert TOWN_SVC_STATE_SPEC.size == 12 and 12 + PC_NETGAME_TS_BLOB_MAX <= PC_NET_MAX_PAYLOAD
+MAILBOX_LETTER_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_MAILBOX_LETTER, MAILBOX_LETTER_FMT,
+    ["msg_type", "house", "mbox_idx", "flags", "seq", "digest", "used_count", "rsv0", "letter", "rsv1"], "MailboxLetterFields")
+assert MAILBOX_LETTER_SPEC.size == 316 and MAILBOX_LETTER_SPEC.size <= PC_NET_MAX_PAYLOAD
 assert PC_NETGAME_TS_BLOB_MAX >= max(PC_NETGAME_TS_POLICE_LEN, PC_NETGAME_TS_MUSEUM_LEN, PC_NETGAME_TS_SHOP_LEN)
 assert struct.calcsize(TXN_TAG_FMT) == 64 and TXN_COMMIT_SPEC.size == 72 and TXN_RESULT_SPEC.size == 76
 assert max(TXN_COMMIT_SPEC.size, TXN_RESULT_SPEC.size) <= PC_NET_MAX_PAYLOAD
@@ -1575,7 +1590,8 @@ GAME_SPECS = {
               INTERACT_CONFIRM_SPEC, VILLAGER_ARRIVAL_SPEC, VILLAGER_DEPARTURE_SPEC, VILLAGER_SNAPSHOT_SPEC,
               FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
               MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC, RECORD_HELLO_SPEC,
-              RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC, TOWN_SVC_STATE_SPEC)
+              RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC, TOWN_SVC_STATE_SPEC,
+              MAILBOX_LETTER_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
@@ -1872,6 +1888,8 @@ class FakeClient(TransportClient):
         self.txn_results = []        # (conn, TxnResultFields) for EVERY TXN_RESULT received, arrival order
         self.txn_commits_sent = []   # (raw bytes, conn) for EVERY TXN_COMMIT this client sent
         self.ts_states = []          # (conn, TownSvcStateFields, blob bytes) for EVERY TOWN_SVC_STATE received (town services), arrival order
+        self.mbox_log = []           # (conn, MailboxLetterFields, inbox index) for EVERY MAILBOX_LETTER received (mail milestone 2), arrival order
+        self.take_ctx = {}           # (nonce, seq) -> (dst mail slot, letter BE bytes) of a MAIL_TAKE this client sent (what its apply step writes on APPLIED)
         self.txn_requests = {}       # (kind, request_id) -> (slot, item): what the auto-commit needs for drop/bury
         super().__init__(label, host_ip, port, hub=hub, **kw)
         self.host_ip = host_ip
@@ -2405,6 +2423,11 @@ class FakeClient(TransportClient):
                               if i != g.slot and record_mail(self.rec_local, i)[0x2E] == MAIL_FONT_UNUSED), None)
                 if empty is not None:
                     self.rec_local = record_set_mail(self.rec_local, g.slot, empty)
+            if g.kind == PC_NETGAME_TXN_KIND_MAIL_TAKE and (g.txn_nonce, g.txn_seq) in self.take_ctx:
+                # the real client's pcnetgame_txn_apply_take: the verified letter goes into its own mail[dst]
+                dst, lt = self.take_ctx[(g.txn_nonce, g.txn_seq)]
+                if lt is not None and 0 <= dst < REC_MAIL_COUNT:
+                    self.rec_local = record_set_mail(self.rec_local, dst, lt)
         self.rec_last = (g.host_session, g.epoch, g.rev)
 
     def _auto_txn_commit(self, kind, rid, g):
@@ -2626,11 +2649,57 @@ class FakeClient(TransportClient):
         sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_MAIL_SEND, rid, PC_NETGAME_TXN_DEST_NONE, slot, it, pre=pre, **kw)
         return sent, self.wait_txn_result(sent.seq, timeout), ack
 
+    # --- mail milestone 2: the mailbox shadow (MAILBOX_LETTER, id 56) and MAIL_TAKE (TXN_COMMIT kind 13) ------------------------------------
+
+    def mbox_msgs(self, current_conn_only=True, since=0):
+        """[(MailboxLetterFields, inbox index)] of every MAILBOX_LETTER received (this connection only by default), arrival order, index >= since."""
+        return [(g, i) for conn, g, i in self.mbox_log if (not current_conn_only or conn == self.connect_count) and i >= since]
+
+    def mbox_state(self, current_conn_only=True):
+        """{mailbox idx: the MAILBOX_LETTER with the highest seq} of this connection: the client's shadow of the host mailbox as the real client applies it."""
+        st = {}
+        for g, _i in self.mbox_msgs(current_conn_only):
+            if g.mbox_idx not in st or g.seq > st[g.mbox_idx].seq:
+                st[g.mbox_idx] = g
+        return st
+
+    def wait_mbox_msgs(self, n, timeout=6.0, since=0):
+        """Waits until >= n MAILBOX_LETTERs (index >= since) arrived on this connection; returns the list (possibly shorter on timeout)."""
+        self.hub.wait_until(lambda: len(self.mbox_msgs(since=since)) >= n, timeout)
+        return self.mbox_msgs(since=since)
+
+    def txn_mail_take(self, mbox_idx, dst, rid=0, timeout=3.0, letter_be=None, hash24=None, item=None, pre=None, **kw):
+        """MAIL_TAKE: TXN_COMMIT kind 13 (dest NONE, slot = the mailbox slot, flags = the destination mail[] slot, item = the letter's present, aux = the
+        24-bit letter hash). The letter defaults to this client's shadow of that mailbox slot (the latest MAILBOX_LETTER). Default pre-image = the
+        local image's pockets. Returns (TxnSent, TxnResultFields or None)."""
+        st = self.mbox_state().get(mbox_idx)
+        cur = letter_be if letter_be is not None else (bytes(st.letter) if st is not None else bytes(REC_MAIL_SIZE))
+        it, ac, ai = self.mail_tag_fields(cur, hash24)
+        if item is not None:
+            it = item
+        if pre is None:
+            pre = self.txn_pre_image()
+        kw.setdefault("aux_cond", ac)
+        kw.setdefault("aux_item", ai)
+        kw.setdefault("flags", dst)
+        sent = self.send_txn_commit(PC_NETGAME_TXN_KIND_MAIL_TAKE, rid, PC_NETGAME_TXN_DEST_NONE, mbox_idx, it, pre=pre, **kw)
+        self.take_ctx[(sent.nonce, sent.seq)] = (dst, cur)
+        return sent, self.wait_txn_result(sent.seq, timeout)
+
+    def free_mail_slot(self, skip=()):
+        """The first mail[] slot of this client's local record image that is unused (font 0xFF) and not in `skip`, or None."""
+        rec = self.rec_local if self.rec_local is not None else self.own_record()
+        return next((i for i in range(REC_MAIL_COUNT) if i not in skip and record_mail(rec, i)[0x2E] == MAIL_FONT_UNUSED), None)
+
     def on_message(self, m):
         if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TOWN_SVC_STATE:
             g = m.game
             if g is not None:
                 self.ts_states.append((m.conn, g, bytes(m.payload[12:12 + g.len])))
+        if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_MAILBOX_LETTER:
+            g = m.game
+            if g is not None:
+                self.mbox_log.append((m.conn, g, m.index))
         if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TXN_RESULT:
             g = m.game
             if g is not None:

@@ -659,6 +659,19 @@ int pc_net_game_ts_last_reject_reason(void);
 int pc_net_game_mail_begin_send(int mail_slot);
 int pc_net_game_mail_poll(void);
 int pc_net_game_mail_last_reason(void);
+
+/* Mail milestone 2 (protocol v8, unreleased): the owning client's house mailbox is the HOST's. The host sends every slot of that mailbox as MAILBOX_LETTER
+ * (56) at READY and whenever a slot changes; the client keeps a verified SHADOW in its local homes[].mailbox. The mailbox actor / overlay open for a
+ * network client ONLY while pc_net_game_client_mailbox_usable() == 1 (all 10 slots received this session); solo and the host never use it. Taking a letter
+ * is a host transaction (TXN_COMMIT kind 13 MAIL_TAKE): the overlay's transfer code calls pc_net_game_mail_take_step(mailbox slot, &mail slot) every
+ * transfer tick. PENDING = wait, change nothing; APPLIED = the letter is now in Now_Private->mail[*mail slot] and the local mailbox slot is clear (the
+ * overlay does only its animation / sound); REJECTED = nothing moved, stop transferring (pc_net_game_mail_take_last_reason() = the host's
+ * PC_NETGAME_TXN_REASON_*, 0 = a local refusal). Throwing letters away from the mailbox stays refused for a client (the overlay clears the marks). */
+#define PC_NETGAME_MAIL_TAKE_REJECT_NO_SUCH_LETTER 26
+#define PC_NETGAME_MAIL_TAKE_REJECT_MAIL_CHANGED   27
+int pc_net_game_client_mailbox_usable(void);
+int pc_net_game_mail_take_step(int mbox_idx, int* dst_out);
+int pc_net_game_mail_take_last_reason(void);
 /* H1: 1 when the HOST's own purchase of `item` may proceed (always 1 unless this is a networked HOST whose stock no longer holds the item: a client may have
  * bought it meanwhile). Special-day stock (bargain / raffle) and solo / client roles answer 1 (vanilla behaviour). */
 int pc_net_game_host_shop_can_sell(int item);

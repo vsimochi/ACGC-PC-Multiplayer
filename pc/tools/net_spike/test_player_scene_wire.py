@@ -114,7 +114,7 @@ check("pc_net_game.h PC_NETGAME_PROTOCOL_VERSION == EXPECTED (%du)" % wire_basel
 csrc = open(os.path.join(PC_DIR, "src", "pc_net_game.c"), encoding="utf-8").read()
 check("pc_net_game.c defines PC_NETGAME_MSG_PLAYER_SCENE = 44",
       re.search(r"PC_NETGAME_MSG_PLAYER_SCENE\s*=\s*44", csrc) is not None)
-ids = [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_]+\s*=\s*(\d+)", csrc[:csrc.index("} PCNetGameMsgType;")])]
+ids = [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_0-9]+\s*=\s*(\d+)", csrc[:csrc.index("} PCNetGameMsgType;")])]
 check("all C message ids are unique, contiguous 1..N and N == wire_baseline.EXPECTED_MAX_MSG_ID (%d: v8 X1 TXN_RESULT) is the maximum"
       % wire_baseline.EXPECTED_MAX_MSG_ID,
       len(ids) == len(set(ids)) and max(ids) == wire_baseline.EXPECTED_MAX_MSG_ID

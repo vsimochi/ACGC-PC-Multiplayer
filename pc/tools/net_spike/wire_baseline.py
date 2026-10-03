@@ -37,7 +37,7 @@ import sys
 # dig request is now a host-transactional grant owned by PCNetGameClientTxn, no longer a queue entry.
 HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRange", "PCNetGameRecSlot", "PCNetGameClientRec",
              "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending",
-             "PCNetGameTsHost", "PCNetGameTsOp", "PCNetGameMailOp")
+             "PCNetGameTsHost", "PCNetGameTsOp", "PCNetGameMailOp", "PCNetGameMboxHost", "PCNetGameTakeOp")
 # Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
 # (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
 REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
@@ -45,7 +45,8 @@ REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
 # instead of a literal, so the next deliberate id addition is one reviewed edit here.
 # Town services milestone 1 (deliberate, v8 still unreleased): 53 / 54 are ENUMERATED as reserved ids (X2: TXN_QUERY / TXN_STATUS, never sent) so
 # the ids stay contiguous, and 55 = TOWN_SVC_STATE (the generic host -> client service mirror).
-EXPECTED_MAX_MSG_ID = 55
+# Mail milestone 2 (deliberate, v8 still unreleased): 56 = MAILBOX_LETTER (host -> the owning client only: one slot of the host-held house mailbox).
+EXPECTED_MAX_MSG_ID = 56
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -75,6 +76,9 @@ V8_NEW_STRUCTS = {
     # town services milestone 1: the generic host -> client service mirror (variable length on the wire: offsetof(blob) + len)
     "PCNetGameTownSvcStateMsg": "uint8_t msg_type; uint8_t service; uint16_t len; uint32_t seq; uint32_t digest; "
                                 "uint8_t blob[PC_NETGAME_TS_BLOB_MAX];",
+    # mail milestone 2: one slot of the host-held house mailbox, host -> the owning client (316 B: 16 B header + the 298 B canonical BE letter + 2 B pad)
+    "PCNetGameMailboxLetterMsg": "uint8_t msg_type; uint8_t house; uint8_t mbox_idx; uint8_t flags; uint32_t seq; uint32_t digest; "
+                                 "uint16_t used_count; uint16_t _rsv0; uint8_t letter[PC_NETGAME_MAIL_WIRE_SIZE]; uint16_t _rsv1;",
 }
 # What HEAD may still contain for a struct whose v8 text was deliberately changed in place by a later (still unreleased) milestone.
 V8_PREV_STRUCTS = {
@@ -115,17 +119,23 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              # mail milestone 1: the MAIL_SEND kind (TXN_COMMIT, no new message id) and its three reasons
              "#define PC_NETGAME_TXN_KIND_MAIL_SEND 12u", "#define PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS 23u",
              "#define PC_NETGAME_TXN_REASON_MAILBOX_FULL    24u", "#define PC_NETGAME_TXN_REASON_PO_FULL         25u",
-             "#define PC_NETGAME_REC_FIELD_MAIL_PRESENT 12u")
+             "#define PC_NETGAME_REC_FIELD_MAIL_PRESENT 12u",
+             # mail milestone 2: MAILBOX_LETTER (316 B, id 56), the MAIL_TAKE kind (TXN_COMMIT kind 13, tag.flags = the destination mail slot) and its two reasons
+             "#define PC_NETGAME_TXN_KIND_MAIL_TAKE 13u", "#define PC_NETGAME_TXN_REASON_NO_SUCH_LETTER  26u",
+             "#define PC_NETGAME_TXN_REASON_MAIL_CHANGED    27u", "#define PC_NETGAME_MBOX_SLOTS      10u",
+             "#define PC_NETGAME_MBOX_FLAG_EMPTY 0x01u", "#define PC_NETGAME_MAIL_WIRE_SIZE  298u",
+             '_Static_assert(sizeof(PCNetGameMailboxLetterMsg) == 316,', "offsetof(PCNetGameMailboxLetterMsg, letter) == 16")
 V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_BEGIN", "48"),
                 ("PC_NETGAME_MSG_RECORD_CHUNK", "49"), ("PC_NETGAME_MSG_RECORD_ACK", "50"),
                 ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52"),
                 ("PC_NETGAME_MSG_TXN_RESERVED_53", "53"), ("PC_NETGAME_MSG_TXN_RESERVED_54", "54"),
-                ("PC_NETGAME_MSG_TOWN_SVC_STATE", "55")]
-_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE)\s*=\s*\d+,"
+                ("PC_NETGAME_MSG_TOWN_SVC_STATE", "55"), ("PC_NETGAME_MSG_MAILBOX_LETTER", "56")]
+_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER)\s*=\s*\d+,"
 # net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
 V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
                            r"|PC_NETGAME_MSG_TOWN_SVC_STATE|PC_NETGAME_TS_\w+|PC_NETGAME_SHOP_\w+|TOWN_SVC_STATE_FMT"
+                           r"|PC_NETGAME_MSG_MAILBOX_LETTER|PC_NETGAME_MBOX_\w+|PC_NETGAME_MAIL_WIRE_SIZE|MAILBOX_LETTER_FMT"
                            r"|PC_NETGAME_MSG_(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)|(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)_FMT) = ")
 
 
@@ -211,6 +221,15 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_MAILBOX_FULL": '24',
     "PC_NETGAME_TXN_REASON_PO_FULL": '25',
     "PC_NETGAME_REC_FIELD_MAIL_PRESENT": '12',
+    # mail milestone 2
+    "PC_NETGAME_TXN_REASON_NO_SUCH_LETTER": '26',
+    "PC_NETGAME_TXN_REASON_MAIL_CHANGED": '27',
+    "PC_NETGAME_TXN_KIND_MAIL_TAKE": '13',
+    "PC_NETGAME_MSG_MAILBOX_LETTER": '56',
+    "PC_NETGAME_MBOX_SLOTS": '10',
+    "PC_NETGAME_MBOX_FLAG_EMPTY": '0x01',
+    "PC_NETGAME_MAIL_WIRE_SIZE": '298',
+    "MAILBOX_LETTER_FMT": '"<BBBBIIHH298sH"',
     "PC_NETGAME_TXN_RING": '16',
     "PC_NETGAME_TXN_FENCED_NUM": '4',
     "TXN_TAG_FMT": '"<IIBBHBBHII15HHII"',
@@ -330,14 +349,15 @@ def audit_texts(head, cur):
     add("wire: town services -- the service ids, blob length constants and the 352-byte / offset _Static_asserts of PCNetGameTownSvcStateMsg are pinned in pc_net_game.c",
         all(a in cur["game_c"] for a in TS_C_PINS))
     strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
-    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE))\s*=\s*(\d+),", b)
-    # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52) or all of them
-    head_ids_ok = ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS) if "PCNetGameMsgType" in hb else False
-    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-55 (appended, in order; 53/54 enumerated as reserved)",
+    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER))\s*=\s*(\d+),", b)
+    # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52), + town services (47-55) or all of them
+    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS)
+                   if "PCNetGameMsgType" in hb else False)
+    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-56 (appended, in order; 53/54 enumerated as reserved)",
         "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
         and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
         and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
-        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_TOWN_SVC_STATE = 55"))
+        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_MAILBOX_LETTER = 56"))
     nums = [v for _n, v in c_message_ids(cur["game_c"])]
     add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
@@ -427,7 +447,18 @@ def selftest(repo):
         "protocol version": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>9u", c["game_h"], count=1)),
         "protocol reverted": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>7u", c["game_h"], count=1)),
         "enum value": lambda c: c.update(game_c=c["game_c"].replace(msg_id.group(0), msg_id.group(0).replace(",", " + 1,"), 1)),
-        "extra enum id 56": lambda c: c.update(game_c=c["game_c"].replace("} PCNetGameMsgType;", "    PC_NETGAME_MSG_EXTRA = 56,\n} PCNetGameMsgType;", 1)),
+        "extra enum id 57": lambda c: c.update(game_c=c["game_c"].replace("} PCNetGameMsgType;", "    PC_NETGAME_MSG_EXTRA = 57,\n} PCNetGameMsgType;", 1)),
+        "mailbox enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_MAILBOX_LETTER        = 56,", "PC_NETGAME_MSG_MAILBOX_LETTER        = 66,", 1)),
+        "mailbox struct field": lambda c: c.update(game_c=c["game_c"].replace("    uint16_t _rsv1;\n} PCNetGameMailboxLetterMsg;", "    uint16_t _rsv1;\n    uint32_t extra;\n} PCNetGameMailboxLetterMsg;", 1)),
+        "mailbox struct size assert": lambda c: c.update(game_c=c["game_c"].replace("_Static_assert(sizeof(PCNetGameMailboxLetterMsg) == 316,", "_Static_assert(sizeof(PCNetGameMailboxLetterMsg) == 314,", 1)),
+        "mailbox flag": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_MBOX_FLAG_EMPTY 0x01u", "#define PC_NETGAME_MBOX_FLAG_EMPTY 0x02u", 1)),
+        "take kind moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_KIND_MAIL_TAKE 13u", "#define PC_NETGAME_TXN_KIND_MAIL_TAKE 14u", 1)),
+        "take reason moved": lambda c: c.update(game_c=c["game_c"].replace("#define PC_NETGAME_TXN_REASON_MAIL_CHANGED    27u", "#define PC_NETGAME_TXN_REASON_MAIL_CHANGED    37u", 1)),
+        "mailbox lib fmt": lambda c: c.update(lib=c["lib"].replace('MAILBOX_LETTER_FMT = "<BBBBIIHH298sH"', 'MAILBOX_LETTER_FMT = "<BBBBIIHH298sHH"', 1)),
+        "mailbox lib id": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_MSG_MAILBOX_LETTER = 56", "PC_NETGAME_MSG_MAILBOX_LETTER = 57", 1)),
+        "take lib kind": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_KIND_MAIL_TAKE = 13", "PC_NETGAME_TXN_KIND_MAIL_TAKE = 14", 1)),
+        "take lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_NO_SUCH_LETTER = 26", "PC_NETGAME_TXN_REASON_NO_SUCH_LETTER = 28", 1)),
+        "mailbox lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_MBOX_EXTRA = 3\n"),
         "ts enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TOWN_SVC_STATE        = 55,", "PC_NETGAME_MSG_TOWN_SVC_STATE        = 65,", 1)),
         "reserved 53 removed": lambda c: c.update(game_c=c["game_c"].replace("    PC_NETGAME_MSG_TXN_RESERVED_53       = 53,", "    PC_NETGAME_MSG_TXN_RESERVED_X        = 53,", 1)),
         "ts struct field": lambda c: c.update(game_c=c["game_c"].replace("    uint8_t  blob[PC_NETGAME_TS_BLOB_MAX];\n} PCNetGameTownSvcStateMsg;", "    uint8_t  blob[PC_NETGAME_TS_BLOB_MAX];\n    uint32_t extra;\n} PCNetGameTownSvcStateMsg;", 1)),

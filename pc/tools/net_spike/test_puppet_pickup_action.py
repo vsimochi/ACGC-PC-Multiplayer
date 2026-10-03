@@ -180,7 +180,7 @@ def a0(check):
     ncode = strip_comments(net)
     # Ids 47+ exist now (D3 47..50, X1 51/52), so 46 is no longer the maximum. Kept strict: id 46 is present and unique, and ALL
     # ids are contiguous 1..N with N == the current maximum parsed from the header == wire_baseline's source of truth.
-    msg_ids = [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_]+\s*=\s*(\d+)", net[:net.index("} PCNetGameMsgType;")])]
+    msg_ids = [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_0-9]+\s*=\s*(\d+)", net[:net.index("} PCNetGameMsgType;")])]
     check("A0 PLAYER_ACTION = 46 and unique; ids are unique and contiguous 1..N with N == max parsed from the enum == "
           "wire_baseline.EXPECTED_MAX_MSG_ID (%d)" % wire_baseline.EXPECTED_MAX_MSG_ID,
           re.search(r"PC_NETGAME_MSG_PLAYER_ACTION\s*=\s*46", net) is not None and msg_ids.count(46) == 1 and

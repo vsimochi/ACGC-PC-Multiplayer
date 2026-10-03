@@ -68,10 +68,11 @@ def main():
     # ------------------------------------------------------------------ W: wire
     ids = wire_baseline.c_message_ids(c_raw)
     d = dict(ids)
-    check("W ids 51 = TXN_COMMIT and 52 = TXN_RESULT; 53 / 54 are ENUMERATED as the reserved X2 ids and 55 = TOWN_SVC_STATE (town services); all ids contiguous 1..%d (wire_baseline.EXPECTED_MAX_MSG_ID)" % wire_baseline.EXPECTED_MAX_MSG_ID,
+    check("W ids 51 = TXN_COMMIT and 52 = TXN_RESULT; 53 / 54 are ENUMERATED as the reserved X2 ids, 55 = TOWN_SVC_STATE (town services) and 56 = MAILBOX_LETTER (mail milestone 2); all ids contiguous 1..%d (wire_baseline.EXPECTED_MAX_MSG_ID)" % wire_baseline.EXPECTED_MAX_MSG_ID,
           d.get("PC_NETGAME_MSG_TXN_COMMIT") == 51 and d.get("PC_NETGAME_MSG_TXN_RESULT") == 52
           and d.get("PC_NETGAME_MSG_TXN_RESERVED_53") == 53 and d.get("PC_NETGAME_MSG_TXN_RESERVED_54") == 54 and d.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
-          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 56)))
+          and d.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56
+          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 57)))
     enum_body = c_raw[c_raw.index("typedef enum PCNetGameMsgType {"):c_raw.index("} PCNetGameMsgType;")]
     check("W the enum comment documents that 53 and 54 are reserved for X2 (TXN_QUERY / TXN_STATUS)", "53 and 54 are reserved for X2" in enum_body and "TXN_QUERY" in enum_body)
     for t, size in (("PCNetGameTxnTag", 64), ("PCNetGameTxnCommitMsg", 72), ("PCNetGameTxnResultMsg", 76)):
@@ -92,7 +93,7 @@ def main():
     check(f"W every PC_NETGAME_TXN_* #define of the C source (reasons, dest, outcome, ring, fence) equals the net_spike_lib constant (mismatch {mism}, missing {missing}, {len(cm)} defines)",
           len(cm) >= 25 and not mism and not missing)
     names = {v: k.replace("PC_NETGAME_TXN_REASON_", "") for k, v in pyc.items() if k.startswith("PC_NETGAME_TXN_REASON_")}
-    check("W TXN_REASON_NAMES (python) lists exactly the 26 C reasons (15 + the 4 town-services reasons + the 4 shop reasons + the 3 mail reasons), same names/values", {k: v for k, v in L.TXN_REASON_NAMES.items()} == names and len(names) == 26)
+    check("W TXN_REASON_NAMES (python) lists exactly the 28 C reasons (15 + the 4 town-services reasons + the 4 shop reasons + the 3 mail reasons + the 2 mail-take reasons), same names/values", {k: v for k, v in L.TXN_REASON_NAMES.items()} == names and len(names) == 28)
     sends = re.findall(r"pc_net_send\(([^()]*(?:\([^()]*\)[^()]*)*)\)", blk)
     check("W every pc_net_send in the X1 block is RELIABLE and there is exactly one (the RESULT sender)", len(sends) == 1 and all("PC_NET_RELIABLE" in s for s in sends))
     check("W the X1 block never sends a TXN_COMMIT (client -> host only) and the host dispatcher has no TXN_RESULT handling",
@@ -101,9 +102,9 @@ def main():
     disp = func_body(c_raw, "pcnetgame_handle_host_data")
     check("W dispatch: exact size check + id, aligned memcpy into a local, then the handler (and only there)",
           re.search(r"size == sizeof\(PCNetGameTxnCommitMsg\) && data\[0\] == \(uint8_t\)PC_NETGAME_MSG_TXN_COMMIT\) \{\s*PCNetGameTxnCommitMsg tc;\s*memcpy\(&tc, data, sizeof\(tc\)\);[^\n]*\n\s*"
-                    r"if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_DONATE \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_POLICE_CLAIM \|\|\s*tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_BUY \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_SELL\) \{\s*pcnetgame_handle_host_ts_txn\(peer, &tc\);[^\n]*\n\s*\} else if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND\) \{\s*pcnetgame_handle_host_mail_txn\(peer, &tc\);[^\n]*\n\s*\} else \{\s*pcnetgame_handle_host_txn_commit\(peer, &tc\);",
+                    r"if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_DONATE \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_POLICE_CLAIM \|\|\s*tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_BUY \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_SELL\) \{\s*pcnetgame_handle_host_ts_txn\(peer, &tc\);[^\n]*\n\s*\} else if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND\) \{\s*pcnetgame_handle_host_mail_txn\(peer, &tc\);[^\n]*\n\s*\} else if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_TAKE\) \{\s*pcnetgame_handle_host_mail_take_txn\(peer, &tc\);[^\n]*\n\s*\} else \{\s*pcnetgame_handle_host_txn_commit\(peer, &tc\);",
                     disp) is not None and c.count("pcnetgame_handle_host_txn_commit(") == 2 and c.count("pcnetgame_handle_host_ts_txn(") == 2
-          and c.count("pcnetgame_handle_host_mail_txn(") == 2)  # town services: kinds 8 / 9 / 10 / 11 route to their own one-phase handler; mail milestone 1: kind 12 to the mail handler
+          and c.count("pcnetgame_handle_host_mail_txn(") == 2 and c.count("pcnetgame_handle_host_mail_take_txn(") == 2)  # town services: kinds 8 / 9 / 10 / 11 route to their own one-phase handler; mail milestone 1: kind 12 to the mail handler; mail milestone 2: kind 13 to the take handler
     check("W version policy: v8 (header), NO bump (wire_baseline expects 8), the header documents the in-place extension, and the STRICT equality checks are intact",
           wire_baseline.header_protocol_ok(h) and wire_baseline.EXPECTED_PROTOCOL_VERSION == 8 and "VERSION POLICY (X1" in h and "EXTENDED IN PLACE" in h
           and "NO version" in h and "STRICT equality" in h and "if (version != PC_NETGAME_PROTOCOL_VERSION) {" in c
@@ -183,7 +184,7 @@ def main():
     check("H a push in flight is restarted at the new rev: 'if (st->rec_push_active) pcnetgame_rec_start_push(peer, idx, st->rec_push_kind)' is the last statement",
           hd.rstrip().endswith("if (st->rec_push_active) {\n        pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);\n    }"))
     check("H the extractions exist and are shared: validate_inventory (D3 upload + txn), stale_push (D3 upload + txn), cown_digest (txn + D3 client)",
-          c.count("pcnetgame_rec_validate_inventory(") >= 4 and c.count("pcnetgame_rec_stale_push(") == 7 and c.count("pcnetgame_crec_cown_digest(") >= 4  # X3: + the grant handler's STALE_IMAGE push; town services: + the TS handler's; mail milestone 1: + the mail handler's two (stale base, stale letter)
+          c.count("pcnetgame_rec_validate_inventory(") >= 4 and c.count("pcnetgame_rec_stale_push(") == 8 and c.count("pcnetgame_crec_cown_digest(") >= 4  # X3: + the grant handler's STALE_IMAGE push; town services: + the TS handler's; mail milestone 1: + the mail handler's two (stale base, stale letter); mail milestone 2: + the take handler's one (stale base; a stale mailbox letter re-pushes the MAILBOX_LETTER instead)
           and "static uint32_t pcnetgame_crec_cown_digest" in blk and "static uint32_t pcnetgame_crec_cown_digest" not in c_raw[c_raw.index("===== D3 CLIENT BEGIN"):])
 
     # ------------------------------------------------------------------ S: single sanctioned writers
@@ -343,7 +344,7 @@ def main():
           "#define PC_NETGAME_TXN_RESEND_MS    2000u" in c_raw and "(uint32_t)(now - s_ctxn.sent_ms) >= PC_NETGAME_TXN_RESEND_MS" in tk
           and "memset(&s_ctxn" not in tk and "s_ctxn.state = PC_NETGAME_CTXN_FREE" not in tk and "CONFIRM" not in tk
           and "s_client_link != PC_NETGAME_LINK_READY" in tk and "if (pcnetgame_txn_tick()) { /* X1b" in c_raw
-          and c.count("memset(&s_ctxn, 0, sizeof(s_ctxn))") == 7)  # X3: session reset, begin, begin_grant, cancel_queued, a matched result; town services: + ts_begin; mail milestone 1: + pcnetgame_mail_tick (begins the kind-12 txn)
+          and c.count("memset(&s_ctxn, 0, sizeof(s_ctxn))") == 8)  # X3: session reset, begin, begin_grant, cancel_queued, a matched result; town services: + ts_begin; mail milestone 1: + pcnetgame_mail_tick (begins the kind-12 txn); mail milestone 2: + pc_net_game_mail_take_step (begins the kind-13 txn)
     check("C a QUEUED txn (nothing ever on the wire) may be cancelled with an ABORT; that path is unreachable once SENT (cancel_queued is called only from try_send, which returns first unless QUEUED)",
           "if (T->state != PC_NETGAME_CTXN_QUEUED) {" in ts
           and all("pcnetgame_txn_cancel_queued(" not in func_body(c, n) for n in ("pcnetgame_txn_tick", "pcnetgame_handle_client_txn_result", "pcnetgame_txn_apply_applied")))
@@ -449,7 +450,8 @@ def main():
           sorted(fires) == sorted(["PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_FAIL_WORLD",
                                    "PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_EXPIRE", "PC_TXN_FAULT_DROP_RESULT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT",
                                    "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT",
-                                   "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"])  # town services: + one site each in the TS handler; mail milestone 1: + one each in the mail handler
+                                   "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT",
+                                   "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"])  # town services: + one site each in the TS handler; mail milestone 1: + one each in the mail handler; mail milestone 2: + one each in the take handler
           and len(re.findall(r"pcnetgame_txn_fault_fire\(PC_TXN_FAULT_", blk)) == 5
           and sorted(re.findall(r"pcnetgame_txn_fault_fire\((PC_TXN_FAULT_\w+)\)", x3blk)) == ["PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"]
           and "getenv" not in blk and "getenv" not in x3blk and "g_pc_txn_fault" not in strip_comments(c_raw[:b]))
