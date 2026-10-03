@@ -46,6 +46,7 @@ import socket
 import struct
 import subprocess
 import time
+import weakref
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -686,6 +687,7 @@ class TransportClient:
         """Vanish WITHOUT a DISCONNECT (like a crashed process): stop pumping and close the socket.
         The host keeps this peer's slot until its PCNET_TIMEOUT (5 s)."""
         self.state = self.STATE_CLOSED
+        self._abandoned_at = time.monotonic()  # next_default_player(): its resident stays bound host-side until the timeout
         self.hub.unregister(self)
         if self.sock is not None:
             try:
@@ -1423,11 +1425,13 @@ ZERO_PLAYER = DEFAULT_PLAYER  # phase-1 name kept for compatibility
 PROBE_TOWN = TownIdentity(b"NOTOWN\x00\x00", 0xFFFF, 0xDEADBEEF)  # deliberately wrong: the host must REJECT it
 
 
-def build_identity(town=ZERO_TOWN, player=DEFAULT_PLAYER, protocol_version=None):
+def build_identity(town=ZERO_TOWN, player=None, protocol_version=None):
     """v2 IDENTITY: u8 type; u8 has_save; u16 res; u32 protocol_version; name[8]; land[8]; u16
     player_id; u16 land_id; u32 terrain_hash."""
     if protocol_version is None:
         protocol_version = PC_NETGAME_PROTOCOL_VERSION
+    if player is None:
+        player = DEFAULT_PLAYER  # looked up at CALL time: _init_default_player() below may replace it
     return struct.pack(IDENTITY_FMT, PC_NETGAME_MSG_IDENTITY, player.has_save & 0xFF, 0, protocol_version & U32_MASK,
                        bytes(player.player_name)[:8].ljust(8, b"\x00"),
                        bytes(town.land_name)[:8].ljust(8, b"\x00"),
@@ -1593,7 +1597,7 @@ class FakeClient(TransportClient):
         self.host_ip = host_ip
         self.port = int(port)
         self.town = town
-        self.player = player or DEFAULT_PLAYER
+        self.player = player or next_default_player(self)
         self.context_flags = context_flags
         self.wait_snapshot = wait_snapshot
         self.assigned_peer_id = None
@@ -2039,7 +2043,8 @@ def probe_host_town(host_ip, port, hub=None, timeout=PROBE_TIMEOUT_S):
     Sends IDENTITY claiming the deliberately wrong PROBE_TOWN; a v2 host answers with the 24-byte
     REJECT(LAND_MISMATCH) carrying its own town and disconnects us. (If the host ever ACKed the
     probe, its IDENTITY_ACK carries the same identity.) Raises RuntimeError otherwise."""
-    c = FakeClient("town-probe", host_ip, port, town=PROBE_TOWN, hub=hub, context_flags=None, wait_snapshot=False)
+    c = FakeClient("town-probe", host_ip, port, town=PROBE_TOWN, player=DEFAULT_PLAYER, hub=hub, context_flags=None,
+                   wait_snapshot=False)
     try:
         c.connect(timeout=3.0)
         c.send_identity(town=PROBE_TOWN)
@@ -2478,6 +2483,143 @@ def require_test_bin_dir():
               "Set NET_SPIKE_GAME_BIN to an absolute path of a test copy (e.g. pc\\build64\\bin_talkfix), or set "
               "NET_SPIKE_ALLOW_LIVE_BIN=1 to override explicitly." % LIVE_GAME_BIN_DIR, file=sys.stderr)
         sys.exit(2)
+
+
+# --- M9 identity Stage 1A: resident identities of the TEST COPY's save ---------------------------------------------
+# Since Stage 1A the host REFUSES an IDENTITY that does not match one of ITS OWN saved residents (and refuses the
+# host's own resident and an already-connected resident). The old arbitrary default fake identity ("FAKECLI") would be
+# refused, so the default FakeClient identity is now a REAL resident of the host's save. Test-only: the residents are
+# parsed READ-ONLY from <bin dir>/save/card_a/DobutsunomoriP_MURA.gci of the TEST COPY (NET_SPIKE_GAME_BIN); the LIVE
+# bin dir is never read (it is refused here), and nothing is ever written. Layout: 0x40 CARDDir header, Save_t at
+# 0x26000, private_data[4] at +0x20, stride 0x2440 (Private_c), PersonalID_c first (name[8], land[8], BE u16 player_id,
+# BE u16 land_id), Private_c.exists at +0x1086. Wire constants are untouched.
+SAVE_GCI_REL = os.path.join("save", "card_a", "DobutsunomoriP_MURA.gci")
+_GCI_PRIVATE_BASE = 0x40 + 0x26000 + 0x20
+_GCI_PRIVATE_STRIDE = 0x2440
+_GCI_PRIVATE_EXISTS = 0x1086
+PLAYER_NUM = 4
+TEST_HOST_RESIDENT = int(os.environ.get("NET_SPIKE_HOST_RESIDENT", "0"))  # the resident the test host bootstraps (--bootstrap-resident N)
+
+
+def read_test_save_residents(bin_dir=None):
+    """[(slot, PlayerIdentity, exists)] for the four resident records of the test copy's save, or [] when the save is
+    absent/unreadable or the bin dir is the LIVE one (never read)."""
+    bd = bin_dir or GAME_BIN_DIR
+    norm = lambda p: os.path.normcase(os.path.realpath(os.path.abspath(p)))
+    if norm(bd) == norm(LIVE_GAME_BIN_DIR):
+        return []
+    try:
+        with open(os.path.join(bd, SAVE_GCI_REL), "rb") as f:
+            f.seek(_GCI_PRIVATE_BASE)
+            raw = f.read(_GCI_PRIVATE_STRIDE * PLAYER_NUM)
+    except OSError:
+        return []
+    if len(raw) < _GCI_PRIVATE_STRIDE * PLAYER_NUM:
+        return []
+    out = []
+    for i in range(PLAYER_NUM):
+        o = i * _GCI_PRIVATE_STRIDE
+        name = raw[o:o + 8]
+        pid, land_id = struct.unpack(">HH", raw[o + 16:o + 20])
+        exists = raw[o + _GCI_PRIVATE_EXISTS]
+        if land_id == 0xFFFF:
+            continue  # empty slot
+        out.append((i, PlayerIdentity(name, pid, 1), bool(exists)))
+    return out
+
+
+def resident_player(slot, bin_dir=None):
+    """PlayerIdentity of resident `slot` of the test copy's save (raises LookupError when unavailable)."""
+    for i, ident, _ex in read_test_save_residents(bin_dir):
+        if i == slot:
+            return ident
+    raise LookupError(f"resident slot {slot} not found in the test save ({SAVE_GCI_REL}); is NET_SPIKE_GAME_BIN a test copy?")
+
+
+def resident_land(bin_dir=None):
+    """(land_name bytes, land_id) of the test copy's town (PersonalID land fields of resident 0)."""
+    bd = bin_dir or GAME_BIN_DIR
+    norm = lambda p: os.path.normcase(os.path.realpath(os.path.abspath(p)))
+    if norm(bd) == norm(LIVE_GAME_BIN_DIR):
+        raise LookupError("resident_land: refusing to read the LIVE bin dir's save")
+    with open(os.path.join(bd, SAVE_GCI_REL), "rb") as f:
+        f.seek(_GCI_PRIVATE_BASE)
+        raw = f.read(20)
+    return raw[8:16], struct.unpack(">H", raw[18:20])[0]
+
+
+def _init_default_player():
+    """Default fake identity := the first existing resident that is not the host's own (TEST_HOST_RESIDENT). Only when
+    NET_SPIKE_GAME_BIN names a test copy whose save can be read; otherwise the legacy arbitrary identity stays (a host
+    started from the live bin dir is never targeted by tests -- require_test_bin_dir())."""
+    global DEFAULT_PLAYER, ZERO_PLAYER
+    if "NET_SPIKE_GAME_BIN" not in os.environ:
+        return
+    for i, ident, exists in read_test_save_residents():
+        if exists and i != TEST_HOST_RESIDENT:
+            DEFAULT_PLAYER = ident
+            ZERO_PLAYER = ident
+            return
+
+
+_init_default_player()
+
+_default_player_alloc = []  # [(resident slot, weakref to the FakeClient it was handed to, allocation sequence number)]
+_default_player_seq = [0]
+ABANDON_HOLD_S = 6.0  # host transport silence timeout (PCNET_TIMEOUT ~5 s) + margin
+
+
+def reset_default_player_allocator():
+    """Forget every allocation (call at the top of a test's run() if it must start from the first non-host resident)."""
+    del _default_player_alloc[:]
+
+
+def next_default_player(client=None):
+    """Per-process allocator for FakeClient's DEFAULT identity (an explicit `player=` argument always wins). Hands out
+    DISTINCT existing non-host residents of the TEST COPY's save: a resident is skipped while the FakeClient it was last
+    handed to is still open (state != CLOSED, i.e. IDLE/PENDING/CONNECTED; close()/disconnect()/abandon() free it), and
+    among the free ones the least recently handed out wins (so a just-disconnected resident is reused last, giving the
+    host time to release its binding). A resident whose client was abandon()ed (silent vanish, the host keeps the
+    binding until its ~5 s transport timeout) counts as held for ABANDON_HOLD_S; if that is all that stands in the way the
+    allocator pumps (pump_sleep) until the host has released it. Env NET_SPIKE_DEFAULT_RESIDENT=<slot> makes that slot
+    the first choice (used by a test that starts a subprocess while its own clients hold other residents). If all are held by OPEN clients the least recently used
+    one is returned anyway (a genuine "more simultaneous clients than residents" situation -- the host will refuse it,
+    which is the correct behaviour).
+    With the 2-resident bin_talkfix save (one non-host resident) this is exactly the old single DEFAULT_PLAYER; with the
+    4-resident fixture (make_four_resident_fixture.py -> pc/build64/bin_fixture4, host = resident 0) up to three clients can
+    be connected at the same time (residents 1, 2, 3). Outside a test copy (NET_SPIKE_GAME_BIN unset / unreadable save)
+    it returns DEFAULT_PLAYER. Test-only: no wire or production effect; duplicate-claim tests pass an explicit `player=`."""
+    if "NET_SPIKE_GAME_BIN" not in os.environ:
+        return DEFAULT_PLAYER
+    cands = [(i, ident) for i, ident, ex in read_test_save_residents() if ex and i != TEST_HOST_RESIDENT]
+    if not cands:
+        return DEFAULT_PLAYER
+    preferred = int(os.environ.get("NET_SPIKE_DEFAULT_RESIDENT", "-1"))  # a parent test steering a subprocess to a spare resident
+    while True:
+        now = time.monotonic()
+        last = {}  # slot -> (busy, release_time or None, seq) of its most recent allocation
+        for slot, ref, seq in _default_player_alloc:
+            c = ref()
+            ab = getattr(c, "_abandoned_at", None) if c is not None else None
+            hold_until = (ab + ABANDON_HOLD_S) if ab is not None and now < ab + ABANDON_HOLD_S else None
+            open_ = c is not None and getattr(c, "state", None) != TransportClient.STATE_CLOSED
+            last[slot] = (open_ or hold_until is not None, hold_until if not open_ else None, seq)
+        free = [(0 if i == preferred else 1, last.get(i, (False, None, -1))[2], i, ident) for i, ident in cands
+                if not last.get(i, (False, None, -1))[0]]
+        if free:
+            k = min(free)
+            pick = (k[1], k[2], k[3])
+            break
+        waits = [last[i][1] for i, _ in cands if last[i][1] is not None]
+        if not waits:  # every resident is held by an open client: more simultaneous clients than residents
+            pick = min((last[i][2], i, ident) for i, ident in cands)
+            break
+        # a resident is only held by an abandoned (silent) client: the host frees it at its transport timeout; wait for that
+        pump_sleep(max(0.05, min(waits) - now + 0.3))
+    _default_player_seq[0] += 1
+    if client is not None:
+        _default_player_alloc.append((pick[1], weakref.ref(client), _default_player_seq[0]))
+    return pick[2]
 
 
 class HostProcess:

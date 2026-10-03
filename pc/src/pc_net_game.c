@@ -431,7 +431,7 @@ typedef enum PCNetGameMsgType {
 
 typedef enum PCNetGameRejectReason {
     PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1, /* 8-byte PCNetGameRejectMsg (version-stable form) */
-    PC_NETGAME_REJECT_SERVER_FULL       = 2, /* reserved, never sent */
+    PC_NETGAME_REJECT_SERVER_FULL       = 2, /* 8-byte form; M9 Stage 1A: identity unavailable (own/connected/ambiguous) */
     PC_NETGAME_REJECT_LAND_MISMATCH     = 3, /* v2: 24-byte PCNetGameRejectTownMsg (host town identity) */
     PC_NETGAME_REJECT_NO_SAVE           = 4, /* v2: 24-byte form; IDENTITY had has_save == 0 */
 } PCNetGameRejectReason;
@@ -2650,6 +2650,19 @@ typedef struct PCNetGameHostPeerState {
     uint8_t              ready_land_name[PC_NETGAME_LAND_LEN];
     uint16_t             ready_player_id;
     uint16_t             ready_land_id;
+    /* M9 identity Stage 1A: the HOST-DERIVED resident binding of this peer, set only at READY by
+     * pcnetgame_host_process_identity() from the host's OWN Save_Get(private_data[]) (never from
+     * anything the peer claims except the PersonalID it is matched with). bound_valid != 0 <=> the
+     * peer is READY and bound_resident_idx (0..PLAYER_NUM-1) is the resident record it is bound to.
+     * It is distinct from the transport slot (index into this array), assigned_peer_id (== slot),
+     * the claimed PLAYER_CONTEXT player_no and the PersonalID claim. Cleared (bound_valid = 0,
+     * bound_resident_idx = -1) by the same memset in pcnetgame_reset_all_host_peer_state() that
+     * clears everything else, i.e. on connect, disconnect, reject, drop and timeout. */
+    int                  bound_valid;
+    int                  bound_resident_idx;
+    PersonalID_c         bound_pid; /* the host's saved PersonalID of that resident AT BIND TIME (re-validation) */
+    int                  ctx_player_no_warned; /* PLAYER_CONTEXT player_no mismatch warned once per connection */
+    int                  ctx_clamp_logged;     /* PLAYER_CONTEXT clamp notice logged once per connection */
     /* snapshot progress */
     int                  snap_active;
     int                  snap_stage;      /* 0 = BEGIN next, 1 = FIELD_BLOCKs, 2 = VILLAGER_SNAPSHOT next,
@@ -4539,6 +4552,7 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
          * on PC_NET_EVENT_PEER_CONNECTED (a freshly allocated transport slot starts clean even if a
          * disconnect was somehow never observed) and on every host-initiated reject/drop. */
         memset(&s_host_peer[peer], 0, sizeof(s_host_peer[peer]));
+        s_host_peer[peer].bound_resident_idx = -1; /* M9 identity Stage 1A: no resident binding */
         /* World Ecology Stage 1: this peer's field-action dedup record -- a dead/reused peer's last
          * decision must never be replayed against a NEW connection's request_id space (request ids
          * are not shared across peers, so this cheaply avoids any chance of stale cross-peer replay). */
@@ -6122,6 +6136,8 @@ static void pcnetgame_host_closing_tick(void) {
  * (town-change branch) before that point in the file -- see s_host_tree_cut_count's own doc. */
 static void pcnetgame_reset_host_tree_cut_state(void);
 
+static void pcnetgame_host_revalidate_bound_peers(void); /* defined with the Stage 1A identity helpers */
+
 static void pcnetgame_host_world_tick(int local_ready) {
     PCNetGameTownIdentity cur;
 
@@ -6182,6 +6198,7 @@ static void pcnetgame_host_world_tick(int local_ready) {
         s_host_world_ready = 1;
         pcnetgame_format_town(&s_host_town, a, sizeof(a));
         printf("[NET][WORLD] host: world ready (%s, world_seq %u)\n", a, (unsigned)s_world_seq);
+        pcnetgame_host_revalidate_bound_peers(); /* the host's save/resident may have changed while paused */
     }
 }
 
@@ -10419,12 +10436,168 @@ static void pcnetgame_handle_client_villager_snapshot(const PCNetGameVillagerSna
            (unsigned)in->world_seq, (unsigned)in->now_npc_max);
 }
 
+/* ---- M9 identity Stage 1A: host-side identity classification --------------------------------------
+ * The ONE place that decides who a joining peer is, using the HOST's own saved resident records only.
+ * (Temporary Stage-1A rule: only a RESIDENT claim is admitted; there is no guest class yet. A later stage
+ * adds PCNETGAME_IDCLASS_GUEST here without touching the callers' structure.)
+ *
+ * What the claim is: IDENTITY carries player_name[8] + player_id + the TOWN land_name/land_id (the
+ * client sends the Save town fields, pcnetgame_build_identity_msg()). For a resident the town land
+ * fields equal its PersonalID land fields (m_private.c / pcnetgame_build_identity_msg() comment), so the
+ * claim is a full PersonalID_c and is compared with the vanilla comparator mPr_CheckCmpPersonalID()
+ * (land_id, player_id, non-null land name, non-null player name -- exactly how vanilla recognises a
+ * resident, cf. mPr_GetPrivateIdx()). A record only counts if it EXISTS: mPr_CheckPrivate() (valid land
+ * id) and Private_c.exists == TRUE (exists == FALSE is vanilla's "resident away travelling" state, see
+ * the --bootstrap-resident comment in pc_m_card.c; such a record is not an admissible resident here).
+ * The client's own player_no is never consulted.
+ *
+ *   RESIDENT  exactly one record matches; *out_idx = its index 0..PLAYER_NUM-1 (host-derived)
+ *   UNKNOWN   no record matches (a guest / foreigner / garbage claim)
+ *   AMBIGUOUS more than one record matches (two residents with identical name AND player_id; vanilla's
+ *             uniqueness check cannot prevent that, ~1/253 per pair) -- cannot be bound safely */
+typedef enum PCNetGameIdentityClass {
+    PCNETGAME_IDCLASS_RESIDENT = 0,
+    PCNETGAME_IDCLASS_UNKNOWN,
+    PCNETGAME_IDCLASS_AMBIGUOUS
+} PCNetGameIdentityClass;
+
+static PCNetGameIdentityClass pcnetgame_host_classify_identity(const PCNetGameIdentityMsg* in, int* out_idx) {
+    PersonalID_c claim;
+    Private_c* priv = Save_Get(private_data);
+    int i;
+    int matches = 0;
+    int idx = -1;
+
+    *out_idx = -1;
+    memcpy(claim.player_name, in->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(claim.land_name, in->land_name, PC_NETGAME_LAND_LEN);
+    claim.player_id = in->player_id;
+    claim.land_id = in->land_id;
+
+    for (i = 0; i < PLAYER_NUM; i++) {
+        Private_c* p = &priv[i];
+        /* NOTE: requiring exists == TRUE is STRICTER than vanilla mPr_GetPrivateIdx() (which ignores it): a resident
+         * marked away/travelling is classified UNKNOWN and refused with NO_SAVE until Stage 2 handles it. */
+        if (mPr_CheckPrivate(p) == TRUE && p->exists == TRUE && mPr_NullCheckPersonalID(&p->player_ID) == FALSE &&
+            mPr_CheckCmpPersonalID(&claim, &p->player_ID) == TRUE) {
+            matches++;
+            if (idx < 0) {
+                idx = i;
+            }
+        }
+    }
+    if (matches == 0) {
+        return PCNETGAME_IDCLASS_UNKNOWN;
+    }
+    if (matches > 1) {
+        return PCNETGAME_IDCLASS_AMBIGUOUS;
+    }
+    *out_idx = idx;
+    return PCNETGAME_IDCLASS_RESIDENT;
+}
+
+/* The resident index the HOST process itself is playing (-1 if none/foreigner): Now_Private points
+ * into Save_Get(private_data[]) for a resident (m_start_data_init.c), so the pointer identifies it;
+ * the PersonalID comparison is the fallback. */
+static int pcnetgame_host_own_resident_idx(void) {
+    Private_c* priv = Save_Get(private_data);
+    int i;
+    if (Now_Private == NULL) {
+        return -1;
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        if (&priv[i] == Now_Private) {
+            return i;
+        }
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        if (mPr_NullCheckPersonalID(&priv[i].player_ID) == FALSE &&
+            mPr_CheckCmpPersonalID(&Now_Private->player_ID, &priv[i].player_ID) == TRUE) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* The peer READY and bound to resident `idx` other than `peer` itself (-1 if none). A peer that is
+ * merely in HANDSHAKE/closing has bound_valid == 0 (reset), so only live READY peers count. */
+static int pcnetgame_host_peer_bound_to_resident(int idx, PCNetPeerId except_peer) {
+    int j;
+    for (j = 0; j < PC_NET_MAX_PEERS; j++) {
+        if (j != (int)except_peer && s_host_peer_link[j] == PC_NETGAME_LINK_READY && s_host_peer[j].bound_valid &&
+            s_host_peer[j].bound_resident_idx == idx) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+/* The PersonalID the peer was VALIDATED with at bind time (cached st->bound_pid, copied from the host save in the
+ * same place bound_valid/bound_resident_idx are set). It deliberately does NOT reread Save_Get(private_data): while
+ * the host is mid-load that array can hold another save or zeros (peers stay READY until re-validation closes
+ * them). 0 if the peer is not bound (never for a READY peer) -- callers must then ignore the request. */
+static int pcnetgame_host_bound_personal_id(PCNetPeerId peer, PersonalID_c* out) {
+    int idx;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || !s_host_peer[peer].bound_valid) {
+        return 0;
+    }
+    idx = s_host_peer[peer].bound_resident_idx;
+    if (idx < 0 || idx >= PLAYER_NUM) {
+        return 0;
+    }
+    mPr_CopyPersonalID(out, &s_host_peer[peer].bound_pid);
+    return 1;
+}
+
+/* Stage 1A refusal helper: log, send the (existing, wire-unchanged) REJECT and tear the peer down through
+ * the normal reject-and-close path. `use_no_save` selects REJECT(NO_SAVE) (the 24-byte host-town form)
+ * instead of REJECT(SERVER_FULL) (the 8-byte form) -- see the comment at the call sites. */
+static void pcnetgame_host_refuse_identity(PCNetPeerId peer, const char* why, int use_no_save) {
+    printf("[NET][IDENTITY] host: peer %d REFUSED before READY: %s\n", (int)peer, why);
+    if (use_no_save) {
+        pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject_town(peer, PC_NETGAME_REJECT_NO_SAVE, &s_host_town));
+    } else {
+        pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject(peer, PC_NETGAME_REJECT_SERVER_FULL));
+    }
+}
+
+/* M9 identity Stage 1A re-validation: bindings are made at admission, but the host's save can change while the
+ * process lives (world paused -> ready again: the host loaded another save / switched resident). Called on the
+ * !ready -> ready transition of pcnetgame_host_world_tick(). Closes (existing refuse/reject-and-close path) every
+ * READY peer whose bound resident is now the host's OWN resident, or whose saved record no longer matches the
+ * PersonalID cached at bind time or no longer exists. Nothing differs -> no effect. */
+static void pcnetgame_host_revalidate_bound_peers(void) {
+    int i;
+    int own_idx = pcnetgame_host_own_resident_idx();
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        PCNetGameHostPeerState* st = &s_host_peer[i];
+        const char* why = NULL;
+        if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || !st->bound_valid) {
+            continue;
+        }
+        if (own_idx >= 0 && st->bound_resident_idx == own_idx) {
+            why = "bound resident became the host's own resident";
+        } else if (st->bound_resident_idx < 0 || st->bound_resident_idx >= PLAYER_NUM ||
+                   Save_Get(private_data)[st->bound_resident_idx].exists != TRUE ||
+                   mPr_CheckCmpPersonalID(&st->bound_pid, &Save_Get(private_data)[st->bound_resident_idx].player_ID) != TRUE) {
+            why = "bound resident record changed or no longer exists in the host save";
+        }
+        if (why != NULL) {
+            pcnetgame_host_refuse_identity((PCNetPeerId)i, why, 0);
+        }
+    }
+}
+
 /* v2 host side: validate a parked IDENTITY against the host's own town, then either reject+drop or
  * accept (ACK -> READY -> roster -> snapshot). Only called with the host world ready. */
 static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     PCNetGameIdentityMsg in = s_host_peer[peer].pending_identity; /* copy: the reset below clears it */
     PCNetGameTownIdentity peer_town;
     char host_buf[96], peer_buf[96];
+    PCNetGameIdentityClass id_class;
+    int resident_idx = -1;
+    int own_idx;
+    int other;
 
     s_host_peer[peer].identity_pending = 0;
 
@@ -10443,6 +10616,44 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         printf("[NET] host: peer %d is in a different town (peer %s, host %s) -- rejecting (LAND_MISMATCH)\n",
                (int)peer, peer_buf, host_buf);
         pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject_town(peer, PC_NETGAME_REJECT_LAND_MISMATCH, &s_host_town));
+        return;
+    }
+
+    /* M9 identity Stage 1A: classify the claim against the HOST's own resident records BEFORE any ACK/READY.
+     * The client's player_no is not part of the claim and is never read. Reject codes (no new wire value --
+     * the REJECT reason enum is frozen in v7): "this identity is unavailable" (ambiguous, the host's own
+     * resident, already connected) reuses REJECT(SERVER_FULL), the reserved-but-unsent code, whose meaning
+     * ("no room for you") is the closest; "the host has no such resident" reuses REJECT(NO_SAVE), the 24-byte
+     * form, whose meaning ("no usable save record for this player") is the closest. The client treats every
+     * REJECT identically (log + shutdown), so neither has a behavioural downside; only the log wording is
+     * imprecise. The host-side log line carries the real reason. */
+    id_class = pcnetgame_host_classify_identity(&in, &resident_idx);
+    if (id_class == PCNETGAME_IDCLASS_AMBIGUOUS) {
+        pcnetgame_host_refuse_identity(peer, "claimed identity matches more than one resident record (ambiguous)", 0);
+        return;
+    }
+    if (id_class != PCNETGAME_IDCLASS_RESIDENT) {
+        /* Temporary Stage-1A rule: unknown identities (guests) are refused until guest admission exists. */
+        pcnetgame_host_refuse_identity(peer, "claimed identity matches no resident record of this town", 1);
+        return;
+    }
+    own_idx = pcnetgame_host_own_resident_idx();
+    if (own_idx >= 0 && resident_idx == own_idx) {
+        printf("[NET][IDENTITY] host: peer %d claims resident %d, which is the host's own active resident\n", (int)peer,
+               resident_idx);
+        pcnetgame_host_refuse_identity(peer, "claimed resident is the host's own resident", 0);
+        return;
+    }
+    other = pcnetgame_host_peer_bound_to_resident(resident_idx, peer);
+    if (other >= 0) {
+        /* No replacement policy in Stage 1A: the live connection wins, the newcomer is refused. A reconnect
+         * from a new address while the old session is still silent-but-alive (up to the transport timeout)
+         * is therefore refused until the old peer is gone -- Stage 1B decides replace-stale. A restart from
+         * the SAME ip:port reuses its transport slot (pc_net.c) and is reset on PEER_CONNECTED, so it never
+         * collides with itself (the scan excludes `peer`). */
+        printf("[NET][IDENTITY] host: peer %d claims resident %d, already bound to live peer %d\n", (int)peer,
+               resident_idx, other);
+        pcnetgame_host_refuse_identity(peer, "claimed resident is already connected on another peer", 0);
         return;
     }
 
@@ -10472,6 +10683,10 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         }
     }
     s_host_peer_link[peer] = PC_NETGAME_LINK_READY;
+    s_host_peer[peer].bound_valid = 1;
+    s_host_peer[peer].bound_resident_idx = resident_idx;
+    mPr_CopyPersonalID(&s_host_peer[peer].bound_pid, &Save_Get(private_data)[resident_idx].player_ID);
+    printf("[NET][IDENTITY] host: peer %d bound to resident %d (host-derived)\n", (int)peer, resident_idx);
     printf("[NET] host: peer %d identity OK (player_id=%u, %s) -> READY\n", (int)peer, (unsigned)in.player_id, peer_buf);
 
     /* Friendship/mail sync milestone: cache this peer's own PersonalID_c fields for the lifetime of
@@ -10568,15 +10783,65 @@ static void pcnetgame_handle_host_player_context(PCNetPeerId peer, const PCNetGa
     if (s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    st->ctx.player_no = in->player_no;
-    st->ctx.destiny_type = in->destiny_type;
-    st->ctx.flags = in->flags;
-    st->ctx.money_power = in->money_power;
-    st->ctx.goods_power = in->goods_power;
+    /* M9 identity Stage 1A: the peer's claimed player_no is NOT used for anything. ctx.player_no (read only by
+     * log lines) holds the HOST-DERIVED bound resident index; a differing claim is warned about once. */
+    st->ctx.player_no = (uint8_t)(st->bound_valid ? st->bound_resident_idx : 0);
+    if (st->bound_valid && (int)in->player_no != st->bound_resident_idx && !st->ctx_player_no_warned) {
+        st->ctx_player_no_warned = 1;
+        printf("[NET][IDENTITY] host: peer %d PLAYER_CONTEXT claims player_no=%u but is bound to resident %d -- "
+               "claim ignored\n", (int)peer, (unsigned)in->player_no, st->bound_resident_idx);
+    }
+    {
+        /* Clamp to the legal ranges before any gameplay calc reads them (sources per line):
+         *  - destiny_type: mPr_DESTINY_* enum, 0..mPr_DESTINY_NUM-1 (m_private.h); anything else -> NORMAL.
+         *  - goods_power: mPr_GetGoodsPower() returns it clamped to [mPr_GOODS_POWER_MIN, mPr_GOODS_POWER_MAX]
+         *    (-30..50, m_private.c) -- exactly the range an honest client can send.
+         *  - money_power: mPr_GetMoneyPower() clamps its low end at mPr_MONEY_POWER_MIN (-80) and has NO upper
+         *    clamp in vanilla (it is Common money_power from the house's feng-shui score plus +100 for
+         *    MONEY_LUCK, bounded only by the furniture in the house). So only the low end is clamped; every
+         *    consumer saturates a large value anyway (the money-rock swing_time is capped at 100, the
+         *    money-tree win test is already certain once money_power >= 100).
+         *  - flags: only PC_NETGAME_CTX_FLAG_IN_TOWN is defined.
+         * Valid values pass through unchanged. */
+        uint8_t destiny = in->destiny_type;
+        uint8_t flags = (uint8_t)(in->flags & PC_NETGAME_CTX_FLAG_IN_TOWN);
+        int16_t money = in->money_power;
+        int16_t goods = in->goods_power;
+        int clamped = 0;
+        if (destiny >= (uint8_t)mPr_DESTINY_NUM) {
+            destiny = (uint8_t)mPr_DESTINY_NORMAL;
+            clamped = 1;
+        }
+        if (money < (int16_t)mPr_MONEY_POWER_MIN) {
+            money = (int16_t)mPr_MONEY_POWER_MIN;
+            clamped = 1;
+        }
+        if (goods < (int16_t)mPr_GOODS_POWER_MIN) {
+            goods = (int16_t)mPr_GOODS_POWER_MIN;
+            clamped = 1;
+        } else if (goods > (int16_t)mPr_GOODS_POWER_MAX) {
+            goods = (int16_t)mPr_GOODS_POWER_MAX;
+            clamped = 1;
+        }
+        if (flags != in->flags) {
+            clamped = 1;
+        }
+        if (clamped && (g_pc_verbose || !st->ctx_clamp_logged)) {
+            st->ctx_clamp_logged = 1;
+            printf("[NET][IDENTITY] host: peer %d PLAYER_CONTEXT out-of-range values clamped: destiny %u->%u "
+                   "money %d->%d goods %d->%d flags 0x%02X->0x%02X\n", (int)peer, (unsigned)in->destiny_type,
+                   (unsigned)destiny, (int)in->money_power, (int)money, (int)in->goods_power, (int)goods,
+                   (unsigned)in->flags, (unsigned)flags);
+        }
+        st->ctx.destiny_type = destiny;
+        st->ctx.flags = flags;
+        st->ctx.money_power = money;
+        st->ctx.goods_power = goods;
+    }
     if (!st->ctx_valid || g_pc_verbose) {
         printf("[NET] host: peer %d context player_no=%u destiny=%u flags=0x%02X money=%d goods=%d\n", (int)peer,
-               (unsigned)in->player_no, (unsigned)in->destiny_type, (unsigned)in->flags, (int)in->money_power,
-               (int)in->goods_power);
+               (unsigned)st->ctx.player_no, (unsigned)st->ctx.destiny_type, (unsigned)st->ctx.flags,
+               (int)st->ctx.money_power, (int)st->ctx.goods_power);
     }
     st->ctx_valid = 1;
 }
@@ -14652,12 +14917,12 @@ static int pcnetgame_build_friendship_snapshot_entry(PCNetGameFriendshipSnapshot
 }
 
 /* Host side: FRIENDSHIP_REQUEST from a READY peer -- see mNpc_AddFriendship()'s doc comment
- * (m_npc.c) for the full contract. Resolves (find-or-create) the memory slot from the SENDING
- * PEER's own cached identity (never anything the peer's payload claims about who it is), applies
- * the SAME mNpc_AddFriendship() the host's own local interactions use, then broadcasts the result
- * to every READY client including the requester. Ignored (no reply) for a non-READY peer, an
- * out-of-range slot, an unoccupied villager slot, or if this peer's identity was somehow never
- * cached (defensive only -- ready_identity_valid is set unconditionally at READY). */
+ * (m_npc.c) for the full contract. Processed only for a READY peer with a valid host-derived binding AND only
+ * while the host world is ready (s_host_world_ready); otherwise dropped silently (fire-and-forget: the client
+ * keeps no pending state). Resolves (find-or-create) the memory slot from the CACHED validated bound_pid
+ * captured at bind time (never the client's claim, never a live private_data reread), applies the SAME
+ * mNpc_AddFriendship() the host's own local interactions use, then broadcasts the result to every READY client
+ * including the requester. Also ignored (no reply) for an out-of-range slot or an unoccupied villager slot. */
 static void pcnetgame_handle_host_friendship_request(PCNetPeerId peer, const PCNetGameFriendshipRequestMsg* in) {
     PersonalID_c pid;
     int friendship;
@@ -14665,17 +14930,24 @@ static void pcnetgame_handle_host_friendship_request(PCNetPeerId peer, const PCN
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    if (!s_host_peer[peer].ready_identity_valid) {
-        return; /* should not happen -- set unconditionally at READY */
+    if (!s_host_world_ready) {
+        /* Stage 1A hardening: same predicate the other authoritative host handlers use. The client sends this
+         * fire-and-forget (no pending state, no reply expected), and an unresolvable request is already dropped
+         * silently, so ignoring it while the host save is not loaded is safe. */
+        if (g_pc_verbose) {
+            printf("[NET][IDENTITY] host: peer %d %s ignored -- host world not ready\n", (int)peer, "FRIENDSHIP_REQUEST");
+        }
+        return;
     }
     if (in->slot >= ANIMAL_NUM_MAX) {
         return;
     }
 
-    memcpy(pid.player_name, s_host_peer[peer].ready_player_name, PC_NETGAME_NAME_LEN);
-    memcpy(pid.land_name, s_host_peer[peer].ready_land_name, PC_NETGAME_LAND_LEN);
-    pid.player_id = s_host_peer[peer].ready_player_id;
-    pid.land_id = s_host_peer[peer].ready_land_id;
+    /* M9 identity Stage 1A: the key is the HOST's own saved PersonalID of the resident this peer was validated
+     * and bound to at READY -- no longer the peer's cached IDENTITY claim (ready_*). */
+    if (!pcnetgame_host_bound_personal_id(peer, &pid)) {
+        return; /* should not happen -- a READY peer is always bound */
+    }
 
     friendship = mNpc_PcHostResolveAndApplyFriendshipDelta((int)in->slot, &pid, (int)in->delta);
     if (friendship < 0) {
@@ -14749,8 +15021,11 @@ static void pcnetgame_handle_client_friendship_snapshot_entry(const PCNetGameFri
 }
 
 /* Host side: MAIL_REQUEST from a READY peer -- see mNpc_SendMailtoNpc()'s doc comment (m_npc.c)
- * for the full contract. Ignored for a non-READY peer (defensive only; the caller already checks
- * pc_net_game_role() == CLIENT before ever sending one). */
+ * for the full contract. Processed only for a READY peer with a valid host-derived binding AND only while the
+ * host world is ready (s_host_world_ready); otherwise dropped silently (fire-and-forget: the client keeps no
+ * pending state; the caller already checks pc_net_game_role() == CLIENT before ever sending one). The host
+ * OVERWRITES any client-supplied sender PersonalID with the CACHED validated bound_pid captured at bind time
+ * (never the client's claim, never a live private_data reread) before the villager lookup. */
 static void pcnetgame_handle_host_mail_request(PCNetPeerId peer, const PCNetGameMailRequestMsg* in) {
     Mail_c mail;
     int slot;
@@ -14762,8 +15037,34 @@ static void pcnetgame_handle_host_mail_request(PCNetPeerId peer, const PCNetGame
         return;
     }
 
+    if (!s_host_world_ready) {
+        /* Stage 1A hardening: same predicate the other authoritative host handlers use. The client sends this
+         * fire-and-forget (no pending state, no reply expected), and an unresolvable request is already dropped
+         * silently, so ignoring it while the host save is not loaded is safe. */
+        if (g_pc_verbose) {
+            printf("[NET][IDENTITY] host: peer %d %s ignored -- host world not ready\n", (int)peer, "MAIL_REQUEST");
+        }
+        return;
+    }
+
     _Static_assert(sizeof(in->mail) == sizeof(Mail_c), "PCNetGameMailRequestMsg.mail size drifted from Mail_c");
     memcpy(&mail, in->mail, sizeof(mail));
+
+    /* M9 identity Stage 1A: the sender PersonalID is not taken from the payload. It is overwritten with the
+     * HOST's own saved PersonalID of the resident this peer is bound to (an honest client's value is
+     * identical -- it sends its own Now_Private->player_ID, which equals the host's record). Everything
+     * downstream (villager memory key, MAIL_DELIVERED broadcast) therefore sees the validated sender. */
+    {
+        PersonalID_c bound_pid;
+        if (!pcnetgame_host_bound_personal_id(peer, &bound_pid)) {
+            return; /* should not happen -- a READY peer is always bound */
+        }
+        if (memcmp(&mail.header.sender.personalID, &bound_pid, sizeof(bound_pid)) != 0) {
+            printf("[NET][IDENTITY] host: peer %d MAIL_REQUEST sender PersonalID differs from its bound resident %d -- "
+                   "overwritten\n", (int)peer, s_host_peer[peer].bound_resident_idx);
+        }
+        mPr_CopyPersonalID(&mail.header.sender.personalID, &bound_pid);
+    }
 
     slot = mNpc_PcApplyMailToVillagerMemory(&mail, &friendship, &letter_info, letter, sizeof(letter));
     if (slot < 0) {

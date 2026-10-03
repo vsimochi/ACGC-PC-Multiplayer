@@ -172,8 +172,15 @@ def s1(port, log_dir, check):
             ver = e.reject.expected_protocol_version
         check("V1 a protocol-version-6 client is rejected with PROTOCOL_MISMATCH", rejected)
         check("V1 the host reports required protocol version 7 (got %s)" % ver, ver == 7)
+        # the subprocess has its own default-identity allocator: steer it to a resident that neither b nor c holds
+        used = {bytes(x.player.player_name) for x in (b, c)}
+        spare = next((i for i, pl, ex in L.read_test_save_residents() if ex and i != L.TEST_HOST_RESIDENT
+                      and bytes(pl.player_name) not in used), None)
+        sub_env = dict(os.environ)
+        if spare is not None:
+            sub_env["NET_SPIKE_DEFAULT_RESIDENT"] = str(spare)
         r = subprocess.run([sys.executable, os.path.join(HERE, "test_version_mismatch.py"), "127.0.0.1", str(port)],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, env=sub_env)
         check("V1 test_version_mismatch.py passes against the booted v7 host (exit %d)" % r.returncode, r.returncode == 0)
 
         # ---- P1: restart edge on re-entry, duplicates/stale never edge --------------------------------------------
