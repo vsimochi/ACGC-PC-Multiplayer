@@ -6,6 +6,9 @@
 #include "m_private.h"
 #include "m_event.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Batch G6: pc_net_game_role() */
+#endif
 
 int fuusen_DEBUG_mode_flag;
 
@@ -49,7 +52,17 @@ extern void Balloon_chk_make_fuusen(GAME_PLAY* play) {
 
 extern void Balloon_move(GAME_PLAY* play) {
   s16 min;
-    
+
+#ifdef TARGET_PC
+  /* Batch G6: balloons are per-process (nothing replicates the actor), and a shot balloon's present is dropped
+   * by aFSN_escape through fruit_set_proc into the LOCAL field only, i.e. a phantom ITM_PRESENT the host never
+   * has. A network CLIENT therefore never spawns balloons (balloon_state stays DEAD, no actor, no drop); the
+   * host's balloon and its present (a host fg item) replicate normally. Host/solo: unchanged. */
+  if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+    return;
+  }
+#endif
+
   if (mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELDTYPE_FG) {
     return;
   }

@@ -30,7 +30,7 @@ static void Player_actor_setup_main_Ready_pitfall(ACTOR* actorx, GAME* game) {
      * vanilla and optimistic regardless of the request's outcome -- there is no grant and no resource, so
      * nothing needs to be gated on the network round trip here. A reject is reconciled later via the
      * RESULT's echoed tile value. */
-    if (pc_net_game_world_is_host_authoritative()) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
         int ux, uz;
         if (mFI_Wpos2UtNum(&ux, &uz, req_ready_pifall_p->pos)) {
             pc_net_game_request_pitfall_consume(ux, uz);

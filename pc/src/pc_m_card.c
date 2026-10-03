@@ -295,7 +295,16 @@ static void pc_save_pre_write_side_effects(int save_mode) {
 }
 
 static int pc_save_write_gci(void) {
-    return pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);
+    int ok = pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);
+    /* D3-4: the Card-A GCI is the only place a host-merged resident record becomes durable. Right after it was really written
+     * (pc_save_write_gci_to() also returns TRUE without writing when the save is not ready), the host persists the resident
+     * record lineage sidecar save/mp/records.dat (pc_net_game.c -> pc_mp_records.c; no-op unless this process is the HOST).
+     * Same (main) thread, synchronously, so the sidecar describes exactly the records the GCI just serialized; the GCI layout,
+     * checksum, backup rotation and atomic rename above are untouched. The sidecar never lives in or next to a card directory. */
+    if (ok && pc_save_ready) {
+        pc_net_game_record_after_gci_save(PC_GCI_PATH);
+    }
+    return ok;
 }
 
 static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
@@ -939,7 +948,13 @@ int mCD_InitGameStart_bg(int player_no, int card_private_idx, int start_cond, s3
                                  Now_Private->reset_count);
                     }
                 }
-                /* Arm reset code: if player quits without saving, next load detects it */
+                /* Arm reset code: if player quits without saving, next load detects it.
+                 * Batch G1: a network CLIENT never persists (F1: save dialog, periodic and shutdown
+                 * saves are all skipped), so an armed code written here could never be cleared by a
+                 * full save and Resetti would nag on every later launch. The client role is set at
+                 * boot (pc_main.c) before any save loads, so skip the arming AND the persist below
+                 * for a CLIENT. Host and single-player are unchanged. */
+                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
                 pc_set_reset_code(Now_Private);
 
                 /* GC writes the save (armed code included) back to the card
@@ -955,6 +970,7 @@ int mCD_InitGameStart_bg(int player_no, int card_private_idx, int start_cond, s3
                         OSReport("[PC] InitGameStart: reset-code persist failed\n");
                     }
                 }
+                } /* Batch G1: role != CLIENT */
             }
 
             /* Handle foreigner start conditions */

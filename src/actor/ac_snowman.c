@@ -172,7 +172,7 @@ static void aSNOWMAN_Set_PSnowman_info(SNOWMAN_ACTOR* actor) {
          * runs), the host never learns this build's completion-time dates, which were already written
          * locally back at MSG_2209 time (see aSMAN_process_combine_head_jump_init(), left completely
          * unmodified/local) -- documented, not engineered around. */
-        if (pc_net_game_world_is_host_authoritative()) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
             int ut_x, ut_z;
 
             if (mFI_Wpos2UtNum(&ut_x, &ut_z, sman_info.pos)) {

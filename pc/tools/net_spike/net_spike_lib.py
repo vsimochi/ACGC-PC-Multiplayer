@@ -1065,7 +1065,110 @@ PC_NETGAME_MSG_PLAYER_ACTION = 46
 PC_NETGAME_PLAYER_ACTION_KIND_PICKUP = 1
 PLAYER_ACTION_FMT = "<BBBBBBHH"  # msg_type, net_player_id, kind, flags, ut_x, ut_z, item, seq
 
-PC_NETGAME_PROTOCOL_VERSION = 7  # M9-C: v6 NPC_TALK (id 45); v7 MOVE action_state (main index + entry counter), same 28-byte layout, + PLAYER_ACTION (id 46)
+PC_NETGAME_PROTOCOL_VERSION = 8  # M9-C: v6 NPC_TALK (id 45); v7 MOVE action_state (main index + entry counter), same 28-byte layout, + PLAYER_ACTION (id 46); v8 (D3): RECORD_HELLO/BEGIN/CHUNK/ACK (ids 47-50) + (X1, unreleased: extended in place) TXN_COMMIT/TXN_RESULT (ids 51-52)
+PROTOCOL_VERSION = PC_NETGAME_PROTOCOL_VERSION  # the ONE source of truth for tests (wire_baseline.EXPECTED_PROTOCOL_VERSION audits it)
+
+# --- D3 (protocol v8): host-mirrored resident record, messages 47..50 (all RELIABLE) ---
+PC_NETGAME_MSG_RECORD_HELLO = 47   # C->H 24 B
+PC_NETGAME_MSG_RECORD_BEGIN = 48   # both 28 B
+PC_NETGAME_MSG_RECORD_CHUNK = 49   # both 1012 B
+PC_NETGAME_MSG_RECORD_ACK = 50     # both 20 B
+PC_NETGAME_REC_SIZE = 0x2440
+PC_NETGAME_REC_CHUNK_DATA = 1000
+PC_NETGAME_REC_CHUNK_COUNT = 10
+PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST = 0x01
+PC_NETGAME_REC_KIND_PUSH_FULL = 1
+PC_NETGAME_REC_KIND_PUSH_HOSTFIELDS = 2
+PC_NETGAME_REC_KIND_UPLOAD = 3
+PC_NETGAME_REC_KIND_MIGRATE_UPLOAD = 4
+PC_NETGAME_REC_ACK_APPLIED = 0
+PC_NETGAME_REC_ACK_STALE_BASE = 1
+PC_NETGAME_REC_ACK_BAD_DIGEST = 2
+PC_NETGAME_REC_ACK_BAD_SHAPE = 3
+PC_NETGAME_REC_ACK_INVALID_FIELD = 4
+PC_NETGAME_REC_ACK_RATE_LIMITED = 5
+PC_NETGAME_REC_ACK_NOT_BOUND = 6
+PC_NETGAME_REC_ACK_BUSY = 7
+PC_NETGAME_REC_ACK_MIGRATE_REQUEST = 8
+PC_NETGAME_REC_ACK_ADOPT_DEFERRED = 9
+PC_NETGAME_REC_ACK_ADOPT_FAILED = 10
+PC_NETGAME_REC_FIELD_PLAYER_ID = 1
+PC_NETGAME_REC_FIELD_EXISTS = 2
+PC_NETGAME_REC_FIELD_WALLET = 3
+PC_NETGAME_REC_FIELD_BANK = 4
+PC_NETGAME_REC_FIELD_LOAN = 5
+PC_NETGAME_REC_FIELD_POCKET = 6
+PC_NETGAME_REC_FIELD_ITEM_COND = 7
+PC_NETGAME_REC_FIELD_EQUIPMENT = 8
+PC_NETGAME_REC_FIELD_ORG_TABLE = 9
+PC_NETGAME_REC_FIELD_CATALOG = 10   # detail high byte = catalog order index
+PC_NETGAME_REC_FIELD_LOTTO = 11
+# BAD_SHAPE detail codes: 1 total_size, 2 chunk_count, 3 host-only/unknown BEGIN kind, 4 HELLO record_size, 5 BEGIN.rsv != 0,
+# 6 HELLO _reserved0 / undefined flag bits. (A host counts a client RECORD_ACK status other than 0/9/10 as a violation.)
+RECORD_HELLO_FMT = "<BBHIIIII"      # PCNetGameRecordHelloMsg, 24 bytes
+RECORD_BEGIN_FMT = "<BBBBIIIIII"    # PCNetGameRecordBeginMsg, 28 bytes
+RECORD_CHUNK_FMT = "<BBHIHH1000s"   # PCNetGameRecordChunkMsg, 1012 bytes
+RECORD_ACK_FMT = "<BBHIIII"         # PCNetGameRecordAckMsg, 20 bytes
+
+# --- X1 (protocol v8, UNRELEASED: ids 51/52 extend v8 in place, no version bump): host-transactional PICKUP/DROP/BURY commit ---
+# TXN_COMMIT (C->H, RELIABLE, 72 B = 8 B header + the reusable 64 B PCNetGameTxnTag) answers an accepted provisional
+# PICKUP/DROP/BURY RESULT; TXN_RESULT (H->C, RELIABLE, 76 B) is the host's answer to EVERY COMMIT (APPLIED + the post-image, or
+# REJECTED + a reason). 53/54 are reserved for X2 (TXN_QUERY / TXN_STATUS). The three pocket arrays (15 x u16) are native LE.
+PC_NETGAME_MSG_TXN_COMMIT = 51   # C->H 72 B
+PC_NETGAME_MSG_TXN_RESULT = 52   # H->C 76 B
+PC_NETGAME_TXN_DEST_NONE = 0
+PC_NETGAME_TXN_DEST_POCKET = 1
+PC_NETGAME_TXN_DEST_WALLET = 2
+PC_NETGAME_TXN_SLOT_WALLET = 0xFF
+PC_NETGAME_TXN_FLAG_EXCHANGE = 0x01   # X3: TXN_COMMIT kind DROP only (the dropped slot takes aux_item / aux_cond, a catch replacement)
+PC_NETGAME_TXN_OUTCOME_APPLIED = 0
+PC_NETGAME_TXN_OUTCOME_REJECTED = 1
+PC_NETGAME_TXN_REASON_NONE = 0
+PC_NETGAME_TXN_REASON_EXPIRED = 1
+PC_NETGAME_TXN_REASON_NOT_PENDING = 2
+PC_NETGAME_TXN_REASON_WORLD_CHANGED = 3
+PC_NETGAME_TXN_REASON_NOT_SYNCED = 4
+PC_NETGAME_TXN_REASON_NOT_BOUND = 5
+PC_NETGAME_TXN_REASON_FENCED = 6
+PC_NETGAME_TXN_REASON_CONFLICT = 7
+PC_NETGAME_TXN_REASON_BAD_IMAGE = 8
+PC_NETGAME_TXN_REASON_PRECOND = 9
+PC_NETGAME_TXN_REASON_STALE_IMAGE = 10
+PC_NETGAME_TXN_REASON_BAD_SHAPE = 11
+PC_NETGAME_TXN_REASON_BUSY = 12
+PC_NETGAME_TXN_REASON_FAULT = 13
+PC_NETGAME_TXN_REASON_REPLAYED = 14   # informational, on APPLIED replays
+PC_NETGAME_TXN_RING = 16              # host journal entries per resident
+PC_NETGAME_TXN_FENCED_NUM = 4         # fenced nonces remembered per resident
+TXN_TAG_FMT = "<IIBBHBBHII15HHII"       # PCNetGameTxnTag, 64 bytes
+TXN_COMMIT_FMT = "<BBHIIIBBHBBHII15HHII"  # PCNetGameTxnCommitMsg, 72 bytes
+TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHII"  # PCNetGameTxnResultMsg, 76 bytes
+TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED", 4: "NOT_SYNCED", 5: "NOT_BOUND", 6: "FENCED",
+                    7: "CONFLICT", 8: "BAD_IMAGE", 9: "PRECOND", 10: "STALE_IMAGE", 11: "BAD_SHAPE", 12: "BUSY", 13: "FAULT",
+                    14: "REPLAYED"}
+
+# --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
+# CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
+# FIELD_ACTION_REQUEST means "no grant" (every non-granting kind; DIG_HOLE / DIG_SHINE without a bonus); DIG_BURIED and CATCH need a tag.
+PC_NETGAME_MSG_FIELD_ACTION_REQUEST = 29  # C->H 76 B (X3)
+PC_NETGAME_MSG_FIELD_ACTION_RESULT = 30   # H->C 12 B
+PC_NETGAME_MSG_CATCH_REQUEST = 41         # C->H 84 B (X3)
+PC_NETGAME_MSG_CATCH_RESULT = 42          # H->C 12 B
+PC_NETGAME_TXN_KIND_DIG_BURIED = 4
+PC_NETGAME_TXN_KIND_DIG_HOLE = 5
+PC_NETGAME_TXN_KIND_DIG_SHINE = 6
+PC_NETGAME_TXN_KIND_CATCH = 7
+FIELD_ACTION_REQUEST_FMT = "<BBBBIBBHIIBBHBBHII15HHII"  # PCNetGameFieldActionRequestMsg, 76 bytes (12 B header + the 64 B tag)
+FIELD_ACTION_RESULT_FMT = "<BBBBIHBB"                   # PCNetGameFieldActionResultMsg, 12 bytes
+CATCH_REQUEST_FMT = "<B3xIIIiIIBBHBBHII15HHII"          # PCNetGameCatchRequestMsg, 84 bytes (20 B header + the 64 B tag)
+CATCH_RESULT_FMT = "<BBHII"                             # PCNetGameCatchResultMsg, 12 bytes
+FIELD_ACTION_KIND_DIG_BURIED = 1
+FIELD_ACTION_KIND_MONEY_ROCK_HIT = 2
+FIELD_ACTION_KIND_DIG_HOLE = 5
+FIELD_ACTION_KIND_DIG_SHINE = 8
+TXN_KIND_NAMES = {1: "PICKUP", 2: "DROP", 3: "BURY", 4: "DIG_BURIED", 5: "DIG_HOLE", 6: "DIG_SHINE", 7: "CATCH"}
+assert struct.calcsize(FIELD_ACTION_REQUEST_FMT) == 76 and struct.calcsize(CATCH_REQUEST_FMT) == 84
+assert struct.calcsize(FIELD_ACTION_RESULT_FMT) == 12 and struct.calcsize(CATCH_RESULT_FMT) == 12
 
 PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1  # 8-byte REJECT
 PC_NETGAME_REJECT_SERVER_FULL = 2        # reserved, never sent
@@ -1371,6 +1474,58 @@ PLAYER_ACTION_SPEC = build_msg_spec(
     PC_NETGAME_MSG_PLAYER_ACTION, PLAYER_ACTION_FMT,
     ["msg_type", "net_player_id", "kind", "flags", "ut_x", "ut_z", "item", "seq"], "PlayerActionFields")
 assert PLAYER_ACTION_SPEC.size == 10
+RECORD_HELLO_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_RECORD_HELLO, RECORD_HELLO_FMT,
+    ["msg_type", "flags", "reserved0", "record_size", "local_digest", "last_host_session", "last_epoch", "last_rev"],
+    "RecordHelloFields")
+RECORD_BEGIN_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_RECORD_BEGIN, RECORD_BEGIN_FMT,
+    ["msg_type", "kind", "chunk_count", "rsv", "xfer_id", "epoch", "rev", "total_size", "digest", "host_session"],
+    "RecordBeginFields")
+RECORD_CHUNK_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_RECORD_CHUNK, RECORD_CHUNK_FMT,
+    ["msg_type", "chunk_idx", "length", "xfer_id", "offset", "rsv", "data"], "RecordChunkFields")
+RECORD_ACK_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_RECORD_ACK, RECORD_ACK_FMT,
+    ["msg_type", "status", "detail", "xfer_id", "epoch", "rev", "host_session"], "RecordAckFields")
+assert RECORD_HELLO_SPEC.size == 24 and RECORD_BEGIN_SPEC.size == 28
+assert RECORD_CHUNK_SPEC.size == 1012 and RECORD_ACK_SPEC.size == 20
+assert max(RECORD_HELLO_SPEC.size, RECORD_BEGIN_SPEC.size, RECORD_CHUNK_SPEC.size, RECORD_ACK_SPEC.size) <= PC_NET_MAX_PAYLOAD
+assert PC_NETGAME_REC_CHUNK_COUNT * PC_NETGAME_REC_CHUNK_DATA >= PC_NETGAME_REC_SIZE > (PC_NETGAME_REC_CHUNK_COUNT - 1) * PC_NETGAME_REC_CHUNK_DATA
+
+class TxnSpec(MsgSpec):
+    """MsgSpec of an X1 message whose 15-entry u16 pocket array (struct items 14..28) is collapsed into ONE tuple field."""
+
+    __slots__ = ()
+    POCKET_AT = 14
+
+    def decode(self, payload):
+        raw = struct.unpack_from(self.fmt, payload, 0)
+        a = self.POCKET_AT
+        return self.tuple_cls._make(raw[:a] + (tuple(raw[a:a + 15]),) + raw[a + 15:])
+
+
+def build_txn_spec(msg_type, fmt, field_names, type_name):
+    size = struct.calcsize(fmt)
+    tuple_cls = namedtuple(type_name, field_names)
+    raw = struct.unpack(fmt, b"\x00" * size)
+    if len(raw) - 14 != len(field_names):
+        raise AssertionError(f"build_txn_spec({msg_type}): fmt unpacks to {len(raw)} items, 15 collapse into 1 -> expected "
+                             f"{len(raw) - 14} names, got {len(field_names)}")
+    return TxnSpec(msg_type, fmt, size, tuple_cls, True, None)
+
+
+TXN_COMMIT_SPEC = build_txn_spec(
+    PC_NETGAME_MSG_TXN_COMMIT, TXN_COMMIT_FMT,
+    ["msg_type", "kind", "rsv0", "request_id", "txn_nonce", "txn_seq", "dest", "slot", "item", "flags", "aux_cond", "aux_item",
+     "base_epoch", "base_rev", "pre_pockets", "tag_rsv0", "pre_conds", "pre_wallet"], "TxnCommitFields")
+TXN_RESULT_SPEC = build_txn_spec(
+    PC_NETGAME_MSG_TXN_RESULT, TXN_RESULT_FMT,
+    ["msg_type", "kind", "outcome", "reason", "request_id", "txn_nonce", "txn_seq", "host_session", "epoch", "rev", "cdig",
+     "dest", "slot", "item", "post_pockets", "rsv0", "post_conds", "post_wallet"], "TxnResultFields")
+assert struct.calcsize(TXN_TAG_FMT) == 64 and TXN_COMMIT_SPEC.size == 72 and TXN_RESULT_SPEC.size == 76
+assert max(TXN_COMMIT_SPEC.size, TXN_RESULT_SPEC.size) <= PC_NET_MAX_PAYLOAD
+assert struct.calcsize(TXN_COMMIT_FMT) == 8 + struct.calcsize(TXN_TAG_FMT)
 
 GAME_SPECS = {
     s.msg_type: s
@@ -1379,7 +1534,8 @@ GAME_SPECS = {
               SNAPSHOT_BEGIN_SPEC, FIELD_BLOCK_SPEC, SNAPSHOT_END_SPEC, WORLD_META_SPEC, RESYNC_REQUEST_SPEC,
               INTERACT_CONFIRM_SPEC, VILLAGER_ARRIVAL_SPEC, VILLAGER_DEPARTURE_SPEC, VILLAGER_SNAPSHOT_SPEC,
               FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
-              MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC)
+              MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC, RECORD_HELLO_SPEC,
+              RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
@@ -1511,6 +1667,54 @@ def build_interact_confirm(kind, request_id, outcome=CONFIRM_OUTCOME_COMMIT, rea
                        reason & 0xFF, request_id & U32_MASK)
 
 
+def build_txn_commit(kind, request_id, nonce, seq, dest, slot, item, base_epoch, base_rev, pre_pockets, pre_conds, pre_wallet,
+                     flags=0, aux_cond=0, aux_item=0, rsv0=0, tag_rsv0=0):
+    """The 72-byte TXN_COMMIT (X1). pre_pockets = 15 NATIVE u16 values. Every field can be set arbitrarily (malformed tests)."""
+    assert len(pre_pockets) == 15
+    return struct.pack(TXN_COMMIT_FMT, PC_NETGAME_MSG_TXN_COMMIT, kind & 0xFF, rsv0 & 0xFFFF, request_id & U32_MASK,
+                       nonce & U32_MASK, seq & U32_MASK, dest & 0xFF, slot & 0xFF, item & 0xFFFF, flags & 0xFF, aux_cond & 0xFF,
+                       aux_item & 0xFFFF, base_epoch & U32_MASK, base_rev & U32_MASK, *[p & 0xFFFF for p in pre_pockets],
+                       tag_rsv0 & 0xFFFF, pre_conds & U32_MASK, pre_wallet & U32_MASK)
+
+
+def fish_item_for_species(species):
+    """The item a caught fish of bobber species `species` becomes (aUKI_get_fish_type()'s fish_data[], duplicated host-side as
+    pcnetgame_x3_fish_item()): FISH00 + n for n < 40, whale -> FISH39, the three trash kinds, SALMON2 -> FISH22. 0 if out of range."""
+    if 0 <= species < 40:
+        return 0x2300 + species
+    return {40: 0x2300 + 39, 41: 0x2500 + 14, 42: 0x2500 + 15, 43: 0x2500 + 16, 44: 0x2300 + 22}.get(species, 0)
+
+
+def bug_item_for_species(species):
+    """The item of a caught bug: ITM_INSECT00 + species (0x2D00 + n), the spirit is ITM_SPIRIT0 (0x2D28)."""
+    return 0x2D00 + species if 0 <= species <= 40 else 0
+
+
+def build_txn_tag(nonce, seq, dest, slot, item, base_epoch, base_rev, pre_pockets, pre_conds, pre_wallet,
+                  flags=0, aux_cond=0, aux_item=0, tag_rsv0=0):
+    """The 64-byte reusable PCNetGameTxnTag (X1/X3). pre_pockets = 15 NATIVE u16 values."""
+    assert len(pre_pockets) == 15
+    return struct.pack(TXN_TAG_FMT, nonce & U32_MASK, seq & U32_MASK, dest & 0xFF, slot & 0xFF, item & 0xFFFF, flags & 0xFF,
+                       aux_cond & 0xFF, aux_item & 0xFFFF, base_epoch & U32_MASK, base_rev & U32_MASK,
+                       *[p & 0xFFFF for p in pre_pockets], tag_rsv0 & 0xFFFF, pre_conds & U32_MASK, pre_wallet & U32_MASK)
+
+
+ZERO_TXN_TAG = bytes(64)
+assert struct.calcsize(TXN_TAG_FMT) == 64
+
+
+def build_field_action_request(kind, ut_x, ut_z, request_id, hole_variant=0, tag=None, rsv0=0, rsv1=0):
+    """The 76-byte FIELD_ACTION_REQUEST (X3). tag=None -> the all-zero tag (a request that grants nothing)."""
+    return struct.pack("<BBBBIBBH", PC_NETGAME_MSG_FIELD_ACTION_REQUEST, kind & 0xFF, ut_x & 0xFF, ut_z & 0xFF,
+                       request_id & U32_MASK, hole_variant & 0xFF, rsv0 & 0xFF, rsv1 & 0xFFFF) + (ZERO_TXN_TAG if tag is None else tag)
+
+
+def build_catch_request(entity_id, generation, request_id, claimed_species, tag=None):
+    """The 84-byte CATCH_REQUEST (X3); the tag is mandatory on the host (tag=None sends an all-zero one: a BAD_SHAPE probe)."""
+    return struct.pack("<B3xIIIi", PC_NETGAME_MSG_CATCH_REQUEST, entity_id & U32_MASK, generation & U32_MASK,
+                       request_id & U32_MASK, claimed_species) + (ZERO_TXN_TAG if tag is None else tag)
+
+
 def build_pickup_request(ut_x, ut_z, request_id):
     return struct.pack(PICKUP_REQUEST_FMT, PC_NETGAME_MSG_PICKUP_REQUEST, ut_x & 0xFF, ut_z & 0xFF, 0,
                        request_id & U32_MASK)
@@ -1571,6 +1775,7 @@ class HandshakeRejected(RuntimeError):
 
 HANDSHAKE_TIMEOUT_S = 5.0   # generous: a v2 host defers IDENTITY until its own save is loaded
 SNAPSHOT_TIMEOUT_S = 10.0
+RECORD_SYNC_TIMEOUT_S = 10.0
 
 
 class FakeClient(TransportClient):
@@ -1591,8 +1796,42 @@ class FakeClient(TransportClient):
     # at most once, so a replayed RESULT never produces a second CONFIRM.
     auto_confirm = True
 
+    # D3 (v8) record protocol defaults: a FakeClient behaves like a v8 client that is compatible with the host's HELLO
+    # enforcement: it sends RECORD_HELLO right after IDENTITY_ACK (record_hello=False suppresses it), answers a
+    # MIGRATE_REQUEST by uploading its resident's GCI record and adopts/ACKs pushes automatically (record_auto=False
+    # turns the automatic answers off so a test can drive the exchange by hand), and connect_and_ready() waits until the
+    # host reports the record synced (record_wait=False skips that wait).
+    record_hello = True
+    record_auto = True
+    record_wait = True
+
+    # X1 commit path of an accepted provisional RESULT: "txn" (the DEFAULT since X1b, like the real client: PC_NETGAME_TXN_RETIRE_LEGACY_COMMIT
+    # == 1) = TXN_COMMIT + the TXN_RESULT; "legacy" = INTERACT_CONFIRM(COMMIT), which the host now RETIRES (logged, reservation released,
+    # nothing mutated) -- kept only so a test can prove exactly that.
+    commit_mode = "txn"
+    txn_pickup_dest = "pocket"   # auto-commit of a pickup in "txn" mode: "pocket" (first free slot) or "wallet"
+
     def __init__(self, label, host_ip, port, town=None, player=None, hub=None, context_flags=DEFAULT_CONTEXT_FLAGS,
-                 wait_snapshot=True, **kw):
+                 wait_snapshot=True, record_hello=None, record_auto=None, record_wait=None, commit_mode=None, **kw):
+        if record_hello is not None:
+            self.record_hello = record_hello
+        if record_auto is not None:
+            self.record_auto = record_auto
+        if record_wait is not None:
+            self.record_wait = record_wait
+        self.rec_last = None            # (host_session, epoch, rev) this client last synced with; survives reconnects
+        self.rec_resident_idx = None    # resident slot of self.player in the test GCI (lazy)
+        self.rec_migrate_payload = None  # override of the MIGRATE_UPLOAD bytes (default: own_record())
+        self.rec_local = None           # the client's current local record image (BE bytes)
+        # X1 transactional commit (test double of the real client's s_txn_nonce / s_txn_next_seq): the nonce is per PROCESS
+        # (survives reconnect(); new_process() re-rolls it), the seq is monotone per process and never reset by a session reset.
+        if commit_mode is not None:
+            self.commit_mode = commit_mode
+        self.txn_nonce = new_txn_nonce()
+        self.txn_seq = 0
+        self.txn_results = []        # (conn, TxnResultFields) for EVERY TXN_RESULT received, arrival order
+        self.txn_commits_sent = []   # (raw bytes, conn) for EVERY TXN_COMMIT this client sent
+        self.txn_requests = {}       # (kind, request_id) -> (slot, item): what the auto-commit needs for drop/bury
         super().__init__(label, host_ip, port, hub=hub, **kw)
         self.host_ip = host_ip
         self.port = int(port)
@@ -1605,6 +1844,7 @@ class FakeClient(TransportClient):
         self.reject = None
         self.move_frame = 0
         self.result_log = []  # (msg_type, request_id, fields, conn) for EVERY result ever delivered
+        self._reset_record_tracking()
         self.confirm_policy = {}   # (kind, request_id) -> bool, per-request override of auto_confirm
         self.confirms_sent = []    # (kind, request_id, outcome, reason, conn) for EVERY CONFIRM this client sent
         self._auto_confirmed = set()  # (kind, request_id, conn) already auto-confirmed
@@ -1615,6 +1855,16 @@ class FakeClient(TransportClient):
     def _reset_connection_state(self):
         super()._reset_connection_state()
         self._reset_world_tracking()  # a new connection starts with no world knowledge at all
+        self._reset_record_tracking()
+
+    def _reset_record_tracking(self):
+        self.rec_xfer_counter = 0   # next client -> host xfer_id is rec_xfer_counter + 1 (per connection)
+        self.rec_rx = None          # the host -> client transfer being reassembled
+        self.rec_pushes = []        # completed host pushes this connection: dicts (kind, epoch, rev, session, data, digest_ok, ...)
+        self.rec_acks = []          # every RECORD_ACK received this connection: (conn, RecordAckFields)
+        self.rec_violations = []    # reassembly protocol problems seen on pushes
+        self.rec_synced = False     # PUSH_FULL fully received (digest ok) or HELLO answered APPLIED (continuation)
+        self.rec_migrate_epoch = None
 
     def _reset_world_tracking(self):
         self.world = WorldView()  # what a correct client believes, per contract section 4
@@ -1787,7 +2037,12 @@ class FakeClient(TransportClient):
         self.identity_ack_seq = m.seq
         self.identity_ack_index = m.index
         self.assigned_peer_id = g.assigned_peer_id
+        if self.record_hello:
+            self.send_record_hello()
         self.post_ready_handshake(self.wait_snapshot if wait_snapshot is None else wait_snapshot)
+        if self.record_hello and self.record_auto and self.record_wait and not self.wait_record_synced(RECORD_SYNC_TIMEOUT_S):
+            raise RuntimeError(f"{self.label}: READY but the resident record was not synced within {RECORD_SYNC_TIMEOUT_S}s "
+                               f"(acks: {[(a.status, a.xfer_id) for _c, a in self.rec_acks]}, pushes: {len(self.rec_pushes)})")
         if not quiet:
             print(f"[{self.label}] READY (assigned_peer_id={self.assigned_peer_id})")
         return self
@@ -1846,12 +2101,14 @@ class FakeClient(TransportClient):
         return self.send_reliable(build_pickup_request(ut_x, ut_z, request_id))
 
     def send_drop_request(self, pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, auto_confirm=None):
+        self.txn_requests[(CONFIRM_KIND_DROP, request_id & U32_MASK)] = (pocket_slot_idx, claimed_item)
         if auto_confirm is not None:
             self.confirm_policy[(CONFIRM_KIND_DROP, request_id & U32_MASK)] = bool(auto_confirm)
         return self.send_reliable(build_drop_request(pocket_slot_idx, claimed_item, ut_x, ut_z, request_id))
 
     def send_bury_request(self, pocket_slot_idx, claimed_item, ut_x, ut_z, request_id, hole_variant=0xFF,
                           auto_confirm=None):
+        self.txn_requests[(CONFIRM_KIND_BURY, request_id & U32_MASK)] = (pocket_slot_idx, claimed_item)
         if auto_confirm is not None:
             self.confirm_policy[(CONFIRM_KIND_BURY, request_id & U32_MASK)] = bool(auto_confirm)
         return self.send_reliable(
@@ -1880,7 +2137,354 @@ class FakeClient(TransportClient):
 
     # --- results, matched strictly by request_id -------------------------------------------------------
 
+    # --- D3 record protocol (client side of the wire, as a test double) --------------------------------------
+
+    def own_record(self):
+        """This client's resident record as the test GCI holds it (the 'local GCI' a real client would import on MIGRATE)."""
+        if self.rec_resident_idx is None:
+            for i, ident, _ex in read_test_save_residents():
+                if ident.player_id == self.player.player_id and ident.player_name == self.player.player_name:
+                    self.rec_resident_idx = i
+                    break
+        if self.rec_resident_idx is None:
+            raise LookupError(f"{self.label}: no resident of the test GCI matches {self.player}")
+        return record_from_gci(GAME_BIN_DIR, self.rec_resident_idx)
+
+    def send_record_hello(self, flags=None, last=None, record_size=PC_NETGAME_REC_SIZE, local_digest=None, raw=None):
+        """RECORD_HELLO (reliable). Defaults: last = what this client last synced (rec_last), local_digest of rec_local."""
+        if raw is not None:
+            return self.send_reliable(raw)
+        last = last if last is not None else self.rec_last
+        have = last is not None
+        if flags is None:
+            flags = PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST if have else 0
+        if local_digest is None:
+            try:
+                local_digest = fnv1a32(self.rec_local if self.rec_local is not None else self.own_record())
+            except (LookupError, OSError):
+                local_digest = 0
+        sess, ep, rv = last if have else (0, 0, 0)
+        return self.send_reliable(struct.pack(RECORD_HELLO_FMT, PC_NETGAME_MSG_RECORD_HELLO, flags, 0, record_size,
+                                              local_digest & U32_MASK, sess, ep, rv))
+
+    def send_record_begin(self, kind, xfer_id, epoch, rev, total_size=PC_NETGAME_REC_SIZE, digest=0,
+                          chunk_count=PC_NETGAME_REC_CHUNK_COUNT, rsv=0, host_session=0):
+        return self.send_reliable(struct.pack(RECORD_BEGIN_FMT, PC_NETGAME_MSG_RECORD_BEGIN, kind, chunk_count, rsv,
+                                              xfer_id & U32_MASK, epoch & U32_MASK, rev & U32_MASK, total_size,
+                                              digest & U32_MASK, host_session))
+
+    def send_record_chunk(self, chunk_idx, xfer_id, data, length=None, offset=None, rsv=0):
+        """One RECORD_CHUNK; `data` is padded/truncated to the fixed 1000-byte field. Defaults for length/offset are the
+        correct values for a well-formed chunk of a full record."""
+        total = PC_NETGAME_REC_SIZE
+        if offset is None:
+            offset = chunk_idx * PC_NETGAME_REC_CHUNK_DATA
+        if length is None:
+            length = min(PC_NETGAME_REC_CHUNK_DATA, max(0, total - chunk_idx * PC_NETGAME_REC_CHUNK_DATA))
+        body = bytes(data[:PC_NETGAME_REC_CHUNK_DATA]).ljust(PC_NETGAME_REC_CHUNK_DATA, b"\x00")
+        return self.send_reliable(struct.pack(RECORD_CHUNK_FMT, PC_NETGAME_MSG_RECORD_CHUNK, chunk_idx & 0xFF, length & 0xFFFF,
+                                              xfer_id & U32_MASK, offset & 0xFFFF, rsv & 0xFFFF, body))
+
+    def send_record_ack(self, status, xfer_id=0, detail=0, epoch=0, rev=0, host_session=0):
+        return self.send_reliable(struct.pack(RECORD_ACK_FMT, PC_NETGAME_MSG_RECORD_ACK, status, detail, xfer_id & U32_MASK,
+                                              epoch & U32_MASK, rev & U32_MASK, host_session))
+
+    def next_record_xfer_id(self):
+        self.rec_xfer_counter += 1
+        return self.rec_xfer_counter
+
+    def upload_record(self, data, base=None, kind=PC_NETGAME_REC_KIND_UPLOAD, xfer_id=None, digest=None):
+        """BEGIN + all chunks of `data` (BE bytes) as client -> host transfer `xfer_id` (default: next id). `base` = (epoch,
+        rev) the upload builds on (default: this client's last synced point). `digest` defaults to fnv1a32(data). Returns the
+        xfer_id used. Needs no ACK wait: use wait_record_ack(xfer_id)."""
+        if xfer_id is None:
+            xfer_id = self.next_record_xfer_id()
+        else:
+            self.rec_xfer_counter = max(self.rec_xfer_counter, xfer_id)
+        if base is None:
+            base = (self.rec_last[1], self.rec_last[2]) if self.rec_last else (0, 0)
+        if digest is None:
+            digest = fnv1a32(data)
+        n = (len(data) + PC_NETGAME_REC_CHUNK_DATA - 1) // PC_NETGAME_REC_CHUNK_DATA
+        self.send_record_begin(kind, xfer_id, base[0], base[1], total_size=len(data), digest=digest, chunk_count=n)
+        for i in range(n):
+            self.send_record_chunk(i, xfer_id, data[i * PC_NETGAME_REC_CHUNK_DATA:(i + 1) * PC_NETGAME_REC_CHUNK_DATA],
+                                   length=min(PC_NETGAME_REC_CHUNK_DATA, len(data) - i * PC_NETGAME_REC_CHUNK_DATA),
+                                   offset=i * PC_NETGAME_REC_CHUNK_DATA)
+        return xfer_id
+
+    def wait_record_ack(self, xfer_id=None, status=None, timeout=3.0, consume=True):
+        """The next RECORD_ACK on this connection (optionally for `xfer_id` / with `status`), or None."""
+        conn = self.connect_count
+
+        def pred(m):
+            if m.conn != conn or m.channel != CH_RELIABLE or m.msg_type != PC_NETGAME_MSG_RECORD_ACK:
+                return False
+            g = m.game
+            return g is not None and (xfer_id is None or g.xfer_id == xfer_id) and (status is None or g.status == status)
+
+        m = self.inbox.wait_for(pred, timeout, consume=consume)
+        return None if m is None else m.game
+
+    def wait_record_push(self, after=0, timeout=5.0):
+        """Block until more than `after` completed pushes exist on this connection; returns the newest (dict) or None."""
+        if not self.hub.wait_until(lambda: len(self.rec_pushes) > after, timeout):
+            return None
+        return self.rec_pushes[-1]
+
+    def recv_record(self, after=0, timeout=5.0):
+        """Reassembled host push (dict: kind, epoch, rev, session, data, digest, digest_ok, xfer) or None."""
+        return self.wait_record_push(after, timeout)
+
+    def wait_record_synced(self, timeout=RECORD_SYNC_TIMEOUT_S):
+        return self.hub.wait_until(lambda: self.rec_synced, timeout)
+
+    def _record_on_message(self, m):
+        t = m.msg_type
+        g = m.game
+        if g is None or m.conn != self.connect_count:
+            return
+        if t == PC_NETGAME_MSG_RECORD_BEGIN:
+            self.rec_rx = {"kind": g.kind, "xfer": g.xfer_id, "epoch": g.epoch, "rev": g.rev, "session": g.host_session,
+                           "digest": g.digest, "count": g.chunk_count, "total": g.total_size, "chunks": {}}
+        elif t == PC_NETGAME_MSG_RECORD_CHUNK:
+            rx = self.rec_rx
+            if rx is None or rx["xfer"] != g.xfer_id or g.chunk_idx >= rx["count"] or g.chunk_idx in rx["chunks"] \
+                    or g.offset != g.chunk_idx * PC_NETGAME_REC_CHUNK_DATA:
+                self.rec_violations.append(("chunk", g.chunk_idx, g.xfer_id))
+                return
+            rx["chunks"][g.chunk_idx] = bytes(g.data[:g.length])
+            if len(rx["chunks"]) == rx["count"]:
+                data = b"".join(rx["chunks"][i] for i in range(rx["count"]))
+                push = dict(rx, data=data, digest_ok=(len(data) == rx["total"] == PC_NETGAME_REC_SIZE
+                                                      and fnv1a32(data) == rx["digest"]), conn=m.conn)
+                self.rec_rx = None
+                self.rec_pushes.append(push)
+                if push["digest_ok"]:
+                    self.rec_last = (push["session"], push["epoch"], push["rev"])
+                    self.rec_local = data
+                    if push["kind"] == PC_NETGAME_REC_KIND_PUSH_FULL:
+                        self.rec_synced = True
+                    if self.record_auto and getattr(self, "state", None) == self.STATE_CONNECTED:
+                        self.send_record_ack(PC_NETGAME_REC_ACK_APPLIED, push["xfer"], 0, push["epoch"], push["rev"],
+                                             push["session"])
+        elif t == PC_NETGAME_MSG_RECORD_ACK:
+            self.rec_acks.append((m.conn, g))
+            if g.status == PC_NETGAME_REC_ACK_MIGRATE_REQUEST:
+                self.rec_migrate_epoch = g.epoch
+                if self.record_auto and getattr(self, "state", None) == self.STATE_CONNECTED:
+                    payload = self.rec_migrate_payload if self.rec_migrate_payload is not None else self.own_record()
+                    self.upload_record(payload, base=(g.epoch, 0), kind=PC_NETGAME_REC_KIND_MIGRATE_UPLOAD)
+            elif g.status == PC_NETGAME_REC_ACK_APPLIED:
+                self.rec_last = (g.host_session, g.epoch, g.rev)
+                if g.xfer_id == 0:
+                    self.rec_synced = True  # HELLO continuation answered without a push
+
+    # --- X1 transactional commit (client side of the wire, as a test double) ---------------------------------------
+
+    def new_process(self, keep_record=False):
+        """Pretend this client is a NEW game process: a new random txn nonce, seq restarts at 1, and (unless keep_record) nothing
+        is remembered about the previous record sync (a real new process never claims a continuation). keep_record=True models
+        the real client's nonce RE-ROLL on a seq wrap, which keeps its record state."""
+        self.txn_nonce = new_txn_nonce()
+        self.txn_seq = 0
+        if not keep_record:
+            self.rec_last = None
+            self.rec_local = None
+
+    def next_txn_seq(self):
+        self.txn_seq = (self.txn_seq + 1) & U32_MASK
+        return self.txn_seq
+
+    def txn_pre_image(self):
+        """(pockets tuple of 15 native u16, item_conditions, wallet) of this client's current local record image."""
+        return record_inventory(self.rec_local if self.rec_local is not None else self.own_record())
+
+    def build_txn_commit_bytes(self, kind, request_id, dest, slot, item, pre=None, base=None, seq=None, nonce=None, **kw):
+        """The COMMIT bytes. Default pre-image: this client's local image (drop/bury: forced to hold `item` at `slot`, a legal
+        client-owned claim); default base: what it last synced (rec_last); seq = next_txn_seq(); nonce = self.txn_nonce."""
+        if pre is None:
+            pockets, conds, wallet = self.txn_pre_image()
+            if kind in (CONFIRM_KIND_DROP, CONFIRM_KIND_BURY) and 0 <= slot < 15:
+                pockets = tuple(item if i == slot else p for i, p in enumerate(pockets))
+            pre = (pockets, conds, wallet)
+        if base is None:
+            base = (self.rec_last[1], self.rec_last[2]) if self.rec_last else (0, 0)
+        if seq is None:
+            seq = self.next_txn_seq()
+        if nonce is None:
+            nonce = self.txn_nonce
+        return build_txn_commit(kind, request_id, nonce, seq, dest, slot, item, base[0], base[1], pre[0], pre[1], pre[2], **kw)
+
+    def send_txn_commit(self, kind, request_id, dest, slot, item, pre=None, base=None, seq=None, nonce=None, raw=None, **kw):
+        """Builds (unless `raw` is given) and sends a TXN_COMMIT (reliable). Returns TxnSent(raw, seq, nonce)."""
+        if raw is None:
+            raw = self.build_txn_commit_bytes(kind, request_id, dest, slot, item, pre=pre, base=base, seq=seq, nonce=nonce, **kw)
+        self.txn_commits_sent.append((raw, self.connect_count))
+        self.send_reliable(raw)
+        return TxnSent(raw, struct.unpack_from("<I", raw, 12)[0] if len(raw) >= 16 else 0,
+                       struct.unpack_from("<I", raw, 8)[0] if len(raw) >= 12 else 0)
+
+    def resend_txn(self, sent, copies=1):
+        """Resends the IDENTICAL bytes of an earlier COMMIT (what the real client does on a timeout) as a NEW reliable message;
+        copies > 1 additionally transmits that datagram `copies` times (transport-level duplicates)."""
+        if copies <= 1:
+            self.send_reliable(sent.raw)
+        else:
+            self.send_reliable_duplicate(sent.raw, copies)
+        self.txn_commits_sent.append((sent.raw, self.connect_count))
+        return sent
+
+    def drop_next_txn_result(self):
+        """Client-side loss hook: the next inbound TXN_RESULT is dropped before it reaches the inbox (and not acked, so the host's
+        transport retransmits it). Complements the host's --txn-fault=drop_result (the host never SENDS it)."""
+        self.drop_inbound_next(lambda payload: bool(payload) and payload[0] == PC_NETGAME_MSG_TXN_RESULT)
+
+    def txn_results_for(self, seq, nonce=None, current_conn_only=False):
+        n = self.txn_nonce if nonce is None else nonce
+        return [g for conn, g in self.txn_results if g.txn_seq == seq and g.txn_nonce == n
+                and (not current_conn_only or conn == self.connect_count)]
+
+    def wait_txn_result(self, seq, timeout=3.0, nth=1, nonce=None):
+        """The nth TXN_RESULT (default the first) for (nonce, seq), or None after `timeout`. Non-consuming."""
+        if not self.hub.wait_until(lambda: len(self.txn_results_for(seq, nonce)) >= nth, timeout):
+            return None
+        return self.txn_results_for(seq, nonce)[nth - 1]
+
+    def _txn_on_result(self, m, g):
+        """Applies an APPLIED result like the real client's apply step: the pocket range / conds / wallet of the local image become
+        the host's post-image and the D3 base moves to the result's lineage point."""
+        if m.conn != self.connect_count or g.outcome != PC_NETGAME_TXN_OUTCOME_APPLIED or g.txn_nonce != self.txn_nonce:
+            return
+        if self.rec_local is not None:
+            self.rec_local = record_set_inventory(self.rec_local, g.post_pockets, g.post_conds, g.post_wallet)
+        self.rec_last = (g.host_session, g.epoch, g.rev)
+
+    def _auto_txn_commit(self, kind, rid, g):
+        """commit_mode == "txn": answer an accepted provisional RESULT with a TXN_COMMIT (once per request, like the auto-confirm)."""
+        pockets, _conds, wallet = self.txn_pre_image()
+        if kind == CONFIRM_KIND_PICKUP:
+            item = g.granted_item
+            if self.txn_pickup_dest == "wallet":
+                self.send_txn_commit(kind, rid, PC_NETGAME_TXN_DEST_WALLET, PC_NETGAME_TXN_SLOT_WALLET, item)
+            else:
+                free = next((i for i, p in enumerate(pockets) if p == EMPTY_NO), None)
+                pre = None
+                if free is None:
+                    # Every pocket of the modelled local image is occupied (a long test picks up more items than there are slots). The REAL
+                    # client would ABORT(POCKETS_FULL); the scripted client models a player who discarded the item in the last slot instead,
+                    # so the exactly-once host behaviour under test stays reachable. (Explicit TXN_COMMITs / txn_pickup() never do this.)
+                    free = len(pockets) - 1
+                    cleared = tuple(EMPTY_NO if i == free else p for i, p in enumerate(pockets))
+                    pre = (cleared, self.txn_pre_image()[1], wallet)
+                    if self.rec_local is not None:
+                        self.rec_local = record_set_inventory(self.rec_local, cleared, pre[1], wallet)
+                self.send_txn_commit(kind, rid, PC_NETGAME_TXN_DEST_POCKET, free, item, pre=pre)
+        else:
+            slot, item = self.txn_requests.get((kind, rid), (0, 0))
+            self.send_txn_commit(kind, rid, PC_NETGAME_TXN_DEST_NONE, slot, item)
+
+    def commit_pending(self, kind, request_id):
+        """Explicit commit of an ACCEPTED provisional RESULT of this connection that was left pending (auto_confirm=False): exactly what
+        the automatic commit would have sent (TXN_COMMIT in the default 'txn' mode, CONFIRM(COMMIT) in the retired 'legacy' mode)."""
+        rid = request_id & U32_MASK
+        g = next((g for _t, r, g, conn in reversed(self.result_log)
+                  if r == rid and conn == self.connect_count and getattr(g, "accepted", 0)), None)
+        if g is None:
+            raise RuntimeError(f"{self.label}: no accepted provisional RESULT for request {request_id} on this connection")
+        if self.commit_mode == "txn":
+            self._auto_txn_commit(kind, rid, g)
+        else:
+            self.confirm(kind, rid, CONFIRM_OUTCOME_COMMIT, CONFIRM_REASON_NONE)
+
+    def _txn_flow(self, kind, rid, prov, dest, slot, item, timeout, **kw):
+        """Shared tail of txn_pickup/txn_drop/txn_bury: TXN_COMMIT for an accepted provisional RESULT, then wait for its RESULT."""
+        if prov is None or not prov.accepted:
+            return prov, None, None
+        sent = self.send_txn_commit(kind, rid, dest, slot, item, **kw)
+        return prov, sent, self.wait_txn_result(sent.seq, timeout)
+
+    def txn_pickup(self, ut_x, ut_z, rid, dest="pocket", slot=None, timeout=3.0, claim=True, req_timeout=1.0, **kw):
+        """Full pickup transaction through the NEW path: PICKUP_REQUEST -> provisional RESULT -> TXN_COMMIT -> TXN_RESULT.
+        Returns (provisional, TxnSent or None, TxnResultFields or None)."""
+        prov = self.pickup(ut_x, ut_z, rid, timeout=req_timeout, claim=claim, auto_confirm=False)
+        if prov is None or not prov.accepted:
+            return prov, None, None
+        if dest == "wallet":
+            d, s = PC_NETGAME_TXN_DEST_WALLET, PC_NETGAME_TXN_SLOT_WALLET
+        else:
+            pockets = self.txn_pre_image()[0]
+            d, s = PC_NETGAME_TXN_DEST_POCKET, (slot if slot is not None else next((i for i, p in enumerate(pockets) if p == EMPTY_NO), 0))
+        return self._txn_flow(CONFIRM_KIND_PICKUP, rid, prov, d, s, prov.granted_item, timeout, **kw)
+
+    def txn_drop(self, pocket_slot_idx, item, ut_x, ut_z, rid, claim_at=None, facing=0, timeout=3.0, req_timeout=1.0, **kw):
+        """Full drop transaction: DROP_REQUEST -> provisional RESULT -> TXN_COMMIT -> TXN_RESULT (see txn_pickup)."""
+        prov = self.drop(pocket_slot_idx, item, ut_x, ut_z, rid, timeout=req_timeout, claim_at=claim_at, facing=facing,
+                         auto_confirm=False)
+        return self._txn_flow(CONFIRM_KIND_DROP, rid, prov, PC_NETGAME_TXN_DEST_NONE, pocket_slot_idx, item, timeout, **kw)
+
+    def txn_bury(self, pocket_slot_idx, item, ut_x, ut_z, rid, hole_variant=0xFF, claim=True, timeout=3.0, req_timeout=1.0, **kw):
+        """Full bury transaction: BURY_REQUEST -> provisional RESULT -> TXN_COMMIT -> TXN_RESULT (see txn_pickup)."""
+        prov = self.bury(pocket_slot_idx, item, ut_x, ut_z, rid, hole_variant=hole_variant, timeout=req_timeout, claim=claim,
+                         auto_confirm=False)
+        return self._txn_flow(CONFIRM_KIND_BURY, rid, prov, PC_NETGAME_TXN_DEST_NONE, pocket_slot_idx, item, timeout, **kw)
+
+    def build_grant_tag(self, dest, slot, item, pre=None, base=None, seq=None, nonce=None, **kw):
+        """(tag bytes, seq, nonce) for an X3 grant request. Default pre-image = this client's local image, default base = rec_last,
+        seq = next_txn_seq(), nonce = self.txn_nonce, slot None = the first free slot of the pre-image (0xFF when there is none)."""
+        if pre is None:
+            pre = self.txn_pre_image()
+        if base is None:
+            base = (self.rec_last[1], self.rec_last[2]) if self.rec_last else (0, 0)
+        if seq is None:
+            seq = self.next_txn_seq()
+        if nonce is None:
+            nonce = self.txn_nonce
+        if slot is None:
+            slot = next((i for i, p in enumerate(pre[0]) if p == EMPTY_NO), PC_NETGAME_TXN_SLOT_WALLET)
+        return build_txn_tag(nonce, seq, dest, slot, item, base[0], base[1], pre[0], pre[1], pre[2], **kw), seq, nonce
+
+    def send_fa_grant(self, kind, ut_x, ut_z, rid, item=0, slot=None, hole_variant=0, dest=PC_NETGAME_TXN_DEST_POCKET, raw=None,
+                      **kw):
+        """Builds (unless `raw`) and sends an X3 FIELD_ACTION_REQUEST carrying a grant tag (DIG_BURIED item 0 / DIG_HOLE 0x2103 /
+        DIG_SHINE 0x2100..0x2102). Returns TxnSent(raw, seq, nonce); wait_txn_result(sent.seq) gives the host's TXN_RESULT."""
+        if raw is None:
+            tag, seq, nonce = self.build_grant_tag(dest, slot, item, **kw)
+            raw = build_field_action_request(kind, ut_x, ut_z, rid, hole_variant, tag)
+        self.txn_commits_sent.append((raw, self.connect_count))
+        self.send_reliable(raw)
+        return TxnSent(raw, struct.unpack_from("<I", raw, 16)[0], struct.unpack_from("<I", raw, 12)[0])
+
+    def catch_request_bytes(self, entity_id, generation, rid, species, item=None, kind="fish", slot=None, dest=PC_NETGAME_TXN_DEST_POCKET,
+                            **kw):
+        """The 84-byte X3 CATCH_REQUEST (not sent). item None = the host-derived item of `species` for `kind` ("fish" / "bug");
+        dest NONE = a full-pockets catch (slot 0xFF, item 0). Default pre-image / base / seq / nonce as build_grant_tag()."""
+        if dest == PC_NETGAME_TXN_DEST_NONE:
+            slot, item = PC_NETGAME_TXN_SLOT_WALLET, 0
+        elif item is None:
+            item = fish_item_for_species(species) if kind == "fish" else bug_item_for_species(species)
+        tag, _seq, _nonce = self.build_grant_tag(dest, slot, item, **kw)
+        return build_catch_request(entity_id, generation, rid, species, tag)
+
+    def send_catch_txn(self, entity_id, generation, rid, species, item=None, slot=None, dest=PC_NETGAME_TXN_DEST_POCKET, raw=None,
+                       kind="fish", **kw):
+        """Builds (unless `raw`) and sends an X3 CATCH_REQUEST (tag: dest POCKET + the host-derived item, or dest NONE / item 0 for a
+        full-pockets catch). Returns TxnSent(raw, seq, nonce)."""
+        if raw is None:
+            raw = self.catch_request_bytes(entity_id, generation, rid, species, item=item, kind=kind, slot=slot, dest=dest, **kw)
+        self.txn_commits_sent.append((raw, self.connect_count))
+        self.send_reliable(raw)
+        return TxnSent(raw, struct.unpack_from("<I", raw, 24)[0], struct.unpack_from("<I", raw, 20)[0])
+
     def on_message(self, m):
+        if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TXN_RESULT:
+            g = m.game
+            if g is not None:
+                self.txn_results.append((m.conn, g))
+                self._txn_on_result(m, g)
+        if m.channel == CH_RELIABLE and m.msg_type in (PC_NETGAME_MSG_RECORD_BEGIN, PC_NETGAME_MSG_RECORD_CHUNK,
+                                                       PC_NETGAME_MSG_RECORD_ACK):
+            self._record_on_message(m)
         if m.channel == CH_RELIABLE and m.msg_type in RESULT_SPECS:
             g = m.game
             if g is not None:
@@ -1907,7 +2511,10 @@ class FakeClient(TransportClient):
         if not want or key in self.__dict__.get("_auto_confirmed", ()):
             return
         self._auto_confirmed.add(key)
-        self.confirm(kind, rid, CONFIRM_OUTCOME_COMMIT, CONFIRM_REASON_NONE)
+        if self.commit_mode == "txn":
+            self._auto_txn_commit(kind, rid, g)
+        else:
+            self.confirm(kind, rid, CONFIRM_OUTCOME_COMMIT, CONFIRM_REASON_NONE)
 
     def count_results(self, msg_type, request_id, current_conn_only=True):
         return sum(1 for t, rid, _g, conn in self.result_log
@@ -2466,6 +3073,37 @@ GAME_BIN_DIR = os.environ.get("NET_SPIKE_GAME_BIN",
                               os.path.abspath(os.path.join(HERE, "..", "..", "build64", "bin")))
 GAME_EXE_NAME = "AnimalCrossing.exe"
 LIVE_GAME_BIN_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "build64", "bin"))  # holds the LIVE save
+# PROTECTED test artifact: its save must never be modified (a host that accepts a migrate upload / early-saves on a dirty
+# client disconnect REWRITES the GCI and creates save/mp). The harness never launches a game from it; use the disposable
+# clone pc/build64/bin_talkfix_clone (make_four_resident_fixture.py --clone-talkfix). Read-only parse helpers may still read it.
+PROTECTED_GAME_BIN_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "build64", "bin_talkfix"))
+CLONE_GAME_BIN_DIR = os.path.abspath(os.path.join(HERE, "..", "..", "build64", "bin_talkfix_clone"))
+
+
+def _norm_dir(p):
+    return os.path.normcase(os.path.realpath(os.path.abspath(p)))
+
+
+def bin_dir_refusal(bin_dir):
+    """None when a game process may be launched from bin_dir, else the refusal message. There is deliberately NO override for the
+    protected bin_talkfix dir; the live bin dir keeps the pre-existing NET_SPIKE_ALLOW_LIVE_BIN=1 override."""
+    nd = _norm_dir(bin_dir)
+    if nd == _norm_dir(PROTECTED_GAME_BIN_DIR):
+        return ("REFUSING to launch a game process from the PROTECTED test artifact %s (its save must never be modified; a host "
+                "can rewrite the GCI and create save/mp). Use the disposable clone %s "
+                "(python make_four_resident_fixture.py --clone-talkfix) via NET_SPIKE_GAME_BIN." % (bin_dir, CLONE_GAME_BIN_DIR))
+    if nd == _norm_dir(LIVE_GAME_BIN_DIR) and os.environ.get("NET_SPIKE_ALLOW_LIVE_BIN") != "1":
+        return ("REFUSING to launch a game process from the LIVE build directory %s, which holds the live save. Set "
+                "NET_SPIKE_GAME_BIN to a disposable test copy (e.g. %s), or set NET_SPIKE_ALLOW_LIVE_BIN=1 to override explicitly."
+                % (bin_dir, CLONE_GAME_BIN_DIR))
+    return None
+
+
+def require_launchable_bin_dir(bin_dir):
+    """Raise RuntimeError (naming the dir) when a host/client game process must not be launched from bin_dir."""
+    msg = bin_dir_refusal(bin_dir)
+    if msg:
+        raise RuntimeError(msg)
 
 
 def require_test_bin_dir():
@@ -2475,14 +3113,38 @@ def require_test_bin_dir():
     never called at import time and changes nothing for tests that do not call it."""
     import sys
 
-    def norm(p):
-        return os.path.normcase(os.path.realpath(os.path.abspath(p)))
-
-    if norm(GAME_BIN_DIR) == norm(LIVE_GAME_BIN_DIR) and os.environ.get("NET_SPIKE_ALLOW_LIVE_BIN") != "1":
-        print("REFUSING to run: the game bin dir resolves to the LIVE build directory (%s), which holds the live save.\n"
-              "Set NET_SPIKE_GAME_BIN to an absolute path of a test copy (e.g. pc\\build64\\bin_talkfix), or set "
-              "NET_SPIKE_ALLOW_LIVE_BIN=1 to override explicitly." % LIVE_GAME_BIN_DIR, file=sys.stderr)
+    msg = bin_dir_refusal(GAME_BIN_DIR)
+    if msg:
+        print(msg, file=sys.stderr)
         sys.exit(2)
+
+
+class CloneSaveGuard:
+    """Context manager for runs on the DISPOSABLE bin_talkfix_clone: snapshots its save .gci at entry and, on exit, restores it
+    byte-for-byte and removes save/mp (a host may early-save / accept a migrate upload), so runs stay reproducible. A no-op for
+    any other dir (fixture dirs keep their own handling; the protected/live dirs can never launch a game anyway)."""
+
+    def __init__(self, bin_dir=None):
+        self.bin_dir = bin_dir or GAME_BIN_DIR
+        self.active = _norm_dir(self.bin_dir) == _norm_dir(CLONE_GAME_BIN_DIR)
+        self.gci = os.path.join(self.bin_dir, SAVE_GCI_REL)
+        self.snap = None
+
+    def __enter__(self):
+        if self.active and os.path.isfile(self.gci):
+            with open(self.gci, "rb") as f:
+                self.snap = f.read()
+        return self
+
+    def __exit__(self, *exc):
+        if self.active and self.snap is not None:
+            import shutil
+            with open(self.gci, "wb") as f:
+                f.write(self.snap)
+            mp = os.path.join(self.bin_dir, "save", "mp")
+            if os.path.isdir(mp):
+                shutil.rmtree(mp, ignore_errors=True)
+        return False
 
 
 # --- M9 identity Stage 1A: resident identities of the TEST COPY's save ---------------------------------------------
@@ -2548,6 +3210,129 @@ def resident_land(bin_dir=None):
     return raw[8:16], struct.unpack(">H", raw[18:20])[0]
 
 
+# --- D3: the canonical BE record image (== the GCI bytes of one Private_c) and its ownership table ---------------------
+# One offset-range table over the BE image, mirrored from pc_net_game.c (s_rec_ranges; test_d3_record_src.py asserts they
+# are identical and match include/m_private.h): (name, offset, length, owner).
+REC_OWN_IMMUTABLE = "immutable"
+REC_OWN_HOST = "host"
+REC_OWN_SHARED = "shared"   # client-writable AND host-consumed: merged on upload, host value taken on PUSH_HOSTFIELDS
+REC_OWN_CLIENT = "client"
+RECORD_FIELD_RANGES = [
+    ("player_ID", 0x0000, 0x0014, REC_OWN_IMMUTABLE),
+    ("client_a", 0x0014, 0x0072, REC_OWN_CLIENT),
+    ("lotto_ticket", 0x0086, 0x0002, REC_OWN_SHARED),
+    ("client_b", 0x0088, 0x0FFE, REC_OWN_CLIENT),
+    ("exists", 0x1086, 0x0001, REC_OWN_IMMUTABLE),
+    ("client_c", 0x1087, 0x0021, REC_OWN_CLIENT),
+    ("catalog_orders", 0x10A8, 0x0014, REC_OWN_SHARED),
+    ("client_d", 0x10BC, 0x0038, REC_OWN_CLIENT),
+    ("reset_code", 0x10F4, 0x0004, REC_OWN_HOST),
+    ("client_e", 0x10F8, 0x1348, REC_OWN_CLIENT),
+]
+assert RECORD_FIELD_RANGES[0][1] == 0 and all(
+    RECORD_FIELD_RANGES[i][1] + RECORD_FIELD_RANGES[i][2] == RECORD_FIELD_RANGES[i + 1][1]
+    for i in range(len(RECORD_FIELD_RANGES) - 1)) and     RECORD_FIELD_RANGES[-1][1] + RECORD_FIELD_RANGES[-1][2] == PC_NETGAME_REC_SIZE
+REC_OFF_PLAYER_ID = 0x0000
+REC_OFF_POCKETS = 0x0068            # 15 x BE u16
+REC_OFF_LOTTO = 0x0086              # 2 bytes
+REC_OFF_ITEM_COND = 0x0088          # BE u32
+REC_OFF_WALLET = 0x008C             # BE u32
+REC_OFF_LOAN = 0x0090               # BE u32
+REC_OFF_EQUIPMENT = 0x04A4          # BE u16
+REC_OFF_EXISTS = 0x1086
+REC_OFF_CATALOG_ORDERS = 0x10A8     # 5 x {BE u16 item, u8 shop_level, pad}
+REC_OFF_RESET_CODE = 0x10F4         # BE u32
+REC_OFF_CATALOG_ITEM0 = 0x10A8      # order i: BE u16 item at +4*i, u8 shop_level at +4*i+2, pad
+REC_OFF_BANK = 0x122C               # BE u32
+REC_OFF_ORG_TABLE = 0x2340          # 8 x u8
+
+
+def fnv1a32(data):
+    """FNV-1a 32 over bytes (the D3 record digest; pc_net_game.c pcnetgame_fnv1a32)."""
+    h = 2166136261
+    for b in data:
+        h = ((h ^ b) * 16777619) & U32_MASK
+    return h
+
+
+def record_from_gci(bin_or_path, idx):
+    """The 0x2440-byte canonical BE image of resident `idx` read from GCI bytes, a GCI path, or a bin dir (-> its
+    save/card_a GCI). Read-only; the LIVE bin dir is refused."""
+    data = bin_or_path
+    if not isinstance(data, (bytes, bytearray)):
+        path = str(bin_or_path)
+        norm = lambda q: os.path.normcase(os.path.realpath(os.path.abspath(q)))
+        if os.path.isdir(path):
+            path = os.path.join(path, SAVE_GCI_REL)
+        if norm(os.path.dirname(os.path.dirname(os.path.dirname(path)))) == norm(LIVE_GAME_BIN_DIR):
+            raise LookupError("record_from_gci: refusing to read the LIVE bin dir's save")
+        with open(path, "rb") as f:
+            f.seek(_GCI_PRIVATE_BASE + idx * _GCI_PRIVATE_STRIDE)
+            return f.read(_GCI_PRIVATE_STRIDE)
+    o = _GCI_PRIVATE_BASE + idx * _GCI_PRIVATE_STRIDE
+    return bytes(data[o:o + _GCI_PRIVATE_STRIDE])
+
+
+TxnSent = namedtuple("TxnSent", "raw seq nonce")
+
+
+def new_txn_nonce():
+    """A random non-zero 32-bit client-process nonce (test double of pcnetgame_rec_rand32 for the txn nonce)."""
+    import random
+    return random.getrandbits(32) or 1
+
+
+def record_inventory(rec):
+    """(pockets tuple of 15 native u16, item_conditions, wallet) of a canonical BE record image (what a TXN pre-image carries)."""
+    return (tuple(struct.unpack_from(">15H", rec, REC_OFF_POCKETS)), struct.unpack_from(">I", rec, REC_OFF_ITEM_COND)[0],
+            struct.unpack_from(">I", rec, REC_OFF_WALLET)[0])
+
+
+def record_set_inventory(rec, pockets, conds, wallet):
+    """`rec` with its pockets / item_conditions / wallet replaced (native values in, BE bytes out); nothing else changes."""
+    b = bytearray(rec)
+    struct.pack_into(">15H", b, REC_OFF_POCKETS, *[p & 0xFFFF for p in pockets])
+    struct.pack_into(">I", b, REC_OFF_ITEM_COND, conds & U32_MASK)
+    struct.pack_into(">I", b, REC_OFF_WALLET, wallet & U32_MASK)
+    return bytes(b)
+
+
+def record_set_u16(rec, off, val):
+    b = bytearray(rec)
+    b[off:off + 2] = struct.pack(">H", val & 0xFFFF)
+    return bytes(b)
+
+
+def record_set_u32(rec, off, val):
+    b = bytearray(rec)
+    b[off:off + 4] = struct.pack(">I", val & U32_MASK)
+    return bytes(b)
+
+
+def record_set_bytes(rec, off, data):
+    b = bytearray(rec)
+    b[off:off + len(data)] = data
+    return bytes(b)
+
+
+def record_get_u16(rec, off):
+    return struct.unpack_from(">H", rec, off)[0]
+
+
+def record_get_u32(rec, off):
+    return struct.unpack_from(">I", rec, off)[0]
+
+
+def record_merge_expected(host_be, upload_be):
+    """What the host must hold after accepting `upload_be` over `host_be`: client-owned AND shared ranges from the upload,
+    immutable and host-owned (reset_code) ranges from the host record."""
+    out = bytearray(host_be)
+    for _n, off, ln, owner in RECORD_FIELD_RANGES:
+        if owner in (REC_OWN_CLIENT, REC_OWN_SHARED):
+            out[off:off + ln] = upload_be[off:off + ln]
+    return bytes(out)
+
+
 def _init_default_player():
     """Default fake identity := the first existing resident that is not the host's own (TEST_HOST_RESIDENT). Only when
     NET_SPIKE_GAME_BIN names a test copy whose save can be read; otherwise the legacy arbitrary identity stays (a host
@@ -2585,7 +3370,7 @@ def next_default_player(client=None):
     the first choice (used by a test that starts a subprocess while its own clients hold other residents). If all are held by OPEN clients the least recently used
     one is returned anyway (a genuine "more simultaneous clients than residents" situation -- the host will refuse it,
     which is the correct behaviour).
-    With the 2-resident bin_talkfix save (one non-host resident) this is exactly the old single DEFAULT_PLAYER; with the
+    With the 2-resident bin_talkfix(_clone) save (one non-host resident) this is exactly the old single DEFAULT_PLAYER; with the
     4-resident fixture (make_four_resident_fixture.py -> pc/build64/bin_fixture4, host = resident 0) up to three clients can
     be connected at the same time (residents 1, 2, 3). Outside a test copy (NET_SPIKE_GAME_BIN unset / unreadable save)
     it returns DEFAULT_PLAYER. Test-only: no wire or production effect; duplicate-claim tests pass an explicit `player=`."""
@@ -2622,6 +3407,21 @@ def next_default_player(client=None):
     return pick[2]
 
 
+def rebind_default_player(client):
+    """Re-register `client`'s CURRENT identity in next_default_player()'s allocator as held by `client` (test-only
+    bookkeeping, no wire/host effect). Needed when a test reconnects a client that it had closed earlier ("parked" it to stay
+    within the 3-simultaneous-client limit): meanwhile another client may have been handed the same resident, so the
+    allocator's most recent record for that resident no longer names the reconnecting client and would wrongly treat the
+    resident as free again."""
+    if "NET_SPIKE_GAME_BIN" not in os.environ:
+        return
+    for i, ident, ex in read_test_save_residents():
+        if ex and ident == client.player:
+            _default_player_seq[0] += 1
+            _default_player_alloc.append((i, weakref.ref(client), _default_player_seq[0]))
+            return
+
+
 class HostProcess:
     """Launches `AnimalCrossing.exe --host <port> --verbose [extra...]` with CWD = the game's bin
     directory (resources are CWD-relative) and stdout/stderr redirected to a log file (--verbose
@@ -2632,12 +3432,14 @@ class HostProcess:
         self.extra_args = list(extra_args)
         self.bin_dir = bin_dir or GAME_BIN_DIR
         self.exe = os.path.join(self.bin_dir, GAME_EXE_NAME)
+        require_launchable_bin_dir(self.bin_dir)  # protected bin_talkfix / live bin: refuse at construction
         self.log_path = log_path or os.path.join(self.bin_dir, f"net_spike_host_{self.port}.log")
         self.env = env
         self.proc = None
         self._log_fp = None
 
     def start(self):
+        require_launchable_bin_dir(self.bin_dir)
         if not os.path.isfile(self.exe):
             raise FileNotFoundError(self.exe)
         self._log_fp = open(self.log_path, "wb")
@@ -2744,7 +3546,9 @@ class HostProcess:
                 return None
             if self.proc is not None and self.proc.poll() is not None:
                 if verbose:
-                    print("[boot_to_field] process exited before any bootstrap outcome line")
+                    tail = [ln for ln in text.splitlines() if ln.strip()][-4:]
+                    print("[boot_to_field] process exited before any bootstrap outcome line (exit code %s; log %s; "
+                          "last lines: %s)" % (self.proc.returncode, self.log_path, tail))
                 return None
             time.sleep(0.1)
         if verbose:
@@ -2855,6 +3659,7 @@ class ClientProcess(HostProcess):
         self.log_path = log_path or os.path.join(self.bin_dir, f"net_spike_{label}.log")
 
     def start(self):
+        require_launchable_bin_dir(self.bin_dir)
         if not os.path.isfile(self.exe):
             raise FileNotFoundError(self.exe)
         self._log_fp = open(self.log_path, "wb")

@@ -5,8 +5,10 @@
         keep load, no state change) before any save write; Passport_bg writes nothing.
   G4-2  mTG_exchange_proc (src/game/m_tag_ovl.c): a client never reaches mTG_common_throw_put_field for the
         swapped-out hand item; it goes through pc_net_game_exchange_request_drop (pc_net_game.c), whose
-        deferred record is applied only by the matching accepted DROP_RESULT, after the normal slot clear,
-        and is cleared on session reset. Protocol stays v7, net_spike_lib.py unchanged.
+        deferred record is consumed by the matching accepted DROP_RESULT. X1b: that handler now begins a
+        host-transactional TXN_COMMIT carrying the record, and the replacement is written (after the normal slot
+        clear) only by pcnetgame_txn_apply_applied when the host's TXN_RESULT(APPLIED) arrives; the record is
+        cleared on session reset.
 
 Runtime behavior of these paths is NOT TESTED (no hook reaches the train station save talk or the catch
 exchange menu on a real client).
@@ -20,6 +22,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from net_spike_lib import check, summary_and_exit_code  # noqa: E402
+import wire_baseline  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 
@@ -122,16 +125,25 @@ def main():
     h = func_body(net, r"\nstatic void pcnetgame_handle_client_drop_result\(const PCNetGameDropResultMsg\* in\) \{")
     take = h.find("deferred = s_exchange_deferred;")
     consume = h.find("s_exchange_deferred.valid = 0;")
-    clr = h.find("mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)EMPTY_NO, mPr_ITEM_COND_NORMAL);")
-    app = h.find("mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)deferred.replacement")
     rej = h.find("if (!in->accepted) {")
     check("G4-2: record taken and consumed at handler entry (before any reject/abort path)",
           0 <= take < consume < rej, results)
-    check("G4-2: replacement written after the normal slot clear, gated on the slot being empty",
-          0 <= clr < app and "== (mActor_name_t)EMPTY_NO" in h[clr:app + 200], results)
-    check("G4-2: replacement applied exactly once, only at the end of the success path",
-          h.count("deferred.replacement") >= 2 and h.count("mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)deferred.replacement") == 1
-          and app > h.find("CONFIRM_COMMIT"), results)
+    check("G4-2 (X1b): the drop result handler writes NO pocket itself: the consumed record is handed to the transaction (have_deferred ? &deferred : NULL), "
+          "once, after every validation, and there is no mPr_Set* / CONFIRM(COMMIT) in the handler",
+          h.count("pcnetgame_txn_begin(") == 1 and "have_deferred ? &deferred : NULL" in h and "mPr_Set" not in h
+          and "PC_NETGAME_CONFIRM_COMMIT" not in h and h.find("pcnetgame_txn_begin(") > h.find("SLOT_CHANGED"), results)
+    ap = func_body(net, r"\nstatic void pcnetgame_txn_apply_applied\(const PCNetGameClientTxn\* T, const PCNetGameTxnResultMsg\* in\) \{")
+    clr = ap.find("np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;")
+    app = ap.find("np->inventory.pockets[s] = (mActor_name_t)t->aux_item;")
+    ts = func_body(net, r"\nstatic int pcnetgame_txn_try_send\(void\) \{")
+    check("G4-2 (X3, replaces the X1b check): the replacement travels IN the TXN_COMMIT tag (flags EXCHANGE + aux_item / aux_cond, set by try_send only when the "
+          "exchange slot and owner stamp still match) and is written only in pcnetgame_txn_apply_applied (i.e. after the host APPLIED the drop): from the host "
+          "post-image, or in the delta path as a RAW write after the slot clear -- mPr_SetPossessionItem is gone from the apply step",
+          0 <= clr < app and "mPr_SetPossessionItem(" not in ap and "flags = (uint8_t)PC_NETGAME_TXN_FLAG_EXCHANGE;" in ts
+          and "T->exch_slot == slot && pcnetgame_owner_stamp_matches(&T->exch_owner)" in ts and "aux_item = T->exch_item;" in ts and "aux_cond = T->exch_cond;" in ts
+          and "in->post_pockets[t->slot] != (is_exch ? t->aux_item : (uint16_t)EMPTY_NO)" in ap and ap.rfind("if (is_exch) {") > ap.find("delta impossible"), results)
+    check("G4-2 (X1b): a REJECTED result loses the replacement (logged), never applies it",
+          "the exchange replacement is lost" in func_body(net, r"\nstatic void pcnetgame_handle_client_txn_result\(const PCNetGameTxnResultMsg\* in\) \{"), results)
     rst = func_body(net, r"\nstatic void pcnetgame_reset_client_session_state\(void\) \{")
     check("G4-2: session reset clears record and swap note",
           "memset(&s_exchange_deferred, 0, sizeof(s_exchange_deferred));" in rst and "s_exchange_swap_slot = -1;" in rst,
@@ -146,13 +158,10 @@ def main():
           "pc_net_game_request_drop(idx, (int)put_item, found_ux, found_uz)" in tag, results)
 
     # ---- protocol / lib unchanged
-    check("protocol stays v7", "#define PC_NETGAME_PROTOCOL_VERSION 7u" in hdr, results)
-    try:
-        out = subprocess.run(["git", "diff", "--name-only", "--", "pc/tools/net_spike/net_spike_lib.py"], cwd=ROOT,
-                             capture_output=True, text=True, timeout=30).stdout.strip()
-        check("net_spike_lib.py unchanged vs HEAD", out == "", results)
-    except Exception as exc:  # noqa: BLE001
-        check("net_spike_lib.py unchanged vs HEAD (git unavailable: %s)" % exc, False, results)
+    check("protocol is v%d (wire_baseline.EXPECTED_PROTOCOL_VERSION)" % wire_baseline.EXPECTED_PROTOCOL_VERSION,
+          wire_baseline.header_protocol_ok(hdr), results)
+    # wire contract vs HEAD (content-based, see wire_baseline.py): the files may legitimately change, the WIRE may not
+    wire_baseline.run(lambda d, c: check(d, c, results), ROOT)
 
     return summary_and_exit_code(results)
 

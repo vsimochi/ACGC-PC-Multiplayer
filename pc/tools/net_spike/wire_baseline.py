@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""wire_baseline.py - shared SOURCE-AUDIT helper: "no wire change vs HEAD", checked on CONTENT, not on file diffs.
+
+Several source audits used to assert `git diff --name-only -- <file>` is empty for net_spike_lib.py / pc_net_game.c /
+pc_net_game.h. That is wrong once those files legitimately change for host-only / client-only logic. The intent is "the
+WIRE CONTRACT is unchanged", which this module enforces by comparing the working tree against `git show HEAD:<path>`:
+
+  * protocol version constant (pc_net_game.h) - identical;
+  * every `typedef struct|enum PCNet*` block of pc_net_game.c (message-id enum PCNetGameMsgType, reject reasons and every
+    wire struct), comment-stripped - identical, EXCEPT the host-only PCNetGameHostPeerState (which may only gain members:
+    every HEAD member must remain, in order) and the new host-only PCNetGameIdentityClass;
+  * pc_net_game.h: every typedef block identical, every HEAD `#define` still present with the same value;
+  * pc_net.c / pc_net.h transport: PCNET_WIRE_* / MAGIC / HEARTBEAT / TIMEOUT defines and all typedef blocks identical;
+  * net_spike_lib.py: every wire constant / format string line (`PC_NETGAME_* = ...`, `PCNET_* = ...`, `*_FMT = ...`) identical.
+PROTOCOL v8 (D3 + X1, deliberate): the audit now accepts ONLY the documented v8 additions and still fails on any other wire
+change: protocol constant 7u -> EXPECTED_PROTOCOL_VERSION (8u), message ids 47..50 (RECORD_HELLO/BEGIN/CHUNK/ACK) and, since X1
+(host-transactional pickup/drop/bury, v8 still unreleased so NO further bump), 51 TXN_COMMIT / 52 TXN_RESULT appended to
+PCNetGameMsgType (EXPECTED_MAX_MSG_ID = 52; 53/54 are reserved for X2), the pinned structs PCNetGameRecord{Hello,Begin,Chunk,Ack}Msg
+and PCNetGameTxn{Tag,CommitMsg,ResultMsg} (exact normalised text below), the matching net_spike_lib constants
+(PC_NETGAME_MSG_RECORD_*, PC_NETGAME_REC_*, RECORD_*_FMT, PC_NETGAME_MSG_TXN_*, PC_NETGAME_TXN_*, TXN_*_FMT, the version line) and
+new host-only members of PCNetGameHostPeerState. After the v8 commit HEAD already contains them and the audit keeps passing unchanged.
+It FAILS when a message struct, enum value, format string or protocol constant changes (see `--selftest`, which mutates
+in-memory copies and requires each mutation to be detected).
+
+Usage in a test: `import wire_baseline; wire_baseline.run(check_fn, repo_root)` where check_fn(desc, cond) records a check.
+Tier: SOURCE AUDITED. Needs git (read-only `git show`)."""
+import os
+import re
+import subprocess
+import sys
+
+# Host/client-local state, never on the wire: PCNetGameRecRange/RecSlot/ClientRec (D3); X1: PCNetGameHostInteraction (gains the
+# reservation's pocket_slot / commit_path), PCNetGameTxnLog + PCNetGameTxnResident (the host's per-resident journal) and
+# PCNetGameClientTxn (the real client's one in-flight transaction, added by X1b).
+# X3: PCNetGameFieldActionPending (the CLIENT-only field-action queue entry, never on the wire) lost its `local_grant` member: a grant-carrying
+# dig request is now a host-transactional grant owned by PCNetGameClientTxn, no longer a queue entry.
+HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRange", "PCNetGameRecSlot", "PCNetGameClientRec",
+             "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending")
+# Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
+# (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
+REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
+# The highest message id of PCNetGameMsgType (ids are contiguous 1..EXPECTED_MAX_MSG_ID). Tests assert against THIS constant
+# instead of a literal, so the next deliberate id addition is one reviewed edit here.
+EXPECTED_MAX_MSG_ID = 52
+
+# The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
+# is audited against it).
+EXPECTED_PROTOCOL_VERSION = 8
+PREVIOUS_PROTOCOL_VERSION = 7  # what an audit against a pre-v8 HEAD may still see
+
+# Documented v8 additions (comment-stripped, whitespace-normalised struct bodies, pinned exactly).
+V8_NEW_STRUCTS = {
+    "PCNetGameRecordHelloMsg": "uint8_t msg_type; uint8_t flags; uint16_t _reserved0; uint32_t record_size; uint32_t local_digest; "
+                               "uint32_t last_host_session; uint32_t last_epoch; uint32_t last_rev;",
+    "PCNetGameRecordBeginMsg": "uint8_t msg_type; uint8_t kind; uint8_t chunk_count; uint8_t rsv; uint32_t xfer_id; uint32_t epoch; "
+                               "uint32_t rev; uint32_t total_size; uint32_t digest; uint32_t host_session;",
+    "PCNetGameRecordChunkMsg": "uint8_t msg_type; uint8_t chunk_idx; uint16_t len; uint32_t xfer_id; uint16_t offset; uint16_t rsv; "
+                               "uint8_t data[PC_NETGAME_REC_CHUNK_DATA];",
+    "PCNetGameRecordAckMsg": "uint8_t msg_type; uint8_t status; uint16_t detail; uint32_t xfer_id; uint32_t epoch; uint32_t rev; "
+                             "uint32_t host_session;",
+    # X1: the reusable 64-byte transaction tag, the 72-byte TXN_COMMIT (C->H) and the 76-byte TXN_RESULT (H->C)
+    "PCNetGameTxnTag": "uint32_t txn_nonce; uint32_t txn_seq; uint8_t dest; uint8_t slot; uint16_t item; uint8_t flags; "
+                       "uint8_t aux_cond; uint16_t aux_item; uint32_t base_epoch; uint32_t base_rev; uint16_t pre_pockets[15]; "
+                       "uint16_t _rsv0; uint32_t pre_conds; uint32_t pre_wallet;",
+    "PCNetGameTxnCommitMsg": "uint8_t msg_type; uint8_t kind; uint16_t _rsv0; uint32_t request_id; PCNetGameTxnTag tag;",
+    "PCNetGameTxnResultMsg": "uint8_t msg_type; uint8_t kind; uint8_t outcome; uint8_t reason; uint32_t request_id; "
+                             "uint32_t txn_nonce; uint32_t txn_seq; uint32_t host_session; uint32_t epoch; uint32_t rev; "
+                             "uint32_t cdig; uint8_t dest; uint8_t slot; uint16_t item; uint16_t post_pockets[15]; "
+                             "uint16_t _rsv0; uint32_t post_conds; uint32_t post_wallet;",
+}
+# X3 (host-transactional dig / catch GRANTS; still v8, extended IN PLACE, deliberate): the ONLY two pre-existing wire structs that change are
+# FIELD_ACTION_REQUEST (12 -> 76 bytes) and CATCH_REQUEST (20 -> 84 bytes): each gains the trailing 64-byte PCNetGameTxnTag. Pinned exactly
+# (the old text is pinned too, so a HEAD that predates X3 is recognised); any other change to either struct, or to any other pre-existing
+# struct, still fails the audit.
+X3_OLD_STRUCTS = {
+    "PCNetGameFieldActionRequestMsg": "uint8_t msg_type; uint8_t kind; uint8_t ut_x; uint8_t ut_z; uint32_t request_id; "
+                                      "uint8_t hole_variant; uint8_t _reserved0; uint16_t _reserved1;",
+    "PCNetGameCatchRequestMsg": "uint8_t msg_type; uint8_t _reserved0[3]; uint32_t entity_id; uint32_t generation; "
+                                "uint32_t request_id; int32_t claimed_species;",
+}
+X3_CHANGED_STRUCTS = {
+    "PCNetGameFieldActionRequestMsg": X3_OLD_STRUCTS["PCNetGameFieldActionRequestMsg"] + " PCNetGameTxnTag tag;",
+    "PCNetGameCatchRequestMsg": X3_OLD_STRUCTS["PCNetGameCatchRequestMsg"] + " PCNetGameTxnTag tag;",
+}
+X3_SIZE_ASSERTS = ('_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 76,', '_Static_assert(sizeof(PCNetGameCatchRequestMsg) == 84,',
+                   '_Static_assert(offsetof(PCNetGameFieldActionRequestMsg, tag) == 12,',
+                   '_Static_assert(offsetof(PCNetGameCatchRequestMsg, tag) == 20,')
+V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_BEGIN", "48"),
+                ("PC_NETGAME_MSG_RECORD_CHUNK", "49"), ("PC_NETGAME_MSG_RECORD_ACK", "50"),
+                ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52")]
+_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT))\s*=\s*\d+,"
+# net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
+V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
+                           r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
+                           r"|PC_NETGAME_MSG_(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)|(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)_FMT) = ")
+
+
+def c_message_ids(game_c_text):
+    """[(name, value)] of every PC_NETGAME_MSG_* = N in the PCNetGameMsgType enum of pc_net_game.c text (comments included in the
+    scan, but only `NAME = N,` at the start of a line counts), in source order."""
+    body = game_c_text[game_c_text.index("typedef enum PCNetGameMsgType {"):game_c_text.index("} PCNetGameMsgType;")]
+    return [(m.group(1), int(m.group(2))) for m in re.finditer(r"^\s*(PC_NETGAME_MSG_\w+)\s*=\s*(\d+),", body, re.M)]
+# Exact values of every v8 net_spike_lib wire line (trailing comment stripped): a changed id / kind / status / format fails the audit.
+V8_LIB_PINNED = {
+    "PC_NETGAME_MSG_RECORD_HELLO": '47',
+    "PC_NETGAME_MSG_RECORD_BEGIN": '48',
+    "PC_NETGAME_MSG_RECORD_CHUNK": '49',
+    "PC_NETGAME_MSG_RECORD_ACK": '50',
+    "PC_NETGAME_REC_SIZE": '0x2440',
+    "PC_NETGAME_REC_CHUNK_DATA": '1000',
+    "PC_NETGAME_REC_CHUNK_COUNT": '10',
+    "PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST": '0x01',
+    "PC_NETGAME_REC_KIND_PUSH_FULL": '1',
+    "PC_NETGAME_REC_KIND_PUSH_HOSTFIELDS": '2',
+    "PC_NETGAME_REC_KIND_UPLOAD": '3',
+    "PC_NETGAME_REC_KIND_MIGRATE_UPLOAD": '4',
+    "PC_NETGAME_REC_ACK_APPLIED": '0',
+    "PC_NETGAME_REC_ACK_STALE_BASE": '1',
+    "PC_NETGAME_REC_ACK_BAD_DIGEST": '2',
+    "PC_NETGAME_REC_ACK_BAD_SHAPE": '3',
+    "PC_NETGAME_REC_ACK_INVALID_FIELD": '4',
+    "PC_NETGAME_REC_ACK_RATE_LIMITED": '5',
+    "PC_NETGAME_REC_ACK_NOT_BOUND": '6',
+    "PC_NETGAME_REC_ACK_BUSY": '7',
+    "PC_NETGAME_REC_ACK_MIGRATE_REQUEST": '8',
+    "PC_NETGAME_REC_ACK_ADOPT_DEFERRED": '9',
+    "PC_NETGAME_REC_ACK_ADOPT_FAILED": '10',
+    "PC_NETGAME_REC_FIELD_PLAYER_ID": '1',
+    "PC_NETGAME_REC_FIELD_EXISTS": '2',
+    "PC_NETGAME_REC_FIELD_WALLET": '3',
+    "PC_NETGAME_REC_FIELD_BANK": '4',
+    "PC_NETGAME_REC_FIELD_LOAN": '5',
+    "PC_NETGAME_REC_FIELD_POCKET": '6',
+    "PC_NETGAME_REC_FIELD_ITEM_COND": '7',
+    "PC_NETGAME_REC_FIELD_EQUIPMENT": '8',
+    "PC_NETGAME_REC_FIELD_ORG_TABLE": '9',
+    "PC_NETGAME_REC_FIELD_CATALOG": '10',
+    "PC_NETGAME_REC_FIELD_LOTTO": '11',
+    "RECORD_HELLO_FMT": '"<BBHIIIII"',
+    "RECORD_BEGIN_FMT": '"<BBBBIIIIII"',
+    "RECORD_CHUNK_FMT": '"<BBHIHH1000s"',
+    "RECORD_ACK_FMT": '"<BBHIIII"',
+    # X1
+    "PC_NETGAME_MSG_TXN_COMMIT": '51',
+    "PC_NETGAME_MSG_TXN_RESULT": '52',
+    "PC_NETGAME_TXN_DEST_NONE": '0',
+    "PC_NETGAME_TXN_DEST_POCKET": '1',
+    "PC_NETGAME_TXN_DEST_WALLET": '2',
+    "PC_NETGAME_TXN_SLOT_WALLET": '0xFF',
+    "PC_NETGAME_TXN_FLAG_EXCHANGE": '0x01',
+    "PC_NETGAME_TXN_OUTCOME_APPLIED": '0',
+    "PC_NETGAME_TXN_OUTCOME_REJECTED": '1',
+    "PC_NETGAME_TXN_REASON_NONE": '0',
+    "PC_NETGAME_TXN_REASON_EXPIRED": '1',
+    "PC_NETGAME_TXN_REASON_NOT_PENDING": '2',
+    "PC_NETGAME_TXN_REASON_WORLD_CHANGED": '3',
+    "PC_NETGAME_TXN_REASON_NOT_SYNCED": '4',
+    "PC_NETGAME_TXN_REASON_NOT_BOUND": '5',
+    "PC_NETGAME_TXN_REASON_FENCED": '6',
+    "PC_NETGAME_TXN_REASON_CONFLICT": '7',
+    "PC_NETGAME_TXN_REASON_BAD_IMAGE": '8',
+    "PC_NETGAME_TXN_REASON_PRECOND": '9',
+    "PC_NETGAME_TXN_REASON_STALE_IMAGE": '10',
+    "PC_NETGAME_TXN_REASON_BAD_SHAPE": '11',
+    "PC_NETGAME_TXN_REASON_BUSY": '12',
+    "PC_NETGAME_TXN_REASON_FAULT": '13',
+    "PC_NETGAME_TXN_REASON_REPLAYED": '14',
+    "PC_NETGAME_TXN_RING": '16',
+    "PC_NETGAME_TXN_FENCED_NUM": '4',
+    "TXN_TAG_FMT": '"<IIBBHBBHII15HHII"',
+    "TXN_COMMIT_FMT": '"<BBHIIIBBHBBHII15HHII"',
+    "TXN_RESULT_FMT": '"<BBBBIIIIIIIBBH15HHII"',
+    # X3
+    "PC_NETGAME_MSG_FIELD_ACTION_REQUEST": '29',
+    "PC_NETGAME_MSG_FIELD_ACTION_RESULT": '30',
+    "PC_NETGAME_MSG_CATCH_REQUEST": '41',
+    "PC_NETGAME_MSG_CATCH_RESULT": '42',
+    "PC_NETGAME_TXN_KIND_DIG_BURIED": '4',
+    "PC_NETGAME_TXN_KIND_DIG_HOLE": '5',
+    "PC_NETGAME_TXN_KIND_DIG_SHINE": '6',
+    "PC_NETGAME_TXN_KIND_CATCH": '7',
+    "FIELD_ACTION_REQUEST_FMT": '"<BBBBIBBHIIBBHBBHII15HHII"',
+    "FIELD_ACTION_RESULT_FMT": '"<BBBBIHBB"',
+    "CATCH_REQUEST_FMT": '"<B3xIIIiIIBBHBBHII15HHII"',
+    "CATCH_RESULT_FMT": '"<BBHII"',
+}
+_LIB_LINE_RE = re.compile(r"^(\w+) = (.*?)(?:\s+#.*)?$")
+_LIB_PV_RE = re.compile(r"^PC_NETGAME_PROTOCOL_VERSION = (\d+)\b")
+
+
+def header_protocol_ok(hdr):
+    """True iff pc_net_game.h defines PC_NETGAME_PROTOCOL_VERSION as EXPECTED_PROTOCOL_VERSION (the single check tests use)."""
+    return re.search(r"^#define PC_NETGAME_PROTOCOL_VERSION %du\b" % EXPECTED_PROTOCOL_VERSION, hdr, re.M) is not None
+FILES = {
+    "game_c": "pc/src/pc_net_game.c",
+    "game_h": "pc/include/pc_net_game.h",
+    "net_c": "pc/src/pc_net.c",
+    "net_h": "pc/include/pc_net.h",
+    "lib": "pc/tools/net_spike/net_spike_lib.py",
+}
+
+
+def _norm(b):
+    return b.decode("utf-8", "replace").replace("\r\n", "\n")
+
+
+def _strip_comments(s):
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    s = re.sub(r"//[^\n]*", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def typedef_blocks(text, pattern=r".*"):
+    out = {}
+    for m in re.finditer(r"typedef (?:struct|enum) (\w+) \{(.*?)\n\} (\w+);", text, re.S):
+        if re.match(pattern, m.group(3)):
+            out[m.group(3)] = _strip_comments(m.group(2))
+    return out
+
+
+def defines(text):
+    """{name: normalised value} of every `#define NAME value` (function-like macros keep their parameter list)."""
+    out = {}
+    for m in re.finditer(r"^[ \t]*#define[ \t]+(\w+(?:\([^)]*\))?)[ \t]*(.*)$", text, re.M):
+        out[m.group(1)] = _strip_comments(m.group(2))
+    return out
+
+
+def wire_lines_lib(t):
+    return sorted(m.group(0).strip() for m in re.finditer(r"^(?:(?:PC_NETGAME|PCNET)_\w+|\w+_FMT) = .*$", t, re.M))
+
+
+def wire_defines_net_c(t):
+    return sorted(m.group(0).strip() for m in re.finditer(r"^#define PCNET_(?:WIRE_|MAGIC|HEARTBEAT|TIMEOUT)\w*.*$", t, re.M))
+
+
+def audit_texts(head, cur):
+    """head/cur: {key: text} for the FILES keys. Returns [(description, ok)]."""
+    out = []
+    add = lambda d, c: out.append((d, bool(c)))
+
+    pv = lambda t: re.findall(r"^#define PC_NETGAME_PROTOCOL_VERSION\s+(\S+)", t, re.M)
+    ev, pvv = "%du" % EXPECTED_PROTOCOL_VERSION, "%du" % PREVIOUS_PROTOCOL_VERSION
+    add("wire: PC_NETGAME_PROTOCOL_VERSION is the expected v%d (%s) and HEAD is v%d or v%d (%s)"
+        % (EXPECTED_PROTOCOL_VERSION, pv(cur["game_h"]), PREVIOUS_PROTOCOL_VERSION, EXPECTED_PROTOCOL_VERSION, pv(head["game_h"])),
+        pv(cur["game_h"]) == [ev] and pv(head["game_h"]) in ([pvv], [ev]))
+
+    cb, hb = typedef_blocks(cur["game_c"], r"PCNet\w*"), typedef_blocks(head["game_c"], r"PCNet\w*")
+    diff = sorted(k for k in set(cb) | set(hb) if cb.get(k) != hb.get(k) and k not in HOST_ONLY and k not in V8_NEW_STRUCTS
+                  and k not in X3_CHANGED_STRUCTS  # the two request structs that gained the tag are pinned by the X3 check below
+                  and k != "PCNetGameMsgType"  # the id enum has its own v8-aware check below
+                  and not (k in REMOVED_CLIENT_ONLY and k not in cb))  # a deliberately deleted client-only struct (X1b)
+    add("wire: every PCNet* typedef struct/enum of pc_net_game.c identical to HEAD except the host-only %s, the deleted client-only %s and the pinned v8 "
+        "structs (changed: %s) [%d blocks]" % ("/".join(HOST_ONLY), "/".join(REMOVED_CLIENT_ONLY), diff, len(cb)), not diff and len(cb) > 50)
+    add("wire: the %d v8 record + transaction structs exist with EXACTLY the documented layout (pinned) and HEAD has none or the same"
+        % len(V8_NEW_STRUCTS), all(cb.get(k) == v and hb.get(k) in (None, v) for k, v in V8_NEW_STRUCTS.items()))
+    add("wire: X3 -- FIELD_ACTION_REQUEST (12 -> 76 B) and CATCH_REQUEST (20 -> 84 B) are the ONLY pre-existing structs that changed: EXACTLY the "
+        "old layout + the trailing PCNetGameTxnTag (pinned; HEAD has the old or the same layout) and the 76 / 84 size and tag-offset asserts exist",
+        all(cb.get(k) == v and hb.get(k) in (X3_OLD_STRUCTS[k], v) for k, v in X3_CHANGED_STRUCTS.items())
+        and all(a in cur["game_c"] for a in X3_SIZE_ASSERTS))
+    strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
+    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT)))\s*=\s*(\d+),", b)
+    # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit) or all of them
+    head_ids_ok = ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS) if "PCNetGameMsgType" in hb else False
+    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-52 (appended, in order; 53/54 reserved)",
+        "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
+        and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
+        and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
+        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_TXN_RESULT = 52"))
+    nums = [v for _n, v in c_message_ids(cur["game_c"])]
+    add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
+        % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
+        len(nums) == len(set(nums)) and sorted(nums) == list(range(1, EXPECTED_MAX_MSG_ID + 1)))
+    add("wire: PCNetGameRejectReason values identical to HEAD",
+        "PCNetGameRejectReason" in cb and cb["PCNetGameRejectReason"] == hb["PCNetGameRejectReason"])
+    def _subseq(small, big):
+        it = iter(big)
+        return all(any(x == y for y in it) for x in small)
+    members = lambda b: [m.strip() for m in b.split(";") if m.strip()]
+    add("wire: host-only PCNetGameHostPeerState and PCNetGameHostInteraction (X1: + pocket_slot, commit_path) only GAINED members "
+        "(every HEAD member still present, in order)",
+        all(k in cb and k in hb and _subseq(members(hb[k]), members(cb[k]))
+            for k in ("PCNetGameHostPeerState", "PCNetGameHostInteraction")))
+
+    gh, hh = typedef_blocks(cur["game_h"]), typedef_blocks(head["game_h"])
+    add("wire: pc_net_game.h typedef struct/enum blocks identical to HEAD [%d]" % len(gh), gh == hh)
+    gd, hd = defines(cur["game_h"]), defines(head["game_h"])
+    changed = sorted(k for k in hd if gd.get(k) != hd[k] and k != "PC_NETGAME_PROTOCOL_VERSION")
+    add("wire: every HEAD #define of pc_net_game.h still present with the same value (changed/removed: %s)" % changed,
+        not changed and len(hd) > 5)
+
+    add("wire: pc_net.c transport constants (PCNET_WIRE_*, MAGIC, HEARTBEAT, TIMEOUT) identical to HEAD",
+        wire_defines_net_c(cur["net_c"]) == wire_defines_net_c(head["net_c"]) and len(wire_defines_net_c(cur["net_c"])) >= 4)
+    add("wire: pc_net.c / pc_net.h typedef struct/enum blocks identical to HEAD",
+        typedef_blocks(cur["net_c"]) == typedef_blocks(head["net_c"]) and typedef_blocks(cur["net_h"]) == typedef_blocks(head["net_h"])
+        and len(typedef_blocks(cur["net_c"])) >= 3)
+    nd, nh = defines(cur["net_h"]), defines(head["net_h"])
+    add("wire: every HEAD #define of pc_net.h still present with the same value",
+        all(nd.get(k) == v for k, v in nh.items()))
+
+    wl, wh = wire_lines_lib(cur["lib"]), wire_lines_lib(head["lib"])
+    not_pv = lambda ls: [x for x in ls if not _LIB_PV_RE.match(x)]
+    removed = [x for x in not_pv(wh) if x not in wl]
+    added = [x for x in not_pv(wl) if x not in wh and not V8_LIB_ADD_RE.match(x)]
+    cur_pv = [m.group(1) for m in map(_LIB_PV_RE.match, wl) if m]
+    cur_vals = {m.group(1): m.group(2) for m in map(_LIB_LINE_RE.match, wl) if m}
+    pin_bad = sorted(k for k, v in V8_LIB_PINNED.items() if cur_vals.get(k) != v)
+    extra_v8 = sorted(k for k in cur_vals if V8_LIB_ADD_RE.match(k + " = ") and k not in V8_LIB_PINNED)
+    add("wire: net_spike_lib wire constants / format strings (PC_NETGAME_*, PCNET_*, *_FMT) identical to HEAD except the v8 "
+        "version line and the documented RECORD_* additions (removed/changed: %s, unexpected additions: %s) [%d lines]"
+        % (removed, added, len(wl)), not removed and not added and len(wl) > 50 and cur_pv == [str(EXPECTED_PROTOCOL_VERSION)])
+    add("wire: every v8 net_spike_lib wire constant/format has exactly the pinned value and none is unpinned (bad: %s, unpinned: %s)"
+        % (pin_bad, extra_v8), not pin_bad and not extra_v8)
+    return out
+
+
+def _git_show(repo, rel):
+    return _norm(subprocess.run(["git", "-C", repo, "show", "HEAD:" + rel], capture_output=True, check=True, timeout=60).stdout)
+
+
+def load(repo):
+    head, cur = {}, {}
+    for k, rel in FILES.items():
+        head[k] = _git_show(repo, rel)
+        with open(os.path.join(repo, rel.replace("/", os.sep)), "rb") as f:
+            cur[k] = _norm(f.read())
+    return head, cur
+
+
+def run(check, repo):
+    """Records every wire check through check(desc, cond); a git failure is a failed check."""
+    try:
+        head, cur = load(repo)
+    except Exception as exc:  # noqa: BLE001
+        check("wire baseline unavailable (git show HEAD failed: %s)" % exc, False)
+        return
+    for desc, ok in audit_texts(head, cur):
+        check(desc, ok)
+
+
+def selftest(repo):
+    """Mutate in-memory copies of the working files; every wire mutation must be reported, host-only edits must not."""
+    head, cur = load(repo)
+    ok_all = True
+
+    def failing(mut):
+        c = dict(cur)
+        mut(c)
+        return [d for d, ok in audit_texts(head, c) if not ok]
+
+    base = [d for d, ok in audit_texts(head, cur) if not ok]
+    print("baseline failures:", base)
+    ok_all &= not base
+    msg_id = re.search(r"^(\s*)(PC_NETGAME_MSG_\w+)( = \w+)?,", cur["game_c"], re.M)
+    cases = {
+        "protocol version": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>9u", c["game_h"], count=1)),
+        "protocol reverted": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>7u", c["game_h"], count=1)),
+        "enum value": lambda c: c.update(game_c=c["game_c"].replace(msg_id.group(0), msg_id.group(0).replace(",", " + 1,"), 1)),
+        "extra enum id 53": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 52,\n    PC_NETGAME_MSG_EXTRA = 53,", 1)),
+        "txn enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_COMMIT            = 51,", "PC_NETGAME_MSG_TXN_COMMIT            = 61,", 1)),
+        "txn tag field": lambda c: c.update(game_c=c["game_c"].replace("    uint32_t pre_wallet;\n} PCNetGameTxnTag;", "    uint32_t pre_wallet;\n    uint32_t extra;\n} PCNetGameTxnTag;", 1)),
+        "txn result field": lambda c: c.update(game_c=c["game_c"].replace("    uint16_t post_pockets[15];", "    uint16_t post_pockets[16];", 1)),
+        "txn lib fmt": lambda c: c.update(lib=c["lib"].replace('TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHII"', 'TXN_RESULT_FMT = "<BBBBIIIIIIIBBH15HHIII"', 1)),
+        "txn lib reason": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_REASON_FENCED = 6", "PC_NETGAME_TXN_REASON_FENCED = 66", 1)),
+        "txn lib unlisted": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_TXN_REASON_EXTRA = 15\n"),
+        "txn max id": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_TXN_RESULT            = 52,", "PC_NETGAME_MSG_TXN_RESULT            = 53,", 1)),
+        "X3 fa request reverted": lambda c: c.update(game_c=c["game_c"].replace("    uint16_t _reserved1;\n    PCNetGameTxnTag tag;    /* X3: all zero = no grant; see the doc above */\n} PCNetGameFieldActionRequestMsg;", "    uint16_t _reserved1;\n} PCNetGameFieldActionRequestMsg;", 1)),
+        "X3 fa request field": lambda c: c.update(game_c=c["game_c"].replace("    PCNetGameTxnTag tag;    /* X3: all zero = no grant; see the doc above */\n} PCNetGameFieldActionRequestMsg;", "    PCNetGameTxnTag tag;\n    uint8_t extra;\n} PCNetGameFieldActionRequestMsg;", 1)),
+        "X3 catch request field": lambda c: c.update(game_c=c["game_c"].replace("    int32_t  claimed_species;\n    PCNetGameTxnTag tag;\n} PCNetGameCatchRequestMsg;", "    int32_t  claimed_species;\n    PCNetGameTxnTag tag;\n    uint32_t extra;\n} PCNetGameCatchRequestMsg;", 1)),
+        "X3 fa size assert": lambda c: c.update(game_c=c["game_c"].replace("_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 76,", "_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 77,", 1)),
+        "X3 other struct": lambda c: c.update(game_c=c["game_c"].replace("typedef struct PCNetGameCatchResultMsg {\n    uint8_t  msg_type;     /* PC_NETGAME_MSG_CATCH_RESULT */", "typedef struct PCNetGameCatchResultMsg {\n    uint8_t  extra;\n    uint8_t  msg_type;     /* PC_NETGAME_MSG_CATCH_RESULT */", 1)),
+        "X3 lib fa fmt": lambda c: c.update(lib=c["lib"].replace('FIELD_ACTION_REQUEST_FMT = "<BBBBIBBHIIBBHBBHII15HHII"', 'FIELD_ACTION_REQUEST_FMT = "<BBBBIBBHIIBBHBBHII15HHIII"', 1)),
+        "X3 lib kind": lambda c: c.update(lib=c["lib"].replace("PC_NETGAME_TXN_KIND_CATCH = 7", "PC_NETGAME_TXN_KIND_CATCH = 8", 1)),
+        "X3 lib unlisted": lambda c: c.update(lib=c["lib"] + "\nCATCH_EXTRA_RESULT_FMT = \"<B\"\n"),
+        "host-only member removed": lambda c: c.update(game_c=c["game_c"].replace("    uint8_t  hole_variant;      /* World Ecology T3: bury only", "    uint8_t  hole_variant_x;      /* World Ecology T3: bury only", 1)),
+        "v8 enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_RECORD_BEGIN          = 48,", "PC_NETGAME_MSG_RECORD_BEGIN          = 58,", 1)),
+        "v8 struct field": lambda c: c.update(game_c=c["game_c"].replace("    uint32_t digest;      /* FNV-1a32 of the whole BE record */", "    uint32_t digest;\n    uint32_t extra;", 1)),
+        "v8 lib fmt": lambda c: c.update(lib=c["lib"].replace('RECORD_ACK_FMT = "<BBHIIII"', 'RECORD_ACK_FMT = "<BBHIIIII"', 1)),
+        "lib unlisted constant": lambda c: c.update(lib=c["lib"] + "\nPC_NETGAME_MSG_EXTRA = 51\n"),
+        "struct field": lambda c: c.update(game_c=re.sub(r"(typedef struct PCNetMoveMsg \{)", r"\1\n    uint8_t extra;", c["game_c"], count=1)),
+        "lib format string": lambda c: c.update(lib=re.sub(r'^(\w+_FMT = ")', r'\1x', c["lib"], count=1, flags=re.M)),
+        "transport constant": lambda c: c.update(net_c=re.sub(r"(#define PCNET_TIMEOUT_MS\s+)5000u", r"\g<1>5001u", c["net_c"], count=1)),
+    }
+    for name, mut in cases.items():
+        f = failing(mut)
+        print("mutation %-18s -> %s" % (name, "DETECTED" if f else "MISSED"))
+        ok_all &= bool(f)
+    f = failing(lambda c: c.update(game_c=c["game_c"] + "\nstatic int pcnetgame_host_only_extra;\n"))
+    print("host-only addition -> %s" % ("no failure (correct)" if not f else "FALSE POSITIVE %s" % f))
+    ok_all &= not f
+    return 0 if ok_all else 1
+
+
+if __name__ == "__main__":
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    if "--selftest" in sys.argv:
+        sys.exit(selftest(root))
+    res = []
+    run(lambda d, c: (res.append(c), print(("PASS - " if c else "FAIL - ") + d)), root)
+    sys.exit(0 if all(res) else 1)

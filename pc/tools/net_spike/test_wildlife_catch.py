@@ -125,6 +125,20 @@ def build_catch_request(entity_id, generation, request_id, claimed_species):
     return struct.pack(CATCH_REQUEST_FMT, CATCH_REQUEST_TYPE, entity_id, generation, request_id,
                        claimed_species)
 
+# X3 (host-transactional catch, protocol v8 extended in place): CATCH_REQUEST is 84 bytes = the 20-byte header above + the 64-byte
+# PCNetGameTxnTag. These helpers build the tagged request from the sending FakeClient's own record image (dest POCKET + the
+# host-derived item of the claimed species), exactly like the real client does.
+KIND_UNDER_TEST = "fish"
+
+
+def catch_bytes(client, entity_id, generation, request_id, claimed_species):
+    return client.catch_request_bytes(entity_id, generation, request_id, claimed_species, kind=KIND_UNDER_TEST)
+
+
+def send_catch(client, entity_id, generation, request_id, claimed_species):
+    return client.send_catch_txn(entity_id, generation, request_id, claimed_species, kind=KIND_UNDER_TEST)
+
+
 
 def collect_catch_results(client, duration):
     def pred(m):
@@ -239,15 +253,15 @@ def main():
         print("[catch] TEST D: stale/unknown entity_id and mismatched generation")
         stale_target = fish[0]
         since = a.inbox.mark()
-        a.send_reliable(build_catch_request(0xDEADBEEF, generation, 9001, stale_target["species"]))
+        send_catch(a, 0xDEADBEEF, generation, 9001, stale_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST D: unknown entity_id rejected", len(res) == 1 and res[0]["accepted"] == 0, results)
         despawns = collect_despawns(a, 0.2)
         check("TEST D: no WILDLIFE_DESPAWN for an unknown entity_id", len(despawns) == 0, results)
 
         since = a.inbox.mark()
-        a.send_reliable(build_catch_request(stale_target["entity_id"], generation ^ 0xFFFFFFFF, 9002,
-                                            stale_target["species"]))
+        send_catch(a, stale_target["entity_id"], generation ^ 0xFFFFFFFF, 9002,
+                                            stale_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST D: mismatched-generation claim on a REAL entity_id rejected",
               len(res) == 1 and res[0]["accepted"] == 0, results)
@@ -263,7 +277,7 @@ def main():
         a.send_move_any(far_target["x"] + 100000.0, 0.0, far_target["z"] + 100000.0, reliable=True)
         time.sleep(0.3)
         since = a.inbox.mark()
-        a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9003, far_target["species"]))
+        send_catch(a, far_target["entity_id"], generation, 9003, far_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST E: out-of-range claim rejected", len(res) == 1 and res[0]["accepted"] == 0, results)
         despawns = collect_despawns(a, 0.2)
@@ -273,7 +287,7 @@ def main():
         a.send_move_any(far_target["x"], 0.0, far_target["z"], reliable=True)
         time.sleep(0.3)
         since = a.inbox.mark()
-        a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9004, far_target["species"]))
+        send_catch(a, far_target["entity_id"], generation, 9004, far_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST E: the SAME entity_id, claimed from a legitimate in-range position, is accepted",
               len(res) == 1 and res[0]["accepted"] == 1 and res[0]["entity_id"] == far_target["entity_id"],
@@ -303,8 +317,8 @@ def main():
 
             since_a = a.inbox.mark()
             since_b = b.inbox.mark()
-            a.send_reliable(build_catch_request(target["entity_id"], generation, 9101, target["species"]))
-            b.send_reliable(build_catch_request(target["entity_id"], generation, 9102, target["species"]))
+            send_catch(a, target["entity_id"], generation, 9101, target["species"])
+            send_catch(b, target["entity_id"], generation, 9102, target["species"])
             res_a = collect_catch_results(a, 0.6)
             res_b = collect_catch_results(b, 0.6)
             accepted_count = sum(1 for r in res_a if r["accepted"]) + sum(1 for r in res_b if r["accepted"])
@@ -354,8 +368,8 @@ def main():
             a.send_move_any(trash_target["x"], 0.0, trash_target["z"], reliable=True)
             time.sleep(0.3)
             since = a.inbox.mark()
-            a.send_reliable(build_catch_request(trash_target["entity_id"], generation, 9201,
-                                                AGYO_TYPE_EMPTY_CAN))
+            send_catch(a, trash_target["entity_id"], generation, 9201,
+                                                AGYO_TYPE_EMPTY_CAN)
             res = collect_catch_results(a, 0.5)
             check("TEST G: a recognized trash claim (EMPTY_CAN) on a real fish entity is ACCEPTED "
                   "regardless of the record's own species",
@@ -372,8 +386,8 @@ def main():
             a.send_move_any(mismatch_target["x"], 0.0, mismatch_target["z"], reliable=True)
             time.sleep(0.3)
             since = a.inbox.mark()
-            a.send_reliable(build_catch_request(mismatch_target["entity_id"], generation, 9202,
-                                                bogus_species))
+            send_catch(a, mismatch_target["entity_id"], generation, 9202,
+                                                bogus_species)
             res = collect_catch_results(a, 0.5)
             check("TEST G: a genuine species mismatch is REJECTED",
                   len(res) == 1 and res[0]["accepted"] == 0, results)
@@ -383,8 +397,8 @@ def main():
 
             # The fish must remain live and catchable with its own real species afterward.
             since = a.inbox.mark()
-            a.send_reliable(build_catch_request(mismatch_target["entity_id"], generation, 9203,
-                                                mismatch_target["species"]))
+            send_catch(a, mismatch_target["entity_id"], generation, 9203,
+                                                mismatch_target["species"])
             res = collect_catch_results(a, 0.5)
             check("TEST G: the SAME entity, claimed afterward with its own real species, is accepted "
                   "(a rejected mismatch claim did not consume/despawn the entity)",

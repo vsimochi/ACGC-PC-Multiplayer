@@ -10,8 +10,14 @@ made the reach checks fail open. The contract now is:
   REQUEST  (client -> host)  PICKUP_REQUEST / DROP_REQUEST, validated entirely by the host
   RESULT   (host -> client)  accepted=1 is PROVISIONAL: the tile is RESERVED for the requester, the FIELD HAS NOT
                              CHANGED; accepted=0 is a final rejection (no reservation)
-  CONFIRM  (client -> host)  INTERACT_CONFIRM (type 17, 8 bytes: kind, outcome COMMIT/ABORT, reason, request_id)
-  COMMIT   the host mutates the field ONLY on a matching CONFIRM(COMMIT) and then broadcasts FIELD_UPDATE
+  CONFIRM  (client -> host)  INTERACT_CONFIRM (type 17, 8 bytes: kind, outcome ABORT, reason, request_id); since X1b the
+                             legacy outcome COMMIT is RETIRED (the host logs and releases, never mutates)
+  COMMIT   (client -> host)  TXN_COMMIT (type 51): the host mutates the field (and the resident mirror) ONLY on a matching,
+                             valid TXN_COMMIT, answers TXN_RESULT (52) and then broadcasts FIELD_UPDATE. X1b MIGRATION: every
+                             former explicit CONFIRM(COMMIT) of this test is now an explicit TXN_COMMIT (helpers refused() /
+                             applied() below): "a COMMIT that must be ignored" is answered REJECTED(NOT_PENDING / EXPIRED) with no
+                             FIELD_UPDATE and the tile unchanged (a STRONGER assertion: the refusal is observable), "a COMMIT that must
+                             succeed" is answered APPLIED. Nothing was weakened; the auto-commit of the scripted client is TXN too.
   release  ABORT, a newer request from the same peer, peer disconnect/reset/timeout, expiry after
            PC_NETGAME_CONFIRM_TIMEOUT_MS (20 s). Expiry/abort never mutate the field.
 
@@ -27,7 +33,7 @@ Groups (select with --only, comma separated; default = all):
                          rejected, COMMIT after the abort ignored, a later drop on the tile succeeds
   B        INV-B*        pickup with full pockets: ... ABORT(POCKETS_FULL): tile still holds the item, a second
                          client can still pick it up
-  ci       INV-Ci*       (i)  CONFIRM(COMMIT) with an unknown / old / wrong-kind / another peer's request_id
+  ci       INV-Ci*       (i)  TXN_COMMIT with an unknown / old / wrong-kind / another peer's request_id
   civ      INV-Civ*      (iv) the same tile cannot be reserved by two peers (pickup and drop)
   cvi      INV-Cvi*      (vi) a new request from a peer replaces (aborts) its own pending one
   cv       INV-Cv*       (v)  reconnect into the same slot with a colliding request_id (clean DISCONNECT and
@@ -42,8 +48,20 @@ Groups (select with --only, comma separated; default = all):
   cross    INV-X*        one pending interaction PER KIND per peer: a pending pickup and a pending drop of the
                          same peer coexist and are independent; a new request of the same kind replaces only
                          that kind's pending one
-  expiry   INV-C-expiry* (ii) COMMIT after the reservation expired (~22 s on the real host): no mutation, the
+  expiry   INV-C-expiry* (ii) TXN_COMMIT after the reservation expired (~22 s on the real host): REJECTED(EXPIRED), no mutation, the
                          tile is available again, a retry of the expired request is rejected
+Concurrency (Stage 1A/1B): the host admits a client only as a DISTINCT non-host RESIDENT of its save; with the 4-resident
+fixture (bin_fixture4) at most THREE clients can be connected at once, so the old "A, B, C open + a 4th connection" pattern
+(snapshot probes / extra peers) is impossible. The groups therefore run in ROUNDS: A, B and C stay the core observers, but
+whenever a 4th connection is needed (an authoritative-snapshot probe, an extra peer D, the "truth" client) the Env first
+PARKS (graceful DISCONNECT + wait for the host's "peer N disconnected" teardown line when --host-log is given, else a short
+settle) the least-needed core client (default C, then A; the expiry group parks B) and RECONNECTS it afterwards (fresh peer,
+fresh snapshot, same inbox history so earlier marks stay valid). Consequences, stated explicitly: (1) a parked client is not
+an observer while parked (fus/exactly_once/wait_all_saw consider only the currently connected core clients), so "every client
+saw X" means every client CONNECTED at that moment, and the C-observer coverage has holes around probes / extra peers;
+(2) a parked client's per-connection state (world view violations, reliable stream, pending reservations) starts afresh on
+reconnect, so Z1/Z2 cover C only since its last reconnect; (3) only clients that hold no pending reservation / dedup state the
+following checks depend on are ever parked (A keeps its pending reservations across probes; the expiry group parks B).
 Selectors: --skip-expiry drops the slow group; --expiry-s N tells the test the host's confirm timeout
 (default 20; loopback runs the model with a short one).
 
@@ -54,6 +72,7 @@ Usage: python test_inventory_correctness.py <host_ip> <port> [--expiry-s 20] [--
 import argparse
 import math
 import re
+import struct
 import sys
 import time
 
@@ -76,9 +95,49 @@ R_POCKETS_FULL = L.CONFIRM_REASON_POCKETS_FULL
 R_SLOT_CHANGED = L.CONFIRM_REASON_SLOT_CHANGED
 R_CANCELLED = L.CONFIRM_REASON_CANCELLED
 R_STALE = L.CONFIRM_REASON_STALE
+D_NONE = L.PC_NETGAME_TXN_DEST_NONE
+D_POCKET = L.PC_NETGAME_TXN_DEST_POCKET
+T_APPLIED = L.PC_NETGAME_TXN_OUTCOME_APPLIED
+T_REJECTED = L.PC_NETGAME_TXN_OUTCOME_REJECTED
+T_NOT_PENDING = L.PC_NETGAME_TXN_REASON_NOT_PENDING
+T_EXPIRED = L.PC_NETGAME_TXN_REASON_EXPIRED
+T_REPLAYED = L.PC_NETGAME_TXN_REASON_REPLAYED
 
 results = []
 pend = []
+
+
+def txn_commit(client, kind, rid, item=None, slot=None):
+    """An explicit TXN_COMMIT (the X1b replacement of the retired CONFIRM(COMMIT)); returns TxnSent. Defaults: DROP/BURY use the (slot, item)
+    its request carried; PICKUP goes to the first free pocket of the client's local image (when every pocket is occupied the scripted
+    player 'discards' the last slot, exactly like the auto-commit) with item = the seed apple unless given."""
+    if kind == K_PICKUP:
+        pockets = client.txn_pre_image()[0]
+        pre = None
+        s_ = slot if slot is not None else next((i for i, p in enumerate(pockets) if p == L.EMPTY_NO), None)
+        if s_ is None:
+            s_ = len(pockets) - 1
+            cleared = tuple(L.EMPTY_NO if i == s_ else p for i, p in enumerate(pockets))
+            pre = (cleared, client.txn_pre_image()[1], client.txn_pre_image()[2])
+            if client.rec_local is not None:
+                client.rec_local = L.record_set_inventory(client.rec_local, *pre)
+        return client.send_txn_commit(kind, rid, D_POCKET, s_, item if item is not None else ITM_FOOD_APPLE, pre=pre)
+    s_, it = client.txn_requests.get((kind, rid), (0, ITM_FOOD_CHERRY))
+    return client.send_txn_commit(kind, rid, D_NONE, slot if slot is not None else s_, item if item is not None else it)
+
+
+def refused(client, kind, rid, reason=T_NOT_PENDING, item=None, slot=None):
+    """Sends an explicit TXN_COMMIT the host must REFUSE; True iff it was answered REJECTED with `reason`."""
+    sent = txn_commit(client, kind, rid, item, slot)
+    r = client.wait_txn_result(sent.seq, 2.0)
+    return r is not None and r.outcome == T_REJECTED and r.reason == reason
+
+
+def applied(client, kind, rid, item=None, slot=None):
+    """Sends an explicit TXN_COMMIT that must succeed; returns the APPLIED TXN_RESULT or None."""
+    sent = txn_commit(client, kind, rid, item, slot)
+    r = client.wait_txn_result(sent.seq, 2.0)
+    return r if r is not None and r.outcome == T_APPLIED else None
 
 
 def ck(desc, cond):
@@ -131,8 +190,12 @@ def evaluate_evidence(log_text, evidence):
 class Env:
     """Three long-lived fake clients (A requester, B second client, C observer/third peer) plus helpers."""
 
-    def __init__(self, host_ip, port, expiry_s):
+    def __init__(self, host_ip, port, expiry_s, host_log=None):
         self.host_ip, self.port, self.expiry_s = host_ip, port, expiry_s
+        self.host_log = host_log  # object with log_text() (optional): lets park() wait for the host's teardown line
+        self.ext_parked = []      # core clients parked for the lifetime of the extra peers (restored by close_extras)
+        self.parks = 0            # how many park/unpark cycles ran (informational)
+        self.parked = set()       # core clients deliberately parked right now (labels); anything else must be connected
         self.rid_gen = L.make_request_id_counter(9000)
         self.a, self.b, self.c = L.connect_ready_clients(host_ip, port, ["A", "B", "C"])
         self.core = [self.a, self.b, self.c]
@@ -154,7 +217,63 @@ class Env:
     def settle(self, seconds=0.4):
         L.pump_sleep(seconds)
 
+    # --- <= 3 simultaneous clients: park / unpark core clients -------------------------------------------
+    def observers(self):
+        """The core clients that are connected right now (a parked client observes nothing)."""
+        conn = [x for x in self.core if x.is_connected()]
+        expected = [x for x in self.core if x.label not in self.parked]
+        if {x.label for x in conn} != {x.label for x in expected} or not conn:
+            # an UNEXPECTED drop of a core client must fail the run, never silently shrink the observer set
+            raise RuntimeError("core observer set mismatch: connected=%s expected=%s (parked=%s)"
+                               % (sorted(x.label for x in conn), sorted(x.label for x in expected), sorted(self.parked)))
+        return conn
+
+    def open_count(self):
+        return len(self.observers()) + sum(1 for x in self.extras if x.is_connected())
+
+    def _td(self):
+        return len(re.findall(r"\[NET\] host: peer \d+ disconnected", self.host_log.log_text())) if self.host_log else 0
+
+    def park(self, x):
+        """Graceful departure of a core client; waits for the host's teardown line (or a settle without a host log)."""
+        before = self._td()
+        self.parked.add(x.label)
+        x.disconnect()
+        if self.host_log:
+            if not L.DEFAULT_HUB.wait_until(lambda: self._td() > before, 6.0):
+                ck(f"INV-park host tore down parked client {x.label} (teardown line within 6 s)", False)
+        else:
+            self.settle(0.6)
+        self.settle(0.3)
+        self.parks += 1
+
+    def unpark(self, x):
+        """Reconnect a parked core client as a fresh peer; its earlier inbox history is kept so marks stay valid."""
+        self.settle(0.3)
+        saved = list(x.inbox._items)
+        L.rebind_default_player(x)  # the allocator must again see x as the holder of its resident
+        x.connect_and_ready(quiet=True)
+        self.parked.discard(x.label)
+        x.inbox._items = saved + x.inbox._items
+        self.peer_ids.add(x.assigned_peer_id)
+        x.drain_field_updates(0.2)
+
+    def make_room(self, victims=None):
+        """Park core clients (order: `victims`, default C then A) until a further connection fits (<= 3 open clients).
+        Returns the clients it parked."""
+        parked = []
+        for v in (victims if victims is not None else [self.c, self.a]):
+            if self.open_count() < 3:
+                break
+            if v.is_connected():
+                self.park(v)
+                parked.append(v)
+        if self.open_count() >= 3:
+            raise RuntimeError("cannot make room for a 4th connection (no parkable core client left)")
+        return parked
+
     def new_client(self, label):
+        self.ext_parked += self.make_room()
         c = L.FakeClient(label, self.host_ip, self.port)
         c.connect_and_ready(quiet=True)
         self.extras.append(c)
@@ -169,14 +288,16 @@ class Env:
                 pass
         self.extras = []
         self.settle(0.2)
+        while self.ext_parked:
+            self.unpark(self.ext_parked.pop())
 
     def marks(self):
         return {c: c.inbox.mark() for c in self.core}
 
     def fus(self, marks, ut):
-        """[(client label, value)] for every FIELD_UPDATE about `ut` that reached a core client since `marks`."""
+        """[(client label, value)] for every FIELD_UPDATE about `ut` that reached a connected core client since `marks`."""
         out = []
-        for c in self.core:
+        for c in self.observers():
             for g in c.field_updates_since(marks[c]):
                 if L.field_update_tuple(g)[:2] == ut:
                     out.append((c.label, g.value))
@@ -187,7 +308,7 @@ class Env:
 
     def wait_all_saw(self, marks, ut, value, timeout=2.0):
         return L.DEFAULT_HUB.wait_until(
-            lambda: all(value in self.fu_values(marks, ut, c.label) for c in self.core), timeout)
+            lambda: all(value in self.fu_values(marks, ut, c.label) for c in self.observers()), timeout)
 
     def ev(self, desc, must=(), must_not=()):
         self.evidence.append((desc, list(must), list(must_not)))
@@ -197,11 +318,21 @@ class Env:
         if not self.wait_all_saw(marks, ut, value, timeout):
             return False
         self.settle(0.3)
-        return all(self.fu_values(marks, ut, c.label) == [value] for c in self.core)
+        return all(self.fu_values(marks, ut, c.label) == [value] for c in self.observers())
+
+    def tiles(self, uts, park=None):
+        """Authoritative values of town tiles via a fresh client's complete snapshot (non-mutating). The probe is a
+        4th connection, so a core client is parked for its duration (see the module docstring); `park` overrides the
+        victim order."""
+        parked = self.make_room(park)
+        try:
+            return L.read_tiles_via_snapshot(self.host_ip, self.port, uts)
+        finally:
+            for v in reversed(parked):
+                self.unpark(v)
 
     def tile(self, ut):
-        """Authoritative value of a town tile via a fresh client's complete snapshot (non-mutating)."""
-        return L.read_tiles_via_snapshot(self.host_ip, self.port, [ut])[ut]
+        return self.tiles([ut])[ut]
 
     # --- tile pools ----------------------------------------------------------------------------------------
     def take_live(self):
@@ -250,10 +381,10 @@ def group_a(env):
     r2 = a.wait_result(DROP_RES, rid, 1.0)
     ck("INV-A5 a retry of the aborted request_id is deterministically REJECTED (never re-granted)",
        r2 is not None and r2.accepted == 0)
-    a.confirm(K_DROP, rid, COMMIT)  # a late/duplicate COMMIT after the abort
+    rej_a6 = refused(a, K_DROP, rid, item=ITM_FOOD_CHERRY, slot=0)  # a late/duplicate TXN_COMMIT after the abort
     env.settle(0.5)
-    ck("INV-A6 a COMMIT after the ABORT is ignored: no FIELD_UPDATE and the tile is still EMPTY",
-       env.fus(m, E) == [] and env.tile(E) == L.EMPTY_NO)
+    ck("INV-A6 a TXN_COMMIT after the ABORT is refused (REJECTED NOT_PENDING): no FIELD_UPDATE and the tile is still EMPTY",
+       rej_a6 and env.fus(m, E) == [] and env.tile(E) == L.EMPTY_NO)
     rb = env.rid()
     res_b = b.drop(1, ITM_FOOD_APPLE, E[0], E[1], rb, claim_at=E, timeout=1.0)
     ck("INV-A7 the tile is available again: a second client's drop onto it is accepted",
@@ -289,10 +420,10 @@ def group_b(env):
     a.send_pickup_request(P[0], P[1], rid)
     r2 = a.wait_result(PICKUP_RES, rid, 1.0)
     ck("INV-B5 a retry of the aborted request_id is deterministically REJECTED", r2 is not None and r2.accepted == 0)
-    a.confirm(K_PICKUP, rid, COMMIT)
+    rej_b6 = refused(a, K_PICKUP, rid, item=ITM_FOOD_APPLE)
     env.settle(0.5)
-    ck("INV-B6 a COMMIT after the ABORT is ignored: no FIELD_UPDATE, the tile still holds the apple",
-       env.fus(m, P) == [] and env.tile(P) == ITM_FOOD_APPLE)
+    ck("INV-B6 a TXN_COMMIT after the ABORT is refused (REJECTED NOT_PENDING): no FIELD_UPDATE, the tile still holds the apple",
+       rej_b6 and env.fus(m, P) == [] and env.tile(P) == ITM_FOOD_APPLE)
     rb = env.rid()
     res_b = b.pickup(P[0], P[1], rb, timeout=1.0)
     ck("INV-B7 a second client can still pick the item up (granted the apple)",
@@ -313,14 +444,14 @@ def group_ci(env):
     rid = env.rid()
     res = a.pickup(P[0], P[1], rid, timeout=1.0, auto_confirm=False)
     ck("INV-Ci0 precondition: A holds a pending (provisional) pickup reservation", res is not None and res.accepted == 1)
-    a.confirm(K_PICKUP, rid + 5000, COMMIT)   # unknown request id
-    a.confirm(K_DROP, rid, COMMIT)            # the pending request's id, but the wrong kind
-    c.confirm(K_PICKUP, rid, COMMIT)          # another peer citing A's request id
-    c.confirm(K_DROP, 424242, COMMIT)         # a peer with nothing pending at all
-    a.confirm(K_PICKUP, 1, COMMIT)            # an old, never-issued low id
+    rejs = [refused(a, K_PICKUP, rid + 5000),   # unknown request id
+            refused(a, K_DROP, rid),            # the pending request's id, but the wrong kind
+            refused(c, K_PICKUP, rid),          # another peer citing A's request id
+            refused(c, K_DROP, 424242),         # a peer with nothing pending at all
+            refused(a, K_PICKUP, 1)]            # an old, never-issued low id
     env.settle(0.6)
-    ck("INV-Ci1 CONFIRM(COMMIT) with an unknown / wrong-kind / other-peer / never-issued request_id: no FIELD_UPDATE",
-       env.fus(m, P) == [])
+    ck("INV-Ci1 TXN_COMMIT with an unknown / wrong-kind / other-peer / never-issued request_id: each answered REJECTED(NOT_PENDING), no FIELD_UPDATE",
+       all(rejs) and env.fus(m, P) == [])
     ck("INV-Ci2 ... and the authoritative snapshot still shows the apple (no mutation)", env.tile(P) == ITM_FOOD_APPLE)
     rb = env.rid()
     res_b = b.pickup(P[0], P[1], rb, timeout=1.0)
@@ -333,14 +464,20 @@ def group_ci(env):
     Q = env.take_live()
     m2 = env.marks()
     rq = env.rid()
-    resq = a.pickup(Q[0], Q[1], rq, timeout=1.0)  # auto-CONFIRM(COMMIT)
+    resq = a.pickup(Q[0], Q[1], rq, timeout=1.0)  # auto TXN_COMMIT
     ck("INV-Ci4 control: a normal pickup (auto-confirmed) is accepted and every client sees exactly one FIELD_UPDATE",
        resq is not None and resq.accepted == 1 and env.exactly_once(m2, Q, L.EMPTY_NO))
-    a.confirm(K_PICKUP, rq, COMMIT)
-    a.confirm(K_PICKUP, rq, COMMIT)
+    env.settle(0.4)
+    raw_rq = a.txn_commits_sent[-1][0]               # the auto-commit's exact bytes
+    seq_rq = struct.unpack_from("<I", raw_rq, 12)[0]
+    a.send_reliable(raw_rq)                          # a BYTE-IDENTICAL resend: the journal replays the APPLIED, nothing executes twice
+    replay = a.wait_txn_result(seq_rq, 2.0, nth=2)
+    rej_rq = refused(a, K_PICKUP, rq)                # a NEW seq for the request that is already DONE: NOT_PENDING
     env.settle(0.6)
-    ck("INV-Ci5 duplicate COMMITs after the request is DONE are idempotent (still exactly one FIELD_UPDATE per client)",
-       all(env.fu_values(m2, Q, x.label) == [L.EMPTY_NO] for x in env.core))
+    ck("INV-Ci5 duplicates after the request is DONE are idempotent: the identical resend replays APPLIED (REPLAYED), a new-seq COMMIT is "
+       "REFUSED (NOT_PENDING), still exactly one FIELD_UPDATE per client",
+       replay is not None and replay.outcome == T_APPLIED and replay.reason == T_REPLAYED and rej_rq
+       and all(env.fu_values(m2, Q, x.label) == [L.EMPTY_NO] for x in env.observers()))
     env.empty.append(Q)
 
 
@@ -433,10 +570,10 @@ def group_civ(env):
     ck("INV-Civ3 C's request for the same tile is rejected too", res_c is not None and res_c.accepted == 0)
     env.settle(0.4)
     ck("INV-Civ4 the rejected competitors caused no FIELD_UPDATE", env.fus(m, P) == [])
-    a.confirm(K_PICKUP, ra, COMMIT)
-    ck("INV-Civ5 A's later COMMIT still succeeds (the competitors did not disturb the reservation): every client "
+    ok_civ5 = applied(a, K_PICKUP, ra, item=res_a.granted_item)
+    ck("INV-Civ5 A's later TXN_COMMIT still succeeds (APPLIED; the competitors did not disturb the reservation): every client "
        "(A, B, C) sees exactly one FIELD_UPDATE clearing the tile",
-       env.exactly_once(m, P, L.EMPTY_NO))
+       ok_civ5 is not None and env.exactly_once(m, P, L.EMPTY_NO))
     env.empty.append(P)
 
     E = env.take_empty()
@@ -482,10 +619,10 @@ def group_cv(env, variant):
     d.reconnect_and_ready(same_address_restart=(variant == "restart"))
     ck(f"INV-Cv1 [{variant}] precondition: the reconnect landed in the SAME slot {slot} (got {d.assigned_peer_id}) "
        "-- otherwise the collision is not exercised", d.assigned_peer_id == slot)
-    d.confirm(K_PICKUP, R, COMMIT)  # the colliding request id: the OLD reservation must not be confirmable
+    rej_cv2 = refused(d, K_PICKUP, R, item=ITM_FOOD_APPLE)  # the colliding request id: the OLD reservation must not be committable
     env.settle(0.6)
-    ck(f"INV-Cv2 [{variant}] a COMMIT with the colliding request_id from the new connection does nothing: no "
-       "FIELD_UPDATE", env.fus(m, P) == [])
+    ck(f"INV-Cv2 [{variant}] a TXN_COMMIT with the colliding request_id from the new connection is refused (NOT_PENDING) and does "
+       "nothing: no FIELD_UPDATE", rej_cv2 and env.fus(m, P) == [])
     ck(f"INV-Cv3 [{variant}] ... and the authoritative snapshot still shows the apple", env.tile(P) == ITM_FOOD_APPLE)
     res2 = d.pickup(P2[0], P2[1], R, timeout=1.0, auto_confirm=False)
     ck(f"INV-Cv4 [{variant}] the SAME request_id from the new connection is validated fresh (accepted, echoing the "
@@ -519,10 +656,10 @@ def group_cvi(env):
     res2 = a.pickup(P2[0], P2[1], r2, timeout=1.0, auto_confirm=False)
     ck("INV-Cvi2 A's SECOND request (new request_id, other tile) is accepted: it replaces the first",
        res2 is not None and res2.accepted == 1)
-    a.confirm(K_PICKUP, r1, COMMIT)  # the replaced (implicitly aborted) request
+    rej_cvi3 = refused(a, K_PICKUP, r1, item=res1.granted_item)  # the replaced (implicitly aborted) request
     env.settle(0.6)
-    ck("INV-Cvi3 a COMMIT for the replaced request is ignored: no FIELD_UPDATE, the first tile still holds the apple",
-       env.fus(m, P1) == [] and env.tile(P1) == ITM_FOOD_APPLE)
+    ck("INV-Cvi3 a TXN_COMMIT for the replaced request is refused (NOT_PENDING): no FIELD_UPDATE, the first tile still holds the apple",
+       rej_cvi3 and env.fus(m, P1) == [] and env.tile(P1) == ITM_FOOD_APPLE)
     rb = env.rid()
     res_b = b.pickup(P1[0], P1[1], rb, timeout=1.0, auto_confirm=False)
     ck("INV-Cvi4 the replaced request's reservation was released: B's request for the first tile is accepted",
@@ -532,9 +669,9 @@ def group_cvi(env):
     res_c = c.pickup(P2[0], P2[1], env.rid(), timeout=1.0)
     ck("INV-Cvi5 the new request keeps its own reservation: C's pickup of the second tile is rejected",
        res_c is not None and res_c.accepted == 0)
-    a.confirm(K_PICKUP, r2, COMMIT)
-    ck("INV-Cvi6 A's COMMIT for the surviving request clears the second tile for every client",
-       env.wait_all_saw(m, P2, L.EMPTY_NO, 2.0))
+    ok_cvi6 = applied(a, K_PICKUP, r2, item=res2.granted_item)
+    ck("INV-Cvi6 A's TXN_COMMIT for the surviving request is APPLIED and clears the second tile for every client",
+       ok_cvi6 is not None and env.wait_all_saw(m, P2, L.EMPTY_NO, 2.0))
     a.send_pickup_request(P1[0], P1[1], r1)  # a retry of exactly the replaced request id (its tile is free again)
     r_retry = a.wait_result(PICKUP_RES, r1, 1.0)
     ck("INV-Cvi7 a retry of the replaced request_id is rejected (accepted=0), not re-granted even though its tile "
@@ -542,7 +679,7 @@ def group_cvi(env):
     if r_retry is not None and r_retry.accepted:
         a.confirm(K_PICKUP, r1, ABORT, R_CANCELLED)
     env.settle(0.4)
-    tiles = L.read_tiles_via_snapshot(env.host_ip, env.port, [P1, P2])
+    tiles = env.tiles([P1, P2])
     ck("INV-Cvi8 authoritative snapshot: the first tile still holds its apple, the second is empty",
        tiles[P1] == ITM_FOOD_APPLE and tiles[P2] == L.EMPTY_NO)
     env.live.append(P1)
@@ -574,9 +711,9 @@ def group_cross(env):
        res_b1 is not None and res_b1.accepted == 0 and res_b2 is not None and res_b2.accepted == 0)
     env.settle(0.3)
     ck("INV-X3 neither pending request caused a FIELD_UPDATE", env.fus(m, P1) == [] and env.fus(m, E) == [])
-    a.confirm(K_DROP, rd, COMMIT)
-    ck("INV-X4 COMMIT of the DROP commits it (every client sees the cherry on the drop tile exactly once)",
-       env.exactly_once(m, E, ITM_FOOD_CHERRY))
+    ok_x4 = applied(a, K_DROP, rd)
+    ck("INV-X4 TXN_COMMIT of the DROP commits it (APPLIED; every client sees the cherry on the drop tile exactly once)",
+       ok_x4 is not None and env.exactly_once(m, E, ITM_FOOD_CHERRY))
     ck("INV-X5 ...and did NOT touch the pending pickup: its tile is still reserved (B rejected) and unchanged",
        env.fus(m, P1) == [] and b.pickup(P1[0], P1[1], env.rid(), timeout=1.0).accepted == 0
        and env.tile(P1) == ITM_FOOD_APPLE)
@@ -589,14 +726,14 @@ def group_cross(env):
        res_b3 is not None and res_b3.accepted == 1)
     if res_b3 is not None and res_b3.accepted:
         b.confirm(K_PICKUP, rb3, ABORT, R_CANCELLED)  # leave the tile untouched
-    a.confirm(K_PICKUP, rp1, COMMIT)  # the replaced request: ignored
-    a.confirm(K_PICKUP, rp2, COMMIT)
-    ck("INV-X8 COMMIT of the replaced pickup is ignored, COMMIT of the surviving pickup clears only its own tile",
-       env.exactly_once(m, P2, L.EMPTY_NO) and env.fus(m, P1) == [])
+    rej_x8 = refused(a, K_PICKUP, rp1, item=res_p.granted_item)  # the replaced request: refused
+    ok_x8 = applied(a, K_PICKUP, rp2, item=res_p2.granted_item)
+    ck("INV-X8 TXN_COMMIT of the replaced pickup is refused (NOT_PENDING), COMMIT of the surviving pickup is APPLIED and clears only its own tile",
+       rej_x8 and ok_x8 is not None and env.exactly_once(m, P2, L.EMPTY_NO) and env.fus(m, P1) == [])
     env.settle(0.3)
     ck("INV-X9 authoritative snapshot: first pickup tile still holds the apple, second is empty, drop tile holds the "
        "cherry", (lambda t: t[P1] == ITM_FOOD_APPLE and t[P2] == L.EMPTY_NO and t[E] == ITM_FOOD_CHERRY)(
-           L.read_tiles_via_snapshot(env.host_ip, env.port, [P1, P2, E])))
+           env.tiles([P1, P2, E])))
     # reverse direction: a pending DROP, then a PICKUP request; abort the drop -> the pickup survives, then commit it
     E2 = env.take_empty()
     rd2, rp3 = env.rid(), env.rid()
@@ -613,8 +750,8 @@ def group_cross(env):
        and res_b5.accepted == 1)
     if res_b5 is not None and res_b5.accepted:
         b.confirm(K_DROP, res_b5.request_id, ABORT, R_CANCELLED)
-    a.confirm(K_PICKUP, rp3, COMMIT)
-    ck("INV-X12 the surviving pickup still commits independently", env.exactly_once(m, P3, L.EMPTY_NO))
+    ok_x12 = applied(a, K_PICKUP, rp3, item=res_p3.granted_item)
+    ck("INV-X12 the surviving pickup still commits independently (APPLIED)", ok_x12 is not None and env.exactly_once(m, P3, L.EMPTY_NO))
     env.live.append(P1)
     env.empty.extend([P2, P3, E2])
 
@@ -849,21 +986,27 @@ def group_expiry(env):
     env.settle(max(0.0, t0 + T + 2.0 - time.monotonic()))
     ck("INV-C-expiry-3 no FIELD_UPDATE for either tile through the expiry (expiry never mutates the field)",
        env.fus(m, P) == [] and env.fus(m, E) == [])
-    a.confirm(K_PICKUP, ra, COMMIT)
-    c.confirm(K_DROP, rc, COMMIT)
+    rej_p = refused(a, K_PICKUP, ra, reason=T_EXPIRED, item=res_a.granted_item)
+    # C's resident (3) was taken over by later FakeClient "extra" peers with NEW process nonces while C was parked, so the host (correctly) FENCES C's old
+    # nonce: a refusal either way (EXPIRED if C's nonce is still the current one, FENCED when a newer process has served the resident). The
+    # EXPIRED answer itself is asserted for the pickup (A, same nonce throughout) and in test_txn_protocol T4.
+    rej_d = refused(c, K_DROP, rc, reason=T_EXPIRED, item=ITM_FOOD_CHERRY, slot=0) or c.txn_results_for(c.txn_seq) and         c.txn_results_for(c.txn_seq)[-1].reason == L.PC_NETGAME_TXN_REASON_FENCED
     env.settle(0.7)
-    ck("INV-C-expiry-4 COMMIT after expiry (pickup and drop) causes no mutation: no FIELD_UPDATE",
-       env.fus(m, P) == [] and env.fus(m, E) == [])
-    tiles = L.read_tiles_via_snapshot(env.host_ip, env.port, [P, E])
-    ck("INV-C-expiry-5 authoritative snapshot: the pickup tile still holds the apple, the drop tile is still empty "
-       "(the timer was not extended by the retry, and the late COMMIT did nothing)",
-       tiles[P] == ITM_FOOD_APPLE and tiles[E] == L.EMPTY_NO)
+    ck("INV-C-expiry-4 TXN_COMMIT after expiry (pickup and drop) is answered REJECTED(EXPIRED) (the L-2 gap: the legacy COMMIT got no answer) "
+       "and causes no mutation: no FIELD_UPDATE", rej_p and rej_d and env.fus(m, P) == [] and env.fus(m, E) == [])
     a.send_pickup_request(P[0], P[1], ra)
     ra2 = a.wait_result(PICKUP_RES, ra, 1.0)
     c.send_drop_request(0, ITM_FOOD_CHERRY, E[0], E[1], rc)
     rc2 = c.wait_result(DROP_RES, rc, 1.0)
     ck("INV-C-expiry-6 a retry of an EXPIRED request_id is deterministically rejected (pickup and drop; never "
        "re-granted)", ra2 is not None and ra2.accepted == 0 and rc2 is not None and rc2.accepted == 0)
+    # -5 (authoritative snapshot) is taken HERE, after the -6 retries (which must not mutate anything either): the probe is a 4th
+    # connection and A (retry of ra) and C (retry of rc) must stay on their connections for -6, so B is parked for it (B holds
+    # no pending state; its first action after the probe is the -7 pickup).
+    tiles = env.tiles([P, E], park=[b])
+    ck("INV-C-expiry-5 authoritative snapshot: the pickup tile still holds the apple, the drop tile is still empty "
+       "(the timer was not extended by the retry, and the late COMMIT did nothing; taken after the -6 retries)",
+       tiles[P] == ITM_FOOD_APPLE and tiles[E] == L.EMPTY_NO)
     res_b = b.pickup(P[0], P[1], env.rid(), timeout=1.0)
     ck("INV-C-expiry-7 the expired pickup tile is available again: B's pickup is accepted (granted the apple)",
        res_b is not None and res_b.accepted == 1 and res_b.granted_item == ITM_FOOD_APPLE)
@@ -891,7 +1034,7 @@ def log_evidence(env, host_log):
 
 def final_integrity(env):
     env.settle(0.5)
-    truth_client = env.new_client("truth")
+    truth_client = env.new_client("truth")  # parks C for its lifetime; C's world cannot change meanwhile (no mutation here)
     ck("INV-Z1 every core client's reliable stream stayed contiguous and it holds no world violations",
        all(x.delivered_in_order() and not x.world.violations for x in env.core))
     diffs = [x.world.diff(truth_client.world) for x in env.core]
@@ -943,7 +1086,7 @@ def main():
                     return ""
         host_log = _Log(a.host_log)
 
-    env = Env(a.host_ip, a.port, a.expiry_s)
+    env = Env(a.host_ip, a.port, a.expiry_s, host_log)
     if not env.live:
         L.pending("no apple fixture tile in the snapshot (launch the host with --pickup-test-seed)", pend)
         for x in env.core:
@@ -967,6 +1110,7 @@ def main():
         finally:
             env.close_extras()
     final_integrity(env)
+    L.info(f"core park/unpark cycles this run (4th-connection rounds): {env.parks}")
     log_evidence(env, host_log)
     for x in env.core:
         x.close()

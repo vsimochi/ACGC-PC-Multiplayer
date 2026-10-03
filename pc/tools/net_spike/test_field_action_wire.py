@@ -10,7 +10,7 @@ re-implements (in Python, from the C source, not imported) the key host/client d
 milestone added so they can be regression-checked without a live game process:
 
   1. Struct size/layout matches the documented C layout exactly:
-       PCNetGameFieldActionRequestMsg == 12 bytes (msg_type, kind, ut_x, ut_z, request_id,
+       PCNetGameFieldActionRequestMsg == 76 bytes (X3: the 12-byte v3 header + the 64-byte txn tag; msg_type, kind, ut_x, ut_z, request_id,
                                                      hole_variant, _reserved0, _reserved1) -- protocol
                                                      v3 widened this from 8 bytes; see below.
        PCNetGameFieldActionResultMsg  == 12 bytes (msg_type, kind, accepted, ut_x, request_id,
@@ -46,9 +46,9 @@ import struct
 import sys
 
 # --- wire layout -----------------------------------------------------------------------------
-# PCNetGameFieldActionRequestMsg (protocol v3): uint8 msg_type, uint8 kind, uint8 ut_x, uint8 ut_z,
-#   uint32 request_id, uint8 hole_variant, uint8 _reserved0, uint16 _reserved1
-REQ_FMT = "<BBBBIBBH"
+# PCNetGameFieldActionRequestMsg (protocol v3 + X3): uint8 msg_type, uint8 kind, uint8 ut_x, uint8 ut_z,
+#   uint32 request_id, uint8 hole_variant, uint8 _reserved0, uint16 _reserved1, then the 64-byte PCNetGameTxnTag (X3)
+REQ_FMT = "<BBBBIBBH64x"
 REQ_SIZE = struct.calcsize(REQ_FMT)
 
 # PCNetGameFieldActionResultMsg: uint8 msg_type, uint8 kind, uint8 accepted, uint8 ut_x,
@@ -113,7 +113,7 @@ def decode_result(buf):
 
 
 # --- 1/2: layout + round-trip ------------------------------------------------------------------
-check("PCNetGameFieldActionRequestMsg size == 12 bytes (protocol v3, was 8)", REQ_SIZE == 12)
+check("PCNetGameFieldActionRequestMsg size == 76 bytes (X3: the 12-byte v3 header + the 64-byte txn tag; was 12)", REQ_SIZE == 76)
 check("PCNetGameFieldActionResultMsg size == 12 bytes (unchanged by v3)", RES_SIZE == 12)
 
 req = decode_request(encode_request(KIND_DIG_BURIED, 200, 5, 0xDEADBEEF & 0xFFFFFFFF))

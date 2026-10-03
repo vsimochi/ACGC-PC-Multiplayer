@@ -152,11 +152,11 @@ static void Player_actor_CutTree_Swing_axe(ACTOR* actor, GAME* game, mPlayer_mai
              * mode: it only flips a local timer Player_actor_Check_BirthBee_Swing_axe() polls every
              * frame; the actual bee-birth mutation is requested separately, from
              * Player_actor_Check_BirthBee_common() (m_player_common.c_inc), once that timer elapses. */
-            if (pc_net_game_world_is_host_authoritative() || pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT || pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
                 if (IS_ITEM_BEE_TREE(item) && flag == FALSE && mPlib_able_birth_bee()) {
                     main_axe->bee_counter = 5.0f;
                 }
-                if (pc_net_game_world_is_host_authoritative()) {
+                if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                     pc_net_game_request_tree_chop(ut_x, ut_z);
                 } else {
                     pc_net_game_host_local_tree_chop(ut_x, ut_z);

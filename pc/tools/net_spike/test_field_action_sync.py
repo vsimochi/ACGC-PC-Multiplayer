@@ -64,7 +64,7 @@ FIELD_ACTION_RESULT_TYPE = 30   # PC_NETGAME_MSG_FIELD_ACTION_RESULT
 KIND_DIG_BURIED = 1             # PC_NETGAME_FIELD_ACTION_KIND_DIG_BURIED
 KIND_MONEY_ROCK_HIT = 2         # PC_NETGAME_FIELD_ACTION_KIND_MONEY_ROCK_HIT
 
-REQ_FMT = "<BBBBIBBH"  # protocol v3: + hole_variant, _reserved0, _reserved1 (was "<BBBBI", 8 bytes)
+REQ_FMT = "<BBBBIBBH64x"  # protocol v3 + X3: 12-byte header (hole_variant, _reserved0, _reserved1) + the 64-byte txn tag (all zero = no grant)
 RES_FMT = "<BBBBIHBB"
 REQ_SIZE = struct.calcsize(REQ_FMT)
 RES_SIZE = struct.calcsize(RES_FMT)
@@ -98,7 +98,19 @@ def decode_field_action_result(payload):
 
 
 def send_field_action_request(client, kind, ut_x, ut_z, request_id):
+    if kind == KIND_DIG_BURIED:
+        # X3: DIG_BURIED is a host-transactional GRANT: the request carries the pre-image tag (the host resolves the item; the pocket
+        # changes only on the TXN_RESULT). The tag is built from the client's own record image (FakeClient.send_fa_grant).
+        return client.send_fa_grant(kind, ut_x, ut_z, request_id)
     return client.send_reliable(build_field_action_request(kind, ut_x, ut_z, request_id))
+
+
+def txn_result_for(client, request_id):
+    """The TXN_RESULT (X3) of this request on the current connection, or None."""
+    for conn, g in client.txn_results:
+        if g.request_id == request_id and conn == client.connect_count:
+            return g
+    return None
 
 
 def wait_field_action_result(client, request_id, timeout=1.0):
@@ -143,6 +155,11 @@ def main():
         check("Test D1: request_id echoed", r1["request_id"] == rid1, results)
         check("Test D1: granted item is the seeded ITM_FOOD_APPLE (or a resolved equivalent, never EMPTY_NO)",
               r1["accepted"] and r1["granted_item"] != EMPTY_NO, results)
+        t1 = txn_result_for(a, rid1)
+        check("Test D1 (X3): the grant was answered by a TXN_RESULT(APPLIED, kind DIG_BURIED) carrying the SAME host-resolved item "
+              "(the pocket is granted by it, not by the legacy RESULT)",
+              t1 is not None and t1.outcome == 0 and t1.kind == 4 and t1.item == r1["granted_item"]
+              and t1.post_pockets[t1.slot] == r1["granted_item"], results)
 
     # --- Test D2: a second DIG_BURIED on the SAME (now-dug) tile is rejected -- no duplication. -----
     r2, _rid2 = field_action(a, KIND_DIG_BURIED, *DIG_TILE)

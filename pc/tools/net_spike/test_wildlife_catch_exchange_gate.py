@@ -129,6 +129,20 @@ def build_catch_request(entity_id, generation, request_id, claimed_species):
     return struct.pack(CATCH_REQUEST_FMT, CATCH_REQUEST_TYPE, entity_id, generation, request_id,
                        claimed_species)
 
+# X3 (host-transactional catch, protocol v8 extended in place): CATCH_REQUEST is 84 bytes = the 20-byte header above + the 64-byte
+# PCNetGameTxnTag. These helpers build the tagged request from the sending FakeClient's own record image (dest POCKET + the
+# host-derived item of the claimed species), exactly like the real client does.
+KIND_UNDER_TEST = "fish"
+
+
+def catch_bytes(client, entity_id, generation, request_id, claimed_species):
+    return client.catch_request_bytes(entity_id, generation, request_id, claimed_species, kind=KIND_UNDER_TEST)
+
+
+def send_catch(client, entity_id, generation, request_id, claimed_species):
+    return client.send_catch_txn(entity_id, generation, request_id, claimed_species, kind=KIND_UNDER_TEST)
+
+
 
 def collect_catch_results(client, duration):
     def pred(m):
@@ -244,7 +258,7 @@ def test_h(port, log_dir, results):
               results)
         if generation is None:
             return
-        racer_request = build_catch_request(target["entity_id"], generation, 5001, target["species"])
+        racer_request = catch_bytes(racer, target["entity_id"], generation, 5001, target["species"])
 
         # The real client is launched AFTER the fish already exists, so its own late-join snapshot names
         # this SAME entity_id -- --force-fish-catch's own client trigger latches whichever fish it most

@@ -103,6 +103,8 @@ int pc_net_is_host(void) { return 0; }
 int pc_net_is_connected(void) { return 0; }
 int pc_net_peer_count(void) { return 0; }
 void pc_net_disconnect(PCNetPeerId peer) { (void)peer; }
+int pc_net_peer_idle_ms(PCNetPeerId peer) { (void)peer; return -1; }
+void pc_net_evict(PCNetPeerId peer) { (void)peer; }
 
 #else /* _WIN32 */
 
@@ -1105,6 +1107,22 @@ int pc_net_peer_count(void) {
         if (s_peers[i].state == PCNET_PEER_CONNECTED) n++;
     }
     return n;
+}
+
+int pc_net_peer_idle_ms(PCNetPeerId peer) {
+    uint32_t idle;
+    if (s_socket == INVALID_SOCKET || !s_is_host) return -1;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_peers[peer].state != PCNET_PEER_CONNECTED) return -1;
+    idle = (uint32_t)GetTickCount() - s_peers[peer].last_recv_tick;
+    return idle > 0x7FFFFFFFu ? 0 : (int)idle; /* a tick newer than `now` (wrap/ordering) reads as 0 */
+}
+
+void pc_net_evict(PCNetPeerId peer) {
+    if (s_socket == INVALID_SOCKET || !s_is_host) return;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_peers[peer].state != PCNET_PEER_CONNECTED) return;
+    if (s_fault.enabled) pcnet_fault_flush_held();
+    pcnet_send_ctrl(&s_peers[peer].addr, PCNET_WIRE_DISCONNECT, NULL, 0); /* best effort: a falsely evicted live peer learns at once */
+    pcnet_lose_peer((int)peer); /* delivers already-ACKed payloads, frees the slot, queues PEER_DISCONNECTED */
 }
 
 void pc_net_disconnect(PCNetPeerId peer) {

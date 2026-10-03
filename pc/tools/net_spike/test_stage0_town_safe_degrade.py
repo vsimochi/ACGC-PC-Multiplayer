@@ -25,6 +25,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from net_spike_lib import check, summary_and_exit_code  # noqa: E402
+import wire_baseline  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 CLIENT = "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT"
@@ -85,9 +86,24 @@ def main():
     inr = func_body(shop, r"\nextern int mSP_InRenewal\(\) \{")
     gated_first(inr, ["mEv_CheckEvent(mEv_SAVED_RENEWSHOP)"], results, "S0-1 InRenewal")
     check("S0-1 InRenewal: client gets FALSE", "return FALSE;" in inr[:inr.find("mEv_CheckEvent")], results)
-    check("S0-1: shop purchase/sell paths untouched (no role gate in ac_npc_shop_common.c / ac_shop_design.c)",
-          "pc_net_game" not in read("src/actor/npc/ac_npc_shop_common.c")
-          and "pc_net_game" not in read("src/actor/ac_shop_design.c"), results)
+    # Batch G2/G3 added client refusals to ac_npc_shop_common.c (catalog order, house loan/rehouse, paint), so the old
+    # "file has no pc_net_game" check is stale. Current truth: purchases and sells stay UNGATED -- the sell/buy bodies and
+    # ac_shop_design.c carry no role gate -- and the only role-gated spots in ac_npc_shop_common.c are the G2/G3 refusal sites.
+    nsc = read("src/actor/npc/ac_npc_shop_common.c")
+    check("S0-1: shop purchase/sell paths still ungated (ac_shop_design.c has no role gate)",
+          "pc_net_game" not in read("src/actor/ac_shop_design.c"), results)
+    spans = []
+    for fname in ("aNSC_sell_item_init", "aNSC_sell_item_with_ticket_init", "aNSC_buy_check_init", "aNSC_buy_check"):
+        b = func_body(nsc, r"\nstatic void %s\(NPC_SHOP_COMMON_ACTOR\* shop_common, GAME_PLAY\* play\) \{" % fname)
+        check("S0-1: %s found and contains no pc_net_game / role gate (purchase/sell stays ungated)" % fname,
+              bool(b) and "pc_net_game" not in b and "aNSC_PC_IS_CLIENT" not in b, results)
+        if b:
+            spans.append((nsc.index(b), nsc.index(b) + len(b)))
+    sites = [m.start() for m in re.finditer(r"aNSC_PC_IS_CLIENT\(\)", nsc)
+             if not nsc[nsc.rfind("\n", 0, m.start()) + 1:m.start()].lstrip().startswith("#define")]
+    check("S0-1: ac_npc_shop_common.c role gates are exactly the 7 G2/G3 refusal sites (paint x3, rehouse, order x2, "
+          "paint-sell) and none lies inside a purchase/sell body (found %d)" % len(sites),
+          len(sites) == 7 and not [x for x in sites if any(a <= x < b for a, b in spans)], results)
     sl = read("src/actor/ac_shop_level.c")
     check("S0-1: ac_shop_level.c includes pc_net_game.h under TARGET_PC",
           '#ifdef TARGET_PC\n#include "pc_net_game.h"' in sl, results)
@@ -241,14 +257,10 @@ def main():
 
     # ---- protocol / wire unchanged
     hdr = read("pc/include/pc_net_game.h")
-    check("protocol stays v7", "#define PC_NETGAME_PROTOCOL_VERSION 7u" in hdr, results)
-    for rel in ("pc/tools/net_spike/net_spike_lib.py", "pc/include/pc_net_game.h", "pc/src/pc_net_game.c"):
-        try:
-            out = subprocess.run(["git", "diff", "--name-only", "--", rel], cwd=ROOT, capture_output=True, text=True,
-                                 timeout=30).stdout.strip()
-            check("%s unchanged vs HEAD (no wire/struct change)" % rel, out == "", results)
-        except Exception as exc:  # noqa: BLE001
-            check("%s unchanged vs HEAD (git unavailable: %s)" % (rel, exc), False, results)
+    check("protocol is v%d (wire_baseline.EXPECTED_PROTOCOL_VERSION)" % wire_baseline.EXPECTED_PROTOCOL_VERSION,
+          wire_baseline.header_protocol_ok(hdr), results)
+    # wire contract vs HEAD (content-based, see wire_baseline.py): the files may legitimately change, the WIRE may not
+    wire_baseline.run(lambda d, c: check(d, c, results), ROOT)
 
     return summary_and_exit_code(results)
 

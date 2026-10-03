@@ -211,6 +211,18 @@ int pc_net_is_host(void);      /* 1 if pc_net_host_start() succeeded and hasn't 
 int pc_net_is_connected(void); /* client: handshake with the host completed. host: currently listening. */
 int pc_net_peer_count(void);   /* number of currently-connected peers (0 or 1 for a client) */
 
+/* Host: milliseconds since the last packet of any kind (DATA, ACK, HEARTBEAT, ...) arrived from the CONNECTED
+ * `peer`, measured at call time; -1 if `peer` is not a connected host-side peer (and always -1 on a client).
+ * Read-only liveness query -- a healthy remote sends at least a heartbeat every 500 ms. No wire change. */
+int pc_net_peer_idle_ms(PCNetPeerId peer);
+
+/* Host: remote-caused-style removal of a peer the game has judged unresponsive (M9 identity Stage 1B). Sends a
+ * best-effort DISCONNECT notice, then ends the peer exactly like a timeout/DISCONNECT would: payloads the peer
+ * already had ACKed are delivered first, the slot is wiped, and a PC_NET_EVENT_PEER_DISCONNECTED is queued so the
+ * game runs its normal teardown once. Unlike pc_net_disconnect() it queues an event and does not purge
+ * already-ACKed payloads. No effect on a non-connected peer or on a client. */
+void pc_net_evict(PCNetPeerId peer);
+
 /* Host: sends a DISCONNECT notice to `peer` and immediately frees its local slot (all reliable
  * state for it is discarded, any of its DATA events not yet popped are removed from the queue,
  * and no local DISCONNECTED event is queued -- the caller already knows).

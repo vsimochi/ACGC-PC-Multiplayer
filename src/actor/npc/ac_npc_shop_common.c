@@ -1,3 +1,14 @@
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Batch G2/G3: pc_net_game_role() */
+/* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
+ * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
+ * order/loan/statue, paint) would debit/commit with nothing to show for it. Role test (not READY-aware):
+ * the client role is set at boot, before any save loads, and clients never persist anyway. */
+#define aNSC_PC_IS_CLIENT() (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT)
+#else
+#define aNSC_PC_IS_CLIENT() (0)
+#endif
+
 enum aNSC_action {
     aNSC_ACTION_EMPTY,
     aNSC_ACTION_SAY_HELLO_APPROACH,
@@ -1086,7 +1097,7 @@ static void aNSC_set_talk_info_sell_item(ACTOR* actorx) {
     }
 
     if (item >= ITM_RED_PAINT && item <= ITM_BROWN_PAINT) {
-        if (mLd_PlayerManKindCheck() == FALSE) {
+        if (mLd_PlayerManKindCheck() == FALSE && !aNSC_PC_IS_CLIENT()) {
             msg_no = aNSC_MSG_SELL_PAINT;
         } else {
             msg_no = aNSC_MSG_SELL_PAINT_FOREIGN;
@@ -1140,7 +1151,7 @@ static void aNSC_message_ctrl_force_talk_start_normal_day(NPC_SHOP_COMMON_ACTOR*
                     next_act_idx = aNSC_ACTION_SHOW_ITEM_CHECK;
                     break;
                 default:
-                    if (ITEM_IS_PAINT(sell_item) && mLd_PlayerManKindCheck()) {
+                    if (ITEM_IS_PAINT(sell_item) && (mLd_PlayerManKindCheck() || aNSC_PC_IS_CLIENT())) {
                         next_act_idx = aNSC_ACTION_REQUEST_Q_END_WAIT;
                     }
                     break;
@@ -1343,7 +1354,7 @@ static int aNSC_message_ctrl(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play
                                             break;
                                         default:
                                             if (item >= ITM_RED_PAINT && item <= ITM_BROWN_PAINT) {
-                                                if (mLd_PlayerManKindCheck() != FALSE) {
+                                                if (mLd_PlayerManKindCheck() != FALSE || aNSC_PC_IS_CLIENT()) {
                                                     action = aNSC_ACTION_REQUEST_Q_END_WAIT;
                                                 }
                                             }
@@ -1753,6 +1764,15 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
     } else if (aNSC_check_present_balloon() == TRUE) {
         wait_type = aNSC_WAIT_TYPE_BALLOON;
     } else {
+        wait_type = aNSC_WAIT_TYPE_3;
+    }
+
+    if (aNSC_PC_IS_CLIENT() &&
+        (wait_type == aNSC_WAIT_TYPE_REHOUSE || wait_type == aNSC_WAIT_TYPE_DONE_REHOUSE)) {
+        /* Batch G3: REHOUSE (loan/statue bookkeeping in aNSC_set_talk_info_start_wait) and DONE_REHOUSE (house
+         * upgrade/basement/roof-colour order) write homes[] / Private_c.inventory.loan locally. For a client use
+         * the plain greeting instead; TYPE_3 is identical to REHOUSE's else-branch (aNSC_get_start_call_msg_no,
+         * next_action SAY_HELLO_APPROACH) minus those writes. Host/solo unchanged. */
         wait_type = aNSC_WAIT_TYPE_3;
     }
 
@@ -2331,6 +2351,12 @@ static void aNSC_msg_win_open_wait2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
             action = 0;
         } else {
             action = (submenu_item->slot_no != 0 ? 2 : 1);
+            if (aNSC_PC_IS_CLIENT()) {
+                /* Batch G2: refuse the order up front (ORDER_UNAVAILABLE -> REQUEST_Q_ANSWER_WAIT, the
+                 * same clean path as an unorderable item) so no bell is taken for an order the host never
+                 * delivers. Host/solo unchanged. */
+                action = 1;
+            }
             aNSC_set_item_name_str(item, 0x1);
             shop_common->order_item = item;
         }
@@ -2349,7 +2375,11 @@ static void aNSC_order_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play
             switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
                 case mChoice_CHOICE0:
                     price = mSP_ItemNo2ItemPrice(shop_common->order_item);
-                    if (aNSC_money_check(price) == FALSE) {
+                    if (aNSC_PC_IS_CLIENT()) {
+                        /* Batch G2 defense in depth (normally unreachable: the offer is refused above):
+                         * end as a cancelled order, before any bell or order slot is touched. */
+                        msg_no = aNSC_MSG_ORDER_CANCEL;
+                    } else if (aNSC_money_check(price) == FALSE) {
                         msg_no = aNSC_MSG_ORDER_INSUFFICIENT_FUNDS;
                     } else {
                         msg_no = aNSC_MSG_ORDER_CONFIRM;
@@ -2416,6 +2446,12 @@ static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pla
         if (mMsg_Check_MainNormal(msg_p) == TRUE) {
             int next = 0;
             if (aNSC_money_check(shop_common->value) == FALSE) {
+                next = 0x3;
+            } else if (aNSC_PC_IS_CLIENT() && shop_common->sell_item >= ITM_RED_PAINT &&
+                       shop_common->sell_item <= ITM_BROWN_PAINT) {
+                /* Batch G3 defense in depth (normally unreachable: client paint talks take the foreigner
+                 * path above): refuse before homes[].next_outlook_pal or the pending flag is written. The
+                 * existing INSUFFICIENT_FUNDS reply ends cleanly and takes no bell. */
                 next = 0x3;
             } else {
                 mActor_name_t item = shop_common->sell_item;

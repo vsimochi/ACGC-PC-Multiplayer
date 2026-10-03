@@ -28,6 +28,9 @@ without crashing; NOT that the flying item looks right.
   P6  disconnect clears the queued event: nothing pairs after the reconnect
   P7  no world mutation: exactly one FIELD_UPDATE per committed pickup tile (none for the aborted one), a fresh authoritative
       snapshot agrees, no crash text; the disconnect summary reports the pickup counters
+  (Capacity: the host admits at most 3 clients on the 4-resident fixture since Stage 1A.  OBS and A stay connected; the
+   SHOP / G1 / G2 peers each leave gracefully (host teardown line awaited, explicit check) before the next joins, and G2
+   leaves before the P7 snapshot probe, so never more than 3 connections are open.)
   S2  (--only s2) real client process: it receives the relayed PLAYER_ACTION about A (`state=pending` in the client log)
 
 Usage: python test_puppet_pickup_action.py [--port 8300] [--only a0|p|s2]
@@ -41,8 +44,9 @@ import sys
 import time
 
 import net_spike_lib as L
+import wire_baseline
 from test_player_scene_real import boot_host, boot_client
-from test_puppet_cosmetics import scene_msg, SCENE_FG, SCENE_SHOP0, strip_comments
+from test_puppet_cosmetics import scene_msg, SCENE_FG, SCENE_SHOP0, strip_comments, leave_peer
 from test_puppet_held_item import clean, make_b, wait_visual
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -133,7 +137,7 @@ class Peer:
         return rid, res
 
     def commit(self, rid):
-        self.c.confirm(L.CONFIRM_KIND_PICKUP, rid)
+        self.c.commit_pending(L.CONFIRM_KIND_PICKUP, rid)  # X1b: a TXN_COMMIT (the legacy CONFIRM(COMMIT) is retired)
 
     def abort(self, rid):
         self.c.confirm(L.CONFIRM_KIND_PICKUP, rid, L.CONFIRM_OUTCOME_ABORT, L.CONFIRM_REASON_CANCELLED)
@@ -174,14 +178,18 @@ def a0(check):
     check("A0 hold timeout 90 frames and one-event-per-run pairing", "PC_PUPPET_PK_HOLD_FRAMES 90.0f" in src and "c->pk_bound" in blk)
     net = open(NETSRC, encoding="utf-8").read()
     ncode = strip_comments(net)
-    check("A0 PLAYER_ACTION = 46, unique, the maximum id",
-          re.search(r"PC_NETGAME_MSG_PLAYER_ACTION\s*=\s*46", net) is not None and
-          (lambda ids: len(ids) == len(set(ids)) and max(ids) == 46)(
-              [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_]+\s*=\s*(\d+)", net[:net.index("} PCNetGameMsgType;")])]))
+    # Ids 47+ exist now (D3 47..50, X1 51/52), so 46 is no longer the maximum. Kept strict: id 46 is present and unique, and ALL
+    # ids are contiguous 1..N with N == the current maximum parsed from the header == wire_baseline's source of truth.
+    msg_ids = [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_]+\s*=\s*(\d+)", net[:net.index("} PCNetGameMsgType;")])]
+    check("A0 PLAYER_ACTION = 46 and unique; ids are unique and contiguous 1..N with N == max parsed from the enum == "
+          "wire_baseline.EXPECTED_MAX_MSG_ID (%d)" % wire_baseline.EXPECTED_MAX_MSG_ID,
+          re.search(r"PC_NETGAME_MSG_PLAYER_ACTION\s*=\s*46", net) is not None and msg_ids.count(46) == 1 and
+          len(msg_ids) == len(set(msg_ids)) and sorted(msg_ids) == list(range(1, max(msg_ids) + 1)) and
+          max(msg_ids) == wire_baseline.EXPECTED_MAX_MSG_ID)
     check("A0 wire struct is 10 bytes (static asserts for size and offsets)",
           "sizeof(PCNetGamePlayerActionMsg) == 10" in net and "offsetof(PCNetGamePlayerActionMsg, item) == 6" in net)
     check("A0 net_spike_lib PLAYER_ACTION constants/spec match (46, 10 bytes)",
-          L.PC_NETGAME_MSG_PLAYER_ACTION == 46 and L.PLAYER_ACTION_SPEC.size == 10 and L.PC_NETGAME_PROTOCOL_VERSION == 7)
+          L.PC_NETGAME_MSG_PLAYER_ACTION == 46 and L.PLAYER_ACTION_SPEC.size == 10 and L.PC_NETGAME_PROTOCOL_VERSION == wire_baseline.EXPECTED_PROTOCOL_VERSION)
     check("A0 emission only from the host commit and the host-local notify (2 call sites + definition)",
           ncode.count("pcnetgame_host_emit_player_action(") == 3)
     i = ncode.index("static void pcnetgame_host_emit_player_action")
@@ -197,8 +205,8 @@ def a0(check):
     check("A0 host drops client-originated PLAYER_ACTION (explicit dispatch case, never relayed)",
           "client-originated PLAYER_ACTION" in net)
     hdr = open(os.path.join(HERE, "..", "..", "include", "pc_net_game.h"), encoding="utf-8").read()
-    check("A0 header: PC_NETGAME_PROTOCOL_VERSION 7u and the v7 paragraph mentions PLAYER_ACTION (id 46)",
-          "#define PC_NETGAME_PROTOCOL_VERSION 7u" in hdr and "PC_NETGAME_MSG_PLAYER_ACTION (id 46" in hdr)
+    check("A0 header: PC_NETGAME_PROTOCOL_VERSION is the expected version and the v7 paragraph mentions PLAYER_ACTION (id 46)",
+          wire_baseline.header_protocol_ok(hdr) and "PC_NETGAME_MSG_PLAYER_ACTION (id 46" in hdr)
 
 
 def p_all(port, log_dir, check):
@@ -381,6 +389,8 @@ def p_all(port, log_dir, check):
         check("P5 no flying item start and no ok sound for the SHOP peer",
               not [m for m in START_RX.finditer(t) if int(m.group(1)) == shop.pid] and
               all(s[4] == "scene" for s in sn) and len(sn) >= 1)
+        check("P5 SHOP peer left gracefully (host teardown line seen)", leave_peer(host, shop))
+        peers.remove(shop)
 
         # ---- P6: disconnect clears the queue ----
         g1 = new_peer("G1")
@@ -396,9 +406,7 @@ def p_all(port, log_dir, check):
         check("P6 the event was queued (pending) before the disconnect (%s)" % [e[5] for e in pend],
               [e[5] for e in pend] == ["pending"])
         off = len(host.log_text())
-        g1.c.disconnect()
-        L.pump_sleep(0.6, obs.c.hub)
-        g1.close()
+        check("P6 G1 left gracefully (host teardown line seen)", leave_peer(host, g1))
         peers.remove(g1)
         host.wait_for_log(r"player %d cosmetics summary: .*pickup_events=" % gpid, 15.0, since_offset=off)
         sms = [x for x in SUM_RX.finditer(host.log_text()[off:]) if int(x.group(1)) == gpid]
@@ -412,6 +420,8 @@ def p_all(port, log_dir, check):
         check("P6 after the reconnect (pid %d -> %d) the old event can never pair: no pickup lines for it (%s)" %
               (gpid, g2.pid, events(t, g2.pid)), events(t, g2.pid) == [] and events(t, gpid, gseq) == [])
         g2.stream(1.0)
+        check("P6 G2 left gracefully before the P7 snapshot probe (host teardown line seen)", leave_peer(host, g2))
+        peers.remove(g2)
 
         # ---- P7: no world mutation ----
         L.pump_sleep(0.8, obs.c.hub)

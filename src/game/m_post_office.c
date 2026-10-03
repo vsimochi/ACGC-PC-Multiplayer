@@ -527,6 +527,18 @@ extern void mPO_business_proc(GAME_PLAY* play) {
 }
 
 extern void mPO_first_work() {
+#ifdef TARGET_PC
+    /* Batch G4: load-time delivery (first_delivery_proc: delivery_time, homes[].mailbox, leaflets, special mail;
+     * adjust_keep_mail: post_office recipient flags/sums and orphan-mail clearing) is the same host-owned,
+     * non-replicated state that mPO_business_proc already refuses for a network CLIENT (Stage 0). Skip it so a
+     * client's local copy is not delivered into or purged. Nothing else depends on it: those fields are only
+     * read by the (gated) postman/receipt paths, and force_mail_delivery_flag is only consumed by the gated
+     * delivery procs. Role test, not READY-aware: client role is set at boot, before the save loads and
+     * StartInitAfter runs. Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     lbRTC_time_c* time = &Save_Get(save_check).time;
     if (mTM_AreTimesEqual(time, &mTM_rtcTime_clear_code) == FALSE && lbRTC_IsOverRTC(time) == FALSE) {
         Common_Set(force_mail_delivery_flag, TRUE);

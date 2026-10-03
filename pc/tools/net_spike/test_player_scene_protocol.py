@@ -16,8 +16,22 @@ Covers PC_NETGAME_MSG_PLAYER_SCENE (id 44, reliable, 12 bytes):
       is NOT told about it (no stale presence), and the departed peer's seq space restarts cleanly.
   S9  reconnect: the re-announced scene (seq 1 again) is accepted and relayed.
   S10 a peer that is not READY (never completed IDENTITY) cannot inject a scene.
-  S11 a protocol-version-4 peer is rejected with PROTOCOL_MISMATCH and the host reports version 7.
+  S11 a protocol-version-4 peer is rejected with PROTOCOL_MISMATCH and the host reports the expected protocol version (wire_baseline).
   S12 host stays alive/READY throughout.
+
+Since Stage 1A the host admits a client only as a DISTINCT non-host RESIDENT of its save (bin_fixture4: host slot 0 +
+Angelica/Bella/Cleo) => at most THREE clients may be connected at once. The scenario therefore runs in ROUNDS; every
+client that is no longer needed is closed gracefully (DISCONNECT) and the host's "[NET] host: peer N disconnected"
+teardown line is awaited before the next one connects:
+  round 1  A, B (S1-S6), C joins (S7), A leaves (S8 CLEARED checks)           peak 3 (A,B,C)
+  round 2  D joins into A's freed resident/slot (S8)                           peak 3 (B,C,D)
+  round 3  C leaves (its CLEARED checks are done; S12 liveness checkpoint for C), E joins as the observer for the
+           "D reused A's slot, no stale scene" check, then E leaves             peak 3 (B,D,E)
+  round 4  E and D leave, A2 joins (S9)                                          peak 3 (B,A2 + transient)
+  round 5  X (not READY, S10) and the protocol-4 peer (S11) while B and A2 are READY   peak 3 (B,A2,X|V4)
+Explicitly NOT covered after the restructure: nothing that needs >3 simultaneous clients was dropped; the old
+"B, C and A2 all still READY at the very end" S12 check is split (C is checked at the moment it leaves, B and A2 at the
+end) because C is no longer open at the end.
 
 Tier: PROTOCOL TESTED (real host binary, scripted clients). Not real two-process gameplay.
 
@@ -31,6 +45,7 @@ import struct
 import sys
 
 import net_spike_lib as L
+import wire_baseline
 
 MSG = L.PC_NETGAME_MSG_PLAYER_SCENE
 FMT = "<BBBBHHI"
@@ -65,6 +80,19 @@ def is_scene(m):
 
 def scenes(client, duration, since=None):
     return [decode(m.payload) for m in client.inbox.collect(is_scene, duration, since=since)]
+
+
+def teardowns(host):
+    return len(re.findall(r"\[NET\] host: peer \d+ disconnected", host.log_text()))
+
+
+def leave(host, client, timeout=6.0):
+    """Graceful departure: DISCONNECT, then wait for the host's teardown line (one more 'peer N disconnected')."""
+    before = teardowns(host)
+    client.disconnect()
+    ok = L.DEFAULT_HUB.wait_until(lambda: teardowns(host) > before, timeout)
+    L.pump_sleep(0.2)
+    return ok
 
 
 def run(port, log_dir, results):
@@ -164,6 +192,7 @@ def run(port, log_dir, results):
         # ---- S8: disconnect clears ----
         old_a = a.assigned_peer_id
         since_b, since_c = b.inbox.mark(), c.inbox.mark()
+        td0 = teardowns(host)
         a.disconnect()
         b.ping()
         c.ping()
@@ -173,6 +202,8 @@ def run(port, log_dir, results):
               any(s["net_player_id"] == old_a and (s["flags"] & FLAG_CLEARED) for s in rb))
         check("S8 C receives a CLEARED notice for A's id",
               any(s["net_player_id"] == old_a and (s["flags"] & FLAG_CLEARED) for s in rc))
+        check("round 2: A's departure was torn down by the host before D joins (teardown line seen)",
+              L.DEFAULT_HUB.wait_until(lambda: teardowns(host) > td0, 6.0))
         d = L.FakeClient("D", "127.0.0.1", port)
         d.connect_and_ready()
         got = scenes(d, 0.8)
@@ -183,6 +214,10 @@ def run(port, log_dir, results):
               b.assigned_peer_id in ids and HOST_ID in ids)
         b.ping()
         c.ping()
+        # round 3: C's CLEARED checks are done; it leaves so that E can join (at most 3 clients at once)
+        check("S12 (checkpoint) host alive and B, C, D still READY before C leaves",
+              host.alive() and b.is_connected() and c.is_connected() and d.is_connected())
+        check("round 3: C left gracefully (host teardown line seen)", leave(host, c))
         e = L.FakeClient("E", "127.0.0.1", port)
         e.connect_and_ready()
         got = scenes(e, 0.8)
@@ -190,8 +225,10 @@ def run(port, log_dir, results):
               "(A's old NPC_HOUSE scene did not survive the slot reuse)",
               d.assigned_peer_id == old_a and all(sc["net_player_id"] != d.assigned_peer_id for sc in got))
         b.ping()
-        c.ping()
         d.ping()
+        # round 4: E (observer only) and D (S8 done) leave before A2 joins; A2 + B + one free slot remain <= 3 clients
+        check("round 4: E left gracefully (host teardown line seen)", leave(host, e))
+        check("round 4: D left gracefully (host teardown line seen)", leave(host, d))
 
         # ---- S9: reconnect re-establishes ----
         a2 = L.FakeClient("A2", "127.0.0.1", port)
@@ -221,11 +258,12 @@ def run(port, log_dir, results):
             rejected = e.reject.reason == L.PC_NETGAME_REJECT_PROTOCOL_MISMATCH
             expected_version = e.reject.expected_protocol_version
         check("S11 protocol version 4 peer rejected with PROTOCOL_MISMATCH", rejected)
-        check("S11 host reports required protocol version 7", expected_version == 7)
+        check("S11 host reports required protocol version %d" % wire_baseline.EXPECTED_PROTOCOL_VERSION,
+              expected_version == wire_baseline.EXPECTED_PROTOCOL_VERSION)
 
         # ---- S12 ----
-        check("S12 host process still alive and clients still READY",
-              host.alive() and b.is_connected() and c.is_connected() and a2.is_connected())
+        check("S12 host process still alive and the remaining clients (B, A2) still READY",
+              host.alive() and b.is_connected() and a2.is_connected())
         scene_lines = len(re.findall(r"\[NET\]\[SCENE\] local scene live", host.log_text()))
         check("S12 host's own local scene was announced exactly once in the whole run (no re-announce churn)",
               scene_lines == 1)
@@ -237,6 +275,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7790)
     args = ap.parse_args()
+    L.require_test_bin_dir()
     results = []
     run(args.port, os.path.dirname(os.path.abspath(__file__)), results)
     return L.summary_and_exit_code(results)

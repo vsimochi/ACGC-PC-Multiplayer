@@ -20,6 +20,9 @@
  * constant, not a magic number, matching this codebase's own PCNET_HEARTBEAT_INTERVAL_MS-style
  * naming (pc_net.c). Not user-configurable yet -- out of scope for this stage. */
 #define PC_SAVE_INTERVAL_MS 60000u
+/* D3-4 (Q5): minimum gap between two early host saves (a dirty client disconnect asks for an immediate save of the merged
+ * resident record; bursts of disconnects coalesce into one save per gap). */
+#define PC_EARLY_SAVE_MIN_GAP_MS 5000u
 
 static u32 retrace_count = 0;
 u32 pc_frame_counter = 0;
@@ -120,8 +123,25 @@ void VIWaitForRetrace(void) {
         extern int pcfa_save_ready(void);
         extern int pc_save_write_authoritative(void);
         static Uint64 l_last_save_time = 0;
+        static Uint64 l_last_early_save_time = 0; /* D3-4 Q5: start of the last early (dirty-disconnect) save attempt */
 
-        if (pc_net_game_role() == PC_NETGAME_ROLE_HOST && pcfa_save_ready()) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_HOST && pcfa_save_ready() && l_last_save_time != 0 &&
+            pc_net_game_record_early_save_due() &&
+            (l_last_early_save_time == 0 ||
+             (double)(vi_enter - l_last_early_save_time) * 1000.0 / (double)perf_freq >= (double)PC_EARLY_SAVE_MIN_GAP_MS)) {
+            /* D3-4 (Q5): a peer with unsaved accepted record uploads disconnected: save now (same gates as the periodic save:
+             * HOST role + pcfa_save_ready, plus the host world being ready) instead of waiting up to PC_SAVE_INTERVAL_MS, but
+             * at most once per PC_EARLY_SAVE_MIN_GAP_MS (coalesced). Main thread, same call as the periodic save; a failed
+             * save keeps the request pending and is retried after the gap. */
+            Uint64 t_save_begin = SDL_GetPerformanceCounter();
+            int save_ok;
+            l_last_early_save_time = vi_enter;
+            save_ok = pc_save_write_authoritative();
+            printf("[PC] early save (dirty client disconnect) %s (%.1fms, frame %lu)\n", save_ok ? "OK" : "FAILED",
+                   (double)(SDL_GetPerformanceCounter() - t_save_begin) * 1000.0 / (double)perf_freq,
+                   (unsigned long)pc_frame_counter);
+            l_last_save_time = vi_enter; /* the periodic cadence restarts from this save */
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST && pcfa_save_ready()) {
             if (l_last_save_time == 0) {
                 /* World just became ready (or this is the first ready frame) -- wait one full
                  * interval before the first periodic save rather than saving immediately. */

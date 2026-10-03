@@ -9,8 +9,9 @@ protocol) -- it hand-crafts IDENTITY with net_spike_lib.py, whose wire formats m
 PCNetGameRejectTownMsg) byte-for-byte.
 
   F  (original Stage 1 test) protocol_version 999 -> 8-byte REJECT(PROTOCOL_MISMATCH) carrying the
-     host's protocol version (PC_NETGAME_PROTOCOL_VERSION, now 2), then a transport DISCONNECT.
+     host's protocol version (PC_NETGAME_PROTOCOL_VERSION), then a transport DISCONNECT.
   F2 version is checked FIRST: version 999 AND a wrong town still gets the 8-byte PROTOCOL_MISMATCH.
+  F3 (v8) protocol_version 7 (the previous protocol) -> the same 8-byte PROTOCOL_MISMATCH reporting version 8.
   L  correct version, WRONG town -> 24-byte REJECT(LAND_MISMATCH) whose tail carries the HOST's town
      (land_name, land_id, terrain_hash) -- identical to what a matching client's IDENTITY_ACK reports
      -- and no IDENTITY_ACK / APPEARANCE / SNAPSHOT_BEGIN / FIELD_BLOCK follows; transport DISCONNECT.
@@ -85,6 +86,20 @@ def main():
     L.check(f"F REJECT is delivered BEFORE the DISCONNECT and the DISCONNECT follows within 2 s ({detail})", ok, results)
     L.check("F REJECT arrived over the reliable channel (RDATA), never legacy reliable DATA",
             m.channel == L.CH_RELIABLE and c.stats["legacy_reliable_rx"] == 0, results)
+    c.close()
+
+    # --- F3 (v8): a client speaking the PREVIOUS protocol (7) is refused with PROTOCOL_MISMATCH reporting the current one ---
+    prev = L.PC_NETGAME_PROTOCOL_VERSION - 1
+    c, m = reject_roundtrip(host_ip, port, "v%d-client" % prev, L.build_identity(town=L.ZERO_TOWN, protocol_version=prev),
+                            timeout=3.0)
+    L.check("F3 a v%d client is rejected with the 8-byte PROTOCOL_MISMATCH reporting v%d" % (prev, L.PC_NETGAME_PROTOCOL_VERSION),
+            m is not None and m.msg_type == L.PC_NETGAME_MSG_REJECT and len(m.payload) == 8
+            and m.game.reason == L.PC_NETGAME_REJECT_PROTOCOL_MISMATCH
+            and m.game.expected_protocol_version == L.PC_NETGAME_PROTOCOL_VERSION == L.PROTOCOL_VERSION, results)
+    L.check("F3 the v%d client got no IDENTITY_ACK / record traffic and the host closed the link" % prev,
+            c.inbox.count(lambda x: x.channel == L.CH_RELIABLE and x.msg_type in (
+                L.PC_NETGAME_MSG_IDENTITY_ACK, L.PC_NETGAME_MSG_RECORD_BEGIN, L.PC_NETGAME_MSG_RECORD_ACK)) == 0
+            and c.wait_disconnected(2.0), results)
     c.close()
 
     # --- F2: version checked before town ---------------------------------------------------------------

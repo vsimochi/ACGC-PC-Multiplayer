@@ -832,6 +832,14 @@ static void swap_save_check(mFRm_chk_t* chk) {
     swap16(&chk->checksum);
 }
 
+/* D3 (protocol v8): public wrapper around the static swap_Private(). `prv` is converted IN PLACE, so callers must always
+ * pass a COPY of a live record (never Save_Get(private_data)[i] itself). The direction matters (museum_record and the
+ * quest bitfields are repacked, which is not self-inverse): TO_BE = native LE -> canonical GCI/BE image, FROM_BE = the
+ * reverse. */
+void pc_save_bswap_private(Private_c* prv, pc_bswap_dir_t dir) {
+    swap_Private(prv, dir);
+}
+
 void pc_save_bswap(Save_t* save, pc_bswap_dir_t dir) {
     int i;
 

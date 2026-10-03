@@ -10,6 +10,9 @@
 #include "libultra/libultra.h"
 #include "m_lib.h"
 #include "libc64/qrand.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Batch G5: pc_net_game_role() */
+#endif
 
 /* 'zero' time (uninitialized time value for mushroom saved time) */
 static lbRTC_time_c l_mmsr_zeto_time = { 0, 0, 0, 0, 0, 0, 0 };
@@ -329,6 +332,13 @@ static void mMsr_ClearMushrooms(int clear_num, int block_x, int block_z) {
  * if there are any.
  **/
 extern void mMsr_FirstClearMushroom() {
+#ifdef TARGET_PC
+    /* Batch G5: load-time clear of "missed" mushrooms mutates shared fg tiles and the saved mushroom_time; a
+     * network CLIENT never owns either (host replicates tiles, client never persists). Host/solo unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     int first_clear_num;
     lbRTC_time_c mush_rtc_time;
     mMsr_time_c* mush_time = Save_GetPointer(mushroom_time);
@@ -664,6 +674,15 @@ static void mMsr_SetMushroomNum(int mushroom_num, int player_bx, int player_bz) 
  * @param mushroom_num player_pos Current world position of the player
  **/
 extern void mMsr_SetMushroom(xyz_t player_pos) {
+#ifdef TARGET_PC
+    /* Batch G5: per-frame mushroom spawn/clear (via mFI_FieldMove) writes shared fg tiles directly. A network
+     * CLIENT spawns phantom mushrooms the host rejects on pickup and clears host-spawned ones locally, so skip
+     * it before any tile or mushroom_time write; the host's spawns/clears reach the client via FIELD_UPDATE.
+     * Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     int player_bx, player_bz;
     lbRTC_time_c mush_rtc;
     mMsr_time_c* mush_time = Save_GetPointer(mushroom_time);

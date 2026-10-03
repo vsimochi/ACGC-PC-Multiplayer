@@ -9,6 +9,9 @@ identity rule is involved; the game loads the fixture like any other save.
 
 Usage (from anywhere):
     python make_four_resident_fixture.py [--src <bin_talkfix>] [--dest <bin_fixture4>] [--ambiguous] [--force]
+    python make_four_resident_fixture.py --clone-talkfix [--force]     -> pc/build64/bin_talkfix_clone (2-resident save, byte copy)
+bin_talkfix is a PROTECTED artifact (the harness refuses to launch a game from it, net_spike_lib.require_launchable_bin_dir):
+run what used to run on bin_talkfix on bin_talkfix_clone instead.  bin_talkfix is only ever READ by this tool.
 Then run a multi-client test with   NET_SPIKE_GAME_BIN=<absolute path of bin_fixture4>   (host = resident 0).
 
 Safety: READ-ONLY on the source save (only its .gci is read); writes ONLY inside --dest; refuses the live pc/build64/bin,
@@ -50,6 +53,8 @@ LIVE_BIN = os.path.join(BUILD64, "bin")
 DEF_SRC = os.path.join(BUILD64, "bin_talkfix")
 DEF_DEST = os.path.join(BUILD64, "bin_fixture4")
 DEF_DEST_AMBIG = os.path.join(BUILD64, "bin_fixture4_ambig")
+DEF_DEST_CLONE = os.path.join(BUILD64, "bin_talkfix_clone")
+CLONE_MARKER = ".talkfix_clone"
 MARKER = ".four_resident_fixture"
 GCI_REL = os.path.join("save", "card_a", "DobutsunomoriP_MURA.gci")
 
@@ -146,25 +151,56 @@ def verify(dest, ambiguous=False):
     return res
 
 
+def clone_talkfix(src, dest):
+    """Disposable full copy of bin_talkfix (exe, dll, ini, shaders, shader cache) with the save .gci copied BYTE-FOR-BYTE
+    (only the main .gci; backups/other files are not copied); rom = junction to the live ISO dir. Read-only on src."""
+    src_gci = os.path.join(src, GCI_REL)
+    os.makedirs(os.path.join(dest, "save", "card_a"))
+    os.makedirs(os.path.join(dest, "save", "card_b"))
+    for f in ("AnimalCrossing.exe", "SDL2.dll", "keybindings.ini", "settings.ini", "shader_cache.bin"):
+        if os.path.isfile(os.path.join(src, f)):
+            shutil.copy2(os.path.join(src, f), os.path.join(dest, f))
+    shutil.copytree(os.path.join(src, "shaders"), os.path.join(dest, "shaders"))
+    shutil.copy2(src_gci, os.path.join(dest, GCI_REL))
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", os.path.join(dest, "rom"), os.path.join(LIVE_BIN, "rom")],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("mklink /J failed: " + r.stdout + r.stderr)
+    open(os.path.join(dest, CLONE_MARKER), "w").write("disposable clone of bin_talkfix; see make_four_resident_fixture.py\n")
+    a, b = open(src_gci, "rb").read(), open(os.path.join(dest, GCI_REL), "rb").read()
+    assert a == b, "clone save differs from source"
+    res = parse_residents(b)
+    assert res[0][5] == 1 and res[1][5] == 1 and res[2][5] == 0, "unexpected clone residents"
+    print("clone:", dest, "(save byte-identical to bin_talkfix; residents %r %r)" % (res[0][1], res[1][1]))
+    print("Run tests with NET_SPIKE_GAME_BIN=" + dest)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--src", default=DEF_SRC)
     ap.add_argument("--dest", default=None)
     ap.add_argument("--ambiguous", action="store_true",
                     help="variant with slot 2 == slot 1's PersonalID (default dest bin_fixture4_ambig)")
+    ap.add_argument("--clone-talkfix", action="store_true",
+                    help="build the disposable 2-resident clone pc/build64/bin_talkfix_clone (exe/dll/ini/shaders + the save "
+                         "copied byte-for-byte; rom junction) instead of a 4-resident fixture")
     ap.add_argument("--force", action="store_true", help="rebuild an existing fixture dir (only if it has the marker file)")
     a = ap.parse_args()
     src = os.path.abspath(a.src)
-    dest = os.path.abspath(a.dest or (DEF_DEST_AMBIG if a.ambiguous else DEF_DEST))
+    dest = os.path.abspath(a.dest or (DEF_DEST_CLONE if a.clone_talkfix else DEF_DEST_AMBIG if a.ambiguous else DEF_DEST))
+    if norm(dest) == norm(DEF_SRC):
+        sys.exit("REFUSING: dest may never be the protected bin_talkfix")
     if norm(dest) in (norm(LIVE_BIN), norm(src)) or os.path.dirname(norm(dest)) != norm(BUILD64):
         sys.exit("REFUSING: dest must be a NEW directory directly under pc/build64 (not the live bin, not the source)")
     if norm(src) == norm(LIVE_BIN):
         sys.exit("REFUSING: the live bin dir is never a source")
     if os.path.exists(dest):
-        if not (a.force and os.path.isfile(os.path.join(dest, MARKER))):
+        if not (a.force and os.path.isfile(os.path.join(dest, CLONE_MARKER if a.clone_talkfix else MARKER))):
             sys.exit("REFUSING: %s exists (pass --force only for a dir created by this tool)" % dest)
         os.rmdir(os.path.join(dest, "rom")) if os.path.isdir(os.path.join(dest, "rom")) else None  # junction only, never the ISO
         shutil.rmtree(dest)
+    if a.clone_talkfix:
+        return clone_talkfix(src, dest)
     new_gci = derive_gci(open(os.path.join(src, GCI_REL), "rb").read(),
                         NEW_RESIDENTS_AMBIG if a.ambiguous else NEW_RESIDENTS)      # read-only on the source save
     os.makedirs(os.path.join(dest, "save", "card_a"))

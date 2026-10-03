@@ -126,7 +126,7 @@ static void aPSM_actor_move(ACTOR* actor, GAME* game) {
          * If the host ACCEPTS it, the incoming FIELD_UPDATE(EMPTY_NO) and SNOWMAN_STATE (slot cleared)
          * converge to the exact same end state moments later. Uses the 4-deep client queue (NOT a
          * single-in-flight guard) -- see pc_net_game_request_snowman_break()'s own doc. */
-        if (pc_net_game_world_is_host_authoritative()) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
             int ut_x, ut_z;
 
             if (mFI_Wpos2UtNum(&ut_x, &ut_z, actor->world.position)) {

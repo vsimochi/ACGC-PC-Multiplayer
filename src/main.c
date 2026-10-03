@@ -124,7 +124,11 @@ extern void mainproc(void* val) {
         extern int pcfa_save_ready(void);
         extern int pc_save_write_authoritative(void);
         extern int pc_net_game_role_is_client(void);
+        extern void pc_net_game_client_record_quit_flush(unsigned max_ms);
         if (pc_net_game_role_is_client()) {
+            /* D3: best-effort, bounded (1500 ms) upload of the client's dirty resident record to the HOST (which owns and
+             * persists it). This writes NOTHING locally: the no-save-for-clients rule below is unchanged. */
+            pc_net_game_client_record_quit_flush(1500u);
             OSReport("[PC] mainproc: final shutdown save SKIPPED (this process is a network "
                      "CLIENT; only the HOST may write the authoritative town)\n");
         } else if (pcfa_save_ready()) {

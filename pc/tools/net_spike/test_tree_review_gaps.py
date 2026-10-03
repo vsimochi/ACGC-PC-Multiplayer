@@ -71,7 +71,7 @@ KIND_TREE_CHOP = 4              # PC_NETGAME_FIELD_ACTION_KIND_TREE_CHOP
 # PCNetGameFieldActionRequestMsg is now 12 bytes (protocol v3 added hole_variant/_reserved0/_reserved1
 # for the T-dig pitfall sub-case, concurrent with this T1 review work) -- msg_type, kind, ut_x, ut_z,
 # request_id, hole_variant, _reserved0, _reserved1. hole_variant is always 0 for TREE_SHAKE/TREE_CHOP.
-REQ_FMT = "<BBBBIBBH"
+REQ_FMT = "<BBBBIBBH64x"  # X3: 76 B = the 12-byte v3 header + the 64-byte txn tag (all zero = no grant)
 RES_FMT = "<BBBBIHBB"
 REQ_SIZE = struct.calcsize(REQ_FMT)
 RES_SIZE = struct.calcsize(RES_FMT)

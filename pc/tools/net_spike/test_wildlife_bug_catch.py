@@ -149,6 +149,20 @@ def build_catch_request(entity_id, generation, request_id, claimed_species):
     return struct.pack(CATCH_REQUEST_FMT, CATCH_REQUEST_TYPE, entity_id, generation, request_id,
                        claimed_species)
 
+# X3 (host-transactional catch, protocol v8 extended in place): CATCH_REQUEST is 84 bytes = the 20-byte header above + the 64-byte
+# PCNetGameTxnTag. These helpers build the tagged request from the sending FakeClient's own record image (dest POCKET + the
+# host-derived item of the claimed species), exactly like the real client does.
+KIND_UNDER_TEST = "bug"
+
+
+def catch_bytes(client, entity_id, generation, request_id, claimed_species):
+    return client.catch_request_bytes(entity_id, generation, request_id, claimed_species, kind=KIND_UNDER_TEST)
+
+
+def send_catch(client, entity_id, generation, request_id, claimed_species):
+    return client.send_catch_txn(entity_id, generation, request_id, claimed_species, kind=KIND_UNDER_TEST)
+
+
 
 def collect_catch_results(client, duration):
     def pred(m):
@@ -440,14 +454,14 @@ def test_protocol_suite(port, log_dir, results):
         print("=" * 72)
         print("[bug-catch] TEST D: stale/unknown entity_id and mismatched generation")
         stale_target = ordinary[0]
-        a.send_reliable(build_catch_request(0xDEADBEEF, generation, 9001, stale_target["species"]))
+        send_catch(a, 0xDEADBEEF, generation, 9001, stale_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST D: unknown entity_id rejected", len(res) == 1 and res[0]["accepted"] == 0, results)
         despawns = collect_despawns(a, 0.2)
         check("TEST D: no WILDLIFE_DESPAWN for an unknown entity_id", len(despawns) == 0, results)
 
-        a.send_reliable(build_catch_request(stale_target["entity_id"], generation ^ 0xFFFFFFFF, 9002,
-                                            stale_target["species"]))
+        send_catch(a, stale_target["entity_id"], generation ^ 0xFFFFFFFF, 9002,
+                                            stale_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST D: mismatched-generation claim on a REAL entity_id rejected",
               len(res) == 1 and res[0]["accepted"] == 0, results)
@@ -464,7 +478,7 @@ def test_protocol_suite(port, log_dir, results):
         # Comfortably beyond 1000 units (bug reach) -- 100000 units is unambiguously out of range.
         a.send_move_any(far_target["x"] + 100000.0, 0.0, far_target["z"] + 100000.0, reliable=True)
         time.sleep(0.3)
-        a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9003, far_target["species"]))
+        send_catch(a, far_target["entity_id"], generation, 9003, far_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST E: out-of-range claim rejected", len(res) == 1 and res[0]["accepted"] == 0, results)
         despawns = collect_despawns(a, 0.2)
@@ -475,7 +489,7 @@ def test_protocol_suite(port, log_dir, results):
         # anti-teleport sanity bound, not removed).
         a.send_move_any(far_target["x"] + 1100.0, 0.0, far_target["z"], reliable=True)
         time.sleep(0.3)
-        a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9005, far_target["species"]))
+        send_catch(a, far_target["entity_id"], generation, 9005, far_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST E: claim from 1100 units (just beyond the 1000-unit bound) rejected",
               len(res) == 1 and res[0]["accepted"] == 0, results)
@@ -486,7 +500,7 @@ def test_protocol_suite(port, log_dir, results):
         # genuine radius test rather than an exact-position match.
         a.send_move_any(far_target["x"] + 50.0, 0.0, far_target["z"], reliable=True)
         time.sleep(0.3)
-        a.send_reliable(build_catch_request(far_target["entity_id"], generation, 9004, far_target["species"]))
+        send_catch(a, far_target["entity_id"], generation, 9004, far_target["species"])
         res = collect_catch_results(a, 0.5)
         check("TEST E: the SAME entity_id, claimed from a legitimate in-range position (50 units, well "
               "within the bug reach), is accepted",
@@ -515,7 +529,7 @@ def test_protocol_suite(port, log_dir, results):
             ant = ants[0]
             a.send_move_any(ant["x"], 0.0, ant["z"], reliable=True)
             time.sleep(0.3)
-            a.send_reliable(build_catch_request(ant["entity_id"], generation, 9050, ant["species"]))
+            send_catch(a, ant["entity_id"], generation, 9050, ant["species"])
             res = collect_catch_results(a, 0.5)
             check("TEST ANT: a CATCH_REQUEST claiming an ant's own real species, from within reach, is "
                   "still REJECTED by the explicit `rec.species == aINS_INSECT_TYPE_ANT` guard",
@@ -547,8 +561,8 @@ def test_protocol_suite(port, log_dir, results):
             b.send_move_any(target["x"], 0.0, target["z"], reliable=True)
             time.sleep(0.3)
 
-            a.send_reliable(build_catch_request(target["entity_id"], generation, 9101, target["species"]))
-            b.send_reliable(build_catch_request(target["entity_id"], generation, 9102, target["species"]))
+            send_catch(a, target["entity_id"], generation, 9101, target["species"])
+            send_catch(b, target["entity_id"], generation, 9102, target["species"])
             res_a = collect_catch_results(a, 0.6)
             res_b = collect_catch_results(b, 0.6)
             accepted_count = sum(1 for r in res_a if r["accepted"]) + sum(1 for r in res_b if r["accepted"])
@@ -727,7 +741,7 @@ def test_label_race(port, log_dir, results):
         # host's own local actor for it is still alive and still holding the label just forced onto it --
         # this is the exact precondition the regression needs: a despawn landing on a process whose own
         # actor is genuinely mid-catch.
-        racer_request = build_catch_request(latched_id, generation, 9001, latched_species)
+        racer_request = catch_bytes(racer, latched_id, generation, 9001, latched_species)
         racer.send_reliable(racer_request)
         racer_res = collect_catch_results(racer, 2.0)
         print(f"[bug-catch] LABEL-RACE: racer CATCH_RESULT(s): {racer_res}")
@@ -836,7 +850,7 @@ def test_exchange_h(port, log_dir, results):
               generation is not None, results)
         if generation is None:
             return
-        racer_request = build_catch_request(target["entity_id"], generation, 5001, target["species"])
+        racer_request = catch_bytes(racer, target["entity_id"], generation, 5001, target["species"])
 
         client = L.ClientProcess(f"127.0.0.1:{port}",
                                  extra_args=["--bootstrap-resident", "1", "--authoritative-wildlife",

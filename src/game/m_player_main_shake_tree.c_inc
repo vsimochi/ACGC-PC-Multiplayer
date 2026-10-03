@@ -77,7 +77,7 @@ static void Player_actor_SetEffect_Shake_tree(ACTOR* actorx, GAME* game) {
                          * role (including a host-authoritative client) -- hence the plain, ungated call
                          * still below for that case. */
                         if (pc_net_game_is_tree_fruit_drop_source((int)item) &&
-                            pc_net_game_world_is_host_authoritative()) {
+                            pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                             pc_net_game_request_tree_shake(ut_x, ut_z);
                         } else if (pc_net_game_is_tree_fruit_drop_source((int)item) &&
                                    pc_net_game_role() == PC_NETGAME_ROLE_HOST) {

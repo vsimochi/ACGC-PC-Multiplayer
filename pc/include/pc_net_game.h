@@ -73,8 +73,19 @@ extern "C" {
  * v4 bury bump above). v7 ALSO includes ONE new reliable host -> client message, PC_NETGAME_MSG_PLAYER_ACTION (id 46,
  * 10 bytes): a presentation-only "player X picked up item I at tile (ux,uz)" hint (kind 1 = PICKUP; the host emits it at
  * its own commit, relays it to every READY client except the originator, and a client never sends one) -- the same
- * unreleased v7, so no further bump. */
-#define PC_NETGAME_PROTOCOL_VERSION 7u
+ * unreleased v7, so no further bump.
+ *
+ * Protocol version 8 (D3, host-mirrored resident record): ONE new message family, ids 47..50 (RECORD_HELLO 24 B,
+ * RECORD_BEGIN 28 B, RECORD_CHUNK 1012 B, RECORD_ACK 20 B, all reliable) carrying a resident's Private_c as canonical
+ * big-endian GCI bytes (0x2440 B in 10 chunks). Existing layouts are unchanged; the bump makes a v7 peer be refused at
+ * IDENTITY (PROTOCOL_MISMATCH) because it would never answer the host's record protocol. See pc_net_game.c's D3 block.
+ *
+ * VERSION POLICY (X1, host-transactional pickup/drop/bury commit): v8 is still UNRELEASED, so its message set is EXTENDED IN PLACE
+ * with ids 51 TXN_COMMIT (client -> host, 72 bytes) and 52 TXN_RESULT (host -> client, 76 bytes), both reliable -- NO version
+ * bump. The version check stays STRICT equality (a host and a client of different versions are refused at IDENTITY, never
+ * downgraded to a mixed mode), so the v8 build that ships must contain the whole set. Ids 53/54 (TXN_QUERY / TXN_STATUS) are
+ * reserved for X2: if v8 ships before X2 they arrive as an additive v9. See pc_net_game.c's X1 WIRE block. */
+#define PC_NETGAME_PROTOCOL_VERSION 8u
 
 /* SHARED-WORLD INTERACTION POLICY (intentional): the TOWN field is the one shared, host-authoritative
  * world -- pickups and drops of ground items go through the two-phase protocol below. A PRIVATE HOUSE /
@@ -596,6 +607,13 @@ int pc_net_game_is_droppable_item(int item);
  * either). */
 int pc_net_game_request_bury(int pocket_slot_idx, int claimed_item, int ut_x, int ut_z, int hole_variant);
 
+/* X1b: 1 while THIS process is a network client with an unresolved pickup/drop/bury request or host-transactional pocket commit (the
+ * TXN_COMMIT / TXN_RESULT round trip), else 0 (single-player and the host are never locked). The client-only lock that
+ * mPlib_able_submenu_type1() (src/game/m_player_lib.c, TARGET_PC) ANDs in: while it is 1 the inventory / map / A-button boards, the
+ * mailbox and the mscore stay shut, so the pocket slot a transaction refers to cannot be rearranged before the host's outcome is
+ * known. It clears by itself on every matched TXN_RESULT, and on a session reset. */
+int pc_net_game_client_pocket_locked(void);
+
 /* World Ecology T3: HOST-LOCAL bury -- mirrors pc_net_game_host_local_money_rock_hit()'s/
  * pc_net_game_host_local_tree_shake()'s own precedent exactly: the host's own local bury action routes
  * through the SAME validate+commit logic a remote peer's BURY_REQUEST/INTERACT_CONFIRM pair uses,
@@ -658,6 +676,14 @@ int pc_net_game_host_bury_tile_is_valid(int ut_x, int ut_z);
  * internally). The host never rolls RNG for the granted item -- it is read directly from its own
  * authoritative pcfa_get_tile() at the target tile, exactly what vanilla's own mPlib_Check_scoop_after()
  * would have read locally. */
+/* X3 NOTE (applies to every request below that carries a grant: DIG_BURIED, the _with_grant variants, catch_fish / catch_bug): the grant is a
+ * HOST-TRANSACTIONAL transaction, not a local mutation on RESULT. The request carries the 64-byte PCNetGameTxnTag (pre-image of the pockets /
+ * conds / wallet, the D3 base, nonce + seq) and is resent byte-identically until the host's TXN_RESULT arrives; the host validates, mutates the
+ * world and writes its resident mirror in ONE call and answers TXN_RESULT (kinds DIG_BURIED / DIG_HOLE / DIG_SHINE / CATCH) immediately before the
+ * legacy RESULT. This client changes its pockets, sets its collection bit and records the catch outcome ONLY on TXN_RESULT(APPLIED) (the legacy
+ * RESULT is informational). One pocket transaction at a time: a request made while another is unresolved is refused (a catch returns 0 = the seam's
+ * local denial). The wording about mPr_SetFreePossessionItem / "on accept" in the older paragraphs below describes the pre-X3 behaviour. */
+int pc_net_game_request_dig_buried(int ut_x, int ut_z);
 int pc_net_game_request_dig_buried(int ut_x, int ut_z);
 
 /* World Ecology milestone (Stage 1, Item 2): called from the decomp money-rock hit seam (see
@@ -1177,6 +1203,23 @@ uint32_t pc_net_game_bug_entity_id_for_label(const void* label_actor, int insect
  * logging -- see pc_wildlife_authority.h/.c and pcnetgame_handle_client_wildlife_spawn() (pc_net_game.c). */
 void pc_net_game_notify_wildlife_spawn(uint32_t entity_id, int kind, int species, int bx, int bz,
                                         float pos_x, float pos_y, float pos_z);
+
+/* D3 Q5: HOST only. Nonzero when a peer with unsaved accepted record uploads went away (coalesced flag; the consumer is the
+ * early authoritative host save in pc_vi.c, D3-4). pc_net_game_record_note_saved() clears the flag and every per-resident
+ * unsaved marker (called from pc_net_game_record_after_gci_save() after a successful GCI save). */
+int pc_net_game_record_early_save_requested(void);
+void pc_net_game_record_note_saved(void);
+/* D3-4: early_save_requested() AND the host world is ready (pc_vi.c adds HOST role, pcfa_save_ready and the 5 s coalescing). */
+int pc_net_game_record_early_save_due(void);
+/* D3-4: called by pc_m_card.c (main thread) right after every successful Card-A GCI save: clears the unsaved markers and
+ * writes the host record sidecar save/mp/records.dat (pc_mp_records.c). No-op unless this process is the HOST. */
+void pc_net_game_record_after_gci_save(const char* gci_path);
+
+/* D3 client half: graceful-quit flush, called from the CLIENT branch of the shutdown block in src/main.c (after the game
+ * loop ended, before pc_net_game_shutdown()). If this process is a client whose resident record is SYNCED and dirty, uploads
+ * it and waits at most `max_ms` for the host's APPLIED (best effort, strictly bounded, never blocks longer; it pumps only the
+ * transport and consumes RECORD_ACKs, no game state). A no-op for every other role/state. It writes no save. */
+void pc_net_game_client_record_quit_flush(unsigned max_ms);
 
 #ifdef __cplusplus
 }

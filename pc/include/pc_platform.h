@@ -148,7 +148,11 @@ extern int           g_pc_force_mail_send;
  *                                 for a money-bag item, and calls pc_net_game_request_pickup() on it --
  *                                 the exact real seam m_player_main_pickup.c_inc uses, bypassing only
  *                                 the player's own walk-up-and-swing input. Retries every poll until a
- *                                 bag is found (the host-side hit may not have landed yet). */
+ *                                 bag is found (the host-side hit may not have landed yet).
+ *                                 X1b: it additionally waits for the resident record to be SYNCED and, like
+ *                                 --force-dig-hole, first moves the local actor onto the bag's tile centre and
+ *                                 waits 1.5 s for the MOVE to reach the host (else the host's reach check
+ *                                 rejects a client standing far from the fixture). */
 extern int           g_pc_force_money_rock_hit;
 extern int           g_pc_force_money_bag_pickup;
 /* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY: --force-dig-hole. CLIENT-only,
@@ -299,6 +303,57 @@ extern int           g_pc_diag_bug_despawn_label_race;
  * to 0 (identical to single-player) but pcwld_should_suppress_local_wildlife() correctly STAYS 1 (unlike
  * single-player, where it is always 0). A complete no-op when 0 (the default). */
 extern int           g_pc_diag_role_link_state;
+/* D3 (host-mirrored resident record) real-client verification, TEST-ONLY: --d3-test-wallet-add <N> (N may be negative).
+ * CLIENT only: once, 3 s after the client adopted the host's resident record (state SYNCED), adds N bells to the local
+ * Now_Private wallet (clamped to 0..99999) and logs a loud "[NET][REC][TEST-ONLY]" line, so a real client exercises the
+ * record UPLOAD path (and the quit flush) without any gameplay input. A complete no-op when 0 (the default); NOT active in
+ * normal play, a host or single-player. */
+extern int           g_pc_d3_test_wallet_add;
+/* D3 TEST-ONLY: --d3-test-wallet-add-late <N>. Like the flag above but a SECOND change, applied 900 ms after the previous
+ * upload started (and was acknowledged), i.e. inside the client's 2 s upload gap, so that only the graceful-quit flush can
+ * upload it. Default 0 = off. NOT active in normal play. */
+extern int           g_pc_d3_test_wallet_add_late;
+/* X1b (host-transactional pickup/drop/bury commit) REAL-CLIENT verification, TEST-ONLY: --txn-test-pickup-drop. CLIENT only (a
+ * complete no-op for any other role), default OFF, never active in normal play; armed at start with a loud "[NET][TXN][TEST-ONLY]" log
+ * and every step logs "[NET][TXN][TEST-ONLY]". Once the client's resident record is SYNCED (+4 s, so its MOVE has reached the host) it
+ * performs ONE drop of its first droppable pocket item at the tile vanilla's drop search picks for the player's current position
+ * (through the real pc_net_game_request_drop()), and 1.5 s after that transaction resolved a pickup of the same item from the same tile
+ * (through the real pc_net_game_request_pickup(); like --force-dig-hole the local actor is first moved onto that tile's centre and
+ * 1.5 s later the request is sent, so the host's pickup reach check accepts it). It bypasses only the inventory UI / pickup animation
+ * input and the walk to the tile, never any part of the
+ * request / provisional RESULT / TXN_COMMIT / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_txn_test_hook(). */
+extern int           g_pc_txn_test_pickup_drop;
+/* X3 (host-transactional dig grants) REAL-CLIENT verification, TEST-ONLY: --txn-test-dig-grant. CLIENT only (a complete no-op for any other
+ * role), default OFF, never active in normal play; armed with a loud "[NET][TXN][TEST-ONLY]" log, every step logs the same prefix. Needs the
+ * host to run --field-action-test-seed. Once the client's resident record is SYNCED (+4 s) it moves the local actor onto each fixture tile
+ * (so the host's reach check accepts), waits 1.5 s for the MOVE to reach the host and calls the REAL request functions in turn:
+ * pc_net_game_request_dig_buried(40,104), pc_net_game_request_dig_hole_with_grant(56,105,0,ITM_MONEY_100) and
+ * pc_net_game_request_dig_shine_with_grant(88,105,ITM_MONEY_1000) (the golden-shovel / shine rolls are fixed instead of random). It logs the
+ * pockets before the request and after the transaction resolved. Bypasses only the shovel animation / input and the roll, never the
+ * request / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_txn_dig_test_hook(). */
+extern int           g_pc_txn_test_dig_grant;
+/* X1 (host-transactional PICKUP/DROP/BURY commit) host-side FAULT INJECTION, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. HOST role ONLY:
+ * pc_main.c refuses (exit code 2, message on stderr) any other role, and the C hook re-checks the role. OFF by default (mode 0),
+ * never active in normal play; when armed the process logs "[NET][TXN][TEST-ONLY] FAULT INJECTION ENABLED mode=..." at start and
+ * "[NET][TXN][TEST-ONLY] FAULT INJECTION FIRED ..." at every firing. The N-th visit of the mode's single site (default 1) and the
+ * K-1 visits after it fire (K default 1):
+ *   ignore_commit            discard the COMMIT right after the READY gate (nothing validated or journaled): a lost COMMIT
+ *   fail_world               force the world re-validation to fail after the other validation passed (REJECTED WORLD_CHANGED)
+ *   expire                   treat the COMMIT's PENDING reservation as aged >= 20 s (REJECTED EXPIRED; closes the L-2 gap)
+ *   drop_result              do not send an APPLIED TXN_RESULT (first execution AND replays): the ack is lost on a live link
+ *   kill_peer_after_commit   after the commit (world + mirror + journal) drop the peer WITHOUT a RESULT
+ * (the crash modes are X4). g_pc_txn_fault_nth / _arg hold N and K. */
+enum {
+    PC_TXN_FAULT_NONE = 0,
+    PC_TXN_FAULT_IGNORE_COMMIT = 1,
+    PC_TXN_FAULT_FAIL_WORLD = 2,
+    PC_TXN_FAULT_EXPIRE = 3,
+    PC_TXN_FAULT_DROP_RESULT = 4,
+    PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT = 5
+};
+extern int           g_pc_txn_fault_mode;
+extern int           g_pc_txn_fault_nth;
+extern int           g_pc_txn_fault_arg;
 extern int           g_pc_frame_limit_override;
 extern int           g_pc_speedhack_enabled;
 extern int           g_pc_time_override;

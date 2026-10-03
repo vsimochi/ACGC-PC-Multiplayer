@@ -64,7 +64,7 @@ KIND_FILL_HOLE = 6
 KIND_PITFALL_CONSUME = 7
 KIND_DIG_SHINE = 8
 
-REQ_FMT = "<BBBBIBBH"  # protocol v3: msg_type,kind,ut_x,ut_z,request_id,hole_variant,_reserved0,_reserved1
+REQ_FMT = "<BBBBIBBH64x"  # protocol v3 + X3: msg_type,kind,ut_x,ut_z,request_id,hole_variant,_reserved0,_reserved1 + the 64-byte txn tag (zero = no grant)
 RES_FMT = "<BBBBIHBB"
 REQ_SIZE = struct.calcsize(REQ_FMT)
 RES_SIZE = struct.calcsize(RES_FMT)
@@ -95,6 +95,9 @@ def decode_field_action_result(payload):
 
 
 def send_field_action_request(client, kind, ut_x, ut_z, request_id, hole_variant=0):
+    if kind == KIND_DIG_BURIED:
+        # X3: DIG_BURIED (incl. the pitfall dig-up sub-case) is a host-transactional GRANT: it carries the pre-image tag
+        return client.send_fa_grant(kind, ut_x, ut_z, request_id, hole_variant=hole_variant)
     return client.send_reliable(build_field_action_request(kind, ut_x, ut_z, request_id, hole_variant))
 
 
@@ -194,6 +197,10 @@ def main():
         check("Test B1: request_id echoed", b1["request_id"] == brid1, results)
         check(f"Test B1: granted ITM_PITFALL (0x{ITM_PITFALL:04X}), got 0x{b1['granted_item']:04X}",
               b1["granted_item"] == ITM_PITFALL, results)
+        tb1 = next((g for conn, g in a.txn_results if g.request_id == brid1 and conn == a.connect_count), None)
+        check("Test B1 (X3): the grant came with a TXN_RESULT(APPLIED, kind DIG_BURIED, item ITM_PITFALL, post-image slot == item)",
+              tb1 is not None and tb1.outcome == 0 and tb1.kind == 4 and tb1.item == ITM_PITFALL
+              and tb1.post_pockets[tb1.slot] == ITM_PITFALL, results)
     b1_updates = a.drain_field_updates(timeout=1.0)
     b1_tile_update = [u for u in b1_updates if (u[0], u[1]) == PITFALL_DIG_TILE]
     check("Test B1: a FIELD_UPDATE for the dug pitfall tile was observed", len(b1_tile_update) >= 1, results)

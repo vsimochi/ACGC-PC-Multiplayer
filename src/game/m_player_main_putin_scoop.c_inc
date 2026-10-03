@@ -54,7 +54,7 @@ static void Player_actor_setup_main_Putin_scoop(ACTOR* actor, GAME* game) {
              * path ever does reach here with a nonzero item while host-authoritative, this prevents the
              * real local field mutation (player_drop_entry_proc()) from running at all -- a
              * host-authoritative client must never write the shared field directly. */
-            if (!pc_net_game_world_is_host_authoritative()) {
+            if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
                 Common_Get(clip).bg_item_clip->player_drop_entry_proc(game, item, ut_x, ut_z, 0);
             }
 #else

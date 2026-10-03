@@ -324,7 +324,7 @@ static void mNtc_check_treasure() {
      * otherwise harmless, but skipping the whole function keeps this client's copy simply frozen
      * rather than silently diverging). Host and single-player are unaffected -- the host still buries
      * treasure normally. */
-    if (pc_net_game_world_is_host_authoritative()) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
         return;
     }
 #endif
@@ -428,7 +428,7 @@ static void mNtc_check_treasure() {
 #ifdef TARGET_PC
     /* World Ecology Stage 1, Item 3: see the other region variant's copy of this same guard above
      * (mNtc_check_treasure(), the #if VERSION != VER_GAFE01_00 branch) for the full rationale. */
-    if (pc_net_game_world_is_host_authoritative()) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
         return;
     }
 #endif

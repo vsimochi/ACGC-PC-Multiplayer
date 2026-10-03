@@ -21,6 +21,9 @@ changed, and that nothing crashed; NOT that the canopy shake looks or sounds rig
       with tile == the tile the snapshot says holds a tree and item == that tile's snapshot value; facing sweep (only the
       east facing finds the adjacent tree, the other three give budget=notree and no effect)
   T2  cooldown: a new counter inside the 84 frame window -> budget=cooldown (no effect, no sound); after it -> ok again
+  (Capacity: the host admits at most 3 clients on the 4-resident fixture since Stage 1A.  The observer OBS stays connected for
+   the whole run; every other peer leaves gracefully (host teardown line awaited, explicit check) before the next one
+   joins, so never more than 3 are open.  T3 uses OBS itself as one of the three simultaneous shakers.)
   T3  three puppets shaking at once: at most 2 effects ok (EffectBG pool: >= 1 slot always stays free, never evict),
       every ok line reports efbg_active <= 1, the others are pool/capped/cooldown
   T4  a puppet in another scene (SHOP) -> budget=scene, zero ok lines
@@ -39,7 +42,7 @@ import time
 
 import net_spike_lib as L
 from test_player_scene_real import boot_host
-from test_puppet_cosmetics import scene_msg, SCENE_FG, SCENE_SHOP0, strip_comments
+from test_puppet_cosmetics import scene_msg, SCENE_FG, SCENE_SHOP0, strip_comments, leave_peer
 from test_puppet_held_item import clean, make_b, wait_visual
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -229,7 +232,7 @@ def t_all(port, log_dir, check):
                 break
             if probe is None or pi >= 3:
                 if probe is not None:
-                    probe.close()
+                    check("T1 probe peer left gracefully (host teardown line seen)", leave_peer(host, probe))
                     peers.remove(probe)
                 probe = new_peer("P%d" % len(peers))
                 pi = 0
@@ -261,6 +264,11 @@ def t_all(port, log_dir, check):
         if len(good) < 2:
             return
 
+        # round boundary: the last probe leaves before the sweep / cooldown peers join (OBS + 2 more at most)
+        if probe is not None:
+            check("T1 last probe peer left gracefully (host teardown line seen)", leave_peer(host, probe))
+            peers.remove(probe)
+            probe = None
         # facing sweep on the first good tree (fresh peer: fresh diag limiter)
         sweep = new_peer("SW")
         L.pump_sleep(2.8, sweep.c.hub)
@@ -298,9 +306,7 @@ def t_all(port, log_dir, check):
         # ---- summary counters on disconnect (the sweep peer: 1 effect ok + 3 notree) ----
         off = len(host.log_text())
         swpid = sweep.pid
-        sweep.c.disconnect()
-        L.pump_sleep(1.0, obs.c.hub)
-        sweep.close()
+        check("T6 sweep peer left gracefully (host teardown line seen)", leave_peer(host, sweep))
         peers.remove(sweep)
         host.wait_for_log(r"player %d cosmetics summary: .*tree_effects=" % swpid, 15.0, since_offset=off)
         sms = [x for x in SUM_RX.finditer(host.log_text()[off:]) if int(x.group(1)) == swpid]
@@ -313,9 +319,10 @@ def t_all(port, log_dir, check):
         if len(good) >= 3:
             for p in list(peers):
                 if p is not obs:
-                    p.close()
+                    check("T3 round boundary: %s left gracefully (host teardown line seen)" % p.c.label, leave_peer(host, p))
                     peers.remove(p)
-            trio = [new_peer("Q%d" % i) for i in range(3)]
+            # OBS is one of the three simultaneous shakers (the host admits only 3 clients; OBS must stay connected for T6)
+            trio = [obs] + [new_peer("Q%d" % i) for i in (1, 2)]
             L.pump_sleep(3.0, trio[0].c.hub)
             for i, p in enumerate(trio):
                 p.place_at_tree(good[i][0])
@@ -338,8 +345,9 @@ def t_all(port, log_dir, check):
                   {e[6] for e in allfx} - {"ok"} <= {"pool", "capped", "cooldown"})
             check("T3 host alive", host.alive())
             for p in trio:
-                p.close()
-                peers.remove(p)
+                if p is not obs:
+                    check("T3 %s left gracefully (host teardown line seen)" % p.c.label, leave_peer(host, p))
+                    peers.remove(p)
         else:
             print("INFO - T3 skipped: fewer than 3 good trees")
 
@@ -350,6 +358,8 @@ def t_all(port, log_dir, check):
         fx = effects(t, sp.pid)
         check("T4 puppet in the SHOP scene: zero ok lines, budget=scene (%s)" % [e[6] for e in fx],
               len(fx) >= 1 and all(e[6] == "scene" for e in fx) and not sounds(t, sp.pid))
+        check("T4 SHOP peer left gracefully (host teardown line seen)", leave_peer(host, sp))
+        peers.remove(sp)
 
         # ---- T5: interrupted before frame 10 ----
         ip = new_peer("IN")
@@ -373,6 +383,9 @@ def t_all(port, log_dir, check):
             check("T5 a shake replaced by another row state before frame 10 never fires (ok=%d)" % n_ok, n_ok == 0)
         else:
             print("INFO - T5 the interpolator never adopted the 89 snapshot (too brief): not a failure, weak check")
+
+        check("T5 IN peer left gracefully before the snapshot probe (host teardown line seen)", leave_peer(host, ip))
+        peers.remove(ip)
 
         # ---- T6: no world mutation ----
         L.pump_sleep(1.0, obs.c.hub)

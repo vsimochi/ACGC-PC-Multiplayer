@@ -400,6 +400,82 @@ int g_pc_diag_bug_despawn_label_race = 0;
  * global. */
 int g_pc_diag_role_link_state = 0;
 
+/* D3 real-client verification, TEST-ONLY: --d3-test-wallet-add <N>. See pc_platform.h's own doc comment on this global. */
+int g_pc_d3_test_wallet_add = 0;
+int g_pc_d3_test_wallet_add_late = 0; /* second change, see pc_platform.h */
+
+/* X1b real-client transaction verification, TEST-ONLY: --txn-test-pickup-drop. See pc_platform.h's own doc comment on this global. */
+int g_pc_txn_test_pickup_drop = 0;
+
+/* X3 real-client grant verification, TEST-ONLY: --txn-test-dig-grant. See pc_platform.h's own doc comment on this global. */
+int g_pc_txn_test_dig_grant = 0;
+
+/* X1 host-side fault injection, TEST-ONLY: --txn-fault=<mode>[:N[:K]]. See pc_platform.h's own doc comment on these globals. */
+int g_pc_txn_fault_mode = 0;
+int g_pc_txn_fault_nth = 1;
+int g_pc_txn_fault_arg = 1;
+
+/* Parses "<mode>[:N[:K]]". Returns 1 and fills the three globals, or 0 for an unknown mode / malformed number (the caller refuses). */
+static int pc_parse_txn_fault(const char* spec) {
+    static const struct { const char* name; int mode; } modes[] = {
+        { "ignore_commit", PC_TXN_FAULT_IGNORE_COMMIT },
+        { "fail_world", PC_TXN_FAULT_FAIL_WORLD },
+        { "expire", PC_TXN_FAULT_EXPIRE },
+        { "drop_result", PC_TXN_FAULT_DROP_RESULT },
+        { "kill_peer_after_commit", PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT },
+    };
+    char buf[96];
+    char* parts[3] = { NULL, NULL, NULL };
+    char* p;
+    int n = 0;
+    size_t k;
+    int nth = 1, cnt = 1;
+    if (strlen(spec) >= sizeof(buf)) {
+        return 0;
+    }
+    strcpy(buf, spec);
+    p = buf;
+    while (n < 3) {
+        parts[n++] = p;
+        p = strchr(p, ':');
+        if (p == NULL) {
+            break;
+        }
+        *p++ = '\0';
+    }
+    if (p != NULL) {
+        return 0; /* more than three fields */
+    }
+    for (k = 0; k < sizeof(modes) / sizeof(modes[0]); k++) {
+        if (strcmp(parts[0], modes[k].name) == 0) {
+            break;
+        }
+    }
+    if (k == sizeof(modes) / sizeof(modes[0])) {
+        return 0;
+    }
+    if (n >= 2) {
+        char* end = NULL;
+        long v = strtol(parts[1], &end, 10);
+        if (parts[1][0] == '\0' || *end != '\0' || v < 1 || v > 1000000) {
+            return 0;
+        }
+        nth = (int)v;
+    }
+    if (n >= 3) {
+        char* end = NULL;
+        long v = strtol(parts[2], &end, 10);
+        if (parts[2][0] == '\0' || *end != '\0' || v < 1 || v > 1000000) {
+            return 0;
+        }
+        cnt = (int)v;
+    }
+    g_pc_txn_fault_mode = modes[k].mode;
+    g_pc_txn_fault_nth = nth;
+    g_pc_txn_fault_arg = cnt;
+    return 1;
+}
+
 /* Stage 0: --bootstrap-resident N. Non-interactively binds an EXISTING resident from save slot N
  * (0..PLAYER_NUM-1) and transitions into gameplay (SCENE_FG), without driving the interactive
  * Rover/player-select flow. Off by default (-1); never active in normal single-player or hosted
@@ -485,6 +561,26 @@ int main(int argc, char* argv[]) {
             printf("                      despawn (a second peer's CATCH_REQUEST for the same entity) while\n");
             printf("                      the label is still active -- requires --authoritative-wildlife --\n");
             printf("                      see pc_net_game.c/pc_platform.h.\n");
+            printf("  --d3-test-wallet-add N  Client-only TEST hook: 3 s after the host's resident record is\n");
+            printf("                      adopted, add N bells to the local wallet once (exercises the record\n");
+            printf("                      upload path) -- see pc_platform.h. Never use in normal play.\n");
+            printf("  --d3-test-wallet-add-late N  Client-only TEST hook: a second wallet change inside the upload\n"
+                   "                      gap (only the quit flush can send it); see pc_platform.h.\n");
+            printf("  --txn-test-pickup-drop  Client-only TEST hook (default off; loud logs): once the resident record\n"
+                   "                      is synced, drop the first droppable pocket item at the player's own drop\n"
+                   "                      tile and then pick it up again through the real request functions, so the\n"
+                   "                      host-transactional TXN_COMMIT path runs without GUI input; see\n"
+                   "                      pc_platform.h. Never use in normal play.\n");
+            printf("  --txn-test-dig-grant  Client-only TEST hook (default off; loud logs): once the resident record is\n"
+                   "                      synced, request the three host-transactional dig GRANTS at the\n"
+                   "                      --field-action-test-seed fixtures through the real request functions\n"
+                   "                      (DIG_BURIED (40,104), DIG_HOLE+golden-shovel bonus (56,105), DIG_SHINE+bell\n"
+                   "                      roll (88,105)); see pc_platform.h. Never use in normal play.\n");
+            printf("  --txn-fault=MODE[:N[:K]]  HOST-only TEST hook (refused for any other role; off by default; loud\n"
+                   "                      logs): inject a fault into the host's transactional pickup/drop/bury\n"
+                   "                      commit. MODE = ignore_commit | fail_world | expire | drop_result |\n"
+                   "                      kill_peer_after_commit; fires on the N-th visit of the mode's site (default 1),\n"
+                   "                      K times (default 1). See pc_platform.h. Never use in normal play.\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -554,6 +650,28 @@ int main(int argc, char* argv[]) {
             g_pc_diag_bug_despawn_label_race = 1;
         } else if (strcmp(argv[i], "--diag-role-link-state") == 0) {
             g_pc_diag_role_link_state = 1;
+        } else if (strcmp(argv[i], "--d3-test-wallet-add") == 0 && i + 1 < argc) {
+            g_pc_d3_test_wallet_add = atoi(argv[i + 1]);
+            printf("[NET][REC][TEST-ONLY] --d3-test-wallet-add %d armed (a TEST hook: not for normal play)\n",
+                   g_pc_d3_test_wallet_add);
+            i++;
+        } else if (strcmp(argv[i], "--d3-test-wallet-add-late") == 0 && i + 1 < argc) {
+            g_pc_d3_test_wallet_add_late = atoi(argv[i + 1]);
+            printf("[NET][REC][TEST-ONLY] --d3-test-wallet-add-late %d armed (a TEST hook: not for normal play)\n",
+                   g_pc_d3_test_wallet_add_late);
+            i++;
+        } else if (strcmp(argv[i], "--txn-test-pickup-drop") == 0) {
+            g_pc_txn_test_pickup_drop = 1;
+            printf("[NET][TXN][TEST-ONLY] --txn-test-pickup-drop armed (a TEST hook: not for normal play)\n");
+        } else if (strcmp(argv[i], "--txn-test-dig-grant") == 0) {
+            g_pc_txn_test_dig_grant = 1;
+            printf("[NET][TXN][TEST-ONLY] --txn-test-dig-grant armed (a TEST hook: not for normal play)\n");
+        } else if (strncmp(argv[i], "--txn-fault=", 12) == 0) {
+            if (!pc_parse_txn_fault(argv[i] + 12)) {
+                fprintf(stderr, "[NET][TXN][TEST-ONLY] REFUSED: bad --txn-fault spec '%s' (expected MODE[:N[:K]], MODE = ignore_commit | "
+                                "fail_world | expire | drop_result | kill_peer_after_commit)\n", argv[i] + 12);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--bootstrap-resident") == 0 && i + 1 < argc) {
             g_pc_bootstrap_resident = atoi(argv[i + 1]);
             i++;
@@ -618,6 +736,16 @@ int main(int argc, char* argv[]) {
             }
             i++;
         }
+    }
+
+    /* X1: --txn-fault is a HOST-only TEST hook: refused (before stdout/stderr are redirected) for any other role. */
+    if (g_pc_txn_fault_mode != 0) {
+        if (g_pc_net_role != 1) {
+            fprintf(stderr, "[NET][TXN][TEST-ONLY] REFUSED: --txn-fault is a HOST-only test hook (use it together with --host)\n");
+            return 2;
+        }
+        printf("[NET][TXN][TEST-ONLY] FAULT INJECTION ENABLED mode=%d nth=%d count=%d (a TEST hook: not for normal play)\n",
+               g_pc_txn_fault_mode, g_pc_txn_fault_nth, g_pc_txn_fault_arg);
     }
 
     /* Redirect stdout/stderr to NUL unless verbose — unbuffered terminal writes

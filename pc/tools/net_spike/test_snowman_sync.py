@@ -70,7 +70,7 @@ SNOWMAN_STATE_TYPE = 35          # PC_NETGAME_MSG_SNOWMAN_STATE
 
 # PCNetGameFieldActionRequestMsg (current, post-T1-widening): msg_type, kind, ut_x, ut_z, uint32
 # request_id, hole_variant, _reserved0, uint16 _reserved1 -- 12 bytes.
-FA_REQ_FMT = "<BBBBIBBH"
+FA_REQ_FMT = "<BBBBIBBH64x"  # X3: 76 B = the 12-byte v3 header + the 64-byte txn tag (all zero = no grant)
 FA_RES_FMT = "<BBBBIHBB"
 FA_RES_SIZE = struct.calcsize(FA_RES_FMT)
 

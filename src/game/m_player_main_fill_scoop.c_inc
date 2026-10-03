@@ -66,7 +66,7 @@ static void Player_actor_Reset_Hole_Fill_scoop(ACTOR* actor) {
          * host only -- a host-authoritative client sends the request and skips its own local
          * bury_hole_effect_entry_proc() call (the true vanilla commit point for this seam); everything
          * before this point (animation, sound, effects) already ran unconditionally and is untouched. */
-        if (pc_net_game_world_is_host_authoritative()) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
             int ux, uz;
             if (mFI_Wpos2UtNum(&ux, &uz, *pos)) {
                 pc_net_game_request_fill_hole(ux, uz);

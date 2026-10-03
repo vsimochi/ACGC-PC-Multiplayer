@@ -5,8 +5,11 @@
         client (warning mWR_WARNING_PUT_PLANT, return before mTG_common_throw_put_field / pocket clear).
   G2-2  Player_actor_SetEffectRemoveFlower_Dash (m_player_main_dash.c_inc): on a host-authoritative client
         the trample (fade_entry_proc) is skipped after the RANDOM(4) draw.
-  G2-3  pc_net_game.c: a committed bury is retained (s_bury_committed); a matching later reject restores
-        the item (same slot / free slot / LOST log); reset + next request + timeout discard it.
+  G2-3  (X1b: SUPERSEDED, deliberately converted) the M9-D mechanism "retain the committed bury claim (s_bury_committed) and restore the item
+        on a later host reject" is DELETED: the client no longer clears the pocket before the host's TXN_RESULT(APPLIED), so a failed bury can
+        never cost the item and there is nothing to restore. The audit now asserts exactly that: the mechanism is gone, the bury result
+        handler only validates and begins a TXN_COMMIT (no pocket write), the slot is cleared only in pcnetgame_txn_apply_applied, and the
+        host still sends the tile-reconcile reject after a failed commit (REJECTED(WORLD_CHANGED) + BURY_RESULT accepted=0).
 
 Runtime behavior of these paths is NOT TESTED (no hook reaches the plant menu / dash tile / a bury
 COMMIT failure on a real client).
@@ -70,44 +73,40 @@ def main():
     dash = read("src/game/m_player_main_dash.c_inc")
     d = func_body(dash, r"\nstatic int Player_actor_SetEffectRemoveFlower_Dash\(ACTOR\* actor, GAME\* game, s16 angle\) \{")
     r = d.find("RANDOM(4)")
-    g = d.find("pc_net_game_world_is_host_authoritative()")
+    g = d.find("pc_net_game_role() == PC_NETGAME_ROLE_CLIENT")
     f = d.find("fade_entry_proc(name, actor_pos)")
     e = d.find("eEC_EFFECT_HANATIRI")
     check("G2-2: RANDOM draw precedes the client gate; gate precedes petal effect and tile write",
           0 <= r < g < e and g < f, results)
-    check("G2-2: gate returns FALSE (dust effect, no trample)",
-          re.search(r"world_is_host_authoritative\(\)\) \{\s*return FALSE;", d) is not None, results)
+    # G7 intentionally switched this gate from pc_net_game_world_is_host_authoritative() to the plain role test
+    check("G2-2: gate returns FALSE (dust effect, no trample) and is the role-based CLIENT gate",
+          re.search(r"PC_NETGAME_ROLE_CLIENT\) \{\s*return FALSE;", d) is not None, results)
+    check("G2-2: the trample gate is NOT the READY-aware host-authoritative predicate any more (G7: role-based only)",
+          "world_is_host_authoritative" not in d, results)
 
     # ---- G2-3
     net = read("pc/src/pc_net_game.c")
-    check("G2-3: s_bury_committed record defined", "static PCNetGameBuryCommitted s_bury_committed;" in net, results)
+    c_noc = re.sub(r"/\*.*?\*/", "", net, flags=re.S)
+    check("G2-3 (X1b): the M9-D committed-bury claim mechanism is DELETED: no s_bury_committed / PCNetGameBuryCommitted / keep timeout anywhere",
+          "s_bury_committed" not in c_noc and "PCNetGameBuryCommitted" not in c_noc and "BURY_COMMITTED_KEEP" not in c_noc, results)
     h = func_body(net, r"\nstatic void pcnetgame_handle_client_bury_result\(const PCNetGameBuryResultMsg\* in\) \{")
-    ri = h.find("s_bury_committed.valid && s_bury_committed.request_id == in->request_id")
-    nm = h.find("if (!matches) {")
-    check("G2-3: reject path restores for a matching retained request (in the !matches branch)",
-          0 <= nm < ri, results)
-    rb = h[ri:h.find("return; /* not our current pending request")] if ri >= 0 else ""
-    check("G2-3: restore: same-slot-if-empty, else free slot, else LOST; one restore only",
-          "== (mActor_name_t)EMPTY_NO" in rb and "mPr_SetFreePossessionItem(" in rb and "LOST" in rb
-          and "s_bury_committed.valid = 0;" in rb and "pcnetgame_owner_stamp_matches(&s_bury_committed.owner)" in rb,
+    h_noc = re.sub(r"/\*.*?\*/", "", h, flags=re.S)
+    check("G2-3 (X1b): the bury result handler never writes the pocket (no mPr_*, no inventory write) and never queues CONFIRM(COMMIT): it begins a "
+          "TXN_COMMIT with the pending claim", "mPr_Set" not in h_noc and "mPr_Give" not in h_noc and not re.search(r"inventory\.\w+(?:\[[^\]]*\])?\s*=[^=]", h_noc)
+          and "PC_NETGAME_CONFIRM_COMMIT" not in h_noc and "pcnetgame_txn_begin(kind, in->request_id, (uint8_t)slot, (uint16_t)s_bury_pending.claimed_item, NULL, &s_bury_pending.owner)" in h_noc,
           results)
-    clr = h.find("mPr_SetPossessionItem(Now_Private, slot, (mActor_name_t)EMPTY_NO")
-    setr = h.find("s_bury_committed.valid = 1;")
-    cmt = h.find("PC_NETGAME_CONFIRM_COMMIT")
-    check("G2-3: retained after COMMIT is queued and pocket cleared (record set after the clear)",
-          clr >= 0 and setr >= 0 and clr < setr and "s_bury_committed.request_id = in->request_id;" in h, results)
-    check("G2-3: source order COMMIT queued < pocket cleared < record set",
-          cmt >= 0 and clr >= 0 and setr >= 0 and cmt < clr < setr, results)
-    check("G2-3: accepted (provisional) path does not restore anything", "RESTORED" not in h[h.find("if (!matches) {", nm + 10):], results)
+    check("G2-3 (X1b): the reject branch still reconciles the tile (pcnetgame_client_apply_tile) and restores nothing (nothing was cleared)",
+          "pcnetgame_client_apply_tile(" in h_noc and "RESTORED" not in h_noc and "mPr_SetFreePossessionItem" not in h_noc, results)
+    ap = func_body(net, r"\nstatic void pcnetgame_txn_apply_applied\(const PCNetGameClientTxn\* T, const PCNetGameTxnResultMsg\* in\) \{")
+    check("G2-3 (X1b): the bury/drop slot is cleared ONLY in pcnetgame_txn_apply_applied (host post-image, or the delta clearing the claimed slot)",
+          "np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;" in ap and "in->post_pockets[i]" in ap, results)
     rst = func_body(net, r"\nstatic void pcnetgame_reset_client_session_state\(void\) \{")
-    check("G2-3: session reset clears the retained record",
-          "memset(&s_bury_committed, 0, sizeof(s_bury_committed));" in rst, results)
+    check("G2-3 (X1b): the session reset clears the transaction in flight (s_ctxn) and the pending bury request",
+          "memset(&s_ctxn, 0, sizeof(s_ctxn));" in rst and "memset(&s_bury_pending, 0, sizeof(s_bury_pending));" in rst, results)
     req = func_body(net, r"\nint pc_net_game_request_bury\(")
-    check("G2-3: new bury request supersedes the retained record",
-          "s_bury_committed.valid = 0;" in req, results)
-    check("G2-3: safety timeout discards the retained record",
-          "graph_dt_period_elapsed(gamePT, &s_bury_committed.keep_accum" in net, results)
-    check("G2-3: host still sends a reject on commit failure with the request id",
+    check("G2-3 (X1b): a new bury request is refused while a pocket transaction is unresolved (return 0 = the seam shows the 'cannot' warning)",
+          "pcnetgame_txn_busy()" in req and "s_bury_committed" not in req, results)
+    check("G2-3: the host still sends the tile-reconcile reject with the request id after a failed commit (legacy path AND the TXN WORLD_CHANGED step)",
           "pcnetgame_host_send_bury_reject(peer, rec->request_id, rec->ut_x, rec->ut_z);" in net, results)
 
     return summary_and_exit_code(results)

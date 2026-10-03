@@ -39,7 +39,7 @@ import time
 import net_spike_lib as L
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BIN = os.path.normpath(os.path.join(HERE, "..", "..", "build64", "bin_talkfix"))
+DEFAULT_BIN = os.path.normpath(os.path.join(HERE, "..", "..", "build64", "bin_fixture4"))  # 4 residents: H7 needs a 2nd scripted peer
 TERMINAL_RX = r"\[NPC\]\[TALKHOOK\] (?:client|host) (?:DONE|STUCK|TRIGGER_TIMEOUT)"
 
 
@@ -701,6 +701,32 @@ def h8c(port, log_dir, bin_dir, check):
     h8_keepalive(port, log_dir, bin_dir, check, "0", True)
 
 
+def is_fixture_dir(bin_dir):
+    return bool(bin_dir) and os.path.basename(os.path.normpath(bin_dir)).startswith("bin_fixture4")
+
+
+class FixtureSaveGuard:
+    """The 4-resident fixture save is disposable too: the whole save dir is snapshotted at entry and restored (incl. removal of
+    save/mp written by the host's sidecar / early save) on exit."""
+
+    def __init__(self, bin_dir):
+        self.save = os.path.join(bin_dir, "save")
+        self.snap = None
+
+    def __enter__(self):
+        import shutil
+        self.snap = os.path.join(os.environ.get("TEMP", "."), "villager_talk_save_snap_%d" % os.getpid())
+        shutil.copytree(self.save, self.snap)
+        return self
+
+    def __exit__(self, *exc):
+        import shutil
+        shutil.rmtree(self.save, ignore_errors=True)
+        shutil.copytree(self.snap, self.save)
+        shutil.rmtree(self.snap, ignore_errors=True)
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7811)
@@ -711,12 +737,13 @@ def main():
     log_dir = os.path.join(HERE, "logs", "client_villager_talk")
     os.makedirs(log_dir, exist_ok=True)
     check = lambda d, c: L.check(d, c, results)
-    for i, (name, fn) in enumerate((("C1", c1), ("C2", c2), ("C3", c3), ("H1", h1_h2_h3), ("H1C", h1c_control),
-                                    ("H6", h6_killed_client), ("H7", h7_protocol), ("H7E", h7e_expiry),
-                                    ("H8", h8), ("H8C", h8c))):
-        if args.only and args.only != name:
-            continue
-        fn(args.port + i, log_dir, args.bin_dir, check)
+    with (FixtureSaveGuard(args.bin_dir) if is_fixture_dir(args.bin_dir) else L.CloneSaveGuard(args.bin_dir)):  # disposable saves restored afterwards
+        for i, (name, fn) in enumerate((("C1", c1), ("C2", c2), ("C3", c3), ("H1", h1_h2_h3), ("H1C", h1c_control),
+                                        ("H6", h6_killed_client), ("H7", h7_protocol), ("H7E", h7e_expiry),
+                                        ("H8", h8), ("H8C", h8c))):
+            if args.only and args.only != name:
+                continue
+            fn(args.port + i, log_dir, args.bin_dir, check)
     return L.summary_and_exit_code(results)
 
 

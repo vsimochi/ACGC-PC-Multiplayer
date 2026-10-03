@@ -7,6 +7,9 @@
 #include "m_bgm.h"
 #include "m_event.h"
 #include "_mem.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* X1 review M1: pc_net_game_client_pocket_locked() -- see wait_talk_start() */
+#endif
 
 /* Z-X */
 static f32 direct_vector[mDemo_DIRECT_NUM][2] = { { -1.0f, 0.0f },      { -F_SQRT2, F_SQRT2 }, { 0.0f, 1.0f },
@@ -419,6 +422,16 @@ static int set_talk_default() {
 static int wait_talk_start() {
     PLAYER_ACTOR* player = GET_PLAYER_ACTOR_NOW();
 
+#ifdef TARGET_PC
+    /* X1 review M1: EVERY talk (villager gift flow, shops, museum, post office, ...) starts here. While a network CLIENT has an unresolved
+     * pickup/drop/bury or its host-transactional commit, a conversation must not start: it could give / sell / swap the very item the
+     * host is about to remove from the pockets (a duplicate), or its sale proceeds would be overwritten. Returning FALSE is the existing
+     * 'player cannot talk right now' answer (the speaker simply keeps waiting and starts the moment the lock clears: RTT, hard-capped at
+     * 60 s by the client); single-player and the host are never locked. A talk already running (change_player == FALSE flows) is untouched. */
+    if (demo->data.talk.change_player && pc_net_game_client_pocket_locked()) {
+        return FALSE;
+    }
+#endif
     if (demo->data.talk.change_player) {
         if (mPlib_get_player_actor_main_index(gamePT) != 65 &&
             mPlib_request_main_talk_type1(gamePT, demo->current.actor, demo->data.talk.turn, FALSE) == FALSE) {

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""test_identity_validation_src.py - M9 identity Stage 1A SOURCE AUDIT (no game process, no network, read-only).
+"""test_identity_validation_src.py - M9 identity Stage 1A (+1B) SOURCE AUDIT (no game process, no network, read-only).
 
 Behaviour-ORDERING / structure checks on pc/src/pc_net_game.c against the Stage 1A contract (protocol v7 unchanged):
-  S1  protocol version is still 7u
+  S1  protocol version is the expected v8 (wire_baseline.EXPECTED_PROTOCOL_VERSION)
   S2  the identity classification happens BEFORE any IDENTITY_ACK build / READY in pcnetgame_host_process_identity, and
       after the town checks (so the unchanged LAND_MISMATCH / NO_SAVE rejects keep their precedence)
   S3  the classifier is ONE isolated function returning the host-only enum {RESIDENT, UNKNOWN, AMBIGUOUS}; it never reads
@@ -17,7 +17,9 @@ Behaviour-ORDERING / structure checks on pc/src/pc_net_game.c against the Stage 
   S7  every host request handler is gated on LINK_READY
   S8  no wire layout/enum changed vs HEAD: every PCNetGame*/PCNet* wire struct, PCNetGameMsgType and
       PCNetGameRejectReason (values), the whole pc_net_game.h, and net_spike_lib's wire constants are identical to HEAD
-  S9  no save-format / persistence file is modified in the working tree (read-only `git diff --name-only`)
+  S11 (Stage 1B) transport idle query + pc_net_evict (lose-style), constants 2500/6000, never-evict-live, park (no authority),
+      evict only in the idle>=stale branch then admit only after the PEER_DISCONNECTED teardown, no wire/header change
+  S9  save FORMAT untouched (content-based: layout/bswap sources identical to HEAD; pc_m_card.c diff touches no GCI layout line)
 
 Tier: SOURCE AUDITED only (not hook-driven). Usage: python test_identity_validation_src.py"""
 import os
@@ -26,6 +28,7 @@ import subprocess
 import sys
 
 import net_spike_lib as L
+import wire_baseline
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -116,7 +119,8 @@ def main():
     head_hdr = git("show", "HEAD:pc/include/pc_net_game.h")
 
     # S1
-    check("S1 PC_NETGAME_PROTOCOL_VERSION is still 7u", re.search(r"#define PC_NETGAME_PROTOCOL_VERSION 7u\b", hdr) is not None)
+    check("S1 PC_NETGAME_PROTOCOL_VERSION is v%d (wire_baseline.EXPECTED_PROTOCOL_VERSION)" % wire_baseline.EXPECTED_PROTOCOL_VERSION,
+          wire_baseline.header_protocol_ok(hdr))
 
     # S2
     pi = func_body(src, "pcnetgame_host_process_identity")
@@ -252,20 +256,16 @@ def main():
     # S8
     cur = typedef_blocks(src, r"PCNet\w*")
     old = typedef_blocks(head_src, r"PCNet\w*")
-    diff = [k for k in set(cur) | set(old) if cur.get(k) != old.get(k)
-            and k not in ("PCNetGameHostPeerState", "PCNetGameIdentityClass")]
-    check(f"S8 every PCNet* typedef struct/enum in pc_net_game.c is unchanged vs HEAD except the host-only "
-          f"PCNetGameHostPeerState / new PCNetGameIdentityClass (changed: {sorted(diff)}) [{len(cur)} blocks]", not diff and len(cur) > 50)
+    # v8 (D3): the wire audit is delegated to wire_baseline, which accepts ONLY the documented v8 additions (ids 47-50, the four
+    # pinned structs, the version constant, host-only members/structs) and fails on anything else (selftest-proven).
+    wire_baseline.run(lambda d, c: check("S8 " + d, c), REPO)
     check("S8 PCNetGameHostPeerState changed only by appended host-only fields (no wire struct)",
           "PCNetGameHostPeerState" in cur and cur["PCNetGameHostPeerState"].startswith(old["PCNetGameHostPeerState"][:200]))
-    check("S8 PCNetGameRejectReason / PCNetGameMsgType values identical to HEAD",
-          cur["PCNetGameRejectReason"] == old["PCNetGameRejectReason"] and cur["PCNetGameMsgType"] == old["PCNetGameMsgType"])
-    check("S8 pc_net_game.h is byte-identical to HEAD (normalised EOL)", hdr == head_hdr)
+    hdr_removed = [l for l in git("diff", "-U0", "HEAD", "--", "pc/include/pc_net_game.h").split("\n")
+                   if l.startswith("-") and not l.startswith("---")]
+    check("S8 pc_net_game.h differs from HEAD only by ADDED lines plus the protocol-version define (removed: %s)" % hdr_removed,
+          all(("PC_NETGAME_PROTOCOL_VERSION" in l or "unreleased v7, so no further bump" in l) for l in hdr_removed))
     lib = read(os.path.join(HERE, "net_spike_lib.py"))
-    head_lib = git("show", "HEAD:pc/tools/net_spike/net_spike_lib.py")
-    wire_lines = lambda t: sorted(m.group(0) for m in re.finditer(r"^(?:(?:PC_NETGAME|PCNET)_\w+|\w+_FMT) = .*$", t, re.M))
-    check("S8 net_spike_lib wire constants (PC_NETGAME_*, PCNET_*, *_FMT) identical to HEAD",
-          wire_lines(lib) == wire_lines(head_lib) and len(wire_lines(lib)) > 50)
     check("S8 net_spike_lib IDENTITY_FMT/build layout unchanged: still 32 bytes",
           "assert IDENTITY_SPEC.size == 32" in lib)
 
@@ -282,12 +282,117 @@ def main():
           "mPr_CopyPersonalID(&s_host_peer[peer].bound_pid" in pi)
     # NOT hook-tested: the host cannot be made to switch resident/save mid-run by the existing harness.
 
-    # S9
-    changed = [x for x in git("diff", "--name-only").split("\n") if x]
-    forbidden = re.compile(r"(m_private\.|m_common_data\.|m_card\.|pc_save|pc_m_card\.|m_start_data_init|m_land\.|"
-                           r"include/m_personal_id|mCD|\.gci$)")
-    check(f"S9 no save-format / persistence file modified (working-tree changes: {changed})",
-          not [c for c in changed if forbidden.search(c)])
+    # S11 (Stage 1B): stale-session handling -- parking, never-evict-live, evict-then-admit ordering, no wire change
+    net_c = read(os.path.join(REPO, "pc", "src", "pc_net.c"))
+    net_h = read(os.path.join(REPO, "pc", "include", "pc_net.h"))
+    head_net_c = git("show", "HEAD:pc/src/pc_net.c")
+    win_c = net_c[net_c.index("#else /* _WIN32 */"):]  # skip the non-Windows stubs
+    idle_fn = func_body(win_c, "pc_net_peer_idle_ms")
+    evict_fn = func_body(win_c, "pc_net_evict")
+    check("S11 transport has a read-only peer idle query built from last_recv_tick (CONNECTED host peers only, -1 else), "
+          "declared in pc_net.h",
+          "last_recv_tick" in idle_fn and "!= PCNET_PEER_CONNECTED" in idle_fn and "return -1" in idle_fn
+          and "s_peers[peer]." not in re.sub(r"s_peers\[peer\]\.(state|last_recv_tick)", "", idle_fn)
+          and "int pc_net_peer_idle_ms(PCNetPeerId peer);" in net_h)
+    check("S11 pc_net_evict reuses the lose-style path (pcnet_lose_peer: delivers ACKed payloads, queues DISCONNECTED), "
+          "not pc_net_disconnect/purge",
+          "pcnet_lose_peer((int)peer)" in evict_fn and "pcnet_purge_peer_data_events" not in evict_fn
+          and "pcnet_free_slot" not in evict_fn and "PCNET_WIRE_DISCONNECT" in evict_fn
+          and "void pc_net_evict(PCNetPeerId peer);" in net_h)
+    wire_c = lambda t: sorted(m.group(0) for m in re.finditer(r"^#define PCNET_(?:WIRE_|MAGIC|HEARTBEAT|TIMEOUT)\w*.*$", t, re.M))
+    check("S11 transport wire constants/timeouts unchanged vs HEAD (PCNET_WIRE_*, MAGIC, HEARTBEAT 500, TIMEOUT 5000)",
+          wire_c(net_c) == wire_c(head_net_c) and len(wire_c(net_c)) >= 4
+          and "#define PCNET_HEARTBEAT_INTERVAL_MS 500u" in net_c and "#define PCNET_TIMEOUT_MS            5000u" in net_c)
+    check("S11 the wire structs/enums of pc_net.c are unchanged vs HEAD",
+          typedef_blocks(net_c, r".*") == typedef_blocks(head_net_c, r".*") and len(typedef_blocks(net_c, r".*")) >= 3)
+    hd = git("diff", "-U0", "HEAD", "--", "pc/include/pc_net.h")
+    check("S11 pc_net.h only gained declarations (no removed/changed line)",
+          [l for l in hd.split("\n") if l.startswith("-") and not l.startswith("---")] == [])
+    check("S11 pc_net_game.h: no declaration REMOVED vs HEAD (v8 only adds the early-save API + version text)",
+          all(("PC_NETGAME_PROTOCOL_VERSION" in l or "unreleased v7, so no further bump" in l) for l in hdr_removed))
+    check("S11 named constants: stale idle 2500u (5 missed heartbeats, < transport timeout 5000) and park window 6000u "
+          "(> transport timeout)",
+          re.search(r"#define PC_NETGAME_STALE_PEER_IDLE_MS 2500u\b", src) is not None
+          and re.search(r"#define PC_NETGAME_DUP_PARK_MAX_MS\s+6000u\b", src) is not None)
+    i_own = pi.find("claimed resident is the host's own resident")
+    i_dup = pi.find("pcnetgame_host_peer_bound_to_resident(")
+    i_idle = pi.find("pc_net_peer_idle_ms(")
+    i_ev = pi.find("pc_net_evict(")
+    i_cmp = pi.find(">= (int)PC_NETGAME_STALE_PEER_IDLE_MS")
+    i_exp = pi.find("park_now - pst->dup_park_since_ms")
+    i_dupref = pi.find("claimed resident is already connected on another peer")
+    i_log_park = pi.find("parked (resident")
+    check("S11 the host's own-resident refusal stays immediate and precedes the duplicate/park logic",
+          0 < i_own < i_dup < i_idle)
+    check("S11 eviction happens ONLY inside the `idle >= PC_NETGAME_STALE_PEER_IDLE_MS` branch (one pc_net_evict call, "
+          "never keyed on the claim alone) and before any ACK/READY",
+          0 < i_idle < i_cmp < i_ev < i_ack and src.count("pc_net_evict(") == 1 and pi.count("pc_net_evict(") == 1
+          and re.search(r"if \(idle_ms >= \(int\)PC_NETGAME_STALE_PEER_IDLE_MS\) \{[^}]*pc_net_evict\(", pi, re.S) is not None)
+    check("S11 a live old peer is never dropped/disconnected/reset by process_identity (only pc_net_evict of a stale one)",
+          "pc_net_disconnect(" not in pi and "pcnetgame_host_drop_peer(other" not in pi
+          and "pcnetgame_reset_all_host_peer_state(other" not in pi and "reject_and_close(other" not in pi
+          and "refuse_identity((PCNetPeerId)other" not in pi and "refuse_identity(other" not in pi)
+    ev_branch = pi[i_cmp:i_exp]
+    check("S11 after the eviction the newcomer stays parked (identity_pending = 1; return) -- admission only by the "
+          "re-run through the duplicate check after the old peer's PEER_DISCONNECTED teardown",
+          re.search(r"pc_net_evict\([^;]*;\s*pst->identity_pending = 1;\s*return;", ev_branch) is not None)
+    check("S11 the refusal after the park window uses the unchanged SERVER_FULL path and only after PC_NETGAME_DUP_PARK_MAX_MS",
+          i_cmp < i_exp < i_dupref < i_log_park and re.search(
+              r"park_now - pst->dup_park_since_ms\) >= PC_NETGAME_DUP_PARK_MAX_MS\) \{[^}]*"
+              r"pcnetgame_host_refuse_identity\(peer, \"claimed resident is already connected on another peer\", 0\)",
+              pi, re.S) is not None)
+    check("S11 park: identity_pending stays 1 and the function returns (no ACK, no READY, no binding for the newcomer); "
+          "the park window state is per peer and cleared by the single memset",
+          re.search(r"pst->identity_pending = 1;[^\n]*\n\s*return;\s*\}\s*\n\s*/\* Accept", pi) is not None
+          and all(k in src for k in ("int                  dup_park_active;", "uint32_t             dup_park_since_ms;")))
+    check("S11 park/evict log lines exist; no environment/flag bypass in process_identity",
+          "host: peer %d parked (resident %d live on peer %d, idle %d ms)" in pi
+          and "host: evicted stale peer %d (resident %d, idle %d ms) for peer %d" in pi
+          and "getenv" not in pi and "g_pc_" not in pi and "PC_ENHANCEMENTS" not in pi)
+    pend = func_body(src, "pcnetgame_host_process_pending_identities")
+    check("S11 parked peers are re-evaluated every host poll (process_pending, host poll after the event drain) without "
+          "log spam", "pcnetgame_host_process_identity(" in pend and "dup_park_active" in pend)
+    disc = src[src.find("case PC_NET_EVENT_PEER_DISCONNECTED:"):]
+    disc = disc[:disc.find("case PC_NET_EVENT_DATA:")]
+    check("S11 the (unchanged) host PEER_DISCONNECTED handler is the single teardown of an evicted peer: link DISCONNECTED, "
+          "scene gone, reset_all_host_peer_state (reservations/dedup/binding/talk hold), remote actor removal",
+          all(k in disc for k in ("PC_NETGAME_LINK_DISCONNECTED", "pcnetgame_host_peer_scene_gone(",
+                                  "pcnetgame_reset_all_host_peer_state(", "pc_remote_player_on_disconnect(")))
+    check("S11 Stage 1A refusal strings (ambiguous, unknown, host-own, duplicate) are all still present",
+          all(k in pi for k in ("claimed identity matches more than one resident record (ambiguous)",
+                                "claimed identity matches no resident record of this town",
+                                "claimed resident is the host's own resident",
+                                "claimed resident is already connected on another peer")))
+    check("S11 protocol version is v%d" % wire_baseline.EXPECTED_PROTOCOL_VERSION, wire_baseline.header_protocol_ok(hdr))
+
+    # S9 (content-based). The old check "no save/persistence FILE in `git diff --name-only`" is stale: pc_m_card.c is
+    # intentionally modified by Batch G1 (client role skips arming the reset code / persisting). The intent is "the SAVE
+    # FORMAT is untouched", so: (1) the layout/bswap sources are byte-identical to HEAD, and (2) the pc_m_card.c diff vs HEAD
+    # touches no GCI layout / (de)serialisation line (constants, pc_save_write_gci_to, offsets, byte swaps, file I/O).
+    layout_files = ["pc/src/pc_save_bswap.c", "include/m_private.h", "include/m_common_data.h", "include/m_home_h.h"]
+    moved = [f for f in layout_files if git("diff", "--name-only", "HEAD", "--", f).strip()]
+    # v8 (D3): pc_save_bswap.c may only GAIN the public wrapper pc_save_bswap_private (no removed line, no layout/swap change)
+    bsw = git("diff", "-U0", "HEAD", "--", "pc/src/pc_save_bswap.c")
+    bsw_add = [l[1:] for l in bsw.split("\n") if l.startswith("+") and not l.startswith("+++")]
+    bsw_rm = [l for l in bsw.split("\n") if l.startswith("-") and not l.startswith("---")]
+    if not bsw_rm and any("void pc_save_bswap_private(Private_c* prv, pc_bswap_dir_t dir) {" in l for l in bsw_add) \
+            and not any(re.match(r"\s*swap\d*\(", l) for l in bsw_add if "swap_Private(prv, dir);" not in l):
+        moved = [f for f in moved if f != "pc/src/pc_save_bswap.c"]
+    check(f"S9 save-layout sources unchanged vs HEAD ({layout_files}; modified: {moved})",
+          not moved and all(os.path.isfile(os.path.join(REPO, f)) for f in layout_files))
+    card_diff = git("diff", "-U0", "HEAD", "--", "pc/src/pc_m_card.c")
+    touched = [l for l in card_diff.split("\n") if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+    layout_rx = re.compile(r"GCI_|pc_save_write_gci|pc_save_load|OTHERS_SIZE|mCD_|put_be|get_be|bswap|sizeof\((?:Save|CARDDir|Private)|"
+                           r"\b(?:fwrite|fread|fseek|calloc|malloc|memcpy)\(|\.length|\.gci")
+    # D3-4: the ONLY pc_save_write_gci line change allowed is the hook wrapper (the writer itself, pc_save_write_gci_to, is
+    # byte-identical): the one-line `return pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);` becomes `int ok = ...;` followed by
+    # the post-save hook (pc_net_game_record_after_gci_save, checked by test_d3_record_src.py P-checks).
+    d34_allowed = {"-    return pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);", "+    int ok = pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);",
+                  "+        pc_net_game_record_after_gci_save(PC_GCI_PATH);"}
+    bad = [l.strip()[:90] for l in touched if not re.match(r"^[+-]\s*(/\*|\*|//)", l) and layout_rx.search(l)
+           and l.rstrip("\r") not in d34_allowed]
+    check(f"S9 pc_m_card.c diff vs HEAD ({len(touched)} changed lines) touches no GCI layout / serialisation line (offending: {bad})",
+          not bad)
     return L.summary_and_exit_code(results)
 
 

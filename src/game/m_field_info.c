@@ -3403,6 +3403,16 @@ static void mFI_SetShellWave(int set_num, xyz_t player_pos) {
 static void mFI_SetShell(xyz_t player_pos) {
     static int set_flag;
 
+#ifdef TARGET_PC
+    /* Batch G5: shells are shared field state. A network CLIENT would write phantom shells into its local
+     * fg tiles (direct pointer writes, not logged by pcfa) that the host rejects on pickup; the host's own
+     * spawns reach the client through FIELD_UPDATE. Return before touching set_flag/l_reserve_set_shell so no
+     * pending-spawn state accumulates on the client. Role test (client role is set at boot). Host/solo:
+     * unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     if (mFI_CheckSetShell() == TRUE) {
         if (set_flag == FALSE) {
             set_flag = TRUE;

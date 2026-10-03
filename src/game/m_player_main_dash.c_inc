@@ -57,7 +57,7 @@ static int Player_actor_SetEffectRemoveFlower_Dash(ACTOR* actor, GAME* game, s16
                  * are not played, and FALSE makes the caller spawn the ordinary dash dust instead. The
                  * RANDOM(4) draw above has already happened exactly as before, so the local RNG stream
                  * is unchanged. An authoritative client trample needs a new field-action kind (v8). */
-                if (pc_net_game_world_is_host_authoritative()) {
+                if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                     return FALSE;
                 }
 #endif

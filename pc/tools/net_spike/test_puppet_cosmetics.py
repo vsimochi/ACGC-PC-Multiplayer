@@ -19,7 +19,10 @@ right.
       disconnect prints a summary; a NEW peer in the same slot (edge state reset) produces them again
   C2  gating: peer in the SHOP scene, peer that never announced a scene, peer beyond the range limit: zero budget=ok,
       budget=scene / budget=range lines; the same peer back in FIELD + near: budget=ok again
-  C3  up to 8 peers dashing at once: global per-frame cap respected (peak <= 3), host alive, summaries on disconnect
+  C3  8 peers dashing, in ROUNDS of at most 3 simultaneous peers (host admits 3 clients on the 4-resident fixture since
+      Stage 1A; each round leaves gracefully and waits for the host teardown line): global per-frame cap respected
+      (peak <= 3), host alive, summaries on disconnect.  DOCUMENTED LIMITATION: the original 6-8 SIMULTANEOUS puppets cannot
+      run any more; saturating the 3-per-frame cap needs >= 4 puppets spawning in the same frame (INFO/SKIP line printed)
   C4  scene-generation recreate (host enters SHOP0 and returns): cosmetics resume afterwards, nothing wedged
 
 Usage: python test_puppet_cosmetics.py [--port 7870] [--only c1|c2|c3|c4|a0]
@@ -103,6 +106,24 @@ class Peer:
             self.c.close()
         except Exception:
             pass
+
+
+TEARDOWN_RX = re.compile(r"\[NET\] host: peer \d+ disconnected")
+
+
+def teardowns(host):
+    return len(TEARDOWN_RX.findall(host.log_text()))
+
+
+def leave_peer(host, p, timeout=8.0):
+    """Graceful departure of a Peer: DISCONNECT, wait for the host's teardown line (one more 'peer N disconnected'), then
+    close the socket.  Returns False when the teardown line never showed (callers turn that into an explicit check)."""
+    before = teardowns(host)
+    p.c.disconnect()
+    ok = p.c.hub.wait_until(lambda: teardowns(host) > before, timeout)
+    L.pump_sleep(0.2, p.c.hub)
+    p.close()
+    return ok
 
 
 def strip_comments(text):
@@ -211,9 +232,7 @@ def c1(port, log_dir, check):
         clean(host, check, "C1")
 
         off = len(host.log_text())
-        b.c.disconnect()
-        L.pump_sleep(1.0, b.c.hub)
-        b.close()
+        check("C1 B left gracefully (host teardown line seen)", leave_peer(host, b))
         b = None
         m = host.wait_for_log(SUM_RX.pattern, 15.0, since_offset=off)
         sm = SUM_RX.search(host.log_text()[off:])
@@ -313,65 +332,87 @@ def c2(port, log_dir, check):
 
 
 def c3(port, log_dir, check):
-    print("=" * 72 + "\n[C3] HOOK-DRIVEN: up to 8 peers dashing at once (budget / global per-frame cap)")
+    print("=" * 72 + "\n[C3] HOOK-DRIVEN: 8 peers dashing in rounds of <= 3 simultaneous (budget / global per-frame cap)")
+    print("INFO - C3 LIMITATION (documented, Stage 1A host cap = 3 clients on the 4-resident fixture): the original 6-8 "
+          "SIMULTANEOUS puppets are not possible; the per-frame cap (3) can only be SATURATED by >= 4 puppets spawning in one "
+          "frame, and the pool budget (budget=pool) by far more.  These two saturation paths are NOT exercised here "
+          "(coverage lost, no other way to get >= 4 puppets from <= 3 clients); what is checked: the cap value, no logged "
+          "peak above it, rounds of 3 dashing puppets spawning independently, summaries per puppet, host liveness.")
     host = boot_host(port, ["--authoritative-wildlife"], "cos_c3", log_dir)
     if host is None:
         check("C3 host reached field", False)
         return
     peers = []
+    all_ids = set()
     try:
-        off = len(host.log_text())
-        for i in range(8):
-            try:
-                ang = 2.0 * math.pi * i / 8.0
-                peers.append(Peer(port, "P%d" % i, offset=(80.0 + 90.0 * math.cos(ang), 90.0 * math.sin(ang))))
-            except Exception as e:  # server full / handshake trouble: continue with what connected
-                print("INFO - C3 peer %d could not connect: %s" % (i, e))
-                break
-        check("C3 at least 6 peers connected (%d)" % len(peers), len(peers) >= 6)
-        end = time.monotonic() + 3.0
-        while time.monotonic() < end:
+        total = 0
+        for rnd, n in enumerate((3, 3, 2), 1):
+            tag = "C3 round %d" % rnd
+            off0 = len(host.log_text())
+            peers = []
+            for i in range(n):
+                k = total + i
+                try:
+                    ang = 2.0 * math.pi * k / 8.0
+                    peers.append(Peer(port, "P%d" % k, offset=(80.0 + 90.0 * math.cos(ang), 90.0 * math.sin(ang))))
+                except Exception as e:  # server full / handshake trouble: continue with what connected
+                    print("INFO - %s peer %d could not connect: %s" % (tag, k, e))
+                    break
+            total += n
+            check("%s all %d peers connected (%d)" % (tag, n, len(peers)), len(peers) == n)
+            if not peers:
+                continue
+            all_ids |= {p.pid for p in peers}
+            end = time.monotonic() + 3.0
+            while time.monotonic() < end:
+                for p in peers:
+                    p.move_once(IDLE, 0.0)
+                L.pump_sleep(0.05, peers[0].c.hub)
+            if rnd == 1:
+                check("C3 puppet visuals initialised (first)", wait_visual(host, off0, 60.0))
+            o = len(host.log_text())
+            end = time.monotonic() + 10.0
+            while time.monotonic() < end:
+                for p in peers:
+                    p.move_once(DASH, 7.0)
+                L.pump_sleep(0.05, peers[0].c.hub)
+            L.pump_sleep(0.5, peers[0].c.hub)
+            t = host.log_text()[o:]
+            peaks = [int(m.group(1)) for m in PEAK_RX.finditer(host.log_text())]
+            caps = {int(m.group(2)) for m in PEAK_RX.finditer(host.log_text())}
+            ok_by = {p.pid: len(effects(t, p.pid)) for p in peers}
+            cap_lines = sum(len(effects(t, p.pid, "capped")) for p in peers)
+            print("INFO - %s effect ok lines per peer: %s; capped lines: %d; peak per-frame spawns seen so far: %s" %
+                  (tag, ok_by, cap_lines, max(peaks) if peaks else None))
+            check("%s dashing puppets spawned effects (>= %d peers with ok lines)" % (tag, min(3, len(peers))),
+                  sum(1 for v in ok_by.values() if v > 0) >= min(3, len(peers)))
+            check("%s global per-frame cap respected: every logged peak <= %d (peaks %s)" %
+                  (tag, FRAME_CAP, sorted(set(peaks))), all(p <= FRAME_CAP for p in peaks) and caps <= {FRAME_CAP})
+            check("%s host process alive after the dash storm" % tag, host.alive())
+            clean(host, check, tag)
+            o = len(host.log_text())
+            ids = {p.pid for p in peers}
             for p in peers:
-                p.move_once(IDLE, 0.0)
-            L.pump_sleep(0.05, peers[0].c.hub)
-        check("C3 puppet visuals initialised (first)", wait_visual(host, off, 60.0))
-        o = len(host.log_text())
-        end = time.monotonic() + 10.0
-        while time.monotonic() < end:
+                p.c.disconnect()
+            td0 = teardowns(host)
+            ok_td = peers[0].c.hub.wait_until(lambda: teardowns(host) >= td0 + len(ids), 10.0)
             for p in peers:
-                p.move_once(DASH, 7.0)
-            L.pump_sleep(0.05, peers[0].c.hub)
-        L.pump_sleep(0.5, peers[0].c.hub)
-        t = host.log_text()[o:]
-        peaks = [int(m.group(1)) for m in PEAK_RX.finditer(host.log_text())]
-        caps = {int(m.group(2)) for m in PEAK_RX.finditer(host.log_text())}
-        ok_by = {p.pid: len(effects(t, p.pid)) for p in peers}
-        cap_lines = sum(len(effects(t, p.pid, "capped")) for p in peers)
-        print("INFO - C3 effect ok lines per peer: %s; capped lines: %d; peak per-frame spawns seen: %s" %
-              (ok_by, cap_lines, max(peaks) if peaks else None))
-        check("C3 several puppets spawned effects (>= 3 peers with ok lines)", sum(1 for v in ok_by.values() if v > 0) >= 3)
-        check("C3 global per-frame cap respected: every logged peak <= %d (peaks %s)" % (FRAME_CAP, sorted(set(peaks))),
-              all(p <= FRAME_CAP for p in peaks) and caps <= {FRAME_CAP})
-        check("C3 host process alive after the dash storm", host.alive())
-        clean(host, check, "C3")
-        o = len(host.log_text())
-        for p in peers:
-            p.c.disconnect()
-        L.pump_sleep(2.0, peers[0].c.hub)
-        for p in peers:
-            p.close()
-        ids = {p.pid for p in peers}
-        peers = []
-        t0 = time.monotonic()
-        sums = {}
-        while time.monotonic() - t0 < 20.0 and set(sums) != ids:
-            for m in SUM_RX.finditer(host.log_text()[o:]):
-                sums[int(m.group(1))] = tuple(int(x) for x in m.groups()[1:])
-            time.sleep(0.5)
-        print("INFO - C3 per-player summaries (spawned,capped,suppressed,sounds,sounds_sup,peak): %s" % sums)
-        check("C3 every disconnect printed a summary (%d of %d)" % (len(sums), len(ids)), set(sums) == ids)
-        check("C3 summary peak_frame_spawns <= cap", all(v[5] <= FRAME_CAP for v in sums.values()))
-        check("C3 host alive after all disconnects", host.alive())
+                p.close()
+            peers = []
+            check("%s all %d peers left gracefully (host teardown lines seen)" % (tag, n), ok_td)
+            t0 = time.monotonic()
+            sums = {}
+            while time.monotonic() - t0 < 20.0 and set(sums) != ids:
+                for m in SUM_RX.finditer(host.log_text()[o:]):
+                    sums[int(m.group(1))] = tuple(int(x) for x in m.groups()[1:])
+                time.sleep(0.5)
+            print("INFO - %s per-player summaries (spawned,capped,suppressed,sounds,sounds_sup,peak): %s" % (tag, sums))
+            check("%s every disconnect printed a summary (%d of %d)" % (tag, len(sums), len(ids)), set(sums) == ids)
+            check("%s summary peak_frame_spawns <= cap" % tag, all(v[5] <= FRAME_CAP for v in sums.values()))
+            check("%s host alive after the round's disconnects" % tag, host.alive())
+        check("C3 8 peers dashed in total across the 3 rounds (%d)" % total, total == 8)
+        print("SKIP - C3 6-8 simultaneous puppets / per-frame cap saturation / budget=pool: needs > 3 clients "
+              "(documented limitation, see the header)")
         clean(host, check, "C3 (after)")
     finally:
         for p in peers:

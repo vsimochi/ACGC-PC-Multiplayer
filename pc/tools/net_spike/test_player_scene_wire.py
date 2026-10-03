@@ -21,6 +21,7 @@ import struct
 import sys
 
 import net_spike_lib as L
+import wire_baseline
 
 FMT = "<BBBBHHI"
 SIZE = struct.calcsize(FMT)
@@ -105,15 +106,19 @@ check("12 bytes fits PC_NET_MAX_PAYLOAD (1024)", SIZE <= 1024)
 check("PLAYER_SCENE id 44 is not one of the existing ids 1..43", MSG_TYPE_PLAYER_SCENE not in EXISTING)
 check("PLAYER_SCENE id 44 is the next free id after WILDLIFE_DESPAWN (43)", MSG_TYPE_PLAYER_SCENE == 43 + 1)
 check("net_spike_lib.PC_NETGAME_MSG_PLAYER_SCENE == 44", L.PC_NETGAME_MSG_PLAYER_SCENE == 44)
-check("net_spike_lib.PC_NETGAME_PROTOCOL_VERSION == 7", L.PC_NETGAME_PROTOCOL_VERSION == 7)
+check("net_spike_lib.PC_NETGAME_PROTOCOL_VERSION == wire_baseline.EXPECTED_PROTOCOL_VERSION (%d)" % wire_baseline.EXPECTED_PROTOCOL_VERSION,
+      L.PC_NETGAME_PROTOCOL_VERSION == wire_baseline.EXPECTED_PROTOCOL_VERSION and L.PROTOCOL_VERSION == L.PC_NETGAME_PROTOCOL_VERSION)
 hsrc = open(os.path.join(PC_DIR, "include", "pc_net_game.h"), encoding="utf-8").read()
-check("pc_net_game.h PC_NETGAME_PROTOCOL_VERSION == 7u",
-      re.search(r"#define PC_NETGAME_PROTOCOL_VERSION 7u", hsrc) is not None)
+check("pc_net_game.h PC_NETGAME_PROTOCOL_VERSION == EXPECTED (%du)" % wire_baseline.EXPECTED_PROTOCOL_VERSION,
+      wire_baseline.header_protocol_ok(hsrc))
 csrc = open(os.path.join(PC_DIR, "src", "pc_net_game.c"), encoding="utf-8").read()
 check("pc_net_game.c defines PC_NETGAME_MSG_PLAYER_SCENE = 44",
       re.search(r"PC_NETGAME_MSG_PLAYER_SCENE\s*=\s*44", csrc) is not None)
 ids = [int(x) for x in re.findall(r"PC_NETGAME_MSG_[A-Z_]+\s*=\s*(\d+)", csrc[:csrc.index("} PCNetGameMsgType;")])]
-check("all C message ids are unique and 46 (M9-C PLAYER_ACTION) is the maximum", len(ids) == len(set(ids)) and max(ids) == 46)
+check("all C message ids are unique, contiguous 1..N and N == wire_baseline.EXPECTED_MAX_MSG_ID (%d: v8 X1 TXN_RESULT) is the maximum"
+      % wire_baseline.EXPECTED_MAX_MSG_ID,
+      len(ids) == len(set(ids)) and max(ids) == wire_baseline.EXPECTED_MAX_MSG_ID
+      and sorted(ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)))
 check("pc_net_game.c static-asserts the 12-byte size", "sizeof(PCNetGamePlayerSceneMsg) == 12" in csrc)
 
 # --- 5: raw scene-id whitelist ---------------------------------------------------------------------

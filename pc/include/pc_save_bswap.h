@@ -17,6 +17,9 @@ typedef enum {
 
 void pc_save_bswap(Save_t* save, pc_bswap_dir_t dir);
 
+/* D3: convert ONE Private_c in place (see pc_save_bswap.c). Always pass a copy of a live record. */
+void pc_save_bswap_private(Private_c* prv, pc_bswap_dir_t dir);
+
 void pc_save_bswap_keep_mail(mCD_keep_mail_c* mail, pc_bswap_dir_t dir);
 void pc_save_bswap_keep_original(mCD_keep_original_c* orig, pc_bswap_dir_t dir);
 void pc_save_bswap_keep_diary(mCD_keep_diary_c* diary, pc_bswap_dir_t dir);

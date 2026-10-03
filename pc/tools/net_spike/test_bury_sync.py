@@ -67,7 +67,7 @@ PC_NETGAME_BURY_FLAG_DEPOSIT_ON = 0x02
 FIELD_ACTION_REQUEST_TYPE = 29
 FIELD_ACTION_RESULT_TYPE = 30
 KIND_DIG_BURIED = 1
-FA_REQ_FMT = "<BBBBIBBH"
+FA_REQ_FMT = "<BBBBIBBH64x"  # X3: 76 B = the 12-byte v3 header + the 64-byte txn tag (zero = no grant)
 FA_RES_FMT = "<BBBBIHBB"
 FA_RES_SIZE = struct.calcsize(FA_RES_FMT)
 
@@ -86,7 +86,8 @@ def decode_field_action_result(payload):
 def dig_buried(client, ut_x, ut_z, request_id, timeout=1.0):
     x, y, z = tile_center(ut_x, ut_z)
     client.claim_position(x, y, z)
-    client.send_reliable(build_field_action_request(KIND_DIG_BURIED, ut_x, ut_z, request_id))
+    # X3: DIG_BURIED is a host-transactional GRANT: its request carries the pre-image tag (the pocket changes only on TXN_RESULT)
+    client.send_fa_grant(KIND_DIG_BURIED, ut_x, ut_z, request_id)
     conn = client.connect_count
 
     def pred(m):

@@ -146,7 +146,7 @@ static void Player_actor_Put_Hole_Dig_scoop(ACTOR* actor) {
              * matches exactly when/how vanilla itself computes the same hole-shape value. Local particle
              * effects, sound, insects, and animation chaining (separate functions, not gated) are
              * untouched -- they already ran/will run unconditionally this frame. */
-            if (pc_net_game_world_is_host_authoritative()) {
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                 int ux, uz, hn = mCoBG_GetHoleNumber(*pos);
                 if (hn >= 0 && mFI_Wpos2UtNum(&ux, &uz, *pos)) {
                     pc_net_game_request_dig_hole(ux, uz, (uint8_t)hn);

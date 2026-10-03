@@ -15,7 +15,7 @@ real process, NO visual verification) for P1..P3 and S2. Nothing here proves tha
       the host's own MOVE carries a plausible action_state (main index 1..120) from the real sampler
   W2  malformed action_state (index 200 / 121, reserved bits 12..15 set): the MOVE is NOT rejected (position relayed
       intact) but the field is zeroed before relaying; index 120 (the maximum) passes; the puppet ignores it
-  V1  a protocol-version-6 client is rejected with PROTOCOL_MISMATCH reporting version 7; test_version_mismatch.py passes
+  V1  a protocol-version-6 client is rejected with PROTOCOL_MISMATCH reporting the expected version (wire_baseline); test_version_mismatch.py passes
   P1  idle -> dig_scoop edge starts the row (latch=on); re-entry of the SAME index with a bumped counter restarts (a second
       edge line); a duplicate / stale-frame MOVE never produces an edge
   P2  one-shot latch: an idle snapshot arriving right after the swing does not cut the clip (fallback edge shows latch=on);
@@ -43,6 +43,7 @@ import sys
 import time
 
 import net_spike_lib as L
+import wire_baseline
 from test_player_scene_real import boot_host
 from test_puppet_held_item import make_b, wait_visual, host_position, clean
 
@@ -171,7 +172,8 @@ def s1(port, log_dir, check):
             rejected = e.reject.reason == L.PC_NETGAME_REJECT_PROTOCOL_MISMATCH
             ver = e.reject.expected_protocol_version
         check("V1 a protocol-version-6 client is rejected with PROTOCOL_MISMATCH", rejected)
-        check("V1 the host reports required protocol version 7 (got %s)" % ver, ver == 7)
+        check("V1 the host reports the required protocol version %d (got %s)" % (wire_baseline.EXPECTED_PROTOCOL_VERSION, ver),
+              ver == wire_baseline.EXPECTED_PROTOCOL_VERSION)
         # the subprocess has its own default-identity allocator: steer it to a resident that neither b nor c holds
         used = {bytes(x.player.player_name) for x in (b, c)}
         spare = next((i for i, pl, ex in L.read_test_save_residents() if ex and i != L.TEST_HOST_RESIDENT

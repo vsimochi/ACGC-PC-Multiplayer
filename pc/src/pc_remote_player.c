@@ -4807,9 +4807,11 @@ void pc_remote_player_poll(void) {
     int i;
     int dump_now;
 
-    if (gamePT == NULL) {
-        return; /* no active GAME_PLAY (e.g. still at a menu) -- nothing to do, and Actor_info
-                  * isn't valid to touch yet anyway. */
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        /* No running GAME_PLAY (still booting / at a menu): gamePT may be a much smaller GAME_SECOND etc., and
+         * GET_PLAYER_ACTOR_NOW() / play->collision_check would read adjacent heap (boot-crash root cause). Nothing in this poll
+         * is needed outside a GAME_PLAY: the scene generation is re-derived at the first play poll (gamePT / frame_counter change). */
+        return;
     }
     local = GET_PLAYER_ACTOR_NOW();
     if (local == NULL || (uint64_t)(uintptr_t)local >= PC_LOWADDR_LIMIT) {

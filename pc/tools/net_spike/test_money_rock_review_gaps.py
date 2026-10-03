@@ -52,7 +52,7 @@ KIND_MONEY_ROCK_HIT = 2
 #   FIELD_ACTION_REQUEST v3 (12 bytes): msg_type, kind, ut_x, ut_z, uint32 request_id, uint8
 #   hole_variant, uint8 _reserved0, uint16 _reserved1 -- see PCNetGameFieldActionRequestMsg's own doc
 #   (pc_net_game.c) / test_field_action_wire.py. hole_variant is pinned to 0 for MONEY_ROCK_HIT.
-REQ_FMT = "<BBBBIBBH"
+REQ_FMT = "<BBBBIBBH64x"  # X3: 76 B = the 12-byte v3 header + the 64-byte txn tag (all zero = no grant)
 RES_FMT = "<BBBBIHBB"
 RES_SIZE = struct.calcsize(RES_FMT)
 

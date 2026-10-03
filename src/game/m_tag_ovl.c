@@ -3913,7 +3913,7 @@ static void mTG_plant_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
          * reached via a different tag) -- see that seam's own doc for the shared reasoning, including
          * why pocket-clear timing is deliberately deferred to pcnetgame_handle_client_bury_result()
          * rather than cleared here at menu-action time. */
-        if (pc_net_game_world_is_host_authoritative()) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
             int ut_x, ut_z, hole_no;
             int ok = FALSE;
             if (mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos)) {
@@ -5097,7 +5097,7 @@ static void mTG_bury_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
          * write + pocket clear) itself -- so it must NOT also fall through to the plain single-player
          * path below, which would clear the pocket a second time and could re-enter the outcome table
          * against a tile the host-local call already mutated. */
-        if (pc_net_game_world_is_host_authoritative()) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
             int ut_x, ut_z, hole_no;
             int ok = FALSE;
             if (mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos)) {
@@ -5363,7 +5363,7 @@ static void mTG_exchange_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                          * suspenders, per this milestone's own design brief). The item is presentation-
                          * only here; if this path is ever wired for real, it needs its own
                          * pc_net_game_request_bury()-style call with a genuine pocket_slot_idx. */
-                        if (pc_net_game_world_is_host_authoritative()) {
+                        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                             mPlib_request_main_putin_scoop_from_submenu((xyz_t*)menu_info->data2, EMPTY_NO,
                                                                         demo_gold_scoop);
                         } else

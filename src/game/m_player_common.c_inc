@@ -4356,7 +4356,7 @@ static int Player_actor_Search_STONE_TC(ACTOR* actorx, xyz_t* target_pos_p) {
          * own fg-writing calls) is unsafe. Stage 1 simplification: no local wobble animation plays on
          * this client for this hit (see that same doc) -- the tile visibly updates moments later via
          * the ordinary FIELD_UPDATE broadcast instead. */
-        if (pc_net_game_world_is_host_authoritative()) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
             int ut_x, ut_z;
             if (mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
                 pc_net_game_request_money_rock_hit(ut_x, ut_z);
@@ -4440,7 +4440,7 @@ static int Player_actor_CheckAndRequest_main_scoop_all(GAME* game, int priority)
              * pocket slot up front, exactly like DIG_BURIED's own check -- if none is free, the action
              * is swallowed for this frame with nothing sent, matching vanilla's own "can't dig, no
              * room" behavior for this case. */
-            if (pc_net_game_world_is_host_authoritative()) {
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                 int ut_x, ut_z;
                 mActor_name_t* raw_fg_p = mFI_GetUnitFG(target_pos);
                 mActor_name_t raw_fg = raw_fg_p != NULL ? *raw_fg_p : (mActor_name_t)EMPTY_NO;
@@ -4463,6 +4463,13 @@ static int Player_actor_CheckAndRequest_main_scoop_all(GAME* game, int priority)
                     return TRUE;
                 } else if (mFI_Wpos2UtNum(&ut_x, &ut_z, target_pos)) {
                     if (pc_net_game_request_dig_buried(ut_x, ut_z)) {
+                        return TRUE;
+                    }
+                    /* G7: a CLIENT whose link is not READY (still connecting, or the host is gone) sent
+                     * nothing above. Swallow the A press (same shape as the no-free-slot swallows above) so
+                     * the vanilla get_scoop never grants a buried item into the pockets / clears the local
+                     * field -- that grant would be duplicated once READY snapshots the host's field. */
+                    if (pc_net_game_client_link_state() != PC_NETGAME_LINK_READY) {
                         return TRUE;
                     }
                 }
@@ -6848,7 +6855,7 @@ static int Player_actor_Check_BirthBee_common(ACTOR* actorx, mActor_name_t item,
                  * instead of the real mutating proc when networked, reporting the exact same
                  * success/failure shape (a valid vs. -1-sentinel *item_drop_pos) so the angle-aim math
                  * below is unaffected either way. */
-                if (pc_net_game_world_is_host_authoritative()) {
+                if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                     pc_net_game_request_tree_shake(tree_ut_x, tree_ut_z);
                     pc_tree_birth_bee_visual(tree_ut_x, tree_ut_z, &item_drop_pos);
                 } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {

@@ -241,7 +241,7 @@ def a0(check):
 
     try:
         live_exit = guard_exit(L.LIVE_GAME_BIN_DIR, False)
-        test_exit = guard_exit(os.path.join(L.LIVE_GAME_BIN_DIR, "..", "bin_talkfix"), False)
+        test_exit = guard_exit(os.path.join(L.LIVE_GAME_BIN_DIR, "..", "bin_talkfix_clone"), False)
         allow_exit = guard_exit(L.LIVE_GAME_BIN_DIR, True)
     finally:
         L.GAME_BIN_DIR = saved_dir

@@ -10,6 +10,7 @@
 #include "ac_uki.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_net_game.h" /* X1b: pc_net_game_client_pocket_locked() -- see mPlib_able_submenu_type1() */
 #endif
 
 int g_mPlib_wade_disabled = FALSE;
@@ -2618,6 +2619,16 @@ static int mPlib_CheckScene_AbleSubmenu(void) {
 
 extern int mPlib_able_submenu_type1(GAME* game) {
     int res = FALSE;
+
+#ifdef TARGET_PC
+    /* X1b lock (b), CLIENT ONLY (the predicate is false for single-player and the host): while a pickup/drop/bury request or its
+     * host-transactional commit is unresolved, the inventory / map / A-button board opens, the mailbox and the mscore stay closed, so
+     * the pocket slot the transaction refers to cannot be rearranged before the host's outcome. Every caller evaluates this once per
+     * frame inside an && chain (m_submenu.c, ac_mailbox_move.c_inc, ac_mscore_control.c) and nothing loops on it. */
+    if (pc_net_game_client_pocket_locked()) {
+        return FALSE;
+    }
+#endif
 
     if (GET_PLAYER_ACTOR_GAME(game)->check_request_main_priority_proc(game, mPlayer_REQUEST_PRIORITY_19) > 0 &&
         mPlib_Check_SetOrderSubmenu() == FALSE && mPlib_check_request_change_item() == FALSE &&
