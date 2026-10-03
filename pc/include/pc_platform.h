@@ -343,6 +343,13 @@ extern int           g_pc_txn_test_dig_grant;
 extern const char*   g_pc_ts_test_seed_police;
 extern int           g_pc_ts_test_donate;
 extern int           g_pc_ts_test_claim;
+/* World-state real-client TEST-ONLY hook (default OFF, never active in normal play, loud "[NET][WORLD][TEST-ONLY]" log):
+ *   --world-test-force=W,I,T,P[,M[,E]]  HOST only: once the host world is ready, force known values into the host's own world state: weather type W
+ *                                   (mEnv_WEATHER_*, 0..4), weather intensity I (0..3), Stalk Market trend T (0..4), daily turnip prices P+weekday
+ *                                   (P 1..600), and optionally shift the host's game clock by M minutes (-180..180, via Save time_delta); E (month*100+day) pokes the host's Wisp date (event_save_common.ghost_day) 4 s after the first READY peer. The
+ *                                   normal WORLD_META / CLOCK_SYNC machinery then carries them; the client's own log lines are compared by
+ *                                   test_world_state_real_client.py. Refused for any other role. See pc_net_game.c pcnetgame_world_test_force(). */
+extern const char*   g_pc_world_test_force;
 /* Town services milestone 2 (shop) TEST-ONLY hooks (default OFF, never active in normal play, every step logs "[NET][SHOP][TEST-ONLY]"):
  *   --shop-test-buy   CLIENT only: once the record is SYNCED and the shop mirror arrived, raise the local wallet to 90000 (the hook's one local write), wait 5 s
  *                     for the D3 upload, then buy the cheapest buyable item of the LOCAL mirror through pc_net_game_ts_begin_shop_buy() / _poll().

@@ -1112,6 +1112,13 @@ int pc_net_game_authoritative_wildlife_enabled(void);
  * the announcement yet: local wildlife spawning (aSetMgr_move_set) is suppressed meanwhile so no local fish/bugs exist before the mode is known. */
 int pc_net_game_wildlife_mode_pending(void);
 
+/* Events (TOWN_SVC_STATE service 5). The town's special events / visitors / weekly events are decided by the HOST and mirrored to clients.
+ * pc_net_game_event_client_gate(site) returns 1 iff this process is a CLIENT (role CLIENT, linked or not): the caller (site 0 = init_special_event,
+ * 1 = init_weekly_event, 2 = the special-event contents generator in the event manager) must then NOT roll / generate anything. The first use of each
+ * site logs a loud [NET][EVENT] line. pc_net_game_event_note_rederive() logs the client's one-shot re-derivation of today's event table after a mirror. */
+int pc_net_game_event_client_gate(int site);
+void pc_net_game_event_note_rederive(void);
+
 /* Batch A (A2): host only. 1 iff a READY remote player in the town field scene currently stands in block (bx, bz) (mFI_Wpos2BlockNum numbering). The
  * shell / mushroom refill skips such acres like the host player's own acre. 0 for client / solo. */
 int pc_net_game_host_remote_player_in_acre(int bx, int bz);

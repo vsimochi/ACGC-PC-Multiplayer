@@ -1200,6 +1200,8 @@ PC_NETGAME_TS_MUSEUM_LEN = 63
 PC_NETGAME_TS_SHOP_LEN = 320
 PC_NETGAME_TS_HOSTCFG = 4      # batch A (A1): HOST_CONFIG, the host's session configuration (not a save region): blob = u8 authoritative_wildlife (0/1) + 7 reserved zero bytes
 PC_NETGAME_TS_HOSTCFG_LEN = 8
+PC_NETGAME_TS_EVENT = 5        # events: the host's event DECISION state (subset of event_save_data + event_save_common), blob = 84 special + 100 weekly + 30 core
+PC_NETGAME_TS_EVENT_LEN = 214
 TOWN_SVC_STATE_FMT = "<BBHII"  # 12-byte header (msg_type, service, len, seq, digest); the blob (len bytes) follows
 # --- Mail milestone 2 (same v8, extended IN PLACE): MAILBOX_LETTER (id 56, host -> the OWNING client only, RELIABLE, 316 B): ONE slot of the host-held house
 # mailbox as its 298 canonical BE bytes (or an "empty" indication, flags bit 0), per-(resident, slot) seq, FNV-1a32 of the 298 bytes. ---
@@ -1601,7 +1603,7 @@ IDENTITY_EXT_SPEC = build_msg_spec(
 IDENTITY_TOKEN_SPEC = build_msg_spec(
     PC_NETGAME_MSG_IDENTITY_TOKEN, IDENTITY_TOKEN_FMT, ["msg_type", "flags", "guest_slot", "table_size", "token"], "IdentityTokenFields")
 assert IDENTITY_EXT_SPEC.size == 42 and IDENTITY_TOKEN_SPEC.size == 20 and max(IDENTITY_EXT_SPEC.size, IDENTITY_TOKEN_SPEC.size) <= PC_NET_MAX_PAYLOAD
-assert PC_NETGAME_TS_BLOB_MAX >= max(PC_NETGAME_TS_POLICE_LEN, PC_NETGAME_TS_MUSEUM_LEN, PC_NETGAME_TS_SHOP_LEN, PC_NETGAME_TS_HOSTCFG_LEN)
+assert PC_NETGAME_TS_BLOB_MAX >= max(PC_NETGAME_TS_POLICE_LEN, PC_NETGAME_TS_MUSEUM_LEN, PC_NETGAME_TS_SHOP_LEN, PC_NETGAME_TS_HOSTCFG_LEN, PC_NETGAME_TS_EVENT_LEN)
 assert struct.calcsize(TXN_TAG_FMT) == 64 and TXN_COMMIT_SPEC.size == 72 and TXN_RESULT_SPEC.size == 76
 assert max(TXN_COMMIT_SPEC.size, TXN_RESULT_SPEC.size) <= PC_NET_MAX_PAYLOAD
 assert struct.calcsize(TXN_COMMIT_FMT) == 8 + struct.calcsize(TXN_TAG_FMT)

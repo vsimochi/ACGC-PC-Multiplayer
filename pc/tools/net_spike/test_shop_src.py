@@ -79,7 +79,7 @@ def main():
     build = func_body(hblk_raw, "pcnetgame_ts_build")
     check("M service 3 is built from the host's raw Save_Get(shop) (320 B) and the refresh_all / push loops cover it",
           "memcpy(blob, &Save_Get(shop), PC_NETGAME_TS_SHOP_LEN)" in build and "pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP)" in func_body(hblk_raw, "pcnetgame_ts_refresh_all")
-          and "svc <= (int)PC_NETGAME_TS_HOSTCFG" in func_body(hblk_raw, "pcnetgame_host_ts_push_peer"))  # batch A: the loop bound is now service 4 (HOST_CONFIG), which still covers the shop (3)
+          and "svc <= (int)PC_NETGAME_TS_EVENT" in func_body(hblk_raw, "pcnetgame_host_ts_push_peer"))  # batch A: the loop bound is now service 4 (HOST_CONFIG), which still covers the shop (3)
     check("M the host runs the CLIENT validator on its own shop blob and logs a loud warning if clients would refuse it; the validator checks every stock / lottery / rare entry, the bag count, sales_sum and the visitor flag",
           "pcnetgame_ts_valid_shop_blob(blob)" in func_body(hblk_raw, "pcnetgame_ts_refresh") and "would be REFUSED by clients" in hblk_raw
           and all(x in func_body(hblk_raw, "pcnetgame_ts_valid_shop_blob") for x in ("s.items[i]", "s.lottery_items[i]", "s.rare_item", "flowers_candy_grab_bag_count", "s.visitor_flag")))

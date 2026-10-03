@@ -2259,12 +2259,14 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_TS_MUSEUM   2u
 #define PC_NETGAME_TS_SHOP     3u   /* milestone 2: Save_t.shop, the 320 raw bytes of Shop_c (little-endian PC image, host == client build) */
 #define PC_NETGAME_TS_HOSTCFG  4u   /* batch A (A1): HOST_CONFIG, the host's session configuration (NOT a Save_t region): blob = u8 authoritative_wildlife (0/1) + 7 reserved zero bytes */
-#define PC_NETGAME_TS_NUM      5u   /* array bound: services 1..4 named (index 0 unused), 5+ reserved */
+#define PC_NETGAME_TS_EVENT    5u   /* events: the host's special event / visitor / weekly event decision state (a SUBSET of Save_t.event_save_data + event_save_common, see the EVENTS block) */
+#define PC_NETGAME_TS_NUM      6u   /* array bound: services 1..5 named (index 0 unused), 6+ reserved */
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
 #define PC_NETGAME_TS_MUSEUM_LEN 63u
 #define PC_NETGAME_TS_SHOP_LEN   320u
 #define PC_NETGAME_TS_HOSTCFG_LEN 8u
+#define PC_NETGAME_TS_EVENT_LEN 214u /* 84 (mEv_special_c) + 100 (mEv_weekly_u) + 30 (decision fields of event_save_common + event_year) */
 typedef struct PCNetGameTownSvcStateMsg {
     uint8_t  msg_type;   /* PC_NETGAME_MSG_TOWN_SVC_STATE */
     uint8_t  service;    /* PC_NETGAME_TS_* */
@@ -2285,6 +2287,9 @@ _Static_assert(PC_NETGAME_TS_POLICE_LEN == sizeof(PoliceBox_c) && PC_NETGAME_TS_
                "a town-service blob does not fit PCNetGameTownSvcStateMsg (the 320-byte shop blob is checked here too)");
 _Static_assert(PC_NETGAME_TS_SHOP_LEN == sizeof(Shop_c), "PC_NETGAME_TS_SHOP_LEN is no longer sizeof(Shop_c): the shop mirror wire image changed");
 _Static_assert(PC_NETGAME_TS_HOSTCFG_LEN <= PC_NETGAME_TS_BLOB_MAX, "the HOST_CONFIG blob does not fit PCNetGameTownSvcStateMsg");
+_Static_assert(sizeof(mEv_special_c) == 84u && sizeof(mEv_weekly_u) == 100u && PC_NETGAME_TS_EVENT_LEN == 84u + 100u + 30u &&
+                   PC_NETGAME_TS_EVENT_LEN <= PC_NETGAME_TS_BLOB_MAX,
+               "the EVENT_STATE blob layout (84 + 100 + 30) no longer matches mEv_special_c / mEv_weekly_u or does not fit PCNetGameTownSvcStateMsg");
 
 /* Mail milestone 2 (v8, unreleased): host -> the OWNING client only. One slot of the host's house mailbox. `house` = the host's homes[] index of the
  * bound resident's house, `mbox_idx` = the mailbox slot 0..9, flags bit 0 = EMPTY (the slot holds no letter: `letter` is then the canonical form of a
@@ -10878,9 +10883,16 @@ static void pcnetgame_handle_client_snapshot_end(const PCNetGameSnapshotEndMsg* 
         }
         if (in->flags & PC_NETGAME_META_FLAG_WEATHER_VALID) {
             pcnetgame_client_apply_weather_state(&in->world_state);
+            printf("[NET][WORLD] client: snapshot-end host weather -> type %u intensity %u (world_seq %u)\n",
+                   (unsigned)in->world_state.weather, (unsigned)in->world_state.weather_intensity, (unsigned)in->world_seq);
         }
         if (in->flags & PC_NETGAME_META_FLAG_MARKET_VALID) {
             pcnetgame_client_apply_market_state(&in->world_state);
+            printf("[NET][WORLD] client: snapshot-end host Stalk Market schedule -> trend %u sunday %u prices %u,%u,%u,%u,%u,%u,%u (world_seq %u)\n",
+                   (unsigned)in->world_state.trade_market, (unsigned)in->world_state.daily_price[0], (unsigned)in->world_state.daily_price[0],
+                   (unsigned)in->world_state.daily_price[1], (unsigned)in->world_state.daily_price[2], (unsigned)in->world_state.daily_price[3],
+                   (unsigned)in->world_state.daily_price[4], (unsigned)in->world_state.daily_price[5], (unsigned)in->world_state.daily_price[6],
+                   (unsigned)in->world_seq);
         }
         if (in->flags & PC_NETGAME_META_FLAG_TERM_VALID) {
             pcnetgame_client_apply_term_state(&in->world_state);
@@ -14111,9 +14123,159 @@ static int pcnetgame_ts_valid_shop_blob(const uint8_t* blob) {
            s.flowers_candy_grab_bag_count <= 64 && (s.visitor_flag == 0 || s.visitor_flag == 1);
 }
 
+/* ---- EVENTS (service 5): the host's event DECISION state. Blob (little-endian PC image, 214 B):
+ *   [0..84)    Save_t.event_save_data.special  (mEv_special_c raw: scheduled date, kind, the union = bargain items / broker / designer / artist / arabian / gypsy)
+ *   [84..184)  Save_t.event_save_data.weekly   (mEv_weekly_u raw: Joan's spoken ids / Gulliver flags)
+ *   [184..214) core of Save_t.event_save_common: u8 special_event.type, u8 (special_event.flags: ALWAYS 0 in the blob, it is a transient "renewed" flag the
+ *              host consumes), u8 weekly_event.type, u8 weekly_event.flags, u16 dates[8] (dates[TODAY] and dates[BIRTHDAY] are the LOCAL player's and are
+ *              sent as 0), u16 ghost_day, u16 bridge_day, u8 bridge_flags, u8 ghost_event_type, u8 soncho_event_type, u8 dozaemon_completed, s16 event_year.
+ * NOT mirrored (client-local on purpose): event_save_data.flags (per-player story flags: first job / intro / gateway of THIS client's player),
+ * event_save_common.area[] + area_use_bitfield (per-event runtime save areas written by the local event actors), last_date / valentines_day_date /
+ * white_day_date (the local mail-event cursor), delete_event_id, and the Common-only runtime (event_today table, event actors). ---- */
+#define PCNG_EV_OFF_SPECIAL 0u
+#define PCNG_EV_OFF_WEEKLY  84u
+#define PCNG_EV_OFF_CORE    184u
+
+static void pcnetgame_ev_put16(uint8_t** pp, uint16_t v) {
+    *(*pp)++ = (uint8_t)(v & 0xFFu);
+    *(*pp)++ = (uint8_t)(v >> 8);
+}
+
+static uint16_t pcnetgame_ev_get16(const uint8_t** pp) {
+    uint16_t v = (uint16_t)((uint16_t)(*pp)[0] | ((uint16_t)(*pp)[1] << 8));
+    *pp += 2;
+    return v;
+}
+
+static void pcnetgame_ts_build_event(uint8_t* blob) {
+    const mEv_save_common_data_c* c = &Save_Get(event_save_common);
+    uint8_t* p;
+    int i;
+    memset(blob, 0, PC_NETGAME_TS_EVENT_LEN);
+    memcpy(blob + PCNG_EV_OFF_SPECIAL, &Save_Get(event_save_data).special, sizeof(mEv_special_c));
+    memcpy(blob + PCNG_EV_OFF_WEEKLY, &Save_Get(event_save_data).weekly, sizeof(mEv_weekly_u));
+    p = blob + PCNG_EV_OFF_CORE;
+    *p++ = (uint8_t)c->special_event.type;
+    *p++ = 0u; /* special_event.flags: transient, never mirrored */
+    *p++ = (uint8_t)c->weekly_event.type;
+    *p++ = (uint8_t)c->weekly_event.flags;
+    for (i = 0; i < mEv_SAVE_DATE_NUM; i++) {
+        pcnetgame_ev_put16(&p, (i == mEv_SAVE_DATE_TODAY || i == mEv_SAVE_DATE_BIRTHDAY) ? (uint16_t)0u : (uint16_t)c->dates[i]);
+    }
+    pcnetgame_ev_put16(&p, (uint16_t)c->ghost_day);
+    pcnetgame_ev_put16(&p, (uint16_t)c->bridge_day);
+    *p++ = (uint8_t)c->bridge_flags.raw;
+    *p++ = (uint8_t)c->ghost_event_type;
+    *p++ = (uint8_t)c->soncho_event_type;
+    *p++ = (uint8_t)c->dozaemon_completed;
+    pcnetgame_ev_put16(&p, (uint16_t)Save_Get(event_year));
+}
+
+/* One decoded line of an event blob (host log at every change, client log at every apply: the real-client test compares them). */
+static void pcnetgame_ts_event_log(const char* who, const uint8_t* blob) {
+    mEv_special_c sp;
+    const uint8_t* p = blob + PCNG_EV_OFF_CORE;
+    uint16_t dates[mEv_SAVE_DATE_NUM];
+    int i;
+    memcpy(&sp, blob + PCNG_EV_OFF_SPECIAL, sizeof(sp));
+    for (i = 0; i < mEv_SAVE_DATE_NUM; i++) {
+        dates[i] = (uint16_t)((uint16_t)p[4 + 2 * i] | ((uint16_t)p[5 + 2 * i] << 8));
+    }
+    printf("[NET][EVENT] %s: state special_type=%u kind=0x%08X sched=%04u-%02u-%02u/%02u weekly_type=%u weekly_flags=%u ghost_type=%u ghost_day=0x%04X "
+           "sp_start=0x%04X sp_end=0x%04X sp_hour=%u weekly_date=0x%04X bridge_flags=0x%02X year=%d\n",
+           who, (unsigned)p[0], (unsigned)sp.kind, (unsigned)sp.scheduled.year, (unsigned)sp.scheduled.month, (unsigned)sp.scheduled.day,
+           (unsigned)sp.scheduled.hour, (unsigned)p[2], (unsigned)p[3], (unsigned)p[25], (unsigned)((uint16_t)p[20] | ((uint16_t)p[21] << 8)),
+           (unsigned)dates[mEv_SAVE_DATE_SPECIAL1], (unsigned)dates[mEv_SAVE_DATE_SPECIAL2], (unsigned)dates[mEv_SAVE_DATE_SPECIAL3],
+           (unsigned)dates[mEv_SAVE_DATE_WEEKLY], (unsigned)p[24], (int)(int16_t)((uint16_t)p[28] | ((uint16_t)p[29] << 8)));
+}
+
+static int pcnetgame_ev_md_ok(uint16_t md) {
+    return md == 0u || ((md >> 8) >= 1u && (md >> 8) <= 12u && (md & 0xFFu) >= 1u && (md & 0xFFu) <= 31u);
+}
+
+/* The legal content of an EVENT_STATE blob (the CLIENT validates; the HOST runs it on its own blob too and logs a loud warning). */
+static int pcnetgame_ts_valid_event_blob(const uint8_t* blob) {
+    mEv_special_c sp;
+    const uint8_t* p = blob + PCNG_EV_OFF_CORE;
+    uint16_t dates[mEv_SAVE_DATE_NUM];
+    uint16_t ghost_day, bridge_day;
+    int i;
+    mActor_name_t items[6];
+    int n_items = 0;
+    int used = 0;
+    memcpy(&sp, blob + PCNG_EV_OFF_SPECIAL, sizeof(sp));
+    if (sp.kind != 0xFFFFFFFFu && sp.kind > (uint32_t)mEv_SPNPC_END) {
+        return 0;
+    }
+    if (sp.scheduled.month > 12 || sp.scheduled.day > 31 || sp.scheduled.hour > 23 || sp.scheduled.min > 59 || sp.scheduled.sec > 59) {
+        return 0;
+    }
+    if (p[0] > (uint8_t)mEv_EVENT_NUM || p[1] != 0u || p[2] > (uint8_t)mEv_EVENT_NUM || p[3] > (uint8_t)mEv_EVENT_NUM) {
+        return 0; /* event types / the weekly flag are mEv_EVENT_* ids; the transient special_event.flags byte must be 0 */
+    }
+    for (i = 0; i < mEv_SAVE_DATE_NUM; i++) {
+        dates[i] = (uint16_t)((uint16_t)p[4 + 2 * i] | ((uint16_t)p[5 + 2 * i] << 8));
+    }
+    if (dates[mEv_SAVE_DATE_TODAY] != 0u || dates[mEv_SAVE_DATE_BIRTHDAY] != 0u || dates[mEv_SAVE_DATE_SPECIAL3] > 23u) {
+        return 0; /* the local player's two dates are never carried; SPECIAL3 is an hour */
+    }
+    for (i = 0; i < mEv_SAVE_DATE_NUM; i++) {
+        if (i != (int)mEv_SAVE_DATE_SPECIAL3 && !pcnetgame_ev_md_ok(dates[i])) {
+            return 0;
+        }
+    }
+    ghost_day = (uint16_t)((uint16_t)p[20] | ((uint16_t)p[21] << 8));
+    bridge_day = (uint16_t)((uint16_t)p[22] | ((uint16_t)p[23] << 8));
+    if (!pcnetgame_ev_md_ok(ghost_day) || !pcnetgame_ev_md_ok(bridge_day)) {
+        return 0;
+    }
+    if (p[25] > (uint8_t)mEv_EVENT_NUM || (p[26] != 0xFFu && p[26] > (uint8_t)mEv_EVENT_NUM) || p[27] > 1u) {
+        return 0;
+    }
+    /* the union is interpreted by kind; every item id a visitor sells / holds must be a legal pocket item (or empty) */
+    if (sp.kind == (uint32_t)mEv_SPNPC_SHOP) {
+        for (i = 0; i < mEv_BARGIN_ITEM_NUM; i++) {
+            items[n_items++] = sp.event.bargin.items[i];
+        }
+        if (sp.event.bargin.kind < 0 || sp.event.bargin.kind > (int)mSP_KIND_MAX) {
+            return 0;
+        }
+    } else if (sp.kind == (uint32_t)mEv_SPNPC_DESIGNER) {
+        for (i = 0; i < mEv_DESGINER_NUM; i++) {
+            items[n_items++] = sp.event.designer.gifted_cloths[i];
+        }
+        used = sp.event.designer.used;
+    } else if (sp.kind == (uint32_t)mEv_SPNPC_BROKER) {
+        for (i = 0; i < mEv_BROKER_ITEM_NUM; i++) {
+            items[n_items++] = sp.event.broker.items[i];
+        }
+        for (i = 0; i < mEv_BROKER_ITEM_NUM - 1; i++) {
+            items[n_items++] = sp.event.broker.sold_items[i];
+        }
+        used = sp.event.broker.used;
+    } else if (sp.kind == (uint32_t)mEv_SPNPC_ARTIST) {
+        for (i = 0; i < mEv_ARTIST_ENTRY_SAVE_NUM; i++) {
+            items[n_items++] = sp.event.artist.walls[i];
+        }
+        used = sp.event.artist.used;
+    } else if (sp.kind == (uint32_t)mEv_SPNPC_ARABIAN) {
+        items[n_items++] = sp.event.arabian.carpet;
+        used = sp.event.arabian.used;
+    }
+    if (used < 0 || used > 4) {
+        return 0;
+    }
+    for (i = 0; i < n_items; i++) {
+        if (!pcnetgame_is_pocket_legal_item(items[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
-           : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : "?";
+           : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -14146,6 +14308,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
         *len = (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN;
         return 1;
     }
+    if (svc == (int)PC_NETGAME_TS_EVENT) {
+        pcnetgame_ts_build_event(blob);
+        *len = (uint16_t)PC_NETGAME_TS_EVENT_LEN;
+        return 1;
+    }
     return 0;
 }
 
@@ -14169,6 +14336,12 @@ static int pcnetgame_ts_refresh(int svc) {
     h->valid = 1;
     printf("[NET][TS] host: service %d (%s) state -> seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)h->seq,
            (unsigned)dig, (unsigned)len);
+    if (svc == (int)PC_NETGAME_TS_EVENT) {
+        pcnetgame_ts_event_log("host", blob);
+        if (!pcnetgame_ts_valid_event_blob(blob)) {
+            printf("[NET][TS] host: *** WARNING: the host's own event state would be REFUSED by clients (illegal content) ***\n");
+        }
+    }
     if (svc == (int)PC_NETGAME_TS_SHOP) {
         printf("[NET][TS] host: shop level %d sales_sum %u bag_count %d rare 0x%04X\n", (int)Save_Get(shop).shop_info.shop_level,
                (unsigned)Save_Get(shop).sales_sum, (int)Save_Get(shop).flowers_candy_grab_bag_count, (unsigned)Save_Get(shop).rare_item);
@@ -14196,6 +14369,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MUSEUM);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVENT);
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -14223,7 +14397,7 @@ static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_HOSTCFG; svc++) {
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_EVENT; svc++) {
         PCNetGameHostPeerState* st = &s_host_peer[peer];
         if (s_ts_host[svc].valid && st->ts_sent_seq[svc] != s_ts_host[svc].seq) {
             if (pcnetgame_ts_send_to_peer(peer, svc)) {
@@ -14285,6 +14459,78 @@ static void pcnetgame_ts_test_seed_police(void) {
     }
 }
 
+/* TEST-ONLY (--world-test-force=W,I,T,P[,M], HOST only, default OFF): once the host world is ready, writes known values into the host's own world
+ * state, exactly once: weather type / intensity, Stalk Market trend + daily prices (P + weekday), and an optional game-clock shift of M minutes
+ * (Save time_delta). Everything after that is the normal machinery (WORLD_META on the change, CLOCK_SYNC), so a real client's log lines can be compared
+ * with the values logged here. */
+static int s_world_test_poke_md = 0; /* the optional 6th value E (month * 100 + day): the host's Wisp date (event_save_common.ghost_day) is poked to it once a client is READY */
+static void pcnetgame_world_test_force(void) {
+    static int done = 0;
+    int w = 0, in = 0, t = 0, p = 0, m = 0, e = 0;
+    int n;
+    int d;
+    Kabu_price_c* kabu;
+    if (done || g_pc_world_test_force == NULL || g_pc_world_test_force[0] == '\0') {
+        return;
+    }
+    done = 1;
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        printf("[NET][WORLD][TEST-ONLY] --world-test-force REFUSED: host-only hook\n");
+        return;
+    }
+    n = sscanf(g_pc_world_test_force, "%d,%d,%d,%d,%d,%d", &w, &in, &t, &p, &m, &e);
+    if (n < 4 || w < 0 || w >= (int)mEnv_WEATHER_NUM || in < 0 || in > 3 || t < 0 || t > 4 || p < 1 || p > 600 || m < -180 || m > 180 ||
+        (e != 0 && (e / 100 < 1 || e / 100 > 12 || e % 100 < 1 || e % 100 > 28))) {
+        printf("[NET][WORLD][TEST-ONLY] --world-test-force REFUSED: bad value '%s' (want W 0..4, I 0..3, T 0..4, P 1..600[, M -180..180[, E month*100+day]])\n",
+               g_pc_world_test_force);
+        return;
+    }
+    s_world_test_poke_md = e != 0 ? ((e / 100) << 8) | (e % 100) : 0;
+    Common_Set(weather, (s16)w);
+    Common_Set(weather_intensity, (s16)in);
+    Save_Set(weather, (u8)(in | (w << 4)));
+    kabu = Save_GetPointer(kabu_price_schedule);
+    kabu->trade_market = (u16)t;
+    for (d = 0; d < lbRTC_WEEKDAYS_MAX; d++) {
+        kabu->daily_price[d] = (u16)(p + d);
+    }
+    if (m != 0) {
+        Save_Set(time_delta, Save_Get(time_delta) + (OSTime)m * 60 * (OSTime)GC_TIMER_CLOCK);
+    }
+    printf("[NET][WORLD][TEST-ONLY] --world-test-force: host forced weather=%d intensity=%d trend=%d price_sunday=%d (price[d]=%d+d) clock_shift_min=%d "
+           "(NOT active in normal play)\n", w, in, t, p, p, m);
+}
+
+/* TEST-ONLY (the 6th value of --world-test-force): 4 s after the first READY peer, pokes event_save_common.ghost_day (a mirrored decision field) to the
+ * requested month/day, exactly once, so a real / scripted client can observe a digest-change push of service 5 AFTER the READY push. */
+static void pcnetgame_world_test_poke_event(void) {
+    static int poked = 0;
+    static uint32_t first_ready_ms = 0;
+    uint32_t now = pcnetgame_now_ms();
+    int p;
+    int any_ready = 0;
+    if (poked || s_world_test_poke_md == 0) {
+        return;
+    }
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        if (s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
+            any_ready = 1;
+        }
+    }
+    if (!any_ready) {
+        return;
+    }
+    if (first_ready_ms == 0u) {
+        first_ready_ms = now | 1u;
+    }
+    if ((uint32_t)(now - first_ready_ms) < 4000u) {
+        return;
+    }
+    poked = 1;
+    Save_Get(event_save_common).ghost_day = (u16)s_world_test_poke_md;
+    printf("[NET][EVENT][TEST-ONLY] --world-test-force: host poked event_save_common.ghost_day = 0x%04X (NOT active in normal play)\n", (unsigned)s_world_test_poke_md);
+}
+
 static void pcnetgame_host_ts_tick(void) {
     uint32_t now = pcnetgame_now_ms();
     int p;
@@ -14292,6 +14538,8 @@ static void pcnetgame_host_ts_tick(void) {
         return;
     }
     pcnetgame_ts_test_seed_police();
+    pcnetgame_world_test_force();
+    pcnetgame_world_test_poke_event();
     if ((uint32_t)(now - s_ts_next_check_ms) >= PC_NETGAME_TS_CHECK_MS || !s_ts_host[PC_NETGAME_TS_POLICE].valid) {
         s_ts_next_check_ms = now;
         pcnetgame_ts_refresh_all();
@@ -17534,6 +17782,37 @@ static void pcnetgame_client_wildlife_mode_apply(int on) {
     }
 }
 
+/* Events (service 5), CLIENT: writes the host's decision state into the local Save_t (never persisted). Only the fields listed at the EVENTS block
+ * are touched; the client keeps its own special_event.flags (forced to 0: a client never generates special-event contents), the per-player story
+ * flags, the per-event save areas, the mail-event cursor and the local player's two dates. Then mEv_run() re-derives today's table once. */
+static uint32_t s_ts_client_event_digest = 0;
+static void pcnetgame_ts_apply_event(const uint8_t* blob) {
+    mEv_save_common_data_c* c = &Save_Get(event_save_common);
+    const uint8_t* p = blob + PCNG_EV_OFF_CORE;
+    int i;
+    memcpy(&Save_Get(event_save_data).special, blob + PCNG_EV_OFF_SPECIAL, sizeof(mEv_special_c));
+    memcpy(&Save_Get(event_save_data).weekly, blob + PCNG_EV_OFF_WEEKLY, sizeof(mEv_weekly_u));
+    c->special_event.type = p[0];
+    c->special_event.flags = 0;
+    c->weekly_event.type = p[2];
+    c->weekly_event.flags = p[3];
+    p += 4;
+    for (i = 0; i < mEv_SAVE_DATE_NUM; i++) {
+        uint16_t v = pcnetgame_ev_get16(&p);
+        if (i != (int)mEv_SAVE_DATE_TODAY && i != (int)mEv_SAVE_DATE_BIRTHDAY) {
+            c->dates[i] = v;
+        }
+    }
+    c->ghost_day = pcnetgame_ev_get16(&p);
+    c->bridge_day = pcnetgame_ev_get16(&p);
+    c->bridge_flags.raw = *p++;
+    c->ghost_event_type = *p++;
+    c->soncho_event_type = *p++;
+    c->dozaemon_completed = *p++;
+    Save_Set(event_year, (s16)pcnetgame_ev_get16(&p));
+    mEv_PcNotifyMirrorApplied();
+}
+
 static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
     const int svc = (int)m->service;
     int i;
@@ -17551,6 +17830,10 @@ static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
         }
     } else if (svc == (int)PC_NETGAME_TS_SHOP) {
         memcpy(&Save_Get(shop), m->blob, PC_NETGAME_TS_SHOP_LEN); /* the host's Shop_c wholesale: stock, rare item, bag count, level, sales_sum, times */
+    } else if (svc == (int)PC_NETGAME_TS_EVENT) {
+        pcnetgame_ts_apply_event(m->blob);
+        s_ts_client_event_digest = m->digest;
+        pcnetgame_ts_event_log("client", m->blob);
     } else {
         memcpy(&Save_Get(museum_display), m->blob, PC_NETGAME_TS_MUSEUM_LEN);
     }
@@ -17584,13 +17867,15 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     memset(&m, 0, sizeof(m));
     memcpy(&m, data, size);
     svc = (int)m.service;
-    if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG) {
+    if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG &&
+        svc != (int)PC_NETGAME_TS_EVENT) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
     expect = (svc == (int)PC_NETGAME_TS_POLICE) ? (uint16_t)PC_NETGAME_TS_POLICE_LEN
              : (svc == (int)PC_NETGAME_TS_SHOP) ? (uint16_t)PC_NETGAME_TS_SHOP_LEN
-             : (svc == (int)PC_NETGAME_TS_HOSTCFG) ? (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_HOSTCFG) ? (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN
+             : (svc == (int)PC_NETGAME_TS_EVENT) ? (uint16_t)PC_NETGAME_TS_EVENT_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -17608,10 +17893,11 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     }
     if (!(svc == (int)PC_NETGAME_TS_POLICE ? pcnetgame_ts_valid_police_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_SHOP ? pcnetgame_ts_valid_shop_blob(m.blob)
-          : svc == (int)PC_NETGAME_TS_HOSTCFG ? pcnetgame_ts_valid_hostcfg_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_HOSTCFG ? pcnetgame_ts_valid_hostcfg_blob(m.blob)
+          : svc == (int)PC_NETGAME_TS_EVENT ? pcnetgame_ts_valid_event_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
                svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
-               : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : "museum");
+               : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : "museum");
         return;
     }
     if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
@@ -17627,12 +17913,37 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     pcnetgame_ts_client_apply(&m);
 }
 
+/* Events: once a second, logs (on change only) the digest of the CLIENT's own event state next to the digest of the last applied host state. The two
+ * match as long as the client's local daily derivation (update_schedule_today) leaves the mirrored decision fields alone, which is the invariant
+ * the real-client test checks. */
+static void pcnetgame_event_client_selfcheck(void) {
+    static uint32_t next_ms = 0;
+    static uint32_t last_dig = 0;
+    static int have_last = 0;
+    uint8_t blob[PC_NETGAME_TS_BLOB_MAX];
+    uint32_t now = pcnetgame_now_ms();
+    uint32_t dig;
+    if (!s_ts_client_have[PC_NETGAME_TS_EVENT] || (uint32_t)(now - next_ms) < 1000u) {
+        return;
+    }
+    next_ms = now;
+    pcnetgame_ts_build_event(blob);
+    dig = pcnetgame_fnv1a32(blob, PC_NETGAME_TS_EVENT_LEN);
+    if (have_last && dig == last_dig) {
+        return;
+    }
+    have_last = 1;
+    last_dig = dig;
+    printf("[NET][EVENT] client: local event state digest 0x%08X, last applied host digest 0x%08X (%s)\n", (unsigned)dig,
+           (unsigned)s_ts_client_event_digest, dig == s_ts_client_event_digest ? "MATCH" : "DIFFERS");
+}
+
 static void pcnetgame_ts_client_tick(void) {
     int svc;
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcfa_save_ready()) {
         return;
     }
-    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_SHOP; svc++) {
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_EVENT; svc++) {
         if (s_ts_client_stash_valid[svc]) {
             s_ts_client_stash_valid[svc] = 0;
             if (!s_ts_client_have[svc] || s_ts_client_stash[svc].seq > s_ts_client_seq[svc]) {
@@ -17640,6 +17951,7 @@ static void pcnetgame_ts_client_tick(void) {
             }
         }
     }
+    pcnetgame_event_client_selfcheck();
 }
 
 /* Begins the transaction of the pending UI operation. Returns 1 = started, 0 = refused for good (not a READY client, bad arguments, no usable
@@ -24026,6 +24338,25 @@ int pc_net_game_authoritative_wildlife_enabled(void) {
 /* Batch A (A1): see pc_net_game.h. */
 int pc_net_game_wildlife_mode_pending(void) {
     return s_role == PC_NETGAME_ROLE_CLIENT && s_client_wildlife_mode < 0;
+}
+
+/* Events: see pc_net_game.h. Site 0/1/2 = init_special_event / init_weekly_event / the event manager's special-event contents generator. */
+int pc_net_game_event_client_gate(int site) {
+    static uint8_t logged[3];
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return 0;
+    }
+    if (site >= 0 && site < 3 && !logged[site]) {
+        logged[site] = 1;
+        printf("[NET][EVENT] client: local %s suppressed (the host decides the town's events and visitors; they arrive through the service 5 mirror)\n",
+               site == 0 ? "init_special_event (special visitor roll)" : site == 1 ? "init_weekly_event (weekly event / Gulliver / Wisp roll)"
+                                                                                   : "special-event contents generation");
+    }
+    return 1;
+}
+
+void pc_net_game_event_note_rederive(void) {
+    printf("[NET][EVENT] client: host event state applied -> re-deriving today's event table once (vanilla new-day path)\n");
 }
 
 /* See pc_net_game.h's own doc. No "one already in flight" guard, matching TREE_SHAKE's own

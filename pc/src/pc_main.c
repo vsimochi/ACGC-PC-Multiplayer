@@ -412,6 +412,7 @@ int g_pc_txn_test_dig_grant = 0;
 
 /* Town services milestone 1 TEST-ONLY hooks: --ts-test-seed-police / --ts-test-donate / --ts-test-claim. See pc_platform.h's own doc comment. */
 const char* g_pc_ts_test_seed_police = NULL;
+const char* g_pc_world_test_force = NULL; /* --world-test-force=W,I,T,P[,M] (HOST only, TEST-ONLY): see pc_platform.h */
 int g_pc_ts_test_donate = 0;
 int g_pc_ts_test_claim = 0;
 /* Town services milestone 2 (shop) TEST-ONLY hooks: --shop-test-buy / --shop-test-sell. See pc_platform.h's own doc comment. */
@@ -611,6 +612,10 @@ int main(int argc, char* argv[]) {
                    "                      K times (default 1). See pc_platform.h. Never use in normal play.\n");
             printf("  --ts-test-seed-police=HEX[,HEX...]  HOST-only TEST hook (default off; loud logs): keep the listed\n"
                    "                      items in the host's lost and found once the world is ready. See pc_platform.h.\n");
+            printf("  --world-test-force=W,I,T,P[,M[,E]]  HOST-only TEST hook (default off; loud logs): force weather W,\n"
+                   "                      intensity I, Stalk Market trend T, daily prices P+weekday and optionally a\n"
+                   "                      clock shift of M minutes once the world is ready; E (month*100+day) pokes the\n"
+                   "                      host's Wisp date 4 s after a client is READY. See pc_platform.h.\n");
             printf("  --ts-test-donate    Client-only TEST hook (default off; loud logs): drive ONE real museum donation\n"
                    "                      through the town-service transaction path. See pc_platform.h.\n");
             printf("  --ts-test-claim     Client-only TEST hook (default off; loud logs): drive ONE real lost-and-found\n"
@@ -719,6 +724,9 @@ int main(int argc, char* argv[]) {
         } else if (strncmp(argv[i], "--ts-test-seed-police=", 22) == 0) {
             g_pc_ts_test_seed_police = argv[i] + 22;
             printf("[NET][TS][TEST-ONLY] --ts-test-seed-police=%s armed (a TEST hook: not for normal play)\n", g_pc_ts_test_seed_police);
+        } else if (strncmp(argv[i], "--world-test-force=", 19) == 0) {
+            g_pc_world_test_force = argv[i] + 19;
+            printf("[NET][WORLD][TEST-ONLY] --world-test-force=%s armed (a TEST hook: not for normal play)\n", g_pc_world_test_force);
         } else if (strcmp(argv[i], "--ts-test-donate") == 0) {
             g_pc_ts_test_donate = 1;
             printf("[NET][TS][TEST-ONLY] --ts-test-donate armed (a TEST hook: not for normal play)\n");

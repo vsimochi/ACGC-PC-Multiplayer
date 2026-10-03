@@ -17,6 +17,8 @@ Phases (one host process each):
            concurrent donation of the same species (exactly one winner), invalid / malformed / stale / bad-image requests, police claim
            (success, replay, compaction, mismatch, stale index after compaction, concurrent claim), HANDSHAKE / parked / host-own peers,
            persistence in the host GCI (early save after the clients leave)
+  E        events (service 5 EVENT_STATE): host with --world-test-force=...,E (the test hook pokes the Wisp date 4 s after READY): the READY push, the
+           digest-change push (seq 2, only ghost_day differs), a late joiner gets the latest, no spam, host log == blob (decoded)
   F-drop   drop_result:1:1   the APPLIED RESULT of a donation is lost but the mirror still arrives; the resend replays, executed once
   F-kill   kill_peer_after_commit:1:1   a claim commits, the peer is dropped without a RESULT; the other client sees the new police state, a
            same-nonce reconnect replays, a NEW-PROCESS session sees the post-state (pushed record + mirror)
@@ -37,6 +39,7 @@ from test_txn_protocol import APPLIED, REJECTED, R, D_NONE, D_POCKET, first_free
 
 K_DONATE, K_CLAIM = L.PC_NETGAME_TXN_KIND_MUSEUM_DONATE, L.PC_NETGAME_TXN_KIND_POLICE_CLAIM
 SVC_POLICE, SVC_MUSEUM = L.PC_NETGAME_TS_POLICE, L.PC_NETGAME_TS_MUSEUM
+SVC_EVENT = L.PC_NETGAME_TS_EVENT
 SEEDS = [0x2800, 0x2801, 0x2802]          # --ts-test-seed-police (ITEM1 items; mPB_keep_item appends them)
 FISH0, INSECT0 = 0x2300, 0x2D00
 MUS_OFF = {"fossil": 0x00, "art": 0x0D, "fish": 0x15, "insect": 0x2A}
@@ -68,6 +71,31 @@ def free_idx(blob, cat, n):
 def host_digests(run, svc, name):
     """{seq: digest} of every '[NET][TS] host: service N (NAME) state -> seq S digest 0xD len L' log line."""
     return {int(m.group(1)): int(m.group(2), 16) for m in re.finditer(r"service %d \(%s\) state -> seq (\d+) digest 0x([0-9A-F]{8}) len \d+" % (svc, name), run.log())}
+
+
+def ev_decode(blob):
+    """Decode the 214-byte EVENT blob: (special_type, kind, weekly_type, weekly_flags, dates[8], ghost_day, ghost_type, flags_byte)."""
+    p = blob[184:214]
+    return {"special_type": p[0], "flags": p[1], "weekly_type": p[2], "weekly_flags": p[3], "dates": struct.unpack("<8H", p[4:20]),
+            "ghost_day": struct.unpack("<H", p[20:22])[0], "bridge_day": struct.unpack("<H", p[22:24])[0], "ghost_type": p[25],
+            "kind": struct.unpack("<I", blob[8:12])[0], "year": struct.unpack("<h", p[28:30])[0]}
+
+
+def host_event_log(run, seq=None):
+    """The decoded host log lines of the EVENT state, in order: [(special_type, kind, weekly_type, weekly_flags, ghost_type, ghost_day)]."""
+    out = []
+    for m in re.finditer(r"\[NET\]\[EVENT\] host: state special_type=(\d+) kind=0x([0-9A-F]{8}) sched=\S+ weekly_type=(\d+) weekly_flags=(\d+) ghost_type=(\d+) ghost_day=0x([0-9A-F]{4})", run.log()):
+        out.append((int(m.group(1)), int(m.group(2), 16), int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6), 16)))
+    return out
+
+
+def wait_log(run, rx, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if run.n_log(rx) >= 1:
+            return True
+        L.pump_sleep(0.3)
+    return run.n_log(rx) >= 1
 
 
 def ts_count(c, svc):
@@ -175,11 +203,24 @@ def m_mirror_at_ready(run, a, b):
     ck("TS2 no spam: exactly ONE TOWN_SVC_STATE per service per client after 2.5 s idle (the digest poll sends only on a change)",
        ts_count(a, SVC_POLICE) == 1 and ts_count(a, SVC_MUSEUM) == 1 and ts_count(b, SVC_POLICE) == 1 and ts_count(b, SVC_MUSEUM) == 1)
     ck("TS2 the shop (3) is mirrored since the shop milestone (exactly ONE push per client, 320 B, digest == FNV-1a32), HOST_CONFIG (4, batch A) is pushed exactly "
-       "once per client (len 8, host WITHOUT --authoritative-wildlife -> blob[0] == 0, reserved bytes zero, digest == FNV-1a32) and no reserved service (5+) is ever sent",
+       "once per client (len 8, host WITHOUT --authoritative-wildlife -> blob[0] == 0, reserved bytes zero, digest == FNV-1a32) service 5 (EVENT, events milestone) is pushed exactly once per client and no reserved service (6+) is ever sent",
        all(ts_count(c, L.PC_NETGAME_TS_SHOP) == 1 and c.ts_latest(L.PC_NETGAME_TS_SHOP)[0].len == L.PC_NETGAME_TS_SHOP_LEN for c in (a, b))
        and all(ts_count(c, L.PC_NETGAME_TS_HOSTCFG) == 1 and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[0].len == L.PC_NETGAME_TS_HOSTCFG_LEN
                and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[1] == bytes(8) and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[0].digest == L.fnv1a32(bytes(8)) for c in (a, b))
-       and not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM, L.PC_NETGAME_TS_SHOP, L.PC_NETGAME_TS_HOSTCFG)])
+       and not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM, L.PC_NETGAME_TS_SHOP, L.PC_NETGAME_TS_HOSTCFG, SVC_EVENT)])
+    ev_a, ev_b = latest(a, SVC_EVENT, 1, 5.0), latest(b, SVC_EVENT, 1, 5.0)
+    ck("TS4 events: both clients received the EVENT_STATE (service 5) at READY: len 214, digest == FNV-1a32 of the blob == the digest the HOST logged for that seq, "
+       "identical blob and seq for both clients, exactly ONE push per client after the idle wait",
+       ev_a is not None and ev_b is not None and ev_a[0].len == L.PC_NETGAME_TS_EVENT_LEN and len(ev_a[1]) == 214 and ev_a[0].digest == L.fnv1a32(ev_a[1])
+       and host_digests(run, SVC_EVENT, "EVENT").get(ev_a[0].seq) == ev_a[0].digest and ev_a[1] == ev_b[1] and ev_a[0].seq == ev_b[0].seq
+       and ts_count(a, SVC_EVENT) == 1 and ts_count(b, SVC_EVENT) == 1)
+    if ev_a is not None:
+        d = ev_decode(ev_a[1])
+        hl = host_event_log(run)
+        ck("TS4 events: the blob never carries the host player's local fields (the transient special_event.flags byte is 0, dates[TODAY] and dates[BIRTHDAY] are 0), the special kind is "
+           "-1 or a legal kind, and the DECODED blob equals the host's own decoded log line (special type, kind, weekly type / flags, Wisp type / date)",
+           d["flags"] == 0 and d["dates"][0] == 0 and d["dates"][2] == 0 and (d["kind"] == 0xFFFFFFFF or d["kind"] <= 6) and bool(hl)
+           and hl[-1] == (d["special_type"], d["kind"], d["weekly_type"], d["weekly_flags"], d["ghost_type"], d["ghost_day"]))
     ck("TS3 batch A: HOST_CONFIG reaches each client BEFORE the first world SNAPSHOT_BEGIN (the wildlife mode is known before any wildlife snapshot message)",
        all(ts_indices(c, L.PC_NETGAME_TS_HOSTCFG) and c.inbox.peek_all(L.p_msg_type(L.PC_NETGAME_MSG_SNAPSHOT_BEGIN, (L.CH_RELIABLE,)))
            and ts_indices(c, L.PC_NETGAME_TS_HOSTCFG)[0] < c.inbox.peek_all(L.p_msg_type(L.PC_NETGAME_MSG_SNAPSHOT_BEGIN, (L.CH_RELIABLE,)))[0].index for c in (a, b)))
@@ -572,9 +613,41 @@ def phase_hostcfg_on(run):
     ck("W7 the host survived", run.host.alive())
 
 
+def phase_events(run):
+    """Events: a digest CHANGE of the host's event state is pushed to every READY client (seq increases, only the poked field differs); a late joiner gets the latest."""
+    ck = run.check
+    a = run.ready("A", run.r1)
+    ck("E setup: A READY and SYNCED", a.rec_synced and a.rec_last is not None)
+    s1 = latest(a, SVC_EVENT, 1, 5.0)
+    ck("E1 A received the EVENT_STATE at READY (len 214, digest == FNV-1a32, seq >= 1)",
+       s1 is not None and s1[0].len == 214 and s1[0].digest == L.fnv1a32(s1[1]) and s1[0].seq >= 1)
+    if s1 is None:
+        return
+    poked = wait_log(run, r"\[NET\]\[EVENT\]\[TEST-ONLY\] --world-test-force: host poked event_save_common.ghost_day = 0x0B0F", 15.0)
+    ck("E2 the host test hook poked the Wisp date to Nov 15 (0x0B0F) once, 4 s after A was READY", poked)
+    s2 = a.wait_ts_state(SVC_EVENT, 8.0, min_seq=s1[0].seq + 1)
+    ck("E3 the digest change was PUSHED to A: seq increased, digest == FNV-1a32 == the host's logged digest for that seq", s2 is not None
+       and s2[0].digest == L.fnv1a32(s2[1]) and host_digests(run, SVC_EVENT, "EVENT").get(s2[0].seq) == s2[0].digest)
+    if s2 is None:
+        return
+    d1, d2 = ev_decode(s1[1]), ev_decode(s2[1])
+    diff = [i for i in range(214) if s1[1][i] != s2[1][i]]
+    ck("E4 only the poked field changed: the two blobs differ exactly in the ghost_day bytes (offsets 204..205) and the new ghost_day is 0x0B0F",
+       d2["ghost_day"] == 0x0B0F and set(diff) <= {204, 205} and diff != [])
+    b = run.ready("B", run.r2)
+    sb = latest(b, SVC_EVENT, 1, 5.0)
+    ck("E5 a late-joining client B gets the LATEST state at its READY (same seq and blob as A's last), exactly once",
+       sb is not None and sb[0].seq == s2[0].seq and sb[1] == s2[1] and ts_count(b, SVC_EVENT) == 1)
+    L.pump_sleep(2.5)
+    ck("E6 no spam: A received exactly 2 EVENT pushes in total (READY + the one change), B exactly 1, no stale seq", ts_count(a, SVC_EVENT) == 2 and ts_count(b, SVC_EVENT) == 1
+       and [g.seq for conn, g, bl in a.ts_states if g.service == SVC_EVENT] == sorted(g.seq for conn, g, bl in a.ts_states if g.service == SVC_EVENT))
+    ck("E7 the host survived", run.host.alive())
+
+
 PHASES = [
     ("M", [], phase_main),
     ("W", ["--authoritative-wildlife"], phase_hostcfg_on),
+    ("E", ["--world-test-force=1,2,3,100,0,1115"], phase_events),
     ("F-drop", ["--txn-fault=drop_result:1:1"], phase_drop),
     ("F-kill", ["--txn-fault=kill_peer_after_commit:1:1"], phase_kill),
 ]
@@ -583,7 +656,7 @@ PHASES = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=11000)
-    ap.add_argument("--only", default="", help="comma list of phase names (M, W, F-drop, F-kill)")
+    ap.add_argument("--only", default="", help="comma list of phase names (M, W, E, F-drop, F-kill)")
     args = ap.parse_args()
     L.require_test_bin_dir()
     if not os.path.basename(os.path.normpath(L.GAME_BIN_DIR)).startswith("bin_fixture4"):

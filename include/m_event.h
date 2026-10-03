@@ -676,6 +676,10 @@ extern int mEv_bridge_time_check();
 extern void mEv_init(Event_c* event);
 extern void mEv_init_force(Event_c* event);
 extern void mEv_2nd_init(Event_c* event);
+#ifdef TARGET_PC
+/* Multiplayer (events, TOWN_SVC_STATE service 5): called by the client mirror after it wrote a new host event state into the local save. */
+extern void mEv_PcNotifyMirrorApplied(void);
+#endif
 extern int mEv_PlayerOK();
 extern void mEv_run(Event_c* event);
 extern void mEv_finish(Event_c* event);

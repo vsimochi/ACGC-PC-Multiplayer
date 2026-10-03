@@ -10,6 +10,21 @@
 #include "m_scene_table.h"
 #include "m_soncho.h"
 
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* events (TOWN_SVC_STATE service 5): pc_net_game_event_client_gate() / pc_net_game_event_note_rederive() */
+
+/* Multiplayer: the town's special events / visitors / weekly events are decided by the HOST and mirrored to clients (pc_net_game.c, service 5).
+ * A client never rolls them itself: init_special_event() (seeded by the LOCAL player id / RANDOM) and init_weekly_event() (Gulliver's hour, the
+ * Wisp's RANDOM date) return immediately on a CLIENT process (role CLIENT, linked or not: a disconnected client keeps the last mirrored state
+ * instead of inventing its own). When a new host state is applied the mirror raises this flag and mEv_run() re-derives today's event table
+ * from the (now mirrored) save fields through the vanilla daily path. */
+static int s_pc_event_mirror_dirty = 0;
+
+extern void mEv_PcNotifyMirrorApplied(void) {
+    s_pc_event_mirror_dirty = 1;
+}
+#endif
+
 enum {
     mEv_INIT_NO_RENEWAL,
     mEv_INIT_RENEWAL,
@@ -896,6 +911,12 @@ static int init_special_event(int new_event) {
     s16 event_year;
     int t;
 
+#ifdef TARGET_PC
+    if (pc_net_game_event_client_gate(0)) {
+        return FALSE; /* the host decides the special event; the mirror (service 5) carries it */
+    }
+#endif
+
     switch (Common_Get(last_scene_no)) {
         case SCENE_BUGGY:
         case SCENE_BROKER_SHOP: {
@@ -1185,6 +1206,12 @@ static void init_weekly_event() {
     u16 monday_date;
     u16 friday_date;
     u16* event_dates = Save_Get(event_save_common).dates;
+
+#ifdef TARGET_PC
+    if (pc_net_game_event_client_gate(1)) {
+        return; /* the host decides the weekly event / Gulliver / the Wisp; the mirror (service 5) carries them */
+    }
+#endif
 
     today_date.month = rtc_time->month;
     today_date.day = rtc_time->day;
@@ -2039,6 +2066,14 @@ extern void mEv_run(Event_c* event) {
             lbRTC_day_t hour = (u32)Common_Get(time.rtc_time.hour);
             lbRTC_day_t day = Common_Get(time.rtc_time.day);
 
+#ifdef TARGET_PC
+            if (s_pc_event_mirror_dirty) {
+                /* a new host event state was mirrored: take the vanilla "new day" path once so today's table follows it */
+                s_pc_event_mirror_dirty = 0;
+                event->day = 99;
+                pc_net_game_event_note_rederive();
+            }
+#endif
             if (event->day != day) {
                 mEv_RenewalDataEveryDay();
                 event->state = 2;

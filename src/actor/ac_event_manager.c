@@ -14,6 +14,9 @@
 #include "ac_groundhog_control.h"
 #include "m_bgm.h"
 #include "m_random_field.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* events: pc_net_game_event_client_gate() */
+#endif
 #include "zurumode.h"
 #include "_mem.h"
 
@@ -4712,6 +4715,9 @@ static void schedule_main(ACTOR* actorx) {
     int nearby_info_valid = FALSE;
 
     if (Save_Get(event_save_common).special_event.flags == 1) {
+#ifdef TARGET_PC
+        if (!pc_net_game_event_client_gate(2)) /* a client never generates the special-event contents (RANDOM items): the host's mirror carries them */
+#endif
         set_special_event_save();
         Save_Get(event_save_common).special_event.flags = 0;
     }
