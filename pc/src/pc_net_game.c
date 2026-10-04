@@ -167,6 +167,7 @@
 #include "m_post_office.h" /* mail milestone 1: mPO_receipt_proc / mPO_count_mail / mPO_get_keep_mail_sum / mPO_delivery_one_address */
 #include "pc_save_bswap.h" /* D3: pc_save_bswap_private() for the canonical-BE record image */
 #include "pc_mp_records.h" /* D3-4: save/mp/records.dat sidecar (pure storage module) */
+#include "pc_guest_profile.h" /* guest profiles: pc_guest_token_path() = the selected profile's client token file (default save/mp/guest_token.dat) */
 #include "pc_mp_guests.h"  /* guests: save/mp/guests.dat host table + save/mp/guest_token.dat client token file (pure storage module) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
@@ -20432,7 +20433,7 @@ static void pcnetgame_client_gtk_load(void) {
         return;
     }
     s_client_gtk_loaded = 1;
-    (void)pc_mp_gtoken_load(PC_MP_GUEST_TOKEN_PATH, &s_client_gtk, &s_client_gtk_unreadable);
+    (void)pc_mp_gtoken_load(pc_guest_token_path(), &s_client_gtk, &s_client_gtk_unreadable);
 }
 
 static void pcnetgame_client_build_ext(PCNetGameIdentityExtMsg* m, const PCNetGameTownIdentity* town) {
@@ -20483,10 +20484,10 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
             printf("[NET][GUEST] client: *** the host issued a DIFFERENT guest token than the one this client PRESENTED for this town: this is not the "
                    "host that issued it (its guest table was reset, another machine hosts a copy of the town, or an impostor). REFUSING the host. "
                    "To start over delete %s and ask the host owner to remove this guest from the host's save/mp/guests.dat ***\n",
-                   PC_MP_GUEST_TOKEN_PATH);
+                   pc_guest_token_path());
             pcnetgame_join_message_set(0, "The host gave you a DIFFERENT guest token than the one you hold: this is not the host that issued it (its guest table was reset, "
                                           "or it is another machine). You were disconnected. Delete %s and ask the host operator to run guest-reset-token or "
-                                          "guest-remove for your guest.", PC_MP_GUEST_TOKEN_PATH);
+                                          "guest-remove for your guest.", pc_guest_token_path());
             pc_net_game_shutdown();
             return;
         }
@@ -20509,13 +20510,13 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
     memcpy(e.token, m.token, PC_NETGAME_GUEST_TOKEN_LEN);
     pcnetgame_client_gtk_load();
     (void)pc_mp_gtoken_put(&s_client_gtk, &e);
-    if (pc_mp_gtoken_save(PC_MP_GUEST_TOKEN_PATH, &s_client_gtk) == PC_MP_GST_OK) {
-        printf("[NET][GUEST] client: first contact: guest token (slot %u) saved to %s\n", (unsigned)m.guest_slot, PC_MP_GUEST_TOKEN_PATH);
+    if (pc_mp_gtoken_save(pc_guest_token_path(), &s_client_gtk) == PC_MP_GST_OK) {
+        printf("[NET][GUEST] client: first contact: guest token (slot %u) saved to %s\n", (unsigned)m.guest_slot, pc_guest_token_path());
     } else {
         printf("[NET][GUEST] client: *** could NOT save the guest token to %s: the host will refuse this guest on the next visit until the host "
-               "owner removes it from the host's save/mp/guests.dat ***\n", PC_MP_GUEST_TOKEN_PATH);
+               "owner removes it from the host's save/mp/guests.dat ***\n", pc_guest_token_path());
         pcnetgame_join_message_set(0, "Your guest token could not be saved to %s. The host will refuse you next time until its operator runs guest-reset-token for "
-                                      "your guest. Check that the folder is writable.", PC_MP_GUEST_TOKEN_PATH);
+                                      "your guest. Check that the folder is writable.", pc_guest_token_path());
     }
 }
 

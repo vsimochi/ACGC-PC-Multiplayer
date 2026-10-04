@@ -84,7 +84,7 @@ def main():
     i_diff = tk.index("DIFFERENT guest token")
     ck("A the 'received a new token while holding an old one' path sets a readable message (naming guest_token.dat and the operator recovery) BEFORE it shuts the client down",
        "pcnetgame_join_message_set(0, \"The host gave you a DIFFERENT guest token" in tk and tk.index("pcnetgame_join_message_set(0", i_diff) < tk.index("pc_net_game_shutdown();", i_diff)
-       and "guest-reset-token" in tk and "PC_MP_GUEST_TOKEN_PATH);\n            pc_net_game_shutdown();" in tk.replace("\r", ""))
+       and "guest-reset-token" in tk and "pc_guest_token_path());\n            pc_net_game_shutdown();" in tk.replace("\r", ""))
     ck("A a token that could not be saved also tells the user (not only the log)", "Your guest token could not be saved to %s" in tk or "Your guest token could not be saved to %s" in ng)
     ia = ng[ng.index("IDENTITY_ACK does not match"):]
     ia = ia[:ia.index("pc_net_game_shutdown();")]

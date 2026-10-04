@@ -397,6 +397,45 @@ Tests (exact results below): native guard unit `test_guest_arrival.py` (`guest_a
 Real-run evidence: the resident client logged exactly one `starting the local arrival train (coming_flag=3)` for the guest and the action sequence 2, 3, 4, 5, 6, 7, 8, 0 (arriving, stopped, waiting, departing, departed); the dedicated host logged the same; no second train for the same puppet (one start line, one 0 -> non-zero transition per process); with resident 0 as host the guard refused once with LOCAL_DEMO.
 Re-run of the directly affected existing tests on the new exe (bin_fixture4): `test_guest_train.py` 33/33 (native), `test_guest_train_src.py` 34/34 (source audit), `test_guest_train_real.py` 12/12 (REAL), `test_move_action_state_wire.py` 38/38 (REAL host + scripted clients; its row table parser picked up the new `standing_train` row with no pin change), `test_guest_g3_real.py` 43/43 (REAL), `test_guest_g4_real.py` 36/36 (REAL); the other pc_remote_player-related source audits pass (g3 35/35, g4 27/27, g5 19/19, dedicated 87/87, observer 65/65, hostcfg 21/21, events 24/24). Pre-existing failures NOT caused by this change (files untouched here: pc_m_card.c / pc_net_game.c / the guest-arrival pins of earlier commits): `test_boot_exec_gate_src.py` 8/10 (A4 / A7 player-actor allowlists), `test_d3_record_src.py` 133/134 (P hook), `test_identity_validation_src.py` 93/96 (S2 / S9 / S11).
 
+## Guest profiles (multiple guests on one PC)
+
+Problem: `--connect HOST --guest` always used `save/mp/guest.ini` + `save/mp/guest_token.dat`, so several clients started on one PC were all the SAME guest.
+
+Usage: `AnimalCrossing.exe --connect HOST --guest-profile NAME` (implies `--guest`; may also be given together with `--guest`). CLIENT only, requires `--connect`, same exclusivity and
+refusals as `--guest` (exit 2 + a usage line); a missing, empty, invalid or repeated NAME is refused with exit 2 and a diagnostic naming the rule. One process = one profile.
+
+Files (in `save/mp`, next to the unchanged default):
+
+| profile | profile file | client token file |
+|---|---|---|
+| none (`--guest` alone, and the title-menu item without `--guest-profile`) | `guest.ini` | `guest_token.dat` (exactly as before, byte-identical behaviour) |
+| `--guest-profile NAME` | `guest_<name>.ini` | `guest_token_<name>.dat` (each profile has its OWN token, so each is its own guest on every host) |
+
+`<name>` is the profile name folded to lower case: `Alice` and `alice` are ONE profile (one file, one identity); the typed case is kept only as the default display name of a new profile.
+
+Rules:
+
+* NAME = 1..16 characters of `[A-Za-z0-9-]`; it must not start with `-` (an option such as `--guest` can never be swallowed as a value); no dots, spaces, path separators, `..`, drive
+  colons; not a Windows device name (`CON PRN AUX NUL COM0..COM9 LPT0..LPT9`, any case).
+* A missing profile file is created on first use (atomic write, own CSPRNG `player_id` / `land_id`, home town `GuestVil`, gender / face derived from the ids as before). An existing or
+  corrupt file is never overwritten (exit 2 naming the bad key, as for guest.ini). The home land name stays `GuestVil`: the host key is the full PersonalID, equal land names are harmless.
+* Default display name of a new profile = the profile name cut to 8 characters; if that is not a valid game name, is `SERVER` (any case) or is `Guest` (the default profile's own name),
+  the name is `Guest` + 2 hex digits of the player_id. The host refuses a NEW guest whose name equals another guest's name in the town, so the names of the profiles of one PC differ.
+* Uniqueness: before a NEW profile is created the sibling profiles of the folder (`guest.ini`, `guest_*.ini`) are scanned read-only (an unreadable or invalid one is skipped with a
+  stderr warning, never touched) and the ids are re-drawn (at most 32 draws) until neither the display name (any case) nor the full identity (name, home town, player_id, land_id) equals a
+  sibling's; a name collision first falls back to the `GuestXX` name. If no unique identity is found the creation fails (exit 2) and nothing is written.
+* ONE source of truth: `pc_main.c` selects the profile once (`pc_guest_profile_select`); `--guest`, the title-menu item and the client token file all derive their paths from that selection
+  (`pc_guest_token_path()`, `pc_guest_profile_selected_path()`).
+* Title menu: drawing the menu only READS the selected profile (label `Join as Guest (NAME)`, or `Join as Guest (new profile)` when the file does not exist); the profile is created only when
+  the player actually joins (title item or `--guest`). Before this change merely drawing the menu of any `--connect` client created `save/mp/guest.ini`.
+* No protocol bump, no wire change.
+
+Limitations: the same profile must not run in two processes at once (no lock, nothing is refused); the title-menu item uses the profile chosen on the command line (there is no in-game profile
+picker); the title-menu label and a join from the title menu are not visually verified; the profile identity is permanent exactly like guest.ini (deleting a profile file makes a NEW guest).
+
+Tests: native `test_guest_profiles_unit.py` (101 native checks), CLI `test_guest_profiles_cli.py` (101), source audit `test_guest_profiles_src.py` (30), REAL `test_guest_profiles_real.py`
+(40: three real guests from one cwd, kill / restart one, host restart). Commit: (filled by orchestrator)
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

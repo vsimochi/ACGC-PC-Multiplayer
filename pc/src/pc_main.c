@@ -530,7 +530,9 @@ const char* g_pc_bootstrap_guest = NULL;
 
 /* Guests G2.3: --guest (CLIENT only, requires --connect): play as a GUEST with the persistent profile save/mp/guest.ini (created with defaults on first use; see
  * pc_guest_profile.h). It is validated at startup (exit 2 on any problem), then drives the SAME arrival path as --bootstrap-guest: the profile is turned into the
- * --bootstrap-guest spec stored in g_pc_guest_spec (the test hook stays as is). */
+ * --bootstrap-guest spec stored in g_pc_guest_spec (the test hook stays as is).
+ * --guest-profile NAME (implies --guest, same exclusivity) selects the independent profile save/mp/guest_<name>.ini + save/mp/guest_token_<name>.dat via
+ * pc_guest_profile_select(): that module call is the ONE source of truth for the profile (also used by the title-menu item and the client token file). */
 static int g_pc_guest = 0;
 static char g_pc_guest_spec[96];
 
@@ -618,6 +620,14 @@ int main(int argc, char* argv[]) {
             printf("                      name / look BEFORE the first join; the ids are permanent: the same file is the same guest on every run).\n");
             printf("                      A broken guest.ini is never overwritten: the game prints the bad key and exits with code 2. A guest\n");
             printf("                      starts with empty pockets and wallet (the host enforces it) and needs a copy of the host town save.\n");
+            printf("  --guest-profile NAME  CLIENT-only (same rules and refusals as --guest, which it implies; it may also be given together\n");
+            printf("                      with --guest): play as the independent guest profile NAME so SEVERAL guests can run on ONE PC. NAME is\n");
+            printf("                      1..16 characters of A-Z a-z 0-9 - (not starting with '-', no dots / spaces / path characters, not a\n");
+            printf("                      Windows device name such as CON, NUL, COM1, LPT1; exit code 2 otherwise). Files: save/mp/guest_<name>.ini\n");
+            printf("                      and save/mp/guest_token_<name>.dat, <name> in lower case ('Alice' and 'alice' are the same profile). A new\n");
+            printf("                      profile gets its own random ids and the display name NAME (cut to 8 characters; 'GuestXX' if unusable) and\n");
+            printf("                      differs from every other profile of the folder. Without --guest-profile, --guest keeps using\n");
+            printf("                      save/mp/guest.ini and save/mp/guest_token.dat. One profile must not run in two processes at once.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
             printf("                      not a one-shot test hook): activates the host-authoritative\n");
             printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
@@ -867,6 +877,28 @@ int main(int argc, char* argv[]) {
             i++;
         } else if (strcmp(argv[i], "--guest") == 0) {
             g_pc_guest = 1;
+        } else if (strcmp(argv[i], "--guest-profile") == 0) {
+            /* Several guests on ONE PC: --guest-profile NAME implies --guest and selects the independent profile save/mp/guest_<name>.ini (+ its own token file
+             * save/mp/guest_token_<name>.dat). A missing / invalid / repeated value is never ignored: exit 2 naming the rule. */
+            char perr[160];
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                fprintf(stderr, "[PC] --guest-profile: REFUSED: the option needs a profile NAME (1..16 characters of A-Z a-z 0-9 -)\n"
+                                "usage: AnimalCrossing --connect HOST[:PORT] --guest-profile NAME   (see --help)\n");
+                return 2;
+            }
+            if (!pc_guest_profile_name_check(argv[i + 1], perr, sizeof(perr))) {
+                fprintf(stderr, "[PC] --guest-profile: REFUSED: '%s': %s\n"
+                                "usage: AnimalCrossing --connect HOST[:PORT] --guest-profile NAME   (see --help)\n", argv[i + 1], perr);
+                return 2;
+            }
+            if (pc_guest_profile_selected() != NULL) {
+                fprintf(stderr, "[PC] --guest-profile: REFUSED: the option was given more than once (one process plays one guest profile)\n"
+                                "usage: AnimalCrossing --connect HOST[:PORT] --guest-profile NAME   (see --help)\n");
+                return 2;
+            }
+            (void)pc_guest_profile_select(argv[i + 1]);
+            g_pc_guest = 1;
+            i++;
         } else if (strcmp(argv[i], "--host-observer") == 0) {
             g_pc_host_observer = 1;
         } else if (strcmp(argv[i], "--dedicated") == 0) {
@@ -960,7 +992,7 @@ int main(int argc, char* argv[]) {
      * Refused (exit 2 + usage) otherwise, BEFORE anything is initialised or the profile file is touched. Then the profile is loaded / created and validated
      * here (a bad guest.ini exits 2 with the bad key named; it is never overwritten) and converted into the --bootstrap-guest spec: the SAME arrival path. */
     if (g_pc_guest) {
-        static const char k_guest_usage[] = "usage: AnimalCrossing --connect HOST[:PORT] --guest   (see --help)\n";
+        static const char k_guest_usage[] = "usage: AnimalCrossing --connect HOST[:PORT] --guest [--guest-profile NAME]   (see --help)\n";
         const char* conflict = NULL;
         int a;
         for (a = 1; a < argc; a++) {
@@ -990,14 +1022,15 @@ int main(int argc, char* argv[]) {
         {
             PCGuestProfile gp;
             char gerr[512];
-            int gres = pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, gerr, sizeof(gerr));
+            int gres = pc_guest_profile_load_or_create_selected(&gp, gerr, sizeof(gerr));
             if (gres == PC_GUEST_PROFILE_ERR || !pc_guest_profile_spec(&gp, g_pc_guest_spec, sizeof(g_pc_guest_spec))) {
                 fprintf(stderr, "[PC] --guest: REFUSED: bad guest profile: %s\n", gres == PC_GUEST_PROFILE_ERR ? gerr : "internal error (spec buffer)");
                 return 2;
             }
             printf("[PC] --guest: %s guest profile %s: name '%s', home town '%s', gender %d, face %d, player id 0x%04X, land id 0x%04X "
                    "(the ids are permanent; edit name / look before the first join)\n",
-                   gres == PC_GUEST_PROFILE_CREATED ? "CREATED the default" : "loaded", PC_GUEST_PROFILE_PATH, gp.name, gp.home_town, gp.gender, gp.face,
+                   gres == PC_GUEST_PROFILE_CREATED ? (pc_guest_profile_selected() != NULL ? "CREATED the new" : "CREATED the default") : "loaded",
+                   pc_guest_profile_selected_path(), gp.name, gp.home_town, gp.gender, gp.face,
                    (unsigned)gp.player_id, (unsigned)gp.land_id);
             g_pc_bootstrap_guest = g_pc_guest_spec;
         }

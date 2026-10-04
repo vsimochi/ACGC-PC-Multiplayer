@@ -100,7 +100,7 @@ def main():
     ck("B the name / reserved rules are the shared helpers pc_mp_guests_name_valid / pc_mp_guests_name_reserved", "pc_mp_guests_name_valid(nb)" in pcm and "pc_mp_guests_name_reserved(nb)" in pcm)
     ck("B the ONLY file write is the atomic writer (tmp -> flush + commit -> replace), reached only from the missing-file branch; a parse error returns before any write",
        len(re.findall(r'fopen\([^)]*"wb"\)', pcm)) == 1 and 'snprintf(tmp, sizeof(tmp), "%s.tmp", path);' in pcm and "rename_over(tmp, path)" in pcm and "_commit(_fileno(fp))" in pcm
-       and pcm.count("write_atomic(") == 2)
+       and pcm.count("write_atomic(") == 3)  # guest-profiles update: + the named-profile creator (pc_guest_profile_load_or_create_in), same atomic writer
     lc = S.body(pcm, S.functions(pcm), "pc_guest_profile_load_or_create")
     ck("B load_or_create: a write happens only when fopen fails with ENOENT; an existing file that cannot be parsed returns PC_GUEST_PROFILE_ERR with the file preserved (no write, no rename, no remove)",
        "errno != ENOENT" in lc and lc.count("write_atomic(") == 1 and lc.index("write_atomic(") < lc.index("pc_guest_profile_parse(") and "remove(" not in lc and "rename" not in lc
@@ -123,7 +123,7 @@ def main():
     ck("C the refusals print `--guest: REFUSED` + the usage line and `return 2`; CLIENT role (g_pc_net_role == 2, i.e. --connect) is required",
        blk.count("return 2;") == 3 and "g_pc_net_role != 2" in blk and "usage: AnimalCrossing --connect HOST[:PORT] --guest" in blk and blk.count("[PC] --guest: REFUSED") == 3)
     ck("C the profile is loaded / created with the module and a bad profile exits 2 with the module's diagnostic (bad key named): pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, ...)",
-       "pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, gerr, sizeof(gerr))" in blk and "bad guest profile" in blk and "pc_guest_profile_spec(&gp, g_pc_guest_spec" in blk)
+       "pc_guest_profile_load_or_create_selected(&gp, gerr, sizeof(gerr))" in blk and "bad guest profile" in blk and "pc_guest_profile_spec(&gp, g_pc_guest_spec" in blk)
     _mc = S.mask(S.read("pc/src/pc_m_card.c"))
     _mcf = S.functions(_mc)
     _arr_poll = S.body(_mc, _mcf, "pc_bootstrap_guest_poll") + S.body(_mc, _mcf, "pc_guest_arrive")
@@ -140,7 +140,7 @@ def main():
        "the guest.ini writer is still the module's atomic writer only (see B)",
        "pc_guest_profile" not in S.read("src/actor/ac_animal_logo.c") and "pc_guest_title_join" in S.read("src/actor/ac_animal_logo.c"))
     eol_ok = True
-    for rel, crlf in (("pc/src/pc_net_game.c", True), ("pc/src/pc_main.c", True), ("pc/CMakeLists.txt", None), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
+    for rel, crlf in (("pc/src/pc_net_game.c", False), ("pc/src/pc_main.c", False), ("pc/CMakeLists.txt", None), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
                       ("pc/src/pc_guest_profile.c", False), ("pc/include/pc_guest_profile.h", False), ("pc/tools/net_spike/guest_g2_selftest.c", False),
                       ("pc/tools/net_spike/test_guest_g2_unit.py", False), ("pc/tools/net_spike/test_guest_g2_protocol.py", False), ("pc/tools/net_spike/test_guest_g2_src.py", False)):
         b = raw_bytes(rel)

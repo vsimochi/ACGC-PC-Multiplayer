@@ -14,6 +14,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -322,8 +323,13 @@ size_t pc_guest_profile_format(const PCGuestProfile* p, char* out, size_t cap) {
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
+static PCGuestProfileIdSource s_id_source = NULL; /* TEST SEAM (pc_guest_profile_test_set_id_source); NULL = the OS CSPRNG, the only production value */
+
 static int random_id(uint16_t* out) {
     uint8_t b[2];
+    if (s_id_source != NULL) {
+        return s_id_source(out);
+    }
     if (!pc_mp_guests_random_bytes(b, sizeof(b))) {
         return 0;
     }
@@ -458,4 +464,340 @@ int pc_guest_profile_load_or_create(const char* path, PCGuestProfile* out, char*
 int pc_guest_profile_spec(const PCGuestProfile* p, char* out, size_t cap) {
     int n = snprintf(out, cap, "%s,%s,%u,%u,%d,%d", p->name, p->home_town, (unsigned)p->player_id, (unsigned)p->land_id, p->gender, p->face);
     return n > 0 && (size_t)n < cap;
+}
+
+/* ================= named guest profiles (--guest-profile NAME) ================= */
+
+#define PROFILE_MAX_SIBLINGS 64
+#define PROFILE_ID_DRAWS 32
+
+void pc_guest_profile_test_set_id_source(PCGuestProfileIdSource fn) {
+    s_id_source = fn;
+}
+
+static char lower_c(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+void pc_guest_profile_fold(const char* name, char* out) {
+    size_t k = 0;
+    if (name != NULL) {
+        for (; name[k] != '\0' && k < PC_GUEST_PROFILE_ARG_MAX; k++) {
+            out[k] = lower_c(name[k]);
+        }
+    }
+    out[k] = '\0';
+}
+
+static int is_device_name(const char* low) {
+    static const char* const k_dev[] = { "con", "prn", "aux", "nul" };
+    size_t k;
+    for (k = 0; k < sizeof(k_dev) / sizeof(k_dev[0]); k++) {
+        if (strcmp(low, k_dev[k]) == 0) {
+            return 1;
+        }
+    }
+    return strlen(low) == 4 && (strncmp(low, "com", 3) == 0 || strncmp(low, "lpt", 3) == 0) && low[3] >= '0' && low[3] <= '9';
+}
+
+int pc_guest_profile_name_check(const char* name, char* err, size_t errcap) {
+    size_t n, k;
+    char low[PC_GUEST_PROFILE_ARG_MAX + 1];
+    if (name == NULL || name[0] == '\0') {
+        set_err(err, errcap, "%s", "profile name is empty (rule: 1..16 characters of A-Z a-z 0-9 -)", NULL);
+        return 0;
+    }
+    n = strlen(name);
+    if (n > PC_GUEST_PROFILE_ARG_MAX) {
+        set_err(err, errcap, "%s", "profile name is too long (rule: 1..16 characters of A-Z a-z 0-9 -)", NULL);
+        return 0;
+    }
+    for (k = 0; k < n; k++) {
+        const unsigned char c = (unsigned char)name[k];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+            set_err(err, errcap, "%s", "profile name has a character outside A-Z a-z 0-9 - (rule: no path separators, dots, spaces or other characters)", NULL);
+            return 0;
+        }
+    }
+    if (name[0] == '-') {
+        set_err(err, errcap, "%s", "profile name must not start with '-' (rule: it would be confused with an option)", NULL);
+        return 0;
+    }
+    pc_guest_profile_fold(name, low);
+    if (is_device_name(low)) {
+        set_err(err, errcap, "%s", "profile name is a reserved Windows device name (rule: not CON PRN AUX NUL COM0..COM9 LPT0..LPT9)", NULL);
+        return 0;
+    }
+    return 1;
+}
+
+int pc_guest_profile_file_path(const char* dir, const char* profile, int token_file, char* out, size_t cap) {
+    char low[PC_GUEST_PROFILE_ARG_MAX + 1];
+    int n;
+    if (dir == NULL) {
+        dir = PC_GUEST_PROFILE_DIR;
+    }
+    if (profile == NULL || profile[0] == '\0') {
+        n = snprintf(out, cap, token_file ? "%s/guest_token.dat" : "%s/guest.ini", dir);
+    } else {
+        if (!pc_guest_profile_name_check(profile, NULL, 0)) {
+            return 0;
+        }
+        pc_guest_profile_fold(profile, low);
+        n = snprintf(out, cap, token_file ? "%s/guest_token_%s.dat" : "%s/guest_%s.ini", dir, low);
+    }
+    return n > 0 && (size_t)n < cap;
+}
+
+static char s_selected[PC_GUEST_PROFILE_ARG_MAX + 1];
+
+int pc_guest_profile_select(const char* name) {
+    if (name == NULL || name[0] == '\0') {
+        s_selected[0] = '\0';
+        return 1;
+    }
+    if (!pc_guest_profile_name_check(name, NULL, 0)) {
+        return 0;
+    }
+    memcpy(s_selected, name, strlen(name) + 1);
+    return 1;
+}
+
+const char* pc_guest_profile_selected(void) {
+    return s_selected[0] != '\0' ? s_selected : NULL;
+}
+
+const char* pc_guest_profile_selected_path(void) {
+    static char buf[96];
+    if (!pc_guest_profile_file_path(NULL, pc_guest_profile_selected(), 0, buf, sizeof(buf))) {
+        snprintf(buf, sizeof(buf), "%s", PC_GUEST_PROFILE_PATH);
+    }
+    return buf;
+}
+
+const char* pc_guest_token_path(void) {
+    static char buf[96];
+    if (!pc_guest_profile_file_path(NULL, pc_guest_profile_selected(), 1, buf, sizeof(buf))) {
+        snprintf(buf, sizeof(buf), "%s", PC_GUEST_TOKEN_DEFAULT_PATH);
+    }
+    return buf;
+}
+
+int pc_guest_profile_read(const char* path, PCGuestProfile* out, char* err, size_t errcap) {
+    FILE* fp = fopen(path, "rb");
+    char text[PC_GUEST_PROFILE_MAX_FILE + 2];
+    char perr[256];
+    PCGuestProfile p;
+    size_t n;
+    if (fp == NULL) {
+        if (errno == ENOENT) {
+            return PC_GUEST_PROFILE_ABSENT;
+        }
+        set_err(err, errcap, "%s: cannot open the profile file (%s); it was not modified", path, strerror(errno));
+        return PC_GUEST_PROFILE_ERR;
+    }
+    n = fread(text, 1, sizeof(text) - 1, fp);
+    if (ferror(fp)) {
+        fclose(fp);
+        set_err(err, errcap, "%s: read error; the file was not modified%s", path, "");
+        return PC_GUEST_PROFILE_ERR;
+    }
+    fclose(fp);
+    if (n > PC_GUEST_PROFILE_MAX_FILE) {
+        set_err(err, errcap, "%s: the file is too large (more than 4096 bytes); it was not modified%s", path, "");
+        return PC_GUEST_PROFILE_ERR;
+    }
+    if (!pc_guest_profile_parse(text, n, &p, perr, sizeof(perr))) {
+        if (err != NULL && errcap > 0) {
+            snprintf(err, errcap, "%s: %s (the file was preserved unchanged; fix it, or delete it to get a NEW guest identity)", path, perr);
+        }
+        return PC_GUEST_PROFILE_ERR;
+    }
+    *out = p;
+    return PC_GUEST_PROFILE_LOADED;
+}
+
+static int streq_ci(const char* a, const char* b) {
+    for (; *a != '\0' && *b != '\0'; a++, b++) {
+        if (lower_c(*a) != lower_c(*b)) {
+            return 0;
+        }
+    }
+    return *a == *b;
+}
+
+void pc_guest_profile_default_name(const char* profile, uint16_t id, char* out) {
+    char base[PC_GUEST_PROFILE_NAME_LEN + 1];
+    PCGuestProfile t;
+    size_t n = profile != NULL ? strlen(profile) : 0;
+    if (n > PC_GUEST_PROFILE_NAME_LEN) {
+        n = PC_GUEST_PROFILE_NAME_LEN;
+    }
+    memcpy(base, profile != NULL ? profile : "", n);
+    base[n] = '\0';
+    memset(&t, 0, sizeof(t));
+    memcpy(t.name, base, n + 1);
+    memcpy(t.home_town, PC_GUEST_PROFILE_DEFAULT_HOME, sizeof(PC_GUEST_PROFILE_DEFAULT_HOME));
+    t.player_id = 1;
+    t.land_id = 1;
+    /* the profile name cut to 8 characters, unless it is not a valid guest name, is SERVER (any case: the reserved name is an exact match, a look-alike is just
+     * confusing) or is the default profile's own name "Guest" (two guests of a town may not share a name): then "Guest" + 2 hex digits of the id */
+    if (n == 0 || !pc_guest_profile_validate(&t, NULL, NULL) || streq_ci(base, "SERVER") || streq_ci(base, PC_GUEST_PROFILE_DEFAULT_NAME)) {
+        snprintf(out, PC_GUEST_PROFILE_NAME_LEN + 1, "Guest%02X", (unsigned)(id & 0xFFu));
+        return;
+    }
+    memcpy(out, base, n + 1);
+}
+
+static int sibling_conflict(const PCGuestProfile* c, const PCGuestProfile* sib, int nsib) {
+    int k;
+    for (k = 0; k < nsib; k++) {
+        if (streq_ci(c->name, sib[k].name)) {
+            return 1; /* the host refuses a NEW guest whose name equals another guest's in the town */
+        }
+        if (strcmp(c->home_town, sib[k].home_town) == 0 && c->player_id == sib[k].player_id && c->land_id == sib[k].land_id && strcmp(c->name, sib[k].name) == 0) {
+            return 1; /* the full identity (name, home town, ids) is the host's guest key */
+        }
+    }
+    return 0;
+}
+
+int pc_guest_profile_make_unique(const char* profile, const PCGuestProfile* sib, int nsib, PCGuestProfile* out) {
+    int attempt;
+    for (attempt = 0; attempt < PROFILE_ID_DRAWS; attempt++) {
+        PCGuestProfile p;
+        memset(&p, 0, sizeof(p));
+        memcpy(p.home_town, PC_GUEST_PROFILE_DEFAULT_HOME, sizeof(PC_GUEST_PROFILE_DEFAULT_HOME));
+        if (!random_id(&p.player_id) || !random_id(&p.land_id)) {
+            return 0;
+        }
+        pc_guest_profile_default_name(profile, p.player_id, p.name);
+        if (sibling_conflict(&p, sib, nsib)) {
+            /* the profile-name based name collides with a sibling: use the id based fallback name for this draw, else draw again */
+            snprintf(p.name, sizeof(p.name), "Guest%02X", (unsigned)(p.player_id & 0xFFu));
+            if (sibling_conflict(&p, sib, nsib)) {
+                continue;
+            }
+        }
+        {
+            const uint32_t h = identity_hash(&p);
+            p.gender = (int)((h >> 31) & 1u);
+            p.face = (int)((h >> 16) & 7u);
+        }
+        if (!pc_guest_profile_validate(&p, NULL, NULL)) {
+            continue;
+        }
+        *out = p;
+        return 1;
+    }
+    return 0;
+}
+
+/* the file names that count as profiles of a directory: guest.ini and guest_<x>.ini */
+static int sibling_file_name(const char* nm) {
+    const size_t len = strlen(nm);
+    return streq_ci(nm, "guest.ini") || (len > 10 && strncmp(nm, "guest_", 6) == 0 && streq_ci(nm + len - 4, ".ini"));
+}
+
+static int sibling_take(const char* dir, const char* nm, PCGuestProfile* sib, int n) {
+    char full[560], err[400];
+    PCGuestProfile p;
+    snprintf(full, sizeof(full), "%s/%s", dir, nm);
+    if (pc_guest_profile_read(full, &p, err, sizeof(err)) == PC_GUEST_PROFILE_LOADED) {
+        sib[n] = p;
+        return 1;
+    }
+    fprintf(stderr, "[PC] guest profile: sibling profile skipped (not readable / not a valid profile): %s\n", err);
+    return 0;
+}
+
+/* the sibling profiles of `dir` except the file `self_file`; read-only, an unreadable / invalid one is skipped with a warning */
+static int scan_siblings(const char* dir, const char* self_file, PCGuestProfile* sib, int cap) {
+    int n = 0;
+#ifdef _WIN32
+    char pat[512];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof(pat), "%s/guest*.ini", dir);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && n < cap && !streq_ci(fd.cFileName, self_file) && sibling_file_name(fd.cFileName)) {
+            n += sibling_take(dir, fd.cFileName, sib, n);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir);
+    struct dirent* de;
+    if (d == NULL) {
+        return 0;
+    }
+    while ((de = readdir(d)) != NULL && n < cap) {
+        if (!streq_ci(de->d_name, self_file) && sibling_file_name(de->d_name)) {
+            n += sibling_take(dir, de->d_name, sib, n);
+        }
+    }
+    closedir(d);
+#endif
+    return n;
+}
+
+int pc_guest_profile_load_or_create_in(const char* dir, const char* profile, PCGuestProfile* out, char* err, size_t errcap) {
+    char path[512], self[64], fmt[PC_GUEST_PROFILE_MAX_FILE];
+    PCGuestProfile sib[PROFILE_MAX_SIBLINGS];
+    PCGuestProfile p;
+    int r, nsib;
+    size_t n;
+    if (dir == NULL) {
+        dir = PC_GUEST_PROFILE_DIR;
+    }
+    if (profile == NULL || profile[0] == '\0') {
+        if (!pc_guest_profile_file_path(dir, NULL, 0, path, sizeof(path))) {
+            set_err(err, errcap, "the profile directory path is too long%s", "", NULL);
+            return PC_GUEST_PROFILE_ERR;
+        }
+        return pc_guest_profile_load_or_create(path, out, err, errcap);
+    }
+    if (err != NULL && errcap > 0) {
+        err[0] = '\0';
+    }
+    if (!pc_guest_profile_name_check(profile, err, errcap)) {
+        return PC_GUEST_PROFILE_ERR;
+    }
+    if (!pc_guest_profile_file_path(dir, profile, 0, path, sizeof(path))) {
+        set_err(err, errcap, "the profile path is too long%s", "", NULL);
+        return PC_GUEST_PROFILE_ERR;
+    }
+    r = pc_guest_profile_read(path, &p, err, errcap);
+    if (r != PC_GUEST_PROFILE_ABSENT) {
+        if (r == PC_GUEST_PROFILE_LOADED) {
+            *out = p;
+        }
+        return r;
+    }
+    /* a NEW profile: unique among its siblings, then the atomic create */
+    pc_guest_profile_file_path(".", profile, 0, self, sizeof(self)); /* "./guest_<x>.ini": only the file name part is used */
+    nsib = scan_siblings(dir, self + 2, sib, PROFILE_MAX_SIBLINGS);
+    if (!pc_guest_profile_make_unique(profile, sib, nsib, &p)) {
+        set_err(err, errcap, "%s: no unique guest identity could be drawn (random source failed or too many collisions)%s", path, "");
+        return PC_GUEST_PROFILE_ERR;
+    }
+    n = pc_guest_profile_format(&p, fmt, sizeof(fmt));
+    if (n == 0 || !write_atomic(path, fmt, n)) {
+        set_err(err, errcap, "%s: cannot create the profile file (is the directory writable?)%s", path, "");
+        return PC_GUEST_PROFILE_ERR;
+    }
+    *out = p;
+    return PC_GUEST_PROFILE_CREATED;
+}
+
+int pc_guest_profile_load_or_create_selected(PCGuestProfile* out, char* err, size_t errcap) {
+    return pc_guest_profile_load_or_create_in(NULL, pc_guest_profile_selected(), out, err, errcap);
+}
+
+int pc_guest_profile_read_selected(PCGuestProfile* out, char* err, size_t errcap) {
+    return pc_guest_profile_read(pc_guest_profile_selected_path(), out, err, errcap);
 }

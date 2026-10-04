@@ -1607,7 +1607,8 @@ void pc_bootstrap_guest_poll(void) {
 }
 
 /* Guests G3.2: the title-menu "Join as Guest" item (src/actor/ac_animal_logo.c, PC_ENHANCEMENTS). Client-only: the item is visible for any --connect client. The label
- * carries the guest name once the profile (save/mp/guest.ini) could be read; a missing profile is created like --guest does, a broken one never touched. */
+ * carries the guest name once the SELECTED profile (save/mp/guest.ini, or save/mp/guest_<name>.ini with --guest-profile) could be read; a missing profile is only READ
+ * (label "Join as Guest (new profile)", nothing is created by drawing the menu) and created when the player joins; a broken one is never touched. */
 int pc_guest_title_item_visible(void) {
     return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT;
 }
@@ -1617,8 +1618,12 @@ const char* pc_guest_title_label(void) {
         PCGuestProfile gp;
         char perr[512];
         s_pc_guest_title_label_done = 1; /* read once; the click re-reads the file */
-        if (pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, perr, sizeof(perr)) != PC_GUEST_PROFILE_ERR) {
+        /* READ ONLY: drawing the menu never creates the profile (that happens only when the player joins: pc_guest_title_join / --guest) */
+        const int rres = pc_guest_profile_read_selected(&gp, perr, sizeof(perr));
+        if (rres == PC_GUEST_PROFILE_LOADED) {
             snprintf(s_pc_guest_title_label, sizeof(s_pc_guest_title_label), "Join as Guest (%s)", gp.name);
+        } else if (rres == PC_GUEST_PROFILE_ABSENT) {
+            snprintf(s_pc_guest_title_label, sizeof(s_pc_guest_title_label), "Join as Guest (new profile)");
         } else {
             OSReport("[PC] join-as-guest: the guest profile is not usable yet: %s\n", perr);
         }
@@ -1653,11 +1658,12 @@ int pc_guest_title_join(void) {
         pc_guest_title_fail("only a network client (--connect) can join as a guest");
         return 0;
     }
-    gres = pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, perr, sizeof(perr));
+    gres = pc_guest_profile_load_or_create_selected(&gp, perr, sizeof(perr)); /* the SELECTED profile (--guest-profile), created only here */
     if (gres == PC_GUEST_PROFILE_ERR) {
         pc_guest_title_fail(perr);
         return 0;
     }
+    s_pc_guest_title_label_done = 0; /* the label is re-read (it shows the name of a just created profile if this join fails and the title stays) */
     if (!pc_guest_profile_spec(&gp, spec, sizeof(spec))) {
         pc_guest_title_fail("internal error: the guest profile does not fit the spec buffer");
         return 0;

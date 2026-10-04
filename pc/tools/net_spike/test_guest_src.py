@@ -331,7 +331,7 @@ def main():
     ck("K IDENTITY_TOKEN is honoured only after a guest claim; a DIFFERENT token than the one presented REFUSES the host (shutdown, with reset instructions); first contact persists it "
        "(pc_mp_gtoken_put + save); a failed save is loud",
        "!s_client_guest_claim_sent" in it and "memcmp(m.token, s_client_ext_sent.token, PC_NETGAME_GUEST_TOKEN_LEN) != 0" in it and "pc_net_game_shutdown();" in it
-       and "pc_mp_gtoken_put(&s_client_gtk, &e)" in it and "pc_mp_gtoken_save(PC_MP_GUEST_TOKEN_PATH, &s_client_gtk)" in it and "could NOT save the guest token" in it
+       and "pc_mp_gtoken_put(&s_client_gtk, &e)" in it and "pc_mp_gtoken_save(pc_guest_token_path(), &s_client_gtk)" in it and "could NOT save the guest token" in it
        and "To start over delete" in it)
     ck("K the token file is looked up by (host TOWN identity, home PersonalID) BEFORE the ACK names the host; it is client metadata, never a GCI",
        "pc_mp_gtoken_find(&s_client_gtk, town->land_name, town->land_id, town->terrain_hash, home_be)" in fb("pcnetgame_client_build_ext") and ".gci" not in fb("pcnetgame_client_build_ext")

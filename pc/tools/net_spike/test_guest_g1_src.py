@@ -275,7 +275,7 @@ def main():
        all(not os.popen('git -C "%s" diff --name-only HEAD -- %s' % (ROOT, f)).read().strip() for f in ("pc/src/pc_save_bswap.c", "src/game/m_private.c",
                                                                                                          "src/game/m_needlework.c", "include/m_private.h")))
     eol_ok = True
-    for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", True), ("pc/src/pc_main.c", True), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
+    for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", False), ("pc/src/pc_main.c", False), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
                       ("pc/tools/net_spike/net_spike_lib.py", False), ("pc/tools/net_spike/test_guest_protocol.py", False), ("pc/tools/net_spike/test_guest_real_client.py", False), ("pc/tools/net_spike/test_guest_bootstrap_cli.py", False),
                       ("pc/tools/net_spike/test_guest_persist.py", False), ("pc/tools/net_spike/test_guest_src.py", False), ("pc/tools/net_spike/test_guest_g1_src.py", False),
                       ("pc/tools/net_spike/mp_guests_selftest.c", False)):
