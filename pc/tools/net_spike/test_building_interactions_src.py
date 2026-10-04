@@ -86,8 +86,22 @@ def main():
     check("hidden_door timeout constant is 600 frames", re.search(r"HIDDEN_DOOR_TIMEOUT_FRAMES\s+600\.0", rp) is not None)
 
     dw = func(rp, "static void pc_remote_player_dw(")
-    check("dw: hides on hidden body, pending snap_req and outside the local field scene",
-          "pc_remote_player_body_hidden(self)" in dw and "slot->snap_req" in dw and "pc_remote_player_scene_is_local_field(slot" in dw)
+    check("dw: hides on hidden body, pending snap_req and outside the shown scene (field, or the same shared interior)",
+          "pc_remote_player_body_hidden(self)" in dw and "slot->snap_req" in dw and "pc_remote_player_scene_is_local_shown(slot" in dw)
+    check("dw: interior presence hides a stale ghost (no MOVE for ACTION_GAP_FRAMES)",
+          re.search(r"!pc_remote_player_scene_is_local_field\(slot[^{]*last_move_recv_local_frame\) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES", dw, re.S) is not None)
+    shown = func(rp, "static int pc_remote_player_scene_is_local_shown(")
+    check("shown predicate: field rule OR same non-cottage interior scene id + owner as the local scene, field-less kinds refused",
+          "pc_remote_player_scene_is_local_field(slot, play)" in shown and "pc_net_game_get_local_scene(&ls)" in shown and
+          "SCENE_COTTAGE_MY" in shown and "SCENE_COTTAGE_NPC" in shown and "ls.scene_id == sid" in shown and "play->scene_id == sid" in shown and
+          "ls.owner == slot->scene.owner" in shown and "PC_NETSCENE_KIND_OTHER_INTERIOR" in shown and "default:" in shown)
+    check("the shown predicate is used ONLY in dw (collision, fx, arrival train, door pick/wrapper stay field-only)",
+          rp.count("pc_remote_player_scene_is_local_shown(") == 2 and "pc_remote_player_scene_is_local_shown(" in dw and
+          all("pc_remote_player_scene_is_local_shown" not in func(rp, sig) for sig in
+              ("static const char* pc_remote_player_collide_eval(", "static void pc_remote_player_arrival_train_poll(",
+               "static int pc_remote_player_door_pick(", "static void pc_remote_player_cosmetic_door(")))
+    check("row_post: hidden_door is not set once the owner's announced scene is an interior",
+          "hs->scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD" in post and "!hs->scene.valid" in post)
     fxg = rp.count("pc_remote_player_body_hidden(self)")
     check("fx gates (2) + dw + collision use the shared hidden test", fxg >= 4)
     check("collision holds for KNOCK_DOOR / DOOR / OUTDOOR rows, hidden bodies and a pending scene event",

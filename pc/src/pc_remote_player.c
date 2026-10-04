@@ -75,6 +75,7 @@
 #include "pc_remote_arrival_logic.h"  /* T3 / T4: pure per-puppet latch + DEMO_WALK mapping (natively tested) */
 #endif
 #include "m_kankyo.h"        /* M9-C Phase 3: mEnv_NowWeather(), mEnv_WEATHER_* (caller-side effect guard) */
+#include "m_scene_table.h"   /* interiors: SCENE_* ids (shared-interior presence, door class of the scene the owner just left) */
 #define PC_REMOTE_PLAYER_HAVE_EEC_ENUM 1
 #include "audio.h" /* Stage 4B.1: sAdo_OngenTrgStart() -- see the TURN_DASH skid sound in
                      * pc_remote_player_mv(). Already #include'd elsewhere in pc/ (e.g.
@@ -193,6 +194,7 @@ typedef struct PCRemotePlayerVisual {
     int                   hidden_door;         /* building interactions: a HIDE_AT_END row (DOOR) finished: the puppet has walked in, do not draw it */
     double                hidden_door_since;   /* graph_dt_frame_time() when hidden_door was set (600 frame timeout) */
     double                door_cosm_time;      /* building doors: row_start_time of the DOOR/OUTDOOR run whose cosmetic building door was already tried (once, no retry) */
+    int                   door_cls;            /* building doors: PC_DOOR_* class picked for that run (door_cosm_time): selects the clip (hinged vs shop type) */
     int                   train_standing_latched; /* T4: this puppet's current 'standing in the train' period was already evaluated
                                                    * for a local arrival train (cleared when the state ends; zero at creation) */
 } PCRemotePlayerVisual;
@@ -481,6 +483,8 @@ typedef struct PCRemotePlayerSlot {
     int                snap_req;           /* building interactions: a scene event was accepted; the puppet stays hidden and its snapshot ring is
                                              * trimmed to samples received after scene_accept_frame before it is placed again */
     double             scene_accept_frame; /* graph_dt_frame_time() when that scene event was accepted */
+    uint8_t            prev_scene_id;      /* scene id the player was announced in before the current one (0 = unknown: SCENE_TEST1 is never
+                                             * announced); lets an OUTDOOR row know which interior the owner just left */
     int                latch_clear_req;    /* M9-C v7: the player's scene presence changed -> the puppet drops any one-shot
                                              * latch at its next move (consumed by pc_remote_player_row_pre) */
     PCRemotePlayerCosStats cos_stats;      /* M9-C Phase 3: cosmetic counters (diag) */
@@ -1110,9 +1114,9 @@ static const PCStateRow s_state_rows[mPlayer_INDEX_NUM] = {
     [mPlayer_INDEX_TURN_DASH] = PCFB("locomotion basic: move_state TURN_DASH -> RUN_SLIP1 at fixed 0.5 + skid sound (Stage 4B.1, turn_dash.c_inc)"),
     [mPlayer_INDEX_FALL] = PCFB("m_player_main_fall.c_inc:26-28: WAIT1 REPEAT 0.5 + item pose = idle fallback (airborne stand; position synced by MOVE)"),
     [mPlayer_INDEX_WADE] = PCFB("m_player_main_wade.c_inc:32-34: WAIT1 REPEAT 0.5 + item pose = idle fallback (the slide across the wade tiles is position-synced)"),
-    /* DOOR 4 (m_player_main_door.c_inc:22-37): clip OPEN1 (type 0, houses) or INTO_S1 (shops) on BOTH layers (no item pose), STOP 0.5, morph -9, ct_base TRANS_XZ|ROT_Y (flags 5) with Set_base_shape_trs(0,1000,0,0,0,0x4000): the walk-in is the synced position, so the row pins the clip root (ROOT_PIN); the door type is not on the wire: OPEN1 is shown. The puppet is hidden when the clip ends (HIDE_AT_END); the building actor's own door open/close is not synced. */
+    /* DOOR 4 (m_player_main_door.c_inc:22-37): clip OPEN1 (type 0, houses) or INTO_S1 (shops) on BOTH layers (no item pose), STOP 0.5, morph -9, ct_base TRANS_XZ|ROT_Y (flags 5) with Set_base_shape_trs(0,1000,0,0,0,0x4000): the walk-in is the synced position, so the row pins the clip root (ROOT_PIN). The door type is not on the wire: the table clip is OPEN1 (hinged buildings); row_start swaps it for INTO_S1 when the nearest door point in the town is a type-1 (shop-style) building (pc_remote_player_door_pick). The puppet is hidden when the clip ends (HIDE_AT_END); the building actor's own door open/close is not synced. */
     [mPlayer_INDEX_DOOR] = PCROW("door", mPlayer_ANIM_OPEN1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN | PC_ROWF_HIDE_AT_END, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
-    /* OUTDOOR 5 (m_player_main_outdoor.c_inc:23-43): GO_OUT_O1 (GO_OUT_S1 for the start demo) on BOTH layers, STOP 0.5, start frame 25 (type 0) or 1; NO ct_base: world.position stays where the state put it and the clip's own root translation walks the body out. Start frame 1.0 (the type is not on the wire). The row is SCENE_ENTRY: it starts when the puppet re-appears in the town and is not released by that scene change. */
+    /* OUTDOOR 5 (m_player_main_outdoor.c_inc:23-43): GO_OUT_O1 (GO_OUT_S1 for the start demo) on BOTH layers, STOP 0.5, start frame 25 (type 0) or 1; NO ct_base: world.position stays where the state put it and the clip's own root translation walks the body out. Start frame 1.0 / GO_OUT_O1 is the table default (the type is not on the wire): row_start overrides it from the interior the owner just left or the nearest door point: shop-style buildings GO_OUT_S1 from frame 1, hinged buildings GO_OUT_O1 from frame 25 (pc_remote_player_door_pick). The row is SCENE_ENTRY: it starts when the puppet re-appears in the town and is not released by that scene change. */
     [mPlayer_INDEX_OUTDOOR] = PCROW("outdoor", mPlayer_ANIM_GO_OUT_O1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_SCENE_ENTRY, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
     [mPlayer_INDEX_INVADE] = PCFB("m_player_main_invade.c_inc:19-20: WAIT1 REPEAT 0.5 + item pose (entering a building) = idle fallback"),
     [mPlayer_INDEX_HOLD] = PCFB("interior furniture grab: clip depends on furniture class (hold.c_inc:58,139-151 HOLD_WAIT1/_O1/_H1), not transmitted"),
@@ -1704,23 +1708,189 @@ static void pc_remote_player_bind_body(PCRemotePlayerVisual* v, int a0, int a1, 
 
 #ifdef TARGET_PC
 #define PC_REMOTE_PLAYER_DOOR_COSM_RADIUS 60.0f /* a puppet's door position must be this close to a building's door point */
+/* door class of a building / of the interior a player just left (PC_DOOR_UNKNOWN: keep the table clip) */
+#define PC_DOOR_UNKNOWN 0
+#define PC_DOOR_HINGED 1 /* vanilla door type 0: OPEN1 in, exit GO_OUT_O1 from frame 25 (houses, my house, post office, needlework, cottages) */
+#define PC_DOOR_SHOP 2   /* vanilla door type 1 (mPlib_request_main_door_type1(..., TRUE)): INTO_S1 in, exit GO_OUT_S1 from frame 1 */
 static int pc_remote_player_scene_is_local_field(const PCRemotePlayerSlot* slot, const GAME_PLAY* play);
 
-/* Building doors: a remote puppet that enters (main index DOOR) / leaves (OUTDOOR) a hinged-door building in the local town makes
- * that building play its door clip. Vanilla only animates for the local player (PLAYER_ACTOR door label), an NPC request or the
- * structure control's exit request, so a puppet would walk through a closed door. The building wrappers (aHUS/aMHS/aPOFF/aNW_pc_cosmetic_door)
- * only set that building's own request/animation fields and refuse a busy door (several puppets at one door: the first wins). Local scene
- * only (the puppet's announced scene is the shown town), never while a local exit is in progress. Called once per row instance. */
-static void pc_remote_player_cosmetic_door(PCRemotePlayerActor* self, int exit_row) {
+/* Door class of an interior scene id (the scene a player was announced in before it came back out into the town). Mapped by scene id, not by
+ * pc_net_game_scene_kind (SCENE_NEEDLEWORK is KIND_SHOP there but uses the hinged door). */
+static int pc_remote_player_door_class_of_scene(int scene_id) {
+    switch (scene_id) {
+        case SCENE_SHOP0:
+        case SCENE_CONVENI:
+        case SCENE_SUPER:
+        case SCENE_DEPART:
+        case SCENE_DEPART_2:
+        case SCENE_BROKER_SHOP:
+        case SCENE_MUSEUM_ENTRANCE:
+        case SCENE_MUSEUM_ROOM_PAINTING:
+        case SCENE_MUSEUM_ROOM_FOSSIL:
+        case SCENE_MUSEUM_ROOM_INSECT:
+        case SCENE_MUSEUM_ROOM_FISH:
+        case SCENE_POLICE_BOX:
+        case SCENE_KAMAKURA:
+        case SCENE_BUGGY:
+        case SCENE_LIGHTHOUSE:
+        case SCENE_TENT:
+            return PC_DOOR_SHOP;
+        case SCENE_MY_ROOM_S:
+        case SCENE_MY_ROOM_M:
+        case SCENE_MY_ROOM_L:
+        case SCENE_MY_ROOM_LL1:
+        case SCENE_MY_ROOM_LL2:
+        case SCENE_MY_ROOM_BASEMENT_S:
+        case SCENE_MY_ROOM_BASEMENT_M:
+        case SCENE_MY_ROOM_BASEMENT_L:
+        case SCENE_MY_ROOM_BASEMENT_LL1:
+        case SCENE_NPC_HOUSE:
+        case SCENE_POST_OFFICE:
+        case SCENE_NEEDLEWORK:
+        case SCENE_COTTAGE_MY:
+        case SCENE_COTTAGE_NPC:
+            return PC_DOOR_HINGED;
+        default:
+            return PC_DOOR_UNKNOWN;
+    }
+}
+
+/* World position of the door point of building `a` for an entry (exit_row 0: where the player stands when the door request is made) or an
+ * exit (exit_row 1: the exit_position the building writes into structure_exit_door_data). Returns the building's door class, or
+ * PC_DOOR_UNKNOWN for an actor that is not a door building. The hinged points are the ones the aHUS/aMHS/aPOFF/aNW wrappers measure from;
+ * the type-1 points are the pos of the building's mPlib_request_main_door_type1 call / its *_rewrite_out_data (ac_shop_move.c_inc:248 and :64,
+ * ac_conveni_move.c_inc:258 and :21, ac_super/ac_depart_move.c_inc:280 and :21, ac_museum.c:239 and :151, ac_police_box_move.c_inc:127 and :42,
+ * ac_br_shop_move.c_inc:~194 and :83, ac_buggy_move.c_inc:~246 and :98, ac_kamakura_move.c_inc:~168 and :95, ac_tent.c:~176 and :122,
+ * ac_toudai_move.c_inc:193 and :13). */
+static int pc_remote_player_door_point(const ACTOR* a, int exit_row, float* out_x, float* out_z) {
+    float wx = a->world.position.x;
+    float wz = a->world.position.z;
+    float hx = a->home.position.x;
+    float hz = a->home.position.z;
+
+    switch (a->id) {
+        case mAc_PROFILE_MYHOUSE: {
+            const STRUCTURE_ACTOR* sa = (const STRUCTURE_ACTOR*)a;
+            if (exit_row) {
+                *out_x = wx + (((sa->action & 1) != 0) ? -48.29f : 48.29f); /* aMHS_rewrite_pl_out_data */
+                *out_z = wz + 48.29f;
+            } else {
+                *out_x = sa->arg0_f; /* the point aMHS_check_player_sub measures from */
+                *out_z = sa->arg1_f;
+            }
+            return PC_DOOR_HINGED;
+        }
+        case mAc_PROFILE_HOUSE:
+            if (exit_row) {
+                *out_x = hx; /* aHUS_rewrite_out_data */
+                *out_z = hz + 60.0f;
+            } else {
+                *out_x = wx; /* house size 40, direction south: (size / 2 + 20) * direct_vector */
+                *out_z = wz + 40.0f;
+            }
+            return PC_DOOR_HINGED;
+        case mAc_PROFILE_POST_OFFICE:
+        case mAc_PROFILE_NEEDLEWORK_SHOP:
+            *out_x = wx - 40.0f * 0.70710678f; /* size 40, direction 5 (south west) */
+            *out_z = wz + 40.0f * 0.70710678f;
+            return PC_DOOR_HINGED;
+        case mAc_PROFILE_SHOP:
+            *out_x = wx + (exit_row ? -68.29f : -50.0f);
+            *out_z = wz + (exit_row ? 68.29f : 50.0f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_CONVENI:
+            *out_x = wx + (exit_row ? -42.0f : -25.0f);
+            *out_z = wz + (exit_row ? 98.57f : 82.5f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_SUPER:
+        case mAc_PROFILE_DEPART:
+            *out_x = wx + (exit_row ? -62.0f : -45.0f);
+            *out_z = wz + (exit_row ? 118.57f : 102.5f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_MUSEUM:
+            *out_x = exit_row ? hx : wx;
+            *out_z = exit_row ? hz + 120.0f : wz + 100.0f;
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_POLICE_BOX:
+            *out_x = exit_row ? hx + 60.0f : wx + 50.0f;
+            *out_z = exit_row ? hz + 60.0f : wz + 50.0f;
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_BRSHOP:
+        case mAc_PROFILE_BUGGY:
+            *out_x = wx;
+            *out_z = wz + (exit_row ? 100.0f : 64.0f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_KAMAKURA:
+        case mAc_PROFILE_TENT:
+            *out_x = wx;
+            *out_z = wz + (exit_row ? 86.0f : 68.0f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_TOUDAI:
+            *out_x = wx;
+            *out_z = wz + (exit_row ? -70.0f : -60.0f);
+            return PC_DOOR_SHOP;
+        default:
+            return PC_DOOR_UNKNOWN;
+    }
+}
+
+/* Which kind of building door a remote puppet's DOOR (entry) / OUTDOOR (exit) row belongs to: the nearest door point of the right kind
+ * (entry or exit) of a building of the local town within PC_REMOTE_PLAYER_DOOR_COSM_RADIUS of the puppet. For an exit the interior the owner
+ * just left (slot->prev_scene_id) fixes the class when it is known (the geometry then only picks the building); an unknown previous scene
+ * falls back to the nearest door point of either class. Returns PC_DOOR_UNKNOWN (keep the table clip) when the puppet is not in the shown
+ * town or nothing is near. *out_best is the nearest building of that class within the radius, or NULL. Reads only. */
+static int pc_remote_player_door_pick(PCRemotePlayerActor* self, int exit_row, ACTOR** out_best) {
     GAME_PLAY* play = (GAME_PLAY*)gamePT;
     PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
-    STRUCTURE_CONTROL_ACTOR* ctrl;
     ACTOR* a;
     ACTOR* best = NULL;
+    int best_cls = PC_DOOR_UNKNOWN;
+    int want = PC_DOOR_UNKNOWN;
     float best_d2 = PC_REMOTE_PLAYER_DOOR_COSM_RADIUS * PC_REMOTE_PLAYER_DOOR_COSM_RADIUS;
     float px = ((ACTOR*)self)->world.position.x;
     float pz = ((ACTOR*)self)->world.position.z;
 
+    *out_best = NULL;
+    if (slot == NULL || play == NULL || !pc_remote_player_scene_is_local_field(slot, play)) {
+        return PC_DOOR_UNKNOWN;
+    }
+    if (exit_row) {
+        want = pc_remote_player_door_class_of_scene((int)slot->prev_scene_id);
+    }
+    for (a = play->actor_info.list[ACTOR_PART_ITEM].actor; a != NULL; a = a->next_actor) {
+        float x, z, dx, dz, d2;
+        int cls = pc_remote_player_door_point(a, exit_row, &x, &z);
+
+        if (cls == PC_DOOR_UNKNOWN || (want != PC_DOOR_UNKNOWN && cls != want)) {
+            continue;
+        }
+        dx = px - x;
+        dz = pz - z;
+        d2 = dx * dx + dz * dz;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = a;
+            best_cls = cls;
+        }
+    }
+    *out_best = best;
+    return (best != NULL) ? best_cls : want; /* a known previous scene decides the clip even if the building is not found */
+}
+
+/* Building doors: a remote puppet that enters (main index DOOR) / leaves (OUTDOOR) a HINGED-door building in the local town makes that
+ * building play its door clip (door_pick found it). Vanilla only animates for the local player (PLAYER_ACTOR door label), an NPC request or
+ * the structure control's exit request, so a puppet would walk through a closed door. The building wrappers (aHUS/aMHS/aPOFF/aNW_pc_cosmetic_door)
+ * only set that building's own request/animation fields and refuse a busy door (several puppets at one door: the first wins). Shop-style
+ * (type-1) buildings have no cosmetic door clip. Local scene only, never while a scene event waits for its first fresh MOVE, never while a
+ * local exit is in progress. Called once per row instance. */
+static void pc_remote_player_cosmetic_door(PCRemotePlayerActor* self, int exit_row, int cls, ACTOR* best) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
+    STRUCTURE_CONTROL_ACTOR* ctrl;
+
+    if (cls != PC_DOOR_HINGED || best == NULL) {
+        return;
+    }
     if (slot == NULL || play == NULL || slot->snap_req || !pc_remote_player_scene_is_local_field(slot, play)) {
         return;
     }
@@ -1730,44 +1900,6 @@ static void pc_remote_player_cosmetic_door(PCRemotePlayerActor* self, int exit_r
     ctrl = (STRUCTURE_CONTROL_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_STRUCTURE, ACTOR_PART_CONTROL);
     if (ctrl != NULL && ctrl->str_door_name != EMPTY_NO) {
         return; /* a local exit request is still pending */
-    }
-    for (a = play->actor_info.list[ACTOR_PART_ITEM].actor; a != NULL; a = a->next_actor) {
-        float dx, dz, d2;
-        float x, z;
-
-        if (a->id == mAc_PROFILE_MYHOUSE) {
-            const STRUCTURE_ACTOR* sa = (const STRUCTURE_ACTOR*)a;
-            if (exit_row) {
-                x = a->world.position.x + (((sa->action & 1) != 0) ? -48.29f : 48.29f); /* aMHS_rewrite_pl_out_data */
-                z = a->world.position.z + 48.29f;
-            } else {
-                x = sa->arg0_f; /* the point aMHS_check_player_sub measures from */
-                z = sa->arg1_f;
-            }
-        } else if (a->id == mAc_PROFILE_HOUSE) {
-            if (exit_row) {
-                x = a->home.position.x; /* aHUS_rewrite_out_data */
-                z = a->home.position.z + 60.0f;
-            } else {
-                x = a->world.position.x; /* house size 40, direction south: (size / 2 + 20) * direct_vector */
-                z = a->world.position.z + 40.0f;
-            }
-        } else if (a->id == mAc_PROFILE_POST_OFFICE || a->id == mAc_PROFILE_NEEDLEWORK_SHOP) {
-            x = a->world.position.x - 40.0f * 0.70710678f; /* size 40, direction 5 (south west) */
-            z = a->world.position.z + 40.0f * 0.70710678f;
-        } else {
-            continue;
-        }
-        dx = px - x;
-        dz = pz - z;
-        d2 = dx * dx + dz * dz;
-        if (d2 < best_d2) {
-            best_d2 = d2;
-            best = a;
-        }
-    }
-    if (best == NULL) {
-        return;
     }
     if (best->id == mAc_PROFILE_MYHOUSE) {
         aMHS_pc_cosmetic_door(best, exit_row);
@@ -1792,6 +1924,7 @@ static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const 
     int pt = row->part_table;
     int cont;
     f32 f0;
+    f32 start_frame = row->start_frame;
 
     if (mPlib_Get_Pointer_Animation(a0) == NULL) {
         return 0;
@@ -1812,6 +1945,33 @@ static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const 
             a1 = a0;
         }
     }
+#ifdef TARGET_PC
+    if (idx == (int)mPlayer_INDEX_DOOR || idx == (int)mPlayer_INDEX_OUTDOOR) {
+        /* building doors: once per row instance (door_cosm_time latch) pick the door class, make a hinged building play its door clip, then
+         * swap the table clip for the shop-style one (type-1 door: INTO_S1 in, GO_OUT_S1 from frame 1 out) or the hinged exit start (GO_OUT_O1
+         * from frame 25). PC_DOOR_UNKNOWN keeps the table clip. */
+        int exit_row = (idx == (int)mPlayer_INDEX_OUTDOOR);
+
+        if (v->door_cosm_time != now) {
+            ACTOR* door_best = NULL;
+
+            v->door_cosm_time = now;
+            v->door_cls = pc_remote_player_door_pick(self, exit_row, &door_best);
+            pc_remote_player_cosmetic_door(self, exit_row, v->door_cls, door_best);
+        }
+        if (v->door_cls == PC_DOOR_SHOP) {
+            int alt = exit_row ? (int)mPlayer_ANIM_GO_OUT_S1 : (int)mPlayer_ANIM_INTO_S1;
+
+            if (mPlib_Get_Pointer_Animation(alt) != NULL) {
+                a0 = alt;
+                a1 = alt;
+                start_frame = 1.0f;
+            }
+        } else if (v->door_cls == PC_DOOR_HINGED && exit_row) {
+            start_frame = 25.0f; /* vanilla type 0 outdoor (m_player_main_outdoor.c_inc:35-37) */
+        }
+    }
+#endif
     if (row->flags & PC_ROWF_PT_FROM_ANIM1) {
         pt = mPlib_Get_BasicPartTableIndex_fromAnimeIndex(a1);
     }
@@ -1826,7 +1986,7 @@ static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const 
     cont = (row->flags & PC_ROWF_BODY_CONTINUE) && prev_active && v->current_anim_idx == a0 &&
            v->current_anim1_idx == a1;
     if (!cont) {
-        f0 = ((row->flags & PC_ROWF_BODY_CARRY) && prev_active) ? v->keyframe0.frame_control.current_frame : row->start_frame;
+        f0 = ((row->flags & PC_ROWF_BODY_CARRY) && prev_active) ? v->keyframe0.frame_control.current_frame : start_frame;
         pc_remote_player_bind_body(v, a0, a1, f0, row->speed, row->mode);
     }
     if (pt != v->current_part_table) {
@@ -1853,12 +2013,6 @@ static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const 
     v->row_pending = 0;
     v->row_start_time = now;
     v->row_adopted = 0;
-#ifdef TARGET_PC
-    if ((idx == (int)mPlayer_INDEX_DOOR || idx == (int)mPlayer_INDEX_OUTDOOR) && v->door_cosm_time != now) {
-        v->door_cosm_time = now; /* once per row instance, no retry */
-        pc_remote_player_cosmetic_door(self, idx == (int)mPlayer_INDEX_OUTDOOR);
-    }
-#endif
     v->item_hidden = 0; /* no row hides the carried item (the HIDE row hides the whole body via PC_ROWF_HIDE_BODY) */
     v->item_restart = 1;
     v->item_carry_ok = prev_active;
@@ -2068,8 +2222,15 @@ static void pc_remote_player_row_post(PCRemotePlayerActor* self, int play_state,
         } else {
             v->row_finished = 1;
             if ((row->flags & PC_ROWF_HIDE_AT_END) && !v->hidden_door) {
-                v->hidden_door = 1; /* the body is inside the building: never left standing outside the door */
-                v->hidden_door_since = now;
+                /* the body is inside the building: never left standing outside the door. Not once the owner's announced scene is already
+                 * an interior (shared-interior presence): the scene gate in dw decides there, and the flag would keep a puppet that
+                 * legitimately shares the local player's interior invisible until the (already consumed) scene clear. */
+                const PCRemotePlayerSlot* hs = pc_remote_player_get_slot(self->peer);
+
+                if (hs == NULL || !hs->scene.valid || hs->scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD) {
+                    v->hidden_door = 1;
+                    v->hidden_door_since = now;
+                }
             }
         }
     }
@@ -2138,6 +2299,43 @@ static int pc_remote_player_scene_is_local_field(const PCRemotePlayerSlot* slot,
     return slot->scene.valid && slot->scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD &&
            (slot->scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) && slot->scene.scene_id == (uint8_t)play->scene_id &&
            pc_net_game_scene_kind((int)play->scene_id) == PC_NETSCENE_KIND_FIELD;
+}
+
+/* Interiors: the puppet may be DRAWN (dw only) when the field rule holds, or when it and the local player are in the very same shared
+ * interior: both announced scenes are the same non-cottage interior scene id with the same owner (player room / NPC house owner id; 0 for the
+ * one-instance-per-town shops, post office, police box, museum, depart floors, needlework, kamakura, buggy, lighthouse, tent) and that scene is the
+ * one the local GAME_PLAY runs. Cottages (island, not shared: COTTAGE_MY/NPC owner is forced to 0) never match. Collision, effects, sounds, the
+ * arrival-train poll and the cosmetic building doors keep the field-only rule (pc_remote_player_scene_is_local_field). */
+static int pc_remote_player_scene_is_local_shown(const PCRemotePlayerSlot* slot, const GAME_PLAY* play) {
+    PCNetPlayerScene ls;
+    int sid;
+
+    if (pc_remote_player_scene_is_local_field(slot, play)) {
+        return 1;
+    }
+    if (!slot->scene.valid) {
+        return 0;
+    }
+    switch ((PCNetSceneKind)slot->scene.kind) {
+        case PC_NETSCENE_KIND_SHOP:
+        case PC_NETSCENE_KIND_POST_OFFICE:
+        case PC_NETSCENE_KIND_POLICE:
+        case PC_NETSCENE_KIND_MUSEUM:
+        case PC_NETSCENE_KIND_PLAYER_HOUSE:
+        case PC_NETSCENE_KIND_VILLAGER_HOUSE:
+        case PC_NETSCENE_KIND_OTHER_INTERIOR:
+            break;
+        default:
+            return 0;
+    }
+    sid = (int)slot->scene.scene_id;
+    if (sid == SCENE_COTTAGE_MY || sid == SCENE_COTTAGE_NPC) {
+        return 0;
+    }
+    if (!pc_net_game_get_local_scene(&ls)) {
+        return 0;
+    }
+    return (int)ls.scene_id == sid && (int)play->scene_id == sid && ls.owner == slot->scene.owner;
 }
 
 /* M9-B: decides whether this puppet's collision pipe is registered this frame. Returns NULL = arm; "hold" = a
@@ -4658,8 +4856,12 @@ static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
     /* Building interactions: a puppet is shown only while its announced scene is the town this process shows (the owner's
      * MOVEs from inside a building carry interior coordinates: an interior is never shared), and not while a scene event
      * still waits for its first fresh MOVE. */
-    if (slot->snap_req || !pc_remote_player_scene_is_local_field(slot, (GAME_PLAY*)game)) {
+    if (slot->snap_req || !pc_remote_player_scene_is_local_shown(slot, (GAME_PLAY*)game)) {
         return;
+    }
+    if (!pc_remote_player_scene_is_local_field(slot, (GAME_PLAY*)game) && gamePT != NULL &&
+        (graph_dt_frame_time(gamePT) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+        return; /* interior presence: the owner stopped sending MOVE (e.g. an unannounced scene such as the save screen): no stale ghost */
     }
 
     /* Per-frame scratch matrices, exactly like the inventory preview (mIV_pl_shape_draw) --
@@ -4742,6 +4944,7 @@ static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot, int keep_sce
      * BEFORE the in_use early-out: no stale interior presence may survive a disconnect. */
     if (!keep_scene) {
         memset(&slot->scene, 0, sizeof(slot->scene));
+        slot->prev_scene_id = 0;
     }
     if (!slot->in_use) {
         return;
@@ -4797,6 +5000,7 @@ void pc_remote_player_on_ready(PCNetPlayerId player_id, const PCNetGameIdentity*
     }
 
     memset(&slot->scene, 0, sizeof(slot->scene)); /* M9-A: a new READY starts with no known scene */
+    slot->prev_scene_id = 0;
     slot->in_use = 1;
     slot->pending_create = 1;
     slot->lazily_discovered = 0; /* a direct handshake, not a relay discovery */
@@ -4992,6 +5196,9 @@ int pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* s
     if (slot->scene.valid && scene->seq <= slot->scene.seq) {
         return 0;
     }
+    if (slot->scene.valid && slot->scene.scene_id != scene->scene_id) {
+        slot->prev_scene_id = slot->scene.scene_id; /* the interior an arriving OUTDOOR row came out of (door class) */
+    }
     slot->scene = *scene;
     slot->scene.valid = 1;
     slot->latch_clear_req = 1; /* M9-C v7: scene presence changed -> drop any one-shot latch at the next puppet move */
@@ -5004,6 +5211,7 @@ void pc_remote_player_clear_scene(PCNetPlayerId player_id) {
     PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
     if (slot != NULL) {
         memset(&slot->scene, 0, sizeof(slot->scene));
+        slot->prev_scene_id = 0;
         slot->latch_clear_req = 1; /* M9-C v7: see pc_remote_player_on_scene() */
     }
 }
