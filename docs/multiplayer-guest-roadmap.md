@@ -187,7 +187,7 @@ Limitations:
 
 ## G5 - gameplay audit and guards
 
-Status: **Complete, with limitations** (source fixes + local refusals + scripted protocol coverage; NO real-client gameplay run and NO visual verification, see Limitations). Commit hash: (filled by orchestrator)
+Status: **Complete, with limitations** (source fixes + local refusals + scripted protocol coverage; NO real-client gameplay run and NO visual verification, see Limitations). Commit hash: 8ad36ca
 
 ### G5.0 - the three player_no 4 out-of-range accesses (verified in the code, fixed minimally, TARGET_PC only, foreigner / NULL guarded)
 
