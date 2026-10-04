@@ -218,6 +218,14 @@ static u8* aNG2_getP_other_pl_name(void) {
         }
     }
 
+#ifdef TARGET_PC
+    /* A multiplayer guest in the Rover scene has player_no == mPr_FOREIGNER (PLAYER_NUM): the loop above already looked at every resident slot, and the loop
+     * below would run (PLAYER_NUM - 1) - player_no == -1 times, i.e. out of bounds. */
+    if (player_no >= PLAYER_NUM) {
+        return NULL;
+    }
+#endif
+
     priv = Save_Get(private_data) + player_no;
     /* Search for players after this one's player no */
     for (i = (PLAYER_NUM - 1) - player_no; i != 0; i--) {
@@ -230,6 +238,12 @@ static u8* aNG2_getP_other_pl_name(void) {
     /* No other players to reference */
     return NULL;
 }
+
+#ifdef TARGET_PC
+extern int pc_guest_creation_active(void);                 /* pc_m_card.c: a multiplayer guest is creating its profile in this scene */
+extern int pc_guest_creation_name_ok(const u8* game_name); /* pc_m_card.c: the name can be stored in the profile file */
+extern void pc_guest_creation_finish(GAME_PLAY* play);     /* pc_m_card.c: persist the profile, go to the station */
+#endif
 
 static int aNG2_check_pname(void) {
     int ok = TRUE;
@@ -246,6 +260,16 @@ static int aNG2_check_pname(void) {
             }
         }
     }
+
+#ifdef TARGET_PC
+    if (ok == TRUE && pc_guest_creation_active()) {
+        /* first-run guest creation: the name is stored in a profile file, so it must be representable there (ASCII charset, no leading blank, not SERVER);
+         * otherwise the scene answers "that name is taken" and asks again */
+        if (!pc_guest_creation_name_ok(Now_Private->player_ID.player_name)) {
+            ok = FALSE;
+        }
+    }
+#endif
 
     return ok;
 }
@@ -742,6 +766,17 @@ static void aNG2_last_talk_end_wait_init(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* pl
 }
 
 static void aNG2_scene_change_wait_init(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (pc_guest_creation_active()) {
+        /* Multiplayer first-run guest creation: keep the face assignment and the BGM, but NOT the vanilla new-resident body (mEv_SetFirstJob /
+         * mEv_SetFirstIntro / random shirt / weather decision / submenu lock): the guest's profile is persisted and it goes to the station like any guest. */
+        aNG2_set_pl_face_type(guide2);
+        pc_guest_creation_finish(play);
+        mBGMPsComp_make_ps_wipe(0x41C2);
+        mBGMPsComp_scene_mode(18);
+        return;
+    }
+#endif
     /* Init next scene transition */
     goto_next_scene(play, 0, 1);
     play->fb_wipe_type = WIPE_TYPE_FADE_BLACK;

@@ -20424,6 +20424,9 @@ static PCMpGtkFile             s_client_gtk;                  /* the token file,
 static int                     s_client_gtk_loaded = 0;
 static int                     s_client_gtk_unreadable = 0;
 
+static int s_client_identity_create_logged = 0;
+extern int pc_guest_creation_active(void); /* pc_m_card.c: a first-run guest profile is being created in the Rover scene */
+
 static int pcnetgame_client_is_guest_player(void) {
     return Now_Private != NULL && (int)Common_Get(player_no) >= (int)mPr_FOREIGNER;
 }
@@ -21144,7 +21147,14 @@ static void pcnetgame_client_tick(void) {
     int ready = s_local_world_latched;
 
     if (s_client_link == PC_NETGAME_LINK_HANDSHAKE && !s_client_identity_sent) {
-        if (ready) {
+        if (ready && pc_guest_creation_active()) {
+            /* first-run guest creation (the Rover scene is choosing the guest's name / gender / face): the identity claim must carry the FINAL guest identity,
+             * so it is not sent until the profile is created (pc_m_card.c pc_guest_creation_finish) */
+            if (!s_client_identity_create_logged) {
+                s_client_identity_create_logged = 1;
+                printf("[NET][GUEST] client: first-run guest creation in progress -- the identity claim waits for the Rover scene to finish\n");
+            }
+        } else if (ready) {
             PCNetGameIdentityMsg msg;
             char buf[96];
             pcnetgame_capture_town_identity(&s_client_claimed_town);

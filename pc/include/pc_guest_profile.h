@@ -130,6 +130,24 @@ void pc_guest_profile_default_name(const char* profile, uint16_t id, char* out);
  * failed / no unique identity was found within 32 draws. */
 int pc_guest_profile_make_unique(const char* profile, const PCGuestProfile* sib, int nsib, PCGuestProfile* out);
 
+/* ================= First-run guest creation (the REAL vanilla Rover scene creates the profile) =================
+ * `--guest-profile NAME` with NO guest_<name>.ini does not auto-create the file any more: prepare_new draws the permanent ids + a placeholder name IN MEMORY
+ * (unique among the sibling profiles, exactly like load_or_create_in, but nothing is written); the Rover scene (SCENE_START_DEMO2) then lets the player
+ * choose name / gender / face and pc_guest_profile_create_exclusive() writes the file ONCE, create-only (never replaces an existing file). */
+
+/* Draws the identity of a NEW named profile in `dir` (NULL = PC_GUEST_PROFILE_DIR) WITHOUT writing anything. Returns 1, or 0 with err: the profile name is invalid
+ * / the profile file ALREADY exists (use read) / guest_token_<name>.dat exists WITHOUT the ini (an orphan token: refused, never deleted) / the random source failed. */
+int pc_guest_profile_prepare_new(const char* dir, const char* profile, PCGuestProfile* out, char* err, size_t errcap);
+int pc_guest_profile_prepare_new_selected(PCGuestProfile* out, char* err, size_t errcap); /* the SELECTED named profile in PC_GUEST_PROFILE_DIR */
+
+/* Writes `p` (validated) to `path` atomically (tmp file, flush, then a move that does NOT replace). Returns 1 = created, 0 = `path` already exists (nothing
+ * written), -1 = error (err filled). */
+int pc_guest_profile_create_exclusive(const char* path, const PCGuestProfile* p, char* err, size_t errcap);
+
+/* The 8 game font code bytes of a player name -> the profile's ASCII name (trailing blanks trimmed). Returns 1 only when the name is EXACTLY representable
+ * in a profile (allowed charset, no leading blank, valid, not SERVER) so that name_bytes() gives back the same 8 bytes; else 0 (out = ""). out >= 9 bytes. */
+int pc_guest_profile_name_from_game(const uint8_t name[PC_GUEST_PROFILE_NAME_LEN], char* out);
+
 /* TEST SEAM: replaces the CSPRNG id source (NULL = the OS CSPRNG, the default and the only production value). */
 typedef int (*PCGuestProfileIdSource)(uint16_t* out);
 void pc_guest_profile_test_set_id_source(PCGuestProfileIdSource fn);

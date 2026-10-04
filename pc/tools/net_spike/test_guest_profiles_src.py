@@ -138,6 +138,34 @@ def main():
     ck("E the header documents the profile feature: names / files / folding / uniqueness / unreadable siblings skipped",
        "named guest profiles (--guest-profile NAME)" in ph and "guest_token_<name>.dat" in ph and "folded to lower case" in ph and "re-drawn (bounded)" in ph and "unreadable ones are skipped" in ph)
 
+    # ---------------------------------------------------------------- G: first-run guest creation (the Rover scene creates a NEW named profile)
+    g2raw = S.read("src/actor/npc/ac_npc_guide2_move.c_inc")
+    g2n = g2raw.replace(chr(13), "")
+    fin = S.body(cm, cf, "pc_guest_creation_finish")
+    arr = S.body(cm, cf, "pc_guest_arrive")
+    join = S.body(cm, cf, "pc_guest_title_join")
+    ck("G pc_main.c: a NAMED profile is READ first; only ABSENT draws an in-memory identity (prepare_new_selected) and arms the creation, nothing is written there",
+       "pc_guest_profile_read_selected(&gp, gerr, sizeof(gerr))" in mm and "pc_guest_profile_prepare_new_selected(&gp, gerr, sizeof(gerr))" in mm and "pc_guest_creation_arm(&gp)" in mm
+       and mm.index("pc_guest_profile_read_selected(&gp, gerr") < mm.index("pc_guest_profile_prepare_new_selected") < mm.index("pc_guest_profile_load_or_create_selected(&gp, gerr"))
+    ck("G the title join does the same for a named profile (read, ABSENT -> prepare_new + arm, disarm on a failed arrival); the label still only reads",
+       "pc_guest_profile_read_selected(&gp, perr, sizeof(perr))" in join and "pc_guest_profile_prepare_new_selected" in join and "pc_guest_creation_arm(&gp)" in join and "s_pc_guest_create_armed = 0" in join)
+    ck("G pc_guest_arrive CREATE mode: the door is SCENE_START_DEMO2 north (120, 340) with NO RIDE_OFF_DEMO, the resident-name check is skipped; the station branch is unchanged",
+       "create = s_pc_guest_create_armed" in arr and "SCENE_START_DEMO2" in arr and "exit_position.x = 120" in arr and "exit_position.z = 340" in arr
+       and arr.count("mAc_PROFILE_RIDE_OFF_DEMO") == 1 and "pc_guest_station_door(&door_data)" in arr and "create ? -1 : pc_guest_resident_name_conflict" in arr)
+    ck("G the finish validates, writes the profile CREATE-ONLY (pc_guest_profile_create_exclusive), applies the identity-hash shirt and goes to the station with RIDE_OFF_DEMO; "
+       "it never runs the vanilla new-resident events, never rebuilds the record and exits 2 on failure",
+       "pc_guest_profile_name_from_game(" in fin and "pc_guest_profile_create_exclusive(" in fin and "pc_guest_starter_shirt(" in fin and "mAc_PROFILE_RIDE_OFF_DEMO" in fin
+       and "mEv_" not in fin and "pc_guest_build_fresh_record" not in fin and "mPr_SetNowPrivateCloth" not in fin and "pc_save_" not in fin and "pc_guest_creation_die" in fin
+       and "exit(2)" in S.body(cm, cf, "pc_guest_creation_die"))
+    ck("G the create-only write: MoveFileExA WITHOUT MOVEFILE_REPLACE_EXISTING (link() elsewhere), in its own helper beside the replacing one",
+       "static int rename_exclusive(" in pcm and "MoveFileExA(src, dst, MOVEFILE_WRITE_THROUGH)" in pcm and "REPLACE_EXISTING" not in S.body(pcm, pf, "rename_exclusive"))
+    ck("G the Rover actor (TARGET_PC): scene_change_wait_init calls the finish ONLY while a creation is active (face + BGM kept, mEv_ calls skipped); check_pname also rejects names the profile cannot store; "
+       "getP_other_pl_name returns before its out-of-bounds second loop for player_no >= PLAYER_NUM",
+       "if (pc_guest_creation_active()) {" in g2n and "pc_guest_creation_finish(play);" in g2n and "pc_guest_creation_name_ok(" in g2n
+       and "if (player_no >= PLAYER_NUM) {" in g2n and "aNG2_set_pl_face_type(guide2);\n        pc_guest_creation_finish(play);" in g2n)
+    ck("G the client's identity claim waits for the creation to finish (pc_net_game.c) and no wire / protocol constant changed",
+       "pc_guest_creation_active()" in ng and "the identity claim waits for the Rover scene" in ng_raw)
+
     # ---------------------------------------------------------------- F: no wire change
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), S.ROOT)

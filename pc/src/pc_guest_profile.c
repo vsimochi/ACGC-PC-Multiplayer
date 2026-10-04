@@ -363,6 +363,19 @@ static int rename_over(const char* src, const char* dst) {
 #endif
 }
 
+/* create-only move: fails (-1) when `dst` exists, never replaces it */
+static int rename_exclusive(const char* src, const char* dst) {
+#ifdef _WIN32
+    return MoveFileExA(src, dst, MOVEFILE_WRITE_THROUGH) ? 0 : -1; /* no MOVEFILE_REPLACE_EXISTING */
+#else
+    if (link(src, dst) != 0) {
+        return -1;
+    }
+    remove(src);
+    return 0;
+#endif
+}
+
 static void make_dir(const char* p) {
 #ifdef _WIN32
     _mkdir(p);
@@ -388,8 +401,8 @@ static void ensure_parent_dirs(const char* path) {
     }
 }
 
-/* atomic create: tmp -> flush + commit -> replace; returns 1 on success */
-static int write_atomic(const char* path, const char* text, size_t n) {
+/* atomic create: tmp -> flush + commit -> replace (exclusive: create-only, fails when `path` exists); returns 1 on success */
+static int write_atomic_ex(const char* path, const char* text, size_t n, int exclusive) {
     char tmp[600];
     FILE* fp;
     int ok;
@@ -409,11 +422,15 @@ static int write_atomic(const char* path, const char* text, size_t n) {
     ok = ok && fsync(fileno(fp)) == 0;
 #endif
     ok = (fclose(fp) == 0) && ok;
-    if (!ok || rename_over(tmp, path) != 0) {
+    if (!ok || (exclusive ? rename_exclusive(tmp, path) : rename_over(tmp, path)) != 0) {
         remove(tmp);
         return 0;
     }
     return 1;
+}
+
+static int write_atomic(const char* path, const char* text, size_t n) {
+    return write_atomic_ex(path, text, n, 0);
 }
 
 int pc_guest_profile_load_or_create(const char* path, PCGuestProfile* out, char* err, size_t errcap) {
@@ -800,4 +817,105 @@ int pc_guest_profile_load_or_create_selected(PCGuestProfile* out, char* err, siz
 
 int pc_guest_profile_read_selected(PCGuestProfile* out, char* err, size_t errcap) {
     return pc_guest_profile_read(pc_guest_profile_selected_path(), out, err, errcap);
+}
+
+/* ================= first-run guest creation (see pc_guest_profile.h) ================= */
+
+int pc_guest_profile_prepare_new(const char* dir, const char* profile, PCGuestProfile* out, char* err, size_t errcap) {
+    char path[512], tokpath[512], self[64];
+    PCGuestProfile sib[PROFILE_MAX_SIBLINGS];
+    PCGuestProfile p;
+    FILE* fp;
+    int nsib;
+    if (dir == NULL) {
+        dir = PC_GUEST_PROFILE_DIR;
+    }
+    if (profile == NULL || profile[0] == '\0') {
+        set_err(err, errcap, "%s", "first-run creation needs a named profile (--guest-profile NAME)", NULL);
+        return 0;
+    }
+    if (!pc_guest_profile_name_check(profile, err, errcap)) {
+        return 0;
+    }
+    if (!pc_guest_profile_file_path(dir, profile, 0, path, sizeof(path)) || !pc_guest_profile_file_path(dir, profile, 1, tokpath, sizeof(tokpath))) {
+        set_err(err, errcap, "the profile path is too long%s", "", NULL);
+        return 0;
+    }
+    fp = fopen(path, "rb");
+    if (fp != NULL) {
+        fclose(fp);
+        set_err(err, errcap, "%s: the profile file already exists (nothing to create)%s", path, "");
+        return 0;
+    }
+    fp = fopen(tokpath, "rb");
+    if (fp != NULL) {
+        fclose(fp);
+        set_err(err, errcap, "%s: this guest token file exists but its profile file %s is missing; refusing to create a NEW guest over an old token (restore the "
+                             "profile file, or move the token file away yourself; it was NOT deleted)", tokpath, path);
+        return 0;
+    }
+    pc_guest_profile_file_path(".", profile, 0, self, sizeof(self)); /* "./guest_<x>.ini": only the file name part is used */
+    nsib = scan_siblings(dir, self + 2, sib, PROFILE_MAX_SIBLINGS);
+    if (!pc_guest_profile_make_unique(profile, sib, nsib, &p)) {
+        set_err(err, errcap, "%s: no unique guest identity could be drawn (random source failed or too many collisions)%s", path, "");
+        return 0;
+    }
+    *out = p;
+    return 1;
+}
+
+int pc_guest_profile_prepare_new_selected(PCGuestProfile* out, char* err, size_t errcap) {
+    return pc_guest_profile_prepare_new(NULL, pc_guest_profile_selected(), out, err, errcap);
+}
+
+int pc_guest_profile_create_exclusive(const char* path, const PCGuestProfile* p, char* err, size_t errcap) {
+    char fmt[PC_GUEST_PROFILE_MAX_FILE];
+    const char* bad_key = NULL;
+    const char* why = NULL;
+    FILE* fp;
+    size_t n;
+    if (!pc_guest_profile_validate(p, &bad_key, &why)) {
+        set_err(err, errcap, "the new profile is invalid: %s %s", bad_key, why);
+        return -1;
+    }
+    fp = fopen(path, "rb");
+    if (fp != NULL) {
+        fclose(fp);
+        return 0;
+    }
+    n = pc_guest_profile_format(p, fmt, sizeof(fmt));
+    if (n == 0 || !write_atomic_ex(path, fmt, n, 1)) {
+        fp = fopen(path, "rb");
+        if (fp != NULL) {
+            fclose(fp);
+            return 0; /* lost a race with another creator: the existing file wins */
+        }
+        set_err(err, errcap, "%s: cannot create the profile file (is the directory writable?)%s", path, "");
+        return -1;
+    }
+    return 1;
+}
+
+int pc_guest_profile_name_from_game(const uint8_t name[PC_GUEST_PROFILE_NAME_LEN], char* out) {
+    size_t len = PC_GUEST_PROFILE_NAME_LEN, k;
+    const char* why = NULL;
+    out[0] = '\0';
+    while (len > 0 && name[len - 1] == ' ') {
+        len--;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    for (k = 0; k < len; k++) {
+        if (!name_char_ok(name[k])) {
+            return 0;
+        }
+        out[k] = (char)name[k];
+    }
+    out[len] = '\0';
+    if (!text_value_ok(out, &why) || !pc_mp_guests_name_valid(name) || pc_mp_guests_name_reserved(name)) {
+        out[0] = '\0';
+        return 0;
+    }
+    return 1;
 }

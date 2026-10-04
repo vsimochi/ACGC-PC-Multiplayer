@@ -1412,9 +1412,17 @@ static void pc_guest_init_designs(Private_c* rec) {
 _Static_assert(mPr_SEX_MALE == 0 && mPr_SEX_FEMALE == 1 && mPr_FACE_TYPE_NUM == 8, "guest gender / face derivation assumes 2 genders and 8 faces");
 _Static_assert(ITM_CLOTH008 == ITM_CLOTH000 + 8 && ITM_CLOTH015 == ITM_CLOTH000 + 15, "starter shirts: boys ITM_CLOTH000..007, girls ITM_CLOTH008..015");
 
+/* The starter shirt a guest wears: derived from the identity hash (bits 8..10 pick one of the gender's 8 shirts), never random. Shared by the fresh record and
+ * the first-run creation finish (the vanilla Rover scene hands out a RANDOM shirt there; the guest keeps this deterministic one). */
+u16 pc_guest_starter_shirt(const PersonalID_c* id, int gender) {
+    const u32 h = pc_guest_identity_hash(id);
+    const int shirt_idx = (int)((h >> 8) & 7u);
+
+    return (u16)(ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx);
+}
+
 static void pc_guest_build_fresh_record(Private_c* rec, const PersonalID_c* home, int gender, int face) {
     const u32 h = pc_guest_identity_hash(home);
-    int shirt_idx = (int)((h >> 8) & 7u);
 
     if (gender < 0) {
         gender = (int)((h >> 31) & 1u);
@@ -1429,7 +1437,7 @@ static void pc_guest_build_fresh_record(Private_c* rec, const PersonalID_c* home
     rec->reset_code = 0;
     rec->gender = (s8)gender;
     rec->face = (s8)face;
-    mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)(ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx));
+    mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)pc_guest_starter_shirt(home, gender));
     pc_guest_init_designs(rec);
 }
 
@@ -1453,6 +1461,41 @@ static char s_pc_guest_title_msg[256];
 static time_t s_pc_guest_title_msg_until = 0;
 static char s_pc_guest_title_label[48] = "Join as Guest";
 static int s_pc_guest_title_label_done = 0;
+
+/* First-run guest creation (--guest-profile NAME / title item with a NEW named profile): the profile file does not exist, its identity (ids, placeholder name) is
+ * held IN MEMORY (armed by pc_main.c / pc_guest_title_join), the guest arrives in the REAL vanilla Rover scene (SCENE_START_DEMO2: name entry, gender, face
+ * questions) and pc_guest_creation_finish() writes the file ONCE, create-only, then sends the guest to the station like pc_guest_arrive. `armed` stays set from
+ * the arming until the finish succeeded (it is also what pc_net_game.c's handshake gate and the Rover actor ask through pc_guest_creation_active()). */
+static int s_pc_guest_create_armed = 0;
+static PCGuestProfile s_pc_guest_create_profile;
+
+void pc_guest_creation_arm(const PCGuestProfile* p) {
+    s_pc_guest_create_profile = *p;
+    s_pc_guest_create_armed = 1;
+}
+
+int pc_guest_creation_active(void) {
+    return s_pc_guest_create_armed;
+}
+
+/* The Rover scene's name check (ac_npc_guide2_move.c_inc aNG2_check_pname): 1 iff the typed name can be stored EXACTLY in the profile file. */
+int pc_guest_creation_name_ok(const u8* game_name) {
+    char nm[PC_GUEST_PROFILE_NAME_LEN + 1];
+    return pc_guest_profile_name_from_game(game_name, nm);
+}
+
+/* The station arrival door: SCENE_FG at (1979, 760), exactly aNPS2_make_door_data's station entry; the caller adds RIDE_OFF_DEMO + the circle wipe. */
+static void pc_guest_station_door(Door_data_c* door_data) {
+    door_data->next_scene_id = SCENE_FG;
+    door_data->exit_orientation = mSc_DIRECT_SOUTH;
+    door_data->exit_type = 0;
+    door_data->extra_data = 0;
+    door_data->exit_position.x = 1979;
+    door_data->exit_position.y = 0;
+    door_data->exit_position.z = 760;
+    door_data->door_actor_name = EMPTY_NO;
+    door_data->wipe_type = WIPE_TYPE_FADE_BLACK;
+}
 
 /* Guests G3: the ONE guest arrival, shared by --bootstrap-guest / --guest (pc_bootstrap_guest_poll, exit(2) on failure) and the title-menu item
  * (pc_guest_title_join, back to the title with a message on failure). `tag` prefixes the log lines ("--bootstrap-guest" / "join-as-guest").
@@ -1479,6 +1522,7 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
     int opt_face = -1;
     int clash;
     int scene_res;
+    const int create = s_pc_guest_create_armed; /* first-run creation: the Rover scene (SCENE_START_DEMO2) first, the station after the finish */
     const char* bad_why = "unknown";
 
     if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
@@ -1510,7 +1554,8 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
         snprintf(err, errcap, "REFUSED: bad spec '%s': %s (expected NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]])", spec, bad_why);
         return 0;
     }
-    clash = pc_guest_resident_name_conflict(&home);
+    /* creation: `home`'s name is only a placeholder (the player types the real one in the Rover scene, checked there and again in the finish) */
+    clash = create ? -1 : pc_guest_resident_name_conflict(&home);
     if (clash >= 0) {
         snprintf(err, errcap, "REFUSED: the guest name '%.8s' equals the name of resident %d of this town (a guest must have its own name)",
                  (const char*)home.player_name, clash);
@@ -1549,29 +1594,148 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
              tag, (int)mEv_CheckGateway(), (int)Common_Get(player_no));
     /* pc_save_ready is deliberately NOT armed: this process can never write a save. */
 
-    door_data.next_scene_id = SCENE_FG;
-    door_data.exit_orientation = mSc_DIRECT_SOUTH;
-    door_data.exit_type = 0;
-    door_data.extra_data = 0;
-    door_data.exit_position.x = 1979;
-    door_data.exit_position.y = 0;
-    door_data.exit_position.z = 760;
-    door_data.door_actor_name = EMPTY_NO;
-    door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
-    Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
-    Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
+    if (create) {
+        /* the vanilla Rover entry (aNPS2_make_door_data type DEMO2): SCENE_START_DEMO2, north, (120, 340), no RIDE_OFF_DEMO */
+        door_data.next_scene_id = SCENE_START_DEMO2;
+        door_data.exit_orientation = mSc_DIRECT_NORTH;
+        door_data.exit_type = 0;
+        door_data.extra_data = 0;
+        door_data.exit_position.x = 120;
+        door_data.exit_position.y = 0;
+        door_data.exit_position.z = 340;
+        door_data.door_actor_name = EMPTY_NO;
+        door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
+        OSReport("[PC] %s: FIRST-RUN guest creation: profile file %s does not exist yet -> the real Rover scene (SCENE_START_DEMO2) creates it\n", tag,
+                 pc_guest_profile_selected_path());
+    } else {
+        pc_guest_station_door(&door_data);
+        Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
+        Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
+    }
     scene_res = goto_other_scene(play, &door_data, TRUE);
     if (scene_res != TRUE) {
         Common_Set(demo_profiles[0], mAc_PROFILE_NUM);
         Common_Set(now_private, prev_private);
         Common_Set(player_no, prev_player_no);
         Common_Set(time.rtc_enabled, prev_rtc);
-        snprintf(err, errcap, "FAILED: goto_other_scene to SCENE_FG (station) failed (res=%d)", scene_res);
+        snprintf(err, errcap, "FAILED: goto_other_scene to %s failed (res=%d)", create ? "SCENE_START_DEMO2 (Rover)" : "SCENE_FG (station)", scene_res);
         return 0;
     }
-    OSReport("[PC] %s: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the station (SCENE_FG)\n", tag,
-             (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id);
+    OSReport("[PC] %s: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the %s\n", tag,
+             (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id, create ? "Rover scene (SCENE_START_DEMO2)" : "station (SCENE_FG)");
     return 1;
+}
+
+/* First-run creation, END of the Rover scene (called by the guide2 actor's aNG2_scene_change_wait_init instead of the vanilla body, and by the test hook):
+ * validates what the player chose, writes save/mp/guest_<name>.ini ONCE (create-only, atomic), then applies the identity-derived starter shirt and sends the
+ * guest to the station exactly like pc_guest_arrive (RIDE_OFF_DEMO, circle wipe). The vanilla body's mEv_SetFirstJob / mEv_SetFirstIntro / random shirt /
+ * weather decision / submenu lock are NOT run (a guest owns no house and no first-day events), and the record is NOT rebuilt: the Rover edited it in place.
+ * Nothing is written before this point, so an interrupted creation simply replays on the next launch. Any failure exits 2 with a message (never a half state). */
+static void pc_guest_creation_die(const char* msg) {
+    fprintf(stderr, "[PC] guest creation: FAILED: %s\n", msg);
+    fflush(stdout);
+    fflush(stderr);
+    exit(2);
+}
+
+void pc_guest_creation_finish(GAME_PLAY* play) {
+    Private_c* rec = Common_Get(now_private);
+    PCGuestProfile p;
+    char nm[PC_GUEST_PROFILE_NAME_LEN + 1];
+    char err[400];
+    Door_data_c door_data;
+    int cr, clash;
+
+    if (!s_pc_guest_create_armed || rec == NULL || Common_Get(player_no) != mPr_FOREIGNER) {
+        pc_guest_creation_die("internal error: the creation finish ran without an armed first-run creation / a bound guest");
+    }
+    if (!pc_guest_profile_name_from_game(rec->player_ID.player_name, nm)) {
+        pc_guest_creation_die("the chosen name cannot be stored in the guest profile (allowed: 1..8 of A-Z a-z 0-9 blank . ' -, no leading blank, not SERVER)");
+    }
+    clash = pc_guest_resident_name_conflict(&rec->player_ID);
+    if (clash >= 0) {
+        pc_guest_creation_die("the chosen name equals the name of a resident of this town");
+    }
+    if (rec->gender != mPr_SEX_MALE && rec->gender != mPr_SEX_FEMALE) {
+        pc_guest_creation_die("the chosen gender is invalid");
+    }
+    if (rec->face < 0 || rec->face >= mPr_FACE_TYPE_NUM) {
+        pc_guest_creation_die("the chosen face is invalid");
+    }
+    p = s_pc_guest_create_profile;
+    memcpy(p.name, nm, sizeof(nm));
+    p.gender = (int)rec->gender;
+    p.face = (int)rec->face;
+    err[0] = '\0';
+    cr = pc_guest_profile_create_exclusive(pc_guest_profile_selected_path(), &p, err, sizeof(err));
+    if (cr == 0) {
+        pc_guest_creation_die("the profile file appeared while the Rover scene was running; it was NOT replaced (restart to use it)");
+    } else if (cr < 0) {
+        pc_guest_creation_die(err);
+    }
+    s_pc_guest_create_armed = 0;
+    OSReport("[PC] guest creation: profile %s CREATED: name '%s', gender %d, face %d, home town '%s', player id 0x%04X, land id 0x%04X\n",
+             pc_guest_profile_selected_path(), p.name, p.gender, p.face, p.home_town, (unsigned)p.player_id, (unsigned)p.land_id);
+    printf("[PC] guest creation: profile %s CREATED: name '%s', gender %d, face %d\n", pc_guest_profile_selected_path(), p.name, p.gender, p.face);
+    fflush(stdout);
+
+    mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)pc_guest_starter_shirt(&rec->player_ID, p.gender));
+
+    pc_guest_station_door(&door_data);
+    Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
+    Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
+    if (goto_other_scene(play, &door_data, TRUE) != TRUE) {
+        Common_Set(demo_profiles[0], mAc_PROFILE_NUM);
+        pc_guest_creation_die("the profile was saved, but the scene change to the station failed; start the game again (the profile now exists)");
+    }
+    OSReport("[PC] guest creation: guest '%s' leaves the Rover scene for the station (SCENE_FG, RIDE_OFF_DEMO)\n", p.name);
+}
+
+/* TEST-ONLY hook (--guest-creation-test NAME,GENDER,FACE, needs --guest-profile): once the Rover scene has been running for a while it types NAME / GENDER /
+ * FACE into the guest record WITHOUT any UI and runs the very same finish. Driven from pc_bootstrap_guest_poll(). */
+extern const char* g_pc_guest_creation_test; /* pc_main.c; NULL = off */
+static void pc_guest_creation_test_poll(void) {
+    static int l_frames = 0;
+    static int l_done = 0;
+    GAME_PLAY* play;
+    char spec[64];
+    char* c1;
+    char* c2;
+    Private_c* rec;
+    size_t n, k;
+
+    if (l_done || g_pc_guest_creation_test == NULL || !s_pc_guest_create_armed) {
+        return;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main || Save_Get(scene_no) != SCENE_START_DEMO2) {
+        return;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE || get_player_actor_withoutCheck(play) == NULL || ++l_frames < 120) {
+        return; /* let the Rover scene (guide2, train window, player) really run first */
+    }
+    l_done = 1;
+    snprintf(spec, sizeof(spec), "%s", g_pc_guest_creation_test);
+    c1 = strchr(spec, ',');
+    c2 = c1 != NULL ? strchr(c1 + 1, ',') : NULL;
+    if (c1 == NULL || c2 == NULL) {
+        pc_guest_creation_die("--guest-creation-test needs NAME,GENDER,FACE");
+    }
+    *c1 = '\0';
+    *c2 = '\0';
+    rec = Common_Get(now_private);
+    n = strlen(spec);
+    if (rec == NULL || n < 1 || n > PLAYER_NAME_LEN) {
+        pc_guest_creation_die("--guest-creation-test: bad NAME");
+    }
+    memset(rec->player_ID.player_name, ' ', PLAYER_NAME_LEN);
+    for (k = 0; k < n; k++) {
+        rec->player_ID.player_name[k] = (u8)spec[k];
+    }
+    rec->gender = (s8)atoi(c1 + 1);
+    rec->face = (s8)atoi(c2 + 1);
+    OSReport("[PC] guest creation: TEST HOOK typed name '%s', gender %d, face %d in the Rover scene (no UI)\n", spec, (int)rec->gender, (int)rec->face);
+    pc_guest_creation_finish(play);
 }
 
 /* Guests G2: --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID (see pc_main.c; --guest feeds it from guest.ini). TEST-ONLY / headless entry, default off, CLIENT role
@@ -1588,6 +1752,7 @@ void pc_bootstrap_guest_poll(void) {
     static int l_done = 0;
     char err[320];
 
+    pc_guest_creation_test_poll();
     if (l_done || g_pc_bootstrap_guest == NULL) {
         return;
     }
@@ -1652,23 +1817,41 @@ int pc_guest_title_join(void) {
     char spec[96];
     char err[320];
     int gres;
+    int create = 0;
 
     s_pc_guest_title_msg[0] = '\0';
     if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
         pc_guest_title_fail("only a network client (--connect) can join as a guest");
         return 0;
     }
-    gres = pc_guest_profile_load_or_create_selected(&gp, perr, sizeof(perr)); /* the SELECTED profile (--guest-profile), created only here */
+    if (pc_guest_profile_selected() != NULL) {
+        /* a NAMED profile is never auto-created: an existing one is loaded, a missing one is created by the Rover scene (first-run creation) */
+        gres = pc_guest_profile_read_selected(&gp, perr, sizeof(perr));
+        if (gres == PC_GUEST_PROFILE_ABSENT) {
+            if (!pc_guest_profile_prepare_new_selected(&gp, perr, sizeof(perr))) {
+                pc_guest_title_fail(perr);
+                return 0;
+            }
+            pc_guest_creation_arm(&gp);
+            create = 1;
+        }
+    } else {
+        gres = pc_guest_profile_load_or_create_selected(&gp, perr, sizeof(perr)); /* the DEFAULT profile, created only here */
+    }
     if (gres == PC_GUEST_PROFILE_ERR) {
         pc_guest_title_fail(perr);
         return 0;
     }
     s_pc_guest_title_label_done = 0; /* the label is re-read (it shows the name of a just created profile if this join fails and the title stays) */
     if (!pc_guest_profile_spec(&gp, spec, sizeof(spec))) {
+        s_pc_guest_create_armed = 0;
         pc_guest_title_fail("internal error: the guest profile does not fit the spec buffer");
         return 0;
     }
     if (!pc_guest_arrive("join-as-guest", spec, err, sizeof(err))) {
+        if (create) {
+            s_pc_guest_create_armed = 0; /* nothing was written; the next click draws and arms again */
+        }
         pc_guest_title_fail(err);
         return 0;
     }

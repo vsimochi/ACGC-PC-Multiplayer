@@ -436,6 +436,44 @@ picker); the title-menu label and a join from the title menu are not visually ve
 Tests: native `test_guest_profiles_unit.py` (101 native checks), CLI `test_guest_profiles_cli.py` (101), source audit `test_guest_profiles_src.py` (30), REAL `test_guest_profiles_real.py`
 (40: three real guests from one cwd, kill / restart one, host restart). Commit: 7c95a59
 
+## First-run guest creation
+
+`AnimalCrossing.exe --connect HOST:PORT --guest-profile NAME` now has two modes:
+
+- **`save/mp/guest_<name>.ini` exists**: unchanged. The profile is loaded and validated, the guest arrives at the station (RIDE_OFF_DEMO) as before. A corrupt file is still never touched (exit 2).
+- **the ini does not exist**: nothing is auto-created. The client draws the permanent ids (and a placeholder display name, unique among the sibling profiles) **in memory** (`pc_guest_profile_prepare_new`) and arms a "creation pending" state. The guest is bound exactly as in `pc_guest_arrive` (placeholder name, `mSDI_StartDataInitGuest`, player_no 4) but the door is the vanilla Rover entry `SCENE_START_DEMO2`, north, (120, 340), no RIDE_OFF_DEMO. The player plays the REAL vanilla Rover scene (`ac_npc_guide2*`: name entry, gender, face questions). When the scene ends, `aNG2_scene_change_wait_init` calls `pc_guest_creation_finish(play)` instead of the vanilla body (TARGET_PC only).
+
+The finish: validates name / gender / face, writes the ini **create-only** (tmp file + `MoveFileExA` without `MOVEFILE_REPLACE_EXISTING`, `link()` on POSIX; an existing file is never replaced), applies the identity-hash starter shirt (`pc_guest_starter_shirt`, the same one `pc_guest_build_fresh_record` uses), keeps the face assignment and the two BGM calls, and goes to the station (`SCENE_FG` 1979,760, RIDE_OFF_DEMO, circle wipe). It does NOT run `mEv_SetFirstJob`, `mEv_SetFirstIntro`, the random shirt, the weather decision, `mGH_animal_return_init` or the submenu lock, does not rebuild the record, and never arms `pc_save_ready` (a guest process writes no save).
+
+Plain `--guest` and `--bootstrap-guest` keep their behaviour (`--guest` auto-creates `guest.ini`). `--guest-profile` still implies `--guest`. The title menu label only reads the profile (never creates). Choosing "Join as Guest" with a named profile that has no file uses the same creation path; with the default profile (no `--guest-profile`) the legacy auto-create remains.
+
+### Persistence and failure rules
+
+- Written once, at the end of the Rover scene, to `save/mp/guest_<name>.ini` (lower-cased profile name). Nothing is written before that, so an interrupted creation (closed window, crash) simply replays on the next launch.
+- If the write fails (or the file appeared meanwhile) the process exits with status 2 and a message; an existing file is never replaced.
+- If `save/mp/guest_token_<name>.dat` exists WITHOUT the ini, creation is refused with a message (exit 2 / title message); the token file is never deleted.
+- The typed name must be storable in the ini (`pc_guest_profile_name_from_game`: A-Z a-z 0-9 blank . ' -, no leading blank, not SERVER). Otherwise the Rover scene answers with its normal "that name is taken" message and asks again (`aNG2_check_pname`; the existing "same name as a resident" rule is unchanged). `aNG2_getP_other_pl_name` returns before its out-of-bounds second loop for player_no >= PLAYER_NUM.
+- Network: the client does not send its guest claim (IDENTITY_EXT / IDENTITY) while a creation is pending (`pc_guest_creation_active()` gate in `pcnetgame_client_tick`), so the host only ever sees the final identity. No wire or protocol change.
+
+### Test-only hook
+
+`--guest-creation-test NAME,GENDER,FACE` (requires `--guest-profile`; inert when the profile exists) types those answers into the Rover scene without UI after it has run for 120 frames and calls the very same finish. Used for process tests; it is not a gameplay option.
+
+### Tests run for this feature
+
+- Real client process (disposable copy of the fixture dir under the session scratchpad, no host): new profile `Roger` + hook `Zed,1,3` loaded the Rover scene, wrote `guest_roger.ini` (`name = Zed`, `gender = 1`, `face = 3`, ids as drawn at start, no tmp file), then moved to the station scene without a crash; the copied town save GCI stayed byte-identical.
+- Relaunch with the same profile: log `loaded guest profile ... name 'Zed'`, no creation line, ini byte-identical (md5), straight to the station arrival with the identity-derived shirt.
+- `test_guest_profiles_src.py` (37 checks, new group G audits: finish never touches `mEv_*` / `pc_save_*` / the record builder, create-only write helper, arm/read order in `pc_main.c` and the title join, actor hooks) and `test_guest_profiles_unit.py` (123 checks incl. new `first-run:` group: prepare_new writes nothing, create_exclusive create-only, orphan token refused and not deleted, name round trip).
+
+### Limitations
+
+- The Rover UI itself (name keyboard, gender and face questions) was not exercised visually; only the scene load / actor run (120+ frames at player_no 4) and the finish path were verified through the hook.
+- START_DEMO2 actors with player_no 4 (mPr_FOREIGNER) are unverified beyond "the scene ran without crashing"; other Rover-scene code that indexes `private_data[player_no]` was not audited.
+- Name clashes with OTHER guests of a host are only known at first contact (the host refuses a NEW guest whose name equals another guest's; nothing is checked while creating).
+- The network handshake waits during creation; a host that times out an idle connection would drop the client before the Rover scene ends.
+- A name the profile file cannot represent shows the Rover scene's "name already used" message, which is not an exact explanation.
+- `test_guest_profiles_real.py` still expects `--guest-profile` to auto-create its ini files; it needs pre-seeded profile files (or the hook) to run unchanged and was not updated or run.
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

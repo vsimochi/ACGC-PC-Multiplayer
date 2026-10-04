@@ -536,6 +536,11 @@ const char* g_pc_bootstrap_guest = NULL;
 static int g_pc_guest = 0;
 static char g_pc_guest_spec[96];
 
+/* First-run guest creation: --guest-profile NAME whose guest_<name>.ini does NOT exist plays the REAL vanilla Rover scene (name, gender, face) and the result is
+ * written to the profile (pc_m_card.c pc_guest_creation_finish). --guest-creation-test NAME,GENDER,FACE is the TEST-ONLY hook that types those answers
+ * without any UI once the Rover scene runs (requires --guest-profile; inert when the profile already exists). NULL = off. */
+const char* g_pc_guest_creation_test = NULL;
+
 /* --host-observer (opt-in, HOST role only): the host plays NO resident. It binds a hidden, inert, static observer identity (outside
  * Save_t.private_data[]) so that all four residents are claimable by clients. See pc/include/pc_host_observer.h and pc_m_card.c's
  * pc_host_observer_poll(). 0 = off (default: plain --host is unchanged). */
@@ -628,6 +633,10 @@ int main(int argc, char* argv[]) {
             printf("                      profile gets its own random ids and the display name NAME (cut to 8 characters; 'GuestXX' if unusable) and\n");
             printf("                      differs from every other profile of the folder. Without --guest-profile, --guest keeps using\n");
             printf("                      save/mp/guest.ini and save/mp/guest_token.dat. One profile must not run in two processes at once.\n");
+            printf("                      FIRST RUN of a --guest-profile NAME whose file does not exist: the profile is NOT auto-created; you play the real\n");
+            printf("                      Rover train scene (name, gender, face) and the answers are saved to save/mp/guest_<name>.ini when it ends\n");
+            printf("                      (an interrupted creation writes nothing and replays next launch). TEST-ONLY: --guest-creation-test\n");
+            printf("                      NAME,GENDER,FACE answers the Rover scene without UI. Plain --guest keeps auto-creating guest.ini.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
             printf("                      not a one-shot test hook): activates the host-authoritative\n");
             printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
@@ -877,6 +886,13 @@ int main(int argc, char* argv[]) {
             i++;
         } else if (strcmp(argv[i], "--guest") == 0) {
             g_pc_guest = 1;
+        } else if (strcmp(argv[i], "--guest-creation-test") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                fprintf(stderr, "[PC] --guest-creation-test: REFUSED: the option needs NAME,GENDER,FACE (TEST-ONLY, with --guest-profile)\n");
+                return 2;
+            }
+            g_pc_guest_creation_test = argv[i + 1];
+            i++;
         } else if (strcmp(argv[i], "--guest-profile") == 0) {
             /* Several guests on ONE PC: --guest-profile NAME implies --guest and selects the independent profile save/mp/guest_<name>.ini (+ its own token file
              * save/mp/guest_token_<name>.dat). A missing / invalid / repeated value is never ignored: exit 2 naming the rule. */
@@ -988,6 +1004,11 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
+    if (g_pc_guest_creation_test != NULL && pc_guest_profile_selected() == NULL) {
+        fprintf(stderr, "[PC] --guest-creation-test: REFUSED: the TEST-ONLY hook needs --guest-profile NAME\n");
+        return 2;
+    }
+
     /* Guests G2.3: --guest = CLIENT only (needs --connect), exclusive with --host / --dedicated / --host-observer / --bootstrap-resident / --bootstrap-guest.
      * Refused (exit 2 + usage) otherwise, BEFORE anything is initialised or the profile file is touched. Then the profile is loaded / created and validated
      * here (a bad guest.ini exits 2 with the bad key named; it is never overwritten) and converted into the --bootstrap-guest spec: the SAME arrival path. */
@@ -1022,17 +1043,41 @@ int main(int argc, char* argv[]) {
         {
             PCGuestProfile gp;
             char gerr[512];
-            int gres = pc_guest_profile_load_or_create_selected(&gp, gerr, sizeof(gerr));
+            int gres;
+            int creating = 0;
+            if (pc_guest_profile_selected() != NULL) {
+                /* a NAMED profile is never auto-created any more: an existing file is loaded (and validated), a missing one is created by the Rover scene
+                 * (first-run creation): ids + a placeholder name are drawn in memory here, NOTHING is written until the Rover scene finished */
+                gres = pc_guest_profile_read_selected(&gp, gerr, sizeof(gerr));
+                if (gres == PC_GUEST_PROFILE_ABSENT) {
+                    if (!pc_guest_profile_prepare_new_selected(&gp, gerr, sizeof(gerr))) {
+                        gres = PC_GUEST_PROFILE_ERR;
+                    } else {
+                        creating = 1;
+                    }
+                }
+            } else {
+                gres = pc_guest_profile_load_or_create_selected(&gp, gerr, sizeof(gerr));
+            }
             if (gres == PC_GUEST_PROFILE_ERR || !pc_guest_profile_spec(&gp, g_pc_guest_spec, sizeof(g_pc_guest_spec))) {
                 fprintf(stderr, "[PC] --guest: REFUSED: bad guest profile: %s\n", gres == PC_GUEST_PROFILE_ERR ? gerr : "internal error (spec buffer)");
                 return 2;
             }
+            if (creating) {
+                extern void pc_guest_creation_arm(const PCGuestProfile* p); /* pc_m_card.c */
+                pc_guest_creation_arm(&gp);
+                printf("[PC] --guest: guest profile %s does not exist yet: FIRST-RUN CREATION -- the real Rover scene (name, gender, face) will create it; "
+                       "nothing is written before it finishes (placeholder name '%s', home town '%s', player id 0x%04X, land id 0x%04X)\n",
+                       pc_guest_profile_selected_path(), gp.name, gp.home_town, (unsigned)gp.player_id, (unsigned)gp.land_id);
+                g_pc_bootstrap_guest = g_pc_guest_spec;
+            } else {
             printf("[PC] --guest: %s guest profile %s: name '%s', home town '%s', gender %d, face %d, player id 0x%04X, land id 0x%04X "
                    "(the ids are permanent; edit name / look before the first join)\n",
                    gres == PC_GUEST_PROFILE_CREATED ? (pc_guest_profile_selected() != NULL ? "CREATED the new" : "CREATED the default") : "loaded",
                    pc_guest_profile_selected_path(), gp.name, gp.home_town, gp.gender, gp.face,
                    (unsigned)gp.player_id, (unsigned)gp.land_id);
             g_pc_bootstrap_guest = g_pc_guest_spec;
+            }
         }
     }
 

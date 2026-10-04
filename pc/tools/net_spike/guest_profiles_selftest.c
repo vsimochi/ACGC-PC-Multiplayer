@@ -406,6 +406,70 @@ static void profile_dir_tests(void) {
     (void)pc;
 }
 
+/* first-run creation: prepare_new writes NOTHING, create_exclusive is create-only, an orphan token refuses, name_from_game is an exact round trip */
+static void first_run_tests(void) {
+    char dir[450], pn[500], tok[500], tmpp[520], err[500], nm[16];
+    PCGuestProfile p, q, r2;
+    uint8_t gb[8];
+    size_t n1 = 0, n2 = 0;
+    uint8_t *b1, *b2;
+    int r;
+
+    snprintf(dir, sizeof(dir), "%s/fr", g_dir);
+    MKDIR(dir);
+    snprintf(pn, sizeof(pn), "%s/guest_roger.ini", dir);
+    snprintf(tok, sizeof(tok), "%s/guest_token_roger.dat", dir);
+    check("first-run: prepare_new draws a valid in-memory identity (display name 'Roger') and writes NOTHING", pc_guest_profile_prepare_new(dir, "Roger", &p, err, sizeof(err))
+          && strcmp(p.name, "Roger") == 0 && pc_guest_profile_validate(&p, NULL, NULL) && !exists(pn));
+    check("first-run: prepare_new refuses the default profile (NULL) and an invalid name", !pc_guest_profile_prepare_new(dir, NULL, &q, err, sizeof(err)) && !pc_guest_profile_prepare_new(dir, "a b", &q, err, sizeof(err)));
+    strcpy(p.name, "Zed");
+    p.gender = 1;
+    p.face = 3;
+    r = pc_guest_profile_create_exclusive(pn, &p, err, sizeof(err));
+    check("first-run: create_exclusive writes the file (1) and it loads back with the chosen identity", r == 1 && pc_guest_profile_read(pn, &r2, err, sizeof(err)) == PC_GUEST_PROFILE_LOADED
+          && same_identity(&p, &r2) && r2.gender == 1 && r2.face == 3);
+    b1 = slurp(pn, &n1);
+    q = p;
+    strcpy(q.name, "Other");
+    r = pc_guest_profile_create_exclusive(pn, &q, err, sizeof(err));
+    b2 = slurp(pn, &n2);
+    check("first-run: a second create_exclusive returns 0 and leaves the existing file byte-identical (never replaces)", r == 0 && b1 != NULL && b2 != NULL && n1 == n2 && memcmp(b1, b2, n1) == 0);
+    free(b1);
+    free(b2);
+    snprintf(tmpp, sizeof(tmpp), "%s.tmp", pn);
+    check("first-run: no .tmp file is left behind", !exists(tmpp) && !exists(tok));
+    check("first-run: prepare_new refuses when the profile file already exists", !pc_guest_profile_prepare_new(dir, "Roger", &q, err, sizeof(err)));
+    remove(pn);
+    spit(tok, "token");
+    check("first-run: an ORPHAN token (guest_token_roger.dat without the ini) is refused with a message and NOT deleted", !pc_guest_profile_prepare_new(dir, "Roger", &q, err, sizeof(err))
+          && strstr(err, "NOT deleted") != NULL && same_file(tok, "token"));
+    remove(tok);
+    q = p;
+    q.gender = 7;
+    check("first-run: create_exclusive refuses an invalid profile (-1) and creates nothing", pc_guest_profile_create_exclusive(pn, &q, err, sizeof(err)) == -1 && !exists(pn));
+    memset(gb, ' ', 8);
+    memcpy(gb, "Zed", 3);
+    check("first-run: name_from_game('Zed     ') = 'Zed'", pc_guest_profile_name_from_game(gb, nm) && strcmp(nm, "Zed") == 0);
+    memcpy(gb, "A.b'-9 z", 8);
+    check("first-run: name_from_game accepts the whole charset incl. an inner blank (round trip exact)", pc_guest_profile_name_from_game(gb, nm) && strcmp(nm, "A.b'-9 z") == 0);
+    memset(gb, ' ', 8);
+    memcpy(gb + 1, "Zed", 3);
+    check("first-run: name_from_game rejects a LEADING blank", !pc_guest_profile_name_from_game(gb, nm) && nm[0] == '\0');
+    memset(gb, ' ', 8);
+    check("first-run: name_from_game rejects an all-blank name", !pc_guest_profile_name_from_game(gb, nm));
+    memset(gb, ' ', 8);
+    memcpy(gb, "SERVER", 6);
+    check("first-run: name_from_game rejects the reserved name SERVER", !pc_guest_profile_name_from_game(gb, nm));
+    memset(gb, ' ', 8);
+    gb[0] = 'A';
+    gb[1] = 0xA4;
+    check("first-run: name_from_game rejects a non-ASCII font code", !pc_guest_profile_name_from_game(gb, nm));
+    memset(gb, ' ', 8);
+    gb[0] = 'A';
+    gb[1] = 0;
+    check("first-run: name_from_game rejects a NUL byte", !pc_guest_profile_name_from_game(gb, nm));
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: guest_profiles_selftest <scratch_dir>\n");
@@ -418,6 +482,7 @@ int main(int argc, char** argv) {
     select_table();
     default_name_table();
     profile_dir_tests();
+    first_run_tests();
     printf("RESULT passed=%d failed=%d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
