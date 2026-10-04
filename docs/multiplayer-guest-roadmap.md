@@ -492,6 +492,36 @@ Plain `--guest` and `--bootstrap-guest` keep their behaviour (`--guest` auto-cre
 - A name the profile file cannot represent shows the Rover scene's "name already used" message, which is not an exact explanation.
 - `test_guest_profiles_real.py` still expects `--guest-profile` to auto-create its ini files; it needs pre-seeded profile files (or the hook) to run unchanged and was not updated or run.
 
+## Building interactions (doors, knock, enter/exit)
+
+What a remote puppet does when its owner knocks, opens a door, walks in and comes out again. No protocol change: the MOVE `action_state` (vanilla main index + entry counter) and the existing scene event drive everything; the only sender change is a VALUE: `facing_angle` carries `shape_info.rotation.y` for KNOCK_DOOR and DOOR (as it already did for TURN_DASH), because `AnimationMove_base` turns the visual facing toward the door while `world.angle.y` holds the state's fixed target angle.
+
+### Behaviour (pc/src/pc_remote_player.c)
+- KNOCK_DOOR (100): row `knock_door`, KNOCK1 on the body layer + the carried item pose, STOP at 0.5. Flag ROOT_PIN.
+- DOOR (4): row `door`, OPEN1 on both layers, STOP at 0.5. Flags ROOT_PIN | HIDE_AT_END: when the clip ends the puppet is hidden (`hidden_door`) until the scene event arrives, a new scene presence is consumed, or 600 frames pass. Not cleared by the 90 frame silent-peer gap (an owner inside a building keeps sending).
+- OUTDOOR (5): row `outdoor`, GO_OUT_O1 on both layers, STOP at 0.5 from frame 1. Flag SCENE_ENTRY and NO root pin: vanilla has no `ct_base` there, `world.position` stays put and the clip's own root translation walks the body out. (The old PCFB comment claiming `AnimationMove` root motion was wrong and was replaced.) It starts from the scene-change clear (and from first sight on a fresh actor) and is not released by that clear.
+- ROOT_PIN reproduces vanilla `ct_base` TRANS_XZ|ROT_Y with `Set_base_shape_trs(0,1000,0,0,0,0x4000)`: the draw of joint 0 then uses the base translation (0) instead of the clip root, so the clip is not added on top of the synced position (no double root motion). `AnimationMove_base` is never run on a puppet; the pin is dropped on row release and on any rebind.
+- Scene gate: `dw` draws a puppet only while its announced scene is the town this process shows (`pc_remote_player_scene_is_local_field`); interiors are not shared, so an owner inside a building (whose MOVEs carry interior coordinates) is never drawn as an idle ghost. Effects, sounds and collision were already gated by it.
+- Return: `on_scene` records `scene_accept_frame` and arms `snap_req`. The puppet stays hidden until a MOVE received at/after that frame exists, then every older sample is dropped so it is placed at the first post-scene sample (no slide through stale interior positions, no interpolation from old samples; escapes: 60 frames without any MOVE, or the frame clock restarting). That placement frame never sets `pos_snapped` (which would release the row).
+- Collision: the puppet's pipe is held (silent) while a KNOCK_DOOR / DOOR / OUTDOOR row runs, while hidden and while a scene event is pending.
+- Remote animation only writes the puppet's own `PCRemotePlayerVisual` / slot; nothing touches the local player's state.
+
+### Vanilla trace (include/m_player.h, src/game/m_player_main_*.c_inc)
+knock_door: Base1(KNOCK1) + Base2 STOP 0.5, ct_base ROT_Y|TRANS_XZ, then request door. door: type 0 -> OPEN1 else INTO_S1 (shops), ct_base flags 5 (TRANS_XZ|ROT_Y), STOP 0.5, then the scene change. outdoor: GO_OUT_O1 (GO_OUT_S1 for the start demo), start frame 25 for type 0 else 1, no ct_base, then RETURN_OUTDOOR (idle fallback row).
+
+### Limitations
+- The building actor's own door open/close animation (ac_my_house / ac_house) is NOT synced: observers see the person walk into a closed door, the door itself stays shut.
+- The door type is not on the wire: OPEN1 is always shown (shop entries really play INTO_S1), and GO_OUT_O1 from frame 1 is shown for every exit (vanilla uses frame 25 for type 0, GO_OUT_S1 for the start demo). These are guesses.
+- The clip root end positions of OPEN1 / GO_OUT_O1 vs the owner's synced positions are unverified; a small pop at the end of the exit clip is possible.
+- Ordering of MOVE vs SCENE is not guaranteed. MOVEs received before the scene event are dropped on purpose; an OUTDOOR state that began before the event is only caught if it is still the current state when the event is consumed.
+- Interiors are not shared: a puppet in a building is simply not drawn; nobody sees what the owner does inside.
+- The knock sound is not reproduced.
+- Nothing was verified visually. Every statement above is source-level or hook-driven; no screenshot or two-screen play test was done.
+
+### Tests
+- `pc/tools/net_spike/test_building_interactions_src.py` (SOURCE AUDIT only): flags, row shapes, root pin apply/clear, hidden_door set/timeout/clears, scene gate, snap_req wait and trim, collision hold, sender facing value.
+- `pc/tools/net_spike/test_move_action_state_wire.py --only s3` (REAL host process + scripted client, HOOK-DRIVEN, no visual check): the parsed row table still covers all 121 indexes (now 48 filled rows incl. knock_door / door / outdoor) and every index, including 4, 5 and 100, logs the expected row without crashing the host.
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

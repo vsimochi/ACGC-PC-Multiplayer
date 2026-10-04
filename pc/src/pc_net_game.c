@@ -4151,8 +4151,13 @@ static void pcnetgame_sample_local_move(PLAYER_ACTOR* local, PCNetMoveMsg* msg) 
      * gradual turn. Every other state keeps these two fields in lockstep every frame (e.g.
      * m_player_main_walk.c_inc:155's `world.angle.y = shape_info.rotation.y = target`), so this
      * only changes behavior for TURN_DASH specifically. */
-    msg->facing_angle = (local->now_main_index == mPlayer_INDEX_TURN_DASH) ? actor->shape_info.rotation.y
-                                                                            : actor->world.angle.y;
+    /* Building interactions (docs/multiplayer-guest-roadmap.md): KNOCK_DOOR and DOOR are the same shape: the visual
+     * facing (shape_info.rotation.y) is turned toward the door by cKF_SkeletonInfo_R_AnimationMove_base while
+     * world.angle.y holds the state's fixed target angle. Value change only, the wire format is unchanged. */
+    msg->facing_angle = (local->now_main_index == mPlayer_INDEX_TURN_DASH || local->now_main_index == mPlayer_INDEX_KNOCK_DOOR ||
+                         local->now_main_index == mPlayer_INDEX_DOOR)
+                            ? actor->shape_info.rotation.y
+                            : actor->world.angle.y;
     msg->speed = actor->speed;
 }
 

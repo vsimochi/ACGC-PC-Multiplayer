@@ -185,6 +185,8 @@ typedef struct PCRemotePlayerVisual {
     int                   row_held_kind;       /* effective held kind when the row started (chain clip item pose) */
     int                   row_adopted;         /* M9-C Phase 6a: the active row was adopted on a fresh actor (no entry edge seen) */
     int                   rebind_from_row;     /* review R1-L3: current_anim_idx was invalidated by a row release (no skid replay) */
+    int                   hidden_door;         /* building interactions: a HIDE_AT_END row (DOOR) finished: the puppet has walked in, do not draw it */
+    double                hidden_door_since;   /* graph_dt_frame_time() when hidden_door was set (600 frame timeout) */
     int                   train_standing_latched; /* T4: this puppet's current 'standing in the train' period was already evaluated
                                                    * for a local arrival train (cleared when the state ends; zero at creation) */
 } PCRemotePlayerVisual;
@@ -470,6 +472,9 @@ typedef struct PCRemotePlayerSlot {
                                              * was evaluated (log state only -- registration itself is stateless) */
     int                collide_target_ok;  /* M9-B: test-hook accessor input: puppet is live, same-scene, has
                                              * snapshots and a visual (range/hold ignored) */
+    int                snap_req;           /* building interactions: a scene event was accepted; the puppet stays hidden and its snapshot ring is
+                                             * trimmed to samples received after scene_accept_frame before it is placed again */
+    double             scene_accept_frame; /* graph_dt_frame_time() when that scene event was accepted */
     int                latch_clear_req;    /* M9-C v7: the player's scene presence changed -> the puppet drops any one-shot
                                              * latch at its next move (consumed by pc_remote_player_row_pre) */
     PCRemotePlayerCosStats cos_stats;      /* M9-C Phase 3: cosmetic counters (diag) */
@@ -906,6 +911,13 @@ enum {
                                        * SetupItem_Base1() out-parameter the vanilla state passes on (Phase 2b) */
     PC_ROWF_CHAIN_STOP = 1 << 6,      /* the chain clip is a STOP clip (stays on its last frame), not REPEAT (stung_bee) */
     PC_ROWF_HIDE_BODY = 1 << 7,       /* vanilla draw type NONE (m_player.c Player_actor_draw): draw neither body nor item */
+    PC_ROWF_ROOT_PIN = 1 << 8,        /* building interactions: the state runs under AnimationMove ct_base (TRANS_XZ|ROT_Y) in vanilla, i.e. the
+                                       * clip's root translation is NOT applied (the synced world.position already contains the motion): pin
+                                       * the puppet's root with cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(0,1000,0,0,0,0x4000) +
+                                       * animation_enabled = TRANS_XZ|ROT_Y so the clip is not added on top of the position (no double root motion) */
+    PC_ROWF_HIDE_AT_END = 1 << 9,     /* the body has walked inside when the clip ends (DOOR): hide the puppet (v->hidden_door) until the scene
+                                       * event / snap / 600 frame timeout, so it never stands outside the closed door */
+    PC_ROWF_SCENE_ENTRY = 1 << 10,    /* OUTDOOR: the first state of a scene arrival; may start from the scene-change clear and is not released by it */
 };
 
 enum { PC_NETANG_DEFAULT = 0, PC_NETANG_RESET, PC_NETANG_READY, PC_NETANG_READY_WALK, PC_NETANG_SLIP,
@@ -1092,8 +1104,10 @@ static const PCStateRow s_state_rows[mPlayer_INDEX_NUM] = {
     [mPlayer_INDEX_TURN_DASH] = PCFB("locomotion basic: move_state TURN_DASH -> RUN_SLIP1 at fixed 0.5 + skid sound (Stage 4B.1, turn_dash.c_inc)"),
     [mPlayer_INDEX_FALL] = PCFB("m_player_main_fall.c_inc:26-28: WAIT1 REPEAT 0.5 + item pose = idle fallback (airborne stand; position synced by MOVE)"),
     [mPlayer_INDEX_WADE] = PCFB("m_player_main_wade.c_inc:32-34: WAIT1 REPEAT 0.5 + item pose = idle fallback (the slide across the wade tiles is position-synced)"),
-    [mPlayer_INDEX_DOOR] = PCFB("scene transition: clip chosen by door type + AnimationMove root motion (door.c_inc:34, ct_base): would double-apply root translation"),
-    [mPlayer_INDEX_OUTDOOR] = PCFB("scene transition: clip/frame from the door animation + AnimationMove root motion (outdoor.c_inc:37)"),
+    /* DOOR 4 (m_player_main_door.c_inc:22-37): clip OPEN1 (type 0, houses) or INTO_S1 (shops) on BOTH layers (no item pose), STOP 0.5, morph -9, ct_base TRANS_XZ|ROT_Y (flags 5) with Set_base_shape_trs(0,1000,0,0,0,0x4000): the walk-in is the synced position, so the row pins the clip root (ROOT_PIN); the door type is not on the wire: OPEN1 is shown. The puppet is hidden when the clip ends (HIDE_AT_END); the building actor's own door open/close is not synced. */
+    [mPlayer_INDEX_DOOR] = PCROW("door", mPlayer_ANIM_OPEN1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN | PC_ROWF_HIDE_AT_END, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* OUTDOOR 5 (m_player_main_outdoor.c_inc:23-43): GO_OUT_O1 (GO_OUT_S1 for the start demo) on BOTH layers, STOP 0.5, start frame 25 (type 0) or 1; NO ct_base: world.position stays where the state put it and the clip's own root translation walks the body out. Start frame 1.0 (the type is not on the wire). The row is SCENE_ENTRY: it starts when the puppet re-appears in the town and is not released by that scene change. */
+    [mPlayer_INDEX_OUTDOOR] = PCROW("outdoor", mPlayer_ANIM_GO_OUT_O1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_SCENE_ENTRY, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
     [mPlayer_INDEX_INVADE] = PCFB("m_player_main_invade.c_inc:19-20: WAIT1 REPEAT 0.5 + item pose (entering a building) = idle fallback"),
     [mPlayer_INDEX_HOLD] = PCFB("interior furniture grab: clip depends on furniture class (hold.c_inc:58,139-151 HOLD_WAIT1/_O1/_H1), not transmitted"),
     [mPlayer_INDEX_PUSH] = PCFB("interior furniture push: AnimationMove root motion (push.c_inc:47, ct_base)"),
@@ -1157,7 +1171,8 @@ static const PCStateRow s_state_rows[mPlayer_INDEX_NUM] = {
     /* REMOVE_GRASS 98 (m_player_main_remove_grass.c_inc:25-27): SetupItem_Base1(ZASSOU1) + Base2(ZASSOU1, item pose, 1, 1, 0.5, morph -6, STOP, PART_TABLE_PICK_UP (explicit, not the item's)). The frame-17 weed-pull presentation (grass_mud effect + zassou_nuku sound, only while the target tile still holds grass) is the Phase 6b tool table; the weed removal itself is a world change and stays host-authoritative. */
     [mPlayer_INDEX_REMOVE_GRASS] = PCROW_ITEM("remove_grass", mPlayer_ANIM_ZASSOU1, mPlayer_PART_TABLE_PICK_UP, PC_STOP, 0, -1, PC_NETANG_RESET),
     [mPlayer_INDEX_SHOCK] = PCFB("shock.c_inc:34-36,84-114: WAIT1 for a REQUEST-dependent start_time (20/24/60 ticks, not synced) then GAAAN1 -> GAAAN2: time-driven phases the wire cannot reproduce"),
-    [mPlayer_INDEX_KNOCK_DOOR] = PCFB("AnimationMove root motion (knock_door.c_inc:27-32, ct_base)"),
+    /* KNOCK_DOOR 100 (m_player_main_knock_door.c_inc:27-33): SetupItem_Base1(KNOCK1) + Base2(KNOCK1, item pose, 1, 1, 0.5, morph -5, STOP, part table from SetupItem), under ct_base ROT_Y|TRANS_XZ: the synced position is already the knock position, so ROOT_PIN. The sound at the knock frame is not reproduced. */
+    [mPlayer_INDEX_KNOCK_DOOR] = PCROW_ITEM("knock_door", mPlayer_ANIM_KNOCK1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_ROOT_PIN, -1, PC_NETANG_RESET),
     [mPlayer_INDEX_CHANGE_CLOTH] = PCFB("change_cloth.c_inc:49-62: clip/speed by try_on_flag (MENU_CHANGE1 @1.0 vs ITAZURA1 @0.5), not synced"),
     /* PUSH_SNOWBALL 102 (m_player_main_push_snowball.c_inc:43-50): SetupItem_Base1(PUSH_YUKI1), part table from the item pose but forced to NET when anim1 != PUSH_YUKI1; Base1 REPEAT, start frames 0.0/0.0 (not 1.0), speed 0.5. Net carried angle: dummy_net table entry 102 = walk (m_player_item_net.c_inc table, 2 entries/line from index 0 at line 8 -> line 59). */
     [mPlayer_INDEX_PUSH_SNOWBALL] = PCROW("push_snowball", mPlayer_ANIM_PUSH_YUKI1, PC_ROW_A1_ITEM, PC_NORMAL, PC_REPEAT, 0.5f, 0.0f, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_PT_NET_IF_ITEM, -1, -1, 0, 1.0f, PC_NETANG_WALK, PC_TEMPO_FIXED),
@@ -1210,6 +1225,23 @@ static const PCStateRow* pc_remote_player_row_for(int idx) {
         return NULL;
     }
     return &s_state_rows[idx];
+}
+
+/* Building interactions: the puppet's body (and carried item) is not drawn and spawns no effects/sounds: the HIDE_BODY row
+ * (hide / standing_train) or the walked-in door state (v->hidden_door, set when a HIDE_AT_END row ended). */
+static int pc_remote_player_body_hidden(const PCRemotePlayerActor* self) {
+    const PCRemotePlayerVisual* v = &self->visual;
+
+    if (v->hidden_door) {
+        return 1;
+    }
+    if (v->row_active) {
+        const PCStateRow* hrow = pc_remote_player_row_for(v->row_idx);
+        if (hrow != NULL && (hrow->flags & PC_ROWF_HIDE_BODY)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Catalog umbrella display lists: the same {handle, canopy} pairs ac_t_umbrella.c's draw_dt[] and the inventory
@@ -1616,6 +1648,8 @@ static void pc_remote_player_draw_item(PCRemotePlayerActor* self, GAME* game) {
 
 #define PC_REMOTE_PLAYER_LATCH_TIMEOUT_FRAMES 120.0 /* fallback may cut a one-shot this long after its edge */
 #define PC_REMOTE_PLAYER_ACTION_GAP_FRAMES 90.0     /* no MOVE for this long clears a one-shot latch */
+#define PC_REMOTE_PLAYER_HIDDEN_DOOR_TIMEOUT_FRAMES 600.0 /* a walked-in (DOOR) puppet whose scene event never arrives re-appears after this */
+#define PC_REMOTE_PLAYER_SCENE_FRESH_TIMEOUT_FRAMES 60.0  /* a scene event waits at most this long for a MOVE received after it */
 
 static void pc_puppet_sweat_kill(PCRemotePlayerActor* self, const char* reason); /* review H1 (defined with the Phase 3 block) */
 
@@ -1646,6 +1680,7 @@ static void pc_remote_player_row_release(PCRemotePlayerActor* self, const char* 
     v->row_chained = 0;
     v->item_hidden = 0;
     v->item_restart = 0;
+    v->keyframe0.animation_enabled = 0; /* ROOT_PIN rows: the root pin ends with the row */
     v->current_anim_idx = -1; /* force the fallback block to rebind both layers + part table */
     v->current_anim1_idx = -1;
     v->current_part_table = -1;
@@ -1658,6 +1693,7 @@ static void pc_remote_player_bind_body(PCRemotePlayerVisual* v, int a0, int a1, 
                                                                      frame, speed, 0.0f, mode);
     v->current_anim_idx = a0;
     v->current_anim1_idx = a1;
+    v->keyframe0.animation_enabled = 0; /* a (re)bind drops a previous ROOT_PIN (row_start re-applies it) */
 }
 
 /* Starts `row` (restart if it is already active). Returns 0 and leaves the puppet on its fallback if a clip pointer is
@@ -1711,6 +1747,18 @@ static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const 
     if (pt != v->current_part_table) {
         mPlib_DMA_player_Part_Table(v->part_table, pt);
         v->current_part_table = pt;
+    }
+    if (row->flags & PC_ROWF_ROOT_PIN) {
+        /* vanilla ct_base (TRANS_XZ|ROT_Y) + Set_base_shape_trs(0,1000,0,0,0,0x4000): the joint-0 draw (c_keyframe.c, cKF draw joint)
+         * then uses base_model_translation x/z (0) instead of the clip's root translation, so the clip never adds its own travel
+         * to the synced position. AnimationMove_base is deliberately NOT run (the position is synced, never integrated here). */
+        cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(&v->keyframe0, 0.0f, 1000.0f, 0.0f, 0, 0, 0x4000);
+        v->keyframe0.animation_enabled = cKF_ANIMATION_TRANS_XZ | cKF_ANIMATION_ROT_Y;
+    } else {
+        v->keyframe0.animation_enabled = 0;
+    }
+    if (row->flags & PC_ROWF_SCENE_ENTRY) {
+        v->hidden_door = 0; /* the owner is out again */
     }
 
     v->row_active = 1;
@@ -1767,6 +1815,12 @@ static void pc_remote_player_row_pre(PCRemotePlayerActor* self, PCRemotePlayerSl
         return; /* review R1-L1: no MOVE seen yet (fresh actor / reconnect): nothing to adopt, so the first real pair is adopted
                  * silently (steady rows start) instead of being treated as an entry edge of an action in progress */
     }
+    if (slot->snap_req) {
+        return; /* a scene event is waiting for its first fresh MOVE (mv): the stale pre-scene state must not start or release anything */
+    }
+    if (v->hidden_door && (now - v->hidden_door_since) > PC_REMOTE_PLAYER_HIDDEN_DOOR_TIMEOUT_FRAMES) {
+        v->hidden_door = 0; /* the scene event never came: never stay invisible */
+    }
 #ifdef TARGET_PC
     pc_remote_player_arrival_train_poll(self, slot, valid && idx == (int)mPlayer_INDEX_DEMO_STANDING_TRAIN);
 #endif
@@ -1783,7 +1837,32 @@ static void pc_remote_player_row_pre(PCRemotePlayerActor* self, PCRemotePlayerSl
     /* clears first: scene presence change / teleport snap / snapshot gap */
     if (slot->latch_clear_req) {
         slot->latch_clear_req = 0;
+        v->hidden_door = 0; /* scene presence changed: the scene gate / the new snapshots decide visibility from here */
+        if (active != NULL && (active->flags & PC_ROWF_SCENE_ENTRY)) {
+            /* an arrival (OUTDOOR) row survives the scene change that brought the owner back into this town */
+            v->pair_known = 1;
+            v->pair_valid = valid;
+            v->pair_idx = (uint8_t)(idx < 0 ? 0 : idx);
+            v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
+            return;
+        }
         pc_remote_player_row_release(self, "scene");
+        if (valid && idx == (int)mPlayer_INDEX_OUTDOOR) {
+            /* the owner arrives out of a building: play the exit from its start (the clear would otherwise adopt it silently) */
+            row = pc_remote_player_row_for(idx);
+            if (row != NULL && (row->flags & PC_ROWF_SCENE_ENTRY) && row->mode == cKF_FRAMECONTROL_STOP) {
+                v->pair_known = 1;
+                v->pair_valid = valid;
+                v->pair_idx = (uint8_t)idx;
+                v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
+                if (pc_remote_player_row_start(self, idx, row, raw_kind, held_kind, now, &a0, &a1, &pt) && diag) {
+                    printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=%s anim0=%d anim1=%d part_table=%d "
+                           "mode=stop latch=on (scene entry)\n",
+                           (int)self->peer, idx, ctr, row->name, a0, a1, pt);
+                }
+                return;
+            }
+        }
         if (v->pair_known) {
             v->pair_valid = valid; /* adopt the current pair silently: no restart without a NEW edge */
             v->pair_idx = (uint8_t)(idx < 0 ? 0 : idx);
@@ -1811,7 +1890,7 @@ static void pc_remote_player_row_pre(PCRemotePlayerActor* self, PCRemotePlayerSl
         v->pair_idx = (uint8_t)(idx < 0 ? 0 : idx);
         v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
         row = valid ? pc_remote_player_row_for(idx) : NULL;
-        if (row != NULL && row->mode == cKF_FRAMECONTROL_REPEAT &&
+        if (row != NULL && (row->mode == cKF_FRAMECONTROL_REPEAT || (row->flags & PC_ROWF_SCENE_ENTRY)) &&
             pc_remote_player_row_start(self, idx, row, raw_kind, held_kind, now, &a0, &a1, &pt) && diag) {
             printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=%s anim0=%d anim1=%d part_table=%d "
                    "mode=repeat latch=off\n",
@@ -1897,6 +1976,10 @@ static void pc_remote_player_row_post(PCRemotePlayerActor* self, int play_state,
             v->row_chained = 1; /* steady pose now (vanilla: InitAnimation_Base1/2 in the state): no latch */
         } else {
             v->row_finished = 1;
+            if ((row->flags & PC_ROWF_HIDE_AT_END) && !v->hidden_door) {
+                v->hidden_door = 1; /* the body is inside the building: never left standing outside the door */
+                v->hidden_door_since = now;
+            }
         }
     }
     if (v->row_pending) {
@@ -1991,6 +2074,14 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     }
     if (!self->visual.initialized) {
         return "no-visual";
+    }
+    /* building interactions: a puppet that is hidden, waiting for its first post-scene MOVE, or playing a door/knock/exit state
+     * (positions are scripted around a door) never shoves the local player */
+    if (slot->snap_req || pc_remote_player_body_hidden(self) ||
+        (self->visual.row_active && (self->visual.row_idx == (int)mPlayer_INDEX_KNOCK_DOOR ||
+                                     self->visual.row_idx == (int)mPlayer_INDEX_DOOR ||
+                                     self->visual.row_idx == (int)mPlayer_INDEX_OUTDOOR))) {
+        return "hold";
     }
     local = NULL;
     if (Common_Get(player_actor_exists)) {
@@ -2202,11 +2293,8 @@ static const char* pc_puppet_fx_reason_cost(PCRemotePlayerActor* self, PCRemoteP
     if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized) {
         return "scene"; /* includes an unknown (never announced) puppet scene */
     }
-    if (self->visual.row_active) {
-        const PCStateRow* hrow = pc_remote_player_row_for(self->visual.row_idx);
-        if (hrow != NULL && (hrow->flags & PC_ROWF_HIDE_BODY)) {
-            return "hidden";
-        }
+    if (pc_remote_player_body_hidden(self)) {
+        return "hidden";
     }
     if (_Game_play_isPause(play) == 1) {
         return "pause";
@@ -2934,11 +3022,8 @@ static const char* pc_pk_gate(PCRemotePlayerActor* self, PCRemotePlayerSlot* slo
     if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized) {
         return "scene";
     }
-    if (self->visual.row_active) {
-        const PCStateRow* hrow = pc_remote_player_row_for(self->visual.row_idx);
-        if (hrow != NULL && (hrow->flags & PC_ROWF_HIDE_BODY)) {
-            return "hidden";
-        }
+    if (pc_remote_player_body_hidden(self)) {
+        return "hidden";
     }
     if (_Game_play_isPause(play) == 1) {
         return "pause";
@@ -4101,11 +4186,50 @@ static void pc_puppet_fx_dump_stats(const PCRemotePlayerSlot* slot, int player) 
     }
 }
 
+/* Building interactions: a scene event (on_scene) arms slot->snap_req. The puppet stays hidden (dw) until the ring holds a MOVE
+ * received at or after the event; then every older sample (the owner's pre-scene MOVEs, e.g. interior coordinates) is dropped so the
+ * puppet is placed at the first post-scene sample instead of sliding/teleporting through stale positions. Returns 1 when resolved. */
+static int pc_remote_player_scene_snap_resolve(PCRemotePlayerSlot* slot, double now) {
+    PCRemoteMoveSnapshot keep[PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+    int n = slot->snapshot_count;
+    int oldest, i, kept = 0;
+
+    if (n == 0) {
+        return 0;
+    }
+    if (now < slot->scene_accept_frame) { /* the frame clock restarted (new GAME_PLAY): nothing to wait for */
+        slot->snap_req = 0;
+        return 1;
+    }
+    oldest = (slot->snapshot_head - n + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    for (i = 0; i < n; i++) {
+        const PCRemoteMoveSnapshot* sn = &slot->snapshots[(oldest + i) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+        if (sn->recv_local_frame >= slot->scene_accept_frame) {
+            keep[kept++] = *sn;
+        }
+    }
+    if (kept == 0) {
+        if ((now - slot->scene_accept_frame) > PC_REMOTE_PLAYER_SCENE_FRESH_TIMEOUT_FRAMES) {
+            slot->snap_req = 0; /* the owner sent nothing: show the last position rather than staying invisible */
+            return 1;
+        }
+        return 0;
+    }
+    for (i = 0; i < kept; i++) {
+        slot->snapshots[i] = keep[i];
+    }
+    slot->snapshot_count = kept;
+    slot->snapshot_head = kept % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    slot->snap_req = 0;
+    return 1;
+}
+
 static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
     PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
     PCRemotePlayerRenderState render;
     double target_time;
+    int just_placed = 0; /* building interactions: this frame resolved a pending scene event (see pc_remote_player_scene_snap_resolve) */
     int pos_snapped = 0; /* M9-C v7: an interpolator teleport snap / placement jump this frame (clears a one-shot latch) */
 
     if (slot == NULL) {
@@ -4120,7 +4244,10 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
      * the unknown. */
     target_time = graph_dt_frame_time(game) - PC_REMOTE_PLAYER_INTERP_DELAY_FRAMES;
 
-    if (pc_remote_player_interpolate(slot, target_time, &render)) {
+    if (slot->snap_req && pc_remote_player_scene_snap_resolve(slot, graph_dt_frame_time(game))) {
+        just_placed = 1;
+    }
+    if (!slot->snap_req && pc_remote_player_interpolate(slot, target_time, &render)) {
         {
             /* M9-B: an interpolator teleport-snap (or the first placement) moves the puppet far in a single frame;
              * keep its collider out of the OC pass for a couple of frames so it cannot deep-overlap-pop the player. */
@@ -4129,6 +4256,12 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
             if ((jdx * jdx + jdz * jdz) > (PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST * PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST)) {
                 self->collide_hold = PC_REMOTE_PLAYER_COLLIDE_SNAP_HOLD_FRAMES;
                 pos_snapped = 1;
+            }
+            if (just_placed) {
+                /* first placement after a scene event: a jump to the door is expected and must NOT release a row (it would
+                 * cancel the exit row that is about to start) */
+                self->collide_hold = PC_REMOTE_PLAYER_COLLIDE_SNAP_HOLD_FRAMES;
+                pos_snapped = 0;
             }
         }
         actor->world.position = render.pos;
@@ -4428,11 +4561,14 @@ static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
 
     /* M9-C Phase 2b: HIDE (mPlayer_INDEX_HIDE 81) has vanilla draw type NONE (m_player.c, Player_actor_draw table), so the
      * peer's body and carried item are not drawn while that state is the active row. */
-    if (self->visual.row_active) {
-        const PCStateRow* hrow = pc_remote_player_row_for(self->visual.row_idx);
-        if (hrow != NULL && (hrow->flags & PC_ROWF_HIDE_BODY)) {
-            return;
-        }
+    if (pc_remote_player_body_hidden(self)) {
+        return;
+    }
+    /* Building interactions: a puppet is shown only while its announced scene is the town this process shows (the owner's
+     * MOVEs from inside a building carry interior coordinates: an interior is never shared), and not while a scene event
+     * still waits for its first fresh MOVE. */
+    if (slot->snap_req || !pc_remote_player_scene_is_local_field(slot, (GAME_PLAY*)game)) {
+        return;
     }
 
     /* Per-frame scratch matrices, exactly like the inventory preview (mIV_pl_shape_draw) --
@@ -4543,6 +4679,7 @@ static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot, int keep_sce
     slot->newest_sender_frame = 0;
     slot->snapshot_count = 0;
     slot->snapshot_head = 0;
+    slot->snap_req = 0;
 
     /* Stage 4C-1: a genuine disconnect (unlike a scene-generation staleness event, which never
      * calls this function) means whoever reconnects into this slot next -- possibly a completely
@@ -4767,6 +4904,8 @@ int pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* s
     slot->scene = *scene;
     slot->scene.valid = 1;
     slot->latch_clear_req = 1; /* M9-C v7: scene presence changed -> drop any one-shot latch at the next puppet move */
+    slot->snap_req = 1;        /* building interactions: hidden until the first MOVE received after this event; older samples are dropped */
+    slot->scene_accept_frame = (gamePT != NULL) ? graph_dt_frame_time(gamePT) : 0.0;
     return 1;
 }
 
@@ -4955,6 +5094,7 @@ void pc_remote_player_poll(void) {
             memset(slot->pk_ev, 0, sizeof(slot->pk_ev)); /* M9-C Phase 5: events of the old scene generation are meaningless */
             slot->actor = NULL;
             slot->pending_create = 1;
+            slot->snap_req = 0; /* the new actor is created at the newest sample; the scene gate decides its visibility */
         }
 
         /* Liveness timeout: only for relay-discovered peers (see pc_remote_player_on_move()) --
