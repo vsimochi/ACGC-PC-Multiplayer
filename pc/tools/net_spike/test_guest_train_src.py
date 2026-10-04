@@ -163,8 +163,10 @@ def main():
     ck("wire: PC_NETGAME_PROTOCOL_VERSION is still 8 and pc_net_game.h has no change vs the baseline", "#define PC_NETGAME_PROTOCOL_VERSION 8u" in ngc and ngc == ng)
     changed = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--ignore-cr-at-eol", BASELINE] + ([FIX_COMMIT] if FIX_COMMIT else []), capture_output=True,
                              text=True, timeout=60).stdout.split()
-    ck("wire: no pc/src/pc_net*.c / pc_remote_player.c / protocol file is touched (%s)" % ",".join(changed),
-       not any(re.search(r"pc_net|pc_remote_player|protocol", c) and not c.endswith(".py") for c in changed))
+    # T3 / T4 (pinned update): pc/src/pc_remote_player.c is now legitimately changed (puppet rows + the arrival-train hook, audited by
+    # test_guest_arrival_sync_src.py: additive/pinned, no wire change); every pc_net* / protocol file is still untouched.
+    ck("wire: no pc/src/pc_net*.c / protocol file is touched (%s)" % ",".join(changed),
+       not any(re.search(r"pc_net|protocol", c) and not c.endswith(".py") for c in changed))
 
     bad = [d for d, ok in results if not ok]
     print("-" * 60)

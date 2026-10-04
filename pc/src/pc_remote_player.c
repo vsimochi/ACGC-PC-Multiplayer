@@ -65,6 +65,10 @@
 #include "ac_effectbg.h" /* M9-C Phase 4: EffectBG_EFFECT_SHAKE_LARGE / EffectBG_VARIANT_* (remote tree-shake presentation) */
 #include "ef_effect_control.h" /* M9-C Phase 2a: eEC_EFFECT_TURI_MIZU (alias proof for the relax_rod row); Phase 3: eEC_CLIP + effect ids */
 #include "m_collision_bg.h" /* M9-C Phase 3: mCoBG_Wpos2Attribute() (read-only ground attribute), mCoBG_ATTRIBUTE_* */
+#ifdef TARGET_PC
+#include "m_train_control.h"          /* T4: mTRC_pc_remote_arrival() (the only train API this file calls, through its guard) */
+#include "pc_remote_arrival_logic.h"  /* T3 / T4: pure per-puppet latch + DEMO_WALK mapping (natively tested) */
+#endif
 #include "m_kankyo.h"        /* M9-C Phase 3: mEnv_NowWeather(), mEnv_WEATHER_* (caller-side effect guard) */
 #define PC_REMOTE_PLAYER_HAVE_EEC_ENUM 1
 #include "audio.h" /* Stage 4B.1: sAdo_OngenTrgStart() -- see the TURN_DASH skid sound in
@@ -181,6 +185,8 @@ typedef struct PCRemotePlayerVisual {
     int                   row_held_kind;       /* effective held kind when the row started (chain clip item pose) */
     int                   row_adopted;         /* M9-C Phase 6a: the active row was adopted on a fresh actor (no entry edge seen) */
     int                   rebind_from_row;     /* review R1-L3: current_anim_idx was invalidated by a row release (no skid replay) */
+    int                   train_standing_latched; /* T4: this puppet's current 'standing in the train' period was already evaluated
+                                                   * for a local arrival train (cleared when the state ends; zero at creation) */
 } PCRemotePlayerVisual;
 
 /* M9-C Phase 3 (locomotion cosmetics): per-actor puppet state. Zero-initialised at actor creation (a recreated puppet,
@@ -1119,11 +1125,12 @@ static const PCStateRow s_state_rows[mPlayer_INDEX_NUM] = {
     [mPlayer_INDEX_TAKEOUT_ITEM] = PCFB("takeout_item.c_inc:31-43,75-100: kind-dependent (umbrella UMB_OPEN1 vs reversed PUTAWAY1 = Base3), item_scale 0->1 and a mid-state clip switch; the puppet has no reverse-play or item_scale infrastructure"),
     [mPlayer_INDEX_PUTIN_ITEM] = PCFB("putin_item.c_inc:22-54,75-88: kind from the pocket submenu (not the carried kind), UMB_CLOSE1 vs PUTAWAY1 and an item_scale 1->0 curve; no item_scale infrastructure"),
     [mPlayer_INDEX_DEMO_WAIT] = PCFB("m_player_main_demo_wait.c_inc:38-40: WAIT1 REPEAT 0.5 + item pose = idle fallback (scripted demo)"),
-    [mPlayer_INDEX_DEMO_WALK] = PCFB("demo_walk.c_inc:21-41: WALK1 (or WAIT1 near the goal) REPEAT with a demo-driven tempo (CulcAnimation_Demo_walk); scripted, kept on the move_state mapping"),
+    [mPlayer_INDEX_DEMO_WALK] = PCFB("demo_walk.c_inc:21-41: WALK1 (or WAIT1 near the goal) REPEAT with a demo-driven tempo (CulcAnimation_Demo_walk); scripted, kept on the fallback block, which maps it to WALK1 (T3: pcarr_demo_walk_plays_walk, the sender classifies it OTHER)"),
     [mPlayer_INDEX_DEMO_GETON_TRAIN] = PCFB("scripted train demo with AnimationMove root motion (demo_geton_train.c_inc, ct_base)"),
     [mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT] = PCFB("scripted train demo: INTRAIN_WAIT1 REPEAT (demo_geton_train_wait.c_inc:11), demo-driven; fallback by policy"),
-    [mPlayer_INDEX_DEMO_GETOFF_TRAIN] = PCFB("scripted train demo with AnimationMove root motion (demo_getoff_train.c_inc, ct_base)"),
-    [mPlayer_INDEX_DEMO_STANDING_TRAIN] = PCFB("demo_standing_train.c_inc:14-15: WAIT1 REPEAT 0.5 + item pose = idle fallback (scripted)"),
+    [mPlayer_INDEX_DEMO_GETOFF_TRAIN] = PCFB("scripted train demo with AnimationMove root motion (demo_getoff_train.c_inc:20-31, ct_base + OUTTRAIN1): a puppet row would draw the clip's own root translation on top of the synced position (the puppet never runs AnimationMove), so it stays a fallback (T3: deliberately NOT an OUTTRAIN1 row)"),
+    /* DEMO_STANDING_TRAIN (m_player_main_demo_standing_train.c_inc: WAIT1, forced by the ride-off demo to caboose + (60, 20, 20) every frame, ac_train1_move.c_inc:83-95). T3: HIDDEN while the state lasts (PC_ROWF_HIDE_BODY, the HIDE row's mechanism and clears: snap / gap / scene / any other state). The guest is carried by a train this process does not have (or has a few seconds off); the T4 arrival train (mTRC_pc_remote_arrival) is started from the entry of this state. */
+    [mPlayer_INDEX_DEMO_STANDING_TRAIN] = PCROW("standing_train", mPlayer_ANIM_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0.5f, 1.0f, PC_ROWF_HIDE_BODY, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
     [mPlayer_INDEX_DEMO_WADE] = PCFB("demo_wade.c_inc:27-28: WAIT1 REPEAT 0.5 + item pose = idle fallback (scripted)"),
     /* HIDE 81 (m_player_main_hide.c_inc:10-12 binds no clip; m_player.c Player_actor_draw: draw type table index 81 == mPlayer_DRAW_TYPE_NONE): the row exists only for the HIDE_BODY flag (body + item not drawn). Cleared by the usual scene/snap/gap/edge releases. */
     [mPlayer_INDEX_HIDE] = PCROW("hide", mPlayer_ANIM_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0.5f, 1.0f, PC_ROWF_HIDE_BODY, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
@@ -1723,6 +1730,23 @@ static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const 
     return 1;
 }
 
+#ifdef TARGET_PC
+static int pc_remote_player_scene_is_local_field(const PCRemotePlayerSlot* slot, const GAME_PLAY* play);
+
+/* T4: the puppet is in the 'standing in the train' state (mPlayer_INDEX_DEMO_STANDING_TRAIN: the ride-off demo of an arriving player).
+ * Once per contiguous standing period (per-puppet latch in PCRemotePlayerVisual, cleared when the state ends and by actor re-creation) and
+ * only while the puppet's announced scene is the town this process shows, ask the train code to start the local arrival train through its
+ * guard (mTRC_pc_remote_arrival: no own train, no title demo, no local arrival, no pending request). Reads the wire state only, sends nothing. */
+static void pc_remote_player_arrival_train_poll(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, int standing) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    int in_town = (gamePT != NULL && slot != NULL) ? pc_remote_player_scene_is_local_field(slot, play) : 0;
+
+    if (pcarr_remote_standing_should_evaluate(&self->visual.train_standing_latched, standing, in_town)) {
+        (void)mTRC_pc_remote_arrival((GAME*)play, (int)self->peer, in_town);
+    }
+}
+#endif
+
 /* Entry-edge detection + row start/latch bookkeeping; runs once per puppet move BEFORE the fallback animation block.
  * fb_* are the fallback (move_state / carried pose) values, logged for rows without an override. */
 static void pc_remote_player_row_pre(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, double now, int raw_kind,
@@ -1742,6 +1766,9 @@ static void pc_remote_player_row_pre(PCRemotePlayerActor* self, PCRemotePlayerSl
         return; /* review R1-L1: no MOVE seen yet (fresh actor / reconnect): nothing to adopt, so the first real pair is adopted
                  * silently (steady rows start) instead of being treated as an entry edge of an action in progress */
     }
+#ifdef TARGET_PC
+    pc_remote_player_arrival_train_poll(self, slot, valid && idx == (int)mPlayer_INDEX_DEMO_STANDING_TRAIN);
+#endif
     active = v->row_active ? pc_remote_player_row_for(v->row_idx) : NULL;
     oneshot_held = (active != NULL && active->mode == cKF_FRAMECONTROL_STOP && !v->row_chained);
     if (active != NULL && (active->flags & PC_ROWF_HIDE_BODY)) {
@@ -4170,6 +4197,15 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
             case PC_MOVE_STATE_TURN_DASH: desired_anim_idx = mPlayer_ANIM_RUN_SLIP1; break;
             default:                      desired_anim_idx = mPlayer_ANIM_WAIT1;    break;
         }
+#ifdef TARGET_PC
+        /* T3: DEMO_WALK (scripted walks: the arrival walk to the station exit, NPC-driven walks) is classified OTHER by the sender, which
+         * mapped it to WAIT1 and made the puppet slide in idle. The vanilla state plays WALK1 with the walk tempo (demo_walk.c_inc). It has
+         * no state row (PCFB), so this fallback block owns it; the tempo formula below applies because the clip is WALK1. */
+        if (pcarr_demo_walk_plays_walk(self->cosmetic_action_valid, (int)self->cosmetic_action_index, (int)mPlayer_INDEX_DEMO_WALK,
+                                       self->cosmetic_move_state == PC_MOVE_STATE_OTHER)) {
+            desired_anim_idx = mPlayer_ANIM_WALK1;
+        }
+#endif
 
         /* M9-C Phase 1: held item. The EFFECTIVE kind comes from the same interpolation result as move_state
          * (self->cosmetic_item_kind, set above from render.item_kind). Deferred/unknown kinds behave exactly like

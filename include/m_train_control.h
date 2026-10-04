@@ -40,6 +40,10 @@ enum {
 
 extern void mTRC_init(GAME* game);
 extern void mTRC_move(GAME* game);
+#ifdef TARGET_PC
+/* T4: a remote puppet entered the 'standing in the train' state: start the local vanilla arrival train if the guard allows. 1 = started. */
+extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town);
+#endif
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,7 @@
 #ifdef TARGET_PC
 #include "pc_log.h"           /* T1: train lifecycle diagnostics */
 #include "pc_arrival_logic.h" /* T2: title-demo-1 -> other edge decision (pure, natively tested) */
+#include "pc_remote_arrival_logic.h" /* T4: remote-arrival train guard (pure, natively tested) */
 #endif
 
 #define mTRC_RTC_TIME_SECONDS(rtc_time) \
@@ -558,6 +559,46 @@ static void mTRC_pc_title_edge(GAME* game) {
     } else if (was && !s_was_start1) {
         PC_LOG(PCL_GENERAL, "[TRAIN] title demo 1 -> %d: pre-game scene, vanilla flow (no re-init)\n", demo);
     }
+}
+
+/* T4: a remote puppet just entered the 'standing in the train' state (the vanilla ride-off demo of an arriving player, seen on the wire as
+ * main index DEMO_STANDING_TRAIN) in the town. Start the vanilla arrival train on THIS process the way the arriving client's demo does
+ * (ac_ride_off_demo_move.c_inc aROD_first_set: train_coming_flag = 3; mTRC_schedule -> mTRC_demo_init puts the train at x 2037, it slows,
+ * stops, waits about 20 s of RTC time and leaves). Every process runs its own train (nothing about it is synced), so this is a local
+ * presentation only; it is called ONLY through the pure guard pcarr_remote_arrival_train_decide() (no train of its own, no title demo,
+ * no local arrival / boarding, no pending request) and the caller latches once per standing period. No passenger is forced: the
+ * train's arg0 / arg1 are set only by the ride-off demo / station master, never here.
+ * puppet_in_local_town: the puppet's announced scene is the town field this process shows (checked by the caller, which owns the slot).
+ * Returns 1 when the train was started. */
+extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* player = get_player_actor_withoutCheck(play);
+    int local_demo = FALSE;
+    int main_index;
+    int why;
+
+    if (player != NULL) {
+        main_index = mPlib_get_player_actor_main_index(game);
+        local_demo = main_index == mPlayer_INDEX_DEMO_STANDING_TRAIN || main_index == mPlayer_INDEX_DEMO_GETOFF_TRAIN ||
+                     main_index == mPlayer_INDEX_DEMO_GETON_TRAIN || main_index == mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT ||
+                     Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL ||
+                     Actor_info_name_search(&play->actor_info, mAc_PROFILE_INTRO_DEMO, ACTOR_PART_CONTROL) != NULL;
+    }
+
+    why = pcarr_remote_arrival_train_decide(0, puppet_in_local_town, play->scene_id == SCENE_FG && Common_Get(field_type) == mFI_FIELDTYPE2_FG,
+                                            player != NULL, mEv_CheckTitleDemo() != mEv_TITLEDEMO_NONE,
+                                            Common_Get(field_draw_type) == FIELD_DRAW_TYPE_TRAIN ||
+                                                Common_Get(field_draw_type) == FIELD_DRAW_TYPE_PLAYER_SELECT,
+                                            local_demo, (unsigned)Common_Get(train_coming_flag), (unsigned)Common_Get(train_action));
+    if (why != PCARR_REMOTE_TRAIN_OK) {
+        PC_LOG(PCL_GENERAL, "[TRAIN] remote arrival of player %d: NOT calling a local train (guard reason %d; action=%u coming_flag=%u)\n", peer, why,
+               (unsigned)Common_Get(train_action), (unsigned)Common_Get(train_coming_flag));
+        return 0;
+    }
+
+    Common_Set(train_coming_flag, 3);
+    PC_LOG(PCL_GENERAL, "[TRAIN] remote arrival of player %d: starting the local arrival train (coming_flag=3)\n", peer);
+    return 1;
 }
 #endif
 
