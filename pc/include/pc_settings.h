@@ -21,9 +21,12 @@ typedef struct {
     int master_volume;    /* Applied at the PC audio output, 0-100 (default 100) */
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */
     int cstick_deadzone;  /* Gamepad C-stick deadzone, percent 0-40 (default 12) */
+    int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..8 (default 4); out of range = ignored */
 } PCSettings;
 
 extern PCSettings g_pc_settings;
+/* G4: `--max-guests N` (host test / operator override of settings.ini max_guests); 0 = no override. Set by pc_main.c, valid 1..8. */
+extern int g_pc_max_guests_override;
 
 void pc_settings_load(void);
 void pc_settings_save(void);

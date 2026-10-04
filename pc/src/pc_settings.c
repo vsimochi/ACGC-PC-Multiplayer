@@ -20,7 +20,10 @@ PCSettings g_pc_settings = {
     .master_volume = 100,
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
+    .max_guests = 4,
 };
+
+int g_pc_max_guests_override = 0;
 
 static const char* SETTINGS_FILE = "settings.ini";
 
@@ -69,7 +72,11 @@ static const char* DEFAULT_SETTINGS =
     "[Input]\n"
     "# Gamepad stick deadzones as a percentage (0-40)\n"
     "stick_deadzone = 12\n"
-    "cstick_deadzone = 12\n";
+    "cstick_deadzone = 12\n"
+    "\n"
+    "[Network]\n"
+    "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n"
+    "max_guests = 4\n";
 
 static const char* skip_ws(const char* s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -120,6 +127,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val >= 0 && val <= 40) g_pc_settings.stick_deadzone = val;
     } else if (strcmp(key, "cstick_deadzone") == 0) {
         if (val >= 0 && val <= 40) g_pc_settings.cstick_deadzone = val;
+    } else if (strcmp(key, "max_guests") == 0) {
+        if (val >= 1 && val <= 8) g_pc_settings.max_guests = val;
     }
 }
 
@@ -208,6 +217,10 @@ void pc_settings_save(void) {
     fprintf(f, "# Gamepad stick deadzones as a percentage (0-40)\n");
     fprintf(f, "stick_deadzone = %d\n", g_pc_settings.stick_deadzone);
     fprintf(f, "cstick_deadzone = %d\n", g_pc_settings.cstick_deadzone);
+    fprintf(f, "\n");
+    fprintf(f, "[Network]\n");
+    fprintf(f, "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n");
+    fprintf(f, "max_guests = %d\n", g_pc_settings.max_guests);
     fclose(f);
     printf("[Settings] Saved %s\n", SETTINGS_FILE);
 }

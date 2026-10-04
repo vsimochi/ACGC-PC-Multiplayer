@@ -67,6 +67,7 @@ typedef struct PCNetGameDedicatedPeerInfo {
 int  pc_net_game_dedicated_world_ready(void);   /* HOST && s_host_world_ready */
 int  pc_net_game_dedicated_peer_slots(void);    /* number of transport slots to iterate (0 unless HOST) */
 int  pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out); /* 1 iff the slot is not DISCONNECTED */
+int  pc_net_game_dedicated_guest_counts(int* bound, int* cap); /* G4: guests bound now / the max_guests cap; 1 iff HOST */
 /* what: 0 = transport-connected, 1 = READY (bound), 2 = disconnected (call BEFORE the per-peer state is reset). Prints one "[DEDICATED] ..." line. */
 void pc_net_game_dedicated_announce(int peer, int what);
 

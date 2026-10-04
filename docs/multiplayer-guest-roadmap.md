@@ -106,10 +106,84 @@ Limitations:
 * The gender look fix is one extra fade-out scene load of the town after the first adopt (only when the gender differs).
 * The host's own resident / house bytes in the GCI change by themselves on its periodic save; the test therefore pins slots 1..3 strictly and slot 0 by a control envelope.
 
-## G4 - capacity
+## G4 - capacity and identity separation under concurrency
 
-Status: Not started. Planned: host setting `max_guests` (default 4, clamp 0..8), clean refusal ("guest limit reached"), reply instead of a silent drop of a 9th transport peer,
-soak test with several real guests plus residents.
+Status: **Complete, with limitations** (every focused test green; the real-client tier runs 2 guests + 1 resident, the harness limit, higher counts are scripted). Commit hash: (filled by orchestrator)
+
+What was implemented:
+
+* **Host-local cap `max_guests`** (default **4**, valid **1..8**). Read from `settings.ini` (`max_guests = N` under `[Network]`, parsed in `pc_settings.c`, written by the defaults text and the
+  settings writer; an out-of-range value is ignored and the default stays) and overridable per process with `--max-guests N` (1..8; a missing / 0 / 9 / non-numeric value exits 2 before any
+  initialisation). The flag wins over the file; both are clipped to the guest table size (8). It is a HOST setting only, nothing is sent to clients (no wire change, no protocol bump).
+* **Enforced at guest ADMISSION only** (`pcnetgame_host_guest_cap_refusal`, ONE call site in `pcnetgame_host_process_identity`, inside the guest-only `if (is_guest)` block): after the guest
+  claim was authenticated (key / token / name rules) and after the duplicate-binding handling, BEFORE any token is minted / re-minted or a table slot is created. A NEW key and a KNOWN
+  returning guest are treated alike: when the number of currently bound guests (READY peers bound as GUEST, excluding the asking peer) is >= `max_guests`, the peer is refused through the existing
+  path `REJECT(SERVER_FULL)` with the host log line `guest limit reached (N of max_guests=M guests are connected)`. Nothing is minted, created or written. A returning guest whose OLD session is
+  still bound is the existing duplicate case (parked; a silent old session is evicted after 2.5 s) and replaces ITS OWN binding without being counted twice. Residents never reach the gate (none
+  of the cap helpers is referenced by a resident branch); a resident is admitted while the guest cap is full. Behaviour under the cap is unchanged.
+* **Transport reserve** so guests can never lock a resident out: besides `max_guests`, a new guest is refused (same path, log `... held for residents ...`) when the occupied transport peers plus
+  the number of resident records of the town that are not the host's own and not connected would exceed `PC_NET_MAX_PEERS`. With a playing host (3 possible resident clients) at most 5 guests fit
+  even with `max_guests 8`; a dedicated / observer host (4 possible residents) fits at most 4. The transport itself is unchanged: a 9th peer is still dropped silently with no REJECT (the reserve
+  keeps guests from filling the table).
+* Dedicated console `status` shows `guests: bound=N max_guests=M` (`players` already lists the class / slot of every peer).
+* No identity defect was found (see below), so no identity code changed.
+
+Capacity facts (read from the code, then measured):
+
+| limit | value | source |
+|---|---|---|
+| transport peers (all clients: residents + guests together) | **8** (`PC_NET_MAX_PEERS`; the host is not a peer; a 9th is dropped silently) | pc_net.h, pc_net.c |
+| resident clients | up to 3 with a playing host, up to 4 with `--dedicated` / `--host-observer` | resident records 0..3 |
+| guest record slots | 4..11 (`PLAYER_NUM + guest table slot`) | pc_net_game.c |
+| guests.dat | 8 entries over ALL host towns, confirmed entries never evicted (table full -> `guest table is full`, SERVER_FULL) | pc_mp_guests.h |
+| puppets | `PC_REMOTE_PLAYER_SLOT_COUNT` = 9, indexed by TRANSPORT PEER id (host = 8), never by player_no | pc_remote_player.c |
+| per-peer host state | `s_host_peer`, link, record rx / tx buffers, dedup tables: all `[PC_NET_MAX_PEERS]`, indexed by peer id | pc_net_game.c |
+| `player_no` 4 | every guest client has exactly one local foreigner with player_no 4; the host never uses the number (a guest's host-derived context player_no is `PLAYER_NUM`; the record slot comes from the binding) | pc_net_game.c |
+| default `max_guests` | 4 (4 guests + up to 3 resident clients = 7 peers; 4 + 4 on a dedicated host = 8) | this milestone |
+
+So the total is bounded by the 8 transport peers, not by the table: residents + guests <= 8 at once; the useful guest maximum is 8 minus the residents that may connect, i.e. 5 with a playing host
+and 4 dedicated. The default of 4 keeps the puppet / appearance-texture memory and the 8-way message fan-out well inside what was tested.
+
+Identity separation under concurrency (read + tested; no defect found):
+
+* Binding is host-derived (`bound_class` / `bound_guest_slot` from the validated IDENTITY_EXT + token, never from a message); the record slot of a peer is derived ONLY from the binding
+  (`pcnetgame_peer_rec_slot`). Two guests with the same shared `player_no` 4 therefore never share a record, puppet, friendship / mail sender key (the guest key) or transaction journal.
+* Scripted tests: a guest key with ANOTHER guest's token, with no token, a new key carrying a connected guest's name, and a guest-flagged claim of a resident are all refused with every live
+  session unaffected; a guest leaving destroys only ITS puppet slot; a restart of the host keeps every record separate.
+* The money rock / shine-stone / gateway state of player_no 4 is process-local (each guest has its own process), not shared on the host.
+
+Tests (disposable fixtures only, ONE build, protocol version unchanged):
+
+| test | tier | result |
+|---|---|---|
+| test_guest_g4_src.py (new: settings parse / flag, cap placement, reserve, identity keys, wire, additive diff) | source audit | 27/27 |
+| test_guest_g4_protocol.py (new: 4 concurrent guests; cap 4 / 2 / 1 via default / flag / settings.ini; 5 guests + 3 residents on `--max-guests 8`; cross-token; records after restart; table full; CLI) | scripted clients vs REAL host | 65/65 |
+| test_guest_g4_real.py (new: 2 REAL guests + 1 REAL resident client, abrupt kill, restart, host restart) | REAL host + 3 REAL clients | 36/36 |
+| test_guest_protocol.py / test_guest_persist.py | existing, scripted vs REAL host | 174/174, 51/51 |
+| test_guest_g3_real.py | existing, REAL host + REAL client | 43/43 |
+| test_guest_src / g1_src / g2_src / g3_src, test_dedicated_src, test_observer_src | source audits | 81/81, 55/55, 44/44, 35/35 (one pin updated), 87/87, 65/65 |
+
+Pin updated: test_guest_g3_src "CLI path keeps exit(2)" asserted that `pc_main.c` has NO diff vs the G2 commit; G4 legitimately adds the `--max-guests` option, so the pin now reads exactly 11 added /
+0 removed lines (everything else in that check is unchanged; test_guest_g4_src.py pins the same on the G3 commit).
+
+What the scripted test asserts: four guests at once get slots 0..3 and four distinct tokens; the 5th is refused with the cap line and nothing is minted; a resident is admitted with the cap full;
+cross-token / token-less / name-clash / resident-claim attempts are refused with all sessions untouched; one guest leaving removes only its puppet; the refused guest then joins (slot 4); a known
+guest returning at a full cap is refused, but a returning guest replacing its own silent old binding is admitted; every guest is pushed ITS OWN record (byte-equal to its upload) at each reconnect
+and after the host restarts; guests.dat full: the 9th new guest gets `guest table is full`, not the cap line; with `--max-guests 8` and 3 resident records unconnected the 6th guest is refused
+(`held for residents`) and then all three residents are admitted (8 peers, 8 open puppet slots); with `--max-guests 2` / settings.ini `max_guests = 1` the 3rd / 2nd guest is refused naming the
+cap, and a new key at a full table AND a full cap gets the cap line. The real test asserts: three real processes bound as guest slot 0, guest slot 1 and resident 1 on three different peers, each
+client's guest_token.dat holds its OWN token (matching its guests.dat entry), three open host puppet slots, `private_data[2..3]` and `homes[1..3]` byte-identical to the baseline; after
+TerminateProcess of guest A only A's peer / puppet slot disappears (B and the resident stay connected, their slots open); A restarts into the SAME slot as the SAME guest (KNOWN, token verified,
+no MIGRATE, record byte-identical); after a host restart both guests reconnect to their own slot and byte-identical records.
+
+Limitations:
+
+* 8 simultaneous REAL clients were NOT run (the harness runs at most 3 client processes); 4 / 5 guests and 8 peers are scripted (FakeClient: no rendering, no puppet textures). The memory / frame cost
+  of 8 real puppets is still unmeasured, which is why the default stays 4.
+* A guest peer that is bound but silent keeps counting against the cap until the transport times it out or its own key returns (eviction at 2.5 s idle); a NEW guest meanwhile gets the cap refusal.
+* A refused guest only sees the numeric REJECT (`reason=2`) and goes offline; the readable reason (guest limit vs table full vs token) is G6.
+* The cap is per host process; guests.dat still holds 8 entries for all towns (no admin removal yet, G6).
+* `settings.ini` gets a `[Network]` section the next time the in-game settings are saved (the loader ignores unknown keys, so older builds still read the file).
 
 ## G5 - gameplay audit and guards
 
@@ -138,4 +212,4 @@ commands `guests`, `guest-reset`, `guest-remove` for token recovery; corrupt `gu
 ## Deferred
 
 * Town transfer from the host (so a guest needs no local copy), in-game profile creation UI (vanilla name editor), changing the look of an existing guest, villager -> guest
-  letters, catalog ordering for guests, per-feature guard messages (G5), the `max_guests` setting (G4), REJECT_INFO (G6).
+  letters, catalog ordering for guests, per-feature guard messages (G5), REJECT_INFO (G6), a soak test with 8 real clients (G4 follow-up).

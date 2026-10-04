@@ -149,8 +149,11 @@ def main():
     ck("G3.2 title failure path: every failure shows a message and returns 0 (pc_guest_title_fail), nothing exits: no exit / abort / SDL_Quit / g_pc_running in the join, the fail helper or the arrival",
        "exit(" not in join + cb("pc_guest_title_fail") + arr and "abort(" not in join + arr and "g_pc_running" not in join + arr
        and join.count("pc_guest_title_fail(") == 4 and join.count("return 0;") == 4 and join.count("return 1;") == 1)
-    ck("G3.2 CLI path keeps exit(2): the poll exits 2 on any arrival failure, the early validation in pc_main.c is untouched (--bootstrap-guest / --guest argument validation exits 2)",
-       poll.count("exit(2);") == 1 and numstat("pc/src/pc_main.c") == (0, 0) and numstat("pc/src/pc_vi.c") == (0, 0))
+    # G4 pin update: G4 added the host-side `--max-guests N` option to pc_main.c (11 purely ADDED lines: the option parse + two help lines, no line removed or changed); the early
+    # --bootstrap-guest / --guest validation is still untouched (deletions == 0), pc_vi.c is still untouched. Asserted again in test_guest_g4_src.py.
+    ck("G3.2 CLI path keeps exit(2): the poll exits 2 on any arrival failure, the early validation in pc_main.c is untouched (--bootstrap-guest / --guest argument validation exits 2; "
+       "G4: the only change to pc_main.c is the 11 added --max-guests lines, nothing removed)",
+       poll.count("exit(2);") == 1 and numstat("pc/src/pc_main.c") == (11, 0) and numstat("pc/src/pc_vi.c") == (0, 0))
     ck("G3.2 the arrival restores now_private / player_no / rtc_enabled when the init or the scene change fails (so a failed title join leaves the title usable), and checks the scene is "
        "ready (play_main, no wipe, a player actor) BEFORE anything is bound",
        re.search(r"mSDI_StartDataInitGuest\(gamePT\) != TRUE\) \{\s*Common_Set\(now_private, prev_private\);\s*Common_Set\(player_no, prev_player_no\);\s*Common_Set\(time\.rtc_enabled, prev_rtc\);", arr)

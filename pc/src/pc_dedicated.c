@@ -398,6 +398,12 @@ static void pc_ded_cmd_status(void) {
         printf("  frame limit: none (uncapped)\n");
     }
     printf("  peers: connected=%d ready=%d\n", transport, ready);
+    {
+        int gb = 0, gc = 0;
+        if (pc_net_game_dedicated_guest_counts(&gb, &gc)) {
+            printf("  guests: bound=%d max_guests=%d\n", gb, gc);
+        }
+    }
     if (s_last_save_ok < 0) {
         printf("  last save: none yet\n");
     } else {

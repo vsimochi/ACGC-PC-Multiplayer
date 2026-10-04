@@ -609,6 +609,8 @@ int main(int argc, char* argv[]) {
             printf("                      deterministically from the identity. The name must be a valid game name\n");
             printf("                      and must not equal a resident's name (otherwise exit code 2).\n");
             printf("                      See pc_m_card.c pc_bootstrap_guest_poll().\n");
+            printf("  --max-guests N      HOST: most guests (visitors with their own character) connected at once, 1..8 (default 4 or settings.ini\n");
+            printf("                      max_guests); a new guest beyond the cap is refused like a full server, residents are never refused.\n");
             printf("  --guest             CLIENT-only (requires --connect; exit code 2 with usage otherwise; cannot be combined with\n");
             printf("                      --host, --dedicated, --host-observer, --bootstrap-resident or --bootstrap-guest): join the host as a\n");
             printf("                      GUEST with your own new character instead of a resident. The profile lives in save/mp/guest.ini\n");
@@ -854,6 +856,15 @@ int main(int argc, char* argv[]) {
             /* Guests G1.1: the option is the last argument (no spec follows): never silently ignored */
             fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: the option needs a spec argument NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]\n");
             return 2;
+        } else if (strcmp(argv[i], "--max-guests") == 0) {
+            /* Guests G4: HOST-side cap on simultaneously bound guests (overrides settings.ini max_guests); a bad / missing value is never ignored. */
+            const int mg = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
+            if (i + 1 >= argc || mg < 1 || mg > 8) {
+                fprintf(stderr, "[PC] --max-guests: REFUSED: the option needs a number 1..8 (most guests connected at once)\n");
+                return 2;
+            }
+            g_pc_max_guests_override = mg;
+            i++;
         } else if (strcmp(argv[i], "--guest") == 0) {
             g_pc_guest = 1;
         } else if (strcmp(argv[i], "--host-observer") == 0) {

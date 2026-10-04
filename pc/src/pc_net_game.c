@@ -167,6 +167,7 @@
 #include "pc_save_bswap.h" /* D3: pc_save_bswap_private() for the canonical-BE record image */
 #include "pc_mp_records.h" /* D3-4: save/mp/records.dat sidecar (pure storage module) */
 #include "pc_mp_guests.h"  /* guests: save/mp/guests.dat host table + save/mp/guest_token.dat client token file (pure storage module) */
+#include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
 #include "m_player_lib.h" /* Stage 3: GET_PLAYER_ACTOR_NOW(), PLAYER_ACTOR, mPlayer_INDEX_*, and
                             * (transitively, via m_actor.h -> game.h) gamePT/GAME/
@@ -11398,6 +11399,62 @@ static int pcnetgame_host_peer_bound_to_guest(int gslot, PCNetPeerId except_peer
     return -1;
 }
 
+/* Guests G4: the host-local cap on simultaneously BOUND guests. `--max-guests N` (1..8) wins over settings.ini `max_guests` (1..8, default 4); either is
+ * clipped to the guest table size. Never read by any resident path. */
+static int pcnetgame_host_max_guests(void) {
+    int n = g_pc_max_guests_override > 0 ? g_pc_max_guests_override : g_pc_settings.max_guests;
+    if (n < 1) {
+        n = 1;
+    }
+    return n > PC_NETGAME_GUEST_MAX ? PC_NETGAME_GUEST_MAX : n;
+}
+
+/* Guests G4: READY peers currently bound to a guest slot, other than `except_peer` (-1 = count every one). */
+static int pcnetgame_host_bound_guest_count(PCNetPeerId except_peer) {
+    int j, n = 0;
+    for (j = 0; j < PC_NET_MAX_PEERS; j++) {
+        if (j != (int)except_peer && s_host_peer_link[j] == PC_NETGAME_LINK_READY && s_host_peer[j].bound_valid &&
+            s_host_peer[j].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Guests G4: transport slots a not-yet-connected RESIDENT may still need: every existing resident record of this town that is not the host's own and is
+ * not bound to a READY peer. A new guest must leave these free (PC_NET_MAX_PEERS is the transport table; a 9th peer is dropped silently, so a resident could
+ * otherwise be locked out by guests). Conservative: a resident that is mid-handshake counts both as an occupied peer and as a reserve. */
+static int pcnetgame_host_resident_peer_reserve(void) {
+    const Private_c* priv = Save_Get(private_data);
+    const int own = pcnetgame_host_own_resident_idx();
+    int i, n = 0;
+    for (i = 0; i < PLAYER_NUM; i++) {
+        if (i != own && mPr_NullCheckPersonalID((PersonalID_c*)&priv[i].player_ID) == FALSE && pcnetgame_host_peer_bound_to_resident(i, (PCNetPeerId)-1) < 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Guests G4: admission gate for a guest `peer` that is about to be bound (a NEW key or a KNOWN key alike), evaluated BEFORE anything is minted or created.
+ * Residents never reach it. Returns NULL = admitted, else the host log reason (the refusal reuses REJECT(SERVER_FULL); no wire change). */
+static const char* pcnetgame_host_guest_cap_refusal(PCNetPeerId peer, char* buf, size_t buf_size) {
+    const int cap = pcnetgame_host_max_guests();
+    const int bound = pcnetgame_host_bound_guest_count(peer);
+    const int reserve = pcnetgame_host_resident_peer_reserve();
+    const int occupied = pc_net_peer_count();
+    if (bound >= cap) {
+        snprintf(buf, buf_size, "guest limit reached (%d of max_guests=%d guests are connected)", bound, cap);
+        return buf;
+    }
+    if (occupied + reserve > PC_NET_MAX_PEERS) {
+        snprintf(buf, buf_size, "guest limit reached (%d of %d transport peer slots are in use and %d more are held for residents; %d of max_guests=%d guests connected)",
+                 occupied, (int)PC_NET_MAX_PEERS, reserve, bound, cap);
+        return buf;
+    }
+    return NULL;
+}
+
 /* THE binding -> record slot helper: -1 = not bound (or a binding that is out of range), 0..PLAYER_NUM-1 = the resident slot, PLAYER_NUM..
  * PC_NETGAME_REC_SLOTS-1 = PLAYER_NUM + the guest table slot. Derived ONLY from the host-side binding (never from a message). */
 static int pcnetgame_peer_rec_slot(PCNetPeerId peer) {
@@ -19525,6 +19582,14 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     }
 
     if (is_guest) {
+        /* Guests G4: the guest cap, at ADMISSION only (a resident never gets here): after the duplicate-binding handling above (a returning guest that is
+         * still bound replaces ITS OWN old binding, never counted twice) and BEFORE a token is minted / an entry created / the table touched. */
+        char cap_why[200];
+        const char* cap_msg = pcnetgame_host_guest_cap_refusal(peer, cap_why, sizeof(cap_why));
+        if (cap_msg != NULL) {
+            pcnetgame_host_refuse_identity(peer, cap_msg, 0);
+            return;
+        }
         if (guest_mode != 1) {
             /* M3: a token ISSUANCE (first contact of a key, or the re-mint of an unconfirmed entry) is rate limited per source address, BEFORE
              * anything is minted or evicted; bounded memory (a small ring), refused with a log. */
@@ -25594,6 +25659,16 @@ int pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out) {
     }
     out->idle_ms = pc_net_peer_idle_ms((PCNetPeerId)slot);
     out->puppet = pc_remote_player_puppet_state((PCNetPlayerId)slot);
+    return 1;
+}
+
+/* Guests G4: console status: guests currently bound / the effective max_guests cap (0, 0 unless HOST). */
+int pc_net_game_dedicated_guest_counts(int* bound, int* cap) {
+    if (bound == NULL || cap == NULL || s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    *bound = pcnetgame_host_bound_guest_count((PCNetPeerId)-1);
+    *cap = pcnetgame_host_max_guests();
     return 1;
 }
 
