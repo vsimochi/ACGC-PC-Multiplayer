@@ -434,7 +434,7 @@ Limitations: the same profile must not run in two processes at once (no lock, no
 picker); the title-menu label and a join from the title menu are not visually verified; the profile identity is permanent exactly like guest.ini (deleting a profile file makes a NEW guest).
 
 Tests: native `test_guest_profiles_unit.py` (101 native checks), CLI `test_guest_profiles_cli.py` (101), source audit `test_guest_profiles_src.py` (30), REAL `test_guest_profiles_real.py`
-(40: three real guests from one cwd, kill / restart one, host restart). Commit: (filled by orchestrator)
+(40: three real guests from one cwd, kill / restart one, host restart). Commit: 7c95a59
 
 ## Known limitations
 
