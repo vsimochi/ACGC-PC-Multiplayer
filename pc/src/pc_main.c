@@ -1105,7 +1105,7 @@ int main(int argc, char* argv[]) {
 
     /* Redirect stdout/stderr to NUL unless verbose — unbuffered terminal writes
      * are extremely slow on Windows and tank FPS. */
-    if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console && !g_pc_dedicated) { /* --dedicated: the console is always on (a debug flag for routing) */
+    if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console && (!g_pc_dedicated || pc_dedicated_stdout_quiet())) { /* --dedicated: the console is always on (a debug flag for routing), except in its own interactive window where only the console stream shows it */
 #ifdef _WIN32
         freopen("NUL", "w", stdout);
         freopen("NUL", "w", stderr);

@@ -43,17 +43,55 @@ static int      s_last_save_ok = -1; /* -1 = none yet */
 static Uint32   s_last_save_ticks = 0;
 static int      s_save_pending = 0;  /* console `save` waiting for the next safe point */
 
+/* The ONE writer of every server-console line ([DEDICATED] notices, command responses). Normally it is stdout (redirected pipes / files, a console the
+ * caller already owns: byte-identical to before). In INTERACTIVE mode (the exe was started by hand from a shell: pc_dedicated_early_console) it is the
+ * server's OWN console window opened as a separate stream, while stdout / stderr go to NUL like every other non-verbose run: the game's thousands of debug
+ * printf lines (frame counters, send rates, ...) then never interleave with the line being typed. -debug* / --verbose keep stdout on the console. */
+static FILE* s_ded_out = NULL;
+static int   s_ded_interactive = 0;
+#ifdef _WIN32
+static HANDLE s_ded_conin = NULL; /* interactive mode: the server console's OWN input buffer, opened directly (not through the CRT stdin) */
+#endif
+
+static FILE* pc_ded_stream(void) {
+    return s_ded_out != NULL ? s_ded_out : stdout;
+}
+
+static void pc_ded_flush(void) {
+    fflush(pc_ded_stream());
+}
+
+static int pc_ded_printf(const char* fmt, ...) {
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vfprintf(pc_ded_stream(), fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int pc_dedicated_stdout_quiet(void) {
+    return s_ded_interactive;
+}
+
 void pc_dedicated_say(const char* fmt, ...) {
     va_list ap;
     if (!g_pc_dedicated) {
         return;
     }
-    fputs("[DEDICATED] ", stdout);
+    fputs("[DEDICATED] ", pc_ded_stream());
     va_start(ap, fmt);
-    vfprintf(stdout, fmt, ap);
+    vfprintf(pc_ded_stream(), fmt, ap);
     va_end(ap);
-    fputc('\n', stdout);
-    fflush(stdout);
+    fputc('\n', pc_ded_stream());
+    pc_ded_flush();
+}
+
+/* FATAL notices: stderr, or the server console when stderr is going to NUL (interactive mode) so they are never lost. */
+static void pc_ded_fatal(const char* msg_a, const char* arg) {
+    FILE* f = s_ded_interactive ? pc_ded_stream() : stderr;
+    fprintf(f, msg_a, arg);
+    fflush(f);
 }
 
 /* ------------------------------------------------------------------------------------------------------------------------------------- */
@@ -72,10 +110,81 @@ static int pc_ded_fd_valid(int fd) {
 }
 #endif
 
+#ifdef _WIN32
+/* 1 when this exe is the GUI subsystem (-mwindows, the normal build): a shell does NOT wait for such a process. */
+static int pc_ded_is_gui_subsystem(void) {
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)GetModuleHandle(NULL);
+    const IMAGE_NT_HEADERS* nt;
+    if (dos == NULL || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return 0;
+    }
+    nt = (const IMAGE_NT_HEADERS*)((const char*)dos + dos->e_lfanew);
+    return nt->Signature == IMAGE_NT_SIGNATURE && nt->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI;
+}
+
+/* "redirected": the inherited std handle is a pipe or a file (a test harness, `> log`, `| tee`), as opposed to a console / nothing. */
+static int pc_ded_std_redirected(DWORD which) {
+    HANDLE h = GetStdHandle(which);
+    DWORD t;
+    if (h == NULL || h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    t = GetFileType(h);
+    return t == FILE_TYPE_PIPE || t == FILE_TYPE_DISK;
+}
+#endif
+
+/* Console setup, called as soon as --dedicated is parsed.
+ *
+ * ROOT CAUSE of "commands are interpreted by PowerShell / the input line is corrupted": the normal exe is a GUI-subsystem (-mwindows) process, so a shell
+ * returns its prompt IMMEDIATELY; the server attached to the shell's console (AttachConsole(PARENT)), and the shell and the server then both read the
+ * keyboard and both write to the same console: `status` went to PowerShell and the server's output tore through whatever was being typed.
+ *
+ * Fix: when a GUI-subsystem server is started interactively (stdin is not a pipe / file), it detaches from the shell's console and opens its OWN console
+ * window (a one-line note is left in the shell). Only the server reads that window's keyboard. Redirected runs (tests, services, `> log`) are unchanged. */
 void pc_dedicated_early_console(void) {
 #ifdef _WIN32
-    int attached = AttachConsole(ATTACH_PARENT_PROCESS) ? 1 : 0; /* fails harmlessly: no parent console / already attached (console build) */
-    int in_ok = pc_ded_fd_valid(0);
+    int attached;
+    int in_ok;
+    if (pc_ded_is_gui_subsystem() && !pc_ded_std_redirected(STD_INPUT_HANDLE)) {
+        const int keep_out = pc_ded_std_redirected(STD_OUTPUT_HANDLE);
+        const int keep_err = pc_ded_std_redirected(STD_ERROR_HANDLE);
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            HANDLE ph = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if (ph != INVALID_HANDLE_VALUE) {
+                static const char note[] = "[DEDICATED] the server console opened in its own window: type help / status / players / guests / save / stop THERE "
+                                           "(this shell is not the server's console).\r\n";
+                DWORD w = 0;
+                WriteFile(ph, note, (DWORD)(sizeof(note) - 1), &w, NULL);
+                CloseHandle(ph);
+            }
+            FreeConsole();
+        }
+        if (GetConsoleWindow() == NULL) {
+            AllocConsole();
+        }
+        SetConsoleTitleA("Animal Crossing dedicated server console");
+        s_ded_conin = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (s_ded_conin == INVALID_HANDLE_VALUE) {
+            s_ded_conin = NULL;
+        }
+        if (!keep_out) {
+            freopen("CONOUT$", "w", stdout);
+        }
+        if (!keep_err) {
+            freopen("CONOUT$", "w", stderr);
+        }
+        if (!keep_out) {
+            s_ded_out = fopen("CONOUT$", "w"); /* the server console's own stream; stdout / stderr are sent to NUL later (pc_dedicated_stdout_quiet) */
+            if (s_ded_out != NULL) {
+                setvbuf(s_ded_out, NULL, _IONBF, 0);
+                s_ded_interactive = 1;
+            }
+        }
+        return;
+    }
+    attached = AttachConsole(ATTACH_PARENT_PROCESS) ? 1 : 0; /* fails harmlessly: no parent console / already attached (console build) */
+    in_ok = pc_ded_fd_valid(0);
     int out_ok = pc_ded_fd_valid(1);
     int err_ok = pc_ded_fd_valid(2);
     if (!in_ok || !out_ok || !err_ok) {
@@ -208,7 +317,9 @@ static int pc_ded_start_stdin_thread(void) {
 #ifdef _WIN32
     intptr_t h = _get_osfhandle(0);
     uintptr_t th;
-    if (!pc_ded_fd_valid(0)) {
+    if (s_ded_conin != NULL) {
+        h = (intptr_t)s_ded_conin; /* interactive mode: read the server console's own input buffer */
+    } else if (!pc_ded_fd_valid(0)) {
         return 0;
     }
     s_stdin_handle = (HANDLE)h;
@@ -283,8 +394,8 @@ int pc_dedicated_post_sdl_init(void) {
     }
     drv = SDL_GetCurrentAudioDriver();
     if (drv == NULL || strcmp(drv, "dummy") != 0) {
-        fprintf(stderr, "[DEDICATED] FATAL: the SDL dummy audio driver is not the one that opened (driver=%s); refusing to run a dedicated server with "
-                        "a real or stalled audio device\n", drv ? drv : "(none)");
+        pc_ded_fatal("[DEDICATED] FATAL: the SDL dummy audio driver is not the one that opened (driver=%s); refusing to run a dedicated server with "
+                     "a real or stalled audio device\n", drv ? drv : "(none)");
         return 0;
     }
     snprintf(s_audio_driver, sizeof(s_audio_driver), "%s", drv);
@@ -297,8 +408,8 @@ void pc_dedicated_audio_opened(int ok, int freq, int channels, int samples) {
         return;
     }
     if (!ok) {
-        fprintf(stderr, "[DEDICATED] FATAL: the dummy audio device could not be opened (%s); a stalled audio producer could block fades and message "
-                        "waits, so a dedicated server refuses to start\n", SDL_GetError());
+        pc_ded_fatal("[DEDICATED] FATAL: the dummy audio device could not be opened (%s); a stalled audio producer could block fades and message "
+                     "waits, so a dedicated server refuses to start\n", SDL_GetError());
         exit(1);
     }
     pc_dedicated_say("audio device opened: driver=%s freq=%d ch=%d samples=%d", s_audio_driver, freq, channels, samples);
@@ -344,7 +455,7 @@ void pc_dedicated_notify_shutdown(const char* what) {
 /* ------------------------------------------------------------------------------------------------------------------------------------- */
 
 static void pc_ded_cmd_help(void) {
-    printf("[DEDICATED] commands (case-insensitive):\n"
+    pc_ded_printf("[DEDICATED] commands (case-insensitive):\n"
            "  help     list the commands\n"
            "  status   server status: observer, network role/port, world+save readiness, uptime, peers, last save\n"
            "  players  connected players: peer slot, link, class (RESIDENT idx / GUEST slot), name, puppet, idle ms\n"
@@ -353,7 +464,7 @@ static void pc_ded_cmd_help(void) {
            "  guest-remove <slot|name> confirm        remove a guest and its character (guests.dat is backed up first; refused while the guest is connected)\n"
            "  guest-reset-token <slot|name> confirm   token lost: the next claim of that guest's key gets a NEW token for the SAME character (10 min, once; backed up)\n"
            "  stop     graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit\n");
-    fflush(stdout);
+    pc_ded_flush();
 }
 
 static const char* pc_ded_role_name(void) {
@@ -387,33 +498,33 @@ static void pc_ded_cmd_status(void) {
             }
         }
     }
-    printf("[DEDICATED] status\n");
-    printf("  dedicated: yes\n");
-    printf("  observer: active=%s ready=%s\n", pc_host_observer_active() ? "yes" : "no", pc_host_observer_ready() ? "yes" : "no");
-    printf("  network: role=%s listening_port=%u\n", pc_ded_role_name(), (unsigned)s_port);
-    printf("  world ready: %s\n", pc_net_game_dedicated_world_ready() ? "yes" : "no");
-    printf("  save ready: %s\n", pcfa_save_ready() ? "yes" : "no");
-    printf("  uptime: %lus (%luh %02lum %02lus), frames=%lu, avg_fps=%.1f\n", up_s, up_s / 3600ul, (up_s / 60ul) % 60ul, up_s % 60ul, frames,
+    pc_ded_printf("[DEDICATED] status\n");
+    pc_ded_printf("  dedicated: yes\n");
+    pc_ded_printf("  observer: active=%s ready=%s\n", pc_host_observer_active() ? "yes" : "no", pc_host_observer_ready() ? "yes" : "no");
+    pc_ded_printf("  network: role=%s listening_port=%u\n", pc_ded_role_name(), (unsigned)s_port);
+    pc_ded_printf("  world ready: %s\n", pc_net_game_dedicated_world_ready() ? "yes" : "no");
+    pc_ded_printf("  save ready: %s\n", pcfa_save_ready() ? "yes" : "no");
+    pc_ded_printf("  uptime: %lus (%luh %02lum %02lus), frames=%lu, avg_fps=%.1f\n", up_s, up_s / 3600ul, (up_s / 60ul) % 60ul, up_s % 60ul, frames,
            up_ms > 0 ? (double)frames * 1000.0 / (double)up_ms : 0.0);
     if (g_frame_limiter > 0) {
-        printf("  frame limit: %lu Hz\n", (unsigned long)g_frame_limiter);
+        pc_ded_printf("  frame limit: %lu Hz\n", (unsigned long)g_frame_limiter);
     } else {
-        printf("  frame limit: none (uncapped)\n");
+        pc_ded_printf("  frame limit: none (uncapped)\n");
     }
-    printf("  peers: connected=%d ready=%d\n", transport, ready);
+    pc_ded_printf("  peers: connected=%d ready=%d\n", transport, ready);
     {
         int gb = 0, gc = 0;
         if (pc_net_game_dedicated_guest_counts(&gb, &gc)) {
-            printf("  guests: bound=%d max_guests=%d\n", gb, gc);
+            pc_ded_printf("  guests: bound=%d max_guests=%d\n", gb, gc);
         }
     }
     if (s_last_save_ok < 0) {
-        printf("  last save: none yet\n");
+        pc_ded_printf("  last save: none yet\n");
     } else {
-        printf("  last save: %s %lus ago\n", s_last_save_ok ? "OK" : "FAILED", (unsigned long)((SDL_GetTicks() - s_last_save_ticks) / 1000u));
+        pc_ded_printf("  last save: %s %lus ago\n", s_last_save_ok ? "OK" : "FAILED", (unsigned long)((SDL_GetTicks() - s_last_save_ticks) / 1000u));
     }
-    printf("  audio: driver=%s ring_fill=%d consumed_samples=%d\n", s_audio_ok ? s_audio_driver : "?", pc_audio_get_buffer_fill(), pc_audio_consumed_samples());
-    fflush(stdout);
+    pc_ded_printf("  audio: driver=%s ring_fill=%d consumed_samples=%d\n", s_audio_ok ? s_audio_driver : "?", pc_audio_get_buffer_fill(), pc_audio_consumed_samples());
+    pc_ded_flush();
 }
 
 static void pc_ded_cmd_players(void) {
@@ -425,11 +536,11 @@ static void pc_ded_cmd_players(void) {
         }
     }
     if (listed == 0) {
-        printf("[DEDICATED] no players connected\n");
-        fflush(stdout);
+        pc_ded_printf("[DEDICATED] no players connected\n");
+        pc_ded_flush();
         return;
     }
-    printf("[DEDICATED] players: %d\n", listed);
+    pc_ded_printf("[DEDICATED] players: %d\n", listed);
     for (i = 0; i < n; i++) {
         PCNetGameDedicatedPeerInfo pi;
         char cls[32];
@@ -443,10 +554,10 @@ static void pc_ded_cmd_players(void) {
         } else {
             snprintf(cls, sizeof(cls), "RESIDENT idx %d", pi.index);
         }
-        printf("  peer %d: link=%s class=%s name=\"%s\" puppet=%s idle=%dms\n", pi.peer, pc_ded_link_name(pi.link), cls, pi.name,
+        pc_ded_printf("  peer %d: link=%s class=%s name=\"%s\" puppet=%s idle=%dms\n", pi.peer, pc_ded_link_name(pi.link), cls, pi.name,
                pi.puppet == 2 ? "live" : pi.puppet == 1 ? "pending" : "none", pi.idle_ms);
     }
-    fflush(stdout);
+    pc_ded_flush();
 }
 
 static int pc_ded_stricmp(const char* a, const char* b) {
@@ -467,20 +578,20 @@ static void pc_ded_cmd_guests(void) {
             continue;
         }
         if (n == 0) {
-            printf("[DEDICATED] guests (host guest table, all towns; %s):\n", gi.untrusted ? "guests.dat is UNTRUSTED" : "tokens are never printed");
+            pc_ded_printf("[DEDICATED] guests (host guest table, all towns; %s):\n", gi.untrusted ? "guests.dat is UNTRUSTED" : "tokens are never printed");
         }
         n++;
-        printf("  slot %d: name=\"%s\" home_town=\"%s\" host_town=\"%s\"%s confirmed=%s rev=%u bound=%s%s\n", gi.slot, gi.name, gi.home_town, gi.town,
+        pc_ded_printf("  slot %d: name=\"%s\" home_town=\"%s\" host_town=\"%s\"%s confirmed=%s rev=%u bound=%s%s\n", gi.slot, gi.name, gi.home_town, gi.town,
                gi.active ? "" : " (other town: inactive)", gi.confirmed ? "yes" : "no", gi.rev,
                gi.bound_peer >= 0 ? "yes" : "no", gi.recovery ? " RECOVERY-ARMED" : "");
         if (gi.bound_peer >= 0) {
-            printf("    (connected on peer %d)\n", gi.bound_peer);
+            pc_ded_printf("    (connected on peer %d)\n", gi.bound_peer);
         }
     }
     if (n == 0) {
-        printf("[DEDICATED] guests: none stored (or this server is not a ready host)\n");
+        pc_ded_printf("[DEDICATED] guests: none stored (or this server is not a ready host)\n");
     }
-    fflush(stdout);
+    pc_ded_flush();
 }
 
 /* args = the text after the command word: "<slot|name> [confirm]". The selector is one token; the trailing token `confirm` (case-insensitive) is the explicit consent. */
@@ -494,31 +605,31 @@ static void pc_ded_cmd_guest_admin(int op, char* args) {
     sel[0] = tok2[0] = extra[0] = '\0';
     n = sscanf(args != NULL ? args : "", "%63s %31s %7s", sel, tok2, extra);
     if (n < 1) {
-        printf("[DEDICATED] %s: usage: %s <slot|name> confirm (see `guests`)\n", cname, cname);
-        fflush(stdout);
+        pc_ded_printf("[DEDICATED] %s: usage: %s <slot|name> confirm (see `guests`)\n", cname, cname);
+        pc_ded_flush();
         return;
     }
     if (n >= 3 || (n == 2 && pc_ded_stricmp(tok2, "confirm") != 0)) {
-        printf("[DEDICATED] %s: expected exactly `<slot|name> confirm` (extra / unknown arguments: nothing was changed)\n", cname);
-        fflush(stdout);
+        pc_ded_printf("[DEDICATED] %s: expected exactly `<slot|name> confirm` (extra / unknown arguments: nothing was changed)\n", cname);
+        pc_ded_flush();
         return;
     }
     r = pc_net_game_dedicated_guest_admin(op, sel, n == 2, msg, sizeof(msg));
-    printf("[DEDICATED] %s: %s\n", cname, msg);
+    pc_ded_printf("[DEDICATED] %s: %s\n", cname, msg);
     PC_LOG(PCL_GENERAL, "dedicated: %s %s -> %s\n", cname, sel, r == 1 ? "done" : r == 2 ? "needs confirm" : "refused");
-    fflush(stdout);
+    pc_ded_flush();
 }
 
 static void pc_ded_cmd_stop(void) {
     if (s_stop_requested) {
-        printf("[DEDICATED] already stopping...\n");
+        pc_ded_printf("[DEDICATED] already stopping...\n");
     } else {
         s_stop_requested = 1;
-        printf("[DEDICATED] stopping...\n");
+        pc_ded_printf("[DEDICATED] stopping...\n");
         PC_LOG(PCL_GENERAL, "dedicated: console stop requested\n");
         g_pc_running = 0; /* same flag as Ctrl+C: the normal shutdown path (final save once, net shutdown, platform shutdown) follows */
     }
-    fflush(stdout);
+    pc_ded_flush();
 }
 
 static void pc_ded_execute(char* line) {
@@ -559,18 +670,18 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_guest_admin(1, args);
     } else if (strcmp(cmd, "save") == 0) {
         if (s_save_pending) {
-            printf("[DEDICATED] save: already requested (waiting for the next safe point)\n");
+            pc_ded_printf("[DEDICATED] save: already requested (waiting for the next safe point)\n");
         } else {
             s_save_pending = 1;
-            printf("[DEDICATED] save: requested (runs at the next safe point; the result follows)\n");
+            pc_ded_printf("[DEDICATED] save: requested (runs at the next safe point; the result follows)\n");
         }
-        fflush(stdout);
+        pc_ded_flush();
     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
         pc_ded_cmd_stop();
     } else {
-        printf("[DEDICATED] unknown command: %s (type help)\n", cmd);
+        pc_ded_printf("[DEDICATED] unknown command: %s (type help)\n", cmd);
         PC_LOG(PCL_GENERAL, "dedicated: unknown console command '%s'\n", cmd);
-        fflush(stdout);
+        pc_ded_flush();
     }
 }
 
@@ -589,8 +700,8 @@ void pc_dedicated_console_poll(void) {
                 s_q_count_hint = 0;
                 PC_DED_UNLOCK();
                 if (dropped > 0) {
-                    printf("[DEDICATED] warning: console input queue was full, %d line(s) dropped\n", dropped);
-                    fflush(stdout);
+                    pc_ded_printf("[DEDICATED] warning: console input queue was full, %d line(s) dropped\n", dropped);
+                    pc_ded_flush();
                 }
                 break;
             }
@@ -600,16 +711,16 @@ void pc_dedicated_console_poll(void) {
             s_q_count_hint = s_q_count;
             PC_DED_UNLOCK();
             if (ln.truncated) {
-                printf("[DEDICATED] warning: console line truncated to %d characters\n", PC_DED_LINE_MAX);
+                pc_ded_printf("[DEDICATED] warning: console line truncated to %d characters\n", PC_DED_LINE_MAX);
             }
             pc_ded_execute(ln.text);
         }
     }
     if (s_stdin_eof && !s_stdin_eof_reported) {
         s_stdin_eof_reported = 1;
-        printf("[DEDICATED] console input closed (EOF); the server keeps running (stop it with Ctrl+C or a termination request)\n");
+        pc_ded_printf("[DEDICATED] console input closed (EOF); the server keeps running (stop it with Ctrl+C or a termination request)\n");
         PC_LOG(PCL_GENERAL, "dedicated: console input closed (EOF), server keeps running\n");
-        fflush(stdout);
+        pc_ded_flush();
     }
 }
 
@@ -620,12 +731,12 @@ int pc_dedicated_save_request_pending(void) {
 void pc_dedicated_save_report(int ok, const char* refusal_reason) {
     s_save_pending = 0;
     if (refusal_reason != NULL) {
-        printf("[DEDICATED] save: refused: %s\n", refusal_reason);
+        pc_ded_printf("[DEDICATED] save: refused: %s\n", refusal_reason);
         PC_LOG(PCL_GENERAL, "dedicated: console save refused: %s\n", refusal_reason);
     } else if (ok) {
-        printf("[DEDICATED] save: OK\n");
+        pc_ded_printf("[DEDICATED] save: OK\n");
     } else {
-        printf("[DEDICATED] save: FAILED (the authoritative write reported an error; see the log)\n");
+        pc_ded_printf("[DEDICATED] save: FAILED (the authoritative write reported an error; see the log)\n");
     }
-    fflush(stdout);
+    pc_ded_flush();
 }

@@ -32,6 +32,9 @@ extern int g_pc_dedicated;
  * the invalid ones on CONIN$/CONOUT$. Valid (redirected) std handles are NEVER replaced. Called from the argument parser as soon as --dedicated is
  * seen, so even the refusal text is visible. */
 void pc_dedicated_early_console(void);
+/* 1 when the server console is its OWN window (interactive launch of the GUI-subsystem exe): stdout / stderr then go to NUL (non-verbose) so debug printf noise
+ * cannot tear the line being typed; [DEDICATED] lines and command output use the console stream directly. 0 for redirected runs / console builds. */
+int  pc_dedicated_stdout_quiet(void);
 
 /* pc_main.c, after the output routing is decided: remember the listen port, print the "[DEDICATED] ..." startup line, start the stdin reader. */
 void pc_dedicated_startup(uint16_t port);

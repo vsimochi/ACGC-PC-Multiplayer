@@ -234,9 +234,11 @@ def main():
     head_main = head("pc/src/pc_main.c")
     ck("C9 the Ctrl+C / console-ctrl / signal handlers are byte-identical to HEAD", func_body(main_c, "pc_console_ctrl_handler") == func_body(head_main, "pc_console_ctrl_handler") != ""
        and func_body(main_c, "pc_signal_handler") == func_body(head_main, "pc_signal_handler") != "")
-    ck("C10 console routing: stdout is never redirected to NUL under dedicated (condition ends `&& !g_pc_dedicated`) and stdout stays unbuffered; the console attach keeps valid std handles",
-       "if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console && !g_pc_dedicated) {" in main_c and "setvbuf(stdout, NULL, _IONBF, 0);" in main_c
-       and "if (!in_ok) {" in ded_c and "if (!out_ok) {" in ded_c and "if (!err_ok) {" in ded_c and 'freopen("CONIN$", "r", stdin);' in ded_c and "AttachConsole(ATTACH_PARENT_PROCESS)" in ded_c)
+    ck("C10 console routing: stdout is redirected to NUL under dedicated ONLY in the server's own interactive console window (condition ends `&& (!g_pc_dedicated || pc_dedicated_stdout_quiet())`; "
+       "redirected / console-build runs keep stdout) and stdout stays unbuffered otherwise; the console attach keeps valid std handles (the legacy attach path is intact)",
+       "if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console && (!g_pc_dedicated || pc_dedicated_stdout_quiet())) {" in main_c and "setvbuf(stdout, NULL, _IONBF, 0);" in main_c
+       and "if (!in_ok) {" in ded_c and "if (!out_ok) {" in ded_c and "if (!err_ok) {" in ded_c and 'freopen("CONIN$", "r", stdin);' in ded_c and "AttachConsole(ATTACH_PARENT_PROCESS)" in ded_c
+       and "int pc_dedicated_stdout_quiet(void) {" + chr(10) + "    return s_ded_interactive;" + chr(10) + "}" in ded_c)
 
     # ---------------------------------------------------------------- X: shutdown
     sd = func_body(mainmain, "mainproc")
