@@ -144,6 +144,7 @@
  */
 #include "pc_net_game.h"
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
+#include "pc_adopt_clock.h" /* client record-adoption watchdog clock (scene lifecycle time does not count towards the 10 s) */
 #include "pc_log.h" /* category-based PC_LOG()/PC_LOG_RL() lines (new, [CAT]-prefixed; every pre-existing printf is untouched) */
 #include "pc_dedicated.h" /* --dedicated: g_pc_dedicated + the [DEDICATED] peer notices (read-only hooks) */
 #include "pc_net.h"
@@ -16263,6 +16264,10 @@ static void pcnetgame_mail_test_seed_reply(void) {
 #define PC_NETGAME_CREC_DIGEST_PERIOD_MS 500u
 #define PC_NETGAME_CREC_UPLOAD_GAP_MS    2000u /* min distance between two upload starts (host min gap is 1500 ms) */
 #define PC_NETGAME_CREC_ADOPT_TIMEOUT_MS 10000u
+/* Scene-lifecycle time (title -> player select -> start demo -> town: fades, scene changes, the human choosing a character) does not count towards the
+ * 10 s above (see pc_adopt_clock.h); it is bounded by this separate cap. */
+#define PC_NETGAME_CREC_ADOPT_LIFECYCLE_CAP_MS 300000u
+static PCAdoptClock s_crec_adopt_clock; /* armed when a push is staged; ticked on every blocked adoption attempt (pcnetgame_crec_try_adopt) */
 #define PC_NETGAME_CREC_DEFER_ACK_MS     1000u
 #define PC_NETGAME_CREC_RX_TIMEOUT_MS    8000u
 #define PC_NETGAME_CREC_UP_SEND_TIMEOUT_MS 4000u /* host discards an open upload after 5 s: finish sending well before */
@@ -16702,6 +16707,23 @@ static void pcnetgame_crec_apply_staged(int host_only, int* cloth_refreshed, int
 /* Adoption diagnostics (DIAGNOSTIC ONLY, no behaviour): the existing blocker line is a plain printf, which a normal (non --verbose) client sends to NUL, so the
  * blocker was invisible. These lines go through PC_LOG(PCL_RECORDS) (enable with -debugrecords [-logfile PATH], no --verbose needed) on every blocker CHANGE
  * (never per frame) and with a state snapshot at the final ADOPT_FAILED; the final failure is also shown on screen through the join-message notice. */
+/* Adoption watchdog clock + its "scene lifecycle" predicate. The game is in its own scene lifecycle (adoption is blocked for a legitimate, bounded reason that is
+ * not a stuck condition) when: no GAME_PLAY is running (between two games), a fade / wipe is running (a scene change in progress), or the running scene is a
+ * PRE-GAME scene of the normal Start Game flow (title demo, the player-select train where the human chooses a character, the start demos). */
+static int pcnetgame_crec_adopt_lifecycle_now(void) {
+    GAME_PLAY* play;
+    int sc;
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 1;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE) {
+        return 1;
+    }
+    sc = (int)play->scene_id;
+    return sc == SCENE_TITLE_DEMO || sc == SCENE_PLAYERSELECT || sc == SCENE_PLAYERSELECT_2 || sc == SCENE_PLAYERSELECT_3 || sc == SCENE_PLAYERSELECT_SAVE ||
+           sc == SCENE_START_DEMO || sc == SCENE_START_DEMO2 || sc == SCENE_START_DEMO3;
+}
 static char s_crec_diag_last_why[96];
 static int s_crec_diag_first_frame = -1; /* graph frame counter when the first blocker of this push was logged (did the game advance since?) */
 static void pcnetgame_join_message_set(int warning, const char* fmt, ...); /* defined with the client join messages (G6.1) */
@@ -16758,14 +16780,16 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
                        (unsigned)s_crec.st_rev, why, (unsigned)PC_NETGAME_CREC_ADOPT_TIMEOUT_MS);
             }
         }
-        if ((uint32_t)(now - s_crec.st_ms) >= PC_NETGAME_CREC_ADOPT_TIMEOUT_MS) {
+        pc_adopt_clock_tick(&s_crec_adopt_clock, now, pcnetgame_crec_adopt_lifecycle_now());
+        if (pc_adopt_clock_expired(&s_crec_adopt_clock, now, PC_NETGAME_CREC_ADOPT_TIMEOUT_MS, PC_NETGAME_CREC_ADOPT_LIFECYCLE_CAP_MS)) {
             printf("[NET][REC] client: ADOPT_FAILED for rev %u after %u ms (last blocker: %s) -- the host closes the link\n",
                    (unsigned)s_crec.st_rev, (unsigned)PC_NETGAME_CREC_ADOPT_TIMEOUT_MS, why);
             {
                 char snap[512];
                 pcnetgame_crec_diag_snapshot(snap, sizeof(snap));
-                PC_LOG(PCL_RECORDS, "client ADOPT_FAILED for rev %u after %u ms: final blocker: %s | %s\n", (unsigned)s_crec.st_rev,
-                       (unsigned)PC_NETGAME_CREC_ADOPT_TIMEOUT_MS, why, snap);
+                PC_LOG(PCL_RECORDS, "client ADOPT_FAILED for rev %u after %u ms (active %u ms, scene-lifecycle %u ms, cap %u ms): final blocker: %s | %s\n",
+                       (unsigned)s_crec.st_rev, (unsigned)(now - s_crec.st_ms), (unsigned)pc_adopt_clock_active_ms(&s_crec_adopt_clock, now),
+                       (unsigned)s_crec_adopt_clock.paused_ms, (unsigned)PC_NETGAME_CREC_ADOPT_LIFECYCLE_CAP_MS, why, snap);
                 pcnetgame_join_message_set(0, "Your character record could not be adopted within %u s (blocked by: %s). The host will disconnect you.",
                                            (unsigned)(PC_NETGAME_CREC_ADOPT_TIMEOUT_MS / 1000u), why);
             }
@@ -16892,6 +16916,7 @@ static void pcnetgame_crec_push_complete(void) {
     memcpy(s_crec_staged, s_crec_rx, PC_NETGAME_REC_SIZE);
     if (!s_crec.st_valid) {
         s_crec.st_ms = pcnetgame_now_ms();
+        pc_adopt_clock_arm(&s_crec_adopt_clock, s_crec.st_ms);
         s_crec.st_defer_ack_ms = 0;
         s_crec.st_defer_logged = 0;
         s_crec_diag_last_why[0] = '\0'; /* diagnostics: a new push starts a new blocker history */

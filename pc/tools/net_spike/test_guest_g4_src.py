@@ -24,9 +24,16 @@ import wire_baseline
 ROOT = S.ROOT
 HERE = S.HERE
 BASELINE = "891677b"   # G3 commit + docs (HEAD when G4 started)
+G4_COMMIT = "8b9ebdd"  # the G4 feature commit: the diff audits compare BASELINE..G4_COMMIT, not the working tree (later milestones / diagnostics touch the same files)
 
 
 def numstat(rel):
+    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, G4_COMMIT, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
+    return (int(out[0]), int(out[1])) if out else (0, 0)
+
+
+def numstat_wt(rel):
+    """BASELINE vs the working tree: for a file only the later G6.1 milestone touched (one declaration in pc_net_game.h)."""
     out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
     return (int(out[0]), int(out[1])) if out else (0, 0)
 
@@ -123,7 +130,7 @@ def main():
 
     # ------------------------------------------------------------------ W
     ck("W no wire change: message ids 1..58 unchanged, wire_baseline green, protocol header pc_net_game.h (G6.1 added exactly one function declaration, 5 lines, no typedef / define) and the transport (pc_net.c / pc_net.h) untouched vs the G3 commit",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 59)) and numstat("pc/include/pc_net_game.h") == (5, 0)
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 59)) and numstat_wt("pc/include/pc_net_game.h") == (5, 0)
        and S.read("pc/include/pc_net_game.h").count("const char* pc_net_game_join_message(int* is_warning);") == 1
        and numstat("pc/src/pc_net.c") == (0, 0) and numstat("pc/include/pc_net.h") == (0, 0) and numstat("pc/src/pc_remote_player.c") == (0, 0))
     wb = []
