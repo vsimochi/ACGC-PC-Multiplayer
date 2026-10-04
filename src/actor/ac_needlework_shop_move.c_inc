@@ -299,3 +299,30 @@ static void aNW_actor_init(ACTOR* actor, GAME* game) {
     aNW_actor_move(actor, game);
     actor->mv_proc = aNW_actor_move;
 }
+
+#ifdef TARGET_PC
+/* Puppet entered/left the needlework shop: play the door clip, bypassing the wait proc.
+ * Cosmetic-only: touches only this building's own request/animation fields; never reaches a scene-changing request. */
+int aNW_pc_cosmetic_door(ACTOR* actorx, int exit) {
+    STRUCTURE_ACTOR* str = (STRUCTURE_ACTOR*)actorx;
+    PLAYER_ACTOR* player;
+
+    if (actorx == NULL || actorx->id != mAc_PROFILE_NEEDLEWORK_SHOP || ((STRUCTURE_ACTOR*)actorx)->action_proc != (aSTR_MOVE_PROC)&aNW_wait || ((STRUCTURE_ACTOR*)actorx)->request_type != 0) {
+        return 0; /* only an idle, closed door: never one an NPC / the local player / an exit request is using */
+    }
+    if (mDemo_Check(mDemo_TYPE_DOOR, actorx) || mDemo_Check(mDemo_TYPE_DOOR2, actorx) ||
+        mDemo_Check(mDemo_TYPE_SPEAK, actorx)) {
+        return 0; /* a local demo owns this door */
+    }
+    player = GET_PLAYER_ACTOR_NOW();
+    if (player != NULL && player->get_door_label_proc != NULL && (ACTOR*)(*player->get_door_label_proc)(gamePT) == actorx) {
+        return 0; /* the local player is at this door */
+    }
+
+    str->request_type = exit ? 4 : 2; /* 4: out clip from frame 25, 2: out clip from frame 1; 3 (scene change) is never used */
+    aNW_setup_animation(str, 0.5f);
+    aNW_setup_action(str, aNW_ACTION_OPEN_DOOR);
+
+    return 1;
+}
+#endif

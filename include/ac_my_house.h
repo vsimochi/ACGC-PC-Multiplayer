@@ -17,6 +17,11 @@ struct my_house_actor_s {
 
 extern ACTOR_PROFILE MyHouse_Profile;
 
+#ifdef TARGET_PC
+/* pc_remote_player.c: cosmetic door animation for a remote puppet (returns 1 when started) */
+int aMHS_pc_cosmetic_door(ACTOR* actorx, int exit);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

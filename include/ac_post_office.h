@@ -10,6 +10,11 @@ extern "C" {
 
 extern ACTOR_PROFILE Post_Office_Profile;
 
+#ifdef TARGET_PC
+/* pc_remote_player.c: cosmetic door animation for a remote puppet (returns 1 when started) */
+int aPOFF_pc_cosmetic_door(ACTOR* actorx, int exit);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

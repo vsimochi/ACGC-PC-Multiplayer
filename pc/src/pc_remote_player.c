@@ -66,6 +66,11 @@
 #include "ef_effect_control.h" /* M9-C Phase 2a: eEC_EFFECT_TURI_MIZU (alias proof for the relax_rod row); Phase 3: eEC_CLIP + effect ids */
 #include "m_collision_bg.h" /* M9-C Phase 3: mCoBG_Wpos2Attribute() (read-only ground attribute), mCoBG_ATTRIBUTE_* */
 #ifdef TARGET_PC
+#include "ac_structure.h"     /* building doors: STRUCTURE_ACTOR / STRUCTURE_CONTROL_ACTOR */
+#include "ac_house.h"         /* building doors: aHUS_pc_cosmetic_door */
+#include "ac_my_house.h"      /* building doors: aMHS_pc_cosmetic_door */
+#include "ac_post_office.h"   /* building doors: aPOFF_pc_cosmetic_door */
+#include "ac_needlework_shop.h" /* building doors: aNW_pc_cosmetic_door */
 #include "m_train_control.h"          /* T4: mTRC_pc_remote_arrival() (the only train API this file calls, through its guard) */
 #include "pc_remote_arrival_logic.h"  /* T3 / T4: pure per-puppet latch + DEMO_WALK mapping (natively tested) */
 #endif
@@ -187,6 +192,7 @@ typedef struct PCRemotePlayerVisual {
     int                   rebind_from_row;     /* review R1-L3: current_anim_idx was invalidated by a row release (no skid replay) */
     int                   hidden_door;         /* building interactions: a HIDE_AT_END row (DOOR) finished: the puppet has walked in, do not draw it */
     double                hidden_door_since;   /* graph_dt_frame_time() when hidden_door was set (600 frame timeout) */
+    double                door_cosm_time;      /* building doors: row_start_time of the DOOR/OUTDOOR run whose cosmetic building door was already tried (once, no retry) */
     int                   train_standing_latched; /* T4: this puppet's current 'standing in the train' period was already evaluated
                                                    * for a local arrival train (cleared when the state ends; zero at creation) */
 } PCRemotePlayerVisual;
@@ -1696,6 +1702,85 @@ static void pc_remote_player_bind_body(PCRemotePlayerVisual* v, int a0, int a1, 
     v->keyframe0.animation_enabled = 0; /* a (re)bind drops a previous ROOT_PIN (row_start re-applies it) */
 }
 
+#ifdef TARGET_PC
+#define PC_REMOTE_PLAYER_DOOR_COSM_RADIUS 60.0f /* a puppet's door position must be this close to a building's door point */
+static int pc_remote_player_scene_is_local_field(const PCRemotePlayerSlot* slot, const GAME_PLAY* play);
+
+/* Building doors: a remote puppet that enters (main index DOOR) / leaves (OUTDOOR) a hinged-door building in the local town makes
+ * that building play its door clip. Vanilla only animates for the local player (PLAYER_ACTOR door label), an NPC request or the
+ * structure control's exit request, so a puppet would walk through a closed door. The building wrappers (aHUS/aMHS/aPOFF/aNW_pc_cosmetic_door)
+ * only set that building's own request/animation fields and refuse a busy door (several puppets at one door: the first wins). Local scene
+ * only (the puppet's announced scene is the shown town), never while a local exit is in progress. Called once per row instance. */
+static void pc_remote_player_cosmetic_door(PCRemotePlayerActor* self, int exit_row) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
+    STRUCTURE_CONTROL_ACTOR* ctrl;
+    ACTOR* a;
+    ACTOR* best = NULL;
+    float best_d2 = PC_REMOTE_PLAYER_DOOR_COSM_RADIUS * PC_REMOTE_PLAYER_DOOR_COSM_RADIUS;
+    float px = ((ACTOR*)self)->world.position.x;
+    float pz = ((ACTOR*)self)->world.position.z;
+
+    if (slot == NULL || play == NULL || slot->snap_req || !pc_remote_player_scene_is_local_field(slot, play)) {
+        return;
+    }
+    if (mPlib_get_player_actor_main_index((GAME*)play) == (int)mPlayer_INDEX_OUTDOOR) {
+        return; /* the local player is leaving a building: the structure control hands that exit to the right door */
+    }
+    ctrl = (STRUCTURE_CONTROL_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_STRUCTURE, ACTOR_PART_CONTROL);
+    if (ctrl != NULL && ctrl->str_door_name != EMPTY_NO) {
+        return; /* a local exit request is still pending */
+    }
+    for (a = play->actor_info.list[ACTOR_PART_ITEM].actor; a != NULL; a = a->next_actor) {
+        float dx, dz, d2;
+        float x, z;
+
+        if (a->id == mAc_PROFILE_MYHOUSE) {
+            const STRUCTURE_ACTOR* sa = (const STRUCTURE_ACTOR*)a;
+            if (exit_row) {
+                x = a->world.position.x + (((sa->action & 1) != 0) ? -48.29f : 48.29f); /* aMHS_rewrite_pl_out_data */
+                z = a->world.position.z + 48.29f;
+            } else {
+                x = sa->arg0_f; /* the point aMHS_check_player_sub measures from */
+                z = sa->arg1_f;
+            }
+        } else if (a->id == mAc_PROFILE_HOUSE) {
+            if (exit_row) {
+                x = a->home.position.x; /* aHUS_rewrite_out_data */
+                z = a->home.position.z + 60.0f;
+            } else {
+                x = a->world.position.x; /* house size 40, direction south: (size / 2 + 20) * direct_vector */
+                z = a->world.position.z + 40.0f;
+            }
+        } else if (a->id == mAc_PROFILE_POST_OFFICE || a->id == mAc_PROFILE_NEEDLEWORK_SHOP) {
+            x = a->world.position.x - 40.0f * 0.70710678f; /* size 40, direction 5 (south west) */
+            z = a->world.position.z + 40.0f * 0.70710678f;
+        } else {
+            continue;
+        }
+        dx = px - x;
+        dz = pz - z;
+        d2 = dx * dx + dz * dz;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = a;
+        }
+    }
+    if (best == NULL) {
+        return;
+    }
+    if (best->id == mAc_PROFILE_MYHOUSE) {
+        aMHS_pc_cosmetic_door(best, exit_row);
+    } else if (best->id == mAc_PROFILE_HOUSE) {
+        aHUS_pc_cosmetic_door(best, exit_row);
+    } else if (best->id == mAc_PROFILE_POST_OFFICE) {
+        aPOFF_pc_cosmetic_door(best, exit_row);
+    } else {
+        aNW_pc_cosmetic_door(best, exit_row);
+    }
+}
+#endif
+
 /* Starts `row` (restart if it is already active). Returns 0 and leaves the puppet on its fallback if a clip pointer is
  * missing. Writes only into the puppet's own PCRemotePlayerVisual. */
 static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const PCStateRow* row, int raw_kind, int held_kind,
@@ -1768,6 +1853,12 @@ static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const 
     v->row_pending = 0;
     v->row_start_time = now;
     v->row_adopted = 0;
+#ifdef TARGET_PC
+    if ((idx == (int)mPlayer_INDEX_DOOR || idx == (int)mPlayer_INDEX_OUTDOOR) && v->door_cosm_time != now) {
+        v->door_cosm_time = now; /* once per row instance, no retry */
+        pc_remote_player_cosmetic_door(self, idx == (int)mPlayer_INDEX_OUTDOOR);
+    }
+#endif
     v->item_hidden = 0; /* no row hides the carried item (the HIDE row hides the whole body via PC_ROWF_HIDE_BODY) */
     v->item_restart = 1;
     v->item_carry_ok = prev_active;
@@ -5094,7 +5185,14 @@ void pc_remote_player_poll(void) {
             memset(slot->pk_ev, 0, sizeof(slot->pk_ev)); /* M9-C Phase 5: events of the old scene generation are meaningless */
             slot->actor = NULL;
             slot->pending_create = 1;
-            slot->snap_req = 0; /* the new actor is created at the newest sample; the scene gate decides its visibility */
+            if (slot->snap_req) {
+                /* a remote scene event (e.g. an exit from a building) still awaits its first fresh MOVE: keep waiting, but on THIS
+                 * scene's clock (the frame clock restarted with the new GAME_PLAY) and drop the pre-event samples */
+                slot->snapshot_count = 0;
+                slot->snapshot_head = 0;
+                slot->scene_accept_frame = graph_dt_frame_time(gamePT);
+            }
+            /* else: the new actor is created at the newest sample; the scene gate decides its visibility */
         }
 
         /* Liveness timeout: only for relay-discovered peers (see pc_remote_player_on_move()) --
