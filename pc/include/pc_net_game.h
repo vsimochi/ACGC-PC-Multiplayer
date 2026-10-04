@@ -1138,6 +1138,11 @@ int pc_net_game_host_remote_player_in_acre(int bx, int bz);
 /* Batch A (A3): 1 iff the CLIENT "not connected" notice should be drawn this frame (role CLIENT, local world loaded, link not READY for > 3 s). */
 int pc_net_game_client_notice_visible(void);
 
+/* Guests G6.1: the readable join-failure message of the last client connection attempt (a refused join: server full / town mismatch / protocol mismatch /
+ * token problems; host unreachable) or NULL when there is none (or a final failure older than 30 s). Survives the shutdown a refusal causes. *is_warning
+ * (optional) = 1 for the non-final "no answer from the host yet, still trying" kind. Drawn by pc_net_notice_draw(); also logged ([NET][JOIN]) and on stderr. */
+const char* pc_net_game_join_message(int* is_warning);
+
 /* World Ecology Wildlife Sync T0 (authority seam foundation only -- see pc_wildlife_authority.h's
  * own scope doc: NOT fish/bug catching, NOT a snapshot, NOT bee/ant capture sync). Called from the
  * decomp wade-trigger seam (aSetMgr_move_set(), ac_set_manager.c) INSTEAD of running

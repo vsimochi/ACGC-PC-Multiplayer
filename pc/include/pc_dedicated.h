@@ -68,6 +68,23 @@ int  pc_net_game_dedicated_world_ready(void);   /* HOST && s_host_world_ready */
 int  pc_net_game_dedicated_peer_slots(void);    /* number of transport slots to iterate (0 unless HOST) */
 int  pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out); /* 1 iff the slot is not DISCONNECTED */
 int  pc_net_game_dedicated_guest_counts(int* bound, int* cap); /* G4: guests bound now / the max_guests cap; 1 iff HOST */
+/* Guests G6.2: host operator tools (HOST only, main thread). `guests` lists through _guest_info (never the token); _guest_admin: op 0 = remove, 1 = reset-token.
+ * Returns 1 = done, 2 = nothing changed (no `confirm`: msg says what would happen), 0 = refused (msg says why). Both refuse while the guest is bound / guests.dat is
+ * UNTRUSTED, and back guests.dat up (guests.dat.bak-<timestamp>) before changing anything. */
+typedef struct PCNetGameDedicatedGuestInfo {
+    int  slot;
+    char name[PC_NETGAME_NAME_LEN + 1];      /* the guest's player name (ASCII, '?' for other font codes) */
+    char home_town[PC_NETGAME_NAME_LEN + 1]; /* the guest's HOME town name */
+    char town[PC_NETGAME_NAME_LEN + 1];      /* the HOST town this entry belongs to */
+    int  active;     /* 1 = the entry belongs to this host's current town */
+    int  confirmed;
+    unsigned rev;    /* 0 = the first upload never completed */
+    int  bound_peer; /* transport peer the guest is connected on, -1 = not bound */
+    int  recovery;   /* 1 = an operator token recovery is armed */
+    int  untrusted;  /* guests.dat is UNTRUSTED */
+} PCNetGameDedicatedGuestInfo;
+int  pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out); /* 1 iff the slot is in use */
+int  pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char* msg, size_t cap);
 /* what: 0 = transport-connected, 1 = READY (bound), 2 = disconnected (call BEFORE the per-peer state is reset). Prints one "[DEDICATED] ..." line. */
 void pc_net_game_dedicated_announce(int peer, int what);
 

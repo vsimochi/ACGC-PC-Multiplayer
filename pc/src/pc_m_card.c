@@ -1516,6 +1516,14 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
                  (const char*)home.player_name, clash);
         return 0;
     }
+    /* Guests G6.3: a guest comes from ANOTHER town. The host refuses a home land equal to its own town's land (1 / 65534 chance for a random land id): say
+     * it HERE, before anything is bound, instead of letting the host refuse it silently. The ids are permanent, so the fix is the user's (guest.ini). */
+    if (home.land_id == (u16)Save_Get(land_info.id) && memcmp(home.land_name, Save_Get(land_info.name), sizeof(home.land_name)) == 0) {
+        snprintf(err, errcap, "REFUSED: your guest home town '%.8s' (land id 0x%04X) is the same as this town, so the host would refuse you. Edit land_id in "
+                              "save/mp/guest.ini (a different land_id or home_town makes you a NEW guest on every host).",
+                 (const char*)home.land_name, (unsigned)home.land_id);
+        return 0;
+    }
     memset(&l_mcd_foreigner_file, 0, sizeof(l_mcd_foreigner_file));
     pass = &l_mcd_foreigner_file.file.priv;
     pc_guest_build_fresh_record(pass, &home, opt_gender, opt_face);

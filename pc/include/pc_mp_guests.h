@@ -136,6 +136,9 @@ int pc_mp_guests_parse(const uint8_t* buf, size_t len, PCMpGuestFile* out);
 
 PCMpGuestLoadMode pc_mp_guests_load(const char* path, PCMpGuestFile* out, PCMpGuestLoadInfo* info);
 int pc_mp_guests_save(const char* path, const PCMpGuestFile* f);
+/* Guests G6.2: copy `path` byte for byte to "<path>.bak-<timestamp>" (out_path receives the name) BEFORE an operator command changes the table.
+ * 1 = backup exists; 0 = no source file / I/O error (nothing is left behind). The caller must refuse its change when this returns 0. */
+int pc_mp_guests_backup_file(const char* path, char* out_path, size_t cap);
 
 /* Cryptographically secure random bytes from the OS (RtlGenRandom / SystemFunction036 on Windows, /dev/urandom elsewhere).
  * Returns 1 on success, 0 on failure. There is NO weak fallback: a caller that gets 0 must refuse to mint a token. */

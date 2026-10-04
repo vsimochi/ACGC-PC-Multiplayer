@@ -349,6 +349,9 @@ static void pc_ded_cmd_help(void) {
            "  status   server status: observer, network role/port, world+save readiness, uptime, peers, last save\n"
            "  players  connected players: peer slot, link, class (RESIDENT idx / GUEST slot), name, puppet, idle ms\n"
            "  save     request an authoritative save at the next safe point (prints 'save: OK', 'save: FAILED (...)' or 'save: refused: ...')\n"
+           "  guests   guest table: slot, name, home town, host town, confirmed, rev, bound peer, recovery (never the token)\n"
+           "  guest-remove <slot|name> confirm        remove a guest and its character (guests.dat is backed up first; refused while the guest is connected)\n"
+           "  guest-reset-token <slot|name> confirm   token lost: the next claim of that guest's key gets a NEW token for the SAME character (10 min, once; backed up)\n"
            "  stop     graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit\n");
     fflush(stdout);
 }
@@ -446,6 +449,66 @@ static void pc_ded_cmd_players(void) {
     fflush(stdout);
 }
 
+static int pc_ded_stricmp(const char* a, const char* b) {
+    for (; *a != '\0' && *b != '\0'; a++, b++) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return 1;
+        }
+    }
+    return *a != *b;
+}
+
+/* G6.2: `guests` (list, never the token) and the two guarded operator commands. */
+static void pc_ded_cmd_guests(void) {
+    int g, n = 0;
+    for (g = 0; g < 8; g++) {
+        PCNetGameDedicatedGuestInfo gi;
+        if (!pc_net_game_dedicated_guest_info(g, &gi)) {
+            continue;
+        }
+        if (n == 0) {
+            printf("[DEDICATED] guests (host guest table, all towns; %s):\n", gi.untrusted ? "guests.dat is UNTRUSTED" : "tokens are never printed");
+        }
+        n++;
+        printf("  slot %d: name=\"%s\" home_town=\"%s\" host_town=\"%s\"%s confirmed=%s rev=%u bound=%s%s\n", gi.slot, gi.name, gi.home_town, gi.town,
+               gi.active ? "" : " (other town: inactive)", gi.confirmed ? "yes" : "no", gi.rev,
+               gi.bound_peer >= 0 ? "yes" : "no", gi.recovery ? " RECOVERY-ARMED" : "");
+        if (gi.bound_peer >= 0) {
+            printf("    (connected on peer %d)\n", gi.bound_peer);
+        }
+    }
+    if (n == 0) {
+        printf("[DEDICATED] guests: none stored (or this server is not a ready host)\n");
+    }
+    fflush(stdout);
+}
+
+/* args = the text after the command word: "<slot|name> [confirm]". The selector is one token; the trailing token `confirm` (case-insensitive) is the explicit consent. */
+static void pc_ded_cmd_guest_admin(int op, char* args) {
+    const char* cname = op == 0 ? "guest-remove" : "guest-reset-token";
+    char sel[64];
+    char tok2[32];
+    char extra[8];
+    char msg[640];
+    int n, r;
+    sel[0] = tok2[0] = extra[0] = '\0';
+    n = sscanf(args != NULL ? args : "", "%63s %31s %7s", sel, tok2, extra);
+    if (n < 1) {
+        printf("[DEDICATED] %s: usage: %s <slot|name> confirm (see `guests`)\n", cname, cname);
+        fflush(stdout);
+        return;
+    }
+    if (n >= 3 || (n == 2 && pc_ded_stricmp(tok2, "confirm") != 0)) {
+        printf("[DEDICATED] %s: expected exactly `<slot|name> confirm` (extra / unknown arguments: nothing was changed)\n", cname);
+        fflush(stdout);
+        return;
+    }
+    r = pc_net_game_dedicated_guest_admin(op, sel, n == 2, msg, sizeof(msg));
+    printf("[DEDICATED] %s: %s\n", cname, msg);
+    PC_LOG(PCL_GENERAL, "dedicated: %s %s -> %s\n", cname, sel, r == 1 ? "done" : r == 2 ? "needs confirm" : "refused");
+    fflush(stdout);
+}
+
 static void pc_ded_cmd_stop(void) {
     if (s_stop_requested) {
         printf("[DEDICATED] already stopping...\n");
@@ -462,6 +525,7 @@ static void pc_ded_execute(char* line) {
     char* p = line;
     char* end;
     char* cmd;
+    char* args = NULL;
     size_t i;
     while (*p != '\0' && isspace((unsigned char)*p)) {
         p++;
@@ -479,6 +543,7 @@ static void pc_ded_execute(char* line) {
     }
     if (cmd[i] != '\0') {
         cmd[i] = '\0';
+        args = cmd + i + 1; /* the rest of the line, case preserved (guest names) */
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
         pc_ded_cmd_help();
@@ -486,6 +551,12 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_status();
     } else if (strcmp(cmd, "players") == 0) {
         pc_ded_cmd_players();
+    } else if (strcmp(cmd, "guests") == 0) {
+        pc_ded_cmd_guests();
+    } else if (strcmp(cmd, "guest-remove") == 0) {
+        pc_ded_cmd_guest_admin(0, args);
+    } else if (strcmp(cmd, "guest-reset-token") == 0) {
+        pc_ded_cmd_guest_admin(1, args);
     } else if (strcmp(cmd, "save") == 0) {
         if (s_save_pending) {
             printf("[DEDICATED] save: already requested (waiting for the next safe point)\n");

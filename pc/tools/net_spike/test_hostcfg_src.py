@@ -132,9 +132,10 @@ def main():
           "if (s_role == PC_NETGAME_ROLE_CLIENT) {\n        pcnetgame_client_notice_update();" in po and "s_notice_visible = 0;" in po[:300]
           and "return s_notice_visible;" in func_body(c, "pc_net_game_client_notice_visible") and "int pc_net_game_client_notice_visible(void);" in h)
     dr = func_body(pm, "pc_net_notice_draw")
-    check("A3 draw: the existing PC font overlay path only (pc_menu_draw_centered inside mFont_SetMatrix / UnSetMatrix, like the pause overlay), no-op while paused / hidden / no graph; "
+    check("A3 draw: the existing PC font overlay path only (pc_menu_draw_centered inside mFont_SetMatrix / UnSetMatrix, like the pause overlay), no-op while paused / no graph (G6.1: the join-failure message is drawn first, in the same path, and returns; the not-connected notice is unchanged); "
           "called from graph_main right after pc_pause_menu_draw, under TARGET_PC",
-          "g_pc_paused || game == NULL || game->graph == NULL || !pc_net_game_client_notice_visible()" in dr and dr.count("pc_menu_draw_centered(") == 2
+          "if (g_pc_paused || game == NULL || game->graph == NULL) return;" in dr and "if (!pc_net_game_client_notice_visible()) return;" in dr
+          and dr.index("pc_net_game_join_message(&join_warning)") < dr.index("if (!pc_net_game_client_notice_visible()) return;") and dr.count("pc_menu_draw_centered(") == 2
           and "mFont_SetMatrix(game->graph, mFont_MODE_FONT);" in dr and "mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);" in dr
           and "void pc_net_notice_draw(struct game_s* game);" in pmh
           and gr.index("pc_pause_menu_draw(game);") < gr.index("pc_net_notice_draw(game);") and gr.count("pc_net_notice_draw(game);") == 1

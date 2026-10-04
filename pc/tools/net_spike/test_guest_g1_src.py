@@ -228,10 +228,10 @@ def main():
        re.search(r'strcmp\(argv\[i\], "--bootstrap-guest"\) == 0\) \{\s*/\*[^*]*\*/\s*fprintf\(stderr, "\[PC\] --bootstrap-guest: REFUSED: the option needs a spec argument[^;]*;\s*return 2;', main_raw))
     after = poll_only[poll_only.index("l_done = 1;"):]
     ck("H no failure path of the CLI arrival is a silent return (G3: the poll after `l_done = 1;` has no `return` at all and ONE exit(2) with the stderr diagnostic for every failure of pc_guest_arrive; "
-       "pc_guest_arrive has exactly 9 failure paths, each a `return 0` with a message: not a client, no GAME_PLAY, scene not ready, save reload, no valid save, bad spec, resident-name clash, "
-       "mSDI_StartDataInitGuest, goto_other_scene)",
+       "pc_guest_arrive has exactly 10 failure paths (G6.3 added the home-land-equals-town refusal), each a `return 0` with a message: not a client, no GAME_PLAY, scene not ready, save reload, "
+       "no valid save, bad spec, resident-name clash, home land == this town, mSDI_StartDataInitGuest, goto_other_scene)",
        "return" not in after and after.count("exit(2);") == 1 and after.count("fprintf(stderr, \"[PC] --bootstrap-guest: %s\\n\", err);") == 1 and after.count("fflush(stdout);") == 1
-       and arr.count("return 0;") == 9 and arr.count("snprintf(err, errcap,") == 9 and arr.count("return 1;") == 1)
+       and arr.count("return 0;") == 10 and arr.count("snprintf(err, errcap,") == 10 and arr.count("return 1;") == 1)
     pre = poll_only[:poll_only.index("l_done = 1;")]
     ck("H the only early `return`s of the poll are the one-shot / disabled guard and the two readiness waits (play_main, wipe), BEFORE l_done = 1 (the option-not-supplied path is untouched)",
        pre.count("return;") == 3 and "if (l_done || g_pc_bootstrap_guest == NULL) {" in pre and "gamePT->exec != play_main" in pre and "fb_wipe_mode != WIPE_MODE_NONE" in pre)

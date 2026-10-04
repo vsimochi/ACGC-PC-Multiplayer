@@ -119,9 +119,11 @@ def main():
           '"save/mp/guests.dat"' in h and '"save/mp/guest_token.dat"' in h and not re.search(r'\.gci|GAF', re.sub(r"/\*.*?\*/", "", c + h, flags=re.S)))
     check("writes are atomic: tmp -> flush + commit -> validated rotation -> MoveFileEx(REPLACE_EXISTING | WRITE_THROUGH); the serialized image is self-parsed BEFORE it is written",
           "MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)" in c and "commit_file(fp)" in c and "failed self-validation" in c)
-    check("an unreadable file is MOVED ASIDE (never deleted): no remove() of a guests / token file except the tmp and the oldest valid generation being rotated out",
-          sorted(set(re.findall(r"\bremove\((\w+)\)", c))) == ["b2", "tmp"] and len(re.findall(r"\bremove\(", c)) == len(re.findall(r"\bremove\((?:tmp|b2)\)", c))
-          and "move_aside(" in c)
+    bk = c[c.index("int pc_mp_guests_backup_file("):]
+    check("an unreadable file is MOVED ASIDE (never deleted): no remove() of a guests / token file except the tmp, the oldest valid generation being rotated out and (G6.2) the "
+          "PARTIAL operator backup copy that pc_mp_guests_backup_file itself created (never the source)",
+          sorted(set(re.findall(r"\bremove\((\w+)\)", c))) == ["b2", "out_path", "tmp"] and len(re.findall(r"\bremove\(", c)) == len(re.findall(r"\bremove\((?:tmp|b2|out_path)\)", c))
+          and c.count("remove(out_path)") == 1 and "remove(out_path)" in bk and "remove(path)" not in c and "move_aside(" in c)
     check("the OS random source has NO weak fallback (RtlGenRandom / SystemFunction036 or /dev/urandom, failure returns 0)",
           "SystemFunction036" in c and "/dev/urandom" in c and "return 0;" in c[c.index("int pc_mp_guests_random_bytes"):c.index("/* ---------------- file helpers")] and "rand()" not in c)
     check("M2: the header documents the bearer-token limitation and the TOFU exposure (replay on an unencrypted transport, re-mint / eviction rules, per-address limit)",

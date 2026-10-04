@@ -142,8 +142,10 @@ def main():
        "guest slot < PC_NETGAME_REC_SLOTS and the entry used -> s_guest_rec", len(re.findall(r"^static Private_c\* pcnetgame_rec_priv_ptr\(", c, re.M)) == 1
        and "slot >= 0 && slot < PLAYER_NUM" in fb("pcnetgame_rec_priv_ptr") and "slot >= PLAYER_NUM && slot < PC_NETGAME_REC_SLOTS && s_guest[slot - PLAYER_NUM].used" in fb("pcnetgame_rec_priv_ptr")
        and "&s_guest_rec[slot - PLAYER_NUM]" in fb("pcnetgame_rec_priv_ptr") and c.count("&s_guest_rec[") >= 4)
-    ck("A s_guest_rec[] is addressed ONLY through the accessor, the guest table lifecycle functions (install / create / rollback) and nothing else",
-       sorted({n for a, b, n in funcs if "s_guest_rec[" in c[a:b]}) == sorted(["pcnetgame_rec_priv_ptr", "pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create"]))
+    ck("A s_guest_rec[] is addressed ONLY through the accessor, the guest table lifecycle functions (install / create / rollback) and the G6.2 operator tools (remove: "
+       "pc_net_game_dedicated_guest_admin) and nothing else",
+       sorted({n for a, b, n in funcs if "s_guest_rec[" in c[a:b]}) == sorted(["pcnetgame_rec_priv_ptr", "pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create",
+                                                                              "pc_net_game_dedicated_guest_admin"]))
     pinned = ["pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
               "pcnetgame_mail_test_poke_museum", "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mail_test_seed_reply", "pcnetgame_mbox_refresh_resident",
@@ -290,10 +292,10 @@ def main():
        c.count("pc_mp_guests_load(") == 1 and c.count("pc_mp_guests_save(") == 1 and not re.search(r"\bfopen\b|card_a|card_b", blk) and ".gci" not in blk
        and '#define PC_MP_GUESTS_PATH         "save/mp/guests.dat"' in gh)
     ck("P guests.dat is written (1) when a token is minted / re-minted (durable, before the token is sent), (2) when an entry is rolled back, (3) when an entry is confirmed, (4) by the "
-       "GCI-save hook -- and never while UNTRUSTED",
+       "GCI-save hook, (5) by the G6.2 operator removal (pc_net_game_dedicated_guest_admin, after a backup) -- and never while UNTRUSTED",
        sorted({n for a, b, n in funcs if "pcnetgame_guest_store_write(" in c[a:b] and n != "pcnetgame_guest_store_write"})
        == sorted(["pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pcnetgame_guest_remint", "pcnetgame_guest_remint_rollback",
-                  "pcnetgame_guest_confirm_on_record_step", "pc_net_game_record_after_gci_save"]))
+                  "pcnetgame_guest_confirm_on_record_step", "pc_net_game_record_after_gci_save", "pc_net_game_dedicated_guest_admin"]))
     ck("P the store write refuses while UNTRUSTED (a write would lift the operator lock) and while nothing was loaded; the epoch alone never forces a rewrite; failures are logged, never fatal",
        "if (!s_guest_store_loaded || s_guest_untrusted) {" in fb("pcnetgame_guest_store_write") and "cmp.e[g].epoch = s_guest_file.e[g].epoch;" in fb("pcnetgame_guest_store_write")
        and "return 0;" in fb("pcnetgame_guest_store_write") and "exit(" not in fb("pcnetgame_guest_store_write") and "abort(" not in fb("pcnetgame_guest_store_write"))

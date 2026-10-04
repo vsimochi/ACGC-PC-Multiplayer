@@ -267,7 +267,14 @@ def main():
         # a removed line must come back in the same hunk (guarded / re-expressed), never vanish
         ck("P1 %s: every removed line reappears in the same hunk, guarded or re-expressed (all its identifiers are in one added line)" % rel,
            all(all(any(norm_tokens(r) <= norm_tokens(a) for a in h["add"]) for r in h["rem"]) for h in hs))
-    ck("P1 pc/include/pc_net_game.h (the wire header) is byte-identical to HEAD: the dedicated accessor struct / prototypes live in pc_dedicated.h", read("pc/include/pc_net_game.h") == head("pc/include/pc_net_game.h")
+    g61 = """
+/* Guests G6.1: the readable join-failure message of the last client connection attempt (a refused join: server full / town mismatch / protocol mismatch /
+ * token problems; host unreachable) or NULL when there is none (or a final failure older than 30 s). Survives the shutdown a refusal causes. *is_warning
+ * (optional) = 1 for the non-final \"no answer from the host yet, still trying\" kind. Drawn by pc_net_notice_draw(); also logged ([NET][JOIN]) and on stderr. */
+const char* pc_net_game_join_message(int* is_warning);
+"""
+    ck("P1 pc/include/pc_net_game.h (the wire header) is byte-identical to HEAD apart from the ONE pinned G6.1 function declaration (no typedef / define touched): the dedicated accessor struct / prototypes live in pc_dedicated.h",
+       read("pc/include/pc_net_game.h").replace(g61, "", 1) == head("pc/include/pc_net_game.h")
        and "typedef struct PCNetGameDedicatedPeerInfo {" in ded_h and "int  pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out);" in ded_h)
     ck("W6 frame pacing: dedicated defaults to the 60 Hz tick (g_pc_frame_limit_override = 60 only when no --framelimit / --no-framelimit was given), inside the dedicated block, after the observer flag",
        blk.index("if (g_pc_frame_limit_override < 0) {") > blk.index("g_pc_host_observer = 1;") and "g_pc_frame_limit_override = 60;" in blk and blk.count("g_pc_frame_limit_override") == 2)

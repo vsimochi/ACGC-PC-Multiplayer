@@ -3440,6 +3440,29 @@ def _auto_fixture_guard(bin_dir):
     atexit.register(lambda: os.path.isdir(snap) and _fixture_restore(bin_dir, snap))
 
 
+def discard_fixture_guest_mp(bin_dir=None):
+    """G6.0: remove save/mp (guest.ini / guest_token.dat / guests.dat ...) of a DISPOSABLE fixture dir (bin_fixture4*) or the disposable clone, both from the
+    dir itself AND from the pending automatic at-exit snapshot. A real-guest test writes its guest.ini BEFORE the first launch, so the automatic snapshot
+    (taken at that launch) contains it and its at-exit restore used to bring save/mp/guest.ini back after the test's own restore. Refuses (does nothing)
+    for every other dir: the live / protected dirs are never touched. Returns the list of removed paths."""
+    import shutil
+    bin_dir = bin_dir or GAME_BIN_DIR
+    removed = []
+    if not (is_fixture_bin_dir(bin_dir) or _norm_dir(bin_dir) == _norm_dir(CLONE_GAME_BIN_DIR)):
+        return removed
+    if bin_dir_refusal(bin_dir) is not None:
+        return removed
+    targets = [os.path.join(bin_dir, "save", "mp")]
+    snap = _FIXTURE_AUTO_GUARDS.get(_norm_dir(bin_dir))
+    if snap:
+        targets.append(os.path.join(snap, "mp"))
+    for t in targets:
+        if os.path.isdir(t):
+            shutil.rmtree(t, ignore_errors=True)
+            removed.append(t)
+    return removed
+
+
 def require_launchable_bin_dir(bin_dir):
     """Raise RuntimeError (naming the dir) when a host/client game process must not be launched from bin_dir. A launch from a fixture dir also
     arms the automatic whole-save snapshot / at-exit restore (_auto_fixture_guard)."""

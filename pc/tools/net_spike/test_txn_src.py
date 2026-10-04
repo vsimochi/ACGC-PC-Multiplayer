@@ -234,9 +234,9 @@ def main():
     check("J the journal is NOT cleared per peer: pcnetgame_reset_all_host_peer_state mentions neither s_txn_res nor the journal clear",
           "s_txn_res" not in reset and "pcnetgame_txn_journal_clear" not in reset)
     calls = {n: ("pcnetgame_txn_journal_clear(" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_rec_on_town_changed", "pcnetgame_rec_on_world_reset", "pcnetgame_rec_slot")}
-    gcalls = {n: ("pcnetgame_txn_journal_clear(PLAYER_NUM + g)" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create")}
-    check(f"J cleared by exactly the three spec'd events: town change, world reset, slot re-init ({calls}) + the three guest-table lifecycle events (guests G1: a guest entry is installed / created / rolled back: {gcalls}); no other caller",
-          all(calls.values()) and all(gcalls.values()) and c.count("pcnetgame_txn_journal_clear(") == 8)  # declaration + definition + 3 calls + 3 guest-table calls
+    gcalls = {n: ("pcnetgame_txn_journal_clear(PLAYER_NUM + g)" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pc_net_game_dedicated_guest_admin")}
+    check(f"J cleared by exactly the three spec'd events: town change, world reset, slot re-init ({calls}) + the guest-table lifecycle events (guests G1: a guest entry is installed / created / rolled back; G6.2: removed by the operator: {gcalls}); no other caller",
+          all(calls.values()) and all(gcalls.values()) and c.count("pcnetgame_txn_journal_clear(") == 9)  # declaration + definition + 3 calls + 3 guest-table calls + the G6.2 operator removal
     check("J the journal is memory-only: nothing of it reaches the records file / GCI (no s_txn_res near pc_mp_records / store build)",
           "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_build")) and "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_write")))
     lib = open(os.path.join(HERE, "net_spike_lib.py"), encoding="utf-8").read()

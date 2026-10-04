@@ -211,6 +211,7 @@
 #include "m_kabu_manager.h" /* Town services milestone 2 (shop): Kabu_get_price() -- the sale value of a turnip bundle (SHOP_SELL) */
 #include "ac_shop_design.h" /* Town services milestone 2 (shop): aSD_PC_SyncDisplayWithStock() -- redraw the shop floor from the stock */
 
+#include <stdarg.h>
 #include <math.h>   /* fabsf(), isfinite() -- see pcnetgame_pos_valid() and the reach checks */
 #include <stddef.h> /* offsetof() */
 #include <stdio.h>
@@ -3426,6 +3427,11 @@ typedef struct PCNetGameGuest {
      * key or evicted (oldest first) when the table is full; a confirmed entry never is. `age` = mint order (persisted, larger = newer). */
     uint8_t      confirmed;
     uint32_t     age;
+    /* G6.2 operator recovery (`guest-reset-token <guest> confirm` on the dedicated console): HOST-LOCAL and in memory only (never on the wire, never
+     * persisted: a host restart forgets it). While set (and younger than PC_NETGAME_GUEST_RECOVERY_MS) the NEXT claim of THIS key that does not carry
+     * the stored token is answered with ONE re-minted token for the SAME record (the character is kept); the claim clears it. */
+    uint8_t      recovery;
+    uint32_t     recovery_since_ms;
 } PCNetGameGuest;
 static PCNetGameGuest s_guest[PC_NETGAME_GUEST_MAX];
 static Private_c      s_guest_rec[PC_NETGAME_GUEST_MAX];
@@ -13086,6 +13092,20 @@ static int pcnetgame_guest_find(const PersonalID_c* key) {
     return -1;
 }
 
+/* G6.2: the operator recovery window (ms) of a guest-reset-token. */
+#define PC_NETGAME_GUEST_RECOVERY_MS 600000u
+static int pcnetgame_guest_recovery_active(int g) {
+    if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used || !s_guest[g].recovery) {
+        return 0;
+    }
+    if ((uint32_t)(pcnetgame_now_ms() - s_guest[g].recovery_since_ms) >= PC_NETGAME_GUEST_RECOVERY_MS) {
+        s_guest[g].recovery = 0; /* expired: the entry is exactly as before the command */
+        printf("[NET][GUEST] host: the operator recovery of guest slot %d EXPIRED unused\n", g);
+        return 0;
+    }
+    return 1;
+}
+
 /* M3: an entry that may be re-minted / evicted: UNCONFIRMED, no accepted data (rev 0) and no live peer bound to it. */
 static int pcnetgame_guest_entry_disposable(int g) {
     return s_guest[g].used && !s_guest[g].confirmed && s_rec_slot[PLAYER_NUM + g].rev == 0 &&
@@ -13215,11 +13235,24 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
 /* M3 re-mint: an UNCONFIRMED data-less idle entry for the same (town, key) gets a NEW token (the old one was never demonstrably stored by the
  * client: its TOKEN message may have been lost). Durable before the token is sent; *old_token_out keeps the previous one for the rollback. Returns
  * 0 = ok, -2 = no randomness, -3 = could not persist (the old token is restored). */
+static uint8_t s_guest_remint_prev_recovery = 0, s_guest_remint_prev_confirmed = 0; /* G6.2: the entry state the last re-mint replaced (for the rollback) */
+static uint32_t s_guest_remint_prev_since = 0;
+static int s_guest_remint_prev_g = -1;
 static int pcnetgame_guest_remint(int g, uint8_t* token_out, uint8_t* old_token_out) {
     uint32_t age_max = 0, old_age;
     int k;
     if (!pcnetgame_guest_token_fresh(token_out)) {
         return -2;
+    }
+    s_guest_remint_prev_g = g;
+    s_guest_remint_prev_recovery = s_guest[g].recovery;
+    s_guest_remint_prev_confirmed = s_guest[g].confirmed;
+    s_guest_remint_prev_since = s_guest[g].recovery_since_ms;
+    if (pcnetgame_guest_recovery_active(g)) {
+        /* G6.2: one use; the new token is unproven until the client presents it (a later connection confirms it) */
+        s_guest[g].recovery = 0;
+        s_guest[g].confirmed = 0;
+        printf("[NET][GUEST] host: operator recovery of guest slot %d used: re-minting its token (the stored record is kept)\n", g);
     }
     memcpy(old_token_out, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN);
     for (k = 0; k < PC_NETGAME_GUEST_MAX; k++) {
@@ -13233,6 +13266,9 @@ static int pcnetgame_guest_remint(int g, uint8_t* token_out, uint8_t* old_token_
     if (!pcnetgame_guest_store_write("unconfirmed guest re-minted")) {
         memcpy(s_guest[g].token, old_token_out, PC_NETGAME_GUEST_TOKEN_LEN);
         s_guest[g].age = old_age;
+        s_guest[g].recovery = s_guest_remint_prev_recovery;
+        s_guest[g].recovery_since_ms = s_guest_remint_prev_since;
+        s_guest[g].confirmed = s_guest_remint_prev_confirmed;
         return -3;
     }
     return 0;
@@ -13243,6 +13279,11 @@ static void pcnetgame_guest_remint_rollback(int g, const uint8_t* old_token) {
         return;
     }
     memcpy(s_guest[g].token, old_token, PC_NETGAME_GUEST_TOKEN_LEN);
+    if (s_guest_remint_prev_g == g) {
+        s_guest[g].recovery = s_guest_remint_prev_recovery; /* G6.2: the recovery was not used up: the real guest never got the token */
+        s_guest[g].recovery_since_ms = s_guest_remint_prev_since;
+        s_guest[g].confirmed = s_guest_remint_prev_confirmed;
+    }
     (void)pcnetgame_guest_store_write("guest re-mint rolled back (token not deliverable)");
 }
 
@@ -13332,6 +13373,16 @@ static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityM
             }
             *out_slot = g;
             *out_mode = 1;
+            return 1;
+        }
+        if (pcnetgame_guest_recovery_active(g)) {
+            /* G6.2: the OPERATOR authorised a token re-mint for this entry (guest-reset-token ... confirm, entry not bound, one use, expires). The
+             * key owner gets a new token for the SAME stored record; the name rules judge new identities only and are not applied (the operator chose
+             * this guest). The key conflict / validity checks above still applied. */
+            printf("[NET][GUEST] host: peer %d claims guest slot %d which has an operator RECOVERY pending: a new token will be issued for the stored record\n",
+                   (int)peer, g);
+            *out_slot = g;
+            *out_mode = 2;
             return 1;
         }
         if (pcnetgame_guest_entry_disposable(g)) {
@@ -20223,6 +20274,60 @@ static void pcnetgame_handle_client_wildlife_snapshot_end(const PCNetGameWildlif
 static void pcnetgame_handle_client_catch_result(const PCNetGameCatchResultMsg* in);
 static void pcnetgame_handle_client_wildlife_despawn(const PCNetGameWildlifeDespawnMsg* in);
 
+/* ===== G6.1 BEGIN: readable join-failure messages (client only; NO wire change: the frozen reject reasons are mapped to text locally) =====
+ * A refused / failed join used to print only "reason=N" and keep playing alone silently. Every failure now produces ONE human sentence, kept in a small
+ * static buffer that outlives pc_net_game_shutdown() (the client falls back to single player after a refusal) and is shown on screen by
+ * pc_net_notice_draw() (pc_pause_menu.c, called from graph_main every frame: the same overlay works on the title screen and in game) for
+ * PC_NETGAME_JOIN_MSG_SHOW_MS. It is ALSO printed to the log ([NET][JOIN]) and to stderr. A "waiting" warning (host does not answer yet) is not final: it
+ * stays until the transport answers. Starting a new client connection clears it. */
+#define PC_NETGAME_JOIN_MSG_SHOW_MS    30000u
+#define PC_NETGAME_CONNECT_WARN_MS     8000u
+#define PC_NETGAME_JOIN_MSG_MAX        420
+static char     s_join_msg[PC_NETGAME_JOIN_MSG_MAX];
+static uint32_t s_join_msg_since_ms = 0;
+static int      s_join_msg_set = 0;
+static int      s_join_msg_warning = 0;   /* 1 = "still trying" (cleared when the transport answers), 0 = a final failure shown for PC_NETGAME_JOIN_MSG_SHOW_MS */
+static char     s_client_host_addr[80];   /* "ip:port" of the host this client connects to (for the unreachable message) */
+static uint32_t s_client_connect_since_ms = 0;
+static int      s_client_connect_warned = 0;
+
+static void pcnetgame_join_message_set(int warning, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_join_msg, sizeof(s_join_msg), fmt, ap);
+    va_end(ap);
+    s_join_msg_since_ms = pcnetgame_now_ms();
+    s_join_msg_set = 1;
+    s_join_msg_warning = warning ? 1 : 0;
+    printf("[NET][JOIN] %s: %s\n", warning ? "waiting" : "CANNOT JOIN", s_join_msg);
+    fprintf(stderr, "[NET][JOIN] %s: %s\n", warning ? "waiting" : "CANNOT JOIN", s_join_msg);
+    fflush(stdout);
+    fflush(stderr);
+}
+
+static void pcnetgame_join_message_clear(void) {
+    s_join_msg_set = 0;
+    s_join_msg_warning = 0;
+    s_join_msg[0] = '\0';
+}
+
+/* The text drawn by pc_net_notice_draw(): NULL when there is none (or a final failure older than PC_NETGAME_JOIN_MSG_SHOW_MS). *is_warning (optional)
+ * tells the "waiting" kind from a final failure. Valid in every role (it survives the shutdown after a refusal). */
+const char* pc_net_game_join_message(int* is_warning) {
+    if (is_warning != NULL) {
+        *is_warning = s_join_msg_warning;
+    }
+    if (!s_join_msg_set) {
+        return NULL;
+    }
+    if (!s_join_msg_warning && (uint32_t)(pcnetgame_now_ms() - s_join_msg_since_ms) >= PC_NETGAME_JOIN_MSG_SHOW_MS) {
+        s_join_msg_set = 0;
+        return NULL;
+    }
+    return s_join_msg;
+}
+/* ===== G6.1 END ===== */
+
 /* ===== GUESTS CLIENT BEGIN: the guest claim (IDENTITY_EXT) and the token it holds (IDENTITY_TOKEN, save/mp/guest_token.dat) =====
  * A client that PLAYS A GUEST (its game identity is a foreigner: Common player_no >= mPr_FOREIGNER, Now_Private = its HOME private) sends
  * IDENTITY_EXT right before its IDENTITY: the guest flag, its HOME PersonalID (Now_Private->player_ID) and the token this host issued earlier,
@@ -20299,6 +20404,9 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
                    "host that issued it (its guest table was reset, another machine hosts a copy of the town, or an impostor). REFUSING the host. "
                    "To start over delete %s and ask the host owner to remove this guest from the host's save/mp/guests.dat ***\n",
                    PC_MP_GUEST_TOKEN_PATH);
+            pcnetgame_join_message_set(0, "The host gave you a DIFFERENT guest token than the one you hold: this is not the host that issued it (its guest table was reset, "
+                                          "or it is another machine). You were disconnected. Delete %s and ask the host operator to run guest-reset-token or "
+                                          "guest-remove for your guest.", PC_MP_GUEST_TOKEN_PATH);
             pc_net_game_shutdown();
             return;
         }
@@ -20326,6 +20434,44 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
     } else {
         printf("[NET][GUEST] client: *** could NOT save the guest token to %s: the host will refuse this guest on the next visit until the host "
                "owner removes it from the host's save/mp/guests.dat ***\n", PC_MP_GUEST_TOKEN_PATH);
+        pcnetgame_join_message_set(0, "Your guest token could not be saved to %s. The host will refuse you next time until its operator runs guest-reset-token for "
+                                      "your guest. Check that the folder is writable.", PC_MP_GUEST_TOKEN_PATH);
+    }
+}
+
+/* G6.1: the REJECT reason -> one readable sentence (the numeric reason stays in the log line printed by the caller). `host_town` is non-NULL for the
+ * 24-byte forms (LAND_MISMATCH / NO_SAVE). The code cannot tell the refusals that share a reason apart (the wire is frozen), so the text lists them. */
+static void pcnetgame_reject_text(unsigned reason, unsigned host_protocol, const PCNetGameTownIdentity* host_town, char* out, size_t cap) {
+    char a[96] = "?", b[96] = "?";
+    const int guest = s_client_guest_claim_sent != 0;
+    if (host_town != NULL) {
+        pcnetgame_format_town(host_town, a, sizeof(a));
+        pcnetgame_format_town(&s_client_claimed_town, b, sizeof(b));
+    }
+    switch (reason) {
+        case PC_NETGAME_REJECT_PROTOCOL_MISMATCH:
+            snprintf(out, cap, "The host runs another network version (host %u, this game %u). Use the same game build as the host.", host_protocol,
+                     (unsigned)PC_NETGAME_PROTOCOL_VERSION);
+            break;
+        case PC_NETGAME_REJECT_SERVER_FULL:
+            if (guest) {
+                snprintf(out, cap, "The host refused this guest: server full / guest limit reached / all resident slots taken. The host gives the same answer when the guest table is "
+                                   "full, this guest or its name is already in use, or the guest token is missing or wrong.%s",
+                         s_client_ext_sent.token_present ? " This client presented a token: the host may have reset its guest table (ask its operator)."
+                                                         : " Lost save/mp/guest_token.dat? Ask the host operator to run guest-reset-token for your guest.");
+            } else {
+                snprintf(out, cap, "The host refused you: server full / all resident slots taken, or your character is already connected or is the host's own character.");
+            }
+            break;
+        case PC_NETGAME_REJECT_LAND_MISMATCH:
+            snprintf(out, cap, "Your town (%s) is not the host's town (%s). Copy the host's town save (DobutsunomoriP_MURA.gci) into save/card_a and restart.", b, a);
+            break;
+        case PC_NETGAME_REJECT_NO_SAVE:
+            snprintf(out, cap, "The host (town %s) has no resident matching your character. Play one of the host's residents, or join as a guest (Join as Guest / --guest).", a);
+            break;
+        default:
+            snprintf(out, cap, "The host refused the connection (reason %u, unknown to this game version). Update the game to the host's version.", reason);
+            break;
     }
 }
 /* ===== GUESTS CLIENT END ===== */
@@ -20619,6 +20765,12 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
             pcnetgame_format_town(&s_client_claimed_town, b, sizeof(b));
             printf("[NET] client: IDENTITY_ACK does not match (host protocol %u %s, ours %u %s) -- disconnecting\n",
                    (unsigned)in.protocol_version, a, (unsigned)PC_NETGAME_PROTOCOL_VERSION, b);
+            if (in.protocol_version != PC_NETGAME_PROTOCOL_VERSION) {
+                pcnetgame_join_message_set(0, "The host runs another network version (host %u, this game %u). Use the same game build as the host.",
+                                           (unsigned)in.protocol_version, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
+            } else {
+                pcnetgame_join_message_set(0, "The host's town (%s) does not match your town (%s). Copy the host's town save into save/card_a and restart.", a, b);
+            }
             pc_net_game_shutdown();
             return;
         }
@@ -20667,6 +20819,22 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         memcpy(&in, data, sizeof(in)); /* first 8 bytes are common to both forms */
         printf("[NET] client: host rejected the connection (reason=%u, host requires protocol %u, we sent %u)\n",
                (unsigned)in.reason, (unsigned)in.expected_protocol_version, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
+        {
+            /* G6.1: the readable message (computed BEFORE the shutdown below clears the per-connection state it reads) */
+            PCNetGameRejectTownMsg rtt;
+            PCNetGameTownIdentity htown;
+            char jtxt[PC_NETGAME_JOIN_MSG_MAX];
+            const PCNetGameTownIdentity* hp = NULL;
+            if (size == sizeof(PCNetGameRejectTownMsg)) {
+                memcpy(&rtt, data, sizeof(rtt));
+                memcpy(htown.land_name, rtt.land_name, PC_NETGAME_LAND_LEN);
+                htown.land_id = rtt.land_id;
+                htown.terrain_hash = rtt.terrain_hash;
+                hp = &htown;
+            }
+            pcnetgame_reject_text((unsigned)in.reason, (unsigned)in.expected_protocol_version, hp, jtxt, sizeof(jtxt));
+            pcnetgame_join_message_set(0, "%s (reason %u)", jtxt, (unsigned)in.reason);
+        }
         if (size == sizeof(PCNetGameRejectTownMsg)) {
             PCNetGameRejectTownMsg rt;
             PCNetGameTownIdentity host_town;
@@ -21047,6 +21215,10 @@ int pc_net_game_start_client(const char* host_ip, uint16_t port) {
     }
     s_role = PC_NETGAME_ROLE_CLIENT;
     s_client_link = PC_NETGAME_LINK_CONNECTING;
+    pcnetgame_join_message_clear(); /* G6.1: a new attempt starts without the previous one's message */
+    snprintf(s_client_host_addr, sizeof(s_client_host_addr), "%s:%u", host_ip, (unsigned)port);
+    s_client_connect_since_ms = pcnetgame_now_ms();
+    s_client_connect_warned = 0;
     s_client_wildlife_mode = -1; /* batch A (A1): unknown until the host's HOST_CONFIG arrives (local wildlife spawning is suppressed meanwhile) */
     if (g_pc_authoritative_wildlife) {
         printf("[NET][HOSTCFG] client: --authoritative-wildlife is IGNORED on a client: the host's HOST_CONFIG decides the wildlife mode (unknown until it arrives; local wildlife spawning suppressed meanwhile)\n");
@@ -22442,6 +22614,17 @@ static uint32_t s_notice_last_log_ms = 0;
 
 static void pcnetgame_client_notice_update(void) {
     const uint32_t now = pcnetgame_now_ms();
+    /* G6.1: the host does not answer at all (no transport connection yet): say so once after PC_NETGAME_CONNECT_WARN_MS; the warning is withdrawn as soon
+     * as the transport answers (the client keeps retrying; there is no transport-level give-up). */
+    if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_CONNECTING) {
+        if (!s_client_connect_warned && (uint32_t)(now - s_client_connect_since_ms) >= PC_NETGAME_CONNECT_WARN_MS) {
+            s_client_connect_warned = 1;
+            pcnetgame_join_message_set(1, "No answer from the host at %s after %u s (host not running, wrong address or port, or a firewall). Still trying.",
+                                       s_client_host_addr, (unsigned)(PC_NETGAME_CONNECT_WARN_MS / 1000u));
+        }
+    } else if (s_join_msg_set && s_join_msg_warning) {
+        pcnetgame_join_message_clear();
+    }
     const int cond = s_role == PC_NETGAME_ROLE_CLIENT && s_local_world_latched && s_client_link != PC_NETGAME_LINK_READY;
     if (!cond) {
         if (s_notice_visible) {
@@ -22580,6 +22763,11 @@ void pc_net_game_poll(void) {
                     break;
                 }
                 case PC_NET_EVENT_PEER_DISCONNECTED:
+                    if (s_client_link == PC_NETGAME_LINK_CONNECTING || s_client_link == PC_NETGAME_LINK_HANDSHAKE) {
+                        /* G6.1: closed before the handshake finished (an older / incompatible host transport, a stopped host, a network error) */
+                        pcnetgame_join_message_set(0, "The host at %s closed the connection before you could join (host stopped, an older game version, or a network problem).",
+                                                   s_client_host_addr);
+                    }
                     s_client_link = PC_NETGAME_LINK_DISCONNECTED;
                     printf("[NET] client: host connection lost\n");
                     {
@@ -25686,6 +25874,153 @@ int pc_net_game_dedicated_guest_counts(int* bound, int* cap) {
     *cap = pcnetgame_host_max_guests();
     return 1;
 }
+
+/* ===== GUESTS G6.2: host operator tools (dedicated console: guests / guest-remove / guest-reset-token). Main thread only, HOST only. ===== */
+int pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out) {
+    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= PC_NETGAME_GUEST_MAX || !s_guest_store_loaded || !s_guest[slot].used) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->slot = slot;
+    pcnetgame_dedicated_ascii_name(s_guest[slot].key.player_name, out->name);
+    pcnetgame_dedicated_ascii_name(s_guest[slot].key.land_name, out->home_town);
+    pcnetgame_dedicated_ascii_name(s_guest[slot].town.land_name, out->town);
+    out->active = pcnetgame_town_equal(&s_guest[slot].town, &s_host_town) ? 1 : 0;
+    out->confirmed = s_guest[slot].confirmed ? 1 : 0;
+    out->rev = s_rec_slot[PLAYER_NUM + slot].rev;
+    out->bound_peer = pcnetgame_host_peer_bound_to_guest(slot, (PCNetPeerId)-1);
+    out->recovery = pcnetgame_guest_recovery_active(slot);
+    out->untrusted = s_guest_untrusted;
+    return 1;
+}
+
+static int pcnetgame_dedicated_ieq(const char* a, const char* b) {
+    for (; *a != '\0' && *b != '\0'; a++, b++) {
+        char x = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char y = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (x != y) {
+            return 0;
+        }
+    }
+    return *a == *b;
+}
+
+/* sel: a single digit 0..7 = the guest table slot, otherwise the guest name (case-insensitive; it must name exactly ONE entry). */
+static int pcnetgame_dedicated_guest_resolve(const char* sel, char* msg, size_t cap) {
+    int g, found = -1, n = 0;
+    char nm[PC_NETGAME_NAME_LEN + 1];
+    if (sel == NULL || sel[0] == '\0') {
+        snprintf(msg, cap, "missing <slot|name> (see `guests`)");
+        return -1;
+    }
+    if (sel[0] >= '0' && sel[0] <= '7' && sel[1] == '\0') {
+        g = sel[0] - '0';
+        if (g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used) {
+            snprintf(msg, cap, "guest slot %d is not in use (see `guests`)", g);
+            return -1;
+        }
+        return g;
+    }
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        if (!s_guest[g].used) {
+            continue;
+        }
+        pcnetgame_dedicated_ascii_name(s_guest[g].key.player_name, nm);
+        if (pcnetgame_dedicated_ieq(nm, sel)) {
+            found = g;
+            n++;
+        }
+    }
+    if (n == 0) {
+        snprintf(msg, cap, "no guest named \"%s\" (see `guests`)", sel);
+        return -1;
+    }
+    if (n > 1) {
+        snprintf(msg, cap, "the name \"%s\" matches %d guest entries (other host towns / home towns): use the slot number (see `guests`)", sel, n);
+        return -1;
+    }
+    return found;
+}
+
+/* op 0 = remove, 1 = reset-token. Returns 1 = done, 2 = nothing changed (no `confirm`: msg says what would happen), 0 = REFUSED (msg says why).
+ * Both refuse while the guest is bound, while guests.dat is UNTRUSTED / not loaded, and whenever the backup of guests.dat cannot be made. */
+int pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char* msg, size_t cap) {
+    char bak[340];
+    char who[PC_NETGAME_NAME_LEN + 1];
+    int g, peer;
+    if (msg == NULL || cap < 8) {
+        return 0;
+    }
+    msg[0] = '\0';
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        snprintf(msg, cap, "refused: this process is not a host with a ready world");
+        return 0;
+    }
+    pcnetgame_guest_store_load();
+    if (s_guest_untrusted) {
+        snprintf(msg, cap, "refused: guests.dat is UNTRUSTED (existed but unreadable); fix the file first (see the startup log), nothing can be changed safely");
+        return 0;
+    }
+    g = pcnetgame_dedicated_guest_resolve(sel, msg, cap);
+    if (g < 0) {
+        char tmp[240];
+        snprintf(tmp, sizeof(tmp), "refused: %s", msg);
+        snprintf(msg, cap, "%s", tmp);
+        return 0;
+    }
+    pcnetgame_dedicated_ascii_name(s_guest[g].key.player_name, who);
+    peer = pcnetgame_host_peer_bound_to_guest(g, (PCNetPeerId)-1);
+    if (peer >= 0) {
+        snprintf(msg, cap, "refused: guest slot %d (\"%s\") is connected on peer %d right now; wait until it has left", g, who, peer);
+        return 0;
+    }
+    if (!confirm) {
+        if (op == 0) {
+            snprintf(msg, cap, "guest slot %d (\"%s\"): this REMOVES the guest and its stored character (guests.dat is backed up first); re-run with `confirm` as the last argument", g, who);
+        } else {
+            snprintf(msg, cap, "guest slot %d (\"%s\"): this lets the NEXT claim of this guest's key (no / lost token) receive a NEW token for the SAME character, within %u minutes, once; "
+                               "anyone who claims the key first becomes this guest; re-run with `confirm` as the last argument", g, who, (unsigned)(PC_NETGAME_GUEST_RECOVERY_MS / 60000u));
+        }
+        return 2;
+    }
+    if (!pc_mp_guests_backup_file(PC_MP_GUESTS_PATH, bak, sizeof(bak))) {
+        snprintf(msg, cap, "refused: could not back up %s first (nothing was changed)", PC_MP_GUESTS_PATH);
+        printf("[NET][GUEST] ADMIN: %s of guest slot %d refused: backup of %s failed\n", op == 0 ? "remove" : "reset-token", g, PC_MP_GUESTS_PATH);
+        return 0;
+    }
+    if (op == 1) {
+        s_guest[g].recovery = 1;
+        s_guest[g].recovery_since_ms = pcnetgame_now_ms();
+        printf("[NET][GUEST] ADMIN: guest slot %d (\"%s\") token recovery ARMED for %u minutes (backup %s); the next claim of its key gets a new token for the stored record\n",
+               g, who, (unsigned)(PC_NETGAME_GUEST_RECOVERY_MS / 60000u), bak);
+        PC_LOG(PCL_GUESTS, "admin: guest slot %d token recovery armed (backup %s)\n", g, bak);
+        snprintf(msg, cap, "guest slot %d (\"%s\"): token recovery ARMED for %u minutes (backup %s). Ask the guest to delete its save/mp/guest_token.dat entry and join now; "
+                           "a restart of this server cancels it", g, who, (unsigned)(PC_NETGAME_GUEST_RECOVERY_MS / 60000u), bak);
+        return 1;
+    }
+    {
+        PCNetGameGuest old_g = s_guest[g];
+        Private_c old_rec = s_guest_rec[g];
+        PCNetGameRecSlot old_rs = s_rec_slot[PLAYER_NUM + g];
+        memset(&s_guest[g], 0, sizeof(s_guest[g]));
+        memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
+        memset(&s_rec_slot[PLAYER_NUM + g], 0, sizeof(s_rec_slot[0]));
+        memset(s_rec_backup[PLAYER_NUM + g], 0, PC_NETGAME_REC_SIZE);
+        pcnetgame_txn_journal_clear(PLAYER_NUM + g);
+        if (!pcnetgame_guest_store_write("operator removed a guest")) {
+            s_guest[g] = old_g;
+            s_guest_rec[g] = old_rec;
+            s_rec_slot[PLAYER_NUM + g] = old_rs;
+            snprintf(msg, cap, "refused: guests.dat could not be written, the guest was NOT removed (backup %s kept)", bak);
+            return 0;
+        }
+    }
+    printf("[NET][GUEST] ADMIN: guest slot %d (\"%s\") REMOVED by the operator (backup %s)\n", g, who, bak);
+    PC_LOG(PCL_GUESTS, "admin: guest slot %d removed (backup %s)\n", g, bak);
+    snprintf(msg, cap, "guest slot %d (\"%s\") REMOVED; its character is gone from this host (backup %s). The guest can join again as a NEW character after deleting its save/mp/guest_token.dat entry", g, who, bak);
+    return 1;
+}
+/* ===== GUESTS G6.2 END ===== */
 
 void pc_net_game_dedicated_announce(int peer, int what) {
     PCNetGameDedicatedPeerInfo pi;

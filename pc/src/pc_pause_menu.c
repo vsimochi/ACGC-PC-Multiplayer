@@ -253,8 +253,56 @@ void pc_pause_menu_draw(struct game_s* game) {
     mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
 }
 
+/* Guests G6.1: the join-failure message, word wrapped (the same rule as the title menu's guest message): header + up to 8 rows. */
+static void pc_net_join_message_draw(struct game_s* game, const char* msg, int is_warning) {
+    const int row_chars = 44;
+    const int max_rows = 8;
+    f32 y = 14.0f;
+    int pos = 0;
+    int len = (int)strlen(msg);
+    int rows = 0;
+
+    pc_menu_draw_centered(game, is_warning ? "Waiting for the host:" : "Cannot join the host:", y, 255, 90, 90, 255, 1.0f);
+    y += 16.0f;
+    while (pos < len && rows < max_rows) {
+        char row[64];
+        int take = len - pos;
+        int k;
+
+        if (take > row_chars) {
+            take = row_chars;
+            for (k = take; k > row_chars / 2; k--) { /* break at the last blank of the window */
+                if (msg[pos + k] == ' ') {
+                    take = k;
+                    break;
+                }
+            }
+        }
+        memcpy(row, msg + pos, (size_t)take);
+        row[take] = '\0';
+        pc_menu_draw_centered(game, row, y, 255, 255, 255, 235, 1.0f);
+        y += 16.0f;
+        pos += take;
+        while (pos < len && msg[pos] == ' ') {
+            pos++;
+        }
+        rows++;
+    }
+}
+
 void pc_net_notice_draw(struct game_s* game) {
-    if (g_pc_paused || game == NULL || game->graph == NULL || !pc_net_game_client_notice_visible()) return;
+    int join_warning = 0;
+    const char* join_msg;
+
+    if (g_pc_paused || game == NULL || game->graph == NULL) return;
+    join_msg = pc_net_game_join_message(&join_warning);
+    if (join_msg != NULL) { /* G6.1: works on the title screen and in game (graph_main draws this every frame) */
+        mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+        pc_net_join_message_draw(game, join_msg, join_warning);
+        mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+        return;
+    }
+    if (!pc_net_game_client_notice_visible()) return;
     mFont_SetMatrix(game->graph, mFont_MODE_FONT);
     pc_menu_draw_centered(game, "Not connected to the host", 14.0f, 255, 90, 90, 255, 1.0f);
     pc_menu_draw_centered(game, "Waiting for the connection...", 30.0f, 255, 255, 255, 230, 1.0f);

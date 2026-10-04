@@ -983,3 +983,71 @@ const char* pc_mp_guest_fresh_reason_str(int reason) {
         default: return "unknown";
     }
 }
+
+/* Guests G6.2: a byte-exact copy of `path` to "<path>.bak-<YYYYmmdd-HHMMSS>[-n]" (never overwrites an existing backup, never touches the source),
+ * made by the operator commands BEFORE they change the guest table. 1 = the copy exists and has the same size; 0 = no source / I/O error / short copy
+ * (any partial copy is removed again: it is OUR file). */
+int pc_mp_guests_backup_file(const char* path, char* out_path, size_t cap) {
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm* tmv = localtime(&now);
+    FILE* in;
+    FILE* out;
+    long total = 0, written = 0;
+    int n, ok = 0;
+    unsigned char buf[8192];
+    size_t got;
+    if (path == NULL || out_path == NULL || cap < 16) {
+        return 0;
+    }
+    if (tmv != NULL) {
+        strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", tmv);
+    } else {
+        snprintf(ts, sizeof(ts), "%lld", (long long)now);
+    }
+    in = fopen(path, "rb");
+    if (in == NULL) {
+        return 0;
+    }
+    for (n = 0; n < 1000; n++) {
+        if (n == 0) {
+            snprintf(out_path, cap, "%s.bak-%s", path, ts);
+        } else {
+            snprintf(out_path, cap, "%s.bak-%s-%d", path, ts, n);
+        }
+        if (!file_exists(out_path)) {
+            break;
+        }
+    }
+    if (n >= 1000) {
+        fclose(in);
+        return 0;
+    }
+    out = fopen(out_path, "wb");
+    if (out == NULL) {
+        fclose(in);
+        return 0;
+    }
+    ok = 1;
+    while ((got = fread(buf, 1, sizeof(buf), in)) > 0) {
+        total += (long)got;
+        if (fwrite(buf, 1, got, out) != got) {
+            ok = 0;
+            break;
+        }
+        written += (long)got;
+    }
+    if (ferror(in)) {
+        ok = 0;
+    }
+    fclose(in);
+    if (fflush(out) != 0 || fclose(out) != 0) {
+        ok = 0;
+    }
+    if (!ok || written != total) {
+        remove(out_path);
+        return 0;
+    }
+    glog("backup of '%s' written to '%s' (%ld bytes)\n", path, out_path, written);
+    return 1;
+}

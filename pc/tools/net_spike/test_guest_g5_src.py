@@ -25,6 +25,7 @@ import wire_baseline
 ROOT = S.ROOT
 HERE = S.HERE
 BASELINE = "e68c90c"   # G4 commit + docs (HEAD when G5 started)
+G5_COMMIT = "8ad36ca"  # the G5 commit itself: the "diff vs baseline" pins below measure THE G5 CHANGE (baseline..G5 commit), so later milestones (G6) do not break them
 
 
 def blob(rel):
@@ -32,7 +33,7 @@ def blob(rel):
 
 
 def numstat(rel):
-    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
+    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, G5_COMMIT, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
     return (int(out[0]), int(out[1])) if out else (0, 0)
 
 
@@ -128,7 +129,7 @@ def main():
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("C wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))
-    changed = sorted(subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASELINE, "--", "src", "pc/src", "pc/include", "include"], capture_output=True, check=True,
+    changed = sorted(subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASELINE, G5_COMMIT, "--", "src", "pc/src", "pc/include", "include"], capture_output=True, check=True,
                                     timeout=60).stdout.decode().split())
     ck("C resident / single-player byte identity: the only touched source files are the four above (%s)" % changed,
        changed == ["pc/src/pc_net_game.c", "src/game/m_event.c", "src/game/m_player_main_pull_net.c_inc", "src/game/m_tag_ovl.c"])

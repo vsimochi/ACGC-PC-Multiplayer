@@ -294,6 +294,7 @@ def main():
         shutil.rmtree(save_dir, ignore_errors=True)
         shutil.copytree(snap_dir, save_dir)
         shutil.rmtree(snap_dir, ignore_errors=True)
+        L.discard_fixture_guest_mp(L.GAME_BIN_DIR)   # G6.0: the auto at-exit snapshot holds the pre-launch guest.ini: drop save/mp there too
         for d in env.dirs.values():
             remove_client_dir(d)
     return L.summary_and_exit_code(results)

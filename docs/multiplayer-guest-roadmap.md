@@ -252,10 +252,98 @@ Limitations:
 * The catch race, spawn counts and the wildlife section depend on the RNG spawn burst (the test fails loudly when too few entities spawn).
 * A comment-only rewording in `pc_net_game_mail_begin_send` (to satisfy the test_mail_src pin) was made after the single build; the compiled code is identical to the tested exe.
 
-## G6 - join-failure reasons and token recovery
+## G6 - reliability and release readiness for guests
 
-Status: Not started. Planned: an additive REJECT_INFO message with a reason code and short text (no protocol bump), shown on the title menu and in the pause menu; host console
-commands `guests`, `guest-reset`, `guest-remove` for token recovery; corrupt `guests.dat` / `guest.ini` handling messages; host shutdown with a dirty guest.
+Status: **Complete, with limitations** (every focused test green, see results; the on-screen message drawing and the arrival cutscene were NOT visually verified). Commit hash: (filled by orchestrator)
+
+Scope decision: NO wire change and NO protocol bump. The design's additive `REJECT_INFO` message (id 59) was deliberately NOT implemented: every readable message is produced from the EXISTING
+frozen reject reasons (1 PROTOCOL_MISMATCH, 2 SERVER_FULL, 3 LAND_MISMATCH, 4 NO_SAVE) and from state the client already has; all admin tools are host-local. Message ids stay 1..58, wire_baseline 18/18,
+`pc_net_game.h` gained one function declaration only. Resident and single-player behaviour is unchanged (the touched source files are `pc_net_game.c`, `pc_net_game.h`, `pc_pause_menu.c`, `pc_m_card.c`,
+`pc_dedicated.c/.h`, `pc_mp_guests.c/.h`; every new branch fires only for a client refusal / the dedicated console / the guest arrival).
+
+### G6.0 - test debris (`save/mp/guest.ini` left in the disposable fixture)
+
+Mechanism (verified): a real-guest test writes `save/mp/guest.ini` BEFORE its first game launch; `net_spike_lib` snapshots the fixture's whole save dir at that first launch (`_auto_fixture_guard`)
+and restores it at process exit, so after the test's own (correct) restore the at-exit restore put the pre-launch `guest.ini` back. Fix: `net_spike_lib.discard_fixture_guest_mp()` removes `save/mp` from the
+fixture dir AND from the pending auto-snapshot; it acts only on `bin_fixture4*` dirs and the disposable clone and refuses the live / protected dirs (functional check in `test_guest_g6_src.py`). Called after the
+restore by `test_guest_g2_real`, `test_guest_g3_real`, `test_guest_g4_real`, `test_guest_real_client` and the two new G6 tests. Verified after every run: no `save\mp` exists in any build64 dir.
+
+### G6.1 - readable join-failure messages
+
+Every refusal / failure of a CLIENT join now produces one sentence that is (a) printed to the log AND to stderr (`[NET][JOIN] CANNOT JOIN: ...`, the numeric reason stays in the older log line),
+(b) kept in a static buffer that survives `pc_net_game_shutdown()` (the client plays on alone after a refusal), and (c) drawn on screen for 30 s by `pc_net_notice_draw()` (`pc_pause_menu.c`), which `graph_main`
+calls every frame, so the same overlay works on the title screen and in game (it is the pre-existing "Not connected to the host" notice path; the join message is drawn first, word wrapped, header "Cannot join the
+host:"). A new connection attempt clears the message.
+
+| situation | message (abridged) |
+|---|---|
+| REJECT 1 PROTOCOL_MISMATCH | the host runs another network version (host N, this game M), use the same build |
+| REJECT 2 SERVER_FULL, guest | **server full / guest limit reached / all resident slots taken**; the host gives the same answer for: guest table full, guest / name already in use, guest token missing or wrong; plus "lost save/mp/guest_token.dat? ask the host operator to run guest-reset-token" (no token held) or "the host may have reset its guest table" (token presented) |
+| REJECT 2 SERVER_FULL, resident | server full / all resident slots taken, or your character is already connected or is the host's own |
+| REJECT 3 LAND_MISMATCH | your town (X) is not the host's town (Y): copy the host's town save (DobutsunomoriP_MURA.gci) into save/card_a and restart |
+| REJECT 4 NO_SAVE | the host (town Y) has no resident matching your character: play one of its residents or join as a guest |
+| unknown reason | refused with reason N unknown to this version: update the game |
+| IDENTITY_ACK with another protocol / town | both versions, or both towns, named |
+| a different guest token than the one held (old behaviour: silent self shutdown) | "the host gave you a DIFFERENT guest token ... not the host that issued it ... delete guest_token.dat and ask the operator to run guest-reset-token / guest-remove" |
+| guest token could not be saved | the host will refuse you next time until the operator resets you |
+| transport closed during CONNECTING / HANDSHAKE (older host, stopped host) | the host at ip:port closed the connection before you could join |
+| host unreachable (no transport answer for 8 s) | non-final warning "No answer from the host at ip:port after 8 s (host not running, wrong address or port, firewall). Still trying."; withdrawn when the transport answers (the client retries forever, as before) |
+
+Not changed: the code cannot tell the SERVER_FULL variants apart (one frozen reason), so the text lists them. The guest-only title-menu message of G3 and the in-game "Not connected" notice are unchanged.
+
+### G6.2 - host operator tools (dedicated console)
+
+New commands (`help` lists them): `guests` (slot, name, home town, host town, confirmed, rev, bound, RECOVERY-ARMED; never a token, not even a prefix), `guest-remove <slot|name> confirm`,
+`guest-reset-token <slot|name> confirm`. The selector is a single digit 0..7 (slot) or a unique case-insensitive guest name (an ambiguous name must be given as a slot). Order of the checks (pinned by the source
+audit): host with a ready world -> guests.dat not UNTRUSTED -> selector -> **refused while the guest is bound** -> without `confirm` only the effect is described and nothing changes -> the backup
+`guests.dat.bak-<timestamp>` (byte copy, never overwrites; the command is REFUSED if it cannot be made) -> the change. A removal is rolled back if guests.dat cannot be written. Each action is logged
+(`[NET][GUEST] ADMIN: ...`).
+
+Semantics decided: `guest-remove` deletes the entry and its stored character (the backup keeps it); the guest can later join as a NEW guest. `guest-reset-token` keeps the character: it ARMS a host-local, in-memory
+recovery (10 minutes, ONE use, lost on a host restart) for that key. The next claim of the key that does not carry the stored token is answered with one re-minted token for the SAME slot and the SAME record (the
+real guest is pushed its own record byte for byte); the entry becomes unconfirmed until the new token is presented once; the old token is dead. The recovery passes every normal admission gate (key / validity /
+UNTRUSTED checks, the bound-peer duplicate handling, the guest cap, the per-address mint limit) and skips only the new-identity name rules. Safety trade-off, stated plainly: during the armed window ANYONE who
+claims that exact home PersonalID (public information) receives the character, so arm it only when the guest is about to connect; nothing is stored on disk (no flag, no wire change), so a crash cancels it.
+If the guest still holds a stale token in `guest_token.dat` it refuses the new one ("DIFFERENT guest token", see G6.1): delete that entry / file first.
+
+### G6.3 - corrupt / untrusted storage and shutdown safety (checked, no defect found; one client fix)
+
+* (a) corrupt `guests.dat`: empty file, truncated file and FUTURE version (new scripted test, each over a real dedicated host with the file as the ONLY generation) and the earlier bit-flip / every-generation cases
+  (`test_guest_persist`, `test_guest_storage` native: truncated / magic / old / future / crc / field): the host does not crash, logs UNTRUSTED mode, refuses a known and a new guest with the existing
+  SERVER_FULL reason, admits a resident, never writes a guests.dat, preserves the bad file byte for byte as `guests.dat.corrupt-<timestamp>`, `guests` shows nothing and `guest-remove` is refused.
+* (b) `records.dat` for a guest slot: not applicable by design: guest records live inside guests.dat (the lineage of a guest slot is created at admission / loaded from guests.dat, never from records.dat); a corrupt
+  records.dat affects residents only (existing D3 coverage).
+* (c) shutdown: `guests.dat` is written only after a successful town GCI write (the hook in `pc_net_game_record_after_gci_save`, unchanged; pinned). `stop` with a guest session in progress exits 0, leaves a valid,
+  format-size guests.dat holding the same token and the byte-identical record, writes it at most once during the shutdown (0 times when nothing changed), and after a restart the guest reconnects (KNOWN) and is pushed the
+  byte-identical record. The earlier persistence test additionally proves the write happens AFTER the GCI save line for a dirty guest.
+* (d) home land == host town (1 in 65534): the CLIENT now refuses to arrive before anything is bound (`pc_guest_arrive`), with a message naming guest.ini (`land_id`) and the consequence (a different land_id or
+  home_town is a NEW guest). `--guest` exits 2 with the message; the title-menu item shows it on the title. The host's own check stays.
+
+### Tests (disposable fixtures only, ONE build, protocol version unchanged)
+
+| test | tier | result |
+|---|---|---|
+| test_guest_g6_src.py (new) | source audit (+ functional check of the python cleanup helper) | 50/50 |
+| test_guest_g6_protocol.py (new: P1 operator tools incl. token loss / recovery / removal, P2-P3 stop with a guest connected + restart, P4-P6 empty / truncated / future guests.dat) | scripted clients + the stdin console vs REAL dedicated hosts | 66/66 |
+| test_guest_g6_real.py (new: refused real client with the readable message, not hung; home land == town refused on the client) | REAL host + REAL clients | 14/14 |
+| test_guest_g3_real.py / test_guest_g4_real.py / test_guest_g2_real.py / test_guest_real_client.py (cleanup fix + new client code; the G6.0 check: no `save\mp` left afterwards) | REAL host + REAL client(s) | 43/43, 36/36, 34/34, 43/43 |
+| test_guest_protocol.py / test_guest_persist.py (the re-mint code touched the guest table) | scripted vs REAL host | 174/174, 51/51 |
+| test_dedicated_runtime.py / test_dedicated_cli.py (the console gained commands) | REAL dedicated host / argv | 64/64, 34/34 |
+| test_guest_storage.py (native, one pin updated) / test_guest_g2_unit.py | native unit | 95 checks 0 failed, 116 checks 0 failed |
+| test_guest_src / g1_src / g2_src / g3_src / g4_src / g5_src, test_dedicated_src, test_observer_src, test_hostcfg_src, test_txn_src, wire_baseline | source audits | 81/81, 55/55, 44/44, 35/35, 27/27, 19/19, 87/87, 65/65, 21/21, 111/111, 18/18 |
+
+Pins updated (each explained, nothing weakened): test_guest_src (s_guest_rec[] / guests.dat write sites now include the operator removal function), test_guest_g1_src (pc_guest_arrive has 10 failure paths instead of 9),
+test_guest_g4_src and test_dedicated_src (pc_net_game.h is the HEAD header plus the ONE pinned declaration instead of byte-identical), test_guest_g5_src (its "vs baseline" diffs now measure baseline..G5 commit,
+so a later milestone cannot break them), test_hostcfg_src (pc_net_notice_draw's guard is split in two and draws the join message first), test_guest_storage (the backup function removes only its own partial copy),
+test_txn_src (the journal clear has one more guest-table call site). Pre-existing, NOT touched by G6 and failing before it: test_d3_record_src "P hook ... pc_save_write_gci" (the dedicated milestone wrapped
+`pc_save_write_authoritative`), test_identity_validation_src S2 / S9 / S11 (stale since the G4 cap refusal / observer blocks).
+
+Limitations (G6):
+
+* The on-screen drawing of the join message and of the title message is NOT visually verified (only the log / stderr output and process state of real clients are); the message is word wrapped to 44 characters x 8 rows.
+* A refused guest cannot be told WHY beyond the frozen reasons: the text lists the possible causes (SERVER_FULL covers cap, table full, in use, token missing / wrong).
+* The recovery of a lost token is operator-mediated, in memory only (10 minutes, one use, cancelled by a host restart) and trusts whoever claims the key first during the window.
+* Windows `stop` / Ctrl+C were verified through the console `stop` (graceful path); a hard kill keeps the last durable guests.dat (<= 60 s old, or the early save on a dirty disconnect).
 
 ## Known limitations
 
@@ -264,14 +352,46 @@ commands `guests`, `guest-reset`, `guest-remove` for token recovery; corrupt `gu
 * The empty-economy rule only constrains a NEW guest's first upload. Afterwards the client-owned ranges (pockets, wallet, bank, ...) are uploaded after a legality check only,
   exactly as for residents; a modified client can still edit its own inventory by later uploads (pre-existing trust model).
 * A guest's `player_id` / `land_id` / `name` / `home_town` cannot be changed without becoming a different guest; guests.dat holds 8 entries for ALL towns, confirmed entries are
-  never evicted, and there are no admin commands yet (G6).
+  never evicted; the dedicated console tools `guests` / `guest-remove` / `guest-reset-token` (G6.2) are the only way to free a slot or recover a lost token.
 * The guest token is a bearer secret over unencrypted UDP (fine for LAN / friends).
 * `--guest` / `--bootstrap-guest` still fire on the first title-demo frame (now after a save reload and without the gateway flag); the RIDE_OFF_DEMO / station-master arrival and the
   title-menu "Join as Guest" click are not visually verified / not exercised by a process test (G3).
 * The guest profile name charset is ASCII on purpose (`A-Za-z0-9 .'-`); no in-game name editor yet.
-* The home land of a guest may by chance equal the host town's land id (probability 1 / 65534); the host refuses it and the guest then edits `land_id` in guest.ini (no automatic re-draw yet).
+* The home land of a guest may by chance equal the host town's land id (probability 1 / 65534); since G6.3 the CLIENT refuses to arrive with a message telling the user to edit `land_id` in guest.ini (a different
+  land_id is a NEW guest); there is still no automatic re-draw (the ids are permanent).
 
 ## Deferred
 
 * Town transfer from the host (so a guest needs no local copy), in-game profile creation UI (vanilla name editor), changing the look of an existing guest, villager -> guest
-  letters, museum / mail / bank for guests, a real-client gameplay run for guests (needs UI automation), the deferred player_no 4 indexed uses listed under G5.0, REJECT_INFO (G6), a soak test with 8 real clients (G4 follow-up).
+  letters, museum / mail / bank for guests, a real-client gameplay run for guests (needs UI automation), the deferred player_no 4 indexed uses listed under G5.0, an additive REJECT_INFO wire message (deliberately NOT implemented in G6: the frozen reject reasons are mapped to text locally), a soak test with 8 real clients (G4 follow-up),
+  encrypted / challenge-response token handshake, a persisted operator recovery flag.
+
+## Release readiness summary (G1 .. G6)
+
+What a guest can do today (evidence tier in brackets):
+
+* Start a client (`--connect host:port --guest`, or the title item "Join as Guest (NAME)") with a generated or hand-edited `save/mp/guest.ini`; the arrival path re-reads the town save, builds a FRESH character,
+  binds it as the foreigner without the visitor gateway, and walks the vanilla train arrival at the station [real: G3 / G4 arrival and adoption; the cutscene and the title click are NOT visually verified].
+* Be admitted by the host as a guest (never a resident), receive a host-minted token at first contact, return with it and get the SAME record back (also after a host restart, after an abrupt guest kill, with several
+  guests at once up to the `max_guests` cap) [scripted + real: G1, G4, G6].
+* Play with the guest record owned by the host: pickup / drop / bury / dig / shop buy and sell / police / catch / villager talk and letters to villagers are accepted and journalled; museum donation, mail to players,
+  mailbox, house entry, catalog ordering are refused with the game's own refusal rows [scripted + source audit: G5; no real-client gameplay run].
+* Get a readable reason when the join fails (server full / guest limit, wrong town, protocol version, token problems, host unreachable) on screen and in the log [real: the cap refusal and the home-land refusal; the
+  other texts by source audit; drawing not visually verified: G6.1].
+
+What a host operator can do: run `--host --dedicated` and use `guests`, `guest-remove <guest> confirm`, `guest-reset-token <guest> confirm` (always backed up, refused while the guest is connected), set
+`--max-guests N` / `max_guests`, and rely on a corrupt guests.dat producing UNTRUSTED mode (guests refused, residents unaffected, the bad file preserved) instead of a crash or silent re-issue of tokens [scripted: G6].
+
+Known limitations that materially affect play (all documented above and in "Known limitations"):
+
+1. A guest needs a MANUALLY COPIED copy of the host's town save (`DobutsunomoriP_MURA.gci` in `save/card_a`); there is no town transfer. A wrong or missing copy is now explained on screen but not fixed.
+2. The guest token is a bearer secret over unencrypted UDP: anyone who can see the traffic can be that guest (fine for LAN / friends, not for the open internet).
+3. The guest table holds 8 entries for ALL host towns; confirmed entries are never evicted. The operator tools (G6.2) are the only way to free a slot or recover a lost token; recovery trusts whoever claims the key first
+   while it is armed.
+4. The arrival cutscene (train, station master), the title-menu "Join as Guest" click and the new on-screen messages were never seen by a person or a screenshot; they are verified by logs, process state and source audit only.
+5. No real-client gameplay run beyond arrival / reconnect (no UI automation): the G5 guards and the guest activity table are scripted / source audited.
+6. At most 3 real client processes were ever run together; 4..8 guests and 8 peers are scripted without puppets / rendering, so the memory and frame cost of 8 real puppets is unmeasured (default cap 4).
+7. A guest never owns a house, mailbox or museum donor slot; villager letters to guests, bank / loan UI and the birthday calendar are deferred.
+8. Guest identity (name, home town, ids) is permanent: changing it makes a new guest, and the old character stays on the host until the operator removes it.
+
+Verdict: ready for a supervised friends-and-LAN test of arrival, reconnection, capacity and failure handling; NOT ready to be advertised as a public / internet feature until limitations 1, 2 and 4 are addressed.
