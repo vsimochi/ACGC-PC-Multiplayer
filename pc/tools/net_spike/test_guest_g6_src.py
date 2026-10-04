@@ -34,8 +34,13 @@ import wire_baseline
 ROOT, HERE = S.ROOT, S.HERE
 
 
-def numstat(rel, ref="HEAD"):
-    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", ref, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
+# The G6 diff audits compare the G6 feature commit against its parent (HEAD when G6 started), NOT against HEAD: HEAD contains G6 since 91de602 and may carry later work.
+BASELINE = "cb45bb2"
+G6_COMMIT = "91de602"
+
+
+def numstat(rel):
+    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, G6_COMMIT, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
     return (int(out[0]), int(out[1])) if out else (0, 0)
 
 
@@ -179,14 +184,14 @@ def main():
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("D wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))
-    hdr = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "HEAD", "--", "pc/include/pc_net_game.h"], capture_output=True, check=True, timeout=60).stdout.decode().replace("\r\n", "\n")
+    hdr = subprocess.run(["git", "-C", ROOT, "diff", "-U0", BASELINE, G6_COMMIT, "--", "pc/include/pc_net_game.h"], capture_output=True, check=True, timeout=60).stdout.decode().replace("\r\n", "\n")
     added = [l[1:] for l in hdr.split("\n") if l.startswith("+") and not l.startswith("+++")]
     ck("D pc_net_game.h gained exactly the one pinned function declaration (5 added lines, 0 removed, no typedef / define)", numstat("pc/include/pc_net_game.h") == (5, 0)
        and sum(1 for l in added if l.startswith("const char* pc_net_game_join_message(")) == 1 and not any(re.match(r"\s*(typedef|#define|enum)\b", l) for l in added))
     ck("D pc_net.c / pc_net.h / net_spike_lib wire constants untouched by G6 (net_spike_lib only gained the cleanup helper)", numstat("pc/src/pc_net.c") == (0, 0) and numstat("pc/include/pc_net.h") == (0, 0)
        and numstat("pc/tools/net_spike/net_spike_lib.py")[1] == 0)
     ck("D pc_net_game.c is purely additive vs HEAD (0 removed lines)", numstat("pc/src/pc_net_game.c")[1] == 0 and numstat("pc/src/pc_net_game.c")[0] > 0)
-    changed = sorted(subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "HEAD", "--", "src", "pc/src", "pc/include", "include"], capture_output=True, check=True, timeout=60).stdout.decode().split())
+    changed = sorted(subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASELINE, G6_COMMIT, "--", "src", "pc/src", "pc/include", "include"], capture_output=True, check=True, timeout=60).stdout.decode().split())
     ck("D resident / single-player byte identity: the touched source files are exactly the expected set (%s)" % changed,
        changed == ["pc/include/pc_dedicated.h", "pc/include/pc_mp_guests.h", "pc/include/pc_net_game.h", "pc/src/pc_dedicated.c", "pc/src/pc_m_card.c", "pc/src/pc_mp_guests.c",
                    "pc/src/pc_net_game.c", "pc/src/pc_pause_menu.c"])
