@@ -144,6 +144,7 @@
  */
 #include "pc_net_game.h"
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
+#include "pc_log.h" /* category-based PC_LOG()/PC_LOG_RL() lines (new, [CAT]-prefixed; every pre-existing printf is untouched) */
 #include "pc_net.h"
 #include "pc_remote_player.h"
 #include "pc_field_authority.h" /* v2: persistent town-field addressing/authority (Workstream C) */
@@ -7025,6 +7026,8 @@ static void pcnetgame_host_world_tick(int local_ready) {
         s_host_world_ready = 1;
         pcnetgame_format_town(&s_host_town, a, sizeof(a));
         printf("[NET][WORLD] host: world ready (%s, world_seq %u)\n", a, (unsigned)s_world_seq);
+        PC_LOG(PCL_NET, "host world ready: %s world_seq %u\n", a, (unsigned)s_world_seq);
+        PC_LOG(PCL_VILLAGERS, "host villager roster at world ready: now_npc_max=%u\n", (unsigned)Save_Get(now_npc_max));
         pcnetgame_host_revalidate_bound_peers(); /* the host's save/resident may have changed while paused */
     }
 }
@@ -7218,6 +7221,8 @@ static void pcnetgame_handle_host_pickup_request(PCNetPeerId peer, const PCNetGa
         rec->reserved_since_ms = pcnetgame_now_ms();
         printf("[NET][PICKUP] host: peer %d request %u reserved tile (%d,%d) item=0x%04X (field unchanged until CONFIRM)\n",
                (int)peer, (unsigned)in->request_id, (int)in->ut_x, (int)in->ut_z, (unsigned)granted_item);
+        PC_LOG_RL(PCL_ITEMS, 8, 64, "host pickup reserved: peer %d request %u tile (%d,%d) item 0x%04X\n", (int)peer, (unsigned)in->request_id,
+                  (int)in->ut_x, (int)in->ut_z, (unsigned)granted_item);
     } else {
         rec->phase = (uint8_t)PC_NETGAME_PHASE_DONE; /* final rejection; replayed verbatim on a retry */
         rec->accepted = 0;
@@ -12719,6 +12724,7 @@ static void pcnetgame_handle_host_record(PCNetPeerId peer, const uint8_t* data, 
         }
         return;
     }
+    PC_LOG_RL(PCL_RECORDS, 8, 64, "host record message: peer %d type %u (%u bytes)\n", (int)peer, (unsigned)data[0], (unsigned)size);
     switch (data[0]) {
         case PC_NETGAME_MSG_RECORD_HELLO:
             if (size != sizeof(h)) { pcnetgame_rec_violation(peer, "HELLO wrong size"); return; }
@@ -13154,6 +13160,7 @@ static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer) {
     }
     s_guest[g].confirmed = 1;
     printf("[NET][GUEST] guest slot %d CONFIRMED (the client presented its token and started a record exchange)\n", g);
+    PC_LOG(PCL_GUESTS, "guest slot %d confirmed (peer %d)\n", g, (int)peer);
     (void)pcnetgame_guest_store_write("guest confirmed");
 }
 
@@ -13798,6 +13805,8 @@ static void pcnetgame_handle_host_txn_commit(PCNetPeerId peer, const PCNetGameTx
         printf("[NET][%s] host: peer %d request %u committed tile (%d,%d) 0x%04X -> 0x%04X [TXN]\n", pcnetgame_kind_tag((int)in->kind),
                (int)peer, (unsigned)rec->request_id, (int)rec->ut_x, (int)rec->ut_z, (unsigned)cur, (unsigned)new_value);
     }
+    PC_LOG_RL(PCL_TXN, 8, 64, "host txn applied: peer %d kind=%d request %u rev %u\n", (int)peer, (int)in->kind, (unsigned)rec->request_id,
+              (unsigned)slot->rev);
     if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
         printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the commit, no RESULT sent\n", (int)peer);
         pcnetgame_txn_world_publish(peer, rec, (int)in->kind);
@@ -14299,6 +14308,7 @@ static void pcnetgame_ts_event_log(const char* who, const uint8_t* blob) {
     for (i = 0; i < mEv_SAVE_DATE_NUM; i++) {
         dates[i] = (uint16_t)((uint16_t)p[4 + 2 * i] | ((uint16_t)p[5 + 2 * i] << 8));
     }
+    PC_LOG_RL(PCL_EVENTS, 8, 16, "event state blob logged by %s: special_type=%u ghost_type=%u\n", who, (unsigned)p[0], (unsigned)p[25]);
     printf("[NET][EVENT] %s: state special_type=%u kind=0x%08X sched=%04u-%02u-%02u/%02u weekly_type=%u weekly_flags=%u ghost_type=%u ghost_day=0x%04X "
            "sp_start=0x%04X sp_end=0x%04X sp_hour=%u weekly_date=0x%04X bridge_flags=0x%02X year=%d\n",
            who, (unsigned)p[0], (unsigned)sp.kind, (unsigned)sp.scheduled.year, (unsigned)sp.scheduled.month, (unsigned)sp.scheduled.day,
@@ -15189,6 +15199,12 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     slot->dirty_unsaved = 1;
     R->last_pocket_rev = slot->rev;
     pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+    PC_LOG_RL(PCL_TOWNSVC, 8, 64, "host town-service txn committed: peer %d svc %d kind %u rev %u\n", (int)peer, svc, (unsigned)in->kind,
+              (unsigned)slot->rev);
+    if (is_shop) {
+        PC_LOG_RL(PCL_SHOP, 8, 64, "host shop %s committed: peer %d resident %d wallet %u -> %u\n", is_buy ? "buy" : "sell", (int)peer, idx,
+                  (unsigned)t->pre_wallet, (unsigned)post_wallet);
+    }
     pcnetgame_ts_refresh(svc); /* the seq the RESULT echoes */
     if (is_buy) {
         printf("[NET][SHOP] host: peer %d resident %d SHOP_BUY item=0x%04X stock=0x%02X pocket slot=%u price=%u wallet %u -> %u sales_sum now %u committed [TXN]\n",
@@ -15434,6 +15450,7 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
     printf("[NET][MAIL] host: peer %d resident %d MAIL_SEND slot %u -> house %d present 0x%04X letter_hash=0x%08X po_slot=%d po_sum=%d mirror_slot_cleared=1 committed [TXN]\n",
            (int)peer, idx, (unsigned)t->slot, rh, (unsigned)t->item, (unsigned)wh, po_slot, (int)mPO_get_keep_mail_sum());
+    PC_LOG_RL(PCL_MAIL, 8, 64, "host mail send committed: peer %d resident %d house %d\n", (int)peer, idx, rh);
     if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
         printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the mail commit, no RESULT sent\n", (int)peer);
         pcnetgame_host_drop_peer(peer);
@@ -20754,6 +20771,7 @@ int pc_net_game_start_host(uint16_t port) {
     s_role = PC_NETGAME_ROLE_HOST;
     pcnetgame_reset_host_world_state();
     printf("[NET] hosting on UDP port %u (protocol %u)\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
+    PC_LOG(PCL_NET, "host listening: UDP port %u protocol %u\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
     return 1;
 }
 
@@ -22257,6 +22275,7 @@ void pc_net_game_poll(void) {
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_HANDSHAKE;
                     }
                     printf("[NET] host: peer %d transport-connected, awaiting identity\n", (int)ev.peer);
+                    PC_LOG(PCL_NET, "peer %d transport event: connected (awaiting identity)\n", (int)ev.peer);
                     break;
                 case PC_NET_EVENT_PEER_DISCONNECTED:
                     if (ev.peer >= 0 && ev.peer < PC_NET_MAX_PEERS) {
@@ -22264,9 +22283,11 @@ void pc_net_game_poll(void) {
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_DISCONNECTED;
                         if (was_ready_peer) {
                             pcnetgame_host_peer_scene_gone(ev.peer); /* M9-A: clients drop the relayed scene */
+                            PC_LOG(PCL_PLAYERS, "peer %d left a READY session (scene relay dropped)\n", (int)ev.peer);
                         }
                     }
                     printf("[NET] host: peer %d disconnected\n", (int)ev.peer);
+                    PC_LOG(PCL_NET, "peer %d transport event: disconnected\n", (int)ev.peer);
                     pcnetgame_reset_all_host_peer_state(ev.peer); /* Stage 5A/5B-1/v2: never let a
                                                                      * reused peer slot inherit this
                                                                      * connection's dedup caches,
@@ -22288,6 +22309,7 @@ void pc_net_game_poll(void) {
                     pcnetgame_reset_client_session_state();
                     s_client_link = PC_NETGAME_LINK_HANDSHAKE;
                     printf("[NET] client: transport-connected to host\n");
+                    PC_LOG(PCL_NET, "client transport-connected to host\n");
                     /* Stage 4C-1 (ordering-race fix): appearance is NOT sent here any more. Sending
                      * it immediately alongside IDENTITY raced against the host's own IDENTITY
                      * processing -- if this process's APPEARANCE datagram was dequeued by the host
@@ -23870,6 +23892,8 @@ void pc_net_game_notify_villager_arrival(int slot) {
            slot, (unsigned)msg.npc_id, (unsigned)msg.reserved_block_x, (unsigned)msg.reserved_block_z,
            (unsigned)msg.reserved_ut_x, (unsigned)msg.reserved_ut_z, (unsigned)s_world_seq,
            (unsigned)msg.now_npc_max);
+    PC_LOG_RL(PCL_VILLAGERS, 16, 16, "host villager arrival broadcast: slot %d npc_id 0x%04X now_npc_max %u\n", slot, (unsigned)msg.npc_id,
+              (unsigned)msg.now_npc_max);
     pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
 }
 
@@ -23904,6 +23928,7 @@ void pc_net_game_notify_villager_departure(int slot) {
 
     printf("[NET][NPC] host: villager departed slot %d (world_seq %u, now_npc_max %u)\n", slot,
            (unsigned)s_world_seq, (unsigned)msg.now_npc_max);
+    PC_LOG_RL(PCL_VILLAGERS, 16, 16, "host villager departure broadcast: slot %d now_npc_max %u\n", slot, (unsigned)msg.now_npc_max);
     pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
 }
 

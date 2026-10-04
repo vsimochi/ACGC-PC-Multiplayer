@@ -17,6 +17,7 @@
 #include "pc_net_game.h" /* World Ecology T3: pc_net_game_field_tile_reserved() -- see
                           * mFI_ClearHoleBlock_sub()'s own doc for why a block-clear must not wipe a
                           * tile a bury commit is mid-flight through. */
+#include "pc_log.h" /* PC_LOG_RL(): one rate-limited BUILDINGS line per structure replacement */
 #endif
 
 static mCoBG_Collision_u l_edge_ut = { { 0, 31, 31, 31, 31, 31, mCoBG_ATTRIBUTE_GRASS0 } };
@@ -2574,6 +2575,10 @@ extern void mFI_ClearBeecomb(int bx, int bz) {
 }
 
 static void mFI_SetFGStructureKeep(mActor_name_t* item_p, mActor_name_t replace_item, int destroy_item) {
+#ifdef TARGET_PC
+    PC_LOG_RL(PCL_BUILDINGS, 16, 16, "field structure tile 0x%04X -> 0x%04X (destroy_item=%d)\n", (unsigned)*item_p, (unsigned)replace_item,
+              destroy_item);
+#endif
     if (destroy_item == FALSE) {
         mPB_keep_item(*item_p);
 // Aus version cleans up any snowmen here

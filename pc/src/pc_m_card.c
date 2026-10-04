@@ -36,6 +36,7 @@
 #include "pc_net_game.h"
 /* OBSERVER-BEGIN */
 #include "pc_host_observer.h"
+#include "pc_log.h"
 #include "pc_field_authority.h"
 #include "m_player_lib.h"
 #include "ac_birth_control.h"
@@ -548,7 +549,15 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
  * can be observed/asserted on without inferring it from log timestamps. */
 static int s_pc_save_authoritative_client_reject_count = 0;
 
+static int pc_save_write_authoritative_impl(void);
+
 int pc_save_write_authoritative(void) {
+    int ok = pc_save_write_authoritative_impl();
+    PC_LOG(PCL_SAVE, "authoritative save %s\n", ok ? "OK" : "FAILED/REJECTED");
+    return ok;
+}
+
+static int pc_save_write_authoritative_impl(void) {
     if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
         s_pc_save_authoritative_client_reject_count++;
         OSReport("[PC] pc_save_write_authoritative: REJECTED -- this process is a network CLIENT "
@@ -1206,6 +1215,7 @@ void pc_bootstrap_resident_poll(void) {
 
     OSReport("[PC] --bootstrap-resident %d: resident bound, transitioning to town (SCENE_FG)\n",
              player_no);
+    PC_LOG(PCL_PLAYERS, "bootstrap resident %d bound\n", player_no);
 }
 
 /* Guests G2: parses "NAME,LAND,PLAYER_ID,LAND_ID" (NAME / LAND 1..8 chars, space padded like every vanilla name; ids decimal or 0x hex, 1..0xFFFE). */

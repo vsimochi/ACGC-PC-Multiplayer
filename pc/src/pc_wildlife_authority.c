@@ -146,6 +146,7 @@
 
 #include "pc_field_authority.h"
 #include "pc_net_game.h"
+#include "pc_log.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -678,6 +679,7 @@ int pcwld_host_spawn_trigger(int bx, int bz) {
     }
 
     s_in_progress = 0;
+    PC_LOG_RL(PCL_WILDLIFE, 8, 16, "host wildlife spawn trigger done: acre (%d,%d)\n", bx, bz);
     return 1;
 }
 

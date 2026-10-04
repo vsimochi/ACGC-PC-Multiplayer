@@ -12,6 +12,7 @@
 #include "pc_profiler.h"
 #include "pc_net_game.h"
 #include "pc_host_observer.h"
+#include "pc_log.h"
 #include "pc_rng_domains_selftest.h"
 #include "m_kankyo.h"
 
@@ -524,9 +525,28 @@ static char     g_pc_net_host_ip[64] = "127.0.0.1";
 
 int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
+        /* pc_log: -debug*, --debug*, -debug-list, -logtime, -logfile PATH (see pc_log.h). -debug-list exits 0 and a bad value exits 2 HERE,
+         * before any game init. Anything that is not a log flag falls through to the chain below untouched. */
+        {
+            int log_consumed = 0;
+            int log_r = pc_log_cli_arg(argv[i], i + 1 < argc ? argv[i + 1] : NULL, &log_consumed);
+            if (log_r == 3) {
+                return 0;
+            }
+            if (log_r == 2) {
+                return 2;
+            }
+            if (log_r == 1) {
+                i += log_consumed;
+                continue;
+            }
+        }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: AnimalCrossing [options]\n");
             printf("  --verbose, -v       Enable diagnostic output\n");
+            printf("  -debug              Enable GENERAL debug output only (see --debug-list); -debug<category> / --debug=a,b,c / -debugall\n");
+            printf("                      select categories; env PC_LOG=a,b,c is ORed in; -logtime stamps lines; -logfile PATH appends them to a file\n");
+            printf("  --debug-list        List the debug categories and exit\n");
             printf("  --no-framelimit     Alias for --framelimit 0 (uncapped)\n");
             printf("  --framelimit N      Set the target frame rate (default 60, 0 = uncapped)\n");
             printf("  --profile [N]       Print frame profiler summary every N frames (default 120)\n");
@@ -672,6 +692,7 @@ int main(int argc, char* argv[]) {
             g_pc_uber_shader_only = 1;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             g_pc_verbose = 1;
+            g_pc_log_mask |= PCL_LEGACY | PCL_GENERAL; /* pc_log: --verbose == LEGACY + GENERAL; g_pc_verbose itself is unchanged */
 #ifdef PC_LOW_ADDRESS_64
         } else if (strcmp(argv[i], "--lowaddr-selftest") == 0) {
             g_pc_lowaddr_selftest = 1;
@@ -916,9 +937,15 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    /* pc_log: env PC_LOG, legacy env aliases, -logfile. A -debug-flag or PC_LOG request keeps stdout/stderr like --verbose does. */
+    int log_want_console = 0;
+    if (pc_log_finish_cli(&log_want_console) != 0) {
+        return 2;
+    }
+
     /* Redirect stdout/stderr to NUL unless verbose — unbuffered terminal writes
      * are extremely slow on Windows and tank FPS. */
-    if (!g_pc_verbose && !g_pc_profile_enabled) {
+    if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console) {
 #ifdef _WIN32
         freopen("NUL", "w", stdout);
         freopen("NUL", "w", stderr);
@@ -929,6 +956,9 @@ int main(int argc, char* argv[]) {
     } else {
         setvbuf(stdout, NULL, _IONBF, 0);
         setvbuf(stderr, NULL, _IONBF, 0);
+    }
+    if (log_want_console) { /* new line only for an explicit -debug-flag or PC_LOG request: plain --verbose output stays byte-identical */
+        PC_LOG(PCL_GENERAL, "log mask=0x%08X (verbose=%d console=%d)\n", (unsigned)g_pc_log_mask, g_pc_verbose, log_want_console);
     }
 
     /* exe image range for seg2k0 — BSS can overlap N64 segment addresses */
