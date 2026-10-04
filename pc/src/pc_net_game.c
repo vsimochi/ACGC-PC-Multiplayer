@@ -11691,6 +11691,17 @@ _Static_assert(offsetof(Private_c, reset_code) == 0x10F4 && sizeof(((Private_c*)
 _Static_assert(offsetof(Private_c, equipment) == 0x04A4 && offsetof(Private_c, bank_account) == 0x122C &&
                    offsetof(Private_c, my_org_no_table) == 0x2340,
                "D3 validation: equipment/bank/design-order offsets");
+/* Guests G2.1: the offsets the pure fresh-character predicate (pc_mp_guests.c pc_mp_guest_record_fresh_check) hard-codes */
+_Static_assert(offsetof(Private_c, deliveries) == 0x0094 && sizeof(mQst_delivery_c) == 0x28 && offsetof(Private_c, errands) == 0x02EC &&
+                   sizeof(mQst_errand_c) == 0x58 && offsetof(Private_c, cloth) == 0x1088 && offsetof(Mail_c, present) == 0x2C &&
+                   offsetof(Private_c, destiny) == 0x109A && sizeof(mPr_destiny_c) == 0xA && offsetof(Private_c, aircheck_collect_bitfield) == 0x10D4 &&
+                   offsetof(Private_c, complete_fish_insect_flags) == 0x1102 && offsetof(Private_c, celebrated_birthday_year) == 0x1104 &&
+                   offsetof(Private_c, furniture_collected_bitfield) == 0x1108 && offsetof(Private_c, maps) == 0x11DC &&
+                   sizeof(((Private_c*)0)->maps) == 0x50 && offsetof(Private_c, state_flags) == 0x2348 &&
+                   offsetof(Private_c, soncho_trophy_field0) == 0x23B4 && offsetof(Private_c, birthday_present_npc) == 0x23D8 &&
+                   offsetof(Private_c, golden_items_collected) == 0x23DA && offsetof(Private_c, soncho_trophy_field1) == 0x23DC &&
+                   offsetof(Private_c, ecard_letter_data) == 0x23E0 && sizeof(mPr_carde_data_c) == 0x32 && ITM_CLOTH000 == 0x2400,
+               "Guests G2.1: fresh-guest predicate offsets");
 
 /* ---- D3-0 (d): pocket-legal item ids, derived from the game's own tables (no invented bounds) ----
  * What vanilla lets into a pocket (mPr_SetPossessionItem callers, pickup path pcnetgame_is_pickupable_field_item): ITEM1 items
@@ -11735,6 +11746,7 @@ _Static_assert(mPlayer_DEBT4 >= mPlayer_DEBT0 && mPlayer_DEBT4 >= mPlayer_DEBT1 
 #define PC_NETGAME_REC_FIELD_CATALOG    10u /* high byte = catalog order index */
 #define PC_NETGAME_REC_FIELD_LOTTO      11u
 #define PC_NETGAME_REC_FIELD_MAIL_PRESENT 12u /* high byte = mail slot: a USED letter whose gift is neither EMPTY_NO / RSV_NO nor pocket-legal */
+#define PC_NETGAME_REC_FIELD_GUEST_NOT_FRESH 13u /* Guests G2.1 (detail only, no wire change): high byte = PC_MP_FRESH_BAD_* reason: a NEW guest's first MIGRATE is not a fresh character */
 
 /* Timing / policy constants. */
 #define PC_NETGAME_REC_HELLO_TIMEOUT_MS   5000u
@@ -12582,6 +12594,18 @@ static void pcnetgame_rec_process_upload(PCNetPeerId peer) {
         static uint8_t host_be[PC_NETGAME_REC_SIZE];
         pcnetgame_rec_export_be(idx, host_be);
         bad = pcnetgame_rec_validate_fields(&s_rec_scratch_b, rx, host_be);
+        if (bad == 0 && kind == PC_NETGAME_REC_KIND_MIGRATE_UPLOAD && idx >= PLAYER_NUM) {
+            /* Guests G2.1: a NEW guest has nothing to import (it was created in this session), so its first upload may choose identity / appearance /
+             * designs only: economy and progress must be the vanilla EMPTY defaults (host-enforced; never applied to a resident or to a later upload). */
+            unsigned fresh_off = 0;
+            const int fresh_bad = pc_mp_guest_record_fresh_check(rx, PC_NETGAME_REC_SIZE, &fresh_off);
+            if (fresh_bad != PC_MP_FRESH_OK) {
+                bad = (uint16_t)(PC_NETGAME_REC_FIELD_GUEST_NOT_FRESH | ((uint16_t)fresh_bad << 8));
+                printf("[NET][REC] host: peer %d guest slot %d first MIGRATE REFUSED (not a fresh character): %s (record offset 0x%04X); "
+                       "nothing stored, the guests.dat entry is unchanged\n", (int)peer, idx - PLAYER_NUM,
+                       pc_mp_guest_fresh_reason_str(fresh_bad), fresh_off);
+            }
+        }
         if (bad == 0 && kind == PC_NETGAME_REC_KIND_MIGRATE_UPLOAD) {
             memcpy(s_rec_backup[idx], host_be, PC_NETGAME_REC_SIZE); /* backup of the replaced host record (persisted by the D3-4 sidecar after the next GCI save) */
             slot->backup_valid = 1;

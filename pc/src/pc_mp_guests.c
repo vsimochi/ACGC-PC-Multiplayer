@@ -830,3 +830,156 @@ int pc_mp_guests_name_reserved(const uint8_t* name) {
     }
     return memcmp(name, PC_MP_GUEST_RESERVED_NAME, PC_MP_GUEST_NAME_LEN) == 0;
 }
+
+/* ================= Guests G2.1: the fresh-character predicate (see pc_mp_guests.h) ================= */
+
+/* Offsets into the canonical BE Private_c image; pc_net_game.c static-asserts every one of them against offsetof(Private_c, ...). */
+static uint16_t fr_be16(const uint8_t* b, size_t o) {
+    return (uint16_t)(((unsigned)b[o] << 8) | b[o + 1]);
+}
+
+static uint32_t fr_be32(const uint8_t* b, size_t o) {
+    return ((uint32_t)b[o] << 24) | ((uint32_t)b[o + 1] << 16) | ((uint32_t)b[o + 2] << 8) | b[o + 3];
+}
+
+static int fr_all_zero(const uint8_t* b, size_t o, size_t n) {
+    size_t k;
+    for (k = 0; k < n; k++) {
+        if (b[o + k] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int pc_mp_guest_record_fresh_check(const uint8_t* r, size_t len, unsigned* detail) {
+    size_t i, o;
+    unsigned bits = 0;
+    unsigned dummy;
+    if (detail == NULL) {
+        detail = &dummy;
+    }
+    *detail = 0;
+#define FRESH_FAIL(reason, off) do { *detail = (unsigned)(off); return (reason); } while (0)
+    if (r == NULL || len != PC_MP_GUEST_PRIVATE_SIZE) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_SHAPE, 0);
+    }
+    /* appearance: the guest's own choice, range-checked only */
+    if (r[0x14] > 1u || r[0x15] > 7u || r[0x16] != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_APPEARANCE, 0x14);
+    }
+    {
+        const uint16_t idx = fr_be16(r, 0x1088), item = fr_be16(r, 0x108A);
+        if (item < 0x2400u || item > 0x240Fu || idx != (uint16_t)(item - 0x2400u)) {
+            FRESH_FAIL(PC_MP_FRESH_BAD_APPEARANCE, 0x1088);
+        }
+    }
+    /* economy */
+    for (i = 0; i < 15; i++) {
+        if (fr_be16(r, 0x68 + i * 2) != 0u) {
+            FRESH_FAIL(PC_MP_FRESH_BAD_POCKET, 0x68 + i * 2);
+        }
+    }
+    if (fr_be32(r, 0x88) != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_POCKET, 0x88);
+    }
+    if (fr_be32(r, 0x8C) != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_WALLET, 0x8C);
+    }
+    if (fr_be32(r, 0x122C) != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_BANK, 0x122C);
+    }
+    if (fr_be32(r, 0x90) != (uint32_t)PC_MP_FRESH_LOAN) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_LOAN, 0x90);
+    }
+    if (r[0x86] != 0u || r[0x87] != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_LOTTO, 0x86);
+    }
+    if (fr_be16(r, 0x4A4) != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_EQUIPMENT, 0x4A4);
+    }
+    for (i = 0; i < 10; i++) { /* Mail_c: 0x12A bytes, `present` at +0x2C */
+        const uint16_t pr = fr_be16(r, 0x4E0 + i * 0x12A + 0x2C);
+        if (pr != 0u && pr != 0xFFFFu) {
+            FRESH_FAIL(PC_MP_FRESH_BAD_MAIL_GIFT, 0x4E0 + i * 0x12A + 0x2C);
+        }
+    }
+    if (!fr_all_zero(r, 0x10A8, 0x14)) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_CATALOG_ORDER, 0x10A8);
+    }
+    /* catalog progress: the arrival init sets exactly 3 item-collect bits; anything above that is progress */
+    for (o = 0x1108; o < 0x11DC; o++) {
+        uint8_t v = r[o];
+        while (v != 0) {
+            bits += (unsigned)(v & 1u);
+            v = (uint8_t)(v >> 1);
+        }
+    }
+    if (bits > (unsigned)PC_MP_FRESH_CATALOG_MAX_BITS) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_CATALOG, 0x1108);
+    }
+    /* quests: every delivery (15 x 0x28 at 0x94) and errand (5 x 0x58 at 0x2EC) slot is the vanilla "none" marker (type 3 = 0xC0 in the BE bitfield byte) */
+    for (i = 0; i < 15; i++) {
+        if (r[0x94 + i * 0x28] != 0xC0u) {
+            FRESH_FAIL(PC_MP_FRESH_BAD_QUEST, 0x94 + i * 0x28);
+        }
+    }
+    for (i = 0; i < 5; i++) {
+        if (r[0x2EC + i * 0x58] != 0xC0u) {
+            FRESH_FAIL(PC_MP_FRESH_BAD_QUEST, 0x2EC + i * 0x58);
+        }
+    }
+    /* other progress */
+    if (r[0x1087] != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, 0x1087);                       /* hint_count */
+    }
+    if (!fr_all_zero(r, 0x109A, 0x0A)) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, 0x109A);                       /* destiny */
+    }
+    if (!fr_all_zero(r, 0x10BC, 0x18) || !fr_all_zero(r, 0x10D4, 0x08)) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, 0x10BC);                       /* unk_10A8, aircheck */
+    }
+    if (r[0x1102] != 0u || fr_be16(r, 0x1104) != 0u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, 0x1102);                       /* complete fish/insect flags, celebrated birthday */
+    }
+    for (i = 0; i < 8; i++) {                                               /* maps: land name spaces, land id 0 */
+        size_t m = 0x11DC + i * 10;
+        size_t k;
+        for (k = 0; k < 8; k++) {
+            if (r[m + k] != 0x20u) {
+                FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, m);
+            }
+        }
+        if (fr_be16(r, m + 8) != 0u) {
+            FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, m + 8);
+        }
+    }
+    if (fr_be32(r, 0x2348) != 1u) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, 0x2348);                       /* state_flags (includes the post office gift bits) */
+    }
+    if (!fr_all_zero(r, 0x23B4, 4) || fr_be16(r, 0x23D8) != 0u || r[0x23DA] != 0u || !fr_all_zero(r, 0x23DC, 4) || !fr_all_zero(r, 0x23E0, 0x32)) {
+        FRESH_FAIL(PC_MP_FRESH_BAD_PROGRESS, 0x23B4);                       /* tortimer, birthday present npc, golden items, e-Card data */
+    }
+#undef FRESH_FAIL
+    return PC_MP_FRESH_OK;
+}
+
+const char* pc_mp_guest_fresh_reason_str(int reason) {
+    switch (reason) {
+        case PC_MP_FRESH_OK: return "fresh";
+        case PC_MP_FRESH_BAD_SHAPE: return "wrong record size";
+        case PC_MP_FRESH_BAD_APPEARANCE: return "gender / face / shirt out of range";
+        case PC_MP_FRESH_BAD_POCKET: return "a pocket slot is not empty (or an item condition is set)";
+        case PC_MP_FRESH_BAD_WALLET: return "wallet is not 0";
+        case PC_MP_FRESH_BAD_BANK: return "bank account is not 0";
+        case PC_MP_FRESH_BAD_LOAN: return "loan is not the vanilla 100";
+        case PC_MP_FRESH_BAD_LOTTO: return "lottery ticket state is not empty";
+        case PC_MP_FRESH_BAD_EQUIPMENT: return "equipment is not empty";
+        case PC_MP_FRESH_BAD_MAIL_GIFT: return "a letter carries a gift";
+        case PC_MP_FRESH_BAD_CATALOG_ORDER: return "a catalog order is not empty";
+        case PC_MP_FRESH_BAD_CATALOG: return "catalog progress beyond the 3 starter bits";
+        case PC_MP_FRESH_BAD_QUEST: return "a delivery / errand quest is active";
+        case PC_MP_FRESH_BAD_PROGRESS: return "game progress is not the vanilla empty default";
+        default: return "unknown";
+    }
+}

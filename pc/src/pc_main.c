@@ -13,6 +13,7 @@
 #include "pc_net_game.h"
 #include "pc_host_observer.h"
 #include "pc_dedicated.h"
+#include "pc_guest_profile.h"
 #include "pc_log.h"
 #include "pc_rng_domains_selftest.h"
 #include "m_kankyo.h"
@@ -527,6 +528,12 @@ int g_pc_bootstrap_resident = -1;
  * GENDER (0|1) / FACE (0..7) are derived deterministically from the identity when omitted. See pc_m_card.c's pc_bootstrap_guest_poll(). NULL = off. */
 const char* g_pc_bootstrap_guest = NULL;
 
+/* Guests G2.3: --guest (CLIENT only, requires --connect): play as a GUEST with the persistent profile save/mp/guest.ini (created with defaults on first use; see
+ * pc_guest_profile.h). It is validated at startup (exit 2 on any problem), then drives the SAME arrival path as --bootstrap-guest: the profile is turned into the
+ * --bootstrap-guest spec stored in g_pc_guest_spec (the test hook stays as is). */
+static int g_pc_guest = 0;
+static char g_pc_guest_spec[96];
+
 /* --host-observer (opt-in, HOST role only): the host plays NO resident. It binds a hidden, inert, static observer identity (outside
  * Save_t.private_data[]) so that all four residents are claimable by clients. See pc/include/pc_host_observer.h and pc_m_card.c's
  * pc_host_observer_poll(). 0 = off (default: plain --host is unchanged). */
@@ -602,6 +609,13 @@ int main(int argc, char* argv[]) {
             printf("                      deterministically from the identity. The name must be a valid game name\n");
             printf("                      and must not equal a resident's name (otherwise exit code 2).\n");
             printf("                      See pc_m_card.c pc_bootstrap_guest_poll().\n");
+            printf("  --guest             CLIENT-only (requires --connect; exit code 2 with usage otherwise; cannot be combined with\n");
+            printf("                      --host, --dedicated, --host-observer, --bootstrap-resident or --bootstrap-guest): join the host as a\n");
+            printf("                      GUEST with your own new character instead of a resident. The profile lives in save/mp/guest.ini\n");
+            printf("                      (name, gender, face, home_town, player_id, land_id); it is created with defaults on first use (edit the\n");
+            printf("                      name / look BEFORE the first join; the ids are permanent: the same file is the same guest on every run).\n");
+            printf("                      A broken guest.ini is never overwritten: the game prints the bad key and exits with code 2. A guest\n");
+            printf("                      starts with empty pockets and wallet (the host enforces it) and needs a copy of the host town save.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
             printf("                      not a one-shot test hook): activates the host-authoritative\n");
             printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
@@ -840,6 +854,8 @@ int main(int argc, char* argv[]) {
             /* Guests G1.1: the option is the last argument (no spec follows): never silently ignored */
             fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: the option needs a spec argument NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]\n");
             return 2;
+        } else if (strcmp(argv[i], "--guest") == 0) {
+            g_pc_guest = 1;
         } else if (strcmp(argv[i], "--host-observer") == 0) {
             g_pc_host_observer = 1;
         } else if (strcmp(argv[i], "--dedicated") == 0) {
@@ -927,6 +943,53 @@ int main(int argc, char* argv[]) {
     if ((g_pc_mail_test_send != NULL || g_pc_mail_test_take != 0) && g_pc_net_role != 2) {
         fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-send / --mail-test-take are CLIENT-only test hooks (use them together with --connect)\n");
         return 2;
+    }
+
+    /* Guests G2.3: --guest = CLIENT only (needs --connect), exclusive with --host / --dedicated / --host-observer / --bootstrap-resident / --bootstrap-guest.
+     * Refused (exit 2 + usage) otherwise, BEFORE anything is initialised or the profile file is touched. Then the profile is loaded / created and validated
+     * here (a bad guest.ini exits 2 with the bad key named; it is never overwritten) and converted into the --bootstrap-guest spec: the SAME arrival path. */
+    if (g_pc_guest) {
+        static const char k_guest_usage[] = "usage: AnimalCrossing --connect HOST[:PORT] --guest   (see --help)\n";
+        const char* conflict = NULL;
+        int a;
+        for (a = 1; a < argc; a++) {
+            if (strcmp(argv[a], "--host") == 0) {
+                conflict = "--host";
+            } else if (strcmp(argv[a], "--dedicated") == 0) {
+                conflict = "--dedicated";
+            } else if (strcmp(argv[a], "--host-observer") == 0) {
+                conflict = "--host-observer";
+            } else if (strcmp(argv[a], "--bootstrap-resident") == 0) {
+                conflict = "--bootstrap-resident";
+            } else if (strcmp(argv[a], "--bootstrap-guest") == 0) {
+                conflict = "--bootstrap-guest";
+            }
+            if (conflict != NULL) {
+                break;
+            }
+        }
+        if (conflict != NULL) {
+            fprintf(stderr, "[PC] --guest: REFUSED: --guest cannot be combined with %s (a guest is a CLIENT of someone else's town)\n%s", conflict, k_guest_usage);
+            return 2;
+        }
+        if (g_pc_net_role != 2) {
+            fprintf(stderr, "[PC] --guest: REFUSED: --guest is a CLIENT-only option (use it together with --connect HOST[:PORT])\n%s", k_guest_usage);
+            return 2;
+        }
+        {
+            PCGuestProfile gp;
+            char gerr[512];
+            int gres = pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, gerr, sizeof(gerr));
+            if (gres == PC_GUEST_PROFILE_ERR || !pc_guest_profile_spec(&gp, g_pc_guest_spec, sizeof(g_pc_guest_spec))) {
+                fprintf(stderr, "[PC] --guest: REFUSED: bad guest profile: %s\n", gres == PC_GUEST_PROFILE_ERR ? gerr : "internal error (spec buffer)");
+                return 2;
+            }
+            printf("[PC] --guest: %s guest profile %s: name '%s', home town '%s', gender %d, face %d, player id 0x%04X, land id 0x%04X "
+                   "(the ids are permanent; edit name / look before the first join)\n",
+                   gres == PC_GUEST_PROFILE_CREATED ? "CREATED the default" : "loaded", PC_GUEST_PROFILE_PATH, gp.name, gp.home_town, gp.gender, gp.face,
+                   (unsigned)gp.player_id, (unsigned)gp.land_id);
+            g_pc_bootstrap_guest = g_pc_guest_spec;
+        }
     }
 
     /* Guests G2: --bootstrap-guest is a CLIENT-only TEST hook and excludes --bootstrap-resident: refused (exit 2) otherwise. */

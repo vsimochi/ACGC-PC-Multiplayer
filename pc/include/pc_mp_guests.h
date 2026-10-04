@@ -191,6 +191,40 @@ int  pc_mp_guests_name_valid(const uint8_t* name);
 #define PC_MP_GUEST_RESERVED_NAME "SERVER  "
 int  pc_mp_guests_name_reserved(const uint8_t* name);
 
+/* Guests G2.1: the FRESH-CHARACTER rule the HOST enforces on a NEW guest's first (MIGRATE) upload. A guest has nothing to import (it is created in the
+ * session), so the client wins ONLY for identity / appearance / designs; every economy and progress field must still be the vanilla EMPTY default that
+ * pc_m_card.c pc_guest_build_fresh_record() produces (mPr_ClearPrivateInfo + mPr_InitPrivateInfo with the home PersonalID):
+ *   pockets all EMPTY_NO, item_conditions 0, wallet 0, bank 0, loan == 100 (the vanilla pre-house value), lotto 0/0, equipment EMPTY_NO, catalog orders empty,
+ *   NO letter carries a gift (present EMPTY_NO / RSV_NO; a gift-less letter is accepted), no quest, hint_count / destiny / complete flags / aircheck / unk
+ *   spans / museum-adjacent progress zero, state_flags == 1, my_org_no_table is checked elsewhere, maps empty (spaces / id 0), tortimer / golden / e-Card
+ *   progress zero, and at most PC_MP_FRESH_CATALOG_MAX_BITS catalog bits set (the arrival init sets exactly 3 item-collect bits).
+ * ACCEPTED as the guest's own choice (range-checked only): gender 0|1, face 0..7, starter shirt in ITM_CLOTH000..015 with idx == item - 0x2400, the Able
+ * Sisters designs, the calendar / day-counter tail 0x234C..0x23B4 and 0x23B8..0x23D8 (date dependent), birthday, remail, animal memory (all vanilla-empty markers
+ * that a client can legitimately differ in); reset_count must be 0. `be_rec` is the canonical 0x2440-byte BIG-ENDIAN Private_c image (the record wire / guests.dat
+ * form), so the predicate is pure and natively testable. Returns 0 = a legal fresh character, else a PC_MP_FRESH_BAD_* reason; *detail (optional) is set to the
+ * offset of the first bad field. Applies ONLY to a guest's first MIGRATE (never to later uploads, never to residents): see pc_net_game.c. */
+#define PC_MP_FRESH_CATALOG_MAX_BITS 3
+#define PC_MP_FRESH_LOAN 100
+enum {
+    PC_MP_FRESH_OK = 0,
+    PC_MP_FRESH_BAD_SHAPE,        /* len != 0x2440 / NULL */
+    PC_MP_FRESH_BAD_APPEARANCE,   /* gender / face / shirt out of range or reset_count != 0 */
+    PC_MP_FRESH_BAD_POCKET,       /* a pocket slot is not empty, or an item condition is set */
+    PC_MP_FRESH_BAD_WALLET,
+    PC_MP_FRESH_BAD_BANK,
+    PC_MP_FRESH_BAD_LOAN,
+    PC_MP_FRESH_BAD_LOTTO,
+    PC_MP_FRESH_BAD_EQUIPMENT,
+    PC_MP_FRESH_BAD_MAIL_GIFT,    /* a letter carries a gift (present != EMPTY_NO / RSV_NO) */
+    PC_MP_FRESH_BAD_CATALOG_ORDER,
+    PC_MP_FRESH_BAD_CATALOG,      /* more than PC_MP_FRESH_CATALOG_MAX_BITS catalog bits */
+    PC_MP_FRESH_BAD_QUEST,        /* a delivery / errand quest is active */
+    PC_MP_FRESH_BAD_PROGRESS,     /* hint_count / destiny / complete flags / aircheck / unk spans / maps / tortimer / golden / e-Card / state_flags */
+    PC_MP_FRESH_REASON_COUNT
+};
+int         pc_mp_guest_record_fresh_check(const uint8_t* be_rec, size_t len, unsigned* detail);
+const char* pc_mp_guest_fresh_reason_str(int reason);
+
 #ifdef __cplusplus
 }
 #endif
