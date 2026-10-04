@@ -8,7 +8,7 @@ Legend: Complete / In progress / Not started. Commit hashes are filled in by who
 
 ## G2 - guest profile, `--guest`, host-enforced empty economy
 
-Status: **Complete** (all focused tests green, see results). Commit hash: (filled by orchestrator)
+Status: **Complete** (all focused tests green, see results). Commit hash: 91453aa
 
 What was implemented:
 
