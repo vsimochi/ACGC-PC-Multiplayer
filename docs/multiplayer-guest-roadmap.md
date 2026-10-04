@@ -46,7 +46,7 @@ Tests (all on disposable fixtures, one build):
 
 ## G3 - arrival without the gateway, title-menu entry, appearance rebuild
 
-Status: **Complete, with limitations** (every focused test green, see results; the title-menu click and the cutscene were NOT exercised / seen). Commit hash: (filled by orchestrator)
+Status: **Complete, with limitations** (every focused test green, see results; the title-menu click and the cutscene were NOT exercised / seen). Commit hash: 90d4cb5
 
 What was implemented:
 
