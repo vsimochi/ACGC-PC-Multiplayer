@@ -254,7 +254,7 @@ Limitations:
 
 ## G6 - reliability and release readiness for guests
 
-Status: **Complete, with limitations** (every focused test green, see results; the on-screen message drawing and the arrival cutscene were NOT visually verified). Commit hash: (filled by orchestrator)
+Status: **Complete, with limitations** (every focused test green, see results; the on-screen message drawing and the arrival cutscene were NOT visually verified). Commit hash: 91de602
 
 Scope decision: NO wire change and NO protocol bump. The design's additive `REJECT_INFO` message (id 59) was deliberately NOT implemented: every readable message is produced from the EXISTING
 frozen reject reasons (1 PROTOCOL_MISMATCH, 2 SERVER_FULL, 3 LAND_MISMATCH, 4 NO_SAVE) and from state the client already has; all admin tools are host-local. Message ids stay 1..58, wire_baseline 18/18,
