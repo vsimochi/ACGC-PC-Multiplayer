@@ -16703,13 +16703,20 @@ static void pcnetgame_crec_apply_staged(int host_only, int* cloth_refreshed, int
  * blocker was invisible. These lines go through PC_LOG(PCL_RECORDS) (enable with -debugrecords [-logfile PATH], no --verbose needed) on every blocker CHANGE
  * (never per frame) and with a state snapshot at the final ADOPT_FAILED; the final failure is also shown on screen through the join-message notice. */
 static char s_crec_diag_last_why[96];
+static int s_crec_diag_first_frame = -1; /* graph frame counter when the first blocker of this push was logged (did the game advance since?) */
 static void pcnetgame_join_message_set(int warning, const char* fmt, ...); /* defined with the client join messages (G6.1) */
 static void pcnetgame_crec_diag_snapshot(char* out, size_t cap) {
+    extern int g_pc_paused; /* pc_pause_menu.c: Game_play_move() returns immediately while set (nothing, incl. the wipe/scene change, advances) */
     GAME_PLAY* play = (gamePT != NULL && gamePT->exec == play_main) ? (GAME_PLAY*)gamePT : NULL;
     PLAYER_ACTOR* pl = play != NULL ? GET_PLAYER_ACTOR_NOW() : NULL;
     int real = pl != NULL && pcnetgame_is_real_player_actor(pl);
-    snprintf(out, cap, "save_ready=%d latched=%d now_private=%d play_main=%d submenu(status=%d type=%d mode=%d refuse=%d) fade=%d wipe=%d player_actor=%d main_index=%d "
+    snprintf(out, cap, "paused=%d frames_since_first_block=%d game_doing=%d scene_id=%d next_scene=%d save_scene=%d from_title_demo=%d wipe_type=%d wipe_finished=%d | "
+                       "save_ready=%d latched=%d now_private=%d play_main=%d submenu(status=%d type=%d mode=%d refuse=%d) fade=%d wipe=%d player_actor=%d main_index=%d "
                        "pending(pickup=%d drop=%d bury=%d txn=%d exch=%d swap=%d catch=%d field=%d)",
+             g_pc_paused, (play != NULL && s_crec_diag_first_frame >= 0) ? (int)play->game.graph->frame_counter - s_crec_diag_first_frame : -1,
+             play != NULL ? (int)play->game.doing : -1, play != NULL ? (int)play->scene_id : -1, play != NULL ? (int)play->next_scene_no : -1, (int)Save_Get(scene_no),
+             (int)Common_Get(scene_from_title_demo), play != NULL ? (int)play->fbdemo_wipe.wipe_type : -1,
+             (play != NULL && play->fb_wipe_mode == WIPE_MODE_MOVE) ? (int)(play->fbdemo_wipe.wipe_procs.isfinished_proc(&play->fbdemo_wipe.wipe_data) != 0) : -1,
              (int)pcfa_save_ready(), (int)s_local_world_latched, Now_Private != NULL, play != NULL,
              play != NULL ? (int)play->submenu.process_status : -1, play != NULL ? (int)play->submenu.menu_type : -1,
              play != NULL ? (int)play->submenu.mode : -1, play != NULL ? (int)play->submenu.start_refuse_timer : -1,
@@ -16733,8 +16740,13 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
     if (why != NULL) {
         if (strcmp(s_crec_diag_last_why, why) != 0) { /* blocker CHANGED (or first): one line, never per frame */
             snprintf(s_crec_diag_last_why, sizeof(s_crec_diag_last_why), "%s", why);
-            PC_LOG(PCL_RECORDS, "client adoption of rev %u blocked: %s (%u ms since the push arrived)\n", (unsigned)s_crec.st_rev, why,
-                   (unsigned)(now - s_crec.st_ms));
+            char snap[512];
+            if (s_crec_diag_first_frame < 0 && gamePT != NULL && gamePT->exec == play_main) {
+                s_crec_diag_first_frame = (int)((GAME_PLAY*)gamePT)->game.graph->frame_counter;
+            }
+            pcnetgame_crec_diag_snapshot(snap, sizeof(snap));
+            PC_LOG(PCL_RECORDS, "client adoption of rev %u blocked: %s (%u ms since the push arrived) | %s\n", (unsigned)s_crec.st_rev, why,
+                   (unsigned)(now - s_crec.st_ms), snap);
         }
         if (s_crec.st_defer_ack_ms == 0 || (uint32_t)(now - s_crec.st_defer_ack_ms) >= PC_NETGAME_CREC_DEFER_ACK_MS) {
             s_crec.st_defer_ack_ms = now;
@@ -16750,7 +16762,7 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
             printf("[NET][REC] client: ADOPT_FAILED for rev %u after %u ms (last blocker: %s) -- the host closes the link\n",
                    (unsigned)s_crec.st_rev, (unsigned)PC_NETGAME_CREC_ADOPT_TIMEOUT_MS, why);
             {
-                char snap[384];
+                char snap[512];
                 pcnetgame_crec_diag_snapshot(snap, sizeof(snap));
                 PC_LOG(PCL_RECORDS, "client ADOPT_FAILED for rev %u after %u ms: final blocker: %s | %s\n", (unsigned)s_crec.st_rev,
                        (unsigned)PC_NETGAME_CREC_ADOPT_TIMEOUT_MS, why, snap);
@@ -16883,6 +16895,7 @@ static void pcnetgame_crec_push_complete(void) {
         s_crec.st_defer_ack_ms = 0;
         s_crec.st_defer_logged = 0;
         s_crec_diag_last_why[0] = '\0'; /* diagnostics: a new push starts a new blocker history */
+        s_crec_diag_first_frame = -1;
     }
     s_crec.st_valid = 1;
     s_crec.st_kind = kind;
