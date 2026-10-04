@@ -5,16 +5,23 @@ TIER: REAL HOST + REAL CLIENT game processes, hook-driven (no GUI automation of 
   host   = `AnimalCrossing.exe --host <port> --bootstrap-resident 0`
   client = `AnimalCrossing.exe --connect 127.0.0.1:<port> --bootstrap-guest GUESTR,HOMETWN,0x4A07,0x5B01 [--d3-test-wallet-add N]` (a NEW process every run)
 `--bootstrap-guest` is the TEST-ONLY, default-off, CLIENT-only hook that stands in for the (unreachable in netplay) train arrival: the process binds a
-foreigner (Common player_no = mPr_FOREIGNER, Now_Private = a passport copy of a resident record of the loaded town re-keyed to the guest's HOME
-PersonalID) and spawns at the station. Everything asserted comes from the two processes' own '[NET]' log lines, the files they wrote
+foreigner (Common player_no = mPr_FOREIGNER, Now_Private = the passport) and spawns at the station. Guests G1: the passport is a FRESH character
+(mPr_ClearPrivateInfo + mPr_InitPrivateInfo + the guest's HOME PersonalID + gender / face / starter shirt given or derived from the identity), NEVER a copy of a
+resident: the first-contact MIGRATE uploads that fresh record. Everything asserted comes from the two processes' own '[NET]' log lines, the files they wrote
 (guests.dat parsed by the protocol test's independent parser, guest_token.dat parsed here by an independent parser) and byte-exact checks of the host
 record through a scripted FakeClient guest session.
 
+  R0  (Guests G1) the client-side early NAME check: a guest named like a resident of the loaded town, and a blank name, make the client exit with code 2
+      BEFORE it connects as anything (no guest is created on the host)
   R1  first contact: the client reaches READY as a foreigner, sends IDENTITY_EXT, the host MINTS the token (slot 0), the client PERSISTS it
       (save/mp/guest_token.dat == the token in guests.dat), the D3 record flow runs with record_class GUEST (MIGRATE -> rev 1 -> PUSH_FULL -> adopt)
   R2  a NEW client process presents the stored token: KNOWN, verified by the host, NO migration, adopts the host record; --d3-test-wallet-add 100 makes
       it upload a change (class GUEST) which the host applies; a FakeClient guest session then sees the wallet + 100
   R3  a client whose token file was tampered (wrong token) is REFUSED by the host; a client without a token file is REFUSED too
+  R5  (Guests G1) a SECOND real guest with the optional GENDER,FACE arguments (1,5): honoured in the client log and in the record the host holds; the record is
+      independent of guest 1's (own name / appearance), no resident name / pocket / wallet in either
+  (R1 also asserts the FRESH record: name == NAME, pockets / wallet / bank / letters empty, no resident name, identity-derived appearance, the whole record equal to
+   the python mirror fresh_guest_record_for() except the ranges the MODE_PAK arrival init legitimately touches -- catalog bits, maps, calendar / day counters)
 NOT covered (documented): the vanilla train arrival (RIDE_OFF_DEMO is replayed by the hook's door data but not visually verified), any inventory UI,
 a guest's shop / pickup through the REAL client request path (the host transactions for guests are protocol-tested in test_guest_protocol.py).
 Run ONLY on the disposable pc\\build64\\bin_fixture4 (NET_SPIKE_GAME_BIN=<absolute path>, ports 11600+). The fixture save dir is snapshotted at start and
@@ -56,6 +63,60 @@ def parse_token_file(path):
     return out
 
 
+# Ranges of the guest record that the vanilla MODE_PAK arrival init (mSDI_StartInitAfter on the passport: item-collect bits, map renewal, calendar welcome, complete
+# talk flags) or the in-game day logic may touch before the first upload. EVERY OTHER BYTE of the stored record must equal the python mirror exactly.
+#   Observed with the real client (R1 / R5): ONLY the catalog bitfields differ (the three item-collect bits mSDI_StartInitAfter sets: mPr_SetItemCollectBit
+#   FTR_SUM_CASSE01 / FTR_NOG_COLLEGENOTE / FTR_NOG_MIKANBOX); maps, complete flags and the calendar are byte-identical to the mirror. The calendar / day counter tail
+#   stays allowed because it is date dependent (calendar welcome, sunburn day logic), nothing else is.
+MAY_DIFFER = [("catalog bitfields (3 item-collect bits)", 0x1108, 0x11DC), ("calendar / day counters / tail (date dependent)", 0x234C, 0x2440)]
+
+
+def diff_ranges(a, b):
+    """[(start, end)] runs of differing bytes of two equal-length images."""
+    out, i, n = [], 0, min(len(a), len(b))
+    while i < n:
+        if a[i] != b[i]:
+            j = i
+            while j < n and a[j] != b[j]:
+                j += 1
+            out.append((i, j))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def design_oracle():
+    """my_org[0..3] (names / textures come from ROM / ARAM): the vanilla defaults every fixture resident carries. Returns (bytes, all residents identical)."""
+    recs = [L.record_from_gci(L.GAME_BIN_DIR, i) for i in range(4)]
+    d = [bytes(r[L.REC_OFF_MY_ORG:L.REC_OFF_MY_ORG + 4 * L.REC_MY_ORG_SIZE]) for r in recs]
+    return d[1], all(x == d[1] for x in d)
+
+
+def fresh_record_checks(check, tag, rec, g, oracle, gender=None, face=None, resident_names=()):
+    """The host-held record `rec` of guest `g` is the FRESH character: python mirror equal outside MAY_DIFFER, empty economy, no resident data."""
+    exp = L.fresh_guest_record_for(g, gender=gender, face=face, default_designs=oracle)
+    bad = [(a, b) for a, b in diff_ranges(rec, exp) if not any(lo <= a and b <= hi for _n, lo, hi in MAY_DIFFER)]
+    allowed = [(a, b) for a, b in diff_ranges(rec, exp) if any(lo <= a and b <= hi for _n, lo, hi in MAY_DIFFER)]
+    print("   [%s] record vs python mirror: unexpected diffs %s; allowed (MODE_PAK / day) diffs %s" % (tag, [(hex(a), hex(b)) for a, b in bad], [(hex(a), hex(b)) for a, b in allowed]))
+    check("%s the host holds the guest's FRESH record: equal to the python mirror (fresh_guest_record_for) in every byte outside the MODE_PAK-touched ranges" % tag,
+          len(rec) == L.PC_NETGAME_REC_SIZE and not bad)
+    cat_runs = [(a, b) for a, b in diff_ranges(rec, exp) if 0x1108 <= a and b <= 0x11DC]
+    set_bits = sum(bin(rec[i] ^ exp[i]).count("1") for a, b in cat_runs for i in range(a, b))
+    check("%s the ONLY change the arrival init made inside the catalog bitfields is item-collect bits being SET (%d bit(s) in %s; vanilla sets exactly 3)" % (tag, set_bits, [(hex(a), hex(b)) for a, b in cat_runs]),
+          all((rec[i] & exp[i]) == exp[i] for a, b in cat_runs for i in range(a, b)) and 0 < set_bits <= 3)
+    check("%s the record: PersonalID = the guest's HOME PersonalID, exists 1, reset_code 0" % tag,
+          rec[:20] == L.guest_pid_be(g) and rec[L.REC_OFF_EXISTS] == 1 and L.record_get_u32(rec, L.REC_OFF_RESET_CODE) == 0)
+    check("%s the record: pockets, item conditions, wallet, bank EMPTY (no starter bag, nothing cloned), loan = the vanilla pre-house 100" % tag,
+          L.record_inventory(rec) == ((0,) * 15, 0, 0) and L.record_get_u32(rec, L.REC_OFF_BANK) == 0 and L.record_get_u32(rec, L.REC_OFF_LOAN) == 100)
+    check("%s the record: all 10 letters EMPTY (font 0xFF), no catalog order, no equipment" % tag,
+          all(L.mail_font(rec[L.REC_OFF_MAIL + i * L.REC_MAIL_SIZE:L.REC_OFF_MAIL + (i + 1) * L.REC_MAIL_SIZE]) == L.MAIL_FONT_UNUSED for i in range(10))
+          and rec[L.REC_OFF_CATALOG_ORDERS:L.REC_OFF_CATALOG_ORDERS + 20] == b"\x00" * 20 and L.record_get_u16(rec, L.REC_OFF_EQUIPMENT) == 0)
+    check("%s the record carries NO resident name (%s) anywhere" % (tag, ", ".join(n.decode("latin-1").strip() for n in resident_names)),
+          all(n not in rec for n in resident_names))
+    return exp
+
+
 class Rig:
     def __init__(self, port, results, save_dir, snap_dir):
         self.port, self.results, self.save_dir, self.snap_dir = port, results, save_dir, snap_dir
@@ -78,14 +139,20 @@ class Rig:
             time.sleep(2.0)
         return False
 
-    def start_client(self, name, extra=()):
+    def start_client(self, name, extra=(), spec=None):
         self.n += 1
-        return L.ClientProcess("127.0.0.1:%d" % self.port, extra_args=["--bootstrap-guest", SPEC] + list(extra),
+        return L.ClientProcess("127.0.0.1:%d" % self.port, extra_args=["--bootstrap-guest", spec or SPEC] + list(extra),
                                log_path=os.path.join(HERE, "guest_real_%s.log" % name), bin_dir=L.GAME_BIN_DIR, label=name).start()
 
 
 def fake_guest(rig, label, token):
     c = L.FakeClient(label, "127.0.0.1", rig.port, guest=GUEST, guest_token=token)
+    c.connect_and_ready(quiet=True)
+    return c
+
+
+def fake_guest_as(rig, label, ident, token):
+    c = L.FakeClient(label, "127.0.0.1", rig.port, guest=ident, guest_token=token)
     c.connect_and_ready(quiet=True)
     return c
 
@@ -113,6 +180,27 @@ def run(args, results, rig):
     host = rig.host
     town = L.resolve_host_town(ip, args.port)
 
+    oracle, oracle_ok = design_oracle()
+    check("fixture: the 4 residents carry identical my_org[0..3] (the vanilla default designs: the oracle for the ROM / ARAM-derived default design names / textures)", oracle_ok)
+    res_names = [bytes(L.resident_player(i).player_name) for i in range(4)]
+
+    # ---------------- R0: the client's early NAME check ----------------
+    for tag, spec, rx in (("R0a resident name", "%s,HOMETWN,0x4A07,0x5B01" % res_names[1].decode("latin-1").strip(), r"REFUSED: the guest name '%s' equals the name of resident 1 of this town" % re.escape(res_names[1].decode("latin-1"))),
+                          ("R0b blank name", "   ,HOMETWN,0x4A07,0x5B01", r"REFUSED: bad spec '   ,HOMETWN,0x4A07,0x5B01': NAME is not a valid game player name \(blank, or a character the name entry cannot produce\)")):
+        # Guests G1.1: a blank name is a SPEC error now caught by the early validator (pc_bootstrap_guest_validate, before the window / save load); the resident-name
+        # clash needs the loaded town and is still refused by pc_bootstrap_guest_poll. Both exit with code 2 and a stderr diagnostic.
+        c0 = rig.start_client("r0" + tag[2], spec=spec)
+        t_end = time.monotonic() + 180.0
+        while c0.alive() and time.monotonic() < t_end:
+            time.sleep(0.5)
+        t0 = c0.log_text()
+        check("%s: the client EXITS with code 2 before connecting (alive=%s, exit code %s) and says why" % (tag, c0.alive(), c0.exit_code()),
+              not c0.alive() and c0.exit_code() == 2 and re.search(rx, t0) is not None)
+        check("%s: no FRESH record was built, no foreigner bound, and the host created no guest (no guests.dat, no 'bound to GUEST')" % tag,
+              "FRESH guest record" not in t0 and "bound as a foreigner" not in t0 and not os.path.exists(guests) and "bound to GUEST" not in host.log_text())
+        if c0.alive():
+            c0.stop()
+
     # ---------------- R1: first contact ----------------
     cl = rig.start_client("r1")
     m = cl.wait_for_log(r"\[NET\]\[REC\] client: adopted rev=(\d+) epoch=(\d+) kind=FULL", 120.0)
@@ -120,6 +208,10 @@ def run(args, results, rig):
     print("--- client R1 log tail ---")
     print("\n".join(ct.splitlines()[-25:]))
     check("R1 the guest bootstrap ran: foreigner bound, arriving at the station (SCENE_FG)", "--bootstrap-guest: guest 'GUESTR  '" in ct and "bound as a foreigner" in ct)
+    mf = re.search(r"--bootstrap-guest: FRESH guest record \(not a copy of any resident\): gender=(\d+) face=(\d+) shirt=0x([0-9A-Fa-f]+) \(derived from the identity\)", ct)
+    dg, df, ditem, _didx = L.guest_fresh_derive(L.guest_pid_be(GUEST))
+    check("R1 (G1) client log: a FRESH guest record was built (not a resident copy); gender / face / shirt = the values DERIVED from the identity (python mirror: %d / %d / 0x%04X)" % (dg, df, ditem),
+          mf is not None and (int(mf.group(1)), int(mf.group(2)), int(mf.group(3), 16)) == (dg, df, ditem))
     check("R1 the real client reached READY as a foreigner (pcfa_save_ready accepted it): handshake complete", "handshake complete, town verified" in ct)
     check("R1 client log: IDENTITY_EXT sent before the IDENTITY (token not held: first contact)", "playing a guest -- sent IDENTITY_EXT (token not held (first contact))" in ct)
     check("R1 host log: bound to GUEST slot 0 (first contact: token minted); the IDENTITY_EXT was cached as a guest claim",
@@ -151,6 +243,10 @@ def run(args, results, rig):
     rev1 = f1.rec_pushes[-1]["rev"]
     check("R1 a FakeClient guest session with the token (KNOWN, same slot) is pushed the host record (rev %d)" % rev1,
           f1.token_msgs[0][1].flags == 2 and f1.token_msgs[0][1].guest_slot == 0 and rev1 >= 1)
+    hrec1 = bytes(f1.rec_pushes[-1]["data"])
+    fresh_record_checks(check, "R1 (G1) reconnect", hrec1, GUEST, oracle, resident_names=res_names)
+    check("R1 (G1) the host's first-contact record is what the REAL client uploaded and is restored to a returning session: the derived appearance bytes (gender %d, face %d, shirt 0x%04X) are in it" % (dg, df, ditem),
+          hrec1[0x14] == dg and hrec1[0x15] == df and struct.unpack(">H", hrec1[L.REC_OFF_CLOTH_ITEM:L.REC_OFF_CLOTH_ITEM + 2])[0] == ditem and w1 == 0)
     release(f1)
 
     # ---------------- R2: a new process presents the stored token ----------------
@@ -195,6 +291,33 @@ def run(args, results, rig):
     check("R3 a client WITHOUT a token file (a squatter / a lost token) is REFUSED: 'known guest key presented WITHOUT a token'", m4 is not None
           and "presented WITHOUT a token" in host.log_text()[off_log:])
     cl4.stop()
+    # ---------------- R5: a second real guest, GENDER,FACE given ----------------
+    spec2 = "GUESTS,HOMETWN,0x4A08,0x5B01,1,5"
+    g2 = L.GuestIdentity(b"GUESTS  ", 0x4A08, b"HOMETWN ", 0x5B01)
+    off_log = len(host.log_text())
+    cl5 = rig.start_client("r5", spec=spec2)
+    m5 = cl5.wait_for_log(r"\[NET\]\[REC\] client: adopted rev=(\d+) epoch=(\d+) kind=FULL", 120.0)
+    ct5 = cl5.log_text()
+    check("R5 (G1) client log: FRESH record with the GIVEN gender 1 / face 5 (not derived)", re.search(r"FRESH guest record \(not a copy of any resident\): gender=1 face=5 shirt=0x24(0[89A-Fa-f])", ct5) is not None)
+    check("R5 host log: the second real guest is bound to GUEST slot 1 (first contact: token minted), no violation in the client log",
+          re.search(r"peer \d+ bound to GUEST slot 1 \(first contact: token minted;", host.log_text()[off_log:]) is not None and m5 is not None
+          and not re.search(r"violation \d/\d|BAD[_ ]DIGEST|ADOPT_FAILED|host rejected the connection", ct5))
+    cl5.stop()
+    L.pump_sleep(7.0)
+    try:
+        e5 = [e for e in TG.parse_guests(guests)["e"] if e["present"] and e["pid"] == L.guest_pid_be(g2)]
+        tok5 = e5[0]["token"]
+    except (AssertionError, OSError, IndexError) as exc:
+        check("R5 guests.dat holds the second guest (%s)" % exc, False)
+        tok5 = None
+    if tok5 is not None:
+        f5 = fake_guest_as(rig, "F5", g2, tok5)
+        hrec5 = bytes(f5.rec_pushes[-1]["data"])
+        fresh_record_checks(check, "R5", hrec5, g2, oracle, gender=1, face=5, resident_names=res_names)
+        check("R5 the two real guests are independent characters: different PersonalID / name; guest 2 has the GIVEN gender 1 / face 5 and a girl's shirt, guest 1 has its derived values",
+              hrec5[:20] != hrec1[:20] and hrec5[:8] != hrec1[:8] and hrec5[0x14:0x16] == bytes([1, 5]) and 0x2408 <= struct.unpack(">H", hrec5[L.REC_OFF_CLOTH_ITEM:L.REC_OFF_CLOTH_ITEM + 2])[0] < 0x2410
+              and hrec1[0x14:0x16] == bytes([dg, df]))
+        release(f5)
     check("the host stayed alive and logged no INTERNAL error", host.alive() and "*** INTERNAL" not in host.log_text())
 
 

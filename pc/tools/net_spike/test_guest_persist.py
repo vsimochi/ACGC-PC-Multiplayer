@@ -87,6 +87,8 @@ def run(args, results):
     check("A guest A: first contact, MIGRATE -> PUSH_FULL rev 1, class GUEST, slot 0 token minted", a.token_msgs[0][1].guest_slot == 0 and push["rev"] == 1 and push["rsv"] == 1 and tokA)
     expA1 = L.record_merge_expected(L.guest_blank_record(gA), a.own_record())
     check("A the pushed record is the merge of the upload into the blank guest record", push["data"] == expA1)
+    check("A (G1) the first-contact upload is a FRESH character (not a resident clone) and the host stored exactly it: pushed == fresh_guest_record_for(A) == the upload",
+          push["data"] == L.fresh_guest_record_for(gA) == a.own_record())
     check("A guests.dat exists right after the mint, entry 0 = A with its token and rev 0 (independent parser)", os.path.isfile(GUESTS)
           and TG.parse_guests(GUESTS)["e"][0]["pid"] == L.guest_pid_be(gA) and TG.parse_guests(GUESTS)["e"][0]["token"] == tokA and TG.parse_guests(GUESTS)["e"][0]["rev"] == 0)
     up = L.record_set_u32(expA1, L.REC_OFF_WALLET, 4321)
@@ -124,6 +126,9 @@ def run(args, results):
           e0["present"] and e0["pid"] == L.guest_pid_be(gA) and e0["token"] == tokA and e0["rev"] == 2 and e0["record"] == expA2
           and e1["present"] and e1["pid"] == L.guest_pid_be(gB) and e1["token"] == tokB and e1["rev"] == 1 and e1["record"] == expB1
           and all(not e["present"] for e in pf["e"][2:]) and e0["epoch"] != 0 and e1["epoch"] != 0)
+    check("A (G1) guests.dat holds EXACTLY the fresh record guest B uploaded (client-owned / shared ranges AND the host-owned zeros), and guest A's record = the fresh record + its "
+          "later wallet / pocket upload only",
+          e1["record"] == L.fresh_guest_record_for(gB) and e0["record"] == L.record_set_u16(L.record_set_u32(L.fresh_guest_record_for(gA), L.REC_OFF_WALLET, 4321), L.REC_OFF_POCKETS + 6, 0x2037))
     check("A the records of guests are not in the GCI: GCI keeps its vanilla size and no guest PersonalID is anywhere in it",
           os.path.getsize(GCI) == 0x72040 and L.guest_pid_be(gA) not in open(GCI, "rb").read() and L.guest_pid_be(gB) not in open(GCI, "rb").read())
     check("A nothing guest-like in card_a / card_b; no *.gci / GAF named file in save/mp; save/mp is a sibling of card_a",

@@ -176,6 +176,21 @@ int  pc_mp_gtoken_find(const PCMpGtkFile* f, const uint8_t* host_land_name, uint
  * index used. */
 int  pc_mp_gtoken_put(PCMpGtkFile* f, const PCMpGtkEntry* e);
 
+/* Guests G1: the guest NAME rule shared by the client (early check) and the host (authority). `name` = the 8-byte space padded player name in the
+ * game's font encoding (PersonalID_c.player_name). Valid = at least one character that is not a blank (CHAR_SPACE 32, CHAR_SPACE_2 210,
+ * CHAR_SPACE_3 211: the vanilla name entry refuses an all-space name, mED_all_space_check) and every byte is a printable font character:
+ * not NUL, not CHAR_CONTROL_CODE (127), CHAR_MESSAGE_TAG (128), CHAR_NEW_LINE (205) and not one of the unused codes above 222 (the name keyboard
+ * can produce none of them). Length is the fixed 8 bytes of the field. Returns 1 = valid, 0 = invalid. */
+#define PC_MP_GUEST_NAME_LEN 8
+int  pc_mp_guests_name_valid(const uint8_t* name);
+
+/* Guests G1.1: the RESERVED observer display name. 1 iff the 8 bytes equal ASCII "SERVER" space padded to 8 (PC_MP_GUEST_RESERVED_NAME), the exact bytes
+ * the hidden server observer's PersonalID carries (pc_m_card.c pc_host_observer_poll). The comparison is EXACT (memcmp over 8 bytes, NOT case-folded, no
+ * trimming): the game's own name comparison is exact, so "Server  " is a different name. NULL -> 0. A NEW guest (new key / re-mint) may not carry it; a
+ * guest already stored in guests.dat is never locked out by it. */
+#define PC_MP_GUEST_RESERVED_NAME "SERVER  "
+int  pc_mp_guests_name_reserved(const uint8_t* name);
+
 #ifdef __cplusplus
 }
 #endif

@@ -26,12 +26,22 @@ Sections (one host process, in order; <= 3 live clients at any time):
   X    GUEST TRANSACTIONS against the guest record (slot space 4..11): pickup (pocket + money bag), drop, bury, DIG_BURIED grant, SHOP_BUY / SHOP_SELL,
        POLICE_CLAIM work; MUSEUM_DONATE / MAIL_SEND / MAIL_TAKE are refused NO_DONOR_SLOT (no rev change), no MAILBOX_LETTER is ever pushed to a guest;
        FRIENDSHIP_REQUEST / MAIL_REQUEST are keyed by the guest's home PersonalID (a forged mail sender is overwritten); a new session sees the final record
+  G    (Guests G1, fresh record) the first-contact upload is a FRESH character (python mirror of pc_guest_build_fresh_record), never a resident's: the host
+       stores EXACTLY what the guest uploaded, a returning guest is pushed that record with no new MIGRATE, two guests are independent; the NAME rules at the
+       host: a name equal to a RESIDENT's (any slot, incl. the host's own) is refused, a name already used by ANOTHER guest of this town is refused, blank /
+       control-character names are refused, nothing is created by any refusal; after the whole run the resident records and homes[] owners of the disposable GCI
+       are byte-unchanged
   N    TABLE FULL: 8 guests fit, the 9th is refused (nothing disposable), a known guest still reconnects; guests.dat holds exactly the 8 (unique tokens)
   M    (SECOND host process, pre-seeded guests.dat with an entry of ANOTHER town) M1 table keyed by (host town, key): the other town's entry is kept but
        inactive, the same key presenting that token is a first contact; M3 an UNCONFIRMED data-less entry is RE-MINTED for its key (a lost TOKEN must not
        lock the guest out), confirmed by a token-presenting reconnect, then a squatter / old token is refused; a squatter WITHOUT the token against a
        SILENT LIVE guest is refused with the session untouched and no eviction; per-address first-contact limit (3 per 60 s); table full: the OLDEST
        unconfirmed data-less idle entry is evicted, confirmed / data-bearing entries never
+
+  R    (Guests G1.1, THIRD / FOURTH host process on a guests.dat the test patched) the name rules judge NEW identities only: a CONFIRMED returning guest whose
+       stored name now equals a RESIDENT's (or the reserved observer name "SERVER  ") is ADMITTED with its token and gets its stored record (residents / homes
+       byte-unchanged), the same key without / with a wrong token is still refused, a NEW key (and an unconfirmed data-less RE-MINT) with a resident's / the
+       reserved name is refused with no token minted and no entry changed; a NEW guest named SERVER is refused in the main run too (section G)
 
 Tier: PROTOCOL TESTED (real host binary, scripted clients). Usage: python test_guest_protocol.py [--port 11400]
 """
@@ -181,7 +191,25 @@ def s_wire(results):
     ck("W the frozen IDENTITY / IDENTITY_ACK stay 32 bytes", L.IDENTITY_SPEC.size == 32 and L.IDENTITY_ACK_SPEC.size == 32)
     ck("W the guest pid helper is the BE PersonalID (the first 0x14 bytes of a record image)",
        L.guest_pid_be(g) == g.player_name + g.land_name + struct.pack(">HH", g.player_id, g.land_id) and len(L.guest_pid_be(g)) == 20)
-    ck("W the guest record helper re-keys a legal record: PersonalID replaced, the rest identical", L.guest_record(g)[:20] == L.guest_pid_be(g) and len(L.guest_record(g)) == L.PC_NETGAME_REC_SIZE)
+    ck("W the guest record helper is a FRESH record (not a resident clone): PersonalID = the guest's, exists 1, reset_code 0, 0x2440 bytes", L.guest_record(g)[:20] == L.guest_pid_be(g)
+       and len(L.guest_record(g)) == L.PC_NETGAME_REC_SIZE and L.guest_record(g) == L.fresh_guest_record_for(g) and L.guest_record(g)[L.REC_OFF_EXISTS] == 1
+       and L.record_get_u32(L.guest_record(g), L.REC_OFF_RESET_CODE) == 0)
+    fr = L.guest_record(g)
+    ck("W fresh record: pockets / wallet / bank / item conditions empty, loan 100, 10 empty letters (font 0xFF), no quest, birthday + remail + maps cleared, org table 0..7",
+       L.record_inventory(fr) == ((0,) * 15, 0, 0) and L.record_get_u32(fr, L.REC_OFF_LOAN) == 100 and L.record_get_u32(fr, L.REC_OFF_BANK) == 0
+       and all(L.mail_font(fr[L.REC_OFF_MAIL + i * L.REC_MAIL_SIZE:L.REC_OFF_MAIL + (i + 1) * L.REC_MAIL_SIZE]) == L.MAIL_FONT_UNUSED for i in range(10))
+       and all(fr[L.REC_OFF_DELIVERIES + i * 0x28] == 0xC0 for i in range(15)) and fr[L.REC_OFF_BIRTHDAY:L.REC_OFF_BIRTHDAY + 4] == b"\xff" * 4
+       and list(fr[L.REC_OFF_ORG_TABLE:L.REC_OFF_ORG_TABLE + 8]) == list(range(8)))
+    d0 = L.guest_fresh_derive(L.guest_pid_be(g))
+    d1 = L.guest_fresh_derive(L.guest_pid_be(gid(1)))
+    ck("W the derived gender / face / shirt are deterministic (same identity -> same values), inside the legal ranges, and differ across the 8 test guests",
+       d0 == L.guest_fresh_derive(L.guest_pid_be(g)) and all(x[0] in (0, 1) and 0 <= x[1] < 8 and L.ITM_CLOTH_START + (8 if x[0] else 0) <= x[2] < L.ITM_CLOTH_START + (16 if x[0] else 8)
+                                                               for x in (L.guest_fresh_derive(L.guest_pid_be(gid(i))) for i in range(8)))
+       and len({L.guest_fresh_derive(L.guest_pid_be(gid(i)))[:3] for i in range(8)}) >= 4)
+    ck("W the GENDER / FACE arguments are honoured by the builder (given values land at 0x14 / 0x15, the shirt is taken from the GIVEN gender's table)",
+       L.fresh_guest_record_for(g, gender=1, face=5)[0x14:0x16] == bytes([1, 5]) and L.fresh_guest_record_for(g, gender=0, face=2)[0x14:0x16] == bytes([0, 2])
+       and 0x2408 <= struct.unpack(">H", L.fresh_guest_record_for(g, gender=1, face=5)[L.REC_OFF_CLOTH_ITEM:L.REC_OFF_CLOTH_ITEM + 2])[0] < 0x2410
+       and 0x2400 <= struct.unpack(">H", L.fresh_guest_record_for(g, gender=0, face=5)[L.REC_OFF_CLOTH_ITEM:L.REC_OFF_CLOTH_ITEM + 2])[0] < 0x2408)
 
 
 def s_first_contact(run):
@@ -209,6 +237,14 @@ def s_first_contact(run):
     ck("F the pushed record == the client-owned / shared ranges of the upload merged into the host's BLANK guest record (host-owned ranges stay zero, "
        "player_ID = the guest key, exists = 1)", push is not None and push["data"] == exp and push["data"][:20] == L.guest_pid_be(g))
     ck("F the pushed record is NOT any resident's: no resident PersonalID in it", push is not None and all(push["data"][:20] != L.record_from_gci(run.snap_gci, i)[:20] for i in range(4)))
+    ck("F (G1) the guest uploaded a FRESH character (the python mirror of pc_guest_build_fresh_record), not a resident clone: the MIGRATE payload == fresh_guest_record_for(guest)",
+       up == L.fresh_guest_record_for(g) and L.record_inventory(up) == ((0,) * 15, 0, 0))
+    ck("F (G1) the host stored EXACTLY what the guest uploaded: the PUSH_FULL record == the upload byte for byte (the fresh record's host-owned ranges are zero like the blank "
+       "host record, player_ID / exists equal), so the blank-record merge loses and adds nothing",
+       push is not None and push["data"] == up and exp == up)
+    ck("F (G1) no resident NAME, pocket item or wallet of the fixture survives in the stored guest record (the old clone carried the first resident's)",
+       push is not None and all(bytes(L.resident_player(i).player_name) not in push["data"] for i in range(4) if L.resident_player(i) is not None)
+       and L.record_inventory(push["data"])[0] == (0,) * 15 and L.record_inventory(push["data"])[2] == 0)
     t = run.log()
     ck("F host log: bound to GUEST slot 0 (first contact: token minted), IDENTITY_EXT cached, guests.dat written when the token was minted",
        re.search(r"peer \d+ bound to GUEST slot 0 \(first contact: token minted;", t) and "IDENTITY_EXT cached (guest=1, token_present=0)" in t
@@ -400,6 +436,9 @@ def s_transactions(run, a, tok):
     b = run.guest("B", b_g)
     b.connect_and_ready(quiet=True)
     ck("X a second guest gets slot 1 (first contact) while guest A is live", b.token_msgs and b.token_msgs[0][1].guest_slot == 1 and b.token_msgs[0][1].flags == 1)
+    bp = b.rec_pushes[0]["data"] if b.rec_pushes else b""
+    ck("X (G1) guest B's stored record is ITS OWN fresh character (== fresh_guest_record_for(B), exactly what it uploaded), independent of A's: different PersonalID / name",
+       bp == L.fresh_guest_record_for(b_g) and bp[:20] != L.guest_pid_be(g) and bp[:8] != L.guest_pid_be(g)[:8] and L.record_inventory(bp) == ((0,) * 15, 0, 0))
     # ---- pickup (pocket + money bag), drop, bury on the guest record ----
     res = TP.t1_success_paths(run, a, b)
     ck("X pickup POCKET / drop / pickup WALLET (money bag) / bury ran against guest records (TP T1 matrix, guests as actor and observer)", res is not None)
@@ -492,6 +531,85 @@ def s_transactions(run, a, tok):
     ck("X the host never logged an INTERNAL error", "*** INTERNAL" not in run.log())
     run.release(b)
     return a3
+
+
+def s_g1(run, a3):
+    """Guests G1: the NAME rules at the host (authority) and the independence of guests from residents. Nothing here creates a guest entry."""
+    ck = run.check
+    land_name, land_id = b"HOMETWN ", 0x5B01
+    pf0 = parse_guests(guests_path())
+    n_before = sum(1 for e in pf0["e"] if e["present"])
+    town = L.resolve_host_town(run.ip, run.port)
+
+    def refused(label, ident, needle):
+        off = len(run.log())
+        c, rej = run.attempt(run.guest(label, ident))
+        lg = run.log()[off:]
+        pf = parse_guests(guests_path())
+        ck("G %s: REFUSED (SERVER_FULL), logged '%s', no guest bound, no guest entry created" % (label, needle), c is None and rej is not None
+           and rej.reason == L.PC_NETGAME_REJECT_SERVER_FULL and needle in lg and "bound to GUEST" not in lg and sum(1 for e in pf["e"] if e["present"]) == n_before
+           and L.guest_pid_be(ident) not in {e["pid"] for e in pf["e"] if e["present"]})
+        return lg
+
+    # ---- a guest named like a RESIDENT (different player_id: not the same key, so only the name rule can stop it): any resident slot incl. the host's own ----
+    for slot, tag in ((run.r1, "resident 1"), (run.r2, "resident 2"), (run.r3, "resident 3"), (run.host_slot, "the host's own resident")):
+        pl = L.resident_player(slot)
+        refused("G-name-%s" % tag.replace(" ", ""), L.GuestIdentity(bytes(pl.player_name), (pl.player_id ^ 0x0101) & 0xFFFF or 0x4B01, land_name, land_id),
+                "the guest name equals the name of a resident of this town")
+    # ---- a guest named like ANOTHER guest of this town (guest B, slot 1) but with another key (other player_id, other home land) ----
+    gb = gid(1)
+    refused("G-name-dupguest", L.GuestIdentity(bytes(gb.player_name), 0x4B77, b"OTHERLND", 0x5C01), "the guest name is already used by another guest of this town")
+    # ... while the SAME key (a returning guest, token held) is unaffected by the rule (it is the same guest)
+    # ---- invalid names ----
+    bad = [("blank", b"        "), ("nul-inside", b"AB\x00     "), ("control-127", b"AB\x7f     "), ("message-tag-128", b"AB\x80     "),
+           ("newline-205", b"AB\xcd     "), ("unused-code-230", b"AB\xe6     "), ("all-wide-space", bytes([211]) * 8)]
+    for nm, raw in bad:
+        refused("G-invalid-%s" % nm, L.GuestIdentity(raw, 0x4B90, land_name, land_id), "not a valid game player name")
+    # ---- G1.1: the RESERVED observer name: refused for a new key, nothing created (the exact space padded 8 bytes only; the host refuses it for NEW keys / re-mints) ----
+    lg = refused("G-reserved-SERVER", L.GuestIdentity(b"SERVER  ", 0x4B93, land_name, land_id), "the guest name is RESERVED for the server observer")
+    ck("G (G1.1) the SERVER refusal minted no token: no IDENTITY_TOKEN / mint line in the refusal's log window", "token minted" not in lg)
+    c, rej = run.attempt(run.guest("G-invalid-nul-first", L.GuestIdentity(b"\x00BCDEFGH", 0x4B91, land_name, land_id)))
+    ck("G a name starting with NUL is refused as an invalid identity (the pre-existing key rule), nothing created", c is None and rej is not None
+       and sum(1 for e in parse_guests(guests_path())["e"] if e["present"]) == n_before)
+    # ---- A and B are independent characters (their stored first-contact records are each their own fresh record; B's appearance differs from A's when the hash says so) ----
+    ga, gb = gid(0), gid(1)
+    da, db = L.guest_fresh_derive(L.guest_pid_be(ga)), L.guest_fresh_derive(L.guest_pid_be(gb))
+    ck("G the two live test guests derive their own appearance from THEIR identity (A %s, B %s): deterministic, never a resident's or each other's by construction" % (da[:3], db[:3]),
+       da == L.guest_fresh_derive(L.guest_pid_be(ga)) and db == L.guest_fresh_derive(L.guest_pid_be(gb)))
+    # ---- the same key re-connecting with its token is NOT stopped by the name rule (it is the same guest); the connection also gets NO new MIGRATE (S section)
+    ck("G the host never logged an INTERNAL error during the name-rule checks", "*** INTERNAL" not in run.log())
+
+
+def check_residents_unchanged(results, snap_gci, gci_path, host_slot, host_log, require_write=True):
+    """After the whole guest session the disposable GCI's resident records of the NON-host residents and the four homes[] ownerIDs are byte-identical to the snapshot
+    (a guest never allocates / writes a private_data[] slot or a house)."""
+    ck = lambda d, c: L.check(d, bool(c), results)
+    base = L._GCI_PRIVATE_BASE - 0x20            # Save_t base inside the GCI
+    homes = base + 0x9CE8
+    with open(gci_path, "rb") as f:
+        now = f.read()
+    if require_write:
+        ck("G1-R the host WROTE the GCI during the run (so the byte comparison below is meaningful, not a no-op)", "GCI save: written successfully" in host_log)
+    else:
+        # Guests G1.1 phase R: a short host process may not save; the comparison is then against the file the EARLIER host processes of this run left (their writes are
+        # covered by the main run's own check, which required a write), so it still proves no guest session touched a resident record or a house
+        print("   INFO phase R host wrote the GCI: %s" % ("GCI save: written successfully" in host_log))
+    ck("G1-R the GCI keeps its size", len(now) == len(snap_gci))
+    same = [L.record_from_gci(snap_gci, i) == L.record_from_gci(now, i) for i in range(4) if i != host_slot]
+    ck("G1-R the %d non-host resident records (private_data[]) are byte-unchanged after all guest sessions" % len(same), same and all(same))
+    owners = [snap_gci[homes + h * 0x26B0:homes + h * 0x26B0 + 20] == now[homes + h * 0x26B0:homes + h * 0x26B0 + 20] for h in range(4)]
+    ck("G1-R the four homes[].ownerID are byte-unchanged (no house was allocated or released for a guest)", all(owners))
+    names = [bytes(L.resident_player(i).player_name) for i in range(4) if L.resident_player(i) is not None]
+    # NOT the whole file: a guest's FRIENDSHIP_REQUEST legitimately stores the guest's PersonalID in the villager memory (Animal memories, keyed by the guest key; part of
+    # the X section of this very run). What must never happen is a guest in a resident / house slot: scan exactly private_data[0..3] and homes[0..3].
+    priv_region = now[base + 0x20:base + 0x20 + 4 * 0x2440]
+    homes_region = now[homes:homes + 4 * 0x26B0]
+    hits = [(i, w) for i in range(8) for w, blob in (("private_data", priv_region), ("homes", homes_region))
+            if L.guest_pid_be(gid(i)) in blob or (b"GUEST" + bytes([0x41 + i])) in blob]
+    ck("G1-R no guest PersonalID / name appears in private_data[0..3] or homes[0..3] (guest slots live only in guests.dat; hits: %s)" % hits, not hits)
+    where = sorted({m.start() for i in range(8) for m in re.finditer(re.escape(L.guest_pid_be(gid(i))), now)})
+    print("   INFO guest PersonalID occurrences elsewhere in the GCI (villager memory written by the guests' FRIENDSHIP_REQUEST): offsets %s" % [hex(o) for o in where])
+    ck("G1-R the residents' PersonalIDs are still exactly the snapshot's (%d names)" % len(names), [L.record_from_gci(now, i)[:20] for i in range(4)] == [L.record_from_gci(snap_gci, i)[:20] for i in range(4)])
 
 
 def s_table_full(run, a3, tok):
@@ -688,6 +806,186 @@ def phase_m(args, results, ip, snap_gci, residents, host_slot):
         L.check("[M] host did not crash (exit code before stop: %s)" % rc, rc is None, results)
 
 
+def patch_guests(path, renames):
+    """Rewrite guests.dat (independent writer): entry slot -> GuestIdentity: the entry keeps its token / epoch / rev / confirmed / town identity / record tail, but its KEY
+    (and the PersonalID at the start of its record) becomes the given identity. This models 'the guest was admitted earlier under a name that is now taken'."""
+    pf = parse_guests(path)
+    ents = []
+    for i, e in enumerate(pf["e"]):
+        if not e["present"]:
+            ents.append(None)
+            continue
+        pid = L.guest_pid_be(renames[i]) if i in renames else e["pid"]
+        ents.append({"pid": pid, "token": e["token"], "epoch": e["epoch"], "rev": e["rev"], "age": e["age"], "confirmed": e["confirmed"], "town_name": e["town_land_name"],
+                     "town_id": e["town_land_id"], "town_hash": e["town_terrain_hash"], "record": pid + e["record"][20:]})
+    with open(path, "wb") as f:
+        f.write(build_guests(ents, gen=pf["gen"]))
+    return parse_guests(path)
+
+
+def s_r_seed(run, results):
+    """Stage 1 (own host process): four guests with ordinary names: slots 0 / 1 CONFIRMED + data-bearing, slots 2 / 3 UNCONFIRMED + data-less. Returns {i: token}."""
+    toks = {}
+    for i in (30, 31):
+        g = gid(i)
+        c = run.guest("R-seed%d" % i, g)
+        c.connect_and_ready(quiet=True)
+        tok = bytes(c.token_msgs[0][1].token)
+        run.release(c)
+        c2 = run.guest("R-seedc%d" % i, g, token=tok)
+        c2.connect_and_ready(quiet=True)
+        L.pump_sleep(0.6)
+        run.release(c2)
+        toks[i] = tok
+    for i in (32, 33):
+        c = run.guest("R-seedu%d" % i, gid(i), record_auto=False)
+        c.connect_and_ready(quiet=True)
+        toks[i] = bytes(c.token_msgs[0][1].token)
+        run.release(c)
+    return toks
+
+
+def s_r(run, ids, toks, stored):
+    """Stage 2: the host runs on the patched guests.dat. ids = {30: resident-named confirmed, 31: SERVER-named confirmed, 32: resident-named unconfirmed, 33: SERVER-named unconfirmed}."""
+    ck = run.check
+    KNOWN = L.PC_NETGAME_IDTOKEN_FLAG_KNOWN
+    pf = parse_guests(guests_path())
+    ck("R seed (patched guests.dat): slots 0 / 1 confirmed with data (rev >= 1), slots 2 / 3 unconfirmed rev 0; slot 0 / 2 carry a RESIDENT's name, slot 1 / 3 the reserved name",
+       [pf["e"][i]["confirmed"] for i in range(4)] == [1, 1, 0, 0] and pf["e"][0]["rev"] >= 1 and pf["e"][1]["rev"] >= 1 and pf["e"][2]["rev"] == 0 and pf["e"][3]["rev"] == 0
+       and pf["e"][0]["pid"][:8] == bytes(ids[30].player_name) and pf["e"][1]["pid"][:8] == b"SERVER  " and pf["e"][2]["pid"][:8] == bytes(ids[32].player_name)
+       and pf["e"][3]["pid"][:8] == b"SERVER  ")
+    # ---- (b) the returning CONFIRMED guest whose name equals a resident's is ADMITTED to its stored record ----
+    off = len(run.log())
+    a = run.guest("R-ret", ids[30], token=toks[30])
+    a.connect_and_ready(quiet=True)
+    lg = run.log()[off:]
+    push = a.rec_pushes[-1] if a.rec_pushes else None
+    ck("R a CONFIRMED returning guest (known key + valid token) whose name now equals a RESIDENT's is ADMITTED: IDENTITY_TOKEN KNOWN, slot 0, the same token, bound to its stored record",
+       a.identity_ack is not None and a.token_msgs and a.token_msgs[-1][1].flags == KNOWN and a.token_msgs[-1][1].guest_slot == 0 and bytes(a.token_msgs[-1][1].token) == toks[30]
+       and re.search(r"peer \d+ bound to GUEST slot 0 \(known guest: token verified;", lg) is not None)
+    ck("R ... the host LOGS that it admitted the guest although a resident carries its name (visible, not silent); nothing was refused",
+       "authenticated returning guest slot 0 is admitted although its name now equals a resident's name" in lg and "REFUSED" not in lg)
+    ck("R ... it is pushed its STORED record byte for byte (host wins), no MIGRATE_REQUEST, class GUEST",
+       push is not None and push["data"] == stored[0] and push["rsv"] == L.PC_NETGAME_REC_CLASS_GUEST and all(x.status != L.PC_NETGAME_REC_ACK_MIGRATE_REQUEST for _c, x in a.rec_acks))
+    L.pump_sleep(0.5)
+    ck("R ... and it STAYS connected (a world-ready revalidation does not close it for the name)", a.is_connected())
+    run.release(a)
+    # ---- the same key without / with a wrong token is still refused ----
+    off = len(run.log())
+    c1, rej1 = run.attempt(run.guest("R-notok", ids[30]))
+    c2, rej2 = run.attempt(run.guest("R-wrong", ids[30], token=bytes(b ^ 0x5A for b in toks[30])))
+    lg = run.log()[off:]
+    ck("R the same key WITHOUT a token / with a WRONG token is still REFUSED (confirmed entry: never re-minted)", c1 is None and c2 is None and rej1 is not None and rej2 is not None
+       and "presented WITHOUT a token" in lg and "presented a WRONG token" in lg and "re-minted" not in lg and "bound to GUEST" not in lg)
+    # ---- a NEW key with the resident's name is still refused ----
+    off = len(run.log())
+    pf0 = parse_guests(guests_path())
+    n0 = sum(1 for e in pf0["e"] if e["present"])
+    newres = L.GuestIdentity(bytes(ids[30].player_name), 0x4C11, bytes(ids[30].land_name), ids[30].land_id)
+    cn, rejn = run.attempt(run.guest("R-newres", newres))
+    pf1 = parse_guests(guests_path())
+    ck("R a NEW key carrying the RESIDENT's name is still REFUSED (SERVER_FULL), no guest entry, no token",
+       cn is None and rejn is not None and rejn.reason == L.PC_NETGAME_REJECT_SERVER_FULL and "the guest name equals the name of a resident of this town" in run.log()[off:]
+       and sum(1 for e in pf1["e"] if e["present"]) == n0 and L.guest_pid_be(newres) not in {e["pid"] for e in pf1["e"] if e["present"]})
+    # ---- the reserved name: a stored SERVER guest is admitted with its token, a NEW one is refused ----
+    off = len(run.log())
+    sv = run.guest("R-srv", ids[31], token=toks[31])
+    sv.connect_and_ready(quiet=True)
+    lg = run.log()[off:]
+    spush = sv.rec_pushes[-1] if sv.rec_pushes else None
+    ck("R a stored guest named SERVER (CONFIRMED, valid token) is still ADMITTED: KNOWN, slot 1, its stored record; logged as admitted despite the reserved name",
+       sv.identity_ack is not None and sv.token_msgs and sv.token_msgs[-1][1].flags == KNOWN and sv.token_msgs[-1][1].guest_slot == 1 and spush is not None and spush["data"] == stored[1]
+       and "authenticated returning guest slot 1 is admitted although its name now equals a resident's name or the reserved name" in lg)
+    run.release(sv)
+    off = len(run.log())
+    newsrv = L.GuestIdentity(b"SERVER  ", 0x4C12, bytes(ids[31].land_name), ids[31].land_id)
+    cs, rejs = run.attempt(run.guest("R-newsrv", newsrv))
+    pf2 = parse_guests(guests_path())
+    ck("R a NEW key named SERVER is REFUSED (RESERVED), no entry, no token", cs is None and rejs is not None and rejs.reason == L.PC_NETGAME_REJECT_SERVER_FULL
+       and "the guest name is RESERVED for the server observer" in run.log()[off:] and sum(1 for e in pf2["e"] if e["present"]) == n0
+       and L.guest_pid_be(newsrv) not in {e["pid"] for e in pf2["e"] if e["present"]})
+    off = len(run.log())
+    cs2, rejs2 = run.attempt(run.guest("R-srv-notok", ids[31]))
+    ck("R the stored SERVER guest's key WITHOUT its token is still refused (no squatting through the reserved name)", cs2 is None and rejs2 is not None
+       and "presented WITHOUT a token" in run.log()[off:])
+    # ---- mode 2: the unconfirmed data-less entries are effectively NEW identities: re-mint refused for a resident's / the reserved name, entries unchanged ----
+    off = len(run.log())
+    pf3 = parse_guests(guests_path())
+    for label, ident, needle in (("R-remint-res", ids[32], "the guest name equals the name of a resident of this town"),
+                                 ("R-remint-srv", ids[33], "the guest name is RESERVED for the server observer")):
+        o2 = len(run.log())
+        cr, rr = run.attempt(run.guest(label, ident, record_auto=False))
+        ck("R %s: an UNCONFIRMED data-less entry is NOT re-minted to a token-less claimant when its name is a resident's / reserved (refused, logged '%s', no token)" % (label, needle),
+           cr is None and rr is not None and needle in run.log()[o2:] and "re-minted" not in run.log()[o2:] and "bound to GUEST" not in run.log()[o2:])
+    pf4 = parse_guests(guests_path())
+    ck("R ... guests.dat is byte-for-byte unchanged by all the refusals (no token minted, nothing evicted, nothing created)", [(e["present"], e.get("token"), e.get("rev"), e.get("confirmed"), e.get("pid"))
+       for e in pf4["e"]] == [(e["present"], e.get("token"), e.get("rev"), e.get("confirmed"), e.get("pid")) for e in pf3["e"]])
+    ck("R the host is alive and never logged an INTERNAL error", run.host.alive() and "*** INTERNAL" not in run.log())
+
+
+def phase_r(args, results, ip, snap_gci, residents, host_slot):
+    """THIRD (seeding) and FOURTH (patched guests.dat) host processes."""
+    import glob
+    mp = os.path.join(L.GAME_BIN_DIR, SAVE_DIR_REL, "mp")
+    os.makedirs(mp, exist_ok=True)
+    for f in glob.glob(os.path.join(mp, "guests.dat*")):
+        os.remove(f)
+    r1 = L.resident_player(residents[0])
+    log2 = ""
+    toks = {}
+    # ---- stage 1: seed ----
+    host, ok = TP.start_host(ip, args.port + 2, "guestr1", HOST_EXTRA, results)
+    run = GRun(ip, args.port + 2, host, results, snap_gci, host_slot, residents[:3])
+    try:
+        if ok:
+            toks = s_r_seed(run, results)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        L.check("guest protocol phase R (seed) raised %r" % exc, False, results)
+    finally:
+        for cl in run.clients:
+            try:
+                cl.close()
+            except Exception:  # noqa: BLE001
+                pass
+        rc = host.stop()
+        L.check("[R1] host did not crash (exit code before stop: %s)" % rc, rc is None, results)
+    if len(toks) != 4:
+        L.check("phase R seeding produced four guests", False, results)
+        return
+    seeded = parse_guests(guests_path())
+    base = gid(30)
+    ids = {30: L.GuestIdentity(bytes(r1.player_name), gid(30).player_id, bytes(gid(30).land_name), gid(30).land_id),
+           31: L.GuestIdentity(b"SERVER  ", gid(31).player_id, bytes(gid(31).land_name), gid(31).land_id),
+           32: L.GuestIdentity(bytes(r1.player_name), gid(32).player_id, bytes(gid(32).land_name), gid(32).land_id),
+           33: L.GuestIdentity(b"SERVER  ", gid(33).player_id, bytes(gid(33).land_name), gid(33).land_id)}
+    L.check("R seeding: slots 0..3 hold guests 30..33 (confirmed, confirmed, unconfirmed, unconfirmed)", [e["pid"] for e in seeded["e"][:4]] == [L.guest_pid_be(gid(i)) for i in (30, 31, 32, 33)]
+            and [e["confirmed"] for e in seeded["e"][:4]] == [1, 1, 0, 0], results)
+    patched = patch_guests(guests_path(), {0: ids[30], 1: ids[31], 2: ids[32], 3: ids[33]})
+    stored = [patched["e"][0]["record"], patched["e"][1]["record"]]
+    # ---- stage 2: the patched table ----
+    host, ok = TP.start_host(ip, args.port + 3, "guestr2", HOST_EXTRA, results)
+    run = GRun(ip, args.port + 3, host, results, snap_gci, host_slot, residents[:3])
+    try:
+        if ok:
+            s_r(run, ids, toks, stored)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        L.check("guest protocol phase R raised %r" % exc, False, results)
+    finally:
+        for cl in run.clients:
+            try:
+                cl.close()
+            except Exception:  # noqa: BLE001
+                pass
+        rc = host.stop()
+        L.check("[R2] host did not crash (exit code before stop: %s)" % rc, rc is None, results)
+    log2 = run.log()
+    check_residents_unchanged(results, snap_gci, os.path.join(L.GAME_BIN_DIR, L.SAVE_GCI_REL), host_slot, log2, require_write=False)
+
+
 def run_main(args, results, ip, snap_gci):
     port = args.port
     host_slot = L.TEST_HOST_RESIDENT
@@ -707,6 +1005,7 @@ def run_main(args, results, ip, snap_gci):
         e = s_dup(run, a2, tok, exp2)
         s_resident_priority(run, e, tok)
         a3 = s_transactions(run, e, tok)
+        s_g1(run, a3)
         s_table_full(run, a3, tok)
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -720,7 +1019,9 @@ def run_main(args, results, ip, snap_gci):
                 pass
         rc = host.stop()
         L.check("host did not crash (exit code before stop: %s)" % rc, rc is None, results)
+    check_residents_unchanged(results, snap_gci, os.path.join(L.GAME_BIN_DIR, L.SAVE_GCI_REL), host_slot, run.log())
     phase_m(args, results, ip, snap_gci, residents, host_slot)
+    phase_r(args, results, ip, snap_gci, residents, host_slot)
 
 
 def main():

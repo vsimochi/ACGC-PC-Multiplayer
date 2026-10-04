@@ -804,3 +804,29 @@ int pc_mp_gtoken_put(PCMpGtkFile* f, const PCMpGtkEntry* e) {
     f->generation++;
     return i;
 }
+
+/* Guests G1: see pc_mp_guests.h (the guest NAME rule shared by the client's early check and the host's authority check). */
+int pc_mp_guests_name_valid(const uint8_t* name) {
+    int k, content = 0;
+    if (name == NULL) {
+        return 0;
+    }
+    for (k = 0; k < PC_MP_GUEST_NAME_LEN; k++) {
+        const uint8_t ch = name[k];
+        if (ch == 0u || ch == 127u || ch == 128u || ch == 205u || ch > 222u) {
+            return 0;
+        }
+        if (ch != 32u && ch != 210u && ch != 211u) {
+            content = 1;
+        }
+    }
+    return content;
+}
+
+/* Guests G1.1: see pc_mp_guests.h (the reserved observer name; exact 8-byte comparison, shared by the client's early check and the host's authority check). */
+int pc_mp_guests_name_reserved(const uint8_t* name) {
+    if (name == NULL) {
+        return 0;
+    }
+    return memcmp(name, PC_MP_GUEST_RESERVED_NAME, PC_MP_GUEST_NAME_LEN) == 0;
+}

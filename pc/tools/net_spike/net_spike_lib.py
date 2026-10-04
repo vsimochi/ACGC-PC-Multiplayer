@@ -3778,9 +3778,10 @@ GuestIdentity = namedtuple("GuestIdentity", "player_name player_id land_name lan
 
 
 def guest_identity(name="GUESTA", player_id=0x4A01, land="HOMETWN", land_id=0x5B01):
-    """A guest whose HOME town is not the test town (the default land / ids never equal the fixture's resident or town ids)."""
-    return GuestIdentity(bytes(name.encode("ascii") if isinstance(name, str) else name)[:8].ljust(8, b"\x00"), player_id,
-                         bytes(land.encode("ascii") if isinstance(land, str) else land)[:8].ljust(8, b"\x00"), land_id)
+    """A guest whose HOME town is not the test town (the default land / ids never equal the fixture's resident or town ids). Names are SPACE
+    padded like every vanilla name and like the real client's --bootstrap-guest (Guests G1: the host refuses a name with NUL bytes)."""
+    return GuestIdentity(bytes(name.encode("ascii") if isinstance(name, str) else name)[:8].ljust(8, b" "), player_id,
+                         bytes(land.encode("ascii") if isinstance(land, str) else land)[:8].ljust(8, b" "), land_id)
 
 
 def guest_pid_be(g):
@@ -3793,11 +3794,139 @@ def guest_player(g):
     return PlayerIdentity(bytes(g.player_name)[:8].ljust(8, b"\x00"), g.player_id & 0xFFFF, 1)
 
 
-def guest_record(g, base_slot=1, bin_dir=None, base=None):
-    """A LEGAL guest record image: a resident record of the test GCI (default slot 1) re-keyed to the guest's home PersonalID
-    (player_ID replaced, exists stays 1, every other field a field the validators already accept)."""
+def guest_record(g, base_slot=None, bin_dir=None, base=None):
+    """The record a GUEST client uploads at its first contact (the 'local record' of a scripted guest).
+    Guests G1: a FRESH character -- fresh_guest_record(...) -- NEVER a copy of a resident. Only an explicit `base` (or `base_slot`, a resident record of the test
+    GCI) re-keys a resident record to the guest's home PersonalID: explicit test data for a test that really wants a populated record, never the default."""
+    if base is None and base_slot is None:
+        return fresh_guest_record_for(g)
     rec = base if base is not None else record_from_gci(bin_dir or GAME_BIN_DIR, base_slot)
     return guest_pid_be(g) + bytes(rec)[20:]
+
+
+# --- Guests G1: the FRESH guest record (python mirror of pc_m_card.c pc_guest_build_fresh_record) ----------------------------
+# C: mPr_ClearPrivateInfo + mPr_InitPrivateInfo, then the home PersonalID, exists = 1, reset_code = 0, gender / face / starter shirt (given, or derived from the
+# identity hash), default designs. Offsets are the canonical BE image (RECORD_FIELD_RANGES / include/m_private.h). The vanilla "empty" markers are written
+# explicitly here (a marker is NOT zero for: PersonalIDs 0xFFFF / space names, quests type 3, letters font 0xFF, birthday 0xFFFF.., remail, animal memory, ...).
+REC_OFF_GENDER = 0x0014
+REC_OFF_FACE = 0x0015
+REC_OFF_DELIVERIES = 0x0094         # 15 x 0x28
+REC_OFF_ERRANDS = 0x02EC            # 5 x 0x58
+REC_OFF_SAVED_MAIL_HEADER = 0x04A6  # 0x3A
+REC_OFF_BACKGROUND = 0x1084         # BE u16 (ITM_CLOTH226 = 0x24E2)
+REC_OFF_HINT_COUNT = 0x1087
+REC_OFF_CLOTH_IDX = 0x1088          # BE u16
+REC_OFF_CLOTH_ITEM = 0x108A         # BE u16
+REC_OFF_STORED_ANM = 0x108C         # AnmPersonalID 0xE
+REC_OFF_BIRTHDAY = 0x10A4           # year BE u16 + month + day
+REC_OFF_REMAIL = 0x10DC             # 0x16
+REC_OFF_ANIMAL_MEMORY = 0x10F8      # 0xA
+REC_OFF_CATALOG = 0x1108            # furniture[43] wall[3] carpet[3] paper[2] music[2] BE u32 bitfields (0x1108 .. 0x11DC)
+REC_OFF_MAPS = 0x11DC               # 8 x 0xA
+REC_OFF_MY_ORG = 0x1240             # 8 x 0x220 (name[16], palette, flag, pad, texture at +0x20 (0x200))
+REC_MY_ORG_SIZE = 0x220
+REC_OFF_ORG_TABLE = 0x2340
+REC_OFF_STATE_FLAGS = 0x2348        # BE u32
+REC_OFF_CALENDAR = 0x234C
+ITM_CLOTH_START = 0x2400
+ITM_CLOTH226 = ITM_CLOTH_START + 226
+FACE_TYPE_NUM = 8
+SEX_MALE, SEX_FEMALE = 0, 1
+FRESH_LOAN = 100                    # mPr_InitPrivateInfo: the vanilla pre-house loan value
+DESIGN_PALETTES = (0, 8, 7, 7, 0, 0, 0, 0)   # mNW_InitMyOriginalPallet
+DEFAULT_DESIGN_COUNT = 4                      # mNW_DEFAULT_ORIGINAL_TEX_NUM: names / textures from ROM / ARAM (not reproducible here)
+
+
+def _anm_pid_clear():
+    """mNpc_ClearAnimalPersonalID: npc_id 0, land_id 0xFFFF, land name spaces, name_id 0xFF, looks mNpc_LOOKS_UNSET (6)."""
+    return struct.pack(">HH", 0, 0xFFFF) + b"\x20" * 8 + bytes([0xFF, 6])
+
+
+def _pid_clear():
+    """mPr_ClearPersonalID (canonical BE): name / land names spaces, player_id 0xFFFF, land_id 0xFFFF."""
+    return b"\x20" * 16 + struct.pack(">HH", 0xFFFF, 0xFFFF)
+
+
+def guest_fresh_derive(pid_be):
+    """(gender, face, shirt_item, cloth_idx) a guest gets when the arguments do not give them: FNV-1a32 of the canonical 20-byte PersonalID (name[8], land[8],
+    player_id BE, land_id BE), gender = bit 31, face = bits 16..18, shirt index = bits 8..10 inside the gender's 8-shirt table (boys ITM_CLOTH000.., girls ITM_CLOTH008..)."""
+    h = fnv1a32(bytes(pid_be))
+    gender = (h >> 31) & 1
+    face = (h >> 16) & 7
+    item = ITM_CLOTH_START + (8 if gender == SEX_FEMALE else 0) + ((h >> 8) & 7)
+    return gender, face, item, item - ITM_CLOTH_START
+
+
+def fresh_guest_record(name, land, player_id, land_id, gender=None, face=None, default_designs=None):
+    """The 0x2440-byte canonical BE image of a FRESH guest character (what pc_guest_build_fresh_record leaves in the passport): the vanilla empty record of
+    mPr_ClearPrivateInfo + mPr_InitPrivateInfo with the guest's HOME PersonalID, exists = 1, reset_code = 0, gender / face (given, else derived from the identity),
+    a starter shirt of that gender (derived), NO starter bag (pockets / wallet / bank empty), loan 100, empty letters / quests / catalog.
+    `default_designs` = the 4 x 0x220 bytes of the default Able Sisters designs 0..3 (their names and textures come from ROM / ARAM in C and cannot be
+    derived here: a test passes the bytes of a vanilla resident's my_org[0..3] as the oracle); None leaves their name / texture zero (palettes are set)."""
+    nm = bytes(name.encode("ascii") if isinstance(name, str) else name)[:8].ljust(8, b" ")
+    ln = bytes(land.encode("ascii") if isinstance(land, str) else land)[:8].ljust(8, b" ")
+    pid = nm + ln + struct.pack(">HH", player_id & 0xFFFF, land_id & 0xFFFF)
+    dg, df, item, idx = guest_fresh_derive(pid)
+    if gender is None:
+        gender = dg
+    if face is None:
+        face = df
+    if gender != dg and gender in (SEX_MALE, SEX_FEMALE):
+        # the shirt index stays the derived one, inside the table of the GIVEN gender
+        item = ITM_CLOTH_START + (8 if gender == SEX_FEMALE else 0) + (item - ITM_CLOTH_START) % 8
+        idx = item - ITM_CLOTH_START
+    r = bytearray(PC_NETGAME_REC_SIZE)
+    r[0:20] = pid
+    r[REC_OFF_GENDER] = gender & 0xFF
+    r[REC_OFF_FACE] = face & 0xFF
+    struct.pack_into(">I", r, REC_OFF_LOAN, FRESH_LOAN)
+    for i in range(15):                                         # mQst_ClearDelivery
+        o = REC_OFF_DELIVERIES + i * 0x28
+        r[o] = 0xC0                                             # quest_type = none (3), canonical BE bitfield byte
+        r[o + 0x0C:o + 0x1A] = _anm_pid_clear()
+        r[o + 0x1A:o + 0x28] = _anm_pid_clear()
+    for i in range(5):                                          # mQst_ClearErrand
+        o = REC_OFF_ERRANDS + i * 0x58
+        r[o] = 0xC0
+        r[o + 0x0C:o + 0x1A] = _anm_pid_clear()
+        r[o + 0x1A:o + 0x28] = _anm_pid_clear()
+        r[o + 0x2A] = 0xF8                                      # pockets_idx = -1, errand_type = none
+    r[REC_OFF_SAVED_MAIL_HEADER] = 0xFF                         # mMl_clear_mail_header_common
+    r[REC_OFF_SAVED_MAIL_HEADER + 2:REC_OFF_SAVED_MAIL_HEADER + 0x3A] = b"\x20" * 0x38
+    for i in range(REC_MAIL_COUNT):                             # mMl_clear_mail_box
+        o = REC_OFF_MAIL + i * REC_MAIL_SIZE
+        r[o:o + 0x14] = _pid_clear()
+        r[o + 0x14] = 0xFF
+        r[o + 0x16:o + 0x2A] = _pid_clear()
+        r[o + 0x2A] = 0xFF
+        r[o + 0x2E] = 0xFF                                      # content.font = -1 (unused letter)
+        r[o + 0x32:o + 0x12A] = b"\x20" * (24 + 192 + 32)
+    struct.pack_into(">H", r, REC_OFF_BACKGROUND, ITM_CLOTH226)
+    r[REC_OFF_EXISTS] = 1
+    struct.pack_into(">HH", r, REC_OFF_CLOTH_IDX, idx, item)    # mPlib_change_player_cloth_info_lv2: idx = item - ITM_CLOTH_START
+    r[REC_OFF_STORED_ANM:REC_OFF_STORED_ANM + 14] = _anm_pid_clear()
+    r[REC_OFF_BIRTHDAY:REC_OFF_BIRTHDAY + 4] = b"\xFF\xFF\xFF\xFF"   # mPr_ClearPrivateBirthday
+    r[REC_OFF_REMAIL:REC_OFF_REMAIL + 0x16] = b"\xFF\xFF\xFF\xFF" + b"\x20" * 16 + bytes([0xFE, 0x00])   # mNpc_ClearRemail (cond 0, looks 0x7F)
+    r[REC_OFF_ANIMAL_MEMORY:REC_OFF_ANIMAL_MEMORY + 10] = b"\xFF\xFF" + b"\x20" * 8
+    for i in range(8):                                          # mPr_ClearMapInfo
+        r[REC_OFF_MAPS + i * 10:REC_OFF_MAPS + i * 10 + 8] = b"\x20" * 8
+    for i in range(8):                                          # my_org_no_table + the default designs
+        r[REC_OFF_ORG_TABLE + i] = i
+        o = REC_OFF_MY_ORG + i * REC_MY_ORG_SIZE
+        r[o + 0x10] = DESIGN_PALETTES[i]
+        if i >= DEFAULT_DESIGN_COUNT:                           # mNW_InitOriginalData: 'blank' + 0xFF texture, palette 0
+            r[o:o + 16] = b"blank           "
+            r[o + 0x20:o + 0x220] = b"\xFF" * 0x200
+    if default_designs is not None:
+        assert len(default_designs) == DEFAULT_DESIGN_COUNT * REC_MY_ORG_SIZE
+        r[REC_OFF_MY_ORG:REC_OFF_MY_ORG + DEFAULT_DESIGN_COUNT * REC_MY_ORG_SIZE] = default_designs
+    struct.pack_into(">I", r, REC_OFF_STATE_FLAGS, 1)           # mPr_ClearPrivateInfo: state_flags = 1
+    return bytes(r)
+
+
+def fresh_guest_record_for(g, **kw):
+    """fresh_guest_record() for a GuestIdentity (the helper the scripted guest clients use)."""
+    return fresh_guest_record(bytes(g.player_name), bytes(g.land_name), g.player_id, g.land_id, **kw)
 
 
 def guest_blank_record(g):

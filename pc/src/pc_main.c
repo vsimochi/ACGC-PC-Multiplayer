@@ -521,9 +521,10 @@ static int pc_parse_txn_fault(const char* spec) {
  * pc_m_card.c/pc_vi.c can read it without any new coupling to pc_main.c. */
 int g_pc_bootstrap_resident = -1;
 
-/* Guests G2: --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID (TEST-ONLY, default OFF, CLIENT role only). Non-interactively makes this process a
+/* Guests G2: --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]] (TEST-ONLY, default OFF, CLIENT role only). Non-interactively makes this process a
  * GUEST (a foreigner whose HOME PersonalID is the given one: name <= 8 chars, land <= 8 chars, ids decimal or 0x hex) visiting the town it
- * loaded -- the state a train arrival produces -- and spawns it at the station. See pc_m_card.c's pc_bootstrap_guest_poll(). NULL = off. */
+ * loaded -- the state a train arrival produces -- and spawns it at the station. Guests G1: a FRESH character (never a resident clone); the optional
+ * GENDER (0|1) / FACE (0..7) are derived deterministically from the identity when omitted. See pc_m_card.c's pc_bootstrap_guest_poll(). NULL = off. */
 const char* g_pc_bootstrap_guest = NULL;
 
 /* --host-observer (opt-in, HOST role only): the host plays NO resident. It binds a hidden, inert, static observer identity (outside
@@ -593,10 +594,13 @@ int main(int argc, char* argv[]) {
             printf("                      nothing, uses SDL's dummy audio driver, keeps the console on and reads commands from stdin:\n");
             printf("                      help, status, players, save, stop (Ctrl+C also stops gracefully). Default off; plain --host,\n");
             printf("                      --host-observer and --bootstrap-resident are unchanged. See pc_dedicated.h.\n");
-            printf("  --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID  TEST-ONLY, CLIENT role only, default off:\n");
-            printf("                      become a GUEST (foreigner with that HOME PersonalID, the record of\n");
-            printf("                      the first existing resident of the loaded town as a template) in the\n");
-            printf("                      loaded town and spawn at the station; no save is ever written.\n");
+            printf("  --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]  TEST-ONLY, CLIENT role only, default off:\n");
+            printf("                      become a GUEST (foreigner with that HOME PersonalID) in the loaded town\n");
+            printf("                      and spawn at the station; no save is ever written. The guest is a FRESH\n");
+            printf("                      character (empty pockets / wallet, never a copy of a resident). Optional\n");
+            printf("                      GENDER (0 male, 1 female) and FACE (0..7); omitted values are derived\n");
+            printf("                      deterministically from the identity. The name must be a valid game name\n");
+            printf("                      and must not equal a resident's name (otherwise exit code 2).\n");
             printf("                      See pc_m_card.c pc_bootstrap_guest_poll().\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
             printf("                      not a one-shot test hook): activates the host-authoritative\n");
@@ -832,6 +836,10 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--bootstrap-guest") == 0 && i + 1 < argc) {
             g_pc_bootstrap_guest = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "--bootstrap-guest") == 0) {
+            /* Guests G1.1: the option is the last argument (no spec follows): never silently ignored */
+            fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: the option needs a spec argument NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]\n");
+            return 2;
         } else if (strcmp(argv[i], "--host-observer") == 0) {
             g_pc_host_observer = 1;
         } else if (strcmp(argv[i], "--dedicated") == 0) {
@@ -925,6 +933,15 @@ int main(int argc, char* argv[]) {
     if (g_pc_bootstrap_guest != NULL && (g_pc_net_role != 2 || g_pc_bootstrap_resident >= 0)) {
         fprintf(stderr, "[NET][GUEST][TEST-ONLY] REFUSED: --bootstrap-guest is a CLIENT-only test hook (use it together with --connect) and cannot be combined with --bootstrap-resident\n");
         return 2;
+    }
+
+    /* Guests G1.1: validate the guest spec NOW (before any window / network / save work): every bad part gets a stderr diagnostic and exit status 2. */
+    if (g_pc_bootstrap_guest != NULL) {
+        extern int pc_bootstrap_guest_validate(const char* spec); /* pc_m_card.c */
+        if (!pc_bootstrap_guest_validate(g_pc_bootstrap_guest)) {
+            fflush(stdout);
+            return 2;
+        }
     }
 
     /* --dedicated: HOST-only; incompatible with --connect, --bootstrap-resident, --bootstrap-guest and the SAME host-self test hooks --host-observer refuses.

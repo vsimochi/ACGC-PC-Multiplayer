@@ -34,6 +34,9 @@
 #include "lb_rtc.h"
 #include "game.h"
 #include "pc_net_game.h"
+#include "pc_mp_guests.h" /* Guests G1: pc_mp_guests_name_valid() (the guest NAME rule shared with the host) */
+#include "m_string.h"   /* Guests G1: mString_Load_StringFromRom (default design names) */
+#include "jsyswrap.h"   /* Guests G1: _JW_GetResourceAram (default design textures) */
 /* OBSERVER-BEGIN */
 #include "pc_host_observer.h"
 #include "pc_log.h"
@@ -1220,18 +1223,32 @@ void pc_bootstrap_resident_poll(void) {
     PC_LOG(PCL_PLAYERS, "bootstrap resident %d bound\n", player_no);
 }
 
-/* Guests G2: parses "NAME,LAND,PLAYER_ID,LAND_ID" (NAME / LAND 1..8 chars, space padded like every vanilla name; ids decimal or 0x hex, 1..0xFFFE). */
-static int pc_guest_parse_spec(const char* spec, PersonalID_c* out) {
+/* Guests G2: parses "NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]" (NAME / LAND 1..8 chars, space padded like every vanilla name; ids decimal or 0x hex, 1..0xFFFE).
+ * Guests G1: the OPTIONAL trailing GENDER (0 = male, 1 = female: mPr_SEX_MALE / mPr_SEX_FEMALE) and FACE (0..7: mPr_FACE_TYPE0..7) are returned through
+ * *gender_out / *face_out, -1 = not given (an empty field also means "not given": the value is then derived from the guest identity).
+ * Guests G1.1: on failure returns 0 and, when `why` is not NULL, points *why at a static string naming WHICH part of the spec is wrong. */
+static int pc_guest_parse_spec(const char* spec, PersonalID_c* out, int* gender_out, int* face_out, const char** why) {
     char buf[96];
-    char* tok[4];
+    char* tok[6];
     char* p;
     int n = 0;
     unsigned long pid, lid;
     char* end;
     size_t len;
     size_t k;
+    const char* dummy_why;
 
-    if (spec == NULL || strlen(spec) >= sizeof(buf)) {
+    if (why == NULL) {
+        why = &dummy_why;
+    }
+    *gender_out = -1;
+    *face_out = -1;
+    if (spec == NULL) {
+        *why = "no spec given";
+        return 0;
+    }
+    if (strlen(spec) >= sizeof(buf)) {
+        *why = "the spec is too long (limit 95 characters)";
         return 0;
     }
     strcpy(buf, spec);
@@ -1240,18 +1257,25 @@ static int pc_guest_parse_spec(const char* spec, PersonalID_c* out) {
     while (*p != '\0') {
         if (*p == ',') {
             *p = '\0';
-            if (n >= 4) {
+            if (n >= 6) {
+                *why = "too many fields (at most 6: NAME,LAND,PLAYER_ID,LAND_ID,GENDER,FACE; extra fields are not allowed)";
                 return 0;
             }
             tok[n++] = p + 1;
         }
         p++;
     }
-    if (n != 4) {
+    if (n < 4) {
+        *why = "wrong field count (need 4..6 comma-separated fields: NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]])";
         return 0;
     }
     len = strlen(tok[0]);
-    if (len < 1 || len > PLAYER_NAME_LEN) {
+    if (len < 1) {
+        *why = "NAME is empty (1..8 characters required)";
+        return 0;
+    }
+    if (len > PLAYER_NAME_LEN) {
+        *why = "NAME is too long (1..8 characters allowed)";
         return 0;
     }
     memset(out->player_name, ' ', PLAYER_NAME_LEN);
@@ -1259,7 +1283,12 @@ static int pc_guest_parse_spec(const char* spec, PersonalID_c* out) {
         out->player_name[k] = (u8)tok[0][k];
     }
     len = strlen(tok[1]);
-    if (len < 1 || len > LAND_NAME_SIZE) {
+    if (len < 1) {
+        *why = "LAND (the home town name) is empty (1..8 characters required)";
+        return 0;
+    }
+    if (len > LAND_NAME_SIZE) {
+        *why = "LAND (the home town name) is too long (1..8 characters allowed)";
         return 0;
     }
     memset(out->land_name, ' ', LAND_NAME_SIZE);
@@ -1268,33 +1297,178 @@ static int pc_guest_parse_spec(const char* spec, PersonalID_c* out) {
     }
     pid = strtoul(tok[2], &end, 0);
     if (*tok[2] == '\0' || *end != '\0' || pid == 0 || pid >= 0xFFFFul) {
+        *why = "bad PLAYER_ID (a decimal or 0x-hex number in 1..0xFFFE)";
         return 0;
     }
     lid = strtoul(tok[3], &end, 0);
     if (*tok[3] == '\0' || *end != '\0' || lid == 0 || lid >= 0xFFFFul) {
+        *why = "bad LAND_ID (a decimal or 0x-hex number in 1..0xFFFE)";
         return 0;
     }
     out->player_id = (u16)pid;
     out->land_id = (u16)lid;
+    if (n >= 5 && *tok[4] != '\0') {
+        unsigned long gv = strtoul(tok[4], &end, 10);
+        if (*end != '\0' || gv > (unsigned long)mPr_SEX_FEMALE) {
+            *why = "bad GENDER (must be 0 = male or 1 = female, or empty)";
+            return 0;
+        }
+        *gender_out = (int)gv;
+    }
+    if (n >= 6 && *tok[5] != '\0') {
+        unsigned long fv = strtoul(tok[5], &end, 10);
+        if (*end != '\0' || fv >= (unsigned long)mPr_FACE_TYPE_NUM) {
+            *why = "bad FACE (must be 0..7, or empty)";
+            return 0;
+        }
+        *face_out = (int)fv;
+    }
     return 1;
+}
+
+/* Guests G1.1: every spec-only rule a guest must satisfy, in one place (used by the early validator AND, as defence in depth, by pc_bootstrap_guest_poll).
+ * Beyond the syntax (pc_guest_parse_spec): a real game name (pc_mp_guests_name_valid, the host's own rule), not the RESERVED observer name
+ * (pc_mp_guests_name_reserved), and an identity the host would not reject as invalid (the same tests as pcnetgame_guest_key_valid: first byte of name and
+ * land non-NUL, player_id / land_id != 0xFFFF). Returns 1 = fine, else 0 with *why naming the problem. The resident-name rule needs the loaded save and
+ * stays in pc_bootstrap_guest_poll (and on the host). */
+static int pc_guest_spec_check(const char* spec, PersonalID_c* home, int* gender_out, int* face_out, const char** why) {
+    if (!pc_guest_parse_spec(spec, home, gender_out, face_out, why)) {
+        return 0;
+    }
+    if (home->player_name[0] == 0 || home->land_name[0] == 0 || home->player_id == 0xFFFFu || home->land_id == 0xFFFFu) {
+        *why = "the identity is not a valid PersonalID (empty name / land or an id of 0xFFFF)";
+        return 0;
+    }
+    if (!pc_mp_guests_name_valid(home->player_name)) {
+        *why = "NAME is not a valid game player name (blank, or a character the name entry cannot produce)";
+        return 0;
+    }
+    if (pc_mp_guests_name_reserved(home->player_name)) {
+        *why = "NAME 'SERVER' is reserved for the server observer (a guest cannot take it)";
+        return 0;
+    }
+    return 1;
+}
+
+/* Guests G1.1: the EARLY --bootstrap-guest validator, called from pc_main.c right after option parsing (before any window / network / save work).
+ * Returns 1 = the spec is acceptable, 0 = a diagnostic naming the wrong part was printed to stderr and the caller must exit with status 2. */
+int pc_bootstrap_guest_validate(const char* spec) {
+    PersonalID_c home;
+    int g, f;
+    const char* why = "unknown";
+    if (pc_guest_spec_check(spec, &home, &g, &f, &why)) {
+        return 1;
+    }
+    fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: bad spec '%s': %s (expected NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]])\n", spec != NULL ? spec : "(null)", why);
+    fflush(stderr);
+    return 0;
+}
+
+/* Guests G1: the FRESH guest character. A new guest is its own independent character, never a copy of a resident.
+ *  - identity hash: FNV-1a32 over the canonical 20-byte PersonalID image (name[8], land[8], player_id BE, land_id BE: independent of the host byte order, so the
+ *    python test double mirrors it). Everything the guest does not choose is derived from it DETERMINISTICALLY (never from the client RNG, never from a resident):
+ *    gender = bit 31, face = bits 16..18, starter shirt index = bits 8..10 (within the gender's 8-shirt table).
+ *  - pc_guest_build_fresh_record(): mPr_ClearPrivateInfo (the vanilla "empty" markers of every field: quests, letters, birthday, maps, museum, remail, animal
+ *    memory, starter shirt CLOTH001, inventory background CLOTH226, state_flags = 1; pockets / wallet / bank / catalog / calendar / lotto are zero = EMPTY_NO / 0)
+ *    then mPr_InitPrivateInfo (exists = TRUE, loan = 100 (the vanilla pre-house value), my_org_no_table 0..7; it also stamps THIS town's land + a random 8-bit id
+ *    + a random shirt + a random face, and draws the client RNG: ALL of those are overwritten below, nothing random survives), then the guest's HOME PersonalID,
+ *    exists = TRUE, reset_code = 0, gender / face / starter shirt (the same explicit setter the vanilla code ends in: mPlib_change_player_cloth_info_lv2) and the
+ *    default Able Sisters designs. NO starter bag (vanilla's 1000-bell pocket is written by mSDI_StartInitNew*, which a guest never runs): a guest starts with
+ *    EMPTY pockets and an empty wallet. It reads Save_t only (mPr_InitPrivateInfo's face / id uniqueness scan) and writes ONLY `rec`. */
+static u32 pc_guest_identity_hash(const PersonalID_c* id) {
+    u32 h = 2166136261u;
+    int k;
+    for (k = 0; k < PLAYER_NAME_LEN; k++) {
+        h = (h ^ (u32)id->player_name[k]) * 16777619u;
+    }
+    for (k = 0; k < LAND_NAME_SIZE; k++) {
+        h = (h ^ (u32)id->land_name[k]) * 16777619u;
+    }
+    h = (h ^ (u32)((id->player_id >> 8) & 0xFFu)) * 16777619u;
+    h = (h ^ (u32)(id->player_id & 0xFFu)) * 16777619u;
+    h = (h ^ (u32)((id->land_id >> 8) & 0xFFu)) * 16777619u;
+    h = (h ^ (u32)(id->land_id & 0xFFu)) * 16777619u;
+    return h;
+}
+
+/* The default designs a vanilla new player gets (mNW_InitOneMyOriginal, which only knows Save_t's private_data[player_no] slots): the palette table, the
+ * ROM names and the ARAM default textures of the first mNW_DEFAULT_ORIGINAL_TEX_NUM designs, 'blank' for the rest -- written into `rec` instead. */
+static void pc_guest_init_designs(Private_c* rec) {
+    static const u8 pal_table[mPr_ORIGINAL_DESIGN_COUNT] = { 0, 8, 7, 7, 0, 0, 0, 0 };
+    int i;
+    for (i = 0; i < mPr_ORIGINAL_DESIGN_COUNT; i++) {
+        mNW_original_design_c* d = &rec->my_org[i];
+        if (i < mNW_DEFAULT_ORIGINAL_TEX_NUM) {
+            d->palette = pal_table[i];
+            mString_Load_StringFromRom(d->name, mNW_ORIGINAL_DESIGN_NAME_LEN, 0x6DF + i);
+            _JW_GetResourceAram(JW_GetAramAddress(27) + i * mNW_DESIGN_TEX_SIZE, d->design.data, mNW_DESIGN_TEX_SIZE);
+        } else {
+            mNW_InitOriginalData(d);
+        }
+    }
+}
+
+_Static_assert(mPr_SEX_MALE == 0 && mPr_SEX_FEMALE == 1 && mPr_FACE_TYPE_NUM == 8, "guest gender / face derivation assumes 2 genders and 8 faces");
+_Static_assert(ITM_CLOTH008 == ITM_CLOTH000 + 8 && ITM_CLOTH015 == ITM_CLOTH000 + 15, "starter shirts: boys ITM_CLOTH000..007, girls ITM_CLOTH008..015");
+
+static void pc_guest_build_fresh_record(Private_c* rec, const PersonalID_c* home, int gender, int face) {
+    const u32 h = pc_guest_identity_hash(home);
+    int shirt_idx = (int)((h >> 8) & 7u);
+
+    if (gender < 0) {
+        gender = (int)((h >> 31) & 1u);
+    }
+    if (face < 0) {
+        face = (int)((h >> 16) & 7u);
+    }
+    mPr_ClearPrivateInfo(rec);
+    mPr_InitPrivateInfo(rec);
+    mPr_CopyPersonalID(&rec->player_ID, (PersonalID_c*)home);
+    rec->exists = TRUE;
+    rec->reset_code = 0;
+    rec->gender = (s8)gender;
+    rec->face = (s8)face;
+    mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)(ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx));
+    pc_guest_init_designs(rec);
+}
+
+/* Guests G1: the vanilla guide2 rule "a new player's name must not equal a resident's name" (aNG2_check_pname), as a BOUNDED loop over private_data[0..3]
+ * (not aNG2_getP_other_pl_name, whose second loop runs out of bounds when no resident exists). Every slot holding a PersonalID counts, even an away resident.
+ * Returns the resident index whose name equals `home`'s, or -1. */
+static int pc_guest_resident_name_conflict(const PersonalID_c* home) {
+    int i;
+    for (i = 0; i < PLAYER_NUM; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        if (mPr_NullCheckPersonalID(p) == FALSE && memcmp(p->player_name, home->player_name, PLAYER_NAME_LEN) == 0) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /* Guests G2: --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID (see pc_main.c). TEST-ONLY, default off, CLIENT role only (refused otherwise): makes THIS process a
  * GUEST -- a foreigner whose HOME PersonalID is the given one -- in the town it loaded, the state a vanilla train arrival leaves (mCD_InitGameStart_bg,
  * start_cond INCOMING_FOREIGNER: now_private = the passport, player_no = mPr_FOREIGNER, mSDI_StartDataInit(.., MODE_PAK)), and spawns it at the station
  * exactly like the restart NPC's type 1 / 2 entry (aNPS2_make_door_data: SCENE_FG at (1979, 760), RIDE_OFF_DEMO, circle wipe). The passport is a COPY of
- * the first existing resident record of the loaded town, re-keyed to the guest's HOME PersonalID (a synthetic visitor: its pockets / wallet are that
- * resident's, which is what the host's first-contact MIGRATE then imports). Same one-shot / readiness preconditions as pc_bootstrap_resident_poll().
- * It NEVER arms pc_save_ready (a guest process can write no save at all), never touches Save_t's private_data[], and fires at most once per process. */
+ * Guests G1: a FRESH, independent character (pc_guest_build_fresh_record: vanilla empty markers via mPr_ClearPrivateInfo + mPr_InitPrivateInfo, the guest's HOME
+ * PersonalID, gender / face / starter shirt given or derived from the identity; empty pockets / wallet), NEVER a copy of a resident: that is what the host's
+ * first-contact MIGRATE imports. The name must be a valid game name and must not equal a resident's name of the loaded town (the host enforces the same rule
+ * for NEW guests, and more: pcnetgame_host_guest_check) and not be the reserved observer name: otherwise the process exits with code 2 before it connects as
+ * anything. EVERY failure after the readiness wait prints a diagnostic on stderr and exits 2 (never a silent return that would leave an unbound client
+ * running); pc_bootstrap_guest_validate() fails the same bad specs even earlier, before any window / network / save work. Same one-shot / readiness preconditions as
+ * pc_bootstrap_resident_poll(). It NEVER arms pc_save_ready (a guest process can write no save at all), never writes or even indexes Save_t's
+ * private_data[] in this function, and fires at most once per process. */
 void pc_bootstrap_guest_poll(void) {
     extern const char* g_pc_bootstrap_guest; /* pc_main.c; NULL = disabled (default) */
     static int l_done = 0;
     PersonalID_c home;
-    Private_c* tmpl = NULL;
     Private_c* pass;
     GAME_PLAY* play;
     Door_data_c door_data;
-    int i;
+    int opt_gender = -1;
+    int opt_face = -1;
+    int clash;
+    const char* bad_why = "unknown";
 
     if (l_done || g_pc_bootstrap_guest == NULL) {
         return;
@@ -1308,42 +1482,43 @@ void pc_bootstrap_guest_poll(void) {
     l_done = 1;
 
     if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
-        OSReport("[PC] --bootstrap-guest: refused (a CLIENT-only test hook)\n");
-        return;
+        fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: a CLIENT-only test hook (the process is not a client)\n");
+        fflush(stdout);
+        exit(2);
     }
     if (mFRm_CheckSaveData() == FALSE) {
-        OSReport("[PC] --bootstrap-guest: no valid town save is loaded\n");
-        return;
+        fprintf(stderr, "[PC] --bootstrap-guest: FAILED: no valid town save is loaded (a guest needs the town the client loaded)\n");
+        fflush(stdout);
+        exit(2);
     }
-    if (!pc_guest_parse_spec(g_pc_bootstrap_guest, &home)) {
-        OSReport("[PC] --bootstrap-guest: bad spec '%s' (expected NAME,LAND,PLAYER_ID,LAND_ID)\n", g_pc_bootstrap_guest);
-        return;
+    /* defence in depth: pc_main.c already ran pc_bootstrap_guest_validate() before anything started */
+    if (!pc_guest_spec_check(g_pc_bootstrap_guest, &home, &opt_gender, &opt_face, &bad_why)) {
+        fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: bad spec '%s': %s (expected NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]])\n", g_pc_bootstrap_guest, bad_why);
+        fflush(stdout);
+        exit(2);
     }
-    for (i = 0; i < PLAYER_NUM; i++) {
-        Private_c* p = Save_GetPointer(private_data[i]);
-        if (mPr_CheckPrivate(p) == TRUE && p->exists == TRUE) {
-            tmpl = p;
-            break;
-        }
-    }
-    if (tmpl == NULL) {
-        OSReport("[PC] --bootstrap-guest: the loaded town has no resident record to use as the passport template\n");
-        return;
+    clash = pc_guest_resident_name_conflict(&home);
+    if (clash >= 0) {
+        fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: the guest name '%.8s' equals the name of resident %d of this town (a guest must have its own name)\n",
+                (const char*)home.player_name, clash);
+        fflush(stdout);
+        exit(2);
     }
     memset(&l_mcd_foreigner_file, 0, sizeof(l_mcd_foreigner_file));
     pass = &l_mcd_foreigner_file.file.priv;
-    mPr_CopyPrivateInfo(pass, tmpl);
-    mPr_CopyPersonalID(&pass->player_ID, &home);
-    pass->exists = TRUE;
-    pass->reset_code = 0;
+    pc_guest_build_fresh_record(pass, &home, opt_gender, opt_face);
     l_mcd_foreigner_file.file.copy_protect = (u16)Common_Get(copy_protect);
+    OSReport("[PC] --bootstrap-guest: FRESH guest record (not a copy of any resident): gender=%d face=%d shirt=0x%04X (%s), empty pockets / wallet / letters\n",
+             (int)pass->gender, (int)pass->face, (unsigned)pass->cloth.item,
+             (opt_gender >= 0 || opt_face >= 0) ? "given / derived from the identity" : "derived from the identity");
 
     Common_Set(time.rtc_enabled, TRUE); /* see pc_bootstrap_resident_poll() */
     Common_Set(now_private, pass);
     Common_Set(player_no, mPr_FOREIGNER);
     if (mSDI_StartDataInit(gamePT, mPr_FOREIGNER, mSDI_INIT_MODE_PAK) != TRUE) {
-        OSReport("[PC] --bootstrap-guest: mSDI_StartDataInit failed\n");
-        return;
+        fprintf(stderr, "[PC] --bootstrap-guest: FAILED: mSDI_StartDataInit failed (the guest could not be bound)\n");
+        fflush(stdout);
+        exit(2);
     }
     /* pc_save_ready is deliberately NOT armed: this process can never write a save. */
 
@@ -1362,8 +1537,9 @@ void pc_bootstrap_guest_poll(void) {
     {
         int scene_res = goto_other_scene(play, &door_data, TRUE);
         if (scene_res != TRUE) {
-            OSReport("[PC] --bootstrap-guest: goto_other_scene to SCENE_FG (station) failed (res=%d)\n", scene_res);
-            return;
+            fprintf(stderr, "[PC] --bootstrap-guest: FAILED: goto_other_scene to SCENE_FG (station) failed (res=%d)\n", scene_res);
+            fflush(stdout);
+            exit(2);
         }
     }
     OSReport("[PC] --bootstrap-guest: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the station (SCENE_FG)\n",

@@ -11482,6 +11482,36 @@ static const char* pcnetgame_guest_key_conflict(const PersonalID_c* key) {
     return NULL;
 }
 
+/* Guests (G1 fresh record): the guest NAME rules, enforced here as the AUTHORITY (the client's early check in pc_bootstrap_guest_poll is only a fail-fast).
+ * Guests G1.1: these name rules judge NEW identities only (a new key, or the re-mint of an unconfirmed data-less entry): an AUTHENTICATED returning guest
+ * (known key + valid token) is never refused or closed because a resident later took its name (pcnetgame_host_guest_check, revalidate_bound_peers).
+ * A guest's name must not equal a RESIDENT's name of this town (the vanilla guide2 rule aNG2_check_pname, as a bounded loop over private_data[0..3]; an away
+ * resident counts too): without it a guest with another player_id but a resident's name would impersonate that resident in every name-keyed place (mail,
+ * speech, puppet label). Returns a reason string or NULL. */
+static const char* pcnetgame_guest_name_conflict_resident(const PersonalID_c* key) {
+    int i;
+    for (i = 0; i < PLAYER_NUM; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        if (mPr_NullCheckPersonalID(p) == FALSE && memcmp(p->player_name, key->player_name, PLAYER_NAME_LEN) == 0) {
+            return "the guest name equals the name of a resident of this town (a guest cannot take a resident's name)";
+        }
+    }
+    return NULL;
+}
+
+/* ... and (for a NEW key only) not the name of ANOTHER guest of THIS town in guests.dat (entries of other towns are inactive; the same key is the same guest).
+ * Existing entries are never re-judged here, so a guest admitted before this rule existed is not locked out. Returns a reason string or NULL. */
+static const char* pcnetgame_guest_name_conflict_guest(const PersonalID_c* key) {
+    int g;
+    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        if (s_guest[g].used && pcnetgame_town_equal(&s_guest[g].town, &s_host_town) && memcmp(&s_guest[g].key, key, sizeof(*key)) != 0 &&
+            memcmp(s_guest[g].key.player_name, key->player_name, PLAYER_NAME_LEN) == 0) {
+            return "the guest name is already used by another guest of this town";
+        }
+    }
+    return NULL;
+}
+
 static void pcnetgame_host_revalidate_bound_peers(void) {
     int i;
     int own_idx = pcnetgame_host_own_resident_idx();
@@ -11504,6 +11534,8 @@ static void pcnetgame_host_revalidate_bound_peers(void) {
                  * land is not this town's land" is re-applied against the town as it is now (the key conflict check below covers residents) */
                 why = "bound guest entry belongs to another town now, or its home land is this town's land";
             } else {
+                /* Guests G1.1: ONLY the identity-impersonation test (key == a resident PersonalID / house owner / the observer id). A resident that now
+                 * merely carries the guest's NAME does NOT close an authenticated bound guest: the name rules apply to NEW identities at admission only. */
                 why = pcnetgame_guest_key_conflict(&st->bound_pid);
             }
         } else if (own_idx >= 0 && st->bound_resident_idx == own_idx) {
@@ -13185,6 +13217,10 @@ static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityM
         pcnetgame_host_refuse_identity(peer, "guest claim: the home PersonalID is not a valid identity", 0);
         return 0;
     }
+    if (!pc_mp_guests_name_valid(key->player_name)) {
+        pcnetgame_host_refuse_identity(peer, "guest claim: the guest name is not a valid game player name (blank, or a character the name entry cannot produce)", 0);
+        return 0;
+    }
     if (ext->home_land_id == s_host_town.land_id && memcmp(ext->home_land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN) == 0) {
         pcnetgame_host_refuse_identity(peer, "guest claim: the guest's home land is this town's land (a guest comes from another town)", 0);
         return 0;
@@ -13194,6 +13230,8 @@ static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityM
         pcnetgame_host_refuse_identity(peer, why, 0);
         return 0;
     }
+    /* Guests G1.1 order: validity + home land + KEY conflict (true impersonation of a resident identity) apply to EVERY mode; then the known-key lookup and
+     * the token decision; the NAME rules (reserved observer name, a resident's name, another guest's name) only for NEW keys and for a mode-2 re-mint. */
     pcnetgame_guest_store_load();
     if (s_guest_untrusted) {
         pcnetgame_host_refuse_identity(peer, "guest admission disabled: guests.dat is UNTRUSTED (existed but unreadable); operator reset required", 0);
@@ -13204,6 +13242,13 @@ static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityM
         /* plain memcmp: the host's answer is the same refusal either way, so response timing carries nothing a remote peer can use */
         const int tok_ok = ext->token_present && memcmp(ext->token, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN) == 0;
         if (tok_ok) {
+            /* Guests G1.1: an AUTHENTICATED returning guest is admitted to its stored record whatever the name rules say today: a resident may have
+             * taken its name (or the reserved name rule may be newer than the entry) since it was admitted; it must not be locked out of its own record. */
+            if (pcnetgame_guest_name_conflict_resident(key) != NULL || pc_mp_guests_name_reserved(key->player_name)) {
+                printf("[NET][GUEST] host: peer %d: authenticated returning guest slot %d is admitted although its name now equals a resident's name or the reserved name "
+                       "(the name rules judge new identities only)\n", (int)peer, g);
+                PC_LOG(PCL_GUESTS, "returning guest slot %d admitted despite a resident / reserved name clash (peer %d)\n", g, (int)peer);
+            }
             *out_slot = g;
             *out_mode = 1;
             return 1;
@@ -13211,13 +13256,38 @@ static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityM
         if (pcnetgame_guest_entry_disposable(g)) {
             /* M1/M3: the entry was never confirmed by a client that stored its token and holds no accepted data, and no peer is bound to it: its
              * token may simply never have reached the real guest. The key owner (anyone claiming it: TOFU) gets a fresh token instead of a lock-out.
-             * A LIVE-bound entry never gets here: it is refused below, with no eviction of the live session. */
+             * A LIVE-bound entry never gets here: it is refused below, with no eviction of the live session. A re-mint is effectively a NEW identity
+             * (no proof of ownership, no data): the reserved-name and resident-name rules apply to it like to a new key. */
+            if (pc_mp_guests_name_reserved(key->player_name)) {
+                pcnetgame_host_refuse_identity(peer, "guest claim: the guest name is RESERVED for the server observer (a guest cannot take it)", 0);
+                return 0;
+            }
+            why = pcnetgame_guest_name_conflict_resident(key);
+            if (why != NULL) {
+                pcnetgame_host_refuse_identity(peer, why, 0);
+                return 0;
+            }
             *out_slot = g;
             *out_mode = 2;
             return 1;
         }
         pcnetgame_host_refuse_identity(peer, ext->token_present ? "known guest key presented a WRONG token"
                                                                 : "known guest key presented WITHOUT a token (a squatter cannot take over a known guest; the real guest must present its token)", 0);
+        return 0;
+    }
+    /* a NEW key (no entry in this town): the reserved observer name, a resident's name and another guest's name are all refused (no entry, no token) */
+    if (pc_mp_guests_name_reserved(key->player_name)) {
+        pcnetgame_host_refuse_identity(peer, "guest claim: the guest name is RESERVED for the server observer (a guest cannot take it)", 0);
+        return 0;
+    }
+    why = pcnetgame_guest_name_conflict_resident(key);
+    if (why != NULL) {
+        pcnetgame_host_refuse_identity(peer, why, 0);
+        return 0;
+    }
+    why = pcnetgame_guest_name_conflict_guest(key); /* ... and free among the guests of this town */
+    if (why != NULL) {
+        pcnetgame_host_refuse_identity(peer, why, 0);
         return 0;
     }
     if (ext->token_present) {

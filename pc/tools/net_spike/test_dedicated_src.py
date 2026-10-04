@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_dedicated_src.py - SOURCE AUDIT of the opt-in dedicated server mode (`--host --dedicated`). No game process.
 
-Reads the working-tree sources and `git show HEAD:<path>` / `git diff HEAD` (read-only). Checks:
+Reads the working-tree sources and `git show BASELINE_REF:<path>` / `git diff BASELINE_REF FEATURE_REF` (read-only; "HEAD" below means that baseline, see BASELINE_REF). Checks:
   F   flag: g_pc_dedicated defaults to 0 and is assigned only by the `--dedicated` argument branch; the dedicated validation block refuses (exit 2) without
       --host / with --connect / --bootstrap-resident / --bootstrap-guest / the SAME ten host-self hooks the observer refuses (the two lists are compared),
       then sets g_pc_host_observer = 1; there is exactly ONE observer init (pc_host_observer_poll), nothing in pc_dedicated.c re-implements or calls it
@@ -32,6 +32,13 @@ import net_spike_lib as L
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 MARKERS = ("dedicated", "DEDICATED")
+# BASELINE_REF is the PARENT of the dedicated-mode feature commit (FEATURE_REF = 3afc165): every "vs HEAD" in this audit really means "vs the code before the
+# dedicated mode". HEAD itself contains the feature since 3afc165 (and the working tree may carry later, unrelated work), so neither can be the baseline.
+#   * head(rel) = the file as it was BEFORE the dedicated mode (BASELINE_REF blob); the "unchanged vs baseline" checks compare the working tree's function
+#     bodies / files against it (current-behaviour checks stay on the working tree).
+#   * hunks(rel) = `git diff -U0 BASELINE_REF FEATURE_REF` = the dedicated commit's OWN change (diff-discipline checks), independent of later work.
+BASELINE_REF = "e310798"
+FEATURE_REF = "3afc165"
 
 
 def read(rel):
@@ -40,11 +47,11 @@ def read(rel):
 
 
 def head(rel):
-    return subprocess.run(["git", "-C", ROOT, "show", "HEAD:" + rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+    return subprocess.run(["git", "-C", ROOT, "show", BASELINE_REF + ":" + rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
 
 
 def hunks(rel):
-    d = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", "HEAD", "--", rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
+    d = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", BASELINE_REF, FEATURE_REF, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
     out, cur = [], None
     for ln in d.split("\n"):
         if ln.startswith("@@"):

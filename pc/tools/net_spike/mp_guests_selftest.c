@@ -175,6 +175,51 @@ int main(int argc, char** argv) {
     check("the path is save/mp/guests.dat (never .gci, never under card_a / card_b)", strcmp(PC_MP_GUESTS_PATH, "save/mp/guests.dat") == 0 &&
           strstr(PC_MP_GUESTS_PATH, "gci") == NULL && strstr(PC_MP_GUESTS_PATH, "card_") == NULL && strcmp(PC_MP_GUEST_TOKEN_PATH, "save/mp/guest_token.dat") == 0);
 
+    /* ---------- Guests G1: the guest NAME rule (shared by the client's early check and the host's authority check) ---------- */
+    {
+        static const uint8_t ok1[8] = { 'B', 'e', 'l', 'l', 'a', ' ', ' ', ' ' };
+        static const uint8_t ok8[8] = { 'A', 'n', 'g', 'e', 'l', 'i', 'c', 'a' };
+        static const uint8_t ok1c[8] = { 'Z', ' ', ' ', ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t okhigh[8] = { 222, ' ', ' ', ' ', ' ', ' ', ' ', ' ' };   /* the last printable font code */
+        static const uint8_t blank[8] = { ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t wide[8] = { 211, 211, 211, 211, 211, 211, 211, 211 };     /* CHAR_SPACE_3 only: still blank */
+        static const uint8_t mixed_blank[8] = { 32, 210, 211, 32, 210, 211, 32, 32 };
+        static const uint8_t nul_in[8] = { 'A', 'B', 0, ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t nul_first[8] = { 0, 'B', 'C', ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t ctl[8] = { 'A', 127, ' ', ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t tag[8] = { 'A', 128, ' ', ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t nl[8] = { 'A', 205, ' ', ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t unused[8] = { 'A', 223, ' ', ' ', ' ', ' ', ' ', ' ' };
+        static const uint8_t ff[8] = { 'A', 255, ' ', ' ', ' ', ' ', ' ', ' ' };
+        check("G1 name rule: 'Bella', an 8-character name, a 1-character name and the last printable code 222 are valid",
+              pc_mp_guests_name_valid(ok1) == 1 && pc_mp_guests_name_valid(ok8) == 1 && pc_mp_guests_name_valid(ok1c) == 1 && pc_mp_guests_name_valid(okhigh) == 1);
+        check("G1 name rule: an all-space name, an all-wide-space name and a mix of the three blank codes (32 / 210 / 211) are NOT valid (vanilla refuses an empty name)",
+              pc_mp_guests_name_valid(blank) == 0 && pc_mp_guests_name_valid(wide) == 0 && pc_mp_guests_name_valid(mixed_blank) == 0);
+        check("G1 name rule: NUL (inside or first), CHAR_CONTROL_CODE 127, CHAR_MESSAGE_TAG 128, CHAR_NEW_LINE 205 and the unused codes 223 / 255 are NOT valid",
+              pc_mp_guests_name_valid(nul_in) == 0 && pc_mp_guests_name_valid(nul_first) == 0 && pc_mp_guests_name_valid(ctl) == 0 && pc_mp_guests_name_valid(tag) == 0 &&
+              pc_mp_guests_name_valid(nl) == 0 && pc_mp_guests_name_valid(unused) == 0 && pc_mp_guests_name_valid(ff) == 0 && pc_mp_guests_name_valid(NULL) == 0);
+        check("G1 name rule: exactly 8 bytes are examined (PC_MP_GUEST_NAME_LEN)", PC_MP_GUEST_NAME_LEN == 8);
+        {
+            /* Guests G1.1: the reserved observer name: EXACT 8-byte "SERVER" + 2 spaces, nothing else (no case folding, no trimming, no prefix match) */
+            static const uint8_t r_ok[8] = { 'S', 'E', 'R', 'V', 'E', 'R', ' ', ' ' };
+            static const uint8_t r_lc[8] = { 'S', 'e', 'r', 'v', 'e', 'r', ' ', ' ' };
+            static const uint8_t r_lower[8] = { 's', 'e', 'r', 'v', 'e', 'r', ' ', ' ' };
+            static const uint8_t r_x[8] = { 'S', 'E', 'R', 'V', 'E', 'R', 'X', ' ' };
+            static const uint8_t r_short[8] = { 'S', 'E', 'R', 'V', 'E', ' ', ' ', ' ' };
+            static const uint8_t r_lead[8] = { ' ', 'S', 'E', 'R', 'V', 'E', 'R', ' ' };
+            static const uint8_t r_wide[8] = { 'S', 'E', 'R', 'V', 'E', 'R', 210, 211 };
+            static const uint8_t r_nul[8] = { 'S', 'E', 'R', 'V', 'E', 'R', 0, ' ' };
+            static const uint8_t r_tail[8] = { 'S', 'E', 'R', 'V', 'E', 'R', ' ', 'X' };
+            check("G1.1 reserved name: exactly \"SERVER  \" (6 letters + 2 spaces) is reserved, the macro is that literal, and it is itself a valid game name",
+                  pc_mp_guests_name_reserved(r_ok) == 1 && memcmp(PC_MP_GUEST_RESERVED_NAME, "SERVER  ", 8) == 0 && pc_mp_guests_name_valid(r_ok) == 1);
+            check("G1.1 reserved name: 'Server  ', 'server  ', 'SERVERX ', 'SERVE   ', ' SERVER ', 'SERVER'+wide blanks, 'SERVER'+NUL, 'SERVER X' are NOT reserved (exact comparison, not case-folded)",
+                  pc_mp_guests_name_reserved(r_lc) == 0 && pc_mp_guests_name_reserved(r_lower) == 0 && pc_mp_guests_name_reserved(r_x) == 0 && pc_mp_guests_name_reserved(r_short) == 0 &&
+                  pc_mp_guests_name_reserved(r_lead) == 0 && pc_mp_guests_name_reserved(r_wide) == 0 && pc_mp_guests_name_reserved(r_nul) == 0 && pc_mp_guests_name_reserved(r_tail) == 0 &&
+                  pc_mp_guests_name_reserved(blank) == 0 && pc_mp_guests_name_reserved(ok8) == 0);
+            check("G1.1 reserved name: NULL is not reserved", pc_mp_guests_name_reserved(NULL) == 0);
+        }
+    }
+
     /* ---------- serialize / parse ---------- */
     f = mkfile(7, 5);
     r = pc_mp_guests_serialize(f, buf, sizeof(buf));

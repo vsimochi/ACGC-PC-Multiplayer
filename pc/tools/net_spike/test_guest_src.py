@@ -95,9 +95,11 @@ def strip_observer(text):
     return re.sub(r"/\* OBSERVER-BEGIN \*/.*?/\* OBSERVER-END \*/\n?", "", text, flags=re.S)
 
 
-def head_function(name, path="pc/src/pc_net_game.c"):
+def head_function(name, path="pc/src/pc_net_game.c", strip=False):
     txt = subprocess.run(["git", "-C", ROOT, "show", "HEAD:" + path], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
     txt = txt.replace("\r\n", "\n")
+    if strip:
+        txt = strip_observer(txt)  # HEAD already contains the committed --host-observer blocks: compare like with like (both sides without them)
     f = functions(txt)
     return body(txt, f, name)
 
@@ -142,7 +144,7 @@ def main():
        and "&s_guest_rec[slot - PLAYER_NUM]" in fb("pcnetgame_rec_priv_ptr") and c.count("&s_guest_rec[") >= 4)
     ck("A s_guest_rec[] is addressed ONLY through the accessor, the guest table lifecycle functions (install / create / rollback) and nothing else",
        sorted({n for a, b, n in funcs if "s_guest_rec[" in c[a:b]}) == sorted(["pcnetgame_rec_priv_ptr", "pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create"]))
-    pinned = ["pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
+    pinned = ["pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
               "pcnetgame_mail_test_poke_museum", "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mail_test_seed_reply", "pcnetgame_mbox_refresh_resident",
               "pcnetgame_mbox_send", "pcnetgame_rec_gate", "pcnetgame_rec_priv_ptr", "pcnetgame_rec_resolve_slot", "pcnetgame_rec_slot", "pcnetgame_rec_store_build"]
@@ -228,11 +230,12 @@ def main():
     # ------------------------------------------------------------------------------------------------ C
     ws = lambda t: re.sub(r"\s+", "", t)
     own_head = mask(head_function("pcnetgame_host_own_resident_idx"))
-    own_expect = own_head.replace("    int i;\n", "    int i;\n    if (pc_host_observer_active()) {\n        return -1;\n    }\n", 1)
+    # HEAD (>= the committed --host-observer feature) ALREADY contains the observer's early `return -1`: the worktree function must equal HEAD exactly
+    own_expect = own_head if "if (pc_host_observer_active()) {" in own_head else own_head.replace("    int i;\n", "    int i;\n    if (pc_host_observer_active()) {\n        return -1;\n    }\n", 1)
     ck("C the RESIDENT classifier is byte-identical to HEAD and the own-resident function is HEAD plus EXACTLY the --host-observer early `return -1` "
        "(residents keep priority, the guest path changed neither; the observer plays no resident)",
        fb("pcnetgame_host_classify_identity") != "" and mask(head_function("pcnetgame_host_classify_identity")).strip() == fb("pcnetgame_host_classify_identity").strip()
-       and own_expect != own_head and ws(own_expect) == ws(fb("pcnetgame_host_own_resident_idx")))
+       and "if (pc_host_observer_active()) {" in own_expect and ws(own_expect) == ws(fb("pcnetgame_host_own_resident_idx")))
     pi = fb("pcnetgame_host_process_identity")
     ck("C the class is decided in process_identity AFTER the unchanged NO_SAVE / LAND_MISMATCH checks and BEFORE the ACK: classify -> (UNKNOWN + EXT guest claim -> guest_check) / "
        "(RESIDENT + guest claim -> refuse) -> own-resident -> duplicate/park -> create -> reset -> ACK -> TOKEN -> READY",
@@ -303,7 +306,7 @@ def main():
     cur_mc = mask(strip_observer(read("pc/src/pc_m_card.c")))  # the --host-observer marker blocks removed (see strip_observer)
     cur_f = functions(cur_mc)
     writers = ("pc_save_write_gci_to", "pc_save_write_gci", "pc_save_rotate_backups", "pc_save_write_authoritative", "mCD_SaveHome_bg")
-    same = {n: (mask(head_function(n, "pc/src/pc_m_card.c")).strip() == body(cur_mc, cur_f, n).strip() != "") for n in writers}
+    same = {n: (mask(head_function(n, "pc/src/pc_m_card.c", True)).strip() == body(cur_mc, cur_f, n).strip() != "") for n in writers}
     ck("P the GCI writer functions (%s), the Card-B scan (pc_card.c) and the byte-swap code are UNCHANGED vs HEAD: guests add no file to the vanilla save path" % sorted(same),
        d == "" and all(same.values()))
     ck("P pc_mp_guests.c is in the build (CMakeLists) and the path / format are documented", "pc_mp_guests.c" in read("pc/CMakeLists.txt") and "ACMPGST" in gh and "UNTRUSTED" in gh)
@@ -411,6 +414,16 @@ def main():
     ck("G2 pc_main.c: --bootstrap-guest is parsed, documented in --help, and REFUSED (exit 2) without --connect or together with --bootstrap-resident; pc_vi.c polls it next to the resident poll",
        'strcmp(argv[i], "--bootstrap-guest") == 0' in mm and "const char* g_pc_bootstrap_guest = NULL;" in mm and "--bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID" in raw_main()
        and re.search(r"g_pc_bootstrap_guest != NULL && \(g_pc_net_role != 2 \|\| g_pc_bootstrap_resident >= 0\)", mm) and "pc_bootstrap_guest_poll();" in read("pc/src/pc_vi.c"))
+    ck("G1.1 --bootstrap-guest is validated EARLY: pc_main.c calls pc_bootstrap_guest_validate(g_pc_bootstrap_guest) (exit 2 on failure) after the role check and before pc_platform_init(); "
+       "the poll's failure paths all exit(2) with a stderr diagnostic (no silent `return` after l_done = 1)",
+       mm.find("g_pc_bootstrap_guest != NULL && (g_pc_net_role != 2") < mm.find("pc_bootstrap_guest_validate(g_pc_bootstrap_guest)") < mm.find("    pc_platform_init();")
+       and "return" not in bg[bg.index("l_done = 1;"):] and bg[bg.index("l_done = 1;"):].count("exit(2);") == 6
+       and body(mc, mfn, "pc_bootstrap_guest_validate") != "")
+    gci = gcheck.index("pcnetgame_guest_find(key)")
+    ck("G1.1 guest_check: the KEY conflict + validity run for every mode before the lookup; the resident-name and reserved-name rules sit only AFTER the token decision (mode 1 is never refused for a name)",
+       gcheck.index("pcnetgame_guest_key_conflict(key)") < gci and gcheck.index("if (tok_ok) {") > gci
+       and gcheck.index("pcnetgame_guest_name_conflict_resident(key)") > gcheck.index("if (tok_ok) {") and gcheck.index("pc_mp_guests_name_reserved(key->player_name)") > gcheck.index("if (tok_ok) {")
+       and "pcnetgame_guest_name_conflict_resident" not in fb("pcnetgame_host_revalidate_bound_peers") and "pcnetgame_guest_key_conflict(&st->bound_pid)" in fb("pcnetgame_host_revalidate_bound_peers"))
     ck("G2 the guest's save can never be written by this process: the client role gates every writer (pc_save_write_authoritative, save dialog, shutdown) and pc_save_ready stays 0 under the hook",
        "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {" in mc and "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT" in mask(read("pc/src/pc_m_card.c")))
     return L.summary_and_exit_code(results)
