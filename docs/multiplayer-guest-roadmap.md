@@ -397,6 +397,24 @@ Tests (exact results below): native guard unit `test_guest_arrival.py` (`guest_a
 Real-run evidence: the resident client logged exactly one `starting the local arrival train (coming_flag=3)` for the guest and the action sequence 2, 3, 4, 5, 6, 7, 8, 0 (arriving, stopped, waiting, departing, departed); the dedicated host logged the same; no second train for the same puppet (one start line, one 0 -> non-zero transition per process); with resident 0 as host the guard refused once with LOCAL_DEMO.
 Re-run of the directly affected existing tests on the new exe (bin_fixture4): `test_guest_train.py` 33/33 (native), `test_guest_train_src.py` 34/34 (source audit), `test_guest_train_real.py` 12/12 (REAL), `test_move_action_state_wire.py` 38/38 (REAL host + scripted clients; its row table parser picked up the new `standing_train` row with no pin change), `test_guest_g3_real.py` 43/43 (REAL), `test_guest_g4_real.py` 36/36 (REAL); the other pc_remote_player-related source audits pass (g3 35/35, g4 27/27, g5 19/19, dedicated 87/87, observer 65/65, hostcfg 21/21, events 24/24). Pre-existing failures NOT caused by this change (files untouched here: pc_m_card.c / pc_net_game.c / the guest-arrival pins of earlier commits): `test_boot_exec_gate_src.py` 8/10 (A4 / A7 player-actor allowlists), `test_d3_record_src.py` 133/134 (P hook), `test_identity_validation_src.py` 93/96 (S2 / S9 / S11).
 
+
+### Train arrival on residents (fix)
+
+Symptom: resident clients did not see the train when a guest arrived (19 of 24 logged remote-arrival lines were guard reason 7, LOCAL_DEMO).
+
+Root cause: `mTRC_pc_remote_arrival` treated the mere existence of an INTRO_DEMO actor as "the local player is arriving". Vanilla keeps that actor alive for the whole first-job event (`m_actor.c`, `ac_intro_demo.c`; deleted when the job finishes, `ac_intro_demo_move.c_inc`), so any resident still in the first job was refused. The decision was also latched once per standing period, so it was never retried after the condition cleared.
+
+Change (wire protocol unchanged, version 8):
+
+* `src/game/m_train_control.c`: the INTRO_DEMO actor counts as a local arrival only while `mEv_CheckFirstIntro()` is true (cleared in `aID_retire_rcn_guide_wait`), through the pure `pcarr_local_intro_arriving`. `mTRC_pc_remote_arrival` now returns the guard reason (0 = started) and logs a refusal only when (peer, reason) changes.
+* `pc/include/pc_remote_arrival_logic.h`: reasons 7 (LOCAL_DEMO), 8 (COMING_FLAG), 9 (BUSY) are transient (`pcarr_remote_reason_is_transient`); `pcarr_remote_standing_settle` releases the latch for them. OK and reasons 1-6 still consume it (once per standing period).
+* `pc/src/pc_remote_player.c` (`pc_remote_player_arrival_train_poll`): passes the returned reason to `pcarr_remote_standing_settle`, so the puppet re-polls every frame while it stands in DEMO_STANDING_TRAIN.
+* `mTRC_trainSet` diagnostics (`-debug`): one `[TRAIN] actor spawned` or `[TRAIN] actor not in area (... player block x,z = ..)` line per train.
+
+Limitations: the train ACTORS only exist while the train is inside `aTRC_area_check` of the local player (near the station acre; vanilla behaviour, unchanged), so a resident far from the station runs the train state machine but sees nothing (the new `not in area` line says so). A transient refusal that outlasts the guest's standing period (a few seconds) is lost. The visual result was NOT verified by eye or screenshot.
+
+Tests: `guest_arrival_selftest.c` via `test_guest_arrival.py` (47/47: transient-vs-latching cases, intro-only-while-FirstIntro, BUSY-then-free calls once, structural refusals not retried); `test_guest_arrival_sync_src.py` pins updated (40/43; the 3 failures are pre-existing wire/classifier checks against the T-phase baseline because `pc_net_game.c` changed in later G phases, not by this fix). No real host+resident+guest run was made for this fix.
+
 ## Guest profiles (multiple guests on one PC)
 
 Problem: `--connect HOST --guest` always used `save/mp/guest.ini` + `save/mp/guest_token.dat`, so several clients started on one PC were all the SAME guest.

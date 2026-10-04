@@ -1742,7 +1742,8 @@ static void pc_remote_player_arrival_train_poll(PCRemotePlayerActor* self, PCRem
     int in_town = (gamePT != NULL && slot != NULL) ? pc_remote_player_scene_is_local_field(slot, play) : 0;
 
     if (pcarr_remote_standing_should_evaluate(&self->visual.train_standing_latched, standing, in_town)) {
-        (void)mTRC_pc_remote_arrival((GAME*)play, (int)self->peer, in_town);
+        /* transient refusals (local intro demo, pending request, own train) release the latch: re-polled each frame while standing */
+        pcarr_remote_standing_settle(&self->visual.train_standing_latched, mTRC_pc_remote_arrival((GAME*)play, (int)self->peer, in_town));
     }
 }
 #endif

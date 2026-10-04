@@ -88,14 +88,66 @@ int main(void) {
         }
     }
     check("T4 sequence: 100 standing frames call the train exactly once", n == 1);
+    /* a structural refusal (reasons 1-6) consumes the latch; a transient one (7 LOCAL_DEMO, 8 COMING_FLAG, 9 BUSY) does not */
+    for (i = 1; i <= 9; i++) {
+        latch = 0;
+        pcarr_remote_standing_should_evaluate(&latch, 1, 1);
+        pcarr_remote_standing_settle(&latch, i);
+        check("T4 latch: reason 1-6 keeps the latch, 7-9 release it", (i <= 6) == (latch == 1) && pcarr_remote_reason_is_transient(i) == (i >= 7));
+    }
+    latch = 0;
+    pcarr_remote_standing_should_evaluate(&latch, 1, 1);
+    pcarr_remote_standing_settle(&latch, PCARR_REMOTE_TRAIN_OK);
+    check("T4 latch: OK keeps the latch", latch == 1);
+
+    /* transient: the resident is in the first-job intro for 50 frames (LOCAL_DEMO), then the intro ends -> the train is called exactly once */
+    latch = 0;
+    n = 0;
+    {
+        int calls = 0;
+        for (i = 0; i < 200; i++) {
+            int local_demo = pcarr_local_intro_arriving(1, i < 50); /* INTRO_DEMO actor lives on; FirstIntro ends at frame 50 */
+            if (pcarr_remote_standing_should_evaluate(&latch, 1, 1)) {
+                int why = decide(0, 1, 1, 1, 0, 0, local_demo, 0u, 0u);
+                calls++;
+                pcarr_remote_standing_settle(&latch, why);
+                n += why == PCARR_REMOTE_TRAIN_OK;
+            }
+        }
+        check("T4 transient: LOCAL_DEMO re-polled every frame (50 refused + 1 OK), then latched", n == 1 && calls == 51 && latch == 1);
+    }
+    check("T4 intro actor alone (first intro finished) is NOT a local arrival", pcarr_local_intro_arriving(1, 0) == 0 && pcarr_local_intro_arriving(0, 1) == 0 &&
+                                                                                    pcarr_local_intro_arriving(1, 1) == 1);
+
+    /* transient BUSY (own hourly train, action 5) then idle: called once when it clears */
     latch = 0;
     n = 0;
     for (i = 0; i < 100; i++) {
         if (pcarr_remote_standing_should_evaluate(&latch, 1, 1)) {
-            n += decide(0, 1, 1, 1, 0, 0, 0, 0u, 5u) == PCARR_REMOTE_TRAIN_OK; /* own hourly train is running: refused, and not retried later */
+            int why = decide(0, 1, 1, 1, 0, 0, 0, 0u, i < 40 ? 5u : 0u);
+            pcarr_remote_standing_settle(&latch, why);
+            n += why == PCARR_REMOTE_TRAIN_OK;
         }
     }
-    check("T4 sequence: with an own train running no call is made, and the refusal is not retried every frame", n == 0 && latch == 1);
+    check("T4 transient: BUSY then free -> the train is called exactly once", n == 1 && latch == 1);
+
+    /* latching: a structural refusal (not in the town scene) is never retried every frame */
+    latch = 0;
+    n = 0;
+    for (i = 0; i < 100; i++) {
+        if (pcarr_remote_standing_should_evaluate(&latch, 1, 1)) {
+            n++;
+            pcarr_remote_standing_settle(&latch, decide(0, 1, 0, 1, 0, 0, 0, 0u, 0u));
+        }
+    }
+    check("T4 latching: LOCAL_SCENE refusal evaluated once, not retried", n == 1 && latch == 1);
+
+    /* a transient refusal that never clears does not outlive the standing period: leaving the state clears the latch */
+    latch = 0;
+    pcarr_remote_standing_should_evaluate(&latch, 1, 1);
+    pcarr_remote_standing_settle(&latch, PCARR_REMOTE_TRAIN_BUSY);
+    pcarr_remote_standing_should_evaluate(&latch, 0, 1);
+    check("T4 transient: leaving the state after only refusals leaves the latch clear", latch == 0);
 
     /* ---- T3 DEMO_WALK mapping ---- */
     check("T3 DEMO_WALK (index 17) with the sender's OTHER class plays walk", pcarr_demo_walk_plays_walk(1, 17, 17, 1) == 1);

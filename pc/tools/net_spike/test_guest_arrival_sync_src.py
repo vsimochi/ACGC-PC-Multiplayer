@@ -63,6 +63,10 @@ def main():
     ck("diff: inside the TARGET_PC regions only lines were ADDED (every baseline region line is still there, in order)", all(any(b == c for c in it) for b in bl))
     for fn in ("mTRC_schedule", "mTRC_trainControl", "mTRC_trainSet", "mTRC_init", "mTRC_go_process", "mTRC_mati_init", "mTRC_demo_init", "mTRC_call_init",
                "mTRC_norm_init", "mTRC_move", "mTRC_pc_diag", "mTRC_pc_title_edge"):
+        if fn == "mTRC_trainSet":  # the train-on-residents fix adds TARGET_PC-guarded spawn diagnostics inside it; everything else must be byte-identical
+            fs, _fr, fu = T.strip_target_pc(T.func(tc, fn))
+            ck("diff: mTRC_trainSet is byte-identical to the baseline outside its TARGET_PC diagnostics", not fu and T.nonblank(fs) == T.nonblank(T.func(tcb, fn)))
+            continue
         ck("diff: %s is byte-identical to the baseline" % fn, T.func(tc, fn) != "" and T.func(tc, fn) == T.func(tcb, fn))
     ck("vanilla player / train / ride-off / station master decomp files are untouched (git diff vs %s)" % BASELINE,
        unchanged(["src/game/m_player.c", "src/game/m_player_lib.c", "src/game/m_player_common.c_inc", "src/game/m_player_main_demo_standing_train.c_inc",
@@ -85,7 +89,9 @@ def main():
                             "FIELD_DRAW_TYPE_TRAIN", "FIELD_DRAW_TYPE_PLAYER_SELECT", "Common_Get(train_coming_flag)", "Common_Get(train_action)")))
     ck("T4: local train demo = all four train main indexes + the ride-off / intro demo actors",
        all(x in f for x in ("mPlayer_INDEX_DEMO_STANDING_TRAIN", "mPlayer_INDEX_DEMO_GETOFF_TRAIN", "mPlayer_INDEX_DEMO_GETON_TRAIN", "mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT",
-                            "mAc_PROFILE_RIDE_OFF_DEMO", "mAc_PROFILE_INTRO_DEMO")))
+                            "mAc_PROFILE_RIDE_OFF_DEMO", "mAc_PROFILE_INTRO_DEMO"))
+       and "pcarr_local_intro_arriving(Actor_info_name_search(&play->actor_info, mAc_PROFILE_INTRO_DEMO, ACTOR_PART_CONTROL) != NULL," in f
+       and "mEv_CheckFirstIntro() != FALSE" in f)
     ck("T4: the ONLY state write is Common_Set(train_coming_flag, 3) (the arriving client's own request), after the refusal return",
        len(re.findall(r"Common_Set\(", f)) == 1 and "Common_Set(train_coming_flag, 3);" in f and f.index("return 0;") < f.index("Common_Set(train_coming_flag, 3);"))
     ck("T4: no direct train state machine call / no scene / net call in the hook (mTRC_schedule, mTRC_demo_init, mTRC_init, goto_other_scene, pc_net)",
@@ -137,7 +143,7 @@ def main():
        and re.search(r"#ifdef TARGET_PC\nstatic int pc_remote_player_scene_is_local_field\(const PCRemotePlayerSlot\* slot, const GAME_PLAY\* play\);", rp) is not None)
     ck("T4: the poll goes through the pure latch (once per standing period, scene must be the local town) and calls ONLY mTRC_pc_remote_arrival",
        "pcarr_remote_standing_should_evaluate(&self->visual.train_standing_latched, standing, in_town)" in poll and "pc_remote_player_scene_is_local_field(slot, play)" in poll
-       and re.findall(r"\bmTRC_\w+\(", poll) == ["mTRC_pc_remote_arrival("] and rp.count("(void)mTRC_pc_remote_arrival(") == 1)
+       and re.findall(r"\bmTRC_\w+\(", poll) == ["mTRC_pc_remote_arrival("] and rp.count("mTRC_pc_remote_arrival((GAME*)play, (int)self->peer, in_town)") == 1 and "pcarr_remote_standing_settle(&self->visual.train_standing_latched, mTRC_pc_remote_arrival(" in poll)
     ck("T4: pc_remote_player.c never writes train state itself (no Common_Set(train_*), no train_coming_flag)",
        not re.search(r"Common_Set\(train_|train_coming_flag|train_action", rp.replace("mTRC_pc_remote_arrival", "")))
     ck("T4: the per-puppet latch lives in the per-actor visual struct (zero at creation: a re-created puppet is a new arrival)",
@@ -149,7 +155,7 @@ def main():
     ck("T3: the train-demo main indexes are the contiguous DEMO_WALK, GETON_TRAIN, GETON_TRAIN_WAIT, GETOFF_TRAIN, STANDING_TRAIN of m_player.h",
        re.search(r"mPlayer_INDEX_DEMO_WALK,\s*mPlayer_INDEX_DEMO_GETON_TRAIN,\s*mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT,\s*mPlayer_INDEX_DEMO_GETOFF_TRAIN,\s*mPlayer_INDEX_DEMO_STANDING_TRAIN,", mp) is not None)
     hdr = open(os.path.join(PC, "include", "pc_remote_arrival_logic.h"), encoding="utf-8").read()
-    ck("header: pure and libc-free (no #include; three static inline functions)", "#include" not in hdr and hdr.count("static inline") == 3)
+    ck("header: pure and libc-free (no #include; six static inline functions: decide, standing_should_evaluate, reason_is_transient, standing_settle, local_intro_arriving, demo_walk)", "#include" not in hdr and hdr.count("static inline") == 6)
 
     # ---------------- no wire change ----------------
     ck("wire: pc_net_game.h / pc_net.h / pc_net.c / pc_net_game.c are byte-identical to the baseline", unchanged(["pc/include/pc_net_game.h", "pc/include/pc_net.h", "pc/src/pc_net.c", "pc/src/pc_net_game.c"]))

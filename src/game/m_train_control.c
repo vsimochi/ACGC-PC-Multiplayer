@@ -425,6 +425,26 @@ static void mTRC_trainControl(GAME_PLAY* play, int state) {
     Common_Set(train_position, pos);
 }
 
+#ifdef TARGET_PC
+/* one line per train: spawned, or (vanilla) not spawned because the train is outside the player's area (aTRC_area_check; actors only exist
+ * near the station acre). Re-armed when the train is no longer in the FG field / flag state, i.e. per train. */
+static void mTRC_pc_spawn_diag(int spawned, const GAME_PLAY* play, f32 x) {
+    static int s_logged = 0;
+    if (spawned) {
+        if (!s_logged) {
+            s_logged = 1;
+            PC_LOG(PCL_GENERAL, "[TRAIN] actor spawned (train x=%.0f)\n", x);
+        }
+    } else if (!s_logged && Common_Get(train_action) != 0) {
+        s_logged = 1;
+        PC_LOG(PCL_GENERAL, "[TRAIN] actor not in area (train x=%.0f; player block x,z = %d,%d)\n", x, play->block_table.block_x, play->block_table.block_z);
+    }
+    if (Common_Get(train_action) == 0) {
+        s_logged = 0;
+    }
+}
+#endif
+
 static void mTRC_trainSet(GAME_PLAY* play) {
     ACTOR* train_actor;
     ACTOR* caboose_actor;
@@ -477,6 +497,9 @@ static void mTRC_trainSet(GAME_PLAY* play) {
             }
 
             Common_Set(train_flag, FALSE);
+#ifdef TARGET_PC
+            mTRC_pc_spawn_diag(1, play, x + 250.0f);
+#endif
 
             train_actor->block_x = -1;
             train_actor->block_z = -1;
@@ -486,6 +509,11 @@ static void mTRC_trainSet(GAME_PLAY* play) {
             caboose_actor->block_z = -1;
             caboose_actor->parent_actor = train_actor;
         }
+#ifdef TARGET_PC
+        else {
+            mTRC_pc_spawn_diag(0, play, x);
+        }
+#endif
     }
 }
 
@@ -569,7 +597,7 @@ static void mTRC_pc_title_edge(GAME* game) {
  * no local arrival / boarding, no pending request) and the caller latches once per standing period. No passenger is forced: the
  * train's arg0 / arg1 are set only by the ride-off demo / station master, never here.
  * puppet_in_local_town: the puppet's announced scene is the town field this process shows (checked by the caller, which owns the slot).
- * Returns 1 when the train was started. */
+ * Returns the guard reason (PCARR_REMOTE_TRAIN_OK = 0 when the train was started); the caller re-polls on transient reasons. */
 extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     PLAYER_ACTOR* player = get_player_actor_withoutCheck(play);
@@ -582,7 +610,10 @@ extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town
         local_demo = main_index == mPlayer_INDEX_DEMO_STANDING_TRAIN || main_index == mPlayer_INDEX_DEMO_GETOFF_TRAIN ||
                      main_index == mPlayer_INDEX_DEMO_GETON_TRAIN || main_index == mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT ||
                      Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL ||
-                     Actor_info_name_search(&play->actor_info, mAc_PROFILE_INTRO_DEMO, ACTOR_PART_CONTROL) != NULL;
+                     /* the intro demo actor lives the whole first job (m_actor.c, ac_intro_demo.c); it means 'local arrival' only while the
+                      * first intro runs (mEv_CheckFirstIntro is cleared in aID_retire_rcn_guide_wait) */
+                     pcarr_local_intro_arriving(Actor_info_name_search(&play->actor_info, mAc_PROFILE_INTRO_DEMO, ACTOR_PART_CONTROL) != NULL,
+                                                mEv_CheckFirstIntro() != FALSE);
     }
 
     why = pcarr_remote_arrival_train_decide(0, puppet_in_local_town, play->scene_id == SCENE_FG && Common_Get(field_type) == mFI_FIELDTYPE2_FG,

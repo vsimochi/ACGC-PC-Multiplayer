@@ -85,6 +85,26 @@ static inline int pcarr_remote_standing_should_evaluate(int* latched, int standi
     return 1;
 }
 
+/* Train-on-residents fix: reasons 7 (LOCAL_DEMO), 8 (COMING_FLAG), 9 (BUSY) are TRANSIENT local conditions (a resident in the first-job intro,
+ * a pending train request, an own train in progress) that can clear while the guest is still standing in the train, so they must not consume
+ * the per-period latch: the caller re-polls every frame. Only OK (the train was called) and the structural reasons 1-6 consume it. */
+static inline int pcarr_remote_reason_is_transient(int reason) {
+    return reason == PCARR_REMOTE_TRAIN_LOCAL_DEMO || reason == PCARR_REMOTE_TRAIN_COMING_FLAG || reason == PCARR_REMOTE_TRAIN_BUSY;
+}
+
+/* Call after pcarr_remote_standing_should_evaluate() returned 1 and the guard answered `reason`: a transient refusal releases the latch so the
+ * next frame evaluates again (while the puppet still stands); OK / structural reasons keep it (once per standing period). */
+static inline void pcarr_remote_standing_settle(int* latched, int reason) {
+    if (pcarr_remote_reason_is_transient(reason)) {
+        *latched = 0;
+    }
+}
+
+/* Intro demo actor counts as 'the LOCAL player is arriving' only while the first-job intro runs (the actor lives the whole first job). */
+static inline int pcarr_local_intro_arriving(int intro_actor_exists, int first_intro_active) {
+    return intro_actor_exists && first_intro_active;
+}
+
 /* T3 (puppet rows): nonzero when the wire main index is the DEMO_WALK state, which the sender classifies as OTHER (WAIT1 on the fallback
  * path): the puppet then plays the walk clip instead of sliding in idle. `move_state_is_other`: the sender's coarse class is OTHER. */
 static inline int pcarr_demo_walk_plays_walk(int action_valid, int action_index, int demo_walk_index, int move_state_is_other) {
