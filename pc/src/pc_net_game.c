@@ -3693,12 +3693,22 @@ static void pcnetgame_set_dep_bit(uint16_t deposit[PCFA_DEPOSIT_ROWS], int tile,
  * rewrites of fg with a possibly-stale Save scene_no) can never be mistaken for a loaded session.
  * The latch then holds across door/scene transitions (gamePT briefly NULL) and drops the moment
  * pcfa_save_ready() does. */
+/* PRE-GAME scenes of the normal Start Game flow (title demo, the player-select train where the human chooses a character, the start demos). The
+ * title's Start handler (title_action_data_init_start_select, src/actor/ac_animal_logo_misc.c) binds a PLACEHOLDER player (Now_Private = private_data[0],
+ * player_no 0) BEFORE the human has chosen anyone, and the save re-read leaves Save scene_no at the saved scene (the town), so pcfa_save_ready() is already
+ * true while the title-demo GAME_PLAY is still running. A latch taken there would send the placeholder Resident 0 as the client's IDENTITY (and make a host
+ * treat it as its own resident) long before the real choice. */
+static int pcnetgame_scene_is_pregame(int sc) {
+    return sc == SCENE_TITLE_DEMO || sc == SCENE_PLAYERSELECT || sc == SCENE_PLAYERSELECT_2 || sc == SCENE_PLAYERSELECT_3 || sc == SCENE_PLAYERSELECT_SAVE ||
+           sc == SCENE_START_DEMO || sc == SCENE_START_DEMO2 || sc == SCENE_START_DEMO3;
+}
+
 static int pcnetgame_update_local_world_ready(void) {
     if (!pcfa_save_ready()) {
         s_local_world_latched = 0;
         return 0;
     }
-    if (!s_local_world_latched && gamePT != NULL && gamePT->exec == play_main) {
+    if (!s_local_world_latched && gamePT != NULL && gamePT->exec == play_main && !pcnetgame_scene_is_pregame((int)((GAME_PLAY*)gamePT)->scene_id)) {
         s_local_world_latched = 1;
     }
     return s_local_world_latched;
@@ -16721,8 +16731,7 @@ static int pcnetgame_crec_adopt_lifecycle_now(void) {
         return 1;
     }
     sc = (int)play->scene_id;
-    return sc == SCENE_TITLE_DEMO || sc == SCENE_PLAYERSELECT || sc == SCENE_PLAYERSELECT_2 || sc == SCENE_PLAYERSELECT_3 || sc == SCENE_PLAYERSELECT_SAVE ||
-           sc == SCENE_START_DEMO || sc == SCENE_START_DEMO2 || sc == SCENE_START_DEMO3;
+    return pcnetgame_scene_is_pregame(sc);
 }
 static char s_crec_diag_last_why[96];
 static int s_crec_diag_first_frame = -1; /* graph frame counter when the first blocker of this push was logged (did the game advance since?) */

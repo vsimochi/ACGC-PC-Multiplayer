@@ -19,6 +19,7 @@ PC = os.path.abspath(os.path.join(HERE, "..", ".."))
 ROOT = os.path.abspath(os.path.join(PC, ".."))
 GCC = r"C:\msys64\ucrt64\bin\gcc.exe"
 BASELINE = "266c746"  # the diagnostic commit: HEAD when this fix started
+FIX_COMMIT = "f3d69ef"  # the adoption-clock fix commit: the diff audit compares BASELINE..FIX_COMMIT (later work touches the same file)
 
 
 def main():
@@ -69,10 +70,11 @@ def main():
     lf = func(src, "pcnetgame_crec_adopt_lifecycle_now")
     ck("src: the lifecycle predicate = no running GAME_PLAY | fade / wipe in progress | a pre-game scene",
        "gamePT == NULL || gamePT->exec != play_main" in lf and "play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE" in lf
-       and all(s in lf for s in ("SCENE_TITLE_DEMO", "SCENE_PLAYERSELECT_2", "SCENE_PLAYERSELECT_3", "SCENE_PLAYERSELECT_SAVE", "SCENE_START_DEMO3")))
+       and "return pcnetgame_scene_is_pregame(sc);" in lf
+       and all(x in func(src, "pcnetgame_scene_is_pregame") for x in ("SCENE_TITLE_DEMO", "SCENE_PLAYERSELECT_2", "SCENE_PLAYERSELECT_3", "SCENE_PLAYERSELECT_SAVE", "SCENE_START_DEMO3")))
     ck("src: adoption itself is still gated by the unchanged blocker (the clock only changes WHEN the attempt is given up)",
        "why = pcnetgame_crec_adopt_blocker(&s_crec_scratch);" in ty)
-    diff = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", BASELINE, "--", "pc/src/pc_net_game.c"], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
+    diff = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", BASELINE, FIX_COMMIT, "--", "pc/src/pc_net_game.c"], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
     removed = [l for l in diff.split("\n") if l.startswith("-") and not l.startswith("---")]
     ck("src: the only lines removed vs the baseline are the flat timeout check and the old ADOPT_FAILED log text (%d)" % len(removed),
        len(removed) <= 4 and all(("now - s_crec.st_ms" in l) or ("ADOPT_FAILED" in l) or ("PC_NETGAME_CREC_ADOPT_TIMEOUT_MS" in l) for l in removed))
