@@ -16471,11 +16471,87 @@ static const char* pcnetgame_crec_adopt_blocker(const Private_c* pushed_native) 
     return NULL;
 }
 
+/* Guests G3.3 (look refresh after adopt): the local player actor's skeleton (boy / girl object bank) and face textures are bound at SCENE LOAD from
+ * Now_Private->gender / face (m_scene.c Object_Exchange_keep_new_Player). A returning guest's adopted record can carry a different look than the placeholder
+ * the arrival built from guest.ini. GUESTS ONLY (player_no >= mPr_FOREIGNER; residents are never touched):
+ *   - face differs, gender same: the face texture + palette bank are the same size for every face, so they are rebuilt in place with the vanilla
+ *     mPlib_change_player_face() (the call Player_actor_ct() itself makes) -- no scene change;
+ *   - gender differs: the boy / girl skeleton bank can only change at a scene load, so ONE same-position reload of the current scene is requested
+ *     (s_look_reload_pending; performed by pcnetgame_look_reload_poll() when the player is idle in SCENE_FG, demo profiles cleared so the train arrival is
+ *     not replayed). If the player is elsewhere (a shop interior) the next scene load rebuilds the banks anyway and nothing more is needed. */
+static int s_look_reload_pending = 0;
+
+static void pcnetgame_look_refresh_after_adopt(int old_gender, int old_face, const Private_c* np) {
+    if ((int)Common_Get(player_no) < (int)mPr_FOREIGNER) {
+        return; /* residents: untouched */
+    }
+    if ((int)np->gender == old_gender && (int)np->face == old_face) {
+        return;
+    }
+    if ((int)np->gender != old_gender) {
+        s_look_reload_pending = 1;
+        printf("[NET][LOOK] guest look changed on adopt: gender %d -> %d face %d -> %d: requesting ONE same-position scene reload (the skeleton bank is bound at scene load)\n",
+               old_gender, (int)np->gender, old_face, (int)np->face);
+    } else if (gamePT != NULL && mPlib_get_player_face_p(gamePT) != NULL) {
+        mPlib_change_player_face(gamePT);
+        printf("[NET][LOOK] guest face changed on adopt: face %d -> %d (gender %d): face texture + palette rebuilt in place (no scene change)\n", old_face,
+               (int)np->face, (int)np->gender);
+    } else {
+        printf("[NET][LOOK] guest face changed on adopt: face %d -> %d but no face bank is live yet; it is rebuilt at the next scene load\n", old_face, (int)np->face);
+    }
+}
+
+/* G3.3: the deferred same-position reload. One-shot: the pending flag is cleared on the first decision (done, or not applicable). */
+static void pcnetgame_look_reload_poll(void) {
+    GAME_PLAY* play;
+    PLAYER_ACTOR* pl;
+    Door_data_c door;
+    xyz_t pos;
+    int res;
+    if (!s_look_reload_pending || gamePT == NULL || gamePT->exec != play_main) {
+        return;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE) {
+        return; /* a transition is running: retry */
+    }
+    if (play->scene_id != SCENE_FG || Save_Get(scene_no) != SCENE_FG) {
+        s_look_reload_pending = 0;
+        printf("[NET][LOOK] look reload not needed: the player is not in the town scene (the next scene load rebuilds the player banks)\n");
+        return;
+    }
+    pl = GET_PLAYER_ACTOR_NOW();
+    if (!pcnetgame_is_real_player_actor(pl) || !mPlib_able_submenu_type1((GAME*)play) || play->submenu.process_status != mSM_PROCESS_WAIT) {
+        return; /* not idle yet: retry */
+    }
+    pos = pl->actor_class.world.position;
+    memset(&door, 0, sizeof(door));
+    door.next_scene_id = SCENE_FG;
+    door.exit_orientation = mSc_DIRECT_SOUTH;
+    door.exit_type = 0;
+    door.extra_data = 0;
+    door.exit_position.x = (s16)pos.x;
+    door.exit_position.y = (s16)mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
+    door.exit_position.z = (s16)pos.z;
+    door.door_actor_name = EMPTY_NO;
+    door.wipe_type = WIPE_TYPE_FADE_BLACK;
+    Common_Set(demo_profiles[0], mAc_PROFILE_NUM); /* never replay the RIDE_OFF_DEMO train arrival */
+    Common_Set(demo_profiles[1], mAc_PROFILE_NUM);
+    res = goto_other_scene(play, &door, TRUE);
+    printf("[NET][LOOK] same-position scene reload (SCENE_FG at %d,%d) to rebuild the player's gender/face banks: goto_other_scene res=%d\n",
+           (int)door.exit_position.x, (int)door.exit_position.z, res);
+    if (res == 1 || res == 0) {
+        s_look_reload_pending = 0; /* res 2 = already changing scenes: retry */
+    }
+}
+
 /* Applies the staged push in ONE memcpy into *Now_Private. host_only: only the host-owned ranges are taken. */
 static void pcnetgame_crec_apply_staged(int host_only, int* cloth_refreshed, int* equip_changed, int* dirty_lost) {
     Private_c* np = Now_Private;
     mPr_cloth_c old_cloth = np->cloth;
     mActor_name_t old_equip = np->equipment;
+    const int old_gender = (int)np->gender;
+    const int old_face = (int)np->face;
     uint8_t* dst = (uint8_t*)&s_crec_merged;
     const uint8_t* src = (const uint8_t*)&s_crec_scratch;
     int i;
@@ -16502,6 +16578,7 @@ static void pcnetgame_crec_apply_staged(int host_only, int* cloth_refreshed, int
     }
     memcpy(np, &s_crec_merged, sizeof(Private_c)); /* the single write into the live record; no mPr_ init helper, no RNG */
     *equip_changed = np->equipment != old_equip;
+    pcnetgame_look_refresh_after_adopt(old_gender, old_face, np); /* G3.3: guests only */
     *cloth_refreshed = 0;
     if (np->cloth.item != old_cloth.item || np->cloth.idx != old_cloth.idx) {
         /* NOT mPr_SetNowPrivateCloth(): that one assigns a RANDOM shirt (mPr_GetRandomCloth / RANDOM()). The vanilla texture
@@ -16881,6 +16958,8 @@ static void pcnetgame_crec_tick(void) {
     if (s_crec.state != PC_NETGAME_CRS_SYNCED) {
         return;
     }
+
+    pcnetgame_look_reload_poll(); /* G3.3: no-op unless a guest's adopted gender differed (see pcnetgame_look_refresh_after_adopt) */
 
     /* TEST-ONLY (--d3-test-wallet-add N, default off): one deliberate local wallet change after the adopt, so a real client
      * exercises the upload path without any gameplay input. Never active in normal play. */

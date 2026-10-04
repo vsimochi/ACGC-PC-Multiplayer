@@ -27,6 +27,7 @@
 #include "pc_menu_util.h"
 #include "main.h"
 #include <stdio.h>
+#include <string.h>
 #endif
 
 #define G_CC_TITLE PRIMITIVE, ENVIRONMENT, TEXEL0, ENVIRONMENT, PRIMITIVE, 0, TEXEL0, 0
@@ -85,11 +86,19 @@ ACTOR_PROFILE Animal_Logo_Profile = {
 static void aAL_setupAction(ANIMAL_LOGO_ACTOR* actor, GAME* game, int action);
 static void aAL_title_decide_p_sel_npc();
 
+#ifdef PC_ENHANCEMENTS
+static int s_aAL_pc_guest_joining = 0; /* Guests G3.2: set once the guest arrival scene change was requested (further presses ignored); cleared in aAL_actor_ct */
+#endif
+
 static void aAL_actor_ct(ACTOR* actor, GAME* game) {
   ANIMAL_LOGO_ACTOR* logo_actor = (ANIMAL_LOGO_ACTOR*)actor;
   GAME_PLAY* play = (GAME_PLAY*)game;
   Clip_c* clip = Common_GetPointer(clip);
   aAL_SkeletonInfo_c* skeleton_info;
+
+#ifdef PC_ENHANCEMENTS
+  s_aAL_pc_guest_joining = 0;
+#endif
 
 #ifdef TARGET_PC
   { extern int g_pc_verbose; if (g_pc_verbose) printf("[LOGO] aAL_actor_ct: Animal Logo actor created\n"); }
@@ -335,6 +344,31 @@ static void aAL_fade_out_start_wait_init(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
 }
 
 #ifdef PC_ENHANCEMENTS
+/* Guests G3.2: the PC title menu items. Without a guest item the menu is exactly the old Start / Options / Quit (ids 0..2 in that order). A network CLIENT
+ * (--connect) gets a 4th item "Join as Guest (NAME)" right after Start: Start Game, Join as Guest, Options, Quit Game. */
+enum {
+  aAL_PC_ITEM_START = 0,
+  aAL_PC_ITEM_OPTIONS = 1,
+  aAL_PC_ITEM_QUIT = 2,
+  aAL_PC_ITEM_GUEST = 3
+};
+
+static int aAL_pc_menu_count(void) {
+  extern int pc_guest_title_item_visible(void); /* pc_m_card.c: role == CLIENT */
+  return pc_guest_title_item_visible() ? 4 : 3;
+}
+
+static int aAL_pc_menu_item(int sel) {
+  static const int k_plain[3] = { aAL_PC_ITEM_START, aAL_PC_ITEM_OPTIONS, aAL_PC_ITEM_QUIT };
+  static const int k_guest[4] = { aAL_PC_ITEM_START, aAL_PC_ITEM_GUEST, aAL_PC_ITEM_OPTIONS, aAL_PC_ITEM_QUIT };
+  int n = aAL_pc_menu_count();
+
+  if (sel < 0 || sel >= n) {
+    sel = 0;
+  }
+  return n == 4 ? k_guest[sel] : k_plain[sel];
+}
+
 static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
   GAME_PLAY* play = (GAME_PLAY*)game;
   f32 dt = (f32)game->graph->dt_num_60fps_frames;
@@ -388,7 +422,7 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
     return;
   }
 
-  /* Main menu navigation (3 items: Start / Options / Quit) */
+  /* Main menu navigation (3 items: Start / Options / Quit; 4 for a network client: Start / Join as Guest / Options / Quit) */
   if (actor->pc_cursor_cooldown <= 0.0f) {
     if (stick_y > 30 || (on_btn & BUTTON_DUP)) {
       if (actor->pc_menu_sel > 0) {
@@ -396,7 +430,7 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
         actor->pc_cursor_cooldown = 10.0f;
       }
     } else if (stick_y < -30 || (on_btn & BUTTON_DDOWN)) {
-      if (actor->pc_menu_sel < 2) {
+      if (actor->pc_menu_sel < aAL_pc_menu_count() - 1) {
         actor->pc_menu_sel++;
         actor->pc_cursor_cooldown = 10.0f;
       }
@@ -405,20 +439,32 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
 
   /* Select */
   if (on_btn & (BUTTON_A | BUTTON_START)) {
-    switch (actor->pc_menu_sel) {
-      case 0: /* Start Game */
+    switch (aAL_pc_menu_item(actor->pc_menu_sel)) {
+      case aAL_PC_ITEM_START: /* Start Game */
         if (mLd_CheckStartFlag() == TRUE &&
             aAL_wipe_end_check(game) == TRUE &&
             mTD_tdemo_button_ok_check()) {
           aAL_setupAction(actor, game, aAL_ACTION_FADE_OUT_START);
         }
         break;
-      case 1: /* Options */
+      case aAL_PC_ITEM_GUEST: /* Join as Guest (network client only): same readiness conditions as Start Game */
+        if (!s_aAL_pc_guest_joining &&
+            mLd_CheckStartFlag() == TRUE &&
+            aAL_wipe_end_check(game) == TRUE &&
+            mTD_tdemo_button_ok_check()) {
+          extern int pc_guest_title_join(void); /* pc_m_card.c: reloads the save, binds the guest, goes to the station; 0 = failed, message set, we stay here */
+          if (pc_guest_title_join()) {
+            s_aAL_pc_guest_joining = 1;
+          }
+          actor->pc_cursor_cooldown = 10.0f;
+        }
+        break;
+      case aAL_PC_ITEM_OPTIONS: /* Options */
         actor->pc_options_open = 1;
         actor->pc_cursor_cooldown = 10.0f;
         pc_settings_menu_enter();
         break;
-      case 2: /* Quit Game */
+      case aAL_PC_ITEM_QUIT: /* Quit Game */
         g_pc_running = 0;
         actor->pc_cursor_cooldown = 10.0f;
         break;
@@ -800,18 +846,66 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
   f32 y_base = 135.0f;
   f32 line_h = 18.0f;
   int sel = actor->pc_menu_sel;
+  int n_items = aAL_pc_menu_count();
 
   /* Hide the title's main menu items while the Options overlay is open, else
    * Start/Options/Quit bleed through the dimmed backdrop. */
   if (!actor->pc_options_open) {
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < n_items; i++) {
       int on = (sel == i);
-      pc_menu_draw_centered(game, labels[i], y_base + i * line_h,
+      int item = aAL_pc_menu_item(i);
+      const char* label = labels[item < 3 ? item : 0];
+
+      if (item == aAL_PC_ITEM_GUEST) {
+        extern const char* pc_guest_title_label(void); /* pc_m_card.c: "Join as Guest (NAME)" */
+        label = pc_guest_title_label();
+      }
+      pc_menu_draw_centered(game, label, y_base + i * line_h,
         on ? sel_r[td] : dim_r[td],
         on ? sel_g[td] : dim_g[td],
         on ? sel_b[td] : dim_b[td],
         on ? 255 : 220,
         on ? PC_MENU_SCALE_SELECTED : 1.0f);
+    }
+
+    /* Guests G3.2: why the last "Join as Guest" attempt failed (shown for a few seconds, word wrapped, the title stays up). */
+    {
+      extern const char* pc_guest_title_message(void); /* pc_m_card.c: NULL when there is no (or an expired) message */
+      const char* msg = pc_guest_title_message();
+
+      if (msg != NULL) {
+        f32 y = y_base + n_items * line_h + 10.0f;
+        int pos = 0;
+        int len = (int)strlen(msg);
+        int rows = 0;
+
+        pc_menu_draw_centered(game, "Could not join as a guest:", y, 255, 90, 90, 255, 1.0f);
+        y += line_h;
+        while (pos < len && rows < 4) {
+          char row[48];
+          int take = len - pos;
+          int k;
+
+          if (take > 40) {
+            take = 40;
+            for (k = take; k > 20; k--) { /* break at the last blank of the window */
+              if (msg[pos + k] == ' ') {
+                take = k;
+                break;
+              }
+            }
+          }
+          memcpy(row, msg + pos, (size_t)take);
+          row[take] = '\0';
+          pc_menu_draw_centered(game, row, y, 255, 255, 255, 230, 1.0f);
+          y += line_h;
+          pos += take;
+          while (pos < len && msg[pos] == ' ') {
+            pos++;
+          }
+          rows++;
+        }
+      }
     }
   }
 

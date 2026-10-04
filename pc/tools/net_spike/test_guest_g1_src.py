@@ -2,9 +2,9 @@
 """test_guest_g1_src.py - GUESTS G1 (fresh guest record) SOURCE AUDIT (no game process).
 
 A new guest is its own independent character, never a copy of a resident. This audit pins the source rules that guarantee it:
-  A  pc_bootstrap_guest_poll (pc_m_card.c): NO resident clone (no private_data[...] read, no mPr_CopyPrivateInfo / template), the fresh record comes from
+  A  pc_bootstrap_guest_poll + (G3) the shared pc_guest_arrive it calls (pc_m_card.c): NO resident clone (no private_data[...] read, no mPr_CopyPrivateInfo / template), the fresh record comes from
      pc_guest_build_fresh_record, the NAME checks (valid game name, not a resident's name) run BEFORE anything is bound and refuse with exit code 2; the arrival
-     binding / mSDI_StartDataInit(MODE_PAK) / station spawn are exactly as before; never mSDI NEW / NEW_PLAYER, no pc_save_ready, no homes[] / house calls
+     binding / station spawn are as before; since G3 the init is mSDI_StartDataInitGuest (no gateway) instead of mSDI_StartDataInit(MODE_PAK); never mSDI NEW / NEW_PLAYER, no pc_save_ready, no homes[] / house calls
   B  pc_guest_build_fresh_record: mPr_ClearPrivateInfo THEN mPr_InitPrivateInfo, then the HOME PersonalID, exists, reset_code, gender / face / explicit starter
      shirt (mPlib_change_player_cloth_info_lv2, NOT the random mPr_SetNowPrivateCloth); DETERMINISTIC (no RANDOM / rand / fqrand / time in the guest creation
      code; the identity hash is FNV-1a32 over the canonical 20-byte PersonalID), writes only through `rec`
@@ -58,16 +58,20 @@ def main():
     lib = S.read("pc/tools/net_spike/net_spike_lib.py")
 
     # ---------------------------------------------------------------- A
-    poll = cb("pc_bootstrap_guest_poll")
-    ck("A pc_bootstrap_guest_poll exists", poll != "")
+    # G3: the arrival moved from pc_bootstrap_guest_poll into the shared pc_guest_arrive (the poll keeps the one-shot / readiness waits + exit(2)); `poll` below
+    # means "the arrival code" = the poll AND the shared function, so every G1 rule is still pinned on the code that now carries it.
+    poll_only = cb("pc_bootstrap_guest_poll")
+    arr = cb("pc_guest_arrive")
+    poll = poll_only + "\n" + arr
+    ck("A pc_bootstrap_guest_poll and (G3) the shared pc_guest_arrive exist", poll_only != "" and arr != "")
     ck("A NO resident clone: the guest poll contains no private_data[...] access, no template pointer and no mPr_CopyPrivateInfo / mPr_CopyPrivate*",
        "private_data" not in poll and "tmpl" not in poll and "template" not in poll.lower() and "mPr_CopyPrivateInfo" not in poll and "bcopy" not in poll)
     ck("A the passport is built by pc_guest_build_fresh_record() into l_mcd_foreigner_file.file.priv (zeroed first), the optional GENDER / FACE arguments are passed through",
        "memset(&l_mcd_foreigner_file, 0, sizeof(l_mcd_foreigner_file));" in poll and "pass = &l_mcd_foreigner_file.file.priv;" in poll
        and "pc_guest_build_fresh_record(pass, &home, opt_gender, opt_face);" in poll
-       and "pc_guest_spec_check(g_pc_bootstrap_guest, &home, &opt_gender, &opt_face, &bad_why)" in poll)
-    i_val, i_res, i_bld, i_bind = (poll.find(x) for x in ("pc_guest_spec_check(g_pc_bootstrap_guest", "pc_guest_resident_name_conflict(&home)", "pc_guest_build_fresh_record(pass",
-                                                          "Common_Set(now_private, pass);"))
+       and "pc_guest_spec_check(spec, &home, &opt_gender, &opt_face, &bad_why)" in poll)
+    i_val, i_res, i_bld, i_bind = (arr.find(x) for x in ("pc_guest_spec_check(spec", "pc_guest_resident_name_conflict(&home)", "pc_guest_build_fresh_record(pass",
+                                                         "Common_Set(now_private, pass);"))
     ck("A order (G1.1: the spec check = syntax + valid name + reserved name + valid identity lives in pc_guest_spec_check): spec check, resident-name check, THEN the fresh record, "
        "THEN the binding (nothing is bound when a name check fails)", 0 < i_val < i_res < i_bld < i_bind)
     sc = cb("pc_guest_spec_check")
@@ -75,16 +79,18 @@ def main():
        sc != "" and "pc_guest_parse_spec(spec, home, gender_out, face_out, why)" in sc and "pc_mp_guests_name_valid(home->player_name)" in sc and "pc_mp_guests_name_reserved(home->player_name)" in sc
        and sc.index("pc_guest_parse_spec(") < sc.index("home->player_name[0] == 0 || home->land_name[0] == 0 || home->player_id == 0xFFFFu || home->land_id == 0xFFFFu")
        < sc.index("pc_mp_guests_name_valid(") < sc.index("pc_mp_guests_name_reserved(") and "is not a valid game player name" in card and "is reserved for the server observer" in card)
-    ck("A the resident-name refusal exits the process with code 2 (stderr message names the reason) before anything is bound",
-       "equals the name of resident %d of this town" in card and poll.count("exit(2);") == 6 and poll.index("exit(2);", i_res) < i_bld)
-    ck("A the arrival is unchanged: Common_Set(player_no, mPr_FOREIGNER), mSDI_StartDataInit(gamePT, mPr_FOREIGNER, mSDI_INIT_MODE_PAK), station spawn (1979, 760) with RIDE_OFF_DEMO",
-       "Common_Set(player_no, mPr_FOREIGNER);" in poll and "mSDI_StartDataInit(gamePT, mPr_FOREIGNER, mSDI_INIT_MODE_PAK)" in poll and "1979" in poll and "760" in poll
-       and "mAc_PROFILE_RIDE_OFF_DEMO" in poll and "Common_Set(time.rtc_enabled, TRUE);" in poll)
+    ck("A the resident-name refusal FAILS the arrival (G3: `return 0` with the reason in err; the CLI poll turns every failure into exit code 2 + stderr, the title menu into a message) before anything is bound",
+       "equals the name of resident %d of this town" in card and arr.index("return 0;", i_res) < i_bld and "exit(" not in arr and poll_only.count("exit(2);") == 1
+       and 'fprintf(stderr, "[PC] --bootstrap-guest: %s\\n", err);' in poll_only)
+    ck("A the arrival binding is unchanged: Common_Set(player_no, mPr_FOREIGNER), station spawn (1979, 760) with RIDE_OFF_DEMO; (G3.1) the init is mSDI_StartDataInitGuest(gamePT) -- NOT "
+       "mSDI_StartDataInit(.., MODE_PAK) any more (that one sets the gateway); a failed init restores the previous binding",
+       "Common_Set(player_no, mPr_FOREIGNER);" in arr and "mSDI_StartDataInitGuest(gamePT)" in arr and "mSDI_StartDataInit(" not in arr and "MODE_PAK" not in arr and "1979" in arr and "760" in arr
+       and "mAc_PROFILE_RIDE_OFF_DEMO" in arr and "Common_Set(time.rtc_enabled, TRUE);" in arr and "Common_Set(now_private, prev_private);" in arr)
     ck("A never the vanilla new-player / new-town init, never a save writer, no house / home call in the guest poll",
        not re.search(r"mSDI_INIT_MODE_NEW|NEW_PLAYER|mSDI_StartInitNew|mSDI_StartDataInitObserver", poll) and "pc_save_ready" not in poll and "pc_save_write" not in poll
-       and not re.search(r"homes|mHS_|mHm_|mNW_InitOneMyOriginal|mEv_|mPr_LoadPak", poll))
+       and not re.search(r"homes|mHS_|mHm_|mNW_InitOneMyOriginal|mPr_LoadPak", poll) and set(re.findall(r"\bmEv_\w+\(", poll)) <= {"mEv_CheckGateway("})  # G3: the one read-only gateway probe for the log line
     ck("A the guest log markers the real-client test greps are intact (additive: a FRESH-record line before the arrival line)",
-       "[PC] --bootstrap-guest: FRESH guest record (not a copy of any resident): gender=%d face=%d shirt=0x%04X (%s), empty pockets / wallet / letters" in card
+       "[PC] %s: FRESH guest record (not a copy of any resident): gender=%d face=%d shirt=0x%04X (%s), empty pockets / wallet / letters" in card and 'pc_guest_arrive("--bootstrap-guest"' in poll_only
        and "bound as a foreigner, arriving at the station (SCENE_FG)" in card and "guest '%.8s' (home land id 0x%04X, player id 0x%04X)" in card)
 
     # ---------------------------------------------------------------- B
@@ -98,7 +104,7 @@ def main():
     ck("B gender / face / shirt come from the identity HASH when not given (bit 31 / bits 16..18 / bits 8..10), never from a random call",
        "gender = (int)((h >> 31) & 1u);" in bld and "face = (int)((h >> 16) & 7u);" in bld and "int shirt_idx = (int)((h >> 8) & 7u);" in bld
        and "const u32 h = pc_guest_identity_hash(home);" in bld)
-    guest_fns = ["pc_guest_parse_spec", "pc_guest_identity_hash", "pc_guest_init_designs", "pc_guest_build_fresh_record", "pc_guest_resident_name_conflict", "pc_bootstrap_guest_poll"]
+    guest_fns = ["pc_guest_parse_spec", "pc_guest_identity_hash", "pc_guest_init_designs", "pc_guest_build_fresh_record", "pc_guest_resident_name_conflict", "pc_guest_arrive", "pc_bootstrap_guest_poll"]
     allg = "\n".join(cb(n) for n in guest_fns)
     ck("B DETERMINISTIC: no RANDOM / rand / fqrand / srand / time / mPr_SetNowPrivateCloth / mPr_GetRandom / RANDOM_F anywhere in the guest-creation code of pc_m_card.c "
        "(mPr_InitPrivateInfo itself draws the client RNG internally; every value it sets is overwritten, see the builder comment)",
@@ -220,15 +226,19 @@ def main():
        0 < i_opt < i_role < i_val < first_init and "return 2;" in mm[i_val:i_val + 160] and "extern int pc_bootstrap_guest_validate(const char* spec);" in mm)
     ck("H a --bootstrap-guest without a value (last argument) is refused with exit 2 instead of being silently ignored",
        re.search(r'strcmp\(argv\[i\], "--bootstrap-guest"\) == 0\) \{\s*/\*[^*]*\*/\s*fprintf\(stderr, "\[PC\] --bootstrap-guest: REFUSED: the option needs a spec argument[^;]*;\s*return 2;', main_raw))
-    after = poll[poll.index("l_done = 1;"):]
-    ck("H no failure path of pc_bootstrap_guest_poll after `l_done = 1;` is a silent return: no `return` statement at all, every failure prints to stderr and exits 2 (6 paths: not a client, "
-       "no town save, bad spec, resident-name clash, mSDI_StartDataInit, goto_other_scene)",
-       "return" not in after and after.count("exit(2);") == 6 and after.count("fprintf(stderr, \"[PC] --bootstrap-guest:") == 6 and after.count("fflush(stdout);") == 6)
-    pre = poll[:poll.index("l_done = 1;")]
+    after = poll_only[poll_only.index("l_done = 1;"):]
+    ck("H no failure path of the CLI arrival is a silent return (G3: the poll after `l_done = 1;` has no `return` at all and ONE exit(2) with the stderr diagnostic for every failure of pc_guest_arrive; "
+       "pc_guest_arrive has exactly 9 failure paths, each a `return 0` with a message: not a client, no GAME_PLAY, scene not ready, save reload, no valid save, bad spec, resident-name clash, "
+       "mSDI_StartDataInitGuest, goto_other_scene)",
+       "return" not in after and after.count("exit(2);") == 1 and after.count("fprintf(stderr, \"[PC] --bootstrap-guest: %s\\n\", err);") == 1 and after.count("fflush(stdout);") == 1
+       and arr.count("return 0;") == 9 and arr.count("snprintf(err, errcap,") == 9 and arr.count("return 1;") == 1)
+    pre = poll_only[:poll_only.index("l_done = 1;")]
     ck("H the only early `return`s of the poll are the one-shot / disabled guard and the two readiness waits (play_main, wipe), BEFORE l_done = 1 (the option-not-supplied path is untouched)",
        pre.count("return;") == 3 and "if (l_done || g_pc_bootstrap_guest == NULL) {" in pre and "gamePT->exec != play_main" in pre and "fb_wipe_mode != WIPE_MODE_NONE" in pre)
-    ck("H the failing paths never leave anything bound: the two binding failures (StartDataInit / goto_other_scene) exit 2 and the bad-spec / name exits are before the binding",
-       "mSDI_StartDataInit(gamePT, mPr_FOREIGNER, mSDI_INIT_MODE_PAK) != TRUE) {\n        fprintf(stderr" in poll and "res=%d)\\n\", scene_res);\n            fflush(stdout);\n            exit(2);" in poll)
+    ck("H the failing paths never leave anything bound: the two binding failures (StartDataInitGuest / goto_other_scene) RESTORE now_private / player_no / rtc_enabled before failing, the "
+       "bad-spec / name failures are before the binding",
+       re.search(r"mSDI_StartDataInitGuest\(gamePT\) != TRUE\) \{\s*Common_Set\(now_private, prev_private\);\s*Common_Set\(player_no, prev_player_no\);\s*Common_Set\(time\.rtc_enabled, prev_rtc\);", arr)
+       and re.search(r"scene_res != TRUE\) \{\s*Common_Set\(demo_profiles\[0\], mAc_PROFILE_NUM\);\s*Common_Set\(now_private, prev_private\);", arr))
     # reserved name: one shared helper, exact, observer literal agrees
     rn = S.body(S.mask(gc), S.functions(S.mask(gc)), "pc_mp_guests_name_reserved")
     ck("H the RESERVED observer name is ONE shared exact helper (pc_mp_guests.[ch]): 8-byte memcmp against PC_MP_GUEST_RESERVED_NAME = \"SERVER  \" (NULL -> 0), not case folded",
@@ -260,8 +270,9 @@ def main():
     # ---------------------------------------------------------------- G
     ck("G the guest-creation code never writes Save_t private_data / homes: pc_m_card.c's guest functions contain no `Save_Set(private_data` / `Save_GetPointer(private_data` / homes / mHS_ / mHm_ calls",
        not re.search(r"Save_Set\(private_data|Save_GetPointer\(private_data|homes|mHS_|mHm_", allg.replace("PersonalID_c* p = &Save_Get(private_data)[i].player_ID;", "")))
-    ck("G the observer / resident bootstrap and the GCI writers are not touched by this change: pc_save_bswap.c and the m_private.c / m_start_data_init.c decomp files have no diff vs HEAD",
-       all(not os.popen('git -C "%s" diff --name-only HEAD -- %s' % (ROOT, f)).read().strip() for f in ("pc/src/pc_save_bswap.c", "src/game/m_private.c", "src/game/m_start_data_init.c",
+    ck("G the observer / resident bootstrap and the GCI writers are not touched by this change: pc_save_bswap.c and the m_private.c decomp files have no diff vs HEAD "
+       "(G3: m_start_data_init.c IS edited, additively -- pinned strictly in test_guest_g3_src.py)",
+       all(not os.popen('git -C "%s" diff --name-only HEAD -- %s' % (ROOT, f)).read().strip() for f in ("pc/src/pc_save_bswap.c", "src/game/m_private.c",
                                                                                                          "src/game/m_needlework.c", "include/m_private.h")))
     eol_ok = True
     for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", True), ("pc/src/pc_main.c", True), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),

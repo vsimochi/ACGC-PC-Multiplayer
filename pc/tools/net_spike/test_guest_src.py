@@ -404,12 +404,14 @@ def main():
        and all(x in sr for x in ("Common_Get(now_private) == NULL", "case SCENE_TITLE_DEMO:", "case SCENE_PLAYERSELECT_SAVE:", "mLd_CHECK_LAND_ID(Save_Get(land_info.id))")))
     mc = mask(read("pc/src/pc_m_card.c"))
     mfn = functions(mc)
-    bg = body(mc, mfn, "pc_bootstrap_guest_poll")
-    ck("G2 --bootstrap-guest (pc_bootstrap_guest_poll): TEST-ONLY, one-shot, refuses any role but CLIENT, binds a foreigner exactly like the INCOMING_FOREIGNER arrival (now_private = the passport, "
-       "player_no = mPr_FOREIGNER, mSDI_StartDataInit MODE_PAK), NEVER arms pc_save_ready, NEVER writes a save or touches private_data[] (it only READS a template), spawns at the station",
-       bg != "" and "pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in bg and "static int l_done = 0;" in bg and "Common_Set(now_private, pass);" in bg
-       and "Common_Set(player_no, mPr_FOREIGNER);" in bg and "mSDI_StartDataInit(gamePT, mPr_FOREIGNER, mSDI_INIT_MODE_PAK)" in bg and "pc_save_ready" not in bg
-       and "pc_save_write" not in bg and not re.search(r"Save_GetPointer\(private_data\[[^\]]*\]\)\s*->\s*\w+\s*=", bg) and "1979" in bg and "760" in bg and "mAc_PROFILE_RIDE_OFF_DEMO" in bg)
+    bg_poll = body(mc, mfn, "pc_bootstrap_guest_poll")
+    bg_arr = body(mc, mfn, "pc_guest_arrive")  # G3: the arrival itself moved into the shared pc_guest_arrive (poll = one-shot / readiness waits + exit(2))
+    bg = bg_poll + "\n" + bg_arr
+    ck("G2 --bootstrap-guest (pc_bootstrap_guest_poll + G3 pc_guest_arrive): TEST-ONLY, one-shot, refuses any role but CLIENT, binds a foreigner exactly like the INCOMING_FOREIGNER arrival (now_private = the passport, "
+       "player_no = mPr_FOREIGNER; G3.1: mSDI_StartDataInitGuest = the PAK init without the gateway), NEVER arms pc_save_ready, NEVER writes a save or touches private_data[] (it only READS a template), spawns at the station",
+       bg_poll != "" and bg_arr != "" and "pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in bg_arr and "static int l_done = 0;" in bg_poll and "Common_Set(now_private, pass);" in bg_arr
+       and "Common_Set(player_no, mPr_FOREIGNER);" in bg_arr and "mSDI_StartDataInitGuest(gamePT)" in bg_arr and "MODE_PAK" not in bg and "pc_save_ready" not in bg
+       and "pc_save_write" not in bg and not re.search(r"Save_GetPointer\(private_data\[[^\]]*\]\)\s*->\s*\w+\s*=", bg) and "1979" in bg_arr and "760" in bg_arr and "mAc_PROFILE_RIDE_OFF_DEMO" in bg_arr)
     mm = mask(read("pc/src/pc_main.c"))
     ck("G2 pc_main.c: --bootstrap-guest is parsed, documented in --help, and REFUSED (exit 2) without --connect or together with --bootstrap-resident; pc_vi.c polls it next to the resident poll",
        'strcmp(argv[i], "--bootstrap-guest") == 0' in mm and "const char* g_pc_bootstrap_guest = NULL;" in mm and "--bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID" in raw_main()
@@ -417,7 +419,7 @@ def main():
     ck("G1.1 --bootstrap-guest is validated EARLY: pc_main.c calls pc_bootstrap_guest_validate(g_pc_bootstrap_guest) (exit 2 on failure) after the role check and before pc_platform_init(); "
        "the poll's failure paths all exit(2) with a stderr diagnostic (no silent `return` after l_done = 1)",
        mm.find("g_pc_bootstrap_guest != NULL && (g_pc_net_role != 2") < mm.find("pc_bootstrap_guest_validate(g_pc_bootstrap_guest)") < mm.find("    pc_platform_init();")
-       and "return" not in bg[bg.index("l_done = 1;"):] and bg[bg.index("l_done = 1;"):].count("exit(2);") == 6
+       and "return" not in bg_poll[bg_poll.index("l_done = 1;"):] and bg_poll[bg_poll.index("l_done = 1;"):].count("exit(2);") == 1 and "exit(" not in bg_arr
        and body(mc, mfn, "pc_bootstrap_guest_validate") != "")
     gci = gcheck.index("pcnetgame_guest_find(key)")
     ck("G1.1 guest_check: the KEY conflict + validity run for every mode before the lookup; the resident-name and reserved-name rules sit only AFTER the token decision (mode 1 is never refused for a name)",

@@ -34,6 +34,11 @@ extern int mSDI_StartDataInit(GAME* game, int player_no, int init_mode);
 extern int mSDI_StartDataInitObserver(GAME* game);
 #endif
 
+#ifdef TARGET_PC
+/* PC: a multiplayer GUEST's arrival init = the visitor (PAK) init minus mEv_SetGateway / return animal / goodbye mail (Guests G3.1, pc_m_card.c pc_guest_arrive()). */
+extern int mSDI_StartDataInitGuest(GAME* game);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

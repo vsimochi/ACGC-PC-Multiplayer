@@ -34,6 +34,7 @@
 #include "lb_rtc.h"
 #include "game.h"
 #include "pc_net_game.h"
+#include "pc_guest_profile.h" /* Guests G3.2: PCGuestProfile / pc_guest_profile_load_or_create (the title-menu "Join as Guest" item) */
 #include "pc_mp_guests.h" /* Guests G1: pc_mp_guests_name_valid() (the guest NAME rule shared with the host) */
 #include "m_string.h"   /* Guests G1: mString_Load_StringFromRom (default design names) */
 #include "jsyswrap.h"   /* Guests G1: _JW_GetResourceAram (default design textures) */
@@ -1446,29 +1447,138 @@ static int pc_guest_resident_name_conflict(const PersonalID_c* home) {
     return -1;
 }
 
-/* Guests G2: --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID (see pc_main.c). TEST-ONLY, default off, CLIENT role only (refused otherwise): makes THIS process a
- * GUEST -- a foreigner whose HOME PersonalID is the given one -- in the town it loaded, the state a vanilla train arrival leaves (mCD_InitGameStart_bg,
- * start_cond INCOMING_FOREIGNER: now_private = the passport, player_no = mPr_FOREIGNER, mSDI_StartDataInit(.., MODE_PAK)), and spawns it at the station
- * exactly like the restart NPC's type 1 / 2 entry (aNPS2_make_door_data: SCENE_FG at (1979, 760), RIDE_OFF_DEMO, circle wipe). The passport is a COPY of
- * Guests G1: a FRESH, independent character (pc_guest_build_fresh_record: vanilla empty markers via mPr_ClearPrivateInfo + mPr_InitPrivateInfo, the guest's HOME
- * PersonalID, gender / face / starter shirt given or derived from the identity; empty pockets / wallet), NEVER a copy of a resident: that is what the host's
- * first-contact MIGRATE imports. The name must be a valid game name and must not equal a resident's name of the loaded town (the host enforces the same rule
- * for NEW guests, and more: pcnetgame_host_guest_check) and not be the reserved observer name: otherwise the process exits with code 2 before it connects as
- * anything. EVERY failure after the readiness wait prints a diagnostic on stderr and exits 2 (never a silent return that would leave an unbound client
- * running); pc_bootstrap_guest_validate() fails the same bad specs even earlier, before any window / network / save work. Same one-shot / readiness preconditions as
- * pc_bootstrap_resident_poll(). It NEVER arms pc_save_ready (a guest process can write no save at all), never writes or even indexes Save_t's
- * private_data[] in this function, and fires at most once per process. */
-void pc_bootstrap_guest_poll(void) {
-    extern const char* g_pc_bootstrap_guest; /* pc_main.c; NULL = disabled (default) */
-    static int l_done = 0;
+/* Guests G3.2 (client-only title menu "Join as Guest"): the failure message of the last attempt (shown by the title menu for a few seconds) and the cached
+ * label. Plain statics, no allocation. */
+static char s_pc_guest_title_msg[256];
+static time_t s_pc_guest_title_msg_until = 0;
+static char s_pc_guest_title_label[48] = "Join as Guest";
+static int s_pc_guest_title_label_done = 0;
+
+/* Guests G3: the ONE guest arrival, shared by --bootstrap-guest / --guest (pc_bootstrap_guest_poll, exit(2) on failure) and the title-menu item
+ * (pc_guest_title_join, back to the title with a message on failure). `tag` prefixes the log lines ("--bootstrap-guest" / "join-as-guest").
+ * Steps, each failing BEFORE anything is bound unless noted (err = "REFUSED: ..." / "FAILED: ...", the function returns 0):
+ *   1. CLIENT role, a ready title scene (play_main, no wipe, a player actor: goto_other_scene needs exactly those, so it can no longer fail after the init);
+ *   2. the town save is RE-READ from disk with pc_save_reload() -- the very call the vanilla Start path makes (ac_animal_logo.c
+ *      aAL_title_game_data_init_start_select: "the title demo mutated save data in RAM") -- and must be valid (mFRm_CheckSaveData);
+ *   3. spec check + resident-name check (read-only over the freshly reloaded private_data[0..3]);
+ *   4. the fresh record into the passport, bind now_private = passport / player_no = mPr_FOREIGNER / rtc_enabled (the previous values are kept and RESTORED if
+ *      the init fails);
+ *   5. mSDI_StartDataInitGuest() = the visitor (PAK) init WITHOUT mEv_SetGateway / return animal / goodbye mail (src/game/m_start_data_init.c);
+ *   6. goto_other_scene to the station (SCENE_FG at (1979, 760)) with RIDE_OFF_DEMO and the circle wipe.
+ * It NEVER arms pc_save_ready (a guest process can write no save at all), never writes or indexes Save_t's private_data[] / homes[] except the read-only name
+ * check, runs no new-town / new-player init and allocates no house. */
+static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t errcap) {
     PersonalID_c home;
     Private_c* pass;
+    Private_c* prev_private;
+    int prev_player_no;
+    int prev_rtc;
     GAME_PLAY* play;
     Door_data_c door_data;
     int opt_gender = -1;
     int opt_face = -1;
     int clash;
+    int scene_res;
     const char* bad_why = "unknown";
+
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        snprintf(err, errcap, "REFUSED: a CLIENT-only test hook (the process is not a client)");
+        return 0;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        snprintf(err, errcap, "FAILED: the title scene is not running (no GAME_PLAY)");
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE || get_player_actor_withoutCheck(play) == NULL) {
+        snprintf(err, errcap, "FAILED: the title scene is not ready (a scene change is already running or there is no player actor)");
+        return 0;
+    }
+    if (pc_save_loaded) {
+        if (!pc_save_reload()) {
+            snprintf(err, errcap, "FAILED: the town save could not be re-read from disk (save/card_a)");
+            return 0;
+        }
+        OSReport("[PC] %s: town save re-read from disk before the arrival (pc_save_reload(), as the vanilla Start path does: the title demo mutated it in RAM)\n", tag);
+    }
+    if (mFRm_CheckSaveData() == FALSE) {
+        snprintf(err, errcap, "FAILED: no valid town save is loaded (a guest needs the town the client loaded)");
+        return 0;
+    }
+    /* defence in depth: pc_main.c already ran pc_bootstrap_guest_validate() before anything started */
+    if (!pc_guest_spec_check(spec, &home, &opt_gender, &opt_face, &bad_why)) {
+        snprintf(err, errcap, "REFUSED: bad spec '%s': %s (expected NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]])", spec, bad_why);
+        return 0;
+    }
+    clash = pc_guest_resident_name_conflict(&home);
+    if (clash >= 0) {
+        snprintf(err, errcap, "REFUSED: the guest name '%.8s' equals the name of resident %d of this town (a guest must have its own name)",
+                 (const char*)home.player_name, clash);
+        return 0;
+    }
+    memset(&l_mcd_foreigner_file, 0, sizeof(l_mcd_foreigner_file));
+    pass = &l_mcd_foreigner_file.file.priv;
+    pc_guest_build_fresh_record(pass, &home, opt_gender, opt_face);
+    l_mcd_foreigner_file.file.copy_protect = (u16)Common_Get(copy_protect);
+    OSReport("[PC] %s: FRESH guest record (not a copy of any resident): gender=%d face=%d shirt=0x%04X (%s), empty pockets / wallet / letters\n", tag,
+             (int)pass->gender, (int)pass->face, (unsigned)pass->cloth.item,
+             (opt_gender >= 0 || opt_face >= 0) ? "given / derived from the identity" : "derived from the identity");
+
+    prev_private = Common_Get(now_private);
+    prev_player_no = Common_Get(player_no);
+    prev_rtc = Common_Get(time.rtc_enabled);
+    Common_Set(time.rtc_enabled, TRUE); /* see pc_bootstrap_resident_poll() */
+    Common_Set(now_private, pass);
+    Common_Set(player_no, mPr_FOREIGNER);
+    if (mSDI_StartDataInitGuest(gamePT) != TRUE) {
+        Common_Set(now_private, prev_private);
+        Common_Set(player_no, prev_player_no);
+        Common_Set(time.rtc_enabled, prev_rtc);
+        snprintf(err, errcap, "FAILED: mSDI_StartDataInitGuest failed (the guest could not be bound)");
+        return 0;
+    }
+    OSReport("[PC] %s: guest init ran WITHOUT the gateway (mSDI_StartDataInitGuest: no mEv_SetGateway / return animal / goodbye mail): gateway flag after init = %d (0 = not set), player_no = %d\n",
+             tag, (int)mEv_CheckGateway(), (int)Common_Get(player_no));
+    /* pc_save_ready is deliberately NOT armed: this process can never write a save. */
+
+    door_data.next_scene_id = SCENE_FG;
+    door_data.exit_orientation = mSc_DIRECT_SOUTH;
+    door_data.exit_type = 0;
+    door_data.extra_data = 0;
+    door_data.exit_position.x = 1979;
+    door_data.exit_position.y = 0;
+    door_data.exit_position.z = 760;
+    door_data.door_actor_name = EMPTY_NO;
+    door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
+    Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
+    Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
+    scene_res = goto_other_scene(play, &door_data, TRUE);
+    if (scene_res != TRUE) {
+        Common_Set(demo_profiles[0], mAc_PROFILE_NUM);
+        Common_Set(now_private, prev_private);
+        Common_Set(player_no, prev_player_no);
+        Common_Set(time.rtc_enabled, prev_rtc);
+        snprintf(err, errcap, "FAILED: goto_other_scene to SCENE_FG (station) failed (res=%d)", scene_res);
+        return 0;
+    }
+    OSReport("[PC] %s: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the station (SCENE_FG)\n", tag,
+             (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id);
+    return 1;
+}
+
+/* Guests G2: --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID (see pc_main.c; --guest feeds it from guest.ini). TEST-ONLY / headless entry, default off, CLIENT role
+ * only (refused otherwise): makes THIS process a GUEST -- a foreigner whose HOME PersonalID is the given one -- in the town it loaded, the state a vanilla train
+ * arrival leaves (mCD_InitGameStart_bg, start_cond INCOMING_FOREIGNER: now_private = the passport, player_no = mPr_FOREIGNER) and spawns it at the station exactly
+ * like the restart NPC's type 1 / 2 entry (aNPS2_make_door_data: SCENE_FG at (1979, 760), RIDE_OFF_DEMO, circle wipe). All of that is pc_guest_arrive() (shared with
+ * the title-menu item): since Guests G3 it re-reads the town save first (pc_save_reload()) and uses mSDI_StartDataInitGuest() (no gateway) instead of the visitor PAK
+ * init. The passport is a FRESH, independent character (pc_guest_build_fresh_record), NEVER a copy of a resident: that is what the host's first-contact MIGRATE
+ * imports. EVERY failure after the readiness wait prints a diagnostic on stderr and exits 2 (never a silent return that would leave an unbound client running);
+ * pc_bootstrap_guest_validate() fails the same bad specs even earlier, before any window / network / save work. Same one-shot / readiness preconditions as
+ * pc_bootstrap_resident_poll(). Fires at most once per process. */
+void pc_bootstrap_guest_poll(void) {
+    extern const char* g_pc_bootstrap_guest; /* pc_main.c; NULL = disabled (default) */
+    static int l_done = 0;
+    char err[320];
 
     if (l_done || g_pc_bootstrap_guest == NULL) {
         return;
@@ -1481,69 +1591,74 @@ void pc_bootstrap_guest_poll(void) {
     }
     l_done = 1;
 
-    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
-        fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: a CLIENT-only test hook (the process is not a client)\n");
+    if (!pc_guest_arrive("--bootstrap-guest", g_pc_bootstrap_guest, err, sizeof(err))) {
+        fprintf(stderr, "[PC] --bootstrap-guest: %s\n", err);
         fflush(stdout);
         exit(2);
     }
-    if (mFRm_CheckSaveData() == FALSE) {
-        fprintf(stderr, "[PC] --bootstrap-guest: FAILED: no valid town save is loaded (a guest needs the town the client loaded)\n");
-        fflush(stdout);
-        exit(2);
-    }
-    /* defence in depth: pc_main.c already ran pc_bootstrap_guest_validate() before anything started */
-    if (!pc_guest_spec_check(g_pc_bootstrap_guest, &home, &opt_gender, &opt_face, &bad_why)) {
-        fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: bad spec '%s': %s (expected NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]])\n", g_pc_bootstrap_guest, bad_why);
-        fflush(stdout);
-        exit(2);
-    }
-    clash = pc_guest_resident_name_conflict(&home);
-    if (clash >= 0) {
-        fprintf(stderr, "[PC] --bootstrap-guest: REFUSED: the guest name '%.8s' equals the name of resident %d of this town (a guest must have its own name)\n",
-                (const char*)home.player_name, clash);
-        fflush(stdout);
-        exit(2);
-    }
-    memset(&l_mcd_foreigner_file, 0, sizeof(l_mcd_foreigner_file));
-    pass = &l_mcd_foreigner_file.file.priv;
-    pc_guest_build_fresh_record(pass, &home, opt_gender, opt_face);
-    l_mcd_foreigner_file.file.copy_protect = (u16)Common_Get(copy_protect);
-    OSReport("[PC] --bootstrap-guest: FRESH guest record (not a copy of any resident): gender=%d face=%d shirt=0x%04X (%s), empty pockets / wallet / letters\n",
-             (int)pass->gender, (int)pass->face, (unsigned)pass->cloth.item,
-             (opt_gender >= 0 || opt_face >= 0) ? "given / derived from the identity" : "derived from the identity");
+}
 
-    Common_Set(time.rtc_enabled, TRUE); /* see pc_bootstrap_resident_poll() */
-    Common_Set(now_private, pass);
-    Common_Set(player_no, mPr_FOREIGNER);
-    if (mSDI_StartDataInit(gamePT, mPr_FOREIGNER, mSDI_INIT_MODE_PAK) != TRUE) {
-        fprintf(stderr, "[PC] --bootstrap-guest: FAILED: mSDI_StartDataInit failed (the guest could not be bound)\n");
-        fflush(stdout);
-        exit(2);
-    }
-    /* pc_save_ready is deliberately NOT armed: this process can never write a save. */
+/* Guests G3.2: the title-menu "Join as Guest" item (src/actor/ac_animal_logo.c, PC_ENHANCEMENTS). Client-only: the item is visible for any --connect client. The label
+ * carries the guest name once the profile (save/mp/guest.ini) could be read; a missing profile is created like --guest does, a broken one never touched. */
+int pc_guest_title_item_visible(void) {
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT;
+}
 
-    play = (GAME_PLAY*)gamePT;
-    door_data.next_scene_id = SCENE_FG;
-    door_data.exit_orientation = mSc_DIRECT_SOUTH;
-    door_data.exit_type = 0;
-    door_data.extra_data = 0;
-    door_data.exit_position.x = 1979;
-    door_data.exit_position.y = 0;
-    door_data.exit_position.z = 760;
-    door_data.door_actor_name = EMPTY_NO;
-    door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
-    Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
-    Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
-    {
-        int scene_res = goto_other_scene(play, &door_data, TRUE);
-        if (scene_res != TRUE) {
-            fprintf(stderr, "[PC] --bootstrap-guest: FAILED: goto_other_scene to SCENE_FG (station) failed (res=%d)\n", scene_res);
-            fflush(stdout);
-            exit(2);
+const char* pc_guest_title_label(void) {
+    if (!s_pc_guest_title_label_done) {
+        PCGuestProfile gp;
+        char perr[512];
+        s_pc_guest_title_label_done = 1; /* read once; the click re-reads the file */
+        if (pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, perr, sizeof(perr)) != PC_GUEST_PROFILE_ERR) {
+            snprintf(s_pc_guest_title_label, sizeof(s_pc_guest_title_label), "Join as Guest (%s)", gp.name);
+        } else {
+            OSReport("[PC] join-as-guest: the guest profile is not usable yet: %s\n", perr);
         }
     }
-    OSReport("[PC] --bootstrap-guest: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the station (SCENE_FG)\n",
-             (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id);
+    return s_pc_guest_title_label;
+}
+
+const char* pc_guest_title_message(void) {
+    if (s_pc_guest_title_msg[0] == '\0' || time(NULL) >= s_pc_guest_title_msg_until) {
+        return NULL;
+    }
+    return s_pc_guest_title_msg;
+}
+
+static void pc_guest_title_fail(const char* what) {
+    snprintf(s_pc_guest_title_msg, sizeof(s_pc_guest_title_msg), "%s", what);
+    s_pc_guest_title_msg_until = time(NULL) + 8;
+    OSReport("[PC] join-as-guest: FAILED: %s -- staying on the title screen\n", what);
+}
+
+/* Returns 1 = the arrival began (the station scene change was requested), 0 = it failed: a message is set for the title menu, NOTHING exits and the title
+ * keeps running. (The save reload, if reached, is harmless: it is what Start Game does too.) */
+int pc_guest_title_join(void) {
+    PCGuestProfile gp;
+    char perr[512];
+    char spec[96];
+    char err[320];
+    int gres;
+
+    s_pc_guest_title_msg[0] = '\0';
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        pc_guest_title_fail("only a network client (--connect) can join as a guest");
+        return 0;
+    }
+    gres = pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, perr, sizeof(perr));
+    if (gres == PC_GUEST_PROFILE_ERR) {
+        pc_guest_title_fail(perr);
+        return 0;
+    }
+    if (!pc_guest_profile_spec(&gp, spec, sizeof(spec))) {
+        pc_guest_title_fail("internal error: the guest profile does not fit the spec buffer");
+        return 0;
+    }
+    if (!pc_guest_arrive("join-as-guest", spec, err, sizeof(err))) {
+        pc_guest_title_fail(err);
+        return 0;
+    }
+    return 1;
 }
 
 /* OBSERVER-BEGIN */

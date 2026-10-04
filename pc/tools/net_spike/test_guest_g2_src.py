@@ -124,15 +124,21 @@ def main():
        blk.count("return 2;") == 3 and "g_pc_net_role != 2" in blk and "usage: AnimalCrossing --connect HOST[:PORT] --guest" in blk and blk.count("[PC] --guest: REFUSED") == 3)
     ck("C the profile is loaded / created with the module and a bad profile exits 2 with the module's diagnostic (bad key named): pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, ...)",
        "pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, &gp, gerr, sizeof(gerr))" in blk and "bad guest profile" in blk and "pc_guest_profile_spec(&gp, g_pc_guest_spec" in blk)
-    ck("C it then drives the SAME arrival path: g_pc_bootstrap_guest = g_pc_guest_spec (the --bootstrap-guest spec); pc_bootstrap_guest_poll is neither duplicated nor edited by this change",
-       "g_pc_bootstrap_guest = g_pc_guest_spec;" in blk and not re.search(r"pc_guest_profile", S.read("pc/src/pc_m_card.c")) and not re.search(r"pc_guest_profile|g_pc_guest\b", S.read("pc/src/pc_vi.c")))
+    _mc = S.mask(S.read("pc/src/pc_m_card.c"))
+    _mcf = S.functions(_mc)
+    _arr_poll = S.body(_mc, _mcf, "pc_bootstrap_guest_poll") + S.body(_mc, _mcf, "pc_guest_arrive")
+    ck("C it then drives the SAME arrival path: g_pc_bootstrap_guest = g_pc_guest_spec (the --bootstrap-guest spec); pc_bootstrap_guest_poll is not duplicated (G3 update: the arrival now lives in the "
+       "shared pc_guest_arrive; the profile module is referenced from pc_m_card.c only by the title-menu functions, never by the poll / arrival, and not at all by pc_vi.c)",
+       "g_pc_bootstrap_guest = g_pc_guest_spec;" in blk and "pc_guest_profile" not in _arr_poll and "PCGuestProfile" not in _arr_poll
+       and not re.search(r"pc_guest_profile|g_pc_guest\b", S.read("pc/src/pc_vi.c")))
     ck("C --bootstrap-guest stays the TEST hook (its own parse + early validation unchanged)",
        'strcmp(argv[i], "--bootstrap-guest") == 0 && i + 1 < argc' in main_raw and "pc_bootstrap_guest_validate(g_pc_bootstrap_guest)" in main_raw)
 
     # ---------------------------------------------------------------- D
     ck("D no protocol version bump (PC_NETGAME_PROTOCOL_VERSION is still the value the wire baseline pins) and the wire baseline is green", wire_baseline_ok())
-    ck("D no G3 work: the title menu actor and the arrival code are not touched (no Join-as-Guest item, no pc_guest_profile reference in ac_animal_logo.c / pc_m_card.c)",
-       "Join as Guest" not in S.read("src/actor/ac_animal_logo.c") and "pc_guest_profile" not in S.read("pc/src/pc_m_card.c"))
+    ck("D (G3 update of the G2 pin 'no G3 work') the G2 guarantees that remain: the title actor never touches the profile module itself (it only calls pc_guest_title_* in pc_m_card.c) and "
+       "the guest.ini writer is still the module's atomic writer only (see B)",
+       "pc_guest_profile" not in S.read("src/actor/ac_animal_logo.c") and "pc_guest_title_join" in S.read("src/actor/ac_animal_logo.c"))
     eol_ok = True
     for rel, crlf in (("pc/src/pc_net_game.c", True), ("pc/src/pc_main.c", True), ("pc/CMakeLists.txt", None), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
                       ("pc/src/pc_guest_profile.c", False), ("pc/include/pc_guest_profile.h", False), ("pc/tools/net_spike/guest_g2_selftest.c", False),
