@@ -550,6 +550,11 @@ Manual verification still needed (two instances, nothing was seen on screen): a 
 - `pc/tools/net_spike/test_building_interactions_src.py` (SOURCE AUDIT only): flags, row shapes, root pin apply/clear, hidden_door set/timeout/clears, scene gate, snap_req wait and trim, collision hold, sender facing value.
 - `pc/tools/net_spike/test_move_action_state_wire.py --only s3` (REAL host process + scripted client, HOOK-DRIVEN, no visual check): the parsed row table still covers all 121 indexes (now 48 filled rows incl. knock_door / door / outdoor) and every index, including 4, 5 and 100, logs the expected row without crashing the host.
 
+### Puppet idle speed and shop NPC (investigation)
+
+* Remote idle played at 2x: the puppet's animation fallback rebind (`pc_remote_player.c`, "desired_anim_idx changed") bound frame 0 / speed 1.0, but vanilla wait (`m_player_main_wait.c_inc`, `InitAnimation_Base1`) is frame 1.0 / speed 0.5; WAIT1 is excluded from the tempo retune, so after every walk->stop and every action row (door, outdoor, tool, pickup) idle ran at twice the vanilla rate. Walk/run/dash/RUN_SLIP overwrite the speed afterwards, so they were unaffected. Fix: bind 1.0 / 0.5. The door clip itself already used the vanilla 0.5; the abrupt start (vanilla door uses morph -9, the puppet morph 0) is NOT changed. Timebase check: `cKF_FrameControl_play` scales by the same frame-time for local and puppet, and the puppet advances once per `mv`, so no per-packet / double advance was found. Verified by build + source reading only, not visually.
+* Tom Nook following only the local player is NOT a sync bug: `ac_npc_shop_master*` / `ac_npc_shop_common.c` target only `GET_PLAYER_ACTOR`; puppets are not PLAYER actors, the shop scene is a per-process interior, Nook is not in `Save animals[]` so N2 villager sync never carries it. Each process sees its own Nook. Deliberately left unsynchronised (making shop NPCs host-authoritative would break buy/sell/camera demos). A cosmetic follow-up would be a TARGET_PC target picker over same-interior puppets in `aNSC_set_zone_data` / `aNSC_decide_next_move_act`.
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

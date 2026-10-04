@@ -4701,10 +4701,11 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
                 printf("[NET][REMOTE][DIAG] player %d: animation %d -> %d (move_state=%d)\n", (int)self->peer,
                        self->visual.current_anim_idx, desired_anim_idx, (int)self->cosmetic_move_state);
             }
+            /* vanilla wait (m_player_main_wait.c_inc InitAnimation_Base1) is frame 1.0 / speed 0.5; walk/run/dash tempo and RUN_SLIP retune below. Was 0.0/1.0 = idle at 2x after every action row. */
             cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&self->visual.keyframe0, new_anim, NULL,
-                                                                             0.0f, 1.0f, 0.0f);
+                                                                             1.0f, 0.5f, 0.0f);
             cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&self->visual.keyframe1, new_anim1, NULL,
-                                                                             0.0f, 1.0f, 0.0f);
+                                                                             1.0f, 0.5f, 0.0f);
             self->visual.current_anim_idx = desired_anim_idx;
             self->visual.current_anim1_idx = desired_anim1_idx;
 
