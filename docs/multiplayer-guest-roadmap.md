@@ -108,7 +108,7 @@ Limitations:
 
 ## G4 - capacity and identity separation under concurrency
 
-Status: **Complete, with limitations** (every focused test green; the real-client tier runs 2 guests + 1 resident, the harness limit, higher counts are scripted). Commit hash: (filled by orchestrator)
+Status: **Complete, with limitations** (every focused test green; the real-client tier runs 2 guests + 1 resident, the harness limit, higher counts are scripted). Commit hash: 8b9ebdd
 
 What was implemented:
 
