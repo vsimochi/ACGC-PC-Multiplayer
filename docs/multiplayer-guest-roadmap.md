@@ -369,7 +369,7 @@ Tests: `test_guest_train.py` (native unit of `pc/include/pc_arrival_logic.h`), `
 
 ### T3 / T4: arrival presentation on the other processes
 
-Commit hash: (filled by orchestrator). Baseline f660cc7. Protocol version unchanged (8), NO wire message / flag added: everything is derived from the MOVE `action_state` main index, the positions and the PLAYER_SCENE already on the wire; `pc_net_game.c/.h`, `pc_net.c/.h` are byte-identical to the baseline.
+Commit hash: 98c61c8. Baseline f660cc7. Protocol version unchanged (8), NO wire message / flag added: everything is derived from the MOVE `action_state` main index, the positions and the PLAYER_SCENE already on the wire; `pc_net_game.c/.h`, `pc_net.c/.h` are byte-identical to the baseline.
 
 What the code does (verified against the decomp, not only the design):
 
