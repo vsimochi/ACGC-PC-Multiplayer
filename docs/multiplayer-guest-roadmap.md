@@ -347,7 +347,7 @@ Limitations (G6):
 
 ## Guest arrival: train / sync / world edge
 
-Phase T (design: investigation of branch `multiplayer` at 018344c). Commit: (filled by orchestrator). Protocol version unchanged (8), no wire message added.
+Phase T (design: investigation of branch `multiplayer` at 018344c). Commit: b67775d. Protocol version unchanged (8), no wire message added.
 
 | Step | What | Status |
 |---|---|---|
