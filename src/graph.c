@@ -199,8 +199,11 @@ static void graph_task_set00(GRAPH* this) {
             PC_DIAG(3, "graph_task_set00: emu64_taskstart(Gfx_list05=%p)\n", (void*)this->Gfx_list05);
 #ifdef TARGET_PC
             {
+                extern int g_pc_dedicated; /* --dedicated: the display list is never interpreted (nothing is drawn); see pc_dedicated.h */
                 Uint64 pc_prof_t = pc_profiler_begin_timer();
-                emu64_taskstart(this->Gfx_list05); /* work data */
+                if (!g_pc_dedicated) {
+                    emu64_taskstart(this->Gfx_list05); /* work data */
+                }
                 pc_profiler_add_time(PC_PROF_TIMER_EMU64, pc_prof_t);
             }
 #else

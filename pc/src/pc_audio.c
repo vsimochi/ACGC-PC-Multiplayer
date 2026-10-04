@@ -11,6 +11,7 @@
 #include "pc_platform.h"
 #include "pc_settings.h"
 #include "jaudio_NES/audiothread.h"
+#include "pc_dedicated.h"
 
 #define PC_AUDIO_SAMPLE_RATE 32000
 
@@ -109,8 +110,10 @@ void AIInit(u8* stack) {
     if (audio_device != 0) {
         printf("[AUDIO] Opened: freq=%d fmt=0x%04X ch=%d samples=%d (requested: freq=%d)\n",
                have.freq, have.format, have.channels, have.samples, want.freq);
+        if (g_pc_dedicated) pc_dedicated_audio_opened(1, have.freq, have.channels, have.samples);
     } else {
         printf("[AUDIO] Failed to open: %s\n", SDL_GetError());
+        if (g_pc_dedicated) pc_dedicated_audio_opened(0, 0, 0, 0); /* dedicated: a stalled audio producer is not acceptable -> exits 1 */
     }
 }
 
@@ -193,6 +196,11 @@ void* DSPAddTask(void* task) { return task; }
 
 int pc_audio_get_buffer_fill(void) {
     return SDL_AtomicGet(&ring_write_pos) - SDL_AtomicGet(&ring_read_pos);
+}
+
+/* --dedicated `status`: total samples the SDL callback has consumed (proves the dummy device keeps draining the ring). Read-only. */
+int pc_audio_consumed_samples(void) {
+    return SDL_AtomicGet(&ring_read_pos);
 }
 
 int pc_audio_is_active(void) {

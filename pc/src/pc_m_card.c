@@ -37,6 +37,7 @@
 /* OBSERVER-BEGIN */
 #include "pc_host_observer.h"
 #include "pc_log.h"
+#include "pc_dedicated.h"
 #include "pc_field_authority.h"
 #include "m_player_lib.h"
 #include "ac_birth_control.h"
@@ -554,6 +555,7 @@ static int pc_save_write_authoritative_impl(void);
 int pc_save_write_authoritative(void) {
     int ok = pc_save_write_authoritative_impl();
     PC_LOG(PCL_SAVE, "authoritative save %s\n", ok ? "OK" : "FAILED/REJECTED");
+    if (g_pc_dedicated) pc_dedicated_notify_save_result(ok); /* --dedicated: every save result (periodic / early / shutdown / console) */
     return ok;
 }
 
@@ -1435,6 +1437,7 @@ void pc_host_observer_poll(void) {
             s_pc_observer_latched = 1;
             OSReport("[NET][OBSERVER] host: observer active at acre (%d,%d)\n", (int)play->block_table.block_x, (int)play->block_table.block_z);
             OSReport("[NET][OBSERVER] host: avatar main_index=%d (hidden, no collider, no input)\n", mPlib_get_player_actor_main_index(gamePT));
+            if (g_pc_dedicated) pc_dedicated_say("observer active at acre (%d,%d): the hidden server identity is parked in the town", (int)play->block_table.block_x, (int)play->block_table.block_z);
         }
         return;
     }

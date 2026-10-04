@@ -4767,6 +4767,15 @@ int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
     return 1;
 }
 
+/* --dedicated console accessor: see pc_remote_player.h. Read-only. */
+int pc_remote_player_puppet_state(PCNetPlayerId player_id) {
+    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    if (slot == NULL || !slot->in_use) {
+        return 0;
+    }
+    return pc_remote_player_actor_is_live(slot) ? 2 : 1;
+}
+
 /* Stage 5A: see the doc comment in pc_remote_player.h. Reads the NEWEST entry of the same
  * snapshot ring pc_remote_player_interpolate() already consumes for rendering -- `snapshot_head`
  * is "the index the NEXT snapshot will be written to" (see its own field doc above), so the most

@@ -319,12 +319,15 @@ static bool FrameDrawing = false;
 
 #ifdef TARGET_PC
 extern "C" void pc_gx_begin_frame(void);
+extern "C" int g_pc_dedicated; /* --dedicated: no GL frame is begun (nothing is drawn) */
 #endif
 
 extern void JW_BeginFrame() {
 #ifdef TARGET_PC
     /* Clear framebuffer at frame start so we don't see undefined data */
-    pc_gx_begin_frame();
+    if (!g_pc_dedicated) {
+        pc_gx_begin_frame();
+    }
     FrameDrawing = true;
     return;
 #endif

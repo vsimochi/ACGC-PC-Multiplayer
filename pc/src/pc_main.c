@@ -12,6 +12,7 @@
 #include "pc_profiler.h"
 #include "pc_net_game.h"
 #include "pc_host_observer.h"
+#include "pc_dedicated.h"
 #include "pc_log.h"
 #include "pc_rng_domains_selftest.h"
 #include "m_kankyo.h"
@@ -101,9 +102,16 @@ void pc_platform_init(void) {
     signal(SIGINT, pc_signal_handler);
     signal(SIGTERM, pc_signal_handler);
 #endif
+    if (g_pc_dedicated) {
+        pc_dedicated_pre_sdl_init(); /* --dedicated: dummy audio driver, selected BEFORE SDL_Init reads the driver choice */
+    }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         exit(1);
+    }
+    if (g_pc_dedicated && !pc_dedicated_post_sdl_init()) {
+        SDL_Quit();
+        exit(1); /* the dummy audio driver did not open: a dedicated server must not run with a real/stalled audio device */
     }
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -126,6 +134,9 @@ void pc_platform_init(void) {
             flags |= SDL_WINDOW_FULLSCREEN;
         } else if (g_pc_settings.fullscreen == 2) {
             flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+        }
+        if (g_pc_dedicated) {
+            flags = SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN; /* --dedicated: hidden, never shown (SDL_ShowWindow is never called), not fullscreen/resizable; the GL 3.3 context below still exists */
         }
         g_pc_window = SDL_CreateWindow(
             PC_WINDOW_TITLE,
@@ -155,7 +166,7 @@ void pc_platform_init(void) {
         exit(1);
     }
 
-    SDL_GL_SetSwapInterval(g_pc_settings.vsync);
+    SDL_GL_SetSwapInterval(g_pc_dedicated ? 0 : g_pc_settings.vsync); /* --dedicated: no vsync */
 
     pc_platform_update_window_size();
 
@@ -168,10 +179,13 @@ void pc_platform_init(void) {
     pc_gx_init();
     pc_texture_pack_init();
 #ifdef PC_ENHANCEMENTS
-    if (g_pc_settings.preload_textures) {
+    if (g_pc_settings.preload_textures && !g_pc_dedicated) { /* --dedicated: nothing is drawn, no GL texture preload */
         pc_texture_pack_preload_all();
     }
 #endif
+    if (g_pc_dedicated) {
+        pc_dedicated_platform_summary();
+    }
 }
 
 extern void PADCleanup(void);
@@ -573,6 +587,12 @@ int main(int argc, char* argv[]) {
             printf("                      player): the host plays NO resident. It binds a hidden, inert, static server identity\n");
             printf("                      (never saved, never sent to clients) parked in the town field, so all four residents\n");
             printf("                      can be claimed by clients. Default off; plain --host is unchanged. See pc_host_observer.h.\n");
+            printf("  --dedicated         HOST-only option (requires --host; exit code 2 otherwise; cannot be combined with --connect,\n");
+            printf("                      --bootstrap-resident, --bootstrap-guest or the host-self test hooks): run as an unattended\n");
+            printf("                      server. Implies --host-observer (no host resident), creates a HIDDEN window, no vsync, draws\n");
+            printf("                      nothing, uses SDL's dummy audio driver, keeps the console on and reads commands from stdin:\n");
+            printf("                      help, status, players, save, stop (Ctrl+C also stops gracefully). Default off; plain --host,\n");
+            printf("                      --host-observer and --bootstrap-resident are unchanged. See pc_dedicated.h.\n");
             printf("  --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID  TEST-ONLY, CLIENT role only, default off:\n");
             printf("                      become a GUEST (foreigner with that HOME PersonalID, the record of\n");
             printf("                      the first existing resident of the loaded town as a template) in the\n");
@@ -814,6 +834,9 @@ int main(int argc, char* argv[]) {
             i++;
         } else if (strcmp(argv[i], "--host-observer") == 0) {
             g_pc_host_observer = 1;
+        } else if (strcmp(argv[i], "--dedicated") == 0) {
+            g_pc_dedicated = 1;
+            pc_dedicated_early_console(); /* attach/allocate a console now so even the refusal text below is visible (valid redirected handles are kept) */
         } else if (strcmp(argv[i], "--authoritative-wildlife") == 0) {
             g_pc_authoritative_wildlife = 1;
         } else if (strcmp(argv[i], "--profile") == 0) {
@@ -904,6 +927,52 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
+    /* --dedicated: HOST-only; incompatible with --connect, --bootstrap-resident, --bootstrap-guest and the SAME host-self test hooks --host-observer refuses.
+     * Refused (exit 2, usage text on stderr) before anything is initialised. It then sets the SAME observer flag --host-observer sets: the observer init
+     * (pc_host_observer_poll) is reused as is, there is no second init path. */
+    if (g_pc_dedicated) {
+        static const char* const k_dedicated_refused_hooks[] = {
+            "--force-friendship-delta", "--force-mail-send", "--force-money-rock-hit", "--force-fish-catch", "--force-bug-catch",
+            "--diag-bug-despawn-label-race", "--scene-test-enter-shop", "--scene-test-leave-after", "--collide-test-overlap",
+            "--collide-test-approach",
+        };
+        size_t k;
+        int a;
+        if (g_pc_net_role != 1) {
+            fprintf(stderr, "[DEDICATED] REFUSED: --dedicated is a HOST-only option (use it together with --host)\n"
+                            "usage: AnimalCrossing --host [port] --dedicated   (see --help)\n");
+            return 2;
+        }
+        if (g_pc_bootstrap_resident >= 0) {
+            fprintf(stderr, "[DEDICATED] REFUSED: --dedicated cannot be combined with --bootstrap-resident (the dedicated server plays no resident)\n"
+                            "usage: AnimalCrossing --host [port] --dedicated   (see --help)\n");
+            return 2;
+        }
+        if (g_pc_bootstrap_guest != NULL) {
+            fprintf(stderr, "[DEDICATED] REFUSED: --dedicated cannot be combined with --bootstrap-guest\n"
+                            "usage: AnimalCrossing --host [port] --dedicated   (see --help)\n");
+            return 2;
+        }
+        for (a = 1; a < argc; a++) {
+            if (strcmp(argv[a], "--connect") == 0) {
+                fprintf(stderr, "[DEDICATED] REFUSED: --dedicated cannot be combined with --connect (a dedicated server only hosts)\n"
+                                "usage: AnimalCrossing --host [port] --dedicated   (see --help)\n");
+                return 2;
+            }
+            for (k = 0; k < sizeof(k_dedicated_refused_hooks) / sizeof(k_dedicated_refused_hooks[0]); k++) {
+                if (strcmp(argv[a], k_dedicated_refused_hooks[k]) == 0) {
+                    fprintf(stderr, "[DEDICATED] REFUSED: --dedicated cannot be combined with %s (a host-self test hook that needs a host player)\n"
+                                    "usage: AnimalCrossing --host [port] --dedicated   (see --help)\n", argv[a]);
+                    return 2;
+                }
+            }
+        }
+        g_pc_host_observer = 1; /* implies --host-observer: the existing observer init is reused */
+        if (g_pc_frame_limit_override < 0) {
+            g_pc_frame_limit_override = 60; /* a server runs at the 60 Hz tick whatever the GUI's settings.ini max_fps says (--framelimit N / --no-framelimit still win) */
+        }
+    }
+
     /* --host-observer: HOST-only, exclusive with --bootstrap-resident / --bootstrap-guest, and incompatible with the host-self TEST hooks that
      * need a host player (the observer has no avatar to act with): refused (exit 2, before stdout/stderr are redirected) otherwise. */
     if (g_pc_host_observer) {
@@ -945,7 +1014,7 @@ int main(int argc, char* argv[]) {
 
     /* Redirect stdout/stderr to NUL unless verbose — unbuffered terminal writes
      * are extremely slow on Windows and tank FPS. */
-    if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console) {
+    if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console && !g_pc_dedicated) { /* --dedicated: the console is always on (a debug flag for routing) */
 #ifdef _WIN32
         freopen("NUL", "w", stdout);
         freopen("NUL", "w", stderr);
@@ -956,6 +1025,9 @@ int main(int argc, char* argv[]) {
     } else {
         setvbuf(stdout, NULL, _IONBF, 0);
         setvbuf(stderr, NULL, _IONBF, 0);
+    }
+    if (g_pc_dedicated) {
+        pc_dedicated_startup(g_pc_net_port); /* "[DEDICATED] ..." startup line + the stdin command reader (only enqueues; drained on the main thread) */
     }
     if (log_want_console) { /* new line only for an explicit -debug-flag or PC_LOG request: plain --verbose output stays byte-identical */
         PC_LOG(PCL_GENERAL, "log mask=0x%08X (verbose=%d console=%d)\n", (unsigned)g_pc_log_mask, g_pc_verbose, log_want_console);

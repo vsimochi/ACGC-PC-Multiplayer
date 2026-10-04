@@ -125,6 +125,8 @@ extern void mainproc(void* val) {
         extern int pc_save_write_authoritative(void);
         extern int pc_net_game_role_is_client(void);
         extern void pc_net_game_client_record_quit_flush(unsigned max_ms);
+        extern int g_pc_dedicated; /* --dedicated: console notices only; no behaviour change */
+        extern void pc_dedicated_notify_shutdown(const char* what);
         if (pc_net_game_role_is_client()) {
             /* D3: best-effort, bounded (1500 ms) upload of the client's dirty resident record to the HOST (which owns and
              * persists it). This writes NOTHING locally: the no-save-for-clients rule below is unchanged. */
@@ -135,9 +137,13 @@ extern void mainproc(void* val) {
             OSReport("[PC] mainproc: final authoritative save before shutdown...\n");
             if (!pc_save_write_authoritative()) {
                 OSReport("[PC] mainproc: final shutdown save FAILED\n");
+                if (g_pc_dedicated) pc_dedicated_notify_shutdown("final save FAILED");
             } else {
                 OSReport("[PC] mainproc: final shutdown save OK\n");
+                if (g_pc_dedicated) pc_dedicated_notify_shutdown("final save OK");
             }
+        } else if (g_pc_dedicated) {
+            pc_dedicated_notify_shutdown("final save skipped (world/save not ready)");
         }
     }
     {
@@ -153,6 +159,11 @@ extern void mainproc(void* val) {
         pc_lowaddr_report();
 #endif
         pc_platform_shutdown();
+        {
+            extern int g_pc_dedicated;
+            extern void pc_dedicated_notify_shutdown(const char* what);
+            if (g_pc_dedicated) pc_dedicated_notify_shutdown("complete (networking and platform closed)");
+        }
         exit(0);
     }
 #else

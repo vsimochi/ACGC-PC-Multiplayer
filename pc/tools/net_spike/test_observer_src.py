@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_observer_src.py - SOURCE AUDIT of the opt-in hidden server observer (`--host-observer`). No game process.
 
-Reads the sources (working tree) and `git show HEAD:<path>` (read-only) and checks the rules the design rests on:
+Reads the sources (working tree) and `git show <BASELINE_REF|FEATURE_REF>:<path>` (read-only; "HEAD" below means the pre-observer parent BASELINE_REF) and checks the rules the design rests on:
   R   record + identity: the observer record is a static Private_c in pc_m_card.c OUTSIDE Save_t.private_data[]; it is only ever referenced inside the
       fenced /* OBSERVER-BEGIN */ ... /* OBSERVER-END */ blocks; bound with player_no == mPr_FOREIGNER (4) EXACTLY (no 5 / PLAYER_NUM+1 / TOTAL_PLAYER_NUM sentinel
       anywhere in the added code); bound BEFORE the init; the reserved PersonalID is checked against private_data[0..PLAYER_NUM) (even away residents) and
@@ -31,6 +31,14 @@ import wire_baseline
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 OBS_BLOCK = re.compile(r"/\* OBSERVER-BEGIN \*/.*?/\* OBSERVER-END \*/\n?", re.S)
+# BASELINE_REF is the PARENT of the observer feature commit (FEATURE_REF = 1a0c8c8): every "vs HEAD" baseline of this audit is really "vs the code before the observer".
+# (HEAD itself contains the observer since 1a0c8c8, so it can no longer serve as the baseline.)
+# Read side per check:
+#   * additive / "unchanged vs baseline" / diff-discipline checks read the FEATURE COMMIT's own blobs (`git show FEATURE_REF:path` vs `git show BASELINE_REF:path`), so
+#     they are independent of any later work in the tree (e.g. Dedicated Phase A) and a violation introduced by the observer commit itself is still caught;
+#   * checks that look for guards / markers / predicates read the CURRENT WORKING TREE (read()).
+BASELINE_REF = "66bfa48"
+FEATURE_REF = "1a0c8c8"
 MARKERS = ("observer", "OBSERVER", "pc_host_observer", "HOST_NO_AVATAR", "host-observer")
 
 
@@ -40,7 +48,17 @@ def read(rel):
 
 
 def head(rel):
-    return subprocess.run(["git", "-C", ROOT, "show", "HEAD:" + rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+    """The file as it was BEFORE the observer feature (BASELINE_REF)."""
+    return blob(BASELINE_REF, rel)
+
+
+def feat(rel):
+    """The file as the observer feature commit left it (FEATURE_REF)."""
+    return blob(FEATURE_REF, rel)
+
+
+def blob(ref, rel):
+    return subprocess.run(["git", "-C", ROOT, "show", ref + ":" + rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
 
 
 def mask(s):
@@ -77,8 +95,8 @@ def ws(t):
 
 
 def hunks(rel):
-    """[{rem: [...], add: [...]}] of `git diff -U0 HEAD -- rel` (stripped, non-blank lines)."""
-    d = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", "HEAD", "--", rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
+    """[{rem: [...], add: [...]}] of `git diff -U0 BASELINE_REF FEATURE_REF -- rel` = the observer commit's own change (stripped, non-blank lines)."""
+    d = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", BASELINE_REF, FEATURE_REF, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
     out, cur = [], None
     for ln in d.split("\n"):
         if ln.startswith("@@"):
@@ -156,7 +174,7 @@ def main():
        and "l_mcd_foreigner_file" not in mask("".join(blocks)) and "g_foreigner_private" not in mask("".join(blocks)))
     outside = strip_obs(card_raw)
     ck("R s_pc_observer_private is referenced ONLY inside the fenced observer blocks (no resident / travel / save code can reach it)", "s_pc_observer_private" not in outside)
-    ck("R pc_m_card.c WITHOUT its observer blocks is BYTE-IDENTICAL to HEAD (no pre-existing line changed)", outside == card_head)
+    ck("R pc_m_card.c WITHOUT its observer blocks is BYTE-IDENTICAL to HEAD (no pre-existing line changed)  [feature commit vs its parent]", strip_obs(feat("pc/src/pc_m_card.c")) == card_head)
     obs_text = mask("".join(blocks))
     sets = re.findall(r"Common_Set\(player_no,\s*([^)]*)\)", obs_text) + re.findall(r"Common_Set\(player_no,\s*([^)]*)\)", sb("mSDI_StartDataInitObserver"))
     ck("R player_no is bound to mPr_FOREIGNER (4) EXACTLY (or the saved previous value on a failed init): %s" % sets,
@@ -290,7 +308,8 @@ def main():
 
     # ------------------------------------------------------------------------------------------------ S
     writers = ("pc_save_write_gci_to", "pc_save_write_gci", "pc_save_rotate_backups", "pc_save_write_authoritative", "pc_save_check_and_load")
-    stripped = mask(outside)
+    outside_feat = strip_obs(feat("pc/src/pc_m_card.c"))  # feature-commit side: independent of later (Phase A) edits to pc_m_card.c
+    stripped = mask(outside_feat)
     sff = functions(stripped)
     hmask = mask(card_head)
     hf = functions(hmask)
@@ -300,7 +319,7 @@ def main():
     ck("S the writers never read the player binding (no Now_Private / now_private / player_no inside %s): Save_t is serialised verbatim, so the observer record can never reach a GCI"
        % ", ".join(save_writers), all(body(stripped, sff, n) != "" and not re.search(r"Now_Private|now_private|player_no", body(stripped, sff, n)) for n in save_writers))
     ck("S src/main.c (shutdown save) and pc_save_bswap.c are byte-identical to HEAD (the observer never needed a change: pcfa_save_ready() gates it)",
-       read("src/main.c") == head("src/main.c") and read("pc/src/pc_save_bswap.c") == head("pc/src/pc_save_bswap.c"))
+       feat("src/main.c") == head("src/main.c") and feat("pc/src/pc_save_bswap.c") == head("pc/src/pc_save_bswap.c"))
     rem, add = diff_lines("pc/src/pc_vi.c")
     ck("S pc_vi.c: the diff is ONLY the observer poll call block (no line removed; the periodic / early save logic is untouched)", not rem and all(("observer" in a or a in ("{", "}", "pc_host_observer_poll();")) or a.startswith("/*") for a in add))
     obs_all = "".join(blocks)
@@ -338,7 +357,7 @@ def main():
     ok_same = True
     which = []
     for rel, n in unchanged:
-        cur = mask(strip_obs(read(rel)))
+        cur = mask(strip_obs(feat(rel)))
         hd = mask(head(rel))
         a, b = body(cur, functions(cur), n).strip(), body(hd, functions(hd), n).strip()
         if not (a and a == b):
@@ -346,7 +365,7 @@ def main():
             which.append(n)
     ck("P the plain --host / --bootstrap-resident / --bootstrap-guest / solo code is BYTE-IDENTICAL to HEAD: mSDI_StartInit{New,From,Pak,After,Before,NewPlayer}, mSDI_StartDataInit, "
        "pc_bootstrap_resident_poll, pc_bootstrap_guest_poll %s" % which, ok_same)
-    gbody = nb("pcnetgame_host_classify_identity")
+    gbody = body(mask(feat("pc/src/pc_net_game.c")), functions(mask(feat("pc/src/pc_net_game.c"))), "pcnetgame_host_classify_identity")
     ck("P the identity classifier is byte-identical to HEAD (only the own-resident function gained its early return; test_guest_src pins that exactly)",
        mask(head("pc/src/pc_net_game.c")).count("pcnetgame_host_classify_identity") >= 1 and
        body(mask(head("pc/src/pc_net_game.c")), functions(mask(head("pc/src/pc_net_game.c"))), "pcnetgame_host_classify_identity").strip() == gbody.strip() != "")

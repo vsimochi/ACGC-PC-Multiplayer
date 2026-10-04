@@ -3,6 +3,7 @@
 #include "pc_profiler.h"
 #include "pc_net_game.h"
 #include "pc_remote_player.h"
+#include "pc_dedicated.h"
 
 #define VI_TVMODE_NTSC_INT    0
 #define VI_TVMODE_NTSC_DS     1
@@ -70,6 +71,12 @@ void VIWaitForRetrace(void) {
      * (a pure PC-layer function, called unconditionally every frame regardless of game state --
      * menus, loading, gameplay) rather than in any decomp game-loop file. */
     pc_net_game_poll();
+
+    /* --dedicated only: drain the stdin command queue and run the console commands (help/status/players/save/stop) on THIS thread, right next to the
+     * network poll. A console `save` only sets a flag that the save block below consumes, so every save gate applies. */
+    if (g_pc_dedicated) {
+        pc_dedicated_console_poll();
+    }
 
     /* Stage 2: retries deferred remote-player actor creation once gamePT/the local player actor
      * are valid. Also unconditional every frame; a no-op whenever nothing is pending. */
@@ -176,6 +183,23 @@ void VIWaitForRetrace(void) {
              * "wait one interval" grace period re-applies whenever the world next becomes ready. */
             l_last_save_time = 0;
         }
+
+        /* --dedicated only: a console `save` request. Handled HERE (main thread, same function and gates as the periodic/early saves: HOST role, host
+         * world ready, pcfa_save_ready; the sidecar hooks (records.dat / guests.dat) run inside pc_save_write_authoritative exactly as for any other
+         * save). The outcome is reported only after the call returned (or the gate refused); never claimed early. */
+        if (pc_dedicated_save_request_pending()) {
+            if (pc_net_game_role() != PC_NETGAME_ROLE_HOST) {
+                pc_dedicated_save_report(0, "not hosting");
+            } else if (!pc_net_game_dedicated_world_ready()) {
+                pc_dedicated_save_report(0, "world not ready");
+            } else if (!pcfa_save_ready()) {
+                pc_dedicated_save_report(0, "save not ready (no live town scene yet)");
+            } else {
+                int console_save_ok = pc_save_write_authoritative();
+                l_last_save_time = vi_enter; /* the periodic cadence restarts from this save */
+                pc_dedicated_save_report(console_save_ok, NULL);
+            }
+        }
     }
 
     /* Drain the frame's last deferred batch here so its cost bills to
@@ -183,13 +207,13 @@ void VIWaitForRetrace(void) {
     {
         extern void pc_gx_draw_pending(void);
         Uint64 t_drain = pc_profiler_begin_timer();
-        pc_gx_draw_pending();
+        if (!g_pc_dedicated) pc_gx_draw_pending(); /* --dedicated: nothing was drawn */
         pc_profiler_add_time(PC_PROF_TIMER_GX_FLUSH, t_drain);
     }
 
     Uint64 t_before_swap = SDL_GetPerformanceCounter();
     Uint64 t_before_swap_prof = pc_profiler_begin_timer();
-    pc_platform_swap_buffers();
+    if (!g_pc_dedicated) pc_platform_swap_buffers(); /* --dedicated: no buffer swap (hidden window, nothing drawn); pacing below is unchanged */
     pc_profiler_add_time(PC_PROF_TIMER_SWAP, t_before_swap_prof);
     Uint64 t_after_swap = SDL_GetPerformanceCounter();
 
@@ -216,7 +240,7 @@ void VIWaitForRetrace(void) {
                 /* Spin for sub-ms precision. */
                 while (elapsed_us < (Uint64)pace_us) {
                     Uint64 remain_us = (Uint64)pace_us - elapsed_us;
-                    if (remain_us > 2000) {
+                    if (remain_us > (g_pc_dedicated ? 1000u : 2000u)) { /* --dedicated: spin only the last 1 ms (a server has no presentation to align with; idle CPU) */
                         SDL_Delay(1);
                     }
                     now = SDL_GetPerformanceCounter();
@@ -255,7 +279,7 @@ void VIWaitForRetrace(void) {
             double fps = (double)fps_count / secs;
             char title[64];
             snprintf(title, sizeof(title), "Animal Crossing - %.1f FPS", fps);
-            SDL_SetWindowTitle(g_pc_window, title);
+            if (!g_pc_dedicated) SDL_SetWindowTitle(g_pc_window, title); /* --dedicated: hidden window, no title updates */
             fps_start = now;
             fps_count = 0;
         }

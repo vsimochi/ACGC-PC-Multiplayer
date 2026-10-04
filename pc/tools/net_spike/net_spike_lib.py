@@ -3911,9 +3911,15 @@ class HostProcess:
     directory (resources are CWD-relative) and stdout/stderr redirected to a log file (--verbose
     makes stdout unbuffered). Context manager; stop() terminates the process."""
 
-    def __init__(self, port=7788, extra_args=(), log_path=None, bin_dir=None, env=None):
+    def __init__(self, port=7788, extra_args=(), log_path=None, bin_dir=None, env=None, verbose=True, stdin_pipe=False, new_group=False):
         self.port = int(port)
         self.extra_args = list(extra_args)
+        # --dedicated tests: verbose=False launches WITHOUT --verbose (the console must stay on by itself), stdin_pipe=True gives the game a stdin
+        # pipe (send_line()/close_stdin()), new_group=True starts it in its own process group (so CTRL_BREAK_EVENT can be aimed at it).
+        # Defaults reproduce the historical launch exactly.
+        self.verbose = bool(verbose)
+        self.stdin_pipe = bool(stdin_pipe)
+        self.new_group = bool(new_group)
         self.bin_dir = bin_dir or GAME_BIN_DIR
         self.exe = os.path.join(self.bin_dir, GAME_EXE_NAME)
         require_launchable_bin_dir(self.bin_dir)  # protected bin_talkfix / live bin: refuse at construction
@@ -3930,9 +3936,42 @@ class HostProcess:
         env = dict(os.environ)
         if self.env:
             env.update(self.env)
-        self.proc = subprocess.Popen([self.exe, "--host", str(self.port), "--verbose"] + self.extra_args,
-                                     cwd=self.bin_dir, stdout=self._log_fp, stderr=subprocess.STDOUT, env=env)
+        popen_kw = {}
+        if self.stdin_pipe:
+            popen_kw["stdin"] = subprocess.PIPE
+        if self.new_group:
+            popen_kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        self.proc = subprocess.Popen([self.exe, "--host", str(self.port)] + (["--verbose"] if self.verbose else []) + self.extra_args,
+                                     cwd=self.bin_dir, stdout=self._log_fp, stderr=subprocess.STDOUT, env=env, **popen_kw)
         return self
+
+    def send_line(self, text):
+        """Writes one console line to the game's stdin pipe (stdin_pipe=True only). False if the pipe is not usable."""
+        if self.proc is None or self.proc.stdin is None:
+            return False
+        try:
+            self.proc.stdin.write((text + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def close_stdin(self):
+        """Closes the game's stdin pipe (the game sees EOF)."""
+        if self.proc is not None and self.proc.stdin is not None:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+
+    def wait_exit(self, timeout):
+        """Waits up to `timeout` s for the process to exit on its own; returns its exit code or None."""
+        if self.proc is None:
+            return None
+        try:
+            return self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            return None
 
     def log_text(self):
         try:
@@ -4148,6 +4187,79 @@ class HostProcess:
             print("[boot_to_observer] observer active -> world ready (no post-readiness 'local save not loaded')")
         return True
 
+    # --- --dedicated readiness (boot_to_dedicated) ---------------------------------------------------------------------------------------
+    DEDICATED_START_RX = r"\[DEDICATED\] dedicated server starting: role=host port=(\d+)"
+    DEDICATED_PLATFORM_RX = r"\[DEDICATED\] platform: window=(\w+) \(GL 3\.3 context kept\) vsync=(\w+) audio_driver=(\w+)"
+
+    def status_blocks(self):
+        """Every `status` console answer in the log, as dicts {key: value-text} (the "[DEDICATED] status" header + the indented 'key: value' lines)."""
+        blocks, cur = [], None
+        for ln in self.log_text().splitlines():
+            if ln.startswith("[DEDICATED] status"):
+                cur = {}
+                blocks.append(cur)
+            elif cur is not None and ln.startswith("  ") and ": " in ln:
+                k, v = ln.strip().split(": ", 1)
+                cur[k] = v
+            else:
+                cur = None
+        return blocks
+
+    def ask_status(self, timeout=8.0):
+        """Sends `status` over the stdin pipe and returns the NEW status block (a dict), or None."""
+        n = len(self.status_blocks())
+        if not self.send_line("status"):
+            return None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            b = self.status_blocks()
+            if len(b) > n and "audio" in b[n]:
+                return b[n]
+            if not self.alive():
+                return None
+            time.sleep(0.1)
+        return None
+
+    def boot_to_dedicated(self, timeout=120.0, settle=2.0, verbose=True):
+        """Readiness check for a process launched with `--dedicated` AND stdin_pipe=True. Waits for the [DEDICATED] startup line, then asks the server's
+        own `status` command every 2 s until it reports observer active+ready, world ready and save ready (the observer's own log lines are OSReport
+        output that only exists with --verbose, so the console is the one readiness source that also works without it), sleeps `settle` seconds, and
+        confirms the process is alive with no 'local save not loaded' line after readiness."""
+        deadline = time.monotonic() + timeout
+        if self.wait_for_log(self.DEDICATED_START_RX, max(1.0, deadline - time.monotonic())) is None:
+            if verbose:
+                tail = [ln for ln in self.log_text().splitlines() if ln.strip()][-4:]
+                print("[boot_to_dedicated] no [DEDICATED] startup line (exit code %s; last lines: %s)" % (self.exit_code(), tail))
+            return False
+        ready_off = None
+        while time.monotonic() < deadline:
+            if not self.alive():
+                if verbose:
+                    tail = [ln for ln in self.log_text().splitlines() if ln.strip()][-4:]
+                    print("[boot_to_dedicated] process exited before readiness (exit code %s; last lines: %s)" % (self.exit_code(), tail))
+                return False
+            st = self.ask_status(timeout=4.0)
+            if (st is not None and st.get("observer", "").startswith("active=yes ready=yes") and st.get("world ready") == "yes"
+                    and st.get("save ready") == "yes"):
+                ready_off = len(self.log_text())
+                break
+            time.sleep(2.0)
+        if ready_off is None:
+            if verbose:
+                print("[boot_to_dedicated] timed out waiting for observer ready + world ready + save ready via `status`")
+            return False
+        if settle > 0:
+            time.sleep(settle)
+        if not self.alive():
+            return False
+        if re.search(self.LOCAL_SAVE_NOT_LOADED_RX, self.log_text()[ready_off:]):
+            if verbose:
+                print("[boot_to_dedicated] 'local save not loaded' seen AFTER readiness")
+            return False
+        if verbose:
+            print("[boot_to_dedicated] status: observer active+ready, world ready, save ready")
+        return True
+
     def host_town_from_log(self):
         mo = re.search(self.WORLD_READY_RX, self.log_text())
         return None if mo is None else (int(mo.group(1), 16), int(mo.group(2), 16))
@@ -4180,6 +4292,7 @@ class HostProcess:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout)
+        self.close_stdin()
         if self._log_fp is not None:
             self._log_fp.close()
             self._log_fp = None

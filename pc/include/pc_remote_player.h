@@ -121,6 +121,10 @@ int  pc_remote_player_on_action(PCNetPlayerId player_id, int kind, int ut_x, int
 void pc_remote_player_clear_scene(PCNetPlayerId player_id);
 int  pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
 
+/* --dedicated console (`players`): read-only state of this player's puppet. 0 = no puppet slot, 1 = tracked but the actor is not created yet
+ * (pending), 2 = the actor is live in the current GAME_PLAY. Safe for an out-of-range player_id (0). */
+int  pc_remote_player_puppet_state(PCNetPlayerId player_id);
+
 /* M9-B TEST-ONLY (used by the off-by-default --collide-test-* hooks in pc_net_game.c): fills the current
  * (interpolated) world position of the first live puppet that has snapshots, a visual and a same-scene FIELD/IN_TOWN
  * presence (range and transient holds are ignored). Returns 0 when there is none. Read-only. */

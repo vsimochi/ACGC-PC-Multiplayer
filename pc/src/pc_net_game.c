@@ -145,6 +145,7 @@
 #include "pc_net_game.h"
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
 #include "pc_log.h" /* category-based PC_LOG()/PC_LOG_RL() lines (new, [CAT]-prefixed; every pre-existing printf is untouched) */
+#include "pc_dedicated.h" /* --dedicated: g_pc_dedicated + the [DEDICATED] peer notices (read-only hooks) */
 #include "pc_net.h"
 #include "pc_remote_player.h"
 #include "pc_field_authority.h" /* v2: persistent town-field addressing/authority (Workstream C) */
@@ -19470,6 +19471,7 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     s_host_peer[peer].ready_player_id = in.player_id;
     s_host_peer[peer].ready_land_id = in.land_id;
     s_host_peer[peer].ready_identity_valid = 1;
+    if (g_pc_dedicated) pc_net_game_dedicated_announce((int)peer, 1);
 
     /* Stage 4C-1 (3+ player backfill fix): give this now-READY client the host's own appearance
      * AND the last-known appearance of every other already-READY peer -- otherwise anyone who
@@ -22275,9 +22277,11 @@ void pc_net_game_poll(void) {
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_HANDSHAKE;
                     }
                     printf("[NET] host: peer %d transport-connected, awaiting identity\n", (int)ev.peer);
+                    if (g_pc_dedicated) pc_net_game_dedicated_announce((int)ev.peer, 0);
                     PC_LOG(PCL_NET, "peer %d transport event: connected (awaiting identity)\n", (int)ev.peer);
                     break;
                 case PC_NET_EVENT_PEER_DISCONNECTED:
+                    if (g_pc_dedicated) pc_net_game_dedicated_announce((int)ev.peer, 2); /* before the per-peer state is reset */
                     if (ev.peer >= 0 && ev.peer < PC_NET_MAX_PEERS) {
                         int was_ready_peer = (s_host_peer_link[ev.peer] == PC_NETGAME_LINK_READY);
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_DISCONNECTED;
@@ -25369,5 +25373,68 @@ static void pcnetgame_handle_client_wildlife_despawn(const PCNetGameWildlifeDesp
         printf("[NET][WILDLIFE] client: WILDLIFE_DESPAWN entity %u reconciled against this process's "
                "own local presentation\n",
                (unsigned)in->entity_id);
+    }
+}
+
+/* --dedicated server console (pc_dedicated.c): read-only accessors + the [DEDICATED] peer notices. Main thread only. Nothing here changes any state; the
+ * callers in the host event loop / identity handler are guarded by g_pc_dedicated. */
+int pc_net_game_dedicated_world_ready(void) {
+    return (s_role == PC_NETGAME_ROLE_HOST && s_host_world_ready) ? 1 : 0;
+}
+
+int pc_net_game_dedicated_peer_slots(void) {
+    return s_role == PC_NETGAME_ROLE_HOST ? PC_NET_MAX_PEERS : 0;
+}
+
+/* PersonalID names are game font codes; the letters/digits/space used by the usual names are ASCII-compatible. Anything else prints as '?'. */
+static void pcnetgame_dedicated_ascii_name(const uint8_t* src, char* out) {
+    int i, n = 0;
+    for (i = 0; i < PC_NETGAME_NAME_LEN; i++) {
+        out[n++] = (src[i] >= 0x20 && src[i] <= 0x7E) ? (char)src[i] : '?';
+    }
+    while (n > 0 && out[n - 1] == ' ') {
+        n--;
+    }
+    out[n] = '\0';
+}
+
+int pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out) {
+    const PCNetGameHostPeerState* st;
+    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= PC_NET_MAX_PEERS) {
+        return 0;
+    }
+    if (s_host_peer_link[slot] == PC_NETGAME_LINK_DISCONNECTED) {
+        return 0;
+    }
+    st = &s_host_peer[slot];
+    memset(out, 0, sizeof(*out));
+    out->peer = slot;
+    out->link = (int)s_host_peer_link[slot];
+    out->bound = st->bound_valid ? 1 : 0;
+    out->cls = (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) ? 1 : 0;
+    out->index = !out->bound ? -1 : (out->cls ? st->bound_guest_slot : st->bound_resident_idx);
+    if (st->ready_identity_valid) {
+        pcnetgame_dedicated_ascii_name(st->ready_player_name, out->name);
+    } else {
+        out->name[0] = '-';
+        out->name[1] = '\0';
+    }
+    out->idle_ms = pc_net_peer_idle_ms((PCNetPeerId)slot);
+    out->puppet = pc_remote_player_puppet_state((PCNetPlayerId)slot);
+    return 1;
+}
+
+void pc_net_game_dedicated_announce(int peer, int what) {
+    PCNetGameDedicatedPeerInfo pi;
+    if (!g_pc_dedicated) {
+        return;
+    }
+    if (what == 0) {
+        pc_dedicated_say("peer %d connected (transport; awaiting identity)", peer);
+    } else if (pc_net_game_dedicated_peer_info(peer, &pi) && pi.bound) {
+        pc_dedicated_say("peer %d %s: %s %d name=\"%s\"", peer, what == 1 ? "READY" : "disconnected (was READY)", pi.cls ? "GUEST slot" : "RESIDENT idx",
+                         pi.index, pi.name);
+    } else {
+        pc_dedicated_say("peer %d disconnected", peer);
     }
 }

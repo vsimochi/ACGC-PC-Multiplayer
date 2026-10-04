@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_log_src.py - pc_log source audit + a native unit run of pc_log.c (no game is started).
 
-TIER: pure source/diff audit against git HEAD (read-only git calls) + ONE small native compile of pc/src/pc_log.c with MinGW gcc into a temp dir
+TIER: pure source/diff audit against the pre-feature parent commit (BASELINE_REF, see below) (read-only git calls) + ONE small native compile of pc/src/pc_log.c with MinGW gcc into a temp dir
 (skipped with a PENDING-free INFO if gcc is missing).
 
 Checks:
@@ -34,6 +34,13 @@ sys.path.insert(0, HERE)
 import net_spike_lib as L  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+# BASELINE_REF is the PARENT of the logging feature commit (FEATURE_REF = e310798); HEAD contains the feature, so it can no longer be the baseline.
+# Read side per check:
+#   * "vs baseline" checks (removed-line sets, added-line audits, occurrence counts, CMake diff, pc_main.c redirect / verbose text) read the FEATURE COMMIT's own state
+#     (`git diff BASELINE_REF FEATURE_REF`, `git grep ... FEATURE_REF`, `git show FEATURE_REF:path`), independent of later work (e.g. Dedicated Phase A);
+#   * header / pc_log.c / macro-shape / CMake-listing / EOL checks read the CURRENT WORKING TREE (rd()).
+BASELINE_REF = "1a0c8c8"
+FEATURE_REF = "e310798"
 GCC = r"C:\msys64\ucrt64\bin\gcc.exe"
 
 
@@ -47,23 +54,29 @@ def git(*args):
 
 
 def head(rel):
-    return git("show", "HEAD:" + rel)
+    """The file before the logging feature (BASELINE_REF)."""
+    return git("show", BASELINE_REF + ":" + rel)
+
+
+def feat(rel):
+    """The file as the logging feature commit left it (FEATURE_REF)."""
+    return git("show", FEATURE_REF + ":" + rel)
 
 
 def count_wt(needle, _files=None):
-    """Occurrences in the WORKTREE of the tracked files under pc/src and src (git grep, so new untracked files are not counted on either side)."""
-    out = git("grep", "-F", "-o", "-h", "--", needle, "--", "pc/src", "src")
+    """Occurrences in the FEATURE COMMIT (FEATURE_REF; name kept from the old worktree version) of the files under pc/src and src (git grep)."""
+    out = git("grep", "-F", "-o", "-h", "--", needle, FEATURE_REF, "--", "pc/src", "src")
     return len([ln for ln in out.splitlines() if ln.strip()])
 
 
 def count_head(needle):
-    out = git("grep", "-F", "-o", "-h", "--", needle, "HEAD", "--", "pc/src", "src")
+    out = git("grep", "-F", "-o", "-h", "--", needle, BASELINE_REF, "--", "pc/src", "src")
     return len([ln for ln in out.splitlines() if ln.strip()])
 
 
 def diff_lines(rel):
-    """(added, removed) lines (without the +/-) of the worktree vs HEAD diff of one file."""
-    d = git("diff", "-U0", "--no-color", "HEAD", "--", rel).replace("\r", "")
+    """(added, removed) lines (without the +/-) of the feature commit's own diff (BASELINE_REF..FEATURE_REF) of one file."""
+    d = git("diff", "-U0", "--no-color", BASELINE_REF, FEATURE_REF, "--", rel).replace("\r", "")
     add, rem = [], []
     for ln in d.splitlines():
         if ln.startswith("+++") or ln.startswith("---"):
@@ -214,7 +227,8 @@ def main():
        and any(l.startswith("if (!g_pc_verbose && !g_pc_profile_enabled && !log_want_console)") for l in added_v)
        and any("g_pc_log_mask |= PCL_LEGACY" in l and "g_pc_verbose itself is unchanged" in l for l in added_v)
        and any(l.startswith("PC_LOG(PCL_GENERAL") and "g_pc_verbose, log_want_console" in l for l in added_v))
-    mw = rd("pc/src/pc_main.c").replace("\r\n", "\n")
+    # feature-commit side (the working tree's redirect condition legitimately gained Phase A terms)
+    mw = feat("pc/src/pc_main.c").replace("\r\n", "\n")
     mh = head("pc/src/pc_main.c").replace("\r\n", "\n")
     ck("V1 pc_main.c: one `g_pc_verbose = 1;` and the same definition as HEAD", mw.count("g_pc_verbose = 1;") == 1 == mh.count("g_pc_verbose = 1;")
        and "int           g_pc_verbose = 0;" in mw)
