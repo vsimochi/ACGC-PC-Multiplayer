@@ -13,6 +13,10 @@
 #include "m_name_table.h"
 #include "m_collision_bg.h"
 #include "m_random_field.h"
+#ifdef TARGET_PC
+#include "pc_log.h"           /* T1: train lifecycle diagnostics */
+#include "pc_arrival_logic.h" /* T2: title-demo-1 -> other edge decision (pure, natively tested) */
+#endif
 
 #define mTRC_RTC_TIME_SECONDS(rtc_time) \
     (rtc_time->sec + (rtc_time->min + rtc_time->hour * mTM_MINUTES_IN_HOUR) * mTM_SECONDS_IN_MINUTE)
@@ -499,17 +503,85 @@ extern void mTRC_init(GAME* game) {
     Common_Set(train_flag, FALSE);
 }
 
+#ifdef TARGET_PC
+/* T1 (diagnostics only, no behaviour change): one PC_LOG(GENERAL) line per CHANGE of the train control state, so a resident / guest
+ * run log shows the train lifecycle (action 0 none, 1 spawn, 2 slowdown, 3 stop, 4 signal stopped, 5 wait stopped, 6 signal starting,
+ * 7 pull out, 8 speed up; "now" / "start" are RTC seconds of the day). */
+static void mTRC_pc_diag(const char* where) {
+    static int s_valid = FALSE;
+    static u8 s_action, s_ctl, s_last, s_coming, s_signal;
+    static int s_demo;
+    u8 action = Common_Get(train_action);
+    u8 ctl = Common_Get(train_control_state);
+    u8 last = Common_Get(train_last_control_state);
+    u8 coming = Common_Get(train_coming_flag);
+    u8 signal = Common_Get(train_signal);
+    int demo = mEv_CheckTitleDemo();
+
+    if (s_valid && s_action == action && s_ctl == ctl && s_last == last && s_coming == coming && s_signal == signal &&
+        s_demo == demo) {
+        return;
+    }
+
+    s_valid = TRUE;
+    s_action = action;
+    s_ctl = ctl;
+    s_last = last;
+    s_coming = coming;
+    s_signal = signal;
+    s_demo = demo;
+    PC_LOG(PCL_GENERAL, "[TRAIN] %s: action=%u control=%u last_control=%u coming_flag=%u signal=%u title_demo=%d start_timer=%u now=%u x=%.0f\n",
+           where, (unsigned)action, (unsigned)ctl, (unsigned)last, (unsigned)coming, (unsigned)signal, demo,
+           (unsigned)Common_Get(train_start_timer), (unsigned)mTRC_RTC_TIME_SECONDS(Common_GetPointer(time.rtc_time)),
+           (double)Common_Get(train_position).x);
+}
+
+/* T2: the title-demo train leak. START1's train is parked by mTRC_mati_init(); the bootstraps bind a player from the title scene, which
+ * runs on during the outgoing wipe and re-parks the train after mSDI_StartInitAfter -> mTRC_init. In the town the parked train never
+ * leaves (WAIT_STOPPED needs control != last, or control == 0). Re-initialise it once on the edge "title demo 1 -> anything else",
+ * keeping the arrival demo's coming_flag == 3. Vanilla flows are untouched: the player-select / train interior (pre-game draw types)
+ * skip it, they re-init through mSDI_StartDataInit anyway. */
+static void mTRC_pc_title_edge(GAME* game) {
+    static int s_was_start1 = 0;
+    int demo = mEv_CheckTitleDemo();
+    int pre_game = Common_Get(field_draw_type) == FIELD_DRAW_TYPE_TRAIN || Common_Get(field_draw_type) == FIELD_DRAW_TYPE_PLAYER_SELECT;
+    int was = s_was_start1;
+
+    if (pcarr_trc_title_edge(&s_was_start1, demo, mEv_TITLEDEMO_START1, pre_game)) {
+        unsigned coming = pcarr_trc_coming_after_reinit(Common_Get(train_coming_flag), 3u);
+
+        PC_LOG(PCL_GENERAL, "[TRAIN] title demo 1 -> %d: re-init (was action=%u control=%u last=%u coming_flag=%u, keep coming_flag=%u)\n", demo,
+               (unsigned)Common_Get(train_action), (unsigned)Common_Get(train_control_state),
+               (unsigned)Common_Get(train_last_control_state), (unsigned)Common_Get(train_coming_flag), coming);
+        mTRC_init(game);
+        Common_Set(train_coming_flag, (u8)coming);
+    } else if (was && !s_was_start1) {
+        PC_LOG(PCL_GENERAL, "[TRAIN] title demo 1 -> %d: pre-game scene, vanilla flow (no re-init)\n", demo);
+    }
+}
+#endif
+
 extern void mTRC_move(GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     PLAYER_ACTOR* player = get_player_actor_withoutCheck(play);
     int state;
     Common_Set(train_approaching_flag, FALSE);
 
+#ifdef TARGET_PC
+    mTRC_pc_title_edge(game);
+#endif
+
     if (!mTRC_go_process() || player == NULL) {
+#ifdef TARGET_PC
+        mTRC_pc_diag("idle");
+#endif
         return;
     }
 
     state = mTRC_schedule(play);
     mTRC_trainControl(play, state);
     mTRC_trainSet(play);
+#ifdef TARGET_PC
+    mTRC_pc_diag("move");
+#endif
 }

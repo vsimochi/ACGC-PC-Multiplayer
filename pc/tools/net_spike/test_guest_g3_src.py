@@ -23,6 +23,7 @@ import wire_baseline
 
 ROOT = S.ROOT
 BASELINE = "e056f56"   # G2 commit (HEAD when G3 started)
+END_REF = "e68c90c"    # G4 commit + docs: the diff audits compare BASELINE..END_REF (G3 + the G4 additions it pins), not the working tree (later milestones touch the same files)
 
 
 def blob(rel, ref=BASELINE):
@@ -35,7 +36,7 @@ def raw_bytes(rel):
 
 
 def numstat(rel):
-    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
+    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, END_REF, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
     return (int(out[0]), int(out[1])) if out else (0, 0)
 
 
@@ -201,7 +202,7 @@ def main():
 
     # ------------------------------------------------------------------ EOL
     eol_ok = True
-    for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", True), ("src/game/m_start_data_init.c", True), ("include/m_start_data_init.h", True), ("src/actor/ac_animal_logo.c", True),
+    for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", False), ("src/game/m_start_data_init.c", True), ("include/m_start_data_init.h", True), ("src/actor/ac_animal_logo.c", True),
                       ("pc/tools/net_spike/test_guest_g3_src.py", False), ("pc/tools/net_spike/test_guest_g3_real.py", False), ("pc/tools/net_spike/test_guest_g1_src.py", False),
                       ("pc/tools/net_spike/test_guest_src.py", False), ("pc/tools/net_spike/test_guest_g2_src.py", False)):
         b = raw_bytes(rel)

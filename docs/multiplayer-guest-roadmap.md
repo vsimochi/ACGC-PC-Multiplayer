@@ -345,6 +345,26 @@ Limitations (G6):
 * The recovery of a lost token is operator-mediated, in memory only (10 minutes, one use, cancelled by a host restart) and trusts whoever claims the key first during the window.
 * Windows `stop` / Ctrl+C were verified through the console `stop` (graceful path); a hard kill keeps the last durable guests.dat (<= 60 s old, or the early save on a dirty disconnect).
 
+## Guest arrival: train / sync / world edge
+
+Phase T (design: investigation of branch `multiplayer` at 018344c). Commit: (filled by orchestrator). Protocol version unchanged (8), no wire message added.
+
+| Step | What | Status |
+|---|---|---|
+| T1 | `[TRAIN]` diagnostics: `src/game/m_train_control.c` logs (PC_LOG GENERAL, i.e. `-debug`) every CHANGE of action / control / last_control / coming_flag / signal / title demo with `start_timer` vs `now` (RTC seconds), plus the title-demo-1 edge | done, no behaviour change |
+| T2 | Title-demo train leak fix: on the edge "title demo 1 seen -> anything else" `mTRC_move` calls `mTRC_init` once, keeping `train_coming_flag == 3` (ride-off arrival); the pre-game player-select / train draw types are skipped (vanilla Start flow untouched) | done, verified by real host + client logs |
+| T5 | Borderless edge clamp: in `Player_actor_BGcheck_common_type2` the vanilla `mCoBG_UniqueWallCheck` clamp runs only when the new position is in an INVALID acre (`mFI_BlockCheck`, floor-divided so negative coordinates are invalid); the borderless acre-change wade is refused into an invalid acre | done, native + source audit only |
+| T3 / T4 / T6 | puppet animation rows, observer-side arrival train, guest departure guard | NOT done (later steps) |
+
+Root cause of "the train never departs" (confirmed in a real run): the first title screen is title demo START1, whose train is parked by `mTRC_mati_init` (action 5, control 1 == last 1). The bootstraps (`--bootstrap-resident`, the host observer) bind a player from the still-running title scene; `mSDI_StartInitAfter -> mTRC_init` resets the train, but the title scene keeps ticking during the outgoing wipe and re-parks it. In the town the train never leaves (WAIT_STOPPED needs control != last or control == 0). The log of a bootstrapped process shows `title_demo=1 action=5 control=1 last_control=1` followed by the T2 re-init line and `action=0 control=0`.
+The interactive Start flow and a real guest arrival (ride-off demo sets coming_flag 3 on its first town frame) are not affected by the leak; the generic edge keeps coming_flag 3 anyway.
+
+Real-run result (bin_fixture4, host resident 0 + client resident 2): one re-init per process, the parked title state never reappears, and the client log shows the hourly train lifecycle `0, 1, 2, 3, 4, 5, 6, 7, 8, 0` (spawn at hh:14:50, stop, depart about 5 minutes later, departed). Note: a resident in the first-job / HRA events (fixture residents 0 and 1) never gets the hourly train (vanilla `mEv_CheckArbeit`), so the test picks a free resident.
+
+Limitations: the edge fires once per title exit and is also taken when the title cycles START1 -> START2 (a harmless reset). The train lifecycle after the re-init follows the hourly schedule (spawn at hh:14:50), so a short test may not observe a full arrival/departure. Visual checks (train, edge feel at the map corners and at the station) were NOT done: no human / UI automation. T5 changes single-player borderless behaviour at the map edges (intended); diagonal and corner crossings need a manual pass. Host-side MOVE bounds are not checked (a puppet out of bounds means its owner really is).
+
+Tests: `test_guest_train.py` (native unit of `pc/include/pc_arrival_logic.h`), `test_guest_train_src.py` (source audit pinned to baseline 018344c), `test_guest_train_real.py` (REAL host + client processes, `[TRAIN]` log assertions).
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

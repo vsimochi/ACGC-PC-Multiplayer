@@ -2597,8 +2597,26 @@ static void Player_actor_BGcheck_common_type1(ACTOR* actorx) {
     Player_actor_CorrectWadeBlockBorder(actorx);
 }
 
+#ifdef TARGET_PC
+/* T5: borderless acres. nonzero when `pos` lies in a valid field block (the vanilla validity test of the scroll transition:
+ * mFI_BlockCheck = in range and not BG_TYPE_292). Negative coordinates are invalid (mFI_Wpos2BlockNum truncates toward zero). */
+static int Player_actor_pc_pos_in_valid_block(const xyz_t* pos) {
+    int bx = pcarr_floor_div(pos->x, mFI_BK_WORLDSIZE_X_F);
+    int bz = pcarr_floor_div(pos->z, mFI_BK_WORLDSIZE_Z_F);
+
+    return mFI_BlockCheck(bx, bz);
+}
+#endif
+
 static void Player_actor_BGcheck_common_type2(ACTOR* actorx) {
     mCoBG_BgCheckControll(NULL, actorx, 18.0f, 0.0f, TRUE, FALSE, 1);
+#ifdef TARGET_PC
+    /* T5: restore the vanilla edge (clamp against the previous, valid, block) only where the new position is in an invalid acre. */
+    if (pcarr_borderless_clamp_needed(Common_Get(field_type) == mFI_FIELDTYPE2_FG,
+                                      Player_actor_pc_pos_in_valid_block(&actorx->world.position))) {
+        mCoBG_UniqueWallCheck(actorx, 18.0f, 0.0f);
+    }
+#endif
 }
 
 static void Player_actor_BGcheck_common_type3(ACTOR* actorx) {
@@ -3699,7 +3717,13 @@ static int Player_actor_Set_ScrollDemo_forWade(ACTOR* actorx, GAME* game, int np
         int trigger_wade = FALSE;
 
         mFI_Wpos2BlockNum(&bx, &bz, *player_pos_p);
-        if (play->block_table.block_x != bx || play->block_table.block_z != bz) {
+        if ((play->block_table.block_x != bx || play->block_table.block_z != bz)
+#ifdef TARGET_PC
+            /* T5: never start the borderless acre change into an invalid acre (the vanilla scroll check mFI_BlockCheck) */
+            && pcarr_borderless_wade_allowed(Common_Get(field_type) == mFI_FIELDTYPE2_FG,
+                                             Player_actor_pc_pos_in_valid_block(player_pos_p))
+#endif
+        ) {
             if (play->block_table.block_x < bx) {
                 dir = mFI_MOVEDIR_LEFT;
             } else if (play->block_table.block_x > bx) {
