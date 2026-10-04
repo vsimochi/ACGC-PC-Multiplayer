@@ -18363,7 +18363,16 @@ static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item, int aux
     return 1;
 }
 
+static int pcnetgame_client_is_guest_player(void);
+
 int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item) {
+    if (s_role == PC_NETGAME_ROLE_CLIENT && pcnetgame_client_is_guest_player()) {
+        /* G5.1: a guest owns no museum donor slot (the host would answer NO_DONOR_SLOT): refuse locally, nothing is sent, the pocket is untouched; the
+         * curator's existing give-back row 2 tells the player the item stays with them. */
+        printf("[NET][TS] client: MUSEUM_DONATE refused locally: a guest cannot donate to the museum (pocket slot %d item 0x%04X stays in the pocket)\n", pocket_slot,
+               (unsigned)item);
+        return 0;
+    }
     return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item, 0);
 }
 
@@ -18752,6 +18761,12 @@ int pc_net_game_mail_begin_send(int slot) {
     PCNetGameOwnerStamp stamp;
     const Mail_c* ml;
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || Now_Private == NULL) {
+        return 0;
+    }
+    if (pcnetgame_client_is_guest_player()) {
+        /* G5.1: a guest has no address (it owns no house): letters to players are refused locally (the post office's existing "no such address" row),
+         * the letter stays in its slot, nothing is sent. Letters to villagers use the MAIL_REQUEST path, not this one. */
+        printf("[NET][MAIL] client: MAIL_SEND refused locally: a guest cannot send letters to players (mail slot %d stays)\n", slot);
         return 0;
     }
     if (slot < 0 || slot >= mPr_INVENTORY_MAIL_COUNT) {

@@ -187,8 +187,70 @@ Limitations:
 
 ## G5 - gameplay audit and guards
 
-Status: Not started. Planned: `player_no == 4` safety patches (birthday read in `update_schedule_today`, spirit read in the pull net include, `now_home` NULL check in the tag
-overlay), client-side early refusals with vanilla-style messages for museum / mail send / mailbox / house, real-client pickup / drop / shop round trips.
+Status: **Complete, with limitations** (source fixes + local refusals + scripted protocol coverage; NO real-client gameplay run and NO visual verification, see Limitations). Commit hash: (filled by orchestrator)
+
+### G5.0 - the three player_no 4 out-of-range accesses (verified in the code, fixed minimally, TARGET_PC only, foreigner / NULL guarded)
+
+| # | where | defect (a guest is the foreigner, `player_no == mPr_FOREIGNER == 4`, `private_data[]` has 4 entries) | fix |
+|---|---|---|---|
+| a | `src/game/m_event.c` `update_schedule_today` | `priv = &Save_Get(private_data[Common_Get(player_no)])` reads the field behind the array and feeds `priv->birthday` into `event_save_common.dates[BIRTHDAY]` (a bogus birthday event could be scheduled) | after the vanilla init: `if (player_no == mPr_FOREIGNER && Now_Private != NULL) priv = Now_Private;` (the guest's own record) |
+| b | `src/game/m_player_main_pull_net.c_inc` `Player_actor_Pull_net_demo_ct` (spirit / wisp catch) | `mPr_GetPossessionItemIdxKindWithCond(Save_GetPointer(private_data[player_no]), SPIRIT0..4)` reads out of range, then `Now_Private->inventory.pockets[item_idx]` indexes with that bogus result | TARGET_PC branch reads `Now_Private` for the foreigner, the unchanged vanilla expression otherwise (`#else` keeps the original lines verbatim) |
+| c | `src/game/m_tag_ovl.c` `mTG_client_mail_is_mailbox` (discarding a letter in the inventory) | pointer arithmetic on `Common_Get(now_home)->mailbox` with `now_home == NULL` for the foreigner (m_home.c) | `Common_Get(now_home) != NULL` before the first dereference |
+
+Evidence: test_guest_g5_src.py pins each guard and proves that the working file minus the pinned additions (m_tag_ovl.c: the pinned return undone) is BYTE-IDENTICAL to the baseline blob (e68c90c) for m_event.c, the pull-net include and m_tag_ovl.c, i.e. nothing else in the vanilla bodies changed; resident / single-player behaviour is unchanged (the guards fire only for player_no == 4 or a NULL home).
+
+Bounded grep of the other `private_data[player_no]` / `Common_Get(player_no)` indexed uses (not exhaustive, normal-visit paths only): already guarded by vanilla foreigner checks or by `mLd_PlayerManKindCheck` / `player_no < PLAYER_NUM` (m_calendar.c, m_calendar_ovl.c 24 / 92, m_private.c 70 / 1305 / 1320, m_shop.c, m_start_data_init.c, house doors), or not reachable for a guest (ac_haniwa, ac_douzou, ac_sign: the index comes from a saved sign item `& 3`, the post office loops residents 0..3, the curator's `donator - 1` comes from the museum record). Not changed and recorded as deferred: `m_calendar_ovl.c:404` (`mCD_make_calendar_data_month` birthday read, only reachable through a calendar furniture inside a house, which a guest cannot enter), `ac_shop_level.c:66` (host-side leaflet, loop over resident houses), `m_home.c:350` / `m_needlework.c` / `m_room_type.c` / `ac_my_house_draw.c_inc` (house / design code of resident houses). No out-of-range WRITE reachable with player_no 4 was found.
+
+### G5.1 - refusals (nothing is lost or duplicated; the client never mutates pockets without a host APPLIED)
+
+* **Museum donation (client guard, new):** `pc_net_game_ts_begin_museum_donate` returns 0 for a CLIENT guest before anything is queued or sent (log `MUSEUM_DONATE refused locally`). The curator's existing code maps 0 onto its give-back row (row 2: the item stays with the player). Before G5 the same outcome came only from the host (`NO_DONOR_SLOT`) after a round trip. The host refusal stays (authoritative, not journaled, nothing mutated).
+* **Mail to a player (client guard, new):** `pc_net_game_mail_begin_send` returns 0 for a CLIENT guest (log `MAIL_SEND refused locally`); the post girl's existing row 1 ("no such address") hands the letter back; the slot is never touched. Letters to villagers use the MAIL_REQUEST path and are unchanged. Host: `NO_DONOR_SLOT` stays.
+* **Mailbox take / read, house entry:** unchanged and already safe: a guest owns no house (`pcnetgame_mbox_house_of` walks `homes[]` only), so `pc_net_game_client_mailbox_usable()` is false and the mailbox stays closed; the vanilla foreigner branch makes the doors knock only.
+* **Catalog ordering:** already refused for EVERY network client (guests included) by the earlier town-services batch: `aNSC_msg_win_open_wait2` forces Nook's ORDER_UNAVAILABLE row before any bell is taken, and `aNSC_order_check` defends with ORDER_CANCEL before an order slot is written. No change was needed; there is no host path that could deliver a guest's order (the SHARED `catalog_orders` range is only legality-checked, the post office walks `private_data[]`).
+* **Villager letters to a guest:** none arrive (remail is resident-only, the client skips mailbox letters). Documented as deferred.
+* The visible message is the game's own dialogue row of each flow (the refusals reuse existing rows; no new on-screen notice was added because both flows already have a refusal row; `pc_net_notice` is only the link-loss notice).
+
+### G5 activity table
+
+| activity | guest status | evidence tier |
+|---|---|---|
+| movement / puppet / appearance | supported | source audit (G1..G4), real (G3 arrival) |
+| pickup, drop, bury, DIG_BURIED, shop buy / sell, police claim | supported | scripted (test_guest_protocol section X, pre-existing) |
+| DIG_HOLE / DIG_SHINE bonus grants | supported (guest record only) | scripted (test_guest_g5_protocol M1 / M2) |
+| shop buy replay (charged once), record mirror == client | supported | scripted (g5 M3, D) |
+| weed pull / flower trample | supported (field action, no record change) | scripted (g5 M4) |
+| fish / bug catch | supported (guest record only, one winner per entity) | scripted (g5 M5); the spirit-catch read is fixed (G5.0 b) by source audit |
+| disconnect between COMMIT and RESULT (kill / lost result), reconnect with the token | supported: journal replay, no duplicate item / bell, host record == client | scripted (g5 K, D) |
+| villager talk / friendship / letters TO villagers | supported (keyed by the guest key) | scripted (test_guest_protocol X, pre-existing) |
+| birthday scheduling, spirit catch, discarding an inventory letter | fixed (no out-of-range read / NULL math) | source audit (g5 src A) |
+| museum donation | refused (local give-back + host NO_DONOR_SLOT) | source audit (g5 src B) + scripted host refusal (pre-existing) |
+| mail to a player | refused (local "no such address" row + host NO_DONOR_SLOT) | source audit + scripted host refusal (pre-existing) |
+| mailbox take / read, house / room entry | refused (no house) | source audit (g5 src C) |
+| catalog ordering | refused (Nook's ORDER_UNAVAILABLE, all clients) | source audit (g5 src C) |
+| villager -> guest letters, museum / mail for guests, bank / loan UI, birthday calendar | deferred | -- |
+
+Exact results (disposable fixtures only, ONE build, protocol version unchanged, no wire change):
+
+| test | tier | result |
+|---|---|---|
+| test_guest_g5_src.py (new) | source audit | 19/19 |
+| test_guest_g5_protocol.py (new: phases M / K / D) | scripted clients vs REAL host | 81/81 |
+| test_guest_g4_protocol.py | scripted vs REAL host (re-run on the new exe) | 65/65 |
+| test_guest_g3_real.py | REAL host + REAL client (re-run: the client code of pc_net_game.c changed) | 43/43 |
+| test_guest_src / g1_src / g2_src / g3_src / g4_src, test_dedicated_src, test_observer_src | source audits | 81/81, 55/55, 44/44, 35/35, 27/27, 87/87, 65/65 |
+| test_mail_src, test_mail2_src, test_ts_src, test_stage0_town_safe_degrade | source audits touching the edited functions | 74/74, 77/77, 70/70, 102/102 |
+
+Pins updated: test_mail2_src "O4" pinned the exact old return line of `mTG_client_mail_is_mailbox`; it now pins the new two-line return (the old expression plus the NULL guard, nothing else). test_mail_src "C" forbids the word `mailbox` inside `pc_net_game_mail_begin_send`: the new comment was reworded instead of loosening the test. The wire / protocol is unchanged (message ids 1..58, wire_baseline 18/18).
+
+What test_guest_g5_protocol.py proves (kinds already covered before G5 are NOT repeated, see its header): guest A's DIG_HOLE / DIG_SHINE grants change only A's record (host log `resident 4+slot`, none to any resident 0..3), rev + 1, one FIELD_UPDATE at the observers, guest B and the resident control receive no push or result; byte-identical resends replay APPLIED/REPLAYED (journalled kind / item, the host's current mirror, no second execution); SHOP_BUY resends charge once; weed pull / flower trample are accepted without a TXN_RESULT and without a record change; fish / bug catches apply to the guest only, a resend replays, two guests racing for one entity give one APPLIED and one REJECTED whose record is untouched; a new session of the guest is pushed exactly the record the client applied and guests.dat holds the same inventory; guest B's record stays byte-identical to its first contact. K: `kill_peer_after_commit` between COMMIT and RESULT of a guest pickup: the same-nonce reconnect with the token is the same slot, KNOWN, and is pushed the record that already has the item; the old COMMIT replays (one item, one world change); a new process with the token gets the same record; guests.dat equals it. D: `drop_result` twice on a guest SHOP_BUY: the third resend replays the same post-image, one execution, the wallet is charged once, and a new session's record equals the client's. The fixtures end without a `save/mp` directory.
+
+Limitations:
+
+* **No real-client gameplay evidence beyond arrival.** The existing real-test hooks (`--force-*`, `--txn-test-dig-grant`, ...) act on the host's own resident or need a resident client; there is no UI automation, so a real guest process has NOT been driven through pickup / drop / shop / catch / the refusals. The real tier for guests is still only G3 / G4 (arrival, adoption, reconnect). The new client refusals and the three G5.0 guards are audited at source level only and were not exercised by a running guest, and nothing was visually verified.
+* The scripted pre-image of a transaction is the client's own claim (existing trust model): the scripted shop test sets the wallet it spends in the pre-image, exactly like the pre-existing guest test.
+* A replay returns the host's CURRENT mirror with the journalled kind / item (later grants included); this is the existing resident behaviour, now confirmed for guest slots.
+* The catch race, spawn counts and the wildlife section depend on the RNG spawn burst (the test fails loudly when too few entities spawn).
+* A comment-only rewording in `pc_net_game_mail_begin_send` (to satisfy the test_mail_src pin) was made after the single build; the compiled code is identical to the tested exe.
 
 ## G6 - join-failure reasons and token recovery
 
@@ -212,4 +274,4 @@ commands `guests`, `guest-reset`, `guest-remove` for token recovery; corrupt `gu
 ## Deferred
 
 * Town transfer from the host (so a guest needs no local copy), in-game profile creation UI (vanilla name editor), changing the look of an existing guest, villager -> guest
-  letters, catalog ordering for guests, per-feature guard messages (G5), REJECT_INFO (G6), a soak test with 8 real clients (G4 follow-up).
+  letters, museum / mail / bank for guests, a real-client gameplay run for guests (needs UI automation), the deferred player_no 4 indexed uses listed under G5.0, REJECT_INFO (G6), a soak test with 8 real clients (G4 follow-up).

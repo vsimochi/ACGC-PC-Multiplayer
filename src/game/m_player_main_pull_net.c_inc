@@ -117,8 +117,16 @@ static void Player_actor_Pull_net_demo_ct(ACTOR* actor) {
             player->item_net_has_catch = TRUE;
         }
         if (idx == aINS_INSECT_TYPE_SPIRIT) {
+#ifdef TARGET_PC
+            /* G5.0: the foreigner (a guest, player_no 4) has no private_data[4]; read its own record (Now_Private). */
+            Private_c* spirit_priv = (Common_Get(player_no) == mPr_FOREIGNER && Common_Get(now_private) != NULL)
+                                         ? Common_Get(now_private)
+                                         : Save_GetPointer(private_data[Common_Get(player_no)]);
+            int item_idx = mPr_GetPossessionItemIdxKindWithCond(spirit_priv, ITM_SPIRIT0, ITM_SPIRIT4, FALSE);
+#else
             int item_idx = mPr_GetPossessionItemIdxKindWithCond(Save_GetPointer(private_data[Common_Get(player_no)]),
                                                                 ITM_SPIRIT0, ITM_SPIRIT4, FALSE);
+#endif
 
             if (item_idx == -1) {
                 msg_no = 0x2F03;

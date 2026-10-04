@@ -318,7 +318,7 @@ def main():
           "when the pointer is a mailbox slot (mTG_client_mail_is_mailbox); the multi-letter clear loop is skipped for a client",
           "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {\n            mailbox_ovl->mark_bitfield = 0;" in dm and dm.index("mailbox_ovl->mark_bitfield = 0;") < dm.index("for (i = 0; i < HOME_MAILBOX_SIZE; i++) {")
           and "if (!mTG_client_mail_is_mailbox(mTG_get_mail_pointer(submenu, NULL)))" in tag and "if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) /* mail milestone 2: refused for a client" in tag
-          and "return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && mail >= Common_Get(now_home)->mailbox &&" in func_body(tag, "mTG_client_mail_is_mailbox"))
+          and "return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && Common_Get(now_home) != NULL &&\n           mail >= Common_Get(now_home)->mailbox && mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;" in func_body(tag, "mTG_client_mail_is_mailbox"))  # G5.0: + the NULL now_home guard (a guest has no home)
     check("O5 the M0 gates that must stay: the four villager generators that write straight into homes[].mailbox return before any write for a CLIENT, the mother's letter and the system letters are not generated for a client, "
           "the archive -> pocket exchange is refused for a client (test_mail_src.py audits each in detail)",
           "#define mNpc_CLIENT_SKIPS_MAILBOX_LETTER() (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT)" in npc and npc.count("if (mNpc_CLIENT_SKIPS_MAILBOX_LETTER()) {") == 4

@@ -1766,6 +1766,14 @@ static void update_schedule_today(Event_c* event) {
     int i;
     int type;
 
+#ifdef TARGET_PC
+    /* G5.0: a guest is the foreigner (player_no 4): private_data[4] is out of range (it would read the field behind the array and could schedule a
+     * bogus birthday); use the guest's own record (the bound passport) instead. */
+    if (Common_Get(player_no) == mPr_FOREIGNER && Common_Get(now_private) != NULL) {
+        priv = Common_Get(now_private);
+    }
+#endif
+
     if (mEv_ArbeitPlayer_kari(Common_Get(player_no)) == FALSE) {
         // month = rtc_time->month;
 

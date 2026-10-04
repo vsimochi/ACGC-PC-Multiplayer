@@ -3392,8 +3392,9 @@ static void mTG_get_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 /* Mail milestone 2: 1 iff this is a network CLIENT and `mail` is one of the slots of its house mailbox (the host's mailbox, shadowed locally). Throwing a
  * mailbox letter away is refused for a client (the host's letter must not vanish without the host knowing; a discard transaction is a later milestone). */
 static int mTG_client_mail_is_mailbox(const Mail_c* mail) {
-    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && mail >= Common_Get(now_home)->mailbox &&
-           mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;
+    /* G5.0: a guest (foreigner) has no home (now_home == NULL): its letters are never mailbox letters. */
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && Common_Get(now_home) != NULL &&
+           mail >= Common_Get(now_home)->mailbox && mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;
 }
 
 /* Mail milestone 2: one transfer tick of a client's mailbox letter through the host (MAIL_TAKE). 1 = applied (the letter is in Now_Private->mail[*dst_idx],
