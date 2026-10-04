@@ -2341,13 +2341,14 @@ static int pc_remote_player_scene_is_local_shown(const PCRemotePlayerSlot* slot,
 /* M9-B: decides whether this puppet's collision pipe is registered this frame. Returns NULL = arm; "hold" = a
  * transient, deliberately silent skip (pause / net-or-axe swing / post-teleport-snap hold: no log state change);
  * otherwise a DISARMED reason string for the log. Pure read-only evaluation. *out_local is set only when a real local
- * player actor was found. Interiors are intentionally never armed (FIELD, same scene id, IN_TOWN only). */
+ * player actor was found. Interiors: armed only for a shared non-player-house interior (scene_is_local_shown), never in door/outdoor/demo local states. */
 static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game,
                                                  PLAYER_ACTOR** out_local, float* out_dist) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     PLAYER_ACTOR* local;
     float dx, dz, dist;
     int main_index;
+    int in_interior;
 
     *out_local = NULL;
     *out_dist = 0.0f;
@@ -2355,8 +2356,16 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     if (pc_host_observer_active()) {
         return "observer"; /* --host-observer: the hidden server observer is never shoved by a puppet (it also registers no collider of its own) */
     }
+    in_interior = 0;
     if (!pc_remote_player_scene_is_local_field(slot, play)) {
-        return "scene";
+        /* Shared interior (same scene id + owner as the local scene, see scene_is_local_shown): arm the same pipe. Player rooms stay
+         * disarmed: the furniture is not synchronized (each process builds the room from its own save), so a puppet may stand inside
+         * a piece that only exists on the owner's side. */
+        if (!pc_remote_player_scene_is_local_shown(slot, play) ||
+            slot->scene.kind == (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE) {
+            return "scene";
+        }
+        in_interior = 1;
     }
     if (slot->snapshot_count == 0) {
         return "no-snapshot";
@@ -2392,6 +2401,42 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     /* Transient holds. Pause: CollisionCheck_setOC() itself refuses while paused. Net/axe swing: the player's
      * item-triangle check (OCC) ignores group flags, so a registered pipe would stop/reflect the swing. */
     main_index = local->now_main_index;
+    if (in_interior) {
+        /* a stale puppet (owner stopped sending MOVE, e.g. an unannounced scene) is hidden by dw: it must not shove either */
+        if (gamePT != NULL && (graph_dt_frame_time(gamePT) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+            return "hold";
+        }
+        /* never while the local player is in a door / outdoor / intro / demo state (a puppet on the door mat must not shove a
+         * player who is entering or leaving) */
+        switch (main_index) {
+            case mPlayer_INDEX_INTRO:
+            case mPlayer_INDEX_RETURN_DEMO:
+            case mPlayer_INDEX_RETURN_OUTDOOR:
+            case mPlayer_INDEX_RETURN_OUTDOOR2:
+            case mPlayer_INDEX_DOOR:
+            case mPlayer_INDEX_OUTDOOR:
+            case mPlayer_INDEX_KNOCK_DOOR:
+            case mPlayer_INDEX_DEMO_WAIT:
+            case mPlayer_INDEX_DEMO_WALK:
+            case mPlayer_INDEX_DEMO_GETON_TRAIN:
+            case mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT:
+            case mPlayer_INDEX_DEMO_GETOFF_TRAIN:
+            case mPlayer_INDEX_DEMO_STANDING_TRAIN:
+            case mPlayer_INDEX_DEMO_WADE:
+            case mPlayer_INDEX_DEMO_GETON_BOAT:
+            case mPlayer_INDEX_DEMO_GETON_BOAT_SITDOWN:
+            case mPlayer_INDEX_DEMO_GETON_BOAT_WAIT:
+            case mPlayer_INDEX_DEMO_GETON_BOAT_WADE:
+            case mPlayer_INDEX_DEMO_GETOFF_BOAT_STANDUP:
+            case mPlayer_INDEX_DEMO_GETOFF_BOAT:
+            case mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM:
+            case mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM2:
+            case mPlayer_INDEX_DEMO_GET_GOLDEN_AXE_WAIT:
+                return "hold";
+            default:
+                break;
+        }
+    }
     if (_Game_play_isPause(play) == 1 || main_index == mPlayer_INDEX_SWING_AXE || main_index == mPlayer_INDEX_SWING_NET) {
         return "hold";
     }

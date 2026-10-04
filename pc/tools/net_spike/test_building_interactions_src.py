@@ -95,10 +95,11 @@ def main():
           "pc_remote_player_scene_is_local_field(slot, play)" in shown and "pc_net_game_get_local_scene(&ls)" in shown and
           "SCENE_COTTAGE_MY" in shown and "SCENE_COTTAGE_NPC" in shown and "ls.scene_id == sid" in shown and "play->scene_id == sid" in shown and
           "ls.owner == slot->scene.owner" in shown and "PC_NETSCENE_KIND_OTHER_INTERIOR" in shown and "default:" in shown)
-    check("the shown predicate is used ONLY in dw (collision, fx, arrival train, door pick/wrapper stay field-only)",
-          rp.count("pc_remote_player_scene_is_local_shown(") == 2 and "pc_remote_player_scene_is_local_shown(" in dw and
+    check("the shown predicate is used ONLY in dw and collide_eval (shared-interior collision); fx, arrival train, door pick/wrapper stay field-only",
+          rp.count("pc_remote_player_scene_is_local_shown(") == 3 and "pc_remote_player_scene_is_local_shown(" in dw and
+          "pc_remote_player_scene_is_local_shown(" in func(rp, "static const char* pc_remote_player_collide_eval(") and
           all("pc_remote_player_scene_is_local_shown" not in func(rp, sig) for sig in
-              ("static const char* pc_remote_player_collide_eval(", "static void pc_remote_player_arrival_train_poll(",
+              ("static void pc_remote_player_arrival_train_poll(",
                "static int pc_remote_player_door_pick(", "static void pc_remote_player_cosmetic_door(")))
     check("row_post: hidden_door is not set once the owner's announced scene is an interior",
           "hs->scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD" in post and "!hs->scene.valid" in post)
