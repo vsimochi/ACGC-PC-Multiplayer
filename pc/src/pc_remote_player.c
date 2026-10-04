@@ -60,6 +60,7 @@
 #include "m_lib.h"           /* M9-B: _Game_play_isPause() */
 #include "libultra/libultra.h"
 #include "pc_platform.h"     /* M9-B: g_pc_collide_test_* (diagnostic verbosity only) */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() (the observer registers no collider and is never pushed by puppets) */
 #include "pc_lowaddr.h" /* PC_LOWADDR_LIMIT -- see the guard in pc_remote_player_poll() */
 #include "ac_effectbg.h" /* M9-C Phase 4: EffectBG_EFFECT_SHAKE_LARGE / EffectBG_VARIANT_* (remote tree-shake presentation) */
 #include "ef_effect_control.h" /* M9-C Phase 2a: eEC_EFFECT_TURI_MIZU (alias proof for the relax_rod row); Phase 3: eEC_CLIP + effect ids */
@@ -1951,6 +1952,9 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     *out_local = NULL;
     *out_dist = 0.0f;
 
+    if (pc_host_observer_active()) {
+        return "observer"; /* --host-observer: the hidden server observer is never shoved by a puppet (it also registers no collider of its own) */
+    }
     if (!pc_remote_player_scene_is_local_field(slot, play)) {
         return "scene";
     }
@@ -2021,6 +2025,15 @@ static void pc_remote_player_collide_update(PCRemotePlayerActor* self, PCRemoteP
     reason = pc_remote_player_collide_eval(self, slot, game, &local, &dist);
 
     if (reason != NULL) {
+        if (strcmp(reason, "observer") == 0) {
+            static int s_observer_disarm_logged = 0;
+            slot->collide_armed = 0;
+            if (!s_observer_disarm_logged) {
+                s_observer_disarm_logged = 1;
+                printf("[NET][COLLIDE] player %d: collider DISARMED reason=observer\n", (int)self->peer);
+            }
+            return;
+        }
         if (strcmp(reason, "hold") != 0 && slot->collide_armed) {
             slot->collide_armed = 0;
             printf("[NET][COLLIDE] player %d: collider DISARMED reason=%s\n", (int)self->peer, reason);

@@ -29,6 +29,11 @@ extern void mSDI_StartInitAfter(GAME* game, int renewal_reserve_flag, int malloc
 extern int mSDI_StartInitBefore(GAME* game, int player_no, int init_mode, int malloc_flag);
 extern int mSDI_StartDataInit(GAME* game, int player_no, int init_mode);
 
+#ifdef TARGET_PC
+/* PC: the hidden server observer's town initialisation (--host-observer, pc_m_card.c pc_host_observer_poll()). See the definition. */
+extern int mSDI_StartDataInitObserver(GAME* game);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

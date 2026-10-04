@@ -143,6 +143,7 @@
  * =============================================================================================
  */
 #include "pc_net_game.h"
+#include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
 #include "pc_net.h"
 #include "pc_remote_player.h"
 #include "pc_field_authority.h" /* v2: persistent town-field addressing/authority (Workstream C) */
@@ -520,9 +521,15 @@ _Static_assert(sizeof(PCNetGameIdentityMsg) <= PC_NET_MAX_PAYLOAD,
  * so land_name/land_id/terrain_hash (the host's PCNetGameTownIdentity) must equal what the client
  * claimed in its IDENTITY -- the client re-checks and disconnects otherwise
  * (pcnetgame_handle_client_identity_ack()). */
+/* --host-observer: IDENTITY_ACK.accepted is a flag byte, NOT a boolean: any NONZERO value means "accepted" (every client, old or new, only tests
+ * `!accepted`), and bit 0x02 additionally says "the host has NO AVATAR" (a hidden server observer: player_name / player_id are zero and the host will
+ * never send an APPEARANCE / MOVE / PLAYER_SCENE for PC_NETGAME_HOST_PLAYER_ID). A client that knows the bit skips creating the host puppet; one that does
+ * not simply gets an inert never-initialised puppet (it never receives an appearance). Same 32-byte layout: NO protocol-version bump (v8 is unreleased). */
+#define PC_NETGAME_ACK_FLAG_HOST_NO_AVATAR 0x02u
+
 typedef struct PCNetGameIdentityAckMsg {
     uint8_t  msg_type;              /* PC_NETGAME_MSG_IDENTITY_ACK */
-    uint8_t  accepted;              /* always 1 here; a rejection is a separate message (below) */
+    uint8_t  accepted;              /* nonzero = accepted (1 normally, 1|0x02 from a --host-observer host: see PC_NETGAME_ACK_FLAG_HOST_NO_AVATAR); a rejection is a separate message (below) */
     uint16_t assigned_peer_id;      /* the PCNetPeerId pc_net.c assigned this connection, widened */
     uint32_t protocol_version;      /* host's own version -- the client requires it to equal its own */
     uint8_t  player_name[PC_NETGAME_NAME_LEN]; /* host's identity, so the client knows who it reached */
@@ -4281,8 +4288,10 @@ static void pcnetgame_host_send_full_roster(PCNetPeerId dest) {
     PCNetGameAppearanceMsg amsg;
     int i;
 
-    pcnetgame_build_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID);
-    pc_net_send(dest, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
+    if (!pc_host_observer_active()) { /* --host-observer: the hidden host has no avatar -- its own entry is never sent (backfill and periodic resend alike) */
+        pcnetgame_build_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID);
+        pc_net_send(dest, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
+    }
 
     for (i = 0; i < PC_NET_MAX_PEERS; i++) {
         PCNetPlayerAppearance state;
@@ -4491,6 +4500,9 @@ static void pcnetgame_host_emit_player_action(int origin, uint8_t kind, int ut_x
     if (s_role != PC_NETGAME_ROLE_HOST || kind != (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_PICKUP) {
         return;
     }
+    if (origin == (int)PC_NETGAME_HOST_PLAYER_ID && pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar to present a pickup with (unreachable: it has no input) */
+    }
     if (origin < 0 || origin > (int)PC_NETGAME_HOST_PLAYER_ID || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 ||
         item == 0u || item == 0xFFFFu) {
         return;
@@ -4584,7 +4596,7 @@ static void pcnetgame_host_send_scene_roster(PCNetPeerId dest) {
     PCNetPlayerScene s;
     int i;
 
-    if (s_local_scene.valid) {
+    if (s_local_scene.valid && !pc_host_observer_active()) { /* --host-observer: the hidden host's scene is never announced */
         pcnetgame_scene_pack(&msg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene);
         pc_net_send(dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
     }
@@ -4627,7 +4639,7 @@ static void pcnetgame_scene_tick(void) {
                 s_local_scene.flags != flags) {
                 pcnetgame_scene_fill(&s_local_scene, sid, flags, owner, s_local_scene.seq);
                 s_local_scene_sent = 0;
-                if (s_role == PC_NETGAME_ROLE_HOST) {
+                if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) { /* --host-observer: tracked locally, never announced */
                     PCNetGamePlayerSceneMsg msg;
                     s_local_scene.seq = ++s_local_scene_seq;
                     s_local_scene_sent = 1;
@@ -8376,6 +8388,9 @@ void pc_net_game_host_local_money_rock_hit(int ut_x, int ut_z) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar, hence no host-local field action (unreachable: no input) */
+    }
     if (!pcfa_scene_is_town()) {
         return; /* the host itself is indoors -- ut_x/ut_z from a room are not town coordinates */
     }
@@ -8391,6 +8406,9 @@ void pc_net_game_host_local_tree_shake(int ut_x, int ut_z) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar, hence no host-local field action (unreachable: no input) */
+    }
     if (!pcfa_scene_is_town()) {
         return;
     }
@@ -8405,6 +8423,9 @@ void pc_net_game_host_local_tree_shake(int ut_x, int ut_z) {
 void pc_net_game_host_local_tree_chop(int ut_x, int ut_z) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
+    }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar, hence no host-local field action (unreachable: no input) */
     }
     if (!pcfa_scene_is_town()) {
         return;
@@ -11326,6 +11347,9 @@ static PCNetGameIdentityClass pcnetgame_host_classify_identity(const PCNetGameId
 static int pcnetgame_host_own_resident_idx(void) {
     Private_c* priv = Save_Get(private_data);
     int i;
+    if (pc_host_observer_active()) {
+        return -1; /* --host-observer: the host plays NO resident (authoritative rule): every resident 0..3 is claimable */
+    }
     if (Now_Private == NULL) {
         return -1;
     }
@@ -11434,6 +11458,9 @@ static void pcnetgame_host_refuse_identity(PCNetPeerId peer, const char* why, in
  * non-null counts: such a key is a resident / house owner of this town and can NEVER be a guest. Returns a reason string or NULL. */
 static const char* pcnetgame_guest_key_conflict(const PersonalID_c* key) {
     int i;
+    if (pc_host_observer_id_matches(key)) {
+        return "the guest key equals the reserved PersonalID of this host's server observer";
+    }
     for (i = 0; i < PLAYER_NUM; i++) {
         PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
         if (mPr_NullCheckPersonalID(p) == FALSE && memcmp(p, key, sizeof(*key)) == 0) {
@@ -12833,6 +12860,13 @@ static void pcnetgame_guest_store_load(void) {
         if (s_guest_file.e[g].present) {
             pcnetgame_guest_install(g, &s_guest_file.e[g]);
             n++;
+        }
+    }
+    if (pc_host_observer_active()) {
+        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+            if (s_guest[g].used && pc_host_observer_id_matches(&s_guest[g].key)) {
+                printf("[NET][OBSERVER] host: guests.dat entry %d carries the observer's reserved PersonalID -- that guest is refused (key conflict)\n", g);
+            }
         }
     }
     printf("[NET][GUEST] store: guests file '%s' load mode=%s (generation used %d, %d unreadable file(s) preserved), %d guest(s) restored\n",
@@ -19351,8 +19385,15 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         ack.accepted = 1;
         ack.assigned_peer_id = (uint16_t)peer;
         ack.protocol_version = PC_NETGAME_PROTOCOL_VERSION;
-        pcnetgame_capture_local_identity(ack.player_name, unused_land_name, &ack.player_id, &unused_land_id,
-                                          &unused_has_save);
+        if (pc_host_observer_active()) {
+            /* --host-observer: "the host has no avatar". The observer's synthetic identity never leaves this process: name / id stay zero and the
+             * ACK carries accepted = 1 | HOST_NO_AVATAR (every client treats any nonzero value as accepted). */
+            ack.accepted = (uint8_t)(1u | PC_NETGAME_ACK_FLAG_HOST_NO_AVATAR);
+            printf("[NET][OBSERVER] host: peer %d: host has no avatar (roster / move / scene / appearance suppressed)\n", (int)peer);
+        } else {
+            pcnetgame_capture_local_identity(ack.player_name, unused_land_name, &ack.player_id, &unused_land_id,
+                                              &unused_has_save);
+        }
         memcpy(ack.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN);
         ack.land_id = s_host_town.land_id;
         ack.terrain_hash = s_host_town.terrain_hash;
@@ -20338,7 +20379,12 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         /* Stage 2: give the client a visible representation of the host. Tracked under the
          * reserved PC_NETGAME_HOST_PLAYER_ID (a PCNetPlayerId), NOT the client's own transport
          * PCNetPeerId (which is a different, transport-only number space -- see pc_net_game.h). */
-        pc_remote_player_on_ready(PC_NETGAME_HOST_PLAYER_ID, &s_client_host_identity);
+        if (in.accepted & PC_NETGAME_ACK_FLAG_HOST_NO_AVATAR) {
+            /* --host-observer host: it has no avatar, so no host puppet is created (nothing will ever be sent for PC_NETGAME_HOST_PLAYER_ID) */
+            printf("[NET][OBSERVER] client: host has no avatar (no host puppet)\n");
+        } else {
+            pc_remote_player_on_ready(PC_NETGAME_HOST_PLAYER_ID, &s_client_host_identity);
+        }
         pcnetgame_crec_on_ready(); /* D3: record state machine starts (HELLO goes out from the next client tick) */
         return;
     }
@@ -22319,7 +22365,7 @@ void pc_net_game_poll(void) {
 
             if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY) {
                 pc_net_send(0, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
-            } else if (s_role == PC_NETGAME_ROLE_HOST) {
+            } else if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) { /* --host-observer: no host MOVE stream */
                 int i;
                 msg.net_player_id = (uint8_t)PC_NETGAME_HOST_PLAYER_ID;
                 for (i = 0; i < PC_NET_MAX_PEERS; i++) {
@@ -22403,7 +22449,7 @@ void pc_net_game_poll(void) {
                 PCNetGameAppearanceMsg amsg;
                 pcnetgame_pack_appearance_msg(&amsg, 0, &current);
                 pc_net_send(0, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
-            } else if (s_role == PC_NETGAME_ROLE_HOST) {
+            } else if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) { /* --host-observer: nothing to broadcast (cache still updated below) */
                 /* Host: there is no equivalent "someone else relays my own change" path -- a
                  * client's changed appearance reaches other clients because the host itself
                  * receives and relays it, but the host never "receives" its own appearance over
@@ -22709,6 +22755,9 @@ int pc_net_game_get_player_context(PCNetPlayerId player_id, PCNetPlayerContext* 
         return 0;
     }
     if (player_id == PC_NETGAME_HOST_PLAYER_ID) {
+        if (pc_host_observer_active()) {
+            return 0; /* --host-observer: the hidden host has no player context (nobody uses its own luck for anyone else) */
+        }
         return pc_net_game_get_local_player_context(out);
     }
     if (player_id < 0 || player_id >= PC_NET_MAX_PEERS || s_host_peer_link[player_id] != PC_NETGAME_LINK_READY ||
@@ -23276,6 +23325,9 @@ void pc_net_game_host_local_dig_hole(int ut_x, int ut_z, int hole_variant) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar, hence no host-local field action (unreachable: no input) */
+    }
     if (!pcfa_scene_is_town()) {
         return;
     }
@@ -23293,6 +23345,9 @@ void pc_net_game_host_local_fill_hole(int ut_x, int ut_z) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar, hence no host-local field action (unreachable: no input) */
+    }
     if (!pcfa_scene_is_town()) {
         return;
     }
@@ -23307,6 +23362,9 @@ void pc_net_game_host_local_pitfall_consume(int ut_x, int ut_z) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar, hence no host-local field action (unreachable: no input) */
+    }
     if (!pcfa_scene_is_town()) {
         return;
     }
@@ -23320,6 +23378,9 @@ void pc_net_game_host_local_pitfall_consume(int ut_x, int ut_z) {
 void pc_net_game_host_local_dig_shine(int ut_x, int ut_z) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
+    }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host has no avatar, hence no host-local field action (unreachable: no input) */
     }
     if (!pcfa_scene_is_town()) {
         return;
@@ -23362,6 +23423,9 @@ int pc_net_game_field_tile_reserved(int ut_x, int ut_z) {
  * broadcast this regardless of how it might be called). No self-send: the host is not its own
  * peer. */
 void pc_net_game_notify_local_field_pickup(int ut_x, int ut_z) {
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: no host pickup exists (unreachable: no input); nothing to commit or present */
+    }
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
@@ -23667,6 +23731,9 @@ int pc_net_game_host_local_bury(int pocket_slot_idx, int ut_x, int ut_z, int cla
 
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return 0;
+    }
+    if (pc_host_observer_active()) {
+        return 1; /* --host-observer: "handled" with NO mutation (the caller must not fall back to vanilla's local bury); unreachable: no input */
     }
     if (!pcfa_scene_is_town()) {
         return 0; /* the host itself is indoors -- ut_x/ut_z from a room are not town coordinates */
@@ -24670,6 +24737,9 @@ void pc_net_game_host_local_wildlife_spawn_trigger(int bx, int bz) {
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden host never wades / triggers vanilla wildlife spawns (clients' triggers are per peer) */
+    }
     if (!pcnetgame_wildlife_auth_on()) {
         return; /* opt-in gate off -- caller falls through to plain vanilla behavior */
     }
@@ -24778,6 +24848,9 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
 
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return 0;
+    }
+    if (pc_host_observer_active()) {
+        return 0; /* --host-observer: the hidden host catches nothing (rejected, nothing is granted) */
     }
     if (!pcnetgame_wildlife_auth_on()) {
         return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior */

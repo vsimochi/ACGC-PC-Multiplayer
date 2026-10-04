@@ -387,7 +387,14 @@ def main():
         moved = [f for f in moved if f != "pc/src/pc_save_bswap.c"]
     check(f"S9 save-layout sources unchanged vs HEAD ({layout_files}; modified: {moved})",
           not moved and all(os.path.isfile(os.path.join(REPO, f)) for f in layout_files))
-    card_diff = git("diff", "-U0", "HEAD", "--", "pc/src/pc_m_card.c")
+    # --host-observer: the additions of that opt-in feature are fenced by `/* OBSERVER-BEGIN */ ... /* OBSERVER-END */` markers (their own audit is
+    # test_observer_src.py: no GCI / serialisation call inside them). The diff below is computed on the file WITHOUT those blocks, so the observer
+    # cannot hide a layout / serialisation change anywhere else in pc_m_card.c.
+    import difflib
+    head_card = git("show", "HEAD:pc/src/pc_m_card.c").replace("\r\n", "\n")
+    with open(os.path.join(REPO, "pc/src/pc_m_card.c"), "rb") as f_card:
+        cur_card = re.sub(r"/\* OBSERVER-BEGIN \*/.*?/\* OBSERVER-END \*/\n?", "", f_card.read().decode("utf-8", "replace").replace("\r\n", "\n"), flags=re.S)
+    card_diff = "\n".join(difflib.unified_diff(head_card.split("\n"), cur_card.split("\n"), lineterm="", n=0))
     touched = [l for l in card_diff.split("\n") if l[:1] in "+-" and not l.startswith(("+++", "---"))]
     layout_rx = re.compile(r"GCI_|pc_save_write_gci|pc_save_load|OTHERS_SIZE|mCD_|put_be|get_be|bswap|sizeof\((?:Save|CARDDir|Private)|"
                            r"\b(?:fwrite|fread|fseek|calloc|malloc|memcpy)\(|\.length|\.gci")

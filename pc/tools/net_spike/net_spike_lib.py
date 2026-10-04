@@ -4086,6 +4086,68 @@ class HostProcess:
                   "'local save not loaded')")
         return True
 
+    # --- --host-observer readiness (the hidden server observer: NO resident, NO keystrokes) ---------------------------------------
+    # The observer poll (pc_m_card.c pc_host_observer_poll) logs "[NET][OBSERVER] host: observer active at acre (bx,bz)" on the first frame the town
+    # field is loaded with the observer in it (and "[NET][OBSERVER] host: observer init FAILED: ..." when it could not start). The same title-demo
+    # "world ready" false positive as boot_to_field applies, so the readiness search is anchored STRICTLY AFTER the observer-active line.
+    OBSERVER_ACTIVE_RX = r"\[NET\]\[OBSERVER\] host: observer active at acre \((-?\d+),(-?\d+)\)"
+    OBSERVER_FAIL_RX = r"\[NET\]\[OBSERVER\] host: observer init FAILED[^\n]*"
+
+    def boot_to_observer(self, timeout=90.0, ready_rx=None, settle=2.5, verbose=True):
+        """Non-interactive readiness check for a process launched with `--host-observer`. Steps: (1) wait for the observer-active line (fail fast on an
+        init FAILED line or an early exit); (2) wait for `ready_rx` (default WORLD_READY_RX) STRICTLY AFTER that line; (3) sleep `settle` seconds;
+        (4) confirm no 'local save not loaded' line after the readiness match and the process is alive. True only if all of it passes in `timeout`."""
+        if ready_rx is None:
+            ready_rx = self.WORLD_READY_RX
+        active_rx = re.compile(self.OBSERVER_ACTIVE_RX)
+        fail_rx = re.compile(self.OBSERVER_FAIL_RX)
+        deadline = time.monotonic() + timeout
+        active_off = None
+        while time.monotonic() < deadline:
+            text = self.log_text()
+            mo = active_rx.search(text)
+            if mo:
+                active_off = mo.end()
+                break
+            fmo = fail_rx.search(text)
+            if fmo:
+                if verbose:
+                    print("[boot_to_observer] observer init failure: %r" % fmo.group(0))
+                return False
+            if self.proc is not None and self.proc.poll() is not None:
+                if verbose:
+                    tail = [ln for ln in text.splitlines() if ln.strip()][-4:]
+                    print("[boot_to_observer] process exited before the observer was active (exit code %s; log %s; last lines: %s)"
+                          % (self.proc.returncode, self.log_path, tail))
+                return False
+            time.sleep(0.1)
+        if active_off is None:
+            if verbose:
+                print("[boot_to_observer] timed out waiting for the observer-active line")
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        mo = self.wait_for_log(ready_rx, remaining, since_offset=active_off)
+        if mo is None:
+            if verbose:
+                print("[boot_to_observer] timed out waiting for readiness AFTER the observer-active line")
+            return False
+        ready_off = active_off + mo.end()
+        if settle > 0:
+            time.sleep(settle)
+        if self.proc is not None and self.proc.poll() is not None:
+            if verbose:
+                print("[boot_to_observer] process exited during the post-readiness settle period")
+            return False
+        if re.search(self.LOCAL_SAVE_NOT_LOADED_RX, self.log_text()[ready_off:]):
+            if verbose:
+                print("[boot_to_observer] 'local save not loaded' seen AFTER readiness")
+            return False
+        if verbose:
+            print("[boot_to_observer] observer active -> world ready (no post-readiness 'local save not loaded')")
+        return True
+
     def host_town_from_log(self):
         mo = re.search(self.WORLD_READY_RX, self.log_text())
         return None if mo is None else (int(mo.group(1), 16), int(mo.group(2), 16))

@@ -89,6 +89,12 @@ def raw_main():
     return read("pc/src/pc_main.c")
 
 
+def strip_observer(text):
+    """pc_m_card.c with every `/* OBSERVER-BEGIN */ ... /* OBSERVER-END */` block (the --host-observer additions) removed: what remains must be the
+    pre-observer file (the audits below compare the GCI writers against HEAD on THIS text, so the observer cannot hide a change in them)."""
+    return re.sub(r"/\* OBSERVER-BEGIN \*/.*?/\* OBSERVER-END \*/\n?", "", text, flags=re.S)
+
+
 def head_function(name, path="pc/src/pc_net_game.c"):
     txt = subprocess.run(["git", "-C", ROOT, "show", "HEAD:" + path], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
     txt = txt.replace("\r\n", "\n")
@@ -220,9 +226,13 @@ def main():
        "bound guest table entry is gone or changed" in fb("pcnetgame_host_revalidate_bound_peers") and "pcnetgame_guest_key_conflict(&st->bound_pid)" in fb("pcnetgame_host_revalidate_bound_peers"))
 
     # ------------------------------------------------------------------------------------------------ C
-    ck("C the RESIDENT classifier and the own-resident function are byte-identical to HEAD (residents keep priority, the guest path changed neither)",
+    ws = lambda t: re.sub(r"\s+", "", t)
+    own_head = mask(head_function("pcnetgame_host_own_resident_idx"))
+    own_expect = own_head.replace("    int i;\n", "    int i;\n    if (pc_host_observer_active()) {\n        return -1;\n    }\n", 1)
+    ck("C the RESIDENT classifier is byte-identical to HEAD and the own-resident function is HEAD plus EXACTLY the --host-observer early `return -1` "
+       "(residents keep priority, the guest path changed neither; the observer plays no resident)",
        fb("pcnetgame_host_classify_identity") != "" and mask(head_function("pcnetgame_host_classify_identity")).strip() == fb("pcnetgame_host_classify_identity").strip()
-       and mask(head_function("pcnetgame_host_own_resident_idx")).strip() == fb("pcnetgame_host_own_resident_idx").strip())
+       and own_expect != own_head and ws(own_expect) == ws(fb("pcnetgame_host_own_resident_idx")))
     pi = fb("pcnetgame_host_process_identity")
     ck("C the class is decided in process_identity AFTER the unchanged NO_SAVE / LAND_MISMATCH checks and BEFORE the ACK: classify -> (UNKNOWN + EXT guest claim -> guest_check) / "
        "(RESIDENT + guest claim -> refuse) -> own-resident -> duplicate/park -> create -> reset -> ACK -> TOKEN -> READY",
@@ -290,7 +300,7 @@ def main():
     ck("P an accepted guest change raises the same early-save request as a resident (note_peer_gone maps the guest slot) and the resident note_saved never clears a guest's dirty marker",
        "slot = st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST" in fb("pcnetgame_rec_note_peer_gone") and "for (i = 0; i < PLAYER_NUM; i++) {" in fb("pc_net_game_record_note_saved"))
     d = subprocess.run(["git", "-C", ROOT, "diff", "--stat", "HEAD", "--", "pc/src/pc_card.c", "pc/src/pc_save_bswap.c"], capture_output=True, text=True).stdout.strip()
-    cur_mc = mask(read("pc/src/pc_m_card.c"))
+    cur_mc = mask(strip_observer(read("pc/src/pc_m_card.c")))  # the --host-observer marker blocks removed (see strip_observer)
     cur_f = functions(cur_mc)
     writers = ("pc_save_write_gci_to", "pc_save_write_gci", "pc_save_rotate_backups", "pc_save_write_authoritative", "mCD_SaveHome_bg")
     same = {n: (mask(head_function(n, "pc/src/pc_m_card.c")).strip() == body(cur_mc, cur_f, n).strip() != "") for n in writers}
@@ -384,8 +394,10 @@ def main():
     fa_fns = functions(fa)
     sr = body(fa, fa_fns, "pcfa_save_ready")
     ck("G2 pcfa_save_ready: a player_no >= mPr_FOREIGNER is 'not ready' (travelling: Save is another town) UNLESS this process is a network CLIENT (it never travels: the "
-       "station save is refused for it); a host / single-player foreigner stays not ready exactly as before; every other readiness condition is unchanged",
-       re.search(r"if \(Common_Get\(player_no\) >= mPr_FOREIGNER\) \{[^}]*if \(pc_net_game_role\(\) != PC_NETGAME_ROLE_CLIENT\) \{\s*return 0;\s*\}\s*\}", sr, re.S)
+       "station save is refused for it) or a HOST whose --host-observer latch is set (pc_host_observer_ready(): the hidden observer never travels); a plain host / "
+       "single-player foreigner stays not ready exactly as before; every other readiness condition is unchanged",
+       re.search(r"if \(Common_Get\(player_no\) >= mPr_FOREIGNER\) \{\s*if \(pc_net_game_role\(\) == PC_NETGAME_ROLE_CLIENT\) \{\s*\} else if "
+                 r"\(pc_net_game_role\(\) == PC_NETGAME_ROLE_HOST && pc_host_observer_ready\(\)\) \{\s*\} else \{\s*return 0;\s*\}\s*\}", sr, re.S)
        and all(x in sr for x in ("Common_Get(now_private) == NULL", "case SCENE_TITLE_DEMO:", "case SCENE_PLAYERSELECT_SAVE:", "mLd_CHECK_LAND_ID(Save_Get(land_info.id))")))
     mc = mask(read("pc/src/pc_m_card.c"))
     mfn = functions(mc)

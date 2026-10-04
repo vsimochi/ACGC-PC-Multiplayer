@@ -30,6 +30,7 @@
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Stage 5A: pc_net_game_role()/pc_net_game_request_pickup() -- see
                            * m_player_main_pickup.c_inc's Setup_main_Pickup seam. */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() (hidden, collider-less, undrawn avatar; also used by m_player_common.c_inc) */
 #include "pc_wildlife_authority.h" /* T8 audit fix (Bug 3): pcwld_should_suppress_local_wildlife() --
                                      * see m_player_main_notice_rod.c_inc / m_player_main_notice_net.c_inc's
                                      * own catch-interception seams. */
@@ -1796,6 +1797,12 @@ extern void Player_actor_draw(ACTOR* actorx, GAME* game) {
 
     PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
     int main_idx = player->now_main_index;
+
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden server observer is never drawn */
+    }
+#endif
 
     if (mPlayer_MAIN_INDEX_VALID(main_idx) != FALSE) {
         int draw_idx = data[main_idx];

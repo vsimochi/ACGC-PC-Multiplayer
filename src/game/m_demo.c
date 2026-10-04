@@ -9,6 +9,7 @@
 #include "_mem.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* X1 review M1: pc_net_game_client_pocket_locked() -- see wait_talk_start() */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() -- see mDemo_Request() */
 #endif
 
 /* Z-X */
@@ -988,6 +989,19 @@ extern void mDemo_stock_clear() {
 extern int mDemo_Request(int type, ACTOR* actor, mDemo_REQUEST_PROC req_proc) {
     f32 weight = 1.0f;
     int request_num = demo->request_num;
+
+#ifdef TARGET_PC
+    /* --host-observer: the hidden server observer is "not talkable". Every message-window demo (a villager / event NPC forcing a SPEAK, a TALK, a
+     * REPORT / SPEECH announcement, an EVENTMSG) would wait for a button press that never comes (the observer has no input), freezing that NPC in
+     * its talk state and the demo state machine for good. Refused exactly like any other "cannot talk right now" answer: every caller re-requests
+     * every frame and ignores the result, so the NPC simply stays in its idle state. Door / scroll / outdoor demos are not message demos and are
+     * untouched (the observer never moves). */
+    if (pc_host_observer_active() &&
+        (type == mDemo_TYPE_TALK || type == mDemo_TYPE_SPEAK || type == mDemo_TYPE_REPORT || type == mDemo_TYPE_SPEECH ||
+         type == mDemo_TYPE_EVENTMSG || type == mDemo_TYPE_EVENTMSG2)) {
+        return FALSE;
+    }
+#endif
 
     if (request_num < mDemo_REQUEST_NUM) {
         if (type >= demo->priority_type) {

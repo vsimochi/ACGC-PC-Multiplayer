@@ -85,6 +85,12 @@ void VIWaitForRetrace(void) {
         pc_bootstrap_guest_poll();
     }
 
+    /* --host-observer (HOST role + flag only; a no-op otherwise): the hidden server observer's one-shot bootstrap and readiness latch. */
+    {
+        extern void pc_host_observer_poll(void);
+        pc_host_observer_poll();
+    }
+
     /* Stage 0.5D: periodic authoritative-town save. Fires only while BOTH:
      *   - this process is the host (pc_net_game_role() == PC_NETGAME_ROLE_HOST) -- an M1 hardening
      *     correction: the original Stage 0.5D condition below gated on readiness alone, which meant

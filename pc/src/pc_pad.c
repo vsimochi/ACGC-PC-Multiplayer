@@ -3,6 +3,7 @@
 #include "pc_typing.h"
 #include "pc_keybindings.h"
 #include "pc_settings.h"
+#include "pc_host_observer.h"
 #include <dolphin/pad.h>
 
 /* analog stick constants */
@@ -162,6 +163,15 @@ u32 PADRead(PADStatus* status) {
 
         status[0].triggerLeft  = pad_trigger_value(pb->l);
         status[0].triggerRight = pad_trigger_value(pb->r);
+    }
+
+    if (pc_host_observer_active()) {
+        /* --host-observer: the hidden observer is NOT controllable. Every keyboard / mouse / gamepad input is dropped here, the single place the
+         * game reads a controller from (PADRead), so neither the avatar, nor a message window, nor any menu can be driven from this process. */
+        buttons = 0;
+        stickX = stickY = cstickX = cstickY = 0;
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
     }
 
     status[0].button = buttons;

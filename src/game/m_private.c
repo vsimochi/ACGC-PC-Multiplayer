@@ -20,6 +20,7 @@
 
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* mail milestone M0: pc_net_game_role() */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() */
 #endif
 
 static Mail_c l_mpr_mail;
@@ -763,6 +764,15 @@ extern Private_c* mPr_GetForeignerP() {
 extern int mPr_LoadPak_and_SetPrivateInfo2(Private_c* unused_private, u8 player_no) {
     Private_c* priv;
     int res = FALSE;
+
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        /* --host-observer: this function COPIES g_foreigner_private INTO private_data[i] when the PersonalIDs compare equal (a returning
+         * resident). The observer is a static record outside private_data[] with a reserved PersonalID that equals no resident, and it never
+         * travels, so the merge is unreachable; refused explicitly so that it can never alias a resident slot (and never rebinds now_private). */
+        return FALSE;
+    }
+#endif
 
     if (player_no < mPr_FOREIGNER) {
         u32 loan;

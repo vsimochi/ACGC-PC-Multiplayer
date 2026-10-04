@@ -2010,6 +2010,12 @@ static void Player_actor_Excute_Corect_forStand(ACTOR* actorx, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     CollisionCheck_c* col_check_p = &play->collision_check;
 
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden server observer registers no collider (villagers / puppets walk through it) */
+    }
+#endif
+
     CollisionCheck_Uty_ActorWorldPosSetPipeC(actorx, col_pipe_p);
     CollisionCheck_setOC(game, col_check_p, col_obj_p);
 }
@@ -2036,6 +2042,12 @@ static void Player_actor_Excute_Corect_forOutdoor(ACTOR* actorx, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     CollisionCheck_c* col_check_p = &play->collision_check;
     xyz_t world_pos;
+
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: no collider (see Player_actor_Excute_Corect_forStand) */
+    }
+#endif
 
     cKF_SkeletonInfo_R_AnimationMove_CulcTransToWorld(&world_pos, &actorx->world.position, 0.0f, 1000.0f, 0.0f,
                                                       actorx->shape_info.rotation.y, &actorx->scale, kf0_p,
@@ -2130,6 +2142,11 @@ static void Player_actor_SetPosition_OBJtoLine_forItem(ACTOR* actorx, GAME* game
         ClObj_c* axe_col_obj_p = &axe_tris_p->collision_obj;
         ClObj_c* net_col_obj_p = &net_tris_p->collision_obj;
 
+#ifdef TARGET_PC
+        if (pc_host_observer_active()) {
+            return; /* --host-observer: no axe / net item colliders either */
+        }
+#endif
         CollisionCheck_setOCC(game, col_check_p, axe_col_obj_p);
         CollisionCheck_setOCC(game, col_check_p, net_col_obj_p);
     }

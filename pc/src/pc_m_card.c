@@ -34,6 +34,12 @@
 #include "lb_rtc.h"
 #include "game.h"
 #include "pc_net_game.h"
+/* OBSERVER-BEGIN */
+#include "pc_host_observer.h"
+#include "pc_field_authority.h"
+#include "m_player_lib.h"
+#include "ac_birth_control.h"
+/* OBSERVER-END */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +91,29 @@ static union {
 static int l_mcd_keep_startCond = 0;
 static char l_card_b_gci_path[300] = {0};      /* Path to the Card B GCI file, if found */
 
+/* OBSERVER-BEGIN */
+/* --- --host-observer (the hidden SERVER OBSERVER, see pc_host_observer.h) -------------------------------------------------------------
+ * s_pc_observer_private is a PC-owned STATIC record: it is NOT an element of Save_t.private_data[], NOT the passport (l_mcd_foreigner_file) and NOT
+ * g_foreigner_private, so no save routine, no travel merge and no resident lookup can ever see or serialise it (the writer serialises Save_t only). It is
+ * bound as Common.now_private with Common.player_no == mPr_FOREIGNER (exactly 4). Its PersonalID is RESERVED (name "SERVER", this town's land, a fixed
+ * player_id chosen by pc_host_observer_pick_id() so that it equals no resident / house owner of the loaded save). */
+static Private_c s_pc_observer_private;
+static int s_pc_observer_latched = 0; /* one-way: the town field was loaded once with the observer in it (pcfa_save_ready() foreigner exemption) */
+
+int pc_host_observer_active(void) {
+    return g_pc_host_observer != 0 && pc_net_game_role() == PC_NETGAME_ROLE_HOST &&
+           Common_Get(now_private) == &s_pc_observer_private && Common_Get(player_no) == mPr_FOREIGNER;
+}
+
+int pc_host_observer_ready(void) {
+    return s_pc_observer_latched != 0 && pc_host_observer_active();
+}
+
+int pc_host_observer_id_matches(const void* personal_id) {
+    return personal_id != NULL && pc_host_observer_active() &&
+           memcmp(personal_id, &s_pc_observer_private.player_ID, sizeof(PersonalID_c)) == 0;
+}
+/* OBSERVER-END */
 /* External: scan card_b/ for valid AC GCI file (defined in pc_card.c) */
 extern int pc_card_scan_for_gci(int chan, char* out_path, int out_size);
 
@@ -268,6 +297,11 @@ static void pc_save_pre_write_side_effects(int save_mode) {
     u16 copy_protect;
     int i;
 
+/* OBSERVER-BEGIN */
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: nothing here applies to the static observer record (never reached: mCD_SaveHome_bg refuses first) */
+    }
+/* OBSERVER-END */
     mCkRh_SavePlayTime(Common_Get(player_no));
 
     if (priv != NULL) {
@@ -910,6 +944,15 @@ void mCD_InitAll(void) {
 int mCD_InitGameStart_bg(int player_no, int card_private_idx, int start_cond, s32* mounted_chan) {
     static int init_done = 0;
 
+/* OBSERVER-BEGIN */
+    if (pc_host_observer_active()) {
+        /* --host-observer: the observer never goes through the player-select / train flow. mSDI_StartDataInit(PAK) from here would call
+         * mEv_SetGateway() and the OUTGOING branch would merge the passport into a resident record. Refused (defence in depth: unreachable). */
+        OSReport("[NET][OBSERVER] host: mCD_InitGameStart_bg refused (the observer never enters the player-select / travel flow)\n");
+        if (mounted_chan) *mounted_chan = mCD_SLOT_A;
+        return mCD_TRANS_ERR_NONE;
+    }
+/* OBSERVER-END */
     /* On GC, save is re-read from the memory card each game start.
      * On PC, the save was already reloaded from disk in common_data_reinit
      * and aAL_title_game_data_init_start_select. We just need to allow
@@ -1315,6 +1358,163 @@ void pc_bootstrap_guest_poll(void) {
              (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id);
 }
 
+/* OBSERVER-BEGIN */
+/* --host-observer: picks the observer's reserved player_id. The identity must equal NO resident of the loaded save (every private_data[] PersonalID,
+ * even a resident whose `exists` is FALSE = away) and NO house owner (homes[].ownerID): checked on the full PersonalID AND, more conservatively, on the
+ * 16-bit player_id alone (so not even an id-only comparison anywhere can confuse them). Deterministic candidate sequence 0xF0FE, 0xF0FD, ... (the
+ * range mPr_InitPrivateInfo never hands out is 0xF0FD.. up, 0xF000..0xF0FC is its range). Returns the id or 0 if every candidate collides. The guests
+ * table needs no check here: a guest key has a home land that differs from this town's land (pcnetgame_host_guest_check), the observer's land IS this
+ * town's land, and pcnetgame_guest_key_conflict() additionally refuses the observer id explicitly. */
+#define PC_OBSERVER_ID_CANDIDATES 16
+static u16 pc_host_observer_pick_id(const PersonalID_c* base) {
+    int c;
+    for (c = 0; c < PC_OBSERVER_ID_CANDIDATES; c++) {
+        PersonalID_c cand = *base;
+        int i, clash = 0;
+        cand.player_id = (u16)(0xF0FEu - (u16)c);
+        for (i = 0; i < PLAYER_NUM && !clash; i++) {
+            const PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+            if (memcmp(p, &cand, sizeof(cand)) == 0 || p->player_id == cand.player_id) {
+                clash = 1;
+            }
+        }
+        for (i = 0; i < mHS_HOUSE_NUM && !clash; i++) {
+            const PersonalID_c* p = &Save_Get(homes[i]).ownerID;
+            if (memcmp(p, &cand, sizeof(cand)) == 0 || p->player_id == cand.player_id) {
+                clash = 1;
+            }
+        }
+        if (!clash) {
+            return cand.player_id;
+        }
+    }
+    return 0;
+}
+
+/* --host-observer (see pc_main.c / pc_host_observer.h): the hidden SERVER OBSERVER bootstrap + readiness latch, called every frame from pc_vi.c next
+ * to the other bootstrap polls. HOST role + flag only. Modelled on pc_bootstrap_guest_poll() / pc_bootstrap_resident_poll():
+ *   1. once, on the first settled play frame (play_main, no wipe): checks a valid town save is loaded, builds the static record
+ *      (mPr_InitPrivateInfo, then the reserved PersonalID), sets rtc_enabled, binds Now_Private + player_no == mPr_FOREIGNER BEFORE the init (so the
+ *      init's mEv_UnSetGateway() clears a stale visitor flag), runs mSDI_StartDataInitObserver() (no mEv_SetGateway / return-animal / goodbye mail, no
+ *      passport), arms pc_save_ready ONLY on success, forces borderless acres (live 3x3 acres), and goes to SCENE_FG at the station point (1979, 760)
+ *      with a plain fade (no train / station cutscene, no demo profile);
+ *   2. then, once, on the first frame where the town field is loaded with the observer in it (SCENE_FG, no wipe, pcfa_scene_is_town()): sets the
+ *      one-way readiness latch and logs "[NET][OBSERVER] host: observer active at acre (bx,bz)".
+ * A saved resident whose PersonalID cannot be told from every candidate observer id FAILS the startup (loud message, exit code 3): a hosted town
+ * must never continue with an ambiguous identity. Any other failure restores the previous binding, disarms the writer and leaves the host unbound
+ * (not world-ready), exactly like a host whose save never loaded. */
+void pc_host_observer_poll(void) {
+    static int l_started = 0;
+    static int l_init_ok = 0;
+    GAME_PLAY* play;
+
+    if (!g_pc_host_observer || pc_net_game_role() != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE) {
+        return; /* goto_other_scene() refuses while a wipe runs (same wait as the bootstraps) */
+    }
+
+    if (l_started) {
+        if (l_init_ok && !s_pc_observer_latched && pc_host_observer_active() && play->scene_id == SCENE_FG && Save_Get(scene_no) == SCENE_FG &&
+            Common_Get(player_actor_exists) && pcfa_scene_is_town()) {
+            s_pc_observer_latched = 1;
+            OSReport("[NET][OBSERVER] host: observer active at acre (%d,%d)\n", (int)play->block_table.block_x, (int)play->block_table.block_z);
+            OSReport("[NET][OBSERVER] host: avatar main_index=%d (hidden, no collider, no input)\n", mPlib_get_player_actor_main_index(gamePT));
+        }
+        return;
+    }
+    l_started = 1; /* never retried, whether what follows succeeds or fails */
+
+    {
+        Private_c* prev_private = Common_Get(now_private);
+        int prev_player_no = Common_Get(player_no);
+        Private_c* rec = &s_pc_observer_private;
+        Door_data_c door_data;
+        PersonalID_c base;
+        u16 pid;
+        int scene_res;
+
+        if (mFRm_CheckSaveData() == FALSE) {
+            OSReport("[NET][OBSERVER] host: observer init FAILED: no valid town save is loaded (the host stays unbound and not world-ready)\n");
+            return;
+        }
+
+        /* The static record: valid default appearance + exists = TRUE from the vanilla initialiser (it also sets land = THIS town), then the reserved
+         * identity. memset first so no byte of an earlier life remains (this runs once per process). */
+        memset(rec, 0, sizeof(*rec));
+        mPr_InitPrivateInfo(rec);
+        base = rec->player_ID;
+        memset(base.player_name, CHAR_SPACE, PLAYER_NAME_LEN);
+        memcpy(base.player_name, "SERVER", 6); /* the game's font encoding is ASCII-compatible for letters (CHAR_A == 65) */
+        pid = pc_host_observer_pick_id(&base);
+        if (pid == 0) {
+            OSReport("[NET][OBSERVER] host: observer init FAILED: no reserved PersonalID is free of the saved residents / house owners (%d candidates tried) -- "
+                     "refusing to host with an ambiguous identity\n", PC_OBSERVER_ID_CANDIDATES);
+            fprintf(stderr, "[NET][OBSERVER] FATAL: no reserved observer PersonalID is free of this save's residents / house owners; start the host "
+                            "without --host-observer or rename the conflicting resident\n");
+            fflush(stdout);
+            exit(3);
+        }
+        base.player_id = pid;
+        mPr_CopyPersonalID(&rec->player_ID, &base);
+        rec->exists = TRUE;
+        rec->reset_code = 0;
+        rec->destiny.type = mPr_DESTINY_NORMAL;
+
+        Common_Set(time.rtc_enabled, TRUE); /* see pc_bootstrap_resident_poll() */
+        /* Bind BEFORE the init: mSDI_StartDataInitObserver() -> mEv_UnSetGateway() needs player_no == 4 to clear a stale GATEWAY_FRGN flag. */
+        Common_Set(now_private, rec);
+        Common_Set(player_no, mPr_FOREIGNER);
+        if (mSDI_StartDataInitObserver(gamePT) != TRUE) {
+            Common_Set(now_private, prev_private);
+            Common_Set(player_no, prev_player_no);
+            OSReport("[NET][OBSERVER] host: observer init FAILED: mSDI_StartDataInitObserver failed (binding restored, the host stays unbound)\n");
+            return;
+        }
+
+        /* Armed ONLY after a successful init (mirrors pc_bootstrap_resident_poll). */
+        pc_save_ready = 1;
+
+        /* Live 3x3 acres around the parked avatar (villagers / actors stay alive in the neighbouring acres): a runtime switch. */
+        if (!g_mPlib_wade_disabled) {
+            aBC_RequestNearbyRefresh();
+        }
+        g_mPlib_wade_disabled = TRUE;
+
+        /* Outdoor SCENE_FG at the station point like pc_bootstrap_guest_poll, but a plain fade: no RIDE_OFF_DEMO / train cutscene, no demo profile
+         * (both demo_profiles are cleared so no demo actor can spawn with the player). */
+        Common_Set(demo_profiles[0], mAc_PROFILE_NUM);
+        Common_Set(demo_profiles[1], mAc_PROFILE_NUM);
+        door_data.next_scene_id = SCENE_FG;
+        door_data.exit_orientation = mSc_DIRECT_SOUTH;
+        door_data.exit_type = 0;
+        door_data.extra_data = 0;
+        door_data.exit_position.x = 1979;
+        door_data.exit_position.y = 0;
+        door_data.exit_position.z = 760;
+        door_data.door_actor_name = EMPTY_NO;
+        door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
+        Common_Get(transition).wipe_type = WIPE_TYPE_FADE_BLACK;
+        scene_res = goto_other_scene(play, &door_data, TRUE);
+        if (scene_res != TRUE) {
+            pc_save_ready = 0;
+            Common_Set(now_private, prev_private);
+            Common_Set(player_no, prev_player_no);
+            OSReport("[NET][OBSERVER] host: observer init FAILED: goto_other_scene to SCENE_FG (station) failed (res=%d) (binding restored, writer disarmed)\n",
+                     scene_res);
+            return;
+        }
+        l_init_ok = 1;
+        OSReport("[PC] --host-observer: observer bound (not a network participant: player_no=%d, PersonalID '%.8s' id 0x%04X), transitioning to town (SCENE_FG)\n",
+                 (int)Common_Get(player_no), (const char*)rec->player_ID.player_name, (unsigned)rec->player_ID.player_id);
+    }
+}
+/* OBSERVER-END */
 void mCD_LoadLand(void) {
     (void)pc_save_loaded;
 }
@@ -1343,6 +1543,16 @@ int mCD_SaveHome_bg(int param_1, int* chan) {
         return mCD_TRANS_ERR_NONE;
     }
 
+/* OBSERVER-BEGIN */
+    if (pc_host_observer_active()) {
+        /* --host-observer: player_no 4 maps to Card B (mCD_GetThisLandSlotNo) and the pre-write side effects are resident logic. The observer never
+         * opens the save dialog (no input); the authoritative periodic / early / shutdown saves of the host use their own entry point instead.
+         * Refuse without touching anything. */
+        OSReport("[NET][OBSERVER] host: mCD_SaveHome_bg refused (the observer never saves through the player save dialog)\n");
+        if (chan) *chan = mCD_SLOT_A;
+        return mCD_TRANS_ERR_NONE;
+    }
+/* OBSERVER-END */
     pc_save_pre_write_side_effects(param_1);
 
     if (slot == mCD_SLOT_B && l_card_b_gci_path[0] != '\0') {
@@ -1466,6 +1676,15 @@ int mCD_SaveStation_NextLand_bg(s32* chan) {
         return mCD_TRANS_ERR_NO_TOWN_DATA;
     }
 
+/* OBSERVER-BEGIN */
+    if (pc_host_observer_active()) {
+        /* --host-observer: the foreigner branch below would write Card B and reload the home town into l_keepSave (train travel). The observer must
+         * never travel: refused exactly like a client (the station talk answers it with the normal 'no town data' message). */
+        OSReport("[NET][OBSERVER] host: station travel save refused (the observer never travels) -- reporting NO_TOWN_DATA\n");
+        if (chan) *chan = mCD_SLOT_A;
+        return mCD_TRANS_ERR_NO_TOWN_DATA;
+    }
+/* OBSERVER-END */
     if (is_foreigner) {
         /* Record departure info (visited town) for Rover. */
         {
@@ -1608,6 +1827,16 @@ void mCD_toNextLand(void) {
     Transition_c transition;
     int rtc_enabled;
 
+/* OBSERVER-BEGIN */
+    if (pc_host_observer_active()) {
+        /* --host-observer: never leave the served town (this memset-s common_data and rebinds the passport as player 4). The vanilla scene cleanup
+         * calls this on EVERY scene change (a no-op while l_keepSave_set != TRUE), so only a real travel attempt is logged; refused either way. */
+        if (l_keepSave_set == TRUE) {
+            OSReport("[NET][OBSERVER] host: toNextLand refused (the observer never travels)\n");
+        }
+        return;
+    }
+/* OBSERVER-END */
     if (l_keepSave_set != TRUE) {
         OSReport("[PC] toNextLand: l_keepSave not set, aborting\n");
         return;

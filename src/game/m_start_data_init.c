@@ -624,3 +624,53 @@ extern int mSDI_StartDataInit(GAME* game, int player_no, int init_mode) {
 
     return res;
 }
+
+#ifdef TARGET_PC
+/* PC (--host-observer): the town initialisation of the hidden SERVER OBSERVER. The caller (pc_m_card.c pc_host_observer_poll()) has ALREADY bound
+ * Common.now_private to the PC-owned static observer record (outside Save_t.private_data[]) and Common.player_no to mPr_FOREIGNER (exactly 4), which
+ * is the vanilla incoming-visitor state. This is mSDI_StartDataInit(.., mSDI_INIT_MODE_PAK) minus every visitor side effect that would be wrong, or
+ * persisted, on a hosting machine:
+ *   - NOT mEv_SetGateway(): it persists mEv_SAVED_GATEWAY_FRGN in Save_t, which makes mEv_LivePlayer(4) FALSE and freezes the event schedule / hourly
+ *     and daily mEv_run update; only the station master's arrival handler clears it again, and the observer never goes near him. (mEv_UnSetGateway() IS
+ *     called, exactly like mSDI_StartInitBefore() does: with player_no == 4 it clears a stale FRGN flag left in the save by an earlier real visitor.)
+ *   - NOT mNpc_SetReturnAnimal(mNpc_GetInAnimalP()): it is gated on mLd_PlayerManKindCheck() == FALSE, i.e. a no-op for a foreigner anyway, and pointless.
+ *   - NOT mNpc_SendRegisteredGoodbyMail(): it flushes the module-static l_mnpc_goodby_mail to the residents; mSDI_StartInitFrom (a resident continuing)
+ *     does not call it either.
+ *   - no passport / Card B access of any kind (no l_mcd_foreigner_file, no mPr_LoadPak_and_SetPrivateInfo2).
+ * What stays is the player-neutral part of mSDI_StartInitPak (m_start_data_init.c: mFM_SetBlockKindLoadCombi, mEv_init_force, mHsRm_GetHuusuiRoom(4) = zero
+ * power, mCkRh_DecideNowGokiFamilyCount(4) = guarded no-op, mSP_ExchangeLineUp_InGame, mNpc_SetRemoveAnimalNo, mMkRm_MarkRoom,
+ * mRmTp_SetDefaultLightSwitchData(2)) followed by mSDI_StartInitAfter(game, FALSE, mSDI_MALLOC_FLAG_ZELDA), the same malloc flag mSDI_StartDataInit() uses
+ * (so `g` is NULL for the player-neutral calls, as in the vanilla path). Returns FALSE (nothing started) unless the observer binding is exactly the
+ * expected one and a valid town save is loaded. */
+extern int mSDI_StartDataInitObserver(GAME* game) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    Animal_c* animals = Save_Get(animals);
+    int res = FALSE;
+
+    if (Common_Get(now_private) == NULL || Common_Get(player_no) != mPr_FOREIGNER) {
+        return FALSE; /* the caller must bind the observer record and player_no == mPr_FOREIGNER first */
+    }
+
+    mEv_UnSetGateway(); /* player_no == 4: clears a stale GATEWAY_FRGN flag (never sets one) */
+    Common_Set(scene_from_title_demo, SCENE_FG);
+    lbRTC_GetTime(Common_GetPointer(time.rtc_time));
+
+    if (mFRm_CheckSaveData() == TRUE) {
+        mFM_SetBlockKindLoadCombi(NULL);
+        mEv_init_force(&play->event);
+        mHsRm_GetHuusuiRoom(NULL, mPr_FOREIGNER);
+        mCkRh_DecideNowGokiFamilyCount(mPr_FOREIGNER);
+        mSP_ExchangeLineUp_InGame(NULL);
+        mNpc_SetRemoveAnimalNo(Save_GetPointer(remove_animal_idx), animals, -1);
+        mMkRm_MarkRoom(NULL);
+        mRmTp_SetDefaultLightSwitchData(2); // TODO: enum
+        res = TRUE;
+    }
+
+    if (res == TRUE) {
+        mSDI_StartInitAfter(game, FALSE, mSDI_MALLOC_FLAG_ZELDA);
+    }
+
+    return res;
+}
+#endif

@@ -23,6 +23,7 @@
  */
 #include "pc_field_authority.h"
 #include "pc_net_game.h" /* pc_net_game_role() only (read-only use; owned by Workstream B) */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_ready() */
 
 #include "m_common_data.h"
 #include "m_field_make.h"
@@ -176,7 +177,13 @@ int pcfa_save_ready(void) {
          * client never travels (the station save is refused for it, M9-D G4-1), so its Save is the HOST's town copy that the host's
          * town-identity check already matched, and its Now_Private is its home (foreigner) private. A host or a single-player
          * process stays "not ready" exactly as before. */
-        if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            /* guest client: ready, unchanged */
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST && pc_host_observer_ready()) {
+            /* --host-observer: the HOST plays no resident but a hidden, inert foreigner-bound observer record parked in the town field (never
+             * serialised, never travelling). Ready ONLY once the observer latch is set (the town field was loaded once with it in it). The latch is
+             * deliberately NOT pcfa_scene_is_town(): that flickers during every field reload and would pause the world / re-roll record epochs. */
+        } else {
             return 0;
         }
     }

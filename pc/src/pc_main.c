@@ -11,6 +11,7 @@
 #include "pc_settings_menu.h"
 #include "pc_profiler.h"
 #include "pc_net_game.h"
+#include "pc_host_observer.h"
 #include "pc_rng_domains_selftest.h"
 #include "m_kankyo.h"
 
@@ -510,6 +511,11 @@ int g_pc_bootstrap_resident = -1;
  * loaded -- the state a train arrival produces -- and spawns it at the station. See pc_m_card.c's pc_bootstrap_guest_poll(). NULL = off. */
 const char* g_pc_bootstrap_guest = NULL;
 
+/* --host-observer (opt-in, HOST role only): the host plays NO resident. It binds a hidden, inert, static observer identity (outside
+ * Save_t.private_data[]) so that all four residents are claimable by clients. See pc/include/pc_host_observer.h and pc_m_card.c's
+ * pc_host_observer_poll(). 0 = off (default: plain --host is unchanged). */
+int g_pc_host_observer = 0;
+
 /* --host / --connect: Stage 1 role selection. No settings.ini persistence (matches --time/
  * --date/--rain: a per-launch dev override, not a saved preference), no UI yet. */
 static int      g_pc_net_role = 0; /* 0 = none/single-player, 1 = host, 2 = client */
@@ -542,6 +548,11 @@ int main(int argc, char* argv[]) {
             printf("                      otherwise; see pc_net_game.c.\n");
             printf("  --bootstrap-resident N  Non-interactively bind existing resident slot N and enter\n");
             printf("                      gameplay, bypassing the Rover/player-select flow. See pc_m_card.c.\n");
+            printf("  --host-observer     HOST-only option (requires --host; exit code 2 otherwise; cannot be combined with\n");
+            printf("                      --bootstrap-resident, --bootstrap-guest or the host-self test hooks that need a host\n");
+            printf("                      player): the host plays NO resident. It binds a hidden, inert, static server identity\n");
+            printf("                      (never saved, never sent to clients) parked in the town field, so all four residents\n");
+            printf("                      can be claimed by clients. Default off; plain --host is unchanged. See pc_host_observer.h.\n");
             printf("  --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID  TEST-ONLY, CLIENT role only, default off:\n");
             printf("                      become a GUEST (foreigner with that HOME PersonalID, the record of\n");
             printf("                      the first existing resident of the loaded town as a template) in the\n");
@@ -780,6 +791,8 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--bootstrap-guest") == 0 && i + 1 < argc) {
             g_pc_bootstrap_guest = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "--host-observer") == 0) {
+            g_pc_host_observer = 1;
         } else if (strcmp(argv[i], "--authoritative-wildlife") == 0) {
             g_pc_authoritative_wildlife = 1;
         } else if (strcmp(argv[i], "--profile") == 0) {
@@ -868,6 +881,39 @@ int main(int argc, char* argv[]) {
     if (g_pc_bootstrap_guest != NULL && (g_pc_net_role != 2 || g_pc_bootstrap_resident >= 0)) {
         fprintf(stderr, "[NET][GUEST][TEST-ONLY] REFUSED: --bootstrap-guest is a CLIENT-only test hook (use it together with --connect) and cannot be combined with --bootstrap-resident\n");
         return 2;
+    }
+
+    /* --host-observer: HOST-only, exclusive with --bootstrap-resident / --bootstrap-guest, and incompatible with the host-self TEST hooks that
+     * need a host player (the observer has no avatar to act with): refused (exit 2, before stdout/stderr are redirected) otherwise. */
+    if (g_pc_host_observer) {
+        static const char* const k_observer_refused_hooks[] = {
+            "--force-friendship-delta", "--force-mail-send", "--force-money-rock-hit", "--force-fish-catch", "--force-bug-catch",
+            "--diag-bug-despawn-label-race", "--scene-test-enter-shop", "--scene-test-leave-after", "--collide-test-overlap",
+            "--collide-test-approach",
+        };
+        size_t k;
+        int a;
+        if (g_pc_net_role != 1) {
+            fprintf(stderr, "[NET][OBSERVER] REFUSED: --host-observer is a HOST-only option (use it together with --host)\n");
+            return 2;
+        }
+        if (g_pc_bootstrap_resident >= 0) {
+            fprintf(stderr, "[NET][OBSERVER] REFUSED: --host-observer cannot be combined with --bootstrap-resident (the observer plays no resident)\n");
+            return 2;
+        }
+        if (g_pc_bootstrap_guest != NULL) {
+            fprintf(stderr, "[NET][OBSERVER] REFUSED: --host-observer cannot be combined with --bootstrap-guest\n");
+            return 2;
+        }
+        for (a = 1; a < argc; a++) {
+            for (k = 0; k < sizeof(k_observer_refused_hooks) / sizeof(k_observer_refused_hooks[0]); k++) {
+                if (strcmp(argv[a], k_observer_refused_hooks[k]) == 0) {
+                    fprintf(stderr, "[NET][OBSERVER] REFUSED: --host-observer cannot be combined with %s (a host-self test hook that needs a host player)\n",
+                            argv[a]);
+                    return 2;
+                }
+            }
+        }
     }
 
     /* Redirect stdout/stderr to NUL unless verbose — unbuffered terminal writes

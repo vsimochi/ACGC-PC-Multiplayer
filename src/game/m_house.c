@@ -3,6 +3,10 @@
 #include "m_common_data.h"
 #include "m_home.h"
 #include "m_private.h"
+#ifdef TARGET_PC
+#include <stdio.h>
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() */
+#endif
 
 #define DEFAULT_ARRANGEMENT ((mHS_HOUSE3 << 6) | (mHS_HOUSE2 << 4) | (mHS_HOUSE1 << 2) | (mHS_HOUSE0 << 0))
 
@@ -28,6 +32,20 @@ extern void mHS_house_init() {
  * @return The house index for the player.
  **/
 extern int mHS_get_arrange_idx(int player_no) {
+#ifdef TARGET_PC
+    /* --host-observer: the hidden observer is bound as player_no == mPr_FOREIGNER (4). For 4 the shift reads bits 8..9 of house_arrangement, which
+     * is an in-range house index (0..3) and therefore ALIASES a real resident's house. The function cannot refuse (callers index homes[] with the
+     * result), so this only makes any such lookup loudly visible: the observer is inert and stays outdoors, none of the paths that call this with
+     * the local player_no (house / room / mail / cockroach / mark-room sites) is reachable from it. First 3 occurrences are logged. */
+    if (player_no >= mPr_FOREIGNER && pc_host_observer_active()) {
+        static int s_logged = 0;
+        if (s_logged < 3) {
+            s_logged++;
+            printf("[NET][OBSERVER] WARNING: house arrangement looked up for the observer (player_no=%d aliases house %d)\n", player_no,
+                   (int)ARRANGE_GET(player_no));
+        }
+    }
+#endif
     return ARRANGE_GET(player_no);
 }
 
