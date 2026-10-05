@@ -12,6 +12,12 @@ PCConnectSession* pc_session(void) {
     return &s_session;
 }
 
+void pc_session_apply_server(const PCServer* s) {
+    snprintf(s_session.host, sizeof(s_session.host), "%s", s->address);
+    s_session.port = s->port;
+    snprintf(s_session.server_name, sizeof(s_session.server_name), "%s", s->name);
+}
+
 int pc_session_select_town(const uint8_t land_name[8], uint16_t land_id, uint32_t terrain_hash) {
     char key[PC_CHARACTER_TOWNKEY_LEN + 1], path[300];
     if (s_session.storage != PC_CHARACTER_STORAGE_STORE) {

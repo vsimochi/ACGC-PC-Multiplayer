@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "pc_character.h"
 #include "pc_mp_guests.h"
+#include "pc_servers.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,6 +36,9 @@ int pc_session_select_town(const uint8_t land_name[8], uint16_t land_id, uint32_
 
 /* READ-ONLY lookup of (town, home pid) in the character's LEGACY token file (when it has a legacy_profile). 1 = found (*out filled). */
 int pc_session_legacy_token_lookup(const uint8_t land_name[8], uint16_t land_id, uint32_t terrain_hash, const uint8_t home_pid[20], PCMpGtkEntry* out);
+
+/* M3: fills host / port / server_name from a saved server profile (a destination only; the character is independent of it). */
+void pc_session_apply_server(const PCServer* s);
 
 /* Writes the first-run creation result as characters/<uuid>/character.ini (create-only). 1 = created, 0 = exists, -1 = error. */
 int pc_session_store_create_finish(const char* name, int gender, int face, char* err, size_t errcap);

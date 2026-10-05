@@ -1,0 +1,30 @@
+/* pc_relaunch.h - M4: "Play Online" starts the network client by RELAUNCHING this executable with the right CLI instead of starting a client inside the
+ * running title process (the role audit assumes the role is fixed at process start). Windows: CreateProcess(exe from GetModuleFileName, same working directory),
+ * the caller then exits the title process. Other platforms: a stub that prints the command and returns 0 (nothing is started, the caller must NOT exit). No game
+ * headers here (windows.h stays out of the game translation units). */
+#ifndef PC_RELAUNCH_H
+#define PC_RELAUNCH_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+enum {
+    PC_RELAUNCH_CHARACTER = 0, /* --character NAME|UUID   (store character, or a NEW name -> first-run creation) */
+    PC_RELAUNCH_PROFILE = 1,   /* --guest-profile NAME    (legacy-only guest profile) */
+    PC_RELAUNCH_DEFAULT_GUEST = 2 /* --guest               (the legacy default guest.ini; name ignored) */
+};
+
+/* Builds the argument tail (without the exe), e.g. `--connect 192.168.1.5:7777 --character "ab12..."`. `host` must be an IPv4 literal, `port` 1..65535 and `name`
+ * only [A-Za-z0-9-] (1..32) so no quoting / injection is possible. 1 = ok, 0 = refused. */
+int pc_relaunch_build_args(const char* host, int port, int kind, const char* name, char* out, size_t cap);
+
+/* Windows: starts the new process, 1 = started (the caller should now quit the current process). Else 0 with err. Non-Windows: prints the command, returns 0. */
+int pc_relaunch_connect(const char* host, int port, int kind, const char* name, char* err, size_t errcap);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

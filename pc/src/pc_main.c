@@ -14,6 +14,8 @@
 #include "pc_host_observer.h"
 #include "pc_dedicated.h"
 #include "pc_guest_profile.h"
+#include "pc_play_online_menu.h" /* M4: text entry routing for the title "Play Online" menu */
+#include "pc_servers.h"
 #include "pc_session.h" /* M2: characters / town memberships: --character, --characters, --character-import-profile */
 #include "pc_log.h"
 #include "pc_rng_domains_selftest.h"
@@ -248,6 +250,11 @@ int pc_platform_poll_events(void) {
                 }
                 break;
             case SDL_KEYDOWN:
+                /* M4: the Play Online menu text entry (add / edit server, new character name) eats keys first. */
+                if (pc_play_online_menu_text_active()) {
+                    pc_play_online_menu_handle_text_event(&event);
+                    break;
+                }
                 /* Keybinding capture eats all input first (works from both
                  * the pause menu and the title Options menu). */
                 if (pc_settings_menu_capture_active()) {
@@ -278,6 +285,10 @@ int pc_platform_poll_events(void) {
                 }
                 break;
             case SDL_CONTROLLERBUTTONDOWN:
+                if (pc_play_online_menu_text_active()) {
+                    pc_play_online_menu_handle_text_event(&event);
+                    break;
+                }
                 if (pc_settings_menu_capture_active()) {
                     pc_settings_menu_handle_capture_event(&event);
                     break;
@@ -301,6 +312,10 @@ int pc_platform_poll_events(void) {
                 }
                 break;
             case SDL_TEXTINPUT:
+                if (pc_play_online_menu_text_active()) {
+                    pc_play_online_menu_handle_text_event(&event);
+                    break;
+                }
                 if (g_pc_paused) break;
                 pc_typing_handle_event(&event);
                 break;
@@ -553,6 +568,13 @@ static char g_pc_guest_spec[96];
 static const char* g_pc_character_spec = NULL;
 static const char* g_pc_character_import = NULL;
 static int g_pc_characters_list = 0;
+/* M3 (servers): --server NAME (saved destination from save/mp/servers.ini, fills the --connect host:port; alone it implies --guest), --servers (list, exit 0),
+ * --server-add NAME HOST[:PORT] / --server-delete NAME (one-shot admin, exit 0 / 2). See pc_servers.h and docs/multiplayer-guest-roadmap.md. */
+static const char* g_pc_server_name = NULL;
+static int g_pc_servers_list = 0;
+static const char* g_pc_server_add_name = NULL;
+static const char* g_pc_server_add_addr = NULL;
+static const char* g_pc_server_delete = NULL;
 
 /* First-run guest creation: --guest-profile NAME whose guest_<name>.ini does NOT exist plays the REAL vanilla Rover scene (name, gender, face) and the result is
  * written to the profile (pc_m_card.c pc_guest_creation_finish). --guest-creation-test NAME,GENDER,FACE is the TEST-ONLY hook that types those answers
@@ -731,6 +753,11 @@ int main(int argc, char* argv[]) {
             printf("                      first-run creation in the Rover scene. --characters lists the store + legacy guest profiles and exits 0;\n");
             printf("                      --character-import-profile NAME (\"\" / default = guest.ini) copies a legacy profile and its tokens into the\n");
             printf("                      store and exits 0 (the legacy files are never modified; afterwards --guest-profile NAME uses the character).\n");
+            printf("  --server NAME       CLIENT: connect to the saved server NAME (save/mp/servers.ini; fills --connect HOST:PORT; refused with --connect /\n");
+            printf("                      --host / --dedicated or an unknown NAME, exit 2). Use it with --character NAME|UUID (or --guest-profile NAME);\n");
+            printf("                      alone it implies --guest (the default guest profile). A server is only a destination; characters are not tied to it.\n");
+            printf("  --servers           list the saved servers and exit 0.  --server-add NAME HOST[:PORT]  save a server (HOST = IPv4 literal, port default\n");
+            printf("                      7777; no hostname resolution).  --server-delete NAME  remove one. Exit 0, or 2 on a refusal.\n");
             printf("  --house-sync        HOST opt-in: the host is authoritative for the furniture of player houses (the owner's edits are committed to\n");
             printf("                      the host together with the pocket record; announced to every client in HOST_CONFIG). Off by default.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
@@ -1030,6 +1057,33 @@ int main(int argc, char* argv[]) {
             i++;
         } else if (strcmp(argv[i], "--characters") == 0) {
             g_pc_characters_list = 1;
+        } else if (strcmp(argv[i], "--servers") == 0) {
+            g_pc_servers_list = 1;
+        } else if (strcmp(argv[i], "--server") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || g_pc_server_name != NULL) {
+                fprintf(stderr, "[PC] --server: REFUSED: the option needs ONE saved server NAME (see --servers)\n"
+                                "usage: AnimalCrossing --server NAME [--character NAME|UUIDPREFIX]   (see --help)\n");
+                return 2;
+            }
+            g_pc_server_name = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--server-add") == 0) {
+            if (i + 2 >= argc || argv[i + 1][0] == '\0' || g_pc_server_add_name != NULL) {
+                fprintf(stderr, "[PC] --server-add: REFUSED: the option needs NAME HOST[:PORT]\n"
+                                "usage: AnimalCrossing --server-add NAME HOST[:PORT]   (HOST = IPv4 literal, port default 7777; see --help)\n");
+                return 2;
+            }
+            g_pc_server_add_name = argv[i + 1];
+            g_pc_server_add_addr = argv[i + 2];
+            i += 2;
+        } else if (strcmp(argv[i], "--server-delete") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || g_pc_server_delete != NULL) {
+                fprintf(stderr, "[PC] --server-delete: REFUSED: the option needs a saved server NAME\n"
+                                "usage: AnimalCrossing --server-delete NAME   (see --servers)\n");
+                return 2;
+            }
+            g_pc_server_delete = argv[i + 1];
+            i++;
         } else if (strcmp(argv[i], "--host-observer") == 0) {
             g_pc_host_observer = 1;
         } else if (strcmp(argv[i], "--dedicated") == 0) {
@@ -1130,6 +1184,87 @@ int main(int argc, char* argv[]) {
     if ((g_pc_mail_test_send != NULL || g_pc_mail_test_take != 0) && g_pc_net_role != 2) {
         fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-send / --mail-test-take are CLIENT-only test hooks (use them together with --connect)\n");
         return 2;
+    }
+
+    /* M3: the one-shot server profile commands (no network, no window): add, delete, list, then exit 0 (2 on a refusal). */
+    if (g_pc_servers_list || g_pc_server_add_name != NULL || g_pc_server_delete != NULL) {
+        char serr[400];
+        if (g_pc_server_add_name != NULL) {
+            PCServer ns;
+            const int too_long = strlen(g_pc_server_add_name) > PC_SERVER_NAME_MAX;
+            memset(&ns, 0, sizeof(ns));
+            if (!too_long) {
+                snprintf(ns.name, sizeof(ns.name), "%s", g_pc_server_add_name);
+            }
+            if (too_long || !pc_servers_parse_hostport(g_pc_server_add_addr, ns.address, &ns.port, serr, sizeof(serr))) {
+                fprintf(stderr, "[PC] --server-add: REFUSED: %s\nusage: AnimalCrossing --server-add NAME HOST[:PORT]   (HOST = IPv4 literal)\n",
+                        too_long ? "server name must be 1..32 characters" : serr);
+                return 2;
+            }
+            if (pc_servers_add(NULL, &ns, serr, sizeof(serr)) != PC_SERVERS_OK) {
+                fprintf(stderr, "[PC] --server-add: REFUSED: %s\n", serr);
+                return 2;
+            }
+            printf("[PC] --server-add: saved server '%s' = %s:%d\n", ns.name, ns.address, ns.port);
+        }
+        if (g_pc_server_delete != NULL) {
+            if (pc_servers_delete(NULL, g_pc_server_delete, serr, sizeof(serr)) != PC_SERVERS_OK) {
+                fprintf(stderr, "[PC] --server-delete: REFUSED: %s\n", serr);
+                return 2;
+            }
+            printf("[PC] --server-delete: deleted server '%s'\n", g_pc_server_delete);
+        }
+        if (g_pc_servers_list) {
+            static PCServer sl[PC_SERVER_MAX];
+            int sn = 0, k;
+            if (pc_servers_load(NULL, sl, PC_SERVER_MAX, &sn, serr, sizeof(serr)) != PC_SERVERS_OK) {
+                fprintf(stderr, "[PC] --servers: REFUSED: %s\n", serr);
+                return 2;
+            }
+            printf("[PC] servers (%s/servers.ini): %d\n", PC_GUEST_PROFILE_DIR, sn);
+            for (k = 0; k < sn; k++) {
+                printf("  name='%s' address=%s port=%d last_character='%s' last_town='%s'\n", sl[k].name, sl[k].address, sl[k].port, sl[k].last_character, sl[k].last_town);
+            }
+        }
+        fflush(stdout);
+        return 0;
+    }
+
+    /* M3: --server NAME = a saved destination: refused (exit 2) with --connect / --host / --dedicated / --host-observer or an unknown NAME; otherwise it fills the
+     * --connect host:port (role 2) and implies --guest (with --character / --guest-profile that character plays, else the default guest profile). */
+    if (g_pc_server_name != NULL) {
+        static const char k_server_usage[] = "usage: AnimalCrossing --server NAME [--character NAME|UUIDPREFIX]   (see --servers, --help)\n";
+        static PCServer sl[PC_SERVER_MAX];
+        char serr[400];
+        const char* conflict = NULL;
+        int sn = 0, a, idx;
+        for (a = 1; a < argc && conflict == NULL; a++) {
+            if (strcmp(argv[a], "--connect") == 0 || strcmp(argv[a], "--host") == 0 || strcmp(argv[a], "--dedicated") == 0 || strcmp(argv[a], "--host-observer") == 0) {
+                conflict = argv[a];
+            }
+        }
+        if (conflict != NULL || g_pc_net_role != 0) {
+            fprintf(stderr, "[PC] --server: REFUSED: --server cannot be combined with %s (a saved server IS the --connect target of a client)\n%s", conflict != NULL ? conflict : "--connect / --host", k_server_usage);
+            return 2;
+        }
+        if (pc_servers_load(NULL, sl, PC_SERVER_MAX, &sn, serr, sizeof(serr)) != PC_SERVERS_OK) {
+            fprintf(stderr, "[PC] --server: REFUSED: %s\n%s", serr, k_server_usage);
+            return 2;
+        }
+        idx = pc_servers_find(sl, sn, g_pc_server_name);
+        if (idx < 0) {
+            fprintf(stderr, "[PC] --server: REFUSED: no saved server named '%s' (--servers lists them, --server-add NAME HOST[:PORT] saves one)\n%s", g_pc_server_name, k_server_usage);
+            return 2;
+        }
+        g_pc_net_role = 2;
+        snprintf(g_pc_net_host_ip, sizeof(g_pc_net_host_ip), "%s", sl[idx].address);
+        g_pc_net_port = (uint16_t)sl[idx].port;
+        pc_session_apply_server(&sl[idx]);
+        g_pc_guest = 1;
+        if (g_pc_character_spec != NULL) {
+            (void)pc_servers_set_last(NULL, sl[idx].name, g_pc_character_spec, NULL); /* UI hint only */
+        }
+        printf("[PC] --server: '%s' = %s:%d\n", sl[idx].name, sl[idx].address, sl[idx].port);
     }
 
     /* M2: the one-shot character store commands (no network, no window): list / import, then exit 0 (2 on a refusal). */

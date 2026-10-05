@@ -313,6 +313,9 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_character.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_membership.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_session.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_servers.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_relaunch.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_play_online_menu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_model_viewer.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_texture_pack.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_settings.c

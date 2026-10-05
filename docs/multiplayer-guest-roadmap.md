@@ -691,7 +691,7 @@ Tests actually run (disposable copy `pc/build64/bin_fixture4_reconnect`, ONE exe
 
 ## Characters and town memberships
 
-Status: M1 (character store) + M2 (membership lookup, per-town tokens) are implemented; M2b / M3 / M4 are not (see "Remaining").
+Status: M1 (character store) + M2 (membership lookup, per-town tokens) are implemented; M3 (servers.ini + `--server`) and M4 (Play Online title menu, relaunch) are implemented; M2b is not (see "Remaining").
 
 **Player-owned vs town-owned.** A *character* is the player-owned portable seed of a guest: `name`, `gender`, `face`, `home_town`, `player_id`, `land_id` (+ a local-only `uuid`).
 Everything else is **town-owned per membership** and host-authoritative: pockets, item conditions, wallet, loan, bank, lotto, equipment, mail, quests, catalog, museum, maps,
@@ -733,9 +733,54 @@ Host admission (`pcnetgame_host_process_identity`) is deliberately not rewired.
 **Session.** `pc_session.h` holds the minimal connect session (role, host, port, join kind, selected character + storage LEGACY|STORE). For a STORE character the token file is
 chosen per host town (`pc_session_select_town` installs it as the `pc_guest_token_path()` override); for LEGACY nothing changes.
 
-**Remaining:** M2b resident token authentication; guest -> resident promotion (blocked by town transfer); per-server town save dir; M3 `servers.ini` + connect descriptor;
-M4 Play Online UI. Known gaps of this step: the title-menu "Join as Guest" item refuses a STORE session (use the CLI); a few creation log lines still print the legacy profile
+**Remaining (after M3 / M4):** M2b resident token authentication; guest -> resident promotion (blocked by town transfer); per-server town save dir; hostname resolution; in-process role start (see below).
+Known gaps of M1/M2: the title-menu "Join as Guest" item refuses a STORE session (use the CLI or Play Online); a few creation log lines still print the legacy profile
 path for a STORE character; `membership.ini` is written on import only (no reader yet).
+
+### M3: saved servers (`save/mp/servers.ini`) and the connect descriptor
+
+A *server profile* is only a destination; characters are NOT tied to servers (`last_character` / `last_town` are UI hints). Format (repeated sections, `#` / `;` comments; `pc_settings.c`
+ignores sections so `pc_servers.c` has its own parser):
+
+    [server]
+    name = Friends
+    address = 192.168.1.20
+    port = 7777
+    last_character = Roger
+    last_town = Foo
+
+Rules: name 1..32 printable ASCII without `[ ] = " \` and without leading/trailing space (unique, case-insensitive); `address` = an IPv4 dotted-quad literal ONLY (`pc_net.c` uses `inet_pton`, there is
+no hostname resolution, so a hostname is refused at save time instead of failing later); port 1..65535 (default 7777); at most 32 entries. Writes are atomic (tmp + replace). A file the parser cannot
+read (unknown section / key, bad value, duplicate name, missing name / address, > 32 entries, > 64 KiB) is CORRUPT: it is reported, every write is refused, and it is never overwritten, moved or deleted.
+
+CLI (`pc_main.c`, `pc_session_apply_server()` fills `pc_session()->host / port / server_name`):
+
+* `--server NAME` - connect to the saved server (fills `--connect HOST:PORT`, role CLIENT). Exit 2 + usage for an unknown NAME, a corrupt servers.ini, or when combined with `--connect`, `--host`,
+  `--dedicated` or `--host-observer`. It implies `--guest`: with `--character NAME|UUID` (or `--guest-profile NAME`) that character plays, ALONE it connects as the default guest profile exactly like
+  `--connect HOST:PORT --guest` (least surprising: it never invents a character). With `--character` the server's `last_character` hint is updated at start.
+* `--servers` (list, exit 0), `--server-add NAME HOST[:PORT]`, `--server-delete NAME` (one-shot, exit 0, or 2 on a refusal). Legacy `--connect HOST:PORT [--guest|--guest-profile|--character]` is unchanged.
+* `last_town` is NOT updated (it would need the READY handshake in `pc_net_game.c`; skipped to keep that file untouched).
+
+### M4: Play Online (title menu)
+
+Title menu item "Play Online" (`ac_animal_logo.c`, `pc_play_online_menu.c`), shown only when no network role is active (not `--connect`, not `--host` / `--dedicated`; a client keeps "Join as Guest").
+Flow: Server list (saved servers, "Add server", "Back") -> per server Connect / Edit / Delete (with Keep/Delete confirm) / Back -> Character list (local store characters + legacy guest
+profiles not yet imported + "New character" (asks for a name) + Back; the server's `last_character` is preselected) -> Connect. Navigation is pad/keyboard like the settings menu. Add / Edit / New character use a
+text-entry mode: `pc_main.c` routes `SDL_TEXTINPUT` / `SDL_KEYDOWN` / controller A,B to the menu while it is active (Enter = next / OK, Esc or pad B = cancel), the pad driver stands down meanwhile (same
+pattern as the keybinding capture). Add = name -> address -> port, validated field by field with the same rules as `--server-add`.
+
+**Decision: relaunch, not in-process start.** Starting the network client inside the running title process would change the role after startup, which the role audit (role is fixed before init) does not
+allow. Connect therefore RELAUNCHES the same executable (`pc_relaunch.c`: `CreateProcess`, exe from `GetModuleFileName`, same working directory so `save/` resolves identically) with
+`--connect HOST:PORT --character UUID` (store character; a typed new name starts the Rover creation), `--guest-profile NAME` (legacy-only profile) or `--guest` (the default `guest.ini`), then sets
+`g_pc_running = 0` so the title process exits cleanly. Arguments are validated (IPv4 literal, port, name `[A-Za-z0-9-]`) so no quoting/injection is possible. On non-Windows the function only prints the
+command and does not quit. Other command-line options of the title process (e.g. `--fullscreen`) are NOT forwarded; settings come from `settings.ini`.
+
+Verification: the menu code is compile-checked and source-audited only (no UI automation, never seen on screen); the data layer (`pc_servers.c`, relaunch command line) and the CLI are covered by
+`pc/tools/net_spike/test_servers.py` (native selftest + temp-cwd CLI checks).
+
+Still missing: M2b resident token authentication; guest -> resident promotion (needs town transfer); a per-server town save dir (there is one `save/card_a` today, so switching to a server
+with another town still needs the matching town GCI copied there); hostname / DNS resolution (IPv4 literals only); starting the role in-process (needs a re-init path audited for every role-dependent
+module); `last_town` hint; controller-only add/edit of servers (needs a keyboard; use `--server-add`).
 
 ## Known limitations
 
