@@ -17151,6 +17151,11 @@ static int         pcnetgame_house_client_quit_flush(unsigned max_ms);
 static void        pcnetgame_house_client_tick(void);
 static void        pcnetgame_house_client_reset_session(void);
 static void        pcnetgame_house_client_set_hostcfg(int on);
+static int         pcnetgame_house_client_own_room_inside(int* h_out);  /* house sync in effect and the player is inside (or entering / leaving) its OWN house */
+static int         pcnetgame_house_client_reconcile_apply(int h);       /* own-room reconcile, step 1: the live room is rebuilt from the host's image (0 = deferred, nothing changed) */
+static void        pcnetgame_house_client_reconcile_finish(int h);      /* own-room reconcile, step 2 (after the record was adopted): canon / baseline / taint */
+static int         pcnetgame_hcl_reconcile_ready(int h);
+static int         pcnetgame_house_client_offline_taint(void); /* the link was lost with house sync active and no FULL record push has been adopted since */
 
 /* ===== D3 CLIENT BEGIN: host-mirrored resident record (protocol v8, CLIENT half) =====
  * What this process does for its OWN resident record (Now_Private == Save.private_data[player_no]):
@@ -17356,8 +17361,12 @@ static void pcnetgame_crec_send_hello(void) {
     if (pcnetgame_crec_snapshot_scratch()) {
         h.local_digest = pcnetgame_fnv1a32(&s_crec_scratch, PC_NETGAME_REC_SIZE);
     }
-    if (s_crec_last.have && memcmp(&s_crec_last.owner, &s_crec.owner, sizeof(s_crec.owner)) == 0) {
-        h.flags |= (uint8_t)PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST;
+    /* House sync, offline taint: the link was lost while house sync was active, so the pockets / room may carry edits made offline. HAVE_LAST is then OMITTED: a host
+     * that kept running (network blip) would otherwise accept a 'continuation' without any push, and the offline pair would later be committed as authoritative. Without
+     * HAVE_LAST the host always pushes the FULL record (host_only = 0), whose adoption restores the house together with the pockets (pcnetgame_house_client_on_full_adopt /
+     * the own-room reconcile in pcnetgame_crec_try_adopt) and clears the taint. */
+    if (s_crec_last.have && memcmp(&s_crec_last.owner, &s_crec.owner, sizeof(s_crec.owner)) == 0 && !pcnetgame_house_client_offline_taint()) {
+        h.flags |=(uint8_t)PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST;
         h.last_host_session = s_crec_last.session;
         h.last_epoch = s_crec_last.epoch;
         h.last_rev = s_crec_last.rev;
@@ -17670,6 +17679,7 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
     int host_only;
     int older_than_base;
     int host_dirty_before = 0;
+    int rc_inside = -1;
     int cloth_refreshed = 0, equip_changed = 0, dirty_lost = 0;
     if (!s_crec.st_valid) {
         return;
@@ -17677,6 +17687,7 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
     memcpy(&s_crec_scratch, s_crec_staged, PC_NETGAME_REC_SIZE);
     pc_save_bswap_private(&s_crec_scratch, PC_BSWAP_FROM_BE);
     why = pcnetgame_crec_adopt_blocker(&s_crec_scratch);
+adopt_blocked_retry: /* the own-room reconcile below re-enters here with its own reason (the deferred / watchdog handling is shared) */
     if (why != NULL) {
         if (strcmp(s_crec_diag_last_why, why) != 0) { /* blocker CHANGED (or first): one line, never per frame */
             snprintf(s_crec_diag_last_why, sizeof(s_crec_diag_last_why), "%s", why);
@@ -17739,9 +17750,30 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
         uint32_t before = 0;
         host_dirty_before = s_crec.acked_valid && pcnetgame_crec_now_cdig(&before) && before != s_crec.acked_cdig;
     }
+    /* House sync, own-room reconcile (offline taint only): a FULL push may be adopted while the owner is INSIDE its own house when the live room can be rebuilt from the host's
+     * image in the SAME call. Order matters: the room is rebuilt first (it writes the image into the save and destroys the actors without write-back), then the record
+     * (pockets) is adopted: pockets and room stay a consistent pair. If the rebuild is not possible now the push stays staged (deferred, never forced). */
+    {
+        int rc_h = -1;
+        if (s_crec.st_kind == PC_NETGAME_REC_KIND_PUSH_FULL && pcnetgame_house_client_own_room_inside(&rc_h)) {
+            if (host_only) {
+                why = "the owner is inside (or entering / leaving) its own house";
+                goto adopt_blocked_retry;
+            }
+            if (!pcnetgame_house_client_reconcile_apply(rc_h)) {
+                why = "the owner is inside its own house and the room cannot be reconciled in place yet";
+                goto adopt_blocked_retry;
+            }
+            rc_inside = rc_h;
+        }
+    }
     pcnetgame_crec_apply_staged(host_only, &cloth_refreshed, &equip_changed, &dirty_lost);
     if (!host_only) {
-        pcnetgame_house_client_on_full_adopt(); /* furniture sync: the pockets are the host's now -> the own house goes back to the host's state in the same call */
+        if (rc_inside >= 0) {
+            pcnetgame_house_client_reconcile_finish(rc_inside); /* the room already shows the host's house: only canon / baseline / taint remain */
+        } else {
+            pcnetgame_house_client_on_full_adopt(); /* furniture sync: the pockets are the host's now -> the own house goes back to the host's state in the same call */
+        }
     }
     {
         /* acked digest = the client-owned+shared bytes of what we now hold (adopting never marks the record dirty); for a
@@ -18276,7 +18308,17 @@ static struct {
     uint32_t stash_seq[PC_NETGAME_HOUSE_NUM];
     uint32_t stash_session[PC_NETGAME_HOUSE_NUM];
     uint8_t  stash_img[PC_NETGAME_HOUSE_NUM][PC_NETGAME_HOUSE_IMG_SIZE];
+    /* OFFLINE TAINT: set by pcnetgame_client_on_link_lost (house sync was active and the player owns a house) BEFORE the session reset; cleared ONLY by a FULL record
+     * adoption that put house + pockets back to the host's pair (pcnetgame_house_client_on_full_adopt / the own-room reconcile), by a new local player (owner change)
+     * or by a host that does not announce house sync. While set: HELLO omits HAVE_LAST, commit_tick and the quit flush refuse, the own-room edit lock is on. */
+    int      offline_taint;
+    /* The last HOST_CONFIG announced house sync. Survives the session reset (that is the point: the edit lock must also hold while the link is down). */
+    int      sync_last;
 } s_hcp;
+
+static int pcnetgame_house_client_offline_taint(void) {
+    return s_hcp.offline_taint;
+}
 
 static void pcnetgame_house_client_reset_session(void) {
     memset(&s_hcl, 0, sizeof(s_hcl)); /* canon / stash (s_hcp) deliberately survive */
@@ -18285,12 +18327,15 @@ static void pcnetgame_house_client_reset_session(void) {
 /* Entered from pcnetgame_crec_on_ready() (a new READY session): canon / stash belong to ONE local player; another player or save invalidates them. */
 static void pcnetgame_house_client_on_ready(void) {
     PCNetGameOwnerStamp cur;
+    const int keep_sync_last = s_hcp.sync_last; /* a property of the host's announcement, not of the local player */
     if (!pcnetgame_capture_owner_stamp(&cur)) {
         memset(&s_hcp, 0, sizeof(s_hcp));
+        s_hcp.sync_last = keep_sync_last;
         return;
     }
     if (!s_hcp.owner_valid || memcmp(&cur, &s_hcp.owner, sizeof(cur)) != 0) {
         memset(&s_hcp, 0, sizeof(s_hcp));
+        s_hcp.sync_last = keep_sync_last;
         s_hcp.owner = cur;
         s_hcp.owner_valid = 1;
     }
@@ -18308,6 +18353,10 @@ int pc_net_game_house_sync_active(void) {
 /* HOST_CONFIG byte 1 bit 0 (pcnetgame_ts_client_apply). */
 static void pcnetgame_house_client_set_hostcfg(int on) {
     s_hcl.on = on ? 1 : 0;
+    s_hcp.sync_last = s_hcl.on;
+    if (!s_hcl.on) {
+        s_hcp.offline_taint = 0; /* no house sync on this host: nothing to reconcile, nothing to lock */
+    }
     s_hcl.since_ms = pcnetgame_now_ms();
     printf("[NET][HOUSE] client: the host %s furniture sync (HOST_CONFIG)\n", s_hcl.on ? "ANNOUNCED" : "did not announce");
 }
@@ -18609,6 +18658,177 @@ static int pcnetgame_hcl_apply_stash(int h) {
     return 1;
 }
 
+/* ---- own-room reconcile (offline taint only) ----
+ * The client was inside its OWN house when the link dropped, edited offline (ground items / furniture / pockets) and reconnected. The host's FULL record push restores the
+ * pockets; the room must go back to the host's house in the SAME call or the pair breaks (a rebuild alone would discard the room edits while the pockets kept the moved
+ * item = duplicate; a record adoption alone would do the opposite). Everything below is DEFER-ONLY: any doubt keeps the push staged and the player is told to leave the
+ * house (the exit adoption path restores the same state consistently). Unverified hazards of an in-place rebuild of the OWN room (documented in the roadmap): layer-0 ITEM1
+ * redraw, a stale bed_ftr_actor_idx / demo_ftrID / emu_ftrID of the player actor, gyroid / cockroach state, a bgm blip. */
+extern int aMI_pc_wall_floor_matches(int wallpaper_idx, int flooring_idx);
+static uint8_t  s_hcl_rc_keep[PC_NETGAME_HOUSE_IMG_SIZE]; /* the image being applied (a stable copy: set_canon_from_save rewrites s_hcp.canon_img) */
+static uint32_t s_hcl_rc_seq, s_hcl_rc_session;
+static int      s_hcl_rc_same;                            /* 1 = the live floor already equals the target (no rebuild), the live floor bytes are kept */
+
+/* The image the own house must show: the stashed push, else canon. NULL = nothing usable. */
+static const uint8_t* pcnetgame_hcl_reconcile_target(int h, uint32_t* seq, uint32_t* session) {
+    if (s_hcp.stash_valid[h]) {
+        *seq = s_hcp.stash_seq[h];
+        *session = s_hcp.stash_session[h];
+        return s_hcp.stash_img[h];
+    }
+    if (s_hcp.canon_valid[h]) {
+        *seq = s_hcp.canon_seq[h];
+        *session = s_hcp.canon_session[h];
+        return s_hcp.canon_img[h];
+    }
+    return NULL;
+}
+
+/* 1 = the live floor already equals the target layers, 0 = a rebuild is needed and possible, -1 = defer (not exportable, wrong owner, wallpaper / flooring disagree with the
+ * live indoor actor, or the new layout puts furniture on the cells around the player). Fills s_hcl_cur (live export) and s_hs_native (target). */
+static int pcnetgame_hcl_reconcile_plan(int h, const uint8_t* img) {
+    int fl = -1, l, same = 1, dx, dz, px = 0, pz = 0;
+    PLAYER_ACTOR* pl;
+    if (!aMR_pc_export_home(&s_hcl_cur, h, &fl) || fl < 0 || fl >= mHm_ROOM_NUM) {
+        return -1;
+    }
+    pcnetgame_house_import_native(img, &s_hs_native);
+    if (mPr_CheckCmpPersonalID(&s_hs_native.ownerID, &Save_Get(homes[h]).ownerID) != TRUE) {
+        return -1;
+    }
+    /* the live indoor actor's wall_num / floor_num are what a later reserve mints the OLD item from (aMI_GetWallFloorItem): they must agree with the target */
+    if (!aMI_pc_wall_floor_matches((int)s_hs_native.floors[fl].wall_floor.wallpaper_idx, (int)s_hs_native.floors[fl].wall_floor.flooring_idx)) {
+        return -1;
+    }
+    for (l = 0; l < mHm_LAYER_NUM; l++) {
+        if (memcmp((&s_hcl_cur.floors[fl].layer_main)[l].items, (&s_hs_native.floors[fl].layer_main)[l].items, sizeof((&s_hs_native.floors[fl].layer_main)[l].items)) != 0) {
+            same = 0;
+        }
+    }
+    if (same) {
+        return 1;
+    }
+    pl = GET_PLAYER_ACTOR_NOW();
+    if (!pcnetgame_is_real_player_actor(pl) || !mFI_Wpos2UtNum_inBlock(&px, &pz, pl->actor_class.world.position)) {
+        return -1;
+    }
+    for (l = mCoBG_LAYER0; l < mCoBG_LAYER2; l++) {
+        for (dz = -1; dz <= 1; dz++) {
+            for (dx = -1; dx <= 1; dx++) {
+                const int x = px + dx, z = pz + dz;
+                if (x >= 0 && x < UT_X_NUM && z >= 0 && z < UT_Z_NUM) {
+                    const mActor_name_t nv = (&s_hs_native.floors[fl].layer_main)[l].items[z][x];
+                    const mActor_name_t ov = (&s_hcl_cur.floors[fl].layer_main)[l].items[z][x];
+                    if (nv != ov && (ITEM_IS_FTR(nv) || nv == (mActor_name_t)RSV_FE1F)) {
+                        return -1; /* the visitor rule: never put furniture on or next to the player */
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* All terms of the own-room reconcile: sync known, no commit in flight, the live OWN room of house h quiet for >= 30 frames, a usable target and a plan that is not 'defer'. */
+static int pcnetgame_hcl_reconcile_ready(int h) {
+    uint32_t seq, session;
+    const uint8_t* img;
+    if (!pcnetgame_hcl_active() || h < 0 || h != pcnetgame_hcl_own_house() || !s_hcl.known || s_hcl.c_active) {
+        return 0;
+    }
+    if (pcnetgame_hcl_live_room_house(1) != h || pcnetgame_hcl_quiet_frames(h) < PC_NETGAME_HCL_QUIET_FRAMES) {
+        return 0;
+    }
+    img = pcnetgame_hcl_reconcile_target(h, &seq, &session);
+    if (img == NULL) {
+        return 0;
+    }
+    return pcnetgame_hcl_reconcile_plan(h, img) >= 0;
+}
+
+static int pcnetgame_hcl_reconcile_write_cb(void* ctx) {
+    return pcnetgame_hcl_write_save(*(int*)ctx, s_hcl_rc_keep);
+}
+
+static int pcnetgame_house_client_own_room_inside(int* h_out) {
+    int h;
+    if (!pcnetgame_hcl_active()) {
+        return 0;
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h < 0 || !pcnetgame_local_house_unsafe(h)) {
+        return 0;
+    }
+    *h_out = h;
+    return 1;
+}
+
+static int pcnetgame_house_client_reconcile_apply(int h) {
+    uint32_t seq, session;
+    const uint8_t* img;
+    int plan;
+    if (!s_hcp.offline_taint || !pcnetgame_hcl_reconcile_ready(h)) {
+        return 0;
+    }
+    img = pcnetgame_hcl_reconcile_target(h, &seq, &session);
+    if (img == NULL) {
+        return 0;
+    }
+    plan = pcnetgame_hcl_reconcile_plan(h, img);
+    if (plan < 0) {
+        return 0;
+    }
+    memcpy(s_hcl_rc_keep, img, sizeof(s_hcl_rc_keep));
+    s_hcl_rc_seq = seq;
+    s_hcl_rc_session = session;
+    s_hcl_rc_same = plan;
+    if (plan == 1) {
+        /* the live floor's furniture already is what the host holds: write every other part, keep the live floor's bytes (drawer contents are in the actors) */
+        static mHm_flr_c keep;
+        int fl = -1;
+        if (!aMR_pc_export_home(&s_hcl_cur, h, &fl) || fl < 0 || fl >= mHm_ROOM_NUM) {
+            return 0;
+        }
+        memcpy(&keep, &Save_Get(homes[h]).floors[fl], sizeof(keep));
+        if (!pcnetgame_hcl_write_save(h, s_hcl_rc_keep)) {
+            return 0;
+        }
+        memcpy(&Save_Get(homes[h]).floors[fl], &keep, sizeof(keep));
+        printf("[NET][HOUSE] client: own-room reconcile: house %d seq %u already shown by the live room (no rebuild)\n", h, (unsigned)seq);
+        return 1;
+    }
+    if (!aMR_pc_live_reload((GAME*)gamePT, pcnetgame_hcl_reconcile_write_cb, &h)) {
+        return 0;
+    }
+    printf("[NET][HOUSE] client: own-room reconcile: house %d seq %u written into the local save and the live room REBUILT in place (offline edits dropped)\n", h, (unsigned)seq);
+    return 1;
+}
+
+static void pcnetgame_house_client_reconcile_finish(int h) {
+    pcnetgame_hcl_set_canon_from_save(h, s_hcl_rc_keep, s_hcl_rc_seq, s_hcl_rc_session);
+    if (s_hcl_rc_same) {
+        /* the save still holds the live floor's pre-teardown bytes: predict what the teardown will write from the live export instead */
+        static uint8_t tmp[PC_NETGAME_HOUSE_IMG_SIZE];
+        pcnetgame_house_export_be(&s_hcl_cur, tmp);
+        s_hcp.canon_cown[h] = pcnetgame_house_cown_digest(tmp);
+    }
+    s_hcp.stash_valid[h] = 0;
+    s_hcp.offline_taint = 0;
+    s_hcl.rollback = 0;
+    s_hcl.room_stopped = 0;
+    s_hcl.retry_not_before_ms = 0;
+    /* re-arm the in-room pre-check on the pair the host holds NOW (the room edits made before the reconnect are gone, the pockets are the host's) */
+    memset(s_hcl_cnt_base, 0, sizeof(s_hcl_cnt_base));
+    pcnetgame_house_count_image(s_hcl_cnt_base, s_hcl_rc_keep);
+    if (Now_Private != NULL) {
+        pcnetgame_house_count_record(s_hcl_cnt_base, Now_Private);
+        s_hcl.room_base_valid = 1;
+    } else {
+        s_hcl.room_base_valid = 0;
+    }
+    printf("[NET][HOUSE] client: own-room reconcile complete: the room and the pockets are the host's pair again (house %d seq %u); taint cleared\n", h, (unsigned)s_hcl_rc_seq);
+}
+
 /* ---- gates used by the D3 / X1 code (forward-declared above the D3 CLIENT block) ---- */
 
 /* X1b: no pocket transaction may begin while the own house is dirty or its commit is in flight, nor while the player is inside it. */
@@ -18652,6 +18872,9 @@ static const char* pcnetgame_house_client_adopt_blocker(int staged_is_full) {
         return "a furniture commit is in flight";
     }
     if (staged_is_full && pcnetgame_local_house_unsafe(h)) {
+        if (s_hcp.offline_taint && pcnetgame_hcl_reconcile_ready(h)) {
+            return NULL; /* the live room can be rebuilt from the host's image in the adoption call itself (pcnetgame_crec_try_adopt) */
+        }
         return "the owner is inside (or entering / leaving) its own house";
     }
     return NULL;
@@ -18679,12 +18902,17 @@ static void pcnetgame_house_client_on_full_adopt(void) {
     const uint8_t* img;
     uint32_t seq, session;
     if (!pcnetgame_hcl_active()) {
+        s_hcp.offline_taint = 0; /* house sync is not in effect (any more): the pockets are the host's now, there is no pair to restore */
         return;
     }
     s_hcl.rollback = 0;
     h = pcnetgame_hcl_own_house();
-    if (h < 0 || pcnetgame_local_house_unsafe(h)) {
+    if (h < 0) {
+        s_hcp.offline_taint = 0;
         return;
+    }
+    if (pcnetgame_local_house_unsafe(h)) {
+        return; /* the inside case is handled by the own-room reconcile (pcnetgame_hcl_reconcile_apply), never here; the taint stays */
     }
     if (s_hcp.stash_valid[h]) {
         img = s_hcp.stash_img[h];
@@ -18695,10 +18923,11 @@ static void pcnetgame_house_client_on_full_adopt(void) {
         seq = s_hcp.canon_seq[h];
         session = s_hcp.canon_session[h];
     } else {
+        s_hcp.offline_taint = 0; /* the house already equals the host's canon: the pair is consistent */
         return;
     }
     if (!pcnetgame_hcl_write_save(h, img)) {
-        return;
+        return; /* the house could not be restored: the taint stays (the lock and the commit refusal keep protecting the host) */
     }
     {
         static uint8_t keep[PC_NETGAME_HOUSE_IMG_SIZE];
@@ -18706,6 +18935,7 @@ static void pcnetgame_house_client_on_full_adopt(void) {
         pcnetgame_hcl_set_canon_from_save(h, keep, seq, session);
     }
     s_hcp.stash_valid[h] = 0;
+    s_hcp.offline_taint = 0;
     s_hcl.retry_not_before_ms = 0;
     printf("[NET][HOUSE] client: a FULL record push was adopted -> own house %d restored to the host's state (seq %u): local furniture edits discarded together with the pocket edits\n", h,
            (unsigned)seq);
@@ -18922,6 +19152,9 @@ static int pcnetgame_house_client_commit_tick(uint32_t now) {
     if (s_hcl.c_active) {
         return 1;
     }
+    if (s_hcp.offline_taint) {
+        return 1; /* offline edits may be in the pockets / room: nothing is committed (and the plain upload is held) until a FULL record push restored the host's pair */
+    }
     if (!pcnetgame_crec_time_ok(s_hcl.next_check_ms, now)) {
         return 0; /* evaluated every 200 ms (the plain upload is held independently by pcnetgame_house_client_upload_deferred) */
     }
@@ -19116,6 +19349,10 @@ static int pcnetgame_house_client_quit_flush(unsigned max_ms) {
     h = pcnetgame_hcl_own_house();
     if (h < 0) {
         return 1;
+    }
+    if (s_hcp.offline_taint) {
+        printf("[NET][HOUSE] client: quit flush: the offline taint is set (the link was lost and the host's pair was not restored): neither the house nor the record is flushed\n");
+        return 0;
     }
     if (s_hcl.last_own_unsafe || !s_hcl.known || !s_hcp.canon_valid[h]) {
         printf("[NET][HOUSE] client: quit flush: the player was inside (or entering / leaving) its own house, or the house was never synced: the record flush is skipped (the host keeps the last committed pair)\n");
@@ -23141,6 +23378,13 @@ static void pcnetgame_client_on_link_lost(const char* cause) {
         pcnetgame_join_message_set(0, "The host at %s closed the connection before you could join (host stopped, an older game version, or a network problem).",
                                    s_client_host_addr);
     }
+    if (s_role == PC_NETGAME_ROLE_CLIENT && s_hcl.on && !s_hcl.disabled && pcnetgame_hcl_own_house() >= 0) {
+        /* House sync: from now on the pockets / own room may be edited offline. Set BEFORE the session reset below (it zeroes s_hcl); the taint survives the reset. */
+        if (!s_hcp.offline_taint) {
+            printf("[NET][HOUSE] client: link lost with house sync active: OFFLINE TAINT set (own-house edits are locked; the reconnect forces a FULL record push that restores the host's pair)\n");
+        }
+        s_hcp.offline_taint = 1;
+    }
     s_client_link = PC_NETGAME_LINK_DISCONNECTED;
     printf("[NET] client: host connection lost\n");
     {
@@ -25484,6 +25728,31 @@ int pc_net_game_client_own_room_local(void) {
         return 0;
     }
     return Common_Get(field_type) == mFI_FIELDTYPE2_PLAYER_ROOM;
+}
+
+int pc_net_game_client_room_edit_locked(void) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || !s_hcp.sync_last || !pc_net_game_client_own_room_local()) {
+        return 0;
+    }
+    if (s_client_link != PC_NETGAME_LINK_READY || s_hcp.offline_taint) {
+        return 1;
+    }
+    if (s_hcl.disabled) {
+        return 0; /* no usable CANON_PUSH within 20 s: this session fell back to the pre-furniture-sync behaviour (the taint, if any, is handled above) */
+    }
+    return !s_hcl.known || s_crec.state != PC_NETGAME_CRS_SYNCED;
+}
+
+static uint32_t s_edit_denied_ms;
+void pc_net_game_room_edit_denied(void) {
+    s_edit_denied_ms = pcnetgame_now_ms() | 1u; /* never 0 */
+}
+
+int pc_net_game_room_edit_notice(void) {
+    if (s_edit_denied_ms == 0 || (uint32_t)(pcnetgame_now_ms() - s_edit_denied_ms) >= 3000u) {
+        return 0;
+    }
+    return s_client_link != PC_NETGAME_LINK_READY ? 1 : 2;
 }
 
 int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {

@@ -459,6 +459,17 @@ int pc_net_game_request_pickup(int ut_x, int ut_z, int item);
  * like the room drop. Visitors in another player's house get 0 (their pickup stays blocked). 0 otherwise. */
 int pc_net_game_client_own_room_local(void);
 
+/* House-sync OFFLINE EDIT LOCK (client only, TARGET_PC): 1 iff the client stands in the room of its OWN house (pc_net_game_client_own_room_local) while house sync is /
+ * was in effect (the host announced it in the last session) AND the house is not currently a reconciled copy of the host's: the link is not READY, or the own house's
+ * CANON_PUSH has not arrived, or the resident record is not SYNCED, or the offline taint is set (the link was lost and the host has not yet re-pushed the record, see
+ * s_hcp.offline_taint). The gates in the pickup / put / push-pull-rotate / wallpaper-carpet / drawer / music-box paths refuse BEFORE touching any state while this is 1.
+ * 0 for the host, single-player, a guest, outside the own room, and whenever house sync is not in effect. */
+int pc_net_game_client_room_edit_locked(void);
+/* A gate refused a house edit: arms the one-line notice (pc_net_notice_draw, ~3 s after the LAST refusal, so it is naturally rate-limited). Safe to call every frame. */
+void pc_net_game_room_edit_denied(void);
+/* 0 = no notice, 1 = "Not connected - house changes are disabled", 2 = "Leave the house to resync" (the link is back; the reconcile is waiting for a safe moment or for the exit). */
+int pc_net_game_room_edit_notice(void);
+
 /* Stage 5A.1: called from the decomp pickup state (see m_player_main_pickup.c_inc) immediately
  * after the HOST's OWN local pickup has already mutated the field tile through the existing,
  * unmodified single-player code -- never before that mutation, and never as a substitute for it.

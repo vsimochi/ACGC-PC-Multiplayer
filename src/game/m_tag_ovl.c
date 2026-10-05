@@ -3680,6 +3680,14 @@ static void mTG_nw_carpet_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int change_org_flag = FALSE;
     int img_no;
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (tag_ovl->tags[3].tag_row == 1) {
         change_org_flag = TRUE;
     }
@@ -3725,6 +3733,14 @@ static void mTG_carpet_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
     int idx = mTG_get_table_idx(tag);
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (CLIP(my_indoor_clip) != NULL) {
         mActor_name_t* item_p = &Now_Private->inventory.pockets[idx];
 
@@ -3752,6 +3768,14 @@ static void mTG_nw_cover_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int change_org_flag = FALSE;
     int img_no;
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (tag_ovl->tags[3].tag_row == 1) {
         change_org_flag = TRUE;
     }
@@ -3797,6 +3821,14 @@ static void mTG_cover_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
     int idx = mTG_get_table_idx(tag);
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (CLIP(my_indoor_clip) != NULL) {
         mActor_name_t* item_p = &Now_Private->inventory.pockets[idx];
 
@@ -3820,6 +3852,14 @@ static void mTG_putin_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int idx = mTG_get_table_idx(tag);
     Submenu_Item_c* item_p = submenu->item_p;
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     item_p->item = Now_Private->inventory.pockets[idx];
     item_p->slot_no = idx;
     submenu->selected_item_num = 1;
@@ -4259,6 +4299,14 @@ static void mTG_room_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int ux;
     int uz;
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: the game's own refusal row, pocket unchanged. */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     idx = mTG_get_table_idx(tag);
     put_item = mRmTp_Item1ItemNo2FtrItemNo_AtPlayerRoom(Now_Private->inventory.pockets[idx], TRUE);
     inv_ovl = submenu->overlay->inventory_ovl;

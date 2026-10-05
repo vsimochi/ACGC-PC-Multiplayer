@@ -18,6 +18,9 @@
 #include "m_mark_room.h"
 #include "sys_matrix.h"
 #include "m_rcp.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* pc_net_game_client_room_edit_locked() (own-room edit lock, see ac_my_room_msg_ctrl.c_inc / ac_my_room_move.c_inc) */
+#endif
 
 enum {
     aMR_ICON_LEAF,

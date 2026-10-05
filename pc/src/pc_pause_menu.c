@@ -296,6 +296,15 @@ void pc_net_notice_draw(struct game_s* game) {
 
     if (g_pc_paused || game == NULL || game->graph == NULL) return;
     {
+        /* House-sync offline edit lock: a refused house edit shows one short line for ~3 s (below the other notices, drawn in addition to them). */
+        const int edit_notice = pc_net_game_room_edit_notice();
+        if (edit_notice != 0) {
+            mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+            pc_menu_draw_centered(game, edit_notice == 1 ? "Not connected - house changes are disabled" : "Leave the house to resync", 62.0f, 255, 200, 90, 255, 1.0f);
+            mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+        }
+    }
+    {
         /* Client auto-reconnect: its status wins over the join message / the generic "Not connected" notice. */
         int rc_attempt = 0, rc_next_s = 0;
         const int rc = pc_net_game_client_reconnect_status(&rc_attempt, &rc_next_s);

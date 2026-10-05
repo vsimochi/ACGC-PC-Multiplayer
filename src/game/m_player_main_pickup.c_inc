@@ -63,8 +63,9 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
             item = EMPTY_NO;
             signboard_flag = FALSE;
         }
-    } else if (own_room_local && slot_idx < 0) {
-        /* pockets full: vanilla would clear the cell and run the exchange flow; keep the item on the floor */
+    } else if (own_room_local && (slot_idx < 0 || pc_net_game_client_room_edit_locked())) {
+        /* pockets full (or the house link is down / not yet reconciled: pc_net_game_client_room_edit_locked, belt-and-braces behind the
+         * Player_actor_CheckAndRequest_main_pickup_all gate): vanilla would clear the cell and run the exchange flow; keep the item on the floor */
         host_pickup_blocked = TRUE;
         item = EMPTY_NO;
         signboard_flag = FALSE;

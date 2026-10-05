@@ -165,9 +165,30 @@ static void aMR_NoMsgControl(ACTOR* actorx, GAME* game) {
     // nothing
 }
 
+#ifdef TARGET_PC
+/* Client inside its OWN house with the house link down / not reconciled (pc_net_game_client_room_edit_locked): the drawer / music-box contents
+ * and the furniture switch must not change (the choice is treated as "cancel", pockets and furniture untouched). */
+static int aMR_PcEditLocked(void) {
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+#define aMR_PcEditLocked() FALSE
+#endif
+
 static void aMR_MsgControlOwnerNoItem(ACTOR* actorx, GAME* game) {
     MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
     int choice = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
+
+    if (choice != -1 && aMR_PcEditLocked()) {
+        my_room->requested_msg_type = aMR_MSG_STATE_REQUEST_CLOSE_FTR;
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return;
+    }
 
     if (choice != -1) {
         switch (choice) {
@@ -247,6 +268,12 @@ static void aMR_MsgControlOwnerWhichPutOut(ACTOR* actorx, GAME* game) {
     int choice_no = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
 
     mChoice_Clear_ChoseNum(mChoice_Get_base_window_p());
+    if (choice_no != -1 && aMR_PcEditLocked()) {
+        my_room->requested_msg_type = aMR_MSG_STATE_REQUEST_CLOSE_FTR;
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return;
+    }
     if (choice_no != -1) {
         FTR_ACTOR* ftr_actor = aMR_GetNowDemoFtr(actorx);
 
@@ -313,6 +340,13 @@ static void aMR_MsgControlOwnerExistItem(ACTOR* actorx, GAME* game) {
 
     mChoice_Clear_ChoseNum(mChoice_Get_base_window_p());
 
+    if (choice_no != -1 && aMR_PcEditLocked()) {
+        my_room->requested_msg_type = aMR_MSG_STATE_REQUEST_CLOSE_FTR;
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return;
+    }
+
     if (choice_no != -1) {
         if (choice_no == mChoice_CHOICE0) {
             if (mSM_check_open_inventory_itemlist(mSM_IV_OPEN_PUTIN_FTR, 0) == FALSE) {
@@ -356,6 +390,13 @@ static void aMR_MsgControlOwnerExistItem_ItemCount2(ACTOR* actorx, GAME* game) {
     int choice_no = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
 
     mChoice_Clear_ChoseNum(mChoice_Get_base_window_p());
+
+    if (choice_no != -1 && aMR_PcEditLocked()) {
+        my_room->requested_msg_type = aMR_MSG_STATE_REQUEST_CLOSE_FTR;
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return;
+    }
 
     if (choice_no != -1) {
         if (choice_no == mChoice_CHOICE0) {
@@ -522,6 +563,13 @@ static void aMR_MsgControlOwnerNoMD(ACTOR* actorx, GAME* game) {
     MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
     int choice_no = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
 
+    if (choice_no == mChoice_CHOICE0 && aMR_PcEditLocked()) {
+        my_room->requested_msg_type = aMR_MSG_STATE_REQUEST_CLOSE_MD;
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return;
+    }
+
     if (choice_no != -1) {
         switch (choice_no) {
             case mChoice_CHOICE0: {
@@ -577,6 +625,12 @@ static void aMR_MsgControlOwnerExistMD(ACTOR* actorx, GAME* game) {
     int choice_no = mChoice_GET_CHOSENUM();
 
     mChoice_CLEAR_CHOSENUM();
+    if ((choice_no == mChoice_CHOICE0 || choice_no == mChoice_CHOICE2) && aMR_PcEditLocked()) {
+        my_room->requested_msg_type = aMR_MSG_STATE_REQUEST_CLOSE_MD;
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return;
+    }
     if (choice_no != -1) {
         if (choice_no == mChoice_CHOICE0) {
             if (mSM_check_open_inventory_itemlist(mSM_IV_OPEN_MINIDISK, 0) == FALSE) {

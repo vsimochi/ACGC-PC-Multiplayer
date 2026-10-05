@@ -7656,6 +7656,17 @@ static void Player_actor_Request_main_refuse_pickup_all(GAME* game, int refuse_p
 static int Player_actor_CheckAndRequest_main_pickup_all(GAME* game) {
     int field_type = Common_Get(field_type);
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: no pickup at all (state untouched, no animation).
+     * Deliberately not the refuse demo (it says 'pockets full'). */
+    if (field_type == mFI_FIELDTYPE2_PLAYER_ROOM && pc_net_game_client_room_edit_locked()) {
+        if (Player_actor_CheckController_forPickup(game)) {
+            pc_net_game_room_edit_denied();
+        }
+        return FALSE;
+    }
+#endif
+
     if ((field_type == mFI_FIELDTYPE2_FG || field_type == mFI_FIELDTYPE2_PLAYER_ROOM) &&
         Player_actor_CheckController_forPickup(game) &&
         Player_actor_check_request_main_priority(game, mPlayer_REQUEST_PRIORITY_8) > 0 &&

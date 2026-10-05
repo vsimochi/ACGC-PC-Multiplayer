@@ -171,7 +171,7 @@ def main():
        "pcnetgame_scene_is_pregame(sc) || pcnetgame_house_client_adopt_wait()" in func_body(c, "pcnetgame_crec_adopt_lifecycle_now"))
     ta = func_body(c, "pcnetgame_crec_try_adopt")
     ck("G a FULL adoption that replaces the client-owned ranges restores the own house in the same call (on_full_adopt after apply_staged, inside `if (!host_only)`), and after a refused commit the next FULL push replaces them even for the same lineage point (force_full_adopt)",
-       "pcnetgame_crec_apply_staged(host_only, &cloth_refreshed, &equip_changed, &dirty_lost);\n    if (!host_only) {\n        pcnetgame_house_client_on_full_adopt();" in ta
+       "pcnetgame_crec_apply_staged(host_only, &cloth_refreshed, &equip_changed, &dirty_lost);\n    if (!host_only) {\n        if (rc_inside >= 0) {" in ta and "pcnetgame_house_client_on_full_adopt();" in ta
        and "pcnetgame_house_client_force_full_adopt()" in ta and ta.index("force_full_adopt") < ta.index("pcnetgame_crec_apply_staged("))
     ct = func_body(c, "pcnetgame_crec_tick")
     ck("G the commit is sent from pcnetgame_crec_tick BEFORE the plain upload trigger, its chunks are pumped there, and the plain upload only runs when the commit machinery does not own the tick",
@@ -209,7 +209,7 @@ def main():
     lw = func_body(c, "pcnetgame_hcl_live_apply")
     ck("S the ONLY client write of a received house into the save is pcnetgame_hcl_write_save() -> pcnetgame_house_copy_canon() (one call each); its callers are the stash writer, the FULL-adoption restore "
        "and the two live-apply paths of a VISITOR (no-rebuild path / the rebuild callback)",
-       cs.count("pcnetgame_house_copy_canon(&Save_Get(homes[h]), &s_hs_native);") == 1 and cs.count("pcnetgame_hcl_write_save(") == 5 and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in ap_
+       cs.count("pcnetgame_house_copy_canon(&Save_Get(homes[h]), &s_hs_native);") == 1 and cs.count("pcnetgame_hcl_write_save(") == 7 and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in ap_
        and "pcnetgame_hcl_write_save(h, img)" in fa and "pcnetgame_house_copy_canon(" in ws and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in lw
        and "pcnetgame_hcl_write_save(*(int*)ctx, s_hcp.stash_img[*(int*)ctx])" in func_body(c, "pcnetgame_hcl_live_write_cb"))
     ck("S both writers check pcnetgame_local_house_unsafe() BEFORE writing; the stash writer also refuses while the own house is dirty or its commit is in flight and while the local save is unusable",
@@ -255,8 +255,8 @@ def main():
     ck("L an in-room commit needs: a baseline captured at room entry, no refusal this visit, no rollback, no commit in flight, the OWN room quiescent NOW (live_room_house(1)) and for >= 30 frames; the dirty test is the snapshot digest vs canon",
        all(k in ik for k in ("!s_hcl.room_base_valid || s_hcl.room_stopped || s_hcl.rollback || s_hcl.c_active", "pcnetgame_hcl_live_room_house(1) != h", "pcnetgame_hcl_quiet_frames(h) >= PC_NETGAME_HCL_QUIET_FRAMES"))
        and "pcnetgame_house_room_digest(s_hcl_snap_img) == pcnetgame_house_room_digest(s_hcp.canon_img[h])" in strip_comments(cm))
-    ck("L in-room commits only exist under house sync: the commit tick returns first when !pcnetgame_hcl_active(); aMR_pc_export_home is called from exactly two client places (snapshot, visitor live apply) and nowhere on the host",
-       cm.lstrip().startswith("int h;") and "if (!pcnetgame_hcl_active()) {\n        return 0;" in cm and cs.count("aMR_pc_export_home(") == 3 and "aMR_pc_export_home(&s_hcl_snap, h, &fl)" in func_body(c, "pcnetgame_hcl_snapshot")
+    ck("L in-room commits only exist under house sync: the commit tick returns first when !pcnetgame_hcl_active(); aMR_pc_export_home is called from the client places only (snapshot, visitor live apply, the offline-taint reconcile plan / apply: 5 occurrences incl. the extern) and nowhere on the host",
+       cm.lstrip().startswith("int h;") and "if (!pcnetgame_hcl_active()) {\n        return 0;" in cm and cs.count("aMR_pc_export_home(") == 5 and "aMR_pc_export_home(&s_hcl_snap, h, &fl)" in func_body(c, "pcnetgame_hcl_snapshot")
        and "aMR_pc_export_home(&s_hcl_cur, h, &fl)" in lw)
     ck("L client pre-check: before any in-room send the host's conservation rule is applied to (snapshot + pockets) vs the baseline pair captured at room entry / moved by each APPLIED; a mismatch stops in-room commits for the visit and sends nothing; the baseline moves only on APPLIED",
        cm.index("pcnetgame_house_conserved(s_hcl_cnt_base, s_hcl_cnt_new") < cm.index("pcnetgame_hcl_start_commit(h, now, in_room);") and "s_hcl.room_stopped = 1;" in cm
@@ -265,8 +265,8 @@ def main():
        "pcnetgame_local_house_unsafe(h)" in fa and "staged_is_full && pcnetgame_local_house_unsafe(h)" in func_body(c, "pcnetgame_house_client_adopt_blocker")
        and "|| s_hcl.c_active || pcnetgame_local_house_unsafe(h) || pcnetgame_hcl_dirty(h);" in tg + func_body(c, "pcnetgame_house_client_upload_deferred") and "s_hcl.room_base_valid = 0;" in func_body(c, "pcnetgame_hcl_room_track"))
     la = strip_comments(func_body(c, "pcnetgame_hcl_apply_stash"))
-    ck("L a visitor's live apply never touches the OWN house: live_apply refuses h == own first, the stash writer only calls it as `h != own ? live_apply(h) : 0` when the house is unsafe, and aMR_pc_live_reload has exactly one caller",
-       "const int own = pcnetgame_hcl_own_house();" in lw[:120] and "h == own ||" in lw[:260] and "return h != own ? pcnetgame_hcl_live_apply(h) : 0;" in la and cs.count("aMR_pc_live_reload(") == 2
+    ck("L a visitor's live apply never touches the OWN house: live_apply refuses h == own first, the stash writer only calls it as `h != own ? live_apply(h) : 0` when the house is unsafe; the ONLY own-house reload is the offline-taint reconcile inside try_adopt (pinned in section O)",
+       "const int own = pcnetgame_hcl_own_house();" in lw[:120] and "h == own ||" in lw[:260] and "return h != own ? pcnetgame_hcl_live_apply(h) : 0;" in la and cs.count("aMR_pc_live_reload(") == 3
        and cs.count("pcnetgame_hcl_live_apply(") == 2)
     ck("L destroy-WITHOUT-write-back precedes the save write: the reload destroys every actor (dt_proc, CrossOffMoveBg, MinusWeight) and clears used_list before cb(ctx) writes the save, NEVER calls aMR_KeepItem2Fg / aMR_SaveSwitchData, and rebuilds the actors after the write",
        rl.index("profile->vtable->dt_proc(") < rl.index("(void)cb(ctx);") < rl.index("aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER0);") and rl.index("l_aMR_work.used_list[i] = FALSE;") < rl.index("(void)cb(ctx);")
@@ -307,12 +307,81 @@ def main():
        and pks.index("pc_net_game_client_own_room_local()") < pks.index("pc_net_game_request_pickup(")
        and "PC_NETGAME_ROLE_CLIENT && !own_room_local) {\n        int ut_x, ut_z;" in pks and "PC_NETGAME_ROLE_CLIENT && !own_room_local) {\n        main_pickup_p->exchange_flag = FALSE;" in pks)
     ck("R full pockets (slot_idx < 0) in the own room block the pickup (no mutation, item stays on the floor); the money-bag-to-wallet shortcut is skipped so a bag goes to a pocket",
-       "else if (own_room_local && slot_idx < 0) {" in pks and "host_pickup_blocked = TRUE;" in pks[pks.index("own_room_local && slot_idx < 0"):pks.index("own_room_local && slot_idx < 0") + 200]
+       "else if (own_room_local && (slot_idx < 0 || pc_net_game_client_room_edit_locked())) {" in pks and "host_pickup_blocked = TRUE;" in pks[pks.index("own_room_local && (slot_idx < 0"):pks.index("own_room_local && (slot_idx < 0") + 260]
        and "&& !own_room_local\n#endif\n            && mPr_GivePossessionBells(bell_amount)" in pks.replace(chr(13), ""))
     rp = func_body(c, "pc_net_game_request_pickup")
     ck("R the house-sync refusal in pc_net_game_request_pickup is logged (rate-limited), and visitors in another house stay blocked (the town-only rule is unchanged)",
        "[NET][PICKUP] refused:" in rp[:rp.index("ut_x < 0")] and "s_pickup_blk_log++ & 31u" in rp and "if (!pcfa_scene_is_town()) {" in rp)
     ck("R the roadmap documents the own-room pickup (cause, fix, safety, limitations)", "Own-room ground pickup" in road and "pc_net_game_client_own_room_local" in road)
+    # ------------------------------------------------------------------ O (offline taint, edit lock, own-room reconcile)
+    hello = strip_comments(func_body(c, "pcnetgame_crec_send_hello"))
+    ck("O HELLO omits HAVE_LAST while the offline taint is set (the host then always answers with a FULL push: the same-host-process continuation hole is closed)",
+       "&& !pcnetgame_house_client_offline_taint()) {\n        h.flags |=(uint8_t)PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST;" in hello
+       and "static int pcnetgame_house_client_offline_taint(void) {\n    return s_hcp.offline_taint;" in c)
+    hs = strip_comments(c[c.index("continuation accepted") - 1500:c.index("continuation accepted") + 600])
+    ck("O host: the no-push continuation needs HAVE_LAST + the same host session + epoch + rev, otherwise PUSH_FULL is started (so a HELLO without HAVE_LAST gets a FULL push in the same host session)",
+       "(in->flags & PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST) != 0 && in->last_host_session == s_rec_host_session" in hs and "pcnetgame_rec_start_push(peer, idx, (uint8_t)PC_NETGAME_REC_KIND_PUSH_FULL);" in hs
+       and hs.index("continuation accepted") < hs.index("pcnetgame_rec_start_push(peer, idx, (uint8_t)PC_NETGAME_REC_KIND_PUSH_FULL);"))
+    ll = strip_comments(func_body(c, "pcnetgame_client_on_link_lost"))
+    ck("O taint is set in on_link_lost BEFORE the session reset (which zeroes s_hcl), only when house sync was on and the player owns a house; sync_last is set by set_hostcfg and survives the reset",
+       "s_hcp.offline_taint = 1;" in ll and ll.index("s_hcp.offline_taint = 1;") < ll.index("pcnetgame_reset_client_session_state();") and "s_hcl.on && !s_hcl.disabled && pcnetgame_hcl_own_house() >= 0" in ll
+       and "s_hcp.sync_last = s_hcl.on;" in strip_comments(func_body(c, "pcnetgame_house_client_set_hostcfg")) and "memset(&s_hcl, 0, sizeof(s_hcl));" in func_body(c, "pcnetgame_house_client_reset_session")
+       and "s_hcp.sync_last = keep_sync_last;" in func_body(c, "pcnetgame_house_client_on_ready"))
+    cmt = strip_comments(func_body(c, "pcnetgame_house_client_commit_tick"))
+    qft = strip_comments(func_body(c, "pcnetgame_house_client_quit_flush"))
+    ck("O commit_tick and the quit flush REFUSE while the taint is set (the offline pair can never be committed)",
+       "if (s_hcp.offline_taint) {\n        return 1;" in cmt and cmt.index("s_hcp.offline_taint") < cmt.index("pcnetgame_hcl_build_pair") and "if (s_hcp.offline_taint) {" in qft
+       and qft.index("s_hcp.offline_taint") < qft.index("pcnetgame_hcl_start_commit"))
+    fa2 = strip_comments(fa)
+    ck("O the taint is cleared ONLY by a FULL record adoption (on_full_adopt: not on a failed restore, not while inside) or by the own-room reconcile finish, by a new local player (owner change memset) or by a host without house sync",
+       cs.count("s_hcp.offline_taint = 0;") == 6 and "if (pcnetgame_local_house_unsafe(h)) {\n        return;" in fa2 and fa2.index("pcnetgame_hcl_write_save(h, img)") < fa2.rindex("s_hcp.offline_taint = 0;")
+       and "s_hcp.offline_taint = 0;" in strip_comments(func_body(c, "pcnetgame_house_client_reconcile_finish")) and "if (!s_hcl.on) {\n        s_hcp.offline_taint = 0;" in strip_comments(func_body(c, "pcnetgame_house_client_set_hostcfg")))
+    lk = strip_comments(func_body(c, "pc_net_game_client_room_edit_locked"))
+    ck("O the lock predicate: CLIENT + sync_last + own room local; locked when the link is not READY, the taint is set, or (not disabled) the house is unknown / the record not SYNCED; declared in pc_net_game.h with the denied / notice API",
+       "s_role != PC_NETGAME_ROLE_CLIENT || !s_hcp.sync_last || !pc_net_game_client_own_room_local()" in lk and "s_client_link != PC_NETGAME_LINK_READY || s_hcp.offline_taint" in lk
+       and "!s_hcl.known || s_crec.state != PC_NETGAME_CRS_SYNCED" in lk and "int pc_net_game_client_room_edit_locked(void);" in h and "void pc_net_game_room_edit_denied(void);" in h
+       and "int pc_net_game_room_edit_notice(void);" in h)
+    pmn = strip_comments(read("pc/src/pc_pause_menu.c"))
+    ck("O the notice: one short rate-limited line drawn by pc_net_notice_draw ('Not connected - house changes are disabled' / 'Leave the house to resync')",
+       "pc_net_game_room_edit_notice()" in pmn and "Not connected - house changes are disabled" in read("pc/src/pc_pause_menu.c") and "Leave the house to resync" in read("pc/src/pc_pause_menu.c")
+       and "(uint32_t)(pcnetgame_now_ms() - s_edit_denied_ms) >= 3000u" in cs)
+    pall = strip_comments(read("src/game/m_player_common.c_inc")).replace("\r", "")
+    pa = pall[pall.index("static int Player_actor_CheckAndRequest_main_pickup_all(GAME* game) {"):]
+    pa = pa[:pa.index("pc_net_game_client_room_edit_locked") + 400]
+    tg = strip_comments(read("src/game/m_tag_ovl.c")).replace("\r", "")
+    rp_ = tg[tg.index("static void mTG_room_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {"):]
+    mv = strip_comments(read("src/actor/ac_my_room_move.c_inc")).replace("\r", "")
+    mc = strip_comments(read("src/actor/ac_my_room_msg_ctrl.c_inc")).replace("\r", "")
+    ck("O lock gate: pickup_all returns FALSE first for field_type PLAYER_ROOM (no refuse demo), before any priority / request call",
+       "field_type == mFI_FIELDTYPE2_PLAYER_ROOM && pc_net_game_client_room_edit_locked()" in pa and "return FALSE;" in pa[:pa.index("pc_net_game_client_room_edit_locked") + 200]
+       and "Player_actor_Request_main_refuse_pickup_all" not in pa[:pa.index("pc_net_game_client_room_edit_locked") + 300])
+    ck("O lock gate: mTG_room_put_proc opens the game's own refusal row (mWR_WARNING_PUT_ITEM) and returns BEFORE it reads the pocket / touches anything",
+       rp_.index("pc_net_game_client_room_edit_locked()") < rp_.index("idx = mTG_get_table_idx(tag);") and "mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);\n        return;" in rp_[:rp_.index("idx = mTG_get_table_idx(tag);")])
+    ck("O lock gate: the push / pull / rotate grab returns FALSE before mPlib_request_main_hold_type1",
+       mv.index("pc_net_game_client_room_edit_locked()") < mv.index("mPlib_request_main_hold_type1(game, contact_info0->ftrID") and mv.count("pc_net_game_client_room_edit_locked()") == 1)
+    ck("O lock gate: wallpaper / carpet (4 procs) and putin are refused in the CALLERS in m_tag_ovl.c (ac_my_indoor's reserve procs return the old item, which would erase the pocket item), warning row + return before any change",
+       tg.count("pc_net_game_client_room_edit_locked()") == 6)
+    ck("O lock gate: the drawer / music-box choices (put in, take out, MD switch) are treated as cancel while locked (aMR_PcEditLocked in 6 handlers + its definition); the pickup seam has the belt-and-braces gate",
+       mc.count("aMR_PcEditLocked()") == 7 and mc.count("pc_net_game_client_room_edit_locked()") == 1 and "(slot_idx < 0 || pc_net_game_client_room_edit_locked())" in pks)
+    ra = strip_comments(func_body(c, "pcnetgame_house_client_reconcile_apply"))
+    rr = strip_comments(func_body(c, "pcnetgame_hcl_reconcile_ready"))
+    rpl = strip_comments(func_body(c, "pcnetgame_hcl_reconcile_plan"))
+    ab2 = strip_comments(func_body(c, "pcnetgame_house_client_adopt_blocker"))
+    tas = strip_comments(ta)
+    ck("O reconcile: own-house reload ONLY inside try_adopt with !host_only, reload strictly BEFORE apply_staged, the FULL push stays staged (shared deferral) when the reload is not possible, finish AFTER apply_staged",
+       cs.count("pcnetgame_house_client_reconcile_apply(") == 3 and tas.index("if (host_only) {") < tas.index("pcnetgame_house_client_reconcile_apply(rc_h)") < tas.index("pcnetgame_crec_apply_staged(")
+       < tas.index("pcnetgame_house_client_reconcile_finish(rc_inside)") and "goto adopt_blocked_retry;" in tas and "aMR_pc_live_reload((GAME*)gamePT, pcnetgame_hcl_reconcile_write_cb, &h)" in ra
+       and "if (!s_hcp.offline_taint || !pcnetgame_hcl_reconcile_ready(h)) {" in ra)
+    ck("O reconcile terms: known, no commit in flight, live OWN room quiet >= 30 frames, a usable target (stash else canon), wall_floor equality with the live indoor actor, furniture-next-to-the-player deferral; the adoption blocker lets a FULL push through only then and only with the taint",
+       "!s_hcl.known || s_hcl.c_active" in rr and "pcnetgame_hcl_live_room_house(1) != h || pcnetgame_hcl_quiet_frames(h) < PC_NETGAME_HCL_QUIET_FRAMES" in rr and "s_hcp.stash_valid[h]" in strip_comments(func_body(c, "pcnetgame_hcl_reconcile_target"))
+       and "aMI_pc_wall_floor_matches(" in rpl and rpl.index("aMI_pc_wall_floor_matches(") < rpl.index("return 1;") and "nv != ov && (ITEM_IS_FTR(nv) || nv == (mActor_name_t)RSV_FE1F)" in rpl
+       and "s_hcp.offline_taint && pcnetgame_hcl_reconcile_ready(h)" in ab2 and "return NULL;" in ab2[ab2.index("pcnetgame_hcl_reconcile_ready(h)"):ab2.index("pcnetgame_hcl_reconcile_ready(h)") + 200])
+    ind = read("src/actor/ac_my_indoor.c").replace("\r", "")
+    ck("O the indoor actor exports aMI_pc_wall_floor_matches (wall_num / floor_num equality, no pending reserve), TARGET_PC only",
+       "int aMI_pc_wall_floor_matches(int wallpaper_idx, int flooring_idx) {" in ind and "my_indoor->wall_num == wallpaper_idx && my_indoor->floor_num == flooring_idx" in ind)
+    ck("O the roadmap documents the disconnect / reconnect house state (taint, forced FULL push, edit lock, reconcile, limitations, manual tests)",
+       "House state across disconnect/reconnect" in road and "offline taint" in road and "Leave the house to resync" in road and "aMI_pc_wall_floor_matches" in road)
+
     return L.summary_and_exit_code(results)
 
 

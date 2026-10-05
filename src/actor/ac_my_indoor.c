@@ -896,3 +896,17 @@ static void aMI_IndoorDmaAgain(void) {
         }
     }
 }
+
+#ifdef TARGET_PC
+/* House sync (own-room reconcile): 1 iff the live indoor actor currently shows exactly this wallpaper / flooring. The live values are what a later reserve would mint
+ * the old item from (aMI_GetWallFloorItem), so the room is only rebuilt in place when the target house agrees with them. */
+int aMI_pc_wall_floor_matches(int wallpaper_idx, int flooring_idx) {
+    if (Common_Get(clip).my_indoor_clip == NULL || Common_Get(clip).my_indoor_clip->my_indoor_actor_p == NULL) {
+        return 0;
+    }
+    {
+        const MY_INDOOR_ACTOR* my_indoor = Common_Get(clip).my_indoor_clip->my_indoor_actor_p;
+        return my_indoor->wall_num == wallpaper_idx && my_indoor->floor_num == flooring_idx && !my_indoor->wall_reserve.reserve_flag && !my_indoor->floor_reserve.reserve_flag;
+    }
+}
+#endif

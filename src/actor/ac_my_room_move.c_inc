@@ -1024,6 +1024,13 @@ static int aMR_ManageMoveBottun(MY_ROOM_ACTOR* my_room, GAME* game, aMR_contact_
                 return FALSE;
             }
 
+#ifdef TARGET_PC
+            /* Client inside its OWN house with the house link down / not reconciled: no push / pull / rotate grab (state untouched). */
+            if (pc_net_game_client_room_edit_locked()) {
+                pc_net_game_room_edit_denied();
+                return FALSE;
+            }
+#endif
             aMR_SetNicePos(&nice_pos, player->actor_class.world.position, contact_info0->contact_edge_start,
                            contact_info0->contact_edge_end, contact_info0, 1);
             my_room->nice_pos = nice_pos;
