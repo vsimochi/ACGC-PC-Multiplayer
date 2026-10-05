@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include "pc_mp_guests.h"
+#include "pc_mp_members.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,47 @@ int pc_mp_membership_lookup(const uint8_t pid_be[20], const PCMpTownKey* town, c
 /* Lists every member of `town`: residents first (slot order), then the active guests (table order). Returns the number of rows written (<= cap). */
 int pc_mp_membership_list(const PCMpTownKey* town, const uint8_t res_pid[4][20], const uint8_t res_exists[4], const PCMpGuestFile* guests,
                           PCMpMembership* rows, int cap);
+
+/* ---- M-H: the ADMISSION classifier (pure): the membership layer is the authority that decides who an IDENTITY claim is ----
+ * Inputs are plain arrays (no game state). `pid_equal_vanilla` mirrors mPr_CheckCmpPersonalID on the 20-byte BE form: equal player_id AND land_id, and both the player name and the
+ * land name are NOT blank (all 0x20 = CHAR_SPACE) and byte-equal. A resident record counts only when `valid` (mLd_CHECK_LAND_ID(land_id) and the PersonalID is not the null one) and
+ * `exists` (exists == FALSE is vanilla's "resident away" state). Results:
+ *   RESIDENT   exactly one valid, existing resident matches (res_index) and the claim matches no guest entry of the town
+ *   AMBIGUOUS  more than one resident matches, OR a resident matches and a guest entry of this town has the same PID (guest aliasing)
+ *   GUEST      no resident matches and the EXT is a GUEST claim: guest_slot = the entry of this town with the claimed home PID, or -1 (a NEW key)
+ *   STALE      no resident matches, the EXT is not a GUEST claim, but the members file holds a credential / handoff of this town for the claim PID
+ *   NONE       anything else (a claim that is no member; a guest PID WITHOUT a guest claim is NONE as well)
+ * A malformed EXT is treated exactly like no EXT. */
+enum { PC_MP_EXT_NONE = 0, PC_MP_EXT_GUEST = 1, PC_MP_EXT_RESIDENT = 2, PC_MP_EXT_MALFORMED = 3 };
+enum { PC_MP_ADMIT_NONE = 0, PC_MP_ADMIT_RESIDENT = 1, PC_MP_ADMIT_GUEST = 2, PC_MP_ADMIT_AMBIGUOUS = 3, PC_MP_ADMIT_STALE = 4 };
+
+typedef struct PCMpAdmitRes {
+    uint8_t pid[20];
+    uint8_t valid;   /* mLd_CHECK_LAND_ID(land_id) and not the null PersonalID */
+    uint8_t exists;  /* Private_c.exists == TRUE */
+} PCMpAdmitRes;
+
+typedef struct PCMpAdmitIn {
+    uint8_t              claim_pid[20];     /* the IDENTITY claim (BE) */
+    int                  ext_kind;          /* PC_MP_EXT_* (GUEST wins when both flags are set, like the host) */
+    uint8_t              ext_home_pid[20];  /* the EXT home PersonalID (BE), meaningful for GUEST */
+    PCMpTownKey          town;
+    PCMpAdmitRes         res[4];
+    const PCMpGuestFile* guests;            /* NULL = none / untrusted */
+    const PCMpMemberFile* members;          /* NULL = none / untrusted / not loaded */
+    int                  own_idx;           /* the host's own active resident, -1 none */
+} PCMpAdmitIn;
+
+typedef struct PCMpAdmitView {
+    int kind;         /* PC_MP_ADMIT_* */
+    int res_index;    /* RESIDENT: the slot, else -1 */
+    int guest_slot;   /* GUEST: the table slot or -1 (new key); else -1 */
+    int n_res_match;  /* residents matching the claim */
+    int is_own;       /* RESIDENT and res_index == own_idx */
+} PCMpAdmitView;
+
+int pc_mp_pid_equal_vanilla(const uint8_t a[20], const uint8_t b[20]);
+int pc_mp_membership_resolve(const PCMpAdmitIn* in, PCMpAdmitView* out);
 
 #ifdef __cplusplus
 }

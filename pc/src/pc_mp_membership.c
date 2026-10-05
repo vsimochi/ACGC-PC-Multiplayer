@@ -58,3 +58,67 @@ int pc_mp_membership_list(const PCMpTownKey* town, const uint8_t res_pid[4][20],
     }
     return n;
 }
+
+/* ---- M-H: the admission classifier ---- */
+static int blank8(const uint8_t* n) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (n[i] != 0x20) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* mPr_CheckCmpPersonalID on the BE 20-byte form (name 8, land name 8, player_id 2, land_id 2). */
+int pc_mp_pid_equal_vanilla(const uint8_t a[20], const uint8_t b[20]) {
+    return memcmp(a + 16, b + 16, 4) == 0 && !blank8(a + 8) && !blank8(b + 8) && memcmp(a + 8, b + 8, 8) == 0 && !blank8(a) && !blank8(b) && memcmp(a, b, 8) == 0;
+}
+
+int pc_mp_membership_resolve(const PCMpAdmitIn* in, PCMpAdmitView* out) {
+    PCMpAdmitView v;
+    int i, guest_alias = 0;
+    memset(&v, 0, sizeof(v));
+    v.res_index = -1;
+    v.guest_slot = -1;
+    for (i = 0; i < 4; i++) {
+        if (in->res[i].valid && in->res[i].exists && pc_mp_pid_equal_vanilla(in->claim_pid, in->res[i].pid)) {
+            if (v.n_res_match == 0) {
+                v.res_index = i;
+            }
+            v.n_res_match++;
+        }
+    }
+    for (i = 0; in->guests != NULL && i < PC_MP_GUEST_SLOTS; i++) {
+        if (guest_in_town(&in->guests->e[i], &in->town) && pc_mp_pid_equal_vanilla(in->guests->e[i].pid, in->claim_pid)) {
+            guest_alias = 1;
+        }
+    }
+    if (v.n_res_match > 1 || (v.n_res_match == 1 && guest_alias)) {
+        v.kind = PC_MP_ADMIT_AMBIGUOUS;
+        v.res_index = -1;
+    } else if (v.n_res_match == 1) {
+        v.kind = PC_MP_ADMIT_RESIDENT;
+        v.is_own = (in->own_idx >= 0 && v.res_index == in->own_idx) ? 1 : 0;
+    } else if (in->ext_kind == PC_MP_EXT_GUEST) {
+        v.kind = PC_MP_ADMIT_GUEST;
+        for (i = 0; in->guests != NULL && i < PC_MP_GUEST_SLOTS; i++) {
+            if (guest_in_town(&in->guests->e[i], &in->town) && memcmp(in->guests->e[i].pid, in->ext_home_pid, 20) == 0) {
+                v.guest_slot = i;
+                break;
+            }
+        }
+    } else {
+        v.kind = PC_MP_ADMIT_NONE;
+        for (i = 0; in->members != NULL && i < PC_MP_MEMBERS_SLOTS; i++) {
+            const PCMpMemberEntry* e = &in->members->e[i];
+            if (e->present && memcmp(e->land_name, in->town.land_name, 8) == 0 && e->land_id == in->town.land_id && e->terrain_hash == in->town.terrain_hash &&
+                memcmp(e->pid, in->claim_pid, 20) == 0) {
+                v.kind = PC_MP_ADMIT_STALE;
+                break;
+            }
+        }
+    }
+    *out = v;
+    return v.kind;
+}

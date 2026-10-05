@@ -492,10 +492,11 @@ def source_audit(rig):
        and 'strcmp(value, "required") == 0' in st and "allow_new_guests = %d" in st and 'resident_tokens = %s' in st)
     ck("S the host CLI refuses a bad / missing value (exit 2) and both options outside --host", "--allow-new-guests: REFUSED: the option needs 0 or 1" in mn and "--resident-tokens: REFUSED: the option needs off, tofu or required" in mn
        and "HOST-only options" in mn)
-    ck("S process_identity calls admission_decide, applies the refusal, runs the membership CROSS-CHECK (a log line only when it disagrees), and the decide function calls classify, guest_check and "
-       "the credential check in that order (classify itself is NOT replaced)",
-       "pcnetgame_host_admission_decide(peer, &in, &ext, ext_valid, &adm);" in ng and "pcnetgame_host_admission_crosscheck(peer, &in, &adm);" in ng
-       and ng.index("pcnetgame_host_classify_identity(in, &resident_idx)") < ng.index("pcnetgame_host_guest_check(peer, in, ext, &a->guest_key") < ng.index("pcnetgame_host_resident_credential_check(peer, resident_idx")
+    ck("S process_identity calls admission_decide and applies the refusal; M-H: the decide function builds the resolver view (pc_mp_membership_resolve is the AUTHORITY), runs classify only as an "
+       "equivalence check (any disagreement logged `ADMISSION EQUIV differs` and refused), then guest_check and the credential check in that order (classify itself is NOT replaced)",
+       "pcnetgame_host_admission_decide(peer, &in, &ext, ext_valid, &adm);" in ng and "pcnetgame_host_admission_crosscheck" not in ng and "CROSS-CHECK" not in ng
+       and "pc_mp_membership_resolve(&ai, view)" in ng and "ADMISSION EQUIV differs" in ng
+       and ng.index("pcnetgame_host_admission_resolve_view(in, ext_guest") < ng.index("pcnetgame_host_classify_identity(in, &resident_idx)") < ng.index("pcnetgame_host_guest_check(peer, in, ext, &a->guest_key") < ng.index("pcnetgame_host_resident_credential_check(peer, resident_idx")
        and "static PCNetGameIdentityClass pcnetgame_host_classify_identity(" in ng)
     pi = ng[ng.index("static void pcnetgame_host_process_identity(PCNetPeerId peer) {"):]
     ck("S the credential check (decide) happens BEFORE the duplicate-park step and the mint after it; the mint is before the ACK, the rollback covers a failed ACK / token send",

@@ -150,7 +150,7 @@ def main():
               # M-D / M-E: the admission cross-check (reads the host's own residents), the resident credential table (keyed by the resident PersonalID of private_data[idx]) and the
               # resident operator commands (residents / resident-reset / resident-arm); all host-side, none reachable with a guest slot
               "pc_net_game_dedicated_resident_admin", "pc_net_game_dedicated_resident_info", "pc_net_game_dedicated_promote", "pcnetgame_host_promotion_handoff",  # M-F: promote (the guest record -> a new resident) + the handoff check (resident PID lookup)
-               "pcnetgame_dedicated_resident_resolve", "pcnetgame_host_admission_crosscheck",
+               "pcnetgame_dedicated_resident_resolve", "pcnetgame_host_admission_resolve_view", "pcnetgame_rec_has_promote_entry",  # M-H: the resolver input builder (reads the host residents); M-G: the promote-entry probe (guarded idx < PLAYER_NUM)
               "pcnetgame_resident_arm_active", "pcnetgame_resident_cred_find", "pcnetgame_resident_mint", "pcnetgame_resident_mint_rollback",
               "pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
@@ -283,9 +283,9 @@ def main():
        0 < pi.index("PC_NETGAME_REJECT_NO_SAVE") < pi.index("PC_NETGAME_REJECT_LAND_MISMATCH") < pi.index("pcnetgame_host_classify_identity(") < pi.index("pcnetgame_host_guest_check(")
        < pi.index("sent a GUEST claim but its IDENTITY matches resident") < pi.index("claimed resident is the host's own resident") < pi.index("pcnetgame_guest_create(")
        < pi.index("pcnetgame_reset_all_host_peer_state(peer);") < pi.index("PC_NETGAME_MSG_IDENTITY_ACK") < pi.index("PC_NETGAME_MSG_IDENTITY_TOKEN") < pi.index("PC_NETGAME_LINK_READY"))
-    ck("C a guest is admitted ONLY for an UNKNOWN class with the EXT guest flag: the guest_check call sits in the `id_class != RESIDENT` branch; the resident branch refuses a guest claim",
-       re.search(r"if \(id_class != PCNETGAME_IDCLASS_RESIDENT\) \{\s*if \(!ext_guest\) \{[^}]*claimed identity matches no resident record of this town\", 1\);\s*return;\s*\}[^}]*pcnetgame_host_guest_check\(", pi, re.S)
-       and re.search(r"\}\s*if \(ext_guest\) \{[^}]*pcnetgame_host_admission_refuse_identity_text\(a, \"guest-flagged claim matches a resident of this town", pi, re.S))
+    ck("C a guest is admitted ONLY for an UNKNOWN class with the EXT guest flag: the guest_check call sits in the `view.kind != PC_MP_ADMIT_RESIDENT` branch (M-H: the membership resolver decides, classify is the equivalence check); the resident branch refuses a guest claim",
+       re.search(r"if \(view\.kind != PC_MP_ADMIT_RESIDENT\) \{.*?if \(!ext_guest\) \{[^}]*claimed identity matches no resident record of this town\", 1\);\s*return;\s*\}[^}]*pcnetgame_host_guest_check\(", pi, re.S)
+       and re.search(r"resident_idx = view\.res_index;\s*if \(ext_guest\) \{[^}]*pcnetgame_host_admission_refuse_identity_text\(a, \"guest-flagged claim matches a resident of this town", pi, re.S))
     ext_readers = ["pcnetgame_handle_host_identity_ext", "pcnetgame_host_admission_decide", "pcnetgame_host_guest_check", "pcnetgame_host_process_identity",
                    "pcnetgame_host_promotion_handoff", "pcnetgame_host_resident_credential_check", "pcnetgame_townsrv_handle_req"]
     pr_ext = re.findall(r"ext->\w+", fb("pcnetgame_host_promotion_handoff"))
@@ -368,7 +368,7 @@ def main():
     # PINNED reviewed baseline: da9074a (the HEAD the Opus guest-safety review audited). The writers, pc_card.c and pc_save_bswap.c must equal that commit EXACTLY.
     # Pre-session equivalence (the baseline vs 0c9bc72, the last commit before this work) was reviewed BY HAND: the writers are identical except pc_gci_path() / pc_gci_tmp_path()
     # and s_pc_town_gen++ in pc_save_write_gci.
-    BASELINE = "da9074a"
+    BASELINE = "a74740b"  # advanced from da9074a after review: M-G added ONLY an early return in pc_save_write_gci (skip saving when the loaded town is a SANITIZED client cache) = strictly fewer writes
     d = subprocess.run(["git", "-C", ROOT, "diff", "--stat", BASELINE, "--", "pc/src/pc_card.c"], capture_output=True, text=True).stdout.strip()
     d_bsw = subprocess.run(["git", "-C", ROOT, "diff", "--stat", BASELINE, "--", "pc/src/pc_save_bswap.c"], capture_output=True, text=True).stdout.strip()
     bsw_txt = read("pc/src/pc_save_bswap.c")

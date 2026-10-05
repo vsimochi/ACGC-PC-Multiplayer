@@ -22300,7 +22300,7 @@ static void pcnetgame_run_txn_dig_test_hook(void) {
  * equivalent), AMBIGUOUS -> refused, UNKNOWN without a GUEST claim -> NO_SAVE, UNKNOWN with a GUEST claim -> pcnetgame_host_guest_check, RESIDENT with a GUEST claim -> refused,
  * RESIDENT -> the own-resident check and then (M-E) the credential check. The credential check sits BEFORE the duplicate-park step of the caller, so an impostor can never evict a
  * live peer. The caller (pcnetgame_host_process_identity) keeps the duplicate park, the guest cap / reserve / allow_new_guests, the mint, the ACK and the IDENTITY_TOKEN.
- * pc_mp_membership_lookup is used ONLY as a logged cross-check (pcnetgame_host_admission_crosscheck), never as the decider. */
+ * M-H: the DECIDER is pc_mp_membership_resolve (via pcnetgame_host_admission_resolve_view); classify only runs as an equivalence check (a disagreement is logged and refused). */
 typedef enum PCNetGameAdmissionKind {
     PCNETGAME_ADM_REFUSE = 0,
     PCNETGAME_ADM_RESIDENT,
@@ -22336,6 +22336,35 @@ static void pcnetgame_host_admission_refuse_identity_text(PCNetGameAdmission* a,
     snprintf(a->text, sizeof(a->text), "%s", text);
 }
 
+/* M-H: builds the pure resolver's input from the host state (the host's 4 private_data records, the in-memory guests / members mirrors) and runs it. `home` = the EXT home PersonalID
+ * (only read for ext_kind GUEST). The members file counts only when resident_tokens != off (off never touches it) and it is trusted; guests.dat only when trusted. */
+static void pcnetgame_host_admission_resolve_view(const PCNetGameIdentityMsg* in, int ext_kind, const PersonalID_c* home, int own_idx, PCMpAdmitView* view) {
+    PCMpAdmitIn ai;
+    PersonalID_c claim;
+    int i;
+    memset(&ai, 0, sizeof(ai));
+    memcpy(claim.player_name, in->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(claim.land_name, in->land_name, PC_NETGAME_LAND_LEN);
+    claim.player_id = in->player_id;
+    claim.land_id = in->land_id;
+    pcnetgame_resident_pid_be(&claim, ai.claim_pid);
+    ai.ext_kind = ext_kind;
+    pcnetgame_resident_pid_be(home, ai.ext_home_pid);
+    memcpy(ai.town.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN);
+    ai.town.land_id = s_host_town.land_id;
+    ai.town.terrain_hash = s_host_town.terrain_hash;
+    for (i = 0; i < PLAYER_NUM; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        pcnetgame_resident_pid_be(p, ai.res[i].pid);
+        ai.res[i].valid = (mLd_CHECK_LAND_ID(p->land_id) && mPr_NullCheckPersonalID(p) == FALSE) ? 1 : 0;
+        ai.res[i].exists = Save_Get(private_data)[i].exists == TRUE ? 1 : 0;
+    }
+    ai.guests = (s_guest_store_loaded && !s_guest_untrusted) ? &s_guest_file : NULL;
+    ai.members = (pcnetgame_resident_policy() != PC_NETGAME_RESTOK_OFF && s_members_loaded && !s_members_untrusted) ? &s_members_file : NULL;
+    ai.own_idx = own_idx;
+    (void)pc_mp_membership_resolve(&ai, view);
+}
+
 static void pcnetgame_host_admission_decide(PCNetPeerId peer, const PCNetGameIdentityMsg* in, const PCNetGameIdentityExtMsg* ext, int ext_valid, PCNetGameAdmission* a) {
     const int ext_guest = ext_valid && (ext->flags & PC_NETGAME_IDEXT_FLAG_GUEST) != 0;
     PCNetGameTownIdentity peer_town;
@@ -22343,6 +22372,8 @@ static void pcnetgame_host_admission_decide(PCNetPeerId peer, const PCNetGameIde
     PCNetGameIdentityClass id_class;
     int resident_idx = -1;
     int own_idx;
+    int equiv_ok;
+    PCMpAdmitView view;
 
     memset(a, 0, sizeof(*a));
     a->kind = PCNETGAME_ADM_REFUSE;
@@ -22377,18 +22408,48 @@ static void pcnetgame_host_admission_decide(PCNetPeerId peer, const PCNetGameIde
      * form, whose meaning ("no usable save record for this player") is the closest. The client treats every
      * REJECT identically (log + shutdown), so neither has a behavioural downside; only the log wording is
      * imprecise. The host-side log line carries the real reason. (M-E added reason 5, RESIDENT_CREDENTIAL.) */
+    /* M-H: pc_mp_membership_resolve is the AUTHORITY. The old classifier still runs as an equivalence check; ANY disagreement is logged and refused (never admitted). Documented
+     * additions that the old code did not have (they are refusals): guest aliasing (a resident matches AND a guest entry of this town has the same PID -> AMBIGUOUS) and STALE. */
+    own_idx = pcnetgame_host_own_resident_idx();
+    {
+        PersonalID_c home;
+        memset(&home, 0, sizeof(home));
+        if (ext_valid) {
+            memcpy(home.player_name, ext->home_player_name, PC_NETGAME_NAME_LEN);
+            memcpy(home.land_name, ext->home_land_name, PC_NETGAME_LAND_LEN);
+            home.player_id = ext->home_player_id;
+            home.land_id = ext->home_land_id;
+        }
+        pcnetgame_host_admission_resolve_view(in, ext_guest ? PC_MP_EXT_GUEST : (ext_valid ? PC_MP_EXT_RESIDENT : PC_MP_EXT_NONE), &home, own_idx, &view);
+    }
     id_class = pcnetgame_host_classify_identity(in, &resident_idx);
-    if (id_class == PCNETGAME_IDCLASS_AMBIGUOUS) {
+    equiv_ok = (view.kind == PC_MP_ADMIT_RESIDENT && id_class == PCNETGAME_IDCLASS_RESIDENT && view.res_index == resident_idx) ||
+               (view.kind == PC_MP_ADMIT_AMBIGUOUS && id_class == PCNETGAME_IDCLASS_AMBIGUOUS) ||
+               ((view.kind == PC_MP_ADMIT_NONE || view.kind == PC_MP_ADMIT_GUEST || view.kind == PC_MP_ADMIT_STALE) && id_class == PCNETGAME_IDCLASS_UNKNOWN);
+    if (!equiv_ok) {
+        printf("[NET][IDENTITY] host: peer %d ADMISSION EQUIV differs (membership resolve kind=%d resident index %d, residents matching %d; classify class=%d resident index %d) -- refusing\n",
+               (int)peer, view.kind, view.res_index, view.n_res_match, (int)id_class, resident_idx);
+        if (view.kind == PC_MP_ADMIT_AMBIGUOUS || id_class == PCNETGAME_IDCLASS_AMBIGUOUS) {
+            pcnetgame_host_admission_refuse_identity_text(a, "claimed identity matches more than one resident record (ambiguous)", 0);
+        } else {
+            pcnetgame_host_admission_refuse_identity_text(a, "claimed identity matches no resident record of this town", 1);
+        }
+        return;
+    }
+    if (view.kind == PC_MP_ADMIT_AMBIGUOUS) {
         pcnetgame_host_admission_refuse_identity_text(a, "claimed identity matches more than one resident record (ambiguous)", 0);
         return;
     }
-    if (id_class != PCNETGAME_IDCLASS_RESIDENT) {
+    if (view.kind != PC_MP_ADMIT_RESIDENT) {
+        if (view.kind == PC_MP_ADMIT_STALE) {
+            printf("[NET][IDENTITY] host: peer %d claim is STALE (a credential or handoff exists for this identity but no live resident record matches it)\n", (int)peer);
+        }
         if (!ext_guest) {
             /* Stage-1A rule (unchanged for a client without a guest claim): unknown identities are refused. */
             pcnetgame_host_admission_refuse_identity_text(a, "claimed identity matches no resident record of this town", 1);
             return;
         }
-        /* Guests (G1): UNKNOWN + a valid IDENTITY_EXT guest claim = a guest candidate. The HOST derives everything: the key is checked against
+        /* Guests (G1): no resident + a valid IDENTITY_EXT guest claim = a guest candidate. The HOST derives everything: the key is checked against
          * the claim, this town and every resident / house owner, the token against the guest table (pcnetgame_host_guest_check). */
         if (!pcnetgame_host_guest_check(peer, in, ext, &a->guest_key, &a->guest_slot, &a->guest_mode)) {
             a->refuse_style = PCNETGAME_ADM_R_HANDLED; /* refused (logged, peer torn down) */
@@ -22398,6 +22459,7 @@ static void pcnetgame_host_admission_decide(PCNetPeerId peer, const PCNetGameIde
         a->kind = PCNETGAME_ADM_GUEST;
         return;
     }
+    resident_idx = view.res_index;
     if (ext_guest) {
         /* A guest-flagged claim whose IDENTITY matches a resident of this town: the guest path can never claim a resident, and a resident
          * never sends a guest claim (a client sends IDENTITY_EXT only when it plays a foreigner): refused, not bound as either. */
@@ -22405,7 +22467,6 @@ static void pcnetgame_host_admission_decide(PCNetPeerId peer, const PCNetGameIde
         pcnetgame_host_admission_refuse_identity_text(a, "guest-flagged claim matches a resident of this town (a guest can never claim or become a resident)", 0);
         return;
     }
-    own_idx = pcnetgame_host_own_resident_idx();
     if (own_idx >= 0 && resident_idx == own_idx) {
         printf("[NET][IDENTITY] host: peer %d claims resident %d, which is the host's own active resident\n", (int)peer, resident_idx);
         pcnetgame_host_admission_refuse_identity_text(a, "claimed resident is the host's own resident", 0);
@@ -22450,47 +22511,6 @@ static void pcnetgame_host_admission_apply_refusal(PCNetPeerId peer, const PCNet
     }
 }
 
-/* Logged cross-check against the pure membership layer (pc_mp_membership_lookup): a line ONLY when it disagrees with the decision about the RESIDENT dimension of the IDENTITY
- * claim; the decision always stands. */
-static void pcnetgame_host_admission_crosscheck(PCNetPeerId peer, const PCNetGameIdentityMsg* in, const PCNetGameAdmission* a) {
-    uint8_t res_pid[PLAYER_NUM][20];
-    uint8_t res_exists[PLAYER_NUM];
-    uint8_t claim[20];
-    PCMpTownKey tk;
-    PCMpMembership mm;
-    int i, kind;
-    if (a->kind == PCNETGAME_ADM_REFUSE) {
-        return;
-    }
-    memset(res_pid, 0, sizeof(res_pid));
-    memset(res_exists, 0, sizeof(res_exists));
-    for (i = 0; i < PLAYER_NUM; i++) {
-        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
-        if (mPr_NullCheckPersonalID(p) == FALSE) {
-            memcpy(res_pid[i], p->player_name, PC_NETGAME_NAME_LEN);
-            memcpy(res_pid[i] + 8, p->land_name, PC_NETGAME_LAND_LEN);
-            res_pid[i][16] = (uint8_t)(p->player_id >> 8);
-            res_pid[i][17] = (uint8_t)p->player_id;
-            res_pid[i][18] = (uint8_t)(p->land_id >> 8);
-            res_pid[i][19] = (uint8_t)p->land_id;
-            res_exists[i] = Save_Get(private_data)[i].exists == TRUE ? 1 : 0;
-        }
-    }
-    memcpy(claim, in->player_name, PC_NETGAME_NAME_LEN);
-    memcpy(claim + 8, in->land_name, PC_NETGAME_LAND_LEN);
-    claim[16] = (uint8_t)(in->player_id >> 8);
-    claim[17] = (uint8_t)in->player_id;
-    claim[18] = (uint8_t)(in->land_id >> 8);
-    claim[19] = (uint8_t)in->land_id;
-    memcpy(tk.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN);
-    tk.land_id = s_host_town.land_id;
-    tk.terrain_hash = s_host_town.terrain_hash;
-    kind = pc_mp_membership_lookup(claim, &tk, (const uint8_t(*)[20])res_pid, res_exists, NULL, &mm);
-    if (a->kind == PCNETGAME_ADM_RESIDENT ? (kind != PC_MP_MEMBER_RESIDENT || mm.res_index != a->resident_idx) : (kind == PC_MP_MEMBER_RESIDENT)) {
-        printf("[NET][IDENTITY] host: peer %d admission CROSS-CHECK differs: the decision is %s%d, pc_mp_membership_lookup says kind=%d (resident index %d); the decision stands\n", (int)peer,
-               a->kind == PCNETGAME_ADM_RESIDENT ? "RESIDENT " : "GUEST ", a->kind == PCNETGAME_ADM_RESIDENT ? a->resident_idx : a->guest_slot, kind, mm.res_index);
-    }
-}
 /* ===== ADMISSION DECIDE END ===== */
 
 /* v2 host side: validate a parked IDENTITY against the host's own town, then either reject+drop or
@@ -22527,7 +22547,6 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         pcnetgame_host_admission_apply_refusal(peer, &adm);
         return;
     }
-    pcnetgame_host_admission_crosscheck(peer, &in, &adm);
     if (adm.kind == PCNETGAME_ADM_GUEST) {
         is_guest = 1;
         guest_key = adm.guest_key;
