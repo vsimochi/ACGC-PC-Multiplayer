@@ -123,8 +123,8 @@ def main():
     ck("C the host refuses MUSEUM_DONATE / MAIL_SEND / MAIL_TAKE for guest slots with NO_DONOR_SLOT (existing, unchanged): the guest reasons are in the source",
        "has no museum donor slot" in ng_new and "a guest / extra player has no house: sending mail is refused" in ng_new
        and "has no house and no mailbox: taking mail is refused" in ng_new)
-    ck("C no wire / protocol change by G5: message ids 1..65 (59..61 = furniture sync, 62..65 = town transfer), pc_net_game.h / pc_net.c / pc_net.h unchanged",
-       sorted(dict(wire_baseline.c_message_ids(ng_new)).values()) == list(range(1, 66)) and numstat("pc/include/pc_net_game.h") == (0, 0)
+    ck("C no wire / protocol change by G5: message ids 1..66 (66 = M-F promotion handoff) (59..61 = furniture sync, 62..65 = town transfer), pc_net_game.h / pc_net.c / pc_net.h unchanged",
+       sorted(dict(wire_baseline.c_message_ids(ng_new)).values()) == list(range(1, 67)) and numstat("pc/include/pc_net_game.h") == (0, 0)
        and numstat("pc/src/pc_net.c") == (0, 0) and numstat("pc/include/pc_net.h") == (0, 0))
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)

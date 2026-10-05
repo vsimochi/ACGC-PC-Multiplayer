@@ -1,6 +1,6 @@
 # Multiplayer phase 2 design: resident credentials, town cache, town transfer, promotion, admission
 
-Status: **design**. Milestones M-A .. M-F are implemented in order. Implementers update this document with an "Implementation status" section as each milestone lands.
+Status: **design**. Milestones M-A .. M-F are implemented in order (M-F in its reduced scope). Implementers update this document with an "Implementation status" section as each milestone lands.
 
 Anchors refer to `ACGC-PC-Multiplayer` at HEAD 0c9bc72 (branch `multiplayer`).
 
@@ -230,7 +230,7 @@ After that:
 | **M-C** Play Online wiring | `pc_relaunch.c`, `pc_main.c`, `pc_session.c` (membership resolve, resident by PID), `pc_play_online_menu.c` | `test_servers.py` extension; real process; screenshots manual / computer-use | depends on M-B |
 | **M-D** admission refactor | `pc_net_game.c` (`admission_decide`, `allow_new_guests`), `pc_settings.c` | behaviour-identical: all guest/identity scripted suites must pass unchanged; re-pin audits | — |
 | **M-E** resident credentials | `pc_mp_members.c/.h`, `pc_net_game.c` (EXT/TOKEN flags, reason 5, credential check, client resident token), `pc_dedicated.c` (commands), `pc_settings.c`, CMake | native storage unit; scripted per mode against a real host; one real resident client in tofu | depends on M-D |
-| **M-F** promotion | — | — | too large for one autonomous run (see below) |
+| **M-F** promotion | `pc_m_card.c` (`pc_mp_promote_create`), `pc_net_game.c` (`promote`, handoff 66 / reason 6), `pc_dedicated.c`, `wire_baseline.py` | scripted FakeClient against a real host | reduced scope implemented, see Implementation status |
 
 **M-F, safe reduced scope:** host `promote` + handoff + message 66/reason 6, with a scripted FakeClient test checking the GCI holds the new resident, the guest gets the handoff, and `records.dat` rev is 1. The client auto-adopt/relaunch, the first-job and house behaviour, and the visual check follow as a separate manual-heavy run.
 
@@ -400,3 +400,28 @@ an in-game screenshot, the "Retry" round trip, the relaunch-failure message.
 - Play offline keeps the client connecting in the background; no true "offline only" mode. A new character that never reaches READY writes no membership.
 - Guest-to-resident promotion (M-F) is not started; the character list does not show the membership role or the town.
 - The title attract demo restarts the scene after ~60 s idle (vanilla); a very slow text entry may meet the wipe.
+
+### M-F (guest -> resident promotion, reduced scope): implemented (uncommitted, branch `multiplayer`)
+
+User documentation: `docs/multiplayer-guest-roadmap.md`, section "Guest -> resident promotion". Scope as the milestone table says: host `promote` + handoff + message 66 / reason 6, with the scripted test; the client
+adopt is only the cheap part (`membership.ini` + `token.dat` rewrite for a STORE character, the REJECT text), the relaunch / re-fetch stays the manual Play Online path.
+
+**Where the design disagreed with the code, and what was chosen.**
+
+1. **The handoff entry carries the GUEST token, not the resident token.** `members.dat` rejects two entries with the same token, and the handoff has to prove the claimant is the promoted guest: its `token` is the
+   guest's own token, `aux_pid` the guest's home PID, `pid` the new resident PID; the resident credential is the separate RESIDENT_TOKEN entry of the same PID (which is also what the message hands over).
+2. **The guest check must run before the guest table lookup.** The guest entry is removed LAST, so after a completed promotion the key is unknown to `guests.dat`; the handoff is therefore matched on the members
+   table (town, aux_pid = claimed key, presented guest token) inside `pcnetgame_host_guest_check` right after the key validity / conflict checks. It only reads `members.dat` when that file exists (a host that never
+   promoted anybody, with `resident_tokens=off`, never touches it).
+3. **House / slot come from the vanilla routines, with a safety check the vanilla function lacks.** `mHS_set_use` swaps `house_arrangement` and assumes it is a permutation; `pc_mp_promote_create` refuses to touch an
+   arrangement that is not (the swap would corrupt it). `mHm_InitHomeInfo` only copies the ownerID, so a null-owner house (vanilla delete = `mHm_ClearHomeInfo`) already is a valid empty house. Vanilla's house selection
+   (ac_intro_demo) also sets `loan = mPlayer_DEBT0`: the promoted resident gets that loan (a house without its debt would be a free house); the catalog bits of the intro are not set.
+4. **Designs are copied from the guest, not rebuilt.** `mNW_InitOneMyOriginal` reads ARAM resources, which a dedicated host may not have; the guest record already holds valid designs.
+5. **A guest's first record upload must be a fresh character** (the host refuses a first MIGRATE with pockets): a guest with goods only exists after play; the test seeds the stored record directly.
+6. **Nook intro / first job:** both are per-slot saved event flags (`mEv_SAVED_FIRSTJOB_PLR0 + n`, `FIRSTINTRO`). A free slot normally has them off; `mEv_ClearPersonalEventFlag(slot)` (the call vanilla's delete makes) is run so
+   the slot is certainly in the veteran state: no intro starts for the promoted resident. Verified by source, not by a real client.
+7. Under `resident_tokens=off` nothing confirms a resident login, so the handoff entry stays (harmless: it keeps handing the old guest key over).
+
+**Tests** (`pc/tools/net_spike/`): `test_promotion_protocol.py` (see the roadmap section) and `wire_baseline.py` (`EXPECTED_MAX_MSG_ID` 66, the 48-byte struct + offset pins, reject reasons 1..6) with the id-range literals of the source audits
+re-pinned (`test_guest_g1/g3/g4/g5/g6_src`, `test_guest_src` (+ the reviewed `private_data` / `homes` / `s_guest_rec` function lists: promote + the handoff check), `test_identity_validation_src` (reason 6),
+`test_house_sync_src`, `test_mail_src`, `test_mail2_src`, `test_ts_src`, `test_txn_x3_src`, `test_town_cache_unit`).

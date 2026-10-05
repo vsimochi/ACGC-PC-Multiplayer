@@ -876,10 +876,41 @@ has no credential, refused under `required` and once a credential exists (it see
 
 **Limitations.** Not internet-grade: the token is a bearer token over the same unencrypted UDP transport as the guest tokens (a captured packet can be replayed), and trust on first use means whoever claims a
 resident first wins it; `resident-arm` / `tofu` do not prove who the claimant is. The credential protects the slot, not the data: the town save is still served unsanitized when `town_serve` is on. Nothing here
-changes the town save; promotion (M-F) and Play Online passing a resident membership (M-C) are not implemented; the real client half was verified by source audit and a scripted host test, not yet by a real
+changes the town save; Play Online passing a resident membership is M-C (done); guest -> resident promotion is M-F (see "Guest -> resident promotion"); the real client half was verified by source audit and a scripted host test, not yet by a real
 resident client run.
 Tests: `pc/tools/net_spike/test_members_unit.py` (native storage unit), `test_resident_credentials_protocol.py` (scripted clients against real dedicated hosts: off / tofu / restart / required + arm /
 corrupt UNTRUSTED / allow_new_guests).
+
+### Guest -> resident promotion (phase 2, M-F, reduced scope: host side + wire handoff)
+
+A dedicated host operator can turn a GUEST into a RESIDENT of the host town: `promote <guest slot|name> <resident slot 0-3|auto> <house 0-3|auto> confirm`. Without `confirm` nothing changes and
+the command says what it would do. It is refused (nothing changed) unless: the process is a host with a ready world; `guests.dat` and `members.dat` are trusted; the selector names ONE guest of
+this town; the guest is OFFLINE and has synced a record; there is a free resident slot (`mPr_CheckPrivate != TRUE`) and a free house (null ownerID) (a full town of 4 residents cannot promote);
+no resident already has the guest's name; `members.dat` has room for 2 entries. `guests.dat`, `members.dat` and `records.dat` are backed up first (`<file>.bak-<timestamp>`).
+
+What is created (pc_m_card.c `pc_mp_promote_create`, game thread, the vanilla routines): `mPr_ClearPrivateInfo` + `mPr_InitPrivateInfo` into the free slot (this town's land, a new unique 0xF0xx player
+id, vanilla defaults), then the guest's name, gender, the shirt it wears, pockets / item conditions / wallet, bank account and its Able Sisters designs are copied over, and the face when no other
+resident wears it (otherwise the vanilla unique face stays; logged). `inventory.loan` = the house price (what vanilla's house selection writes). `mHS_set_use(slot, house)` assigns the house
+(a vanilla delete clears a house, so a null-owner house is a default house) and `mEv_ClearPersonalEventFlag(slot)` gives the slot the veteran event state: the Nook intro and first-job are NOT started.
+Then, in this order: the records lineage of the new resident is seeded at rev 1 (the host pushes its record, it never MIGRATEs), `members.dat` gets a resident credential for the new PID (always minted,
+whatever `resident_tokens` says: with `off` the entry exists but is unused) plus a PROMOTION_HANDOFF entry (aux = the guest's home PID, token = the guest's own GUEST token), the town is saved
+(`records.dat` follows from the save hook), and LAST the guest entry is removed from `guests.dat`. A failure before the save is durable rolls the game state, the lineage and `members.dat` back.
+Crash safety: a handoff whose resident PID is not in the saved town is ignored (log `INVALID`), so the guest entry keeps working; a handoff with the resident present is valid even if the guest entry
+removal did not happen.
+
+Wire (v8 extended in place, no version bump): `RESIDENT_HANDOFF` id 66 (host -> client, 48 B: type, flags, res_slot, rsv, town PID[20], token[16], rsv[8]) is sent to the promoted guest when it connects
+with its GUEST claim and its guest token, followed by `REJECT` reason 6 `PROMOTED` (8-byte form). An old client drops 66 and shows "unknown reason 6: update the game"; a new client shows "This character was
+promoted to a resident of this town: restart to join as a resident." Client (cheap part): a STORE character gets `characters/<uuid>/towns/<townkey>/token.dat` replaced by the single resident token and
+`membership.ini` set to `role=resident` + the new town PID; the next Play Online connect re-fetches the town (it now contains the resident) and binds by PID (M-C). A legacy guest profile is not rewritten
+(message only). The handoff entry is deleted at the first confirmed resident login with the matching token (`members.dat` `confirmed`; under `resident_tokens=off` there is no confirm step, the handoff stays
+and the guest keeps getting it until the entry is reset).
+
+**Honest limits.** Villager memories / letters / friendship keyed by the guest PID are lost (the resident is a new PID). The Nook first-job / intro is not run: the promoted resident starts like a veteran
+(first-job / first-intro / gateway flags of the slot cleared by vanilla's own `mEv_ClearPersonalEventFlag`); the catalog bits the intro would set (shirt, cassette, carpet, wall) are not set and the
+first-job quest is not given. The house is whatever default house the free slot / house holds; contents left behind by a previous owner who was removed outside the game are kept. The client's local town
+copy must be re-fetched (town transfer, `--town-fetch`) to contain the resident; there is no automatic relaunch yet. A full town cannot promote. Not verified: a REAL game client playing the promoted
+resident, the in-game look of the new house / resident, and the first login of the promoted character after the re-fetch (only the scripted host + FakeClient flow is tested).
+Tests: `pc/tools/net_spike/test_promotion_protocol.py` (scripted clients against real dedicated hosts on `bin_fixture4_promo`, a copy with resident slot 3 and house 3 cleared).
 
 ## Known limitations
 

@@ -175,6 +175,7 @@ def main():
                                                             "PC_NETGAME_REJECT_SERVER_FULL",
                                                             "PC_NETGAME_REJECT_LAND_MISMATCH", "PC_NETGAME_REJECT_NO_SAVE",
                                                             "PC_NETGAME_REJECT_RESIDENT_CREDENTIAL",  # M-E: the ONE deliberate new reason (8-byte form)
+                                                            "PC_NETGAME_REJECT_PROMOTED",  # M-F: reason 6 (8-byte form), sent only to a promoted guest after its RESIDENT_HANDOFF
                                                             "PC_NETGAME_REJECT_LINGER_MS"})
 
     # S4

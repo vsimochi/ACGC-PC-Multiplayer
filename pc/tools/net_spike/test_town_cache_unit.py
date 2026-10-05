@@ -105,7 +105,7 @@ def source_audit():
         if not c:
             check("S " + d, False)
     check("S wire_baseline: every wire audit is green with the 62..65 additions (%d checks)" % len(wb), bool(wb) and all(c for _d, c in wb))
-    check("S wire_baseline.EXPECTED_MAX_MSG_ID is 65", wire_baseline.EXPECTED_MAX_MSG_ID == 65)
+    check("S wire_baseline.EXPECTED_MAX_MSG_ID is 66", wire_baseline.EXPECTED_MAX_MSG_ID == 66)
 
 
 def run_exe(dst, args, timeout=30):

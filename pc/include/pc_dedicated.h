@@ -103,6 +103,11 @@ typedef struct PCNetGameDedicatedResidentInfo {
 } PCNetGameDedicatedResidentInfo;
 int  pc_net_game_dedicated_resident_info(int slot, PCNetGameDedicatedResidentInfo* out); /* 1 iff the slot holds a resident (HOST only) */
 int  pc_net_game_dedicated_resident_admin(int op, const char* sel, int confirm, char* msg, size_t cap);
+/* M-F: `promote <guest> <slot|auto> <house|auto> confirm` (HOST only, main thread). Checks like guest-remove (world ready, guests.dat / members.dat trusted, ONE guest of this town, offline, a free
+ * resident slot + a free house, unique resident name, room in members.dat, the `confirm` word, backups of guests.dat / members.dat / records.dat), then: new resident + house, records lineage rev 1,
+ * members.dat (resident credential + PROMOTION_HANDOFF), the town save, and LAST the removal of the guests.dat entry. Returns 1 = done, 2 = nothing changed (no `confirm`: msg says what would
+ * happen), 0 = REFUSED (msg says why; nothing was changed). Never prints a token. */
+int  pc_net_game_dedicated_promote(const char* guest_sel, const char* slot_sel, const char* house_sel, int confirm, char* msg, size_t cap);
 /* M2: `members` -- residents + active guests of the host town through pc_mp_membership_list(). kind = PC_MP_MEMBER_* (1 resident, 2 guest, 3 ambiguous);
  * slot = resident index or guest table slot (is_guest_row says which). Returns the number of rows (0 unless HOST with a loaded guest store). */
 typedef struct PCNetGameDedicatedMemberInfo {

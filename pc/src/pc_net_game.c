@@ -500,6 +500,8 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_TOWN_INFO             = 63, /* Town transfer: host -> client, RELIABLE, 40 bytes: status (0 STREAM, 1 UP_TO_DATE, 2 UNAVAILABLE, 3 BUSY, 4 REFUSED, 5 BAD_REQUEST) + size / CRC32 / town. */
     PC_NETGAME_MSG_TOWN_CHUNK            = 64, /* Town transfer: host -> client, RELIABLE, 1012 bytes: one <= 1000 byte slice of the GCI snapshot at a u32 offset. */
     PC_NETGAME_MSG_TOWN_DONE             = 65, /* Town transfer: client -> host, RELIABLE, 12 bytes: the client's verdict (0 OK, 1 BAD_CRC, 2 BAD_GCI, 3 IO, 4 ABORT); the host then closes the connection. */
+    PC_NETGAME_MSG_RESIDENT_HANDOFF      = 66, /* Guest -> resident promotion (M-F, v8 unreleased: extended in place, NO version bump), host -> client, RELIABLE, 48 bytes: sent to a PROMOTED guest that connects
+                                             * with its GUEST claim + guest token, right before REJECT reason 6 PROMOTED. Carries the new resident's town PID and resident token. An old client drops it. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -508,6 +510,7 @@ typedef enum PCNetGameRejectReason {
     PC_NETGAME_REJECT_LAND_MISMATCH     = 3, /* v2: 24-byte PCNetGameRejectTownMsg (host town identity) */
     PC_NETGAME_REJECT_NO_SAVE           = 4, /* v2: 24-byte form; IDENTITY had has_save == 0 */
     PC_NETGAME_REJECT_RESIDENT_CREDENTIAL = 5, /* M-E (v8 extended in place): 8-byte form; the resident credential is missing or wrong (resident_tokens = tofu / required) */
+    PC_NETGAME_REJECT_PROMOTED = 6, /* M-F (v8 extended in place): 8-byte form; this guest was promoted to a resident of this town (a RESIDENT_HANDOFF precedes it) */
 } PCNetGameRejectReason;
 
 /* v2 layout. Byte offset 4 (protocol_version) and the 32-byte size are FROZEN across protocol
@@ -622,6 +625,20 @@ _Static_assert(sizeof(PCNetGameIdentityTokenMsg) == 20, "PCNetGameIdentityTokenM
 _Static_assert(offsetof(PCNetGameIdentityTokenMsg, token) == 4, "PCNetGameIdentityTokenMsg field offsets drifted");
 _Static_assert(sizeof(PCNetGameIdentityTokenMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameIdentityTokenMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* M-F: the promotion handoff (host -> the promoted guest, 48 B). town_pid = the new resident's PersonalID in the canonical BE form (name 8, land 8, player_id BE, land_id BE);
+ * token = the resident token minted for it (the same bytes as members.dat's RESIDENT_TOKEN entry); res_slot = its resident slot. Never sent to a client that did not claim the guest. */
+typedef struct PCNetGameResidentHandoffMsg {
+    uint8_t msg_type;      /* PC_NETGAME_MSG_RESIDENT_HANDOFF */
+    uint8_t flags;         /* 0 */
+    uint8_t res_slot;      /* 0..3 */
+    uint8_t rsv;
+    uint8_t town_pid[20];
+    uint8_t token[PC_NETGAME_GUEST_TOKEN_LEN];
+    uint8_t rsv2[8];
+} PCNetGameResidentHandoffMsg;
+_Static_assert(sizeof(PCNetGameResidentHandoffMsg) == 48, "PCNetGameResidentHandoffMsg wire size drifted");
+_Static_assert(offsetof(PCNetGameResidentHandoffMsg, town_pid) == 4 && offsetof(PCNetGameResidentHandoffMsg, token) == 24, "PCNetGameResidentHandoffMsg field offsets drifted");
 _Static_assert(PC_NETGAME_GUEST_MAX == PC_MP_GUEST_SLOTS && PC_NETGAME_GUEST_TOKEN_LEN == PC_MP_GUEST_TOKEN_SIZE,
                "the guest table size / token length no longer match the pc_mp_guests.h storage format");
 
@@ -12118,6 +12135,7 @@ static void pcnetgame_guest_store_load(void);   /* guests (G1): defined with the
 static int  pcnetgame_guest_store_write(const char* why);
 static void pcnetgame_members_store_load(void);  /* M-E: defined with the RESIDENT CREDENTIALS HOST block below */
 static int  pcnetgame_resident_policy(void);
+static int  pcnetgame_host_promotion_handoff(PCNetPeerId peer, const PersonalID_c* key, const PCNetGameIdentityExtMsg* ext); /* M-F: defined after the RESIDENT CREDENTIALS HOST block */
 static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer); /* M3: defined with the GUESTS HOST block */
 
 /* Slot lookup/(re)initialisation. Only called with an index that came from a validated binding. */
@@ -14358,6 +14376,10 @@ static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityM
         pcnetgame_host_refuse_identity(peer, why, 0);
         return 0;
     }
+    /* M-F: a guest that was PROMOTED to a resident presents its guest token: it gets the RESIDENT_HANDOFF and REJECT 6 instead of a guest admission (HANDLED, nothing else runs). */
+    if (pcnetgame_host_promotion_handoff(peer, key, ext)) {
+        return 0;
+    }
     /* Guests G1.1 order: validity + home land + KEY conflict (true impersonation of a resident identity) apply to EVERY mode; then the known-key lookup and
      * the token decision; the NAME rules (reserved observer name, a resident's name, another guest's name) only for NEW keys and for a mode-2 re-mint. */
     pcnetgame_guest_store_load();
@@ -14672,12 +14694,94 @@ static void pcnetgame_resident_mint_rollback(int idx) {
 static void pcnetgame_resident_confirm(int idx) {
     static PCMpMemberFile nf;
     const int ci = pcnetgame_resident_cred_find(idx);
-    if (ci < 0 || s_members_file.e[ci].confirmed) {
+    int i, handoffs = 0;
+    if (ci < 0) {
+        return;
+    }
+    for (i = 0; i < PC_MP_MEMBERS_SLOTS; i++) { /* M-F: the first confirmed resident login with the matching token ends the promotion handoff of this resident */
+        const PCMpMemberEntry* h = &s_members_file.e[i];
+        if (h->present && h->kind == PC_MP_MEMBER_KIND_PROMOTION_HANDOFF && memcmp(h->pid, s_members_file.e[ci].pid, PC_MP_MEMBERS_PID_SIZE) == 0 &&
+            h->land_id == s_host_town.land_id && memcmp(h->land_name, s_host_town.land_name, 8) == 0 && h->terrain_hash == s_host_town.terrain_hash) {
+            handoffs++;
+        }
+    }
+    if (s_members_file.e[ci].confirmed && handoffs == 0) {
         return;
     }
     nf = s_members_file;
     nf.e[ci].confirmed = 1;
-    (void)pcnetgame_members_commit(&nf, "resident credential confirmed");
+    for (i = 0; i < PC_MP_MEMBERS_SLOTS && handoffs > 0; i++) {
+        const PCMpMemberEntry* h = &nf.e[i];
+        if (h->present && h->kind == PC_MP_MEMBER_KIND_PROMOTION_HANDOFF && memcmp(h->pid, nf.e[ci].pid, PC_MP_MEMBERS_PID_SIZE) == 0 &&
+            h->land_id == s_host_town.land_id && memcmp(h->land_name, s_host_town.land_name, 8) == 0 && h->terrain_hash == s_host_town.terrain_hash) {
+            memset(&nf.e[i], 0, sizeof(nf.e[i]));
+        }
+    }
+    (void)pcnetgame_members_commit(&nf, handoffs > 0 ? "resident credential confirmed, promotion handoff removed" : "resident credential confirmed");
+}
+
+/* M-F: the PROMOTION_HANDOFF check of a GUEST claim (called from pcnetgame_host_guest_check after the key validity / conflict checks). The entry matches when its town is this
+ * town, its aux_pid is the claimed guest key and its token equals the presented GUEST token (the guest's own secret: it proves the claimant is the promoted guest). It is VALID only
+ * while the new resident is really in the host save (private_data holds its PersonalID) and its RESIDENT_TOKEN entry exists: a handoff whose resident is missing (crash between the members.dat
+ * write and the GCI save) is ignored, so the guest entry keeps working. A valid handoff: RESIDENT_HANDOFF (66) then REJECT PROMOTED (6), the peer is closed through the normal reject path.
+ * members.dat is only read when the file exists (a host that never promoted anybody, with resident_tokens off, never touches it). Returns 1 = handled. */
+static int pcnetgame_host_promotion_handoff(PCNetPeerId peer, const PersonalID_c* key, const PCNetGameIdentityExtMsg* ext) {
+    uint8_t gpid[PC_MP_MEMBERS_PID_SIZE];
+    PCNetGameResidentHandoffMsg m;
+    int i, hi = -1, ci, idx = -1, ok;
+    if (!ext->token_present) {
+        return 0;
+    }
+    if (!s_members_loaded) {
+        FILE* f = fopen(PC_MP_MEMBERS_PATH, "rb");
+        if (f == NULL) {
+            return 0;
+        }
+        fclose(f);
+        pcnetgame_members_store_load();
+    }
+    if (s_members_untrusted) {
+        return 0;
+    }
+    pcnetgame_resident_pid_be(key, gpid);
+    for (i = 0; i < PC_MP_MEMBERS_SLOTS; i++) {
+        const PCMpMemberEntry* e = &s_members_file.e[i];
+        if (e->present && e->kind == PC_MP_MEMBER_KIND_PROMOTION_HANDOFF && e->land_id == s_host_town.land_id && memcmp(e->land_name, s_host_town.land_name, 8) == 0 &&
+            e->terrain_hash == s_host_town.terrain_hash && memcmp(e->aux_pid, gpid, PC_MP_MEMBERS_PID_SIZE) == 0 &&
+            memcmp(e->token, ext->token, PC_MP_MEMBERS_TOKEN_SIZE) == 0) {
+            hi = i;
+            break;
+        }
+    }
+    if (hi < 0) {
+        return 0;
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        uint8_t rp[PC_MP_MEMBERS_PID_SIZE];
+        if (mPr_NullCheckPersonalID(&Save_Get(private_data)[i].player_ID) != FALSE) {
+            continue;
+        }
+        pcnetgame_resident_pid_be(&Save_Get(private_data)[i].player_ID, rp);
+        if (memcmp(rp, s_members_file.e[hi].pid, PC_MP_MEMBERS_PID_SIZE) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    ci = pc_mp_members_find(&s_members_file, PC_MP_MEMBER_KIND_RESIDENT_TOKEN, s_host_town.land_name, s_host_town.land_id, s_host_town.terrain_hash, s_members_file.e[hi].pid);
+    if (idx < 0 || ci < 0) {
+        printf("[NET][PROMOTE] host: peer %d: a promotion handoff exists for this guest but is INVALID (%s): ignored, the guest entry stays in force\n", (int)peer,
+               idx < 0 ? "the new resident is not in the host save" : "its resident credential entry is missing");
+        return 0;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_RESIDENT_HANDOFF;
+    m.res_slot = (uint8_t)idx;
+    memcpy(m.town_pid, s_members_file.e[ci].pid, sizeof(m.town_pid));
+    memcpy(m.token, s_members_file.e[ci].token, sizeof(m.token));
+    ok = pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+    printf("[NET][PROMOTE] host: peer %d: the guest was PROMOTED to resident %d: RESIDENT_HANDOFF %s, then REJECT PROMOTED\n", (int)peer, idx, ok ? "sent" : "NOT sent (queue)");
+    pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject(peer, PC_NETGAME_REJECT_PROMOTED));
+    return 1;
 }
 /* ===== RESIDENT CREDENTIALS HOST END ===== */
 
@@ -23624,6 +23728,67 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
     pcnetgame_rc_log_guest_success((unsigned)m.guest_slot);
 }
 
+/* M-F: RESIDENT_HANDOFF (host -> the promoted guest, before REJECT 6 PROMOTED). Only honoured after OUR guest claim, from the host we claimed, and only when the new resident's name /
+ * land / player id are consistent with this guest (name == our guest name, land == the host town). A STORE character: characters/<uuid>/towns/<townkey>/token.dat is REPLACED by the
+ * single resident token entry and membership.ini becomes role=resident (town_pid = the new resident PersonalID), so the next Play Online connect re-fetches the town (it now contains the
+ * resident) and binds by PID (M-C). A legacy guest profile (no character) is NOT rewritten: only the message is shown. Nothing is sent. */
+static void pcnetgame_handle_client_resident_handoff(const uint8_t* data, uint16_t size) {
+    PCNetGameResidentHandoffMsg m;
+    PCMpGtkFile f;
+    PCMpGtkEntry e;
+    char key[PC_CHARACTER_TOWNKEY_LEN + 1], tp[420];
+    uint16_t land_id;
+    int k, allz = 1;
+    if (size != sizeof(m)) {
+        return;
+    }
+    memcpy(&m, data, sizeof(m));
+    if (!s_client_guest_claim_sent) {
+        printf("[NET][PROMOTE] client: RESIDENT_HANDOFF ignored (this client did not send a guest claim)\n");
+        return;
+    }
+    land_id = (uint16_t)(((unsigned)m.town_pid[18] << 8) | m.town_pid[19]);
+    for (k = 0; k < (int)sizeof(m.token); k++) {
+        if (m.token[k] != 0) {
+            allz = 0;
+        }
+    }
+    if (m.flags != 0 || m.res_slot >= PLAYER_NUM || allz || memcmp(m.town_pid, s_client_ext_sent.home_player_name, PC_NETGAME_NAME_LEN) != 0 ||
+        memcmp(m.town_pid + 8, s_client_claimed_town.land_name, PC_NETGAME_LAND_LEN) != 0 || land_id != s_client_claimed_town.land_id) {
+        printf("[NET][PROMOTE] client: RESIDENT_HANDOFF ignored (not consistent with this guest / the claimed town)\n");
+        return;
+    }
+    printf("[NET][PROMOTE] client: the host PROMOTED this guest to resident slot %u of its town\n", (unsigned)m.res_slot);
+    if (pc_session()->storage != PC_CHARACTER_STORAGE_STORE) {
+        printf("[NET][PROMOTE] client: legacy guest profile: the token / membership files are NOT rewritten (use a character from the character store, or a resident client with the new PersonalID + token)\n");
+        return;
+    }
+    pc_character_town_key_format(s_client_claimed_town.land_name, s_client_claimed_town.land_id, s_client_claimed_town.terrain_hash, key);
+    if (!pc_character_token_path(NULL, pc_session()->character.uuid, key, tp, sizeof(tp))) {
+        printf("[NET][PROMOTE] client: could not resolve the token path of character %s\n", pc_session()->character.uuid);
+        return;
+    }
+    memset(&f, 0, sizeof(f));
+    memset(&e, 0, sizeof(e));
+    e.present = 1;
+    memcpy(e.host_land_name, s_client_claimed_town.land_name, PC_NETGAME_LAND_LEN);
+    e.host_land_id = s_client_claimed_town.land_id;
+    e.host_terrain_hash = s_client_claimed_town.terrain_hash;
+    memcpy(e.home_pid, m.town_pid, sizeof(e.home_pid));
+    memcpy(e.token, m.token, PC_NETGAME_GUEST_TOKEN_LEN);
+    (void)pc_mp_gtoken_put(&f, &e);
+    if (pc_mp_gtoken_save(tp, &f) != PC_MP_GST_OK) {
+        printf("[NET][PROMOTE] client: *** could NOT save the resident token to %s: membership.ini was NOT changed; ask the host operator for resident-reset ***\n", tp);
+        return;
+    }
+    s_client_gtk_loaded = 0; /* the token file changed under the cache */
+    if (pc_character_membership_write(NULL, pc_session()->character.uuid, key, "resident", m.town_pid, "")) {
+        printf("[NET][PROMOTE] client: character %s is now a RESIDENT of town %s (token.dat + membership.ini written): restart / Play Online to join as the resident\n", pc_session()->character.uuid, key);
+    } else {
+        printf("[NET][PROMOTE] client: the resident token was saved to %s but membership.ini could NOT be written\n", tp);
+    }
+}
+
 /* G6.1: the REJECT reason -> one readable sentence (the numeric reason stays in the log line printed by the caller). `host_town` is non-NULL for the
  * 24-byte forms (LAND_MISMATCH / NO_SAVE). The code cannot tell the refusals that share a reason apart (the wire is frozen), so the text lists them. */
 static void pcnetgame_reject_text(unsigned reason, unsigned host_protocol, const PCNetGameTownIdentity* host_town, char* out, size_t cap) {
@@ -23655,6 +23820,9 @@ static void pcnetgame_reject_text(unsigned reason, unsigned host_protocol, const
             snprintf(out, cap, "The host refused your resident: resident credential missing or wrong: ask the operator for resident-reset/arm.%s",
                      s_client_ext_sent.token_present ? " This client presented a token: the host may have reset its credentials (delete the stored resident token)." : "");
             break;
+        case PC_NETGAME_REJECT_PROMOTED:
+            snprintf(out, cap, "This character was promoted to a resident of this town: restart to join as a resident.");
+            break;
         case PC_NETGAME_REJECT_NO_SAVE:
             snprintf(out, cap, "The host (town %s) has no resident matching your character. Play one of the host's residents, or join as a guest (Join as Guest / --guest).", a);
             break;
@@ -23666,6 +23834,10 @@ static void pcnetgame_reject_text(unsigned reason, unsigned host_protocol, const
 /* ===== GUESTS CLIENT END ===== */
 
 static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
+    if (size >= 1 && data[0] == (uint8_t)PC_NETGAME_MSG_RESIDENT_HANDOFF) {
+        pcnetgame_handle_client_resident_handoff(data, size); /* M-F: inert unless this client sent a guest claim */
+        return;
+    }
     if (size >= 1 && data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_TOKEN) {
         pcnetgame_handle_client_identity_token(data, size); /* guests (G1): inert unless this client sent a guest claim */
         return;
@@ -29887,6 +30059,250 @@ int pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char
     return 1;
 }
 /* ===== GUESTS G6.2 END ===== */
+
+/* ===== M-F: dedicated console `promote <guest> <slot|auto> <house|auto> confirm` (guest -> resident). Main thread only, HOST only. =====
+ * Checks in the order of guest-remove: world ready, guests.dat and members.dat trusted, the selector names ONE guest of this town, the guest is OFFLINE (and has synced a record), a free
+ * resident slot (mPr_CheckPrivate != TRUE) and a free house (null ownerID), the name is unique among the residents, room for 2 members.dat entries, the `confirm` word, the backups
+ * (guests.dat, members.dat, records.dat). Then, in this order: build the resident (pc_m_card.c pc_mp_promote_create) -> seed the records lineage (rev 1) -> members.dat (resident
+ * token + PROMOTION_HANDOFF) -> pc_save_write_authoritative (the GCI; records.dat follows from the save hook) -> remove the guests.dat entry LAST. A failure before the GCI is durable
+ * rolls the game state, the lineage and members.dat back. Crash safety: see pcnetgame_host_promotion_handoff (a handoff whose resident is not in the GCI is ignored). */
+extern int  pc_mp_promote_create(const void* guest_rec, int slot, int house, char* err, size_t cap);
+extern void pc_mp_promote_rollback(void);
+extern void pc_mp_promote_commit(void);
+extern int  pc_save_write_authoritative(void);
+
+static int pcnetgame_promote_file_exists(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+/* sel: "auto" or one digit 0..3. Returns -2 = auto, -1 = invalid, else the index. */
+static int pcnetgame_promote_parse_index(const char* sel) {
+    if (sel != NULL && pcnetgame_dedicated_ieq(sel, "auto")) {
+        return -2;
+    }
+    if (sel != NULL && sel[0] >= '0' && sel[0] <= '3' && sel[1] == '\0') {
+        return sel[0] - '0';
+    }
+    return -1;
+}
+
+int pc_net_game_dedicated_promote(const char* gsel, const char* ssel, const char* hsel, int confirm, char* msg, size_t cap) {
+    static PCMpMemberFile nf, old_members;
+    char bak_g[340], bak_m[340], bak_r[340];
+    char who[PC_NETGAME_NAME_LEN + 1];
+    char err[200];
+    uint8_t rtok[PC_MP_MEMBERS_TOKEN_SIZE], gpid[PC_MP_MEMBERS_PID_SIZE], npid[PC_MP_MEMBERS_PID_SIZE];
+    int g, peer, s, h, si, hi, i, a, b;
+    PCNetGameRecSlot old_rs;
+    PCNetGameGuest old_g;
+    Private_c old_rec;
+    PCNetGameRecSlot old_grs;
+    if (msg == NULL || cap < 8) {
+        return 0;
+    }
+    msg[0] = '\0';
+#define PROMOTE_REFUSE(...) do { snprintf(msg, cap, __VA_ARGS__); return 0; } while (0)
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        PROMOTE_REFUSE("refused: this process is not a host with a ready world");
+    }
+    pcnetgame_guest_store_load();
+    if (s_guest_untrusted) {
+        PROMOTE_REFUSE("refused: guests.dat is UNTRUSTED (existed but unreadable); fix the file first (see the startup log), nothing can be changed safely");
+    }
+    pcnetgame_members_store_load();
+    if (s_members_untrusted) {
+        PROMOTE_REFUSE("refused: members.dat is UNTRUSTED (existed but unreadable); fix the file first (see the startup log), nothing can be changed safely");
+    }
+    g = pcnetgame_dedicated_guest_resolve(gsel, msg, cap);
+    if (g < 0) {
+        char tmp[240];
+        snprintf(tmp, sizeof(tmp), "refused: %s", msg);
+        snprintf(msg, cap, "%s", tmp);
+        return 0;
+    }
+    pcnetgame_dedicated_ascii_name(s_guest[g].key.player_name, who);
+    if (!pcnetgame_town_equal(&s_guest[g].town, &s_host_town)) {
+        PROMOTE_REFUSE("refused: guest slot %d (\"%s\") belongs to another host town (inactive here)", g, who);
+    }
+    peer = pcnetgame_host_peer_bound_to_guest(g, (PCNetPeerId)-1);
+    if (peer >= 0) {
+        PROMOTE_REFUSE("refused: guest slot %d (\"%s\") is connected on peer %d right now; wait until it has left", g, who, peer);
+    }
+    if (!s_rec_slot[PLAYER_NUM + g].init || s_rec_slot[PLAYER_NUM + g].rev == 0u) {
+        PROMOTE_REFUSE("refused: guest slot %d (\"%s\") has never synced its character record (nothing to promote yet)", g, who);
+    }
+    pcnetgame_rec_store_resolve(); /* lineage of the residents derived (idempotent): the new resident's lineage is seeded over it */
+    si = pcnetgame_promote_parse_index(ssel);
+    hi = pcnetgame_promote_parse_index(hsel);
+    if (si == -1 || hi == -1) {
+        PROMOTE_REFUSE("refused: <slot> and <house> must each be 0..3 or `auto`");
+    }
+    s = si;
+    if (si == -2) {
+        s = -1;
+        for (i = 0; i < PLAYER_NUM; i++) {
+            if (mPr_CheckPrivate(&Save_Get(private_data)[i]) != TRUE) {
+                s = i;
+                break;
+            }
+        }
+        if (s < 0) {
+            PROMOTE_REFUSE("refused: the town is FULL (all %d resident slots are used): nothing to promote into", PLAYER_NUM);
+        }
+    } else if (mPr_CheckPrivate(&Save_Get(private_data)[s]) == TRUE) {
+        PROMOTE_REFUSE("refused: resident slot %d is not free (see `residents`)", s);
+    }
+    h = hi;
+    if (hi == -2) {
+        h = -1;
+        if (mPr_NullCheckPersonalID(&Save_Get(homes[mHS_get_arrange_idx(s)]).ownerID) == TRUE) {
+            h = mHS_get_arrange_idx(s);
+        }
+        for (i = 0; i < mHS_HOUSE_NUM && h < 0; i++) {
+            if (mPr_NullCheckPersonalID(&Save_Get(homes[i]).ownerID) == TRUE) {
+                h = i;
+            }
+        }
+        if (h < 0) {
+            PROMOTE_REFUSE("refused: no free house (every house has an owner)");
+        }
+    } else if (mPr_NullCheckPersonalID(&Save_Get(homes[h]).ownerID) != TRUE) {
+        PROMOTE_REFUSE("refused: house %d already has an owner", h);
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        if (mPr_NullCheckPersonalID(p) == FALSE && memcmp(p->player_name, s_guest[g].key.player_name, PC_NETGAME_NAME_LEN) == 0) {
+            PROMOTE_REFUSE("refused: a resident (slot %d) already has the name \"%s\" (a promoted guest needs a unique resident name)", i, who);
+        }
+    }
+    nf = s_members_file;
+    a = pc_mp_members_free_slot(&nf);
+    if (a >= 0) {
+        nf.e[a].present = 1;
+        b = pc_mp_members_free_slot(&nf);
+        nf.e[a].present = 0;
+    } else {
+        b = -1;
+    }
+    if (a < 0 || b < 0) {
+        PROMOTE_REFUSE("refused: members.dat has no room for 2 entries (resident credential + handoff): reset a credential first");
+    }
+    if (!confirm) {
+        snprintf(msg, cap, "guest slot %d (\"%s\"): this PROMOTES the guest to RESIDENT slot %d with house %d: a new resident is created in the town save (name / gender / face / shirt / pockets / wallet / bank "
+                           "carried over, everything else vanilla new-player defaults, NO Nook intro), the town is saved, a resident credential + a handoff are stored in members.dat and the guest entry is REMOVED "
+                           "from guests.dat (all three files are backed up first). Villager memories / letters keyed by the guest are lost. re-run with `confirm` as the last argument", g, who, s, h);
+        return 2;
+    }
+    bak_g[0] = bak_m[0] = bak_r[0] = '\0';
+    if (!pc_mp_guests_backup_file(PC_MP_GUESTS_PATH, bak_g, sizeof(bak_g))) {
+        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", PC_MP_GUESTS_PATH);
+    }
+    if (pcnetgame_promote_file_exists(PC_MP_MEMBERS_PATH) && !pc_mp_guests_backup_file(PC_MP_MEMBERS_PATH, bak_m, sizeof(bak_m))) {
+        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", PC_MP_MEMBERS_PATH);
+    }
+    if (pcnetgame_promote_file_exists(PC_MP_RECORDS_PATH) && !pc_mp_guests_backup_file(PC_MP_RECORDS_PATH, bak_r, sizeof(bak_r))) {
+        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", PC_MP_RECORDS_PATH);
+    }
+    printf("[NET][PROMOTE] ADMIN: promoting guest slot %d (\"%s\") to resident slot %d, house %d (backups: guests.dat %s, members.dat %s, records.dat %s)\n", g, who, s, h,
+           bak_g, bak_m[0] ? bak_m : "(none: no file)", bak_r[0] ? bak_r : "(none: no file)");
+
+    /* 1. the game state (snapshot kept inside pc_m_card.c for the rollback) */
+    if (!pcnetgame_guest_token_fresh(rtok)) {
+        PROMOTE_REFUSE("refused: no OS randomness for the resident token (nothing was changed)");
+    }
+    if (!pc_mp_promote_create(&s_guest_rec[g], s, h, err, sizeof(err))) {
+        PROMOTE_REFUSE("refused: %s (nothing was changed)", err);
+    }
+    pcnetgame_resident_pid_be(&Save_Get(private_data)[s].player_ID, npid);
+    pcnetgame_resident_pid_be(&s_guest[g].key, gpid);
+
+    /* 2. the records lineage of the new resident: rev 1 (the host record is the truth: no MIGRATE, the host pushes it); a fresh epoch, a clean journal */
+    old_rs = s_rec_slot[s];
+    memset(&s_rec_slot[s], 0, sizeof(s_rec_slot[s]));
+    s_rec_slot[s].init = 1;
+    mPr_CopyPersonalID(&s_rec_slot[s].pid, &Save_Get(private_data)[s].player_ID);
+    s_rec_slot[s].epoch = pcnetgame_rec_rand32();
+    s_rec_slot[s].rev = 1u;
+    s_rec_slot[s].hf_digest = pcnetgame_rec_hostfield_digest(&Save_Get(private_data)[s]);
+    memset(s_rec_backup[s], 0, PC_NETGAME_REC_SIZE);
+    pcnetgame_txn_journal_clear(s);
+    s_res_arm[s].armed = 0;
+
+    /* 3. members.dat: the resident credential + the handoff (the handoff carries the GUEST token: the proof the claimant is the promoted guest) */
+    old_members = s_members_file;
+    nf = s_members_file;
+    {
+        PCMpMemberEntry* e1 = &nf.e[a];
+        PCMpMemberEntry* e2;
+        memset(e1, 0, sizeof(*e1));
+        e1->present = 1;
+        e1->res_slot = (uint8_t)s;
+        e1->kind = PC_MP_MEMBER_KIND_RESIDENT_TOKEN;
+        memcpy(e1->land_name, s_host_town.land_name, 8);
+        e1->land_id = s_host_town.land_id;
+        e1->terrain_hash = s_host_town.terrain_hash;
+        memcpy(e1->pid, npid, PC_MP_MEMBERS_PID_SIZE);
+        memcpy(e1->token, rtok, PC_MP_MEMBERS_TOKEN_SIZE);
+        e1->age = pc_mp_members_max_age(&nf) + 1u;
+        e2 = &nf.e[b];
+        memset(e2, 0, sizeof(*e2));
+        e2->present = 1;
+        e2->res_slot = (uint8_t)s;
+        e2->kind = PC_MP_MEMBER_KIND_PROMOTION_HANDOFF;
+        memcpy(e2->land_name, s_host_town.land_name, 8);
+        e2->land_id = s_host_town.land_id;
+        e2->terrain_hash = s_host_town.terrain_hash;
+        memcpy(e2->pid, npid, PC_MP_MEMBERS_PID_SIZE);
+        memcpy(e2->token, s_guest[g].token, PC_MP_MEMBERS_TOKEN_SIZE);
+        e2->age = e1->age + 1u;
+        memcpy(e2->aux_pid, gpid, PC_MP_MEMBERS_PID_SIZE);
+    }
+    if (!pcnetgame_members_commit(&nf, "guest promotion: resident credential + handoff")) {
+        s_rec_slot[s] = old_rs;
+        pc_mp_promote_rollback();
+        PROMOTE_REFUSE("refused: members.dat could not be written; the promotion was rolled back (nothing changed; backups %s)", bak_g);
+    }
+
+    /* 4. the town save (the GCI; records.dat is written right after it by the save hook with rev 1 for the new resident) */
+    if (!pc_save_write_authoritative()) {
+        s_rec_slot[s] = old_rs;
+        pc_mp_promote_rollback();
+        (void)pcnetgame_members_commit(&old_members, "guest promotion rolled back (the town save could not be written)");
+        PROMOTE_REFUSE("refused: the town save could not be written; the promotion was rolled back in memory and members.dat restored (the on-disk save was NOT modified)");
+    }
+    pc_mp_promote_commit();
+    s_rec_slot[s].dirty_unsaved = 0;
+
+    /* 5. LAST: remove the guest entry (the handoff is valid from now on even if this write fails: the resident is durable) */
+    old_g = s_guest[g];
+    old_rec = s_guest_rec[g];
+    old_grs = s_rec_slot[PLAYER_NUM + g];
+    memset(&s_guest[g], 0, sizeof(s_guest[g]));
+    memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
+    memset(&s_rec_slot[PLAYER_NUM + g], 0, sizeof(s_rec_slot[0]));
+    memset(s_rec_backup[PLAYER_NUM + g], 0, PC_NETGAME_REC_SIZE);
+    pcnetgame_txn_journal_clear(PLAYER_NUM + g);
+    if (!pcnetgame_guest_store_write("guest promoted to a resident")) {
+        s_guest[g] = old_g;
+        s_guest_rec[g] = old_rec;
+        s_rec_slot[PLAYER_NUM + g] = old_grs;
+        printf("[NET][PROMOTE] ADMIN: guest slot %d (\"%s\") PROMOTED to resident %d (house %d) but guests.dat could NOT be written: the guest entry stays (run guest-remove later); the handoff is valid\n", g, who, s, h);
+        snprintf(msg, cap, "guest slot %d (\"%s\") PROMOTED to resident slot %d, house %d, BUT guests.dat could not be written: the stale guest entry remains (run guest-remove %d confirm later); the handoff still works", g, who, s, h, g);
+        return 1;
+    }
+    printf("[NET][PROMOTE] ADMIN: guest slot %d (\"%s\") PROMOTED to resident slot %d, house %d (guests.dat entry removed last; records.dat rev 1; handoff stored)\n", g, who, s, h);
+    PC_LOG(PCL_GUESTS, "admin: guest slot %d promoted to resident %d house %d\n", g, s, h);
+    snprintf(msg, cap, "guest slot %d (\"%s\") PROMOTED to RESIDENT slot %d, house %d. Backups: guests.dat %s, members.dat %s, records.dat %s. The guest receives a handoff the next time it connects; "
+                       "its client must fetch the town again (restart / Play Online) to play the resident", g, who, s, h, bak_g, bak_m[0] ? bak_m : "(none)", bak_r[0] ? bak_r : "(none)");
+#undef PROMOTE_REFUSE
+    return 1;
+}
+/* ===== M-F END ===== */
 
 /* ===== RESIDENT CREDENTIALS ADMIN (M-E): dedicated console `residents` / `resident-reset` / `resident-arm`. Main thread only, HOST only. ===== */
 int pc_net_game_dedicated_resident_info(int slot, PCNetGameDedicatedResidentInfo* out) {

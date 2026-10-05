@@ -61,9 +61,9 @@ def main():
     enum = re.search(r"typedef enum PCNetGameRejectReason \{(.*?)\} PCNetGameRejectReason;", ng, re.S).group(1)
     reasons = re.findall(r"(PC_NETGAME_REJECT_\w+)\s*=\s*(\d+)", enum)
     rt = fr("pcnetgame_reject_text")
-    ck("A the reject enum keeps the frozen reasons 1 PROTOCOL_MISMATCH, 2 SERVER_FULL, 3 LAND_MISMATCH, 4 NO_SAVE and has exactly ONE deliberate addition (M-E): 5 RESIDENT_CREDENTIAL", [(n, int(v)) for n, v in reasons] == [
+    ck("A the reject enum keeps the frozen reasons 1 PROTOCOL_MISMATCH, 2 SERVER_FULL, 3 LAND_MISMATCH, 4 NO_SAVE and has exactly TWO deliberate additions: 5 RESIDENT_CREDENTIAL (M-E) and 6 PROMOTED (M-F)", [(n, int(v)) for n, v in reasons] == [
         ("PC_NETGAME_REJECT_PROTOCOL_MISMATCH", 1), ("PC_NETGAME_REJECT_SERVER_FULL", 2), ("PC_NETGAME_REJECT_LAND_MISMATCH", 3), ("PC_NETGAME_REJECT_NO_SAVE", 4),
-        ("PC_NETGAME_REJECT_RESIDENT_CREDENTIAL", 5)])
+        ("PC_NETGAME_REJECT_RESIDENT_CREDENTIAL", 5), ("PC_NETGAME_REJECT_PROMOTED", 6)])
     ck("A pcnetgame_reject_text has a `case` for EVERY reject reason of the enum and a `default` for unknown ones", all("case %s:" % n in rt for n, _v in reasons) and "default:" in rt)
     ck("A SERVER_FULL says 'server full / guest limit reached / all resident slots taken' (the code cannot tell them apart) for a guest, and names the other causes (guest table full, "
        "in use, missing / wrong token) plus the guest-reset-token recovery; a resident gets the resident wording",
@@ -180,8 +180,8 @@ def main():
        'pcnetgame_guest_store_write("after the GCI save")' in fr("pc_net_game_record_after_gci_save"))
 
     # ------------------------------------------------------------------ D
-    ck("D no wire change: message ids 1..65 (59..61 = the furniture sync, 62..65 = the town transfer, none is a REJECT_INFO), the protocol version unchanged, wire_baseline green",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 66)) and "PC_NETGAME_MSG_REJECT_INFO" not in ng_raw)
+    ck("D no wire change: message ids 1..66 (66 = M-F promotion handoff) (59..61 = the furniture sync, 62..65 = the town transfer, none is a REJECT_INFO), the protocol version unchanged, wire_baseline green",
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 67)) and "PC_NETGAME_MSG_REJECT_INFO" not in ng_raw)
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("D wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))

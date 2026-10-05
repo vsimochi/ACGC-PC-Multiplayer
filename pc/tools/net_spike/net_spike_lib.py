@@ -1276,6 +1276,10 @@ PC_NETGAME_REJECT_SERVER_FULL = 2        # reserved, never sent
 PC_NETGAME_REJECT_LAND_MISMATCH = 3      # 24-byte REJECT carrying the host town
 PC_NETGAME_REJECT_NO_SAVE = 4            # 24-byte REJECT carrying the host town
 PC_NETGAME_REJECT_RESIDENT_CREDENTIAL = 5  # M-E: 8-byte REJECT, the resident credential is missing or wrong
+PC_NETGAME_REJECT_PROMOTED = 6  # M-F: 8-byte REJECT, this guest was promoted to a resident (a RESIDENT_HANDOFF precedes it)
+PC_NETGAME_MSG_RESIDENT_HANDOFF = 66  # M-F: H->C 48 B (type, flags, res_slot, rsv, town PID[20] BE, token[16], rsv[8])
+RESIDENT_HANDOFF_FMT = "<BBBB20s16s8s"  # PCNetGameResidentHandoffMsg, 48 bytes
+assert struct.calcsize(RESIDENT_HANDOFF_FMT) == 48
 
 PC_NETGAME_HOST_PLAYER_ID = 8  # == PC_NET_MAX_PEERS
 PC_NETGAME_GRID_TOWN = 0

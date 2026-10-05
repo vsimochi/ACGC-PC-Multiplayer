@@ -100,7 +100,7 @@ def main():
           and L.PC_NETGAME_REC_FIELD_MAIL_PRESENT == 12 and L.TXN_REASON_NAMES[23] == "NO_SUCH_ADDRESS" and L.TXN_REASON_NAMES[24] == "MAILBOX_FULL" and L.TXN_REASON_NAMES[25] == "PO_FULL")
     check("W M1 added NO message id (55 was the highest at M1; the current highest, wire_baseline.EXPECTED_MAX_MSG_ID = %d, is MAILBOX_LETTER of mail milestone 2 -- audited by test_mail2_src.py) and TXN_COMMIT (72 B) / TXN_RESULT (76 B) keep their exact size asserts: the M1 letter is NEVER on the wire"
           % wire_baseline.EXPECTED_MAX_MSG_ID,
-          wire_baseline.EXPECTED_MAX_MSG_ID == 65 and max(v for _n, v in wire_baseline.c_message_ids(c_raw)) == 65 and dict(wire_baseline.c_message_ids(c_raw)).get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
+          wire_baseline.EXPECTED_MAX_MSG_ID == 66 and max(v for _n, v in wire_baseline.c_message_ids(c_raw)) == 66 and dict(wire_baseline.c_message_ids(c_raw)).get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and "_Static_assert(sizeof(PCNetGameTxnCommitMsg) == 72," in c_raw and "_Static_assert(sizeof(PCNetGameTxnResultMsg) == 76," in c_raw
           and not re.search(r"Mail_c\s+\w+;", c_raw[c_raw.index("typedef struct PCNetGameTxnCommitMsg"):c_raw.index("} PCNetGameTxnCommitMsg;")]))
     check("W the tag convention of the doc comment: dest NONE, slot = mail slot, item = gift echo, aux_item = low 16 / aux_cond = bits 16..23 of the 24-bit hash; python mail_hash24 is the same cut",

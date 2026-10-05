@@ -118,8 +118,8 @@ def main():
     # ------------------------------------------------------------------------------------------------ W
     ids = dict(wire_baseline.c_message_ids(raw))
     ck("W ids: 57 = IDENTITY_EXT, 58 = IDENTITY_TOKEN, all ids contiguous 1..%d" % wire_baseline.EXPECTED_MAX_MSG_ID,
-       ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58 and wire_baseline.EXPECTED_MAX_MSG_ID == 65
-       and sorted(ids.values()) == list(range(1, 66)))
+       ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58 and wire_baseline.EXPECTED_MAX_MSG_ID == 66
+       and sorted(ids.values()) == list(range(1, 67)))
     ck("W IDENTITY_EXT: exact 42-byte size assert + offsets + <= 64 and <= PC_NET_MAX_PAYLOAD; IDENTITY_TOKEN 20 bytes",
        "_Static_assert(sizeof(PCNetGameIdentityExtMsg) == 42," in raw and "offsetof(PCNetGameIdentityExtMsg, token) == 25" in raw
        and "sizeof(PCNetGameIdentityExtMsg) <= 64 && sizeof(PCNetGameIdentityExtMsg) <= PC_NET_MAX_PAYLOAD" in raw
@@ -145,11 +145,12 @@ def main():
     ck("A s_guest_rec[] is addressed ONLY through the accessor, the guest table lifecycle functions (install / create / rollback) and the G6.2 operator tools (remove: "
        "pc_net_game_dedicated_guest_admin) and nothing else",
        sorted({n for a, b, n in funcs if "s_guest_rec[" in c[a:b]}) == sorted(["pcnetgame_rec_priv_ptr", "pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create",
-                                                                              "pc_net_game_dedicated_guest_admin"]))
+                                                                              "pc_net_game_dedicated_guest_admin", "pc_net_game_dedicated_promote"]))
     pinned = ["pc_net_game_dedicated_members", "pcnetgame_dedicated_give_resolve",  # the dedicated console tools (host admin items / members), reviewed
               # M-D / M-E: the admission cross-check (reads the host's own residents), the resident credential table (keyed by the resident PersonalID of private_data[idx]) and the
               # resident operator commands (residents / resident-reset / resident-arm); all host-side, none reachable with a guest slot
-              "pc_net_game_dedicated_resident_admin", "pc_net_game_dedicated_resident_info", "pcnetgame_dedicated_resident_resolve", "pcnetgame_host_admission_crosscheck",
+              "pc_net_game_dedicated_resident_admin", "pc_net_game_dedicated_resident_info", "pc_net_game_dedicated_promote", "pcnetgame_host_promotion_handoff",  # M-F: promote (the guest record -> a new resident) + the handoff check (resident PID lookup)
+               "pcnetgame_dedicated_resident_resolve", "pcnetgame_host_admission_crosscheck",
               "pcnetgame_resident_arm_active", "pcnetgame_resident_cred_find", "pcnetgame_resident_mint", "pcnetgame_resident_mint_rollback",
               "pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
@@ -163,7 +164,7 @@ def main():
     homes_users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(homes\[", c[a:b])})
     ck("A the functions that subscript Save_Get(homes[...]) are exactly the reviewed ones (house lookup by PersonalID, mail / mailbox paths behind the guest refusal, "
        "client-side shadows, TEST-ONLY hooks): %s" % homes_users,
-       homes_users == sorted(["pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
+       homes_users == sorted(["pc_net_game_dedicated_promote", "pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
                               "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mbox_client_apply", "pcnetgame_mbox_client_tick", "pcnetgame_mbox_house_of",
                               "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook", "pcnetgame_txn_apply_take",
                               # furniture sync (house index from a bound PersonalID, guest refused first; client shadows; TEST-ONLY host edit): see test_house_sync_src.py

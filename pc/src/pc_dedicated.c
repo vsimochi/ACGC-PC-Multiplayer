@@ -459,6 +459,7 @@ static void pc_ded_cmd_help(void) {
            "  members  town memberships: residents and guests (kind, slot, confirmed)\n"
            "  guest-remove <slot|name> confirm        remove a guest and its character (guests.dat is backed up first; refused while the guest is connected)\n"
            "  guest-reset-token <slot|name> confirm   token lost: the next claim of that guest's key gets a NEW token for the SAME character (10 min, once; backed up)\n"
+           "  promote <guest> <slot|auto> <house|auto> confirm   promote an OFFLINE guest to a resident of this town (free slot + free house; guests.dat / members.dat / records.dat are backed up first; see docs)\n"
            "  residents   resident credentials: slot, name, credential state, confirmed, armed, connected (never the token); policy = resident_tokens off|tofu|required\n"
            "  resident-reset <slot|name> confirm      delete a resident's credential (members.dat is backed up first; refused while the resident is connected)\n"
            "  resident-arm <slot|name> confirm        under resident_tokens=required: allow ONE credential mint for a resident without one (memory only, 10 min, one use)\n"
@@ -641,6 +642,29 @@ static void pc_ded_cmd_resident_admin(int op, char* args) {
     r = pc_net_game_dedicated_resident_admin(op, sel, n == 2, msg, sizeof(msg));
     pc_ded_printf("[DEDICATED] %s: %s\n", cname, msg);
     PC_LOG(PCL_GENERAL, "dedicated: %s %s -> %s\n", cname, sel, r == 1 ? "done" : r == 2 ? "needs confirm" : "refused");
+    pc_ded_flush();
+}
+
+/* M-F: `promote <guest> <slot|auto> <house|auto> confirm`. Without `confirm` nothing changes and the message says what would happen. */
+static void pc_ded_cmd_promote(char* args) {
+    char gsel[64], ssel[16], hsel[16], tok4[16], extra[8];
+    char msg[900];
+    int n, r;
+    gsel[0] = ssel[0] = hsel[0] = tok4[0] = extra[0] = '\0';
+    n = sscanf(args != NULL ? args : "", "%63s %15s %15s %15s %7s", gsel, ssel, hsel, tok4, extra);
+    if (n < 3) {
+        pc_ded_printf("[DEDICATED] promote: usage: promote <guest slot|name> <resident slot 0-3|auto> <house 0-3|auto> confirm (see `guests`, `residents`)\n");
+        pc_ded_flush();
+        return;
+    }
+    if (n >= 5 || (n == 4 && pc_ded_stricmp(tok4, "confirm") != 0)) {
+        pc_ded_printf("[DEDICATED] promote: expected exactly `<guest> <slot|auto> <house|auto> confirm` (extra / unknown arguments: nothing was changed)\n");
+        pc_ded_flush();
+        return;
+    }
+    r = pc_net_game_dedicated_promote(gsel, ssel, hsel, n == 4, msg, sizeof(msg));
+    pc_ded_printf("[DEDICATED] promote: %s\n", msg);
+    PC_LOG(PCL_GENERAL, "dedicated: promote %s -> %s\n", gsel, r == 1 ? "done" : r == 2 ? "needs confirm" : "refused");
     pc_ded_flush();
 }
 
@@ -1320,6 +1344,8 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_resident_admin(1, args);
     } else if (strcmp(cmd, "members") == 0) {
         pc_ded_cmd_members();
+    } else if (strcmp(cmd, "promote") == 0) {
+        pc_ded_cmd_promote(args);
     } else if (strcmp(cmd, "guest-remove") == 0) {
         pc_ded_cmd_guest_admin(0, args);
     } else if (strcmp(cmd, "guest-reset-token") == 0) {

@@ -1520,6 +1520,138 @@ static int pc_guest_resident_name_conflict(const PersonalID_c* home) {
     return -1;
 }
 
+/* M-F (guest -> resident promotion, HOST only, game thread): turns a guest's stored record into a NEW resident in the FREE resident slot `slot` with the FREE house
+ * `house` of THIS host save. The caller (pc_net_game.c pc_net_game_dedicated_promote) has already checked every precondition and owns the members.dat / records.dat /
+ * guests.dat bookkeeping; this routine only builds the game state, in the order and with the vanilla routines the new-player flow uses:
+ *   mPr_ClearPrivateInfo + mPr_InitPrivateInfo(&private_data[slot])   vanilla new-player defaults: THIS town's land + a unique 0xF000|id player id, exists = TRUE,
+ *                                                                    random shirt (overwritten below), a face unused by the other residents, my_org_no_table
+ *   copied from the guest record (BE -> native already done by the guest table): name, gender, the shirt it wears, the pockets / item conditions / wallet, the bank
+ *   account, the Able Sisters designs (so no ARAM resource read is needed on a host); the face when no other resident wears it (else the vanilla unique face stays)
+ *   inventory.loan = mPlayer_DEBT0       what vanilla's house selection (ac_intro_demo_move.c_inc aID_retire_rcn_guide_wait) writes right after mHS_set_use
+ *   mHS_set_use(slot, house)             swaps house_arrangement and sets homes[house].ownerID through mHm_InitHomeInfo (the house must have a null owner: vanilla
+ *                                        deletion mHm_ClearHomeInfo's it, so a null-owner house is a clean default house)
+ *   mEv_ClearPersonalEventFlag(slot)     the veteran state of the slot: NO first-job / first-intro (the Nook intro is never started for a promoted resident)
+ * NOT done (documented limits): the catalog / collected bits of the intro (shirt, cassette, carpet, wall), the first-job quest, mCkRh roach data (the house is already a
+ * default house). One snapshot is kept so the caller can roll the whole change back when the save cannot be written. Returns 1 or 0 with err. */
+static struct {
+    int      valid;
+    int      slot;
+    int      house;
+    Private_c priv;
+    mHm_hs_c home;
+    u32      arrangement;
+    u32      ev_save_flags;
+    u32      ev_common_flags;
+} s_pc_promote_snap;
+
+void pc_mp_promote_rollback(void);
+int pc_mp_promote_create(const void* guest_rec, int slot, int house, char* err, size_t cap) {
+    const Private_c* g = (const Private_c*)guest_rec;
+    Private_c* priv;
+    mHm_hs_c* home;
+    int i, face_ok = 1;
+    u32 seen = 0;
+
+    if (err != NULL && cap > 0) {
+        err[0] = '\0';
+    }
+#define PC_PROMOTE_FAIL(...) do { if (err != NULL && cap > 0) snprintf(err, cap, __VA_ARGS__); return 0; } while (0)
+    if (g == NULL || slot < 0 || slot >= PLAYER_NUM || house < 0 || house >= PLAYER_NUM) {
+        PC_PROMOTE_FAIL("bad slot / house / guest record");
+    }
+    if (!pc_save_loaded || pc_net_game_role() != PC_NETGAME_ROLE_HOST) {
+        PC_PROMOTE_FAIL("this process is not a host with a loaded save");
+    }
+    priv = Save_GetPointer(private_data[slot]);
+    home = Save_GetPointer(homes[house]);
+    if (mPr_CheckPrivate(priv) == TRUE) {
+        PC_PROMOTE_FAIL("resident slot %d is not free", slot);
+    }
+    if (mPr_NullCheckPersonalID(&home->ownerID) != TRUE) {
+        PC_PROMOTE_FAIL("house %d already has an owner", house);
+    }
+    for (i = 0; i < PLAYER_NUM; i++) { /* the arrangement must be a permutation of 0..3, else mHS_set_use's swap would corrupt it */
+        const int h = (int)(((u32)Save_Get(house_arrangement) >> (i * 2)) & 3u);
+        if (seen & (1u << h)) {
+            PC_PROMOTE_FAIL("the house arrangement of this save is not a permutation (0x%02X): refusing to touch it", (unsigned)Save_Get(house_arrangement));
+        }
+        seen |= 1u << h;
+    }
+    if (g->gender != mPr_SEX_MALE && g->gender != mPr_SEX_FEMALE) {
+        PC_PROMOTE_FAIL("the guest record has an invalid gender (%d)", (int)g->gender);
+    }
+    if (g->face < 0 || g->face >= mPr_FACE_TYPE_NUM) {
+        PC_PROMOTE_FAIL("the guest record has an invalid face (%d)", (int)g->face);
+    }
+
+    memset(&s_pc_promote_snap, 0, sizeof(s_pc_promote_snap));
+    s_pc_promote_snap.valid = 1;
+    s_pc_promote_snap.slot = slot;
+    s_pc_promote_snap.house = house;
+    s_pc_promote_snap.priv = *priv;
+    s_pc_promote_snap.home = *home;
+    s_pc_promote_snap.arrangement = (u32)Save_Get(house_arrangement);
+    s_pc_promote_snap.ev_save_flags = (u32)Save_Get(event_save_data).flags;
+    s_pc_promote_snap.ev_common_flags = (u32)Common_Get(event_flags[mEv_SAVED_EVENT]);
+
+    mPr_ClearPrivateInfo(priv);
+    mPr_InitPrivateInfo(priv);
+    memcpy(priv->player_ID.player_name, g->player_ID.player_name, PLAYER_NAME_LEN);
+    priv->exists = TRUE;
+    priv->reset_code = 0;
+    priv->gender = g->gender;
+    for (i = 0; i < PLAYER_NUM; i++) {
+        if (i != slot && mPr_NullCheckPersonalID(&Save_Get(private_data)[i].player_ID) == FALSE && Save_Get(private_data)[i].face == g->face) {
+            face_ok = 0;
+        }
+    }
+    if (face_ok) {
+        priv->face = g->face;
+    }
+    if (ITEM_IS_CLOTH(g->cloth.item)) {
+        mPlib_change_player_cloth_info_lv2(priv, (mActor_name_t)g->cloth.item);
+    } else {
+        mPlib_change_player_cloth_info_lv2(priv, (mActor_name_t)pc_guest_starter_shirt(&priv->player_ID, priv->gender));
+    }
+    memcpy(priv->inventory.pockets, g->inventory.pockets, sizeof(priv->inventory.pockets));
+    priv->inventory.item_conditions = g->inventory.item_conditions;
+    priv->inventory.wallet = g->inventory.wallet;
+    priv->bank_account = g->bank_account;
+    memcpy(priv->my_org, g->my_org, sizeof(priv->my_org));
+    memcpy(priv->my_org_no_table, g->my_org_no_table, sizeof(priv->my_org_no_table));
+    priv->inventory.loan = mPlayer_DEBT0;
+
+    if (mHS_set_use(slot, house) != TRUE || (int)mHS_get_arrange_idx(slot) != house || mPr_CheckCmpPersonalID(&home->ownerID, &priv->player_ID) != TRUE) {
+        pc_mp_promote_rollback();
+        PC_PROMOTE_FAIL("mHS_set_use(%d, %d) did not give the house to the new resident (everything was rolled back)", slot, house);
+    }
+    mEv_ClearPersonalEventFlag(slot);
+    printf("[PC] M-F promote: resident slot %d created for '%.8s' (gender %d, face %d%s, player id 0x%04X), house %d assigned (arrangement 0x%02X), loan %u, pockets/wallet/bank carried over\n",
+           slot, (const char*)priv->player_ID.player_name, (int)priv->gender, (int)priv->face, face_ok ? "" : " (the guest's face is worn by another resident: vanilla unique face kept)",
+           (unsigned)priv->player_ID.player_id, house, (unsigned)Save_Get(house_arrangement), (unsigned)priv->inventory.loan);
+#undef PC_PROMOTE_FAIL
+    return 1;
+}
+
+/* Restores the snapshot taken by the last successful-or-failed pc_mp_promote_create (idempotent: the snapshot is consumed). */
+void pc_mp_promote_rollback(void) {
+    if (!s_pc_promote_snap.valid) {
+        return;
+    }
+    *Save_GetPointer(private_data[s_pc_promote_snap.slot]) = s_pc_promote_snap.priv;
+    *Save_GetPointer(homes[s_pc_promote_snap.house]) = s_pc_promote_snap.home;
+    Save_Set(house_arrangement, s_pc_promote_snap.arrangement);
+    Save_Get(event_save_data).flags = s_pc_promote_snap.ev_save_flags;
+    Common_Set(event_flags[mEv_SAVED_EVENT], s_pc_promote_snap.ev_common_flags);
+    memset(&s_pc_promote_snap, 0, sizeof(s_pc_promote_snap));
+    printf("[PC] M-F promote: the in-memory change was ROLLED BACK\n");
+}
+
+/* The change is durable (or deliberately kept): drop the snapshot. */
+void pc_mp_promote_commit(void) {
+    memset(&s_pc_promote_snap, 0, sizeof(s_pc_promote_snap));
+}
+
 /* Guests G3.2 (client-only title menu "Join as Guest"): the failure message of the last attempt (shown by the title menu for a few seconds) and the cached
  * label. Plain statics, no allocation. */
 static char s_pc_guest_title_msg[256];

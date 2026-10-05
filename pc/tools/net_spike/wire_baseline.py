@@ -53,7 +53,8 @@ REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
 # (host -> the admitted guest only, sent right after the frozen IDENTITY_ACK). The 32-byte IDENTITY / IDENTITY_ACK structs themselves stay frozen.
 # Furniture sync Stage 1 (deliberate, v8 still unreleased): 59 = HOUSE_BEGIN (both directions, 36 B), 60 = HOUSE_CHUNK (both, 1012 B), 61 = HOUSE_ACK (host -> owner, 24 B).
 # Town transfer (M-B, deliberate, v8 still unreleased): 62 = TOWN_FETCH_REQ (C -> H, 40 B), 63 = TOWN_INFO (H -> C, 40 B), 64 = TOWN_CHUNK (H -> C, 1012 B, u32 offset), 65 = TOWN_DONE (C -> H, 12 B).
-EXPECTED_MAX_MSG_ID = 65
+# Guest -> resident promotion (M-F, deliberate, v8 still unreleased): 66 = RESIDENT_HANDOFF (H -> C, 48 B, sent to a promoted guest right before REJECT reason 6 PROMOTED).
+EXPECTED_MAX_MSG_ID = 66
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -106,7 +107,13 @@ V8_NEW_STRUCTS = {
                             "uint8_t land_name[PC_NETGAME_LAND_LEN]; uint16_t land_id; uint16_t _rsv0; uint32_t terrain_hash; uint32_t town_gen; uint32_t chunk_count;",
     "PCNetGameTownChunkMsg": "uint8_t msg_type; uint8_t _rsv0; uint16_t len; uint32_t xfer_id; uint32_t offset; uint8_t data[PC_NETGAME_TOWN_CHUNK_DATA];",
     "PCNetGameTownDoneMsg": "uint8_t msg_type; uint8_t status; uint16_t _rsv0; uint32_t xfer_id; uint32_t crc32;",
+    # guest -> resident promotion (M-F): host -> the promoted guest (48 B): the new resident's town PID + resident token + slot
+    "PCNetGameResidentHandoffMsg": "uint8_t msg_type; uint8_t flags; uint8_t res_slot; uint8_t rsv; uint8_t town_pid[20]; "
+                                   "uint8_t token[PC_NETGAME_GUEST_TOKEN_LEN]; uint8_t rsv2[8];",
 }
+# Guest -> resident promotion (M-F): exact C lines (size / offset asserts) that must stay as they are.
+HANDOFF_C_PINS = ('_Static_assert(sizeof(PCNetGameResidentHandoffMsg) == 48,', "offsetof(PCNetGameResidentHandoffMsg, town_pid) == 4",
+                  "offsetof(PCNetGameResidentHandoffMsg, token) == 24")
 # Town transfer (M-B): exact C lines (constants + size asserts) that must stay as they are.
 TOWN_C_PINS = ("#define PC_NETGAME_TOWN_CHUNK_DATA   1000u", "#define PC_NETGAME_TOWN_FILE_SIZE    467008u",
                "#define PC_NETGAME_TOWN_STATUS_STREAM        0u", "#define PC_NETGAME_TOWN_STATUS_UP_TO_DATE    1u",
@@ -184,14 +191,15 @@ V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_B
                 ("PC_NETGAME_MSG_TOWN_SVC_STATE", "55"), ("PC_NETGAME_MSG_MAILBOX_LETTER", "56"),
                 ("PC_NETGAME_MSG_IDENTITY_EXT", "57"), ("PC_NETGAME_MSG_IDENTITY_TOKEN", "58"),
                 ("PC_NETGAME_MSG_HOUSE_BEGIN", "59"), ("PC_NETGAME_MSG_HOUSE_CHUNK", "60"), ("PC_NETGAME_MSG_HOUSE_ACK", "61"),
-                ("PC_NETGAME_MSG_TOWN_FETCH_REQ", "62"), ("PC_NETGAME_MSG_TOWN_INFO", "63"), ("PC_NETGAME_MSG_TOWN_CHUNK", "64"), ("PC_NETGAME_MSG_TOWN_DONE", "65")]
-_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE))\s*=\s*\d+,"
+                ("PC_NETGAME_MSG_TOWN_FETCH_REQ", "62"), ("PC_NETGAME_MSG_TOWN_INFO", "63"), ("PC_NETGAME_MSG_TOWN_CHUNK", "64"), ("PC_NETGAME_MSG_TOWN_DONE", "65"),
+                ("PC_NETGAME_MSG_RESIDENT_HANDOFF", "66")]
+_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|RESIDENT_HANDOFF)\s*=\s*\d+,"
 # net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
 V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
                            r"|PC_NETGAME_MSG_TOWN_SVC_STATE|PC_NETGAME_TS_\w+|PC_NETGAME_SHOP_\w+|TOWN_SVC_STATE_FMT"
                            r"|PC_NETGAME_MSG_MAILBOX_LETTER|PC_NETGAME_MBOX_\w+|PC_NETGAME_MAIL_WIRE_SIZE|MAILBOX_LETTER_FMT"
-                           r"|PC_NETGAME_MSG_IDENTITY_(?:EXT|TOKEN)|PC_NETGAME_IDEXT_\w+|PC_NETGAME_IDTOKEN_\w+|PC_NETGAME_GUEST_\w+|PC_NETGAME_RESIDENT_\w+|PC_NETGAME_REJECT_RESIDENT_CREDENTIAL|build_resident_ext"
+                           r"|PC_NETGAME_MSG_IDENTITY_(?:EXT|TOKEN)|PC_NETGAME_IDEXT_\w+|PC_NETGAME_IDTOKEN_\w+|PC_NETGAME_GUEST_\w+|PC_NETGAME_RESIDENT_\w+|PC_NETGAME_REJECT_(?:RESIDENT_CREDENTIAL|PROMOTED)|PC_NETGAME_MSG_RESIDENT_HANDOFF|RESIDENT_HANDOFF_FMT|build_resident_ext"
                            r"|PC_NETGAME_REC_CLASS_\w+|IDENTITY_(?:EXT|TOKEN)_FMT"
                            r"|PC_NETGAME_MSG_HOUSE_(?:BEGIN|CHUNK|ACK)|PC_NETGAME_HOUSE_\w+|PC_NETGAME_HOSTCFG_\w+|HOUSE_(?:BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|PC_NETGAME_TOWN_\w+|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)_FMT"
@@ -339,6 +347,9 @@ V8_LIB_PINNED = {
     "PC_NETGAME_IDTOKEN_FLAG_RESIDENT": '0x04',
     "PC_NETGAME_RESIDENT_TABLE_SIZE": '4',
     "PC_NETGAME_REJECT_RESIDENT_CREDENTIAL": '5',
+    "PC_NETGAME_REJECT_PROMOTED": '6',
+    "PC_NETGAME_MSG_RESIDENT_HANDOFF": '66',
+    "RESIDENT_HANDOFF_FMT": '"<BBBB20s16s8s"',
     "PC_NETGAME_GUEST_TOKEN_LEN": '16',
     "PC_NETGAME_GUEST_MAX": '8',
     "PC_NETGAME_REC_CLASS_RESIDENT": '0',
@@ -479,30 +490,36 @@ def audit_texts(head, cur):
         all(a in cur["game_c"] for a in GUEST_C_PINS))
     add("wire: town transfer (M-B) -- the status / done / size constants and the 40 / 40 / 1012 / 12 byte _Static_asserts of ids 62..65 are pinned in pc_net_game.c",
         all(a in cur["game_c"] for a in TOWN_C_PINS))
+    add("wire: guest -> resident promotion (M-F) -- the 48-byte _Static_assert and the town_pid / token offsets of PCNetGameResidentHandoffMsg (id 66) are pinned in pc_net_game.c",
+        all(a in cur["game_c"] for a in HANDOFF_C_PINS))
     add("wire: WEEDS -- FIELD_ACTION kinds 10 WEED_PULL / 11 FLOWER_TRAMPLE are pinned in pc_net_game.c (and 9 SNOWMAN_BREAK still precedes them); "
         "the request / result structs they ride are the already pinned ones (no layout change)",
         all(a in cur["game_c"] for a in WEEDS_C_PINS))
     strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
-    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)))\s*=\s*(\d+),", b)
+    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|RESIDENT_HANDOFF))\s*=\s*(\d+),", b)
     # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52), + town services (47-55), + mailbox (47-56) or all of them
-    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS[:15], V8_NEW_ENUMS)
+    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS[:15], V8_NEW_ENUMS[:19], V8_NEW_ENUMS)
                    if "PCNetGameMsgType" in hb else False)
-    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-65 (appended, in order; 53/54 enumerated as reserved; 62-65 = town transfer)",
+    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-66 (appended, in order; 53/54 enumerated as reserved; 62-65 = town transfer; 66 = promotion handoff)",
         "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
         and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
         and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
-        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_TOWN_DONE = 65"))
+        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_RESIDENT_HANDOFF = 66"))
     nums = [v for _n, v in c_message_ids(cur["game_c"])]
     add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
         len(nums) == len(set(nums)) and sorted(nums) == list(range(1, EXPECTED_MAX_MSG_ID + 1)))
     # M-E: the frozen reasons 1..4 are unchanged; reason 5 RESIDENT_CREDENTIAL (8-byte form) is the ONE deliberate addition (pinned exactly; comments are stripped by typedef_blocks)
+    # M-F: reason 6 PROMOTED (8-byte form, preceded by a RESIDENT_HANDOFF) is the second pinned addition
     _rej_new = "PC_NETGAME_REJECT_RESIDENT_CREDENTIAL = 5,"
+    _rej_new6 = "PC_NETGAME_REJECT_PROMOTED = 6,"
     _rej_cur = " ".join(cb.get("PCNetGameRejectReason", "").split())
-    _rej_strip = " ".join(_rej_cur.replace(_rej_new, "").split())
-    add("wire: PCNetGameRejectReason values identical to HEAD except the pinned M-E reason 5 RESIDENT_CREDENTIAL (8-byte form)",
-        "PCNetGameRejectReason" in cb and (cb["PCNetGameRejectReason"] == hb["PCNetGameRejectReason"]
-                                            or (_rej_cur.endswith(_rej_new) and _rej_strip == " ".join(hb["PCNetGameRejectReason"].split()))))
+    _rej_head = " ".join(hb.get("PCNetGameRejectReason", "").split())
+    _strip_rej = lambda t: " ".join(t.replace(_rej_new, "").replace(_rej_new6, "").split())
+    add("wire: PCNetGameRejectReason values identical to HEAD except the pinned M-E reason 5 RESIDENT_CREDENTIAL and M-F reason 6 PROMOTED (8-byte forms)",
+        "PCNetGameRejectReason" in cb and (_rej_cur == _rej_head
+                                            or (_rej_cur.endswith(_rej_new6) and _rej_new in _rej_cur and _strip_rej(_rej_cur) == _strip_rej(_rej_head)
+                                                and _rej_head.count("REJECT_PROMOTED") == 0)))
     def _subseq(small, big):
         it = iter(big)
         return all(any(x == y for y in it) for x in small)
