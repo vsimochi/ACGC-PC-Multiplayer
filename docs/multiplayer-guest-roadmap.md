@@ -719,9 +719,9 @@ Tests actually run (disposable copy `pc/build64/bin_fixture4_reconnect`, ONE exe
 
 ## Characters and town memberships
 
-Status: M1 (character store) + M2 (membership lookup, per-town tokens) are implemented; M3 (servers.ini + `--server`) and M4 (Play Online title menu, relaunch) are implemented; M2b is not (see "Remaining").
+Status: M1 (character store) + M2 (membership lookup, per-town tokens) are implemented; M3 (servers.ini + `--server`) and M4 (Play Online title menu; connects in this process since "Play Online without relaunch", it was a relaunch before) are implemented; M2b is not (see "Remaining").
 
-M-C (phase 2): Play Online now relaunches with `--town-fetch`, resolves `membership.ini` after the fetch (resident -> bound by PersonalID, guest / none -> guest arrival or first-run creation), writes `membership.ini` + servers.ini `last_town` at READY, and shows Retry / Use saved copy / Quit boxes on fetch failures (M-J renamed the middle button: it is NOT offline play). Details and limits: docs/multiplayer-phase2-design.md, "M-C".
+M-C (phase 2): Play Online now connects with the `--town-fetch` flow (first as a relaunch, now in-process: see "Play Online without relaunch"), resolves `membership.ini` after the fetch (resident -> bound by PersonalID, guest / none -> guest arrival or first-run creation), writes `membership.ini` + servers.ini `last_town` at READY, and shows Retry / Use saved copy / Quit boxes on fetch failures (M-J renamed the middle button: it is NOT offline play). Details and limits: docs/multiplayer-phase2-design.md, "M-C".
 
 M-J (phase 2): a resident membership whose character is no longer a resident of the fetched town (removed or town reset) now ends with a Quit box and exit 3 instead of a silent title screen (the membership file is kept); the character list marks `(resident)` for the selected server's last known town; the old "Play offline" button is "Use saved copy" (it still connects in the background); small layout fixes of the Play Online screens after a screenshot pass. Hostnames in servers.ini are still not supported (IPv4 literals only; see design doc, "M-J").
 
@@ -801,8 +801,8 @@ profiles not yet imported + "New character" (asks for a name) + Back; the server
 text-entry mode: `pc_main.c` routes `SDL_TEXTINPUT` / `SDL_KEYDOWN` / controller A,B to the menu while it is active (Enter = next / OK, Esc or pad B = cancel), the pad driver stands down meanwhile (same
 pattern as the keybinding capture). Add = name -> address -> port, validated field by field with the same rules as `--server-add`.
 
-**Decision: relaunch, not in-process start.** Starting the network client inside the running title process would change the role after startup, which the role audit (role is fixed before init) does not
-allow. Connect therefore RELAUNCHES the same executable (`pc_relaunch.c`: `CreateProcess`, exe from `GetModuleFileName`, same working directory so `save/` resolves identically) with
+**Superseded decision (kept for the history): relaunch, not in-process start.** The first M4 cut assumed the role is fixed before init and RELAUNCHED the executable on Connect; the role reads turned out to
+be call-time reads, so Connect now runs in-process (next section). The relaunch machinery (`pc_relaunch.c`: `CreateProcess`, exe from `GetModuleFileName`, same working directory so `save/` resolves identically) is still used by the promoted-guest relaunch and for argument validation. The original design relaunched with
 `--connect HOST:PORT --character UUID` (store character; a typed new name starts the Rover creation), `--guest-profile NAME` (legacy-only profile) or `--guest` (the default `guest.ini`), then sets
 `g_pc_running = 0` so the title process exits cleanly. Arguments are validated (IPv4 literal, port, name `[A-Za-z0-9-]`) so no quoting/injection is possible. On non-Windows the function only prints the
 command and does not quit. Other command-line options of the title process (e.g. `--fullscreen`) are NOT forwarded; settings come from `settings.ini`.
@@ -813,6 +813,43 @@ Verification: the menu code is compile-checked and source-audited only (no UI au
 Still missing: M2b resident token authentication; guest -> resident promotion (needs town transfer); a per-server town save dir (there is one `save/card_a` today, so switching to a server
 with another town still needs the matching town GCI copied there); hostname / DNS resolution (IPv4 literals only); starting the role in-process (needs a re-init path audited for every role-dependent
 module); `last_town` hint; controller-only add/edit of servers (needs a keyboard; use `--server-add`).
+
+### Play Online without relaunch
+
+**Before.** Connect called `pc_relaunch_connect` (a new process with `--connect H:P (--character U | --guest-profile N | --guest) --town-fetch --online-ui`) and quit the title process. **Now** Connect files a request
+(`pc_main_play_online_request`) and `pc_main_play_online_poll()` (`pc_vi.c`, every frame, right after the dedicated console poll, before the bootstrap polls) runs the same steps IN the title process:
+
+1. guards: network role NONE, a live `play_main` scene without a running wipe, the Play Online menu open (the menu is inert from the request on);
+2. snapshot for rollback: `pc_session()` contents, the guest spec / selected guest profile, the CLI-style globals, `pc_save_loaded` / `pc_save_ready`;
+3. session + character exactly like the CLI (`pc_main_prepare_store_character`; a legacy-only profile / the default guest goes through a copy of the `--guest` legacy block, `pc_po_prepare_legacy_guest`);
+4. the pre-boot town fetch (`pc_net_game_town_prefetch`, its own connection, up to ~30 s) with the same boxes: Retry loops, Use saved copy continues, Quit or "no usable town" CANCELS;
+5. membership resolve (a stale membership cancels with a menu message instead of `exit(3)`) and `pc_save_validate_gci_file` on the town that is about to be loaded;
+6. `pc_net_game_start_client` (the role becomes CLIENT);
+7. COMMIT: `pc_save_ready = 0`, then `pc_save_loaded = pc_save_check_and_load()` (the role is CLIENT before a sanitized cache is read, which `pc_save_read_gci` would otherwise refuse with exit 3);
+8. the play scene fades back to the title with the vanilla `FADE_TYPE_OUT_RETURN_TITLE` (`m_play.c`: trademark -> `common_data_reinit` -> `pc_save_reload` of the fetched town): the new title is the state a relaunched
+   `--connect --town-fetch` process reaches at its first title frame (menu shows "Join as Guest");
+9. only after `gamePT->exec` has left `play_main` the one-shot bootstrap polls are armed (`g_pc_bootstrap_guest` / `g_pc_bootstrap_resident_pid_set`), so they fire on the NEW title over the fetched town and the guest
+   arrival / resident bind run unchanged. The log has `[PC] play-online: in-process connect pid=<pid> (no relaunch)`.
+
+**Why it is safe.** Every role read happens at call time (save writers, field / wildlife authority, the local-world latch are re-evaluated per frame); `pc_net_game_shutdown` already returns the role to NONE and net
+init / shutdown already run twice per process in the `--town-fetch` flow; the fetch peer is closed after TOWN_DONE before the game peer connects (the host sees two transport connections, and the game peer is never
+disconnected). The town dir is only switched by the prefetch itself (`pc_card_set_town_dir`), never on top of another one.
+
+**Rollback.** Any failure before the fade (bad character, cancelled box, no usable town, stale membership, invalid GCI, client start failure, load failure) restores the session, the guest selection and spec, all globals,
+the town dir (`pc_card_reset_town_dir_for_test`), shuts the client down if it was started, disarms a first-run creation, and - only when the RAM save had already been replaced - re-reads the single-player town from
+`save/card_a`; then the menu shows the reason. One deliberate side effect stays: the "last used character" hint (`save/mp/characters.ini`) is written before the fetch, exactly like the CLI.
+
+**Limits.** (a) The fetch BLOCKS the frame loop (the window title shows the progress; `SDL_PumpEvents` keeps Windows from flagging it unresponsive); follow-up: a non-blocking fetch state machine. (b) An arrival failure
+after the fade still `exit(2)` like the CLI path. (c) The promoted-guest relaunch (`pc_main_relaunch_poll`, guest -> resident) STAYS a relaunch (follow-up: the same in-process path with a fresh fetch).
+(d) The old title scene keeps running on the freshly loaded town RAM for the ~2 s fade. (e) Leaving a town and reconnecting elsewhere in the same process is not supported (the menu is only offered at role NONE).
+
+**Test aids (test-only, env vars).** `AC_DISPLAY_NAME=<text>`: the window opens on the display whose SDL name, Windows monitor friendly name or EDID vendor (SAM = "samsung") contains the text (case-insensitive);
+every display is logged (`[PC] display N: ... bounds=...`); no or several matches exit with code 4 before any window exists. `AC_MASTER_VOLUME=<0..100>`: integer percent applied at the audio output
+(`sample * vol / 100`, the same scale as `master_volume`; 1 = 1 %), never written to `settings.ini`, no Windows volume is touched.
+
+**Test.** `pc/tools/net_spike/test_play_online_inprocess_real.py` (disposable `bin_fixture4_ipc_*` copies, dedicated host, windowed client driven with key events on the Samsung display, `AC_RELAUNCH_DRYRUN=1` as a
+tripwire): S1 same PID and StartTime before / after Connect, exactly one client process, no `RELAUNCH` in the log, the in-process line carries the PID, the host saw two transport connections and no disconnect of the game
+peer, the client reached READY and the guest arrived at the station; S2 (host stopped, `AC_TOWN_NO_MSGBOX=1`): the fetch finds no town, the connect is rolled back, the process stays alive and the menu accepts a new request.
 
 ### Town cache and town transfer (phase 2, M-A / M-B)
 

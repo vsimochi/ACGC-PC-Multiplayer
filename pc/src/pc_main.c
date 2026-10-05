@@ -101,6 +101,137 @@ static void pc_signal_handler(int sig) {
 }
 #endif
 
+/* Test aid: AC_DISPLAY_NAME=<text> puts the window on the display whose name contains <text> (case-insensitive). Matched against the SDL display name, the Windows monitor
+ * friendly name (QueryDisplayConfig / DISPLAYCONFIG_TARGET_DEVICE_NAME, joined to the SDL display through its GDI device) and the EDID vendor (3 letters + a short vendor
+ * name, e.g. SAM = "Samsung": the friendly name of a Samsung monitor is a model number). EVERY display is logged (name, friendly name, vendor, bounds) whenever the variable
+ * is set. No match, or more than one, exits 4 before any window exists, so a test never lands on the wrong monitor. Unset = SDL_WINDOWPOS_CENTERED as before. */
+static void pc_display_lower(char* s) {
+    for (; *s != '\0'; s++) {
+        if (*s >= 'A' && *s <= 'Z') *s = (char)(*s - 'A' + 'a');
+    }
+}
+
+#ifdef _WIN32
+/* The Windows friendly name + 3-letter EDID vendor of the monitor that shows SDL display `idx`. 1 = found. */
+static int pc_win_display_target(int idx, char* friendly, size_t fcap, char* vendor, size_t vcap) {
+    SDL_Rect r;
+    POINT pt;
+    HMONITOR hm;
+    MONITORINFOEXW mi;
+    UINT32 np = 0, nm = 0, i;
+    DISPLAYCONFIG_PATH_INFO* paths;
+    DISPLAYCONFIG_MODE_INFO* modes;
+    int found = 0;
+    friendly[0] = '\0';
+    vendor[0] = '\0';
+    if (SDL_GetDisplayBounds(idx, &r) != 0) return 0;
+    pt.x = r.x + r.w / 2;
+    pt.y = r.y + r.h / 2;
+    hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+    if (hm == NULL) return 0;
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hm, (MONITORINFO*)&mi)) return 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) return 0;
+    paths = (DISPLAYCONFIG_PATH_INFO*)calloc(np, sizeof(*paths));
+    modes = (DISPLAYCONFIG_MODE_INFO*)calloc(nm > 0 ? nm : 1, sizeof(*modes));
+    if (paths != NULL && modes != NULL && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
+        for (i = 0; i < np && !found; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME sn;
+            DISPLAYCONFIG_TARGET_DEVICE_NAME tn;
+            memset(&sn, 0, sizeof(sn));
+            sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            sn.header.size = sizeof(sn);
+            sn.header.adapterId = paths[i].sourceInfo.adapterId;
+            sn.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS || wcscmp(sn.viewGdiDeviceName, mi.szDevice) != 0) continue;
+            memset(&tn, 0, sizeof(tn));
+            tn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            tn.header.size = sizeof(tn);
+            tn.header.adapterId = paths[i].targetInfo.adapterId;
+            tn.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&tn.header) != ERROR_SUCCESS) continue;
+            WideCharToMultiByte(CP_UTF8, 0, tn.monitorFriendlyDeviceName, -1, friendly, (int)fcap, NULL, NULL);
+            friendly[fcap - 1] = '\0';
+            {
+                /* the EDID manufacturer id is stored big-endian (3 x 5 bits, 'A' = 1): try the swapped reading first, then the direct one */
+                unsigned v[2], k, j;
+                v[0] = (unsigned)(((tn.edidManufactureId & 0xFFu) << 8) | (tn.edidManufactureId >> 8));
+                v[1] = (unsigned)tn.edidManufactureId;
+                for (k = 0; k < 2 && vendor[0] == '\0' && vcap >= 4; k++) {
+                    char c[3];
+                    c[0] = (char)('@' + ((v[k] >> 10) & 31));
+                    c[1] = (char)('@' + ((v[k] >> 5) & 31));
+                    c[2] = (char)('@' + (v[k] & 31));
+                    for (j = 0; j < 3 && c[j] >= 'A' && c[j] <= 'Z'; j++) {
+                    }
+                    if (j == 3 && (v[k] & 0x8000u) == 0) {
+                        memcpy(vendor, c, 3);
+                        vendor[3] = '\0';
+                    }
+                }
+            }
+            found = 1;
+        }
+    }
+    free(paths);
+    free(modes);
+    return found;
+}
+#endif
+
+static const char* pc_display_vendor_name(const char* v) {
+    static const char* const k[][2] = { { "SAM", "samsung" }, { "GSM", "lg" }, { "DEL", "dell" }, { "ACR", "acer" }, { "AUS", "asus" }, { "BNQ", "benq" },
+                                        { "AOC", "aoc" }, { "HWP", "hp" }, { "LEN", "lenovo" }, { "MSI", "msi" }, { "PHL", "philips" }, { "VSC", "viewsonic" } };
+    size_t i;
+    for (i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        if (strcmp(v, k[i][0]) == 0) return k[i][1];
+    }
+    return "";
+}
+
+/* 1 = a display was picked (*pos = SDL_WINDOWPOS_CENTERED_DISPLAY(i)), 0 = AC_DISPLAY_NAME is not set. Exits 4 on no / ambiguous match. */
+static int pc_display_pick_from_env(int* pos) {
+    const char* want = getenv("AC_DISPLAY_NAME");
+    char needle[64];
+    int n, i, matches = 0, first = -1;
+    if (want == NULL || want[0] == '\0') return 0;
+    snprintf(needle, sizeof(needle), "%s", want);
+    pc_display_lower(needle);
+    n = SDL_GetNumVideoDisplays();
+    printf("[PC] display: AC_DISPLAY_NAME='%s': %d display(s)\n", want, n);
+    for (i = 0; i < n; i++) {
+        SDL_Rect r;
+        char friendly[128], vendor[8], hay[512];
+        const char* sdln = SDL_GetDisplayName(i);
+        friendly[0] = '\0';
+        vendor[0] = '\0';
+        memset(&r, 0, sizeof(r));
+        (void)SDL_GetDisplayBounds(i, &r);
+#ifdef _WIN32
+        (void)pc_win_display_target(i, friendly, sizeof(friendly), vendor, sizeof(vendor));
+#endif
+        snprintf(hay, sizeof(hay), "%s|%s|%s|%s", sdln != NULL ? sdln : "", friendly, vendor, pc_display_vendor_name(vendor));
+        pc_display_lower(hay);
+        printf("[PC] display %d: sdl-name='%s' friendly-name='%s' vendor='%s' bounds=%d,%d %dx%d%s\n", i, sdln != NULL ? sdln : "", friendly, vendor, r.x, r.y, r.w, r.h,
+               strstr(hay, needle) != NULL ? "  <-- matches" : "");
+        if (strstr(hay, needle) != NULL) {
+            if (first < 0) first = i;
+            matches++;
+        }
+    }
+    fflush(stdout);
+    if (matches != 1) {
+        fprintf(stderr, "[PC] display: AC_DISPLAY_NAME='%s' matched %d display(s) (need exactly 1): REFUSING to open a window (exit 4)\n", want, matches);
+        fflush(NULL);
+        SDL_Quit();
+        exit(4);
+    }
+    *pos = SDL_WINDOWPOS_CENTERED_DISPLAY(first);
+    printf("[PC] display: window goes to display %d\n", first);
+    return 1;
+}
+
 void pc_platform_init(void) {
 #ifdef _WIN32
     SetProcessDPIAware();
@@ -145,9 +276,11 @@ void pc_platform_init(void) {
         if (g_pc_dedicated) {
             flags = SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN; /* --dedicated: hidden, never shown (SDL_ShowWindow is never called), not fullscreen/resizable; the GL 3.3 context below still exists */
         }
+        int win_pos = SDL_WINDOWPOS_CENTERED;
+        (void)pc_display_pick_from_env(&win_pos); /* test aid AC_DISPLAY_NAME (exits 4 when it matches no / several displays) */
         g_pc_window = SDL_CreateWindow(
             PC_WINDOW_TITLE,
-            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            win_pos, win_pos,
             win_w, win_h, flags
         );
     }
@@ -619,6 +752,10 @@ static int         g_pc_town_fetch = 0;
 static int         g_pc_online_ui = 0;
 int                g_pc_bootstrap_resident_pid_set = 0;
 unsigned char      g_pc_bootstrap_resident_pid[20];
+/* Play Online without relaunch (pc_main_play_online_poll, below): 1 while the in-process connect runs; a STALE membership then is reported through s_po_stale instead of the
+ * box + exit(3) of the CLI path. */
+static int         s_po_inproc = 0;
+static int         s_po_stale = 0;
 
 /* M-G: pc_save_read_gci() found a SANITIZED town transfer image (a client cache) in a process that is not a network client: it must never be hosted, played offline as
  * a town or saved. Box (suppressed by the test hook AC_TOWN_NO_MSGBOX) + exit 3. */
@@ -728,6 +865,10 @@ static void pc_main_resolve_membership(void) {
         if (n == sizeof(gci) && !pc_town_gci_find_resident(gci, n, pid, &slot)) {
             const char* msg = "This character is no longer a resident of this town (removed or town reset): ask the operator.";
             fprintf(stderr, "[PC] membership: STALE: character %s is recorded as a resident of town %s but its PersonalID is not a resident of the fetched town: %s\n", ss->character.uuid, base, msg);
+            if (s_po_inproc) { /* Play Online in this process: no box, no exit; the caller cancels the connect and shows the message in the menu */
+                s_po_stale = 1;
+                return;
+            }
             if (getenv("AC_TOWN_NO_MSGBOX") == NULL) {
                 SDL_MessageBoxButtonData btn;
                 SDL_MessageBoxData box;
@@ -834,6 +975,310 @@ static int pc_main_prepare_store_character(void) {
     }
     g_pc_bootstrap_guest = g_pc_guest_spec;
     return 1;
+}
+
+/* ===== Play Online WITHOUT relaunch =====
+ * The Play Online menu (pc_play_online_menu.c) files a request; pc_main_play_online_poll() (pc_vi.c, every frame, between pc_net_game_poll and the bootstrap polls) executes it
+ * in THIS process: the steps are exactly what a relaunched `--connect H:P (--character U | --guest-profile N | --guest) --town-fetch --online-ui` process does before and at its
+ * first title frame, then the play scene fades back to the title with the vanilla FADE_TYPE_OUT_RETURN_TITLE (trademark_init -> common_data_reinit -> pc_save_reload of the
+ * fetched town), and only after the scene was left the existing one-shot bootstrap polls are armed so they fire on the NEW title:
+ *   1 guards (role NONE, idle play scene, menu open) 2 snapshot 3 session + character 4 pre-boot town fetch (blocking, up to ~30 s; Retry / Use saved copy / Quit boxes)
+ *   5 membership + GCI check 6 pc_net_game_start_client 7 COMMIT: load the fetched town (role is CLIENT before any sanitized image is read) 8 fade to the title
+ *   9 arm the bootstrap polls once the scene is gone.
+ * Any failure before the fade ROLLS BACK everything (town dir, session, guest selection, globals, net, save flags; the single-player town is re-read from save/card_a only if the
+ * RAM save was already replaced) and returns to the menu with a message. Known limits: the fetch blocks the frame loop (window title shows the progress); an arrival failure after
+ * the fade still exits(2) like the CLI path; the promoted-guest relaunch (pc_main_relaunch_poll) stays a relaunch. */
+extern int  pc_play_online_scene_ready(void);                 /* pc_m_card.c */
+extern int  pc_play_online_scene_left(void);
+extern void pc_play_online_begin_return_title(void);
+extern int  pc_play_online_save_load(void);
+extern int  pc_play_online_save_flags_get(int* ready);
+extern void pc_play_online_save_flags_set(int loaded, int ready);
+extern void pc_guest_creation_disarm(void);
+
+enum { PO_IDLE = 0, PO_REQUESTED = 1, PO_FADING = 2 };
+static struct {
+    int  state;
+    char host[64];
+    int  port;
+    int  kind;
+    char name[40];
+    int  wait;       /* frames waiting for an idle title scene */
+    int  arm_guest;  /* arm g_pc_bootstrap_guest once the scene was left */
+    int  arm_pid;    /* arm g_pc_bootstrap_resident_pid_set once the scene was left */
+} s_po;
+static char s_po_character[48]; /* backing store of g_pc_character_spec for the in-process connect */
+
+int pc_main_play_online_request(const char* host, int port, int kind, const char* name) {
+    char tmp[320];
+    if (s_po.state != PO_IDLE || host == NULL || strlen(host) >= sizeof(s_po.host)) {
+        return 0;
+    }
+    if (!pc_relaunch_build_args(host, port, kind, name, tmp, sizeof(tmp))) { /* the same validation as the relaunch had: IPv4 literal, port, [A-Za-z0-9-] name */
+        return 0;
+    }
+    memset(&s_po, 0, sizeof(s_po));
+    snprintf(s_po.host, sizeof(s_po.host), "%s", host);
+    s_po.port = port;
+    s_po.kind = kind;
+    snprintf(s_po.name, sizeof(s_po.name), "%s", name != NULL ? name : "");
+    s_po.state = PO_REQUESTED;
+    return 1;
+}
+
+/* The ONLY guest-profile selection of the in-process connect (the CLI has its own two call sites). NULL / "" = the default profile. */
+static int pc_po_select_profile(const char* name) {
+    return pc_guest_profile_select(name);
+}
+
+static void pc_po_progress(const char* text) {
+    pc_town_title_progress(text);
+    SDL_PumpEvents(); /* keep the window answering to Windows while the fetch blocks the frame loop (events stay queued for the next frame) */
+}
+
+/* The legacy guest-profile flow of main()'s `if (g_pc_guest)` block (same calls), for a Play Online connect whose character is NOT a store character. 1 = ok, 0 = refused. */
+static int pc_po_prepare_legacy_guest(char* err, size_t errcap) {
+    PCGuestProfile gp;
+    char gerr[512];
+    int gres, creating = 0;
+    if (pc_guest_profile_selected() != NULL) {
+        gres = pc_guest_profile_read_selected(&gp, gerr, sizeof(gerr));
+        if (gres == PC_GUEST_PROFILE_ABSENT) {
+            if (!pc_guest_profile_prepare_new_selected(&gp, gerr, sizeof(gerr))) {
+                gres = PC_GUEST_PROFILE_ERR;
+            } else {
+                creating = 1;
+            }
+        }
+    } else {
+        gres = pc_guest_profile_load_or_create_selected(&gp, gerr, sizeof(gerr));
+    }
+    if (gres == PC_GUEST_PROFILE_ERR || !pc_guest_profile_spec(&gp, g_pc_guest_spec, sizeof(g_pc_guest_spec))) {
+        fprintf(stderr, "[PC] play-online: guest profile REFUSED: %s\n", gres == PC_GUEST_PROFILE_ERR ? gerr : "internal error (spec buffer)");
+        snprintf(err, errcap, "The guest profile is not usable: %.200s", gres == PC_GUEST_PROFILE_ERR ? gerr : "internal error");
+        return 0;
+    }
+    if (creating) {
+        extern void pc_guest_creation_arm(const PCGuestProfile* p); /* pc_m_card.c */
+        pc_guest_creation_arm(&gp);
+    }
+    printf("[PC] play-online: guest profile %s: name '%s', player id 0x%04X, land id 0x%04X%s\n", pc_guest_profile_selected_path(), gp.name, (unsigned)gp.player_id, (unsigned)gp.land_id,
+           creating ? " (FIRST-RUN CREATION in the Rover scene)" : "");
+    g_pc_bootstrap_guest = g_pc_guest_spec;
+    return 1;
+}
+
+/* Steps 2..8. 1 = committed (the fade to the title was requested), 0 = rolled back (err holds the menu message). */
+static int pc_po_connect(char* err, size_t errcap) {
+    PCConnectSession* ss = pc_session();
+    PCConnectSession ss_snap = *ss;
+    char host_snap[sizeof(g_pc_net_host_ip)];
+    char gspec_snap[sizeof(g_pc_guest_spec)];
+    char gprof_snap[48];
+    char town_err[700];
+    const char* chr_snap = g_pc_character_spec;
+    const char* bg_snap = g_pc_bootstrap_guest;
+    const int role_snap = g_pc_net_role, fetch_snap = g_pc_town_fetch, ui_snap = g_pc_online_ui, guest_snap = g_pc_guest, pidset_snap = g_pc_bootstrap_resident_pid_set;
+    const uint16_t port_snap = g_pc_net_port;
+    int ready_snap = 0, loaded_snap, net_started = 0, ram_touched = 0, rc, town_rc;
+    const char* sel;
+
+    loaded_snap = pc_play_online_save_flags_get(&ready_snap);
+    memcpy(host_snap, g_pc_net_host_ip, sizeof(host_snap));
+    memcpy(gspec_snap, g_pc_guest_spec, sizeof(gspec_snap));
+    sel = pc_guest_profile_selected();
+    snprintf(gprof_snap, sizeof(gprof_snap), "%s", sel != NULL ? sel : "");
+    err[0] = '\0';
+
+    /* step 1 (defensive): no town dir may be selected in a role-NONE process; a different one would be refused by pc_card_set_town_dir */
+    if (pc_card_town_dir_active()) {
+        pc_card_reset_town_dir_for_test();
+    }
+
+    /* step 3: the state the CLI parse leaves for `--connect H:P ... --town-fetch --online-ui` */
+    s_po_inproc = 1;
+    s_po_stale = 0;
+    g_pc_net_role = 2;
+    snprintf(g_pc_net_host_ip, sizeof(g_pc_net_host_ip), "%s", s_po.host);
+    g_pc_net_port = (uint16_t)s_po.port;
+    g_pc_town_fetch = 1;
+    g_pc_online_ui = 1;
+    g_pc_guest = 1;
+    g_pc_bootstrap_guest = NULL;
+    g_pc_bootstrap_resident_pid_set = 0;
+    memset(ss, 0, sizeof(*ss));
+    if (s_po.kind == PC_RELAUNCH_CHARACTER) {
+        snprintf(s_po_character, sizeof(s_po_character), "%s", s_po.name);
+        g_pc_character_spec = s_po_character;
+        (void)pc_po_select_profile(NULL);
+    } else if (s_po.kind == PC_RELAUNCH_PROFILE) {
+        g_pc_character_spec = NULL;
+        if (!pc_po_select_profile(s_po.name)) {
+            snprintf(err, errcap, "Bad guest profile name");
+            goto rollback;
+        }
+    } else {
+        g_pc_character_spec = NULL;
+        (void)pc_po_select_profile(NULL);
+    }
+    rc = pc_main_prepare_store_character();
+    if (rc < 0) {
+        snprintf(err, errcap, "This character cannot be used (see the log)");
+        goto rollback;
+    }
+    if (rc == 0 && !pc_po_prepare_legacy_guest(err, errcap)) {
+        goto rollback;
+    }
+
+    /* step 4: the pre-boot town fetch, with the box mapping Retry = loop, Use saved copy = continue, Quit / no usable town = CANCEL */
+    for (;;) {
+        town_err[0] = '\0';
+        town_rc = pc_net_game_town_prefetch(g_pc_net_host_ip, g_pc_net_port, 30000u, pc_po_progress, g_pc_server_name, town_err, sizeof(town_err));
+        if (town_rc == PC_TOWN_PREFETCH_ERROR) {
+            fprintf(stderr, "[PC] play-online: town fetch: %s\n", town_err);
+            if (getenv("AC_TOWN_NO_MSGBOX") == NULL && pc_town_failure_box(town_err, 0) == 0) {
+                continue;
+            }
+            snprintf(err, errcap, "Could not get the host's town: %.120s", town_err);
+            if (strchr(err, '\n') != NULL) *strchr(err, '\n') = '\0';
+            goto rollback;
+        }
+        if ((town_rc == PC_TOWN_PREFETCH_CACHE || town_rc == PC_TOWN_PREFETCH_LEGACY) && getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+            char msg[800];
+            int pick;
+            snprintf(msg, sizeof(msg), "Could not get the host's current town (%s).\n\nRetry, or continue with the %s you already have?\n\"Use saved copy\" is not offline play: the game still tries to connect in the background.", town_err,
+                     town_rc == PC_TOWN_PREFETCH_CACHE ? "saved copy of this server's town" : "town in save/card_a");
+            pick = pc_town_failure_box(msg, 1);
+            if (pick == 0) {
+                pc_card_reset_town_dir_for_test();
+                continue;
+            }
+            if (pick == 2) {
+                snprintf(err, errcap, "%s", "Cancelled: the connection was not started");
+                goto rollback;
+            }
+        }
+        break;
+    }
+
+    /* step 5: membership (a stale one cancels instead of exit(3)) and a GCI pre-validation of the town that is about to be loaded */
+    pc_main_resolve_membership();
+    if (s_po_stale) {
+        snprintf(err, errcap, "%s", "This character is no longer a resident of this town (removed or town reset): ask the operator.");
+        goto rollback;
+    }
+    {
+        PCTownId tid;
+        if (!pc_save_validate_gci_file(pc_gci_path(), &tid)) {
+            snprintf(err, errcap, "%s", "The town file is missing or not valid (see the log)");
+            fprintf(stderr, "[PC] play-online: pre-validation of '%s' FAILED\n", pc_gci_path());
+            goto rollback;
+        }
+    }
+    /* the polls fire only on the NEW title: remember what the CLI would have armed and keep the globals clear until the scene was left */
+    s_po.arm_guest = g_pc_bootstrap_guest != NULL;
+    s_po.arm_pid = g_pc_bootstrap_resident_pid_set;
+    g_pc_bootstrap_guest = bg_snap;
+    g_pc_bootstrap_resident_pid_set = pidset_snap;
+
+    /* step 6 */
+    if (!pc_net_game_start_client(g_pc_net_host_ip, g_pc_net_port)) {
+        snprintf(err, errcap, "%s", "Could not start the network client");
+        goto rollback;
+    }
+    net_started = 1;
+
+    /* step 7: COMMIT. The role is CLIENT now, so a sanitized town image may be read; pc_save_ready is cleared inside. */
+    ram_touched = 1;
+    if (!pc_play_online_save_load()) {
+        snprintf(err, errcap, "%s", "The town could not be loaded (see the log)");
+        goto rollback;
+    }
+
+    /* step 8 */
+    printf("[PC] play-online: in-process connect pid=%lu (no relaunch)\n",
+#ifdef _WIN32
+           (unsigned long)GetCurrentProcessId()
+#else
+           (unsigned long)getpid()
+#endif
+    );
+    printf("[PC] play-online: connected to %s:%d as %s, town dir %s: fading back to the title to enter the town\n", g_pc_net_host_ip, (int)g_pc_net_port,
+           ss->storage == PC_CHARACTER_STORAGE_STORE ? ss->character.uuid : "(legacy guest)", pc_card_town_dir() != NULL ? pc_card_town_dir() : "save/card_a");
+    s_po_inproc = 0;
+    pc_play_online_begin_return_title();
+    return 1;
+
+rollback:
+    s_po_inproc = 0;
+    printf("[PC] play-online: connect cancelled / failed, rolling back: %s\n", err);
+    if (net_started) {
+        pc_net_game_shutdown();
+    }
+    pc_card_reset_town_dir_for_test();
+    pc_guest_creation_disarm();
+    *ss = ss_snap;
+    memcpy(g_pc_net_host_ip, host_snap, sizeof(g_pc_net_host_ip));
+    memcpy(g_pc_guest_spec, gspec_snap, sizeof(g_pc_guest_spec));
+    (void)pc_po_select_profile(gprof_snap);
+    g_pc_character_spec = chr_snap;
+    g_pc_bootstrap_guest = bg_snap;
+    g_pc_bootstrap_resident_pid_set = pidset_snap;
+    g_pc_net_role = role_snap;
+    g_pc_net_port = port_snap;
+    g_pc_town_fetch = fetch_snap;
+    g_pc_online_ui = ui_snap;
+    g_pc_guest = guest_snap;
+    if (ram_touched && loaded_snap) {
+        (void)pc_play_online_save_load(); /* the single-player town again (role NONE, default dir) */
+    }
+    pc_play_online_save_flags_set(loaded_snap, ready_snap);
+    return 0;
+}
+
+void pc_main_play_online_poll(void) {
+    char err[300];
+    if (s_po.state == PO_IDLE) {
+        return;
+    }
+    if (s_po.state == PO_REQUESTED) {
+        if (!pc_play_online_menu_active()) {
+            s_po.state = PO_IDLE;
+            return;
+        }
+        if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+            s_po.state = PO_IDLE;
+            pc_play_online_menu_connect_result(0, "Already online");
+            return;
+        }
+        if (!pc_play_online_scene_ready()) {
+            if (++s_po.wait > 600) {
+                s_po.state = PO_IDLE;
+                pc_play_online_menu_connect_result(0, "The title is busy, try again");
+            }
+            return;
+        }
+        if (pc_po_connect(err, sizeof(err))) {
+            s_po.state = PO_FADING;
+            pc_play_online_menu_connect_result(1, "Connected: entering the town ...");
+        } else {
+            s_po.state = PO_IDLE;
+            pc_play_online_menu_connect_result(0, err);
+        }
+        return;
+    }
+    /* PO_FADING: the fade-to-title runs in the play scene; arm the one-shot bootstrap polls only after the scene was left, otherwise they would fire on the OLD title */
+    if (pc_play_online_scene_left()) {
+        if (s_po.arm_guest) {
+            g_pc_bootstrap_guest = g_pc_guest_spec;
+        }
+        if (s_po.arm_pid) {
+            g_pc_bootstrap_resident_pid_set = 1;
+        }
+        printf("[PC] play-online: title scene left: bootstrap %s armed for the new title\n", s_po.arm_pid ? "resident-by-PID" : s_po.arm_guest ? "guest arrival" : "(none)");
+        s_po.state = PO_IDLE;
+        pc_play_online_menu_close();
+    }
 }
 
 int main(int argc, char* argv[]) {

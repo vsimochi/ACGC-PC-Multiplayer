@@ -1,5 +1,5 @@
-/* pc_relaunch.h - M4: "Play Online" starts the network client by RELAUNCHING this executable with the right CLI instead of starting a client inside the
- * running title process (the role audit assumes the role is fixed at process start). Windows: CreateProcess(exe from GetModuleFileName, same working directory),
+/* pc_relaunch.h - M4: the first "Play Online" cut started the network client by RELAUNCHING this executable with the right CLI; Play Online now connects in-process (pc_main.c
+ * pc_main_play_online_poll) and this module remains for the promoted-guest relaunch (pc_main_relaunch_poll) and for validating the connect arguments (pc_relaunch_build_args). Windows: CreateProcess(exe from GetModuleFileName, same working directory),
  * the caller then exits the title process. Other platforms: a stub that prints the command and returns 0 (nothing is started, the caller must NOT exit). No game
  * headers here (windows.h stays out of the game translation units). */
 #ifndef PC_RELAUNCH_H

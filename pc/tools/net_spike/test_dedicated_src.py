@@ -172,7 +172,9 @@ def main():
     ck("A5 audio is not removed: AIInit still opens the SDL device, the producer thread / callback / ring are unchanged vs HEAD",
        "SDL_OpenAudioDevice" in ai and func_body(audio_c, "pc_audio_producer_func") == func_body(head("pc/src/pc_audio.c"), "pc_audio_producer_func")
        and func_body(audio_c, "pc_audio_callback") == func_body(head("pc/src/pc_audio.c"), "pc_audio_callback")
-       and func_body(audio_c, "AIInitDMA") == func_body(head("pc/src/pc_audio.c"), "AIInitDMA"))
+       # Play Online without relaunch: AIInitDMA changed in exactly ONE line (the volume read) for the test-only AC_MASTER_VOLUME override; with that line mapped back it is byte-identical to HEAD
+       and func_body(audio_c, "AIInitDMA").replace("int vol = pc_audio_master_volume();", "int vol = g_pc_settings.master_volume;") == func_body(head("pc/src/pc_audio.c"), "AIInitDMA")
+       and "int vol = pc_audio_master_volume();" in func_body(audio_c, "AIInitDMA") and 'getenv("AC_MASTER_VOLUME")' in audio_c and "return s_env_vol >= 0 ? s_env_vol : g_pc_settings.master_volume;" in audio_c)
 
     # ---------------------------------------------------------------- R: render skip
     t00 = func_body(graph_c, "graph_task_set00")

@@ -1,11 +1,11 @@
 /* pc_play_online_menu.c - see pc_play_online_menu.h. Modelled on pc_settings_menu.c (state + nav/confirm/cancel/draw) and on its keybinding capture (raw SDL events
- * routed by pc_main). Never blocks: every operation is a small file read/write or one CreateProcess. */
+ * routed by pc_main). Never blocks: every operation is a small file read/write or a queued request (the in-process connect itself runs in pc_main_play_online_poll). */
 #include "pc_play_online_menu.h"
 #include "pc_character.h"
 #include "pc_guest_profile.h"
 #include "pc_menu_util.h"
 #include "pc_net_game.h"
-#include "pc_relaunch.h"
+#include "pc_relaunch.h" /* PC_RELAUNCH_* kinds (the relaunch itself is no longer used here) */
 #include "pc_servers.h"
 
 #include "m_font.h"
@@ -173,17 +173,31 @@ static int text_char_ok(unsigned char c) {
 }
 
 static void do_connect(const PCServer* s, int kind, const char* name, const char* display) {
-    char err[200];
     if (s_launched) return;
     (void)pc_servers_set_last(NULL, s->name, display, NULL); /* UI hint only; failure is irrelevant */
-    err[0] = '\0';
-    if (pc_relaunch_connect(s->address, s->port, kind, name, err, sizeof(err))) {
+    /* In-process connect (no relaunch): the request is executed by pc_main_play_online_poll() (pc_vi.c) at the end of this frame. The menu ignores input meanwhile. */
+    if (pc_main_play_online_request(s->address, s->port, kind, name)) {
         s_launched = 1;
-        set_msg(0, "Starting the client for %s ...", s->name);
-        g_pc_running = 0; /* quit THIS process cleanly; the new one is already running */
+        set_msg(0, "Connecting to %s ...", s->name);
     } else {
-        set_msg(1, "Could not start the client: %s", err);
+        set_msg(1, "%s", "Could not start the connection (bad server or character name)");
     }
+}
+
+void pc_play_online_menu_connect_result(int ok, const char* msg) {
+    if (ok) {
+        set_msg(0, "%s", msg != NULL ? msg : "Connected: loading the town ...");
+        /* s_launched stays 1: the menu is inert (and drawn) while the title fades out; pc_main closes it once the title scene is gone */
+    } else {
+        s_launched = 0; /* back to the menu, the character page, with the reason */
+        set_msg(1, "%s", msg != NULL ? msg : "Could not connect");
+    }
+}
+
+void pc_play_online_menu_close(void) {
+    s_active = 0;
+    s_launched = 0;
+    s_text = T_NONE;
 }
 
 static void text_commit(void) {
@@ -544,7 +558,7 @@ void pc_play_online_menu_draw(struct game_s* game, int with_dim_backdrop) {
         sanitize(buf);
         draw_list(game, buf, "Connect picks a character next");
     } else if (s_page == PG_CHARS) {
-        draw_list(game, "- Choose a character -", "The client restarts the game to connect");
+        draw_list(game, "- Choose a character -", "Fetches the town, then joins (no restart)");
     } else {
         snprintf(buf, sizeof(buf), "Delete %s?", s_srv[s_cur].name);
         sanitize(buf);

@@ -131,7 +131,7 @@ This keeps `pc_net_game_poll`, which touches game state, out of the pre-boot pha
   1. An existing `towns/K` found through `origin.ini` (offline-capable).
   2. Otherwise the legacy `save/card_a`.
   3. Otherwise a message box ("host has no town transfer; copy the save").
-- Reconnect does not fetch again (the process is already booted). Switching servers is a new relaunch, so a new fetch.
+- Reconnect does not fetch again (the process is already booted). Switching servers is a new connect, so a new fetch (Play Online connects in-process now; the promoted-guest handoff still relaunches).
 
 **Privacy, stated plainly:** the GCI contains every resident's pockets, mail, diary and designs. The first version serves it unsanitized, which is acceptable only for supervised friends/LAN use, and this must be documented.
 
@@ -178,7 +178,7 @@ Crash safety on load: a handoff whose PID is not in the GCI is invalid, so the g
 
 ## 5. Play Online
 
-- **Keep the relaunch.** The role audit forbids starting a role after startup.
+- **Keep the relaunch.** The role audit forbids starting a role after startup. (SUPERSEDED: Play Online now connects in-process, see docs/multiplayer-guest-roadmap.md "Play Online without relaunch"; only the promoted-guest relaunch remains.)
 - **Change** `pc_relaunch_build_args` to add `--town-fetch`.
 - **Then, in `pc_main`, after the fetch:** resolve the character's membership for town K.
   - `resident` → set `pc_session()->join_kind = RESIDENT` and `resident_pid`. After the save loads, bind through the `--bootstrap-resident` path by PID instead of by index (the slot is found by `CmpPersonalID`).
@@ -355,7 +355,7 @@ unencrypted UDP, trust on first use).
 
 ### M-C (Play Online wiring): implemented (uncommitted, branch `multiplayer`)
 
-**Final flow.** Title -> Play Online -> server list (Add / Edit / Delete, text entry) -> Connect -> character list (existing / New character) -> the title process RELAUNCHES the exe with
+**Final flow.** Title -> Play Online -> server list (Add / Edit / Delete, text entry) -> Connect -> character list (existing / New character) -> (originally: the title process RELAUNCHES the exe; now an in-process connect, see the roadmap) with
 `--connect HOST:PORT --character UUID|--guest-profile NAME|--guest --town-fetch --online-ui [forwarded options]` and quits -> the new process fetches the town before boot (M-B) ->
 `pc_main_resolve_membership()` reads `characters/<uuid>/towns/<townkey>/membership.ini` for the fetched town (townkey = the town dir name) -> resident: `pc_session()->join_kind = RESIDENT`,
 the guest arrival is disarmed, `g_pc_bootstrap_resident_pid` is armed; guest / none: the existing guest arrival (a new character goes through the Rover first-run creation) -> after the save loads
@@ -364,7 +364,7 @@ the new thin `pc_bootstrap_resident_pid_poll()` (pc_m_card.c, called from pc_vi.
 character's per-town `token.dat`) goes out as before -> at READY `pc_session_note_ready()` (called from `pcnetgame_client_note_membership()`, pc_net_game.c) writes `membership.ini`
 (role guest|resident, town_pid = the local PersonalID; a recorded resident membership is never downgraded, a matching one is not rewritten) and servers.ini `last_town` (townkey) of the saved server with that address:port.
 
-**Relaunch decision (kept).** The role audit assumes the role is fixed at process start (host/client/none initialise differently before `boot_main`), and the pre-boot fetch must pick the Card-A
+**Relaunch decision (SUPERSEDED by the in-process connect, see docs/multiplayer-guest-roadmap.md "Play Online without relaunch"; the text below is the original reasoning).** The role audit assumes the role is fixed at process start (host/client/none initialise differently before `boot_main`), and the pre-boot fetch must pick the Card-A
 directory before the save is loaded; starting a client inside the running title process would need both to be re-entrant. The cost is one extra process start (a second or two). The title process
 exits only after `CreateProcess` succeeded.
 

@@ -82,6 +82,13 @@ void VIWaitForRetrace(void) {
         pc_dedicated_console_poll();
     }
 
+    /* Play Online WITHOUT relaunch: executes the title menu's connect request in THIS process (fetch, client start, town load, fade to the title), then arms the bootstrap
+     * polls below once the old title scene is gone. A no-op while no request is pending (always, for a host / dedicated / CLI client). */
+    {
+        extern void pc_main_play_online_poll(void);
+        pc_main_play_online_poll();
+    }
+
     /* Stage 2: retries deferred remote-player actor creation once gamePT/the local player actor
      * are valid. Also unconditional every frame; a no-op whenever nothing is pending. */
     pc_remote_player_poll();

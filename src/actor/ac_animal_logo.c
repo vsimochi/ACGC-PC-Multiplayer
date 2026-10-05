@@ -504,7 +504,7 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
           actor->pc_cursor_cooldown = 10.0f;
         }
         break;
-      case aAL_PC_ITEM_ONLINE: /* Play Online: server -> character selection, then the executable is RELAUNCHED as a client (pc_play_online_menu.c) */
+      case aAL_PC_ITEM_ONLINE: /* Play Online: server -> character selection, then an in-process connect (no relaunch: pc_main.c pc_main_play_online_poll) */
         pc_play_online_menu_enter();
         actor->pc_cursor_cooldown = 10.0f;
         break;

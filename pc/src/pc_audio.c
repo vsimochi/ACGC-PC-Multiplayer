@@ -12,6 +12,8 @@
 #include "pc_settings.h"
 #include "jaudio_NES/audiothread.h"
 #include "pc_dedicated.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 #define PC_AUDIO_SAMPLE_RATE 32000
 
@@ -117,6 +119,29 @@ void AIInit(u8* stack) {
     }
 }
 
+/* Test aid: AC_MASTER_VOLUME=<0..100> (integer percent, same scale as settings master_volume: sample * vol / 100) overrides the settings value AT THE AUDIO OUTPUT ONLY
+ * for this process. It is read once here and NEVER written back (g_pc_settings.master_volume and settings.ini are untouched); no Windows system / per-app volume is
+ * touched. An unset / malformed / out-of-range value is ignored (the settings value applies). */
+static int pc_audio_master_volume(void) {
+    static int s_env_vol = -2; /* -2 = not read yet, -1 = no valid override */
+    if (s_env_vol == -2) {
+        const char* e = getenv("AC_MASTER_VOLUME");
+        char* end = NULL;
+        long v;
+        s_env_vol = -1;
+        if (e != NULL && e[0] != '\0') {
+            v = strtol(e, &end, 10);
+            if (end != e && *end == '\0' && v >= 0 && v <= 100) {
+                s_env_vol = (int)v;
+                printf("[PC] audio: AC_MASTER_VOLUME=%d%% overrides the master volume for this process (settings.ini untouched)\n", s_env_vol);
+            } else {
+                printf("[PC] audio: AC_MASTER_VOLUME='%s' ignored (want an integer 0..100)\n", e);
+            }
+        }
+    }
+    return s_env_vol >= 0 ? s_env_vol : g_pc_settings.master_volume;
+}
+
 void AIInitDMA(u32 addr, u32 size) {
     s16* src = (s16*)(uintptr_t)addr;
     u32 n_samples = size / sizeof(s16);
@@ -132,7 +157,7 @@ void AIInitDMA(u32 addr, u32 size) {
         n_samples = free & ~1u;
     }
 
-    int vol = g_pc_settings.master_volume;
+    int vol = pc_audio_master_volume();
     if (vol < 0)   vol = 0;
     if (vol > 100) vol = 100;
 

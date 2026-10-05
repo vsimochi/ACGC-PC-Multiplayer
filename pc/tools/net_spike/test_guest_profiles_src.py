@@ -87,9 +87,12 @@ def main():
             if n:
                 sel_calls[fn] = n
     prep = S.body(mm, S.functions(mm), "pc_main_prepare_store_character")
-    ck("C ONE source of truth: the selection is set by exactly TWO call sites, both in pc_main.c: (1) the --guest-profile option parsing, (2) pc_main_prepare_store_character selecting the LEGACY profile that a "
-       "--character names / that a store-less legacy character resolves to (calls: %s)" % sel_calls,
-       sel_calls == {"pc_main.c": 2} and len(re.findall(r"\bpc_guest_profile_select\(", mm)) == 2 and len(re.findall(r"\bpc_guest_profile_select\(", prep)) == 1
+    po_sel = S.body(mm, S.functions(mm), "pc_po_select_profile")
+    ck("C ONE source of truth: the selection is set by exactly THREE call sites, all in pc_main.c: (1) the --guest-profile option parsing, (2) pc_main_prepare_store_character selecting the LEGACY profile that a "
+       "--character names / that a store-less legacy character resolves to, (3) Play Online without relaunch: the one wrapper pc_po_select_profile (the in-process connect's select / clear / rollback "
+       "restore; every other in-process use goes through it) (calls: %s)" % sel_calls,
+       sel_calls == {"pc_main.c": 3} and len(re.findall(r"\bpc_guest_profile_select\(", mm)) == 3 and len(re.findall(r"\bpc_guest_profile_select\(", prep)) == 1
+       and "return pc_guest_profile_select(name);" in po_sel and len(re.findall(r"\bpc_po_select_profile\(", mm)) == 5
        and "(void)pc_guest_profile_select(c.legacy_profile);" in prep and "c.storage == PC_CHARACTER_STORAGE_LEGACY" in prep and "(void)pc_guest_profile_select(argv[i + 1]);" in mm)
     ck("C the title actor still never touches the profile module (only pc_guest_title_* in pc_m_card.c)", "pc_guest_profile" not in logo and "pc_guest_title_label()" in logo)
 

@@ -94,7 +94,7 @@ def source_audit():
     check("S pc_main.c: --town-dir is NOT in the --help text (hidden); --town-fetch / --town-serve are documented there",
           '"  --town-dir' not in mn and '"  --town-fetch' in mn and '"  --town-serve' in mn)
     check("S pc_main.c: the legacy --connect start is unchanged without --town-fetch, and the prefetch runs after pc_platform_init and BEFORE pc_disc_init / boot_main",
-          "g_pc_net_role == 2 && !g_pc_town_fetch" in mn and mn.index("pc_platform_init();\n#ifdef PC_LOW_ADDRESS_64") < mn.index("pc_net_game_town_prefetch(")
+          "g_pc_net_role == 2 && !g_pc_town_fetch" in mn and mn.index("pc_platform_init();\n#ifdef PC_LOW_ADDRESS_64") < mn.index("pc_net_game_town_prefetch(", mn.index("int main(int argc"))  # Play Online without relaunch: an earlier in-process call exists in pc_po_connect, so the CLI call is searched inside main()
           < mn.index("pc_disc_init();\n    if (!pc_assets_init())") < mn.index("boot_main(argc"))
     check("S pc_main.c: a fetch with no usable town shows a message box (AC_TOWN_NO_MSGBOX test hook suppresses it) and never boots a wrong town (exit 3)",
           "SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, \"Animal Crossing - town transfer\"" in mn and 'getenv("AC_TOWN_NO_MSGBOX")' in mn and "return 3;" in mn)

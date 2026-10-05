@@ -1789,6 +1789,11 @@ int pc_guest_creation_active(void) {
     return s_pc_guest_create_armed;
 }
 
+/* Play Online without relaunch (pc_main.c pc_main_play_online_poll): a cancelled / failed in-process connect drops a first-run creation that pc_main_prepare_store_character armed. */
+void pc_guest_creation_disarm(void) {
+    s_pc_guest_create_armed = 0;
+}
+
 /* The Rover scene's name check (ac_npc_guide2_move.c_inc aNG2_check_pname): 1 iff the typed name can be stored EXACTLY in the profile file. */
 int pc_guest_creation_name_ok(const u8* game_name) {
     char nm[PC_GUEST_PROFILE_NAME_LEN + 1];
@@ -2095,6 +2100,51 @@ void pc_bootstrap_guest_poll(void) {
         fflush(stdout);
         exit(2);
     }
+}
+
+/* ===== Play Online WITHOUT relaunch: the game-side helpers of pc_main.c pc_main_play_online_poll() (the title scene, an in-process connect) =====
+ * All of them are tiny and non-blocking. The connect itself (fetch, session, net start, save load) lives in pc_main.c; this block only touches the play scene and the save
+ * flags, which are statics of this file. */
+
+/* 1 iff a live play_main scene is idle: no entrance / exit wipe running (the same readiness the bootstrap polls wait for). */
+int pc_play_online_scene_ready(void) {
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    return ((GAME_PLAY*)gamePT)->fb_wipe_mode == WIPE_MODE_NONE;
+}
+
+/* 1 once the play scene has been left (the fade-to-title ended in trademark_init). */
+int pc_play_online_scene_left(void) {
+    return gamePT == NULL || gamePT->exec != play_main;
+}
+
+/* The vanilla "back to the title" request (ac_npc_restart_schedule.c_inc aNRST_think_title: the fade + wipe; m_play.c then goes to trademark -> common_data_reinit ->
+ * pc_save_reload). Only the two fade fields: the vanilla think function also invades the player actor, which does not exist on the title. */
+void pc_play_online_begin_return_title(void) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    play->fb_wipe_type = WIPE_TYPE_FADE_BLACK;
+    play->fb_fade_type = FADE_TYPE_OUT_RETURN_TITLE;
+}
+
+/* Re-reads the town save from the CURRENT town dir (pc_card_a_dir) with the boot-time call (second_game.c: pc_save_loaded = pc_save_check_and_load()). The caller has already
+ * made the role CLIENT when that dir holds a sanitized copy (pc_save_read_gci exits 3 otherwise). pc_save_ready is cleared first: it can be left at 1 by a single-player
+ * session, and the in-process connect must not let any save writer run before the new town is entered. Returns the new pc_save_loaded. */
+int pc_play_online_save_load(void) {
+    pc_save_ready = 0;
+    pc_save_loaded = pc_save_check_and_load();
+    return pc_save_loaded;
+}
+
+/* Rollback helpers: read / restore the two save flags. */
+int pc_play_online_save_flags_get(int* ready) {
+    *ready = pc_save_ready;
+    return pc_save_loaded;
+}
+
+void pc_play_online_save_flags_set(int loaded, int ready) {
+    pc_save_loaded = loaded;
+    pc_save_ready = ready;
 }
 
 /* Guests G3.2: the title-menu "Join as Guest" item (src/actor/ac_animal_logo.c, PC_ENHANCEMENTS). Client-only: the item is visible for any --connect client. The label
