@@ -92,8 +92,8 @@ def main():
     # ------------------------------------------------------------------ W: wire
     ids = dict(wire_baseline.c_message_ids(c_raw))
     check("W id 56 = MAILBOX_LETTER is the highest message id (wire_baseline.EXPECTED_MAX_MSG_ID = %d); 55 = TOWN_SVC_STATE is unchanged; ids stay contiguous" % wire_baseline.EXPECTED_MAX_MSG_ID,
-          ids.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56 and ids.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55 and wire_baseline.EXPECTED_MAX_MSG_ID == 61
-          and sorted(ids.values()) == list(range(1, 62)) and L.PC_NETGAME_MSG_MAILBOX_LETTER == 56)  # guests G1 appended 57 / 58 after it
+          ids.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56 and ids.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55 and wire_baseline.EXPECTED_MAX_MSG_ID == 65
+          and sorted(ids.values()) == list(range(1, 66)) and L.PC_NETGAME_MSG_MAILBOX_LETTER == 56)  # guests G1 appended 57 / 58 after it
     mb = c_raw[c_raw.index("typedef struct PCNetGameMailboxLetterMsg {"):c_raw.index("} PCNetGameMailboxLetterMsg;")]
     check("W PCNetGameMailboxLetterMsg: u8 type, u8 house, u8 mbox_idx, u8 flags, u32 seq, u32 digest, u16 used_count, u16 _rsv0, letter[298], u16 _rsv1; sizeof == 316, offsets 4 / 8 / 12 / 16 / 314, "
           "<= PC_NET_MAX_PAYLOAD, letter size == sizeof(Mail_c), slot count == HOME_MAILBOX_SIZE",

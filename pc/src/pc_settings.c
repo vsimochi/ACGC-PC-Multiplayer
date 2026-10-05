@@ -21,9 +21,11 @@ PCSettings g_pc_settings = {
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
     .max_guests = 4,
+    .town_serve = 0,
 };
 
 int g_pc_max_guests_override = 0;
+int g_pc_town_serve_override = -1;
 
 static const char* SETTINGS_FILE = "settings.ini";
 
@@ -76,7 +78,10 @@ static const char* DEFAULT_SETTINGS =
     "\n"
     "[Network]\n"
     "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n"
-    "max_guests = 4\n";
+    "max_guests = 4\n"
+    "\n"
+    "# Host only: serve this town's save file (every resident's private data!) to clients that start with --town-fetch: 0 = off (default), 1 = on. Friends / LAN only.\n"
+    "town_serve = 0\n";
 
 static const char* skip_ws(const char* s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -129,6 +134,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val >= 0 && val <= 40) g_pc_settings.cstick_deadzone = val;
     } else if (strcmp(key, "max_guests") == 0) {
         if (val >= 1 && val <= 8) g_pc_settings.max_guests = val;
+    } else if (strcmp(key, "town_serve") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.town_serve = val;
     }
 }
 
@@ -221,6 +228,9 @@ void pc_settings_save(void) {
     fprintf(f, "[Network]\n");
     fprintf(f, "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n");
     fprintf(f, "max_guests = %d\n", g_pc_settings.max_guests);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: serve this town's save file (every resident's private data!) to clients that start with --town-fetch: 0 = off (default), 1 = on. Friends / LAN only.\n");
+    fprintf(f, "town_serve = %d\n", g_pc_settings.town_serve);
     fclose(f);
     printf("[Settings] Saved %s\n", SETTINGS_FILE);
 }

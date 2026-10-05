@@ -1650,6 +1650,88 @@ assert struct.calcsize(TXN_TAG_FMT) == 64 and TXN_COMMIT_SPEC.size == 72 and TXN
 assert max(TXN_COMMIT_SPEC.size, TXN_RESULT_SPEC.size) <= PC_NET_MAX_PAYLOAD
 assert struct.calcsize(TXN_COMMIT_FMT) == 8 + struct.calcsize(TXN_TAG_FMT)
 
+# --- M-B town transfer (ids 62..65, v8 unreleased: extended in place, NO version bump): the PRE-BOOT town fetch (see pc_net_game.c TOWN TRANSFER) ---
+PC_NETGAME_MSG_TOWN_FETCH_REQ = 62   # C->H 40 B
+PC_NETGAME_MSG_TOWN_INFO = 63        # H->C 40 B
+PC_NETGAME_MSG_TOWN_CHUNK = 64       # H->C 1012 B
+PC_NETGAME_MSG_TOWN_DONE = 65        # C->H 12 B
+PC_NETGAME_TOWN_CHUNK_DATA = 1000
+PC_NETGAME_TOWN_FILE_SIZE = 467008
+PC_NETGAME_TOWN_STATUS_STREAM = 0
+PC_NETGAME_TOWN_STATUS_UP_TO_DATE = 1
+PC_NETGAME_TOWN_STATUS_UNAVAILABLE = 2
+PC_NETGAME_TOWN_STATUS_BUSY = 3
+PC_NETGAME_TOWN_STATUS_REFUSED = 4
+PC_NETGAME_TOWN_STATUS_BAD_REQUEST = 5
+PC_NETGAME_TOWN_DONE_OK = 0
+PC_NETGAME_TOWN_DONE_BAD_CRC = 1
+PC_NETGAME_TOWN_DONE_BAD_GCI = 2
+PC_NETGAME_TOWN_DONE_IO = 3
+PC_NETGAME_TOWN_DONE_ABORT = 4
+TOWN_FETCH_REQ_FMT = "<BBHIII8sHHI8s"   # PCNetGameTownFetchReqMsg, 40 bytes
+TOWN_INFO_FMT = "<BBHIII8sHHIII"        # PCNetGameTownInfoMsg, 40 bytes
+TOWN_CHUNK_FMT = "<BBHII1000s"          # PCNetGameTownChunkMsg, 1012 bytes
+TOWN_DONE_FMT = "<BBHII"                # PCNetGameTownDoneMsg, 12 bytes
+TOWN_STATUS_NAMES = ("STREAM", "UP_TO_DATE", "UNAVAILABLE", "BUSY", "REFUSED", "BAD_REQUEST")
+TOWN_FETCH_REQ_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_TOWN_FETCH_REQ, TOWN_FETCH_REQ_FMT,
+    ["msg_type", "flags", "rsv0", "protocol_version", "have_crc32", "have_size", "have_land_name", "have_land_id", "rsv1", "have_terrain_hash", "rsv2"],
+    "TownFetchReqFields")
+TOWN_INFO_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_TOWN_INFO, TOWN_INFO_FMT,
+    ["msg_type", "status", "chunk_size", "xfer_id", "total_size", "crc32", "land_name", "land_id", "rsv0", "terrain_hash", "town_gen", "chunk_count"],
+    "TownInfoFields")
+TOWN_CHUNK_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_TOWN_CHUNK, TOWN_CHUNK_FMT, ["msg_type", "rsv0", "length", "xfer_id", "offset", "data"], "TownChunkFields")
+TOWN_DONE_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_TOWN_DONE, TOWN_DONE_FMT, ["msg_type", "status", "rsv0", "xfer_id", "crc32"], "TownDoneFields")
+assert TOWN_FETCH_REQ_SPEC.size == 40 and TOWN_INFO_SPEC.size == 40 and TOWN_CHUNK_SPEC.size == 1012 and TOWN_DONE_SPEC.size == 12
+
+
+def build_town_fetch_req(have_crc=0, have_size=0, town=None, protocol_version=None, flags=0, rsv0=0):
+    """TOWN_FETCH_REQ (62, 40 B). `town` = the TownIdentity of the client's cache (default zeros)."""
+    t = town or ZERO_TOWN
+    return struct.pack(TOWN_FETCH_REQ_FMT, PC_NETGAME_MSG_TOWN_FETCH_REQ, flags, rsv0,
+                       PC_NETGAME_PROTOCOL_VERSION if protocol_version is None else protocol_version,
+                       have_crc & 0xFFFFFFFF, have_size, t.land_name, t.land_id, 0, t.terrain_hash, b"\x00" * 8)
+
+
+def build_town_done(status, xfer_id, crc32=0):
+    return struct.pack(TOWN_DONE_FMT, PC_NETGAME_MSG_TOWN_DONE, status, 0, xfer_id, crc32 & 0xFFFFFFFF)
+
+
+def town_fetch_start(client, **kw):
+    """Sends a TOWN_FETCH_REQ on an already transport-connected client (NO IDENTITY) and waits (<= 5 s) for the TOWN_INFO. Returns the TownInfoFields or None."""
+    client.send_reliable(build_town_fetch_req(**kw))
+    m = client.inbox.wait_for(lambda mm: mm.is_game and mm.payload[0] == PC_NETGAME_MSG_TOWN_INFO, 5.0)
+    return TOWN_INFO_SPEC.decode(m.payload) if m is not None and TOWN_INFO_SPEC.matches(m.payload) else None
+
+
+def town_fetch_collect(client, info, timeout=20.0, stop_after=None, ack_done=True):
+    """Collects the TOWN_CHUNK stream announced by `info` (in order, offsets checked): returns (bytes, problems). `stop_after` = stop after that many bytes
+    (an aborted stream: the caller then disconnects). Sends TOWN_DONE(OK) at the end when ack_done."""
+    got, problems = bytearray(), []
+    deadline = time.monotonic() + timeout
+    while len(got) < info.total_size and time.monotonic() < deadline:
+        if stop_after is not None and len(got) >= stop_after:
+            return bytes(got), problems
+        m = client.inbox.wait_for(lambda mm: mm.is_game and mm.payload[0] == PC_NETGAME_MSG_TOWN_CHUNK, 2.0)
+        if m is None:
+            problems.append("no chunk for 2 s at offset %d" % len(got))
+            break
+        if not TOWN_CHUNK_SPEC.matches(m.payload):
+            problems.append("chunk of wrong size %d" % len(m.payload))
+            break
+        c = TOWN_CHUNK_SPEC.decode(m.payload)
+        if c.xfer_id != info.xfer_id or c.offset != len(got) or c.length > PC_NETGAME_TOWN_CHUNK_DATA or c.length == 0:
+            problems.append("bad chunk xfer=%d offset=%d (expected %d) len=%d" % (c.xfer_id, c.offset, len(got), c.length))
+            break
+        got += c.data[:c.length]
+    if ack_done and len(got) == info.total_size:
+        client.send_reliable(build_town_done(PC_NETGAME_TOWN_DONE_OK, info.xfer_id, zlib.crc32(bytes(got))))
+    return bytes(got), problems
+
+
 GAME_SPECS = {
     s.msg_type: s
     for s in (IDENTITY_SPEC, IDENTITY_ACK_SPEC, REJECT_SPEC, MOVE_SPEC, APPEARANCE_SPEC, PICKUP_REQUEST_SPEC,
@@ -1659,7 +1741,8 @@ GAME_SPECS = {
               FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
               MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC, RECORD_HELLO_SPEC,
               RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC, TOWN_SVC_STATE_SPEC,
-              MAILBOX_LETTER_SPEC, IDENTITY_EXT_SPEC, IDENTITY_TOKEN_SPEC, HOUSE_BEGIN_SPEC, HOUSE_CHUNK_SPEC, HOUSE_ACK_SPEC)
+              MAILBOX_LETTER_SPEC, IDENTITY_EXT_SPEC, IDENTITY_TOKEN_SPEC, HOUSE_BEGIN_SPEC, HOUSE_CHUNK_SPEC, HOUSE_ACK_SPEC,
+              TOWN_FETCH_REQ_SPEC, TOWN_INFO_SPEC, TOWN_CHUNK_SPEC, TOWN_DONE_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12

@@ -11,6 +11,7 @@
 #include "pc_settings_menu.h"
 #include "pc_profiler.h"
 #include "pc_net_game.h"
+#include "pc_town_cache.h" /* M-A: pc_card_set_town_dir() */
 #include "pc_host_observer.h"
 #include "pc_dedicated.h"
 #include "pc_guest_profile.h"
@@ -592,6 +593,19 @@ static int      g_pc_net_role = 0; /* 0 = none/single-player, 1 = host, 2 = clie
 static uint16_t g_pc_net_port = 7777;
 static char     g_pc_net_host_ip[64] = "127.0.0.1";
 
+/* M-A / M-B (town cache, multiplayer phase 2): --town-dir DIR (hidden, CLIENT-only, requires --connect) selects DIR (e.g. save/mp/towns/<townkey>) as the Card-A
+ * parent: the save is read from DIR/card_a instead of save/card_a (pc_card_set_town_dir, set BEFORE boot_main). --town-fetch (CLIENT-only, requires --connect,
+ * exclusive with --town-dir) downloads the host's town first (pc_net_game_town_prefetch, after pc_platform_init and before boot_main). --town-serve on|off
+ * (HOST-only) overrides settings.ini [Network] town_serve (g_pc_town_serve_override). */
+static const char* g_pc_town_dir = NULL;
+static int         g_pc_town_fetch = 0;
+
+static void pc_town_title_progress(const char* text) {
+    if (g_pc_window != NULL && text != NULL) {
+        SDL_SetWindowTitle(g_pc_window, text);
+    }
+}
+
 /* M2: decide whether this --guest / --guest-profile / --character session plays a STORE character. Returns 1 = handled (store character: the --bootstrap-guest spec
  * is built, a new one is armed for the Rover scene), 0 = use the LEGACY guest profile flow unchanged (also when --character names a legacy profile: it is
  * selected like --guest-profile), -1 = refused (message printed). */
@@ -729,6 +743,11 @@ int main(int argc, char* argv[]) {
             printf("                      See pc_m_card.c pc_bootstrap_guest_poll().\n");
             printf("  --max-guests N      HOST: most guests (visitors with their own character) connected at once, 1..8 (default 4 or settings.ini\n");
             printf("                      max_guests); a new guest beyond the cap is refused like a full server, residents are never refused.\n");
+            printf("  --town-fetch        CLIENT-only (requires --connect; exit 2 otherwise; not with --town-dir): before the game boots, download the host's town\n");
+            printf("                      save into save/mp/towns/<townkey>/ and play it (progress in the window title). Falls back to the cached town of that\n");
+            printf("                      server, then to save/card_a. The host must serve it (--town-serve on).\n");
+            printf("  --town-serve on|off HOST-only (exit 2 otherwise): serve the town save to --town-fetch clients (default off or settings.ini town_serve).\n");
+            printf("                      PRIVACY: the file holds every resident's pockets, mail, diary and designs, unsanitized: friends / LAN only.\n");
             printf("  --guest             CLIENT-only (requires --connect; exit code 2 with usage otherwise; cannot be combined with\n");
             printf("                      --host, --dedicated, --host-observer, --bootstrap-resident or --bootstrap-guest): join the host as a\n");
             printf("                      GUEST with your own new character instead of a resident. The profile lives in save/mp/guest.ini\n");
@@ -1006,6 +1025,24 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             g_pc_max_guests_override = mg;
+            i++;
+        } else if (strcmp(argv[i], "--town-dir") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || g_pc_town_dir != NULL) {
+                fprintf(stderr, "[PC] --town-dir: REFUSED: the option needs one DIRECTORY (the town cache dir, e.g. save/mp/towns/<townkey>)\n"
+                                "usage: AnimalCrossing --connect HOST[:PORT] --town-dir DIR\n");
+                return 2;
+            }
+            g_pc_town_dir = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--town-fetch") == 0) {
+            g_pc_town_fetch = 1;
+        } else if (strcmp(argv[i], "--town-serve") == 0) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 && strcmp(argv[i + 1], "off") != 0)) {
+                fprintf(stderr, "[PC] --town-serve: REFUSED: the option needs on or off\n"
+                                "usage: AnimalCrossing --host [port] --town-serve on|off\n");
+                return 2;
+            }
+            g_pc_town_serve_override = strcmp(argv[i + 1], "on") == 0 ? 1 : 0;
             i++;
         } else if (strcmp(argv[i], "--guest") == 0) {
             g_pc_guest = 1;
@@ -1398,6 +1435,28 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    /* M-A / M-B: --town-dir / --town-fetch are CLIENT-only (need --connect, mutually exclusive); --town-serve is HOST-only. Refused (exit 2 + usage) before anything is
+     * initialised. A set town dir is applied here, long before boot_main loads the save (second_game_init). */
+    if ((g_pc_town_dir != NULL || g_pc_town_fetch) && g_pc_net_role != 2) {
+        fprintf(stderr, "[PC] --town-dir / --town-fetch: REFUSED: they are CLIENT-only options (use them together with --connect HOST[:PORT])\n"
+                        "usage: AnimalCrossing --connect HOST[:PORT] --town-fetch   (see --help)\n");
+        return 2;
+    }
+    if (g_pc_town_dir != NULL && g_pc_town_fetch) {
+        fprintf(stderr, "[PC] --town-dir: REFUSED: --town-dir cannot be combined with --town-fetch (the fetch picks the town directory)\n"
+                        "usage: AnimalCrossing --connect HOST[:PORT] --town-fetch   (see --help)\n");
+        return 2;
+    }
+    if (g_pc_town_serve_override >= 0 && g_pc_net_role != 1) {
+        fprintf(stderr, "[PC] --town-serve: REFUSED: it is a HOST-only option (use it together with --host)\n"
+                        "usage: AnimalCrossing --host [port] --town-serve on|off   (see --help)\n");
+        return 2;
+    }
+    if (g_pc_town_dir != NULL && !pc_card_set_town_dir(g_pc_town_dir)) {
+        fprintf(stderr, "[PC] --town-dir: REFUSED: bad directory '%s'\n", g_pc_town_dir);
+        return 2;
+    }
+
     /* --dedicated: HOST-only; incompatible with --connect, --bootstrap-resident, --bootstrap-guest and the SAME host-self test hooks --host-observer refuses.
      * Refused (exit 2, usage text on stderr) before anything is initialised. It then sets the SAME observer flag --host-observer sets: the observer init
      * (pc_host_observer_poll) is reused as is, there is no second init path. */
@@ -1547,7 +1606,7 @@ int main(int argc, char* argv[]) {
      * request unfulfilled -- single-player continues exactly as if neither flag was passed. */
     if (g_pc_net_role == 1) {
         pc_net_game_start_host(g_pc_net_port);
-    } else if (g_pc_net_role == 2) {
+    } else if (g_pc_net_role == 2 && !g_pc_town_fetch) { /* --town-fetch starts the client after the pre-boot fetch (below) */
         pc_net_game_start_client(g_pc_net_host_ip, g_pc_net_port);
     }
 
@@ -1564,6 +1623,20 @@ int main(int argc, char* argv[]) {
         int failures = pc_rng_domains_selftest();
         pc_platform_shutdown();
         return failures;
+    }
+    if (g_pc_net_role == 2 && g_pc_town_fetch) {
+        /* M-B: the PRE-BOOT town fetch (a window exists for the title progress and the error box; nothing of the game is initialised yet). */
+        char town_err[700];
+        const int town_rc = pc_net_game_town_prefetch(g_pc_net_host_ip, g_pc_net_port, 30000u, pc_town_title_progress, g_pc_server_name, town_err, sizeof(town_err));
+        if (town_rc == PC_TOWN_PREFETCH_ERROR) {
+            fprintf(stderr, "[PC] --town-fetch: %s\n", town_err);
+            if (getenv("AC_TOWN_NO_MSGBOX") == NULL) { /* test hook: the box cannot be dismissed headlessly */
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Animal Crossing - town transfer", town_err, g_pc_window);
+            }
+            pc_platform_shutdown();
+            return 3;
+        }
+        pc_net_game_start_client(g_pc_net_host_ip, g_pc_net_port);
     }
     pc_disc_init();
     if (!pc_assets_init()) {

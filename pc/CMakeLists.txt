@@ -309,6 +309,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_save_bswap.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_records.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_guests.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_town_cache.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_guest_profile.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_character.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_membership.c

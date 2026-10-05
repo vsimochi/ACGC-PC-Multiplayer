@@ -129,8 +129,8 @@ def main():
        and "pc_net_game_dedicated_guest_counts" in S.read("pc/include/pc_dedicated.h"))
 
     # ------------------------------------------------------------------ W
-    ck("W no wire change by G4: message ids 1..61 unchanged since (59..61 came with the furniture sync), wire_baseline green, protocol header pc_net_game.h (G6.1 added exactly one function declaration, 5 lines, no typedef / define) and the transport (pc_net.c / pc_net.h) untouched vs the G3 commit",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 62)) and numstat_wt("pc/include/pc_net_game.h") == (5, 0)
+    ck("W no wire change by G4: message ids 1..65 unchanged since (59..61 came with the furniture sync, 62..65 with the town transfer), wire_baseline green, protocol header pc_net_game.h (G6.1 added exactly one function declaration, 5 lines, no typedef / define) and the transport (pc_net.c / pc_net.h) untouched vs the G3 commit",
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 66)) and numstat_wt("pc/include/pc_net_game.h") == (5, 0)
        and S.read("pc/include/pc_net_game.h").count("const char* pc_net_game_join_message(int* is_warning);") == 1
        and numstat("pc/src/pc_net.c") == (0, 0) and numstat("pc/include/pc_net.h") == (0, 0) and numstat("pc/src/pc_remote_player.c") == (0, 0))
     wb = []

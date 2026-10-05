@@ -2,6 +2,7 @@
  * Channel 0 (Slot A) → save/card_a/
  * Channel 1 (Slot B) → save/card_b/ */
 #include "pc_platform.h"
+#include "pc_town_cache.h" /* M-A: pc_card_a_dir() runtime Card-A dir */
 #include <sys/stat.h>   /* mkdir (Linux), stat */
 #ifdef _WIN32
 #include <direct.h>  /* _mkdir */
@@ -82,8 +83,8 @@ static const char* card_dir[2] = { "save/card_a", "save/card_b" };
 static int card_mounted[2] = {0, 0};
 
 static const char* get_card_dir(s32 chan) {
-    if (chan >= 0 && chan <= 1) return card_dir[chan];
-    return card_dir[0];
+    if (chan == 1) return card_dir[1];
+    return pc_card_a_dir(); /* M-A: chan 0 (and the fallback) = the RUNTIME Card-A dir ("save/card_a" unless a town dir was set) */
 }
 
 /* reject path traversal */
@@ -99,11 +100,11 @@ static int card_filename_safe(const char* name) {
 static void ensure_dirs(void) {
 #ifdef _WIN32
     _mkdir("save");
-    _mkdir("save/card_a");
+    if (pc_card_town_dir_active()) pc_town_mkdirs(pc_card_a_dir()); else _mkdir("save/card_a");
     _mkdir("save/card_b");
 #else
     mkdir("save", 0755);
-    mkdir("save/card_a", 0755);
+    if (pc_card_town_dir_active()) pc_town_mkdirs(pc_card_a_dir()); else mkdir("save/card_a", 0755);
     mkdir("save/card_b", 0755);
 #endif
 }

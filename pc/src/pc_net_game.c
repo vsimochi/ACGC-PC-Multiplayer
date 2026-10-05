@@ -148,6 +148,7 @@
 #include "pc_log.h" /* category-based PC_LOG()/PC_LOG_RL() lines (new, [CAT]-prefixed; every pre-existing printf is untouched) */
 #include "pc_dedicated.h" /* --dedicated: g_pc_dedicated + the [DEDICATED] peer notices (read-only hooks) */
 #include "pc_net.h"
+#include "pc_town_cache.h" /* M-A / M-B: runtime Card-A dir, town cache layout, CRC32, atomic install */
 #include "pc_remote_player.h"
 #include "pc_field_authority.h" /* v2: persistent town-field addressing/authority (Workstream C) */
 #include "pc_wildlife_authority.h" /* World Ecology Wildlife Sync T0: host-authoritative wildlife table */
@@ -220,7 +221,10 @@
 #include <math.h>   /* fabsf(), isfinite() -- see pcnetgame_pos_valid() and the reach checks */
 #include <stddef.h> /* offsetof() */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h> /* M-B: stat() in the town fetch fallback */
 
 _Static_assert(PC_NETGAME_NAME_LEN == PLAYER_NAME_LEN, "PC_NETGAME_NAME_LEN must match PLAYER_NAME_LEN (m_personal_id.h)");
 _Static_assert(PC_NETGAME_LAND_LEN == LAND_NAME_SIZE, "PC_NETGAME_LAND_LEN must match LAND_NAME_SIZE (m_land_h.h)");
@@ -490,6 +494,11 @@ typedef enum PCNetGameMsgType {
                                              * commit). See PCNetGameHouseBeginMsg and the HOUSE WIRE block. A misdirected kind is dropped. */
     PC_NETGAME_MSG_HOUSE_CHUNK           = 60, /* Furniture sync: both directions, RELIABLE, 1012 bytes (the RECORD_CHUNK layout): one <= 1000 byte slice of the transfer payload. */
     PC_NETGAME_MSG_HOUSE_ACK             = 61, /* Furniture sync: host -> the committing owner ONLY, RELIABLE, 24 bytes: the outcome of an OWNER_COMMIT. A client's copy is dropped. */
+    PC_NETGAME_MSG_TOWN_FETCH_REQ        = 62, /* Town transfer (M-B, v8 unreleased: extended in place, NO version bump), client -> host, RELIABLE, 40 bytes: the PRE-BOOT cache fetch. Only a
+                                             * HANDSHAKE peer that has not sent IDENTITY may send it (see the TOWN TRANSFER block). */
+    PC_NETGAME_MSG_TOWN_INFO             = 63, /* Town transfer: host -> client, RELIABLE, 40 bytes: status (0 STREAM, 1 UP_TO_DATE, 2 UNAVAILABLE, 3 BUSY, 4 REFUSED, 5 BAD_REQUEST) + size / CRC32 / town. */
+    PC_NETGAME_MSG_TOWN_CHUNK            = 64, /* Town transfer: host -> client, RELIABLE, 1012 bytes: one <= 1000 byte slice of the GCI snapshot at a u32 offset. */
+    PC_NETGAME_MSG_TOWN_DONE             = 65, /* Town transfer: client -> host, RELIABLE, 12 bytes: the client's verdict (0 OK, 1 BAD_CRC, 2 BAD_GCI, 3 IO, 4 ABORT); the host then closes the connection. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2191,6 +2200,76 @@ typedef struct PCNetGameHouseAckMsg {
 } PCNetGameHouseAckMsg;
 _Static_assert(sizeof(PCNetGameHouseAckMsg) == 24, "PCNetGameHouseAckMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameHouseAckMsg) <= PC_NET_MAX_PAYLOAD, "PCNetGameHouseAckMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h)");
+
+/* ===== TOWN TRANSFER WIRE (M-B, ids 62..65, v8 unreleased: extended in place) =====
+ * A client that was started with --town-fetch opens a SEPARATE single-purpose connection BEFORE boot_main (pc_net_game_town_prefetch), asks for the host's last
+ * durably saved GCI file and stores it as its read-only town cache (save/mp/towns/<townkey>/card_a/...). The host serves it only to a HANDSHAKE peer that has
+ * not sent IDENTITY (IDENTITY on that connection is then ignored) and only when town_serve is on (default OFF: the file holds EVERY resident's private data).
+ *   TOWN_FETCH_REQ (62, C -> H, 40 B): flags 0, protocol_version, the client's cache (crc32, size, town) or zeros.
+ *   TOWN_INFO      (63, H -> C, 40 B): status 0 STREAM / 1 UP_TO_DATE / 2 UNAVAILABLE / 3 BUSY / 4 REFUSED / 5 BAD_REQUEST; chunk_size 1000, xfer_id, total_size, crc32, town, town_gen, chunk_count.
+ *   TOWN_CHUNK     (64, H -> C, 1012 B): len <= 1000, xfer_id, u32 offset (a 467 KB file cannot be addressed by RECORD_CHUNK's u16), data.
+ *   TOWN_DONE      (65, C -> H, 12 B): status 0 OK / 1 BAD_CRC / 2 BAD_GCI / 3 IO / 4 ABORT, xfer_id, crc32. */
+#define PC_NETGAME_TOWN_CHUNK_DATA   1000u
+#define PC_NETGAME_TOWN_FILE_SIZE    467008u /* 64-byte CARDDir + 0x72000 */
+#define PC_NETGAME_TOWN_STATUS_STREAM        0u
+#define PC_NETGAME_TOWN_STATUS_UP_TO_DATE    1u
+#define PC_NETGAME_TOWN_STATUS_UNAVAILABLE   2u
+#define PC_NETGAME_TOWN_STATUS_BUSY          3u
+#define PC_NETGAME_TOWN_STATUS_REFUSED       4u
+#define PC_NETGAME_TOWN_STATUS_BAD_REQUEST   5u
+#define PC_NETGAME_TOWN_DONE_OK       0u
+#define PC_NETGAME_TOWN_DONE_BAD_CRC  1u
+#define PC_NETGAME_TOWN_DONE_BAD_GCI  2u
+#define PC_NETGAME_TOWN_DONE_IO       3u
+#define PC_NETGAME_TOWN_DONE_ABORT    4u
+typedef struct PCNetGameTownFetchReqMsg {
+    uint8_t  msg_type;
+    uint8_t  flags;
+    uint16_t _rsv0;
+    uint32_t protocol_version;
+    uint32_t have_crc32;
+    uint32_t have_size;
+    uint8_t  have_land_name[PC_NETGAME_LAND_LEN];
+    uint16_t have_land_id;
+    uint16_t _rsv1;
+    uint32_t have_terrain_hash;
+    uint8_t  _rsv2[8];
+} PCNetGameTownFetchReqMsg;
+_Static_assert(sizeof(PCNetGameTownFetchReqMsg) == 40, "PCNetGameTownFetchReqMsg wire size drifted");
+typedef struct PCNetGameTownInfoMsg {
+    uint8_t  msg_type;
+    uint8_t  status;
+    uint16_t chunk_size;
+    uint32_t xfer_id;
+    uint32_t total_size;
+    uint32_t crc32;
+    uint8_t  land_name[PC_NETGAME_LAND_LEN];
+    uint16_t land_id;
+    uint16_t _rsv0;
+    uint32_t terrain_hash;
+    uint32_t town_gen;
+    uint32_t chunk_count;
+} PCNetGameTownInfoMsg;
+_Static_assert(sizeof(PCNetGameTownInfoMsg) == 40, "PCNetGameTownInfoMsg wire size drifted");
+typedef struct PCNetGameTownChunkMsg {
+    uint8_t  msg_type;
+    uint8_t  _rsv0;
+    uint16_t len;
+    uint32_t xfer_id;
+    uint32_t offset;
+    uint8_t  data[PC_NETGAME_TOWN_CHUNK_DATA];
+} PCNetGameTownChunkMsg;
+_Static_assert(sizeof(PCNetGameTownChunkMsg) == 1012, "PCNetGameTownChunkMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameTownChunkMsg) <= PC_NET_MAX_PAYLOAD, "PCNetGameTownChunkMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h)");
+typedef struct PCNetGameTownDoneMsg {
+    uint8_t  msg_type;
+    uint8_t  status;
+    uint16_t _rsv0;
+    uint32_t xfer_id;
+    uint32_t crc32;
+} PCNetGameTownDoneMsg;
+_Static_assert(sizeof(PCNetGameTownDoneMsg) == 12, "PCNetGameTownDoneMsg wire size drifted");
+_Static_assert(PC_NETGAME_TOWN_FILE_SIZE == PC_TOWN_GCI_SIZE && PC_NETGAME_TOWN_CHUNK_DATA == PC_TOWN_CHUNK_DATA, "town transfer constants drifted from pc_town_cache.h");
 _Static_assert(sizeof(mHm_hs_c) == 0x26B0 && offsetof(mHm_hs_c, floors) == 0x38 && sizeof(mHm_flr_c) == 0x8A8 && offsetof(mHm_hs_c, mailbox) == 0x1A30 &&
                    offsetof(mHm_hs_c, goki) == 0x2678 && offsetof(mHm_hs_c, music_box) == 0x2684 && offsetof(mHm_hs_c, unk_286C) == 0x268C &&
                    offsetof(mHm_flr_c, wall_floor) == 0x8A0 && offsetof(mHm_flr_c, tempo_beat) == 0x8A2 && offsetof(mHm_flr_c, floor_bit_info) == 0x8A4 &&
@@ -5507,7 +5586,9 @@ static void pcnetgame_client_talk_refresh_tick(void) {
  * stays its own function, for the same "don't conflate pickup and drop state" reason
  * s_host_drop_state's doc gives. This is only the dispatch point. Safe to call for an
  * out-of-range peer, because every callee already treats that as a no-op. */
+static void pcnetgame_townsrv_reset(PCNetPeerId peer); /* M-B: frees the peer's town snapshot (defined with the TOWN TRANSFER host block) */
 static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
+    pcnetgame_townsrv_reset(peer);
     /* Stage 5A / 5B-1 / two-phase: clear the dedup records AND release any reservation they hold (the
      * reservation table is the set of PENDING records, so this is the single place a dead or reused
      * peer's reservations disappear). Never touches the field. */
@@ -7108,6 +7189,7 @@ static void pcnetgame_host_closing_tick(void) {
 static void pcnetgame_reset_host_tree_cut_state(void);
 
 static void pcnetgame_host_revalidate_bound_peers(void); /* defined with the Stage 1A identity helpers */
+static void pcnetgame_townsrv_tick(void);                /* M-B: defined with the TOWN TRANSFER host block */
 static void pcnetgame_rec_on_town_changed(void);   /* D3: defined with the record block */
 static void pcnetgame_rec_on_save_back(void);      /* D3 */
 static void pcnetgame_rec_store_resolve(void);     /* D3-4 */
@@ -22279,12 +22361,288 @@ static void pcnetgame_handle_host_bury_request(PCNetPeerId peer, const PCNetGame
 static void pcnetgame_handle_host_wildlife_spawn_trigger_request(PCNetPeerId peer,
                                                                  const PCNetGameWildlifeSpawnTriggerRequestMsg* in);
 
+/* ===== TOWN TRANSFER HOST BEGIN (M-B, wire ids 62..65) =====
+ * Serves the host's last durably saved GCI (pc_gci_path()) to a pre-boot --town-fetch client. Rules (pinned by the town transfer source audit / protocol test):
+ *   - only when town_serve is on (settings.ini [Network] town_serve / --town-serve on|off; default OFF: the file contains EVERY resident's private data, unsanitized);
+ *   - only for a peer in HANDSHAKE that has NOT sent IDENTITY / IDENTITY_EXT; from then on that connection is a FETCH connection: IDENTITY / IDENTITY_EXT on it are ignored
+ *     (it can never bind an identity), and so is everything except TOWN_DONE;
+ *   - the file is read into a malloc'd SNAPSHOT when the request arrives (a concurrent atomic save cannot tear the stream); checked: exact size, "GAF" code, town identity;
+ *   - at most PC_NETGAME_TOWN_MAX_FETCHES streams at once and a per-address limiter (same ring pattern as pcnetgame_guest_mint_allowed); BUSY otherwise;
+ *   - chunks are paced with pc_net_reliable_backlog() < PC_NETGAME_TOWN_BACKLOG_MAX per host poll; the connection is closed after TOWN_DONE or PC_NETGAME_TOWN_TIMEOUT_MS. */
+#define PC_NETGAME_TOWN_MAX_FETCHES      2
+#define PC_NETGAME_TOWN_BACKLOG_MAX      32
+#define PC_NETGAME_TOWN_TIMEOUT_MS       30000u
+#define PC_NETGAME_TOWN_DONE_GRACE_MS    1500u
+#define PC_NETGAME_TOWN_RATE_LOG         16
+#define PC_NETGAME_TOWN_RATE_MAX         10
+#define PC_NETGAME_TOWN_RATE_WINDOW_MS   60000u
+
+typedef struct TownSrvPeer {
+    uint8_t   active;      /* a TOWN_FETCH_REQ was processed on this connection (any status): identity is ignored from now on */
+    uint8_t   streaming;   /* a snapshot is being sent */
+    uint8_t   all_sent;
+    uint32_t  xfer_id;
+    uint8_t*  buf;         /* malloc'd snapshot (PC_NETGAME_TOWN_FILE_SIZE) while streaming */
+    uint32_t  size;
+    uint32_t  next_off;
+    uint32_t  started_ms;
+    uint32_t  done_ms;     /* when the client's TOWN_DONE arrived (0 = not yet): the transport peer is dropped PC_NETGAME_TOWN_DONE_GRACE_MS later (see the handler) */
+} TownSrvPeer;
+static TownSrvPeer s_townsrv[PC_NET_MAX_PEERS];
+static uint32_t s_townsrv_xfer_counter = 0;
+static struct { uint32_t ip; uint32_t at_ms; uint8_t used; } s_townsrv_rate_log[PC_NETGAME_TOWN_RATE_LOG];
+static int s_townsrv_rate_next = 0;
+
+static int pcnetgame_town_serve_on(void) {
+    return (g_pc_town_serve_override >= 0 ? g_pc_town_serve_override : g_pc_settings.town_serve) != 0;
+}
+
+static void pcnetgame_townsrv_reset(PCNetPeerId peer) {
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+        return;
+    }
+    if (s_townsrv[peer].buf != NULL) {
+        free(s_townsrv[peer].buf);
+    }
+    memset(&s_townsrv[peer], 0, sizeof(s_townsrv[peer]));
+}
+
+static int pcnetgame_townsrv_active_streams(void) {
+    int i, n = 0;
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (s_townsrv[i].streaming) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static int pcnetgame_townsrv_rate_allowed(uint32_t ip, uint32_t now) {
+    int i, n = 0;
+    for (i = 0; i < PC_NETGAME_TOWN_RATE_LOG; i++) {
+        if (s_townsrv_rate_log[i].used && s_townsrv_rate_log[i].ip == ip && (uint32_t)(now - s_townsrv_rate_log[i].at_ms) < PC_NETGAME_TOWN_RATE_WINDOW_MS) {
+            n++;
+        }
+    }
+    return n < PC_NETGAME_TOWN_RATE_MAX;
+}
+
+static void pcnetgame_townsrv_rate_note(uint32_t ip, uint32_t now) {
+    s_townsrv_rate_log[s_townsrv_rate_next].used = 1;
+    s_townsrv_rate_log[s_townsrv_rate_next].ip = ip;
+    s_townsrv_rate_log[s_townsrv_rate_next].at_ms = now;
+    s_townsrv_rate_next = (s_townsrv_rate_next + 1) % PC_NETGAME_TOWN_RATE_LOG;
+}
+
+static void pcnetgame_townsrv_send_info(PCNetPeerId peer, uint8_t status, uint32_t xfer, uint32_t total, uint32_t crc, const PCTownId* town, uint32_t chunks) {
+    PCNetGameTownInfoMsg m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_TOWN_INFO;
+    m.status = status;
+    m.chunk_size = (uint16_t)PC_NETGAME_TOWN_CHUNK_DATA;
+    m.xfer_id = xfer;
+    m.total_size = total;
+    m.crc32 = crc;
+    if (town != NULL) {
+        memcpy(m.land_name, town->land_name, PC_NETGAME_LAND_LEN);
+        m.land_id = town->land_id;
+        m.terrain_hash = town->terrain_hash;
+    }
+    m.town_gen = (uint32_t)pc_save_town_gen();
+    m.chunk_count = chunks;
+    pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+}
+
+/* The snapshot: the whole file into a malloc'd buffer (exact size required) and its town identity. NULL when there is no usable saved town. */
+static uint8_t* pcnetgame_townsrv_snapshot(uint32_t* size_out, PCTownId* town_out) {
+    FILE* f = fopen(pc_gci_path(), "rb");
+    uint8_t* buf;
+    size_t got;
+    if (f == NULL) {
+        return NULL;
+    }
+    buf = (uint8_t*)malloc((size_t)PC_NETGAME_TOWN_FILE_SIZE + 1u);
+    if (buf == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    got = fread(buf, 1, (size_t)PC_NETGAME_TOWN_FILE_SIZE + 1u, f);
+    fclose(f);
+    if (got != (size_t)PC_NETGAME_TOWN_FILE_SIZE || !pc_save_validate_gci_buffer(buf, got, town_out)) {
+        free(buf);
+        return NULL;
+    }
+    *size_out = (uint32_t)got;
+    return buf;
+}
+
+static void pcnetgame_townsrv_pump(PCNetPeerId peer) {
+    TownSrvPeer* ts = &s_townsrv[peer];
+    while (ts->streaming && !ts->all_sent && pc_net_reliable_backlog(peer) < PC_NETGAME_TOWN_BACKLOG_MAX) {
+        PCNetGameTownChunkMsg c;
+        uint32_t n = ts->size - ts->next_off;
+        if (n > PC_NETGAME_TOWN_CHUNK_DATA) {
+            n = PC_NETGAME_TOWN_CHUNK_DATA;
+        }
+        memset(&c, 0, sizeof(c));
+        c.msg_type = (uint8_t)PC_NETGAME_MSG_TOWN_CHUNK;
+        c.len = (uint16_t)n;
+        c.xfer_id = ts->xfer_id;
+        c.offset = ts->next_off;
+        memcpy(c.data, ts->buf + ts->next_off, n);
+        if (!pc_net_send(peer, PC_NET_RELIABLE, &c, (uint16_t)sizeof(c))) {
+            break; /* window full: retry next poll */
+        }
+        ts->next_off += n;
+        if (ts->next_off >= ts->size) {
+            ts->all_sent = 1;
+            printf("[NET][TOWN] host: peer %d: all %u bytes sent (xfer %u), waiting for TOWN_DONE\n", (int)peer, (unsigned)ts->size, (unsigned)ts->xfer_id);
+        }
+    }
+}
+
+static void pcnetgame_townsrv_tick(void) {
+    uint32_t now = 0;
+    int i;
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        TownSrvPeer* ts = &s_townsrv[i];
+        if (!ts->active) {
+            continue;
+        }
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_DISCONNECTED) {
+            pcnetgame_townsrv_reset((PCNetPeerId)i);
+            continue;
+        }
+        if (now == 0) {
+            now = pcnetgame_now_ms();
+        }
+        if (ts->done_ms != 0 && (uint32_t)(now - ts->done_ms) >= PC_NETGAME_TOWN_DONE_GRACE_MS) {
+            pcnetgame_host_drop_peer((PCNetPeerId)i); /* the client said DONE and (normally) already left: free the transport slot */
+            continue;
+        }
+        if ((uint32_t)(now - ts->started_ms) >= PC_NETGAME_TOWN_TIMEOUT_MS) {
+            printf("[NET][TOWN] host: peer %d: fetch connection closed after %u ms (no TOWN_DONE)\n", i, (unsigned)PC_NETGAME_TOWN_TIMEOUT_MS);
+            pcnetgame_host_drop_peer((PCNetPeerId)i); /* also frees the snapshot (pcnetgame_reset_all_host_peer_state) */
+            continue;
+        }
+        pcnetgame_townsrv_pump((PCNetPeerId)i);
+    }
+}
+
+static void pcnetgame_townsrv_handle_req(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    TownSrvPeer* ts = &s_townsrv[peer];
+    PCNetGameTownFetchReqMsg rq;
+    PCTownId town;
+    uint8_t* buf;
+    uint32_t total = 0, crc = 0, xfer;
+    uint32_t now = pcnetgame_now_ms();
+    const uint32_t ip = pc_net_peer_ip(peer);
+
+    if (s_host_peer_link[peer] != PC_NETGAME_LINK_HANDSHAKE || ts->active) {
+        printf("[NET][TOWN] host: peer %d TOWN_FETCH_REQ ignored (link state %d%s)\n", (int)peer, (int)s_host_peer_link[peer], ts->active ? ", a fetch is already active" : "");
+        return;
+    }
+    if (st->identity_pending || st->ext_valid) {
+        /* This connection already started an identity handshake: it is not a fetch connection. Refuse; the identity handshake itself is untouched. */
+        printf("[NET][TOWN] host: peer %d TOWN_FETCH_REQ refused (the connection already sent IDENTITY / IDENTITY_EXT)\n", (int)peer);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_REFUSED, 0, 0, 0, NULL, 0);
+        return;
+    }
+    ts->active = 1; /* from now on IDENTITY on this connection is ignored */
+    ts->started_ms = now;
+    if (size != sizeof(rq)) {
+        printf("[NET][TOWN] host: peer %d BAD_REQUEST (size %u)\n", (int)peer, (unsigned)size);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BAD_REQUEST, 0, 0, 0, NULL, 0);
+        return;
+    }
+    memcpy(&rq, data, sizeof(rq));
+    if (rq.flags != 0 || rq._rsv0 != 0 || rq._rsv1 != 0 || rq.protocol_version != PC_NETGAME_PROTOCOL_VERSION) {
+        printf("[NET][TOWN] host: peer %d BAD_REQUEST (flags %u protocol %u)\n", (int)peer, (unsigned)rq.flags, (unsigned)rq.protocol_version);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BAD_REQUEST, 0, 0, 0, NULL, 0);
+        return;
+    }
+    if (!pcnetgame_town_serve_on()) {
+        printf("[NET][TOWN] host: peer %d REFUSED (town_serve is off; enable with --town-serve on or settings.ini [Network] town_serve = 1)\n", (int)peer);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_REFUSED, 0, 0, 0, NULL, 0);
+        return;
+    }
+    if (pcnetgame_townsrv_active_streams() >= PC_NETGAME_TOWN_MAX_FETCHES || !pcnetgame_townsrv_rate_allowed(ip, now)) {
+        printf("[NET][TOWN] host: peer %d BUSY (%d streams active / per-address limit %d per %u ms)\n", (int)peer, pcnetgame_townsrv_active_streams(),
+               (int)PC_NETGAME_TOWN_RATE_MAX, (unsigned)PC_NETGAME_TOWN_RATE_WINDOW_MS);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BUSY, 0, 0, 0, NULL, 0);
+        return;
+    }
+    pcnetgame_townsrv_rate_note(ip, now);
+    buf = pcnetgame_townsrv_snapshot(&total, &town);
+    if (buf == NULL) {
+        printf("[NET][TOWN] host: peer %d UNAVAILABLE (no valid saved town at %s)\n", (int)peer, pc_gci_path());
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_UNAVAILABLE, 0, 0, 0, NULL, 0);
+        return;
+    }
+    crc = pc_town_crc32(buf, total);
+    xfer = ++s_townsrv_xfer_counter;
+    if (xfer == 0) {
+        xfer = ++s_townsrv_xfer_counter;
+    }
+    ts->xfer_id = xfer;
+    if (rq.have_size == total && rq.have_crc32 == crc) {
+        free(buf);
+        printf("[NET][TOWN] host: peer %d UP_TO_DATE (crc32 %08x, %u bytes, xfer %u)\n", (int)peer, (unsigned)crc, (unsigned)total, (unsigned)xfer);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_UP_TO_DATE, xfer, total, crc, &town, 0);
+        return;
+    }
+    ts->buf = buf;
+    ts->size = total;
+    ts->next_off = 0;
+    ts->streaming = 1;
+    printf("[NET][TOWN] host: peer %d STREAM %u bytes crc32 %08x xfer %u gen %u\n", (int)peer, (unsigned)total, (unsigned)crc, (unsigned)xfer, (unsigned)pc_save_town_gen());
+    pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_STREAM, xfer, total, crc, &town,
+                                (total + PC_NETGAME_TOWN_CHUNK_DATA - 1u) / PC_NETGAME_TOWN_CHUNK_DATA);
+    pcnetgame_townsrv_pump(peer);
+}
+
+/* Everything a FETCH connection sends after its request: TOWN_DONE closes it, IDENTITY / IDENTITY_EXT are ignored (logged), the rest is dropped. */
+static void pcnetgame_townsrv_handle_fetch_data(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
+    TownSrvPeer* ts = &s_townsrv[peer];
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_TOWN_DONE && size == sizeof(PCNetGameTownDoneMsg)) {
+        PCNetGameTownDoneMsg d;
+        memcpy(&d, data, sizeof(d));
+        if (d.xfer_id == ts->xfer_id && ts->done_ms == 0) {
+            /* NOT dropped here: this runs inside the transport event drain, where the same poll batch may already hold the client's DISCONNECT and a NEW connection that
+             * reused this slot index (pc_net_disconnect(peer) would then kill the newcomer). The snapshot is released now, the slot a moment later from the tick. */
+            printf("[NET][TOWN] host: peer %d TOWN_DONE status %u crc32 %08x (xfer %u) -- closing the fetch connection\n", (int)peer, (unsigned)d.status,
+                   (unsigned)d.crc32, (unsigned)d.xfer_id);
+            if (ts->buf != NULL) {
+                free(ts->buf);
+                ts->buf = NULL;
+            }
+            ts->streaming = 0;
+            ts->done_ms = pcnetgame_now_ms();
+        }
+        return;
+    }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY || data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_EXT) {
+        printf("[NET][TOWN] host: peer %d is a town FETCH connection: %s IGNORED (it can never bind an identity)\n", (int)peer,
+               data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY ? "IDENTITY" : "IDENTITY_EXT");
+    }
+}
+/* ===== TOWN TRANSFER HOST END ===== */
+
 static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || size == 0) {
         return;
     }
     if (s_host_peer[peer].closing) {
         return; /* rejected peer lingering only so its REJECT can be retransmitted -- ignore everything */
+    }
+    if (s_townsrv[peer].active) {
+        pcnetgame_townsrv_handle_fetch_data(peer, data, size); /* M-B: a town FETCH connection: only TOWN_DONE counts, IDENTITY / IDENTITY_EXT are ignored */
+        return;
+    }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_TOWN_FETCH_REQ) {
+        pcnetgame_townsrv_handle_req(peer, data, size); /* M-B: HANDSHAKE peers that have not sent IDENTITY only; gates inside */
+        return;
     }
 
     if (data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY && size >= 8) {
@@ -23724,6 +24082,315 @@ int pc_net_game_start_client(const char* host_ip, uint16_t port) {
     printf("[NET] connecting to %s:%u (protocol %u)...\n", host_ip, (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
     return 1;
 }
+
+
+/* ===== TOWN TRANSFER CLIENT BEGIN (M-B): the PRE-BOOT fetch =====
+ * Called from pc_main.c after pc_platform_init() and BEFORE boot_main(), only for --town-fetch. It is a SEPARATE single-purpose connection (pc_net_init /
+ * pc_net_client_connect, its own pump of pc_net_poll / pc_net_next_event, pc_net_disconnect + pc_net_shutdown at the end) that never touches s_role, the
+ * session state or any game object, so pc_net_game_poll() (which reads game state) stays out of the pre-boot phase. The normal pc_net_game_start_client()
+ * follows. On success (or a usable fallback) the Card-A dir is switched with pc_card_set_town_dir() BEFORE the save is loaded (second_game_init).
+ * A partial or invalid download never replaces a valid cache: the stream goes to <town>/incoming/town.part (NEVER card_a), is verified (size, CRC32, GCI
+ * validity and town identity == TOWN_INFO) and only then installed atomically. */
+#define PC_NETGAME_TOWN_INFO_WAIT_MS   3000u   /* no TOWN_INFO within this long after starting = an old host / nobody there: fall back */
+#define PC_NETGAME_TOWN_STALL_MS       10000u  /* no chunk for this long mid-stream */
+
+static void pcnetgame_towncl_progress(PCNetGameTownProgressFn fn, const char* text) {
+    if (fn != NULL) {
+        fn(text);
+    }
+}
+
+static void pcnetgame_towncl_send_done(uint8_t status, uint32_t xfer, uint32_t crc) {
+    PCNetGameTownDoneMsg d;
+    memset(&d, 0, sizeof(d));
+    d.msg_type = (uint8_t)PC_NETGAME_MSG_TOWN_DONE;
+    d.status = status;
+    d.xfer_id = xfer;
+    d.crc32 = crc;
+    pc_net_send(0, PC_NET_RELIABLE, &d, (uint16_t)sizeof(d));
+}
+
+/* Fallback ladder: (1) an existing towns/K found through origin.ini (offline-capable), (2) the legacy save/card_a, (3) nothing usable. */
+static int pcnetgame_towncl_fallback(const char* host, uint16_t port, const char* why, char* err, size_t err_cap) {
+    char key[PC_TOWN_KEY_LEN + 1];
+    PCTownPaths p;
+    struct stat st;
+    char legacy[400];
+    printf("[NET][TOWN] fetch FAILED / unavailable: %s\n", why);
+    if (pc_town_cache_find_by_server(NULL, host, port, key, &p)) {
+        if (pc_card_set_town_dir(p.town_dir)) {
+            printf("[NET][TOWN] fallback: using the cached town %s of %s:%u (%s)\n", key, host, (unsigned)port, p.town_dir);
+            return PC_TOWN_PREFETCH_CACHE;
+        }
+    }
+    snprintf(legacy, sizeof(legacy), "save/card_a/%s", PC_TOWN_GCI_FILENAME);
+    if (stat(legacy, &st) == 0) {
+        printf("[NET][TOWN] fallback: using the legacy %s (no town cache for %s:%u)\n", legacy, host, (unsigned)port);
+        return PC_TOWN_PREFETCH_LEGACY;
+    }
+    snprintf(err, err_cap, "Could not get the host's town (%s).\n\nThe host has no town transfer enabled (or is an older version) and there is no local copy of its town. "
+             "Ask the host to start with --town-serve on, or copy the host's save file (DobutsunomoriP_MURA.gci) into save/card_a and restart.", why);
+    printf("[NET][TOWN] fallback: NO USABLE TOWN: %s\n", why);
+    return PC_TOWN_PREFETCH_ERROR;
+}
+
+int pc_net_game_town_prefetch(const char* host_ip, uint16_t port, uint32_t timeout_ms, PCNetGameTownProgressFn progress, const char* server_name,
+                              char* err, size_t err_cap) {
+    enum { ST_WAIT_INFO, ST_STREAM, ST_FINISHED };
+    PCNetEvent ev;
+    PCTownPaths cpaths;
+    PCTownId have_town;
+    PCTownId info_town;
+    PCTownPart part;
+    PCNetGameTownInfoMsg info;
+    char ckey[PC_TOWN_KEY_LEN + 1];
+    char ikey[PC_TOWN_KEY_LEN + 1];
+    char why[220];
+    PCTownPaths ipaths;
+    uint32_t have_crc = 0, have_size = 0;
+    int have_cache = 0;
+    int state = ST_WAIT_INFO;
+    int result = -1;          /* PC_TOWN_PREFETCH_* once decided; -1 = still running / failed (fallback) */
+    int connected = 0, info_seen = 0, part_open = 0, pct_shown = -1;
+    uint32_t t0, last_rx, xfer = 0, done_status = PC_NETGAME_TOWN_DONE_ABORT, done_crc = 0;
+    char title[120];
+
+    why[0] = '\0';
+    if (err != NULL && err_cap > 0) {
+        err[0] = '\0';
+    }
+    memset(&part, 0, sizeof(part));
+    memset(&info, 0, sizeof(info));
+    memset(&have_town, 0, sizeof(have_town));
+    memset(&info_town, 0, sizeof(info_town));
+    ckey[0] = '\0';
+
+    /* What the local cache of this server (address:port -> origin.ini of each town dir) already holds. */
+    if (pc_town_cache_find_by_server(NULL, host_ip, port, ckey, &cpaths) && pc_town_file_crc(cpaths.gci, &have_crc, &have_size) &&
+        pc_save_validate_gci_file(cpaths.gci, &have_town)) {
+        have_cache = 1;
+        printf("[NET][TOWN] fetch: local cache %s (%u bytes, crc32 %08x)\n", ckey, (unsigned)have_size, (unsigned)have_crc);
+    } else {
+        have_crc = 0;
+        have_size = 0;
+        memset(&have_town, 0, sizeof(have_town));
+    }
+
+    if (!pc_net_init()) {
+        snprintf(why, sizeof(why), "networking could not be initialised");
+        return pcnetgame_towncl_fallback(host_ip, port, why, err, err_cap);
+    }
+    if (!pc_net_client_connect(host_ip, port)) {
+        pc_net_shutdown();
+        snprintf(why, sizeof(why), "could not start connecting to %s:%u", host_ip, (unsigned)port);
+        return pcnetgame_towncl_fallback(host_ip, port, why, err, err_cap);
+    }
+    printf("[NET][TOWN] fetch: connecting to %s:%u for the host's town (timeout %u ms, TOWN_INFO within %u ms)\n", host_ip, (unsigned)port, (unsigned)timeout_ms,
+           (unsigned)PC_NETGAME_TOWN_INFO_WAIT_MS);
+    pcnetgame_towncl_progress(progress, "Animal Crossing - connecting to the host...");
+
+    t0 = pcnetgame_now_ms();
+    last_rx = t0;
+    while (state != ST_FINISHED) {
+        const uint32_t now = pcnetgame_now_ms();
+        if ((uint32_t)(now - t0) >= timeout_ms) {
+            snprintf(why, sizeof(why), "timed out after %u ms", (unsigned)timeout_ms);
+            break;
+        }
+        if (state == ST_WAIT_INFO && !info_seen && (uint32_t)(now - t0) >= PC_NETGAME_TOWN_INFO_WAIT_MS) {
+            snprintf(why, sizeof(why), "no TOWN_INFO from %s:%u within %u ms (old host / not reachable / town transfer unsupported)", host_ip, (unsigned)port,
+                     (unsigned)PC_NETGAME_TOWN_INFO_WAIT_MS);
+            break;
+        }
+        if (state == ST_STREAM && (uint32_t)(now - last_rx) >= PC_NETGAME_TOWN_STALL_MS) {
+            snprintf(why, sizeof(why), "the transfer stalled (no data for %u ms)", (unsigned)PC_NETGAME_TOWN_STALL_MS);
+            break;
+        }
+        SDL_PumpEvents();
+        pc_net_poll();
+        while (why[0] == '\0' && state != ST_FINISHED && pc_net_next_event(&ev)) {
+            if (ev.type == PC_NET_EVENT_PEER_CONNECTED) {
+                PCNetGameTownFetchReqMsg rq;
+                connected = 1;
+                memset(&rq, 0, sizeof(rq));
+                rq.msg_type = (uint8_t)PC_NETGAME_MSG_TOWN_FETCH_REQ;
+                rq.protocol_version = PC_NETGAME_PROTOCOL_VERSION;
+                rq.have_crc32 = have_crc;
+                rq.have_size = have_size;
+                memcpy(rq.have_land_name, have_town.land_name, PC_NETGAME_LAND_LEN);
+                rq.have_land_id = have_town.land_id;
+                rq.have_terrain_hash = have_town.terrain_hash;
+                pc_net_send(0, PC_NET_RELIABLE, &rq, (uint16_t)sizeof(rq));
+                pcnetgame_towncl_progress(progress, "Animal Crossing - asking the host for its town...");
+            } else if (ev.type == PC_NET_EVENT_PEER_DISCONNECTED) {
+                connected = 0;
+                snprintf(why, sizeof(why), "the host closed the connection");
+            } else if (ev.type == PC_NET_EVENT_DATA && ev.size >= 1) {
+                last_rx = pcnetgame_now_ms();
+                if (ev.data[0] == (uint8_t)PC_NETGAME_MSG_TOWN_INFO && state == ST_WAIT_INFO && !info_seen) {
+                    if (ev.size != sizeof(info)) {
+                        snprintf(why, sizeof(why), "malformed TOWN_INFO (size %u)", (unsigned)ev.size);
+                        continue;
+                    }
+                    memcpy(&info, ev.data, sizeof(info));
+                    info_seen = 1;
+                    xfer = info.xfer_id;
+                    if (info.status == PC_NETGAME_TOWN_STATUS_UNAVAILABLE) {
+                        snprintf(why, sizeof(why), "the host has no saved town to transfer yet");
+                    } else if (info.status == PC_NETGAME_TOWN_STATUS_BUSY) {
+                        snprintf(why, sizeof(why), "the host is busy with other town transfers (try again in a minute)");
+                    } else if (info.status == PC_NETGAME_TOWN_STATUS_REFUSED) {
+                        snprintf(why, sizeof(why), "the host refused the town transfer (town_serve is off on the host)");
+                    } else if (info.status == PC_NETGAME_TOWN_STATUS_BAD_REQUEST) {
+                        snprintf(why, sizeof(why), "the host rejected the town request as malformed");
+                    } else if (info.status != PC_NETGAME_TOWN_STATUS_STREAM && info.status != PC_NETGAME_TOWN_STATUS_UP_TO_DATE) {
+                        snprintf(why, sizeof(why), "unknown TOWN_INFO status %u (host is a newer version?)", (unsigned)info.status);
+                    } else if (info.total_size != PC_NETGAME_TOWN_FILE_SIZE || info.chunk_size != PC_NETGAME_TOWN_CHUNK_DATA || xfer == 0 ||
+                               (info.status == PC_NETGAME_TOWN_STATUS_STREAM &&
+                                info.chunk_count != (PC_NETGAME_TOWN_FILE_SIZE + PC_NETGAME_TOWN_CHUNK_DATA - 1u) / PC_NETGAME_TOWN_CHUNK_DATA)) {
+                        snprintf(why, sizeof(why), "implausible TOWN_INFO (size %u, chunk %u, chunks %u)", (unsigned)info.total_size, (unsigned)info.chunk_size,
+                                 (unsigned)info.chunk_count);
+                    } else {
+                        memcpy(info_town.land_name, info.land_name, PC_NETGAME_LAND_LEN);
+                        info_town.land_id = info.land_id;
+                        info_town.terrain_hash = info.terrain_hash;
+                        pc_town_key_format(&info_town, ikey);
+                        if (!pc_town_paths(NULL, ikey, &ipaths)) {
+                            snprintf(why, sizeof(why), "bad town key from the host");
+                        } else if (info.status == PC_NETGAME_TOWN_STATUS_UP_TO_DATE) {
+                            if (!have_cache || info.total_size != have_size || info.crc32 != have_crc || !pc_town_id_equal(&info_town, &have_town)) {
+                                snprintf(why, sizeof(why), "the host says UP_TO_DATE but the local cache does not match");
+                            } else {
+                                printf("[NET][TOWN] fetch: UP_TO_DATE town %s (crc32 %08x, %u bytes, host save generation %u)\n", ikey, (unsigned)info.crc32,
+                                       (unsigned)info.total_size, (unsigned)info.town_gen);
+                                done_status = PC_NETGAME_TOWN_DONE_OK;
+                                done_crc = info.crc32;
+                                result = PC_TOWN_PREFETCH_UP_TO_DATE;
+                                state = ST_FINISHED;
+                            }
+                        } else if (!pc_town_part_begin(&part, ipaths.incoming_dir, ipaths.part)) {
+                            done_status = PC_NETGAME_TOWN_DONE_IO;
+                            snprintf(why, sizeof(why), "could not create %s", ipaths.part);
+                        } else {
+                            part_open = 1;
+                            state = ST_STREAM;
+                            printf("[NET][TOWN] fetch: STREAM town %s: %u bytes in %u chunks (crc32 %08x, host save generation %u)\n", ikey, (unsigned)info.total_size,
+                                   (unsigned)info.chunk_count, (unsigned)info.crc32, (unsigned)info.town_gen);
+                        }
+                    }
+                } else if (ev.data[0] == (uint8_t)PC_NETGAME_MSG_TOWN_CHUNK && state == ST_STREAM) {
+                    PCNetGameTownChunkMsg c;
+                    uint32_t want;
+                    if (ev.size != sizeof(c)) {
+                        snprintf(why, sizeof(why), "malformed TOWN_CHUNK (size %u)", (unsigned)ev.size);
+                        continue;
+                    }
+                    memcpy(&c, ev.data, sizeof(c));
+                    want = info.total_size - part.expected;
+                    if (want > PC_NETGAME_TOWN_CHUNK_DATA) {
+                        want = PC_NETGAME_TOWN_CHUNK_DATA;
+                    }
+                    if (c.xfer_id != xfer || c.len != want || !pc_town_part_append(&part, c.offset, c.data, c.len, info.total_size)) {
+                        done_status = part.failed && c.xfer_id == xfer && c.len == want && c.offset == part.expected ? PC_NETGAME_TOWN_DONE_IO : PC_NETGAME_TOWN_DONE_ABORT;
+                        snprintf(why, sizeof(why), "bad TOWN_CHUNK (offset %u len %u, expected offset %u)", (unsigned)c.offset, (unsigned)c.len, (unsigned)part.expected);
+                        continue;
+                    }
+                    {
+                        int pct = (int)(((uint64_t)part.expected * 100u) / info.total_size);
+                        if (pct != pct_shown && (pct % 5 == 0 || pct == 100)) {
+                            pct_shown = pct;
+                            snprintf(title, sizeof(title), "Animal Crossing - fetching the host's town: %d%%", pct);
+                            pcnetgame_towncl_progress(progress, title);
+                        }
+                    }
+                    if (part.expected >= info.total_size) {
+                        uint32_t got_size = 0, got_crc = 0;
+                        PCTownId got_town;
+                        part_open = 0;
+                        if (!pc_town_part_finish(&part, &got_size, &got_crc)) {
+                            done_status = PC_NETGAME_TOWN_DONE_IO;
+                            snprintf(why, sizeof(why), "could not write %s", ipaths.part);
+                        } else if (got_size != info.total_size || got_crc != info.crc32) {
+                            done_status = PC_NETGAME_TOWN_DONE_BAD_CRC;
+                            done_crc = got_crc;
+                            snprintf(why, sizeof(why), "the downloaded town is corrupt (crc32 %08x, expected %08x)", (unsigned)got_crc, (unsigned)info.crc32);
+                        } else if (!pc_save_validate_gci_file(ipaths.part, &got_town) || !pc_town_id_equal(&got_town, &info_town)) {
+                            done_status = PC_NETGAME_TOWN_DONE_BAD_GCI;
+                            snprintf(why, sizeof(why), "the downloaded file is not a valid GCI of the announced town");
+                        } else if (!pc_town_cache_install(ipaths.part, ipaths.gci)) {
+                            done_status = PC_NETGAME_TOWN_DONE_IO;
+                            snprintf(why, sizeof(why), "could not install the town into %s", ipaths.gci);
+                        } else {
+                            PCTownOrigin o;
+                            memset(&o, 0, sizeof(o));
+                            snprintf(o.server_name, sizeof(o.server_name), "%s", server_name != NULL ? server_name : "");
+                            snprintf(o.address, sizeof(o.address), "%s", host_ip);
+                            o.port = port;
+                            o.last_fetch = (int64_t)time(NULL);
+                            pc_town_origin_write(ipaths.origin_ini, &o);
+                            printf("[NET][TOWN] fetch: installed town %s (%u bytes, crc32 %08x) into %s\n", ikey, (unsigned)got_size, (unsigned)got_crc, ipaths.gci);
+                            done_status = PC_NETGAME_TOWN_DONE_OK;
+                            done_crc = got_crc;
+                            result = PC_TOWN_PREFETCH_FETCHED;
+                            state = ST_FINISHED;
+                        }
+                    }
+                }
+                /* anything else (a stray message of another kind) is ignored */
+            }
+        }
+        if (why[0] != '\0') {
+            break;
+        }
+        SDL_Delay(1);
+    }
+
+    /* Leave politely: the verdict, wait (briefly) for it to be acknowledged, then goodbye + socket teardown. */
+    if (part_open) {
+        pc_town_part_abort(&part);
+    }
+    if (connected && xfer != 0) {
+        uint32_t w0 = pcnetgame_now_ms();
+        pcnetgame_towncl_send_done((uint8_t)(result > 0 ? PC_NETGAME_TOWN_DONE_OK : done_status), xfer, done_crc);
+        while ((uint32_t)(pcnetgame_now_ms() - w0) < 300u && pc_net_reliable_backlog(0) > 0) {
+            pc_net_poll();
+            SDL_Delay(2);
+        }
+    }
+    pc_net_disconnect(PC_NET_INVALID_PEER);
+    pc_net_poll();
+    pc_net_shutdown();
+
+    if (result > 0) {
+        if (result == PC_TOWN_PREFETCH_UP_TO_DATE) {
+            PCTownOrigin o;
+            if (!pc_town_origin_read(cpaths.origin_ini, &o)) {
+                memset(&o, 0, sizeof(o));
+                snprintf(o.address, sizeof(o.address), "%s", host_ip);
+                o.port = port;
+            }
+            if (server_name != NULL && server_name[0] != '\0') {
+                snprintf(o.server_name, sizeof(o.server_name), "%s", server_name);
+            }
+            o.last_fetch = (int64_t)time(NULL);
+            pc_town_origin_write(cpaths.origin_ini, &o);
+            if (!pc_card_set_town_dir(cpaths.town_dir)) {
+                snprintf(why, sizeof(why), "could not select the cached town directory");
+                result = -1;
+            }
+        } else if (!pc_card_set_town_dir(ipaths.town_dir)) {
+            snprintf(why, sizeof(why), "could not select the town directory");
+            result = -1;
+        }
+    }
+    if (result > 0) {
+        pcnetgame_towncl_progress(progress, "Animal Crossing");
+        return result;
+    }
+    pcnetgame_towncl_progress(progress, "Animal Crossing");
+    return pcnetgame_towncl_fallback(host_ip, port, why[0] != '\0' ? why : "unknown error", err, err_cap);
+}
+/* ===== TOWN TRANSFER CLIENT END ===== */
 
 void pc_net_game_shutdown(void) {
     if (s_role == PC_NETGAME_ROLE_NONE) return;
@@ -25276,6 +25943,7 @@ void pc_net_game_poll(void) {
     /* v2 world protocol, after events. */
     if (s_role == PC_NETGAME_ROLE_HOST) {
         pcnetgame_host_closing_tick();
+        pcnetgame_townsrv_tick(); /* M-B: town transfer pump (a fetch connection never reaches READY) */
         pcnetgame_host_process_pending_identities();
         pcnetgame_host_record_tick(); /* D3: HELLO/MIGRATE deadlines, record push pump, host-field watcher */
         pcnetgame_host_ts_tick();     /* town services: digest-poll the host's police / museum copies and push TOWN_SVC_STATE */

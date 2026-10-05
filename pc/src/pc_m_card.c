@@ -58,13 +58,12 @@
 #include <direct.h>  /* _mkdir */
 #endif
 #include <dolphin/os.h>  /* OSReport */
+#include "pc_town_cache.h"  /* M-A: pc_card_a_dir() / pc_gci_path() / pc_gci_tmp_path() (runtime Card-A dir); M-B: PCTownId, CRC32 */
 
 /* --- Path constants --- */
-#define PC_CARD_A_DIR     "save/card_a"
 #define PC_CARD_B_DIR     "save/card_b"
+/* M-A: the Card-A directory / GCI paths are RUNTIME values (pc_town_cache.c: pc_card_a_dir() / pc_gci_path() / pc_gci_tmp_path()); default save/card_a. */
 #define PC_GCI_FILENAME   "DobutsunomoriP_MURA.gci"
-#define PC_GCI_PATH       PC_CARD_A_DIR "/" PC_GCI_FILENAME
-#define PC_GCI_TMP_PATH   PC_CARD_A_DIR "/" PC_GCI_FILENAME ".tmp"
 #define PC_SAVE_DIR       "save"
 #define PC_SAVE_MAX_BACKUPS 3
 
@@ -266,11 +265,19 @@ static void pc_save_rotate_backups(const char* base_path) {
 static void pc_ensure_save_dirs(void) {
 #ifdef _WIN32
     _mkdir(PC_SAVE_DIR);
-    _mkdir(PC_CARD_A_DIR);
+    if (pc_card_town_dir_active()) {
+        pc_town_mkdirs(pc_card_a_dir()); /* M-A: save/mp/towns/<key>/card_a (save/card_a is NOT created / touched when a town dir is set) */
+    } else {
+        _mkdir(pc_card_a_dir());
+    }
     _mkdir(PC_CARD_B_DIR);
 #else
     mkdir(PC_SAVE_DIR, 0755);
-    mkdir(PC_CARD_A_DIR, 0755);
+    if (pc_card_town_dir_active()) {
+        pc_town_mkdirs(pc_card_a_dir());
+    } else {
+        mkdir(pc_card_a_dir(), 0755);
+    }
     mkdir(PC_CARD_B_DIR, 0755);
 #endif
 }
@@ -335,15 +342,21 @@ static void pc_save_pre_write_side_effects(int save_mode) {
     Save_Set(travel_hard_time, lbRTC_HardTime());
 }
 
+static unsigned s_pc_town_gen = 0;
+unsigned pc_save_town_gen(void) { return s_pc_town_gen; }
+
 static int pc_save_write_gci(void) {
-    int ok = pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);
+    int ok = pc_save_write_gci_to(pc_gci_path(), pc_gci_tmp_path());
+    if (ok && pc_save_ready) {
+        s_pc_town_gen++; /* M-B: the host's TOWN_INFO.town_gen = number of durable GCI writes since start */
+    }
     /* D3-4: the Card-A GCI is the only place a host-merged resident record becomes durable. Right after it was really written
      * (pc_save_write_gci_to() also returns TRUE without writing when the save is not ready), the host persists the resident
      * record lineage sidecar save/mp/records.dat (pc_net_game.c -> pc_mp_records.c; no-op unless this process is the HOST).
      * Same (main) thread, synchronously, so the sidecar describes exactly the records the GCI just serialized; the GCI layout,
      * checksum, backup rotation and atomic rename above are untouched. The sidecar never lives in or next to a card directory. */
     if (ok && pc_save_ready) {
-        pc_net_game_record_after_gci_save(PC_GCI_PATH);
+        pc_net_game_record_after_gci_save(pc_gci_path());
     }
     return ok;
 }
@@ -505,7 +518,7 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
  * side effects) that are inappropriate for a headless persistence operation.
  *
  * This calls pc_save_write_gci() -- not pc_save_write_gci_to() -- because it is already the
- * existing zero-logic selector for the canonical Card-A path (PC_GCI_PATH/PC_GCI_TMP_PATH); using
+ * existing zero-logic selector for the canonical Card-A path (pc_gci_path()/pc_gci_tmp_path()); using
  * it means this wrapper never constructs or duplicates a path itself. pc_save_write_gci_to() is
  * used elsewhere only for the Card-B travel case, which does not apply here: a bootstrapped
  * resident is always a Card-A resident (pcfa_save_ready() already excludes player_no >=
@@ -801,20 +814,20 @@ static void pc_save_migrate_legacy(void) {
     struct stat st_legacy, st_new;
 
     if (stat(PC_GCI_PATH_LEGACY, &st_legacy) == 0 &&
-        stat(PC_GCI_PATH, &st_new) != 0) {
+        stat(pc_gci_path(), &st_new) != 0) {
         int b;
-        OSReport("[PC] Migrating save from '%s' to '%s'\n", PC_GCI_PATH_LEGACY, PC_GCI_PATH);
+        OSReport("[PC] Migrating save from '%s' to '%s'\n", PC_GCI_PATH_LEGACY, pc_gci_path());
         pc_ensure_save_dirs();
 
         /* Move main save */
-        remove(PC_GCI_PATH); /* in case it somehow exists */
-        rename(PC_GCI_PATH_LEGACY, PC_GCI_PATH);
+        remove(pc_gci_path()); /* in case it somehow exists */
+        rename(PC_GCI_PATH_LEGACY, pc_gci_path());
 
         /* Move backups */
         for (b = 1; b <= PC_SAVE_MAX_BACKUPS; b++) {
             char old_bak[300], new_bak[300];
             snprintf(old_bak, sizeof(old_bak), "%s.bak%d", PC_GCI_PATH_LEGACY, b);
-            snprintf(new_bak, sizeof(new_bak), "%s.bak%d", PC_GCI_PATH, b);
+            snprintf(new_bak, sizeof(new_bak), "%s.bak%d", pc_gci_path(), b);
             remove(new_bak);
             rename(old_bak, new_bak);
         }
@@ -823,8 +836,8 @@ static void pc_save_migrate_legacy(void) {
         {
             char old_tmp[300];
             snprintf(old_tmp, sizeof(old_tmp), "%s.tmp", PC_GCI_PATH_LEGACY);
-            remove(PC_GCI_TMP_PATH);
-            rename(old_tmp, PC_GCI_TMP_PATH);
+            remove(pc_gci_tmp_path());
+            rename(old_tmp, pc_gci_tmp_path());
         }
 
         OSReport("[PC] Migration complete\n");
@@ -833,13 +846,16 @@ static void pc_save_migrate_legacy(void) {
 
 static int pc_save_scan_gci_dir(void) {
     /* Try common AC save filenames in card_a/ */
-    static const char* gci_names[] = {
-        PC_CARD_A_DIR "/DobutsunomoriP_MURA.gci",
-        PC_CARD_A_DIR "/8P-GAFE-DobutsunomoriP_MURA.gci",
-        NULL
-    };
+    char gci_name_a[320], gci_name_b[320];
+    const char* gci_names[3];
     int i;
     struct stat st;
+
+    snprintf(gci_name_a, sizeof(gci_name_a), "%s/DobutsunomoriP_MURA.gci", pc_card_a_dir());
+    snprintf(gci_name_b, sizeof(gci_name_b), "%s/8P-GAFE-DobutsunomoriP_MURA.gci", pc_card_a_dir());
+    gci_names[0] = gci_name_a;
+    gci_names[1] = gci_name_b;
+    gci_names[2] = NULL;
 
     for (i = 0; gci_names[i] != NULL; i++) {
         if (stat(gci_names[i], &st) == 0) {
@@ -869,8 +885,8 @@ static int pc_save_scan_gci_dir(void) {
 int pc_save_reload(void) {
     struct stat st;
     if (!pc_save_loaded) return 0;
-    if (stat(PC_GCI_PATH, &st) == 0) {
-        return pc_save_read_gci(PC_GCI_PATH);
+    if (stat(pc_gci_path(), &st) == 0) {
+        return pc_save_read_gci(pc_gci_path());
     }
     return pc_save_scan_gci_dir();
 }
@@ -885,17 +901,19 @@ int pc_save_check_and_load(void) {
     }
 
     pc_ensure_save_dirs();
-    pc_save_migrate_legacy();
+    if (!pc_card_town_dir_active()) { /* M-A: a town dir must never pull save/DobutsunomoriP_MURA.gci into itself (the legacy file is left alone) */
+        pc_save_migrate_legacy();
+    }
 
-    if (stat(PC_GCI_PATH, &st) == 0) {
-        OSReport("[PC] Found GCI save: %s (%ld bytes)\n", PC_GCI_PATH, (long)st.st_size);
-        if (pc_save_read_gci(PC_GCI_PATH)) {
+    if (stat(pc_gci_path(), &st) == 0) {
+        OSReport("[PC] Found GCI save: %s (%ld bytes)\n", pc_gci_path(), (long)st.st_size);
+        if (pc_save_read_gci(pc_gci_path())) {
             OSReport("[PC] GCI save loaded successfully\n");
             return TRUE;
         }
         OSReport("[PC] GCI save load FAILED\n");
     } else {
-        OSReport("[PC] No GCI save at %s\n", PC_GCI_PATH);
+        OSReport("[PC] No GCI save at %s\n", pc_gci_path());
     }
 
     OSReport("[PC] Scanning for other GCI files...\n");
@@ -905,9 +923,9 @@ int pc_save_check_and_load(void) {
     }
 
     /* recovery: try temp file, then backups */
-    if (stat(PC_GCI_TMP_PATH, &st) == 0) {
-        OSReport("[PC] Found orphaned temp save '%s', recovering...\n", PC_GCI_TMP_PATH);
-        if (rename(PC_GCI_TMP_PATH, PC_GCI_PATH) == 0 && pc_save_read_gci(PC_GCI_PATH)) {
+    if (stat(pc_gci_tmp_path(), &st) == 0) {
+        OSReport("[PC] Found orphaned temp save '%s', recovering...\n", pc_gci_tmp_path());
+        if (rename(pc_gci_tmp_path(), pc_gci_path()) == 0 && pc_save_read_gci(pc_gci_path())) {
             OSReport("[PC] Recovered save from temp file\n");
             return TRUE;
         }
@@ -916,7 +934,7 @@ int pc_save_check_and_load(void) {
         char bak_path[300];
         int b;
         for (b = 1; b <= PC_SAVE_MAX_BACKUPS; b++) {
-            snprintf(bak_path, sizeof(bak_path), "%s.bak%d", PC_GCI_PATH, b);
+            snprintf(bak_path, sizeof(bak_path), "%s.bak%d", pc_gci_path(), b);
             if (stat(bak_path, &st) == 0) {
                 OSReport("[PC] Found backup save '%s', recovering...\n", bak_path);
                 if (pc_save_read_gci(bak_path)) {
@@ -2116,6 +2134,71 @@ static int pc_read_gci_land_info(const char* path, Save_t* out) {
     return ok;
 }
 
+/* M-B: validate a whole GCI image and derive its town identity EXACTLY like pcnetgame_capture_town_identity() does for the live Save (land_name, land_id and
+ * the FNV-1a hash of the town-acre combination table), so a transferred file can be compared with the host's TOWN_INFO. Requires the exact file size
+ * (64 + 0x72000), the "GAF" game code and a successful Save_t read; the Save_t checksum is not verified here (the loader does not either; the transport
+ * checks size + CRC32). Returns TRUE and fills *town on success. */
+static uint32_t pc_town_fnv1a_u16(uint32_t h, uint16_t v) {
+    h ^= (uint32_t)(v & 0xFFu);
+    h *= 16777619u;
+    h ^= (uint32_t)(v >> 8);
+    h *= 16777619u;
+    return h;
+}
+
+int pc_save_validate_gci_buffer(const unsigned char* buf, size_t len, PCTownId* town) {
+    const CARDDir* hdr;
+    Save_t* sv;
+    uint32_t h = 2166136261u;
+    int ax, az;
+
+    if (buf == NULL || town == NULL || len != (size_t)GCI_HEADER_SIZE + (size_t)GCI_FILE_DATA_SIZE) {
+        return FALSE;
+    }
+    hdr = (const CARDDir*)buf;
+    if (memcmp(hdr->gameName, "GAF", 3) != 0) {
+        return FALSE;
+    }
+    sv = (Save_t*)malloc(sizeof(Save_t));
+    if (sv == NULL) {
+        return FALSE;
+    }
+    memcpy(sv, buf + GCI_HEADER_SIZE + GCI_SAVE_MAIN_OFFSET, sizeof(Save_t));
+    pc_save_bswap(sv, PC_BSWAP_FROM_BE);
+    memset(town, 0, sizeof(*town));
+    memcpy(town->land_name, sv->land_info.name, 8);
+    town->land_id = (uint16_t)sv->land_info.id;
+    for (az = 0; az < PCFA_ACRE_Z_NUM; az++) {
+        for (ax = 0; ax < PCFA_ACRE_X_NUM; ax++) {
+            const mFM_combination_c* c = &sv->combi_table[az + 1][ax + 1];
+            uint16_t v = (uint16_t)(((unsigned)c->combination_type & 0x3FFFu) | (((unsigned)c->height & 3u) << 14));
+            h = pc_town_fnv1a_u16(h, v);
+        }
+    }
+    town->terrain_hash = h;
+    free(sv);
+    return TRUE;
+}
+
+int pc_save_validate_gci_file(const char* path, PCTownId* town) {
+    FILE* fp = fopen(path, "rb");
+    unsigned char* buf;
+    size_t want = (size_t)GCI_HEADER_SIZE + (size_t)GCI_FILE_DATA_SIZE;
+    int ok = FALSE;
+
+    if (fp == NULL) {
+        return FALSE;
+    }
+    buf = (unsigned char*)malloc(want + 1);
+    if (buf != NULL) {
+        size_t got = fread(buf, 1, want + 1, fp); /* one extra byte: an oversized file is rejected by the length check */
+        ok = pc_save_validate_gci_buffer(buf, got, town);
+        free(buf);
+    }
+    fclose(fp);
+    return ok;
+}
+
 /* Scan the "other" card for a travel-eligible town.
  *  - Resident: scan Card B for a different town.
  *  - Foreigner: scan Card A for the home town. */
@@ -2125,7 +2208,7 @@ int mCD_CheckStation_bg(s32* chan) {
     if (is_foreigner) {
         Save_t temp_save;
         if (chan) *chan = mCD_SLOT_B;
-        if (pc_read_gci_land_info(PC_GCI_PATH, &temp_save)) {
+        if (pc_read_gci_land_info(pc_gci_path(), &temp_save)) {
             if (mLd_CheckId(temp_save.land_info.id) &&
                 !mLd_CheckThisLand(temp_save.land_info.name, temp_save.land_info.id)) {
                 OSReport("[PC] CheckStation: Card A has home town '%.*s' (id=0x%04X) — return available\n",
@@ -2237,7 +2320,7 @@ int mCD_SaveStation_NextLand_bg(s32* chan) {
             OSReport("[PC] SaveStation_NextLand(return): no Card B path cached\n");
         }
 
-        if (!pc_save_read_gci_to_keep(PC_GCI_PATH)) {
+        if (!pc_save_read_gci_to_keep(pc_gci_path())) {
             OSReport("[PC] SaveStation_NextLand(return): failed to load home town\n");
             if (chan) *chan = mCD_SLOT_A;
             return mCD_TRANS_ERR_CORRUPT;

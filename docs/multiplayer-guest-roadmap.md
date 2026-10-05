@@ -782,10 +782,58 @@ Still missing: M2b resident token authentication; guest -> resident promotion (n
 with another town still needs the matching town GCI copied there); hostname / DNS resolution (IPv4 literals only); starting the role in-process (needs a re-init path audited for every role-dependent
 module); `last_town` hint; controller-only add/edit of servers (needs a keyboard; use `--server-add`).
 
+### Town cache and town transfer (phase 2, M-A / M-B)
+
+A client no longer has to copy the host's town save by hand. Started with `--town-fetch` it downloads the host's town into a per-town cache and plays that; the legacy
+`--connect` without the flag is unchanged.
+
+**Flags.**
+
+* `--town-fetch` (client only, requires `--connect` or `--server`, exit 2 otherwise): fetch the town before the game boots (progress in the window title; errors in an SDL message box).
+* `--town-serve on|off` (host only, exit 2 otherwise) and `settings.ini` `[Network]` `town_serve = 0|1`: whether this host serves its town. **Default OFF.**
+* `--town-dir DIR` (hidden, client only, requires `--connect`, not together with `--town-fetch`): use `DIR` (a town directory) as the Card-A parent: the save is read from `DIR/card_a`.
+  For tests and the fallback; `save/card_a` and the legacy `save/DobutsunomoriP_MURA.gci` are never moved, renamed or written, and the legacy migration is skipped.
+
+**Cache layout** (`pc/src/pc_town_cache.c`, pure module):
+
+```
+save/mp/towns/<townkey>/card_a/DobutsunomoriP_MURA.gci   the cached town (what the loader reads)
+save/mp/towns/<townkey>/incoming/town.part               a download in progress (never inside card_a: the loader renames an orphaned .tmp and scans GAF*.gci)
+save/mp/towns/<townkey>/origin.ini                       server name, address, port, last fetch time
+```
+
+`<townkey>` is `land_name` (16 hex) `_` `land_id` (4 hex) `_` `terrain_hash` (8 hex), the same formatting as the character store. A server is mapped to its town by scanning
+`towns/*/origin.ini` (`servers.ini` is not changed: its parser is strict). The cache is shared by all characters; clients only write it through a fetch.
+
+**Fetch flow** (`pc_net_game_town_prefetch`, called from `pc_main.c` after `pc_platform_init` and before `boot_main`): a separate single-purpose connection (own pump, no game state),
+messages `TOWN_FETCH_REQ` 62 / `TOWN_INFO` 63 / `TOWN_CHUNK` 64 / `TOWN_DONE` 65 (protocol v8 extended in place, no version bump). The client sends what it already has (crc32, size, town);
+the host answers `UP_TO_DATE` (no stream) or `STREAM`: 468 in-order chunks of 1000 bytes with a `u32` offset. The stream goes to `incoming/town.part`; at the end the client checks
+size and CRC32, validates the file as a GCI of the announced town (`pc_save_validate_gci_file`: exact size, `GAF`, land name / id / terrain hash equal to `TOWN_INFO`) and installs it
+with `MoveFileExA(REPLACE_EXISTING | WRITE_THROUGH)`. A partial, corrupt or mismatching download never replaces a valid cache. Every connect refetches when the file differs.
+
+Fallback ladder (no `TOWN_INFO` within 3 s = old host, or the fetch failed / was refused / is busy): (1) the cached town of this address:port found through `origin.ini` (offline-capable),
+(2) the legacy `save/card_a`, (3) an SDL message box and exit code 3 (a wrong town is never booted).
+
+**Host side.** The host serves its last durably saved GCI, read into a snapshot when the request arrives. Only a connection that is still in the handshake and has not sent `IDENTITY` /
+`IDENTITY_EXT` can fetch; on such a fetch connection `IDENTITY` is ignored (it can never bind an identity). At most 2 concurrent streams and 10 requests per address per minute (BUSY
+otherwise), chunks paced by the reliable backlog, the connection is closed after `TOWN_DONE` or 30 s. Statuses: 0 STREAM, 1 UP_TO_DATE, 2 UNAVAILABLE, 3 BUSY, 4 REFUSED (town_serve off, or
+IDENTITY already sent), 5 BAD_REQUEST.
+
+**Privacy.** The GCI contains every resident's pockets, mail, diary and designs and is served UNSANITIZED. That is why `town_serve` is off by default: turn it on only for
+friends / a supervised LAN. Sanitizing other residents' ranges (M-B2) is deferred; it needs a rule so a sanitized record can never be migrated back.
+
+**Limitations.** No adopt-on-match of an existing `save/card_a` into `towns/` (copy it by hand into `towns/<key>/card_a`); the transfer is about 60 s stale at worst (the READY snapshot
+and the record / house / service syncs bring the session up to date); Play Online does not pass `--town-fetch` yet (M-C); NES game saves still live in `save/card_a` (`famicom.cpp`);
+a fetch refetches the whole file whenever it differs (about 467 KB); the Save_t checksum is not verified (the loader does not either; the transport checks size + CRC32); a host that
+never saved yet answers UNAVAILABLE.
+Tests: `pc/tools/net_spike/test_town_cache_unit.py` (native unit + audits + `--town-dir` real process), `test_town_transfer_protocol.py` (scripted client against a real host),
+`test_town_fetch_real.py` (real client with an empty save dir).
+
 ## Known limitations
 
-* A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain
-  hash) must match the host's or the join is refused (LAND_MISMATCH / no matching save). A freshly generated town is not acceptable.
+* A guest needs a copy of the HOST's town save: either fetched with `--town-fetch` (the host must serve it, `--town-serve on`; see "Town cache and town transfer") or copied by hand
+  into `save/card_a/DobutsunomoriP_MURA.gci`. The town identity (land name, id, terrain hash) must match the host's or the join is refused (LAND_MISMATCH / no matching save).
+  A freshly generated town is not acceptable.
 * The empty-economy rule only constrains a NEW guest's first upload. Afterwards the client-owned ranges (pockets, wallet, bank, ...) are uploaded after a legality check only,
   exactly as for residents; a modified client can still edit its own inventory by later uploads (pre-existing trust model).
 * A guest's `player_id` / `land_id` / `name` / `home_town` cannot be changed without becoming a different guest; guests.dat holds 8 entries for ALL towns, confirmed entries are

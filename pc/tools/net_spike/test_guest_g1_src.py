@@ -190,7 +190,7 @@ def main():
        "memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));" in cr and "mPr_CopyPersonalID(&s_guest_rec[g].player_ID, (PersonalID_c*)key);" in cr and "s_guest_rec[g].exists = TRUE;" in cr
        and "mMsm_ClearRecord(&private_info->museum_record);" in vanilla and "bzero(private_info, sizeof(Private_c));" in vanilla
        and "private_info->reset_code" not in vanilla.split("extern void mPr_ClearPrivateInfo")[1].split("static int mPr_GetRandomFace")[0])
-    ck("E no wire change: the message id range is exactly 1..61 (59..61 came with the furniture sync) and wire_baseline is green", sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 62)))
+    ck("E no wire change: the message id range is exactly 1..65 (59..61 came with the furniture sync, 62..65 with the town transfer) and wire_baseline is green", sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 66)))
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("E wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))

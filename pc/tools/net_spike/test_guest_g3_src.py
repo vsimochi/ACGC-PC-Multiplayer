@@ -186,8 +186,8 @@ def main():
     ct = nb("pcnetgame_crec_tick")
     ck("G3.3 the reload poll runs from the client record tick only after the record is SYNCED (after the adopt), and only reads state otherwise",
        ct.index("if (s_crec.state != PC_NETGAME_CRS_SYNCED) {") < ct.index("pcnetgame_look_reload_poll();"))
-    ck("G3.3 no wire change by G3: message ids 1..61 (59..61 came with the furniture sync), wire_baseline green, protocol version untouched",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 62)))
+    ck("G3.3 no wire change by G3: message ids 1..65 (59..61 came with the furniture sync, 62..65 with the town transfer), wire_baseline green, protocol version untouched",
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 66)))
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("G3.3 wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))

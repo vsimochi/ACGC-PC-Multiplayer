@@ -441,8 +441,8 @@ def main():
           and "mp" not in re.findall(r'"save/(\w+)"', read("pc/src/pc_card.c")))
     check("P CMake: pc_mp_records.c is in PC_SOURCES (non-PC builds never see it)", "src/pc_mp_records.c" in cmake)
     check("P hook: pc_save_write_gci() calls pc_net_game_record_after_gci_save() only AFTER pc_save_write_gci_to() succeeded and the save was ready",
-          "pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH)" in wgci and "if (ok && pc_save_ready)" in wgci
-          and wgci.index("pc_save_write_gci_to(") < wgci.index("pc_net_game_record_after_gci_save(PC_GCI_PATH)"))
+          "pc_save_write_gci_to(pc_gci_path(), pc_gci_tmp_path())" in wgci and "if (ok && pc_save_ready)" in wgci
+          and wgci.index("pc_save_write_gci_to(") < wgci.index("pc_net_game_record_after_gci_save(pc_gci_path())"))
     check("P hook: the only caller of pc_net_game_record_after_gci_save is that Card-A hook (Card B writes go through pc_save_write_gci_to directly and never persist records)",
           len(re.findall(r"pc_net_game_record_after_gci_save\(", strip_comments(mcard))) == 1
           and not re.search(r"pc_net_game_record_after_gci_save", strip_comments(read("src/main.c")) + strip_comments(vi) + strip_comments(pcmain)))
@@ -459,7 +459,7 @@ def main():
           "memcmp(nf.e, s_rec_file.e, sizeof(nf.e)) == 0" in store_write and "pc_mp_records_sync_file(gci_path) != 0" in store_write
           and store_write.index("pc_mp_records_sync_file(gci_path)") < store_write.index("pc_mp_records_save(")
           and re.search(r"pc_mp_records_sync_file\(gci_path\) != 0\) \{[^}]*return 0;", store_write, re.S) is not None
-          and "pc_net_game_record_after_gci_save(PC_GCI_PATH)" in mcard)
+          and "pc_net_game_record_after_gci_save(pc_gci_path())" in mcard)
     check("P rev>0 is persisted ONLY through pcnetgame_rec_store_write: pc_mp_records_save has exactly one call site in pc_net_game.c; its callers are the post-GCI-save hook and the immediate UNTRUSTED write",
           len(re.findall(r"pc_mp_records_save\(", c)) == 1 and "pc_mp_records_save(" in store_write
           and len(re.findall(r"pcnetgame_rec_store_write\(", c)) == 3)

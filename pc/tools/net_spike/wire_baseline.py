@@ -51,7 +51,8 @@ REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
 # Guests G1 (deliberate, v8 still unreleased): 57 = IDENTITY_EXT (client -> host, the guest claim sent BEFORE the frozen IDENTITY) and 58 = IDENTITY_TOKEN
 # (host -> the admitted guest only, sent right after the frozen IDENTITY_ACK). The 32-byte IDENTITY / IDENTITY_ACK structs themselves stay frozen.
 # Furniture sync Stage 1 (deliberate, v8 still unreleased): 59 = HOUSE_BEGIN (both directions, 36 B), 60 = HOUSE_CHUNK (both, 1012 B), 61 = HOUSE_ACK (host -> owner, 24 B).
-EXPECTED_MAX_MSG_ID = 61
+# Town transfer (M-B, deliberate, v8 still unreleased): 62 = TOWN_FETCH_REQ (C -> H, 40 B), 63 = TOWN_INFO (H -> C, 40 B), 64 = TOWN_CHUNK (H -> C, 1012 B, u32 offset), 65 = TOWN_DONE (C -> H, 12 B).
+EXPECTED_MAX_MSG_ID = 65
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -97,7 +98,23 @@ V8_NEW_STRUCTS = {
                               "uint8_t data[PC_NETGAME_HOUSE_CHUNK_DATA];",
     "PCNetGameHouseAckMsg": "uint8_t msg_type; uint8_t status; uint16_t detail; uint32_t xfer_id; uint32_t house_seq; uint32_t epoch; uint32_t rev; "
                             "uint32_t host_session;",
+    # town transfer (M-B): the pre-boot cache fetch (40 B request, 40 B info, 1012 B chunk with a u32 offset, 12 B done)
+    "PCNetGameTownFetchReqMsg": "uint8_t msg_type; uint8_t flags; uint16_t _rsv0; uint32_t protocol_version; uint32_t have_crc32; uint32_t have_size; "
+                                "uint8_t have_land_name[PC_NETGAME_LAND_LEN]; uint16_t have_land_id; uint16_t _rsv1; uint32_t have_terrain_hash; uint8_t _rsv2[8];",
+    "PCNetGameTownInfoMsg": "uint8_t msg_type; uint8_t status; uint16_t chunk_size; uint32_t xfer_id; uint32_t total_size; uint32_t crc32; "
+                            "uint8_t land_name[PC_NETGAME_LAND_LEN]; uint16_t land_id; uint16_t _rsv0; uint32_t terrain_hash; uint32_t town_gen; uint32_t chunk_count;",
+    "PCNetGameTownChunkMsg": "uint8_t msg_type; uint8_t _rsv0; uint16_t len; uint32_t xfer_id; uint32_t offset; uint8_t data[PC_NETGAME_TOWN_CHUNK_DATA];",
+    "PCNetGameTownDoneMsg": "uint8_t msg_type; uint8_t status; uint16_t _rsv0; uint32_t xfer_id; uint32_t crc32;",
 }
+# Town transfer (M-B): exact C lines (constants + size asserts) that must stay as they are.
+TOWN_C_PINS = ("#define PC_NETGAME_TOWN_CHUNK_DATA   1000u", "#define PC_NETGAME_TOWN_FILE_SIZE    467008u",
+               "#define PC_NETGAME_TOWN_STATUS_STREAM        0u", "#define PC_NETGAME_TOWN_STATUS_UP_TO_DATE    1u",
+               "#define PC_NETGAME_TOWN_STATUS_UNAVAILABLE   2u", "#define PC_NETGAME_TOWN_STATUS_BUSY          3u",
+               "#define PC_NETGAME_TOWN_STATUS_REFUSED       4u", "#define PC_NETGAME_TOWN_STATUS_BAD_REQUEST   5u",
+               "#define PC_NETGAME_TOWN_DONE_OK       0u", "#define PC_NETGAME_TOWN_DONE_BAD_CRC  1u", "#define PC_NETGAME_TOWN_DONE_BAD_GCI  2u",
+               "#define PC_NETGAME_TOWN_DONE_IO       3u", "#define PC_NETGAME_TOWN_DONE_ABORT    4u",
+               '_Static_assert(sizeof(PCNetGameTownFetchReqMsg) == 40,', '_Static_assert(sizeof(PCNetGameTownInfoMsg) == 40,',
+               '_Static_assert(sizeof(PCNetGameTownChunkMsg) == 1012,', '_Static_assert(sizeof(PCNetGameTownDoneMsg) == 12,')
 # What HEAD may still contain for a struct whose v8 text was deliberately changed in place by a later (still unreleased) milestone.
 V8_PREV_STRUCTS = {
     "PCNetGameTxnResultMsg": "uint8_t msg_type; uint8_t kind; uint8_t outcome; uint8_t reason; uint32_t request_id; "
@@ -164,8 +181,9 @@ V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_B
                 ("PC_NETGAME_MSG_TXN_RESERVED_53", "53"), ("PC_NETGAME_MSG_TXN_RESERVED_54", "54"),
                 ("PC_NETGAME_MSG_TOWN_SVC_STATE", "55"), ("PC_NETGAME_MSG_MAILBOX_LETTER", "56"),
                 ("PC_NETGAME_MSG_IDENTITY_EXT", "57"), ("PC_NETGAME_MSG_IDENTITY_TOKEN", "58"),
-                ("PC_NETGAME_MSG_HOUSE_BEGIN", "59"), ("PC_NETGAME_MSG_HOUSE_CHUNK", "60"), ("PC_NETGAME_MSG_HOUSE_ACK", "61")]
-_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK))\s*=\s*\d+,"
+                ("PC_NETGAME_MSG_HOUSE_BEGIN", "59"), ("PC_NETGAME_MSG_HOUSE_CHUNK", "60"), ("PC_NETGAME_MSG_HOUSE_ACK", "61"),
+                ("PC_NETGAME_MSG_TOWN_FETCH_REQ", "62"), ("PC_NETGAME_MSG_TOWN_INFO", "63"), ("PC_NETGAME_MSG_TOWN_CHUNK", "64"), ("PC_NETGAME_MSG_TOWN_DONE", "65")]
+_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE))\s*=\s*\d+,"
 # net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
 V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
@@ -174,6 +192,7 @@ V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)
                            r"|PC_NETGAME_MSG_IDENTITY_(?:EXT|TOKEN)|PC_NETGAME_IDEXT_\w+|PC_NETGAME_IDTOKEN_\w+|PC_NETGAME_GUEST_\w+"
                            r"|PC_NETGAME_REC_CLASS_\w+|IDENTITY_(?:EXT|TOKEN)_FMT"
                            r"|PC_NETGAME_MSG_HOUSE_(?:BEGIN|CHUNK|ACK)|PC_NETGAME_HOUSE_\w+|PC_NETGAME_HOSTCFG_\w+|HOUSE_(?:BEGIN|CHUNK|ACK)_FMT"
+                           r"|PC_NETGAME_MSG_TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|PC_NETGAME_TOWN_\w+|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)_FMT"
                            r"|PC_NETGAME_MSG_(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)|(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)_FMT) = ")
 
 
@@ -344,6 +363,28 @@ V8_LIB_PINNED = {
     "HOUSE_BEGIN_FMT": '"<BBBBIIIIIHHII"',
     "HOUSE_CHUNK_FMT": '"<BBHIHH1000s"',
     "HOUSE_ACK_FMT": '"<BBHIIIII"',
+    # town transfer (M-B)
+    "PC_NETGAME_MSG_TOWN_FETCH_REQ": '62',
+    "PC_NETGAME_MSG_TOWN_INFO": '63',
+    "PC_NETGAME_MSG_TOWN_CHUNK": '64',
+    "PC_NETGAME_MSG_TOWN_DONE": '65',
+    "PC_NETGAME_TOWN_CHUNK_DATA": '1000',
+    "PC_NETGAME_TOWN_FILE_SIZE": '467008',
+    "PC_NETGAME_TOWN_STATUS_STREAM": '0',
+    "PC_NETGAME_TOWN_STATUS_UP_TO_DATE": '1',
+    "PC_NETGAME_TOWN_STATUS_UNAVAILABLE": '2',
+    "PC_NETGAME_TOWN_STATUS_BUSY": '3',
+    "PC_NETGAME_TOWN_STATUS_REFUSED": '4',
+    "PC_NETGAME_TOWN_STATUS_BAD_REQUEST": '5',
+    "PC_NETGAME_TOWN_DONE_OK": '0',
+    "PC_NETGAME_TOWN_DONE_BAD_CRC": '1',
+    "PC_NETGAME_TOWN_DONE_BAD_GCI": '2',
+    "PC_NETGAME_TOWN_DONE_IO": '3',
+    "PC_NETGAME_TOWN_DONE_ABORT": '4',
+    "TOWN_FETCH_REQ_FMT": '"<BBHIII8sHHI8s"',
+    "TOWN_INFO_FMT": '"<BBHIII8sHHIII"',
+    "TOWN_CHUNK_FMT": '"<BBHII1000s"',
+    "TOWN_DONE_FMT": '"<BBHII"',
     "FIELD_ACTION_REQUEST_FMT": '"<BBBBIBBHIIBBHBBHII15HHII"',
     "FIELD_ACTION_RESULT_FMT": '"<BBBBIHBB"',
     "CATCH_REQUEST_FMT": '"<B3xIIIiIIBBHBBHII15HHII"',
@@ -429,19 +470,21 @@ def audit_texts(head, cur):
     add("wire: guests G1 -- IDENTITY_EXT (42 B) / IDENTITY_TOKEN (20 B) constants + size / offset _Static_asserts are pinned in pc_net_game.c, and the "
         "frozen 32-byte IDENTITY / IDENTITY_ACK size + protocol_version offset asserts are still there",
         all(a in cur["game_c"] for a in GUEST_C_PINS))
+    add("wire: town transfer (M-B) -- the status / done / size constants and the 40 / 40 / 1012 / 12 byte _Static_asserts of ids 62..65 are pinned in pc_net_game.c",
+        all(a in cur["game_c"] for a in TOWN_C_PINS))
     add("wire: WEEDS -- FIELD_ACTION kinds 10 WEED_PULL / 11 FLOWER_TRAMPLE are pinned in pc_net_game.c (and 9 SNOWMAN_BREAK still precedes them); "
         "the request / result structs they ride are the already pinned ones (no layout change)",
         all(a in cur["game_c"] for a in WEEDS_C_PINS))
     strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
-    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)))\s*=\s*(\d+),", b)
+    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)))\s*=\s*(\d+),", b)
     # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52), + town services (47-55), + mailbox (47-56) or all of them
-    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS)
+    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS[:15], V8_NEW_ENUMS)
                    if "PCNetGameMsgType" in hb else False)
-    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-61 (appended, in order; 53/54 enumerated as reserved)",
+    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-65 (appended, in order; 53/54 enumerated as reserved; 62-65 = town transfer)",
         "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
         and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
         and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
-        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_HOUSE_ACK = 61"))
+        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_TOWN_DONE = 65"))
     nums = [v for _n, v in c_message_ids(cur["game_c"])]
     add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),

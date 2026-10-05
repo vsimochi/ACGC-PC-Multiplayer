@@ -158,7 +158,7 @@ def main():
 def wire_baseline_ok():
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
-    return bool(wb) and all(c for _d, c in wb) and sorted(dict(wire_baseline.c_message_ids(S.read("pc/src/pc_net_game.c"))).values()) == list(range(1, 62))
+    return bool(wb) and all(c for _d, c in wb) and sorted(dict(wire_baseline.c_message_ids(S.read("pc/src/pc_net_game.c"))).values()) == list(range(1, 66))
 
 
 if __name__ == "__main__":

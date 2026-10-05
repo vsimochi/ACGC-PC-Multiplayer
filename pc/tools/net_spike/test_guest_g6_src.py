@@ -179,8 +179,8 @@ def main():
        'pcnetgame_guest_store_write("after the GCI save")' in fr("pc_net_game_record_after_gci_save"))
 
     # ------------------------------------------------------------------ D
-    ck("D no wire change: message ids 1..61 (59..61 = the furniture sync, none is a REJECT_INFO), the protocol version unchanged, wire_baseline green",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 62)) and "PC_NETGAME_MSG_REJECT_INFO" not in ng_raw)
+    ck("D no wire change: message ids 1..65 (59..61 = the furniture sync, 62..65 = the town transfer, none is a REJECT_INFO), the protocol version unchanged, wire_baseline green",
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 66)) and "PC_NETGAME_MSG_REJECT_INFO" not in ng_raw)
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("D wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))
