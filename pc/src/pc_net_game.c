@@ -25239,6 +25239,26 @@ int pc_net_game_client_world_synced(void) {
     return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_client_world_synced;
 }
 
+int pc_net_game_client_own_room_local(void) {
+    int h;
+    mActor_name_t fid;
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return 0;
+    }
+    h = pcnetgame_hcl_own_house(); /* -1 for a guest / a resident without a house */
+    if (h < 0 || h >= PC_NETGAME_HOUSE_NUM || gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    if (!mSc_IS_SCENE_PLAYER_HOUSE_ROOM((int)((GAME_PLAY*)gamePT)->scene_id)) {
+        return 0;
+    }
+    fid = mFI_GetFieldId();
+    if (mFI_GET_TYPE(fid) != mFI_FIELD_PLAYER0_ROOM || (int)mFI_GET_PLAYER_ROOM_NO(fid) != h) {
+        return 0;
+    }
+    return Common_Get(field_type) == mFI_FIELDTYPE2_PLAYER_ROOM;
+}
+
 int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
     PCNetGamePickupRequestMsg msg;
     PCNetGameOwnerStamp stamp;
@@ -25251,6 +25271,10 @@ int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
         return 1; /* D3: the resident record is not SYNCED with the host yet (adoption pending): no pocket/wallet-dependent request */
     }
     if (pcnetgame_txn_begin_blocked()) {
+        static uint32_t s_pickup_blk_log;
+        if (g_pc_verbose || (s_pickup_blk_log++ & 31u) == 0) { /* rate-limited: 1 in 32 refusals */
+            printf("[NET][PICKUP] refused: a pocket transaction / house sync lock is active (pickup at (%d,%d) not sent)\n", ut_x, ut_z);
+        }
         return 1; /* X1b lock (a): a pocket transaction is unresolved: handled, nothing sent, no local mutation */
     }
     if (ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {

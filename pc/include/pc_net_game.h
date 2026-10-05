@@ -452,6 +452,13 @@ int pc_net_game_client_world_synced(void);
  * no inventory change, exactly like any other stale/invalid pickup attempt already is. */
 int pc_net_game_request_pickup(int ut_x, int ut_z, int item);
 
+/* Client only: 1 iff this client is a resident (not a guest) standing in the room of its OWN player house
+ * (scene is a player-house room, room number == its own homes[] index, field_type PLAYER_ROOM). The room
+ * floor is then owner-local state (no host room-floor transaction exists), so the pickup seam in
+ * m_player_main_pickup.c_inc takes the vanilla local branch instead of pc_net_game_request_pickup(), exactly
+ * like the room drop. Visitors in another player's house get 0 (their pickup stays blocked). 0 otherwise. */
+int pc_net_game_client_own_room_local(void);
+
 /* Stage 5A.1: called from the decomp pickup state (see m_player_main_pickup.c_inc) immediately
  * after the HOST's OWN local pickup has already mutated the field tile through the existing,
  * unmodified single-player code -- never before that mutation, and never as a substitute for it.

@@ -21,7 +21,8 @@ Phases (one host process each; --only P1,P2):
       (seq + 1, pushed) that makes an older commit STALE (so it is never undone) and is accepted when built on the new seq, a partial 16 / 17 transfer followed by a disconnect
       (nothing applied, the reconnect is pushed the unchanged seq), a valid commit followed by a reconnect (pushed exactly the committed seq + image), and a graceful host stop whose GCI
       holds the committed house floors AND the committed pockets together (save -> GCI consistency)
-Usage: python test_house_sync_protocol.py [--port 11800] [--only P1,P2]
+  P3  own-room ground pickup pairs (layer-0 ITEM1 cell cleared + same id in a pocket -> APPLIED; cleared cell without a pocket gain -> CONSERVATION; wallet credit -> CONSERVATION)
+Usage: python test_house_sync_protocol.py [--port 11800] [--only P1,P2,P3]
 """
 import argparse
 import os
@@ -435,16 +436,71 @@ def run_p2(rig):
     check("P2 GCI: the houses the tests never edited are unchanged (house %d, host house 0)" % hb, owner_equal(L.house_from_gci(DST_BIN, hb), gci_imgs[hb]) and owner_equal(L.house_from_gci(DST_BIN, 0), gci_imgs[0]))
 
 
+def run_p3(rig):
+    """Own-room ground pickup (client inside its own room takes the vanilla local branch: the layer-0 ITEM1 cell is cleared and the same id enters a pocket in one frame;
+    the commit pair is what the host sees). Host-side conservation only; the client seam itself is covered by test_house_sync_src.py."""
+    check = rig.check
+    host = rig.start_host("P3")
+    check("P3 host reached field-ready state with --house-sync", host is not None)
+    if host is None:
+        return
+    residents = [i for i, _p, ex in L.read_test_save_residents() if ex and i != L.TEST_HOST_RESIDENT]
+    check("P3 fixture has >= 1 non-host resident %s" % residents, len(residents) >= 1)
+    ha = residents[0]
+    a = rig.join(ha, "A")
+    pa = pushes_by_house(a)
+    check("P3 client A received the canonical push of its house %d" % ha, ha in pa)
+    if ha not in pa:
+        return
+    img0 = pa[ha]["data"]
+    rec0 = a.rec_local
+    pk0 = pockets_of(rec0)
+    jj = [j for j, v in enumerate(pk0) if (v >> 12) == 2 and not 0x2F00 <= v < 0x2F04]
+    check("P3 fixture record has a plain ITEM1 pocket item to use as the dropped item %s" % ([hex(pk0[j]) for j in jj],), len(jj) > 0)
+    if not jj:
+        return
+    j = jj[0]
+    item = pk0[j]
+    cell = empty_cells(img0)[0]
+    sess0, seq0 = a.house_base_for(ha)
+    wallet0 = L.record_inventory(rec0)[2]
+    # 1. drop in the room (pocket -> layer-0 cell)
+    img_f = L.house_set_cell(img0, 0, 0, cell, item)
+    pk_e = list(pk0)
+    pk_e[j] = 0
+    rec_e = with_pockets(rec0, pk_e)
+    ack = a.wait_house_ack(a.commit_house(ha, img_f, rec_e))
+    check("P3 drop pair (ITEM1 0x%04X pocket -> room cell %d) APPLIED" % (item, cell), ack is not None and ack.status == 0 and ack.house_seq == seq0 + 1)
+    # 2. own-room ground pickup: the cell is cleared and the SAME id appears in a pocket
+    ack = a.wait_house_ack(a.commit_house(ha, L.house_set_cell(img_f, 0, 0, cell, 0), rec0))
+    check("P3 own-room ground pickup pair (layer-0 ITEM1 cell cleared + same id in a pocket) APPLIED", ack is not None and ack.status == 0 and ack.house_seq == seq0 + 2)
+    # 3. back on the floor, then two illegal pickups
+    ack = a.wait_house_ack(a.commit_house(ha, img_f, rec_e))
+    check("P3 second drop APPLIED (baseline for the rejected pickups)", ack is not None and ack.status == 0 and ack.house_seq == seq0 + 3)
+    img_c = L.house_set_cell(img_f, 0, 0, cell, 0)
+    nrec = len(a.rec_pushes)
+    ack = a.wait_house_ack(a.commit_house(ha, img_c, rec_e))
+    check("P3 cleared cell with NO pocket gain -> CONSERVATION (an item cannot vanish)", ack is not None and ack.status == L.PC_NETGAME_HOUSE_ACK_CONSERVATION)
+    a.wait_record_push(after=nrec, timeout=5.0)
+    L.pump_sleep(1.0)
+    nrec = len(a.rec_pushes)
+    rec_w = L.record_set_inventory(rec_e, pk_e, L.record_inventory(rec_e)[1], wallet0 + 100)
+    ack = a.wait_house_ack(a.commit_house(ha, img_c, rec_w))
+    check("P3 cleared cell paid into the WALLET instead of a pocket (money-bag shortcut) -> CONSERVATION (the wallet is not counted)",
+          ack is not None and ack.status == L.PC_NETGAME_HOUSE_ACK_CONSERVATION)
+    check("P3 the host did not crash and still runs", host.alive())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=11800)
-    ap.add_argument("--only", default="P1,P2")
+    ap.add_argument("--only", default="P1,P2,P3")
     args = ap.parse_args()
     L.require_test_bin_dir()
     only = {s.strip().upper() for s in args.only.split(",") if s.strip()}
     results = []
     rig = Rig(args.port, results)
-    for tag, fn in (("P1", run_p1), ("P2", run_p2)):
+    for tag, fn in (("P1", run_p1), ("P2", run_p2), ("P3", run_p3)):
         if tag not in only:
             continue
         print("=" * 72 + "\n[%s]" % tag)

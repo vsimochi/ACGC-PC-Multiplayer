@@ -294,6 +294,25 @@ def main():
        and "s_host_peer[pp].hsent_seq[v[0]] == s_hh[v[0]].seq" in func_body(c, "pcnetgame_house_test_host_edit"))
     ck("D the roadmap documents Stage 1 (Furniture synchronization: Stage 1, with the deviation notes, evidence tiers and the manual tests)",
        "### Furniture synchronization: Stage 1" in road and "NOT implemented" not in road[road.index("### Furniture synchronization: Stage 1"):road.index("### Furniture synchronization: Stage 1") + 200])
+    # ------------------------------------------------------------------ R (own-room ground pickup)
+    pk = read("src/game/m_player_main_pickup.c_inc")
+    pks = strip_comments(pk)
+    orl = strip_comments(func_body(c, "pc_net_game_client_own_room_local"))
+    ck("R pc_net_game_client_own_room_local is declared in pc_net_game.h, defined once, and requires CLIENT + own house h >= 0 (guests excluded via pcnetgame_hcl_own_house) + player-house room scene + room no == h + PLAYER_ROOM field_type",
+       "int pc_net_game_client_own_room_local(void);" in h and c.count("int pc_net_game_client_own_room_local(void) {") == 1
+       and "s_role != PC_NETGAME_ROLE_CLIENT" in orl and "pcnetgame_hcl_own_house()" in orl and "h < 0" in orl and "mSc_IS_SCENE_PLAYER_HOUSE_ROOM" in orl
+       and "mFI_GET_PLAYER_ROOM_NO(fid) != h" in orl and "Common_Get(field_type) == mFI_FIELDTYPE2_PLAYER_ROOM" in orl)
+    ck("R the pickup seam only sends to the network when NOT own_room_local (predicate evaluated before pc_net_game_request_pickup), and the exchange_flag force-FALSE is skipped for it",
+       "own_room_local = (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) && pc_net_game_client_own_room_local();" in pks
+       and pks.index("pc_net_game_client_own_room_local()") < pks.index("pc_net_game_request_pickup(")
+       and "PC_NETGAME_ROLE_CLIENT && !own_room_local) {\n        int ut_x, ut_z;" in pks and "PC_NETGAME_ROLE_CLIENT && !own_room_local) {\n        main_pickup_p->exchange_flag = FALSE;" in pks)
+    ck("R full pockets (slot_idx < 0) in the own room block the pickup (no mutation, item stays on the floor); the money-bag-to-wallet shortcut is skipped so a bag goes to a pocket",
+       "else if (own_room_local && slot_idx < 0) {" in pks and "host_pickup_blocked = TRUE;" in pks[pks.index("own_room_local && slot_idx < 0"):pks.index("own_room_local && slot_idx < 0") + 200]
+       and "&& !own_room_local\n#endif\n            && mPr_GivePossessionBells(bell_amount)" in pks.replace(chr(13), ""))
+    rp = func_body(c, "pc_net_game_request_pickup")
+    ck("R the house-sync refusal in pc_net_game_request_pickup is logged (rate-limited), and visitors in another house stay blocked (the town-only rule is unchanged)",
+       "[NET][PICKUP] refused:" in rp[:rp.index("ut_x < 0")] and "s_pickup_blk_log++ & 31u" in rp and "if (!pcfa_scene_is_town()) {" in rp)
+    ck("R the roadmap documents the own-room pickup (cause, fix, safety, limitations)", "Own-room ground pickup" in road and "pc_net_game_client_own_room_local" in road)
     return L.summary_and_exit_code(results)
 
 

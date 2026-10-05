@@ -34,6 +34,8 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
 #endif
 #ifdef TARGET_PC
     int host_pickup_blocked = FALSE;
+    /* Client inside its OWN house room: the room floor is owner-local (no network seam, like the drop). */
+    int own_room_local = (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) && pc_net_game_client_own_room_local();
 #endif
 
     slot_idx = req_pickup_p->inv_slot;
@@ -61,6 +63,11 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
             item = EMPTY_NO;
             signboard_flag = FALSE;
         }
+    } else if (own_room_local && slot_idx < 0) {
+        /* pockets full: vanilla would clear the cell and run the exchange flow; keep the item on the floor */
+        host_pickup_blocked = TRUE;
+        item = EMPTY_NO;
+        signboard_flag = FALSE;
     }
 #endif
 
@@ -87,7 +94,7 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
      * (pcnetgame_validate_and_resolve_pickup()) -- no host-side per-tile allow-list needed any more.
      * Single-player and the host are unaffected, since this branch only ever runs when
      * pc_net_game_role() == PC_NETGAME_ROLE_CLIENT. */
-    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !own_room_local) {
         int ut_x, ut_z;
         if (mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
             /* `item` (already resolved above from req_pickup_p->item -- this client's own local
@@ -115,10 +122,15 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
         } else
 #endif
 #ifdef PC_ENHANCEMENTS
-    /* bells go straight to wallet when the whole amount fits; otherwise the bag is picked up normally */
+    /* bells go straight to wallet when the whole amount fits; otherwise the bag is picked up normally.
+     * Own-room-local client: skip the shortcut (the wallet is not counted by house conservation), the bag goes to a pocket. */
     {
         u32 bell_amount = mPr_GetAmountForMoneyItem(item);
-        if (bell_amount > 0 && mPr_GivePossessionBells(bell_amount)) {
+        if (bell_amount > 0
+#ifdef TARGET_PC
+            && !own_room_local
+#endif
+            && mPr_GivePossessionBells(bell_amount)) {
             sAdo_SysTrgStart(SE_REGISTER);
             if (target_pos_p != NULL) {
                 mFI_SetFG_common(EMPTY_NO, *target_pos_p, TRUE);
@@ -154,7 +166,7 @@ static void Player_actor_setup_main_Pickup(ACTOR* actorx, GAME* game) {
      * when that result arrives simply does not receive the item (logged there, never fabricated)
      * -- the safest available Stage 5A fallback rather than reimplementing the swap/drop submenu
      * against network-pending state. */
-    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !own_room_local) {
         main_pickup_p->exchange_flag = FALSE;
     } else
 #endif
