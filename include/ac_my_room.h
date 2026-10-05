@@ -314,6 +314,14 @@ extern int aMR_RadioBgmNow(void);
 extern void aMR_ThrowItem_FurnitureLock(void);
 extern void aMR_ThrowItem_FurnitureUnlock(void);
 
+#ifdef TARGET_PC
+#include "m_home_h.h"
+/* PC multiplayer furniture sync (Stage 1), see ac_my_room.c: live export of the room as the teardown would write it, quiescence, in-place rebuild (visitor). */
+extern int aMR_pc_room_quiet(void);
+extern int aMR_pc_export_home(mHm_hs_c* out, int house, int* floor_out);
+extern int aMR_pc_live_reload(GAME* game, int (*cb)(void*), void* ctx);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

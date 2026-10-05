@@ -374,6 +374,7 @@ int g_pc_authoritative_wildlife = 0;
 int g_pc_house_sync = 0;
 int g_pc_house_test_host_in_house = -1;
 const char* g_pc_house_test_host_edit = NULL;
+int g_pc_house_test_fidelity = 0; /* TEST-ONLY --house-test-fidelity (see pc_platform.h) */
 
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * See pc_platform.h's own doc comment on these two globals. */
@@ -939,6 +940,9 @@ int main(int argc, char* argv[]) {
             g_pc_house_test_host_in_house = atoi(argv[i + 1]);
             printf("[NET][HOUSE][TEST-ONLY] --house-test-host-in-house %d armed (a TEST hook: not for normal play)\n", g_pc_house_test_host_in_house);
             i++;
+        } else if (strcmp(argv[i], "--house-test-fidelity") == 0) {
+            g_pc_house_test_fidelity = 1;
+            printf("[NET][HOUSE][TEST-ONLY] --house-test-fidelity armed (logs MATCH / MISMATCH of the live room export at every room teardown; not for normal play)\n");
         } else if (strcmp(argv[i], "--house-test-host-edit") == 0 && i + 1 < argc) {
             g_pc_house_test_host_edit = argv[i + 1];
             printf("[NET][HOUSE][TEST-ONLY] --house-test-host-edit %s armed (a TEST hook: not for normal play)\n", g_pc_house_test_host_edit);

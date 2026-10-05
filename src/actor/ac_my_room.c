@@ -1993,11 +1993,314 @@ static int aMR_SetLeaf(const xyz_t* pos, f32 scale) {
     return FALSE;
 }
 
+#ifdef TARGET_PC
+/* ===== PC multiplayer furniture sync (Stage 1): live export / quiescence / live reload =====
+ * The live room does NOT work on a copy: mFM_SetFgUtPtoHomeInfo / fg2_p alias Save_Get(homes[h]).floors[f] (aMR_GetLayerTopFg returns pointers INTO the save). While the
+ * room is live, aMR_MakeItemDataInFurniture moved the contents of every storage furniture out of the upper layers into ftr_actor->items[] (and left the cells EMPTY),
+ * aMR_ClearSwitchSaveData zeroed ftr_switch, and the teardown (My_Room_Actor_dt) writes all of it back (aMR_SaveSwitchData + aMR_KeepItem2Fg). aMR_pc_export_home builds
+ * "what the teardown would write at this instant" on a COPY; the live room is never modified by it. */
+#include <string.h>
+#include <stdio.h>
+#include "ac_my_indoor.h"
+
+extern int g_pc_house_test_fidelity;
+
+/* The live room as a PLAYER HOUSE room (never the cottage / a shop): out = actor, house index, floor. FALSE when anything does not line up, including the
+ * save aliasing (a layer pointer of the field that is not the save's layer: the export would then not describe what the room uses). */
+static int aMR_pc_live_house(MY_ROOM_ACTOR** my_room_out, int* idx_out, int* floor_out) {
+    mActor_name_t field_id;
+    MY_ROOM_ACTOR* my_room;
+    int idx;
+    int floor_no;
+    int l;
+    mHm_lyr_c* lyr;
+
+    if (aMR_CLIP == NULL || aMR_CLIP->my_room_actor_p == NULL || l_aMR_work.ftr_actor_list == NULL || l_aMR_work.used_list == NULL) {
+        return FALSE;
+    }
+
+    my_room = (MY_ROOM_ACTOR*)aMR_CLIP->my_room_actor_p;
+    if (my_room->scene == SCENE_COTTAGE_MY) {
+        return FALSE;
+    }
+
+    field_id = mFI_GetFieldId();
+    if (mFI_GET_TYPE(field_id) != mFI_FIELD_PLAYER0_ROOM) {
+        return FALSE;
+    }
+
+    idx = (field_id - mFI_FIELD_PLAYER0_ROOM) & 3;
+    floor_no = mFI_GetPlayerHouseFloorNo(my_room->scene);
+    if (floor_no < 0 || floor_no >= mHm_ROOM_NUM) {
+        return FALSE;
+    }
+
+    lyr = &Save_Get(homes[idx]).floors[floor_no].layer_main;
+    for (l = 0; l < mHm_LAYER_NUM; l++) {
+        if (aMR_GetLayerTopFg(l) != lyr[l].items[0]) {
+            return FALSE;
+        }
+    }
+
+    *my_room_out = my_room;
+    *idx_out = idx;
+    *floor_out = floor_no;
+    return TRUE;
+}
+
+/* 1 when the room is in a state where nothing is half-way: no demo / message / pickup / placement / push-pull in progress, every furniture actor is idle and
+ * the wallpaper / carpet changers are idle. Owner-agnostic (a visitor's room is judged the same way). The caller adds the player / scene / submenu terms. */
+int aMR_pc_room_quiet(void) {
+    MY_ROOM_ACTOR* my_room;
+    int idx;
+    int floor_no;
+    int i;
+
+    if (!aMR_pc_live_house(&my_room, &idx, &floor_no)) {
+        return FALSE;
+    }
+
+    if (my_room->state != 0 || my_room->demo_flag != 0 || my_room->msg_type != aMR_MSG_STATE_NONE ||
+        my_room->requested_msg_type != aMR_MSG_STATE_NONE || my_room->force_open_demo_flag != 0 || my_room->emu_info.request_flag != 0 ||
+        my_room->bgm_info.reserve_flag != 0 || my_room->throw_item_lock_flag != 0 || my_room->pickup_info.pickup_flag != 0 ||
+        my_room->pickup_info.picking_up_flag != 0 || my_room->leaf_info.exist_flag != 0 || my_room->parent_ftr.ftrID != -1) {
+        return FALSE;
+    }
+
+    for (i = 0; i < 3; i++) {
+        if (my_room->rsv_ftr[i].exist_flag != 0) {
+            return FALSE;
+        }
+    }
+
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            const FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+
+            if (ftr_actor->state != aFTR_STATE_STOP || ftr_actor->demo_status != 0) {
+                return FALSE;
+            }
+        }
+    }
+
+    if (Common_Get(clip).my_indoor_clip != NULL && Common_Get(clip).my_indoor_clip->my_indoor_actor_p != NULL) {
+        const MY_INDOOR_ACTOR* my_indoor = Common_Get(clip).my_indoor_clip->my_indoor_actor_p;
+
+        if (my_indoor->wall_reserve.reserve_flag || my_indoor->floor_reserve.reserve_flag) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+/* `out` = a copy of the save's house `house` with the LIVE floor replaced by what the teardown would write now: for every used actor the logic of
+ * aMR_KeepItem2Fg (drawer / music-box contents back into the upper layers at the actor's origin cell), ftr_switch rebuilt like aMR_SaveSwitchData and
+ * haniwa_step like aMR_SaveHaniwaStepData (tempo_beat stays the save's: the audio state is not read). Nothing live is modified. FALSE = not a live room of
+ * that house (nothing written to *floor_out). */
+int aMR_pc_export_home(mHm_hs_c* out, int house, int* floor_out) {
+    MY_ROOM_ACTOR* my_room;
+    int idx;
+    int floor_no;
+    int i;
+    int l;
+    int ut_x;
+    int ut_z;
+    mHm_lyr_c* lyr;
+
+    if (out == NULL || !aMR_pc_live_house(&my_room, &idx, &floor_no) || idx != house) {
+        return FALSE;
+    }
+
+    memcpy(out, &Save_Get(homes[idx]), sizeof(mHm_hs_c));
+    lyr = &out->floors[floor_no].layer_main;
+
+    /* ftr_switch (aMR_SaveSwitchData): zero, then OR the switch bit of the furniture standing on each furniture cell of layers 0 / 1 */
+    for (l = mCoBG_LAYER0; l < mCoBG_LAYER2; l++) {
+        lyr[l].ftr_switch = 0;
+        for (ut_z = aMR_MIN_BOUND; ut_z <= aMR_MAX_BOUND; ut_z++) {
+            for (ut_x = aMR_MIN_BOUND; ut_x <= aMR_MAX_BOUND; ut_x++) {
+                if (ITEM_IS_FTR(lyr[l].items[ut_z][ut_x])) {
+                    mActor_name_t name;
+                    int ftr_id;
+
+                    if (aMR_UnitNum2FtrItemNoFtrID(&name, &ftr_id, ut_x, ut_z, l)) {
+                        if (l_aMR_work.ftr_actor_list[ftr_id].switch_bit) {
+                            lyr[l].ftr_switch |= 1ull << ((ut_x - 1 + (ut_z - 1) * 8) & 0x3F);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* haniwa_step (aMR_SaveHaniwaStepData) */
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            const FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+
+            if (ftr_actor->name < FTR_NUM && ftr_actor->layer >= 0 && ftr_actor->layer < mHm_LAYER_NUM) {
+                aFTR_PROFILE* profile = aMR_GetFurnitureProfile(ftr_actor->name);
+
+                if (profile != NULL && aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_HANIWA) &&
+                    mFI_Wpos2UtNum_inBlock(&ut_x, &ut_z, ftr_actor->position) && aMR_BOUNDS_OK(ut_x, ut_z)) {
+                    u32* step_data = lyr[ftr_actor->layer].haniwa_step;
+                    int shift = (ut_x - 1) * 4;
+                    int row = ut_z - 1;
+
+                    step_data[row] &= ~(0xFu << shift);
+                    step_data[row] |= ((u32)ftr_actor->haniwa_step & 0xF) << shift;
+                }
+            }
+        }
+    }
+
+    /* aMR_KeepItem2Fg for every used actor, against the COPY (the actor is not touched) */
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            const FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+            int item_idx = 0;
+
+            for (l = ftr_actor->layer + 1; l < mCoBG_LAYER_NUM && item_idx < aFTR_KEEP_ITEM_COUNT; l++) {
+                if (ftr_actor->items[item_idx] != EMPTY_NO) {
+                    if (aMR_Wpos2PlaceNumber(&ut_x, &ut_z, ftr_actor->position, ftr_actor->shape_type) && ut_x >= 0 && ut_z >= 0) {
+                        lyr[l].items[ut_z][ut_x] = ftr_actor->items[item_idx];
+                    }
+                }
+
+                item_idx++;
+            }
+        }
+    }
+
+    *floor_out = floor_no;
+    return TRUE;
+}
+
+/* Destroys every furniture actor WITHOUT writing its contents back (the caller's save write replaces the floor wholesale: a write-back first would put the old
+ * drawer contents into the new layers = duplicates), rebuilds the actor set exactly like My_Room_Actor_ct does, with `cb(ctx)` writing the new house into the save in
+ * between. Heap, banks, camera and player are untouched. Returns 1 when the callback ran (the room now shows the new layout), 0 when the room was not in a state to
+ * be rebuilt (nothing done, the callback NOT called). The caller has already checked the player / scene / submenu terms. */
+int aMR_pc_live_reload(GAME* game, int (*cb)(void*), void* ctx) {
+    MY_ROOM_ACTOR* my_room;
+    ACTOR* actorx;
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    int idx;
+    int floor_no;
+    int i;
+
+    if (game == NULL || cb == NULL || !aMR_pc_room_quiet() || !aMR_pc_live_house(&my_room, &idx, &floor_no)) {
+        return 0;
+    }
+
+    actorx = (ACTOR*)my_room;
+
+    /* (1) the destroy half of aMR_AllFurnitureDestruct, minus aMR_KeepItem2Fg */
+    sAdo_RhythmAllStop();
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+            aFTR_PROFILE* profile = aMR_GetFurnitureProfile(ftr_actor->name);
+
+            mCoBG_CrossOffMoveBg(ftr_actor->move_bg_idx);
+            aMR_MiniDiskCommonDt(ftr_actor, actorx);
+            aMR_RadioCommonDt(ftr_actor, actorx);
+            aMR_MinusWeight(actorx, ftr_actor);
+
+            if (profile != NULL && profile->vtable != NULL && profile->vtable->dt_proc != NULL) {
+                profile->vtable->dt_proc(ftr_actor, aMR_FtrNo2BankAddress(ftr_actor->name));
+            }
+
+            l_aMR_work.used_list[i] = FALSE;
+        }
+    }
+
+    my_room->bgm_info.active_flag = FALSE;
+    my_room->bgm_info.active_ftr_actor = NULL;
+    my_room->bgm_info.reserved_ftr_actor = NULL;
+
+    /* (2) the same fresh state My_Room_Actor_ct starts from */
+    aMR_InitFurnitureWork();
+    aMR_InitFurnitureTable(l_aMR_work.ftr_actor_list, l_aMR_work.list_size);
+    aMR_InitFurnitureActorExistTable();
+    aMR_InitHaniwaOnTable(actorx);
+    aMR_InitFurnitureBankTable();
+
+    /* (3) the new house goes into the save: nothing of the old actors exists any more */
+    (void)cb(ctx);
+    aMR_GetSavedWaltzTempo(my_room);
+
+    /* (4) the tail of My_Room_Actor_ct */
+    aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER0);
+    aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER1);
+    my_room->parent_ftr.ftrID = -1;
+    aMR_MakeItemDataInFurniture();
+    aMR_DeleteMusicWhichMusicBoxDontHave();
+    my_room->bgm_info.reserve_flag = FALSE;
+    my_room->bgm_info.md_no = -1;
+    my_room->bgm_info.last_md_no = -1;
+    my_room->bgm_info.timer = 0;
+    aMR_ClearSwitchSaveData(my_room);
+    aMR_OneMDFurnitureSwitchOn();
+    return 1;
+}
+
+/* TEST-ONLY fidelity check (--house-test-fidelity): the export taken just before the teardown vs the owner-writable bytes the save holds right after it.
+ * Compared: the cells of the 4 layers + ftr_switch + wall_floor of the live floor (what the teardown writes); haniwa_step is reported separately (the teardown does
+ * not write it, aMR_SaveWaltzTempo2 does earlier on the way out). */
+static mHm_hs_c l_pc_fidelity_snap;
+static int l_pc_fidelity_floor = -1;
+static int l_pc_fidelity_idx = -1;
+
+static void aMR_pc_fidelity_before(void) {
+    int floor_no = -1;
+    int idx = -1;
+    MY_ROOM_ACTOR* my_room;
+
+    l_pc_fidelity_floor = -1;
+    if (g_pc_house_test_fidelity && aMR_pc_live_house(&my_room, &idx, &floor_no) && aMR_pc_export_home(&l_pc_fidelity_snap, idx, &floor_no)) {
+        l_pc_fidelity_floor = floor_no;
+        l_pc_fidelity_idx = idx;
+    }
+}
+
+static void aMR_pc_fidelity_after(void) {
+    if (g_pc_house_test_fidelity && l_pc_fidelity_floor >= 0) {
+        const mHm_flr_c* a = &l_pc_fidelity_snap.floors[l_pc_fidelity_floor];
+        const mHm_flr_c* b = &Save_Get(homes[l_pc_fidelity_idx]).floors[l_pc_fidelity_floor];
+        int l;
+        int bad_cells = 0;
+        int bad_switch = 0;
+        int bad_haniwa = 0;
+        int bad_wf = memcmp(&a->wall_floor, &b->wall_floor, sizeof(a->wall_floor)) != 0;
+
+        for (l = 0; l < mHm_LAYER_NUM; l++) {
+            const mHm_lyr_c* la = &a->layer_main + l;
+            const mHm_lyr_c* lb = &b->layer_main + l;
+
+            bad_cells += memcmp(la->items, lb->items, sizeof(la->items)) != 0;
+            bad_switch += la->ftr_switch != lb->ftr_switch;
+            bad_haniwa += memcmp(la->haniwa_step, lb->haniwa_step, sizeof(la->haniwa_step)) != 0;
+        }
+
+        printf("[NET][HOUSE][TEST-ONLY] fidelity house %d floor %d: %s (cells differing layers %d, ftr_switch differing layers %d, wall_floor %s; haniwa_step differing layers %d)\n",
+               l_pc_fidelity_idx, l_pc_fidelity_floor, (bad_cells == 0 && bad_switch == 0 && !bad_wf) ? "MATCH" : "MISMATCH", bad_cells, bad_switch,
+               bad_wf ? "DIFFERS" : "same", bad_haniwa);
+        l_pc_fidelity_floor = -1;
+    }
+}
+#else
+#define aMR_pc_fidelity_before() ((void)0)
+#define aMR_pc_fidelity_after() ((void)0)
+#endif /* TARGET_PC */
+
 static void My_Room_Actor_dt(ACTOR* actorx, GAME* game) {
     MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
 
+    aMR_pc_fidelity_before();
     aMR_SaveSwitchData(my_room);
     aMR_AllFurnitureDestruct(actorx, game);
+    aMR_pc_fidelity_after();
     aMR_FreeHeapArea(actorx);
     aMR_GokiInfoDt();
     aMR_CLIP = NULL;

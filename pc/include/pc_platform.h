@@ -115,6 +115,8 @@ extern int           g_pc_authoritative_wildlife;
 extern int           g_pc_house_sync;
 extern int           g_pc_house_test_host_in_house;
 extern const char*   g_pc_house_test_host_edit;
+/* TEST-ONLY --house-test-fidelity: at every player-house room teardown log whether the live export (aMR_pc_export_home) matched what the teardown wrote. Default off. */
+extern int           g_pc_house_test_fidelity;
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * Fire mNpc_DebugForceGrow()/mNpc_DebugForceRemove() (m_npc.c) once, as soon as the host world is
  * ready -- see pc_net_game.c's pcnetgame_run_villager_test_triggers(). Off by default; never active

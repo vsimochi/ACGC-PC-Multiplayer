@@ -97,12 +97,12 @@ def main():
     ck("H the guest refusal uses the guest-slot test idx >= PLAYER_NUM (idx comes only from pcnetgame_rec_gate) and sends NOT_OWNER; the house index is derived from the BOUND record, never from the message",
        "PC_NETGAME_HOUSE_ACK_NOT_OWNER" in hb[hb.index("if (idx >= PLAYER_NUM) {"):hb.index("pcnetgame_mbox_house_of(")] and "in->house" not in hb[:hb.index("in->house != (uint8_t)h")])
     ok, miss = in_order(pc, ["pcnetgame_rec_gate(peer, xfer, 0)", "if (idx >= PLAYER_NUM) {", "pcnetgame_mbox_house_of(", "PC_NETGAME_HOUSE_ACK_BAD_SHAPE", "PC_NETGAME_HOUSE_ACK_BUSY",
-                            "PC_NETGAME_HOUSE_ACK_BAD_DIGEST", "PC_NETGAME_HOUSE_ACK_RATE_LIMITED", "pcnetgame_local_house_unsafe(h)", "pcnetgame_rec_refresh_hostfields(idx, slot)",
+                            "PC_NETGAME_HOUSE_ACK_BAD_DIGEST", "pcnetgame_local_house_unsafe(h)", "PC_NETGAME_HOUSE_ACK_RATE_LIMITED", "pcnetgame_rec_refresh_hostfields(idx, slot)",
                             "PC_NETGAME_HOUSE_ACK_STALE", "pcnetgame_rec_validate_fields(", "PC_NETGAME_HOUSE_ACK_INVALID_CELL", "pcnetgame_is_pocket_legal_item(nv)",
                             "pcnetgame_house_count_image(s_hs_cnt_old", "pcnetgame_house_conserved(", "PC_NETGAME_HOUSE_ACK_CONSERVATION", "pcnetgame_house_import_native(nimg",
                             "pcnetgame_rec_merge_into_save(idx, &s_rec_scratch_b)", "pcnetgame_house_copy_owner(&Save_Get(homes[h])", "pcnetgame_house_host_refresh(h, 1)",
                             "PC_NETGAME_HOUSE_ACK_APPLIED"])
-    ck("H OWNER_COMMIT handler order: gate, guest NOT_OWNER, house, BAD_SHAPE, BUSY (world / record SYNCED / no push in flight), BAD_DIGEST, RATE_LIMITED, BUSY while the host's player is in the house, "
+    ck("H OWNER_COMMIT handler order: gate, guest NOT_OWNER, house, BAD_SHAPE, BUSY (world / record SYNCED / no push in flight), BAD_DIGEST, BUSY while the host's player is in the house (BEFORE the rate accounting), RATE_LIMITED, "
        "base STALE, record validated like an upload, cells, conservation, ONE commit (merge + owner-only copy), APPLIED (missing: %s)" % miss, ok)
     ck("H the commit is ONE call site: exactly one pcnetgame_rec_merge_into_save and one pcnetgame_house_copy_owner call in the commit handler, both after the CONSERVATION reject, and no early return between them and the ACK",
        pc.count("pcnetgame_rec_merge_into_save(") == 1 and pc.count("pcnetgame_house_copy_owner(") == 1 and pc.index("PC_NETGAME_HOUSE_ACK_CONSERVATION") < pc.index("pcnetgame_rec_merge_into_save(")
@@ -177,12 +177,14 @@ def main():
     ck("G the commit is sent from pcnetgame_crec_tick BEFORE the plain upload trigger, its chunks are pumped there, and the plain upload only runs when the commit machinery does not own the tick",
        ct.index("pcnetgame_house_client_commit_tick(now)") < ct.index("upload trigger: digest the client-owned bytes") and "pcnetgame_house_client_pump();" in ct)
     cm = func_body(c, "pcnetgame_house_client_commit_tick")
-    ok, miss = in_order(cm, ["s_hcl.c_active", "next_check_ms", "s_hcl.last_own_unsafe = pcnetgame_local_house_unsafe(h);", "!s_hcl.known || !s_hcp.canon_valid[h] || s_hcl.last_own_unsafe || !pcnetgame_hcl_dirty(h)",
-                             "s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.st_valid || s_crec.up_active", "pcnetgame_txn_busy()", "s_crec.base_session != s_hcp.canon_session[h]",
-                             "pcnetgame_hcl_build_pair(h)", "pcnetgame_hcl_start_commit(h, now);"])
-    ck("G commit trigger: house sync on, dirty, own house NOT unsafe, record SYNCED with no staged push / no record upload / no pickup-drop-bury-txn pending, both bases on the host's current session, rate gap, then the pair is built and sent (missing: %s)" % miss, ok)
+    ok, miss = in_order(cm, ["s_hcl.c_active", "next_check_ms", "s_hcl.last_own_unsafe = pcnetgame_local_house_unsafe(h);", "!s_hcl.known || !s_hcp.canon_valid[h]",
+                             "if (s_hcl.last_own_unsafe) {", "pcnetgame_hcl_inroom_ok(h)", "} else if (!pcnetgame_hcl_dirty(h)) {",
+                             "s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.st_valid || s_crec.up_active", "pcnetgame_hcl_gates_pending()", "s_crec.base_session != s_hcp.canon_session[h]",
+                             "pcnetgame_hcl_build_pair(h, in_room ? s_hcl_snap_img : NULL)", "pcnetgame_house_conserved(s_hcl_cnt_base, s_hcl_cnt_new", "pcnetgame_hcl_start_commit(h, now, in_room);"])
+    ck("G commit trigger: house sync on, dirty (outside: the save; inside the room: ONLY a quiescent own room and the snapshot's digest), record SYNCED with no staged push / no record upload / no pickup-drop-bury-txn pending, both bases on the host's current session, rate gap, then the pair is built and sent (missing: %s)" % miss, ok)
     bp = func_body(c, "pcnetgame_hcl_build_pair")
-    ck("G the pair is ONE payload: the local house image followed by the local record image", "pcnetgame_house_export_be(&Save_Get(homes[h]), s_hcl_tx);" in bp and "memcpy(s_hcl_tx + PC_NETGAME_HOUSE_IMG_SIZE, s_crec_tx, PC_NETGAME_REC_SIZE);" in bp)
+    ck("G the pair is ONE payload: the local house image followed by the local record image", "pcnetgame_house_export_be(&Save_Get(homes[h]), s_hcl_tx);" in bp and "memcpy(s_hcl_tx, snap_img, PC_NETGAME_HOUSE_IMG_SIZE);" in bp
+       and "memcpy(s_hcl_tx + PC_NETGAME_HOUSE_IMG_SIZE, s_crec_tx, PC_NETGAME_REC_SIZE);" in bp)
     pm = func_body(c, "pcnetgame_house_client_pump")
     ck("G the commit BEGIN carries the canon (host_session, seq) of the house and the CURRENT record base; digest = FNV of the whole 16004 byte payload", "b.host_session = s_hcp.canon_session[h];" in pm and "b.house_seq = s_hcp.canon_seq[h];" in pm
        and "b.rec_epoch = s_crec.base_epoch;" in pm and "b.rec_rev = s_crec.base_rev;" in pm and "pcnetgame_fnv1a32(s_hcl_tx, PC_NETGAME_HOUSE_COMMIT_SIZE)" in pm)
@@ -204,9 +206,12 @@ def main():
     ws = func_body(c, "pcnetgame_hcl_write_save")
     ap_ = func_body(c, "pcnetgame_hcl_apply_stash")
     fa = func_body(c, "pcnetgame_house_client_on_full_adopt")
-    ck("S the ONLY client write of a received house into the save is pcnetgame_hcl_write_save() -> pcnetgame_house_copy_canon() (one call each) and its two callers are the stash writer and the FULL-adoption restore",
-       cs.count("pcnetgame_house_copy_canon(&Save_Get(homes[h]), &s_hs_native);") == 1 and cs.count("pcnetgame_hcl_write_save(") == 3 and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in ap_
-       and "pcnetgame_hcl_write_save(h, img)" in fa and "pcnetgame_house_copy_canon(" in ws)
+    lw = func_body(c, "pcnetgame_hcl_live_apply")
+    ck("S the ONLY client write of a received house into the save is pcnetgame_hcl_write_save() -> pcnetgame_house_copy_canon() (one call each); its callers are the stash writer, the FULL-adoption restore "
+       "and the two live-apply paths of a VISITOR (no-rebuild path / the rebuild callback)",
+       cs.count("pcnetgame_house_copy_canon(&Save_Get(homes[h]), &s_hs_native);") == 1 and cs.count("pcnetgame_hcl_write_save(") == 5 and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in ap_
+       and "pcnetgame_hcl_write_save(h, img)" in fa and "pcnetgame_house_copy_canon(" in ws and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in lw
+       and "pcnetgame_hcl_write_save(*(int*)ctx, s_hcp.stash_img[*(int*)ctx])" in func_body(c, "pcnetgame_hcl_live_write_cb"))
     ck("S both writers check pcnetgame_local_house_unsafe() BEFORE writing; the stash writer also refuses while the own house is dirty or its commit is in flight and while the local save is unusable",
        ap_.index("pcnetgame_local_house_unsafe(h)") < ap_.index("pcnetgame_hcl_write_save(") and fa.index("pcnetgame_local_house_unsafe(h)") < fa.index("pcnetgame_hcl_write_save(")
        and "if (h == own && (s_hcl.c_active || pcnetgame_hcl_dirty(h))) {" in ap_ and "!pcfa_save_ready() || !s_local_world_latched" in ap_)
@@ -215,6 +220,68 @@ def main():
                                                                      "mPr_CheckCmpPersonalID(&s_hs_native.ownerID, &Save_Get(homes[h]).ownerID) != TRUE", "s_hcp.stash_valid[h] = 1;")))
     ck("S the clients never persist a house: no GCI / save write function is called anywhere in the house blocks",
        not re.search(r"pc_save_write|mCD_|pcnetgame_rec_store_write|pc_save_gci", strip_comments(c[c.index("/* ===== HOUSE CLIENT BEGIN"):c.index("/* ===== HOUSE CLIENT END")])))
+    # ------------------------------------------------------------------ L (live room, Stage 1b)
+    mr = read("src/actor/ac_my_room.c")
+    mrh = read("include/ac_my_room.h")
+    mrs = strip_comments(mr)
+    ex = strip_comments(func_body(mr, "aMR_pc_export_home"))
+    rl = strip_comments(func_body(mr, "aMR_pc_live_reload"))
+    qt = strip_comments(func_body(mr, "aMR_pc_room_quiet"))
+    lrh = strip_comments(func_body(c, "pcnetgame_hcl_live_room_house"))
+    ck("L ac_my_room.c: the three live-room entry points exist only under TARGET_PC (one guarded block before My_Room_Actor_dt) and are declared in ac_my_room.h under TARGET_PC",
+       "#ifdef TARGET_PC\n/* ===== PC multiplayer furniture sync (Stage 1): live export" in mr and mr.index("int aMR_pc_live_reload(") < mr.index("static void My_Room_Actor_dt(ACTOR* actorx")
+       and all(("extern int %s(" % n) in mrh[mrh.index("#ifdef TARGET_PC"):] for n in ("aMR_pc_room_quiet", "aMR_pc_export_home", "aMR_pc_live_reload")))
+    ck("L the export works on a COPY and never modifies the live room: memcpy of the save house into `out`, actors only read through const pointers, no write to ftr_actor / used_list / the live layers (Save_Get is only the memcpy source)",
+       "memcpy(out, &Save_Get(homes[idx]), sizeof(mHm_hs_c));" in ex and ex.count("Save_Get(") == 1 and "const FTR_ACTOR* ftr_actor" in ex and "FTR_ACTOR* ftr_actor" not in ex.replace("const FTR_ACTOR* ftr_actor", "")
+       and "ftr_actor->items[item_idx] =" not in ex and "used_list[i] =" not in ex and "aMR_KeepItem2Fg" not in ex)
+    ck("L the export reproduces the three teardown writes against the copy: ftr_switch (SaveSwitchData), haniwa_step (SaveHaniwaStepData), drawer / disc contents into the upper layers at the actor origin cell (KeepItem2Fg), and refuses when the field's layer pointers do not alias the save",
+       "lyr[l].ftr_switch |=" in ex and "step_data[row] |=" in ex and "lyr[l].items[ut_z][ut_x] = ftr_actor->items[item_idx];" in ex and "aMR_Wpos2PlaceNumber(&ut_x, &ut_z, ftr_actor->position, ftr_actor->shape_type)" in ex
+       and "aMR_GetLayerTopFg(l) != lyr[l].items[0]" in strip_comments(func_body(mr, "aMR_pc_live_house")))
+    ck("L quiescence (room side): state == 0, no demo / message (current AND requested) / forced-open demo / emulator request / bgm reservation / throw lock / pickup / picking-up / leaf, no parent furniture, no reserved furniture, "
+       "every used actor STOP with demo_status 0, wallpaper / carpet changers idle",
+       all(k in qt for k in ("my_room->state != 0", "my_room->demo_flag != 0", "my_room->msg_type != aMR_MSG_STATE_NONE", "my_room->requested_msg_type != aMR_MSG_STATE_NONE", "my_room->force_open_demo_flag != 0",
+                             "my_room->emu_info.request_flag != 0", "my_room->bgm_info.reserve_flag != 0", "my_room->throw_item_lock_flag != 0", "my_room->pickup_info.pickup_flag != 0",
+                             "my_room->pickup_info.picking_up_flag != 0", "my_room->parent_ftr.ftrID != -1", "my_room->rsv_ftr[i].exist_flag != 0", "ftr_actor->state != aFTR_STATE_STOP || ftr_actor->demo_status != 0",
+                             "my_indoor->wall_reserve.reserve_flag || my_indoor->floor_reserve.reserve_flag")))
+    ck("L quiescence (game side): GAME_PLAY running, no fade / wipe, a player-house room scene, submenu fully idle, no demo, message window hidden, player WAIT / WALK / RUN / DASH with no pending request, room quiet; >= 30 continuous GAME frames (game_frame based)",
+       all(k in lrh for k in ("gamePT->exec != play_main", "play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE", "mSc_IS_SCENE_PLAYER_HOUSE_ROOM", "play->submenu.process_status != mSM_PROCESS_WAIT",
+                             "play->submenu.menu_type != mSM_OVL_NONE", "play->submenu.mode != mSM_MODE_IDLE", "mDemo_CheckDemo() != FALSE", "!mMsg_Check_MainHide(mMsg_Get_base_window_p())",
+                             "pl->requested_main_index_changed", "mPlayer_INDEX_WAIT", "mPlayer_INDEX_WALK", "mPlayer_INDEX_RUN", "mPlayer_INDEX_DASH", "aMR_pc_room_quiet()",
+                             "need_own_room && Common_Get(field_type) != mFI_FIELDTYPE2_PLAYER_ROOM"))
+       and num(c, "PC_NETGAME_HCL_QUIET_FRAMES") == 30 and "->game_frame" in func_body(c, "pcnetgame_hcl_quiet_frames") and "pcnetgame_hcl_quiet_update();\n    pcnetgame_hcl_room_track();" in func_body(c, "pcnetgame_house_client_tick"))
+    ik = strip_comments(func_body(c, "pcnetgame_hcl_inroom_ok"))
+    ck("L an in-room commit needs: a baseline captured at room entry, no refusal this visit, no rollback, no commit in flight, the OWN room quiescent NOW (live_room_house(1)) and for >= 30 frames; the dirty test is the snapshot digest vs canon",
+       all(k in ik for k in ("!s_hcl.room_base_valid || s_hcl.room_stopped || s_hcl.rollback || s_hcl.c_active", "pcnetgame_hcl_live_room_house(1) != h", "pcnetgame_hcl_quiet_frames(h) >= PC_NETGAME_HCL_QUIET_FRAMES"))
+       and "pcnetgame_house_room_digest(s_hcl_snap_img) == pcnetgame_house_room_digest(s_hcp.canon_img[h])" in strip_comments(cm))
+    ck("L in-room commits only exist under house sync: the commit tick returns first when !pcnetgame_hcl_active(); aMR_pc_export_home is called from exactly two client places (snapshot, visitor live apply) and nowhere on the host",
+       cm.lstrip().startswith("int h;") and "if (!pcnetgame_hcl_active()) {\n        return 0;" in cm and cs.count("aMR_pc_export_home(") == 3 and "aMR_pc_export_home(&s_hcl_snap, h, &fl)" in func_body(c, "pcnetgame_hcl_snapshot")
+       and "aMR_pc_export_home(&s_hcl_cur, h, &fl)" in lw)
+    ck("L client pre-check: before any in-room send the host's conservation rule is applied to (snapshot + pockets) vs the baseline pair captured at room entry / moved by each APPLIED; a mismatch stops in-room commits for the visit and sends nothing; the baseline moves only on APPLIED",
+       cm.index("pcnetgame_house_conserved(s_hcl_cnt_base, s_hcl_cnt_new") < cm.index("pcnetgame_hcl_start_commit(h, now, in_room);") and "s_hcl.room_stopped = 1;" in cm
+       and "if (s_hcl.c_inroom) {\n                memcpy(s_hcl_cnt_base, s_hcl_cnt_new" in ak and ak.count("s_hcl.room_stopped = 1;") == 2)
+    ck("L after a STALE / refusal in-room commits stop (room_stopped) until the owner leaves; the FULL adoption / stash restore stay blocked inside the room (unchanged adopt_blocker / on_full_adopt unsafe gates)",
+       "pcnetgame_local_house_unsafe(h)" in fa and "staged_is_full && pcnetgame_local_house_unsafe(h)" in func_body(c, "pcnetgame_house_client_adopt_blocker")
+       and "|| s_hcl.c_active || pcnetgame_local_house_unsafe(h) || pcnetgame_hcl_dirty(h);" in tg + func_body(c, "pcnetgame_house_client_upload_deferred") and "s_hcl.room_base_valid = 0;" in func_body(c, "pcnetgame_hcl_room_track"))
+    la = strip_comments(func_body(c, "pcnetgame_hcl_apply_stash"))
+    ck("L a visitor's live apply never touches the OWN house: live_apply refuses h == own first, the stash writer only calls it as `h != own ? live_apply(h) : 0` when the house is unsafe, and aMR_pc_live_reload has exactly one caller",
+       "const int own = pcnetgame_hcl_own_house();" in lw[:120] and "h == own ||" in lw[:260] and "return h != own ? pcnetgame_hcl_live_apply(h) : 0;" in la and cs.count("aMR_pc_live_reload(") == 2
+       and cs.count("pcnetgame_hcl_live_apply(") == 2)
+    ck("L destroy-WITHOUT-write-back precedes the save write: the reload destroys every actor (dt_proc, CrossOffMoveBg, MinusWeight) and clears used_list before cb(ctx) writes the save, NEVER calls aMR_KeepItem2Fg / aMR_SaveSwitchData, and rebuilds the actors after the write",
+       rl.index("profile->vtable->dt_proc(") < rl.index("(void)cb(ctx);") < rl.index("aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER0);") and rl.index("l_aMR_work.used_list[i] = FALSE;") < rl.index("(void)cb(ctx);")
+       and "aMR_KeepItem2Fg" not in rl and "aMR_SaveSwitchData" not in rl and "mCoBG_CrossOffMoveBg(ftr_actor->move_bg_idx);" in rl and "aMR_MinusWeight(actorx, ftr_actor);" in rl
+       and "aMR_pc_room_quiet()" in rl[:rl.index("(void)cb(ctx);")] and "aMR_ClearSwitchSaveData(my_room);" in rl[rl.index("(void)cb(ctx);"):])
+    ck("L the rebuild is skipped (live floor left byte-identical) when the new layout equals the live one, is DEFERRED when the new layout puts furniture on a cell within one unit of the visitor, and only runs in a quiescent room for >= 30 frames",
+       "pcnetgame_hcl_live_room_house(0) != h || pcnetgame_hcl_quiet_frames(h) < PC_NETGAME_HCL_QUIET_FRAMES" in lw and "memcpy(&Save_Get(homes[h]).floors[fl], &keep, sizeof(keep));" in lw
+       and "nv != ov && (ITEM_IS_FTR(nv) || nv == (mActor_name_t)RSV_FE1F)" in lw and lw.index("deferred: the new layout puts furniture next to the visitor") < lw.index("aMR_pc_live_reload("))
+    ck("L the host BUSY (host's player in / entering / leaving the house) is answered BEFORE the rate-limit window accounting and BEFORE rec_win_count++, so a retrying owner can never reach RATE_LIMITED / the peer drop because of BUSY",
+       pc.index("pcnetgame_local_house_unsafe(h)") < pc.index("st->rec_win_start_ms") and pc.index("pcnetgame_local_house_unsafe(h)") < pc.index("st->rec_win_count++;") and pc.count("pcnetgame_local_house_unsafe(h)") == 1)
+    ck("L fidelity hook: --house-test-fidelity (default off, logged as TEST-ONLY) makes My_Room_Actor_dt export before the teardown and log MATCH / MISMATCH after it; compiled out of non-PC builds",
+       "int g_pc_house_test_fidelity = 0;" in main_c and 'strcmp(argv[i], "--house-test-fidelity") == 0' in main_c and "extern int           g_pc_house_test_fidelity;" in plat
+       and re.search(r"aMR_pc_fidelity_before\(\);\s+aMR_SaveSwitchData\(my_room\);\s+aMR_AllFurnitureDestruct\(actorx, game\);\s+aMR_pc_fidelity_after\(\);", mr) is not None
+       and "g_pc_house_test_fidelity &&" in mr and "#define aMR_pc_fidelity_before() ((void)0)" in mr)
+    ck("L the roadmap documents the live room (live commit, live apply, quiescence, limitations, the unverified list) and no longer says the room works on a copy",
+       "Stage 1b" in road and "quiescen" in road and "aMR_pc_export_home" in road and "unverified" in road[road.index("Stage 1b"):].lower()
+       and "the room scene works on a COPY" not in road and "works on a COPY of the house floors" not in c)
     # ------------------------------------------------------------------ D
     ck("D house sync is OFF by default (g_pc_house_sync = 0, set only by --house-sync), the two TEST hooks default to off / NULL, all documented in --help and pc_platform.h",
        "int g_pc_house_sync = 0;" in main_c and "int g_pc_house_test_host_in_house = -1;" in main_c and "const char* g_pc_house_test_host_edit = NULL;" in main_c
