@@ -12,6 +12,7 @@
 #include "pc_profiler.h"
 #include "pc_net_game.h"
 #include "pc_town_cache.h" /* M-A: pc_card_set_town_dir() */
+#include "pc_town_sanitize.h" /* M-J: pc_town_gci_find_resident() for the stale-membership check */
 #include "pc_host_observer.h"
 #include "pc_dedicated.h"
 #include "pc_guest_profile.h"
@@ -600,7 +601,7 @@ static char     g_pc_net_host_ip[64] = "127.0.0.1";
  * (HOST-only) overrides settings.ini [Network] town_serve (g_pc_town_serve_override). */
 static const char* g_pc_town_dir = NULL;
 static int         g_pc_town_fetch = 0;
-/* M-C (Play Online): --online-ui (hidden, set by the relaunch): failure boxes of the pre-boot fetch offer Retry / Play offline / Quit. Without it the fetch keeps its
+/* M-C (Play Online): --online-ui (hidden, set by the relaunch): failure boxes of the pre-boot fetch offer Retry / Use saved copy / Quit. Without it the fetch keeps its
  * silent fallback ladder (scripts / tests). g_pc_bootstrap_resident_pid(_set): a RESIDENT membership of the fetched town (20 BE PersonalID bytes) read by the thin
  * pc_bootstrap_resident_pid_poll() in pc_m_card.c, which resolves the slot and then drives the unchanged --bootstrap-resident path. */
 static int         g_pc_online_ui = 0;
@@ -620,7 +621,7 @@ void pc_main_refuse_sanitized_town(void) {
     exit(3);
 }
 
-/* SDL box for a failed fetch: 0 = Retry, 1 = Play offline (only when `offline`), 2 = Quit (also when the box could not be shown). */
+/* SDL box for a failed fetch: 0 = Retry, 1 = Use saved copy (only when `offline`; the client STILL connects in the background), 2 = Quit (also when the box could not be shown). */
 static int pc_town_failure_box(const char* msg, int offline) {
     SDL_MessageBoxButtonData btn[3];
     SDL_MessageBoxData box;
@@ -631,7 +632,7 @@ static int pc_town_failure_box(const char* msg, int offline) {
     btn[nb++].text = "Retry";
     if (offline) {
         btn[nb].buttonid = 1;
-        btn[nb++].text = "Play offline";
+        btn[nb++].text = "Use saved copy";
     }
     btn[nb].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
     btn[nb].buttonid = 2;
@@ -700,6 +701,42 @@ static void pc_main_resolve_membership(void) {
     if (strcmp(role, "resident") != 0) {
         printf("[PC] membership: character %s is a guest of town %s\n", ss->character.uuid, base);
         return;
+    }
+    /* M-J: a stale membership (the resident was removed, or the town was reset) must not leave the player on a silent title screen. The fetched GCI is checked here;
+     * the membership is never downgraded (the operator may restore the resident). An unreadable file skips the check (the later PID poll still logs / shows a notice). */
+    {
+        static uint8_t gci[PC_TS_GCI_SIZE];
+        size_t n = 0;
+        int slot = -1;
+        FILE* f = fopen(pc_gci_path(), "rb");
+        if (f != NULL) {
+            n = fread(gci, 1, sizeof(gci), f);
+            fclose(f);
+        }
+        if (n == sizeof(gci) && !pc_town_gci_find_resident(gci, n, pid, &slot)) {
+            const char* msg = "This character is no longer a resident of this town (removed or town reset): ask the operator.";
+            fprintf(stderr, "[PC] membership: STALE: character %s is recorded as a resident of town %s but its PersonalID is not a resident of the fetched town: %s\n", ss->character.uuid, base, msg);
+            if (getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+                SDL_MessageBoxButtonData btn;
+                SDL_MessageBoxData box;
+                int hit = -1;
+                memset(&btn, 0, sizeof(btn));
+                btn.flags = SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+                btn.buttonid = 2;
+                btn.text = "Quit";
+                memset(&box, 0, sizeof(box));
+                box.flags = SDL_MESSAGEBOX_WARNING;
+                box.window = g_pc_window;
+                box.title = "Animal Crossing - Play Online";
+                box.message = msg;
+                box.numbuttons = 1;
+                box.buttons = &btn;
+                (void)SDL_ShowMessageBox(&box, &hit);
+            }
+            fflush(NULL);
+            pc_platform_shutdown();
+            exit(3);
+        }
     }
     ss->join_kind = PC_SESSION_JOIN_RESIDENT;
     memcpy(ss->resident_pid, pid, sizeof(pid));
@@ -1789,7 +1826,7 @@ int main(int argc, char* argv[]) {
                 /* M-C: the fetch failed but an older copy of the town exists: ask instead of silently playing it */
                 char msg[800];
                 int pick;
-                snprintf(msg, sizeof(msg), "Could not get the host's current town (%s).\n\nRetry, or play offline with the %s you already have?", town_err,
+                snprintf(msg, sizeof(msg), "Could not get the host's current town (%s).\n\nRetry, or continue with the %s you already have?\n\"Use saved copy\" is not offline play: the game still tries to connect in the background.", town_err,
                          town_rc == PC_TOWN_PREFETCH_CACHE ? "saved copy of this server's town" : "town in save/card_a");
                 pick = pc_town_failure_box(msg, 1);
                 if (pick == 0) {

@@ -25100,7 +25100,7 @@ static int pcnetgame_towncl_fallback(const char* host, uint16_t port, const char
     char legacy[400];
     printf("[NET][TOWN] fetch FAILED / unavailable: %s\n", why);
     if (err != NULL && err_cap > 0) {
-        snprintf(err, err_cap, "%s", why); /* M-C: for CACHE / LEGACY results err holds the reason of the failed fetch (the caller may offer Retry / Play offline) */
+        snprintf(err, err_cap, "%s", why); /* M-C: for CACHE / LEGACY results err holds the reason of the failed fetch (the caller may offer Retry / Use saved copy) */
     }
     if (pc_town_cache_find_by_server(NULL, host, port, key, &p)) {
         if (pc_card_set_town_dir(p.town_dir)) {

@@ -930,7 +930,8 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
         int len = (int)strlen(msg);
         int rows = 0;
 
-        pc_menu_draw_centered(game, "Could not join as a guest:", y, 255, 90, 90, 255, 1.0f);
+        extern const char* pc_guest_title_message_head(void); /* pc_m_card.c: heading of the message */
+        pc_menu_draw_centered(game, pc_guest_title_message_head(), y, 255, 90, 90, 255, 1.0f);
         y += line_h;
         while (pos < len && rows < 4) {
           char row[48];

@@ -183,7 +183,7 @@ Crash safety on load: a handoff whose PID is not in the GCI is invalid, so the g
 - **Then, in `pc_main`, after the fetch:** resolve the character's membership for town K.
   - `resident` → set `pc_session()->join_kind = RESIDENT` and `resident_pid`. After the save loads, bind through the `--bootstrap-resident` path by PID instead of by index (the slot is found by `CmpPersonalID`).
   - `guest`, or none → the existing guest arrival. A new character goes through the existing Rover first-run creation.
-- **Failures:** SDL message box with Retry / Play offline (use the cache) / Quit.
+- **Failures:** SDL message box with Retry / Use saved copy (the cache; M-J: formerly "Play offline") / Quit.
 - **Visual check is possible from the parent session.** The computer-use tools available there can launch the exe from a disposable fixture copy, `request_access` the game window (full tier), navigate the menu with the keyboard and take screenshots. No visual check was done during the design. A scripted alternative (a test-only menu script plus a `glReadPixels` dump; `pc_gx.c:2075` already reads pixels) is deferred.
 
 ## 6. Admission restructure
@@ -373,8 +373,8 @@ fallback ladder is unchanged). Forwarded from the title process: a FIXED whiteli
 `--fullscreen` is not a CLI option here: the window mode is a settings.ini value, which the new process reads again, so it is "forwarded" by construction. Name / host / port validation (no injection) is unchanged.
 
 **Failure UX.**
-- Fetch failed but an older copy exists (cache of this server or legacy `save/card_a`): SDL box "Retry / Play offline / Quit" (only with `--online-ui`). Retry un-selects the fallback directory
-  (`pc_card_reset_town_dir_for_test`, the only way to re-pick a possibly different town) and fetches again; Play offline continues with the old copy (the client then still tries the server and the usual
+- Fetch failed but an older copy exists (cache of this server or legacy `save/card_a`): SDL box "Retry / Use saved copy / Quit" (only with `--online-ui`; renamed in M-J). Retry un-selects the fallback directory
+  (`pc_card_reset_town_dir_for_test`, the only way to re-pick a possibly different town) and fetches again; Use saved copy continues with the old copy (the client then still tries the server and the usual
   auto-reconnect / REJECT title message apply); Quit exits 0. The reason of the failed fetch is now filled into `err` for the CACHE / LEGACY results.
 - No usable town at all: box "Retry / Quit" (`--online-ui`) or the old OK box (without); exit 3 on Quit.
 - A server REJECT after boot: the existing title message. A failed relaunch (`CreateProcess` error): the Play Online menu stays open and shows the red message (the title process does not quit; by source, not exercised).
@@ -395,11 +395,42 @@ an in-game screenshot, the "Retry" round trip, the relaunch-failure message.
   `resident_tokens = tofu`, token stored in the character's `token.dat`, membership stays resident): 14 / 14.
 
 **Limitations / not done.**
-- The resident bind needs the PID to be in the fetched save; a stale membership (resident removed / town reset) logs "nothing is bound" and the process stays on the title screen (no UI for that yet).
+- The resident bind needs the PID to be in the fetched save; a stale membership is handled in M-J (box + exit 3).
 - Under `resident_tokens = off` hosts no token comes back; `membership.ini` is still written at READY (role from the local player).
-- Play offline keeps the client connecting in the background; no true "offline only" mode. A new character that never reaches READY writes no membership.
+- "Use saved copy" keeps the client connecting in the background; no true "offline only" mode (see M-J for why). A new character that never reaches READY writes no membership.
 - Guest-to-resident promotion (M-F) is not started; the character list does not show the membership role or the town.
 - The title attract demo restarts the scene after ~60 s idle (vanilla); a very slow text entry may meet the wipe.
+
+### M-J (Play Online polish + visual pass): implemented (uncommitted, branch `multiplayer`)
+
+**Stale resident membership.** After the town fetch, `pc_main_resolve_membership()` reads the fetched town's GCI (`pc_gci_path()`, 467,008 B) and runs `pc_town_gci_find_resident()` for the membership's PID.
+A resident membership whose PID is not a live resident of that town (resident removed, or the town was reset) now logs `[PC] membership: STALE: ...`, shows a Quit-only box ("This character is no longer a
+resident of this town (removed or town reset): ask the operator.") and exits 3 before the network client is started; `membership.ini` is left as it is (never downgraded; the operator may restore the resident).
+A GCI that cannot be read in full skips the check. `AC_TOWN_NO_MSGBOX` suppresses the box (the log line and the exit stay). The in-game fallback is kept: if the PID poll after boot still finds no single
+match, it also sets a title-screen notice ("Could not play this character: ..."), shown for 10 minutes, instead of leaving the title silent.
+
+**"Use saved copy".** The middle button of the fetch-failure box was "Play offline", which is unsafe to implement for real: the role would be NONE and a save made then would land in the town cache, and a
+sanitized town copy is blank. It is renamed "Use saved copy" and the box text says it still connects in the background.
+
+**Character list.** A character whose `membership.ini` for the selected server's `last_town` (servers.ini hint, known without any network access) says `role = resident` is listed as `Name (resident)`. A server that
+never reached READY has no `last_town`, so nothing is marked there.
+
+**Hostnames: NOT implemented (decision).** The address is an IPv4 literal in `PCServer.address[16]`, the strict servers.ini parser, `pc_relaunch_build_args`, `--connect` (64-byte host buffer), the origin.ini cache key
+(64-byte address, compared as a string) and several pinned selftests that assert hostnames are refused. A hostname would change the struct size, the menu text-entry limits, the cache identity (an IP that moves would
+orphan or mix cached towns) and the relaunch injection surface in one go; that is not "contained". Resolution at connect time (`getaddrinfo` in `pc_net_client_connect`) would be the easy part. Left for a milestone
+that decides the cache identity first.
+
+**Visual pass (really done).** Method as in M-C: the disposable `bin_fixture4_ui` copy (cwd = that folder, its own `save/mp`: 2 servers, 2 store characters (Alice, Roger with a resident membership of a made-up town key),
+1 unimported legacy profile Bob, one made-up cached town), synthetic key events (`keybd_event` with scan codes, only after the game window really had the foreground; a failed focus sends nothing) and screenshots of ONLY
+the game window rectangle (plus the message boxes by their own rectangle). Boxes were clicked by `BM_CLICK` on the disposable process. Seen: title; server list (populated, selection highlight); actions page; Edit form
+(name, address, port steps, then "Saved server"); Delete confirmation; character list (populated, selected row, `(resident)` and `(profile)` markers, New character, Back); new-character entry; the fetch-failure box
+with the new button text (both the legacy-fallback and the cached-copy wording); the stale-resident box (reached for real: cached town + fake PID + "Use saved copy"). Findings fixed: the entry hint used "/", which is
+not in the font's safe glyph set and drew a music note ("Enter = next / OK" -> "next or OK"); the 180 dim let the title logo fight with the list rows (215); the Delete page had no hint line (added).
+Not seen: anything after a successful connect (in-game), the Retry round trip, the relaunch-failure message, an actual `Use saved copy` run through to the title.
+Known and unchanged: the title demo restarts its scene every so often; a slow text entry or a menu step can meet that wipe (the menu page survives, a text entry in progress is lost).
+
+**Tests.** `test_play_online_real.py` gained phase S (a real client, membership = resident with a PID that is not in the fetched town, `AC_TOWN_NO_MSGBOX=1`): asserts the STALE log line, exit 3, no bind, no READY,
+`membership.ini` unchanged: 18 / 18 with the existing G and R phases.
 
 ### M-F (guest -> resident promotion, reduced scope): implemented (uncommitted, branch `multiplayer`)
 

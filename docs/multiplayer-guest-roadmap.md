@@ -693,7 +693,9 @@ Tests actually run (disposable copy `pc/build64/bin_fixture4_reconnect`, ONE exe
 
 Status: M1 (character store) + M2 (membership lookup, per-town tokens) are implemented; M3 (servers.ini + `--server`) and M4 (Play Online title menu, relaunch) are implemented; M2b is not (see "Remaining").
 
-M-C (phase 2): Play Online now relaunches with `--town-fetch`, resolves `membership.ini` after the fetch (resident -> bound by PersonalID, guest / none -> guest arrival or first-run creation), writes `membership.ini` + servers.ini `last_town` at READY, and shows Retry / Play offline / Quit boxes on fetch failures. Details and limits: docs/multiplayer-phase2-design.md, "M-C".
+M-C (phase 2): Play Online now relaunches with `--town-fetch`, resolves `membership.ini` after the fetch (resident -> bound by PersonalID, guest / none -> guest arrival or first-run creation), writes `membership.ini` + servers.ini `last_town` at READY, and shows Retry / Use saved copy / Quit boxes on fetch failures (M-J renamed the middle button: it is NOT offline play). Details and limits: docs/multiplayer-phase2-design.md, "M-C".
+
+M-J (phase 2): a resident membership whose character is no longer a resident of the fetched town (removed or town reset) now ends with a Quit box and exit 3 instead of a silent title screen (the membership file is kept); the character list marks `(resident)` for the selected server's last known town; the old "Play offline" button is "Use saved copy" (it still connects in the background); small layout fixes of the Play Online screens after a screenshot pass. Hostnames in servers.ini are still not supported (IPv4 literals only; see design doc, "M-J").
 
 **Player-owned vs town-owned.** A *character* is the player-owned portable seed of a guest: `name`, `gender`, `face`, `home_town`, `player_id`, `land_id` (+ a local-only `uuid`).
 Everything else is **town-owned per membership** and host-authoritative: pockets, item conditions, wallet, loan, bank, lotto, equipment, mail, quests, catalog, museum, maps,

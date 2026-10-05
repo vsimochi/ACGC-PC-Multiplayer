@@ -12,6 +12,9 @@ save dir; nothing else is touched: not the live save dir, bin_talkfix*, bin_fixt
   R  membership.ini is replaced by role = resident + town_pid = the PersonalID of fixture resident 1: the client resolves the membership after the fetch, binds the
      resident by PID through the --bootstrap-resident path (slot 1), sends the RESIDENT claim under tofu (host mints a credential, the client stores it in the
      character's token.dat) and reaches READY; membership.ini stays resident.
+  S  (M-J) membership.ini = role resident + a PersonalID that is NOT a resident of the fetched town (removed / town reset), AC_TOWN_NO_MSGBOX=1 (the modal box cannot be
+     dismissed headlessly): the client logs 'membership: STALE', exits 3 right after the fetch, never starts the network client (no connect, no READY) and does not touch
+     membership.ini (never downgraded).
 Usage: python test_play_online_real.py [--port 11890]
 """
 import argparse
@@ -46,9 +49,9 @@ def resident_pid_hex(slot):
         return f.read(20).hex()
 
 
-def start_client(port, uuid, tag):
+def start_client(port, uuid, tag, env=None):
     return L.ClientProcess("127.0.0.1:%d" % port, extra_args=["--character", uuid, "--town-fetch", "--online-ui"], log_path=T.log_path("mc_client_%s.log" % tag),
-                           bin_dir=CLIENT_DIR, label="mcclient").start()
+                           bin_dir=CLIENT_DIR, env=env, label="mcclient").start()
 
 
 def run(port, results):
@@ -116,6 +119,26 @@ def run(port, results):
         ck("R first claim: the resident token was stored in the character's token.dat", "first claim: resident token" in client.log_text() and os.path.isfile(os.path.join(towns[0], "token.dat")))
         mtext = open(mpath).read()
         ck("R membership.ini stays role = resident with the resident PID", "role = resident" in mtext and ("town_pid = " + rpid) in mtext)
+        client.stop()
+        client = None
+        time.sleep(7.0)
+
+        # ---------------- S: stale resident membership (the PID is not in the fetched town)
+        fake = (b"Ghost   " + b"GuestVil" + (0x0777).to_bytes(2, "big") + (0x4321).to_bytes(2, "big")).hex()
+        stale = "role = resident\ntown_pid = %s\nlast_server = mcsrv\n" % fake
+        with open(mpath, "w", newline="") as f:
+            f.write(stale)
+        client = start_client(port, uuid, "stale", env={"AC_TOWN_NO_MSGBOX": "1"})
+        try:
+            rc = client.proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            rc = None
+        time.sleep(0.5)
+        ctext = client.log_text()
+        ck("S the client fetched the town and then logged 'membership: STALE' naming the character and the town", "fetch: installed town" in ctext and "membership: STALE: character " + uuid in ctext and key in ctext)
+        ck("S the message text is in the log and the process exited 3", "no longer a resident of this town" in ctext and rc == 3)
+        ck("S it never bound / connected: no RESIDENT line, no READY, no resident-by-pid", "is a RESIDENT of town" not in ctext and "-> READY" not in ctext and "--resident-by-pid" not in ctext)
+        ck("S membership.ini is unchanged (never auto-downgraded)", open(mpath).read() == stale)
     finally:
         for p in (client, host):
             if p is not None:

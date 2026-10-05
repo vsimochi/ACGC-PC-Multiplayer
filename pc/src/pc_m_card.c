@@ -1275,6 +1275,8 @@ void pc_bootstrap_resident_poll(void) {
  * entrance wipe settled), resolves the index with the vanilla comparator over private_data[] (an existing resident only), stores it in g_pc_bootstrap_resident and lets
  * the UNCHANGED pc_bootstrap_resident_poll() (called right after it from pc_vi.c) drive the bind. One shot per process; the CLI index flow (--bootstrap-resident N) never
  * arms it. A PID that matches no resident is logged once and nothing is bound. */
+static void pc_title_notice(const char* head, const char* msg, int secs); /* below (guest title message) */
+
 void pc_bootstrap_resident_pid_poll(void) {
     extern int g_pc_bootstrap_resident;                   /* pc_main.c */
     extern int g_pc_bootstrap_resident_pid_set;           /* pc_main.c: 1 = armed by Play Online (membership role = resident) */
@@ -1310,6 +1312,8 @@ void pc_bootstrap_resident_pid_poll(void) {
     }
     if (matches != 1) {
         OSReport("[PC] --resident-by-pid: %s (%d match(es) in this town): nothing is bound\n", matches == 0 ? "the resident of this membership is not in the town save" : "ambiguous resident", matches);
+        /* M-J: do not sit silent on the title screen */
+        pc_title_notice("Could not play this character:", matches == 0 ? "this character is not a resident of this town save (removed or town reset). Ask the operator." : "this character matches more than one resident of this town. Ask the operator.", 600);
         return;
     }
     OSReport("[PC] --resident-by-pid: resident PersonalID matches slot %d: binding through the --bootstrap-resident path\n", found);
@@ -1739,6 +1743,7 @@ void pc_mp_promote_commit(void) {
  * label. Plain statics, no allocation. */
 static char s_pc_guest_title_msg[256];
 static time_t s_pc_guest_title_msg_until = 0;
+static const char* s_pc_guest_title_msg_head = "Could not join as a guest:"; /* M-J: heading of the message (pc_title_notice may set another) */
 static char s_pc_guest_title_label[48] = "Join as Guest";
 static int s_pc_guest_title_label_done = 0;
 
@@ -2098,8 +2103,20 @@ const char* pc_guest_title_message(void) {
     return s_pc_guest_title_msg;
 }
 
+const char* pc_guest_title_message_head(void) {
+    return s_pc_guest_title_msg_head;
+}
+
+/* M-J: a title-menu notice with its own heading and duration (the Play Online resident bind found nothing to bind). */
+static void pc_title_notice(const char* head, const char* msg, int secs) {
+    snprintf(s_pc_guest_title_msg, sizeof(s_pc_guest_title_msg), "%s", msg);
+    s_pc_guest_title_msg_head = head;
+    s_pc_guest_title_msg_until = time(NULL) + secs;
+}
+
 static void pc_guest_title_fail(const char* what) {
     snprintf(s_pc_guest_title_msg, sizeof(s_pc_guest_title_msg), "%s", what);
+    s_pc_guest_title_msg_head = "Could not join as a guest:";
     s_pc_guest_title_msg_until = time(NULL) + 8;
     OSReport("[PC] join-as-guest: FAILED: %s -- staying on the title screen\n", what);
 }
