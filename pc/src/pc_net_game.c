@@ -18276,6 +18276,15 @@ static void pcnetgame_house_client_on_ready(void) {
     }
 }
 
+/* Furniture sync is in effect for this session (host: --house-sync; client: the host announced it and did not disable us). Used by the
+ * puppet collision gate: player-house interiors only collide when every process builds the room from the same synchronized furniture. */
+int pc_net_game_house_sync_active(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return g_pc_house_sync != 0;
+    }
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_hcl.on && !s_hcl.disabled;
+}
+
 /* HOST_CONFIG byte 1 bit 0 (pcnetgame_ts_client_apply). */
 static void pcnetgame_house_client_set_hostcfg(int on) {
     s_hcl.on = on ? 1 : 0;

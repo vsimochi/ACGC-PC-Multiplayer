@@ -2358,11 +2358,11 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     }
     in_interior = 0;
     if (!pc_remote_player_scene_is_local_field(slot, play)) {
-        /* Shared interior (same scene id + owner as the local scene, see scene_is_local_shown): arm the same pipe. Player rooms stay
-         * disarmed: the furniture is not synchronized (each process builds the room from its own save), so a puppet may stand inside
-         * a piece that only exists on the owner's side. */
+        /* Shared interior (same scene id + owner as the local scene, see scene_is_local_shown): arm the same pipe. Player rooms are armed
+         * only while furniture sync is in effect for the session (pc_net_game_house_sync_active): without it each process builds the room
+         * from its own save, so a puppet may stand inside a piece that only exists on the owner's side. */
         if (!pc_remote_player_scene_is_local_shown(slot, play) ||
-            slot->scene.kind == (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE) {
+            (slot->scene.kind == (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE && !pc_net_game_house_sync_active())) {
             return "scene";
         }
         in_interior = 1;

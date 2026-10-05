@@ -7,7 +7,7 @@ body = m.group(0) if m else ""
 checks = [
     ("collide_eval found", bool(body)),
     ("uses scene_is_local_shown for interiors", "pc_remote_player_scene_is_local_shown(slot, play)" in body),
-    ("player house disarmed", "PC_NETSCENE_KIND_PLAYER_HOUSE" in body),
+    ("player house armed only with furniture sync active", "PC_NETSCENE_KIND_PLAYER_HOUSE" in body and "!pc_net_game_house_sync_active()" in body),
     ("field rule still first", "pc_remote_player_scene_is_local_field(slot, play)" in body),
     ("interior stale-gap hold", "PC_REMOTE_PLAYER_ACTION_GAP_FRAMES" in body),
     ("local DOOR/OUTDOOR/KNOCK/INTRO/DEMO holds", all(k in body for k in ("mPlayer_INDEX_DOOR", "mPlayer_INDEX_OUTDOOR", "mPlayer_INDEX_INTRO", "mPlayer_INDEX_DEMO_WALK", "mPlayer_INDEX_RETURN_OUTDOOR"))),

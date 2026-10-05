@@ -377,6 +377,8 @@ PCNetSceneKind pc_net_game_scene_kind(int scene_id);
 /* M9-A: this process's own last announced scene. 0 if none announced yet (never in an announceable live
  * scene since start). */
 int pc_net_game_get_local_scene(PCNetPlayerScene* out);
+/* Furniture sync Stage 1 is in effect for this session (host: --house-sync; client: announced by the host and not disabled). */
+int pc_net_game_house_sync_active(void);
 /* M9-A: the last accepted scene of another network player (host: a READY client id; client: the host id
  * or a relayed client id). Returns 1 and fills *out only if a scene is currently known; 0 otherwise
  * (never announced, disconnected, or cleared). Presence only: nothing consumes this yet (puppet
