@@ -249,7 +249,9 @@ def main():
        "(residents keep priority, the guest path changed neither; the observer plays no resident)",
        fb("pcnetgame_host_classify_identity") != "" and mask(head_function("pcnetgame_host_classify_identity")).strip() == fb("pcnetgame_host_classify_identity").strip()
        and "if (pc_host_observer_active()) {" in own_expect and ws(own_expect) == ws(fb("pcnetgame_host_own_resident_idx")))
-    pi = fb("pcnetgame_host_process_identity")
+    # M-D refactor: the admission DECISION (has_save / town, classify, guest / resident rules) moved from process_identity into pcnetgame_host_admission_decide(), which the
+    # caller process_identity runs first; the concatenation keeps the same source order (decide, then the rest of process_identity), so the order checks keep their strictness.
+    pi = fb("pcnetgame_host_admission_decide") + "\n" + fb("pcnetgame_host_process_identity")
     ck("C the class is decided in process_identity AFTER the unchanged NO_SAVE / LAND_MISMATCH checks and BEFORE the ACK: classify -> (UNKNOWN + EXT guest claim -> guest_check) / "
        "(RESIDENT + guest claim -> refuse) -> own-resident -> duplicate/park -> create -> reset -> ACK -> TOKEN -> READY",
        0 < pi.index("PC_NETGAME_REJECT_NO_SAVE") < pi.index("PC_NETGAME_REJECT_LAND_MISMATCH") < pi.index("pcnetgame_host_classify_identity(") < pi.index("pcnetgame_host_guest_check(")
@@ -257,7 +259,7 @@ def main():
        < pi.index("pcnetgame_reset_all_host_peer_state(peer);") < pi.index("PC_NETGAME_MSG_IDENTITY_ACK") < pi.index("PC_NETGAME_MSG_IDENTITY_TOKEN") < pi.index("PC_NETGAME_LINK_READY"))
     ck("C a guest is admitted ONLY for an UNKNOWN class with the EXT guest flag: the guest_check call sits in the `id_class != RESIDENT` branch; the resident branch refuses a guest claim",
        re.search(r"if \(id_class != PCNETGAME_IDCLASS_RESIDENT\) \{\s*if \(!ext_guest\) \{[^}]*claimed identity matches no resident record of this town\", 1\);\s*return;\s*\}[^}]*pcnetgame_host_guest_check\(", pi, re.S)
-       and re.search(r"\} else if \(ext_guest\) \{[^}]*pcnetgame_host_refuse_identity\(peer, \"guest-flagged claim matches a resident of this town", pi, re.S))
+       and re.search(r"\}\s*if \(ext_guest\) \{[^}]*pcnetgame_host_admission_refuse_identity_text\(a, \"guest-flagged claim matches a resident of this town", pi, re.S))
     ck("C the EXT claim is only read by the EXT handler (cache), process_identity (class decision) and guest_check (key / token); the claimed player_no is still never used",
        sorted({n for a, b, n in funcs if re.search(r"\bext_valid\b|\.ext\b|->ext\b|\bext->", c[a:b])})
        == sorted(["pcnetgame_handle_host_identity_ext", "pcnetgame_host_guest_check", "pcnetgame_host_process_identity"]))
@@ -342,16 +344,16 @@ def main():
     ck("K M2: at most ONE IDENTITY_TOKEN is accepted per connection (s_client_token_received, reset with the per-connection claim state), only after our own EXT; the shutdown on a "
        "DIFFERENT token happens ONLY inside the `token_present` branch (a token was PRESENTED); a token from a host this client holds NO token for is stored as a first contact",
        "if (s_client_token_received) {" in it and it.index("!s_client_guest_claim_sent") < it.index("if (s_client_token_received) {") < it.index("s_client_token_received = 1;")
-       < it.index("if (s_client_ext_sent.token_present) {") < it.index("pc_net_game_shutdown();") < it.index("pc_mp_gtoken_put(&s_client_gtk, &e)")
-       and it.count("pc_net_game_shutdown();") == 1 and fb("pcnetgame_reset_client_session_state").count("s_client_token_received = 0;") == 1
-       and re.search(r"if \(s_client_ext_sent\.token_present\) \{\s*if \(memcmp\(m\.token, s_client_ext_sent\.token, PC_NETGAME_GUEST_TOKEN_LEN\) != 0\) \{[^}]*pc_net_game_shutdown\(\);\s*return;\s*\}", it, re.S))
+       < it.index("if (s_client_ext_sent.token_present) {") < it.index("pcnetgame_client_refused(") < it.index("pc_mp_gtoken_put(&s_client_gtk, &e)")
+       and it.count("pcnetgame_client_refused(") == 1 and fb("pcnetgame_reset_client_session_state").count("s_client_token_received = 0;") == 1
+       and re.search(r"if \(s_client_ext_sent\.token_present\) \{\s*if \(memcmp\(m\.token, s_client_ext_sent\.token, PC_NETGAME_GUEST_TOKEN_LEN\) != 0\) \{[^}]*pcnetgame_client_refused\(\"guest token mismatch\"\);\s*return;\s*\}", it, re.S))
     ck("K IDENTITY_TOKEN is honoured only after a guest claim; a DIFFERENT token than the one presented REFUSES the host (shutdown, with reset instructions); first contact persists it "
        "(pc_mp_gtoken_put + save); a failed save is loud",
-       "!s_client_guest_claim_sent" in it and "memcmp(m.token, s_client_ext_sent.token, PC_NETGAME_GUEST_TOKEN_LEN) != 0" in it and "pc_net_game_shutdown();" in it
+       "!s_client_guest_claim_sent" in it and "memcmp(m.token, s_client_ext_sent.token, PC_NETGAME_GUEST_TOKEN_LEN) != 0" in it and "pcnetgame_client_refused(" in it
        and "pc_mp_gtoken_put(&s_client_gtk, &e)" in it and "pc_mp_gtoken_save(pc_guest_token_path(), &s_client_gtk)" in it and "could NOT save the guest token" in it
        and "To start over delete" in it)
     ck("K the token file is looked up by (host TOWN identity, home PersonalID) BEFORE the ACK names the host; it is client metadata, never a GCI",
-       "pc_mp_gtoken_find(&s_client_gtk, town->land_name, town->land_id, town->terrain_hash, home_be)" in fb("pcnetgame_client_build_ext") and ".gci" not in fb("pcnetgame_client_build_ext")
+       "pc_mp_gtoken_find(&s_client_gtk, town->land_name, town->land_id, town->terrain_hash, home_be)" in fb("pcnetgame_client_build_ext_ex") and ".gci" not in fb("pcnetgame_client_build_ext_ex")
        and '#define PC_MP_GUEST_TOKEN_PATH    "save/mp/guest_token.dat"' in gh)
     ck("K record_class GUEST is stamped on the client's BEGIN only after a guest claim; the host stamps its pushes to a guest",
        "b.rsv = s_client_guest_claim_sent ? (uint8_t)PC_NETGAME_REC_CLASS_GUEST : (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT;" in fb("pcnetgame_crec_pump_upload")

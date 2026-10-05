@@ -78,20 +78,22 @@ def main():
     i_rej = h.index("host rejected the connection (reason=")
     i_txt = h.index("pcnetgame_reject_text(", i_rej)
     i_msg = h.index("pcnetgame_join_message_set(0, \"%s (reason %u)\"", i_txt)
-    i_down = h.index("pc_net_game_shutdown();", i_msg)
+    i_down = h.index("pcnetgame_client_refused(", i_msg)  # the teardown (pre-READY = pc_net_game_shutdown()) now goes through pcnetgame_client_refused
     ck("A the REJECT handler: numeric reason log line first, the text is built and the message set BEFORE pc_net_game_shutdown(), and the message carries '(reason N)'",
        i_rej < i_txt < i_msg < i_down and "(unsigned)in.reason, (unsigned)in.expected_protocol_version" in h[i_rej:i_txt])
     tk = fr("pcnetgame_handle_client_identity_token")
     i_diff = tk.index("DIFFERENT guest token")
     ck("A the 'received a new token while holding an old one' path sets a readable message (naming guest_token.dat and the operator recovery) BEFORE it shuts the client down",
-       "pcnetgame_join_message_set(0, \"The host gave you a DIFFERENT guest token" in tk and tk.index("pcnetgame_join_message_set(0", i_diff) < tk.index("pc_net_game_shutdown();", i_diff)
-       and "guest-reset-token" in tk and "pc_guest_token_path());\n            pc_net_game_shutdown();" in tk.replace("\r", ""))
+       "pcnetgame_join_message_set(0, \"The host gave you a DIFFERENT guest token" in tk and tk.index("pcnetgame_join_message_set(0", i_diff) < tk.index("pcnetgame_client_refused(", i_diff)
+       and "guest-reset-token" in tk and "pc_guest_token_path());\n            pcnetgame_client_refused(\"guest token mismatch\");" in tk.replace("\r", ""))
     ck("A a token that could not be saved also tells the user (not only the log)", "Your guest token could not be saved to %s" in tk or "Your guest token could not be saved to %s" in ng)
     ia = ng[ng.index("IDENTITY_ACK does not match"):]
-    ia = ia[:ia.index("pc_net_game_shutdown();")]
+    ia = ia[:ia.index("pcnetgame_client_refused(")]
     ck("A an IDENTITY_ACK mismatch sets a message first: protocol versions (both numbers) or the two towns", "host runs another network version (host %u, this game %u)" in ia and "does not match your town" in ia)
-    ev = ng[ng.index("case PC_NET_EVENT_PEER_DISCONNECTED:\n                    if (s_client_link == PC_NETGAME_LINK_CONNECTING"):] if "case PC_NET_EVENT_PEER_DISCONNECTED:\n                    if (s_client_link == PC_NETGAME_LINK_CONNECTING" in ng else ""
+    # auto-reconnect refactor: the PEER_DISCONNECTED case now just calls pcnetgame_client_on_link_lost(), which holds the message + the DISCONNECTED transition
+    ev = fr("pcnetgame_client_on_link_lost")
     ck("A a transport close during CONNECTING / HANDSHAKE (older host, stopped host, network error) sets a message naming the host address", "closed the connection before you could join" in ev
+       and "pcnetgame_client_on_link_lost(" in ng[ng.index("case PC_NET_EVENT_PEER_DISCONNECTED:"):] and "s_client_host_addr" in ev
        and ev.index("pcnetgame_join_message_set(0") < ev.index("s_client_link = PC_NETGAME_LINK_DISCONNECTED;"))
     nu = fr("pcnetgame_client_notice_update")
     ck("A host unreachable: after PC_NETGAME_CONNECT_WARN_MS in CONNECTING a 'No answer from the host at <ip:port> after N s ... Still trying' warning (non final) is set once and withdrawn as "
@@ -102,7 +104,7 @@ def main():
     sd = fr("pc_net_game_shutdown")
     sc = fr("pc_net_game_start_client")
     ck("A the message outlives pc_net_game_shutdown() (the client plays on alone) and a new connection attempt clears it", "s_join_msg" not in sd and "pcnetgame_join_message_clear" not in sd
-       and "pcnetgame_join_message_clear();" in sc)
+       and "pcnetgame_join_message_clear();" in fr("pcnetgame_client_begin_attempt") and "pcnetgame_client_begin_attempt();" in sc)  # start_client -> begin_attempt (shared with reconnect attempts)
     acc = fr("pc_net_game_join_message")
     ck("A the accessor is role independent and a FINAL message expires after PC_NETGAME_JOIN_MSG_SHOW_MS (30 s) while a warning stays", "s_role" not in acc and "PC_NETGAME_JOIN_MSG_SHOW_MS" in acc
        and "#define PC_NETGAME_JOIN_MSG_SHOW_MS    30000u" in ng)
