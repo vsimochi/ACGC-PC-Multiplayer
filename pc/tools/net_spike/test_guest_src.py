@@ -95,8 +95,8 @@ def strip_observer(text):
     return re.sub(r"/\* OBSERVER-BEGIN \*/.*?/\* OBSERVER-END \*/\n?", "", text, flags=re.S)
 
 
-def head_function(name, path="pc/src/pc_net_game.c", strip=False):
-    txt = subprocess.run(["git", "-C", ROOT, "show", "HEAD:" + path], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
+def head_function(name, path="pc/src/pc_net_game.c", strip=False, ref="HEAD"):
+    txt = subprocess.run(["git", "-C", ROOT, "show", ref + ":" + path], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
     txt = txt.replace("\r\n", "\n")
     if strip:
         txt = strip_observer(txt)  # HEAD already contains the committed --host-observer blocks: compare like with like (both sides without them)
@@ -169,7 +169,33 @@ def main():
                               "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook", "pcnetgame_txn_apply_take",
                               # furniture sync (house index from a bound PersonalID, guest refused first; client shadows; TEST-ONLY host edit): see test_house_sync_src.py
                               "pcnetgame_hcl_build_pair", "pcnetgame_hcl_local_cown", "pcnetgame_hcl_push_complete", "pcnetgame_hcl_write_save", "pcnetgame_house_host_refresh",
+                              # furniture sync, reviewed (guest-safety review of da9074a): live apply / reconcile plan / room track (client shadows, range-checked house index),
+                              # the client reconcile apply (own house only, no guest claim)
+                              "pcnetgame_hcl_live_apply", "pcnetgame_hcl_reconcile_plan", "pcnetgame_hcl_room_track", "pcnetgame_house_client_reconcile_apply",
                               "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit"]))
+    # reviewed guards of the furniture-sync / promote code that subscripts homes[] / private_data[] (a guest can never reach them with an out-of-range index)
+    hcl_own = fb("pcnetgame_hcl_own_house")
+    prm_idx = fb("pcnetgame_promote_parse_index")
+    mc_raw = mask(read("pc/src/pc_m_card.c"))
+    mc_fn = functions(mc_raw)
+
+    def other_c_callers(fn):
+        out = []
+        for d_ in ("pc/src", "pc/include", "pc/tools"):
+            for dp, _dn, fns in os.walk(os.path.join(ROOT, d_.replace("/", os.sep))):
+                for f_ in fns:
+                    if f_.endswith((".c", ".cpp", ".cc")) and f_ != "pc_net_game.c":  # headers hold declarations only
+                        t_ = mask(read(os.path.relpath(os.path.join(dp, f_), ROOT).replace(os.sep, "/")))
+                        if re.search(r"\b%s\(" % fn, t_):
+                            out.append(f_)
+        return sorted(out)
+    ck("A furniture sync / promote guards: hcl_own_house returns nothing for a guest (`Now_Private == NULL || s_client_guest_claim_sent`), live_apply range-checks the house index "
+       "(`h < 0 || h >= PC_NETGAME_HOUSE_NUM`), promote_parse_index accepts only a single digit 0..3 (`sel[0] >= '0' && sel[0] <= '3'`), pc_mp_promote_create range-checks the house "
+       "(`house < 0 || house >= PLAYER_NUM`), and the only callers of pc_net_game_dedicated_promote( / pc_net_game_dedicated_give( outside pc_net_game.c are in pc_dedicated.c",
+       "Now_Private == NULL || s_client_guest_claim_sent" in hcl_own and "h < 0 || h >= PC_NETGAME_HOUSE_NUM" in fb("pcnetgame_hcl_live_apply")
+       and "sel[0] >= '0' && sel[0] <= '3'" in prm_idx and prm_idx != ""
+       and "house < 0 || house >= PLAYER_NUM" in body(mc_raw, mc_fn, "pc_mp_promote_create")
+       and other_c_callers("pc_net_game_dedicated_promote") == ["pc_dedicated.c"] and other_c_callers("pc_net_game_dedicated_give") == ["pc_dedicated.c"])
     for name in ("pcnetgame_handle_host_txn_commit", "pcnetgame_x3_grant", "pcnetgame_handle_host_ts_txn", "pcnetgame_rec_process_upload", "pcnetgame_rec_handle_hello",
                  "pcnetgame_rec_start_push", "pcnetgame_txn_send_applied", "pcnetgame_rec_txn_write_inventory", "pcnetgame_rec_txn_write_mail", "pcnetgame_rec_txn_idx_ok",
                  "pcnetgame_rec_merge_into_save", "pcnetgame_rec_export_be", "pcnetgame_rec_refresh_hostfields"):
@@ -260,9 +286,17 @@ def main():
     ck("C a guest is admitted ONLY for an UNKNOWN class with the EXT guest flag: the guest_check call sits in the `id_class != RESIDENT` branch; the resident branch refuses a guest claim",
        re.search(r"if \(id_class != PCNETGAME_IDCLASS_RESIDENT\) \{\s*if \(!ext_guest\) \{[^}]*claimed identity matches no resident record of this town\", 1\);\s*return;\s*\}[^}]*pcnetgame_host_guest_check\(", pi, re.S)
        and re.search(r"\}\s*if \(ext_guest\) \{[^}]*pcnetgame_host_admission_refuse_identity_text\(a, \"guest-flagged claim matches a resident of this town", pi, re.S))
-    ck("C the EXT claim is only read by the EXT handler (cache), process_identity (class decision) and guest_check (key / token); the claimed player_no is still never used",
-       sorted({n for a, b, n in funcs if re.search(r"\bext_valid\b|\.ext\b|->ext\b|\bext->", c[a:b])})
-       == sorted(["pcnetgame_handle_host_identity_ext", "pcnetgame_host_guest_check", "pcnetgame_host_process_identity"]))
+    ext_readers = ["pcnetgame_handle_host_identity_ext", "pcnetgame_host_admission_decide", "pcnetgame_host_guest_check", "pcnetgame_host_process_identity",
+                   "pcnetgame_host_promotion_handoff", "pcnetgame_host_resident_credential_check", "pcnetgame_townsrv_handle_req"]
+    pr_ext = re.findall(r"ext->\w+", fb("pcnetgame_host_promotion_handoff"))
+    cred = fb("pcnetgame_host_resident_credential_check")
+    ck("C the EXT claim is only read by the EXT handler (cache), the admission decision, process_identity, guest_check (key / token), the promotion handoff (token only), the resident "
+       "credential check (token only, after the `!ext_res` early exit) and the town-service request handler (no ext-> / .ext at all); the claimed player_no is still never used by ANY of the 7 readers",
+       sorted({n for a, b, n in funcs if re.search(r"\bext_valid\b|\.ext\b|->ext\b|\bext->", c[a:b])}) == sorted(ext_readers)
+       and not [n for n in ext_readers if "player_no" in fb(n)]
+       and fb("pcnetgame_townsrv_handle_req") != "" and not re.search(r"\bext->|\.ext\b", fb("pcnetgame_townsrv_handle_req"))
+       and pr_ext and set(pr_ext) <= {"ext->token_present", "ext->token"}
+       and "if (!ext_res) {" in cred and "ext->token" in cred and cred.index("if (!ext_res) {") < cred.index("ext->token"))
     gcheck = fb("pcnetgame_host_guest_check")
     order = ["in->player_id != ext->home_player_id", "pcnetgame_guest_key_valid(key)", "ext->home_land_id == s_host_town.land_id", "pcnetgame_guest_key_conflict(key)",
              "s_guest_untrusted", "pcnetgame_guest_find(key)", "ext->token_present && memcmp(ext->token, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN) == 0",
@@ -291,9 +325,11 @@ def main():
        printf_calls and not [p for p in printf_calls if re.search(r"(?:->|\.)token\b|\btoken_out\b|\bguest_token\b|s_guest\[[^\]]*\]\.token|\bm\.token\b", re.sub(r'"(?:[^"\\]|\\.)*"', '""', p))])
     ck("C the first-contact entry is rolled back (and the removal made durable) when the ACK / TOKEN could not be queued: the real guest never got the token",
        pi.count("pcnetgame_guest_rollback_create(guest_slot)") == 2 and "guest_new" in pi)
-    ck("C the EXT handler caches only a well-formed claim before IDENTITY: wrong size, reserved bits, token bytes without token_present, a second claim and a late claim are ignored",
+    ck("C the EXT handler caches only a well-formed claim before IDENTITY: wrong size, reserved / unknown flag bits, BOTH the GUEST and the RESIDENT flag, token bytes without token_present, a second claim and a late claim are ignored",
        all(x in fb("pcnetgame_handle_host_identity_ext") for x in ("s_host_peer_link[peer] != PC_NETGAME_LINK_HANDSHAKE || st->identity_pending", "st->ext_valid", "size != sizeof(m)",
-                                                                  "(m.flags & ~PC_NETGAME_IDEXT_FLAG_GUEST) != 0 || m._reserved0 != 0 || m._reserved1 != 0 || m.token_present > 1",
+                                                                  "(m.flags & ~(PC_NETGAME_IDEXT_FLAG_GUEST | PC_NETGAME_IDEXT_FLAG_RESIDENT)) != 0 || m._reserved0 != 0 || m._reserved1 != 0 || m.token_present > 1",
+                                                                  "(PC_NETGAME_IDEXT_FLAG_GUEST | PC_NETGAME_IDEXT_FLAG_RESIDENT)) == (PC_NETGAME_IDEXT_FLAG_GUEST | PC_NETGAME_IDEXT_FLAG_RESIDENT)",
+                                                                  "both the GUEST and the RESIDENT claim flags are set",
                                                                   "token bytes present without token_present")))
     ck("C a client may NOT originate IDENTITY_TOKEN: the host drops it before any handler", "data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_TOKEN" in fb("pcnetgame_handle_host_data")
        and fb("pcnetgame_handle_host_data").index("PC_NETGAME_MSG_IDENTITY_TOKEN") < fb("pcnetgame_handle_host_data").index("pcnetgame_handle_host_record(peer"))
@@ -308,7 +344,19 @@ def main():
        "GCI-save hook, (5) by the G6.2 operator removal (pc_net_game_dedicated_guest_admin, after a backup) -- and never while UNTRUSTED",
        sorted({n for a, b, n in funcs if "pcnetgame_guest_store_write(" in c[a:b] and n != "pcnetgame_guest_store_write"})
        == sorted(["pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pcnetgame_guest_remint", "pcnetgame_guest_remint_rollback",
-                  "pcnetgame_guest_confirm_on_record_step", "pc_net_game_record_after_gci_save", "pc_net_game_dedicated_guest_admin"]))
+                  "pcnetgame_guest_confirm_on_record_step", "pc_net_game_record_after_gci_save", "pc_net_game_dedicated_guest_admin",
+                  "pc_net_game_dedicated_give", "pc_net_game_dedicated_promote"]))
+    give = fb("pc_net_game_dedicated_give")
+    prom = fb("pc_net_game_dedicated_promote")
+    pord = ["s_guest_untrusted", "pc_mp_guests_backup_file(PC_MP_GUESTS_PATH", "pc_mp_promote_create("]
+    pord2 = ["pcnetgame_members_commit(&nf", "pc_save_write_authoritative()", 'pcnetgame_guest_store_write("guest promoted to a resident")']
+    ck("P the two further guests.dat writers are guarded: dedicated_give refuses a guest while UNTRUSTED (`if (is_guest && s_guest_untrusted) {`) BEFORE the inventory write and its failure path "
+       "says the gift was rolled back; dedicated_promote refuses while UNTRUSTED, THEN backs guests.dat up, THEN creates the resident, and commits in the order members.dat -> authoritative "
+       "save -> guest store write",
+       "if (is_guest && s_guest_untrusted) {" in give and "pcnetgame_rec_txn_write_inventory(" in give and give.index("if (is_guest && s_guest_untrusted) {") < give.index("pcnetgame_rec_txn_write_inventory(")
+       and "gift was rolled back" in raw
+       and all(x in prom for x in pord + pord2) and [prom.index(x) for x in pord] == sorted(prom.index(x) for x in pord)
+       and [prom.index(x) for x in pord2] == sorted(prom.index(x) for x in pord2))
     ck("P the store write refuses while UNTRUSTED (a write would lift the operator lock) and while nothing was loaded; the epoch alone never forces a rewrite; failures are logged, never fatal",
        "if (!s_guest_store_loaded || s_guest_untrusted) {" in fb("pcnetgame_guest_store_write") and "cmp.e[g].epoch = s_guest_file.e[g].epoch;" in fb("pcnetgame_guest_store_write")
        and "return 0;" in fb("pcnetgame_guest_store_write") and "exit(" not in fb("pcnetgame_guest_store_write") and "abort(" not in fb("pcnetgame_guest_store_write"))
@@ -317,18 +365,19 @@ def main():
        and "pcnetgame_guest_store_load();" in fb("pcnetgame_rec_store_resolve").split("if (s_rec_resolved)")[0])
     ck("P an accepted guest change raises the same early-save request as a resident (note_peer_gone maps the guest slot) and the resident note_saved never clears a guest's dirty marker",
        "slot = st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST" in fb("pcnetgame_rec_note_peer_gone") and "for (i = 0; i < PLAYER_NUM; i++) {" in fb("pc_net_game_record_note_saved"))
-    d = subprocess.run(["git", "-C", ROOT, "diff", "--stat", "HEAD", "--", "pc/src/pc_card.c"], capture_output=True, text=True).stdout.strip()
-    # furniture sync: pc_save_bswap.c may differ from HEAD by exactly ONE addition -- the public pc_save_bswap_home() wrapper of swap_mHm_hs (no removed line, nothing else)
-    dbs = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", "HEAD", "--", "pc/src/pc_save_bswap.c"], capture_output=True, text=True).stdout
-    bs_added = [ln[1:] for ln in dbs.split("\n") if ln.startswith("+") and not ln.startswith("+++")]
-    bs_removed = [ln for ln in dbs.split("\n") if ln.startswith("-") and not ln.startswith("---")]
-    d_bsw_ok = not bs_removed and len(bs_added) <= 8 and any("void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {" in ln for ln in bs_added) \
-        and any("swap_mHm_hs(home, dir);" in ln for ln in bs_added)
+    # PINNED reviewed baseline: da9074a (the HEAD the Opus guest-safety review audited). The writers, pc_card.c and pc_save_bswap.c must equal that commit EXACTLY.
+    # Pre-session equivalence (the baseline vs 0c9bc72, the last commit before this work) was reviewed BY HAND: the writers are identical except pc_gci_path() / pc_gci_tmp_path()
+    # and s_pc_town_gen++ in pc_save_write_gci.
+    BASELINE = "da9074a"
+    d = subprocess.run(["git", "-C", ROOT, "diff", "--stat", BASELINE, "--", "pc/src/pc_card.c"], capture_output=True, text=True).stdout.strip()
+    d_bsw = subprocess.run(["git", "-C", ROOT, "diff", "--stat", BASELINE, "--", "pc/src/pc_save_bswap.c"], capture_output=True, text=True).stdout.strip()
+    bsw_txt = read("pc/src/pc_save_bswap.c")
+    d_bsw_ok = d_bsw == "" and bsw_txt.count("void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {") == 1
     cur_mc = mask(strip_observer(read("pc/src/pc_m_card.c")))  # the --host-observer marker blocks removed (see strip_observer)
     cur_f = functions(cur_mc)
     writers = ("pc_save_write_gci_to", "pc_save_write_gci", "pc_save_rotate_backups", "pc_save_write_authoritative", "mCD_SaveHome_bg")
-    same = {n: (mask(head_function(n, "pc/src/pc_m_card.c", True)).strip() == body(cur_mc, cur_f, n).strip() != "") for n in writers}
-    ck("P the GCI writer functions (%s), the Card-B scan (pc_card.c) and the byte-swap code are UNCHANGED vs HEAD (the byte-swap code only GAINED the furniture-sync wrapper pc_save_bswap_home): guests add no file to the vanilla save path" % sorted(same),
+    same = {n: (mask(head_function(n, "pc/src/pc_m_card.c", True, BASELINE)).strip() == body(cur_mc, cur_f, n).strip() != "") for n in writers}
+    ck("P the GCI writer functions (%s), the Card-B scan (pc_card.c) and the byte-swap code (pc_save_bswap.c, pc_save_bswap_home defined exactly once) are UNCHANGED vs the reviewed baseline %s: guests add no file to the vanilla save path" % (sorted(same), BASELINE),
        d == "" and d_bsw_ok and all(same.values()))
     ck("P pc_mp_guests.c is in the build (CMakeLists) and the path / format are documented", "pc_mp_guests.c" in read("pc/CMakeLists.txt") and "ACMPGST" in gh and "UNTRUSTED" in gh)
 
@@ -427,12 +476,15 @@ def main():
     mfn = functions(mc)
     bg_poll = body(mc, mfn, "pc_bootstrap_guest_poll")
     bg_arr = body(mc, mfn, "pc_guest_arrive")  # G3: the arrival itself moved into the shared pc_guest_arrive (poll = one-shot / readiness waits + exit(2))
-    bg = bg_poll + "\n" + bg_arr
+    bg_fin = body(mc, mfn, "pc_guest_creation_finish")
+    bg_door = body(mc, mfn, "pc_guest_station_door")
+    bg = bg_poll + "\n" + bg_arr + "\n" + bg_fin
     ck("G2 --bootstrap-guest (pc_bootstrap_guest_poll + G3 pc_guest_arrive): TEST-ONLY, one-shot, refuses any role but CLIENT, binds a foreigner exactly like the INCOMING_FOREIGNER arrival (now_private = the passport, "
        "player_no = mPr_FOREIGNER; G3.1: mSDI_StartDataInitGuest = the PAK init without the gateway), NEVER arms pc_save_ready, NEVER writes a save or touches private_data[] (it only READS a template), spawns at the station",
        bg_poll != "" and bg_arr != "" and "pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in bg_arr and "static int l_done = 0;" in bg_poll and "Common_Set(now_private, pass);" in bg_arr
        and "Common_Set(player_no, mPr_FOREIGNER);" in bg_arr and "mSDI_StartDataInitGuest(gamePT)" in bg_arr and "MODE_PAK" not in bg and "pc_save_ready" not in bg
-       and "pc_save_write" not in bg and not re.search(r"Save_GetPointer\(private_data\[[^\]]*\]\)\s*->\s*\w+\s*=", bg) and "1979" in bg_arr and "760" in bg_arr and "mAc_PROFILE_RIDE_OFF_DEMO" in bg_arr)
+       and "pc_save_write" not in bg and not re.search(r"Save_GetPointer\(private_data\[[^\]]*\]\)\s*->\s*\w+\s*=", bg) and "pc_guest_station_door(&door_data);" in bg_arr and "next_scene_id = SCENE_FG;" in bg_door
+       and "exit_position.x = 1979;" in bg_door and "exit_position.z = 760;" in bg_door and "mAc_PROFILE_RIDE_OFF_DEMO" in bg_arr and bg_fin != "")
     mm = mask(read("pc/src/pc_main.c"))
     ck("G2 pc_main.c: --bootstrap-guest is parsed, documented in --help, and REFUSED (exit 2) without --connect or together with --bootstrap-resident; pc_vi.c polls it next to the resident poll",
        'strcmp(argv[i], "--bootstrap-guest") == 0' in mm and "const char* g_pc_bootstrap_guest = NULL;" in mm and "--bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID" in raw_main()
