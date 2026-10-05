@@ -23295,7 +23295,7 @@ static void pcnetgame_reset_host_world_state(void) {
  * host that still holds our stale slot replaces it at once). No pc_net_game_shutdown() is involved: the local save, the record lineage (s_crec_last), the
  * house canon (s_hcp), the txn nonce/seq, the catch id, the wildlife generation, the clock offset, the last appearance and the guest token are all kept.
  * Only armed (= reconnecting) once this process has reached READY at least once: before that the old behaviour (message + stay disconnected / shutdown on a
- * refusal) is unchanged. State machine: IDLE (READY, or never lost) -> WAIT (backoff 1,2,4,8,15,15.. s) -> ATTEMPT (HELLO out, 4 s to be transport-connected;
+ * refusal) is unchanged. State machine: IDLE (READY, or never lost) -> WAIT (backoff 1,2,3,3.. s) -> ATTEMPT (HELLO out, 4 s to be transport-connected;
  * afterwards no timeout: the host may park the claim) -> READY -> IDLE. Permanent refusals (REJECT, ACK mismatch, guest-token mismatch, local town changed,
  * 3 consecutive ADOPT_FAILED) -> GAVE_UP: link closed, role stays CLIENT (the client "no save" rules stay in force), persistent notice. */
 enum { RC_OFF = 0, RC_IDLE, RC_WAIT, RC_ATTEMPT, RC_GAVE_UP };
@@ -23326,7 +23326,7 @@ static int pcnetgame_rc_armed(void) {
 }
 
 static void pcnetgame_rc_schedule(const char* cause) {
-    static const unsigned backoff_s[5] = {1u, 2u, 4u, 8u, 15u};
+    static const unsigned backoff_s[4] = {1u, 2u, 3u, 3u}; /* 1, 2, then every 3 s */
     uint32_t delay;
     const uint32_t now = pcnetgame_now_ms();
     if (s_rc.state == RC_GAVE_UP) {
@@ -23347,7 +23347,7 @@ static void pcnetgame_rc_schedule(const char* cause) {
             return;
         }
     }
-    delay = backoff_s[s_rc.n < 4 ? s_rc.n : 4] * 1000u;
+    delay = backoff_s[s_rc.n < 3 ? s_rc.n : 3] * 1000u;
     s_rc.n++;
     s_rc.state = RC_WAIT;
     s_rc.next_ms = now + delay;

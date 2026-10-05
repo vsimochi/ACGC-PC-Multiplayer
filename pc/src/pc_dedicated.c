@@ -152,15 +152,7 @@ void pc_dedicated_early_console(void) {
         const int keep_out = pc_ded_std_redirected(STD_OUTPUT_HANDLE);
         const int keep_err = pc_ded_std_redirected(STD_ERROR_HANDLE);
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            HANDLE ph = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-            if (ph != INVALID_HANDLE_VALUE) {
-                static const char note[] = "[DEDICATED] the server console opened in its own window: type help / status / players / guests / save / stop THERE "
-                                           "(this shell is not the server's console).\r\n";
-                DWORD w = 0;
-                WriteFile(ph, note, (DWORD)(sizeof(note) - 1), &w, NULL);
-                CloseHandle(ph);
-            }
-            FreeConsole();
+            FreeConsole(); /* nothing is written to the launching shell any more: the "console ready" note goes to the NEW console below */
         }
         if (GetConsoleWindow() == NULL) {
             AllocConsole();
@@ -181,6 +173,7 @@ void pc_dedicated_early_console(void) {
             if (s_ded_out != NULL) {
                 setvbuf(s_ded_out, NULL, _IONBF, 0);
                 s_ded_interactive = 1;
+                fputs("[DEDICATED] Server console ready.\nType help / status / players / guests / save / stop\n", s_ded_out);
             }
         }
         return;
