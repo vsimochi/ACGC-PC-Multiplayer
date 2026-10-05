@@ -88,6 +88,8 @@ void VIWaitForRetrace(void) {
     {
         extern void pc_bootstrap_resident_poll(void);
         extern void pc_bootstrap_guest_poll(void); /* guests G2: --bootstrap-guest (TEST-ONLY, CLIENT only, default off; one-shot like the resident poll) */
+        extern void pc_bootstrap_resident_pid_poll(void); /* M-C: Play Online resident: resolves the slot from the PersonalID, then the poll below binds as usual */
+        pc_bootstrap_resident_pid_poll();
         pc_bootstrap_resident_poll();
         pc_bootstrap_guest_poll();
     }

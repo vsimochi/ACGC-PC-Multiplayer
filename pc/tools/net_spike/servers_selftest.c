@@ -172,13 +172,25 @@ int main(int argc, char** argv) {
 
     /* relaunch command line */
     check("relaunch args: character uuid", pc_relaunch_build_args("192.168.1.20", 7777, PC_RELAUNCH_CHARACTER, "ab12", b1, sizeof(b1)) &&
-                                               strcmp(b1, "--connect 192.168.1.20:7777 --character \"ab12\"") == 0);
+                                               strcmp(b1, "--connect 192.168.1.20:7777 --character \"ab12\" --town-fetch --online-ui") == 0);
     check("relaunch args: legacy profile", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_PROFILE, "roger", b1, sizeof(b1)) &&
-                                               strcmp(b1, "--connect 10.0.0.5:9000 --guest-profile \"roger\"") == 0);
-    check("relaunch args: default guest", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) && strcmp(b1, "--connect 10.0.0.5:9000 --guest") == 0);
+                                               strcmp(b1, "--connect 10.0.0.5:9000 --guest-profile \"roger\" --town-fetch --online-ui") == 0);
+    check("relaunch args: default guest", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) && strcmp(b1, "--connect 10.0.0.5:9000 --guest --town-fetch --online-ui") == 0);
     check("relaunch args: injection / bad values refused",
           !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "a\" --host", b1, sizeof(b1)) && !pc_relaunch_build_args("example.com", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) &&
               !pc_relaunch_build_args("10.0.0.5", 0, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) && !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "", b1, sizeof(b1)));
+
+    /* M-C: forwarded display options (whitelist only, a number for --framelimit) */
+    {
+        char* fa[] = { "ac", "--verbose", "--host", "--fullscreen", "--framelimit", "30", "--bootstrap-resident", "1", "--uber-shader", "--framelimit", "x;rm", "--no-framelimit" };
+        pc_relaunch_forward_capture((int)(sizeof(fa) / sizeof(fa[0])), fa);
+        check("forward: whitelisted options only", strcmp(pc_relaunch_forwarded(), " --verbose --framelimit 30 --uber-shader --no-framelimit") == 0);
+        check("relaunch args: forwarded options appended + --town-fetch", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "ab12", b1, sizeof(b1)) &&
+                  strcmp(b1, "--connect 10.0.0.5:9000 --character \"ab12\" --town-fetch --online-ui --verbose --framelimit 30 --uber-shader --no-framelimit") == 0);
+        check("relaunch args: injection still refused with forwarded options", !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "a b", b1, sizeof(b1)));
+        pc_relaunch_forward_capture(0, NULL);
+        check("forward: cleared", pc_relaunch_forwarded()[0] == 0);
+    }
 
     printf("RESULT passed=%d failed=%d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

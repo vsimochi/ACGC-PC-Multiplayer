@@ -17,6 +17,7 @@
 #include "pc_guest_profile.h"
 #include "pc_play_online_menu.h" /* M4: text entry routing for the title "Play Online" menu */
 #include "pc_servers.h"
+#include "pc_relaunch.h" /* M-C: pc_relaunch_forward_capture() */
 #include "pc_session.h" /* M2: characters / town memberships: --character, --characters, --character-import-profile */
 #include "pc_log.h"
 #include "pc_rng_domains_selftest.h"
@@ -599,6 +600,79 @@ static char     g_pc_net_host_ip[64] = "127.0.0.1";
  * (HOST-only) overrides settings.ini [Network] town_serve (g_pc_town_serve_override). */
 static const char* g_pc_town_dir = NULL;
 static int         g_pc_town_fetch = 0;
+/* M-C (Play Online): --online-ui (hidden, set by the relaunch): failure boxes of the pre-boot fetch offer Retry / Play offline / Quit. Without it the fetch keeps its
+ * silent fallback ladder (scripts / tests). g_pc_bootstrap_resident_pid(_set): a RESIDENT membership of the fetched town (20 BE PersonalID bytes) read by the thin
+ * pc_bootstrap_resident_pid_poll() in pc_m_card.c, which resolves the slot and then drives the unchanged --bootstrap-resident path. */
+static int         g_pc_online_ui = 0;
+int                g_pc_bootstrap_resident_pid_set = 0;
+unsigned char      g_pc_bootstrap_resident_pid[20];
+
+/* SDL box for a failed fetch: 0 = Retry, 1 = Play offline (only when `offline`), 2 = Quit (also when the box could not be shown). */
+static int pc_town_failure_box(const char* msg, int offline) {
+    SDL_MessageBoxButtonData btn[3];
+    SDL_MessageBoxData box;
+    int hit = -1, nb = 0;
+    memset(btn, 0, sizeof(btn));
+    btn[nb].flags = SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
+    btn[nb].buttonid = 0;
+    btn[nb++].text = "Retry";
+    if (offline) {
+        btn[nb].buttonid = 1;
+        btn[nb++].text = "Play offline";
+    }
+    btn[nb].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+    btn[nb].buttonid = 2;
+    btn[nb++].text = "Quit";
+    memset(&box, 0, sizeof(box));
+    box.flags = SDL_MESSAGEBOX_WARNING;
+    box.window = g_pc_window;
+    box.title = "Animal Crossing - Play Online";
+    box.message = msg;
+    box.numbuttons = nb;
+    box.buttons = btn;
+    if (SDL_ShowMessageBox(&box, &hit) != 0 || hit < 0) {
+        return 2;
+    }
+    return hit;
+}
+
+/* M-C: after the pre-boot fetch the town directory (save/mp/towns/<townkey>) is known. A STORE character with a RESIDENT membership of that town plays its resident
+ * (session join kind RESIDENT, the guest arrival is disarmed, the slot is bound by PersonalID once the save is loaded); a guest membership / none keeps the guest
+ * arrival (an existing character) or the Rover first-run creation (a new one). No town dir (legacy fallback) = no key = guest. */
+static void pc_main_resolve_membership(void) {
+    PCConnectSession* ss = pc_session();
+    const char* dir = pc_card_town_dir();
+    const char* base;
+    char role[16];
+    uint8_t pid[20];
+    if (ss->storage != PC_CHARACTER_STORAGE_STORE || ss->creating || dir == NULL) {
+        return;
+    }
+    base = strrchr(dir, '/');
+    if (strrchr(dir, '\\') != NULL && (base == NULL || strrchr(dir, '\\') > base)) {
+        base = strrchr(dir, '\\');
+    }
+    base = base != NULL ? base + 1 : dir;
+    if (!pc_town_key_valid(base)) {
+        return;
+    }
+    snprintf(ss->town_key, sizeof(ss->town_key), "%s", base);
+    if (!pc_character_membership_read(NULL, ss->character.uuid, base, role, pid)) {
+        printf("[PC] membership: character %s has no membership of town %s yet: arriving as a guest\n", ss->character.uuid, base);
+        return;
+    }
+    if (strcmp(role, "resident") != 0) {
+        printf("[PC] membership: character %s is a guest of town %s\n", ss->character.uuid, base);
+        return;
+    }
+    ss->join_kind = PC_SESSION_JOIN_RESIDENT;
+    memcpy(ss->resident_pid, pid, sizeof(pid));
+    memcpy(g_pc_bootstrap_resident_pid, pid, sizeof(pid));
+    g_pc_bootstrap_resident_pid_set = 1;
+    g_pc_bootstrap_guest = NULL; /* a resident is not a guest arrival */
+    printf("[PC] membership: character %s is a RESIDENT of town %s: the resident will be bound by PersonalID after the save loads (credential token: characters/%s/towns/%s/token.dat)\n",
+           ss->character.uuid, base, ss->character.uuid, base);
+}
 
 static void pc_town_title_progress(const char* text) {
     if (g_pc_window != NULL && text != NULL) {
@@ -678,6 +752,7 @@ static int pc_main_prepare_store_character(void) {
 }
 
 int main(int argc, char* argv[]) {
+    pc_relaunch_forward_capture(argc, argv); /* M-C: the whitelisted display / diagnostic options are forwarded by a Play Online relaunch */
     for (int i = 1; i < argc; i++) {
         /* pc_log: -debug*, --debug*, -debug-list, -logtime, -logfile PATH (see pc_log.h). -debug-list exits 0 and a bad value exits 2 HERE,
          * before any game init. Anything that is not a log flag falls through to the chain below untouched. */
@@ -1041,6 +1116,8 @@ int main(int argc, char* argv[]) {
             i++;
         } else if (strcmp(argv[i], "--town-fetch") == 0) {
             g_pc_town_fetch = 1;
+        } else if (strcmp(argv[i], "--online-ui") == 0) {
+            g_pc_online_ui = 1; /* hidden: set by the Play Online relaunch (interactive fetch failure boxes) */
         } else if (strcmp(argv[i], "--town-serve") == 0) {
             if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 && strcmp(argv[i + 1], "off") != 0)) {
                 fprintf(stderr, "[PC] --town-serve: REFUSED: the option needs on or off\n"
@@ -1653,15 +1730,43 @@ int main(int argc, char* argv[]) {
     if (g_pc_net_role == 2 && g_pc_town_fetch) {
         /* M-B: the PRE-BOOT town fetch (a window exists for the title progress and the error box; nothing of the game is initialised yet). */
         char town_err[700];
-        const int town_rc = pc_net_game_town_prefetch(g_pc_net_host_ip, g_pc_net_port, 30000u, pc_town_title_progress, g_pc_server_name, town_err, sizeof(town_err));
-        if (town_rc == PC_TOWN_PREFETCH_ERROR) {
-            fprintf(stderr, "[PC] --town-fetch: %s\n", town_err);
-            if (getenv("AC_TOWN_NO_MSGBOX") == NULL) { /* test hook: the box cannot be dismissed headlessly */
-                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Animal Crossing - town transfer", town_err, g_pc_window);
+        int town_rc;
+        for (;;) {
+            town_rc = pc_net_game_town_prefetch(g_pc_net_host_ip, g_pc_net_port, 30000u, pc_town_title_progress, g_pc_server_name, town_err, sizeof(town_err));
+            if (town_rc == PC_TOWN_PREFETCH_ERROR) {
+                fprintf(stderr, "[PC] --town-fetch: %s\n", town_err);
+                if (getenv("AC_TOWN_NO_MSGBOX") == NULL) { /* test hook: the box cannot be dismissed headlessly */
+                    if (g_pc_online_ui) {
+                        /* M-C: no usable town at all: Retry or Quit */
+                        if (pc_town_failure_box(town_err, 0) == 0) {
+                            continue;
+                        }
+                    } else {
+                        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Animal Crossing - town transfer", town_err, g_pc_window);
+                    }
+                }
+                pc_platform_shutdown();
+                return 3;
             }
-            pc_platform_shutdown();
-            return 3;
+            if ((town_rc == PC_TOWN_PREFETCH_CACHE || town_rc == PC_TOWN_PREFETCH_LEGACY) && g_pc_online_ui && getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+                /* M-C: the fetch failed but an older copy of the town exists: ask instead of silently playing it */
+                char msg[800];
+                int pick;
+                snprintf(msg, sizeof(msg), "Could not get the host's current town (%s).\n\nRetry, or play offline with the %s you already have?", town_err,
+                         town_rc == PC_TOWN_PREFETCH_CACHE ? "saved copy of this server's town" : "town in save/card_a");
+                pick = pc_town_failure_box(msg, 1);
+                if (pick == 0) {
+                    pc_card_reset_town_dir_for_test(); /* un-select the fallback cache so the retry can pick the (possibly different) fetched town */
+                    continue;
+                }
+                if (pick == 2) {
+                    pc_platform_shutdown();
+                    return 0;
+                }
+            }
+            break;
         }
+        pc_main_resolve_membership(); /* M-C: resident / guest / new, from characters/<uuid>/towns/<townkey>/membership.ini */
         pc_net_game_start_client(g_pc_net_host_ip, g_pc_net_port);
     }
     pc_disc_init();

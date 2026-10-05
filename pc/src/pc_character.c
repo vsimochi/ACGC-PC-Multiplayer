@@ -493,6 +493,56 @@ int pc_character_membership_write(const char* dir, const char* uuid, const char*
     return n > 0 && (size_t)n < sizeof(text) && write_atomic(path, text, (size_t)n, 0);
 }
 
+/* M-C: reads membership.ini. 1 = a valid file (role "guest" / "resident" and a 40-hex town_pid), 0 = absent / unreadable / malformed (never an error: the caller treats
+ * "none" as a guest). Read-only. */
+int pc_character_membership_read(const char* dir, const char* uuid, const char* townkey, char role_out[16], uint8_t town_pid[20]) {
+    char path[400], text[600];
+    size_t n = 0;
+    const char* p;
+    int have_role = 0, have_pid = 0;
+    role_out[0] = '\0';
+    if (!pc_character_membership_path(dir, uuid, townkey, path, sizeof(path)) || !file_exists(path) || !read_all(path, text, sizeof(text) - 1, &n)) {
+        return 0;
+    }
+    text[n] = '\0';
+    for (p = text; *p != '\0';) {
+        char line[200];
+        size_t l = 0;
+        char* eq;
+        while (*p != '\0' && *p != '\n' && l + 1 < sizeof(line)) {
+            if (*p != '\r') line[l++] = *p;
+            p++;
+        }
+        while (*p != '\0' && *p != '\n') p++;
+        if (*p == '\n') p++;
+        line[l] = '\0';
+        eq = strchr(line, '=');
+        if (line[0] == '#' || eq == NULL) continue;
+        {
+            char* k = line;
+            char* v = eq + 1;
+            char* ke = eq;
+            size_t vl;
+            while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+            *ke = '\0';
+            while (*v == ' ' || *v == '\t') v++;
+            vl = strlen(v);
+            while (vl > 0 && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) v[--vl] = '\0';
+            if (strcmp(k, "role") == 0 && (strcmp(v, "guest") == 0 || strcmp(v, "resident") == 0)) {
+                snprintf(role_out, 16, "%s", v);
+                have_role = 1;
+            } else if (strcmp(k, "town_pid") == 0 && strlen(v) == 40 && hex_decode(v, town_pid, 20)) {
+                have_pid = 1;
+            }
+        }
+    }
+    if (!have_role || !have_pid) {
+        role_out[0] = '\0';
+        return 0;
+    }
+    return 1;
+}
+
 /* ---------------- load / list ---------------- */
 
 int pc_character_load(const char* dir, const char* uuid, PCCharacter* out, char* err, size_t errcap) {

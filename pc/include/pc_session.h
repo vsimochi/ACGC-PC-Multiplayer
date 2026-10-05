@@ -26,6 +26,8 @@ typedef struct PCConnectSession {
     int         creating;             /* a NEW store character is being created in the Rover scene (nothing written yet) */
     PCCharacter character;            /* valid when storage != NONE */
     char        guest_spec[96];       /* the --bootstrap-guest spec built from the character */
+    uint8_t     resident_pid[20];     /* M-C: join_kind == RESIDENT: the PersonalID (20 BE bytes) of the resident this character plays in the fetched town */
+    char        town_key[PC_CHARACTER_TOWNKEY_LEN + 1]; /* M-C: the townkey of the fetched / READY town ("" until known) */
 } PCConnectSession;
 
 PCConnectSession* pc_session(void);
@@ -39,6 +41,11 @@ int pc_session_legacy_token_lookup(const uint8_t land_name[8], uint16_t land_id,
 
 /* M3: fills host / port / server_name from a saved server profile (a destination only; the character is independent of it). */
 void pc_session_apply_server(const PCServer* s);
+
+/* M-C: called ONCE per client connection when the host handshake reaches READY. Records client-side metadata only: servers.ini last_town (a UI hint) for the saved server of
+ * host:port, and - for a STORE character - characters/<uuid>/towns/<townkey>/membership.ini role=guest|resident with town_pid = `home_pid` (20 BE bytes). An existing
+ * resident membership is never downgraded to guest; a matching one is not rewritten. Nothing here is sent anywhere or decides anything for the host. */
+void pc_session_note_ready(const uint8_t land_name[8], uint16_t land_id, uint32_t terrain_hash, const uint8_t home_pid[20], int resident);
 
 /* Writes the first-run creation result as characters/<uuid>/character.ini (create-only). 1 = created, 0 = exists, -1 = error. */
 int pc_session_store_create_finish(const char* name, int gender, int face, char* err, size_t errcap);

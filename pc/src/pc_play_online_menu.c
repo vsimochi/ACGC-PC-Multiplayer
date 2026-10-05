@@ -534,9 +534,9 @@ void pc_play_online_menu_draw(struct game_s* game, int with_dim_backdrop) {
         pc_menu_draw_two_choice(game, "Keep", "Delete", s_del_sel, 160.0f);
     }
     if (s_msg[0] != '\0') {
-        snprintf(buf, sizeof(buf), "%.60s", s_msg);
+        snprintf(buf, sizeof(buf), "%.64s", s_msg);
         sanitize(buf);
-        if (s_msg_err) pc_menu_draw_centered(game, buf, 195.0f, 255, 120, 110, 255, 1.0f);
-        else pc_menu_draw_centered(game, buf, 195.0f, 255, 195, 85, 230, 1.0f);
+        if (s_msg_err) pc_menu_draw_centered(game, buf, 176.0f, 255, 120, 110, 255, 1.0f);
+        else pc_menu_draw_centered(game, buf, 176.0f, 255, 195, 85, 230, 1.0f);
     }
 }

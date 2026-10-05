@@ -693,6 +693,8 @@ Tests actually run (disposable copy `pc/build64/bin_fixture4_reconnect`, ONE exe
 
 Status: M1 (character store) + M2 (membership lookup, per-town tokens) are implemented; M3 (servers.ini + `--server`) and M4 (Play Online title menu, relaunch) are implemented; M2b is not (see "Remaining").
 
+M-C (phase 2): Play Online now relaunches with `--town-fetch`, resolves `membership.ini` after the fetch (resident -> bound by PersonalID, guest / none -> guest arrival or first-run creation), writes `membership.ini` + servers.ini `last_town` at READY, and shows Retry / Play offline / Quit boxes on fetch failures. Details and limits: docs/multiplayer-phase2-design.md, "M-C".
+
 **Player-owned vs town-owned.** A *character* is the player-owned portable seed of a guest: `name`, `gender`, `face`, `home_town`, `player_id`, `land_id` (+ a local-only `uuid`).
 Everything else is **town-owned per membership** and host-authoritative: pockets, item conditions, wallet, loan, bank, lotto, equipment, mail, quests, catalog, museum, maps,
 calendar, events/flags, house, mailbox, villager memories/friendship (keyed by the character's PID). Ambiguous items are town-owned for now: cloth/shirt (seeded from the

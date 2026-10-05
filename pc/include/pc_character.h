@@ -87,6 +87,8 @@ int  pc_character_token_path(const char* dir, const char* uuid, const char* town
 int  pc_character_membership_path(const char* dir, const char* uuid, const char* townkey, char* out, size_t cap);
 /* Writes membership.ini (atomic replace). role: "guest" | "resident". town_pid = 20 BE bytes. last_server may be NULL. */
 int  pc_character_membership_write(const char* dir, const char* uuid, const char* townkey, const char* role, const uint8_t town_pid[20], const char* last_server);
+/* M-C: reads membership.ini: 1 = valid (role_out = "guest" | "resident", town_pid filled), 0 = absent / malformed (treat as no membership). */
+int  pc_character_membership_read(const char* dir, const char* uuid, const char* townkey, char role_out[16], uint8_t town_pid[20]);
 
 /* characters.ini default = <uuid>. get: 1 + uuid in out[33], else 0. set: atomic replace; 1 / 0. */
 int pc_character_default_get(const char* dir, char out[PC_CHARACTER_UUID_LEN + 1]);

@@ -1243,6 +1243,52 @@ void pc_bootstrap_resident_poll(void) {
     PC_LOG(PCL_PLAYERS, "bootstrap resident %d bound\n", player_no);
 }
 
+/* M-C (Play Online): bind the local resident by PersonalID instead of by index. A character with a RESIDENT membership of the fetched town knows the resident's PID
+ * (membership.ini town_pid), not its slot. This thin entry waits for exactly the same moment pc_bootstrap_resident_poll() waits for (a live play_main GAME_PLAY, the
+ * entrance wipe settled), resolves the index with the vanilla comparator over private_data[] (an existing resident only), stores it in g_pc_bootstrap_resident and lets
+ * the UNCHANGED pc_bootstrap_resident_poll() (called right after it from pc_vi.c) drive the bind. One shot per process; the CLI index flow (--bootstrap-resident N) never
+ * arms it. A PID that matches no resident is logged once and nothing is bound. */
+void pc_bootstrap_resident_pid_poll(void) {
+    extern int g_pc_bootstrap_resident;                   /* pc_main.c */
+    extern int g_pc_bootstrap_resident_pid_set;           /* pc_main.c: 1 = armed by Play Online (membership role = resident) */
+    extern unsigned char g_pc_bootstrap_resident_pid[20]; /* pc_main.c: the 20 BE bytes of the resident PersonalID (name 8, land 8, player_id BE16, land_id BE16) */
+    static int l_done = 0;
+    PersonalID_c want;
+    Private_c* priv;
+    int i, found = -1, matches = 0;
+
+    if (l_done || !g_pc_bootstrap_resident_pid_set) {
+        return;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main || ((GAME_PLAY*)gamePT)->fb_wipe_mode != WIPE_MODE_NONE) {
+        return; /* the same wait as pc_bootstrap_resident_poll() */
+    }
+    l_done = 1;
+    if (mFRm_CheckSaveData() == FALSE) {
+        OSReport("[PC] --resident-by-pid: no valid town save is loaded\n");
+        return;
+    }
+    memcpy(want.player_name, g_pc_bootstrap_resident_pid, 8);
+    memcpy(want.land_name, g_pc_bootstrap_resident_pid + 8, 8);
+    want.player_id = (u16)(((u16)g_pc_bootstrap_resident_pid[16] << 8) | g_pc_bootstrap_resident_pid[17]);
+    want.land_id = (u16)(((u16)g_pc_bootstrap_resident_pid[18] << 8) | g_pc_bootstrap_resident_pid[19]);
+    priv = Save_GetPointer(private_data[0]);
+    for (i = 0; i < PLAYER_NUM; i++) {
+        if (mPr_CheckPrivate(&priv[i]) == TRUE && mPr_NullCheckPersonalID(&priv[i].player_ID) == FALSE && mPr_CheckCmpPersonalID(&want, &priv[i].player_ID) == TRUE) {
+            matches++;
+            if (found < 0) {
+                found = i;
+            }
+        }
+    }
+    if (matches != 1) {
+        OSReport("[PC] --resident-by-pid: %s (%d match(es) in this town): nothing is bound\n", matches == 0 ? "the resident of this membership is not in the town save" : "ambiguous resident", matches);
+        return;
+    }
+    OSReport("[PC] --resident-by-pid: resident PersonalID matches slot %d: binding through the --bootstrap-resident path\n", found);
+    g_pc_bootstrap_resident = found;
+}
+
 /* Guests G2: parses "NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]" (NAME / LAND 1..8 chars, space padded like every vanilla name; ids decimal or 0x hex, 1..0xFFFE).
  * Guests G1: the OPTIONAL trailing GENDER (0 = male, 1 = female: mPr_SEX_MALE / mPr_SEX_FEMALE) and FACE (0..7: mPr_FACE_TYPE0..7) are returned through
  * *gender_out / *face_out, -1 = not given (an empty field also means "not given": the value is then derived from the guest identity).

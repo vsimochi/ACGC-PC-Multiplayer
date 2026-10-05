@@ -23488,6 +23488,22 @@ static int pcnetgame_client_is_resident_player(void) {
     return Now_Private != NULL && (int)Common_Get(player_no) < (int)mPr_FOREIGNER;
 }
 
+/* M-C: at the first READY of a connection, record the client-side membership metadata (membership.ini role, servers.ini last_town) for the local player: its PersonalID is
+ * the home PID of a guest or the PersonalID of a resident (the same bytes the IDENTITY_EXT claims). Metadata only: nothing is sent and the host is not consulted. */
+static void pcnetgame_client_note_membership(void) {
+    uint8_t pid[PC_MP_GUEST_PID_SIZE];
+    if (Now_Private == NULL) {
+        return;
+    }
+    memcpy(pid, Now_Private->player_ID.player_name, PC_NETGAME_NAME_LEN);
+    memcpy(pid + 8, Now_Private->player_ID.land_name, PC_NETGAME_LAND_LEN);
+    pid[16] = (uint8_t)(Now_Private->player_ID.player_id >> 8);
+    pid[17] = (uint8_t)Now_Private->player_ID.player_id;
+    pid[18] = (uint8_t)(Now_Private->player_ID.land_id >> 8);
+    pid[19] = (uint8_t)Now_Private->player_ID.land_id;
+    pc_session_note_ready(s_client_claimed_town.land_name, s_client_claimed_town.land_id, s_client_claimed_town.terrain_hash, pid, pcnetgame_client_is_resident_player());
+}
+
 /* M-E: IDENTITY_TOKEN with the RESIDENT flag. Same rules as a guest token: only after our own RESIDENT claim, one per connection; a first contact persists the token (BEFORE anything
  * depends on it); a token that DIFFERS from the one this client PRESENTED means this is not the host that issued it: the client refuses the host. */
 static void pcnetgame_handle_client_resident_token(const PCNetGameIdentityTokenMsg* m) {
@@ -23966,6 +23982,7 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         s_client_link = PC_NETGAME_LINK_READY;
         printf("[NET] client: handshake complete, town verified (assigned peer id %u) -> READY\n",
                (unsigned)in.assigned_peer_id);
+        pcnetgame_client_note_membership(); /* M-C: membership.ini + servers.ini last_town (client-side metadata only) */
 
         {
             /* Stage 4C-1 (ordering-race fix): send our own appearance now, right after reaching
@@ -24707,6 +24724,9 @@ static int pcnetgame_towncl_fallback(const char* host, uint16_t port, const char
     struct stat st;
     char legacy[400];
     printf("[NET][TOWN] fetch FAILED / unavailable: %s\n", why);
+    if (err != NULL && err_cap > 0) {
+        snprintf(err, err_cap, "%s", why); /* M-C: for CACHE / LEGACY results err holds the reason of the failed fetch (the caller may offer Retry / Play offline) */
+    }
     if (pc_town_cache_find_by_server(NULL, host, port, key, &p)) {
         if (pc_card_set_town_dir(p.town_dir)) {
             printf("[NET][TOWN] fallback: using the cached town %s of %s:%u (%s)\n", key, host, (unsigned)port, p.town_dir);

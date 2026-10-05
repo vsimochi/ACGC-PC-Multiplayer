@@ -353,3 +353,50 @@ the 4 frozen reasons + 5), `test_identity_validation_src.py` (S2 / S3 / S11 now 
 M-C will have to pass a resident membership; promotion (M-F) is not started (PROMOTION_HANDOFF entries exist in the format but nothing writes or reads them); the credential is not internet-grade (bearer token over
 unencrypted UDP, trust on first use).
 
+### M-C (Play Online wiring): implemented (uncommitted, branch `multiplayer`)
+
+**Final flow.** Title -> Play Online -> server list (Add / Edit / Delete, text entry) -> Connect -> character list (existing / New character) -> the title process RELAUNCHES the exe with
+`--connect HOST:PORT --character UUID|--guest-profile NAME|--guest --town-fetch --online-ui [forwarded options]` and quits -> the new process fetches the town before boot (M-B) ->
+`pc_main_resolve_membership()` reads `characters/<uuid>/towns/<townkey>/membership.ini` for the fetched town (townkey = the town dir name) -> resident: `pc_session()->join_kind = RESIDENT`,
+the guest arrival is disarmed, `g_pc_bootstrap_resident_pid` is armed; guest / none: the existing guest arrival (a new character goes through the Rover first-run creation) -> after the save loads
+the new thin `pc_bootstrap_resident_pid_poll()` (pc_m_card.c, called from pc_vi.c right before the UNCHANGED `pc_bootstrap_resident_poll()`) finds the slot with `mPr_CheckCmpPersonalID` over
+`private_data[]` (exactly one match, else nothing is bound and a log line says so), stores it in `g_pc_bootstrap_resident` and the old path binds -> the M-E client claim (token of the
+character's per-town `token.dat`) goes out as before -> at READY `pc_session_note_ready()` (called from `pcnetgame_client_note_membership()`, pc_net_game.c) writes `membership.ini`
+(role guest|resident, town_pid = the local PersonalID; a recorded resident membership is never downgraded, a matching one is not rewritten) and servers.ini `last_town` (townkey) of the saved server with that address:port.
+
+**Relaunch decision (kept).** The role audit assumes the role is fixed at process start (host/client/none initialise differently before `boot_main`), and the pre-boot fetch must pick the Card-A
+directory before the save is loaded; starting a client inside the running title process would need both to be re-entrant. The cost is one extra process start (a second or two). The title process
+exits only after `CreateProcess` succeeded.
+
+**Relaunch arguments.** `--town-fetch` and the hidden `--online-ui` are always added. `--online-ui` only switches the failure boxes below (scripts and the existing tests never pass it, so the silent
+fallback ladder is unchanged). Forwarded from the title process: a FIXED whitelist (`--verbose`/`-v`, `--no-framelimit`, `--framelimit N` digits only, `--uber-shader`; `pc_relaunch_forward_capture`).
+`--fullscreen` is not a CLI option here: the window mode is a settings.ini value, which the new process reads again, so it is "forwarded" by construction. Name / host / port validation (no injection) is unchanged.
+
+**Failure UX.**
+- Fetch failed but an older copy exists (cache of this server or legacy `save/card_a`): SDL box "Retry / Play offline / Quit" (only with `--online-ui`). Retry un-selects the fallback directory
+  (`pc_card_reset_town_dir_for_test`, the only way to re-pick a possibly different town) and fetches again; Play offline continues with the old copy (the client then still tries the server and the usual
+  auto-reconnect / REJECT title message apply); Quit exits 0. The reason of the failed fetch is now filled into `err` for the CACHE / LEGACY results.
+- No usable town at all: box "Retry / Quit" (`--online-ui`) or the old OK box (without); exit 3 on Quit.
+- A server REJECT after boot: the existing title message. A failed relaunch (`CreateProcess` error): the Play Online menu stays open and shows the red message (the title process does not quit; by source, not exercised).
+
+**Visually verified (really).** `computer-use` could not be used (`request_access` resolves Start-menu apps only; the exe is not one, so no grant was possible). Instead the disposable
+`bin_fixture4_ui` exe was driven with synthetic key events (`keybd_event`) and window-only screenshots (`CopyFromScreen` of the game window / of the message box). Seen: title with
+"Play Online" entry; the server list (empty: "Add server / Back" + hint; with one server: "test  127.0.0.1:7777"); the add form (name, IPv4 address, port screens with titles, hint lines, caret);
+"Saved server" status; the server actions page (Connect / Edit / Delete / Back); the character list (empty store: "New character / Back"); the new-character name entry; and, after typing a name,
+the real relaunch and the fetch-failure box. Findings fixed: the status message at y=195 overlapped the copyright line (moved to y=176, 64 characters); the middle box button "Play offline (use the saved town)"
+was cut off and is now "Play offline" (the fixed build was not re-screenshotted). Observations not changed: the typed text is lower case only because the key injection sent no Shift; the title demo
+wipes the scene about every 60 s of inactivity but the menu stays open. NOT seen: a populated character list, the Delete confirm page, the Edit form, the resident bind visually,
+an in-game screenshot, the "Retry" round trip, the relaunch-failure message.
+
+**Tests.**
+- `test_servers.py` (extended `servers_selftest.c`): the new argument strings (`--town-fetch --online-ui`), forwarded options (whitelist, `--framelimit` digits, junk dropped), injection still refused: 78 / 78.
+- `test_play_online_real.py` (new, real host + real client in an EMPTY save dir on disposable `bin_fixture4_mc` / `bin_fixture4_mcclient`): guest path (no membership: fetch, guest arrival, READY, `membership.ini`
+  role = guest with the home PID, servers.ini `last_town`) and resident path (membership.ini role = resident + PID of fixture resident 1: resolved after the fetch, slot 1 bound by PID, RESIDENT claim under
+  `resident_tokens = tofu`, token stored in the character's `token.dat`, membership stays resident): 14 / 14.
+
+**Limitations / not done.**
+- The resident bind needs the PID to be in the fetched save; a stale membership (resident removed / town reset) logs "nothing is bound" and the process stays on the title screen (no UI for that yet).
+- Under `resident_tokens = off` hosts no token comes back; `membership.ini` is still written at READY (role from the local player).
+- Play offline keeps the client connecting in the background; no true "offline only" mode. A new character that never reaches READY writes no membership.
+- Guest-to-resident promotion (M-F) is not started; the character list does not show the membership role or the town.
+- The title attract demo restarts the scene after ~60 s idle (vanilla); a very slow text entry may meet the wipe.

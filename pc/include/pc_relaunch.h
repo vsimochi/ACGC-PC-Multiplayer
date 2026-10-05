@@ -17,7 +17,12 @@ enum {
     PC_RELAUNCH_DEFAULT_GUEST = 2 /* --guest               (the legacy default guest.ini; name ignored) */
 };
 
-/* Builds the argument tail (without the exe), e.g. `--connect 192.168.1.5:7777 --character "ab12..."`. `host` must be an IPv4 literal, `port` 1..65535 and `name`
+/* M-C: remembers the whitelisted options of the title process (--verbose / -v, --no-framelimit, --framelimit N (digits only), --uber-shader) so the relaunched client
+ * process gets them too. Call once from main(); everything else (including --fullscreen: it is a settings.ini value, read again by the new process) is not forwarded. */
+void pc_relaunch_forward_capture(int argc, char** argv);
+const char* pc_relaunch_forwarded(void); /* " --verbose ..." (leading space) or "" */
+
+/* Builds the argument tail (without the exe), e.g. `--connect 192.168.1.5:7777 --character "ab12..." --town-fetch --online-ui [forwarded]`. `host` must be an IPv4 literal, `port` 1..65535 and `name`
  * only [A-Za-z0-9-] (1..32) so no quoting / injection is possible. 1 = ok, 0 = refused. */
 int pc_relaunch_build_args(const char* host, int port, int kind, const char* name, char* out, size_t cap);
 
