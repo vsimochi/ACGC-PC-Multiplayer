@@ -241,8 +241,10 @@ def main():
        "every used actor STOP with demo_status 0, wallpaper / carpet changers idle",
        all(k in qt for k in ("my_room->state != 0", "my_room->demo_flag != 0", "my_room->msg_type != aMR_MSG_STATE_NONE", "my_room->requested_msg_type != aMR_MSG_STATE_NONE", "my_room->force_open_demo_flag != 0",
                              "my_room->emu_info.request_flag != 0", "my_room->bgm_info.reserve_flag != 0", "my_room->throw_item_lock_flag != 0", "my_room->pickup_info.pickup_flag != 0",
-                             "my_room->pickup_info.picking_up_flag != 0", "my_room->parent_ftr.ftrID != -1", "my_room->rsv_ftr[i].exist_flag != 0", "ftr_actor->state != aFTR_STATE_STOP || ftr_actor->demo_status != 0",
+                             "my_room->parent_ftr.ftrID != -1", "my_room->rsv_ftr[i].exist_flag != 0", "ftr_actor->state != aFTR_STATE_STOP || ftr_actor->demo_status != 0",
                              "my_indoor->wall_reserve.reserve_flag || my_indoor->floor_reserve.reserve_flag")))
+    ck("L quiescence (room side): the vanilla picking_up_flag (never cleared after a pickup) is NOT tested, else the room stays 'not quiet' after the first furniture pickup of a visit",
+       "picking_up_flag" not in qt and "my_room->pickup_info.pickup_flag != 0" in qt)
     ck("L quiescence (game side): GAME_PLAY running, no fade / wipe, a player-house room scene, submenu fully idle, no demo, message window hidden, player WAIT / WALK / RUN / DASH with no pending request, room quiet; >= 30 continuous GAME frames (game_frame based)",
        all(k in lrh for k in ("gamePT->exec != play_main", "play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE", "mSc_IS_SCENE_PLAYER_HOUSE_ROOM", "play->submenu.process_status != mSM_PROCESS_WAIT",
                              "play->submenu.menu_type != mSM_OVL_NONE", "play->submenu.mode != mSM_MODE_IDLE", "mDemo_CheckDemo() != FALSE", "!mMsg_Check_MainHide(mMsg_Get_base_window_p())",

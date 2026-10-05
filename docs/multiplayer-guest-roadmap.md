@@ -661,6 +661,10 @@ Known costs: when the client adopts the push it discards its own unsynced client
 
 Tests: `pc/tools/net_spike/test_admin_items_protocol.py` (REAL dedicated host process on the disposable `bin_fixture4` copy + a scripted FakeClient resident + the stdin console) and `test_admin_items_src.py` (source audit).
 
+### Live furniture sync: stale `picking_up_flag` fix (manual report)
+
+Manual two-client test: a placed dresser did not appear live for a visitor, and a picked-up dresser stayed visible for the visitor. Root cause found by code tracing (not by a real-room run): vanilla sets `pickup_info.picking_up_flag` when a pickup's shrink animation ends (`ac_my_room_move.c_inc` ~2551) and never clears it (it is only read inside the pickup states), but `aMR_pc_room_quiet` tested it, so after the FIRST furniture pickup of a visit the owner's room was never "quiet" again: no in-room OWNER_COMMIT, hence no CANON_PUSH for any later edit (a ghost on the visitor, and a placement that only travelled on exit). Fix: `aMR_pc_room_quiet` no longer tests `picking_up_flag` (`pickup_flag` already covers the whole pickup). The visitor's rebuild chain (compare, write order, destroy-without-write-back, anchor-cell actor creation incl. RSV_FE1F fillers and layer 1) was traced and found correct; the draw loop iterates `used_list`, so a rebuild without the dresser cannot leave a ghost. Second possible delay: the visitor's "new furniture within one cell of me" deferral (retried every tick, applies when the visitor steps away); its log now has its own counter (1 line per 32) instead of the 16-lines-per-session cap. Not changed: a switch-only change (lamp toggle) is not shown live. Tests: `test_house_sync_src.py` 64/64 (new check that `picking_up_flag` is absent from the quiet test). Real-room behaviour NOT verified; to separate causes in a manual run look for `OWNER_COMMIT ... APPLIED` in A's log and `live apply of house ... deferred` in B's.
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

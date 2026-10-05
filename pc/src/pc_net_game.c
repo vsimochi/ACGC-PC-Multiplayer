@@ -18554,7 +18554,8 @@ static int pcnetgame_hcl_live_apply(int h) {
                         const mActor_name_t nv = (&s_hs_native.floors[fl].layer_main)[l].items[z][x];
                         const mActor_name_t ov = (&s_hcl_cur.floors[fl].layer_main)[l].items[z][x];
                         if (nv != ov && (ITEM_IS_FTR(nv) || nv == (mActor_name_t)RSV_FE1F)) {
-                            if (s_hcl.log_n++ < 16u) {
+                            static uint32_t s_defer_log_n; /* own counter: the shared s_hcl.log_n cap (16 lines per session) hid later deferrals */
+                            if ((s_defer_log_n++ & 31u) == 0u) {
                                 printf("[NET][HOUSE] client: live apply of house %d deferred: the new layout puts furniture next to the visitor (cell %d,%d)\n", h, x, z);
                             }
                             return 0;

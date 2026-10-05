@@ -2063,7 +2063,10 @@ int aMR_pc_room_quiet(void) {
     if (my_room->state != 0 || my_room->demo_flag != 0 || my_room->msg_type != aMR_MSG_STATE_NONE ||
         my_room->requested_msg_type != aMR_MSG_STATE_NONE || my_room->force_open_demo_flag != 0 || my_room->emu_info.request_flag != 0 ||
         my_room->bgm_info.reserve_flag != 0 || my_room->throw_item_lock_flag != 0 || my_room->pickup_info.pickup_flag != 0 ||
-        my_room->pickup_info.picking_up_flag != 0 || my_room->leaf_info.exist_flag != 0 || my_room->parent_ftr.ftrID != -1) {
+        my_room->leaf_info.exist_flag != 0 || my_room->parent_ftr.ftrID != -1) {
+        /* picking_up_flag is deliberately NOT tested: vanilla sets it when a pickup's shrink animation ends and never clears it again (it is only read
+         * inside the pickup states), so testing it made the room permanently "not quiet" after the first furniture pickup of a visit and blocked every
+         * later in-room commit. pickup_flag covers the whole pickup (set at aMR_Furniture2ItemBag, cleared when the pickup state ends). */
         return FALSE;
     }
 
