@@ -97,8 +97,22 @@ def main():
        and 'pc_guest_arrive("--bootstrap-guest", g_pc_bootstrap_guest, err, sizeof(err))' in poll and "mSDI_" not in poll)
     ck("G3.1 pc_guest_arrive never arms pc_save_ready, never writes a save, never writes private_data / homes (only the read-only name check function reads private_data)",
        "pc_save_ready" not in arr and "pc_save_write" not in arr and "private_data" not in arr and "homes" not in arr)
-    ck("G3.1 resident path untouched: pc_bootstrap_resident_poll and the observer poll are byte-identical to the baseline blob",
-       all(S.body(cm, cf, n) == S.body(*fns(blob("pc/src/pc_m_card.c")), n) != "" for n in ("pc_bootstrap_resident_poll", "pc_host_observer_poll", "pc_guest_build_fresh_record", "pc_guest_resident_name_conflict")))
+    ck("G3.1 resident path untouched: pc_bootstrap_resident_poll, the observer poll and the resident-name conflict function are byte-identical to the baseline blob",
+       all(S.body(cm, cf, n) == S.body(*fns(blob("pc/src/pc_m_card.c")), n) != "" for n in ("pc_bootstrap_resident_poll", "pc_host_observer_poll", "pc_guest_resident_name_conflict")))
+    # pc_guest_build_fresh_record differs from the baseline ONLY by the shirt-helper extraction (the G6 first-run creation shares the shirt): substituting the helper call with the
+    # old inline expression (and re-declaring the old local) must give the baseline body byte for byte; the helper itself is pinned separately.
+    _bld_new = cb("pc_guest_build_fresh_record")
+    _bld_old = S.body(*fns(blob("pc/src/pc_m_card.c")), "pc_guest_build_fresh_record")
+    _call = "pc_guest_starter_shirt(home, gender)"
+    _inline = "(ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx)"
+    _h_line = "const u32 h = pc_guest_identity_hash(home);\n"
+    _bld_sub = _bld_new.replace(_call, _inline).replace(_h_line, _h_line + "    int shirt_idx = (int)((h >> 8) & 7u);\n")
+    _shirt = cb("pc_guest_starter_shirt")
+    ck("G3.1 pc_guest_build_fresh_record == the baseline body once the one pc_guest_starter_shirt() call is replaced by the old inline shirt expression (+ the old shirt_idx local); the helper "
+       "derives the same shirt: const u32 h = pc_guest_identity_hash(id); shirt_idx = (h >> 8) & 7; ITM_CLOTH000 + (female ? 8 : 0) + shirt_idx",
+       _bld_old != "" and _bld_new.count(_call) == 1 and _bld_sub == _bld_old
+       and "const u32 h = pc_guest_identity_hash(id);" in _shirt and "const int shirt_idx = (int)((h >> 8) & 7u);" in _shirt
+       and "(u16)(ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx)" in _shirt)
 
     # ------------------------------------------------------------------ G3.2
     logo = S.read("src/actor/ac_animal_logo.c")
@@ -119,10 +133,14 @@ def main():
     gcase = re.search(r"case aAL_PC_ITEM_GUEST:[^\n]*\n(.*?)break;", lb("aAL_pc_game_start_wait"), re.S).group(1)
     ck("G3.2 the Join as Guest case has the SAME three readiness conditions as Start Game (mLd_CheckStartFlag, aAL_wipe_end_check, mTD_tdemo_button_ok_check) and calls pc_guest_title_join",
        all(x in gcase for x in ("mLd_CheckStartFlag() == TRUE", "aAL_wipe_end_check(game) == TRUE", "mTD_tdemo_button_ok_check()", "pc_guest_title_join()")))
-    ck("G3.2 the item exists ONLY for a network client: the menu has 4 items only when pc_guest_title_item_visible(); otherwise the id table is the old Start / Options / Quit",
-       "return pc_guest_title_item_visible() ? 4 : 3;" in lb("aAL_pc_menu_count")
-       and "k_plain[3] = { aAL_PC_ITEM_START, aAL_PC_ITEM_OPTIONS, aAL_PC_ITEM_QUIT }" in re.sub(r"\s+", " ", lm)
-       and "k_guest[4] = { aAL_PC_ITEM_START, aAL_PC_ITEM_GUEST, aAL_PC_ITEM_OPTIONS, aAL_PC_ITEM_QUIT }" in re.sub(r"\s+", " ", lm))
+    mb = lb("aAL_pc_menu_build")
+    ck("G3.2 the item exists ONLY for a network client: the menu (aAL_pc_menu_build) adds aAL_PC_ITEM_GUEST only under `if (pc_guest_title_item_visible())` (the else branch is the Play Online "
+       "item, no role); Start, Options and Quit are UNCONDITIONAL, in that order (without a client the id list is Start / [Play Online] / Options / Quit); the count / item accessors use the builder",
+       mb != "" and re.search(r"if \(pc_guest_title_item_visible\(\)\) \{\s*items\[n\+\+\] = aAL_PC_ITEM_GUEST;\s*\} else if \(pc_play_online_menu_available\(\)\)", mb) is not None
+       and mb.count("aAL_PC_ITEM_GUEST") == 1
+       and re.search(r"items\[n\+\+\] = aAL_PC_ITEM_START;\s*if \(pc_guest_title_item_visible\(\)\)", mb) is not None
+       and re.search(r"\}\s*items\[n\+\+\] = aAL_PC_ITEM_OPTIONS;\s*items\[n\+\+\] = aAL_PC_ITEM_QUIT;\s*return n;", mb) is not None
+       and "aAL_pc_menu_build(items)" in lb("aAL_pc_menu_count") and "aAL_pc_menu_build(items)" in lb("aAL_pc_menu_item"))
     ck("G3.2 pc_guest_title_item_visible() == (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT); the join refuses any other role",
        re.sub(r"\s+", "", cb("pc_guest_title_item_visible")).endswith("returnpc_net_game_role()==PC_NETGAME_ROLE_CLIENT;") and "pc_net_game_role() != PC_NETGAME_ROLE_CLIENT" in join)
     def in_pc_enh(text, pos):
@@ -148,8 +166,9 @@ def main():
     ck("G3.2 ONE arrival function: the title join and the CLI poll both call pc_guest_arrive (tags join-as-guest / --bootstrap-guest)",
        'pc_guest_arrive("join-as-guest", spec, err, sizeof(err))' in join and 'pc_guest_arrive("--bootstrap-guest"' in poll and cb("pc_guest_arrive") != "")
     ck("G3.2 title failure path: every failure shows a message and returns 0 (pc_guest_title_fail), nothing exits: no exit / abort / SDL_Quit / g_pc_running in the join, the fail helper or the arrival",
-       "exit(" not in join + cb("pc_guest_title_fail") + arr and "abort(" not in join + arr and "g_pc_running" not in join + arr
-       and join.count("pc_guest_title_fail(") == 4 and join.count("return 0;") == 4 and join.count("return 1;") == 1)
+       "exit(" not in join + cb("pc_guest_title_fail") + arr and "abort(" not in join + arr and "g_pc_running" not in join + arr and "SDL_Quit" not in join + cb("pc_guest_title_fail") + arr
+       and join.count("pc_guest_title_fail(") == join.count("return 0;") == 6 and join.count("return 1;") == 1
+       and len(re.findall(r'pc_guest_title_fail\((?:[^;"]|"(?:[^"\\]|\\.)*")*\);\s*return 0;', join)) == 6)  # every `return 0;` immediately follows a pc_guest_title_fail(...) call
     # G4 pin update: G4 added the host-side `--max-guests N` option to pc_main.c (11 purely ADDED lines: the option parse + two help lines, no line removed or changed); the early
     # --bootstrap-guest / --guest validation is still untouched (deletions == 0), pc_vi.c is still untouched. Asserted again in test_guest_g4_src.py.
     ck("G3.2 CLI path keeps exit(2): the poll exits 2 on any arrival failure, the early validation in pc_main.c is untouched (--bootstrap-guest / --guest argument validation exits 2; "
@@ -161,7 +180,11 @@ def main():
        and re.search(r"scene_res != TRUE\) \{\s*Common_Set\(demo_profiles\[0\], mAc_PROFILE_NUM\);\s*Common_Set\(now_private, prev_private\);", arr)
        and arr.index("get_player_actor_withoutCheck(play) == NULL") < i_reload)
     ck("G3.2 the message is drawn by the title menu with the existing PC font helper pc_menu_draw_centered (word wrapped), read through pc_guest_title_message(), shown for 8 s",
-       "pc_guest_title_message()" in lb("aAL_pc_menu_draw") and "pc_menu_draw_centered(game, row" in lb("aAL_pc_menu_draw") and "time(NULL) + 8" in cm and "Could not join as a guest:" in logo)
+       "pc_guest_title_message()" in lb("aAL_pc_menu_draw") and "pc_menu_draw_centered(game, row" in lb("aAL_pc_menu_draw")
+       and "time(NULL) + 8" in cb("pc_guest_title_fail")
+       # the heading moved out of the title actor: it is set by pc_guest_title_fail() and drawn through pc_guest_title_message_head()
+       and 's_pc_guest_title_msg_head = "Could not join as a guest:";' in cb("pc_guest_title_fail") and "Could not join as a guest:" in card
+       and "pc_menu_draw_centered(game, pc_guest_title_message_head()" in lb("aAL_pc_menu_draw") and "pc_guest_title_message_head" in logo)
 
     # ------------------------------------------------------------------ G3.3
     ng_raw = S.read("pc/src/pc_net_game.c")
@@ -187,7 +210,7 @@ def main():
     ck("G3.3 the reload poll runs from the client record tick only after the record is SYNCED (after the adopt), and only reads state otherwise",
        ct.index("if (s_crec.state != PC_NETGAME_CRS_SYNCED) {") < ct.index("pcnetgame_look_reload_poll();"))
     ck("G3.3 no wire change by G3: message ids 1..66 (66 = M-F promotion handoff) (59..61 came with the furniture sync, 62..65 with the town transfer), wire_baseline green, protocol version untouched",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 67)))
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID == 66)
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("G3.3 wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))
@@ -202,16 +225,18 @@ def main():
 
     # ------------------------------------------------------------------ EOL
     eol_ok = True
-    for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", False), ("src/game/m_start_data_init.c", True), ("include/m_start_data_init.h", True), ("src/actor/ac_animal_logo.c", True),
-                      ("pc/tools/net_spike/test_guest_g3_src.py", False), ("pc/tools/net_spike/test_guest_g3_real.py", False), ("pc/tools/net_spike/test_guest_g1_src.py", False),
-                      ("pc/tools/net_spike/test_guest_src.py", False), ("pc/tools/net_spike/test_guest_g2_src.py", False)):
+    for rel in ("pc/src/pc_m_card.c", "pc/src/pc_net_game.c", "src/game/m_start_data_init.c", "include/m_start_data_init.h", "src/actor/ac_animal_logo.c",
+                "pc/tools/net_spike/test_guest_g3_src.py", "pc/tools/net_spike/test_guest_g3_real.py", "pc/tools/net_spike/test_guest_g1_src.py",
+                "pc/tools/net_spike/test_guest_src.py", "pc/tools/net_spike/test_guest_g2_src.py"):
+        # the INDEX holds LF (i/lf); the worktree file is uniform (all LF, or all CRLF under autocrlf), never mixed
+        eol = subprocess.run(["git", "-C", ROOT, "ls-files", "--eol", "--", rel], capture_output=True, check=True, timeout=60).stdout.decode()
         b = raw_bytes(rel)
         n_crlf, n_lf = b.count(b"\r\n"), b.count(b"\n")
-        good = (n_crlf == n_lf) if crlf else (n_crlf == 0)
+        good = eol.startswith("i/lf") and n_crlf in (0, n_lf)
         if not good:
-            print("   EOL mismatch:", rel, n_crlf, n_lf)
+            print("   EOL mismatch:", rel, eol.strip(), n_crlf, n_lf)
         eol_ok = eol_ok and good
-    ck("every edited file keeps its EOL (CRLF worktree files fully CRLF, LF files with no CR)", eol_ok)
+    ck("every edited file keeps its EOL (index LF; worktree files uniformly LF or uniformly CRLF, never mixed)", eol_ok)
     return L.summary_and_exit_code(results)
 
 

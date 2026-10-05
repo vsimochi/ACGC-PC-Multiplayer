@@ -48,6 +48,12 @@ def func_body(src, name):
     return src[i:j]
 
 
+def lock_ok(c_raw, kind, ret, next_test):
+    """The request_<kind> D3 gate is followed IMMEDIATELY by `if (pcnetgame_txn_begin_blocked()) { ... return N; }` (lock (a)), and that block ends before the next validity test."""
+    m = re.search(r'blocks\("%s"\)\) \{\s*%s[^\n]*\n\s*\}\s*(if \(pcnetgame_txn_begin_blocked\(\)\) \{.*?\n        %s)' % (kind, re.escape(ret), re.escape(ret)), c_raw, re.S)
+    return m is not None and next_test not in m.group(1) and m.group(1).count("if (pcnetgame_txn_begin_blocked())") == 1
+
+
 def main():
     results = []
     check = lambda d, c: L.check(d, bool(c), results)
@@ -73,7 +79,7 @@ def main():
           and d.get("PC_NETGAME_MSG_TXN_RESERVED_53") == 53 and d.get("PC_NETGAME_MSG_TXN_RESERVED_54") == 54 and d.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and d.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56
           and d.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and d.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58  # guests G1
-          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 66)))
+          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 67)) and wire_baseline.EXPECTED_MAX_MSG_ID == 66)
     enum_body = c_raw[c_raw.index("typedef enum PCNetGameMsgType {"):c_raw.index("} PCNetGameMsgType;")]
     check("W the enum comment documents that 53 and 54 are reserved for X2 (TXN_QUERY / TXN_STATUS)", "53 and 54 are reserved for X2" in enum_body and "TXN_QUERY" in enum_body)
     for t, size in (("PCNetGameTxnTag", 64), ("PCNetGameTxnCommitMsg", 72), ("PCNetGameTxnResultMsg", 76)):
@@ -198,9 +204,15 @@ def main():
     check("S the host's OWN resident (and a bad index / non-existing record) is refused by the writer's gate", "pcnetgame_host_own_resident_idx()" in idxok and "idx == own" in idxok
           and "exists == TRUE" in idxok and "idx >= 0 && idx < PLAYER_NUM" in idxok)
     wr_calls = len(re.findall(r"pcnetgame_rec_txn_write_inventory\(", c))
-    check("S the writer has exactly THREE callers: the X1 commit handler (after the world write), since X3 the X3 grant core (after the world commit) and, since town services, the "
-          "MUSEUM_DONATE / POLICE_CLAIM / SHOP_BUY / SHOP_SELL handler (after the service commit; it passes its computed post_wallet since the shop milestone); all pass the gate index",
-          wr_calls == 4 and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)") == 2
+    give = func_body(c, "pc_net_game_dedicated_give")
+    check("S the writer has exactly FIVE callers (+ its definition = 6 occurrences): the X1 commit handler (after the world write), since X3 the X3 grant core (after the world commit), since town services "
+          "the MUSEUM_DONATE / POLICE_CLAIM / SHOP_BUY / SHOP_SELL handler (after the service commit; it passes its computed post_wallet since the shop milestone) and, since the operator `give` command, the TWO "
+          "calls of pc_net_game_dedicated_give (the gift + the guest-store-failure rollback), which is gated by the same pcnetgame_rec_txn_idx_ok(idx), validates the post-image with "
+          "pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet) first and restamps last_pocket_rev (a client TXN built on the old base becomes STALE_IMAGE)",
+          wr_calls == 6 and give.count("pcnetgame_rec_txn_write_inventory(") == 2 and "pcnetgame_rec_txn_idx_ok(idx)" in give
+          and "pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet)" in give and "s_txn_res[idx].last_pocket_rev = slot->rev;" in give
+          and give.index("pcnetgame_rec_txn_idx_ok(idx)") < give.index("pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet)") < give.index("pcnetgame_rec_txn_write_inventory(")
+          and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)") == 2
           and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)") == 1)
     direct = re.findall(r"Save_Get\(private_data\)\[[^\]]*\]\s*(?:\.\w+(?:\[[^\]]*\])?)+\s*=[^=]", blk)
     check("S the X1 block has no direct private_data assignment, memcpy/memset into it, or mPr_ writer (the txn path never calls mPr_SetPossessionItem / "
@@ -235,8 +247,12 @@ def main():
           "s_txn_res" not in reset and "pcnetgame_txn_journal_clear" not in reset)
     calls = {n: ("pcnetgame_txn_journal_clear(" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_rec_on_town_changed", "pcnetgame_rec_on_world_reset", "pcnetgame_rec_slot")}
     gcalls = {n: ("pcnetgame_txn_journal_clear(PLAYER_NUM + g)" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pc_net_game_dedicated_guest_admin")}
-    check(f"J cleared by exactly the three spec'd events: town change, world reset, slot re-init ({calls}) + the guest-table lifecycle events (guests G1: a guest entry is installed / created / rolled back; G6.2: removed by the operator: {gcalls}); no other caller",
-          all(calls.values()) and all(gcalls.values()) and c.count("pcnetgame_txn_journal_clear(") == 9)  # declaration + definition + 3 calls + 3 guest-table calls + the G6.2 operator removal
+    prom = strip_comments(func_body(c_raw, "pc_net_game_dedicated_promote"))
+    pcalls = {"slot re-init of the new resident": prom.count("pcnetgame_txn_journal_clear(s);"), "guest removal": prom.count("pcnetgame_txn_journal_clear(PLAYER_NUM + g);")}
+    check(f"J cleared by exactly the three spec'd events: town change, world reset, slot re-init ({calls}) + the guest-table lifecycle events (guests G1: a guest entry is installed / created / rolled back; G6.2: removed by the operator: {gcalls}) "
+          f"+ the guest -> resident promotion (M-F: the new resident's slot is re-initialised and the guest entry removed, one call each: {pcalls}); no other caller",
+          all(calls.values()) and all(gcalls.values()) and prom != "" and all(v == 1 for v in pcalls.values())
+          and c.count("pcnetgame_txn_journal_clear(") == 11)  # declaration + definition + 3 calls + 3 guest-table calls + the G6.2 operator removal + 2 in the promotion (slot re-init, guest removal)
     check("J the journal is memory-only: nothing of it reaches the records file / GCI (no s_txn_res near pc_mp_records / store build)",
           "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_build")) and "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_write")))
     lib = open(os.path.join(HERE, "net_spike_lib.py"), encoding="utf-8").read()
@@ -353,9 +369,10 @@ def main():
           and all("pcnetgame_txn_cancel_queued(" not in func_body(c, n) for n in ("pcnetgame_txn_tick", "pcnetgame_handle_client_txn_result", "pcnetgame_txn_apply_applied")))
     check("C lock (a): request_pickup / request_drop / request_bury refuse while pcnetgame_txn_begin_blocked() (= txn busy OR a mail send in AWAIT_CLEAN) (pickup: return 1 = handled/nothing sent; drop and bury: return 0 + log), right after the D3 gate; "
           "exchange_request_drop inherits the refusal through request_drop",
-          re.search(r'blocks\("PICKUP"\)\) \{\s*return 1;[^\n]*\n\s*\}\s*if \(pcnetgame_txn_begin_blocked\(\)\) \{\s*return 1;', c_raw) is not None
-          and re.search(r'blocks\("DROP"\)\) \{\s*return 0;[^\n]*\n\s*\}\s*if \(pcnetgame_txn_begin_blocked\(\)\) \{[^}]*return 0;', c_raw) is not None
-          and re.search(r'blocks\("BURY"\)\) \{\s*return 0;[^\n]*\n\s*\}\s*if \(pcnetgame_txn_begin_blocked\(\)\) \{[^}]*return 0;', c_raw) is not None
+          # (the pickup refusal now holds a nested rate-limited log, so `[^}]*` no longer spans it: the block is `if (...blocked()) { ... <8-space> return N;` bounded before the next validity test)
+          lock_ok(c_raw, "PICKUP", "return 1;", "if (ut_x < 0")
+          and lock_ok(c_raw, "DROP", "return 0;", "if (pocket_slot_idx < 0")
+          and lock_ok(c_raw, "BURY", "return 0;", "if (pocket_slot_idx < 0")
           and "pc_net_game_request_drop(slot, hand_item, ut_x, ut_z)" in func_body(c, "pc_net_game_exchange_request_drop"))
     pl = open(os.path.join(ROOT, "src", "game", "m_player_lib.c"), "rb").read().decode("utf-8", "replace").replace("\r\n", "\n")
     sm = pl[pl.index("extern int mPlib_able_submenu_type1(GAME* game) {"):]
@@ -414,10 +431,15 @@ def main():
           and "np->inventory.pockets[t->slot] = (mActor_name_t)in->post_pockets[t->slot];" in imp and "(u32)mPr_WALLET_MAX" in imp
           and "for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {\n                np->inventory.pockets[i] = (mActor_name_t)in->post_pockets[i];" not in imp[:imp.index("if (is_exch) {")])
     tk2 = func_body(c, "pcnetgame_txn_tick")
-    check("R M2 a transaction unresolved for PC_NETGAME_TXN_RESET_MS (60 s) leaves the session through the normal exit (pc_net_game_shutdown), loudly "
+    rs = func_body(c, "pcnetgame_reset_client_session_state")
+    ll = func_body(c, "pcnetgame_client_on_link_lost")
+    check("R M2 a transaction unresolved for PC_NETGAME_TXN_RESET_MS (60 s) leaves the session (since the auto-reconnect work: pc_net_disconnect(PC_NET_INVALID_PEER) then the normal link-loss path "
+          "pcnetgame_client_on_link_lost(), which runs pcnetgame_reset_client_session_state() = memset(&s_ctxn) + pcnetgame_crec_reset(); no longer pc_net_game_shutdown()), loudly "
           "'[NET][TXN] unresolved >60 s: reconnect required', without touching the inventory; the caller returns on it; QUEUED counts too (first_ms)",
           "#define PC_NETGAME_TXN_RESET_MS    60000u" in c_raw and "(uint32_t)(now - s_ctxn.first_ms) >= PC_NETGAME_TXN_RESET_MS" in tk2
-          and "[NET][TXN] unresolved >%u s: reconnect required" in tk2 and "pc_net_game_shutdown();" in tk2 and "return 1;" in tk2
+          and "[NET][TXN] unresolved >%u s: reconnect required" in tk2 and "pc_net_game_shutdown" not in tk2 and "return 1;" in tk2
+          and re.search(r"pc_net_disconnect\(PC_NET_INVALID_PEER\);\s*pcnetgame_client_on_link_lost\(", tk2) is not None
+          and "pcnetgame_reset_client_session_state();" in ll and "memset(&s_ctxn, 0, sizeof(s_ctxn))" in rs and "pcnetgame_crec_reset();" in rs
           and "inventory." not in tk2 and "if (pcnetgame_txn_tick()) {" in func_body(c, "pcnetgame_client_tick"))
     hc = func_body(c, "pcnetgame_handle_host_txn_commit")
     sy = hc[hc.index("st->rec_state != PC_NETGAME_RECS_SYNCED || !s_host_world_ready"):hc.index("shape_ok = in->kind")]

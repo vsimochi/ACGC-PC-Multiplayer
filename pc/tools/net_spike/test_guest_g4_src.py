@@ -38,6 +38,15 @@ def numstat_wt(rel):
     return (int(out[0]), int(out[1])) if out else (0, 0)
 
 
+def hdr_additions_only(rel, old_ref=BASELINE, new_ref=None):
+    """old_ref vs new_ref (None = the working tree) for a header only later milestones touched: (removed line count, [added non-comment, non-blank lines]). Comment lines are `/*`, ` *`, `//`."""
+    out = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", old_ref] + ([new_ref] if new_ref else []) + ["--", rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
+    removed = [l for l in out.split("\n") if l.startswith("-") and not l.startswith("---")]
+    added = [l[1:].rstrip("\r") for l in out.split("\n") if l.startswith("+") and not l.startswith("+++")]
+    code = [l for l in added if l.strip() and not l.strip().startswith(("/*", "*", "//"))]
+    return len(removed), code
+
+
 def main():
     results = []
     ck = lambda d, c: L.check(d, bool(c), results)
@@ -129,8 +138,15 @@ def main():
        and "pc_net_game_dedicated_guest_counts" in S.read("pc/include/pc_dedicated.h"))
 
     # ------------------------------------------------------------------ W
-    ck("W no wire change by G4: message ids 1..66 (66 = M-F promotion handoff) unchanged since (59..61 came with the furniture sync, 62..65 with the town transfer), wire_baseline green, protocol header pc_net_game.h (G6.1 added exactly one function declaration, 5 lines, no typedef / define) and the transport (pc_net.c / pc_net.h) untouched vs the G3 commit",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 67)) and numstat_wt("pc/include/pc_net_game.h") == (5, 0)
+    ck("W no wire change by G4: message ids 1..66 (66 = M-F promotion handoff) unchanged since (59..61 came with the furniture sync, 62..65 with the town transfer), wire_baseline green, protocol header pc_net_game.h (since G3 only function prototypes were added: nothing removed, no typedef / define / struct / enum) and the transport (pc_net.c / pc_net.h) untouched vs the G3 commit",
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID == 66
+       # pc_net_game.h since the G3 commit: ADDITIONS ONLY (later milestones added function prototypes): nothing removed, every added non-comment line is a function prototype,
+       # no #define / typedef / struct / enum (so no wire struct, enum value or constant changed)
+       # (the COMMITTED state, G3 commit..HEAD: strict; uncommitted work in progress on top of HEAD may add declarations / constants but must still remove nothing and add no typedef / struct / enum)
+       and hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[0] == 0 and hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[1]
+       and all(re.match(r"^\w[\w\s\*]*\(.*\);", l) and not re.search(r"#\s*define|typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[1])
+       and hdr_additions_only("pc/include/pc_net_game.h", "HEAD")[0] == 0
+       and not any(re.search(r"typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", "HEAD")[1])
        and S.read("pc/include/pc_net_game.h").count("const char* pc_net_game_join_message(int* is_warning);") == 1
        and numstat("pc/src/pc_net.c") == (0, 0) and numstat("pc/include/pc_net.h") == (0, 0) and numstat("pc/src/pc_remote_player.c") == (0, 0))
     wb = []

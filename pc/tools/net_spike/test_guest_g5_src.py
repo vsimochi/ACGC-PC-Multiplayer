@@ -32,6 +32,16 @@ def blob(rel):
     return subprocess.run(["git", "-C", ROOT, "show", BASELINE + ":" + rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
 
 
+def blob_at(rel, ref):
+    return subprocess.run(["git", "-C", ROOT, "show", ref + ":" + rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+
+
+def numstat_to_wt(rel, ref):
+    """ref vs the WORKING TREE (--ignore-cr-at-eol): (added, removed)."""
+    out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", "--ignore-cr-at-eol", ref, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
+    return (int(out[0]), int(out[1])) if out else (0, 0)
+
+
 def numstat(rel):
     out = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", BASELINE, G5_COMMIT, "--", rel], capture_output=True, check=True, timeout=60).stdout.decode().split()
     return (int(out[0]), int(out[1])) if out else (0, 0)
@@ -78,9 +88,20 @@ def main():
     new_ret = """    /* G5.0: a guest (foreigner) has no home (now_home == NULL): its letters are never mailbox letters. */
     return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && Common_Get(now_home) != NULL &&
            mail >= Common_Get(now_home)->mailbox && mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;"""
-    ck("A.c m_tag_ovl.c: the ONLY change is the one pinned return statement (+3 / -2) gaining `Common_Get(now_home) != NULL` BEFORE the first dereference; undoing it yields the baseline blob byte for byte",
-       numstat("src/game/m_tag_ovl.c") == (3, 2) and tg_new.count(new_ret) == 1 and tg_old.count(old_ret) == 1 and tg_new.replace(new_ret, old_ret) == tg_old
-       and new_ret.index("!= NULL") < new_ret.index("now_home)->mailbox"))
+    # G5 commit (8ad36ca, `git log -- src/game/m_tag_ovl.c`: the G5 change itself): THE G5 change is the one pinned return statement (+3 / -2)
+    tg_g5 = blob_at("src/game/m_tag_ovl.c", G5_COMMIT)
+    ck("A.c m_tag_ovl.c: the G5 change (baseline..%s) is ONLY the one pinned return statement (+3 / -2) gaining `Common_Get(now_home) != NULL` BEFORE the first dereference; undoing it in the G5 blob yields "
+       "the baseline blob byte for byte; the worktree holds that guard exactly once" % G5_COMMIT,
+       numstat("src/game/m_tag_ovl.c") == (3, 2) and tg_g5.count(new_ret) == 1 and tg_old.count(old_ret) == 1 and tg_g5.replace(new_ret, old_ret) == tg_old
+       and new_ret.index("!= NULL") < new_ret.index("now_home)->mailbox") and tg_new.count(new_ret) == 1)
+    # Later (8772e19, house-state-across-disconnect): 6 `#ifdef TARGET_PC` house-edit-lock refusals were ADDED to the pocket->room put procs (+48 / -0 vs the G5 blob). Pure additions only:
+    # removing exactly those blocks from the working file must give the G5 blob byte for byte.
+    lock_rx = re.compile(r"#ifdef TARGET_PC\n    /\*[^\n]*\*/\n    if \(pc_net_game_client_room_edit_locked\(\)\) \{\n(?:        [^\n]*\n)*?    \}\n#endif\n")
+    lock_blocks = [mm.group(0) for mm in lock_rx.finditer(tg_new)]
+    ck("A.c m_tag_ovl.c vs the G5 blob: ONLY pure additions of %d `#ifdef TARGET_PC` house edit-lock refusal blocks (each: pc_net_game_client_room_edit_locked() -> pc_net_game_room_edit_denied() -> "
+       "warning window -> return), +48 / -0; the worktree minus those blocks IS the G5 blob" % 6,
+       numstat_to_wt("src/game/m_tag_ovl.c", G5_COMMIT) == (48, 0) and len(lock_blocks) == 6
+       and all("pc_net_game_room_edit_denied();" in b_ and "return;" in b_ for b_ in lock_blocks) and lock_rx.sub("", tg_new) == tg_g5)
     k = tg_new.index("static int mTG_client_mail_is_mailbox")
     ck("A.c the function is TARGET_PC-only (inside the existing #ifdef TARGET_PC block of the mail milestone 2 helpers)",
        tg_new.rfind("#ifdef TARGET_PC", 0, k) > tg_new.rfind("#endif", 0, k))

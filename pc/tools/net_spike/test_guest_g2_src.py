@@ -91,8 +91,9 @@ def main():
        "fresh_check" not in S.body(ng, nf, "pcnetgame_rec_handle_hello") and "fresh_check" not in S.body(ng, nf, "pcnetgame_rec_merge_into_save") and "fresh_check" not in S.body(ng, nf, "pcnetgame_rec_start_push"))
 
     # ---------------------------------------------------------------- B
-    ck("B pc_guest_profile.c is listed in pc/CMakeLists.txt PC_SOURCES (next to pc_mp_guests.c)",
-       re.search(r"set\(PC_SOURCES.*?\$\{CMAKE_CURRENT_SOURCE_DIR\}/src/pc_mp_guests\.c\s+\$\{CMAKE_CURRENT_SOURCE_DIR\}/src/pc_guest_profile\.c", cmake, re.S) is not None and cmake.count("pc_guest_profile.c") == 1)
+    _ps = re.search(r"set\(PC_SOURCES\b(.*?)\n\s*\)", cmake, re.S)  # the source list block (adjacency to pc_mp_guests.c is not required: other modules were inserted since)
+    ck("B pc_guest_profile.c is listed EXACTLY ONCE inside the set(PC_SOURCES ...) block of pc/CMakeLists.txt (and nowhere else in the file)",
+       _ps is not None and len(re.findall(r"/src/pc_guest_profile\.c\b", _ps.group(1))) == 1 and cmake.count("pc_guest_profile.c") == 1)
     ck("B the module is pure C: it includes only pc_guest_profile.h / pc_mp_guests.h and libc / OS headers (no game / decomp header)",
        re.findall(r'#include "([^"]+)"', pc_raw) == ["pc_guest_profile.h", "pc_mp_guests.h"] and re.findall(r'#include "([^"]+)"', ph_raw) == [])
     ck("B ids come from the OS CSPRNG (pc_mp_guests_random_bytes) with no weak fallback (no rand / time / srand anywhere)", "pc_mp_guests_random_bytes(b, sizeof(b))" in pcm
@@ -121,7 +122,7 @@ def main():
     for opt in ("--host", "--dedicated", "--host-observer", "--bootstrap-resident", "--bootstrap-guest"):
         ck("C --guest refuses %s (exit 2 + usage)" % opt, 'strcmp(argv[a], "%s") == 0' % opt in blk)
     ck("C the refusals print `--guest: REFUSED` + the usage line and `return 2`; CLIENT role (g_pc_net_role == 2, i.e. --connect) is required",
-       blk.count("return 2;") == 3 and "g_pc_net_role != 2" in blk and "usage: AnimalCrossing --connect HOST[:PORT] --guest" in blk and blk.count("[PC] --guest: REFUSED") == 3)
+       blk.count("return 2;") == 4 and re.search(r"if \(store_rc < 0\) \{\s*return 2;\s*\}", blk) is not None and "g_pc_net_role != 2" in blk and "usage: AnimalCrossing --connect HOST[:PORT] --guest" in blk and blk.count("[PC] --guest: REFUSED") == 3)
     ck("C the profile is loaded / created with the module and a bad profile exits 2 with the module's diagnostic (bad key named): pc_guest_profile_load_or_create(PC_GUEST_PROFILE_PATH, ...)",
        "pc_guest_profile_load_or_create_selected(&gp, gerr, sizeof(gerr))" in blk and "bad guest profile" in blk and "pc_guest_profile_spec(&gp, g_pc_guest_spec" in blk)
     _mc = S.mask(S.read("pc/src/pc_m_card.c"))
@@ -129,7 +130,7 @@ def main():
     _arr_poll = S.body(_mc, _mcf, "pc_bootstrap_guest_poll") + S.body(_mc, _mcf, "pc_guest_arrive")
     ck("C it then drives the SAME arrival path: g_pc_bootstrap_guest = g_pc_guest_spec (the --bootstrap-guest spec); pc_bootstrap_guest_poll is not duplicated (G3 update: the arrival now lives in the "
        "shared pc_guest_arrive; the profile module is referenced from pc_m_card.c only by the title-menu functions, never by the poll / arrival, and not at all by pc_vi.c)",
-       "g_pc_bootstrap_guest = g_pc_guest_spec;" in blk and "pc_guest_profile" not in _arr_poll and "PCGuestProfile" not in _arr_poll
+       "g_pc_bootstrap_guest = g_pc_guest_spec;" in blk and set(re.findall(r"pc_guest_profile\w*|PCGuestProfile\w*", _arr_poll)) <= {"pc_guest_profile_selected_path"}
        and not re.search(r"pc_guest_profile|g_pc_guest\b", S.read("pc/src/pc_vi.c")))
     ck("C --bootstrap-guest stays the TEST hook (its own parse + early validation unchanged)",
        'strcmp(argv[i], "--bootstrap-guest") == 0 && i + 1 < argc' in main_raw and "pc_bootstrap_guest_validate(g_pc_bootstrap_guest)" in main_raw)
@@ -158,7 +159,7 @@ def main():
 def wire_baseline_ok():
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
-    return bool(wb) and all(c for _d, c in wb) and sorted(dict(wire_baseline.c_message_ids(S.read("pc/src/pc_net_game.c"))).values()) == list(range(1, 66))
+    return bool(wb) and all(c for _d, c in wb) and sorted(dict(wire_baseline.c_message_ids(S.read("pc/src/pc_net_game.c"))).values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID == 66
 
 
 if __name__ == "__main__":

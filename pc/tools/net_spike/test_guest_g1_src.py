@@ -20,6 +20,7 @@ A new guest is its own independent character, never a copy of a resident. This a
 Tier: SOURCE AUDITED. Exit code 0 when all checks pass."""
 import os
 import re
+import subprocess
 import sys
 
 import net_spike_lib as L
@@ -82,16 +83,21 @@ def main():
     ck("A the resident-name refusal FAILS the arrival (G3: `return 0` with the reason in err; the CLI poll turns every failure into exit code 2 + stderr, the title menu into a message) before anything is bound",
        "equals the name of resident %d of this town" in card and arr.index("return 0;", i_res) < i_bld and "exit(" not in arr and poll_only.count("exit(2);") == 1
        and 'fprintf(stderr, "[PC] --bootstrap-guest: %s\\n", err);' in poll_only)
-    ck("A the arrival binding is unchanged: Common_Set(player_no, mPr_FOREIGNER), station spawn (1979, 760) with RIDE_OFF_DEMO; (G3.1) the init is mSDI_StartDataInitGuest(gamePT) -- NOT "
+    sd = cb("pc_guest_station_door")
+    ck("A the arrival binding is unchanged: Common_Set(player_no, mPr_FOREIGNER), station spawn (1979, 760) with RIDE_OFF_DEMO (the spawn lives in pc_guest_station_door(), called by the "
+       "non-create branch of the arrival); (G3.1) the init is mSDI_StartDataInitGuest(gamePT) -- NOT "
        "mSDI_StartDataInit(.., MODE_PAK) any more (that one sets the gateway); a failed init restores the previous binding",
-       "Common_Set(player_no, mPr_FOREIGNER);" in arr and "mSDI_StartDataInitGuest(gamePT)" in arr and "mSDI_StartDataInit(" not in arr and "MODE_PAK" not in arr and "1979" in arr and "760" in arr
+       "Common_Set(player_no, mPr_FOREIGNER);" in arr and "mSDI_StartDataInitGuest(gamePT)" in arr and "mSDI_StartDataInit(" not in arr and "MODE_PAK" not in arr
+       and sd != "" and "door_data->next_scene_id = SCENE_FG;" in sd and "door_data->exit_position.x = 1979;" in sd and "door_data->exit_position.z = 760;" in sd
+       and re.search(r"\} else \{\s*pc_guest_station_door\(&door_data\);", arr)
+       and "1979" in arr + sd and "760" in arr + sd
        and "mAc_PROFILE_RIDE_OFF_DEMO" in arr and "Common_Set(time.rtc_enabled, TRUE);" in arr and "Common_Set(now_private, prev_private);" in arr)
     ck("A never the vanilla new-player / new-town init, never a save writer, no house / home call in the guest poll",
        not re.search(r"mSDI_INIT_MODE_NEW|NEW_PLAYER|mSDI_StartInitNew|mSDI_StartDataInitObserver", poll) and "pc_save_ready" not in poll and "pc_save_write" not in poll
        and not re.search(r"homes|mHS_|mHm_|mNW_InitOneMyOriginal|mPr_LoadPak", poll) and set(re.findall(r"\bmEv_\w+\(", poll)) <= {"mEv_CheckGateway("})  # G3: the one read-only gateway probe for the log line
     ck("A the guest log markers the real-client test greps are intact (additive: a FRESH-record line before the arrival line)",
        "[PC] %s: FRESH guest record (not a copy of any resident): gender=%d face=%d shirt=0x%04X (%s), empty pockets / wallet / letters" in card and 'pc_guest_arrive("--bootstrap-guest"' in poll_only
-       and "bound as a foreigner, arriving at the station (SCENE_FG)" in card and "guest '%.8s' (home land id 0x%04X, player id 0x%04X)" in card)
+       and "bound as a foreigner, arriving at the %s" in card and '"station (SCENE_FG)"' in arr and '"Rover scene (SCENE_START_DEMO2)"' in arr and "guest '%.8s' (home land id 0x%04X, player id 0x%04X)" in card)
 
     # ---------------------------------------------------------------- B
     bld = cb("pc_guest_build_fresh_record")
@@ -99,12 +105,16 @@ def main():
        bld != "" and 0 < bld.find("mPr_ClearPrivateInfo(rec);") < bld.find("mPr_InitPrivateInfo(rec);") < bld.find("mPr_CopyPersonalID(&rec->player_ID, (PersonalID_c*)home);"))
     ck("B ... then exists = TRUE, reset_code = 0, gender / face assigned, the starter shirt via the explicit setter mPlib_change_player_cloth_info_lv2 with a deterministic item, default designs",
        "rec->exists = TRUE;" in bld and "rec->reset_code = 0;" in bld and "rec->gender = (s8)gender;" in bld and "rec->face = (s8)face;" in bld
-       and "mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)(ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx));" in bld and "pc_guest_init_designs(rec);" in bld
+       and "mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)pc_guest_starter_shirt(home, gender));" in bld
+       and "pc_guest_init_designs(rec);" in bld
        and bld.find("mPr_CopyPersonalID") < bld.find("rec->exists = TRUE;") < bld.find("mPlib_change_player_cloth_info_lv2") < bld.find("pc_guest_init_designs(rec);"))
-    ck("B gender / face / shirt come from the identity HASH when not given (bit 31 / bits 16..18 / bits 8..10), never from a random call",
-       "gender = (int)((h >> 31) & 1u);" in bld and "face = (int)((h >> 16) & 7u);" in bld and "int shirt_idx = (int)((h >> 8) & 7u);" in bld
-       and "const u32 h = pc_guest_identity_hash(home);" in bld)
-    guest_fns = ["pc_guest_parse_spec", "pc_guest_identity_hash", "pc_guest_init_designs", "pc_guest_build_fresh_record", "pc_guest_resident_name_conflict", "pc_guest_arrive", "pc_bootstrap_guest_poll"]
+    shirt = cb("pc_guest_starter_shirt")
+    ck("B gender / face / shirt come from the identity HASH when not given (bit 31 / bits 16..18 in the builder; bits 8..10 in the shared pc_guest_starter_shirt() helper the builder calls), never from a random call",
+       "gender = (int)((h >> 31) & 1u);" in bld and "face = (int)((h >> 16) & 7u);" in bld and "const u32 h = pc_guest_identity_hash(home);" in bld
+       and shirt != "" and "const int shirt_idx = (int)((h >> 8) & 7u);" in shirt and "const u32 h = pc_guest_identity_hash(id);" in shirt
+       and "(mActor_name_t)(ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx)" not in bld and "ITM_CLOTH000 + (gender == mPr_SEX_FEMALE ? 8 : 0) + shirt_idx" in shirt)
+    guest_fns = ["pc_guest_parse_spec", "pc_guest_identity_hash", "pc_guest_init_designs", "pc_guest_build_fresh_record", "pc_guest_resident_name_conflict", "pc_guest_arrive", "pc_bootstrap_guest_poll",
+                "pc_guest_starter_shirt", "pc_guest_station_door"]
     allg = "\n".join(cb(n) for n in guest_fns)
     ck("B DETERMINISTIC: no RANDOM / rand / fqrand / srand / time / mPr_SetNowPrivateCloth / mPr_GetRandom / RANDOM_F anywhere in the guest-creation code of pc_m_card.c "
        "(mPr_InitPrivateInfo itself draws the client RNG internally; every value it sets is overwritten, see the builder comment)",
@@ -270,24 +280,32 @@ def main():
     # ---------------------------------------------------------------- G
     ck("G the guest-creation code never writes Save_t private_data / homes: pc_m_card.c's guest functions contain no `Save_Set(private_data` / `Save_GetPointer(private_data` / homes / mHS_ / mHm_ calls",
        not re.search(r"Save_Set\(private_data|Save_GetPointer\(private_data|homes|mHS_|mHm_", allg.replace("PersonalID_c* p = &Save_Get(private_data)[i].player_ID;", "")))
-    ck("G the observer / resident bootstrap and the GCI writers are not touched by this change: pc_save_bswap.c and the m_private.c decomp files have no diff vs HEAD "
+    def git_out(*args):
+        return subprocess.run(["git", "-C", ROOT] + list(args), capture_output=True, text=True, check=True).stdout
+    # HEAD-relative checks of UNCOMMITTED changes went stale once the work was committed: the baseline is now 0c9bc72 (before the town cache / transfer /
+    # promotion work); `git diff <commit> -- f` compares that commit with the WORKTREE, so uncommitted edits are still caught.
+    bsw = git_out("diff", "-U0", "--ignore-cr-at-eol", "8044668^", "--", "pc/src/pc_save_bswap.c")
+    ck("G the observer / resident bootstrap and the GCI writers are not touched by this change: src/game/m_private.c, m_needlework.c and include/m_private.h have no diff vs 0c9bc72 "
+       "(worktree included); pc_save_bswap.c has no removed line since the furniture-sync parent (8044668^) and only GAINED the public pc_save_bswap_home() wrapper "
        "(G3: m_start_data_init.c IS edited, additively -- pinned strictly in test_guest_g3_src.py)",
-       all(not os.popen('git -C "%s" diff --name-only HEAD -- %s' % (ROOT, f)).read().strip() for f in ("src/game/m_private.c", "src/game/m_needlework.c", "include/m_private.h"))
-       # furniture sync: pc_save_bswap.c may only GAIN the public pc_save_bswap_home() wrapper (no removed line, nothing else)
-       and not [ln for ln in os.popen('git -C "%s" diff -U0 --ignore-cr-at-eol HEAD -- pc/src/pc_save_bswap.c' % ROOT).read().split("\n") if ln.startswith("-") and not ln.startswith("---")]
-       and "void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {" in os.popen('git -C "%s" diff -U0 --ignore-cr-at-eol HEAD -- pc/src/pc_save_bswap.c' % ROOT).read())
+       all(not git_out("diff", "--name-only", "0c9bc72", "--", f).strip() for f in ("src/game/m_private.c", "src/game/m_needlework.c", "include/m_private.h"))
+       and not [ln for ln in bsw.split("\n") if ln.startswith("-") and not ln.startswith("---")]
+       and "void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {" in bsw)
     eol_ok = True
-    for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", False), ("pc/src/pc_main.c", False), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
-                      ("pc/tools/net_spike/net_spike_lib.py", False), ("pc/tools/net_spike/test_guest_protocol.py", False), ("pc/tools/net_spike/test_guest_real_client.py", False), ("pc/tools/net_spike/test_guest_bootstrap_cli.py", False),
-                      ("pc/tools/net_spike/test_guest_persist.py", False), ("pc/tools/net_spike/test_guest_src.py", False), ("pc/tools/net_spike/test_guest_g1_src.py", False),
-                      ("pc/tools/net_spike/mp_guests_selftest.c", False)):
+    eol_files = ("pc/src/pc_m_card.c", "pc/src/pc_net_game.c", "pc/src/pc_main.c", "pc/src/pc_mp_guests.c", "pc/include/pc_mp_guests.h",
+                 "pc/tools/net_spike/net_spike_lib.py", "pc/tools/net_spike/test_guest_protocol.py", "pc/tools/net_spike/test_guest_real_client.py", "pc/tools/net_spike/test_guest_bootstrap_cli.py",
+                 "pc/tools/net_spike/test_guest_persist.py", "pc/tools/net_spike/test_guest_src.py", "pc/tools/net_spike/test_guest_g1_src.py",
+                 "pc/tools/net_spike/mp_guests_selftest.c")
+    for rel in eol_files:
+        # the INDEX holds LF (i/lf); the worktree file is uniform (all LF, or all CRLF under autocrlf): never a mixed file
+        eol = git_out("ls-files", "--eol", "--", rel)
         b = raw_bytes(rel)
         n_crlf, n_lf = b.count(b"\r\n"), b.count(b"\n")
-        good = (n_crlf == n_lf) if crlf else (n_crlf == 0)
+        good = eol.startswith("i/lf") and n_crlf in (0, n_lf)
         if not good:
-            print("   EOL mismatch:", rel, n_crlf, n_lf)
+            print("   EOL mismatch:", rel, eol.strip(), n_crlf, n_lf)
         eol_ok = eol_ok and good
-    ck("G every edited file keeps its EOL (CRLF worktree files fully CRLF, LF files with no CR)", eol_ok)
+    ck("G every edited file keeps its EOL (index LF; worktree files uniformly LF or uniformly CRLF, never mixed)", eol_ok)
     return L.summary_and_exit_code(results)
 
 

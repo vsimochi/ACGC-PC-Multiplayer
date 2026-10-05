@@ -395,25 +395,113 @@ def main():
     check(f"S9 save-layout sources unchanged vs HEAD ({layout_files}; modified: {moved})",
           not moved and all(os.path.isfile(os.path.join(REPO, f)) for f in layout_files))
     # --host-observer: the additions of that opt-in feature are fenced by `/* OBSERVER-BEGIN */ ... /* OBSERVER-END */` markers (their own audit is
-    # test_observer_src.py: no GCI / serialisation call inside them). The diff below is computed on the file WITHOUT those blocks, so the observer
+    # test_observer_src.py: no GCI / serialisation call inside them). The observer blocks are stripped from BOTH sides before diffing, so the observer
     # cannot hide a layout / serialisation change anywhere else in pc_m_card.c.
+    # The baseline is 0c9bc72 (the last commit before the town-cache / transfer / promotion work): HEAD itself is no longer a usable baseline
+    # (the working tree == HEAD, and stripping observer blocks on one side only made every observer line show up as a removal).
     import difflib
-    head_card = git("show", "HEAD:pc/src/pc_m_card.c").replace("\r\n", "\n")
-    with open(os.path.join(REPO, "pc/src/pc_m_card.c"), "rb") as f_card:
-        cur_card = re.sub(r"/\* OBSERVER-BEGIN \*/.*?/\* OBSERVER-END \*/\n?", "", f_card.read().decode("utf-8", "replace").replace("\r\n", "\n"), flags=re.S)
-    card_diff = "\n".join(difflib.unified_diff(head_card.split("\n"), cur_card.split("\n"), lineterm="", n=0))
-    touched = [l for l in card_diff.split("\n") if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+    strip_obs = lambda t: re.sub(r"/\* OBSERVER-BEGIN \*/.*?/\* OBSERVER-END \*/\n?", "", t, flags=re.S)
+    # M-A runtime paths: the constants became runtime accessors (pc_town_cache.c); normalise the OLD spelling to the new one (whole identifiers only,
+    # so PC_GCI_PATH_LEGACY is left alone).
+    def nz_paths(t):
+        t = re.sub(r"\bPC_GCI_TMP_PATH\b", "pc_gci_tmp_path()", t)
+        t = re.sub(r"\bPC_GCI_PATH\b", "pc_gci_path()", t)
+        return re.sub(r"\bPC_CARD_A_DIR\b", "pc_card_a_dir()", t)
+    old_card_raw = git("show", "0c9bc72:pc/src/pc_m_card.c")
+    base_card_raw = git("show", "a74740b:pc/src/pc_m_card.c")
+    cur_card_raw = read(os.path.join(REPO, "pc/src/pc_m_card.c"))
+    old_card = nz_paths(strip_obs(old_card_raw))
+    cur_card = strip_obs(cur_card_raw)
+    # (1) the three GCI (de)serialisers are byte-identical to the a74740b blob (observer blocks stripped on both sides)
+    pinned = {}
+    for fn in ("pc_save_write_gci_to", "pc_save_write_gci", "pc_save_read_gci"):
+        cb, bb = func_body(cur_card, fn), func_body(strip_obs(base_card_raw), fn)
+        pinned[fn] = bool(cb) and cb == bb
+    check(f"S9 pc_save_write_gci_to / pc_save_write_gci / pc_save_read_gci bodies byte-identical to a74740b ({pinned})", all(pinned.values()))
+    # (2) diff vs 0c9bc72: every changed layout / serialisation line must be inside a NEW function (not defined in 0c9bc72: pc_ts_*, pc_mp_promote_*,
+    # the town-image reader / sanitize-template code, ...), a PC_TS_ / s_ts_ top-level template declaration, or in the explicit allow-list below.
+    old_l, cur_l = old_card.split("\n"), cur_card.split("\n")
+    def_rx = re.compile(r"^(?:static )?[\w \*]+?[\s\*](\w+)\(.*\)\s*\{\s*$")
+    def fn_spans(lines):
+        spans, i = [], 0
+        while i < len(lines):
+            m = def_rx.match(lines[i])
+            if m and not lines[i].startswith(("if", "for", "while", "switch", "} ", " ")):
+                j = i
+                while j < len(lines) and lines[j] != "}":
+                    j += 1
+                spans.append((i, j, m.group(1)))
+                i = j
+            i += 1
+        return spans
+    old_spans, cur_spans = fn_spans(old_l), fn_spans(cur_l)
+    # top-level `_Static_assert(...);` statements (any line range from `_Static_assert(` to the line ending in `);`): compile-time only, they can write nothing
+    sa_lines, in_sa = set(), False
+    for k_, l_ in enumerate(cur_l):
+        if l_.startswith("_Static_assert("):
+            in_sa = True
+        if in_sa:
+            sa_lines.add(k_)
+            if l_.rstrip().endswith(");"):
+                in_sa = False
+    old_fns = {n for _, _, n in old_spans}
+    def encl(spans, idx):
+        for a_, b_, n in spans:
+            if a_ <= idx <= b_:
+                return n
+        return None
     layout_rx = re.compile(r"GCI_|pc_save_write_gci|pc_save_load|OTHERS_SIZE|mCD_|put_be|get_be|bswap|sizeof\((?:Save|CARDDir|Private)|"
-                           r"\b(?:fwrite|fread|fseek|calloc|malloc|memcpy)\(|\.length|\.gci")
-    # D3-4: the ONLY pc_save_write_gci line change allowed is the hook wrapper (the writer itself, pc_save_write_gci_to, is
-    # byte-identical): the one-line `return pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);` becomes `int ok = ...;` followed by
-    # the post-save hook (pc_net_game_record_after_gci_save, checked by test_d3_record_src.py P-checks).
-    d34_allowed = {"-    return pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);", "+    int ok = pc_save_write_gci_to(PC_GCI_PATH, PC_GCI_TMP_PATH);",
-                  "+        pc_net_game_record_after_gci_save(PC_GCI_PATH);"}
-    bad = [l.strip()[:90] for l in touched if not re.match(r"^[+-]\s*(/\*|\*|//)", l) and layout_rx.search(l)
-           and l.rstrip("\r") not in d34_allowed]
-    check(f"S9 pc_m_card.c diff vs HEAD ({len(touched)} changed lines) touches no GCI layout / serialisation line (offending: {bad})",
-          not bad)
+                           r"\b(?:fwrite|fread|fseek|calloc|malloc|memcpy|fopen|rename)\(|\.length|\.gci")
+    # D3-4 hook / M-G refusal / M-A runtime-path spellings of existing lines (exact, stripped):
+    allow = {
+        "int ok = pc_save_write_gci_to(pc_gci_path(), pc_gci_tmp_path());",                 # D3-4 hook wrapper (the writer is pinned above)
+        "pc_net_game_record_after_gci_save(pc_gci_path());",
+        "if (memcmp(file_data + GCI_OTHERS_OFFSET + (PC_TS_MARKER_OFF - PC_TS_OTHERS_OFF), PC_TS_MARKER_TEXT, PC_TS_MARKER_LEN) == 0) {",  # M-G (inside the pinned reader)
+        'pc_card_a_dir() "/DobutsunomoriP_MURA.gci",',                                         # M-A: pc_save_scan_gci_dir candidate paths (old / new spelling)
+        'pc_card_a_dir() "/8P-GAFE-DobutsunomoriP_MURA.gci",',
+        'snprintf(gci_name_a, sizeof(gci_name_a), "%s/DobutsunomoriP_MURA.gci", pc_card_a_dir());',
+        'snprintf(gci_name_b, sizeof(gci_name_b), "%s/8P-GAFE-DobutsunomoriP_MURA.gci", pc_card_a_dir());',
+        # M-A: the legacy-file migration is skipped inside a town dir (a pure guard around the existing pc_save_migrate_legacy() call)
+        "if (!pc_card_town_dir_active()) { /* M-A: a town dir must never pull save/DobutsunomoriP_MURA.gci into itself (the legacy file is left alone) */",
+        '#define pc_gci_path()       pc_card_a_dir() "/" PC_GCI_FILENAME',                    # normalisation artefact of the old PC_GCI_PATH define
+        '#define pc_gci_tmp_path()   pc_card_a_dir() "/" PC_GCI_FILENAME ".tmp"',
+    }
+    sm = difflib.SequenceMatcher(None, old_l, cur_l, autojunk=False)
+    offending, n_changed = [], 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        n_changed += (i2 - i1) + (j2 - j1)
+        for i in range(i1, i2):                      # removed lines: only the allow-list may match the layout regex
+            l = old_l[i]
+            if layout_rx.search(l) and not re.match(r"\s*(/\*|\*|//)", l) and l.strip() not in allow:
+                offending.append("-" + l.strip()[:70])
+        for j in range(j1, j2):
+            l = cur_l[j]
+            if not layout_rx.search(l) or re.match(r"\s*(/\*|\*|//)", l) or l.strip() in allow:
+                continue
+            fn = encl(cur_spans, j)
+            if fn is None:
+                if "PC_TS_" in l or "s_ts_" in l or j in sa_lines:   # top-level sanitize-template constants / buffers / compile-time _Static_asserts
+                    continue
+            elif fn not in old_fns:
+                continue
+            offending.append("+" + (fn or "<top>") + ": " + l.strip()[:70])
+    check(f"S9 pc_m_card.c diff vs 0c9bc72 (observers stripped both sides, paths normalised; {n_changed} changed lines) touches no GCI layout / serialisation line outside new functions + the allow-list (offending: {offending[:6]})",
+          not offending)
+    # (3) no new file-writing primitive outside the new functions: fopen(wb) / fwrite / rename counts per pre-existing function are unchanged
+    wr_rx = re.compile(r'fopen\([^;]*"[wa]b?\+?"|\bfwrite\(|\brename\(')
+    def wr_by_fn(lines, spans):
+        out = {}
+        for k, l in enumerate(lines):
+            if wr_rx.search(l) and not re.match(r"\s*(/\*|\*|//)", l):
+                n = encl(spans, k) or "<top>"
+                out[n] = out.get(n, 0) + 1
+        return out
+    wo, wc = wr_by_fn(old_l, old_spans), wr_by_fn(cur_l, cur_spans)
+    grown = {n: c for n, c in wc.items() if n in old_fns and c > wo.get(n, 0)}
+    check(f"S9 no new fopen(wb)/fwrite/rename in any function that existed at 0c9bc72 (grown: {grown}; new-function writers: "
+          f"{sorted(n for n in wc if n not in old_fns)})", not grown and "<top>" not in wc)
     return L.summary_and_exit_code(results)
 
 

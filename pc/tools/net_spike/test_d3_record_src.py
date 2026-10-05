@@ -446,8 +446,23 @@ def main():
     check("P hook: the only caller of pc_net_game_record_after_gci_save is that Card-A hook (Card B writes go through pc_save_write_gci_to directly and never persist records)",
           len(re.findall(r"pc_net_game_record_after_gci_save\(", strip_comments(mcard))) == 1
           and not re.search(r"pc_net_game_record_after_gci_save", strip_comments(read("src/main.c")) + strip_comments(vi) + strip_comments(pcmain)))
-    check("P hook: the authoritative save (periodic / early / shutdown) goes through pc_save_write_gci",
-          "return pc_save_write_gci();" in func_body(mcard, "pc_save_write_authoritative"))
+    # pc_save_write_authoritative is a thin WRAPPER (logs + the --dedicated save-result notify) around pc_save_write_authoritative_impl(), which holds the
+    # CLIENT-rejection and the GCI write: the impl ends with `return pc_save_write_gci();` and has exactly one other return (`return FALSE;`, the CLIENT branch).
+    auth = strip_comments(func_body(mcard, "pc_save_write_authoritative"))
+    auth_impl = strip_comments(func_body(mcard, "pc_save_write_authoritative_impl"))
+    impl_returns = re.findall(r"\breturn\b[^;]*;", auth_impl)
+    promote_body = strip_comments(func_body(c_raw, "pc_net_game_dedicated_promote"))
+    pcmain_src = read("src/main.c")
+    check("P hook: the authoritative save (periodic / early / shutdown / console / promotion) goes through pc_save_write_gci: pc_save_write_authoritative() = `int ok = pc_save_write_authoritative_impl();` "
+          "(+ log / notify), the impl ends with `return pc_save_write_gci();` and has exactly ONE other return (`return FALSE;` inside the CLIENT branch); every save site calls the wrapper",
+          "int ok = pc_save_write_authoritative_impl();" in auth and auth.count("pc_save_write_authoritative_impl(") == 1 and "return ok;" in auth
+          and auth_impl.rstrip().endswith("return pc_save_write_gci();") and sorted(impl_returns) == ["return FALSE;", "return pc_save_write_gci();"]
+          and re.search(r"if \(pc_net_game_role\(\) == PC_NETGAME_ROLE_CLIENT\) \{.*?return FALSE;\s*\}", auth_impl, re.S) is not None
+          and strip_comments(mcard).count("pc_save_write_authoritative_impl(") == 3  # declaration + the wrapper's call + the definition
+          and strip_comments(vi).count("pc_save_write_authoritative();") >= 3  # early (dirty client disconnect) / periodic / console save
+          and strip_comments(pcmain_src).count("pc_save_write_authoritative()") >= 1  # shutdown save
+          and "pc_save_write_authoritative()" in promote_body  # guest -> resident promotion: the GCI is durable before the guest entry is removed
+          and not re.search(r"pc_save_write_authoritative_impl", strip_comments(vi) + strip_comments(pcmain_src) + promote_body))
     store_write = func_body(c_raw, "pcnetgame_rec_store_write")
     store_build = func_body(c_raw, "pcnetgame_rec_store_build")
     check("P write-after-GCI: HOST only; persists only when the lineage was resolved for the town that is STILL loaded (resolved + town identity equal, NOT world-ready); busy-guarded; failure logged not fatal; unsaved markers cleared ONLY when the sidecar write succeeded / nothing to write",
