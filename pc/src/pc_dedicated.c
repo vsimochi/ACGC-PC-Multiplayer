@@ -456,6 +456,7 @@ static void pc_ded_cmd_help(void) {
            "  players  connected players: peer slot, link, class (RESIDENT idx / GUEST slot), name, puppet, idle ms\n"
            "  save     request an authoritative save at the next safe point (prints 'save: OK', 'save: FAILED (...)' or 'save: refused: ...')\n"
            "  guests   guest table: slot, name, home town, host town, confirmed, rev, bound peer, recovery (never the token)\n"
+           "  members  town memberships: residents and guests (kind, slot, confirmed)\n"
            "  guest-remove <slot|name> confirm        remove a guest and its character (guests.dat is backed up first; refused while the guest is connected)\n"
            "  guest-reset-token <slot|name> confirm   token lost: the next claim of that guest's key gets a NEW token for the SAME character (10 min, once; backed up)\n"
            "  finditem <text> [page]   search item names (case-insensitive); lines: 0xID - Name - Category, 15 per page\n"
@@ -589,6 +590,24 @@ static void pc_ded_cmd_guests(void) {
     }
     if (n == 0) {
         pc_ded_printf("[DEDICATED] guests: none stored (or this server is not a ready host)\n");
+    }
+    pc_ded_flush();
+}
+
+/* M2: `members`: the town's memberships (residents + guests) as the pure membership layer sees them. */
+static void pc_ded_cmd_members(void) {
+    PCNetGameDedicatedMemberInfo rows[16];
+    int i, n = pc_net_game_dedicated_members(rows, 16);
+    if (n == 0) {
+        pc_ded_printf("[DEDICATED] members: none (or this server is not a ready host)\n");
+        pc_ded_flush();
+        return;
+    }
+    pc_ded_printf("[DEDICATED] members of this town (%d):\n", n);
+    for (i = 0; i < n; i++) {
+        pc_ded_printf("  %s %d: name=\"%s\" home_town=\"%s\" kind=%s%s\n", rows[i].is_guest_row ? "guest slot" : "resident idx", rows[i].slot, rows[i].name,
+               rows[i].home_town, rows[i].kind == 3 ? "AMBIGUOUS" : rows[i].is_guest_row ? "GUEST" : "RESIDENT",
+               rows[i].is_guest_row ? (rows[i].confirmed ? " confirmed=yes" : " confirmed=no") : "");
     }
     pc_ded_flush();
 }
@@ -1243,6 +1262,8 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_players();
     } else if (strcmp(cmd, "guests") == 0) {
         pc_ded_cmd_guests();
+    } else if (strcmp(cmd, "members") == 0) {
+        pc_ded_cmd_members();
     } else if (strcmp(cmd, "guest-remove") == 0) {
         pc_ded_cmd_guest_admin(0, args);
     } else if (strcmp(cmd, "guest-reset-token") == 0) {

@@ -689,6 +689,54 @@ Limitations: the cause of a transport loss is generic (the transport does not sa
 
 Tests actually run (disposable copy `pc/build64/bin_fixture4_reconnect`, ONE execution of `pc/tools/net_spike/test_client_reconnect_real.py`): 18/18. T1 resident: host killed, `host link lost`, 3 attempts with delays 1000/2000/4000 ms, client alive, host restarted on the same port + save -> `reconnect successful ... resident 1`, `HELLO sent (have_last=1`, exactly one host puppet created after success, no CANNOT JOIN / violation. T2: host restarted with `--bootstrap-resident 1` -> REJECT -> `permanent refusal (host REJECT)`, no further attempt for 30 s, client still running. NOT run: the guest variant, test_reconnect_state.py, test_g7_disconnected_client_gates.py, test_version_mismatch.py, test_identity_validation.py, the full suites, any in-room / house reconnect, a UI screenshot. Manual tests to do: join as resident and as guest, kill and restart the host mid-play (watch the notice, puppets, inventory, an open house), cut the network for 3 s and for 30 s, restart the host with a different town (expect the refused notice), quit the client during a reconnect.
 
+## Characters and town memberships
+
+Status: M1 (character store) + M2 (membership lookup, per-town tokens) are implemented; M2b / M3 / M4 are not (see "Remaining").
+
+**Player-owned vs town-owned.** A *character* is the player-owned portable seed of a guest: `name`, `gender`, `face`, `home_town`, `player_id`, `land_id` (+ a local-only `uuid`).
+Everything else is **town-owned per membership** and host-authoritative: pockets, item conditions, wallet, loan, bank, lotto, equipment, mail, quests, catalog, museum, maps,
+calendar, events/flags, house, mailbox, villager memories/friendship (keyed by the character's PID). Ambiguous items are town-owned for now: cloth/shirt (seeded from the
+identity hash, then changes in play), Able designs, birthday, animal memory/remail, sunburn. An imported resident's name may contain non-ASCII game font codes, so the
+raw `name_bytes` (hex) are stored next to the display name.
+
+**Identity rules.** No wire change. The wire identity is the existing guest *home PersonalID* (name, home town "GuestVil", CSPRNG `player_id` + `land_id`, sent in
+IDENTITY_EXT, immutable). The `uuid` (128-bit CSPRNG) exists only on the player's PC (directory name / registry); it is never sent and never derived from an IP or a
+guest slot. Each membership has its own `town_pid`: for a guest membership it equals the home PID; for a resident membership it will be that resident's vanilla
+PersonalID (recorded only; resident authentication is M2b).
+
+**Storage** (`save/mp`, atomic writes, a corrupt file is never overwritten, moved or deleted):
+
+    characters/<uuid32hex>/character.ini                   uuid, name, name_bytes, home_town, home_town_bytes, player_id, land_id, gender, face, created, [legacy_profile]
+    characters/<uuid>/towns/<townkey>/membership.ini       role=resident|guest, town_pid (hex, 20 B), last_server (UI hint only)
+    characters/<uuid>/towns/<townkey>/token.dat            the existing PCMpGtk file format holding exactly ONE entry
+    characters.ini                                         default=<uuid> (last used)
+
+The registry is the directory scan (no index to corrupt). `townkey = <host land name 16 hex>_<land_id 4 hex>_<terrain_hash 8 hex>`: the host *town* identity, known before
+connecting because LAND_MISMATCH forces the local town to equal the host's. It is not the server address (an address can host another town tomorrow); `last_server` is
+only a hint. One token file per (character, town) avoids the defect of the legacy `guest_token*.dat`: `pc_mp_gtoken_put` silently recycles the oldest of its 4 slots
+when a 5th town is visited.
+
+**Migration is an adapter, never a move.** `guest.ini`, `guest_<name>.ini` and `guest_token*.dat` keep working byte for byte. They are listed as LEGACY characters
+(`--characters`). `--character-import-profile NAME` (NAME `""`/`default` = guest.ini) creates `characters/<uuid>` with the same identity, copies the matching token entries
+to `towns/<key>/token.dat` (+ `membership.ini`), records `legacy_profile`, and refuses if it already exists or the legacy token file is unreadable; the legacy files are only
+read. After an import `--guest-profile NAME` (or plain `--guest` for the default) resolves to the character; otherwise to the legacy file; otherwise first-run creation as
+before. Token lookup: store file first, then a read-only fallback to the legacy token file (copied forward on a hit).
+
+**CLI.** `--character NAME|UUIDPREFIX` (implies `--guest`; client only, needs `--connect`, not with `--guest-profile`; an unknown NAME starts the Rover first-run creation
+which writes `characters/<uuid>/character.ini`), `--characters` (list, exit 0), `--character-import-profile NAME` (import, exit 0). Resolution order for `--character`:
+imported `legacy_profile`, exact name (ambiguous => refused), uuid prefix (>= 4 hex), legacy profile file.
+
+**Membership lookup** (`pc_mp_membership.h`, pure): `(host town, PID)` is NONE / RESIDENT / GUEST / AMBIGUOUS; the same PID can be a resident of town A and a guest of town B.
+The guest table (`guests.dat`) is already keyed by (host town, home PID). The dedicated console command `members` lists residents and guests (kind, slot, confirmed).
+Host admission (`pcnetgame_host_process_identity`) is deliberately not rewired.
+
+**Session.** `pc_session.h` holds the minimal connect session (role, host, port, join kind, selected character + storage LEGACY|STORE). For a STORE character the token file is
+chosen per host town (`pc_session_select_town` installs it as the `pc_guest_token_path()` override); for LEGACY nothing changes.
+
+**Remaining:** M2b resident token authentication; guest -> resident promotion (blocked by town transfer); per-server town save dir; M3 `servers.ini` + connect descriptor;
+M4 Play Online UI. Known gaps of this step: the title-menu "Join as Guest" item refuses a STORE session (use the CLI); a few creation log lines still print the legacy profile
+path for a STORE character; `membership.ini` is written on import only (no reader yet).
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

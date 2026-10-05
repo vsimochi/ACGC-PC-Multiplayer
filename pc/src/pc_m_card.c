@@ -34,6 +34,7 @@
 #include "lb_rtc.h"
 #include "game.h"
 #include "pc_net_game.h"
+#include "pc_session.h" /* M2: pc_session() = a STORE character (characters/<uuid>/character.ini) instead of a legacy guest profile file */
 #include "pc_guest_profile.h" /* Guests G3.2: PCGuestProfile / pc_guest_profile_load_or_create (the title-menu "Join as Guest" item) */
 #include "pc_mp_guests.h" /* Guests G1: pc_mp_guests_name_valid() (the guest NAME rule shared with the host) */
 #include "m_string.h"   /* Guests G1: mString_Load_StringFromRom (default design names) */
@@ -1667,6 +1668,13 @@ void pc_guest_creation_finish(GAME_PLAY* play) {
     p.gender = (int)rec->gender;
     p.face = (int)rec->face;
     err[0] = '\0';
+    if (pc_session()->storage == PC_CHARACTER_STORAGE_STORE) {
+        /* M2: the session character is a STORE character: the creation result becomes characters/<uuid>/character.ini (create-only); no guest_<name>.ini */
+        cr = pc_session_store_create_finish(p.name, p.gender, p.face, err, sizeof(err));
+        if (cr == 1) {
+            printf("[PC] guest creation: CHARACTER %s CREATED in the character store (%s)\n", pc_session()->character.uuid, pc_session()->character.path);
+        }
+    } else
     cr = pc_guest_profile_create_exclusive(pc_guest_profile_selected_path(), &p, err, sizeof(err));
     if (cr == 0) {
         pc_guest_creation_die("the profile file appeared while the Rover scene was running; it was NOT replaced (restart to use it)");
@@ -1820,6 +1828,10 @@ int pc_guest_title_join(void) {
     int create = 0;
 
     s_pc_guest_title_msg[0] = '\0';
+    if (pc_session()->storage == PC_CHARACTER_STORAGE_STORE) {
+        pc_guest_title_fail("this session plays a stored character (--character / imported profile): it joins from the command line, not from this menu item");
+        return 0;
+    }
     if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
         pc_guest_title_fail("only a network client (--connect) can join as a guest");
         return 0;

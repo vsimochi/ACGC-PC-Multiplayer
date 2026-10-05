@@ -168,6 +168,8 @@
 #include "m_post_office.h" /* mail milestone 1: mPO_receipt_proc / mPO_count_mail / mPO_get_keep_mail_sum / mPO_delivery_one_address */
 #include "pc_save_bswap.h" /* D3: pc_save_bswap_private() for the canonical-BE record image */
 #include "pc_mp_records.h" /* D3-4: save/mp/records.dat sidecar (pure storage module) */
+#include "pc_session.h"        /* M2: pc_session_select_town() = the per-town token file of a STORE character (pc_guest_token_path() override) */
+#include "pc_mp_membership.h"  /* M2: pc_mp_membership_list() for the dedicated `members` command */
 #include "pc_guest_profile.h" /* guest profiles: pc_guest_token_path() = the selected profile's client token file (default save/mp/guest_token.dat) */
 #include "pc_mp_guests.h"  /* guests: save/mp/guests.dat host table + save/mp/guest_token.dat client token file (pure storage module) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
@@ -22592,11 +22594,24 @@ static void pcnetgame_client_build_ext(PCNetGameIdentityExtMsg* m, const PCNetGa
     home_be[17] = (uint8_t)m->home_player_id;
     home_be[18] = (uint8_t)(m->home_land_id >> 8);
     home_be[19] = (uint8_t)m->home_land_id;
+    if (pc_session_select_town(town->land_name, town->land_id, town->terrain_hash)) {
+        s_client_gtk_loaded = 0; /* M2: a STORE character keeps ONE token file per host town: another town => another file (LEGACY: never changes) */
+    }
     pcnetgame_client_gtk_load();
     i = pc_mp_gtoken_find(&s_client_gtk, town->land_name, town->land_id, town->terrain_hash, home_be);
     if (i >= 0) {
         m->token_present = 1;
         memcpy(m->token, s_client_gtk.e[i].token, PC_NETGAME_GUEST_TOKEN_LEN);
+    } else {
+        /* M2: a STORE character imported from a legacy profile: READ-ONLY fallback to the legacy token file, copied forward on a hit */
+        PCMpGtkEntry lg;
+        if (pc_session_legacy_token_lookup(town->land_name, town->land_id, town->terrain_hash, home_be, &lg)) {
+            const char* store_tp = pc_guest_token_path();
+            (void)pc_mp_gtoken_put(&s_client_gtk, &lg);
+            (void)pc_mp_gtoken_save(store_tp, &s_client_gtk);
+            m->token_present = 1;
+            memcpy(m->token, lg.token, PC_NETGAME_GUEST_TOKEN_LEN);
+        }
     }
 }
 
@@ -28404,6 +28419,67 @@ int pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out)
     out->recovery = pcnetgame_guest_recovery_active(slot);
     out->untrusted = s_guest_untrusted;
     return 1;
+}
+
+/* M2: the dedicated `members` command: residents + active guests of the host's current town through the pure membership layer. */
+int pc_net_game_dedicated_members(PCNetGameDedicatedMemberInfo* rows, int cap) {
+    uint8_t res_pid[4][20];
+    uint8_t res_exists[4];
+    static PCMpGuestFile gf;
+    PCMpMembership mm[4 + PC_MP_GUEST_SLOTS];
+    PCMpTownKey tk;
+    int i, n, out_n = 0;
+    if (rows == NULL || s_role != PC_NETGAME_ROLE_HOST || !s_guest_store_loaded) {
+        return 0;
+    }
+    memset(res_pid, 0, sizeof(res_pid));
+    memset(res_exists, 0, sizeof(res_exists));
+    memset(&gf, 0, sizeof(gf));
+    for (i = 0; i < 4; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        if (mPr_NullCheckPersonalID(p) == FALSE) {
+            memcpy(res_pid[i], p->player_name, PC_NETGAME_NAME_LEN);
+            memcpy(res_pid[i] + 8, p->land_name, PC_NETGAME_LAND_LEN);
+            res_pid[i][16] = (uint8_t)(p->player_id >> 8);
+            res_pid[i][17] = (uint8_t)p->player_id;
+            res_pid[i][18] = (uint8_t)(p->land_id >> 8);
+            res_pid[i][19] = (uint8_t)p->land_id;
+            res_exists[i] = 1;
+        }
+    }
+    for (i = 0; i < PC_NETGAME_GUEST_MAX && i < PC_MP_GUEST_SLOTS; i++) {
+        const PersonalID_c* k = &s_guest[i].key;
+        PCMpGuestEntry* e = &gf.e[i];
+        if (!s_guest[i].used) {
+            continue;
+        }
+        e->present = 1;
+        e->confirmed = s_guest[i].confirmed ? 1 : 0;
+        memcpy(e->pid, k->player_name, PC_NETGAME_NAME_LEN);
+        memcpy(e->pid + 8, k->land_name, PC_NETGAME_LAND_LEN);
+        e->pid[16] = (uint8_t)(k->player_id >> 8);
+        e->pid[17] = (uint8_t)k->player_id;
+        e->pid[18] = (uint8_t)(k->land_id >> 8);
+        e->pid[19] = (uint8_t)k->land_id;
+        memcpy(e->town_land_name, s_guest[i].town.land_name, PC_NETGAME_LAND_LEN);
+        e->town_land_id = s_guest[i].town.land_id;
+        e->town_terrain_hash = s_guest[i].town.terrain_hash;
+    }
+    memcpy(tk.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN);
+    tk.land_id = s_host_town.land_id;
+    tk.terrain_hash = s_host_town.terrain_hash;
+    n = pc_mp_membership_list(&tk, (const uint8_t(*)[20])res_pid, res_exists, &gf, mm, (int)(sizeof(mm) / sizeof(mm[0])));
+    for (i = 0; i < n && out_n < cap; i++) {
+        const int gr = mm[i].guest_slot >= 0 && mm[i].res_index < 0;
+        rows[out_n].kind = mm[i].kind;
+        rows[out_n].slot = gr ? mm[i].guest_slot : mm[i].res_index;
+        rows[out_n].is_guest_row = gr;
+        rows[out_n].confirmed = mm[i].confirmed;
+        pcnetgame_dedicated_ascii_name(mm[i].pid, rows[out_n].name);
+        pcnetgame_dedicated_ascii_name(mm[i].pid + 8, rows[out_n].home_town);
+        out_n++;
+    }
+    return out_n;
 }
 
 static int pcnetgame_dedicated_ieq(const char* a, const char* b) {

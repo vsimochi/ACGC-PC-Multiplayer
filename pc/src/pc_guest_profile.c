@@ -592,8 +592,17 @@ const char* pc_guest_profile_selected_path(void) {
     return buf;
 }
 
+static char s_token_override[300]; /* M2: a STORE character's per-town token file (pc_session.c); empty = the legacy file below, unchanged */
+
+void pc_guest_token_path_set_override(const char* path) {
+    snprintf(s_token_override, sizeof(s_token_override), "%s", path != NULL ? path : "");
+}
+
 const char* pc_guest_token_path(void) {
     static char buf[96];
+    if (s_token_override[0] != '\0') {
+        return s_token_override;
+    }
     if (!pc_guest_profile_file_path(NULL, pc_guest_profile_selected(), 1, buf, sizeof(buf))) {
         snprintf(buf, sizeof(buf), "%s", PC_GUEST_TOKEN_DEFAULT_PATH);
     }

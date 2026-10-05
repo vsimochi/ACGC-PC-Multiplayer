@@ -55,9 +55,15 @@ def main():
     # ---------------------------------------------------------------- B: token file
     ck("B pc_net_game.c no longer uses PC_MP_GUEST_TOKEN_PATH in code (it uses pc_guest_token_path()); it includes pc_guest_profile.h",
        "PC_MP_GUEST_TOKEN_PATH" not in ng and ng_raw.count("pc_guest_token_path()") >= 7 and '#include "pc_guest_profile.h"' in ng_raw)
-    ck("B the token file is LOADED (pc_mp_gtoken_load) and SAVED (pc_mp_gtoken_save) through the profile aware path, nowhere else",
+    ck("B the token file is LOADED (pc_mp_gtoken_load) and SAVED (pc_mp_gtoken_save) through the profile aware path, nowhere else: 1 load + 1 save in the client load/save helpers (pc_guest_token_path()) "
+       "and, since M2, exactly ONE more save = the read-only legacy-token fallback copy-forward into the STORE character's per-town file (store_tp = pc_guest_token_path())",
        "pc_mp_gtoken_load(pc_guest_token_path(), &s_client_gtk, &s_client_gtk_unreadable)" in ng and "pc_mp_gtoken_save(pc_guest_token_path(), &s_client_gtk)" in ng
-       and len(re.findall(r"pc_mp_gtoken_(?:load|save)\(", ng)) == 2)
+       and len(re.findall(r"pc_mp_gtoken_load\(", ng)) == 1 and len(re.findall(r"pc_mp_gtoken_save\(", ng)) == 2
+       and "const char* store_tp = pc_guest_token_path();" in ng and "pc_mp_gtoken_save(store_tp, &s_client_gtk)" in ng
+       and ng.count("pc_session_legacy_token_lookup(") == 1)
+    ck("B the per-town token override: pc_guest_token_path() itself is NOT redefined here; the ONLY place the active town is switched is pcnetgame_client_build_ext via pc_session_select_town (the token file is reloaded "
+       "only when it returned true; a LEGACY character never changes), and the legacy token file is only READ (lookup) by the fallback",
+       ng.count("pc_session_select_town(") == 1 and re.search(r"if \(pc_session_select_town\(town->land_name, town->land_id, town->terrain_hash\)\) \{\s*s_client_gtk_loaded = 0;", ng))
     ck("B no other source file references the token path macro for a client file open (pc_mp_guests.h keeps the macro for the default only)",
        not [f for f in os.listdir(os.path.join(S.ROOT, "pc", "src")) if f.endswith((".c", ".cpp")) and f != "pc_mp_guests.c" and "PC_MP_GUEST_TOKEN_PATH" in S.mask(S.read("pc/src/" + f))])
 
@@ -79,12 +85,16 @@ def main():
             n = len(re.findall(r"\bpc_guest_profile_select\(", S.mask(S.read("pc/src/" + fn))))
             if n:
                 sel_calls[fn] = n
-    ck("C ONE source of truth: the selection is set by exactly one call site, in pc_main.c's option parsing (calls: %s)" % sel_calls, sel_calls == {"pc_main.c": 1})
+    prep = S.body(mm, S.functions(mm), "pc_main_prepare_store_character")
+    ck("C ONE source of truth: the selection is set by exactly TWO call sites, both in pc_main.c: (1) the --guest-profile option parsing, (2) pc_main_prepare_store_character selecting the LEGACY profile that a "
+       "--character names / that a store-less legacy character resolves to (calls: %s)" % sel_calls,
+       sel_calls == {"pc_main.c": 2} and len(re.findall(r"\bpc_guest_profile_select\(", mm)) == 2 and len(re.findall(r"\bpc_guest_profile_select\(", prep)) == 1
+       and "(void)pc_guest_profile_select(c.legacy_profile);" in prep and "c.storage == PC_CHARACTER_STORAGE_LEGACY" in prep and "(void)pc_guest_profile_select(argv[i + 1]);" in mm)
     ck("C the title actor still never touches the profile module (only pc_guest_title_* in pc_m_card.c)", "pc_guest_profile" not in logo and "pc_guest_title_label()" in logo)
 
     # ---------------------------------------------------------------- D: flags
     i_opt = mm.index('strcmp(argv[i], "--guest-profile") == 0')
-    opt = mm[i_opt:mm.index('} else if (strcmp(argv[i], "--host-observer") == 0)', i_opt)]
+    opt = mm[i_opt:mm.index('} else if (strcmp(argv[i], "--character") == 0)', i_opt)]
     ck("D --guest-profile is parsed next to --guest: it consumes the value, implies g_pc_guest = 1, validates with pc_guest_profile_name_check and selects with pc_guest_profile_select",
        "g_pc_guest = 1;" in opt and "i++;" in opt and "pc_guest_profile_name_check(argv[i + 1], perr, sizeof(perr))" in opt and "pc_guest_profile_select(argv[i + 1])" in opt)
     ck("D a missing / empty value, an invalid name and a repeated option each `return 2` with a `--guest-profile: REFUSED` diagnostic and a usage line",
@@ -93,9 +103,11 @@ def main():
     start = mm.index("if (g_pc_guest) {")
     blk = main_raw[start:main_raw.index("/* Guests G2: --bootstrap-guest is a CLIENT-only TEST hook", start)]
     ck("D --guest-profile shares the --guest exclusivity block unchanged: refuses --host / --dedicated / --host-observer / --bootstrap-resident / --bootstrap-guest and a missing --connect, "
-       "exit 2 + the usage line (which now mentions [--guest-profile NAME])",
+       "exit 2 + the usage line (which now mentions [--guest-profile NAME]); since M2 the block also holds the 4th `return 2` of a refused store character (pc_main_prepare_store_character < 0, "
+       "its message is printed inside pc_main_prepare_store_character, so 3 messages stay in the block), and the block is ALSO the one --character goes through (it sets g_pc_guest = 1)",
        all('strcmp(argv[a], "%s") == 0' % o in blk for o in ("--host", "--dedicated", "--host-observer", "--bootstrap-resident", "--bootstrap-guest")) and "g_pc_net_role != 2" in blk
-       and blk.count("return 2;") == 3 and blk.count("[PC] --guest: REFUSED") == 3 and "usage: AnimalCrossing --connect HOST[:PORT] --guest [--guest-profile NAME]" in blk)
+       and "const int store_rc = pc_main_prepare_store_character();" in blk and "if (store_rc < 0) {" in blk and blk.index("g_pc_net_role != 2") < blk.index("pc_main_prepare_store_character()")
+       and blk.count("return 2;") == 4 and blk.count("[PC] --guest: REFUSED") == 3 and "[PC] --guest: REFUSED: bad character" in mm and "usage: AnimalCrossing --connect HOST[:PORT] --guest [--guest-profile NAME]" in blk)
     ck("D the exclusivity block runs before the profile file is touched (the load is after the conflict / role refusals) and before --bootstrap-guest validation",
        blk.index("conflict != NULL") < blk.index("g_pc_net_role != 2") < blk.index("pc_guest_profile_load_or_create_selected") and mm.index("if (g_pc_guest) {") < mm.index("pc_bootstrap_guest_validate(g_pc_bootstrap_guest)"))
     ck("D --help documents --guest-profile (rule, files, default unchanged) and the header comment of the option exists",

@@ -14,6 +14,7 @@
 #include "pc_host_observer.h"
 #include "pc_dedicated.h"
 #include "pc_guest_profile.h"
+#include "pc_session.h" /* M2: characters / town memberships: --character, --characters, --character-import-profile */
 #include "pc_log.h"
 #include "pc_rng_domains_selftest.h"
 #include "m_kankyo.h"
@@ -546,6 +547,13 @@ const char* g_pc_bootstrap_guest = NULL;
 static int g_pc_guest = 0;
 static char g_pc_guest_spec[96];
 
+/* M2 (characters): --character NAME|UUIDPREFIX plays a character of the local store save/mp/characters (implies --guest; client only); --characters lists them
+ * (+ the legacy guest profiles) and exits 0; --character-import-profile NAME copies a legacy guest profile (NAME "" / default = guest.ini) into the store, prints
+ * the result and exits 0. The legacy files are never moved or deleted. See pc_character.h and docs/multiplayer-guest-roadmap.md. */
+static const char* g_pc_character_spec = NULL;
+static const char* g_pc_character_import = NULL;
+static int g_pc_characters_list = 0;
+
 /* First-run guest creation: --guest-profile NAME whose guest_<name>.ini does NOT exist plays the REAL vanilla Rover scene (name, gender, face) and the result is
  * written to the profile (pc_m_card.c pc_guest_creation_finish). --guest-creation-test NAME,GENDER,FACE is the TEST-ONLY hook that types those answers
  * without any UI once the Rover scene runs (requires --guest-profile; inert when the profile already exists). NULL = off. */
@@ -561,6 +569,77 @@ int g_pc_host_observer = 0;
 static int      g_pc_net_role = 0; /* 0 = none/single-player, 1 = host, 2 = client */
 static uint16_t g_pc_net_port = 7777;
 static char     g_pc_net_host_ip[64] = "127.0.0.1";
+
+/* M2: decide whether this --guest / --guest-profile / --character session plays a STORE character. Returns 1 = handled (store character: the --bootstrap-guest spec
+ * is built, a new one is armed for the Rover scene), 0 = use the LEGACY guest profile flow unchanged (also when --character names a legacy profile: it is
+ * selected like --guest-profile), -1 = refused (message printed). */
+static int pc_main_prepare_store_character(void) {
+    PCConnectSession* ss = pc_session();
+    PCCharacter c;
+    PCGuestProfile gp;
+    char err[600];
+    int r, creating = 0;
+    const char* bk = NULL;
+    const char* why = NULL;
+    ss->role = g_pc_net_role;
+    snprintf(ss->host, sizeof(ss->host), "%s", g_pc_net_host_ip);
+    ss->port = (int)g_pc_net_port;
+    ss->join_kind = PC_SESSION_JOIN_GUEST;
+    err[0] = '\0';
+    if (g_pc_character_spec != NULL) {
+        r = pc_character_resolve(NULL, g_pc_character_spec, &c, err, sizeof(err));
+        if (r == PC_CHARACTER_AMBIGUOUS || r == PC_CHARACTER_ERR) {
+            fprintf(stderr, "[PC] --character: REFUSED: %s\n", err);
+            return -1;
+        }
+        if (r == PC_CHARACTER_ABSENT) {
+            if (!pc_character_prepare_new(NULL, g_pc_character_spec, &c, err, sizeof(err))) {
+                fprintf(stderr, "[PC] --character: REFUSED: no character '%s' exists and a new one cannot be created: %s\n", g_pc_character_spec, err);
+                return -1;
+            }
+            creating = 1;
+        }
+    } else {
+        r = pc_character_resolve_profile(NULL, pc_guest_profile_selected(), &c, err, sizeof(err));
+        if (r != PC_CHARACTER_OK) {
+            return 0; /* absent (first run) or unreadable: the legacy flow creates / reports exactly as before */
+        }
+    }
+    if (c.storage == PC_CHARACTER_STORAGE_LEGACY) {
+        (void)pc_guest_profile_select(c.legacy_profile);
+        ss->storage = PC_CHARACTER_STORAGE_LEGACY;
+        return 0;
+    }
+    memset(&gp, 0, sizeof(gp));
+    memcpy(gp.name, c.name, sizeof(gp.name));
+    memcpy(gp.home_town, c.home_town, sizeof(gp.home_town));
+    gp.gender = c.gender;
+    gp.face = c.face;
+    gp.player_id = c.player_id;
+    gp.land_id = c.land_id;
+    if (!pc_guest_profile_validate(&gp, &bk, &why) || !pc_guest_profile_spec(&gp, g_pc_guest_spec, sizeof(g_pc_guest_spec))) {
+        fprintf(stderr, "[PC] --guest: REFUSED: bad character %s: %s\n", c.uuid, bk != NULL ? bk : "internal error (spec buffer)");
+        return -1;
+    }
+    ss->storage = PC_CHARACTER_STORAGE_STORE;
+    ss->creating = creating;
+    ss->character = c;
+    snprintf(ss->guest_spec, sizeof(ss->guest_spec), "%s", g_pc_guest_spec);
+    if (creating) {
+        extern void pc_guest_creation_arm(const PCGuestProfile* p); /* pc_m_card.c */
+        pc_guest_creation_arm(&gp);
+        printf("[PC] --character: character '%s' does not exist yet: FIRST-RUN CREATION -- the real Rover scene (name, gender, face) will create "
+               "characters/%s/character.ini; nothing is written before it finishes (placeholder name '%s', home town '%s', player id 0x%04X, land id 0x%04X)\n",
+               g_pc_character_spec, c.uuid, gp.name, gp.home_town, (unsigned)gp.player_id, (unsigned)gp.land_id);
+    } else {
+        (void)pc_character_default_set(NULL, c.uuid);
+        printf("[PC] --guest: loaded character %s (%s): name '%s', home town '%s', gender %d, face %d, player id 0x%04X, land id 0x%04X "
+               "(wire identity = home PersonalID; the uuid is local only; tokens live in characters/%s/towns/<townkey>/token.dat)\n",
+               c.uuid, c.path, gp.name, gp.home_town, gp.gender, gp.face, (unsigned)gp.player_id, (unsigned)gp.land_id, c.uuid);
+    }
+    g_pc_bootstrap_guest = g_pc_guest_spec;
+    return 1;
+}
 
 int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
@@ -647,6 +726,11 @@ int main(int argc, char* argv[]) {
             printf("                      Rover train scene (name, gender, face) and the answers are saved to save/mp/guest_<name>.ini when it ends\n");
             printf("                      (an interrupted creation writes nothing and replays next launch). TEST-ONLY: --guest-creation-test\n");
             printf("                      NAME,GENDER,FACE answers the Rover scene without UI. Plain --guest keeps auto-creating guest.ini.\n");
+            printf("  --character NAME|UUIDPREFIX  CLIENT-only (implies --guest; not with --guest-profile): play a character of the local store\n");
+            printf("                      save/mp/characters/<uuid>/ (player-owned identity; one token file PER host town). An unknown NAME starts the\n");
+            printf("                      first-run creation in the Rover scene. --characters lists the store + legacy guest profiles and exits 0;\n");
+            printf("                      --character-import-profile NAME (\"\" / default = guest.ini) copies a legacy profile and its tokens into the\n");
+            printf("                      store and exits 0 (the legacy files are never modified; afterwards --guest-profile NAME uses the character).\n");
             printf("  --house-sync        HOST opt-in: the host is authoritative for the furniture of player houses (the owner's edits are committed to\n");
             printf("                      the host together with the pocket record; announced to every client in HOST_CONFIG). Off by default.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
@@ -927,6 +1011,25 @@ int main(int argc, char* argv[]) {
             (void)pc_guest_profile_select(argv[i + 1]);
             g_pc_guest = 1;
             i++;
+        } else if (strcmp(argv[i], "--character") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || g_pc_character_spec != NULL) {
+                fprintf(stderr, "[PC] --character: REFUSED: the option needs ONE NAME or UUID-PREFIX (see --characters)\n"
+                                "usage: AnimalCrossing --connect HOST[:PORT] --character NAME|UUIDPREFIX   (see --help)\n");
+                return 2;
+            }
+            g_pc_character_spec = argv[i + 1];
+            g_pc_guest = 1;
+            i++;
+        } else if (strcmp(argv[i], "--character-import-profile") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[PC] --character-import-profile: REFUSED: the option needs a legacy profile NAME (\"\" or default = save/mp/guest.ini)\n"
+                                "usage: AnimalCrossing --character-import-profile NAME   (see --help)\n");
+                return 2;
+            }
+            g_pc_character_import = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--characters") == 0) {
+            g_pc_characters_list = 1;
         } else if (strcmp(argv[i], "--host-observer") == 0) {
             g_pc_host_observer = 1;
         } else if (strcmp(argv[i], "--dedicated") == 0) {
@@ -1029,7 +1132,41 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    if (g_pc_guest_creation_test != NULL && pc_guest_profile_selected() == NULL) {
+    /* M2: the one-shot character store commands (no network, no window): list / import, then exit 0 (2 on a refusal). */
+    if (g_pc_characters_list || g_pc_character_import != NULL) {
+        char cerr[600];
+        if (g_pc_characters_list) {
+            static PCCharacter lst[PC_CHARACTER_MAX];
+            int skipped = 0, k;
+            const int cn = pc_character_list(NULL, lst, PC_CHARACTER_MAX, &skipped);
+            printf("[PC] characters (%s/characters + legacy guest profiles): %d%s\n", PC_GUEST_PROFILE_DIR, cn, skipped > 0 ? " (some unreadable files were skipped, see stderr)" : "");
+            for (k = 0; k < cn; k++) {
+                printf("  %s %s name='%s' home_town='%s' gender=%d face=%d player_id=0x%04X land_id=0x%04X%s%s\n",
+                       lst[k].storage == PC_CHARACTER_STORAGE_STORE ? "store " : "legacy", lst[k].storage == PC_CHARACTER_STORAGE_STORE ? lst[k].uuid : "(profile file)",
+                       lst[k].name, lst[k].home_town, lst[k].gender, lst[k].face, (unsigned)lst[k].player_id, (unsigned)lst[k].land_id,
+                       lst[k].has_legacy ? " legacy_profile=" : "", lst[k].has_legacy ? (lst[k].legacy_profile[0] != '\0' ? lst[k].legacy_profile : "(default guest.ini)") : "");
+            }
+        }
+        if (g_pc_character_import != NULL) {
+            PCCharacter imp;
+            int ntok = 0;
+            if (!pc_character_import_legacy(NULL, g_pc_character_import, &imp, &ntok, cerr, sizeof(cerr))) {
+                fprintf(stderr, "[PC] --character-import-profile: REFUSED: %s\n", cerr);
+                return 2;
+            }
+            printf("[PC] --character-import-profile: imported legacy profile '%s' as character %s (name '%s', %d token entr%s copied; the legacy files were NOT modified)\n",
+                   imp.legacy_profile[0] != '\0' ? imp.legacy_profile : "(default guest.ini)", imp.uuid, imp.name, ntok, ntok == 1 ? "y" : "ies");
+        }
+        fflush(stdout);
+        return 0;
+    }
+    if (g_pc_character_spec != NULL && pc_guest_profile_selected() != NULL) {
+        fprintf(stderr, "[PC] --character: REFUSED: --character cannot be combined with --guest-profile (pick one)\n"
+                        "usage: AnimalCrossing --connect HOST[:PORT] --character NAME|UUIDPREFIX   (see --help)\n");
+        return 2;
+    }
+
+    if (g_pc_guest_creation_test != NULL && pc_guest_profile_selected() == NULL && g_pc_character_spec == NULL) {
         fprintf(stderr, "[PC] --guest-creation-test: REFUSED: the TEST-ONLY hook needs --guest-profile NAME\n");
         return 2;
     }
@@ -1065,6 +1202,11 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "[PC] --guest: REFUSED: --guest is a CLIENT-only option (use it together with --connect HOST[:PORT])\n%s", k_guest_usage);
             return 2;
         }
+        const int store_rc = pc_main_prepare_store_character();
+        if (store_rc < 0) {
+            return 2;
+        }
+        if (store_rc == 0)
         {
             PCGuestProfile gp;
             char gerr[512];

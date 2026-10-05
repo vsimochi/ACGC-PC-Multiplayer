@@ -111,6 +111,8 @@ int pc_guest_profile_select(const char* name);
 const char* pc_guest_profile_selected(void); /* the NAME as given, or NULL when the default profile is in use */
 const char* pc_guest_profile_selected_path(void); /* the selected profile's ini path (static buffer) */
 const char* pc_guest_token_path(void);            /* the selected profile's client token file path (static buffer) */
+/* M2: install (non-empty) / clear (NULL or "") a token path that pc_guest_token_path() returns instead of the legacy file (used by pc_session.c for STORE characters). */
+void pc_guest_token_path_set_override(const char* path);
 
 /* Reads `path` WITHOUT ever creating or modifying anything: LOADED / ABSENT (missing file) / ERR (err names file + problem, file untouched). */
 int pc_guest_profile_read(const char* path, PCGuestProfile* out, char* err, size_t errcap);

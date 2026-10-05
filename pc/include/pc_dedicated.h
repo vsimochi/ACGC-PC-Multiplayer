@@ -88,6 +88,17 @@ typedef struct PCNetGameDedicatedGuestInfo {
 } PCNetGameDedicatedGuestInfo;
 int  pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out); /* 1 iff the slot is in use */
 int  pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char* msg, size_t cap);
+/* M2: `members` -- residents + active guests of the host town through pc_mp_membership_list(). kind = PC_MP_MEMBER_* (1 resident, 2 guest, 3 ambiguous);
+ * slot = resident index or guest table slot (is_guest_row says which). Returns the number of rows (0 unless HOST with a loaded guest store). */
+typedef struct PCNetGameDedicatedMemberInfo {
+    int  kind;
+    int  slot;
+    int  is_guest_row;
+    int  confirmed;
+    char name[PC_NETGAME_NAME_LEN + 1];
+    char home_town[PC_NETGAME_NAME_LEN + 1];
+} PCNetGameDedicatedMemberInfo;
+int  pc_net_game_dedicated_members(PCNetGameDedicatedMemberInfo* rows, int cap);
 /* Host admin item tools (HOST only, main thread, no wire change). _item_giveblock: NULL when `id` may be given, else a short reason (invalid pocket id, money, tickets,
  * my-design items, furniture id with rotation bits). _give: fill `qty` (1..15) EMPTY pockets of a resident / guest (name or `peer N`) with `id`, all-or-nothing; 1 = given,
  * 0 = refused (msg = the text that follows "GIVE FAILED: "). A connected owner receives a PUSH_FULL record push (client-unsynced edits are discarded on adoption). */
