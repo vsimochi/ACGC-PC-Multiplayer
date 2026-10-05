@@ -1246,6 +1246,11 @@ PC_NETGAME_MSG_IDENTITY_TOKEN = 58
 PC_NETGAME_IDEXT_FLAG_GUEST = 0x01
 PC_NETGAME_IDTOKEN_FLAG_NEW = 0x01
 PC_NETGAME_IDTOKEN_FLAG_KNOWN = 0x02
+# --- M-E resident credentials (same v8, extended in place): IDENTITY_EXT flag bit1 = RESIDENT claim, IDENTITY_TOKEN flag bit2 = RESIDENT (+ NEW / KNOWN; guest_slot = the
+# resident index, table_size = 4); REJECT reason 5 RESIDENT_CREDENTIAL (8-byte form) ---
+PC_NETGAME_IDEXT_FLAG_RESIDENT = 0x02
+PC_NETGAME_IDTOKEN_FLAG_RESIDENT = 0x04
+PC_NETGAME_RESIDENT_TABLE_SIZE = 4
 PC_NETGAME_GUEST_TOKEN_LEN = 16
 PC_NETGAME_GUEST_MAX = 8
 PC_NETGAME_REC_CLASS_RESIDENT = 0
@@ -1270,6 +1275,7 @@ PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1  # 8-byte REJECT
 PC_NETGAME_REJECT_SERVER_FULL = 2        # reserved, never sent
 PC_NETGAME_REJECT_LAND_MISMATCH = 3      # 24-byte REJECT carrying the host town
 PC_NETGAME_REJECT_NO_SAVE = 4            # 24-byte REJECT carrying the host town
+PC_NETGAME_REJECT_RESIDENT_CREDENTIAL = 5  # M-E: 8-byte REJECT, the resident credential is missing or wrong
 
 PC_NETGAME_HOST_PLAYER_ID = 8  # == PC_NET_MAX_PEERS
 PC_NETGAME_GRID_TOWN = 0
@@ -1969,7 +1975,7 @@ def build_resync_request(reason=PC_NETGAME_RESYNC_REASON_SAVE_RELOADED, grid=PC_
 # 7. FakeClient
 # =================================================================================================
 
-REJECT_REASON_NAMES = {1: "PROTOCOL_MISMATCH", 2: "SERVER_FULL", 3: "LAND_MISMATCH", 4: "NO_SAVE"}
+REJECT_REASON_NAMES = {1: "PROTOCOL_MISMATCH", 2: "SERVER_FULL", 3: "LAND_MISMATCH", 4: "NO_SAVE", 5: "RESIDENT_CREDENTIAL"}
 
 
 class HandshakeRejected(RuntimeError):
@@ -2020,6 +2026,10 @@ class FakeClient(TransportClient):
     guest_send_ext = True
     guest_ext_flags = PC_NETGAME_IDEXT_FLAG_GUEST
     guest_record_img = None
+    # M-E: a FakeClient with `resident_claim` set sends the RESIDENT IDENTITY_EXT (its resident PersonalID + the token it holds) BEFORE its IDENTITY and, like the real client,
+    # remembers a token the host sends (IDENTITY_TOKEN with the RESIDENT flag + NEW) in `resident_token` -- the test double of save/mp/resident_token.dat.
+    resident_claim = False
+    resident_token = None
 
     # X1 commit path of an accepted provisional RESULT: "txn" (the DEFAULT since X1b, like the real client: PC_NETGAME_TXN_RETIRE_LEGACY_COMMIT
     # == 1) = TXN_COMMIT + the TXN_RESULT; "legacy" = INTERACT_CONFIRM(COMMIT), which the host now RETIRES (logged, reservation released,
@@ -2029,7 +2039,7 @@ class FakeClient(TransportClient):
 
     def __init__(self, label, host_ip, port, town=None, player=None, hub=None, context_flags=DEFAULT_CONTEXT_FLAGS,
                  wait_snapshot=True, record_hello=None, record_auto=None, record_wait=None, commit_mode=None, guest=None,
-                 guest_token=None, guest_record_img=None, guest_send_ext=None, **kw):
+                 guest_token=None, guest_record_img=None, guest_send_ext=None, resident_claim=None, resident_token=None, **kw):
         if guest is not None:
             self.guest = guest
             player = player or guest_player(guest)
@@ -2037,6 +2047,10 @@ class FakeClient(TransportClient):
                 self.guest_record_img = guest_record_img
         if guest_token is not None:
             self.guest_token = guest_token
+        if resident_claim is not None:
+            self.resident_claim = resident_claim
+        if resident_token is not None:
+            self.resident_token = resident_token
         if guest_send_ext is not None:
             self.guest_send_ext = guest_send_ext
         self.token_msgs = []            # (conn, IdentityTokenFields) for EVERY IDENTITY_TOKEN received
@@ -2251,6 +2265,14 @@ class FakeClient(TransportClient):
         tk = self.guest_token if token == "held" else token
         return self.send_reliable(build_identity_ext(self.guest, tk, self.guest_ext_flags if flags is None else flags, **kw))
 
+    def send_resident_ext(self, token="held", flags=None, raw=None, town=None, player=None, **kw):
+        """M-E RESIDENT IDENTITY_EXT. token: "held" = resident_token, None = none, or 16 bytes."""
+        if raw is not None:
+            return self.send_reliable(raw)
+        tk = self.resident_token if token == "held" else token
+        return self.send_reliable(build_resident_ext(player if player is not None else self.player, town if town is not None else self.claimed_town(), tk,
+                                                      PC_NETGAME_IDEXT_FLAG_RESIDENT if flags is None else flags, **kw))
+
     def send_identity(self, protocol_version=None, town=None, player=None):
         payload = build_identity(town if town is not None else self.claimed_town(),
                                  player if player is not None else self.player, protocol_version)
@@ -2279,6 +2301,8 @@ class FakeClient(TransportClient):
         self.reject = None
         if self.guest is not None and self.guest_send_ext:
             self.send_identity_ext()
+        if self.resident_claim and self.guest is None:
+            self.send_resident_ext(town=self.town_claimed)
         self.send_identity(protocol_version=protocol_version, town=self.town_claimed)
         m = self.wait_handshake_reply(timeout)
         if m is None:
@@ -3012,8 +3036,10 @@ class FakeClient(TransportClient):
             g = m.game
             if g is not None:
                 self.token_msgs.append((m.conn, g))
-                if self.guest is not None and self.guest_token is None and (g.flags & PC_NETGAME_IDTOKEN_FLAG_NEW):
+                if self.guest is not None and self.guest_token is None and (g.flags & PC_NETGAME_IDTOKEN_FLAG_NEW) and not (g.flags & PC_NETGAME_IDTOKEN_FLAG_RESIDENT):
                     self.guest_token = bytes(g.token)  # first contact: remember it (what the real client persists to save/mp/guest_token.dat)
+                if self.resident_claim and self.resident_token is None and (g.flags & PC_NETGAME_IDTOKEN_FLAG_RESIDENT) and (g.flags & PC_NETGAME_IDTOKEN_FLAG_NEW):
+                    self.resident_token = bytes(g.token)  # M-E first claim: remember it (what the real client persists to save/mp/resident_token.dat)
         if m.channel == CH_RELIABLE and m.msg_type == PC_NETGAME_MSG_TOWN_SVC_STATE:
             g = m.game
             if g is not None:
@@ -4362,6 +4388,14 @@ def build_identity_ext(g, token=None, flags=PC_NETGAME_IDEXT_FLAG_GUEST, rsv0=0,
     return struct.pack(IDENTITY_EXT_FMT, PC_NETGAME_MSG_IDENTITY_EXT, flags & 0xFF, rsv0 & 0xFFFF, bytes(g.player_name)[:8].ljust(8, b"\x00"),
                        bytes(g.land_name)[:8].ljust(8, b"\x00"), g.player_id & 0xFFFF, g.land_id & 0xFFFF, tp & 0xFF,
                        bytes(token if token is not None else b"")[:16].ljust(16, b"\x00"), rsv1 & 0xFF)
+
+
+def build_resident_ext(player, town, token=None, flags=PC_NETGAME_IDEXT_FLAG_RESIDENT, token_present=None):
+    """M-E: the RESIDENT IDENTITY_EXT (42 B). home_* = the resident's PersonalID in the host town (= the IDENTITY's name / player_id / land_name / land_id)."""
+    tp = (1 if token is not None else 0) if token_present is None else token_present
+    return struct.pack(IDENTITY_EXT_FMT, PC_NETGAME_MSG_IDENTITY_EXT, flags & 0xFF, 0, bytes(player.player_name)[:8].ljust(8, b"\x00"),
+                       bytes(town.land_name)[:8].ljust(8, b"\x00"), player.player_id & 0xFFFF, town.land_id & 0xFFFF, tp & 0xFF,
+                       bytes(token if token is not None else b"")[:16].ljust(16, b"\x00"), 0)
 
 
 def _init_default_player():

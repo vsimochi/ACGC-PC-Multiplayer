@@ -61,8 +61,9 @@ def main():
     enum = re.search(r"typedef enum PCNetGameRejectReason \{(.*?)\} PCNetGameRejectReason;", ng, re.S).group(1)
     reasons = re.findall(r"(PC_NETGAME_REJECT_\w+)\s*=\s*(\d+)", enum)
     rt = fr("pcnetgame_reject_text")
-    ck("A the frozen reject enum has exactly the 4 reasons (1 PROTOCOL_MISMATCH, 2 SERVER_FULL, 3 LAND_MISMATCH, 4 NO_SAVE) -- no new reason was added", [(n, int(v)) for n, v in reasons] == [
-        ("PC_NETGAME_REJECT_PROTOCOL_MISMATCH", 1), ("PC_NETGAME_REJECT_SERVER_FULL", 2), ("PC_NETGAME_REJECT_LAND_MISMATCH", 3), ("PC_NETGAME_REJECT_NO_SAVE", 4)])
+    ck("A the reject enum keeps the frozen reasons 1 PROTOCOL_MISMATCH, 2 SERVER_FULL, 3 LAND_MISMATCH, 4 NO_SAVE and has exactly ONE deliberate addition (M-E): 5 RESIDENT_CREDENTIAL", [(n, int(v)) for n, v in reasons] == [
+        ("PC_NETGAME_REJECT_PROTOCOL_MISMATCH", 1), ("PC_NETGAME_REJECT_SERVER_FULL", 2), ("PC_NETGAME_REJECT_LAND_MISMATCH", 3), ("PC_NETGAME_REJECT_NO_SAVE", 4),
+        ("PC_NETGAME_REJECT_RESIDENT_CREDENTIAL", 5)])
     ck("A pcnetgame_reject_text has a `case` for EVERY reject reason of the enum and a `default` for unknown ones", all("case %s:" % n in rt for n, _v in reasons) and "default:" in rt)
     ck("A SERVER_FULL says 'server full / guest limit reached / all resident slots taken' (the code cannot tell them apart) for a guest, and names the other causes (guest table full, "
        "in use, missing / wrong token) plus the guest-reset-token recovery; a resident gets the resident wording",

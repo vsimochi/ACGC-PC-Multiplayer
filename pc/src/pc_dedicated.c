@@ -459,6 +459,9 @@ static void pc_ded_cmd_help(void) {
            "  members  town memberships: residents and guests (kind, slot, confirmed)\n"
            "  guest-remove <slot|name> confirm        remove a guest and its character (guests.dat is backed up first; refused while the guest is connected)\n"
            "  guest-reset-token <slot|name> confirm   token lost: the next claim of that guest's key gets a NEW token for the SAME character (10 min, once; backed up)\n"
+           "  residents   resident credentials: slot, name, credential state, confirmed, armed, connected (never the token); policy = resident_tokens off|tofu|required\n"
+           "  resident-reset <slot|name> confirm      delete a resident's credential (members.dat is backed up first; refused while the resident is connected)\n"
+           "  resident-arm <slot|name> confirm        under resident_tokens=required: allow ONE credential mint for a resident without one (memory only, 10 min, one use)\n"
            "  finditem <text> [page]   search item names (case-insensitive); lines: 0xID - Name - Category, 15 per page\n"
            "  iteminfo <id>            name, category and whether it can be given (id = 0x2203 or decimal)\n"
            "  items <furniture|tools|clothing|wallpaper|carpet|miscellaneous|all> [page]   list items by category (categories are incomplete; see docs)\n"
@@ -591,6 +594,53 @@ static void pc_ded_cmd_guests(void) {
     if (n == 0) {
         pc_ded_printf("[DEDICATED] guests: none stored (or this server is not a ready host)\n");
     }
+    pc_ded_flush();
+}
+
+/* M-E: `residents` (list, never the token) and the two guarded operator commands. */
+static void pc_ded_cmd_residents(void) {
+    int s, n = 0;
+    for (s = 0; s < 4; s++) {
+        PCNetGameDedicatedResidentInfo ri;
+        if (!pc_net_game_dedicated_resident_info(s, &ri)) {
+            continue;
+        }
+        if (n == 0) {
+            pc_ded_printf("[DEDICATED] residents (resident_tokens=%s%s; tokens are never printed):\n", ri.policy == 2 ? "required" : ri.policy == 1 ? "tofu" : "off",
+                          ri.untrusted ? ", members.dat is UNTRUSTED" : "");
+        }
+        n++;
+        pc_ded_printf("  slot %d: name=\"%s\" credential=%s confirmed=%s armed=%s connected=%s\n", ri.slot, ri.name, ri.untrusted ? "unknown (UNTRUSTED)" : ri.has_cred ? "yes" : "no",
+                      ri.has_cred ? (ri.confirmed ? "yes" : "no") : "-", ri.armed ? "yes" : "no", ri.bound_peer >= 0 ? "yes" : "no");
+    }
+    if (n == 0) {
+        pc_ded_printf("[DEDICATED] residents: none (or this server is not a ready host)\n");
+    }
+    pc_ded_flush();
+}
+
+static void pc_ded_cmd_resident_admin(int op, char* args) {
+    const char* cname = op == 0 ? "resident-reset" : "resident-arm";
+    char sel[64];
+    char tok2[32];
+    char extra[8];
+    char msg[640];
+    int n, r;
+    sel[0] = tok2[0] = extra[0] = '\0';
+    n = sscanf(args != NULL ? args : "", "%63s %31s %7s", sel, tok2, extra);
+    if (n < 1) {
+        pc_ded_printf("[DEDICATED] %s: usage: %s <slot|name> confirm (see `residents`)\n", cname, cname);
+        pc_ded_flush();
+        return;
+    }
+    if (n >= 3 || (n == 2 && pc_ded_stricmp(tok2, "confirm") != 0)) {
+        pc_ded_printf("[DEDICATED] %s: expected exactly `<slot|name> confirm` (extra / unknown arguments: nothing was changed)\n", cname);
+        pc_ded_flush();
+        return;
+    }
+    r = pc_net_game_dedicated_resident_admin(op, sel, n == 2, msg, sizeof(msg));
+    pc_ded_printf("[DEDICATED] %s: %s\n", cname, msg);
+    PC_LOG(PCL_GENERAL, "dedicated: %s %s -> %s\n", cname, sel, r == 1 ? "done" : r == 2 ? "needs confirm" : "refused");
     pc_ded_flush();
 }
 
@@ -1262,6 +1312,12 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_players();
     } else if (strcmp(cmd, "guests") == 0) {
         pc_ded_cmd_guests();
+    } else if (strcmp(cmd, "residents") == 0) {
+        pc_ded_cmd_residents();
+    } else if (strcmp(cmd, "resident-reset") == 0) {
+        pc_ded_cmd_resident_admin(0, args);
+    } else if (strcmp(cmd, "resident-arm") == 0) {
+        pc_ded_cmd_resident_admin(1, args);
     } else if (strcmp(cmd, "members") == 0) {
         pc_ded_cmd_members();
     } else if (strcmp(cmd, "guest-remove") == 0) {

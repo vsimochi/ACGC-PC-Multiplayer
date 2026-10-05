@@ -21,11 +21,15 @@ PCSettings g_pc_settings = {
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
     .max_guests = 4,
+    .allow_new_guests = 1,
+    .resident_tokens = 0,
     .town_serve = 0,
 };
 
 int g_pc_max_guests_override = 0;
 int g_pc_town_serve_override = -1;
+int g_pc_allow_new_guests_override = -1;
+int g_pc_resident_tokens_override = -1;
 
 static const char* SETTINGS_FILE = "settings.ini";
 
@@ -79,6 +83,13 @@ static const char* DEFAULT_SETTINGS =
     "[Network]\n"
     "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n"
     "max_guests = 4\n"
+    "\n"
+    "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n"
+    "allow_new_guests = 1\n"
+    "\n"
+    "# Host only: resident credentials: off (default: nothing is minted or checked), tofu (a resident's first claim mints its token), required (like tofu, but a resident without\n"
+    "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n"
+    "resident_tokens = off\n"
     "\n"
     "# Host only: serve this town's save file (every resident's private data!) to clients that start with --town-fetch: 0 = off (default), 1 = on. Friends / LAN only.\n"
     "town_serve = 0\n";
@@ -134,6 +145,12 @@ static void apply_setting(const char* key, const char* value) {
         if (val >= 0 && val <= 40) g_pc_settings.cstick_deadzone = val;
     } else if (strcmp(key, "max_guests") == 0) {
         if (val >= 1 && val <= 8) g_pc_settings.max_guests = val;
+    } else if (strcmp(key, "allow_new_guests") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.allow_new_guests = val;
+    } else if (strcmp(key, "resident_tokens") == 0) {
+        if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.resident_tokens = 0;
+        else if (strcmp(value, "tofu") == 0) g_pc_settings.resident_tokens = 1;
+        else if (strcmp(value, "required") == 0) g_pc_settings.resident_tokens = 2;
     } else if (strcmp(key, "town_serve") == 0) {
         if (val == 0 || val == 1) g_pc_settings.town_serve = val;
     }
@@ -228,6 +245,13 @@ void pc_settings_save(void) {
     fprintf(f, "[Network]\n");
     fprintf(f, "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n");
     fprintf(f, "max_guests = %d\n", g_pc_settings.max_guests);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n");
+    fprintf(f, "allow_new_guests = %d\n", g_pc_settings.allow_new_guests);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: resident credentials: off (default: nothing is minted or checked), tofu (a resident's first claim mints its token), required (like tofu, but a resident without\n");
+    fprintf(f, "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n");
+    fprintf(f, "resident_tokens = %s\n", g_pc_settings.resident_tokens == 2 ? "required" : g_pc_settings.resident_tokens == 1 ? "tofu" : "off");
     fprintf(f, "\n");
     fprintf(f, "# Host only: serve this town's save file (every resident's private data!) to clients that start with --town-fetch: 0 = off (default), 1 = on. Friends / LAN only.\n");
     fprintf(f, "town_serve = %d\n", g_pc_settings.town_serve);

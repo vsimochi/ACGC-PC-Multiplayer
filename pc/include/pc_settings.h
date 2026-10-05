@@ -22,12 +22,18 @@ typedef struct {
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */
     int cstick_deadzone;  /* Gamepad C-stick deadzone, percent 0-40 (default 12) */
     int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..8 (default 4); out of range = ignored */
+    int allow_new_guests; /* HOST only (M-D): 1 = a NEW guest key may be admitted (default), 0 = only guests already known to guests.dat; a new key is refused (SERVER_FULL) */
+    int resident_tokens;  /* HOST only (M-E): 0 = off (default, nothing minted / checked), 1 = tofu, 2 = required (see docs/multiplayer-guest-roadmap.md) */
     int town_serve;       /* HOST only (M-B): 1 = serve the town GCI to pre-boot --town-fetch clients (default 0 = OFF: the file holds every resident's private data) */
 } PCSettings;
 
 extern PCSettings g_pc_settings;
 /* G4: `--max-guests N` (host test / operator override of settings.ini max_guests); 0 = no override. Set by pc_main.c, valid 1..8. */
 extern int g_pc_max_guests_override;
+/* M-D: `--allow-new-guests 0|1` (host override of settings.ini allow_new_guests); -1 = no override. */
+extern int g_pc_allow_new_guests_override;
+/* M-E: `--resident-tokens off|tofu|required` (host override of settings.ini resident_tokens); -1 = no override. */
+extern int g_pc_resident_tokens_override;
 /* M-B: `--town-serve on|off` (host operator override of settings.ini town_serve); -1 = no override. */
 extern int g_pc_town_serve_override;
 

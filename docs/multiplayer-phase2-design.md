@@ -293,3 +293,63 @@ M-B2 (sanitized transfer) stays deferred.
 - Not verified: the SDL message box and the window-title progress (no screenshot; the box is bypassed by `AC_TOWN_NO_MSGBOX` in the test), a real OLD host (the "no TOWN_INFO within 3 s" path was exercised against a closed port, which gives the same silence), a lossy / slow link, and `town_serve = 1` through `settings.ini` (only the CLI override was exercised; the parser line is source-audited).
 - Remaining design items: adopt-on-match (copy only), M-B2 (sanitized transfer), Play Online passing `--town-fetch` (M-C).
 
+### M-D (admission refactor) and M-E (resident credentials): implemented (uncommitted, branch `multiplayer`)
+
+User documentation: `docs/multiplayer-guest-roadmap.md`, section "Resident credentials and admission".
+
+**M-D.** `pcnetgame_host_admission_decide(peer, in, ext, ext_valid, &adm)` returns `{RESIDENT idx | GUEST | REFUSE(reason, text)}` as DATA, built from the existing steps in the same order
+(has_save / town, classify, AMBIGUOUS, UNKNOWN + no GUEST claim = NO_SAVE, UNKNOWN + GUEST claim = `pcnetgame_host_guest_check`, RESIDENT + GUEST claim refused, own-resident check, then the M-E
+credential check); `pcnetgame_host_admission_apply_refusal` produces the original logs / wire answers (the has_save / LAND_MISMATCH log lines and the 24-byte forms are byte-identical; the
+guest-check refusals stay inside `pcnetgame_host_guest_check`, flagged HANDLED). `pcnetgame_host_process_identity` keeps the duplicate park, the guest cap / reserve, the mint, the ACK and the
+IDENTITY_TOKEN. `pcnetgame_host_classify_identity` is NOT replaced; `pc_mp_membership_lookup` is only a logged cross-check (`pcnetgame_host_admission_crosscheck`, a line only when it disagrees).
+`allow_new_guests = 0|1` (settings.ini `[Network]`, `--allow-new-guests 0|1`, default 1) refuses a NEW guest key (`guest_mode == 0` only) with SERVER_FULL inside the `guest_mode != 1` block before the
+rate limiter and before `pcnetgame_guest_create`; a known key (token verified) and an operator re-mint are unaffected. Deviation: the function takes `peer` (the guest check logs / tears down per peer) and
+`ext_valid` as well, not just `(in, ext)`.
+
+**M-E.** New pure module `pc/src/pc_mp_members.c` / `pc/include/pc_mp_members.h` (members.dat v1). Wire (v8 extended in place): `PC_NETGAME_IDEXT_FLAG_RESIDENT 0x02`, `PC_NETGAME_IDTOKEN_FLAG_RESIDENT 0x04`,
+REJECT reason 5 `RESIDENT_CREDENTIAL` (8-byte form), all pinned in `wire_baseline.py` and `net_spike_lib.py`. Policy `resident_tokens = off|tofu|required` (settings.ini `[Network]`, `--resident-tokens`,
+default off = the credential check returns before any file access; `members.dat` is only loaded at world ready when the policy is not off). Console: `residents`, `resident-reset <slot|name> confirm`,
+`resident-arm <slot|name> confirm`; help updated. Client: `s_client_resident_claim_sent`, RESIDENT claim sent whenever the client plays a resident, `pcnetgame_handle_client_resident_token`
+(DIFFERENT-token rule), token file = the store character's per-town `token.dat` (+ `membership.ini` `role=resident`) or `save/mp/resident_token.dat`.
+
+**Where the design disagreed with the code, and what was chosen (the safer behaviour).**
+
+1. **Entry size 80, not 72.** The design's own field list (4 + 16 town key + 20 pid + 16 token + 4 age + 20 aux pid) adds up to 80 bytes. The format stores 80 (`entry_size` is in the header and checked), file size 1316.
+2. **A token presented for a resident the host has NO credential for is refused (reason 5), never minted over.** Minting would send a token different from the presented one, so the real client would refuse the
+   host ("DIFFERENT token") and the host would keep an orphan credential that locks the slot. Applies to `tofu` and `required` (the operator reset / a wiped table needs the client to delete its token too).
+3. **Legacy client under tofu:** exactly the design text: admitted without a mint only while the slot has no credential, refused once one exists. Under `required` + armed a legacy client is still refused (it cannot
+   receive a token) and the arm is kept.
+4. **EXT home must equal the IDENTITY** (name, player id, land name, land id) only when the policy is not off; a mismatch is REJECT 5. Under `off` the flag is ignored entirely. An EXT with both GUEST and
+   RESIDENT set is a malformed claim (logged `malformed IDENTITY_EXT ignored`, treated as no claim); `flags == 0` is still accepted as before.
+5. **`confirmed`** = the client presented the matching token once (set at the KNOWN admission), not "started a record exchange" as for guests; the mint is rolled back when the ACK / token cannot be queued.
+6. **`resident-arm`** is refused unless the policy is `required`, refused when the slot already has a credential, and needs no backup (memory only); `resident-reset` backs `members.dat` up first.
+7. The resident claim is **sent by every resident client** (not only "when a token file exists or TOFU first claim"): the client cannot know the host policy, and a first claim has no file yet. A host with `off`
+   ignores it (one extra `IDENTITY_EXT cached (resident claim ...)` log line); an old host drops the unknown flag.
+
+**Source audits re-pinned (edited, then run green or reduced to the failures that pre-date this work).** `wire_baseline.py` (host-only types, reason 5, new constants; `--selftest` green),
+`test_guest_src.py` (the reviewed `Save_Get(private_data)[...]` function list: + the 8 new host functions and the 2 pre-existing dedicated ones that were already missing), `test_guest_g6_src.py` (reject enum:
+the 4 frozen reasons + 5), `test_identity_validation_src.py` (S2 / S3 / S11 now read decide + apply_refusal + process_identity as one ordered text; the 8-site refusal count; `g_pc_dedicated` excluded from the
+"no g_pc_ bypass" check; the optional resident-mint block in the park regex), `test_guest_profiles_src.py` (token file load / save sites). Remaining failures of those files and of `test_guest_g1/g2/g3/g4/g5_src`,
+`test_observer_src`, `test_txn_src`, `test_d3_record_src`, `test_identity_handshake_timing`, `test_guest_train_src` are unrelated to this change (git-baseline comparisons, `pc_m_card.c`, mail / house lists) and were not touched.
+
+**Tests** (`pc/tools/net_spike/`; all on disposable `pc/build64/bin_fixture4_*` copies, never the live save, `bin_talkfix*` or `bin_fixture4`).
+
+* `test_members_unit.py` (+ `members_selftest.c`): native storage unit, `-Wall -Wextra` warning-free: format and field offsets, every parse refusal, rotation `.bak1`/`.bak2`, recovery from `.bak1`, a CRC-corrupt
+  file moved to `.corrupt-<ts>` (byte-identical) and the sticky UNTRUSTED mode, save self-validation, an independent Python writer parsed by the C reader, no token in any output. **69 / 69.**
+* `test_resident_credentials_protocol.py`: scripted FakeClients against real `--dedicated` hosts (7 host processes on `bin_fixture4_resid`): off (a resident with and without the claim: READY, no token, no
+  members.dat, no `[NET][RESIDENT]` host line; a first guest still gets its NEW token), tofu (mint: IDENTITY_TOKEN `RESIDENT|NEW`, members.dat written before it is sent and holding the sent token; reconnect KNOWN +
+  confirmed; wrong / no token / legacy client / mismatching EXT home = REJECT 5 (8 bytes, protocol 8); an impostor cannot evict the live peer; a legacy client of a credential-less slot is admitted with the log line
+  and nothing written; `residents` never prints a token; resident-arm refused under tofu; resident-reset refused while bound / without `confirm` / unknown selector / no credential, with `confirm` a byte-identical
+  `members.dat.bak-<ts>` backup then deletion; the old token refused, a token-less client mints a NEW different token), host restart (KNOWN, credential persisted), required (no arm = REJECT 5, arm = ONE mint then
+  armed=no, the second claim and another resident refused, arming a resident with a credential refused, a legacy client refused on an armed slot), corrupt members.dat (tofu: UNTRUSTED, residents admitted
+  legacy-style, bad file preserved, nothing written, resident-reset refused; required: every resident refused), `--allow-new-guests 0` (a NEW guest key = REJECT 2 with the log line and guests.dat byte-identical,
+  the known guest returns KNOWN, residents unaffected), plus source audits of the new code. **94 / 94.** (A first attempt failed in the test itself: a FakeClient without RECORD_HELLO is closed by the host after
+  5 s; residents now send it.)
+* Existing guest admission regression: `test_guest_g4_protocol.py` on a fresh `bin_fixture4_g4reg` copy with the new exe (4 / 8 concurrent guests, cap, reserve, wrong token, table full, `max_guests` flag and
+  setting, resident admitted at the cap): **65 / 65**, unchanged.
+* Not run: a REAL game client against a `tofu` host (the client half is compiled and source-audited only), no real OLD host / old client, no wildlife tests, no full suites.
+
+**Known gaps.** The RESIDENT claim is sent by every resident client but only a real run proves the token file round trip (`save/mp/resident_token.dat`, store character `token.dat` + `membership.ini`);
+M-C will have to pass a resident membership; promotion (M-F) is not started (PROMOTION_HANDOFF entries exist in the format but nothing writes or reads them); the credential is not internet-grade (bearer token over
+unencrypted UDP, trust on first use).
+

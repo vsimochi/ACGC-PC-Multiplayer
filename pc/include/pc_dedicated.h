@@ -88,6 +88,21 @@ typedef struct PCNetGameDedicatedGuestInfo {
 } PCNetGameDedicatedGuestInfo;
 int  pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out); /* 1 iff the slot is in use */
 int  pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char* msg, size_t cap);
+/* M-E: resident credentials (HOST only, main thread). `residents` lists through _resident_info (never a token); _resident_admin: op 0 = resident-reset (delete the credential), 1 = resident-arm
+ * (allow ONE mint under resident_tokens=required: memory only, 10 minutes, one use). Returns 1 = done, 2 = nothing changed (no `confirm`: msg says what would happen), 0 = refused (msg says why).
+ * Order of checks like guest-remove: world ready, members.dat not UNTRUSTED, selector, refused while the resident is connected, the `confirm` word, members.dat.bak-<timestamp> (reset only), then the change. */
+typedef struct PCNetGameDedicatedResidentInfo {
+    int  slot;
+    char name[PC_NETGAME_NAME_LEN + 1];
+    int  policy;      /* 0 off, 1 tofu, 2 required */
+    int  untrusted;   /* members.dat is UNTRUSTED */
+    int  has_cred;    /* a credential is stored for this resident (keyed by its PersonalID in the host town) */
+    int  confirmed;   /* the client presented the token at least once */
+    int  armed;       /* resident-arm pending (required) */
+    int  bound_peer;  /* transport peer the resident is connected on, -1 = not bound */
+} PCNetGameDedicatedResidentInfo;
+int  pc_net_game_dedicated_resident_info(int slot, PCNetGameDedicatedResidentInfo* out); /* 1 iff the slot holds a resident (HOST only) */
+int  pc_net_game_dedicated_resident_admin(int op, const char* sel, int confirm, char* msg, size_t cap);
 /* M2: `members` -- residents + active guests of the host town through pc_mp_membership_list(). kind = PC_MP_MEMBER_* (1 resident, 2 guest, 3 ambiguous);
  * slot = resident index or guest table slot (is_guest_row says which). Returns the number of rows (0 unless HOST with a loaded guest store). */
 typedef struct PCNetGameDedicatedMemberInfo {

@@ -172,6 +172,7 @@
 #include "pc_session.h"        /* M2: pc_session_select_town() = the per-town token file of a STORE character (pc_guest_token_path() override) */
 #include "pc_mp_membership.h"  /* M2: pc_mp_membership_list() for the dedicated `members` command */
 #include "pc_guest_profile.h" /* guest profiles: pc_guest_token_path() = the selected profile's client token file (default save/mp/guest_token.dat) */
+#include "pc_mp_members.h" /* M-E: save/mp/members.dat resident credentials (pure storage module) */
 #include "pc_mp_guests.h"  /* guests: save/mp/guests.dat host table + save/mp/guest_token.dat client token file (pure storage module) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
@@ -506,6 +507,7 @@ typedef enum PCNetGameRejectReason {
     PC_NETGAME_REJECT_SERVER_FULL       = 2, /* 8-byte form; M9 Stage 1A: identity unavailable (own/connected/ambiguous) */
     PC_NETGAME_REJECT_LAND_MISMATCH     = 3, /* v2: 24-byte PCNetGameRejectTownMsg (host town identity) */
     PC_NETGAME_REJECT_NO_SAVE           = 4, /* v2: 24-byte form; IDENTITY had has_save == 0 */
+    PC_NETGAME_REJECT_RESIDENT_CREDENTIAL = 5, /* M-E (v8 extended in place): 8-byte form; the resident credential is missing or wrong (resident_tokens = tofu / required) */
 } PCNetGameRejectReason;
 
 /* v2 layout. Byte offset 4 (protocol_version) and the 32-byte size are FROZEN across protocol
@@ -582,6 +584,12 @@ _Static_assert(sizeof(PCNetGameIdentityAckMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_IDTOKEN_FLAG_KNOWN    0x02u
 #define PC_NETGAME_GUEST_TOKEN_LEN       16u
 #define PC_NETGAME_GUEST_MAX             8
+/* M-E resident credentials (v8 extended in place, no bump): IDENTITY_EXT flag bit1 = RESIDENT claim (exactly one of GUEST | RESIDENT; home_* = the resident's PersonalID in the
+ * host town and must equal the IDENTITY's name / player_id / land_name / land_id); IDENTITY_TOKEN flag bit2 = RESIDENT (+ NEW / KNOWN; guest_slot = the resident index 0..3,
+ * table_size = 4). Host policy resident_tokens = off | tofu | required (default off: the flag is parsed and ignored, nothing is minted). */
+#define PC_NETGAME_IDEXT_FLAG_RESIDENT   0x02u
+#define PC_NETGAME_IDTOKEN_FLAG_RESIDENT 0x04u
+#define PC_NETGAME_RESIDENT_TABLE_SIZE   4
 typedef struct PCNetGameIdentityExtMsg {
     uint8_t  msg_type;       /* PC_NETGAME_MSG_IDENTITY_EXT */
     uint8_t  flags;          /* PC_NETGAME_IDEXT_FLAG_* */
@@ -3646,6 +3654,12 @@ static int               s_guest_untrusted = 0;   /* guests.dat existed but no g
 static PCMpGuestLoadMode s_guest_store_mode = PC_MP_GST_LOAD_MISSING;
 static int               s_guest_store_last_failed = 0; /* the last guests.dat write failed: a guest's FIRST migration is refused (BUSY) until a write succeeds */
 static uint32_t          s_guest_store_fail_count = 0;
+/* M-E: the host's resident credential table (save/mp/members.dat), loaded lazily and ONLY when resident_tokens != off (policy off never reads or writes the file). */
+static PCMpMemberFile     s_members_file;
+static int                s_members_loaded = 0;
+static int                s_members_untrusted = 0;  /* members.dat existed but no generation is readable: no credential is trusted or minted, nothing is written */
+static PCMpMemberLoadMode s_members_mode = PC_MP_MBR_LOAD_MISSING;
+static struct { uint8_t armed; uint32_t since_ms; uint8_t pid[PC_MP_MEMBERS_PID_SIZE]; } s_res_arm[PC_NETGAME_RESIDENT_TABLE_SIZE]; /* resident-arm: memory only, one use, 10 minutes */
 
 /* THE accessor: the record of slot `slot` (resident or guest), or NULL for an out-of-range slot / an unused guest entry. */
 static Private_c* pcnetgame_rec_priv_ptr(int slot) {
@@ -3731,6 +3745,7 @@ static int             s_out_overflow = 0;
 static int                   s_client_identity_sent = 0;
 static int                   s_client_token_received = 0;  /* M2: an IDENTITY_TOKEN was already accepted on this connection (at most ONE) */
 static int                   s_client_guest_claim_sent = 0; /* guests (G1): IDENTITY_EXT went out on this connection (record_class GUEST) */
+static int                   s_client_resident_claim_sent = 0; /* M-E: a RESIDENT IDENTITY_EXT went out on this connection */
 static int                   s_client_identity_defer_logged = 0;
 static PCNetGameTownIdentity s_client_claimed_town;     /* what our IDENTITY claimed */
 static uint16_t              s_client_assigned_peer_id = 0;
@@ -11638,6 +11653,11 @@ static int pcnetgame_host_max_guests(void) {
     return n > PC_NETGAME_GUEST_MAX ? PC_NETGAME_GUEST_MAX : n;
 }
 
+/* M-D: `--allow-new-guests 0|1` wins over settings.ini allow_new_guests (default 1). Only consulted for a NEW guest key. */
+static int pcnetgame_host_allow_new_guests(void) {
+    return (g_pc_allow_new_guests_override >= 0 ? g_pc_allow_new_guests_override : g_pc_settings.allow_new_guests) != 0;
+}
+
 /* Guests G4: READY peers currently bound to a guest slot, other than `except_peer` (-1 = count every one). */
 static int pcnetgame_host_bound_guest_count(PCNetPeerId except_peer) {
     int j, n = 0;
@@ -12096,6 +12116,8 @@ static void pcnetgame_rec_store_resolve(void); /* D3-4: defined below with the p
 static void pcnetgame_rec_resolve_slot(int i);  /* D3-4 */
 static void pcnetgame_guest_store_load(void);   /* guests (G1): defined with the GUESTS HOST block below */
 static int  pcnetgame_guest_store_write(const char* why);
+static void pcnetgame_members_store_load(void);  /* M-E: defined with the RESIDENT CREDENTIALS HOST block below */
+static int  pcnetgame_resident_policy(void);
 static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer); /* M3: defined with the GUESTS HOST block */
 
 /* Slot lookup/(re)initialisation. Only called with an index that came from a validated binding. */
@@ -12393,6 +12415,9 @@ static void pcnetgame_rec_store_resolve(void) {
     int i;
     int first_untrusted_pass = 0;
     pcnetgame_guest_store_load(); /* guests (G1): the guest table is loaded with the host world, before any client can be READY (idempotent) */
+    if (pcnetgame_resident_policy() != 0) {
+        pcnetgame_members_store_load(); /* M-E: loaded next to guests.dat, but ONLY when resident_tokens != off (off never touches the file) */
+    }
     if (s_rec_resolved) {
         return;
     }
@@ -14410,6 +14435,251 @@ static int pcnetgame_host_guest_check(PCNetPeerId peer, const PCNetGameIdentityM
     return 1;
 }
 /* ===== GUESTS HOST END ===== */
+
+/* ===== RESIDENT CREDENTIALS HOST BEGIN (M-E): save/mp/members.dat, the credential check of a RESIDENT claim, mint / confirm / rollback =====
+ * Policy resident_tokens (settings.ini [Network], `--resident-tokens`): 0 off (DEFAULT: this whole block is inert, the file is never read or written, nothing is
+ * minted, IDENTITY_EXT's RESIDENT flag is parsed and ignored), 1 tofu, 2 required. The credential of a resident is keyed by (host town, the resident's PersonalID in the
+ * host save), never by the slot index, so a re-created slot has no credential. The token is minted at the FIRST claim (trust on first use), written to members.dat
+ * synchronously BEFORE it is sent, and must be presented by every later claim. See docs/multiplayer-guest-roadmap.md "Resident credentials and admission". */
+#define PC_NETGAME_RESIDENT_ARM_MS 600000u
+enum { PC_NETGAME_RESTOK_OFF = 0, PC_NETGAME_RESTOK_TOFU = 1, PC_NETGAME_RESTOK_REQUIRED = 2 };
+
+static int pcnetgame_resident_policy(void) {
+    return g_pc_resident_tokens_override >= 0 ? g_pc_resident_tokens_override : g_pc_settings.resident_tokens;
+}
+
+static const char* pcnetgame_resident_policy_name(void) {
+    const int p = pcnetgame_resident_policy();
+    return p == PC_NETGAME_RESTOK_REQUIRED ? "required" : p == PC_NETGAME_RESTOK_TOFU ? "tofu" : "off";
+}
+
+static void pcnetgame_resident_pid_be(const PersonalID_c* p, uint8_t out[PC_MP_MEMBERS_PID_SIZE]) {
+    memcpy(out, p->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(out + 8, p->land_name, PC_NETGAME_LAND_LEN);
+    out[16] = (uint8_t)(p->player_id >> 8);
+    out[17] = (uint8_t)p->player_id;
+    out[18] = (uint8_t)(p->land_id >> 8);
+    out[19] = (uint8_t)p->land_id;
+}
+
+static void pcnetgame_members_store_load(void) {
+    PCMpMemberLoadInfo info;
+    int i, n = 0;
+    if (s_members_loaded) {
+        return;
+    }
+    s_members_loaded = 1;
+    s_members_mode = pc_mp_members_load(PC_MP_MEMBERS_PATH, &s_members_file, &info);
+    s_members_untrusted = (s_members_mode == PC_MP_MBR_LOAD_UNTRUSTED);
+    for (i = 0; i < PC_MP_MEMBERS_SLOTS; i++) {
+        n += (s_members_file.e[i].present && s_members_file.e[i].kind == PC_MP_MEMBER_KIND_RESIDENT_TOKEN) ? 1 : 0;
+    }
+    printf("[NET][RESIDENT] store: members file '%s' load mode=%s (generation used %d, %d unreadable file(s) preserved), %d resident credential(s) restored (resident_tokens=%s)\n",
+           PC_MP_MEMBERS_PATH, s_members_mode == PC_MP_MBR_LOAD_MISSING ? "MISSING" : s_members_mode == PC_MP_MBR_LOAD_OK ? "OK" :
+           s_members_mode == PC_MP_MBR_LOAD_OK_BACKUP ? "OK_BACKUP" : "UNTRUSTED", info.gen_used, info.moved_aside, n, pcnetgame_resident_policy_name());
+    if (s_members_untrusted) {
+        printf("[NET][RESIDENT] store: *** UNTRUSTED MODE: members.dat existed but no generation is readable. resident_tokens=required refuses EVERY resident; tofu admits "
+               "residents legacy-style (no credential check, nothing minted, nothing written); the bad file(s) were preserved. To reset deliberately remove members.dat, its "
+               ".bak files AND the *.corrupt-* files ***\n");
+    }
+}
+
+/* Writes `nf` (the new table; generation is set here) durably. 1 = durable and adopted as the in-memory table, 0 = failed / refused (the in-memory table is unchanged). */
+static int pcnetgame_members_commit(PCMpMemberFile* nf, const char* why) {
+    int r, n = 0, i;
+    if (!s_members_loaded || s_members_untrusted) {
+        return 0;
+    }
+    nf->generation = s_members_file.generation + 1u;
+    r = pc_mp_members_save(PC_MP_MEMBERS_PATH, nf);
+    if (r != PC_MP_MBR_OK) {
+        printf("[NET][RESIDENT] store: *** members.dat write FAILED (%s, %s); nothing changed ***\n", pc_mp_members_strerror(r), why);
+        return 0;
+    }
+    s_members_file = *nf;
+    for (i = 0; i < PC_MP_MEMBERS_SLOTS; i++) {
+        n += (nf->e[i].present && nf->e[i].kind == PC_MP_MEMBER_KIND_RESIDENT_TOKEN) ? 1 : 0;
+    }
+    printf("[NET][RESIDENT] store: members.dat written (%s; generation %u, %d resident credential(s))\n", why, (unsigned)nf->generation, n);
+    return 1;
+}
+
+/* The credential entry of resident `idx` of the host's CURRENT town (keyed by the PID in the host save), or -1. */
+static int pcnetgame_resident_cred_find(int idx) {
+    uint8_t pid[PC_MP_MEMBERS_PID_SIZE];
+    if (idx < 0 || idx >= PLAYER_NUM || !s_members_loaded) {
+        return -1;
+    }
+    pcnetgame_resident_pid_be(&Save_Get(private_data)[idx].player_ID, pid);
+    return pc_mp_members_find(&s_members_file, PC_MP_MEMBER_KIND_RESIDENT_TOKEN, s_host_town.land_name, s_host_town.land_id, s_host_town.terrain_hash, pid);
+}
+
+static int pcnetgame_resident_arm_active(int idx) {
+    uint8_t pid[PC_MP_MEMBERS_PID_SIZE];
+    if (idx < 0 || idx >= PC_NETGAME_RESIDENT_TABLE_SIZE || !s_res_arm[idx].armed) {
+        return 0;
+    }
+    pcnetgame_resident_pid_be(&Save_Get(private_data)[idx].player_ID, pid);
+    if (memcmp(pid, s_res_arm[idx].pid, PC_MP_MEMBERS_PID_SIZE) != 0) {
+        s_res_arm[idx].armed = 0; /* the slot holds another resident now */
+        return 0;
+    }
+    if ((uint32_t)(pcnetgame_now_ms() - s_res_arm[idx].since_ms) >= PC_NETGAME_RESIDENT_ARM_MS) {
+        s_res_arm[idx].armed = 0;
+        printf("[NET][RESIDENT] host: the operator ARM of resident %d EXPIRED unused\n", idx);
+        return 0;
+    }
+    return 1;
+}
+
+/* The credential decision for a RESIDENT claim on resident `idx` (called by pcnetgame_host_admission_decide AFTER the own-resident check and BEFORE the duplicate-park
+ * step, so an impostor can never evict a live peer). Returns 1 = admissible, *out_mode = 0 admit WITHOUT a credential (policy off, UNTRUSTED under tofu, a legacy client of a
+ * credential-less slot under tofu), 1 = KNOWN (the presented token matches), 2 = MINT (the first claim; minted after the duplicate-park step); 0 = REFUSED (why = host log text,
+ * the wire answer is REJECT 5). Never changes any state (the mint happens later). */
+static int pcnetgame_host_resident_credential_check(PCNetPeerId peer, int idx, const PCNetGameIdentityMsg* in, const PCNetGameIdentityExtMsg* ext, int ext_valid,
+                                                    int* out_mode, char* why, size_t cap) {
+    const int policy = pcnetgame_resident_policy();
+    const int ext_res = ext_valid && (ext->flags & PC_NETGAME_IDEXT_FLAG_RESIDENT) != 0;
+    int ci;
+    *out_mode = 0;
+    why[0] = '\0';
+    if (policy == PC_NETGAME_RESTOK_OFF) {
+        return 1; /* byte-identical to a host without this feature: the RESIDENT flag (if any) is ignored */
+    }
+    pcnetgame_members_store_load();
+    if (s_members_untrusted) {
+        if (policy == PC_NETGAME_RESTOK_REQUIRED) {
+            snprintf(why, cap, "resident_tokens=required and members.dat is UNTRUSTED (existed but unreadable): every resident is refused until the operator fixes the file");
+            return 0;
+        }
+        printf("[NET][RESIDENT] host: peer %d: members.dat is UNTRUSTED: resident %d is admitted legacy-style (no credential check, nothing minted, nothing written)\n", (int)peer, idx);
+        return 1;
+    }
+    if (ext_res) {
+        if (memcmp(ext->home_player_name, in->player_name, PC_NETGAME_NAME_LEN) != 0 || memcmp(ext->home_land_name, in->land_name, PC_NETGAME_LAND_LEN) != 0 ||
+            ext->home_player_id != in->player_id || ext->home_land_id != in->land_id) {
+            snprintf(why, cap, "resident claim: the IDENTITY_EXT home PersonalID differs from the IDENTITY (name / player id / land)");
+            return 0;
+        }
+    }
+    ci = pcnetgame_resident_cred_find(idx);
+    if (ci >= 0) {
+        if (!ext_res) {
+            snprintf(why, cap, "resident %d has a credential: a client that sent no resident claim (legacy client) is refused", idx);
+            return 0;
+        }
+        if (!ext->token_present) {
+            snprintf(why, cap, "resident %d has a credential and the claim presented NO token", idx);
+            return 0;
+        }
+        /* plain memcmp: the answer is the same refusal either way (the guest check does the same) */
+        if (memcmp(ext->token, s_members_file.e[ci].token, PC_MP_MEMBERS_TOKEN_SIZE) != 0) {
+            snprintf(why, cap, "resident %d has a credential and the claim presented a WRONG token", idx);
+            return 0;
+        }
+        *out_mode = 1;
+        return 1;
+    }
+    /* no credential for this resident */
+    if (ext_res && ext->token_present) {
+        snprintf(why, cap, "resident %d: the client presents a token but this host has no credential for it (host table reset / another host): nothing is minted over it; the "
+                           "client must delete its stored resident token (and, under required, the operator must run resident-arm)", idx);
+        return 0;
+    }
+    if (policy == PC_NETGAME_RESTOK_TOFU) {
+        if (ext_res) {
+            *out_mode = 2;
+            return 1;
+        }
+        printf("[NET][RESIDENT] host: peer %d: resident %d has no credential (legacy client)\n", (int)peer, idx);
+        return 1; /* admitted without minting: the client cannot receive a token */
+    }
+    /* required */
+    if (!pcnetgame_resident_arm_active(idx)) {
+        snprintf(why, cap, "resident_tokens=required and resident %d has no credential and is not armed (the operator must run resident-arm)", idx);
+        return 0;
+    }
+    if (!ext_res) {
+        snprintf(why, cap, "resident %d is armed but this client sent no resident claim (legacy client): it cannot receive a credential", idx);
+        return 0;
+    }
+    *out_mode = 2;
+    return 1;
+}
+
+/* MINT: a new credential for resident `idx`, durable BEFORE the token is sent. 0 = ok (token_out set), -1 = table full, -2 = no OS randomness, -3 = could not persist. */
+static uint8_t s_res_mint_prev_armed = 0;
+static int pcnetgame_resident_mint(int idx, uint8_t* token_out) {
+    static PCMpMemberFile nf;
+    PCMpMemberEntry* e;
+    int slot, k, allz = 1;
+    pcnetgame_members_store_load();
+    if (s_members_untrusted) {
+        return -3;
+    }
+    nf = s_members_file;
+    slot = pc_mp_members_free_slot(&nf);
+    if (slot < 0) {
+        return -1;
+    }
+    if (!pc_mp_guests_random_bytes(token_out, PC_MP_MEMBERS_TOKEN_SIZE)) {
+        return -2;
+    }
+    for (k = 0; k < PC_MP_MEMBERS_TOKEN_SIZE; k++) {
+        if (token_out[k] != 0) {
+            allz = 0;
+        }
+    }
+    if (allz) {
+        return -2;
+    }
+    e = &nf.e[slot];
+    memset(e, 0, sizeof(*e));
+    e->present = 1;
+    e->confirmed = 0;
+    e->res_slot = (uint8_t)idx;
+    e->kind = PC_MP_MEMBER_KIND_RESIDENT_TOKEN;
+    memcpy(e->land_name, s_host_town.land_name, 8);
+    e->land_id = s_host_town.land_id;
+    e->terrain_hash = s_host_town.terrain_hash;
+    pcnetgame_resident_pid_be(&Save_Get(private_data)[idx].player_ID, e->pid);
+    memcpy(e->token, token_out, PC_MP_MEMBERS_TOKEN_SIZE);
+    e->age = pc_mp_members_max_age(&nf) + 1u;
+    if (!pcnetgame_members_commit(&nf, "resident credential minted")) {
+        return -3;
+    }
+    s_res_mint_prev_armed = s_res_arm[idx].armed;
+    s_res_arm[idx].armed = 0; /* resident-arm is ONE use */
+    return 0;
+}
+
+static void pcnetgame_resident_mint_rollback(int idx) {
+    static PCMpMemberFile nf;
+    const int ci = pcnetgame_resident_cred_find(idx);
+    if (ci < 0) {
+        return;
+    }
+    nf = s_members_file;
+    memset(&nf.e[ci], 0, sizeof(nf.e[ci]));
+    (void)pcnetgame_members_commit(&nf, "resident credential rolled back (token not deliverable)");
+    if (idx >= 0 && idx < PC_NETGAME_RESIDENT_TABLE_SIZE && s_res_mint_prev_armed) {
+        pcnetgame_resident_pid_be(&Save_Get(private_data)[idx].player_ID, s_res_arm[idx].pid);
+        s_res_arm[idx].armed = 1; /* the arm was not used up: the client never got the token (the original window keeps running) */
+    }
+}
+
+/* KNOWN: the client presented the matching token = it demonstrably stored it: CONFIRMED (durable, never fatal). */
+static void pcnetgame_resident_confirm(int idx) {
+    static PCMpMemberFile nf;
+    const int ci = pcnetgame_resident_cred_find(idx);
+    if (ci < 0 || s_members_file.e[ci].confirmed) {
+        return;
+    }
+    nf = s_members_file;
+    nf.e[ci].confirmed = 1;
+    (void)pcnetgame_members_commit(&nf, "resident credential confirmed");
+}
+/* ===== RESIDENT CREDENTIALS HOST END ===== */
 
 
 /* ===== X1 BEGIN: host-transactional PICKUP / DROP / BURY commit (protocol v8, HOST half) =====
@@ -21821,41 +22091,78 @@ static void pcnetgame_run_txn_dig_test_hook(void) {
     }
 }
 
-/* v2 host side: validate a parked IDENTITY against the host's own town, then either reject+drop or
- * accept (ACK -> READY -> roster -> snapshot). Only called with the host world ready. */
-static void pcnetgame_host_process_identity(PCNetPeerId peer) {
-    PCNetGameIdentityMsg in = s_host_peer[peer].pending_identity; /* copy: the reset below clears it */
-    PCNetGameIdentityExtMsg ext = s_host_peer[peer].ext;          /* copy: the reset below clears it (guests, G1) */
-    const int ext_guest = s_host_peer[peer].ext_valid && (ext.flags & PC_NETGAME_IDEXT_FLAG_GUEST) != 0;
+/* ===== ADMISSION DECIDE BEGIN (M-D): the admission decision as ONE function, built from the EXISTING steps in the SAME order =====
+ * pcnetgame_host_admission_decide() returns {RESIDENT idx | GUEST | REFUSE(reason, text)} and applies NO state change: the has_save / town checks, the classification
+ * (pcnetgame_host_classify_identity is NOT replaced: pc_mp_membership_lookup compares raw bytes while classify uses mPr_CheckCmpPersonalID + `exists`, so they are not proven
+ * equivalent), AMBIGUOUS -> refused, UNKNOWN without a GUEST claim -> NO_SAVE, UNKNOWN with a GUEST claim -> pcnetgame_host_guest_check, RESIDENT with a GUEST claim -> refused,
+ * RESIDENT -> the own-resident check and then (M-E) the credential check. The credential check sits BEFORE the duplicate-park step of the caller, so an impostor can never evict a
+ * live peer. The caller (pcnetgame_host_process_identity) keeps the duplicate park, the guest cap / reserve / allow_new_guests, the mint, the ACK and the IDENTITY_TOKEN.
+ * pc_mp_membership_lookup is used ONLY as a logged cross-check (pcnetgame_host_admission_crosscheck), never as the decider. */
+typedef enum PCNetGameAdmissionKind {
+    PCNETGAME_ADM_REFUSE = 0,
+    PCNETGAME_ADM_RESIDENT,
+    PCNETGAME_ADM_GUEST
+} PCNetGameAdmissionKind;
+
+enum {
+    PCNETGAME_ADM_R_HANDLED = 0, /* already logged and torn down inside the step (pcnetgame_host_guest_check) */
+    PCNETGAME_ADM_R_IDENTITY,    /* pcnetgame_host_refuse_identity(text, use_no_save): REJECT SERVER_FULL (8 B) or NO_SAVE (24 B) */
+    PCNETGAME_ADM_R_NO_SAVE_RAW, /* text = the complete log line; REJECT NO_SAVE (24 B) */
+    PCNETGAME_ADM_R_LAND_RAW,    /* text = the complete log line; REJECT LAND_MISMATCH (24 B) */
+    PCNETGAME_ADM_R_CREDENTIAL   /* M-E: REJECT RESIDENT_CREDENTIAL (8 B) */
+};
+
+typedef struct PCNetGameAdmission {
+    PCNetGameAdmissionKind kind;
+    int            resident_idx;   /* RESIDENT: the private_data index, else -1 */
+    int            resident_cred;  /* RESIDENT: 0 no credential involved, 1 KNOWN (token verified), 2 MINT (first claim) */
+    PersonalID_c   guest_key;      /* GUEST */
+    int            guest_slot;     /* GUEST: the existing table slot, -1 for a new key */
+    int            guest_mode;     /* GUEST: 0 new key, 1 known + token verified, 2 re-mint */
+    int            refuse_style;   /* REFUSE: PCNETGAME_ADM_R_* */
+    int            refuse_reason;  /* REFUSE: the PCNetGameRejectReason that goes on the wire (informational for HANDLED) */
+    int            refuse_no_save; /* PCNETGAME_ADM_R_IDENTITY: use the NO_SAVE form */
+    char           text[420];
+} PCNetGameAdmission;
+
+static void pcnetgame_host_admission_refuse_identity_text(PCNetGameAdmission* a, const char* text, int use_no_save) {
+    a->kind = PCNETGAME_ADM_REFUSE;
+    a->refuse_style = PCNETGAME_ADM_R_IDENTITY;
+    a->refuse_no_save = use_no_save;
+    a->refuse_reason = use_no_save ? PC_NETGAME_REJECT_NO_SAVE : PC_NETGAME_REJECT_SERVER_FULL;
+    snprintf(a->text, sizeof(a->text), "%s", text);
+}
+
+static void pcnetgame_host_admission_decide(PCNetPeerId peer, const PCNetGameIdentityMsg* in, const PCNetGameIdentityExtMsg* ext, int ext_valid, PCNetGameAdmission* a) {
+    const int ext_guest = ext_valid && (ext->flags & PC_NETGAME_IDEXT_FLAG_GUEST) != 0;
     PCNetGameTownIdentity peer_town;
     char host_buf[96], peer_buf[96];
     PCNetGameIdentityClass id_class;
     int resident_idx = -1;
     int own_idx;
-    int other;
-    int is_guest = 0, guest_slot = -1, guest_new = 0, guest_mode = 0, guest_remint = 0, dup_key;
-    PersonalID_c guest_key;
-    uint8_t guest_token[PC_NETGAME_GUEST_TOKEN_LEN];
-    uint8_t guest_old_token[PC_NETGAME_GUEST_TOKEN_LEN];
-    const char* dup_label;
 
-    s_host_peer[peer].identity_pending = 0;
+    memset(a, 0, sizeof(*a));
+    a->kind = PCNETGAME_ADM_REFUSE;
+    a->resident_idx = -1;
+    a->guest_slot = -1;
 
-    memcpy(peer_town.land_name, in.land_name, PC_NETGAME_LAND_LEN);
-    peer_town.land_id = in.land_id;
-    peer_town.terrain_hash = in.terrain_hash;
+    memcpy(peer_town.land_name, in->land_name, PC_NETGAME_LAND_LEN);
+    peer_town.land_id = in->land_id;
+    peer_town.terrain_hash = in->terrain_hash;
     pcnetgame_format_town(&s_host_town, host_buf, sizeof(host_buf));
     pcnetgame_format_town(&peer_town, peer_buf, sizeof(peer_buf));
 
-    if (!in.has_save) {
-        printf("[NET] host: peer %d sent IDENTITY without a loaded save -- rejecting (NO_SAVE)\n", (int)peer);
-        pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject_town(peer, PC_NETGAME_REJECT_NO_SAVE, &s_host_town));
+    /* step 1: has_save / town */
+    if (!in->has_save) {
+        a->refuse_style = PCNETGAME_ADM_R_NO_SAVE_RAW;
+        a->refuse_reason = PC_NETGAME_REJECT_NO_SAVE;
+        snprintf(a->text, sizeof(a->text), "[NET] host: peer %d sent IDENTITY without a loaded save -- rejecting (NO_SAVE)", (int)peer);
         return;
     }
     if (!pcnetgame_town_equal(&peer_town, &s_host_town)) {
-        printf("[NET] host: peer %d is in a different town (peer %s, host %s) -- rejecting (LAND_MISMATCH)\n",
-               (int)peer, peer_buf, host_buf);
-        pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject_town(peer, PC_NETGAME_REJECT_LAND_MISMATCH, &s_host_town));
+        a->refuse_style = PCNETGAME_ADM_R_LAND_RAW;
+        a->refuse_reason = PC_NETGAME_REJECT_LAND_MISMATCH;
+        snprintf(a->text, sizeof(a->text), "[NET] host: peer %d is in a different town (peer %s, host %s) -- rejecting (LAND_MISMATCH)", (int)peer, peer_buf, host_buf);
         return;
     }
 
@@ -21866,39 +22173,166 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
      * ("no room for you") is the closest; "the host has no such resident" reuses REJECT(NO_SAVE), the 24-byte
      * form, whose meaning ("no usable save record for this player") is the closest. The client treats every
      * REJECT identically (log + shutdown), so neither has a behavioural downside; only the log wording is
-     * imprecise. The host-side log line carries the real reason. */
-    id_class = pcnetgame_host_classify_identity(&in, &resident_idx);
+     * imprecise. The host-side log line carries the real reason. (M-E added reason 5, RESIDENT_CREDENTIAL.) */
+    id_class = pcnetgame_host_classify_identity(in, &resident_idx);
     if (id_class == PCNETGAME_IDCLASS_AMBIGUOUS) {
-        pcnetgame_host_refuse_identity(peer, "claimed identity matches more than one resident record (ambiguous)", 0);
+        pcnetgame_host_admission_refuse_identity_text(a, "claimed identity matches more than one resident record (ambiguous)", 0);
         return;
     }
     if (id_class != PCNETGAME_IDCLASS_RESIDENT) {
         if (!ext_guest) {
             /* Stage-1A rule (unchanged for a client without a guest claim): unknown identities are refused. */
-            pcnetgame_host_refuse_identity(peer, "claimed identity matches no resident record of this town", 1);
+            pcnetgame_host_admission_refuse_identity_text(a, "claimed identity matches no resident record of this town", 1);
             return;
         }
         /* Guests (G1): UNKNOWN + a valid IDENTITY_EXT guest claim = a guest candidate. The HOST derives everything: the key is checked against
          * the claim, this town and every resident / house owner, the token against the guest table (pcnetgame_host_guest_check). */
-        if (!pcnetgame_host_guest_check(peer, &in, &ext, &guest_key, &guest_slot, &guest_mode)) {
-            return; /* refused (logged, peer torn down) */
+        if (!pcnetgame_host_guest_check(peer, in, ext, &a->guest_key, &a->guest_slot, &a->guest_mode)) {
+            a->refuse_style = PCNETGAME_ADM_R_HANDLED; /* refused (logged, peer torn down) */
+            a->refuse_reason = PC_NETGAME_REJECT_SERVER_FULL;
+            return;
         }
-        is_guest = 1;
-    } else if (ext_guest) {
+        a->kind = PCNETGAME_ADM_GUEST;
+        return;
+    }
+    if (ext_guest) {
         /* A guest-flagged claim whose IDENTITY matches a resident of this town: the guest path can never claim a resident, and a resident
          * never sends a guest claim (a client sends IDENTITY_EXT only when it plays a foreigner): refused, not bound as either. */
         printf("[NET][IDENTITY] host: peer %d sent a GUEST claim but its IDENTITY matches resident %d\n", (int)peer, resident_idx);
-        pcnetgame_host_refuse_identity(peer, "guest-flagged claim matches a resident of this town (a guest can never claim or become a resident)", 0);
+        pcnetgame_host_admission_refuse_identity_text(a, "guest-flagged claim matches a resident of this town (a guest can never claim or become a resident)", 0);
         return;
     }
-    if (!is_guest) {
-        own_idx = pcnetgame_host_own_resident_idx();
-        if (own_idx >= 0 && resident_idx == own_idx) {
-            printf("[NET][IDENTITY] host: peer %d claims resident %d, which is the host's own active resident\n", (int)peer,
-                   resident_idx);
-            pcnetgame_host_refuse_identity(peer, "claimed resident is the host's own resident", 0);
+    own_idx = pcnetgame_host_own_resident_idx();
+    if (own_idx >= 0 && resident_idx == own_idx) {
+        printf("[NET][IDENTITY] host: peer %d claims resident %d, which is the host's own active resident\n", (int)peer, resident_idx);
+        pcnetgame_host_admission_refuse_identity_text(a, "claimed resident is the host's own resident", 0);
+        return;
+    }
+    /* M-E: the resident credential (policy off = nothing happens). Before the caller's duplicate-park step. */
+    {
+        char why[420];
+        int cmode = 0;
+        if (!pcnetgame_host_resident_credential_check(peer, resident_idx, in, ext, ext_valid, &cmode, why, sizeof(why))) {
+            a->refuse_style = PCNETGAME_ADM_R_CREDENTIAL;
+            a->refuse_reason = PC_NETGAME_REJECT_RESIDENT_CREDENTIAL;
+            snprintf(a->text, sizeof(a->text), "%s", why);
             return;
         }
+        a->resident_cred = cmode;
+    }
+    a->kind = PCNETGAME_ADM_RESIDENT;
+    a->resident_idx = resident_idx;
+}
+
+/* Applies a REFUSE decision (the logs and wire answers of the original inline code, unchanged). */
+static void pcnetgame_host_admission_apply_refusal(PCNetPeerId peer, const PCNetGameAdmission* a) {
+    switch (a->refuse_style) {
+        case PCNETGAME_ADM_R_IDENTITY:
+            pcnetgame_host_refuse_identity(peer, a->text, a->refuse_no_save);
+            break;
+        case PCNETGAME_ADM_R_NO_SAVE_RAW:
+            printf("%s\n", a->text);
+            pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject_town(peer, PC_NETGAME_REJECT_NO_SAVE, &s_host_town));
+            break;
+        case PCNETGAME_ADM_R_LAND_RAW:
+            printf("%s\n", a->text);
+            pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject_town(peer, PC_NETGAME_REJECT_LAND_MISMATCH, &s_host_town));
+            break;
+        case PCNETGAME_ADM_R_CREDENTIAL:
+            printf("[NET][IDENTITY] host: peer %d REFUSED before READY: %s\n", (int)peer, a->text);
+            pcnetgame_host_reject_and_close(peer, pcnetgame_send_reject(peer, PC_NETGAME_REJECT_RESIDENT_CREDENTIAL));
+            break;
+        default:
+            break; /* HANDLED */
+    }
+}
+
+/* Logged cross-check against the pure membership layer (pc_mp_membership_lookup): a line ONLY when it disagrees with the decision about the RESIDENT dimension of the IDENTITY
+ * claim; the decision always stands. */
+static void pcnetgame_host_admission_crosscheck(PCNetPeerId peer, const PCNetGameIdentityMsg* in, const PCNetGameAdmission* a) {
+    uint8_t res_pid[PLAYER_NUM][20];
+    uint8_t res_exists[PLAYER_NUM];
+    uint8_t claim[20];
+    PCMpTownKey tk;
+    PCMpMembership mm;
+    int i, kind;
+    if (a->kind == PCNETGAME_ADM_REFUSE) {
+        return;
+    }
+    memset(res_pid, 0, sizeof(res_pid));
+    memset(res_exists, 0, sizeof(res_exists));
+    for (i = 0; i < PLAYER_NUM; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        if (mPr_NullCheckPersonalID(p) == FALSE) {
+            memcpy(res_pid[i], p->player_name, PC_NETGAME_NAME_LEN);
+            memcpy(res_pid[i] + 8, p->land_name, PC_NETGAME_LAND_LEN);
+            res_pid[i][16] = (uint8_t)(p->player_id >> 8);
+            res_pid[i][17] = (uint8_t)p->player_id;
+            res_pid[i][18] = (uint8_t)(p->land_id >> 8);
+            res_pid[i][19] = (uint8_t)p->land_id;
+            res_exists[i] = Save_Get(private_data)[i].exists == TRUE ? 1 : 0;
+        }
+    }
+    memcpy(claim, in->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(claim + 8, in->land_name, PC_NETGAME_LAND_LEN);
+    claim[16] = (uint8_t)(in->player_id >> 8);
+    claim[17] = (uint8_t)in->player_id;
+    claim[18] = (uint8_t)(in->land_id >> 8);
+    claim[19] = (uint8_t)in->land_id;
+    memcpy(tk.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN);
+    tk.land_id = s_host_town.land_id;
+    tk.terrain_hash = s_host_town.terrain_hash;
+    kind = pc_mp_membership_lookup(claim, &tk, (const uint8_t(*)[20])res_pid, res_exists, NULL, &mm);
+    if (a->kind == PCNETGAME_ADM_RESIDENT ? (kind != PC_MP_MEMBER_RESIDENT || mm.res_index != a->resident_idx) : (kind == PC_MP_MEMBER_RESIDENT)) {
+        printf("[NET][IDENTITY] host: peer %d admission CROSS-CHECK differs: the decision is %s%d, pc_mp_membership_lookup says kind=%d (resident index %d); the decision stands\n", (int)peer,
+               a->kind == PCNETGAME_ADM_RESIDENT ? "RESIDENT " : "GUEST ", a->kind == PCNETGAME_ADM_RESIDENT ? a->resident_idx : a->guest_slot, kind, mm.res_index);
+    }
+}
+/* ===== ADMISSION DECIDE END ===== */
+
+/* v2 host side: validate a parked IDENTITY against the host's own town, then either reject+drop or
+ * accept (ACK -> READY -> roster -> snapshot). Only called with the host world ready. The admission DECISION is pcnetgame_host_admission_decide() (M-D). */
+static void pcnetgame_host_process_identity(PCNetPeerId peer) {
+    PCNetGameIdentityMsg in = s_host_peer[peer].pending_identity; /* copy: the reset below clears it */
+    PCNetGameIdentityExtMsg ext = s_host_peer[peer].ext;          /* copy: the reset below clears it (guests, G1) */
+    const int ext_valid = s_host_peer[peer].ext_valid;
+    PCNetGameTownIdentity peer_town;
+    char host_buf[96], peer_buf[96];
+    PCNetGameAdmission adm;
+    int resident_idx = -1;
+    int other;
+    int is_guest = 0, guest_slot = -1, guest_new = 0, guest_mode = 0, guest_remint = 0, dup_key;
+    int res_cred = 0, res_minted = 0;
+    PersonalID_c guest_key;
+    uint8_t guest_token[PC_NETGAME_GUEST_TOKEN_LEN];
+    uint8_t guest_old_token[PC_NETGAME_GUEST_TOKEN_LEN];
+    uint8_t res_token[PC_MP_MEMBERS_TOKEN_SIZE];
+    const char* dup_label;
+
+    s_host_peer[peer].identity_pending = 0;
+
+    memcpy(peer_town.land_name, in.land_name, PC_NETGAME_LAND_LEN);
+    peer_town.land_id = in.land_id;
+    peer_town.terrain_hash = in.terrain_hash;
+    pcnetgame_format_town(&s_host_town, host_buf, sizeof(host_buf));
+    pcnetgame_format_town(&peer_town, peer_buf, sizeof(peer_buf));
+
+    /* M-D: the admission decision (has_save / town, classify, guest or resident rules, the M-E credential check) is ONE function; this function keeps the duplicate park, the
+     * guest cap / reserve / allow_new_guests, the mint, the ACK and the IDENTITY_TOKEN. */
+    pcnetgame_host_admission_decide(peer, &in, &ext, ext_valid, &adm);
+    if (adm.kind == PCNETGAME_ADM_REFUSE) {
+        pcnetgame_host_admission_apply_refusal(peer, &adm);
+        return;
+    }
+    pcnetgame_host_admission_crosscheck(peer, &in, &adm);
+    if (adm.kind == PCNETGAME_ADM_GUEST) {
+        is_guest = 1;
+        guest_key = adm.guest_key;
+        guest_slot = adm.guest_slot;
+        guest_mode = adm.guest_mode;
+    } else {
+        resident_idx = adm.resident_idx;
+        res_cred = adm.resident_cred;
     }
     other = is_guest ? (guest_slot >= 0 ? pcnetgame_host_peer_bound_to_guest(guest_slot, peer) : -1)
                      : pcnetgame_host_peer_bound_to_resident(resident_idx, peer);
@@ -21953,6 +22387,13 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
             return;
         }
         if (guest_mode != 1) {
+            /* M-D allow_new_guests = 0: a NEW guest key (first contact, no table entry) is refused as a full server BEFORE anything is minted / created / rate counted; a known key
+             * whose entry is re-minted (guest_mode 2) and every token-verified guest (guest_mode 1, not in this block) are NOT affected. */
+            if (guest_mode == 0 && !pcnetgame_host_allow_new_guests()) {
+                printf("[NET][GUEST] host: peer %d: new guest key refused (allow_new_guests=0; only guests this host already knows may join)\n", (int)peer);
+                pcnetgame_host_refuse_identity(peer, "new guests are not accepted on this host (allow_new_guests=0)", 0);
+                return;
+            }
             /* M3: a token ISSUANCE (first contact of a key, or the re-mint of an unconfirmed entry) is rate limited per source address, BEFORE
              * anything is minted or evicted; bounded memory (a small ring), refused with a log. */
             const uint32_t mint_now = pcnetgame_now_ms();
@@ -21990,6 +22431,24 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         }
     }
 
+    if (!is_guest && res_cred == 2) {
+        /* M-E MINT (tofu first claim, or one resident-arm under required): the credential is durable in members.dat BEFORE anything is sent; after the duplicate-park step above, so
+         * an impostor can never evict a live peer for it. */
+        const int mr = pcnetgame_resident_mint(resident_idx, res_token);
+        if (mr != 0) {
+            pcnetgame_host_refuse_identity(peer, mr == -1 ? "resident credential table is full (no room for a new credential)"
+                                                 : mr == -2 ? "no OS randomness available to mint a resident token"
+                                                            : "the new resident credential could not be persisted (members.dat write failed)", 0);
+            return;
+        }
+        res_minted = 1;
+    } else if (!is_guest && res_cred == 1) {
+        const int ci = pcnetgame_resident_cred_find(resident_idx);
+        if (ci >= 0) {
+            memcpy(res_token, s_members_file.e[ci].token, PC_MP_MEMBERS_TOKEN_SIZE);
+        }
+    }
+
     /* Accept. Reset every per-peer cache FIRST (a reused slot inherits nothing), then build state. */
     pcnetgame_reset_all_host_peer_state(peer);
 
@@ -22022,9 +22481,29 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
                 pcnetgame_guest_rollback_create(guest_slot); /* the guest never got its token: forget the entry again */
             } else if (guest_remint) {
                 pcnetgame_guest_remint_rollback(guest_slot, guest_old_token);
+            } else if (res_minted) {
+                pcnetgame_resident_mint_rollback(resident_idx); /* M-E: the resident never got its token */
             }
             pcnetgame_host_drop_peer(peer);
             return;
+        }
+        if (!is_guest && res_cred != 0) {
+            /* M-E: IDENTITY_TOKEN with the RESIDENT flag (+ NEW for a fresh mint, KNOWN for a verified token): guest_slot = the resident index, table_size = 4 */
+            PCNetGameIdentityTokenMsg rtk;
+            memset(&rtk, 0, sizeof(rtk));
+            rtk.msg_type = (uint8_t)PC_NETGAME_MSG_IDENTITY_TOKEN;
+            rtk.flags = (uint8_t)(PC_NETGAME_IDTOKEN_FLAG_RESIDENT | (res_minted ? PC_NETGAME_IDTOKEN_FLAG_NEW : PC_NETGAME_IDTOKEN_FLAG_KNOWN));
+            rtk.guest_slot = (uint8_t)resident_idx;
+            rtk.table_size = (uint8_t)PC_NETGAME_RESIDENT_TABLE_SIZE;
+            memcpy(rtk.token, res_token, PC_NETGAME_GUEST_TOKEN_LEN);
+            if (!pc_net_send(peer, PC_NET_RELIABLE, &rtk, (uint16_t)sizeof(rtk))) {
+                printf("[NET] host: peer %d resident IDENTITY_TOKEN could not be queued -- dropping peer\n", (int)peer);
+                if (res_minted) {
+                    pcnetgame_resident_mint_rollback(resident_idx);
+                }
+                pcnetgame_host_drop_peer(peer);
+                return;
+            }
         }
         if (is_guest) {
             PCNetGameIdentityTokenMsg tk;
@@ -22061,6 +22540,12 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
         s_host_peer[peer].bound_resident_idx = resident_idx;
         mPr_CopyPersonalID(&s_host_peer[peer].bound_pid, &Save_Get(private_data)[resident_idx].player_ID);
         printf("[NET][IDENTITY] host: peer %d bound to resident %d (host-derived)\n", (int)peer, resident_idx);
+        if (res_cred != 0) {
+            printf("[NET][RESIDENT] host: peer %d resident %d credential %s\n", (int)peer, resident_idx, res_minted ? "MINTED (first claim, token sent: NEW)" : "verified (token sent: KNOWN)");
+            if (!res_minted) {
+                pcnetgame_resident_confirm(resident_idx); /* the client presented the token = it stored it */
+            }
+        }
     }
     printf("[NET] host: peer %d identity OK (player_id=%u, %s) -> READY\n", (int)peer, (unsigned)in.player_id, peer_buf);
 
@@ -22121,8 +22606,10 @@ static void pcnetgame_handle_host_identity_ext(PCNetPeerId peer, const uint8_t* 
         why = "wrong size";
     } else {
         memcpy(&m, data, sizeof(m));
-        if ((m.flags & ~PC_NETGAME_IDEXT_FLAG_GUEST) != 0 || m._reserved0 != 0 || m._reserved1 != 0 || m.token_present > 1) {
+        if ((m.flags & ~(PC_NETGAME_IDEXT_FLAG_GUEST | PC_NETGAME_IDEXT_FLAG_RESIDENT)) != 0 || m._reserved0 != 0 || m._reserved1 != 0 || m.token_present > 1) {
             why = "reserved / undefined bits set";
+        } else if ((m.flags & (PC_NETGAME_IDEXT_FLAG_GUEST | PC_NETGAME_IDEXT_FLAG_RESIDENT)) == (PC_NETGAME_IDEXT_FLAG_GUEST | PC_NETGAME_IDEXT_FLAG_RESIDENT)) {
+            why = "both the GUEST and the RESIDENT claim flags are set (exactly one is allowed)";
         } else if (m.token_present == 0) {
             int i;
             for (i = 0; i < (int)PC_NETGAME_GUEST_TOKEN_LEN; i++) {
@@ -22138,6 +22625,10 @@ static void pcnetgame_handle_host_identity_ext(PCNetPeerId peer, const uint8_t* 
     }
     st->ext = m;
     st->ext_valid = 1;
+    if ((m.flags & PC_NETGAME_IDEXT_FLAG_RESIDENT) != 0) {
+        printf("[NET][IDENTITY] host: peer %d IDENTITY_EXT cached (resident claim, token_present=%d; acted on only when resident_tokens != off)\n", (int)peer, (int)m.token_present);
+        return;
+    }
     printf("[NET][IDENTITY] host: peer %d IDENTITY_EXT cached (guest=%d, token_present=%d)\n", (int)peer,
            (m.flags & PC_NETGAME_IDEXT_FLAG_GUEST) != 0, (int)m.token_present);
 }
@@ -22919,6 +23410,7 @@ static PCNetGameIdentityExtMsg s_client_ext_sent;             /* what the IDENTI
 static PCMpGtkFile             s_client_gtk;                  /* the token file, loaded once per process */
 static int                     s_client_gtk_loaded = 0;
 static int                     s_client_gtk_unreadable = 0;
+static int                     s_client_token_kind = 0;       /* M-E: 0 = the file of a GUEST token (pc_guest_token_path()), 1 = a RESIDENT token (store character: the same per-town token.dat; legacy / CLI: save/mp/resident_token.dat) */
 
 static int s_client_identity_create_logged = 0;
 extern int pc_guest_creation_active(void); /* pc_m_card.c: a first-run guest profile is being created in the Rover scene */
@@ -22927,20 +23419,34 @@ static int pcnetgame_client_is_guest_player(void) {
     return Now_Private != NULL && (int)Common_Get(player_no) >= (int)mPr_FOREIGNER;
 }
 
+/* M-E: the token file of this process' claim kind. Guests: exactly as before. A resident of a STORE character shares the character's per-town token.dat (the entry is keyed by
+ * the resident PersonalID of that town); a legacy / CLI resident uses save/mp/resident_token.dat (same PCMpGtk format, keyed by town + resident PID). */
+static const char* pcnetgame_client_token_path(void) {
+    if (s_client_token_kind == 1 && pc_session()->storage != PC_CHARACTER_STORAGE_STORE) {
+        return PC_MP_MEMBERS_RESIDENT_TOKEN_PATH;
+    }
+    return pc_guest_token_path();
+}
+
 static void pcnetgame_client_gtk_load(void) {
     if (s_client_gtk_loaded) {
         return;
     }
     s_client_gtk_loaded = 1;
-    (void)pc_mp_gtoken_load(pc_guest_token_path(), &s_client_gtk, &s_client_gtk_unreadable);
+    (void)pc_mp_gtoken_load(pcnetgame_client_token_path(), &s_client_gtk, &s_client_gtk_unreadable);
 }
 
-static void pcnetgame_client_build_ext(PCNetGameIdentityExtMsg* m, const PCNetGameTownIdentity* town) {
+/* resident != 0: the M-E RESIDENT claim (home_* = the resident's PersonalID in the host town = the IDENTITY's); else the guest claim of G1. */
+static void pcnetgame_client_build_ext_ex(PCNetGameIdentityExtMsg* m, const PCNetGameTownIdentity* town, int resident) {
     uint8_t home_be[PC_MP_GUEST_PID_SIZE];
     int i;
+    if (s_client_token_kind != (resident ? 1 : 0)) {
+        s_client_token_kind = resident ? 1 : 0;
+        s_client_gtk_loaded = 0; /* another token file */
+    }
     memset(m, 0, sizeof(*m));
     m->msg_type = (uint8_t)PC_NETGAME_MSG_IDENTITY_EXT;
-    m->flags = (uint8_t)PC_NETGAME_IDEXT_FLAG_GUEST;
+    m->flags = resident ? (uint8_t)PC_NETGAME_IDEXT_FLAG_RESIDENT : (uint8_t)PC_NETGAME_IDEXT_FLAG_GUEST;
     memcpy(m->home_player_name, Now_Private->player_ID.player_name, PC_NETGAME_NAME_LEN);
     memcpy(m->home_land_name, Now_Private->player_ID.land_name, PC_NETGAME_LAND_LEN);
     m->home_player_id = Now_Private->player_ID.player_id;
@@ -22960,7 +23466,7 @@ static void pcnetgame_client_build_ext(PCNetGameIdentityExtMsg* m, const PCNetGa
     if (i >= 0) {
         m->token_present = 1;
         memcpy(m->token, s_client_gtk.e[i].token, PC_NETGAME_GUEST_TOKEN_LEN);
-    } else {
+    } else if (!resident) {
         /* M2: a STORE character imported from a legacy profile: READ-ONLY fallback to the legacy token file, copied forward on a hit */
         PCMpGtkEntry lg;
         if (pc_session_legacy_token_lookup(town->land_name, town->land_id, town->terrain_hash, home_be, &lg)) {
@@ -22973,6 +23479,70 @@ static void pcnetgame_client_build_ext(PCNetGameIdentityExtMsg* m, const PCNetGa
     }
 }
 
+static void pcnetgame_client_build_ext(PCNetGameIdentityExtMsg* m, const PCNetGameTownIdentity* town) {
+    pcnetgame_client_build_ext_ex(m, town, 0);
+}
+
+/* M-E: a resident client = it plays a RESIDENT of the town it connects to (Common player_no < mPr_FOREIGNER, Now_Private = its private_data). */
+static int pcnetgame_client_is_resident_player(void) {
+    return Now_Private != NULL && (int)Common_Get(player_no) < (int)mPr_FOREIGNER;
+}
+
+/* M-E: IDENTITY_TOKEN with the RESIDENT flag. Same rules as a guest token: only after our own RESIDENT claim, one per connection; a first contact persists the token (BEFORE anything
+ * depends on it); a token that DIFFERS from the one this client PRESENTED means this is not the host that issued it: the client refuses the host. */
+static void pcnetgame_handle_client_resident_token(const PCNetGameIdentityTokenMsg* m) {
+    PCMpGtkEntry e;
+    const char* tp = pcnetgame_client_token_path();
+    if (!s_client_resident_claim_sent) {
+        printf("[NET][RESIDENT] client: resident IDENTITY_TOKEN ignored (this client did not send a resident claim)\n");
+        return;
+    }
+    if (s_client_token_received) {
+        printf("[NET][RESIDENT] client: a second IDENTITY_TOKEN on this connection ignored\n");
+        return;
+    }
+    s_client_token_received = 1;
+    if (s_client_ext_sent.token_present) {
+        if (memcmp(m->token, s_client_ext_sent.token, PC_NETGAME_GUEST_TOKEN_LEN) != 0) {
+            printf("[NET][RESIDENT] client: *** the host issued a DIFFERENT resident token than the one this client PRESENTED for this town: this is not the host that issued it "
+                   "(its credential table was reset, another machine hosts a copy of the town, or an impostor). REFUSING the host. To start over delete %s and ask the host operator "
+                   "to run resident-reset for your resident ***\n", tp);
+            pcnetgame_join_message_set(0, "The host gave your resident a DIFFERENT token than the one you hold: this is not the host that issued it. You were disconnected. Delete %s "
+                                          "and ask the host operator to run resident-reset for your resident.", tp);
+            pcnetgame_client_refused("resident token mismatch");
+            return;
+        }
+        printf("[NET][RESIDENT] client: resident token verified by the host (resident %u)\n", (unsigned)m->guest_slot);
+        return;
+    }
+    memset(&e, 0, sizeof(e));
+    e.present = 1;
+    memcpy(e.host_land_name, s_client_claimed_town.land_name, PC_NETGAME_LAND_LEN);
+    e.host_land_id = s_client_claimed_town.land_id;
+    e.host_terrain_hash = s_client_claimed_town.terrain_hash;
+    memcpy(e.home_pid, s_client_ext_sent.home_player_name, PC_NETGAME_NAME_LEN);
+    memcpy(e.home_pid + 8, s_client_ext_sent.home_land_name, PC_NETGAME_LAND_LEN);
+    e.home_pid[16] = (uint8_t)(s_client_ext_sent.home_player_id >> 8);
+    e.home_pid[17] = (uint8_t)s_client_ext_sent.home_player_id;
+    e.home_pid[18] = (uint8_t)(s_client_ext_sent.home_land_id >> 8);
+    e.home_pid[19] = (uint8_t)s_client_ext_sent.home_land_id;
+    memcpy(e.token, m->token, PC_NETGAME_GUEST_TOKEN_LEN);
+    pcnetgame_client_gtk_load();
+    (void)pc_mp_gtoken_put(&s_client_gtk, &e);
+    if (pc_mp_gtoken_save(tp, &s_client_gtk) == PC_MP_GST_OK) {
+        printf("[NET][RESIDENT] client: first claim: resident token (resident %u) saved to %s\n", (unsigned)m->guest_slot, tp);
+        if (pc_session()->storage == PC_CHARACTER_STORAGE_STORE) {
+            char key[PC_CHARACTER_TOWNKEY_LEN + 1];
+            pc_character_town_key_format(e.host_land_name, e.host_land_id, e.host_terrain_hash, key);
+            (void)pc_character_membership_write(NULL, pc_session()->character.uuid, key, "resident", e.home_pid, "");
+        }
+    } else {
+        printf("[NET][RESIDENT] client: *** could NOT save the resident token to %s: the host will refuse this resident on the next visit until its operator runs resident-reset ***\n", tp);
+        pcnetgame_join_message_set(0, "Your resident token could not be saved to %s. The host will refuse you next time until its operator runs resident-reset for your resident. "
+                                      "Check that the folder is writable.", tp);
+    }
+}
+
 static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t size) {
     PCNetGameIdentityTokenMsg m;
     PCMpGtkEntry e;
@@ -22980,6 +23550,10 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
         return;
     }
     memcpy(&m, data, sizeof(m));
+    if ((m.flags & PC_NETGAME_IDTOKEN_FLAG_RESIDENT) != 0) {
+        pcnetgame_handle_client_resident_token(&m); /* M-E: a RESIDENT token (never a guest token) */
+        return;
+    }
     if (!s_client_guest_claim_sent) {
         printf("[NET][GUEST] client: IDENTITY_TOKEN ignored (this client did not claim a guest identity)\n");
         return;
@@ -23060,6 +23634,10 @@ static void pcnetgame_reject_text(unsigned reason, unsigned host_protocol, const
             break;
         case PC_NETGAME_REJECT_LAND_MISMATCH:
             snprintf(out, cap, "Your town (%s) is not the host's town (%s). Copy the host's town save (DobutsunomoriP_MURA.gci) into save/card_a and restart.", b, a);
+            break;
+        case PC_NETGAME_REJECT_RESIDENT_CREDENTIAL:
+            snprintf(out, cap, "The host refused your resident: resident credential missing or wrong: ask the operator for resident-reset/arm.%s",
+                     s_client_ext_sent.token_present ? " This client presented a token: the host may have reset its credentials (delete the stored resident token)." : "");
             break;
         case PC_NETGAME_REJECT_NO_SAVE:
             snprintf(out, cap, "The host (town %s) has no resident matching your character. Play one of the host's residents, or join as a guest (Join as Guest / --guest).", a);
@@ -23489,6 +24067,7 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_client_host_identity, 0, sizeof(s_client_host_identity));
     s_client_identity_sent = 0;
     s_client_guest_claim_sent = 0; /* guests (G1): the claim is per connection */
+    s_client_resident_claim_sent = 0; /* M-E: per connection too */
     s_client_token_received = 0;
     memset(&s_client_ext_sent, 0, sizeof(s_client_ext_sent));
     s_client_identity_defer_logged = 0;
@@ -23929,6 +24508,17 @@ static void pcnetgame_client_tick(void) {
                 s_client_ext_sent = ext;
                 s_client_guest_claim_sent = 1;
                 printf("[NET][GUEST] client: playing a guest -- sent IDENTITY_EXT (token %s)\n", ext.token_present ? "held" : "not held (first contact)");
+            } else if (pcnetgame_client_is_resident_player() && !s_client_resident_claim_sent) {
+                /* M-E: a RESIDENT claim (home_* = our resident PersonalID, the token this host issued earlier). A host with resident_tokens = off parses and ignores it; an OLD host
+                 * drops it as an unknown flag and admits the legacy way. */
+                PCNetGameIdentityExtMsg rext;
+                pcnetgame_client_build_ext_ex(&rext, &s_client_claimed_town, 1);
+                if (!pc_net_send(0, PC_NET_RELIABLE, &rext, (uint16_t)sizeof(rext))) {
+                    return; /* retried next tick */
+                }
+                s_client_ext_sent = rext;
+                s_client_resident_claim_sent = 1;
+                printf("[NET][RESIDENT] client: playing a resident -- sent IDENTITY_EXT (token %s)\n", rext.token_present ? "held" : "not held (first claim)");
             }
             pcnetgame_build_identity_msg(&msg, &s_client_claimed_town);
             if (pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
@@ -29277,6 +29867,152 @@ int pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char
     return 1;
 }
 /* ===== GUESTS G6.2 END ===== */
+
+/* ===== RESIDENT CREDENTIALS ADMIN (M-E): dedicated console `residents` / `resident-reset` / `resident-arm`. Main thread only, HOST only. ===== */
+int pc_net_game_dedicated_resident_info(int slot, PCNetGameDedicatedResidentInfo* out) {
+    const PersonalID_c* pid;
+    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready || slot < 0 || slot >= PLAYER_NUM) {
+        return 0;
+    }
+    pid = &Save_Get(private_data)[slot].player_ID;
+    if (mPr_NullCheckPersonalID((PersonalID_c*)pid) != FALSE || Save_Get(private_data)[slot].exists != TRUE) {
+        return 0;
+    }
+    pcnetgame_members_store_load(); /* a read of the file (and, when it is unreadable, the same preserve-aside + UNTRUSTED handling as at host start) */
+    memset(out, 0, sizeof(*out));
+    out->slot = slot;
+    pcnetgame_dedicated_ascii_name(pid->player_name, out->name);
+    out->policy = pcnetgame_resident_policy();
+    out->untrusted = s_members_untrusted;
+    {
+        const int ci = pcnetgame_resident_cred_find(slot);
+        out->has_cred = ci >= 0;
+        out->confirmed = ci >= 0 && s_members_file.e[ci].confirmed ? 1 : 0;
+    }
+    out->armed = pcnetgame_resident_arm_active(slot);
+    out->bound_peer = pcnetgame_host_peer_bound_to_resident(slot, (PCNetPeerId)-1);
+    return 1;
+}
+
+/* sel: a single digit 0..3 = the resident slot, otherwise the resident name (case-insensitive; it must name exactly ONE resident). */
+static int pcnetgame_dedicated_resident_resolve(const char* sel, char* msg, size_t cap) {
+    int i, found = -1, n = 0;
+    char nm[PC_NETGAME_NAME_LEN + 1];
+    if (sel == NULL || sel[0] == '\0') {
+        snprintf(msg, cap, "missing <slot|name> (see `residents`)");
+        return -1;
+    }
+    if (sel[0] >= '0' && sel[0] <= '3' && sel[1] == '\0') {
+        i = sel[0] - '0';
+        if (mPr_NullCheckPersonalID(&Save_Get(private_data)[i].player_ID) != FALSE || Save_Get(private_data)[i].exists != TRUE) {
+            snprintf(msg, cap, "resident slot %d is not in use (see `residents`)", i);
+            return -1;
+        }
+        return i;
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        if (mPr_NullCheckPersonalID(&Save_Get(private_data)[i].player_ID) != FALSE || Save_Get(private_data)[i].exists != TRUE) {
+            continue;
+        }
+        pcnetgame_dedicated_ascii_name(Save_Get(private_data)[i].player_ID.player_name, nm);
+        if (pcnetgame_dedicated_ieq(nm, sel)) {
+            found = i;
+            n++;
+        }
+    }
+    if (n == 0) {
+        snprintf(msg, cap, "no resident named \"%s\" (see `residents`)", sel);
+        return -1;
+    }
+    if (n > 1) {
+        snprintf(msg, cap, "the name \"%s\" matches %d residents: use the slot number (see `residents`)", sel, n);
+        return -1;
+    }
+    return found;
+}
+
+int pc_net_game_dedicated_resident_admin(int op, const char* sel, int confirm, char* msg, size_t cap) {
+    char bak[340];
+    char who[PC_NETGAME_NAME_LEN + 1];
+    int r, peer, ci;
+    if (msg == NULL || cap < 8) {
+        return 0;
+    }
+    msg[0] = '\0';
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        snprintf(msg, cap, "refused: this process is not a host with a ready world");
+        return 0;
+    }
+    pcnetgame_members_store_load();
+    if (s_members_untrusted) {
+        snprintf(msg, cap, "refused: members.dat is UNTRUSTED (existed but unreadable); fix the file first (see the startup log), nothing can be changed safely");
+        return 0;
+    }
+    r = pcnetgame_dedicated_resident_resolve(sel, msg, cap);
+    if (r < 0) {
+        char tmp[240];
+        snprintf(tmp, sizeof(tmp), "refused: %s", msg);
+        snprintf(msg, cap, "%s", tmp);
+        return 0;
+    }
+    pcnetgame_dedicated_ascii_name(Save_Get(private_data)[r].player_ID.player_name, who);
+    peer = pcnetgame_host_peer_bound_to_resident(r, (PCNetPeerId)-1);
+    if (peer >= 0) {
+        snprintf(msg, cap, "refused: resident %d (\"%s\") is connected on peer %d right now; wait until it has left", r, who, peer);
+        return 0;
+    }
+    ci = pcnetgame_resident_cred_find(r);
+    if (op == 0 && ci < 0) {
+        snprintf(msg, cap, "refused: resident %d (\"%s\") has no credential (nothing to reset)", r, who);
+        return 0;
+    }
+    if (op == 1) {
+        if (pcnetgame_resident_policy() != PC_NETGAME_RESTOK_REQUIRED) {
+            snprintf(msg, cap, "refused: resident-arm is only needed under resident_tokens=required (this host runs %s)", pcnetgame_resident_policy_name());
+            return 0;
+        }
+        if (ci >= 0) {
+            snprintf(msg, cap, "refused: resident %d (\"%s\") already has a credential (use resident-reset to delete it first)", r, who);
+            return 0;
+        }
+    }
+    if (!confirm) {
+        if (op == 0) {
+            snprintf(msg, cap, "resident %d (\"%s\"): this DELETES its credential (members.dat is backed up first); the next claim mints a new one (tofu) or needs resident-arm (required); "
+                               "the real player must also delete its stored resident token; re-run with `confirm` as the last argument", r, who);
+        } else {
+            snprintf(msg, cap, "resident %d (\"%s\"): this lets the NEXT resident claim (one use, %u minutes, memory only) receive a credential; anyone who claims the slot first becomes this resident; "
+                               "re-run with `confirm` as the last argument", r, who, (unsigned)(PC_NETGAME_RESIDENT_ARM_MS / 60000u));
+        }
+        return 2;
+    }
+    if (op == 0) {
+        static PCMpMemberFile nf;
+        if (!pc_mp_guests_backup_file(PC_MP_MEMBERS_PATH, bak, sizeof(bak))) {
+            snprintf(msg, cap, "refused: could not back up %s first (nothing was changed)", PC_MP_MEMBERS_PATH);
+            printf("[NET][RESIDENT] ADMIN: reset of resident %d refused: backup of %s failed\n", r, PC_MP_MEMBERS_PATH);
+            return 0;
+        }
+        nf = s_members_file;
+        memset(&nf.e[ci], 0, sizeof(nf.e[ci]));
+        if (!pcnetgame_members_commit(&nf, "operator reset a resident credential")) {
+            snprintf(msg, cap, "refused: members.dat could not be written, the credential was NOT deleted (backup %s kept)", bak);
+            return 0;
+        }
+        s_res_arm[r].armed = 0;
+        printf("[NET][RESIDENT] ADMIN: resident %d (\"%s\") credential RESET by the operator (backup %s)\n", r, who, bak);
+        snprintf(msg, cap, "resident %d (\"%s\") credential DELETED (backup %s). The player must delete its stored resident token (save/mp/resident_token.dat or its character's token.dat) and join again", r, who, bak);
+        return 1;
+    }
+    s_res_arm[r].armed = 1;
+    s_res_arm[r].since_ms = pcnetgame_now_ms();
+    pcnetgame_resident_pid_be(&Save_Get(private_data)[r].player_ID, s_res_arm[r].pid);
+    printf("[NET][RESIDENT] ADMIN: resident %d (\"%s\") ARMED for %u minutes (one mint, memory only)\n", r, who, (unsigned)(PC_NETGAME_RESIDENT_ARM_MS / 60000u));
+    snprintf(msg, cap, "resident %d (\"%s\") ARMED for %u minutes: the next resident claim of this slot gets a credential (one use; a restart of this server cancels it)", r, who,
+             (unsigned)(PC_NETGAME_RESIDENT_ARM_MS / 60000u));
+    return 1;
+}
+/* ===== RESIDENT CREDENTIALS ADMIN END ===== */
 
 /* ===== HOST ADMIN ITEM TOOLS (dedicated console `give` / `iteminfo` / `items`): HOST only, MAIN thread only, NO wire change. =====
  * `give` writes the pockets of a MIRRORED record (resident or guest) through the same sanctioned writer the TXNs use, bumps the record lineage

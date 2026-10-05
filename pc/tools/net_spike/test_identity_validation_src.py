@@ -123,8 +123,12 @@ def main():
           wire_baseline.header_protocol_ok(hdr))
 
     # S2
-    pi = func_body(src, "pcnetgame_host_process_identity")
-    check("S2 process_identity found", len(pi) > 500)
+    # M-D re-pin: the admission DECISION (has_save / town, classify, the guest and resident rules, the M-E credential check) is pcnetgame_host_admission_decide(); the refusal
+    # application is pcnetgame_host_admission_apply_refusal(); process_identity keeps the duplicate park, cap, mint, ACK, token and the binding. The three bodies are checked
+    # as ONE text in that order (decide, apply, process_identity): every ordering rule below is about that sequence.
+    pi = (func_body(src, "pcnetgame_host_admission_decide") + "\n" + func_body(src, "pcnetgame_host_admission_apply_refusal") + "\n"
+          + func_body(src, "pcnetgame_host_process_identity"))
+    check("S2 process_identity found", len(pi) > 500 and "pcnetgame_host_admission_decide(peer, &in, &ext, ext_valid, &adm);" in func_body(src, "pcnetgame_host_process_identity"))
     i_town = pi.find("PC_NETGAME_REJECT_LAND_MISMATCH")
     i_nosave = pi.find("PC_NETGAME_REJECT_NO_SAVE")
     i_cls = pi.find("pcnetgame_host_classify_identity(")
@@ -139,8 +143,9 @@ def main():
     check("S2 the binding is set together with READY (after the ACK was queued), never earlier",
           i_ready < i_bind < i_snap and pi.count("bound_valid = 1") == 1)
     refuse_positions = [m.start() for m in re.finditer(r"pcnetgame_host_refuse_identity\(", pi)]
-    check("S2 every refusal (ambiguous, unknown, guest-flagged claim on a resident, host's own, already bound, guest entry could not be created / re-minted, first-contact rate limit) is issued "
-          "before the ACK (guests G1: 8 refusal sites in process_identity; the guest-claim checks live in pcnetgame_host_guest_check, also before any ACK)",
+    check("S2 every refusal (ambiguous, unknown, guest-flagged claim on a resident, host's own, credential, already bound, guest cap / allow_new_guests / entry could not be created / re-minted, "
+          "first-contact rate limit, resident mint) is issued before the ACK (M-D: 8 pcnetgame_host_refuse_identity sites = the apply helper's one + 7 in process_identity; the decision's "
+          "refusals are DATA returned by pcnetgame_host_admission_decide and applied before any ACK; the guest-claim checks live in pcnetgame_host_guest_check)",
           len(refuse_positions) == 8 and all(p < i_ack for p in refuse_positions))
 
     # S3
@@ -169,6 +174,7 @@ def main():
           set(re.findall(r"PC_NETGAME_REJECT_\w+", src)) <= {"PC_NETGAME_REJECT_PROTOCOL_MISMATCH",
                                                             "PC_NETGAME_REJECT_SERVER_FULL",
                                                             "PC_NETGAME_REJECT_LAND_MISMATCH", "PC_NETGAME_REJECT_NO_SAVE",
+                                                            "PC_NETGAME_REJECT_RESIDENT_CREDENTIAL",  # M-E: the ONE deliberate new reason (8-byte form)
                                                             "PC_NETGAME_REJECT_LINGER_MS"})
 
     # S4
@@ -349,13 +355,13 @@ def main():
               pi, re.S) is not None)
     check("S11 park: identity_pending stays 1 and the function returns (no ACK, no READY, no binding for the newcomer); "
           "the park window state is per peer and cleared by the single memset",
-          re.search(r"pst->identity_pending = 1;[^\n]*\n\s*return;\s*\}\s*\n\s*(?:if \(is_guest\) \{[\s\S]*?\n    \}\s*\n\s*)?/\* Accept", pi) is not None
+          re.search(r"pst->identity_pending = 1;[^\n]*\n\s*return;\s*\}\s*\n\s*(?:if \(is_guest\) \{[\s\S]*?\n    \}\s*\n\s*)?(?:if \(!is_guest && res_cred == 2\) \{[\s\S]*?\n    \}\s*\n\s*)?/\* Accept", pi) is not None
           and all(k in src for k in ("int                  dup_park_active;", "uint32_t             dup_park_since_ms;")))
     check("S11 park/evict log lines exist; no environment/flag bypass in process_identity",
           "host: peer %d parked (%s %d live on peer %d, idle %d ms)" in pi
           and "host: evicted stale peer %d (%s %d, idle %d ms) for peer %d" in pi
           and 'dup_label = is_guest ? "guest slot" : "resident";' in pi
-          and "getenv" not in pi and "g_pc_" not in pi and "PC_ENHANCEMENTS" not in pi)
+          and "getenv" not in pi and "g_pc_" not in pi.replace("g_pc_dedicated", "") and "PC_ENHANCEMENTS" not in pi)
     pend = func_body(src, "pcnetgame_host_process_pending_identities")
     check("S11 parked peers are re-evaluated every host poll (process_pending, host poll after the event drain) without "
           "log spam", "pcnetgame_host_process_identity(" in pend and "dup_park_active" in pend)

@@ -829,6 +829,56 @@ never saved yet answers UNAVAILABLE.
 Tests: `pc/tools/net_spike/test_town_cache_unit.py` (native unit + audits + `--town-dir` real process), `test_town_transfer_protocol.py` (scripted client against a real host),
 `test_town_fetch_real.py` (real client with an empty save dir).
 
+### Resident credentials and admission (phase 2, M-D / M-E)
+
+PersonalIDs are public, so a resident could be claimed by anyone who knows the name and ids. Optional **resident credentials** give each resident the same trust-on-first-use token a
+guest has. They are **off by default**: with `resident_tokens = off` nothing below happens and every existing flow is unchanged.
+
+**Policy** (`settings.ini` `[Network]` `resident_tokens = off|tofu|required`, host override `--resident-tokens off|tofu|required`, host only, exit 2 otherwise; default `off`).
+
+* `off`: the `IDENTITY_EXT` RESIDENT flag is parsed and ignored, nothing is minted or checked, `members.dat` is never read or written.
+* `tofu`: a resident slot that has a credential accepts only the matching token (KNOWN); a missing or wrong token is refused with REJECT reason 5. A slot with no credential and a RESIDENT claim
+  gets a token minted at its first claim (NEW). A **legacy client** (sends no `IDENTITY_EXT`) is admitted **only while the slot has no credential** (the host logs
+  `resident N has no credential (legacy client)`; nothing is minted); once a credential exists a legacy client is refused.
+* `required`: like `tofu`, but a slot without a credential is refused until the operator arms it (`resident-arm`); a legacy client can never be armed in (it cannot receive a token).
+* A client that presents a token for a resident the host has **no** credential for (the host table was reset, or it is another host) is refused and nothing is minted over it (the client must
+  delete its stored token): minting a different token would make the real client refuse the host and leave an orphan credential locking the slot.
+* `members.dat` **UNTRUSTED** (it existed but no generation is readable, or only preserved `*.corrupt-*` files remain): under `required` every resident is refused; under `tofu` residents are admitted
+  legacy-style (no credential check, no mint, nothing written). The bad file is moved to `members.dat.corrupt-<timestamp>`, never deleted.
+
+**Admission order** (M-D, `pcnetgame_host_admission_decide`, behaviour-identical by default): has_save / town checks, classify (the existing `pcnetgame_host_classify_identity`, NOT replaced), AMBIGUOUS
+refused, UNKNOWN without a GUEST claim = NO_SAVE, UNKNOWN with a GUEST claim = `pcnetgame_host_guest_check`, RESIDENT with a GUEST claim refused, RESIDENT = own-resident check, then the
+credential check. The credential check is **before** the duplicate-park step, so an impostor can never evict a live peer. Afterwards (in `process_identity`, unchanged): duplicate park, guest cap /
+reserve, mint (guest or resident), ACK, IDENTITY_TOKEN. `pc_mp_membership_lookup` is only a logged cross-check (a `CROSS-CHECK differs` line when it disagrees); it is not the decider.
+New host option `allow_new_guests = 0|1` (`settings.ini` `[Network]`, `--allow-new-guests 0|1`, default 1): with 0 a NEW guest key is refused as SERVER_FULL before anything is minted or created;
+known guests (key + token, and the operator re-mint) still return.
+
+**Wire** (protocol v8 extended in place, no version bump): `IDENTITY_EXT` flag `0x02` RESIDENT (exactly one of GUEST / RESIDENT; `home_*` = the resident's PersonalID, must equal the IDENTITY's
+name / player id / land name / land id; token as for guests). Reply `IDENTITY_TOKEN` flags `0x04` RESIDENT + `0x01` NEW or `0x02` KNOWN, `guest_slot` = the resident index, `table_size` = 4. New
+REJECT reason **5 RESIDENT_CREDENTIAL** (8-byte form); a new client shows "resident credential missing or wrong: ask the operator for resident-reset/arm", an old client shows "unknown reason 5: update the
+game". Reasons 1..4 are unchanged. A new client sends the RESIDENT claim whenever it plays a resident (an old host drops the unknown flag as malformed and admits the legacy way; a new host with
+`off` ignores it).
+
+**Files.** Host `save/mp/members.dat` (`pc/src/pc_mp_members.c`, same storage pattern as `guests.dat`: CRC32, tmp, `.bak1`/`.bak2` rotation, atomic replace, UNTRUSTED). 16 entries of **80 bytes**
+(the design text said 72, but its own field list adds up to 80): present, confirmed, res_slot, kind (1 RESIDENT_TOKEN, 2 PROMOTION_HANDOFF for M-F), town key, resident PID (BE), token, age, aux pid.
+It is keyed by (host town, resident PID), not by the slot index, and is written synchronously at mint **before** the token is sent (a failed ACK / token send rolls the mint back). `confirmed` is set
+when the client presents the token once. Client: a store character keeps the resident token in `characters/<uuid>/towns/<townkey>/token.dat` (same PCMpGtk format, `home_pid` = the resident PID) and
+`membership.ini` `role=resident`; a legacy / CLI resident uses `save/mp/resident_token.dat`. A different token than the one the client presented = the client refuses the host (as for guests).
+
+**Console** (`--dedicated`; order of checks like `guest-remove`: world ready, not UNTRUSTED, selector, refused while the resident is connected, the `confirm` word, backup `members.dat.bak-<timestamp>`):
+`residents` (slot, name, credential yes/no, confirmed, armed, connected; never a token), `resident-reset <slot|name> confirm` (backs `members.dat` up, deletes the credential; the player must also delete
+its stored token), `resident-arm <slot|name> confirm` (only under `required`; allows exactly ONE mint for a slot without a credential; memory only, 10 minutes, consumed by the mint, cancelled by a restart).
+
+**Compatibility.** Old host: drops the RESIDENT flag, admits the legacy way, no token, the client plays without a credential. Old client: sends no `IDENTITY_EXT`; admitted under `tofu` only while its slot
+has no credential, refused under `required` and once a credential exists (it sees "unknown reason 5").
+
+**Limitations.** Not internet-grade: the token is a bearer token over the same unencrypted UDP transport as the guest tokens (a captured packet can be replayed), and trust on first use means whoever claims a
+resident first wins it; `resident-arm` / `tofu` do not prove who the claimant is. The credential protects the slot, not the data: the town save is still served unsanitized when `town_serve` is on. Nothing here
+changes the town save; promotion (M-F) and Play Online passing a resident membership (M-C) are not implemented; the real client half was verified by source audit and a scripted host test, not yet by a real
+resident client run.
+Tests: `pc/tools/net_spike/test_members_unit.py` (native storage unit), `test_resident_credentials_protocol.py` (scripted clients against real dedicated hosts: off / tofu / restart / required + arm /
+corrupt UNTRUSTED / allow_new_guests).
+
 ## Known limitations
 
 * A guest needs a copy of the HOST's town save: either fetched with `--town-fetch` (the host must serve it, `--town-serve on`; see "Town cache and town transfer") or copied by hand

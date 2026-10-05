@@ -146,12 +146,18 @@ def main():
        "pc_net_game_dedicated_guest_admin) and nothing else",
        sorted({n for a, b, n in funcs if "s_guest_rec[" in c[a:b]}) == sorted(["pcnetgame_rec_priv_ptr", "pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create",
                                                                               "pc_net_game_dedicated_guest_admin"]))
-    pinned = ["pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
+    pinned = ["pc_net_game_dedicated_members", "pcnetgame_dedicated_give_resolve",  # the dedicated console tools (host admin items / members), reviewed
+              # M-D / M-E: the admission cross-check (reads the host's own residents), the resident credential table (keyed by the resident PersonalID of private_data[idx]) and the
+              # resident operator commands (residents / resident-reset / resident-arm); all host-side, none reachable with a guest slot
+              "pc_net_game_dedicated_resident_admin", "pc_net_game_dedicated_resident_info", "pcnetgame_dedicated_resident_resolve", "pcnetgame_host_admission_crosscheck",
+              "pcnetgame_resident_arm_active", "pcnetgame_resident_cred_find", "pcnetgame_resident_mint", "pcnetgame_resident_mint_rollback",
+              "pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
               "pcnetgame_house_handle_begin", "pcnetgame_house_process_commit",  # furniture sync: guest slot -> NOT_OWNER before the first subscript (test_house_sync_src.py)
               "pcnetgame_mail_test_poke_museum", "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mail_test_seed_reply", "pcnetgame_mbox_refresh_resident",
               "pcnetgame_mbox_send", "pcnetgame_rec_gate", "pcnetgame_rec_priv_ptr", "pcnetgame_rec_resolve_slot", "pcnetgame_rec_slot", "pcnetgame_rec_store_build"]
     users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(private_data\)\[", c[a:b])})
+    pinned = sorted(pinned)
     ck("A the functions that subscript Save_Get(private_data)[...] are exactly the %d reviewed ones (a new one needs a guest-safety review): %s" % (len(pinned), users),
        users == pinned and not re.search(r"Save_Get\(private_data\)\[", re.sub(r"\n}\n", "\n}\n", "".join(c[b:a2] for (a, b, _n), (a2, _b2, _n2) in zip(funcs, funcs[1:])))))
     homes_users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(homes\[", c[a:b])})

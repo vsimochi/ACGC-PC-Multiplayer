@@ -743,6 +743,11 @@ int main(int argc, char* argv[]) {
             printf("                      See pc_m_card.c pc_bootstrap_guest_poll().\n");
             printf("  --max-guests N      HOST: most guests (visitors with their own character) connected at once, 1..8 (default 4 or settings.ini\n");
             printf("                      max_guests); a new guest beyond the cap is refused like a full server, residents are never refused.\n");
+            printf("  --allow-new-guests 0|1  HOST-only (exit 2 otherwise): 0 = refuse guests whose key this host does not know yet (known guests still return); default 1 or\n");
+            printf("                      settings.ini [Network] allow_new_guests.\n");
+            printf("  --resident-tokens off|tofu|required  HOST-only (exit 2 otherwise): resident credentials (default off or settings.ini resident_tokens). tofu: a resident's\n");
+            printf("                      first claim mints its token, later claims must present it. required: a resident without a credential is refused until the\n");
+            printf("                      operator runs resident-arm. See docs/multiplayer-guest-roadmap.md.\n");
             printf("  --town-fetch        CLIENT-only (requires --connect; exit 2 otherwise; not with --town-dir): before the game boots, download the host's town\n");
             printf("                      save into save/mp/towns/<townkey>/ and play it (progress in the window title). Falls back to the cached town of that\n");
             printf("                      server, then to save/card_a. The host must serve it (--town-serve on).\n");
@@ -1043,6 +1048,22 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             g_pc_town_serve_override = strcmp(argv[i + 1], "on") == 0 ? 1 : 0;
+            i++;
+        } else if (strcmp(argv[i], "--allow-new-guests") == 0) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "0") != 0 && strcmp(argv[i + 1], "1") != 0)) {
+                fprintf(stderr, "[PC] --allow-new-guests: REFUSED: the option needs 0 or 1\n"
+                                "usage: AnimalCrossing --host [port] --allow-new-guests 0|1\n");
+                return 2;
+            }
+            g_pc_allow_new_guests_override = argv[i + 1][0] == '1' ? 1 : 0;
+            i++;
+        } else if (strcmp(argv[i], "--resident-tokens") == 0) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "off") != 0 && strcmp(argv[i + 1], "tofu") != 0 && strcmp(argv[i + 1], "required") != 0)) {
+                fprintf(stderr, "[PC] --resident-tokens: REFUSED: the option needs off, tofu or required\n"
+                                "usage: AnimalCrossing --host [port] --resident-tokens off|tofu|required\n");
+                return 2;
+            }
+            g_pc_resident_tokens_override = strcmp(argv[i + 1], "required") == 0 ? 2 : strcmp(argv[i + 1], "tofu") == 0 ? 1 : 0;
             i++;
         } else if (strcmp(argv[i], "--guest") == 0) {
             g_pc_guest = 1;
@@ -1450,6 +1471,11 @@ int main(int argc, char* argv[]) {
     if (g_pc_town_serve_override >= 0 && g_pc_net_role != 1) {
         fprintf(stderr, "[PC] --town-serve: REFUSED: it is a HOST-only option (use it together with --host)\n"
                         "usage: AnimalCrossing --host [port] --town-serve on|off   (see --help)\n");
+        return 2;
+    }
+    if ((g_pc_allow_new_guests_override >= 0 || g_pc_resident_tokens_override >= 0) && g_pc_net_role != 1) {
+        fprintf(stderr, "[PC] --allow-new-guests / --resident-tokens: REFUSED: they are HOST-only options (use them together with --host)\n"
+                        "usage: AnimalCrossing --host [port] --allow-new-guests 0|1 --resident-tokens off|tofu|required   (see --help)\n");
         return 2;
     }
     if (g_pc_town_dir != NULL && !pc_card_set_town_dir(g_pc_town_dir)) {

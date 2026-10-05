@@ -57,8 +57,9 @@ def main():
        "PC_MP_GUEST_TOKEN_PATH" not in ng and ng_raw.count("pc_guest_token_path()") >= 7 and '#include "pc_guest_profile.h"' in ng_raw)
     ck("B the token file is LOADED (pc_mp_gtoken_load) and SAVED (pc_mp_gtoken_save) through the profile aware path, nowhere else: 1 load + 1 save in the client load/save helpers (pc_guest_token_path()) "
        "and, since M2, exactly ONE more save = the read-only legacy-token fallback copy-forward into the STORE character's per-town file (store_tp = pc_guest_token_path())",
-       "pc_mp_gtoken_load(pc_guest_token_path(), &s_client_gtk, &s_client_gtk_unreadable)" in ng and "pc_mp_gtoken_save(pc_guest_token_path(), &s_client_gtk)" in ng
-       and len(re.findall(r"pc_mp_gtoken_load\(", ng)) == 1 and len(re.findall(r"pc_mp_gtoken_save\(", ng)) == 2
+       "pc_mp_gtoken_load(pcnetgame_client_token_path(), &s_client_gtk, &s_client_gtk_unreadable)" in ng and "pc_mp_gtoken_save(pc_guest_token_path(), &s_client_gtk)" in ng
+       and "return pc_guest_token_path();" in ng  # M-E: pcnetgame_client_token_path() = pc_guest_token_path() for a guest (and a store character's resident); save/mp/resident_token.dat only for a legacy resident
+       and len(re.findall(r"pc_mp_gtoken_load\(", ng)) == 1 and len(re.findall(r"pc_mp_gtoken_save\(", ng)) == 3  # guest token, legacy copy-forward, M-E resident token (tp = pcnetgame_client_token_path())
        and "const char* store_tp = pc_guest_token_path();" in ng and "pc_mp_gtoken_save(store_tp, &s_client_gtk)" in ng
        and ng.count("pc_session_legacy_token_lookup(") == 1)
     ck("B the per-town token override: pc_guest_token_path() itself is NOT redefined here; the ONLY place the active town is switched is pcnetgame_client_build_ext via pc_session_select_town (the token file is reloaded "

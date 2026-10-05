@@ -313,6 +313,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_guest_profile.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_character.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_members.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_session.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_servers.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_relaunch.c

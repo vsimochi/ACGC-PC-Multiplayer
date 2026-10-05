@@ -39,6 +39,7 @@ HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRa
              "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending",
              "PCNetGameTsHost", "PCNetGameTsOp", "PCNetGameMailOp", "PCNetGameMboxHost", "PCNetGameTakeOp",
              "PCNetGameGuest",  # guests G1: the host's guest table entry (local, never on the wire)
+             "PCNetGameAdmission", "PCNetGameAdmissionKind",  # M-D: the host's local admission decision (never on the wire)
              "PCNetGameHouseHost", "PCNetGameHouseClient")  # furniture sync: the host's canonical house copy / the client's house state (local, never on the wire)
 # Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
 # (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
@@ -167,7 +168,8 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
 # Guests G1: exact C lines (constants + size / offset asserts) that must stay as they are.
 GUEST_C_PINS = ("#define PC_NETGAME_IDEXT_FLAG_GUEST      0x01u", "#define PC_NETGAME_IDTOKEN_FLAG_NEW      0x01u",
                 "#define PC_NETGAME_IDTOKEN_FLAG_KNOWN    0x02u", "#define PC_NETGAME_GUEST_TOKEN_LEN       16u",
-                "#define PC_NETGAME_GUEST_MAX             8", "#define PC_NETGAME_REC_CLASS_RESIDENT 0u", "#define PC_NETGAME_REC_CLASS_GUEST    1u",
+                "#define PC_NETGAME_GUEST_MAX             8", "#define PC_NETGAME_IDEXT_FLAG_RESIDENT   0x02u", "#define PC_NETGAME_IDTOKEN_FLAG_RESIDENT 0x04u",
+                "#define PC_NETGAME_RESIDENT_TABLE_SIZE   4", "#define PC_NETGAME_REC_CLASS_RESIDENT 0u", "#define PC_NETGAME_REC_CLASS_GUEST    1u",
                 '_Static_assert(sizeof(PCNetGameIdentityExtMsg) == 42,', "offsetof(PCNetGameIdentityExtMsg, token) == 25",
                 '_Static_assert(sizeof(PCNetGameIdentityTokenMsg) == 20,', "offsetof(PCNetGameIdentityTokenMsg, token) == 4",
                 '_Static_assert(sizeof(PCNetGameIdentityMsg) == 32,', '_Static_assert(sizeof(PCNetGameIdentityAckMsg) == 32,',
@@ -189,7 +191,7 @@ V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
                            r"|PC_NETGAME_MSG_TOWN_SVC_STATE|PC_NETGAME_TS_\w+|PC_NETGAME_SHOP_\w+|TOWN_SVC_STATE_FMT"
                            r"|PC_NETGAME_MSG_MAILBOX_LETTER|PC_NETGAME_MBOX_\w+|PC_NETGAME_MAIL_WIRE_SIZE|MAILBOX_LETTER_FMT"
-                           r"|PC_NETGAME_MSG_IDENTITY_(?:EXT|TOKEN)|PC_NETGAME_IDEXT_\w+|PC_NETGAME_IDTOKEN_\w+|PC_NETGAME_GUEST_\w+"
+                           r"|PC_NETGAME_MSG_IDENTITY_(?:EXT|TOKEN)|PC_NETGAME_IDEXT_\w+|PC_NETGAME_IDTOKEN_\w+|PC_NETGAME_GUEST_\w+|PC_NETGAME_RESIDENT_\w+|PC_NETGAME_REJECT_RESIDENT_CREDENTIAL|build_resident_ext"
                            r"|PC_NETGAME_REC_CLASS_\w+|IDENTITY_(?:EXT|TOKEN)_FMT"
                            r"|PC_NETGAME_MSG_HOUSE_(?:BEGIN|CHUNK|ACK)|PC_NETGAME_HOUSE_\w+|PC_NETGAME_HOSTCFG_\w+|HOUSE_(?:BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|PC_NETGAME_TOWN_\w+|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)_FMT"
@@ -333,6 +335,10 @@ V8_LIB_PINNED = {
     "PC_NETGAME_IDEXT_FLAG_GUEST": '0x01',
     "PC_NETGAME_IDTOKEN_FLAG_NEW": '0x01',
     "PC_NETGAME_IDTOKEN_FLAG_KNOWN": '0x02',
+    "PC_NETGAME_IDEXT_FLAG_RESIDENT": '0x02',
+    "PC_NETGAME_IDTOKEN_FLAG_RESIDENT": '0x04',
+    "PC_NETGAME_RESIDENT_TABLE_SIZE": '4',
+    "PC_NETGAME_REJECT_RESIDENT_CREDENTIAL": '5',
     "PC_NETGAME_GUEST_TOKEN_LEN": '16',
     "PC_NETGAME_GUEST_MAX": '8',
     "PC_NETGAME_REC_CLASS_RESIDENT": '0',
@@ -455,6 +461,7 @@ def audit_texts(head, cur):
     diff = sorted(k for k in set(cb) | set(hb) if cb.get(k) != hb.get(k) and k not in HOST_ONLY and k not in V8_NEW_STRUCTS
                   and k not in X3_CHANGED_STRUCTS  # the two request structs that gained the tag are pinned by the X3 check below
                   and k != "PCNetGameMsgType"  # the id enum has its own v8-aware check below
+                  and k != "PCNetGameRejectReason"  # the reject enum has its own check below (M-E reason 5)
                   and not (k in REMOVED_CLIENT_ONLY and k not in cb))  # a deliberately deleted client-only struct (X1b)
     add("wire: every PCNet* typedef struct/enum of pc_net_game.c identical to HEAD except the host-only %s, the deleted client-only %s and the pinned v8 "
         "structs (changed: %s) [%d blocks]" % ("/".join(HOST_ONLY), "/".join(REMOVED_CLIENT_ONLY), diff, len(cb)), not diff and len(cb) > 50)
@@ -489,8 +496,13 @@ def audit_texts(head, cur):
     add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
         len(nums) == len(set(nums)) and sorted(nums) == list(range(1, EXPECTED_MAX_MSG_ID + 1)))
-    add("wire: PCNetGameRejectReason values identical to HEAD",
-        "PCNetGameRejectReason" in cb and cb["PCNetGameRejectReason"] == hb["PCNetGameRejectReason"])
+    # M-E: the frozen reasons 1..4 are unchanged; reason 5 RESIDENT_CREDENTIAL (8-byte form) is the ONE deliberate addition (pinned exactly; comments are stripped by typedef_blocks)
+    _rej_new = "PC_NETGAME_REJECT_RESIDENT_CREDENTIAL = 5,"
+    _rej_cur = " ".join(cb.get("PCNetGameRejectReason", "").split())
+    _rej_strip = " ".join(_rej_cur.replace(_rej_new, "").split())
+    add("wire: PCNetGameRejectReason values identical to HEAD except the pinned M-E reason 5 RESIDENT_CREDENTIAL (8-byte form)",
+        "PCNetGameRejectReason" in cb and (cb["PCNetGameRejectReason"] == hb["PCNetGameRejectReason"]
+                                            or (_rej_cur.endswith(_rej_new) and _rej_strip == " ".join(hb["PCNetGameRejectReason"].split()))))
     def _subseq(small, big):
         it = iter(big)
         return all(any(x == y for y in it) for x in small)
