@@ -792,7 +792,7 @@ A client no longer has to copy the host's town save by hand. Started with `--tow
 **Flags.**
 
 * `--town-fetch` (client only, requires `--connect` or `--server`, exit 2 otherwise): fetch the town before the game boots (progress in the window title; errors in an SDL message box).
-* `--town-serve on|off` (host only, exit 2 otherwise) and `settings.ini` `[Network]` `town_serve = 0|1`: whether this host serves its town. **Default OFF.**
+* `--town-serve off|on|full` (host only, exit 2 otherwise) and `settings.ini` `[Network]` `town_serve = 0|1|2` (the words `off` / `on` / `full` work there too): whether and how this host serves its town. **Default OFF.** `on` (= 1) serves a SANITIZED copy (M-G, below); `full` (= 2) serves the whole saved file as before.
 * `--town-dir DIR` (hidden, client only, requires `--connect`, not together with `--town-fetch`): use `DIR` (a town directory) as the Card-A parent: the save is read from `DIR/card_a`.
   For tests and the fallback; `save/card_a` and the legacy `save/DobutsunomoriP_MURA.gci` are never moved, renamed or written, and the legacy migration is skipped.
 
@@ -821,8 +821,53 @@ Fallback ladder (no `TOWN_INFO` within 3 s = old host, or the fetch failed / was
 otherwise), chunks paced by the reliable backlog, the connection is closed after `TOWN_DONE` or 30 s. Statuses: 0 STREAM, 1 UP_TO_DATE, 2 UNAVAILABLE, 3 BUSY, 4 REFUSED (town_serve off, or
 IDENTITY already sent), 5 BAD_REQUEST.
 
-**Privacy.** The GCI contains every resident's pockets, mail, diary and designs and is served UNSANITIZED. That is why `town_serve` is off by default: turn it on only for
-friends / a supervised LAN. Sanitizing other residents' ranges (M-B2) is deferred; it needs a rule so a sanitized record can never be migrated back.
+**Privacy.** The saved GCI contains every resident's pockets, mail, diary and designs. `town_serve = full` serves it UNSANITIZED (friends / a supervised LAN only); `town_serve = on`
+serves a SANITIZED image instead (next section). That `on` is now the sanitized mode is the only change of meaning of an existing setting: a settings.ini that already says `town_serve = 1`
+now serves the sanitized copy.
+
+#### Sanitized town transfer and the record-import guard (M-G)
+
+With `town_serve = on` the host builds a TRANSFER image from its last saved GCI (`pc/src/pc_town_sanitize.c`, a pure module) and serves that, never the file itself: the host's own
+file is only read, the image is cached per (save generation, CRC32 of the file), the CRC32 / UP_TO_DATE comparison and the stream all use the sanitized bytes, and the output is
+validated again as a GCI of the same town before it is sent (otherwise the host answers UNAVAILABLE). `TOWN_INFO` carries `flags` (the old reserved field; bit0 = SANITIZED; old
+clients ignore it). The game still loads the image: the loader reads only the main Save and the three ARAM blocks and checks no checksum; the sanitizer recomputes the ones it
+touches anyway.
+
+What the transfer image holds, in the order of the file:
+
+* CARDDir, comment / banner / icon: kept, plus the 8 byte marker `ACMPSAN1` at file offset 0x70 (zero in the normal writer). The ARAM blocks (mail, original designs, diary) are replaced
+  by what a fresh PC save holds (block order normalised to the Dolphin order with the land id at +2, checksums recomputed); the rest of the Others area is zero.
+* Every `private_data` record (all four slots, the requester's own included, its real record arrives through PUSH_FULL): only the PersonalID / gender / face / reset_count, exists /
+  hint_count / shirt, reset_code and state_flags are kept; every other byte is a cleared record (pockets, wallet, bank, quests, inventory mail, designs, museum, calendar ...).
+* Every house mailbox: ten cleared letters; the gyroid's bells: zero. The post office's stored mail: cleared, its counters zero. Every villager's saved letter (the villagers and the
+  islander): attached present zero, text blanked; the memory itself (who, friendship, letter flags) stays.
+* The Save checksum is recomputed and the backup Save is a copy of the sanitized main Save. Everything else is kept byte for byte (the table is exported as data by
+  `pc_town_sanitize_layout()`; the unit test checks that it tiles the file).
+
+**What stays visible (residual leakage, by design of this iteration).** Resident names, PersonalIDs, faces and shirts; the houses (furniture, dresser / storage contents, the gyroid
+items and message, music box, house palette); the villager memory headers (which player knows which villager, friendship values, hp_mail), event flags, the museum, fish and insect
+records outside the private records, needlework, the cottage, the noticeboard, the whole town map. The real protection against someone who uses a leaked name is `--resident-tokens
+tofu` (or `required`): the host logs a warning when `town_serve` is on and `resident_tokens` is off. Residents' mail reaches other admitted peers no longer through the friendship
+snapshot (a villager's saved letter text is sent only to the peer whose PersonalID the memory belongs to); other live broadcasts (for example MAIL_DELIVERED) are unchanged.
+**Regression:** a client's own diary, letter storage and design storage were never synced; with a sanitized cache they are now EMPTY in the client's copy (they used to be whatever its
+local copy held). A follow-up has to sync them; the host keeps them.
+
+**A client whose cache came from a sanitized image can never upload a blank record.** Three layers:
+
+1. The client: `pc_save_read_gci` sets `g_pc_save_sanitized` when it loads an image with the marker. RECORD_HELLO then carries flag `0x02 NO_MIGRATE` if the local player is a resident
+   (guests are unaffected), and if a MIGRATE_REQUEST arrives anyway the client logs it and never uploads (the host's MIGRATE timeout closes the link).
+2. The host: at rev 0 for a RESIDENT it takes "host wins" instead of "client wins once" when any of these holds: the HELLO says NO_MIGRATE, `town_serve` is `on` (an old client cannot
+   say it), or `members.dat` holds a promotion entry for that PersonalID (the crash window of a guest promotion). It seeds rev 1 with the promotion's lineage code, logs
+   `HOST WINS (<reason>)` and sends the PUSH_FULL; no MIGRATE_REQUEST. A host that does not know the flag refuses it (BAD_SHAPE detail 6) and the client stays unsynced, which is safe.
+3. The process: a HOST or single-player process that loads an image with the marker refuses it (message box, exit code 3), and the writer never writes while the flag is set, so a
+   cache can never be hosted, played as a town or saved over anything.
+
+**Consequence to know:** while `town_serve = on` the legacy "client wins once" import of an offline copy is off for residents. To import such a copy, start the host once with
+`town_serve` off (or `full`), let the resident join, then switch back.
+
+Tests (M-G): `pc/tools/net_spike/test_town_sanitize_unit.py` (native: table tiling, template equality, independent checksums, idempotence, refusals; source audit),
+`test_town_sanitize_real.py` (real host + FakeClient + a real client with an empty save dir under `--resident-tokens tofu`). `test_town_transfer_protocol.py` P1 and
+`test_town_fetch_real.py` R1 now start the host with `--town-serve full` (they compare the streamed bytes with the host's file).
 
 **Limitations.** No adopt-on-match of an existing `save/card_a` into `towns/` (copy it by hand into `towns/<key>/card_a`); the transfer is about 60 s stale at worst (the READY snapshot
 and the record / house / service syncs bring the session up to date); Play Online does not pass `--town-fetch` yet (M-C); NES game saves still live in `save/card_a` (`famicom.cpp`);

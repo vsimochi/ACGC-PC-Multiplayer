@@ -127,6 +127,13 @@ int      pc_save_validate_gci_file(const char* path, PCTownId* town);
 /* Number of durable Card-A GCI writes since process start (the host's TOWN_INFO.town_gen). */
 unsigned pc_save_town_gen(void);
 
+/* M-G (sanitized town transfer): the replacement templates for pc_town_sanitize() (built once, lazily; NULL if allocation failed) and the flag "the loaded Card-A GCI
+ * is a sanitized transfer image" (set by pc_save_read_gci; client only). */
+struct PCTownSanitizeTpl;
+int      pc_save_build_sanitize_templates(void);
+const struct PCTownSanitizeTpl* pc_save_sanitize_templates(void);
+extern int g_pc_save_sanitized;
+
 #ifdef __cplusplus
 }
 #endif

@@ -1078,6 +1078,7 @@ PC_NETGAME_REC_SIZE = 0x2440
 PC_NETGAME_REC_CHUNK_DATA = 1000
 PC_NETGAME_REC_CHUNK_COUNT = 10
 PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST = 0x01
+PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE = 0x02   # M-G: the client's cache came from a sanitized town image: never MIGRATE
 PC_NETGAME_REC_KIND_PUSH_FULL = 1
 PC_NETGAME_REC_KIND_PUSH_HOSTFIELDS = 2
 PC_NETGAME_REC_KIND_UPLOAD = 3
@@ -1667,6 +1668,7 @@ PC_NETGAME_MSG_TOWN_CHUNK = 64       # H->C 1012 B
 PC_NETGAME_MSG_TOWN_DONE = 65        # C->H 12 B
 PC_NETGAME_TOWN_CHUNK_DATA = 1000
 PC_NETGAME_TOWN_FILE_SIZE = 467008
+PC_NETGAME_TOWN_INFO_FLAG_SANITIZED = 0x0001   # M-G: TOWN_INFO.flags (was _rsv0) bit0: the streamed image is sanitized
 PC_NETGAME_TOWN_STATUS_STREAM = 0
 PC_NETGAME_TOWN_STATUS_UP_TO_DATE = 1
 PC_NETGAME_TOWN_STATUS_UNAVAILABLE = 2
@@ -1689,7 +1691,7 @@ TOWN_FETCH_REQ_SPEC = build_msg_spec(
     "TownFetchReqFields")
 TOWN_INFO_SPEC = build_msg_spec(
     PC_NETGAME_MSG_TOWN_INFO, TOWN_INFO_FMT,
-    ["msg_type", "status", "chunk_size", "xfer_id", "total_size", "crc32", "land_name", "land_id", "rsv0", "terrain_hash", "town_gen", "chunk_count"],
+    ["msg_type", "status", "chunk_size", "xfer_id", "total_size", "crc32", "land_name", "land_id", "flags", "terrain_hash", "town_gen", "chunk_count"],
     "TownInfoFields")
 TOWN_CHUNK_SPEC = build_msg_spec(
     PC_NETGAME_MSG_TOWN_CHUNK, TOWN_CHUNK_FMT, ["msg_type", "rsv0", "length", "xfer_id", "offset", "data"], "TownChunkFields")

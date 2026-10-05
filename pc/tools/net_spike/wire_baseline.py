@@ -104,7 +104,7 @@ V8_NEW_STRUCTS = {
     "PCNetGameTownFetchReqMsg": "uint8_t msg_type; uint8_t flags; uint16_t _rsv0; uint32_t protocol_version; uint32_t have_crc32; uint32_t have_size; "
                                 "uint8_t have_land_name[PC_NETGAME_LAND_LEN]; uint16_t have_land_id; uint16_t _rsv1; uint32_t have_terrain_hash; uint8_t _rsv2[8];",
     "PCNetGameTownInfoMsg": "uint8_t msg_type; uint8_t status; uint16_t chunk_size; uint32_t xfer_id; uint32_t total_size; uint32_t crc32; "
-                            "uint8_t land_name[PC_NETGAME_LAND_LEN]; uint16_t land_id; uint16_t _rsv0; uint32_t terrain_hash; uint32_t town_gen; uint32_t chunk_count;",
+                            "uint8_t land_name[PC_NETGAME_LAND_LEN]; uint16_t land_id; uint16_t flags; uint32_t terrain_hash; uint32_t town_gen; uint32_t chunk_count;",
     "PCNetGameTownChunkMsg": "uint8_t msg_type; uint8_t _rsv0; uint16_t len; uint32_t xfer_id; uint32_t offset; uint8_t data[PC_NETGAME_TOWN_CHUNK_DATA];",
     "PCNetGameTownDoneMsg": "uint8_t msg_type; uint8_t status; uint16_t _rsv0; uint32_t xfer_id; uint32_t crc32;",
     # guest -> resident promotion (M-F): host -> the promoted guest (48 B): the new resident's town PID + resident token + slot
@@ -115,7 +115,7 @@ V8_NEW_STRUCTS = {
 HANDOFF_C_PINS = ('_Static_assert(sizeof(PCNetGameResidentHandoffMsg) == 48,', "offsetof(PCNetGameResidentHandoffMsg, town_pid) == 4",
                   "offsetof(PCNetGameResidentHandoffMsg, token) == 24")
 # Town transfer (M-B): exact C lines (constants + size asserts) that must stay as they are.
-TOWN_C_PINS = ("#define PC_NETGAME_TOWN_CHUNK_DATA   1000u", "#define PC_NETGAME_TOWN_FILE_SIZE    467008u",
+TOWN_C_PINS = ("#define PC_NETGAME_TOWN_INFO_FLAG_SANITIZED 0x0001u", "#define PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE 0x02u", "#define PC_NETGAME_TOWN_CHUNK_DATA   1000u", "#define PC_NETGAME_TOWN_FILE_SIZE    467008u",
                "#define PC_NETGAME_TOWN_STATUS_STREAM        0u", "#define PC_NETGAME_TOWN_STATUS_UP_TO_DATE    1u",
                "#define PC_NETGAME_TOWN_STATUS_UNAVAILABLE   2u", "#define PC_NETGAME_TOWN_STATUS_BUSY          3u",
                "#define PC_NETGAME_TOWN_STATUS_REFUSED       4u", "#define PC_NETGAME_TOWN_STATUS_BAD_REQUEST   5u",
@@ -129,6 +129,9 @@ V8_PREV_STRUCTS = {
                              "uint32_t txn_nonce; uint32_t txn_seq; uint32_t host_session; uint32_t epoch; uint32_t rev; "
                              "uint32_t cdig; uint8_t dest; uint8_t slot; uint16_t item; uint16_t post_pockets[15]; "
                              "uint16_t _rsv0; uint32_t post_conds; uint32_t post_wallet;",
+    # M-G: TOWN_INFO._rsv0 became flags (bit0 SANITIZED); HEAD still has the reserved name
+    "PCNetGameTownInfoMsg": "uint8_t msg_type; uint8_t status; uint16_t chunk_size; uint32_t xfer_id; uint32_t total_size; uint32_t crc32; "
+                            "uint8_t land_name[PC_NETGAME_LAND_LEN]; uint16_t land_id; uint16_t _rsv0; uint32_t terrain_hash; uint32_t town_gen; uint32_t chunk_count;",
 }
 # X3 (host-transactional dig / catch GRANTS; still v8, extended IN PLACE, deliberate): the ONLY two pre-existing wire structs that change are
 # FIELD_ACTION_REQUEST (12 -> 76 bytes) and CATCH_REQUEST (20 -> 84 bytes): each gains the trailing 64-byte PCNetGameTxnTag. Pinned exactly
@@ -221,6 +224,7 @@ V8_LIB_PINNED = {
     "PC_NETGAME_REC_CHUNK_DATA": '1000',
     "PC_NETGAME_REC_CHUNK_COUNT": '10',
     "PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST": '0x01',
+    "PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE": '0x02',
     "PC_NETGAME_REC_KIND_PUSH_FULL": '1',
     "PC_NETGAME_REC_KIND_PUSH_HOSTFIELDS": '2',
     "PC_NETGAME_REC_KIND_UPLOAD": '3',
@@ -387,6 +391,7 @@ V8_LIB_PINNED = {
     "PC_NETGAME_MSG_TOWN_DONE": '65',
     "PC_NETGAME_TOWN_CHUNK_DATA": '1000',
     "PC_NETGAME_TOWN_FILE_SIZE": '467008',
+    "PC_NETGAME_TOWN_INFO_FLAG_SANITIZED": '0x0001',
     "PC_NETGAME_TOWN_STATUS_STREAM": '0',
     "PC_NETGAME_TOWN_STATUS_UP_TO_DATE": '1',
     "PC_NETGAME_TOWN_STATUS_UNAVAILABLE": '2',

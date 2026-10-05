@@ -607,6 +607,19 @@ static int         g_pc_online_ui = 0;
 int                g_pc_bootstrap_resident_pid_set = 0;
 unsigned char      g_pc_bootstrap_resident_pid[20];
 
+/* M-G: pc_save_read_gci() found a SANITIZED town transfer image (a client cache) in a process that is not a network client: it must never be hosted, played offline as
+ * a town or saved. Box (suppressed by the test hook AC_TOWN_NO_MSGBOX) + exit 3. */
+void pc_main_refuse_sanitized_town(void) {
+    const char* msg = "This save file is a sanitized town copy downloaded from a server (other residents' data is blanked). It cannot be hosted, played offline or saved as a town.\n"
+                      "Join the server as a client, or restore your own town save.";
+    fprintf(stderr, "[PC] REFUSED: %s\n", msg);
+    if (getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Animal Crossing - sanitized town copy", msg, g_pc_window);
+    }
+    fflush(NULL);
+    exit(3);
+}
+
 /* SDL box for a failed fetch: 0 = Retry, 1 = Play offline (only when `offline`), 2 = Quit (also when the box could not be shown). */
 static int pc_town_failure_box(const char* msg, int offline) {
     SDL_MessageBoxButtonData btn[3];
@@ -826,8 +839,9 @@ int main(int argc, char* argv[]) {
             printf("  --town-fetch        CLIENT-only (requires --connect; exit 2 otherwise; not with --town-dir): before the game boots, download the host's town\n");
             printf("                      save into save/mp/towns/<townkey>/ and play it (progress in the window title). Falls back to the cached town of that\n");
             printf("                      server, then to save/card_a. The host must serve it (--town-serve on).\n");
-            printf("  --town-serve on|off HOST-only (exit 2 otherwise): serve the town save to --town-fetch clients (default off or settings.ini town_serve).\n");
-            printf("                      PRIVACY: the file holds every resident's pockets, mail, diary and designs, unsanitized: friends / LAN only.\n");
+            printf("  --town-serve off|on|full HOST-only (exit 2 otherwise): serve the town save to --town-fetch clients (default off or settings.ini town_serve).\n");
+            printf("                      on = a SANITIZED copy (other residents' pockets, mail, diary, designs and villager letters are blanked; names / houses / furniture are NOT);\n");
+            printf("                      full = the whole file, unsanitized (every resident's private data: friends / LAN only). While 'on' the legacy 'client wins once' import is off.\n");
             printf("  --guest             CLIENT-only (requires --connect; exit code 2 with usage otherwise; cannot be combined with\n");
             printf("                      --host, --dedicated, --host-observer, --bootstrap-resident or --bootstrap-guest): join the host as a\n");
             printf("                      GUEST with your own new character instead of a resident. The profile lives in save/mp/guest.ini\n");
@@ -1119,12 +1133,12 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--online-ui") == 0) {
             g_pc_online_ui = 1; /* hidden: set by the Play Online relaunch (interactive fetch failure boxes) */
         } else if (strcmp(argv[i], "--town-serve") == 0) {
-            if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 && strcmp(argv[i + 1], "off") != 0)) {
-                fprintf(stderr, "[PC] --town-serve: REFUSED: the option needs on or off\n"
-                                "usage: AnimalCrossing --host [port] --town-serve on|off\n");
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 && strcmp(argv[i + 1], "off") != 0 && strcmp(argv[i + 1], "full") != 0)) {
+                fprintf(stderr, "[PC] --town-serve: REFUSED: the option needs off, on or full\n"
+                                "usage: AnimalCrossing --host [port] --town-serve off|on|full\n");
                 return 2;
             }
-            g_pc_town_serve_override = strcmp(argv[i + 1], "on") == 0 ? 1 : 0;
+            g_pc_town_serve_override = strcmp(argv[i + 1], "full") == 0 ? 2 : strcmp(argv[i + 1], "on") == 0 ? 1 : 0; /* M-G: 0 off | 1 sanitized | 2 full (unsanitized) */
             i++;
         } else if (strcmp(argv[i], "--allow-new-guests") == 0) {
             if (i + 1 >= argc || (strcmp(argv[i + 1], "0") != 0 && strcmp(argv[i + 1], "1") != 0)) {
@@ -1547,7 +1561,7 @@ int main(int argc, char* argv[]) {
     }
     if (g_pc_town_serve_override >= 0 && g_pc_net_role != 1) {
         fprintf(stderr, "[PC] --town-serve: REFUSED: it is a HOST-only option (use it together with --host)\n"
-                        "usage: AnimalCrossing --host [port] --town-serve on|off   (see --help)\n");
+                        "usage: AnimalCrossing --host [port] --town-serve off|on|full   (see --help)\n");
         return 2;
     }
     if ((g_pc_allow_new_guests_override >= 0 || g_pc_resident_tokens_override >= 0) && g_pc_net_role != 1) {

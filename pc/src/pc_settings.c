@@ -91,7 +91,7 @@ static const char* DEFAULT_SETTINGS =
     "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n"
     "resident_tokens = off\n"
     "\n"
-    "# Host only: serve this town's save file (every resident's private data!) to clients that start with --town-fetch: 0 = off (default), 1 = on. Friends / LAN only.\n"
+    "# Host only: serve this town's save to clients that start with --town-fetch: 0 = off (default), 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n"
     "town_serve = 0\n";
 
 static const char* skip_ws(const char* s) {
@@ -152,7 +152,11 @@ static void apply_setting(const char* key, const char* value) {
         else if (strcmp(value, "tofu") == 0) g_pc_settings.resident_tokens = 1;
         else if (strcmp(value, "required") == 0) g_pc_settings.resident_tokens = 2;
     } else if (strcmp(key, "town_serve") == 0) {
-        if (val == 0 || val == 1) g_pc_settings.town_serve = val;
+        /* M-G: 0 = off, 1 = on (a SANITIZED copy), 2 = full (the whole file); the words off / on / full are accepted too */
+        if (strcmp(value, "off") == 0) g_pc_settings.town_serve = 0;
+        else if (strcmp(value, "on") == 0) g_pc_settings.town_serve = 1;
+        else if (strcmp(value, "full") == 0) g_pc_settings.town_serve = 2;
+        else if (val >= 0 && val <= 2) g_pc_settings.town_serve = val;
     }
 }
 
@@ -253,7 +257,7 @@ void pc_settings_save(void) {
     fprintf(f, "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n");
     fprintf(f, "resident_tokens = %s\n", g_pc_settings.resident_tokens == 2 ? "required" : g_pc_settings.resident_tokens == 1 ? "tofu" : "off");
     fprintf(f, "\n");
-    fprintf(f, "# Host only: serve this town's save file (every resident's private data!) to clients that start with --town-fetch: 0 = off (default), 1 = on. Friends / LAN only.\n");
+    fprintf(f, "# Host only: serve this town's save to clients that start with --town-fetch: 0 = off (default), 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n");
     fprintf(f, "town_serve = %d\n", g_pc_settings.town_serve);
     fclose(f);
     printf("[Settings] Saved %s\n", SETTINGS_FILE);

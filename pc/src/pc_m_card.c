@@ -59,6 +59,7 @@
 #endif
 #include <dolphin/os.h>  /* OSReport */
 #include "pc_town_cache.h"  /* M-A: pc_card_a_dir() / pc_gci_path() / pc_gci_tmp_path() (runtime Card-A dir); M-B: PCTownId, CRC32 */
+#include "pc_town_sanitize.h" /* M-G: sanitized town transfer image (pure module) + the templates built below */
 
 /* --- Path constants --- */
 #define PC_CARD_B_DIR     "save/card_b"
@@ -80,6 +81,10 @@
 
 int pc_save_loaded = 0;
 static int pc_save_ready = 0;
+/* M-G: 1 when the Card-A GCI this process loaded is a SANITIZED town transfer image (marker "ACMPSAN1" at file offset 0x70, see pc_town_sanitize.h). Only a network
+ * CLIENT may hold one (pc_save_read_gci refuses it in every other role, exit 3); the writer never writes while it is set. */
+int g_pc_save_sanitized = 0;
+extern void pc_main_refuse_sanitized_town(void); /* pc_main.c: message box + exit 3 */
 
 /* --- Travel state --- */
 static Save l_keepSave;                        /* Other town's save data (for Card B visit) */
@@ -370,6 +375,13 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
     u8* others_ptr;
 
     if (!pc_save_ready) return TRUE;
+
+    if (g_pc_save_sanitized) {
+        /* M-G: this process loaded a SANITIZED town transfer image (a client's cache): it must never be written back as a town (it holds blank records of the
+         * other residents). Reported as success so no save UI reacts; nothing is written. */
+        OSReport("[PC] GCI save: SKIPPED (the loaded town is a sanitized transfer image; it is never saved)\n");
+        return TRUE;
+    }
 
     pc_ensure_save_dirs();
 
@@ -668,6 +680,21 @@ static int pc_save_read_gci(const char* path) {
         return FALSE;
     }
     fclose(fp);
+
+    /* M-G: a sanitized transfer image (marker in the Others comment area) is only valid in a network CLIENT: a host / single-player process would play (and save)
+     * a town whose other residents are blank. */
+    if (memcmp(file_data + GCI_OTHERS_OFFSET + (PC_TS_MARKER_OFF - PC_TS_OTHERS_OFF), PC_TS_MARKER_TEXT, PC_TS_MARKER_LEN) == 0) {
+        if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+            OSReport("[PC] GCI: '%s' is a SANITIZED town transfer image: refused (only a network client may load it)\n", path);
+            free(file_data);
+            pc_main_refuse_sanitized_town(); /* does not return */
+            return FALSE;
+        }
+        g_pc_save_sanitized = 1;
+        OSReport("[PC] GCI: '%s' is a SANITIZED town transfer image (client cache: never saved, never uploaded as a record)\n", path);
+    } else {
+        g_pc_save_sanitized = 0;
+    }
 
     save_src = (Save_t*)(file_data + GCI_SAVE_MAIN_OFFSET);
     pc_save_bswap_verify_roundtrip((const u8*)save_src, sizeof(Save_t));
@@ -2375,6 +2402,98 @@ int pc_save_validate_gci_file(const char* path, PCTownId* town) {
     }
     fclose(fp);
     return ok;
+}
+
+/* ===== M-G: SANITIZED TOWN TRANSFER: layout mirrors + replacement templates =====
+ * pc_town_sanitize.c (pure) encodes the offsets of the table; every one of them is checked here against the real structs, so a layout change breaks the build. */
+_Static_assert(PC_TS_GCI_SIZE == sizeof(CARDDir) + mCD_LAND_SAVE_SIZE && PC_TS_HDR_SIZE == sizeof(CARDDir), "M-G: GCI size / header drifted");
+_Static_assert(PC_TS_OTHERS_OFF == sizeof(CARDDir) && PC_TS_OTHERS_SIZE == OTHERS_SIZE && PC_TS_MAIN_OFF == sizeof(CARDDir) + OTHERS_SIZE &&
+                   PC_TS_SAVE_SIZE == sizeof(Save) && PC_TS_SAVE_T_SIZE == sizeof(Save_t) && PC_TS_BACK_OFF == sizeof(CARDDir) + OTHERS_SIZE + sizeof(Save) &&
+                   PC_TS_BACK_OFF + PC_TS_SAVE_SIZE == PC_TS_GCI_SIZE,
+               "M-G: Others / Save / backup offsets drifted");
+_Static_assert(PC_TS_ARAM_START == ALIGN_NEXT(sizeof(MemcardHeader_c) + 32, 32) && PC_TS_ARAM_MAIL_SIZE == ALIGN_NEXT(sizeof(mCD_keep_mail_c), 32) &&
+                   PC_TS_ARAM_ORIG_SIZE == ALIGN_NEXT(sizeof(mCD_keep_original_c), 32) && PC_TS_ARAM_DIARY_SIZE == ALIGN_NEXT(sizeof(mCD_keep_diary_c), 32) &&
+                   PC_TS_ARAM_START + PC_TS_ARAM_MAIL_SIZE + PC_TS_ARAM_ORIG_SIZE + PC_TS_ARAM_DIARY_SIZE <= PC_TS_OTHERS_SIZE &&
+                   PC_TS_MARKER_OFF >= PC_TS_OTHERS_OFF + 48 && PC_TS_MARKER_OFF + PC_TS_MARKER_LEN <= PC_TS_OTHERS_OFF + sizeof(MemcardHeader_c),
+               "M-G: ARAM block offsets / marker position drifted");
+_Static_assert(PC_TS_PRIV_SIZE == sizeof(Private_c) && PC_TS_MAIL_SIZE == sizeof(Mail_c) && offsetof(Save_t, private_data) == 0x20 && sizeof(Private_c) == 0x2440 &&
+                   offsetof(Save_t, save_check) == 0 && offsetof(mFRm_chk_t, checksum) == 0x12 && sizeof(((mFRm_chk_t*)0)->checksum) == 2 &&
+                   offsetof(Save_t, land_info) == 0x9120 && offsetof(mLd_land_info_c, id) == 0xA,
+               "M-G: Save_t / Private_c / land id offsets drifted");
+_Static_assert(offsetof(Private_c, reset_count) == 0x16 && offsetof(Private_c, museum_record) == 0x18 && offsetof(Private_c, exists) == 0x1086 &&
+                   offsetof(Private_c, hint_count) == 0x1087 && offsetof(Private_c, cloth) == 0x1088 && sizeof(mPr_cloth_c) == 4 &&
+                   offsetof(Private_c, stored_anm_id) == 0x108C && offsetof(Private_c, reset_code) == 0x10F4 && offsetof(Private_c, animal_memory) == 0x10F8 &&
+                   offsetof(Private_c, state_flags) == 0x2348 && offsetof(Private_c, calendar) == 0x234C && offsetof(Private_c, mail) == 0x4E0,
+               "M-G: Private_c keep ranges drifted");
+_Static_assert(offsetof(Save_t, homes) == 0x9CE8 && sizeof(mHm_hs_c) == 0x26B0 && offsetof(mHm_hs_c, mailbox) == 0x1A30 && HOME_MAILBOX_SIZE == 10 &&
+                   offsetof(mHm_hs_c, haniwa) + offsetof(Haniwa_c, bells) == 0x2674 && sizeof(((Haniwa_c*)0)->bells) == 4 && offsetof(mHm_hs_c, goki) == 0x2678,
+               "M-G: house mailbox / gyroid bells offsets drifted");
+_Static_assert(offsetof(Save_t, animals) == 0x17438 && sizeof(Animal_c) == 0x988 && ANIMAL_NUM_MAX == 15 && ANIMAL_MEMORY_NUM == 7 && offsetof(Animal_c, memories) == 0x10 &&
+                   sizeof(Anmmem_c) == 0x138 && offsetof(Anmmem_c, letter) == 0x32 && offsetof(Anmplmail_c, present) == 2 && offsetof(Anmplmail_c, header_back_start) == 4 &&
+                   offsetof(Anmplmail_c, header) == 5 && offsetof(Anmplmail_c, pad0) == 0xFD && offsetof(Anmplmail_c, date) == 0xFE &&
+                   offsetof(Save_t, island) == 0x22540 && offsetof(Island_c, animal) == 0xF00,
+               "M-G: villager memory / letter / islander offsets drifted");
+_Static_assert(offsetof(Save_t, post_office) == 0x20694 && offsetof(PostOffice_c, mail) == 8 && mPO_MAIL_STORAGE_SIZE == 5 && offsetof(PostOffice_c, leaflet) == 0x5DA,
+               "M-G: post office offsets drifted");
+
+static u8 s_ts_priv[4][sizeof(Private_c)];
+static u8 s_ts_mail[sizeof(Mail_c)];
+static u8* s_ts_aram[mCD_ARAM_DATA_NUM]; /* mail / original / diary, aligned sizes (l_aram_alloc_size_table) */
+static PCTownSanitizeTpl s_ts_tpl;
+static int s_ts_built = 0;
+
+/* Builds the replacement templates ONCE (lazily from the first transfer request; they do not depend on any world state): the cleared Private_c of every slot
+ * (mPr_ClearPrivateInfo, my_org_no_table 0..7, canonical BE image), the cleared Mail_c (taken from that BE record: Private_c.mail[0] is mMl_clear_mail's output), and the
+ * ARAM blocks a FRESH PC save holds (calloc + pc_init_mail_entries / pc_init_diary_entries; "original" stays zero), in BE. Returns 1 when ready. */
+int pc_save_build_sanitize_templates(void) {
+    int i, j;
+    Private_c* p;
+    if (s_ts_built) {
+        return 1;
+    }
+    p = (Private_c*)malloc(sizeof(Private_c));
+    if (p == NULL) {
+        return 0;
+    }
+    for (i = 0; i < 4; i++) {
+        mPr_ClearPrivateInfo(p);
+        for (j = 0; j < mPr_ORIGINAL_DESIGN_COUNT; j++) {
+            p->my_org_no_table[j] = (u8)j;
+        }
+        pc_save_bswap_private(p, PC_BSWAP_TO_BE);
+        memcpy(s_ts_priv[i], p, sizeof(Private_c));
+    }
+    free(p);
+    memcpy(s_ts_mail, s_ts_priv[0] + offsetof(Private_c, mail), sizeof(Mail_c));
+    for (i = 0; i < mCD_ARAM_DATA_NUM; i++) {
+        u8* blk = (u8*)calloc(1, l_aram_alloc_size_table[i]);
+        if (blk == NULL) {
+            return 0;
+        }
+        if (i == mCD_ARAM_DATA_MAIL) {
+            pc_init_mail_entries(blk);
+            pc_save_bswap_keep_mail((mCD_keep_mail_c*)blk, PC_BSWAP_TO_BE);
+        } else if (i == mCD_ARAM_DATA_DIARY) {
+            pc_init_diary_entries(blk);
+            pc_save_bswap_keep_diary((mCD_keep_diary_c*)blk, PC_BSWAP_TO_BE);
+        } else {
+            pc_save_bswap_keep_original((mCD_keep_original_c*)blk, PC_BSWAP_TO_BE);
+        }
+        s_ts_aram[i] = blk;
+    }
+    for (i = 0; i < 4; i++) {
+        s_ts_tpl.private_be[i] = s_ts_priv[i];
+    }
+    s_ts_tpl.mail_be = s_ts_mail;
+    s_ts_tpl.aram_mail_be = s_ts_aram[mCD_ARAM_DATA_MAIL];
+    s_ts_tpl.aram_orig_be = s_ts_aram[mCD_ARAM_DATA_ORIGINAL];
+    s_ts_tpl.aram_diary_be = s_ts_aram[mCD_ARAM_DATA_DIARY];
+    s_ts_built = 1;
+    return 1;
+}
+
+const PCTownSanitizeTpl* pc_save_sanitize_templates(void) {
+    return pc_save_build_sanitize_templates() ? &s_ts_tpl : NULL;
 }
 
 /* Scan the "other" card for a travel-eligible town.

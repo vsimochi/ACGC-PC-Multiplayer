@@ -8,7 +8,7 @@ TIER: REAL HOST + REAL CLIENT game processes (no GUI automation):
 The live save dir, bin_talkfix* and bin_fixture4 are never launched or modified (both dirs are fresh copies, basename bin_fixture4*, so the harness' whole-save
 snapshot / restore applies).
 
-  R1  host --town-serve on: the client fetches the town into save/mp/towns/<townkey>/card_a, boots from it and reaches READY (snapshot applied) with NO LAND_MISMATCH;
+  R1  host --town-serve full (M-G: on = sanitized, see test_town_sanitize_real.py): the client fetches the town into save/mp/towns/<townkey>/card_a, boots from it and reaches READY (snapshot applied) with NO LAND_MISMATCH;
       the cache GCI md5 == the host's GCI md5 (taken before the client started) and is NOT written by the client; nothing staged in card_a (.tmp / .part / extra .gci);
       origin.ini names the server; no save/card_a is created in the client dir
   R2  host with town_serve OFF (default): the same client (cache present) falls back to the cached town (log line) and reaches READY again (offline-capable cache)
@@ -70,8 +70,8 @@ def run(port, results):
     host = client = None
     try:
         # ---------------- R1
-        host = start_host(args.port, "on", ["--town-serve", "on"])
-        ck("R1 host (--town-serve on) started and booted to the field", host is not None)
+        host = start_host(args.port, "on", ["--town-serve", "full"])  # M-G: R1 compares the cache md5 with the host GCI -> the FULL image
+        ck("R1 host (--town-serve full) started and booted to the field", host is not None)
         if host is None:
             return
         host_md5 = T.md5_file(HOST_GCI)

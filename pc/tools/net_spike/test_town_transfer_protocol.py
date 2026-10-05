@@ -9,7 +9,7 @@ DISPOSABLE FIXTURE: a fresh copy of pc\\build64\\bin_fixture4 (never touched, on
 harness' whole-save snapshot / restore applies); NET_SPIKE_GAME_BIN points at it. The live save dir, bin_talkfix* and bin_fixture4 are never used.
 
 Phases (one host process each):
-  P1  host WITH --town-serve on: the streamed bytes' md5 == the host's GCI md5 and crc32 == TOWN_INFO.crc32, the TOWN_INFO town == the host's IDENTITY town (the terrain hash
+  P1  host WITH --town-serve full (M-G: on = sanitized): the streamed bytes' md5 == the host's GCI md5 and crc32 == TOWN_INFO.crc32, the TOWN_INFO town == the host's IDENTITY town (the terrain hash
       replica of pc_save_validate_gci_buffer is exact); 468 in-order chunks of <= 1000 B with a u32 offset; UP_TO_DATE for equal (crc, size) with no chunks, STREAM for a
       different crc; BAD_REQUEST (flags, protocol, size); an ABORT mid-stream leaves the host healthy (the next fetch and a normal READY client work); IDENTITY on a fetch
       connection is ignored (no ACK / REJECT, logged) and TOWN_DONE closes the connection; BUSY when 2 streams are active; a request after IDENTITY never streams; the
@@ -88,8 +88,8 @@ class Rig:
 
 def p1(rig):
     ck = rig.check
-    h = rig.start_host("p1", ["--town-serve", "on"])
-    ck("P1 host started (--town-serve on) and boots to the field", h is not None)
+    h = rig.start_host("p1", ["--town-serve", "full"])  # M-G: the md5 == host GCI checks need the FULL image; sanitized mode: test_town_sanitize_real.py
+    ck("P1 host started (--town-serve full) and boots to the field", h is not None)
     if h is None:
         return
     watch = T.GciWatcher(GCI).start()  # every version of the host's GCI (it re-saves every 60 s with random bytes): a snapshot must equal one of them

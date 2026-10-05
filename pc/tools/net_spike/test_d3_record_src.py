@@ -392,7 +392,7 @@ def main():
           and pu.index("pcnetgame_rec_merge_into_save(idx,") < pu.index("slot->hf_digest = pcnetgame_rec_hostfield_digest"))
     hh = func_body(blk_raw, "pcnetgame_rec_handle_hello")
     check("R HELLO: reserved-zero rule (_reserved0 / undefined flags -> BAD_SHAPE detail 6, no violation) and the digest refresh before the continuation decision",
-          "in->_reserved0 != 0 || (in->flags & ~PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST) != 0" in hh and "PC_NETGAME_REC_ACK_BAD_SHAPE, 6" in hh
+          "in->_reserved0 != 0 || (in->flags & ~(PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST | PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE)) != 0" in hh and "PC_NETGAME_REC_ACK_BAD_SHAPE, 6" in hh
           and hh.index("pcnetgame_rec_refresh_hostfields(idx, slot)") < hh.index("in->last_host_session == s_rec_host_session"))
     hb = func_body(blk_raw, "pcnetgame_rec_handle_begin")
     rsv_at = hb.index("if (in->rsv != (st->bound_class")

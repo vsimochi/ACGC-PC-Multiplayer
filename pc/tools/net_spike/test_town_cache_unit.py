@@ -85,10 +85,10 @@ def source_audit():
           "int pc_save_validate_gci_buffer(" in mc and "int pc_save_validate_gci_file(" in mc and "s_pc_town_gen++;" in mc and mc.count("s_pc_town_gen++;") == 1
           and "len != (size_t)GCI_HEADER_SIZE + (size_t)GCI_FILE_DATA_SIZE" in mc)
     check("S CMake: pc_town_cache.c is part of PC_SOURCES", "src/pc_town_cache.c" in cm)
-    check("S settings: town_serve defaults OFF (0), is parsed 0/1 only, is written by the defaults text and the writer; --town-serve override default -1",
-          ".town_serve = 0," in st_c and "int g_pc_town_serve_override = -1;" in st_c and "if (val == 0 || val == 1) g_pc_settings.town_serve = val;" in st_c
+    check("S settings: town_serve defaults OFF (0), is parsed 0..2 / off / on / full, is written by the defaults text and the writer; --town-serve override default -1",
+          ".town_serve = 0," in st_c and "int g_pc_town_serve_override = -1;" in st_c and "else if (val >= 0 && val <= 2) g_pc_settings.town_serve = val;" in st_c
           and '"town_serve = 0\\n"' in st_c and 'fprintf(f, "town_serve = %d\\n", g_pc_settings.town_serve);' in st_c and "int town_serve;" in st_h)
-    check("S pc_main.c: --town-dir / --town-fetch are CLIENT-only (exit 2 otherwise), mutually exclusive; --town-serve is HOST-only and needs on|off",
+    check("S pc_main.c: --town-dir / --town-fetch are CLIENT-only (exit 2 otherwise), mutually exclusive; --town-serve is HOST-only and needs off|on|full",
           '"--town-dir"' in mn and '"--town-fetch"' in mn and '"--town-serve"' in mn and "g_pc_net_role != 2" in mn and "g_pc_net_role != 1" in mn
           and "cannot be combined with --town-fetch" in mn and "pc_card_set_town_dir(g_pc_town_dir)" in mn)
     check("S pc_main.c: --town-dir is NOT in the --help text (hidden); --town-fetch / --town-serve are documented there",

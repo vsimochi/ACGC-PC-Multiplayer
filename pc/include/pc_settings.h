@@ -24,7 +24,7 @@ typedef struct {
     int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..8 (default 4); out of range = ignored */
     int allow_new_guests; /* HOST only (M-D): 1 = a NEW guest key may be admitted (default), 0 = only guests already known to guests.dat; a new key is refused (SERVER_FULL) */
     int resident_tokens;  /* HOST only (M-E): 0 = off (default, nothing minted / checked), 1 = tofu, 2 = required (see docs/multiplayer-guest-roadmap.md) */
-    int town_serve;       /* HOST only (M-B): 1 = serve the town GCI to pre-boot --town-fetch clients (default 0 = OFF: the file holds every resident's private data) */
+    int town_serve;       /* HOST only (M-B): serve the town to pre-boot --town-fetch clients: 0 = OFF (default), 1 = a SANITIZED copy (M-G), 2 = the full GCI (every resident's private data) */
 } PCSettings;
 
 extern PCSettings g_pc_settings;

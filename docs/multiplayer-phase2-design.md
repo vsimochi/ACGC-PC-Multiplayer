@@ -425,3 +425,28 @@ adopt is only the cheap part (`membership.ini` + `token.dat` rewrite for a STORE
 **Tests** (`pc/tools/net_spike/`): `test_promotion_protocol.py` (see the roadmap section) and `wire_baseline.py` (`EXPECTED_MAX_MSG_ID` 66, the 48-byte struct + offset pins, reject reasons 1..6) with the id-range literals of the source audits
 re-pinned (`test_guest_g1/g3/g4/g5/g6_src`, `test_guest_src` (+ the reviewed `private_data` / `homes` / `s_guest_rec` function lists: promote + the handoff check), `test_identity_validation_src` (reason 6),
 `test_house_sync_src`, `test_mail_src`, `test_mail2_src`, `test_ts_src`, `test_txn_x3_src`, `test_town_cache_unit`).
+
+### M-G (sanitized town transfer + record-import guard, the former M-B2): implemented (uncommitted, branch `multiplayer`)
+
+User documentation: `docs/multiplayer-guest-roadmap.md`, section "Sanitized town transfer and the record-import guard (M-G)" (what is kept / replaced, the residual leakage, the three layers of the guard).
+
+- New pure module `pc/src/pc_town_sanitize.c` / `pc/include/pc_town_sanitize.h`: `pc_town_sanitize(in, len, out, tpl)`, `pc_town_gci_is_sanitized`, `pc_town_gci_file_is_sanitized`, `pc_town_gci_find_resident`, `pc_town_sanitize_layout` (the table as data, used by the unit test). The templates come from `pc_m_card.c` (`pc_save_build_sanitize_templates`, built at host world-ready and lazily on the first request); every offset of the table is mirrored by `_Static_assert`s there.
+- Host (`pc_net_game.c`): `town_serve` is `0 off | 1 sanitized | 2 full`; the snapshot is sanitized into a new buffer, re-validated as a GCI of the same town, cached per (town_gen, input crc); TOWN_INFO `_rsv0` is now `flags` (bit0 SANITIZED; pinned in `wire_baseline.py`, HEAD's `_rsv0` text is the accepted previous layout). A warning is logged at world-ready when the town is served while `resident_tokens` is off (and for `full`).
+- Client: the stream is rejected (BAD_GCI) when the marker in the bytes disagrees with the TOWN_INFO flag (also for UP_TO_DATE against the cache). `g_pc_save_sanitized` is set by the loader; a HOST / single-player process refuses a marked file (box, exit 3; the box is suppressed by `AC_TOWN_NO_MSGBOX`), and `pc_save_write_gci_to` never writes while it is set.
+- D3 guard: RECORD_HELLO flag `0x02 NO_MIGRATE`; host "HOST WINS" at rev 0 for a resident (flag, `town_serve` sanitized, or a promotion entry in members.dat); the client never uploads a MIGRATE from a sanitized cache.
+- Friendship snapshot: the saved villager letter is sent only to the peer whose bound PersonalID the memory belongs to.
+
+**Deviations (the code disagreed with the brief, or a safer choice existed).**
+
+1. The private-record keep range for the PersonalID block ends at 0x17 (exclusive), not 0x18: byte 0x17 is padding before `museum_record` (0x18) and comes from the template.
+2. The land id of `Save_t.land_info` is at +0xA, not +8; the sanitizer reads it from there (BE) to stamp the mail block's land id. A town with land id 0 is refused (the loader could not detect the ARAM block order).
+3. The cleared `Mail_c` template is taken from the BE image of `Private_c.mail[0]` (`mMl_clear_mail_box` output); there is no public byte-swap for a bare Mail_c and the bytes are identical.
+4. The padding between the end of `Save_t` (0x242A0) and 0x26000 is zeroed in the main Save (and so in the backup) instead of kept: unknown content is not copied.
+5. The attached present of a villager letter is two bytes (+2, +3), both zeroed; the letter text range is +5..+0xFD (pad included); the letter date and the memory flags stay.
+6. The comment / banner / icon area including the 0x20 bytes after `MemcardHeader_c` is kept as is (only the marker is written).
+7. The real-client test uses `--bootstrap-resident 1` (as the other town tests do) instead of a membership.ini role.
+8. `town_serve = on` in an existing settings.ini now means sanitized; `full` is the old behaviour.
+
+**Resolved open issue: the host slot-1 record digest changing once after the first sanitized session (FC629933 -> CD163618).** Cause: NOT blank / sanitized data. FULL adoption replaces every non-immutable range (client-owned AND host-owned), and the client's one upload right after the adoption changes exactly 2 bytes of the host record, both inside `Private_c.calendar` (0x234C..0x23B4): `played_days[month]` (today's day bit, record +0x2373) and `calendar.month` (+0x23B2). It is the vanilla daily `mCD_calendar_wellcome_on()` run by the client's `mEv_run` new-day path on the adopted host calendar (the fixture's host record was last played the previous month); the same record state results with `--town-serve full` (final digest CD163618 there too, carried by the MIGRATE import). No pockets / wallet / bank / mail / designs byte changes. Diagnostic added: the host logs `upload xfer N changes B byte(s) in R run(s) of the record: 0xOFF+LEN ...` for every accepted UPLOAD. `test_town_sanitize_real.py` now asserts every upload of the first sanitized session is confined to the calendar, no upload in session 2 / 3, the host GCI slot-1 record differs only inside the calendar (wallet intact), and the pushes of sessions 2 and 3 are identical.
+
+**Not done / known gaps.** The client's own diary, letter storage and design storage are empty in a sanitized cache (they were never synced): a follow-up. MAIL_DELIVERED broadcasts and the resident-token-free claim of a leaked name are unchanged (see the residual-leakage paragraph in the roadmap).

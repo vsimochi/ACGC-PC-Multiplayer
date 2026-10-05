@@ -149,6 +149,7 @@
 #include "pc_dedicated.h" /* --dedicated: g_pc_dedicated + the [DEDICATED] peer notices (read-only hooks) */
 #include "pc_net.h"
 #include "pc_town_cache.h" /* M-A / M-B: runtime Card-A dir, town cache layout, CRC32, atomic install */
+#include "pc_town_sanitize.h" /* M-G: sanitized town transfer image */
 #include "pc_remote_player.h"
 #include "pc_field_authority.h" /* v2: persistent town-field addressing/authority (Workstream C) */
 #include "pc_wildlife_authority.h" /* World Ecology Wildlife Sync T0: host-authoritative wildlife table */
@@ -2060,6 +2061,7 @@ _Static_assert(sizeof(PCNetGamePlayerActionMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_REC_CHUNK_DATA   1000u
 #define PC_NETGAME_REC_CHUNK_COUNT  10u
 #define PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST 0x01u
+#define PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE 0x02u /* M-G: the client's local record may come from a SANITIZED town image: it must never be uploaded as a first-join MIGRATE (the host takes 'host wins'). A host without M-G refuses the bit (BAD_SHAPE detail 6): the client then stays unsynced, which is safe. */
 /* Guests (G1): RECORD_BEGIN.rsv IS the record_class (both directions): 0 = resident (host save record), 1 = guest (the guest table
  * record, outside Save_t). The host answers a BEGIN whose class differs from the CONNECTION's host-derived class with BAD_SHAPE detail 5
  * (not a violation), and stamps its own pushes to a guest with class 1. Any other value is refused the same way. */
@@ -2270,7 +2272,7 @@ typedef struct PCNetGameTownInfoMsg {
     uint32_t crc32;
     uint8_t  land_name[PC_NETGAME_LAND_LEN];
     uint16_t land_id;
-    uint16_t _rsv0;
+    uint16_t flags; /* M-G (was _rsv0): bit0 SANITIZED = the image is sanitized, old clients ignore the field */
     uint32_t terrain_hash;
     uint32_t town_gen;
     uint32_t chunk_count;
@@ -6926,6 +6928,19 @@ static int pcnetgame_build_friendship_snapshot_entry(PCNetGameFriendshipSnapshot
 static int pcnetgame_build_wildlife_snapshot_entry(PCNetGameWildlifeSnapshotEntryMsg* we, int slot,
                                                     uint32_t epoch);
 
+/* M-G: a FRIENDSHIP_SNAPSHOT_ENTRY goes to every admitted peer, but the saved letter text belongs to the player the villager's memory is about: the letter bytes
+ * (and has_letter) are sent only when the memory's PersonalID equals the peer's bound PersonalID; everyone else gets the entry without the letter. */
+static void pcnetgame_friendship_snapshot_redact(PCNetGameFriendshipSnapshotEntryMsg* fe, int peer) {
+    const PCNetGameHostPeerState* st = &s_host_peer[peer];
+    if (st->bound_valid && memcmp(fe->player_name, st->bound_pid.player_name, PC_NETGAME_NAME_LEN) == 0 &&
+        memcmp(fe->land_name, st->bound_pid.land_name, PC_NETGAME_LAND_LEN) == 0 && fe->player_id == st->bound_pid.player_id &&
+        fe->land_id == st->bound_pid.land_id) {
+        return;
+    }
+    fe->has_letter = 0;
+    memset(fe->letter, 0, sizeof(fe->letter));
+}
+
 static void pcnetgame_host_pump_snapshots(void) {
     int i;
 
@@ -7078,6 +7093,7 @@ static void pcnetgame_host_pump_snapshots(void) {
                     int slot = st->snap_next_friendship_idx / ANIMAL_MEMORY_NUM;
                     int memory_idx = st->snap_next_friendship_idx % ANIMAL_MEMORY_NUM;
                     if (pcnetgame_build_friendship_snapshot_entry(&fe, slot, memory_idx)) {
+                        pcnetgame_friendship_snapshot_redact(&fe, i); /* M-G: the letter text only for the player it is about */
                         found = 1;
                         break;
                     }
@@ -7222,6 +7238,7 @@ static void pcnetgame_reset_host_tree_cut_state(void);
 
 static void pcnetgame_host_revalidate_bound_peers(void); /* defined with the Stage 1A identity helpers */
 static void pcnetgame_townsrv_tick(void);                /* M-B: defined with the TOWN TRANSFER host block */
+static void pcnetgame_townsrv_world_ready(void);         /* M-G: templates + the privacy warning, defined with the TOWN TRANSFER host block */
 static void pcnetgame_rec_on_town_changed(void);   /* D3: defined with the record block */
 static void pcnetgame_rec_on_save_back(void);      /* D3 */
 static void pcnetgame_rec_store_resolve(void);     /* D3-4 */
@@ -7287,6 +7304,7 @@ static void pcnetgame_host_world_tick(int local_ready) {
         }
         pcnetgame_rec_store_resolve(); /* D3-4: load records.dat + derive per-resident lineage BEFORE any client can be READY */
         s_host_world_ready = 1;
+        pcnetgame_townsrv_world_ready();
         pcnetgame_format_town(&s_host_town, a, sizeof(a));
         printf("[NET][WORLD] host: world ready (%s, world_seq %u)\n", a, (unsigned)s_world_seq);
         PC_LOG(PCL_NET, "host world ready: %s world_seq %u\n", a, (unsigned)s_world_seq);
@@ -12752,6 +12770,9 @@ static void pcnetgame_host_rec_on_ready(PCNetPeerId peer) {
     st->rec_deadline_ms = pcnetgame_now_ms() + PC_NETGAME_REC_HELLO_TIMEOUT_MS;
 }
 
+static int pcnetgame_rec_has_promote_entry(int idx); /* M-G: defined with the resident credential block */
+static int pcnetgame_town_serve_mode(void);          /* M-G: defined with the TOWN TRANSFER host block */
+
 static void pcnetgame_rec_handle_hello(PCNetPeerId peer, const PCNetGameRecordHelloMsg* in) {
     PCNetGameHostPeerState* st = &s_host_peer[peer];
     PCNetGameRecSlot* slot;
@@ -12775,7 +12796,7 @@ static void pcnetgame_rec_handle_hello(PCNetPeerId peer, const PCNetGameRecordHe
         pcnetgame_rec_send_ack(peer, (uint8_t)PC_NETGAME_REC_ACK_BAD_SHAPE, 4, 0, 0, 0);
         return;
     }
-    if (in->_reserved0 != 0 || (in->flags & ~PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST) != 0) {
+    if (in->_reserved0 != 0 || (in->flags & ~(PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST | PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE)) != 0) {
         /* reserved-zero rule: undefined flag bits / _reserved0 are REFUSED (BAD_SHAPE detail 6), not counted as a violation;
          * the peer stays AWAIT_HELLO and may send a clean HELLO. */
         pcnetgame_rec_send_ack(peer, (uint8_t)PC_NETGAME_REC_ACK_BAD_SHAPE, 6, 0, 0, 0);
@@ -12786,6 +12807,30 @@ static void pcnetgame_rec_handle_hello(PCNetPeerId peer, const PCNetGameRecordHe
     printf("[NET][REC] host: peer %d HELLO (resident %d, have_last=%u last session %u epoch %u rev %u; host rev %u)\n",
            (int)peer, idx, (unsigned)(in->flags & PC_NETGAME_REC_HELLO_FLAG_HAVE_LAST), (unsigned)in->last_host_session,
            (unsigned)in->last_epoch, (unsigned)in->last_rev, (unsigned)slot->rev);
+    if (slot->rev == 0 && idx < PLAYER_NUM) {
+        /* M-G: 'host wins' instead of the legacy 'client wins once' MIGRATE: a client whose cache came from a SANITIZED town image holds a BLANK record for this resident, and
+         * uploading it would destroy the host's real record. Taken when (any of) the client says so (HELLO NO_MIGRATE), this host serves sanitized towns (an old client cannot
+         * say it), or members.dat holds a promotion entry for the PersonalID (the crash window between the promotion's town save and records.dat). Guests are unaffected. */
+        const char* why = NULL;
+        if ((in->flags & PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE) != 0) {
+            why = "the client says its cache is a sanitized town image";
+        } else if (pcnetgame_town_serve_mode() == 1) {
+            why = "town_serve is sanitized: the client's copy may be a sanitized image";
+        } else if (pcnetgame_rec_has_promote_entry(idx)) {
+            why = "members.dat holds a promotion entry for this resident";
+        }
+        if (why != NULL) {
+            slot->rev = 1u; /* same lineage seed as a guest promotion: the host record is the truth, no MIGRATE, the host pushes it */
+            slot->hf_digest = pcnetgame_rec_hostfield_digest(pcnetgame_rec_priv_ptr(idx));
+            slot->dirty_unsaved = 1;
+            slot->backup_valid = 0;
+            memset(s_rec_backup[idx], 0, PC_NETGAME_REC_SIZE);
+            printf("[NET][REC] host: peer %d resident %d never synced (rev 0): HOST WINS (%s): rev 1 seeded, PUSH_FULL (no MIGRATE_REQUEST)\n", (int)peer, idx, why);
+            st->rec_state = PC_NETGAME_RECS_PUSHING;
+            pcnetgame_rec_start_push(peer, idx, (uint8_t)PC_NETGAME_REC_KIND_PUSH_FULL);
+            return;
+        }
+    }
     if (slot->rev == 0 && (idx >= PLAYER_NUM ? s_guest_store_last_failed : s_rec_store_last_failed)) {
         /* D3-4: the last records.dat write failed / was skipped: a first migration could not be made durable-safe -> refuse it
          * (BUSY; the peer stays AWAIT_HELLO and is closed by the HELLO deadline, the client can reconnect later). */
@@ -12923,6 +12968,30 @@ static void pcnetgame_rec_process_upload(PCNetPeerId peer) {
         static uint8_t host_be[PC_NETGAME_REC_SIZE];
         pcnetgame_rec_export_be(idx, host_be);
         bad = pcnetgame_rec_validate_fields(&s_rec_scratch_b, rx, host_be);
+        if (bad == 0 && kind == PC_NETGAME_REC_KIND_UPLOAD) {
+            /* Diagnostic (M-G follow-up): WHICH record bytes does this upload change? (runs of differing bytes vs the host record, first 12 runs) */
+            int run_n = 0, byte_n = 0, o = 0;
+            char runs[320];
+            size_t rl = 0;
+            runs[0] = '\0';
+            while (o < (int)PC_NETGAME_REC_SIZE) {
+                if (rx[o] != host_be[o]) {
+                    int s0 = o;
+                    while (o < (int)PC_NETGAME_REC_SIZE && rx[o] != host_be[o]) {
+                        o++;
+                    }
+                    byte_n += o - s0;
+                    if (run_n < 12 && rl + 24 < sizeof(runs)) {
+                        rl += (size_t)snprintf(runs + rl, sizeof(runs) - rl, " 0x%04X+%d", s0, o - s0);
+                    }
+                    run_n++;
+                } else {
+                    o++;
+                }
+            }
+            printf("[NET][REC] host: peer %d upload xfer %u changes %d byte(s) in %d run(s) of the record:%s\n", (int)peer, (unsigned)xfer, byte_n, run_n,
+                   run_n != 0 ? runs : " (none)");
+        }
         if (bad == 0 && kind == PC_NETGAME_REC_KIND_MIGRATE_UPLOAD && idx >= PLAYER_NUM) {
             /* Guests G2.1: a NEW guest has nothing to import (it was created in this session), so its first upload may choose identity / appearance /
              * designs only: economy and progress must be the vanilla EMPTY defaults (host-enforced; never applied to a resident or to a later upload). */
@@ -14688,6 +14757,25 @@ static void pcnetgame_resident_mint_rollback(int idx) {
         pcnetgame_resident_pid_be(&Save_Get(private_data)[idx].player_ID, s_res_arm[idx].pid);
         s_res_arm[idx].armed = 1; /* the arm was not used up: the client never got the token (the original window keeps running) */
     }
+}
+
+/* M-G: 1 when members.dat holds a PROMOTION_HANDOFF entry of THIS town for the PersonalID of resident `idx` (the promotion crash window: the town save has the new
+ * resident but records.dat may not have its rev 1 yet; the host record is the truth then, never a MIGRATE import). */
+static int pcnetgame_rec_has_promote_entry(int idx) {
+    uint8_t pid[PC_MP_MEMBERS_PID_SIZE];
+    int i;
+    if (idx < 0 || idx >= PLAYER_NUM) {
+        return 0;
+    }
+    pcnetgame_resident_pid_be(&Save_Get(private_data)[idx].player_ID, pid);
+    for (i = 0; i < PC_MP_MEMBERS_SLOTS; i++) {
+        const PCMpMemberEntry* h = &s_members_file.e[i];
+        if (h->present && h->kind == PC_MP_MEMBER_KIND_PROMOTION_HANDOFF && memcmp(h->pid, pid, PC_MP_MEMBERS_PID_SIZE) == 0 &&
+            h->land_id == s_host_town.land_id && memcmp(h->land_name, s_host_town.land_name, 8) == 0 && h->terrain_hash == s_host_town.terrain_hash) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* KNOWN: the client presented the matching token = it demonstrably stored it: CONFIRMED (durable, never fatal). */
@@ -17811,6 +17899,8 @@ static void pcnetgame_crec_on_ready(void) {
     pcnetgame_house_client_on_ready(); /* furniture sync: canon / stash belong to ONE local player */
 }
 
+static int pcnetgame_client_is_resident_player(void); /* M-G: defined with the client membership helpers */
+
 static void pcnetgame_crec_send_hello(void) {
     PCNetGameRecordHelloMsg h;
     memset(&h, 0, sizeof(h));
@@ -17828,6 +17918,12 @@ static void pcnetgame_crec_send_hello(void) {
         h.last_host_session = s_crec_last.session;
         h.last_epoch = s_crec_last.epoch;
         h.last_rev = s_crec_last.rev;
+    }
+    if (g_pc_save_sanitized && pcnetgame_client_is_resident_player()) {
+        /* M-G: this client's whole town (cache) came from a SANITIZED transfer image, so its local record of this resident is BLANK: it must never be uploaded as a
+         * first-join MIGRATE. The host answers 'host wins' (it also does when it merely serves sanitized towns). Guests are unaffected (their record is the passport). */
+        h.flags |= (uint8_t)PC_NETGAME_REC_HELLO_FLAG_NO_MIGRATE;
+        printf("[NET][REC] client: HELLO flag NO_MIGRATE set (the loaded town is a sanitized transfer image)\n");
     }
     if (pc_net_send(0, PC_NET_RELIABLE, &h, (uint16_t)sizeof(h))) {
         s_crec.hello_sent = 1;
@@ -18450,7 +18546,10 @@ static void pcnetgame_crec_handle_ack(const PCNetGameRecordAckMsg* a) {
             }
             return;
         case PC_NETGAME_REC_ACK_MIGRATE_REQUEST:
-            if (s_crec.state == PC_NETGAME_CRS_AWAIT_RECORD && !s_crec.up_active && !s_crec.migrate_done && !s_crec.st_valid) {
+            if (g_pc_save_sanitized && pcnetgame_client_is_resident_player()) {
+                /* M-G: never upload a blank record from a sanitized cache, whatever the host asks; the host's MIGRATE deadline closes the link */
+                printf("[NET][REC] client: host asks for a MIGRATE upload but this town is a sanitized transfer image: NOT uploading (the host's timeout will close the link)\n");
+            } else if (s_crec.state == PC_NETGAME_CRS_AWAIT_RECORD && !s_crec.up_active && !s_crec.migrate_done && !s_crec.st_valid) {
                 s_crec.want_migrate = 1;
                 s_crec.migrate_epoch = a->epoch;
                 printf("[NET][REC] client: host asks for a MIGRATE upload (resident never synced, host epoch %u)\n",
@@ -18542,7 +18641,7 @@ static void pcnetgame_crec_tick(void) {
     }
 
     /* MIGRATE (first join, host rev 0): upload the local record once */
-    if (s_crec.want_migrate && !s_crec.up_active && !s_crec.migrate_done && s_crec.state == PC_NETGAME_CRS_AWAIT_RECORD &&
+    if (s_crec.want_migrate && !(g_pc_save_sanitized && pcnetgame_client_is_resident_player()) && !s_crec.up_active && !s_crec.migrate_done && s_crec.state == PC_NETGAME_CRS_AWAIT_RECORD &&
         pcnetgame_crec_time_ok(s_crec.retry_not_before_ms, now) && pcfa_save_ready() && s_local_world_latched &&
         pcnetgame_owner_stamp_matches(&s_crec.owner) && pcnetgame_crec_export_tx()) {
         s_crec.want_migrate = 0;
@@ -22988,8 +23087,37 @@ static uint32_t s_townsrv_xfer_counter = 0;
 static struct { uint32_t ip; uint32_t at_ms; uint8_t used; } s_townsrv_rate_log[PC_NETGAME_TOWN_RATE_LOG];
 static int s_townsrv_rate_next = 0;
 
+/* M-G: 0 off | 1 SANITIZED (settings 'on') | 2 full (the legacy unsanitized file) */
+#define PC_NETGAME_TOWN_SERVE_OFF       0
+#define PC_NETGAME_TOWN_SERVE_SANITIZED 1
+#define PC_NETGAME_TOWN_SERVE_FULL      2
+#define PC_NETGAME_TOWN_INFO_FLAG_SANITIZED 0x0001u /* TOWN_INFO.flags bit0: the streamed image is a sanitized transfer image (old clients ignore the field) */
+
+static int pcnetgame_town_serve_mode(void) {
+    const int m = g_pc_town_serve_override >= 0 ? g_pc_town_serve_override : g_pc_settings.town_serve;
+    return m < 0 ? 0 : m > 2 ? 2 : m;
+}
+
 static int pcnetgame_town_serve_on(void) {
-    return (g_pc_town_serve_override >= 0 ? g_pc_town_serve_override : g_pc_settings.town_serve) != 0;
+    return pcnetgame_town_serve_mode() != PC_NETGAME_TOWN_SERVE_OFF;
+}
+
+/* The sanitized image of the last snapshot (cache key: save generation + CRC32 of the INPUT file); the per-peer stream gets its own copy. */
+static struct { uint8_t* buf; uint32_t gen; uint32_t in_crc; PCTownId town; uint8_t valid; } s_townsrv_san_cache;
+
+static void pcnetgame_townsrv_world_ready(void) {
+    if (pcnetgame_town_serve_mode() == PC_NETGAME_TOWN_SERVE_SANITIZED) {
+        (void)pc_save_build_sanitize_templates(); /* once: cleared records / mail / ARAM blocks the sanitizer substitutes */
+    }
+    if (pcnetgame_town_serve_on()) {
+        if (pcnetgame_town_serve_mode() == PC_NETGAME_TOWN_SERVE_FULL) {
+            printf("[NET][TOWN] WARNING: town_serve = full: the WHOLE saved town (every resident's pockets, mail, diary, designs) is served to any --town-fetch client\n");
+        }
+        if (pcnetgame_resident_policy() == PC_NETGAME_RESTOK_OFF) {
+            printf("[NET][TOWN] WARNING: town_serve is on while resident_tokens is off: the served town (resident names / PersonalIDs are NOT sanitized) lets anyone claim a resident "
+                   "identity and receive that resident's record; enable --resident-tokens tofu (or required)\n");
+        }
+    }
 }
 
 static void pcnetgame_townsrv_reset(PCNetPeerId peer) {
@@ -23029,7 +23157,7 @@ static void pcnetgame_townsrv_rate_note(uint32_t ip, uint32_t now) {
     s_townsrv_rate_next = (s_townsrv_rate_next + 1) % PC_NETGAME_TOWN_RATE_LOG;
 }
 
-static void pcnetgame_townsrv_send_info(PCNetPeerId peer, uint8_t status, uint32_t xfer, uint32_t total, uint32_t crc, const PCTownId* town, uint32_t chunks) {
+static void pcnetgame_townsrv_send_info(PCNetPeerId peer, uint8_t status, uint32_t xfer, uint32_t total, uint32_t crc, const PCTownId* town, uint32_t chunks, uint16_t flags) {
     PCNetGameTownInfoMsg m;
     memset(&m, 0, sizeof(m));
     m.msg_type = (uint8_t)PC_NETGAME_MSG_TOWN_INFO;
@@ -23043,16 +23171,21 @@ static void pcnetgame_townsrv_send_info(PCNetPeerId peer, uint8_t status, uint32
         m.land_id = town->land_id;
         m.terrain_hash = town->terrain_hash;
     }
+    m.flags = flags;
     m.town_gen = (uint32_t)pc_save_town_gen();
     m.chunk_count = chunks;
     pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
 }
 
-/* The snapshot: the whole file into a malloc'd buffer (exact size required) and its town identity. NULL when there is no usable saved town. */
-static uint8_t* pcnetgame_townsrv_snapshot(uint32_t* size_out, PCTownId* town_out) {
+/* The snapshot: the whole file into a malloc'd buffer (exact size required) and its town identity. NULL when there is no usable saved town.
+ * M-G: in sanitized mode the returned buffer is the SANITIZED image: a NEW buffer, sanitized from the input and then re-validated as a GCI of the SAME town; cached per
+ * (save generation, CRC32 of the input file). The host's own file is only ever read. *sanitized_out = 1 then. Everything downstream (the CRC32, the UP_TO_DATE
+ * comparison, the stream) sees only the sanitized bytes. */
+static uint8_t* pcnetgame_townsrv_snapshot(uint32_t* size_out, PCTownId* town_out, int* sanitized_out) {
     FILE* f = fopen(pc_gci_path(), "rb");
     uint8_t* buf;
     size_t got;
+    *sanitized_out = 0;
     if (f == NULL) {
         return NULL;
     }
@@ -23066,6 +23199,42 @@ static uint8_t* pcnetgame_townsrv_snapshot(uint32_t* size_out, PCTownId* town_ou
     if (got != (size_t)PC_NETGAME_TOWN_FILE_SIZE || !pc_save_validate_gci_buffer(buf, got, town_out)) {
         free(buf);
         return NULL;
+    }
+    if (pcnetgame_town_serve_mode() == PC_NETGAME_TOWN_SERVE_SANITIZED) {
+        const uint32_t in_crc = pc_town_crc32(buf, (uint32_t)got);
+        const uint32_t gen = (uint32_t)pc_save_town_gen();
+        uint8_t* out = (uint8_t*)malloc(PC_NETGAME_TOWN_FILE_SIZE);
+        if (out != NULL && s_townsrv_san_cache.valid && s_townsrv_san_cache.buf != NULL && s_townsrv_san_cache.gen == gen &&
+            s_townsrv_san_cache.in_crc == in_crc && pc_town_id_equal(&s_townsrv_san_cache.town, town_out)) {
+            memcpy(out, s_townsrv_san_cache.buf, PC_NETGAME_TOWN_FILE_SIZE);
+        } else if (out != NULL) {
+            PCTownId t2;
+            const PCTownSanitizeTpl* tpl = pc_save_sanitize_templates();
+            if (tpl == NULL || !pc_town_sanitize(buf, got, out, tpl) || !pc_town_gci_is_sanitized(out, PC_NETGAME_TOWN_FILE_SIZE) ||
+                !pc_save_validate_gci_buffer(out, PC_NETGAME_TOWN_FILE_SIZE, &t2) || !pc_town_id_equal(&t2, town_out)) {
+                printf("[NET][TOWN] host: the town could not be sanitized (templates %s): serving NOTHING (UNAVAILABLE)\n", tpl == NULL ? "missing" : "ok");
+                free(out);
+                out = NULL;
+            } else {
+                if (s_townsrv_san_cache.buf == NULL) {
+                    s_townsrv_san_cache.buf = (uint8_t*)malloc(PC_NETGAME_TOWN_FILE_SIZE);
+                }
+                if (s_townsrv_san_cache.buf != NULL) {
+                    memcpy(s_townsrv_san_cache.buf, out, PC_NETGAME_TOWN_FILE_SIZE);
+                    s_townsrv_san_cache.gen = gen;
+                    s_townsrv_san_cache.in_crc = in_crc;
+                    s_townsrv_san_cache.town = *town_out;
+                    s_townsrv_san_cache.valid = 1;
+                }
+            }
+        }
+        free(buf);
+        if (out == NULL) {
+            return NULL;
+        }
+        *size_out = PC_NETGAME_TOWN_FILE_SIZE;
+        *sanitized_out = 1;
+        return out;
     }
     *size_out = (uint32_t)got;
     return buf;
@@ -23130,6 +23299,8 @@ static void pcnetgame_townsrv_handle_req(PCNetPeerId peer, const uint8_t* data, 
     PCNetGameTownFetchReqMsg rq;
     PCTownId town;
     uint8_t* buf;
+    int sanitized = 0;
+    uint16_t san_flag = 0;
     uint32_t total = 0, crc = 0, xfer;
     uint32_t now = pcnetgame_now_ms();
     const uint32_t ip = pc_net_peer_ip(peer);
@@ -23141,38 +23312,39 @@ static void pcnetgame_townsrv_handle_req(PCNetPeerId peer, const uint8_t* data, 
     if (st->identity_pending || st->ext_valid) {
         /* This connection already started an identity handshake: it is not a fetch connection. Refuse; the identity handshake itself is untouched. */
         printf("[NET][TOWN] host: peer %d TOWN_FETCH_REQ refused (the connection already sent IDENTITY / IDENTITY_EXT)\n", (int)peer);
-        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_REFUSED, 0, 0, 0, NULL, 0);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_REFUSED, 0, 0, 0, NULL, 0, 0);
         return;
     }
     ts->active = 1; /* from now on IDENTITY on this connection is ignored */
     ts->started_ms = now;
     if (size != sizeof(rq)) {
         printf("[NET][TOWN] host: peer %d BAD_REQUEST (size %u)\n", (int)peer, (unsigned)size);
-        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BAD_REQUEST, 0, 0, 0, NULL, 0);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BAD_REQUEST, 0, 0, 0, NULL, 0, 0);
         return;
     }
     memcpy(&rq, data, sizeof(rq));
     if (rq.flags != 0 || rq._rsv0 != 0 || rq._rsv1 != 0 || rq.protocol_version != PC_NETGAME_PROTOCOL_VERSION) {
         printf("[NET][TOWN] host: peer %d BAD_REQUEST (flags %u protocol %u)\n", (int)peer, (unsigned)rq.flags, (unsigned)rq.protocol_version);
-        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BAD_REQUEST, 0, 0, 0, NULL, 0);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BAD_REQUEST, 0, 0, 0, NULL, 0, 0);
         return;
     }
     if (!pcnetgame_town_serve_on()) {
         printf("[NET][TOWN] host: peer %d REFUSED (town_serve is off; enable with --town-serve on or settings.ini [Network] town_serve = 1)\n", (int)peer);
-        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_REFUSED, 0, 0, 0, NULL, 0);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_REFUSED, 0, 0, 0, NULL, 0, 0);
         return;
     }
     if (pcnetgame_townsrv_active_streams() >= PC_NETGAME_TOWN_MAX_FETCHES || !pcnetgame_townsrv_rate_allowed(ip, now)) {
         printf("[NET][TOWN] host: peer %d BUSY (%d streams active / per-address limit %d per %u ms)\n", (int)peer, pcnetgame_townsrv_active_streams(),
                (int)PC_NETGAME_TOWN_RATE_MAX, (unsigned)PC_NETGAME_TOWN_RATE_WINDOW_MS);
-        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BUSY, 0, 0, 0, NULL, 0);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_BUSY, 0, 0, 0, NULL, 0, 0);
         return;
     }
     pcnetgame_townsrv_rate_note(ip, now);
-    buf = pcnetgame_townsrv_snapshot(&total, &town);
+    buf = pcnetgame_townsrv_snapshot(&total, &town, &sanitized);
+    san_flag = sanitized ? (uint16_t)PC_NETGAME_TOWN_INFO_FLAG_SANITIZED : 0;
     if (buf == NULL) {
         printf("[NET][TOWN] host: peer %d UNAVAILABLE (no valid saved town at %s)\n", (int)peer, pc_gci_path());
-        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_UNAVAILABLE, 0, 0, 0, NULL, 0);
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_UNAVAILABLE, 0, 0, 0, NULL, 0, 0);
         return;
     }
     crc = pc_town_crc32(buf, total);
@@ -23183,17 +23355,17 @@ static void pcnetgame_townsrv_handle_req(PCNetPeerId peer, const uint8_t* data, 
     ts->xfer_id = xfer;
     if (rq.have_size == total && rq.have_crc32 == crc) {
         free(buf);
-        printf("[NET][TOWN] host: peer %d UP_TO_DATE (crc32 %08x, %u bytes, xfer %u)\n", (int)peer, (unsigned)crc, (unsigned)total, (unsigned)xfer);
-        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_UP_TO_DATE, xfer, total, crc, &town, 0);
+        printf("[NET][TOWN] host: peer %d UP_TO_DATE (crc32 %08x, %u bytes, xfer %u%s)\n", (int)peer, (unsigned)crc, (unsigned)total, (unsigned)xfer, sanitized ? ", SANITIZED" : "");
+        pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_UP_TO_DATE, xfer, total, crc, &town, 0, san_flag);
         return;
     }
     ts->buf = buf;
     ts->size = total;
     ts->next_off = 0;
     ts->streaming = 1;
-    printf("[NET][TOWN] host: peer %d STREAM %u bytes crc32 %08x xfer %u gen %u\n", (int)peer, (unsigned)total, (unsigned)crc, (unsigned)xfer, (unsigned)pc_save_town_gen());
+    printf("[NET][TOWN] host: peer %d STREAM %u bytes crc32 %08x xfer %u gen %u%s\n", (int)peer, (unsigned)total, (unsigned)crc, (unsigned)xfer, (unsigned)pc_save_town_gen(), sanitized ? " SANITIZED" : " FULL");
     pcnetgame_townsrv_send_info(peer, (uint8_t)PC_NETGAME_TOWN_STATUS_STREAM, xfer, total, crc, &town,
-                                (total + PC_NETGAME_TOWN_CHUNK_DATA - 1u) / PC_NETGAME_TOWN_CHUNK_DATA);
+                                (total + PC_NETGAME_TOWN_CHUNK_DATA - 1u) / PC_NETGAME_TOWN_CHUNK_DATA, san_flag);
     pcnetgame_townsrv_pump(peer);
 }
 
@@ -25040,7 +25212,8 @@ int pc_net_game_town_prefetch(const char* host_ip, uint16_t port, uint32_t timeo
                         if (!pc_town_paths(NULL, ikey, &ipaths)) {
                             snprintf(why, sizeof(why), "bad town key from the host");
                         } else if (info.status == PC_NETGAME_TOWN_STATUS_UP_TO_DATE) {
-                            if (!have_cache || info.total_size != have_size || info.crc32 != have_crc || !pc_town_id_equal(&info_town, &have_town)) {
+                            if (!have_cache || info.total_size != have_size || info.crc32 != have_crc || !pc_town_id_equal(&info_town, &have_town) ||
+                                pc_town_gci_file_is_sanitized(cpaths.gci) != ((info.flags & PC_NETGAME_TOWN_INFO_FLAG_SANITIZED) != 0u)) {
                                 snprintf(why, sizeof(why), "the host says UP_TO_DATE but the local cache does not match");
                             } else {
                                 printf("[NET][TOWN] fetch: UP_TO_DATE town %s (crc32 %08x, %u bytes, host save generation %u)\n", ikey, (unsigned)info.crc32,
@@ -25099,6 +25272,10 @@ int pc_net_game_town_prefetch(const char* host_ip, uint16_t port, uint32_t timeo
                         } else if (!pc_save_validate_gci_file(ipaths.part, &got_town) || !pc_town_id_equal(&got_town, &info_town)) {
                             done_status = PC_NETGAME_TOWN_DONE_BAD_GCI;
                             snprintf(why, sizeof(why), "the downloaded file is not a valid GCI of the announced town");
+                        } else if (pc_town_gci_file_is_sanitized(ipaths.part) != ((info.flags & PC_NETGAME_TOWN_INFO_FLAG_SANITIZED) != 0u)) {
+                            /* M-G: the SANITIZED flag of TOWN_INFO must agree with the marker inside the bytes: a sanitized image announced as full (or the reverse) is never installed */
+                            done_status = PC_NETGAME_TOWN_DONE_BAD_GCI;
+                            snprintf(why, sizeof(why), "the downloaded file does not match the announced sanitized flag (flags %u)", (unsigned)info.flags);
                         } else if (!pc_town_cache_install(ipaths.part, ipaths.gci)) {
                             done_status = PC_NETGAME_TOWN_DONE_IO;
                             snprintf(why, sizeof(why), "could not install the town into %s", ipaths.gci);
