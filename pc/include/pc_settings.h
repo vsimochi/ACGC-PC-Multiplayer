@@ -25,7 +25,7 @@ typedef struct {
     int allow_new_guests; /* HOST only (M-D): 1 = a NEW guest key may be admitted (default), 0 = only guests already known to guests.dat; a new key is refused (SERVER_FULL) */
     int resident_tokens;  /* HOST only (M-E): 0 = off (default, nothing minted / checked), 1 = tofu, 2 = required (see docs/multiplayer-guest-roadmap.md) */
     int personal_sync;    /* HOST only (personal data sync, diary): -1 = AUTO (default: on only while town_serve != off), 0 = off, 1 = on */
-    int town_serve;       /* HOST only (M-B): serve the town to pre-boot --town-fetch clients: 0 = OFF (default), 1 = a SANITIZED copy (M-G), 2 = the full GCI (every resident's private data) */
+    int town_serve;       /* HOST only (M-B): serve the town to pre-boot --town-fetch clients: -1 = AUTO (default: on for a --dedicated host, off otherwise), 0 = OFF, 1 = a SANITIZED copy (M-G), 2 = the full GCI (every resident's private data) */
 } PCSettings;
 
 extern PCSettings g_pc_settings;
@@ -37,6 +37,8 @@ extern int g_pc_allow_new_guests_override;
 extern int g_pc_resident_tokens_override;
 /* M-B: `--town-serve on|off` (host operator override of settings.ini town_serve); -1 = no override. */
 extern int g_pc_town_serve_override;
+/* Effective town_serve mode: --town-serve override, else settings.ini town_serve, else AUTO = 1 (sanitized) for a --host --dedicated process and 0 otherwise. */
+int pc_settings_town_serve_effective(void);
 /* Personal data sync: `--personal-sync on|off` (host override of settings.ini personal_sync); -1 = no override. */
 extern int g_pc_personal_sync_override;
 

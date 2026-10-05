@@ -13961,7 +13961,7 @@ static int pcnetgame_pdata_host_enabled(void) {
     if (g_pc_settings.personal_sync >= 0) {
         return g_pc_settings.personal_sync != 0;
     }
-    m = g_pc_town_serve_override >= 0 ? g_pc_town_serve_override : g_pc_settings.town_serve;
+    m = pc_settings_town_serve_effective();
     return m != 0;
 }
 
@@ -23966,7 +23966,7 @@ static int s_townsrv_rate_next = 0;
 #define PC_NETGAME_TOWN_INFO_FLAG_SANITIZED 0x0001u /* TOWN_INFO.flags bit0: the streamed image is a sanitized transfer image (old clients ignore the field) */
 
 static int pcnetgame_town_serve_mode(void) {
-    const int m = g_pc_town_serve_override >= 0 ? g_pc_town_serve_override : g_pc_settings.town_serve;
+    const int m = pc_settings_town_serve_effective();
     return m < 0 ? 0 : m > 2 ? 2 : m;
 }
 

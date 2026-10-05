@@ -391,6 +391,7 @@ int g_pc_authoritative_wildlife = 0;
  * writes `item` into layer 0 cell `cell` of floor `floor` of house H of its own Save, standing in for a host-originated change such as turnip
  * spoilage). See pc_platform.h. */
 int g_pc_house_sync = 0;
+static int s_house_sync_explicit = 0; /* --house-sync / --no-house-sync given: a --dedicated host otherwise turns furniture sync ON by default */
 int g_pc_house_test_host_in_house = -1;
 const char* g_pc_house_test_host_edit = NULL;
 int g_pc_house_test_fidelity = 0; /* TEST-ONLY --house-test-fidelity (see pc_platform.h) */
@@ -592,6 +593,17 @@ int g_pc_host_observer = 0;
 /* --host / --connect: Stage 1 role selection. No settings.ini persistence (matches --time/
  * --date/--rain: a per-launch dev override, not a saved preference), no UI yet. */
 static int      g_pc_net_role = 0; /* 0 = none/single-player, 1 = host, 2 = client */
+
+/* Effective town_serve mode: --town-serve override, else an explicit settings.ini value, else AUTO = 1 (sanitized) for a --host --dedicated process and 0 otherwise. */
+int pc_settings_town_serve_effective(void) {
+    if (g_pc_town_serve_override >= 0) {
+        return g_pc_town_serve_override;
+    }
+    if (g_pc_settings.town_serve >= 0) {
+        return g_pc_settings.town_serve;
+    }
+    return (g_pc_dedicated && g_pc_net_role == 1) ? 1 : 0;
+}
 static uint16_t g_pc_net_port = 7777;
 static char     g_pc_net_host_ip[64] = "127.0.0.1";
 
@@ -900,7 +912,7 @@ int main(int argc, char* argv[]) {
             printf("                      save into save/mp/towns/<townkey>/ and play it (progress in the window title). Falls back to the cached town of that\n");
             printf("                      server, then to save/card_a. The host must serve it (--town-serve on).\n");
             printf("  --personal-sync on|off HOST-only (exit 2 otherwise): authenticated per-resident diary sync (default: on only while the town is served, i.e. town_serve is not off; settings.ini personal_sync).\n");
-            printf("  --town-serve off|on|full HOST-only (exit 2 otherwise): serve the town save to --town-fetch clients (default off or settings.ini town_serve).\n");
+            printf("  --town-serve off|on|full HOST-only (exit 2 otherwise): serve the town save to --town-fetch clients (default: ON/sanitized for a --dedicated host, off otherwise; settings.ini town_serve = auto|off|on|full).\n");
             printf("                      on = a SANITIZED copy (other residents' pockets, mail, diary, designs and villager letters are blanked; names / houses / furniture are NOT);\n");
             printf("                      full = the whole file, unsanitized (every resident's private data: friends / LAN only). While 'on' the legacy 'client wins once' import is off.\n");
             printf("  --guest             CLIENT-only (requires --connect; exit code 2 with usage otherwise; cannot be combined with\n");
@@ -932,7 +944,8 @@ int main(int argc, char* argv[]) {
             printf("                      alone it implies --guest (the default guest profile). A server is only a destination; characters are not tied to it.\n");
             printf("  --servers           list the saved servers and exit 0.  --server-add NAME HOST[:PORT]  save a server (HOST = IPv4 literal, port default\n");
             printf("                      7777; no hostname resolution).  --server-delete NAME  remove one. Exit 0, or 2 on a refusal.\n");
-            printf("  --house-sync        HOST opt-in: the host is authoritative for the furniture of player houses (the owner's edits are committed to\n");
+            printf("  --no-house-sync     HOST: turn OFF furniture sync, which a --dedicated host enables by default.\n");
+            printf("  --house-sync        HOST opt-in (already the DEFAULT for --dedicated): the host is authoritative for the furniture of player houses (the owner's edits are committed to\n");
             printf("                      the host together with the pocket record; announced to every client in HOST_CONFIG). Off by default.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
             printf("                      not a one-shot test hook): activates the host-authoritative\n");
@@ -1311,6 +1324,10 @@ int main(int argc, char* argv[]) {
             g_pc_authoritative_wildlife = 1;
         } else if (strcmp(argv[i], "--house-sync") == 0) {
             g_pc_house_sync = 1;
+            s_house_sync_explicit = 1;
+        } else if (strcmp(argv[i], "--no-house-sync") == 0) {
+            g_pc_house_sync = 0;
+            s_house_sync_explicit = 1;
         } else if (strcmp(argv[i], "--house-test-host-in-house") == 0 && i + 1 < argc) {
             g_pc_house_test_host_in_house = atoi(argv[i + 1]);
             printf("[NET][HOUSE][TEST-ONLY] --house-test-host-in-house %d armed (a TEST hook: not for normal play)\n", g_pc_house_test_host_in_house);
@@ -1633,6 +1650,12 @@ int main(int argc, char* argv[]) {
                         "usage: AnimalCrossing --host [port] --personal-sync on|off   (see --help)\n");
         return 2;
     }
+    /* Dedicated multiplayer host defaults: furniture sync ON (unless --no-house-sync) and town serving AUTO = ON/sanitized (unless --town-serve off or settings.ini town_serve is explicit). */
+    if (g_pc_dedicated && g_pc_net_role == 1) {
+        if (!s_house_sync_explicit) {
+            g_pc_house_sync = 1;
+        }
+    }
     if (g_pc_town_serve_override >= 0 && g_pc_net_role != 1) {
         fprintf(stderr, "[PC] --town-serve: REFUSED: it is a HOST-only option (use it together with --host)\n"
                         "usage: AnimalCrossing --host [port] --town-serve off|on|full   (see --help)\n");
@@ -1790,6 +1813,12 @@ int main(int argc, char* argv[]) {
     pc_lowaddr_init(); /* no-op unless built with PC_LOW_ADDRESS_64 */
     SDL_SetMainReady();
     pc_settings_load();
+    if (g_pc_dedicated && g_pc_net_role == 1) { /* printed AFTER the settings load so an explicit settings.ini town_serve is reflected */
+        printf("[PC] dedicated host services: house sync %s (%s), town serve %s (%s)\n", g_pc_house_sync ? "ON" : "off",
+               s_house_sync_explicit ? "explicit option" : "default for --dedicated; --no-house-sync disables",
+               pc_settings_town_serve_effective() == 0 ? "off" : pc_settings_town_serve_effective() == 1 ? "ON (sanitized)" : "ON (FULL, unsanitized)",
+               (g_pc_town_serve_override >= 0 || g_pc_settings.town_serve >= 0) ? "explicit setting" : "default for --dedicated; --town-serve off disables");
+    }
     pc_keybindings_load();
 
     /* Stage 1: role selection only. A failure here (bad port, bad address, Winsock

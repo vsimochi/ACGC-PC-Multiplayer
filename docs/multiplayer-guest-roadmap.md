@@ -559,9 +559,9 @@ Manual verification still needed (two instances, nothing was seen on screen): a 
 
 Change (`pc_remote_player_collide_eval`, `pc/src/pc_remote_player.c`; no wire / save change): the existing puppet pipe (it only pushes the LOCAL player; the local player's own wall / furniture collision then corrects the result) is now also armed when the puppet and the local player are in the very same shared interior (`pc_remote_player_scene_is_local_shown`: same scene id + same owner, not a cottage). Different houses, rooms, floors or scenes never match. PLAYER_HOUSE scenes stay DISARMED while furniture is not synchronized. In an interior the pipe is held while the puppet's last MOVE is older than 90 frames (same stale rule as dw) and while the local player is in a door / outdoor / knock / intro / return / demo main state. Outdoor behaviour is unchanged. No environmental collision was added to puppets: the owner already collided with the same geometry locally. Tests: `test_interior_collision_src.py` (source audit), `test_building_interactions_src.py` (one pin updated: the shown predicate may now be used by dw AND collide_eval). Not verified visually (shove feel in a shop, door-mat case).
 
-### Furniture synchronization: Stage 1 (host-authoritative, opt-in `--house-sync`)
+### Furniture synchronization: Stage 1 (host-authoritative, `--house-sync`; default ON only for a `--dedicated` host)
 
-Stage 1 synchronizes the FURNITURE (and wall / floor / music box) of player houses. Collision of a visitor with the owner's furniture is Stage 2 and is NOT part of this change (the interior puppet pipe stays disarmed for player-house scenes). The feature is OFF unless the HOST is started with `--house-sync` (default off, like `--authoritative-wildlife`; the host announces it in HOST_CONFIG byte 1 bit 0 and a client follows the host; a client that never sees the bit gates nothing). To make it the default change `g_pc_house_sync` in `pc/src/pc_main.c`.
+Stage 1 synchronizes the FURNITURE (and wall / floor / music box) of player houses. Collision of a visitor with the owner's furniture is Stage 2 and is NOT part of this change (the interior puppet pipe stays disarmed for player-house scenes). The feature is OFF unless the HOST is started with `--house-sync` or with `--dedicated` (a dedicated host turns it ON by default, `--no-house-sync` disables it; a plain `--host` stays off, like `--authoritative-wildlife`; the host announces it in HOST_CONFIG byte 1 bit 0 and a client follows the host; a client that never sees the bit gates nothing).
 
 Why a pair: a pickup moves an item between the room and a pocket in ONE frame (`Player_actor_putin_furniture` -> `aMR_Furniture2ItemBag`), a placement does not (`mTG_drop_furniture` clears the pocket, the item sits in `rsv_ftr` for 46 frames), drawer contents live in `ftr_actor->items[]` and reach the save only when the room is torn down (`aMR_KeepItem2Fg` in `aMR_AllFurnitureDestruct`), and a pocket transaction commit writes the client's pocket pre-image into the host record. House and pockets therefore agree only OUTSIDE the room, and they are committed as ONE pair or not at all. (Read from code; none of it reproduced in a real room.)
 
@@ -664,6 +664,34 @@ Tests: `pc/tools/net_spike/test_admin_items_protocol.py` (REAL dedicated host pr
 ### Live furniture sync: stale `picking_up_flag` fix (manual report)
 
 Manual two-client test: a placed dresser did not appear live for a visitor, and a picked-up dresser stayed visible for the visitor. Root cause found by code tracing (not by a real-room run): vanilla sets `pickup_info.picking_up_flag` when a pickup's shrink animation ends (`ac_my_room_move.c_inc` ~2551) and never clears it (it is only read inside the pickup states), but `aMR_pc_room_quiet` tested it, so after the FIRST furniture pickup of a visit the owner's room was never "quiet" again: no in-room OWNER_COMMIT, hence no CANON_PUSH for any later edit (a ghost on the visitor, and a placement that only travelled on exit). Fix: `aMR_pc_room_quiet` no longer tests `picking_up_flag` (`pickup_flag` already covers the whole pickup). The visitor's rebuild chain (compare, write order, destroy-without-write-back, anchor-cell actor creation incl. RSV_FE1F fillers and layer 1) was traced and found correct; the draw loop iterates `used_list`, so a rebuild without the dresser cannot leave a ghost. Second possible delay: the visitor's "new furniture within one cell of me" deferral (retried every tick, applies when the visitor steps away); its log now has its own counter (1 line per 32) instead of the 16-lines-per-session cap. Not changed: a switch-only change (lamp toggle) is not shown live. Tests: `test_house_sync_src.py` 64/64 (new check that `picking_up_flag` is absent from the quiet test). Real-room behaviour NOT verified; to separate causes in a manual run look for `OWNER_COMMIT ... APPLIED` in A's log and `live apply of house ... deferred` in B's.
+
+## Dedicated host defaults
+
+A dedicated server is started with the one normal command:
+
+```
+AnimalCrossing.exe --host 7777 --dedicated
+```
+
+For `--host P --dedicated` (and only then) these services default to ON, without any further flag:
+
+* **Furniture / house sync** (`g_pc_house_sync`, HOST_CONFIG byte 1 bit 0). Override: `--no-house-sync` (`--house-sync` is still accepted and means the same as the default).
+* **Town serving, AUTO = ON / sanitized** (`town_serve = auto`): `--town-fetch` clients get a SANITIZED copy of the town (other residents' pockets / mail / diary / designs / villager letters blanked, the same image as `--town-serve on`). Override: `--town-serve off|on|full`, or `settings.ini` `[Network]` `town_serve = auto|off|on|full` (also `0|1|2`); the CLI wins over settings.ini, and an explicit settings.ini value wins over auto. A fresh game-written settings.ini contains `town_serve = auto`.
+* **Personal (diary) sync** stays `auto` and follows town serving, so it is ON as well (HOST_CONFIG byte 1 bit 1); `--town-serve off` therefore also turns it off unless `--personal-sync on` is given.
+
+A non-dedicated `--host` keeps every one of these OFF (unchanged).
+
+**Privacy note.** The town that is served by default is the sanitized one: nothing a resident keeps private leaves the host. Resident names / PersonalIDs are still in it, so anybody who fetches the town could claim a resident name while `resident_tokens` is off. **`resident_tokens` is still recommended**: `AnimalCrossing.exe --host 7777 --dedicated --resident-tokens tofu` (or `settings.ini` `resident_tokens = tofu`).
+
+**Startup log line**, printed once at launch of a dedicated host:
+
+```
+[PC] dedicated host services: house sync ON (default for --dedicated; --no-house-sync disables), town serve ON (sanitized) (default for --dedicated; --town-serve off disables)
+```
+
+The line is printed after settings.ini is loaded, so it reflects a `town_serve` set only in the file (this was a cosmetic defect found by the first test run and fixed).
+
+Test: `pc/tools/net_spike/test_dedicated_defaults_real.py` (REAL dedicated hosts + FakeClients + one REAL guest client on disposable `bin_fixture4_dfl` / `bin_fixture4_dflc` copies: defaults, `--town-serve off`, `--no-house-sync`, settings.ini off / auto / fresh file, non-dedicated unchanged).
 
 ## Client auto-reconnect
 
@@ -794,7 +822,7 @@ A client no longer has to copy the host's town save by hand. Started with `--tow
 **Flags.**
 
 * `--town-fetch` (client only, requires `--connect` or `--server`, exit 2 otherwise): fetch the town before the game boots (progress in the window title; errors in an SDL message box).
-* `--town-serve off|on|full` (host only, exit 2 otherwise) and `settings.ini` `[Network]` `town_serve = 0|1|2` (the words `off` / `on` / `full` work there too): whether and how this host serves its town. **Default OFF.** `on` (= 1) serves a SANITIZED copy (M-G, below); `full` (= 2) serves the whole saved file as before.
+* `--town-serve off|on|full` (host only, exit 2 otherwise) and `settings.ini` `[Network]` `town_serve = 0|1|2` (the words `off` / `on` / `full` work there too): whether and how this host serves its town. **Default AUTO (`town_serve = auto`, `-1`): ON/sanitized for a `--dedicated` host, OFF for a plain `--host`**; an explicit `--town-serve` or settings.ini value always wins. `on` (= 1) serves a SANITIZED copy (M-G, below); `full` (= 2) serves the whole saved file as before.
 * `--town-dir DIR` (hidden, client only, requires `--connect`, not together with `--town-fetch`): use `DIR` (a town directory) as the Card-A parent: the save is read from `DIR/card_a`.
   For tests and the fallback; `save/card_a` and the legacy `save/DobutsunomoriP_MURA.gci` are never moved, renamed or written, and the legacy migration is skipped.
 

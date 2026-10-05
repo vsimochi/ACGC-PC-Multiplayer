@@ -23,7 +23,7 @@ PCSettings g_pc_settings = {
     .max_guests = 4,
     .allow_new_guests = 1,
     .resident_tokens = 0,
-    .town_serve = 0,
+    .town_serve = -1, /* -1 = AUTO: on for a --dedicated host (sanitized), off otherwise; an explicit off/on/full in settings.ini or --town-serve wins */
     .personal_sync = -1,
 };
 
@@ -93,8 +93,8 @@ static const char* DEFAULT_SETTINGS =
     "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n"
     "resident_tokens = off\n"
     "\n"
-    "# Host only: serve this town's save to clients that start with --town-fetch: 0 = off (default), 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n"
-    "town_serve = 0\n"
+    "# Host only: serve this town's save to clients that start with --town-fetch: auto (default: on for a --dedicated host, off otherwise), 0 = off, 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n"
+    "town_serve = auto\n"
     "\n"
     "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n"
     "personal_sync = auto\n";
@@ -158,7 +158,8 @@ static void apply_setting(const char* key, const char* value) {
         else if (strcmp(value, "required") == 0) g_pc_settings.resident_tokens = 2;
     } else if (strcmp(key, "town_serve") == 0) {
         /* M-G: 0 = off, 1 = on (a SANITIZED copy), 2 = full (the whole file); the words off / on / full are accepted too */
-        if (strcmp(value, "off") == 0) g_pc_settings.town_serve = 0;
+        if (strcmp(value, "auto") == 0) g_pc_settings.town_serve = -1;
+        else if (strcmp(value, "off") == 0) g_pc_settings.town_serve = 0;
         else if (strcmp(value, "on") == 0) g_pc_settings.town_serve = 1;
         else if (strcmp(value, "full") == 0) g_pc_settings.town_serve = 2;
         else if (val >= 0 && val <= 2) g_pc_settings.town_serve = val;
@@ -266,8 +267,8 @@ void pc_settings_save(void) {
     fprintf(f, "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n");
     fprintf(f, "resident_tokens = %s\n", g_pc_settings.resident_tokens == 2 ? "required" : g_pc_settings.resident_tokens == 1 ? "tofu" : "off");
     fprintf(f, "\n");
-    fprintf(f, "# Host only: serve this town's save to clients that start with --town-fetch: 0 = off (default), 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n");
-    fprintf(f, "town_serve = %d\n", g_pc_settings.town_serve);
+    fprintf(f, "# Host only: serve this town's save to clients that start with --town-fetch: auto (default: on for a --dedicated host, off otherwise), 0 = off, 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n");
+    if (g_pc_settings.town_serve < 0) fprintf(f, "town_serve = auto\n"); else fprintf(f, "town_serve = %d\n", g_pc_settings.town_serve);
     fprintf(f, "\n");
     fprintf(f, "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n");
     fprintf(f, "personal_sync = %s\n", g_pc_settings.personal_sync < 0 ? "auto" : g_pc_settings.personal_sync ? "on" : "off");
