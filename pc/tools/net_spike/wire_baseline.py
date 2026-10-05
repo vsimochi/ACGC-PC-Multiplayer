@@ -38,7 +38,8 @@ import sys
 HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRange", "PCNetGameRecSlot", "PCNetGameClientRec",
              "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending",
              "PCNetGameTsHost", "PCNetGameTsOp", "PCNetGameMailOp", "PCNetGameMboxHost", "PCNetGameTakeOp",
-             "PCNetGameGuest")  # guests G1: the host's guest table entry (local, never on the wire)
+             "PCNetGameGuest",  # guests G1: the host's guest table entry (local, never on the wire)
+             "PCNetGameHouseHost", "PCNetGameHouseClient")  # furniture sync: the host's canonical house copy / the client's house state (local, never on the wire)
 # Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
 # (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
 REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
@@ -49,7 +50,8 @@ REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
 # Mail milestone 2 (deliberate, v8 still unreleased): 56 = MAILBOX_LETTER (host -> the owning client only: one slot of the host-held house mailbox).
 # Guests G1 (deliberate, v8 still unreleased): 57 = IDENTITY_EXT (client -> host, the guest claim sent BEFORE the frozen IDENTITY) and 58 = IDENTITY_TOKEN
 # (host -> the admitted guest only, sent right after the frozen IDENTITY_ACK). The 32-byte IDENTITY / IDENTITY_ACK structs themselves stay frozen.
-EXPECTED_MAX_MSG_ID = 58
+# Furniture sync Stage 1 (deliberate, v8 still unreleased): 59 = HOUSE_BEGIN (both directions, 36 B), 60 = HOUSE_CHUNK (both, 1012 B), 61 = HOUSE_ACK (host -> owner, 24 B).
+EXPECTED_MAX_MSG_ID = 61
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -88,6 +90,13 @@ V8_NEW_STRUCTS = {
                                "uint8_t token_present; uint8_t token[PC_NETGAME_GUEST_TOKEN_LEN]; uint8_t _reserved1;",
     "PCNetGameIdentityTokenMsg": "uint8_t msg_type; uint8_t flags; uint8_t guest_slot; uint8_t table_size; "
                                  "uint8_t token[PC_NETGAME_GUEST_TOKEN_LEN];",
+    # furniture sync Stage 1: the house transfer (36 B BEGIN both directions, 1012 B CHUNK, 24 B ACK host -> owner)
+    "PCNetGameHouseBeginMsg": "uint8_t msg_type; uint8_t kind; uint8_t chunk_count; uint8_t house; uint32_t xfer_id; uint32_t host_session; "
+                              "uint32_t house_seq; uint32_t rec_epoch; uint32_t rec_rev; uint16_t total_size; uint16_t rsv; uint32_t digest; uint32_t rsv2;",
+    "PCNetGameHouseChunkMsg": "uint8_t msg_type; uint8_t chunk_idx; uint16_t len; uint32_t xfer_id; uint16_t offset; uint16_t rsv; "
+                              "uint8_t data[PC_NETGAME_HOUSE_CHUNK_DATA];",
+    "PCNetGameHouseAckMsg": "uint8_t msg_type; uint8_t status; uint16_t detail; uint32_t xfer_id; uint32_t house_seq; uint32_t epoch; uint32_t rev; "
+                            "uint32_t host_session;",
 }
 # What HEAD may still contain for a struct whose v8 text was deliberately changed in place by a later (still unreleased) milestone.
 V8_PREV_STRUCTS = {
@@ -154,8 +163,9 @@ V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_B
                 ("PC_NETGAME_MSG_TXN_COMMIT", "51"), ("PC_NETGAME_MSG_TXN_RESULT", "52"),
                 ("PC_NETGAME_MSG_TXN_RESERVED_53", "53"), ("PC_NETGAME_MSG_TXN_RESERVED_54", "54"),
                 ("PC_NETGAME_MSG_TOWN_SVC_STATE", "55"), ("PC_NETGAME_MSG_MAILBOX_LETTER", "56"),
-                ("PC_NETGAME_MSG_IDENTITY_EXT", "57"), ("PC_NETGAME_MSG_IDENTITY_TOKEN", "58")]
-_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN))\s*=\s*\d+,"
+                ("PC_NETGAME_MSG_IDENTITY_EXT", "57"), ("PC_NETGAME_MSG_IDENTITY_TOKEN", "58"),
+                ("PC_NETGAME_MSG_HOUSE_BEGIN", "59"), ("PC_NETGAME_MSG_HOUSE_CHUNK", "60"), ("PC_NETGAME_MSG_HOUSE_ACK", "61")]
+_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK))\s*=\s*\d+,"
 # net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
 V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
@@ -163,6 +173,7 @@ V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)
                            r"|PC_NETGAME_MSG_MAILBOX_LETTER|PC_NETGAME_MBOX_\w+|PC_NETGAME_MAIL_WIRE_SIZE|MAILBOX_LETTER_FMT"
                            r"|PC_NETGAME_MSG_IDENTITY_(?:EXT|TOKEN)|PC_NETGAME_IDEXT_\w+|PC_NETGAME_IDTOKEN_\w+|PC_NETGAME_GUEST_\w+"
                            r"|PC_NETGAME_REC_CLASS_\w+|IDENTITY_(?:EXT|TOKEN)_FMT"
+                           r"|PC_NETGAME_MSG_HOUSE_(?:BEGIN|CHUNK|ACK)|PC_NETGAME_HOUSE_\w+|PC_NETGAME_HOSTCFG_\w+|HOUSE_(?:BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)|(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)_FMT) = ")
 
 
@@ -309,6 +320,30 @@ V8_LIB_PINNED = {
     "PC_NETGAME_REC_CLASS_GUEST": '1',
     "IDENTITY_EXT_FMT": '"<BBH8s8sHHB16sB"',
     "IDENTITY_TOKEN_FMT": '"<BBBB16s"',
+    # furniture sync Stage 1
+    "PC_NETGAME_MSG_HOUSE_BEGIN": '59',
+    "PC_NETGAME_MSG_HOUSE_CHUNK": '60',
+    "PC_NETGAME_MSG_HOUSE_ACK": '61',
+    "PC_NETGAME_HOUSE_IMG_SIZE": '0x1A44',
+    "PC_NETGAME_HOUSE_COMMIT_SIZE": '16004',
+    "PC_NETGAME_HOUSE_CHUNK_DATA": '1000',
+    "PC_NETGAME_HOUSE_COMMIT_CHUNKS": '17',
+    "PC_NETGAME_HOUSE_PUSH_CHUNKS": '7',
+    "PC_NETGAME_HOUSE_KIND_OWNER_COMMIT": '1',
+    "PC_NETGAME_HOUSE_KIND_CANON_PUSH": '2',
+    "PC_NETGAME_HOUSE_ACK_APPLIED": '0',
+    "PC_NETGAME_HOUSE_ACK_STALE": '1',
+    "PC_NETGAME_HOUSE_ACK_BAD_DIGEST": '2',
+    "PC_NETGAME_HOUSE_ACK_BAD_SHAPE": '3',
+    "PC_NETGAME_HOUSE_ACK_INVALID_CELL": '4',
+    "PC_NETGAME_HOUSE_ACK_CONSERVATION": '5',
+    "PC_NETGAME_HOUSE_ACK_NOT_OWNER": '6',
+    "PC_NETGAME_HOUSE_ACK_BUSY": '7',
+    "PC_NETGAME_HOUSE_ACK_RATE_LIMITED": '8',
+    "PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC": '0x01',
+    "HOUSE_BEGIN_FMT": '"<BBBBIIIIIHHII"',
+    "HOUSE_CHUNK_FMT": '"<BBHIHH1000s"',
+    "HOUSE_ACK_FMT": '"<BBHIIIII"',
     "FIELD_ACTION_REQUEST_FMT": '"<BBBBIBBHIIBBHBBHII15HHII"',
     "FIELD_ACTION_RESULT_FMT": '"<BBBBIHBB"',
     "CATCH_REQUEST_FMT": '"<B3xIIIiIIBBHBBHII15HHII"',
@@ -398,15 +433,15 @@ def audit_texts(head, cur):
         "the request / result structs they ride are the already pinned ones (no layout change)",
         all(a in cur["game_c"] for a in WEEDS_C_PINS))
     strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
-    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)))\s*=\s*(\d+),", b)
+    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)))\s*=\s*(\d+),", b)
     # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52), + town services (47-55), + mailbox (47-56) or all of them
-    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS)
+    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS)
                    if "PCNetGameMsgType" in hb else False)
-    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-58 (appended, in order; 53/54 enumerated as reserved)",
+    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-61 (appended, in order; 53/54 enumerated as reserved)",
         "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
         and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
         and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
-        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_IDENTITY_TOKEN = 58"))
+        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_HOUSE_ACK = 61"))
     nums = [v for _n, v in c_message_ids(cur["game_c"])]
     add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
@@ -496,7 +531,7 @@ def selftest(repo):
         "protocol version": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>9u", c["game_h"], count=1)),
         "protocol reverted": lambda c: c.update(game_h=re.sub(r"(PC_NETGAME_PROTOCOL_VERSION\s+)8u", r"\g<1>7u", c["game_h"], count=1)),
         "enum value": lambda c: c.update(game_c=c["game_c"].replace(msg_id.group(0), msg_id.group(0).replace(",", " + 1,"), 1)),
-        "extra enum id 59": lambda c: c.update(game_c=c["game_c"].replace("} PCNetGameMsgType;", "    PC_NETGAME_MSG_EXTRA = 59,\n} PCNetGameMsgType;", 1)),
+        "extra enum id 62": lambda c: c.update(game_c=c["game_c"].replace("} PCNetGameMsgType;", "    PC_NETGAME_MSG_EXTRA = 62,\n} PCNetGameMsgType;", 1)),
         "guest ext enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_IDENTITY_EXT          = 57,", "PC_NETGAME_MSG_IDENTITY_EXT          = 67,", 1)),
         "guest token enum id moved": lambda c: c.update(game_c=c["game_c"].replace("PC_NETGAME_MSG_IDENTITY_TOKEN        = 58,", "PC_NETGAME_MSG_IDENTITY_TOKEN        = 68,", 1)),
         "guest ext struct field": lambda c: c.update(game_c=c["game_c"].replace("    uint8_t  _reserved1;     /* 0 */\n} PCNetGameIdentityExtMsg;", "    uint8_t  _reserved1;     /* 0 */\n    uint8_t  extra;\n} PCNetGameIdentityExtMsg;", 1)),

@@ -118,8 +118,8 @@ def main():
     # ------------------------------------------------------------------------------------------------ W
     ids = dict(wire_baseline.c_message_ids(raw))
     ck("W ids: 57 = IDENTITY_EXT, 58 = IDENTITY_TOKEN, all ids contiguous 1..%d" % wire_baseline.EXPECTED_MAX_MSG_ID,
-       ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58 and wire_baseline.EXPECTED_MAX_MSG_ID == 58
-       and sorted(ids.values()) == list(range(1, 59)))
+       ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58 and wire_baseline.EXPECTED_MAX_MSG_ID == 61
+       and sorted(ids.values()) == list(range(1, 62)))
     ck("W IDENTITY_EXT: exact 42-byte size assert + offsets + <= 64 and <= PC_NET_MAX_PAYLOAD; IDENTITY_TOKEN 20 bytes",
        "_Static_assert(sizeof(PCNetGameIdentityExtMsg) == 42," in raw and "offsetof(PCNetGameIdentityExtMsg, token) == 25" in raw
        and "sizeof(PCNetGameIdentityExtMsg) <= 64 && sizeof(PCNetGameIdentityExtMsg) <= PC_NET_MAX_PAYLOAD" in raw
@@ -148,6 +148,7 @@ def main():
                                                                               "pc_net_game_dedicated_guest_admin"]))
     pinned = ["pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
+              "pcnetgame_house_handle_begin", "pcnetgame_house_process_commit",  # furniture sync: guest slot -> NOT_OWNER before the first subscript (test_house_sync_src.py)
               "pcnetgame_mail_test_poke_museum", "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mail_test_seed_reply", "pcnetgame_mbox_refresh_resident",
               "pcnetgame_mbox_send", "pcnetgame_rec_gate", "pcnetgame_rec_priv_ptr", "pcnetgame_rec_resolve_slot", "pcnetgame_rec_slot", "pcnetgame_rec_store_build"]
     users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(private_data\)\[", c[a:b])})
@@ -158,7 +159,10 @@ def main():
        "client-side shadows, TEST-ONLY hooks): %s" % homes_users,
        homes_users == sorted(["pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
                               "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mbox_client_apply", "pcnetgame_mbox_client_tick", "pcnetgame_mbox_house_of",
-                              "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook", "pcnetgame_txn_apply_take"]))
+                              "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook", "pcnetgame_txn_apply_take",
+                              # furniture sync (house index from a bound PersonalID, guest refused first; client shadows; TEST-ONLY host edit): see test_house_sync_src.py
+                              "pcnetgame_hcl_build_pair", "pcnetgame_hcl_local_cown", "pcnetgame_hcl_push_complete", "pcnetgame_hcl_write_save", "pcnetgame_house_host_refresh",
+                              "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit"]))
     for name in ("pcnetgame_handle_host_txn_commit", "pcnetgame_x3_grant", "pcnetgame_handle_host_ts_txn", "pcnetgame_rec_process_upload", "pcnetgame_rec_handle_hello",
                  "pcnetgame_rec_start_push", "pcnetgame_txn_send_applied", "pcnetgame_rec_txn_write_inventory", "pcnetgame_rec_txn_write_mail", "pcnetgame_rec_txn_idx_ok",
                  "pcnetgame_rec_merge_into_save", "pcnetgame_rec_export_be", "pcnetgame_rec_refresh_hostfields"):
@@ -304,13 +308,19 @@ def main():
        and "pcnetgame_guest_store_load();" in fb("pcnetgame_rec_store_resolve").split("if (s_rec_resolved)")[0])
     ck("P an accepted guest change raises the same early-save request as a resident (note_peer_gone maps the guest slot) and the resident note_saved never clears a guest's dirty marker",
        "slot = st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST" in fb("pcnetgame_rec_note_peer_gone") and "for (i = 0; i < PLAYER_NUM; i++) {" in fb("pc_net_game_record_note_saved"))
-    d = subprocess.run(["git", "-C", ROOT, "diff", "--stat", "HEAD", "--", "pc/src/pc_card.c", "pc/src/pc_save_bswap.c"], capture_output=True, text=True).stdout.strip()
+    d = subprocess.run(["git", "-C", ROOT, "diff", "--stat", "HEAD", "--", "pc/src/pc_card.c"], capture_output=True, text=True).stdout.strip()
+    # furniture sync: pc_save_bswap.c may differ from HEAD by exactly ONE addition -- the public pc_save_bswap_home() wrapper of swap_mHm_hs (no removed line, nothing else)
+    dbs = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", "HEAD", "--", "pc/src/pc_save_bswap.c"], capture_output=True, text=True).stdout
+    bs_added = [ln[1:] for ln in dbs.split("\n") if ln.startswith("+") and not ln.startswith("+++")]
+    bs_removed = [ln for ln in dbs.split("\n") if ln.startswith("-") and not ln.startswith("---")]
+    d_bsw_ok = not bs_removed and len(bs_added) <= 8 and any("void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {" in ln for ln in bs_added) \
+        and any("swap_mHm_hs(home, dir);" in ln for ln in bs_added)
     cur_mc = mask(strip_observer(read("pc/src/pc_m_card.c")))  # the --host-observer marker blocks removed (see strip_observer)
     cur_f = functions(cur_mc)
     writers = ("pc_save_write_gci_to", "pc_save_write_gci", "pc_save_rotate_backups", "pc_save_write_authoritative", "mCD_SaveHome_bg")
     same = {n: (mask(head_function(n, "pc/src/pc_m_card.c", True)).strip() == body(cur_mc, cur_f, n).strip() != "") for n in writers}
-    ck("P the GCI writer functions (%s), the Card-B scan (pc_card.c) and the byte-swap code are UNCHANGED vs HEAD: guests add no file to the vanilla save path" % sorted(same),
-       d == "" and all(same.values()))
+    ck("P the GCI writer functions (%s), the Card-B scan (pc_card.c) and the byte-swap code are UNCHANGED vs HEAD (the byte-swap code only GAINED the furniture-sync wrapper pc_save_bswap_home): guests add no file to the vanilla save path" % sorted(same),
+       d == "" and d_bsw_ok and all(same.values()))
     ck("P pc_mp_guests.c is in the build (CMakeLists) and the path / format are documented", "pc_mp_guests.c" in read("pc/CMakeLists.txt") and "ACMPGST" in gh and "UNTRUSTED" in gh)
 
     # ------------------------------------------------------------------------------------------------ K

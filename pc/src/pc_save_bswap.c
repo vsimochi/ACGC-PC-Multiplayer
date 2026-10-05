@@ -840,6 +840,12 @@ void pc_save_bswap_private(Private_c* prv, pc_bswap_dir_t dir) {
     swap_Private(prv, dir);
 }
 
+/* Furniture sync (house image): public wrapper around the static swap_mHm_hs(). `home` is converted IN PLACE, so callers must always pass a COPY of a
+ * live Save_Get(homes[h]) (never the live struct). Direction matters (flags / size_info / floor_bit_info bitfields are repacked). */
+void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {
+    swap_mHm_hs(home, dir);
+}
+
 void pc_save_bswap(Save_t* save, pc_bswap_dir_t dir) {
     int i;
 

@@ -482,6 +482,11 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_IDENTITY_TOKEN        = 58, /* Guests (G1): host -> the one admitted GUEST client ONLY, RELIABLE, 20 bytes, sent right after the (frozen,
                                              * 32-byte) IDENTITY_ACK: the 16-byte guest token (trust on first use: minted at first contact) and the guest
                                              * table slot. See PCNetGameIdentityTokenMsg. */
+    PC_NETGAME_MSG_HOUSE_BEGIN           = 59, /* Furniture sync Stage 1 (v8, unreleased: extended in place, NO version bump), 36 bytes, RELIABLE, both directions (kind 1 OWNER_COMMIT
+                                             * client -> host, kind 2 CANON_PUSH host -> client). Opens one house transfer (a player house image, plus the 0x2440 B record for a
+                                             * commit). See PCNetGameHouseBeginMsg and the HOUSE WIRE block. A misdirected kind is dropped. */
+    PC_NETGAME_MSG_HOUSE_CHUNK           = 60, /* Furniture sync: both directions, RELIABLE, 1012 bytes (the RECORD_CHUNK layout): one <= 1000 byte slice of the transfer payload. */
+    PC_NETGAME_MSG_HOUSE_ACK             = 61, /* Furniture sync: host -> the committing owner ONLY, RELIABLE, 24 bytes: the outcome of an OWNER_COMMIT. A client's copy is dropped. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2113,6 +2118,86 @@ _Static_assert((PC_NETGAME_REC_SIZE + PC_NETGAME_REC_CHUNK_DATA - 1u) / PC_NETGA
                "PC_NETGAME_REC_CHUNK_COUNT does not match the record size");
 _Static_assert(PC_NETGAME_REC_CHUNK_COUNT <= 16, "the per-transfer got mask is 16 bits");
 
+/* ===== HOUSE WIRE (furniture sync Stage 1, protocol v8, UNRELEASED: ids 59..61 extend v8 in place, NO version bump), all RELIABLE =====
+ * Host-authoritative player-house furniture. The OWNER commits an edited house TOGETHER WITH its full 0x2440-byte pocket record as ONE pair (a pickup moves an
+ * item between the room and a pocket, a placement the other way: only the pair is consistent); the host validates and commits both in one handler call or
+ * rejects both. The host pushes its canonical copy of a house to every other READY (non-guest) peer.
+ * HOUSE IMAGE (0x1A44 B) = the canonical BIG-ENDIAN bytes of mHm_hs_c [0x0000, 0x1A30) (header, floors[3]) followed by [0x2678, 0x268C) (goki, 2 padding bytes,
+ * music_box); the mailbox (host-fed by MAILBOX_LETTER) and the gyroid message / bells (haniwa) are NOT in it. The OWNER may write ONLY floors[*] (4 layers incl.
+ * ftr_switch and haniwa_step, wall_floor, tempo_beat, floor_bit_info) and music_box; every other byte is host-owned (a commit's copy of it is ignored).
+ *   HOUSE_BEGIN (59, 36 B): kind 1 OWNER_COMMIT (C -> H): payload = image || record = 16004 B = 17 chunks, house_seq = the canon seq the edit was built on,
+ *     host_session = the host session that seq belongs to, rec_epoch / rec_rev = the record base; kind 2 CANON_PUSH (H -> C): payload = image = 7 chunks, house_seq =
+ *     the resulting canonical seq, rec_epoch / rec_rev = 0. digest = FNV-1a32 of the whole payload. rsv / rsv2 must be 0.
+ *   HOUSE_CHUNK (60, 1012 B): the RECORD_CHUNK layout (idx, len, xfer_id, offset = idx * 1000, data[1000]); the host's got mask for a commit is 32 bits (17 chunks).
+ *   HOUSE_ACK (61, 24 B, H -> C): status 0 APPLIED (new seq / epoch / rev) 1 STALE 2 BAD_DIGEST 3 BAD_SHAPE 4 INVALID_CELL (detail = floor * 1024 + layer * 256 + cell,
+ *     0x4000 | floor << 4 | 1 wall / 2 floor for wall_floor, 0x8000 | record field for a record field) 5 CONSERVATION 6 NOT_OWNER 7 BUSY 8 RATE_LIMITED. */
+#define PC_NETGAME_HOUSE_IMG_SIZE        0x1A44u
+#define PC_NETGAME_HOUSE_COMMIT_SIZE     (PC_NETGAME_HOUSE_IMG_SIZE + PC_NETGAME_REC_SIZE) /* 16004 */
+#define PC_NETGAME_HOUSE_CHUNK_DATA      1000u
+#define PC_NETGAME_HOUSE_COMMIT_CHUNKS   17u
+#define PC_NETGAME_HOUSE_PUSH_CHUNKS     7u
+#define PC_NETGAME_HOUSE_KIND_OWNER_COMMIT 1u
+#define PC_NETGAME_HOUSE_KIND_CANON_PUSH   2u
+#define PC_NETGAME_HOUSE_ACK_APPLIED       0u
+#define PC_NETGAME_HOUSE_ACK_STALE         1u
+#define PC_NETGAME_HOUSE_ACK_BAD_DIGEST    2u
+#define PC_NETGAME_HOUSE_ACK_BAD_SHAPE     3u
+#define PC_NETGAME_HOUSE_ACK_INVALID_CELL  4u
+#define PC_NETGAME_HOUSE_ACK_CONSERVATION  5u
+#define PC_NETGAME_HOUSE_ACK_NOT_OWNER     6u
+#define PC_NETGAME_HOUSE_ACK_BUSY          7u
+#define PC_NETGAME_HOUSE_ACK_RATE_LIMITED  8u
+#define PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC 0x01u /* HOST_CONFIG blob byte 1 bit 0 */
+typedef struct PCNetGameHouseBeginMsg {
+    uint8_t  msg_type;
+    uint8_t  kind;
+    uint8_t  chunk_count;
+    uint8_t  house;        /* homes[] index (a COMMIT's claim is checked against the host-derived house of the sender) */
+    uint32_t xfer_id;
+    uint32_t host_session;
+    uint32_t house_seq;
+    uint32_t rec_epoch;
+    uint32_t rec_rev;
+    uint16_t total_size;
+    uint16_t rsv;
+    uint32_t digest;
+    uint32_t rsv2;
+} PCNetGameHouseBeginMsg;
+_Static_assert(sizeof(PCNetGameHouseBeginMsg) == 36, "PCNetGameHouseBeginMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameHouseBeginMsg) <= PC_NET_MAX_PAYLOAD, "PCNetGameHouseBeginMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h)");
+typedef struct PCNetGameHouseChunkMsg {
+    uint8_t  msg_type;
+    uint8_t  chunk_idx;
+    uint16_t len;
+    uint32_t xfer_id;
+    uint16_t offset;
+    uint16_t rsv;
+    uint8_t  data[PC_NETGAME_HOUSE_CHUNK_DATA];
+} PCNetGameHouseChunkMsg;
+_Static_assert(sizeof(PCNetGameHouseChunkMsg) == 1012, "PCNetGameHouseChunkMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameHouseChunkMsg) <= PC_NET_MAX_PAYLOAD, "PCNetGameHouseChunkMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h)");
+typedef struct PCNetGameHouseAckMsg {
+    uint8_t  msg_type;
+    uint8_t  status;
+    uint16_t detail;
+    uint32_t xfer_id;
+    uint32_t house_seq;
+    uint32_t epoch;
+    uint32_t rev;
+    uint32_t host_session;
+} PCNetGameHouseAckMsg;
+_Static_assert(sizeof(PCNetGameHouseAckMsg) == 24, "PCNetGameHouseAckMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameHouseAckMsg) <= PC_NET_MAX_PAYLOAD, "PCNetGameHouseAckMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h)");
+_Static_assert(sizeof(mHm_hs_c) == 0x26B0 && offsetof(mHm_hs_c, floors) == 0x38 && sizeof(mHm_flr_c) == 0x8A8 && offsetof(mHm_hs_c, mailbox) == 0x1A30 &&
+                   offsetof(mHm_hs_c, goki) == 0x2678 && offsetof(mHm_hs_c, music_box) == 0x2684 && offsetof(mHm_hs_c, unk_286C) == 0x268C &&
+                   offsetof(mHm_flr_c, wall_floor) == 0x8A0 && offsetof(mHm_flr_c, tempo_beat) == 0x8A2 && offsetof(mHm_flr_c, floor_bit_info) == 0x8A4 &&
+                   sizeof(mHm_lyr_c) == 0x228 && offsetof(mHm_lyr_c, ftr_switch) == 0x200 && offsetof(mHm_lyr_c, haniwa_step) == 0x208,
+               "mHm_hs_c layout changed: the furniture-sync house image offsets (0x1A44 B image) are wrong");
+_Static_assert((PC_NETGAME_HOUSE_COMMIT_SIZE + PC_NETGAME_HOUSE_CHUNK_DATA - 1u) / PC_NETGAME_HOUSE_CHUNK_DATA == PC_NETGAME_HOUSE_COMMIT_CHUNKS &&
+                   (PC_NETGAME_HOUSE_IMG_SIZE + PC_NETGAME_HOUSE_CHUNK_DATA - 1u) / PC_NETGAME_HOUSE_CHUNK_DATA == PC_NETGAME_HOUSE_PUSH_CHUNKS &&
+                   PC_NETGAME_HOUSE_COMMIT_SIZE <= 0xFFFFu && PC_NETGAME_HOUSE_COMMIT_CHUNKS <= 32,
+               "the house transfer chunk counts do not match the payload sizes");
+
 /* ===== X1 WIRE (protocol v8, UNRELEASED: ids 51/52 extend v8 in place, so there is NO version bump and the strict-equality
  * version check is untouched; a v8 build without them would never answer a COMMIT): host-transactional PICKUP/DROP/BURY =====
  * Both messages are RELIABLE, little-endian natural-alignment like every other non-record message. The 64-byte tag is reusable
@@ -3099,8 +3184,12 @@ static int pcnetgame_txn_busy_with(uint8_t kind, uint32_t request_id) {
 
 /* Mail milestone 1 review: ONE pocket-transaction token. A NEW transaction / grant / town-service request must not begin while a MAIL_SEND is waiting in
  * AWAIT_CLEAN (s_mail_op, which is deliberately NOT pcnetgame_txn_busy(): the upload flush must keep running). Every request-side begin check uses this. */
+static int pcnetgame_house_client_txn_blocked(void); /* furniture sync (Stage 1): defined with the HOUSE CLIENT block */
 static int pcnetgame_txn_begin_blocked(void) {
-    return s_ctxn.state != PC_NETGAME_CTXN_FREE || (s_mail_op.active && !s_mail_op.done) || (s_take_op.active && !s_take_op.done);
+    /* furniture sync: while this client's OWN house holds uncommitted edits (or its commit is in flight) no pocket transaction may begin: its pre-image
+     * would carry the pockets of the unsent house edit into the host's record while the host's house still holds the furniture (a duplicate) */
+    return s_ctxn.state != PC_NETGAME_CTXN_FREE || (s_mail_op.active && !s_mail_op.done) || (s_take_op.active && !s_take_op.done) ||
+           pcnetgame_house_client_txn_blocked();
 }
 
 static void pcnetgame_txn_begin(uint8_t kind, uint32_t request_id, uint8_t slot, uint16_t item,
@@ -3366,6 +3455,30 @@ typedef struct PCNetGameHostPeerState {
     uint32_t             rec_win_count;
     uint32_t             rec_rl_run;       /* consecutive RATE_LIMITED answers (5 close the peer) */
     uint32_t             rec_last_stale_push_ms;
+    /* Furniture sync (Stage 1): per-peer house transfer state, all cleared by the per-peer memset. hup_* = the open client -> host OWNER_COMMIT (17 chunks, 32-bit got
+     * mask); hpush_* = the host -> client CANON_PUSH in flight (one at a time, snapshot of the canonical image in s_host_house_tx[peer]); hsent_seq[h] = the last canonical
+     * seq of house h pushed to (or known by) this peer (0 = never; a changed s_hh[h].seq owes a push). */
+    uint8_t              hup_open;
+    uint8_t              hup_refused_valid;
+    uint8_t              hup_house;
+    uint32_t             hup_got_mask;
+    uint32_t             hup_xfer;
+    uint32_t             hup_last_xfer;
+    uint32_t             hup_refused_xfer;
+    uint32_t             hup_session;
+    uint32_t             hup_seq;
+    uint32_t             hup_epoch;
+    uint32_t             hup_rev;
+    uint32_t             hup_digest;
+    uint32_t             hup_started_ms;
+    uint8_t              hpush_active;
+    uint8_t              hpush_house;
+    uint8_t              hpush_next;       /* 0 = BEGIN next, 1..PC_NETGAME_HOUSE_PUSH_CHUNKS = chunk (hpush_next - 1) next */
+    uint32_t             hpush_xfer_counter;
+    uint32_t             hpush_xfer;
+    uint32_t             hpush_seq;
+    uint32_t             hpush_digest;
+    uint32_t             hsent_seq[4];
     uint8_t              guest_token_verified; /* M3: this guest connection presented the entry's matching token at admission (set after the per-peer reset) */
     uint8_t              exch_credit_valid;/* X3: a full-pockets catch (dest NONE) was accepted for this peer: its host-derived item is the ONE */
     uint16_t             exch_credit_item; /*     replacement a following TXN_COMMIT(DROP, EXCHANGE) of this connection may write (consumed on APPLIED) */
@@ -3389,6 +3502,8 @@ static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];
 #define PC_NETGAME_RECS_SYNCED       4u
 static uint8_t s_host_rec_rx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE]; /* client -> host reassembly (BE image) */
 static uint8_t s_host_rec_tx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE]; /* host -> client push snapshot (BE image) */
+static uint8_t s_host_house_rx[PC_NET_MAX_PEERS][PC_NETGAME_HOUSE_COMMIT_SIZE]; /* furniture sync: client -> host OWNER_COMMIT reassembly (house image || record) */
+static uint8_t s_host_house_tx[PC_NET_MAX_PEERS][PC_NETGAME_HOUSE_IMG_SIZE];    /* furniture sync: host -> client CANON_PUSH snapshot (house image) */
 
 /* Per-resident-slot lineage state, IN MEMORY ONLY in this iteration (persistence = D3-4). Keyed by the slot index of the
  * host's own Save_Get(private_data)[]; re-initialised (epoch re-rolled, rev 0 = "never synced") when the slot's saved
@@ -12949,6 +13064,760 @@ static void pcnetgame_host_record_tick(void) {
 }
 /* ===== D3 END ===== */
 
+/* ===== HOUSE COMMON + HOST BEGIN: furniture sync Stage 1 (protocol v8, wire ids 59..61; see the HOUSE WIRE block) =====
+ * The host keeps the canonical copy of every owned house in Save_Get(homes[h]) (the process's own save) plus a BE image + seq per house (s_hh[]): the seq moves when
+ * the image digest of the live save copy changes (an accepted owner commit, or a HOST-originated change such as turnip spoilage / an upgrade / the host's own edit,
+ * polled once per second like the mailboxes and never while the host's own player is in that house). A client's OWNER_COMMIT is built on a (host_session, seq) and
+ * on the record base (epoch, rev); anything else is STALE, so a host change is never undone by an older edit. House and record commit as ONE pair in one handler
+ * call, or both are rejected (and rolled back by a FULL record push + a CANON_PUSH of the house).
+ * Why the owner may only commit OUTSIDE its house: the room scene works on a COPY of the house floors (aMR_GetLayerTopFg / the fg working area); drawer contents live
+ * in the furniture actors and reach the save only when the room is torn down (aMR_KeepItem2Fg in aMR_AllFurnitureDestruct). House and pockets therefore agree only
+ * after the room scene is gone, and nothing is ever snapshotted or written while a scene of that house is live (pcnetgame_local_house_unsafe). */
+
+#define PC_NETGAME_HOUSE_PERIOD_MS        1000u
+#define PC_NETGAME_HOUSE_UPLOAD_TIMEOUT_MS 5000u
+#define PC_NETGAME_HOUSE_PUSH_MSGS_PER_POLL 4
+#define PC_NETGAME_HOUSE_FLOOR_OWNER_BYTES 0x8A5u /* floors[f] bytes the owner may write: 4 layers, wall_floor, tempo_beat, floor_bit_info (not the 3 padding bytes) */
+#define PC_NETGAME_HOUSE_OFF_FLOORS        0x38u
+#define PC_NETGAME_HOUSE_FLOOR_STRIDE      0x8A8u
+#define PC_NETGAME_HOUSE_OFF_MUSIC         0x1A3Cu
+#define PC_NETGAME_HOUSE_NUM               4
+_Static_assert((int)mHS_HOUSE_NUM == PC_NETGAME_HOUSE_NUM && PLAYER_NUM == PC_NETGAME_HOUSE_NUM, "the furniture sync code assumes 4 houses");
+
+static mHm_hs_c s_hs_scratch;  /* native scratch for the BE conversions (main thread only; every user finishes before the next call) */
+static mHm_hs_c s_hs_native;   /* the decoded native copy of an incoming image */
+
+static uint16_t pcnetgame_house_be16(const uint8_t* p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+/* Canonical BE image (0x1A44 B) of a live home, built from a COPY (the live home is never converted in place). Padding bytes are zeroed so a digest never
+ * depends on indeterminate bytes. */
+static void pcnetgame_house_export_be(const mHm_hs_c* home, uint8_t* out) {
+    int f;
+    memcpy(&s_hs_scratch, home, sizeof(mHm_hs_c));
+    pc_save_bswap_home(&s_hs_scratch, PC_BSWAP_TO_BE);
+    memcpy(out, &s_hs_scratch, 0x1A30u);
+    memcpy(out + 0x1A30u, (const uint8_t*)&s_hs_scratch + 0x2678u, 0x14u);
+    for (f = 0; f < mHm_ROOM_NUM; f++) {
+        memset(out + PC_NETGAME_HOUSE_OFF_FLOORS + (size_t)f * PC_NETGAME_HOUSE_FLOOR_STRIDE + PC_NETGAME_HOUSE_FLOOR_OWNER_BYTES, 0, 3); /* mHm_flr_c tail padding */
+    }
+    memset(out + 0x1A30u + 0xAu, 0, 2); /* the 2 alignment bytes between mHm_goki_c and music_box */
+}
+
+/* A BE image -> a native mHm_hs_c in *out (mailbox / haniwa / tail zero). */
+static void pcnetgame_house_import_native(const uint8_t* img, mHm_hs_c* out) {
+    memset(out, 0, sizeof(*out));
+    memcpy(out, img, 0x1A30u);
+    memcpy((uint8_t*)out + 0x2678u, img + 0x1A30u, 0x14u);
+    pc_save_bswap_home(out, PC_BSWAP_FROM_BE);
+}
+
+/* FNV-1a32 of the OWNER-WRITABLE bytes of an image (floors incl. wall_floor, music_box): the dirty test of the owner. */
+static uint32_t pcnetgame_house_cown_digest(const uint8_t* img) {
+    uint32_t h = 2166136261u;
+    int f;
+    for (f = 0; f < mHm_ROOM_NUM; f++) {
+        h = pcnetgame_fnv1a32_update(h, img + PC_NETGAME_HOUSE_OFF_FLOORS + (size_t)f * PC_NETGAME_HOUSE_FLOOR_STRIDE, PC_NETGAME_HOUSE_FLOOR_OWNER_BYTES);
+    }
+    return pcnetgame_fnv1a32_update(h, img + PC_NETGAME_HOUSE_OFF_MUSIC, 8);
+}
+
+/* floors + music_box of `src` into the live home `dst` (the OWNER-writable part; the only thing a commit may change). */
+static void pcnetgame_house_copy_owner(mHm_hs_c* dst, const mHm_hs_c* src) {
+    int f;
+    for (f = 0; f < mHm_ROOM_NUM; f++) {
+        memcpy(&dst->floors[f].layer_main, &src->floors[f].layer_main, offsetof(mHm_flr_c, wall_floor) - offsetof(mHm_flr_c, layer_main));
+        dst->floors[f].wall_floor = src->floors[f].wall_floor;
+        dst->floors[f].tempo_beat = src->floors[f].tempo_beat;
+        dst->floors[f].floor_bit_info = src->floors[f].floor_bit_info;
+    }
+    memcpy(dst->music_box, src->music_box, sizeof(dst->music_box));
+}
+
+/* everything an image carries (header, floors, goki, music_box) into the live home `dst`; the mailbox and the haniwa are NEVER touched. */
+static void pcnetgame_house_copy_canon(mHm_hs_c* dst, const mHm_hs_c* src) {
+    memcpy(dst, src, 0x1A30u);
+    memcpy((uint8_t*)dst + 0x2678u, (const uint8_t*)src + 0x2678u, 0x14u);
+}
+
+static int pcnetgame_house_owned(int h) {
+    return h >= 0 && h < PC_NETGAME_HOUSE_NUM && mPr_NullCheckPersonalID(&Save_Get(homes[h]).ownerID) != TRUE;
+}
+
+/* Does floor `f` exist in this house? (floor 0 always, 1 = the upper floor of the LL house, 2 = the basement.) */
+static int pcnetgame_house_floor_exists(const mHm_hs_c* hs, int f) {
+    if (f == 0) {
+        return 1;
+    }
+    if (f == 1) {
+        return hs->size_info.size >= (u8)mHm_HOMESIZE_UPPER;
+    }
+    return hs->flags.has_basement ? 1 : 0;
+}
+
+/* THE safety predicate of this feature: 1 when the LOCAL process may not read a consistent copy of / write into homes[h] right now. True when a scene of house h is
+ * live or being entered / left (a room works on a copy of the floors and writes it back at teardown), when no GAME_PLAY is running, or while a fade / wipe runs
+ * (a scene change may be in progress). TEST-ONLY: --house-test-host-in-house H forces it for house H. A room of ANOTHER house, the town and every other
+ * scene are safe: nothing of house h is live there. */
+static int pcnetgame_local_house_unsafe(int h) {
+    GAME_PLAY* play;
+    int sid;
+    if (h < 0 || h >= PC_NETGAME_HOUSE_NUM) {
+        return 1;
+    }
+    if (g_pc_house_test_host_in_house == h) {
+        return 1;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 1;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE) {
+        return 1;
+    }
+    sid = (int)play->scene_id;
+    if (mSc_IS_SCENE_PLAYER_HOUSE_ROOM(sid)) {
+        const mActor_name_t fid = mFI_GetFieldId();
+        if (mFI_GET_TYPE(fid) != mFI_FIELD_PLAYER0_ROOM) {
+            return 1; /* a player room whose house cannot be identified: assume it is this one */
+        }
+        return mFI_GET_PLAYER_ROOM_NO(fid) == h;
+    }
+    return 0;
+}
+
+/* ---- inventory conservation ---- */
+static uint16_t s_hs_cnt_old[65536];
+static uint16_t s_hs_cnt_new[65536];
+
+/* N: the normalisation of one id into its item class. EMPTY / reserved / structural ids are skipped, furniture maps to its rotation-free item id (a mannequin /
+ * insect / fish / balloon ... furniture to the item1 it is made from, via mRmTp_FtrItemNo2Item1ItemNo), the player's own designs (my-design mannequins and
+ * umbrellas have no pocket form: Player_actor_putin_furniture never puts them in a pocket) are skipped, and all four turnip ids (10 / 50 / 100 / SPOILED) count as ONE
+ * class (spoilage turns a turnip into ITM_KABU_SPOILED in place). */
+static void pcnetgame_house_count_id(uint16_t* cnt, mActor_name_t id) {
+    mActor_name_t y;
+    if (id == (mActor_name_t)EMPTY_NO) {
+        return;
+    }
+    switch (ITEM_NAME_GET_TYPE(id)) {
+        case NAME_TYPE_FTR0:
+        case NAME_TYPE_FTR1:
+            if (ITEM_IS_MYMANNIQUIN(id) || ITEM_IS_MYUMBRELLA(id)) {
+                return;
+            }
+            y = mRmTp_FtrItemNo2Item1ItemNo(id, TRUE);
+            if (y == id) {
+                y = (mActor_name_t)(id & ~3u); /* FTR_GET_ROTATION: the 2 low bits */
+            }
+            break;
+        case NAME_TYPE_ITEM1:
+            if (id >= (mActor_name_t)ITM_KABU_START && id < (mActor_name_t)ITM_KABU_END) {
+                y = (mActor_name_t)ITM_KABU_START;
+            } else if (ITEM_IS_MYUMBRELLA_TOOL(id)) {
+                return;
+            } else {
+                y = id;
+            }
+            break;
+        default:
+            return;
+    }
+    if (cnt[y] < 0xFFFFu) {
+        cnt[y]++;
+    }
+}
+
+/* Every class of one house image: 3 floors x 4 layers x 256 cells, wall_floor (wallpaper / carpet items, except original designs) and the music box discs. */
+static void pcnetgame_house_count_image(uint16_t* cnt, const uint8_t* img) {
+    int f, l, c, n;
+    for (f = 0; f < mHm_ROOM_NUM; f++) {
+        const uint8_t* fl = img + PC_NETGAME_HOUSE_OFF_FLOORS + (size_t)f * PC_NETGAME_HOUSE_FLOOR_STRIDE;
+        for (l = 0; l < mHm_LAYER_NUM; l++) {
+            for (c = 0; c < UT_Z_NUM * UT_X_NUM; c++) {
+                pcnetgame_house_count_id(cnt, (mActor_name_t)pcnetgame_house_be16(fl + (size_t)l * sizeof(mHm_lyr_c) + (size_t)c * 2u));
+            }
+        }
+        if (fl[0x8A0] < (u8)CARPET_NUM) {
+            cnt[ITM_CARPET_START + fl[0x8A0]]++; /* flooring_idx */
+        }
+        if (fl[0x8A1] < (u8)WALL_NUM) {
+            cnt[ITM_WALL_START + fl[0x8A1]]++;   /* wallpaper_idx */
+        }
+    }
+    for (n = 0; n < (int)MINIDISK_NUM; n++) {
+        const uint8_t* mb = img + PC_NETGAME_HOUSE_OFF_MUSIC + 4u * (size_t)((n / 32) & 1);
+        const uint32_t w = ((uint32_t)mb[0] << 24) | ((uint32_t)mb[1] << 16) | ((uint32_t)mb[2] << 8) | (uint32_t)mb[3];
+        if (((w >> (n & 31)) & 1u) != 0) {
+            cnt[ITM_MINIDISK_START + n]++;
+        }
+    }
+}
+
+static void pcnetgame_house_count_record(uint16_t* cnt, const Private_c* r) {
+    int i;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        pcnetgame_house_count_id(cnt, r->inventory.pockets[i]);
+    }
+    for (i = 0; i < mPr_INVENTORY_MAIL_COUNT; i++) {
+        if (r->mail[i].content.font != 0xFF) {
+            pcnetgame_house_count_id(cnt, r->mail[i].present); /* a used letter's gift is an item that exists nowhere else */
+        }
+    }
+}
+
+static int pcnetgame_house_class_decreasable(int id) {
+    return (id >= (int)ITM_WALL_START && id < (int)ITM_WALL_START + (int)WALL_NUM) || (id >= (int)ITM_CARPET_START && id < (int)ITM_CARPET_START + (int)CARPET_NUM) ||
+           (id >= (int)ITM_MINIDISK_START && id < (int)ITM_MINIDISK_START + (int)MINIDISK_NUM);
+}
+
+/* 1 = every class equal (wallpaper / carpet / disc classes may also DECREASE), else 0 with the first 4 differing ids in diff[]. */
+static int pcnetgame_house_conserved(const uint16_t* oc, const uint16_t* nc, uint16_t* diff, int* ndiff) {
+    int id, ok = 1;
+    *ndiff = 0;
+    for (id = 0; id < 65536; id++) {
+        if (oc[id] == nc[id]) {
+            continue;
+        }
+        if (nc[id] < oc[id] && pcnetgame_house_class_decreasable(id)) {
+            continue;
+        }
+        ok = 0;
+        if (*ndiff < 4) {
+            diff[(*ndiff)++] = (uint16_t)id;
+        }
+    }
+    return ok;
+}
+
+/* ---- the host's canonical copies ---- */
+typedef struct PCNetGameHouseHost {
+    uint8_t  valid;
+    uint32_t seq;
+    uint32_t digest;
+    uint8_t  img[PC_NETGAME_HOUSE_IMG_SIZE];
+} PCNetGameHouseHost;
+static PCNetGameHouseHost s_hh[PC_NETGAME_HOUSE_NUM];
+static uint32_t           s_hh_next_check_ms;
+static int                s_hh_test_edit_done;
+
+static void pcnetgame_house_host_reset(void) {
+    memset(s_hh, 0, sizeof(s_hh));
+    s_hh_next_check_ms = 0;
+    s_hh_test_edit_done = 0;
+}
+
+/* Re-reads house h of the host's save into its canonical copy; returns 1 when the image changed (seq bumped). The very first read of a house is always taken; later
+ * changes are skipped while the host's own player is in that house (`force` = a commit just wrote it, nothing of that house is live). */
+static int pcnetgame_house_host_refresh(int h, int force) {
+    static uint8_t img[PC_NETGAME_HOUSE_IMG_SIZE];
+    uint32_t d;
+    if (!pcnetgame_house_owned(h)) {
+        return 0;
+    }
+    if (s_hh[h].valid && !force && pcnetgame_local_house_unsafe(h)) {
+        return 0;
+    }
+    pcnetgame_house_export_be(&Save_Get(homes[h]), img);
+    d = pcnetgame_fnv1a32(img, PC_NETGAME_HOUSE_IMG_SIZE);
+    if (s_hh[h].valid && s_hh[h].digest == d) {
+        return 0;
+    }
+    memcpy(s_hh[h].img, img, PC_NETGAME_HOUSE_IMG_SIZE);
+    s_hh[h].digest = d;
+    s_hh[h].seq++;
+    s_hh[h].valid = 1;
+    printf("[NET][HOUSE] host: house %d canonical image -> seq %u digest 0x%08X\n", h, (unsigned)s_hh[h].seq, (unsigned)d);
+    return 1;
+}
+
+/* TEST-ONLY --house-test-host-edit H,floor,cell,item: once the house has a canonical copy the host writes `item` into layer 0 cell `cell` of floor `floor` of house H
+ * of its OWN save (a stand-in for a host-originated change such as turnip spoilage); the next poll sees the digest change and pushes it. */
+static void pcnetgame_house_test_host_edit(void) {
+    long v[4];
+    int n = 0;
+    char* e = NULL;
+    const char* p = g_pc_house_test_host_edit;
+    if (s_hh_test_edit_done || p == NULL || p[0] == '\0') {
+        return;
+    }
+    while (n < 4) {
+        v[n++] = strtol(p, &e, 0);
+        if (e == p) {
+            n = -1;
+            break;
+        }
+        p = e;
+        if (*p == ',') {
+            p++;
+        } else {
+            break;
+        }
+    }
+    if (n == 4 && v[0] >= 0 && v[0] < PC_NETGAME_HOUSE_NUM && s_hh[v[0]].valid) {
+        int pp, seen = 0;
+        for (pp = 0; pp < PC_NET_MAX_PEERS; pp++) { /* wait until a READY peer holds the current canonical copy: the edit is then observable as a seq bump + push */
+            if (s_host_peer_link[pp] == PC_NETGAME_LINK_READY && s_host_peer[pp].bound_valid && s_host_peer[pp].bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST &&
+                !s_host_peer[pp].hpush_active && s_host_peer[pp].hsent_seq[v[0]] == s_hh[v[0]].seq) {
+                seen = 1;
+            }
+        }
+        if (!seen) {
+            return;
+        }
+    }
+    s_hh_test_edit_done = 1;
+    if (n != 4 || v[0] < 0 || v[0] >= PC_NETGAME_HOUSE_NUM || v[1] < 0 || v[1] >= mHm_ROOM_NUM || v[2] < 0 || v[2] >= UT_Z_NUM * UT_X_NUM || !pcnetgame_house_owned((int)v[0]) ||
+        !s_hh[v[0]].valid) {
+        printf("[NET][HOUSE][TEST-ONLY] --house-test-host-edit '%s' refused (need H,floor,cell,item with an owned house)\n", g_pc_house_test_host_edit);
+        return;
+    }
+    Save_Get(homes[v[0]]).floors[v[1]].layer_main.items[v[2] / UT_X_NUM][v[2] % UT_X_NUM] = (mActor_name_t)v[3];
+    printf("[NET][HOUSE][TEST-ONLY] --house-test-host-edit: house %ld floor %ld layer 0 cell %ld = 0x%04lX written into the host's own save\n", v[0], v[1], v[2], (unsigned long)v[3] & 0xFFFFu);
+}
+
+static int pcnetgame_house_send_ack(PCNetPeerId peer, uint8_t status, uint16_t detail, uint32_t xfer, uint32_t seq, uint32_t epoch, uint32_t rev) {
+    PCNetGameHouseAckMsg a;
+    memset(&a, 0, sizeof(a));
+    a.msg_type = (uint8_t)PC_NETGAME_MSG_HOUSE_ACK;
+    a.status = status;
+    a.detail = detail;
+    a.xfer_id = xfer;
+    a.house_seq = seq;
+    a.epoch = epoch;
+    a.rev = rev;
+    a.host_session = s_rec_host_session;
+    return pc_net_send(peer, PC_NET_RELIABLE, &a, (uint16_t)sizeof(a));
+}
+
+static const char* pcnetgame_house_status_name(unsigned s) {
+    static const char* const n[] = { "APPLIED", "STALE", "BAD_DIGEST", "BAD_SHAPE", "INVALID_CELL", "CONSERVATION", "NOT_OWNER", "BUSY", "RATE_LIMITED" };
+    return s < sizeof(n) / sizeof(n[0]) ? n[s] : "?";
+}
+
+/* A refused commit: ACK it. Unless it is only BUSY / RATE_LIMITED / NOT_OWNER, NOTHING changed and the OWNER is rolled back to the last known good PAIR: a FULL record
+ * push (pcnetgame_rec_stale_push, un-paced here: the shared commit attempt window already bounds it) and a CANON_PUSH of the house (hsent_seq cleared: owed again). */
+static void pcnetgame_house_reject(PCNetPeerId peer, int idx, int h, uint8_t status, uint16_t detail, uint32_t xfer) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    PCNetGameRecSlot* slot = idx >= 0 ? pcnetgame_rec_slot(idx) : NULL;
+    const uint32_t seq = (h >= 0 && h < PC_NETGAME_HOUSE_NUM) ? s_hh[h].seq : 0u;
+    pcnetgame_house_send_ack(peer, status, detail, xfer, seq, slot != NULL ? slot->epoch : 0u, slot != NULL ? slot->rev : 0u);
+    if (pcnetgame_rec_log_ok(st)) {
+        printf("[NET][HOUSE] host: peer %d OWNER_COMMIT xfer %u house %d REJECTED %s (detail 0x%04X)\n", (int)peer, (unsigned)xfer, h, pcnetgame_house_status_name(status),
+               (unsigned)detail);
+    }
+    if (status != (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY && status != (uint8_t)PC_NETGAME_HOUSE_ACK_RATE_LIMITED && status != (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER &&
+        h >= 0 && h < PC_NETGAME_HOUSE_NUM && slot != NULL) {
+        st->hsent_seq[h] = 0;
+        st->rec_last_stale_push_ms = 0;
+        pcnetgame_rec_stale_push(peer, idx, slot, pcnetgame_now_ms());
+    }
+}
+
+static void pcnetgame_house_refuse_xfer(PCNetGameHostPeerState* st, uint32_t xfer) {
+    st->hup_refused_valid = 1;
+    st->hup_refused_xfer = xfer;
+}
+
+/* A fully reassembled OWNER_COMMIT (house image || record) in s_host_house_rx[peer]. Steps (any failure -> nothing changes, see pcnetgame_house_reject):
+ *  1 binding / world / record SYNCED / no push in flight (BUSY), 2 guest -> NOT_OWNER, 3 house of the sender (derived from its bound PersonalID), 4 digest + the shared
+ *  commit rate limit, 5 BUSY while the host's own player is in / entering / leaving that house, 6 base (host_session, house seq, record epoch / rev) else STALE, 7 the
+ *  record validated exactly like an upload, 8 every changed cell legal, 9 inventory CONSERVATION over house + pockets + letter gifts, 10 commit all in one call. */
+static void pcnetgame_house_process_commit(PCNetPeerId peer) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    static uint8_t cur[PC_NETGAME_HOUSE_IMG_SIZE];
+    const uint8_t* rx = s_host_house_rx[peer];
+    const uint8_t* nimg = rx;
+    const uint8_t* nrec = rx + PC_NETGAME_HOUSE_IMG_SIZE;
+    const uint32_t xfer = st->hup_xfer;
+    const uint32_t now = pcnetgame_now_ms();
+    PCNetGameRecSlot* slot;
+    uint16_t bad, diff[4];
+    int idx, h, f, l, c, ndiff;
+
+    st->hup_open = 0;
+    st->hup_got_mask = 0;
+    idx = pcnetgame_rec_gate(peer, xfer, 0);
+    if (idx < 0) {
+        return;
+    }
+    if (idx >= PLAYER_NUM) { /* a guest owns no house: refused BEFORE any homes[] index is formed */
+        pcnetgame_house_reject(peer, -1, -1, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, xfer);
+        return;
+    }
+    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
+    if (h < 0) {
+        pcnetgame_house_reject(peer, idx, -1, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, xfer);
+        return;
+    }
+    if (st->hup_house != (uint8_t)h) {
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_BAD_SHAPE, 5, xfer);
+        return;
+    }
+    slot = pcnetgame_rec_slot(idx);
+    if (slot == NULL || !s_host_world_ready || st->rec_state != PC_NETGAME_RECS_SYNCED || st->rec_push_active || st->hpush_active) {
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY, 0, xfer);
+        return;
+    }
+    if (pcnetgame_fnv1a32(rx, PC_NETGAME_HOUSE_COMMIT_SIZE) != st->hup_digest) {
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_BAD_DIGEST, 0, xfer);
+        return;
+    }
+    /* the record path's rate limit: min gap since the last ACCEPTED upload / commit, at most 30 completed attempts per minute, 5 RATE_LIMITED in a row close */
+    if ((uint32_t)(now - st->rec_win_start_ms) >= 60000u || st->rec_win_start_ms == 0) {
+        st->rec_win_start_ms = now;
+        st->rec_win_count = 0;
+    }
+    if ((st->rec_have_accept && (uint32_t)(now - st->rec_last_accept_ms) < PC_NETGAME_REC_MIN_GAP_MS) || st->rec_win_count >= PC_NETGAME_REC_MAX_PER_MIN) {
+        st->rec_rl_run++;
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_RATE_LIMITED, 0, xfer);
+        if (st->rec_rl_run >= PC_NETGAME_REC_RL_CLOSE_RUN) {
+            printf("[NET][HOUSE] host: peer %d closed: %u consecutive RATE_LIMITED commits\n", (int)peer, (unsigned)st->rec_rl_run);
+            pcnetgame_host_drop_peer(peer);
+        }
+        return;
+    }
+    st->rec_rl_run = 0;
+    st->rec_win_count++;
+    if (pcnetgame_local_house_unsafe(h)) {
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY, 0, xfer);
+        return;
+    }
+    pcnetgame_rec_refresh_hostfields(idx, slot);
+    (void)pcnetgame_house_host_refresh(h, 0);
+    if (!s_hh[h].valid) {
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY, 0, xfer);
+        return;
+    }
+    if (st->hup_session != s_rec_host_session || st->hup_seq != s_hh[h].seq || st->hup_epoch != slot->epoch || st->hup_rev != slot->rev) {
+        printf("[NET][HOUSE] host: peer %d commit xfer %u STALE (base session %u seq %u rec %u/%u; host session %u seq %u rec %u/%u)\n", (int)peer, (unsigned)xfer,
+               (unsigned)st->hup_session, (unsigned)st->hup_seq, (unsigned)st->hup_epoch, (unsigned)st->hup_rev, (unsigned)s_rec_host_session, (unsigned)s_hh[h].seq,
+               (unsigned)slot->epoch, (unsigned)slot->rev);
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_STALE, 0, xfer);
+        return;
+    }
+    /* 7: the record, on a FROM_BE scratch copy, exactly like an upload */
+    memcpy(&s_rec_scratch_b, nrec, PC_NETGAME_REC_SIZE);
+    pc_save_bswap_private(&s_rec_scratch_b, PC_BSWAP_FROM_BE);
+    {
+        static uint8_t host_be[PC_NETGAME_REC_SIZE];
+        pcnetgame_rec_export_be(idx, host_be);
+        bad = pcnetgame_rec_validate_fields(&s_rec_scratch_b, nrec, host_be);
+    }
+    if (bad != 0) {
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_INVALID_CELL, (uint16_t)(0x8000u | bad), xfer);
+        return;
+    }
+    /* 8: the house. `cur` = the host's live copy (== s_hh[h].img after the refresh above) */
+    pcnetgame_house_export_be(&Save_Get(homes[h]), cur);
+    for (f = 0; f < mHm_ROOM_NUM; f++) {
+        const uint8_t* nf = nimg + PC_NETGAME_HOUSE_OFF_FLOORS + (size_t)f * PC_NETGAME_HOUSE_FLOOR_STRIDE;
+        const uint8_t* of = cur + PC_NETGAME_HOUSE_OFF_FLOORS + (size_t)f * PC_NETGAME_HOUSE_FLOOR_STRIDE;
+        if (!pcnetgame_house_floor_exists(&Save_Get(homes[h]), f)) {
+            if (memcmp(nf, of, PC_NETGAME_HOUSE_FLOOR_OWNER_BYTES) != 0) { /* a floor the house does not have must be byte-identical to the host's */
+                pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_INVALID_CELL, (uint16_t)(f * 1024), xfer);
+                return;
+            }
+            continue;
+        }
+        for (l = 0; l < mHm_LAYER_NUM; l++) {
+            for (c = 0; c < UT_Z_NUM * UT_X_NUM; c++) {
+                const mActor_name_t nv = (mActor_name_t)pcnetgame_house_be16(nf + (size_t)l * sizeof(mHm_lyr_c) + (size_t)c * 2u);
+                const mActor_name_t ov = (mActor_name_t)pcnetgame_house_be16(of + (size_t)l * sizeof(mHm_lyr_c) + (size_t)c * 2u);
+                int ok;
+                if (nv == ov) {
+                    continue;
+                }
+                /* a changed cell: empty, a multi-tile furniture marker, a furniture id or a pocket-legal item. A STRUCTURAL id (door, wall, warp, any other reserved
+                 * value) may not be written and may not be removed: the cell must stay byte-identical */
+                ok = (nv == (mActor_name_t)RSV_FE1F || pcnetgame_is_pocket_legal_item(nv)) &&
+                     (ov == (mActor_name_t)EMPTY_NO || ov == (mActor_name_t)RSV_FE1F || ITEM_IS_FTR(ov) || ITEM_IS_ITEM1(ov));
+                if (!ok) {
+                    pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_INVALID_CELL, (uint16_t)(f * 1024 + l * 256 + c), xfer);
+                    return;
+                }
+            }
+        }
+        if (nf[0x8A0] >= (u8)FLOOR_ALL_NUM) {
+            pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_INVALID_CELL, (uint16_t)(0x4000u | (unsigned)(f << 4) | 2u), xfer);
+            return;
+        }
+        if (nf[0x8A1] >= (u8)WALL_ALL_NUM) {
+            pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_INVALID_CELL, (uint16_t)(0x4000u | (unsigned)(f << 4) | 1u), xfer);
+            return;
+        }
+    }
+    /* 9: conservation (host: live house + host record; new: the committed house + the committed record) */
+    memset(s_hs_cnt_old, 0, sizeof(s_hs_cnt_old));
+    memset(s_hs_cnt_new, 0, sizeof(s_hs_cnt_new));
+    pcnetgame_house_count_image(s_hs_cnt_old, cur);
+    pcnetgame_house_count_record(s_hs_cnt_old, &Save_Get(private_data)[idx]);
+    pcnetgame_house_count_image(s_hs_cnt_new, nimg);
+    pcnetgame_house_count_record(s_hs_cnt_new, &s_rec_scratch_b);
+    if (!pcnetgame_house_conserved(s_hs_cnt_old, s_hs_cnt_new, diff, &ndiff)) {
+        printf("[NET][HOUSE] host: peer %d commit xfer %u house %d CONSERVATION failed; first differing item ids (old -> new): ", (int)peer, (unsigned)xfer, h);
+        for (l = 0; l < ndiff; l++) {
+            printf("0x%04X (%u -> %u)%s", (unsigned)diff[l], (unsigned)s_hs_cnt_old[diff[l]], (unsigned)s_hs_cnt_new[diff[l]], l + 1 < ndiff ? ", " : "");
+        }
+        printf("\n");
+        pcnetgame_house_reject(peer, idx, h, (uint8_t)PC_NETGAME_HOUSE_ACK_CONSERVATION, 0, xfer);
+        return;
+    }
+    /* 10: commit the pair in ONE call. The record: client-owned ranges (the same merge as an upload); the house: ONLY the owner-writable bytes. */
+    pcnetgame_house_import_native(nimg, &s_hs_native);
+    pcnetgame_rec_merge_into_save(idx, &s_rec_scratch_b);
+    slot->rev++;
+    slot->hf_digest = pcnetgame_rec_hostfield_digest(pcnetgame_rec_priv_ptr(idx));
+    slot->dirty_unsaved = 1;
+    st->rec_have_accept = 1;
+    st->rec_last_accept_ms = now;
+    pcnetgame_house_copy_owner(&Save_Get(homes[h]), &s_hs_native);
+    (void)pcnetgame_house_host_refresh(h, 1);
+    st->hsent_seq[h] = s_hh[h].seq; /* the committer holds this state: no push back to it */
+    printf("[NET][HOUSE] host: peer %d OWNER_COMMIT xfer %u house %d APPLIED (house seq %u, resident %d epoch %u rev %u)\n", (int)peer, (unsigned)xfer, h, (unsigned)s_hh[h].seq, idx,
+           (unsigned)slot->epoch, (unsigned)slot->rev);
+    pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_APPLIED, 0, xfer, s_hh[h].seq, slot->epoch, slot->rev);
+    /* every OTHER READY peer is owed the new canonical copy: its hsent_seq[h] differs from the bumped seq, the tick pushes it */
+}
+
+static void pcnetgame_house_handle_begin(PCNetPeerId peer, const PCNetGameHouseBeginMsg* in) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    int idx, h;
+    idx = pcnetgame_rec_gate(peer, in->xfer_id, 0);
+    if (idx < 0) {
+        return;
+    }
+    if (!g_pc_house_sync) {
+        return; /* the host did not announce house sync: a client never sends this; dropped */
+    }
+    if (in->kind == (uint8_t)PC_NETGAME_HOUSE_KIND_CANON_PUSH) {
+        return; /* misdirected (a CANON_PUSH is host -> client only): dropped */
+    }
+    if (in->kind != (uint8_t)PC_NETGAME_HOUSE_KIND_OWNER_COMMIT) {
+        pcnetgame_house_refuse_xfer(st, in->xfer_id);
+        pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_BAD_SHAPE, 3, in->xfer_id, 0, 0, 0);
+        pcnetgame_rec_violation(peer, "HOUSE_BEGIN with an unknown kind");
+        return;
+    }
+    if (in->xfer_id == 0 || in->xfer_id <= st->hup_last_xfer) {
+        pcnetgame_rec_violation(peer, "HOUSE_BEGIN xfer_id not strictly increasing");
+        return;
+    }
+    st->hup_open = 0;
+    st->hup_got_mask = 0;
+    st->hup_refused_valid = 0;
+    st->hup_last_xfer = in->xfer_id;
+    if (idx >= PLAYER_NUM) { /* a guest: refused before any homes[] index exists */
+        pcnetgame_house_refuse_xfer(st, in->xfer_id);
+        pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, in->xfer_id, 0, 0, 0);
+        return;
+    }
+    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
+    if (h < 0) {
+        pcnetgame_house_refuse_xfer(st, in->xfer_id);
+        pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, in->xfer_id, 0, 0, 0);
+        return;
+    }
+    if (in->house != (uint8_t)h) {
+        pcnetgame_house_refuse_xfer(st, in->xfer_id);
+        pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_BAD_SHAPE, 5, in->xfer_id, s_hh[h].seq, 0, 0);
+        return;
+    }
+    if (in->rsv != 0 || in->rsv2 != 0) {
+        pcnetgame_house_refuse_xfer(st, in->xfer_id);
+        pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_BAD_SHAPE, 6, in->xfer_id, s_hh[h].seq, 0, 0);
+        return;
+    }
+    if (in->chunk_count != (uint8_t)PC_NETGAME_HOUSE_COMMIT_CHUNKS || in->total_size != (uint16_t)PC_NETGAME_HOUSE_COMMIT_SIZE) {
+        pcnetgame_house_refuse_xfer(st, in->xfer_id);
+        pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_BAD_SHAPE, in->total_size != (uint16_t)PC_NETGAME_HOUSE_COMMIT_SIZE ? 1 : 2, in->xfer_id, s_hh[h].seq, 0, 0);
+        return;
+    }
+    st->hup_open = 1;
+    st->hup_xfer = in->xfer_id;
+    st->hup_house = in->house;
+    st->hup_session = in->host_session;
+    st->hup_seq = in->house_seq;
+    st->hup_epoch = in->rec_epoch;
+    st->hup_rev = in->rec_rev;
+    st->hup_digest = in->digest;
+    st->hup_started_ms = pcnetgame_now_ms();
+}
+
+static void pcnetgame_house_handle_chunk(PCNetPeerId peer, const PCNetGameHouseChunkMsg* in) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    uint32_t off, want;
+    if (pcnetgame_rec_gate(peer, in->xfer_id, 0) < 0 || !g_pc_house_sync) {
+        return;
+    }
+    if (!st->hup_open || in->xfer_id != st->hup_xfer) {
+        if (st->hup_refused_valid && in->xfer_id == st->hup_refused_xfer) {
+            return; /* a chunk of a transfer whose BEGIN was already answered with a refusal */
+        }
+        pcnetgame_rec_violation(peer, st->hup_open ? "HOUSE_CHUNK for a foreign xfer_id" : "HOUSE_CHUNK before BEGIN");
+        return;
+    }
+    if (in->chunk_idx >= PC_NETGAME_HOUSE_COMMIT_CHUNKS) {
+        pcnetgame_rec_violation(peer, "HOUSE_CHUNK idx >= count");
+        return;
+    }
+    off = (uint32_t)in->chunk_idx * PC_NETGAME_HOUSE_CHUNK_DATA;
+    want = PC_NETGAME_HOUSE_COMMIT_SIZE - off;
+    if (want > PC_NETGAME_HOUSE_CHUNK_DATA) {
+        want = PC_NETGAME_HOUSE_CHUNK_DATA;
+    }
+    if ((uint32_t)in->offset != off) {
+        pcnetgame_rec_violation(peer, "HOUSE_CHUNK offset != idx*1000");
+        return;
+    }
+    if ((uint32_t)in->len != want) {
+        pcnetgame_rec_violation(peer, "HOUSE_CHUNK len wrong");
+        return;
+    }
+    if ((st->hup_got_mask & (1u << in->chunk_idx)) != 0) {
+        pcnetgame_rec_violation(peer, "duplicate HOUSE_CHUNK");
+        return;
+    }
+    memcpy(s_host_house_rx[peer] + off, in->data, want);
+    st->hup_got_mask |= 1u << in->chunk_idx;
+    if (st->hup_got_mask == (1u << PC_NETGAME_HOUSE_COMMIT_CHUNKS) - 1u) {
+        pcnetgame_house_process_commit(peer);
+    }
+}
+
+/* Dispatcher (READY + bound gates inside the handlers). A wrong-size HOUSE_BEGIN / HOUSE_CHUNK from a READY bound peer is a record-class violation; HOUSE_ACK from a
+ * client is misdirected and dropped. */
+static void pcnetgame_handle_host_house(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
+    PCNetGameHouseBeginMsg b;
+    PCNetGameHouseChunkMsg c;
+    if (s_host_peer_link[peer] != PC_NETGAME_LINK_READY || !s_host_peer[peer].bound_valid) {
+        return;
+    }
+    switch (data[0]) {
+        case PC_NETGAME_MSG_HOUSE_BEGIN:
+            if (size != sizeof(b)) { pcnetgame_rec_violation(peer, "HOUSE_BEGIN wrong size"); return; }
+            memcpy(&b, data, sizeof(b));
+            pcnetgame_house_handle_begin(peer, &b);
+            return;
+        case PC_NETGAME_MSG_HOUSE_CHUNK:
+            if (size != sizeof(c)) { pcnetgame_rec_violation(peer, "HOUSE_CHUNK wrong size"); return; }
+            memcpy(&c, data, sizeof(c));
+            pcnetgame_house_handle_chunk(peer, &c);
+            return;
+        default:
+            return; /* HOUSE_ACK is host -> client only */
+    }
+}
+
+/* Host -> one peer: the next owed CANON_PUSH is started, the one in flight is pumped (4 messages per poll, under the shared snapshot backlog limit). */
+static void pcnetgame_house_pump_push(PCNetPeerId peer) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    int sent = 0;
+    while (sent < PC_NETGAME_HOUSE_PUSH_MSGS_PER_POLL) {
+        int backlog;
+        if (!st->hpush_active) {
+            int h;
+            for (h = 0; h < PC_NETGAME_HOUSE_NUM; h++) {
+                if (s_hh[h].valid && pcnetgame_house_owned(h) && st->hsent_seq[h] != s_hh[h].seq) {
+                    break;
+                }
+            }
+            if (h >= PC_NETGAME_HOUSE_NUM) {
+                return;
+            }
+            memcpy(s_host_house_tx[peer], s_hh[h].img, PC_NETGAME_HOUSE_IMG_SIZE);
+            st->hpush_active = 1;
+            st->hpush_house = (uint8_t)h;
+            st->hpush_next = 0;
+            st->hpush_xfer = ++st->hpush_xfer_counter;
+            st->hpush_seq = s_hh[h].seq;
+            st->hpush_digest = s_hh[h].digest;
+        }
+        backlog = pc_net_reliable_backlog(peer);
+        if (backlog < 0 || backlog >= PC_NETGAME_SNAPSHOT_BACKLOG_LIMIT) {
+            return;
+        }
+        if (st->hpush_next == 0) {
+            PCNetGameHouseBeginMsg b;
+            memset(&b, 0, sizeof(b));
+            b.msg_type = (uint8_t)PC_NETGAME_MSG_HOUSE_BEGIN;
+            b.kind = (uint8_t)PC_NETGAME_HOUSE_KIND_CANON_PUSH;
+            b.chunk_count = (uint8_t)PC_NETGAME_HOUSE_PUSH_CHUNKS;
+            b.house = st->hpush_house;
+            b.xfer_id = st->hpush_xfer;
+            b.host_session = s_rec_host_session;
+            b.house_seq = st->hpush_seq;
+            b.total_size = (uint16_t)PC_NETGAME_HOUSE_IMG_SIZE;
+            b.digest = pcnetgame_fnv1a32(s_host_house_tx[peer], PC_NETGAME_HOUSE_IMG_SIZE); /* of the snapshot actually sent */
+            if (!pc_net_send(peer, PC_NET_RELIABLE, &b, (uint16_t)sizeof(b))) {
+                return;
+            }
+            st->hpush_next = 1;
+            printf("[NET][HOUSE] host: peer %d CANON_PUSH house %u seq %u xfer %u started\n", (int)peer, (unsigned)st->hpush_house, (unsigned)st->hpush_seq, (unsigned)st->hpush_xfer);
+        } else {
+            PCNetGameHouseChunkMsg c;
+            const uint32_t idx = (uint32_t)st->hpush_next - 1u;
+            const uint32_t off = idx * PC_NETGAME_HOUSE_CHUNK_DATA;
+            uint32_t len = PC_NETGAME_HOUSE_IMG_SIZE - off;
+            if (len > PC_NETGAME_HOUSE_CHUNK_DATA) {
+                len = PC_NETGAME_HOUSE_CHUNK_DATA;
+            }
+            memset(&c, 0, sizeof(c));
+            c.msg_type = (uint8_t)PC_NETGAME_MSG_HOUSE_CHUNK;
+            c.chunk_idx = (uint8_t)idx;
+            c.len = (uint16_t)len;
+            c.xfer_id = st->hpush_xfer;
+            c.offset = (uint16_t)off;
+            memcpy(c.data, s_host_house_tx[peer] + off, len);
+            if (!pc_net_send(peer, PC_NET_RELIABLE, &c, (uint16_t)sizeof(c))) {
+                return;
+            }
+            st->hpush_next++;
+            if (st->hpush_next > PC_NETGAME_HOUSE_PUSH_CHUNKS) {
+                st->hpush_active = 0;
+                st->hsent_seq[st->hpush_house] = st->hpush_seq;
+            }
+        }
+        sent++;
+    }
+}
+
+/* Once per host poll: the canonical copies (1 Hz re-read; first read at once), the TEST edit hook, upload deadlines and the push pumps. */
+static void pcnetgame_house_host_tick(void) {
+    uint32_t now;
+    int h, p;
+    if (!g_pc_house_sync || s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    for (h = 0; h < PC_NETGAME_HOUSE_NUM; h++) {
+        if (!s_hh[h].valid) {
+            (void)pcnetgame_house_host_refresh(h, 0);
+        }
+    }
+    if (s_hh_next_check_ms == 0 || (int32_t)(now - s_hh_next_check_ms) >= 0) {
+        s_hh_next_check_ms = now + PC_NETGAME_HOUSE_PERIOD_MS;
+        pcnetgame_house_test_host_edit();
+        for (h = 0; h < PC_NETGAME_HOUSE_NUM; h++) {
+            (void)pcnetgame_house_host_refresh(h, 0); /* host-originated changes (turnip spoilage, upgrades, the host's own edits): seq++ and a push to everyone */
+        }
+    }
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        PCNetGameHostPeerState* st = &s_host_peer[p];
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid || st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+            continue; /* a guest never sees (or edits) a house */
+        }
+        if (st->hup_open && (uint32_t)(now - st->hup_started_ms) >= PC_NETGAME_HOUSE_UPLOAD_TIMEOUT_MS) {
+            printf("[NET][HOUSE] host: peer %d open OWNER_COMMIT xfer %u timed out -- discarded, nothing applied\n", p, (unsigned)st->hup_xfer);
+            pcnetgame_house_refuse_xfer(st, st->hup_xfer);
+            st->hup_open = 0;
+            st->hup_got_mask = 0;
+        }
+        pcnetgame_house_pump_push((PCNetPeerId)p);
+    }
+}
+/* ===== HOUSE COMMON + HOST END ===== */
+
 /* ===== GUESTS HOST BEGIN: the guest table (outside Save_t), its persistence (save/mp/guests.dat) and guest admission helpers =====
  * A GUEST is a player whose home town is NOT this town (a foreigner / extra player). The HOST decides the class only at IDENTITY (see
  * pcnetgame_host_process_identity): RESIDENT keeps strict priority and the guest path can never claim a resident. A guest's KEY is its
@@ -14653,6 +15522,7 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
          * bytes 1..7 reserved, zero. Not a save region: the client applies it without a usable save. */
         memset(blob, 0, PC_NETGAME_TS_HOSTCFG_LEN);
         blob[0] = g_pc_authoritative_wildlife ? 1u : 0u;
+        blob[1] = g_pc_house_sync ? (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC : 0u; /* furniture sync Stage 1 (byte 1 bit 0) */
         *len = (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN;
         return 1;
     }
@@ -16257,6 +17127,20 @@ static void pcnetgame_mail_test_seed_reply(void) {
 }
 /* ===== MAIL2 HOST END ===== */
 
+/* furniture sync (Stage 1): the HOUSE CLIENT block below the D3 CLIENT block; the D3 / X1 code consults these gates */
+static void        pcnetgame_house_client_on_ready(void);
+static int         pcnetgame_house_client_upload_deferred(void);
+static const char* pcnetgame_house_client_adopt_blocker(int staged_is_full);
+static int         pcnetgame_house_client_adopt_wait(void);
+static void        pcnetgame_house_client_on_full_adopt(void);
+static int         pcnetgame_house_client_force_full_adopt(void);
+static int         pcnetgame_house_client_commit_tick(uint32_t now);
+static void        pcnetgame_house_client_pump(void);
+static int         pcnetgame_house_client_quit_flush(unsigned max_ms);
+static void        pcnetgame_house_client_tick(void);
+static void        pcnetgame_house_client_reset_session(void);
+static void        pcnetgame_house_client_set_hostcfg(int on);
+
 /* ===== D3 CLIENT BEGIN: host-mirrored resident record (protocol v8, CLIENT half) =====
  * What this process does for its OWN resident record (Now_Private == Save.private_data[player_no]):
  *   1. right after IDENTITY_ACK (-> READY) it sends RECORD_HELLO (have_last / last_* carried from an earlier session of THIS
@@ -16450,6 +17334,7 @@ static void pcnetgame_crec_on_ready(void) {
     s_crec.state = PC_NETGAME_CRS_AWAIT_RECORD;
     s_crec.ready_ms = pcnetgame_now_ms();
     pcnetgame_capture_owner_stamp(&s_crec.owner);
+    pcnetgame_house_client_on_ready(); /* furniture sync: canon / stash belong to ONE local player */
 }
 
 static void pcnetgame_crec_send_hello(void) {
@@ -16479,7 +17364,8 @@ static void pcnetgame_crec_send_hello(void) {
  * be) and, since X1b, while a host-transactional pocket commit is unresolved (QUEUED or SENT): an upload built from the pre-transaction
  * pockets must not overtake or race the transaction. The gate cannot stick while READY: every COMMIT resend is answered. */
 static int pcnetgame_crec_upload_deferred(void) {
-    return s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid || pcnetgame_txn_busy();
+    return s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid || pcnetgame_txn_busy() ||
+           pcnetgame_house_client_upload_deferred(); /* furniture sync: the pockets of an unsent house edit must not be uploaded alone */
 }
 
 /* ---- upload (UPLOAD / MIGRATE_UPLOAD) ---- */
@@ -16578,6 +17464,12 @@ static const char* pcnetgame_crec_adopt_blocker(const Private_c* pushed_native) 
     if (s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid || pcnetgame_txn_busy() ||
         s_exchange_deferred.valid || s_exchange_swap_slot >= 0 || s_catch_pending.valid || s_field_action_queue_len > 0) {
         return "a pickup/drop/bury/exchange/catch/field-action gate is pending";
+    }
+    {
+        const char* hwhy = pcnetgame_house_client_adopt_blocker(s_crec.st_kind == PC_NETGAME_REC_KIND_PUSH_FULL); /* furniture sync */
+        if (hwhy != NULL) {
+            return hwhy;
+        }
     }
     if (gamePT == NULL || gamePT->exec != play_main) {
         return "no running GAME_PLAY";
@@ -16737,7 +17629,7 @@ static int pcnetgame_crec_adopt_lifecycle_now(void) {
         return 1;
     }
     sc = (int)play->scene_id;
-    return pcnetgame_scene_is_pregame(sc);
+    return pcnetgame_scene_is_pregame(sc) || pcnetgame_house_client_adopt_wait(); /* furniture sync: waiting for the owner to leave its own house is bounded by the lifecycle cap, not by the 10 s watchdog */
 }
 static char s_crec_diag_last_why[96];
 static int s_crec_diag_first_frame = -1; /* graph frame counter when the first blocker of this push was logged (did the game advance since?) */
@@ -16826,6 +17718,9 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
                 (s_crec.state == PC_NETGAME_CRS_SYNCED && s_crec.st_kind == PC_NETGAME_REC_KIND_PUSH_FULL &&
                  s_crec.st_session == s_crec.base_session && s_crec.st_epoch == s_crec.base_epoch &&
                  s_crec.st_rev == s_crec.base_rev);
+    if (host_only && !older_than_base && s_crec.st_kind == PC_NETGAME_REC_KIND_PUSH_FULL && pcnetgame_house_client_force_full_adopt()) {
+        host_only = 0; /* furniture sync: the host refused our (house + pockets) pair -> this FULL push rolls the pockets back; on_full_adopt restores the house with them */
+    }
     {
         /* A host-only apply replaces the SHARED ranges (the host consumed them), which are part of the client digest: if the
          * record was clean before, it is clean after (re-baseline); if there were unsaved local CLIENT edits they stay pending. */
@@ -16833,6 +17728,9 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
         host_dirty_before = s_crec.acked_valid && pcnetgame_crec_now_cdig(&before) && before != s_crec.acked_cdig;
     }
     pcnetgame_crec_apply_staged(host_only, &cloth_refreshed, &equip_changed, &dirty_lost);
+    if (!host_only) {
+        pcnetgame_house_client_on_full_adopt(); /* furniture sync: the pockets are the host's now -> the own house goes back to the host's state in the same call */
+    }
     {
         /* acked digest = the client-owned+shared bytes of what we now hold (adopting never marks the record dirty); for a
          * host-only apply on a dirty record the acked baseline is kept (the local edits remain to be uploaded). */
@@ -17135,6 +18033,7 @@ static void pcnetgame_crec_tick(void) {
         }
     }
     pcnetgame_crec_pump_upload();
+    pcnetgame_house_client_pump(); /* furniture sync: the OWNER_COMMIT in flight */
 
     if (s_crec.st_valid) {
         pcnetgame_crec_try_adopt(now);
@@ -17188,6 +18087,11 @@ static void pcnetgame_crec_tick(void) {
         }
     }
 
+    /* furniture sync: the pair (own house + record) goes out BEFORE the plain upload; while it is pending / in flight the plain upload is held */
+    if (pcnetgame_house_client_commit_tick(now)) {
+        return;
+    }
+
     /* upload trigger: digest the client-owned bytes every 500 ms; upload when dirty and >= 2 s since the last start */
     if (!s_crec.up_active && !s_crec.up_blocked && pcnetgame_crec_time_ok(s_crec.next_check_ms, now)) {
         s_crec.next_check_ms = now + PC_NETGAME_CREC_DIGEST_PERIOD_MS;
@@ -17232,6 +18136,9 @@ void pc_net_game_client_record_quit_flush(unsigned max_ms) {
     if (pcnetgame_txn_busy()) {
         printf("[NET][REC] client: quit flush skipped: a pocket transaction is still unresolved (an upload now could race it)\n");
         return;
+    }
+    if (!pcnetgame_house_client_quit_flush(max_ms)) {
+        return; /* furniture sync: committed as a pair, or skipped so the pockets of an unsent house edit are not uploaded alone */
     }
     t0 = pcnetgame_now_ms();
     deadline = t0 + max_ms;
@@ -17284,6 +18191,677 @@ void pc_net_game_client_record_quit_flush(unsigned max_ms) {
            (unsigned)(pcnetgame_now_ms() - t0));
 }
 /* ===== D3 CLIENT END ===== */
+
+/* ===== HOUSE CLIENT BEGIN: furniture sync Stage 1, CLIENT half (protocol v8, wire ids 59..61) =====
+ * Only active when the HOST announced house sync (HOST_CONFIG byte 1 bit 0): a client without the bit never gates anything.
+ *   * The host pushes its canonical copy of every owned house (CANON_PUSH). A push is digest-checked, must be NEWER than the last one seen for that house (this
+ *     session) and must carry the house's existing owner; it is STASHED and written into the in-memory save only when nothing of that house is live
+ *     (pcnetgame_local_house_unsafe) -- a visitor inside sees the change on its next entry (no live rebuild). Only floors / header / goki / music_box are written, NEVER
+ *     the mailbox (host-fed) or the haniwa; a client never persists the save.
+ *   * The owner's edits live in the in-memory save (the room scene writes them at teardown). canon[h] = the last state known to agree with the host; the own house is DIRTY
+ *     when the FNV of its owner-writable bytes differs from canon. While it is dirty (or its commit is in flight, or its first push has not arrived, or the player is
+ *     inside it) the plain record upload, the pocket transactions and the adoption of a FULL record push are held: the pocket edit and the house edit travel as ONE pair
+ *     (OWNER_COMMIT: house image + the whole record), sent as soon as the player is outside the house.
+ *   * A push that arrives while the own house is dirty is NOT applied over the edits (deviation from the design note, the SAFER choice: the pockets would stay edited and the
+ *     item would exist twice): it is kept in the stash; the owner's commit is then STALE, the host rejects both and rolls the pair back (FULL record push + CANON_PUSH), and
+ *     the FULL adoption restores the stash (else canon) into the save in the same call (pcnetgame_house_client_on_full_adopt). Net effect: an unlucky race costs the
+ *     edit, never an item.
+ * canon / stash survive a reconnect of this process (like s_crec_last) as long as the owner stamp is the same, so an edit made before a link loss is not silently
+ * overwritten by the push of the next session. */
+#define PC_NETGAME_HCL_RX_TIMEOUT_MS      8000u
+#define PC_NETGAME_HCL_SEND_TIMEOUT_MS    4000u /* the host discards an open commit after 5 s: finish sending well before */
+#define PC_NETGAME_HCL_ACK_TIMEOUT_MS     8000u
+#define PC_NETGAME_HCL_MIN_GAP_MS         2000u
+#define PC_NETGAME_HCL_QUIT_GAP_MS        1550u
+#define PC_NETGAME_HCL_RETRY_BUSY_MS      2000u
+#define PC_NETGAME_HCL_RETRY_RATE_MS      3000u
+#define PC_NETGAME_HCL_RETRY_STALE_MS     3000u
+#define PC_NETGAME_HCL_RETRY_REJECT_MS    5000u
+#define PC_NETGAME_HCL_MSGS_PER_POLL      4
+
+typedef struct PCNetGameHouseClient {
+    int      on;           /* the host announced house sync this session */
+    int      disabled;     /* the host does not treat us as this house's owner (NOT_OWNER / owner mismatch): every gate is off for the rest of the session */
+    int      known;        /* the push of our OWN house was processed this session */
+    int      rx_open;
+    uint8_t  rx_house;
+    uint8_t  rx_got;
+    uint32_t rx_xfer, rx_seq, rx_session, rx_digest, rx_started_ms, rx_last_xfer;
+    uint8_t  last_valid[PC_NETGAME_HOUSE_NUM];
+    uint32_t last_seq[PC_NETGAME_HOUSE_NUM];
+    uint32_t last_session[PC_NETGAME_HOUSE_NUM];
+    int      c_active;     /* an OWNER_COMMIT is in flight (sending or awaiting its ACK) */
+    uint8_t  c_next;       /* 0 = BEGIN next, 1..17 = chunk (c_next - 1) next, 18 = all sent */
+    uint8_t  c_house;
+    uint32_t c_xfer_counter, c_xfer, c_started_ms, c_cown;
+    uint32_t last_commit_ms, retry_not_before_ms, next_check_ms, since_ms;
+    int      last_own_unsafe; /* the own house's unsafe state as seen by the last tick (the quit flush runs without a GAME_PLAY) */
+    int      rollback;        /* our commit was refused (STALE / BAD_* / INVALID_CELL / CONSERVATION): the NEXT FULL record push must replace the client-owned ranges even
+                               * when it carries the lineage point we already hold (otherwise the pocket edit would survive the rollback and the item would exist twice) */
+    uint32_t log_n;
+} PCNetGameHouseClient;
+static PCNetGameHouseClient s_hcl;
+static uint8_t s_hcl_rx[PC_NETGAME_HOUSE_IMG_SIZE];
+static uint8_t s_hcl_tx[PC_NETGAME_HOUSE_COMMIT_SIZE];
+/* carried across sessions of THIS process */
+static struct {
+    int      owner_valid;
+    PCNetGameOwnerStamp owner;
+    uint8_t  canon_valid[PC_NETGAME_HOUSE_NUM];
+    uint32_t canon_seq[PC_NETGAME_HOUSE_NUM];
+    uint32_t canon_session[PC_NETGAME_HOUSE_NUM];
+    uint32_t canon_cown[PC_NETGAME_HOUSE_NUM];
+    uint8_t  canon_img[PC_NETGAME_HOUSE_NUM][PC_NETGAME_HOUSE_IMG_SIZE];
+    uint8_t  stash_valid[PC_NETGAME_HOUSE_NUM];
+    uint32_t stash_seq[PC_NETGAME_HOUSE_NUM];
+    uint32_t stash_session[PC_NETGAME_HOUSE_NUM];
+    uint8_t  stash_img[PC_NETGAME_HOUSE_NUM][PC_NETGAME_HOUSE_IMG_SIZE];
+} s_hcp;
+
+static void pcnetgame_house_client_reset_session(void) {
+    memset(&s_hcl, 0, sizeof(s_hcl)); /* canon / stash (s_hcp) deliberately survive */
+}
+
+/* Entered from pcnetgame_crec_on_ready() (a new READY session): canon / stash belong to ONE local player; another player or save invalidates them. */
+static void pcnetgame_house_client_on_ready(void) {
+    PCNetGameOwnerStamp cur;
+    if (!pcnetgame_capture_owner_stamp(&cur)) {
+        memset(&s_hcp, 0, sizeof(s_hcp));
+        return;
+    }
+    if (!s_hcp.owner_valid || memcmp(&cur, &s_hcp.owner, sizeof(cur)) != 0) {
+        memset(&s_hcp, 0, sizeof(s_hcp));
+        s_hcp.owner = cur;
+        s_hcp.owner_valid = 1;
+    }
+}
+
+/* HOST_CONFIG byte 1 bit 0 (pcnetgame_ts_client_apply). */
+static void pcnetgame_house_client_set_hostcfg(int on) {
+    s_hcl.on = on ? 1 : 0;
+    s_hcl.since_ms = pcnetgame_now_ms();
+    printf("[NET][HOUSE] client: the host %s furniture sync (HOST_CONFIG)\n", s_hcl.on ? "ANNOUNCED" : "did not announce");
+}
+
+static int pcnetgame_hcl_active(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_hcl.on && !s_hcl.disabled;
+}
+
+/* The homes[] index of this client's own house, -1 = none (a guest, a resident without a house, no save loaded). */
+static int pcnetgame_hcl_own_house(void) {
+    if (Now_Private == NULL || s_client_guest_claim_sent) {
+        return -1;
+    }
+    return pcnetgame_mbox_house_of(&Now_Private->player_ID);
+}
+
+/* The owner-writable digest of the LOCAL copy of house h. */
+static uint32_t pcnetgame_hcl_local_cown(int h) {
+    static uint8_t img[PC_NETGAME_HOUSE_IMG_SIZE];
+    pcnetgame_house_export_be(&Save_Get(homes[h]), img);
+    return pcnetgame_house_cown_digest(img);
+}
+
+/* 1 = the own house holds edits the host has not seen (the local owner-writable bytes differ from canon). Without a canon nothing can be judged: 0. */
+static int pcnetgame_hcl_dirty(int h) {
+    if (h < 0 || h >= PC_NETGAME_HOUSE_NUM || !s_hcp.canon_valid[h]) {
+        return 0;
+    }
+    return pcnetgame_hcl_local_cown(h) != s_hcp.canon_cown[h];
+}
+
+/* Writes a pushed image into the in-memory save (header, floors, goki, music_box; never the mailbox / haniwa). 0 = the image is not for this house's owner. */
+static int pcnetgame_hcl_write_save(int h, const uint8_t* img) {
+    pcnetgame_house_import_native(img, &s_hs_native);
+    if (mPr_CheckCmpPersonalID(&s_hs_native.ownerID, &Save_Get(homes[h]).ownerID) != TRUE) {
+        return 0;
+    }
+    pcnetgame_house_copy_canon(&Save_Get(homes[h]), &s_hs_native);
+    return 1;
+}
+
+static void pcnetgame_hcl_set_canon_from_save(int h, const uint8_t* img, uint32_t seq, uint32_t session) {
+    memcpy(s_hcp.canon_img[h], img, PC_NETGAME_HOUSE_IMG_SIZE);
+    s_hcp.canon_seq[h] = seq;
+    s_hcp.canon_session[h] = session;
+    s_hcp.canon_cown[h] = pcnetgame_hcl_local_cown(h); /* of what the save holds NOW: robust against any encode / decode asymmetry */
+    s_hcp.canon_valid[h] = 1;
+}
+
+/* Writes the stash of house h if (and only if) nothing of it is live and no local edit would be overwritten. Returns 1 when written. */
+static int pcnetgame_hcl_apply_stash(int h) {
+    const int own = pcnetgame_hcl_own_house();
+    if (!s_hcp.stash_valid[h] || !pcfa_save_ready() || !s_local_world_latched || pcnetgame_local_house_unsafe(h)) {
+        return 0;
+    }
+    if (h == own && (s_hcl.c_active || pcnetgame_hcl_dirty(h))) {
+        return 0; /* local edits (or a commit in flight): see the file header comment */
+    }
+    if (!pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])) {
+        s_hcp.stash_valid[h] = 0;
+        printf("[NET][HOUSE] client: stashed house %d image dropped: its owner is not this save's owner of that house\n", h);
+        return 0;
+    }
+    pcnetgame_hcl_set_canon_from_save(h, s_hcp.stash_img[h], s_hcp.stash_seq[h], s_hcp.stash_session[h]);
+    s_hcp.stash_valid[h] = 0;
+    printf("[NET][HOUSE] client: house %d canonical seq %u written into the local save%s\n", h, (unsigned)s_hcp.canon_seq[h], h == own ? " (own house)" : "");
+    return 1;
+}
+
+/* ---- gates used by the D3 / X1 code (forward-declared above the D3 CLIENT block) ---- */
+
+/* X1b: no pocket transaction may begin while the own house is dirty or its commit is in flight, nor while the player is inside it. */
+static int pcnetgame_house_client_txn_blocked(void) {
+    int h;
+    if (!pcnetgame_hcl_active()) {
+        return 0;
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h < 0) {
+        return 0;
+    }
+    return s_hcl.c_active || pcnetgame_local_house_unsafe(h) || pcnetgame_hcl_dirty(h);
+}
+
+/* D3: the plain record upload is held while the own house's first push is outstanding, the player is inside / entering / leaving it, its edits are uncommitted or its
+ * commit is in flight (an upload of the pockets alone would duplicate the item the unsent house edit moved). */
+static int pcnetgame_house_client_upload_deferred(void) {
+    int h;
+    if (!pcnetgame_hcl_active()) {
+        return 0;
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h < 0) {
+        return 0;
+    }
+    return !s_hcl.known || s_hcl.c_active || pcnetgame_local_house_unsafe(h) || pcnetgame_hcl_dirty(h);
+}
+
+/* D3: NULL or the reason a staged FULL record push may not be adopted now. */
+static const char* pcnetgame_house_client_adopt_blocker(int staged_is_full) {
+    int h;
+    if (!pcnetgame_hcl_active()) {
+        return NULL;
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h < 0) {
+        return NULL;
+    }
+    if (s_hcl.c_active) {
+        return "a furniture commit is in flight";
+    }
+    if (staged_is_full && pcnetgame_local_house_unsafe(h)) {
+        return "the owner is inside (or entering / leaving) its own house";
+    }
+    return NULL;
+}
+
+/* D3 adoption watchdog: waiting for the owner to leave its house is a legitimate, bounded (lifecycle cap) wait, not a stuck adoption. */
+static int pcnetgame_house_client_adopt_wait(void) {
+    int h;
+    if (!pcnetgame_hcl_active()) {
+        return 0;
+    }
+    h = pcnetgame_hcl_own_house();
+    return h >= 0 && pcnetgame_local_house_unsafe(h);
+}
+
+/* D3 (pcnetgame_crec_try_adopt): 1 = a staged FULL push must replace the client-owned ranges even though it carries the lineage point we hold (see s_hcl.rollback). */
+static int pcnetgame_house_client_force_full_adopt(void) {
+    return pcnetgame_hcl_active() && s_hcl.rollback;
+}
+
+/* D3: a FULL record push was just adopted (the client-owned ranges, i.e. the pockets, are now the host's): the own house goes back to the host's state in the same
+ * call -- the newest stash if one is pending, else canon -- so pockets and room stay a consistent pair (local furniture edits are discarded with the pocket edits). */
+static void pcnetgame_house_client_on_full_adopt(void) {
+    int h;
+    const uint8_t* img;
+    uint32_t seq, session;
+    if (!pcnetgame_hcl_active()) {
+        return;
+    }
+    s_hcl.rollback = 0;
+    h = pcnetgame_hcl_own_house();
+    if (h < 0 || pcnetgame_local_house_unsafe(h)) {
+        return;
+    }
+    if (s_hcp.stash_valid[h]) {
+        img = s_hcp.stash_img[h];
+        seq = s_hcp.stash_seq[h];
+        session = s_hcp.stash_session[h];
+    } else if (s_hcp.canon_valid[h] && pcnetgame_hcl_dirty(h)) {
+        img = s_hcp.canon_img[h];
+        seq = s_hcp.canon_seq[h];
+        session = s_hcp.canon_session[h];
+    } else {
+        return;
+    }
+    if (!pcnetgame_hcl_write_save(h, img)) {
+        return;
+    }
+    {
+        static uint8_t keep[PC_NETGAME_HOUSE_IMG_SIZE];
+        memcpy(keep, img, sizeof(keep)); /* img may point into s_hcp.canon_img, which pcnetgame_hcl_set_canon_from_save rewrites */
+        pcnetgame_hcl_set_canon_from_save(h, keep, seq, session);
+    }
+    s_hcp.stash_valid[h] = 0;
+    s_hcl.retry_not_before_ms = 0;
+    printf("[NET][HOUSE] client: a FULL record push was adopted -> own house %d restored to the host's state (seq %u): local furniture edits discarded together with the pocket edits\n", h,
+           (unsigned)seq);
+}
+
+/* ---- receive: CANON_PUSH ---- */
+static void pcnetgame_hcl_rx_violation(const char* why) {
+    if (s_hcl.log_n++ < 16u) {
+        printf("[NET][HOUSE] client: push protocol violation: %s (dropped)\n", why);
+    }
+}
+
+static void pcnetgame_hcl_handle_begin(const PCNetGameHouseBeginMsg* in) {
+    if (in->kind != (uint8_t)PC_NETGAME_HOUSE_KIND_CANON_PUSH) {
+        return; /* an OWNER_COMMIT is client -> host only: misdirected, dropped */
+    }
+    if (!s_hcl.on) {
+        return;
+    }
+    if (in->xfer_id == 0 || in->xfer_id <= s_hcl.rx_last_xfer) {
+        pcnetgame_hcl_rx_violation("BEGIN xfer_id not strictly increasing");
+        return;
+    }
+    s_hcl.rx_last_xfer = in->xfer_id;
+    s_hcl.rx_open = 0; /* a new BEGIN aborts an open transfer */
+    s_hcl.rx_got = 0;
+    if (in->chunk_count != (uint8_t)PC_NETGAME_HOUSE_PUSH_CHUNKS || in->total_size != (uint16_t)PC_NETGAME_HOUSE_IMG_SIZE || in->house >= PC_NETGAME_HOUSE_NUM ||
+        in->rsv != 0 || in->rsv2 != 0 || in->house_seq == 0) {
+        pcnetgame_hcl_rx_violation("BEGIN with a wrong shape");
+        return;
+    }
+    s_hcl.rx_open = 1;
+    s_hcl.rx_house = in->house;
+    s_hcl.rx_xfer = in->xfer_id;
+    s_hcl.rx_seq = in->house_seq;
+    s_hcl.rx_session = in->host_session;
+    s_hcl.rx_digest = in->digest;
+    s_hcl.rx_started_ms = pcnetgame_now_ms();
+}
+
+static void pcnetgame_hcl_push_complete(void) {
+    const int h = s_hcl.rx_house;
+    const int own = pcnetgame_hcl_own_house();
+    s_hcl.rx_open = 0;
+    s_hcl.rx_got = 0;
+    if (pcnetgame_fnv1a32(s_hcl_rx, PC_NETGAME_HOUSE_IMG_SIZE) != s_hcl.rx_digest) {
+        printf("[NET][HOUSE] client: CANON_PUSH house %d seq %u BAD DIGEST -- discarded\n", h, (unsigned)s_hcl.rx_seq);
+        return;
+    }
+    if (s_hcl.last_valid[h] && s_hcl.last_session[h] == s_hcl.rx_session && s_hcl.rx_seq <= s_hcl.last_seq[h]) {
+        printf("[NET][HOUSE] client: CANON_PUSH house %d seq %u is stale / duplicate (last %u) -- ignored\n", h, (unsigned)s_hcl.rx_seq, (unsigned)s_hcl.last_seq[h]);
+        return;
+    }
+    if (!pcfa_save_ready() || !s_local_world_latched) {
+        printf("[NET][HOUSE] client: CANON_PUSH house %d seq %u ignored: the local save is not usable (the host pushes again after a reconnect)\n", h, (unsigned)s_hcl.rx_seq);
+        return;
+    }
+    pcnetgame_house_import_native(s_hcl_rx, &s_hs_native);
+    if (mPr_CheckCmpPersonalID(&s_hs_native.ownerID, &Save_Get(homes[h]).ownerID) != TRUE) {
+        printf("[NET][HOUSE] client: CANON_PUSH house %d seq %u refused: its owner is not the owner of this save's house %d%s\n", h, (unsigned)s_hcl.rx_seq, h,
+               h == own ? " (OWN house: furniture sync disabled for this session)" : "");
+        if (h == own) {
+            s_hcl.disabled = 1;
+        }
+        return;
+    }
+    s_hcl.last_valid[h] = 1;
+    s_hcl.last_seq[h] = s_hcl.rx_seq;
+    s_hcl.last_session[h] = s_hcl.rx_session;
+    if (h == own) {
+        s_hcl.known = 1;
+        if (s_hcp.canon_valid[h] && s_hcp.canon_session[h] == s_hcl.rx_session && s_hcp.canon_seq[h] == s_hcl.rx_seq) {
+            /* the push for the very state we are based on (e.g. after a reconnect to the same host session): nothing to apply, our edits (if any) stay */
+            printf("[NET][HOUSE] client: CANON_PUSH own house %d seq %u equals our base: nothing to apply%s\n", h, (unsigned)s_hcl.rx_seq,
+                   pcnetgame_hcl_dirty(h) ? " (local edits kept, to be committed)" : "");
+            return;
+        }
+    }
+    memcpy(s_hcp.stash_img[h], s_hcl_rx, PC_NETGAME_HOUSE_IMG_SIZE);
+    s_hcp.stash_seq[h] = s_hcl.rx_seq;
+    s_hcp.stash_session[h] = s_hcl.rx_session;
+    s_hcp.stash_valid[h] = 1;
+    printf("[NET][HOUSE] client: CANON_PUSH house %d seq %u session %u received & stashed%s\n", h, (unsigned)s_hcl.rx_seq, (unsigned)s_hcl.rx_session, h == own ? " (own house)" : "");
+    (void)pcnetgame_hcl_apply_stash(h);
+}
+
+static void pcnetgame_hcl_handle_chunk(const PCNetGameHouseChunkMsg* in) {
+    uint32_t off, want;
+    if (!s_hcl.on) {
+        return;
+    }
+    if (!s_hcl.rx_open || in->xfer_id != s_hcl.rx_xfer) {
+        pcnetgame_hcl_rx_violation(s_hcl.rx_open ? "CHUNK for a foreign xfer_id" : "CHUNK before BEGIN");
+        return;
+    }
+    if (in->chunk_idx >= PC_NETGAME_HOUSE_PUSH_CHUNKS) {
+        pcnetgame_hcl_rx_violation("CHUNK idx >= count");
+        return;
+    }
+    off = (uint32_t)in->chunk_idx * PC_NETGAME_HOUSE_CHUNK_DATA;
+    want = PC_NETGAME_HOUSE_IMG_SIZE - off;
+    if (want > PC_NETGAME_HOUSE_CHUNK_DATA) {
+        want = PC_NETGAME_HOUSE_CHUNK_DATA;
+    }
+    if ((uint32_t)in->offset != off || (uint32_t)in->len != want) {
+        pcnetgame_hcl_rx_violation("CHUNK offset / len wrong");
+        return;
+    }
+    if ((s_hcl.rx_got & (uint8_t)(1u << in->chunk_idx)) != 0) {
+        pcnetgame_hcl_rx_violation("duplicate CHUNK");
+        return;
+    }
+    memcpy(s_hcl_rx + off, in->data, want);
+    s_hcl.rx_got |= (uint8_t)(1u << in->chunk_idx);
+    if (s_hcl.rx_got == (uint8_t)((1u << PC_NETGAME_HOUSE_PUSH_CHUNKS) - 1u)) {
+        pcnetgame_hcl_push_complete();
+    }
+}
+
+/* ---- OWNER_COMMIT: send ---- */
+static void pcnetgame_hcl_start_commit(int h, uint32_t now) {
+    s_hcl.c_active = 1;
+    s_hcl.c_next = 0;
+    s_hcl.c_house = (uint8_t)h;
+    s_hcl.c_xfer = ++s_hcl.c_xfer_counter;
+    s_hcl.c_started_ms = now;
+    s_hcl.last_commit_ms = now;
+    s_hcl.c_cown = pcnetgame_house_cown_digest(s_hcl_tx);
+    printf("[NET][HOUSE] client: OWNER_COMMIT xfer %u house %d started (base session %u seq %u, record base epoch %u rev %u)\n", (unsigned)s_hcl.c_xfer, h,
+           (unsigned)s_hcp.canon_session[h], (unsigned)s_hcp.canon_seq[h], (unsigned)s_crec.base_epoch, (unsigned)s_crec.base_rev);
+}
+
+static void pcnetgame_house_client_pump(void) {
+    int sent = 0;
+    while (s_hcl.c_active && s_hcl.c_next <= PC_NETGAME_HOUSE_COMMIT_CHUNKS && sent < PC_NETGAME_HCL_MSGS_PER_POLL) {
+        int backlog = pc_net_reliable_backlog(0);
+        if (backlog < 0 || backlog >= PC_NETGAME_SNAPSHOT_BACKLOG_LIMIT) {
+            break;
+        }
+        if (s_hcl.c_next == 0) {
+            PCNetGameHouseBeginMsg b;
+            const int h = s_hcl.c_house;
+            memset(&b, 0, sizeof(b));
+            b.msg_type = (uint8_t)PC_NETGAME_MSG_HOUSE_BEGIN;
+            b.kind = (uint8_t)PC_NETGAME_HOUSE_KIND_OWNER_COMMIT;
+            b.chunk_count = (uint8_t)PC_NETGAME_HOUSE_COMMIT_CHUNKS;
+            b.house = (uint8_t)h;
+            b.xfer_id = s_hcl.c_xfer;
+            b.host_session = s_hcp.canon_session[h];
+            b.house_seq = s_hcp.canon_seq[h];
+            b.rec_epoch = s_crec.base_epoch;
+            b.rec_rev = s_crec.base_rev;
+            b.total_size = (uint16_t)PC_NETGAME_HOUSE_COMMIT_SIZE;
+            b.digest = pcnetgame_fnv1a32(s_hcl_tx, PC_NETGAME_HOUSE_COMMIT_SIZE);
+            if (!pc_net_send(0, PC_NET_RELIABLE, &b, (uint16_t)sizeof(b))) {
+                break;
+            }
+            s_hcl.c_next = 1;
+        } else {
+            PCNetGameHouseChunkMsg c;
+            const uint32_t idx = (uint32_t)s_hcl.c_next - 1u;
+            const uint32_t off = idx * PC_NETGAME_HOUSE_CHUNK_DATA;
+            uint32_t len = PC_NETGAME_HOUSE_COMMIT_SIZE - off;
+            if (len > PC_NETGAME_HOUSE_CHUNK_DATA) {
+                len = PC_NETGAME_HOUSE_CHUNK_DATA;
+            }
+            memset(&c, 0, sizeof(c));
+            c.msg_type = (uint8_t)PC_NETGAME_MSG_HOUSE_CHUNK;
+            c.chunk_idx = (uint8_t)idx;
+            c.len = (uint16_t)len;
+            c.xfer_id = s_hcl.c_xfer;
+            c.offset = (uint16_t)off;
+            memcpy(c.data, s_hcl_tx + off, len);
+            if (!pc_net_send(0, PC_NET_RELIABLE, &c, (uint16_t)sizeof(c))) {
+                break;
+            }
+            s_hcl.c_next++;
+        }
+        sent++;
+    }
+}
+
+/* Builds the pair (house image || record) from the LOCAL save. 0 = no record available. */
+static int pcnetgame_hcl_build_pair(int h) {
+    if (!pcnetgame_crec_export_tx()) {
+        return 0;
+    }
+    pcnetgame_house_export_be(&Save_Get(homes[h]), s_hcl_tx);
+    memcpy(s_hcl_tx + PC_NETGAME_HOUSE_IMG_SIZE, s_crec_tx, PC_NETGAME_REC_SIZE);
+    return 1;
+}
+
+/* Called by pcnetgame_crec_tick() right before the plain upload trigger. Returns 1 when the commit machinery owns this tick (a commit is in flight, or the own house
+ * is dirty and waiting for its preconditions): the plain upload must not run. The commit is sent as soon as: house sync on, the house dirty, the record SYNCED with
+ * no staged push, no pocket transaction / pickup / drop / bury pending and no record upload in flight, the player outside the house, and the base of both parts is the
+ * host's current session. The record base is the CURRENT s_crec base, the house base is canon (session, seq). */
+static int pcnetgame_house_client_commit_tick(uint32_t now) {
+    int h;
+    if (!pcnetgame_hcl_active()) {
+        return 0;
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h < 0) {
+        return 0;
+    }
+    if (s_hcl.c_active) {
+        return 1;
+    }
+    if (!pcnetgame_crec_time_ok(s_hcl.next_check_ms, now)) {
+        return 0; /* evaluated every 200 ms (the plain upload is held independently by pcnetgame_house_client_upload_deferred) */
+    }
+    s_hcl.next_check_ms = now + 200u;
+    s_hcl.last_own_unsafe = pcnetgame_local_house_unsafe(h);
+    if (!s_hcl.known || !s_hcp.canon_valid[h] || s_hcl.last_own_unsafe || !pcnetgame_hcl_dirty(h)) {
+        return 0;
+    }
+    if (s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.st_valid || s_crec.up_active || s_crec.up_blocked || s_pickup_pending.valid || s_drop_pending.valid ||
+        s_bury_pending.valid || pcnetgame_txn_busy() || s_exchange_deferred.valid || s_exchange_swap_slot >= 0 || s_catch_pending.valid || s_field_action_queue_len > 0) {
+        return 1; /* dirty but not ready: hold the plain upload, wait */
+    }
+    if (!pcfa_save_ready() || !s_local_world_latched || !pcnetgame_owner_stamp_matches(&s_crec.owner) || s_crec.base_session != s_hcp.canon_session[h]) {
+        return 1;
+    }
+    if (!pcnetgame_crec_time_ok(s_hcl.retry_not_before_ms, now) || (s_hcl.last_commit_ms != 0 && (uint32_t)(now - s_hcl.last_commit_ms) < PC_NETGAME_HCL_MIN_GAP_MS)) {
+        return 1;
+    }
+    if (!pcnetgame_hcl_build_pair(h)) {
+        return 1;
+    }
+    pcnetgame_hcl_start_commit(h, now);
+    pcnetgame_house_client_pump();
+    return 1;
+}
+
+/* ---- OWNER_COMMIT: the host's answer ---- */
+static void pcnetgame_hcl_handle_ack(const PCNetGameHouseAckMsg* a) {
+    const uint32_t now = pcnetgame_now_ms();
+    const int h = s_hcl.c_house;
+    if (!s_hcl.on || !s_hcl.c_active || a->xfer_id != s_hcl.c_xfer || a->xfer_id == 0) {
+        return; /* not ours (a late answer of an abandoned commit) */
+    }
+    s_hcl.c_active = 0;
+    switch (a->status) {
+        case PC_NETGAME_HOUSE_ACK_APPLIED:
+            memcpy(s_hcp.canon_img[h], s_hcl_tx, PC_NETGAME_HOUSE_IMG_SIZE);
+            s_hcp.canon_cown[h] = s_hcl.c_cown;
+            s_hcp.canon_seq[h] = a->house_seq;
+            s_hcp.canon_session[h] = a->host_session;
+            s_hcp.canon_valid[h] = 1;
+            s_hcl.rollback = 0;
+            if (s_hcp.stash_valid[h] && s_hcp.stash_session[h] == a->host_session && s_hcp.stash_seq[h] <= a->house_seq) {
+                s_hcp.stash_valid[h] = 0;
+            }
+            s_hcl.last_valid[h] = 1;
+            s_hcl.last_seq[h] = a->house_seq;
+            s_hcl.last_session[h] = a->host_session;
+            pcnetgame_crec_set_base(a->epoch, a->rev, a->host_session, pcnetgame_crec_cown_digest(s_hcl_tx + PC_NETGAME_HOUSE_IMG_SIZE));
+            s_crec.up_blocked = 0;
+            printf("[NET][HOUSE] client: OWNER_COMMIT xfer %u APPLIED (house %d seq %u, record epoch %u rev %u)\n", (unsigned)a->xfer_id, h, (unsigned)a->house_seq, (unsigned)a->epoch,
+                   (unsigned)a->rev);
+            return;
+        case PC_NETGAME_HOUSE_ACK_STALE:
+            s_hcl.rollback = 1;
+            s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_STALE_MS;
+            printf("[NET][HOUSE] client: OWNER_COMMIT xfer %u STALE (host house seq %u, record %u/%u): waiting for the host's pushes (the FULL record adoption restores the house)\n",
+                   (unsigned)a->xfer_id, (unsigned)a->house_seq, (unsigned)a->epoch, (unsigned)a->rev);
+            return;
+        case PC_NETGAME_HOUSE_ACK_BUSY:
+            s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_BUSY_MS;
+            return;
+        case PC_NETGAME_HOUSE_ACK_RATE_LIMITED:
+            s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_RATE_MS;
+            return;
+        case PC_NETGAME_HOUSE_ACK_NOT_OWNER:
+            s_hcl.disabled = 1;
+            printf("[NET][HOUSE] client: *** the host answered NOT_OWNER: furniture sync is DISABLED for this session (the host does not treat this player as the owner of house %d) ***\n", h);
+            return;
+        default:
+            s_hcl.rollback = 1;
+            s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_REJECT_MS;
+            printf("[NET][HOUSE] client: *** OWNER_COMMIT xfer %u REFUSED by the host: %s (detail 0x%04X) -- house + pockets are rolled back by the host's pushes ***\n", (unsigned)a->xfer_id,
+                   pcnetgame_house_status_name(a->status), (unsigned)a->detail);
+            return;
+    }
+}
+
+static void pcnetgame_handle_client_house(const uint8_t* data, uint16_t size) {
+    PCNetGameHouseBeginMsg b;
+    PCNetGameHouseAckMsg a;
+    PCNetGameHouseChunkMsg c;
+    switch (data[0]) {
+        case PC_NETGAME_MSG_HOUSE_BEGIN:
+            if (size != sizeof(b)) { pcnetgame_hcl_rx_violation("BEGIN wrong size"); return; }
+            memcpy(&b, data, sizeof(b));
+            pcnetgame_hcl_handle_begin(&b);
+            return;
+        case PC_NETGAME_MSG_HOUSE_CHUNK:
+            if (size != sizeof(c)) { pcnetgame_hcl_rx_violation("CHUNK wrong size"); return; }
+            memcpy(&c, data, sizeof(c));
+            pcnetgame_hcl_handle_chunk(&c);
+            return;
+        case PC_NETGAME_MSG_HOUSE_ACK:
+            if (size != sizeof(a)) { pcnetgame_hcl_rx_violation("ACK wrong size"); return; }
+            memcpy(&a, data, sizeof(a));
+            pcnetgame_hcl_handle_ack(&a);
+            return;
+        default:
+            return;
+    }
+}
+
+/* Once per client poll (READY and the local save loaded): receive / commit watchdogs, the stash writer. */
+static void pcnetgame_house_client_tick(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    int h;
+    if (!pcnetgame_hcl_active()) {
+        return;
+    }
+    if (s_hcl.rx_open && (uint32_t)(now - s_hcl.rx_started_ms) >= PC_NETGAME_HCL_RX_TIMEOUT_MS) {
+        printf("[NET][HOUSE] client: CANON_PUSH xfer %u timed out -- discarded\n", (unsigned)s_hcl.rx_xfer);
+        s_hcl.rx_open = 0;
+        s_hcl.rx_got = 0;
+    }
+    if (s_hcl.c_active) {
+        if (s_hcl.c_next <= PC_NETGAME_HOUSE_COMMIT_CHUNKS && (uint32_t)(now - s_hcl.c_started_ms) >= PC_NETGAME_HCL_SEND_TIMEOUT_MS) {
+            printf("[NET][HOUSE] client: OWNER_COMMIT xfer %u could not be sent within %u ms -- aborted, retrying later\n", (unsigned)s_hcl.c_xfer, (unsigned)PC_NETGAME_HCL_SEND_TIMEOUT_MS);
+            s_hcl.c_active = 0;
+            s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_BUSY_MS;
+        } else if ((uint32_t)(now - s_hcl.c_started_ms) >= PC_NETGAME_HCL_ACK_TIMEOUT_MS) {
+            printf("[NET][HOUSE] client: OWNER_COMMIT xfer %u got no ACK within %u ms -- abandoned, retrying later (the host's answer to the new commit tells the truth)\n", (unsigned)s_hcl.c_xfer,
+                   (unsigned)PC_NETGAME_HCL_ACK_TIMEOUT_MS);
+            s_hcl.c_active = 0;
+            s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_BUSY_MS;
+        }
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h >= 0) {
+        s_hcl.last_own_unsafe = pcnetgame_local_house_unsafe(h);
+        if (!s_hcl.known && (uint32_t)(now - s_hcl.since_ms) >= 20000u) {
+            /* the host never delivered a usable push of our own house: do not hold the record uploads / transactions hostage -- fall back to the pre-furniture-sync behaviour for this session */
+            s_hcl.disabled = 1;
+            printf("[NET][HOUSE] client: *** no usable CANON_PUSH of the own house %d within 20 s: furniture sync is DISABLED for this session (the record uploads are no longer held) ***\n", h);
+            return;
+        }
+    }
+    for (h = 0; h < PC_NETGAME_HOUSE_NUM; h++) {
+        if (s_hcp.stash_valid[h]) {
+            (void)pcnetgame_hcl_apply_stash(h);
+        }
+    }
+}
+
+/* Graceful quit (called first by pc_net_game_client_record_quit_flush; gamePT is gone, so the unsafe state of the LAST tick is used). Returns 1 when the plain record
+ * flush may go on, 0 when it must NOT run: an uncommitted house edit is in the pockets, and the pockets alone would duplicate. Bounded by max_ms. */
+static int pcnetgame_house_client_quit_flush(unsigned max_ms) {
+    uint32_t t0, deadline, now;
+    int h, started = 0;
+    if (!pcnetgame_hcl_active()) {
+        return 1;
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h < 0) {
+        return 1;
+    }
+    if (s_hcl.last_own_unsafe || !s_hcl.known || !s_hcp.canon_valid[h]) {
+        printf("[NET][HOUSE] client: quit flush: the player was inside (or entering / leaving) its own house, or the house was never synced: the record flush is skipped (the host keeps the last committed pair)\n");
+        return 0;
+    }
+    t0 = pcnetgame_now_ms();
+    deadline = t0 + max_ms;
+    for (;;) {
+        PCNetEvent ev;
+        now = pcnetgame_now_ms();
+        if ((int32_t)(now - deadline) >= 0) {
+            break;
+        }
+        if (!s_hcl.c_active) {
+            if (!pcnetgame_hcl_dirty(h)) {
+                if (started) {
+                    printf("[NET][HOUSE] client: quit flush done: pair APPLIED by the host in %u ms\n", (unsigned)(now - t0));
+                }
+                return 1;
+            }
+            if (started) {
+                break; /* our commit ended without APPLIED (refused / stale): do not hammer during shutdown */
+            }
+            if (s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.up_active || s_crec.up_blocked || pcnetgame_txn_busy() || s_crec.base_session != s_hcp.canon_session[h] ||
+                !pcfa_save_ready() || Now_Private == NULL || !pcnetgame_owner_stamp_matches(&s_crec.owner)) {
+                break;
+            }
+            if (pcnetgame_crec_time_ok(s_hcl.retry_not_before_ms, now) &&
+                (s_hcl.last_commit_ms == 0 || (uint32_t)(now - s_hcl.last_commit_ms) >= PC_NETGAME_HCL_QUIT_GAP_MS) && pcnetgame_hcl_build_pair(h)) {
+                printf("[NET][HOUSE] client: quit flush: committing the dirty house + record (budget %u ms)\n", max_ms);
+                pcnetgame_hcl_start_commit(h, now);
+                started = 1;
+            }
+        }
+        pcnetgame_house_client_pump();
+        pc_net_poll();
+        while (pc_net_next_event(&ev)) {
+            if (ev.type == PC_NET_EVENT_PEER_DISCONNECTED) {
+                printf("[NET][HOUSE] client: quit flush aborted: host link lost\n");
+                return 0;
+            }
+            if (ev.type == PC_NET_EVENT_DATA && ev.size == sizeof(PCNetGameHouseAckMsg) && ev.data[0] == (uint8_t)PC_NETGAME_MSG_HOUSE_ACK) {
+                PCNetGameHouseAckMsg a;
+                memcpy(&a, ev.data, sizeof(a));
+                pcnetgame_hcl_handle_ack(&a);
+            }
+        }
+        SDL_Delay(5);
+    }
+    printf("[NET][HOUSE] client: quit flush gave up after %u ms (best effort); the plain record flush is skipped so the pockets of the unsent house edit are not uploaded alone\n",
+           (unsigned)(pcnetgame_now_ms() - t0));
+    return !pcnetgame_hcl_dirty(h) && !s_hcl.c_active;
+}
+/* ===== HOUSE CLIENT END ===== */
 
 /* ===== X1b CLIENT BEGIN: host-transactional PICKUP / DROP / BURY commit, CLIENT half (protocol v8, wire ids 51/52) =====
  * Flow: PICKUP/DROP/BURY_REQUEST -> provisional RESULT (accepted=1, nothing changed) -> the result handler VALIDATES as before and
@@ -18253,12 +19831,12 @@ static int pcnetgame_ts_valid_museum_blob(const uint8_t* blob) {
 
 static int pcnetgame_ts_valid_hostcfg_blob(const uint8_t* blob) {
     unsigned i;
-    if (blob[0] > 1u) {
+    if (blob[0] > 1u || (blob[1] & ~(uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC) != 0u) {
         return 0;
     }
-    for (i = 1; i < PC_NETGAME_TS_HOSTCFG_LEN; i++) {
+    for (i = 2; i < PC_NETGAME_TS_HOSTCFG_LEN; i++) {
         if (blob[i] != 0u) {
-            return 0; /* reserved bytes must be zero (v8 unreleased: strict) */
+            return 0; /* reserved bytes must be zero (v8 unreleased: strict); byte 1 bit 0 = house sync, its other bits reserved */
         }
     }
     return 1;
@@ -18321,6 +19899,7 @@ static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
     int i;
     if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
         pcnetgame_client_wildlife_mode_apply(m->blob[0] != 0);
+        pcnetgame_house_client_set_hostcfg((m->blob[1] & (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC) != 0); /* furniture sync: a client without the bit never gates anything */
         s_ts_client_seq[svc] = m->seq;
         s_ts_client_have[svc] = 1;
         printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc),
@@ -20220,6 +21799,11 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (data[0] >= (uint8_t)PC_NETGAME_MSG_HOUSE_BEGIN && data[0] <= (uint8_t)PC_NETGAME_MSG_HOUSE_ACK) {
+        pcnetgame_handle_host_house(peer, data, size); /* furniture sync (v8 ids 59..61): READY + bound gates inside; misdirected kinds are dropped */
+        return;
+    }
+
     if (data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION) {
         /* M9-C: PLAYER_ACTION is host -> client only; a client never originates it. Dropped, never relayed. */
         if (pcnetgame_action_diag()) {
@@ -20574,6 +22158,13 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
     if (size >= 1 && data[0] >= (uint8_t)PC_NETGAME_MSG_RECORD_HELLO && data[0] <= (uint8_t)PC_NETGAME_MSG_RECORD_ACK) {
         if (s_client_link == PC_NETGAME_LINK_READY) {
             pcnetgame_handle_client_record(data, size); /* D3 (v8) client half */
+        }
+        return;
+    }
+
+    if (size >= 1 && data[0] >= (uint8_t)PC_NETGAME_MSG_HOUSE_BEGIN && data[0] <= (uint8_t)PC_NETGAME_MSG_HOUSE_ACK) {
+        if (s_client_link == PC_NETGAME_LINK_READY) {
+            pcnetgame_handle_client_house(data, size); /* furniture sync (v8 ids 59..61) client half; inert unless the host announced it */
         }
         return;
     }
@@ -21088,6 +22679,7 @@ static void pcnetgame_reset_client_session_state(void) {
     /* D3: link loss / new connection clears the partial push buffer, a staged-but-unadopted push, the in-flight upload
      * and the state (NONE). The carried last_* lineage (s_crec_last) deliberately survives. */
     pcnetgame_crec_reset();
+    pcnetgame_house_client_reset_session(); /* furniture sync: the session part (canon / stash survive for the same local player) */
 }
 
 /* v2: clears every piece of host world state (start_host / shutdown). */
@@ -21104,6 +22696,7 @@ static void pcnetgame_reset_host_world_state(void) {
     s_host_town_valid = 0;
     memset(&s_host_town, 0, sizeof(s_host_town));
     pcnetgame_rec_on_world_reset(); /* D3: new hosting session -> new host_session + epochs */
+    pcnetgame_house_host_reset();   /* furniture sync: the canonical copies and their seqs belong to the previous session */
     s_host_carry_dirty = 0;
     s_host_scan_cursor = 0;
     s_world_seq = 0;
@@ -21231,6 +22824,7 @@ static void pcnetgame_client_tick(void) {
     }
 
     pcnetgame_crec_tick(); /* D3: HELLO / push adoption / upload triggers */
+    pcnetgame_house_client_tick(); /* furniture sync: push receive / commit watchdogs / stash writer */
 
     if (s_client_need_resync) {
         PCNetGameResyncRequestMsg rr;
@@ -22901,6 +24495,7 @@ void pc_net_game_poll(void) {
         pcnetgame_host_ts_tick();     /* town services: digest-poll the host's police / museum copies and push TOWN_SVC_STATE */
         pcnetgame_host_mbox_tick();   /* mail milestone 2: digest-poll the owners' house mailboxes and push MAILBOX_LETTER */
         pcnetgame_host_remail_tick(); /* mail milestone 2 (M2r): villager replies for every connected resident */
+        pcnetgame_house_host_tick();  /* furniture sync: canonical house copies, CANON_PUSH pump, commit deadlines (after the record tick: the commit shares its state) */
         pcnetgame_host_world_poll();
     } else {
         pcnetgame_client_tick();

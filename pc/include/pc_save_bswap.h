@@ -20,6 +20,9 @@ void pc_save_bswap(Save_t* save, pc_bswap_dir_t dir);
 /* D3: convert ONE Private_c in place (see pc_save_bswap.c). Always pass a copy of a live record. */
 void pc_save_bswap_private(Private_c* prv, pc_bswap_dir_t dir);
 
+/* Furniture sync: convert ONE mHm_hs_c (a player house) in place. Always pass a COPY of a live Save_Get(homes[h]). */
+void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir);
+
 void pc_save_bswap_keep_mail(mCD_keep_mail_c* mail, pc_bswap_dir_t dir);
 void pc_save_bswap_keep_original(mCD_keep_original_c* orig, pc_bswap_dir_t dir);
 void pc_save_bswap_keep_diary(mCD_keep_diary_c* diary, pc_bswap_dir_t dir);

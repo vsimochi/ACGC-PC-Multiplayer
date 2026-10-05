@@ -109,6 +109,12 @@ extern int           g_pc_bury_test_seed; /* World Ecology T3: --bury-test-seed 
  * pcnetgame_handle_client_wildlife_spawn()'s own gate checks (pc_net_game.c) for the enforcement.
  * See pc_main.c's CLI parsing and ac_set_manager.c's own gate doc for the exact fallthrough shape. */
 extern int           g_pc_authoritative_wildlife;
+/* Furniture sync (Stage 1, protocol v8 ids 59..61): --house-sync is a HOST opt-in MODE flag (announced in HOST_CONFIG byte 1 bit 0; a client follows the
+ * host and ignores its own copy). Off by default. g_pc_house_test_host_in_house / g_pc_house_test_host_edit are TEST-ONLY host hooks (default -1 / NULL,
+ * never active in normal play): see pc_main.c and pc_net_game.c (pcnetgame_local_house_unsafe / pcnetgame_house_test_host_edit). */
+extern int           g_pc_house_sync;
+extern int           g_pc_house_test_host_in_house;
+extern const char*   g_pc_house_test_host_edit;
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * Fire mNpc_DebugForceGrow()/mNpc_DebugForceRemove() (m_npc.c) once, as soon as the host world is
  * ready -- see pc_net_game.c's pcnetgame_run_villager_test_triggers(). Off by default; never active

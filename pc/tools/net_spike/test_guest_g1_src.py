@@ -190,7 +190,7 @@ def main():
        "memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));" in cr and "mPr_CopyPersonalID(&s_guest_rec[g].player_ID, (PersonalID_c*)key);" in cr and "s_guest_rec[g].exists = TRUE;" in cr
        and "mMsm_ClearRecord(&private_info->museum_record);" in vanilla and "bzero(private_info, sizeof(Private_c));" in vanilla
        and "private_info->reset_code" not in vanilla.split("extern void mPr_ClearPrivateInfo")[1].split("static int mPr_GetRandomFace")[0])
-    ck("E no wire change: the message id range is unchanged (1..58) and wire_baseline is green", sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 59)))
+    ck("E no wire change: the message id range is exactly 1..61 (59..61 came with the furniture sync) and wire_baseline is green", sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 62)))
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("E wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))
@@ -272,8 +272,10 @@ def main():
        not re.search(r"Save_Set\(private_data|Save_GetPointer\(private_data|homes|mHS_|mHm_", allg.replace("PersonalID_c* p = &Save_Get(private_data)[i].player_ID;", "")))
     ck("G the observer / resident bootstrap and the GCI writers are not touched by this change: pc_save_bswap.c and the m_private.c decomp files have no diff vs HEAD "
        "(G3: m_start_data_init.c IS edited, additively -- pinned strictly in test_guest_g3_src.py)",
-       all(not os.popen('git -C "%s" diff --name-only HEAD -- %s' % (ROOT, f)).read().strip() for f in ("pc/src/pc_save_bswap.c", "src/game/m_private.c",
-                                                                                                         "src/game/m_needlework.c", "include/m_private.h")))
+       all(not os.popen('git -C "%s" diff --name-only HEAD -- %s' % (ROOT, f)).read().strip() for f in ("src/game/m_private.c", "src/game/m_needlework.c", "include/m_private.h"))
+       # furniture sync: pc_save_bswap.c may only GAIN the public pc_save_bswap_home() wrapper (no removed line, nothing else)
+       and not [ln for ln in os.popen('git -C "%s" diff -U0 --ignore-cr-at-eol HEAD -- pc/src/pc_save_bswap.c' % ROOT).read().split("\n") if ln.startswith("-") and not ln.startswith("---")]
+       and "void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {" in os.popen('git -C "%s" diff -U0 --ignore-cr-at-eol HEAD -- pc/src/pc_save_bswap.c' % ROOT).read())
     eol_ok = True
     for rel, crlf in (("pc/src/pc_m_card.c", True), ("pc/src/pc_net_game.c", False), ("pc/src/pc_main.c", False), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
                       ("pc/tools/net_spike/net_spike_lib.py", False), ("pc/tools/net_spike/test_guest_protocol.py", False), ("pc/tools/net_spike/test_guest_real_client.py", False), ("pc/tools/net_spike/test_guest_bootstrap_cli.py", False),

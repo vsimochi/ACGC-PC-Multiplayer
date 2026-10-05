@@ -97,7 +97,7 @@ int main(void) {
     ck("src: the world latch needs a running GAME_PLAY whose scene is not pre-game",
        "gamePT != NULL && gamePT->exec == play_main && !pcnetgame_scene_is_pregame((int)((GAME_PLAY*)gamePT)->scene_id)" in latch
        and "if (!pcfa_save_ready()) {" in latch and "s_local_world_latched = 0;" in latch)
-    ck("src: the lifecycle predicate of the adoption watchdog shares the same helper", "return pcnetgame_scene_is_pregame(sc);" in func(src, "pcnetgame_crec_adopt_lifecycle_now"))
+    ck("src: the lifecycle predicate of the adoption watchdog shares the same helper", "return pcnetgame_scene_is_pregame(sc) || pcnetgame_house_client_adopt_wait();" in func(src, "pcnetgame_crec_adopt_lifecycle_now"))
     i0 = src.index("static void pcnetgame_client_tick(void) {" + chr(10))
     tick = src[i0:src.index(chr(10) + "}" + chr(10), i0) + 3]
     ck("src: the client still sends IDENTITY only when the (now stricter) latch is set: `int ready = s_local_world_latched;` + `if (ready)` before the send",

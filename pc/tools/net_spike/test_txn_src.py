@@ -73,7 +73,7 @@ def main():
           and d.get("PC_NETGAME_MSG_TXN_RESERVED_53") == 53 and d.get("PC_NETGAME_MSG_TXN_RESERVED_54") == 54 and d.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and d.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56
           and d.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and d.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58  # guests G1
-          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 59)))
+          and sorted(v for _n, v in ids) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) == list(range(1, 62)))
     enum_body = c_raw[c_raw.index("typedef enum PCNetGameMsgType {"):c_raw.index("} PCNetGameMsgType;")]
     check("W the enum comment documents that 53 and 54 are reserved for X2 (TXN_QUERY / TXN_STATUS)", "53 and 54 are reserved for X2" in enum_body and "TXN_QUERY" in enum_body)
     for t, size in (("PCNetGameTxnTag", 64), ("PCNetGameTxnCommitMsg", 72), ("PCNetGameTxnResultMsg", 76)):
@@ -185,7 +185,7 @@ def main():
     check("H a push in flight is restarted at the new rev: 'if (st->rec_push_active) pcnetgame_rec_start_push(peer, idx, st->rec_push_kind)' is the last statement",
           hd.rstrip().endswith("if (st->rec_push_active) {\n        pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);\n    }"))
     check("H the extractions exist and are shared: validate_inventory (D3 upload + txn), stale_push (D3 upload + txn), cown_digest (txn + D3 client)",
-          c.count("pcnetgame_rec_validate_inventory(") >= 4 and c.count("pcnetgame_rec_stale_push(") == 8 and c.count("pcnetgame_crec_cown_digest(") >= 4  # X3: + the grant handler's STALE_IMAGE push; town services: + the TS handler's; mail milestone 1: + the mail handler's two (stale base, stale letter); mail milestone 2: + the take handler's one (stale base; a stale mailbox letter re-pushes the MAILBOX_LETTER instead)
+          c.count("pcnetgame_rec_validate_inventory(") >= 4 and c.count("pcnetgame_rec_stale_push(") == 9 and c.count("pcnetgame_crec_cown_digest(") >= 4  # X3: + the grant handler's STALE_IMAGE push; town services: + the TS handler's; mail milestone 1: + the mail handler's two (stale base, stale letter); mail milestone 2: + the take handler's one (stale base; a stale mailbox letter re-pushes the MAILBOX_LETTER instead; furniture sync: + the house reject's rollback push)
           and "static uint32_t pcnetgame_crec_cown_digest" in blk and "static uint32_t pcnetgame_crec_cown_digest" not in c_raw[c_raw.index("===== D3 CLIENT BEGIN"):])
 
     # ------------------------------------------------------------------ S: single sanctioned writers

@@ -366,6 +366,15 @@ int g_pc_bury_test_seed = 0;
  * behavior when it is not passed. */
 int g_pc_authoritative_wildlife = 0;
 
+/* Furniture sync (Stage 1): --house-sync (HOST decides, like --authoritative-wildlife; announced to every client in HOST_CONFIG byte 1 bit 0). Off by
+ * default: without it nothing about player houses is networked and no client gate is armed. TEST-ONLY: --house-test-host-in-house H (the host treats
+ * house H as 'its player is inside' for every safety decision), --house-test-host-edit H,floor,cell,item (once the host world is ready the host
+ * writes `item` into layer 0 cell `cell` of floor `floor` of house H of its own Save, standing in for a host-originated change such as turnip
+ * spoilage). See pc_platform.h. */
+int g_pc_house_sync = 0;
+int g_pc_house_test_host_in_house = -1;
+const char* g_pc_house_test_host_edit = NULL;
+
 /* Villager population/is_home milestone, TEST-ONLY: --force-villager-grow / --force-villager-remove.
  * See pc_platform.h's own doc comment on these two globals. */
 int g_pc_force_villager_grow = 0;
@@ -637,6 +646,8 @@ int main(int argc, char* argv[]) {
             printf("                      Rover train scene (name, gender, face) and the answers are saved to save/mp/guest_<name>.ini when it ends\n");
             printf("                      (an interrupted creation writes nothing and replays next launch). TEST-ONLY: --guest-creation-test\n");
             printf("                      NAME,GENDER,FACE answers the Rover scene without UI. Plain --guest keeps auto-creating guest.ini.\n");
+            printf("  --house-sync        HOST opt-in: the host is authoritative for the furniture of player houses (the owner's edits are committed to\n");
+            printf("                      the host together with the pocket record; announced to every client in HOST_CONFIG). Off by default.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
             printf("                      not a one-shot test hook): activates the host-authoritative\n");
             printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
@@ -922,6 +933,16 @@ int main(int argc, char* argv[]) {
             pc_dedicated_early_console(); /* attach/allocate a console now so even the refusal text below is visible (valid redirected handles are kept) */
         } else if (strcmp(argv[i], "--authoritative-wildlife") == 0) {
             g_pc_authoritative_wildlife = 1;
+        } else if (strcmp(argv[i], "--house-sync") == 0) {
+            g_pc_house_sync = 1;
+        } else if (strcmp(argv[i], "--house-test-host-in-house") == 0 && i + 1 < argc) {
+            g_pc_house_test_host_in_house = atoi(argv[i + 1]);
+            printf("[NET][HOUSE][TEST-ONLY] --house-test-host-in-house %d armed (a TEST hook: not for normal play)\n", g_pc_house_test_host_in_house);
+            i++;
+        } else if (strcmp(argv[i], "--house-test-host-edit") == 0 && i + 1 < argc) {
+            g_pc_house_test_host_edit = argv[i + 1];
+            printf("[NET][HOUSE][TEST-ONLY] --house-test-host-edit %s armed (a TEST hook: not for normal play)\n", g_pc_house_test_host_edit);
+            i++;
         } else if (strcmp(argv[i], "--profile") == 0) {
             g_pc_profile_enabled = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {

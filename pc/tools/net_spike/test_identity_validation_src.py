@@ -382,8 +382,8 @@ def main():
     bsw = git("diff", "-U0", "HEAD", "--", "pc/src/pc_save_bswap.c")
     bsw_add = [l[1:] for l in bsw.split("\n") if l.startswith("+") and not l.startswith("+++")]
     bsw_rm = [l for l in bsw.split("\n") if l.startswith("-") and not l.startswith("---")]
-    if not bsw_rm and any("void pc_save_bswap_private(Private_c* prv, pc_bswap_dir_t dir) {" in l for l in bsw_add) \
-            and not any(re.match(r"\s*swap\d*\(", l) for l in bsw_add if "swap_Private(prv, dir);" not in l):
+    if not bsw_rm and any(("void pc_save_bswap_private(Private_c* prv, pc_bswap_dir_t dir) {" in l) or ("void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir) {" in l) for l in bsw_add) \
+            and not any(re.match(r"\s*swap\d*\(", l) for l in bsw_add if "swap_Private(prv, dir);" not in l and "swap_mHm_hs(home, dir);" not in l):
         moved = [f for f in moved if f != "pc/src/pc_save_bswap.c"]
     check(f"S9 save-layout sources unchanged vs HEAD ({layout_files}; modified: {moved})",
           not moved and all(os.path.isfile(os.path.join(REPO, f)) for f in layout_files))

@@ -60,8 +60,16 @@ def main():
     ty = func(src, "pcnetgame_crec_try_adopt")
     ck("src: #include of the clock header; the 10 s constant is unchanged vs the baseline",
        '#include "pc_adopt_clock.h"' in src and "#define PC_NETGAME_CREC_ADOPT_TIMEOUT_MS 10000u" in src and "#define PC_NETGAME_CREC_ADOPT_TIMEOUT_MS 10000u" in base)
-    ck("src: pcnetgame_crec_adopt_blocker is byte-identical to the baseline (the guard itself is NOT weakened)",
-       func(src, "pcnetgame_crec_adopt_blocker") != "" and func(src, "pcnetgame_crec_adopt_blocker") == func(base, "pcnetgame_crec_adopt_blocker"))
+    fs_block = """    {
+        const char* hwhy = pcnetgame_house_client_adopt_blocker(s_crec.st_kind == PC_NETGAME_REC_KIND_PUSH_FULL); /* furniture sync */
+        if (hwhy != NULL) {
+            return hwhy;
+        }
+    }
+"""
+    ck("src: pcnetgame_crec_adopt_blocker is byte-identical to the baseline except for ONE added furniture-sync block (the guard itself is NOT weakened: it only gained a blocker)",
+       func(src, "pcnetgame_crec_adopt_blocker") != "" and func(src, "pcnetgame_crec_adopt_blocker").count(fs_block) == 1
+       and func(src, "pcnetgame_crec_adopt_blocker").replace(fs_block, "") == func(base, "pcnetgame_crec_adopt_blocker"))
     ck("src: the clock is armed when a push is staged and ticked on every blocked attempt",
        "pc_adopt_clock_arm(&s_crec_adopt_clock, s_crec.st_ms);" in src and "pc_adopt_clock_tick(&s_crec_adopt_clock, now, pcnetgame_crec_adopt_lifecycle_now());" in ty)
     ck("src: ADOPT_FAILED is decided by pc_adopt_clock_expired(10 s, lifecycle cap); the flat `now - st_ms >= TIMEOUT` check is gone",
@@ -70,7 +78,7 @@ def main():
     lf = func(src, "pcnetgame_crec_adopt_lifecycle_now")
     ck("src: the lifecycle predicate = no running GAME_PLAY | fade / wipe in progress | a pre-game scene",
        "gamePT == NULL || gamePT->exec != play_main" in lf and "play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE" in lf
-       and "return pcnetgame_scene_is_pregame(sc);" in lf
+       and "return pcnetgame_scene_is_pregame(sc) || pcnetgame_house_client_adopt_wait();" in lf
        and all(x in func(src, "pcnetgame_scene_is_pregame") for x in ("SCENE_TITLE_DEMO", "SCENE_PLAYERSELECT_2", "SCENE_PLAYERSELECT_3", "SCENE_PLAYERSELECT_SAVE", "SCENE_START_DEMO3")))
     ck("src: adoption itself is still gated by the unchanged blocker (the clock only changes WHEN the attempt is given up)",
        "why = pcnetgame_crec_adopt_blocker(&s_crec_scratch);" in ty)

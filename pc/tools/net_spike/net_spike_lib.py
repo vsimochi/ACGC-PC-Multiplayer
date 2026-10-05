@@ -1112,6 +1112,34 @@ RECORD_BEGIN_FMT = "<BBBBIIIIII"    # PCNetGameRecordBeginMsg, 28 bytes
 RECORD_CHUNK_FMT = "<BBHIHH1000s"   # PCNetGameRecordChunkMsg, 1012 bytes
 RECORD_ACK_FMT = "<BBHIIII"         # PCNetGameRecordAckMsg, 20 bytes
 
+# --- Furniture sync Stage 1 (protocol v8, UNRELEASED: ids 59..61 extend v8 in place, no version bump), all RELIABLE ---
+# HOUSE_BEGIN (36 B, both directions: kind 1 OWNER_COMMIT C->H = house image || record = 17 chunks, kind 2 CANON_PUSH H->C = house image = 7 chunks),
+# HOUSE_CHUNK (1012 B, the RECORD_CHUNK layout), HOUSE_ACK (24 B, H->C). The house image is 0x1A44 B: the BE bytes of mHm_hs_c [0,0x1A30) + [0x2678,0x268C).
+PC_NETGAME_MSG_HOUSE_BEGIN = 59   # both 36 B
+PC_NETGAME_MSG_HOUSE_CHUNK = 60   # both 1012 B
+PC_NETGAME_MSG_HOUSE_ACK = 61     # H->C 24 B
+PC_NETGAME_HOUSE_IMG_SIZE = 0x1A44
+PC_NETGAME_HOUSE_COMMIT_SIZE = 16004
+PC_NETGAME_HOUSE_CHUNK_DATA = 1000
+PC_NETGAME_HOUSE_COMMIT_CHUNKS = 17
+PC_NETGAME_HOUSE_PUSH_CHUNKS = 7
+PC_NETGAME_HOUSE_KIND_OWNER_COMMIT = 1
+PC_NETGAME_HOUSE_KIND_CANON_PUSH = 2
+PC_NETGAME_HOUSE_ACK_APPLIED = 0
+PC_NETGAME_HOUSE_ACK_STALE = 1
+PC_NETGAME_HOUSE_ACK_BAD_DIGEST = 2
+PC_NETGAME_HOUSE_ACK_BAD_SHAPE = 3
+PC_NETGAME_HOUSE_ACK_INVALID_CELL = 4
+PC_NETGAME_HOUSE_ACK_CONSERVATION = 5
+PC_NETGAME_HOUSE_ACK_NOT_OWNER = 6
+PC_NETGAME_HOUSE_ACK_BUSY = 7
+PC_NETGAME_HOUSE_ACK_RATE_LIMITED = 8
+PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC = 0x01
+HOUSE_BEGIN_FMT = "<BBBBIIIIIHHII"   # PCNetGameHouseBeginMsg, 36 bytes
+HOUSE_CHUNK_FMT = "<BBHIHH1000s"     # PCNetGameHouseChunkMsg, 1012 bytes
+HOUSE_ACK_FMT = "<BBHIIIII"          # PCNetGameHouseAckMsg, 24 bytes
+HOUSE_ACK_NAMES = ("APPLIED", "STALE", "BAD_DIGEST", "BAD_SHAPE", "INVALID_CELL", "CONSERVATION", "NOT_OWNER", "BUSY", "RATE_LIMITED")
+
 # --- X1 (protocol v8, UNRELEASED: ids 51/52 extend v8 in place, no version bump): host-transactional PICKUP/DROP/BURY commit ---
 # TXN_COMMIT (C->H, RELIABLE, 72 B = 8 B header + the reusable 64 B PCNetGameTxnTag) answers an accepted provisional
 # PICKUP/DROP/BURY RESULT; TXN_RESULT (H->C, RELIABLE, 76 B) is the host's answer to EVERY COMMIT (APPLIED + the post-image, or
@@ -1560,6 +1588,18 @@ assert RECORD_HELLO_SPEC.size == 24 and RECORD_BEGIN_SPEC.size == 28
 assert RECORD_CHUNK_SPEC.size == 1012 and RECORD_ACK_SPEC.size == 20
 assert max(RECORD_HELLO_SPEC.size, RECORD_BEGIN_SPEC.size, RECORD_CHUNK_SPEC.size, RECORD_ACK_SPEC.size) <= PC_NET_MAX_PAYLOAD
 assert PC_NETGAME_REC_CHUNK_COUNT * PC_NETGAME_REC_CHUNK_DATA >= PC_NETGAME_REC_SIZE > (PC_NETGAME_REC_CHUNK_COUNT - 1) * PC_NETGAME_REC_CHUNK_DATA
+HOUSE_BEGIN_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_HOUSE_BEGIN, HOUSE_BEGIN_FMT,
+    ["msg_type", "kind", "chunk_count", "house", "xfer_id", "host_session", "house_seq", "rec_epoch", "rec_rev", "total_size", "rsv", "digest", "rsv2"],
+    "HouseBeginFields")
+HOUSE_CHUNK_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_HOUSE_CHUNK, HOUSE_CHUNK_FMT, ["msg_type", "chunk_idx", "length", "xfer_id", "offset", "rsv", "data"], "HouseChunkFields")
+HOUSE_ACK_SPEC = build_msg_spec(
+    PC_NETGAME_MSG_HOUSE_ACK, HOUSE_ACK_FMT, ["msg_type", "status", "detail", "xfer_id", "house_seq", "epoch", "rev", "host_session"], "HouseAckFields")
+assert HOUSE_BEGIN_SPEC.size == 36 and HOUSE_CHUNK_SPEC.size == 1012 and HOUSE_ACK_SPEC.size == 24
+assert max(HOUSE_BEGIN_SPEC.size, HOUSE_CHUNK_SPEC.size, HOUSE_ACK_SPEC.size) <= PC_NET_MAX_PAYLOAD
+assert (PC_NETGAME_HOUSE_COMMIT_SIZE + 999) // 1000 == PC_NETGAME_HOUSE_COMMIT_CHUNKS and (PC_NETGAME_HOUSE_IMG_SIZE + 999) // 1000 == PC_NETGAME_HOUSE_PUSH_CHUNKS
+assert PC_NETGAME_HOUSE_COMMIT_SIZE == PC_NETGAME_HOUSE_IMG_SIZE + PC_NETGAME_REC_SIZE
 
 class TxnSpec(MsgSpec):
     """MsgSpec of an X1 message whose 15-entry u16 pocket array (struct items 14..28) is collapsed into ONE tuple field."""
@@ -1619,7 +1659,7 @@ GAME_SPECS = {
               FRIENDSHIP_REQUEST_SPEC, FRIENDSHIP_UPDATE_SPEC, FRIENDSHIP_SNAPSHOT_ENTRY_SPEC, MAIL_REQUEST_SPEC,
               MAIL_DELIVERED_SPEC, BURY_REQUEST_SPEC, BURY_RESULT_SPEC, PLAYER_ACTION_SPEC, RECORD_HELLO_SPEC,
               RECORD_BEGIN_SPEC, RECORD_CHUNK_SPEC, RECORD_ACK_SPEC, TXN_COMMIT_SPEC, TXN_RESULT_SPEC, TOWN_SVC_STATE_SPEC,
-              MAILBOX_LETTER_SPEC, IDENTITY_EXT_SPEC, IDENTITY_TOKEN_SPEC)
+              MAILBOX_LETTER_SPEC, IDENTITY_EXT_SPEC, IDENTITY_TOKEN_SPEC, HOUSE_BEGIN_SPEC, HOUSE_CHUNK_SPEC, HOUSE_ACK_SPEC)
 }
 assert IDENTITY_SPEC.size == 32 and IDENTITY_ACK_SPEC.size == 32 and REJECT_TOWN_SPEC.size == 24
 assert FIELD_UPDATE_SPEC.size == 12 and PLAYER_CONTEXT_SPEC.size == 8 and SNAPSHOT_BEGIN_SPEC.size == 12
@@ -1972,6 +2012,17 @@ class FakeClient(TransportClient):
         self.rec_violations = []    # reassembly protocol problems seen on pushes
         self.rec_synced = False     # PUSH_FULL fully received (digest ok) or HELLO answered APPLIED (continuation)
         self.rec_migrate_epoch = None
+        self._reset_house_tracking()
+
+    def _reset_house_tracking(self):
+        """Furniture sync (per connection): the CANON_PUSH reassembly, the completed pushes, every HOUSE_ACK, the commit contexts."""
+        self.house_rx = None
+        self.house_pushes = []      # completed CANON_PUSHes this connection: dicts (house, seq, session, data, digest_ok, xfer, conn)
+        self.house_acks = []        # (conn, HouseAckFields) for EVERY HOUSE_ACK received
+        self.house_violations = []
+        self.house_xfer_counter = 0
+        self.house_base = {}        # house -> (host_session, seq): the canonical point this client holds (the last digest-ok push, or our own APPLIED commit)
+        self.house_inflight = {}    # xfer_id -> (house, image, record) of a commit awaiting its ACK
 
     def _reset_world_tracking(self):
         self.world = WorldView()  # what a correct client believes, per contract section 4
@@ -2365,6 +2416,120 @@ class FakeClient(TransportClient):
 
     def wait_record_synced(self, timeout=RECORD_SYNC_TIMEOUT_S):
         return self.hub.wait_until(lambda: self.rec_synced, timeout)
+
+    # --- Furniture sync (HOUSE_BEGIN / HOUSE_CHUNK / HOUSE_ACK, ids 59..61): the OWNER's commit and the host's CANON_PUSH, as a test double ----------------
+
+    def next_house_xfer_id(self):
+        self.house_xfer_counter += 1
+        return self.house_xfer_counter
+
+    def send_house_begin(self, kind, xfer_id, house, host_session, house_seq, rec_epoch, rec_rev, total_size, digest, chunk_count, rsv=0, rsv2=0):
+        return self.send_reliable(struct.pack(HOUSE_BEGIN_FMT, PC_NETGAME_MSG_HOUSE_BEGIN, kind, chunk_count, house, xfer_id & U32_MASK, host_session & U32_MASK,
+                                              house_seq & U32_MASK, rec_epoch & U32_MASK, rec_rev & U32_MASK, total_size, rsv, digest & U32_MASK, rsv2))
+
+    def send_house_chunk(self, chunk_idx, xfer_id, data, length=None, offset=None, rsv=0):
+        if offset is None:
+            offset = chunk_idx * PC_NETGAME_HOUSE_CHUNK_DATA
+        if length is None:
+            length = len(data[:PC_NETGAME_HOUSE_CHUNK_DATA])
+        body = bytes(data[:PC_NETGAME_HOUSE_CHUNK_DATA]).ljust(PC_NETGAME_HOUSE_CHUNK_DATA, b"\x00")
+        return self.send_reliable(struct.pack(HOUSE_CHUNK_FMT, PC_NETGAME_MSG_HOUSE_CHUNK, chunk_idx & 0xFF, length & 0xFFFF, xfer_id & U32_MASK,
+                                              offset & 0xFFFF, rsv & 0xFFFF, body))
+
+    def house_base_for(self, house):
+        """(host_session, seq) of the canonical copy of `house` this client holds: the newest push / own APPLIED commit, else (0, 0)."""
+        return self.house_base.get(house, (0, 0))
+
+    def commit_house(self, house, image, record=None, base=None, rec_base=None, xfer_id=None, digest=None, only_chunks=None, wait_gap=1.7, total_size=None,
+                     chunk_count=None, kind=PC_NETGAME_HOUSE_KIND_OWNER_COMMIT, rsv=0, rsv2=0, house_field=None):
+        """OWNER_COMMIT: house `image` (0x1A44 B) || `record` (0x2440 B BE; default rec_local = this client's local record) as ONE transfer. base = (host_session,
+        house_seq) the edit was built on (default: house_base_for(house)); rec_base = (epoch, rev) (default: rec_last's). `only_chunks` sends just those chunk
+        indexes (a partial transfer). `wait_gap` seconds are pumped first (the host's 1.5 s gap after an accepted upload / commit). Returns the xfer_id."""
+        if record is None:
+            record = self.rec_local if self.rec_local is not None else self.own_record()
+        payload = bytes(image) + bytes(record)
+        if xfer_id is None:
+            xfer_id = self.next_house_xfer_id()
+        else:
+            self.house_xfer_counter = max(self.house_xfer_counter, xfer_id)
+        if base is None:
+            base = self.house_base_for(house)
+        if rec_base is None:
+            rec_base = (self.rec_last[1], self.rec_last[2]) if self.rec_last else (0, 0)
+        if digest is None:
+            digest = fnv1a32(payload)
+        n = (len(payload) + PC_NETGAME_HOUSE_CHUNK_DATA - 1) // PC_NETGAME_HOUSE_CHUNK_DATA
+        if wait_gap:
+            pump_sleep(wait_gap)
+        self.house_inflight[xfer_id] = (house, bytes(image), bytes(record))
+        self.send_house_begin(kind, xfer_id, house if house_field is None else house_field, base[0], base[1], rec_base[0], rec_base[1],
+                              len(payload) if total_size is None else total_size, digest, n if chunk_count is None else chunk_count, rsv=rsv, rsv2=rsv2)
+        for i in range(n):
+            if only_chunks is not None and i not in only_chunks:
+                continue
+            self.send_house_chunk(i, xfer_id, payload[i * PC_NETGAME_HOUSE_CHUNK_DATA:(i + 1) * PC_NETGAME_HOUSE_CHUNK_DATA])
+        return xfer_id
+
+    def wait_house_ack(self, xfer_id=None, status=None, timeout=3.0):
+        """The first HOUSE_ACK of this connection (for `xfer_id`, with `status`) not yet consumed, or None. Not consumed from the inbox: look in house_acks."""
+        conn = self.connect_count
+        deadline = time.monotonic() + timeout
+        while True:
+            for c, g in self.house_acks:
+                if c == conn and (xfer_id is None or g.xfer_id == xfer_id) and (status is None or g.status == status):
+                    return g
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            self.hub.wait_until(lambda: any(c == conn and (xfer_id is None or g.xfer_id == xfer_id) and (status is None or g.status == status)
+                                            for c, g in self.house_acks), min(left, 0.25))
+
+    def wait_house_push(self, after=0, house=None, timeout=5.0, min_seq=None):
+        """Block until the (house-filtered) completed push count of this connection exceeds `after`; returns the newest matching push dict or None."""
+        def pushes():
+            return [p for p in self.house_pushes if p["conn"] == self.connect_count and (house is None or p["house"] == house)
+                    and (min_seq is None or p["seq"] >= min_seq)]
+        if not self.hub.wait_until(lambda: len(pushes()) > after, timeout):
+            return None
+        return pushes()[-1]
+
+    def house_pushes_of(self, house=None):
+        return [p for p in self.house_pushes if p["conn"] == self.connect_count and (house is None or p["house"] == house)]
+
+    def house_canon(self, house):
+        """The newest digest-ok CANON_PUSH image (bytes) of `house` on this connection, or None."""
+        ps = [p for p in self.house_pushes_of(house) if p["digest_ok"]]
+        return ps[-1]["data"] if ps else None
+
+    def _house_on_message(self, m):
+        t = m.msg_type
+        g = m.game
+        if g is None or m.conn != self.connect_count:
+            return
+        if t == PC_NETGAME_MSG_HOUSE_BEGIN:
+            self.house_rx = {"kind": g.kind, "xfer": g.xfer_id, "house": g.house, "session": g.host_session, "seq": g.house_seq, "digest": g.digest,
+                             "count": g.chunk_count, "total": g.total_size, "chunks": {}}
+        elif t == PC_NETGAME_MSG_HOUSE_CHUNK:
+            rx = self.house_rx
+            if rx is None or rx["xfer"] != g.xfer_id or g.chunk_idx >= rx["count"] or g.chunk_idx in rx["chunks"] or g.offset != g.chunk_idx * PC_NETGAME_HOUSE_CHUNK_DATA:
+                self.house_violations.append(("chunk", g.chunk_idx, g.xfer_id))
+                return
+            rx["chunks"][g.chunk_idx] = bytes(g.data[:g.length])
+            if len(rx["chunks"]) == rx["count"]:
+                data = b"".join(rx["chunks"][i] for i in range(rx["count"]))
+                push = dict(rx, data=data, digest_ok=(len(data) == rx["total"] == PC_NETGAME_HOUSE_IMG_SIZE and fnv1a32(data) == rx["digest"]), conn=m.conn)
+                self.house_rx = None
+                self.house_pushes.append(push)
+                if push["digest_ok"]:
+                    self.house_base[push["house"]] = (push["session"], push["seq"])
+        elif t == PC_NETGAME_MSG_HOUSE_ACK:
+            self.house_acks.append((m.conn, g))
+            ctx = self.house_inflight.pop(g.xfer_id, None)
+            if g.status == PC_NETGAME_HOUSE_ACK_APPLIED and ctx is not None:
+                h, image, record = ctx
+                self.house_base[h] = (g.host_session, g.house_seq)
+                self.rec_last = (g.host_session, g.epoch, g.rev)
+                self.rec_local = record
 
     def _record_on_message(self, m):
         t = m.msg_type
@@ -2782,6 +2947,8 @@ class FakeClient(TransportClient):
         if m.channel == CH_RELIABLE and m.msg_type in (PC_NETGAME_MSG_RECORD_BEGIN, PC_NETGAME_MSG_RECORD_CHUNK,
                                                        PC_NETGAME_MSG_RECORD_ACK):
             self._record_on_message(m)
+        if m.channel == CH_RELIABLE and m.msg_type in (PC_NETGAME_MSG_HOUSE_BEGIN, PC_NETGAME_MSG_HOUSE_CHUNK, PC_NETGAME_MSG_HOUSE_ACK):
+            self._house_on_message(m)
         if m.channel == CH_RELIABLE and m.msg_type in RESULT_SPECS:
             g = m.game
             if g is not None:
@@ -3661,6 +3828,151 @@ def record_from_gci(bin_or_path, idx):
             return f.read(_GCI_PRIVATE_STRIDE)
     o = _GCI_PRIVATE_BASE + idx * _GCI_PRIVATE_STRIDE
     return bytes(data[o:o + _GCI_PRIVATE_STRIDE])
+
+
+# --- Furniture sync: the canonical BE house image (0x1A44 B) -- test double of pcnetgame_house_export_be() / the host's validation (pc_net_game.c) ---
+# Save_t.homes[h] sits at 0x9CE8 + h * 0x26B0 of the Save_t (GCI offset 0x40 + 0x26000). Image = BE mHm_hs_c [0, 0x1A30) + [0x2678, 0x268C); the padding bytes (3 at the end of
+# every 0x8A8 floor, the 2 alignment bytes between goki and music_box) are zero in the host's export, so they are zeroed here too.
+HOUSE_COUNT = 4
+HOUSE_GCI_BASE = 0x40 + 0x26000 + 0x9CE8
+HOUSE_GCI_STRIDE = 0x26B0
+HOUSE_OFF_FLOORS = 0x38
+HOUSE_FLOOR_STRIDE = 0x8A8
+HOUSE_FLOOR_OWNER_BYTES = 0x8A5
+HOUSE_LAYER_STRIDE = 0x228
+HOUSE_OFF_MUSIC = 0x1A3C
+HOUSE_CELLS = 256
+HOUSE_EMPTY = 0x0000
+HOUSE_RSV_FE1F = 0xFE1F
+HOUSE_RSV_WALL_NO = 0xFFFE
+
+
+def house_normalize_image(img):
+    """A mutable copy of a house image with the padding bytes zeroed."""
+    b = bytearray(img)
+    for f in range(3):
+        o = HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE + HOUSE_FLOOR_OWNER_BYTES
+        b[o:o + 3] = b"\x00\x00\x00"
+    b[0x1A30 + 0xA:0x1A30 + 0xC] = b"\x00\x00"
+    return b
+
+
+def house_from_gci(bin_or_path, h):
+    """The canonical 0x1A44-byte house image of homes[h] read from GCI bytes, a GCI path, or a bin dir (-> its save/card_a GCI). Read-only; the LIVE bin dir is refused."""
+    data = bin_or_path
+    if not isinstance(data, (bytes, bytearray)):
+        path = str(bin_or_path)
+        norm = lambda q: os.path.normcase(os.path.realpath(os.path.abspath(q)))
+        if os.path.isdir(path):
+            path = os.path.join(path, SAVE_GCI_REL)
+        if norm(os.path.dirname(os.path.dirname(os.path.dirname(path)))) == norm(LIVE_GAME_BIN_DIR):
+            raise LookupError("house_from_gci: refusing to read the LIVE bin dir's save")
+        with open(path, "rb") as f:
+            f.seek(HOUSE_GCI_BASE + h * HOUSE_GCI_STRIDE)
+            raw = f.read(HOUSE_GCI_STRIDE)
+    else:
+        o = HOUSE_GCI_BASE + h * HOUSE_GCI_STRIDE
+        raw = bytes(data[o:o + HOUSE_GCI_STRIDE])
+    return bytes(house_normalize_image(raw[:0x1A30] + raw[0x2678:0x268C]))
+
+
+def house_owner_pid(img):
+    """(player_name bytes, player_id, land_id) of the house image's ownerID (PersonalID_c: name[8], land name[8], BE u16 player_id, BE u16 land_id)."""
+    pid, land = struct.unpack(">HH", bytes(img[16:20]))
+    return bytes(img[0:8]), pid, land
+
+
+def house_cell(img, f, l, c):
+    o = HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE + l * HOUSE_LAYER_STRIDE + 2 * c
+    return struct.unpack(">H", bytes(img[o:o + 2]))[0]
+
+
+def house_set_cell(img, f, l, c, v):
+    """A NEW bytes image with cell (floor f, layer l, cell c) = v."""
+    b = bytearray(img)
+    o = HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE + l * HOUSE_LAYER_STRIDE + 2 * c
+    b[o:o + 2] = struct.pack(">H", v & 0xFFFF)
+    return bytes(b)
+
+
+def house_wall_floor(img, f):
+    """(flooring_idx, wallpaper_idx) of floor f."""
+    o = HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE + 0x8A0
+    return img[o], img[o + 1]
+
+
+def house_set_wall_floor(img, f, flooring_idx, wallpaper_idx):
+    b = bytearray(img)
+    o = HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE + 0x8A0
+    b[o] = flooring_idx
+    b[o + 1] = wallpaper_idx
+    return bytes(b)
+
+
+def house_owner_digest(img):
+    """FNV-1a32 of the OWNER-WRITABLE bytes of an image (the dirty test of the real client: floors incl. wall_floor, music_box)."""
+    chunks = [bytes(img[HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE:HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE + HOUSE_FLOOR_OWNER_BYTES]) for f in range(3)]
+    chunks.append(bytes(img[HOUSE_OFF_MUSIC:HOUSE_OFF_MUSIC + 8]))
+    return fnv1a32(b"".join(chunks))
+
+
+def house_cells(img):
+    """{(floor, layer, cell): value} of every non-empty cell."""
+    out = {}
+    for f in range(3):
+        for l in range(4):
+            o = HOUSE_OFF_FLOORS + f * HOUSE_FLOOR_STRIDE + l * HOUSE_LAYER_STRIDE
+            for c in range(HOUSE_CELLS):
+                v = struct.unpack(">H", bytes(img[o + 2 * c:o + 2 * c + 2]))[0]
+                if v:
+                    out[(f, l, c)] = v
+    return out
+
+
+def house_item_class(v):
+    """Python double of the host's normalisation N for the PLAIN ids the tests use (ITEM1 0x2000.. as itself, furniture 0x1000-0x1FFF / 0x3000-0x3FFF as the
+    rotation-free id); None for EMPTY / reserved / structural. (The host also maps mannequin / insect / fish / balloon ... furniture to their item1 and
+    skips my-design furniture; the tests never use those ids.)"""
+    t = v >> 12
+    if v == 0:
+        return None
+    if t in (1, 3):
+        return v & ~3
+    if t == 2:
+        return 0x2F00 if 0x2F00 <= v < 0x2F04 else v
+    return None
+
+
+def house_class_counts(img, record):
+    """Counter of item classes over house image + the 15 pockets + the gifts of the used letters of the record (BE record image)."""
+    from collections import Counter
+    c = Counter()
+    for v in house_cells(img).values():
+        k = house_item_class(v)
+        if k is not None:
+            c[k] += 1
+    for f in range(3):
+        fl, wl = house_wall_floor(img, f)
+        if fl < 67:
+            c[0x2600 + fl] += 1
+        if wl < 67:
+            c[0x2700 + wl] += 1   # ITM_WALL_START 0x2700 (include/m_name_table.h; ITM_CARPET_START 0x2600): asserted by test_house_sync_src.py
+    for n in range(55):
+        w = struct.unpack(">I", bytes(img[HOUSE_OFF_MUSIC + 4 * ((n // 32) & 1):HOUSE_OFF_MUSIC + 4 * ((n // 32) & 1) + 4]))[0]
+        if (w >> (n & 31)) & 1:
+            c[0x2A00 + n] += 1
+    pockets, _conds, _wallet = record_inventory(record)
+    for v in pockets:
+        k = house_item_class(v)
+        if k is not None:
+            c[k] += 1
+    for i in range(REC_MAIL_COUNT):
+        m = record_mail(record, i)
+        if m[0x2E] != MAIL_FONT_UNUSED:
+            k = house_item_class(struct.unpack(">H", bytes(m[0x2C:0x2E]))[0])
+            if k is not None:
+                c[k] += 1
+    return c
 
 
 TxnSent = namedtuple("TxnSent", "raw seq nonce")
