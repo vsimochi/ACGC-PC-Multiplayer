@@ -156,7 +156,7 @@ def main():
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
               "pcnetgame_house_handle_begin", "pcnetgame_house_process_commit",  # furniture sync: guest slot -> NOT_OWNER before the first subscript (test_house_sync_src.py)
               "pcnetgame_mail_test_poke_museum", "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mail_test_seed_reply", "pcnetgame_mbox_refresh_resident",
-              "pcnetgame_mbox_send", "pcnetgame_rec_gate", "pcnetgame_rec_priv_ptr", "pcnetgame_rec_resolve_slot", "pcnetgame_rec_slot", "pcnetgame_rec_store_build"]
+              "pcnetgame_mbox_send", "pcnetgame_members_prune_orphans", "pcnetgame_rec_gate", "pcnetgame_rec_priv_ptr", "pcnetgame_rec_resolve_slot", "pcnetgame_rec_slot", "pcnetgame_rec_store_build"]
     users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(private_data\)\[", c[a:b])})
     pinned = sorted(pinned)
     ck("A the functions that subscript Save_Get(private_data)[...] are exactly the %d reviewed ones (a new one needs a guest-safety review): %s" % (len(pinned), users),

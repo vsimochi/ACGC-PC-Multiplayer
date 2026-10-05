@@ -71,6 +71,10 @@ void VIWaitForRetrace(void) {
      * (a pure PC-layer function, called unconditionally every frame regardless of game state --
      * menus, loading, gameplay) rather than in any decomp game-loop file. */
     pc_net_game_poll();
+    {
+        extern void pc_main_relaunch_poll(void); /* M-I: promoted guest -> automatic relaunch (--town-fetch clients only) */
+        pc_main_relaunch_poll();
+    }
 
     /* --dedicated only: drain the stdin command queue and run the console commands (help/status/players/save/stop) on THIS thread, right next to the
      * network poll. A console `save` only sets a flag that the save block below consumes, so every save gate applies. */

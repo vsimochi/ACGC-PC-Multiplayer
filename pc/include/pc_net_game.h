@@ -1157,6 +1157,10 @@ int pc_net_game_host_remote_player_in_acre(int bx, int bz);
 
 /* Batch A (A3): 1 iff the CLIENT "not connected" notice should be drawn this frame (role CLIENT, local world loaded, link not READY for > 3 s). */
 int pc_net_game_client_notice_visible(void);
+/* M-I: guest -> resident promotion finished on this client (a store character): 1 once, character UUID copied; pc_main relaunches with --town-fetch. */
+int pc_net_game_client_take_relaunch(char* uuid_out, size_t cap);
+void pc_net_game_client_relaunch_failed(const char* err);
+int pc_net_game_client_holds_guest_token(const void* home_pid_as_PersonalID_c); /* M-I: a known guest of the loaded town (token.dat entry) */
 
 /* Client auto-reconnect UI status: 0 nothing, 1 reconnecting (*attempt = attempt number shown, *next_s = seconds to the next try), 2 just reconnected (3 s),
  * 3 gave up after a permanent refusal (persistent). Either pointer may be NULL. Always 0 for host / solo. */

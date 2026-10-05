@@ -1558,8 +1558,11 @@ static int pc_guest_resident_name_conflict(const PersonalID_c* home) {
  *   mHS_set_use(slot, house)             swaps house_arrangement and sets homes[house].ownerID through mHm_InitHomeInfo (the house must have a null owner: vanilla
  *                                        deletion mHm_ClearHomeInfo's it, so a null-owner house is a clean default house)
  *   mEv_ClearPersonalEventFlag(slot)     the veteran state of the slot: NO first-job / first-intro (the Nook intro is never started for a promoted resident)
- * NOT done (documented limits): the catalog / collected bits of the intro (shirt, cassette, carpet, wall), the first-job quest, mCkRh roach data (the house is already a
- * default house). One snapshot is kept so the caller can roll the whole change back when the save cannot be written. Returns 1 or 0 with err. */
+ *   birthday (M-I)                       copied from the guest record when it is a plausible date
+ *   catalog bits (M-I)                   the four mPr_SetItemCollectBit calls of the intro demo (worn shirt, FTR_SUM_CASSE01, the house's carpet and wallpaper)
+ *   villager memories (M-I)              memory_player_id == the guest's home PID -> the new PID (+ host land / tune for town villagers; the islander's union is left alone)
+ * NOT done (documented limits): the first-job quest and the Nook intro (host-owned Save state with no client -> host path), mCkRh roach data (the house is already a
+ * default house), fish records and mail held for the guest PID. One snapshot (resident, house, event flags, animals[], island animal) is kept so the caller can roll the whole change back when the save cannot be written. Returns 1 or 0 with err. */
 static struct {
     int      valid;
     int      slot;
@@ -1569,11 +1572,15 @@ static struct {
     u32      arrangement;
     u32      ev_save_flags;
     u32      ev_common_flags;
+    Animal_c animals[ANIMAL_NUM_MAX]; /* M-I: villager memories re-keyed to the new PID (rolled back when the save fails) */
+    Animal_c island_animal;
 } s_pc_promote_snap;
 
 void pc_mp_promote_rollback(void);
-int pc_mp_promote_create(const void* guest_rec, int slot, int house, char* err, size_t cap) {
+int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot, int house, char* err, size_t cap) {
     const Private_c* g = (const Private_c*)guest_rec;
+    PersonalID_c* gkey = (PersonalID_c*)guest_key; /* the guest's home PersonalID = bound_pid = memory_player_id of its villager memories */
+    int remapped = 0;
     Private_c* priv;
     mHm_hs_c* home;
     int i, face_ok = 1;
@@ -1620,6 +1627,8 @@ int pc_mp_promote_create(const void* guest_rec, int slot, int house, char* err, 
     s_pc_promote_snap.arrangement = (u32)Save_Get(house_arrangement);
     s_pc_promote_snap.ev_save_flags = (u32)Save_Get(event_save_data).flags;
     s_pc_promote_snap.ev_common_flags = (u32)Common_Get(event_flags[mEv_SAVED_EVENT]);
+    memcpy(s_pc_promote_snap.animals, Save_Get(animals), sizeof(s_pc_promote_snap.animals));
+    s_pc_promote_snap.island_animal = Save_Get(island).animal;
 
     mPr_ClearPrivateInfo(priv);
     mPr_InitPrivateInfo(priv);
@@ -1653,9 +1662,54 @@ int pc_mp_promote_create(const void* guest_rec, int slot, int house, char* err, 
         PC_PROMOTE_FAIL("mHS_set_use(%d, %d) did not give the house to the new resident (everything was rolled back)", slot, house);
     }
     mEv_ClearPersonalEventFlag(slot);
-    printf("[PC] M-F promote: resident slot %d created for '%.8s' (gender %d, face %d%s, player id 0x%04X), house %d assigned (arrangement 0x%02X), loan %u, pockets/wallet/bank carried over\n",
+
+    /* M-I: the birthday (vanilla's intro asks it; a guest record carries it). Only a plausible date is copied, else the vanilla cleared value stays. */
+    if (g->birthday.month >= 1 && g->birthday.month <= 12 && g->birthday.day >= 1 && g->birthday.day <= 31) {
+        priv->birthday = g->birthday;
+    }
+    /* M-I: the catalog bits vanilla's intro demo sets right after mHS_set_use (ac_intro_demo_move.c_inc aID_retire_rcn_guide_wait): the worn shirt, the casette
+     * furniture, the carpet and the wallpaper of the assigned house. mPr_SetItemCollectBit writes Common now_private, so it is pointed at the new resident for these
+     * calls only (game thread, restored right after). The indices come from the house just assigned; out-of-range ones (the bitfields hold 96 carpets / walls) are skipped. */
+    {
+        Private_c* prev_now = Common_Get(now_private);
+        const int fl = (int)home->floors[0].wall_floor.flooring_idx, wp = (int)home->floors[0].wall_floor.wallpaper_idx;
+        Common_Set(now_private, priv);
+        mPr_SetItemCollectBit(priv->cloth.item);
+        mPr_SetItemCollectBit(FTR_START(FTR_SUM_CASSE01));
+        if (fl >= 0 && fl < 96) {
+            mPr_SetItemCollectBit(ITM_CARPET_START + fl);
+        }
+        if (wp >= 0 && wp < 96) {
+            mPr_SetItemCollectBit(ITM_WALL_START + wp);
+        }
+        Common_Set(now_private, prev_now);
+    }
+
+    /* M-I: villager memories the guest made (the host resolves FRIENDSHIP_REQUEST from the guest's home PID) are re-keyed to the new PID, like the memory a resident
+     * gets from mNpc_SetAnimalLastTalk: the land becomes this town and the tune the town melody. The ISLANDER's memuni is a different union member (the furniture bitfield):
+     * only its player id is re-keyed. NOT re-keyed: fish records, mail held for the guest PID. */
+    if (gkey != NULL && mPr_NullCheckPersonalID(gkey) == FALSE) {
+        int a, m;
+        for (a = 0; a < ANIMAL_NUM_MAX + 1; a++) {
+            Animal_c* an = a < ANIMAL_NUM_MAX ? Save_GetPointer(animals[a]) : Save_GetPointer(island.animal);
+            const int is_island = a >= ANIMAL_NUM_MAX;
+            for (m = 0; m < ANIMAL_MEMORY_NUM; m++) {
+                Anmmem_c* mem = &an->memories[m];
+                if (mPr_NullCheckPersonalID(&mem->memory_player_id) == FALSE && mPr_CheckCmpPersonalID(&mem->memory_player_id, gkey) == TRUE) {
+                    mPr_CopyPersonalID(&mem->memory_player_id, &priv->player_ID);
+                    if (!is_island) {
+                        mLd_CopyLandName(mem->memuni.land.name, Save_Get(land_info).name);
+                        mem->memuni.land.id = Save_Get(land_info).id;
+                        mem->saved_town_tune = Save_Get(melody);
+                    }
+                    remapped++;
+                }
+            }
+        }
+    }
+    printf("[PC] M-F promote: resident slot %d created for '%.8s' (gender %d, face %d%s, player id 0x%04X), house %d assigned (arrangement 0x%02X), loan %u, pockets/wallet/bank carried over, %d villager memories re-keyed\n",
            slot, (const char*)priv->player_ID.player_name, (int)priv->gender, (int)priv->face, face_ok ? "" : " (the guest's face is worn by another resident: vanilla unique face kept)",
-           (unsigned)priv->player_ID.player_id, house, (unsigned)Save_Get(house_arrangement), (unsigned)priv->inventory.loan);
+           (unsigned)priv->player_ID.player_id, house, (unsigned)Save_Get(house_arrangement), (unsigned)priv->inventory.loan, remapped);
 #undef PC_PROMOTE_FAIL
     return 1;
 }
@@ -1670,6 +1724,8 @@ void pc_mp_promote_rollback(void) {
     Save_Set(house_arrangement, s_pc_promote_snap.arrangement);
     Save_Get(event_save_data).flags = s_pc_promote_snap.ev_save_flags;
     Common_Set(event_flags[mEv_SAVED_EVENT], s_pc_promote_snap.ev_common_flags);
+    memcpy(Save_Get(animals), s_pc_promote_snap.animals, sizeof(s_pc_promote_snap.animals));
+    Save_Get(island).animal = s_pc_promote_snap.island_animal;
     memset(&s_pc_promote_snap, 0, sizeof(s_pc_promote_snap));
     printf("[PC] M-F promote: the in-memory change was ROLLED BACK\n");
 }
@@ -1780,6 +1836,14 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
     }
     /* creation: `home`'s name is only a placeholder (the player types the real one in the Rover scene, checked there and again in the finish) */
     clash = create ? -1 : pc_guest_resident_name_conflict(&home);
+    if (clash >= 0 && pc_net_game_client_holds_guest_token(&home)) {
+        /* M-I: this character already holds a GUEST token of this town, so the resident with its name is most likely the host's promotion of it (the town was just
+         * re-fetched). Arrive anyway: the guest claim goes out and the host decides (RESIDENT_HANDOFF + REJECT 6 PROMOTED, or a refusal, never an admission of a
+         * second "Roger"). */
+        OSReport("[PC] %s: the guest name '%.8s' equals resident %d of this town, but this character holds a guest token of it: arriving so the host can confirm the promotion\n",
+                 tag, (const char*)home.player_name, clash);
+        clash = -1;
+    }
     if (clash >= 0) {
         snprintf(err, errcap, "REFUSED: the guest name '%.8s' equals the name of resident %d of this town (a guest must have its own name)",
                  (const char*)home.player_name, clash);

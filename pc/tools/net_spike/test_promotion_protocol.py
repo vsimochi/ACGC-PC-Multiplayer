@@ -68,6 +68,64 @@ if __name__ == "__main__":
 import net_spike_lib as L  # noqa: E402
 
 IP = "127.0.0.1"
+ANIMALS_OFF = MF.MAIN_OFF + 0x17438          # Save_t.animals[15], stride 0x988 (memories[7] at +0x10, stride 0x138)
+ANIMAL_STRIDE, MEM_OFF, MEM_STRIDE = 0x988, 0x10, 0x138
+ISLAND_ANIMAL_OFF = MF.MAIN_OFF + 0x22540 + 0xF00  # Save_t.island.animal
+MELODY_OFF = MF.MAIN_OFF + 0x20F08            # u64 BE, the town tune
+REC_OFF_BIRTHDAY = 0x10A4
+REC_OFF_FURN_BITS, REC_OFF_WALL_BITS, REC_OFF_CARPET_BITS = 0x1108, 0x11B4, 0x11C0
+SEED_TUNE = 0x1122334455667788
+
+
+def patch_gci(dest, fn):
+    """Rewrites the main Save_t of the DISPOSABLE copy through fn(bytearray gci) and recomputes the checksum + backup copy like the game's writer."""
+    p = os.path.join(dest, MF.GCI_REL)
+    g = bytearray(open(p, "rb").read())
+    fn(g)
+    m = bytearray(g[MF.MAIN_OFF:MF.MAIN_OFF + MF.SAVE_T_SIZE])
+    m[MF.CHK_OFF:MF.CHK_OFF + 2] = struct.pack(">H", MF.checksum(bytes(m)))
+    g[MF.MAIN_OFF:MF.MAIN_OFF + MF.SAVE_T_SIZE] = m
+    g[MF.BACK_OFF:MF.BACK_OFF + MF.SAVE_SECTOR_SIZE] = g[MF.MAIN_OFF:MF.MAIN_OFF + MF.SAVE_SECTOR_SIZE]
+    open(p, "wb").write(bytes(g))
+
+
+def mem_off(animal_base, k):
+    return animal_base + MEM_OFF + k * MEM_STRIDE
+
+
+def free_mem_slots(g, animal_base):
+    return [k for k in range(7) if bytes(g[mem_off(animal_base, k) + 16:mem_off(animal_base, k) + 20]) == bytes([255, 255, 255, 255])]
+
+
+def seed_memories(dest, pid_a, pid_b):
+    """Seeds villager memories in the disposable GCI: the guest A's (town villagers 0 and 1: land OLDTOWN, id 0x1234, a marker tune), guest B's (villager 0, must stay untouched) and A's on the
+    ISLANDER (the memuni union holds the furniture bitfield there: must stay untouched). Returns {name: (offset, 0x138 seeded bytes)}."""
+    out = {}
+
+    def fn(g):
+        def put(name, base, k, pid, land, lid, tune, island=False):
+            o = mem_off(base, k)
+            g[o:o + 20] = pid
+            if island:
+                g[o + 0x1C:o + 0x20] = struct.pack(">I", 0xAABBCCDD)
+                g[o + 0x20:o + 0x22] = struct.pack(">H", 0x0123)
+            else:
+                g[o + 0x1C:o + 0x24] = land
+                g[o + 0x24:o + 0x26] = struct.pack(">H", lid)
+            g[o + 0x28:o + 0x30] = struct.pack(">Q", tune)
+            g[o + 0x30] = 5  # friendship
+            out[name] = (o, bytes(g[o:o + MEM_STRIDE]))
+        b0 = ANIMALS_OFF
+        b1 = ANIMALS_OFF + ANIMAL_STRIDE
+        f0, f1, fi = free_mem_slots(g, b0), free_mem_slots(g, b1), free_mem_slots(g, ISLAND_ANIMAL_OFF)
+        assert len(f0) >= 2 and len(f1) >= 1 and len(fi) >= 1, (f0, f1, fi)
+        put("a0", b0, f0[0], pid_a, b"OLDTOWN ", 0x1234, SEED_TUNE)
+        put("b0", b0, f0[1], pid_b, b"BTOWN   ", 0x4321, SEED_TUNE + 1)
+        put("a1", b1, f1[0], pid_a, b"OLDTOWN ", 0x1234, SEED_TUNE)
+        put("isl", ISLAND_ANIMAL_OFF, fi[0], pid_a, None, 0, SEED_TUNE + 2, island=True)
+    patch_gci(dest, fn)
+    return out
+
 MBR_SIZE = 32 + 16 * 80 + 4
 GST_ENTRY = 72 + 0x2440
 GST_SIZE = 32 + 8 * GST_ENTRY + 4
@@ -326,6 +384,42 @@ def source_audit(rig):
        and "restart to join as a resident" in ng and "legacy guest profile: the token / membership files are NOT rewritten" in ng)
 
 
+def source_audit_mi(rig):
+    """M-I source audit: re-keyed memories + rollback of the animals, the orphan prune, the automatic relaunch wiring."""
+    ck = rig.ck
+    ng = open(os.path.join(T.PC, "src", "pc_net_game.c"), encoding="utf-8", errors="replace").read()
+    mc = open(os.path.join(T.PC, "src", "pc_m_card.c"), encoding="utf-8", errors="replace").read()
+    mm = open(os.path.join(T.PC, "src", "pc_main.c"), encoding="utf-8", errors="replace").read()
+    rl = open(os.path.join(T.PC, "src", "pc_relaunch.c"), encoding="utf-8", errors="replace").read()
+    vi = open(os.path.join(T.PC, "src", "pc_vi.c"), encoding="utf-8", errors="replace").read()
+    cr = mc[mc.index("int pc_mp_promote_create("):mc.index("void pc_mp_promote_rollback(void) {")]
+    rb = mc[mc.index("void pc_mp_promote_rollback(void) {"):mc.index("void pc_mp_promote_commit(void) {")]
+    ck("S M-I: the snapshot (incl. animals[] and the island animal) is taken BEFORE anything is modified; the rollback restores both; the memories are re-keyed BEFORE the caller's save",
+       cr.index("s_pc_promote_snap.animals") < cr.index("mPr_ClearPrivateInfo(priv);") and "Save_Get(animals), s_pc_promote_snap.animals" in rb and "Save_Get(island).animal = s_pc_promote_snap.island_animal" in rb
+       and "mPr_CopyPersonalID(&mem->memory_player_id, &priv->player_ID)" in cr)
+    ck("S M-I: the islander's memuni is NOT overwritten (the land / tune write is guarded by !is_island); mPr_SetItemCollectBit runs with now_private pointed at the new resident and restored",
+       "if (!is_island) {" in cr and "Common_Set(now_private, priv);" in cr and "Common_Set(now_private, prev_now);" in cr and "mPr_SetItemCollectBit(FTR_START(FTR_SUM_CASSE01));" in cr)
+    pf = ng[ng.index("int pc_net_game_dedicated_promote("):ng.index("/* ===== M-F END ===== */")]
+    ck("S M-I: orphaned RESIDENT_TOKEN / PROMOTION_HANDOFF entries of this town are pruned (room check on a copy, persisted with the step-3 members.dat write)",
+       "pcnetgame_members_prune_orphans(&nf)" in pf and pf.count("pcnetgame_members_prune_orphans(&nf)") == 2)
+    hh = ng[ng.index("static void pcnetgame_handle_client_resident_handoff("):ng.index("static void pcnetgame_reject_text(")]
+    ck("S M-I client: the relaunch flag is set only AFTER membership.ini was written (store character); REJECT 6 turns it into a pending request; take_relaunch is one-shot",
+       hh.index("pc_character_membership_write(") < hh.index("s_client_promote_relaunch = 1;") and "in.reason == (uint8_t)PC_NETGAME_REJECT_PROMOTED && s_client_promote_relaunch" in ng
+       and "s_client_relaunch_ready = 0;" in ng[ng.index("int pc_net_game_client_take_relaunch("):])
+    po = mm[mm.index("void pc_main_relaunch_poll(void) {"):]
+    po = po[:po.index("\n}\n")]
+    ck("S M-I pc_main: only a --town-fetch process relaunches; g_pc_running = 0 ONLY after pc_relaunch_connect succeeded; failure shows a message; polled from pc_vi.c every frame",
+       "if (!g_pc_town_fetch)" in po and po.index("pc_relaunch_connect(") < po.index("g_pc_running = 0;") and "pc_net_game_client_relaunch_failed(err)" in po
+       and "pc_main_relaunch_poll();" in vi and "PC_RELAUNCH_CHARACTER" in po)
+    ar = mc[mc.index("static int pc_guest_arrive("):]
+    ar = ar[:ar.index("pc_guest_build_fresh_record(pass")]
+    ck("S M-I pc_guest_arrive: a name clash with a resident is still REFUSED unless this character holds a guest token of the town (the promoted guest's re-fetched town); the guard sits before the refusal",
+       "clash >= 0 && pc_net_game_client_holds_guest_token(&home)" in ar and ar.index("pc_net_game_client_holds_guest_token(&home)") < ar.index("REFUSED: the guest name")
+       and "mPr_NullCheckPersonalID" not in ar[ar.index("pc_net_game_client_holds_guest_token"):ar.index("REFUSED: the guest name")])
+    ck("S M-I pc_relaunch: AC_RELAUNCH_DRYRUN logs the command line and returns 0 (the caller does not quit), before any CreateProcess", 
+       "AC_RELAUNCH_DRYRUN" in rl and rl.index("AC_RELAUNCH_DRYRUN") < rl.index("CreateProcessA"))
+
+
 def phase0(rig, args, ctx):
     ck = rig.ck
     h, ok = rig.start("p0", args.port - 1)
@@ -353,8 +447,11 @@ def phase0(rig, args, ctx):
         struct.pack_into(">H", rec, L.REC_OFF_POCKETS, 0x2200)
         struct.pack_into(">I", rec, L.REC_OFF_WALLET, 1234)
         struct.pack_into(">I", rec, L.REC_OFF_BANK, 5678)
-    ck("P0 A's stored record patched (pocket 0x2200, wallet 1234, bank 5678)", patch_guest_record(mpath("guests.dat"), L.guest_pid_be(gA), goods)
+        struct.pack_into(">HBB", rec, REC_OFF_BIRTHDAY, 2000, 5, 17)
+    ck("P0 A's stored record patched (pocket 0x2200, wallet 1234, bank 5678, birthday 5/17)", patch_guest_record(mpath("guests.dat"), L.guest_pid_be(gA), goods)
        and parse_guests(mpath("guests.dat")) is not None)
+    ctx["seeds"] = seed_memories(L.GAME_BIN_DIR, L.guest_pid_be(gA), L.guest_pid_be(gB))
+    ck("P0 villager memories seeded in the DISPOSABLE GCI (guest A on villagers 0 and 1 and on the islander, guest B on villager 0)", len(ctx["seeds"]) == 4)
 
 
 def phase1(rig, args, ctx):
@@ -472,6 +569,27 @@ def phase1(rig, args, ctx):
        and struct.unpack(">I", p3[L.REC_OFF_LOAN:L.REC_OFF_LOAN + 4])[0] == 17400 and struct.unpack(">I", p3[L.REC_OFF_RESET_CODE:L.REC_OFF_RESET_CODE + 4])[0] == 0)
     ck("P1 GCI: vanilla new-player defaults (design order table 0..7, no letters: every mail slot unused)", list(p3[L.REC_OFF_ORG_TABLE:L.REC_OFF_ORG_TABLE + 8]) == list(range(8))
        and all(p3[L.REC_OFF_MAIL + i * L.REC_MAIL_SIZE + 0x2E] == L.MAIL_FONT_UNUSED for i in range(L.REC_MAIL_COUNT)))
+    ck("P1 GCI: the birthday was copied from the guest record (5/17), the intro's catalog bits are set (carpet 1, wallpaper 1, furniture >= 1: shirt / cassette)",
+       p3[REC_OFF_BIRTHDAY + 2:REC_OFF_BIRTHDAY + 4] == bytes([5, 17]) and
+       sum(bin(x).count("1") for x in struct.unpack(">3I", p3[REC_OFF_WALL_BITS:REC_OFF_WALL_BITS + 12])) == 1 and
+       sum(bin(x).count("1") for x in struct.unpack(">3I", p3[REC_OFF_CARPET_BITS:REC_OFF_CARPET_BITS + 12])) == 1 and
+       sum(bin(x).count("1") for x in struct.unpack(">43I", p3[REC_OFF_FURN_BITS:REC_OFF_FURN_BITS + 172])) >= 1)
+    melody = bytes(gci[MELODY_OFF:MELODY_OFF + 8])
+    seeds = ctx.get("seeds", {})
+    ok_mem = len(seeds) == 4 and npid is not None
+    for name in ("a0", "a1"):
+        if name in seeds:
+            o, was = seeds[name]
+            now = bytes(gci[o:o + MEM_STRIDE])
+            ok_mem = ok_mem and now[0:20] == npid and now[0x1C:0x24] == ctx["land"] and now[0x24:0x26] == struct.pack(">H", ctx["land_id"]) and now[0x28:0x30] == melody and now[0x14:0x1C] == was[0x14:0x1C] and now[0x30:] == was[0x30:]
+    ck("P1 GCI: the guest's villager memories (villagers 0 and 1) now carry the NEW PID, the host land name / id and the town melody; last-talk time, friendship and letter are untouched", ok_mem)
+    if "b0" in seeds:
+        o, was = seeds["b0"]
+        ck("P1 GCI: another guest's memory on villager 0 is byte-identical (not re-keyed)", bytes(gci[o:o + MEM_STRIDE]) == was)
+    if "isl" in seeds:
+        o, was = seeds["isl"]
+        now = bytes(gci[o:o + MEM_STRIDE])
+        ck("P1 GCI: the ISLANDER's memory is re-keyed to the new PID but its memuni (furniture bitfield) and tune are untouched", npid is not None and now[0:20] == npid and now[20:] == was[20:])
     h3 = gci_home(gci, 3)
     ck("P1 GCI: house 3 ownerID = the new resident, and nothing else of the house changed", npid is not None and h3[0:20] == npid and h3[20:] == gci_home(orig, 3)[20:])
     # the mailbox tail (offset >= 0x1A30) of a house is host RUNTIME state (the game delivers letters: observed on the host's own house 0 in the first run); everything before it is compared
@@ -572,6 +690,7 @@ def run(args, results):
     ctx.update(gA=gA, gB=gB, recA=recA, recB=bytes(L.fresh_guest_record_for(gB)))
     shutil.rmtree(mp_dir(), ignore_errors=True)  # the disposable fixture only
     source_audit(rig)
+    source_audit_mi(rig)
     for name, fn in (("P0", phase0), ("P1", phase1), ("P2", phase2), ("P3", phase3)):
         try:
             fn(rig, args, ctx)

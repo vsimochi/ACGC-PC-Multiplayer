@@ -649,6 +649,29 @@ static int pc_town_failure_box(const char* msg, int offline) {
     return hit;
 }
 
+/* M-I: polled every frame (pc_vi.c). A --town-fetch client whose guest was promoted (handoff stored + REJECT 6) restarts itself as
+ * `--connect HOST:PORT --town-fetch --character UUID`: the new process fetches the town that now contains the resident and joins as it. g_pc_running is cleared ONLY
+ * after the new process exists. A CLI client without --town-fetch (local town = card_a, which lacks the resident) only keeps the message. AC_RELAUNCH_DRYRUN=1 logs the
+ * command line and keeps running. Consumed once, so it cannot loop (a resident process sends no guest claim and never gets a handoff). */
+void pc_main_relaunch_poll(void) {
+    char uuid[64], err[200];
+    if (!pc_net_game_client_take_relaunch(uuid, sizeof(uuid))) {
+        return;
+    }
+    if (!g_pc_town_fetch) {
+        printf("[PC] M-I: promoted; this client was not started with --town-fetch: no automatic relaunch (restart it with --town-fetch / Play Online)\n");
+        return;
+    }
+    err[0] = '\0';
+    if (pc_relaunch_connect(g_pc_net_host_ip, (int)g_pc_net_port, PC_RELAUNCH_CHARACTER, uuid, err, sizeof(err))) {
+        printf("[PC] M-I: promoted: relaunched as the resident (new process started), quitting this one\n");
+        g_pc_running = 0;
+    } else if (getenv("AC_RELAUNCH_DRYRUN") == NULL) {
+        printf("[PC] M-I: promoted: relaunch FAILED: %s\n", err);
+        pc_net_game_client_relaunch_failed(err);
+    }
+}
+
 /* M-C: after the pre-boot fetch the town directory (save/mp/towns/<townkey>) is known. A STORE character with a RESIDENT membership of that town plays its resident
  * (session join kind RESIDENT, the guest arrival is disarmed, the slot is bound by PersonalID once the save is loaded); a guest membership / none keeps the guest
  * arrival (an existing character) or the Rover first-run creation (a new one). No town dir (legacy fallback) = no key = guest. */

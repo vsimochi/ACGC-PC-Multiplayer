@@ -3,6 +3,7 @@
 #include "pc_servers.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -75,6 +76,12 @@ int pc_relaunch_connect(const char* host, int port, int kind, const char* name, 
     char args[320];
     if (!pc_relaunch_build_args(host, port, kind, name, args, sizeof(args))) {
         snprintf(err, errcap, "cannot build the connect command line");
+        return 0;
+    }
+    if (getenv("AC_RELAUNCH_DRYRUN") != NULL) { /* M-I test hook: log the exact command line, start nothing (the caller must not quit) */
+        printf("[PC] RELAUNCH DRYRUN: <this executable> %s\n", args);
+        fflush(stdout);
+        snprintf(err, errcap, "dry run");
         return 0;
     }
 #ifdef _WIN32
