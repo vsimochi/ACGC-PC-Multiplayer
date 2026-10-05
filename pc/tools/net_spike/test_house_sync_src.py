@@ -77,9 +77,9 @@ def main():
        "void pc_save_bswap_home(mHm_hs_c* home, pc_bswap_dir_t dir);" in bsw_h and re.search(r"void pc_save_bswap_home\(mHm_hs_c\* home, pc_bswap_dir_t dir\) \{\s*swap_mHm_hs\(home, dir\);", bsw_c))
     bld = func_body(c, "pcnetgame_ts_build")
     val = func_body(c, "pcnetgame_ts_valid_hostcfg_blob")
-    ck("W HOST_CONFIG: byte 1 bit 0 = house sync built from g_pc_house_sync; the validator accepts only that bit (other bits of byte 1 and bytes 2..7 must be zero)",
+    ck("W HOST_CONFIG: byte 1 bit 0 = house sync built from g_pc_house_sync; the validator accepts only that bit and bit 1 (personal data sync, test_pdata_src.py) (other bits of byte 1 and bytes 2..7 must be zero)",
        "blob[1] = g_pc_house_sync ? (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC : 0u;" in bld and num(c, "PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC") == 1 == L.PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC
-       and "blob[0] > 1u" in val and "(blob[1] & ~(uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC) != 0u" in val and "for (i = 2; i < PC_NETGAME_TS_HOSTCFG_LEN; i++)" in val)
+       and "blob[0] > 1u" in val and "(blob[1] & ~(uint8_t)(PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC | PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC)) != 0u" in val and "for (i = 2; i < PC_NETGAME_TS_HOSTCFG_LEN; i++)" in val)
     ap = func_body(c, "pcnetgame_ts_client_apply")
     ck("W the client reads the bit in the HOST_CONFIG apply (no usable save needed) and a client without the bit never gates anything (every gate starts with pcnetgame_hcl_active() == on)",
        "pcnetgame_house_client_set_hostcfg((m->blob[1] & (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC) != 0);" in ap

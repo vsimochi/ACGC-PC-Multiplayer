@@ -899,6 +899,7 @@ int main(int argc, char* argv[]) {
             printf("  --town-fetch        CLIENT-only (requires --connect; exit 2 otherwise; not with --town-dir): before the game boots, download the host's town\n");
             printf("                      save into save/mp/towns/<townkey>/ and play it (progress in the window title). Falls back to the cached town of that\n");
             printf("                      server, then to save/card_a. The host must serve it (--town-serve on).\n");
+            printf("  --personal-sync on|off HOST-only (exit 2 otherwise): authenticated per-resident diary sync (default: on only while the town is served, i.e. town_serve is not off; settings.ini personal_sync).\n");
             printf("  --town-serve off|on|full HOST-only (exit 2 otherwise): serve the town save to --town-fetch clients (default off or settings.ini town_serve).\n");
             printf("                      on = a SANITIZED copy (other residents' pockets, mail, diary, designs and villager letters are blanked; names / houses / furniture are NOT);\n");
             printf("                      full = the whole file, unsanitized (every resident's private data: friends / LAN only). While 'on' the legacy 'client wins once' import is off.\n");
@@ -1199,6 +1200,14 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             g_pc_town_serve_override = strcmp(argv[i + 1], "full") == 0 ? 2 : strcmp(argv[i + 1], "on") == 0 ? 1 : 0; /* M-G: 0 off | 1 sanitized | 2 full (unsanitized) */
+            i++;
+        } else if (strcmp(argv[i], "--personal-sync") == 0) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "on") != 0 && strcmp(argv[i + 1], "off") != 0)) {
+                fprintf(stderr, "[PC] --personal-sync: REFUSED: the option needs on or off\n"
+                                "usage: AnimalCrossing --host [port] --personal-sync on|off\n");
+                return 2;
+            }
+            g_pc_personal_sync_override = strcmp(argv[i + 1], "on") == 0 ? 1 : 0; /* personal data sync (diary): host operator override of settings.ini personal_sync */
             i++;
         } else if (strcmp(argv[i], "--allow-new-guests") == 0) {
             if (i + 1 >= argc || (strcmp(argv[i + 1], "0") != 0 && strcmp(argv[i + 1], "1") != 0)) {
@@ -1617,6 +1626,11 @@ int main(int argc, char* argv[]) {
     if (g_pc_town_dir != NULL && g_pc_town_fetch) {
         fprintf(stderr, "[PC] --town-dir: REFUSED: --town-dir cannot be combined with --town-fetch (the fetch picks the town directory)\n"
                         "usage: AnimalCrossing --connect HOST[:PORT] --town-fetch   (see --help)\n");
+        return 2;
+    }
+    if (g_pc_personal_sync_override >= 0 && g_pc_net_role != 1) {
+        fprintf(stderr, "[PC] --personal-sync: REFUSED: it is a HOST-only option (use it together with --host)\n"
+                        "usage: AnimalCrossing --host [port] --personal-sync on|off   (see --help)\n");
         return 2;
     }
     if (g_pc_town_serve_override >= 0 && g_pc_net_role != 1) {

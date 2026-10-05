@@ -24,10 +24,12 @@ PCSettings g_pc_settings = {
     .allow_new_guests = 1,
     .resident_tokens = 0,
     .town_serve = 0,
+    .personal_sync = -1,
 };
 
 int g_pc_max_guests_override = 0;
 int g_pc_town_serve_override = -1;
+int g_pc_personal_sync_override = -1;
 int g_pc_allow_new_guests_override = -1;
 int g_pc_resident_tokens_override = -1;
 
@@ -92,7 +94,10 @@ static const char* DEFAULT_SETTINGS =
     "resident_tokens = off\n"
     "\n"
     "# Host only: serve this town's save to clients that start with --town-fetch: 0 = off (default), 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n"
-    "town_serve = 0\n";
+    "town_serve = 0\n"
+    "\n"
+    "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n"
+    "personal_sync = auto\n";
 
 static const char* skip_ws(const char* s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -157,6 +162,10 @@ static void apply_setting(const char* key, const char* value) {
         else if (strcmp(value, "on") == 0) g_pc_settings.town_serve = 1;
         else if (strcmp(value, "full") == 0) g_pc_settings.town_serve = 2;
         else if (val >= 0 && val <= 2) g_pc_settings.town_serve = val;
+    } else if (strcmp(key, "personal_sync") == 0) {
+        if (strcmp(value, "auto") == 0) g_pc_settings.personal_sync = -1;
+        else if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) g_pc_settings.personal_sync = 1;
+        else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.personal_sync = 0;
     }
 }
 
@@ -259,6 +268,9 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Host only: serve this town's save to clients that start with --town-fetch: 0 = off (default), 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n");
     fprintf(f, "town_serve = %d\n", g_pc_settings.town_serve);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n");
+    fprintf(f, "personal_sync = %s\n", g_pc_settings.personal_sync < 0 ? "auto" : g_pc_settings.personal_sync ? "on" : "off");
     fclose(f);
     printf("[Settings] Saved %s\n", SETTINGS_FILE);
 }

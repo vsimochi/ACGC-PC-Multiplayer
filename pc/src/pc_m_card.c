@@ -215,6 +215,32 @@ int mCD_save_data_main_to_aram(void* src, u32 size, u32 idx) {
     return FALSE;
 }
 
+/* PERSONAL DATA sync (diary only, docs/multiplayer-guest-roadmap.md "Personal data sync"): per-resident access to ONE slot of the live diary ARAM block
+ * (entries[slot][0..11], 12 x 992 = 0x2E80 bytes at +2). The block is the same memory the normal host save writes to the GCI and the vanilla diary overlay copies
+ * whole at open / writes back whole at close; the CALLER (pc_net_game.c) never patches it while a diary menu is open. checksum / landid are never touched here
+ * (the writer recomputes them). get / put return 1 on success, 0 for a bad slot or a block that does not exist yet. */
+_Static_assert(offsetof(mCD_keep_diary_c, entries) == 2 && sizeof(((mCD_keep_diary_c*)0)->entries[0]) == PC_M_CARD_DIARY_SLOT_SIZE &&
+                   mCD_KEEP_DIARY_COUNT == 4 && PC_M_CARD_DIARY_SLOT_SIZE == 0x2E80,
+               "diary block layout changed: the personal data sync slot accessor is wrong");
+
+int pc_m_card_diary_slot_get(int slot, void* out) {
+    const mCD_keep_diary_c* d = (const mCD_keep_diary_c*)l_aram_block_p_table[mCD_ARAM_DATA_DIARY];
+    if (d == NULL || out == NULL || slot < 0 || slot >= mCD_KEEP_DIARY_COUNT) {
+        return 0;
+    }
+    memcpy(out, d->entries[slot], PC_M_CARD_DIARY_SLOT_SIZE);
+    return 1;
+}
+
+int pc_m_card_diary_slot_put(int slot, const void* in) {
+    mCD_keep_diary_c* d = (mCD_keep_diary_c*)l_aram_block_p_table[mCD_ARAM_DATA_DIARY];
+    if (d == NULL || in == NULL || slot < 0 || slot >= mCD_KEEP_DIARY_COUNT) {
+        return 0;
+    }
+    memcpy(d->entries[slot], in, PC_M_CARD_DIARY_SLOT_SIZE);
+    return 1;
+}
+
 void mCD_set_aram_save_data(void) {
     int i;
     for (i = 0; i < mCD_ARAM_DATA_NUM; i++) {

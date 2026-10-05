@@ -1136,6 +1136,14 @@ PC_NETGAME_HOUSE_ACK_NOT_OWNER = 6
 PC_NETGAME_HOUSE_ACK_BUSY = 7
 PC_NETGAME_HOUSE_ACK_RATE_LIMITED = 8
 PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC = 0x01
+HOSTCFG_FLAG_PERSONAL_SYNC = 0x02   # HOST_CONFIG byte 1 bit 1: personal data sync (diary only)
+# Personal data sync (diary only): two more KINDS on HOUSE_BEGIN / HOUSE_CHUNK / HOUSE_ACK (no new ids). house = block (0 = diary), rsv = page (diary: the slot),
+# house_seq = page rev, payload = ONE diary slot 12 x 992 = 0x2E80 B = 12 chunks.
+PDATA_KIND_COMMIT = 3  # C -> H
+PDATA_KIND_PUSH = 4    # H -> C
+PDATA_DIARY_SIZE = 0x2E80
+PDATA_CHUNKS = 12
+assert (PDATA_DIARY_SIZE + 999) // 1000 == PDATA_CHUNKS == 12
 HOUSE_BEGIN_FMT = "<BBBBIIIIIHHII"   # PCNetGameHouseBeginMsg, 36 bytes
 HOUSE_CHUNK_FMT = "<BBHIHH1000s"     # PCNetGameHouseChunkMsg, 1012 bytes
 HOUSE_ACK_FMT = "<BBHIIIII"          # PCNetGameHouseAckMsg, 24 bytes
@@ -2126,6 +2134,8 @@ class FakeClient(TransportClient):
         self.house_xfer_counter = 0
         self.house_base = {}        # house -> (host_session, seq): the canonical point this client holds (the last digest-ok push, or our own APPLIED commit)
         self.house_inflight = {}    # xfer_id -> (house, image, record) of a commit awaiting its ACK
+        self.pd_rx = None           # personal data sync: the PDATA_PUSH (kind 4) reassembly
+        self.pd_pushes = []         # completed PDATA_PUSHes this connection: dicts (slot, rev, session, data, digest_ok, xfer, conn)
 
     def _reset_world_tracking(self):
         self.world = WorldView()  # what a correct client believes, per contract section 4
@@ -2606,6 +2616,40 @@ class FakeClient(TransportClient):
             return None
         return pushes()[-1]
 
+    # --- Personal data sync (diary): PDATA_COMMIT / PDATA_PUSH test double ---------------------------------------------------------------------------
+    def pdata_pushes_of(self):
+        return [p for p in self.pd_pushes if p["conn"] == self.connect_count]
+
+    def wait_pdata_push(self, after=0, timeout=6.0):
+        """Block until the completed PDATA_PUSH count of this connection exceeds `after`; returns the newest one or None."""
+        if not self.hub.wait_until(lambda: len(self.pdata_pushes_of()) > after, timeout):
+            return None
+        return self.pdata_pushes_of()[-1]
+
+    def commit_pdata(self, data, base, slot=None, block=0, xfer_id=None, digest=None, wait_gap=1.7, total_size=None, chunk_count=None, kind=PDATA_KIND_COMMIT,
+                     rsv2=0, only_chunks=None):
+        """PDATA_COMMIT: one diary slot (`data`, 0x2E80 B) built on base = (host_session, page_rev). `slot` is the message's page field (default: this client's resident
+        slot); `block` the block id. Shares the xfer counter with the house commits (the host's hup_last_xfer is shared). Returns the xfer_id."""
+        if slot is None:
+            slot = self.rec_resident_idx
+        if xfer_id is None:
+            xfer_id = self.next_house_xfer_id()
+        else:
+            self.house_xfer_counter = max(self.house_xfer_counter, xfer_id)
+        data = bytes(data)
+        if digest is None:
+            digest = fnv1a32(data)
+        n = (len(data) + PC_NETGAME_HOUSE_CHUNK_DATA - 1) // PC_NETGAME_HOUSE_CHUNK_DATA
+        if wait_gap:
+            pump_sleep(wait_gap)
+        self.send_house_begin(kind, xfer_id, block, base[0], base[1], 0, 0, len(data) if total_size is None else total_size, digest,
+                              n if chunk_count is None else chunk_count, rsv=slot, rsv2=rsv2)
+        for i in range(n):
+            if only_chunks is not None and i not in only_chunks:
+                continue
+            self.send_house_chunk(i, xfer_id, data[i * PC_NETGAME_HOUSE_CHUNK_DATA:(i + 1) * PC_NETGAME_HOUSE_CHUNK_DATA])
+        return xfer_id
+
     def house_pushes_of(self, house=None):
         return [p for p in self.house_pushes if p["conn"] == self.connect_count and (house is None or p["house"] == house)]
 
@@ -2618,6 +2662,18 @@ class FakeClient(TransportClient):
         t = m.msg_type
         g = m.game
         if g is None or m.conn != self.connect_count:
+            return
+        if t == PC_NETGAME_MSG_HOUSE_BEGIN and g.kind == PDATA_KIND_PUSH:
+            self.pd_rx = {"xfer": g.xfer_id, "block": g.house, "slot": g.rsv, "session": g.host_session, "rev": g.house_seq, "digest": g.digest,
+                          "count": g.chunk_count, "total": g.total_size, "chunks": {}}
+            return
+        if t == PC_NETGAME_MSG_HOUSE_CHUNK and self.pd_rx is not None and self.pd_rx["xfer"] == g.xfer_id:
+            rx = self.pd_rx
+            rx["chunks"][g.chunk_idx] = bytes(g.data[:g.length])
+            if len(rx["chunks"]) == rx["count"]:
+                data = b"".join(rx["chunks"][i] for i in range(rx["count"]))
+                self.pd_pushes.append(dict(rx, data=data, digest_ok=(len(data) == rx["total"] == PDATA_DIARY_SIZE and fnv1a32(data) == rx["digest"]), conn=m.conn))
+                self.pd_rx = None
             return
         if t == PC_NETGAME_MSG_HOUSE_BEGIN:
             self.house_rx = {"kind": g.kind, "xfer": g.xfer_id, "house": g.house, "session": g.host_session, "seq": g.house_seq, "digest": g.digest,

@@ -379,6 +379,11 @@ PCNetSceneKind pc_net_game_scene_kind(int scene_id);
 int pc_net_game_get_local_scene(PCNetPlayerScene* out);
 /* Furniture sync Stage 1 is in effect for this session (host: --house-sync; client: announced by the host and not disabled). */
 int pc_net_game_house_sync_active(void);
+/* Personal data sync (diary only): one resident's slot (12 months x 992 B = 0x2E80 B) of the live diary ARAM block, implemented in pc_m_card.c. get / put return 1 on
+ * success, 0 for a bad slot or a missing block; they never touch checksum / landid. The caller must not put while a diary menu is open. */
+#define PC_M_CARD_DIARY_SLOT_SIZE 0x2E80
+int pc_m_card_diary_slot_get(int slot, void* out);
+int pc_m_card_diary_slot_put(int slot, const void* in);
 /* M9-A: the last accepted scene of another network player (host: a READY client id; client: the host id
  * or a relayed client id). Returns 1 and fills *out only if a scene is currently known; 0 otherwise
  * (never announced, disconnected, or cleared). Presence only: nothing consumes this yet (puppet
