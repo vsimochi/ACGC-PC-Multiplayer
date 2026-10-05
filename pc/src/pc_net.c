@@ -91,6 +91,7 @@ int pc_net_init(void) { return 0; }
 void pc_net_shutdown(void) {}
 int pc_net_host_start(uint16_t port) { (void)port; return 0; }
 int pc_net_client_connect(const char* host_ip, uint16_t port) { (void)host_ip; (void)port; return 0; }
+int pc_net_client_restart(void) { return 0; }
 void pc_net_poll(void) {}
 int pc_net_next_event(PCNetEvent* out) { (void)out; return 0; }
 int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t size) {
@@ -753,6 +754,10 @@ int pc_net_host_start(uint16_t port) {
     return 1;
 }
 
+/* Client only: the host address of the last successful pc_net_client_connect() (for pc_net_client_restart). */
+static struct sockaddr_in s_client_host;
+static int s_client_host_valid = 0;
+
 int pc_net_client_connect(const char* host_ip, uint16_t port) {
     struct sockaddr_in addr;
     if (!s_wsa_started || s_socket != INVALID_SOCKET) return 0;
@@ -768,6 +773,8 @@ int pc_net_client_connect(const char* host_ip, uint16_t port) {
         return 0;
     }
 
+    s_client_host = addr;
+    s_client_host_valid = 1;
     s_is_host = 0;
     pcnet_free_slot(0); /* fresh sequence/ack/retransmit/reorder state for the new connection */
     s_peers[0].state = PCNET_PEER_PENDING;
@@ -776,6 +783,25 @@ int pc_net_client_connect(const char* host_ip, uint16_t port) {
     s_peers[0].last_recv_tick = GetTickCount();
     s_peers[0].last_send_tick = GetTickCount();
     pcnet_send_ctrl(&addr, PCNET_WIRE_HELLO, &s_peers[0].nonce, PCNET_WIRE_NONCE_BYTES);
+    return 1;
+}
+
+/* Client auto-reconnect: re-arms slot 0 as a fresh PENDING logical peer toward the SAME host over
+ * the SAME socket (same local UDP port, so a host that still holds our stale slot sees "same
+ * address, new nonce" and replaces it at once). No event is queued. Returns 0 if there is no open
+ * client socket / saved host address. */
+int pc_net_client_restart(void) {
+    uint32_t now;
+    if (s_socket == INVALID_SOCKET || s_is_host || !s_client_host_valid) return 0;
+    pcnet_free_slot(0);
+    pcnet_purge_peer_data_events(0);
+    now = GetTickCount();
+    s_peers[0].state = PCNET_PEER_PENDING;
+    s_peers[0].addr = s_client_host;
+    s_peers[0].nonce = pcnet_make_nonce();
+    s_peers[0].last_recv_tick = now;
+    s_peers[0].last_send_tick = now;
+    pcnet_send_ctrl(&s_client_host, PCNET_WIRE_HELLO, &s_peers[0].nonce, PCNET_WIRE_NONCE_BYTES);
     return 1;
 }
 

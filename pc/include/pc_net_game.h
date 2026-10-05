@@ -1147,6 +1147,10 @@ int pc_net_game_host_remote_player_in_acre(int bx, int bz);
 /* Batch A (A3): 1 iff the CLIENT "not connected" notice should be drawn this frame (role CLIENT, local world loaded, link not READY for > 3 s). */
 int pc_net_game_client_notice_visible(void);
 
+/* Client auto-reconnect UI status: 0 nothing, 1 reconnecting (*attempt = attempt number shown, *next_s = seconds to the next try), 2 just reconnected (3 s),
+ * 3 gave up after a permanent refusal (persistent). Either pointer may be NULL. Always 0 for host / solo. */
+int pc_net_game_client_reconnect_status(int* attempt, int* next_s);
+
 /* Guests G6.1: the readable join-failure message of the last client connection attempt (a refused join: server full / town mismatch / protocol mismatch /
  * token problems; host unreachable) or NULL when there is none (or a final failure older than 30 s). Survives the shutdown a refusal causes. *is_warning
  * (optional) = 1 for the non-final "no answer from the host yet, still trying" kind. Drawn by pc_net_notice_draw(); also logged ([NET][JOIN]) and on stderr. */

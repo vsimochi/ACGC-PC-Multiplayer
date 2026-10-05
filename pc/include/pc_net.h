@@ -161,6 +161,11 @@ int pc_net_host_start(uint16_t port);
  * is simply resent every 500 ms, as before. */
 int pc_net_client_connect(const char* host_ip, uint16_t port);
 
+/* Client only (auto-reconnect): after the link was lost, re-arms the PENDING state toward the same host on
+ * the same socket/local port with a fresh nonce and sends HELLO. Returns 0 if unavailable. Cancel an
+ * attempt with pc_net_disconnect(PC_NET_INVALID_PEER). */
+int pc_net_client_restart(void);
+
 /* --- per-frame polling --- */
 
 /* Drains whatever is waiting on the OS socket buffer (never blocks, never sleeps), runs the

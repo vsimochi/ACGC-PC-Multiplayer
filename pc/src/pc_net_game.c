@@ -2572,6 +2572,12 @@ static PCNetGameRole s_role = PC_NETGAME_ROLE_NONE;
 
 /* client-only */
 static PCNetGameLinkState s_client_link = PC_NETGAME_LINK_DISCONNECTED;
+/* Client auto-reconnect (see the "CLIENT AUTO-RECONNECT" block before pcnetgame_client_tick()). No wire change. */
+static void pcnetgame_client_on_link_lost(const char* cause);   /* transport link gone (any cause): reset the session, schedule a retry */
+static void pcnetgame_client_refused(const char* why);           /* permanent refusal: pre-READY = pc_net_game_shutdown(), afterwards = GAVE_UP (role stays CLIENT) */
+static void pcnetgame_rc_note_adopt_failed(void);
+static void pcnetgame_rc_on_ready(void);
+static void pcnetgame_rc_log_guest_success(unsigned guest_slot);
 static PCNetGameIdentity  s_client_host_identity;
 static int                s_client_host_identity_valid = 0;
 
@@ -17707,6 +17713,7 @@ static void pcnetgame_crec_try_adopt(uint32_t now) {
             }
             pcnetgame_crec_send_ack((uint8_t)PC_NETGAME_REC_ACK_ADOPT_FAILED, 0, s_crec.st_xfer, s_crec.st_epoch,
                                     s_crec.st_rev, s_crec.st_session);
+            pcnetgame_rc_note_adopt_failed(); /* auto-reconnect: the host closes the link next; 3 in a row = give up */
             s_crec.st_valid = 0; /* state stays AWAIT_RECORD: requests stay refused; the host drops the peer */
         }
         return;
@@ -19583,10 +19590,12 @@ static int pcnetgame_txn_tick(void) {
         /* M2: a host that keeps the link but never answers must not keep the inventory shut for the whole session. Leaving is SAFE: the
          * host is fully pre-op or fully post-op for this request (one handler call), the client never mutated its pockets, and the
          * next join's PUSH_FULL reconciles. Same exit as the other fatal client conditions (pc_net_game_shutdown()). */
-        printf("[NET][TXN] unresolved >%u s: reconnect required (request %u kind %s, %u resends) -- leaving the session, no inventory change\n",
+        printf("[NET][TXN] unresolved >%u s: reconnect required (request %u kind %s, %u resends) -- dropping the link (auto-reconnect), no inventory change\n",
                (unsigned)(PC_NETGAME_TXN_RESET_MS / 1000u), (unsigned)s_ctxn.request_id, pcnetgame_kind_tag((int)s_ctxn.kind),
                (unsigned)s_ctxn.resends);
-        pc_net_game_shutdown();
+        /* Auto-reconnect: temporary failure. Cancel the transport (the host frees our slot at once), then run the normal link-loss path (it clears s_ctxn). */
+        pc_net_disconnect(PC_NET_INVALID_PEER);
+        pcnetgame_client_on_link_lost("txn unresolved");
         return 1;
     }
     return 0;
@@ -22381,10 +22390,11 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
             pcnetgame_join_message_set(0, "The host gave you a DIFFERENT guest token than the one you hold: this is not the host that issued it (its guest table was reset, "
                                           "or it is another machine). You were disconnected. Delete %s and ask the host operator to run guest-reset-token or "
                                           "guest-remove for your guest.", pc_guest_token_path());
-            pc_net_game_shutdown();
+            pcnetgame_client_refused("guest token mismatch");
             return;
         }
         printf("[NET][GUEST] client: guest token verified by the host (guest slot %u)\n", (unsigned)m.guest_slot);
+        pcnetgame_rc_log_guest_success((unsigned)m.guest_slot);
         return;
     }
     /* first contact (also: a token from a host this client holds NO token for, e.g. its table was wiped or the entry was re-minted): persist the
@@ -22411,6 +22421,7 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
         pcnetgame_join_message_set(0, "Your guest token could not be saved to %s. The host will refuse you next time until its operator runs guest-reset-token for "
                                       "your guest. Check that the folder is writable.", pc_guest_token_path());
     }
+    pcnetgame_rc_log_guest_success((unsigned)m.guest_slot);
 }
 
 /* G6.1: the REJECT reason -> one readable sentence (the numeric reason stays in the log line printed by the caller). `host_town` is non-NULL for the
@@ -22752,7 +22763,7 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
             } else {
                 pcnetgame_join_message_set(0, "The host's town (%s) does not match your town (%s). Copy the host's town save into save/card_a and restart.", a, b);
             }
-            pc_net_game_shutdown();
+            pcnetgame_client_refused(in.protocol_version != PC_NETGAME_PROTOCOL_VERSION ? "protocol mismatch" : "town mismatch");
             return;
         }
 
@@ -22791,6 +22802,7 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
             pc_remote_player_on_ready(PC_NETGAME_HOST_PLAYER_ID, &s_client_host_identity);
         }
         pcnetgame_crec_on_ready(); /* D3: record state machine starts (HELLO goes out from the next client tick) */
+        pcnetgame_rc_on_ready();
         return;
     }
 
@@ -22831,7 +22843,7 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
                    rt.reason == PC_NETGAME_REJECT_NO_SAVE       ? "NO_SAVE" : "rejected",
                    a, b);
         }
-        pc_net_game_shutdown(); /* clean and immediate -- no need to wait for a transport timeout */
+        pcnetgame_client_refused("host REJECT"); /* clean and immediate (pre-READY: shutdown) -- no need to wait for a transport timeout */
         return;
     }
 
@@ -23040,6 +23052,239 @@ static void pcnetgame_reset_host_world_state(void) {
     pcwld_reset();
 }
 
+/* ===== CLIENT AUTO-RECONNECT BEGIN =====
+ * Lifecycle: the transport peer (slot 0) is lost (timeout / DISCONNECT / retransmit budget) -> the session state is reset exactly as before, but the
+ * ROLE stays CLIENT, the socket stays open and the process re-offers HELLO itself (pc_net_client_restart(): same host, same local UDP port, fresh nonce, so a
+ * host that still holds our stale slot replaces it at once). No pc_net_game_shutdown() is involved: the local save, the record lineage (s_crec_last), the
+ * house canon (s_hcp), the txn nonce/seq, the catch id, the wildlife generation, the clock offset, the last appearance and the guest token are all kept.
+ * Only armed (= reconnecting) once this process has reached READY at least once: before that the old behaviour (message + stay disconnected / shutdown on a
+ * refusal) is unchanged. State machine: IDLE (READY, or never lost) -> WAIT (backoff 1,2,4,8,15,15.. s) -> ATTEMPT (HELLO out, 4 s to be transport-connected;
+ * afterwards no timeout: the host may park the claim) -> READY -> IDLE. Permanent refusals (REJECT, ACK mismatch, guest-token mismatch, local town changed,
+ * 3 consecutive ADOPT_FAILED) -> GAVE_UP: link closed, role stays CLIENT (the client "no save" rules stay in force), persistent notice. */
+enum { RC_OFF = 0, RC_IDLE, RC_WAIT, RC_ATTEMPT, RC_GAVE_UP };
+#define PC_NETGAME_RC_ATTEMPT_MS   4000u
+#define PC_NETGAME_RC_OK_SHOW_MS   3000u
+#define PC_NETGAME_RC_STABLE_MS    20000u /* READY this long without the record reaching SYNCED (guests): the backoff resets anyway */
+#define PC_NETGAME_RC_ADOPT_GIVEUP 3
+static struct {
+    int      enabled;       /* set by pc_net_game_start_client() (only reached through --connect) */
+    int      was_ready;     /* READY was reached at least once in this process */
+    int      state;
+    int      n;             /* backoff index: number of retries scheduled since the last stable session */
+    int      attempt_no;    /* attempts made since the link was lost (log / UI) */
+    int      adopt_fails;   /* consecutive ADOPT_FAILED link closes */
+    int      adopt_flag;    /* the link that is going away carried an ADOPT_FAILED */
+    int      success_pending_guest; /* reconnected as a guest: the success line waits for the IDENTITY_TOKEN (guest slot) */
+    int      stable_pending;/* READY after a reconnect; n is reset once stable */
+    uint32_t offline_since_ms;
+    uint32_t next_ms;
+    uint32_t attempt_start_ms;
+    uint32_t ok_until_ms;
+    uint32_t ready_since_ms;
+    uint32_t last_offline_ms;
+} s_rc;
+
+static int pcnetgame_rc_armed(void) {
+    return s_rc.enabled && s_rc.was_ready && s_role == PC_NETGAME_ROLE_CLIENT;
+}
+
+static void pcnetgame_rc_schedule(const char* cause) {
+    static const unsigned backoff_s[5] = {1u, 2u, 4u, 8u, 15u};
+    uint32_t delay;
+    const uint32_t now = pcnetgame_now_ms();
+    if (s_rc.state == RC_GAVE_UP) {
+        return;
+    }
+    if (s_rc.state == RC_IDLE) {
+        s_rc.offline_since_ms = now;
+        s_rc.attempt_no = 0;
+    }
+    s_rc.stable_pending = 0;
+    s_rc.success_pending_guest = 0;
+    if (s_rc.adopt_flag) {
+        s_rc.adopt_flag = 0;
+        if (++s_rc.adopt_fails >= PC_NETGAME_RC_ADOPT_GIVEUP) {
+            printf("[NET][RECONNECT] client: permanent refusal (record adoption failed %d times in a row) -- giving up, staying offline\n", s_rc.adopt_fails);
+            pc_net_disconnect(PC_NET_INVALID_PEER);
+            s_rc.state = RC_GAVE_UP;
+            return;
+        }
+    }
+    delay = backoff_s[s_rc.n < 4 ? s_rc.n : 4] * 1000u;
+    s_rc.n++;
+    s_rc.state = RC_WAIT;
+    s_rc.next_ms = now + delay;
+    printf("[NET][RECONNECT] client: host link lost (cause=%s) -- retry %d in %u ms\n", cause, s_rc.attempt_no + 1, (unsigned)delay);
+    fflush(stdout);
+}
+
+static void pcnetgame_rc_note_adopt_failed(void) {
+    s_rc.adopt_flag = 1;
+}
+
+/* Common to start_client() and every reconnect attempt: join-message bookkeeping and the per-connection wildlife-mode unknown. */
+static void pcnetgame_client_begin_attempt(void) {
+    s_client_link = PC_NETGAME_LINK_CONNECTING;
+    pcnetgame_join_message_clear(); /* G6.1: a new attempt starts without the previous one's message */
+    s_client_connect_since_ms = pcnetgame_now_ms();
+    s_client_connect_warned = 0;
+    s_client_wildlife_mode = -1; /* batch A (A1): unknown until the host's HOST_CONFIG arrives (local wildlife spawning is suppressed meanwhile) */
+}
+
+static void pcnetgame_client_on_link_lost(const char* cause) {
+    const int armed = pcnetgame_rc_armed();
+    if (s_rc.state == RC_GAVE_UP) {
+        return; /* stale event after a permanent refusal */
+    }
+    if (!armed && (s_client_link == PC_NETGAME_LINK_CONNECTING || s_client_link == PC_NETGAME_LINK_HANDSHAKE)) {
+        /* G6.1: closed before the handshake finished (an older / incompatible host transport, a stopped host, a network error) */
+        pcnetgame_join_message_set(0, "The host at %s closed the connection before you could join (host stopped, an older game version, or a network problem).",
+                                   s_client_host_addr);
+    }
+    s_client_link = PC_NETGAME_LINK_DISCONNECTED;
+    printf("[NET] client: host connection lost\n");
+    {
+        /* M9-A: observability for the scene clear done by pcnetgame_reset_client_session_state()
+         * below (counted BEFORE it runs): how many other players' scenes this client was holding. */
+        int scene_pid;
+        int held = 0;
+        PCNetPlayerScene scene_tmp;
+        for (scene_pid = 0; scene_pid <= (int)PC_NETGAME_HOST_PLAYER_ID; scene_pid++) {
+            held += pc_remote_player_get_scene((PCNetPlayerId)scene_pid, &scene_tmp) ? 1 : 0;
+        }
+        printf("[NET][SCENE] client: host link lost -- clearing %d stored peer scene(s)\n", held);
+    }
+    /* Stage 5A/5B-1/v2: pending pickup/drop requests are dropped immediately (the
+     * item was never moved locally, so nothing is lost or needs restoring), and
+     * every other per-connection state goes with them. */
+    pcnetgame_reset_client_session_state();
+    if (armed) {
+        /* A restarted host's MOVE sender_frame restarts low (a surviving slot would reject its samples as stale) and the relayed players' ids may
+         * change: drop every puppet; they come back through the normal on_ready / relay paths. Safe mid-game (static slot table, same destroy path). */
+        pc_remote_player_shutdown();
+        pcnetgame_rc_schedule(cause);
+    } else {
+        pc_remote_player_on_disconnect(PC_NETGAME_HOST_PLAYER_ID);
+    }
+}
+
+/* Permanent refusal. Before the first READY (or without auto-reconnect) this is the old fatal path. Afterwards pc_net_game_shutdown() is NOT used: ROLE_NONE
+ * mid-game would lift the client "no save" rules; the link is closed, the role stays CLIENT, and the notice stays. */
+static void pcnetgame_client_refused(const char* why) {
+    if (!pcnetgame_rc_armed()) {
+        pc_net_game_shutdown();
+        return;
+    }
+    printf("[NET][RECONNECT] client: permanent refusal (%s) -- giving up, staying offline\n", why);
+    fflush(stdout);
+    pc_net_disconnect(PC_NET_INVALID_PEER);
+    s_rc.state = RC_GAVE_UP;
+    s_client_link = PC_NETGAME_LINK_DISCONNECTED;
+    pcnetgame_reset_client_session_state();
+    pc_remote_player_shutdown();
+}
+
+static void pcnetgame_rc_log_success(const char* who, int a, unsigned b) {
+    printf("[NET][RECONNECT] client: reconnect successful (attempt %d, offline %u ms) -- identity re-established (%s: resident %d | guest slot %u)\n",
+           s_rc.attempt_no, (unsigned)s_rc.last_offline_ms, who, a, b);
+    fflush(stdout);
+}
+
+static void pcnetgame_rc_on_ready(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    if (!s_rc.enabled) {
+        return;
+    }
+    s_rc.ready_since_ms = now;
+    if (s_rc.was_ready) { /* a reconnect */
+        s_rc.last_offline_ms = (uint32_t)(now - s_rc.offline_since_ms);
+        s_rc.ok_until_ms = now + PC_NETGAME_RC_OK_SHOW_MS;
+        s_rc.stable_pending = 1;
+        if (pcnetgame_client_is_guest_player()) {
+            s_rc.success_pending_guest = 1; /* logged by the IDENTITY_TOKEN handler (it knows the guest slot) */
+        } else {
+            pcnetgame_rc_log_success("resident", (int)Common_Get(player_no), 0u);
+        }
+    } else {
+        s_rc.was_ready = 1;
+    }
+    s_rc.state = RC_IDLE;
+}
+
+static void pcnetgame_rc_log_guest_success(unsigned guest_slot) {
+    if (s_rc.success_pending_guest) {
+        s_rc.success_pending_guest = 0;
+        pcnetgame_rc_log_success("guest", -1, guest_slot);
+    }
+}
+
+/* Once per poll after the event loop (client only). */
+static void pcnetgame_rc_tick(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    if (!pcnetgame_rc_armed()) {
+        return;
+    }
+    switch (s_rc.state) {
+        case RC_IDLE:
+            if (s_rc.stable_pending && s_client_link == PC_NETGAME_LINK_READY &&
+                (s_crec.state == PC_NETGAME_CRS_SYNCED || (uint32_t)(now - s_rc.ready_since_ms) >= PC_NETGAME_RC_STABLE_MS)) {
+                s_rc.stable_pending = 0;
+                s_rc.n = 0;
+                s_rc.adopt_fails = 0;
+            }
+            break;
+        case RC_WAIT:
+            if ((int32_t)(now - s_rc.next_ms) >= 0) {
+                pcnetgame_client_begin_attempt();
+                if (!pc_net_client_restart()) {
+                    s_client_link = PC_NETGAME_LINK_DISCONNECTED;
+                    pcnetgame_rc_schedule("restart failed");
+                    break;
+                }
+                s_rc.attempt_no++;
+                s_rc.state = RC_ATTEMPT;
+                s_rc.attempt_start_ms = now;
+                printf("[NET][RECONNECT] client: attempt %d: HELLO to %s\n", s_rc.attempt_no, s_client_host_addr);
+                fflush(stdout);
+            }
+            break;
+        case RC_ATTEMPT:
+            if (s_client_link == PC_NETGAME_LINK_CONNECTING && (uint32_t)(now - s_rc.attempt_start_ms) >= PC_NETGAME_RC_ATTEMPT_MS) {
+                printf("[NET][RECONNECT] client: attempt %d timed out\n", s_rc.attempt_no);
+                fflush(stdout);
+                pc_net_disconnect(PC_NET_INVALID_PEER); /* cancels the PENDING slot (no event) */
+                s_client_link = PC_NETGAME_LINK_DISCONNECTED;
+                pcnetgame_rc_schedule("attempt timed out");
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/* UI (pc_pause_menu.c: pc_net_notice_draw): 0 nothing, 1 reconnecting, 2 just reconnected (3 s), 3 gave up (persistent). */
+int pc_net_game_client_reconnect_status(int* attempt, int* next_s) {
+    const uint32_t now = pcnetgame_now_ms();
+    if (attempt != NULL) *attempt = 0;
+    if (next_s != NULL) *next_s = 0;
+    if (!s_rc.enabled || s_role != PC_NETGAME_ROLE_CLIENT) {
+        return 0;
+    }
+    if (s_rc.state == RC_GAVE_UP) {
+        return 3;
+    }
+    if (s_rc.state == RC_WAIT || s_rc.state == RC_ATTEMPT) {
+        if (attempt != NULL) *attempt = s_rc.attempt_no + (s_rc.state == RC_WAIT ? 1 : 0);
+        if (next_s != NULL) *next_s = s_rc.state == RC_WAIT && (int32_t)(s_rc.next_ms - now) > 0 ? (int)((s_rc.next_ms - now + 999u) / 1000u) : 0;
+        return 1;
+    }
+    if (s_rc.state == RC_IDLE && s_rc.ok_until_ms != 0 && (int32_t)(s_rc.ok_until_ms - now) > 0) {
+        return 2;
+    }
+    return 0;
+}
+/* ===== CLIENT AUTO-RECONNECT END ===== */
+
 /* v2 client, once per poll after events: deferred IDENTITY send, save pause/resume + resync,
  * town-change detection, PLAYER_CONTEXT change detection, parked-tile retry. */
 static void pcnetgame_client_tick(void) {
@@ -23114,7 +23359,7 @@ static void pcnetgame_client_tick(void) {
             pcnetgame_format_town(&cur, a, sizeof(a));
             pcnetgame_format_town(&s_client_claimed_town, b, sizeof(b));
             printf("[NET] client: local save now holds a different town (%s, connected as %s) -- disconnecting\n", a, b);
-            pc_net_game_shutdown();
+            pcnetgame_client_refused("local town changed");
             return;
         }
     }
@@ -23205,12 +23450,11 @@ int pc_net_game_start_client(const char* host_ip, uint16_t port) {
         return 0;
     }
     s_role = PC_NETGAME_ROLE_CLIENT;
-    s_client_link = PC_NETGAME_LINK_CONNECTING;
-    pcnetgame_join_message_clear(); /* G6.1: a new attempt starts without the previous one's message */
+    memset(&s_rc, 0, sizeof(s_rc));
+    s_rc.enabled = 1; /* only reached through --connect */
+    s_rc.state = RC_IDLE;
     snprintf(s_client_host_addr, sizeof(s_client_host_addr), "%s:%u", host_ip, (unsigned)port);
-    s_client_connect_since_ms = pcnetgame_now_ms();
-    s_client_connect_warned = 0;
-    s_client_wildlife_mode = -1; /* batch A (A1): unknown until the host's HOST_CONFIG arrives (local wildlife spawning is suppressed meanwhile) */
+    pcnetgame_client_begin_attempt(); /* link CONNECTING, join-message bookkeeping, wildlife mode unknown */
     if (g_pc_authoritative_wildlife) {
         printf("[NET][HOSTCFG] client: --authoritative-wildlife is IGNORED on a client: the host's HOST_CONFIG decides the wildlife mode (unknown until it arrives; local wildlife spawning suppressed meanwhile)\n");
     }
@@ -23225,6 +23469,10 @@ int pc_net_game_start_client(const char* host_ip, uint16_t port) {
 void pc_net_game_shutdown(void) {
     if (s_role == PC_NETGAME_ROLE_NONE) return;
     printf("[NET] shutting down networking (was %s)\n", s_role == PC_NETGAME_ROLE_HOST ? "host" : "client");
+    if (s_role == PC_NETGAME_ROLE_CLIENT && s_rc.enabled && s_rc.was_ready) {
+        printf("[NET][RECONNECT] client: intentional shutdown -- no reconnect\n");
+    }
+    memset(&s_rc, 0, sizeof(s_rc)); /* ROLE_NONE stops the reconnect tick */
 
     /* Say goodbye before tearing down the socket, so a clean exit is detected by the other
      * side immediately (PC_NET_EVENT_PEER_DISCONNECTED) instead of only after the transport's
@@ -24608,7 +24856,7 @@ static void pcnetgame_client_notice_update(void) {
     /* G6.1: the host does not answer at all (no transport connection yet): say so once after PC_NETGAME_CONNECT_WARN_MS; the warning is withdrawn as soon
      * as the transport answers (the client keeps retrying; there is no transport-level give-up). */
     if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_CONNECTING) {
-        if (!s_client_connect_warned && (uint32_t)(now - s_client_connect_since_ms) >= PC_NETGAME_CONNECT_WARN_MS) {
+        if (!pcnetgame_rc_armed() && !s_client_connect_warned && (uint32_t)(now - s_client_connect_since_ms) >= PC_NETGAME_CONNECT_WARN_MS) {
             s_client_connect_warned = 1;
             pcnetgame_join_message_set(1, "No answer from the host at %s after %u s (host not running, wrong address or port, or a firewall). Still trying.",
                                        s_client_host_addr, (unsigned)(PC_NETGAME_CONNECT_WARN_MS / 1000u));
@@ -24754,29 +25002,7 @@ void pc_net_game_poll(void) {
                     break;
                 }
                 case PC_NET_EVENT_PEER_DISCONNECTED:
-                    if (s_client_link == PC_NETGAME_LINK_CONNECTING || s_client_link == PC_NETGAME_LINK_HANDSHAKE) {
-                        /* G6.1: closed before the handshake finished (an older / incompatible host transport, a stopped host, a network error) */
-                        pcnetgame_join_message_set(0, "The host at %s closed the connection before you could join (host stopped, an older game version, or a network problem).",
-                                                   s_client_host_addr);
-                    }
-                    s_client_link = PC_NETGAME_LINK_DISCONNECTED;
-                    printf("[NET] client: host connection lost\n");
-                    {
-                        /* M9-A: observability for the scene clear done by pcnetgame_reset_client_session_state()
-                         * below (counted BEFORE it runs): how many other players' scenes this client was holding. */
-                        int scene_pid;
-                        int held = 0;
-                        PCNetPlayerScene scene_tmp;
-                        for (scene_pid = 0; scene_pid <= (int)PC_NETGAME_HOST_PLAYER_ID; scene_pid++) {
-                            held += pc_remote_player_get_scene((PCNetPlayerId)scene_pid, &scene_tmp) ? 1 : 0;
-                        }
-                        printf("[NET][SCENE] client: host link lost -- clearing %d stored peer scene(s)\n", held);
-                    }
-                    /* Stage 5A/5B-1/v2: pending pickup/drop requests are dropped immediately (the
-                     * item was never moved locally, so nothing is lost or needs restoring), and
-                     * every other per-connection state goes with them. */
-                    pcnetgame_reset_client_session_state();
-                    pc_remote_player_on_disconnect(PC_NETGAME_HOST_PLAYER_ID);
+                    pcnetgame_client_on_link_lost("transport timeout / disconnect");
                     break;
                 case PC_NET_EVENT_DATA:
                     pcnetgame_handle_client_data(ev.data, ev.size);
@@ -24799,6 +25025,7 @@ void pc_net_game_poll(void) {
         pcnetgame_house_host_tick();  /* furniture sync: canonical house copies, CANON_PUSH pump, commit deadlines (after the record tick: the commit shares its state) */
         pcnetgame_host_world_poll();
     } else {
+        pcnetgame_rc_tick(); /* auto-reconnect: backoff / attempt window / stable reset */
         pcnetgame_client_tick();
         if (s_role == PC_NETGAME_ROLE_NONE) {
             return; /* local town changed under a READY link -> shut down */

@@ -295,6 +295,25 @@ void pc_net_notice_draw(struct game_s* game) {
     const char* join_msg;
 
     if (g_pc_paused || game == NULL || game->graph == NULL) return;
+    {
+        /* Client auto-reconnect: its status wins over the join message / the generic "Not connected" notice. */
+        int rc_attempt = 0, rc_next_s = 0;
+        const int rc = pc_net_game_client_reconnect_status(&rc_attempt, &rc_next_s);
+        if (rc != 0) {
+            char line[96];
+            mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+            if (rc == 1) {
+                snprintf(line, sizeof(line), "Connection lost - Reconnecting... (attempt %d)", rc_attempt);
+                pc_menu_draw_centered(game, line, 14.0f, 255, 200, 90, 255, 1.0f);
+            } else if (rc == 2) {
+                pc_menu_draw_centered(game, "Reconnected", 14.0f, 120, 255, 120, 255, 1.0f);
+            } else {
+                pc_menu_draw_centered(game, "Disconnected from host (refused) - restart to rejoin", 14.0f, 255, 90, 90, 255, 1.0f);
+            }
+            mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+            return;
+        }
+    }
     join_msg = pc_net_game_join_message(&join_warning);
     if (join_msg != NULL) { /* G6.1: works on the title screen and in game (graph_main draws this every frame) */
         mFont_SetMatrix(game->graph, mFont_MODE_FONT);
