@@ -88,6 +88,12 @@ typedef struct PCNetGameDedicatedGuestInfo {
 } PCNetGameDedicatedGuestInfo;
 int  pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out); /* 1 iff the slot is in use */
 int  pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char* msg, size_t cap);
+/* Host admin item tools (HOST only, main thread, no wire change). _item_giveblock: NULL when `id` may be given, else a short reason (invalid pocket id, money, tickets,
+ * my-design items, furniture id with rotation bits). _give: fill `qty` (1..15) EMPTY pockets of a resident / guest (name or `peer N`) with `id`, all-or-nothing; 1 = given,
+ * 0 = refused (msg = the text that follows "GIVE FAILED: "). A connected owner receives a PUSH_FULL record push (client-unsynced edits are discarded on adoption). */
+int  pc_net_game_dedicated_item_is_legal(unsigned id); /* pcnetgame_is_pocket_legal_item(), the record validator's rule (id != 0) */
+const char* pc_net_game_dedicated_item_giveblock(unsigned id);
+int  pc_net_game_dedicated_give(const char* sel, unsigned id, int qty, char* who_out, size_t whocap, char* msg, size_t cap);
 /* what: 0 = transport-connected, 1 = READY (bound), 2 = disconnected (call BEFORE the per-peer state is reset). Prints one "[DEDICATED] ..." line. */
 void pc_net_game_dedicated_announce(int peer, int what);
 

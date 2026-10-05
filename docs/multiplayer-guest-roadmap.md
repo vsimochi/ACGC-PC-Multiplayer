@@ -606,6 +606,61 @@ Manual tests required (two real instances, host with `--house-sync`, disposable 
 
 `pc_remote_player_collide_eval` now also arms the puppet pipe in PLAYER_HOUSE interiors (same scene id + owner, same stale / door / demo guards as the other shared interiors) but ONLY while furniture sync is in effect for the session: `pc_net_game_house_sync_active()` (host: `--house-sync`; client: the host announced it in HOST_CONFIG and the client was not disabled). Without sync each process builds the room from its own save, so the pipe stays disarmed there (puppet may stand in a piece that only exists on the owner's side). Shops / museum / other interiors are unchanged. No wire or save change. Tests: `test_interior_collision_src.py` (7/7) and `test_building_interactions_src.py`, source audits only; house shove feel not verified visually. The Stage 1 client half (dirty test, unsafe-scene gates against a live room) has no real-process test, so house collision is only as trustworthy as that.
 
+## Host admin item tools (dedicated console: `finditem`, `iteminfo`, `items`, `give`)
+
+Host-only, typed into the `--host --dedicated` console (`help` lists them). They run on the game thread (the stdin reader only queues lines). No wire change: no new message, no protocol bump.
+
+### Syntax
+
+| Command | What it does |
+|---|---|
+| `finditem <text> [page]` | case-insensitive substring search over the item names. A trailing all-digit word after at least one other word is the page (`finditem dresser 2`); a single word is always the search text. Text up to 40 characters. |
+| `iteminfo <id>` | name, category and whether the item can be given (and why not). `<id>` = `0x2203` (hex) or decimal `8707`, range 0..0xFFFF; anything else (`0xZZ`, `-5`, `0x`, 99999999, a number that is not a pocket item) is rejected with `Invalid item ID`. |
+| `items <furniture\|tools\|clothing\|wallpaper\|carpet\|miscellaneous\|all> [page]` | lists a category, 15 per page. |
+| `give <player> <id> [qty]` | puts `qty` copies (1..15, default 1) of the item in the player's FREE pockets. `<player>` = a resident or guest name (case-insensitive, spaces allowed), `peer <N>` (a connected player, see `players`) or a `"quoted name"`. |
+
+### Output
+
+```
+ITEM SEARCH: "dresser" - 16 results
+0x1034 - Jingle dresser - Furniture
+...
+Page 1/1
+ITEM SEARCH: "zzz" - no results
+ITEMS (furniture) - 1266 results         (then 15 lines, then "Page 1/85 - next: items furniture 2"; a page past the end says it does not exist)
+ITEM INFO: 0x2200 (8704)
+  name: net / category: Tools / giveable: yes (...)
+GIVE: Angelica received item 0x2200 (net).             ("... (axe) x3." for qty 3; a note line when a rotated furniture id was masked)
+GIVE FAILED: Angelica's inventory is full. No items were given.
+GIVE FAILED: Unknown player 'Nobody'.
+GIVE FAILED: Invalid item ID 0x2100 (money bags are not given by the item tools). No items were given.
+```
+
+Names are the game's own (lower case, as the game prints them). They are 16 game-font codes, NOT ASCII: the console folds them through a 256-entry table (accented letters lose the accent, symbols become `?`). Entries whose name table slot is blank/"unknown" show `(unknown name)` and are not giveable. A list line ends with `[not giveable]` when the item exists but `give` refuses it.
+
+### What can be given
+
+Anything a pocket can legally hold (the same rule the host applies to uploaded records: `pcnetgame_is_pocket_legal_item`) EXCEPT: money bags, tickets (the month is encoded in the id), my-design umbrellas / mannequins (they need a player design) and ids the game has no name for. Furniture ids carry the rotation in the low 2 bits: a rotated id is masked to the unrotated piece and the console says so. `qty` = number of pocket slots to fill (pockets have no stack counts); filled slots get the NORMAL item condition. Paper stacks use different ids for 1..4 sheets (the names repeat).
+
+### Failure behaviour (all-or-nothing)
+
+`give` either fills all `qty` slots or changes nothing and says why; there is never a partial gift. Refused (with a `GIVE FAILED: ...` line): unknown / ambiguous player (use `peer <N>`), the host's own resident, an invalid or non-giveable item, a bad quantity, fewer than `qty` free pockets, a record that has never synced with this host (rev 0: the first join would adopt the client's record and the gift would vanish), a connected player that is not idle (record sync / house upload in progress) or not outside in the town (e.g. inside a house: keeps the owner out of the house-sync conservation window), guests when `guests.dat` is untrusted, and an offline guest whose `guests.dat` write fails (rolled back).
+
+### How it is delivered
+
+Pockets belong to the client, so the host writes its mirror record through the same sanctioned writer the transactions use, bumps the record lineage (`rev`, `last_pocket_rev`: a client transaction built on the old image becomes STALE_IMAGE) and, for a connected player, restarts a PUSH_FULL record push (the client adopts any push newer than its base). An offline resident / guest receives it at the next join (the bumped rev makes the host push its record). Residents are saved with the next (early) host save; offline guests immediately through `guests.dat`.
+
+Known costs: when the client adopts the push it discards its own unsynced client-owned edits since the last accepted upload (about 2 s, logged `[discarded local client-owned edits]`): a loss, never a duplicate. A client that cannot adopt for 10 s is dropped by the host, like for every push. A stale record upload / commit after a give is answered STALE_BASE / STALE_IMAGE and the gift is kept. House-sync conservation is not changed: a house OWNER_COMMIT whose record rev is older than the gift is STALE (rolled back on the client); the "in town and no open house upload" gates narrow that window.
+
+### Limitations
+
+- The categories are INCOMPLETE. Only furniture, tools, clothing, wallpaper and carpet map cleanly onto the game's tables. Fish, insects, fruit, plants, paper, music, diaries, lucky bags, turnips, "etc" (fossils, presents, spirits, signs...) and everything else are only in `miscellaneous` / `all` (the category column then shows the table, e.g. `Fish`). Sub-kinds the game does not store in a table (gyroids, fossil models, mannequins, tool sub-kinds) cannot be filtered. Search with `finditem` instead.
+- Furniture forms of fish / insects / tools / clothing resolve to the inventory item's name (that is what the game's name function does).
+- Name resolution: residents and the ACTIVE guests of the current host town (guests of other towns are inactive); a name shared by several entries is refused as ambiguous. Non-ASCII characters of a player name print as `?` and cannot be typed; use `peer <N>` for those.
+- Nothing here changes bells (wallet, bank, loan), teleports a player or touches houses.
+
+Tests: `pc/tools/net_spike/test_admin_items_protocol.py` (REAL dedicated host process on the disposable `bin_fixture4` copy + a scripted FakeClient resident + the stdin console) and `test_admin_items_src.py` (source audit).
+
 ## Known limitations
 
 * A guest needs a manually copied copy of the HOST's town save (`save/card_a/DobutsunomoriP_MURA.gci`): there is no town transfer, the town identity (land name, id, terrain

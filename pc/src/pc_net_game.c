@@ -28013,6 +28013,231 @@ int pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char
 }
 /* ===== GUESTS G6.2 END ===== */
 
+/* ===== HOST ADMIN ITEM TOOLS (dedicated console `give` / `iteminfo` / `items`): HOST only, MAIN thread only, NO wire change. =====
+ * `give` writes the pockets of a MIRRORED record (resident or guest) through the same sanctioned writer the TXNs use, bumps the record lineage
+ * (rev + last_pocket_rev, so a client TXN built on the old base is STALE_IMAGE) and, for a connected owner, restarts a PUSH_FULL (the only host -> client
+ * channel for client-owned fields; the client adopts any push newer than its base). All-or-nothing: either all `qty` slots are filled or nothing changed. */
+int pc_net_game_dedicated_item_is_legal(unsigned id) {
+    return id != 0u && id <= 0xFFFFu && pcnetgame_is_pocket_legal_item((mActor_name_t)id);
+}
+
+const char* pc_net_game_dedicated_item_giveblock(unsigned id) {
+    mActor_name_t it;
+    if (id > 0xFFFFu) {
+        return "the id is outside 0x0000..0xFFFF";
+    }
+    it = (mActor_name_t)id;
+    if (it == (mActor_name_t)EMPTY_NO || !pcnetgame_is_pocket_legal_item(it)) {
+        return "not a valid pocket item id";
+    }
+    if (it >= (mActor_name_t)ITM_MONEY_START && it <= (mActor_name_t)ITM_MONEY_END) {
+        return "money bags are not given by the item tools";
+    }
+    if (it >= (mActor_name_t)ITM_TICKET_START && it <= (mActor_name_t)ITM_TICKET_END) {
+        return "tickets encode a month in the id and are not given by the item tools";
+    }
+    if (ITEM_IS_MYUMBRELLA_TOOL(it)) {
+        return "my-design umbrellas need a player design and are not given";
+    }
+    if (ITEM_IS_FTR(it) && (ITEM_IS_MYMANNIQUIN(it) || ITEM_IS_MYUMBRELLA(it))) {
+        return "my-design mannequins / umbrellas need a player design and are not given";
+    }
+    if (ITEM_IS_FTR(it) && (it & 3u) != 0u) {
+        return "furniture id has rotation bits set (use the id with the low 2 bits cleared)";
+    }
+    return NULL;
+}
+
+/* Who: `peer N` (a connected, bound peer) or a name (case-insensitive, trailing spaces ignored) over this town's residents (online or offline) and active guests.
+ * Returns the record slot idx (0..PLAYER_NUM+7) or -1 with the failure tail in msg. */
+static int pcnetgame_dedicated_give_resolve(const char* sel, char* who, size_t whocap, char* msg, size_t cap) {
+    int i, found = -1, n = 0;
+    char nm[PC_NETGAME_NAME_LEN + 1];
+    who[0] = '\0';
+    if (sel == NULL || sel[0] == '\0') {
+        snprintf(msg, cap, "Unknown player ''.");
+        return -1;
+    }
+    if (strncmp(sel, "peer ", 5) == 0 && sel[5] >= '0' && sel[5] <= '9' && sel[6] == '\0') {
+        PCNetGameDedicatedPeerInfo pi;
+        if (pc_net_game_dedicated_peer_info(sel[5] - '0', &pi) && pi.bound && pi.index >= 0) {
+            found = pi.cls ? PLAYER_NUM + pi.index : pi.index;
+            snprintf(who, whocap, "%s", pi.name);
+            return found;
+        }
+        snprintf(msg, cap, "Unknown player '%s' (no READY peer with that number).", sel);
+        return -1;
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        const Private_c* r = &Save_Get(private_data)[i];
+        if (r->exists != TRUE || mPr_NullCheckPersonalID((PersonalID_c*)&r->player_ID) == TRUE) {
+            continue;
+        }
+        pcnetgame_dedicated_ascii_name(r->player_ID.player_name, nm);
+        if (nm[0] != '\0' && pcnetgame_dedicated_ieq(nm, sel)) {
+            found = i;
+            n++;
+        }
+    }
+    for (i = 0; i < PC_NETGAME_GUEST_MAX; i++) {
+        if (!s_guest[i].used || !s_guest_store_loaded || !pcnetgame_town_equal(&s_guest[i].town, &s_host_town)) {
+            continue; /* another host town's guest: inactive, never matched */
+        }
+        pcnetgame_dedicated_ascii_name(s_guest[i].key.player_name, nm);
+        if (nm[0] != '\0' && pcnetgame_dedicated_ieq(nm, sel)) {
+            found = PLAYER_NUM + i;
+            n++;
+        }
+    }
+    if (n == 0) {
+        snprintf(msg, cap, "Unknown player '%s'.", sel);
+        return -1;
+    }
+    if (n > 1) {
+        snprintf(msg, cap, "Ambiguous player '%s' (%d matches: a resident and/or guests share the name). Use `peer <N>` for a connected player. No items were given.", sel, n);
+        return -1;
+    }
+    if (found >= PLAYER_NUM) {
+        pcnetgame_dedicated_ascii_name(s_guest[found - PLAYER_NUM].key.player_name, who);
+    } else {
+        pcnetgame_dedicated_ascii_name(Save_Get(private_data)[found].player_ID.player_name, who);
+    }
+    return found;
+}
+
+/* Returns 1 = given (msg = ""), 0 = refused (msg = the text after "GIVE FAILED: "). `who_out` = the resolved display name (valid on both). */
+int pc_net_game_dedicated_give(const char* sel, unsigned id, int qty, char* who_out, size_t whocap, char* msg, size_t cap) {
+    char who[PC_NETGAME_NAME_LEN + 2];
+    int idx, peer, i, used = 0, is_guest;
+    PCNetGameRecSlot* slot;
+    Private_c* rec;
+    PCNetGameHostPeerState* st = NULL;
+    mActor_name_t post[mPr_POCKETS_SLOT_COUNT];
+    uint16_t post16[mPr_POCKETS_SLOT_COUNT];
+    uint32_t conds;
+    const char* blk;
+    if (msg == NULL || cap < 16 || who_out == NULL || whocap < 2) {
+        return 0;
+    }
+    msg[0] = '\0';
+    who_out[0] = '\0';
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        snprintf(msg, cap, "this process is not a host with a ready world. No items were given.");
+        return 0;
+    }
+    if (qty < 1 || qty > mPr_POCKETS_SLOT_COUNT) {
+        snprintf(msg, cap, "Invalid quantity %d (1..%d). No items were given.", qty, (int)mPr_POCKETS_SLOT_COUNT);
+        return 0;
+    }
+    blk = pc_net_game_dedicated_item_giveblock(id);
+    if (blk != NULL) {
+        snprintf(msg, cap, "Invalid item ID 0x%04X (%s). No items were given.", id & 0xFFFFu, blk);
+        return 0;
+    }
+    pcnetgame_guest_store_load();
+    idx = pcnetgame_dedicated_give_resolve(sel, who, sizeof(who), msg, cap);
+    if (idx < 0) {
+        return 0;
+    }
+    snprintf(who_out, whocap, "%s", who);
+    is_guest = idx >= PLAYER_NUM;
+    if (!is_guest && idx == pcnetgame_host_own_resident_idx()) {
+        snprintf(msg, cap, "%s is the host's own resident; the item tools only fill mirrored client records. No items were given.", who);
+        return 0;
+    }
+    if (is_guest && s_guest_untrusted) {
+        snprintf(msg, cap, "guests.dat is UNTRUSTED; guest inventories cannot be changed safely. No items were given.");
+        return 0;
+    }
+    if (!pcnetgame_rec_txn_idx_ok(idx)) {
+        snprintf(msg, cap, "%s's record is not writable. No items were given.", who);
+        return 0;
+    }
+    slot = pcnetgame_rec_slot(idx);
+    if (slot == NULL || slot->rev == 0u) {
+        snprintf(msg, cap, "%s has never synced a character record with this host (the first join would overwrite the gift). No items were given.", who);
+        return 0;
+    }
+    rec = pcnetgame_rec_priv_ptr(idx);
+    peer = is_guest ? pcnetgame_host_peer_bound_to_guest(idx - PLAYER_NUM, (PCNetPeerId)-1) : pcnetgame_host_peer_bound_to_resident(idx, (PCNetPeerId)-1);
+    if (peer >= 0) {
+        st = &s_host_peer[peer];
+        if (st->rec_state != PC_NETGAME_RECS_SYNCED || st->up_open || st->hup_open) {
+            snprintf(msg, cap, "%s is connected but not idle (record sync / house upload in progress). Try again in a moment. No items were given.", who);
+            return 0;
+        }
+        if (!st->ctx_valid || !(st->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+            snprintf(msg, cap, "%s is not outside in the town right now (e.g. inside a house). Try again when they are in town. No items were given.", who);
+            return 0;
+        }
+    }
+    /* capacity: >= qty EMPTY slots, nothing is ever overwritten */
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        post[i] = rec->inventory.pockets[i];
+        if (post[i] == (mActor_name_t)EMPTY_NO) {
+            used++;
+        }
+    }
+    if (used < qty) {
+        if (qty == 1) {
+            snprintf(msg, cap, "%s's inventory is full. No items were given.", who);
+        } else {
+            snprintf(msg, cap, "%s's inventory is full (%d free slot(s), %d needed). No items were given.", who, used, qty);
+        }
+        return 0;
+    }
+    conds = rec->inventory.item_conditions;
+    for (i = 0, used = 0; i < mPr_POCKETS_SLOT_COUNT && used < qty; i++) {
+        if (post[i] == (mActor_name_t)EMPTY_NO) {
+            post[i] = (mActor_name_t)id;
+            conds = mPr_SET_ITEM_COND(conds, i, mPr_ITEM_COND_NORMAL);
+            used++;
+        }
+    }
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        post16[i] = (uint16_t)post[i];
+    }
+    if (pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet) != 0) {
+        snprintf(msg, cap, "the resulting inventory failed validation. No items were given.");
+        return 0;
+    }
+    {
+        /* snapshot for the guest rollback; the resident path has no store write that can fail here */
+        PCNetGameRecSlot old_rs = *slot;
+        mActor_name_t old_pockets[mPr_POCKETS_SLOT_COUNT];
+        uint32_t old_conds = rec->inventory.item_conditions;
+        uint16_t old16[mPr_POCKETS_SLOT_COUNT];
+        uint32_t old_lpr = s_txn_res[idx].last_pocket_rev;
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            old_pockets[i] = rec->inventory.pockets[i];
+            old16[i] = (uint16_t)old_pockets[i];
+        }
+        (void)pcnetgame_rec_txn_write_inventory(idx, post16, conds, rec->inventory.wallet);
+        slot->rev++;
+        slot->dirty_unsaved = 1;
+        s_txn_res[idx].last_pocket_rev = slot->rev; /* a client TXN built on the old base is now STALE_IMAGE */
+        if (peer >= 0) {
+            slot->hf_pending = 0; /* the FULL push carries the latest host-consumed fields */
+            pcnetgame_rec_start_push((PCNetPeerId)peer, idx, (uint8_t)PC_NETGAME_REC_KIND_PUSH_FULL);
+        } else if (is_guest) {
+            if (!pcnetgame_guest_store_write("operator gave items to an offline guest")) {
+                (void)pcnetgame_rec_txn_write_inventory(idx, old16, old_conds, rec->inventory.wallet);
+                *slot = old_rs;
+                s_txn_res[idx].last_pocket_rev = old_lpr;
+                snprintf(msg, cap, "guests.dat could not be written; the gift was rolled back. No items were given.");
+                return 0;
+            }
+        }
+        if (!is_guest) {
+            s_rec_early_save_request = 1; /* the GCI + records.dat sidecar carry the new lineage at the next (early) host save */
+        }
+    }
+    printf("[NET][ADMIN] give: %s %d (\"%s\") received item 0x%04X x%d (slots filled; rev now %u)%s\n", is_guest ? "guest" : "resident", is_guest ? idx - PLAYER_NUM : idx,
+           who, id & 0xFFFFu, qty, (unsigned)slot->rev, peer >= 0 ? ", PUSH_FULL queued to the connected owner" : ", owner offline: delivered at its next join");
+    msg[0] = '\0';
+    return 1;
+}
+
 void pc_net_game_dedicated_announce(int peer, int what) {
     PCNetGameDedicatedPeerInfo pi;
     if (!g_pc_dedicated) {
