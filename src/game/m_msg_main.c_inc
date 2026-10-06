@@ -398,26 +398,79 @@ static int mMsg_LoadMsgData(mMsg_Data_c* msg_data, int index, int cut) {
 
 #ifdef TARGET_PC
 #include "pc_test_hooks.h"
-/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_DUMP_MSG=<id>): once, loads message <id> through the normal loader (so the first-page patch applies) and prints its bytes. Never active in normal play. */
-static void mMsg_pc_dump_hook(void) {
-    static int done = 0;
+#include "pc_net_game.h"
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_DUMP_MSG=<id>): loads message <id> through the normal loader (so the first-page patch applies) and prints its bytes, once the job state is known. With
+ * AC_TEST_WORK_ENTER=1 it then walks the REAL work path of this process: dump (the job state as it is) -> ENTER through the real op (client: TXN to the host) -> dump -> LEAVE -> dump.
+ * Never active in normal play. */
+static void mMsg_pc_dump_one(unsigned id, const char* tag) {
     static mMsg_Data_c scratch;
-    const char* e;
-    unsigned id;
     int i;
-    if (done || (e = pc_test_hook_getenv("AC_TEST_DUMP_MSG")) == NULL || !pc_net_game_work_offer_available()) {
-        return;
-    }
-    done = 1;
-    id = (unsigned)strtoul(e, NULL, 0);
     if (mMsg_LoadMsgData(&scratch, (int)id, FALSE)) {
-        printf("[MSG][TEST-ONLY] message 0x%04X loaded, len %d, bytes:", id, (int)scratch.msg_len);
+        printf("[MSG][TEST-ONLY] %s message 0x%04X loaded, len %d, bytes:", tag, id, (int)scratch.msg_len);
         for (i = 0; i < (int)scratch.msg_len && i < 400; i++) {
             printf(" %02X", scratch.text_buf.data[i]);
         }
         printf("\n");
     } else {
-        printf("[MSG][TEST-ONLY] message 0x%04X could not be loaded\n", id);
+        printf("[MSG][TEST-ONLY] %s message 0x%04X could not be loaded\n", tag, id);
+    }
+}
+
+static void mMsg_pc_dump_hook(void) {
+    static int step = 0, tries = 0;
+    static uint32_t retry_ms = 0;
+    const char* e;
+    unsigned id;
+    if (step >= 6 || (e = pc_test_hook_getenv("AC_TEST_DUMP_MSG")) == NULL || !pc_net_game_work_offer_available()) {
+        return;
+    }
+    id = (unsigned)strtoul(e, NULL, 0);
+    switch (step) {
+        case 0:
+            mMsg_pc_dump_one(id, "initial");
+            step = (pc_test_hook_getenv("AC_TEST_WORK_ENTER") != NULL) ? 1 : 6;
+            break;
+        case 1:
+        case 4: {
+            int r;
+            if (pc_net_game_now_ms() < retry_ms) {
+                break;
+            }
+            r = pc_net_game_work_begin_op(step == 1 ? PC_WORK_OP_ENTER : PC_WORK_OP_LEAVE, 0);
+            if (r == -1) {
+                break; /* busy: retry next frame */
+            }
+            printf("[MSG][TEST-ONLY] work %s begin -> %d\n", step == 1 ? "ENTER" : "LEAVE", r);
+            step = (r == 1) ? step + 1 : (r == 3 ? step + 2 : 6);
+            break;
+        }
+        case 2:
+        case 5: {
+            int r = pc_net_game_ts_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                break;
+            }
+            if (r == PC_NETGAME_TS_OP_REJECTED && pc_net_game_ts_last_reject_reason() == 0 && tries < 20) { /* a local refusal (the client was not quite ready): try again in a second */
+                tries++;
+                step--;
+                retry_ms = pc_net_game_now_ms() + 1000u;
+                break;
+            }
+            printf("[MSG][TEST-ONLY] work op result %d (reason %d)\n", r, (int)pc_net_game_ts_last_reject_reason());
+            step++;
+            break;
+        }
+        case 3:
+            mMsg_pc_dump_one(id, "after-ENTER");
+            step = 4;
+            break;
+    }
+    if (step == 6 && pc_test_hook_getenv("AC_TEST_WORK_ENTER") != NULL) {
+        static int last = 0;
+        if (!last) {
+            last = 1;
+            mMsg_pc_dump_one(id, "final");
+        }
     }
 }
 #endif
