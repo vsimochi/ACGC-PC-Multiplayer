@@ -30,6 +30,8 @@ static int        s_n;
 static WheelEntry s_entries[WHEEL_MAX];
 static int        s_req_kind, s_req_slot;
 static int        s_prev_hold;
+static int        s_armed;         /* pad opener: the stick has been pushed out at least once since the last Empty-hand choice */
+static unsigned   s_center_ms;     /* when the stick came back inside the deadzone (0 = it is outside) */
 static int        s_suppress_c;    /* pad opener: the right stick stays consumed after the wheel closed until it has been back inside the deadzone once */
 
 /* the same gates Player_actor_check_and_switch_tool applies, evaluated early so the wheel never opens where an equip is impossible */
@@ -63,6 +65,17 @@ static void wheel_build(void) {
             s_entries[s_n].slot = i;
             s_n++;
         }
+    }
+    /* deterministic, equipment-independent order: by item id (ties by pocket slot, the tool in hand last among equals); the tool in hand keeps its place in the ring and is only marked */
+    for (i = 1; i < s_n; i++) {
+        WheelEntry e = s_entries[i];
+        int j = i - 1;
+        while (j >= 0 && (s_entries[j].item > e.item || (s_entries[j].item == e.item && s_entries[j].slot > e.slot && e.slot != -2 && s_entries[j].slot != -2) ||
+                          (s_entries[j].item == e.item && s_entries[j].slot == -2 && e.slot != -2))) {
+            s_entries[j + 1] = s_entries[j];
+            j--;
+        }
+        s_entries[j + 1] = e;
     }
 }
 
@@ -105,6 +118,8 @@ void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int 
         s_open = 1;
         s_pad_opened = hold_pad && !hold_kb;
         s_sel = 0;
+        s_armed = 0;
+        s_center_ms = 0;
     }
     if (s_open) {
         if (!wheel_can_use()) { /* scene / menu / pause changed under the wheel: cancel, no equip */
@@ -112,8 +127,18 @@ void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int 
         } else if (hold) {
             if (s_pad_opened) {
                 float dx = (float)rx, dy = (float)ry;
-                if (sqrtf(dx * dx + dy * dy) > (float)dz) { /* LATCHED: only a deliberate push outside the deadzone changes the selection; recentering keeps it */
+                if (sqrtf(dx * dx + dy * dy) > (float)dz) { /* LATCHED: only a deliberate push outside the deadzone changes the selection; a release-time recentering keeps it */
                     s_sel = wheel_pick_h(dx, dy, 0.0f, s_n, s_sel > 0 ? s_sel : 0);
+                    s_armed = 1;
+                    s_center_ms = 0;
+                } else if (s_armed) { /* deliberately parked in the centre WHILE STILL HOLDING the button for 300 ms = Empty hand (the quick spring-back of a normal release never reaches this) */
+                    unsigned now = SDL_GetTicks() | 1u;
+                    if (s_center_ms == 0) {
+                        s_center_ms = now;
+                    } else if ((unsigned)(now - s_center_ms) >= 300u) {
+                        s_sel = 0;
+                        s_armed = 0;
+                    }
                 }
             } else {
                 int w = 640, h = 480;
