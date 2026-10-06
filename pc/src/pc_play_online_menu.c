@@ -5,6 +5,8 @@
 #include "pc_guest_profile.h"
 #include "pc_menu_util.h"
 #include "pc_net_game.h"
+#include "pc_player_preview.h" /* the real player model next to each character row */
+#include "pc_text_draw.h"
 #include "pc_relaunch.h" /* PC_RELAUNCH_* kinds (the relaunch itself is no longer used here) */
 #include "pc_servers.h"
 
@@ -21,6 +23,7 @@ enum { PG_SERVERS, PG_ACTIONS, PG_CHARS, PG_DELETE };
 enum { T_NONE, T_SRV_NAME, T_SRV_ADDR, T_SRV_PORT, T_CHAR_NAME };
 
 #define VISIBLE 8
+#define CHAR_ROWS 5 /* the character page shows fewer, taller rows (a player model beside each name) */
 
 static int s_active = 0;
 static int s_page = PG_SERVERS;
@@ -126,7 +129,10 @@ static void sel_clamp(void) {
     if (s_sel < 0) s_sel = 0;
     if (s_sel > n - 1) s_sel = n - 1;
     if (s_sel < s_scroll) s_scroll = s_sel;
-    if (s_sel >= s_scroll + VISIBLE) s_scroll = s_sel - VISIBLE + 1;
+    {
+        const int vis = (s_page == PG_CHARS) ? CHAR_ROWS : VISIBLE;
+        if (s_sel >= s_scroll + vis) s_scroll = s_sel - vis + 1;
+    }
     if (s_scroll < 0) s_scroll = 0;
 }
 
@@ -601,6 +607,32 @@ static void draw_list(struct game_s* game, const char* title, const char* hint) 
     pc_menu_draw_centered(game, hint, 218.0f, 150, 150, 150, 200, 1.0f);
 }
 
+/* The character page: one row per character, the real player model (UI only, see pc_player_preview.h) left of its name. Taller rows than the other lists. */
+#define CHAR_ROW_H 30.0f
+static void draw_char_list(struct game_s* game) {
+    const int n = row_count();
+    int i, r, g, b, a;
+    const int first = s_scroll;
+    pc_menu_draw_centered(game, "- Choose a character -", 26.0f, 255, 255, 255, 255, 1.0f);
+    pc_player_preview_tick();
+    for (i = 0; i < CHAR_ROWS && first + i < n; i++) {
+        const int row = first + i;
+        const int selected = (row == s_sel);
+        const f32 y = 44.0f + (f32)i * CHAR_ROW_H;
+        char buf[96];
+        row_label(row, buf, sizeof(buf));
+        pc_menu_row_colors(selected, &r, &g, &b, &a);
+        pc_menu_draw_centered(game, buf, y + 8.0f, r, g, b, a, selected ? PC_MENU_SCALE_SELECTED : 1.0f);
+        if (row < s_nchr && pc_player_preview_set_character(i, &s_chr[row])) {
+            const f32 w = (f32)pc_text_width(buf) * (selected ? PC_MENU_SCALE_SELECTED : 1.0f);
+            pc_player_preview_draw(game, i, 160.0f - w * 0.5f - 24.0f, y + 30.0f, 26.0f); /* (x, y) = the model's FEET (its origin), the body centered on the row's text line */
+        }
+    }
+    if (first > 0) pc_menu_draw_left(game, "...", 14.0f, 44.0f, 180, 180, 180, 200, 1.0f);
+    if (first + CHAR_ROWS < n) pc_menu_draw_left(game, "...", 14.0f, 44.0f + (CHAR_ROWS - 1) * CHAR_ROW_H, 180, 180, 180, 200, 1.0f);
+    pc_menu_draw_centered(game, "Fetches the town, then joins (no restart)", 218.0f, 150, 150, 150, 200, 1.0f);
+}
+
 static void draw_text_entry(struct game_s* game) {
     static const char* const k_title[] = { "", "- Server name -", "- Server address -", "- Server port -", "- New character name -" };
     static const char* const k_hint[] = { "", "1..32 characters", "IPv4 or hostname, Ctrl+V pastes", "1..65535 (empty = 7777)", "A-Z a-z 0-9 - (1..16)" };
@@ -626,7 +658,7 @@ void pc_play_online_menu_draw(struct game_s* game, int with_dim_backdrop) {
         sanitize(buf);
         draw_list(game, buf, "Connect picks a character next");
     } else if (s_page == PG_CHARS) {
-        draw_list(game, "- Choose a character -", "Fetches the town, then joins (no restart)");
+        draw_char_list(game);
     } else {
         snprintf(buf, sizeof(buf), "Delete %s?", s_srv[s_cur].name);
         sanitize(buf);
