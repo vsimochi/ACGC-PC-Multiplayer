@@ -30,6 +30,7 @@ static int        s_n;
 static WheelEntry s_entries[WHEEL_MAX];
 static int        s_req_kind, s_req_slot;
 static int        s_prev_hold;
+static int        s_suppress_c;    /* pad opener: the right stick stays consumed after the wheel closed until it has been back inside the deadzone once */
 
 /* the same gates Player_actor_check_and_switch_tool applies, evaluated early so the wheel never opens where an equip is impossible */
 static int wheel_can_use(void) {
@@ -85,7 +86,7 @@ static int wheel_pick_h(float dx, float dy, float dead, int n_tools, int prev) {
         if (diff > tau * 0.5f) {
             diff = tau - diff;
         }
-        if (diff < sector * 0.5f * 1.2f) {
+        if (diff < sector * 0.5f * 1.06f) {
             return prev;
         }
     }
@@ -111,7 +112,9 @@ void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int 
         } else if (hold) {
             if (s_pad_opened) {
                 float dx = (float)rx, dy = (float)ry;
-                s_sel = wheel_pick_h(dx, dy, (float)dz, s_n, s_sel);
+                if (sqrtf(dx * dx + dy * dy) > (float)dz) { /* LATCHED: only a deliberate push outside the deadzone changes the selection; recentering keeps it */
+                    s_sel = wheel_pick_h(dx, dy, 0.0f, s_n, s_sel > 0 ? s_sel : 0);
+                }
             } else {
                 int w = 640, h = 480;
                 if (g_pc_window != NULL) {
@@ -124,12 +127,24 @@ void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int 
             *cstick_y = 0;
         } else { /* release: submit once */
             s_open = 0;
+            *buttons = 0; /* this frame still belongs to the wheel */
+            *cstick_x = 0;
+            *cstick_y = 0;
+            s_suppress_c = s_pad_opened;
             if (s_sel == 0) {
                 s_req_kind = 2;
             } else if (s_sel - 1 < s_n && s_entries[s_sel - 1].slot >= 0) {
                 s_req_kind = 1;
                 s_req_slot = s_entries[s_sel - 1].slot;
             } /* the tool already in hand: nothing to do */
+        }
+    }
+    if (s_suppress_c && !s_open) { /* camera input resumes once the stick has been neutral */
+        if (sqrtf((float)rx * (float)rx + (float)ry * (float)ry) > (float)dz) {
+            *cstick_x = 0;
+            *cstick_y = 0;
+        } else {
+            s_suppress_c = 0;
         }
     }
     s_prev_hold = hold;
@@ -177,17 +192,17 @@ static void wheel_rect(struct game_s* game, float x, float y, float w, float h, 
 
 void pc_tool_wheel_draw(struct game_s* game) {
     int i;
-    const float cx = 160.0f, cy = 120.0f, rx = 88.0f, ry = 64.0f;
+    const float cx = 160.0f, cy = 120.0f, R = 74.0f; /* a true circle: the screen is a uniform scale of this 320x240 space, so a slot sits at exactly the angle its sector is selected at */
     if (!s_open || game == NULL || game->graph == NULL) {
         return;
     }
     mFont_SetMatrix(game->graph, mFont_MODE_FONT);
     pc_menu_dim_rect(game->graph, 120);
-    wheel_rect(game, cx - rx - 40.0f, cy - ry - 18.0f, 2.0f * (rx + 40.0f), 2.0f * (ry + 18.0f), 0, 0, 0, 70); /* a darker ring area */
+    wheel_rect(game, cx - R - 44.0f, cy - R - 20.0f, 2.0f * (R + 44.0f), 2.0f * (R + 20.0f), 0, 0, 0, 70); /* a darker ring area */
     for (i = 0; i <= s_n; i++) {
         float ang = (s_n > 0 && i > 0) ? (6.28318530718f * (float)(i - 1) / (float)s_n) : 0.0f;
-        float x = cx + (i > 0 ? rx * sinf(ang) : 0.0f);
-        float y = cy - (i > 0 ? ry * cosf(ang) : 0.0f);
+        float x = cx + (i > 0 ? R * sinf(ang) : 0.0f);
+        float y = cy - 9.0f - (i > 0 ? R * cosf(ang) : 0.0f); /* y = top of the box; its centre is the circle point */
         char label[40];
         int sel = (i == s_sel);
         float tw, bw;
