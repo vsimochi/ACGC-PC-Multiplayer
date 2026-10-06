@@ -12153,6 +12153,11 @@ static int pcnetgame_mbox_house_of(const PersonalID_c* pid) {
  *   the host consumed an order is STALE_BASE (it cannot resurrect it).
  * CLIENT-OWNED: every other byte (uploaded value replaces the host value), including unused/padding spans (opaque,
  *   shape-validated only). */
+/* HOST-OWNED BITS inside the client-owned u32 state_flags (Private_c 0x2348): the museum completion letter bits (mPr_FLAG_MUSEUM_COMP_HANDBILL_SCHEDULED / _RECEIVED, bits 6 and 7) are written
+ * ONLY by the host's day-change code (mMsm_SetPrivateCompMail over every private_data[]) and must never be undone by a client upload that was built before: the host KEEPS its value of
+ * those bits on every upload merge, a push (full or host-fields) always TAKES the host's value, the host-consumption digest covers them (an upload built before the host set them is
+ * STALE_BASE) and the client-owned digest ignores them (a host-set bit is not a local edit). Every other bit of state_flags stays client-owned. */
+#define PC_NETGAME_REC_HOSTBITS_STATE_FLAGS ((u32)(mPr_FLAG_MUSEUM_COMP_HANDBILL_SCHEDULED | mPr_FLAG_MUSEUM_COMP_HANDBILL_RECEIVED))
 #define PC_NETGAME_REC_OWN_IMMUTABLE 0u
 #define PC_NETGAME_REC_OWN_HOST      1u
 #define PC_NETGAME_REC_OWN_CLIENT    2u
@@ -12409,6 +12414,10 @@ static uint32_t pcnetgame_rec_hostfield_digest(const Private_c* r) {
     h = pcnetgame_fnv1a32_update(h, r->catalog_orders, sizeof(r->catalog_orders));
     h = pcnetgame_fnv1a32_update(h, &r->reset_code, sizeof(r->reset_code));
     h = pcnetgame_fnv1a32_update(h, &r->museum_record, sizeof(r->museum_record)); /* Mail milestone R: HOST-owned, consumed per resident at the day-change grow */
+    {
+        const u32 hb = r->state_flags & PC_NETGAME_REC_HOSTBITS_STATE_FLAGS; /* the host-owned bits of state_flags (museum completion letter) */
+        h = pcnetgame_fnv1a32_update(h, &hb, sizeof(hb));
+    }
     return h;
 }
 
@@ -12862,14 +12871,17 @@ static void pcnetgame_rec_merge_into_save(int idx, const Private_c* scratch_nati
     uint8_t* dst = (uint8_t*)pcnetgame_rec_priv_ptr(idx);
     const uint8_t* src = (const uint8_t*)scratch_native;
     int i;
+    u32 keep;
     if (dst == NULL) {
         return;
     }
+    keep = ((Private_c*)dst)->state_flags & PC_NETGAME_REC_HOSTBITS_STATE_FLAGS; /* the host's value of its bits inside the client-owned u32 */
     for (i = 0; i < PC_NETGAME_REC_RANGE_NUM; i++) {
         if (s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_CLIENT || s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_SHARED) {
             memcpy(dst + s_rec_ranges[i].off, src + s_rec_ranges[i].off, s_rec_ranges[i].len);
         }
     }
+    ((Private_c*)dst)->state_flags = (((Private_c*)dst)->state_flags & ~PC_NETGAME_REC_HOSTBITS_STATE_FLAGS) | keep;
 }
 
 /* Start a host -> client push for the peer's bound resident: snapshot the BE image now (consistent digest/rev). */
@@ -15640,7 +15652,16 @@ static uint32_t pcnetgame_crec_cown_digest(const uint8_t* be) {
     for (i = 0; i < PC_NETGAME_REC_RANGE_NUM; i++) {
         if (s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_CLIENT || s_rec_ranges[i].owner == PC_NETGAME_REC_OWN_SHARED) {
             /* SHARED (catalog_orders, lotto) too: a local shop order / ticket is a client edit that must be uploaded */
-            h = pcnetgame_fnv1a32_update(h, be + s_rec_ranges[i].off, s_rec_ranges[i].len);
+            const unsigned lo = s_rec_ranges[i].off, hi = s_rec_ranges[i].off + s_rec_ranges[i].len;
+            const unsigned sfb = 0x2348u + 3u; /* the BE byte holding bits 0..7 of state_flags */
+            if (lo <= sfb && sfb < hi) { /* the host-owned bits of state_flags are not a client edit: hashed as 0 */
+                uint8_t masked = (uint8_t)(be[sfb] & ~(uint8_t)PC_NETGAME_REC_HOSTBITS_STATE_FLAGS);
+                h = pcnetgame_fnv1a32_update(h, be + lo, sfb - lo);
+                h = pcnetgame_fnv1a32_update(h, &masked, 1);
+                h = pcnetgame_fnv1a32_update(h, be + sfb + 1u, hi - sfb - 1u);
+            } else {
+                h = pcnetgame_fnv1a32_update(h, be + s_rec_ranges[i].off, s_rec_ranges[i].len);
+            }
         }
     }
     return h;
@@ -17852,6 +17873,22 @@ static void pcnetgame_world_test_poke_event(void) {
     printf("[NET][EVENT][TEST-ONLY] --world-test-force: host poked event_save_common.ghost_day = 0x%04X (NOT active in normal play)\n", (unsigned)s_world_test_poke_md);
 }
 
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_MUSEUM_BITS=<resident slot>,<mask hex>): once the world is ready the host sets those state_flags bits in that resident's record (what the day-change museum code
+ * does for the completion letter). Never active in normal play. */
+static void pcnetgame_museum_bits_test_hook(void) {
+    static int done = 0;
+    const char* e;
+    unsigned slot, mask;
+    PCNetGameRecSlot* rs;
+    if (done || (e = pc_test_hook_getenv("AC_TEST_MUSEUM_BITS")) == NULL || sscanf(e, "%u,%x", &slot, &mask) != 2 || slot >= PLAYER_NUM || (rs = pcnetgame_rec_slot((int)slot)) == NULL) {
+        return;
+    }
+    done = 1;
+    Save_Get(private_data)[slot].state_flags |= (u32)mask;
+    printf("[NET][REC][TEST-ONLY] host: resident %u state_flags |= 0x%X (the museum completion bits the day change would set)%s", slot, mask, "\n");
+    (void)pcnetgame_rec_refresh_hostfields((int)slot, rs);
+}
+
 static void pcnetgame_host_ts_tick(void) {
     uint32_t now = pcnetgame_now_ms();
     int p;
@@ -17866,6 +17903,7 @@ static void pcnetgame_host_ts_tick(void) {
         s_ts_next_check_ms = now;
         pcnetgame_ts_refresh_all();
     }
+    pcnetgame_museum_bits_test_hook();
     pcnetgame_evnpc_host_tick();
     for (p = 0; p < PC_NET_MAX_PEERS; p++) {
         PCNetGameHostPeerState* wst = &s_host_peer[p];
@@ -20253,6 +20291,7 @@ static void pcnetgame_crec_apply_staged(int host_only, int* cloth_refreshed, int
         }
         memcpy(dst + r->off, src + r->off, r->len);
     }
+    s_crec_merged.state_flags = (s_crec_merged.state_flags & ~PC_NETGAME_REC_HOSTBITS_STATE_FLAGS) | (s_crec_scratch.state_flags & PC_NETGAME_REC_HOSTBITS_STATE_FLAGS); /* host-owned bits: always the host's */
     memcpy(np, &s_crec_merged, sizeof(Private_c)); /* the single write into the live record; no mPr_ init helper, no RNG */
     *equip_changed = np->equipment != old_equip;
     pcnetgame_look_refresh_after_adopt(old_gender, old_face, np); /* G3.3: guests only */

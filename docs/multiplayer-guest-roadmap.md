@@ -1435,3 +1435,15 @@ Audit of the guest / resident paths (read from code, then run with real processe
 The OWNER's client path (dirty test -> OWNER_COMMIT with the pockets -> APPLIED -> push to everybody else) had no process test; it is now exercised by two REAL clients: `AC_TEST_HOUSE_CLIENT_SWAP=<floor>,<cellA>,<cellB>` (TEST-ONLY, AC_TEST_HOOKS=1) swaps two layer-0 cells of the client's OWN house in its local save once the house + record are settled (the gate of the in-room commit), the unchanged commit machinery does the rest.
 
 Test: `test_house_default_real.py` (REAL plain host + 2 REAL client processes + a scripted guest): the announcement with no flag, A's furniture move committed by the host (seq 1 -> 2, digest changed), B (another real process) receives the new canonical house, B restarted is pushed seq 2 at join, a guest is never pushed a house, the host restarted on the committed save has the same canonical digest. NOT run (needs UI to enter a room): the in-room live rebuild of a visitor, entering / leaving a house, disconnect while inside, drawer contents.
+
+## Patch 6 - letters / designs / collections (scoped)
+
+Ownership analysis (who owns it / where it lives / who may change it):
+- Per-resident letters (mail[]), pockets, catalog orders, lotto: already per-character D3 record + host TXN (earlier milestones).
+- Museum completion letter bits (`state_flags` 0xC0, `mPr_FLAG_MUSEUM_COMP_HANDBILL_*`): written only by the host's day-change code, but live as bits inside the CLIENT-owned u32.
+  NEW (this patch): per-bit host ownership. The host keeps its bits on every upload merge (`pcnetgame_rec_merge_into_save`), a client always adopts the host's bits
+  (`pcnetgame_crec_apply_staged`), the host-consumption digest covers them (`pcnetgame_rec_hostfield_digest`), the client-owned digest ignores them (`pcnetgame_crec_cown_digest`).
+  Test: `tools/net_spike/test_museum_bits_protocol.py` (real host, scripted client; hook `AC_TEST_MUSEUM_BITS=<slot>,<mask>` with `AC_TEST_HOOKS=1`) - 7/7.
+- Museum item collection (`museum_record`) was already HOST-owned (mail milestone R).
+- NOT done (documented, no whole-blob migration attempted): a host-authoritative page store for town-shared letter boards / original designs. They remain per-player
+  save data (diary PDATA machinery covers the diary only). Next milestone candidate.
