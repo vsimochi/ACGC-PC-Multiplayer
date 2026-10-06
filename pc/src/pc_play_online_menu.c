@@ -155,7 +155,7 @@ static void text_end(void) {
 static int text_max(void) {
     switch (s_text) {
         case T_SRV_NAME: return PC_SERVER_NAME_MAX;
-        case T_SRV_ADDR: return 15;
+        case T_SRV_ADDR: return PC_SERVER_ADDR_MAX - 1;
         case T_SRV_PORT: return 5;
         case T_CHAR_NAME: return 16;
     }
@@ -165,7 +165,7 @@ static int text_max(void) {
 static int text_char_ok(unsigned char c) {
     switch (s_text) {
         case T_SRV_NAME: return glyph_ok(c) && strchr("[]=\"\\", c) == NULL;
-        case T_SRV_ADDR: return (c >= '0' && c <= '9') || c == '.';
+        case T_SRV_ADDR: return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '-';
         case T_SRV_PORT: return c >= '0' && c <= '9';
         case T_CHAR_NAME: return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-';
     }

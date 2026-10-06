@@ -74,8 +74,11 @@ def main():
     check("--servers lists both", r.returncode == 0 and "name='Friends' address=192.168.1.20 port=7778" in r.stdout and "name='Home'" in r.stdout and ": 2" in r.stdout)
     r = run(["--server-add", "friends", "1.2.3.4"], cwd)
     check("--server-add duplicate name exits 2", r.returncode == 2 and "already exists" in r.stderr)
-    r = run(["--server-add", "Bad", "example.com"], cwd)
-    check("--server-add hostname exits 2 (no resolution)", r.returncode == 2 and "hostnames are not resolved" in r.stderr)
+    r = run(["--server-add", "Bad", "bad_host!"], cwd)
+    check("--server-add malformed hostname exits 2", r.returncode == 2 and "hostname" in r.stderr)
+    r = run(["--server-add", "Tun", "example.gl.at.ply.gg:12345"], cwd)
+    check("--server-add hostname exits 0 and reports it", r.returncode == 0 and "example.gl.at.ply.gg:12345" in r.stdout)
+    r = run(["--server-delete", "Tun"], cwd)
     r = run(["--server-add", "Bad", "1.2.3.4:0"], cwd)
     check("--server-add port 0 exits 2", r.returncode == 2)
     r = run(["--server-add", "Bad"], cwd)
@@ -97,7 +100,7 @@ def main():
     r = run(["--servers"], cwd)
     check("--servers afterwards: only Home", r.returncode == 0 and "name='Home'" in r.stdout and "Friends" not in r.stdout)
     # corrupt file: refused everywhere, byte-identical afterwards
-    bad = b"[server]\nname = X\naddress = nothost\n"
+    bad = b"[server]\nname = X\naddress = bad_host!\n"
     with open(ini, "wb") as f:
         f.write(bad)
     r1 = run(["--servers"], cwd)

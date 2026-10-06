@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+const char* pc_test_hook_getenv(const char* name) { (void)name; return NULL; } /* the relaunch module links the production hook accessor; the unit test has none */
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -52,7 +54,7 @@ static PCServer mk(const char* name, const char* addr, int port) {
 }
 
 int main(int argc, char** argv) {
-    char dir[300], path[320], tmp[330], err[400], a[16], b1[4096], b2[4096];
+    char dir[300], path[320], tmp[330], err[400], a[PC_SERVER_ADDR_MAX], b1[4096], b2[4096];
     PCServer l[PC_SERVER_MAX + 4], s;
     int n = 0, port = 0, i, r;
     if (argc < 2) {
@@ -77,8 +79,13 @@ int main(int argc, char** argv) {
     check("name: leading space refused", !pc_servers_name_check(" ab", err, sizeof(err)));
     check("address: ok", pc_servers_address_check("192.168.1.20", err, sizeof(err)));
     check("address: 255.255.255.255 ok", pc_servers_address_check("255.255.255.255", err, sizeof(err)));
-    check("address: hostname refused", !pc_servers_address_check("example.com", err, sizeof(err)));
-    check("address: localhost refused (no resolution)", !pc_servers_address_check("localhost", err, sizeof(err)));
+    check("address: hostname ok", pc_servers_address_check("example.com", err, sizeof(err)) && pc_servers_address_check("example.gl.at.ply.gg", err, sizeof(err)) && pc_servers_address_check("localhost", err, sizeof(err)) &&
+                                    pc_servers_address_check("my-host.Example.COM", err, sizeof(err)) && pc_servers_address_check("host1", err, sizeof(err)));
+    check("address: malformed hostnames refused", !pc_servers_address_check("-a.com", err, sizeof(err)) && !pc_servers_address_check("a-.com", err, sizeof(err)) && !pc_servers_address_check("a..com", err, sizeof(err)) &&
+                                                  !pc_servers_address_check("a.com.", err, sizeof(err)) && !pc_servers_address_check(".a.com", err, sizeof(err)) && !pc_servers_address_check("a_b.com", err, sizeof(err)) &&
+                                                  !pc_servers_address_check("a b.com", err, sizeof(err)) && !pc_servers_address_check("a/b.com", err, sizeof(err)) && !pc_servers_address_check("[::1]", err, sizeof(err)));
+    check("address: label > 63 / total > 63 refused", !pc_servers_address_check("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com", err, sizeof(err)) &&
+                                                      !pc_servers_address_check("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", err, sizeof(err)));
     check("address: 256 refused", !pc_servers_address_check("1.2.3.256", err, sizeof(err)));
     check("address: 3 parts refused", !pc_servers_address_check("1.2.3", err, sizeof(err)));
     check("address: 5 parts refused", !pc_servers_address_check("1.2.3.4.5", err, sizeof(err)));
@@ -86,6 +93,9 @@ int main(int argc, char** argv) {
     check("address: trailing dot refused", !pc_servers_address_check("1.2.3.4.", err, sizeof(err)));
     check("address: with port refused", !pc_servers_address_check("1.2.3.4:7777", err, sizeof(err)));
     check("port: 0 refused, 65536 refused, 1 / 65535 ok", !pc_servers_port_check(0) && !pc_servers_port_check(65536) && pc_servers_port_check(1) && pc_servers_port_check(65535));
+    check("hostport: hostname + port", pc_servers_parse_hostport("example.gl.at.ply.gg:12345", a, &port, err, sizeof(err)) && port == 12345 && strcmp(a, "example.gl.at.ply.gg") == 0);
+    check("hostport: bad hostname / port refused", !pc_servers_parse_hostport("bad_host:1", a, &port, err, sizeof(err)) && !pc_servers_parse_hostport("host.com:99999", a, &port, err, sizeof(err)) &&
+                                                   !pc_servers_parse_hostport(":7777", a, &port, err, sizeof(err)));
     check("hostport: default port 7777", pc_servers_parse_hostport("10.0.0.5", a, &port, err, sizeof(err)) && port == 7777 && strcmp(a, "10.0.0.5") == 0);
     check("hostport: explicit port", pc_servers_parse_hostport("10.0.0.5:9000", a, &port, err, sizeof(err)) && port == 9000);
     check("hostport: bad port refused", !pc_servers_parse_hostport("10.0.0.5:0", a, &port, err, sizeof(err)) && !pc_servers_parse_hostport("10.0.0.5:x", a, &port, err, sizeof(err)) &&
@@ -100,8 +110,8 @@ int main(int argc, char** argv) {
     check("add Work", pc_servers_add(dir, &s, err, sizeof(err)) == PC_SERVERS_OK);
     s = mk("FRIENDS", "1.1.1.1", 1);
     check("add duplicate (case-insensitive) refused EXISTS", pc_servers_add(dir, &s, err, sizeof(err)) == PC_SERVERS_EXISTS);
-    s = mk("Bad", "example.com", 7777);
-    check("add hostname refused INVALID", pc_servers_add(dir, &s, err, sizeof(err)) == PC_SERVERS_INVALID);
+    s = mk("Bad", "bad_host!", 7777);
+    check("add malformed hostname refused INVALID", pc_servers_add(dir, &s, err, sizeof(err)) == PC_SERVERS_INVALID);
     s = mk("Bad", "1.1.1.1", 0);
     check("add port 0 refused INVALID", pc_servers_add(dir, &s, err, sizeof(err)) == PC_SERVERS_INVALID);
     r = pc_servers_load(dir, l, PC_SERVER_MAX, &n, err, sizeof(err));
@@ -129,7 +139,7 @@ int main(int argc, char** argv) {
     /* corrupt files are never overwritten */
     {
         static const char* const bad[] = {
-            "[server]\nname = A\naddress = example.com\n",          /* hostname */
+            "[server]\nname = A\naddress = bad_host!\n",          /* malformed hostname */
             "[server]\nname = A\n",                                  /* no address */
             "name = A\naddress = 1.2.3.4\n",                        /* key outside a section */
             "[other]\nx = 1\n",                                      /* unknown section */
@@ -177,7 +187,7 @@ int main(int argc, char** argv) {
                                                strcmp(b1, "--connect 10.0.0.5:9000 --guest-profile \"roger\" --town-fetch --online-ui") == 0);
     check("relaunch args: default guest", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) && strcmp(b1, "--connect 10.0.0.5:9000 --guest --town-fetch --online-ui") == 0);
     check("relaunch args: injection / bad values refused",
-          !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "a\" --host", b1, sizeof(b1)) && !pc_relaunch_build_args("example.com", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) &&
+          !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "a\" --host", b1, sizeof(b1)) && !pc_relaunch_build_args("bad host.com", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) &&
               !pc_relaunch_build_args("10.0.0.5", 0, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) && !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "", b1, sizeof(b1)));
 
     /* M-C: forwarded display options (whitelist only, a number for --framelimit) */

@@ -220,6 +220,8 @@ int pc_net_peer_count(void);   /* number of currently-connected peers (0 or 1 fo
  * `peer`, measured at call time; -1 if `peer` is not a connected host-side peer (and always -1 on a client).
  * Read-only liveness query -- a healthy remote sends at least a heartbeat every 500 ms. No wire change. */
 int pc_net_peer_idle_ms(PCNetPeerId peer);
+/* Client: smoothed RTT (ms) the reliable layer measured from DATA -> ACK, plus the age of the newest sample. 1 = available, 0 = none yet / not a client. No wire change. */
+int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms);
 /* Guests: the connected peer's IPv4 address (network byte order), 0 if unknown. Read-only. */
 uint32_t pc_net_peer_ip(PCNetPeerId peer);
 

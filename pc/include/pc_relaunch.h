@@ -22,7 +22,7 @@ enum {
 void pc_relaunch_forward_capture(int argc, char** argv);
 const char* pc_relaunch_forwarded(void); /* " --verbose ..." (leading space) or "" */
 
-/* Builds the argument tail (without the exe), e.g. `--connect 192.168.1.5:7777 --character "ab12..." --town-fetch --online-ui [forwarded]`. `host` must be an IPv4 literal, `port` 1..65535 and `name`
+/* Builds the argument tail (without the exe), e.g. `--connect 192.168.1.5:7777 --character "ab12..." --town-fetch --online-ui [forwarded]`. `host` must be an IPv4 literal or a valid hostname, `port` 1..65535 and `name`
  * only [A-Za-z0-9-] (1..32) so no quoting / injection is possible. 1 = ok, 0 = refused. */
 int pc_relaunch_build_args(const char* host, int port, int kind, const char* name, char* out, size_t cap);
 

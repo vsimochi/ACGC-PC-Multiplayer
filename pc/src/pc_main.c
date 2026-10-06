@@ -400,6 +400,11 @@ int pc_platform_poll_events(void) {
                     pc_settings_menu_handle_capture_event(&event);
                     break;
                 }
+                if (event.key.keysym.sym == SDLK_F4 && !event.key.repeat) {
+                    g_pc_settings.show_ping = !g_pc_settings.show_ping;
+                    printf("[PC] ping counter %s (F4)\n", g_pc_settings.show_ping ? "on" : "off"); /* session-only; settings.ini show_ping sets the start value */
+                    break;
+                }
                 if (event.key.keysym.sym == SDLK_F3 && !event.key.repeat) {
                     pc_speedhack_toggle();
                     break;
@@ -1554,8 +1559,8 @@ int main(int argc, char* argv[]) {
             printf("  --server NAME       CLIENT: connect to the saved server NAME (save/mp/servers.ini; fills --connect HOST:PORT; refused with --connect /\n");
             printf("                      --host / --dedicated or an unknown NAME, exit 2). Use it with --character NAME|UUID (or --guest-profile NAME);\n");
             printf("                      alone it implies --guest (the default guest profile). A server is only a destination; characters are not tied to it.\n");
-            printf("  --servers           list the saved servers and exit 0.  --server-add NAME HOST[:PORT]  save a server (HOST = IPv4 literal, port default\n");
-            printf("                      7777; no hostname resolution).  --server-delete NAME  remove one. Exit 0, or 2 on a refusal.\n");
+            printf("  --servers           list the saved servers and exit 0.  --server-add NAME HOST[:PORT]  save a server (HOST = IPv4 literal or DNS hostname, port default\n");
+            printf("                      7777; a hostname is resolved when connecting).  --server-delete NAME  remove one. Exit 0, or 2 on a refusal.\n");
             printf("  --no-house-sync     HOST: turn OFF furniture sync, which a --dedicated host enables by default.\n");
             printf("  --house-sync        HOST opt-in (already the DEFAULT for --dedicated): the host is authoritative for the furniture of player houses (the owner's edits are committed to\n");
             printf("                      the host together with the pocket record; announced to every client in HOST_CONFIG). Off by default.\n");
@@ -1923,7 +1928,7 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--server-add") == 0) {
             if (i + 2 >= argc || argv[i + 1][0] == '\0' || g_pc_server_add_name != NULL) {
                 fprintf(stderr, "[PC] --server-add: REFUSED: the option needs NAME HOST[:PORT]\n"
-                                "usage: AnimalCrossing --server-add NAME HOST[:PORT]   (HOST = IPv4 literal, port default 7777; see --help)\n");
+                                "usage: AnimalCrossing --server-add NAME HOST[:PORT]   (HOST = IPv4 literal or DNS hostname, port default 7777; see --help)\n");
                 return 2;
             }
             g_pc_server_add_name = argv[i + 1];
@@ -2066,7 +2071,7 @@ int main(int argc, char* argv[]) {
                 snprintf(ns.name, sizeof(ns.name), "%s", g_pc_server_add_name);
             }
             if (too_long || !pc_servers_parse_hostport(g_pc_server_add_addr, ns.address, &ns.port, serr, sizeof(serr))) {
-                fprintf(stderr, "[PC] --server-add: REFUSED: %s\nusage: AnimalCrossing --server-add NAME HOST[:PORT]   (HOST = IPv4 literal)\n",
+                fprintf(stderr, "[PC] --server-add: REFUSED: %s\nusage: AnimalCrossing --server-add NAME HOST[:PORT]   (HOST = IPv4 literal or DNS hostname)\n",
                         too_long ? "server name must be 1..32 characters" : serr);
                 return 2;
             }

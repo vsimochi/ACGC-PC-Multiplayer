@@ -62,13 +62,9 @@ int pc_servers_name_check(const char* name, char* err, size_t errcap) {
     return 1;
 }
 
-int pc_servers_address_check(const char* addr, char* err, size_t errcap) {
+static int ipv4_literal_check(const char* addr) {
     int parts = 0;
     const char* p = addr;
-    if (addr == NULL || addr[0] == '\0') {
-        seterr(err, errcap, "address is empty");
-        return 0;
-    }
     while (1) {
         int digits = 0;
         long v = 0;
@@ -78,10 +74,7 @@ int pc_servers_address_check(const char* addr, char* err, size_t errcap) {
             digits++;
             p++;
         }
-        if (digits < 1 || digits > 3 || v > 255 || (digits > 1 && *start == '0')) {
-            seterr(err, errcap, "address must be an IPv4 literal a.b.c.d (0..255, no leading zeros; hostnames are not resolved)");
-            return 0;
-        }
+        if (digits < 1 || digits > 3 || v > 255 || (digits > 1 && *start == '0')) return 0;
         parts++;
         if (*p == '.') {
             p++;
@@ -89,18 +82,68 @@ int pc_servers_address_check(const char* addr, char* err, size_t errcap) {
         }
         break;
     }
-    if (*p != '\0' || parts != 4) {
-        seterr(err, errcap, "address must be an IPv4 literal a.b.c.d (hostnames are not resolved)");
+    return *p == '\0' && parts == 4;
+}
+
+/* DNS hostname: 1..63 chars in total (the address buffers are 64 bytes), dot-separated labels of 1..63 [A-Za-z0-9-], a label never starts / ends with '-', no
+ * trailing dot. A name made only of digits and dots is NOT a hostname (a malformed IPv4 literal such as 1.2.3 or 256.1.1.1 is refused as before). */
+static int hostname_check(const char* addr, char* err, size_t errcap) {
+    size_t n = strlen(addr), i, label = 0;
+    int only_numeric = 1;
+    if (n > PC_SERVER_ADDR_MAX - 1) {
+        seterr(err, errcap, "address is too long (max 63 characters)");
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)addr[i];
+        const int alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (!(c >= '0' && c <= '9') && c != '.') only_numeric = 0;
+        if (c == '.') {
+            if (label == 0 || addr[i - 1] == '-') {
+                seterr(err, errcap, "address has an empty or malformed hostname label");
+                return 0;
+            }
+            label = 0;
+            continue;
+        }
+        if (!alnum && c != '-') {
+            seterr(err, errcap, "address must be an IPv4 literal or a hostname (letters, digits, '-' and '.')");
+            return 0;
+        }
+        if (c == '-' && label == 0) {
+            seterr(err, errcap, "a hostname label must not start with '-'");
+            return 0;
+        }
+        if (++label > 63) {
+            seterr(err, errcap, "a hostname label is longer than 63 characters");
+            return 0;
+        }
+    }
+    if (label == 0 || addr[n - 1] == '-') {
+        seterr(err, errcap, "address has an empty or malformed hostname label");
+        return 0;
+    }
+    if (only_numeric) {
+        seterr(err, errcap, "address must be an IPv4 literal a.b.c.d (0..255, no leading zeros) or a hostname");
         return 0;
     }
     return 1;
+}
+
+int pc_servers_address_check(const char* addr, char* err, size_t errcap) {
+    if (addr == NULL || addr[0] == '\0') {
+        seterr(err, errcap, "address is empty");
+        return 0;
+    }
+    if (ipv4_literal_check(addr)) return 1;
+    return hostname_check(addr, err, errcap);
 }
 
 int pc_servers_port_check(long port) {
     return port >= 1 && port <= 65535;
 }
 
-int pc_servers_parse_hostport(const char* text, char address[16], int* port, char* err, size_t errcap) {
+int pc_servers_parse_hostport(const char* text, char address[PC_SERVER_ADDR_MAX], int* port, char* err, size_t errcap) {
     char buf[64];
     char* colon;
     size_t n;

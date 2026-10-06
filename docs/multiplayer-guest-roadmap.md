@@ -1349,3 +1349,8 @@ Known limitations that materially affect play (all documented above and in "Know
 8. Guest identity (name, home town, ids) is permanent: changing it makes a new guest, and the old character stays on the host until the operator removes it.
 
 Verdict: ready for a supervised friends-and-LAN test of arrival, reconnection, capacity and failure handling; NOT ready to be advertised as a public / internet feature until limitations 1, 2 and 4 are addressed.
+
+## Hostname server addresses + client ping counter (release prep)
+
+- **Hostnames.** A saved server / `--connect` address is an IPv4 literal or a DNS hostname (labels of `[A-Za-z0-9-]`, 1..63 characters in total, no IPv6, a name of only digits and dots must be a valid IPv4 literal). `servers.ini` stores it verbatim. `pc_net_client_connect` resolves it once per connect with `getaddrinfo(AF_INET)` (IPv4 literal fast path unchanged); the town prefetch uses the same call. Nothing else changed, the UDP wire protocol is untouched. A host IP change while the game runs is only noticed at the next connect (auto-reconnect reuses the address resolved at connect).
+- **Ping counter.** `settings.ini` `show_ping = 0|1` (default 0), `F4` toggles it for the session. It reads the RTT the reliable layer already keeps (`srtt`, DATA -> ACK samples, `pc_net_client_rtt_ms`), refreshed once a second, shown top-right only while a client is READY; "Ping: --" until a sample exists or when the newest is older than 30 s. It sends no packets and never feeds heartbeat/timeout/reconnect logic. Samples only occur when the client sends reliable data, so a long idle stretch shows "--".

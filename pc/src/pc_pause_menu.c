@@ -3,6 +3,9 @@
 #include "pc_settings_menu.h"
 #include "pc_menu_util.h"
 #include "pc_text_draw.h"
+#include "pc_net.h"
+#include "pc_settings.h"
+#include <SDL.h>
 #include "pc_net_game.h" /* batch A (A3): pc_net_game_client_notice_visible() */
 
 #include "m_font.h"
@@ -290,9 +293,38 @@ static void pc_net_join_message_draw(struct game_s* game, const char* msg, int i
     }
 }
 
+/* Optional client ping counter (settings.ini show_ping / F4): a read-only view of the reliable layer's own DATA->ACK RTT, refreshed once a second; only while
+ * connected as a client. Draws nothing on the title / single player and never touches heartbeat, timeout or reconnect state. */
+static void pc_net_ping_draw(struct game_s* game) {
+    static uint32_t shown_tick = 0;
+    static char     line[24] = "";
+    static int      last_ok = 0;
+    static int      announced = 0;
+    uint32_t rtt, age, now;
+    if (!g_pc_settings.show_ping || game == NULL || game->graph == NULL || pc_net_is_host() || !pc_net_is_connected() || pc_net_game_client_link_state() != PC_NETGAME_LINK_READY) return;
+    if (!announced) {
+        announced = 1;
+        printf("[NET][PING] counter ON (client)\n");
+    }
+    now = SDL_GetTicks();
+    if (shown_tick == 0 || (uint32_t)(now - shown_tick) >= 1000u) {
+        const int was_ok = last_ok;
+        shown_tick = now ? now : 1u;
+        last_ok = pc_net_client_rtt_ms(&rtt, &age) && age <= 30000u;
+        if (last_ok && !was_ok) printf("[NET][PING] counter: first measurement %u ms (sample age %u ms)\n", (unsigned)rtt, (unsigned)age);
+        if (last_ok) snprintf(line, sizeof(line), "Ping: %u ms", (unsigned)rtt);
+        else snprintf(line, sizeof(line), "Ping: --");
+    }
+    mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+    pc_menu_draw_left(game, line, SCREEN_WIDTH_F - (f32)pc_text_width(line) * 0.75f - 8.0f, 4.0f, last_ok ? 200 : 170, last_ok ? 255 : 170, last_ok ? 200 : 170, 230, 0.75f);
+    mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+}
+
 void pc_net_notice_draw(struct game_s* game) {
     int join_warning = 0;
     const char* join_msg;
+
+    pc_net_ping_draw(game);
 
     if (g_pc_paused || game == NULL || game->graph == NULL) return;
     {

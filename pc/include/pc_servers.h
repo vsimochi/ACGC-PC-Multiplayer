@@ -12,8 +12,9 @@
  * a key outside a section, bad name / address / port, duplicate name, missing name or address, too many entries, file > 64 KiB) makes the whole file CORRUPT:
  * it is reported, never auto-repaired, never overwritten, moved or deleted (every write is refused with PC_SERVERS_CORRUPT).
  *
- * ADDRESS = an IPv4 dotted-quad literal ONLY (a.b.c.d, each 0..255, no leading zeros): the PC networking code (pc_net.c) uses inet_pton(AF_INET) and does
- * no hostname resolution, so a hostname is refused up front instead of failing later. Port 1..65535, default 7777. Writes are atomic (tmp + replace). */
+ * ADDRESS = an IPv4 dotted-quad literal (a.b.c.d, each 0..255, no leading zeros) OR a DNS hostname (labels of [A-Za-z0-9-], max 63 chars in total), stored
+ * verbatim. The hostname is only RESOLVED at connection time (pc_net_client_connect, getaddrinfo AF_INET); this module never touches the network. A name made only of
+ * digits and dots that is not a valid IPv4 literal is refused. IPv6 literals are not supported (':' separates the port). Port 1..65535, default 7777. Writes are atomic (tmp + replace). */
 #ifndef PC_SERVERS_H
 #define PC_SERVERS_H
 
@@ -26,10 +27,11 @@ extern "C" {
 #define PC_SERVER_MAX 32
 #define PC_SERVER_NAME_MAX 32
 #define PC_SERVER_DEFAULT_PORT 7777
+#define PC_SERVER_ADDR_MAX 64 /* incl. NUL: hostnames up to 63 chars (same size as the town-cache origin and --connect buffers) */
 
 typedef struct PCServer {
     char name[PC_SERVER_NAME_MAX + 1];
-    char address[16];                            /* dotted quad */
+    char address[PC_SERVER_ADDR_MAX];            /* IPv4 dotted quad or DNS hostname, stored verbatim */
     int  port;                                   /* 1..65535 */
     char last_character[PC_SERVER_NAME_MAX + 1]; /* UI hint, "" = none */
     char last_town[PC_SERVER_NAME_MAX + 1];      /* UI hint, "" = none */
@@ -39,11 +41,11 @@ enum { PC_SERVERS_OK = 0, PC_SERVERS_ERR = -1, PC_SERVERS_CORRUPT = -2, PC_SERVE
 
 /* Validation: 1 = ok, 0 = bad with a reason in err (may be NULL). */
 int pc_servers_name_check(const char* name, char* err, size_t errcap);    /* 1..32 printable ASCII, none of [ ] = " \ , no leading / trailing space */
-int pc_servers_address_check(const char* addr, char* err, size_t errcap); /* IPv4 dotted quad literal */
+int pc_servers_address_check(const char* addr, char* err, size_t errcap); /* IPv4 dotted quad literal or DNS hostname */
 int pc_servers_port_check(long port);                                     /* 1..65535 */
 
 /* "HOST[:PORT]" -> address + port (default 7777). 1 = ok, 0 = bad (err). */
-int pc_servers_parse_hostport(const char* text, char address[16], int* port, char* err, size_t errcap);
+int pc_servers_parse_hostport(const char* text, char address[PC_SERVER_ADDR_MAX], int* port, char* err, size_t errcap);
 
 /* dir == NULL -> "save/mp". A missing file is an empty list (OK). CORRUPT: err says why, *count = 0. */
 int pc_servers_load(const char* dir, PCServer* out, int cap, int* count, char* err, size_t errcap);

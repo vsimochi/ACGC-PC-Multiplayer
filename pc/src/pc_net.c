@@ -105,6 +105,7 @@ int pc_net_is_connected(void) { return 0; }
 int pc_net_peer_count(void) { return 0; }
 void pc_net_disconnect(PCNetPeerId peer) { (void)peer; }
 int pc_net_peer_idle_ms(PCNetPeerId peer) { (void)peer; return -1; }
+int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms) { (void)rtt_ms; (void)age_ms; return 0; }
 uint32_t pc_net_peer_ip(PCNetPeerId peer) { (void)peer; return 0; }
 void pc_net_evict(PCNetPeerId peer) { (void)peer; }
 
@@ -196,6 +197,7 @@ typedef struct PCNetPeerSlot {
     uint32_t            tx_next_seq;    /* seq the next pc_net_send(RELIABLE) will use */
     uint32_t            tx_base_seq;    /* oldest seq not yet cumulatively acknowledged */
     uint32_t            srtt_ms;        /* smoothed RTT (Karn samples only); 0 = no sample yet */
+    uint32_t            rtt_tick;       /* GetTickCount() of the last Karn sample (0 = none); read-only, for pc_net_client_rtt_ms */
     /* reliable receive side */
     uint32_t            rx_next_expected; /* first seq not yet received (reported in ACKs) */
     uint32_t            rx_deliver_seq;   /* next seq to hand to the event queue */
@@ -433,6 +435,7 @@ static void pcnet_reset_reliable(int i) {
     p->tx_next_seq = 0;
     p->tx_base_seq = 0;
     p->srtt_ms = 0;
+    p->rtt_tick = 0;
     p->rx_next_expected = 0;
     p->rx_deliver_seq = 0;
     p->ack_pending = 0;
@@ -550,6 +553,7 @@ static void pcnet_tx_mark_acked(int i, uint32_t seq, uint32_t now) {
         if (sample > 10000u) sample = 10000u;
         s_peers[i].srtt_ms = (srtt == 0) ? sample : (7u * srtt + sample) / 8u;
         if (s_peers[i].srtt_ms == 0) s_peers[i].srtt_ms = 1;
+        s_peers[i].rtt_tick = now ? now : 1u;
     }
 }
 
@@ -758,6 +762,25 @@ int pc_net_host_start(uint16_t port) {
 static struct sockaddr_in s_client_host;
 static int s_client_host_valid = 0;
 
+/* Client only: IPv4 literal (fast path, no DNS) or DNS hostname, resolved ONCE per connect through getaddrinfo (AF_INET, UDP; the OS resolver, so hosts file / DNS /
+ * tunnel hostnames all work). Blocks for the resolver's duration; the first IPv4 result wins. 1 = ok. */
+static int pcnet_resolve_host(const char* host, struct in_addr* out) {
+    struct addrinfo hints, *res = NULL;
+    int ok = 0;
+    if (inet_pton(AF_INET, host, out) == 1) return 1;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) return 0;
+    if (res->ai_family == AF_INET && res->ai_addrlen >= sizeof(struct sockaddr_in)) {
+        *out = ((const struct sockaddr_in*)res->ai_addr)->sin_addr;
+        ok = 1;
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
 int pc_net_client_connect(const char* host_ip, uint16_t port) {
     struct sockaddr_in addr;
     if (!s_wsa_started || s_socket != INVALID_SOCKET) return 0;
@@ -767,7 +790,7 @@ int pc_net_client_connect(const char* host_ip, uint16_t port) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host_ip, &addr.sin_addr) != 1) {
+    if (!pcnet_resolve_host(host_ip, &addr.sin_addr)) {
         closesocket(s_socket);
         s_socket = INVALID_SOCKET;
         return 0;
@@ -1134,6 +1157,16 @@ int pc_net_peer_count(void) {
         if (s_peers[i].state == PCNET_PEER_CONNECTED) n++;
     }
     return n;
+}
+
+/* Client only, read-only: the smoothed round-trip time the reliable layer already measures from its own DATA -> ACK exchanges (no extra packets). 1 = a sample
+ * exists (*rtt_ms, and *age_ms = how long ago the newest sample was taken); 0 = not a connected client or no sample yet. Never feeds heartbeat/timeout logic. */
+int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms) {
+    const PCNetPeerSlot* p = &s_peers[0];
+    if (s_socket == INVALID_SOCKET || s_is_host || p->state != PCNET_PEER_CONNECTED || p->srtt_ms == 0 || p->rtt_tick == 0) return 0;
+    if (rtt_ms) *rtt_ms = p->srtt_ms;
+    if (age_ms) *age_ms = GetTickCount() - p->rtt_tick;
+    return 1;
 }
 
 int pc_net_peer_idle_ms(PCNetPeerId peer) {
