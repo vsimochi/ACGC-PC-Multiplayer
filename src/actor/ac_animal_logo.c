@@ -360,7 +360,11 @@ static int aAL_pc_menu_build(int items[5]) {
   extern int pc_guest_title_item_visible(void); /* pc_m_card.c: role == CLIENT */
   int n = 0;
 
-  items[n++] = aAL_PC_ITEM_START;
+  /* Public beta: multiplayer is Play Online, so the old "Start Game" is only offered to a HOST process (--host: it loads the town it serves). With no role or as a
+   * client the menu is Play Online / Join as Guest, Options, Quit. The single-player start code itself is untouched. */
+  if (!pc_guest_title_item_visible() && !pc_play_online_menu_available()) {
+    items[n++] = aAL_PC_ITEM_START;
+  }
   if (pc_guest_title_item_visible()) {
     items[n++] = aAL_PC_ITEM_GUEST;
   } else if (pc_play_online_menu_available()) {

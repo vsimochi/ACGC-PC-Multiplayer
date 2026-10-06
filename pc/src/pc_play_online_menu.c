@@ -42,7 +42,7 @@ static int s_del_sel = 0; /* 0 keep, 1 delete */
 /* text entry */
 static int s_text = T_NONE;
 static int s_text_grace = 0;
-static char s_buf[40];
+static char s_buf[PC_SERVER_ADDR_MAX + 16];
 static int s_buf_len = 0;
 static int s_edit_idx = -1; /* server being edited, -1 = add */
 static PCServer s_draft;
@@ -139,8 +139,11 @@ static void goto_page(int page, int sel) {
 
 /* ---------------- text entry ---------------- */
 
+static int s_paste_port = 0; /* a 'host:port' pasted into the address field: the port step starts with this value */
+
 static void text_begin(int step, const char* initial) {
     s_text = step;
+    if (step == T_SRV_NAME) s_paste_port = 0;
     snprintf(s_buf, sizeof(s_buf), "%s", initial != NULL ? initial : "");
     s_buf_len = (int)strlen(s_buf);
     SDL_StartTextInput();
@@ -230,7 +233,8 @@ static void text_commit(void) {
             set_msg(0, "%s", "");
             {
                 char pb[8];
-                snprintf(pb, sizeof(pb), "%d", s_draft.port > 0 ? s_draft.port : PC_SERVER_DEFAULT_PORT);
+                snprintf(pb, sizeof(pb), "%d", s_paste_port > 0 ? s_paste_port : (s_draft.port > 0 ? s_draft.port : PC_SERVER_DEFAULT_PORT));
+                s_paste_port = 0;
                 text_begin(T_SRV_PORT, pb);
             }
             return;
@@ -288,6 +292,51 @@ int pc_play_online_menu_text_blocking(void) {
     return s_active && (s_text != T_NONE || s_text_grace > 0);
 }
 
+/* Clipboard (Ctrl+V / Ctrl+C / Ctrl+X, Shift+Insert / Ctrl+Insert too). Paste goes through the SAME per-character validation and length limit as typing; whitespace and
+ * line breaks around / inside the text are dropped. In the address field a trailing ':port' (1..65535) is split off and pre-fills the port step; an invalid ':...' is cut. */
+static void text_paste(void) {
+    char* clip;
+    const char* p;
+    char tmp[256];
+    size_t n = 0;
+    if (!SDL_HasClipboardText()) return;
+    clip = SDL_GetClipboardText();
+    if (clip == NULL) return;
+    for (p = clip; *p != '\0' && n < sizeof(tmp) - 1; p++) {
+        if ((unsigned char)*p < 0x20 || (*p == ' ' && s_text != T_SRV_NAME)) continue; /* control chars / line breaks; spaces only inside a server NAME */
+        tmp[n++] = *p;
+    }
+    tmp[n] = '\0';
+    SDL_free(clip);
+    if (s_text == T_SRV_ADDR) {
+        char* colon = strchr(tmp, ':');
+        if (colon != NULL) {
+            char* end = NULL;
+            const long port = strtol(colon + 1, &end, 10);
+            *colon = '\0';
+            if (colon[1] != '\0' && end != NULL && *end == '\0' && pc_servers_port_check(port)) s_paste_port = (int)port;
+        }
+    }
+    for (p = tmp; *p != '\0'; p++) {
+        const unsigned char c = (unsigned char)*p;
+        if (c == ' ' && s_buf_len == 0) {
+            continue;
+        }
+        if (s_buf_len < text_max() && s_buf_len < (int)sizeof(s_buf) - 1 && text_char_ok(c)) {
+            s_buf[s_buf_len++] = (char)c;
+            s_buf[s_buf_len] = '\0';
+        }
+    }
+}
+
+static void text_copy(int cut) {
+    if (s_buf_len > 0) SDL_SetClipboardText(s_buf);
+    if (cut) {
+        s_buf[0] = '\0';
+        s_buf_len = 0;
+    }
+}
+
 int pc_play_online_menu_handle_text_event(const SDL_Event* e) {
     if (!pc_play_online_menu_text_active()) return 0;
     switch (e->type) {
@@ -295,6 +344,9 @@ int pc_play_online_menu_handle_text_event(const SDL_Event* e) {
             const char* p;
             for (p = e->text.text; *p; p++) {
                 const unsigned char c = (unsigned char)*p;
+                if (c == ' ' && s_buf_len == 0) {
+                    continue; /* a field never starts with a space (also swallows the Space key that opened the field from the menu) */
+                }
                 if (s_buf_len < text_max() && s_buf_len < (int)sizeof(s_buf) - 1 && text_char_ok(c)) {
                     s_buf[s_buf_len++] = (char)c;
                     s_buf[s_buf_len] = '\0';
@@ -303,6 +355,22 @@ int pc_play_online_menu_handle_text_event(const SDL_Event* e) {
             return 1;
         }
         case SDL_KEYDOWN:
+            if ((e->key.keysym.mod & KMOD_CTRL) != 0 || (e->key.keysym.mod & KMOD_SHIFT) != 0) {
+                const int ctrl = (e->key.keysym.mod & KMOD_CTRL) != 0;
+                const SDL_Keycode k = e->key.keysym.sym;
+                if ((ctrl && k == SDLK_v) || (!ctrl && k == SDLK_INSERT)) {
+                    if (!e->key.repeat) text_paste();
+                    return 1;
+                }
+                if ((ctrl && k == SDLK_c) || (ctrl && k == SDLK_INSERT)) {
+                    if (!e->key.repeat) text_copy(0);
+                    return 1;
+                }
+                if (ctrl && k == SDLK_x) {
+                    if (!e->key.repeat) text_copy(1);
+                    return 1;
+                }
+            }
             switch (e->key.keysym.sym) {
                 case SDLK_BACKSPACE:
                     if (s_buf_len > 0) s_buf[--s_buf_len] = '\0';
@@ -534,8 +602,8 @@ static void draw_list(struct game_s* game, const char* title, const char* hint) 
 }
 
 static void draw_text_entry(struct game_s* game) {
-    static const char* const k_title[] = { "", "- Server name -", "- Server address (IPv4) -", "- Server port -", "- New character name -" };
-    static const char* const k_hint[] = { "", "1..32 characters", "e.g. 192.168.1.20 (no hostnames)", "1..65535 (empty = 7777)", "A-Z a-z 0-9 - (1..16)" };
+    static const char* const k_title[] = { "", "- Server name -", "- Server address -", "- Server port -", "- New character name -" };
+    static const char* const k_hint[] = { "", "1..32 characters", "IPv4 or hostname, Ctrl+V pastes", "1..65535 (empty = 7777)", "A-Z a-z 0-9 - (1..16)" };
     char line[64];
     pc_menu_draw_centered(game, k_title[s_text], 70.0f, 255, 255, 255, 255, 1.0f);
     snprintf(line, sizeof(line), "%s_", s_buf);

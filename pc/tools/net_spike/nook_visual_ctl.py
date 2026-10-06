@@ -17,7 +17,8 @@ sys.path.insert(0, HERE)
 import town_test_support as T  # noqa: E402
 import game_input as G  # noqa: E402
 
-state = json.load(open(T.log_path("nk_state.json")))
+TAG = os.environ.get("NK_TAG", "")  # a second client of a multi-client rig (restock_rig.py): NK_TAG=A / B selects <tag>_state.json and <tag>_ shot names
+state = json.load(open(T.log_path("%snk_state.json" % (TAG + "_" if TAG else ""))))
 gw = G.GameWindow(state["pid"])
 if not gw.ready():
     print("no game window for pid %s" % state["pid"])
@@ -41,7 +42,7 @@ if cmd == "info":
 elif cmd == "shot":
     need_fg()
     scale = int(sys.argv[3]) if len(sys.argv) > 3 else 2
-    path = T.log_path("nk_%s.png" % sys.argv[2])
+    path = T.log_path("%snk_%s.png" % (TAG + "_" if TAG else "", sys.argv[2]))
     G.capture_window_png(gw.hwnd, path, scale=scale)
     print(path)
 elif cmd == "key":

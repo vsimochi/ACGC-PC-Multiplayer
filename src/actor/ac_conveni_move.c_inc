@@ -112,6 +112,12 @@ static void aCNV_set_talk_info_close_wait(ACTOR* actorx) {
         }
     }
 
+#ifdef TARGET_PC
+    if (mSP_ShopOpen() == mSP_SHOP_STATUS_RESTOCK) { /* Nook's manual restock: the door explains why the shop is closed */
+        extern int pc_nook_restock_door_msg(void);
+        msg_no = pc_nook_restock_door_msg();
+    }
+#endif
     mDemo_Set_msg_num(msg_no);
 
     mDemo_Set_talk_display_name(FALSE);

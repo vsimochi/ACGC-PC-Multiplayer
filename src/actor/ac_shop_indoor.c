@@ -4,6 +4,13 @@
 #include "m_malloc.h"
 #include "m_rcp.h"
 #include "sys_matrix.h"
+#ifdef TARGET_PC
+#include "m_scene.h"
+#include "m_play.h"
+#include "m_player_lib.h"
+#include "m_demo.h"
+#include <stdio.h>
+#endif
 
 enum {
     aSI_SHOP_TYPE_ZAKKA,
@@ -452,8 +459,43 @@ static void Shop_Indoor_Actor_draw(ACTOR* actorx, GAME* game) {
     aSI_DrawShopIndoor(actorx, game);
 }
 
+#ifdef TARGET_PC
+/* Nook's manual restock: while the host says the shop is RESTOCKING every player inside is walked out through the shop's own exit data (the one the door wrote when this
+ * player came in: Common_Get(structure_exit_door_data), the same scene change a walk onto the exit tile makes). "Elegantly": half a second of grace, then as soon as the player
+ * is idle (not talking, no inventory / menu open); a player that is stuck busy is moved after ~15 s anyway. */
+extern int pc_net_game_shop_restocking(void);
+static int aSI_pc_eject_wait = 0;
+static void aSI_pc_restock_eject(GAME* game) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+
+    if (!pc_net_game_shop_restocking()) {
+        aSI_pc_eject_wait = 0;
+        return;
+    }
+    if (play->fb_wipe_mode != WIPE_MODE_NONE) {
+        return;
+    }
+    aSI_pc_eject_wait++;
+    if (aSI_pc_eject_wait < 30) {
+        return;
+    }
+    if (aSI_pc_eject_wait < 900 && (mPlib_able_submenu_type1(game) == FALSE || mDemo_CheckDemo() != FALSE)) {
+        return;
+    }
+    if (Common_Get(structure_exit_door_data).next_scene_id == 0 || Common_Get(structure_exit_door_data).next_scene_id == play->scene_id) {
+        return; /* no valid way out was recorded (a door always writes it): never warp into scene 0; keep waiting */
+    }
+    if (goto_other_scene(play, Common_GetPointer(structure_exit_door_data), FALSE)) {
+        printf("[NET][RESTOCK] shop restocking: the player was shown out (waited %d frames)\n", aSI_pc_eject_wait);
+    }
+    aSI_pc_eject_wait = 0;
+}
+#endif
+
 static void Shop_Indoor_Actor_move(ACTOR* actorx, GAME* game) {
-    // nothing
+#ifdef TARGET_PC
+    aSI_pc_restock_eject(game);
+#endif
 }
 
 static int aSI_ChangeCarpet(mActor_name_t item) {

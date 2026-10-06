@@ -2459,6 +2459,19 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
 #define PC_NETGAME_TXN_REASON_NO_RESIDENCE    28u /* house purchase: no free resident slot / no free house / no members.dat room (nothing changed) */
 #define PC_NETGAME_TXN_REASON_INVALID_HOUSE   29u /* house purchase: the requested house is not free or out of range */
 #define PC_NETGAME_TXN_REASON_NAME_TAKEN      30u /* house purchase: a resident already has the guest's name */
+/* Nook's shop MANUAL RESTOCK (the same reservation-less one-phase TXN_COMMIT machinery, kind 15; NO new message id). Anyone in the town (resident, guest, the host's own
+ * player locally) may pay PC_NETGAME_RESTOCK_PRICE Bells for a new catalog:
+ *   SHOP_RESTOCK (15): tag.dest NONE, tag.slot = 0, tag.item = 0, tag.flags = 0, tag.aux_cond = 0, tag.aux_item = the price the client expects (!= the host price -> PRICE_MISMATCH),
+ *                      pre_pockets / pre_conds / pre_wallet = the real pre-image. The HOST (one synchronous handler) refuses while a restock is active (RESTOCKING, nothing charged),
+ *                      with NO_FUNDS when pre_wallet < price, else debits exactly the price from the wallet and starts the restock: state RESTOCKING (HOST_CONFIG byte 2 + generation bytes
+ *                      4..7, pushed to every ready peer), the shop is closed for PC_NETGAME_RESTOCK_WAIT_MS of HOST monotonic time (persisted as an absolute wall-clock deadline in
+ *                      save/mp/shop_restock.ini so a host restart resumes it), then the HOST regenerates the catalog (Save_t.shop, mirrored by the existing SHOP service) and reopens.
+ *                      Every peer inside a shop is walked out as soon as the state arrives (pc_net_game_shop_restocking(), ac_shop_indoor.c). A replay of the same (nonce, seq) is answered
+ *                      from the journal and never debits twice. */
+#define PC_NETGAME_TXN_KIND_SHOP_RESTOCK 15u
+#define PC_NETGAME_TXN_REASON_RESTOCKING 31u /* shop restock: a restock is already running (nothing charged) */
+#define PC_NETGAME_RESTOCK_PRICE         500u
+#define PC_NETGAME_RESTOCK_WAIT_MS       60000u
 #define PC_NETGAME_HOUSE_AUTO                 0xFFu
 #define PC_NETGAME_HOUSE_PRICE_DIRECT         (1000u + (uint32_t)mPlayer_DEBT0) /* vanilla down payment + loan = 18,400 Bells, paid in full */
 _Static_assert(PC_NETGAME_HOUSE_PRICE_DIRECT == 18400u && PC_NETGAME_HOUSE_PRICE_DIRECT <= 0xFFFFu, "the house price must fit TXN tag.aux_item (u16)");
@@ -5214,6 +5227,9 @@ static const char* pcnetgame_kind_tag(int kind) {
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE) {
         return "HOUSE_PURCHASE"; /* guest-first paid house purchase */
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
+        return "SHOP_RESTOCK";
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
         return "DROP";
@@ -15629,6 +15645,7 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_NO_RESIDENCE: return "NO_RESIDENCE";
         case PC_NETGAME_TXN_REASON_INVALID_HOUSE: return "INVALID_HOUSE";
         case PC_NETGAME_TXN_REASON_NAME_TAKEN: return "NAME_TAKEN";
+        case PC_NETGAME_TXN_REASON_RESTOCKING: return "RESTOCKING";
         default: return "?";
     }
 }
@@ -16672,6 +16689,38 @@ static int pcnetgame_ts_valid_event_blob(const uint8_t* blob) {
     return 1;
 }
 
+/* ===== SHOP RESTOCK STATE (host-authoritative; see PC_NETGAME_TXN_KIND_SHOP_RESTOCK) =====
+ * HOST: s_restock.active + end_tick (the deadline on the host's monotonic ms clock, never a client clock) + gen (bumped at every start; travels in HOST_CONFIG so a
+ * client can tell restocks apart). The absolute wall-clock deadline is mirrored into save/mp/shop_restock.ini (this town only) so that a host restart resumes the remaining
+ * time (or finishes at once when it passed while the host was down). CLIENT: s_restock.client_active / client_gen = the last HOST_CONFIG; reset when the link is lost. */
+static struct {
+    int      active;       /* host: a restock is running */
+    uint32_t gen;
+    uint32_t end_tick;     /* host: pcnetgame_now_ms() deadline */
+    uint64_t end_wall_ms;  /* host: unix ms deadline (persistence only) */
+    int      loaded;       /* host: the restart-resume file was examined */
+    int      client_active;
+    uint32_t client_gen;
+} s_restock;
+
+static int pcnetgame_ts_refresh(int svc);
+static void pcnetgame_host_ts_push_all(void);
+static void pcnetgame_restock_save_payment(void); /* defined after the TS HOST block: the host save / restart file are not town-service concerns */
+static int pcnetgame_restock_start(const char* who);
+static void pcnetgame_restock_finish(const char* why);
+static void pcnetgame_restock_host_tick(uint32_t now);
+
+/* 1 while Nook's shop is restocking (HOST: the real state, CLIENT: the last HOST_CONFIG). Read by mSP_ShopOpen() and the shop interior (ejection). */
+int pc_net_game_shop_restocking(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return s_restock.active;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        return s_restock.client_active;
+    }
+    return 0;
+}
+
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
            : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : "?";
@@ -16705,6 +16754,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
         memset(blob, 0, PC_NETGAME_TS_HOSTCFG_LEN);
         blob[0] = g_pc_authoritative_wildlife ? 1u : 0u;
         blob[1] = g_pc_house_sync ? (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC : 0u; /* furniture sync Stage 1 (byte 1 bit 0) */
+        blob[2] = s_restock.active ? 1u : 0u; /* Nook's shop restock: 1 = RESTOCKING (byte 3 reserved zero, bytes 4..7 = the restock generation, little endian) */
+        blob[4] = (uint8_t)(s_restock.gen & 0xFFu);
+        blob[5] = (uint8_t)((s_restock.gen >> 8) & 0xFFu);
+        blob[6] = (uint8_t)((s_restock.gen >> 16) & 0xFFu);
+        blob[7] = (uint8_t)((s_restock.gen >> 24) & 0xFFu);
         if (pcnetgame_pdata_host_enabled()) {
             blob[1] |= (uint8_t)PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC; /* personal data sync, diary only (byte 1 bit 1) */
         }
@@ -16943,6 +16997,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_ts_test_seed_police();
     pcnetgame_world_test_force();
     pcnetgame_world_test_poke_event();
+    pcnetgame_restock_host_tick(now);
     if ((uint32_t)(now - s_ts_next_check_ms) >= PC_NETGAME_TS_CHECK_MS || !s_ts_host[PC_NETGAME_TS_POLICE].valid) {
         s_ts_next_check_ms = now;
         pcnetgame_ts_refresh_all();
@@ -17218,8 +17273,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     const int is_donate = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE);
     const int is_buy = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY);
     const int is_sell = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL);
+    const int is_restock = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK);
     const int is_shop = is_buy || is_sell;
-    const int svc = is_shop ? (int)PC_NETGAME_TS_SHOP : is_donate ? (int)PC_NETGAME_TS_MUSEUM : (int)PC_NETGAME_TS_POLICE;
+    const int svc = is_restock ? (int)PC_NETGAME_TS_HOSTCFG : is_shop ? (int)PC_NETGAME_TS_SHOP : is_donate ? (int)PC_NETGAME_TS_MUSEUM : (int)PC_NETGAME_TS_POLICE;
     PCNetGameHostPeerState* st;
     PCNetGameRecSlot* slot;
     PCNetGameTxnResident* R;
@@ -17262,9 +17318,11 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
 
     /* 3. shape */
     shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && t->flags == 0 &&
-               t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO;
+               (is_restock ? (t->slot == 0 && t->item == 0) : (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO));
     if (shape_ok) {
-        if (is_donate) {
+        if (is_restock) {
+            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0 && t->aux_item != 0;
+        } else if (is_donate) {
             shape_ok = t->aux_item == 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0;
         } else if (is_buy) {
             shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->aux_item != 0 &&
@@ -17342,7 +17400,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 7. kind precondition on the PRE-image (never on the mirror: it may lag the client) */
-    if (is_donate || is_sell) {
+    if (is_restock) {
+        fail = NULL; /* no pocket involved */
+    } else if (is_donate || is_sell) {
         fail = (t->pre_pockets[t->slot] != t->item) ? (is_donate ? "pocket slot does not hold the donated item" : "pocket slot does not hold the sold item") : NULL;
     } else {
         fail = (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) ? "pocket slot is not free" : NULL;
@@ -17356,7 +17416,21 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     memcpy(post, t->pre_pockets, sizeof(post));
     post_conds = t->pre_conds;
     post_wallet = t->pre_wallet;
-    if (is_shop) {
+    if (is_restock) {
+        /* The HOST decides: a running restock refuses (nothing charged), the price is the host constant, the wallet (pre-image, validated against the lineage above) must cover it. */
+        if (s_restock.active) {
+            fail = "the shop is already restocking";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_RESTOCKING;
+        } else if ((uint32_t)t->aux_item != PC_NETGAME_RESTOCK_PRICE) {
+            fail = "the client's expected price differs from the host price";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRICE_MISMATCH;
+        } else if (post_wallet < PC_NETGAME_RESTOCK_PRICE) {
+            fail = "the wallet cannot pay the restock price (money bags do not count)";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_FUNDS;
+        } else {
+            post_wallet -= PC_NETGAME_RESTOCK_PRICE;
+        }
+    } else if (is_shop) {
         /* Guests (G1) are FULL participants of the shop: the purchase / sale touches only the host's Save_t.shop + the bound record of the
          * shared slot index space (a guest's pockets / wallet live in the guest table), so no resident slot is required. */
         if (is_buy) {
@@ -17421,7 +17495,7 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 9. post-image in locals (pre-image plus the delta), validated BEFORE anything is mutated */
-    if (!is_shop) {
+    if (!is_shop && !is_restock) {
         if (is_donate) {
             post[t->slot] = (uint16_t)EMPTY_NO;
         } else {
@@ -17436,7 +17510,12 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 10. THE host-side service commit (the only writer of museum_display / police_box / the shop stock in this handler path) */
-    if (is_buy) {
+    if (is_restock) {
+        if (!pcnetgame_restock_start("a peer's payment")) { /* cannot happen after the check above (single-threaded); never charge for it */
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_RESTOCKING, 1, NULL, "the shop is already restocking");
+            return;
+        }
+    } else if (is_buy) {
         mSP_PlusSales(shop_price); /* vanilla order (aSD_ReportGoodsSales): sales_sum first, then the sold marker */
         if (shop_cls != PCNG_SHOP_CLS_UNLIMITED) {
             (void)mSP_ShopSaleReport((mActor_name_t)t->item, Save_Get(shop).items, mSP_GOODS_COUNT, shop_rsv);
@@ -17481,7 +17560,11 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
                   (unsigned)t->pre_wallet, (unsigned)post_wallet);
     }
     pcnetgame_ts_refresh(svc); /* the seq the RESULT echoes */
-    if (is_buy) {
+    if (is_restock) {
+        printf("[NET][RESTOCK] host: peer %d resident %d SHOP_RESTOCK paid %u: wallet %u -> %u, restock %u started [TXN]\n", (int)peer, idx, (unsigned)PC_NETGAME_RESTOCK_PRICE,
+               (unsigned)t->pre_wallet, (unsigned)post_wallet, (unsigned)s_restock.gen);
+        pcnetgame_restock_save_payment(); /* the payment (the host mirror -> the town save) is durable before the restock can matter after a crash */
+    } else if (is_buy) {
         printf("[NET][SHOP] host: peer %d resident %d SHOP_BUY item=0x%04X stock=0x%02X pocket slot=%u price=%u wallet %u -> %u sales_sum now %u committed [TXN]\n",
                (int)peer, idx, (unsigned)t->item, (unsigned)t->aux_cond, (unsigned)t->slot, (unsigned)shop_price, (unsigned)t->pre_wallet,
                (unsigned)post_wallet, (unsigned)Save_Get(shop).sales_sum);
@@ -17512,6 +17595,155 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 }
 /* ===== TS HOST END ===== */
+
+/* ===== RESTOCK HOST BEGIN: the restock timer, its restart-resume file (save/mp/shop_restock.ini) and the catalog regeneration ===== */
+static uint64_t pcnetgame_restock_wall_ms(void) {
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) == 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+static int pcnetgame_restock_path(char* out, size_t cap) {
+    return snprintf(out, cap, "%s/shop_restock.ini", PC_GUEST_PROFILE_DIR) < (int)cap;
+}
+
+static void pcnetgame_restock_town_key(char* key) {
+    pc_character_town_key_format(s_host_town.land_name, s_host_town.land_id, s_host_town.terrain_hash, key);
+}
+
+static void pcnetgame_restock_file_write(void) {
+    char path[160], tmp[176], key[PC_CHARACTER_TOWNKEY_LEN + 1];
+    FILE* f;
+    if (!pcnetgame_restock_path(path, sizeof(path)) || !s_host_town_valid) {
+        return;
+    }
+    pcnetgame_restock_town_key(key);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (f == NULL) {
+        printf("[NET][RESTOCK] host: could not write %s (a host restart would not resume this restock)\n", tmp);
+        return;
+    }
+    fprintf(f, "town = %s\ngen = %u\nend_wall_ms = %llu\n", key, (unsigned)s_restock.gen, (unsigned long long)s_restock.end_wall_ms);
+    fflush(f);
+    fclose(f);
+    remove(path);
+    if (rename(tmp, path) != 0) {
+        printf("[NET][RESTOCK] host: could not replace %s\n", path);
+    }
+}
+
+static void pcnetgame_restock_file_remove(void) {
+    char path[160];
+    if (pcnetgame_restock_path(path, sizeof(path))) {
+        remove(path);
+    }
+}
+
+static int pcnetgame_ts_refresh(int svc);
+static void pcnetgame_host_ts_push_all(void);
+static void pcnetgame_restock_save_payment(void); /* defined after the TS HOST block: the host save is not a town-service concern */
+
+/* Starts a restock (HOST). 1 = started, 0 = one is already running (the caller refuses, nothing charged). */
+static int pcnetgame_restock_start(const char* who) {
+    if (s_restock.active) {
+        return 0;
+    }
+    uint32_t wait_ms = PC_NETGAME_RESTOCK_WAIT_MS;
+    {
+        /* TEST-ONLY (PC_TEST_HOOKS build + AC_TEST_HOOKS=1): a longer wait so the host-restart resume can be tested; a production run is always exactly PC_NETGAME_RESTOCK_WAIT_MS */
+        const char* e = pc_test_hook_getenv("AC_TEST_RESTOCK_WAIT_MS");
+        if (e != NULL) {
+            const long v = strtol(e, NULL, 10);
+            if (v >= 1000 && v <= 600000) {
+                wait_ms = (uint32_t)v;
+                printf("[NET][RESTOCK][TEST-ONLY] AC_TEST_RESTOCK_WAIT_MS=%ld: the restock waits %ld ms instead of %u (NOT active in normal play)\n", v, v, (unsigned)PC_NETGAME_RESTOCK_WAIT_MS);
+            }
+        }
+    }
+    s_restock.active = 1;
+    s_restock.gen++;
+    s_restock.end_tick = pcnetgame_now_ms() + wait_ms;
+    s_restock.end_wall_ms = pcnetgame_restock_wall_ms() + wait_ms;
+    pcnetgame_restock_file_write();
+    printf("[NET][RESTOCK] host: RESTOCKING started by %s (generation %u): the shop is closed for %u ms of host time, then a new catalog is generated\n", who, (unsigned)s_restock.gen,
+           (unsigned)PC_NETGAME_RESTOCK_WAIT_MS);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
+    return 1;
+}
+
+/* The deadline passed (HOST): generate the new catalog from the host's RNG with the vanilla lineup routine, mirror it (SHOP service first, then HOST_CONFIG so a client sees the
+ * new stock before it sees OPEN), reopen. */
+static void pcnetgame_restock_finish(const char* why) {
+    if (!s_restock.active) {
+        return;
+    }
+    mSP_ExchangeLineUp_ZeldaMalloc();
+    s_restock.active = 0;
+    pcnetgame_restock_file_remove();
+    printf("[NET][RESTOCK] host: restock %u finished (%s): a NEW catalog was generated, the shop is OPEN\n", (unsigned)s_restock.gen, why);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
+    pcnetgame_host_ts_push_all();
+}
+
+/* Once per host tick (world ready): the restart resume (once) and the deadline. */
+static void pcnetgame_restock_host_tick(uint32_t now) {
+    if (!s_restock.loaded) {
+        char path[160], key[PC_CHARACTER_TOWNKEY_LEN + 1], line[200], fkey[PC_CHARACTER_TOWNKEY_LEN + 8];
+        unsigned long long end_wall = 0;
+        unsigned gen = 0;
+        int have_key = 0, have_end = 0;
+        FILE* f;
+        s_restock.loaded = 1;
+        if (!pcnetgame_restock_path(path, sizeof(path)) || !s_host_town_valid || (f = fopen(path, "rb")) == NULL) {
+            return;
+        }
+        pcnetgame_restock_town_key(key);
+        fkey[0] = '\0';
+        while (fgets(line, (int)sizeof(line), f) != NULL) {
+            if (sscanf(line, "town = %39s", fkey) == 1) {
+                have_key = 1;
+            } else if (sscanf(line, "gen = %u", &gen) == 1) {
+                /* ok */
+            } else if (sscanf(line, "end_wall_ms = %llu", &end_wall) == 1) {
+                have_end = 1;
+            }
+        }
+        fclose(f);
+        if (!have_key || !have_end || strcmp(fkey, key) != 0) {
+            printf("[NET][RESTOCK] host: %s belongs to another town / is unreadable -- ignored\n", path);
+            return;
+        }
+        s_restock.gen = gen;
+        s_restock.active = 1;
+        {
+            const uint64_t wall = pcnetgame_restock_wall_ms();
+            const uint64_t left = (end_wall > wall) ? (end_wall - wall) : 0u;
+            s_restock.end_wall_ms = end_wall;
+            s_restock.end_tick = now + (uint32_t)(left > 600000u ? 600000u : left);
+            printf("[NET][RESTOCK] host: resuming restock %u after a host restart: %u ms remaining\n", gen, (unsigned)(left > 600000u ? 600000u : left));
+            if (left == 0) {
+                pcnetgame_restock_finish("the deadline passed while the host was down");
+                return;
+            }
+        }
+        (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
+    }
+    if (s_restock.active && (int32_t)(now - s_restock.end_tick) >= 0) {
+        pcnetgame_restock_finish("the 60 s wait elapsed");
+    }
+}
+/* ===== RESTOCK HOST END ===== */
+
+extern int pc_save_write_authoritative_durable(void); /* pc_m_card.c: FALSE unless the GCI was REALLY written */
+static void pcnetgame_restock_save_payment(void) {
+    if (pc_save_write_authoritative_durable()) {
+        printf("[NET][RESTOCK] host: the payment was saved durably\n");
+    }
+}
 
 /* Guest-first house purchase: the shared promotion core (defined with the dedicated `promote` command, M-F block). */
 #define PROMOTE_ONLINE 0x01u /* the guest is connected: only the REQUESTING peer may be bound to it (its guest slot is given, no selector); the caller closes that peer afterwards */
@@ -21300,7 +21532,7 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* town services: no reservation to release; the UI seam learns "rejected" */
-    } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE) {
+    } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* guest-first town: nothing was sent, the seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
@@ -21328,7 +21560,7 @@ static int pcnetgame_txn_try_send(void) {
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL ||
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE;
-    const int is_house = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE; /* guest-first town: a TXN_COMMIT kind too */
+    const int is_house = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK; /* guest-first town / shop restock: a TXN_COMMIT kind too (no pocket) */
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -21460,6 +21692,7 @@ static int pcnetgame_txn_try_send(void) {
             aux_item = T->ts_aux_item;
             break;
         }
+        case PC_NETGAME_TXN_KIND_SHOP_RESTOCK: /* same shape: no pocket slot, no item, the price the player was shown as aux_item */
         case PC_NETGAME_TXN_KIND_HOUSE_PURCHASE:
             /* guest-first town: no pocket slot, no item; the requested house (or auto) travels as aux_cond, the price the player was shown as aux_item. The wallet is
              * debited ONLY by APPLIED (pcnetgame_txn_apply_house). */
@@ -21829,6 +22062,20 @@ static int pcnetgame_txn_apply_house(const PCNetGameClientTxn* T, const PCNetGam
     return 1;
 }
 
+/* APPLIED of a SHOP_RESTOCK: the host debited exactly PC_NETGAME_RESTOCK_PRICE; locally only the wallet changes, to the HOST's post-image (validated: post + price == pre). */
+static int pcnetgame_txn_apply_restock(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+    const PCNetGameTxnTag* t = &T->tag;
+    Private_c* np = Now_Private;
+    if (np == NULL || in->post_wallet > (uint32_t)mPr_WALLET_MAX || in->post_wallet + (uint32_t)t->aux_item != t->pre_wallet) {
+        printf("[NET][RESTOCK] client: *** APPLIED SHOP_RESTOCK for request %u carries an inconsistent post-image (wallet %u, price %u, pre %u) -- the local wallet is NOT changed; the restock itself runs on the host ***\n",
+               (unsigned)T->request_id, (unsigned)in->post_wallet, (unsigned)t->aux_item, (unsigned)t->pre_wallet);
+        return 0;
+    }
+    np->inventory.wallet = in->post_wallet;
+    printf("[NET][RESTOCK] client: restock APPLIED -- request %u: %u Bells paid, wallet now %u\n", (unsigned)T->request_id, (unsigned)t->aux_item, (unsigned)np->inventory.wallet);
+    return 1;
+}
+
 /* The ONLY writer of pockets / item_conditions / wallet for a pickup / drop / bury / dig grant / catch. Called with a copy of s_ctxn (the state
  * is already FREE) and the host's APPLIED RESULT. */
 /* Returns 1 when the host post-image was applied to the local inventory (or there is nothing to apply), 0 when it was NOT (owner changed /
@@ -21856,6 +22103,9 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
         return pcnetgame_txn_apply_take(T, in); /* mail milestone 2: the letter goes into mail[dst], never the pockets */
+    }
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
+        return pcnetgame_txn_apply_restock(T, in); /* only the wallet changes */
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE) {
         return pcnetgame_txn_apply_house(T, in); /* guest-first town: only the wallet changes (the pockets are untouched) */
@@ -22208,11 +22458,10 @@ static int pcnetgame_ts_valid_hostcfg_blob(const uint8_t* blob) {
     if (blob[0] > 1u || (blob[1] & ~(uint8_t)(PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC | PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC)) != 0u) {
         return 0;
     }
-    for (i = 2; i < PC_NETGAME_TS_HOSTCFG_LEN; i++) {
-        if (blob[i] != 0u) {
-            return 0; /* reserved bytes must be zero (v8 unreleased: strict); byte 1 bit 0 = house sync, bit 1 = personal sync, its other bits reserved */
-        }
+    if (blob[2] > 1u || blob[3] != 0u) {
+        return 0; /* byte 2 = shop restocking (0/1), byte 3 reserved zero; bytes 4..7 = the restock generation (any value) */
     }
+    (void)i;
     return 1;
 }
 
@@ -22274,6 +22523,15 @@ static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
     if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
         pcnetgame_client_wildlife_mode_apply(m->blob[0] != 0);
         pcnetgame_house_client_set_hostcfg((m->blob[1] & (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC) != 0); /* furniture sync: a client without the bit never gates anything */
+        {
+            const int restocking = m->blob[2] != 0u;
+            const uint32_t gen = (uint32_t)m->blob[4] | ((uint32_t)m->blob[5] << 8) | ((uint32_t)m->blob[6] << 16) | ((uint32_t)m->blob[7] << 24);
+            if (restocking != s_restock.client_active || gen != s_restock.client_gen) {
+                printf("[NET][RESTOCK] client: the host says the shop is %s (generation %u)\n", restocking ? "RESTOCKING (closed)" : "OPEN", (unsigned)gen);
+            }
+            s_restock.client_active = restocking;
+            s_restock.client_gen = gen;
+        }
         pcnetgame_pdata_client_set_hostcfg((m->blob[1] & (uint8_t)PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC) != 0); /* personal data sync: a client without the bit never sends */
         s_ts_client_seq[svc] = m->seq;
         s_ts_client_have[svc] = 1;
@@ -22947,6 +23205,18 @@ static void pcnetgame_run_nook_test_hook(void) {
         level = mSP_GetShopLevel();
         s_door.next_scene_id = scenes[(level >= 0 && level < 4) ? level : 0];
         printf("[NET][HOUSE][TEST-ONLY] --nook-test: warping the guest into the shop (scene %d, shop level %d)\n", s_door.next_scene_id, level);
+        {
+            /* the exit data a real shop door writes (aSHOP_rewrite_out_data): back to the field at the spot the player stands now (a warp has no door to take it from) */
+            Door_data_c* out = Common_GetPointer(structure_exit_door_data);
+            const xyz_t* pp = &GET_PLAYER_ACTOR_NOW()->actor_class.world.position;
+            out->next_scene_id = Save_Get(scene_no);
+            out->exit_orientation = mSc_DIRECT_SOUTH_WEST;
+            out->exit_type = 0;
+            out->extra_data = 3;
+            out->exit_position.x = pp->x;
+            out->exit_position.y = pp->y;
+            out->exit_position.z = pp->z;
+        }
         goto_other_scene(play, &s_door, FALSE);
         s_stage = 3;
     }
@@ -23228,6 +23498,94 @@ static void pcnetgame_run_shop_test_hook(void) {
     }
 }
 /* ===== TS CLIENT END ===== */
+
+/* ===== RESTOCK CLIENT BEGIN: Nook's shop manual restock, the dialogue seam (kept out of the TS CLIENT block: it pays from the wallet) ===== */
+/* ---- Nook's shop MANUAL RESTOCK: the dialogue seam (ac_npc_shop_common.c). The HOST decides everything; these are local pre-checks and the request.
+ *   pc_net_game_restock_offer_available()  1 = the "Refresh the shop" choice is offered: the host's own player, or a READY client.
+ *   pc_net_game_restock_precheck()         0 = may be tried; else PC_NETGAME_TXN_REASON_RESTOCKING (31) / NO_FUNDS (19) / PRECOND (9).
+ *   pc_net_game_restock_begin()            HOST role: pays from the local wallet and starts the restock right now, returns 3 (done). CLIENT: 1 = request sent (poll
+ *                                          pc_net_game_ts_poll()), 0 = refused locally (pc_net_game_ts_last_reject_reason()), -1 = busy, retry next frame. */
+int pc_net_game_restock_offer_available(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return s_host_world_ready;
+    }
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY;
+}
+
+int pc_net_game_restock_precheck(void) {
+    if (!pc_net_game_restock_offer_available() || Now_Private == NULL) {
+        return (int)PC_NETGAME_TXN_REASON_PRECOND;
+    }
+    if (pc_net_game_shop_restocking()) {
+        return (int)PC_NETGAME_TXN_REASON_RESTOCKING;
+    }
+    if (Now_Private->inventory.wallet < PC_NETGAME_RESTOCK_PRICE) {
+        return (int)PC_NETGAME_TXN_REASON_NO_FUNDS;
+    }
+    return 0;
+}
+
+int pc_net_game_restock_price(void) {
+    return (int)PC_NETGAME_RESTOCK_PRICE;
+}
+
+int pc_net_game_restock_begin(void) {
+    PCNetGameOwnerStamp stamp;
+    const uint8_t kind = (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK;
+    int r;
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        r = pc_net_game_restock_precheck();
+        if (r != 0) {
+            s_ts_last_reason = (uint8_t)r;
+            return 0;
+        }
+        Now_Private->inventory.wallet -= PC_NETGAME_RESTOCK_PRICE; /* the host's own wallet, one place, one debit, then the start (a running restock was refused above) */
+        if (!pcnetgame_restock_start("the host player")) {
+            Now_Private->inventory.wallet += PC_NETGAME_RESTOCK_PRICE;
+            s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_RESTOCKING;
+            return 0;
+        }
+        printf("[NET][RESTOCK] host: the host player paid %u Bells (wallet now %u), restock %u started\n", (unsigned)PC_NETGAME_RESTOCK_PRICE, (unsigned)Now_Private->inventory.wallet,
+               (unsigned)s_restock.gen);
+        return 3;
+    }
+    if (s_ts_op.active && s_ts_op.done) {
+        memset(&s_ts_op, 0, sizeof(s_ts_op)); /* the unconsumed result of an abandoned dialogue */
+    }
+    if (s_ts_op.active || pcnetgame_txn_begin_blocked() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return -1;
+    }
+    s_ts_last_reason = 0;
+    r = pc_net_game_restock_precheck();
+    if (r != 0) {
+        s_ts_last_reason = (uint8_t)r;
+        printf("[NET][RESTOCK] client: SHOP_RESTOCK refused locally (%s): nothing is sent\n", pcnetgame_txn_reason_name((uint8_t)r));
+        return 0;
+    }
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+        return 0;
+    }
+    s_ts_op.active = 1;
+    s_ts_op.kind = kind;
+    s_ts_op.slot = 0;
+    s_ts_op.aux = 0;
+    s_ts_op.item = 0;
+    s_ts_op.aux_item = (uint16_t)PC_NETGAME_RESTOCK_PRICE;
+    s_ts_op.request_id = s_ts_next_rid++;
+    memset(&s_ctxn, 0, sizeof(s_ctxn));
+    s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
+    s_ctxn.kind = kind;
+    s_ctxn.ts_aux = 0;
+    s_ctxn.ts_aux_item = s_ts_op.aux_item;
+    s_ctxn.request_id = s_ts_op.request_id;
+    s_ctxn.owner = stamp;
+    s_ctxn.first_ms = pcnetgame_now_ms();
+    printf("[NET][RESTOCK] client: begin SHOP_RESTOCK request=%u price=%u wallet=%u\n", (unsigned)s_ts_op.request_id, (unsigned)PC_NETGAME_RESTOCK_PRICE, (unsigned)Now_Private->inventory.wallet);
+    (void)pcnetgame_txn_try_send();
+    return 1;
+}
+/* ===== RESTOCK CLIENT END ===== */
 
 /* ===== MAIL CLIENT BEGIN: mail milestone 1 -- the client half of a letter to a PLAYER (TXN_COMMIT kind 12) =====
  * Seam: ac_npc_post_girl.c_inc (aPG_check_destination / aPG_receive_menu_close_wait). The vanilla send path hands the letter to the post girl and,
@@ -25253,6 +25611,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
             pcnetgame_handle_host_house_purchase_txn(peer, &tc); /* guest-first town: a GUEST pays for a house and becomes a resident (kind 14, never the X1 handler) */
             return;
         }
+        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
+            pcnetgame_handle_host_ts_txn(peer, &tc); /* Nook's manual restock (kind 15): the same one-phase town-service handler */
+            return;
+        }
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
             tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
             pcnetgame_handle_host_ts_txn(peer, &tc); /* town services: reservation-less one-phase kinds (museum, police, shop) */
@@ -26250,6 +26612,7 @@ static void pcnetgame_reset_client_session_state(void) {
     s_mbox_mask = 0;
     s_mbox_host_fed = 0;
     memset(s_ts_client_have, 0, sizeof(s_ts_client_have));
+    s_restock.client_active = 0; /* the shop mirror is host-fed: the next HOST_CONFIG (at READY) says whether a restock is still running */
     memset(s_ts_client_stash_valid, 0, sizeof(s_ts_client_stash_valid));
     memset(s_field_action_queue, 0, sizeof(s_field_action_queue)); /* T0-C: whole queue, not one slot */
     s_field_action_queue_len = 0;

@@ -180,7 +180,10 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              "#define PC_NETGAME_TXN_REASON_INVALID_HOUSE   29u", "#define PC_NETGAME_TXN_REASON_NAME_TAKEN      30u",
              "#define PC_NETGAME_HOUSE_AUTO                 0xFFu",
              "#define PC_NETGAME_HOUSE_PRICE_DIRECT         (1000u + (uint32_t)mPlayer_DEBT0)",
-             '_Static_assert(PC_NETGAME_HOUSE_PRICE_DIRECT == 18400u')
+             '_Static_assert(PC_NETGAME_HOUSE_PRICE_DIRECT == 18400u',
+             # Nook's shop manual restock: TXN_COMMIT kind 15 (no new message id), reason 31, the host price and wait
+             "#define PC_NETGAME_TXN_KIND_SHOP_RESTOCK 15u", "#define PC_NETGAME_TXN_REASON_RESTOCKING 31u",
+             "#define PC_NETGAME_RESTOCK_PRICE         500u", "#define PC_NETGAME_RESTOCK_WAIT_MS       60000u")
 # Guests G1: exact C lines (constants + size / offset asserts) that must stay as they are.
 GUEST_C_PINS = ("#define PC_NETGAME_IDEXT_FLAG_GUEST      0x01u", "#define PC_NETGAME_IDTOKEN_FLAG_NEW      0x01u",
                 "#define PC_NETGAME_IDTOKEN_FLAG_KNOWN    0x02u", "#define PC_NETGAME_GUEST_TOKEN_LEN       16u",
@@ -306,6 +309,8 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_INVALID_HOUSE": '29',
     "PC_NETGAME_TXN_REASON_NAME_TAKEN": '30',
     "PC_NETGAME_TXN_KIND_HOUSE_PURCHASE": '14',
+    "PC_NETGAME_TXN_KIND_SHOP_RESTOCK": '15',
+    "PC_NETGAME_TXN_REASON_RESTOCKING": '31',
     "PC_NETGAME_HOUSE_AUTO": '0xFF',
     "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',
     "PC_NETGAME_TXN_KIND_MAIL_TAKE": '13',

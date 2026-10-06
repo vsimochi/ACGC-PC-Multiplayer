@@ -1795,6 +1795,13 @@ extern int mSP_ShopOpen() {
         return mSP_SHOP_STATUS_OPEN; // shop is forcefully open during chores
     }
 
+#ifdef TARGET_PC
+    /* Nook's manual restock (host-authoritative, mirrored to clients): the shop is closed while it runs. */
+    if (pc_net_game_shop_restocking()) {
+        return mSP_SHOP_STATUS_RESTOCK;
+    }
+#endif
+
     if (mEv_CheckEvent(mEv_SPNPC_SHOP) == TRUE) {
         lbRTC_time_c bargin_time = Save_Get(event_save_data).special.event.bargin.start_time;
 
@@ -1807,6 +1814,7 @@ extern int mSP_ShopOpen() {
             lbRTC_Sub_hh(&start_time_pre, 1);
             lbRTC_Add_hh(&end_time_post, 1);
 
+#ifndef TARGET_PC /* PC: Nook's shop is open 24/7 (the in-game clock no longer opens / closes it) */
             if (now_hour >= mTM_FIELD_RENEW_HOUR && now_hour < mSP_GetShopOpenTime()) {
                 return mSP_SHOP_STATUS_PRE;
             }
@@ -1814,6 +1822,7 @@ extern int mSP_ShopOpen() {
             if (now_hour < mTM_FIELD_RENEW_HOUR || now_hour >= mSP_GetShopCloseTime()) {
                 return mSP_SHOP_STATUS_END;
             }
+#endif
 
             if (lbRTC_IsOverTime(&start_time_pre, &rtc_time) == lbRTC_LESS) {
                 return mSP_SHOP_STATUS_OPEN;
@@ -1840,6 +1849,14 @@ extern int mSP_ShopOpen() {
     if (mSP_InRenewal() != FALSE) {
         return mSP_SHOP_STATUS_RENEW;
     }
+
+#ifdef TARGET_PC
+    /* PC: Nook's shop is open 24/7 regardless of the in-game clock. Kept: the shop-upgrade construction (RENEW above), the first-job chores (forced open above), the
+     * restock (above) and the end-of-month raffle day, whose door / raffle flow is built on the clock. */
+    if (mSP_CheckFukubikiDay() == FALSE) {
+        return mSP_SHOP_STATUS_OPEN;
+    }
+#endif
 
     if (now_hour >= mSP_GetShopOpenTime() && now_hour < mSP_GetShopCloseTime()) {
         return mSP_SHOP_STATUS_OPEN;
@@ -2573,7 +2590,7 @@ extern void mSP_SelectRandomItemToAGB() {
 extern const char* mSP_ShopStatus2String(int status) {
     static char dummy[] = "hahaha";
 
-    static char* str_table[mSP_SHOP_STATUS_NUM] = { "Pre", "End", "Opn", "Rnw", "PreEv", "EndEv", "OpnEv" };
+    static char* str_table[mSP_SHOP_STATUS_NUM] = { "Pre", "End", "Opn", "Rnw", "PreEv", "EndEv", "OpnEv", "Rstk" };
 
     if (status >= 0 && status < mSP_SHOP_STATUS_NUM) {
         return str_table[status];

@@ -161,6 +161,10 @@ int pc_nook_msg_id(int which) {
     return MSG_MAX + which;
 }
 
+int pc_nook_restock_door_msg(void) {
+    return MSG_MAX + PC_NOOK_MSG_RESTOCK_DOOR; /* the shop doors (ac_*_move.c_inc) while the shop restocks */
+}
+
 int pc_nook_msg_id_valid(int id) {
     return id >= MSG_MAX && id < MSG_MAX + PC_NOOK_MSG_COUNT;
 }
@@ -216,8 +220,96 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             ids[1] = NK_SEL_HEARCODE;
             ids[2] = NK_SEL_SAYCODE;
             ids[3] = PC_NOOK_SEL_BUY_HOUSE;
+            ids[4] = PC_NOOK_SEL_REFRESH;
+            ids[5] = NK_SEL_HANGON;
+            nk_choice(&b, ids, 6);
+            break;
+        case PC_NOOK_MSG_OTHER_R: /* the vanilla 0x3E07 text and choices, plus "Refresh shop." before the last one */
+            nk_text(&b, "As far as other things go,\nthis is all I have to offer.");
+            ids[0] = NK_SEL_TURNIPS;
+            ids[1] = NK_SEL_HEARCODE;
+            ids[2] = NK_SEL_SAYCODE;
+            ids[3] = PC_NOOK_SEL_REFRESH;
             ids[4] = NK_SEL_HANGON;
             nk_choice(&b, ids, 5);
+            break;
+        case PC_NOOK_MSG_RESTOCK_ASK:
+            nk_text(&b, "A fresh set of goods,");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nhm? That is 500 Bells.");
+            nk_page(&b);
+            nk_text(&b, "The shop closes for one");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nminute, and everyone inside\nis shown out.");
+            nk_page(&b);
+            nk_text(&b, "Shall we do it?");
+            ids[0] = NK_SEL_YES;
+            ids[1] = NK_SEL_NO;
+            nk_choice(&b, ids, 2);
+            break;
+        case PC_NOOK_MSG_RESTOCK_DECLINE:
+            nk_text(&b, "Very well, very well!");
+            nk_pause(&b, 8);
+            nk_text(&b, "\nJust ask me again under\nOther things, hm?");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_RESTOCK_THANKS:
+            nk_text(&b, "Splendid! 500 Bells,");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nthank you very much.");
+            nk_page(&b);
+            nk_text(&b, "I must close up and");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nrestock the shelves.\nBack in a minute, hm?");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_RESTOCK_NOFUNDS:
+            nk_text(&b, "Oh dear, you don't have");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nenough Bells. A restock\ncosts 500 Bells.");
+            nk_page(&b);
+            nk_text(&b, "Nothing was charged.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_RESTOCK_BUSY:
+            nk_text(&b, "The shop is restocking");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nright now, hm!");
+            nk_page(&b);
+            nk_text(&b, "Nothing was charged.");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nPlease ask again in a bit!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_RESTOCK_FAILED:
+            nk_text(&b, "Oh my, something went");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nwrong with the order.");
+            nk_page(&b);
+            nk_text(&b, "Nothing was charged, hm.");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nPlease try again later!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_RESTOCK_LINKLOST:
+            nk_text(&b, "Oh my, the line went quiet");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nin the middle of the order.");
+            nk_page(&b);
+            nk_text(&b, "I cannot say whether it");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nwent through. Please check\nyour wallet, then ask me!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_RESTOCK_DOOR:
+            nk_text(&b, "Sorry, sorry!");
+            nk_pause(&b, 8);
+            nk_text(&b, "\nWe are restocking the\nshelves right now.");
+            nk_page(&b);
+            nk_text(&b, "Please come back in about");
+            nk_pause(&b, 6);
+            nk_text(&b, "\na minute, hm?");
+            nk_code(&b, NK_END);
             break;
         case PC_NOOK_MSG_PICK:
             nk_text(&b, "Wonderful!");
@@ -346,6 +438,9 @@ int pc_nook_sel_build(int id, unsigned char* dst16) {
             break;
         case PC_NOOK_SEL_ANY_HOUSE:
             snprintf(tmp, sizeof(tmp), "Any house.");
+            break;
+        case PC_NOOK_SEL_REFRESH:
+            snprintf(tmp, sizeof(tmp), "Refresh shop.");
             break;
         default:
             snprintf(tmp, sizeof(tmp), "House %d.", id - PC_NOOK_SEL_HOUSE1 + 1);

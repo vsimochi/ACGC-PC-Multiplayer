@@ -135,10 +135,10 @@ def main():
        all(x in gcase for x in ("mLd_CheckStartFlag() == TRUE", "aAL_wipe_end_check(game) == TRUE", "mTD_tdemo_button_ok_check()", "pc_guest_title_join()")))
     mb = lb("aAL_pc_menu_build")
     ck("G3.2 the item exists ONLY for a network client: the menu (aAL_pc_menu_build) adds aAL_PC_ITEM_GUEST only under `if (pc_guest_title_item_visible())` (the else branch is the Play Online "
-       "item, no role); Start, Options and Quit are UNCONDITIONAL, in that order (without a client the id list is Start / [Play Online] / Options / Quit); the count / item accessors use the builder",
+       "item, no role); Options and Quit are UNCONDITIONAL, in that order; Start Game is offered ONLY to a host process (public beta: neither with no role nor as a client, where Play Online / Join as Guest replace it); the count / item accessors use the builder",
        mb != "" and re.search(r"if \(pc_guest_title_item_visible\(\)\) \{\s*items\[n\+\+\] = aAL_PC_ITEM_GUEST;\s*\} else if \(pc_play_online_menu_available\(\)\)", mb) is not None
        and mb.count("aAL_PC_ITEM_GUEST") == 1
-       and re.search(r"items\[n\+\+\] = aAL_PC_ITEM_START;\s*if \(pc_guest_title_item_visible\(\)\)", mb) is not None
+       and re.search(r"if \(!pc_guest_title_item_visible\(\) && !pc_play_online_menu_available\(\)\) \{\s*items\[n\+\+\] = aAL_PC_ITEM_START;\s*\}\s*if \(pc_guest_title_item_visible\(\)\)", mb) is not None
        and re.search(r"\}\s*items\[n\+\+\] = aAL_PC_ITEM_OPTIONS;\s*items\[n\+\+\] = aAL_PC_ITEM_QUIT;\s*return n;", mb) is not None
        and "aAL_pc_menu_build(items)" in lb("aAL_pc_menu_count") and "aAL_pc_menu_build(items)" in lb("aAL_pc_menu_item"))
     ck("G3.2 pc_guest_title_item_visible() == (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT); the join refuses any other role",

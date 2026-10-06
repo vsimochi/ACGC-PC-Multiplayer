@@ -1222,6 +1222,8 @@ PC_NETGAME_TXN_KIND_SHOP_SELL = 11      # shop (milestone 2): dest NONE, slot = 
 PC_NETGAME_TXN_KIND_MAIL_SEND = 12      # mail (milestone 1): dest NONE, slot = mail slot 0..9, item = the letter's present echo, aux_item / aux_cond = low 16 / bits 16..23 of the letter's canonical-BE FNV-1a32
 PC_NETGAME_TXN_KIND_MAIL_TAKE = 13      # mail (milestone 2): dest NONE, slot = MAILBOX slot 0..9, flags = the destination mail[] slot, item = the letter's present echo, aux_item / aux_cond = low 16 / bits 16..23 of its canonical-BE FNV-1a32
 PC_NETGAME_TXN_KIND_HOUSE_PURCHASE = 14  # guest-first town: a GUEST pays the whole house price and becomes a resident. dest NONE, slot 0, item 0, flags 0, aux_item = the price (18400), aux_cond = the house 0..3 or 0xFF = auto
+PC_NETGAME_TXN_KIND_SHOP_RESTOCK = 15  # Nook's manual shop restock: dest NONE, slot 0, item 0, flags 0, aux_cond 0, aux_item = the price (500)
+PC_NETGAME_TXN_REASON_RESTOCKING = 31  # shop restock: a restock is already running (nothing charged)
 PC_NETGAME_HOUSE_AUTO = 0xFF
 PC_NETGAME_HOUSE_PRICE_DIRECT = 18400   # 1,000 down payment + 17,400 loan (mPlayer_DEBT0), wallet only
 PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD    # SHOP_BUY aux_cond: a counted candy / grab bag (Shop_c.flowers_candy_grab_bag_count)

@@ -96,8 +96,37 @@ int pc_utf8_to_game_code(const char* text) {
     return -1;
 }
 
+/* Feeds UTF-8 text through the same character mapping as SDL_TEXTINPUT. */
+static void pc_typing_push_utf8(const char* p) {
+    while (*p) {
+        int code = pc_utf8_to_game_code(p);
+        if (code >= 0)
+            pc_typing_queue_push(code);
+        unsigned char lead = (unsigned char)*p;
+        if (lead < 0x80) p += 1;
+        else if (lead < 0xE0) p += 2;
+        else if (lead < 0xF0) p += 3;
+        else p += 4;
+    }
+}
+
 void pc_typing_handle_event(const SDL_Event* event) {
     if (event->type == SDL_KEYDOWN) {
+        /* Clipboard: Ctrl+V / Shift+Insert pastes the text (line breaks become spaces, the editor's own length limit and character set still apply). There is no text selection
+         * in the in-game editor, so Ctrl+C / Ctrl+X have nothing to copy here. */
+        if (g_pc_typing_mode && g_pc_editor_active && !event->key.repeat &&
+            (((event->key.keysym.mod & KMOD_CTRL) && event->key.keysym.sym == SDLK_v) || ((event->key.keysym.mod & KMOD_SHIFT) && event->key.keysym.sym == SDLK_INSERT)) &&
+            SDL_HasClipboardText()) {
+            char* clip = SDL_GetClipboardText();
+            if (clip != NULL) {
+                char* q;
+                for (q = clip; *q; q++) {
+                    if (*q == '\r' || *q == '\n' || *q == '\t') *q = ' ';
+                }
+                pc_typing_push_utf8(clip);
+                SDL_free(clip);
+            }
+        }
         if (event->key.keysym.sym == SDLK_TAB && !event->key.repeat && g_pc_editor_active) {
             g_pc_typing_mode ^= 1;
             if (g_pc_typing_mode) {

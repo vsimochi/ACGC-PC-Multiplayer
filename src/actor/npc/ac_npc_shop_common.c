@@ -1775,7 +1775,10 @@ enum {
     aNSC_PC_HS_ASK_CONFIRM, /* waiting for Yes./No. of the confirmation */
     aNSC_PC_HS_BEGIN,       /* begin the purchase (retried while another transaction is unresolved) */
     aNSC_PC_HS_PENDING,     /* the transaction is in flight */
-    aNSC_PC_HS_END          /* the closing row is showing: wait for the conversation to end */
+    aNSC_PC_HS_END,         /* the closing row is showing: wait for the conversation to end */
+    aNSC_PC_RS_ASK,         /* manual restock: waiting for Yes./No. of the 500 Bells confirmation */
+    aNSC_PC_RS_BEGIN,       /* begin the restock payment (retried while another transaction is unresolved) */
+    aNSC_PC_RS_PENDING      /* the SHOP_RESTOCK transaction is in flight */
 };
 
 static int aNSC_pc_hs_state;
@@ -1854,6 +1857,33 @@ static void aNSC_pc_hs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, 
     aNSC_pc_hs_end(shop_common, which, 1);
 }
 
+/* ---- Nook's manual restock ("Refresh shop." under Other things, every player: resident, guest, the host's own player) ----
+ * confirm (500 Bells) -> pc_net_game_restock_begin() (host: pays locally and starts, client: one SHOP_RESTOCK TXN_COMMIT) -> APPLIED = the thanks row (the shop then closes, everybody
+ * inside is shown out by ac_shop_indoor.c) / a refusal row (RESTOCKING, no funds, ...). The HOST owns the price, the 60 s timer and the new catalog; nothing here is authoritative. */
+static void aNSC_pc_rs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, int sent) {
+    int which = PC_NOOK_MSG_RESTOCK_FAILED;
+    if (reason == PC_NETGAME_TS_REJECT_RESTOCKING) {
+        which = PC_NOOK_MSG_RESTOCK_BUSY;
+    } else if (reason == PC_NETGAME_TS_REJECT_NO_FUNDS) {
+        which = PC_NOOK_MSG_RESTOCK_NOFUNDS;
+    } else if (reason == 0 && sent) {
+        which = PC_NOOK_MSG_RESTOCK_LINKLOST;
+    }
+    printf("[NET][RESTOCK] nook dialogue: restock not made (reason %d) -> row %d\n", reason, which);
+    aNSC_pc_hs_end(shop_common, which, 0);
+}
+
+static void aNSC_pc_rs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int r = pc_net_game_restock_precheck();
+    printf("[NET][RESTOCK] nook dialogue: 'Refresh shop.' chosen, precheck=%d\n", r);
+    if (r != 0) {
+        aNSC_pc_rs_fail_row(shop_common, r, 0);
+        return;
+    }
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_RESTOCK_ASK);
+    aNSC_pc_hs_state = aNSC_PC_RS_ASK;
+}
+
 /* Yes. of the offer / the "Buy a house." choice: price, then the free houses. */
 static void aNSC_pc_hs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     int r = pc_net_game_house_purchase_precheck(-1);
@@ -1887,6 +1917,33 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
         pc_nook_house_rejoin_hold_touch(); /* heartbeat: the rejoin hold lives only while this proc runs (PENDING / END) */
     }
     switch (aNSC_pc_hs_state) {
+        case aNSC_PC_RS_BEGIN:
+            r = pc_net_game_restock_begin();
+            if (r < 0) {
+                return; /* another transaction is unresolved: next frame */
+            }
+            if (r == 3) {
+                printf("[NET][RESTOCK] nook dialogue: restock started by the host player -> thanks row\n");
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_RESTOCK_THANKS, 0);
+            } else if (r == 0) {
+                aNSC_pc_rs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 0); /* refused locally: nothing was sent */
+            } else {
+                aNSC_pc_hs_state = aNSC_PC_RS_PENDING;
+            }
+            break;
+        case aNSC_PC_RS_PENDING:
+            r = pc_net_game_ts_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                return;
+            }
+            if (r == PC_NETGAME_TS_OP_APPLIED) {
+                printf("[NET][RESTOCK] nook dialogue: restock APPLIED -> thanks row\n");
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_RESTOCK_THANKS, 0);
+            } else {
+                aNSC_pc_rs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
+            }
+            break;
+        case aNSC_PC_RS_ASK:
         case aNSC_PC_HS_ASK_INTRO:
         case aNSC_PC_HS_ASK_PICK:
         case aNSC_PC_HS_ASK_CONFIRM:
@@ -1894,7 +1951,15 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 return;
             }
             k = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
-            if (aNSC_pc_hs_state == aNSC_PC_HS_ASK_INTRO) {
+            if (aNSC_pc_hs_state == aNSC_PC_RS_ASK) {
+                if (k == mChoice_CHOICE0) {
+                    printf("[NET][RESTOCK] nook dialogue: payment confirmed, requesting the restock\n");
+                    aNSC_pc_hs_state = aNSC_PC_RS_BEGIN; /* the text stays up; the order value stays set until the answer */
+                } else {
+                    printf("[NET][RESTOCK] nook dialogue: the player declined the restock\n");
+                    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_RESTOCK_DECLINE, 0);
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_HS_ASK_INTRO) {
                 if (k == mChoice_CHOICE0) {
                     aNSC_pc_hs_start_flow(shop_common);
                 } else {
@@ -2490,9 +2555,13 @@ static void aNSC_request_Q_answer_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_
             mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
 #ifdef aNSC_PC_HOUSE
             if (next == 0 && aNSC_pc_hs_menu_offer()) {
-                /* Guest-first town M4: the guest variant of the "Other things" row: the same text + a 4th choice "Buy a house." */
+                /* Guest-first town M4: the guest variant of the "Other things" row: the same text + "Buy a house." and "Refresh shop." */
                 aNSC_Set_continue_msg_num(msg_p, shop_common, pc_nook_msg_id(PC_NOOK_MSG_OTHER));
                 aNSC_pc_hs_other_active = 1;
+            } else if (next == 0 && pc_net_game_restock_offer_available()) {
+                /* resident / host player: the same text + "Refresh shop." */
+                aNSC_Set_continue_msg_num(msg_p, shop_common, pc_nook_msg_id(PC_NOOK_MSG_OTHER_R));
+                aNSC_pc_hs_other_active = 2;
             } else {
                 aNSC_pc_hs_other_active = 0;
                 aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
@@ -2520,7 +2589,14 @@ static void aNSC_request_Q_answer_wait2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME
         if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
             int next;
 #ifdef aNSC_PC_HOUSE
-            if (aNSC_pc_hs_other_active && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3 && aNSC_pc_hs_menu_offer()) {
+            if ((aNSC_pc_hs_other_active == 1 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE4) ||
+                (aNSC_pc_hs_other_active == 2 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3)) {
+                /* "Refresh shop." (the guest menu has it 5th, the resident menu 4th; the vanilla last choice moved down) */
+                aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_NONE);
+                aNSC_pc_rs_start_flow(shop_common);
+                return;
+            }
+            if (aNSC_pc_hs_other_active == 1 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3 && aNSC_pc_hs_menu_offer()) {
                 /* Guest-first town M4: "Buy a house." of the guest "Other things" row (the vanilla 4th choice moved to the 5th place) */
                 printf("[NET][HOUSE] nook dialogue: 'Buy a house.' chosen in the Other things menu\n");
                 aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_NONE);

@@ -337,6 +337,7 @@ void pc_net_game_poll(void);
 /* --- queries --- */
 
 PCNetGameRole pc_net_game_role(void);
+int pc_net_game_shop_restocking(void); /* 1 while Nook's shop restocks (host: real state, client: last HOST_CONFIG); read by mSP_ShopOpen() */
 
 /* Protocol v7 (M9-C): read-only observation hook called by the vanilla player code (src/game/m_player.c,
  * Player_actor_change_main_index, TARGET_PC only) right after the LOCAL player actually entered a main index
@@ -666,6 +667,7 @@ int pc_net_game_ts_poll(void);
  *   pc_net_game_ts_last_reject_reason(): the host's PC_NETGAME_TS_REJECT_* reason of the last REJECTED result (0 = a local refusal / none). */
 #define PC_NETGAME_TS_REJECT_NOT_AVAILABLE   16
 #define PC_NETGAME_TS_REJECT_NO_FUNDS        19
+#define PC_NETGAME_TS_REJECT_RESTOCKING      31 /* shop restock: a restock is already running (nothing charged) */
 #define PC_NETGAME_TS_REJECT_NOT_SELLABLE    20
 #define PC_NETGAME_TS_REJECT_PRICE_MISMATCH  21
 #define PC_NETGAME_TS_REJECT_NO_ROOM         22

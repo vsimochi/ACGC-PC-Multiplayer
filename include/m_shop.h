@@ -168,6 +168,7 @@ enum {
   mSP_SHOP_STATUS_PREEVENT,
   mSP_SHOP_STATUS_ENDEVENT,
   mSP_SHOP_STATUS_OPENEVENT,
+  mSP_SHOP_STATUS_RESTOCK, /* PC: Nook's manual restock is running (closed for 60 s, see pc_net_game_shop_restocking) */
 
   mSP_SHOP_STATUS_NUM
 };
