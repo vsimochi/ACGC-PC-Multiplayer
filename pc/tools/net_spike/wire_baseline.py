@@ -174,7 +174,13 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              "#define PC_NETGAME_TXN_KIND_MAIL_TAKE 13u", "#define PC_NETGAME_TXN_REASON_NO_SUCH_LETTER  26u",
              "#define PC_NETGAME_TXN_REASON_MAIL_CHANGED    27u", "#define PC_NETGAME_MBOX_SLOTS      10u",
              "#define PC_NETGAME_MBOX_FLAG_EMPTY 0x01u", "#define PC_NETGAME_MAIL_WIRE_SIZE  298u",
-             '_Static_assert(sizeof(PCNetGameMailboxLetterMsg) == 316,', "offsetof(PCNetGameMailboxLetterMsg, letter) == 16")
+             '_Static_assert(sizeof(PCNetGameMailboxLetterMsg) == 316,', "offsetof(PCNetGameMailboxLetterMsg, letter) == 16",
+             # guest-first town: the paid HOUSE_PURCHASE kind (TXN_COMMIT kind 14, no new message id), its three reasons, the auto-house byte and the host price
+             "#define PC_NETGAME_TXN_KIND_HOUSE_PURCHASE 14u", "#define PC_NETGAME_TXN_REASON_NO_RESIDENCE    28u",
+             "#define PC_NETGAME_TXN_REASON_INVALID_HOUSE   29u", "#define PC_NETGAME_TXN_REASON_NAME_TAKEN      30u",
+             "#define PC_NETGAME_HOUSE_AUTO                 0xFFu",
+             "#define PC_NETGAME_HOUSE_PRICE_DIRECT         (1000u + (uint32_t)mPlayer_DEBT0)",
+             '_Static_assert(PC_NETGAME_HOUSE_PRICE_DIRECT == 18400u')
 # Guests G1: exact C lines (constants + size / offset asserts) that must stay as they are.
 GUEST_C_PINS = ("#define PC_NETGAME_IDEXT_FLAG_GUEST      0x01u", "#define PC_NETGAME_IDTOKEN_FLAG_NEW      0x01u",
                 "#define PC_NETGAME_IDTOKEN_FLAG_KNOWN    0x02u", "#define PC_NETGAME_GUEST_TOKEN_LEN       16u",
@@ -295,6 +301,13 @@ V8_LIB_PINNED = {
     # mail milestone 2
     "PC_NETGAME_TXN_REASON_NO_SUCH_LETTER": '26',
     "PC_NETGAME_TXN_REASON_MAIL_CHANGED": '27',
+    # guest-first town (paid house purchase)
+    "PC_NETGAME_TXN_REASON_NO_RESIDENCE": '28',
+    "PC_NETGAME_TXN_REASON_INVALID_HOUSE": '29',
+    "PC_NETGAME_TXN_REASON_NAME_TAKEN": '30',
+    "PC_NETGAME_TXN_KIND_HOUSE_PURCHASE": '14',
+    "PC_NETGAME_HOUSE_AUTO": '0xFF',
+    "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',
     "PC_NETGAME_TXN_KIND_MAIL_TAKE": '13',
     "PC_NETGAME_MSG_MAILBOX_LETTER": '56',
     "PC_NETGAME_MBOX_SLOTS": '10',

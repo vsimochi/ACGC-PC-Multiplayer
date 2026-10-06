@@ -1056,6 +1056,71 @@ Tests: `pc/tools/net_spike/test_promotion_protocol.py` (scripted clients against
 
 **Promoted resident gameplay check.** One real run (disposable `bin_fixture4_promo_rc` host with `--dedicated --town-serve on --resident-tokens tofu --house-sync`, `bin_fixture4_promo_rcc` client, store character Roger: guest -> `promote Roger auto auto confirm` -> dry-run relaunch line) and then the logged command line (`--connect 127.0.0.1:P --character <uuid> --town-fetch --online-ui`) started as a normal WINDOWED client, driven with synthetic key events (`keybd_event` scan codes, sent only after the game window was confirmed foreground) and screenshots of ONLY the game window client rectangle. SEEN on screen: (1) the player in the host town as a resident standing at the door step of house 3 (no title / Rover / Nook intro scenes; log: `resident PersonalID matches slot 3`, `playing a resident`, READY, `resident token verified by the host (resident 3)`), in the guest's look (white cap, striped shirt, face 3; the name was not drawn on screen, it is in the promote log: `Roger`, player id 0xF04D); (2) normal movement (walk S and back N, right along the step; screenshots differ as expected); (3) no intro / first-job: no cutscene or dialogue appeared and the client log has no INTRO_DEMO / first-job line; (4) the house door opened with the A key (vanilla needs A while facing the door, not just walking into it) and the interior was entered: a valid default room (metal floor, desk with a diary, radio, lights off), no crash; leaving it returned to the door; (5) host process stopped and restarted (the stop was a normal `stop`): the open client showed `Connection lost - Reconnecting... (attempt 5)` in the room, reconnected after 5 attempts / ~38 s with `identity re-established (resident: resident 3)`, the host logged `credential verified (token sent: KNOWN)`, and the player could walk out of the house afterwards. NOT seen / NOT verified: (6) villager memories: the guest had talked to nobody, so the promote logged `0 villager memories re-keyed`; nothing was re-keyed, no FRIENDSHIP line appeared, no villager was approached or talked to, and the host GCI could not be inspected after the final shutdown (the game processes were ended by the harness with `taskkill`, not a graceful `stop`; and file mtimes under the fixture dirs did not advance in this environment, so on-disk contents were not checked). Not seen: the appearance beyond the character model (name tag / gender text), a second resident, the interior after a house edit, villager greeting dialogue. Observation, not a bug: at the first frames of the resident arrival the client logs `entered own house 3: in-room commits NOT armed` while it is in the town scene; `pcnetgame_local_house_unsafe` also returns 1 while a fade / wipe is running, so the line is a fade artefact and the in-room tracking resets when the fade ends. No code was changed.
 
+## Guest-first town: paid house purchase (host + rejoin)
+
+Goal: a player can join any town as a GUEST first and later BUY a house from inside the game; the host then makes that guest a RESIDENT. This block is the host transaction, the client
+request seam, the in-process rejoin and the test hook. The Nook dialogue (the "buy a house" offer) comes AFTER it and only calls the client seam below. Nothing here changes the
+console `promote` behaviour, Play Online, the dedicated defaults, resident credentials, house sync or the reconnect.
+
+**Flow.** Guest client -> `TXN_COMMIT` kind **14** `HOUSE_PURCHASE` (no new message id) -> the host runs ONE synchronous handler (`pcnetgame_handle_host_house_purchase_txn`, no yield):
+READY gate -> binding gate (a RESIDENT sender is refused: PRECOND) -> guests.dat / members.dat trusted, record SYNCED, no push in flight -> shape -> journal (fence / replay / CONFLICT, same
+rules as the other one-phase kinds) -> base epoch / rev (STALE_IMAGE) -> pre-image validation -> price -> house index range -> the guest MIRROR wallet can pay (the client's `pre_wallet` is
+never trusted) -> the mirror wallet is debited IN MEMORY -> the shared core `pcnetgame_promote_exec(PROMOTE_ONLINE | PROMOTE_PAID)` -> `TXN_RESULT` APPLIED (post wallet) ->
+`RESIDENT_HANDOFF` (66) -> `REJECT` 6 `PROMOTED` -> the peer is closed. All three messages ride the same RELIABLE ORDERED channel, so the client always sees them in this order.
+
+**Price.** Vanilla: 1,000 Bells down payment + a 17,400 Bells loan (`mPlayer_DEBT0`). Here the guest pays everything at once: `PC_NETGAME_HOUSE_PRICE_DIRECT = 1000 + mPlayer_DEBT0 = 18,400`
+(static-asserted, fits `tag.aux_item`). Only the WALLET counts (money bags in the pockets are left alone, unlike the Nook shop). The new resident starts with `loan = 0`
+(`pc_mp_promote_set_paid` is a one-shot flag consumed by `pc_mp_promote_create`; the console `promote` keeps `loan = mPlayer_DEBT0`). The wallet carried into the resident is the already
+debited mirror wallet.
+
+**Message fields.** `tag.dest = NONE`, `slot = 0`, `item = 0`, `flags = 0`, `aux_item` = the price the client expects (!= the host constant -> `PRICE_MISMATCH` 21), `aux_cond` = the requested
+house 0..3 or `0xFF` = auto; `base_epoch / base_rev / pre_*` = the usual pre-image (validated, then ignored for the money: the host decides from its mirror).
+
+**Atomicity.** The handler and the core run in ONE call on the game thread (the host save runs only at frame boundaries). The core is the former body of `pc_net_game_dedicated_promote`
+(the console command is now a thin wrapper, output / order of checks unchanged): token mint -> `pc_mp_promote_create` (vanilla Clear + Init + `mHS_set_use` + veteran event state + catalog
+bits + re-keyed villager memories) -> lineage rev 1 -> members.dat (RESIDENT_TOKEN + PROMOTION_HANDOFF) -> `pc_save_write_authoritative` (the GCI) -> the guests.dat entry removed LAST.
+ANY failure before the durable save rolls the game state, the lineage and members.dat back (existing code) AND the handler restores the pre-debit mirror wallet: the guest gets
+`TXN_RESULT REJECTED`, wallet unchanged, no resident, no house. A second guest asking for the last slot in the same tick runs after the first returns and gets `NO_RESIDENCE`. A lost
+`TXN_RESULT` after a durable purchase is recovered by the guest's next connect: its guest claim + token hit the persisted PROMOTION_HANDOFF (66 + REJECT 6 again, same as the console path).
+The guests.dat backup / members.dat backup / records.dat backup of the console path are written for every purchase too.
+
+**Reason codes** (appended to `PC_NETGAME_TXN_REASON_*`, 1..27 unchanged): `NO_FUNDS` 19 (reused: wallet < price), `PRICE_MISMATCH` 21 (reused), `STALE_IMAGE` 10 / `BAD_SHAPE` 11 / `BAD_IMAGE` 8 /
+`NOT_SYNCED` 4 / `BUSY` 12 (reused), `PRECOND` 9 (a resident sender), new: `NO_RESIDENCE` **28** (no free resident slot, no free house, or no room for the 2 members.dat entries),
+`INVALID_HOUSE` **29** (the requested house is not free / out of range), `NAME_TAKEN` **30** (a resident already has the guest's name). `net_spike_lib.py`, `wire_baseline.py` pin them.
+
+**Client seam (M2)** (`pc_net_game.h`; the dialogue calls only these):
+* `int pc_net_game_house_purchase_price(void)` -> 18400.
+* `int pc_net_game_house_purchase_precheck(int house_or_auto)` -> 0 = may be tried, else a local reason: 9 PRECOND (not a READY guest client), 19 NO_FUNDS (local wallet < price), 28 NO_RESIDENCE
+  (no free resident slot / free house in the LOCAL town copy), 29 INVALID_HOUSE (out of range / not free). `house_or_auto` = 0..3 or -1.
+* `int pc_net_game_ts_begin_house_purchase(int house_or_auto)` -> 1 started, 0 refused (the local reason is in `pc_net_game_ts_last_reject_reason()`), -1 busy (retry next frame).
+* `int pc_net_game_ts_poll(void)` -> `PC_NETGAME_TS_OP_PENDING / APPLIED / REJECTED` (consumed once); after REJECTED `pc_net_game_ts_last_reject_reason()` = the HOST reason (19 / 21 / 28 / 29 / 30 / 10 ...; 0 = link loss).
+* On APPLIED the client debits the price from its local wallet (delta if it moved), logs `house purchase APPLIED`, and for a store character writes `nook_intro = bought` into
+  `characters/<uuid>/towns/<townkey>/membership.ini`. `pc_character_membership_write` now PRESERVES every key it does not own (it used to rewrite the file); `pc_character_membership_get_key /
+  _set_key` read / write one extra key. The handoff then flips `role` to `resident` and keeps `nook_intro`.
+
+**In-process rejoin (M3).** REJECT 6 used to request a PROCESS relaunch (`pc_main_relaunch_poll`). Now, for a `--town-fetch` / Play Online client (a store character), `pc_main_relaunch_poll` calls
+`pc_main_play_online_rejoin`: `pc_net_game_shutdown()` (role NONE), then the NORMAL Play Online connect (`pc_po_connect`) runs for the same character with a REJOIN flag: the town is
+re-fetched (it now holds the resident), the membership says `resident`, the slot is bound by PersonalID and the RESIDENT claim carries the handed-over token. Differences to a menu-started
+connect: no Play Online menu is open (that guard is waived), the start is a LIVE play scene (field / building: it waits for an idle scene, no wipe), and the fetched town is NOT loaded into
+RAM under the old scene (only `pc_save_ready` is cleared, so no save writer runs) - the title's `trademark_init -> pc_save_reload` reads it after the existing fade to
+the title (`FADE_TYPE_OUT_RETURN_TITLE`). Because a field scene counts as "world ready" (a title does not), `pc_net_game_client_world_hold(1)` keeps the new client session from building an identity
+claim out of the OLD scene (the stale guest would be sent and refused); it is released when that scene was left, and the claim then comes from the new town as a RESIDENT. A rejoin that fails shows a title notice and fades to the title; it NEVER reloads save/card_a into the old live session. Fallbacks (documented, not
+silent): if the rejoin cannot even be requested the old process relaunch (`pc_relaunch_connect`) runs; `AC_RELAUNCH_DRYRUN=1` keeps the old dry-run path (used by
+`test_promotion_relaunch_real.py`); a CLI / legacy-profile client (no store character) keeps the old message path.
+
+**Test hook.** `--house-buy-test H|auto` (client only, hidden, loud `[NET][HOUSE][TEST-ONLY]` logs, refused with exit 2 for any other role): once the record is SYNCED the hook raises the
+LOCAL wallet to 20000 when it is below the price (its one local write), waits for the D3 upload, then calls `pc_net_game_ts_begin_house_purchase()` / `pc_net_game_ts_poll()`; fires once.
+
+**Limits.** At most 4 houses / 4 residents (the vanilla table; slot / house selection lives inside `pcnetgame_promote_exec`, so a future >4 houses only changes that function). No Nook intro,
+no first-job quest, no loan to repay (the price is paid up front). Letters / fish records held for the guest PID are lost like in the console promotion. Money bags do not pay.
+A host with `resident_tokens=off` hands off the same way (the handoff entry then stays until the operator resets it, as for the console path). The rejoin keeps the old scene alive for ~2 s on its OLD
+RAM while it fades out (nothing is written).
+
+Tests: `pc/tools/net_spike/test_house_purchase_protocol.py` (FakeClients vs real dedicated hosts on `bin_fixture4_hbuy`: NO_FUNDS / PRICE_MISMATCH / STALE_IMAGE / INVALID_HOUSE / BAD_SHAPE with the
+files byte-identical, two guests racing for the last slot -> exactly one APPLIED, RESULT -> 66 -> REJECT 6 order, GCI loan 0 / wallet / house owner, guests.dat / members.dat / records.dat, the town
+FULL -> NO_RESIDENCE, handoff again on reconnect, resident claim KNOWN, a resident sender refused) and `test_house_purchase_real.py` (one real store-character guest client with `--house-buy-test auto`
+-> APPLIED -> the SAME pid re-joins in-process as resident 3 and reaches READY).
+
 ## Known limitations
 
 * A guest needs a copy of the HOST's town save: either fetched with `--town-fetch` (the host must serve it, `--town-serve on`; see "Town cache and town transfer") or copied by hand

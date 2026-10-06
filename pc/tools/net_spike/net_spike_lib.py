@@ -1190,6 +1190,9 @@ PC_NETGAME_TXN_REASON_MAILBOX_FULL = 24      # mail: MAIL_SEND whose recipient's
 PC_NETGAME_TXN_REASON_PO_FULL = 25           # mail: MAIL_SEND the post office cannot take (5 desk slots / 10 letters per house)
 PC_NETGAME_TXN_REASON_NO_SUCH_LETTER = 26    # mail (milestone 2): MAIL_TAKE of a mailbox slot that is empty on the host
 PC_NETGAME_TXN_REASON_MAIL_CHANGED = 27      # mail (milestone 2): MAIL_TAKE of a mailbox letter whose hash differs from the claimed one
+PC_NETGAME_TXN_REASON_NO_RESIDENCE = 28      # guest-first house purchase: no free resident slot / no free house / no members.dat room
+PC_NETGAME_TXN_REASON_INVALID_HOUSE = 29     # guest-first house purchase: the requested house is not free or out of range
+PC_NETGAME_TXN_REASON_NAME_TAKEN = 30        # guest-first house purchase: a resident already has the guest's name
 PC_NETGAME_TXN_RING = 16              # host journal entries per resident
 PC_NETGAME_TXN_FENCED_NUM = 4         # fenced nonces remembered per resident
 TXN_TAG_FMT = "<IIBBHBBHII15HHII"       # PCNetGameTxnTag, 64 bytes
@@ -1199,7 +1202,7 @@ TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED
                     7: "CONFLICT", 8: "BAD_IMAGE", 9: "PRECOND", 10: "STALE_IMAGE", 11: "BAD_SHAPE", 12: "BUSY", 13: "FAULT",
                     14: "REPLAYED", 15: "ALREADY_DONATED", 16: "NOT_AVAILABLE", 17: "NOT_DONATABLE", 18: "NO_DONOR_SLOT", 19: "NO_FUNDS",
                     20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM", 23: "NO_SUCH_ADDRESS", 24: "MAILBOX_FULL", 25: "PO_FULL",
-                    26: "NO_SUCH_LETTER", 27: "MAIL_CHANGED"}
+                    26: "NO_SUCH_LETTER", 27: "MAIL_CHANGED", 28: "NO_RESIDENCE", 29: "INVALID_HOUSE", 30: "NAME_TAKEN"}
 
 # --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
 # CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
@@ -1218,6 +1221,9 @@ PC_NETGAME_TXN_KIND_SHOP_BUY = 10       # shop (milestone 2): dest POCKET, slot 
 PC_NETGAME_TXN_KIND_SHOP_SELL = 11      # shop (milestone 2): dest NONE, slot = primary slot, item = its item, aux_item = the bit mask of every slot sold
 PC_NETGAME_TXN_KIND_MAIL_SEND = 12      # mail (milestone 1): dest NONE, slot = mail slot 0..9, item = the letter's present echo, aux_item / aux_cond = low 16 / bits 16..23 of the letter's canonical-BE FNV-1a32
 PC_NETGAME_TXN_KIND_MAIL_TAKE = 13      # mail (milestone 2): dest NONE, slot = MAILBOX slot 0..9, flags = the destination mail[] slot, item = the letter's present echo, aux_item / aux_cond = low 16 / bits 16..23 of its canonical-BE FNV-1a32
+PC_NETGAME_TXN_KIND_HOUSE_PURCHASE = 14  # guest-first town: a GUEST pays the whole house price and becomes a resident. dest NONE, slot 0, item 0, flags 0, aux_item = the price (18400), aux_cond = the house 0..3 or 0xFF = auto
+PC_NETGAME_HOUSE_AUTO = 0xFF
+PC_NETGAME_HOUSE_PRICE_DIRECT = 18400   # 1,000 down payment + 17,400 loan (mPlayer_DEBT0), wallet only
 PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD    # SHOP_BUY aux_cond: a counted candy / grab bag (Shop_c.flowers_candy_grab_bag_count)
 PC_NETGAME_SHOP_STOCK_RARE = 0xFE       # SHOP_BUY aux_cond: Shop_c.rare_item
 PC_NETGAME_SHOP_STOCK_UNLIMITED = 0xFF  # SHOP_BUY aux_cond: unlimited stationery

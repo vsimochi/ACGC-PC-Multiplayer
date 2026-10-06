@@ -321,6 +321,9 @@ int pc_net_game_start_host(uint16_t port);
 /* Starts connecting to host_ip:port. Returns 1 if the attempt was launched (not that it
  * succeeded yet -- poll pc_net_game_client_link_state()), 0 on immediate failure. */
 int pc_net_game_start_client(const char* host_ip, uint16_t port);
+/* Guest-first rejoin (pc_main.c pc_po_connect): hold = 1 keeps a CLIENT from treating the local world as ready (no identity claim from the old live scene while it fades to the
+ * title); pc_main releases it once that scene was left. Cleared by pc_net_game_shutdown() and pc_net_game_start_client(). */
+void pc_net_game_client_world_hold(int on);
 
 /* Tears down networking entirely (transport + all handshake state) and returns to
  * PC_NETGAME_ROLE_NONE. Safe to call even if networking was never started. */
@@ -670,6 +673,27 @@ int pc_net_game_shop_buy_stock_code(int item);
 int pc_net_game_ts_begin_shop_buy(int pocket_slot, int item, int stock_code, int price);
 int pc_net_game_ts_begin_shop_sell(int slot_mask, int primary_slot, int item);
 int pc_net_game_ts_last_reject_reason(void);
+
+/* Guest-first town: the client seams of the PAID HOUSE PURCHASE (TXN_COMMIT kind 14 on the same machinery; the dialogue milestone calls these). A GUEST pays the whole
+ * vanilla house price (1,000 down payment + 17,400 loan = 18,400 Bells, wallet only) and the HOST makes it a RESIDENT with a house and no loan (a durable town save, a
+ * resident credential, RESIDENT_HANDOFF + REJECT PROMOTED, then the client re-joins in-process as the resident). Only ever called with role CLIENT.
+ *   pc_net_game_house_purchase_price():          the price in Bells (18400).
+ *   pc_net_game_house_purchase_precheck(house):  0 = a purchase may be tried; else a local refusal reason: PC_NETGAME_HOUSE_REJECT_PRECOND (not a READY guest client), _NO_FUNDS
+ *                                                (local wallet < price), _NO_RESIDENCE (no free resident slot / house in the local copy), _INVALID_HOUSE (house out of range /
+ *                                                not free). `house` = 0..3, or -1 for auto.
+ *   pc_net_game_ts_begin_house_purchase(house):  1 = started, 0 = refused for good (pc_net_game_ts_last_reject_reason() = the local reason above), -1 = busy (retry next
+ *                                                frame). Then poll pc_net_game_ts_poll() (PC_NETGAME_TS_OP_*) every frame; after REJECTED pc_net_game_ts_last_reject_reason()
+ *                                                is the HOST reason (PC_NETGAME_HOUSE_REJECT_* below, 21 PRICE_MISMATCH, 10 STALE_IMAGE, ...; 0 = a link loss). After APPLIED
+ *                                                the session ends within a few frames (the host closes it) and the in-process re-join starts by itself.
+ * A store character's membership.ini gets `nook_intro = bought` on APPLIED (pc_character_membership_get_key / _set_key keep the key across rewrites). */
+#define PC_NETGAME_HOUSE_REJECT_PRECOND      9
+#define PC_NETGAME_HOUSE_REJECT_NO_FUNDS     19
+#define PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE 28
+#define PC_NETGAME_HOUSE_REJECT_INVALID_HOUSE 29
+#define PC_NETGAME_HOUSE_REJECT_NAME_TAKEN   30
+int pc_net_game_house_purchase_price(void);
+int pc_net_game_house_purchase_precheck(int house_or_auto);
+int pc_net_game_ts_begin_house_purchase(int house_or_auto);
 
 /* Mail milestone 1 (protocol v8, unreleased): the client seam of a LETTER TO A PLAYER (a resident's house). The vanilla post-girl dialogue would run
  * mPO_receipt_proc() on the client's LOCAL (dead) post office and lose the letter and its gift; a client instead asks the HOST (TXN_COMMIT kind 12

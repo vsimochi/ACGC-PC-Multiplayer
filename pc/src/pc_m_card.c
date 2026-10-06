@@ -1607,8 +1607,17 @@ static struct {
 } s_pc_promote_snap;
 
 void pc_mp_promote_rollback(void);
+
+/* Guest-first paid house purchase: the NEXT pc_mp_promote_create starts the new resident with loan 0 (the guest paid the whole house price up front; the caller already
+ * debited the guest record's wallet, which is copied as-is). One-shot: consumed (and cleared) at the entry of pc_mp_promote_create, so a refused promote never leaks it. */
+static int s_pc_promote_paid = 0;
+void pc_mp_promote_set_paid(int paid) {
+    s_pc_promote_paid = paid != 0;
+}
+
 int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot, int house, char* err, size_t cap) {
     const Private_c* g = (const Private_c*)guest_rec;
+    const int paid = s_pc_promote_paid;
     PersonalID_c* gkey = (PersonalID_c*)guest_key; /* the guest's home PersonalID = bound_pid = memory_player_id of its villager memories */
     int remapped = 0;
     Private_c* priv;
@@ -1616,6 +1625,7 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     int i, face_ok = 1;
     u32 seen = 0;
 
+    s_pc_promote_paid = 0; /* consumed above into `paid` */
     if (err != NULL && cap > 0) {
         err[0] = '\0';
     }
@@ -1686,6 +1696,9 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     memcpy(priv->my_org, g->my_org, sizeof(priv->my_org));
     memcpy(priv->my_org_no_table, g->my_org_no_table, sizeof(priv->my_org_no_table));
     priv->inventory.loan = mPlayer_DEBT0;
+    if (paid) {
+        priv->inventory.loan = 0; /* the guest paid the 1,000 down payment + the 17,400 loan up front (wallet debited by the host before this call) */
+    }
 
     if (mHS_set_use(slot, house) != TRUE || (int)mHS_get_arrange_idx(slot) != house || mPr_CheckCmpPersonalID(&home->ownerID, &priv->player_ID) != TRUE) {
         pc_mp_promote_rollback();
@@ -2188,6 +2201,11 @@ static void pc_title_notice(const char* head, const char* msg, int secs) {
     snprintf(s_pc_guest_title_msg, sizeof(s_pc_guest_title_msg), "%s", msg);
     s_pc_guest_title_msg_head = head;
     s_pc_guest_title_msg_until = time(NULL) + secs;
+}
+
+/* Guest-first purchase: the in-process REJOIN (pc_main.c) failed after the guest was promoted: the title shows why (head + message for `secs` seconds). `head` must outlive the call. */
+void pc_title_notice_post(const char* head, const char* msg, int secs) {
+    pc_title_notice(head, msg, secs);
 }
 
 static void pc_guest_title_fail(const char* what) {

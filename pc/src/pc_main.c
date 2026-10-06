@@ -601,6 +601,8 @@ int g_pc_ts_test_claim = 0;
 /* Town services milestone 2 (shop) TEST-ONLY hooks: --shop-test-buy / --shop-test-sell. See pc_platform.h's own doc comment. */
 int g_pc_shop_test_buy = 0;
 int g_pc_shop_test_sell = 0;
+/* Guest-first town TEST-ONLY hook: --house-buy-test H|auto (client, a guest). See pc_platform.h. */
+const char* g_pc_house_buy_test = NULL;
 /* Mail milestone 1 TEST-ONLY hooks: --mail-test-send=<house>[,gift] / --mail-test-force-delivery. See pc_platform.h's own doc comment. */
 const char* g_pc_mail_test_send = NULL;
 int g_pc_mail_test_force_delivery = 0;
@@ -803,6 +805,8 @@ static int pc_town_failure_box(const char* msg, int offline) {
  * `--connect HOST:PORT --town-fetch --character UUID`: the new process fetches the town that now contains the resident and joins as it. g_pc_running is cleared ONLY
  * after the new process exists. A CLI client without --town-fetch (local town = card_a, which lacks the resident) only keeps the message. AC_RELAUNCH_DRYRUN=1 logs the
  * command line and keeps running. Consumed once, so it cannot loop (a resident process sends no guest claim and never gets a handoff). */
+static int pc_main_play_online_rejoin(const char* host, int port, const char* uuid); /* the Play Online block below */
+
 void pc_main_relaunch_poll(void) {
     char uuid[64], err[200];
     if (!pc_net_game_client_take_relaunch(uuid, sizeof(uuid))) {
@@ -813,6 +817,16 @@ void pc_main_relaunch_poll(void) {
         return;
     }
     err[0] = '\0';
+    if (getenv("AC_RELAUNCH_DRYRUN") == NULL) {
+        /* Guest-first town (M3): the promoted client re-joins IN THIS PROCESS (no restart, same window / audio / PID): the session is shut down and the Play Online
+         * connect runs again as the resident (re-fetch of the town that now holds the resident, role = resident, bind by PersonalID, RESIDENT claim with the handed-over
+         * token). The process relaunch below is the FALLBACK when the rejoin cannot even be requested (another Play Online request is running). */
+        if (pc_main_play_online_rejoin(g_pc_net_host_ip, (int)g_pc_net_port, uuid)) {
+            printf("[PC] M3: promoted: re-joining IN-PROCESS as the resident (no relaunch)\n");
+            return;
+        }
+        printf("[PC] M3: promoted: the in-process rejoin could not be requested -- falling back to the process relaunch\n");
+    }
     if (pc_relaunch_connect(g_pc_net_host_ip, (int)g_pc_net_port, PC_RELAUNCH_CHARACTER, uuid, err, sizeof(err))) {
         printf("[PC] M-I: promoted: relaunched as the resident (new process started), quitting this one\n");
         g_pc_running = 0;
@@ -995,6 +1009,7 @@ extern int  pc_play_online_save_load(void);
 extern int  pc_play_online_save_flags_get(int* ready);
 extern void pc_play_online_save_flags_set(int loaded, int ready);
 extern void pc_guest_creation_disarm(void);
+extern void pc_title_notice_post(const char* head, const char* msg, int secs); /* pc_m_card.c: a title-screen notice (the rejoin failure) */
 
 enum { PO_IDLE = 0, PO_REQUESTED = 1, PO_FADING = 2 };
 static struct {
@@ -1006,6 +1021,7 @@ static struct {
     int  wait;       /* frames waiting for an idle title scene */
     int  arm_guest;  /* arm g_pc_bootstrap_guest once the scene was left */
     int  arm_pid;    /* arm g_pc_bootstrap_resident_pid_set once the scene was left */
+    int  rejoin;     /* guest-first purchase: the promoted guest re-joins as the resident from a LIVE (field / building) scene, no Play Online menu is open */
 } s_po;
 static char s_po_character[48]; /* backing store of g_pc_character_spec for the in-process connect */
 
@@ -1024,6 +1040,48 @@ int pc_main_play_online_request(const char* host, int port, int kind, const char
     snprintf(s_po.name, sizeof(s_po.name), "%s", name != NULL ? name : "");
     s_po.state = PO_REQUESTED;
     return 1;
+}
+
+/* Guest-first town (M3): the in-process REJOIN of a promoted guest (called by pc_main_relaunch_poll after RESIDENT_HANDOFF + REJECT PROMOTED). The client session is shut
+ * down (role NONE: the sanitized town image may only be read by a CLIENT, the new connect makes it one again), then the NORMAL Play Online connect (pc_po_connect) runs for
+ * the same store character: the host serves the town that now contains the resident, the membership says role = resident, the slot is bound by PersonalID and the RESIDENT
+ * claim carries the handed-over token. Differences to a menu-started connect: no Play Online menu is open (the guard is waived) and the start is a LIVE play scene (a field,
+ * a building), so the existing fade to the title (FADE_TYPE_OUT_RETURN_TITLE) is what ends the old scene; for ~2 s that scene still runs on the freshly loaded RAM
+ * (pc_save_ready is cleared first, so no save writer runs and the net client waits for the new title). A FAILURE shows a title notice and returns to the title: it NEVER
+ * reloads save/card_a into the old live session. 1 = requested, 0 = refused (the caller falls back to the process relaunch). */
+static int pc_main_play_online_rejoin(const char* host, int port, const char* uuid) {
+    char tmp[320];
+    if (s_po.state != PO_IDLE || host == NULL || uuid == NULL || uuid[0] == '\0' || strlen(host) >= sizeof(s_po.host)) {
+        return 0;
+    }
+    if (!pc_relaunch_build_args(host, port, PC_RELAUNCH_CHARACTER, uuid, tmp, sizeof(tmp))) {
+        return 0;
+    }
+    if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+        pc_net_game_shutdown(); /* the REJECT left the (refused) client session standing: end it, the connect below starts a new one */
+    }
+    if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+        return 0;
+    }
+    memset(&s_po, 0, sizeof(s_po));
+    snprintf(s_po.host, sizeof(s_po.host), "%s", host);
+    s_po.port = port;
+    s_po.kind = PC_RELAUNCH_CHARACTER;
+    snprintf(s_po.name, sizeof(s_po.name), "%s", uuid);
+    s_po.rejoin = 1;
+    s_po.state = PO_REQUESTED;
+    return 1;
+}
+
+/* A rejoin that fails after the guest was promoted: the title shows why and the play scene fades back to it (never the Play Online menu, never card_a into this session). */
+static void pc_main_rejoin_failed(const char* why) {
+    static char s_msg[320];
+    snprintf(s_msg, sizeof(s_msg), "You are now a resident of the town, but joining it again failed: %s Choose Play Online to join as the resident.", why != NULL ? why : "?");
+    printf("[PC] M3: rejoin FAILED: %s -- returning to the title\n", s_msg);
+    pc_title_notice_post("Promoted to a resident:", s_msg, 600);
+    if (pc_play_online_scene_ready()) {
+        pc_play_online_begin_return_title();
+    }
 }
 
 /* The ONLY guest-profile selection of the in-process connect (the CLI has its own two call sites). NULL / "" = the default profile. */
@@ -1187,12 +1245,24 @@ static int pc_po_connect(char* err, size_t errcap) {
         goto rollback;
     }
     net_started = 1;
+    if (s_po.rejoin) {
+        pc_net_game_client_world_hold(1); /* the old live scene must not produce an identity claim (see pc_net_game.c): released when that scene was left */
+    }
 
     /* step 7: COMMIT. The role is CLIENT now, so a sanitized town image may be read; pc_save_ready is cleared inside. */
-    ram_touched = 1;
-    if (!pc_play_online_save_load()) {
-        snprintf(err, errcap, "%s", "The town could not be loaded (see the log)");
-        goto rollback;
+    if (s_po.rejoin) {
+        /* guest-first rejoin: the live scene keeps running for ~2 s while it fades out. It stays on its OWN (old, consistent) town RAM: only pc_save_ready is cleared (no save
+         * writer, the net client waits), and the fetched town (already pre-validated above) is read by the title's trademark_init -> pc_save_reload, with the role CLIENT. */
+        int rdy_now = 0;
+        const int ld_now = pc_play_online_save_flags_get(&rdy_now);
+        pc_play_online_save_flags_set(ld_now, 0);
+        printf("[PC] play-online: rejoin: the old scene keeps its RAM; the fetched town is loaded by the title reload\n");
+    } else {
+        ram_touched = 1;
+        if (!pc_play_online_save_load()) {
+            snprintf(err, errcap, "%s", "The town could not be loaded (see the log)");
+            goto rollback;
+        }
     }
 
     /* step 8 */
@@ -1229,6 +1299,14 @@ rollback:
     g_pc_town_fetch = fetch_snap;
     g_pc_online_ui = ui_snap;
     g_pc_guest = guest_snap;
+    if (s_po.rejoin) {
+        /* guest-first rejoin: the live scene belongs to the OLD client session -- never re-read save/card_a into it. Before the town RAM was replaced nothing changed (flags
+         * restored); after it, pc_save_ready stays 0 (set by the failed load) and the caller fades to the title, whose reload reads whatever town dir the role allows. */
+        if (!ram_touched) {
+            pc_play_online_save_flags_set(loaded_snap, ready_snap);
+        }
+        return 0;
+    }
     if (ram_touched && loaded_snap) {
         (void)pc_play_online_save_load(); /* the single-player town again (role NONE, default dir) */
     }
@@ -1242,6 +1320,28 @@ void pc_main_play_online_poll(void) {
         return;
     }
     if (s_po.state == PO_REQUESTED) {
+        if (s_po.rejoin) {
+            /* guest-first rejoin: no menu; the play scene is live (field / building). Wait for an idle scene (no entrance / exit wipe), then the same connect. */
+            if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+                pc_net_game_shutdown();
+            }
+            if (!pc_play_online_scene_ready()) {
+                if (++s_po.wait > 600) {
+                    s_po.state = PO_IDLE;
+                    s_po.rejoin = 0;
+                    pc_main_rejoin_failed("the game never became idle.");
+                }
+                return;
+            }
+            if (pc_po_connect(err, sizeof(err))) {
+                s_po.state = PO_FADING;
+            } else {
+                s_po.state = PO_IDLE;
+                pc_main_rejoin_failed(err);
+                s_po.rejoin = 0;
+            }
+            return;
+        }
         if (!pc_play_online_menu_active()) {
             s_po.state = PO_IDLE;
             return;
@@ -1275,8 +1375,10 @@ void pc_main_play_online_poll(void) {
         if (s_po.arm_pid) {
             g_pc_bootstrap_resident_pid_set = 1;
         }
+        pc_net_game_client_world_hold(0); /* guest-first rejoin: the old scene is gone, the normal readiness rules apply to the new title / town */
         printf("[PC] play-online: title scene left: bootstrap %s armed for the new title\n", s_po.arm_pid ? "resident-by-PID" : s_po.arm_guest ? "guest arrival" : "(none)");
         s_po.state = PO_IDLE;
+        s_po.rejoin = 0;
         pc_play_online_menu_close();
     }
 }
@@ -1475,6 +1577,8 @@ int main(int argc, char* argv[]) {
                    "                      through the town-service transaction path. See pc_platform.h.\n");
             printf("  --shop-test-sell    Client-only TEST hook (default off; loud logs): drive ONE real shop sale\n"
                    "                      through the town-service transaction path. See pc_platform.h.\n");
+            printf("  --house-buy-test H|auto  Client-only TEST hook (default off; loud logs): as a GUEST buy house H (0..3) or `auto`\n"
+                   "                      through the HOUSE_PURCHASE transaction, then re-join as the resident. See pc_platform.h.\n");
             printf("  --mail-test-send=HOUSE[,gift]  Client-only TEST hook (default off; loud logs): drive ONE real letter to\n"
                    "                      the resident of local house HOUSE through the MAIL_SEND transaction path. See pc_platform.h.\n");
             printf("  --mail-test-force-delivery  HOST-only TEST hook (default off; loud logs): run the vanilla post office\n"
@@ -1593,6 +1697,9 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--shop-test-sell") == 0) {
             g_pc_shop_test_sell = 1;
             printf("[NET][SHOP][TEST-ONLY] --shop-test-sell armed (a TEST hook: not for normal play)\n");
+        } else if (strcmp(argv[i], "--house-buy-test") == 0 && i + 1 < argc) {
+            g_pc_house_buy_test = argv[++i];
+            printf("[NET][HOUSE][TEST-ONLY] --house-buy-test %s armed (a TEST hook: not for normal play)\n", g_pc_house_buy_test);
         } else if (strncmp(argv[i], "--mail-test-send=", 17) == 0) {
             g_pc_mail_test_send = argv[i] + 17;
             printf("[NET][MAIL][TEST-ONLY] --mail-test-send=%s armed (a TEST hook: not for normal play)\n", g_pc_mail_test_send);
@@ -1863,6 +1970,11 @@ int main(int argc, char* argv[]) {
     }
     if ((g_pc_mail_test_send != NULL || g_pc_mail_test_take != 0) && g_pc_net_role != 2) {
         fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-send / --mail-test-take are CLIENT-only test hooks (use them together with --connect)\n");
+        return 2;
+    }
+
+    if (g_pc_house_buy_test != NULL && (g_pc_net_role != 2 || !(strcmp(g_pc_house_buy_test, "auto") == 0 || (g_pc_house_buy_test[0] >= '0' && g_pc_house_buy_test[0] <= '3' && g_pc_house_buy_test[1] == '\0')))) {
+        fprintf(stderr, "[NET][HOUSE][TEST-ONLY] REFUSED: --house-buy-test is a CLIENT-only test hook (use it together with --connect) and takes 0, 1, 2, 3 or auto\n");
         return 2;
     }
 

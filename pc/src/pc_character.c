@@ -482,21 +482,169 @@ int pc_character_membership_path(const char* dir, const char* uuid, const char* 
     return town_file(dir, uuid, townkey, "membership.ini", out, cap);
 }
 
+/* Guest-first purchase: membership.ini carries a few CLIENT-side extra keys besides the three the writer owns (role, town_pid, last_server), e.g. `nook_intro =
+ * declined | bought` (the Nook "buy a house" offer state). The writer must NEVER drop them: this collects every `key = value` line of the existing file whose key is not
+ * one of the three (comment lines and junk are not kept), each as a `key = value\n` line, into `extra` (at most cap-1 bytes; a line that does not fit is skipped whole). */
+static void membership_collect_extra(const char* path, char* extra, size_t cap) {
+    char text[900];
+    size_t n = 0, used = 0;
+    const char* p;
+    extra[0] = '\0';
+    if (!file_exists(path) || !read_all(path, text, sizeof(text) - 1, &n)) {
+        return;
+    }
+    text[n] = '\0';
+    for (p = text; *p != '\0';) {
+        char line[200];
+        size_t l = 0;
+        char* eq;
+        while (*p != '\0' && *p != '\n' && l + 1 < sizeof(line)) {
+            if (*p != '\r') line[l++] = *p;
+            p++;
+        }
+        while (*p != '\0' && *p != '\n') p++;
+        if (*p == '\n') p++;
+        line[l] = '\0';
+        eq = strchr(line, '=');
+        if (line[0] == '#' || eq == NULL) continue;
+        {
+            char* k = line;
+            char* v = eq + 1;
+            char* ke = eq;
+            size_t vl, need;
+            while (*k == ' ' || *k == '\t') k++;
+            while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+            *ke = '\0';
+            while (*v == ' ' || *v == '\t') v++;
+            vl = strlen(v);
+            while (vl > 0 && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) v[--vl] = '\0';
+            if (k[0] == '\0' || strcmp(k, "role") == 0 || strcmp(k, "town_pid") == 0 || strcmp(k, "last_server") == 0) continue;
+            need = strlen(k) + vl + 4; /* "k = v\n" */
+            if (used + need + 1 > cap) continue;
+            used += (size_t)snprintf(extra + used, cap - used, "%s = %s\n", k, v);
+        }
+    }
+}
+
 int pc_character_membership_write(const char* dir, const char* uuid, const char* townkey, const char* role, const uint8_t town_pid[20], const char* last_server) {
-    char path[400], text[400], pid[41];
+    char path[400], text[700], pid[41], extra[220];
     int n;
     if (!pc_character_membership_path(dir, uuid, townkey, path, sizeof(path)) || role == NULL || (strcmp(role, "guest") != 0 && strcmp(role, "resident") != 0)) {
         return 0;
     }
     hex_encode(town_pid, 20, pid);
-    n = snprintf(text, sizeof(text), "role = %s\ntown_pid = %s\nlast_server = %s\n", role, pid, last_server != NULL ? last_server : "");
+    membership_collect_extra(path, extra, sizeof(extra)); /* unknown keys (nook_intro, ...) survive a rewrite */
+    n = snprintf(text, sizeof(text), "role = %s\ntown_pid = %s\nlast_server = %s\n%s", role, pid, last_server != NULL ? last_server : "", extra);
     return n > 0 && (size_t)n < sizeof(text) && write_atomic(path, text, (size_t)n, 0);
+}
+
+/* Reads the value of an EXTRA key (never role / town_pid / last_server) of membership.ini into out. 1 = present, 0 = absent / no file. */
+int pc_character_membership_get_key(const char* dir, const char* uuid, const char* townkey, const char* key, char* out, size_t cap) {
+    char path[400], extra[220], needle[64];
+    const char* p;
+    if (out == NULL || cap < 2 || key == NULL || key[0] == '\0' || strlen(key) > 40 || !pc_character_membership_path(dir, uuid, townkey, path, sizeof(path))) {
+        return 0;
+    }
+    out[0] = '\0';
+    membership_collect_extra(path, extra, sizeof(extra));
+    snprintf(needle, sizeof(needle), "%s = ", key);
+    for (p = extra; *p != '\0';) {
+        const char* e = strchr(p, '\n');
+        size_t l = e != NULL ? (size_t)(e - p) : strlen(p);
+        if (strncmp(p, needle, strlen(needle)) == 0) {
+            size_t vl = l - strlen(needle);
+            if (vl >= cap) vl = cap - 1;
+            memcpy(out, p + strlen(needle), vl);
+            out[vl] = '\0';
+            return 1;
+        }
+        p += l + (e != NULL ? 1 : 0);
+    }
+    return 0;
+}
+
+/* Sets (or replaces) ONE extra key of an EXISTING membership.ini, keeping role / town_pid / last_server and every other extra key. 1 = written, 0 = no file / bad
+ * arguments / no room. key: [A-Za-z0-9_]{1,40}, value: printable, at most 60 chars. */
+int pc_character_membership_set_key(const char* dir, const char* uuid, const char* townkey, const char* key, const char* value) {
+    char path[400], text[900], extra[220], nextra[220], needle[64];
+    char role[16];
+    uint8_t pid_bytes[20];
+    char pid[41], last[200];
+    size_t i, nl = 0, n;
+    const char* p;
+    if (key == NULL || value == NULL || key[0] == '\0' || strlen(key) > 40 || strlen(value) > 60 || !pc_character_membership_path(dir, uuid, townkey, path, sizeof(path))) {
+        return 0;
+    }
+    for (i = 0; key[i] != '\0'; i++) {
+        const char c = key[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return 0;
+    }
+    for (i = 0; value[i] != '\0'; i++) {
+        if ((unsigned char)value[i] < 0x20 || (unsigned char)value[i] > 0x7E) return 0;
+    }
+    if (strcmp(key, "role") == 0 || strcmp(key, "town_pid") == 0 || strcmp(key, "last_server") == 0) {
+        return 0;
+    }
+    if (!pc_character_membership_read(dir, uuid, townkey, role, pid_bytes)) {
+        return 0;
+    }
+    hex_encode(pid_bytes, 20, pid);
+    last[0] = '\0';
+    {   /* last_server is read raw (pc_character_membership_read does not return it) */
+        char t2[900];
+        size_t n2 = 0;
+        if (read_all(path, t2, sizeof(t2) - 1, &n2)) {
+            t2[n2] = '\0';
+            for (p = t2; *p != '\0';) {
+                const char* e = strchr(p, '\n');
+                size_t l = e != NULL ? (size_t)(e - p) : strlen(p);
+                if (strncmp(p, "last_server", 11) == 0) {
+                    const char* eq = memchr(p, '=', l);
+                    if (eq != NULL) {
+                        size_t vl;
+                        eq++;
+                        while (eq < p + l && (*eq == ' ' || *eq == '\t')) eq++;
+                        vl = (size_t)(p + l - eq);
+                        while (vl > 0 && (eq[vl - 1] == ' ' || eq[vl - 1] == '\t' || eq[vl - 1] == '\r')) vl--;
+                        if (vl >= sizeof(last)) vl = sizeof(last) - 1;
+                        memcpy(last, eq, vl);
+                        last[vl] = '\0';
+                    }
+                    break;
+                }
+                p += l + (e != NULL ? 1 : 0);
+            }
+        }
+    }
+    membership_collect_extra(path, extra, sizeof(extra));
+    snprintf(needle, sizeof(needle), "%s = ", key);
+    nextra[0] = '\0';
+    for (p = extra; *p != '\0';) { /* every extra line except the replaced key */
+        const char* e = strchr(p, '\n');
+        size_t l = e != NULL ? (size_t)(e - p) : strlen(p);
+        if (strncmp(p, needle, strlen(needle)) != 0 && nl + l + 2 < sizeof(nextra)) {
+            memcpy(nextra + nl, p, l);
+            nextra[nl + l] = '\n';
+            nl += l + 1;
+            nextra[nl] = '\0';
+        }
+        p += l + (e != NULL ? 1 : 0);
+    }
+    if (nl + strlen(key) + strlen(value) + 5 >= sizeof(nextra)) {
+        return 0;
+    }
+    nl += (size_t)snprintf(nextra + nl, sizeof(nextra) - nl, "%s = %s\n", key, value);
+    {
+        int w = snprintf(text, sizeof(text), "role = %s\ntown_pid = %s\nlast_server = %s\n%s", role, pid, last, nextra);
+        n = w > 0 ? (size_t)w : 0;
+    }
+    return n > 0 && n < sizeof(text) && write_atomic(path, text, n, 0);
 }
 
 /* M-C: reads membership.ini. 1 = a valid file (role "guest" / "resident" and a 40-hex town_pid), 0 = absent / unreadable / malformed (never an error: the caller treats
  * "none" as a guest). Read-only. */
 int pc_character_membership_read(const char* dir, const char* uuid, const char* townkey, char role_out[16], uint8_t town_pid[20]) {
-    char path[400], text[600];
+    char path[400], text[900];
     size_t n = 0;
     const char* p;
     int have_role = 0, have_pid = 0;

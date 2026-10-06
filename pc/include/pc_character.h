@@ -89,6 +89,10 @@ int  pc_character_membership_path(const char* dir, const char* uuid, const char*
 int  pc_character_membership_write(const char* dir, const char* uuid, const char* townkey, const char* role, const uint8_t town_pid[20], const char* last_server);
 /* M-C: reads membership.ini: 1 = valid (role_out = "guest" | "resident", town_pid filled), 0 = absent / malformed (treat as no membership). */
 int  pc_character_membership_read(const char* dir, const char* uuid, const char* townkey, char role_out[16], uint8_t town_pid[20]);
+/* Guest-first purchase: extra keys of membership.ini (e.g. `nook_intro = declined | bought`) are PRESERVED by pc_character_membership_write. get_key: 1 + value, 0 = absent.
+ * set_key: sets / replaces ONE extra key of an existing file (role / town_pid / last_server are kept); 1 = written, 0 = no file / bad key or value / no room. */
+int  pc_character_membership_get_key(const char* dir, const char* uuid, const char* townkey, const char* key, char* out, size_t cap);
+int  pc_character_membership_set_key(const char* dir, const char* uuid, const char* townkey, const char* key, const char* value);
 
 /* characters.ini default = <uuid>. get: 1 + uuid in out[33], else 0. set: atomic replace; 1 / 0. */
 int pc_character_default_get(const char* dir, char out[PC_CHARACTER_UUID_LEN + 1]);

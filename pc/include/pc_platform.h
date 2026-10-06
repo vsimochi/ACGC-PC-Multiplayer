@@ -371,6 +371,11 @@ extern const char*   g_pc_world_test_force;
  * They bypass only the Nook dialogue and the menu, never the TXN_COMMIT / TXN_RESULT chain. See pc_net_game.c pcnetgame_run_shop_test_hook(). */
 extern int           g_pc_shop_test_buy;
 extern int           g_pc_shop_test_sell;
+/* Guest-first town TEST-ONLY hook (default OFF, never active in normal play, every step logs "[NET][HOUSE][TEST-ONLY]"):
+ *   --house-buy-test H|auto   CLIENT only (a GUEST client): once the record is SYNCED, raise the local wallet to 20000 when it is below the house price (the hook's one
+ *                             local write), wait for the D3 upload, then buy house H (0..3) or `auto` through pc_net_game_ts_begin_house_purchase() / _poll(). On APPLIED the
+ *                             host makes the guest a resident and the process re-joins as the resident in-process. See pc_net_game.c pcnetgame_run_house_buy_test_hook(). */
+extern const char*   g_pc_house_buy_test;
 /* Mail milestone 1 TEST-ONLY hooks (default OFF, never active in normal play, every step logs "[NET][MAIL][TEST-ONLY]"):
  *   --mail-test-send=<house>[,gift]   CLIENT only: once the record is SYNCED, write ONE send-font letter (sender = the local player, recipient = the
  *                                     owner of local house <house>) into the first free mail slot (the hook's one local write; with ",gift" the first
