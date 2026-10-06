@@ -117,7 +117,7 @@ V8_NEW_STRUCTS = {
                                    "uint8_t token[PC_NETGAME_GUEST_TOKEN_LEN]; uint8_t rsv2[8];",
     # indoor villagers (Patch 2): the villager-house pose (28 B), both directions, unreliable
     "PCNetGameRoomNpcMsg": "uint8_t msg_type; uint8_t scene_id; uint8_t action_type; uint8_t sender; uint16_t owner; uint16_t npc_id; uint32_t frame; "
-                           "float pos_x, pos_y, pos_z; int16_t facing_angle; int16_t _reserved;",
+                           "float pos_x, pos_y, pos_z; int16_t facing_angle; uint16_t flags;",
     # Nook Work Mode (Patch 3): the character's job as the host holds it (28 B), host -> the requesting client, reliable
     "PCNetGameWorkStateMsg": "uint8_t msg_type; uint8_t flags; uint8_t state; uint8_t job_type; uint32_t job_id; uint32_t reward; uint32_t jobs_done; "
                              "uint32_t last_rewarded; uint16_t obj_item; uint16_t carried_item; uint16_t target_villager; uint8_t obj_state; uint8_t tip_kind; uint32_t tip_value; "
@@ -140,6 +140,9 @@ TOWN_C_PINS = ("#define PC_NETGAME_TOWN_INFO_FLAG_SANITIZED 0x0001u", "#define P
                '_Static_assert(sizeof(PCNetGameTownChunkMsg) == 1012,', '_Static_assert(sizeof(PCNetGameTownDoneMsg) == 12,')
 # What HEAD may still contain for a struct whose v8 text was deliberately changed in place by a later (still unreleased) milestone.
 V8_PREV_STRUCTS = {
+    # Patch 7: ROOM_NPC._reserved became flags (bit0 TALK); an older HEAD still has the reserved name
+    "PCNetGameRoomNpcMsg": "uint8_t msg_type; uint8_t scene_id; uint8_t action_type; uint8_t sender; uint16_t owner; uint16_t npc_id; uint32_t frame; "
+                           "float pos_x, pos_y, pos_z; int16_t facing_angle; int16_t _reserved;",
     "PCNetGameTxnResultMsg": "uint8_t msg_type; uint8_t kind; uint8_t outcome; uint8_t reason; uint32_t request_id; "
                              "uint32_t txn_nonce; uint32_t txn_seq; uint32_t host_session; uint32_t epoch; uint32_t rev; "
                              "uint32_t cdig; uint8_t dest; uint8_t slot; uint16_t item; uint16_t post_pockets[15]; "

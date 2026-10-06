@@ -1121,9 +1121,13 @@ int pc_net_game_get_npc_move_pose(int slot, uint16_t expected_npc_id, float* out
  * _sample: called each frame by the room NPC2 actor that is SIMULATING locally; throttled; host-arbitrated lease (a no-op when not networked; the host drops the pose when a
  * different in-room player holds the lease). _follow: 1 iff a fresh pose of that villager from another in-room player was received (the caller then applies it INSTEAD of
  * simulating); 0 = simulate locally (and sample). Never blocks. */
-void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, float pos_x, float pos_y, float pos_z, int16_t facing_angle, uint8_t action_type);
+void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, float pos_x, float pos_y, float pos_z, int16_t facing_angle, uint8_t action_type, int talking);
 int  pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, float* out_pos_x, float* out_pos_y, float* out_pos_z, int16_t* out_facing_angle, int* out_moving,
-                                 uint8_t* out_action_type);
+                                 uint8_t* out_action_type, int* out_talking);
+/* Patch 7: `talking` = this process's player is in a conversation with the villager (the sender takes the room lease; the others hold the villager); *out_talking = another player is. */
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_ROOM_ENTER=<animal idx>,<enter ms>[,<talk start ms>,<talk end ms>[,<leave ms>[,<reenter ms>]]]): drives a real process into a villager's house, forces the
+ * "talking" flag for a window, leaves and re-enters. pc_net_game_room_test_talking() = 1 inside the forced-talk window. */
+int pc_net_game_room_test_talking(void);
 
 /* Event NPC authority (Patch 4). evnpc_synced: the allowlist of event NPC ids the host owns (Gulliver, K.K., the Wisp, the peddlers, ...). suppress_spawn: 1 on a READY client for such an id
  * (aNPC_setupActor_proc then creates nothing: the host's table drives the local actors). host_unbounded: 1 on the host for such an id (the event manager creates it without the

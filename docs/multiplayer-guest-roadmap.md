@@ -1447,3 +1447,12 @@ Ownership analysis (who owns it / where it lives / who may change it):
 - Museum item collection (`museum_record`) was already HOST-owned (mail milestone R).
 - NOT done (documented, no whole-blob migration attempted): a host-authoritative page store for town-shared letter boards / original designs. They remain per-player
   save data (diary PDATA machinery covers the diary only). Next milestone candidate.
+
+## Patch 7 - indoor villager synchronization
+
+ROOM_NPC (id 67, 28 B, unchanged size) now carries `flags` (was `_reserved`): bit0 TALK. The pose holder (host-arbitrated lease) samples position / facing / coarse action as before; a player who is talking to
+the villager now ALSO samples (his pose carries TALK) and the host hands him the lease (a conversation is the visible truth); every other occupant applies the pose and holds the villager in `wait`
+(`aNPC_pc_room_follow`). Presence (is_home / hide / forced schedule) is the N3 channel's job and is unchanged; the room's furniture / interior is the Patch 5 house canon.
+Dialogue text, choices and the talk script stay local (by design: no full dialogue sync). A second player can still START a talk with a villager someone else is talking to (not blocked; follow-up).
+Real two-process test: `tools/net_spike/test_room_npc_real.py` (host + client both walk into the same villager's house through `goto_other_scene` via the test hook `AC_TEST_ROOM_ENTER`, talk flag forced for a
+window, leave and re-enter) 13/13. The talk flag is injected at the sampling seam (no GUI to run the dialogue); everything downstream is real code.

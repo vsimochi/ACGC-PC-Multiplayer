@@ -308,7 +308,7 @@ static int aNPC_pc_room_villager(NPC_ACTOR* nactorx, GAME_PLAY* play, u16* owner
 }
 
 static int aNPC_pc_room_talking(NPC_ACTOR* nactorx) {
-    return nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK || mDemo_Get_talk_actor() != NULL;
+    return nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK || mDemo_Get_talk_actor() != NULL || pc_net_game_room_test_talking();
 }
 
 /* 1 = a fresh pose of this villager from another in-room player is applied this frame (schedule / action / angle are skipped by the caller). */
@@ -318,12 +318,13 @@ static int aNPC_pc_room_follow(NPC_ACTOR* nactorx, ACTOR* actorx, GAME_PLAY* pla
     s16 angle;
     int moving;
     uint8_t act;
+    int other_talking;
     u8 desired;
 
     if (!aNPC_pc_room_villager(nactorx, play, &owner) || aNPC_pc_room_talking(nactorx)) {
         return FALSE;
     }
-    if (!pc_net_game_room_npc_follow((int)play->scene_id, owner, (uint16_t)nactorx->npc_info.animal->id.npc_id, &x, &y, &z, &angle, &moving, &act)) {
+    if (!pc_net_game_room_npc_follow((int)play->scene_id, owner, (uint16_t)nactorx->npc_info.animal->id.npc_id, &x, &y, &z, &angle, &moving, &act, &other_talking)) {
         return FALSE;
     }
     actorx->world.position.x = x;
@@ -333,6 +334,9 @@ static int aNPC_pc_room_follow(NPC_ACTOR* nactorx, ACTOR* actorx, GAME_PLAY* pla
     actorx->world.angle.y = angle;
     actorx->speed = 0.0f;
     desired = (act < aNPC_ACTION_TYPE_NUM) ? act : (u8)(moving ? aNPC_ACTION_TYPE_WALK : aNPC_ACTION_TYPE_WAIT);
+    if (other_talking) {
+        desired = aNPC_ACTION_TYPE_WAIT; /* another player is talking to it: it stands there, facing as the talker's process has it */
+    }
     if (nactorx->condition_info.action != desired) {
         aNPC_setupAction(nactorx, desired);
     }
@@ -342,12 +346,12 @@ static int aNPC_pc_room_follow(NPC_ACTOR* nactorx, ACTOR* actorx, GAME_PLAY* pla
 static void aNPC_pc_room_sample(NPC_ACTOR* nactorx, GAME_PLAY* play) {
     u16 owner;
 
-    if (!aNPC_pc_room_villager(nactorx, play, &owner) || aNPC_pc_room_talking(nactorx)) {
+    if (!aNPC_pc_room_villager(nactorx, play, &owner)) {
         return;
     }
     pc_net_game_room_npc_sample((int)play->scene_id, owner, (uint16_t)nactorx->npc_info.animal->id.npc_id, nactorx->actor_class.world.position.x,
                                 nactorx->actor_class.world.position.y, nactorx->actor_class.world.position.z, nactorx->actor_class.world.angle.y,
-                                (uint8_t)nactorx->condition_info.action);
+                                (uint8_t)nactorx->condition_info.action, aNPC_pc_room_talking(nactorx));
 }
 #endif
 

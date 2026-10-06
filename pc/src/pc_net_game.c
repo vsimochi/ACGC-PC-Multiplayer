@@ -2816,8 +2816,11 @@ typedef struct PCNetGameRoomNpcMsg {
     uint32_t frame;        /* holder-local monotonic counter */
     float    pos_x, pos_y, pos_z;
     int16_t  facing_angle;
-    int16_t  _reserved;
+    uint16_t flags;        /* PCNG_ROOM_NPC_F_* (Patch 7; 0 from an older sender = a plain pose) */
 } PCNetGameRoomNpcMsg;
+/* The villager is in a conversation with the sender's player: the sender's simulation is the truth for this room while it lasts (the host hands it the lease), every other occupant holds
+ * the villager still in `wait` at the received pose instead of letting it wander off mid-sentence. Dialogue text / choices stay local. */
+#define PCNG_ROOM_NPC_F_TALK 0x0001u
 _Static_assert(sizeof(PCNetGameRoomNpcMsg) == 28, "PCNetGameRoomNpcMsg wire size drifted");
 typedef struct PCNetGameWorkStateMsg {
     uint8_t  msg_type; /* PC_NETGAME_MSG_WORK_STATE */
@@ -2837,6 +2840,7 @@ typedef struct PCNetGameWorkStateMsg {
     uint32_t request_id;      /* the TXN request this state answers (0 = unsolicited / at connect) */
 } PCNetGameWorkStateMsg;
 _Static_assert(sizeof(PCNetGameWorkStateMsg) == 36, "PCNetGameWorkStateMsg wire size drifted");
+static void pcnetgame_room_enter_test_hook(void);
 static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in);
 static void pcnetgame_handle_client_room_npc(const PCNetGameRoomNpcMsg* in);
 
@@ -30646,6 +30650,7 @@ void pc_net_game_poll(void) {
         s_notice_timing = 0;
         return;
     }
+    pcnetgame_room_enter_test_hook();
     if (s_role == PC_NETGAME_ROLE_CLIENT) {
         pcnetgame_client_notice_update();
     }
@@ -32695,11 +32700,13 @@ typedef struct PCNetRoomNpcLease {
     PCNetPlayerId holder;
     uint32_t      last_ms;
     uint32_t      last_frame;
+    uint16_t      flags; /* PCNG_ROOM_NPC_F_* of the holder's last accepted pose */
 } PCNetRoomNpcLease;
 static PCNetRoomNpcLease s_room_lease[PCNG_ROOM_NPC_LEASES]; /* host only */
 
 static PCNetNpcMoveSlot s_room_ring;     /* receive/interpolation ring of the local room (one room at a time) */
 static uint8_t          s_room_rx_scene; /* room the ring belongs to */
+static uint16_t         s_room_rx_flags; /* PCNG_ROOM_NPC_F_* of the last accepted sample */
 static uint16_t         s_room_rx_owner;
 static double           s_room_rx_frame; /* graph_dt_frame_time() of the last accepted sample */
 static uint32_t         s_room_tx_counter;
@@ -32724,6 +32731,7 @@ static void pcnetgame_room_npc_deliver_local(const PCNetGameRoomNpcMsg* m) {
     }
     if (s_room_rx_scene != m->scene_id || s_room_rx_owner != m->owner || s_room_ring.cached_npc_id != m->npc_id) {
         memset(&s_room_ring, 0, sizeof(s_room_ring));
+        s_room_rx_flags = 0;
         s_room_rx_scene = m->scene_id;
         s_room_rx_owner = m->owner;
     }
@@ -32738,6 +32746,10 @@ static void pcnetgame_room_npc_deliver_local(const PCNetGameRoomNpcMsg* m) {
     s_room_ring.last_accepted_frame = m->frame;
     s_room_ring.cached_npc_id = m->npc_id;
     s_room_ring.last_action_type = m->action_type;
+    if ((m->flags & PCNG_ROOM_NPC_F_TALK) != (s_room_rx_flags & PCNG_ROOM_NPC_F_TALK)) {
+        printf("[NET][ROOMNPC] room villager 0x%04X talk state -> %d (holder player %d)\n", (unsigned)m->npc_id, (m->flags & PCNG_ROOM_NPC_F_TALK) ? 1 : 0, (int)m->sender);
+    }
+    s_room_rx_flags = m->flags;
     dst = &s_room_ring.snapshots[s_room_ring.snapshot_head];
     dst->recv_local_frame = graph_dt_frame_time(gamePT);
     dst->pos_x = m->pos_x;
@@ -32788,6 +32800,9 @@ static void pcnetgame_room_npc_host_submit(PCNetPlayerId from, PCNetGameRoomNpcM
     }
     if (L->holder != from) {
         int holder_alive = L->holder >= 0 && (uint32_t)(now - L->last_ms) < PCNG_ROOM_NPC_LEASE_MS && pcnetgame_room_player_in_room(L->holder, m->scene_id, m->owner);
+        if (holder_alive && (m->flags & PCNG_ROOM_NPC_F_TALK) != 0u && (L->flags & PCNG_ROOM_NPC_F_TALK) == 0u) {
+            holder_alive = 0; /* the player talking to the villager owns its pose from now on (his conversation is the visible truth) */
+        }
         if (holder_alive) {
             return; /* someone else simulates this room's villager */
         }
@@ -32800,6 +32815,10 @@ static void pcnetgame_room_npc_host_submit(PCNetPlayerId from, PCNetGameRoomNpcM
     }
     L->last_frame = m->frame;
     L->last_ms = now;
+    if ((L->flags & PCNG_ROOM_NPC_F_TALK) != (m->flags & PCNG_ROOM_NPC_F_TALK)) {
+        printf("[NET][ROOMNPC] host: villager 0x%04X in its house is %s with player %d\n", (unsigned)m->owner, (m->flags & PCNG_ROOM_NPC_F_TALK) ? "TALKING" : "no longer talking", (int)from);
+    }
+    L->flags = m->flags;
     m->sender = (uint8_t)from;
     for (i = 0; i < PC_NET_MAX_PEERS; i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_READY && (PCNetPlayerId)i != from && pcnetgame_room_player_in_room((PCNetPlayerId)i, m->scene_id, m->owner)) {
@@ -32827,7 +32846,7 @@ static void pcnetgame_handle_client_room_npc(const PCNetGameRoomNpcMsg* in) {
     pcnetgame_room_npc_deliver_local(in);
 }
 
-void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, float pos_x, float pos_y, float pos_z, int16_t facing_angle, uint8_t action_type) {
+void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, float pos_x, float pos_y, float pos_z, int16_t facing_angle, uint8_t action_type, int talking) {
     PCNetGameRoomNpcMsg m;
 
     if (s_role == PC_NETGAME_ROLE_NONE || (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link != PC_NETGAME_LINK_READY) || gamePT == NULL ||
@@ -32851,6 +32870,7 @@ void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, 
     m.pos_y = pos_y;
     m.pos_z = pos_z;
     m.facing_angle = facing_angle;
+    m.flags = talking ? PCNG_ROOM_NPC_F_TALK : 0u;
     if (s_role == PC_NETGAME_ROLE_HOST) {
         pcnetgame_room_npc_host_submit(PC_NETGAME_HOST_PLAYER_ID, &m);
     } else {
@@ -32859,7 +32879,7 @@ void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, 
 }
 
 int pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, float* out_pos_x, float* out_pos_y, float* out_pos_z, int16_t* out_facing_angle, int* out_moving,
-                                uint8_t* out_action_type) {
+                                uint8_t* out_action_type, int* out_talking) {
     double now;
     int moving = 0;
 
@@ -32878,7 +32898,118 @@ int pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, f
     }
     *out_moving = moving;
     *out_action_type = s_room_ring.last_action_type;
+    *out_talking = (s_room_rx_flags & PCNG_ROOM_NPC_F_TALK) != 0u;
     return 1;
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_ROOM_ENTER=<animal idx>,<enter ms>[,<talk start>,<talk end>[,<leave>[,<reenter>]]] (all ms; talk / leave relative to the room entry, reenter to the
+ * return to the field). A REAL process (host or client) walks itself into a villager's house through the game's own scene change (goto_other_scene, the door data aHUS_rewrite_out_data builds),
+ * forces the "talking" flag of that villager's pose for the window (the dialogue itself needs a GUI), leaves through the exit door data and optionally re-enters. Never active in normal play. */
+static struct {
+    int      parsed, idx, enter_ms, ts, te, leave_ms, reenter_ms;
+    int      state; /* 0 wait to enter, 1 entering, 2 in room, 3 leaving, 4 wait to re-enter, 5 done */
+    uint32_t t_elig, t_in, t_out;
+    int      entries;
+} s_rt;
+
+int pc_net_game_room_test_talking(void) {
+    uint32_t dt;
+    if (s_rt.state != 2 || s_rt.te <= s_rt.ts) {
+        return 0;
+    }
+    dt = (uint32_t)(pcnetgame_now_ms() - s_rt.t_in);
+    return dt >= (uint32_t)s_rt.ts && dt < (uint32_t)s_rt.te;
+}
+
+static void pcnetgame_room_enter_test_hook(void) {
+    const char* e;
+    GAME_PLAY* play;
+    PCNetPlayerScene ls;
+    uint32_t now;
+    int in_room, in_field;
+    PLAYER_ACTOR* pa;
+
+    if (s_rt.state == 5) {
+        return;
+    }
+    if (!s_rt.parsed) {
+        int n;
+        s_rt.parsed = 1;
+        s_rt.ts = s_rt.te = s_rt.leave_ms = s_rt.reenter_ms = -1;
+        e = pc_test_hook_getenv("AC_TEST_ROOM_ENTER");
+        n = (e == NULL) ? 0 : sscanf(e, "%d,%d,%d,%d,%d,%d", &s_rt.idx, &s_rt.enter_ms, &s_rt.ts, &s_rt.te, &s_rt.leave_ms, &s_rt.reenter_ms);
+        if (n < 2) {
+            s_rt.state = 5;
+            return;
+        }
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play == NULL || !pc_net_game_get_local_scene(&ls) || (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link != PC_NETGAME_LINK_READY)) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    in_room = (int)ls.scene_id == SCENE_NPC_HOUSE;
+    in_field = (int)ls.scene_id == SCENE_FG;
+    pa = get_player_actor_withoutCheck(play);
+    switch (s_rt.state) {
+        case 0:
+        case 4:
+            if (!in_field || pa == NULL || play->fb_wipe_mode != WIPE_MODE_NONE || !pcnetgame_is_real_player_actor(pa)) {
+                s_rt.t_elig = 0;
+                return;
+            }
+            if (s_rt.t_elig == 0) {
+                s_rt.t_elig = now ? now : 1;
+            }
+            if ((uint32_t)(now - s_rt.t_elig) >= (uint32_t)(s_rt.state == 0 ? s_rt.enter_ms : s_rt.reenter_ms)) {
+                Door_data_c in = { SCENE_NPC_HOUSE, mSc_DIRECT_NORTH, 0, 0, { 160, 0, 300 }, EMPTY_NO, 1, { 0, 0, 0 } };
+                Door_data_c* out = Common_GetPointer(structure_exit_door_data);
+                Animal_c* an = &Save_Get(animals)[s_rt.idx];
+                mActor_name_t who = an->id.npc_id;
+                an->is_home = TRUE;
+                Common_Set(house_owner_name, who);
+                out->next_scene_id = Save_Get(scene_no);
+                out->exit_orientation = mSc_DIRECT_SOUTH;
+                out->exit_type = 0;
+                out->extra_data = 2;
+                out->exit_position.x = (s16)pa->actor_class.world.position.x;
+                out->exit_position.y = (s16)pa->actor_class.world.position.y;
+                out->exit_position.z = (s16)pa->actor_class.world.position.z;
+                out->door_actor_name = who;
+                out->wipe_type = WIPE_TYPE_TRIFORCE;
+                printf("[NET][ROOMNPC][TEST-ONLY] entering the house of villager 0x%04X (animal %d), entry %d\n", (unsigned)who, s_rt.idx, s_rt.entries + 1);
+                if (goto_other_scene(play, &in, FALSE) == 1) {
+                    play->fb_fade_type = FADE_TYPE_DEMO;
+                    s_rt.state = 1;
+                    s_rt.entries++;
+                }
+            }
+            break;
+        case 1:
+            if (in_room) {
+                s_rt.state = 2;
+                s_rt.t_in = now;
+                printf("[NET][ROOMNPC][TEST-ONLY] inside the villager's house (entry %d)\n", s_rt.entries);
+            }
+            break;
+        case 2:
+            if (s_rt.leave_ms >= 0 && (uint32_t)(now - s_rt.t_in) >= (uint32_t)s_rt.leave_ms && play->fb_wipe_mode == WIPE_MODE_NONE) {
+                if (goto_other_scene(play, Common_GetPointer(structure_exit_door_data), FALSE) == 1) {
+                    printf("[NET][ROOMNPC][TEST-ONLY] leaving the villager's house\n");
+                    s_rt.state = 3;
+                }
+            }
+            break;
+        case 3:
+            if (in_field) {
+                s_rt.state = (s_rt.reenter_ms >= 0 && s_rt.entries < 2) ? 4 : 5;
+                s_rt.t_elig = 0;
+                printf("[NET][ROOMNPC][TEST-ONLY] back in the field\n");
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 /* ---- N3 Channel B: villager is_home/hide/forced-schedule sync ---- */
