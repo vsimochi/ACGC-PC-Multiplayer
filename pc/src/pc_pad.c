@@ -176,6 +176,11 @@ u32 PADRead(PADStatus* status) {
 
     pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
 
+    if (pc_tool_wheel_is_open()) { /* the analog L/R triggers must not leak into the game while the wheel is up either */
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
+    }
+
     if (pc_host_observer_active()) {
         /* --host-observer: the hidden observer is NOT controllable. Every keyboard / mouse / gamepad input is dropped here, the single place the
          * game reads a controller from (PADRead), so neither the avatar, nor a message window, nor any menu can be driven from this process. */

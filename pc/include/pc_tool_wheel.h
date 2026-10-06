@@ -14,6 +14,9 @@ struct game_s;
  * deadzone. While the wheel is open the buttons and the C-stick are zeroed (the main stick keeps moving the player). */
 void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int ry, int dz, unsigned short* buttons, signed char* cstick_x, signed char* cstick_y);
 
+/* 1 while the wheel is up (PADRead zeroes the analog triggers too then). */
+int pc_tool_wheel_is_open(void);
+
 /* Overlay, drawn next to the pause menu (graph.c). */
 void pc_tool_wheel_draw(struct game_s* game);
 

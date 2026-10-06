@@ -9,6 +9,7 @@
 #include "m_name_table.h"
 #include "m_private.h"
 #include "m_font.h"
+#include "m_rcp.h"
 #include "graph.h"
 #include "main.h"
 #include <SDL.h>
@@ -64,19 +65,36 @@ static void wheel_build(void) {
     }
 }
 
-int pc_tool_wheel_pick(float dx, float dy, float dead, int n_tools) {
+/* prev = the current selection: it is kept a little beyond its own sector edge / the centre deadzone, so a cursor or stick resting on a boundary or near the middle does not flicker */
+static int wheel_pick_h(float dx, float dy, float dead, int n_tools, int prev) {
+    const float tau = 6.28318530718f;
     float len = sqrtf(dx * dx + dy * dy);
-    float ang;
+    float ang, sector, centre, diff;
     int idx;
-    if (n_tools <= 0 || len <= dead) {
+    if (n_tools <= 0 || len <= dead * (prev == 0 ? 1.0f : 0.8f)) {
         return 0;
     }
     ang = atan2f(dx, -dy); /* 0 = straight up, clockwise positive */
     if (ang < 0.0f) {
-        ang += 6.28318530718f;
+        ang += tau;
     }
-    idx = (int)(ang / (6.28318530718f / (float)n_tools) + 0.5f) % n_tools;
+    sector = tau / (float)n_tools;
+    if (prev > 0 && prev <= n_tools) {
+        centre = sector * (float)(prev - 1);
+        diff = fabsf(ang - centre);
+        if (diff > tau * 0.5f) {
+            diff = tau - diff;
+        }
+        if (diff < sector * 0.5f * 1.2f) {
+            return prev;
+        }
+    }
+    idx = (int)(ang / sector + 0.5f) % n_tools;
     return 1 + idx;
+}
+
+int pc_tool_wheel_pick(float dx, float dy, float dead, int n_tools) {
+    return wheel_pick_h(dx, dy, dead, n_tools, 0);
 }
 
 void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int ry, int dz, unsigned short* buttons, signed char* cstick_x, signed char* cstick_y) {
@@ -93,13 +111,13 @@ void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int 
         } else if (hold) {
             if (s_pad_opened) {
                 float dx = (float)rx, dy = (float)ry;
-                s_sel = pc_tool_wheel_pick(dx, dy, (float)dz, s_n);
+                s_sel = wheel_pick_h(dx, dy, (float)dz, s_n, s_sel);
             } else {
                 int w = 640, h = 480;
                 if (g_pc_window != NULL) {
                     SDL_GetWindowSize(g_pc_window, &w, &h);
                 }
-                s_sel = pc_tool_wheel_pick((float)(mx - w / 2), (float)(my - h / 2), 0.08f * (float)(w < h ? w : h), s_n);
+                s_sel = wheel_pick_h((float)(mx - w / 2), (float)(my - h / 2), 0.08f * (float)(w < h ? w : h), s_n, s_sel);
             }
             *buttons = 0; /* no gameplay action while the wheel is up (the opener button / mouse clicks included) */
             *cstick_x = 0;
@@ -115,6 +133,10 @@ void pc_tool_wheel_input(int hold_kb, int hold_pad, int mx, int my, int rx, int 
         }
     }
     s_prev_hold = hold;
+}
+
+int pc_tool_wheel_is_open(void) {
+    return s_open;
 }
 
 int pc_tool_wheel_take_request(int* slot) {
@@ -137,25 +159,51 @@ static const char* tool_name(mActor_name_t it) {
     return "Tool";
 }
 
+/* flat translucent rectangle in the font phase (same display-list recipe as pc_menu_dim_rect) */
+static void wheel_rect(struct game_s* game, float x, float y, float w, float h, int r, int g, int b, int a) {
+    Gfx* gfx;
+    OPEN_DISP(game->graph);
+    gfx = NOW_FONT_DISP;
+    gDPPipeSync(gfx++);
+    gDPSetOtherMode(gfx++, G_AD_DISABLE | G_CD_MAGICSQ | G_CK_NONE | G_TC_FILT | G_TF_POINT | G_TT_NONE | G_TL_TILE | G_TD_CLAMP | G_TP_NONE | G_CYC_1CYCLE | G_PM_NPRIMITIVE,
+                    G_AC_NONE | G_ZS_PRIM | G_RM_XLU_SURF | G_RM_XLU_SURF2);
+    gDPSetCombineMode(gfx++, G_CC_PRIMITIVE, G_CC_PRIMITIVE);
+    gDPSetPrimColor(gfx++, 0, 0, r, g, b, a);
+    gfx = gfx_gSPTextureRectangle1(gfx, (int)(x * 4.0f), (int)(y * 4.0f), (int)((x + w) * 4.0f), (int)((y + h) * 4.0f), 0, 0, 0, 0, 0);
+    gDPPipeSync(gfx++);
+    SET_FONT_DISP(gfx);
+    CLOSE_DISP(game->graph);
+}
+
 void pc_tool_wheel_draw(struct game_s* game) {
     int i;
+    const float cx = 160.0f, cy = 120.0f, rx = 88.0f, ry = 64.0f;
     if (!s_open || game == NULL || game->graph == NULL) {
         return;
     }
     mFont_SetMatrix(game->graph, mFont_MODE_FONT);
-    pc_menu_dim_rect(game->graph, 140);
+    pc_menu_dim_rect(game->graph, 120);
+    wheel_rect(game, cx - rx - 40.0f, cy - ry - 18.0f, 2.0f * (rx + 40.0f), 2.0f * (ry + 18.0f), 0, 0, 0, 70); /* a darker ring area */
     for (i = 0; i <= s_n; i++) {
         float ang = (s_n > 0 && i > 0) ? (6.28318530718f * (float)(i - 1) / (float)s_n) : 0.0f;
-        float x = 160.0f + (i > 0 ? 78.0f * sinf(ang) : 0.0f);
-        float y = 112.0f - (i > 0 ? 62.0f * cosf(ang) : 0.0f);
+        float x = cx + (i > 0 ? rx * sinf(ang) : 0.0f);
+        float y = cy - (i > 0 ? ry * cosf(ang) : 0.0f);
         char label[40];
         int sel = (i == s_sel);
+        float tw, bw;
         if (i == 0) {
-            snprintf(label, sizeof(label), "%sEmpty hand", sel ? "> " : "");
+            snprintf(label, sizeof(label), "Empty hand");
         } else {
-            snprintf(label, sizeof(label), "%s%s%s", sel ? "> " : "", tool_name(s_entries[i - 1].item), s_entries[i - 1].slot == -2 ? " *" : "");
+            snprintf(label, sizeof(label), "%s%s", tool_name(s_entries[i - 1].item), s_entries[i - 1].slot == -2 ? " *" : "");
         }
-        pc_text_draw(game, label, x - (float)pc_text_width(label) * 0.5f, y, sel ? 255 : 200, sel ? 230 : 200, sel ? 60 : 200, 255, sel ? 1.25f : 1.0f);
+        tw = (float)pc_text_width(label) * (sel ? 1.15f : 1.0f);
+        bw = tw + 12.0f;
+        if (i > 0) { /* spoke from the centre to the slot */
+            wheel_rect(game, (cx + x) * 0.5f - 1.0f, (cy + y) * 0.5f - 1.0f, 2.0f, 2.0f, 255, 255, 255, 60);
+        }
+        wheel_rect(game, x - bw * 0.5f - 2.0f, y - 3.0f, bw + 4.0f, 22.0f, sel ? 255 : 0, sel ? 220 : 0, sel ? 90 : 0, sel ? 235 : 120); /* frame */
+        wheel_rect(game, x - bw * 0.5f, y - 1.0f, bw, 18.0f, sel ? 150 : 25, sel ? 105 : 25, sel ? 20 : 40, sel ? 240 : 210);
+        pc_text_draw(game, label, x - tw * 0.5f, y + 1.0f, sel ? 255 : 215, sel ? 245 : 215, sel ? 190 : 215, 255, sel ? 1.15f : 1.0f);
     }
     mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
 }
