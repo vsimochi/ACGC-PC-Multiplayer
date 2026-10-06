@@ -6,6 +6,7 @@
 #include "pc_host_observer.h"
 #include "pc_net_game.h"
 #include "pc_log.h"
+#include "pc_server.h" /* servers/<id>/ storage tree (status line, server.log) */
 #include "m_name_table.h" /* item ids / categories for the host item tools (finditem, iteminfo, items, give) */
 #include "m_item_name.h"  /* mIN_copy_name_str(): the game's own item name tables (filled from the ROM by pc_assets_init) */
 
@@ -88,6 +89,14 @@ void pc_dedicated_say(const char* fmt, ...) {
     va_end(ap);
     fputc('\n', pc_ded_stream());
     pc_ded_flush();
+    {
+        char line[400];
+        va_list ap2;
+        va_start(ap2, fmt);
+        vsnprintf(line, sizeof(line), fmt, ap2); /* the same notice goes to servers/<id>/logs/server.log */
+        va_end(ap2);
+        pc_server_log("%s", line);
+    }
 }
 
 /* FATAL notices: stderr, or the server console when stderr is going to NUL (interactive mode) so they are never lost. */
@@ -505,6 +514,7 @@ static void pc_ded_cmd_status(void) {
     }
     pc_ded_printf("[DEDICATED] status\n");
     pc_ded_printf("  dedicated: yes\n");
+    pc_ded_printf("  server: %s (%s), town dir %s\n", pc_server_id(), pc_server_dir(), pc_server_town_dir());
     pc_ded_printf("  observer: active=%s ready=%s\n", pc_host_observer_active() ? "yes" : "no", pc_host_observer_ready() ? "yes" : "no");
     pc_ded_printf("  network: role=%s listening_port=%u\n", pc_ded_role_name(), (unsigned)s_port);
     pc_ded_printf("  world ready: %s\n", pc_net_game_dedicated_world_ready() ? "yes" : "no");

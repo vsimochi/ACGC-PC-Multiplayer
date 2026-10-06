@@ -178,6 +178,8 @@
 #include "pc_session.h"        /* M2: pc_session_select_town() = the per-town token file of a STORE character (pc_guest_token_path() override) */
 #include "pc_mp_membership.h"  /* M2: pc_mp_membership_list() for the dedicated `members` command */
 #include "pc_guest_profile.h" /* guest profiles: pc_guest_token_path() = the selected profile's client token file (default save/mp/guest_token.dat) */
+#include "pc_server.h" /* dedicated server storage tree: servers/<id>/ (host-owned file paths) */
+static void pcnetgame_server_init_members(void); /* first launch of a dedicated server: creates residents/members.dat (defined with the members store) */
 #include "pc_mp_members.h" /* M-E: save/mp/members.dat resident credentials (pure storage module) */
 #include "pc_mp_guests.h"  /* guests: save/mp/guests.dat host table + save/mp/guest_token.dat client token file (pure storage module) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
@@ -7390,6 +7392,19 @@ static void pcnetgame_host_world_tick(int local_ready) {
         pcnetgame_townsrv_world_ready();
         pcnetgame_format_town(&s_host_town, a, sizeof(a));
         printf("[NET][WORLD] host: world ready (%s, world_seq %u)\n", a, (unsigned)s_world_seq);
+        if (pc_server_active()) {
+            /* dedicated server tree: the authoritative town identity belongs in servers/<id>/server.ini [town] (recorded the first time, compared afterwards) */
+            PCTownId sid;
+            memcpy(sid.land_name, s_host_town.land_name, 8);
+            sid.land_id = s_host_town.land_id;
+            sid.terrain_hash = s_host_town.terrain_hash;
+            if (!pc_server_note_town(&sid, pc_server_town_missing())) {
+                fprintf(stderr, "[SERVER] FATAL: servers/%s/server.ini names another town than the one loaded from %s: refusing to host it (nothing was changed)\n", pc_server_id(), pc_gci_path());
+                fflush(stdout);
+                exit(3);
+            }
+            pcnetgame_server_init_members();
+        }
         PC_LOG(PCL_NET, "host world ready: %s world_seq %u\n", a, (unsigned)s_world_seq);
         PC_LOG(PCL_VILLAGERS, "host villager roster at world ready: now_npc_max=%u\n", (unsigned)Save_Get(now_npc_max));
         pcnetgame_host_revalidate_bound_peers(); /* the host's save/resident may have changed while paused */
@@ -12458,7 +12473,7 @@ static int pcnetgame_rec_store_write(const char* why, const char* gci_path) {
     for (i = 0; i < PLAYER_NUM; i++) {
         entries += nf.e[i].present ? 1 : 0;
     }
-    r = pc_mp_records_save(PC_MP_RECORDS_PATH, &nf);
+    r = pc_mp_records_save(pc_server_records_path(), &nf);
     if (r == PC_MP_REC_OK) {
         s_rec_file = nf;
         s_rec_store_last_failed = 0;
@@ -12551,12 +12566,12 @@ static void pcnetgame_rec_store_resolve(void) {
     }
     if (!s_rec_store_loaded) {
         PCMpRecLoadInfo info;
-        s_rec_store_mode = pc_mp_records_load(PC_MP_RECORDS_PATH, &s_rec_file, &info);
+        s_rec_store_mode = pc_mp_records_load(pc_server_records_path(), &s_rec_file, &info);
         s_rec_store_loaded = 1;
         s_rec_untrusted = (s_rec_store_mode == PC_MP_REC_LOAD_UNTRUSTED);
         first_untrusted_pass = s_rec_untrusted;
         printf("[NET][REC] store: records file '%s' load mode=%s (generation used %d, %d unreadable file(s) preserved)\n",
-               PC_MP_RECORDS_PATH, pcnetgame_rec_store_mode_name(s_rec_store_mode), info.gen_used, info.moved_aside);
+               pc_server_records_path(), pcnetgame_rec_store_mode_name(s_rec_store_mode), info.gen_used, info.moved_aside);
         if (s_rec_untrusted) {
             printf("[NET][REC] store: *** UNTRUSTED MODE: the record file existed but no generation is readable. Migration is "
                    "DISABLED for this process; every resident is treated as already synced (rev 1) and the host save wins ***\n");
@@ -14586,7 +14601,7 @@ static void pcnetgame_guest_store_load(void) {
         return;
     }
     s_guest_store_loaded = 1;
-    s_guest_store_mode = pc_mp_guests_load(PC_MP_GUESTS_PATH, &s_guest_file, &info);
+    s_guest_store_mode = pc_mp_guests_load(pc_server_guests_path(), &s_guest_file, &info);
     s_guest_untrusted = (s_guest_store_mode == PC_MP_GST_LOAD_UNTRUSTED);
     for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
         if (s_guest_file.e[g].present) {
@@ -14602,7 +14617,7 @@ static void pcnetgame_guest_store_load(void) {
         }
     }
     printf("[NET][GUEST] store: guests file '%s' load mode=%s (generation used %d, %d unreadable file(s) preserved), %d guest(s) restored\n",
-           PC_MP_GUESTS_PATH, s_guest_store_mode == PC_MP_GST_LOAD_MISSING ? "MISSING" : s_guest_store_mode == PC_MP_GST_LOAD_OK ? "OK" :
+           pc_server_guests_path(), s_guest_store_mode == PC_MP_GST_LOAD_MISSING ? "MISSING" : s_guest_store_mode == PC_MP_GST_LOAD_OK ? "OK" :
            s_guest_store_mode == PC_MP_GST_LOAD_OK_BACKUP ? "OK_BACKUP" : "UNTRUSTED", info.gen_used, info.moved_aside, n);
     if (s_guest_untrusted) {
         printf("[NET][GUEST] store: *** UNTRUSTED MODE: guests.dat existed but no generation is readable. NO guest is admitted (their tokens "
@@ -14664,7 +14679,7 @@ static int pcnetgame_guest_store_write(const char* why) {
     for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
         count += nf.e[g].present ? 1 : 0;
     }
-    r = pc_mp_guests_save(PC_MP_GUESTS_PATH, &nf);
+    r = pc_mp_guests_save(pc_server_guests_path(), &nf);
     if (r == PC_MP_GST_OK) {
         s_guest_file = nf;
         s_guest_store_last_failed = 0;
@@ -15073,13 +15088,13 @@ static void pcnetgame_members_store_load(void) {
         return;
     }
     s_members_loaded = 1;
-    s_members_mode = pc_mp_members_load(PC_MP_MEMBERS_PATH, &s_members_file, &info);
+    s_members_mode = pc_mp_members_load(pc_server_members_path(), &s_members_file, &info);
     s_members_untrusted = (s_members_mode == PC_MP_MBR_LOAD_UNTRUSTED);
     for (i = 0; i < PC_MP_MEMBERS_SLOTS; i++) {
         n += (s_members_file.e[i].present && s_members_file.e[i].kind == PC_MP_MEMBER_KIND_RESIDENT_TOKEN) ? 1 : 0;
     }
     printf("[NET][RESIDENT] store: members file '%s' load mode=%s (generation used %d, %d unreadable file(s) preserved), %d resident credential(s) restored (resident_tokens=%s)\n",
-           PC_MP_MEMBERS_PATH, s_members_mode == PC_MP_MBR_LOAD_MISSING ? "MISSING" : s_members_mode == PC_MP_MBR_LOAD_OK ? "OK" :
+           pc_server_members_path(), s_members_mode == PC_MP_MBR_LOAD_MISSING ? "MISSING" : s_members_mode == PC_MP_MBR_LOAD_OK ? "OK" :
            s_members_mode == PC_MP_MBR_LOAD_OK_BACKUP ? "OK_BACKUP" : "UNTRUSTED", info.gen_used, info.moved_aside, n, pcnetgame_resident_policy_name());
     if (s_members_untrusted) {
         printf("[NET][RESIDENT] store: *** UNTRUSTED MODE: members.dat existed but no generation is readable. resident_tokens=required refuses EVERY resident; tofu admits "
@@ -15095,7 +15110,7 @@ static int pcnetgame_members_commit(PCMpMemberFile* nf, const char* why) {
         return 0;
     }
     nf->generation = s_members_file.generation + 1u;
-    r = pc_mp_members_save(PC_MP_MEMBERS_PATH, nf);
+    r = pc_mp_members_save(pc_server_members_path(), nf);
     if (r != PC_MP_MBR_OK) {
         printf("[NET][RESIDENT] store: *** members.dat write FAILED (%s, %s); nothing changed ***\n", pc_mp_members_strerror(r), why);
         return 0;
@@ -15106,6 +15121,19 @@ static int pcnetgame_members_commit(PCMpMemberFile* nf, const char* why) {
     }
     printf("[NET][RESIDENT] store: members.dat written (%s; generation %u, %d resident credential(s))\n", why, (unsigned)nf->generation, n);
     return 1;
+}
+
+/* A dedicated server's first launch: the resident / member state of the server exists on disk from the start (an empty, valid residents/members.dat), so "this server has no
+ * credentials yet" is a state of the server directory, not a missing file. An existing file (or an UNTRUSTED one) is never touched. */
+static void pcnetgame_server_init_members(void) {
+    PCMpMemberFile nf;
+    pcnetgame_members_store_load();
+    if (s_members_mode == PC_MP_MBR_LOAD_MISSING && !s_members_untrusted) {
+        nf = s_members_file;
+        if (pcnetgame_members_commit(&nf, "dedicated server init")) {
+            printf("[SERVER] server '%s': created %s\n", pc_server_id(), pc_server_members_path());
+        }
+    }
 }
 
 /* The credential entry of resident `idx` of the host's CURRENT town (keyed by the PID in the host save), or -1. */
@@ -15319,8 +15347,8 @@ static int pcnetgame_guest_drop_promoted(const uint8_t aux[PC_MP_MEMBERS_PID_SIZ
         return 0;
     }
     bak[0] = '\0';
-    if (!pc_mp_guests_backup_file(PC_MP_GUESTS_PATH, bak, sizeof(bak))) {
-        printf("[NET][PROMOTE] host: the stale guest entry %d of a promoted guest could not be removed: the backup of %s failed (entry kept, retried later)\n", g, PC_MP_GUESTS_PATH);
+    if (!pc_mp_guests_backup_file(pc_server_guests_path(), bak, sizeof(bak))) {
+        printf("[NET][PROMOTE] host: the stale guest entry %d of a promoted guest could not be removed: the backup of %s failed (entry kept, retried later)\n", g, pc_server_guests_path());
         return 0;
     }
     {
@@ -15452,7 +15480,7 @@ static int pcnetgame_host_promotion_handoff(PCNetPeerId peer, const PersonalID_c
         return 0;
     }
     if (!s_members_loaded) {
-        FILE* f = fopen(PC_MP_MEMBERS_PATH, "rb");
+        FILE* f = fopen(pc_server_members_path(), "rb");
         if (f == NULL) {
             return 0;
         }
@@ -17606,7 +17634,7 @@ static uint64_t pcnetgame_restock_wall_ms(void) {
 }
 
 static int pcnetgame_restock_path(char* out, size_t cap) {
-    return snprintf(out, cap, "%s/shop_restock.ini", PC_GUEST_PROFILE_DIR) < (int)cap;
+    return snprintf(out, cap, "%s", pc_server_restock_path()) < (int)cap;
 }
 
 static void pcnetgame_restock_town_key(char* key) {
@@ -32420,9 +32448,9 @@ int pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char
         }
         return 2;
     }
-    if (!pc_mp_guests_backup_file(PC_MP_GUESTS_PATH, bak, sizeof(bak))) {
-        snprintf(msg, cap, "refused: could not back up %s first (nothing was changed)", PC_MP_GUESTS_PATH);
-        printf("[NET][GUEST] ADMIN: %s of guest slot %d refused: backup of %s failed\n", op == 0 ? "remove" : "reset-token", g, PC_MP_GUESTS_PATH);
+    if (!pc_mp_guests_backup_file(pc_server_guests_path(), bak, sizeof(bak))) {
+        snprintf(msg, cap, "refused: could not back up %s first (nothing was changed)", pc_server_guests_path());
+        printf("[NET][GUEST] ADMIN: %s of guest slot %d refused: backup of %s failed\n", op == 0 ? "remove" : "reset-token", g, pc_server_guests_path());
         return 0;
     }
     if (op == 1) {
@@ -32500,10 +32528,10 @@ static uint8_t* pcnetgame_file_slurp(const char* path, size_t* len) {
 /* Rollback of the members.dat write of a promotion: puts the exact old bytes back (raw != NULL) or removes the file again (it did not exist before). 1 = done. */
 static int pcnetgame_members_restore_raw(const uint8_t* raw, size_t len) {
     if (raw == NULL) {
-        return remove(PC_MP_MEMBERS_PATH) == 0;
+        return remove(pc_server_members_path()) == 0;
     }
     {
-        FILE* f = fopen(PC_MP_MEMBERS_PATH, "wb");
+        FILE* f = fopen(pc_server_members_path(), "wb");
         int ok;
         if (f == NULL) {
             return 0;
@@ -32677,14 +32705,14 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
         return 2;
     }
     bak_g[0] = bak_m[0] = bak_r[0] = '\0';
-    if (!pc_mp_guests_backup_file(PC_MP_GUESTS_PATH, bak_g, sizeof(bak_g))) {
-        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", PC_MP_GUESTS_PATH);
+    if (!pc_mp_guests_backup_file(pc_server_guests_path(), bak_g, sizeof(bak_g))) {
+        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", pc_server_guests_path());
     }
-    if (pcnetgame_promote_file_exists(PC_MP_MEMBERS_PATH) && !pc_mp_guests_backup_file(PC_MP_MEMBERS_PATH, bak_m, sizeof(bak_m))) {
-        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", PC_MP_MEMBERS_PATH);
+    if (pcnetgame_promote_file_exists(pc_server_members_path()) && !pc_mp_guests_backup_file(pc_server_members_path(), bak_m, sizeof(bak_m))) {
+        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", pc_server_members_path());
     }
-    if (pcnetgame_promote_file_exists(PC_MP_RECORDS_PATH) && !pc_mp_guests_backup_file(PC_MP_RECORDS_PATH, bak_r, sizeof(bak_r))) {
-        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", PC_MP_RECORDS_PATH);
+    if (pcnetgame_promote_file_exists(pc_server_records_path()) && !pc_mp_guests_backup_file(pc_server_records_path(), bak_r, sizeof(bak_r))) {
+        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", pc_server_records_path());
     }
     printf("[NET][PROMOTE] ADMIN: promoting guest slot %d (\"%s\") to resident slot %d, house %d (backups: guests.dat %s, members.dat %s, records.dat %s)\n", g, who, s, h,
            bak_g, bak_m[0] ? bak_m : "(none: no file)", bak_r[0] ? bak_r : "(none: no file)");
@@ -32716,7 +32744,7 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
 
     /* 3. members.dat: the resident credential + the handoff (the handoff carries the GUEST token: the proof the claimant is the promoted guest) */
     old_members = s_members_file;
-    old_members_raw = pcnetgame_file_slurp(PC_MP_MEMBERS_PATH, &old_members_len); /* NULL = the file did not exist: a rollback removes it again (byte-identical members.dat) */
+    old_members_raw = pcnetgame_file_slurp(pc_server_members_path(), &old_members_len); /* NULL = the file did not exist: a rollback removes it again (byte-identical members.dat) */
     nf = s_members_file;
     {
         const int pruned = pcnetgame_members_prune_orphans(&nf);
@@ -32943,9 +32971,9 @@ int pc_net_game_dedicated_resident_admin(int op, const char* sel, int confirm, c
     }
     if (op == 0) {
         static PCMpMemberFile nf;
-        if (!pc_mp_guests_backup_file(PC_MP_MEMBERS_PATH, bak, sizeof(bak))) {
-            snprintf(msg, cap, "refused: could not back up %s first (nothing was changed)", PC_MP_MEMBERS_PATH);
-            printf("[NET][RESIDENT] ADMIN: reset of resident %d refused: backup of %s failed\n", r, PC_MP_MEMBERS_PATH);
+        if (!pc_mp_guests_backup_file(pc_server_members_path(), bak, sizeof(bak))) {
+            snprintf(msg, cap, "refused: could not back up %s first (nothing was changed)", pc_server_members_path());
+            printf("[NET][RESIDENT] ADMIN: reset of resident %d refused: backup of %s failed\n", r, pc_server_members_path());
             return 0;
         }
         nf = s_members_file;

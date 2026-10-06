@@ -498,7 +498,7 @@ def main():
           and store_write.count("s_rec_store_last_failed = 1;") == 2 and "s_rec_store_last_failed = 0;" in store_write)
     check("P latch: the coalesce branch of pcnetgame_rec_store_write clears s_rec_store_last_failed (s_rec_file mirrors the last durable write: set only by a successful load or save) so a failed write cannot stick the first-migration BUSY refusal for the whole process",
           re.search(r"memcmp\(nf\.e, s_rec_file\.e, sizeof\(nf\.e\)\) == 0\) \{[^}]*s_rec_store_last_failed = 0;[^}]*return 1;", store_write, re.S) is not None
-          and len(re.findall(r"s_rec_file = nf;", c)) == 1 and "s_rec_store_mode = pc_mp_records_load(PC_MP_RECORDS_PATH, &s_rec_file, &info);" in c)
+          and len(re.findall(r"s_rec_file = nf;", c)) == 1 and "s_rec_store_mode = pc_mp_records_load(pc_server_records_path(), &s_rec_file, &info);" in c)
     check("P re-init: a slot whose PersonalID changes (A -> B -> A in one process) is re-derived from the stored entry via pcnetgame_rec_resolve_slot (restored rev>0, no second MIGRATE), not freshly zeroed",
           "pcnetgame_rec_resolve_slot(idx);" in func_body(c_raw, "pcnetgame_rec_slot")
           and "for (i = 0; i < PLAYER_NUM; i++) {\n        pcnetgame_rec_resolve_slot(i);" in func_body(c_raw, "pcnetgame_rec_store_resolve"))

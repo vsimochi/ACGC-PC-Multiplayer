@@ -355,7 +355,7 @@ def main():
                   "pc_net_game_dedicated_give", "pcnetgame_promote_exec", "pcnetgame_guest_drop_promoted"]))  # lifecycle hardening: + the stale-entry removal (resident confirm / sweep)
     give = fb("pc_net_game_dedicated_give")
     prom = fb("pcnetgame_promote_exec")  # the console command pc_net_game_dedicated_promote is a thin wrapper of it
-    pord = ["s_guest_untrusted", "pc_mp_guests_backup_file(PC_MP_GUESTS_PATH", "pc_mp_promote_create("]
+    pord = ["s_guest_untrusted", "pc_mp_guests_backup_file(pc_server_guests_path()", "pc_mp_promote_create("]
     pord2 = ["pcnetgame_members_commit(&nf", "pc_save_write_authoritative_durable()", 'pcnetgame_guest_store_write("guest promoted to a resident")']  # lifecycle hardening (B3a): the DURABLE variant (FALSE unless the GCI was really written)
     ck("P the two further guests.dat writers are guarded: dedicated_give refuses a guest while UNTRUSTED (`if (is_guest && s_guest_untrusted) {`) BEFORE the inventory write and its failure path "
        "says the gift was rolled back; dedicated_promote refuses while UNTRUSTED, THEN backs guests.dat up, THEN creates the resident, and commits in the order members.dat -> authoritative "

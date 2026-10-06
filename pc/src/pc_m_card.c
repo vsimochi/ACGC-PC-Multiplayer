@@ -42,6 +42,7 @@
 #include "jsyswrap.h"   /* Guests G1: _JW_GetResourceAram (default design textures) */
 /* OBSERVER-BEGIN */
 #include "pc_host_observer.h"
+#include "pc_server.h" /* dedicated server storage tree: first-launch town generation */
 #include "pc_log.h"
 #include "pc_dedicated.h"
 #include "pc_field_authority.h"
@@ -2442,6 +2443,41 @@ static u16 pc_host_observer_pick_id(const PersonalID_c* base) {
  * A saved resident whose PersonalID cannot be told from every candidate observer id FAILS the startup (loud message, exit code 3): a hosted town
  * must never continue with an ambiguous identity. Any other failure restores the previous binding, disarms the writer and leaves the host unbound
  * (not world-ready), exactly like a host whose save never loaded. */
+/* Dedicated server FIRST LAUNCH (pc_server.h): no authoritative town exists yet, so the host generates one with the game's own new-town initialiser -- the SAME call "Start Game" makes
+ * for a brand-new town (mSDI_StartDataInit(.., mSDI_INIT_MODE_NEW): field / acre combination, trees, villagers, events, shop, houses, town day, new land id). What the interactive
+ * new-game flow adds is a player and a town name chosen at the Rover intro; a dedicated server has no player (the guest-first town starts with every house free), so the initialiser's
+ * pseudo-resident is cleared again and the town gets the server's name. The result is written once, atomically, to servers/<id>/town/card_a/DobutsunomoriP_MURA.gci. 1 = generated + saved. */
+static int pc_server_generate_town(GAME_PLAY* play) {
+    char name[9];
+    int i, ok, was_ready;
+    pc_server_land_name(name);
+    OSReport("[SERVER] first launch: generating a new town (land name '%s') for server '%s'\n", name, pc_server_id());
+    if (mSDI_StartDataInit((GAME*)play, 0, mSDI_INIT_MODE_NEW) != TRUE) {
+        OSReport("[SERVER] town generation FAILED: mSDI_StartDataInit(NEW) failed\n");
+        return FALSE;
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        mPr_ClearPrivateInfo(Save_GetPointer(private_data[i]));
+    }
+    for (i = 0; i < LAND_NAME_SIZE; i++) {
+        Save_Get(land_info).name[i] = (u8)(i < (int)strlen(name) ? name[i] : CHAR_SPACE);
+    }
+    Save_Get(land_info).exists = TRUE;
+    mFRm_SetSaveCheckData(Save_GetPointer(save_check));
+    was_ready = pc_save_ready;
+    pc_save_ready = 1; /* the writer is a no-op while the save is not armed */
+    ok = pc_save_write_authoritative();
+    pc_save_ready = was_ready;
+    if (!ok) {
+        OSReport("[SERVER] town generation FAILED: the new town could not be written to %s\n", pc_gci_path());
+        return FALSE;
+    }
+    pc_save_loaded = 1;
+    OSReport("[SERVER] new town '%s' (land id 0x%04X) generated and saved to %s\n", name, (unsigned)Save_Get(land_info).id, pc_gci_path());
+    pc_server_log("new town '%s' (land id 0x%04X) generated and saved to %s", name, (unsigned)Save_Get(land_info).id, pc_gci_path());
+    return TRUE;
+}
+
 void pc_host_observer_poll(void) {
     static int l_started = 0;
     static int l_init_ok = 0;
@@ -2479,6 +2515,13 @@ void pc_host_observer_poll(void) {
         u16 pid;
         int scene_res;
 
+        if (mFRm_CheckSaveData() == FALSE && g_pc_dedicated && pc_server_town_missing()) {
+            if (!pc_server_generate_town(play)) {
+                fprintf(stderr, "[SERVER] FATAL: the first-launch town could not be generated / saved (see the log); nothing is served\n");
+                fflush(stdout);
+                exit(3);
+            }
+        }
         if (mFRm_CheckSaveData() == FALSE) {
             OSReport("[NET][OBSERVER] host: observer init FAILED: no valid town save is loaded (the host stays unbound and not world-ready)\n");
             return;
