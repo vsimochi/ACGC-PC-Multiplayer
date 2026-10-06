@@ -513,6 +513,8 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_ROOM_NPC              = 67, /* Indoor villagers (v8 unreleased: extended in place, NO version bump), both directions, UNRELIABLE, 28 bytes. The pose of the villager
                                              * standing in its own house (SCENE_NPC_HOUSE, owner = the villager's npc_id), sampled by the room's pose holder (any in-room player process) -> host, which
                                              * validates that the sender announced exactly that room and holds the room lease, then relays it to every OTHER in-room READY peer. An old peer drops it. */
+    PC_NETGAME_MSG_WORK_STATE            = 68, /* Nook Work Mode (v8 unreleased: extended in place, NO version bump), host -> the ONE requesting client, RELIABLE, 28 bytes. The character's job
+                                             * exactly as the host's work table holds it, sent right BEFORE the TXN_RESULT of every WORK op (any outcome). The client mirrors it; it never decides. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2476,6 +2478,20 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
 #define PC_NETGAME_TXN_KIND_SHOP_RESTOCK 15u
 #define PC_NETGAME_TXN_REASON_RESTOCKING 31u /* shop restock: a restock is already running (nothing charged); also a SHOP_BUY while the shop is closed for it */
 #define PC_NETGAME_TXN_REASON_STALE_CATALOG 32u /* shop: a SHOP_BUY made against another catalog generation than the host's current one (nothing charged) */
+/* Nook WORK MODE (kind 16, the same one-phase TXN_COMMIT machinery; the character's job lives in the host's work table, see "WORK HOST"). tag.aux_cond = the op:
+ *   PC_WORK_OP_ENTER (1)   start / resume Work Mode: the host gives the character a job (an active one is kept). tag.slot = 0, item = 0, aux_item = 0, dest NONE.
+ *   PC_WORK_OP_DELIVER (2) hand in the objective item: tag.slot = the pocket slot holding it, tag.item = the item, tag.aux_item = the LOW 16 BITS of the job id the client
+ *                          believes it is completing. The HOST checks the character is in Work Mode with an ACTIVE job of that id and that the item is the job's objective, then in ONE
+ *                          step empties the pocket slot, pays the reward, retires the job (tombstone last_rewarded) and persists. Post-image = pre-image minus the item plus the reward.
+ *   PC_WORK_OP_LEAVE (3)   leave Work Mode (an active job is kept for the next ENTER).
+ * Every outcome is followed by a WORK_STATE (id 68) to the requester: the job as the host holds it. Reasons: WORK_NO_JOB (33), WORK_STALE_JOB (34), WORK_WALLET_FULL (35). */
+#define PC_NETGAME_TXN_KIND_WORK 16u
+#define PC_NETGAME_TXN_REASON_WORK_NO_JOB 33u      /* no active job (not in Work Mode, never started, already completed and paid) */
+#define PC_NETGAME_TXN_REASON_WORK_STALE_JOB 34u   /* the completion names another job than the current one */
+#define PC_NETGAME_TXN_REASON_WORK_WALLET_FULL 35u /* the reward would overflow the wallet: nothing happens, the job stays active */
+enum { PC_WORK_OP_ENTER = 1, PC_WORK_OP_DELIVER = 2, PC_WORK_OP_LEAVE = 3 };
+enum { PC_WORK_STATE_NONE = 0, PC_WORK_STATE_ACTIVE = 1 };
+enum { PC_WORK_JOB_NONE = 0, PC_WORK_JOB_DELIVER = 1, PC_WORK_JOB_MAX = 1 };
 #define PC_NETGAME_RESTOCK_PRICE         500u
 #define PC_NETGAME_RESTOCK_WAIT_MS       60000u
 #define PC_NETGAME_HOUSE_AUTO                 0xFFu
@@ -2791,6 +2807,20 @@ typedef struct PCNetGameRoomNpcMsg {
     int16_t  _reserved;
 } PCNetGameRoomNpcMsg;
 _Static_assert(sizeof(PCNetGameRoomNpcMsg) == 28, "PCNetGameRoomNpcMsg wire size drifted");
+typedef struct PCNetGameWorkStateMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_WORK_STATE */
+    uint8_t  flags;    /* bit 0: the character is in Work Mode */
+    uint8_t  state;    /* PC_WORK_STATE_* */
+    uint8_t  job_type; /* PC_WORK_JOB_* */
+    uint32_t job_id;
+    uint32_t reward;
+    uint32_t jobs_done;
+    uint32_t last_rewarded;
+    uint16_t obj_item;
+    uint16_t obj_count;
+    uint32_t request_id; /* the TXN request this state answers (0 = unsolicited) */
+} PCNetGameWorkStateMsg;
+_Static_assert(sizeof(PCNetGameWorkStateMsg) == 28, "PCNetGameWorkStateMsg wire size drifted");
 static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in);
 static void pcnetgame_handle_client_room_npc(const PCNetGameRoomNpcMsg* in);
 
@@ -5255,6 +5285,9 @@ static const char* pcnetgame_kind_tag(int kind) {
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
         return "SHOP_RESTOCK";
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_WORK) {
+        return "WORK";
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
         return "DROP";
@@ -15701,6 +15734,9 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_NAME_TAKEN: return "NAME_TAKEN";
         case PC_NETGAME_TXN_REASON_RESTOCKING: return "RESTOCKING";
         case PC_NETGAME_TXN_REASON_STALE_CATALOG: return "STALE_CATALOG";
+        case PC_NETGAME_TXN_REASON_WORK_NO_JOB: return "WORK_NO_JOB";
+        case PC_NETGAME_TXN_REASON_WORK_STALE_JOB: return "WORK_STALE_JOB";
+        case PC_NETGAME_TXN_REASON_WORK_WALLET_FULL: return "WORK_WALLET_FULL";
         default: return "?";
     }
 }
@@ -16540,6 +16576,211 @@ static void pcnetgame_x3_catch_request(PCNetPeerId peer, const PCNetGameCatchReq
 }
 /* ===== X3 HOST END ===== */
 
+/* ===== WORK HOST BEGIN: Nook Work Mode -- the host-owned job table (see PC_NETGAME_TXN_KIND_WORK) =====
+ * One record per CHARACTER (the bound PersonalID of the resident / guest record, never the peer slot, the connection, an address or a PID alone: a reconnect, a different peer slot or
+ * a host restart finds the very same record). The host alone creates jobs (unique host-generated job_id, never reused: the counter is persisted), validates delivery against its
+ * MIRROR of the character's pockets and pays the reward in the same atomic step that consumes the item and retires the job, so a duplicate packet (journal replay), a retransmit, a
+ * retry with a new sequence number, a stale completion (old job id) or a reconnect can never pay twice. State is persisted (work_jobs.dat) before the result is sent. */
+#define PC_WORK_MAX_CHARS 64
+#define PC_WORK_FILE_MAGIC 0x4B574341u /* 'ACWK' */
+#define PC_WORK_FILE_VERSION 1u
+
+typedef struct PCNetWorkChar {
+    PersonalID_c key;       /* the character */
+    uint32_t     job_id;    /* the CURRENT job (state ACTIVE) or the last one (state NONE); host-unique, never 0 mod 65536 */
+    uint32_t     reward;    /* Bells paid on completion */
+    uint32_t     jobs_done; /* jobs completed and paid */
+    uint32_t     last_rewarded; /* job_id of the last paid job (tombstone: it can never pay again) */
+    uint16_t     obj_item;
+    uint16_t     obj_count;
+    uint8_t      used;
+    uint8_t      mode_on;   /* the character is in Work Mode */
+    uint8_t      state;     /* PC_WORK_STATE_* */
+    uint8_t      job_type;  /* PC_WORK_JOB_* */
+    uint8_t      _pad[4];
+} PCNetWorkChar;
+_Static_assert(sizeof(PCNetWorkChar) == 48, "PCNetWorkChar persisted layout drifted");
+
+typedef struct PCNetWorkJobDef {
+    uint8_t  type;
+    uint8_t  n_items;
+    uint16_t items[6];
+    uint32_t reward_base;
+    uint32_t reward_step; /* the reward is reward_base + (0..3) * reward_step, chosen from the job id */
+} PCNetWorkJobDef;
+
+/* EXTENSIBLE: a new job type is one row here (+ its objective check in pcnetgame_work_check_deliver). The only type today is a delivery of one fruit. */
+static const PCNetWorkJobDef s_work_defs[] = {
+    {PC_WORK_JOB_DELIVER, 5, {ITM_FOOD_APPLE, ITM_FOOD_CHERRY, ITM_FOOD_PEAR, ITM_FOOD_PEACH, ITM_FOOD_ORANGE, 0}, 300u, 100u},
+};
+
+static PCNetWorkChar s_work[PC_WORK_MAX_CHARS];
+static uint32_t      s_work_next_job_id = 0;
+static int           s_work_loaded = 0;
+
+static uint32_t pcnetgame_work_hash32(const void* p, size_t n) {
+    return pcnetgame_fnv1a32(p, n);
+}
+
+static void pcnetgame_work_save(void) {
+    char tmp[200];
+    const char* path = pc_server_work_path();
+    uint32_t hdr[4];
+    uint32_t crc;
+    FILE* f;
+    if (path == NULL || path[0] == 0) {
+        return;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (f == NULL) {
+        printf("[NET][WORK] host: could not write %s (job state would not survive a host restart)\n", tmp);
+        return;
+    }
+    hdr[0] = PC_WORK_FILE_MAGIC;
+    hdr[1] = PC_WORK_FILE_VERSION;
+    hdr[2] = s_work_next_job_id;
+    hdr[3] = (uint32_t)sizeof(s_work);
+    crc = pcnetgame_work_hash32(hdr, sizeof(hdr)) ^ pcnetgame_work_hash32(s_work, sizeof(s_work));
+    fwrite(hdr, sizeof(hdr), 1, f);
+    fwrite(s_work, sizeof(s_work), 1, f);
+    fwrite(&crc, sizeof(crc), 1, f);
+    fflush(f);
+    fclose(f);
+    remove(path);
+    if (rename(tmp, path) != 0) {
+        printf("[NET][WORK] host: could not replace %s\n", path);
+    }
+}
+
+static void pcnetgame_work_load(void) {
+    uint32_t hdr[4], crc, want;
+    FILE* f;
+    const char* path = pc_server_work_path();
+    if (s_work_loaded) {
+        return;
+    }
+    s_work_loaded = 1;
+    memset(s_work, 0, sizeof(s_work));
+    s_work_next_job_id = 0;
+    if (path == NULL || path[0] == 0 || (f = fopen(path, "rb")) == NULL) {
+        return;
+    }
+    if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == PC_WORK_FILE_MAGIC && hdr[1] == PC_WORK_FILE_VERSION && hdr[3] == (uint32_t)sizeof(s_work) &&
+        fread(s_work, sizeof(s_work), 1, f) == 1 && fread(&crc, sizeof(crc), 1, f) == 1) {
+        want = pcnetgame_work_hash32(hdr, sizeof(hdr)) ^ pcnetgame_work_hash32(s_work, sizeof(s_work));
+        if (crc == want) {
+            s_work_next_job_id = hdr[2];
+            printf("[NET][WORK] host: loaded %s (next job id %u)\n", path, (unsigned)s_work_next_job_id);
+            fclose(f);
+            return;
+        }
+    }
+    printf("[NET][WORK] host: %s is unreadable or corrupt -- starting with no work state\n", path);
+    memset(s_work, 0, sizeof(s_work));
+    s_work_next_job_id = 0;
+    fclose(f);
+}
+
+static PCNetWorkChar* pcnetgame_work_find(const PersonalID_c* key, int create) {
+    int i, freei = -1;
+    pcnetgame_work_load();
+    for (i = 0; i < PC_WORK_MAX_CHARS; i++) {
+        if (s_work[i].used && memcmp(&s_work[i].key, key, sizeof(*key)) == 0) {
+            return &s_work[i];
+        }
+        if (!s_work[i].used && freei < 0) {
+            freei = i;
+        }
+    }
+    if (!create || freei < 0) {
+        return NULL;
+    }
+    memset(&s_work[freei], 0, sizeof(s_work[freei]));
+    s_work[freei].used = 1;
+    s_work[freei].key = *key;
+    return &s_work[freei];
+}
+
+/* a guest bought a house: the character keeps its work record under the NEW resident PID */
+static void pcnetgame_work_rekey(const PersonalID_c* from, const PersonalID_c* to) {
+    PCNetWorkChar* w = pcnetgame_work_find(from, 0);
+    if (w != NULL && pcnetgame_work_find(to, 0) == NULL) {
+        w->key = *to;
+        pcnetgame_work_save();
+        printf("[NET][WORK] host: work record moved to the promoted resident's PID\n");
+    }
+}
+
+/* ENTER: Work Mode on; a character without an active job receives a new one (an existing active job is kept: ENTER is idempotent). */
+static void pcnetgame_work_enter(PCNetWorkChar* w) {
+    const PCNetWorkJobDef* d = &s_work_defs[0];
+    uint32_t h;
+    w->mode_on = 1;
+    if (w->state == PC_WORK_STATE_ACTIVE) {
+        return;
+    }
+    do {
+        s_work_next_job_id++;
+    } while ((s_work_next_job_id & 0xFFFFu) == 0u);
+    h = s_work_next_job_id * 2654435761u;
+    w->job_id = s_work_next_job_id;
+    w->job_type = d->type;
+    w->obj_item = d->items[(h >> 8) % d->n_items];
+    w->obj_count = 1;
+    w->reward = d->reward_base + ((h >> 20) & 3u) * d->reward_step;
+    w->state = PC_WORK_STATE_ACTIVE;
+}
+
+/* The host-side validation of a DELIVER. Returns 0 = valid, else the PC_NETGAME_TXN_REASON_* and *why. A client never claims "done": it names the job it believes it is
+ * completing and the item it hands in; the host checks both against ITS record, and the caller checks the pocket against the pre-image / mirror. */
+static uint8_t pcnetgame_work_check_deliver(const PCNetWorkChar* w, uint16_t job_low16, uint16_t item, const char** why) {
+    if (w == NULL || !w->mode_on || w->state != PC_WORK_STATE_ACTIVE) {
+        *why = "the character has no active job (not in work mode, never started, or already completed and paid)";
+        return (uint8_t)PC_NETGAME_TXN_REASON_WORK_NO_JOB;
+    }
+    if ((uint16_t)(w->job_id & 0xFFFFu) != job_low16) {
+        *why = "the completion names another job than the character's current one (stale / replayed completion)";
+        return (uint8_t)PC_NETGAME_TXN_REASON_WORK_STALE_JOB;
+    }
+    if (w->job_type != PC_WORK_JOB_DELIVER || item != w->obj_item) {
+        *why = "the handed-in item is not the job's objective";
+        return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+    }
+    return 0;
+}
+
+/* DELIVER commit: the job is retired and the tombstone written in the same step the reward is decided; persisted by the caller before any result is sent. */
+static void pcnetgame_work_commit_deliver(PCNetWorkChar* w) {
+    w->last_rewarded = w->job_id;
+    w->jobs_done++;
+    w->state = PC_WORK_STATE_NONE;
+}
+
+static void pcnetgame_work_pack_state(PCNetGameWorkStateMsg* m, const PCNetWorkChar* w, uint32_t request_id) {
+    memset(m, 0, sizeof(*m));
+    m->msg_type = (uint8_t)PC_NETGAME_MSG_WORK_STATE;
+    if (w != NULL) {
+        m->flags = (uint8_t)(w->mode_on ? 1u : 0u);
+        m->state = w->state;
+        m->job_type = w->job_type;
+        m->job_id = w->job_id;
+        m->reward = w->reward;
+        m->jobs_done = w->jobs_done;
+        m->last_rewarded = w->last_rewarded;
+        m->obj_item = w->obj_item;
+        m->obj_count = w->obj_count;
+    }
+    m->request_id = request_id;
+}
+
+static void pcnetgame_work_send_state(PCNetPeerId peer, const PersonalID_c* key, uint32_t request_id) {
+    PCNetGameWorkStateMsg m;
+    pcnetgame_work_pack_state(&m, pcnetgame_work_find(key, 0), request_id);
+    pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+}
+/* ===== WORK HOST END ===== */
+
 /* ===== TS HOST BEGIN: town services milestone 1 -- the generic host -> client service MIRROR (TOWN_SVC_STATE) and the host-authoritative
  * MUSEUM_DONATE / POLICE_CLAIM transactions (protocol v8, unreleased: extended in place) =====
  * MIRROR. The host owns Save_t.police_box and Save_t.museum_display (and persists them in its normal GCI save). A client never persists them:
@@ -17368,6 +17609,7 @@ static int pcnetgame_shop_local_scene_is_shop(void) {
                                    s_local_scene.scene_id == (uint8_t)SCENE_DEPART_2);
 }
 
+
 /* MUSEUM_DONATE / POLICE_CLAIM / SHOP_BUY / SHOP_SELL. `in` is the exact 72-byte TXN_COMMIT (kind 8 / 9 / 10 / 11). After the READY gate every path ends in one TXN_RESULT
  * (except the TEST-ONLY injected faults). */
 static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
@@ -17376,8 +17618,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     const int is_buy = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY);
     const int is_sell = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL);
     const int is_restock = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK);
+    const int is_work = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK);
     const int is_shop = is_buy || is_sell;
-    const int svc = is_restock ? (int)PC_NETGAME_TS_HOSTCFG : is_shop ? (int)PC_NETGAME_TS_SHOP : is_donate ? (int)PC_NETGAME_TS_MUSEUM : (int)PC_NETGAME_TS_POLICE;
+    const int svc = (is_restock || is_work) ? (int)PC_NETGAME_TS_HOSTCFG : is_shop ? (int)PC_NETGAME_TS_SHOP : is_donate ? (int)PC_NETGAME_TS_MUSEUM : (int)PC_NETGAME_TS_POLICE;
     PCNetGameHostPeerState* st;
     PCNetGameRecSlot* slot;
     PCNetGameTxnResident* R;
@@ -17391,6 +17634,8 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     int idx, shape_ok, pidx = -1;
     const char* fail = NULL;
     uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+    PCNetWorkChar* work = NULL;
+    uint32_t work_reward = 0;
 
     /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
     if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
@@ -17420,9 +17665,16 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
 
     /* 3. shape */
     shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && (t->flags == 0 || is_buy) && /* SHOP_BUY: flags = the catalog generation the buyer saw (0 = unclaimed) */
-               (is_restock ? (t->slot == 0 && t->item == 0) : (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO));
+               (is_restock ? (t->slot == 0 && t->item == 0)
+                                                               : is_work ? ((t->aux_cond == (uint8_t)PC_WORK_OP_DELIVER) ? (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO)
+                                                                                                                         : (t->slot == 0 && t->item == 0))
+                                                                         : (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO));
     if (shape_ok) {
-        if (is_restock) {
+        if (is_work) {
+            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE &&
+                       ((t->aux_cond == (uint8_t)PC_WORK_OP_DELIVER && t->aux_item != 0) ||
+                        ((t->aux_cond == (uint8_t)PC_WORK_OP_ENTER || t->aux_cond == (uint8_t)PC_WORK_OP_LEAVE) && t->aux_item == 0));
+        } else if (is_restock) {
             shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0 && t->aux_item != 0;
         } else if (is_donate) {
             shape_ok = t->aux_item == 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0;
@@ -17460,6 +17712,10 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
                                      "same (nonce, seq) with different bytes");
             } else if (old->outcome == (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED) {
                 s_txn_svc_echo = (uint16_t)s_ts_host[svc].seq;
+                if (is_work) {
+                    printf("[NET][WORK] host: peer %d replay of an applied WORK op (request %u): answered from the journal, nothing re-executed\n", (int)peer, (unsigned)in->request_id);
+                    pcnetgame_work_send_state(peer, &st->bound_pid, in->request_id);
+                }
                 pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED, "replay ");
                 s_txn_svc_echo = 0;
             } else {
@@ -17502,8 +17758,10 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 7. kind precondition on the PRE-image (never on the mirror: it may lag the client) */
-    if (is_restock) {
+    if (is_restock || (is_work && t->aux_cond != (uint8_t)PC_WORK_OP_DELIVER)) {
         fail = NULL; /* no pocket involved */
+    } else if (is_work) {
+        fail = (t->pre_pockets[t->slot] != t->item) ? "pocket slot does not hold the handed-in item" : NULL;
     } else if (is_donate || is_sell) {
         fail = (t->pre_pockets[t->slot] != t->item) ? (is_donate ? "pocket slot does not hold the donated item" : "pocket slot does not hold the sold item") : NULL;
     } else {
@@ -17518,7 +17776,29 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     memcpy(post, t->pre_pockets, sizeof(post));
     post_conds = t->pre_conds;
     post_wallet = t->pre_wallet;
-    if (is_restock) {
+    if (is_work) {
+        /* The HOST decides everything from ITS work record of the bound character (never from the connection): the client only names the op, the job it believes it is
+         * finishing and the item it hands in. Nothing is mutated here. */
+        work = pcnetgame_work_find(&st->bound_pid, 1);
+        if (work == NULL) {
+            fail = "the host work table is full";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+        } else if (t->aux_cond == (uint8_t)PC_WORK_OP_DELIVER) {
+            fail_reason = pcnetgame_work_check_deliver(work, t->aux_item, t->item, &fail);
+            if (fail_reason == 0) {
+                fail = NULL;
+                work_reward = work->reward;
+                if (post_wallet + work_reward > (uint32_t)mPr_WALLET_MAX) {
+                    fail = "the reward does not fit into the wallet (the job stays active)";
+                    fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_WORK_WALLET_FULL;
+                } else {
+                    post[t->slot] = (uint16_t)EMPTY_NO;
+                    post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+                    post_wallet += work_reward;
+                }
+            }
+        }
+    } else if (is_restock) {
         /* The HOST decides: a running restock refuses (nothing charged), the price is the host constant, the wallet (pre-image, validated against the lineage above) must cover it. */
         if (s_restock.active) {
             fail = "the shop is already restocking";
@@ -17605,12 +17885,16 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
         fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_WORLD_CHANGED;
     }
     if (fail != NULL) {
+        if (is_work) {
+            printf("[NET][WORK] host: peer %d WORK op %u REFUSED (%s): %s\n", (int)peer, (unsigned)t->aux_cond, pcnetgame_txn_reason_name(fail_reason), fail);
+            pcnetgame_work_send_state(peer, &st->bound_pid, in->request_id);
+        }
         pcnetgame_txn_reject(peer, idx, slot, in, hash, fail_reason, 1, NULL, fail);
         return; /* RESULT sent; nothing mutated */
     }
 
     /* 9. post-image in locals (pre-image plus the delta), validated BEFORE anything is mutated */
-    if (!is_shop && !is_restock) {
+    if (!is_shop && !is_restock && !is_work) {
         if (is_donate) {
             post[t->slot] = (uint16_t)EMPTY_NO;
         } else {
@@ -17625,7 +17909,16 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 10. THE host-side service commit (the only writer of museum_display / police_box / the shop stock in this handler path) */
-    if (is_restock) {
+    if (is_work) {
+        if (t->aux_cond == (uint8_t)PC_WORK_OP_ENTER) {
+            pcnetgame_work_enter(work);
+        } else if (t->aux_cond == (uint8_t)PC_WORK_OP_LEAVE) {
+            work->mode_on = 0;
+        } else {
+            pcnetgame_work_commit_deliver(work); /* the job is retired + tombstoned in the SAME step the reward is decided */
+        }
+        pcnetgame_work_save(); /* durable BEFORE the result: a host restart after the reward can never offer the same job again */
+    } else if (is_restock) {
         if (!pcnetgame_restock_start("a peer's payment")) { /* cannot happen after the check above (single-threaded); never charge for it */
             pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_RESTOCKING, 1, NULL, "the shop is already restocking");
             return;
@@ -17670,11 +17963,17 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
     PC_LOG_RL(PCL_TOWNSVC, 8, 64, "host town-service txn committed: peer %d svc %d kind %u rev %u\n", (int)peer, svc, (unsigned)in->kind,
               (unsigned)slot->rev);
+    if (is_work) {
+        printf("[NET][WORK] host: peer %d resident %d WORK op %u committed: job_id=%u mode=%u state=%u reward=%u wallet %u -> %u jobs_done=%u [TXN]\n", (int)peer, idx, (unsigned)t->aux_cond,
+               (unsigned)work->job_id, (unsigned)work->mode_on, (unsigned)work->state, (unsigned)work_reward, (unsigned)t->pre_wallet, (unsigned)post_wallet, (unsigned)work->jobs_done);
+    }
     if (is_shop) {
         PC_LOG_RL(PCL_SHOP, 8, 64, "host shop %s committed: peer %d resident %d wallet %u -> %u\n", is_buy ? "buy" : "sell", (int)peer, idx,
                   (unsigned)t->pre_wallet, (unsigned)post_wallet);
     }
-    pcnetgame_ts_refresh(svc); /* the seq the RESULT echoes */
+    if (!is_work) {
+        pcnetgame_ts_refresh(svc); /* the seq the RESULT echoes */
+    }
     if (is_restock) {
         printf("[NET][RESTOCK] host: peer %d resident %d SHOP_RESTOCK paid %u: wallet %u -> %u, restock %u started [TXN]\n", (int)peer, idx, (unsigned)PC_NETGAME_RESTOCK_PRICE,
                (unsigned)t->pre_wallet, (unsigned)post_wallet, (unsigned)s_restock.gen);
@@ -17700,10 +17999,15 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
         return; /* FAULT: no result by design */
     }
     /* 13. the RESULT first, then the service mirror to EVERY ready peer (the requester gets it right after its APPLIED) */
+    if (is_work) {
+        pcnetgame_work_send_state(peer, &st->bound_pid, in->request_id); /* reliable + ordered: the job state is in the client's hands when the RESULT arrives */
+    }
     s_txn_svc_echo = (uint16_t)s_ts_host[svc].seq;
     pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
     s_txn_svc_echo = 0;
-    pcnetgame_host_ts_push_all();
+    if (!is_work) {
+        pcnetgame_host_ts_push_all(); /* a work op changes no service: nothing to mirror to the other peers */
+    }
     /* 14. a push in flight carries the PRE-transaction pockets: restart it so the client never adopts a stale image */
     if (st->rec_push_active) {
         pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);
@@ -21668,7 +21972,8 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* town services: no reservation to release; the UI seam learns "rejected" */
-    } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
+    } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* guest-first town: nothing was sent, the seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
@@ -21696,7 +22001,8 @@ static int pcnetgame_txn_try_send(void) {
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL ||
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE;
-    const int is_house = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK; /* guest-first town / shop restock: a TXN_COMMIT kind too (no pocket) */
+    const int is_house = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
+                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK; /* guest-first town / shop restock: a TXN_COMMIT kind too (no pocket) */
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -21829,6 +22135,13 @@ static int pcnetgame_txn_try_send(void) {
             aux_item = T->ts_aux_item;
             break;
         }
+        case PC_NETGAME_TXN_KIND_WORK: /* Nook Work Mode: the op as aux_cond, the job id (low 16 bits) as aux_item; DELIVER carries the pocket slot + item (T->slot / T->item) */
+            dest = (uint8_t)PC_NETGAME_TXN_DEST_NONE;
+            slot = T->slot;
+            item = T->item;
+            aux_cond = T->ts_aux;
+            aux_item = T->ts_aux_item;
+            break;
         case PC_NETGAME_TXN_KIND_SHOP_RESTOCK: /* same shape: no pocket slot, no item, the price the player was shown as aux_item */
         case PC_NETGAME_TXN_KIND_HOUSE_PURCHASE:
             /* guest-first town: no pocket slot, no item; the requested house (or auto) travels as aux_cond, the price the player was shown as aux_item. The wallet is
@@ -22199,6 +22512,85 @@ static int pcnetgame_txn_apply_house(const PCNetGameClientTxn* T, const PCNetGam
     return 1;
 }
 
+/* ---- Nook Work Mode, client half 1: the mirror of the character's job (written ONLY by the host's WORK_STATE) and the APPLIED apply ---- */
+typedef struct PCNetWorkMirror {
+    uint8_t  valid, mode_on, state, job_type;
+    uint32_t job_id, reward, jobs_done, last_rewarded;
+    uint16_t obj_item, obj_count;
+    uint32_t last_request_id;
+} PCNetWorkMirror;
+static PCNetWorkMirror s_work_c;
+
+static void pcnetgame_handle_client_work_state(const PCNetGameWorkStateMsg* in) {
+    if (s_client_link != PC_NETGAME_LINK_READY || in->state > (uint8_t)PC_WORK_STATE_ACTIVE || in->job_type > (uint8_t)PC_WORK_JOB_MAX || (in->flags & ~1u) != 0 ||
+        in->obj_count > 99u) {
+        return;
+    }
+    s_work_c.valid = 1;
+    s_work_c.mode_on = (uint8_t)(in->flags & 1u);
+    s_work_c.state = in->state;
+    s_work_c.job_type = in->job_type;
+    s_work_c.job_id = in->job_id;
+    s_work_c.reward = in->reward;
+    s_work_c.jobs_done = in->jobs_done;
+    s_work_c.last_rewarded = in->last_rewarded;
+    s_work_c.obj_item = in->obj_item;
+    s_work_c.obj_count = in->obj_count;
+    s_work_c.last_request_id = in->request_id;
+    printf("[NET][WORK] client: job state from the host: mode=%u state=%u job_id=%u item=0x%04X reward=%u done=%u (request %u)\n", (unsigned)s_work_c.mode_on,
+           (unsigned)s_work_c.state, (unsigned)s_work_c.job_id, (unsigned)s_work_c.obj_item, (unsigned)s_work_c.reward, (unsigned)s_work_c.jobs_done,
+           (unsigned)in->request_id);
+}
+
+/* APPLIED of a WORK op. ENTER / LEAVE change nothing locally (the job lives on the host and arrives as WORK_STATE). DELIVER: the host consumed the handed-in item and paid the
+ * reward: the local pockets / wallet take the HOST's post-image (validated), or, when the local inventory moved during the round trip, only what the transaction touched. */
+static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+    const PCNetGameTxnTag* t = &T->tag;
+    Private_c* np = Now_Private;
+    int i, same = 1, s;
+    uint32_t reward;
+    if (in->host_session == s_crec.base_session && in->epoch == s_crec.base_epoch && in->rev > s_crec.base_rev) {
+        pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
+        s_crec.next_check_ms = 0;
+    }
+    if (t->aux_cond != (uint8_t)PC_WORK_OP_DELIVER) {
+        printf("[NET][WORK] client: work op %u APPLIED (request %u)\n", (unsigned)t->aux_cond, (unsigned)T->request_id);
+        return 1;
+    }
+    if (np == NULL || t->slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT || in->post_pockets[t->slot] != (uint16_t)EMPTY_NO || in->post_wallet > (uint32_t)mPr_WALLET_MAX ||
+        in->post_wallet < t->pre_wallet) {
+        printf("[NET][WORK] client: *** APPLIED DELIVER for request %u carries an inconsistent post-image -- nothing applied (the host record is the truth) ***\n",
+               (unsigned)T->request_id);
+        return 0;
+    }
+    reward = in->post_wallet - t->pre_wallet;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if ((uint16_t)np->inventory.pockets[i] != t->pre_pockets[i]) {
+            same = 0;
+        }
+    }
+    if (np->inventory.item_conditions != t->pre_conds || np->inventory.wallet != t->pre_wallet) {
+        same = 0;
+    }
+    if (same) {
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            np->inventory.pockets[i] = (mActor_name_t)in->post_pockets[i];
+        }
+        np->inventory.item_conditions = in->post_conds;
+        np->inventory.wallet = in->post_wallet;
+    } else {
+        s = (np->inventory.pockets[t->slot] == (mActor_name_t)t->item) ? (int)t->slot : mPr_GetPossessionItemIdx(np, (mActor_name_t)t->item);
+        if (s >= 0) {
+            np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;
+            np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_NORMAL);
+        }
+        np->inventory.wallet = (np->inventory.wallet + reward > (u32)mPr_WALLET_MAX) ? (u32)mPr_WALLET_MAX : np->inventory.wallet + reward;
+    }
+    printf("[NET][WORK] client: DELIVER APPLIED (request %u): item 0x%04X handed in, reward %u Bells, wallet now %u (%s)\n", (unsigned)T->request_id, (unsigned)t->item,
+           (unsigned)reward, (unsigned)np->inventory.wallet, same ? "host post-image" : "delta");
+    return 1;
+}
+
 /* APPLIED of a SHOP_RESTOCK: the host debited exactly PC_NETGAME_RESTOCK_PRICE; locally only the wallet changes, to the HOST's post-image (validated: post + price == pre). */
 static int pcnetgame_txn_apply_restock(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
     const PCNetGameTxnTag* t = &T->tag;
@@ -22243,6 +22635,9 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
         return pcnetgame_txn_apply_restock(T, in); /* only the wallet changes */
+    }
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK) {
+        return pcnetgame_txn_apply_work(T, in); /* Nook Work Mode: ENTER / LEAVE change nothing locally, DELIVER takes the item and pays the reward */
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE) {
         return pcnetgame_txn_apply_house(T, in); /* guest-first town: only the wallet changes (the pockets are untouched) */
@@ -23727,6 +24122,161 @@ int pc_net_game_restock_begin(void) {
     return 1;
 }
 /* ===== RESTOCK CLIENT END ===== */
+
+/* ===== WORK CLIENT BEGIN: Nook Work Mode, the dialogue seam (ac_npc_shop_common.c; the HOST decides everything) =====
+ *   pc_net_game_work_offer_available()  1 = the "I'd like to work." choice is offered: the host's own player (world ready), or a READY client.
+ *   pc_net_game_work_info(...)          the character's job as the host last told us (host role: its own table); 0 = unknown yet. *state 0 none / 1 active.
+ *   pc_net_game_work_begin(op)          op 1 ENTER (start Work Mode, receive / resume the job), 2 DELIVER (hand in the objective item), 3 LEAVE (leave Work Mode).
+ *                                       HOST role: runs the host rules on the host player's own record at once, returns 3 (done) or 0 (refused: pc_net_game_ts_last_reject_reason()).
+ *                                       CLIENT: 1 = request sent (poll pc_net_game_ts_poll()), 0 = refused locally, -1 = busy, retry next frame. */
+int pc_net_game_work_offer_available(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return s_host_world_ready && Now_Private != NULL;
+    }
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && Now_Private != NULL;
+}
+
+int pc_net_game_work_info(unsigned* job_id, int* obj_item, unsigned* reward, int* state, int* mode_on, unsigned* jobs_done) {
+    const PCNetWorkChar* w;
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        if (Now_Private == NULL || (w = pcnetgame_work_find(&Now_Private->player_ID, 0)) == NULL) {
+            return 0;
+        }
+        *job_id = w->job_id;
+        *obj_item = (int)w->obj_item;
+        *reward = w->reward;
+        *state = (int)w->state;
+        *mode_on = (int)w->mode_on;
+        *jobs_done = w->jobs_done;
+        return 1;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !s_work_c.valid) {
+        return 0;
+    }
+    *job_id = s_work_c.job_id;
+    *obj_item = (int)s_work_c.obj_item;
+    *reward = s_work_c.reward;
+    *state = (int)s_work_c.state;
+    *mode_on = (int)s_work_c.mode_on;
+    *jobs_done = s_work_c.jobs_done;
+    return 1;
+}
+
+/* the first pocket slot holding `item`, or -1 */
+static int pcnetgame_work_find_pocket(uint16_t item) {
+    int i;
+    if (Now_Private == NULL) {
+        return -1;
+    }
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if ((uint16_t)Now_Private->inventory.pockets[i] == item) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* HOST role: the host's own player works through the same record rules (no wire, no journal: nothing can be duplicated in one process). */
+static int pcnetgame_work_host_local(int op) {
+    PCNetWorkChar* w = pcnetgame_work_find(&Now_Private->player_ID, 1);
+    const char* why = NULL;
+    uint8_t reason;
+    int s;
+    if (w == NULL) {
+        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+        return 0;
+    }
+    if (op == PC_WORK_OP_ENTER) {
+        pcnetgame_work_enter(w);
+    } else if (op == PC_WORK_OP_LEAVE) {
+        w->mode_on = 0;
+    } else {
+        reason = pcnetgame_work_check_deliver(w, (uint16_t)(w->job_id & 0xFFFFu), w->obj_item, &why);
+        s = pcnetgame_work_find_pocket(w->obj_item);
+        if (reason == 0 && s < 0) {
+            reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            why = "the pockets do not hold the job item";
+        }
+        if (reason == 0 && Now_Private->inventory.wallet + w->reward > (u32)mPr_WALLET_MAX) {
+            reason = (uint8_t)PC_NETGAME_TXN_REASON_WORK_WALLET_FULL;
+            why = "the wallet cannot hold the reward";
+        }
+        if (reason != 0) {
+            printf("[NET][WORK] host: the host player's DELIVER is refused: %s\n", why);
+            s_ts_last_reason = reason;
+            return 0;
+        }
+        Now_Private->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;
+        Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, s, mPr_ITEM_COND_NORMAL);
+        Now_Private->inventory.wallet += w->reward;
+        pcnetgame_work_commit_deliver(w);
+        printf("[NET][WORK] host: the host player delivered job %u: reward %u Bells, wallet now %u\n", (unsigned)w->last_rewarded, (unsigned)w->reward,
+               (unsigned)Now_Private->inventory.wallet);
+    }
+    pcnetgame_work_save();
+    return 3;
+}
+
+int pc_net_game_work_begin(int op) {
+    PCNetGameOwnerStamp stamp;
+    const uint8_t kind = (uint8_t)PC_NETGAME_TXN_KIND_WORK;
+    int slot = 0;
+    uint16_t item = 0, jid = 0;
+    if (!pc_net_game_work_offer_available() || (op != PC_WORK_OP_ENTER && op != PC_WORK_OP_DELIVER && op != PC_WORK_OP_LEAVE)) {
+        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+        return 0;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        s_ts_last_reason = 0;
+        return pcnetgame_work_host_local(op);
+    }
+    if (s_ts_op.active && s_ts_op.done) {
+        memset(&s_ts_op, 0, sizeof(s_ts_op)); /* the unconsumed result of an abandoned dialogue */
+    }
+    if (s_ts_op.active || pcnetgame_txn_begin_blocked() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return -1;
+    }
+    s_ts_last_reason = 0;
+    if (op == PC_WORK_OP_DELIVER) {
+        if (!s_work_c.valid || s_work_c.state != (uint8_t)PC_WORK_STATE_ACTIVE) {
+            s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_WORK_NO_JOB;
+            return 0;
+        }
+        slot = pcnetgame_work_find_pocket(s_work_c.obj_item);
+        if (slot < 0) {
+            s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND; /* nothing to hand in: nothing is sent */
+            return 0;
+        }
+        item = s_work_c.obj_item;
+        jid = (uint16_t)(s_work_c.job_id & 0xFFFFu);
+    }
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+        return 0;
+    }
+    s_ts_op.active = 1;
+    s_ts_op.kind = kind;
+    s_ts_op.slot = (uint8_t)slot;
+    s_ts_op.aux = (uint8_t)op;
+    s_ts_op.item = item;
+    s_ts_op.aux_item = jid;
+    s_ts_op.request_id = s_ts_next_rid++;
+    memset(&s_ctxn, 0, sizeof(s_ctxn));
+    s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
+    s_ctxn.kind = kind;
+    s_ctxn.slot = (uint8_t)slot;
+    s_ctxn.item = item;
+    s_ctxn.ts_aux = (uint8_t)op;
+    s_ctxn.ts_aux_item = jid;
+    s_ctxn.request_id = s_ts_op.request_id;
+    s_ctxn.owner = stamp;
+    s_ctxn.first_ms = pcnetgame_now_ms();
+    printf("[NET][WORK] client: begin WORK op=%d request=%u slot=%d item=0x%04X job=%u\n", op, (unsigned)s_ts_op.request_id, slot, (unsigned)item, (unsigned)jid);
+    (void)pcnetgame_txn_try_send();
+    return 1;
+}
+/* ===== WORK CLIENT END ===== */
+
 
 /* ===== MAIL CLIENT BEGIN: mail milestone 1 -- the client half of a letter to a PLAYER (TXN_COMMIT kind 12) =====
  * Seam: ac_npc_post_girl.c_inc (aPG_check_destination / aPG_receive_menu_close_wait). The vanilla send path hands the letter to the post girl and,
@@ -25759,8 +26309,8 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
             pcnetgame_handle_host_house_purchase_txn(peer, &tc); /* guest-first town: a GUEST pays for a house and becomes a resident (kind 14, never the X1 handler) */
             return;
         }
-        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK) {
-            pcnetgame_handle_host_ts_txn(peer, &tc); /* Nook's manual restock (kind 15): the same one-phase town-service handler */
+        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK) {
+            pcnetgame_handle_host_ts_txn(peer, &tc); /* Nook's manual restock (kind 15) / Work Mode (kind 16): the same one-phase town-service handler */
             return;
         }
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
@@ -26490,6 +27040,14 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == sizeof(PCNetGameWorkStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_WORK_STATE) {
+        PCNetGameWorkStateMsg ws;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&ws, data, sizeof(ws));
+        pcnetgame_handle_client_work_state(&ws);
+        return;
+    }
+
     if (size == sizeof(PCNetGameRoomNpcMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ROOM_NPC) {
         PCNetGameRoomNpcMsg rn;
         if (s_client_link != PC_NETGAME_LINK_READY) return;
@@ -26755,6 +27313,7 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_bury_pending, 0, sizeof(s_bury_pending));
     memset(&s_ctxn, 0, sizeof(s_ctxn)); /* X1b: the transaction in flight dies with the session (no orphan retention in X1); s_txn_nonce / s_txn_next_seq are PROCESS-wide and deliberately NOT reset */
     s_next_bury_request_id = 1;
+    memset(&s_work_c, 0, sizeof(s_work_c));  /* Nook Work Mode: the mirror of the job dies with the session (the host record is the truth and comes back with the next op) */
     memset(&s_ts_op, 0, sizeof(s_ts_op)); /* town services: the UI operation and the mirror's seq memory die with the session (the host's seq restarts per process) */
     s_ts_last_reason = 0;
     memset(&s_mail_op, 0, sizeof(s_mail_op)); /* mail milestone 1: the post girl's operation dies with the session (a local refusal) */
@@ -33158,6 +33717,7 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     old_g = s_guest[g];
     old_rec = s_guest_rec[g];
     old_grs = s_rec_slot[PLAYER_NUM + g];
+    pcnetgame_work_rekey(&old_g.key, &Save_Get(private_data)[s].player_ID); /* Nook Work Mode: the character keeps its job under its new resident PID */
     memset(&s_guest[g], 0, sizeof(s_guest[g]));
     memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
     memset(&s_rec_slot[PLAYER_NUM + g], 0, sizeof(s_rec_slot[0]));

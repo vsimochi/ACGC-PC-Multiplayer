@@ -7,6 +7,7 @@
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES */
 #include "pc_platform.h"  /* SDL_GetTicks: the rejoin hold heartbeat runs on the wall clock */
 #include "m_msg_data.h"
+#include "m_name_table.h" /* ITM_FOOD_*: the Work Mode objective names */
 
 /* control code bytes (tools/msg_tool.py COMMANDS / CONT_SIZES; include/m_font.h mFont_CONT_CODE_*) */
 #define NK_CC 0x7F
@@ -39,6 +40,8 @@
 static int s_pick[PC_RESIDENCE_HOUSES];
 static int s_pick_n = 0;
 static int s_confirm = -1;
+static int s_work_item = 0;
+static unsigned s_work_reward = 0;
 
 typedef struct {
     unsigned char* d;
@@ -185,6 +188,22 @@ void pc_nook_house_set_confirm(int house_or_auto) {
     s_confirm = house_or_auto;
 }
 
+void pc_nook_house_set_work(int item, unsigned reward) {
+    s_work_item = item;
+    s_work_reward = reward;
+}
+
+static const char* nk_work_item_name(void) {
+    switch (s_work_item) {
+        case ITM_FOOD_APPLE: return "an apple";
+        case ITM_FOOD_CHERRY: return "a cherry";
+        case ITM_FOOD_PEAR: return "a pear";
+        case ITM_FOOD_PEACH: return "a peach";
+        case ITM_FOOD_ORANGE: return "an orange";
+        default: return "the item";
+    }
+}
+
 int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
     NkBuf b;
     char price[16], tmp[96];
@@ -218,7 +237,7 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "As far as other things go,\nthis is all I have to offer.");
             ids[0] = NK_SEL_TURNIPS;
             ids[1] = NK_SEL_HEARCODE;
-            ids[2] = NK_SEL_SAYCODE;
+            ids[2] = PC_NOOK_SEL_WORK; /* the 6 choices of the window are full: "Say code" gives its place to "I'd like to work" for a guest */
             ids[3] = PC_NOOK_SEL_BUY_HOUSE;
             ids[4] = PC_NOOK_SEL_REFRESH;
             ids[5] = NK_SEL_HANGON;
@@ -230,8 +249,9 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             ids[1] = NK_SEL_HEARCODE;
             ids[2] = NK_SEL_SAYCODE;
             ids[3] = PC_NOOK_SEL_REFRESH;
-            ids[4] = NK_SEL_HANGON;
-            nk_choice(&b, ids, 5);
+            ids[4] = PC_NOOK_SEL_WORK;
+            ids[5] = NK_SEL_HANGON;
+            nk_choice(&b, ids, 6);
             break;
         case PC_NOOK_MSG_RESTOCK_ASK:
             nk_text(&b, "A fresh set of goods,");
@@ -299,6 +319,75 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "I cannot say whether it");
             nk_pause(&b, 6);
             nk_text(&b, "\nwent through. Please check\nyour wallet, then ask me!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_JOB:
+            nk_text(&b, "Oh, you want to work, hm?");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nSplendid! Here is the job.");
+            nk_page(&b);
+            nk_text(&b, "Bring me ");
+            nk_text(&b, nk_work_item_name());
+            nk_text(&b, ".");
+            nk_pause(&b, 6);
+            snprintf(tmp, sizeof(tmp), "\nI'll pay %u Bells for it.", s_work_reward);
+            nk_text(&b, tmp);
+            nk_page(&b);
+            nk_text(&b, "Do you have it?");
+            ids[0] = PC_NOOK_SEL_WORK_HERE;
+            ids[1] = PC_NOOK_SEL_WORK_LATER;
+            ids[2] = PC_NOOK_SEL_WORK_LEAVE;
+            nk_choice(&b, ids, 3);
+            break;
+        case PC_NOOK_MSG_WORK_DONE:
+            nk_text(&b, "Excellent! Just what I");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nneeded.");
+            nk_page(&b);
+            snprintf(tmp, sizeof(tmp), "Here are your %u Bells.", s_work_reward);
+            nk_text(&b, tmp);
+            nk_pause(&b, 6);
+            nk_text(&b, "\nCome back any time for\nmore work!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_NOITEM:
+            nk_text(&b, "Hm? You do not have ");
+            nk_text(&b, nk_work_item_name());
+            nk_text(&b, ",");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nnot yet. Come back when\nyou do!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_LATER:
+            nk_text(&b, "Very well. Come back with");
+            nk_pause(&b, 6);
+            nk_text(&b, "\n");
+            nk_text(&b, nk_work_item_name());
+            nk_text(&b, ", hm?");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_LEFT:
+            nk_text(&b, "All right, no more work");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nfor now. Thank you for\nyour help!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_FAILED:
+            nk_text(&b, "Hm, something is off with");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nthe job. Nothing was lost.\nPlease ask me again.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_LINKLOST:
+            nk_text(&b, "The line went quiet.");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nI cannot say if the work\nwas recorded. Ask me again.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_FULL:
+            nk_text(&b, "Your wallet is full!");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nSpend some Bells and come\nback, hm?");
             nk_code(&b, NK_END);
             break;
         case PC_NOOK_MSG_RESTOCK_DOOR:
@@ -442,6 +531,18 @@ int pc_nook_sel_build(int id, unsigned char* dst16) {
         case PC_NOOK_SEL_REFRESH:
             snprintf(tmp, sizeof(tmp), "Refresh shop.");
             break;
+        case PC_NOOK_SEL_WORK:
+            snprintf(tmp, sizeof(tmp), "I'd like to work"); /* the choice string window holds 16 characters: no room for the final period */
+            break;
+        case PC_NOOK_SEL_WORK_HERE:
+            snprintf(tmp, sizeof(tmp), "Here it is!");
+            break;
+        case PC_NOOK_SEL_WORK_LATER:
+            snprintf(tmp, sizeof(tmp), "I'll fetch it.");
+            break;
+        case PC_NOOK_SEL_WORK_LEAVE:
+            snprintf(tmp, sizeof(tmp), "I'm done working");
+            break;
         default:
             snprintf(tmp, sizeof(tmp), "House %d.", id - PC_NOOK_SEL_HOUSE1 + 1);
             break;
@@ -462,6 +563,7 @@ int pc_nook_house_selftest(void) {
     int which, i, bad = 0, h4[PC_RESIDENCE_HOUSES] = { 0, 1, 2, 3 };
     pc_nook_house_set_pick(h4, PC_RESIDENCE_HOUSES);
     pc_nook_house_set_confirm(2);
+    pc_nook_house_set_work(ITM_FOOD_PEACH, 400u);
     for (which = 0; which < PC_NOOK_MSG_COUNT; which++) {
         int n = pc_nook_msg_build(MSG_MAX + which, buf, sizeof(buf)), last_ok;
         if (n < 2) {

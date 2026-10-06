@@ -670,6 +670,10 @@ int pc_net_game_ts_poll(void);
  *   pc_net_game_ts_last_reject_reason(): the host's PC_NETGAME_TS_REJECT_* reason of the last REJECTED result (0 = a local refusal / none). */
 #define PC_NETGAME_TS_REJECT_NOT_AVAILABLE   16
 #define PC_NETGAME_TS_REJECT_NO_FUNDS        19
+#define PC_NETGAME_TS_REJECT_PRECOND         9
+#define PC_NETGAME_TS_REJECT_WORK_NO_JOB     33 /* Nook Work Mode: no active job (nothing changed) */
+#define PC_NETGAME_TS_REJECT_WORK_STALE_JOB  34 /* the completion names another job than the current one */
+#define PC_NETGAME_TS_REJECT_WORK_WALLET_FULL 35 /* the reward would overflow the wallet: the job stays */
 #define PC_NETGAME_TS_REJECT_RESTOCKING      31 /* shop restock: a restock is already running (nothing charged) */
 #define PC_NETGAME_TS_REJECT_NOT_SELLABLE    20
 #define PC_NETGAME_TS_REJECT_PRICE_MISMATCH  21

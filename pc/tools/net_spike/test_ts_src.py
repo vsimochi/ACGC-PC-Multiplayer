@@ -81,7 +81,7 @@ def main():
     check("W ids: 53 / 54 are ENUMERATED reserved ids (X2), 55 = TOWN_SVC_STATE, 56 = MAILBOX_LETTER (mail milestone 2), all ids contiguous 1..%d" % wire_baseline.EXPECTED_MAX_MSG_ID,
           ids.get("PC_NETGAME_MSG_TXN_RESERVED_53") == 53 and ids.get("PC_NETGAME_MSG_TXN_RESERVED_54") == 54 and ids.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and ids.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56 and ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58
-          and sorted(ids.values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID == 66)
+          and sorted(ids.values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID == 68)
     check("W PCNetGameTownSvcStateMsg: u8 type, u8 service, u16 len, u32 seq, u32 digest, blob[PC_NETGAME_TS_BLOB_MAX]; sizeof == 352 (12 + 340), offsets 4 / 8 / 12, "
           "<= PC_NET_MAX_PAYLOAD, blobs fit (40, 63, the 320-byte shop)",
           "_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352," in c_raw and "offsetof(PCNetGameTownSvcStateMsg, blob) == 12" in c_raw
@@ -168,7 +168,7 @@ def main():
              "pcnetgame_shop_sell_plan(t->pre_pockets", "mMmd_GetDisplayInfo(", "PC_TXN_FAULT_FAIL_WORLD",
              "pcnetgame_rec_validate_inventory(post, post_conds", "mSP_PlusSales(shop_price);", "mSP_ShopSaleReport(", "mMmd_RequestMuseumDisplay(", "mPB_copy_itemBuf(", "pcnetgame_rec_txn_write_inventory(idx, post", "slot->rev++;",
              "slot->dirty_unsaved = 1;", "R->last_pocket_rev = slot->rev;", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED", "pcnetgame_ts_refresh(svc);",
-             "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE", "pcnetgame_host_ts_push_all();\n    /* 14.",
+             "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE", "pcnetgame_host_ts_push_all(); /* a work op changes no service: nothing to mirror to the other peers */\n    }\n    /* 14.",
              "pcnetgame_rec_start_push(peer, idx, st->rec_push_kind)"]
     ok, miss = in_order(ts_raw, order)
     check("H the algorithm steps appear in order: READY gate, fault, binding gate, SYNCED / world ready, shape, journal (fence / replay / max_seq), base, pre-image, service validation, "

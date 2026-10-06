@@ -1394,3 +1394,16 @@ A villager standing in its own house is a NPC2 actor (`ac_npc2_move.c_inc`) that
 - Not synchronized (unchanged): dialogue, choices, interaction scripts, a villager in a local talk state (never overridden), whether the villager is home (relies on the existing NPC_STATE `is_home` stream), room furniture of the villager.
 
 Test: `tools/net_spike/test_room_npc_protocol.py` (real host + scripted clients; actor hooks only source-audited, no two-process visual verification).
+
+## Nook Work Mode foundation (Patch 3)
+
+"I'd like to work" (Nook's shop, Other things) for **every** player: resident, guest and the host's own player. The job belongs to the **character** (the bound PersonalID of the resident / guest record), never to the connection, peer slot, address or a PID alone; the **host** owns it.
+
+- `TXN_COMMIT` kind **16 WORK** (the same one-phase machinery, journal replay and pre/post images as the shop kinds): `aux_cond` = op (1 ENTER, 2 DELIVER, 3 LEAVE), `aux_item` = the low 16 bits of the job id the client believes it is completing, `slot`/`item` = the pocket slot and objective item for DELIVER. New reasons 33 WORK_NO_JOB, 34 WORK_STALE_JOB, 35 WORK_WALLET_FULL.
+- `WORK_STATE` (id 68, host -> the requesting client, reliable, 28 B) carries the job exactly as the host holds it (mode, state, job_id, objective, reward, jobs_done, last_rewarded), sent right **before** every WORK result (any outcome). The client only mirrors it.
+- Host job table (`work_jobs.dat` next to the other host files, `servers/<id>/` on a dedicated server): host-generated, never reused job ids (counter persisted, never 0 mod 65536), job type table (`s_work_defs`: one row = one job type; today a delivery of one fruit, 300-600 Bells), per-character record, fnv-checked file written **before** the result is sent. ENTER creates or resumes the job (idempotent), LEAVE keeps an active job, DELIVER checks Work Mode + ACTIVE job + job id + objective item + wallet cap and, in one step, empties the pocket slot, pays the host reward, retires the job and writes the tombstone `last_rewarded`.
+- Duplicate-reward protection: journal replay of the same (nonce, seq), retired job (WORK_NO_JOB) for a new sequence number, stale job id (WORK_STALE_JOB), tombstone across a host restart. A guest that buys a house keeps its record (re-keyed in the shared promotion core).
+- Nook dialogue: "I'd like to work" in the Other things menu (the 6-choice window is full for a guest: "Say code" gives its place to it there; the choice string window holds 16 characters, so no final period), job row ("Bring me an apple ... I'll pay N Bells"), Here it is! / I'll fetch it. / I'm done working.
+- Not done (by design): any job type besides the fruit delivery, job timeouts / expiry, per-job NPC state, WORK_STATE push at connect time (the state arrives with every op; ENTER is the query), the host player's work state is not mirrored to other peers.
+
+Test: `tools/net_spike/test_work_mode_protocol.py` (real host + scripted resident / guest clients, host restart). The Nook dialogue and the client apply are covered by the build, the message selftest and source audits only: no GUI run.

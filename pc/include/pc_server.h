@@ -13,6 +13,7 @@
  *       backups/                      reserved for authoritative server backups (the guest / member / record files still put their own .bak-<time> copies next to themselves)
  *       logs/server.log               the server's own log (-logfile default for a dedicated host, plus the [DEDICATED] notices)
  *       shop_restock.ini              the running manual shop restock (host restart resume)
+ *       work_jobs.dat                 Nook Work Mode: one job record per character (host-owned)
  *
  * SERVER IDENTITY is the directory name <server-id> ([A-Za-z0-9_-], 1..32, always "default" for now: one server id = one persistent town, no command-line option): it is stable and says nothing about the town. The TOWN identity is the
  * game's own PCTownId (land_name, land_id, terrain_hash; its text form is the townkey) and lives in server.ini [town]; the townkey is NOT the directory name. The same PCTownId /
@@ -54,6 +55,7 @@ const char* pc_server_guests_path(void);
 const char* pc_server_members_path(void);
 const char* pc_server_records_path(void);
 const char* pc_server_restock_path(void);
+const char* pc_server_work_path(void); /* Nook Work Mode: the host-owned job table (work_jobs.dat) */
 
 /* The NAME of a town this server is about to generate (first launch only). The dedicated console asks for it (pc_dedicated.c pc_dedicated_prompt_town_name) and hands it to the
  * game's own new-town initialiser. The game's town-name field takes 1..8 characters of the keyboard editor's charset (pc_typing.c pc_utf8_to_game_code: letters, digits and the

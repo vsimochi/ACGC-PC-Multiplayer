@@ -36,7 +36,7 @@ static char s_dir[PS_PATH];
 static char s_town_dir[PS_PATH];
 static char s_ini[PS_PATH + 16];
 static char s_log[PS_PATH + 16];
-static char s_guests[PS_PATH + 32], s_members[PS_PATH + 32], s_records[PS_PATH + 32], s_restock[PS_PATH + 32];
+static char s_guests[PS_PATH + 32], s_members[PS_PATH + 32], s_records[PS_PATH + 32], s_restock[PS_PATH + 32], s_work[PS_PATH + 32];
 static PSIni s_cfg;
 static char s_server_name[48];
 static unsigned s_port = 0;
@@ -259,6 +259,7 @@ int pc_server_open(const char* id, uint16_t port, char* err, size_t errcap) {
     snprintf(s_members, sizeof(s_members), "%s/residents/members.dat", s_dir);
     snprintf(s_records, sizeof(s_records), "%s/residents/records.dat", s_dir);
     snprintf(s_restock, sizeof(s_restock), "%s/shop_restock.ini", s_dir);
+    snprintf(s_work, sizeof(s_work), "%s/work_jobs.dat", s_dir);
 
     had_ini = ps_ini_read(s_ini, &ini);
     if (!had_ini) {
@@ -345,6 +346,7 @@ const char* pc_server_guests_path(void) { return s_active ? s_guests : PC_MP_GUE
 const char* pc_server_members_path(void) { return s_active ? s_members : PC_MP_MEMBERS_PATH; }
 const char* pc_server_records_path(void) { return s_active ? s_records : PC_MP_RECORDS_PATH; }
 const char* pc_server_restock_path(void) { return s_active ? s_restock : "save/mp/shop_restock.ini"; }
+const char* pc_server_work_path(void) { return s_active ? s_work : "save/mp/work_jobs.dat"; }
 
 extern int pc_utf8_to_game_code(const char* text); /* pc_typing.c: the game's keyboard-editor charset (-1 = not a valid game character) */
 

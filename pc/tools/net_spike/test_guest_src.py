@@ -118,8 +118,8 @@ def main():
     # ------------------------------------------------------------------------------------------------ W
     ids = dict(wire_baseline.c_message_ids(raw))
     ck("W ids: 57 = IDENTITY_EXT, 58 = IDENTITY_TOKEN, all ids contiguous 1..%d" % wire_baseline.EXPECTED_MAX_MSG_ID,
-       ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58 and wire_baseline.EXPECTED_MAX_MSG_ID == 66
-       and sorted(ids.values()) == list(range(1, 67)))
+       ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58 and wire_baseline.EXPECTED_MAX_MSG_ID == 68
+       and sorted(ids.values()) == list(range(1, 69)))
     ck("W IDENTITY_EXT: exact 42-byte size assert + offsets + <= 64 and <= PC_NET_MAX_PAYLOAD; IDENTITY_TOKEN 20 bytes",
        "_Static_assert(sizeof(PCNetGameIdentityExtMsg) == 42," in raw and "offsetof(PCNetGameIdentityExtMsg, token) == 25" in raw
        and "sizeof(PCNetGameIdentityExtMsg) <= 64 && sizeof(PCNetGameIdentityExtMsg) <= PC_NET_MAX_PAYLOAD" in raw

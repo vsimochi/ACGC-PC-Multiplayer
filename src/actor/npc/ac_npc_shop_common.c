@@ -1778,7 +1778,14 @@ enum {
     aNSC_PC_HS_END,         /* the closing row is showing: wait for the conversation to end */
     aNSC_PC_RS_ASK,         /* manual restock: waiting for Yes./No. of the 500 Bells confirmation */
     aNSC_PC_RS_BEGIN,       /* begin the restock payment (retried while another transaction is unresolved) */
-    aNSC_PC_RS_PENDING      /* the SHOP_RESTOCK transaction is in flight */
+    aNSC_PC_RS_PENDING,     /* the SHOP_RESTOCK transaction is in flight */
+    aNSC_PC_WK_ENTER_BEGIN, /* Work Mode: begin ENTER (start Work Mode, receive or resume the job) */
+    aNSC_PC_WK_ENTER_PENDING,
+    aNSC_PC_WK_ASK,         /* the job row is up: Here it is! / I'll fetch it. / I'm done working. */
+    aNSC_PC_WK_DELIVER_BEGIN,
+    aNSC_PC_WK_DELIVER_PENDING,
+    aNSC_PC_WK_LEAVE_BEGIN,
+    aNSC_PC_WK_LEAVE_PENDING
 };
 
 static int aNSC_pc_hs_state;
@@ -1873,6 +1880,86 @@ static void aNSC_pc_rs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, 
     aNSC_pc_hs_end(shop_common, which, 0);
 }
 
+/* ---- Nook Work Mode ("I'd like to work" under Other things, every player: resident, guest, the host's own player) ----
+ * ENTER (the host creates / resumes the character's job) -> the job row -> "Here it is!" = DELIVER (the host checks the job id + the item, takes it, pays the reward) / "I'll fetch it." /
+ * "I'm done working." = LEAVE. The HOST owns the job (host job_id, per character), the validation and the reward; nothing here is authoritative. */
+static unsigned aNSC_pc_wk_reward;
+static int aNSC_pc_wk_item;
+
+static void aNSC_pc_wk_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, int sent) {
+    int which = PC_NOOK_MSG_WORK_FAILED;
+    if (reason == PC_NETGAME_TS_REJECT_WORK_WALLET_FULL) {
+        which = PC_NOOK_MSG_WORK_FULL;
+    } else if (reason == PC_NETGAME_TS_REJECT_PRECOND && !sent) {
+        which = PC_NOOK_MSG_WORK_NOITEM; /* refused locally: the pockets do not hold the objective */
+    } else if (reason == 0 && sent) {
+        which = PC_NOOK_MSG_WORK_LINKLOST;
+    }
+    printf("[NET][WORK] nook dialogue: work op not done (reason %d) -> row %d\n", reason, which);
+    pc_nook_house_set_work(aNSC_pc_wk_item, aNSC_pc_wk_reward);
+    aNSC_pc_hs_end(shop_common, which, 0);
+}
+
+/* the job row from the character's job as the host last told us */
+static void aNSC_pc_wk_show_job(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    unsigned job_id = 0, reward = 0, done = 0;
+    int item = 0, state = 0, mode_on = 0;
+    if (!pc_net_game_work_info(&job_id, &item, &reward, &state, &mode_on, &done) || state != 1 || !mode_on) {
+        aNSC_pc_wk_fail_row(shop_common, PC_NETGAME_TS_REJECT_WORK_NO_JOB, 1);
+        return;
+    }
+    aNSC_pc_wk_item = item;
+    aNSC_pc_wk_reward = reward;
+    printf("[NET][WORK] nook dialogue: job %u: item 0x%04X for %u Bells\n", job_id, (unsigned)item, reward);
+    pc_nook_house_set_work(item, reward);
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_WORK_JOB);
+    aNSC_pc_hs_state = aNSC_PC_WK_ASK;
+}
+
+static void aNSC_pc_wk_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    printf("[NET][WORK] nook dialogue: 'I'd like to work' chosen\n");
+    if (!pc_net_game_work_offer_available()) {
+        aNSC_pc_wk_fail_row(shop_common, PC_NETGAME_TS_REJECT_PRECOND, 1);
+        return;
+    }
+    aNSC_pc_hs_state = aNSC_PC_WK_ENTER_BEGIN; /* the Other things text stays up until the host answers */
+}
+
+/* one begin step of a work op: BEGIN -> PENDING (client), or done at once (host player) */
+static void aNSC_pc_wk_begin(NPC_SHOP_COMMON_ACTOR* shop_common, int op, int pending_state) {
+    int r = pc_net_game_work_begin(op);
+    if (r < 0) {
+        return; /* another transaction is unresolved: next frame */
+    }
+    if (r == 0) {
+        aNSC_pc_wk_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 0); /* refused locally: nothing was sent */
+    } else if (r == 3) {
+        if (op == 1) {
+            aNSC_pc_wk_show_job(shop_common);
+        } else {
+            pc_nook_house_set_work(aNSC_pc_wk_item, aNSC_pc_wk_reward);
+            aNSC_pc_hs_end(shop_common, op == 2 ? PC_NOOK_MSG_WORK_DONE : PC_NOOK_MSG_WORK_LEFT, 0);
+        }
+    } else {
+        aNSC_pc_hs_state = pending_state;
+    }
+}
+
+static void aNSC_pc_wk_pending(NPC_SHOP_COMMON_ACTOR* shop_common, int op) {
+    int r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return;
+    }
+    if (r != PC_NETGAME_TS_OP_APPLIED) {
+        aNSC_pc_wk_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
+    } else if (op == 1) {
+        aNSC_pc_wk_show_job(shop_common);
+    } else {
+        pc_nook_house_set_work(aNSC_pc_wk_item, aNSC_pc_wk_reward);
+        aNSC_pc_hs_end(shop_common, op == 2 ? PC_NOOK_MSG_WORK_DONE : PC_NOOK_MSG_WORK_LEFT, 0);
+    }
+}
+
 static void aNSC_pc_rs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     int r = pc_net_game_restock_precheck();
     printf("[NET][RESTOCK] nook dialogue: 'Refresh shop.' chosen, precheck=%d\n", r);
@@ -1917,6 +2004,24 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
         pc_nook_house_rejoin_hold_touch(); /* heartbeat: the rejoin hold lives only while this proc runs (PENDING / END) */
     }
     switch (aNSC_pc_hs_state) {
+        case aNSC_PC_WK_ENTER_BEGIN:
+            aNSC_pc_wk_begin(shop_common, 1, aNSC_PC_WK_ENTER_PENDING);
+            break;
+        case aNSC_PC_WK_ENTER_PENDING:
+            aNSC_pc_wk_pending(shop_common, 1);
+            break;
+        case aNSC_PC_WK_DELIVER_BEGIN:
+            aNSC_pc_wk_begin(shop_common, 2, aNSC_PC_WK_DELIVER_PENDING);
+            break;
+        case aNSC_PC_WK_DELIVER_PENDING:
+            aNSC_pc_wk_pending(shop_common, 2);
+            break;
+        case aNSC_PC_WK_LEAVE_BEGIN:
+            aNSC_pc_wk_begin(shop_common, 3, aNSC_PC_WK_LEAVE_PENDING);
+            break;
+        case aNSC_PC_WK_LEAVE_PENDING:
+            aNSC_pc_wk_pending(shop_common, 3);
+            break;
         case aNSC_PC_RS_BEGIN:
             r = pc_net_game_restock_begin();
             if (r < 0) {
@@ -1943,6 +2048,7 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 aNSC_pc_rs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
             }
             break;
+        case aNSC_PC_WK_ASK:
         case aNSC_PC_RS_ASK:
         case aNSC_PC_HS_ASK_INTRO:
         case aNSC_PC_HS_ASK_PICK:
@@ -1951,7 +2057,18 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 return;
             }
             k = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
-            if (aNSC_pc_hs_state == aNSC_PC_RS_ASK) {
+            if (aNSC_pc_hs_state == aNSC_PC_WK_ASK) {
+                if (k == mChoice_CHOICE0) {
+                    printf("[NET][WORK] nook dialogue: 'Here it is!' -> DELIVER\n");
+                    aNSC_pc_hs_state = aNSC_PC_WK_DELIVER_BEGIN; /* the job row stays up until the host answers */
+                } else if (k == mChoice_CHOICE2) {
+                    printf("[NET][WORK] nook dialogue: 'I'm done working' -> LEAVE\n");
+                    aNSC_pc_hs_state = aNSC_PC_WK_LEAVE_BEGIN;
+                } else {
+                    pc_nook_house_set_work(aNSC_pc_wk_item, aNSC_pc_wk_reward);
+                    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_WORK_LATER, 0);
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_RS_ASK) {
                 if (k == mChoice_CHOICE0) {
                     printf("[NET][RESTOCK] nook dialogue: payment confirmed, requesting the restock\n");
                     aNSC_pc_hs_state = aNSC_PC_RS_BEGIN; /* the text stays up; the order value stays set until the answer */
@@ -2589,6 +2706,13 @@ static void aNSC_request_Q_answer_wait2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME
         if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
             int next;
 #ifdef aNSC_PC_HOUSE
+            if ((aNSC_pc_hs_other_active == 1 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE2) ||
+                (aNSC_pc_hs_other_active == 2 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE4)) {
+                /* "I'd like to work" (the guest menu has it 3rd in place of "Say code", the resident menu 5th) */
+                aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_NONE);
+                aNSC_pc_wk_start_flow(shop_common);
+                return;
+            }
             if ((aNSC_pc_hs_other_active == 1 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE4) ||
                 (aNSC_pc_hs_other_active == 2 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3)) {
                 /* "Refresh shop." (the guest menu has it 5th, the resident menu 4th; the vanilla last choice moved down) */
