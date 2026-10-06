@@ -2847,6 +2847,7 @@ typedef struct PCNetGameWorkStateMsg {
 } PCNetGameWorkStateMsg;
 _Static_assert(sizeof(PCNetGameWorkStateMsg) == 36, "PCNetGameWorkStateMsg wire size drifted");
 static void pcnetgame_room_enter_test_hook(void);
+static void pcnetgame_goto_test_hook(void);
 static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in);
 static void pcnetgame_handle_client_room_npc(const PCNetGameRoomNpcMsg* in);
 
@@ -5743,6 +5744,7 @@ static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg*
 static void pcnetgame_page_handle_client(const PCNetGamePageMsg* in);
 static void pcnetgame_page_client_reset(void);
 static void pcnetgame_page_test_edit(void);
+static void pcnetgame_clear_errands_test_hook(void);
 
 /* ---- Patch 8: exclusive villager interaction lease (outdoor AND indoor villagers, keyed by the animal slot) ----
  * The talk hold above IS the lease: ONE owner per villager (a client peer bit, or the host's own player). A second BEGIN is DENIED (see the handler), the host's own talk goes through
@@ -18123,6 +18125,26 @@ static void pcnetgame_world_test_poke_event(void) {
 
 /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_MUSEUM_BITS=<resident slot>,<mask hex>): once the world is ready the host sets those state_flags bits in that resident's record (what the day-change museum code
  * does for the completion letter). Never active in normal play. */
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_CLEAR_ERRANDS=1): ends the vanilla "first job" town event on the HOST once its world is up (the opening chores of a brand-new town: Tom Nook is then the vanilla
+ * guide NPC and never shows the normal first page). A GUI check of Nook's first page needs a town past that stage. Never active in normal play. */
+static void pcnetgame_clear_errands_test_hook(void) {
+    static int done = 0;
+    int i;
+    if (done || gamePT == NULL || !s_local_world_latched || pc_test_hook_getenv("AC_TEST_CLEAR_ERRANDS") == NULL) {
+        return;
+    }
+    done = 1;
+    for (i = 0; i < PLAYER_NUM; i++) { /* the per-player "arbeit" events (first job, waiting for the Able Sisters / Resetti stage, its talk) of THIS process's save */
+        mEv_EventOFF(mEv_SAVED_FIRSTJOB_PLR0 + i);
+        mEv_EventOFF(mEv_SAVED_HRAWAIT_PLR0 + i);
+        mEv_EventOFF(mEv_SAVED_HRATALK_PLR0 + i);
+    }
+    printf("[NET][TEST-ONLY] ended the vanilla first-job / arbeit events of every character in this save\n");
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_MUSEUM_BITS=<resident slot>,<mask hex>): once the world is ready the host sets those state_flags bits in that resident's record (what the day-change museum code
+ * does for the completion letter). Never active in normal play. */
+
 static void pcnetgame_museum_bits_test_hook(void) {
     static int done = 0;
     const char* e;
@@ -18152,6 +18174,7 @@ static void pcnetgame_host_ts_tick(void) {
         pcnetgame_ts_refresh_all();
     }
     pcnetgame_museum_bits_test_hook();
+    pcnetgame_clear_errands_test_hook();
     pcnetgame_evnpc_host_tick();
     pcnetgame_npc_lease_host_tick();
     pcnetgame_page_host_tick();
@@ -29199,6 +29222,7 @@ static void pcnetgame_client_tick(void) {
     pcnetgame_evnpc_claim_test_hook();
     pcnetgame_evnpc_client_tick(); /* event NPC authority: match the host's table (no-op until the host sent one) */
     pcnetgame_page_client_tick();  /* town-shared pages: upload a local edit built on the adopted revision */
+    pcnetgame_clear_errands_test_hook();
 
     if (s_client_link == PC_NETGAME_LINK_HANDSHAKE && !s_client_identity_sent) {
         if (ready && pc_guest_creation_active()) {
@@ -31201,6 +31225,7 @@ void pc_net_game_poll(void) {
         return;
     }
     pcnetgame_room_enter_test_hook();
+    pcnetgame_goto_test_hook();
     if (s_role == PC_NETGAME_ROLE_CLIENT) {
         pcnetgame_client_notice_update();
     }
@@ -33450,6 +33475,61 @@ int pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, f
     *out_action_type = s_room_ring.last_action_type;
     *out_talking = (s_room_rx_flags & PCNG_ROOM_NPC_F_TALK) != 0u;
     return 1;
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1): a POSITIONING AID for the GUI verification, not a gameplay path. Once a half second, if the file `ac_goto.txt` exists in the working directory it is read and deleted:
+ *   "v <slot>"  parks THIS process's player in front of the villager of that animal slot (the actor of THIS process: the talk itself is then played by hand),
+ *   "h <slot>"  parks the player in front of that villager's HOUSE door (the door, the scene change and the room are then entered by hand through the real game path).
+ * Never active in normal play. */
+static void pcnetgame_goto_test_hook(void) {
+    static uint32_t next_ms;
+    uint32_t now = pcnetgame_now_ms();
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    FILE* f;
+    char kind = 0;
+    int slot = -1;
+    PLAYER_ACTOR* pa;
+    ACTOR* t = NULL;
+    if ((uint32_t)(now - next_ms) < 500u || play == NULL || pc_test_hook_getenv("AC_TEST_GOTO") == NULL) {
+        return;
+    }
+    next_ms = now;
+    if ((f = fopen("ac_goto.txt", "rb")) == NULL) {
+        return;
+    }
+    if (fscanf(f, " %c %d", &kind, &slot) != 2) {
+        kind = 0;
+    }
+    fclose(f);
+    pa = get_player_actor_withoutCheck(play);
+    if (pa == NULL || slot < 0 || slot >= ANIMAL_NUM_MAX || play->fb_wipe_mode != WIPE_MODE_NONE) {
+        return;
+    }
+    remove("ac_goto.txt");
+    if (kind == 'v') {
+        t = Actor_info_fgName_search(&play->actor_info, Save_Get(animals)[slot].id.npc_id, ACTOR_PART_NPC);
+    } else if (kind == 'h' || kind == 'p') {
+        int part;
+        mActor_name_t house = (kind == 'p') ? (mActor_name_t)(HOUSE0 + slot) : (mActor_name_t)(NPC_HOUSE_START + (Save_Get(animals)[slot].id.npc_id - NPC_START)); /* 'p' = the PLAYER house of that slot */
+        for (part = 0; part < ACTOR_PART_NUM && t == NULL; part++) {
+            t = Actor_info_fgName_search(&play->actor_info, house, part);
+        }
+    }
+    if (t == NULL) {
+        printf("[NET][TEST-ONLY] goto %c %d: no such actor in this scene%s", kind, slot, "\n");
+        return;
+    }
+    if (kind == 'v') {
+        pa->actor_class.world.position.x = t->world.position.x + sin_s(t->shape_info.rotation.y) * 35.0f;
+        pa->actor_class.world.position.z = t->world.position.z + cos_s(t->shape_info.rotation.y) * 35.0f;
+        pa->actor_class.shape_info.rotation.y = (s16)(t->shape_info.rotation.y + 0x8000); /* face the villager */
+        pa->actor_class.world.angle.y = pa->actor_class.shape_info.rotation.y;
+    } else {
+        pa->actor_class.world.position.x = t->home.position.x;
+        pa->actor_class.world.position.z = t->home.position.z + 60.0f;
+    }
+    pa->actor_class.world.position.y = t->world.position.y;
+    printf("[NET][TEST-ONLY] goto %c %d: player parked at (%.1f, %.1f)%s", kind, slot, (double)pa->actor_class.world.position.x, (double)pa->actor_class.world.position.z, "\n");
 }
 
 /* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_ROOM_ENTER=<animal idx>,<enter ms>[,<talk start>,<talk end>[,<leave>[,<reenter>]]] (all ms; talk / leave relative to the room entry, reenter to the
