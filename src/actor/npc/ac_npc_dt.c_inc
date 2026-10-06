@@ -3,8 +3,8 @@ static void aNPC_actor_dt(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     ACTOR* palActor = nactorx->palActor;
 
-#if defined(TARGET_PC) && !defined(aNPC_NPC2)
-    aNPC_pc_talk_net_on_destroy(nactorx); /* M9-C: END for an outstanding client talk BEGIN */
+#ifdef TARGET_PC
+    aNPC_pc_lease_on_destroy(nactorx); /* M9-C / Patch 8: END for an outstanding talk BEGIN (outdoor and indoor villagers) */
 #endif
 
 #ifndef aNPC_NPC2

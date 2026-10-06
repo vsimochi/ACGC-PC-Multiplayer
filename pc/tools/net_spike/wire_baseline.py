@@ -37,7 +37,7 @@ import sys
 # dig request is now a host-transactional grant owned by PCNetGameClientTxn, no longer a queue entry.
 HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRange", "PCNetGameRecSlot", "PCNetGameClientRec",
              "PCNetGameHostInteraction", "PCNetGameTxnLog", "PCNetGameTxnResident", "PCNetGameClientTxn", "PCNetGameFieldActionPending",
-             "PCNetGameTsHost", "PCNetGameTsOp", "PCNetGameMailOp", "PCNetGameMboxHost", "PCNetGameTakeOp",
+             "PCNetGameNpcTalkHold", "PCNetGameTsHost", "PCNetGameTsOp", "PCNetGameMailOp", "PCNetGameMboxHost", "PCNetGameTakeOp",
              "PCNetGameGuest",  # guests G1: the host's guest table entry (local, never on the wire)
              "PCNetGameAdmission", "PCNetGameAdmissionKind",  # M-D: the host's local admission decision (never on the wire)
              "PCNetGameHouseHost", "PCNetGameHouseClient",
@@ -59,7 +59,7 @@ REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
 # Indoor villagers (Patch 2, deliberate, v8 still unreleased): 67 = ROOM_NPC (both directions, UNRELIABLE, 28 B): the pose of the villager standing in its own house.
 # Nook Work Mode (Patch 3, deliberate, v8 still unreleased): 68 = WORK_STATE (host -> the requesting client, RELIABLE, 28 B): the character's job as the host holds it.
 # Event NPC authority (Patch 4, deliberate, v8 still unreleased): 69 = EVNPC_STATE (host -> every READY client, RELIABLE, 104 B): the event NPCs the host has in its town.
-EXPECTED_MAX_MSG_ID = 69
+EXPECTED_MAX_MSG_ID = 70
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -124,6 +124,8 @@ V8_NEW_STRUCTS = {
                              "uint32_t request_id;",
     # Event NPC authority (Patch 4): the host's event NPC table (104 B), host -> every READY client, reliable
     "PCNetGameEvNpcEntry": "uint16_t npc_id; int16_t angle; float x, z;",
+    # Patch 8: exclusive villager interaction lease table (24 B), host -> every ready client, reliable
+    "PCNetGameNpcLeaseMsg": "uint8_t msg_type; uint8_t count; uint16_t _rsv; uint32_t seq; uint8_t owner[16];",
     "PCNetGameEvNpcStateMsg": "uint8_t msg_type; uint8_t count; uint16_t _rsv; uint32_t seq; PCNetGameEvNpcEntry e[PC_EVNPC_MAX];",
 }
 # Guest -> resident promotion (M-F): exact C lines (size / offset asserts) that must stay as they are.
@@ -225,8 +227,8 @@ V8_NEW_ENUMS = [("PC_NETGAME_MSG_RECORD_HELLO", "47"), ("PC_NETGAME_MSG_RECORD_B
                 ("PC_NETGAME_MSG_IDENTITY_EXT", "57"), ("PC_NETGAME_MSG_IDENTITY_TOKEN", "58"),
                 ("PC_NETGAME_MSG_HOUSE_BEGIN", "59"), ("PC_NETGAME_MSG_HOUSE_CHUNK", "60"), ("PC_NETGAME_MSG_HOUSE_ACK", "61"),
                 ("PC_NETGAME_MSG_TOWN_FETCH_REQ", "62"), ("PC_NETGAME_MSG_TOWN_INFO", "63"), ("PC_NETGAME_MSG_TOWN_CHUNK", "64"), ("PC_NETGAME_MSG_TOWN_DONE", "65"),
-                ("PC_NETGAME_MSG_RESIDENT_HANDOFF", "66"), ("PC_NETGAME_MSG_ROOM_NPC", "67"), ("PC_NETGAME_MSG_WORK_STATE", "68"), ("PC_NETGAME_MSG_EVNPC_STATE", "69")]
-_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|RESIDENT_HANDOFF|ROOM_NPC|WORK_STATE|EVNPC_STATE)\s*=\s*\d+,"
+                ("PC_NETGAME_MSG_RESIDENT_HANDOFF", "66"), ("PC_NETGAME_MSG_ROOM_NPC", "67"), ("PC_NETGAME_MSG_WORK_STATE", "68"), ("PC_NETGAME_MSG_EVNPC_STATE", "69"), ("PC_NETGAME_MSG_NPC_LEASE", "70")]
+_V8_ENUM_RE = r"PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|RESIDENT_HANDOFF|ROOM_NPC|WORK_STATE|EVNPC_STATE|NPC_LEASE)\s*=\s*\d+,"
 # net_spike_lib lines that may exist in the working tree but not in a pre-v8 HEAD (the version line is checked separately).
 V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|PC_NETGAME_REC_\w+|RECORD_(?:HELLO|BEGIN|CHUNK|ACK)_FMT"
                            r"|PC_NETGAME_MSG_TXN_\w+|PC_NETGAME_TXN_\w+|TXN_(?:COMMIT|RESULT|TAG)_FMT"
@@ -540,15 +542,15 @@ def audit_texts(head, cur):
         "the request / result structs they ride are the already pinned ones (no layout change)",
         all(a in cur["game_c"] for a in WEEDS_C_PINS))
     strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
-    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|RESIDENT_HANDOFF|ROOM_NPC|WORK_STATE|EVNPC_STATE))\s*=\s*(\d+),", b)
+    ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|RESIDENT_HANDOFF|ROOM_NPC|WORK_STATE|EVNPC_STATE|NPC_LEASE))\s*=\s*(\d+),", b)
     # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52), + town services (47-55), + mailbox (47-56) or all of them
-    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS[:15], V8_NEW_ENUMS[:19], V8_NEW_ENUMS[:-3], V8_NEW_ENUMS[:-2], V8_NEW_ENUMS[:-1], V8_NEW_ENUMS)
+    head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS[:15], V8_NEW_ENUMS[:19], V8_NEW_ENUMS[:-3], V8_NEW_ENUMS[:-1], V8_NEW_ENUMS[:-2], V8_NEW_ENUMS[:-1], V8_NEW_ENUMS)
                    if "PCNetGameMsgType" in hb else False)
-    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-69 (appended, in order; 53/54 enumerated as reserved; 62-65 = town transfer; 66 = promotion handoff; 67 = indoor villager pose; 68 = Work Mode job state; 69 = event NPC table)",
+    add("wire: message-id enum PCNetGameMsgType identical to HEAD except the documented v8 ids 47-70 (appended, in order; 53/54 enumerated as reserved; 62-65 = town transfer; 66 = promotion handoff; 67 = indoor villager pose; 68 = Work Mode job state; 69 = event NPC table; 70 = villager interaction lease table)",
         "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
         and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
         and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
-        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_EVNPC_STATE = 69"))
+        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_NPC_LEASE = 70"))
     nums = [v for _n, v in c_message_ids(cur["game_c"])]
     add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),

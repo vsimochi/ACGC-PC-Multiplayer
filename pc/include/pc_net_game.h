@@ -415,6 +415,16 @@ int pc_net_game_host_npc_talk_held(int slot, int npc_id);
 /* M9-C: client: incremented on every client session reset (connect/disconnect/shutdown); the NPC edge code
  * drops its per-slot "begin sent" bits when it changes. */
 int pc_net_game_npc_talk_session_epoch(void);
+/* Patch 8: EXCLUSIVE villager interaction lease (outdoor + indoor villagers, keyed by the animal slot). owner: -1 nobody, else the PCNetPlayerId (PC_NETGAME_HOST_PLAYER_ID = the host's own
+ * player). busy: 1 iff ANOTHER player owns it (the talk-request gate; busy_by_id for callers without a slot). host_npc_talk_edge: the HOST's own player begins / keeps (call every frame) / ends a
+ * conversation: 1 = the host owns it, 0 = a client does. owner_pos: where the owning CLIENT stands (host only), for the conversation facing. */
+int pc_net_game_npc_talk_owner(int slot);
+int pc_net_game_npc_talk_busy(int slot, uint16_t npc_id);
+int pc_net_game_npc_talk_busy_by_id(uint16_t npc_id);
+int pc_net_game_host_npc_talk_edge(int slot, uint16_t npc_id, int begin);
+int pc_net_game_npc_talk_owner_pos(int slot, float* out_x, float* out_z);
+/* Idle look-at: the nearest OTHER player (a remote puppet in the same scene as this process) within `max_dist` of (x, z): 1 + its position. */
+int pc_net_game_nearest_remote_player(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z);
 
 /* This process's own town identity (see PCNetGameTownIdentity). 0 if no gameplay save is loaded
  * (the value would be meaningless -- e.g. the title-demo town). */

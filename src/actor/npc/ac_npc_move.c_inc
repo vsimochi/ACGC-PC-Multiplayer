@@ -754,95 +754,14 @@ static int aNPC_pc_is_client_consumer(NPC_ACTOR* nactorx) {
  * whenever this process is not a READY client; a bit also remembers which actor set it, so a bit left by an actor
  * that vanished without its destructor can never be mistaken for the next actor of that slot.
  * PC_NPC_TALKHOLD_DISABLE=1 (test-only negative control) suppresses the BEGIN (and therefore the END). */
-static u32 s_pc_talk_net_sent_mask = 0;
-static NPC_ACTOR* s_pc_talk_net_actor[ANIMAL_NUM_MAX];
-static int s_pc_talk_net_epoch = 0;
-
-static int aNPC_pc_talk_net_disabled(void) {
-    static int s_disabled = -1;
-    if (s_disabled < 0) {
-        const char* e = getenv("PC_NPC_TALKHOLD_DISABLE");
-        s_disabled = (e != NULL && e[0] == '1') ? 1 : 0;
-    }
-    return s_disabled;
-}
-
-static void aNPC_pc_talk_net_sync_epoch(void) {
-    int epoch = pc_net_game_npc_talk_session_epoch();
-    if (epoch != s_pc_talk_net_epoch) {
-        s_pc_talk_net_epoch = epoch;
-        s_pc_talk_net_sent_mask = 0;
-        memset(s_pc_talk_net_actor, 0, sizeof(s_pc_talk_net_actor));
-    }
-}
-
-static int aNPC_pc_talk_net_probe(int slot, uint16_t npc_id);
+/* Patch 8: the begin/end/keepalive reporting and the exclusive-lease race handling are shared with the indoor villagers (aNPC_pc_lease_update in ac_npc_talk.c_inc). */
 static void aNPC_pc_talk_net_edge(NPC_ACTOR* nactorx) {
-    int slot;
-    int active;
-
-    aNPC_pc_talk_net_sync_epoch();
-    if (!pc_net_game_world_is_host_authoritative()) {
-        s_pc_talk_net_sent_mask = 0; /* not a READY client (single-player/host/lost link): nothing is outstanding */
-        return;
-    }
-    if (nactorx->npc_info.animal == NULL) {
-        return;
-    }
-    slot = aNPC_get_animal_idx(nactorx);
-    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
-        return;
-    }
-    if ((s_pc_talk_net_sent_mask & (1u << slot)) != 0 && s_pc_talk_net_actor[slot] != nactorx) {
-        s_pc_talk_net_sent_mask &= ~(1u << slot); /* stale bit of a vanished actor: the host timeout covers it */
-    }
-    active = aNPC_pc_talk_lease_active(nactorx);
-    if (active && (s_pc_talk_net_sent_mask & (1u << slot)) == 0) {
-        if (!aNPC_pc_talk_net_disabled() &&
-            pc_net_game_notify_local_npc_talk(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, 1)) {
-            s_pc_talk_net_sent_mask |= (1u << slot);
-            s_pc_talk_net_actor[slot] = nactorx;
-            pc_net_game_set_npc_talk_lease_probe(aNPC_pc_talk_net_probe);
-        }
-    } else if (!active && (s_pc_talk_net_sent_mask & (1u << slot)) != 0) {
-        s_pc_talk_net_sent_mask &= ~(1u << slot); /* even if the send fails: the host timeout covers a lost END */
-        s_pc_talk_net_actor[slot] = NULL;
-        pc_net_game_notify_local_npc_talk(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, 0);
-    }
-}
-
-/* Keepalive probe (pc_net_game_poll() calls it from the net layer, which runs even while a submenu freezes the
- * actors): TRUE iff the BEGIN for this slot/npc is outstanding and its actor's lease predicate is still true. */
-static int aNPC_pc_talk_net_probe(int slot, uint16_t npc_id) {
-    NPC_ACTOR* a;
-
-    aNPC_pc_talk_net_sync_epoch();
-    if (slot < 0 || slot >= ANIMAL_NUM_MAX || (s_pc_talk_net_sent_mask & (1u << slot)) == 0) {
-        return 0;
-    }
-    a = s_pc_talk_net_actor[slot];
-    if (a == NULL || a->npc_info.animal == NULL || (uint16_t)a->npc_info.animal->id.npc_id != npc_id) {
-        return 0;
-    }
-    return aNPC_pc_talk_lease_active(a) ? 1 : 0;
+    aNPC_pc_lease_update(nactorx);
 }
 
 /* Called from aNPC_actor_dt(): END for a still-outstanding BEGIN of a villager that is being destroyed. */
 static void aNPC_pc_talk_net_on_destroy(NPC_ACTOR* nactorx) {
-    int slot;
-
-    aNPC_pc_talk_net_sync_epoch();
-    if (s_pc_talk_net_sent_mask == 0 || nactorx->npc_info.animal == NULL) {
-        return;
-    }
-    slot = aNPC_get_animal_idx(nactorx);
-    if (slot < 0 || slot >= ANIMAL_NUM_MAX || (s_pc_talk_net_sent_mask & (1u << slot)) == 0 ||
-        s_pc_talk_net_actor[slot] != nactorx) {
-        return;
-    }
-    s_pc_talk_net_sent_mask &= ~(1u << slot);
-    s_pc_talk_net_actor[slot] = NULL;
-    pc_net_game_notify_local_npc_talk(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, 0);
+    aNPC_pc_lease_on_destroy(nactorx);
 }
 
 /* HOST side: TRUE iff a validated client talk hold is active for this villager AND the host is not itself talking
@@ -878,6 +797,27 @@ static void aNPC_pc_host_held_position_move(ACTOR* actorx) {
     nactorx->movement.speed.max_speed = 0.0f;
     aNPC_position_move(actorx);
     nactorx->movement.speed.max_speed = saved_max;
+    {   /* Patch 8: conversation facing -- the held villager turns toward the player that owns the lease (the host's own player is handled by the vanilla talk) */
+        float ox, oz;
+        int slot = aNPC_pc_lease_slot(nactorx);
+        if (slot >= 0 && pc_net_game_npc_talk_owner_pos(slot, &ox, &oz)) {
+            xyz_t to;
+            s16 want, cur, diff;
+            to.x = ox;
+            to.y = actorx->world.position.y;
+            to.z = oz;
+            want = search_position_angleY(&actorx->world.position, &to);
+            cur = actorx->world.angle.y;
+            diff = (s16)(want - cur);
+            if (diff > 0x400) {
+                diff = 0x400;
+            } else if (diff < -0x400) {
+                diff = -0x400;
+            }
+            actorx->world.angle.y = (s16)(cur + diff);
+            actorx->shape_info.rotation.y = actorx->world.angle.y;
+        }
+    }
 }
 
 /* Observation only: one line at hold start/end with the host position of the villager, and (only with
@@ -930,6 +870,7 @@ static void aNPC_pc_host_talk_hold_log(NPC_ACTOR* nactorx, GAME_PLAY* play, int 
 #define aNPC_PC_TH_PULSE_FRAMES 2
 
 static int s_th_enabled = -1;
+static u32 s_th_first = 0xFFFFFFFF;
 static int s_th_stage = 0;
 static ACTOR* s_th_actor = NULL;
 static int s_th_slot = -1;
@@ -1024,11 +965,18 @@ static void aNPC_pc_talk_hook(NPC_ACTOR* nactorx, GAME_PLAY* play, int consumer)
     }
 
     if (s_th_stage == 0) {
-        static u32 s_first = 0xFFFFFFFF;
-        if (s_first == 0xFFFFFFFF) {
-            s_first = frame;
+        static int s_slot_env = -2;
+        if (s_slot_env == -2) {
+            const char* e = getenv("PC_FORCE_TALK_SLOT"); /* test-only: only this animal slot is selected (both processes talk to the SAME villager) */
+            s_slot_env = (e != NULL) ? atoi(e) : -1;
         }
-        if (frame - s_first < 600 || nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0 ||
+        if (s_th_first == 0xFFFFFFFF) {
+            s_th_first = frame;
+        }
+        if (s_slot_env >= 0 && nactorx->npc_info.animal != NULL && aNPC_get_animal_idx(nactorx) != s_slot_env) {
+            return;
+        }
+        if (frame - s_th_first < 600 || nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0 ||
             nactorx->condition_info.hide_flg || nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE ||
             main_idx != mPlayer_INDEX_WAIT) {
             return;
@@ -1080,6 +1028,12 @@ static void aNPC_pc_talk_hook(NPC_ACTOR* nactorx, GAME_PLAY* play, int consumer)
         if (s_th_cnt > 900) {
             printf("[NPC][TALKHOOK] %s TRIGGER_TIMEOUT: A never started a talk (main=%d dist=%.1f)\n", role,
                    main_idx, actorx->player_distance_xz);
+            if (getenv("PC_FORCE_TALK_RETRY") != NULL) { /* test-only: try again (the villager may be owned by another player right now) */
+                s_th_stage = 0;
+                s_th_first = frame - 480; /* re-arm after ~2 s */
+                s_th_force_a = 0;
+                return;
+            }
             s_th_stage = 9;
             return;
         }
@@ -1157,7 +1111,7 @@ static void aNPC_pc_talk_hook(NPC_ACTOR* nactorx, GAME_PLAY* play, int consumer)
             s_th_cnt = 0;
             return;
         }
-        if (s_th_talk_frames > 5400) {
+        if (s_th_talk_frames > (getenv("PC_FORCE_TALK_MAX_FRAMES") != NULL ? atoi(getenv("PC_FORCE_TALK_MAX_FRAMES")) : 5400)) {
             printf("[NPC][TALKHOOK] %s STUCK: still in talk after %d frames (main=%d listen=%d msg_visible=%d "
                    "act_idx=%d talk_cond=%d)\n",
                    role, s_th_talk_frames, main_idx, listen, msg_visible, (int)nactorx->action.idx,

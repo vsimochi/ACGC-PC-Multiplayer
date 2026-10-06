@@ -521,6 +521,9 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_EVNPC_STATE           = 69, /* Event NPC authority (v8 unreleased: extended in place, NO version bump), host -> every READY client, RELIABLE, 104 bytes. The event NPCs (Gulliver,
                                              * K.K., the Wisp, the peddlers...) the HOST has in its town: npc id, world position, facing; sent on change and at READY. A client creates / removes its
                                              * local actors to match and never creates one on its own. An old peer drops it. */
+    PC_NETGAME_MSG_NPC_LEASE             = 70, /* Exclusive villager interaction lease (Patch 8; v8 unreleased: extended in place, NO version bump), host -> every READY client, RELIABLE, 24 bytes.
+                                             * Who (PCNetPlayerId, 0xFF = nobody) owns the conversation with each animal slot's villager, outdoor AND indoor: sent on change and at READY. The
+                                             * clients only mirror it (they refuse a new talk with a villager somebody else owns, and a client that lost a race ends its optimistic talk). */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -3632,6 +3635,7 @@ typedef struct PCNetGameHostPeerState {
     int                  bound_resident_idx;
     PersonalID_c         bound_pid; /* the host's saved PersonalID of that resident AT BIND TIME (re-validation) */
     int                  work_sent; /* Nook Work Mode: the job state was sent to this peer since its record became SYNCED */
+    uint32_t             nlease_seq; /* Patch 8: the NPC_LEASE seq this peer has received (0 = none yet) */
     uint32_t             evnpc_seq; /* event NPC authority: the EVNPC_STATE seq this peer has received (0 = none yet) */
     int                  ctx_player_no_warned; /* PLAYER_CONTEXT player_no mismatch warned once per connection */
     int                  ctx_clamp_logged;     /* PLAYER_CONTEXT clamp notice logged once per connection */
@@ -4833,6 +4837,7 @@ static void pcnetgame_host_send_scene_to_all(PCNetPeerId skip, const PCNetGamePl
 
 /* M9-C: defined with the host talk-hold table further down. */
 static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* why, int reset_seq);
+static void pcnetgame_host_talk_hold_scene_left(PCNetPeerId peer, const PCNetPlayerScene* s);
 
 /* Host: a client's own scene. READY-gated; id taken from the transport slot; announceable/flags/owner/seq
  * validated; relayed to every OTHER READY client only when accepted (a stale/duplicate seq is dropped and
@@ -4855,9 +4860,8 @@ static void pcnetgame_handle_host_player_scene(PCNetPeerId peer, const PCNetGame
         printf("[NET][SCENE] host: peer %d stale PLAYER_SCENE (seq %u) -- ignored\n", (int)peer, (unsigned)in->seq);
         return;
     }
-    if (s.kind != (uint8_t)PC_NETSCENE_KIND_FIELD || (s.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0 ||
-        s.scene_id != (uint8_t)SCENE_FG) {
-        pcnetgame_host_talk_hold_clear_peer(peer, "left the town field", 0); /* M9-C */
+    {
+        pcnetgame_host_talk_hold_scene_left(peer, &s); /* M9-C / Patch 8: a conversation ends when its owner leaves the field (or the villager's own house) */
     }
     printf("[NET][SCENE] host: peer %d now in scene %u (kind %u, owner 0x%04X, flags 0x%02X, seq %u)\n", (int)peer,
            (unsigned)s.scene_id, (unsigned)s.kind, (unsigned)s.owner, (unsigned)s.flags, (unsigned)s.seq);
@@ -5475,6 +5479,9 @@ typedef struct PCNetGameNpcTalkHold {
     uint16_t peer_mask; /* bit i = PCNetPeerId i currently holds this slot */
     uint16_t npc_id;    /* identity the mask was set for */
     uint32_t last_ms;   /* pcnetgame_now_ms() of the last valid BEGIN */
+    uint8_t  indoor;     /* Patch 8: the owner began inside the villager's house (so leaving the house ends it, and so does going outdoors) */
+    uint8_t  host_owned; /* Patch 8: the HOST's own player owns the conversation (peer_mask is then 0: the host never holds its own villager) */
+    uint32_t host_ms;    /* pcnetgame_now_ms() of the host player's last "still talking" call */
 } PCNetGameNpcTalkHold;
 static PCNetGameNpcTalkHold s_host_talk_hold[ANIMAL_NUM_MAX];
 static uint16_t s_host_talk_last_seq[PC_NET_MAX_PEERS];
@@ -5569,6 +5576,10 @@ static void pcnetgame_host_talk_hold_sweep(void) {
     uint32_t now = 0;
     for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
         PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
+        if (h->host_owned && (uint32_t)(pcnetgame_now_ms() - h->host_ms) >= pcnetgame_talk_hold_timeout_ms()) {
+            printf("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X (the host player's lease went quiet)%s", slot, (unsigned)h->npc_id, "\n");
+            h->host_owned = 0;
+        }
         if (h->peer_mask == 0) {
             continue;
         }
@@ -5636,9 +5647,13 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
             pcnetgame_host_talk_reject(peer, in, "npc_id does not match the host animal table");
             return;
         }
-        if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) || sc.kind != (uint8_t)PC_NETSCENE_KIND_FIELD ||
-            (sc.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0 || sc.scene_id != (uint8_t)SCENE_FG) {
-            pcnetgame_host_talk_reject(peer, in, "peer is not in the town field scene");
+        if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc)) {
+            pcnetgame_host_talk_reject(peer, in, "peer scene unknown");
+            return;
+        }
+        if (!(sc.kind == (uint8_t)PC_NETSCENE_KIND_FIELD && (sc.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0 && sc.scene_id == (uint8_t)SCENE_FG) &&
+            !(sc.scene_id == (uint8_t)SCENE_NPC_HOUSE && sc.owner == in->npc_id)) { /* outdoors in the town, or inside THAT villager's own house */
+            pcnetgame_host_talk_reject(peer, in, "peer is neither in the town field nor in that villager's house");
             return;
         }
     }
@@ -5651,10 +5666,20 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
         printf("[NPC][TALKNET][DIAG] refresh peer=%d slot=%u npc=0x%04X seq=%u\n", (int)peer, (unsigned)in->slot,
                (unsigned)in->npc_id, (unsigned)in->seq);
     }
-    if (h->peer_mask != 0 && h->npc_id != in->npc_id) {
+    if ((h->peer_mask != 0 || h->host_owned) && h->npc_id != in->npc_id) {
         h->peer_mask = 0; /* stale mask for a previous occupant of the slot */
+        h->host_owned = 0;
+    }
+    if ((h->peer_mask & (uint16_t)~(uint16_t)(1u << peer)) != 0 || h->host_owned) { /* Patch 8: EXCLUSIVE -- somebody else already owns this villager's conversation */
+        pcnetgame_host_talk_reject(peer, in, h->host_owned ? "the villager is talking with the host player" : "the villager is talking with another player (exclusive lease)");
+        printf("[NPC][TALKNET] DENIED peer=%d slot=%u npc=0x%04X: owner is %s%s", (int)peer, (unsigned)in->slot, (unsigned)in->npc_id, h->host_owned ? "the host player" : "another player", "\n");
+        return;
     }
     h->npc_id = in->npc_id;
+    {
+        PCNetPlayerScene bs;
+        h->indoor = (pc_remote_player_get_scene((PCNetPlayerId)peer, &bs) && bs.scene_id == (uint8_t)SCENE_NPC_HOUSE) ? 1 : 0;
+    }
     h->last_ms = pcnetgame_now_ms();
     if ((h->peer_mask & (uint16_t)(1u << peer)) == 0) {
         h->peer_mask = (uint16_t)(h->peer_mask | (uint16_t)(1u << peer));
@@ -5681,6 +5706,189 @@ int pc_net_game_host_npc_talk_held(int slot, int npc_id) {
         return 0;
     }
     return 1;
+}
+
+/* ---- Patch 8: exclusive villager interaction lease (outdoor AND indoor villagers, keyed by the animal slot) ----
+ * The talk hold above IS the lease: ONE owner per villager (a client peer bit, or the host's own player). A second BEGIN is DENIED (see the handler), the host's own talk goes through
+ * pc_net_game_host_npc_talk_edge(). The owners are mirrored to every READY client in NPC_LEASE (id 70, on change + at READY) so a client refuses to start a conversation somebody else owns, and a
+ * client that lost a near-simultaneous race (its optimistic local talk was denied) ends that talk. Release: END, the owner's disconnect / scene change (clear_peer / scene_left), the sweep timeout. */
+typedef struct PCNetGameNpcLeaseMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_NPC_LEASE */
+    uint8_t  count;    /* ANIMAL_NUM_MAX */
+    uint16_t _rsv;
+    uint32_t seq;
+    uint8_t  owner[16]; /* PCNetPlayerId per animal slot, 0xFF = nobody */
+} PCNetGameNpcLeaseMsg;
+_Static_assert(sizeof(PCNetGameNpcLeaseMsg) == 24, "PCNetGameNpcLeaseMsg wire size drifted");
+_Static_assert(ANIMAL_NUM_MAX <= 16, "PCNetGameNpcLeaseMsg owner[] too small");
+static PCNetGameNpcLeaseMsg s_lease_host;   /* host: the last table sent */
+static uint32_t             s_lease_host_seq;
+static PCNetGameNpcLeaseMsg s_lease_client; /* client: the last table received (valid iff seq != 0) */
+
+static int pcnetgame_lease_owner_of(int slot) { /* host: -1 none, else the PCNetPlayerId */
+    PCNetGameNpcTalkHold* h;
+    int p;
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return -1;
+    }
+    h = &s_host_talk_hold[slot];
+    if (h->host_owned) {
+        return (int)PC_NETGAME_HOST_PLAYER_ID;
+    }
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        if ((h->peer_mask & (uint16_t)(1u << p)) != 0 && s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
+            return p;
+        }
+    }
+    return -1;
+}
+
+int pc_net_game_npc_talk_owner(int slot) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return pcnetgame_lease_owner_of(slot);
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_lease_client.seq != 0 && slot >= 0 && slot < ANIMAL_NUM_MAX && s_lease_client.owner[slot] != 0xFFu) {
+        return (int)s_lease_client.owner[slot];
+    }
+    return -1;
+}
+
+int pc_net_game_npc_talk_busy(int slot, uint16_t npc_id) { /* 1 iff ANOTHER player owns the conversation with this villager */
+    int o = pc_net_game_npc_talk_owner(slot);
+    (void)npc_id;
+    if (o < 0) {
+        return 0;
+    }
+    return s_role == PC_NETGAME_ROLE_HOST ? (o != (int)PC_NETGAME_HOST_PLAYER_ID) : (o != (int)s_client_assigned_peer_id);
+}
+
+int pc_net_game_npc_talk_busy_by_id(uint16_t npc_id) { /* the same, keyed by the villager (the talk-request gate has no slot at hand) */
+    int slot = mNpc_SearchAnimalinfo(Save_Get(animals), (mActor_name_t)npc_id, ANIMAL_NUM_MAX);
+    return slot >= 0 && pc_net_game_npc_talk_busy(slot, npc_id);
+}
+
+/* The host's OWN player starts / keeps / ends a conversation with this villager (called every frame while talking: it is the host's heartbeat). 1 = the host owns it, 0 = a client does. */
+int pc_net_game_host_npc_talk_edge(int slot, uint16_t npc_id, int begin) {
+    PCNetGameNpcTalkHold* h;
+    if (s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return 1;
+    }
+    h = &s_host_talk_hold[slot];
+    if (!begin) {
+        if (h->host_owned) {
+            h->host_owned = 0;
+            printf("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X (the host player ended the conversation)%s", slot, (unsigned)npc_id, "\n");
+        }
+        return 1;
+    }
+    if (h->npc_id != npc_id && h->peer_mask != 0) {
+        h->peer_mask = 0;
+    }
+    if (h->peer_mask != 0) {
+        printf("[NPC][TALKNET] DENIED host player slot=%d npc=0x%04X: a client owns the conversation%s", slot, (unsigned)npc_id, "\n");
+        return 0;
+    }
+    if (!h->host_owned) {
+        printf("[NPC][TALKNET] HOST-LEASE slot=%d npc=0x%04X (the host player owns the conversation)%s", slot, (unsigned)npc_id, "\n");
+    }
+    h->npc_id = npc_id;
+    h->host_owned = 1;
+    h->host_ms = pcnetgame_now_ms();
+    return 1;
+}
+
+/* Where the owning CLIENT player stands (the host turns the held villager toward him). 0 when the owner is the host's own player / unknown. */
+int pc_net_game_npc_talk_owner_pos(int slot, float* out_x, float* out_z) {
+    int o = pc_net_game_npc_talk_owner(slot);
+    float y;
+    if (o < 0 || o == (int)PC_NETGAME_HOST_PLAYER_ID || s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    return pc_remote_player_get_last_position((PCNetPlayerId)o, out_x, &y, out_z);
+}
+
+static void pcnetgame_host_talk_hold_scene_left(PCNetPeerId peer, const PCNetPlayerScene* s) {
+    int slot;
+    int outdoors = s->kind == (uint8_t)PC_NETSCENE_KIND_FIELD && (s->flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0 && s->scene_id == (uint8_t)SCENE_FG;
+    for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+        PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
+        int still_ok = outdoors ? !h->indoor : (s->scene_id == (uint8_t)SCENE_NPC_HOUSE && s->owner == h->npc_id && h->indoor);
+        if (peer >= 0 && peer < PC_NET_MAX_PEERS && (h->peer_mask & (uint16_t)(1u << peer)) != 0 && !still_ok) {
+            h->peer_mask = (uint16_t)(h->peer_mask & ~(uint16_t)(1u << peer));
+            printf("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X (peer %d left the villager's surroundings)%s", slot, (unsigned)h->npc_id, (int)peer, "\n");
+        }
+    }
+}
+
+int pc_net_game_nearest_remote_player(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z) {
+    PCNetPlayerScene ls, ps;
+    int p, best = -1;
+    float bd = max_dist * max_dist;
+    if ((s_role != PC_NETGAME_ROLE_HOST && !(s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY)) || !pc_net_game_get_local_scene(&ls)) {
+        return 0;
+    }
+    for (p = 0; p <= PC_NET_MAX_PEERS; p++) {
+        float px, py, pz, d;
+        if ((s_role == PC_NETGAME_ROLE_HOST && p == (int)PC_NETGAME_HOST_PLAYER_ID) || (s_role == PC_NETGAME_ROLE_CLIENT && p == (int)s_client_assigned_peer_id)) {
+            continue;
+        }
+        if (!pc_remote_player_get_scene((PCNetPlayerId)p, &ps) || ps.scene_id != ls.scene_id || ps.owner != ls.owner || !pc_remote_player_get_last_position((PCNetPlayerId)p, &px, &py, &pz)) {
+            continue;
+        }
+        d = (px - x) * (px - x) + (pz - z) * (pz - z);
+        if (d < bd) {
+            bd = d;
+            best = p;
+            *out_x = px;
+            *out_y = py;
+            *out_z = pz;
+        }
+    }
+    return best >= 0;
+}
+
+/* host tick: send the owner table to every READY client when it changed and to a client that has not seen it */
+static void pcnetgame_npc_lease_host_tick(void) {
+    PCNetGameNpcLeaseMsg cur;
+    int slot, p, changed = 0;
+    memset(&cur, 0xFF, sizeof(cur.owner));
+    for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+        int o = pcnetgame_lease_owner_of(slot);
+        cur.owner[slot] = (o < 0) ? 0xFFu : (uint8_t)o;
+        if (cur.owner[slot] != s_lease_host.owner[slot]) {
+            changed = 1;
+        }
+    }
+    if (changed || s_lease_host_seq == 0) {
+        for (slot = ANIMAL_NUM_MAX; slot < 16; slot++) {
+            cur.owner[slot] = 0xFFu;
+        }
+        cur.msg_type = (uint8_t)PC_NETGAME_MSG_NPC_LEASE;
+        cur.count = (uint8_t)ANIMAL_NUM_MAX;
+        cur._rsv = 0;
+        cur.seq = ++s_lease_host_seq;
+        s_lease_host = cur;
+        for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+            s_host_peer[p].nlease_seq = 0;
+        }
+    }
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        if (s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
+            if (s_host_peer[p].nlease_seq != s_lease_host.seq && s_lease_host_seq != 0) {
+                s_host_peer[p].nlease_seq = s_lease_host.seq;
+                (void)pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &s_lease_host, (uint16_t)sizeof(s_lease_host));
+            }
+        } else {
+            s_host_peer[p].nlease_seq = 0;
+        }
+    }
+}
+
+static void pcnetgame_handle_client_npc_lease(const PCNetGameNpcLeaseMsg* in) {
+    if (s_client_link != PC_NETGAME_LINK_READY || in->count != (uint8_t)ANIMAL_NUM_MAX || in->seq == 0) {
+        return;
+    }
+    s_lease_client = *in;
 }
 
 int pc_net_game_npc_talk_session_epoch(void) {
@@ -17909,6 +18117,7 @@ static void pcnetgame_host_ts_tick(void) {
     }
     pcnetgame_museum_bits_test_hook();
     pcnetgame_evnpc_host_tick();
+    pcnetgame_npc_lease_host_tick();
     for (p = 0; p < PC_NET_MAX_PEERS; p++) {
         PCNetGameHostPeerState* wst = &s_host_peer[p];
         pcnetgame_host_ts_push_peer((PCNetPeerId)p); /* a late joiner / reconnect / a failed send is covered here */
@@ -27957,6 +28166,14 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == sizeof(PCNetGameNpcLeaseMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_LEASE) {
+        PCNetGameNpcLeaseMsg nl;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&nl, data, sizeof(nl));
+        pcnetgame_handle_client_npc_lease(&nl);
+        return;
+    }
+
     if (size == sizeof(PCNetGameEvNpcStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_EVNPC_STATE) {
         PCNetGameEvNpcStateMsg es;
         if (s_client_link != PC_NETGAME_LINK_READY) return;
@@ -28208,6 +28425,7 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(s_action_last_valid, 0, sizeof(s_action_last_valid));
     s_npc_talk_epoch++;
     memset(s_client_talk_out, 0, sizeof(s_client_talk_out)); /* keepalive table dies with the session */
+    memset(&s_lease_client, 0, sizeof(s_lease_client));      /* Patch 8: the owner table is the old host's */
     {
         /* M9-A: every scene this client holds for OTHER players (the host and relayed clients) came over the
          * old host link; once that link is lost or replaced it can no longer be trusted (the new connection

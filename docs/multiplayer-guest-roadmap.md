@@ -1456,3 +1456,15 @@ the villager now ALSO samples (his pose carries TALK) and the host hands him the
 Dialogue text, choices and the talk script stay local (by design: no full dialogue sync). A second player can still START a talk with a villager someone else is talking to (not blocked; follow-up).
 Real two-process test: `tools/net_spike/test_room_npc_real.py` (host + client both walk into the same villager's house through `goto_other_scene` via the test hook `AC_TEST_ROOM_ENTER`, talk flag forced for a
 window, leave and re-enter) 13/13. The talk flag is injected at the sampling seam (no GUI to run the dialogue); everything downstream is real code.
+
+## Patch 8 - exclusive villager conversation lease (outdoor + indoor), conversation facing, idle look-at
+
+One host-owned lease table, keyed by animal slot, serves outdoor AND indoor villagers (the M9-C talk hold became exclusive; no second system).
+- Host: a BEGIN (NPC_TALK id 45) on a villager somebody else owns is DENIED (log `DENIED`); the host player's own talk goes through `pc_net_game_host_npc_talk_edge` (heartbeat every frame). Released on END, owner
+  disconnect, the owner leaving the field / the villager's house (`pcnetgame_host_talk_hold_scene_left`), or the 30 s sweep. A restarted host starts empty (leases are not persisted).
+- NPC_LEASE (id 70, 24 B, reliable, host -> every READY client, on change + at READY): the owner per slot. Clients refuse to start a talk with a villager another player owns (`aNPC_pc_talk_request_blocked`,
+  one gate for NPC and NPC2) and a client that lost a near-simultaneous race ends its optimistic talk after 300 ms (`mMsg_request_main_disappear`; this abort path is NOT exercised by a real test).
+- Facing: while a CLIENT owns the lease the host turns the held villager toward that player at <= 0x400 per frame (no per-frame network traffic: the owner is state, the pose stream carries the result).
+  Idle: a head-look target at the nearest remote player when he is nearer than the local one (`pc_net_game_nearest_remote_player`, local presentation only).
+- Tests: `test_npc_lease_protocol.py` (18/18, scripted clients, outdoor + indoor + disconnect + late join), `test_npc_lease_real.py` (9/9, TWO REAL processes, real dialogue: host talks, client refused, host ends,
+  client's real talk accepted and finished), H7 of `test_client_villager_talk.py` updated to the exclusive semantics (the 'stopping the repeats -> EXPIRE' check is output-buffering flaky, pre-existing).

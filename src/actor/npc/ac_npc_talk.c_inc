@@ -641,11 +641,142 @@ static void aNPC_talk_request_normal_npc(ACTOR* actorx, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* Patch 8: EXCLUSIVE villager interaction lease, shared by outdoor (ac_npc.c) and indoor (ac_npc2.c) villagers. The host owns it (pc_net_game.c, NPC_TALK / NPC_LEASE): this file only
+ *  - refuses to START a conversation with a villager ANOTHER player owns (aNPC_pc_talk_request_blocked, the talk-request gate),
+ *  - reports this process's own conversation edges to the host (client: NPC_TALK BEGIN / keepalive / END, host: host_npc_talk_edge every frame / end) and
+ *  - ends the optimistic local conversation of a player who lost a near-simultaneous race (the host denied it and the table names someone else for >= 300 ms).
+ * Nothing here moves or authors an NPC. */
+static u32 s_pc_lease_mask;
+static NPC_ACTOR* s_pc_lease_actor[ANIMAL_NUM_MAX];
+static u32 s_pc_lease_lost_ms[ANIMAL_NUM_MAX];
+static int s_pc_lease_epoch;
+
+static int aNPC_pc_lease_slot(NPC_ACTOR* nactorx) {
+    int slot;
+    if (nactorx->npc_info.animal == NULL) {
+        return -1;
+    }
+    slot = (int)(nactorx->npc_info.animal - Save_Get(animals));
+    return (slot >= 0 && slot < ANIMAL_NUM_MAX) ? slot : -1;
+}
+
+static int aNPC_pc_lease_active_now(NPC_ACTOR* nactorx) {
+    return nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK;
+}
+
+static int aNPC_pc_talk_request_blocked(NPC_ACTOR* nactorx) {
+    return nactorx->npc_info.animal != NULL && pc_net_game_npc_talk_busy_by_id((uint16_t)nactorx->npc_info.animal->id.npc_id);
+}
+
+static int aNPC_pc_lease_probe(int slot, uint16_t npc_id) {
+    NPC_ACTOR* a;
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || (s_pc_lease_mask & (1u << slot)) == 0) {
+        return 0;
+    }
+    a = s_pc_lease_actor[slot];
+    if (a == NULL || a->npc_info.animal == NULL || (uint16_t)a->npc_info.animal->id.npc_id != npc_id) {
+        return 0;
+    }
+    return aNPC_pc_lease_active_now(a);
+}
+
+static void aNPC_pc_lease_update(NPC_ACTOR* nactorx) {
+    int role = pc_net_game_role();
+    int slot, active, granted = 1;
+    u16 npc_id;
+    u32 bit;
+    int epoch = pc_net_game_npc_talk_session_epoch();
+
+    if (epoch != s_pc_lease_epoch) {
+        s_pc_lease_epoch = epoch;
+        s_pc_lease_mask = 0;
+        memset(s_pc_lease_actor, 0, sizeof(s_pc_lease_actor));
+        memset(s_pc_lease_lost_ms, 0, sizeof(s_pc_lease_lost_ms));
+    }
+    if (role == PC_NETGAME_ROLE_NONE || (role == PC_NETGAME_ROLE_CLIENT && !pc_net_game_world_is_host_authoritative())) {
+        s_pc_lease_mask = 0;
+        return;
+    }
+    slot = aNPC_pc_lease_slot(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    bit = 1u << slot;
+    npc_id = (u16)nactorx->npc_info.animal->id.npc_id;
+    if ((s_pc_lease_mask & bit) != 0 && s_pc_lease_actor[slot] != nactorx) {
+        s_pc_lease_mask &= ~bit; /* stale bit of a vanished actor: the host timeout covers it */
+    }
+    active = aNPC_pc_lease_active_now(nactorx);
+    if (role == PC_NETGAME_ROLE_HOST) {
+        if (active) {
+            granted = pc_net_game_host_npc_talk_edge(slot, npc_id, 1); /* every frame: the host player's heartbeat */
+            s_pc_lease_mask |= bit;
+            s_pc_lease_actor[slot] = nactorx;
+        } else if ((s_pc_lease_mask & bit) != 0) {
+            s_pc_lease_mask &= ~bit;
+            s_pc_lease_actor[slot] = NULL;
+            pc_net_game_host_npc_talk_edge(slot, npc_id, 0);
+        }
+    } else {
+        if (active && (s_pc_lease_mask & bit) == 0) {
+            if (pc_net_game_notify_local_npc_talk(slot, npc_id, 1)) {
+                s_pc_lease_mask |= bit;
+                s_pc_lease_actor[slot] = nactorx;
+                pc_net_game_set_npc_talk_lease_probe(aNPC_pc_lease_probe);
+            }
+        } else if (!active && (s_pc_lease_mask & bit) != 0) {
+            s_pc_lease_mask &= ~bit; /* even if the send fails: the host timeout covers a lost END */
+            s_pc_lease_actor[slot] = NULL;
+            pc_net_game_notify_local_npc_talk(slot, npc_id, 0);
+        }
+    }
+    /* lost the race: someone else owns the conversation we started optimistically */
+    if (active && (s_pc_lease_mask & bit) != 0 && (!granted || (role == PC_NETGAME_ROLE_CLIENT && pc_net_game_npc_talk_busy(slot, npc_id)))) {
+        u32 now = pc_net_game_now_ms();
+        if (s_pc_lease_lost_ms[slot] == 0) {
+            s_pc_lease_lost_ms[slot] = now;
+        } else if ((u32)(now - s_pc_lease_lost_ms[slot]) >= 300u) {
+            printf("[NPC][TALKNET] LOST the conversation race for slot=%d npc=0x%04X: ending the local talk%s", slot, (unsigned)npc_id, "\n");
+            s_pc_lease_lost_ms[slot] = 0;
+            s_pc_lease_mask &= ~bit; /* not the owner: nothing to END */
+            mMsg_request_main_disappear(mMsg_Get_base_window_p());
+        }
+    } else {
+        s_pc_lease_lost_ms[slot] = 0;
+    }
+}
+
+static void aNPC_pc_lease_on_destroy(NPC_ACTOR* nactorx) {
+    int slot = aNPC_pc_lease_slot(nactorx);
+    int role = pc_net_game_role();
+    u32 bit;
+    if (slot < 0 || s_pc_lease_mask == 0) {
+        return;
+    }
+    bit = 1u << slot;
+    if ((s_pc_lease_mask & bit) == 0 || s_pc_lease_actor[slot] != nactorx) {
+        return;
+    }
+    s_pc_lease_mask &= ~bit;
+    s_pc_lease_actor[slot] = NULL;
+    if (role == PC_NETGAME_ROLE_HOST) {
+        pc_net_game_host_npc_talk_edge(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, 0);
+    } else if (role == PC_NETGAME_ROLE_CLIENT) {
+        pc_net_game_notify_local_npc_talk(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, 0);
+    }
+}
+#endif
+
 static void aNPC_talk_request_check(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
 
     if ((nactorx->condition_info.demo_flg & aNPC_COND_DEMO_SKIP_TALK_CHECK) == 0 &&
-        nactorx->condition_info.talk_condition == aNPC_TALK_TYPE_NONE && !nactorx->condition_info.hide_flg) {
+        nactorx->condition_info.talk_condition == aNPC_TALK_TYPE_NONE && !nactorx->condition_info.hide_flg
+#ifdef TARGET_PC
+        && !aNPC_pc_talk_request_blocked(nactorx) /* Patch 8: exclusive lease -- another player is talking to this villager */
+#endif
+    ) {
         if (mEv_CheckTitleDemo() == mEv_TITLEDEMO_NONE || mEv_CheckTitleDemo() == mEv_TITLEDEMO_STAFFROLL) {
             if (nactorx->action.idx != aNPC_ACT_TALK) {
 #ifndef aNPC_NPC2

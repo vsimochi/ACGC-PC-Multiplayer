@@ -365,6 +365,7 @@ static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
     aNPC_set_over_friendship(nactorx);
     aNPC_actor_move_show_before(actorx, game);
 #ifdef TARGET_PC
+    aNPC_pc_lease_update(nactorx); /* Patch 8: the same exclusive conversation lease as the outdoor villagers */
     pc_room_follow = aNPC_pc_room_follow(nactorx, actorx, play);
     if (!pc_room_follow) {
 #endif

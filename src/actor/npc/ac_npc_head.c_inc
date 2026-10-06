@@ -111,6 +111,23 @@ static void aNPC_look_target(NPC_ACTOR* nactorx, GAME_PLAY* play) {
         }
     }
 
+#ifdef TARGET_PC
+    if (nactorx->palActor == NULL && prio == 1) { /* Patch 8: idle look-at -- the NEAREST player; a remote player nearer than the local one wins (a head angle is local presentation, nothing is networked) */
+        float rx, ry, rz;
+        f32 local_d = (target != NULL) ? nactorx->actor_class.player_distance_xz : 1e9f;
+        if (local_d > 24.0f && pc_net_game_nearest_remote_player(nactorx->actor_class.world.position.x, nactorx->actor_class.world.position.z, 120.0f, &rx, &ry, &rz)) {
+            float dx = rx - nactorx->actor_class.world.position.x, dz = rz - nactorx->actor_class.world.position.z;
+            if (dx * dx + dz * dz < local_d * local_d) {
+                xyz_t at;
+                at.x = rx;
+                at.y = ry + 20.0f;
+                at.z = rz;
+                aNPC_set_head_request(nactorx, prio, aNPC_HEAD_TARGET_POS, NULL, &at);
+                target = NULL;
+            }
+        }
+    }
+#endif
     if (target != NULL) {
         aNPC_set_head_request(nactorx, prio, aNPC_HEAD_TARGET_ACTOR, target, NULL);
     }

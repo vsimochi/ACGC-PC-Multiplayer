@@ -477,23 +477,25 @@ def h7_protocol(port, log_dir, bin_dir, check):
               seen(r"HOLD slot=%d npc=0x%04X peers=0x%04X" % (slot, npc, ma), m))
         m = mark()
         b.send_reliable(npc_talk_msg(slot, npc, True, 1))
-        check("H7 (2) B begin on the same villager: HOLD peers=A|B", seen(
-            r"HOLD slot=%d npc=0x%04X peers=0x%04X" % (slot, npc, ma | mb_), m))
+        check("H7 (2) B begin on the same villager: DENIED (Patch 8: the lease is exclusive, A keeps it)", seen(
+            r"DENIED peer=%d slot=%d npc=0x%04X" % (b.assigned_peer_id, slot, npc), m))
         m = mark()
         a.send_reliable(npc_talk_msg(slot, npc, False, 2))
-        check("H7 (3) A end: hold stays (peers=B), NO release yet",
-              seen(r"HOLD slot=%d npc=0x%04X peers=0x%04X" % (slot, npc, mb_), m) and
-              absent(r"RELEASE slot=%d" % slot, m))
+        check("H7 (3) A end: the lease is RELEASED (exclusive owner ended)",
+              seen(r"RELEASE slot=%d npc=0x%04X" % (slot, npc), m))
         m = mark()
         a.send_reliable(npc_talk_msg(slot, npc, True, 1))  # stale (<= last seq 2)
         check("H7 (4) stale seq begin rejected and does NOT resurrect A's hold",
               seen(r"REJECT peer=%d slot=%d .*stale" % (a.assigned_peer_id, slot), m) and
-              absent(r"HOLD slot=%d npc=0x%04X peers=0x%04X" % (slot, npc, ma | mb_), m, 0.3))
+              absent(r"HOLD slot=%d npc=0x%04X peers=0x%04X" % (slot, npc, ma), m, 0.3))
         m = mark()
         a.send_reliable(npc_talk_msg(slot, npc, False, 3))  # A is not holding: must not clear B
         time.sleep(0.8)
-        check("H7 (5) END from a peer that holds nothing is ignored (B still holds, no RELEASE)",
+        check("H7 (5) END from a peer that holds nothing is ignored (no RELEASE)",
               absent(r"RELEASE slot=%d" % slot, m, 0.1))
+        m = mark()
+        b.send_reliable(npc_talk_msg(slot, npc, True, 2))
+        check("H7 (5b) B can take the villager now that A released it", seen(r"HOLD slot=%d npc=0x%04X peers=0x%04X" % (slot, npc, mb_), m))
         m = mark()
         a.send_reliable(npc_talk_msg(slot, (npc ^ 0x0001) & 0xFFFF, True, 4))
         check("H7 (6) wrong npc_id rejected", seen(r"REJECT peer=%d slot=%d .*npc_id" % (a.assigned_peer_id, slot), m))
@@ -510,8 +512,8 @@ def h7_protocol(port, log_dir, bin_dir, check):
         a.send_reliable(scene_msg(SCENE_FG, 3))
         time.sleep(0.4)
         m = mark()
-        b.send_reliable(npc_talk_msg(slot, npc, False, 2))
-        check("H7 (9) B end: END + RELEASE (only after BOTH peers ended)",
+        b.send_reliable(npc_talk_msg(slot, npc, False, 3))
+        check("H7 (9) B end: END + RELEASE",
               seen(r"END peer=%d slot=%d" % (b.assigned_peer_id, slot), m) and
               seen(r"RELEASE slot=%d npc=0x%04X" % (slot, npc), m))
         # leaving the town field releases the peer's hold; disconnect releases too; reconnect restarts the seq
@@ -520,7 +522,7 @@ def h7_protocol(port, log_dir, bin_dir, check):
         time.sleep(0.5)
         a.send_reliable(scene_msg(SCENE_SHOP0, 4))
         check("H7 (10) peer announcing a non-town scene releases its hold (left the town field)",
-              seen(r"RELEASE slot=%d npc=0x%04X \(peer %d left the town field\)" % (slot, npc, a.assigned_peer_id), m))
+              seen(r"RELEASE slot=%d npc=0x%04X \(peer %d left the villager's surroundings\)" % (slot, npc, a.assigned_peer_id), m))
         a.send_reliable(scene_msg(SCENE_FG, 5))
         time.sleep(0.4)
         m = mark()
