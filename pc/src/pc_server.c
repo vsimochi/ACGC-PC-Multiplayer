@@ -226,12 +226,49 @@ static void ps_ini_write(const char* path, const PSIni* c, const char* id, unsig
     }
 }
 
+/* First launch with a valid legacy town: ASK (synchronously, on the console, before the game boots) instead of adopting it silently. The legacy file is only READ here (its town name).
+ * 1 = use it (adopt by copy), 0 = generate a new town (the legacy files are not touched), -1 = no answer possible (stdin closed). */
+static int ps_ask_legacy_town(const char* legacy_gci) {
+    unsigned char nm[8];
+    char text[24], line[64];
+    FILE* f = fopen(legacy_gci, "rb");
+    size_t i;
+    if (f == NULL || fseek(f, 0x40 + 0x26000 + 0x9120, SEEK_SET) != 0 || fread(nm, 1, 8, f) != 8) { /* GCI header + Save_t, land_info.name */
+        if (f != NULL) {
+            fclose(f);
+        }
+        memcpy(nm, "Village ", 8);
+    } else {
+        fclose(f);
+    }
+    for (i = 0; i < 8; i++) {
+        text[i] = (nm[i] >= 0x20 && nm[i] < 0x7F) ? (char)nm[i] : '?';
+    }
+    text[8] = '\0';
+    for (i = 8; i > 0 && text[i - 1] == ' '; i--) {
+        text[i - 1] = '\0';
+    }
+    for (;;) {
+        printf("\nWe noticed a save with the town named \"%s\".\nWould you like to use this town or generate a new one?\n[1] Use this town\n[2] Generate new town\n> ", text);
+        fflush(stdout);
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            printf("\n[SERVER] console input is closed: cannot ask which town to use\n");
+            return -1;
+        }
+        if ((line[0] == '1' || line[0] == '2') && (line[1] == '\n' || line[1] == '\r' || line[1] == '\0')) {
+            return line[0] == '1' ? 1 : 0;
+        }
+        printf("Please enter 1 or 2.\n");
+    }
+}
+
 int pc_server_open(const char* id, uint16_t port, char* err, size_t errcap) {
     char p[PS_PATH + 64], legacy_gci[PS_PATH];
     const char* sub[] = { "town/card_a", "citizens", "residents", "backups", "logs" };
     size_t i;
     PSIni ini;
     int had_ini;
+    int legacy_choice = 0;
     if (s_active) {
         return 1;
     }
@@ -278,8 +315,12 @@ int pc_server_open(const char* id, uint16_t port, char* err, size_t errcap) {
     snprintf(legacy_gci, sizeof(legacy_gci), "save/card_a/" PC_TOWN_GCI_FILENAME);
     if (ps_exists(p)) {
         s_town_missing = 0;
-    } else if (!ini.has_town && strcmp(s_id, PC_SERVER_DEFAULT_ID) == 0 && ps_gci_plausible(legacy_gci)) {
-        /* An existing legacy dedicated town: ADOPT it by COPY (the legacy files are never moved, deleted or modified; nothing here is overwritten). */
+    } else if (!ini.has_town && strcmp(s_id, PC_SERVER_DEFAULT_ID) == 0 && ps_gci_plausible(legacy_gci) && (legacy_choice = ps_ask_legacy_town(legacy_gci)) != 0) {
+        /* An existing legacy dedicated town the operator chose to USE: ADOPT it by COPY (the legacy files are never moved, deleted or modified; nothing here is overwritten). */
+        if (legacy_choice < 0) {
+            ps_seterr(err, errcap, "a legacy town exists at %s and no answer could be read from the console; run the server from an interactive console (nothing was changed)", legacy_gci);
+            return 0;
+        }
         if (!ps_copy_new(legacy_gci, p)) {
             ps_seterr(err, errcap, "the legacy town %s could not be copied to %s (nothing was changed there)", legacy_gci, p);
             return 0;
