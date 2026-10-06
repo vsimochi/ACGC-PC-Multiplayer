@@ -376,6 +376,57 @@ static int pc_ded_pop_line(PCDedLine* out) {
     return got;
 }
 
+/* One console line, read SYNCHRONOUSLY from the server console's own input (interactive mode: the CONIN$ buffer of the window this process opened; otherwise the redirected stdin), before the
+ * stdin reader thread exists. Byte-wise on purpose: nothing beyond the newline is consumed, so the reader thread started later sees the rest. 1 = a line (no newline) in buf, 0 = EOF / error. */
+int pc_dedicated_read_line_blocking(char* buf, size_t cap) {
+    size_t n = 0;
+    char c;
+    if (buf == NULL || cap < 2) {
+        return 0;
+    }
+#ifdef _WIN32
+    {
+        HANDLE h = s_ded_conin != NULL ? s_ded_conin : (HANDLE)_get_osfhandle(0);
+        if (h == NULL || h == INVALID_HANDLE_VALUE) {
+            return 0;
+        }
+        for (;;) {
+            DWORD got = 0;
+            if (!ReadFile(h, &c, 1, &got, NULL) || got == 0) {
+                if (n == 0) {
+                    return 0;
+                }
+                break;
+            }
+            if (c == '\n') {
+                break;
+            }
+            if (c != '\r' && n + 1 < cap) {
+                buf[n++] = c;
+            }
+        }
+    }
+#else
+    for (;;) {
+        ssize_t got = read(0, &c, 1);
+        if (got <= 0) {
+            if (n == 0) {
+                return 0;
+            }
+            break;
+        }
+        if (c == '\n') {
+            break;
+        }
+        if (c != '\r' && n + 1 < cap) {
+            buf[n++] = c;
+        }
+    }
+#endif
+    buf[n] = '\0';
+    return 1;
+}
+
 void pc_dedicated_prompt_town_name(void) {
     uint8_t codes[8];
     char err[96], text[24];

@@ -17,6 +17,7 @@
 #define PC_DEDICATED_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "pc_net_game.h" /* PC_NETGAME_NAME_LEN */
 
 #ifdef __cplusplus
@@ -42,6 +43,8 @@ void pc_dedicated_startup(uint16_t port);
  * through the SAME stdin reader / queue the console commands use (no second reader thread). Called once after pc_dedicated_startup(), before the game boots. When stdin is
  * closed / unavailable (EOF before a valid name) the fallback name "Village" is used. The chosen name goes to pc_server_set_town_name(). */
 void pc_dedicated_prompt_town_name(void);
+/* One console line read synchronously from the server console (interactive window or redirected stdin); 1 = line, 0 = EOF. Used by the pre-boot legacy-town question. */
+int  pc_dedicated_read_line_blocking(char* buf, size_t cap);
 
 /* pc_platform_init(): BEFORE SDL_Init select SDL's dummy audio driver (env + OVERRIDE hint) and keep timer resolution requests honoured for a hidden
  * window; AFTER SDL_Init verify the dummy driver is the one that opened (returns 0 = refuse to continue). */

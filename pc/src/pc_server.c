@@ -251,11 +251,11 @@ static int ps_ask_legacy_town(const char* legacy_gci) {
     for (;;) {
         printf("\nWe noticed a save with the town named \"%s\".\nWould you like to use this town or generate a new one?\n[1] Use this town\n[2] Generate new town\n> ", text);
         fflush(stdout);
-        if (fgets(line, sizeof(line), stdin) == NULL) {
+        if (!pc_dedicated_read_line_blocking(line, sizeof(line))) {
             printf("\n[SERVER] console input is closed: cannot ask which town to use\n");
             return -1;
         }
-        if ((line[0] == '1' || line[0] == '2') && (line[1] == '\n' || line[1] == '\r' || line[1] == '\0')) {
+        if ((line[0] == '1' || line[0] == '2') && line[1] == '\0') {
             return line[0] == '1' ? 1 : 0;
         }
         printf("Please enter 1 or 2.\n");
