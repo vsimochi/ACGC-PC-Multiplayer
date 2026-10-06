@@ -525,6 +525,12 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             }
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_EVNPC_GIFT_GONE:
+            nk_text(&b, "Hm? I gave my gift away");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nto someone else, I'm afraid.\nMaybe next time!");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_WORK_V_FAIL:
             nk_text(&b, "Hm? I do not know what");
             nk_pause(&b, 6);

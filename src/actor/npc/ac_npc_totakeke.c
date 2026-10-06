@@ -9,6 +9,9 @@
 #include "m_player_lib.h"
 #include "m_string_data.h"
 #include "m_ledit_ovl.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Patch 4: pc_net_game_evnpc_claim_*() */
+#endif
 
 #ifdef TARGET_PC
 static void aNTT_schedule_proc(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play, int schedule_id);

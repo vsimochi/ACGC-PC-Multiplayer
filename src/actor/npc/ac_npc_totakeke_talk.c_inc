@@ -38,6 +38,9 @@ static void aTTN_give_merody(NPC_TOTAKEKE_ACTOR* totakeke) {
     }
 }
 
+#ifdef TARGET_PC
+static void aNTT_pc_claim_start(NPC_TOTAKEKE_ACTOR* totakeke, int path, int song);
+#endif
 static void aNTT_talk_select0(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play) {
     int value = mDemo_Get_OrderValue(mDemo_ORDER_NPC0, 0x9);
     aNTT_event_save_c* save = (aNTT_event_save_c*)mEv_get_save_area(mEv_EVENT_KK_SLIDER, 0xa);
@@ -77,6 +80,12 @@ static void aNTT_talk_select1(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play) {
                     totakeke->song = CLIP(mikanbox_clip)->search_merody_proc();
                 }
                 totakeke->_99f = totakeke->song;
+#ifdef TARGET_PC
+                if (pc_net_game_evnpc_claim_active()) {
+                    aNTT_pc_claim_start(totakeke, 0, totakeke->song); /* a READY client: the HOST decides whether this player gets the song */
+                    break;
+                }
+#endif
                 CLIP(mikanbox_clip)->set_itemstr_proc(mMsg_ITEM_STR1, totakeke->song);
                 CLIP(mikanbox_clip)->set_itemstr_proc(mMsg_ITEM_STR2, totakeke->song);
                 mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), MSG_TOTAKEKE_START + 10);
@@ -128,6 +137,12 @@ static void aNTT_talk_submenu2(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play) {
             totakeke->song = 0x37 + (int)RANDOM_F(3);
         } else {
             totakeke->song = submenu_item->item - ITM_MINIDISK_START;
+#ifdef TARGET_PC
+            if (pc_net_game_evnpc_claim_active()) {
+                aNTT_pc_claim_start(totakeke, 1, totakeke->song); /* a READY client: the HOST decides whether this player gets the song */
+                return;
+            }
+#endif
             if (totakeke->song >= 0x34) {
                 mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), MSG_TOTAKEKE_START + 8);
             } else {
@@ -141,6 +156,78 @@ static void aNTT_talk_submenu2(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play) {
     }
 }
 
+#ifdef TARGET_PC
+/* Event NPC authority (Patch 4): on a READY client the song is a HOST decision (EVNPC claim op 2: the per-player "got a song at this concert" bit lives on the host, so a reconnect or a client
+ * restart cannot ask twice). The talk continues exactly like the vanilla one once the host answered: APPLIED = the song is already in the pockets (the host's post-image), no room = the
+ * vanilla "pockets full" ending, refused = K.K.'s "I already gave you one" line. */
+static int aNTT_pc_path;
+static int aNTT_pc_req;
+static int aNTT_pc_stage;
+
+static void aNTT_pc_claim_start(NPC_TOTAKEKE_ACTOR* totakeke, int path, int song) {
+    aNTT_pc_path = path;
+    aNTT_pc_req = song;
+    aNTT_pc_stage = 0;
+    aNTT_change_talk_proc(totakeke, aNTT_TALK_PC_CLAIM);
+}
+
+static void aNTT_pc_claim_continue(NPC_TOTAKEKE_ACTOR* totakeke, int granted) {
+    aNTT_event_save_c* save = (aNTT_event_save_c*)mEv_get_save_area(mEv_EVENT_KK_SLIDER, 0xa);
+    if (aNTT_pc_path == 0) {
+        CLIP(mikanbox_clip)->set_itemstr_proc(mMsg_ITEM_STR1, totakeke->song);
+        CLIP(mikanbox_clip)->set_itemstr_proc(mMsg_ITEM_STR2, totakeke->song);
+        mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), MSG_TOTAKEKE_START + 10);
+    } else {
+        if (totakeke->song >= 0x34) {
+            mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), MSG_TOTAKEKE_START + 8);
+        } else {
+            mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), MSG_TOTAKEKE_START + 9);
+        }
+        CLIP(mikanbox_clip)->set_itemstr_proc(mMsg_ITEM_STR2, totakeke->song);
+    }
+    if (granted) {
+        totakeke->post_roll_think = aNTT_THINK_GIVE_MERODY;
+        if (save != NULL) {
+            save->bitfield = aNTT_bitset_func(save->bitfield, aNTT_FLAG_AIRCHECK_RECEIVED);
+        }
+        CLIP(mikanbox_clip)->check_merody_proc(totakeke->song);
+    } else {
+        totakeke->post_roll_think = aNTT_THINK_POCKETS_FULL;
+    }
+    aNTT_change_talk_proc(totakeke, aNTT_TALK_STOP_PLAYER);
+    totakeke->pre_roll_think = aNTT_THINK_ROLL2;
+}
+
+static void aNTT_talk_pc_claim(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play) {
+    int r;
+    if (aNTT_pc_stage == 0) {
+        r = pc_net_game_evnpc_claim_begin(2, aNTT_pc_req);
+        if (r < 0) {
+            return; /* another transaction is unresolved: next frame */
+        }
+        if (r == 0) {
+            aNTT_pc_claim_continue(totakeke, 0); /* nothing sent (no free pocket slot): the vanilla pockets-full ending */
+            return;
+        }
+        aNTT_pc_stage = 1;
+        return;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return;
+    }
+    if (r == PC_NETGAME_TS_OP_APPLIED && pc_net_game_evnpc_claim_item() != EMPTY_NO) {
+        totakeke->song = pc_net_game_evnpc_claim_item() - ITM_MINIDISK_START;
+        aNTT_pc_claim_continue(totakeke, 1);
+    } else {
+        printf("[NET][EVNPC] K.K.: the host refused the song (reason %d) -> the 'already got one' line\n", (int)pc_net_game_ts_last_reject_reason());
+        mMsg_Set_ForceNext(mMsg_Get_base_window_p());
+        mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), MSG_TOTAKEKE_START + 4);
+        aNTT_change_talk_proc(totakeke, aNTT_TALK_NONE);
+    }
+}
+#endif
+
 static void aNTT_talk_give(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play) {
     int value = mDemo_Get_OrderValue(mDemo_ORDER_NPC0, 0x1);
     if (value == 0x2) {
@@ -152,8 +239,12 @@ static void aNTT_talk_give(NPC_TOTAKEKE_ACTOR* totakeke, GAME_PLAY* play) {
 }
 
 static int aNTT_change_talk_proc(NPC_TOTAKEKE_ACTOR* totakeke, int talk) {
-    static aNTT_PROC proc[7] = { (aNTT_PROC)none_proc1, aNTT_talk_select0,  aNTT_talk_select1, aNTT_talk_stop_player,
-                                 aNTT_talk_submenu,     aNTT_talk_submenu2, aNTT_talk_give };
+    static aNTT_PROC proc[] = { (aNTT_PROC)none_proc1, aNTT_talk_select0,  aNTT_talk_select1, aNTT_talk_stop_player,
+                                 aNTT_talk_submenu,     aNTT_talk_submenu2, aNTT_talk_give
+#ifdef TARGET_PC
+                                 , aNTT_talk_pc_claim
+#endif
+    };
     totakeke->proc = proc[talk];
     if (talk == aNTT_TALK_STOP_PLAYER) {
         mEv_SetTitleDemo(mEv_TITLEDEMO_STAFFROLL);
@@ -249,3 +340,36 @@ static int aNTT_talk_end_chk(ACTOR* actorx, GAME* game) {
     }
     return res;
 }
+
+#ifdef TARGET_PC
+/* Event NPC authority (Patch 4): K.K.'s song is a per-PLAYER gift (one bit of the save area per player; the foreigners share one bit). The HOST keeps the bits of the claimants:
+ * claimant = the resident slot 0..3 (the bit the vanilla talk would set), or -1 for a guest. check returns 1 = may be given (*song set: the requested song, or a random one for 0xFFFF), 0 = no
+ * concert / bad song, 2 = this player already got a song at this concert. */
+int aNTT_pc_host_song_check(int claimant, int request, int* song) {
+    aNTT_event_save_c* save = (aNTT_event_save_c*)mEv_get_save_area(mEv_EVENT_KK_SLIDER, 0xa);
+    aNTT_event_common_c* common = (aNTT_event_common_c*)mEv_get_common_area(mEv_EVENT_KK_SLIDER, 0x10);
+    int got;
+    if (Save_Get(event_save_common).weekly_event.type != mEv_EVENT_KK_SLIDER || save == NULL || common == NULL) {
+        return 0;
+    }
+    got = (claimant >= 0 && claimant < PLAYER_NUM) ? (save->bitfield & ((u16)aNTT_FLAG_AIRCHECK_RECEIVED << claimant)) != 0 : (common->foreigner_bitfield & aNTT_FLAG_AIRCHECK_RECEIVED) != 0;
+    if (got) {
+        return 2;
+    }
+    *song = request;
+    return (*song >= 0 && *song <= 0x36) ? 1 : 0; /* the 55 songs; K.K.'s random song (0x37..) is no item and never claimed */
+}
+
+void aNTT_pc_host_song_commit(int claimant) {
+    aNTT_event_save_c* save = (aNTT_event_save_c*)mEv_get_save_area(mEv_EVENT_KK_SLIDER, 0xa);
+    aNTT_event_common_c* common = (aNTT_event_common_c*)mEv_get_common_area(mEv_EVENT_KK_SLIDER, 0x10);
+    if (save == NULL || common == NULL) {
+        return;
+    }
+    if (claimant >= 0 && claimant < PLAYER_NUM) {
+        save->bitfield |= (u16)((u16)aNTT_FLAG_AIRCHECK_RECEIVED << claimant);
+    } else {
+        common->foreigner_bitfield |= aNTT_FLAG_AIRCHECK_RECEIVED;
+    }
+}
+#endif

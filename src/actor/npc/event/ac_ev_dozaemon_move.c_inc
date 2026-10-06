@@ -53,6 +53,50 @@ static void aEDZ_talk_okiagaru(DOZAEMON_ACTOR* dozaemon, GAME_PLAY* play) {
     }
 }
 
+#ifdef TARGET_PC
+/* Patch 4: the claim of Gulliver's gift (EVNPC op 1). APPLIED = the host rolled the item and put it into the free pocket slot (post-image), the hand-over animation then runs without a local grant;
+ * refused (somebody else got the gift first / no room) = Gulliver's "I already gave it away" row, and the talk ends. */
+static int aEDZ_pc_stage;
+static void aEDZ_pc_give_claim(DOZAEMON_ACTOR* dozaemon, mEv_dozaemon_c* dozaemon_ev) {
+    int r;
+    if (aEDZ_pc_stage == 0) {
+        r = pc_net_game_evnpc_claim_begin(1, 0);
+        if (r < 0) {
+            return;
+        }
+        if (r == 0) {
+            mMsg_SET_CONTINUE_MSG_NUM(pc_nook_msg_id(PC_NOOK_MSG_EVNPC_GIFT_GONE));
+            aEDZ_change_talk_proc(dozaemon, aEDZ_TALK_END_WAIT);
+            return;
+        }
+        aEDZ_pc_stage = 1;
+        return;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return;
+    }
+    aEDZ_pc_stage = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED && pc_net_game_evnpc_claim_item() != EMPTY_NO) {
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 1, 2);
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC1, 0, pc_net_game_evnpc_claim_item());
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC1, 1, aHOI_REQUEST_PUTAWAY);
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC1, 2, FALSE);
+        dozaemon_ev->flags |= aEDZ_SAVE_FLAG_GIVE;
+        Save_Get(event_save_common).dozaemon_completed = TRUE;
+        if ((dozaemon_ev->flags & aEDZ_SAVE_FLAG_GAVE_FIRST) != 0) {
+            mMsg_SET_CONTINUE_MSG_NUM(0x2406);
+        } else {
+            mMsg_SET_CONTINUE_MSG_NUM(0x2407);
+        }
+    } else {
+        printf("[NET][EVNPC] Gulliver: the host refused the gift (reason %d) -> 'already given' row\n", (int)pc_net_game_ts_last_reject_reason());
+        mMsg_SET_CONTINUE_MSG_NUM(pc_nook_msg_id(PC_NOOK_MSG_EVNPC_GIFT_GONE));
+    }
+    aEDZ_change_talk_proc(dozaemon, aEDZ_TALK_END_WAIT);
+}
+#endif
+
 static void aEDZ_talk_give(DOZAEMON_ACTOR* dozaemon, GAME_PLAY* play) {
     mEv_dozaemon_c* dozaemon_ev = (mEv_dozaemon_c*)mEv_get_save_area(mEv_EVENT_DOZAEMON, 13);
     
@@ -61,6 +105,12 @@ static void aEDZ_talk_give(DOZAEMON_ACTOR* dozaemon, GAME_PLAY* play) {
             dozaemon->give_flag = FALSE;
         }
     } else if (mMsg_CHECK_MAINNORMALCONTINUE()) {
+#ifdef TARGET_PC
+        if (pc_net_game_evnpc_claim_active()) {
+            aEDZ_pc_give_claim(dozaemon, dozaemon_ev); /* a READY client: the HOST decides who gets Gulliver's gift (one per visit, for anybody) */
+            return;
+        }
+#endif
         aEDZ_ageru();
         dozaemon_ev->flags |= aEDZ_SAVE_FLAG_GIVE;
         Save_Get(event_save_common).dozaemon_completed = TRUE;
@@ -186,3 +236,26 @@ static int aEDZ_talk_end_chk(ACTOR* actorx, GAME* game) {
 
     return ret;
 }
+
+#ifdef TARGET_PC
+/* Event NPC authority (Patch 4): the HOST decides Gulliver's gift. check = the event is Gulliver's and nobody got the gift yet; it rolls the item with the host's RNG and shop state.
+ * commit = the gift is given (the same two writes the vanilla talk makes: the save flag and dozaemon_completed, which also sends Gulliver home on every process). */
+int aEDZ_pc_host_gift_check(mActor_name_t* item) {
+    if (Save_Get(event_save_common).weekly_event.type != mEv_EVENT_DOZAEMON) {
+        return 0;
+    }
+    if (Save_Get(event_save_common).dozaemon_completed == TRUE) {
+        return 2; /* already given */
+    }
+    mSP_SelectRandomItem_New(NULL, item, 1, NULL, 0, mSP_KIND_FURNITURE, mSP_LISTTYPE_JONASON, FALSE);
+    return *item != EMPTY_NO ? 1 : 0;
+}
+
+void aEDZ_pc_host_gift_commit(void) {
+    mEv_dozaemon_c* dozaemon_ev = (mEv_dozaemon_c*)mEv_get_save_area(mEv_EVENT_DOZAEMON, 13);
+    if (dozaemon_ev != NULL) {
+        dozaemon_ev->flags |= aEDZ_SAVE_FLAG_GIVE;
+    }
+    Save_Get(event_save_common).dozaemon_completed = TRUE;
+}
+#endif

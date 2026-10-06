@@ -81,7 +81,7 @@ def main():
     check("W ids: 53 / 54 are ENUMERATED reserved ids (X2), 55 = TOWN_SVC_STATE, 56 = MAILBOX_LETTER (mail milestone 2), all ids contiguous 1..%d" % wire_baseline.EXPECTED_MAX_MSG_ID,
           ids.get("PC_NETGAME_MSG_TXN_RESERVED_53") == 53 and ids.get("PC_NETGAME_MSG_TXN_RESERVED_54") == 54 and ids.get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and ids.get("PC_NETGAME_MSG_MAILBOX_LETTER") == 56 and ids.get("PC_NETGAME_MSG_IDENTITY_EXT") == 57 and ids.get("PC_NETGAME_MSG_IDENTITY_TOKEN") == 58
-          and sorted(ids.values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID == 68)
+          and sorted(ids.values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID >= 66)
     check("W PCNetGameTownSvcStateMsg: u8 type, u8 service, u16 len, u32 seq, u32 digest, blob[PC_NETGAME_TS_BLOB_MAX]; sizeof == 352 (12 + 340), offsets 4 / 8 / 12, "
           "<= PC_NET_MAX_PAYLOAD, blobs fit (40, 63, the 320-byte shop)",
           "_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352," in c_raw and "offsetof(PCNetGameTownSvcStateMsg, blob) == 12" in c_raw

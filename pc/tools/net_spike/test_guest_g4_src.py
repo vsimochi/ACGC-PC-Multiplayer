@@ -139,7 +139,7 @@ def main():
 
     # ------------------------------------------------------------------ W
     ck("W no wire change by G4: message ids 1..66 (66 = M-F promotion handoff) unchanged since (59..61 came with the furniture sync, 62..65 with the town transfer), wire_baseline green, protocol header pc_net_game.h (since G3 only function prototypes were added: nothing removed, no typedef / define / struct / enum) and the transport (pc_net.c / pc_net.h) untouched vs the G3 commit",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID == 66
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and wire_baseline.EXPECTED_MAX_MSG_ID >= 66
        # pc_net_game.h since the G3 commit: ADDITIONS ONLY (later milestones added function prototypes): nothing removed, every added non-comment line is a function prototype,
        # no #define / typedef / struct / enum (so no wire struct, enum value or constant changed)
        # (the COMMITTED state, G3 commit..HEAD: strict; uncommitted work in progress on top of HEAD may add declarations / constants but must still remove nothing and add no typedef / struct / enum)

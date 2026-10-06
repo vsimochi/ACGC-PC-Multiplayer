@@ -16,6 +16,7 @@
 #include "m_random_field.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* events: pc_net_game_event_client_gate() */
+#define aEvMgr_HOST_UNBOUNDED(name) pc_net_game_evnpc_host_unbounded((int)(name)) /* Patch 4: the host creates its event NPCs whether or not a player is near */
 #endif
 #include "zurumode.h"
 #include "_mem.h"
@@ -1615,11 +1616,11 @@ static mEv_place_data_c* show_actor_at_wade(EVENT_MANAGER_ACTOR* evmgr, aEvMgr_e
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
@@ -1664,11 +1665,11 @@ static mEv_place_data_c* show_actor_at_wade_checkless(EVENT_MANAGER_ACTOR* evmgr
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
@@ -1699,12 +1700,12 @@ static mEv_place_data_c* show_actor_at_wade_checkfgcol(EVENT_MANAGER_ACTOR* evmg
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_check_in_nearby_area((const BlockOrUnit_c*)&place_data->block, &ctrl->block, quadrant) ==
-                FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(((mEv_place_data_c*)place_data)->actor_name) &&
+                aEvMgr_check_in_nearby_area((const BlockOrUnit_c*)&place_data->block, &ctrl->block, quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 

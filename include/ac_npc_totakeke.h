@@ -104,6 +104,10 @@ enum aNTT_talk_proc {
     aNTT_TALK_SUBMENU,
     aNTT_TALK_SUBMENU2,
     aNTT_TALK_GIVE
+#ifdef TARGET_PC
+    ,
+    aNTT_TALK_PC_CLAIM /* Patch 4: a networked client waits for the host to grant the song */
+#endif
 };
 
 enum aNTT_think_proc {

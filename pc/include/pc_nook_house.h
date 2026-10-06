@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 32
+#define PC_NOOK_MSG_COUNT 33
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -44,7 +44,8 @@ enum {
     PC_NOOK_MSG_WORK_PARCEL,     /* TAKE_PARCEL done: "here is the parcel for <villager>" */
     PC_NOOK_MSG_WORK_V_GIVE,     /* the villager hands over the fetched item (spoken by the villager) */
     PC_NOOK_MSG_WORK_V_RECEIVE,  /* the villager receives the parcel (+ the optional tip) */
-    PC_NOOK_MSG_WORK_V_FAIL      /* the villager does not know what this is about */
+    PC_NOOK_MSG_WORK_V_FAIL,     /* the villager does not know what this is about */
+    PC_NOOK_MSG_EVNPC_GIFT_GONE  /* Gulliver: his gift of this visit was already given away (the host decided) */
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */

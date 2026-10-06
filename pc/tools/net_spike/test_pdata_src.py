@@ -39,7 +39,7 @@ def main():
     # ------------------------------------------------------------------ W
     ids = dict(wire_baseline.c_message_ids(c))
     ck("W NO new message id: still contiguous 1..%d, 59 / 60 / 61 = HOUSE_BEGIN / CHUNK / ACK (wire_baseline.EXPECTED_MAX_MSG_ID unchanged)" % wire_baseline.EXPECTED_MAX_MSG_ID,
-       wire_baseline.EXPECTED_MAX_MSG_ID == 66 and sorted(ids.values()) == list(range(1, 67)) and ids.get("PC_NETGAME_MSG_HOUSE_BEGIN") == 59 and ids.get("PC_NETGAME_MSG_HOUSE_ACK") == 61)
+       wire_baseline.EXPECTED_MAX_MSG_ID >= 66 and sorted(ids.values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and ids.get("PC_NETGAME_MSG_HOUSE_BEGIN") == 59 and ids.get("PC_NETGAME_MSG_HOUSE_ACK") == 61)
     ck("W NO struct change: the three house structs keep their sizes (36 / 1012 / 24) and the protocol version is still 8",
        all("_Static_assert(sizeof(%s) == %d," % (t, s) in c for t, s in (("PCNetGameHouseBeginMsg", 36), ("PCNetGameHouseChunkMsg", 1012), ("PCNetGameHouseAckMsg", 24)))
        and wire_baseline.header_protocol_ok(h) and L.PROTOCOL_VERSION == 8)

@@ -183,7 +183,7 @@ def main():
 
     # ------------------------------------------------------------------ D
     ck("D no wire change: message ids 1..66 (66 = M-F promotion handoff) (59..61 = the furniture sync, 62..65 = the town transfer, none is a REJECT_INFO), the protocol version unchanged, wire_baseline green",
-       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, 67)) and "PC_NETGAME_MSG_REJECT_INFO" not in ng_raw)
+       sorted(dict(wire_baseline.c_message_ids(ng_raw)).values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and "PC_NETGAME_MSG_REJECT_INFO" not in ng_raw)
     wb = []
     wire_baseline.run(lambda d, cond: wb.append((d, cond)), ROOT)
     ck("D wire_baseline: %d checks, all green" % len(wb), wb and all(c for _d, c in wb))

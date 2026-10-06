@@ -464,6 +464,11 @@ static int aNPC_setupActor_proc(GAME_PLAY* play, mActor_name_t name, s8 idx, int
     s16 profile;
     xyz_t pos;
 
+#ifdef TARGET_PC
+    if (pc_net_game_evnpc_suppress_spawn((int)name)) {
+        return TRUE; /* Patch 4: the HOST owns this event NPC; the local event code must not create a second one (the host's table drives the actors) */
+    }
+#endif
     profile = mAc_PROFILE_NORMAL_NPC;
     switch (ITEM_NAME_GET_TYPE(name)) {
         case NAME_TYPE_SPNPC:

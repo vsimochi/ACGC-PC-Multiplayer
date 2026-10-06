@@ -1125,6 +1125,18 @@ void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, 
 int  pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, float* out_pos_x, float* out_pos_y, float* out_pos_z, int16_t* out_facing_angle, int* out_moving,
                                  uint8_t* out_action_type);
 
+/* Event NPC authority (Patch 4). evnpc_synced: the allowlist of event NPC ids the host owns (Gulliver, K.K., the Wisp, the peddlers, ...). suppress_spawn: 1 on a READY client for such an id
+ * (aNPC_setupActor_proc then creates nothing: the host's table drives the local actors). host_unbounded: 1 on the host for such an id (the event manager creates it without the
+ * "a player is nearby" gate). */
+int pc_net_game_evnpc_synced(int npc_id);
+int pc_net_game_evnpc_suppress_spawn(int npc_id);
+int pc_net_game_evnpc_host_unbounded(int npc_id);
+/* Event NPC claims (kind 17): claim_active = a READY client (the event NPC's talk must ask the host); claim_begin(op, arg) op 1 Gulliver's gift, 2 K.K.'s song (arg = song or 0xFFFF): 1 sent
+ * (poll pc_net_game_ts_poll()), 0 refused locally, -1 busy; claim_item = the item the last APPLIED claim granted (already in the pockets). */
+int pc_net_game_evnpc_claim_active(void);
+int pc_net_game_evnpc_claim_begin(int op, int arg);
+int pc_net_game_evnpc_claim_item(void);
+
 /* N3 Channel B: is_home/hide/forced-schedule sync. Host only (no-op for single-player/client): report
  * this villager's current is_home/hide/forced_type/forced_timer -- called once per frame per real
  * Save_t.animals[]-backed villager NPC_ACTOR, whether or not it is currently visible/hidden (see

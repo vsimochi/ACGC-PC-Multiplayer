@@ -1,3 +1,7 @@
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#include "pc_nook_house.h" /* Patch 4: the host-decided gift + the generated "already given" row */
+#endif
 #include "ac_ev_dozaemon.h"
 
 #include "m_common_data.h"

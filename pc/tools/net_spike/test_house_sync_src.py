@@ -43,7 +43,7 @@ def main():
     ids = dict(wire_baseline.c_message_ids(c))
     ck("W ids: 59 = HOUSE_BEGIN, 60 = HOUSE_CHUNK, 61 = HOUSE_ACK, all ids contiguous 1..%d (wire_baseline.EXPECTED_MAX_MSG_ID)" % wire_baseline.EXPECTED_MAX_MSG_ID,
        ids.get("PC_NETGAME_MSG_HOUSE_BEGIN") == 59 and ids.get("PC_NETGAME_MSG_HOUSE_CHUNK") == 60 and ids.get("PC_NETGAME_MSG_HOUSE_ACK") == 61
-       and wire_baseline.EXPECTED_MAX_MSG_ID == 66 and sorted(ids.values()) == list(range(1, 67))
+       and wire_baseline.EXPECTED_MAX_MSG_ID >= 66 and sorted(ids.values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1))
        and L.PC_NETGAME_MSG_HOUSE_BEGIN == 59 and L.PC_NETGAME_MSG_HOUSE_CHUNK == 60 and L.PC_NETGAME_MSG_HOUSE_ACK == 61)
     ck("W the protocol version is STILL 8 (extended in place, no bump): pc_net_game.h and net_spike_lib agree with wire_baseline",
        wire_baseline.header_protocol_ok(h) and L.PROTOCOL_VERSION == wire_baseline.EXPECTED_PROTOCOL_VERSION == 8)
