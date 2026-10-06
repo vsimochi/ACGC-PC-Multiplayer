@@ -1,5 +1,6 @@
 /* pc_main.c - PC entry point: SDL2/GL init and boot sequence */
 #include "pc_platform.h"
+#include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
 #include "pc_gx_internal.h"
 #include "pc_texture_pack.h"
 #include "pc_settings.h"
@@ -603,6 +604,8 @@ int g_pc_shop_test_buy = 0;
 int g_pc_shop_test_sell = 0;
 /* Guest-first town TEST-ONLY hook: --house-buy-test H|auto (client, a guest). See pc_platform.h. */
 const char* g_pc_house_buy_test = NULL;
+/* Guest Nook dialogue (M4) TEST-ONLY hook: --nook-test SPEC (client only). See pc_platform.h. */
+const char* g_pc_nook_test = NULL;
 /* Mail milestone 1 TEST-ONLY hooks: --mail-test-send=<house>[,gift] / --mail-test-force-delivery. See pc_platform.h's own doc comment. */
 const char* g_pc_mail_test_send = NULL;
 int g_pc_mail_test_force_delivery = 0;
@@ -814,6 +817,7 @@ void pc_main_relaunch_poll(void) {
     }
     if (!g_pc_town_fetch) {
         printf("[PC] M-I: promoted; this client was not started with --town-fetch: no automatic relaunch (restart it with --town-fetch / Play Online)\n");
+        pc_net_game_promote_notice_show(); /* the legacy / CLI path still tells the user to restart */
         return;
     }
     err[0] = '\0';
@@ -1325,6 +1329,9 @@ void pc_main_play_online_poll(void) {
             if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
                 pc_net_game_shutdown();
             }
+            if (pc_nook_house_rejoin_hold()) {
+                return; /* guest Nook dialogue (M4): the congratulation row of the purchase is still being read (bounded, see pc_nook_house.h) */
+            }
             if (!pc_play_online_scene_ready()) {
                 if (++s_po.wait > 600) {
                     s_po.state = PO_IDLE;
@@ -1579,6 +1586,8 @@ int main(int argc, char* argv[]) {
                    "                      through the town-service transaction path. See pc_platform.h.\n");
             printf("  --house-buy-test H|auto  Client-only TEST hook (default off; loud logs): as a GUEST buy house H (0..3) or `auto`\n"
                    "                      through the HOUSE_PURCHASE transaction, then re-join as the resident. See pc_platform.h.\n");
+            printf("  --nook-test SPEC    Client-only TEST hook (default off; loud logs) for the guest Nook dialogue: SPEC = wallet=N (set the LOCAL\n"
+                   "                      wallet once) and / or warp (go into Nook's shop). See pc_net_game.c pcnetgame_run_nook_test_hook().\n");
             printf("  --mail-test-send=HOUSE[,gift]  Client-only TEST hook (default off; loud logs): drive ONE real letter to\n"
                    "                      the resident of local house HOUSE through the MAIL_SEND transaction path. See pc_platform.h.\n");
             printf("  --mail-test-force-delivery  HOST-only TEST hook (default off; loud logs): run the vanilla post office\n"
@@ -1700,6 +1709,9 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--house-buy-test") == 0 && i + 1 < argc) {
             g_pc_house_buy_test = argv[++i];
             printf("[NET][HOUSE][TEST-ONLY] --house-buy-test %s armed (a TEST hook: not for normal play)\n", g_pc_house_buy_test);
+        } else if (strcmp(argv[i], "--nook-test") == 0 && i + 1 < argc) {
+            g_pc_nook_test = argv[++i];
+            printf("[NET][HOUSE][TEST-ONLY] --nook-test %s armed (a TEST hook: not for normal play)\n", g_pc_nook_test);
         } else if (strncmp(argv[i], "--mail-test-send=", 17) == 0) {
             g_pc_mail_test_send = argv[i] + 17;
             printf("[NET][MAIL][TEST-ONLY] --mail-test-send=%s armed (a TEST hook: not for normal play)\n", g_pc_mail_test_send);
@@ -1970,6 +1982,11 @@ int main(int argc, char* argv[]) {
     }
     if ((g_pc_mail_test_send != NULL || g_pc_mail_test_take != 0) && g_pc_net_role != 2) {
         fprintf(stderr, "[NET][MAIL][TEST-ONLY] REFUSED: --mail-test-send / --mail-test-take are CLIENT-only test hooks (use them together with --connect)\n");
+        return 2;
+    }
+
+    if (g_pc_nook_test != NULL && g_pc_net_role != 2) {
+        fprintf(stderr, "[NET][HOUSE][TEST-ONLY] REFUSED: --nook-test is a CLIENT-only test hook (use it together with --connect)\n");
         return 2;
     }
 

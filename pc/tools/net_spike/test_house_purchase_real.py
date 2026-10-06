@@ -129,8 +129,8 @@ def run(port, results):
         # ---------------- M: the in-process rejoin
         mo = client.wait_for_log(r"play-online: in-process connect pid=(\d+)", 120.0)
         ctext = client.log_text()
-        ck("H client: RESIDENT_HANDOFF honoured (token.dat + membership.ini written) and REJECT 6 shown", "the host PROMOTED this guest to resident slot 3" in ctext and "token.dat + membership.ini written" in ctext
-           and "promoted to a resident of this town" in ctext)
+        ck("H client: RESIDENT_HANDOFF honoured (token.dat + membership.ini written) and REJECT 6 expected (the generic Cannot-join notice is held back for the in-process rejoin)", "the host PROMOTED this guest to resident slot 3" in ctext and "token.dat + membership.ini written" in ctext
+           and "promoted: REJECT 6 is expected (rejoin pending, the notice is held back)" in ctext)
         ck("M the client re-joins IN-PROCESS (no relaunch): 'M3: promoted: re-joining IN-PROCESS as the resident' and the in-process connect line carries the SAME pid %d" % pid,
            mo is not None and int(mo.group(1)) == pid and "M3: promoted: re-joining IN-PROCESS as the resident (no relaunch)" in ctext and "RELAUNCH" not in ctext and "relaunched as the resident" not in ctext)
         ok2 = wait_count(client, r"-> READY", 2, 240.0)

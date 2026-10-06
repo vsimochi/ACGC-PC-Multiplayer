@@ -451,7 +451,9 @@ def main():
     auth = strip_comments(func_body(mcard, "pc_save_write_authoritative"))
     auth_impl = strip_comments(func_body(mcard, "pc_save_write_authoritative_impl"))
     impl_returns = re.findall(r"\breturn\b[^;]*;", auth_impl)
-    promote_body = strip_comments(func_body(c_raw, "pc_net_game_dedicated_promote"))
+    # the shared core pcnetgame_promote_exec (multi-line signature: the DEFINITION is the last occurrence); the console wrapper pc_net_game_dedicated_promote and the online house purchase both call it
+    _pe = c_raw.rindex("static int pcnetgame_promote_exec(")
+    promote_body = strip_comments(c_raw[_pe:c_raw.index("\n}\n", _pe)])
     pcmain_src = read("src/main.c")
     check("P hook: the authoritative save (periodic / early / shutdown / console / promotion) goes through pc_save_write_gci: pc_save_write_authoritative() = `int ok = pc_save_write_authoritative_impl();` "
           "(+ log / notify), the impl ends with `return pc_save_write_gci();` and has exactly ONE other return (`return FALSE;` inside the CLIENT branch); every save site calls the wrapper",

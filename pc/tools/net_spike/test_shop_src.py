@@ -64,10 +64,12 @@ def main():
     check("W the host's sale ratio PC_NETGAME_SHOP_SELL_RATIO (4u) equals the game's SELL_BUY_RATIO (include/ac_npc_shop_common.h = %s); the stock-code count equals mSP_GOODS_COUNT (39)" % (ratio and ratio.group(1)),
           ratio is not None and ratio.group(1) == "4" and "#define PC_NETGAME_SHOP_SELL_RATIO      4u" in c_raw
           and re.search(r"#define mSP_GOODS_COUNT 39", read("include/m_shop.h")) and L.PC_NETGAME_SHOP_GOODS_COUNT == 39)
-    check("W python formats / constants / reason names equal the C values (kinds 10 / 11, 28 reasons, stock codes, TS_SHOP_LEN, sale ratio)",
+    check("W python formats / constants / reason names equal the C values (kinds 10 / 11, 31 reasons (0..30), stock codes, TS_SHOP_LEN, sale ratio)",
           (L.PC_NETGAME_TXN_KIND_SHOP_BUY, L.PC_NETGAME_TXN_KIND_SHOP_SELL) == (10, 11)
           and (L.PC_NETGAME_SHOP_STOCK_COUNTED, L.PC_NETGAME_SHOP_STOCK_RARE, L.PC_NETGAME_SHOP_STOCK_UNLIMITED) == (0xFD, 0xFE, 0xFF)
-          and [L.TXN_REASON_NAMES[i] for i in (19, 20, 21, 22)] == ["NO_FUNDS", "NOT_SELLABLE", "PRICE_MISMATCH", "NO_ROOM"] and len(L.TXN_REASON_NAMES) == 28  # mail milestone 1: + 23 / 24 / 25; mail milestone 2: + 26 / 27
+          and [L.TXN_REASON_NAMES[i] for i in (19, 20, 21, 22)] == ["NO_FUNDS", "NOT_SELLABLE", "PRICE_MISMATCH", "NO_ROOM"] and len(L.TXN_REASON_NAMES) == 31  # mail milestone 1: + 23 / 24 / 25; mail milestone 2: + 26 / 27; house purchase: + 28 / 29 / 30
+          and [L.TXN_REASON_NAMES[i] for i in (28, 29, 30)] == ["NO_RESIDENCE", "INVALID_HOUSE", "NAME_TAKEN"]
+          and all(re.search(r"#define PC_NETGAME_TXN_REASON_%s\s+%du" % (L.TXN_REASON_NAMES[i], i), c_raw) for i in range(31))
           and L.PC_NETGAME_TS_SHOP_LEN == 320 and L.PC_NETGAME_SHOP_SELL_RATIO == 4)
     check("W the client-facing reject codes of pc_net_game.h equal the C reasons (NOT_AVAILABLE 16, NO_FUNDS 19, NOT_SELLABLE 20, PRICE_MISMATCH 21, NO_ROOM 22) and the new seam API is declared",
           all(re.search(r"#define PC_NETGAME_TS_REJECT_%s\s+%d" % (n, v), h) for n, v in (("NOT_AVAILABLE", 16), ("NO_FUNDS", 19), ("NOT_SELLABLE", 20), ("PRICE_MISMATCH", 21), ("NO_ROOM", 22)))
@@ -218,8 +220,18 @@ def main():
           "slots of the transaction (+ a bag in / out), APPLIED echo checked by the result handler",
           "return pcnetgame_txn_apply_shop(T, in);" in c and "changes slot %d outside the transaction" in c_raw and "inconsistent shop post-image" in c_raw
           and len(re.findall(r"np->inventory\.wallet\s*=[^=]", func_body(c_raw, "pcnetgame_txn_apply_shop"))) == 2)
-    check("C the TS CLIENT block (outside the TEST-ONLY hooks) never touches the inventory: begin / poll / mirror apply contain no 'inventory' access (the shop hook is stripped like the other hooks)",
-          "inventory" not in strip_hook_bodies(cblk))
+    # the client never WRITES its inventory in the TS client block: the only `inventory` accesses outside the TEST-ONLY hooks (stripped like the other hooks: shop / ts / house-buy / nook)
+    # are the READ-ONLY wallet reads of the house-purchase precheck (NO_FUNDS) and its begin-time log line; the real debit happens only in pcnetgame_txn_apply_house (host post-image).
+    cl_nohook = strip_hook_bodies(cblk)
+    inv_uses = [m for m in re.finditer(r"\binventory\b[^;\n]{0,40}", cl_nohook)]
+    pre_body = func_body(cblk, "pc_net_game_house_purchase_precheck")
+    beg_body = func_body(cblk, "pc_net_game_ts_begin_house_purchase")
+    check("C the TS CLIENT block (outside the TEST-ONLY hooks) never WRITES the inventory: every `inventory` access is a read-only `Now_Private->inventory.wallet` (no assignment / compound / ++ / --) and lives only in the house-purchase precheck (1 comparison) and begin (1 log read); "
+          "the pockets are never touched; begin / poll / mirror apply contain no other access (the shop / house-buy / nook hooks are stripped like the other hooks)",
+          len(inv_uses) == 2 and all(re.match(r"inventory\.wallet(?!\s*(?:[-+*/|&^]?=(?!=)|\+\+|--))", u.group(0)) for u in inv_uses)
+          and pre_body.count("inventory") == 1 and "Now_Private->inventory.wallet < PC_NETGAME_HOUSE_PRICE_DIRECT" in pre_body
+          and beg_body.count("inventory") == 1 and "(unsigned)Now_Private->inventory.wallet);" in beg_body
+          and "inventory.pockets" not in cl_nohook)
 
     # ------------------------------------------------------------------ T: test hooks
     hook = func_body(cblk_raw, "pcnetgame_run_shop_test_hook")

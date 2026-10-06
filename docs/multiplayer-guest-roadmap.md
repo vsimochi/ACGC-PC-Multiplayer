@@ -1121,6 +1121,86 @@ files byte-identical, two guests racing for the last slot -> exactly one APPLIED
 FULL -> NO_RESIDENCE, handoff again on reconnect, resident claim KNOWN, a resident sender refused) and `test_house_purchase_real.py` (one real store-character guest client with `--house-buy-test auto`
 -> APPLIED -> the SAME pid re-joins in-process as resident 3 and reaches READY).
 
+## Guest Nook dialogue (house offer)
+
+Goal (milestone M4 of "Guest-first town"): a GUEST (`player_no >= PLAYER_NUM`, role CLIENT, READY link) who talks to Tom Nook is offered a house in Nook's own message window; accepting runs the
+paid purchase of the section above (`pc_net_game_ts_begin_house_purchase` / `pc_net_game_ts_poll`). Residents, the host, solo play and every other Nook talk are byte-identical (every entry point is
+guarded by `pc_net_game_house_offer_available()`: CLIENT role + READY link + the local player is a guest; all shop variants except Timmy / Tommy, i.e. `!aNSC_MAMEDANUKI`).
+
+**Flow** (state machine `aNSC_pc_house_proc` in `src/actor/npc/ac_npc_shop_common.c`, installed as the `proc` of an existing action so that animation / camera / demo handling stay vanilla):
+1. FIRST talk (membership.ini key `nook_intro` absent): `aNSC_start_wait` gets a new wait type `aNSC_WAIT_TYPE_PC_HOUSE` (only reachable for a guest): Nook greets and introduces himself (message
+   `PC_NOOK_MSG_INTRO`, pages: greeting / "no house yet" / "would you like to buy a house here in town, hm?") and the Yes. / No. choice opens. The action is `aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT`
+   (the vanilla greeting-with-a-question action), then `proc` is switched to the house proc.
+2. No. (or the B button = last choice): `nook_intro = declined` (`pc_net_game_nook_intro_set`, the membership writer preserves unknown keys; no store character -> kept in RAM for the session),
+   "I see, I see. No pressure at all! ... just ask me under Other things", the conversation ends: the guest is NOT an employee (no mEv_* call: every first-job / intro check is `< PLAYER_NUM` already),
+   no chores, no house, no slot, no loan.
+3. Later talks (declined, or the first prompt was skipped, never `bought`): the top menu "Other things" row (`aNSC_request_Q_answer_wait`) shows the guest message `PC_NOOK_MSG_OTHER` = the vanilla
+   text and choices of message 0x3E07 with a 5th-row insert "Buy a house." before "Umm, hang on!" (`SETSELSTR5`); choice 3 of `aNSC_request_Q_answer_wait2` starts the same flow as Yes.
+4. Yes. / "Buy a house.": `pc_net_game_house_purchase_precheck(-1)`: 19 NO_FUNDS -> "Oh dear, you don't have enough Bells for that. A house costs 18,400 Bells." (still a guest, nothing charged, `declined`);
+   28 / 29 -> "there are no lots available in this town" (`PC_NOOK_MSG_NOLOT`); 9 / anything else -> "something went wrong with the paperwork, nothing was charged".
+   Otherwise `PC_NOOK_MSG_PICK`: price line, then the choice among the FREE houses of the local town copy (`pc_net_game_house_free_list`: `homes[h].ownerID` null): "House N." for each (1..4, `N = index + 1`),
+   "Any house." when 2 or more are free, "Never mind..." (last = the B-button choice). The pick is re-checked with `precheck(house)`; `PC_NOOK_MSG_CONFIRM` ("House N, then! That comes to 18,400 Bells, payable
+   right now, hm? Shall we make it official?" Yes./No.).
+5. Yes.: `pc_net_game_ts_begin_house_purchase(house)` (-1 busy = retried every frame; 0 = refused locally, reason in `pc_net_game_ts_last_reject_reason()`), then `pc_net_game_ts_poll()` every frame while the
+   question text stays on screen (the vanilla shop buy pattern). REJECTED = the host reason 19 / 21 / 28 / 29 / 30 / 10 / 0 (link loss) mapped to the NOFUNDS / NOLOT / FAILED rows. APPLIED =
+   `PC_NOOK_MSG_THANKS` ("Splendid, splendid! The house is yours, <name>! I'm filing the paperwork right now. Thank you very much!"). The client wrote `nook_intro = bought` itself.
+6. The dialogue never waits for the session end. Because the host closes the session within a frame or two of the APPLIED result, `pc_net_game_ts_poll()` can already report the link loss (REJECTED, reason 0)
+   when the dialogue polls one frame later: `pc_net_game_house_purchase_applied()` (sticky flag set by `pcnetgame_txn_apply_house`, cleared by the next begin) is the truth for APPLIED. One small coupling the other way
+   round: the in-process rejoin (`pc_main_play_online_poll`, PO_REQUESTED) asks `pc_nook_house_rejoin_hold()` once per frame and WAITS while the congratulation row is being read (set when the purchase begins,
+   cleared when the conversation ended or the purchase failed; expires by itself after ~2400 frames), otherwise the rejoin fade (a fraction of a second) hides the row (observed in the first visual run).
+
+**Text mechanism: generated messages, not an overlay.** The port has no message override system; the only table is the ARAM message resource read by `mMsg_LoadMsgData`. This milestone adds the
+smallest possible one: message ids `>= MSG_MAX (0x3F91)` and choice string ids `>= mChoice_SELECT_STR_NUM (607)` are generated at load time by `pc/src/pc_nook_house.c` in the game's own byte format
+(`pc_nook_msg_build` / `pc_nook_sel_build`), hooked in exactly four places: `mMsg_LoadMsgData` (m_msg_main.c_inc), the two `index < MSG_MAX` bounds (`mMsg_ChangeMsgData`, `mMsg_request_main_index_fromNormal`
+in m_msg_normal.c_inc) and `mChoice_Load_ChoseStringFromRom` (m_choice_main.c_inc). The text therefore renders in Nook's own window with his name tag, voice and the normal choice window (verified on screen).
+The pre-PC ids 0..0x3F90 are untouched (the table has no free id: every id 0..0x3F90 has data, which is why the ids live above the table).
+* Format learned from the real rows (extracted with the same `tools/msg_tool.py` tables): text bytes are ASCII for letters / digits / space / `! ' , - . ? :`; `\n` = byte 205; `7F 03 nn` = PAUSE; `7F 04` = wait for A;
+  `7F 02` = clear; `7F 1A` = player name; a question ends with `SETSELSTR<n> id id ..` (`7F 16` = 2 choices, `7F 17` 3, `7F 18` 4, `7F 79` 5, `7F 7A` 6; ids are 2-byte big-endian into the choice string table),
+  `7F 5E` (SELNOB: B = last choice), `7F 04`, `7F 0D` (OPENCHOICE), `7F 19` (FORCENEXT), `7F 09 09 00 01` (demo order 9 = 1: "answered", read by the actor) and `7F 01` (MSGCONTINUE); a closing row ends with `7F 00`.
+  The actor reads `mChoice_Get_ChoseNum` once `mDemo_Get_OrderValue(TYPE_4, 9)` is set and `mMsg_Check_MainNormalContinue`, then selects the next message with `aNSC_Set_continue_msg_num` (same as the vanilla `0x1092` row).
+* Charset: only letters, digits, space and `! ' , - . ? :` (the font has no arbitrary punctuation, `/` draws a music note); `pc_nook_house_selftest()` checks every byte (run from the source audit).
+* Dynamic parts (price from `pc_net_game_house_purchase_price()`, the free house list, the chosen house) are built into the bytes when the message loads; the actor sets them with `pc_nook_house_set_pick` /
+  `pc_nook_house_set_confirm` right before it selects the message.
+* **Adding a message:** add an id to `enum` in `include/pc_nook_house.h` (and raise `PC_NOOK_MSG_COUNT`), add a `case` in `pc_nook_msg_build`, select it with `aNSC_Set_continue_msg_num(msg_p, shop_common,
+  pc_nook_msg_id(PC_NOOK_MSG_X))` (or `mDemo_Set_msg_num` for a greeting). Choice strings: a new id after `PC_NOOK_SEL_ANY_HOUSE` (16 characters max) and a `case` in `pc_nook_sel_build`.
+  No other file changes. Every row that asks something must end with the `nk_choice` tail, every other row with `7F 00`.
+
+**Insertion points** (all `TARGET_PC`): `ac_npc_shop_common.c`: the block `aNSC_pc_hs_*` / `aNSC_pc_house_proc` (before the vanilla `aNSC_start_wait`), `aNSC_start_wait` (wait type), `aNSC_request_Q_answer_wait` (guest "Other things"
+row), `aNSC_request_Q_answer_wait2` (choice 3). `pc_net_game.c`: `pc_net_game_house_offer_available`, `_free_list`, `_nook_intro_get/_set`, `_house_purchase_applied` (declared in `pc_nook_house.h`, NOT in
+`pc_net_game.h`: that header is included by almost every translation unit, touching it rebuilds the whole tree).
+
+**Test hook.** `--nook-test SPEC` (client only, hidden, loud `[NET][HOUSE][TEST-ONLY]` logs, refused with exit 2 for any other role; `pcnetgame_run_nook_test_hook`): SPEC = `wallet=N` (sets the LOCAL wallet once; the
+normal D3 upload carries it to the host mirror and the hook waits for a clean record) and / or `warp` (a scene change into Nook's shop through the vanilla `goto_other_scene`, once the guest is idle in the town: the
+walk from the station was not attempted). Rig: `pc/tools/net_spike/nook_visual_rig.py` (real dedicated host + one real store-character guest on disposable `bin_fixture4_nk_<tag>` copies, display pinned with
+`AC_DISPLAY_NAME=samsung`, `AC_MASTER_VOLUME=1`) and `nook_visual_ctl.py` (synthetic scancode keys, only after the game window is the foreground window; captures only the client rectangle of the game window).
+No automated assertion drives the dialogue: it is a manual / screenshot-driven tier.
+
+**What was seen on screen** (Samsung monitor, game volume 1 %; screenshots of the game window only):
+Three real runs (disposable `bin_fixture4_nk_s1 / s2 / s3` host + client copies; a real dedicated host and one real store-character guest client; the guest was walked into the shop by the test warp, NOT from the
+station on foot; every dialogue key was a synthetic scancode, every screenshot the game window only). SEEN = a screenshot of the game window; LOG = client / host log or file; nothing else is claimed.
+* **S1 (decline)**, wallet 0: SEEN Nook's name tag + the greeting pages ("Welcome, welcome! I'm Tom Nook, the owner of this shop, hm?" / "I see you're new in town, and you have no house of your own yet." /
+  "Would you like to buy a house here in town, hm?") then the Yes. / No. choice window; No. -> "I see, I see. No pressure at all!" / "...just ask me under Other things, hm?", the conversation closed and the guest
+  walked freely. SEEN: talking to Nook again opens the NORMAL shop greeting and menu (no second intro); "Other things" shows "Turnip Prices? / Hear code / Say code / Buy a house. / Umm, hang on!" (5 rows);
+  "Buy a house." with 0 Bells -> "Oh dear, you don't have enough Bells for that. A house costs 18,400 Bells." / "Do come back when you can afford it, hm?" (this doubles as the cannot-afford scenario; no money was
+  created or taken). LOG: `nook dialogue: the guest declined the first offer`, `membership.ini nook_intro = declined`, `precheck=19 -> row 5`; no first-job / intro / mEv line. Host after the run: `guests` = 1 guest
+  (bound), `residents` = slots 0..2 only (no resident created); membership.ini `role = guest`, `nook_intro = declined`.
+* **S2 (accept, first run)**, wallet 20000 (test hook, uploaded to the host mirror): SEEN the same greeting, Yes. -> "Wonderful! A house costs 18,400 Bells, paid all at once, hm?" / "Which house would you like?"
+  with a choice window "House 4. / Never mind..." (only house 3 was free in the fixture, so "Any house." is not offered) -> "House 4, then! That comes to 18,400 Bells, payable right now, hm?" / "Shall we make it
+  official?" Yes./No. -> Yes. LOG: APPLIED, `wallet 20000 -> 1600`, `membership.ini nook_intro = bought`, `M3: re-joining IN-PROCESS`, same PID, READY a second time as resident 3. HOST: `BOUGHT a house: resident slot 3,
+  house 3, price 18400, wallet 20000 -> 1600, loan 0`; `residents` slot 3 "Buyer" credential=yes confirmed=yes connected=yes; `guests`: none stored; membership.ini `role = resident`, `nook_intro = bought`.
+  SEEN after the rejoin: the player standing in the town in front of its new house (green roof, mailbox). This run exposed two defects that were FIXED before S3: the dialogue polled one frame after the host had
+  already closed the session (-> link-loss REJECTED -> the FAILED row, invisible) and the rejoin fade started before the congratulation row could be read (black screen after Yes.).
+* **S3 (accept, after the fixes)**: same flow; SEEN after Yes.: Nook's congratulation row "Splendid, splendid! The house is yours, Buyer!" (the player's name through the name code; page 2 "I'm filing the
+  paperwork right now. Thank you very much!" read with A), then the fade to the title logo scene of the SAME process (PID unchanged), then the player in the town as the resident next to its house. Also SEEN in that
+  frame: the pre-existing refusal notice of REJECT 6 ("Cannot join the host: This character was promoted to a resident of this town: restart to join as a resident. (reason 6)") drawn over the shop during the
+  hold, a cosmetic leftover of the M2 / M3 notice (it is not suppressed by this milestone). LOG / HOST of S3: `nook dialogue: purchase APPLIED -> congratulation row`, the rejoin waited until the row was closed, same PID 215996; host `BOUGHT a house: resident slot 3, house 3, price 18400, wallet 20000 -> 1600, loan 0`, `residents` slot 3 "Buyer" credential=yes confirmed=yes connected=yes, `guests`: none stored, membership.ini `role = resident` + `nook_intro = bought`. The GCI file itself (private_data slot, house owner) was NOT re-parsed in these runs (that is covered by `test_house_purchase_protocol.py`); only the host log / console output were read.
+
+**Limits.** The house is chosen by NUMBER ("House 1..4"), not by a position on a map. "Any house." appears only when 2 or more are free. The offer needs a READY link (a guest talking to Nook while the link is
+down gets the normal shop). A client without a store character (legacy / CLI guest) keeps `declined` in RAM only. The congratulation row is shown, but the rejoin that follows fades out right after it;
+Timmy / Tommy (the mamedanuki variant of the shop code) do not make the offer. Source audits re-pinned for this change: `test_guest_src.py` (the `Save_Get(homes[...])` list gained the loop-bounded
+`pc_net_game_house_free_list`). `test_shop_src.py` (2 checks: `W` reason names / `C` TS CLIENT block contains no `inventory`) and `test_d3_record_src.py` (check `P`) were already failing for the earlier house-purchase milestones, not for this one.
+
+
 ## Known limitations
 
 * A guest needs a copy of the HOST's town save: either fetched with `--town-fetch` (the host must serve it, `--town-serve on`; see "Town cache and town transfer") or copied by hand

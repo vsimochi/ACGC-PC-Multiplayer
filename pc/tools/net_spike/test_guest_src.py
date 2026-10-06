@@ -169,7 +169,7 @@ def main():
     homes_users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(homes\[", c[a:b])})
     ck("A the functions that subscript Save_Get(homes[...]) are exactly the reviewed ones (house lookup by PersonalID, mail / mailbox paths behind the guest refusal, "
        "client-side shadows, TEST-ONLY hooks): %s" % homes_users,
-       homes_users == sorted(["pcnetgame_promote_exec", "pc_net_game_house_purchase_precheck", "pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
+       homes_users == sorted(["pcnetgame_promote_exec", "pc_net_game_house_purchase_precheck", "pc_net_game_house_free_list", "pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
                               "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mbox_client_apply", "pcnetgame_mbox_client_tick", "pcnetgame_mbox_house_of",
                               "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook", "pcnetgame_txn_apply_take",
                               # furniture sync (house index from a bound PersonalID, guest refused first; client shadows; TEST-ONLY host edit): see test_house_sync_src.py
@@ -177,7 +177,7 @@ def main():
                               # furniture sync, reviewed (guest-safety review of da9074a): live apply / reconcile plan / room track (client shadows, range-checked house index),
                               # the client reconcile apply (own house only, no guest claim)
                               "pcnetgame_hcl_live_apply", "pcnetgame_hcl_reconcile_plan", "pcnetgame_hcl_room_track", "pcnetgame_house_client_reconcile_apply",
-                              "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit"]))
+                              "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit"]))  # pc_net_game_house_free_list: guest Nook dialogue (M4): loop-bounded i < mHS_HOUSE_NUM read of the LOCAL town copy
     # reviewed guards of the furniture-sync / promote code that subscripts homes[] / private_data[] (a guest can never reach them with an out-of-range index)
     hcl_own = fb("pcnetgame_hcl_own_house")
     prm_idx = fb("pcnetgame_promote_parse_index")

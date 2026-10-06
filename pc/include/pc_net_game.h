@@ -1199,6 +1199,7 @@ int pc_net_game_client_reconnect_status(int* attempt, int* next_s);
  * token problems; host unreachable) or NULL when there is none (or a final failure older than 30 s). Survives the shutdown a refusal causes. *is_warning
  * (optional) = 1 for the non-final "no answer from the host yet, still trying" kind. Drawn by pc_net_notice_draw(); also logged ([NET][JOIN]) and on stderr. */
 const char* pc_net_game_join_message(int* is_warning);
+void pc_net_game_promote_notice_show(void); /* show the held-back REJECT 6 (PROMOTED) text when no in-process rejoin follows */
 
 /* World Ecology Wildlife Sync T0 (authority seam foundation only -- see pc_wildlife_authority.h's
  * own scope doc: NOT fish/bug catching, NOT a snapshot, NOT bee/ant capture sync). Called from the

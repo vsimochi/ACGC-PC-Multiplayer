@@ -11,6 +11,7 @@
 #include "sys_matrix.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated messages >= MSG_MAX */
 #endif
 
 static u32 Msg_table_rom_start = 0;

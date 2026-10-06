@@ -143,6 +143,7 @@
  * =============================================================================================
  */
 #include "pc_net_game.h"
+#include "pc_nook_house.h" /* guest Nook dialogue (M4): the dialogue-side helpers defined near the house purchase seam */
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
 #include "pc_adopt_clock.h" /* client record-adoption watchdog clock (scene lifecycle time does not count towards the 10 s) */
 #include "pc_log.h" /* category-based PC_LOG()/PC_LOG_RL() lines (new, [CAT]-prefixed; every pre-existing printf is untouched) */
@@ -21657,18 +21658,19 @@ static int pcnetgame_txn_apply_take(const PCNetGameClientTxn* T, const PCNetGame
  * guest a RESIDENT of the town (RESIDENT_HANDOFF + REJECT PROMOTED follow on the same reliable channel). Locally only the wallet changes (the debit, as a delta when the
  * local wallet moved during the round trip); the membership.ini key `nook_intro = bought` records the purchase for a store character (the handoff handler then flips the role
  * to resident and the writer PRESERVES the key). The D3 base is NOT advanced: the guest record is gone on the host and the session ends right after. Returns 1 / 0. */
+static int s_house_applied_sticky = 0; /* guest Nook dialogue (M4): 1 once an APPLIED HOUSE_PURCHASE was applied; cleared by the next begin. The host closes the session within a frame or two
+                                        * of the RESULT, so a dialogue that polls one frame later can see the link loss (REJECTED) instead of the APPLIED: this flag is the truth. */
 static int pcnetgame_txn_apply_house(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
     const PCNetGameTxnTag* t = &T->tag;
     Private_c* np = Now_Private;
     char key[PC_CHARACTER_TOWNKEY_LEN + 1];
-    int64_t w;
     if (np == NULL || in->post_wallet > (uint32_t)mPr_WALLET_MAX || in->post_wallet + (uint32_t)t->aux_item != t->pre_wallet) {
         printf("[NET][TXN] client: *** APPLIED HOUSE_PURCHASE for request %u carries an inconsistent post-image (wallet %u, price %u, pre %u) -- nothing applied ***\n",
                (unsigned)T->request_id, (unsigned)in->post_wallet, (unsigned)t->aux_item, (unsigned)t->pre_wallet);
         return 0;
     }
-    w = (int64_t)np->inventory.wallet - (int64_t)t->aux_item;
-    np->inventory.wallet = (u32)(w < 0 ? 0 : w);
+    np->inventory.wallet = in->post_wallet; /* the HOST's post-image (validated above: post + price == pre), never a local debit */
+    s_house_applied_sticky = 1;
     printf("[NET][HOUSE] client: house purchase APPLIED -- request %u: %u Bells paid, wallet now %u; the host makes this guest a resident (house %s)\n", (unsigned)T->request_id,
            (unsigned)t->aux_item, (unsigned)np->inventory.wallet, t->aux_cond == (uint8_t)PC_NETGAME_HOUSE_AUTO ? "auto" : "requested");
     if (pc_session()->storage == PC_CHARACTER_STORAGE_STORE && s_client_claimed_town.land_name[0] != 0) {
@@ -22384,6 +22386,54 @@ int pc_net_game_house_purchase_precheck(int house_or_auto) {
     return 0;
 }
 
+/* Guest Nook dialogue (M4): the dialogue-side helpers of the house offer (declared in pc_nook_house.h). All LOCAL reads; the HOST still validates the purchase. */
+int pc_net_game_house_purchase_applied(void) {
+    return s_house_applied_sticky;
+}
+
+int pc_net_game_house_offer_available(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && pcnetgame_client_is_guest_player();
+}
+
+int pc_net_game_house_free_list(int* out, int cap) {
+    int i, n = 0;
+    for (i = 0; i < mHS_HOUSE_NUM && out != NULL && n < cap; i++) {
+        if (mPr_NullCheckPersonalID(&Save_Get(homes[i]).ownerID) == TRUE) {
+            out[n++] = i;
+        }
+    }
+    return n;
+}
+
+/* membership.ini key `nook_intro` of the store character + town this client claimed: _get returns 1 = present (value in out), 0 = absent, -1 = no store character /
+ * no membership file to ask (the dialogue then keeps the answer in memory for the session); _set returns 1 = written. */
+int pc_net_game_nook_intro_get(char* out, unsigned long cap) {
+    char key[PC_CHARACTER_TOWNKEY_LEN + 1];
+    if (out == NULL || cap < 2) {
+        return -1;
+    }
+    out[0] = '\0';
+    if (s_role != PC_NETGAME_ROLE_CLIENT || pc_session()->storage != PC_CHARACTER_STORAGE_STORE || s_client_claimed_town.land_name[0] == 0) {
+        return -1;
+    }
+    pc_character_town_key_format(s_client_claimed_town.land_name, s_client_claimed_town.land_id, s_client_claimed_town.terrain_hash, key);
+    return pc_character_membership_get_key(NULL, pc_session()->character.uuid, key, "nook_intro", out, (size_t)cap) ? 1 : 0;
+}
+
+int pc_net_game_nook_intro_set(const char* value) {
+    char key[PC_CHARACTER_TOWNKEY_LEN + 1];
+    if (s_role != PC_NETGAME_ROLE_CLIENT || pc_session()->storage != PC_CHARACTER_STORAGE_STORE || s_client_claimed_town.land_name[0] == 0 || value == NULL) {
+        return 0;
+    }
+    pc_character_town_key_format(s_client_claimed_town.land_name, s_client_claimed_town.land_id, s_client_claimed_town.terrain_hash, key);
+    if (pc_character_membership_set_key(NULL, pc_session()->character.uuid, key, "nook_intro", value)) {
+        printf("[NET][HOUSE] client: membership.ini nook_intro = %s (character %s, town %s)\n", value, pc_session()->character.uuid, key);
+        return 1;
+    }
+    printf("[NET][HOUSE] client: membership.ini nook_intro = %s could not be written (no membership file yet)\n", value);
+    return 0;
+}
+
 int pc_net_game_ts_begin_house_purchase(int house_or_auto) {
     PCNetGameOwnerStamp stamp;
     const uint8_t kind = (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE;
@@ -22395,6 +22445,7 @@ int pc_net_game_ts_begin_house_purchase(int house_or_auto) {
         return -1;
     }
     s_ts_last_reason = 0;
+    s_house_applied_sticky = 0;
     r = pc_net_game_house_purchase_precheck(house_or_auto);
     if (r != 0) {
         s_ts_last_reason = (uint8_t)r;
@@ -22533,6 +22584,73 @@ static void pcnetgame_run_house_buy_test_hook(void) {
     }
     printf("[NET][HOUSE][TEST-ONLY] --house-buy-test: result %s (host reason %d)\n", r == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED", pc_net_game_ts_last_reject_reason());
     s_stage = 3;
+}
+
+/* TEST-ONLY (--nook-test SPEC, client role, default OFF, never active in normal play; every step logs "[NET][HOUSE][TEST-ONLY]"). Setup for the VISUAL run of the guest
+ * Nook dialogue (the dialogue itself is driven by a person / the screenshot rig): SPEC is a comma list: `wallet=N` sets the LOCAL wallet to N once (the hook's one local test
+ * write, so the guest can / cannot pay the house; the normal D3 upload carries it to the host mirror and the hook waits for a clean record), `warp` then takes the player into
+ * Nook's shop (a scene change through the vanilla goto_other_scene with the shop's own door data) once it stands idle in the town. Fires once per process. */
+extern const char* g_pc_nook_test; /* pc_main.c (declared here, not in pc_platform.h, to keep the widely included header untouched) */
+static void pcnetgame_run_nook_test_hook(void) {
+    static int s_stage = 0; /* 0 wait synced, 1 wallet set (wait for the upload), 2 warp, 3 done */
+    static uint32_t s_t0 = 0;
+    uint32_t now;
+    const char* w;
+    if (g_pc_nook_test == NULL || s_stage >= 3 || s_role != PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+    if (!pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_stage == 0) {
+        if (!pcnetgame_client_is_guest_player()) {
+            printf("[NET][HOUSE][TEST-ONLY] --nook-test: this client is not a guest -- hook gives up\n");
+            s_stage = 3;
+            return;
+        }
+        if ((uint32_t)(now - s_crec.adopt_ms) < 4000u) {
+            return;
+        }
+        w = strstr(g_pc_nook_test, "wallet=");
+        if (w != NULL) {
+            unsigned long v = strtoul(w + 7, NULL, 10);
+            printf("[NET][HOUSE][TEST-ONLY] --nook-test: setting the LOCAL wallet %u -> %lu (the hook's one local test write, NOT active in normal play)\n",
+                   (unsigned)Now_Private->inventory.wallet, v);
+            Now_Private->inventory.wallet = (u32)(v > (unsigned long)mPr_WALLET_MAX ? (unsigned long)mPr_WALLET_MAX : v);
+        }
+        s_t0 = now;
+        s_stage = 1;
+        return;
+    }
+    if (s_stage == 1) {
+        if ((uint32_t)(now - s_t0) < 6000u || !pcnetgame_mail_state_clean()) {
+            return;
+        }
+        printf("[NET][HOUSE][TEST-ONLY] --nook-test: setup done, wallet=%u (uploaded)\n", (unsigned)Now_Private->inventory.wallet);
+        s_stage = strstr(g_pc_nook_test, "warp") != NULL ? 2 : 3;
+        return;
+    }
+    {
+        static Door_data_c s_door = { SCENE_SHOP0, mSc_DIRECT_NORTH, FALSE, 0, { 160, 0, 300 }, EMPTY_NO, 1, { 0, 0, 0 } };
+        static const int scenes[] = { SCENE_SHOP0, SCENE_CONVENI, SCENE_SUPER, SCENE_DEPART };
+        GAME_PLAY* play;
+        int level;
+        if (gamePT == NULL || gamePT->exec != play_main) {
+            return;
+        }
+        play = (GAME_PLAY*)gamePT;
+        if (play->scene_id != SCENE_FG || play->submenu.process_status != mSM_PROCESS_WAIT || play->submenu.menu_type != mSM_OVL_NONE ||
+            play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE || !pcnetgame_is_real_player_actor(GET_PLAYER_ACTOR_NOW()) ||
+            !mPlib_able_submenu_type1((GAME*)play)) {
+            return;
+        }
+        level = mSP_GetShopLevel();
+        s_door.next_scene_id = scenes[(level >= 0 && level < 4) ? level : 0];
+        printf("[NET][HOUSE][TEST-ONLY] --nook-test: warping the guest into the shop (scene %d, shop level %d)\n", s_door.next_scene_id, level);
+        goto_other_scene(play, &s_door, FALSE);
+        s_stage = 3;
+    }
 }
 
 /* TEST-ONLY (--ts-test-donate / --ts-test-claim, client role, default OFF, never active in normal play; every step logs "[NET][TS][TEST-ONLY]").
@@ -25204,6 +25322,7 @@ static void pcnetgame_handle_client_identity_token(const uint8_t* data, uint16_t
 /* M-I: set by the handoff handler once token.dat AND membership.ini of a STORE character are both written; consumed on the following REJECT 6 (pc_main polls
  * pc_net_game_client_take_relaunch). Plain statics NOT cleared by the per-connection reset (the REJECT path shuts the session down first). */
 static int  s_client_promote_relaunch = 0;      /* both files written */
+static char s_promote_notice[PC_NETGAME_JOIN_MSG_MAX]; /* the REJECT 6 text held back while an in-process rejoin may run */
 static int  s_client_relaunch_ready = 0;        /* REJECT 6 seen with the flag set: a relaunch is requested */
 static char s_client_relaunch_uuid[64];
 
@@ -25680,10 +25799,15 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
                 hp = &htown;
             }
             pcnetgame_reject_text((unsigned)in.reason, (unsigned)in.expected_protocol_version, hp, jtxt, sizeof(jtxt));
-            pcnetgame_join_message_set(0, "%s (reason %u)", jtxt, (unsigned)in.reason);
             if (in.reason == (uint8_t)PC_NETGAME_REJECT_PROMOTED && s_client_promote_relaunch) {
+                /* REJECT 6 after a purchase / promotion is EXPECTED, not a refusal: no "Cannot join" notice over the shop's congratulation row. The in-process rejoin
+                 * (pc_main_relaunch_poll, --town-fetch) shows nothing; the legacy / CLI path (no rejoin) gets the text via pc_net_game_promote_notice_show(). */
                 s_client_promote_relaunch = 0;
                 s_client_relaunch_ready = 1; /* M-I: pc_main relaunches ONLY a --town-fetch process; a CLI client keeps the message */
+                snprintf(s_promote_notice, sizeof(s_promote_notice), "%s (reason %u)", jtxt, (unsigned)in.reason);
+                printf("[NET][JOIN] promoted: REJECT %u is expected (rejoin pending, the notice is held back)\n", (unsigned)in.reason);
+            } else {
+                pcnetgame_join_message_set(0, "%s (reason %u)", jtxt, (unsigned)in.reason);
             }
         }
         if (size == sizeof(PCNetGameRejectTownMsg)) {
@@ -28097,6 +28221,14 @@ int pc_net_game_client_notice_visible(void) {
     return s_notice_visible;
 }
 
+/* The held-back REJECT 6 text becomes the visible notice: called when NO in-process rejoin / relaunch follows (the legacy / CLI guest: restart to join as the resident). */
+void pc_net_game_promote_notice_show(void) {
+    if (s_promote_notice[0] != '\0') {
+        pcnetgame_join_message_set(0, "%s", s_promote_notice);
+        s_promote_notice[0] = '\0';
+    }
+}
+
 /* M-I: 1 once (and only once) after a store character was promoted (handoff stored, REJECT 6 received); copies the character UUID. */
 int pc_net_game_client_take_relaunch(char* uuid_out, size_t cap) {
     if (!s_client_relaunch_ready || uuid_out == NULL || cap < 2) {
@@ -28614,6 +28746,7 @@ void pc_net_game_poll(void) {
     pcnetgame_run_ts_test_hook();
     pcnetgame_run_shop_test_hook(); /* shop milestone: --shop-test-buy / --shop-test-sell (client role, default OFF) */
     pcnetgame_run_house_buy_test_hook(); /* guest-first town: --house-buy-test H|auto (client role, default OFF) */
+    pcnetgame_run_nook_test_hook(); /* guest Nook dialogue (M4): --nook-test SPEC (client role, default OFF) */
     pcnetgame_run_mail_test_hook(); /* mail milestone: --mail-test-send=<house>[,gift] (client role, default OFF) */
     pcnetgame_mail_test_force_delivery(); /* mail milestone: --mail-test-force-delivery (host role, default OFF) */
     pcnetgame_mail_test_poke_museum(); /* mail milestone R: --mail-test-poke-museum=<resident> (host role, default OFF) */

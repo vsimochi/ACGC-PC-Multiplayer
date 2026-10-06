@@ -1,5 +1,7 @@
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Batch G2/G3: pc_net_game_role() */
+#include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated messages / choice strings */
+#include <string.h>
 /* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
  * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
  * order/loan/statue, paint) would debit/commit with nothing to show for it. Role test (not READY-aware):
@@ -1755,6 +1757,222 @@ static int aNSC_pc_selection_has_paper(Submenu* menu) {
 }
 #endif
 
+#if defined(TARGET_PC) && !defined(aNSC_MAMEDANUKI)
+/* ===== Guest-first town M4 (NOOK'S SHOP): the GUEST house offer =====
+ * A network CLIENT that is a GUEST (player_no >= PLAYER_NUM, READY link) gets: (1) on its FIRST greeting (membership.ini `nook_intro` absent) Nook introduces himself and asks
+ * "would you like to buy a house?" Yes./No.; (2) later (declined / skipped) a 4th choice "Buy a house." in the "Other things" submenu; both start the same flow: price ->
+ * which free house -> confirm -> pc_net_game_ts_begin_house_purchase() -> poll -> APPLIED = the congratulation row (the session then ends by itself and the in-process rejoin
+ * brings the player back as the resident: the dialogue never waits for it) / REJECTED = the existing-style refusal rows. NO => `nook_intro = declined`. Residents, the host,
+ * solo play and every other talk are untouched (every entry point tests aNSC_pc_hs_guest()). The texts are generated messages (pc_nook_house.c, ids >= MSG_MAX).
+ * The flow runs as a replacement `proc` of an existing action (the animation / camera of that action stay), see aNSC_pc_house_proc. */
+#define aNSC_PC_HOUSE 1
+
+enum {
+    aNSC_PC_HS_NONE,
+    aNSC_PC_HS_ASK_INTRO,   /* waiting for Yes./No. of the first-talk offer */
+    aNSC_PC_HS_ASK_PICK,    /* waiting for the house choice */
+    aNSC_PC_HS_ASK_CONFIRM, /* waiting for Yes./No. of the confirmation */
+    aNSC_PC_HS_BEGIN,       /* begin the purchase (retried while another transaction is unresolved) */
+    aNSC_PC_HS_PENDING,     /* the transaction is in flight */
+    aNSC_PC_HS_END          /* the closing row is showing: wait for the conversation to end */
+};
+
+static int aNSC_pc_hs_state;
+static int aNSC_pc_hs_house = -1;
+static int aNSC_pc_hs_free[4];
+static int aNSC_pc_hs_nfree;
+static int aNSC_pc_hs_other_active; /* 1 while the guest "Other things" message (5 choices) is the one on screen */
+static int aNSC_pc_hs_mem_declined; /* RAM fallback of `nook_intro = declined` when there is no store character / membership file to write it to */
+static int aNSC_pc_hs_cache = -1;   /* cached intro state: 0 absent, 1 declined, 2 bought, -1 unknown */
+static int aNSC_pc_hs_cache_age;
+
+static int aNSC_pc_hs_guest(void) {
+    return pc_net_game_house_offer_available(); /* CLIENT role + READY link + the local player is a guest (all three tested inside) */
+}
+
+static int aNSC_pc_hs_intro_state(void) {
+    char v[32];
+    int r;
+    if (aNSC_pc_hs_cache >= 0 && ++aNSC_pc_hs_cache_age < 120) {
+        return aNSC_pc_hs_cache;
+    }
+    aNSC_pc_hs_cache_age = 0;
+    r = pc_net_game_nook_intro_get(v, sizeof(v));
+    if (r > 0) {
+        aNSC_pc_hs_cache = (strcmp(v, "bought") == 0) ? 2 : 1;
+    } else {
+        aNSC_pc_hs_cache = aNSC_pc_hs_mem_declined ? 1 : 0;
+    }
+    return aNSC_pc_hs_cache;
+}
+
+static int aNSC_pc_hs_intro_due(void) {
+    return aNSC_pc_hs_guest() && aNSC_pc_hs_intro_state() == 0;
+}
+
+static int aNSC_pc_hs_menu_offer(void) {
+    return aNSC_pc_hs_guest() && aNSC_pc_hs_intro_state() != 2;
+}
+
+static void aNSC_pc_hs_mark_declined(void) {
+    if (aNSC_pc_hs_intro_state() == 0) {
+        if (!pc_net_game_nook_intro_set("declined")) {
+            aNSC_pc_hs_mem_declined = 1;
+        }
+        aNSC_pc_hs_cache = -1;
+    }
+}
+
+static void aNSC_pc_hs_set_msg(NPC_SHOP_COMMON_ACTOR* shop_common, int which) {
+    aNSC_Set_continue_msg_num(mMsg_Get_base_window_p(), shop_common, pc_nook_msg_id(which));
+    mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+}
+
+static void aNSC_pc_hs_end(NPC_SHOP_COMMON_ACTOR* shop_common, int which, int declined) {
+    if (declined) {
+        aNSC_pc_hs_mark_declined();
+    }
+    aNSC_pc_hs_set_msg(shop_common, which);
+    aNSC_pc_hs_state = aNSC_PC_HS_END;
+}
+
+static void aNSC_pc_hs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason) {
+    int which = PC_NOOK_MSG_FAILED;
+    if (reason == PC_NETGAME_HOUSE_REJECT_NO_FUNDS) {
+        which = PC_NOOK_MSG_NOFUNDS;
+    } else if (reason == PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE || reason == PC_NETGAME_HOUSE_REJECT_INVALID_HOUSE || reason == PC_NETGAME_HOUSE_REJECT_NAME_TAKEN) {
+        which = PC_NOOK_MSG_NOLOT;
+    }
+    printf("[NET][HOUSE] nook dialogue: purchase not made (reason %d) -> row %d\n", reason, which);
+    pc_nook_house_rejoin_hold_set(0);
+    aNSC_pc_hs_end(shop_common, which, 1);
+}
+
+/* Yes. of the offer / the "Buy a house." choice: price, then the free houses. */
+static void aNSC_pc_hs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int r = pc_net_game_house_purchase_precheck(-1);
+    printf("[NET][HOUSE] nook dialogue: house offer accepted, precheck=%d\n", r);
+    if (r != 0) {
+        aNSC_pc_hs_fail_row(shop_common, r);
+        return;
+    }
+    aNSC_pc_hs_nfree = pc_net_game_house_free_list(aNSC_pc_hs_free, 4);
+    if (aNSC_pc_hs_nfree < 1) {
+        aNSC_pc_hs_fail_row(shop_common, PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE);
+        return;
+    }
+    pc_nook_house_set_pick(aNSC_pc_hs_free, aNSC_pc_hs_nfree);
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_PICK);
+    aNSC_pc_hs_state = aNSC_PC_HS_ASK_PICK;
+}
+
+static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+    ACTOR* actorx = (ACTOR*)shop_common;
+    mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
+    int k, r;
+
+    if (actorx->world.position.z > aNSC_POS_Z_MAX) { /* the greeting position (same as aNSC_check_col_chg_or_make_basement) */
+        actorx->world.position.z = aNSC_POS_Z_MAX;
+        aNSC_set_stop_spd(shop_common);
+        CLIP(npc_clip)->animation_init_proc(actorx, 0x5, 0x1);
+    }
+
+    switch (aNSC_pc_hs_state) {
+        case aNSC_PC_HS_ASK_INTRO:
+        case aNSC_PC_HS_ASK_PICK:
+        case aNSC_PC_HS_ASK_CONFIRM:
+            if (mDemo_Get_OrderValue(mDemo_TYPE_4, 0x9) == 0 || mMsg_Check_MainNormalContinue(msg_p) != TRUE) {
+                return;
+            }
+            k = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
+            if (aNSC_pc_hs_state == aNSC_PC_HS_ASK_INTRO) {
+                if (k == mChoice_CHOICE0) {
+                    aNSC_pc_hs_start_flow(shop_common);
+                } else {
+                    printf("[NET][HOUSE] nook dialogue: the guest declined the first offer\n");
+                    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_DECLINE, 1);
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_HS_ASK_PICK) {
+                int house = -2;
+                if (k < aNSC_pc_hs_nfree) {
+                    house = aNSC_pc_hs_free[k];
+                } else if (aNSC_pc_hs_nfree >= 2 && k == aNSC_pc_hs_nfree) {
+                    house = -1;
+                }
+                if (house == -2) {
+                    printf("[NET][HOUSE] nook dialogue: the guest backed out at the house choice\n");
+                    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_DECLINE, 1);
+                } else if ((r = pc_net_game_house_purchase_precheck(house)) != 0) {
+                    aNSC_pc_hs_fail_row(shop_common, r);
+                } else {
+                    aNSC_pc_hs_house = house;
+                    printf("[NET][HOUSE] nook dialogue: house %d chosen (-1 = any)\n", house);
+                    pc_nook_house_set_confirm(house);
+                    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_CONFIRM);
+                    aNSC_pc_hs_state = aNSC_PC_HS_ASK_CONFIRM;
+                }
+            } else if (k == mChoice_CHOICE0) {
+                printf("[NET][HOUSE] nook dialogue: payment confirmed, requesting the purchase (house %d)\n", aNSC_pc_hs_house);
+                aNSC_pc_hs_state = aNSC_PC_HS_BEGIN; /* the text stays up; the order value stays set until the answer */
+            } else {
+                printf("[NET][HOUSE] nook dialogue: the guest declined at the confirmation\n");
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_DECLINE, 1);
+            }
+            break;
+        case aNSC_PC_HS_BEGIN:
+            r = pc_net_game_ts_begin_house_purchase(aNSC_pc_hs_house);
+            if (r < 0) {
+                return; /* another transaction is unresolved: next frame */
+            }
+            if (r == 0) {
+                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason());
+            } else {
+                aNSC_pc_hs_state = aNSC_PC_HS_PENDING;
+                pc_nook_house_rejoin_hold_set(1); /* set BEFORE the answer can arrive: the rejoin of an applied purchase must not start before the congratulation row was read */
+            }
+            break;
+        case aNSC_PC_HS_PENDING:
+            r = pc_net_game_ts_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                return;
+            }
+            if (r == PC_NETGAME_TS_OP_APPLIED || pc_net_game_house_purchase_applied()) {
+                /* the host closes the session within a frame or two of the APPLIED result: a link-loss REJECTED after an applied purchase is still the APPLIED purchase */
+                printf("[NET][HOUSE] nook dialogue: purchase APPLIED -> congratulation row (the session ends by itself, the rejoin waits for the row to be read)\n");
+                aNSC_pc_hs_cache = -1;
+                pc_nook_house_rejoin_hold_set(1);
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_THANKS, 0);
+            } else {
+                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason());
+            }
+            break;
+        case aNSC_PC_HS_END:
+            if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == FALSE && mDemo_Check(mDemo_TYPE_TALK, actorx) == FALSE) {
+                pc_nook_house_rejoin_hold_set(0); /* the congratulation row (if any) was read: the in-process rejoin may start */
+                shop_common->sell_item = EMPTY_NO;
+                shop_common->npc_class.talk_info.melody_inst = 0;
+                aNSC_pc_hs_state = aNSC_PC_HS_NONE;
+                aNSC_setupAction(shop_common, play, aNSC_ACTION_WAIT);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/* Switches the running action over to the house dialogue (the action id, animation and camera stay those of the action it replaces). */
+static void aNSC_pc_hs_enter(NPC_SHOP_COMMON_ACTOR* shop_common, int state) {
+    aNSC_pc_hs_state = state;
+    aNSC_pc_hs_other_active = 0;
+    shop_common->proc = aNSC_pc_house_proc;
+}
+
+static void aNSC_pc_set_talk_info_intro(ACTOR* actorx) {
+    mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_INTRO));
+    ((NPC_SHOP_COMMON_ACTOR*)actorx)->next_action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT;
+}
+#endif
+
 #ifdef aNSC_MAMEDANUKI
 
 static void aNSC_set_talk_info_start_wait(ACTOR* actorx) {
@@ -1956,6 +2174,13 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         wait_type = aNSC_WAIT_TYPE_3;
     }
 
+#ifdef aNSC_PC_HOUSE
+    if (wait_type == aNSC_WAIT_TYPE_3 && aNSC_pc_hs_intro_due()) {
+        /* Guest-first town M4: a GUEST that was never offered a house: Nook introduces himself and asks (first greeting only) */
+        wait_type = aNSC_WAIT_TYPE_PC_HOUSE;
+    }
+#endif
+
     if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == TRUE && mDemo_Check_ListenAble() == FALSE) {
         switch (wait_type) {
             case aNSC_WAIT_TYPE_HRATALK:
@@ -1967,6 +2192,11 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
             case aNSC_WAIT_TYPE_3:
                 action = shop_common->next_action;
                 break;
+#ifdef aNSC_PC_HOUSE
+            case aNSC_WAIT_TYPE_PC_HOUSE:
+                action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT; /* a greeting that waits for a choice: same animation / position handling */
+                break;
+#endif
             case aNSC_WAIT_TYPE_DONE_REHOUSE: {
                 int idx = mHS_get_arrange_idx(Common_Get(player_no));
                 mHm_hs_c* home = &Save_Get(homes)[idx];
@@ -1995,6 +2225,11 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         }
         aNSC_Set_ListenAble(shop_common);
         aNSC_setupAction(shop_common, play, action);
+#ifdef aNSC_PC_HOUSE
+        if (wait_type == aNSC_WAIT_TYPE_PC_HOUSE) {
+            aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_ASK_INTRO);
+        }
+#endif
         return;
     }
 
@@ -2015,6 +2250,11 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         case aNSC_WAIT_TYPE_HRATALK:
             proc = aNSC_set_talk_info_start_wait4;
             break;
+#ifdef aNSC_PC_HOUSE
+        case aNSC_WAIT_TYPE_PC_HOUSE:
+            proc = aNSC_pc_set_talk_info_intro;
+            break;
+#endif
     }
     mDemo_Request(mDemo_TYPE_SPEAK, actorx, proc);
 }
@@ -2238,7 +2478,18 @@ static void aNSC_request_Q_answer_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_
                     break;
             }
             mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+#ifdef aNSC_PC_HOUSE
+            if (next == 0 && aNSC_pc_hs_menu_offer()) {
+                /* Guest-first town M4: the guest variant of the "Other things" row: the same text + a 4th choice "Buy a house." */
+                aNSC_Set_continue_msg_num(msg_p, shop_common, pc_nook_msg_id(PC_NOOK_MSG_OTHER));
+                aNSC_pc_hs_other_active = 1;
+            } else {
+                aNSC_pc_hs_other_active = 0;
+                aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
+            }
+#else
             aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
+#endif
             aNSC_setupAction(shop_common, play, next_act_idx[next]);
         }
     }
@@ -2258,6 +2509,15 @@ static void aNSC_request_Q_answer_wait2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME
     if (res != 0) {
         if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
             int next;
+#ifdef aNSC_PC_HOUSE
+            if (aNSC_pc_hs_other_active && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3 && aNSC_pc_hs_menu_offer()) {
+                /* Guest-first town M4: "Buy a house." of the guest "Other things" row (the vanilla 4th choice moved to the 5th place) */
+                printf("[NET][HOUSE] nook dialogue: 'Buy a house.' chosen in the Other things menu\n");
+                aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_NONE);
+                aNSC_pc_hs_start_flow(shop_common);
+                return;
+            }
+#endif
             switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
                 case mChoice_CHOICE0:
                     if (Common_Get(time).rtc_time.weekday == 0) {

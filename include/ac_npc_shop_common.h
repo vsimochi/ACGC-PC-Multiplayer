@@ -142,6 +142,7 @@ enum aNSC_wait_type {
     aNSC_WAIT_TYPE_BALLOON,
     aNSC_WAIT_TYPE_3,
     aNSC_WAIT_TYPE_HRATALK,
+    aNSC_WAIT_TYPE_PC_HOUSE, /* TARGET_PC only: the guest house offer (first greeting); never selected elsewhere */
 
     aNSC_WAIT_TYPE_NUM
 };

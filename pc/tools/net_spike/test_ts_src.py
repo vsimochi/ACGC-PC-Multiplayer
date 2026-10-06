@@ -46,7 +46,8 @@ def func_body(src, name):
 
 def strip_hook_bodies(text):
     """`text` without the bodies of the TEST-ONLY hook functions (the shop hook since milestone 2) (they read / write pockets by design)."""
-    for name in ("pcnetgame_ts_test_log_state", "pcnetgame_run_ts_test_hook", "pcnetgame_run_shop_test_hook"):
+    for name in ("pcnetgame_ts_test_log_state", "pcnetgame_run_ts_test_hook", "pcnetgame_run_shop_test_hook",
+                 "pcnetgame_run_house_buy_test_hook", "pcnetgame_run_nook_test_hook"):
         body = func_body(text, name)
         if body:
             text = text.replace(body, "")
@@ -251,8 +252,11 @@ def main():
     check("C police: tickets / paper stacking is NOT used for a client (mPlib_Get_space_putin_item_forTICKET only in the vanilla host branch)",
           "mPlib_Get_space_putin_item_forTICKET" not in client_branch and "mPlib_Get_space_putin_item_forTICKET(item_p)" in pa)
     ts_cli = cblk
-    check("C the TS client block (outside the TEST-ONLY hook) never touches the inventory: begin / poll / mirror apply contain no 'inventory' access",
-          "inventory" not in strip_hook_bodies(cblk))
+    _stripped_cblk = strip_hook_bodies(cblk)
+    _inv_uses = [m.start() for m in re.finditer("inventory", _stripped_cblk)]
+    _inv_writes = re.findall(r"inventory\\.\w+(?:\[[^\]]*\])?\s*(?:=(?!=)|\+=|-=|\+\+|--)", _stripped_cblk)
+    check("C the TS client block (outside the TEST-ONLY hooks) never WRITES the inventory: no assignment to inventory in begin / poll / mirror apply (the host post-image is applied only in pcnetgame_txn_apply_applied / _apply_house); the only accesses are exactly two read-only inventory.wallet reads (the house-purchase precheck NO_FUNDS compare and begin log) and inventory.pockets never appears",
+          not _inv_writes and len(_inv_uses) == 2 and "inventory.pockets" not in _stripped_cblk and _stripped_cblk.count("inventory.wallet") == 2)
     ap_body = func_body(c, "pcnetgame_txn_apply_applied")
     check("C the pocket of a MUSEUM_DONATE / POLICE_CLAIM changes ONLY in pcnetgame_txn_apply_applied (host post-image, owner stamp checked): MUSEUM_DONATE behaves like a DROP (slot emptied), "
           "POLICE_CLAIM like a grant (the claimed item enters the slot; the collect bit is the vanilla side effect)",

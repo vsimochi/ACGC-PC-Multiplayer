@@ -7,6 +7,9 @@
 #include "m_font.h"
 #include "m_msg.h"
 #include "sys_matrix.h"
+#ifdef TARGET_PC
+#include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated choice strings >= mChoice_SELECT_STR_NUM */
+#endif
 
 typedef void (*mChoice_MAIN_PROC)(mChoice_c*, GAME*);
 
