@@ -1468,3 +1468,14 @@ One host-owned lease table, keyed by animal slot, serves outdoor AND indoor vill
   Idle: a head-look target at the nearest remote player when he is nearer than the local one (`pc_net_game_nearest_remote_player`, local presentation only).
 - Tests: `test_npc_lease_protocol.py` (18/18, scripted clients, outdoor + indoor + disconnect + late join), `test_npc_lease_real.py` (9/9, TWO REAL processes, real dialogue: host talks, client refused, host ends,
   client's real talk accepted and finished), H7 of `test_client_villager_talk.py` updated to the exclusive semantics (the 'stopping the repeats -> EXPIRE' check is output-buffering flaky, pre-existing).
+
+## Patch 6b - host-authoritative town-shared pages (notice board + Able Sisters designs)
+
+Ownership: `Save.noticeboard[15]` and `Save.needlework.original_design[8]` are TOWN data (not per character); the host's Save is canonical. Per-character data (`my_org`, mail, diary) is untouched.
+PAGE (id 71, 560 B, reliable, both directions): the host keeps a revision per page, rescans every 500 ms (its own player's edits bump the revision), pushes a changed page to every READY resident client and ALL
+pages at join / reconnect (guests are never pushed: they keep their own town's pages). A client whose local copy differs from the canonical one it adopted sends ONE write built on that revision; the host
+applies it iff the revision still matches AND the content validates (no control / message-tag bytes, sane palette / flag, exact length), else answers STALE / BAD with the canonical copy (the client's edit is
+dropped and logged -- never a silent overwrite). Nothing is uploaded before the first canonical copy was adopted. Revisions are session-local; the CONTENT persists in the host save.
+Tests: `test_town_pages_protocol.py` (21/21, scripted clients: initial state, apply, mirror, stale, race, invalid, independent pages, late join, reconnect, guest, host restart), `test_town_pages_real.py`
+(8/8, real host + real client: the client's real dirty scan uploads its edit, the host applies it; the host's own edit is adopted by the real client). Not verified in the UI (Able Sisters / notice board screens).
+Known limit: game logic that auto-writes a notice post locally on a client (day-change events) is detected as an edit and loses to the host's copy when stale.

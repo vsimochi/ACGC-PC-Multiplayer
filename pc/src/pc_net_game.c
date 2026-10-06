@@ -524,6 +524,9 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_NPC_LEASE             = 70, /* Exclusive villager interaction lease (Patch 8; v8 unreleased: extended in place, NO version bump), host -> every READY client, RELIABLE, 24 bytes.
                                              * Who (PCNetPlayerId, 0xFF = nobody) owns the conversation with each animal slot's villager, outdoor AND indoor: sent on change and at READY. The
                                              * clients only mirror it (they refuse a new talk with a villager somebody else owns, and a client that lost a race ends its optimistic talk). */
+    PC_NETGAME_MSG_PAGE                  = 71, /* Town-shared pages (Patch 6b; v8 unreleased: extended in place, NO version bump), BOTH directions, RELIABLE, 560 bytes. One page of the notice board /
+                                             * the Able Sisters designs: host -> client the canonical page (push at join, on change, and as the reply to a write), client -> host a write built on a
+                                             * revision. The host applies a write iff the revision still matches, otherwise STALE with the canonical copy. See PCNetGamePageMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -5707,6 +5710,39 @@ int pc_net_game_host_npc_talk_held(int slot, int npc_id) {
     }
     return 1;
 }
+
+/* ---- Patch 6b: host-authoritative TOWN-SHARED pages (PC_NETGAME_MSG_PAGE, id 71) ----
+ * The notice board posts (Save.noticeboard[15]) and the Able Sisters designs (Save.needlework.original_design[8]) belong to the TOWN, not to a character: the HOST's Save is canonical. Every
+ * page has a host revision. The host rescans its pages (its own player's edits bump the revision), pushes a changed page to every READY client and ALL pages at join / reconnect. A client that finds
+ * its local copy differing from the canonical one it adopted sends ONE page write built on that revision: the host applies it iff the revision still matches (+ validation), otherwise answers STALE
+ * with the canonical copy (the client's edit is dropped -- the protocol knows, no silent last-writer-wins). Per-character data (my_org, mail, diary) is NOT touched: it stays character-owned. */
+#define PCNG_PAGE_NOTICE 1u
+#define PCNG_PAGE_DESIGN 2u
+#define PCNG_PAGE_DATA_MAX 0x220u
+#define PCNG_PAGE_COUNT (mNtc_BOARD_POST_COUNT + mNW_TOTAL_DESIGN_NUM)
+#define PCNG_PAGE_F_WRITE   0x01u /* client -> host: write built on base rev `aux` */
+#define PCNG_PAGE_F_APPLIED 0x02u /* host -> client: your write (echoed in aux) was applied; rev = the new revision */
+#define PCNG_PAGE_F_STALE   0x04u /* host -> client: your write was refused (revision moved on); data = the canonical page */
+#define PCNG_PAGE_F_BAD     0x08u /* host -> client: your write was refused (invalid / not allowed); data = the canonical page */
+typedef struct PCNetGamePageMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_PAGE */
+    uint8_t  kind;     /* PCNG_PAGE_NOTICE / PCNG_PAGE_DESIGN */
+    uint8_t  index;
+    uint8_t  flags;
+    uint32_t rev;      /* the canonical revision this page carries (write: ignored) */
+    uint32_t aux;      /* write: the revision the edit is built on; reply: that value echoed */
+    uint16_t len;      /* meaningful bytes of data */
+    uint16_t _rsv;
+    uint8_t  data[PCNG_PAGE_DATA_MAX];
+} PCNetGamePageMsg;
+_Static_assert(sizeof(PCNetGamePageMsg) == 560, "PCNetGamePageMsg wire size drifted");
+_Static_assert(sizeof(mNtc_board_post_c) <= PCNG_PAGE_DATA_MAX && sizeof(mNW_original_design_c) <= PCNG_PAGE_DATA_MAX, "a page does not fit PCNetGamePageMsg");
+static void pcnetgame_page_host_tick(void);
+static void pcnetgame_page_client_tick(void);
+static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg* in);
+static void pcnetgame_page_handle_client(const PCNetGamePageMsg* in);
+static void pcnetgame_page_client_reset(void);
+static void pcnetgame_page_test_edit(void);
 
 /* ---- Patch 8: exclusive villager interaction lease (outdoor AND indoor villagers, keyed by the animal slot) ----
  * The talk hold above IS the lease: ONE owner per villager (a client peer bit, or the host's own player). A second BEGIN is DENIED (see the handler), the host's own talk goes through
@@ -18118,6 +18154,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_museum_bits_test_hook();
     pcnetgame_evnpc_host_tick();
     pcnetgame_npc_lease_host_tick();
+    pcnetgame_page_host_tick();
     for (p = 0; p < PC_NET_MAX_PEERS; p++) {
         PCNetGameHostPeerState* wst = &s_host_peer[p];
         pcnetgame_host_ts_push_peer((PCNetPeerId)p); /* a late joiner / reconnect / a failed send is covered here */
@@ -27356,6 +27393,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGamePageMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PAGE) {
+        PCNetGamePageMsg pg;
+        memcpy(&pg, data, sizeof(pg));
+        pcnetgame_page_handle_host(peer, &pg);
+        return;
+    }
+
     if (size == sizeof(PCNetGameRoomNpcMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ROOM_NPC) {
         PCNetGameRoomNpcMsg rn;
         memcpy(&rn, data, sizeof(rn));
@@ -28166,6 +28210,14 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == sizeof(PCNetGamePageMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PAGE) {
+        PCNetGamePageMsg pg;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&pg, data, sizeof(pg));
+        pcnetgame_page_handle_client(&pg);
+        return;
+    }
+
     if (size == sizeof(PCNetGameNpcLeaseMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_LEASE) {
         PCNetGameNpcLeaseMsg nl;
         if (s_client_link != PC_NETGAME_LINK_READY) return;
@@ -28426,6 +28478,7 @@ static void pcnetgame_reset_client_session_state(void) {
     s_npc_talk_epoch++;
     memset(s_client_talk_out, 0, sizeof(s_client_talk_out)); /* keepalive table dies with the session */
     memset(&s_lease_client, 0, sizeof(s_lease_client));      /* Patch 8: the owner table is the old host's */
+    pcnetgame_page_client_reset();                           /* Patch 6b: the adopted page revisions are the old host's */
     {
         /* M9-A: every scene this client holds for OTHER players (the host and relayed clients) came over the
          * old host link; once that link is lost or replaced it can no longer be trusted (the new connection
@@ -28860,6 +28913,284 @@ int pc_net_game_client_reconnect_status(int* attempt, int* next_s) {
 }
 /* ===== CLIENT AUTO-RECONNECT END ===== */
 
+/* ---- Patch 6b implementation ---- */
+static uint8_t* pcnetgame_page_ptr(unsigned kind, unsigned index, uint16_t* len) {
+    if (kind == PCNG_PAGE_NOTICE && index < (unsigned)mNtc_BOARD_POST_COUNT) {
+        *len = (uint16_t)sizeof(mNtc_board_post_c);
+        return (uint8_t*)&Save_Get(noticeboard)[index];
+    }
+    if (kind == PCNG_PAGE_DESIGN && index < (unsigned)mNW_TOTAL_DESIGN_NUM) {
+        *len = (uint16_t)sizeof(mNW_original_design_c);
+        return (uint8_t*)&Save_Get(needlework).original_design[index];
+    }
+    return NULL;
+}
+static unsigned pcnetgame_page_slot(unsigned kind, unsigned index) { return kind == PCNG_PAGE_NOTICE ? index : (unsigned)mNtc_BOARD_POST_COUNT + index; }
+static void pcnetgame_page_of_slot(unsigned slot, unsigned* kind, unsigned* index) {
+    if (slot < (unsigned)mNtc_BOARD_POST_COUNT) { *kind = PCNG_PAGE_NOTICE; *index = slot; }
+    else { *kind = PCNG_PAGE_DESIGN; *index = slot - (unsigned)mNtc_BOARD_POST_COUNT; }
+}
+/* content rules: no control / message-tag bytes in text, sane flags */
+static int pcnetgame_page_valid(unsigned kind, unsigned index, const uint8_t* d, uint16_t len) {
+    uint16_t want = 0, i;
+    if (pcnetgame_page_ptr(kind, index, &want) == NULL || len != want) {
+        return 0;
+    }
+    if (kind == PCNG_PAGE_NOTICE) {
+        for (i = 0; i < (uint16_t)MAIL_BODY_LEN; i++) {
+            if (d[i] == (uint8_t)PC_NETGAME_PDATA_BAD_BYTE_CONTROL || d[i] == (uint8_t)PC_NETGAME_PDATA_BAD_BYTE_TAG) {
+                return 0;
+            }
+        }
+    } else {
+        const mNW_original_design_c* o = (const mNW_original_design_c*)d;
+        for (i = 0; i < (uint16_t)mNW_ORIGINAL_DESIGN_NAME_LEN; i++) {
+            if (o->name[i] == (uint8_t)PC_NETGAME_PDATA_BAD_BYTE_CONTROL || o->name[i] == (uint8_t)PC_NETGAME_PDATA_BAD_BYTE_TAG) {
+                return 0;
+            }
+        }
+        if (o->flag_design_set > 1u || o->palette >= 16u) {
+            return 0;
+        }
+    }
+    return 1;
+}
+static uint32_t pcnetgame_page_digest(unsigned kind, unsigned index) {
+    uint16_t len;
+    uint8_t* p = pcnetgame_page_ptr(kind, index, &len);
+    return p != NULL ? pcnetgame_fnv1a32(p, len) : 0u;
+}
+static void pcnetgame_page_send(PCNetPeerId peer, unsigned kind, unsigned index, uint32_t rev, uint8_t flags, uint32_t aux, const uint8_t* data, uint16_t len) {
+    PCNetGamePageMsg m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_PAGE;
+    m.kind = (uint8_t)kind;
+    m.index = (uint8_t)index;
+    m.flags = flags;
+    m.rev = rev;
+    m.aux = aux;
+    m.len = len;
+    memcpy(m.data, data, len);
+    (void)pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+}
+
+/* ---- host ---- */
+static uint32_t s_pg_rev[PCNG_PAGE_COUNT];                       /* host: canonical revision (0 = not baselined yet) */
+static uint32_t s_pg_dig[PCNG_PAGE_COUNT];                       /* host: digest of the content at that revision */
+static uint32_t s_pg_sent[PC_NET_MAX_PEERS][PCNG_PAGE_COUNT];    /* host: the revision each peer has */
+static uint32_t s_pg_next_scan_ms;
+static uint32_t s_pg_wr_ms[PC_NET_MAX_PEERS], s_pg_wr_n[PC_NET_MAX_PEERS];
+
+static void pcnetgame_page_host_tick(void) {
+    uint32_t now = pcnetgame_now_ms();
+    unsigned i;
+    int p;
+    if (s_role != PC_NETGAME_ROLE_HOST || gamePT == NULL || !s_local_world_latched) {
+        return;
+    }
+    pcnetgame_page_test_edit();
+    if ((uint32_t)(now - s_pg_next_scan_ms) >= 500u) {
+        s_pg_next_scan_ms = now;
+        for (i = 0; i < (unsigned)PCNG_PAGE_COUNT; i++) {
+            unsigned k, x;
+            uint32_t d;
+            pcnetgame_page_of_slot(i, &k, &x);
+            d = pcnetgame_page_digest(k, x);
+            if (s_pg_rev[i] == 0u || d != s_pg_dig[i]) {
+                if (s_pg_rev[i] != 0u) {
+                    printf("[NET][PAGE] host: page kind %u index %u changed on the host -> rev %u%s", k, x, (unsigned)(s_pg_rev[i] + 1u), "\n");
+                }
+                s_pg_rev[i]++;
+                s_pg_dig[i] = d;
+            }
+        }
+    }
+    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        int budget = 6;
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !s_host_peer[p].bound_valid || s_host_peer[p].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) /* a guest keeps its own town's pages */ {
+            memset(s_pg_sent[p], 0, sizeof(s_pg_sent[p]));
+            continue;
+        }
+        for (i = 0; i < (unsigned)PCNG_PAGE_COUNT && budget > 0; i++) {
+            if (s_pg_rev[i] != 0u && s_pg_sent[p][i] != s_pg_rev[i]) {
+                unsigned k, x;
+                uint16_t len;
+                uint8_t* d;
+                pcnetgame_page_of_slot(i, &k, &x);
+                d = pcnetgame_page_ptr(k, x, &len);
+                pcnetgame_page_send((PCNetPeerId)p, k, x, s_pg_rev[i], 0, 0, d, len);
+                s_pg_sent[p][i] = s_pg_rev[i];
+                budget--;
+            }
+        }
+    }
+}
+
+static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg* in) {
+    unsigned slot;
+    uint16_t len;
+    uint8_t* cur;
+    int idx;
+    uint32_t now;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY || (in->flags & PCNG_PAGE_F_WRITE) == 0u) {
+        return;
+    }
+    cur = pcnetgame_page_ptr(in->kind, in->index, &len);
+    if (cur == NULL) {
+        return;
+    }
+    slot = pcnetgame_page_slot(in->kind, in->index);
+    if (s_pg_rev[slot] == 0u) {
+        return; /* the host has not baselined its pages yet */
+    }
+    now = pcnetgame_now_ms();
+    if ((uint32_t)(now - s_pg_wr_ms[peer]) >= 1000u) {
+        s_pg_wr_ms[peer] = now;
+        s_pg_wr_n[peer] = 0;
+    }
+    idx = pcnetgame_rec_gate(peer, 0, 0);
+    if (idx < 0 || idx >= PLAYER_NUM || ++s_pg_wr_n[peer] > 20u || !pcnetgame_page_valid(in->kind, in->index, in->data, in->len)) {
+        printf("[NET][PAGE] host: peer %d write kind %u index %u REFUSED (%s)%s", (int)peer, (unsigned)in->kind, (unsigned)in->index,
+               (idx < 0 || idx >= PLAYER_NUM) ? "not a resident" : s_pg_wr_n[peer] > 20u ? "rate limited" : "invalid content", "\n");
+        pcnetgame_page_send(peer, in->kind, in->index, s_pg_rev[slot], (uint8_t)PCNG_PAGE_F_BAD, in->aux, cur, len);
+        s_pg_sent[peer][slot] = s_pg_rev[slot];
+        return;
+    }
+    if (in->aux != s_pg_rev[slot]) {
+        if (memcmp(cur, in->data, len) == 0) { /* a replay of a write that is already the canonical content */
+            pcnetgame_page_send(peer, in->kind, in->index, s_pg_rev[slot], (uint8_t)PCNG_PAGE_F_APPLIED, in->aux, cur, len);
+        } else {
+            printf("[NET][PAGE] host: peer %d write kind %u index %u STALE (built on rev %u, host rev %u) -- canonical copy sent back%s", (int)peer, (unsigned)in->kind, (unsigned)in->index,
+                   (unsigned)in->aux, (unsigned)s_pg_rev[slot], "\n");
+            pcnetgame_page_send(peer, in->kind, in->index, s_pg_rev[slot], (uint8_t)PCNG_PAGE_F_STALE, in->aux, cur, len);
+        }
+        s_pg_sent[peer][slot] = s_pg_rev[slot];
+        return;
+    }
+    if (memcmp(cur, in->data, len) != 0) {
+        memcpy(cur, in->data, len);
+        s_pg_rev[slot]++;
+        s_pg_dig[slot] = pcnetgame_page_digest(in->kind, in->index);
+        printf("[NET][PAGE] host: peer %d (resident %d) write kind %u index %u APPLIED -> rev %u%s", (int)peer, idx, (unsigned)in->kind, (unsigned)in->index, (unsigned)s_pg_rev[slot], "\n");
+    }
+    pcnetgame_page_send(peer, in->kind, in->index, s_pg_rev[slot], (uint8_t)PCNG_PAGE_F_APPLIED, in->aux, cur, len);
+    s_pg_sent[peer][slot] = s_pg_rev[slot];
+}
+
+/* ---- client ---- */
+static uint32_t s_pgc_rev[PCNG_PAGE_COUNT];        /* the canonical revision this client adopted (0 = none yet: nothing is uploaded before the host's copy arrived) */
+static uint32_t s_pgc_dig[PCNG_PAGE_COUNT];        /* digest of that canonical content */
+static uint32_t s_pgc_pend_dig[PCNG_PAGE_COUNT];   /* digest of the write in flight (0 = none) */
+static uint32_t s_pgc_pend_ms[PCNG_PAGE_COUNT];
+static uint32_t s_pgc_next_ms;
+
+static void pcnetgame_page_client_reset(void) {
+    memset(s_pgc_rev, 0, sizeof(s_pgc_rev));
+    memset(s_pgc_dig, 0, sizeof(s_pgc_dig));
+    memset(s_pgc_pend_dig, 0, sizeof(s_pgc_pend_dig));
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_PAGE_EDIT=<kind>,<index> edits that page in THIS process's own Save once (client: after it adopted the host's copy; host: once its pages are baselined) --
+ * what a player's real edit does to the save. Never active in normal play. */
+static void pcnetgame_page_test_edit(void) {
+    static int done = 0;
+    const char* e;
+    unsigned k, x, slot;
+    uint16_t len;
+    uint8_t* p;
+    if (done || (e = pc_test_hook_getenv("AC_TEST_PAGE_EDIT")) == NULL || sscanf(e, "%u,%u", &k, &x) != 2 || (p = pcnetgame_page_ptr(k, x, &len)) == NULL) {
+        return;
+    }
+    slot = pcnetgame_page_slot(k, x);
+    if ((s_role == PC_NETGAME_ROLE_CLIENT ? s_pgc_rev[slot] : s_pg_rev[slot]) == 0u) {
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) { /* the host edits 8 s after its first READY client (that client has adopted every page by then) */
+        static uint32_t first_ready;
+        if (pc_net_game_host_ready_peer_count() == 0) {
+            return;
+        }
+        if (first_ready == 0u) {
+            first_ready = pcnetgame_now_ms();
+        }
+        if ((uint32_t)(pcnetgame_now_ms() - first_ready) < 8000u) {
+            return;
+        }
+    }
+    done = 1;
+    p[0] = (uint8_t)(p[0] == 0x41u ? 0x42u : 0x41u);
+    printf("[NET][PAGE][TEST-ONLY] edited page kind %u index %u in this process's save%s", k, x, "\n");
+}
+
+static void pcnetgame_page_client_tick(void) {
+    uint32_t now = pcnetgame_now_ms();
+    unsigned i;
+    pcnetgame_page_test_edit();
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL || (uint32_t)(now - s_pgc_next_ms) < 500u) {
+        return;
+    }
+    s_pgc_next_ms = now;
+    for (i = 0; i < (unsigned)PCNG_PAGE_COUNT; i++) {
+        unsigned k, x;
+        uint32_t d;
+        uint16_t len;
+        uint8_t* cur;
+        if (s_pgc_rev[i] == 0u) {
+            continue;
+        }
+        pcnetgame_page_of_slot(i, &k, &x);
+        cur = pcnetgame_page_ptr(k, x, &len);
+        d = pcnetgame_fnv1a32(cur, len);
+        if (d == s_pgc_dig[i]) {
+            s_pgc_pend_dig[i] = 0u;
+            continue;
+        }
+        if (s_pgc_pend_dig[i] == d && (uint32_t)(now - s_pgc_pend_ms[i]) < 3000u) {
+            continue; /* the write is in flight */
+        }
+        printf("[NET][PAGE] client: local edit of page kind %u index %u (built on rev %u) -> write sent to the host%s", k, x, (unsigned)s_pgc_rev[i], "\n");
+        pcnetgame_page_send(0, k, x, 0, (uint8_t)PCNG_PAGE_F_WRITE, s_pgc_rev[i], cur, len);
+        s_pgc_pend_dig[i] = d;
+        s_pgc_pend_ms[i] = now;
+    }
+}
+
+static void pcnetgame_page_handle_client(const PCNetGamePageMsg* in) {
+    uint16_t len;
+    uint8_t* cur;
+    unsigned slot;
+    if (s_client_link != PC_NETGAME_LINK_READY || (in->flags & PCNG_PAGE_F_WRITE) != 0u || in->rev == 0u) {
+        return;
+    }
+    cur = pcnetgame_page_ptr(in->kind, in->index, &len);
+    if (cur == NULL || in->len != len || !pcnetgame_page_valid(in->kind, in->index, in->data, in->len)) {
+        return;
+    }
+    slot = pcnetgame_page_slot(in->kind, in->index);
+    if (in->rev < s_pgc_rev[slot]) {
+        return; /* an older canonical copy */
+    }
+    if ((in->flags & PCNG_PAGE_F_APPLIED) != 0u && s_pgc_pend_dig[slot] != 0u && memcmp(cur, in->data, len) == 0) {
+        s_pgc_rev[slot] = in->rev;
+        s_pgc_dig[slot] = pcnetgame_fnv1a32(cur, len);
+        s_pgc_pend_dig[slot] = 0u;
+        printf("[NET][PAGE] client: my write of kind %u index %u was APPLIED (rev %u)%s", (unsigned)in->kind, (unsigned)in->index, (unsigned)in->rev, "\n");
+        return;
+    }
+    if ((in->flags & (PCNG_PAGE_F_STALE | PCNG_PAGE_F_BAD)) != 0u) {
+        printf("[NET][PAGE] client: my write of kind %u index %u was %s: the HOST's copy (rev %u) wins, the local edit is dropped%s", (unsigned)in->kind, (unsigned)in->index,
+               (in->flags & PCNG_PAGE_F_BAD) ? "REFUSED" : "STALE", (unsigned)in->rev, "\n");
+    } else if (s_pgc_rev[slot] == 0u) {
+        printf("[NET][PAGE] client: adopted kind %u index %u rev %u%s", (unsigned)in->kind, (unsigned)in->index, (unsigned)in->rev, "\n");
+    } else if (in->rev > s_pgc_rev[slot]) {
+        printf("[NET][PAGE] client: page kind %u index %u updated from the host -> rev %u%s", (unsigned)in->kind, (unsigned)in->index, (unsigned)in->rev, "\n");
+    }
+    memcpy(cur, in->data, len);
+    s_pgc_rev[slot] = in->rev;
+    s_pgc_dig[slot] = pcnetgame_fnv1a32(cur, len);
+    s_pgc_pend_dig[slot] = 0u;
+}
+
 /* v2 client, once per poll after events: deferred IDENTITY send, save pause/resume + resync,
  * town-change detection, PLAYER_CONTEXT change detection, parked-tile retry. */
 static void pcnetgame_client_tick(void) {
@@ -28867,6 +29198,7 @@ static void pcnetgame_client_tick(void) {
 
     pcnetgame_evnpc_claim_test_hook();
     pcnetgame_evnpc_client_tick(); /* event NPC authority: match the host's table (no-op until the host sent one) */
+    pcnetgame_page_client_tick();  /* town-shared pages: upload a local edit built on the adopted revision */
 
     if (s_client_link == PC_NETGAME_LINK_HANDSHAKE && !s_client_identity_sent) {
         if (ready && pc_guest_creation_active()) {
