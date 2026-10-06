@@ -499,6 +499,22 @@ endif()
 # =============================================================================
 # Build executable
 # =============================================================================
+# TEST HOOKS (guest -> resident lifecycle hardening). The hook flags / env switches that inject state (--house-buy-test and --nook-test raise the LOCAL wallet,
+# AC_RELAUNCH_DRYRUN, --house-test-host-edit, --mail-test-*, --txn-fault, --promote-fault, AC_TOWN_NO_MSGBOX) are compiled in ONLY when PC_TEST_HOOKS is ON (the default for the
+# development build, so the test suites keep working) AND even then each one needs the runtime env AC_TEST_HOOKS=1. RELEASE BUILDS MUST CONFIGURE -DPC_TEST_HOOKS=OFF.
+# Scoped to the few translation units that contain hooks (no full rebuild when toggled).
+option(PC_TEST_HOOKS "Compile the test-only hook flags (dev builds; configure OFF for release builds)" ON)
+if(PC_TEST_HOOKS)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_main.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_m_card.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_relaunch.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c
+        ${DECOMP_ROOT}/src/game/m_choice.c
+        PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS)
+endif()
+
 add_executable(ac_pc
     ${PC_SOURCES}
     ${FIXNES_SOURCES}

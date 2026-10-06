@@ -422,6 +422,9 @@ enum {
 extern int           g_pc_txn_fault_mode;
 extern int           g_pc_txn_fault_nth;
 extern int           g_pc_txn_fault_arg;
+#ifdef PC_NET_TEST_HOOKS
+extern int           g_pc_promote_fault; /* --promote-fault (HOST, test builds only): 1 fail_save, 2 crash_after_members, 3 crash_after_gci */
+#endif
 extern int           g_pc_frame_limit_override;
 extern int           g_pc_speedhack_enabled;
 extern int           g_pc_time_override;

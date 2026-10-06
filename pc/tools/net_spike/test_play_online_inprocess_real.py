@@ -91,7 +91,7 @@ class Client:
         self.cdir, self.tag = cdir, tag
         self.log_path = T.log_path("ipc_client_%s.log" % tag)
         env = dict(os.environ)
-        env.update({"AC_RELAUNCH_DRYRUN": "1", "AC_DISPLAY_NAME": display, "AC_MASTER_VOLUME": "1"})
+        env.update({"AC_TEST_HOOKS": "1", "AC_RELAUNCH_DRYRUN": "1", "AC_DISPLAY_NAME": display, "AC_MASTER_VOLUME": "1"})
         env.update(env_extra or {})
         self._fp = open(self.log_path, "wb")
         self.proc = subprocess.Popen([os.path.join(cdir, "AnimalCrossing.exe"), "--verbose"], cwd=cdir, stdout=self._fp, stderr=subprocess.STDOUT, env=env)

@@ -4,6 +4,8 @@
 
 #include "pc_nook_house.h"
 #include "pc_net_game.h"
+#include "pc_residence.h" /* PC_RESIDENCE_HOUSES */
+#include "pc_platform.h"  /* SDL_GetTicks: the rejoin hold heartbeat runs on the wall clock */
 #include "m_msg_data.h"
 
 /* control code bytes (tools/msg_tool.py COMMANDS / CONT_SIZES; include/m_font.h mFont_CONT_CODE_*) */
@@ -34,7 +36,7 @@
 #define NK_SEL_SAYCODE 0x24D  /* "Say code" */
 #define NK_SEL_HANGON 0x3D    /* "Umm, hang on!" */
 
-static int s_pick[4];
+static int s_pick[PC_RESIDENCE_HOUSES];
 static int s_pick_n = 0;
 static int s_confirm = -1;
 
@@ -110,18 +112,49 @@ static void nk_price(char* out, size_t cap) {
     }
 }
 
-static int s_rejoin_hold = 0;
+/* Rejoin hold with a HEARTBEAT (see pc_nook_house.h): 0 off, 1 purchase in flight, 2 APPLIED. The shop proc touches it every game frame; it expires NK_HOLD_IDLE_MS (30 frames at 60 fps)
+ * after the last touch and, once APPLIED, NK_HOLD_APPLIED_CAP_MS after APPLIED whatever happens. WALL CLOCK, not polls: pc_main polls the hold from VIWaitForRetrace, which runs many
+ * times per game frame (the first version counted polls and hit its 900 "frames" cap ~4 s after APPLIED, before the congratulation row was read). */
+#define NK_HOLD_IDLE_MS 500u
+#define NK_HOLD_APPLIED_CAP_MS 15000u
+static int s_hold_mode = 0;
+static uint32_t s_hold_touch_ms = 0;
+static uint32_t s_hold_applied_ms = 0;
+
+static uint32_t nk_now_ms(void) {
+    return (uint32_t)SDL_GetTicks();
+}
 
 void pc_nook_house_rejoin_hold_set(int on) {
-    s_rejoin_hold = on ? 2400 : 0; /* frames: ~40 s at 60 fps */
+    const int mode = on <= 0 ? 0 : on >= 2 ? 2 : 1;
+    if (mode != s_hold_mode) {
+        printf("[NET][HOUSE] rejoin hold set to %d\n", mode);
+    }
+    if (mode == 2 && s_hold_mode != 2) {
+        s_hold_applied_ms = nk_now_ms();
+    }
+    s_hold_mode = mode;
+    s_hold_touch_ms = nk_now_ms();
+}
+
+void pc_nook_house_rejoin_hold_touch(void) {
+    if (s_hold_mode != 0) {
+        s_hold_touch_ms = nk_now_ms();
+    }
 }
 
 int pc_nook_house_rejoin_hold(void) {
-    if (s_rejoin_hold > 0) {
-        s_rejoin_hold--;
-        return 1;
+    uint32_t now;
+    if (s_hold_mode == 0) {
+        return 0;
     }
-    return 0;
+    now = nk_now_ms();
+    if ((uint32_t)(now - s_hold_touch_ms) > NK_HOLD_IDLE_MS || (s_hold_mode == 2 && (uint32_t)(now - s_hold_applied_ms) > NK_HOLD_APPLIED_CAP_MS)) {
+        printf("[NET][HOUSE] rejoin hold EXPIRED (heartbeat): mode %d, %u ms since the last touch, %u ms since APPLIED\n", s_hold_mode, (unsigned)(now - s_hold_touch_ms), (unsigned)(now - s_hold_applied_ms));
+        s_hold_mode = 0;
+        return 0;
+    }
+    return 1;
 }
 
 int pc_nook_msg_id(int which) {
@@ -138,7 +171,7 @@ int pc_nook_sel_id_valid(int id) {
 
 void pc_nook_house_set_pick(const int* houses, int n) {
     int i;
-    s_pick_n = (houses == NULL || n < 1) ? 0 : (n > 4 ? 4 : n);
+    s_pick_n = (houses == NULL || n < 1) ? 0 : (n > PC_RESIDENCE_HOUSES ? PC_RESIDENCE_HOUSES : n);
     for (i = 0; i < s_pick_n; i++) {
         s_pick[i] = houses[i];
     }
@@ -194,8 +227,8 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_page(&b);
             nk_text(&b, "Which house would you like?");
             n = 0;
-            for (i = 0; i < s_pick_n && i < 4; i++) {
-                ids[n++] = PC_NOOK_SEL_HOUSE1 + (s_pick[i] & 3);
+            for (i = 0; i < s_pick_n && i < PC_RESIDENCE_HOUSES; i++) {
+                ids[n++] = PC_NOOK_SEL_HOUSE1 + (s_pick[i] % PC_RESIDENCE_HOUSES);
             }
             if (s_pick_n >= 2) {
                 ids[n++] = PC_NOOK_SEL_ANY_HOUSE;
@@ -208,7 +241,7 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             break;
         case PC_NOOK_MSG_CONFIRM:
             if (s_confirm >= 0) {
-                snprintf(tmp, sizeof(tmp), "House %d, then!", (s_confirm & 3) + 1);
+                snprintf(tmp, sizeof(tmp), "House %d, then!", (s_confirm % PC_RESIDENCE_HOUSES) + 1);
             } else {
                 snprintf(tmp, sizeof(tmp), "Any free house, then!");
             }
@@ -263,6 +296,26 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\nPlease try again later!");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_LINKLOST:
+            nk_text(&b, "Oh my, the line went quiet");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nin the middle of the\npaperwork.");
+            nk_page(&b);
+            nk_text(&b, "I cannot say whether it");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nwent through. Please check\nyour wallet, then ask me!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_NAMETAKEN:
+            nk_text(&b, "I'm terribly sorry,");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nbut a resident of this town\nalready has your name.");
+            nk_page(&b);
+            nk_text(&b, "Nothing was charged.");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nPlease come back with\nanother name, hm?");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_THANKS:
             nk_text(&b, "Splendid, splendid!");
             nk_pause(&b, 8);
@@ -311,8 +364,8 @@ static int nk_char_ok(int c) {
 
 int pc_nook_house_selftest(void) {
     static unsigned char buf[1536];
-    int which, i, bad = 0, h4[4] = { 0, 1, 2, 3 };
-    pc_nook_house_set_pick(h4, 4);
+    int which, i, bad = 0, h4[PC_RESIDENCE_HOUSES] = { 0, 1, 2, 3 };
+    pc_nook_house_set_pick(h4, PC_RESIDENCE_HOUSES);
     pc_nook_house_set_confirm(2);
     for (which = 0; which < PC_NOOK_MSG_COUNT; which++) {
         int n = pc_nook_msg_build(MSG_MAX + which, buf, sizeof(buf)), last_ok;

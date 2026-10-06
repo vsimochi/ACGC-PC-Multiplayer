@@ -34,6 +34,7 @@
 #include "lb_rtc.h"
 #include "game.h"
 #include "pc_net_game.h"
+#include "pc_residence.h" /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES (lifecycle hardening) */
 #include "pc_session.h" /* M2: pc_session() = a STORE character (characters/<uuid>/character.ini) instead of a legacy guest profile file */
 #include "pc_guest_profile.h" /* Guests G3.2: PCGuestProfile / pc_guest_profile_load_or_create (the title-menu "Join as Guest" item) */
 #include "pc_mp_guests.h" /* Guests G1: pc_mp_guests_name_valid() (the guest NAME rule shared with the host) */
@@ -636,6 +637,40 @@ static int pc_save_write_authoritative_impl(void) {
  * tooling already uses elsewhere. Never mutates anything. */
 int pc_save_authoritative_client_reject_count(void) {
     return s_pc_save_authoritative_client_reject_count;
+}
+
+/* Guest -> resident lifecycle hardening (B3a): pc_save_write_gci_to() returns TRUE WITHOUT WRITING when the save is not ready or is a sanitized transfer image, which a promotion
+ * must not mistake for a durable save (it then removes the guest entry for a resident that is not on disk). pc_save_can_be_durable() = a real write can happen in this process;
+ * pc_save_write_authoritative_durable() = FALSE unless the GCI was really written (the test fault --promote-fault fail_save / no_durable act here, test builds only). */
+#ifdef PC_NET_TEST_HOOKS
+extern int g_pc_promote_fault;
+#endif
+int pc_save_can_be_durable(void) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT || !pc_save_ready || g_pc_save_sanitized) {
+        return FALSE;
+    }
+#ifdef PC_NET_TEST_HOOKS
+    if (g_pc_promote_fault == 4) {
+        printf("[PC][TEST-ONLY] --promote-fault no_durable: the town save is reported as NOT durable\n");
+        return FALSE;
+    }
+#endif
+    return TRUE;
+}
+
+int pc_save_write_authoritative_durable(void) {
+    if (!pc_save_can_be_durable()) {
+        OSReport("[PC] pc_save_write_authoritative_durable: REFUSED -- no real write can happen here (client / save not ready / sanitized image)\n");
+        return FALSE;
+    }
+#ifdef PC_NET_TEST_HOOKS
+    if (g_pc_promote_fault == 1) { /* one shot: the authoritative save FAILS (the promotion rolls back; later saves work) */
+        g_pc_promote_fault = 0;
+        printf("[PC][TEST-ONLY] --promote-fault fail_save: the authoritative save FAILS now (one shot)\n");
+        return FALSE;
+    }
+#endif
+    return pc_save_write_authoritative();
 }
 
 /* M1 hardening: a tiny role predicate exposed for non-PC-only translation units (namely
@@ -1592,7 +1627,7 @@ static int pc_guest_resident_name_conflict(const PersonalID_c* home) {
  *   catalog bits (M-I)                   the four mPr_SetItemCollectBit calls of the intro demo (worn shirt, FTR_SUM_CASSE01, the house's carpet and wallpaper)
  *   villager memories (M-I)              memory_player_id == the guest's home PID -> the new PID (+ host land / tune for town villagers; the islander's union is left alone)
  * NOT done (documented limits): the first-job quest and the Nook intro (host-owned Save state with no client -> host path), mCkRh roach data (the house is already a
- * default house), fish records and mail held for the guest PID. One snapshot (resident, house, event flags, animals[], island animal) is kept so the caller can roll the whole change back when the save cannot be written. Returns 1 or 0 with err. */
+ * default house). Everything keyed to the guest PID or carried by the guest record is migrated by pc_mp_promote_migrate (see below); fish records / host-held mail never existed for a guest. One snapshot (resident, house, event flags, animals[], island animal) is kept so the caller can roll the whole change back when the save cannot be written. Returns 1 or 0 with err. */
 static struct {
     int      valid;
     int      slot;
@@ -1604,6 +1639,7 @@ static struct {
     u32      ev_common_flags;
     Animal_c animals[ANIMAL_NUM_MAX]; /* M-I: villager memories re-keyed to the new PID (rolled back when the save fails) */
     Animal_c island_animal;
+    mFR_record_c fish[mFR_RECORD_NUM]; /* lifecycle hardening: fish records re-keyed defensively (rolled back with the rest) */
 } s_pc_promote_snap;
 
 void pc_mp_promote_rollback(void);
@@ -1615,6 +1651,118 @@ void pc_mp_promote_set_paid(int paid) {
     s_pc_promote_paid = paid != 0;
 }
 
+/* ===== Guest -> resident lifecycle hardening: PID re-key + record migration (HOST, game thread, inside pc_mp_promote_create) ===== */
+extern int pc_net_game_pocket_legal_item(unsigned item); /* pc_net_game.c: the D3 pocket-legal predicate (the one the record upload validators use) */
+
+_Static_assert(offsetof(Save_t, fishRecord) == 0x23E68 && offsetof(Save_t, animals) == 0x17438 && sizeof(mFR_record_c) == 0x20, "the lifecycle tests seed the GCI at these Save_t offsets");
+
+/* Copies the WHOLE PersonalID (name, land_name, player_id, land_id) of `npid` over `*p` when `*p` equals `gkey`. Returns 1 when it re-keyed. */
+int pc_pid_rekey(PersonalID_c* p, PersonalID_c* gkey, PersonalID_c* npid) {
+    if (p == NULL || gkey == NULL || npid == NULL || mPr_NullCheckPersonalID(p) != FALSE || mPr_CheckCmpPersonalID(p, gkey) != TRUE) {
+        return 0;
+    }
+    mPr_CopyPersonalID(p, npid);
+    return 1;
+}
+
+static void pc_promote_or_bits(u32* dst, const u32* src, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        dst[i] |= src[i];
+    }
+}
+
+/* Returns the number of migrated items (all classes); the per-class counts are logged on one line. NOT carried (documented): state_flags, museum_record (host-owned),
+ * reset_code, ecard_letter_data, calendar, soncho trophies, first-job quests. Fish records / host-held mail do NOT need carrying (fish records are written only by client
+ * actors, mail is never held on the host for a guest); the defensive fish re-key is a no-op in practice. */
+int pc_mp_promote_migrate(PersonalID_c* gkey, const Private_c* g, Private_c* priv) {
+    int mem = 0, contest = 0, fish = 0, letters = 0, quests = 0, a, m, i, k;
+    int equip = 0;
+    PersonalID_c* npid = &priv->player_ID;
+    if (gkey == NULL || g == NULL || priv == NULL) {
+        return 0;
+    }
+    /* (a) memories + contest quests of the 15 villagers and the islander (the islander's memuni is a different union member: only its id is re-keyed) */
+    if (mPr_NullCheckPersonalID(gkey) == FALSE) {
+        for (a = 0; a < ANIMAL_NUM_MAX + 1; a++) {
+            Animal_c* an = a < ANIMAL_NUM_MAX ? Save_GetPointer(animals[a]) : Save_GetPointer(island.animal);
+            const int is_island = a >= ANIMAL_NUM_MAX;
+            for (m = 0; m < ANIMAL_MEMORY_NUM; m++) {
+                Anmmem_c* mem_p = &an->memories[m];
+                if (pc_pid_rekey(&mem_p->memory_player_id, gkey, npid)) {
+                    if (!is_island) {
+                        mLd_CopyLandName(mem_p->memuni.land.name, Save_Get(land_info).name);
+                        mem_p->memuni.land.id = Save_Get(land_info).id;
+                        mem_p->saved_town_tune = Save_Get(melody);
+                    }
+                    mem++;
+                }
+            }
+            contest += pc_pid_rekey(&an->contest_quest.player_id, gkey, npid);
+        }
+        for (i = 0; i < mFR_RECORD_NUM; i++) {
+            fish += pc_pid_rekey(&Save_Get(fishRecord)[i].pid, gkey, npid);
+        }
+    }
+    /* (b) the guest record's own state */
+    for (i = 0, k = 0; i < mPr_INVENTORY_MAIL_COUNT; i++) {
+        Mail_c* src = (Mail_c*)&g->mail[i];
+        if (mMl_check_not_used_mail(src) == TRUE) {
+            continue;
+        }
+        priv->mail[k] = *src;
+        (void)pc_pid_rekey(&priv->mail[k].header.recipient.personalID, gkey, npid);
+        (void)pc_pid_rekey(&priv->mail[k].header.sender.personalID, gkey, npid);
+        if (priv->mail[k].present != (mActor_name_t)EMPTY_NO && priv->mail[k].present != (mActor_name_t)RSV_NO && !pc_net_game_pocket_legal_item(priv->mail[k].present)) {
+            priv->mail[k].present = (mActor_name_t)EMPTY_NO;
+        }
+        k++;
+        letters++;
+    }
+    if (letters > 0) {
+        priv->saved_mail_header = g->saved_mail_header;
+    }
+    if (g->equipment != (mActor_name_t)EMPTY_NO && pc_net_game_pocket_legal_item(g->equipment)) {
+        priv->equipment = g->equipment;
+        equip = 1;
+    }
+    pc_promote_or_bits(priv->aircheck_collect_bitfield, g->aircheck_collect_bitfield, 2);
+    pc_promote_or_bits(priv->furniture_collected_bitfield, g->furniture_collected_bitfield, 43);
+    pc_promote_or_bits(priv->wall_collected_bitfield, g->wall_collected_bitfield, 3);
+    pc_promote_or_bits(priv->carpet_collected_bitfield, g->carpet_collected_bitfield, 3);
+    pc_promote_or_bits(priv->paper_collected_bitfield, g->paper_collected_bitfield, 2);
+    pc_promote_or_bits(priv->music_collected_bitfield, g->music_collected_bitfield, 2);
+    memcpy(priv->maps, g->maps, sizeof(priv->maps));
+    if (g->backgound_texture == (mActor_name_t)EMPTY_NO || ITEM_IS_CLOTH(g->backgound_texture)) {
+        priv->backgound_texture = g->backgound_texture;
+    }
+    priv->hint_count = g->hint_count;
+    if ((int)g->destiny.type < mPr_DESTINY_NUM) {
+        priv->destiny = g->destiny;
+    }
+    if (g->sunburn.rank >= mPr_SUNBURN_RANK_MIN && g->sunburn.rank <= mPr_SUNBURN_RANK_MAX && g->sunburn.rankdown_days >= 0) {
+        priv->sunburn = g->sunburn;
+    }
+    priv->remail = g->remail;
+    priv->animal_memory = g->animal_memory;
+    for (i = 0; i < mPr_DELIVERY_QUEST_NUM; i++) {
+        if (g->deliveries[i].base.quest_type == mQst_QUEST_TYPE_DELIVERY) {
+            priv->deliveries[i] = g->deliveries[i];
+            quests++;
+        }
+    }
+    for (i = 0; i < mPr_ERRAND_QUEST_NUM; i++) {
+        const mQst_errand_c* e = &g->errands[i];
+        if (e->base.quest_type == mQst_QUEST_TYPE_ERRAND && e->errand_type != mQst_ERRAND_TYPE_FIRST_JOB && (int)e->base.quest_kind < mQst_ERRAND_FIRSTJOB_CHANGE_CLOTH) {
+            priv->errands[i] = *e;
+            quests++;
+        }
+    }
+    printf("[PC] migrate: memories=%d contest_quests=%d fish_records=%d letters=%d equipment=%d quests=%d (+ collection bits OR-ed, maps, hint_count, destiny, sunburn, remail, animal_memory, backgound_texture)\n",
+           mem, contest, fish, letters, equip, quests);
+    return mem + contest + fish + letters + equip + quests;
+}
+
 int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot, int house, char* err, size_t cap) {
     const Private_c* g = (const Private_c*)guest_rec;
     const int paid = s_pc_promote_paid;
@@ -1623,14 +1771,13 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     Private_c* priv;
     mHm_hs_c* home;
     int i, face_ok = 1;
-    u32 seen = 0;
 
     s_pc_promote_paid = 0; /* consumed above into `paid` */
     if (err != NULL && cap > 0) {
         err[0] = '\0';
     }
 #define PC_PROMOTE_FAIL(...) do { if (err != NULL && cap > 0) snprintf(err, cap, __VA_ARGS__); return 0; } while (0)
-    if (g == NULL || slot < 0 || slot >= PLAYER_NUM || house < 0 || house >= PLAYER_NUM) {
+    if (g == NULL || slot < 0 || slot >= PC_RESIDENCE_SLOTS || house < 0 || house >= PC_RESIDENCE_HOUSES) {
         PC_PROMOTE_FAIL("bad slot / house / guest record");
     }
     if (!pc_save_loaded || pc_net_game_role() != PC_NETGAME_ROLE_HOST) {
@@ -1644,12 +1791,11 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     if (mPr_NullCheckPersonalID(&home->ownerID) != TRUE) {
         PC_PROMOTE_FAIL("house %d already has an owner", house);
     }
-    for (i = 0; i < PLAYER_NUM; i++) { /* the arrangement must be a permutation of 0..3, else mHS_set_use's swap would corrupt it */
-        const int h = (int)(((u32)Save_Get(house_arrangement) >> (i * 2)) & 3u);
-        if (seen & (1u << h)) {
-            PC_PROMOTE_FAIL("the house arrangement of this save is not a permutation (0x%02X): refusing to touch it", (unsigned)Save_Get(house_arrangement));
+    { /* the arrangement must be a permutation of 0..3 (else mHS_set_use's swap would corrupt it), the slot the house maps to must be this slot or free, every live resident owns its house */
+        char cerr[200];
+        if (!pc_residence_check(slot, house, cerr, sizeof(cerr))) {
+            PC_PROMOTE_FAIL("%s (nothing was changed)", cerr);
         }
-        seen |= 1u << h;
     }
     if (g->gender != mPr_SEX_MALE && g->gender != mPr_SEX_FEMALE) {
         PC_PROMOTE_FAIL("the guest record has an invalid gender (%d)", (int)g->gender);
@@ -1669,6 +1815,7 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     s_pc_promote_snap.ev_common_flags = (u32)Common_Get(event_flags[mEv_SAVED_EVENT]);
     memcpy(s_pc_promote_snap.animals, Save_Get(animals), sizeof(s_pc_promote_snap.animals));
     s_pc_promote_snap.island_animal = Save_Get(island).animal;
+    memcpy(s_pc_promote_snap.fish, Save_Get(fishRecord), sizeof(s_pc_promote_snap.fish));
 
     mPr_ClearPrivateInfo(priv);
     mPr_InitPrivateInfo(priv);
@@ -1700,11 +1847,11 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
         priv->inventory.loan = 0; /* the guest paid the 1,000 down payment + the 17,400 loan up front (wallet debited by the host before this call) */
     }
 
-    if (mHS_set_use(slot, house) != TRUE || (int)mHS_get_arrange_idx(slot) != house || mPr_CheckCmpPersonalID(&home->ownerID, &priv->player_ID) != TRUE) {
+    if (!pc_residence_assign(slot, house) || mPr_CheckCmpPersonalID(&home->ownerID, &priv->player_ID) != TRUE) {
         pc_mp_promote_rollback();
         PC_PROMOTE_FAIL("mHS_set_use(%d, %d) did not give the house to the new resident (everything was rolled back)", slot, house);
     }
-    mEv_ClearPersonalEventFlag(slot);
+    /* pc_residence_assign() also ran mEv_ClearPersonalEventFlag(slot) (the veteran state of the slot) */
 
     /* M-I: the birthday (vanilla's intro asks it; a guest record carries it). Only a plausible date is copied, else the vanilla cleared value stays. */
     if (g->birthday.month >= 1 && g->birthday.month <= 12 && g->birthday.day >= 1 && g->birthday.day <= 31) {
@@ -1728,29 +1875,10 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
         Common_Set(now_private, prev_now);
     }
 
-    /* M-I: villager memories the guest made (the host resolves FRIENDSHIP_REQUEST from the guest's home PID) are re-keyed to the new PID, like the memory a resident
-     * gets from mNpc_SetAnimalLastTalk: the land becomes this town and the tune the town melody. The ISLANDER's memuni is a different union member (the furniture bitfield):
-     * only its player id is re-keyed. NOT re-keyed: fish records, mail held for the guest PID. */
-    if (gkey != NULL && mPr_NullCheckPersonalID(gkey) == FALSE) {
-        int a, m;
-        for (a = 0; a < ANIMAL_NUM_MAX + 1; a++) {
-            Animal_c* an = a < ANIMAL_NUM_MAX ? Save_GetPointer(animals[a]) : Save_GetPointer(island.animal);
-            const int is_island = a >= ANIMAL_NUM_MAX;
-            for (m = 0; m < ANIMAL_MEMORY_NUM; m++) {
-                Anmmem_c* mem = &an->memories[m];
-                if (mPr_NullCheckPersonalID(&mem->memory_player_id) == FALSE && mPr_CheckCmpPersonalID(&mem->memory_player_id, gkey) == TRUE) {
-                    mPr_CopyPersonalID(&mem->memory_player_id, &priv->player_ID);
-                    if (!is_island) {
-                        mLd_CopyLandName(mem->memuni.land.name, Save_Get(land_info).name);
-                        mem->memuni.land.id = Save_Get(land_info).id;
-                        mem->saved_town_tune = Save_Get(melody);
-                    }
-                    remapped++;
-                }
-            }
-        }
-    }
-    printf("[PC] M-F promote: resident slot %d created for '%.8s' (gender %d, face %d%s, player id 0x%04X), house %d assigned (arrangement 0x%02X), loan %u, pockets/wallet/bank carried over, %d villager memories re-keyed\n",
+    /* Lifecycle hardening: everything keyed to the guest PID (villager memories, contest quests, fish records) is re-keyed and the guest record's carried-over state is
+     * migrated (pc_mp_promote_migrate; ATOMIC with the promotion: inside this call, before the durable save, covered by pc_mp_promote_rollback). */
+    remapped = pc_mp_promote_migrate(gkey, g, priv);
+    printf("[PC] M-F promote: resident slot %d created for '%.8s' (gender %d, face %d%s, player id 0x%04X), house %d assigned (arrangement 0x%02X), loan %u, pockets/wallet/bank carried over, %d PID-keyed / carried items migrated (see the [PC] migrate line)\n",
            slot, (const char*)priv->player_ID.player_name, (int)priv->gender, (int)priv->face, face_ok ? "" : " (the guest's face is worn by another resident: vanilla unique face kept)",
            (unsigned)priv->player_ID.player_id, house, (unsigned)Save_Get(house_arrangement), (unsigned)priv->inventory.loan, remapped);
 #undef PC_PROMOTE_FAIL
@@ -1769,6 +1897,7 @@ void pc_mp_promote_rollback(void) {
     Common_Set(event_flags[mEv_SAVED_EVENT], s_pc_promote_snap.ev_common_flags);
     memcpy(Save_Get(animals), s_pc_promote_snap.animals, sizeof(s_pc_promote_snap.animals));
     Save_Get(island).animal = s_pc_promote_snap.island_animal;
+    memcpy(Save_Get(fishRecord), s_pc_promote_snap.fish, sizeof(s_pc_promote_snap.fish));
     memset(&s_pc_promote_snap, 0, sizeof(s_pc_promote_snap));
     printf("[PC] M-F promote: the in-memory change was ROLLED BACK\n");
 }

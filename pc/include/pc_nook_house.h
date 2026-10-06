@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 9
+#define PC_NOOK_MSG_COUNT 11
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -18,12 +18,16 @@ enum {
     PC_NOOK_MSG_DECLINE,   /* Nook accepts a No. */
     PC_NOOK_MSG_NOFUNDS,   /* not enough Bells */
     PC_NOOK_MSG_NOLOT,     /* no free lot / house */
-    PC_NOOK_MSG_FAILED,    /* the host refused / the link failed: nothing was charged */
-    PC_NOOK_MSG_THANKS     /* APPLIED: congratulations */
+    PC_NOOK_MSG_FAILED,    /* the host refused (a HOST reason): nothing was charged */
+    PC_NOOK_MSG_THANKS,    /* APPLIED: congratulations */
+    PC_NOOK_MSG_LINKLOST,  /* the link was lost while the request was in flight (reason 0): the outcome is UNKNOWN, so the text never says "nothing was charged" */
+    PC_NOOK_MSG_NAMETAKEN  /* reason 30 NAME_TAKEN: a resident of the town already has the guest's name */
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */
 enum { PC_NOOK_SEL_BUY_HOUSE = PC_NOOK_SEL_BASE, PC_NOOK_SEL_HOUSE1, PC_NOOK_SEL_HOUSE2, PC_NOOK_SEL_HOUSE3, PC_NOOK_SEL_HOUSE4, PC_NOOK_SEL_ANY_HOUSE, PC_NOOK_SEL_COUNT_END };
+/* one choice string per house: a different PC_RESIDENCE_HOUSES needs more PC_NOOK_SEL_HOUSEn entries (and Nook's choice paging beyond 6 choices; see the roadmap) */
+_Static_assert(PC_NOOK_SEL_ANY_HOUSE - PC_NOOK_SEL_HOUSE1 == 4, "one PC_NOOK_SEL_HOUSEn per house (PC_RESIDENCE_HOUSES)");
 #define PC_NOOK_SEL_COUNT (PC_NOOK_SEL_COUNT_END - PC_NOOK_SEL_BASE)
 
 #ifdef __cplusplus
@@ -42,9 +46,12 @@ int pc_net_game_nook_intro_set(const char* value);
 int pc_net_game_house_purchase_applied(void);
 
 /* The in-process rejoin of the promoted guest (pc_main.c pc_main_play_online_poll) WAITS while the Nook congratulation row is still being read: the shop sets the hold when it
- * shows the row and clears it when the conversation ended; pc_nook_house_rejoin_hold() (polled once per frame by the rejoin) returns 1 while the hold is on, and expires by itself
- * after ~40 s so a player who walks away cannot block the rejoin for good. */
+ * shows the row and clears it when the conversation ended; pc_nook_house_rejoin_hold() (polled once per frame by the rejoin) returns 1 while the hold is on. */
+/* HEARTBEAT (replaces the fixed ~40 s crutch): set(1) = a purchase is in flight, set(2) = APPLIED, set(0) = released. While the hold is on the shop proc calls
+ * pc_nook_house_rejoin_hold_touch() EVERY frame (PENDING / END); the hold expires 500 ms (30 frames) of WALL CLOCK after the last touch (the shop proc stopped: scene change, pause, walked away) and, in
+ * any case, ~15 s (900 frames) after APPLIED. pc_nook_house_rejoin_hold() is polled once per frame by the rejoin. */
 void pc_nook_house_rejoin_hold_set(int on);
+void pc_nook_house_rejoin_hold_touch(void);
 int pc_nook_house_rejoin_hold(void);
 
 /* The id of PC message `which` (PC_NOOK_MSG_*), and the range tests used by the bounds checks of the message system. */

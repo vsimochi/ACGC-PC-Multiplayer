@@ -1,6 +1,8 @@
 /* pc_main.c - PC entry point: SDL2/GL init and boot sequence */
 #include "pc_platform.h"
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
+#include "pc_residence.h" /* PC_RESIDENCE_HOUSES */
+#include "pc_test_hooks.h" /* test-hook guard (PC_NET_TEST_HOOKS + AC_TEST_HOOKS=1) */
 #include "pc_gx_internal.h"
 #include "pc_texture_pack.h"
 #include "pc_settings.h"
@@ -620,6 +622,53 @@ int g_pc_txn_fault_mode = 0;
 int g_pc_txn_fault_nth = 1;
 int g_pc_txn_fault_arg = 1;
 
+#ifdef PC_NET_TEST_HOOKS
+int g_pc_promote_fault = 0; /* --promote-fault: 1 fail_save, 2 crash_after_members, 3 crash_after_gci, 4 no_durable (HOST only; see pc_net_game.c pcnetgame_promote_exec) */
+#endif
+
+/* Test-hook guard: see include/pc_test_hooks.h. */
+int pc_test_hooks_enabled(void) {
+#ifdef PC_NET_TEST_HOOKS
+    const char* e = getenv("AC_TEST_HOOKS");
+    return e != NULL && strcmp(e, "1") == 0;
+#else
+    return 0;
+#endif
+}
+
+const char* pc_test_hook_getenv(const char* name) {
+    const char* v = getenv(name);
+    if (v == NULL) {
+        return NULL;
+    }
+    if (!pc_test_hooks_enabled()) {
+        static int noted = 0;
+        if (!noted) {
+            noted = 1;
+            fprintf(stderr, "[TEST-HOOK] ignoring the environment variable %s: test hooks are %s\n", name,
+#ifdef PC_NET_TEST_HOOKS
+                    "off (set AC_TEST_HOOKS=1)");
+#else
+                    "not compiled into this build");
+#endif
+        }
+        return NULL;
+    }
+    return v;
+}
+
+/* 1 for the flags that inject state / bypass a rule (guarded). */
+static int pc_is_test_hook_flag(const char* a) {
+    static const char* const pre[] = { "--house-buy-test", "--nook-test", "--house-test-host-edit", "--mail-test-", "--txn-fault", "--promote-fault", "--d3-test-wallet-add", NULL };
+    int k;
+    for (k = 0; pre[k] != NULL; k++) {
+        if (strncmp(a, pre[k], strlen(pre[k])) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Parses "<mode>[:N[:K]]". Returns 1 and fills the three globals, or 0 for an unknown mode / malformed number (the caller refuses). */
 static int pc_parse_txn_fault(const char* spec) {
     static const struct { const char* name; int mode; } modes[] = {
@@ -768,7 +817,7 @@ void pc_main_refuse_sanitized_town(void) {
     const char* msg = "This save file is a sanitized town copy downloaded from a server (other residents' data is blanked). It cannot be hosted, played offline or saved as a town.\n"
                       "Join the server as a client, or restore your own town save.";
     fprintf(stderr, "[PC] REFUSED: %s\n", msg);
-    if (getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+    if (pc_test_hook_getenv("AC_TOWN_NO_MSGBOX") == NULL) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Animal Crossing - sanitized town copy", msg, g_pc_window);
     }
     fflush(NULL);
@@ -806,7 +855,7 @@ static int pc_town_failure_box(const char* msg, int offline) {
 
 /* M-I: polled every frame (pc_vi.c). A --town-fetch client whose guest was promoted (handoff stored + REJECT 6) restarts itself as
  * `--connect HOST:PORT --town-fetch --character UUID`: the new process fetches the town that now contains the resident and joins as it. g_pc_running is cleared ONLY
- * after the new process exists. A CLI client without --town-fetch (local town = card_a, which lacks the resident) only keeps the message. AC_RELAUNCH_DRYRUN=1 logs the
+ * after the new process exists. A CLI client without --town-fetch (local town = card_a, which lacks the resident) only keeps the message. AC_RELAUNCH_DRYRUN=1 (test builds, AC_TEST_HOOKS=1) logs the
  * command line and keeps running. Consumed once, so it cannot loop (a resident process sends no guest claim and never gets a handoff). */
 static int pc_main_play_online_rejoin(const char* host, int port, const char* uuid); /* the Play Online block below */
 
@@ -821,7 +870,7 @@ void pc_main_relaunch_poll(void) {
         return;
     }
     err[0] = '\0';
-    if (getenv("AC_RELAUNCH_DRYRUN") == NULL) {
+    if (pc_test_hook_getenv("AC_RELAUNCH_DRYRUN") == NULL) {
         /* Guest-first town (M3): the promoted client re-joins IN THIS PROCESS (no restart, same window / audio / PID): the session is shut down and the Play Online
          * connect runs again as the resident (re-fetch of the town that now holds the resident, role = resident, bind by PersonalID, RESIDENT claim with the handed-over
          * token). The process relaunch below is the FALLBACK when the rejoin cannot even be requested (another Play Online request is running). */
@@ -834,7 +883,7 @@ void pc_main_relaunch_poll(void) {
     if (pc_relaunch_connect(g_pc_net_host_ip, (int)g_pc_net_port, PC_RELAUNCH_CHARACTER, uuid, err, sizeof(err))) {
         printf("[PC] M-I: promoted: relaunched as the resident (new process started), quitting this one\n");
         g_pc_running = 0;
-    } else if (getenv("AC_RELAUNCH_DRYRUN") == NULL) {
+    } else if (pc_test_hook_getenv("AC_RELAUNCH_DRYRUN") == NULL) {
         printf("[PC] M-I: promoted: relaunch FAILED: %s\n", err);
         pc_net_game_client_relaunch_failed(err);
     }
@@ -887,7 +936,7 @@ static void pc_main_resolve_membership(void) {
                 s_po_stale = 1;
                 return;
             }
-            if (getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+            if (pc_test_hook_getenv("AC_TOWN_NO_MSGBOX") == NULL) {
                 SDL_MessageBoxButtonData btn;
                 SDL_MessageBoxData box;
                 int hit = -1;
@@ -1198,14 +1247,14 @@ static int pc_po_connect(char* err, size_t errcap) {
         town_rc = pc_net_game_town_prefetch(g_pc_net_host_ip, g_pc_net_port, 30000u, pc_po_progress, g_pc_server_name, town_err, sizeof(town_err));
         if (town_rc == PC_TOWN_PREFETCH_ERROR) {
             fprintf(stderr, "[PC] play-online: town fetch: %s\n", town_err);
-            if (getenv("AC_TOWN_NO_MSGBOX") == NULL && pc_town_failure_box(town_err, 0) == 0) {
+            if (pc_test_hook_getenv("AC_TOWN_NO_MSGBOX") == NULL && pc_town_failure_box(town_err, 0) == 0) {
                 continue;
             }
             snprintf(err, errcap, "Could not get the host's town: %.120s", town_err);
             if (strchr(err, '\n') != NULL) *strchr(err, '\n') = '\0';
             goto rollback;
         }
-        if ((town_rc == PC_TOWN_PREFETCH_CACHE || town_rc == PC_TOWN_PREFETCH_LEGACY) && getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+        if ((town_rc == PC_TOWN_PREFETCH_CACHE || town_rc == PC_TOWN_PREFETCH_LEGACY) && pc_test_hook_getenv("AC_TOWN_NO_MSGBOX") == NULL) {
             char msg[800];
             int pick;
             snprintf(msg, sizeof(msg), "Could not get the host's current town (%s).\n\nRetry, or continue with the %s you already have?\n\"Use saved copy\" is not offline play: the game still tries to connect in the background.", town_err,
@@ -1330,7 +1379,7 @@ void pc_main_play_online_poll(void) {
                 pc_net_game_shutdown();
             }
             if (pc_nook_house_rejoin_hold()) {
-                return; /* guest Nook dialogue (M4): the congratulation row of the purchase is still being read (bounded, see pc_nook_house.h) */
+                return; /* guest Nook dialogue (M4): the congratulation row is still being read (heartbeat-held: expires 30 frames after the shop proc stopped touching it, hard cap ~15 s after APPLIED; see pc_nook_house.h) */
             }
             if (!pc_play_online_scene_ready()) {
                 if (++s_po.wait > 600) {
@@ -1408,6 +1457,15 @@ int main(int argc, char* argv[]) {
                 i += log_consumed;
                 continue;
             }
+        }
+        if (pc_is_test_hook_flag(argv[i]) && !pc_test_hooks_enabled()) {
+            fprintf(stderr, "[TEST-HOOK] REFUSED: %s is a test-only hook and %s\n", argv[i],
+#ifdef PC_NET_TEST_HOOKS
+                    "needs the environment variable AC_TEST_HOOKS=1 (exit 2)");
+#else
+                    "is not compiled into this build (configure -DPC_TEST_HOOKS=ON for a test build; exit 2)");
+#endif
+            return 2;
         }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: AnimalCrossing [options]\n");
@@ -1584,22 +1642,10 @@ int main(int argc, char* argv[]) {
                    "                      through the town-service transaction path. See pc_platform.h.\n");
             printf("  --shop-test-sell    Client-only TEST hook (default off; loud logs): drive ONE real shop sale\n"
                    "                      through the town-service transaction path. See pc_platform.h.\n");
-            printf("  --house-buy-test H|auto  Client-only TEST hook (default off; loud logs): as a GUEST buy house H (0..3) or `auto`\n"
-                   "                      through the HOUSE_PURCHASE transaction, then re-join as the resident. See pc_platform.h.\n");
-            printf("  --nook-test SPEC    Client-only TEST hook (default off; loud logs) for the guest Nook dialogue: SPEC = wallet=N (set the LOCAL\n"
-                   "                      wallet once) and / or warp (go into Nook's shop). See pc_net_game.c pcnetgame_run_nook_test_hook().\n");
-            printf("  --mail-test-send=HOUSE[,gift]  Client-only TEST hook (default off; loud logs): drive ONE real letter to\n"
-                   "                      the resident of local house HOUSE through the MAIL_SEND transaction path. See pc_platform.h.\n");
-            printf("  --mail-test-force-delivery  HOST-only TEST hook (default off; loud logs): run the vanilla post office\n"
-                   "                      delivery every 2 s and log the mailboxes. See pc_platform.h.\n");
-            printf("  --mail-test-poke-museum=N  HOST-only TEST hook (default off; loud logs): once resident N is synced, change its\n"
-                   "                      museum_record like the host's day-change mail does. See pc_platform.h.\n");
-            printf("  --mail-test-take[=N]  Client-only TEST hook (default off; loud logs): take up to N (default 10) letters out of the\n"
-                   "                      host-fed mailbox through the MAIL_TAKE transaction path. See pc_platform.h.\n");
-            printf("  --mail-test-seed-mailbox=RES,COUNT,DELAY_MS[,GIFTHEX]  HOST-only TEST hook (default off; loud logs): write COUNT\n"
-                   "                      letters into resident RES's house mailbox after DELAY_MS (a simulated postman). See pc_platform.h.\n");
-            printf("  --mail-test-seed-reply=RES[,RES...]  HOST-only TEST hook (default off; loud logs): make the first villager owe each\n"
-                   "                      listed resident a reply dated a year ago. See pc_platform.h.\n");
+            printf("  Test builds only (-DPC_TEST_HOOKS=ON AND the env AC_TEST_HOOKS=1; any of these flags is refused with exit 2 otherwise; see pc_platform.h):\n"
+                   "    --house-buy-test H|auto  --nook-test SPEC  --mail-test-send=HOUSE[,gift]  --mail-test-force-delivery  --mail-test-poke-museum=N  --mail-test-take[=N]\n"
+                   "    --mail-test-seed-mailbox=RES,COUNT,DELAY_MS[,GIFTHEX]  --mail-test-seed-reply=RES[,RES...]  --house-test-host-edit H,floor,cell,item  --d3-test-wallet-add N\n"
+                   "    --d3-test-wallet-add-late N  --txn-fault=MODE[:N[:K]]  --promote-fault fail_save|crash_after_members|crash_after_gci|no_durable;  env AC_RELAUNCH_DRYRUN, AC_TOWN_NO_MSGBOX\n");
             printf("  --help, -h          Show this help message\n");
             return 0;
         } else if (strcmp(argv[i], "--framelimit") == 0) {
@@ -1672,6 +1718,7 @@ int main(int argc, char* argv[]) {
             g_pc_diag_bug_despawn_label_race = 1;
         } else if (strcmp(argv[i], "--diag-role-link-state") == 0) {
             g_pc_diag_role_link_state = 1;
+#ifdef PC_NET_TEST_HOOKS
         } else if (strcmp(argv[i], "--d3-test-wallet-add") == 0 && i + 1 < argc) {
             g_pc_d3_test_wallet_add = atoi(argv[i + 1]);
             printf("[NET][REC][TEST-ONLY] --d3-test-wallet-add %d armed (a TEST hook: not for normal play)\n",
@@ -1682,6 +1729,7 @@ int main(int argc, char* argv[]) {
             printf("[NET][REC][TEST-ONLY] --d3-test-wallet-add-late %d armed (a TEST hook: not for normal play)\n",
                    g_pc_d3_test_wallet_add_late);
             i++;
+#endif
         } else if (strcmp(argv[i], "--txn-test-pickup-drop") == 0) {
             g_pc_txn_test_pickup_drop = 1;
             printf("[NET][TXN][TEST-ONLY] --txn-test-pickup-drop armed (a TEST hook: not for normal play)\n");
@@ -1706,6 +1754,7 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--shop-test-sell") == 0) {
             g_pc_shop_test_sell = 1;
             printf("[NET][SHOP][TEST-ONLY] --shop-test-sell armed (a TEST hook: not for normal play)\n");
+#ifdef PC_NET_TEST_HOOKS
         } else if (strcmp(argv[i], "--house-buy-test") == 0 && i + 1 < argc) {
             g_pc_house_buy_test = argv[++i];
             printf("[NET][HOUSE][TEST-ONLY] --house-buy-test %s armed (a TEST hook: not for normal play)\n", g_pc_house_buy_test);
@@ -1739,6 +1788,15 @@ int main(int argc, char* argv[]) {
                                 "fail_world | expire | drop_result | kill_peer_after_commit)\n", argv[i] + 12);
                 return 2;
             }
+        } else if (strcmp(argv[i], "--promote-fault") == 0 && i + 1 < argc) {
+            const char* m = argv[++i];
+            g_pc_promote_fault = strcmp(m, "fail_save") == 0 ? 1 : strcmp(m, "crash_after_members") == 0 ? 2 : strcmp(m, "crash_after_gci") == 0 ? 3 : strcmp(m, "no_durable") == 0 ? 4 : 0;
+            if (g_pc_promote_fault == 0) {
+                fprintf(stderr, "[NET][PROMOTE][TEST-ONLY] REFUSED: bad --promote-fault '%s' (fail_save | crash_after_members | crash_after_gci | no_durable)\n", m);
+                return 2;
+            }
+            printf("[NET][PROMOTE][TEST-ONLY] --promote-fault %s armed (a TEST hook: not for normal play)\n", m);
+#endif
         } else if (strcmp(argv[i], "--bootstrap-resident") == 0 && i + 1 < argc) {
             g_pc_bootstrap_resident = atoi(argv[i + 1]);
             i++;
@@ -1899,10 +1957,12 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--house-test-fidelity") == 0) {
             g_pc_house_test_fidelity = 1;
             printf("[NET][HOUSE][TEST-ONLY] --house-test-fidelity armed (logs MATCH / MISMATCH of the live room export at every room teardown; not for normal play)\n");
+#ifdef PC_NET_TEST_HOOKS
         } else if (strcmp(argv[i], "--house-test-host-edit") == 0 && i + 1 < argc) {
             g_pc_house_test_host_edit = argv[i + 1];
             printf("[NET][HOUSE][TEST-ONLY] --house-test-host-edit %s armed (a TEST hook: not for normal play)\n", g_pc_house_test_host_edit);
             i++;
+#endif
         } else if (strcmp(argv[i], "--profile") == 0) {
             g_pc_profile_enabled = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -1990,7 +2050,7 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    if (g_pc_house_buy_test != NULL && (g_pc_net_role != 2 || !(strcmp(g_pc_house_buy_test, "auto") == 0 || (g_pc_house_buy_test[0] >= '0' && g_pc_house_buy_test[0] <= '3' && g_pc_house_buy_test[1] == '\0')))) {
+    if (g_pc_house_buy_test != NULL && (g_pc_net_role != 2 || !(strcmp(g_pc_house_buy_test, "auto") == 0 || (g_pc_house_buy_test[0] >= '0' && g_pc_house_buy_test[0] < (char)('0' + PC_RESIDENCE_HOUSES) && g_pc_house_buy_test[1] == '\0')))) {
         fprintf(stderr, "[NET][HOUSE][TEST-ONLY] REFUSED: --house-buy-test is a CLIENT-only test hook (use it together with --connect) and takes 0, 1, 2, 3 or auto\n");
         return 2;
     }
@@ -2426,7 +2486,7 @@ int main(int argc, char* argv[]) {
             town_rc = pc_net_game_town_prefetch(g_pc_net_host_ip, g_pc_net_port, 30000u, pc_town_title_progress, g_pc_server_name, town_err, sizeof(town_err));
             if (town_rc == PC_TOWN_PREFETCH_ERROR) {
                 fprintf(stderr, "[PC] --town-fetch: %s\n", town_err);
-                if (getenv("AC_TOWN_NO_MSGBOX") == NULL) { /* test hook: the box cannot be dismissed headlessly */
+                if (pc_test_hook_getenv("AC_TOWN_NO_MSGBOX") == NULL) { /* test hook: the box cannot be dismissed headlessly */
                     if (g_pc_online_ui) {
                         /* M-C: no usable town at all: Retry or Quit */
                         if (pc_town_failure_box(town_err, 0) == 0) {
@@ -2439,7 +2499,7 @@ int main(int argc, char* argv[]) {
                 pc_platform_shutdown();
                 return 3;
             }
-            if ((town_rc == PC_TOWN_PREFETCH_CACHE || town_rc == PC_TOWN_PREFETCH_LEGACY) && g_pc_online_ui && getenv("AC_TOWN_NO_MSGBOX") == NULL) {
+            if ((town_rc == PC_TOWN_PREFETCH_CACHE || town_rc == PC_TOWN_PREFETCH_LEGACY) && g_pc_online_ui && pc_test_hook_getenv("AC_TOWN_NO_MSGBOX") == NULL) {
                 /* M-C: the fetch failed but an older copy of the town exists: ask instead of silently playing it */
                 char msg[800];
                 int pick;

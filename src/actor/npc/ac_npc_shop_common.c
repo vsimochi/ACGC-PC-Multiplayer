@@ -1,6 +1,7 @@
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Batch G2/G3: pc_net_game_role() */
 #include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated messages / choice strings */
+#include "pc_residence.h" /* PC_RESIDENCE_HOUSES (lifecycle hardening: the one place that knows the house count) */
 #include <string.h>
 /* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
  * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
@@ -1779,7 +1780,7 @@ enum {
 
 static int aNSC_pc_hs_state;
 static int aNSC_pc_hs_house = -1;
-static int aNSC_pc_hs_free[4];
+static int aNSC_pc_hs_free[PC_RESIDENCE_HOUSES];
 static int aNSC_pc_hs_nfree;
 static int aNSC_pc_hs_other_active; /* 1 while the guest "Other things" message (5 choices) is the one on screen */
 static int aNSC_pc_hs_mem_declined; /* RAM fallback of `nook_intro = declined` when there is no store character / membership file to write it to */
@@ -1836,12 +1837,17 @@ static void aNSC_pc_hs_end(NPC_SHOP_COMMON_ACTOR* shop_common, int which, int de
     aNSC_pc_hs_state = aNSC_PC_HS_END;
 }
 
-static void aNSC_pc_hs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason) {
+/* `sent` = 1 when the request really went to the host (a reason 0 is then a LINK LOSS: the outcome is unknown, so the row never claims "nothing was charged"). */
+static void aNSC_pc_hs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, int sent) {
     int which = PC_NOOK_MSG_FAILED;
     if (reason == PC_NETGAME_HOUSE_REJECT_NO_FUNDS) {
         which = PC_NOOK_MSG_NOFUNDS;
-    } else if (reason == PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE || reason == PC_NETGAME_HOUSE_REJECT_INVALID_HOUSE || reason == PC_NETGAME_HOUSE_REJECT_NAME_TAKEN) {
+    } else if (reason == PC_NETGAME_HOUSE_REJECT_NAME_TAKEN) {
+        which = PC_NOOK_MSG_NAMETAKEN;
+    } else if (reason == PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE || reason == PC_NETGAME_HOUSE_REJECT_INVALID_HOUSE) {
         which = PC_NOOK_MSG_NOLOT;
+    } else if (reason == 0 && sent) {
+        which = PC_NOOK_MSG_LINKLOST;
     }
     printf("[NET][HOUSE] nook dialogue: purchase not made (reason %d) -> row %d\n", reason, which);
     pc_nook_house_rejoin_hold_set(0);
@@ -1853,12 +1859,12 @@ static void aNSC_pc_hs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     int r = pc_net_game_house_purchase_precheck(-1);
     printf("[NET][HOUSE] nook dialogue: house offer accepted, precheck=%d\n", r);
     if (r != 0) {
-        aNSC_pc_hs_fail_row(shop_common, r);
+        aNSC_pc_hs_fail_row(shop_common, r, 0);
         return;
     }
-    aNSC_pc_hs_nfree = pc_net_game_house_free_list(aNSC_pc_hs_free, 4);
+    aNSC_pc_hs_nfree = pc_net_game_house_free_list(aNSC_pc_hs_free, PC_RESIDENCE_HOUSES);
     if (aNSC_pc_hs_nfree < 1) {
-        aNSC_pc_hs_fail_row(shop_common, PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE);
+        aNSC_pc_hs_fail_row(shop_common, PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE, 0);
         return;
     }
     pc_nook_house_set_pick(aNSC_pc_hs_free, aNSC_pc_hs_nfree);
@@ -1877,6 +1883,9 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
         CLIP(npc_clip)->animation_init_proc(actorx, 0x5, 0x1);
     }
 
+    if (aNSC_pc_hs_state == aNSC_PC_HS_BEGIN || aNSC_pc_hs_state == aNSC_PC_HS_PENDING || aNSC_pc_hs_state == aNSC_PC_HS_END) {
+        pc_nook_house_rejoin_hold_touch(); /* heartbeat: the rejoin hold lives only while this proc runs (PENDING / END) */
+    }
     switch (aNSC_pc_hs_state) {
         case aNSC_PC_HS_ASK_INTRO:
         case aNSC_PC_HS_ASK_PICK:
@@ -1903,7 +1912,7 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                     printf("[NET][HOUSE] nook dialogue: the guest backed out at the house choice\n");
                     aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_DECLINE, 1);
                 } else if ((r = pc_net_game_house_purchase_precheck(house)) != 0) {
-                    aNSC_pc_hs_fail_row(shop_common, r);
+                    aNSC_pc_hs_fail_row(shop_common, r, 0);
                 } else {
                     aNSC_pc_hs_house = house;
                     printf("[NET][HOUSE] nook dialogue: house %d chosen (-1 = any)\n", house);
@@ -1925,7 +1934,7 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 return; /* another transaction is unresolved: next frame */
             }
             if (r == 0) {
-                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason());
+                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 0); /* refused locally: nothing was sent */
             } else {
                 aNSC_pc_hs_state = aNSC_PC_HS_PENDING;
                 pc_nook_house_rejoin_hold_set(1); /* set BEFORE the answer can arrive: the rejoin of an applied purchase must not start before the congratulation row was read */
@@ -1940,14 +1949,15 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 /* the host closes the session within a frame or two of the APPLIED result: a link-loss REJECTED after an applied purchase is still the APPLIED purchase */
                 printf("[NET][HOUSE] nook dialogue: purchase APPLIED -> congratulation row (the session ends by itself, the rejoin waits for the row to be read)\n");
                 aNSC_pc_hs_cache = -1;
-                pc_nook_house_rejoin_hold_set(1);
+                pc_nook_house_rejoin_hold_set(2); /* APPLIED: the rejoin waits for the row, kept alive by the heartbeat (hard cap ~15 s) */
                 aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_THANKS, 0);
             } else {
-                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason());
+                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
             }
             break;
         case aNSC_PC_HS_END:
             if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == FALSE && mDemo_Check(mDemo_TYPE_TALK, actorx) == FALSE) {
+                printf("[NET][HOUSE] nook dialogue: the conversation ended -> the rejoin hold is released\n");
                 pc_nook_house_rejoin_hold_set(0); /* the congratulation row (if any) was read: the in-process rejoin may start */
                 shop_common->sell_item = EMPTY_NO;
                 shop_common->npc_class.talk_info.melody_inst = 0;

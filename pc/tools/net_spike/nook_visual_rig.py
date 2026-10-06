@@ -60,7 +60,7 @@ import net_spike_lib as L  # noqa: E402
 CLIENT_DIR = os.path.join(T.BUILD64, CLIENT_NAME)
 EXE = os.path.join(CLIENT_DIR, "AnimalCrossing.exe")
 INI = "name = Buyer\ngender = 0\nface = 3\nhome_town = GuestVil\nplayer_id = 0x1234\nland_id = 0x4321\n"
-ENV = {"AC_TOWN_NO_MSGBOX": "1", "AC_DISPLAY_NAME": "samsung", "AC_MASTER_VOLUME": "1"}
+ENV = {"AC_TEST_HOOKS": "1", "AC_TOWN_NO_MSGBOX": "1", "AC_DISPLAY_NAME": "samsung", "AC_MASTER_VOLUME": "1"}
 STOP = T.log_path("nk_stop")
 STATE = T.log_path("nk_state.json")
 REPORT = T.log_path("nk_report.txt")

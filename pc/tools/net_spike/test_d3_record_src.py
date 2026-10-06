@@ -463,7 +463,8 @@ def main():
           and strip_comments(mcard).count("pc_save_write_authoritative_impl(") == 3  # declaration + the wrapper's call + the definition
           and strip_comments(vi).count("pc_save_write_authoritative();") >= 3  # early (dirty client disconnect) / periodic / console save
           and strip_comments(pcmain_src).count("pc_save_write_authoritative()") >= 1  # shutdown save
-          and "pc_save_write_authoritative()" in promote_body  # guest -> resident promotion: the GCI is durable before the guest entry is removed
+          and "pc_save_write_authoritative_durable()" in promote_body  # guest -> resident promotion (lifecycle hardening B3a): the DURABLE variant (FALSE unless the GCI was really written) is durable before the guest entry is removed
+          and strip_comments(mcard).count("return pc_save_write_authoritative();") == 1  # ... and that variant is the wrapper plus the can-be-durable / fault gates (pc_m_card.c)
           and not re.search(r"pc_save_write_authoritative_impl", strip_comments(vi) + strip_comments(pcmain_src) + promote_body))
     store_write = func_body(c_raw, "pcnetgame_rec_store_write")
     store_build = func_body(c_raw, "pcnetgame_rec_store_build")

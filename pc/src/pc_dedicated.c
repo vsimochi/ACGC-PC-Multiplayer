@@ -2,6 +2,7 @@
  * See pc_dedicated.h for the overview. Nothing in here runs unless g_pc_dedicated == 1 (the callers check it; most functions also check it). */
 #include "pc_platform.h"
 #include "pc_dedicated.h"
+#include "pc_residence.h" /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES */
 #include "pc_host_observer.h"
 #include "pc_net_game.h"
 #include "pc_log.h"
@@ -653,7 +654,7 @@ static void pc_ded_cmd_promote(char* args) {
     gsel[0] = ssel[0] = hsel[0] = tok4[0] = extra[0] = '\0';
     n = sscanf(args != NULL ? args : "", "%63s %15s %15s %15s %7s", gsel, ssel, hsel, tok4, extra);
     if (n < 3) {
-        pc_ded_printf("[DEDICATED] promote: usage: promote <guest slot|name> <resident slot 0-3|auto> <house 0-3|auto> confirm (see `guests`, `residents`)\n");
+        pc_ded_printf("[DEDICATED] promote: usage: promote <guest slot|name> <resident slot 0-%d|auto> <house 0-%d|auto> confirm (see `guests`, `residents`)\n", PC_RESIDENCE_SLOTS - 1, PC_RESIDENCE_HOUSES - 1);
         pc_ded_flush();
         return;
     }

@@ -359,7 +359,7 @@ def main():
           "int g_pc_mail_test_force_delivery = 0;" in main_c and "int g_pc_mail_test_poke_museum = -1;" in main_c and 'strncmp(argv[i], "--mail-test-poke-museum=", 24) == 0' in main_c
           and "s_role != PC_NETGAME_ROLE_HOST" in func_body(mh_raw, "pcnetgame_mail_test_force_delivery") and "mPO_delivery_one_address(h)" in mh
           and "s_role != PC_NETGAME_ROLE_HOST" in func_body(mh_raw, "pcnetgame_mail_test_poke_museum") and "getenv" not in mh and "getenv" not in mc
-          and "--mail-test-force-delivery" in plat_h and "--mail-test-poke-museum=<resident idx>" in plat_h and "--mail-test-force-delivery  HOST-only" in main_c)
+          and "--mail-test-force-delivery" in plat_h and "--mail-test-poke-museum=<resident idx>" in plat_h and "--mail-test-force-delivery  --mail-test-poke-museum=N" in main_c)  # lifecycle hardening: the hook flags are listed on the `Test builds only` --help line
     check("T the hooks are called once per poll from the one place the other test hooks are (a complete no-op unless armed)",
           "pcnetgame_run_mail_test_hook(); /* mail milestone" in c_raw and "pcnetgame_mail_test_force_delivery(); /* mail milestone" in c_raw and "pcnetgame_mail_test_poke_museum(); /* mail milestone R" in c_raw)
 

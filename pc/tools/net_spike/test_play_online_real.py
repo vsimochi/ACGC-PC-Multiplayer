@@ -128,7 +128,7 @@ def run(port, results):
         stale = "role = resident\ntown_pid = %s\nlast_server = mcsrv\n" % fake
         with open(mpath, "w", newline="") as f:
             f.write(stale)
-        client = start_client(port, uuid, "stale", env={"AC_TOWN_NO_MSGBOX": "1"})
+        client = start_client(port, uuid, "stale", env={"AC_TEST_HOOKS": "1", "AC_TOWN_NO_MSGBOX": "1"})
         try:
             rc = client.proc.wait(timeout=120)
         except subprocess.TimeoutExpired:

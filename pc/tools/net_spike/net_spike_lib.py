@@ -4583,6 +4583,7 @@ class HostProcess:
             raise FileNotFoundError(self.exe)
         self._log_fp = open(self.log_path, "wb")
         env = dict(os.environ)
+        env["AC_TEST_HOOKS"] = "1"  # test-hook guard (pc_test_hooks.h): the hook flags need it in a PC_TEST_HOOKS build; a test may override it through env= (e.g. "0")
         if self.env:
             env.update(self.env)
         popen_kw = {}
@@ -4972,6 +4973,7 @@ class ClientProcess(HostProcess):
             raise FileNotFoundError(self.exe)
         self._log_fp = open(self.log_path, "wb")
         env = dict(os.environ)
+        env["AC_TEST_HOOKS"] = "1"  # test-hook guard (pc_test_hooks.h): the hook flags need it in a PC_TEST_HOOKS build; a test may override it through env= (e.g. "0")
         if self.env:
             env.update(self.env)
         self.proc = subprocess.Popen(

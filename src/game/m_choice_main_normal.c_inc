@@ -145,4 +145,7 @@ static void mChoice_MainSetup_Normal(mChoice_c* choice, GAME* game) {
     choice->requested_main_index = -1;
     choice->main_index = mChoice_MAIN_NORMAL;
     choice->font_visible_flag = TRUE;
+#ifdef PC_NET_TEST_HOOKS
+    OSReport("[CHOICE][TEST-ONLY] choice window is NORMAL (open, waiting for the player)\n");
+#endif
 }

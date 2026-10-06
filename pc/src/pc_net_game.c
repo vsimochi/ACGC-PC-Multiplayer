@@ -143,6 +143,8 @@
  * =============================================================================================
  */
 #include "pc_net_game.h"
+#include "pc_residence.h"   /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES: the one place that knows "4 resident slots, 4 houses" */
+#include "pc_test_hooks.h"  /* test-hook guard (PC_NET_TEST_HOOKS + env AC_TEST_HOOKS=1) */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the dialogue-side helpers defined near the house purchase seam */
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
 #include "pc_adopt_clock.h" /* client record-adoption watchdog clock (scene lifecycle time does not count towards the 10 s) */
@@ -12132,6 +12134,11 @@ static int pcnetgame_is_pocket_legal_item(mActor_name_t item) {
     }
 }
 
+/* pc_m_card.c (pc_mp_promote_migrate): the same predicate for the carried equipment / letter presents. */
+int pc_net_game_pocket_legal_item(unsigned item) {
+    return pcnetgame_is_pocket_legal_item((mActor_name_t)item);
+}
+
 /* Loan cap: the largest value vanilla ever assigns to inventory.loan (mPlayer_DEBT0..4, m_player.h; the shop's
  * aNSC_LOAN_* values equal DEBT1/2/3/4); repayment only lowers it. */
 #define PC_NETGAME_REC_LOAN_MAX ((u32)mPlayer_DEBT4)
@@ -12218,6 +12225,7 @@ static void pcnetgame_guest_store_load(void);   /* guests (G1): defined with the
 static int  pcnetgame_guest_store_write(const char* why);
 static void pcnetgame_members_store_load(void);  /* M-E: defined with the RESIDENT CREDENTIALS HOST block below */
 static int  pcnetgame_resident_policy(void);
+static void pcnetgame_promoted_guest_sweep(void); /* lifecycle hardening: defined with the RESIDENT CREDENTIALS HOST block */
 static int  pcnetgame_host_promotion_handoff(PCNetPeerId peer, const PersonalID_c* key, const PCNetGameIdentityExtMsg* ext); /* M-F: defined after the RESIDENT CREDENTIALS HOST block */
 static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer); /* M3: defined with the GUESTS HOST block */
 
@@ -12547,6 +12555,7 @@ static void pcnetgame_rec_store_resolve(void) {
          * GCI is untouched by this write (it is the file as loaded, already on disk). */
         (void)pcnetgame_rec_store_write("UNTRUSTED decision persisted immediately", NULL);
     }
+    pcnetgame_promoted_guest_sweep(); /* lifecycle hardening (B4b/4c): the stale guests.dat entry of a promoted guest whose resident is durable */
 }
 
 /* Called (main thread) by pc_m_card.c right after a successful Card-A GCI save (`gci_path` = the file just written). Never
@@ -13603,6 +13612,7 @@ static int pcnetgame_house_host_refresh(int h, int force) {
 
 /* TEST-ONLY --house-test-host-edit H,floor,cell,item: once the house has a canonical copy the host writes `item` into layer 0 cell `cell` of floor `floor` of house H
  * of its OWN save (a stand-in for a host-originated change such as turnip spoilage); the next poll sees the digest change and pushes it. */
+#ifdef PC_NET_TEST_HOOKS
 static void pcnetgame_house_test_host_edit(void) {
     long v[4];
     int n = 0;
@@ -13645,6 +13655,9 @@ static void pcnetgame_house_test_host_edit(void) {
     Save_Get(homes[v[0]]).floors[v[1]].layer_main.items[v[2] / UT_X_NUM][v[2] % UT_X_NUM] = (mActor_name_t)v[3];
     printf("[NET][HOUSE][TEST-ONLY] --house-test-host-edit: house %ld floor %ld layer 0 cell %ld = 0x%04lX written into the host's own save\n", v[0], v[1], v[2], (unsigned long)v[3] & 0xFFFFu);
 }
+#else
+static void pcnetgame_house_test_host_edit(void) {}
+#endif
 
 static int pcnetgame_house_send_ack(PCNetPeerId peer, uint8_t status, uint16_t detail, uint32_t xfer, uint32_t seq, uint32_t epoch, uint32_t rev) {
     PCNetGameHouseAckMsg a;
@@ -15262,6 +15275,99 @@ static int pcnetgame_rec_has_promote_entry(int idx) {
     return 0;
 }
 
+/* Lifecycle hardening (B4b/4c): removes the guests.dat entry of the town whose key == `aux` (the promoted guest's home PersonalID, BE form). The save hook writes guests.dat
+ * with the guest still present, so a crash between the GCI and promote step 5 (or a failed step-5 write) leaves a STALE guest entry: once the handoff is gone an authenticated
+ * returning guest would be admitted with the old pockets / bank / designs (duplicated) and would hold one of the never-evicted guest slots. guests.dat is backed up first (like
+ * guest-remove); never while guests.dat is UNTRUSTED; never while a peer is bound to the entry. Returns 1 = no such entry any more, 0 = it could not be removed (entry kept). */
+static int pcnetgame_guest_drop_promoted(const uint8_t aux[PC_MP_MEMBERS_PID_SIZE], const char* why) {
+    uint8_t kp[PC_MP_MEMBERS_PID_SIZE];
+    char bak[340];
+    int g, found = -1;
+    if (!s_guest_store_loaded || s_guest_untrusted) {
+        return 0;
+    }
+    for (g = 0; g < PC_NETGAME_GUEST_MAX && found < 0; g++) {
+        if (!s_guest[g].used || !pcnetgame_town_equal(&s_guest[g].town, &s_host_town)) {
+            continue;
+        }
+        pcnetgame_resident_pid_be(&s_guest[g].key, kp);
+        if (memcmp(kp, aux, PC_MP_MEMBERS_PID_SIZE) == 0) {
+            found = g;
+        }
+    }
+    if (found < 0) {
+        return 1;
+    }
+    g = found;
+    if (pcnetgame_host_peer_bound_to_guest(g, (PCNetPeerId)-1) >= 0) {
+        return 0;
+    }
+    bak[0] = '\0';
+    if (!pc_mp_guests_backup_file(PC_MP_GUESTS_PATH, bak, sizeof(bak))) {
+        printf("[NET][PROMOTE] host: the stale guest entry %d of a promoted guest could not be removed: the backup of %s failed (entry kept, retried later)\n", g, PC_MP_GUESTS_PATH);
+        return 0;
+    }
+    {
+        PCNetGameGuest old_g = s_guest[g];
+        Private_c old_rec = s_guest_rec[g];
+        PCNetGameRecSlot old_rs = s_rec_slot[PLAYER_NUM + g];
+        memset(&s_guest[g], 0, sizeof(s_guest[g]));
+        memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
+        memset(&s_rec_slot[PLAYER_NUM + g], 0, sizeof(s_rec_slot[0]));
+        memset(s_rec_backup[PLAYER_NUM + g], 0, PC_NETGAME_REC_SIZE);
+        pcnetgame_txn_journal_clear(PLAYER_NUM + g);
+        if (!pcnetgame_guest_store_write(why)) {
+            s_guest[g] = old_g;
+            s_guest_rec[g] = old_rec;
+            s_rec_slot[PLAYER_NUM + g] = old_rs;
+            printf("[NET][PROMOTE] host: the stale guest entry %d of a promoted guest could not be removed (guests.dat write failed; backup %s): kept\n", g, bak);
+            return 0;
+        }
+    }
+    printf("[NET][PROMOTE] host: the stale guests.dat entry %d of a PROMOTED guest was removed (%s; backup %s)\n", g, why, bak);
+    return 1;
+}
+
+/* The load-time sweep (called once per process from pcnetgame_rec_store_resolve, after guests.dat and members.dat were loaded): every PROMOTION_HANDOFF of this town whose resident
+ * really exists in the loaded town save (and whose RESIDENT_TOKEN entry exists) removes the guest entry it names. Never when guests.dat or members.dat is UNTRUSTED / not loaded
+ * (resident_tokens=off never loads members.dat: the sweep is then skipped and a stale entry needs `guest-remove`; see the roadmap). */
+static void pcnetgame_promoted_guest_sweep(void) {
+    static int done = 0;
+    int i, r, removed = 0;
+    if (done || s_role != PC_NETGAME_ROLE_HOST || !s_host_town_valid) {
+        return;
+    }
+    if (!s_guest_store_loaded || s_guest_untrusted || !s_members_loaded || s_members_untrusted) {
+        return;
+    }
+    done = 1;
+    for (i = 0; i < PC_MP_MEMBERS_SLOTS; i++) {
+        const PCMpMemberEntry* e = &s_members_file.e[i];
+        uint8_t rp[PC_MP_MEMBERS_PID_SIZE];
+        int live = 0;
+        if (!e->present || e->kind != PC_MP_MEMBER_KIND_PROMOTION_HANDOFF || e->land_id != s_host_town.land_id || memcmp(e->land_name, s_host_town.land_name, 8) != 0 ||
+            e->terrain_hash != s_host_town.terrain_hash) {
+            continue;
+        }
+        for (r = 0; r < PLAYER_NUM && !live; r++) {
+            if (mPr_NullCheckPersonalID(&Save_Get(private_data)[r].player_ID) == FALSE && Save_Get(private_data)[r].exists == TRUE) {
+                pcnetgame_resident_pid_be(&Save_Get(private_data)[r].player_ID, rp);
+                live = memcmp(rp, e->pid, PC_MP_MEMBERS_PID_SIZE) == 0;
+            }
+        }
+        if (live && pc_mp_members_find(&s_members_file, PC_MP_MEMBER_KIND_RESIDENT_TOKEN, s_host_town.land_name, s_host_town.land_id, s_host_town.terrain_hash, e->pid) >= 0) {
+            uint8_t aux[PC_MP_MEMBERS_PID_SIZE];
+            memcpy(aux, e->aux_pid, sizeof(aux));
+            if (pcnetgame_guest_drop_promoted(aux, "sweep: the guest was promoted (its resident is in the town save)")) {
+                removed++;
+            }
+        }
+    }
+    if (removed > 0) {
+        printf("[NET][PROMOTE] host: sweep done (%d stale guest entr%s of promoted guests removed)\n", removed, removed == 1 ? "y" : "ies");
+    }
+}
+
 /* KNOWN: the client presented the matching token = it demonstrably stored it: CONFIRMED (durable, never fatal). */
 static void pcnetgame_resident_confirm(int idx) {
     static PCMpMemberFile nf;
@@ -15279,6 +15385,31 @@ static void pcnetgame_resident_confirm(int idx) {
     }
     if (s_members_file.e[ci].confirmed && handoffs == 0) {
         return;
+    }
+    if (handoffs > 0) { /* B4b/4c: the stale guest entry goes FIRST; when that fails the handoff is KEPT (it still redirects the guest's old token to the resident) */
+        pcnetgame_guest_store_load();
+        for (i = 0; i < PC_MP_MEMBERS_SLOTS && handoffs > 0; i++) {
+            const PCMpMemberEntry* h = &s_members_file.e[i];
+            if (h->present && h->kind == PC_MP_MEMBER_KIND_PROMOTION_HANDOFF && memcmp(h->pid, s_members_file.e[ci].pid, PC_MP_MEMBERS_PID_SIZE) == 0 &&
+                h->land_id == s_host_town.land_id && memcmp(h->land_name, s_host_town.land_name, 8) == 0 && h->terrain_hash == s_host_town.terrain_hash) {
+                uint8_t aux[PC_MP_MEMBERS_PID_SIZE];
+                memcpy(aux, h->aux_pid, sizeof(aux));
+                if (!pcnetgame_guest_drop_promoted(aux, "resident confirmed: the promoted guest's stale entry")) {
+                    printf("[NET][PROMOTE] host: the promotion handoff of resident %d is KEPT (the stale guest entry could not be removed yet)\n", idx);
+                    handoffs = -1;
+                }
+            }
+        }
+        if (handoffs < 0) {
+            handoffs = 0;
+            if (s_members_file.e[ci].confirmed) {
+                return;
+            }
+            nf = s_members_file;
+            nf.e[ci].confirmed = 1;
+            (void)pcnetgame_members_commit(&nf, "resident credential confirmed (promotion handoff kept)");
+            return;
+        }
     }
     nf = s_members_file;
     nf.e[ci].confirmed = 1;
@@ -15519,6 +15650,7 @@ static const char* pcnetgame_txn_fault_name(int mode) {
     }
 }
 
+#ifdef PC_NET_TEST_HOOKS
 static int pcnetgame_txn_fault_fire(int mode) {
     static int seen = 0;
     static int fired = 0;
@@ -15536,6 +15668,12 @@ static int pcnetgame_txn_fault_fire(int mode) {
            fired, count);
     return 1;
 }
+#else
+static int pcnetgame_txn_fault_fire(int mode) {
+    (void)mode;
+    return 0;
+}
+#endif
 
 /* Every private_data writer outside the D3 merge: the SECOND sanctioned writer. Raw values only -- NEVER mPr_SetPossessionItem /
  * mPr_Set*Possession* (RNG for presents, writes Common_Get(now_private)), and nothing but pockets / item_conditions / wallet (never the
@@ -17509,7 +17647,7 @@ static void pcnetgame_handle_host_house_purchase_txn(PCNetPeerId peer, const PCN
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRICE_MISMATCH, 1, NULL, "the client's expected price differs from the host price");
         return;
     }
-    if (!(t->aux_cond <= 3u || t->aux_cond == (uint8_t)PC_NETGAME_HOUSE_AUTO)) {
+    if (!(t->aux_cond < (uint8_t)PC_RESIDENCE_HOUSES || t->aux_cond == (uint8_t)PC_NETGAME_HOUSE_AUTO)) {
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_INVALID_HOUSE, 1, NULL, "the requested house index is out of range");
         return;
     }
@@ -17798,6 +17936,7 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
  * in the right acre), which a protocol test cannot wait for. While armed, every 2 s the host runs the vanilla mPO_delivery_one_address() for each
  * house if the post office holds letters for players, and logs every used letter of every mailbox (BE hash, font, gift, sender / recipient type) so
  * the test can prove WHAT landed in WHICH house's mailbox. It uses the real vanilla delivery function; nothing else is changed. */
+#ifdef PC_NET_TEST_HOOKS
 static void pcnetgame_mail_test_force_delivery(void) {
     static uint32_t next_ms = 0;
     uint32_t now;
@@ -17830,6 +17969,9 @@ static void pcnetgame_mail_test_force_delivery(void) {
     }
     printf("[NET][MAIL][TEST-ONLY] force-delivery: done, post office keeps %d player letter(s)\n", (int)Save_Get(post_office).keep_mail_sum_players);
 }
+#else
+static void pcnetgame_mail_test_force_delivery(void) {}
+#endif
 /* TEST-ONLY (--mail-test-poke-museum=<resident idx>, HOST only, default OFF): simulates the HOST consuming a museum_record of a mirrored resident (what
  * mMsm_SendResultMail / mMsm_DepositFossil do at the day-change grow, which no protocol-level test can trigger): once that resident's record is
  * SYNCED (rev > 0) and 3 s have passed, bumps its stored_fossil_num by one. The 1 Hz host-field watcher must then see the museum_record digest change,
@@ -19345,6 +19487,7 @@ static void pcnetgame_crec_tick(void) {
 
     pcnetgame_look_reload_poll(); /* G3.3: no-op unless a guest's adopted gender differed (see pcnetgame_look_refresh_after_adopt) */
 
+#ifdef PC_NET_TEST_HOOKS
     /* TEST-ONLY (--d3-test-wallet-add N, default off): one deliberate local wallet change after the adopt, so a real client
      * exercises the upload path without any gameplay input. Never active in normal play. */
     if (g_pc_d3_test_wallet_add != 0 && !s_crec.test_hook_done &&
@@ -19377,6 +19520,7 @@ static void pcnetgame_crec_tick(void) {
                    g_pc_d3_test_wallet_add_late, (unsigned)before, (unsigned)Now_Private->inventory.wallet);
         }
     }
+#endif
 
     /* furniture sync: the pair (own house + record) goes out BEFORE the plain upload; while it is pending / in flight the plain upload is held */
     if (pcnetgame_house_client_commit_tick(now)) {
@@ -21660,17 +21804,18 @@ static int pcnetgame_txn_apply_take(const PCNetGameClientTxn* T, const PCNetGame
  * to resident and the writer PRESERVES the key). The D3 base is NOT advanced: the guest record is gone on the host and the session ends right after. Returns 1 / 0. */
 static int s_house_applied_sticky = 0; /* guest Nook dialogue (M4): 1 once an APPLIED HOUSE_PURCHASE was applied; cleared by the next begin. The host closes the session within a frame or two
                                         * of the RESULT, so a dialogue that polls one frame later can see the link loss (REJECTED) instead of the APPLIED: this flag is the truth. */
+static int s_client_handoff_seen = 0; /* lifecycle hardening: 1 once a RESIDENT_HANDOFF (66) for the claimed town arrived in THIS process (the host made this guest a resident); cleared by the next begin */
 static int pcnetgame_txn_apply_house(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
     const PCNetGameTxnTag* t = &T->tag;
     Private_c* np = Now_Private;
     char key[PC_CHARACTER_TOWNKEY_LEN + 1];
+    s_house_applied_sticky = 1; /* the HOST said APPLIED: the purchase happened whatever the local post-image check below says (the dialogue must never show FAILED after it) */
     if (np == NULL || in->post_wallet > (uint32_t)mPr_WALLET_MAX || in->post_wallet + (uint32_t)t->aux_item != t->pre_wallet) {
-        printf("[NET][TXN] client: *** APPLIED HOUSE_PURCHASE for request %u carries an inconsistent post-image (wallet %u, price %u, pre %u) -- nothing applied ***\n",
+        printf("[NET][TXN] client: *** APPLIED HOUSE_PURCHASE for request %u carries an inconsistent post-image (wallet %u, price %u, pre %u) -- the local wallet is NOT changed; the purchase itself is applied on the host ***\n",
                (unsigned)T->request_id, (unsigned)in->post_wallet, (unsigned)t->aux_item, (unsigned)t->pre_wallet);
         return 0;
     }
     np->inventory.wallet = in->post_wallet; /* the HOST's post-image (validated above: post + price == pre), never a local debit */
-    s_house_applied_sticky = 1;
     printf("[NET][HOUSE] client: house purchase APPLIED -- request %u: %u Bells paid, wallet now %u; the host makes this guest a resident (house %s)\n", (unsigned)T->request_id,
            (unsigned)t->aux_item, (unsigned)np->inventory.wallet, t->aux_cond == (uint8_t)PC_NETGAME_HOUSE_AUTO ? "auto" : "requested");
     if (pc_session()->storage == PC_CHARACTER_STORAGE_STORE && s_client_claimed_town.land_name[0] != 0) {
@@ -22356,39 +22501,188 @@ int pc_net_game_house_purchase_price(void) {
     return (int)PC_NETGAME_HOUSE_PRICE_DIRECT;
 }
 
+/* ===== RESIDENCE ALLOCATOR (guest -> resident lifecycle hardening): the ONE place that decides which resident slot / house a new resident gets =====
+ * Host pair: pc_residence_find_free() (the selection rules of the console `promote` and of the paid purchase) + pc_residence_assign() (the invariant checks and the vanilla
+ * mHS_set_use / mEv_ClearPersonalEventFlag). Client twin: pc_residence_local_free() over the LOCAL copy of the town (the Nook precheck and the free-house list).
+ * The constants live in pc_residence.h (4 slots, 4 houses: the 2-bit house_arrangement; see docs/multiplayer-guest-roadmap.md for what more houses would need). */
+static int pcres_first_free_slot(void) {
+    int i;
+    for (i = 0; i < PC_RESIDENCE_SLOTS; i++) {
+        if (mPr_CheckPrivate(&Save_Get(private_data)[i]) != TRUE) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int pcres_house_free(int h) {
+    return h >= 0 && h < PC_RESIDENCE_HOUSES && mPr_NullCheckPersonalID(&Save_Get(homes[h]).ownerID) == TRUE;
+}
+
+/* want_slot / want_house: -1 = auto, else explicit. Returns 1 and fills *slot / *house, or 0 with *reason (NO_RESIDENCE / INVALID_HOUSE); on failure *slot is -1 when no slot
+ * could be found and *house is -1 when no house could be (a caller picks its message from that). Auto house: the arrangement's own house of the slot first (as the console
+ * always did), else the first free one. */
+int pc_residence_find_free(int want_slot, int want_house, int* slot, int* house, uint8_t* reason) {
+    int s = -1, h = -1, i;
+    if (slot != NULL) {
+        *slot = -1;
+    }
+    if (house != NULL) {
+        *house = -1;
+    }
+    if (reason != NULL) {
+        *reason = 0;
+    }
+    if (want_slot < -1 || want_slot >= PC_RESIDENCE_SLOTS || want_house < -1 || want_house >= PC_RESIDENCE_HOUSES) {
+        if (reason != NULL) {
+            *reason = (uint8_t)(want_slot < -1 || want_slot >= PC_RESIDENCE_SLOTS ? PC_NETGAME_TXN_REASON_NO_RESIDENCE : PC_NETGAME_TXN_REASON_INVALID_HOUSE);
+        }
+        return 0;
+    }
+    if (want_slot < 0) {
+        s = pcres_first_free_slot();
+    } else if (mPr_CheckPrivate(&Save_Get(private_data)[want_slot]) != TRUE) {
+        s = want_slot;
+    }
+    if (s < 0) {
+        if (reason != NULL) {
+            *reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_RESIDENCE;
+        }
+        return 0;
+    }
+    if (slot != NULL) {
+        *slot = s;
+    }
+    if (want_house < 0) {
+        if (pcres_house_free(mHS_get_arrange_idx(s))) {
+            h = mHS_get_arrange_idx(s);
+        }
+        for (i = 0; i < PC_RESIDENCE_HOUSES && h < 0; i++) {
+            if (pcres_house_free(i)) {
+                h = i;
+            }
+        }
+        if (h < 0) {
+            if (reason != NULL) {
+                *reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_RESIDENCE;
+            }
+            return 0;
+        }
+    } else if (pcres_house_free(want_house)) {
+        h = want_house;
+    } else {
+        if (reason != NULL) {
+            *reason = (uint8_t)PC_NETGAME_TXN_REASON_INVALID_HOUSE;
+        }
+        return 0;
+    }
+    if (house != NULL) {
+        *house = h;
+    }
+    return 1;
+}
+
+/* The invariants a promotion relies on (checked BEFORE anything is touched by pc_mp_promote_create, and again by pc_residence_assign): house_arrangement is a permutation of
+ * 0..3; the house is free; the slot that mHS_get_pl_no(house) maps to is `slot` itself or a FREE slot (mHS_set_use swaps arrangements with that slot: a live resident there would
+ * be moved off its house); every live resident r owns homes[arrange(r)]. Returns 1 or 0 with err. */
+int pc_residence_check(int slot, int house, char* err, size_t cap) {
+    int i, pl;
+    u32 seen = 0;
+#define PCRES_FAIL(...) do { if (err != NULL && cap > 0) snprintf(err, cap, __VA_ARGS__); return 0; } while (0)
+    if (slot < 0 || slot >= PC_RESIDENCE_SLOTS || house < 0 || house >= PC_RESIDENCE_HOUSES) {
+        PCRES_FAIL("slot %d / house %d out of range", slot, house);
+    }
+    if (!pcres_house_free(house)) {
+        PCRES_FAIL("house %d already has an owner", house);
+    }
+    for (i = 0; i < PC_RESIDENCE_SLOTS; i++) {
+        const int h = (int)(((u32)Save_Get(house_arrangement) >> (i * 2)) & 3u);
+        if (seen & (1u << h)) {
+            PCRES_FAIL("the house arrangement of this save is not a permutation (0x%02X): refusing to touch it", (unsigned)Save_Get(house_arrangement));
+        }
+        seen |= 1u << h;
+    }
+    pl = mHS_get_pl_no(house);
+    if (pl != slot && pl >= 0 && pl < PC_RESIDENCE_SLOTS && mPr_CheckPrivate(&Save_Get(private_data)[pl]) == TRUE) {
+        PCRES_FAIL("house %d is mapped to LIVE resident slot %d by the arrangement (0x%02X): the swap would move that resident off its house", house, pl, (unsigned)Save_Get(house_arrangement));
+    }
+    for (i = 0; i < PC_RESIDENCE_SLOTS; i++) {
+        if (i != slot && mPr_CheckPrivate(&Save_Get(private_data)[i]) == TRUE &&
+            mPr_CheckCmpPersonalID(&Save_Get(homes[mHS_get_arrange_idx(i)]).ownerID, &Save_Get(private_data)[i].player_ID) != TRUE) {
+            PCRES_FAIL("live resident %d does not own homes[%d] (arrangement 0x%02X): the house table is inconsistent", i, mHS_get_arrange_idx(i), (unsigned)Save_Get(house_arrangement));
+        }
+    }
+#undef PCRES_FAIL
+    return 1;
+}
+
+/* Gives `house` to `slot` (vanilla mHS_set_use: arrangement swap + mHm_InitHomeInfo, owner = the slot's PersonalID) and sets the veteran event state of the slot. 1 or 0 (a failed
+ * assign has changed nothing the caller cannot roll back: pc_mp_promote_create restores its snapshot). */
+int pc_residence_assign(int slot, int house) {
+    if (!pc_residence_check(slot, house, NULL, 0)) {
+        return 0;
+    }
+    if (mHS_set_use(slot, house) != TRUE || mHS_get_arrange_idx(slot) != house) {
+        return 0;
+    }
+    mEv_ClearPersonalEventFlag(slot);
+    return 1;
+}
+
+/* Client twin over the LOCAL copy of the town. Returns the number of free houses; *slot = the first free resident slot or -1; *house = want_house when it is free (or, for
+ * auto, the first free house) else -1; `list` (cap entries) = the free houses; *reason = 0 when a purchase can be tried, else NO_RESIDENCE / INVALID_HOUSE. */
+int pc_residence_local_free(int want_house, int* slot, int* house, int* list, int cap, uint8_t* reason) {
+    int i, n = 0, s = pcres_first_free_slot(), h = -1;
+    uint8_t why = 0;
+    for (i = 0; i < PC_RESIDENCE_HOUSES; i++) {
+        if (pcres_house_free(i)) {
+            if (list != NULL && n < cap) {
+                list[n] = i;
+            }
+            if (h < 0) {
+                h = i;
+            }
+            n++;
+        }
+    }
+    if (s < 0 || n == 0) {
+        why = (uint8_t)PC_NETGAME_TXN_REASON_NO_RESIDENCE;
+    } else if (want_house >= 0 && !pcres_house_free(want_house)) {
+        why = (uint8_t)PC_NETGAME_TXN_REASON_INVALID_HOUSE;
+    }
+    if (want_house >= 0) {
+        h = pcres_house_free(want_house) ? want_house : -1;
+    }
+    if (slot != NULL) {
+        *slot = s;
+    }
+    if (house != NULL) {
+        *house = h;
+    }
+    if (reason != NULL) {
+        *reason = why;
+    }
+    return n;
+}
+
 int pc_net_game_house_purchase_precheck(int house_or_auto) {
-    int i, free_slot = 0, free_house = 0;
+    uint8_t why = 0;
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcnetgame_client_is_guest_player() || Now_Private == NULL) {
         return (int)PC_NETGAME_TXN_REASON_PRECOND;
     }
-    if (house_or_auto > 3 || house_or_auto < -1) {
+    if (house_or_auto >= PC_RESIDENCE_HOUSES || house_or_auto < -1) {
         return (int)PC_NETGAME_TXN_REASON_INVALID_HOUSE;
     }
     if (Now_Private->inventory.wallet < PC_NETGAME_HOUSE_PRICE_DIRECT) {
         return (int)PC_NETGAME_TXN_REASON_NO_FUNDS;
     }
-    for (i = 0; i < PLAYER_NUM; i++) {
-        if (mPr_CheckPrivate(&Save_Get(private_data)[i]) != TRUE) {
-            free_slot++;
-        }
-    }
-    for (i = 0; i < mHS_HOUSE_NUM; i++) {
-        if (mPr_NullCheckPersonalID(&Save_Get(homes[i]).ownerID) == TRUE) {
-            free_house++;
-        }
-    }
-    if (free_slot == 0 || free_house == 0) {
-        return (int)PC_NETGAME_TXN_REASON_NO_RESIDENCE;
-    }
-    if (house_or_auto >= 0 && mPr_NullCheckPersonalID(&Save_Get(homes[house_or_auto]).ownerID) != TRUE) {
-        return (int)PC_NETGAME_TXN_REASON_INVALID_HOUSE;
-    }
-    return 0;
+    (void)pc_residence_local_free(house_or_auto, NULL, NULL, NULL, 0, &why);
+    return (int)why;
 }
 
 /* Guest Nook dialogue (M4): the dialogue-side helpers of the house offer (declared in pc_nook_house.h). All LOCAL reads; the HOST still validates the purchase. */
 int pc_net_game_house_purchase_applied(void) {
-    return s_house_applied_sticky;
+    return s_house_applied_sticky || s_client_handoff_seen;
 }
 
 int pc_net_game_house_offer_available(void) {
@@ -22396,13 +22690,12 @@ int pc_net_game_house_offer_available(void) {
 }
 
 int pc_net_game_house_free_list(int* out, int cap) {
-    int i, n = 0;
-    for (i = 0; i < mHS_HOUSE_NUM && out != NULL && n < cap; i++) {
-        if (mPr_NullCheckPersonalID(&Save_Get(homes[i]).ownerID) == TRUE) {
-            out[n++] = i;
-        }
+    int n;
+    if (out == NULL || cap < 1) {
+        return 0;
     }
-    return n;
+    n = pc_residence_local_free(-1, NULL, NULL, out, cap, NULL);
+    return n > cap ? cap : n;
 }
 
 /* membership.ini key `nook_intro` of the store character + town this client claimed: _get returns 1 = present (value in out), 0 = absent, -1 = no store character /
@@ -22446,6 +22739,7 @@ int pc_net_game_ts_begin_house_purchase(int house_or_auto) {
     }
     s_ts_last_reason = 0;
     s_house_applied_sticky = 0;
+    s_client_handoff_seen = 0;
     r = pc_net_game_house_purchase_precheck(house_or_auto);
     if (r != 0) {
         s_ts_last_reason = (uint8_t)r;
@@ -22530,6 +22824,7 @@ int pc_net_game_ts_poll(void) {
  * TXN_RESULT -> pcnetgame_txn_apply_house(), the entry points the Nook dialogue seam will call) without GUI input. The one LOCAL test setup write is the wallet (raised to
  * 20000 when it is below the price so the purchase is affordable; the D3 upload carries it to the host, the hook waits for a clean record). Fires ONCE per process.
  * After APPLIED the host sends RESIDENT_HANDOFF + REJECT PROMOTED and the process re-joins as the resident (pc_main.c). */
+#ifdef PC_NET_TEST_HOOKS
 static void pcnetgame_run_house_buy_test_hook(void) {
     static int s_stage = 0; /* 0 wait synced, 1 wallet raised (wait for the upload), 2 begun (poll), 3 done */
     static uint32_t s_t0 = 0;
@@ -22585,12 +22880,16 @@ static void pcnetgame_run_house_buy_test_hook(void) {
     printf("[NET][HOUSE][TEST-ONLY] --house-buy-test: result %s (host reason %d)\n", r == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED", pc_net_game_ts_last_reject_reason());
     s_stage = 3;
 }
+#else
+static void pcnetgame_run_house_buy_test_hook(void) {}
+#endif
 
 /* TEST-ONLY (--nook-test SPEC, client role, default OFF, never active in normal play; every step logs "[NET][HOUSE][TEST-ONLY]"). Setup for the VISUAL run of the guest
  * Nook dialogue (the dialogue itself is driven by a person / the screenshot rig): SPEC is a comma list: `wallet=N` sets the LOCAL wallet to N once (the hook's one local test
  * write, so the guest can / cannot pay the house; the normal D3 upload carries it to the host mirror and the hook waits for a clean record), `warp` then takes the player into
  * Nook's shop (a scene change through the vanilla goto_other_scene with the shop's own door data) once it stands idle in the town. Fires once per process. */
 extern const char* g_pc_nook_test; /* pc_main.c (declared here, not in pc_platform.h, to keep the widely included header untouched) */
+#ifdef PC_NET_TEST_HOOKS
 static void pcnetgame_run_nook_test_hook(void) {
     static int s_stage = 0; /* 0 wait synced, 1 wallet set (wait for the upload), 2 warp, 3 done */
     static uint32_t s_t0 = 0;
@@ -22652,6 +22951,9 @@ static void pcnetgame_run_nook_test_hook(void) {
         s_stage = 3;
     }
 }
+#else
+static void pcnetgame_run_nook_test_hook(void) {}
+#endif
 
 /* TEST-ONLY (--ts-test-donate / --ts-test-claim, client role, default OFF, never active in normal play; every step logs "[NET][TS][TEST-ONLY]").
  * Drives ONE real museum donation / lost-and-found claim through the REAL client request path (pc_net_game_ts_begin_* / _poll -> TXN_COMMIT ->
@@ -25197,6 +25499,52 @@ static void pcnetgame_client_note_membership(void) {
 
 /* M-E: IDENTITY_TOKEN with the RESIDENT flag. Same rules as a guest token: only after our own RESIDENT claim, one per connection; a first contact persists the token (BEFORE anything
  * depends on it); a token that DIFFERS from the one this client PRESENTED means this is not the host that issued it: the client refuses the host. */
+/* Lifecycle hardening (B8): after the FIRST KNOWN resident login (the host verified the token this client presented) the promoted GUEST's entry of this town is obsolete: drop every
+ * other entry of the same town from the character's token.dat (a STORE character's token file is per character AND town, so these can only be the guest's). */
+static void pcnetgame_client_drop_guest_entries(void) {
+    int i, k, dropped = 0;
+    const char* tp;
+    uint8_t rp[PC_MP_GUEST_PID_SIZE];
+    if (pc_session()->storage != PC_CHARACTER_STORAGE_STORE) {
+        return;
+    }
+    tp = pcnetgame_client_token_path();
+    pcnetgame_client_gtk_load();
+    memcpy(rp, s_client_ext_sent.home_player_name, PC_NETGAME_NAME_LEN);
+    memcpy(rp + 8, s_client_ext_sent.home_land_name, PC_NETGAME_LAND_LEN);
+    rp[16] = (uint8_t)(s_client_ext_sent.home_player_id >> 8);
+    rp[17] = (uint8_t)s_client_ext_sent.home_player_id;
+    rp[18] = (uint8_t)(s_client_ext_sent.home_land_id >> 8);
+    rp[19] = (uint8_t)s_client_ext_sent.home_land_id;
+    for (i = 0; i < PC_MP_GTK_SLOTS; i++) {
+        PCMpGtkEntry* e = &s_client_gtk.e[i];
+        if (e->present && e->host_land_id == s_client_claimed_town.land_id && memcmp(e->host_land_name, s_client_claimed_town.land_name, PC_NETGAME_LAND_LEN) == 0 &&
+            e->host_terrain_hash == s_client_claimed_town.terrain_hash && memcmp(e->home_pid, rp, PC_MP_GUEST_PID_SIZE) != 0) {
+            memset(e, 0, sizeof(*e));
+            dropped++;
+        }
+    }
+    if (dropped == 0) {
+        return;
+    }
+    for (i = 0, k = 0; i < PC_MP_GTK_SLOTS; i++) { /* compact */
+        if (s_client_gtk.e[i].present) {
+            if (i != k) {
+                s_client_gtk.e[k] = s_client_gtk.e[i];
+                memset(&s_client_gtk.e[i], 0, sizeof(s_client_gtk.e[i]));
+            }
+            k++;
+        }
+    }
+    if (pc_mp_gtoken_save(tp, &s_client_gtk) == PC_MP_GST_OK) {
+        printf("[NET][RESIDENT] client: first KNOWN resident login: %d obsolete guest token entr%s of this town dropped from %s (the token file now holds the resident entry only)\n", dropped,
+               dropped == 1 ? "y" : "ies", tp);
+    } else {
+        printf("[NET][RESIDENT] client: the obsolete guest token entry could not be dropped (write failed); it is harmless and retried at the next KNOWN login\n");
+    }
+    s_client_gtk_loaded = 0;
+}
+
 static void pcnetgame_handle_client_resident_token(const PCNetGameIdentityTokenMsg* m) {
     PCMpGtkEntry e;
     const char* tp = pcnetgame_client_token_path();
@@ -25220,6 +25568,7 @@ static void pcnetgame_handle_client_resident_token(const PCNetGameIdentityTokenM
             return;
         }
         printf("[NET][RESIDENT] client: resident token verified by the host (resident %u)\n", (unsigned)m->guest_slot);
+        pcnetgame_client_drop_guest_entries();
         return;
     }
     memset(&e, 0, sizeof(e));
@@ -25332,7 +25681,7 @@ static void pcnetgame_handle_client_resident_handoff(const uint8_t* data, uint16
     PCMpGtkEntry e;
     char key[PC_CHARACTER_TOWNKEY_LEN + 1], tp[420];
     uint16_t land_id;
-    int k, allz = 1;
+    int k, allz = 1, unreadable = 0;
     if (size != sizeof(m)) {
         return;
     }
@@ -25353,6 +25702,7 @@ static void pcnetgame_handle_client_resident_handoff(const uint8_t* data, uint16
         return;
     }
     printf("[NET][PROMOTE] client: the host PROMOTED this guest to resident slot %u of its town\n", (unsigned)m.res_slot);
+    s_client_handoff_seen = 1; /* the dialogue treats a link-loss REJECTED after this as the APPLIED purchase it is */
     if (pc_session()->storage != PC_CHARACTER_STORAGE_STORE) {
         printf("[NET][PROMOTE] client: legacy guest profile: the token / membership files are NOT rewritten (use a character from the character store, or a resident client with the new PersonalID + token)\n");
         return;
@@ -25362,8 +25712,11 @@ static void pcnetgame_handle_client_resident_handoff(const uint8_t* data, uint16
         printf("[NET][PROMOTE] client: could not resolve the token path of character %s\n", pc_session()->character.uuid);
         return;
     }
+    /* Lifecycle hardening (B8): token.dat keeps the GUEST entry and gains the RESIDENT entry (it was REPLACED by the single resident entry before membership.ini was written: a crash
+     * between the two files left a guest membership with no guest token). The guest entry is dropped only after the first KNOWN resident login (pcnetgame_client_drop_guest_entries). */
     memset(&f, 0, sizeof(f));
     memset(&e, 0, sizeof(e));
+    (void)pc_mp_gtoken_load(tp, &f, &unreadable);
     e.present = 1;
     memcpy(e.host_land_name, s_client_claimed_town.land_name, PC_NETGAME_LAND_LEN);
     e.host_land_id = s_client_claimed_town.land_id;
@@ -25376,6 +25729,13 @@ static void pcnetgame_handle_client_resident_handoff(const uint8_t* data, uint16
         return;
     }
     s_client_gtk_loaded = 0; /* the token file changed under the cache */
+#ifdef PC_NET_TEST_HOOKS
+    if (pc_test_hook_getenv("AC_PROMOTE_CLIENT_CRASH") != NULL) { /* test hook (B8): the client dies between token.dat and membership.ini */
+        printf("[NET][PROMOTE][TEST-ONLY] client fault: exiting NOW (token.dat holds guest + resident, membership.ini NOT written)\n");
+        fflush(NULL);
+        _exit(96);
+    }
+#endif
     if (pc_character_membership_write(NULL, pc_session()->character.uuid, key, "resident", m.town_pid, "")) {
         printf("[NET][PROMOTE] client: character %s is now a RESIDENT of town %s (token.dat + membership.ini written): restart / Play Online to join as the resident\n", pc_session()->character.uuid, key);
         snprintf(s_client_relaunch_uuid, sizeof(s_client_relaunch_uuid), "%s", pc_session()->character.uuid);
@@ -31747,6 +32107,48 @@ extern void pc_mp_promote_rollback(void);
 extern void pc_mp_promote_commit(void);
 extern void pc_mp_promote_set_paid(int paid); /* pc_m_card.c: the NEXT pc_mp_promote_create starts the resident with loan 0 (the guest paid the whole house price) */
 extern int  pc_save_write_authoritative(void);
+extern int  pc_save_write_authoritative_durable(void); /* pc_m_card.c: FALSE unless the GCI was REALLY written */
+extern int  pc_save_can_be_durable(void);              /* pc_m_card.c: a loaded, non-sanitized town save in a non-client process */
+
+/* Reads a whole (small) file into a malloc'd buffer; NULL when it does not exist / cannot be read. */
+static uint8_t* pcnetgame_file_slurp(const char* path, size_t* len) {
+    FILE* f = fopen(path, "rb");
+    uint8_t* b;
+    long n;
+    *len = 0;
+    if (f == NULL) {
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (n = ftell(f)) < 0 || n > (1L << 20) || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    b = (uint8_t*)malloc((size_t)n + 1u);
+    if (b == NULL || fread(b, 1, (size_t)n, f) != (size_t)n) {
+        free(b);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *len = (size_t)n;
+    return b;
+}
+
+/* Rollback of the members.dat write of a promotion: puts the exact old bytes back (raw != NULL) or removes the file again (it did not exist before). 1 = done. */
+static int pcnetgame_members_restore_raw(const uint8_t* raw, size_t len) {
+    if (raw == NULL) {
+        return remove(PC_MP_MEMBERS_PATH) == 0;
+    }
+    {
+        FILE* f = fopen(PC_MP_MEMBERS_PATH, "wb");
+        int ok;
+        if (f == NULL) {
+            return 0;
+        }
+        ok = fwrite(raw, 1, len, f) == len;
+        return (fclose(f) == 0) && ok;
+    }
+}
 
 static int pcnetgame_promote_file_exists(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -31757,12 +32159,12 @@ static int pcnetgame_promote_file_exists(const char* path) {
     return 1;
 }
 
-/* sel: "auto" or one digit 0..3. Returns -2 = auto, -1 = invalid, else the index. */
+/* sel: "auto" or one digit 0..PC_RESIDENCE_HOUSES-1. Returns -2 = auto, -1 = invalid, else the index. */
 static int pcnetgame_promote_parse_index(const char* sel) {
     if (sel != NULL && pcnetgame_dedicated_ieq(sel, "auto")) {
         return -2;
     }
-    if (sel != NULL && sel[0] >= '0' && sel[0] <= '3' && sel[1] == '\0') {
+    if (sel != NULL && sel[0] >= '0' && sel[0] < (char)('0' + PC_RESIDENCE_HOUSES) && sel[1] == '\0') {
         return sel[0] - '0';
     }
     return -1;
@@ -31813,6 +32215,9 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     PCNetGameGuest old_g;
     Private_c old_rec;
     PCNetGameRecSlot old_grs;
+    uint32_t old_remail = 0;
+    uint8_t* old_members_raw = NULL; /* the exact bytes of members.dat before step 3 (NULL = no file) */
+    size_t old_members_len = 0;
     if (msg == NULL || cap < 8) {
         return 0;
     }
@@ -31863,39 +32268,22 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     si = pcnetgame_promote_parse_index(ssel);
     hi = pcnetgame_promote_parse_index(hsel);
     if (si == -1 || hi == -1) {
-        PROMOTE_REFUSE("refused: <slot> and <house> must each be 0..3 or `auto`");
+        PROMOTE_REFUSE("refused: <slot> and <house> must each be 0..%d or `auto`", PC_RESIDENCE_HOUSES - 1);
     }
-    s = si;
-    if (si == -2) {
-        s = -1;
-        for (i = 0; i < PLAYER_NUM; i++) {
-            if (mPr_CheckPrivate(&Save_Get(private_data)[i]) != TRUE) {
-                s = i;
-                break;
+    {
+        uint8_t why_r = 0;
+        if (!pc_residence_find_free(si == -2 ? -1 : si, hi == -2 ? -1 : hi, &s, &h, &why_r)) {
+            if (s < 0) {
+                if (si == -2) {
+                    PROMOTE_REFUSE_R(why_r, "refused: the town is FULL (all %d resident slots are used): nothing to promote into", PC_RESIDENCE_SLOTS);
+                }
+                PROMOTE_REFUSE_R(why_r, "refused: resident slot %d is not free (see `residents`)", si);
             }
-        }
-        if (s < 0) {
-            PROMOTE_REFUSE_R(PC_NETGAME_TXN_REASON_NO_RESIDENCE, "refused: the town is FULL (all %d resident slots are used): nothing to promote into", PLAYER_NUM);
-        }
-    } else if (mPr_CheckPrivate(&Save_Get(private_data)[s]) == TRUE) {
-        PROMOTE_REFUSE_R(PC_NETGAME_TXN_REASON_NO_RESIDENCE, "refused: resident slot %d is not free (see `residents`)", s);
-    }
-    h = hi;
-    if (hi == -2) {
-        h = -1;
-        if (mPr_NullCheckPersonalID(&Save_Get(homes[mHS_get_arrange_idx(s)]).ownerID) == TRUE) {
-            h = mHS_get_arrange_idx(s);
-        }
-        for (i = 0; i < mHS_HOUSE_NUM && h < 0; i++) {
-            if (mPr_NullCheckPersonalID(&Save_Get(homes[i]).ownerID) == TRUE) {
-                h = i;
+            if (hi == -2) {
+                PROMOTE_REFUSE_R(why_r, "refused: no free house (every house has an owner)");
             }
+            PROMOTE_REFUSE_R(why_r, "refused: house %d already has an owner", hi);
         }
-        if (h < 0) {
-            PROMOTE_REFUSE_R(PC_NETGAME_TXN_REASON_NO_RESIDENCE, "refused: no free house (every house has an owner)");
-        }
-    } else if (mPr_NullCheckPersonalID(&Save_Get(homes[h]).ownerID) != TRUE) {
-        PROMOTE_REFUSE_R(PC_NETGAME_TXN_REASON_INVALID_HOUSE, "refused: house %d already has an owner", h);
     }
     for (i = 0; i < PLAYER_NUM; i++) {
         PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
@@ -31916,10 +32304,13 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     if (a < 0 || b < 0) {
         PROMOTE_REFUSE_R(PC_NETGAME_TXN_REASON_NO_RESIDENCE, "refused: members.dat has no room for 2 entries (resident credential + handoff): reset a credential first");
     }
+    if (!pc_save_can_be_durable()) { /* lifecycle hardening (B3a): a "successful" save that wrote nothing would let the guest entry be removed for a resident that is not on disk */
+        PROMOTE_REFUSE_R(PC_NETGAME_TXN_REASON_BUSY, "refused: the town save cannot be made durable right now (no loaded town save, or a sanitized transfer image): nothing was changed, the guest and its wallet are intact");
+    }
     if (!confirm) {
-        snprintf(msg, cap, "guest slot %d (\"%s\"): this PROMOTES the guest to RESIDENT slot %d with house %d: a new resident is created in the town save (name / gender / face / shirt / pockets / wallet / bank "
-                           "carried over, everything else vanilla new-player defaults, NO Nook intro), the town is saved, a resident credential + a handoff are stored in members.dat and the guest entry is REMOVED "
-                           "from guests.dat (all three files are backed up first). Villager memories of the guest are re-keyed to the resident; fish records / mail held for the guest are lost. re-run with `confirm` as the last argument", g, who, s, h);
+        snprintf(msg, cap, "guest slot %d (\"%s\"): this PROMOTES the guest to RESIDENT slot %d with house %d: a new resident is created in the town save (name / gender / face / shirt / pockets / wallet / bank / "
+                           "the letters in the inventory / equipment / collection bits / maps / quests carried over, everything else vanilla new-player defaults, NO Nook intro), the town is saved, a resident credential + a handoff are stored in members.dat and the guest entry is REMOVED "
+                           "from guests.dat (all three files are backed up first). Villager memories / contest quests of the guest are re-keyed to the resident. re-run with `confirm` as the last argument", g, who, s, h);
         return 2;
     }
     bak_g[0] = bak_m[0] = bak_r[0] = '\0';
@@ -31945,6 +32336,8 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     }
     pcnetgame_resident_pid_be(&Save_Get(private_data)[s].player_ID, npid);
     pcnetgame_resident_pid_be(&s_guest[g].key, gpid);
+    old_remail = s_remail_day[s]; /* the host remail pass of the new resident starts clean (a stale day of a former occupant of the slot would skip today's pass) */
+    s_remail_day[s] = 0;
 
     /* 2. the records lineage of the new resident: rev 1 (the host record is the truth: no MIGRATE, the host pushes it); a fresh epoch, a clean journal */
     old_rs = s_rec_slot[s];
@@ -31960,6 +32353,7 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
 
     /* 3. members.dat: the resident credential + the handoff (the handoff carries the GUEST token: the proof the claimant is the promoted guest) */
     old_members = s_members_file;
+    old_members_raw = pcnetgame_file_slurp(PC_MP_MEMBERS_PATH, &old_members_len); /* NULL = the file did not exist: a rollback removes it again (byte-identical members.dat) */
     nf = s_members_file;
     {
         const int pruned = pcnetgame_members_prune_orphans(&nf);
@@ -31995,19 +32389,44 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     }
     if (!pcnetgame_members_commit(&nf, "guest promotion: resident credential + handoff")) {
         s_rec_slot[s] = old_rs;
+        s_remail_day[s] = old_remail;
         pc_mp_promote_rollback();
+        free(old_members_raw);
         PROMOTE_REFUSE("refused: members.dat could not be written; the promotion was rolled back (nothing changed; backups %s)", bak_g);
     }
 
-    /* 4. the town save (the GCI; records.dat is written right after it by the save hook with rev 1 for the new resident) */
-    if (!pc_save_write_authoritative()) {
+#ifdef PC_NET_TEST_HOOKS
+    if (g_pc_promote_fault == 2) { /* --promote-fault crash_after_members: the process dies right after the members.dat write (before the GCI): the handoff is INVALID on restart */
+        printf("[NET][PROMOTE][TEST-ONLY] FAULT crash_after_members: exiting NOW (members.dat written, the GCI and guests.dat untouched)\n");
+        fflush(NULL);
+        _exit(97);
+    }
+#endif
+    /* 4. the town save (the GCI; records.dat is written right after it by the save hook with rev 1 for the new resident). The DURABLE variant: it is FALSE unless a real write happened. */
+    if (!pc_save_write_authoritative_durable()) {
         s_rec_slot[s] = old_rs;
+        s_remail_day[s] = old_remail;
         pc_mp_promote_rollback();
-        (void)pcnetgame_members_commit(&old_members, "guest promotion rolled back (the town save could not be written)");
+        if (pcnetgame_members_restore_raw(old_members_raw, old_members_len)) {
+            s_members_file = old_members; /* byte-identical members.dat (or no file) again */
+            printf("[NET][RESIDENT] store: members.dat restored byte for byte (guest promotion rolled back: the town save could not be written)\n");
+        } else {
+            (void)pcnetgame_members_commit(&old_members, "guest promotion rolled back (the town save could not be written)");
+        }
+        free(old_members_raw);
         PROMOTE_REFUSE("refused: the town save could not be written; the promotion was rolled back in memory and members.dat restored (the on-disk save was NOT modified)");
     }
     pc_mp_promote_commit();
+    free(old_members_raw);
+    old_members_raw = NULL;
     s_rec_slot[s].dirty_unsaved = 0;
+#ifdef PC_NET_TEST_HOOKS
+    if (g_pc_promote_fault == 3) { /* --promote-fault crash_after_gci: the process dies right after the GCI save (before the guests.dat step 5): the stale guest entry survives */
+        printf("[NET][PROMOTE][TEST-ONLY] FAULT crash_after_gci: exiting NOW (the GCI holds the resident, guests.dat still holds the guest)\n");
+        fflush(NULL);
+        _exit(98);
+    }
+#endif
     if (out != NULL) {
         out->slot = s;
         out->house = h;

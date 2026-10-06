@@ -1,5 +1,6 @@
 /* pc_relaunch.c - see pc_relaunch.h. */
 #include "pc_relaunch.h"
+#include "pc_test_hooks.h" /* test-hook guard: AC_RELAUNCH_DRYRUN needs a PC_TEST_HOOKS build + AC_TEST_HOOKS=1 */
 #include "pc_servers.h"
 
 #include <stdio.h>
@@ -78,7 +79,7 @@ int pc_relaunch_connect(const char* host, int port, int kind, const char* name, 
         snprintf(err, errcap, "cannot build the connect command line");
         return 0;
     }
-    if (getenv("AC_RELAUNCH_DRYRUN") != NULL) { /* M-I test hook: log the exact command line, start nothing (the caller must not quit) */
+    if (pc_test_hook_getenv("AC_RELAUNCH_DRYRUN") != NULL) { /* M-I test hook: log the exact command line, start nothing (the caller must not quit) */
         printf("[PC] RELAUNCH DRYRUN: <this executable> %s\n", args);
         fflush(stdout);
         snprintf(err, errcap, "dry run");

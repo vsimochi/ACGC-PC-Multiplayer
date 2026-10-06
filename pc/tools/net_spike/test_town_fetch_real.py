@@ -127,7 +127,7 @@ def run(port, results):
         if host is None:
             return
         t0 = time.monotonic()
-        client = start_client(args.port, "r3", env={"AC_TOWN_NO_MSGBOX": "1"})
+        client = start_client(args.port, "r3", env={"AC_TEST_HOOKS": "1", "AC_TOWN_NO_MSGBOX": "1"})
         rc3 = client.wait_exit(90.0)
         d3 = time.monotonic() - t0
         ctext = client.log_text()
@@ -139,7 +139,7 @@ def run(port, results):
         host = None
         # R4: nobody listens
         t0 = time.monotonic()
-        client = start_client(args.port + 3, "r4", env={"AC_TOWN_NO_MSGBOX": "1"})
+        client = start_client(args.port + 3, "r4", env={"AC_TEST_HOOKS": "1", "AC_TOWN_NO_MSGBOX": "1"})
         rc4 = client.wait_exit(90.0)
         d4 = time.monotonic() - t0
         ctext = client.log_text()

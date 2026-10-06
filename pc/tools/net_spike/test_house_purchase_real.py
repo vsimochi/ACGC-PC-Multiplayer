@@ -55,7 +55,7 @@ import net_spike_lib as L  # noqa: E402
 HOST_DIR = L.GAME_BIN_DIR
 EXE = os.path.join(CLIENT_DIR, "AnimalCrossing.exe")
 INI = "name = Buyer\ngender = 0\nface = 3\nhome_town = GuestVil\nplayer_id = 0x1234\nland_id = 0x4321\n"
-ENV = {"AC_TOWN_NO_MSGBOX": "1", "AC_DISPLAY_NAME": "samsung", "AC_MASTER_VOLUME": "1"}
+ENV = {"AC_TEST_HOOKS": "1", "AC_TOWN_NO_MSGBOX": "1", "AC_DISPLAY_NAME": "samsung", "AC_MASTER_VOLUME": "1"}
 
 
 def say(h, cmd, settle=1.5, timeout=25.0):

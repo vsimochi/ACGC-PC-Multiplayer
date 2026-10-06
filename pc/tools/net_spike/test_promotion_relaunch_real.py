@@ -74,6 +74,12 @@ def say(h, cmd, settle=1.5, timeout=25.0):
     return h.log_text()[off:].replace("\r\n", "\n")
 
 
+def gtk_entries(path):
+    """[(home_pid, token)] of the PRESENT entries of a PCMpGtk token file (header 32, 4 x 64-byte entries: present @0, home pid @28, token @48)."""
+    b = open(path, "rb").read()
+    return [(b[32 + i * 64 + 28:32 + i * 64 + 48], b[32 + i * 64 + 48:32 + i * 64 + 64]) for i in range(4) if b[32 + i * 64] == 1]
+
+
 def start_client(port, args, tag, env=None):
     return L.ClientProcess("127.0.0.1:%d" % port, extra_args=args, log_path=T.log_path("promo_rc_client_%s.log" % tag), bin_dir=CLIENT_DIR, env=env, label="promorcc").start()
 
@@ -123,7 +129,7 @@ def run(port, results):
             return
 
         # ---------------- D: the same client command, relaunch dry run
-        env = {"AC_RELAUNCH_DRYRUN": "1"}
+        env = {"AC_TEST_HOOKS": "1", "AC_RELAUNCH_DRYRUN": "1"}
         client = start_client(port, cargs, "dryrun", env=env)
         mo = client.wait_for_log(r"RELAUNCH DRYRUN: <this executable> ([^\r\n]+)", 170.0)
         ctext = client.log_text()
@@ -139,6 +145,9 @@ def run(port, results):
         mtext = open(os.path.join(towns[0], "membership.ini")).read() if len(towns) == 1 and os.path.isfile(os.path.join(towns[0], "membership.ini")) else ""
         ck("D membership.ini = role resident + the new town PID (Roger / the host land / a 0xF0xx player id); token.dat exists",
            "role = resident" in mtext and mtext.lower().count("town_pid = ") == 1 and "town_pid = " + b"Roger   ".hex() in mtext.lower() and len(towns) == 1 and os.path.isfile(os.path.join(towns[0], "token.dat")))
+        tk = gtk_entries(os.path.join(towns[0], "token.dat")) if len(towns) == 1 and os.path.isfile(os.path.join(towns[0], "token.dat")) else []
+        ck("D lifecycle B8: token.dat holds BOTH entries after the handoff: the GUEST entry is KEPT (home pid = the guest key, land = the guest's town) and the RESIDENT entry (host land) is present; "
+           "membership.ini was written after it", len(tk) == 2 and tk[0][0] != tk[1][0])
         client.stop()
         client = None
         time.sleep(9.0)
@@ -156,6 +165,8 @@ def run(port, results):
         time.sleep(3.0)
         htext = host.log_text()
         ck("R host: the resident credential was confirmed and the promotion handoff entry removed", "promotion handoff removed" in htext)
+        tk2 = gtk_entries(os.path.join(towns[0], "token.dat")) if len(towns) == 1 and os.path.isfile(os.path.join(towns[0], "token.dat")) else []
+        ck("R lifecycle B8: after the first KNOWN resident login token.dat holds ONLY the resident entry (the obsolete guest entry was dropped)", len(tk2) == 1 and "obsolete guest token" in client.log_text())
         out = say(host, "residents")
         ck("R `residents`: slot 3 confirmed=yes connected=yes", re.search(r'slot 3: name="Roger\s*" credential=yes confirmed=yes armed=no connected=yes', out) is not None)
         client.stop()

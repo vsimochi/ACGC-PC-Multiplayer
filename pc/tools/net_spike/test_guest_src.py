@@ -145,7 +145,8 @@ def main():
     ck("A s_guest_rec[] is addressed ONLY through the accessor, the guest table lifecycle functions (install / create / rollback) and the G6.2 operator tools (remove: "
        "pc_net_game_dedicated_guest_admin) and nothing else",
        sorted({n for a, b, n in funcs if "s_guest_rec[" in c[a:b]}) == sorted(["pcnetgame_rec_priv_ptr", "pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create",
-                                                                              "pc_net_game_dedicated_guest_admin", "pcnetgame_promote_exec"]))  # guest-first purchase: the promote console command is a thin wrapper of pcnetgame_promote_exec (the former body)
+                                                                              "pc_net_game_dedicated_guest_admin", "pcnetgame_promote_exec",
+                                                                              "pcnetgame_guest_drop_promoted"]))  # guest-first purchase: the promote console command is a thin wrapper of pcnetgame_promote_exec (the former body); lifecycle hardening: pcnetgame_guest_drop_promoted removes the stale guest entry of a promoted guest (backup first, never UNTRUSTED)
     pinned = ["pc_net_game_dedicated_members", "pcnetgame_dedicated_give_resolve",  # the dedicated console tools (host admin items / members), reviewed
               # M-D / M-E: the admission cross-check (reads the host's own residents), the resident credential table (keyed by the resident PersonalID of private_data[idx]) and the
               # resident operator commands (residents / resident-reset / resident-arm); all host-side, none reachable with a guest slot
@@ -157,8 +158,9 @@ def main():
               "pcnetgame_house_handle_begin", "pcnetgame_house_process_commit",  # furniture sync: guest slot -> NOT_OWNER before the first subscript (test_house_sync_src.py)
               "pcnetgame_mail_test_poke_museum", "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mail_test_seed_reply", "pcnetgame_mbox_refresh_resident",
               "pcnetgame_mbox_send", "pcnetgame_members_prune_orphans", "pcnetgame_rec_gate", "pcnetgame_rec_priv_ptr", "pcnetgame_rec_resolve_slot", "pcnetgame_rec_slot", "pcnetgame_rec_store_build",
-              # guest-first purchase (reviewed): the CLIENT-side local pre-check of the house purchase reads the LOCAL town copy with loop-bounded indices (i < PLAYER_NUM)
-              "pc_net_game_house_purchase_precheck",
+              # lifecycle hardening (reviewed): the residence allocator (pc_residence_find_free / _check read private_data with a range-checked slot or a loop bounded by
+              # PC_RESIDENCE_SLOTS; the client twin pc_residence_local_free goes through pcres_first_free_slot) and the load-time sweep of the stale guest entries (loop-bounded)
+              "pc_residence_find_free", "pc_residence_check", "pcres_first_free_slot", "pcnetgame_promoted_guest_sweep",
               # reviewed now (they were already at HEAD, unpinned): the personal-data (diary) sync code walks private_data with loop-bounded indices (slot < PLAYER_NUM; the client side
               # returns -1 for a guest claim / a non-resident before the loop)
               "pcnetgame_pdata_host_tick", "pcnetgame_pdc_own_slot"]
@@ -169,7 +171,7 @@ def main():
     homes_users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(homes\[", c[a:b])})
     ck("A the functions that subscript Save_Get(homes[...]) are exactly the reviewed ones (house lookup by PersonalID, mail / mailbox paths behind the guest refusal, "
        "client-side shadows, TEST-ONLY hooks): %s" % homes_users,
-       homes_users == sorted(["pcnetgame_promote_exec", "pc_net_game_house_purchase_precheck", "pc_net_game_house_free_list", "pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
+       homes_users == sorted(["pc_residence_check", "pcres_house_free", "pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
                               "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mbox_client_apply", "pcnetgame_mbox_client_tick", "pcnetgame_mbox_house_of",
                               "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook", "pcnetgame_txn_apply_take",
                               # furniture sync (house index from a bound PersonalID, guest refused first; client shadows; TEST-ONLY host edit): see test_house_sync_src.py
@@ -177,7 +179,7 @@ def main():
                               # furniture sync, reviewed (guest-safety review of da9074a): live apply / reconcile plan / room track (client shadows, range-checked house index),
                               # the client reconcile apply (own house only, no guest claim)
                               "pcnetgame_hcl_live_apply", "pcnetgame_hcl_reconcile_plan", "pcnetgame_hcl_room_track", "pcnetgame_house_client_reconcile_apply",
-                              "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit"]))  # pc_net_game_house_free_list: guest Nook dialogue (M4): loop-bounded i < mHS_HOUSE_NUM read of the LOCAL town copy
+                              "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit"]))  # lifecycle hardening: the residence allocator (pc_residence_check: range-checked house; pcres_house_free: bounds-checked) replaced the open-coded loops of promote_exec / precheck / free_list
     # reviewed guards of the furniture-sync / promote code that subscripts homes[] / private_data[] (a guest can never reach them with an out-of-range index)
     hcl_own = fb("pcnetgame_hcl_own_house")
     prm_idx = fb("pcnetgame_promote_parse_index")
@@ -195,11 +197,11 @@ def main():
                             out.append(f_)
         return sorted(out)
     ck("A furniture sync / promote guards: hcl_own_house returns nothing for a guest (`Now_Private == NULL || s_client_guest_claim_sent`), live_apply range-checks the house index "
-       "(`h < 0 || h >= PC_NETGAME_HOUSE_NUM`), promote_parse_index accepts only a single digit 0..3 (`sel[0] >= '0' && sel[0] <= '3'`), pc_mp_promote_create range-checks the house "
-       "(`house < 0 || house >= PLAYER_NUM`), and the only callers of pc_net_game_dedicated_promote( / pc_net_game_dedicated_give( outside pc_net_game.c are in pc_dedicated.c",
+       "(`h < 0 || h >= PC_NETGAME_HOUSE_NUM`), promote_parse_index accepts only a single digit below PC_RESIDENCE_HOUSES (`sel[0] < (char)('0' + PC_RESIDENCE_HOUSES)`), pc_mp_promote_create range-checks the house "
+       "(`house < 0 || house >= PC_RESIDENCE_HOUSES`), and the only callers of pc_net_game_dedicated_promote( / pc_net_game_dedicated_give( outside pc_net_game.c are in pc_dedicated.c",
        "Now_Private == NULL || s_client_guest_claim_sent" in hcl_own and "h < 0 || h >= PC_NETGAME_HOUSE_NUM" in fb("pcnetgame_hcl_live_apply")
-       and "sel[0] >= '0' && sel[0] <= '3'" in prm_idx and prm_idx != ""
-       and "house < 0 || house >= PLAYER_NUM" in body(mc_raw, mc_fn, "pc_mp_promote_create")
+       and "sel[0] >= '0' && sel[0] < (char)('0' + PC_RESIDENCE_HOUSES)" in prm_idx and prm_idx != ""
+       and "house < 0 || house >= PC_RESIDENCE_HOUSES" in body(mc_raw, mc_fn, "pc_mp_promote_create")
        and other_c_callers("pc_net_game_dedicated_promote") == ["pc_dedicated.c"] and other_c_callers("pc_net_game_dedicated_give") == ["pc_dedicated.c"])
     for name in ("pcnetgame_handle_host_txn_commit", "pcnetgame_x3_grant", "pcnetgame_handle_host_ts_txn", "pcnetgame_rec_process_upload", "pcnetgame_rec_handle_hello",
                  "pcnetgame_rec_start_push", "pcnetgame_txn_send_applied", "pcnetgame_rec_txn_write_inventory", "pcnetgame_rec_txn_write_mail", "pcnetgame_rec_txn_idx_ok",
@@ -350,11 +352,11 @@ def main():
        sorted({n for a, b, n in funcs if "pcnetgame_guest_store_write(" in c[a:b] and n != "pcnetgame_guest_store_write"})
        == sorted(["pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pcnetgame_guest_remint", "pcnetgame_guest_remint_rollback",
                   "pcnetgame_guest_confirm_on_record_step", "pc_net_game_record_after_gci_save", "pc_net_game_dedicated_guest_admin",
-                  "pc_net_game_dedicated_give", "pcnetgame_promote_exec"]))
+                  "pc_net_game_dedicated_give", "pcnetgame_promote_exec", "pcnetgame_guest_drop_promoted"]))  # lifecycle hardening: + the stale-entry removal (resident confirm / sweep)
     give = fb("pc_net_game_dedicated_give")
     prom = fb("pcnetgame_promote_exec")  # the console command pc_net_game_dedicated_promote is a thin wrapper of it
     pord = ["s_guest_untrusted", "pc_mp_guests_backup_file(PC_MP_GUESTS_PATH", "pc_mp_promote_create("]
-    pord2 = ["pcnetgame_members_commit(&nf", "pc_save_write_authoritative()", 'pcnetgame_guest_store_write("guest promoted to a resident")']
+    pord2 = ["pcnetgame_members_commit(&nf", "pc_save_write_authoritative_durable()", 'pcnetgame_guest_store_write("guest promoted to a resident")']  # lifecycle hardening (B3a): the DURABLE variant (FALSE unless the GCI was really written)
     ck("P the two further guests.dat writers are guarded: dedicated_give refuses a guest while UNTRUSTED (`if (is_guest && s_guest_untrusted) {`) BEFORE the inventory write and its failure path "
        "says the gift was rolled back; dedicated_promote refuses while UNTRUSTED, THEN backs guests.dat up, THEN creates the resident, and commits in the order members.dat -> authoritative "
        "save -> guest store write",
