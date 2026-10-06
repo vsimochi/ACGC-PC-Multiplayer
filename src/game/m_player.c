@@ -1483,6 +1483,8 @@ static void Player_actor_main_Demo_get_golden_axe_wait(ACTOR*, GAME*);
         return slot;
     }
 
+    extern int pc_tool_wheel_take_request(int* slot);
+
     #define IS_CUSTOM_UMBRELLA(item) ((item) >= ITM_MY_ORG_UMBRELLA0 && (item) <= ITM_MY_ORG_UMBRELLA7)
 
     /* next slot the cycle search starts from; after a putaway, the slot holding the put-away tool */
@@ -1569,10 +1571,36 @@ static void Player_actor_main_Demo_get_golden_axe_wait(ACTOR*, GAME*);
         Player_actor_request_main_putin_item(game, 0x25);
     }
 
+    /* radial tool wheel (pc_tool_wheel.c): equip the chosen POCKET slot through the same takeout path as the D-pad cycle */
+    static void TrySelectToolSlot(GAME* game, int slot) {
+        Private_c* priv = Common_Get(now_private);
+        mActor_name_t held_item = priv->equipment;
+        mActor_name_t slot_item;
+
+        if (slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT) {
+            return;
+        }
+        slot_item = priv->inventory.pockets[slot];
+        if (mPr_GET_ITEM_COND(priv->inventory.item_conditions, slot) != mPr_ITEM_COND_NORMAL || !ITEM_IS_TOOL(slot_item)) {
+            return; /* the pockets changed since the wheel was built */
+        }
+        if (held_item != EMPTY_NO && !IS_CUSTOM_UMBRELLA(held_item)) {
+            mPr_SetPossessionItem(priv, slot, held_item, 0);
+        } else {
+            mPr_SetPossessionItem(priv, slot, EMPTY_NO, 0);
+        }
+        priv->equipment = slot_item;
+        last_tool_slot = WrapToolSlot(slot + 1);
+        last_direction = 1;
+        Player_actor_request_main_takeout_item(game, mPlayer_REQUEST_PRIORITY_37);
+    }
+
     static void Player_actor_check_and_switch_tool(GAME* game) {
         GAME_PLAY* play = (GAME_PLAY*)game;
         PLAYER_ACTOR* player;
         int main_index;
+        int wheel_slot = -1;
+        int wheel_req = pc_tool_wheel_take_request(&wheel_slot); /* always taken: a request never outlives the frame it is made in */
 
         /* outdoors only, and not while a submenu is open or opening */
         if (mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELDTYPE2_FG ||
@@ -1594,6 +1622,15 @@ static void Player_actor_main_Demo_get_golden_axe_wait(ACTOR*, GAME*);
             return;
         }
         if (Player_actor_Check_is_demo_mode(player->requested_main_index) != 0) {
+            return;
+        }
+
+        if (wheel_req == 1) {
+            TrySelectToolSlot(game, wheel_slot);
+            return;
+        }
+        if (wheel_req == 2) {
+            TryPutawayTool(game);
             return;
         }
 

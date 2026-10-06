@@ -55,6 +55,9 @@ typedef struct {
     PCInputCode dpad_down;
     PCInputCode dpad_left;
     PCInputCode dpad_right;
+
+    /* PC radial tool wheel: hold to open (mouse selects), release to equip */
+    PCInputCode wheel;
 } PCKeybindings;
 
 /* Gamepad button bindings. Sticks are hardwired to the analog sticks
@@ -72,6 +75,9 @@ typedef struct {
     PCPadCode dpad_down;
     PCPadCode dpad_left;
     PCPadCode dpad_right;
+
+    /* PC radial tool wheel: hold to open (right stick selects), release to equip */
+    PCPadCode wheel;
 } PCPadBindings;
 
 extern PCKeybindings  g_pc_keybindings;

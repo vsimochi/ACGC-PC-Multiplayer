@@ -29,6 +29,9 @@ static const PCKeybindings s_kb_defaults = {
     .dpad_down  = SDL_SCANCODE_K,
     .dpad_left  = SDL_SCANCODE_J,
     .dpad_right = SDL_SCANCODE_L,
+
+    /* radial tool wheel (hold) */
+    .wheel = SDL_SCANCODE_G,
 };
 
 /* Back/Select is reserved for opening the PC pause menu, so it is not a
@@ -46,6 +49,7 @@ static const PCPadBindings s_pad_defaults = {
     .dpad_down  = SDL_CONTROLLER_BUTTON_DPAD_DOWN,
     .dpad_left  = SDL_CONTROLLER_BUTTON_DPAD_LEFT,
     .dpad_right = SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+    .wheel      = SDL_CONTROLLER_BUTTON_LEFTSHOULDER, /* radial tool wheel (hold) */
 };
 
 PCKeybindings g_pc_keybindings;
@@ -82,6 +86,7 @@ static const KeybindEntry s_entries[] = {
     KB_ENTRY("DPad_Down",    dpad_down),
     KB_ENTRY("DPad_Left",    dpad_left),
     KB_ENTRY("DPad_Right",   dpad_right),
+    KB_ENTRY("Wheel",        wheel),
 };
 
 #define NUM_ENTRIES (sizeof(s_entries) / sizeof(s_entries[0]))
@@ -102,6 +107,7 @@ static const KeybindEntry s_pad_entries[] = {
     PAD_ENTRY("Pad_DPad_Down",  dpad_down),
     PAD_ENTRY("Pad_DPad_Left",  dpad_left),
     PAD_ENTRY("Pad_DPad_Right", dpad_right),
+    PAD_ENTRY("Pad_Wheel",      wheel),
 };
 
 #define NUM_PAD_ENTRIES (sizeof(s_pad_entries) / sizeof(s_pad_entries[0]))

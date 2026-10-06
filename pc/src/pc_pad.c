@@ -52,11 +52,15 @@ BOOL PADInit(void) {
     return TRUE;
 }
 
+#include "pc_tool_wheel.h"
+
 u32 PADRead(PADStatus* status) {
     memset(status, 0, sizeof(PADStatus) * 4);
 
     const u8* keys = SDL_GetKeyboardState(NULL);
-    u32 mouse = SDL_GetMouseState(NULL, NULL);
+    int mouse_x = 0, mouse_y = 0;
+    u32 mouse = SDL_GetMouseState(&mouse_x, &mouse_y);
+    int wheel_kb = 0, wheel_pad = 0, wheel_rx = 0, wheel_ry = 0;
     u16 buttons = 0;
     s8 stickX = 0, stickY = 0;
     s8 cstickX = 0, cstickY = 0;
@@ -91,6 +95,8 @@ u32 PADRead(PADStatus* status) {
         if (INPUT_PRESSED(kb->cstick_down))  cstickY -= STICK_MAGNITUDE;
         if (INPUT_PRESSED(kb->cstick_left))  cstickX -= STICK_MAGNITUDE;
         if (INPUT_PRESSED(kb->cstick_right)) cstickX += STICK_MAGNITUDE;
+
+        wheel_kb = INPUT_PRESSED(kb->wheel) ? 1 : 0;
 
         /* D-pad */
         if (INPUT_PRESSED(kb->dpad_up))    buttons |= PAD_BUTTON_UP;
@@ -150,6 +156,9 @@ u32 PADRead(PADStatus* status) {
 
         s16 rx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX);
         s16 ry = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY);
+        wheel_pad = pad_code_pressed(pb->wheel) ? 1 : 0;
+        wheel_rx = rx;
+        wheel_ry = ry;
         if (abs(rx) > cstick_dz) {
             int srx = rx >> 8;
             if (srx > 127) srx = 127; else if (srx < -128) srx = -128;
@@ -164,6 +173,8 @@ u32 PADRead(PADStatus* status) {
         status[0].triggerLeft  = pad_trigger_value(pb->l);
         status[0].triggerRight = pad_trigger_value(pb->r);
     }
+
+    pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
 
     if (pc_host_observer_active()) {
         /* --host-observer: the hidden observer is NOT controllable. Every keyboard / mouse / gamepad input is dropped here, the single place the

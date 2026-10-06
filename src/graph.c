@@ -30,6 +30,7 @@
 #include "pc_diag.h"
 #include "pc_platform.h"
 #include "pc_pause_menu.h"
+#include "pc_tool_wheel.h"
 #include "pc_profiler.h"
 /* Local extern matching the atomic_int definition in pc/src/pc_main.c (see pc_platform.h for the
  * full rationale). This TARGET_PC-only block above already includes pc_platform.h (for other PC
@@ -397,6 +398,7 @@ static void graph_main(GRAPH* this, GAME* game) {
     PC_DIAG(10, "graph_main: game_main returned, frame_counter=%d\n", this->frame_counter);
 #ifdef TARGET_PC
     pc_pause_menu_draw(game);
+    pc_tool_wheel_draw(game); /* PC radial tool menu (local UI only) */
     pc_net_notice_draw(game); /* batch A (A3): CLIENT "not connected" notice (no-op for host / solo / READY / paused) */
 #endif
     GRAPH_SET_DOING_POINT(this, GAME_MAIN_FINISHED);
