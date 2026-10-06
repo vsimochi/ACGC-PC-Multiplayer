@@ -1479,3 +1479,9 @@ dropped and logged -- never a silent overwrite). Nothing is uploaded before the 
 Tests: `test_town_pages_protocol.py` (21/21, scripted clients: initial state, apply, mirror, stale, race, invalid, independent pages, late join, reconnect, guest, host restart), `test_town_pages_real.py`
 (8/8, real host + real client: the client's real dirty scan uploads its edit, the host applies it; the host's own edit is adopted by the real client). Not verified in the UI (Able Sisters / notice board screens).
 Known limit: game logic that auto-writes a notice post locally on a client (day-change events) is detected as an edit and loses to the host's copy when stale.
+
+## Collections - ownership decision (no code change)
+
+`Private_c` is the CHARACTER record: the catalog bitfields (`furniture/wall/carpet/paper/music_collected_bitfield`), `aircheck_collect_bitfield` (K.K. songs), `my_org` (the character's own designs) and the fish / insect acknowledgement flags
+(`complete_fish_insect_flags`) are per character in the vanilla game too, so they stay CHARACTER-owned (client-owned ranges of the D3 record, stored by the host). Town-wide collection state is the museum
+(`museum_record`, host-owned since milestone R) and the museum-completion letter bits (host-owned bits, Patch 6). Nothing was moved to the host to make a table greener.
