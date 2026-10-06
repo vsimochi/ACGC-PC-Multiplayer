@@ -216,8 +216,8 @@ def main():
        "g_pc_running" not in func_body(ded_c, "pc_dedicated_console_poll").split("s_stdin_eof && !s_stdin_eof_reported", 1)[1])
     ck("C4 the reader is DETACHED and never joined (CloseHandle on the thread handle / pthread_detach; no WaitForSingleObject / pthread_join / SDL_WaitThread in the module)",
        "CloseHandle((HANDLE)th); /* detach */" in ded_c and "pthread_detach(t);" in ded_c and not re.search(r"WaitForSingleObject|pthread_join|SDL_WaitThread|SDL_CreateThread", strip_comments(ded_c)))
-    ck("C5 commands run only on the main thread: pc_dedicated_console_poll is called from pc_vi.c under `if (g_pc_dedicated)` right after pc_net_game_poll()",
-       re.search(r"pc_net_game_poll\(\);\s*(?:/\*.*?\*/\s*)?if \(g_pc_dedicated\) \{\s*pc_dedicated_console_poll\(\);\s*\}", vw, re.S) is not None and vi_c.count("pc_dedicated_console_poll();") == 1)
+    ck("C5 commands run only on the main thread: pc_dedicated_console_poll is called from pc_vi.c under `if (g_pc_dedicated)` right after pc_net_game_poll() (a later, unrelated one-shot poll block such as pc_main_relaunch_poll may sit between them)",
+       re.search(r"pc_net_game_poll\(\);\s*(?:\{[^{}]*\}\s*)?(?:/\*.*?\*/\s*)?if \(g_pc_dedicated\) \{\s*pc_dedicated_console_poll\(\);\s*\}", vw, re.S) is not None and vi_c.count("pc_dedicated_console_poll();") == 1)
     cmds = func_body(ded_c, "pc_ded_execute")
     ck("C6 command set: help, status, players, save, stop (+ quit / exit aliases), unknown -> 'unknown command: X (type help)'; case-insensitive (tolower)",
        all('strcmp(cmd, "%s") == 0' % c in cmds for c in ("help", "status", "players", "save", "stop", "quit", "exit")) and "unknown command: %s (type help)" in cmds and "tolower" in cmds)
@@ -277,8 +277,8 @@ def main():
  * (optional) = 1 for the non-final \"no answer from the host yet, still trying\" kind. Drawn by pc_net_notice_draw(); also logged ([NET][JOIN]) and on stderr. */
 const char* pc_net_game_join_message(int* is_warning);
 """
-    ck("P1 pc/include/pc_net_game.h (the wire header) is byte-identical to HEAD apart from the ONE pinned G6.1 function declaration (no typedef / define touched): the dedicated accessor struct / prototypes live in pc_dedicated.h",
-       read("pc/include/pc_net_game.h").replace(g61, "", 1) == head("pc/include/pc_net_game.h")
+    ck("P1 pc/include/pc_net_game.h (the wire header) is NOT touched by the dedicated feature commit (FEATURE_REF vs BASELINE_REF: no hunk; later features may add to it, they are audited elsewhere): the dedicated accessor struct / prototypes live in pc_dedicated.h",
+       hunks("pc/include/pc_net_game.h") == []
        and "typedef struct PCNetGameDedicatedPeerInfo {" in ded_h and "int  pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out);" in ded_h)
     ck("W6 frame pacing: dedicated defaults to the 60 Hz tick (g_pc_frame_limit_override = 60 only when no --framelimit / --no-framelimit was given), inside the dedicated block, after the observer flag",
        blk.index("if (g_pc_frame_limit_override < 0) {") > blk.index("g_pc_host_observer = 1;") and "g_pc_frame_limit_override = 60;" in blk and blk.count("g_pc_frame_limit_override") == 2)

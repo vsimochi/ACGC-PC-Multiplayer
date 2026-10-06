@@ -40,9 +40,9 @@ if __name__ == "__main__":
 import net_spike_lib as L  # noqa: E402
 
 HOST_DIR = L.GAME_BIN_DIR
-HOST_GCI = os.path.join(HOST_DIR, L.SAVE_GCI_REL)
+HOST_GCI = os.path.join(HOST_DIR, L.SAVE_GCI_REL)  # the legacy FIXTURE file (seeds the dedicated server town on its first launch); runtime reads use L.host_gci(HOST_DIR)
 EXE = os.path.join(CLIENT_DIR, "AnimalCrossing.exe")
-MEMBERS = os.path.join(HOST_DIR, "save", "mp", "members.dat")
+MEMBERS = L.server_file("members.dat", HOST_DIR)  # the DEDICATED host's resident credentials: servers/default/residents/members.dat
 LEGACY_TOK = os.path.join(LEGACY_DIR, "save", "mp", "resident_token.dat")
 INI = "name = %s\ngender = 0\nface = 3\nhome_town = GuestVil\nplayer_id = %s\nland_id = 0x4321\n"
 RES_PAT = r'slot 1: name="[^"]*" credential=(\w+) confirmed=(\S+) armed=(\w+) connected=(\w+)'
@@ -50,7 +50,7 @@ NO_TOKEN = "resident 1 has a credential and the claim presented NO token"
 
 
 def pid_hex(slot):
-    with open(HOST_GCI, "rb") as f:
+    with open(L.host_gci(HOST_DIR), "rb") as f:
         f.seek(L._GCI_PRIVATE_BASE + slot * L._GCI_PRIVATE_STRIDE)
         return f.read(20).hex()
 
@@ -153,7 +153,7 @@ def run(port, results):
         return ct, ht
 
     try:
-        shutil.rmtree(os.path.join(HOST_DIR, "save", "mp"), ignore_errors=True)
+        L.server_wipe_sidecars(HOST_DIR)
         os.makedirs(mp, exist_ok=True)
         with open(os.path.join(mp, "servers.ini"), "w", newline="") as f:
             f.write("[server]\nname = redgesrv\naddress = 127.0.0.1\nport = %d\n" % port)

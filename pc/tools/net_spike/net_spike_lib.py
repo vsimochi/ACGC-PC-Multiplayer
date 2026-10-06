@@ -3878,6 +3878,54 @@ class CloneSaveGuard:
 # 0x26000, private_data[4] at +0x20, stride 0x2440 (Private_c), PersonalID_c first (name[8], land[8], BE u16 player_id,
 # BE u16 land_id), Private_c.exists at +0x1086. Wire constants are untouched.
 SAVE_GCI_REL = os.path.join("save", "card_a", "DobutsunomoriP_MURA.gci")
+
+
+# --- the DEDICATED server's own storage tree (b97341c): servers/<id>/ ... A dedicated host keeps its town and its host-owned files there, NOT in save/card_a + save/mp.
+# server_file(name) maps a host file name to its place; host_gci() is the town GCI a dedicated host loads / saves (the server copy once the server exists, else the legacy
+# save/card_a file a first launch adopts by copy).
+SERVER_ID = "default"
+_SERVER_SUBDIR = (("guests.dat", "citizens"), ("members.dat", "residents"), ("records.dat", "residents"))
+
+
+def server_dir(bin_dir=None):
+    return os.path.join(bin_dir or GAME_BIN_DIR, "servers", SERVER_ID)
+
+
+def server_file(name, bin_dir=None):
+    for prefix, sub in _SERVER_SUBDIR:
+        if name.startswith(prefix):
+            return os.path.join(server_dir(bin_dir), sub, name)
+    return os.path.join(server_dir(bin_dir), name)
+
+
+def server_glob(pattern, bin_dir=None):
+    import glob as _glob
+    out = []
+    for sub in ("citizens", "residents", ""):
+        out += _glob.glob(os.path.join(server_dir(bin_dir), sub, pattern))
+    return sorted(out)
+
+
+def server_gci(bin_dir=None):
+    return os.path.join(server_dir(bin_dir), "town", "card_a", "DobutsunomoriP_MURA.gci")
+
+
+def host_gci(bin_dir=None):
+    p = server_gci(bin_dir)
+    return p if os.path.isfile(p) else os.path.join(bin_dir or GAME_BIN_DIR, SAVE_GCI_REL)
+
+
+def server_wipe_sidecars(bin_dir=None):
+    """The dedicated equivalent of the old `rmtree(save/mp)` of a disposable host dir: removes the host-owned FILES (guest table, resident credentials, record lineage, backups,
+    restock state) and keeps the town and server.ini."""
+    import shutil as _shutil
+    for sub in ("citizens", "residents"):
+        _shutil.rmtree(os.path.join(server_dir(bin_dir), sub), ignore_errors=True)
+        os.makedirs(os.path.join(server_dir(bin_dir), sub), exist_ok=True)
+    try:
+        os.remove(os.path.join(server_dir(bin_dir), "shop_restock.ini"))
+    except OSError:
+        pass
 _GCI_PRIVATE_BASE = 0x40 + 0x26000 + 0x20
 _GCI_PRIVATE_STRIDE = 0x2440
 _GCI_PRIVATE_EXISTS = 0x1086

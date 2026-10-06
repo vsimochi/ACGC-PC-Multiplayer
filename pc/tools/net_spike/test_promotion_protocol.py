@@ -135,11 +135,11 @@ ARRANGEMENT_OFF = MF.MAIN_OFF + 0x2068A
 
 
 def mp_dir():
-    return os.path.join(L.GAME_BIN_DIR, "save", "mp")
+    return L.server_dir()  # a DEDICATED host's own tree (servers/default/), not save/mp
 
 
 def mpath(n):
-    return os.path.join(mp_dir(), n)
+    return L.server_file(n)
 
 
 def raw(path):
@@ -358,7 +358,7 @@ def source_audit(rig):
     mc = open(os.path.join(T.PC, "src", "pc_m_card.c"), encoding="utf-8", errors="replace").read()
     pf = ng[ng.index("int pc_net_game_dedicated_promote("):ng.index("/* ===== M-F END ===== */")]
     ck("S promote order: members.dat commit BEFORE the town save, the town save BEFORE the guests.dat entry removal (the entry goes LAST)",
-       pf.index("pcnetgame_members_commit(&nf, \"guest promotion: resident credential + handoff\")") < pf.index("pc_save_write_authoritative()") < pf.index("memset(&s_guest[g], 0, sizeof(s_guest[g]));"))
+       pf.index("pcnetgame_members_commit(&nf, \"guest promotion: resident credential + handoff\")") < pf.index("pc_save_write_authoritative_durable()") < pf.index("memset(&s_guest[g], 0, sizeof(s_guest[g]));"))
     ck("S promote checks first: world ready, guests.dat / members.dat trusted, ONE guest of this town, offline, synced record, slot, house, unique name, members room, THEN `confirm`, THEN backups",
        [pf.index(x) for x in ("!s_host_world_ready", "s_guest_untrusted", "s_members_untrusted", "pcnetgame_dedicated_guest_resolve(", "pcnetgame_host_peer_bound_to_guest(g",
                               "has never synced", "the town is FULL", "already has an owner", "already has the name", "has no room for 2 entries", "if (!confirm) {",
@@ -470,7 +470,7 @@ def phase1(rig, args, ctx):
         ck("P1 two guests stored with a synced record (rev >= 1)", len(ents) == 2 and all(e["rev"] >= 1 for e in ents))
         ck("P1 before any promotion: no members.dat (policy off never creates it)", not os.path.exists(mpath("members.dat")))
         pre = {"g": raw(mpath("guests.dat")), "r": md5_or_none(mpath("records.dat"))}
-        baks0 = sorted(glob.glob(mpath("*.bak-*")))
+        baks0 = sorted(L.server_glob("*.bak-*"))
         # ---- guard failures: nothing changes
         o1 = say(h, "promote PROMOGST auto auto confirm")
         ck("P1 an ONLINE guest is refused ('is connected on peer')", "promote: refused: guest slot" in o1 and "is connected on peer" in o1)
@@ -489,7 +489,7 @@ def phase1(rig, args, ctx):
         ck("P1 extra / unknown trailing words are refused ('expected exactly')", "expected exactly" in o7 and "expected exactly" in o8)
         ck("P1 ... none of the guards changed anything: guests.dat byte-identical, no members.dat, records.dat unchanged, no backup file, no 'promoting' log line",
            raw(mpath("guests.dat")) == pre["g"] and not os.path.exists(mpath("members.dat")) and md5_or_none(mpath("records.dat")) == pre["r"]
-           and sorted(glob.glob(mpath("*.bak-*"))) == baks0 and "ADMIN: promoting" not in h.log_text())
+           and sorted(L.server_glob("*.bak-*")) == baks0 and "ADMIN: promoting" not in h.log_text())
         rig.release(a)
         L.pump_sleep(2.5)
         # ---- the promotion
@@ -497,12 +497,12 @@ def phase1(rig, args, ctx):
         pre_r = md5_or_none(mpath("records.dat"))
         out = say(h, "promote PROMOGST auto auto confirm", timeout=25.0, settle=2.0)
         ck("P1 promote: 'PROMOTED to RESIDENT slot 3, house 3' and the [NET][PROMOTE] ADMIN line", "promote: guest slot" in out and 'PROMOTED to RESIDENT slot 3, house 3' in out and "[NET][PROMOTE] ADMIN: guest slot" in out)
-        gbak = sorted(glob.glob(mpath("guests.dat.bak-*")))
+        gbak = sorted(L.server_glob("guests.dat.bak-*"))
         ck("P1 guests.dat was backed up first: exactly one guests.dat.bak-<ts>, BYTE-IDENTICAL to the pre-image", len(gbak) == 1 and raw(gbak[0]) == pre_g)
         if pre_r is not None:
-            rbak = sorted(glob.glob(mpath("records.dat.bak-*")))
+            rbak = sorted(L.server_glob("records.dat.bak-*"))
             ck("P1 records.dat was backed up first (it existed): identical to the pre-image", len(rbak) == 1 and T.md5_file(rbak[0]) == pre_r)
-        ck("P1 members.dat did not exist: no backup of it", not glob.glob(mpath("members.dat.bak-*")))
+        ck("P1 members.dat did not exist: no backup of it", not L.server_glob("members.dat.bak-*"))
         ents = parse_guests(mpath("guests.dat"))
         pidA = L.guest_pid_be(gA)
         ck("P1 A's guests.dat entry is REMOVED (last), B's entry is still there", len(ents) == 1 and ents[0]["pid"] == L.guest_pid_be(gB) and all(e["pid"] != pidA for e in ents))
@@ -557,7 +557,7 @@ def phase1(rig, args, ctx):
         code = rig.stop(h)
         ck("P1 graceful stop (exit 0)", code == 0)
     # ---- the saved GCI
-    gci = raw(os.path.join(L.GAME_BIN_DIR, MF.GCI_REL))
+    gci = raw(L.host_gci())
     orig = ctx["orig_gci"]
     npid = ctx.get("npid")
     p3 = gci_priv(gci, 3)
@@ -688,7 +688,7 @@ def run(args, results):
     gB = L.guest_identity("OTHERGST", 0x4A12, "HOMETWN", 0x5B11)
     recA = bytes(L.fresh_guest_record_for(gA, gender=1, face=ctx["face"]))
     ctx.update(gA=gA, gB=gB, recA=recA, recB=bytes(L.fresh_guest_record_for(gB)))
-    shutil.rmtree(mp_dir(), ignore_errors=True)  # the disposable fixture only
+    L.server_wipe_sidecars()  # the disposable fixture only
     source_audit(rig)
     source_audit_mi(rig)
     for name, fn in (("P0", phase0), ("P1", phase1), ("P2", phase2), ("P3", phase3)):

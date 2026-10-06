@@ -86,15 +86,15 @@ EQUIP_NET = 0x2200  # ITM_NET == ITM_TOOL_START
 
 
 def mp_dir():
-    return os.path.join(L.GAME_BIN_DIR, "save", "mp")
+    return L.server_dir()  # a DEDICATED host's own tree (servers/default/), not save/mp
 
 
 def mpath(n):
-    return os.path.join(mp_dir(), n)
+    return L.server_file(n)
 
 
 def gci_path():
-    return os.path.join(L.GAME_BIN_DIR, MF.GCI_REL)
+    return L.host_gci()  # the dedicated server's town once it exists, else the legacy fixture file a first launch adopts
 
 
 def raw(path):
@@ -557,7 +557,7 @@ def s2_final(rig, ctx):
 def run_s2(rig, args):
     ctx = {}
     fresh_fixture()
-    shutil.rmtree(mp_dir(), ignore_errors=True)
+    L.server_wipe_sidecars()
     if not setup_s2(rig, ctx, args.port):
         return
     phase_no_durable(rig, ctx, args.port + 1)
@@ -569,7 +569,7 @@ def run_s2(rig, args):
 def join_two(rig, tag, port, names, wallet=25000):
     """Fresh fixture + P0 for the given guest names; returns ({key: identity}, {key: token}). The stored records are patched to `wallet`."""
     fresh_fixture()
-    shutil.rmtree(mp_dir(), ignore_errors=True)
+    L.server_wipe_sidecars()
     gs, toks = {}, {}
     h, ok = rig.start(tag + "p0", port)
     if not ok:

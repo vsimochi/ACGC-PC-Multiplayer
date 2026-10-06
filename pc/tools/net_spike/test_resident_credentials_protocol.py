@@ -54,11 +54,11 @@ MBR_SIZE = 32 + 16 * 80 + 4
 
 
 def mp_dir():
-    return os.path.join(L.GAME_BIN_DIR, "save", "mp")
+    return L.server_dir()  # a DEDICATED host's own tree (servers/default/), not save/mp
 
 
 def members_path():
-    return os.path.join(mp_dir(), "members.dat")
+    return L.server_file("members.dat")
 
 
 def parse_members(path):
@@ -197,7 +197,7 @@ def p1(rig, args):
         ck("P1 [off] host log: bound to resident 1 / 2 (host-derived), the claim was cached and ignored", "bound to resident 1 (host-derived)" in t and "bound to resident 2 (host-derived)" in t
            and "IDENTITY_EXT cached (resident claim" in t)
         ck("P1 [off] host log: NO [NET][RESIDENT] host line, no members file load, no credential line", "[NET][RESIDENT]" not in t)
-        ck("P1 [off] save/mp/members.dat does not exist (the file is never read or written under off)", not os.path.exists(members_path()))
+        ck("P1 [off] members.dat does not exist (servers/default/residents) (the file is never read or written under off)", not os.path.exists(members_path()))
         out = say(h, "residents")
         ck("P1 [off] `residents` lists slots 1 and 2 as connected, resident_tokens=off, credential=no", "resident_tokens=off" in out and re.search(r"slot 1: .* credential=no .* connected=yes", out) is not None
            and re.search(r"slot 2: .* credential=no .* connected=yes", out) is not None)
@@ -211,7 +211,7 @@ def p1(rig, args):
         if cg is not None:
             rig.guest_token = bytes(cg.guest_token) if cg.guest_token else bytes(tok_msgs(cg)[0].token)
         rig.release(cg)
-        ck("P1 [off] guests.dat exists (the guest was minted), members.dat still does not", os.path.exists(os.path.join(mp_dir(), "guests.dat")) and not os.path.exists(members_path()))
+        ck("P1 [off] guests.dat exists (the guest was minted), members.dat still does not", os.path.exists(L.server_file("guests.dat")) and not os.path.exists(members_path()))
         rc = rig.stop(h)
         ck("P1 `stop` exits 0", rc == 0)
     finally:
@@ -227,7 +227,7 @@ def p2(rig, args):
     tok1 = None
     try:
         t0 = len(h.log_text())
-        ck("P2 [tofu] host log: the members file was loaded at world ready (MISSING, resident_tokens=tofu)", "members file 'save/mp/members.dat' load mode=MISSING" in h.log_text()
+        ck("P2 [tofu] host log: the members file was loaded at world ready (MISSING, resident_tokens=tofu)", "members file 'servers/default/residents/members.dat' load mode=MISSING" in h.log_text()
            and "resident_tokens=tofu" in h.log_text())
         # --- first claim: mint
         c1, rj = rig.attempt("p2-r1-first", slot=1, claim=True)
@@ -360,7 +360,7 @@ def p3(rig, args):
 def p4(rig, args):
     ck = rig.ck
     # fresh members state (the disposable fixture only): remove the file and its generations / backups
-    for f in glob.glob(os.path.join(mp_dir(), "members.dat*")):
+    for f in glob.glob(members_path() + "*"):
         os.remove(f)
     h, ok = rig.start("p4", args.port + 3, ["--resident-tokens", "required"])
     if not ok:
@@ -411,7 +411,7 @@ def p4(rig, args):
 
 def p56(rig, args):
     ck = rig.ck
-    for f in glob.glob(os.path.join(mp_dir(), "members.dat*")):
+    for f in glob.glob(members_path() + "*"):
         os.remove(f)
     garbage = b"THIS IS NOT A MEMBERS FILE" * 3
     with open(members_path(), "wb") as f:
@@ -454,20 +454,20 @@ def p56(rig, args):
 
 def p7(rig, args):
     ck = rig.ck
-    for f in glob.glob(os.path.join(mp_dir(), "members.dat*")):
+    for f in glob.glob(members_path() + "*"):
         os.remove(f)
     h, ok = rig.start("p7", args.port + 6, ["--allow-new-guests", "0"])
     if not ok:
         return
     try:
         gB = L.guest_identity("GUESTB", 0x4A02)
-        before = raw(os.path.join(mp_dir(), "guests.dat"))
+        before = raw(L.server_file("guests.dat"))
         t0 = len(h.log_text())
         c, rj = rig.attempt("p7-newguest", guest=gB)
         ck("P7 [allow_new_guests=0] a NEW guest key is REFUSED with reason 2 SERVER_FULL (8-byte form)", c is None and rj is not None and rj.reason == FULL)
         tl = h.log_text()[t0:]
         ck("P7 host log: 'new guest key refused (allow_new_guests=0' and the REFUSED line", "new guest key refused (allow_new_guests=0" in tl and "new guests are not accepted on this host" in tl)
-        ck("P7 guests.dat is byte-identical (nothing minted / created for the refused key)", raw(os.path.join(mp_dir(), "guests.dat")) == before)
+        ck("P7 guests.dat is byte-identical (nothing minted / created for the refused key)", raw(L.server_file("guests.dat")) == before)
         gA = L.guest_identity("GUESTA", 0x4A01)
         cg, rj = rig.attempt("p7-knownguest", guest=gA, token=rig.guest_token)
         tm = tok_msgs(cg) if cg else []
@@ -523,7 +523,7 @@ def run(args, results):
     rig = Rig(results, log_dir)
     rig.guest_token = None
     rig.tok1 = None
-    shutil.rmtree(mp_dir(), ignore_errors=True)  # the disposable fixture only
+    L.server_wipe_sidecars()  # the disposable fixture only
     source_audit(rig)
     p1(rig, args)
     p2(rig, args)

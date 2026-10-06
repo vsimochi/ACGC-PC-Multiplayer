@@ -44,11 +44,11 @@ SVC_SHOP, SVC_HOSTCFG = 3, 4
 
 
 def mp_dir():
-    return os.path.join(L.GAME_BIN_DIR, "save", "mp")
+    return L.server_dir()  # a DEDICATED host's own tree (servers/default/), not save/mp
 
 
 def mpath(n):
-    return os.path.join(mp_dir(), n)
+    return L.server_file(n)
 
 
 def raw(path):
@@ -391,7 +391,7 @@ def run(args, results):
     for k, (n, pid) in names.items():
         ctx["g"][k] = L.guest_identity(n, pid, "HOMETWN", 0x5B21)
         ctx["rec"][k] = bytes(L.fresh_guest_record_for(ctx["g"][k]))
-    shutil.rmtree(mp_dir(), ignore_errors=True)  # the disposable fixture only
+    L.server_wipe_sidecars()  # the disposable fixture only
     source_audit(rig)
     for name, fn in (("P0", phase0), ("P1", phase1), ("P2", phase2)):
         try:

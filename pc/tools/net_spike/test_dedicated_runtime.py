@@ -248,8 +248,8 @@ def run(args, results):
             check("A the puppet of the connected resident is LIVE in the (hidden, not drawn) world", puppet == "live")
 
         # --- console save: the same authoritative path; result only after it ran
-        gci_m0 = os.path.getmtime(gci_path)
-        rec_path = os.path.join(save_dir, "mp", "records.dat")
+        gci_m0 = os.path.getmtime(L.host_gci())  # a DEDICATED host saves into servers/default/town/card_a (the legacy fixture file only seeds it)
+        rec_path = L.server_file("records.dat")
         rec_m0 = os.path.getmtime(rec_path) if os.path.isfile(rec_path) else None
         time.sleep(1.1)
         off = len(h.log_text())
@@ -258,9 +258,9 @@ def run(args, results):
         seg = h.log_text()[off:]
         check("A console `save`: 'save: OK' (after the write; the request line 'save: requested' came first)", mo is not None and mo.group(1) == "OK"
               and seg.index("save: requested") < seg.index("save result: OK") < seg.index("save: OK"))
-        check("A the GCI mtime advanced (a real authoritative save ran)", os.path.getmtime(gci_path) > gci_m0)
+        check("A the GCI mtime advanced (a real authoritative save ran)", os.path.getmtime(L.host_gci()) > gci_m0)
         rec_m1 = os.path.getmtime(rec_path) if os.path.isfile(rec_path) else None
-        check("A the records sidecar hook ran with that save (save/mp/records.dat exists%s)" % (" and its mtime advanced" if rec_m0 is not None else ""),
+        check("A the records sidecar hook ran with that save (servers/default/residents/records.dat exists%s)" % (" and its mtime advanced" if rec_m0 is not None else ""),
               rec_m1 is not None and (rec_m0 is None or rec_m1 > rec_m0))
         check("A the save-result notice states the result once per save ('[DEDICATED] save result: OK')", len(re.findall(r"\[DEDICATED\] save result: OK", seg)) == 1)
 
@@ -300,7 +300,7 @@ def run(args, results):
         check("A CTRL_BREAK_EVENT (own process group, console attached by the game): graceful exit code 0 within 30 s", sent and code == 0)
         check("A the Ctrl+Break shutdown ran the normal path ONCE: 'shutdown: final save OK' x1, 'shutdown: complete', 'shutting down networking'",
               len(re.findall(r"\[DEDICATED\] shutdown: final save OK", txt)) == 1 and "[DEDICATED] shutdown: complete" in txt and "[NET] shutting down networking (was host)" in txt)
-        post = gci_bytes(gci_path)
+        post = gci_bytes(L.host_gci())
         check("A the GCI is valid after the Ctrl+Break shutdown (size unchanged, residents 0..3 byte-identical: no-op client sessions)", len(post) == len(pre)
               and all(L.record_from_gci(post, i) == pre_recs[i] for i in range(4)))
         del before
@@ -355,7 +355,7 @@ def run(args, results):
         check("B the shutdown save ran exactly ONCE (1 'final shutdown save OK' via OSReport, 1 'shutdown: final save OK', 1 'save result' after stop)",
               seg.count("final shutdown save OK") == 1 and seg.count("[DEDICATED] shutdown: final save OK") == 1 and seg.count("[DEDICATED] save result:") == 1
               and "final shutdown save FAILED" not in seg)
-        post = gci_bytes(gci_path)
+        post = gci_bytes(L.host_gci())
         check("B the GCI is valid and residents 0..3 are BYTE-IDENTICAL after the dedicated host's shutdown save", len(post) == len(pre)
               and all(L.record_from_gci(post, i) == pre_recs[i] for i in range(4)))
     finally:

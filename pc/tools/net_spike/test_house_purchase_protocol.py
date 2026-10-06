@@ -74,11 +74,11 @@ MSG_TXN_RESULT = L.PC_NETGAME_MSG_TXN_RESULT
 
 
 def mp_dir():
-    return os.path.join(L.GAME_BIN_DIR, "save", "mp")
+    return L.server_dir()  # a DEDICATED host's own tree (servers/default/), not save/mp
 
 
 def mpath(n):
-    return os.path.join(mp_dir(), n)
+    return L.server_file(n)
 
 
 def raw(path):
@@ -273,7 +273,7 @@ def gci_home(gci, i):
 def snap():
     """Everything a refused purchase must leave byte-identical on disk."""
     return {"guests": raw_or_none(mpath("guests.dat")), "members": raw_or_none(mpath("members.dat")), "records": raw_or_none(mpath("records.dat")),
-            "gci": T.md5_file(os.path.join(L.GAME_BIN_DIR, MF.GCI_REL)), "baks": sorted(glob.glob(mpath("*.bak-*")))}
+            "gci": T.md5_file(L.host_gci()), "baks": sorted(L.server_glob("*.bak-*"))}
 
 
 def buy(c, price=PRICE, house=L.PC_NETGAME_HOUSE_AUTO, base=None, rid=1, **kw):
@@ -456,7 +456,7 @@ def final_checks(rig, ctx):
     if "winner" not in ctx or "npid" not in ctx:
         ck("F skipped: no purchase happened", False)
         return
-    gci = raw(os.path.join(L.GAME_BIN_DIR, MF.GCI_REL))
+    gci = raw(L.host_gci())
     orig = ctx["orig_gci"]
     npid, w, l_ = ctx["npid"], ctx["winner"], ctx["loser"]
     p3 = gci_priv(gci, 3)
@@ -486,7 +486,7 @@ def run(args, results):
     for k, (n, pid) in names.items():
         ctx["g"][k] = L.guest_identity(n, pid, "HOMETWN", 0x5B21)
         ctx["rec"][k] = bytes(L.fresh_guest_record_for(ctx["g"][k]))
-    shutil.rmtree(mp_dir(), ignore_errors=True)  # the disposable fixture only
+    L.server_wipe_sidecars()  # the disposable fixture only
     source_audit(rig)
     for name, fn in (("P0", phase0), ("P1", phase1)):
         try:

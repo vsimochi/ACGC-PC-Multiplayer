@@ -8,11 +8,15 @@ touched (not the live save dir, bin_talkfix*, bin_fixture4, other disposable cop
       host reaches 'world ready'; save/card_a and save/mp host files are NOT created
   S2  RESTART: stop (exit 0), start again: NO new town ('generating' absent), the same identity ('town identity confirmed'), the same town key / land id, the GCI is the same town
   S3  REAL CLIENT: a guest store character connects with --town-fetch (transfer of the server's town), reaches READY, the host lists it; the server tree holds citizens/guests.dat
+  S4  LEGACY ADOPTION (default id): a disposable copy of the full fixture (a valid legacy save/card_a GCI with four residents) + legacy save/mp guests / members files: the
+      dedicated host COPIES the town and the host files into servers/default/ (server.ini origin = legacy), the legacy GCI and the legacy save/mp files stay BYTE-IDENTICAL
 Usage: python test_dedicated_server_storage.py [--port 12995]
 """
 import argparse
+import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -147,6 +151,56 @@ def run(port, results):
         h.stop()
 
 
+def md5(p):
+    return hashlib.md5(read(p)).hexdigest()
+
+
+def adoption(port, results, src_tree):
+    """S4: legacy adoption into servers/default/ on a disposable copy of the FULL fixture (bin_fixture4_srva)."""
+    ck = lambda d, c: L.check(d, bool(c), results)  # noqa: E731
+    adir = T.make_fixture("bin_fixture4_srva")
+    legacy_gci = os.path.join(adir, "save", "card_a", "DobutsunomoriP_MURA.gci")
+    ck("S4 (setup) a valid legacy save/card_a GCI (467008 bytes, GAFE) and no servers/ in the disposable copy", os.path.getsize(legacy_gci) == 467008 and read(legacy_gci)[:4] == b"GAFE"
+       and not os.path.exists(os.path.join(adir, "servers")))
+    # legacy host files: valid guests.dat / members.dat taken from the server tree of S1-S3 (a different town: only their FORMAT matters for the copy)
+    legacy_mp = os.path.join(adir, "save", "mp")
+    os.makedirs(legacy_mp, exist_ok=True)
+    seeded = {}
+    for name, sub in (("guests.dat", "citizens"), ("members.dat", "residents")):
+        src = os.path.join(src_tree, sub, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(legacy_mp, name))
+            seeded[name] = md5(os.path.join(legacy_mp, name))
+    ck("S4 (setup) legacy save/mp/guests.dat + members.dat seeded", len(seeded) == 2)
+    gci_before = md5(legacy_gci)
+    recs_before = [L.record_from_gci(read(legacy_gci), i) for i in range(4)]
+    h = L.HostProcess(port=port, extra_args=["--dedicated", "--town-serve", "on", "--resident-tokens", "tofu"], log_path=T.log_path("srv_adopt_host.log"), bin_dir=adir, stdin_pipe=True,
+                      verbose=False, new_group=True).start()
+    try:
+        ok = h.wait_listening(60.0) and h.boot_to_dedicated(timeout=180.0)
+        ck("S4 the dedicated host booted on the legacy directory (server id default)", ok)
+        log = h.log_text().replace("\r\n", "\n")
+        ck("S4 the log says the legacy town was ADOPTED by COPY (and the legacy guest table / credentials)", "adopted the legacy town save/card_a/DobutsunomoriP_MURA.gci by COPY" in log
+           and "adopted the legacy guest table" in log and "adopted the legacy resident credentials" in log and "a new town is generated" not in log and "generating a new town" not in log)
+    finally:
+        h.send_line("stop")
+        code = h.wait_exit(90.0)
+        h.stop()
+    ck("S4 graceful stop (exit 0)", code == 0)
+    srv = os.path.join(adir, "servers", "default")
+    sgci = os.path.join(srv, "town", "card_a", "DobutsunomoriP_MURA.gci")
+    ini = os.path.join(srv, "server.ini")
+    ck("S4 servers/default/town/card_a/DobutsunomoriP_MURA.gci exists (467008 bytes) and is the SAME town: same size, the four residents byte-identical to the legacy file",
+       os.path.isfile(sgci) and os.path.getsize(sgci) == 467008 and [L.record_from_gci(read(sgci), i) for i in range(4)] == recs_before)
+    ck("S4 server.ini: origin = legacy, a [town] key and land_id", ini_value(ini, "origin", "[town]") == "legacy" and ini_value(ini, "key", "[town]") and ini_value(ini, "land_id", "[town]"))
+    ck("S4 the ORIGINAL legacy save/card_a GCI is BYTE-IDENTICAL after the adoption and the whole run (md5 %s...)" % gci_before[:8], md5(legacy_gci) == gci_before)
+    ck("S4 the legacy save/mp host files were COPIED, not moved or changed: still there, byte-identical", all(os.path.isfile(os.path.join(legacy_mp, n)) and md5(os.path.join(legacy_mp, n)) == m
+                                                                                                          for n, m in seeded.items()))
+    ck("S4 the server tree holds its own copies (citizens/guests.dat, residents/members.dat)", os.path.isfile(os.path.join(srv, "citizens", "guests.dat"))
+       and os.path.isfile(os.path.join(srv, "residents", "members.dat")))
+    ck("S4 the legacy directory gained no other host file (no save/mp/records.dat from the dedicated server)", not os.path.exists(os.path.join(legacy_mp, "records.dat")))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=12995)
@@ -156,6 +210,7 @@ def main():
         return 2
     results = []
     run(args.port, results)
+    adoption(args.port + 1, results, SRV)
     return L.summary_and_exit_code(results)
 
 

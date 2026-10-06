@@ -43,7 +43,7 @@ IP = "127.0.0.1"
 
 
 def gpath():
-    return TG.guests_path()
+    return L.server_file("guests.dat")  # a DEDICATED host's guest table: servers/default/citizens/guests.dat
 
 
 def mpdir():

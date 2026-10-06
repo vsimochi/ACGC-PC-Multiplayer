@@ -71,7 +71,7 @@ GST_SIZE = 32 + 8 * GST_ENTRY + 4
 
 
 def mpath(n):
-    return os.path.join(L.GAME_BIN_DIR, "save", "mp", n)
+    return L.server_file(n)  # the DEDICATED host's own files: servers/default/{citizens,residents}/
 
 
 def parse_members(path):

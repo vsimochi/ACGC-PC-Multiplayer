@@ -15127,6 +15127,9 @@ static int pcnetgame_members_commit(PCMpMemberFile* nf, const char* why) {
  * credentials yet" is a state of the server directory, not a missing file. An existing file (or an UNTRUSTED one) is never touched. */
 static void pcnetgame_server_init_members(void) {
     PCMpMemberFile nf;
+    if (pcnetgame_resident_policy() == PC_NETGAME_RESTOK_OFF) {
+        return; /* resident_tokens=off: members.dat is never read or written (the documented guarantee); it appears with the first tofu / required launch */
+    }
     pcnetgame_members_store_load();
     if (s_members_mode == PC_MP_MBR_LOAD_MISSING && !s_members_untrusted) {
         nf = s_members_file;
