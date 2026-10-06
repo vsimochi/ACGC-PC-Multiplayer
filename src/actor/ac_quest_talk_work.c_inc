@@ -1,0 +1,72 @@
+#ifdef TARGET_PC
+/* Nook Work Mode, the VILLAGER side of the errands (Nook's talk is in ac_npc_shop_common.c).
+ * A villager the character's current job points at (pc_net_game_work_villager_pending) takes this talk kind instead of the normal one: the villager's usual hello plays, and while it
+ * is on screen the matching work transaction is sent to the HOST (op 5 = the villager hands over the item of a FETCH job, op 6 = the parcel of a DELIVER job is handed to its
+ * recipient and the optional tip is paid). When the host answers, the continue message of the hello becomes the matching generated row (pc_nook_house.c) and the conversation ends
+ * with it. Nothing here decides anything: the pocket / wallet change is the host's post-image (pcnetgame_txn_apply_work) and a refusal shows "I do not know what this is about". */
+enum {
+    aQMgr_WORK_STEP_START,
+    aQMgr_WORK_STEP_BEGIN,
+    aQMgr_WORK_STEP_PENDING,
+    aQMgr_WORK_STEP_FINISH
+};
+
+static int l_work_op;
+static int l_work_npc;
+static PCWorkView l_work_view;
+
+static void aQMgr_work_show(QUEST_MANAGER_ACTOR* manager, int ok) {
+    int msg = ok ? (l_work_op == PC_WORK_OP_VILLAGER_GIVE ? PC_NOOK_MSG_WORK_V_GIVE : PC_NOOK_MSG_WORK_V_RECEIVE) : PC_NOOK_MSG_WORK_V_FAIL;
+    pc_nook_house_set_work_view(&l_work_view, NULL);
+    mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), pc_nook_msg_id(msg));
+    manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+    manager->talk_step = aQMgr_WORK_STEP_FINISH;
+    printf("[NET][WORK] villager talk: npc 0x%04X op %d %s -> row %d\n", l_work_npc, l_work_op, ok ? "APPLIED" : "refused", msg);
+}
+
+extern void aQMgr_talk_work_init(QUEST_MANAGER_ACTOR* manager) {
+    int r;
+    switch (manager->talk_step) {
+        case aQMgr_WORK_STEP_START: {
+            ACTOR* client = *manager->client;
+            Animal_c* animal = (client != NULL && client->part == ACTOR_PART_NPC) ? ((NPC_ACTOR*)client)->npc_info.animal : NULL;
+            l_work_op = 0;
+            l_work_npc = animal != NULL ? (int)animal->id.npc_id : 0;
+            if (animal == NULL || !pc_net_game_work_villager_pending(l_work_npc, &l_work_op) || !pc_net_game_work_view(&l_work_view)) {
+                (*manager->talk_common_proc)(manager, aQMgr_TALK_COMMON_CHANGE_TALK_NORMAL); /* nothing to do any more: the villager's normal talk */
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+                break;
+            }
+            manager->talk_step = aQMgr_WORK_STEP_BEGIN;
+            manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT; /* the request goes out while the hello is on screen */
+            break;
+        }
+        case aQMgr_WORK_STEP_BEGIN:
+            r = pc_net_game_work_begin_op(l_work_op, l_work_npc);
+            if (r < 0) {
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT; /* another transaction is unresolved: next frame */
+            } else if (r == 0) {
+                aQMgr_work_show(manager, FALSE);
+            } else if (r == 3) {
+                aQMgr_work_show(manager, TRUE); /* the host's own player: done at once */
+            } else {
+                manager->talk_step = aQMgr_WORK_STEP_PENDING;
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+            }
+            break;
+        case aQMgr_WORK_STEP_PENDING:
+            r = pc_net_game_ts_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+            } else {
+                aQMgr_work_show(manager, r == PC_NETGAME_TS_OP_APPLIED);
+            }
+            break;
+        default: /* FINISH: the generated row ends the conversation by itself */
+            (*manager->talk_common_proc)(manager, aQMgr_TALK_COMMON_CLEAR_TALK_INFO);
+            manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+            break;
+    }
+    manager->talk_state = aQMgr_TALK_STATE_SUB;
+}
+#endif

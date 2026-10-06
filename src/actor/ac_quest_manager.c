@@ -14,6 +14,10 @@
 #include "libultra/libultra.h"
 #include "m_malloc.h"
 #include "zurumode.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#include "pc_nook_house.h" /* Nook Work Mode: the villager side of the errands + the generated rows */
+#endif
 
 enum {
     aQMgr_MODE_NORMAL,
@@ -565,12 +569,19 @@ static void aQMgr_clear_talk_init_ovl(QUEST_MANAGER_ACTOR* manager) {
     manager->talk_init_proc = NULL;
 }
 
+#ifdef TARGET_PC
+#include "../src/actor/ac_quest_talk_work.c_inc"
+#endif
+
 static int aQMgr_talk_common_talk_init_ovl(QUEST_MANAGER_ACTOR* manager) {
     static aQMgr_TALK_INIT_PROC talk_init_table[aQMgr_TALK_KIND_NUM] = {
         &aQMgr_actor_move_talk_init,
         &aQMgr_talk_first_job_init,
         &aQMgr_talk_normal_init,
         &aQMgr_talk_island_init
+#ifdef TARGET_PC
+        , &aQMgr_talk_work_init
+#endif
     };
 
     int type = manager->talk_type;
@@ -1203,6 +1214,14 @@ static void aQMgr_select_talk(QUEST_MANAGER_ACTOR* manager) {
     aQMgr_actor_init_quest(manager);
     aQMgr_clear_talk_wait_info(&manager->wait_info);
 
+#ifdef TARGET_PC
+    int pc_work_op = 0;
+
+    if (animal != NULL && pc_net_game_work_villager_pending((int)animal->id.npc_id, &pc_work_op)) {
+        manager->talk_type = aQMgr_TALK_KIND_WORK; /* Nook Work Mode: this villager is the target of the character's current errand step */
+    }
+    else
+#endif
     if ((animal != NULL && mNpc_CheckIslandAnimal(animal) == TRUE) || (mLd_PlayerManKindCheck() == FALSE && mEv_CheckEvent(event_id) == TRUE)) {
         manager->talk_type = aQMgr_TALK_KIND_QUEST;
     }

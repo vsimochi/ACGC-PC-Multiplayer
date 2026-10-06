@@ -59,6 +59,9 @@ enum {
     aQMgr_TALK_KIND_FIRST_JOB,
     aQMgr_TALK_KIND_NORMAL,
     aQMgr_TALK_KIND_ISLAND,
+#ifdef TARGET_PC
+    aQMgr_TALK_KIND_WORK, /* Nook Work Mode: the villager side of an errand (ac_quest_talk_work.c_inc) */
+#endif
 
     aQMgr_TALK_KIND_NUM
 };

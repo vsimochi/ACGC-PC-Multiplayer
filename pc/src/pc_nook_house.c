@@ -40,8 +40,10 @@
 static int s_pick[PC_RESIDENCE_HOUSES];
 static int s_pick_n = 0;
 static int s_confirm = -1;
-static int s_work_item = 0;
-static unsigned s_work_reward = 0;
+static PCWorkView s_wk_view;
+static unsigned char s_wk_name[8] = { ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ' };
+static int s_first_page_work = 0;
+static int s_first_page_id = 0x1092; /* the vanilla What can I do for you row of Tom Nook / Timmy / Tommy (aNSC_MSG_INTERACT_START) */
 
 typedef struct {
     unsigned char* d;
@@ -188,20 +190,94 @@ void pc_nook_house_set_confirm(int house_or_auto) {
     s_confirm = house_or_auto;
 }
 
-void pc_nook_house_set_work(int item, unsigned reward) {
-    s_work_item = item;
-    s_work_reward = reward;
+void pc_nook_house_set_work_view(const PCWorkView* v, const unsigned char* villager_name8) {
+    if (v != NULL) {
+        s_wk_view = *v;
+    }
+    if (villager_name8 != NULL) {
+        memcpy(s_wk_name, villager_name8, 8);
+    }
 }
 
-static const char* nk_work_item_name(void) {
-    switch (s_work_item) {
+static const char* nk_work_item_name(int item) {
+    switch (item) {
         case ITM_FOOD_APPLE: return "an apple";
         case ITM_FOOD_CHERRY: return "a cherry";
         case ITM_FOOD_PEAR: return "a pear";
         case ITM_FOOD_PEACH: return "a peach";
         case ITM_FOOD_ORANGE: return "an orange";
-        default: return "the item";
+        default: break;
     }
+    if (item >= ITM_PAPER_START && item < ITM_PAPER_START + 64) {
+        return "some stationery";
+    }
+    return "the item";
+}
+
+/* the villager's name as the game's own name bytes (letters are ASCII; trailing spaces trimmed) */
+static void nk_work_name(NkBuf* b) {
+    int n = 8, i;
+    while (n > 0 && (s_wk_name[n - 1] == ' ' || s_wk_name[n - 1] == 0)) {
+        n--;
+    }
+    if (n == 0) {
+        nk_text(b, "the villager");
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        nk_byte(b, s_wk_name[i]);
+    }
+}
+
+int pc_nook_work_row(const PCWorkView* v, int* acts, int cap) {
+    int n = 0;
+    if (cap < 3) {
+        return 0;
+    }
+    if (v->job_type == PC_WORK_JOB_FRUIT || (v->job_type == PC_WORK_JOB_FETCH_VILLAGER && v->obj_state == PC_WORK_OBJ_CARRYING)) {
+        acts[n++] = PC_NOOK_WACT_HAND;
+        acts[n++] = PC_NOOK_WACT_LATER;
+    } else if (v->job_type == PC_WORK_JOB_FETCH_VILLAGER) {
+        acts[n++] = PC_NOOK_WACT_LATER;
+    } else if (v->obj_state == PC_WORK_OBJ_START) {
+        acts[n++] = PC_NOOK_WACT_TAKE;
+        acts[n++] = PC_NOOK_WACT_LATER;
+    } else if (v->obj_state == PC_WORK_OBJ_CARRYING) {
+        acts[n++] = PC_NOOK_WACT_LATER;
+    } else {
+        acts[n++] = PC_NOOK_WACT_REPORT;
+    }
+    acts[n++] = PC_NOOK_WACT_QUIT;
+    return n;
+}
+
+int pc_nook_first_page_work(void) {
+    return s_first_page_work;
+}
+
+/* Patches the loaded vanilla first page: SETSELSTR4 (7F 18 + 4 string ids) becomes SETSELSTR5 (7F 79 + 5 ids) with the work choice inserted before the last one. */
+int pc_nook_msg_patch(int index, unsigned char* data, int len, int cap) {
+    PCWorkView v;
+    int i, id;
+    if (index != s_first_page_id) {
+        return 0;
+    }
+    s_first_page_work = 0;
+    if (data == NULL || len < 4 || len + 2 > cap || !pc_net_game_work_offer_available()) {
+        return 0;
+    }
+    for (i = 0; i + 11 < len; i++) {
+        if (data[i] == NK_CC && data[i + 1] == NK_SEL4) {
+            id = (pc_net_game_work_view(&v) && v.state == PC_WORK_STATE_ACTIVE) ? PC_NOOK_SEL_JOB : PC_NOOK_SEL_WORK;
+            memmove(&data[i + 10], &data[i + 8], (size_t)(len - (i + 8))); /* the last (cancel) id and everything after move 2 bytes up ... */
+            data[i + 1] = NK_SEL5;
+            data[i + 8] = (unsigned char)((id >> 8) & 0xFF); /* ... and the work / job choice takes the 4th place (index 3) */
+            data[i + 9] = (unsigned char)(id & 0xFF);
+            s_first_page_work = 1;
+            return len + 2;
+        }
+    }
+    return 0;
 }
 
 int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
@@ -237,7 +313,7 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "As far as other things go,\nthis is all I have to offer.");
             ids[0] = NK_SEL_TURNIPS;
             ids[1] = NK_SEL_HEARCODE;
-            ids[2] = PC_NOOK_SEL_WORK; /* the 6 choices of the window are full: "Say code" gives its place to "I'd like to work" for a guest */
+            ids[2] = NK_SEL_SAYCODE;
             ids[3] = PC_NOOK_SEL_BUY_HOUSE;
             ids[4] = PC_NOOK_SEL_REFRESH;
             ids[5] = NK_SEL_HANGON;
@@ -249,9 +325,8 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             ids[1] = NK_SEL_HEARCODE;
             ids[2] = NK_SEL_SAYCODE;
             ids[3] = PC_NOOK_SEL_REFRESH;
-            ids[4] = PC_NOOK_SEL_WORK;
-            ids[5] = NK_SEL_HANGON;
-            nk_choice(&b, ids, 6);
+            ids[4] = NK_SEL_HANGON;
+            nk_choice(&b, ids, 5);
             break;
         case PC_NOOK_MSG_RESTOCK_ASK:
             nk_text(&b, "A fresh set of goods,");
@@ -321,30 +396,59 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\nwent through. Please check\nyour wallet, then ask me!");
             nk_code(&b, NK_END);
             break;
-        case PC_NOOK_MSG_WORK_JOB:
-            nk_text(&b, "Oh, you want to work, hm?");
+        case PC_NOOK_MSG_WORK_JOB: {
+            /* the job row of the character's CURRENT job (view set by the actor): what to do next and the Nook reward, then the choices of pc_nook_work_row() */
+            int acts[4];
+            int n = pc_nook_work_row(&s_wk_view, acts, 4);
+            nk_text(&b, "Work, hm? Splendid!");
             nk_pause(&b, 6);
-            nk_text(&b, "\nSplendid! Here is the job.");
+            switch (s_wk_view.job_type) {
+                case PC_WORK_JOB_FRUIT:
+                    nk_text(&b, "\nBring me ");
+                    nk_text(&b, nk_work_item_name(s_wk_view.obj_item));
+                    nk_text(&b, "\nfrom this town.");
+                    break;
+                case PC_WORK_JOB_FETCH_VILLAGER:
+                    nk_text(&b, "\n");
+                    nk_work_name(&b);
+                    nk_text(&b, " has ");
+                    nk_text(&b, nk_work_item_name(s_wk_view.obj_item));
+                    nk_text(&b, "\nfor me. Ask for it, then\nbring it here.");
+                    break;
+                default:
+                    if (s_wk_view.obj_state == PC_WORK_OBJ_START) {
+                        nk_text(&b, "\nI have a parcel for ");
+                        nk_work_name(&b);
+                        nk_text(&b, ".\nCan you take it over?");
+                    } else if (s_wk_view.obj_state == PC_WORK_OBJ_CARRYING) {
+                        nk_text(&b, "\nHave you handed the parcel\nto ");
+                        nk_work_name(&b);
+                        nk_text(&b, " yet?");
+                    } else {
+                        nk_text(&b, "\nYou gave it to ");
+                        nk_work_name(&b);
+                        nk_text(&b, "?\nExcellent!");
+                    }
+                    break;
+            }
             nk_page(&b);
-            nk_text(&b, "Bring me ");
-            nk_text(&b, nk_work_item_name());
-            nk_text(&b, ".");
-            nk_pause(&b, 6);
-            snprintf(tmp, sizeof(tmp), "\nI'll pay %u Bells for it.", s_work_reward);
+            snprintf(tmp, sizeof(tmp), "I'll pay %u Bells for it.", s_wk_view.reward);
             nk_text(&b, tmp);
-            nk_page(&b);
-            nk_text(&b, "Do you have it?");
-            ids[0] = PC_NOOK_SEL_WORK_HERE;
-            ids[1] = PC_NOOK_SEL_WORK_LATER;
-            ids[2] = PC_NOOK_SEL_WORK_LEAVE;
-            nk_choice(&b, ids, 3);
+            nk_pause(&b, 6);
+            nk_text(&b, "\nWhat would you like to do?");
+            for (i = 0; i < n; i++) {
+                ids[i] = acts[i] == PC_NOOK_WACT_HAND ? PC_NOOK_SEL_WORK_HERE : acts[i] == PC_NOOK_WACT_TAKE ? PC_NOOK_SEL_WORK_TAKE : acts[i] == PC_NOOK_WACT_REPORT ? PC_NOOK_SEL_WORK_REPORT
+                       : acts[i] == PC_NOOK_WACT_QUIT ? PC_NOOK_SEL_WORK_LEAVE : PC_NOOK_SEL_WORK_LATER;
+            }
+            nk_choice(&b, ids, n);
             break;
+        }
         case PC_NOOK_MSG_WORK_DONE:
             nk_text(&b, "Excellent! Just what I");
             nk_pause(&b, 6);
             nk_text(&b, "\nneeded.");
             nk_page(&b);
-            snprintf(tmp, sizeof(tmp), "Here are your %u Bells.", s_work_reward);
+            snprintf(tmp, sizeof(tmp), "Here are your %u Bells.", s_wk_view.reward);
             nk_text(&b, tmp);
             nk_pause(&b, 6);
             nk_text(&b, "\nCome back any time for\nmore work!");
@@ -352,18 +456,16 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             break;
         case PC_NOOK_MSG_WORK_NOITEM:
             nk_text(&b, "Hm? You do not have ");
-            nk_text(&b, nk_work_item_name());
+            nk_text(&b, nk_work_item_name(s_wk_view.obj_item));
             nk_text(&b, ",");
             nk_pause(&b, 6);
             nk_text(&b, "\nnot yet. Come back when\nyou do!");
             nk_code(&b, NK_END);
             break;
         case PC_NOOK_MSG_WORK_LATER:
-            nk_text(&b, "Very well. Come back with");
+            nk_text(&b, "Very well. Come back to");
             nk_pause(&b, 6);
-            nk_text(&b, "\n");
-            nk_text(&b, nk_work_item_name());
-            nk_text(&b, ", hm?");
+            nk_text(&b, "\nme whenever you like, hm?");
             nk_code(&b, NK_END);
             break;
         case PC_NOOK_MSG_WORK_LEFT:
@@ -388,6 +490,45 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "Your wallet is full!");
             nk_pause(&b, 6);
             nk_text(&b, "\nSpend some Bells and come\nback, hm?");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_PARCEL:
+            nk_text(&b, "Here is the parcel for ");
+            nk_work_name(&b);
+            nk_text(&b, ".");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nPlease hand it over and\nthen report back to me.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_V_GIVE:
+            nk_text(&b, "Oh, Nook sent you for ");
+            nk_text(&b, nk_work_item_name(s_wk_view.obj_item));
+            nk_text(&b, "?");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nHere you go! Tell him I said\nhello.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_V_RECEIVE:
+            nk_text(&b, "Oh! A parcel from Nook");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nfor me? Thank you!");
+            if (s_wk_view.tip_kind == PC_WORK_TIP_BELLS) {
+                nk_page(&b);
+                snprintf(tmp, sizeof(tmp), "Here are %u Bells for", s_wk_view.tip_value);
+                nk_text(&b, tmp);
+                nk_text(&b, "\nyour trouble.");
+            } else if (s_wk_view.tip_kind == PC_WORK_TIP_ITEM) {
+                nk_page(&b);
+                nk_text(&b, "Please take ");
+                nk_text(&b, nk_work_item_name((int)s_wk_view.tip_value));
+                nk_text(&b, "\nfor your trouble.");
+            }
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_WORK_V_FAIL:
+            nk_text(&b, "Hm? I do not know what");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nthis is about.");
             nk_code(&b, NK_END);
             break;
         case PC_NOOK_MSG_RESTOCK_DOOR:
@@ -538,10 +679,19 @@ int pc_nook_sel_build(int id, unsigned char* dst16) {
             snprintf(tmp, sizeof(tmp), "Here it is!");
             break;
         case PC_NOOK_SEL_WORK_LATER:
-            snprintf(tmp, sizeof(tmp), "I'll fetch it.");
+            snprintf(tmp, sizeof(tmp), "I'll get to it.");
             break;
         case PC_NOOK_SEL_WORK_LEAVE:
-            snprintf(tmp, sizeof(tmp), "I'm done working");
+            snprintf(tmp, sizeof(tmp), "I quit the job");
+            break;
+        case PC_NOOK_SEL_JOB:
+            snprintf(tmp, sizeof(tmp), "Check my job");
+            break;
+        case PC_NOOK_SEL_WORK_TAKE:
+            snprintf(tmp, sizeof(tmp), "Take the parcel");
+            break;
+        case PC_NOOK_SEL_WORK_REPORT:
+            snprintf(tmp, sizeof(tmp), "I delivered it.");
             break;
         default:
             snprintf(tmp, sizeof(tmp), "House %d.", id - PC_NOOK_SEL_HOUSE1 + 1);
@@ -563,7 +713,34 @@ int pc_nook_house_selftest(void) {
     int which, i, bad = 0, h4[PC_RESIDENCE_HOUSES] = { 0, 1, 2, 3 };
     pc_nook_house_set_pick(h4, PC_RESIDENCE_HOUSES);
     pc_nook_house_set_confirm(2);
-    pc_nook_house_set_work(ITM_FOOD_PEACH, 400u);
+    {
+        PCWorkView v;
+        unsigned char nm[8] = {'B', 'o', 'b', ' ', ' ', ' ', ' ', ' '};
+        int jt, os;
+        memset(&v, 0, sizeof(v));
+        v.state = 1;
+        v.mode_on = 1;
+        v.reward = 400;
+        v.tip_value = 150;
+        v.obj_item = ITM_FOOD_PEACH;
+        for (jt = PC_WORK_JOB_FRUIT; jt <= PC_WORK_JOB_DELIVER_VILLAGER; jt++) {
+            for (os = 0; os <= 2; os++) {
+                v.job_type = jt;
+                v.obj_state = os;
+                v.tip_kind = os;
+                v.tip_kind = v.tip_kind > 2 ? 2 : v.tip_kind;
+                pc_nook_house_set_work_view(&v, nm);
+                for (which = PC_NOOK_MSG_WORK_JOB; which < PC_NOOK_MSG_COUNT; which++) {
+                    int n = pc_nook_msg_build(MSG_MAX + which, buf, sizeof(buf));
+                    if (n < 2 || !(buf[n - 2] == NK_CC && (buf[n - 1] == NK_END || buf[n - 1] == NK_CONTINUE))) {
+                        printf("[NOOK] selftest: work message %d (type %d step %d) did not build\n", which, jt, os);
+                        bad++;
+                    }
+                }
+            }
+        }
+        pc_nook_house_set_work_view(&v, nm);
+    }
     for (which = 0; which < PC_NOOK_MSG_COUNT; which++) {
         int n = pc_nook_msg_build(MSG_MAX + which, buf, sizeof(buf)), last_ok;
         if (n < 2) {

@@ -119,7 +119,8 @@ V8_NEW_STRUCTS = {
                            "float pos_x, pos_y, pos_z; int16_t facing_angle; int16_t _reserved;",
     # Nook Work Mode (Patch 3): the character's job as the host holds it (28 B), host -> the requesting client, reliable
     "PCNetGameWorkStateMsg": "uint8_t msg_type; uint8_t flags; uint8_t state; uint8_t job_type; uint32_t job_id; uint32_t reward; uint32_t jobs_done; "
-                             "uint32_t last_rewarded; uint16_t obj_item; uint16_t obj_count; uint32_t request_id;",
+                             "uint32_t last_rewarded; uint16_t obj_item; uint16_t carried_item; uint16_t target_villager; uint8_t obj_state; uint8_t tip_kind; uint32_t tip_value; "
+                             "uint32_t request_id;",
 }
 # Guest -> resident promotion (M-F): exact C lines (size / offset asserts) that must stay as they are.
 HANDOFF_C_PINS = ('_Static_assert(sizeof(PCNetGameResidentHandoffMsg) == 48,', "offsetof(PCNetGameResidentHandoffMsg, town_pid) == 4",
@@ -142,6 +143,9 @@ V8_PREV_STRUCTS = {
     # M-G: TOWN_INFO._rsv0 became flags (bit0 SANITIZED); HEAD still has the reserved name
     "PCNetGameTownInfoMsg": "uint8_t msg_type; uint8_t status; uint16_t chunk_size; uint32_t xfer_id; uint32_t total_size; uint32_t crc32; "
                             "uint8_t land_name[PC_NETGAME_LAND_LEN]; uint16_t land_id; uint16_t _rsv0; uint32_t terrain_hash; uint32_t town_gen; uint32_t chunk_count;",
+    # Work Mode errands: WORK_STATE grew from 28 to 36 bytes (job type / villager / step / tip); HEAD may still have the first layout
+    "PCNetGameWorkStateMsg": "uint8_t msg_type; uint8_t flags; uint8_t state; uint8_t job_type; uint32_t job_id; uint32_t reward; uint32_t jobs_done; "
+                             "uint32_t last_rewarded; uint16_t obj_item; uint16_t obj_count; uint32_t request_id;",
 }
 # X3 (host-transactional dig / catch GRANTS; still v8, extended IN PLACE, deliberate): the ONLY two pre-existing wire structs that change are
 # FIELD_ACTION_REQUEST (12 -> 76 bytes) and CATCH_REQUEST (20 -> 84 bytes): each gains the trailing 64-byte PCNetGameTxnTag. Pinned exactly

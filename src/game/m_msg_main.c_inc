@@ -380,6 +380,10 @@ static int mMsg_LoadMsgData(mMsg_Data_c* msg_data, int index, int cut) {
             }
 #endif
 
+#ifdef TARGET_PC
+            /* Nook Work Mode: the FIRST page of Nook's talk gets "I'd like to work" / "Check my job" from the authoritative job state (pc_nook_house.c) */
+            (void)pc_nook_msg_patch(index, msg_data->text_buf.data, (int)size, mMsg_MSG_BUF_MAX);
+#endif
             msg_data->msg_no = index;
             msg_data->data_loaded = TRUE;
             msg_data->msg_len = mMsg_Count_MsgData(msg_data->text_buf.data);
@@ -391,6 +395,32 @@ static int mMsg_LoadMsgData(mMsg_Data_c* msg_data, int index, int cut) {
     msg_data->data_loaded = FALSE;
     return FALSE;
 }
+
+#ifdef TARGET_PC
+#include "pc_test_hooks.h"
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_DUMP_MSG=<id>): once, loads message <id> through the normal loader (so the first-page patch applies) and prints its bytes. Never active in normal play. */
+static void mMsg_pc_dump_hook(void) {
+    static int done = 0;
+    static mMsg_Data_c scratch;
+    const char* e;
+    unsigned id;
+    int i;
+    if (done || (e = pc_test_hook_getenv("AC_TEST_DUMP_MSG")) == NULL || !pc_net_game_work_offer_available()) {
+        return;
+    }
+    done = 1;
+    id = (unsigned)strtoul(e, NULL, 0);
+    if (mMsg_LoadMsgData(&scratch, (int)id, FALSE)) {
+        printf("[MSG][TEST-ONLY] message 0x%04X loaded, len %d, bytes:", id, (int)scratch.msg_len);
+        for (i = 0; i < (int)scratch.msg_len && i < 400; i++) {
+            printf(" %02X", scratch.text_buf.data[i]);
+        }
+        printf("\n");
+    } else {
+        printf("[MSG][TEST-ONLY] message 0x%04X could not be loaded\n", id);
+    }
+}
+#endif
 
 extern int mMsg_ChangeMsgData(mMsg_Window_c* msg_p, int index) {
     #ifdef TARGET_PC
@@ -420,6 +450,9 @@ extern int mMsg_Check_NowUtter() {
 }
 
 static void mMsg_init(GAME* game) {
+#ifdef TARGET_PC
+    mMsg_pc_dump_hook();
+#endif
     mMsg_data.data_loaded = FALSE;
     mMsg_window.data_loaded = FALSE;
     mMsg_window.msg_no = 0;

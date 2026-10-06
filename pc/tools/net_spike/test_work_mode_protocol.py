@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""test_work_mode_protocol.py - Patch 3 (Nook Work Mode foundation): TXN_COMMIT kind 16 WORK + WORK_STATE (id 68) against a REAL host process.
+"""test_work_mode_protocol.py - Nook Work Mode: TXN_COMMIT kind 16 WORK (ops 1..7) + WORK_STATE (id 68, 36 B) against a REAL host process.
 
 TIER: PROTOCOL TESTED (real host binary, `--host --bootstrap-resident`, scripted resident / guest FakeClients -- the harness of test_shop_catalog_protocol.py). The Nook dialogue seam
-(ac_npc_shop_common.c) and the client apply path are covered by the source audit (section S) and the build, NOT by a GUI run here; no visual verification is claimed.
+(ac_npc_shop_common.c), the villager talk (ac_quest_manager.c) and the client apply are covered by the build, the menu-patch harness (test_work_menu_patch.py) and the source audit
+(section S) -- NOT by a GUI run; no visual verification is claimed.
 Run on a DISPOSABLE copy: NET_SPIKE_GAME_BIN=<abs path of pc\\build64\\bin_fixture4_<name>> (the fixture save is snapshotted and restored; the host's save/mp/work_jobs.dat is removed).
-  W1 ENTER: APPLIED, WORK_STATE carries a NEW host job (unique non-zero job_id, a fruit objective, a reward), Work Mode on
-  W2 ENTER again: APPLIED with the SAME job (resume, no second job)
-  W3 DELIVER refused: no job for a character that never entered (WORK_NO_JOB), a wrong job id (WORK_STALE_JOB), a wrong item (PRECOND); nothing credited / consumed
-  W4 DELIVER with the right job id + item: APPLIED, the pocket slot is emptied and the wallet = pre + reward (HOST decides the reward), job retired, jobs_done 1, ONE host commit line
-  W5 duplicate packet / retransmit of the same (nonce, seq) is answered from the journal (REPLAYED), nothing paid twice (still ONE commit line, same post wallet)
-  W6 a stale completion with a NEW sequence number for the retired job is refused (WORK_NO_JOB); after a fresh ENTER the OLD job id is refused (WORK_STALE_JOB) -- no duplicate reward
-  W7 LEAVE: Work Mode off, the active job is kept; DELIVER while not in Work Mode is refused (WORK_NO_JOB)
-  W8 disconnect + reconnect as the SAME character: ENTER returns the SAME job id (the job belongs to the character, not the connection / peer slot)
-  W9 a GUEST character works too (ENTER, DELIVER, reward) and is independent of the residents
-  W10 host restart: the persisted job survives (same job id, reward), a paid job can never be paid again (stale completion refused), and new job ids never repeat
-  S  source audit: host-owned table keyed by the bound PID, durable save before the result, rekey on promotion, dialogue seam
+The host gets AC_TEST_HOOKS=1 and AC_TEST_WORK_TYPE=1,2,3 (the job types of the first three created jobs: fruit, fetch from a villager, deliver to a villager; then 1,2,3 again).
+  W0 connect: the job state reaches a READY + SYNCED peer with NO op (request 0): the menu knows 'no job' before anything was asked
+  W1 job 1 = FRUIT: the objective is the TOWN's native fruit (Save_Get(fruit) of the host save, logged), a Nook reward; ENTER again resumes the SAME job
+  W2 refusals (nothing consumed / paid): a character without a job, a wrong job id, a wrong item, ops of another job type
+  W3 DELIVER of the fruit: the HOST pays its reward, the slot is emptied, the job is retired, ONE commit line; the retransmit is answered from the journal (REPLAYED); a new-seq
+     completion of the paid job is refused
+  W4 job 2 = FETCH_VILLAGER: Nook names villager + item; Nook cannot be paid before the item is fetched; the WRONG villager hands nothing; the right villager hands the item ONCE
+     (a second request is refused), then DELIVER to Nook pays the Nook reward
+  W5 job 3 = DELIVER_VILLAGER: TAKE_PARCEL grants the parcel once; REPORT before delivery is refused; the wrong villager takes nothing; the right villager takes the parcel + pays the optional
+     tip (Bells / an item / none) ONCE; REPORT pays the Nook reward (the tip never replaces it)
+  W6 LEAVE quits the job (state NONE, never paid, menu = 'I'd like to work' again); a later ENTER creates a NEW job
+  W7 disconnect + reconnect as the SAME character: the job state is pushed again at connect (same job id / step), unchanged
+  W8 a GUEST character works independently
+  W9 host restart: the persisted job (type, step, villager) survives, a paid job can never be paid again, new job ids never repeat
+  S  source audit
 """
 import argparse
 import os
@@ -26,6 +31,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ["AC_TEST_HOOKS"] = "1"
+os.environ["AC_TEST_WORK_TYPE"] = "1,2,3"
 import net_spike_lib as L  # noqa: E402
 import test_txn_protocol as TP  # noqa: E402
 import test_ts_protocol as TS  # noqa: E402
@@ -33,17 +39,19 @@ from test_txn_protocol import APPLIED, REJECTED, R, D_NONE  # noqa: E402
 
 K_WORK = 16
 MSG_WORK_STATE = 68
-WS_FMT = "<BBBBIIIIHHI"
+WS_FMT = "<BBBBIIIIHHHBBII"
 WS_SIZE = struct.calcsize(WS_FMT)
-OP_ENTER, OP_DELIVER, OP_LEAVE = 1, 2, 3
+assert WS_SIZE == 36
+ENTER, DELIVER, LEAVE, TAKE, GIVE, RECEIVE, REPORT = 1, 2, 3, 4, 5, 6, 7
 REASON_PRECOND, REASON_NO_JOB, REASON_STALE_JOB, REASON_WALLET_FULL = 9, 33, 34, 35
-FRUITS = {0x2800 + i for i in range(5)}  # ITM_FOOD_START(+0..4); re-read from the source below
+T_FRUIT, T_FETCH, T_DELIVER = 1, 2, 3
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 
 
 def decode_state(payload):
-    t, flags, state, jtype, job_id, reward, done, last, item, cnt, rid = struct.unpack(WS_FMT, payload)
-    return dict(flags=flags, state=state, job_type=jtype, job_id=job_id, reward=reward, done=done, last=last, item=item, count=cnt, request_id=rid)
+    (t, flags, state, jtype, job_id, reward, done, last, item, carried, villager, ostate, tkind, tvalue, rid) = struct.unpack(WS_FMT, payload)
+    return dict(flags=flags, mode=flags & 1, state=state, type=jtype, job_id=job_id, reward=reward, done=done, last=last, item=item, carried=carried, villager=villager,
+                step=ostate, tip_kind=tkind, tip_value=tvalue, request_id=rid)
 
 
 def is_state(m):
@@ -62,20 +70,25 @@ def last_state(c, since=None):
 def food_start():
     src = open(os.path.join(ROOT, "include", "m_name_table.h"), encoding="utf-8", errors="replace").read()
     m = re.search(r"#define ITM_FOOD_START\s+0x([0-9A-Fa-f]+)", src)
-    return int(m.group(1), 16) if m else None
+    return int(m.group(1), 16) if m else 0x2800
 
 
-def work(run, c, op, slot=0, item=0, job_low16=0, pre=None, wait=4.0, **kw):
-    """One WORK op; returns (since-mark, sent, result)."""
+def paper_start():
+    src = open(os.path.join(ROOT, "include", "m_name_table.h"), encoding="utf-8", errors="replace").read()
+    m = re.search(r"#define ITM_PAPER_START\s+0x([0-9A-Fa-f]+)", src)
+    return int(m.group(1), 16) if m else 0x2000
+
+
+def op(run, c, code, slot=0, item=0, aux=0, pre=None, wait=4.0):
     mark = c.inbox.mark()
     rid = run.fresh_rid()
-    sent = c.send_txn_commit(K_WORK, rid, D_NONE, slot, item, pre=pre, aux_cond=op, aux_item=job_low16, **kw)
+    sent = c.send_txn_commit(K_WORK, rid, D_NONE, slot, item, pre=pre, aux_cond=code, aux_item=aux)
     return mark, sent, c.wait_txn_result(sent.seq, wait)
 
 
-def with_item(c, slot, item):
+def image(c, slot=None, item=None):
     pockets, conds, wallet = c.txn_pre_image()
-    pk = tuple(item if i == slot else p for i, p in enumerate(pockets))
+    pk = tuple(item if (slot is not None and i == slot) else p for i, p in enumerate(pockets))
     return (pk, conds, wallet)
 
 
@@ -87,161 +100,218 @@ def audit_source(check):
     net = open(os.path.join(ROOT, "pc", "src", "pc_net_game.c"), encoding="utf-8", errors="replace").read()
     shop = open(os.path.join(ROOT, "src", "actor", "npc", "ac_npc_shop_common.c"), encoding="utf-8", errors="replace").read()
     nook = open(os.path.join(ROOT, "pc", "src", "pc_nook_house.c"), encoding="utf-8", errors="replace").read()
+    qm = open(os.path.join(ROOT, "src", "actor", "ac_quest_manager.c"), encoding="utf-8", errors="replace").read()
+    tw = open(os.path.join(ROOT, "src", "actor", "ac_quest_talk_work.c_inc"), encoding="utf-8", errors="replace").read()
+    msgc = open(os.path.join(ROOT, "src", "game", "m_msg_main.c_inc"), encoding="utf-8", errors="replace").read()
     check("S1 the job table is keyed by the bound character PID (never the peer / connection) and persisted before the result is sent",
           "pcnetgame_work_find(&st->bound_pid, 1)" in net and "pcnetgame_work_save(); /* durable BEFORE the result" in net)
-    check("S2 the host decides: job id match + objective item + wallet cap are checked on the HOST record; the reward is the record's, never the client's",
-          "pcnetgame_work_check_deliver(work, t->aux_item, t->item, &fail)" in net and "work_reward = work->reward;" in net and "post_wallet += work_reward;" in net)
-    check("S3 the job is retired + tombstoned in the SAME step as the reward (commit_deliver) and a duplicate is answered from the journal",
-          "pcnetgame_work_commit_deliver(work); /* the job is retired + tombstoned" in net and "answered from the journal, nothing re-executed" in net)
+    check("S2 the host decides: ONE pure plan validates job id + state-machine step + item + villager + wallet cap against the HOST record; the reward is the record's",
+          "pcnetgame_work_plan(work, t, post, &post_conds, &post_wallet, &work_reward, &fail)" in net and "add = w->reward;" in net and "static uint8_t pcnetgame_work_plan(" in net)
+    check("S3 a delivery retires + tombstones the job in the SAME step the reward is decided; a duplicate is answered from the journal",
+          "w->last_rewarded = w->job_id;" in net and "answered from the journal, nothing re-executed" in net)
     check("S4 a guest buying a house keeps its job: the record is re-keyed to the new resident PID in the shared promotion core",
           "pcnetgame_work_rekey(&old_g.key, &Save_Get(private_data)[s].player_ID)" in net)
-    check("S5 the dialogue offers 'I'd like to work' under Other things (guest menu + resident menu) and runs ENTER / DELIVER / LEAVE through pc_net_game_work_begin",
-          "aNSC_pc_wk_start_flow(shop_common)" in shop and "pc_net_game_work_begin(op)" in shop and "PC_NOOK_SEL_WORK" in nook)
-    check("S6 the job ids are host-generated, never reused and never 0 mod 65536 (the wire carries the low 16 bits)",
-          "} while ((s_work_next_job_id & 0xFFFFu) == 0u);" in net)
+    check("S5 the FIRST page of Nook's talk gets the work / job choice when the vanilla message is loaded (patched from the authoritative state), not under Other things",
+          "pc_nook_msg_patch(index, msg_data->text_buf.data" in msgc and "pc_nook_first_page_work() && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3" in shop
+          and "PC_NOOK_SEL_WORK_LEAVE" in nook and "NK_SEL5" in nook and "PC_NOOK_SEL_JOB" in nook)
+    check("S6 the job ids are host-generated, never reused and never 0 mod 65536 (the wire carries the low 16 bits)", "} while ((s_work_next_job_id & 0xFFFFu) == 0u);" in net)
+    check("S7 the native fruit comes from the HOST save (Save_Get(fruit)), the job types are a registry (fruit / fetch / deliver) and the villager errands need a villager",
+          "pcnetgame_work_town_fruit" in net and "mActor_name_t f = Save_Get(fruit);" in net and "PC_WORK_JOB_FETCH_VILLAGER" in net and "PC_WORK_JOB_DELIVER_VILLAGER" in net)
+    check("S8 the villager side runs in the villager's own talk (quest manager talk kind WORK): the hello plays, the host transaction is sent meanwhile, the generated row ends the talk",
+          "aQMgr_TALK_KIND_WORK" in qm and "pc_net_game_work_villager_pending" in qm and "pc_net_game_work_begin_op(l_work_op, l_work_npc)" in tw)
+    check("S9 the connect-time push: the job state is sent once the record is SYNCED (connect / reconnect), with request 0",
+          "wst->work_sent = 1;" in net and "pcnetgame_work_send_state((PCNetPeerId)p, &wst->bound_pid, 0);" in net)
 
 
 def phase_work(run):
     ck = run.check
+    fs, ps = food_start(), paper_start()
+    fruits = {fs + i for i in range(5)}
+    papers = {ps + i for i in range(8)}
     a = run.ready("A", run.r1)
     b = run.ready("B", run.r2)
     ck("W0 setup: A and B READY and SYNCED", a.rec_synced and b.rec_synced)
-    fs = food_start()
-    fruits = {fs + i for i in range(5)} if fs is not None else FRUITS
+    L.pump_sleep(1.0)
+    s0 = states(a)
+    ck("W0 the job state reached A at connect with NO op (request 0): no job, Work Mode off -- Nook's first page would offer 'I'd like to work'",
+       len(s0) >= 1 and s0[0]["request_id"] == 0 and s0[0]["state"] == 0 and s0[0]["mode"] == 0)
     slot = free_slot(a)
 
-    # ---- W1
+    # ---- W1: job 1 = FRUIT (the town's native fruit)
     off = len(run.log())
-    mark, sent, r = work(run, a, OP_ENTER)
+    mark, sent, r = op(run, a, ENTER)
     run.tx_ok("W1 ENTER", r, APPLIED, R["NONE"])
     st1 = last_state(a, mark)
-    ck("W1 a WORK_STATE answered it: Work Mode on, an ACTIVE job with a unique non-zero job_id, a fruit objective and a reward",
-       st1 is not None and (st1["flags"] & 1) == 1 and st1["state"] == 1 and st1["job_id"] != 0 and (st1["job_id"] & 0xFFFF) != 0 and st1["item"] in fruits and 300 <= st1["reward"] <= 600
-       and st1["request_id"] != 0)
+    ck("W1 an ACTIVE FRUIT job: Work Mode on, unique non-zero job id, a fruit objective, a Nook reward",
+       st1 is not None and st1["mode"] == 1 and st1["state"] == 1 and st1["type"] == T_FRUIT and st1["job_id"] != 0 and (st1["job_id"] & 0xFFFF) != 0 and st1["item"] in fruits and st1["reward"] >= 300)
     if st1 is None:
         return
+    m = re.search(r"new job %d type 1: item 0x([0-9A-F]+) .*town fruit in the save: 0x([0-9A-F]+)" % st1["job_id"], run.log(off))
+    ck("W1 the objective is the TOWN's native fruit from the host save (the save said 0x%s)" % (m.group(2) if m else "?"), m is not None and int(m.group(1), 16) == int(m.group(2), 16) == st1["item"])
     job1, item1, reward1 = st1["job_id"], st1["item"], st1["reward"]
-    ck("W1 the host logged the job creation", run.n_log(r"\[NET\]\[WORK\] host: peer \d+ resident \d+ WORK op 1 committed: job_id=%d " % job1, off) == 1)
+    mark, sent, r = op(run, a, ENTER)
+    st = last_state(a, mark)
+    ck("W1 ENTER again resumes the SAME job", r is not None and r.outcome == APPLIED and st is not None and st["job_id"] == job1)
 
-    # ---- W2
-    mark, sent, r = work(run, a, OP_ENTER)
-    run.tx_ok("W2 ENTER again", r, APPLIED, R["NONE"])
-    st2 = last_state(a, mark)
-    ck("W2 the SAME job is returned (resumed, not re-created)", st2 is not None and st2["job_id"] == job1 and st2["item"] == item1 and st2["reward"] == reward1)
-
-    # ---- W3
-    pre_b = with_item(b, slot, item1)
-    mark, sent, rb = work(run, b, OP_DELIVER, slot, item1, job1 & 0xFFFF, pre=pre_b)
-    ck("W3 B never entered: DELIVER refused WORK_NO_JOB (33), nothing consumed",
-       rb is not None and rb.outcome == REJECTED and rb.reason == REASON_NO_JOB)
-    pre_a = with_item(a, slot, item1)
-    mark, sent, r = work(run, a, OP_DELIVER, slot, item1, (job1 + 1) & 0xFFFF or 7, pre=pre_a)
-    ck("W3 a completion naming ANOTHER job id is refused WORK_STALE_JOB (34)", r is not None and r.outcome == REJECTED and r.reason == REASON_STALE_JOB)
+    # ---- W2: refusals
+    mark, sent, rb = op(run, b, DELIVER, slot, item1, job1 & 0xFFFF, pre=image(b, slot, item1))
+    ck("W2 B never entered: DELIVER refused WORK_NO_JOB (33)", rb is not None and rb.outcome == REJECTED and rb.reason == REASON_NO_JOB)
+    mark, sent, r = op(run, a, DELIVER, slot, item1, ((job1 + 1) & 0xFFFF) or 7, pre=image(a, slot, item1))
+    ck("W2 a completion naming ANOTHER job id is refused WORK_STALE_JOB (34)", r is not None and r.outcome == REJECTED and r.reason == REASON_STALE_JOB)
     wrong = next(f for f in sorted(fruits) if f != item1)
-    pre_w = with_item(a, slot, wrong)
-    mark, sent, r = work(run, a, OP_DELIVER, slot, wrong, job1 & 0xFFFF, pre=pre_w)
-    ck("W3 handing in an item that is NOT the objective is refused PRECOND (9)", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    mark, sent, r = op(run, a, DELIVER, slot, wrong, job1 & 0xFFFF, pre=image(a, slot, wrong))
+    ck("W2 handing in a fruit that is NOT the objective is refused PRECOND (9)", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    mark, sent, r1 = op(run, a, GIVE, slot, ps, 0x1234, pre=image(a))
+    mark, sent, r2 = op(run, a, TAKE, slot, ps, job1 & 0xFFFF, pre=image(a))
+    mark, sent, r3 = op(run, a, REPORT, 0, 0, job1 & 0xFFFF)
+    ck("W2 ops of another job type (villager give / take parcel / report) are refused PRECOND on a fruit job",
+       all(x is not None and x.outcome == REJECTED and x.reason == REASON_PRECOND for x in (r1, r2, r3)))
 
-    # ---- W4
+    # ---- W3: DELIVER pays; duplicate; stale
     off = len(run.log())
-    pockets, conds, wallet0 = a.txn_pre_image()
-    pre_a = with_item(a, slot, item1)
-    mark, sent4, r4 = work(run, a, OP_DELIVER, slot, item1, job1 & 0xFFFF, pre=pre_a)
-    run.tx_ok("W4 DELIVER of the job item", r4, APPLIED, R["NONE"])
-    ck("W4 the HOST paid its own reward: post wallet = pre wallet + reward", r4 is not None and r4.post_wallet == wallet0 + reward1)
-    ck("W4 the pocket slot is empty in the post image", r4 is not None and r4.post_pockets[slot] == 0)
-    s4 = last_state(a, mark)
-    ck("W4 WORK_STATE: job retired (state NONE), tombstone = the job id, jobs_done 1", s4 is not None and s4["state"] == 0 and s4["last"] == job1 and s4["done"] == 1)
-    ck("W4 exactly ONE host commit line for the delivery", run.n_log(r"WORK op 2 committed: job_id=%d " % job1, off) == 1)
-
-    # ---- W5: duplicate packet / retransmit of the same bytes
-    a.resend_txn(sent4)
-    r5 = a.wait_txn_result(sent4.seq, 4.0, nth=2)
-    ck("W5 the retransmit is answered from the journal: APPLIED, reason REPLAYED, the same post wallet",
-       r5 is not None and r5.outcome == APPLIED and r5.reason == R["REPLAYED"] and r5.post_wallet == r4.post_wallet)
+    wallet0 = a.txn_pre_image()[2]
+    mark, sent3, r3 = op(run, a, DELIVER, slot, item1, job1 & 0xFFFF, pre=image(a, slot, item1))
+    run.tx_ok("W3 DELIVER of the native fruit", r3, APPLIED, R["NONE"])
+    ck("W3 the HOST paid its own Nook reward: post wallet = pre wallet + reward, the slot is emptied", r3 is not None and r3.post_wallet == wallet0 + reward1 and r3.post_pockets[slot] == 0)
+    s3 = last_state(a, mark)
+    ck("W3 WORK_STATE: job retired (state NONE), tombstone = the job id, jobs_done 1 -- the menu returns to 'I'd like to work'", s3 is not None and s3["state"] == 0 and s3["last"] == job1 and s3["done"] == 1)
+    ck("W3 exactly ONE host commit line for the delivery", run.n_log(r"WORK op 2 committed: job_id=%d " % job1, off) == 1)
+    a.resend_txn(sent3)
+    r3b = a.wait_txn_result(sent3.seq, 4.0, nth=2)
+    ck("W3 the retransmit is answered from the journal: APPLIED, REPLAYED, the same post wallet", r3b is not None and r3b.outcome == APPLIED and r3b.reason == R["REPLAYED"] and r3b.post_wallet == r3.post_wallet)
     L.pump_sleep(0.4)
-    ck("W5 still ONE commit line (nothing re-executed, nothing paid twice)", run.n_log(r"WORK op 2 committed: job_id=%d " % job1, off) == 1)
+    ck("W3 still ONE commit line (nothing paid twice)", run.n_log(r"WORK op 2 committed: job_id=%d " % job1, off) == 1)
+    mark, sent, r = op(run, a, DELIVER, slot, item1, job1 & 0xFFFF, pre=image(a, slot, item1))
+    ck("W3 a NEW-seq completion of the PAID job is refused WORK_NO_JOB (33): no second reward", r is not None and r.outcome == REJECTED and r.reason == REASON_NO_JOB)
 
-    # ---- W6: a stale completion with a NEW seq for the retired job; a new job; the old id refused
-    pre_a = with_item(a, slot, item1)
-    mark, sent, r = work(run, a, OP_DELIVER, slot, item1, job1 & 0xFFFF, pre=pre_a)
-    ck("W6 a new-seq completion of the already PAID job is refused WORK_NO_JOB (33): no second reward", r is not None and r.outcome == REJECTED and r.reason == REASON_NO_JOB)
-    mark, sent, r = work(run, a, OP_ENTER)
-    run.tx_ok("W6 ENTER after the paid job", r, APPLIED, R["NONE"])
+    # ---- W4: job 2 = FETCH_VILLAGER
+    mark, sent, r = op(run, a, ENTER)
+    run.tx_ok("W4 ENTER (second job)", r, APPLIED, R["NONE"])
+    st4 = last_state(a, mark)
+    ck("W4 a FETCH job: a villager (npc id), a stationery item, a Nook reward, step 0 (the item is still with the villager)",
+       st4 is not None and st4["type"] == T_FETCH and st4["state"] == 1 and st4["villager"] != 0 and st4["item"] in papers and st4["step"] == 0 and st4["job_id"] > job1)
+    if st4 is None or st4["type"] != T_FETCH:
+        return
+    job2, villager2, fitem, reward2 = st4["job_id"], st4["villager"], st4["item"], st4["reward"]
+    mark, sent, r = op(run, a, DELIVER, slot, fitem, job2 & 0xFFFF, pre=image(a, slot, fitem))
+    ck("W4 Nook cannot be paid before the item was fetched (a claimed item, step 0): PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    mark, sent, r = op(run, a, GIVE, slot, fitem, (villager2 + 1) & 0xFFFF or 5, pre=image(a))
+    ck("W4 the WRONG villager hands nothing: PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    pk_before = a.txn_pre_image()[0]
+    mark, sent, r = op(run, a, GIVE, slot, fitem, villager2, pre=image(a))
+    run.tx_ok("W4 the RIGHT villager hands over the item", r, APPLIED, R["NONE"])
+    ck("W4 the item is in the pocket slot (the host post image) and the step is 1", r is not None and r.post_pockets[slot] == fitem and pk_before[slot] == 0 and (last_state(a, mark) or {}).get("step") == 1)
+    mark, sent, r = op(run, a, GIVE, free_slot(a), fitem, villager2, pre=image(a))
+    ck("W4 a SECOND request to the villager is refused (no duplicate item): PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    wallet0 = a.txn_pre_image()[2]
+    mark, sent, r = op(run, a, DELIVER, slot, fitem, job2 & 0xFFFF, pre=image(a))
+    run.tx_ok("W4 DELIVER of the fetched item to Nook", r, APPLIED, R["NONE"])
+    ck("W4 the Nook reward is paid by the HOST and the job is retired", r is not None and r.post_wallet == wallet0 + reward2 and (last_state(a, mark) or {}).get("state") == 0)
+
+    # ---- W5: job 3 = DELIVER_VILLAGER
+    mark, sent, r = op(run, a, ENTER)
+    st5 = last_state(a, mark)
+    ck("W5 a DELIVER job: a recipient villager, a parcel, a Nook reward (+ an optional tip decided by the host)",
+       st5 is not None and st5["type"] == T_DELIVER and st5["villager"] != 0 and st5["carried"] in papers and st5["step"] == 0 and st5["tip_kind"] in (0, 1, 2))
+    if st5 is None or st5["type"] != T_DELIVER:
+        return
+    job3, villager3, parcel, reward3, tkind, tvalue = st5["job_id"], st5["villager"], st5["carried"], st5["reward"], st5["tip_kind"], st5["tip_value"]
+    mark, sent, r = op(run, a, REPORT, 0, 0, job3 & 0xFFFF)
+    ck("W5 REPORT before anything was delivered is refused PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    mark, sent, r = op(run, a, TAKE, slot, parcel, job3 & 0xFFFF, pre=image(a))
+    run.tx_ok("W5 TAKE_PARCEL (Nook hands the parcel over)", r, APPLIED, R["NONE"])
+    ck("W5 the parcel is in the pocket slot and the step is 1", r is not None and r.post_pockets[slot] == parcel and (last_state(a, mark) or {}).get("step") == 1)
+    mark, sent, r = op(run, a, TAKE, free_slot(a), parcel, job3 & 0xFFFF, pre=image(a))
+    ck("W5 a second parcel is refused (no duplicate item): PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    mark, sent, r = op(run, a, RECEIVE, slot, parcel, (villager3 + 1) & 0xFFFF or 5, pre=image(a))
+    ck("W5 the WRONG villager takes nothing: PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    wallet0 = a.txn_pre_image()[2]
+    mark, sent, r = op(run, a, RECEIVE, slot, parcel, villager3, pre=image(a))
+    run.tx_ok("W5 the RIGHT villager takes the parcel", r, APPLIED, R["NONE"])
+    if r is not None and r.outcome == APPLIED:
+        if tkind == 1:
+            ck("W5 the villager tip is Bells (%d): the wallet grows by exactly the tip, the slot is empty" % tvalue, r.post_wallet == wallet0 + tvalue and r.post_pockets[slot] == 0)
+        elif tkind == 2:
+            ck("W5 the villager tip is an item (0x%04X): it takes the parcel's place, the wallet is unchanged" % tvalue, r.post_pockets[slot] == tvalue and r.post_wallet == wallet0)
+        else:
+            ck("W5 no villager tip: the slot is empty, the wallet is unchanged", r.post_pockets[slot] == 0 and r.post_wallet == wallet0)
+        ck("W5 the step is 2 (delivered)", (last_state(a, mark) or {}).get("step") == 2)
+    mark, sent, r2 = op(run, a, RECEIVE, slot, parcel, villager3, pre=image(a, slot, parcel))
+    ck("W5 the villager cannot be paid twice (a second RECEIVE is refused): PRECOND", r2 is not None and r2.outcome == REJECTED and r2.reason == REASON_PRECOND)
+    wallet0 = a.txn_pre_image()[2]
+    mark, sent, r = op(run, a, REPORT, 0, 0, job3 & 0xFFFF)
+    run.tx_ok("W5 REPORT to Nook", r, APPLIED, R["NONE"])
+    ck("W5 the NOOK reward is paid on top of the tip (the tip never replaces it) and the job is retired", r is not None and r.post_wallet == wallet0 + reward3 and (last_state(a, mark) or {}).get("state") == 0)
+    mark, sent, r = op(run, a, REPORT, 0, 0, job3 & 0xFFFF)
+    ck("W5 a second REPORT is refused WORK_NO_JOB (33): no second reward", r is not None and r.outcome == REJECTED and r.reason == REASON_NO_JOB)
+
+    # ---- W6: LEAVE quits the job
+    mark, sent, r = op(run, a, ENTER)
     st6 = last_state(a, mark)
-    ck("W6 a NEW job (a larger host job id), the old one is gone", st6 is not None and st6["job_id"] > job1 and st6["state"] == 1)
-    job2, item2, reward2 = st6["job_id"], st6["item"], st6["reward"]
-    pre_a = with_item(a, slot, item1)
-    mark, sent, r = work(run, a, OP_DELIVER, slot, item1, job1 & 0xFFFF, pre=pre_a)
-    ck("W6 the OLD job id is refused WORK_STALE_JOB (34) while the new job is active", r is not None and r.outcome == REJECTED and r.reason == REASON_STALE_JOB)
+    ck("W6 a new job (the registry cycles on)", st6 is not None and st6["state"] == 1 and st6["job_id"] > job3)
+    job6 = st6["job_id"]
+    mark, sent, r = op(run, a, LEAVE)
+    run.tx_ok("W6 LEAVE (quit the job)", r, APPLIED, R["NONE"])
+    s6 = last_state(a, mark)
+    ck("W6 the job is abandoned: state NONE, Work Mode off -- the menu returns to 'I'd like to work'; nothing was paid (jobs_done unchanged)", s6 is not None and s6["state"] == 0 and s6["mode"] == 0 and s6["done"] == 3)
+    mark, sent, r = op(run, a, DELIVER, slot, st6["item"], job6 & 0xFFFF, pre=image(a, slot, st6["item"]))
+    ck("W6 a completion of the abandoned job is refused WORK_NO_JOB (33)", r is not None and r.outcome == REJECTED and r.reason == REASON_NO_JOB)
+    mark, sent, r = op(run, a, ENTER)
+    st6b = last_state(a, mark)
+    ck("W6 ENTER after a quit creates a NEW job (never the abandoned one)", st6b is not None and st6b["state"] == 1 and st6b["job_id"] > job6)
+    jobA = st6b
 
-    # ---- W7: LEAVE keeps the job, no work outside Work Mode
-    mark, sent, r = work(run, a, OP_LEAVE)
-    run.tx_ok("W7 LEAVE", r, APPLIED, R["NONE"])
-    s7 = last_state(a, mark)
-    ck("W7 Work Mode off, the active job is kept", s7 is not None and (s7["flags"] & 1) == 0 and s7["state"] == 1 and s7["job_id"] == job2)
-    pre_a = with_item(a, slot, item2)
-    mark, sent, r = work(run, a, OP_DELIVER, slot, item2, job2 & 0xFFFF, pre=pre_a)
-    ck("W7 DELIVER while NOT in Work Mode is refused WORK_NO_JOB (33)", r is not None and r.outcome == REJECTED and r.reason == REASON_NO_JOB)
-
-    # ---- W8: reconnect as the same character
+    # ---- W7: reconnect
     run.release(a)
     a2 = run.ready("A2", run.r1)
-    mark, sent, r = work(run, a2, OP_ENTER)
-    run.tx_ok("W8 ENTER after a disconnect + reconnect as the same character", r, APPLIED, R["NONE"])
-    s8 = last_state(a2, mark)
-    ck("W8 the SAME job (id / item / reward) comes back: it belongs to the character, not the connection", s8 is not None and s8["job_id"] == job2 and s8["item"] == item2 and s8["reward"] == reward2)
+    L.pump_sleep(1.0)
+    s7 = states(a2)
+    ck("W7 the SAME job state (id, type, step, villager, reward) is pushed at connect with NO op after a reconnect",
+       len(s7) >= 1 and s7[0]["request_id"] == 0 and s7[0]["job_id"] == jobA["job_id"] and s7[0]["state"] == 1 and s7[0]["type"] == jobA["type"] and s7[0]["step"] == jobA["step"]
+       and s7[0]["villager"] == jobA["villager"] and s7[0]["reward"] == jobA["reward"])
 
-    # ---- W9: a guest works too
+    # ---- W8: guest
     g = L.FakeClient("G", run.ip, run.port, guest=L.guest_identity("WORKGUEST", 0x4B01))
     run.clients.append(g)
+    gjob = None
     try:
         g.connect_and_ready(quiet=True)
     except Exception as exc:  # noqa: BLE001
-        ck("W9 the guest connected (%r)" % (exc,), False)
+        ck("W8 the guest connected (%r)" % (exc,), False)
         g = None
-    gjob = None
     if g is not None:
-        gslot = free_slot(g)
-        mark, sent, r = work(run, g, OP_ENTER)
-        run.tx_ok("W9 guest ENTER", r, APPLIED, R["NONE"])
-        sg = last_state(g, mark)
-        ck("W9 the guest got its OWN job (different from A's)", sg is not None and sg["state"] == 1 and sg["job_id"] not in (job1, job2))
-        if sg is not None:
-            gjob = sg
-            gp0 = g.txn_pre_image()[2]
-            mark, sent, r = work(run, g, OP_DELIVER, gslot, sg["item"], sg["job_id"] & 0xFFFF, pre=with_item(g, gslot, sg["item"]))
-            ck("W9 the guest's DELIVER is APPLIED and pays the host reward", r is not None and r.outcome == APPLIED and r.post_wallet == gp0 + sg["reward"])
+        L.pump_sleep(0.8)
+        ck("W8 the guest got the connect-time state too (no job)", len(states(g)) >= 1 and states(g)[0]["state"] == 0)
+        mark, sent, r = op(run, g, ENTER)
+        run.tx_ok("W8 guest ENTER", r, APPLIED, R["NONE"])
+        gjob = last_state(g, mark)
+        ck("W8 the guest got its OWN job", gjob is not None and gjob["state"] == 1 and gjob["job_id"] != jobA["job_id"])
 
-    # ---- W10: host restart
-    all_jobs = [job1, job2] + ([gjob["job_id"]] if gjob else [])
+    # ---- W9: host restart
+    all_ids = [job1, job2, job3, jobA["job_id"]] + ([gjob["job_id"]] if gjob else [])
     for cl in list(run.clients):
         run.release(cl)
-    ck("W10 the first host did not crash before the restart", run.host.stop() is None)
+    ck("W9 the first host did not crash before the restart", run.host.stop() is None)
     ip, port = run.ip, run.port
     host2 = L.HostProcess(port=port, extra_args=["--bootstrap-resident", str(L.TEST_HOST_RESIDENT)], log_path=os.path.join(HERE, "work_mode_proto_host2.log")).start()
     ok = host2.wait_listening(60.0) and host2.boot_to_field(timeout=90.0, slot=L.TEST_HOST_RESIDENT)
     run.host = host2
-    ck("W10 the host restarted", ok)
+    ck("W9 the host restarted", ok)
     if not ok:
         return
     L.resolve_host_town(ip, port)
     a3 = run.ready("A3", run.r1)
-    mark, sent, r = work(run, a3, OP_ENTER)
-    run.tx_ok("W10 ENTER after a host restart", r, APPLIED, R["NONE"])
-    s10 = last_state(a3, mark)
-    ck("W10 the persisted job survived the restart (same id / item / reward)", s10 is not None and s10["job_id"] == job2 and s10["item"] == item2 and s10["reward"] == reward2)
-    ck("W10 the host loaded work_jobs.dat", run.n_log(r"\[NET\]\[WORK\] host: loaded .*work_jobs\.dat \(next job id \d+\)") == 1)
-    pre = with_item(a3, slot, item1)
-    mark, sent, r = work(run, a3, OP_DELIVER, slot, item1, job1 & 0xFFFF, pre=pre)
-    ck("W10 a completion of the job paid BEFORE the restart is still refused (no duplicate reward across a restart)", r is not None and r.outcome == REJECTED and r.reason in (REASON_STALE_JOB, REASON_NO_JOB))
-    # pay job2 now, then a fresh ENTER must produce a job id beyond everything issued before the restart
-    pre = with_item(a3, slot, item2)
-    mark, sent, r = work(run, a3, OP_DELIVER, slot, item2, job2 & 0xFFFF, pre=pre)
-    ck("W10 the restored job can be completed and paid", r is not None and r.outcome == APPLIED)
-    mark, sent, r = work(run, a3, OP_ENTER)
-    s10b = last_state(a3, mark)
-    ck("W10 a job id issued after the restart never repeats an earlier one", s10b is not None and s10b["job_id"] > max(all_jobs))
+    L.pump_sleep(1.0)
+    s9 = states(a3)
+    ck("W9 the persisted job survived the restart and is pushed at connect (same id / type / step / villager / reward)",
+       len(s9) >= 1 and s9[0]["job_id"] == jobA["job_id"] and s9[0]["type"] == jobA["type"] and s9[0]["villager"] == jobA["villager"] and s9[0]["reward"] == jobA["reward"] and s9[0]["state"] == 1)
+    ck("W9 the host loaded work_jobs.dat", run.n_log(r"\[NET\]\[WORK\] host: loaded .*work_jobs\.dat \(next job id \d+\)") == 1)
+    mark, sent, r = op(run, a3, DELIVER, slot, fitem, job2 & 0xFFFF, pre=image(a3, slot, fitem))
+    ck("W9 a completion of a job paid BEFORE the restart is still refused (no duplicate reward across a restart)", r is not None and r.outcome == REJECTED and r.reason in (REASON_STALE_JOB, REASON_NO_JOB))
+    mark, sent, r = op(run, a3, LEAVE)
+    mark, sent, r = op(run, a3, ENTER)
+    s9b = last_state(a3, mark)
+    ck("W9 a job id issued after the restart never repeats an earlier one", s9b is not None and s9b["job_id"] > max(all_ids))
 
 
 def run_phase_two_hosts(results, ip, port, tag, body, snap_gci, restore):
