@@ -288,16 +288,96 @@ static void aNPC_actor_move_show_after(ACTOR* actorx, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* Indoor villagers (see pc_net_game.c "Indoor villagers"): the villager standing in ITS OWN house (SCENE_NPC_HOUSE, house_owner_name == its npc_id). Every in-room process
+ * simulates this NPC2 locally (schedule / action / RNG), so two players in the same house would see different poses. One process (the host-arbitrated pose holder) keeps simulating
+ * and reports position / facing / coarse action; the others apply that pose instead of running schedule / action / angle code. Dialogue, choices and interaction scripts stay local:
+ * a villager in a local talk (or any local interaction state) is never overridden. */
+static int aNPC_pc_room_villager(NPC_ACTOR* nactorx, GAME_PLAY* play, u16* owner_out) {
+    u16 owner;
+
+    if (play->scene_id != SCENE_NPC_HOUSE || nactorx->npc_info.animal == NULL) {
+        return FALSE;
+    }
+    owner = (u16)Common_Get(house_owner_name);
+    if ((u16)nactorx->npc_info.animal->id.npc_id != owner) {
+        return FALSE;
+    }
+    *owner_out = owner;
+    return TRUE;
+}
+
+static int aNPC_pc_room_talking(NPC_ACTOR* nactorx) {
+    return nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK || mDemo_Get_talk_actor() != NULL;
+}
+
+/* 1 = a fresh pose of this villager from another in-room player is applied this frame (schedule / action / angle are skipped by the caller). */
+static int aNPC_pc_room_follow(NPC_ACTOR* nactorx, ACTOR* actorx, GAME_PLAY* play) {
+    u16 owner;
+    float x, y, z;
+    s16 angle;
+    int moving;
+    uint8_t act;
+    u8 desired;
+
+    if (!aNPC_pc_room_villager(nactorx, play, &owner) || aNPC_pc_room_talking(nactorx)) {
+        return FALSE;
+    }
+    if (!pc_net_game_room_npc_follow((int)play->scene_id, owner, (uint16_t)nactorx->npc_info.animal->id.npc_id, &x, &y, &z, &angle, &moving, &act)) {
+        return FALSE;
+    }
+    actorx->world.position.x = x;
+    actorx->world.position.y = y;
+    actorx->world.position.z = z;
+    actorx->shape_info.rotation.y = angle;
+    actorx->world.angle.y = angle;
+    actorx->speed = 0.0f;
+    desired = (act < aNPC_ACTION_TYPE_NUM) ? act : (u8)(moving ? aNPC_ACTION_TYPE_WALK : aNPC_ACTION_TYPE_WAIT);
+    if (nactorx->condition_info.action != desired) {
+        aNPC_setupAction(nactorx, desired);
+    }
+    return TRUE;
+}
+
+static void aNPC_pc_room_sample(NPC_ACTOR* nactorx, GAME_PLAY* play) {
+    u16 owner;
+
+    if (!aNPC_pc_room_villager(nactorx, play, &owner) || aNPC_pc_room_talking(nactorx)) {
+        return;
+    }
+    pc_net_game_room_npc_sample((int)play->scene_id, owner, (uint16_t)nactorx->npc_info.animal->id.npc_id, nactorx->actor_class.world.position.x,
+                                nactorx->actor_class.world.position.y, nactorx->actor_class.world.position.z, nactorx->actor_class.world.angle.y,
+                                (uint8_t)nactorx->condition_info.action);
+}
+#endif
+
 static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
+#ifdef TARGET_PC
+    int pc_room_follow;
+#endif
 
     aNPC_set_over_friendship(nactorx);
     aNPC_actor_move_show_before(actorx, game);
-    aNPC_schedule_proc(nactorx, play);
-    aNPC_action_proc(nactorx, play);
+#ifdef TARGET_PC
+    pc_room_follow = aNPC_pc_room_follow(nactorx, actorx, play);
+    if (!pc_room_follow) {
+#endif
+        aNPC_schedule_proc(nactorx, play);
+        aNPC_action_proc(nactorx, play);
+#ifdef TARGET_PC
+    }
+#endif
     aNPC_talk_request_check(actorx, game);
-    aNPC_angle_calc(nactorx);
+#ifdef TARGET_PC
+    if (!pc_room_follow) {
+#endif
+        aNPC_angle_calc(nactorx);
+#ifdef TARGET_PC
+        aNPC_pc_room_sample(nactorx, play);
+    }
+#endif
     aNPC_calc_fatigue(nactorx);
     aNPC_actor_move_show_after(actorx, game);
 }

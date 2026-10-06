@@ -510,6 +510,9 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_TOWN_DONE             = 65, /* Town transfer: client -> host, RELIABLE, 12 bytes: the client's verdict (0 OK, 1 BAD_CRC, 2 BAD_GCI, 3 IO, 4 ABORT); the host then closes the connection. */
     PC_NETGAME_MSG_RESIDENT_HANDOFF      = 66, /* Guest -> resident promotion (M-F, v8 unreleased: extended in place, NO version bump), host -> client, RELIABLE, 48 bytes: sent to a PROMOTED guest that connects
                                              * with its GUEST claim + guest token, right before REJECT reason 6 PROMOTED. Carries the new resident's town PID and resident token. An old client drops it. */
+    PC_NETGAME_MSG_ROOM_NPC              = 67, /* Indoor villagers (v8 unreleased: extended in place, NO version bump), both directions, UNRELIABLE, 28 bytes. The pose of the villager
+                                             * standing in its own house (SCENE_NPC_HOUSE, owner = the villager's npc_id), sampled by the room's pose holder (any in-room player process) -> host, which
+                                             * validates that the sender announced exactly that room and holds the room lease, then relays it to every OTHER in-room READY peer. An old peer drops it. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2772,6 +2775,25 @@ static uint32_t s_local_move_send_counter = 0; /* this process's own per-send co
  * multiplier, not a rate change). */
 static float s_move_rate_log_accum = 0.0f;
 static int   s_move_send_count_this_window = 0;
+/* Indoor villagers: PC_NETGAME_MSG_ROOM_NPC. Room NPC2 actors (a villager at home) are simulated by every process that has the room loaded; the host (possibly dedicated, with
+ * no avatar and no room simulation) cannot sample them, so the pose HOLDER is whichever in-room player process got there first (host-arbitrated lease, see
+ * pcnetgame_room_npc_host_submit). `sender` is filled in by the host on relay. */
+typedef struct PCNetGameRoomNpcMsg {
+    uint8_t  msg_type;     /* PC_NETGAME_MSG_ROOM_NPC */
+    uint8_t  scene_id;     /* SCENE_NPC_HOUSE (the only room kind carrying a villager today) */
+    uint8_t  action_type;  /* NPC_ACTOR::condition_info.action (aNPC_ACTION_TYPE_*) of the holder's actor */
+    uint8_t  sender;       /* host relay: the PCNetPlayerId of the holder (client -> host: ignored, the host uses the real peer) */
+    uint16_t owner;        /* house_owner_name: the villager whose house this is */
+    uint16_t npc_id;       /* the actor's Animal_c.id.npc_id (identity guard, == owner today) */
+    uint32_t frame;        /* holder-local monotonic counter */
+    float    pos_x, pos_y, pos_z;
+    int16_t  facing_angle;
+    int16_t  _reserved;
+} PCNetGameRoomNpcMsg;
+_Static_assert(sizeof(PCNetGameRoomNpcMsg) == 28, "PCNetGameRoomNpcMsg wire size drifted");
+static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in);
+static void pcnetgame_handle_client_room_npc(const PCNetGameRoomNpcMsg* in);
+
 #define PC_NETGAME_MOVE_RATE_LOG_PERIOD_60FPS_FRAMES 60.0f /* ~1s */
 
 /* N2 villager movement sync tuning constants (named so they're easy to find and retune later, same
@@ -25658,6 +25680,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGameRoomNpcMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ROOM_NPC) {
+        PCNetGameRoomNpcMsg rn;
+        memcpy(&rn, data, sizeof(rn));
+        pcnetgame_handle_host_room_npc(peer, &rn);
+        return;
+    }
+
     if (data[0] >= (uint8_t)PC_NETGAME_MSG_RECORD_HELLO && data[0] <= (uint8_t)PC_NETGAME_MSG_RECORD_ACK) {
         pcnetgame_handle_host_record(peer, data, size); /* D3 (v8): READY + bound gates inside */
         return;
@@ -26458,6 +26487,14 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         if (s_client_link != PC_NETGAME_LINK_READY) return;
         memcpy(&md, data, sizeof(md));
         pcnetgame_handle_client_mail_delivered(&md);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameRoomNpcMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ROOM_NPC) {
+        PCNetGameRoomNpcMsg rn;
+        if (s_client_link != PC_NETGAME_LINK_READY) return;
+        memcpy(&rn, data, sizeof(rn));
+        pcnetgame_handle_client_room_npc(&rn);
         return;
     }
 
@@ -31155,6 +31192,208 @@ int pc_net_game_get_npc_move_pose(int slot, uint16_t expected_npc_id, float* out
         *out_action_type = ns->last_action_type;
     }
     return ok;
+}
+
+/* ---- Indoor villagers (PC_NETGAME_MSG_ROOM_NPC) ----
+ * A villager inside its own house is a NPC2 actor every process with that room loaded simulates on its own (schedule/action/RNG are local), so two players in the same house
+ * would otherwise see it at different spots / facings / animations. Minimum authoritative state: the pose (position, facing, coarse action) of ONE simulation per room. The
+ * host arbitrates a per-room LEASE (first in-room sampler wins; the lease is released after PCNG_ROOM_NPC_LEASE_MS of silence or when the holder leaves the room) and relays the holder's
+ * pose to the other occupants, who stop simulating and consume it (pc_net_game_room_npc_follow). Nothing here touches the field villager stream, dialogue, schedules or save data. */
+#define PCNG_ROOM_NPC_LEASE_MS 1500u
+#define PCNG_ROOM_NPC_FOLLOW_FRAMES 90.0 /* a received pose is "fresh" for ~1.5 s of 60 fps frames */
+#define PCNG_ROOM_NPC_LEASES 4
+
+typedef struct PCNetRoomNpcLease {
+    uint8_t       active;
+    uint8_t       scene_id;
+    uint16_t      owner;
+    PCNetPlayerId holder;
+    uint32_t      last_ms;
+    uint32_t      last_frame;
+} PCNetRoomNpcLease;
+static PCNetRoomNpcLease s_room_lease[PCNG_ROOM_NPC_LEASES]; /* host only */
+
+static PCNetNpcMoveSlot s_room_ring;     /* receive/interpolation ring of the local room (one room at a time) */
+static uint8_t          s_room_rx_scene; /* room the ring belongs to */
+static uint16_t         s_room_rx_owner;
+static double           s_room_rx_frame; /* graph_dt_frame_time() of the last accepted sample */
+static uint32_t         s_room_tx_counter;
+static float            s_room_tx_accum;
+
+static int pcnetgame_room_scene_ok(const PCNetPlayerScene* s, int scene_id, uint16_t owner) {
+    return s->valid && (int)s->scene_id == scene_id && s->owner == owner && scene_id == SCENE_NPC_HOUSE;
+}
+
+static int pcnetgame_room_player_in_room(PCNetPlayerId who, int scene_id, uint16_t owner) {
+    PCNetPlayerScene ps;
+    return pc_net_game_get_peer_scene(who, &ps) && pcnetgame_room_scene_ok(&ps, scene_id, owner);
+}
+
+/* The local process's own ring: accept one relayed (or locally submitted) sample when this process is standing in that very room. */
+static void pcnetgame_room_npc_deliver_local(const PCNetGameRoomNpcMsg* m) {
+    PCNetPlayerScene ls;
+    PCNetNpcMoveSnapshot* dst;
+
+    if (gamePT == NULL || !pc_net_game_get_local_scene(&ls) || !pcnetgame_room_scene_ok(&ls, m->scene_id, m->owner)) {
+        return;
+    }
+    if (s_room_rx_scene != m->scene_id || s_room_rx_owner != m->owner || s_room_ring.cached_npc_id != m->npc_id) {
+        memset(&s_room_ring, 0, sizeof(s_room_ring));
+        s_room_rx_scene = m->scene_id;
+        s_room_rx_owner = m->owner;
+    }
+    if (s_room_ring.have_frame && m->frame <= s_room_ring.last_accepted_frame && (s_room_ring.last_accepted_frame - m->frame) < 1000u) {
+        return; /* stale / duplicate / reordered (a much smaller frame = a new holder's counter: accepted) */
+    }
+    if (!s_room_ring.have_frame) {
+        printf("[NET][ROOMNPC] following the room pose: scene %u owner 0x%04X npc 0x%04X frame %u\n", (unsigned)m->scene_id, (unsigned)m->owner, (unsigned)m->npc_id,
+               (unsigned)m->frame);
+    }
+    s_room_ring.have_frame = 1;
+    s_room_ring.last_accepted_frame = m->frame;
+    s_room_ring.cached_npc_id = m->npc_id;
+    s_room_ring.last_action_type = m->action_type;
+    dst = &s_room_ring.snapshots[s_room_ring.snapshot_head];
+    dst->recv_local_frame = graph_dt_frame_time(gamePT);
+    dst->pos_x = m->pos_x;
+    dst->pos_y = m->pos_y;
+    dst->pos_z = m->pos_z;
+    dst->facing_angle = m->facing_angle;
+    s_room_ring.snapshot_head = (s_room_ring.snapshot_head + 1) % PC_NETGAME_NPC_MOVE_RING_SIZE;
+    if (s_room_ring.snapshot_count < PC_NETGAME_NPC_MOVE_RING_SIZE) {
+        s_room_ring.snapshot_count++;
+    }
+    s_room_rx_frame = dst->recv_local_frame;
+}
+
+/* Host: validate + arbitrate + relay one room pose from `from` (a peer id, or PC_NETGAME_HOST_PLAYER_ID for the host's own sampler). */
+static void pcnetgame_room_npc_host_submit(PCNetPlayerId from, PCNetGameRoomNpcMsg* m) {
+    PCNetRoomNpcLease* L = NULL;
+    uint32_t now;
+    int i;
+
+    if (m->scene_id != (uint8_t)SCENE_NPC_HOUSE || !pcnetgame_pos_valid(m->pos_x, m->pos_y, m->pos_z) || m->frame == 0) {
+        return;
+    }
+    if (!pcnetgame_room_player_in_room(from, m->scene_id, m->owner)) {
+        return; /* the sender never announced this room: it cannot own its villager pose */
+    }
+    now = pcnetgame_now_ms();
+    for (i = 0; i < PCNG_ROOM_NPC_LEASES; i++) {
+        if (s_room_lease[i].active && s_room_lease[i].scene_id == m->scene_id && s_room_lease[i].owner == m->owner) {
+            L = &s_room_lease[i];
+            break;
+        }
+    }
+    if (L == NULL) {
+        for (i = 0; i < PCNG_ROOM_NPC_LEASES; i++) {
+            if (!s_room_lease[i].active) {
+                L = &s_room_lease[i];
+                break;
+            }
+        }
+        if (L == NULL) {
+            L = &s_room_lease[0]; /* every slot busy: recycle (rooms are few; the holder simply re-acquires) */
+        }
+        memset(L, 0, sizeof(*L));
+        L->active = 1;
+        L->scene_id = m->scene_id;
+        L->owner = m->owner;
+        L->holder = -1;
+    }
+    if (L->holder != from) {
+        int holder_alive = L->holder >= 0 && (uint32_t)(now - L->last_ms) < PCNG_ROOM_NPC_LEASE_MS && pcnetgame_room_player_in_room(L->holder, m->scene_id, m->owner);
+        if (holder_alive) {
+            return; /* someone else simulates this room's villager */
+        }
+        printf("[NET][ROOMNPC] host: room scene %u owner 0x%04X pose holder is now player %d\n", (unsigned)m->scene_id, (unsigned)m->owner, (int)from);
+        L->holder = from;
+        L->last_frame = 0;
+    }
+    if (L->last_frame != 0 && m->frame <= L->last_frame) {
+        return;
+    }
+    L->last_frame = m->frame;
+    L->last_ms = now;
+    m->sender = (uint8_t)from;
+    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY && (PCNetPlayerId)i != from && pcnetgame_room_player_in_room((PCNetPlayerId)i, m->scene_id, m->owner)) {
+            pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, m, (uint16_t)sizeof(*m));
+        }
+    }
+    if (from != PC_NETGAME_HOST_PLAYER_ID) {
+        pcnetgame_room_npc_deliver_local(m); /* the host process is in the room too (non-dedicated) */
+    }
+}
+
+static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in) {
+    PCNetGameRoomNpcMsg m;
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    m = *in;
+    pcnetgame_room_npc_host_submit((PCNetPlayerId)peer, &m);
+}
+
+static void pcnetgame_handle_client_room_npc(const PCNetGameRoomNpcMsg* in) {
+    if (!pcnetgame_pos_valid(in->pos_x, in->pos_y, in->pos_z)) {
+        return;
+    }
+    pcnetgame_room_npc_deliver_local(in);
+}
+
+void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, float pos_x, float pos_y, float pos_z, int16_t facing_angle, uint8_t action_type) {
+    PCNetGameRoomNpcMsg m;
+
+    if (s_role == PC_NETGAME_ROLE_NONE || (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link != PC_NETGAME_LINK_READY) || gamePT == NULL ||
+        scene_id != SCENE_NPC_HOUSE) {
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST && pc_net_game_host_ready_peer_count() == 0) {
+        return;
+    }
+    if (!graph_dt_period_elapsed(gamePT, &s_room_tx_accum, PC_NETGAME_NPC_MOVE_SEND_PERIOD_60FPS_FRAMES)) {
+        return;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_ROOM_NPC;
+    m.scene_id = (uint8_t)scene_id;
+    m.action_type = action_type;
+    m.owner = owner;
+    m.npc_id = npc_id;
+    m.frame = ++s_room_tx_counter;
+    m.pos_x = pos_x;
+    m.pos_y = pos_y;
+    m.pos_z = pos_z;
+    m.facing_angle = facing_angle;
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        pcnetgame_room_npc_host_submit(PC_NETGAME_HOST_PLAYER_ID, &m);
+    } else {
+        pc_net_send(0, PC_NET_UNRELIABLE, &m, (uint16_t)sizeof(m));
+    }
+}
+
+int pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, float* out_pos_x, float* out_pos_y, float* out_pos_z, int16_t* out_facing_angle, int* out_moving,
+                                uint8_t* out_action_type) {
+    double now;
+    int moving = 0;
+
+    if (s_role == PC_NETGAME_ROLE_NONE || (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link != PC_NETGAME_LINK_READY) || gamePT == NULL) {
+        return 0;
+    }
+    if (!s_room_ring.have_frame || s_room_rx_scene != (uint8_t)scene_id || s_room_rx_owner != owner || s_room_ring.cached_npc_id != npc_id) {
+        return 0;
+    }
+    now = graph_dt_frame_time(gamePT);
+    if (now - s_room_rx_frame > PCNG_ROOM_NPC_FOLLOW_FRAMES) {
+        return 0; /* the holder went quiet (left / paused): this process simulates again and may take the lease */
+    }
+    if (!pcnetgame_npc_move_interpolate(&s_room_ring, now - PC_NETGAME_NPC_MOVE_INTERP_DELAY_FRAMES, out_pos_x, out_pos_y, out_pos_z, out_facing_angle, &moving)) {
+        return 0;
+    }
+    *out_moving = moving;
+    *out_action_type = s_room_ring.last_action_type;
+    return 1;
 }
 
 /* ---- N3 Channel B: villager is_home/hide/forced-schedule sync ---- */

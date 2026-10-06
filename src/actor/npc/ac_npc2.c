@@ -18,6 +18,7 @@
 #include "m_malloc.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_net_game.h" /* indoor villager sync -- pc_net_game_room_npc_sample()/_follow() */
 #endif
 
 #define aNPC_UNIT_RIGHT (1 << 0)

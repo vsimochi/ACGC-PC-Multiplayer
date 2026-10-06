@@ -1383,3 +1383,14 @@ The host already validated every SHOP_BUY (slot / item / host price / funds / jo
 - **Closed gate.** A SHOP_BUY while the shop is restocking is refused RESTOCKING (31); while the shop status is neither OPEN nor OPENEVENT (raffle day, upgrade closure) NOT_AVAILABLE.
 - **Host counter window.** The host's own player writes the item into its pocket at the "yes" and debits / marks the slot sold when the thank-you row ends; in between a client's SHOP_BUY of the same unique item still validated. The counter now reserves the item (`pc_net_game_host_shop_reserve`, 60 s cap, ignored when a second copy exists) and publishes the sale at once (`pc_net_game_host_shop_sold_notify`) instead of at the next 500 ms digest poll.
 - **Not implemented (by design).** The shop upgrade itself: the physical building tile (`aSL_RewriteShopFg`, host-only), `mEv_SAVED_RENEWSHOP` closure mirroring, the displaced-items police-box clearing and the flyers are described in the synchronization audit; the generation / level plumbing above is what an upgrade will use.
+
+## Indoor villagers (Patch 2)
+
+A villager standing in its own house is a NPC2 actor (`ac_npc2_move.c_inc`) that every process with the room loaded simulates on its own (schedule, action, RNG), and a dedicated host has no avatar and no room simulation. So the minimum authoritative state is **one pose stream per room** (position, facing, coarse action), not host simulation:
+
+- `PC_NETGAME_MSG_ROOM_NPC` (id 67, unreliable, 28 B; v8 still unreleased, no version bump). The room is `SCENE_NPC_HOUSE` + `house_owner_name` (= the villager's npc_id).
+- The in-room process that starts first **holds a host-arbitrated lease** and keeps simulating; it samples the actor (20 Hz) and sends the pose to the host. The host accepts it only if the sender announced exactly that room (PLAYER_SCENE) and holds the lease (released after 1.5 s of silence or when the holder leaves the room), drops stale / zero / non-finite frames and relays to every OTHER in-room READY peer.
+- Other occupants (`pc_net_game_room_npc_follow`) apply the delay-interpolated pose instead of running schedule / action / angle code; a late joiner snaps to the pose on the first sample; if the holder leaves, the next process that stops receiving poses simulates from where the actor was and takes the lease.
+- Not synchronized (unchanged): dialogue, choices, interaction scripts, a villager in a local talk state (never overridden), whether the villager is home (relies on the existing NPC_STATE `is_home` stream), room furniture of the villager.
+
+Test: `tools/net_spike/test_room_npc_protocol.py` (real host + scripted clients; actor hooks only source-audited, no two-process visual verification).

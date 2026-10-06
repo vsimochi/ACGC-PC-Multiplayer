@@ -1113,6 +1113,14 @@ int pc_net_game_get_npc_move_pose(int slot, uint16_t expected_npc_id, float* out
                                   float* out_pos_z, int16_t* out_facing_angle, int* out_moving,
                                   uint8_t* out_action_type);
 
+/* Indoor villagers (PC_NETGAME_MSG_ROOM_NPC). `scene_id` must be SCENE_NPC_HOUSE and `owner` the house owner (the villager's npc_id).
+ * _sample: called each frame by the room NPC2 actor that is SIMULATING locally; throttled; host-arbitrated lease (a no-op when not networked; the host drops the pose when a
+ * different in-room player holds the lease). _follow: 1 iff a fresh pose of that villager from another in-room player was received (the caller then applies it INSTEAD of
+ * simulating); 0 = simulate locally (and sample). Never blocks. */
+void pc_net_game_room_npc_sample(int scene_id, uint16_t owner, uint16_t npc_id, float pos_x, float pos_y, float pos_z, int16_t facing_angle, uint8_t action_type);
+int  pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, float* out_pos_x, float* out_pos_y, float* out_pos_z, int16_t* out_facing_angle, int* out_moving,
+                                 uint8_t* out_action_type);
+
 /* N3 Channel B: is_home/hide/forced-schedule sync. Host only (no-op for single-player/client): report
  * this villager's current is_home/hide/forced_type/forced_timer -- called once per frame per real
  * Save_t.animals[]-backed villager NPC_ACTOR, whether or not it is currently visible/hidden (see
