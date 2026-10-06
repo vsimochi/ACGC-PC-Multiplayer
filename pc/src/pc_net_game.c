@@ -2471,7 +2471,8 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
  *                      Every peer inside a shop is walked out as soon as the state arrives (pc_net_game_shop_restocking(), ac_shop_indoor.c). A replay of the same (nonce, seq) is answered
  *                      from the journal and never debits twice. */
 #define PC_NETGAME_TXN_KIND_SHOP_RESTOCK 15u
-#define PC_NETGAME_TXN_REASON_RESTOCKING 31u /* shop restock: a restock is already running (nothing charged) */
+#define PC_NETGAME_TXN_REASON_RESTOCKING 31u /* shop restock: a restock is already running (nothing charged); also a SHOP_BUY while the shop is closed for it */
+#define PC_NETGAME_TXN_REASON_STALE_CATALOG 32u /* shop: a SHOP_BUY made against another catalog generation than the host's current one (nothing charged) */
 #define PC_NETGAME_RESTOCK_PRICE         500u
 #define PC_NETGAME_RESTOCK_WAIT_MS       60000u
 #define PC_NETGAME_HOUSE_AUTO                 0xFFu
@@ -15677,6 +15678,7 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_INVALID_HOUSE: return "INVALID_HOUSE";
         case PC_NETGAME_TXN_REASON_NAME_TAKEN: return "NAME_TAKEN";
         case PC_NETGAME_TXN_REASON_RESTOCKING: return "RESTOCKING";
+        case PC_NETGAME_TXN_REASON_STALE_CATALOG: return "STALE_CATALOG";
         default: return "?";
     }
 }
@@ -16732,6 +16734,13 @@ static struct {
     int      loaded;       /* host: the restart-resume file was examined */
     int      client_active;
     uint32_t client_gen;
+    /* Patch 1: the CATALOG GENERATION of the host's physical shop: bumped whenever the stock is regenerated (a restock finishes, the daily exchange day changes, the shop level
+     * changes = an upgrade). It travels in HOST_CONFIG byte 3 (low 8 bits). A SHOP_BUY carries 1 + (gen % 255) in tag.flags (0 = not claimed); the host refuses a purchase
+     * made against another generation (STALE_CATALOG) so a client can never buy from a catalog the host has already replaced. */
+    uint32_t cat_gen;      /* host */
+    uint32_t cat_key;      /* host: digest of (exchange day, shop level) the generation was last derived from */
+    int      cat_key_valid;
+    uint8_t  client_cat_gen; /* client: the last HOST_CONFIG byte 3 */
 } s_restock;
 
 static int pcnetgame_ts_refresh(int svc);
@@ -16785,7 +16794,8 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
         memset(blob, 0, PC_NETGAME_TS_HOSTCFG_LEN);
         blob[0] = g_pc_authoritative_wildlife ? 1u : 0u;
         blob[1] = g_pc_house_sync ? (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC : 0u; /* furniture sync Stage 1 (byte 1 bit 0) */
-        blob[2] = s_restock.active ? 1u : 0u; /* Nook's shop restock: 1 = RESTOCKING (byte 3 reserved zero, bytes 4..7 = the restock generation, little endian) */
+        blob[2] = s_restock.active ? 1u : 0u; /* Nook's shop restock: 1 = RESTOCKING (byte 3 = the shop CATALOG generation (low 8 bits), bytes 4..7 = the restock generation, little endian) */
+        blob[3] = (uint8_t)(s_restock.cat_gen & 0xFFu);
         blob[4] = (uint8_t)(s_restock.gen & 0xFFu);
         blob[5] = (uint8_t)((s_restock.gen >> 8) & 0xFFu);
         blob[6] = (uint8_t)((s_restock.gen >> 16) & 0xFFu);
@@ -17043,6 +17053,45 @@ enum { PCNG_SHOP_CLS_NONE = 0, PCNG_SHOP_CLS_LISTED, PCNG_SHOP_CLS_COUNTED, PCNG
 
 /* tanuki_shop_status of THIS moment without any side effect (mSP_SetTanukiShopStatus() only runs when the host player's shop building actor
  * runs, so Common_Get(tanuki_shop_status) can be stale; every function used here is a pure read of the clock / event save). */
+/* Patch 1: the host's OWN player buys through the vanilla counter code (aNSC): the pocket gets the item at the "yes" and the debit + sold mark follow when the thank-you row
+ * ends. That gap was a window in which a client's SHOP_BUY of the same unique item still validated. The counter reserves the item for the gap (host only); the handler treats a
+ * reserved item as sold unless a second copy exists; the reservation ends with the counter's accounting (pc_net_game_host_shop_sold_notify) or after 60 s. */
+#define PCNG_CAT_TAG(gen) ((uint8_t)(1u + ((uint32_t)(gen) & 0xFFu) % 255u)) /* the non-zero tag.flags a SHOP_BUY carries for catalog generation `gen` (HOST_CONFIG carries its low byte) */
+static struct { mActor_name_t item; uint32_t at_ms; int active; } s_shop_resv;
+
+static int pcnetgame_shop_host_reserved(mActor_name_t item) {
+    int i, copies = 0;
+    if (!s_shop_resv.active || s_shop_resv.item != item) {
+        return 0;
+    }
+    if ((uint32_t)(pcnetgame_now_ms() - s_shop_resv.at_ms) > 60000u) {
+        s_shop_resv.active = 0;
+        return 0;
+    }
+    for (i = 0; i < mSP_GOODS_COUNT; i++) {
+        copies += (Save_Get(shop).items[i] == item) ? 1 : 0;
+    }
+    return copies <= 1;
+}
+
+void pc_net_game_host_shop_reserve(int item) {
+    if (s_role == PC_NETGAME_ROLE_HOST && item > 0 && item <= 0xFFFF) {
+        s_shop_resv.item = (mActor_name_t)item;
+        s_shop_resv.at_ms = pcnetgame_now_ms();
+        s_shop_resv.active = 1;
+    }
+}
+
+/* The host's counter finished its accounting (debit + sold mark done on Save_t.shop): publish the new stock at once (not at the next 500 ms poll) and drop the reservation. */
+void pc_net_game_host_shop_sold_notify(void) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    s_shop_resv.active = 0;
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
+    pcnetgame_host_ts_push_all();
+}
+
 static int pcnetgame_shop_status_now(void) {
     if (mSP_ShopOpen() == mSP_SHOP_STATUS_OPENEVENT) {
         return mSP_TANUKI_SHOP_STATUS_EVENT;
@@ -17348,7 +17397,7 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 3. shape */
-    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && t->flags == 0 &&
+    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && (t->flags == 0 || is_buy) && /* SHOP_BUY: flags = the catalog generation the buyer saw (0 = unclaimed) */
                (is_restock ? (t->slot == 0 && t->item == 0) : (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO));
     if (shape_ok) {
         if (is_restock) {
@@ -17467,9 +17516,22 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
         if (is_buy) {
             const mActor_name_t item = (mActor_name_t)t->item;
             int code = pcnetgame_shop_stock_code(item, &Save_Get(shop), pcnetgame_shop_status_now());
+            const int shop_status = mSP_ShopOpen();
             shop_cls = pcnetgame_shop_classify(item, &shop_rsv);
             shop_price = mSP_ItemNo2ItemPrice(item); /* THE HOST PRICE: the client's aux_item is only compared */
-            if (code < 0 || code != (int)t->aux_cond || shop_price == 0u) {
+            if (code >= 0 && pcnetgame_shop_host_reserved(item)) {
+                code = -1; /* the host's own player already took this unique item at the counter (its debit / sold mark follow a moment later) */
+            }
+            if (s_restock.active || shop_status == mSP_SHOP_STATUS_RESTOCK) {
+                fail = "the shop is closed for a restock";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_RESTOCKING;
+            } else if (shop_status != mSP_SHOP_STATUS_OPEN && shop_status != mSP_SHOP_STATUS_OPENEVENT) {
+                fail = "the shop is closed";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            } else if (t->flags != 0 && t->flags != PCNG_CAT_TAG(s_restock.cat_gen)) {
+                fail = "the purchase was made against another catalog generation than the host's current one";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_STALE_CATALOG;
+            } else if (code < 0 || code != (int)t->aux_cond || shop_price == 0u) {
                 fail = "the item is not in stock at that slot (sold out / not buyable now)";
                 fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
             } else if (shop_price != (uint32_t)t->aux_item) {
@@ -17713,6 +17775,9 @@ static void pcnetgame_restock_finish(const char* why) {
     }
     mSP_ExchangeLineUp_ZeldaMalloc();
     s_restock.active = 0;
+    s_restock.cat_gen++; /* a regenerated catalog is a new generation (the daily-exchange watch may have bumped it already: harmless, it only has to differ) */
+    s_restock.cat_key = 0;
+    s_restock.cat_key_valid = 0; /* re-derived on the next tick without a second bump */
     pcnetgame_restock_file_remove();
     printf("[NET][RESTOCK] host: restock %u finished (%s): a NEW catalog was generated, the shop is OPEN\n", (unsigned)s_restock.gen, why);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
@@ -17720,8 +17785,26 @@ static void pcnetgame_restock_finish(const char* why) {
     pcnetgame_host_ts_push_all();
 }
 
+/* Patch 1: the catalog generation follows the host's own shop: a new exchange day (the daily re-roll at 6:00) or a new shop level (an upgrade) is a new catalog. The first
+ * observation only records the key (a restart does not invent a generation). A restock bumps the generation explicitly in pcnetgame_restock_finish. */
+static void pcnetgame_shop_catalog_watch(void) {
+    uint32_t key = pcnetgame_fnv1a32(&Save_Get(shop).exchange_time, sizeof(Save_Get(shop).exchange_time));
+    key ^= (uint32_t)mSP_GetShopLevel() * 0x9E3779B1u;
+    if (!s_restock.cat_key_valid) {
+        s_restock.cat_key = key;
+        s_restock.cat_key_valid = 1;
+    } else if (key != s_restock.cat_key) {
+        s_restock.cat_key = key;
+        s_restock.cat_gen++;
+        printf("[NET][SHOP] host: the shop catalog changed (new exchange day / shop level %d): catalog generation %u\n", (int)mSP_GetShopLevel(), (unsigned)s_restock.cat_gen);
+        (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
+        (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
+    }
+}
+
 /* Once per host tick (world ready): the restart resume (once) and the deadline. */
 static void pcnetgame_restock_host_tick(uint32_t now) {
+    pcnetgame_shop_catalog_watch();
     if (!s_restock.loaded) {
         char path[160], key[PC_CHARACTER_TOWNKEY_LEN + 1], line[200], fkey[PC_CHARACTER_TOWNKEY_LEN + 8];
         unsigned long long end_wall = 0;
@@ -21665,6 +21748,7 @@ static int pcnetgame_txn_try_send(void) {
             slot = (uint8_t)free_idx;
             aux_cond = T->ts_aux;       /* the stock code */
             aux_item = T->ts_aux_item;  /* the price the player was shown */
+            flags = PCNG_CAT_TAG(s_restock.client_cat_gen); /* Patch 1: the catalog generation this buyer saw (the host refuses a stale one) */
             break;
         case PC_NETGAME_TXN_KIND_SHOP_SELL: {
             int k;
@@ -22489,8 +22573,8 @@ static int pcnetgame_ts_valid_hostcfg_blob(const uint8_t* blob) {
     if (blob[0] > 1u || (blob[1] & ~(uint8_t)(PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC | PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC)) != 0u) {
         return 0;
     }
-    if (blob[2] > 1u || blob[3] != 0u) {
-        return 0; /* byte 2 = shop restocking (0/1), byte 3 reserved zero; bytes 4..7 = the restock generation (any value) */
+    if (blob[2] > 1u) {
+        return 0; /* byte 2 = shop restocking (0/1), byte 3 = the catalog generation (any value); bytes 4..7 = the restock generation (any value) */
     }
     (void)i;
     return 1;
@@ -22562,6 +22646,10 @@ static void pcnetgame_ts_client_apply(const PCNetGameTownSvcStateMsg* m) {
             }
             s_restock.client_active = restocking;
             s_restock.client_gen = gen;
+            if (m->blob[3] != s_restock.client_cat_gen) {
+                printf("[NET][SHOP] client: the host's shop catalog generation is now %u\n", (unsigned)m->blob[3]);
+            }
+            s_restock.client_cat_gen = m->blob[3];
         }
         pcnetgame_pdata_client_set_hostcfg((m->blob[1] & (uint8_t)PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC) != 0); /* personal data sync: a client without the bit never sends */
         s_ts_client_seq[svc] = m->seq;

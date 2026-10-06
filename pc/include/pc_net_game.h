@@ -337,7 +337,10 @@ void pc_net_game_poll(void);
 /* --- queries --- */
 
 PCNetGameRole pc_net_game_role(void);
-int pc_net_game_shop_restocking(void); /* 1 while Nook's shop restocks (host: real state, client: last HOST_CONFIG); read by mSP_ShopOpen() */
+int pc_net_game_shop_restocking(void);
+void pc_net_game_host_shop_reserve(int item);   /* the HOST player took a unique item at the counter: reserved until the accounting ends (Patch 1) */
+void pc_net_game_host_shop_sold_notify(void);   /* the HOST counter finished its debit + sold mark: publish the stock now, drop the reservation */
+#define PC_NETGAME_TS_REJECT_STALE_CATALOG 32 /* a SHOP_BUY against another catalog generation than the host's */ /* 1 while Nook's shop restocks (host: real state, client: last HOST_CONFIG); read by mSP_ShopOpen() */
 
 /* Protocol v7 (M9-C): read-only observation hook called by the vanilla player code (src/game/m_player.c,
  * Player_actor_change_main_index, TARGET_PC only) right after the LOCAL player actually entered a main index

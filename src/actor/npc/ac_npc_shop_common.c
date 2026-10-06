@@ -3081,6 +3081,9 @@ static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pla
 #endif
                     else {
                         mPr_SetPossessionItem(Now_Private, idx, item, mPr_ITEM_COND_NORMAL);
+#ifdef TARGET_PC
+                        pc_net_game_host_shop_reserve((int)item); /* Patch 1: the unique item is taken; the debit + sold mark follow in aNSC_sell_item_init: until then a client's SHOP_BUY must not see it as stock */
+#endif
                         if (aNSC_check_item_with_ticket(item) == TRUE) {
                             mActor_name_t ticket = (Common_Get(time).rtc_time.month - 1) * 8 + ITM_TICKET_START;
                             if (aNSC_check_same_month_ticket(ticket) == TRUE) {
@@ -3724,6 +3727,9 @@ static void aNSC_sell_item_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* p
     if (CLIP(shop_design_clip) != NULL) {
         CLIP(shop_design_clip)->reportGoodsSale_proc(shop_common->ut_x, shop_common->ut_z);
     }
+#ifdef TARGET_PC
+    pc_net_game_host_shop_sold_notify(); /* Patch 1: publish the host's own sale at once (a no-op for a client / solo) */
+#endif
     shop_common->sell_item = EMPTY_NO;
 }
 

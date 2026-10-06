@@ -474,7 +474,7 @@ def m_malformed(run):
         ("buy dest NONE", K_BUY, D_NONE, 2, p_it, dict(aux_cond=1, aux_item=100)),
         ("buy aux_item (price) 0", K_BUY, D_POCKET, 2, p_it, dict(aux_cond=1, aux_item=0)),
         ("buy stock code 39", K_BUY, D_POCKET, 2, p_it, dict(aux_cond=39, aux_item=100)),
-        ("buy flags EXCHANGE", K_BUY, D_POCKET, 2, p_it, dict(aux_cond=1, aux_item=100, flags=1)),
+        ("sell flags EXCHANGE (a SHOP_BUY's flags byte is the catalog generation since Patch 1: any value is shape-legal there)", K_SELL, D_NONE, 2, p_it, dict(aux_item=4, flags=1)),
         ("sell dest POCKET", K_SELL, D_POCKET, 2, p_it, dict(aux_item=4)),
         ("sell mask 0", K_SELL, D_NONE, 2, p_it, dict(aux_item=0)),
         ("sell primary slot not in the mask", K_SELL, D_NONE, 2, p_it, dict(aux_item=1)),
