@@ -38,6 +38,10 @@ int  pc_dedicated_stdout_quiet(void);
 
 /* pc_main.c, after the output routing is decided: remember the listen port, print the "[DEDICATED] ..." startup line, start the stdin reader. */
 void pc_dedicated_startup(uint16_t port);
+/* First launch of a dedicated server (no authoritative town yet): asks on the server console for the town name (1-8 valid characters, re-asks until valid), SYNCHRONOUSLY,
+ * through the SAME stdin reader / queue the console commands use (no second reader thread). Called once after pc_dedicated_startup(), before the game boots. When stdin is
+ * closed / unavailable (EOF before a valid name) the fallback name "Village" is used. The chosen name goes to pc_server_set_town_name(). */
+void pc_dedicated_prompt_town_name(void);
 
 /* pc_platform_init(): BEFORE SDL_Init select SDL's dummy audio driver (env + OVERRIDE hint) and keep timer resolution requests honoured for a hidden
  * window; AFTER SDL_Init verify the dummy driver is the one that opened (returns 0 = refuse to continue). */

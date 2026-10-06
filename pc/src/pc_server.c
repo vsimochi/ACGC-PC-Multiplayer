@@ -1,6 +1,7 @@
 /* pc_server.c - the dedicated server's storage tree (servers/<id>/); see pc_server.h. Pure C + libc + pc_town_cache. */
 #include "pc_server.h"
 
+#include "pc_dedicated.h" /* pc_dedicated_say(): the server console */
 #include "pc_mp_guests.h"  /* PC_MP_GUESTS_PATH (the legacy default) */
 #include "pc_mp_members.h" /* PC_MP_MEMBERS_PATH */
 #include "pc_mp_records.h" /* PC_MP_RECORDS_PATH */
@@ -314,6 +315,22 @@ int pc_server_open(const char* id, uint16_t port, char* err, size_t errcap) {
     printf("[SERVER] server '%s' (%s): town %s%s; residents %s, guests %s\n", s_id, s_dir, s_town_missing ? "NOT FOUND -> a new town is generated on this first launch" : "found",
            s_adopted ? " (adopted from the legacy save)" : "", s_members, s_guests);
     pc_server_log("server '%s' opened (port %u, town %s)", s_id, (unsigned)port, s_town_missing ? "to be generated" : "existing");
+    if (ini.has_town) {
+        /* a restart: the authoritative identity in server.ini carries the town name (land_name hex = the 8 game character codes) */
+        uint8_t codes[8];
+        char text[24];
+        int k;
+        for (k = 0; k < 8; k++) {
+            unsigned v = 0x20;
+            if (strlen(ini.town_name_hex) >= (size_t)(2 * k + 2)) {
+                char b[3] = { ini.town_name_hex[2 * k], ini.town_name_hex[2 * k + 1], 0 };
+                v = (unsigned)strtoul(b, NULL, 16);
+            }
+            codes[k] = (uint8_t)v;
+        }
+        pc_server_town_name_text(codes, text);
+        pc_dedicated_say("Loading town \"%s\"...", text);
+    }
     return 1;
 }
 
@@ -329,17 +346,62 @@ const char* pc_server_members_path(void) { return s_active ? s_members : PC_MP_M
 const char* pc_server_records_path(void) { return s_active ? s_records : PC_MP_RECORDS_PATH; }
 const char* pc_server_restock_path(void) { return s_active ? s_restock : "save/mp/shop_restock.ini"; }
 
-void pc_server_land_name(char out[9]) {
-    size_t i, n = 0;
-    for (i = 0; s_server_name[i] != '\0' && n < 8; i++) {
-        const unsigned char c = (unsigned char)s_server_name[i];
-        if (isalnum(c)) {
-            out[n++] = (char)c;
-        }
+extern int pc_utf8_to_game_code(const char* text); /* pc_typing.c: the game's keyboard-editor charset (-1 = not a valid game character) */
+
+int pc_server_town_name_encode(const char* utf8, uint8_t out[8], char* err, size_t errcap) {
+    size_t i = 0, n = 0;
+    uint8_t tmp[8];
+    int code;
+    if (err != NULL && errcap > 0) {
+        err[0] = '\0';
     }
-    if (n == 0) {
-        memcpy(out, "Village", 7);
-        n = 7;
+    if (utf8 == NULL || utf8[0] == '\0' || utf8[0] == ' ' || utf8[strlen(utf8) - 1] == ' ') {
+        goto bad;
+    }
+    while (utf8[i] != '\0') {
+        const unsigned char c = (unsigned char)utf8[i];
+        size_t len = c < 0x80 ? 1u : (c >= 0xC0 && c <= 0xDF) ? 2u : 0u;
+        if (len == 0 || n >= 8 || (len == 2 && utf8[i + 1] == '\0')) {
+            goto bad;
+        }
+        code = pc_utf8_to_game_code(utf8 + i);
+        if (code < 0 || code > 255) {
+            goto bad;
+        }
+        tmp[n++] = (uint8_t)code;
+        i += len;
+    }
+    memset(out, ' ', 8); /* CHAR_SPACE == ' ' (the keyboard map's own value for a space) */
+    memcpy(out, tmp, n);
+    return 1;
+bad:
+    ps_seterr(err, errcap, "Invalid town name. Please enter 1-8 valid characters.");
+    return 0;
+}
+
+static uint8_t s_town_name[8];
+static int s_town_name_set = 0;
+
+void pc_server_set_town_name(const uint8_t codes[8]) {
+    memcpy(s_town_name, codes, 8);
+    s_town_name_set = 1;
+}
+
+void pc_server_town_name_codes(uint8_t out[8]) {
+    if (s_town_name_set) {
+        memcpy(out, s_town_name, 8);
+    } else {
+        memcpy(out, "Village ", 8);
+    }
+}
+
+void pc_server_town_name_text(const uint8_t codes[8], char out[24]) {
+    size_t i, n = 0;
+    for (i = 0; i < 8; i++) {
+        out[n++] = (codes[i] >= 0x20 && codes[i] < 0x7F) ? (char)codes[i] : '?';
+    }
+    while (n > 0 && out[n - 1] == ' ') {
+        n--;
     }
     out[n] = '\0';
 }
@@ -367,6 +429,8 @@ int pc_server_note_town(const PCTownId* t, int generated) {
             printf("[SERVER] server '%s': the town's terrain hash changed (0x%08lX -> 0x%08X); server.ini keeps the first one\n", s_id, cur.terrain_hash, (unsigned)t->terrain_hash);
         }
         printf("[SERVER] server '%s': town identity confirmed (%s)\n", s_id, key);
+        pc_dedicated_say("Town loaded.");
+        pc_dedicated_say("Server ready.");
         return 1;
     }
     if (cur.name[0] == '\0') {
@@ -384,6 +448,12 @@ int pc_server_note_town(const PCTownId* t, int generated) {
     ps_ini_write(s_ini, &cur, s_id, s_port);
     printf("[SERVER] server '%s': town identity recorded in %s (%s, %s)\n", s_id, s_ini, key, cur.origin);
     pc_server_log("town identity recorded: %s (%s)", key, cur.origin);
+    {
+        char text[24];
+        pc_server_town_name_text(t->land_name, text);
+        pc_dedicated_say(generated ? "Town \"%s\" generated." : (s_adopted ? "Town \"%s\" adopted from the legacy save." : "Town \"%s\" loaded."), text);
+        pc_dedicated_say("Server ready.");
+    }
     return 1;
 }
 

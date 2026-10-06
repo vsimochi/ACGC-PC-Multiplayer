@@ -2448,10 +2448,12 @@ static u16 pc_host_observer_pick_id(const PersonalID_c* base) {
  * new-game flow adds is a player and a town name chosen at the Rover intro; a dedicated server has no player (the guest-first town starts with every house free), so the initialiser's
  * pseudo-resident is cleared again and the town gets the server's name. The result is written once, atomically, to servers/<id>/town/card_a/DobutsunomoriP_MURA.gci. 1 = generated + saved. */
 static int pc_server_generate_town(GAME_PLAY* play) {
-    char name[9];
+    uint8_t name[8];
+    char name_text[24];
     int i, ok, was_ready;
-    pc_server_land_name(name);
-    OSReport("[SERVER] first launch: generating a new town (land name '%s') for server '%s'\n", name, pc_server_id());
+    pc_server_town_name_codes(name); /* the 8 game character codes the console asked for (pc_dedicated_prompt_town_name) */
+    pc_server_town_name_text(name, name_text);
+    OSReport("[SERVER] first launch: generating a new town (land name '%s') for server '%s'\n", name_text, pc_server_id());
     if (mSDI_StartDataInit((GAME*)play, 0, mSDI_INIT_MODE_NEW) != TRUE) {
         OSReport("[SERVER] town generation FAILED: mSDI_StartDataInit(NEW) failed\n");
         return FALSE;
@@ -2460,7 +2462,7 @@ static int pc_server_generate_town(GAME_PLAY* play) {
         mPr_ClearPrivateInfo(Save_GetPointer(private_data[i]));
     }
     for (i = 0; i < LAND_NAME_SIZE; i++) {
-        Save_Get(land_info).name[i] = (u8)(i < (int)strlen(name) ? name[i] : CHAR_SPACE);
+        Save_Get(land_info).name[i] = (u8)name[i];
     }
     Save_Get(land_info).exists = TRUE;
     mFRm_SetSaveCheckData(Save_GetPointer(save_check));
@@ -2473,8 +2475,8 @@ static int pc_server_generate_town(GAME_PLAY* play) {
         return FALSE;
     }
     pc_save_loaded = 1;
-    OSReport("[SERVER] new town '%s' (land id 0x%04X) generated and saved to %s\n", name, (unsigned)Save_Get(land_info).id, pc_gci_path());
-    pc_server_log("new town '%s' (land id 0x%04X) generated and saved to %s", name, (unsigned)Save_Get(land_info).id, pc_gci_path());
+    OSReport("[SERVER] new town '%s' (land id 0x%04X) generated and saved to %s\n", name_text, (unsigned)Save_Get(land_info).id, pc_gci_path());
+    pc_server_log("new town '%s' (land id 0x%04X) generated and saved to %s", name_text, (unsigned)Save_Get(land_info).id, pc_gci_path());
     return TRUE;
 }
 

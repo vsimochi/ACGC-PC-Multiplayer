@@ -14,7 +14,7 @@
  *       logs/server.log               the server's own log (-logfile default for a dedicated host, plus the [DEDICATED] notices)
  *       shop_restock.ini              the running manual shop restock (host restart resume)
  *
- * SERVER IDENTITY is the directory name <server-id> ([A-Za-z0-9_-], 1..32, default "default", --server-id ID): it is stable and says nothing about the town. The TOWN identity is the
+ * SERVER IDENTITY is the directory name <server-id> ([A-Za-z0-9_-], 1..32, always "default" for now: one server id = one persistent town, no command-line option): it is stable and says nothing about the town. The TOWN identity is the
  * game's own PCTownId (land_name, land_id, terrain_hash; its text form is the townkey) and lives in server.ini [town]; the townkey is NOT the directory name. The same PCTownId /
  * townkey keeps being the identity of client caches (save/mp/towns/<townkey>/, origin.ini) and of membership.ini: it is the TOWN identity there, the CACHE identity of a client, and in
  * this tree only a metadata value.
@@ -55,8 +55,14 @@ const char* pc_server_members_path(void);
 const char* pc_server_records_path(void);
 const char* pc_server_restock_path(void);
 
-/* The town's name for a generated town: the server name's letters / digits (max 8), else "Village". */
-void pc_server_land_name(char out[9]);
+/* The NAME of a town this server is about to generate (first launch only). The dedicated console asks for it (pc_dedicated.c pc_dedicated_prompt_town_name) and hands it to the
+ * game's own new-town initialiser. The game's town-name field takes 1..8 characters of the keyboard editor's charset (pc_typing.c pc_utf8_to_game_code: letters, digits and the
+ * punctuation the font has, accented letters): pc_server_town_name_encode() validates exactly that and returns the 8 game character codes (space padded). 1 = valid. A name is
+ * never truncated or altered; leading / trailing spaces are invalid. */
+int  pc_server_town_name_encode(const char* utf8, uint8_t out[8], char* err, size_t errcap);
+void pc_server_set_town_name(const uint8_t codes[8]);
+void pc_server_town_name_codes(uint8_t out[8]); /* the chosen name, else the fallback "Village" (stdin closed at the prompt / no console) */
+void pc_server_town_name_text(const uint8_t codes[8], char out[24]); /* game codes -> text for the console ('?' for a code outside ASCII); trailing spaces dropped */
 
 /* The authoritative town identity is known (the host loaded / generated its town). First time: records it in server.ini [town]. Later: compares. Returns 1 = ok / recorded,
  * 0 = server.ini names ANOTHER town (land_name / land_id differ): the caller must not serve it. A terrain_hash difference only logs. generated = 1 when this process generated it. */

@@ -361,6 +361,66 @@ void pc_dedicated_startup(uint16_t port) {
     }
 }
 
+/* Pops one queued console line. 1 = a line in *out, 0 = none queued. */
+static int pc_ded_pop_line(PCDedLine* out) {
+    int got = 0;
+    PC_DED_LOCK();
+    if (s_q_count > 0) {
+        *out = s_queue[s_q_head];
+        s_q_head = (s_q_head + 1) % PC_DED_QUEUE_MAX;
+        s_q_count--;
+        s_q_count_hint = s_q_count;
+        got = 1;
+    }
+    PC_DED_UNLOCK();
+    return got;
+}
+
+void pc_dedicated_prompt_town_name(void) {
+    uint8_t codes[8];
+    char err[96], text[24];
+    PCDedLine ln;
+    if (!g_pc_dedicated) {
+        return;
+    }
+    pc_ded_printf("\n========================================\n Animal Crossing Dedicated Host\n========================================\n\n");
+    pc_ded_printf("No town exists for this server.\n\n");
+    for (;;) {
+        pc_ded_printf("Enter town name (1-8 characters):\n> ");
+        pc_ded_flush();
+        pc_server_log("waiting for the town name on the console");
+        while (!pc_ded_pop_line(&ln)) {
+            if (!s_stdin_started || s_stdin_eof) {
+                /* the reader may have queued a last line before it saw EOF: look once more, then give up */
+                if (pc_ded_pop_line(&ln)) {
+                    break;
+                }
+                pc_server_town_name_codes(codes);
+                pc_server_set_town_name(codes);
+                pc_server_town_name_text(codes, text);
+                pc_ded_printf("\n[DEDICATED] console input is closed / unavailable: using the default town name \"%s\".\n", text);
+                pc_server_log("no console input: default town name \"%s\"", text);
+                pc_ded_flush();
+                return;
+            }
+#ifdef _WIN32
+            Sleep(20);
+#else
+            usleep(20000);
+#endif
+        }
+        if (!ln.truncated && pc_server_town_name_encode(ln.text, codes, err, sizeof(err))) {
+            pc_server_set_town_name(codes);
+            pc_server_town_name_text(codes, text);
+            pc_ded_printf("Town name set to \"%s\". Generating the town...\n", text);
+            pc_server_log("town name chosen: \"%s\"", text);
+            pc_ded_flush();
+            return;
+        }
+        pc_ded_printf("Invalid town name. Please enter 1-8 valid characters.\n\n");
+    }
+}
+
 /* ------------------------------------------------------------------------------------------------------------------------------------- */
 /* audio / window / platform                                                                                                              */
 /* ------------------------------------------------------------------------------------------------------------------------------------- */

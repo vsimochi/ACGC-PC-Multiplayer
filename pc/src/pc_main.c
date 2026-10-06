@@ -805,7 +805,6 @@ static char     g_pc_net_host_ip[64] = "127.0.0.1";
  * exclusive with --town-dir) downloads the host's town first (pc_net_game_town_prefetch, after pc_platform_init and before boot_main). --town-serve on|off
  * (HOST-only) overrides settings.ini [Network] town_serve (g_pc_town_serve_override). */
 static const char* g_pc_town_dir = NULL;
-static const char* g_pc_server_id = NULL; /* --server-id ID (HOST + --dedicated only): the dedicated server's storage tree servers/<ID>/ (default "default"); see pc_server.h */
 static int         g_pc_town_fetch = 0;
 /* M-C (Play Online): --online-ui (hidden, set by the relaunch): failure boxes of the pre-boot fetch offer Retry / Use saved copy / Quit. Without it the fetch keeps its
  * silent fallback ladder (scripts / tests). g_pc_bootstrap_resident_pid(_set): a RESIDENT membership of the fetched town (20 BE PersonalID bytes) read by the thin
@@ -1512,9 +1511,6 @@ int main(int argc, char* argv[]) {
             printf("                      nothing, uses SDL's dummy audio driver, keeps the console on and reads commands from stdin:\n");
             printf("                      help, status, players, save, stop (Ctrl+C also stops gracefully). Default off; plain --host,\n");
             printf("                      --host-observer and --bootstrap-resident are unchanged. See pc_dedicated.h.\n");
-            printf("  --server-id ID      HOST + --dedicated only: the server's own storage tree servers/ID/ (server.ini, town/card_a/*.gci, residents/, citizens/, backups/, logs/server.log).\n");
-            printf("                      Default ID 'default'. A first launch generates a new town there; a later launch loads it. An existing legacy save/card_a town is COPIED in once\n");
-            printf("                      (default ID only, originals untouched). Client data stays under save/.\n");
             printf("  --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]  TEST-ONLY, CLIENT role only, default off:\n");
             printf("                      become a GUEST (foreigner with that HOME PersonalID) in the loaded town\n");
             printf("                      and spawn at the station; no save is ever written. The guest is a FRESH\n");
@@ -1825,14 +1821,6 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             g_pc_max_guests_override = mg;
-            i++;
-        } else if (strcmp(argv[i], "--server-id") == 0) {
-            if (i + 1 >= argc || argv[i + 1][0] == '\0' || g_pc_server_id != NULL) {
-                fprintf(stderr, "[PC] --server-id: REFUSED: the option needs one ID (letters, digits, '_' and '-', 1..32 characters)\n"
-                                "usage: AnimalCrossing --host [port] --dedicated --server-id ID   (see --help)\n");
-                return 2;
-            }
-            g_pc_server_id = argv[i + 1];
             i++;
         } else if (strcmp(argv[i], "--town-dir") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '\0' || g_pc_town_dir != NULL) {
@@ -2402,16 +2390,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* --server-id / the dedicated server's storage tree (servers/<id>/): created or opened HERE, before boot_main loads the town (second_game_init), and Card A is pointed at its town
-     * directory. Refused (exit 2) outside --host --dedicated, with a bad id, or when an existing server's town file is missing; nothing of an existing town is ever touched. */
-    if (g_pc_server_id != NULL && !g_pc_dedicated) {
-        fprintf(stderr, "[SERVER] --server-id: REFUSED: it is a --dedicated host option (use it together with --host --dedicated)\n"
-                        "usage: AnimalCrossing --host [port] --dedicated --server-id ID   (see --help)\n");
-        return 2;
-    }
+    /* the dedicated server's storage tree (servers/default/: one server id = one persistent town, no CLI option): created or opened HERE, before boot_main loads the town (second_game_init), and Card A is pointed at its town
+     * directory. Refused (exit 2) when an existing server's town file is missing; nothing of an existing town is ever touched. */
     if (g_pc_dedicated) {
         char serr[400];
-        if (!pc_server_open(g_pc_server_id, g_pc_net_port, serr, sizeof(serr))) {
+        if (!pc_server_open(NULL, g_pc_net_port, serr, sizeof(serr))) {
             fprintf(stderr, "[SERVER] REFUSED: %s\n", serr);
             return 2;
         }
@@ -2451,6 +2434,9 @@ int main(int argc, char* argv[]) {
     }
     if (g_pc_dedicated) {
         pc_dedicated_startup(g_pc_net_port); /* "[DEDICATED] ..." startup line + the stdin command reader (only enqueues; drained on the main thread) */
+        if (pc_server_town_missing()) {
+            pc_dedicated_prompt_town_name(); /* first launch: ask for the town name before the game generates the town */
+        }
     }
     if (log_want_console) { /* new line only for an explicit -debug-flag or PC_LOG request: plain --verbose output stays byte-identical */
         PC_LOG(PCL_GENERAL, "log mask=0x%08X (verbose=%d console=%d)\n", (unsigned)g_pc_log_mask, g_pc_verbose, log_want_console);

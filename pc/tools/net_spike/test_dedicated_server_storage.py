@@ -75,9 +75,17 @@ def say(h, cmd, settle=1.2, timeout=10.0):
     return h.log_text()[off:].replace("\r\n", "\n")
 
 
-def start_host(port, tag):
-    h = L.HostProcess(port=port, extra_args=["--dedicated", "--town-serve", "on", "--resident-tokens", "tofu"], log_path=T.log_path("srv_%s_host.log" % tag), bin_dir=HOST_DIR,
+def start_host(port, tag, name=None, bin_dir=None, wrong=()):
+    """Starts `--host P --dedicated`. A FIRST launch (no town) stops at the console prompt before it listens: name (+ the wrong names tried first) are typed into its stdin."""
+    h = L.HostProcess(port=port, extra_args=["--dedicated", "--town-serve", "on", "--resident-tokens", "tofu"], log_path=T.log_path("srv_%s_host.log" % tag), bin_dir=bin_dir or HOST_DIR,
                       stdin_pipe=True, verbose=False, new_group=True).start()
+    if name is not None:
+        end = time.monotonic() + 60.0
+        while time.monotonic() < end and "Enter town name (1-8 characters):" not in h.log_text():
+            time.sleep(0.2)
+        for w in tuple(wrong) + (name,):
+            h.send_line(w)
+            time.sleep(0.8)
     ok = h.wait_listening(60.0) and h.boot_to_dedicated(timeout=180.0)
     return h, ok
 
@@ -87,19 +95,26 @@ def run(port, results):
     ck = lambda d, c: L.check(d, bool(c), results)  # noqa: E731
     ck("(setup) the host directory has no save/card_a and no servers/ yet", not os.path.exists(os.path.join(HOST_DIR, "servers")) and not os.path.exists(os.path.join(HOST_DIR, "save", "card_a")))
     # ---------------- S1
-    h, ok = start_host(port, "1")
+    h, ok = start_host(port, "1", name="Simochi", wrong=("TooLongName", "bad#name"))
     ck("S1 the dedicated host reached world ready on a CLEAN directory (no town existed)", ok)
     if not ok:
         h.stop()
         return
     log1 = h.log_text().replace("\r\n", "\n")
-    ck("S1 the log says the server was opened with 'NOT FOUND -> a new town is generated' and then 'generated and saved'", "a new town is generated on this first launch" in log1 and b"generated and saved to" in read(os.path.join(SRV, "logs", "server.log")))
+    ck("S1 the console asked: banner, 'No town exists for this server.', 'Enter town name (1-8 characters):'", "Animal Crossing Dedicated Host" in log1 and "No town exists for this server." in log1
+       and "Enter town name (1-8 characters):" in log1)
+    ck("S1 an over-long name (11 chars) and a name with an invalid character ('#') were each refused with 'Invalid town name. Please enter 1-8 valid characters.' and asked again",
+       log1.count("Invalid town name. Please enter 1-8 valid characters.") == 2 and log1.count("Enter town name (1-8 characters):") == 3)
+    ck("S1 'Simochi' was accepted: 'Town name set to \"Simochi\"', the town was generated and saved ('Town \"Simochi\" generated.', 'Server ready.')",
+       'Town name set to "Simochi"' in log1 and 'Town "Simochi" generated.' in log1 and "Server ready." in log1 and b"generated and saved to" in read(os.path.join(SRV, "logs", "server.log")))
     for sub in ("town/card_a", "citizens", "residents", "backups", "logs"):
         ck("S1 servers/default/%s exists" % sub, os.path.isdir(os.path.join(SRV, *sub.split("/"))))
     ck("S1 the town GCI exists at servers/default/town/card_a/DobutsunomoriP_MURA.gci (467008 bytes)", os.path.isfile(GCI) and os.path.getsize(GCI) == 467008)
     ini = os.path.join(SRV, "server.ini")
     ck("S1 server.ini: [server] id = default and [town] with land_name / land_id / terrain_hash / key, origin = generated", os.path.isfile(ini) and ini_value(ini, "id", "[server]") == "default"
        and ini_value(ini, "key", "[town]") and ini_value(ini, "land_id", "[town]") and ini_value(ini, "terrain_hash", "[town]") and ini_value(ini, "origin", "[town]") == "generated")
+    ck("S1 server.ini [town] land_name = the 8 game codes of 'Simochi ' (53696D6F63686920) and the saved GCI carries them (land_info name in the card comment)",
+       ini_value(ini, "land_name", "[town]") == "53696D6F63686920" and b"Simochi " in read(GCI)[:0x2000])
     key1 = ini_value(ini, "key", "[town]")
     lid1 = ini_value(ini, "land_id", "[town]")
     ck("S1 residents/members.dat was created (the server's resident state exists from the start)", os.path.isfile(os.path.join(SRV, "residents", "members.dat")))
@@ -118,7 +133,10 @@ def run(port, results):
         h.stop()
         return
     log2 = h.log_text().replace("\r\n", "\n")
-    ck("S2 NO new town: 'generating a new town' / 'a new town is generated' are absent, 'town found' is logged", "generating a new town" not in log2 and "a new town is generated" not in log2 and "town found" in log2)
+    ck("S2 NO prompt and NO new town: 'Enter town name', 'a new town is generated' are absent, 'town found' is logged", "Enter town name" not in log2 and "No town exists" not in log2
+       and "a new town is generated" not in log2 and "town found" in log2)
+    ck("S2 the console shows 'Loading town \"Simochi\"...', 'Town loaded.', 'Server ready.'", 'Loading town "Simochi"...' in log2 and "Town loaded." in log2 and "Server ready." in log2)
+    ck("S2 server.ini still names the Simochi town (land_name 53696D6F63686920)", ini_value(ini, "land_name", "[town]") == "53696D6F63686920")
     ck("S2 the same town identity is confirmed (log: 'town identity confirmed (%s)') and server.ini is unchanged" % key1,
        ("town identity confirmed (%s)" % key1) in log2 and ini_value(ini, "key", "[town]") == key1 and ini_value(ini, "land_id", "[town]") == lid1)
     ck("S2 the authoritative GCI is still servers/default/town/card_a/... (the loaded path is logged)", os.path.isfile(GCI) and "town dir servers/default/town" in say(h, "status").replace("\\", "/"))
@@ -180,6 +198,8 @@ def adoption(port, results, src_tree):
         ok = h.wait_listening(60.0) and h.boot_to_dedicated(timeout=180.0)
         ck("S4 the dedicated host booted on the legacy directory (server id default)", ok)
         log = h.log_text().replace("\r\n", "\n")
+        alog = log
+        ck("S4 NO town-name prompt for an adopted town ('Enter town name' / 'No town exists' absent)", "Enter town name" not in log and "No town exists" not in log)
         ck("S4 the log says the legacy town was ADOPTED by COPY (and the legacy guest table / credentials)", "adopted the legacy town save/card_a/DobutsunomoriP_MURA.gci by COPY" in log
            and "adopted the legacy guest table" in log and "adopted the legacy resident credentials" in log and "a new town is generated" not in log and "generating a new town" not in log)
     finally:
@@ -193,6 +213,12 @@ def adoption(port, results, src_tree):
     ck("S4 servers/default/town/card_a/DobutsunomoriP_MURA.gci exists (467008 bytes) and is the SAME town: same size, the four residents byte-identical to the legacy file",
        os.path.isfile(sgci) and os.path.getsize(sgci) == 467008 and [L.record_from_gci(read(sgci), i) for i in range(4)] == recs_before)
     ck("S4 server.ini: origin = legacy, a [town] key and land_id", ini_value(ini, "origin", "[town]") == "legacy" and ini_value(ini, "key", "[town]") and ini_value(ini, "land_id", "[town]"))
+    name_hex = ini_value(ini, "land_name", "[town]") or ""
+    name_bytes = bytes.fromhex(name_hex) if len(name_hex) == 16 else b""
+    name_text = name_bytes.decode("latin-1").rstrip()
+    ck("S4 the adopted town KEEPS its original name: the 8 name bytes of server.ini (%r) are in the legacy GCI and in the adopted GCI, and the console says 'Town \"%s\" adopted from the legacy save.'"
+       % (name_text, name_text), len(name_bytes) == 8 and name_bytes in read(legacy_gci)[:0x2000] and name_bytes in read(sgci)[:0x2000]
+       and ('Town "%s" adopted from the legacy save.' % name_text) in alog)
     ck("S4 the ORIGINAL legacy save/card_a GCI is BYTE-IDENTICAL after the adoption and the whole run (md5 %s...)" % gci_before[:8], md5(legacy_gci) == gci_before)
     ck("S4 the legacy save/mp host files were COPIED, not moved or changed: still there, byte-identical", all(os.path.isfile(os.path.join(legacy_mp, n)) and md5(os.path.join(legacy_mp, n)) == m
                                                                                                           for n, m in seeded.items()))
