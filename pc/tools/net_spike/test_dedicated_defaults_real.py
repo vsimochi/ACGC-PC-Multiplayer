@@ -141,7 +141,7 @@ def run(port, results):
         if host is not None:
             t = host.log_text()
             m = re.search(LINE_RX, t)
-            ck("1 startup line: house sync ON (default for --dedicated), town serve ON (sanitized) (default for --dedicated)",
+            ck("1 startup line: house sync ON (default for every host), town serve ON (sanitized) (default for --dedicated)",
                m is not None and m.group(1) == "ON" and m.group(2).startswith("default") and m.group(3) == "ON (sanitized)" and m.group(4).startswith("default"))
             info = rig.fetch_status(p)
             ck("1 TOWN_FETCH -> STREAM with the SANITIZED flag (status=%s flags=%s)" % (None if info is None else info.status, None if info is None else info.flags),
@@ -238,7 +238,8 @@ def run(port, results):
             info = rig.fetch_status(p)
             ck("5 TOWN_FETCH -> REFUSED (status=%s)" % (None if info is None else info.status), info is not None and info.status == L.PC_NETGAME_TOWN_STATUS_REFUSED)
             b1 = rig.hostcfg_byte1(p)
-            ck("5 HOST_CONFIG byte 1 = %s: bit0 (house sync) absent" % b1, b1 is not None and not (b1 & HOUSE))
+            ck("5 HOST_CONFIG byte 1 = %s: bit0 (house sync) PRESENT (Patch 5: house sync is the default of every host, dedicated or not), personal sync bit1 absent (town serving stays a --dedicated default)" % b1,
+               b1 is not None and (b1 & HOUSE) and not (b1 & PERSONAL))
         rig.stop(host, dedicated=False)
         host = None
     finally:

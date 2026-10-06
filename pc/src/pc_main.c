@@ -1562,9 +1562,9 @@ int main(int argc, char* argv[]) {
             printf("                      alone it implies --guest (the default guest profile). A server is only a destination; characters are not tied to it.\n");
             printf("  --servers           list the saved servers and exit 0.  --server-add NAME HOST[:PORT]  save a server (HOST = IPv4 literal or DNS hostname, port default\n");
             printf("                      7777; a hostname is resolved when connecting).  --server-delete NAME  remove one. Exit 0, or 2 on a refusal.\n");
-            printf("  --no-house-sync     HOST: turn OFF furniture sync, which a --dedicated host enables by default.\n");
-            printf("  --house-sync        HOST opt-in (already the DEFAULT for --dedicated): the host is authoritative for the furniture of player houses (the owner's edits are committed to\n");
-            printf("                      the host together with the pocket record; announced to every client in HOST_CONFIG). Off by default.\n");
+            printf("  --no-house-sync     HOST: turn OFF furniture / house sync, which every host enables by default.\n");
+            printf("  --house-sync        HOST: the host is authoritative for the furniture of player houses (the owner's edits are committed to the host together with the pocket record;\n");
+            printf("                      announced to every client in HOST_CONFIG). This is the DEFAULT for every --host (dedicated or not); --no-house-sync disables it.\n");
             printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
             printf("                      not a one-shot test hook): activates the host-authoritative\n");
             printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
@@ -2290,8 +2290,9 @@ int main(int argc, char* argv[]) {
                         "usage: AnimalCrossing --host [port] --personal-sync on|off   (see --help)\n");
         return 2;
     }
-    /* Dedicated multiplayer host defaults: furniture sync ON (unless --no-house-sync) and town serving AUTO = ON/sanitized (unless --town-serve off or settings.ini town_serve is explicit). */
-    if (g_pc_dedicated && g_pc_net_role == 1) {
+    /* Multiplayer host defaults: furniture / house sync is ON for EVERY host (dedicated or not) unless --no-house-sync: a player must never need a development flag for houses to be
+     * authoritative. (Town serving AUTO = ON/sanitized stays a --dedicated default: unless --town-serve off or settings.ini town_serve is explicit.) */
+    if (g_pc_net_role == 1) {
         if (!s_house_sync_explicit) {
             g_pc_house_sync = 1;
         }
@@ -2478,9 +2479,12 @@ int main(int argc, char* argv[]) {
     pc_lowaddr_init(); /* no-op unless built with PC_LOW_ADDRESS_64 */
     SDL_SetMainReady();
     pc_settings_load();
+    if (g_pc_net_role == 1 && !g_pc_dedicated) {
+        printf("[PC] host services: house sync %s (%s)\n", g_pc_house_sync ? "ON" : "off", s_house_sync_explicit ? "explicit option" : "default for every host; --no-house-sync disables");
+    }
     if (g_pc_dedicated && g_pc_net_role == 1) { /* printed AFTER the settings load so an explicit settings.ini town_serve is reflected */
         printf("[PC] dedicated host services: house sync %s (%s), town serve %s (%s)\n", g_pc_house_sync ? "ON" : "off",
-               s_house_sync_explicit ? "explicit option" : "default for --dedicated; --no-house-sync disables",
+               s_house_sync_explicit ? "explicit option" : "default for every host; --no-house-sync disables",
                pc_settings_town_serve_effective() == 0 ? "off" : pc_settings_town_serve_effective() == 1 ? "ON (sanitized)" : "ON (FULL, unsanitized)",
                (g_pc_town_serve_override >= 0 || g_pc_settings.town_serve >= 0) ? "explicit setting" : "default for --dedicated; --town-serve off disables");
     }

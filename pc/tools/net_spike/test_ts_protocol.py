@@ -123,7 +123,7 @@ def gci_state(bin_dir):
 def start_host(ip, port, tag, extra, results):
     host_slot = L.TEST_HOST_RESIDENT
     log_dir = os.path.dirname(os.path.abspath(__file__))
-    host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", str(host_slot), "--ts-test-seed-police=" + ",".join("0x%04X" % s for s in SEEDS)] + list(extra),
+    host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", str(host_slot), "--no-house-sync", "--ts-test-seed-police=" + ",".join("0x%04X" % s for s in SEEDS)] + list(extra),
                          log_path=os.path.join(log_dir, f"ts_protocol_{tag}_host.log")).start()
     ok = host.wait_listening(60.0) and host.boot_to_field(timeout=90.0, slot=host_slot)
     L.check(f"[{tag}] host reached genuine field-ready state (extra args {list(extra)})", ok, results)

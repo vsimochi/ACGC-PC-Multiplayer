@@ -22326,12 +22326,42 @@ static void pcnetgame_handle_client_house(const uint8_t* data, uint16_t size) {
 }
 
 /* Once per client poll (READY and the local save loaded): receive / commit watchdogs, the stash writer. */
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_HOUSE_CLIENT_SWAP=<floor>,<cellA>,<cellB>, client role): once the own house is synced and the player is outside, the two layer-0 cells of the OWN house in the
+ * client's save are swapped (a furniture move that conserves every item: what the owner's edit looks like to the commit path). The dirty test then commits it like a real edit. Never active
+ * in normal play. */
+static void pcnetgame_house_test_client_swap(void) {
+    static int done = 0;
+    const char* e;
+    int f, a, b, h;
+    if (done || (e = pc_test_hook_getenv("AC_TEST_HOUSE_CLIENT_SWAP")) == NULL || sscanf(e, "%d,%d,%d", &f, &a, &b) != 3) {
+        return;
+    }
+    h = pcnetgame_hcl_own_house();
+    if (h >= 0 && (!s_hcl.known || !s_hcp.canon_valid[h] || s_hcl.c_active || s_hcl.rollback || pcnetgame_hcl_dirty(h) || s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.st_valid ||
+                   s_crec.up_active || s_crec.up_blocked || pcnetgame_hcl_gates_pending() || s_crec.base_session != s_hcp.canon_session[h] || !s_crec.acked_valid)) {
+        return; /* wait until the house + the record are SETTLED (no staged push, nothing in flight): the same gate the in-room commit uses */
+    }
+    if (h < 0 || !s_hcl.known || !s_hcp.canon_valid[h] || pcnetgame_local_house_unsafe(h) || f < 0 || f >= mHm_ROOM_NUM || a < 0 || b < 0 || a >= UT_Z_NUM * UT_X_NUM || b >= UT_Z_NUM * UT_X_NUM) {
+        return;
+    }
+    {
+        mActor_name_t* ia = &Save_Get(homes[h]).floors[f].layer_main.items[a / UT_X_NUM][a % UT_X_NUM];
+        mActor_name_t* ib = &Save_Get(homes[h]).floors[f].layer_main.items[b / UT_X_NUM][b % UT_X_NUM];
+        mActor_name_t t = *ia;
+        *ia = *ib;
+        *ib = t;
+        done = 1;
+        printf("[NET][HOUSE][TEST-ONLY] client: swapped the layer-0 cells %d (now 0x%04X) and %d (now 0x%04X) of the OWN house %d floor %d in the local save (a furniture move)\n", a, (unsigned)*ia, b, (unsigned)*ib, h, f);
+    }
+}
+
 static void pcnetgame_house_client_tick(void) {
     const uint32_t now = pcnetgame_now_ms();
     int h;
     if (!pcnetgame_hcl_active()) {
         return;
     }
+    pcnetgame_house_test_client_swap();
     pcnetgame_hcl_quiet_update();
     pcnetgame_hcl_room_track();
     if (s_hcl.rx_open && (uint32_t)(now - s_hcl.rx_started_ms) >= PC_NETGAME_HCL_RX_TIMEOUT_MS) {

@@ -79,7 +79,7 @@ def main():
     val = func_body(c, "pcnetgame_ts_valid_hostcfg_blob")
     ck("W HOST_CONFIG: byte 1 bit 0 = house sync built from g_pc_house_sync; the validator accepts only that bit and bit 1 (personal data sync, test_pdata_src.py) (other bits of byte 1 and bytes 2..7 must be zero)",
        "blob[1] = g_pc_house_sync ? (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC : 0u;" in bld and num(c, "PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC") == 1 == L.PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC
-       and "blob[0] > 1u" in val and "(blob[1] & ~(uint8_t)(PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC | PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC)) != 0u" in val and "for (i = 2; i < PC_NETGAME_TS_HOSTCFG_LEN; i++)" in val)
+       and "blob[0] > 1u" in val and "(blob[1] & ~(uint8_t)(PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC | PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC)) != 0u" in val and "if (blob[2] > 1u) {" in val)  # bytes 2..7 carry the shop restock state / catalog generation since the shop milestones: byte 2 is 0/1, the rest any value
     ap = func_body(c, "pcnetgame_ts_client_apply")
     ck("W the client reads the bit in the HOST_CONFIG apply (no usable save needed) and a client without the bit never gates anything (every gate starts with pcnetgame_hcl_active() == on)",
        "pcnetgame_house_client_set_hostcfg((m->blob[1] & (uint8_t)PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC) != 0);" in ap
@@ -285,9 +285,10 @@ def main():
        "Stage 1b" in road and "quiescen" in road and "aMR_pc_export_home" in road and "unverified" in road[road.index("Stage 1b"):].lower()
        and "the room scene works on a COPY" not in road and "works on a COPY of the house floors" not in c)
     # ------------------------------------------------------------------ D
-    ck("D house sync is OFF by default (g_pc_house_sync = 0, set only by --house-sync), the two TEST hooks default to off / NULL, all documented in --help and pc_platform.h",
+    ck("D house sync is ON by default for EVERY host (Patch 5: g_pc_house_sync starts 0 and is set to 1 for any --host unless --no-house-sync), the two TEST hooks default to off / NULL, all documented in --help and pc_platform.h",
        "int g_pc_house_sync = 0;" in main_c and "int g_pc_house_test_host_in_house = -1;" in main_c and "const char* g_pc_house_test_host_edit = NULL;" in main_c
-       and 'strcmp(argv[i], "--house-sync") == 0' in main_c and "g_pc_house_sync = 1;" in main_c and "--house-sync        HOST opt-in" in main_c
+       and 'strcmp(argv[i], "--house-sync") == 0' in main_c and re.search(r"if \(g_pc_net_role == 1\) \{\s+if \(!s_house_sync_explicit\) \{\s+g_pc_house_sync = 1;", main_c) is not None
+       and "--house-sync        HOST: the host is authoritative" in main_c
        and "extern int           g_pc_house_sync;" in plat and "TEST-ONLY" in plat[plat.index("g_pc_house_sync") - 600:plat.index("g_pc_house_sync") + 400])
     ck("D the TEST hooks log loudly ([NET][HOUSE][TEST-ONLY]) and the host-edit hook only edits an owned house's canonical copy once a READY peer holds it",
        "[NET][HOUSE][TEST-ONLY] --house-test-host-in-house" in main_c and "[NET][HOUSE][TEST-ONLY] --house-test-host-edit" in main_c and "[NET][HOUSE][TEST-ONLY] --house-test-host-edit:" in c
