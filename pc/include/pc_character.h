@@ -45,6 +45,7 @@ typedef struct PCCharacter {
     int      has_legacy;                    /* legacy_profile key present (STORE) / always 1 (LEGACY) */
     char     legacy_profile[17];            /* folded profile name; "" = the default guest.ini */
     char     path[420];                     /* the file this was read from */
+    char     label[17];                     /* LOCAL display label (characters.ini label_<uuid>); "" = show name. Filled by pc_character_list only. Never part of the identity. */
 } PCCharacter;
 
 /* Result codes of load / resolve. */
@@ -93,6 +94,15 @@ int  pc_character_membership_read(const char* dir, const char* uuid, const char*
  * set_key: sets / replaces ONE extra key of an existing file (role / town_pid / last_server are kept); 1 = written, 0 = no file / bad key or value / no room. */
 int  pc_character_membership_get_key(const char* dir, const char* uuid, const char* townkey, const char* key, char* out, size_t cap);
 int  pc_character_membership_set_key(const char* dir, const char* uuid, const char* townkey, const char* key, const char* value);
+
+/* Local character management (characters.ini sidecar: order / label_<uuid> / hidden_profiles; identity files are never touched).
+ * label_set: display label only (NULL / "" clears); 1 / 0. move: swaps a STORE character with its neighbour in the persisted order (delta -1 / +1); 1 = moved, 0 = no-op.
+ * resident_count: towns whose membership.ini says role = resident. delete: removes ONLY characters/<uuid>/ (+ its default / order / label entries); an imported character's legacy profile
+ * is added to hidden_profiles so it does not reappear as a legacy row (the legacy files are never touched). 1 = deleted, 0 = refused / failed (err). */
+int pc_character_label_set(const char* dir, const char* uuid, const char* label);
+int pc_character_move(const char* dir, const char* uuid, int delta);
+int pc_character_resident_count(const char* dir, const char* uuid);
+int pc_character_delete(const char* dir, const char* uuid, char* err, size_t errcap);
 
 /* characters.ini default = <uuid>. get: 1 + uuid in out[33], else 0. set: atomic replace; 1 / 0. */
 int pc_character_default_get(const char* dir, char out[PC_CHARACTER_UUID_LEN + 1]);

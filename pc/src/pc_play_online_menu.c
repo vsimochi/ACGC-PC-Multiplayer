@@ -19,8 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { PG_SERVERS, PG_ACTIONS, PG_CHARS, PG_DELETE };
-enum { T_NONE, T_SRV_NAME, T_SRV_ADDR, T_SRV_PORT, T_CHAR_NAME };
+enum { PG_SERVERS, PG_ACTIONS, PG_CHARS, PG_DELETE, PG_MCHARS, PG_MACT };
+enum { T_NONE, T_SRV_NAME, T_SRV_ADDR, T_SRV_PORT, T_CHAR_NAME, T_CHAR_LABEL };
 
 #define VISIBLE 8
 #define CHAR_ROWS 5 /* the character page shows fewer, taller rows (a player model beside each name) */
@@ -41,6 +41,9 @@ static int s_nchr = 0;
 static char s_msg[300];
 static int s_msg_err = 0;
 static int s_del_sel = 0; /* 0 keep, 1 delete */
+static int s_del_char = 0; /* the delete page targets a CHARACTER (s_mi) instead of the server */
+static int s_del_res = 0;  /* towns the character is a resident of (stronger warning) */
+static int s_mi = 0;       /* the character being managed (index into s_chr) */
 
 /* text entry */
 static int s_text = T_NONE;
@@ -115,11 +118,31 @@ static void reload_characters(void) {
     mark_residents();
 }
 
+/* the character as shown in the menus: its local display label when it has one, else its name */
+static const char* disp_name(const PCCharacter* c) {
+    return c->label[0] != '\0' ? c->label : c->name;
+}
+
+/* keep the managed character selected by uuid after a reload (reorder / rename); falls back to the clamped old index */
+static void refind_mi(const char* uuid) {
+    int i;
+    for (i = 0; i < s_nchr; i++) {
+        if (s_chr[i].storage == PC_CHARACTER_STORAGE_STORE && strcmp(s_chr[i].uuid, uuid) == 0) {
+            s_mi = i;
+            return;
+        }
+    }
+    if (s_mi >= s_nchr) s_mi = s_nchr - 1;
+    if (s_mi < 0) s_mi = 0;
+}
+
 static int row_count(void) {
     switch (s_page) {
         case PG_SERVERS: return s_nsrv + 2;
         case PG_ACTIONS: return 4;
-        case PG_CHARS:   return s_nchr + 2;
+        case PG_CHARS:   return s_nchr + 3;
+        case PG_MCHARS:  return s_nchr + 1;
+        case PG_MACT:    return 5;
     }
     return 2;
 }
@@ -130,7 +153,7 @@ static void sel_clamp(void) {
     if (s_sel > n - 1) s_sel = n - 1;
     if (s_sel < s_scroll) s_scroll = s_sel;
     {
-        const int vis = (s_page == PG_CHARS) ? CHAR_ROWS : VISIBLE;
+        const int vis = (s_page == PG_CHARS || s_page == PG_MCHARS) ? CHAR_ROWS : VISIBLE;
         if (s_sel >= s_scroll + vis) s_scroll = s_sel - vis + 1;
     }
     if (s_scroll < 0) s_scroll = 0;
@@ -167,6 +190,7 @@ static int text_max(void) {
         case T_SRV_ADDR: return PC_SERVER_ADDR_MAX - 1;
         case T_SRV_PORT: return 5;
         case T_CHAR_NAME: return 16;
+        case T_CHAR_LABEL: return 16;
     }
     return 0;
 }
@@ -176,7 +200,8 @@ static int text_char_ok(unsigned char c) {
         case T_SRV_NAME: return glyph_ok(c) && strchr("[]=\"\\", c) == NULL;
         case T_SRV_ADDR: return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '-';
         case T_SRV_PORT: return c >= '0' && c <= '9';
-        case T_CHAR_NAME: return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-';
+        case T_CHAR_NAME:
+        case T_CHAR_LABEL: return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-';
     }
     return 0;
 }
@@ -268,6 +293,28 @@ static void text_commit(void) {
             goto_page(PG_SERVERS, 0);
             return;
         }
+        case T_CHAR_LABEL:
+            if (s_mi < 0 || s_mi >= s_nchr || s_chr[s_mi].storage != PC_CHARACTER_STORAGE_STORE) {
+                text_end();
+                return;
+            }
+            if (!pc_guest_profile_name_check(s_buf, why, sizeof(why))) {
+                set_msg(1, "%s", why);
+                return;
+            }
+            {
+                char uuid[PC_CHARACTER_UUID_LEN + 1];
+                snprintf(uuid, sizeof(uuid), "%s", s_chr[s_mi].uuid);
+                text_end();
+                if (pc_character_label_set(NULL, uuid, s_buf)) { /* display label ONLY: name / name_bytes / uuid / ids are untouched */
+                    set_msg(0, "Renamed to %s", s_buf);
+                } else {
+                    set_msg(1, "%s", "Could not save the new name");
+                }
+                reload_characters();
+                refind_mi(uuid);
+            }
+            return;
         case T_CHAR_NAME:
             if (!pc_guest_profile_name_check(s_buf, why, sizeof(why))) {
                 set_msg(1, "%s", why);
@@ -495,6 +542,7 @@ int pc_play_online_menu_confirm(void) {
                 text_begin(T_SRV_NAME, s_draft.name);
             } else if (s_sel == 2) { /* Delete (confirm page) */
                 s_del_sel = 0;
+                s_del_char = 0;
                 s_page = PG_DELETE;
             } else {
                 goto_page(PG_SERVERS, s_cur);
@@ -505,11 +553,74 @@ int pc_play_online_menu_confirm(void) {
                 char_connect(s_sel);
             } else if (s_sel == s_nchr) { /* New character */
                 text_begin(T_CHAR_NAME, "");
+            } else if (s_sel == s_nchr + 1) { /* Manage characters (never connects) */
+                goto_page(PG_MCHARS, 0);
             } else {
                 goto_page(PG_ACTIONS, 0);
             }
             return 1;
+        case PG_MCHARS:
+            if (s_sel < s_nchr) {
+                s_mi = s_sel;
+                goto_page(PG_MACT, 0);
+            } else {
+                goto_page(PG_CHARS, 0);
+            }
+            return 1;
+        case PG_MACT: {
+            const PCCharacter* c;
+            if (s_mi < 0 || s_mi >= s_nchr) {
+                goto_page(PG_MCHARS, 0);
+                return 1;
+            }
+            c = &s_chr[s_mi];
+            if (s_sel == 4) { /* Back */
+                goto_page(PG_MCHARS, s_mi);
+                return 1;
+            }
+            if (c->storage != PC_CHARACTER_STORAGE_STORE) {
+                set_msg(1, "%s", s_sel == 3 ? "Legacy profile files are never deleted" : "Legacy profile: use it once to import it, then manage it");
+                return 1;
+            }
+            if (s_sel == 0) { /* Rename (display label only) */
+                text_begin(T_CHAR_LABEL, disp_name(c));
+            } else if (s_sel == 1 || s_sel == 2) { /* Move up / down */
+                char uuid[PC_CHARACTER_UUID_LEN + 1];
+                snprintf(uuid, sizeof(uuid), "%s", c->uuid);
+                if (pc_character_move(NULL, uuid, s_sel == 1 ? -1 : 1)) {
+                    reload_characters();
+                    refind_mi(uuid);
+                } else {
+                    set_msg(0, "%s", s_sel == 1 ? "Already first" : "Already last");
+                }
+            } else { /* Delete (confirm page) */
+                s_del_sel = 0;
+                s_del_char = 1;
+                s_del_res = pc_character_resident_count(NULL, c->uuid);
+                s_page = PG_DELETE;
+            }
+            return 1;
+        }
         case PG_DELETE:
+            if (s_del_char) {
+                if (s_del_sel == 1 && s_mi >= 0 && s_mi < s_nchr) {
+                    char err[200], uuid[PC_CHARACTER_UUID_LEN + 1], nm[24];
+                    snprintf(uuid, sizeof(uuid), "%s", s_chr[s_mi].uuid);
+                    snprintf(nm, sizeof(nm), "%s", disp_name(&s_chr[s_mi]));
+                    if (pc_character_delete(NULL, uuid, err, sizeof(err))) {
+                        set_msg(0, "Deleted character %s", nm);
+                    } else {
+                        set_msg(1, "Not deleted: %s", err);
+                    }
+                    reload_characters();
+                    s_del_char = 0;
+                    goto_page(PG_MCHARS, s_mi < s_nchr ? s_mi : (s_nchr > 0 ? s_nchr - 1 : 0));
+                } else {
+                    s_del_char = 0;
+                    goto_page(PG_MACT, 3);
+                }
+                return 1;
+            }
             if (s_del_sel == 1) {
                 char err[200];
                 const int r = pc_servers_delete(NULL, s_srv[s_cur].name, err, sizeof(err));
@@ -541,8 +652,19 @@ int pc_play_online_menu_cancel(void) {
         case PG_CHARS:
             goto_page(PG_ACTIONS, 0);
             return 1;
+        case PG_MCHARS:
+            goto_page(PG_CHARS, s_nchr + 1);
+            return 1;
+        case PG_MACT:
+            goto_page(PG_MCHARS, s_mi);
+            return 1;
         case PG_DELETE:
-            goto_page(PG_ACTIONS, 2);
+            if (s_del_char) {
+                s_del_char = 0;
+                goto_page(PG_MACT, 3);
+            } else {
+                goto_page(PG_ACTIONS, 2);
+            }
             return 1;
     }
     return 1;
@@ -558,7 +680,7 @@ static void row_label(int i, char* out, size_t cap) {
     out[0] = '\0';
     switch (s_page) {
         case PG_SERVERS:
-            if (i < s_nsrv) snprintf(out, cap, "%s  %s:%d", s_srv[i].name, s_srv[i].address, s_srv[i].port);
+            if (i < s_nsrv) snprintf(out, cap, "%s", s_srv[i].name); /* the configured name only; address / port stay stored and used for the connection */
             else if (i == s_nsrv) snprintf(out, cap, "Add server");
             else snprintf(out, cap, "Back");
             break;
@@ -567,21 +689,30 @@ static void row_label(int i, char* out, size_t cap) {
             snprintf(out, cap, "%s", k[i & 3]);
             break;
         }
+        case PG_MACT: {
+            static const char* const k[5] = { "Rename", "Move up", "Move down", "Delete", "Back" };
+            snprintf(out, cap, "%s", k[i % 5]);
+            break;
+        }
         case PG_CHARS:
+        case PG_MCHARS:
             if (i < s_nchr) {
                 int dup = 0, j;
+                const char* nm = disp_name(&s_chr[i]);
                 for (j = 0; j < s_nchr; j++) {
-                    if (j != i && strcmp(s_chr[j].name, s_chr[i].name) == 0) dup = 1;
+                    if (j != i && strcmp(disp_name(&s_chr[j]), nm) == 0) dup = 1;
                 }
                 if (s_chr[i].storage == PC_CHARACTER_STORAGE_STORE) {
                     const char* res = (i < PC_CHARACTER_MAX && s_chr_resident[i]) ? " (resident)" : "";
-                    if (dup) snprintf(out, cap, "%s (%.4s)%s", s_chr[i].name, s_chr[i].uuid, res);
-                    else snprintf(out, cap, "%s%s", s_chr[i].name, res);
+                    if (dup) snprintf(out, cap, "%s (%.4s)%s", nm, s_chr[i].uuid, res);
+                    else snprintf(out, cap, "%s%s", nm, res);
                 } else {
-                    snprintf(out, cap, "%s (profile)", s_chr[i].name);
+                    snprintf(out, cap, "%s", nm); /* legacy / imported profiles show the plain name */
                 }
-            } else if (i == s_nchr) {
+            } else if (s_page == PG_CHARS && i == s_nchr) {
                 snprintf(out, cap, "New character");
+            } else if (s_page == PG_CHARS && i == s_nchr + 1) {
+                snprintf(out, cap, "Manage characters");
             } else {
                 snprintf(out, cap, "Back");
             }
@@ -613,7 +744,7 @@ static void draw_char_list(struct game_s* game) {
     const int n = row_count();
     int i, r, g, b, a;
     const int first = s_scroll;
-    pc_menu_draw_centered(game, "- Choose a character -", 26.0f, 255, 255, 255, 255, 1.0f);
+    pc_menu_draw_centered(game, s_page == PG_MCHARS ? "- Manage characters -" : "- Choose a character -", 26.0f, 255, 255, 255, 255, 1.0f);
     pc_player_preview_tick();
     for (i = 0; i < CHAR_ROWS && first + i < n; i++) {
         const int row = first + i;
@@ -630,12 +761,12 @@ static void draw_char_list(struct game_s* game) {
     }
     if (first > 0) pc_menu_draw_left(game, "...", 14.0f, 44.0f, 180, 180, 180, 200, 1.0f);
     if (first + CHAR_ROWS < n) pc_menu_draw_left(game, "...", 14.0f, 44.0f + (CHAR_ROWS - 1) * CHAR_ROW_H, 180, 180, 180, 200, 1.0f);
-    pc_menu_draw_centered(game, "Fetches the town, then joins (no restart)", 218.0f, 150, 150, 150, 200, 1.0f);
+    pc_menu_draw_centered(game, s_page == PG_MCHARS ? "Pick a character to manage (nothing connects)" : "Fetches the town, then joins (no restart)", 218.0f, 150, 150, 150, 200, 1.0f);
 }
 
 static void draw_text_entry(struct game_s* game) {
-    static const char* const k_title[] = { "", "- Server name -", "- Server address -", "- Server port -", "- New character name -" };
-    static const char* const k_hint[] = { "", "1..32 characters", "IPv4 or hostname, Ctrl+V pastes", "1..65535 (empty = 7777)", "A-Z a-z 0-9 - (1..16)" };
+    static const char* const k_title[] = { "", "- Server name -", "- Server address -", "- Server port -", "- New character name -", "- Display name -" };
+    static const char* const k_hint[] = { "", "1..32 characters", "IPv4 or hostname, Ctrl+V pastes", "1..65535 (empty = 7777)", "A-Z a-z 0-9 - (1..16)", "Local label only (A-Z a-z 0-9 -)" };
     char line[64];
     pc_menu_draw_centered(game, k_title[s_text], 70.0f, 255, 255, 255, 255, 1.0f);
     snprintf(line, sizeof(line), "%s_", s_buf);
@@ -657,8 +788,24 @@ void pc_play_online_menu_draw(struct game_s* game, int with_dim_backdrop) {
         snprintf(buf, sizeof(buf), "- %s -", s_srv[s_cur].name);
         sanitize(buf);
         draw_list(game, buf, "Connect picks a character next");
-    } else if (s_page == PG_CHARS) {
+    } else if (s_page == PG_CHARS || s_page == PG_MCHARS) {
         draw_char_list(game);
+    } else if (s_page == PG_MACT) {
+        snprintf(buf, sizeof(buf), "- %s -", s_mi >= 0 && s_mi < s_nchr ? disp_name(&s_chr[s_mi]) : "?");
+        sanitize(buf);
+        draw_list(game, buf, "Rename changes the local display name only");
+    } else if (s_del_char) {
+        snprintf(buf, sizeof(buf), "Delete %s?", s_mi >= 0 && s_mi < s_nchr ? disp_name(&s_chr[s_mi]) : "?");
+        sanitize(buf);
+        pc_menu_draw_centered(game, "- Delete character -", 62.0f, 255, 255, 255, 255, 1.0f);
+        pc_menu_draw_centered(game, buf, 92.0f, 230, 230, 230, 255, 1.0f);
+        pc_menu_draw_centered(game, "Removes this character from this PC only", 112.0f, 190, 190, 190, 230, 1.0f);
+        if (s_del_res > 0) {
+            pc_menu_draw_centered(game, "RESIDENT: its credential is deleted here;", 130.0f, 255, 120, 110, 255, 1.0f);
+            pc_menu_draw_centered(game, "this PC may never reclaim that resident.", 144.0f, 255, 120, 110, 255, 1.0f);
+        }
+        pc_menu_draw_two_choice(game, "Keep", "Delete", s_del_sel, 170.0f);
+        pc_menu_draw_centered(game, "Left or Right, Confirm = OK, Cancel = keep", 218.0f, 150, 150, 150, 200, 1.0f);
     } else {
         snprintf(buf, sizeof(buf), "Delete %s?", s_srv[s_cur].name);
         sanitize(buf);

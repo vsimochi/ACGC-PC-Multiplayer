@@ -235,7 +235,8 @@ extern void title_demo_move(GAME_PLAY* play) {
          * the wipe-to-next-demo cutoff stays paused too. */
         {
             extern int pc_settings_menu_active(void);
-            if (pc_settings_menu_active()) {
+            extern int pc_play_online_menu_active(void); /* Play Online (server / character pages) must not be reset by the 60 s demo timer either */
+            if (pc_settings_menu_active() || pc_play_online_menu_active()) {
                 mPlib_SetData1_controller_data_for_title_demo(0, 0, 0.0f, 0.0f);
                 return;
             }

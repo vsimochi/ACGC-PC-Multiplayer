@@ -722,11 +722,20 @@ int pc_character_load(const char* dir, const char* uuid, PCCharacter* out, char*
     return PC_CHARACTER_OK;
 }
 
+#define CINI_CAP 8192
+static int cini_load(const char* dir, char* text);
+static int cini_get(const char* text, const char* key, char* out, size_t cap);
+static int csv_has(const char* list, const char* tok);
+static void apply_order(const char* dir, PCCharacter* out, int n);
+static void label_key(const char* uuid, char* out, size_t cap);
+static int cmp_legacy_profile(const void* a, const void* b);
+
 typedef struct ListCtx {
     const char* dir;
     PCCharacter* out;
     int cap, n, skipped;
     int legacy_pass;
+    char hidden[512]; /* characters.ini hidden_profiles: deliberately deleted imported profiles that must not reappear as legacy rows */
 } ListCtx;
 
 static void from_profile(const PCGuestProfile* p, PCCharacter* c) {
@@ -780,6 +789,9 @@ static void list_legacy_cb(const char* nm, int is_dir, void* ud) {
     } else {
         return;
     }
+    if (x->hidden[0] != '\0' && csv_has(x->hidden, prof[0] != '\0' ? prof : "(default)")) {
+        return;
+    }
     for (k = 0; k < x->n; k++) { /* already imported (a store character names this legacy profile) */
         if (x->out[k].storage == PC_CHARACTER_STORAGE_STORE && x->out[k].has_legacy && strcmp(x->out[k].legacy_profile, prof) == 0) {
             return;
@@ -814,7 +826,27 @@ int pc_character_list(const char* dir, PCCharacter* out, int cap, int* skipped) 
     snprintf(cdir, sizeof(cdir), "%s/characters", dir);
     list_dir(cdir, list_store_cb, &x);
     qsort(out, (size_t)x.n, sizeof(PCCharacter), cmp_uuid);
-    list_dir(dir, list_legacy_cb, &x);
+    apply_order(dir, out, x.n);
+    {
+        const int ns = x.n;
+        char ci[CINI_CAP];
+        int li;
+        if (cini_load(dir, ci)) {
+            cini_get(ci, "hidden_profiles", x.hidden, sizeof(x.hidden));
+        }
+        for (li = 0; li < ns; li++) {
+            char lk[64];
+            out[li].label[0] = '\0';
+            label_key(out[li].uuid, lk, sizeof(lk));
+            if (cini_get(ci, lk, out[li].label, sizeof(out[li].label))) {
+                out[li].label[16] = '\0';
+            }
+        }
+        list_dir(dir, list_legacy_cb, &x);
+        if (x.n > ns) {
+            qsort(out + ns, (size_t)(x.n - ns), sizeof(PCCharacter), cmp_legacy_profile);
+        }
+    }
     if (skipped != NULL) {
         *skipped = x.skipped;
     }
@@ -1090,46 +1122,336 @@ int pc_character_resolve(const char* dir, const char* spec, PCCharacter* out, ch
     return PC_CHARACTER_ABSENT;
 }
 
-/* ---------------- default ---------------- */
+/* ---------------- characters.ini: local UI sidecar ---------------- */
 
-int pc_character_default_get(const char* dir, char out[PC_CHARACTER_UUID_LEN + 1]) {
-    char path[320], text[512], *p;
+static int cini_load(const char* dir, char* text) {
+    char path[320];
     size_t n = 0;
     snprintf(path, sizeof(path), "%s/characters.ini", dir_or_default(dir));
-    if (!read_all(path, text, sizeof(text) - 1, &n)) {
+    if (!read_all(path, text, CINI_CAP - 1, &n)) {
+        text[0] = '\0';
         return 0;
     }
     text[n] = '\0';
-    p = strstr(text, "default");
-    if (p == NULL) {
+    return 1;
+}
+
+/* does the line [p, p+ll) start with `key` followed by optional blanks and '='? returns the value start or NULL */
+static const char* cini_line_value(const char* p, size_t ll, const char* key) {
+    const size_t kl = strlen(key);
+    const char* q;
+    const char* end = p + ll;
+    if (ll <= kl || strncmp(p, key, kl) != 0) {
+        return NULL;
+    }
+    q = p + kl;
+    while (q < end && (*q == ' ' || *q == '\t')) {
+        q++;
+    }
+    if (q >= end || *q != '=') {
+        return NULL;
+    }
+    q++;
+    while (q < end && (*q == ' ' || *q == '\t')) {
+        q++;
+    }
+    return q;
+}
+
+static int cini_get(const char* text, const char* key, char* out, size_t cap) {
+    const char* p = text;
+    while (*p) {
+        const char* e = strchr(p, '\n');
+        const size_t ll = e != NULL ? (size_t)(e - p) : strlen(p);
+        const char* v = cini_line_value(p, ll, key);
+        if (v != NULL) {
+            const char* end = p + ll;
+            size_t vl;
+            while (end > v && (end[-1] == '\r' || end[-1] == ' ')) {
+                end--;
+            }
+            vl = (size_t)(end - v);
+            if (vl >= cap) {
+                vl = cap - 1;
+            }
+            memcpy(out, v, vl);
+            out[vl] = '\0';
+            return 1;
+        }
+        p = e != NULL ? e + 1 : p + ll;
+    }
+    return 0;
+}
+
+/* replace (or drop, value NULL / "") ONE key, every other line is kept as it was. Atomic. */
+static int cini_put(const char* dir, const char* key, const char* value) {
+    char text[CINI_CAP], nw[CINI_CAP], path[320];
+    size_t w = 0;
+    const char* p;
+    cini_load(dir, text);
+    p = text;
+    while (*p) {
+        const char* e = strchr(p, '\n');
+        const size_t ll = e != NULL ? (size_t)(e - p) : strlen(p);
+        const size_t take = e != NULL ? ll + 1 : ll;
+        if (cini_line_value(p, ll, key) == NULL && ll > 0 && w + take < sizeof(nw) - 2) {
+            memcpy(nw + w, p, ll);
+            w += ll;
+            nw[w++] = '\n';
+        }
+        p += take;
+    }
+    if (value != NULL && value[0] != '\0') {
+        int n = snprintf(nw + w, sizeof(nw) - w, "%s = %s\n", key, value);
+        if (n < 0 || (size_t)n >= sizeof(nw) - w) {
+            return 0;
+        }
+        w += (size_t)n;
+    }
+    snprintf(path, sizeof(path), "%s/characters.ini", dir_or_default(dir));
+    return write_atomic(path, nw, w, 0);
+}
+
+static int csv_has(const char* list, const char* tok) {
+    const size_t tl = strlen(tok);
+    const char* p = list;
+    while (*p) {
+        const char* e = strchr(p, ',');
+        const size_t l = e != NULL ? (size_t)(e - p) : strlen(p);
+        if (l == tl && strncmp(p, tok, tl) == 0) {
+            return 1;
+        }
+        p += l + (e != NULL ? 1 : 0);
+    }
+    return 0;
+}
+
+static int csv_remove(char* list, const char* tok) {
+    char out[CINI_CAP];
+    size_t w = 0;
+    const char* p = list;
+    while (*p) {
+        const char* e = strchr(p, ',');
+        const size_t l = e != NULL ? (size_t)(e - p) : strlen(p);
+        if (!(l == strlen(tok) && strncmp(p, tok, l) == 0) && l > 0) {
+            if (w > 0) out[w++] = ',';
+            memcpy(out + w, p, l);
+            w += l;
+        }
+        p += l + (e != NULL ? 1 : 0);
+    }
+    out[w] = '\0';
+    memcpy(list, out, w + 1);
+    return 1;
+}
+
+static void label_key(const char* uuid, char* out, size_t cap) {
+    snprintf(out, cap, "label_%s", uuid);
+}
+
+int pc_character_label_set(const char* dir, const char* uuid, const char* label) {
+    char key[64];
+    if (!is_uuid(uuid)) {
         return 0;
     }
-    p += 7;
-    while (*p == ' ' || *p == '\t') {
-        p++;
+    label_key(uuid, key, sizeof(key));
+    return cini_put(dir, key, label);
+}
+
+/* the stored order (persisted uuids first, the rest stay in uuid order); out[0..n) are the STORE characters */
+static void apply_order(const char* dir, PCCharacter* out, int n) {
+    char text[CINI_CAP], ord[CINI_CAP];
+    const char* p;
+    int pos = 0;
+    cini_load(dir, text);
+    if (!cini_get(text, "order", ord, sizeof(ord))) {
+        return;
     }
-    if (*p != '=') {
+    p = ord;
+    while (*p && pos < n) {
+        const char* e = strchr(p, ',');
+        const size_t l = e != NULL ? (size_t)(e - p) : strlen(p);
+        if (l == PC_CHARACTER_UUID_LEN) {
+            int i;
+            for (i = pos; i < n; i++) {
+                if (strncmp(out[i].uuid, p, l) == 0) {
+                    PCCharacter t = out[i];
+                    int k;
+                    for (k = i; k > pos; k--) {
+                        out[k] = out[k - 1];
+                    }
+                    out[pos++] = t;
+                    break;
+                }
+            }
+        }
+        p += l + (e != NULL ? 1 : 0);
+    }
+}
+
+static int cmp_legacy_profile(const void* a, const void* b) {
+    return strcmp(((const PCCharacter*)a)->legacy_profile, ((const PCCharacter*)b)->legacy_profile);
+}
+
+int pc_character_move(const char* dir, const char* uuid, int delta) {
+    PCCharacter all[PC_CHARACTER_MAX];
+    char csv[CINI_CAP];
+    int n, ns = 0, i, idx = -1, j;
+    if (!is_uuid(uuid) || (delta != -1 && delta != 1)) {
         return 0;
     }
-    p++;
-    while (*p == ' ' || *p == '\t') {
-        p++;
+    n = pc_character_list(dir, all, PC_CHARACTER_MAX, NULL);
+    for (i = 0; i < n; i++) {
+        if (all[i].storage == PC_CHARACTER_STORAGE_STORE) {
+            if (strcmp(all[i].uuid, uuid) == 0) {
+                idx = ns;
+            }
+            if (ns != i) {
+                all[ns] = all[i];
+            }
+            ns++;
+        }
     }
-    if (strlen(p) < PC_CHARACTER_UUID_LEN) {
+    j = idx + delta;
+    if (idx < 0 || j < 0 || j >= ns) {
         return 0;
     }
-    memcpy(out, p, PC_CHARACTER_UUID_LEN);
+    {
+        PCCharacter t = all[idx];
+        all[idx] = all[j];
+        all[j] = t;
+    }
+    csv[0] = '\0';
+    for (i = 0; i < ns; i++) {
+        if (i > 0) strcat(csv, ",");
+        strcat(csv, all[i].uuid);
+    }
+    return cini_put(dir, "order", csv);
+}
+
+typedef struct ResCtx {
+    const char* dir;
+    const char* uuid;
+    int n;
+} ResCtx;
+
+static void res_cb(const char* name, int is_dir, void* ud) {
+    ResCtx* x = (ResCtx*)ud;
+    char role[16];
+    uint8_t pid[20];
+    if (is_dir && townkey_ok(name) && pc_character_membership_read(x->dir, x->uuid, name, role, pid) && strcmp(role, "resident") == 0) {
+        x->n++;
+    }
+}
+
+int pc_character_resident_count(const char* dir, const char* uuid) {
+    ResCtx x;
+    char d[400];
+    if (!char_dir(dir, uuid, d, sizeof(d) - 16)) {
+        return 0;
+    }
+    x.dir = dir;
+    x.uuid = uuid;
+    x.n = 0;
+    strcat(d, "/towns");
+    list_dir(d, res_cb, &x);
+    return x.n;
+}
+
+typedef struct RmCtx {
+    char dir[620];
+    int fail;
+} RmCtx;
+
+static void rm_cb(const char* name, int is_dir, void* ud) {
+    RmCtx* x = (RmCtx*)ud;
+    char p[700];
+    snprintf(p, sizeof(p), "%s/%s", x->dir, name);
+    if (is_dir) {
+        RmCtx sub;
+        snprintf(sub.dir, sizeof(sub.dir), "%s", p);
+        sub.fail = 0;
+        list_dir(p, rm_cb, &sub);
+        if (sub.fail) x->fail = 1;
+#ifdef _WIN32
+        if (!RemoveDirectoryA(p)) x->fail = 1;
+#else
+        if (rmdir(p) != 0) x->fail = 1;
+#endif
+    } else if (remove(p) != 0) {
+        x->fail = 1;
+    }
+}
+
+int pc_character_delete(const char* dir, const char* uuid, char* err, size_t errcap) {
+    PCCharacter c;
+    char d[400], text[CINI_CAP], buf[CINI_CAP], key[64], ierr[300];
+    RmCtx x;
+    int r;
+    if (!char_dir(dir, uuid, d, sizeof(d))) {
+        seterr(err, errcap, "not a character uuid", NULL, NULL);
+        return 0;
+    }
+    r = pc_character_load(dir, uuid, &c, ierr, sizeof(ierr));
+    if (r == PC_CHARACTER_ABSENT) {
+        seterr(err, errcap, "no such character", NULL, NULL);
+        return 0;
+    }
+    if (r == PC_CHARACTER_OK && c.has_legacy) { /* hide the imported profile BEFORE the store entry goes, so it can never flash back as a legacy row */
+        const char* tok = c.legacy_profile[0] != '\0' ? c.legacy_profile : "(default)";
+        cini_load(dir, text);
+        if (!cini_get(text, "hidden_profiles", buf, sizeof(buf))) {
+            buf[0] = '\0';
+        }
+        if (!csv_has(buf, tok)) {
+            if (buf[0] != '\0') strcat(buf, ",");
+            strncat(buf, tok, sizeof(buf) - strlen(buf) - 1);
+            if (!cini_put(dir, "hidden_profiles", buf)) {
+                seterr(err, errcap, "could not record the hidden legacy profile (nothing deleted)", NULL, NULL);
+                return 0;
+            }
+        }
+    }
+    snprintf(x.dir, sizeof(x.dir), "%s", d);
+    x.fail = 0;
+    list_dir(d, rm_cb, &x);
+#ifdef _WIN32
+    if (!RemoveDirectoryA(d)) x.fail = 1;
+#else
+    if (rmdir(d) != 0) x.fail = 1;
+#endif
+    cini_load(dir, text);
+    if (cini_get(text, "default", buf, sizeof(buf)) && strncmp(buf, uuid, PC_CHARACTER_UUID_LEN) == 0) {
+        cini_put(dir, "default", NULL);
+    }
+    if (cini_get(text, "order", buf, sizeof(buf))) {
+        csv_remove(buf, uuid);
+        cini_put(dir, "order", buf);
+    }
+    label_key(uuid, key, sizeof(key));
+    cini_put(dir, key, NULL);
+    if (x.fail) {
+        seterr(err, errcap, "some files of the character could not be removed", NULL, NULL);
+        return 0;
+    }
+    return 1;
+}
+
+/* ---------------- default ---------------- */
+
+int pc_character_default_get(const char* dir, char out[PC_CHARACTER_UUID_LEN + 1]) {
+    char text[CINI_CAP], v[128];
+    if (!cini_load(dir, text) || !cini_get(text, "default", v, sizeof(v)) || strlen(v) < PC_CHARACTER_UUID_LEN) {
+        return 0;
+    }
+    memcpy(out, v, PC_CHARACTER_UUID_LEN);
     out[PC_CHARACTER_UUID_LEN] = '\0';
     return is_uuid(out);
 }
 
 int pc_character_default_set(const char* dir, const char* uuid) {
-    char path[320], text[128];
-    int n;
     if (!is_uuid(uuid)) {
         return 0;
     }
-    snprintf(path, sizeof(path), "%s/characters.ini", dir_or_default(dir));
-    n = snprintf(text, sizeof(text), "default = %s\n", uuid);
-    return write_atomic(path, text, (size_t)n, 0);
+    return cini_put(dir, "default", uuid);
 }
