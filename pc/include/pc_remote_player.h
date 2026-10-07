@@ -125,6 +125,11 @@ int  pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
  * (pending), 2 = the actor is live in the current GAME_PLAY. Safe for an out-of-range player_id (0). */
 int  pc_remote_player_puppet_state(PCNetPlayerId player_id);
 
+/* Shared train arrival (pc_remote_arrival_logic.h): the local guest about to start the vanilla ride-off asks what the OTHER players are doing. 0 = not decidable yet (the caller keeps
+ * its demo parked this frame and asks again); 1 = decided: *join_class = PCARR_JOIN_NONE (start the normal arrival) / RIDING / STOPPED, *train_x = the train x to start at for RIDING.
+ * Client only (anything else is decided NONE at once). Never waits for another arrival to END. */
+int  pc_remote_arrival_join_query(int* join_class, float* train_x);
+
 /* M9-B TEST-ONLY (used by the off-by-default --collide-test-* hooks in pc_net_game.c): fills the current
  * (interpolated) world position of the first live puppet that has snapshots, a visual and a same-scene FIELD/IN_TOWN
  * presence (range and transient holds are ignored). Returns 0 when there is none. Read-only. */

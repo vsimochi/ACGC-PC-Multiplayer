@@ -2401,6 +2401,12 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     /* Transient holds. Pause: CollisionCheck_setOC() itself refuses while paused. Net/axe swing: the player's
      * item-triangle check (OCC) ignores group flags, so a registered pipe would stop/reflect the swing. */
     main_index = local->now_main_index;
+    /* guest arrival: while the LOCAL guest's ride-off demo actor exists (the train ride, the get-off, the welcome, and above all the scripted final walk to (2220, 840)) no puppet shoves it:
+     * the walk only ends at z >= 840 and cannot be interrupted, so a player already standing at that target (the guest that arrived first, or the one it shares the train with) would lock it
+     * in DEMO_WALK for good. Ordinary collision resumes the moment the demo actor is gone (control restored). */
+    if (Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL) {
+        return "hold";
+    }
     if (in_interior) {
         /* a stale puppet (owner stopped sending MOVE, e.g. an unannounced scene) is hidden by dw: it must not shove either */
         if (gamePT != NULL && (graph_dt_frame_time(gamePT) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
@@ -5289,6 +5295,73 @@ int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
 }
 
 /* --dedicated console accessor: see pc_remote_player.h. Read-only. */
+/* Shared train arrival: see pc_remote_arrival_logic.h. Reads the per-slot canonical storage only (scene presence + the newest MOVE sample), never the puppet actors. */
+int pc_remote_arrival_join_query(int* join_class, float* train_x) {
+    const double now = (gamePT != NULL) ? graph_dt_frame_time(gamePT) : 0.0;
+    static int s_logged_hold = 0;
+    PCNetGameLinkState link;
+    int i, n_stopped = 0, n_riding = 0, unknown = 0, roster_pending, decided;
+    float riding_x = 0.0f;
+
+    *join_class = PCARR_JOIN_NONE;
+    *train_x = 0.0f;
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        return 1;
+    }
+    link = pc_net_game_client_link_state();
+    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
+        const PCRemotePlayerSlot* slot = &s_slots[i];
+        const PCRemoteMoveSnapshot* newest;
+        double since_move, since_scene;
+        int cls;
+
+        if (!slot->in_use || !slot->scene.valid || slot->scene.scene_id != (uint8_t)SCENE_FG || (slot->scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0) {
+            continue;
+        }
+        since_scene = (now >= slot->scene_accept_frame) ? now - slot->scene_accept_frame : 0.0; /* the frame clock restarts with every GAME_PLAY */
+        if (slot->snapshot_count == 0) {
+            if (since_scene <= PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+                unknown++; /* its first MOVE is still on the way; bounded by the same silence gap the puppet code uses */
+            }
+            continue;
+        }
+        since_move = (now >= slot->last_move_recv_local_frame) ? now - slot->last_move_recv_local_frame : 0.0;
+        if (since_move > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+            continue; /* silent (vanished / frozen): not an arrival */
+        }
+        newest = &slot->snapshots[(slot->snapshot_head + PC_REMOTE_PLAYER_SNAPSHOT_COUNT - 1) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+        cls = pcarr_join_class(newest->action_valid, newest->action_index, (int)mPlayer_INDEX_DEMO_STANDING_TRAIN, (int)mPlayer_INDEX_DEMO_GETOFF_TRAIN, (int)mPlayer_INDEX_DEMO_WALK,
+                               (int)mPlayer_INDEX_TALK, (int)mPlayer_INDEX_DEMO_WAIT, newest->pos_x, newest->pos_z);
+        if (cls == PCARR_JOIN_STOPPED) {
+            n_stopped++;
+        } else if (cls == PCARR_JOIN_RIDING) {
+            if (n_riding == 0 || newest->pos_x > riding_x) {
+                riding_x = newest->pos_x; /* the furthest-along passenger: that train is the one to join */
+            }
+            n_riding++;
+        }
+    }
+    roster_pending = link == PC_NETGAME_LINK_READY && !pc_net_game_client_world_synced();
+    decided = pcarr_join_decide(link == PC_NETGAME_LINK_HANDSHAKE, link == PC_NETGAME_LINK_READY, roster_pending, unknown, n_stopped, n_riding);
+    if (decided < 0) {
+        if (!s_logged_hold) {
+            s_logged_hold = 1;
+            printf("[TRAIN] arrival join: the guest's arrival waits for the host's roster of who is arriving (link %s, %d state(s) not known yet)\n", link == PC_NETGAME_LINK_READY ? "READY" : "handshake", unknown);
+        }
+        return 0;
+    }
+    s_logged_hold = 0;
+    *join_class = decided;
+    if (decided == PCARR_JOIN_RIDING) {
+        *train_x = pcarr_join_train_x(riding_x);
+    }
+    printf("[TRAIN] arrival join: %s (%d other player(s) stopped at the station, %d riding)\n",
+           decided == PCARR_JOIN_STOPPED ? "JOINING the arrival that is at the station (the local train starts stopped, doors open)" :
+           decided == PCARR_JOIN_RIDING ? "JOINING the arrival that is riding in (the local train starts where the other passenger's is)" : "no other arrival: the normal arrival starts",
+           n_stopped, n_riding);
+    return 1;
+}
+
 int pc_remote_player_puppet_state(PCNetPlayerId player_id) {
     PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
     if (slot == NULL || !slot->in_use) {

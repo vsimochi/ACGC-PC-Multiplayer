@@ -70,9 +70,38 @@ def main():
         ck("diff: %s is byte-identical to the baseline" % fn, T.func(tc, fn) != "" and T.func(tc, fn) == T.func(tcb, fn))
     ck("vanilla player / train / ride-off / station master decomp files are untouched (git diff vs %s)" % BASELINE,
        unchanged(["src/game/m_player.c", "src/game/m_player_lib.c", "src/game/m_player_common.c_inc", "src/game/m_player_main_demo_standing_train.c_inc",
-                  "src/game/m_player_main_demo_getoff_train.c_inc", "src/game/m_player_main_demo_walk.c_inc", "src/actor/ac_ride_off_demo_move.c_inc",
-                  "src/actor/ac_intro_demo_move.c_inc", "src/actor/ac_train0_move.c_inc", "src/actor/ac_train1_move.c_inc",
+                  "src/game/m_player_main_demo_getoff_train.c_inc", "src/game/m_player_main_demo_walk.c_inc",
+                  "src/actor/ac_intro_demo_move.c_inc", "src/actor/ac_train0_move.c_inc",
                   "src/actor/npc/ac_npc_station_master_schedule.c_inc", "src/actor/npc/ac_npc_station_master_talk.c_inc", "src/game/m_event.c"]))
+    # the shared train arrival (pc_remote_arrival_join_query) and the walk-end retry are the changes of the ride-off demo: TARGET_PC-guarded, vanilla lines byte-identical outside it
+    rod_path = "src/actor/ac_ride_off_demo_move.c_inc"
+    def strip_pc_keep_else(text):
+        """like strip_target_pc, but a region's `#else` branch (the VANILLA lines the PC branch replaces) is kept; no nesting inside such a region"""
+        out, regions, mode, cur_r = [], [], 0, []
+        for ln in text.split("\n"):
+            t = ln.strip()
+            if mode == 0:
+                if t == "#ifdef TARGET_PC":
+                    mode, cur_r = 1, [ln]
+                    continue
+                out.append(ln)
+            else:
+                cur_r.append(ln)
+                if t == "#else" and mode == 1:
+                    mode = 2
+                elif t == "#endif":
+                    regions.append("\n".join(cur_r))
+                    mode = 0
+                elif mode == 2:
+                    out.append(ln)
+        return "\n".join(out), regions, mode != 0
+
+    rod_s, rod_r, rod_u = strip_pc_keep_else(cur(rod_path))
+    ck("diff: ac_ride_off_demo_move.c_inc is BYTE-IDENTICAL to the baseline outside its TARGET_PC regions (the shared-arrival join query / apply, the 'arrival finished' log and the walk-end retry whose #else branch IS the vanilla code)",
+       not rod_u and T.nonblank(rod_s) == T.nonblank(blob(BASELINE, rod_path)) and "pc_remote_arrival_join_query(" in "\n".join(rod_r))
+    t1_s, t1_r, t1_u = strip_pc_keep_else(cur("src/actor/ac_train1_move.c_inc"))
+    ck("diff: ac_train1_move.c_inc is BYTE-IDENTICAL to the baseline outside its TARGET_PC region (the shared-arrival passenger offset, whose #else branch IS the vanilla line)",
+       not t1_u and T.nonblank(t1_s) == T.nonblank(blob(BASELINE, "src/actor/ac_train1_move.c_inc")) and "mTRC_pc_passenger_dx()" in "\n".join(t1_r))
     hb = blob(BASELINE, "include/m_train_control.h")
     hc = cur("include/m_train_control.h")
     hs, hr, hu = T.strip_target_pc(hc)
@@ -96,7 +125,7 @@ def main():
        len(re.findall(r"Common_Set\(", f)) == 1 and "Common_Set(train_coming_flag, 3);" in f and f.index("return 0;") < f.index("Common_Set(train_coming_flag, 3);"))
     ck("T4: no direct train state machine call / no scene / net call in the hook (mTRC_schedule, mTRC_demo_init, mTRC_init, goto_other_scene, pc_net)",
        not re.search(r"mTRC_schedule|mTRC_demo_init|mTRC_init|mTRC_call_init|goto_other_scene|pc_net|mDemo_|Actor_info_delete|setup_actor", f))
-    dm = re.search(r"static void aROD_first_set\(ACTOR\* actor, GAME\* game\) \{\n    Common_Set\(train_coming_flag, 3\);", T.norm(open(os.path.join(ROOT, "src/actor/ac_ride_off_demo_move.c_inc"), encoding="utf-8", errors="replace").read()))
+    dm = re.search(r"static void aROD_first_set\(ACTOR\* actor, GAME\* game\) \{\n    Common_Set\(train_coming_flag, 3\);", T.strip_target_pc(T.norm(open(os.path.join(ROOT, "src/actor/ac_ride_off_demo_move.c_inc"), encoding="utf-8", errors="replace").read()))[0])
     ck("T4: the value matches the arriving client's own request (ride-off demo aROD_first_set sets train_coming_flag = 3; mTRC_schedule case 3 -> mTRC_demo_init)", dm is not None
        and re.search(r"case 3: \{\n\s+Common_Set\(train_coming_flag, 0\);\n\s+mTRC_demo_init\(\);", tc) is not None)
 
@@ -155,7 +184,7 @@ def main():
     ck("T3: the train-demo main indexes are the contiguous DEMO_WALK, GETON_TRAIN, GETON_TRAIN_WAIT, GETOFF_TRAIN, STANDING_TRAIN of m_player.h",
        re.search(r"mPlayer_INDEX_DEMO_WALK,\s*mPlayer_INDEX_DEMO_GETON_TRAIN,\s*mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT,\s*mPlayer_INDEX_DEMO_GETOFF_TRAIN,\s*mPlayer_INDEX_DEMO_STANDING_TRAIN,", mp) is not None)
     hdr = open(os.path.join(PC, "include", "pc_remote_arrival_logic.h"), encoding="utf-8").read()
-    ck("header: pure and libc-free (no #include; six static inline functions: decide, standing_should_evaluate, reason_is_transient, standing_settle, local_intro_arriving, demo_walk)", "#include" not in hdr and hdr.count("static inline") == 6)
+    ck("header: pure and libc-free (no #include; ten static inline functions: decide, standing_should_evaluate, reason_is_transient, standing_settle, local_intro_arriving, demo_walk + the shared arrival's in_station_zone, join_class, join_train_x, join_decide)", "#include" not in hdr and hdr.count("static inline") == 10)
 
     # ---------------- no wire change ----------------
     ck("wire: pc_net_game.h / pc_net.h / pc_net.c / pc_net_game.c are byte-identical to the baseline", unchanged(["pc/include/pc_net_game.h", "pc/include/pc_net.h", "pc/src/pc_net.c", "pc/src/pc_net_game.c"]))

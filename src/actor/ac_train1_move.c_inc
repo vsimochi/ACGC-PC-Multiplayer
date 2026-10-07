@@ -71,7 +71,11 @@ static void aTR1_passenger_ctrl(ACTOR* actor) {
     s_xyz rot;
 
     if (train1->arg0 == 1) {
+#ifdef TARGET_PC
+        pos.x = train1->actor_class.world.position.x + 60.0f + mTRC_pc_passenger_dx(); /* shared arrival: a joiner stands behind the first passenger */
+#else
         pos.x = train1->actor_class.world.position.x + 60.0f;
+#endif
         pos.y = train1->actor_class.world.position.y + 20.0f;
         pos.z = train1->actor_class.world.position.z + 20.0f;
         rot.x = ZeroSVec.x;

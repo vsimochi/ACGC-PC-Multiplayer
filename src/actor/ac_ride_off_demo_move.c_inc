@@ -10,7 +10,33 @@ static void aROD_change_player_demo_standing_train(GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+#include "m_train_control.h"
+#include "pc_remote_arrival_logic.h"
+extern int pc_remote_arrival_join_query(int* join_class, float* train_x); /* pc_remote_player.c */
+
+/* Shared train arrival: a GUEST that arrives while another player is still arriving JOINS that arrival instead of running an independent second one. The vanilla steps below are
+ * unchanged; the guest only (1) learns first what the other players are doing (first_set is polled until the host's roster is in), (2) moves its own freshly started local train to the
+ * phase of the other passenger (train_birth_wait, once), (3) stands a little behind the first passenger (m_train_control.c mTRC_pc_passenger_dx). */
+static int s_aROD_join_class = PCARR_JOIN_NONE;
+static float s_aROD_join_x = 0.0f;
+static int s_aROD_join_pending = 0;
+#endif
+
 static void aROD_first_set(ACTOR* actor, GAME* game) {
+#ifdef TARGET_PC
+    s_aROD_join_pending = 0;
+    if (Common_Get(player_no) == mPr_FOREIGNER) {
+        if (!pc_remote_arrival_join_query(&s_aROD_join_class, &s_aROD_join_x)) {
+            if (mPlib_get_player_actor_main_index(game) != mPlayer_INDEX_DEMO_WAIT) {
+                mPlib_request_main_demo_wait_type1(game, FALSE, NULL); /* parked at the station start, no control, until the roster of the others is known */
+            }
+            return;
+        }
+        s_aROD_join_pending = s_aROD_join_class != PCARR_JOIN_NONE;
+        mTRC_pc_join_arrival(PCARR_JOIN_NONE, 0.0f); /* resets the passenger offset; a join is applied once the local train exists (train_birth_wait) */
+    }
+#endif
     Common_Set(train_coming_flag, 3);
     aROD_change_player_demo_standing_train(game);
     aROD_setupAction(actor, game, 1);
@@ -22,6 +48,12 @@ static void aROD_train_birth_wait(ACTOR* actor, GAME* game) {
     TRAIN1_ACTOR* train = (TRAIN1_ACTOR*)Actor_info_fgName_search(&play->actor_info, TRAIN1, ACTOR_PART_ITEM);
 
     aROD_change_player_demo_standing_train(game);
+#ifdef TARGET_PC
+    if (s_aROD_join_pending && Common_Get(train_coming_flag) == 0 && Common_Get(train_action) != 0) { /* the vanilla arrival request ran: the local train exists in Common */
+        mTRC_pc_join_arrival(s_aROD_join_class, s_aROD_join_x);
+        s_aROD_join_pending = 0;
+    }
+#endif
 
     if (train != NULL) {
         ride_off->train_actor = train;
@@ -62,9 +94,19 @@ static void aROD_walk_one_unit(ACTOR* actor, GAME* game) {
     if (player != NULL) {
         if (player->actor_class.world.position.z >= aROD_OFF_UT_Z_POS) {
             if (F32_IS_ZERO(ride_off->station_master_actor->speed)) {
+#ifdef TARGET_PC
+                /* the player's own end-of-walk request (DEMO_WAIT, priority 19) can still be pending in this very frame: then the wait request is refused (19 - 19 = 0) and, deleting the demo
+                 * actor anyway, the player would stay locked in DEMO_WAIT for good. Finish only once the request was accepted, otherwise retry next frame. */
+                if (mPlib_request_main_wait_type3(game)) {
+                    Camera2_request_main_normal(play, 0, 9);
+                    printf("[TRAIN] local arrival finished: the player stands in the town\n");
+                    Actor_delete(actor);
+                }
+#else
                 mPlib_request_main_wait_type3(game);
                 Camera2_request_main_normal(play, 0, 9);
                 Actor_delete(actor);
+#endif
             }
         } else {
             mPlib_Set_goal_player_demo_walk(aROD_OFF_UT_X_POS, aROD_OFF_UT_Z_POS, 2.5f);

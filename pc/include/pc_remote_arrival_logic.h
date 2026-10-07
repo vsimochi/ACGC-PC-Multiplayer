@@ -111,4 +111,74 @@ static inline int pcarr_demo_walk_plays_walk(int action_valid, int action_index,
     return action_valid && action_index == demo_walk_index && move_state_is_other;
 }
 
+/* ---- SHARED train arrival (a guest that connects while another player is still arriving joins THAT arrival instead of starting a second, independent one) ----
+ * Every process runs its own local train (nothing about it is synced), so "the same train" means: the joining guest's local train is started at the phase the other passenger is in,
+ * read from the other player's streamed state, and the guest takes a different passenger spot. The streamed MOVE state + position is all the information used:
+ *   STANDING_TRAIN (riding)                          the other player's caboose is at its x: PCARR_JOIN_RIDING, train x = passenger x + 190 (caboose = train - 250, passenger = caboose + 60)
+ *   GETOFF_TRAIN / DEMO_WALK, or TALK / DEMO_WAIT on the station platform (Porter's welcome, joined mid-welcome)    the train stands at the station: PCARR_JOIN_STOPPED
+ * Anything else (ordinary field movement, boarding, a DEMO_WAIT elsewhere) is not an arrival. */
+enum { PCARR_JOIN_NONE = 0, PCARR_JOIN_RIDING = 1, PCARR_JOIN_STOPPED = 2 };
+
+#define PCARR_STATION_X 2200.0f /* the station platform around Porter, where an arriving guest gets off and is welcomed */
+#define PCARR_STATION_Z 820.0f
+#define PCARR_STATION_RADIUS 120.0f
+#define PCARR_TRAIN_START_X 2037.0f /* mTRC_demo_init */
+#define PCARR_TRAIN_STOP_X 2365.0f  /* where the arrival train stops (logged train x at action 4 / 5) */
+#define PCARR_TRAIN_RIDE_MAX_X 2160.0f /* a riding join keeps BEGIN_SLOWDOWN (x <= 2165), so the vanilla stop distance still ends at the station */
+#define PCARR_JOIN_PASSENGER_DX (-40.0f) /* the joiner stands this far BEHIND the first passenger (+60 from the caboose) */
+
+static inline int pcarr_in_station_zone(float x, float z) {
+    const float dx = x - PCARR_STATION_X;
+    const float dz = z - PCARR_STATION_Z;
+    return dx > -PCARR_STATION_RADIUS && dx < PCARR_STATION_RADIUS && dz > -PCARR_STATION_RADIUS && dz < PCARR_STATION_RADIUS;
+}
+
+static inline int pcarr_join_class(int action_valid, int action_index, int standing_index, int getoff_index, int walk_index, int talk_index, int demo_wait_index, float x, float z) {
+    if (!action_valid) {
+        return PCARR_JOIN_NONE;
+    }
+    if (action_index == standing_index) {
+        return PCARR_JOIN_RIDING;
+    }
+    if (action_index == getoff_index || action_index == walk_index) {
+        return PCARR_JOIN_STOPPED;
+    }
+    if ((action_index == talk_index || action_index == demo_wait_index) && pcarr_in_station_zone(x, z)) {
+        return PCARR_JOIN_STOPPED;
+    }
+    return PCARR_JOIN_NONE;
+}
+
+/* the x of the train engine a passenger at world x `passenger_x` rides, kept in the part of the approach where the vanilla slowdown / stop still ends at the station */
+static inline float pcarr_join_train_x(float passenger_x) {
+    float x = passenger_x + 190.0f;
+    if (x < PCARR_TRAIN_START_X) {
+        x = PCARR_TRAIN_START_X;
+    }
+    if (x > PCARR_TRAIN_RIDE_MAX_X) {
+        x = PCARR_TRAIN_RIDE_MAX_X;
+    }
+    return x;
+}
+
+/* The decision of a guest that is about to start its arrival: -1 = not decidable yet (keep the demo parked this frame), else the PCARR_JOIN_* class to start with.
+ *   link_handshake   transport-connected, READY not reached yet (READY needs the town entered, i.e. it completes in the first frames of the arrival scene)
+ *   link_ready       READY
+ *   roster_pending   READY but the first world snapshot is not applied yet (the host's join-time scene replay precedes it on the same ordered channel)
+ *   unknown_slots    town players whose first MOVE has not arrived yet (bounded by the puppet code's existing 'no MOVE for 90 frames' silence convention)
+ *   n_stopped / n_riding   other players in each arrival class
+ * Not a connected client: decided at once, NONE (the vanilla arrival, untouched). The joiner never waits for the other arrival to END: only until it knows what the others are doing. */
+static inline int pcarr_join_decide(int link_handshake, int link_ready, int roster_pending, int unknown_slots, int n_stopped, int n_riding) {
+    if (link_handshake) {
+        return -1;
+    }
+    if (!link_ready) {
+        return PCARR_JOIN_NONE;
+    }
+    if (roster_pending || unknown_slots > 0) {
+        return -1;
+    }
+    return n_stopped > 0 ? PCARR_JOIN_STOPPED : (n_riding > 0 ? PCARR_JOIN_RIDING : PCARR_JOIN_NONE);
+}
+
 #endif /* PC_REMOTE_ARRIVAL_LOGIC_H */

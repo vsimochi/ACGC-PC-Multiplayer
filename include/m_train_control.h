@@ -43,6 +43,10 @@ extern void mTRC_move(GAME* game);
 #ifdef TARGET_PC
 /* T4: a remote puppet entered the 'standing in the train' state: start the local vanilla arrival train if the guard allows. Returns the guard reason (0 = started; 7..9 are transient, re-poll). */
 extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town);
+/* Shared train arrival: a guest that joins another player's arrival moves its own freshly started arrival train (mTRC_demo_init) to the joined phase. join_class = PCARR_JOIN_*
+ * (pc_remote_arrival_logic.h), train_x for RIDING. Idempotent per arrival; sets the extra x offset of the joiner's passenger spot (mTRC_pc_passenger_dx). */
+extern void mTRC_pc_join_arrival(int join_class, float train_x);
+extern float mTRC_pc_passenger_dx(void);
 #endif
 
 #ifdef __cplusplus

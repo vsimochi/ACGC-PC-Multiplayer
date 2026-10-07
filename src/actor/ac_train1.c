@@ -10,6 +10,9 @@
 #include "m_common_data.h"
 #include "m_field_info.h"
 #include "m_event.h"
+#ifdef TARGET_PC
+#include "m_train_control.h" /* mTRC_pc_passenger_dx: the shared train arrival passenger offset */
+#endif
 
 static void aTR1_actor_ct(ACTOR* actor, GAME* game);
 static void aTR1_actor_dt(ACTOR* actor, GAME* game);

@@ -633,6 +633,40 @@ extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town
 }
 #endif
 
+#ifdef TARGET_PC
+static float s_pc_passenger_dx = 0.0f;
+
+/* Shared train arrival: see m_train_control.h. Called once from the ride-off demo (aROD_train_birth_wait) after the vanilla arrival request (train_coming_flag = 3 ->
+ * mTRC_demo_init) ran. The train actors are pure views of these Common fields, so moving them here moves the (local) train; nothing else about the train is touched. */
+extern void mTRC_pc_join_arrival(int join_class, float train_x) {
+    xyz_t pos = Common_Get(train_position);
+
+    if (join_class == PCARR_JOIN_RIDING) {
+        pos.x = train_x; /* still in BEGIN_SLOWDOWN: the vanilla slowdown / stop carries on from there */
+        Common_Set(train_position, pos);
+        s_pc_passenger_dx = PCARR_JOIN_PASSENGER_DX;
+    } else if (join_class == PCARR_JOIN_STOPPED) {
+        /* the same state mTRC_trainControl reaches after SIGNAL_STOPPED: stopped at the station, doors open (action 5), leaving after the usual ~20 s of RTC time */
+        pos.x = PCARR_TRAIN_STOP_X;
+        Common_Set(train_position, pos);
+        Common_Set(train_speed, 0.0f);
+        Common_Set(train_signal, TRUE);
+        Common_Set(train_timer, 0);
+        Common_Set(train_action, mTRC_ACTION_WAIT_STOPPED);
+        Common_Set(train_start_timer, mTRC_RTC_TIME_SECONDS(Common_GetPointer(time.rtc_time)) + 20);
+        s_pc_passenger_dx = PCARR_JOIN_PASSENGER_DX;
+    } else {
+        s_pc_passenger_dx = 0.0f;
+    }
+    PC_LOG(PCL_GENERAL, "[TRAIN] shared arrival: local train moved to the joined phase (class %d, train x %.0f, action %u, passenger dx %.0f)\n", join_class, (double)pos.x,
+           (unsigned)Common_Get(train_action), (double)s_pc_passenger_dx);
+}
+
+extern float mTRC_pc_passenger_dx(void) {
+    return s_pc_passenger_dx;
+}
+#endif
+
 extern void mTRC_move(GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     PLAYER_ACTOR* player = get_player_actor_withoutCheck(play);

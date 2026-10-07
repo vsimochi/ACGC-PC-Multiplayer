@@ -155,6 +155,25 @@ int main(void) {
     check("T3 no action info (v6 sender) is untouched", pcarr_demo_walk_plays_walk(0, 17, 17, 1) == 0);
     check("T3 a sender that already classified it (not OTHER) is untouched", pcarr_demo_walk_plays_walk(1, 17, 17, 0) == 0);
 
+    /* ---- SHARED train arrival: what the other players are doing decides how a joining guest starts (main indexes: STANDING_TRAIN 79, GETOFF_TRAIN 78, DEMO_WALK 75, TALK 65, DEMO_WAIT 74) ---- */
+#define JC(valid, idx, x, z) pcarr_join_class((valid), (idx), 79, 78, 75, 65, 74, (x), (z))
+    check("J class: standing in the arrival train is RIDING", JC(1, 79, 2000.0f, 760.0f) == PCARR_JOIN_RIDING);
+    check("J class: getting off the train / the walk from the station are STOPPED (the train is at the station)", JC(1, 78, 2180.0f, 820.0f) == PCARR_JOIN_STOPPED && JC(1, 75, 2210.0f, 830.0f) == PCARR_JOIN_STOPPED);
+    check("J class: Porter's welcome (TALK) and the DEMO_WAIT gaps ON THE STATION PLATFORM are STOPPED (joined mid-welcome)", JC(1, 65, 2200.0f, 820.0f) == PCARR_JOIN_STOPPED && JC(1, 74, 2190.0f, 815.0f) == PCARR_JOIN_STOPPED);
+    check("J class: a TALK / DEMO_WAIT elsewhere (an ordinary conversation, another guest parked at the ride-off start) is NOT an arrival", JC(1, 65, 1400.0f, 1400.0f) == PCARR_JOIN_NONE && JC(1, 74, 1970.0f, 760.0f) == PCARR_JOIN_NONE);
+    check("J class: ordinary field movement, boarding the train (a departure) and an old sender (no action info) are NOT arrivals",
+          JC(1, 7, 2200.0f, 820.0f) == PCARR_JOIN_NONE && JC(1, 3, 2200.0f, 820.0f) == PCARR_JOIN_NONE && JC(1, 76, 2200.0f, 820.0f) == PCARR_JOIN_NONE && JC(0, 79, 2000.0f, 760.0f) == PCARR_JOIN_NONE);
+#undef JC
+    check("J train x: the engine runs 190 ahead of a passenger (caboose = train - 250, passenger = caboose + 60)", pcarr_join_train_x(1911.0f) > 2100.9f && pcarr_join_train_x(1911.0f) < 2101.1f);
+    check("J train x: clamped to the approach (never before the vanilla start 2037, never past 2160 so the slowdown / stop still ends at the station)",
+          pcarr_join_train_x(1500.0f) == PCARR_TRAIN_START_X && pcarr_join_train_x(2175.0f) == PCARR_TRAIN_RIDE_MAX_X);
+    check("J decide: the handshake is not complete -> not decidable yet", pcarr_join_decide(1, 0, 0, 0, 0, 0) == -1);
+    check("J decide: not a connected client (single-player / host / refused) -> the vanilla arrival at once", pcarr_join_decide(0, 0, 1, 3, 2, 2) == PCARR_JOIN_NONE);
+    check("J decide: READY but the host's roster / first MOVEs are not in yet -> not decidable yet (bounded by the existing silence gap)", pcarr_join_decide(0, 1, 1, 0, 0, 0) == -1 && pcarr_join_decide(0, 1, 0, 1, 0, 0) == -1);
+    check("J decide: nobody is arriving -> the normal arrival", pcarr_join_decide(0, 1, 0, 0, 0, 0) == PCARR_JOIN_NONE);
+    check("J decide: another passenger riding -> JOIN riding; someone at the station -> JOIN stopped (wins over a riding one); never a wait for the arrival to end",
+          pcarr_join_decide(0, 1, 0, 0, 0, 1) == PCARR_JOIN_RIDING && pcarr_join_decide(0, 1, 0, 0, 1, 0) == PCARR_JOIN_STOPPED && pcarr_join_decide(0, 1, 0, 0, 2, 1) == PCARR_JOIN_STOPPED);
+
     printf("RESULT passed=%d failed=%d\n", s_pass, s_fail);
     return s_fail ? 1 : 0;
 }
