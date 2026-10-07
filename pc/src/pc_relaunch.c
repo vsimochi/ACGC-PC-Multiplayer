@@ -64,6 +64,8 @@ int pc_relaunch_build_args(const char* host, int port, int kind, const char* nam
     /* M-C: every Play Online client fetches the host's town first (--town-fetch) and uses the interactive failure boxes (--online-ui, hidden) */
     if (kind == PC_RELAUNCH_DEFAULT_GUEST) {
         n = snprintf(out, cap, "--connect %s:%d --guest --town-fetch --online-ui%s", host, port, s_forward);
+    } else if (kind == PC_RELAUNCH_NEW_CHARACTER) { /* validation only (see pc_relaunch_connect): there is no command line for a creation */
+        n = snprintf(out, cap, "--connect %s:%d --town-fetch --online-ui%s", host, port, s_forward);
     } else if (kind == PC_RELAUNCH_CHARACTER || kind == PC_RELAUNCH_PROFILE) {
         if (!name_ok(name)) return 0;
         n = snprintf(out, cap, "--connect %s:%d %s \"%s\" --town-fetch --online-ui%s", host, port, kind == PC_RELAUNCH_CHARACTER ? "--character" : "--guest-profile", name, s_forward);
@@ -75,6 +77,10 @@ int pc_relaunch_build_args(const char* host, int port, int kind, const char* nam
 
 int pc_relaunch_connect(const char* host, int port, int kind, const char* name, char* err, size_t errcap) {
     char args[320];
+    if (kind == PC_RELAUNCH_NEW_CHARACTER) { /* the creation lives in this process (the Rover scene); a relaunch would lose it */
+        snprintf(err, errcap, "a new character cannot be relaunched");
+        return 0;
+    }
     if (!pc_relaunch_build_args(host, port, kind, name, args, sizeof(args))) {
         snprintf(err, errcap, "cannot build the connect command line");
         return 0;

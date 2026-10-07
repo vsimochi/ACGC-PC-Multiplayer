@@ -763,6 +763,10 @@ static char g_pc_guest_spec[96];
  * (+ the legacy guest profiles) and exits 0; --character-import-profile NAME copies a legacy guest profile (NAME "" / default = guest.ini) into the store, prints
  * the result and exits 0. The legacy files are never moved or deleted. See pc_character.h and docs/multiplayer-guest-roadmap.md. */
 static const char* g_pc_character_spec = NULL;
+/* Play Online "New character" (PC_RELAUNCH_NEW_CHARACTER): the in-process connect asks pc_main_prepare_store_character for a NEW store character WITHOUT looking anything up by
+ * name; the Rover scene chooses the real name. Set by pc_po_connect only, cleared right after the character is prepared (and on rollback). */
+static int s_pc_character_new = 0;
+#define PC_NEW_CHARACTER_PLACEHOLDER "NewChar" /* in-memory only: the Rover name editor clears it and the finish saves what the player typed */
 static const char* g_pc_character_import = NULL;
 static int g_pc_characters_list = 0;
 /* M3 (servers): --server NAME (saved destination from save/mp/servers.ini, fills the --connect host:port; alone it implies --guest), --servers (list, exit 0),
@@ -995,7 +999,14 @@ static int pc_main_prepare_store_character(void) {
     ss->port = (int)g_pc_net_port;
     ss->join_kind = PC_SESSION_JOIN_GUEST;
     err[0] = '\0';
-    if (g_pc_character_spec != NULL) {
+    if (s_pc_character_new) {
+        /* explicit NEW request: never resolve by name (a name could match an existing character) */
+        if (!pc_character_prepare_new(NULL, PC_NEW_CHARACTER_PLACEHOLDER, &c, err, sizeof(err))) {
+            fprintf(stderr, "[PC] new character: REFUSED: a new character cannot be created: %s\n", err);
+            return -1;
+        }
+        creating = 1;
+    } else if (g_pc_character_spec != NULL) {
         r = pc_character_resolve(NULL, g_pc_character_spec, &c, err, sizeof(err));
         if (r == PC_CHARACTER_AMBIGUOUS || r == PC_CHARACTER_ERR) {
             fprintf(stderr, "[PC] --character: REFUSED: %s\n", err);
@@ -1037,9 +1048,9 @@ static int pc_main_prepare_store_character(void) {
     if (creating) {
         extern void pc_guest_creation_arm(const PCGuestProfile* p); /* pc_m_card.c */
         pc_guest_creation_arm(&gp);
-        printf("[PC] --character: character '%s' does not exist yet: FIRST-RUN CREATION -- the real Rover scene (name, gender, face) will create "
+        printf("[PC] --character: %s: FIRST-RUN CREATION -- the real Rover scene (name, gender, face) will create "
                "characters/%s/character.ini; nothing is written before it finishes (placeholder name '%s', home town '%s', player id 0x%04X, land id 0x%04X)\n",
-               g_pc_character_spec, c.uuid, gp.name, gp.home_town, (unsigned)gp.player_id, (unsigned)gp.land_id);
+               s_pc_character_new ? "new character" : g_pc_character_spec, c.uuid, gp.name, gp.home_town, (unsigned)gp.player_id, (unsigned)gp.land_id);
     } else {
         (void)pc_character_default_set(NULL, c.uuid);
         printf("[PC] --guest: loaded character %s (%s): name '%s', home town '%s', gender %d, face %d, player id 0x%04X, land id 0x%04X "
@@ -1228,7 +1239,12 @@ static int pc_po_connect(char* err, size_t errcap) {
     g_pc_bootstrap_guest = NULL;
     g_pc_bootstrap_resident_pid_set = 0;
     memset(ss, 0, sizeof(*ss));
-    if (s_po.kind == PC_RELAUNCH_CHARACTER) {
+    s_pc_character_new = 0;
+    if (s_po.kind == PC_RELAUNCH_NEW_CHARACTER) {
+        g_pc_character_spec = NULL;
+        s_pc_character_new = 1;
+        (void)pc_po_select_profile(NULL);
+    } else if (s_po.kind == PC_RELAUNCH_CHARACTER) {
         snprintf(s_po_character, sizeof(s_po_character), "%s", s_po.name);
         g_pc_character_spec = s_po_character;
         (void)pc_po_select_profile(NULL);
@@ -1243,6 +1259,7 @@ static int pc_po_connect(char* err, size_t errcap) {
         (void)pc_po_select_profile(NULL);
     }
     rc = pc_main_prepare_store_character();
+    s_pc_character_new = 0;
     if (rc < 0) {
         snprintf(err, errcap, "This character cannot be used (see the log)");
         goto rollback;
@@ -1349,6 +1366,7 @@ static int pc_po_connect(char* err, size_t errcap) {
 
 rollback:
     s_po_inproc = 0;
+    s_pc_character_new = 0;
     printf("[PC] play-online: connect cancelled / failed, rolling back: %s\n", err);
     if (net_started) {
         pc_net_game_shutdown();

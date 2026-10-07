@@ -186,6 +186,12 @@ int main(int argc, char** argv) {
     check("relaunch args: legacy profile", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_PROFILE, "roger", b1, sizeof(b1)) &&
                                                strcmp(b1, "--connect 10.0.0.5:9000 --guest-profile \"roger\" --town-fetch --online-ui") == 0);
     check("relaunch args: default guest", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) && strcmp(b1, "--connect 10.0.0.5:9000 --guest --town-fetch --online-ui") == 0);
+    check("relaunch args: new character (no name needed, validation only)", pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_NEW_CHARACTER, NULL, b1, sizeof(b1)) && strstr(b1, "--character") == NULL &&
+                                                                           !pc_relaunch_build_args("bad host.com", 9000, PC_RELAUNCH_NEW_CHARACTER, NULL, b1, sizeof(b1)));
+    {
+        char rerr[100];
+        check("relaunch: a new character is never relaunched", !pc_relaunch_connect("10.0.0.5", 9000, PC_RELAUNCH_NEW_CHARACTER, NULL, rerr, sizeof(rerr)));
+    }
     check("relaunch args: injection / bad values refused",
           !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "a\" --host", b1, sizeof(b1)) && !pc_relaunch_build_args("bad host.com", 9000, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) &&
               !pc_relaunch_build_args("10.0.0.5", 0, PC_RELAUNCH_DEFAULT_GUEST, NULL, b1, sizeof(b1)) && !pc_relaunch_build_args("10.0.0.5", 9000, PC_RELAUNCH_CHARACTER, "", b1, sizeof(b1)));

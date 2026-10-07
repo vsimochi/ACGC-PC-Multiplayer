@@ -14,7 +14,8 @@ extern "C" {
 enum {
     PC_RELAUNCH_CHARACTER = 0, /* --character NAME|UUID   (store character, or a NEW name -> first-run creation) */
     PC_RELAUNCH_PROFILE = 1,   /* --guest-profile NAME    (legacy-only guest profile) */
-    PC_RELAUNCH_DEFAULT_GUEST = 2 /* --guest               (the legacy default guest.ini; name ignored) */
+    PC_RELAUNCH_DEFAULT_GUEST = 2, /* --guest              (the legacy default guest.ini; name ignored) */
+    PC_RELAUNCH_NEW_CHARACTER = 3  /* Play Online "New character": a NEW store character whose name is chosen in the Rover scene; in-process only (never relaunched), name ignored */
 };
 
 /* M-C: remembers the whitelisted options of the title process (--verbose / -v, --no-framelimit, --framelimit N (digits only), --uber-shader) so the relaunched client

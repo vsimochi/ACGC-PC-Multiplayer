@@ -20,7 +20,7 @@
 #include <string.h>
 
 enum { PG_SERVERS, PG_ACTIONS, PG_CHARS, PG_DELETE, PG_MCHARS, PG_MACT, PG_IMPORT, PG_LEGACY, PG_ICONF, PG_IRES };
-enum { T_NONE, T_SRV_NAME, T_SRV_ADDR, T_SRV_PORT, T_CHAR_NAME, T_CHAR_LABEL, T_GCI_PATH };
+enum { T_NONE, T_SRV_NAME, T_SRV_ADDR, T_SRV_PORT, T_CHAR_NAME, T_CHAR_LABEL, T_GCI_PATH }; /* T_CHAR_NAME is unused: "New character" connects at once and the Rover scene asks for the name (the slot keeps the title / hint tables aligned) */
 
 #define VISIBLE 8
 #define CHAR_ROWS 5 /* the character page shows fewer, taller rows (a player model beside each name) */
@@ -349,20 +349,6 @@ static void text_commit(void) {
                 refind_mi(uuid);
             }
             return;
-        case T_CHAR_NAME:
-            if (!pc_guest_profile_name_check(s_buf, why, sizeof(why))) {
-                set_msg(1, "%s", why);
-                return;
-            }
-            {
-                char nm[40];
-                snprintf(nm, sizeof(nm), "%s", s_buf);
-                text_end();
-                if (s_cur >= 0 && s_cur < s_nsrv) {
-                    do_connect(&s_srv[s_cur], PC_RELAUNCH_CHARACTER, nm, nm);
-                }
-            }
-            return;
     }
 }
 
@@ -585,8 +571,10 @@ int pc_play_online_menu_confirm(void) {
         case PG_CHARS:
             if (s_sel < s_nchr) {
                 char_connect(s_sel);
-            } else if (s_sel == s_nchr) { /* New character */
-                text_begin(T_CHAR_NAME, "");
+            } else if (s_sel == s_nchr) { /* New character: connect at once, the Rover scene on the train asks for the name (the ONLY name prompt) */
+                if (s_cur >= 0 && s_cur < s_nsrv) {
+                    do_connect(&s_srv[s_cur], PC_RELAUNCH_NEW_CHARACTER, NULL, NULL);
+                }
             } else if (s_sel == s_nchr + 1) { /* Import characters */
                 goto_page(PG_IMPORT, 0);
             } else if (s_sel == s_nchr + 2) { /* Manage characters (never connects) */
