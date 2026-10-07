@@ -29,7 +29,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "pc_net.h" /* PC_NET_MAX_PEERS: the host wire id below must stay above the peer table */
+#include "pc_net.h" /* PC_NET_RESERVED_PEER_ID, pc_peer_* (the host wire id below is skipped by the peer allocator) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -185,19 +185,22 @@ typedef struct PCNetPlayerContext {
  * "Network player id" identifies a specific remote player for movement purposes -- deliberately
  * a DIFFERENT number space from PCNetPeerId (pc_net.h's transport-level connection-slot index,
  * meaningful only to whoever is directly connected to that peer). The host has a real PCNetPeerId
- * for each of its up to PC_NET_MAX_PEERS clients, and those ids are reused directly here. The
+ * for each of its clients (up to the configured peer capacity), and those ids are reused directly here. The
  * host itself has no PCNetPeerId at all (nobody is "connected to" the host from its own point of
  * view) but is still a movement participant, so it gets the one reserved id past the valid client
  * range: PC_NETGAME_HOST_PLAYER_ID. This lets a client (which only ever has ONE real PCNetPeerId --
  * its single link to the host) still tell apart "the host's own movement" from "another client's
  * movement, relayed by the host" once both arrive tagged with a PCNetPlayerId. */
 typedef int32_t PCNetPlayerId;
-/* The host's wire id is its OWN constant, no longer defined as the peer-table size. It is still 8: every shipped client rejects a net_player_id above 8 (and a
- * client with MORE than 8 peers would collide with it), so the value is frozen on the wire until a protocol version change moves it (the ids are uint8_t, 0..254
- * are usable, 0xFF = "nobody" in NPC_LEASE). Until then the peer table may not outgrow it: client ids are the transport slots 0..PC_NET_MAX_PEERS-1. */
+/* The host's wire id is its OWN constant, independent of how many peers the transport accepts. It stays 8 (the value every shipped client knows). The transport hands
+ * out peer ids 0..7 and then 9, 10, ... : the allocator SKIPS this id (PC_NET_RESERVED_PEER_ID, asserted equal below), so a peer can never be mistaken for the host, whatever the
+ * capacity. The ids are uint8_t on the wire: 0..254 are usable (the host's is one of them) and 0xFF means "nobody" (NPC_LEASE), which caps the transport at
+ * pc_peer_capacity_max() = 254 peers. A player-id keyed array must span PC_NETGAME_WIRE_ID_SPACE, never the (host-only, runtime) peer table. */
 #define PC_NETGAME_HOST_WIRE_ID 8
 #define PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NETGAME_HOST_WIRE_ID)
-_Static_assert(PC_NET_MAX_PEERS <= PC_NETGAME_HOST_WIRE_ID, "client player ids (peer slots) must stay below the host's wire id: moving the host id is a protocol change");
+#define PC_NETGAME_WIRE_ID_SPACE PC_PEER_ID_SPACE
+_Static_assert(PC_NET_RESERVED_PEER_ID == PC_NETGAME_HOST_WIRE_ID, "the transport must skip exactly the host's wire id");
+_Static_assert(PC_NETGAME_HOST_WIRE_ID <= PC_PEER_ID_LAST, "the host's wire id must be a usable uint8_t id (not 0xFF)");
 
 /* A small, PC-only, deliberately coarse classification of what the local player's real
  * (~121-value) now_main_index is currently doing -- see pc_net_game.c's classifier. Never an
@@ -576,7 +579,7 @@ int pc_net_game_exchange_request_drop(int hand_item, int hand_cond, int ut_x, in
  * reservation is never invalidated underneath the client. Host only: returns 0 for single-player, for
  * a client, when the host itself is not in the town scene (its ut coordinates are then room
  * coordinates, not town ones), and for coordinates that are not a persistent town tile. Cheap (a scan
- * of at most 2 x PC_NET_MAX_PEERS records); never mutates anything. */
+ * of at most 2 x the peer capacity records); never mutates anything. */
 int pc_net_game_field_tile_reserved(int ut_x, int ut_z);
 
 /* Stage 5B-3: called from the decomp drop-menu seam (see m_tag_ovl.c's mTG_field_put_proc) right

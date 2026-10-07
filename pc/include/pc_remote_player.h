@@ -35,6 +35,9 @@
 extern "C" {
 #endif
 
+/* Puppet slots: one per player id 0..7 plus the host's wire id. Independent of the transport's peer capacity (see pc_remote_player.c): ids past it are ignored. */
+#define PC_REMOTE_PLAYER_SLOT_COUNT ((int)PC_NETGAME_HOST_WIRE_ID + 1)
+
 /* Called by pc_net_game.c the instant a peer's handshake reaches READY. `player_id` is a
  * PCNetPlayerId (see pc_net_game.h) -- host: that client's real PCNetPeerId; client:
  * PC_NETGAME_HOST_PLAYER_ID, meaning "the host". `identity` is the peer's captured

@@ -3,7 +3,7 @@
  * See pc_net.h for the full design summary. Implementation notes:
  *
  *   - One UDP socket total, always non-blocking. The same socket is used whether this process
- *     is hosting (bound to a port, tracks up to PC_NET_MAX_PEERS peers by address) or is a
+ *     is hosting (bound to a port, tracks up to the configured peer capacity (pc_net_set_peer_capacity, default 8) peers by address) or is a
  *     client (unbound, remembers exactly one peer -- the host -- in slot 0).
  *   - Every packet starts with an 8-byte PCNetWireHeader (magic + type + kind + size). The
  *     magic value guards against acting on stray/garbage UDP traffic reaching the port.
@@ -89,6 +89,7 @@
 
 int pc_net_init(void) { return 0; }
 void pc_net_shutdown(void) {}
+int pc_net_set_peer_capacity(int capacity) { (void)capacity; return 0; }
 int pc_net_host_start(uint16_t port) { (void)port; return 0; }
 int pc_net_client_connect(const char* host_ip, uint16_t port) { (void)host_ip; (void)port; return 0; }
 int pc_net_client_restart(void) { return 0; }
@@ -103,6 +104,8 @@ void pc_net_get_stats(PCNetStats* out) { if (out != NULL) memset(out, 0, sizeof(
 int pc_net_is_host(void) { return 0; }
 int pc_net_is_connected(void) { return 0; }
 int pc_net_peer_count(void) { return 0; }
+int pc_net_peer_capacity(void) { return 0; }
+int pc_net_peer_span(void) { return 0; }
 void pc_net_disconnect(PCNetPeerId peer) { (void)peer; }
 int pc_net_peer_idle_ms(PCNetPeerId peer) { (void)peer; return -1; }
 int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms) { (void)rtt_ms; (void)age_ms; return 0; }
@@ -229,13 +232,15 @@ typedef struct PCNetRxEntry {
  *     buffered in s_rx and are retried every poll -- never dropped);
  *   unreliable data may additionally not use the PCNET_EVENT_RELIABLE_RESERVE slots, and is
  *     dropped (counted) when it doesn't fit. */
-#define PC_NET_EVENT_QUEUE_CAP        128
-#define PCNET_EVENT_CONTROL_RESERVE   (2 * PC_NET_MAX_PEERS)
 #define PCNET_EVENT_RELIABLE_RESERVE  32
-#define PCNET_EVENT_LIMIT_CONTROL     PC_NET_EVENT_QUEUE_CAP
-#define PCNET_EVENT_LIMIT_RELIABLE    (PC_NET_EVENT_QUEUE_CAP - PCNET_EVENT_CONTROL_RESERVE)
-#define PCNET_EVENT_LIMIT_UNRELIABLE  (PCNET_EVENT_LIMIT_RELIABLE - PCNET_EVENT_RELIABLE_RESERVE)
-_Static_assert(PCNET_EVENT_LIMIT_UNRELIABLE > 0, "event queue tiers leave no room for unreliable data");
+#define PCNET_EVENT_UNRELIABLE_ROOM   80  /* slots that stay available to unreliable data whatever the peer capacity */
+/* The queue is sized for the peer capacity: the control reserve is 2 events per peer (never fewer than for the historical 8), so the tiers are exactly the old
+ * 128 / 112 / 80 at capacity 8 (and for a client) and the unreliable room never shrinks as the capacity grows. */
+#define PCNET_EVENT_CAP_FOR(peers)    (2 * ((peers) < PC_PEER_DEFAULT_CAPACITY ? PC_PEER_DEFAULT_CAPACITY : (peers)) + PCNET_EVENT_RELIABLE_RESERVE + PCNET_EVENT_UNRELIABLE_ROOM)
+#define PCNET_EVENT_LIMIT_CONTROL     s_event_cap
+#define PCNET_EVENT_LIMIT_RELIABLE    s_event_limit_reliable
+#define PCNET_EVENT_LIMIT_UNRELIABLE  s_event_limit_unreliable
+_Static_assert(PCNET_EVENT_CAP_FOR(PC_PEER_DEFAULT_CAPACITY) == 128, "the event queue at the default capacity must stay the historical 128 entries");
 
 typedef struct PCNetFaultState {
     int      enabled;
@@ -254,9 +259,14 @@ typedef struct PCNetFaultState {
 static int            s_wsa_started = 0;
 static SOCKET         s_socket = INVALID_SOCKET;
 static int            s_is_host = 0;
-static PCNetPeerSlot  s_peers[PC_NET_MAX_PEERS];
-static PCNetTxEntry   s_tx[PC_NET_MAX_PEERS][PC_NET_RELIABLE_WINDOW];
-static PCNetRxEntry   s_rx[PC_NET_MAX_PEERS][PC_NET_RELIABLE_WINDOW];
+/* Peer table: s_peer_span slots, indexed by PCNetPeerId (host: span from the configured capacity; client: 1). The reliable windows are allocated per peer when its slot
+ * is first opened and kept until shutdown (the memory follows the high-water mark of simultaneous peers, ~130 KB each). All of it is NULL / 0 until a host / client starts. */
+static PCNetPeerSlot*  s_peers = NULL;
+static PCNetTxEntry**  s_tx = NULL;
+static PCNetRxEntry**  s_rx = NULL;
+static int             s_peer_span = 0;
+static int             s_peer_capacity_cfg = PC_PEER_DEFAULT_CAPACITY; /* set by pc_net_set_peer_capacity, read by pc_net_host_start */
+static int             s_peer_capacity = 0;                            /* the active host capacity (0 = no host) */
 static PCNetStats     s_stats;
 static PCNetFaultState s_fault;
 static uint32_t       s_nonce_counter = 0;
@@ -270,7 +280,10 @@ typedef struct PCNetLegacyLogEntry {
 static PCNetLegacyLogEntry s_legacy_log[PCNET_LEGACY_LOG_SLOTS];
 static int                 s_legacy_log_next = 0;
 
-static PCNetEvent s_event_queue[PC_NET_EVENT_QUEUE_CAP];
+static PCNetEvent* s_event_queue = NULL;
+static int        s_event_cap = 0;
+static int        s_event_limit_reliable = 0;
+static int        s_event_limit_unreliable = 0;
 static int        s_event_head  = 0; /* next slot to pop */
 static int        s_event_tail  = 0; /* next slot to push */
 static int        s_event_count = 0;
@@ -284,18 +297,29 @@ static int pcnet_addr_eq(const struct sockaddr_in* a, const struct sockaddr_in* 
 
 static PCNetPeerId pcnet_find_peer(const struct sockaddr_in* from) {
     int i;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < s_peer_span; i++) {
         if (s_peers[i].state != PCNET_PEER_FREE && pcnet_addr_eq(&s_peers[i].addr, from)) return (PCNetPeerId)i;
     }
     return PC_NET_INVALID_PEER;
 }
 
+static int pcnet_slot_is_free(void* ctx, int id) {
+    (void)ctx;
+    return s_peers[id].state == PCNET_PEER_FREE;
+}
+
+/* The lowest free id of the table, never the reserved (host) id: the shared, natively tested pc_peer_find_free. */
 static PCNetPeerId pcnet_find_free_slot(void) {
-    int i;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
-        if (s_peers[i].state == PCNET_PEER_FREE) return (PCNetPeerId)i;
-    }
-    return PC_NET_INVALID_PEER;
+    const int id = pc_peer_find_free(s_peer_span, PC_NET_RESERVED_PEER_ID, pcnet_slot_is_free, NULL);
+    return id < 0 ? PC_NET_INVALID_PEER : (PCNetPeerId)id;
+}
+
+/* The reliable windows of slot `i` (allocated once per slot, zeroed by pcnet_reset_reliable). 0 = out of memory. */
+static int pcnet_ensure_buffers(int i) {
+    if (i < 0 || i >= s_peer_span) return 0;
+    if (s_tx[i] == NULL) s_tx[i] = (PCNetTxEntry*)calloc(PC_NET_RELIABLE_WINDOW, sizeof(PCNetTxEntry));
+    if (s_rx[i] == NULL) s_rx[i] = (PCNetRxEntry*)calloc(PC_NET_RELIABLE_WINDOW, sizeof(PCNetRxEntry));
+    return s_tx[i] != NULL && s_rx[i] != NULL;
 }
 
 /* Reserves the next event slot if fewer than `limit` events are queued; NULL otherwise. */
@@ -303,7 +327,7 @@ static PCNetEvent* pcnet_event_alloc(int limit) {
     PCNetEvent* ev;
     if (s_event_count >= limit) return NULL;
     ev = &s_event_queue[s_event_tail];
-    s_event_tail = (s_event_tail + 1) % PC_NET_EVENT_QUEUE_CAP;
+    s_event_tail = (s_event_tail + 1) % s_event_cap;
     s_event_count++;
     return ev;
 }
@@ -439,7 +463,7 @@ static void pcnet_reset_reliable(int i) {
     p->rx_next_expected = 0;
     p->rx_deliver_seq = 0;
     p->ack_pending = 0;
-    for (k = 0; k < PCNET_WINDOW; k++) {
+    for (k = 0; k < PCNET_WINDOW && s_tx[i] != NULL && s_rx[i] != NULL; k++) {
         s_tx[i][k].in_use = 0;
         s_tx[i][k].acked = 0;
         s_tx[i][k].retransmits = 0;
@@ -475,10 +499,10 @@ static void pcnet_purge_peer_data_events(PCNetPeerId peer) {
         const PCNetEvent* ev = &s_event_queue[rd];
         if (!(ev->type == PC_NET_EVENT_DATA && ev->peer == peer)) {
             if (wr != rd) s_event_queue[wr] = *ev;
-            wr = (wr + 1) % PC_NET_EVENT_QUEUE_CAP;
+            wr = (wr + 1) % s_event_cap;
             kept++;
         }
-        rd = (rd + 1) % PC_NET_EVENT_QUEUE_CAP;
+        rd = (rd + 1) % s_event_cap;
     }
     s_event_tail = wr;
     s_event_count = kept;
@@ -688,11 +712,48 @@ static void pcnet_send_ack(int i) {
 /* ------------------------------------------------------------------------------------------ */
 /* lifecycle                                                                                   */
 
+static void pcnet_free_tables(void) {
+    int i;
+    for (i = 0; i < s_peer_span; i++) {
+        if (s_tx != NULL) free(s_tx[i]);
+        if (s_rx != NULL) free(s_rx[i]);
+    }
+    free(s_tx);
+    free(s_rx);
+    free(s_peers);
+    free(s_event_queue);
+    s_tx = NULL;
+    s_rx = NULL;
+    s_peers = NULL;
+    s_event_queue = NULL;
+    s_peer_span = 0;
+    s_peer_capacity = 0;
+    s_event_cap = s_event_limit_reliable = s_event_limit_unreliable = 0;
+}
+
+/* Allocates the peer table (`span` slots, all FREE), the per-peer window pointers and the event queue for `peers` simultaneous peers. 0 = out of memory, nothing kept. */
+static int pcnet_alloc_tables(int span, int peers) {
+    const int cap = PCNET_EVENT_CAP_FOR(peers);
+    const int reserve = 2 * (peers < PC_PEER_DEFAULT_CAPACITY ? PC_PEER_DEFAULT_CAPACITY : peers);
+    pcnet_free_tables();
+    s_peers = (PCNetPeerSlot*)calloc((size_t)span, sizeof(*s_peers));
+    s_tx = (PCNetTxEntry**)calloc((size_t)span, sizeof(*s_tx));
+    s_rx = (PCNetRxEntry**)calloc((size_t)span, sizeof(*s_rx));
+    s_event_queue = (PCNetEvent*)calloc((size_t)cap, sizeof(PCNetEvent));
+    if (s_peers == NULL || s_tx == NULL || s_rx == NULL || s_event_queue == NULL) {
+        pcnet_free_tables();
+        return 0;
+    }
+    s_peer_span = span;
+    s_event_cap = cap;
+    s_event_limit_reliable = cap - reserve;
+    s_event_limit_unreliable = s_event_limit_reliable - PCNET_EVENT_RELIABLE_RESERVE;
+    return 1;
+}
+
 static void pcnet_reset_all_state(void) {
     s_is_host = 0;
-    memset(s_peers, 0, sizeof(s_peers));
-    memset(s_tx, 0, sizeof(s_tx));
-    memset(s_rx, 0, sizeof(s_rx));
+    pcnet_free_tables();
     memset(&s_stats, 0, sizeof(s_stats));
     memset(s_legacy_log, 0, sizeof(s_legacy_log));
     s_legacy_log_next = 0;
@@ -740,10 +801,21 @@ void pc_net_shutdown(void) {
     s_fault.held_peer = -1;
 }
 
+int pc_net_set_peer_capacity(int capacity) {
+    if (s_socket != INVALID_SOCKET || pc_peer_span(capacity, PC_NET_RESERVED_PEER_ID) == 0) return 0;
+    s_peer_capacity_cfg = capacity;
+    return 1;
+}
+
 int pc_net_host_start(uint16_t port) {
     struct sockaddr_in addr;
+    const int span = pc_peer_span(s_peer_capacity_cfg, PC_NET_RESERVED_PEER_ID);
     if (!s_wsa_started || s_socket != INVALID_SOCKET) return 0;
-    if (!pcnet_create_socket()) return 0;
+    if (span == 0 || !pcnet_alloc_tables(span, s_peer_capacity_cfg)) return 0;
+    if (!pcnet_create_socket()) {
+        pcnet_free_tables();
+        return 0;
+    }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -752,9 +824,11 @@ int pc_net_host_start(uint16_t port) {
     if (bind(s_socket, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         closesocket(s_socket);
         s_socket = INVALID_SOCKET;
+        pcnet_free_tables();
         return 0;
     }
     s_is_host = 1;
+    s_peer_capacity = s_peer_capacity_cfg;
     return 1;
 }
 
@@ -785,7 +859,14 @@ int pc_net_client_connect(const char* host_ip, uint16_t port) {
     struct sockaddr_in addr;
     if (!s_wsa_started || s_socket != INVALID_SOCKET) return 0;
     if (host_ip == NULL) return 0;
-    if (!pcnet_create_socket()) return 0;
+    if (!pcnet_alloc_tables(1, PC_PEER_DEFAULT_CAPACITY) || !pcnet_ensure_buffers(0)) { /* a client has exactly one link: slot 0 */
+        pcnet_free_tables();
+        return 0;
+    }
+    if (!pcnet_create_socket()) {
+        pcnet_free_tables();
+        return 0;
+    }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -793,12 +874,14 @@ int pc_net_client_connect(const char* host_ip, uint16_t port) {
     if (!pcnet_resolve_host(host_ip, &addr.sin_addr)) {
         closesocket(s_socket);
         s_socket = INVALID_SOCKET;
+        pcnet_free_tables();
         return 0;
     }
 
     s_client_host = addr;
     s_client_host_valid = 1;
     s_is_host = 0;
+    s_peer_capacity = 1;
     pcnet_free_slot(0); /* fresh sequence/ack/retransmit/reorder state for the new connection */
     s_peers[0].state = PCNET_PEER_PENDING;
     s_peers[0].addr = addr;
@@ -883,7 +966,13 @@ static void pcnet_handle_packet(const struct sockaddr_in* from, const uint8_t* b
             memcpy(&nonce, buf + sizeof(hdr), PCNET_WIRE_NONCE_BYTES);
             if (pid == PC_NET_INVALID_PEER) {
                 pid = pcnet_find_free_slot();
-                if (pid == PC_NET_INVALID_PEER) break; /* peer table full: drop the new connection attempt */
+                if (pid == PC_NET_INVALID_PEER || !pcnet_ensure_buffers((int)pid)) {
+                    /* peer table full (or no memory for another peer's windows): refuse the NEW address with the existing DISCONNECT notice, which a pending client
+                     * answers with its normal "connection lost" event, instead of leaving it to time out. No slot, no event, no wire change. */
+                    s_stats.peer_table_full_refused++;
+                    pcnet_send_ctrl(from, PCNET_WIRE_DISCONNECT, NULL, 0);
+                    break;
+                }
                 pcnet_open_slot((int)pid, from, nonce, now);
             } else if (s_peers[pid].nonce != nonce) {
                 /* Same address, different nonce: the remote process restarted. The old logical
@@ -996,7 +1085,7 @@ void pc_net_poll(void) {
     if (s_socket == INVALID_SOCKET) return;
 
     /* Reliable payloads held back by a full queue get first claim on room the game freed. */
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < s_peer_span; i++) {
         if (s_peers[i].state == PCNET_PEER_CONNECTED) pcnet_rx_deliver(i);
     }
 
@@ -1018,7 +1107,7 @@ void pc_net_poll(void) {
     }
 
     now = GetTickCount();
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < s_peer_span; i++) {
         if (s_peers[i].state == PCNET_PEER_FREE) continue;
 
         if (s_peers[i].state == PCNET_PEER_PENDING) {
@@ -1057,7 +1146,7 @@ void pc_net_poll(void) {
 int pc_net_next_event(PCNetEvent* out) {
     if (s_event_count == 0 || out == NULL) return 0;
     *out = s_event_queue[s_event_head];
-    s_event_head = (s_event_head + 1) % PC_NET_EVENT_QUEUE_CAP;
+    s_event_head = (s_event_head + 1) % s_event_cap;
     s_event_count--;
     return 1;
 }
@@ -1096,18 +1185,18 @@ int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t 
         if (peer == PC_NET_BROADCAST_PEER) {
             /* All-or-nothing: verify every connected peer has window room before queueing to any. */
             int any = 0;
-            for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+            for (i = 0; i < s_peer_span; i++) {
                 if (s_peers[i].state != PCNET_PEER_CONNECTED) continue;
                 any = 1;
                 if (pcnet_tx_window_full(i)) return 0;
             }
             if (!any) return 0;
-            for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+            for (i = 0; i < s_peer_span; i++) {
                 if (s_peers[i].state == PCNET_PEER_CONNECTED) pcnet_tx_queue(i, data, size);
             }
             return 1;
         }
-        if (peer < 0 || peer >= PC_NET_MAX_PEERS) return 0;
+        if (peer < 0 || peer >= s_peer_span) return 0;
         if (s_peers[peer].state != PCNET_PEER_CONNECTED || pcnet_tx_window_full((int)peer)) return 0;
         pcnet_tx_queue((int)peer, data, size);
         return 1;
@@ -1115,7 +1204,7 @@ int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t 
 
     if (peer == PC_NET_BROADCAST_PEER) {
         int ok = 1, sent_any = 0;
-        for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        for (i = 0; i < s_peer_span; i++) {
             if (s_peers[i].state != PCNET_PEER_CONNECTED) continue;
             sent_any = 1;
             if (!pcnet_send_unreliable_to_slot(i, data, size)) ok = 0;
@@ -1123,13 +1212,13 @@ int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t 
         return sent_any ? ok : 0;
     }
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) return 0;
+    if (peer < 0 || peer >= s_peer_span) return 0;
     return pcnet_send_unreliable_to_slot((int)peer, data, size);
 }
 
 int pc_net_reliable_backlog(PCNetPeerId peer) {
     if (s_socket == INVALID_SOCKET) return -1;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) return -1;
+    if (peer < 0 || peer >= s_peer_span) return -1;
     if (s_peers[peer].state != PCNET_PEER_CONNECTED) return -1;
     return (int)(s_peers[peer].tx_next_seq - s_peers[peer].tx_base_seq);
 }
@@ -1151,9 +1240,17 @@ int pc_net_is_connected(void) {
     return s_peers[0].state == PCNET_PEER_CONNECTED;
 }
 
+int pc_net_peer_capacity(void) {
+    return s_socket != INVALID_SOCKET ? s_peer_capacity : 0;
+}
+
+int pc_net_peer_span(void) {
+    return s_socket != INVALID_SOCKET ? s_peer_span : 0;
+}
+
 int pc_net_peer_count(void) {
     int i, n = 0;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < s_peer_span; i++) {
         if (s_peers[i].state == PCNET_PEER_CONNECTED) n++;
     }
     return n;
@@ -1162,8 +1259,10 @@ int pc_net_peer_count(void) {
 /* Client only, read-only: the smoothed round-trip time the reliable layer already measures from its own DATA -> ACK exchanges (no extra packets). 1 = a sample
  * exists (*rtt_ms, and *age_ms = how long ago the newest sample was taken); 0 = not a connected client or no sample yet. Never feeds heartbeat/timeout logic. */
 int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms) {
-    const PCNetPeerSlot* p = &s_peers[0];
-    if (s_socket == INVALID_SOCKET || s_is_host || p->state != PCNET_PEER_CONNECTED || p->srtt_ms == 0 || p->rtt_tick == 0) return 0;
+    const PCNetPeerSlot* p;
+    if (s_socket == INVALID_SOCKET || s_is_host || s_peers == NULL) return 0;
+    p = &s_peers[0];
+    if (p->state != PCNET_PEER_CONNECTED || p->srtt_ms == 0 || p->rtt_tick == 0) return 0;
     if (rtt_ms) *rtt_ms = p->srtt_ms;
     if (age_ms) *age_ms = GetTickCount() - p->rtt_tick;
     return 1;
@@ -1172,7 +1271,7 @@ int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms) {
 int pc_net_peer_idle_ms(PCNetPeerId peer) {
     uint32_t idle;
     if (s_socket == INVALID_SOCKET || !s_is_host) return -1;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_peers[peer].state != PCNET_PEER_CONNECTED) return -1;
+    if (peer < 0 || peer >= s_peer_span || s_peers[peer].state != PCNET_PEER_CONNECTED) return -1;
     idle = (uint32_t)GetTickCount() - s_peers[peer].last_recv_tick;
     return idle > 0x7FFFFFFFu ? 0 : (int)idle; /* a tick newer than `now` (wrap/ordering) reads as 0 */
 }
@@ -1180,13 +1279,13 @@ int pc_net_peer_idle_ms(PCNetPeerId peer) {
 /* Guests: the peer's IPv4 address (network byte order) for per-address admission limits; 0 = unknown / not a connected host-side peer. Read-only. */
 uint32_t pc_net_peer_ip(PCNetPeerId peer) {
     if (s_socket == INVALID_SOCKET || !s_is_host) return 0;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_peers[peer].state != PCNET_PEER_CONNECTED) return 0;
+    if (peer < 0 || peer >= s_peer_span || s_peers[peer].state != PCNET_PEER_CONNECTED) return 0;
     return (uint32_t)s_peers[peer].addr.sin_addr.s_addr;
 }
 
 void pc_net_evict(PCNetPeerId peer) {
     if (s_socket == INVALID_SOCKET || !s_is_host) return;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_peers[peer].state != PCNET_PEER_CONNECTED) return;
+    if (peer < 0 || peer >= s_peer_span || s_peers[peer].state != PCNET_PEER_CONNECTED) return;
     if (s_fault.enabled) pcnet_fault_flush_held();
     pcnet_send_ctrl(&s_peers[peer].addr, PCNET_WIRE_DISCONNECT, NULL, 0); /* best effort: a falsely evicted live peer learns at once */
     pcnet_lose_peer((int)peer); /* delivers already-ACKed payloads, frees the slot, queues PEER_DISCONNECTED */
@@ -1199,7 +1298,7 @@ void pc_net_disconnect(PCNetPeerId peer) {
     if (!s_is_host) {
         idx = 0; /* the only slot a client ever uses; PC_NET_INVALID_PEER (or anything) means "leave" */
     } else {
-        if (peer < 0 || peer >= PC_NET_MAX_PEERS) return;
+        if (peer < 0 || peer >= s_peer_span) return;
         idx = (int)peer;
     }
     if (s_peers[idx].state == PCNET_PEER_FREE) return;

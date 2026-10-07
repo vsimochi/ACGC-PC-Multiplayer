@@ -72,7 +72,12 @@
 extern "C" {
 #endif
 
-#define PC_NET_MAX_PEERS   8     /* fixed peer table size (host role); a client only ever uses 1 */
+#include "pc_peer_table.h"
+
+/* The host's transport capacity is a RUNTIME setting now (pc_net_set_peer_capacity, applied by pc_net_host_start); the peer table, the reliable buffers and the
+ * event queue are allocated for it at host start. PC_NET_MAX_PEERS no longer exists: use pc_net_peer_span() / pc_net_peer_capacity(). A peer's PCNetPeerId is its slot
+ * index, so ids are 0..span-1 except PC_NET_RESERVED_PEER_ID, which the allocator never hands out (it is the HOST's wire id, see pc_net_game.h). A client only uses slot 0. */
+#define PC_NET_RESERVED_PEER_ID 8 /* == PC_NETGAME_HOST_WIRE_ID (asserted in pc_net_game.h) */
 #define PC_NET_MAX_PAYLOAD 1024  /* comfortably under a safe UDP/Ethernet MTU, no fragmentation */
 
 /* Max reliable payloads queued-or-unacknowledged per peer (send side), and the receive-side
@@ -118,6 +123,7 @@ typedef struct PCNetStats {
     uint32_t acks_received;
     uint32_t acks_invalid;               /* ACKs acknowledging seqs never sent (ignored) */
     uint32_t reliable_budget_disconnects;/* peers dropped for exhausting the retransmit budget */
+    uint32_t peer_table_full_refused;    /* host: HELLOs from NEW addresses refused because every peer slot (or its buffers) was taken; each got a DISCONNECT notice */
     uint32_t nonce_restarts;             /* same-address HELLO with a new nonce (remote restart) */
     uint32_t legacy_reliable_dropped;    /* legacy DATA(type 4) kind=RELIABLE datagrams dropped */
     uint32_t legacy_peers_refused;       /* size-0 HELLO (host) / size-0 HELLO_ACK (client) refused */
@@ -144,8 +150,13 @@ void pc_net_shutdown(void);
  * pc_net_init() again first.
  */
 
+/* Host only, BEFORE pc_net_host_start(): how many simultaneous peers the transport accepts (1 .. pc_peer_capacity_max(PC_NET_RESERVED_PEER_ID) = 254, the usable wire ids
+ * minus the host's). Default PC_PEER_DEFAULT_CAPACITY (8). 1 = accepted, 0 = refused (out of range, or the socket is already open). The tables are allocated by
+ * pc_net_host_start; a host that cannot allocate them fails to start instead of running with a smaller table. */
+int pc_net_set_peer_capacity(int capacity);
+
 /* Binds a UDP socket to `port` on all local interfaces and starts accepting peers. Returns 1 on
- * success, 0 on failure (e.g. the port is already in use). */
+ * success, 0 on failure (e.g. the port is already in use, or the tables for the configured capacity could not be allocated). */
 int pc_net_host_start(uint16_t port);
 
 /* Creates a UDP socket and sends the first HELLO to host_ip:port. Returns 1 if the socket was
@@ -215,6 +226,8 @@ void pc_net_get_stats(PCNetStats* out);
 int pc_net_is_host(void);      /* 1 if pc_net_host_start() succeeded and hasn't been shut down */
 int pc_net_is_connected(void); /* client: handshake with the host completed. host: currently listening. */
 int pc_net_peer_count(void);   /* number of currently-connected peers (0 or 1 for a client) */
+int pc_net_peer_capacity(void); /* host: the active capacity (max simultaneous peers); 0 when no host is running (a client: 1) */
+int pc_net_peer_span(void);     /* number of valid peer slot indices (ids are < span; the reserved id's slot is an unused hole); 0 when nothing is open */
 
 /* Host: milliseconds since the last packet of any kind (DATA, ACK, HEARTBEAT, ...) arrived from the CONNECTED
  * `peer`, measured at call time; -1 if `peer` is not a connected host-side peer (and always -1 on a client).

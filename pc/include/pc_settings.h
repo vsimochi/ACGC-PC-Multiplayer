@@ -22,6 +22,7 @@ typedef struct {
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */
     int cstick_deadzone;  /* Gamepad C-stick deadzone, percent 0-40 (default 12) */
     int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..8 (default 4); out of range = ignored */
+    int max_peers;        /* HOST only (capacity phase 2): most simultaneous transport peers (residents + guests + a connecting town-fetch client), 1..254 (default 8); out of range = ignored */
     int allow_new_guests; /* HOST only (M-D): 1 = a NEW guest key may be admitted (default), 0 = only guests already known to guests.dat; a new key is refused (SERVER_FULL) */
     int resident_tokens;  /* HOST only (M-E): 0 = off (default, nothing minted / checked), 1 = tofu, 2 = required (see docs/multiplayer-guest-roadmap.md) */
     int personal_sync;    /* HOST only (personal data sync, diary): -1 = AUTO (default: on only while town_serve != off), 0 = off, 1 = on */
@@ -32,6 +33,8 @@ typedef struct {
 extern PCSettings g_pc_settings;
 /* G4: `--max-guests N` (host test / operator override of settings.ini max_guests); 0 = no override. Set by pc_main.c, valid 1..8. */
 extern int g_pc_max_guests_override;
+/* Capacity phase 2: `--max-peers N` (host operator override of settings.ini max_peers); 0 = no override. Set by pc_main.c, valid 1..254. */
+extern int g_pc_max_peers_override;
 /* M-D: `--allow-new-guests 0|1` (host override of settings.ini allow_new_guests); -1 = no override. */
 extern int g_pc_allow_new_guests_override;
 /* M-E: `--resident-tokens off|tofu|required` (host override of settings.ini resident_tokens); -1 = no override. */

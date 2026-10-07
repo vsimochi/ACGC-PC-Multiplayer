@@ -108,10 +108,10 @@ def main():
     # ------------------------------------------------------------------ A2
     hook = func_body(c, "pc_net_game_host_remote_player_in_acre")
     hs = strip_comments(hook)
-    check("A2 hook is HOST only (0 for client / solo), READY peers only, field-scene peers only, finite in-range last MOVE position, exact-acre compare; read-only: no RNG, no Save_ / fg write, bounded by PC_NET_MAX_PEERS",
+    check("A2 hook is HOST only (0 for client / solo), READY peers only, field-scene peers only, finite in-range last MOVE position, exact-acre compare; read-only: no RNG, no Save_ / fg write, bounded by the peer span",
           "s_role != PC_NETGAME_ROLE_HOST" in hook and "s_host_peer_link[p] != PC_NETGAME_LINK_READY" in hook and "PC_NETSCENE_KIND_FIELD" in hook
           and "pcnetgame_pos_valid(px, py, pz)" in hook and "mFI_Wpos2BlockNum(&pbx, &pbz, pos) == TRUE && pbx == bx && pbz == bz" in hook
-          and "p < PC_NET_MAX_PEERS" in hook and not re.search(r"RANDOM|fqrand|Save_|Common_Get|mFI_Set|\bFG\b|pcfa_note", hs)
+          and "p < pcnetgame_peer_span()" in hook and not re.search(r"RANDOM|fqrand|Save_|Common_Get|mFI_Set|\bFG\b|pcfa_note", hs)
           and "int pc_net_game_host_remote_player_in_acre(int bx, int bz);" in h)
     check("A2 shells: mFI_ResearchShell skips an acre a remote player is in exactly like the player's own acre (host-only hook, TARGET_PC); the vanilla condition and RNG order are untouched",
           "if ((bx != player_bx || bz != player_bz)\n#ifdef TARGET_PC" in fi and "&& !pc_net_game_host_remote_player_in_acre(bx, bz)" in fi

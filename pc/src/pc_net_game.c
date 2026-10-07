@@ -2802,8 +2802,26 @@ static void pcnetgame_rc_log_guest_success(unsigned guest_slot);
 static PCNetGameIdentity  s_client_host_identity;
 static int                s_client_host_identity_valid = 0;
 
+/* ---- per-peer host state: runtime-sized ----
+ * Every table below is indexed by PCNetPeerId (the transport's slot index) and must have one element per slot of the transport's peer table (pc_net_peer_span()).
+ * Each lives INLINE in a static array of PCNG_INLINE_PEERS elements (exactly the old fixed array, so the default 8-peer host and every code path that runs before / without a
+ * host see the same zeroed static memory as before) and moves to the heap only when pc_net_game_start_host asks for a bigger span (pcnetgame_peer_tables_resize, all or
+ * nothing). s_peer_span is the length of ALL of them right now: every loop / bound over peers uses pcnetgame_peer_span(), never the transport's span (which is 0 once the
+ * transport is shut down while the per-peer state is still being reset). Tables keyed by a PLAYER id (the wire id space, clients included) are separate and fixed-size. */
+#define PCNG_INLINE_PEERS PC_PEER_DEFAULT_CAPACITY
+static int s_peer_span = PCNG_INLINE_PEERS;
+static int pcnetgame_peer_span(void) {
+    return s_peer_span;
+}
+/* The ids of a player-id keyed loop: every peer id plus the host's wire id (which is a hole of the peer table when the span is below it, an unused slot otherwise). */
+static int pcnetgame_player_id_end(void) {
+    return s_peer_span > (int)PC_NETGAME_HOST_WIRE_ID + 1 ? s_peer_span : (int)PC_NETGAME_HOST_WIRE_ID + 1;
+}
+#define PCNG_PEER_TABLE(TYPE, NAME) PC_PEER_TABLE(TYPE, NAME, PCNG_INLINE_PEERS)
+#define PCNG_PEER_TABLE2(TYPE, NAME, DIM) PC_PEER_TABLE2(TYPE, NAME, PCNG_INLINE_PEERS, DIM)
+
 /* host-only: parallel to pc_net's own peer table (indexed by the same PCNetPeerId) */
-static PCNetGameLinkState s_host_peer_link[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameLinkState, s_host_peer_link)
 
 /* Stage 3: movement send throttle. Decoupled from the render/frame rate on purpose -- see
  * graph_dt_period_elapsed()'s own doc (src/graph.c): it accumulates real elapsed
@@ -3078,7 +3096,7 @@ typedef struct PCNetGameHostInteraction {
                                  * is harmless: a real client answers such a grant ABORT(STALE).) */
     uint32_t prev_request_id;
 } PCNetGameHostInteraction;
-static PCNetGameHostInteraction s_host_pickup_state[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameHostInteraction, s_host_pickup_state)
 
 /* Client-only OWNER STAMP: who the local player was when a pickup/drop request was sent. A late
  * RESULT must never be applied to a different inventory (quit to title and load another save, another
@@ -3151,7 +3169,7 @@ _Static_assert((PC_NETGAME_PICKUP_MAX_RETRIES + 1) * 500u < PC_NETGAME_CONFIRM_T
  * drop resolve in close succession, and conflating the two would let a retry of one replay the
  * other's decision. Reset on disconnect and defensively on fresh READY, exactly mirroring
  * pcnetgame_reset_host_pickup_state(). */
-static PCNetGameHostInteraction s_host_drop_state[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameHostInteraction, s_host_drop_state)
 
 /* World Ecology T3: host-only BURY record per peer -- same type, phases and reasoning as
  * s_host_pickup_state/s_host_drop_state above (see PCNetGameHostInteraction's doc), kept in its own
@@ -3160,7 +3178,7 @@ static PCNetGameHostInteraction s_host_drop_state[PC_NET_MAX_PEERS];
  * pcnetgame_handle_host_bury_request() at reservation time and consumed by the BURY branch of
  * pcnetgame_handle_host_confirm() at COMMIT. Reset on disconnect and defensively on fresh READY via
  * pcnetgame_reset_host_bury_state(), exactly mirroring the pickup/drop precedent. */
-static PCNetGameHostInteraction s_host_bury_state[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameHostInteraction, s_host_bury_state)
 
 /* World Ecology milestone (Stage 1): host-only, per-peer dedup for the last PROCESSED
  * FIELD_ACTION_REQUEST (both kinds share one slot per peer -- a peer only ever has one field action
@@ -3178,7 +3196,7 @@ typedef struct PCNetGameFieldActionDedup {
     uint8_t  ut_z;
     uint16_t granted_item;
 } PCNetGameFieldActionDedup;
-static PCNetGameFieldActionDedup s_host_field_action_dedup[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameFieldActionDedup, s_host_field_action_dedup)
 
 /* World Ecology: snowmen -- host-only, per-peer dedup for the last PROCESSED
  * SNOWMAN_BUILD_REQUEST, mirroring PCNetGameFieldActionDedup's own single-slot reasoning (BUILD is not
@@ -3190,7 +3208,7 @@ typedef struct PCNetGameSnowmanBuildDedup {
     uint8_t  slot;
     uint8_t  reason;
 } PCNetGameSnowmanBuildDedup;
-static PCNetGameSnowmanBuildDedup s_host_snowman_build_dedup[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameSnowmanBuildDedup, s_host_snowman_build_dedup)
 
 /* World Ecology Wildlife Sync T-catch -- host-only, per-peer dedup for the last PROCESSED
  * CATCH_REQUEST, mirroring PCNetGameSnowmanBuildDedup's own single-slot reasoning exactly (CATCH is not
@@ -3203,7 +3221,7 @@ typedef struct PCNetGameCatchDedup {
     uint8_t  accepted;
     uint32_t entity_id;
 } PCNetGameCatchDedup;
-static PCNetGameCatchDedup s_host_catch_dedup[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameCatchDedup, s_host_catch_dedup)
 
 /* World Ecology milestone (Stage 1, Item 2): host-only per-tile "money rock hit window" bookkeeping
  * -- deliberately separate from (and much simpler than) the vanilla bg_item_ten_coin_c runtime array
@@ -3774,7 +3792,7 @@ typedef struct PCNetGameHostPeerState {
     uint8_t              ext_valid;
     PCNetGameIdentityExtMsg ext;
 } PCNetGameHostPeerState;
-static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(PCNetGameHostPeerState, s_host_peer)
 
 /* D3 (protocol v8): host-side record mirror state. Fixed static buffers, no allocation. */
 #define PC_NETGAME_RECS_NONE         0u /* not READY / not started */
@@ -3782,11 +3800,11 @@ static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];
 #define PC_NETGAME_RECS_AWAIT_MIGRATE 2u
 #define PC_NETGAME_RECS_PUSHING      3u /* initial PUSH_FULL being sent */
 #define PC_NETGAME_RECS_SYNCED       4u
-static uint8_t s_host_rec_rx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE]; /* client -> host reassembly (BE image) */
-static uint8_t s_host_rec_tx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE]; /* host -> client push snapshot (BE image) */
-static uint8_t s_host_house_rx[PC_NET_MAX_PEERS][PC_NETGAME_HOUSE_COMMIT_SIZE]; /* furniture sync: client -> host OWNER_COMMIT reassembly (house image || record) */
-static uint8_t s_host_house_tx[PC_NET_MAX_PEERS][PC_NETGAME_HOUSE_IMG_SIZE];    /* furniture sync: host -> client CANON_PUSH snapshot (house image) */
-static uint8_t s_host_pd_tx[PC_NET_MAX_PEERS][PC_NETGAME_PDATA_DIARY_SIZE];     /* personal data sync: host -> client PDATA_PUSH snapshot (one diary slot) */
+PCNG_PEER_TABLE2(uint8_t, s_host_rec_rx, PC_NETGAME_REC_SIZE) /* client -> host reassembly (BE image) */
+PCNG_PEER_TABLE2(uint8_t, s_host_rec_tx, PC_NETGAME_REC_SIZE) /* host -> client push snapshot (BE image) */
+PCNG_PEER_TABLE2(uint8_t, s_host_house_rx, PC_NETGAME_HOUSE_COMMIT_SIZE) /* furniture sync: client -> host OWNER_COMMIT reassembly (house image || record) */
+PCNG_PEER_TABLE2(uint8_t, s_host_house_tx, PC_NETGAME_HOUSE_IMG_SIZE)    /* furniture sync: host -> client CANON_PUSH snapshot (house image) */
+PCNG_PEER_TABLE2(uint8_t, s_host_pd_tx, PC_NETGAME_PDATA_DIARY_SIZE)     /* personal data sync: host -> client PDATA_PUSH snapshot (one diary slot) */
 
 /* Per-resident-slot lineage state, IN MEMORY ONLY in this iteration (persistence = D3-4). Keyed by the slot index of the
  * host's own Save_Get(private_data)[]; re-initialised (epoch re-rolled, rev 0 = "never synced") when the slot's saved
@@ -4652,7 +4670,7 @@ static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_
     PCNetMoveSample sample;
     int i;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     if (!pcnetgame_move_msg_valid(in)) {
@@ -4666,7 +4684,7 @@ static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_
 
     /* Relay to every OTHER ready client, tagging net_player_id with the TRUE originating peer id
      * -- never the client-supplied (and here, ignored) value -- and never back to the sender. */
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (i != peer && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             PCNetMoveMsg out = *in;
             out.net_player_id = (uint8_t)peer;
@@ -4698,7 +4716,7 @@ static void pcnetgame_handle_host_appearance(PCNetPeerId peer, const PCNetGameAp
     PCNetPlayerAppearance state;
     int i;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
 
@@ -4707,7 +4725,7 @@ static void pcnetgame_handle_host_appearance(PCNetPeerId peer, const PCNetGameAp
 
     /* Relay to every OTHER ready client, tagging net_player_id with the TRUE originating peer id
      * -- never back to the sender -- exactly like pcnetgame_handle_host_move()'s own relay. */
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (i != peer && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             PCNetGameAppearanceMsg out = *in;
             out.net_player_id = (uint8_t)peer;
@@ -4733,7 +4751,7 @@ static void pcnetgame_host_send_full_roster(PCNetPeerId dest) {
         pc_net_send(dest, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
     }
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         PCNetPlayerAppearance state;
         if (i == dest || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
             continue;
@@ -4847,7 +4865,7 @@ static void pcnetgame_scene_pack(PCNetGamePlayerSceneMsg* msg, uint8_t net_playe
 /* Host -> every READY client except `skip` (pass -1 for none). */
 static void pcnetgame_host_send_scene_to_all(PCNetPeerId skip, const PCNetGamePlayerSceneMsg* msg) {
     int i;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (i != (int)skip && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, msg, (uint16_t)sizeof(*msg));
         }
@@ -4865,7 +4883,7 @@ static void pcnetgame_handle_host_player_scene(PCNetPeerId peer, const PCNetGame
     PCNetPlayerScene s;
     PCNetGamePlayerSceneMsg out;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     if ((in->flags & ~PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0 || !pc_net_game_scene_is_announceable(in->scene_id) ||
@@ -4895,7 +4913,7 @@ static void pcnetgame_handle_client_player_scene(const PCNetGamePlayerSceneMsg* 
     if (s_client_link != PC_NETGAME_LINK_READY) {
         return;
     }
-    if (in->net_player_id > (uint8_t)PC_NETGAME_HOST_PLAYER_ID ||
+    if ((int)in->net_player_id >= PC_REMOTE_PLAYER_SLOT_COUNT || /* ids past the puppet table cannot be shown (the host may have more peers than this client has puppet slots) */
         (in->net_player_id != (uint8_t)PC_NETGAME_HOST_PLAYER_ID &&
          (PCNetPlayerId)in->net_player_id == (PCNetPlayerId)s_client_assigned_peer_id)) {
         return; /* out of range, or "about me" (the host never echoes a sender's own scene back) */
@@ -4918,9 +4936,10 @@ static void pcnetgame_handle_client_player_scene(const PCNetGamePlayerSceneMsg* 
 }
 
 /* ---- M9-C Phase 5: PLAYER_ACTION (cosmetic pickup presentation hint, host -> client) ---- */
-static uint16_t s_action_seq_out[PC_NET_MAX_PEERS + 1];   /* host: last seq assigned per origin id (peer ids + the host) */
-static uint16_t s_action_last_seq[PC_NET_MAX_PEERS + 1];  /* client: last accepted seq per origin id */
-static uint8_t  s_action_last_valid[PC_NET_MAX_PEERS + 1];
+/* keyed by the ORIGIN PLAYER id (any uint8_t wire id, host included), on the host AND on a client that cannot know the host's peer capacity: the whole wire id space */
+static uint16_t s_action_seq_out[PC_NETGAME_WIRE_ID_SPACE];   /* host: last seq assigned per origin id (peer ids + the host) */
+static uint16_t s_action_last_seq[PC_NETGAME_WIRE_ID_SPACE];  /* client: last accepted seq per origin id */
+static uint8_t  s_action_last_valid[PC_NETGAME_WIRE_ID_SPACE];
 
 static int pcnetgame_action_diag(void) {
     static int s_d = -1;
@@ -4943,11 +4962,11 @@ static void pcnetgame_host_emit_player_action(int origin, uint8_t kind, int ut_x
     if (origin == (int)PC_NETGAME_HOST_PLAYER_ID && pc_host_observer_active()) {
         return; /* --host-observer: the hidden host has no avatar to present a pickup with (unreachable: it has no input) */
     }
-    if (origin < 0 || origin > (int)PC_NETGAME_HOST_PLAYER_ID || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 ||
+    if (origin < 0 || origin >= pcnetgame_player_id_end() || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 ||
         item == 0u || item == 0xFFFFu) {
         return;
     }
-    if (origin < PC_NET_MAX_PEERS) {
+    if (origin != (int)PC_NETGAME_HOST_PLAYER_ID) { /* a client peer (its id is below the peer span; the host's wire id is a hole of that range) */
         if (s_host_peer_link[origin] != PC_NETGAME_LINK_READY || !s_host_peer[origin].ctx_valid ||
             !(s_host_peer[origin].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
             return; /* a peer that is not READY / not in the town field never gets a presentation event */
@@ -4964,14 +4983,14 @@ static void pcnetgame_host_emit_player_action(int origin, uint8_t kind, int ut_x
     m.item = item;
     s_action_seq_out[origin] = (uint16_t)(s_action_seq_out[origin] + 1u);
     m.seq = s_action_seq_out[origin];
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (i != origin && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             if (pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
                 sent++;
             }
         }
     }
-    if (origin < PC_NET_MAX_PEERS) {
+    if (origin != (int)PC_NETGAME_HOST_PLAYER_ID) {
         /* the host process renders this client's puppet itself: same receiver, no network loop */
         (void)pc_remote_player_on_action((PCNetPlayerId)origin, (int)kind, ut_x, ut_z, item, m.seq);
     }
@@ -4989,7 +5008,7 @@ static void pcnetgame_handle_client_player_action(const PCNetGamePlayerActionMsg
     if (s_client_link != PC_NETGAME_LINK_READY) {
         return;
     }
-    if (origin > (int)PC_NETGAME_HOST_PLAYER_ID ||
+    if (origin >= PC_REMOTE_PLAYER_SLOT_COUNT || /* not representable here (see the SCENE handler) */
         (origin != (int)PC_NETGAME_HOST_PLAYER_ID && (PCNetPlayerId)origin == (PCNetPlayerId)s_client_assigned_peer_id)) {
         return; /* out of range, or "about me" (the originator plays its own visuals) */
     }
@@ -5040,7 +5059,7 @@ static void pcnetgame_host_send_scene_roster(PCNetPeerId dest) {
         pcnetgame_scene_pack(&msg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene);
         pc_net_send(dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
     }
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (i == (int)dest || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
             continue;
         }
@@ -5347,7 +5366,7 @@ static const char* pcnetgame_kind_tag(int kind) {
 }
 
 static PCNetGameHostInteraction* pcnetgame_host_interaction(PCNetPeerId peer, int kind) {
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return NULL;
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_PICKUP) {
@@ -5384,7 +5403,7 @@ static void pcnetgame_host_release(PCNetPeerId peer, int kind, PCNetGameHostInte
  * connection's cached result, nor keep a dead connection's tile reserved). Safe to call for an
  * out-of-range peer (no-op). */
 static void pcnetgame_reset_host_pickup_state(PCNetPeerId peer) {
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return;
     }
     pcnetgame_host_release(peer, (int)PC_NETGAME_INTERACT_KIND_PICKUP, &s_host_pickup_state[peer],
@@ -5397,7 +5416,7 @@ static void pcnetgame_reset_host_pickup_state(PCNetPeerId peer) {
  * kept separate for the same "don't conflate pickup and drop state" reason. Safe to call for an
  * out-of-range peer (no-op). */
 static void pcnetgame_reset_host_drop_state(PCNetPeerId peer) {
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return;
     }
     pcnetgame_host_release(peer, (int)PC_NETGAME_INTERACT_KIND_DROP, &s_host_drop_state[peer],
@@ -5410,7 +5429,7 @@ static void pcnetgame_reset_host_drop_state(PCNetPeerId peer) {
  * practice today either way, since s_host_bury_state is never PENDING until T3. Registered in
  * pcnetgame_reset_all_host_peer_state() now so T3 does not also have to remember to wire this up. */
 static void pcnetgame_reset_host_bury_state(PCNetPeerId peer) {
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return;
     }
     pcnetgame_host_release(peer, (int)PC_NETGAME_INTERACT_KIND_BURY, &s_host_bury_state[peer],
@@ -5426,7 +5445,7 @@ static const int s_host_reservation_kinds[3] = { (int)PC_NETGAME_INTERACT_KIND_P
                                                   (int)PC_NETGAME_INTERACT_KIND_DROP,
                                                   (int)PC_NETGAME_INTERACT_KIND_BURY };
 
-/* Returns the peer (0..PC_NET_MAX_PEERS-1) whose PENDING pickup/drop(/bury -- see
+/* Returns the peer (a slot of the peer table) whose PENDING pickup/drop(/bury -- see
  * s_host_reservation_kinds's doc) currently reserves persistent tile (acre, tile), or -1 if none does.
  * A PENDING record whose age already reached PC_NETGAME_CONFIRM_TIMEOUT_MS does not count (expiry
  * proper runs at the top of every poll; this keeps the answer exact between polls). */
@@ -5434,7 +5453,7 @@ static int pcnetgame_host_tile_reserved_by(int acre, int tile) {
     uint32_t now = 0;
     int i, k;
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         for (k = 0; k < 3; k++) {
             const PCNetGameHostInteraction* it = pcnetgame_host_interaction((PCNetPeerId)i, s_host_reservation_kinds[k]);
             if (it == NULL || it->phase != (uint8_t)PC_NETGAME_PHASE_PENDING || it->acre != (uint8_t)acre ||
@@ -5468,7 +5487,7 @@ static void pcnetgame_host_expire_reservations(void) {
     uint32_t now = 0;
     int i, k;
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         for (k = 0; k < 3; k++) { /* T0-D: PICKUP/DROP/BURY -- see s_host_reservation_kinds's doc */
             int kind = s_host_reservation_kinds[k];
             PCNetGameHostInteraction* it = pcnetgame_host_interaction((PCNetPeerId)i, kind);
@@ -5495,17 +5514,16 @@ static void pcnetgame_host_expire_reservations(void) {
  * safety net for a lost END only: a real dialogue longer than that releases the hold early (X resumes walking on
  * the host and the client snaps at its lease end -- the pre-hold behaviour). */
 typedef struct PCNetGameNpcTalkHold {
-    uint16_t peer_mask; /* bit i = PCNetPeerId i currently holds this slot (u16: widen before PC_NET_MAX_PEERS exceeds 16, see the assert below) */
+    PCPeerSet peer_mask; /* the peers (any wire id 0..255) that currently hold this slot */
     uint16_t npc_id;    /* identity the mask was set for */
     uint32_t last_ms;   /* pcnetgame_now_ms() of the last valid BEGIN */
     uint8_t  indoor;     /* Patch 8: the owner began inside the villager's house (so leaving the house ends it, and so does going outdoors) */
     uint8_t  host_owned; /* Patch 8: the HOST's own player owns the conversation (peer_mask is then 0: the host never holds its own villager) */
     uint32_t host_ms;    /* pcnetgame_now_ms() of the host player's last "still talking" call */
 } PCNetGameNpcTalkHold;
-_Static_assert(PC_NET_MAX_PEERS <= 16, "PCNetGameNpcTalkHold.peer_mask is 16 bits: widen it (and every (uint16_t)(1u << peer) use) before raising PC_NET_MAX_PEERS");
 static PCNetGameNpcTalkHold s_host_talk_hold[ANIMAL_NUM_MAX];
-static uint16_t s_host_talk_last_seq[PC_NET_MAX_PEERS];
-static uint8_t  s_host_talk_seq_valid[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(uint16_t, s_host_talk_last_seq)
+PCNG_PEER_TABLE(uint8_t, s_host_talk_seq_valid)
 static uint16_t s_npc_talk_seq = 0;   /* client: per-process, per-session u16 sequence of sent NPC_TALK */
 static int      s_npc_talk_epoch = 0; /* client: bumped on every client session reset (see the NPC edge code) */
 static int      s_host_talk_reject_logs = 0;
@@ -5567,19 +5585,19 @@ static uint32_t pcnetgame_talk_hold_timeout_ms(void) {
 /* Clear `peer`'s bit in every slot (and, when `reset_seq`, its sequence record). */
 static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* why, int reset_seq) {
     int slot;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return;
     }
     for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
         PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
-        if ((h->peer_mask & (uint16_t)(1u << peer)) != 0) {
-            h->peer_mask = (uint16_t)(h->peer_mask & ~(uint16_t)(1u << peer));
-            if (h->peer_mask == 0) {
+        if (pc_peer_set_has(&h->peer_mask, peer)) {
+            pc_peer_set_del(&h->peer_mask, peer);
+            if (pc_peer_set_empty(&h->peer_mask)) {
                 printf("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X (peer %d %s)\n", slot, (unsigned)h->npc_id,
                        (int)peer, why);
             } else {
                 printf("[NPC][TALKNET] HOLD slot=%d npc=0x%04X peers=0x%04X (peer %d %s)\n", slot,
-                       (unsigned)h->npc_id, (unsigned)h->peer_mask, (int)peer, why);
+                       (unsigned)h->npc_id, (unsigned)pc_peer_set_low32(&h->peer_mask), (int)peer, why);
             }
         }
     }
@@ -5600,7 +5618,7 @@ static void pcnetgame_host_talk_hold_sweep(void) {
             printf("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X (the host player's lease went quiet)%s", slot, (unsigned)h->npc_id, "\n");
             h->host_owned = 0;
         }
-        if (h->peer_mask == 0) {
+        if (pc_peer_set_empty(&h->peer_mask)) {
             continue;
         }
         if (now == 0) {
@@ -5608,8 +5626,8 @@ static void pcnetgame_host_talk_hold_sweep(void) {
         }
         if ((uint32_t)(now - h->last_ms) >= pcnetgame_talk_hold_timeout_ms()) {
             printf("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X peers=0x%04X after %u ms\n", slot, (unsigned)h->npc_id,
-                   (unsigned)h->peer_mask, (unsigned)(now - h->last_ms));
-            h->peer_mask = 0;
+                   (unsigned)pc_peer_set_low32(&h->peer_mask), (unsigned)(now - h->last_ms));
+            pc_peer_set_clear(&h->peer_mask);
         }
     }
 }
@@ -5627,7 +5645,7 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
     PCNetGameNpcTalkHold* h;
     int begin;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     begin = (in->flags & PC_NETGAME_NPC_TALK_FLAG_BEGIN) != 0;
@@ -5645,15 +5663,15 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
 
     if (!begin) {
         /* END: idempotent; clears only THIS peer's bit; unknown slot/npc/peer is ignored. */
-        if (h->npc_id == in->npc_id && (h->peer_mask & (uint16_t)(1u << peer)) != 0) {
+        if (h->npc_id == in->npc_id && pc_peer_set_has(&h->peer_mask, peer)) {
             printf("[NPC][TALKNET] END peer=%d slot=%u npc=0x%04X\n", (int)peer, (unsigned)in->slot,
                    (unsigned)in->npc_id);
-            h->peer_mask = (uint16_t)(h->peer_mask & ~(uint16_t)(1u << peer));
-            if (h->peer_mask == 0) {
+            pc_peer_set_del(&h->peer_mask, peer);
+            if (pc_peer_set_empty(&h->peer_mask)) {
                 printf("[NPC][TALKNET] RELEASE slot=%u npc=0x%04X\n", (unsigned)in->slot, (unsigned)in->npc_id);
             } else {
                 printf("[NPC][TALKNET] HOLD slot=%u npc=0x%04X peers=0x%04X\n", (unsigned)in->slot,
-                       (unsigned)in->npc_id, (unsigned)h->peer_mask);
+                       (unsigned)in->npc_id, (unsigned)pc_peer_set_low32(&h->peer_mask));
             }
         }
         return;
@@ -5679,18 +5697,18 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
     }
     /* Distance validation intentionally skipped: the host NPC actor is not cheaply/safely resolvable from this
      * file by animal slot, and the last known peer position lags; slot+npc_id+town-scene are the guards. */
-    if ((h->peer_mask & (uint16_t)(1u << peer)) == 0 || h->npc_id != in->npc_id) { /* a keepalive repeat logs nothing */
+    if (!pc_peer_set_has(&h->peer_mask, peer) || h->npc_id != in->npc_id) { /* a keepalive repeat logs nothing */
         printf("[NPC][TALKNET] BEGIN peer=%d slot=%u npc=0x%04X (distance check skipped)\n", (int)peer,
                (unsigned)in->slot, (unsigned)in->npc_id);
     } else if (pcnetgame_talk_diag()) {
         printf("[NPC][TALKNET][DIAG] refresh peer=%d slot=%u npc=0x%04X seq=%u\n", (int)peer, (unsigned)in->slot,
                (unsigned)in->npc_id, (unsigned)in->seq);
     }
-    if ((h->peer_mask != 0 || h->host_owned) && h->npc_id != in->npc_id) {
-        h->peer_mask = 0; /* stale mask for a previous occupant of the slot */
+    if ((!pc_peer_set_empty(&h->peer_mask) || h->host_owned) && h->npc_id != in->npc_id) {
+        pc_peer_set_clear(&h->peer_mask); /* stale mask for a previous occupant of the slot */
         h->host_owned = 0;
     }
-    if ((h->peer_mask & (uint16_t)~(uint16_t)(1u << peer)) != 0 || h->host_owned) { /* Patch 8: EXCLUSIVE -- somebody else already owns this villager's conversation */
+    if (pc_peer_set_has_other(&h->peer_mask, peer) || h->host_owned) { /* Patch 8: EXCLUSIVE -- somebody else already owns this villager's conversation */
         pcnetgame_host_talk_reject(peer, in, h->host_owned ? "the villager is talking with the host player" : "the villager is talking with another player (exclusive lease)");
         printf("[NPC][TALKNET] DENIED peer=%d slot=%u npc=0x%04X: owner is %s%s", (int)peer, (unsigned)in->slot, (unsigned)in->npc_id, h->host_owned ? "the host player" : "another player", "\n");
         return;
@@ -5701,10 +5719,10 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
         h->indoor = (pc_remote_player_get_scene((PCNetPlayerId)peer, &bs) && bs.scene_id == (uint8_t)SCENE_NPC_HOUSE) ? 1 : 0;
     }
     h->last_ms = pcnetgame_now_ms();
-    if ((h->peer_mask & (uint16_t)(1u << peer)) == 0) {
-        h->peer_mask = (uint16_t)(h->peer_mask | (uint16_t)(1u << peer));
+    if (!pc_peer_set_has(&h->peer_mask, peer)) {
+        pc_peer_set_add(&h->peer_mask, peer);
         printf("[NPC][TALKNET] HOLD slot=%u npc=0x%04X peers=0x%04X\n", (unsigned)in->slot, (unsigned)in->npc_id,
-               (unsigned)h->peer_mask);
+               (unsigned)pc_peer_set_low32(&h->peer_mask));
     }
 }
 
@@ -5732,7 +5750,7 @@ static void pcnetgame_handle_host_npc_home_exit(PCNetPeerId peer, const PCNetGam
     PCNetPlayerScene sc;
     PCNetNpcStateShadow* sh;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     if (in->slot >= ANIMAL_NUM_MAX || in->_reserved0 != 0) {
@@ -5813,13 +5831,13 @@ int pc_net_game_host_npc_talk_held(int slot, int npc_id) {
         return 0;
     }
     h = &s_host_talk_hold[slot];
-    if (h->peer_mask == 0 || (int)h->npc_id != npc_id) {
+    if (pc_peer_set_empty(&h->peer_mask) || (int)h->npc_id != npc_id) {
         return 0;
     }
     if ((uint32_t)(pcnetgame_now_ms() - h->last_ms) >= pcnetgame_talk_hold_timeout_ms()) {
         printf("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X peers=0x%04X\n", slot, (unsigned)h->npc_id,
-               (unsigned)h->peer_mask);
-        h->peer_mask = 0;
+               (unsigned)pc_peer_set_low32(&h->peer_mask));
+        pc_peer_set_clear(&h->peer_mask);
         return 0;
     }
     return 1;
@@ -5886,8 +5904,8 @@ static int pcnetgame_lease_owner_of(int slot) { /* host: -1 none, else the PCNet
     if (h->host_owned) {
         return (int)PC_NETGAME_HOST_PLAYER_ID;
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
-        if ((h->peer_mask & (uint16_t)(1u << p)) != 0 && s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        if (pc_peer_set_has(&h->peer_mask, p) && s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
             return p;
         }
     }
@@ -5932,10 +5950,10 @@ int pc_net_game_host_npc_talk_edge(int slot, uint16_t npc_id, int begin) {
         }
         return 1;
     }
-    if (h->npc_id != npc_id && h->peer_mask != 0) {
-        h->peer_mask = 0;
+    if (h->npc_id != npc_id && !pc_peer_set_empty(&h->peer_mask)) {
+        pc_peer_set_clear(&h->peer_mask);
     }
-    if (h->peer_mask != 0) {
+    if (!pc_peer_set_empty(&h->peer_mask)) {
         printf("[NPC][TALKNET] DENIED host player slot=%d npc=0x%04X: a client owns the conversation%s", slot, (unsigned)npc_id, "\n");
         return 0;
     }
@@ -5964,8 +5982,8 @@ static void pcnetgame_host_talk_hold_scene_left(PCNetPeerId peer, const PCNetPla
     for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
         PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
         int still_ok = outdoors ? !h->indoor : (s->scene_id == (uint8_t)SCENE_NPC_HOUSE && s->owner == h->npc_id && h->indoor);
-        if (peer >= 0 && peer < PC_NET_MAX_PEERS && (h->peer_mask & (uint16_t)(1u << peer)) != 0 && !still_ok) {
-            h->peer_mask = (uint16_t)(h->peer_mask & ~(uint16_t)(1u << peer));
+        if (peer >= 0 && peer < pcnetgame_peer_span() && pc_peer_set_has(&h->peer_mask, peer) && !still_ok) {
+            pc_peer_set_del(&h->peer_mask, peer);
             printf("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X (peer %d left the villager's surroundings)%s", slot, (unsigned)h->npc_id, (int)peer, "\n");
         }
     }
@@ -5978,7 +5996,7 @@ int pc_net_game_nearest_remote_player(float x, float z, float max_dist, float* o
     if ((s_role != PC_NETGAME_ROLE_HOST && !(s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY)) || !pc_net_game_get_local_scene(&ls)) {
         return 0;
     }
-    for (p = 0; p <= PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < PC_REMOTE_PLAYER_SLOT_COUNT; p++) { /* every puppet slot: the peers the puppet table can show plus the host */
         float px, py, pz, d;
         if ((s_role == PC_NETGAME_ROLE_HOST && p == (int)PC_NETGAME_HOST_PLAYER_ID) || (s_role == PC_NETGAME_ROLE_CLIENT && p == (int)s_client_assigned_peer_id)) {
             continue;
@@ -6019,11 +6037,11 @@ static void pcnetgame_npc_lease_host_tick(void) {
         cur._rsv = 0;
         cur.seq = ++s_lease_host_seq;
         s_lease_host = cur;
-        for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        for (p = 0; p < pcnetgame_peer_span(); p++) {
             s_host_peer[p].nlease_seq = 0;
         }
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         if (s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
             if (s_host_peer[p].nlease_seq != s_lease_host.seq && s_lease_host_seq != 0) {
                 s_host_peer[p].nlease_seq = s_lease_host.seq;
@@ -6140,7 +6158,7 @@ static void pcnetgame_client_talk_refresh_tick(void) {
  * pcnetgame_reset_host_drop_state() directly. That meant every new per-peer cache had to be added
  * by hand at BOTH sites, and missing one would only show up later as a stale-cache replay bug on
  * a reused slot. A prior audit flagged that "remember N call sites" pattern as the design's weak
- * point. So a future feature that adds its own s_host_*_state[PC_NET_MAX_PEERS] cache (and its
+ * point. So a future feature that adds its own PCNG_PEER_TABLE s_host_*_state cache (and its
  * own pcnetgame_reset_host_*_state()) adds one line HERE and nowhere else. Each per-feature reset
  * stays its own function, for the same "don't conflate pickup and drop state" reason
  * s_host_drop_state's doc gives. This is only the dispatch point. Safe to call for an
@@ -6154,10 +6172,10 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
     pcnetgame_reset_host_pickup_state(peer);
     pcnetgame_reset_host_drop_state(peer);
     pcnetgame_reset_host_bury_state(peer); /* World Ecology T0 scaffolding -- see its own doc */
-    if (peer >= 0 && peer < PC_NET_MAX_PEERS) {
+    if (peer >= 0 && peer < pcnetgame_peer_span()) {
         pcnetgame_rec_note_peer_gone(&s_host_peer[peer]); /* D3 Q5: dirty record -> early-save flag */
     }
-    if (peer >= 0 && peer < PC_NET_MAX_PEERS) {
+    if (peer >= 0 && peer < pcnetgame_peer_span()) {
         /* v2: identity deferral, PLAYER_CONTEXT, snapshot progress/epoch. v2 additionally calls this
          * on PC_NET_EVENT_PEER_CONNECTED (a freshly allocated transport slot starts clean even if a
          * disconnect was somehow never observed) and on every host-initiated reject/drop. */
@@ -6812,7 +6830,7 @@ static int pcnetgame_validate_and_resolve_drop(PCNetPeerId peer, const PCNetGame
 static void pcnetgame_host_start_snapshot(PCNetPeerId peer, const char* why) {
     PCNetGameHostPeerState* st;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     st = &s_host_peer[peer];
@@ -6836,7 +6854,7 @@ static void pcnetgame_host_start_snapshot(PCNetPeerId peer, const char* why) {
 
 static void pcnetgame_host_resync_all(const char* why) {
     int i;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             pcnetgame_host_start_snapshot((PCNetPeerId)i, why);
         }
@@ -7002,7 +7020,7 @@ static void pcnetgame_broadcast_snowman_state(uint8_t flags) {
     msg.day = bytes[14];
     msg.hour = bytes[15];
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         int backlog;
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
             continue;
@@ -7166,7 +7184,7 @@ static void pcnetgame_host_diff_commit_acre(int acre) {
 static void pcnetgame_host_send_out_list(void) {
     int i, m;
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         int backlog;
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
             continue;
@@ -7312,7 +7330,7 @@ static void pcnetgame_host_check_world_meta(void) {
                (unsigned)cur_state.gyoei_term, (unsigned)cur_state.insect_term, (unsigned)s_world_seq);
     }
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         int backlog;
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || s_host_peer[i].snap_active) {
             continue;
@@ -7391,7 +7409,7 @@ static void pcnetgame_host_broadcast_clock_sync(uint8_t flags) {
         printf("[NET][CLOCK] host: periodic CLOCK_SYNC broadcast (clock_seq %u, host_game_ticks %lld)\n",
                (unsigned)s_host_clock_seq, (long long)msg.host_game_ticks);
     }
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || s_host_peer[i].snap_active) {
             continue;
         }
@@ -7472,7 +7490,7 @@ static void pcnetgame_host_pump_snapshots(void) {
     if (!s_host_world_ready) {
         return;
     }
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         PCNetGameHostPeerState* st = &s_host_peer[i];
         int sent = 0;
 
@@ -7678,7 +7696,7 @@ static void pcnetgame_host_pump_snapshots(void) {
  * they go through pcnetgame_host_reject_and_close() first so the REJECT can be retransmitted. */
 static void pcnetgame_host_drop_peer(PCNetPeerId peer) {
     int was_ready;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return;
     }
     was_ready = (s_host_peer_link[peer] == PC_NETGAME_LINK_READY);
@@ -7707,7 +7725,7 @@ static void pcnetgame_host_drop_peer(PCNetPeerId peer) {
  * be queued the peer is dropped immediately. */
 static void pcnetgame_host_reject_and_close(PCNetPeerId peer, int sent_ok) {
     int was_ready;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return;
     }
     if (!sent_ok) {
@@ -7730,7 +7748,7 @@ static void pcnetgame_host_closing_tick(void) {
     uint32_t now = 0;
     int i;
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         int backlog;
         if (!s_host_peer[i].closing) {
             continue;
@@ -7786,7 +7804,7 @@ static void pcnetgame_host_world_tick(int local_ready) {
         pcnetgame_format_town(&s_host_town, a, sizeof(a));
         pcnetgame_format_town(&cur, b, sizeof(b));
         printf("[NET][WORLD] host: loaded town changed (%s -> %s) -- dropping READY peers\n", a, b);
-        for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        for (i = 0; i < pcnetgame_peer_span(); i++) {
             if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
                 pcnetgame_host_reject_and_close((PCNetPeerId)i,
                     pcnetgame_send_reject_town((PCNetPeerId)i, PC_NETGAME_REJECT_LAND_MISMATCH, &cur));
@@ -7994,7 +8012,7 @@ static void pcnetgame_handle_host_pickup_request(PCNetPeerId peer, const PCNetGa
     int prev_valid;
     uint32_t prev_rid;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not a known, handshake-complete peer -- never process on their behalf */
     }
 
@@ -8063,7 +8081,7 @@ static void pcnetgame_handle_host_drop_request(PCNetPeerId peer, const PCNetGame
     int prev_valid;
     uint32_t prev_rid;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not a known, handshake-complete peer -- never process on their behalf */
     }
 
@@ -10058,7 +10076,7 @@ static void pcnetgame_handle_host_field_action_request(PCNetPeerId peer, const P
     mActor_name_t item = (mActor_name_t)EMPTY_NO;
     int acre = 0, tile = 0;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
 
@@ -10151,7 +10169,7 @@ static void pcnetgame_handle_host_snowman_build_request(PCNetPeerId peer, const 
     uint8_t reason = (uint8_t)PC_NETGAME_SNOWMAN_REASON_NONE;
     int accepted = 0;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
 
@@ -10343,7 +10361,7 @@ static int pcnetgame_validate_catch(int is_host_local, PCNetPeerId peer, uint32_
         float px = 0.0f, py = 0.0f, pz = 0.0f;
         int reach_ok;
 
-        if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
             return 0;
         }
         if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
@@ -10388,7 +10406,7 @@ static int pcnetgame_validate_and_commit_catch(int is_host_local, PCNetPeerId pe
  * client that immediately re-renders after receiving its own accept never races its own despawn
  * broadcast (the broadcast + host-local reconciliation always go out first). */
 static void pcnetgame_handle_host_catch_request(PCNetPeerId peer, const PCNetGameCatchRequestMsg* in) {
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     /* X3: EVERY peer catch is a host-transactional GRANT (the 84-byte request carries the mandatory PCNetGameTxnTag). The journal
@@ -10630,7 +10648,7 @@ static void pcnetgame_handle_host_confirm(PCNetPeerId peer, const PCNetGameInter
     int is_pickup;
     int is_bury;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     rec = pcnetgame_host_interaction(peer, (int)in->kind);
@@ -12195,7 +12213,7 @@ static int pcnetgame_host_own_resident_idx(void) {
  * merely in HANDSHAKE/closing has bound_valid == 0 (reset), so only live READY peers count. */
 static int pcnetgame_host_peer_bound_to_resident(int idx, PCNetPeerId except_peer) {
     int j;
-    for (j = 0; j < PC_NET_MAX_PEERS; j++) {
+    for (j = 0; j < pcnetgame_peer_span(); j++) {
         if (j != (int)except_peer && s_host_peer_link[j] == PC_NETGAME_LINK_READY && s_host_peer[j].bound_valid &&
             s_host_peer[j].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT && s_host_peer[j].bound_resident_idx == idx) {
             return j;
@@ -12207,7 +12225,7 @@ static int pcnetgame_host_peer_bound_to_resident(int idx, PCNetPeerId except_pee
 /* Guests (G1): the READY peer bound to guest-table slot `gslot` other than `except_peer` (-1 if none). */
 static int pcnetgame_host_peer_bound_to_guest(int gslot, PCNetPeerId except_peer) {
     int j;
-    for (j = 0; j < PC_NET_MAX_PEERS; j++) {
+    for (j = 0; j < pcnetgame_peer_span(); j++) {
         if (j != (int)except_peer && s_host_peer_link[j] == PC_NETGAME_LINK_READY && s_host_peer[j].bound_valid &&
             s_host_peer[j].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && s_host_peer[j].bound_guest_slot == gslot) {
             return j;
@@ -12234,7 +12252,7 @@ static int pcnetgame_host_allow_new_guests(void) {
 /* Guests G4: READY peers currently bound to a guest slot, other than `except_peer` (-1 = count every one). */
 static int pcnetgame_host_bound_guest_count(PCNetPeerId except_peer) {
     int j, n = 0;
-    for (j = 0; j < PC_NET_MAX_PEERS; j++) {
+    for (j = 0; j < pcnetgame_peer_span(); j++) {
         if (j != (int)except_peer && s_host_peer_link[j] == PC_NETGAME_LINK_READY && s_host_peer[j].bound_valid &&
             s_host_peer[j].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
             n++;
@@ -12244,7 +12262,7 @@ static int pcnetgame_host_bound_guest_count(PCNetPeerId except_peer) {
 }
 
 /* Guests G4: transport slots a not-yet-connected RESIDENT may still need: every existing resident record of this town that is not the host's own and is
- * not bound to a READY peer. A new guest must leave these free (PC_NET_MAX_PEERS is the transport table; a 9th peer is dropped silently, so a resident could
+ * not bound to a READY peer. A new guest must leave these free (the transport capacity is finite and a peer beyond it is refused, so a resident could
  * otherwise be locked out by guests). Conservative: a resident that is mid-handshake counts both as an occupied peer and as a reserve. */
 static int pcnetgame_host_resident_peer_reserve(void) {
     const Private_c* priv = Save_Get(private_data);
@@ -12269,9 +12287,9 @@ static const char* pcnetgame_host_guest_cap_refusal(PCNetPeerId peer, char* buf,
         snprintf(buf, buf_size, "guest limit reached (%d of max_guests=%d guests are connected)", bound, cap);
         return buf;
     }
-    if (occupied + reserve > PC_NET_MAX_PEERS) {
+    if (occupied + reserve > pc_net_peer_capacity()) {
         snprintf(buf, buf_size, "guest limit reached (%d of %d transport peer slots are in use and %d more are held for residents; %d of max_guests=%d guests connected)",
-                 occupied, (int)PC_NET_MAX_PEERS, reserve, bound, cap);
+                 occupied, pc_net_peer_capacity(), reserve, bound, cap);
         return buf;
     }
     return NULL;
@@ -12281,7 +12299,7 @@ static const char* pcnetgame_host_guest_cap_refusal(PCNetPeerId peer, char* buf,
  * PC_NETGAME_REC_SLOTS-1 = PLAYER_NUM + the guest table slot. Derived ONLY from the host-side binding (never from a message). */
 static int pcnetgame_peer_rec_slot(PCNetPeerId peer) {
     const PCNetGameHostPeerState* st;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return -1;
     }
     st = &s_host_peer[peer];
@@ -12394,7 +12412,7 @@ static const char* pcnetgame_guest_name_conflict_guest(const PersonalID_c* key) 
 static void pcnetgame_host_revalidate_bound_peers(void) {
     int i;
     int own_idx = pcnetgame_host_own_resident_idx();
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         PCNetGameHostPeerState* st = &s_host_peer[i];
         const char* why = NULL;
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || !st->bound_valid) {
@@ -12687,7 +12705,7 @@ static int pcnetgame_rec_log_ok(PCNetGameHostPeerState* st) {
  * NOT_PENDING flood from one peer cannot flood the host log; refusals are NOT violations). */
 static int pcnetgame_txn_log_ok(PCNetPeerId peer) {
     uint32_t c;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return 1;
     }
     c = s_host_peer[peer].txn_log_n++;
@@ -13109,7 +13127,7 @@ static int pcnetgame_rec_gate(PCNetPeerId peer, uint32_t xfer_id, int reply) {
     PCNetGameHostPeerState* st;
     int idx;
     int own_idx;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return -1;
     }
     st = &s_host_peer[peer];
@@ -13781,7 +13799,7 @@ static void pcnetgame_host_record_tick(void) {
             pcnetgame_rec_refresh_hostfields(i, s);
         }
     }
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         PCNetGameHostPeerState* st = &s_host_peer[i];
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || !st->bound_valid) {
             continue;
@@ -14119,7 +14137,7 @@ static void pcnetgame_house_test_host_edit(void) {
     }
     if (n == 4 && v[0] >= 0 && v[0] < PC_NETGAME_HOUSE_NUM && s_hh[v[0]].valid) {
         int pp, seen = 0;
-        for (pp = 0; pp < PC_NET_MAX_PEERS; pp++) { /* wait until a READY peer holds the current canonical copy: the edit is then observable as a seq bump + push */
+        for (pp = 0; pp < pcnetgame_peer_span(); pp++) { /* wait until a READY peer holds the current canonical copy: the edit is then observable as a seq bump + push */
             if (s_host_peer_link[pp] == PC_NETGAME_LINK_READY && s_host_peer[pp].bound_valid && s_host_peer[pp].bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST &&
                 !s_host_peer[pp].hpush_active && s_host_peer[pp].hsent_seq[v[0]] == s_hh[v[0]].seq) {
                 seen = 1;
@@ -14830,7 +14848,7 @@ static void pcnetgame_pdata_host_tick(void) {
             }
         }
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid || st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT) {
             continue; /* a guest has no diary to sync */
@@ -14989,7 +15007,7 @@ static void pcnetgame_house_host_tick(void) {
             (void)pcnetgame_house_host_refresh(h, 0); /* host-originated changes (turnip spoilage, upgrades, the host's own edits): seq++ and a push to everyone */
         }
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid || st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
             continue; /* a guest never sees (or edits) a house */
@@ -16345,7 +16363,7 @@ static void pcnetgame_handle_host_txn_commit(PCNetPeerId peer, const PCNetGameTx
     const char* fail;
 
     /* 1. READY gate: a peer that is not READY (HANDSHAKE / parked / closing) is dropped silently (D3 rule; parked peers hold no reservation) */
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not READY: dropped silently, no result by design */
     }
     st = &s_host_peer[peer];
@@ -16715,7 +16733,7 @@ static void pcnetgame_x3_grant(PCNetPeerId peer, PCNetGameTxnCommitMsg* in, uint
     uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_WORLD_CHANGED;
 
     /* 1. READY gate (the dispatch already checked it for the legacy handlers; re-checked here, the function is self-contained) */
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not READY: dropped silently, no result by design */
     }
     st = &s_host_peer[peer];
@@ -17148,11 +17166,11 @@ static void pcnetgame_evnpc_host_tick(void) {
         if (n > 0) {
             printf("[NET][EVNPC] host: first entry npc 0x%04X at (%.1f,%.1f)\n", (unsigned)cur[0].npc_id, (double)cur[0].x, (double)cur[0].z);
         }
-        for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+        for (p = 0; p < pcnetgame_peer_span(); p++) {
             s_host_peer[p].evnpc_seq = 0; /* every ready peer gets the new table below */
         }
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         if (s_host_peer_link[p] == PC_NETGAME_LINK_READY && s_host_peer[p].evnpc_seq != s_evnpc_host.seq && s_evnpc_host_seq != 0) {
             s_host_peer[p].evnpc_seq = s_evnpc_host.seq;
             pcnetgame_evnpc_send((PCNetPeerId)p);
@@ -18107,7 +18125,7 @@ static int pcnetgame_ts_send_to_peer(PCNetPeerId peer, int svc) {
 /* Pushes every service whose seq this peer has not been sent yet. Bounded: at most 2 messages per call and peer, each only on a seq change. */
 static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
     int svc;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_EVENT; svc++) {
@@ -18128,7 +18146,7 @@ static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
 static void pcnetgame_host_ts_push_hostcfg(PCNetPeerId peer) {
     PCNetGameHostPeerState* st;
     const int svc = (int)PC_NETGAME_TS_HOSTCFG;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     st = &s_host_peer[peer];
@@ -18142,7 +18160,7 @@ static void pcnetgame_host_ts_push_hostcfg(PCNetPeerId peer) {
 
 static void pcnetgame_host_ts_push_all(void) {
     int p;
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         pcnetgame_host_ts_push_peer((PCNetPeerId)p);
     }
 }
@@ -18225,7 +18243,7 @@ static void pcnetgame_world_test_poke_event(void) {
     if (poked || s_world_test_poke_md == 0) {
         return;
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         if (s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
             any_ready = 1;
         }
@@ -18299,7 +18317,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_evnpc_host_tick();
     pcnetgame_npc_lease_host_tick();
     pcnetgame_page_host_tick();
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* wst = &s_host_peer[p];
         pcnetgame_host_ts_push_peer((PCNetPeerId)p); /* a late joiner / reconnect / a failed send is covered here */
         /* Nook Work Mode: the character's job state reaches the peer as soon as its record is SYNCED (connect, reconnect, a new session), so Nook's menu is right before any op */
@@ -18641,7 +18659,7 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     uint32_t work_reward = 0;
 
     /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not READY: dropped silently, no result by design */
     }
     st = &s_host_peer[peer];
@@ -19234,7 +19252,7 @@ static void pcnetgame_handle_host_house_purchase_txn(PCNetPeerId peer, const PCN
     uint8_t fail_reason;
 
     /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     st = &s_host_peer[peer];
@@ -19410,7 +19428,7 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
 
     /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not READY: dropped silently, no result by design */
     }
     st = &s_host_peer[peer];
@@ -19799,7 +19817,7 @@ static void pcnetgame_host_mbox_tick(void) {
         s_mbox_next_check_ms = now;
     }
     own = pcnetgame_host_own_resident_idx();
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
         int idx, i, sent = 0;
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid) {
@@ -19850,7 +19868,7 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
     uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
 
     /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not READY: dropped silently, no result by design */
     }
     st = &s_host_peer[peer];
@@ -20047,7 +20065,7 @@ static void pcnetgame_host_remail_tick(void) {
     s_next_ms = now + 1000u;
     today = ((uint32_t)Common_Get(time.rtc_time).year << 16) | ((uint32_t)Common_Get(time.rtc_time).month << 8) | (uint32_t)Common_Get(time.rtc_time).day;
     own = pcnetgame_host_own_resident_idx();
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
         int idx;
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid || st->rec_state != PC_NETGAME_RECS_SYNCED) {
@@ -26995,7 +27013,7 @@ static void pcnetgame_host_process_pending_identities(void) {
     if (!s_host_world_ready) {
         return;
     }
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_HANDSHAKE && s_host_peer[i].identity_pending) {
             if (!s_host_peer[i].dup_park_active) {
                 printf("[NET] host: host save loaded -- validating deferred identity of peer %d\n", i);
@@ -27108,7 +27126,7 @@ static void pcnetgame_handle_host_bury_request(PCNetPeerId peer, const PCNetGame
     int prev_valid;
     uint32_t prev_rid;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return; /* not a known, handshake-complete peer -- never process on their behalf */
     }
 
@@ -27195,7 +27213,7 @@ typedef struct TownSrvPeer {
     uint32_t  started_ms;
     uint32_t  done_ms;     /* when the client's TOWN_DONE arrived (0 = not yet): the transport peer is dropped PC_NETGAME_TOWN_DONE_GRACE_MS later (see the handler) */
 } TownSrvPeer;
-static TownSrvPeer s_townsrv[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(TownSrvPeer, s_townsrv)
 static uint32_t s_townsrv_xfer_counter = 0;
 static struct { uint32_t ip; uint32_t at_ms; uint8_t used; } s_townsrv_rate_log[PC_NETGAME_TOWN_RATE_LOG];
 static int s_townsrv_rate_next = 0;
@@ -27234,7 +27252,7 @@ static void pcnetgame_townsrv_world_ready(void) {
 }
 
 static void pcnetgame_townsrv_reset(PCNetPeerId peer) {
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS) {
+    if (peer < 0 || peer >= pcnetgame_peer_span()) {
         return;
     }
     if (s_townsrv[peer].buf != NULL) {
@@ -27245,7 +27263,7 @@ static void pcnetgame_townsrv_reset(PCNetPeerId peer) {
 
 static int pcnetgame_townsrv_active_streams(void) {
     int i, n = 0;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_townsrv[i].streaming) {
             n++;
         }
@@ -27381,7 +27399,7 @@ static void pcnetgame_townsrv_pump(PCNetPeerId peer) {
 static void pcnetgame_townsrv_tick(void) {
     uint32_t now = 0;
     int i;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         TownSrvPeer* ts = &s_townsrv[i];
         if (!ts->active) {
             continue;
@@ -27510,7 +27528,7 @@ static void pcnetgame_townsrv_handle_fetch_data(PCNetPeerId peer, const uint8_t*
 /* ===== TOWN TRANSFER HOST END ===== */
 
 static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || size == 0) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || size == 0) {
         return;
     }
     if (s_host_peer[peer].closing) {
@@ -28680,7 +28698,7 @@ static void pcnetgame_reset_client_session_state(void) {
          * replays join-time scenes), and entries stored before any MOVE arrived are never reaped by the
          * puppet liveness timeout. Only scene identity is cleared -- puppets/movement state are untouched. */
         int scene_pid;
-        for (scene_pid = 0; scene_pid <= (int)PC_NETGAME_HOST_PLAYER_ID; scene_pid++) {
+        for (scene_pid = 0; scene_pid < PC_REMOTE_PLAYER_SLOT_COUNT; scene_pid++) {
             pc_remote_player_clear_scene((PCNetPlayerId)scene_pid);
         }
     }
@@ -28815,7 +28833,7 @@ static void pcnetgame_reset_host_world_state(void) {
     int i;
     memset(&s_host_local_drop_landing, 0, sizeof(s_host_local_drop_landing)); /* no stale arm across sessions */
     memset(s_action_seq_out, 0, sizeof(s_action_seq_out)); /* M9-C Phase 5: PLAYER_ACTION seq restarts per host session (see PCNetGamePlayerActionMsg) */
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         s_host_peer_link[i] = PC_NETGAME_LINK_DISCONNECTED;
         pcnetgame_reset_all_host_peer_state((PCNetPeerId)i);
     }
@@ -28972,7 +28990,7 @@ static void pcnetgame_client_on_link_lost(const char* cause) {
         int scene_pid;
         int held = 0;
         PCNetPlayerScene scene_tmp;
-        for (scene_pid = 0; scene_pid <= (int)PC_NETGAME_HOST_PLAYER_ID; scene_pid++) {
+        for (scene_pid = 0; scene_pid < PC_REMOTE_PLAYER_SLOT_COUNT; scene_pid++) {
             held += pc_remote_player_get_scene((PCNetPlayerId)scene_pid, &scene_tmp) ? 1 : 0;
         }
         printf("[NET][SCENE] client: host link lost -- clearing %d stored peer scene(s)\n", held);
@@ -29172,9 +29190,10 @@ static void pcnetgame_page_send(PCNetPeerId peer, unsigned kind, unsigned index,
 /* ---- host ---- */
 static uint32_t s_pg_rev[PCNG_PAGE_COUNT];                       /* host: canonical revision (0 = not baselined yet) */
 static uint32_t s_pg_dig[PCNG_PAGE_COUNT];                       /* host: digest of the content at that revision */
-static uint32_t s_pg_sent[PC_NET_MAX_PEERS][PCNG_PAGE_COUNT];    /* host: the revision each peer has */
+PCNG_PEER_TABLE2(uint32_t, s_pg_sent, PCNG_PAGE_COUNT)    /* host: the revision each peer has */
 static uint32_t s_pg_next_scan_ms;
-static uint32_t s_pg_wr_ms[PC_NET_MAX_PEERS], s_pg_wr_n[PC_NET_MAX_PEERS];
+PCNG_PEER_TABLE(uint32_t, s_pg_wr_ms)
+PCNG_PEER_TABLE(uint32_t, s_pg_wr_n)
 
 static void pcnetgame_page_host_tick(void) {
     uint32_t now = pcnetgame_now_ms();
@@ -29200,7 +29219,7 @@ static void pcnetgame_page_host_tick(void) {
             }
         }
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         int budget = 6;
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !s_host_peer[p].bound_valid || s_host_peer[p].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) /* a guest keeps its own town's pages */ {
             memset(s_pg_sent[p], 0, sizeof(s_pg_sent[p]));
@@ -29227,7 +29246,7 @@ static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg*
     uint8_t* cur;
     int idx;
     uint32_t now;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY || (in->flags & PCNG_PAGE_F_WRITE) == 0u) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY || (in->flags & PCNG_PAGE_F_WRITE) == 0u) {
         return;
     }
     cur = pcnetgame_page_ptr(in->kind, in->index, &len);
@@ -29531,6 +29550,42 @@ static void pcnetgame_client_tick(void) {
     }
 }
 
+/* The host's transport capacity: `--max-peers N` wins over settings.ini max_peers (default 8); either is clipped to the usable wire ids (254: 0..254 minus the host's). */
+static int pcnetgame_host_max_peers(void) {
+    const int top = pc_peer_capacity_max(PC_NET_RESERVED_PEER_ID);
+    int n = g_pc_max_peers_override > 0 ? g_pc_max_peers_override : g_pc_settings.max_peers;
+    if (n < 1) {
+        n = PC_PEER_DEFAULT_CAPACITY;
+    }
+    return n > top ? top : n;
+}
+
+/* Every per-peer host table (PCNG_PEER_TABLE / PCNG_PEER_TABLE2 above), in one list so that a resize can never miss one. */
+#define PCNG_REG(NAME) PC_PEER_TABLE_ENTRY(NAME)
+static PCPeerTable s_peer_tables[] = {
+    PCNG_REG(s_host_peer_link), PCNG_REG(s_host_pickup_state), PCNG_REG(s_host_drop_state), PCNG_REG(s_host_bury_state),
+    PCNG_REG(s_host_field_action_dedup), PCNG_REG(s_host_snowman_build_dedup), PCNG_REG(s_host_catch_dedup), PCNG_REG(s_host_peer),
+    PCNG_REG(s_host_rec_rx), PCNG_REG(s_host_rec_tx), PCNG_REG(s_host_house_rx), PCNG_REG(s_host_house_tx), PCNG_REG(s_host_pd_tx),
+    PCNG_REG(s_host_talk_last_seq), PCNG_REG(s_host_talk_seq_valid), PCNG_REG(s_townsrv),
+    PCNG_REG(s_pg_sent), PCNG_REG(s_pg_wr_ms), PCNG_REG(s_pg_wr_n),
+};
+#define PCNG_PEER_TABLE_COUNT ((int)(sizeof(s_peer_tables) / sizeof(s_peer_tables[0])))
+
+/* All-or-nothing: gives every per-peer table `span` zeroed elements (never fewer than the inline PCNG_INLINE_PEERS). 0 = out of memory, nothing changed. */
+static int pcnetgame_peer_tables_resize(int span) {
+    const int want = span < PCNG_INLINE_PEERS ? PCNG_INLINE_PEERS : span;
+    if (!pc_peer_tables_resize(s_peer_tables, PCNG_PEER_TABLE_COUNT, PCNG_INLINE_PEERS, want)) {
+        return 0;
+    }
+    s_peer_span = want;
+    return 1;
+}
+
+static void pcnetgame_peer_tables_release(void) {
+    pc_peer_tables_release(s_peer_tables, PCNG_PEER_TABLE_COUNT, PCNG_INLINE_PEERS);
+    s_peer_span = PCNG_INLINE_PEERS;
+}
+
 int pc_net_game_start_host(uint16_t port) {
     if (s_role != PC_NETGAME_ROLE_NONE) {
         printf("[NET] start_host: networking already active, ignoring\n");
@@ -29540,14 +29595,21 @@ int pc_net_game_start_host(uint16_t port) {
         printf("[NET] start_host: pc_net_init failed -- continuing single-player\n");
         return 0;
     }
+    (void)pc_net_set_peer_capacity(pcnetgame_host_max_peers()); /* refused only for a value outside 1..254, which the setting / flag parsers never produce */
     if (!pc_net_host_start(port)) {
-        printf("[NET] start_host: could not bind UDP port %u -- continuing single-player\n", (unsigned)port);
+        printf("[NET] start_host: could not bind UDP port %u (or allocate the transport tables for %d peers) -- continuing single-player\n", (unsigned)port, pcnetgame_host_max_peers());
+        pc_net_shutdown();
+        return 0;
+    }
+    if (!pcnetgame_peer_tables_resize(pc_net_peer_span())) {
+        printf("[NET] start_host: could not allocate the per-peer host state for %d peers (out of memory) -- continuing single-player\n", pc_net_peer_capacity());
         pc_net_shutdown();
         return 0;
     }
     s_role = PC_NETGAME_ROLE_HOST;
     pcnetgame_reset_host_world_state();
-    printf("[NET] hosting on UDP port %u (protocol %u)\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
+    printf("[NET] hosting on UDP port %u (protocol %u), peer capacity %d (slots 0..%d, id %d reserved for the host)\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION, pc_net_peer_capacity(),
+           pc_net_peer_span() - 1, (int)PC_NETGAME_HOST_WIRE_ID);
     PC_LOG(PCL_NET, "host listening: UDP port %u protocol %u\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
     return 1;
 }
@@ -29926,7 +29988,7 @@ void pc_net_game_shutdown(void) {
         pc_net_poll(); /* flush the just-queued send before the socket goes away */
     } else if (s_role == PC_NETGAME_ROLE_HOST) {
         int i;
-        for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        for (i = 0; i < pcnetgame_peer_span(); i++) {
             if (s_host_peer_link[i] != PC_NETGAME_LINK_DISCONNECTED) pc_net_disconnect((PCNetPeerId)i);
         }
         pc_net_poll();
@@ -29937,6 +29999,7 @@ void pc_net_game_shutdown(void) {
     s_client_link = PC_NETGAME_LINK_DISCONNECTED;
     pcnetgame_reset_client_session_state();
     pcnetgame_reset_host_world_state(); /* also clears s_host_peer_link[] and every per-peer cache */
+    pcnetgame_peer_tables_release(); /* back to the zeroed inline tables (frees the heap ones a big capacity needed) */
     memset(&s_local_scene, 0, sizeof(s_local_scene)); /* M9-A: back to single-player: nothing announced */
     s_local_scene_seq = 0;
 
@@ -29994,7 +30057,7 @@ static void pcnetgame_run_villager_test_triggers(void) {
      * host-only smoke checks, or while every connected peer is still mid-snapshot. */
     {
         int i, have_settled_peer = 0;
-        for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+        for (i = 0; i < pcnetgame_peer_span(); i++) {
             if (s_host_peer_link[i] == PC_NETGAME_LINK_READY && !s_host_peer[i].snap_active) {
                 have_settled_peer = 1;
                 break;
@@ -31252,14 +31315,14 @@ static void pcnetgame_run_bury_test_seed(void) {
  * acre") is the acre a READY REMOTE player currently stands in: that peer is in the town / island field scene (PC_NETSCENE_KIND_FIELD, announced by
  * PLAYER_SCENE) and its last synced MOVE position (finite, in range) maps to that acre. Host only (0 for client / solo: nothing changes there).
  * The refill functions (mFI_ResearchShell, mMsr_SetMushroomNum, mMsr_ClearMushrooms) call it per candidate acre and skip such an acre exactly like the
- * host's own player's acre, so a shell / mushroom never pops into view next to a remote player. Read-only, bounded (<= PC_NET_MAX_PEERS peers),
+ * host's own player's acre, so a shell / mushroom never pops into view next to a remote player. Read-only, bounded (<= the peer capacity),
  * no RNG, no writes. */
 int pc_net_game_host_remote_player_in_acre(int bx, int bz) {
     int p;
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return 0;
     }
-    for (p = 0; p < PC_NET_MAX_PEERS; p++) {
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetPlayerScene sc;
         float px, py, pz;
         xyz_t pos;
@@ -31442,7 +31505,7 @@ void pc_net_game_poll(void) {
         if (s_role == PC_NETGAME_ROLE_HOST) {
             switch (ev.type) {
                 case PC_NET_EVENT_PEER_CONNECTED:
-                    if (ev.peer >= 0 && ev.peer < PC_NET_MAX_PEERS) {
+                    if (ev.peer >= 0 && ev.peer < pcnetgame_peer_span()) {
                         /* v2: a freshly allocated transport slot starts from a clean slate even if
                          * the previous occupant's disconnect was never observed here. */
                         pcnetgame_reset_all_host_peer_state(ev.peer);
@@ -31454,7 +31517,7 @@ void pc_net_game_poll(void) {
                     break;
                 case PC_NET_EVENT_PEER_DISCONNECTED:
                     if (g_pc_dedicated) pc_net_game_dedicated_announce((int)ev.peer, 2); /* before the per-peer state is reset */
-                    if (ev.peer >= 0 && ev.peer < PC_NET_MAX_PEERS) {
+                    if (ev.peer >= 0 && ev.peer < pcnetgame_peer_span()) {
                         int was_ready_peer = (s_host_peer_link[ev.peer] == PC_NETGAME_LINK_READY);
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_DISCONNECTED;
                         if (was_ready_peer) {
@@ -31553,7 +31616,7 @@ void pc_net_game_poll(void) {
             } else if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) { /* --host-observer: no host MOVE stream */
                 int i;
                 msg.net_player_id = (uint8_t)PC_NETGAME_HOST_PLAYER_ID;
-                for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+                for (i = 0; i < pcnetgame_peer_span(); i++) {
                     if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
                         pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
                     }
@@ -31588,7 +31651,7 @@ void pc_net_game_poll(void) {
             pc_net_send(0, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
         } else if (s_role == PC_NETGAME_ROLE_HOST) {
             int i;
-            for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+            for (i = 0; i < pcnetgame_peer_span(); i++) {
                 if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
                     pcnetgame_host_send_full_roster((PCNetPeerId)i);
                 }
@@ -31646,7 +31709,7 @@ void pc_net_game_poll(void) {
                 PCNetGameAppearanceMsg amsg;
                 int i;
                 pcnetgame_pack_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &current);
-                for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+                for (i = 0; i < pcnetgame_peer_span(); i++) {
                     if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
                         pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
                     }
@@ -31913,7 +31976,7 @@ PCNetGameLinkState pc_net_game_client_link_state(void) {
 int pc_net_game_host_ready_peer_count(void) {
     int i, n = 0;
     if (s_role != PC_NETGAME_ROLE_HOST) return 0;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) n++;
     }
     return n;
@@ -31947,7 +32010,7 @@ int pc_net_game_get_player_context(PCNetPlayerId player_id, PCNetPlayerContext* 
         }
         return pc_net_game_get_local_player_context(out);
     }
-    if (player_id < 0 || player_id >= PC_NET_MAX_PEERS || s_host_peer_link[player_id] != PC_NETGAME_LINK_READY ||
+    if (player_id < 0 || player_id >= pcnetgame_peer_span() || s_host_peer_link[player_id] != PC_NETGAME_LINK_READY ||
         !s_host_peer[player_id].ctx_valid) {
         return 0;
     }
@@ -33046,7 +33109,7 @@ int pc_net_game_host_bury_tile_is_valid(int ut_x, int ut_z) {
  * silently behind. */
 static void pcnetgame_broadcast_villager_msg(const void* msg, size_t msg_size) {
     int i;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         int backlog;
         if (s_host_peer_link[i] != PC_NETGAME_LINK_READY || s_host_peer[i].snap_active) {
             continue;
@@ -33249,7 +33312,7 @@ void pc_net_game_notify_npc_move(int slot, uint16_t npc_id, float pos_x, float p
         }
     }
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
         }
@@ -33567,7 +33630,7 @@ static void pcnetgame_room_npc_host_submit(PCNetPlayerId from, PCNetGameRoomNpcM
     }
     L->flags = m->flags;
     m->sender = (uint8_t)from;
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_READY && (PCNetPlayerId)i != from && pcnetgame_room_player_in_room((PCNetPlayerId)i, m->scene_id, m->owner)) {
             pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, m, (uint16_t)sizeof(*m));
         }
@@ -33579,7 +33642,7 @@ static void pcnetgame_room_npc_host_submit(PCNetPlayerId from, PCNetGameRoomNpcM
 
 static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in) {
     PCNetGameRoomNpcMsg m;
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     m = *in;
@@ -33877,7 +33940,7 @@ void pc_net_game_notify_npc_state(int slot, uint16_t npc_id, uint8_t is_home, ui
                (unsigned)msg.state_seq);
     }
 
-    for (i = 0; i < PC_NET_MAX_PEERS; i++) {
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
         }
@@ -33993,7 +34056,7 @@ static void pcnetgame_handle_host_friendship_request(PCNetPeerId peer, const PCN
     PersonalID_c pid;
     int friendship;
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     if (!s_host_world_ready) {
@@ -34099,7 +34162,7 @@ static void pcnetgame_handle_host_mail_request(PCNetPeerId peer, const PCNetGame
     uint8_t letter_info = 0;
     uint8_t letter[258];
 
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
 
@@ -34529,7 +34592,7 @@ static void pcnetgame_handle_host_wildlife_spawn_trigger_request(PCNetPeerId pee
         }
         return;
     }
-    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
     if (!s_host_world_ready || !pcfa_save_ready()) {
@@ -34976,7 +35039,7 @@ int pc_net_game_dedicated_world_ready(void) {
 }
 
 int pc_net_game_dedicated_peer_slots(void) {
-    return s_role == PC_NETGAME_ROLE_HOST ? PC_NET_MAX_PEERS : 0;
+    return s_role == PC_NETGAME_ROLE_HOST ? pcnetgame_peer_span() : 0;
 }
 
 /* PersonalID names are game font codes; the letters/digits/space used by the usual names are ASCII-compatible. Anything else prints as '?'. */
@@ -34993,7 +35056,7 @@ static void pcnetgame_dedicated_ascii_name(const uint8_t* src, char* out) {
 
 int pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out) {
     const PCNetGameHostPeerState* st;
-    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= PC_NET_MAX_PEERS) {
+    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= pcnetgame_peer_span()) {
         return 0;
     }
     if (s_host_peer_link[slot] == PC_NETGAME_LINK_DISCONNECTED) {
@@ -35034,7 +35097,7 @@ int pc_net_game_dedicated_capacity(int* peers_used, int* peers_total, int* resid
         return 0;
     }
     *peers_used = pc_net_peer_count();
-    *peers_total = PC_NET_MAX_PEERS;
+    *peers_total = pc_net_peer_capacity();
     *resident_reserve = pcnetgame_host_resident_peer_reserve();
     return 1;
 }

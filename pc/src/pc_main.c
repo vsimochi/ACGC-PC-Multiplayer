@@ -1578,6 +1578,8 @@ int main(int argc, char* argv[]) {
             printf("                      See pc_m_card.c pc_bootstrap_guest_poll().\n");
             printf("  --max-guests N      HOST: most guests (visitors with their own character) connected at once, 1..8 (default 4 or settings.ini\n");
             printf("                      max_guests); a new guest beyond the cap is refused like a full server, residents are never refused.\n");
+            printf("  --max-peers N       HOST: most simultaneous network peers (residents + guests + visitors still connecting), 1..254 (default 8 or settings.ini max_peers).\n");
+            printf("                      A peer beyond it is refused with a connection-lost notice. Guest admission (max_guests) is a separate, stricter limit.\n");
             printf("  --allow-new-guests 0|1  HOST-only (exit 2 otherwise): 0 = refuse guests whose key this host does not know yet (known guests still return); default 1 or\n");
             printf("                      settings.ini [Network] allow_new_guests.\n");
             printf("  --resident-tokens off|tofu|required  HOST-only (exit 2 otherwise): resident credentials (default off or settings.ini resident_tokens). tofu: a resident's\n");
@@ -1878,6 +1880,15 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             g_pc_max_guests_override = mg;
+            i++;
+        } else if (strcmp(argv[i], "--max-peers") == 0) {
+            /* Capacity phase 2: HOST-side transport capacity (overrides settings.ini max_peers); a bad / missing value is never ignored. */
+            const int mp = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
+            if (i + 1 >= argc || mp < 1 || mp > pc_peer_capacity_max(PC_NET_RESERVED_PEER_ID)) {
+                fprintf(stderr, "[PC] --max-peers: REFUSED: the option needs a number 1..%d (most simultaneous network peers)\n", pc_peer_capacity_max(PC_NET_RESERVED_PEER_ID));
+                return 2;
+            }
+            g_pc_max_peers_override = mp;
             i++;
         } else if (strcmp(argv[i], "--town-dir") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '\0' || g_pc_town_dir != NULL) {
@@ -2357,6 +2368,11 @@ int main(int argc, char* argv[]) {
     if (g_pc_town_serve_override >= 0 && g_pc_net_role != 1) {
         fprintf(stderr, "[PC] --town-serve: REFUSED: it is a HOST-only option (use it together with --host)\n"
                         "usage: AnimalCrossing --host [port] --town-serve off|on|full   (see --help)\n");
+        return 2;
+    }
+    if (g_pc_max_peers_override > 0 && g_pc_net_role != 1) {
+        fprintf(stderr, "[PC] --max-peers: REFUSED: it is a HOST-only option (use it together with --host)\n"
+                        "usage: AnimalCrossing --host [port] --max-peers N   (see --help)\n");
         return 2;
     }
     if ((g_pc_allow_new_guests_override >= 0 || g_pc_resident_tokens_override >= 0) && g_pc_net_role != 1) {

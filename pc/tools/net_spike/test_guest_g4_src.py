@@ -114,21 +114,21 @@ def main():
     rs = nb("pcnetgame_host_resident_peer_reserve")
     ck("R the reserve counts resident records that exist (not null PersonalID), are not the host's own resident and are not bound to a READY peer",
        "mPr_NullCheckPersonalID" in rs and "i != own" in rs and "pcnetgame_host_peer_bound_to_resident(i, (PCNetPeerId)-1) < 0" in rs and "pcnetgame_host_own_resident_idx()" in rs)
-    ck("R the gate refuses a guest when occupied transport peers + reserve exceed PC_NET_MAX_PEERS (log: 'more are held for residents'), checked after the max_guests cap",
-       "occupied + reserve > PC_NET_MAX_PEERS" in gate and "pc_net_peer_count()" in gate and "more are held for residents" in gate and gate.index("bound >= cap") < gate.index("occupied + reserve"))
+    ck("R the gate refuses a guest when occupied transport peers + reserve exceed the transport capacity pc_net_peer_capacity() (log: 'more are held for residents'), checked after the max_guests cap",
+       "occupied + reserve > pc_net_peer_capacity()" in gate and "pc_net_peer_count()" in gate and "more are held for residents" in gate and gate.index("bound >= cap") < gate.index("occupied + reserve"))
 
     # ------------------------------------------------------------------ I
     rp = S.read("pc/src/pc_remote_player.c")
-    ck("I puppets: slots are indexed by the transport peer id (PC_NET_MAX_PEERS + 1 incl. the host), pc_remote_player.c never mentions player_no", "#define PC_REMOTE_PLAYER_SLOT_COUNT (PC_NET_MAX_PEERS + 1)" in rp
+    ck("I puppets: slots are indexed by the player id (0..7 + the host's wire id, PC_REMOTE_PLAYER_SLOT_COUNT in pc_remote_player.h), pc_remote_player.c never mentions player_no", "#define PC_REMOTE_PLAYER_SLOT_COUNT ((int)PC_NETGAME_HOST_WIRE_ID + 1)" in S.read("pc/include/pc_remote_player.h")
        and "player_no" not in rp and "static PCRemotePlayerSlot s_slots[PC_REMOTE_PLAYER_SLOT_COUNT];" in rp)
     ck("I the host creates the puppet of a READY peer keyed by that peer: pc_remote_player_on_ready(peer, ...) in process_identity, the identity from the peer's OWN IDENTITY message",
        "pc_remote_player_on_ready(peer, &remote_identity);" in pi and "memcpy(remote_identity.player_name, in.player_name" in pi)
     pr = nb("pcnetgame_peer_rec_slot")
     ck("I the record slot of a peer is derived ONLY from its host-side binding: guest -> PLAYER_NUM + bound_guest_slot, resident -> bound_resident_idx; never from a message",
        "PLAYER_NUM + st->bound_guest_slot" in pr and "st->bound_resident_idx" in pr and "in->" not in pr and "msg" not in pr)
-    ck("I per-peer state is indexed by the peer id (s_host_peer / s_host_peer_link / record rx-tx buffers have PC_NET_MAX_PEERS entries), never by a guest's shared player_no 4",
-       "static PCNetGameHostPeerState s_host_peer[PC_NET_MAX_PEERS];" in ng_raw and "static PCNetGameLinkState s_host_peer_link[PC_NET_MAX_PEERS];" in ng_raw
-       and "s_host_rec_rx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE]" in ng_raw)
+    ck("I per-peer state is indexed by the peer id (s_host_peer / s_host_peer_link / record rx-tx buffers are runtime-sized PCNG_PEER_TABLEs, one element per peer slot), never by a guest's shared player_no 4",
+       "PCNG_PEER_TABLE(PCNetGameHostPeerState, s_host_peer)" in ng_raw and "PCNG_PEER_TABLE(PCNetGameLinkState, s_host_peer_link)" in ng_raw
+       and "PCNG_PEER_TABLE2(uint8_t, s_host_rec_rx, PC_NETGAME_REC_SIZE)" in ng_raw)
     ck("I the guest-vs-guest admission rules stay: key conflict, wrong / missing token, duplicate live key parking and the same-town NAME rule among guests (pcnetgame_guest_name_conflict_guest)",
        "pcnetgame_guest_name_conflict_guest(key)" in nb("pcnetgame_host_guest_check") and "presented a WRONG token" in ng_raw.replace("known guest key presented a WRONG token", "presented a WRONG token")
        and "pcnetgame_host_peer_bound_to_guest(guest_slot, peer)" in pi)

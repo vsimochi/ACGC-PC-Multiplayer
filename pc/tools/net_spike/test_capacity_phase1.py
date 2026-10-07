@@ -74,16 +74,16 @@ int main(void) {
 
     h = read("pc/include/pc_net_game.h")
     check("host wire id: own constant == 8, PLAYER_ID defined from it", "#define PC_NETGAME_HOST_WIRE_ID 8" in h and "((PCNetPlayerId)PC_NETGAME_HOST_WIRE_ID)" in h)
-    check("host wire id: peer table may not outgrow it (static assert)", "PC_NET_MAX_PEERS <= PC_NETGAME_HOST_WIRE_ID" in h)
-    check("host wire id value unchanged vs parent (8 == old PC_NET_MAX_PEERS)", "PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NET_MAX_PEERS)" in parent("pc/include/pc_net_game.h") and "#define PC_NET_MAX_PEERS   8" in read("pc/include/pc_net.h"))
+    check("host wire id: the transport reserves exactly it (static assert; superseded the Phase 1 'peer table may not outgrow it' assert by capacity phase 2)", "PC_NET_RESERVED_PEER_ID == PC_NETGAME_HOST_WIRE_ID" in h)
+    check("host wire id value unchanged vs parent (8 == the old PC_NET_MAX_PEERS)", "PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NET_MAX_PEERS)" in parent("pc/include/pc_net_game.h") and "#define PC_NET_MAX_PEERS   8" in parent("pc/include/pc_net.h") and "#define PC_NET_RESERVED_PEER_ID 8" in read("pc/include/pc_net.h"))
     ng = read("pc/src/pc_net_game.c")
-    check("peer_mask coupling asserted", "PC_NET_MAX_PEERS <= 16, \"PCNetGameNpcTalkHold.peer_mask is 16 bits" in ng)
+    check("talk-hold peer_mask: the 16-bit mask (Phase 1 asserted it) is a 256-bit PCPeerSet since capacity phase 2", "PCPeerSet peer_mask;" in ng and "PCNetGameNpcTalkHold.peer_mask is 16 bits" not in ng)
     check("puppet fx id coupling asserted", "PC_REMOTE_PLAYER_SLOT_COUNT <= 0x11" in rp)
 
     ded = read("pc/src/pc_dedicated.c")
     check("status: capacity + transport counters printed", "capacity: transport slots" in ded and "pc_net_get_stats(&ns)" in ded and "pc_net_game_dedicated_capacity(" in ded)
     check("status accessor declared and defined (HOST only)", "int  pc_net_game_dedicated_capacity(" in read("pc/include/pc_dedicated.h") and "int pc_net_game_dedicated_capacity(" in ng)
-    check("Phase 1 leaves admission untouched: max_guests default 4 / clamp 1..8 / reserve rule", ".max_guests = 4" in read("pc/src/pc_settings.c") and "occupied + reserve > PC_NET_MAX_PEERS" in ng)
+    check("Phase 1 leaves admission untouched: max_guests default 4 / clamp 1..8 / reserve rule", ".max_guests = 4" in read("pc/src/pc_settings.c") and "occupied + reserve > pc_net_peer_capacity()" in ng)
 
     bad = [n for n, ok in results if not ok]
     print("test_capacity_phase1: %d checks, %d failed" % (len(results), len(bad)))

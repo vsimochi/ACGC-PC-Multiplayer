@@ -291,7 +291,7 @@ def source_audit(rig):
        and "#define PC_NETGAME_TXN_REASON_NAME_TAKEN      30u" in ng and "(1000u + (uint32_t)mPlayer_DEBT0)" in ng and "#define mPlayer_DEBT0 17400" in open(os.path.join(T.PC, "..", "include", "m_player.h")).read()
        and (L.PC_NETGAME_TXN_KIND_HOUSE_PURCHASE, L.PC_NETGAME_TXN_REASON_NO_RESIDENCE, L.PC_NETGAME_TXN_REASON_INVALID_HOUSE, L.PC_NETGAME_TXN_REASON_NAME_TAKEN) == (14, 28, 29, 30)
        and ng.index("if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE) {") < ng.index("pcnetgame_handle_host_txn_commit(peer, &tc);"))
-    order = ["peer < 0 || peer >= PC_NET_MAX_PEERS", "pcnetgame_rec_gate(peer, 0, 0)", "if (idx < PLAYER_NUM) {", "s_guest_untrusted || s_members_untrusted", "shape_ok =", "pcnetgame_txn_nonce_fenced(",
+    order = ["peer < 0 || peer >= pcnetgame_peer_span()", "pcnetgame_rec_gate(peer, 0, 0)", "if (idx < PLAYER_NUM) {", "s_guest_untrusted || s_members_untrusted", "shape_ok =", "pcnetgame_txn_nonce_fenced(",
              "pcnetgame_rec_refresh_hostfields(idx, slot)", "STALE_IMAGE", "pcnetgame_rec_validate_inventory(", "PRICE_MISMATCH", "INVALID_HOUSE", "NO_FUNDS",
              "mir->inventory.wallet = wallet_post;", "pcnetgame_promote_exec(NULL, g,", "mir->inventory.wallet = wallet_pre;", "pcnetgame_txn_send_result(peer, idx, in, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED",
              "PC_NETGAME_MSG_RESIDENT_HANDOFF", "PC_NETGAME_REJECT_PROMOTED"]

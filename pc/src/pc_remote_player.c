@@ -93,10 +93,9 @@
 extern cKF_Skeleton_R_c cKF_bs_r_boy_1;
 extern cKF_Skeleton_R_c cKF_bs_r_grl_1;
 
-/* Stage 3: one extra slot past the real 0..PC_NET_MAX_PEERS-1 client-peer-id range, reserved for
- * the host itself (PC_NETGAME_HOST_PLAYER_ID == PC_NET_MAX_PEERS) -- see pc_net_game.h's doc on
- * PCNetPlayerId for why the host needs a slot here despite having no PCNetPeerId of its own. */
-#define PC_REMOTE_PLAYER_SLOT_COUNT (PC_NET_MAX_PEERS + 1)
+/* The puppet table has PC_REMOTE_PLAYER_SLOT_COUNT slots (pc_remote_player.h): player ids 0..7 and the host's wire id. It is deliberately NOT tied to the transport's peer
+ * capacity: a host may now accept more peers than this table can show, and every entry point rejects an id past it (pc_remote_player_get_slot), so such players are connected
+ * and simulated by the host but not drawn on a client until the puppet table becomes dynamic. */
 
 /* Stage 3 tuning constants (named so they're easy to find and retune later). */
 #define PC_REMOTE_PLAYER_SNAPSHOT_COUNT 4        /* ring size per peer; 2 is the true minimum for
@@ -2580,7 +2579,7 @@ static void pc_remote_player_collide_update(PCRemotePlayerActor* self, PCRemoteP
 #define PC_PUPPET_FOOT_COOLDOWN_FRAMES 8.0  /* min spacing between two foot triggers of one puppet (WALK/IDLE flicker) */
 #define PC_PUPPET_EDGE_COOLDOWN_FRAMES 30.0 /* min spacing between two identical one-shot edges (skid in/out, tumble) */
 #define PC_PUPPET_FX_ITEM_NAME_BASE 0xFFE0u /* + slot: per-puppet effect item_name (the local player uses RSV_NO 0xFFFF) */
-_Static_assert(PC_REMOTE_PLAYER_SLOT_COUNT <= 0x11, "PC_PUPPET_FX_ITEM_NAME_BASE + slot must stay below the PC_TID_* ids (0xFFF1..): remap the puppet effect ids before raising PC_NET_MAX_PEERS");
+_Static_assert(PC_REMOTE_PLAYER_SLOT_COUNT <= 0x11, "PC_PUPPET_FX_ITEM_NAME_BASE + slot must stay below the PC_TID_* ids (0xFFF1..): remap the puppet effect ids before growing the puppet table");
 #define PC_PUPPET_FOOT_STALE_FRAMES 3       /* captured foot data older than this (game frames) is replaced by the fallback */
 #define PC_PUPPET_FOOT_FALLBACK_OFFSET 7.0f /* lateral offset (world units) of the fallback foot positions */
 #define PC_PUPPET_FX_DIAG_MAX_OK 40         /* diag lines per puppet actor and (cosmetic name) when it was spawned */

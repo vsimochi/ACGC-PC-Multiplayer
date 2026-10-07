@@ -337,6 +337,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_assets.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_disc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_peer_table.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_remote_player.c

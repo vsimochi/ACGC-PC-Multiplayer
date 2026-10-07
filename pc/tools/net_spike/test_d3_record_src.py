@@ -146,9 +146,9 @@ def main():
           and "pc_save_bswap_private(&s_rec_scratch_b, PC_BSWAP_FROM_BE)" in blk and "pc_save_bswap_private(&s_mail_scratch, PC_BSWAP_TO_BE)" in blk
           and "static Private_c s_mail_scratch;" in blk and "memset(&s_mail_scratch, 0, sizeof(s_mail_scratch));" in blk
           and "pc_save_bswap_private(&Save_Get" not in c)
-    check("I the rx/tx images are static per-peer buffers; no malloc/calloc/realloc/free anywhere in the record path",
-          "static uint8_t s_host_rec_rx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE];" in c_raw
-          and "static uint8_t s_host_rec_tx[PC_NET_MAX_PEERS][PC_NETGAME_REC_SIZE];" in c_raw
+    check("I the rx/tx images are per-peer buffers (runtime-sized tables, allocated by pcnetgame_peer_tables_resize outside the record path); no malloc/calloc/realloc/free anywhere in the record path",
+          "PCNG_PEER_TABLE2(uint8_t, s_host_rec_rx, PC_NETGAME_REC_SIZE)" in c_raw
+          and "PCNG_PEER_TABLE2(uint8_t, s_host_rec_tx, PC_NETGAME_REC_SIZE)" in c_raw
           and not re.search(r"\b(?:malloc|calloc|realloc|free|alloca)\s*\(", blk))
     g0 = blk.index("static PCMpRecFile s_rec_file;")
     g1 = blk.index("static int pcnetgame_rec_send_ack(")

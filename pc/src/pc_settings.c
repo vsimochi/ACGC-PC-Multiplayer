@@ -1,5 +1,6 @@
 /* pc_settings.c - runtime settings loaded from settings.ini */
 #include "pc_settings.h"
+#include "pc_net.h" /* PC_NET_RESERVED_PEER_ID, pc_peer_capacity_max (the max_peers range) */
 #include "pc_platform.h"
 #include "m_player_lib.h"
 #include "ac_birth_control.h"
@@ -21,6 +22,7 @@ PCSettings g_pc_settings = {
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
     .max_guests = 4,
+    .max_peers = 8,
     .allow_new_guests = 1,
     .resident_tokens = 0,
     .show_ping = 0,
@@ -29,6 +31,7 @@ PCSettings g_pc_settings = {
 };
 
 int g_pc_max_guests_override = 0;
+int g_pc_max_peers_override = 0;
 int g_pc_town_serve_override = -1;
 int g_pc_personal_sync_override = -1;
 int g_pc_allow_new_guests_override = -1;
@@ -89,6 +92,9 @@ static const char* DEFAULT_SETTINGS =
     "[Network]\n"
     "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n"
     "max_guests = 4\n"
+    "\n"
+    "# Host only: most simultaneous network peers (residents + guests + visitors still connecting) the transport accepts (1-254, default 8). Memory grows with it (about 130 KB per peer that has connected).\n"
+    "max_peers = 8\n"
     "\n"
     "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n"
     "allow_new_guests = 1\n"
@@ -156,6 +162,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val >= 0 && val <= 40) g_pc_settings.cstick_deadzone = val;
     } else if (strcmp(key, "max_guests") == 0) {
         if (val >= 1 && val <= 8) g_pc_settings.max_guests = val;
+    } else if (strcmp(key, "max_peers") == 0) {
+        if (val >= 1 && val <= pc_peer_capacity_max(PC_NET_RESERVED_PEER_ID)) g_pc_settings.max_peers = val;
     } else if (strcmp(key, "allow_new_guests") == 0) {
         if (val == 0 || val == 1) g_pc_settings.allow_new_guests = val;
     } else if (strcmp(key, "resident_tokens") == 0) {
@@ -268,6 +276,9 @@ void pc_settings_save(void) {
     fprintf(f, "[Network]\n");
     fprintf(f, "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n");
     fprintf(f, "max_guests = %d\n", g_pc_settings.max_guests);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: most simultaneous network peers (residents + guests + visitors still connecting) the transport accepts (1-254, default 8). Memory grows with it (about 130 KB per peer that has connected).\n");
+    fprintf(f, "max_peers = %d\n", g_pc_settings.max_peers);
     fprintf(f, "\n");
     fprintf(f, "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n");
     fprintf(f, "allow_new_guests = %d\n", g_pc_settings.allow_new_guests);
