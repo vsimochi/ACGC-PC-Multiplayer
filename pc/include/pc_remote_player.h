@@ -30,13 +30,16 @@
 
 #include "pc_net.h"
 #include "pc_net_game.h"
+#include "pc_puppet_pool.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Puppet slots: one per player id 0..7 plus the host's wire id. Independent of the transport's peer capacity (see pc_remote_player.c): ids past it are ignored. */
-#define PC_REMOTE_PLAYER_SLOT_COUNT ((int)PC_NETGAME_HOST_WIRE_ID + 1)
+/* Puppet slots are allocated on demand for any usable wire id 0..254 (pc_puppet_pool.h); the id of a slot is its wire id, the host's own id 8 included (on a client it names the host).
+ * PC_REMOTE_PLAYER_ID_LIMIT is the exclusive upper bound of a loop over player ids (0xFF is "nobody"). Readers never allocate. */
+#define PC_REMOTE_PLAYER_ID_LIMIT 255
+_Static_assert(PC_REMOTE_PLAYER_ID_LIMIT == PC_NETGAME_WIRE_ID_SPACE - 1, "puppet ids are every wire id but 0xFF");
 
 /* Called by pc_net_game.c the instant a peer's handshake reaches READY. `player_id` is a
  * PCNetPlayerId (see pc_net_game.h) -- host: that client's real PCNetPeerId; client:
@@ -52,6 +55,22 @@ void pc_remote_player_on_ready(PCNetPlayerId player_id, const PCNetGameIdentity*
  * call for a player_id with no tracked actor (e.g. it disconnected before ever reaching READY, or
  * was never tracked in the first place). */
 void pc_remote_player_on_disconnect(PCNetPlayerId player_id);
+
+/* Capacity phase 6: forget a player completely (puppet, slot, appearance, scene): used when the host says a relayed peer left. Same as a disconnect. */
+void pc_remote_player_forget(PCNetPlayerId player_id);
+
+/* Capacity phase 6: observable resource use (diagnostics, the dedicated status line). */
+typedef struct PCRemotePlayerStats {
+    int      slots_used, slots_peak, slot_alloc_failures; /* the slot pool (state memory) */
+    int      tracked, actors_live, pending_create;        /* slots in use / with a live actor / still waiting for one */
+    int      actors_blocked_now;                          /* puppets that could not get an actor this poll (actor headroom) */
+    unsigned actors_blocked_total, actor_create_failed;   /* polls blocked by the headroom rule / pc_actor_make_from_profile() failures */
+    int      actor_total_peak, actor_max;                 /* highest scene actor count seen / the scene actor pool size (mAc_MAX_ACTORS) */
+    int      collide_armed;                               /* puppets whose collider is registered right now */
+    int      collider_peak, collider_table;               /* highest shared OC table use seen / its size (Cl_COLLIDER_NUM) */
+    int      failed_setoc;                                /* puppet colliders refused by a full table */
+} PCRemotePlayerStats;
+void pc_remote_player_get_stats(PCRemotePlayerStats* out);
 
 /* Stage 3: called by pc_net_game.c for every accepted movement sample -- both a directly-tracked
  * player (host: a specific client; client: the host) and, on a client, any OTHER network player

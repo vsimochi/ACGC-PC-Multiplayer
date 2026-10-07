@@ -239,7 +239,7 @@ def main():
           "mPr_CopyPersonalID(out, &s_host_peer[peer].bound_pid)" in bp and "Save_Get" not in bp
           and "pcnetgame_peer_rec_slot(peer)" in bp and "!st->bound_valid" in slot_fn and "Save_Get" not in slot_fn)
     check("S6 bound_pid is set with bound_valid/bound_resident_idx in process_identity",
-          0 < pi.find("bound_valid = 1") < pi.find("mPr_CopyPersonalID(&s_host_peer[peer].bound_pid") < pi.find("pcnetgame_host_send_full_roster"))
+          0 < pi.find("bound_valid = 1") < pi.find("mPr_CopyPersonalID(&s_host_peer[peer].bound_pid") < pi.find("pc_roster_join(&s_roster_app"))
     fr = func_body(src, "pcnetgame_handle_host_friendship_request")
     check("S6 world-ready gate precedes the bound-PersonalID use / mutation in the friendship and mail handlers",
           0 < func_body(src, "pcnetgame_handle_host_friendship_request").find("!s_host_world_ready")

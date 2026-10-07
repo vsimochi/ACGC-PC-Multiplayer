@@ -78,7 +78,7 @@ int main(void) {
     check("host wire id value unchanged vs parent (8 == the old PC_NET_MAX_PEERS)", "PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NET_MAX_PEERS)" in parent("pc/include/pc_net_game.h") and "#define PC_NET_MAX_PEERS   8" in parent("pc/include/pc_net.h") and "#define PC_NET_RESERVED_PEER_ID 8" in read("pc/include/pc_net.h"))
     ng = read("pc/src/pc_net_game.c")
     check("talk-hold peer_mask: the 16-bit mask (Phase 1 asserted it) is a 256-bit PCPeerSet since capacity phase 2", "PCPeerSet peer_mask;" in ng and "PCNetGameNpcTalkHold.peer_mask is 16 bits" not in ng)
-    check("puppet fx id coupling asserted", "PC_REMOTE_PLAYER_SLOT_COUNT <= 0x11" in rp)
+    check("puppet fx id range asserted (capacity phase 6: base 0xFEE0 + any wire id stays below the PC_TID ids)", "PC_PUPPET_FX_ITEM_NAME_BASE + (PC_PUPPET_ID_LIMIT - 1) < 0xFFF1u" in rp)
 
     ded = read("pc/src/pc_dedicated.c")
     check("status: capacity + transport counters printed", "capacity: transport slots" in ded and "pc_net_get_stats(&ns)" in ded and "pc_net_game_dedicated_capacity(" in ded)

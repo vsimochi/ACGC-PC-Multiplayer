@@ -132,8 +132,7 @@ def main():
     check("the transport reserve and the capacity shown by the status line use the runtime capacity", "*peers_total = pc_net_peer_capacity();" in ng)
 
     rp, rph = read("pc/src/pc_remote_player.c"), read("pc/include/pc_remote_player.h")
-    check("puppet table is a fixed 9 slots (ids 0..7 + the host), independent of the transport capacity; every id past it is rejected", "#define PC_REMOTE_PLAYER_SLOT_COUNT ((int)PC_NETGAME_HOST_WIRE_ID + 1)" in rph and
-          "player_id >= PC_REMOTE_PLAYER_SLOT_COUNT" in rp)
+    check("puppet slots: the fixed 9-slot table of phase 2 is a dynamic pool since capacity phase 6 (see test_capacity_phase567.py)", "PC_REMOTE_PLAYER_ID_LIMIT 255" in rph and "pc_puppet_pool_acquire" in rp)
     check("host wire id still 8 and equals the transport's reserved id (static assert)", "#define PC_NETGAME_HOST_WIRE_ID 8" in read("pc/include/pc_net_game.h") and "PC_NET_RESERVED_PEER_ID == PC_NETGAME_HOST_WIRE_ID" in read("pc/include/pc_net_game.h"))
 
     nc = read("pc/src/pc_net.c")

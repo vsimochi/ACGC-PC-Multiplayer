@@ -81,6 +81,7 @@
                      * pc_remote_player_mv(). Already #include'd elsewhere in pc/ (e.g.
                      * pc_nes_fixnes.c) and compiles cleanly in the PC build. */
 
+#include "pc_puppet_pool.h" /* capacity phase 6: the slot pool */
 #include <math.h> /* sqrtf() -- see the Stage 4B animation-speed formula in pc_remote_player_mv() */
 #include <string.h>
 #include <stdio.h>
@@ -93,9 +94,11 @@
 extern cKF_Skeleton_R_c cKF_bs_r_boy_1;
 extern cKF_Skeleton_R_c cKF_bs_r_grl_1;
 
-/* The puppet table has PC_REMOTE_PLAYER_SLOT_COUNT slots (pc_remote_player.h): player ids 0..7 and the host's wire id. It is deliberately NOT tied to the transport's peer
- * capacity: a host may now accept more peers than this table can show, and every entry point rejects an id past it (pc_remote_player_get_slot), so such players are connected
- * and simulated by the host but not drawn on a client until the puppet table becomes dynamic. */
+/* Capacity phase 6: the puppet slots are a POOL (pc_puppet_pool.h): a slot is allocated on demand for any usable wire id 0..254 (the host's id 8 included: on a client it names the
+ * host), kept while the player is tracked and freed on departure. Before this the table had exactly 9 slots (ids 0..7 + 8) and every id from 9 up was rejected at the door
+ * (pc_remote_player_get_slot returned NULL): the 9th guest (wire id 9) was connected, simulated by the host and able to see everybody, but NO other process could create its puppet.
+ * Three resources are kept apart: the slot STATE (this pool: memory only), the puppet ACTOR (the scene's actor pool, mAc_MAX_ACTORS = 200 shared with everything else: see
+ * pc_remote_player_poll), and the OC collider table (Cl_COLLIDER_NUM = 50, only puppets within PC_REMOTE_PLAYER_COLLIDE_RANGE register). */
 
 /* Stage 3 tuning constants (named so they're easy to find and retune later). */
 #define PC_REMOTE_PLAYER_SNAPSHOT_COUNT 4        /* ring size per peer; 2 is the true minimum for
@@ -334,7 +337,7 @@ typedef struct PCRemotePlayerOffset {
 
 /* Small fixed per-peer spawn offsets (world units, relative to the local player), used only as
  * the actor's initial spawn position before any real movement data has arrived (see
- * pc_remote_player_mv()) -- not a layout with any other meaning. Sized/indexed like s_slots. */
+ * pc_remote_player_mv()) -- not a layout with any other meaning. A wire id past the table (or any id) uses pc_remote_spawn_offset()'s ring pattern. */
 static const PCRemotePlayerOffset s_offset_table[] = {
     { 60.0f, 0.0f },   { -60.0f, 0.0f },  { 0.0f, 60.0f },   { 0.0f, -60.0f },
     { 60.0f, 60.0f },  { -60.0f, 60.0f }, { 60.0f, -60.0f }, { -60.0f, -60.0f },
@@ -443,7 +446,7 @@ typedef struct PCRemotePlayerResolvedAppearance {
  * checkOkAddress()/JKR_ISALIGNED32() (src/static/JSystem/JKernel/JKRAram.cpp,
  * src/static/JSystem/JKernel/JKRAramPiece.cpp) require of any address passed through
  * _JW_GetResourceAram(). This is a per-member check because a struct instance's own base address
- * (s_slots[], a static array -- see below) is not otherwise known to be 32-byte aligned by any
+ * (a pool slot, see pc_puppet_pool.c: allocated 32-byte aligned) is not otherwise known to be 32-byte aligned by any
  * other guarantee in this file. */
 _Static_assert(offsetof(PCRemotePlayerResolvedAppearance, face_tex) % 32 == 0,
               "PCRemotePlayerResolvedAppearance.face_tex is not 32-byte aligned -- ARAM DMA requires it");
@@ -466,6 +469,7 @@ typedef struct PCRemotePickupEvent {
 } PCRemotePickupEvent;
 
 typedef struct PCRemotePlayerSlot {
+    int                peer_id;            /* capacity phase 6: this slot's wire id (0..254) */
     int                in_use;             /* tracked at all (pending creation, or actor already live) */
     int                pending_create;     /* READY/discovered but actor creation hasn't succeeded yet */
     int                lazily_discovered;  /* 1 if learned about purely via a relayed movement sample
@@ -512,7 +516,12 @@ typedef struct PCRemotePlayerSlot {
 static int s_collide_peak_colliders = 0; /* highest play->collision_check.collider_num seen at poll time */
 static int s_collide_failed_setoc = 0;   /* CollisionCheck_setOC() returned -1 for a puppet */
 
-static PCRemotePlayerSlot s_slots[PC_REMOTE_PLAYER_SLOT_COUNT];
+static PCPuppetPool s_pool;
+static int          s_pool_ready = 0;
+static int          s_actor_blocked = 0;       /* puppets waiting for actor headroom this poll */
+static unsigned     s_actor_blocked_total = 0; /* polls that left a puppet without an actor for lack of headroom */
+static unsigned     s_actor_create_failed = 0; /* pc_actor_make_from_profile() returned NULL */
+static int          s_actor_peak_total = 0;    /* highest play->actor_info.total_num seen */
 
 static void pc_remote_player_dt(ACTOR* actor, GAME* game); /* review H1: kills the puppet's own pitfall sweat */
 
@@ -549,11 +558,41 @@ static uint32_t s_last_seen_frame_counter = 0;
 static void pc_remote_player_mv(ACTOR* actor, GAME* game);
 static void pc_remote_player_dw(ACTOR* actor, GAME* game);
 
-static PCRemotePlayerSlot* pc_remote_player_get_slot(PCNetPlayerId player_id) {
-    if (player_id < 0 || player_id >= PC_REMOTE_PLAYER_SLOT_COUNT) {
+/* The actor name of the puppet of wire id `id`: the historical 0xF000 | id for the first slots (unchanged), 0xFA00 | id above them (0xF0F3.. are DUMMY_HOUSE names). Never a real item name
+ * the actor code looks up (type PAD15 only needs to stay >= NAME_TYPE_PAD15, see m_actor.c). */
+static mActor_name_t pc_remote_player_actor_name(int id) {
+    return (mActor_name_t)(id <= (int)PC_NETGAME_HOST_WIRE_ID ? ((NAME_TYPE_PAD15 << 12) | (id & 0xFF)) : (0xFA00u | ((unsigned)id & 0xFFu)));
+}
+
+static void pc_remote_player_pool_ensure(void) {
+    if (!s_pool_ready) {
+        pc_puppet_pool_init(&s_pool, sizeof(PCRemotePlayerSlot));
+        s_pool_ready = 1;
+    }
+}
+
+/* The slot of a tracked / known player, or NULL: NEVER allocates (every reader uses this). Any wire id outside 0..254 (0xFF, negative, huge) has no slot. */
+static PCRemotePlayerSlot* pc_remote_player_find_slot(PCNetPlayerId player_id) {
+    if (!s_pool_ready || player_id < 0 || player_id >= PC_PUPPET_ID_LIMIT) {
         return NULL;
     }
-    return &s_slots[player_id];
+    return (PCRemotePlayerSlot*)pc_puppet_pool_find(&s_pool, (int)player_id);
+}
+
+/* The slot of a player the caller learned about (READY / a relayed MOVE / an appearance / a scene), created zeroed on first use. NULL = invalid id or out of memory (counted in
+ * the pool; the player is then simply not representable on this process, every caller treats NULL as "ignore"). */
+static PCRemotePlayerSlot* pc_remote_player_acquire_slot(PCNetPlayerId player_id) {
+    PCRemotePlayerSlot* slot;
+    pc_remote_player_pool_ensure();
+    if (player_id < 0 || player_id >= PC_PUPPET_ID_LIMIT) {
+        s_pool.alloc_failures++;
+        return NULL;
+    }
+    slot = (PCRemotePlayerSlot*)pc_puppet_pool_acquire(&s_pool, (int)player_id);
+    if (slot != NULL) {
+        slot->peer_id = (int)player_id;
+    }
+    return slot;
 }
 
 /* The result of interpolating (or falling back on) a peer's snapshot buffer, ready to apply
@@ -1858,7 +1897,7 @@ static int pc_remote_player_door_point(const ACTOR* a, int exit_row, float* out_
  * town or nothing is near. *out_best is the nearest building of that class within the radius, or NULL. Reads only. */
 static int pc_remote_player_door_pick(PCRemotePlayerActor* self, int exit_row, ACTOR** out_best) {
     GAME_PLAY* play = (GAME_PLAY*)gamePT;
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
     ACTOR* a;
     ACTOR* best = NULL;
     int best_cls = PC_DOOR_UNKNOWN;
@@ -1902,7 +1941,7 @@ static int pc_remote_player_door_pick(PCRemotePlayerActor* self, int exit_row, A
  * local exit is in progress. Called once per row instance. */
 static void pc_remote_player_cosmetic_door(PCRemotePlayerActor* self, int exit_row, int cls, ACTOR* best) {
     GAME_PLAY* play = (GAME_PLAY*)gamePT;
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
     STRUCTURE_CONTROL_ACTOR* ctrl;
 
     if (cls != PC_DOOR_HINGED || best == NULL) {
@@ -2242,7 +2281,7 @@ static void pc_remote_player_row_post(PCRemotePlayerActor* self, int play_state,
                 /* the body is inside the building: never left standing outside the door. Not once the owner's announced scene is already
                  * an interior (shared-interior presence): the scene gate in dw decides there, and the flag would keep a puppet that
                  * legitimately shares the local player's interior invisible until the (already consumed) scene clear. */
-                const PCRemotePlayerSlot* hs = pc_remote_player_get_slot(self->peer);
+                const PCRemotePlayerSlot* hs = pc_remote_player_find_slot(self->peer);
 
                 if (hs == NULL || !hs->scene.valid || hs->scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD) {
                     v->hidden_door = 1;
@@ -2578,8 +2617,10 @@ static void pc_remote_player_collide_update(PCRemotePlayerActor* self, PCRemoteP
 #define PC_PUPPET_FX_REFILL_PER_FRAME (10.0f / 60.0f) /* per-puppet sustained cap: 10 top-level effects per second */
 #define PC_PUPPET_FOOT_COOLDOWN_FRAMES 8.0  /* min spacing between two foot triggers of one puppet (WALK/IDLE flicker) */
 #define PC_PUPPET_EDGE_COOLDOWN_FRAMES 30.0 /* min spacing between two identical one-shot edges (skid in/out, tumble) */
-#define PC_PUPPET_FX_ITEM_NAME_BASE 0xFFE0u /* + slot: per-puppet effect item_name (the local player uses RSV_NO 0xFFFF) */
-_Static_assert(PC_REMOTE_PLAYER_SLOT_COUNT <= 0x11, "PC_PUPPET_FX_ITEM_NAME_BASE + slot must stay below the PC_TID_* ids (0xFFF1..): remap the puppet effect ids before growing the puppet table");
+#define PC_PUPPET_FX_ITEM_NAME_BASE 0xFEE0u /* + wire id: per-puppet effect item_name (the local player uses RSV_NO 0xFFFF). 0xFEC3..0xFFDF is unused by m_name_table.h (its highest item name
+                                              * below RSV_WALL_NO is 0xFEC2); the old base 0xFFE0 left room for 17 ids only, so it could not outgrow the 9-slot table. */
+_Static_assert(PC_PUPPET_FX_ITEM_NAME_BASE + (PC_PUPPET_ID_LIMIT - 1) < 0xFFF1u, "PC_PUPPET_FX_ITEM_NAME_BASE + wire id must stay below the PC_TID_* ids (0xFFF1..)");
+_Static_assert(PC_PUPPET_FX_ITEM_NAME_BASE > 0xFEC2u, "the puppet effect item names must not overlap a real item name (m_name_table.h ends at 0xFEC2 below RSV_WALL_NO)");
 #define PC_PUPPET_FOOT_STALE_FRAMES 3       /* captured foot data older than this (game frames) is replaced by the fallback */
 #define PC_PUPPET_FOOT_FALLBACK_OFFSET 7.0f /* lateral offset (world units) of the fallback foot positions */
 #define PC_PUPPET_FX_DIAG_MAX_OK 40         /* diag lines per puppet actor and (cosmetic name) when it was spawned */
@@ -3557,7 +3598,7 @@ static void pc_remote_player_draw_pickup_item(PCRemotePlayerActor* self, GAME* g
     if (c->hand_frame != game->frame_counter + 1u) {
         return; /* no fresh hand this frame (hidden body etc.) */
     }
-    slot = pc_remote_player_get_slot(self->peer);
+    slot = pc_remote_player_find_slot(self->peer);
     if (slot == NULL || pc_pk_gate(self, slot, game) != NULL ||
         mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELD_FG) { /* vanilla: single_draw_proc only in FG scenes */
         return;
@@ -4584,7 +4625,7 @@ static int pc_remote_player_scene_snap_resolve(PCRemotePlayerSlot* slot, double 
 
 static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
     PCRemotePlayerRenderState render;
     double target_time;
     int just_placed = 0; /* building interactions: this frame resolved a pending scene event (see pc_remote_player_scene_snap_resolve) */
@@ -4898,7 +4939,7 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
 static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
     GRAPH* graph = game->graph;
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(self->peer);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
     const PCRemotePlayerResolvedAppearance* appearance;
     Mtx* mtx;
     u8* eye_tex_p;
@@ -5020,9 +5061,9 @@ static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot, int keep_sce
         return;
     }
     if (slot->collide_armed) { /* M9-B: the puppet (and so its collider) is going away */
-        printf("[NET][COLLIDE] player %d: collider DISARMED reason=gone\n", (int)(slot - s_slots));
+        printf("[NET][COLLIDE] player %d: collider DISARMED reason=gone\n", slot->peer_id);
     }
-    pc_puppet_fx_dump_stats(slot, (int)(slot - s_slots));
+    pc_puppet_fx_dump_stats(slot, slot->peer_id);
     memset(&slot->cos_stats, 0, sizeof(slot->cos_stats));
     memset(slot->pk_ev, 0, sizeof(slot->pk_ev)); /* M9-C Phase 5: queued pickup events die with the player */
     slot->collide_armed = 0;
@@ -5057,7 +5098,7 @@ static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot, int keep_sce
 }
 
 void pc_remote_player_on_ready(PCNetPlayerId player_id, const PCNetGameIdentity* identity) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
 
     if (slot == NULL) {
         return;
@@ -5085,7 +5126,7 @@ void pc_remote_player_on_ready(PCNetPlayerId player_id, const PCNetGameIdentity*
 }
 
 void pc_remote_player_on_disconnect(PCNetPlayerId player_id) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     if (slot == NULL) {
         return;
     }
@@ -5093,10 +5134,16 @@ void pc_remote_player_on_disconnect(PCNetPlayerId player_id) {
         printf("[NET][REMOTE] player %d disconnected -- destroying remote-player actor\n", (int)player_id);
     }
     pc_remote_player_destroy_slot(slot, 0);
+    pc_puppet_pool_release(&s_pool, (int)player_id); /* capacity phase 6: the slot (its appearance, scene and snapshot ring) is gone: a reused id starts from nothing */
+}
+
+/* A relayed player the host says is gone (CLEARED notice) or whose id this client can no longer trust: everything about it is dropped, like a disconnect. */
+void pc_remote_player_forget(PCNetPlayerId player_id) {
+    pc_remote_player_on_disconnect(player_id);
 }
 
 void pc_remote_player_on_move(PCNetPlayerId player_id, const PCNetMoveSample* sample) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
     PCRemoteMoveSnapshot* snap;
     double now;
 
@@ -5152,7 +5199,7 @@ void pc_remote_player_on_move(PCNetPlayerId player_id, const PCNetMoveSample* sa
 }
 
 int pc_remote_player_on_action(PCNetPlayerId player_id, int kind, int ut_x, int ut_z, uint16_t item, uint16_t seq) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     PCRemotePickupEvent* ev = NULL;
     double now;
     int i;
@@ -5191,7 +5238,7 @@ int pc_remote_player_on_action(PCNetPlayerId player_id, int kind, int ut_x, int 
 }
 
 void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAppearance* appearance) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
 
     if (slot == NULL || appearance == NULL) {
         return;
@@ -5228,7 +5275,7 @@ void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAp
 }
 
 int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearance* out) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
 
     if (slot == NULL || out == NULL || !slot->appearance.valid) {
         return 0;
@@ -5258,7 +5305,7 @@ int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearan
 
 /* M9-A: see pc_remote_player.h. Accepts only a scene whose seq is strictly newer than the stored one. */
 int pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* scene) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
 
     if (slot == NULL || scene == NULL || !scene->valid) {
         return 0;
@@ -5278,11 +5325,14 @@ int pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* s
 }
 
 void pc_remote_player_clear_scene(PCNetPlayerId player_id) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     if (slot != NULL) {
         memset(&slot->scene, 0, sizeof(slot->scene));
         slot->prev_scene_id = 0;
         slot->latch_clear_req = 1; /* M9-C v7: see pc_remote_player_on_scene() */
+        if (!slot->in_use && !slot->appearance.valid && slot->actor == NULL) {
+            pc_puppet_pool_release(&s_pool, (int)player_id); /* capacity phase 6: an empty slot is not kept */
+        }
     }
 }
 
@@ -5290,8 +5340,8 @@ void pc_remote_player_clear_scene(PCNetPlayerId player_id) {
 int pc_remote_player_collide_test_target(float* out_x, float* out_y, float* out_z) {
     int i;
 
-    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
-        PCRemotePlayerSlot* slot = &s_slots[i];
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
         if (slot->in_use && slot->collide_target_ok && pc_remote_player_actor_is_live(slot) &&
             (uint64_t)(uintptr_t)slot->actor < PC_LOWADDR_LIMIT) {
             *out_x = slot->actor->world.position.x;
@@ -5304,7 +5354,7 @@ int pc_remote_player_collide_test_target(float* out_x, float* out_y, float* out_
 }
 
 int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     if (slot == NULL || out == NULL || !slot->scene.valid) {
         return 0;
     }
@@ -5327,8 +5377,8 @@ int pc_remote_arrival_join_query(int* join_class, float* train_x) {
         return 1;
     }
     link = pc_net_game_client_link_state();
-    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
-        const PCRemotePlayerSlot* slot = &s_slots[i];
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        const PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
         const PCRemoteMoveSnapshot* newest;
         double since_move, since_scene;
         int cls;
@@ -5381,7 +5431,7 @@ int pc_remote_arrival_join_query(int* join_class, float* train_x) {
 }
 
 int pc_remote_player_puppet_state(PCNetPlayerId player_id) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     if (slot == NULL || !slot->in_use) {
         return 0;
     }
@@ -5395,7 +5445,7 @@ int pc_remote_player_puppet_state(PCNetPlayerId player_id) {
  * authorization check, not a render position, so the exact last-confirmed sample is the right
  * thing to validate against, not a smoothed guess. */
 int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     int newest;
 
     if (slot == NULL || out_x == NULL || out_y == NULL || out_z == NULL || slot->snapshot_count == 0) {
@@ -5415,7 +5465,7 @@ int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, fl
  * value) -- so a caller reading both back-to-back in one synchronous step always gets the position
  * and facing of the SAME accepted sample. */
 int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out_angle) {
-    PCRemotePlayerSlot* slot = pc_remote_player_get_slot(player_id);
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     int newest;
 
     if (slot == NULL || out_angle == NULL || slot->snapshot_count == 0) {
@@ -5472,8 +5522,8 @@ void pc_remote_player_poll(void) {
     /* M9-B diagnostic (read-only): peak size of the shared OC collider table, sampled once per poll. Poll runs
      * between game frames, so this is the final count of the last completed frame. Logged only on a new peak
      * and only while a remote player is tracked, so single-player logs stay quiet. */
-    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
-        if (s_slots[i].in_use) {
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        if (pc_remote_player_find_slot(i)->in_use) {
             int n = play->collision_check.collider_num;
             if (n > s_collide_peak_colliders) {
                 s_collide_peak_colliders = n;
@@ -5487,8 +5537,12 @@ void pc_remote_player_poll(void) {
 
     pc_remote_player_init_profile();
 
-    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
-        PCRemotePlayerSlot* slot = &s_slots[i];
+    s_actor_blocked = 0;
+    if (play->actor_info.total_num > s_actor_peak_total) {
+        s_actor_peak_total = play->actor_info.total_num;
+    }
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
         ACTOR* actor;
         PCRemotePlayerOffset ofs_v;
         f32 x, y, z;
@@ -5549,6 +5603,9 @@ void pc_remote_player_poll(void) {
             printf("[NET][REMOTE] player %d timed out (no movement data) -- destroying remote-player actor "
                    "(scene identity %s)\n", i, slot->scene.valid ? "preserved" : "none");
             pc_remote_player_destroy_slot(slot, 1); /* keep the scene: see destroy_slot's doc */
+            if (!slot->scene.valid && !slot->appearance.valid) {
+                pc_puppet_pool_release(&s_pool, i); /* capacity phase 6: nothing about it is worth keeping (a stray relayed sample of a player that already left) */
+            }
             continue;
         }
 
@@ -5589,6 +5646,14 @@ void pc_remote_player_poll(void) {
             continue;
         }
 
+        /* Capacity phase 6: the actor pool of the scene (mAc_MAX_ACTORS) is shared with villagers, items and effects: puppets only take what is left above a reserve, so a crowd
+         * can never starve the rest of the game. A puppet that does not fit stays pending (its slot, appearance and snapshots are kept, it is retried every poll) and counted. */
+        if (pc_puppet_actor_headroom((int)play->actor_info.total_num, mAc_MAX_ACTORS, PC_PUPPET_ACTOR_RESERVE) < 1) {
+            s_actor_blocked++;
+            s_actor_blocked_total++;
+            continue;
+        }
+
         ofs_v = pc_remote_spawn_offset(i);
         x = local->actor_class.world.position.x + ofs_v.x;
         y = local->actor_class.world.position.y;
@@ -5596,8 +5661,9 @@ void pc_remote_player_poll(void) {
 
         actor = pc_actor_make_from_profile(&play->actor_info, gamePT, &s_remote_player_profile,
                                            &s_remote_player_dlftbl, x, y, z, 0, 0, 0,
-                                           (mActor_name_t)((NAME_TYPE_PAD15 << 12) | (i & 0xFF)), 0);
+                                           pc_remote_player_actor_name(i), 0);
         if (actor == NULL) {
+            s_actor_create_failed++;
             continue; /* still pending; retried again next frame */
         }
 
@@ -5628,9 +5694,38 @@ void pc_remote_player_poll(void) {
     }
 }
 
+void pc_remote_player_get_stats(PCRemotePlayerStats* out) {
+    int i;
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->slots_used = s_pool.used;
+    out->slots_peak = s_pool.peak;
+    out->slot_alloc_failures = s_pool.alloc_failures;
+    for (i = pc_puppet_pool_next(&s_pool, 0); s_pool_ready && i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        const PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        if (slot->in_use) {
+            out->tracked++;
+            out->actors_live += (slot->actor != NULL) ? 1 : 0;
+            out->pending_create += slot->pending_create ? 1 : 0;
+            out->collide_armed += slot->collide_armed ? 1 : 0;
+        }
+    }
+    out->actors_blocked_now = s_actor_blocked;
+    out->actors_blocked_total = s_actor_blocked_total;
+    out->actor_create_failed = s_actor_create_failed;
+    out->actor_total_peak = s_actor_peak_total;
+    out->actor_max = mAc_MAX_ACTORS;
+    out->collider_peak = s_collide_peak_colliders;
+    out->collider_table = Cl_COLLIDER_NUM;
+    out->failed_setoc = s_collide_failed_setoc;
+}
+
 void pc_remote_player_shutdown(void) {
     int i;
-    for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
-        pc_remote_player_destroy_slot(&s_slots[i], 0);
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        pc_remote_player_destroy_slot(pc_remote_player_find_slot(i), 0);
     }
+    pc_puppet_pool_release_all(&s_pool); /* capacity phase 6: no slot, no appearance, no scene survives a shutdown / a host change */
 }

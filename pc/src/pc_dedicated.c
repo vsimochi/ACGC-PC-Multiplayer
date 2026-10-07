@@ -650,6 +650,18 @@ static void pc_ded_cmd_status(void) {
         }
     }
     {
+        PCNetGameDedicatedScale sc;
+        if (pc_net_game_dedicated_scale(&sc)) {
+            pc_ded_printf("  interest (%s): MOVE relayed near/mid/far/apart = %u/%u/%u/%u, thinned = %u/%u/%u/%u\n", sc.interest_on ? "on" : "OFF: every sample to everyone", sc.move_relayed[0], sc.move_relayed[1],
+                   sc.move_relayed[2], sc.move_relayed[3], sc.move_thinned[0], sc.move_thinned[1], sc.move_thinned[2], sc.move_thinned[3]);
+            pc_ded_printf("  roster: owed=%d sent=%u departures=%u blocked(window full)=%u awaiting-data=%u | reliable backlog now(max)=%d peak=%d of %d\n", sc.roster_owed, sc.roster_sent, sc.roster_gone_sent,
+                   sc.roster_blocked, sc.roster_unavail, sc.backlog_now_max, sc.max_backlog, PC_NET_RELIABLE_WINDOW);
+            pc_ded_printf("  puppets: slots %d (peak %d, alloc failures %d), tracked %d, actors %d, waiting for an actor %d (blocked by actor headroom %d, create failures %u); scene actors peak %d of %d\n", sc.puppet_slots,
+                   sc.puppet_slots_peak, sc.puppet_slot_failures, sc.puppets_tracked, sc.puppet_actors, sc.puppet_actors_pending, sc.puppet_actors_blocked, sc.puppet_actor_create_failed, sc.actor_peak, sc.actor_max);
+            pc_ded_printf("  collision: puppet colliders armed %d, shared collider table peak %d of %d, refused (table full) %d\n", sc.collide_armed, sc.collider_peak, sc.collider_table, sc.failed_setoc);
+        }
+    }
+    {
         int pu = 0, pt = 0, rr = 0;
         PCNetStats ns;
         if (pc_net_game_dedicated_capacity(&pu, &pt, &rr)) {

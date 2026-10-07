@@ -25,6 +25,7 @@ PCSettings g_pc_settings = {
     .max_guests = 4,
     .max_peers = 8,
     .guest_memory_mb = 256,
+    .interest_management = 1,
     .allow_new_guests = 1,
     .resident_tokens = 0,
     .show_ping = 0,
@@ -92,7 +93,7 @@ static const char* DEFAULT_SETTINGS =
     "cstick_deadzone = 12\n"
     "\n"
     "[Network]\n"
-    "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n"
+    "# Host only: most guests (visitors with their own character, never residents) connected at once (1-254, default 4; a guest also needs a network peer, see max_peers)\n"
     "max_guests = 4\n"
     "\n"
     "# Host only: most simultaneous network peers (residents + guests + visitors still connecting) the transport accepts (1-254, default 8). Memory grows with it (about 130 KB per peer that has connected).\n"
@@ -100,6 +101,9 @@ static const char* DEFAULT_SETTINGS =
     "\n"
     "# Host only: memory budget of the guest store in MB (1-1048576, default 256, about 28 KB per stored guest). Guests are stored one file each and there is no fixed number of them; when the budget is used up the oldest unconfirmed idle guest is replaced and a new guest is refused only if there is none.\n"
     "guest_memory_mb = 256\n"
+    "\n"
+    "# Host only: 1 (default) = the host relays other players' movement at a lower rate to players who are far away or in another scene (never to zero), 0 = full rate to everyone\n"
+    "interest_management = 1\n"
     "\n"
     "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n"
     "allow_new_guests = 1\n"
@@ -167,6 +171,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val >= 0 && val <= 40) g_pc_settings.cstick_deadzone = val;
     } else if (strcmp(key, "max_guests") == 0) {
         { int mg; if (pc_guest_admit_parse(value, &mg)) g_pc_settings.max_guests = mg; } /* strict 1..254: malformed / out of range = ignored (default kept) */
+    } else if (strcmp(key, "interest_management") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.interest_management = val;
     } else if (strcmp(key, "guest_memory_mb") == 0) {
         if (val >= 1 && val <= 1048576) g_pc_settings.guest_memory_mb = val;
     } else if (strcmp(key, "max_peers") == 0) {
@@ -289,6 +295,7 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Host only: memory budget of the guest store in MB (1-1048576, default 256, about 28 KB per stored guest). Guests are stored one file each and there is no fixed number of them; when the budget is used up the oldest unconfirmed idle guest is replaced and a new guest is refused only if there is none.\n");
     fprintf(f, "guest_memory_mb = %d\n", g_pc_settings.guest_memory_mb);
+    fprintf(f, "interest_management = %d\n", g_pc_settings.interest_management);
     fprintf(f, "\n");
     fprintf(f, "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n");
     fprintf(f, "allow_new_guests = %d\n", g_pc_settings.allow_new_guests);

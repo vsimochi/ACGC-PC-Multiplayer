@@ -254,14 +254,14 @@ def main():
 
     # ------------------------------------------------------------------------------------------------ E
     G = "pc_host_observer_active()"
-    ck("E1 roster: the host's own APPEARANCE is skipped under the observer (backfill + periodic resend share the function); the peer loop is untouched",
-       re.search(r"if \(!pc_host_observer_active\(\)\) \{[^}]*pcnetgame_build_appearance_msg\(&amsg, \(uint8_t\)PC_NETGAME_HOST_PLAYER_ID\);[^}]*pc_net_send\(dest[^}]*\}\s*for \(i = 0; i < PC_NET_MAX_PEERS; i\+\+\) \{",
-                 nb("pcnetgame_host_send_full_roster"), re.S) is not None)
+    ck("E1 roster: the host's own APPEARANCE entry is skipped under the observer (capacity phase 5: the roster pump marks it delivered without sending; every peer entry is untouched)",
+       re.search(r"if \(pc_host_observer_active\(\)\) \{[^}]*pc_roster_pend_delivered\(&s_roster_app, dest, subject\);[^}]*continue;[^}]*\}\s*pcnetgame_build_appearance_msg\(&amsg, \(uint8_t\)PC_NETGAME_HOST_PLAYER_ID\);",
+                 nb("pcnetgame_roster_pump_dest"), re.S) is not None)
     ck("E2 local appearance-change broadcast: the HOST branch is gated (the cache still updates)",
        "} else if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) {" in net_raw.replace("\r", "") and "s_last_local_appearance = current;" in net)
     ck("E3 MOVE send: the HOST branch is gated", "} else if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) { /* --host-observer: no host MOVE stream */" in net_raw)
     ck("E4 PLAYER_SCENE: the join replay and the announce are both gated",
-       "if (s_local_scene.valid && !pc_host_observer_active())" in nb("pcnetgame_host_send_scene_roster") and
+       "s_local_scene.valid && s_local_scene_sent && !pc_host_observer_active()" in nb("pcnetgame_roster_pump_dest") and
        "if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active())" in nb("pcnetgame_scene_tick"))
     ck("E5 IDENTITY_ACK: under the observer accepted = 1 | HOST_NO_AVATAR, the identity is NOT captured (zero name / id), logged per peer; plain host: capture_local_identity as before",
        "ack.accepted = (uint8_t)(1u | PC_NETGAME_ACK_FLAG_HOST_NO_AVATAR);" in net_raw and "#define PC_NETGAME_ACK_FLAG_HOST_NO_AVATAR 0x02u" in net_raw

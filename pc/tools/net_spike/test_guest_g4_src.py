@@ -120,8 +120,8 @@ def main():
 
     # ------------------------------------------------------------------ I
     rp = S.read("pc/src/pc_remote_player.c")
-    ck("I puppets: slots are indexed by the player id (0..7 + the host's wire id, PC_REMOTE_PLAYER_SLOT_COUNT in pc_remote_player.h), pc_remote_player.c never mentions player_no", "#define PC_REMOTE_PLAYER_SLOT_COUNT ((int)PC_NETGAME_HOST_WIRE_ID + 1)" in S.read("pc/include/pc_remote_player.h")
-       and "player_no" not in rp and "static PCRemotePlayerSlot s_slots[PC_REMOTE_PLAYER_SLOT_COUNT];" in rp)
+    ck("I puppets: slots are allocated per wire id 0..254 on demand (the host's id included, PC_REMOTE_PLAYER_ID_LIMIT in pc_remote_player.h; capacity phase 6), pc_remote_player.c never mentions player_no", "#define PC_REMOTE_PLAYER_ID_LIMIT 255" in S.read("pc/include/pc_remote_player.h")
+       and "player_no" not in rp and "static PCPuppetPool s_pool;" in rp)
     ck("I the host creates the puppet of a READY peer keyed by that peer: pc_remote_player_on_ready(peer, ...) in process_identity, the identity from the peer's OWN IDENTITY message",
        "pc_remote_player_on_ready(peer, &remote_identity);" in pi and "memcpy(remote_identity.player_name, in.player_name" in pi)
     pr = nb("pcnetgame_peer_rec_slot")

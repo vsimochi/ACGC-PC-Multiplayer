@@ -88,6 +88,19 @@ typedef struct PCNetGameDedicatedGuestAdmission {
     int allow_new;    /* allow_new_guests */
 } PCNetGameDedicatedGuestAdmission;
 int  pc_net_game_dedicated_guest_admission(PCNetGameDedicatedGuestAdmission* out); /* capacity phase 4: 1 iff HOST */
+/* Capacity phases 5 + 6: how the host's scale machinery is doing (all counters since the host started). */
+typedef struct PCNetGameDedicatedScale {
+    int      interest_on;                                      /* settings.ini interest_management */
+    unsigned move_relayed[4], move_thinned[4];                 /* MOVE samples by the receiver's tier: NEAR / MID / FAR / APART */
+    unsigned roster_sent, roster_gone_sent, roster_blocked, roster_unavail;
+    int      roster_owed;                                      /* roster entries + departures still owed to READY peers */
+    int      max_backlog, backlog_now_max;                     /* reliable window use: highest ever / highest right now (of PC_NET_RELIABLE_WINDOW) */
+    int      puppet_slots, puppet_slots_peak, puppet_slot_failures;
+    int      puppets_tracked, puppet_actors, puppet_actors_pending, puppet_actors_blocked;
+    unsigned puppet_actor_create_failed;
+    int      actor_peak, actor_max, collide_armed, collider_peak, collider_table, failed_setoc;
+} PCNetGameDedicatedScale;
+int  pc_net_game_dedicated_scale(PCNetGameDedicatedScale* out); /* 1 iff HOST */
 int  pc_net_game_dedicated_guest_counts(int* bound, int* cap); /* G4: guests bound now / the max_guests cap; 1 iff HOST */
 int  pc_net_game_dedicated_capacity(int* peers_used, int* peers_total, int* resident_reserve); /* transport slots used / total / held for absent residents; 1 iff HOST */
 /* Guests G6.2: host operator tools (HOST only, main thread). `guests` lists through _guest_info (never the token); _guest_admin: op 0 = remove, 1 = reset-token.

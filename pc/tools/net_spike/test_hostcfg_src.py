@@ -62,7 +62,7 @@ def main():
           "svc <= (int)PC_NETGAME_TS_EVENT; svc++" in func_body(c, "pcnetgame_host_ts_push_peer")  # events: the loop bound is now service 5
           and c.count("pcnetgame_host_ts_push_hostcfg(peer);") == 1
           and c.index("pcnetgame_host_ts_push_hostcfg(peer);") < c.index('pcnetgame_host_start_snapshot(peer, "joined");')
-          and c.index("pcnetgame_host_send_scene_roster(peer);") < c.index("pcnetgame_host_ts_push_hostcfg(peer);")
+          and c.index("pc_roster_join(&s_roster_scn, (int)peer);") < c.index("pcnetgame_host_ts_push_hostcfg(peer);")  # capacity phase 5: the scene roster is a delta marked at READY
           and "s_host_peer_link[peer] != PC_NETGAME_LINK_READY" in func_body(c, "pcnetgame_host_ts_push_hostcfg"))
     # ------------------------------------------------------------------ A1 client
     hd = func_body(c, "pcnetgame_handle_client_town_svc")

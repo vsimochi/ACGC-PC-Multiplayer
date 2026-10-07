@@ -184,6 +184,11 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_mp_members.h" /* M-E: save/mp/members.dat resident credentials (pure storage module) */
 #include "pc_mp_guests.h"  /* guests: the legacy save/mp/guests.dat v2 format (migrated) + save/mp/guest_token.dat client token file (pure storage module) */
 #include "pc_mp_guest_store.h" /* guests: the per-guest store (one file per guest, no size limit) */
+#include "pc_dayclaims.h"     /* capacity phase 7: per-character, per-day claims (K.K.) */
+#include "pc_keytab.h"        /* capacity phase 7: dynamic tables keyed by a character identity */
+#include "pc_tabfile.h"        /* capacity phase 7: the durable file of a keyed table (work_jobs.dat v3, v2 compatible) */
+#include "pc_interest.h"      /* capacity phase 5: MOVE relay tiers */
+#include "pc_roster.h"        /* capacity phase 5: roster deltas with retry */
 #include "pc_guest_admit.h" /* capacity phase 4: the pure guest admission rules (range, decision) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
@@ -4680,6 +4685,25 @@ static void pcnetgame_note_bad_move(const char* side, int id, const PCNetMoveMsg
            (unsigned)s_bad_move_count);
 }
 
+/* ===== CAPACITY PHASE 5: interest management + roster deltas (host) =====
+ * s_roster_app / s_roster_scn: the roster books (pc_roster.h) for appearance and scene entries; pcnetgame_roster_pump() delivers them. The MOVE relay thins its rate by the
+ * receiver's interest (pc_interest.h). Everything here is HOST-only state sized for the transport span (allocated at host start, released at shutdown). */
+static PCRoster s_roster_app, s_roster_scn;
+static int      s_roster_live = 0;
+PCNG_PEER_TABLE(uint32_t, s_move_rx_count) /* MOVE samples received per sender peer (the relay's thinning counter) */
+PCNG_PEER_TABLE(int, s_move_boost)         /* samples left in a sender's post-scene-change full-rate window */
+static uint32_t s_host_move_count;
+static int      s_host_move_boost;
+typedef struct PCNetGameScaleStats {
+    uint32_t move_relayed[PC_INTEREST_TIERS], move_thinned[PC_INTEREST_TIERS]; /* MOVE samples relayed / not relayed, by the receiver's tier */
+    uint32_t roster_sent, roster_blocked, roster_gone_sent, roster_unavail;     /* roster pump: entries / departures sent, pump stops on a full window, entries without data yet */
+    int      max_backlog;                                                       /* highest reliable backlog seen on any READY peer */
+} PCNetGameScaleStats;
+static PCNetGameScaleStats s_scale_stats;
+static void pcnetgame_interest_view(int id, PCInterestView* v);
+
+/* ===== END CAPACITY PHASE 5 globals ===== */
+
 /* Host side: a client's movement. Only accepted from a peer that has already completed the
  * identity handshake (PC_NETGAME_LINK_READY) -- matches the existing "READY is earned, not
  * assumed" precedent used for IDENTITY. Validation performed: packet size/type (by the caller),
@@ -4708,12 +4732,37 @@ static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_
     pc_remote_player_on_move((PCNetPlayerId)peer, &sample); /* the host's own view of this client */
 
     /* Relay to every OTHER ready client, tagging net_player_id with the TRUE originating peer id
-     * -- never the client-supplied (and here, ignored) value -- and never back to the sender. */
-    for (i = 0; i < pcnetgame_peer_span(); i++) {
-        if (i != peer && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
-            PCNetMoveMsg out = *in;
-            out.net_player_id = (uint8_t)peer;
-            pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &out, (uint16_t)sizeof(out));
+     * -- never the client-supplied (and here, ignored) value -- and never back to the sender.
+     * Capacity phase 5: the RATE of the relay depends on the receiver's interest in this sender (pc_interest.h): every sample for a near / unknown receiver, thinned for
+     * a distant one, a 1 Hz keep-alive for one in another scene. Nobody is cut off. */
+    {
+        PCInterestView sv;
+        const uint32_t count = s_move_rx_count[peer]++;
+        const int boost = s_move_boost[peer];
+        pcnetgame_interest_view((int)peer, &sv);
+        sv.pos_known = 1; /* the sample just accepted */
+        sv.x = in->pos_x;
+        sv.z = in->pos_z;
+        if (boost > 0) {
+            s_move_boost[peer] = boost - 1;
+        }
+        for (i = 0; i < pcnetgame_peer_span(); i++) {
+            if (i != peer && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+                PCInterestView dv;
+                int tier = PC_INTEREST_NEAR;
+                if (g_pc_settings.interest_management) {
+                    pcnetgame_interest_view(i, &dv);
+                    tier = pc_interest_tier(&sv, &dv);
+                }
+                if (pc_interest_relay(tier, count, boost)) {
+                    PCNetMoveMsg out = *in;
+                    out.net_player_id = (uint8_t)peer;
+                    pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &out, (uint16_t)sizeof(out));
+                    s_scale_stats.move_relayed[tier]++;
+                } else {
+                    s_scale_stats.move_thinned[tier]++;
+                }
+            }
         }
     }
 }
@@ -4748,45 +4797,9 @@ static void pcnetgame_handle_host_appearance(PCNetPeerId peer, const PCNetGameAp
     pcnetgame_appearance_msg_to_state(in, &state);
     pc_remote_player_on_appearance((PCNetPlayerId)peer, &state); /* the host's own view of this client */
 
-    /* Relay to every OTHER ready client, tagging net_player_id with the TRUE originating peer id
-     * -- never back to the sender -- exactly like pcnetgame_handle_host_move()'s own relay. */
-    for (i = 0; i < pcnetgame_peer_span(); i++) {
-        if (i != peer && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
-            PCNetGameAppearanceMsg out = *in;
-            out.net_player_id = (uint8_t)peer;
-            pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
-        }
-    }
-}
-
-/* Host side (Stage 4C-1 backfill/resend fix): sends `dest` the host's own appearance plus the
- * last-known appearance of every OTHER currently-READY peer -- i.e. everything `dest` needs to
- * render every currently-visible player. Used both for the one-shot newcomer backfill (right after
- * a peer reaches READY) and for the periodic full-roster resend below; kept as one function so the
- * two call sites can never drift apart. Reads peer appearances back from pc_remote_player.c's own
- * canonical per-slot storage via pc_remote_player_get_appearance() -- no second appearance cache.
- * Skips `dest` itself and any peer that is not READY (disconnected or still mid-handshake), so a
- * disconnected player's old appearance can never be sent out by this function. */
-static void pcnetgame_host_send_full_roster(PCNetPeerId dest) {
-    PCNetGameAppearanceMsg amsg;
-    int i;
-
-    if (!pc_host_observer_active()) { /* --host-observer: the hidden host has no avatar -- its own entry is never sent (backfill and periodic resend alike) */
-        pcnetgame_build_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID);
-        pc_net_send(dest, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
-    }
-
-    for (i = 0; i < pcnetgame_peer_span(); i++) {
-        PCNetPlayerAppearance state;
-        if (i == dest || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
-            continue;
-        }
-        if (pc_remote_player_get_appearance((PCNetPlayerId)i, &state)) {
-            PCNetGameAppearanceMsg out;
-            pcnetgame_pack_appearance_msg(&out, (uint8_t)i, &state);
-            pc_net_send(dest, PC_NET_RELIABLE, &out, (uint16_t)sizeof(out));
-        }
-    }
+    /* Capacity phase 5: the relay is a roster DELTA now: this peer's entry is marked for every OTHER READY client and the pump (pcnetgame_roster_pump) sends it with the TRUE
+     * originating peer id, retrying when a client's reliable window is full (it used to be dropped silently). Never back to the sender. */
+    pc_roster_changed(&s_roster_app, (int)peer);
 }
 
 /* Client side: an appearance message from the host -- either the host's own appearance
@@ -4887,16 +4900,6 @@ static void pcnetgame_scene_pack(PCNetGamePlayerSceneMsg* msg, uint8_t net_playe
     msg->seq = s->seq;
 }
 
-/* Host -> every READY client except `skip` (pass -1 for none). */
-static void pcnetgame_host_send_scene_to_all(PCNetPeerId skip, const PCNetGamePlayerSceneMsg* msg) {
-    int i;
-    for (i = 0; i < pcnetgame_peer_span(); i++) {
-        if (i != (int)skip && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
-            pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, msg, (uint16_t)sizeof(*msg));
-        }
-    }
-}
-
 /* M9-C: defined with the host talk-hold table further down. */
 static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* why, int reset_seq);
 static void pcnetgame_host_talk_hold_scene_left(PCNetPeerId peer, const PCNetPlayerScene* s);
@@ -4906,7 +4909,6 @@ static void pcnetgame_host_talk_hold_scene_left(PCNetPeerId peer, const PCNetPla
  * never relayed). */
 static void pcnetgame_handle_host_player_scene(PCNetPeerId peer, const PCNetGamePlayerSceneMsg* in) {
     PCNetPlayerScene s;
-    PCNetGamePlayerSceneMsg out;
 
     if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
@@ -4927,8 +4929,8 @@ static void pcnetgame_handle_host_player_scene(PCNetPeerId peer, const PCNetGame
     }
     printf("[NET][SCENE] host: peer %d now in scene %u (kind %u, owner 0x%04X, flags 0x%02X, seq %u)\n", (int)peer,
            (unsigned)s.scene_id, (unsigned)s.kind, (unsigned)s.owner, (unsigned)s.flags, (unsigned)s.seq);
-    pcnetgame_scene_pack(&out, (uint8_t)peer, &s); /* TRUE originating peer id, normalized fields */
-    pcnetgame_host_send_scene_to_all(peer, &out);
+    s_move_boost[peer] = PC_INTEREST_BOOST_SAMPLES; /* capacity phase 5: its place changed: every receiver gets its next samples at full rate */
+    pc_roster_changed(&s_roster_scn, (int)peer);    /* a roster delta: relayed (TRUE originating id, normalized fields) by pcnetgame_roster_pump, retried if a window is full */
 }
 
 /* Client: the host's own scene, a relayed peer's scene, a join-time replay entry, or a CLEARED notice. */
@@ -4938,13 +4940,17 @@ static void pcnetgame_handle_client_player_scene(const PCNetGamePlayerSceneMsg* 
     if (s_client_link != PC_NETGAME_LINK_READY) {
         return;
     }
-    if ((int)in->net_player_id >= PC_REMOTE_PLAYER_SLOT_COUNT || /* ids past the puppet table cannot be shown (the host may have more peers than this client has puppet slots) */
+    if ((int)in->net_player_id >= PC_REMOTE_PLAYER_ID_LIMIT || /* 0xFF is "nobody"; every other wire id has a puppet slot on demand (capacity phase 6) */
         (in->net_player_id != (uint8_t)PC_NETGAME_HOST_PLAYER_ID &&
          (PCNetPlayerId)in->net_player_id == (PCNetPlayerId)s_client_assigned_peer_id)) {
         return; /* out of range, or "about me" (the host never echoes a sender's own scene back) */
     }
     if (in->flags & PC_NETGAME_SCENE_FLAG_CLEARED) {
-        pc_remote_player_clear_scene((PCNetPlayerId)in->net_player_id);
+        if (in->net_player_id != (uint8_t)PC_NETGAME_HOST_PLAYER_ID) {
+            pc_remote_player_forget((PCNetPlayerId)in->net_player_id); /* capacity phase 6: a peer the host says left: its puppet, slot, appearance and scene all go (no stale puppet) */
+        } else {
+            pc_remote_player_clear_scene((PCNetPlayerId)in->net_player_id);
+        }
         printf("[NET][SCENE] client: player %u scene cleared\n", (unsigned)in->net_player_id);
         return;
     }
@@ -5033,7 +5039,7 @@ static void pcnetgame_handle_client_player_action(const PCNetGamePlayerActionMsg
     if (s_client_link != PC_NETGAME_LINK_READY) {
         return;
     }
-    if (origin >= PC_REMOTE_PLAYER_SLOT_COUNT || /* not representable here (see the SCENE handler) */
+    if (origin >= PC_REMOTE_PLAYER_ID_LIMIT || /* 0xFF is "nobody" (see the SCENE handler) */
         (origin != (int)PC_NETGAME_HOST_PLAYER_ID && (PCNetPlayerId)origin == (PCNetPlayerId)s_client_assigned_peer_id)) {
         return; /* out of range, or "about me" (the originator plays its own visuals) */
     }
@@ -5062,35 +5068,159 @@ static void pcnetgame_handle_client_player_action(const PCNetGamePlayerActionMsg
  * pc_remote_player_on_disconnect(); this tells every other READY client to drop the relayed entry too (a
  * reliable, ordered CLEARED, so it always precedes the same peer's post-reconnect announcement). */
 static void pcnetgame_host_peer_scene_gone(PCNetPeerId peer) {
-    PCNetGamePlayerSceneMsg msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_type = (uint8_t)PC_NETGAME_MSG_PLAYER_SCENE;
-    msg.net_player_id = (uint8_t)peer;
-    msg.flags = (uint8_t)PC_NETGAME_SCENE_FLAG_CLEARED;
     printf("[NET][SCENE] host: peer %d left -- its scene was cleared (other clients notified)\n", (int)peer);
-    pcnetgame_host_send_scene_to_all(peer, &msg);
+    /* capacity phase 5: the departure is a roster delta (CLEARED) every other READY client owes, delivered before any later entry of a reused id; the appearance entry is moot */
+    pc_roster_leave(&s_roster_scn, (int)peer);
+    pc_roster_leave(&s_roster_app, (int)peer);
+    if (peer >= 0 && peer < pcnetgame_peer_span()) {
+        s_move_rx_count[peer] = 0;
+        s_move_boost[peer] = 0;
+    }
 }
 
-/* Host: join-time replay for a newly READY `dest` (reuses the existing READY hook, like the appearance
- * roster): the host's own scene plus the last known scene of every OTHER READY peer, read from
- * pc_remote_player.c's canonical per-slot storage (no second cache). Nothing is sent for a player with no
- * known scene. The late joiner's own slots are fresh, so original seqs are accepted. */
-static void pcnetgame_host_send_scene_roster(PCNetPeerId dest) {
-    PCNetGamePlayerSceneMsg msg;
-    PCNetPlayerScene s;
-    int i;
-
-    if (s_local_scene.valid && !pc_host_observer_active()) { /* --host-observer: the hidden host's scene is never announced */
-        pcnetgame_scene_pack(&msg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene);
-        pc_net_send(dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+/* The interest view of a player: its announced scene and last known position (a peer: pc_remote_player.c's canonical per-slot storage, the host: its own scene / actor). */
+static void pcnetgame_interest_view(int id, PCInterestView* v) {
+    PCNetPlayerScene sc;
+    float x, y, z;
+    memset(v, 0, sizeof(*v));
+    if (id == (int)PC_NETGAME_HOST_PLAYER_ID) {
+        if (s_local_scene.valid) {
+            v->scene_known = 1;
+            v->scene_id = s_local_scene.scene_id;
+            v->owner = s_local_scene.owner;
+            v->in_town = (s_local_scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0;
+        }
+        if (gamePT != NULL && gamePT->exec == play_main && pcnetgame_is_real_player_actor(GET_PLAYER_ACTOR_NOW())) {
+            const PLAYER_ACTOR* l = GET_PLAYER_ACTOR_NOW();
+            v->pos_known = 1;
+            v->x = l->actor_class.world.position.x;
+            v->z = l->actor_class.world.position.z;
+        }
+        return;
     }
-    for (i = 0; i < pcnetgame_peer_span(); i++) {
-        if (i == (int)dest || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+    if (pc_remote_player_get_scene((PCNetPlayerId)id, &sc)) {
+        v->scene_known = 1;
+        v->scene_id = sc.scene_id;
+        v->owner = sc.owner;
+        v->in_town = (sc.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0;
+    }
+    if (pc_remote_player_get_last_position((PCNetPlayerId)id, &x, &y, &z)) {
+        v->pos_known = 1;
+        v->x = x;
+        v->z = z;
+    }
+}
+_Static_assert((int)PC_INTEREST_ACRE_UNITS == mFI_BK_WORLDSIZE_BASE, "the interest tiers are measured in acres: PC_INTEREST_ACRE_UNITS must be the game's acre size");
+
+/* ---- roster pump (capacity phase 5): delivers the host's roster DELTAS (pc_roster.h) ----
+ * Per READY destination and frame: at most PC_NETGAME_ROSTER_PUMP_BURST messages per kind, only while the destination's reliable window is at most half full, so a slow peer
+ * is simply served later and never starves (or blocks) anyone else. A bit is cleared ONLY when pc_net_send() accepted the message. An entry whose data does not exist yet
+ * (a peer that has not sent its appearance) stays owed. Departures go first (CLEARED), then entries. */
+#define PC_NETGAME_ROSTER_PUMP_BURST 4
+static int pcnetgame_roster_window_ok(int dest) {
+    const int b = pc_net_reliable_backlog((PCNetPeerId)dest);
+    if (b > s_scale_stats.max_backlog) {
+        s_scale_stats.max_backlog = b;
+    }
+    return b >= 0 && b < (int)(PC_NET_RELIABLE_WINDOW / 2);
+}
+
+static void pcnetgame_roster_pump_dest(int dest) {
+    int sent, subject, from, tries;
+    /* departures */
+    for (sent = 0, from = 0; sent < PC_NETGAME_ROSTER_PUMP_BURST && pc_roster_next_gone(&s_roster_scn, dest, from, &subject); ) {
+        PCNetGamePlayerSceneMsg msg;
+        if (!pcnetgame_roster_window_ok(dest)) {
+            s_scale_stats.roster_blocked++;
+            return; /* the entries wait behind the departures (ordering): nothing else to do for this dest this frame */
+        }
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_type = (uint8_t)PC_NETGAME_MSG_PLAYER_SCENE;
+        msg.net_player_id = (uint8_t)subject;
+        msg.flags = (uint8_t)PC_NETGAME_SCENE_FLAG_CLEARED;
+        if (!pc_net_send((PCNetPeerId)dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+            s_scale_stats.roster_blocked++;
+            return;
+        }
+        pc_roster_gone_delivered(&s_roster_scn, dest, subject);
+        s_scale_stats.roster_gone_sent++;
+        sent++;
+        from = subject + 1;
+    }
+    if (pc_roster_next_gone(&s_roster_scn, dest, 0, &subject)) {
+        return; /* departures still owed: no entry may overtake them */
+    }
+    /* appearance entries */
+    for (sent = 0, tries = 0, from = 0; sent < PC_NETGAME_ROSTER_PUMP_BURST && tries < PC_NETGAME_ROSTER_PUMP_BURST * 4 && pc_roster_next_pend(&s_roster_app, dest, from, &subject); tries++) {
+        PCNetGameAppearanceMsg amsg;
+        int have = 0, host_entry = (subject == (int)PC_NETGAME_HOST_PLAYER_ID);
+        from = subject + 1;
+        if (host_entry) {
+            if (pc_host_observer_active()) { /* --host-observer: the hidden host has no avatar: nothing to send, nothing owed */
+                pc_roster_pend_delivered(&s_roster_app, dest, subject);
+                continue;
+            }
+            pcnetgame_build_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID);
+            have = 1;
+        } else if (s_host_peer_link[subject] != PC_NETGAME_LINK_READY) {
+            pc_roster_pend_delivered(&s_roster_app, dest, subject); /* it left meanwhile */
+            continue;
+        } else {
+            PCNetPlayerAppearance state;
+            if (pc_remote_player_get_appearance((PCNetPlayerId)subject, &state)) {
+                pcnetgame_pack_appearance_msg(&amsg, (uint8_t)subject, &state);
+                have = 1;
+            }
+        }
+        if (!have) {
+            s_scale_stats.roster_unavail++; /* its appearance has not arrived yet: it is marked again the moment it does */
             continue;
         }
-        if (pc_remote_player_get_scene((PCNetPlayerId)i, &s)) {
-            pcnetgame_scene_pack(&msg, (uint8_t)i, &s);
-            pc_net_send(dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+        if (!pcnetgame_roster_window_ok(dest) || !pc_net_send((PCNetPeerId)dest, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg))) {
+            s_scale_stats.roster_blocked++;
+            break;
+        }
+        pc_roster_pend_delivered(&s_roster_app, dest, subject);
+        s_scale_stats.roster_sent++;
+        sent++;
+    }
+    /* scene entries */
+    for (sent = 0, tries = 0, from = 0; sent < PC_NETGAME_ROSTER_PUMP_BURST && tries < PC_NETGAME_ROSTER_PUMP_BURST * 4 && pc_roster_next_pend(&s_roster_scn, dest, from, &subject); tries++) {
+        PCNetGamePlayerSceneMsg msg;
+        PCNetPlayerScene sc;
+        int have = 0;
+        from = subject + 1;
+        if (subject == (int)PC_NETGAME_HOST_PLAYER_ID) {
+            if (s_local_scene.valid && s_local_scene_sent && !pc_host_observer_active()) {
+                sc = s_local_scene;
+                have = 1;
+            }
+        } else if (s_host_peer_link[subject] == PC_NETGAME_LINK_READY) {
+            have = pc_remote_player_get_scene((PCNetPlayerId)subject, &sc);
+        }
+        if (!have) {
+            pc_roster_pend_delivered(&s_roster_scn, dest, subject); /* nothing known (a scene is announced when it first changes, and then marked again) */
+            continue;
+        }
+        pcnetgame_scene_pack(&msg, (uint8_t)subject, &sc);
+        if (!pcnetgame_roster_window_ok(dest) || !pc_net_send((PCNetPeerId)dest, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+            s_scale_stats.roster_blocked++;
+            break;
+        }
+        pc_roster_pend_delivered(&s_roster_scn, dest, subject);
+        s_scale_stats.roster_sent++;
+        sent++;
+    }
+}
+
+static void pcnetgame_roster_pump(void) {
+    int i;
+    if (!s_roster_live) {
+        return;
+    }
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY && (pc_roster_owed(&s_roster_app, i) > 0 || pc_roster_owed(&s_roster_scn, i) > 0)) {
+            pcnetgame_roster_pump_dest(i);
         }
     }
 }
@@ -5131,8 +5261,9 @@ static void pcnetgame_scene_tick(void) {
                            "(announcing to clients)\n",
                            sid, (unsigned)s_local_scene.kind, (unsigned)s_local_scene.owner,
                            (unsigned)s_local_scene.flags, (unsigned)s_local_scene.seq);
-                    pcnetgame_scene_pack(&msg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene);
-                    pcnetgame_host_send_scene_to_all((PCNetPeerId)-1, &msg);
+                    (void)msg;
+                    s_host_move_boost = PC_INTEREST_BOOST_SAMPLES; /* capacity phase 5: full-rate MOVE for a while after the host's own scene change */
+                    pc_roster_host_changed(&s_roster_scn);         /* a roster delta delivered (and retried) by pcnetgame_roster_pump */
                 }
             }
         }
@@ -6021,7 +6152,7 @@ int pc_net_game_nearest_remote_player(float x, float z, float max_dist, float* o
     if ((s_role != PC_NETGAME_ROLE_HOST && !(s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY)) || !pc_net_game_get_local_scene(&ls)) {
         return 0;
     }
-    for (p = 0; p < PC_REMOTE_PLAYER_SLOT_COUNT; p++) { /* every puppet slot: the peers the puppet table can show plus the host */
+    for (p = 0; p < PC_REMOTE_PLAYER_ID_LIMIT; p++) { /* every wire id (readers never allocate a slot) */
         float px, py, pz, d;
         if ((s_role == PC_NETGAME_ROLE_HOST && p == (int)PC_NETGAME_HOST_PLAYER_ID) || (s_role == PC_NETGAME_ROLE_CLIENT && p == (int)s_client_assigned_peer_id)) {
             continue;
@@ -6199,6 +6330,10 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
     pcnetgame_reset_host_bury_state(peer); /* World Ecology T0 scaffolding -- see its own doc */
     if (peer >= 0 && peer < pcnetgame_peer_span()) {
         pcnetgame_rec_note_peer_gone(&s_host_peer[peer]); /* D3 Q5: dirty record -> early-save flag */
+    }
+    if (peer >= 0 && peer < pcnetgame_peer_span()) {
+        s_move_rx_count[peer] = 0; /* capacity phase 5: a reused id starts with a fresh relay counter / no boost */
+        s_move_boost[peer] = 0;
     }
     if (peer >= 0 && peer < pcnetgame_peer_span()) {
         /* v2: identity deferral, PLAYER_CONTEXT, snapshot progress/epoch. v2 additionally calls this
@@ -17461,6 +17596,38 @@ extern void aEDZ_pc_host_gift_commit(void);
 extern int aNTT_pc_host_song_check(int claimant, int request, int* song); /* ac_npc_totakeke_talk.c_inc */
 extern void aNTT_pc_host_song_commit(int claimant);
 
+/* ---- K.K. concert claims of GUESTS (capacity phase 7) ----
+ * Vanilla keeps "this player already got K.K.'s song of this concert" as one bit per RESIDENT (save->bitfield bit `slot`) and ONE bit shared by every foreigner
+ * (common->foreigner_bitfield). With guests that is wrong in both directions: the first guest to ask used up the bit of all the others, and a host restart or a reconnect under another
+ * slot changed who "was" the claimant. The host now keeps the claim PER GUEST IDENTITY (the guest's home PersonalID = its stable key, never a peer id / table slot), for the day of the
+ * concert (K.K. visits once a week; a claim of an earlier day no longer counts and is swept at the next claim). Memory only, like the vanilla common-area bit it replaces; the
+ * table grows one 24-byte entry per claiming guest, bounded by the guest store budget. Residents keep their vanilla bits. */
+static PCDayClaims s_kk_claims;
+
+static uint32_t pcnetgame_kk_today(void) {
+    return ((uint32_t)Common_Get(time.rtc_time).year << 9) | ((uint32_t)Common_Get(time.rtc_time).month << 5) | (uint32_t)Common_Get(time.rtc_time).day;
+}
+
+static int pcnetgame_kk_guest_key(int rec_idx, PersonalID_c* out) {
+    const int g = rec_idx - PLAYER_NUM;
+    if (rec_idx < PLAYER_NUM || g < 0 || g >= s_guest_cap || !s_guest[g].used) {
+        return 0;
+    }
+    *out = s_guest[g].key;
+    return 1;
+}
+
+static int pcnetgame_kk_guest_claimed(const PersonalID_c* key) {
+    return pc_dayclaims_has(&s_kk_claims, key, pcnetgame_kk_today());
+}
+
+static int pcnetgame_kk_guest_mark(const PersonalID_c* key) {
+    if (!s_kk_claims.ready && !pc_dayclaims_init(&s_kk_claims, sizeof(PersonalID_c), pcnetgame_guest_budget_slots())) {
+        return 0;
+    }
+    return pc_dayclaims_mark(&s_kk_claims, key, pcnetgame_kk_today());
+}
+
 static uint8_t pcnetgame_evnpc_plan(int claimant, const PCNetGameTxnTag* t, uint16_t* post, uint32_t* post_conds, uint16_t* granted, const char** why) {
     mActor_name_t item = (mActor_name_t)EMPTY_NO;
     int song = 0, r;
@@ -17471,7 +17638,12 @@ static uint8_t pcnetgame_evnpc_plan(int claimant, const PCNetGameTxnTag* t, uint
             return (uint8_t)(r == 2 ? PC_NETGAME_TXN_REASON_EVNPC_DONE : PC_NETGAME_TXN_REASON_NOT_AVAILABLE);
         }
     } else if (t->aux_cond == (uint8_t)PC_EVNPC_OP_KK_SONG) {
-        r = aNTT_pc_host_song_check(claimant, t->aux_item == 0xFFFFu ? 0xFFFF : (int)t->aux_item, &song);
+        PersonalID_c gk;
+        const int is_guest = claimant >= PLAYER_NUM && pcnetgame_kk_guest_key(claimant, &gk);
+        r = aNTT_pc_host_song_check(is_guest ? -2 : (claimant < PLAYER_NUM ? claimant : -1), t->aux_item == 0xFFFFu ? 0xFFFF : (int)t->aux_item, &song);
+        if (r == 1 && is_guest && pcnetgame_kk_guest_claimed(&gk)) {
+            r = 2; /* THIS guest already got a song at this concert (other guests are unaffected) */
+        }
         if (r != 1) {
             *why = r == 2 ? "this player already got K.K.'s song of this concert" : "there is no K.K. concert (or the song is invalid)";
             return (uint8_t)(r == 2 ? PC_NETGAME_TXN_REASON_EVNPC_DONE : PC_NETGAME_TXN_REASON_NOT_AVAILABLE);
@@ -17491,7 +17663,13 @@ static void pcnetgame_evnpc_commit(int claimant, uint8_t op) {
     if (op == (uint8_t)PC_EVNPC_OP_GULLIVER_GIFT) {
         aEDZ_pc_host_gift_commit();
     } else if (op == (uint8_t)PC_EVNPC_OP_KK_SONG) {
-        aNTT_pc_host_song_commit(claimant);
+        PersonalID_c gk;
+        if (claimant >= PLAYER_NUM && pcnetgame_kk_guest_key(claimant, &gk)) {
+            (void)pcnetgame_kk_guest_mark(&gk);
+            aNTT_pc_host_song_commit(-2);
+        } else {
+            aNTT_pc_host_song_commit(claimant < PLAYER_NUM ? claimant : -1);
+        }
     }
 }
 
@@ -17507,9 +17685,8 @@ static void pcnetgame_evnpc_commit(int claimant, uint8_t op) {
  *   DELIVER_VILLAGER  Nook gives the player a parcel (TAKE_PARCEL), names the villager who should receive it; the player hands it to that villager (VILLAGER_RECEIVE, which can pay an
  *                     OPTIONAL villager tip: Bells or an item, decided by the host at job creation), then reports to Nook (REPORT).
  * The Nook reward is ALWAYS the job's Bell reward, paid by DELIVER / REPORT; the villager tip is a secondary host-validated payment and never replaces it. */
-#define PC_WORK_MAX_CHARS 64
 #define PC_WORK_FILE_MAGIC 0x4B574341u /* 'ACWK' */
-#define PC_WORK_FILE_VERSION 2u
+#define PC_WORK_FILE_VERSION 3u
 
 typedef struct PCNetWorkChar {
     PersonalID_c key;            /* the character */
@@ -17537,118 +17714,117 @@ static int pcnetgame_work_op_has_slot(uint8_t op) {
     return op == PC_WORK_OP_DELIVER || op == PC_WORK_OP_TAKE_PARCEL || op == PC_WORK_OP_VILLAGER_GIVE || op == PC_WORK_OP_VILLAGER_RECEIVE;
 }
 
-static PCNetWorkChar s_work[PC_WORK_MAX_CHARS];
-static uint32_t      s_work_next_job_id = 0;
-static int           s_work_loaded = 0;
+/* Capacity phase 7: the work table is DYNAMIC. It was a fixed array of PC_WORK_MAX_CHARS (64) records, one per CHARACTER ever to use Work Mode, residents and guests alike: the 65th
+ * character (easy with a crowd of guests over a few weeks) could never start a job again. It is now a PCKeyTab keyed by the character's PersonalID (the stable identity, never a peer id
+ * or a slot), grown on demand up to a quarter of the guest memory budget (56 B per record). work_jobs.dat is version 3: a record COUNT instead of a fixed 64-record body; a version 2
+ * file (64 records) is read as it is and rewritten as version 3 at the next save. */
+#define PC_WORK_FILE_VERSION_V2 2u
+static PCKeyTab s_work_tab;
+static int      s_work_tab_ready = 0;
+static uint32_t s_work_next_job_id = 0;
+static int      s_work_loaded = 0;
 
-static uint32_t pcnetgame_work_hash32(const void* p, size_t n) {
-    return pcnetgame_fnv1a32(p, n);
+static int pcnetgame_work_max_chars(void) {
+    const unsigned long long n = (unsigned long long)(g_pc_settings.guest_memory_mb >= 1 ? g_pc_settings.guest_memory_mb : 256) * 1048576ull / 4ull / (unsigned long long)sizeof(PCNetWorkChar);
+    return n > 0x3FFFFFFull ? 0x3FFFFFF : (n < 1024ull ? 1024 : (int)n);
+}
+
+static void pcnetgame_work_tab_ensure(void) {
+    if (!s_work_tab_ready) {
+        s_work_tab_ready = pc_keytab_init(&s_work_tab, sizeof(PCNetWorkChar), offsetof(PCNetWorkChar, key), sizeof(PersonalID_c), pcnetgame_work_max_chars());
+    }
 }
 
 static void pcnetgame_work_save(void) {
-    char tmp[200];
     const char* path = pc_server_work_path();
-    uint32_t hdr[4];
-    uint32_t crc;
-    FILE* f;
     if (path == NULL || path[0] == 0) {
         return;
     }
     {
         char dir[200];
-        size_t i;
+        size_t i2;
         snprintf(dir, sizeof(dir), "%s", path);
-        for (i = 1; dir[i] != 0; i++) { /* the parent directories (save/mp, servers/<id>) may not exist yet on a fresh tree */
-            if (dir[i] == '/' || dir[i] == '\\') {
-                char c = dir[i];
-                dir[i] = 0;
+        for (i2 = 1; dir[i2] != 0; i2++) { /* the parent directories (save/mp, servers/<id>) may not exist yet on a fresh tree */
+            if (dir[i2] == '/' || dir[i2] == '\\') {
+                char c = dir[i2];
+                dir[i2] = 0;
 #ifdef _WIN32
                 _mkdir(dir);
 #else
                 mkdir(dir, 0755);
 #endif
-                dir[i] = c;
+                dir[i2] = c;
             }
         }
     }
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    f = fopen(tmp, "wb");
-    if (f == NULL) {
-        printf("[NET][WORK] host: could not write %s (job state would not survive a host restart)\n", tmp);
-        return;
-    }
-    hdr[0] = PC_WORK_FILE_MAGIC;
-    hdr[1] = PC_WORK_FILE_VERSION;
-    hdr[2] = s_work_next_job_id;
-    hdr[3] = (uint32_t)sizeof(s_work);
-    crc = pcnetgame_work_hash32(hdr, sizeof(hdr)) ^ pcnetgame_work_hash32(s_work, sizeof(s_work));
-    fwrite(hdr, sizeof(hdr), 1, f);
-    fwrite(s_work, sizeof(s_work), 1, f);
-    fwrite(&crc, sizeof(crc), 1, f);
-    fflush(f);
-    fclose(f);
-    remove(path);
-    if (rename(tmp, path) != 0) {
-        printf("[NET][WORK] host: could not replace %s\n", path);
+    if (!pc_tabfile_save(path, PC_WORK_FILE_MAGIC, PC_WORK_FILE_VERSION, s_work_next_job_id, &s_work_tab)) {
+        printf("[NET][WORK] host: could not write %s (job state would not survive a host restart)\n", path);
     }
 }
 
 static void pcnetgame_work_load(void) {
-    uint32_t hdr[4], crc, want;
-    FILE* f;
     const char* path = pc_server_work_path();
+    uint32_t next_id = 0, ver = 0;
+    int kept = 0, rc;
     if (s_work_loaded) {
         return;
     }
     s_work_loaded = 1;
-    memset(s_work, 0, sizeof(s_work));
+    pcnetgame_work_tab_ensure();
     s_work_next_job_id = 0;
-    if (path == NULL || path[0] == 0 || (f = fopen(path, "rb")) == NULL) {
+    if (!s_work_tab_ready || path == NULL || path[0] == 0) {
         return;
     }
-    if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == PC_WORK_FILE_MAGIC && hdr[1] == PC_WORK_FILE_VERSION && hdr[3] == (uint32_t)sizeof(s_work) &&
-        fread(s_work, sizeof(s_work), 1, f) == 1 && fread(&crc, sizeof(crc), 1, f) == 1) {
-        want = pcnetgame_work_hash32(hdr, sizeof(hdr)) ^ pcnetgame_work_hash32(s_work, sizeof(s_work));
-        if (crc == want) {
-            s_work_next_job_id = hdr[2];
-            printf("[NET][WORK] host: loaded %s (next job id %u)\n", path, (unsigned)s_work_next_job_id);
-            fclose(f);
-            return;
-        }
+    rc = pc_tabfile_load(path, PC_WORK_FILE_MAGIC, PC_WORK_FILE_VERSION, PC_WORK_FILE_VERSION_V2, 64, offsetof(PCNetWorkChar, used), &s_work_tab, &next_id, &ver, &kept);
+    if (rc == PC_TABFILE_OK) {
+        s_work_next_job_id = next_id;
+        printf("[NET][WORK] host: loaded %s (next job id %u, %d character(s), file version %u)\n", path, (unsigned)s_work_next_job_id, kept, (unsigned)ver);
+    } else if (rc == PC_TABFILE_BAD) {
+        printf("[NET][WORK] host: %s is unreadable, corrupt or from another layout version -- starting with no work state\n", path);
     }
-    printf("[NET][WORK] host: %s is unreadable, corrupt or from another layout version -- starting with no work state\n", path);
-    memset(s_work, 0, sizeof(s_work));
-    s_work_next_job_id = 0;
-    fclose(f);
 }
 
+/* The work record of a character (by PersonalID). `create` makes a zeroed one when none exists; NULL = none, or the table is full / out of memory (a new character cannot start Work
+ * Mode then, a loud log says so once). The pointer is valid until the next create / remove. */
 static PCNetWorkChar* pcnetgame_work_find(const PersonalID_c* key, int create) {
-    int i, freei = -1;
+    PCNetWorkChar* w;
+    int created = 0;
+    static int s_full_logged = 0;
     pcnetgame_work_load();
-    for (i = 0; i < PC_WORK_MAX_CHARS; i++) {
-        if (s_work[i].used && memcmp(&s_work[i].key, key, sizeof(*key)) == 0) {
-            return &s_work[i];
-        }
-        if (!s_work[i].used && freei < 0) {
-            freei = i;
-        }
-    }
-    if (!create || freei < 0) {
+    if (!s_work_tab_ready) {
         return NULL;
     }
-    memset(&s_work[freei], 0, sizeof(s_work[freei]));
-    s_work[freei].used = 1;
-    s_work[freei].key = *key;
-    return &s_work[freei];
+    if (!create) {
+        return (PCNetWorkChar*)pc_keytab_find(&s_work_tab, key);
+    }
+    w = (PCNetWorkChar*)pc_keytab_get_or_create(&s_work_tab, key, &created);
+    if (w == NULL) {
+        if (!s_full_logged) {
+            s_full_logged = 1;
+            printf("[NET][WORK] host: the work table is full (%d characters, a quarter of guest_memory_mb) or out of memory: a NEW character cannot start Work Mode\n", pc_keytab_count(&s_work_tab));
+        }
+        return NULL;
+    }
+    if (created) {
+        w->used = 1;
+    }
+    return w;
 }
 
 /* a guest bought a house: the character keeps its work record under the NEW resident PID */
 static void pcnetgame_work_rekey(const PersonalID_c* from, const PersonalID_c* to) {
     PCNetWorkChar* w = pcnetgame_work_find(from, 0);
     if (w != NULL && pcnetgame_work_find(to, 0) == NULL) {
-        w->key = *to;
-        pcnetgame_work_save();
-        printf("[NET][WORK] host: work record moved to the promoted resident's PID\n");
+        PCNetWorkChar moved = *w; /* the key is what the hash index is built on: remove and re-add instead of editing it in place */
+        PersonalID_c from_key = *from;
+        moved.key = *to;
+        (void)pc_keytab_remove(&s_work_tab, &from_key);
+        w = pcnetgame_work_find(to, 1);
+        if (w != NULL) {
+            *w = moved;
+            pcnetgame_work_save();
+            printf("[NET][WORK] host: work record moved to the promoted resident's PID\n");
+        }
     }
 }
 
@@ -18970,8 +19146,8 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     post_conds = t->pre_conds;
     post_wallet = t->pre_wallet;
     if (is_evnpc) {
-        /* The HOST decides the outcome (claimant = the bound resident slot, or -1 for a guest): nothing is mutated here */
-        fail_reason = pcnetgame_evnpc_plan(idx < PLAYER_NUM ? idx : -1, t, post, &post_conds, &evnpc_item, &fail);
+        /* The HOST decides the outcome (claimant = the record slot: a resident 0..3, or PLAYER_NUM + the guest's store slot: its claim is keyed by the guest's identity): nothing is mutated here */
+        fail_reason = pcnetgame_evnpc_plan(idx, t, post, &post_conds, &evnpc_item, &fail);
         if (fail_reason == 0) {
             fail = NULL;
         }
@@ -19100,7 +19276,7 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
 
     /* 10. THE host-side service commit (the only writer of museum_display / police_box / the shop stock in this handler path) */
     if (is_evnpc) {
-        pcnetgame_evnpc_commit(idx < PLAYER_NUM ? idx : -1, t->aux_cond); /* the reward flag is set in the SAME step the item is granted */
+        pcnetgame_evnpc_commit(idx, t->aux_cond); /* the reward flag is set in the SAME step the item is granted */
     } else if (is_work) {
         pcnetgame_work_commit(work, t->aux_cond); /* the state machine step (a delivery retires + tombstones the job in the SAME step the reward is decided) */
         pcnetgame_work_save(); /* durable BEFORE the result: a host restart after the reward can never offer the same job again */
@@ -27078,8 +27254,17 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     /* Stage 4C-1 (3+ player backfill fix): give this now-READY client the host's own appearance
      * AND the last-known appearance of every other already-READY peer -- otherwise anyone who
      * joined before this peer would stay permanently invisible to it (the original Stage 4C-1
-     * bug; see the investigation). See pcnetgame_host_send_full_roster()'s own doc comment. */
-    pcnetgame_host_send_full_roster(peer);
+     * bug; see the investigation). See the roster pump (pcnetgame_roster_pump, capacity phase 5). */
+    pc_roster_join(&s_roster_app, (int)peer);
+    pc_roster_join(&s_roster_scn, (int)peer);
+    {
+        /* The joiner's roster goes out NOW, ahead of the world snapshot that is about to fill its reliable window (the old code sent it at this point too): up to 8 pump rounds
+         * (4 entries per kind each, window permitting). Whatever does not fit is delivered by the per-frame pump as the window drains. */
+        int round;
+        for (round = 0; round < 8; round++) {
+            pcnetgame_roster_pump_dest((int)peer);
+        }
+    }
 
     {
         /* Stage 2: give the host a visible representation of this now-READY client. */
@@ -27095,7 +27280,7 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     /* M9-A late join / reconnect: tell this now-READY client where the host and every other READY peer
      * currently are (the smallest correct mechanism: the existing READY hook + the per-slot scene storage;
      * no snapshot machinery). The reliable channel orders this after the IDENTITY_ACK. */
-    pcnetgame_host_send_scene_roster(peer);
+    /* (capacity phase 5: the join above already marked the host's scene and every READY peer's scene for this client: the roster pump sends them) */
 
     /* v2: bootstrap the client's world (initial connect, late join and reconnect all land here). */
     pcnetgame_host_ts_push_hostcfg(peer); /* batch A (A1): the wildlife mode is announced BEFORE any snapshot message */
@@ -28881,7 +29066,7 @@ static void pcnetgame_reset_client_session_state(void) {
          * replays join-time scenes), and entries stored before any MOVE arrived are never reaped by the
          * puppet liveness timeout. Only scene identity is cleared -- puppets/movement state are untouched. */
         int scene_pid;
-        for (scene_pid = 0; scene_pid < PC_REMOTE_PLAYER_SLOT_COUNT; scene_pid++) {
+        for (scene_pid = 0; scene_pid < PC_REMOTE_PLAYER_ID_LIMIT; scene_pid++) {
             pc_remote_player_clear_scene((PCNetPlayerId)scene_pid);
         }
     }
@@ -29019,6 +29204,10 @@ static void pcnetgame_reset_host_world_state(void) {
     for (i = 0; i < pcnetgame_peer_span(); i++) {
         s_host_peer_link[i] = PC_NETGAME_LINK_DISCONNECTED;
         pcnetgame_reset_all_host_peer_state((PCNetPeerId)i);
+    }
+    if (s_roster_live) {
+        pc_roster_clear(&s_roster_app); /* a new hosting session: nobody is READY, nothing is owed */
+        pc_roster_clear(&s_roster_scn);
     }
     s_host_world_ready = 0;
     s_host_shadow_valid = 0;
@@ -29173,7 +29362,7 @@ static void pcnetgame_client_on_link_lost(const char* cause) {
         int scene_pid;
         int held = 0;
         PCNetPlayerScene scene_tmp;
-        for (scene_pid = 0; scene_pid < PC_REMOTE_PLAYER_SLOT_COUNT; scene_pid++) {
+        for (scene_pid = 0; scene_pid < PC_REMOTE_PLAYER_ID_LIMIT; scene_pid++) {
             held += pc_remote_player_get_scene((PCNetPlayerId)scene_pid, &scene_tmp) ? 1 : 0;
         }
         printf("[NET][SCENE] client: host link lost -- clearing %d stored peer scene(s)\n", held);
@@ -29184,7 +29373,7 @@ static void pcnetgame_client_on_link_lost(const char* cause) {
     pcnetgame_reset_client_session_state();
     if (armed) {
         /* A restarted host's MOVE sender_frame restarts low (a surviving slot would reject its samples as stale) and the relayed players' ids may
-         * change: drop every puppet; they come back through the normal on_ready / relay paths. Safe mid-game (static slot table, same destroy path). */
+         * change: drop every puppet; they come back through the normal on_ready / relay paths. Safe mid-game (slots are freed by the same destroy path). */
         pc_remote_player_shutdown();
         pcnetgame_rc_schedule(cause);
     } else {
@@ -29750,7 +29939,7 @@ static PCPeerTable s_peer_tables[] = {
     PCNG_REG(s_host_field_action_dedup), PCNG_REG(s_host_snowman_build_dedup), PCNG_REG(s_host_catch_dedup), PCNG_REG(s_host_peer),
     PCNG_REG(s_host_rec_rx), PCNG_REG(s_host_rec_tx), PCNG_REG(s_host_house_rx), PCNG_REG(s_host_house_tx), PCNG_REG(s_host_pd_tx),
     PCNG_REG(s_host_talk_last_seq), PCNG_REG(s_host_talk_seq_valid), PCNG_REG(s_townsrv),
-    PCNG_REG(s_pg_sent), PCNG_REG(s_pg_wr_ms), PCNG_REG(s_pg_wr_n),
+    PCNG_REG(s_pg_sent), PCNG_REG(s_pg_wr_ms), PCNG_REG(s_pg_wr_n), PCNG_REG(s_move_rx_count), PCNG_REG(s_move_boost),
 };
 #define PCNG_PEER_TABLE_COUNT ((int)(sizeof(s_peer_tables) / sizeof(s_peer_tables[0])))
 
@@ -29789,6 +29978,21 @@ int pc_net_game_start_host(uint16_t port) {
         pc_net_shutdown();
         return 0;
     }
+    pc_roster_free(&s_roster_app);
+    pc_roster_free(&s_roster_scn);
+    s_roster_live = pc_roster_init(&s_roster_app, pcnetgame_peer_span(), (int)PC_NETGAME_HOST_WIRE_ID) && pc_roster_init(&s_roster_scn, pcnetgame_peer_span(), (int)PC_NETGAME_HOST_WIRE_ID);
+    if (!s_roster_live) {
+        printf("[NET] start_host: could not allocate the roster books for %d peers (out of memory) -- continuing single-player\n", pc_net_peer_capacity());
+        pc_roster_free(&s_roster_app);
+        pc_roster_free(&s_roster_scn);
+        pcnetgame_peer_tables_release();
+        pc_net_shutdown();
+        return 0;
+    }
+    s_roster_app.track_gone = 0; /* the appearance roster owes no departures: the scene roster's CLEARED is the departure notice */
+    memset(&s_scale_stats, 0, sizeof(s_scale_stats));
+    s_host_move_count = 0;
+    s_host_move_boost = 0;
     s_role = PC_NETGAME_ROLE_HOST;
     pcnetgame_reset_host_world_state();
     printf("[NET] hosting on UDP port %u (protocol %u), peer capacity %d (slots 0..%d, id %d reserved for the host)\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION, pc_net_peer_capacity(),
@@ -30189,6 +30393,9 @@ void pc_net_game_shutdown(void) {
     pcnetgame_reset_client_session_state();
     pcnetgame_reset_host_world_state(); /* also clears s_host_peer_link[] and every per-peer cache */
     pcnetgame_peer_tables_release(); /* back to the zeroed inline tables (frees the heap ones a big capacity needed) */
+    pc_roster_free(&s_roster_app); /* capacity phase 5: the roster books (host only) */
+    pc_roster_free(&s_roster_scn);
+    s_roster_live = 0;
     memset(&s_local_scene, 0, sizeof(s_local_scene)); /* M9-A: back to single-player: nothing announced */
     s_local_scene_seq = 0;
 
@@ -31787,6 +31994,9 @@ void pc_net_game_poll(void) {
     pcnetgame_scene_tick();
     pcnetgame_run_scene_test_hook();
     pcnetgame_run_collide_test_hook(); /* M9-B: off-by-default --collide-test-* hooks */
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        pcnetgame_roster_pump(); /* capacity phase 5: roster deltas (appearance / scene entries, departures) with retry */
+    }
 
     /* Stage 3: throttled movement send, decoupled from the render/frame rate (see
      * PC_NETGAME_MOVE_SEND_PERIOD_60FPS_FRAMES's doc above). gamePT/the local player actor may
@@ -31804,10 +32014,31 @@ void pc_net_game_poll(void) {
                 pc_net_send(0, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
             } else if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) { /* --host-observer: no host MOVE stream */
                 int i;
+                PCInterestView sv;
+                const uint32_t count = s_host_move_count++;
+                const int boost = s_host_move_boost;
                 msg.net_player_id = (uint8_t)PC_NETGAME_HOST_PLAYER_ID;
+                pcnetgame_interest_view((int)PC_NETGAME_HOST_PLAYER_ID, &sv);
+                sv.pos_known = 1;
+                sv.x = msg.pos_x;
+                sv.z = msg.pos_z;
+                if (boost > 0) {
+                    s_host_move_boost = boost - 1;
+                }
                 for (i = 0; i < pcnetgame_peer_span(); i++) {
                     if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
-                        pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
+                        PCInterestView dv;
+                        int tier = PC_INTEREST_NEAR;
+                        if (g_pc_settings.interest_management) {
+                            pcnetgame_interest_view(i, &dv);
+                            tier = pc_interest_tier(&sv, &dv);
+                        }
+                        if (pc_interest_relay(tier, count, boost)) {
+                            pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
+                            s_scale_stats.move_relayed[tier]++;
+                        } else {
+                            s_scale_stats.move_thinned[tier]++;
+                        }
                     }
                 }
             }
@@ -31828,7 +32059,7 @@ void pc_net_game_poll(void) {
      * this simply does not tick yet (never blocks single-player, never fires before a session
      * actually exists). Client: resend only this process's own appearance, and only once actually
      * READY (mirrors the movement throttle's own client-side gate). Host: reuse
-     * pcnetgame_host_send_full_roster() for every currently-READY peer, exactly the same call the
+     * the roster refresh (pcnetgame_roster_pump) for the READY peers, exactly the same call the
      * one-shot newcomer backfill uses -- so a peer that missed its original appearance delivery
      * (lost datagram, or the identity/appearance ordering race) receives a fresh, complete copy
      * within one interval, with no reconnect required. */
@@ -31839,12 +32070,8 @@ void pc_net_game_poll(void) {
             pcnetgame_build_appearance_msg(&amsg, 0);
             pc_net_send(0, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
         } else if (s_role == PC_NETGAME_ROLE_HOST) {
-            int i;
-            for (i = 0; i < pcnetgame_peer_span(); i++) {
-                if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
-                    pcnetgame_host_send_full_roster((PCNetPeerId)i);
-                }
-            }
+            /* capacity phase 5: ONE subject per period is re-marked for every dest (N messages, not N x N); the pump delivers it */
+            (void)pc_roster_refresh_step(&s_roster_app);
         }
     }
 
@@ -31862,7 +32089,7 @@ void pc_net_game_poll(void) {
      * == 0, e.g. right after this process starts, or the moment Now_Private first becomes
      * available) is deliberately NOT treated as a change: the existing READY handshake already
      * sends the initial appearance unconditionally on its own (the client's IDENTITY_ACK handler
-     * above, and pcnetgame_host_send_full_roster() on the host side), so silently adopting whatever
+     * above, and the roster pump on the host side), so silently adopting whatever
      * is currently captured as the baseline -- without sending anything -- avoids ever racing that
      * with a redundant immediate duplicate. From then on the cache simply persists across
      * disconnects/reconnects/scene transitions (nothing here ever clears it): if this process's own
@@ -31892,17 +32119,10 @@ void pc_net_game_poll(void) {
                  * receives and relays it, but the host never "receives" its own appearance over
                  * the network. Broadcast directly to every READY peer instead. Deliberately just
                  * the host's own appearance (net_player_id = PC_NETGAME_HOST_PLAYER_ID, never a
-                 * peer index) -- NOT the full pcnetgame_host_send_full_roster() roster resend,
+                 * peer index) -- NOT the full full roster resend,
                  * which would needlessly retransmit every other peer's already-unchanged
                  * appearance too. */
-                PCNetGameAppearanceMsg amsg;
-                int i;
-                pcnetgame_pack_appearance_msg(&amsg, (uint8_t)PC_NETGAME_HOST_PLAYER_ID, &current);
-                for (i = 0; i < pcnetgame_peer_span(); i++) {
-                    if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
-                        pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &amsg, (uint16_t)sizeof(amsg));
-                    }
-                }
+                pc_roster_host_changed(&s_roster_app); /* capacity phase 5: a roster delta for the host's own entry, delivered (and retried) by the pump */
             }
             s_last_local_appearance = current;
         }
@@ -35297,6 +35517,51 @@ int pc_net_game_dedicated_guest_admission(PCNetGameDedicatedGuestAdmission* out)
     out->store_budget = pcnetgame_guest_budget_slots();
     out->untrusted = s_guest_untrusted ? 1 : 0;
     out->allow_new = pcnetgame_host_allow_new_guests();
+    return 1;
+}
+
+/* Capacity phases 5 + 6: console status of the interest management, the roster pump, the reliable window use and the puppet / collision resources. 0 unless HOST. */
+int pc_net_game_dedicated_scale(PCNetGameDedicatedScale* out) {
+    PCRemotePlayerStats rs;
+    int i, k;
+    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->interest_on = g_pc_settings.interest_management ? 1 : 0;
+    for (k = 0; k < PC_INTEREST_TIERS; k++) {
+        out->move_relayed[k] = s_scale_stats.move_relayed[k];
+        out->move_thinned[k] = s_scale_stats.move_thinned[k];
+    }
+    out->roster_sent = s_scale_stats.roster_sent;
+    out->roster_gone_sent = s_scale_stats.roster_gone_sent;
+    out->roster_blocked = s_scale_stats.roster_blocked;
+    out->roster_unavail = s_scale_stats.roster_unavail;
+    out->max_backlog = s_scale_stats.max_backlog;
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            const int b = pc_net_reliable_backlog((PCNetPeerId)i);
+            out->roster_owed += pc_roster_owed(&s_roster_app, i) + pc_roster_owed(&s_roster_scn, i);
+            if (b > out->backlog_now_max) {
+                out->backlog_now_max = b;
+            }
+        }
+    }
+    pc_remote_player_get_stats(&rs);
+    out->puppet_slots = rs.slots_used;
+    out->puppet_slots_peak = rs.slots_peak;
+    out->puppet_slot_failures = rs.slot_alloc_failures;
+    out->puppets_tracked = rs.tracked;
+    out->puppet_actors = rs.actors_live;
+    out->puppet_actors_pending = rs.pending_create;
+    out->puppet_actors_blocked = rs.actors_blocked_now;
+    out->puppet_actor_create_failed = rs.actor_create_failed;
+    out->actor_peak = rs.actor_total_peak;
+    out->actor_max = rs.actor_max;
+    out->collide_armed = rs.collide_armed;
+    out->collider_peak = rs.collider_peak;
+    out->collider_table = rs.collider_table;
+    out->failed_setoc = rs.failed_setoc;
     return 1;
 }
 

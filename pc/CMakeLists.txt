@@ -339,6 +339,12 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_peer_table.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_guest_admit.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_interest.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_roster.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_puppet_pool.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_keytab.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_tabfile.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dayclaims.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_guest_store.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c

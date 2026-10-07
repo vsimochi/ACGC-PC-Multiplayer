@@ -22,6 +22,7 @@ typedef struct {
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */
     int cstick_deadzone;  /* Gamepad C-stick deadzone, percent 0-40 (default 12) */
     int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..254 (pc_guest_admit_limit(); default 4); malformed / out of range = ignored */
+    int interest_management; /* HOST only (capacity phase 5): 1 (default) = the MOVE relay is thinned by the receiver's interest (pc_interest.h), 0 = every sample to every peer (the old behaviour) */
     int guest_memory_mb;  /* HOST only (capacity phase 3): memory budget of the guest store in MB (default 256, 1..1048576): how many guests the host keeps = budget / ~28 KB per guest; there is no fixed guest table any more */
     int max_peers;        /* HOST only (capacity phase 2): most simultaneous transport peers (residents + guests + a connecting town-fetch client), 1..254 (default 8); out of range = ignored */
     int allow_new_guests; /* HOST only (M-D): 1 = a NEW guest key may be admitted (default), 0 = only guests already known to guests.dat; a new key is refused (SERVER_FULL) */

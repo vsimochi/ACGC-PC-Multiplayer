@@ -346,13 +346,15 @@ static int aNTT_talk_end_chk(ACTOR* actorx, GAME* game) {
  * claimant = the resident slot 0..3 (the bit the vanilla talk would set), or -1 for a guest. check returns 1 = may be given (*song set: the requested song, or a random one for 0xFFFF), 0 = no
  * concert / bad song, 2 = this player already got a song at this concert. */
 int aNTT_pc_host_song_check(int claimant, int request, int* song) {
+    /* capacity phase 7: claimant -2 = a GUEST whose once-per-concert claim the HOST keeps per guest identity (pc_net_game.c, pcnetgame_kk_*): the shared foreigner bit is NOT consulted
+     * (it made the second guest of a concert "already got a song" because the FIRST guest had taken the one bit all foreigners share). */
     aNTT_event_save_c* save = (aNTT_event_save_c*)mEv_get_save_area(mEv_EVENT_KK_SLIDER, 0xa);
     aNTT_event_common_c* common = (aNTT_event_common_c*)mEv_get_common_area(mEv_EVENT_KK_SLIDER, 0x10);
     int got;
     if (Save_Get(event_save_common).weekly_event.type != mEv_EVENT_KK_SLIDER || save == NULL || common == NULL) {
         return 0;
     }
-    got = (claimant >= 0 && claimant < PLAYER_NUM) ? (save->bitfield & ((u16)aNTT_FLAG_AIRCHECK_RECEIVED << claimant)) != 0 : (common->foreigner_bitfield & aNTT_FLAG_AIRCHECK_RECEIVED) != 0;
+    got = claimant == -2 ? 0 : (claimant >= 0 && claimant < PLAYER_NUM) ? (save->bitfield & ((u16)aNTT_FLAG_AIRCHECK_RECEIVED << claimant)) != 0 : (common->foreigner_bitfield & aNTT_FLAG_AIRCHECK_RECEIVED) != 0;
     if (got) {
         return 2;
     }
@@ -365,6 +367,9 @@ void aNTT_pc_host_song_commit(int claimant) {
     aNTT_event_common_c* common = (aNTT_event_common_c*)mEv_get_common_area(mEv_EVENT_KK_SLIDER, 0x10);
     if (save == NULL || common == NULL) {
         return;
+    }
+    if (claimant == -2) {
+        return; /* a guest: the host's per-guest claim table records it (pcnetgame_kk_guest_mark) */
     }
     if (claimant >= 0 && claimant < PLAYER_NUM) {
         save->bitfield |= (u16)((u16)aNTT_FLAG_AIRCHECK_RECEIVED << claimant);

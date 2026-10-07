@@ -108,7 +108,7 @@ def main():
     hunks = [int(m.group(1)) for m in re.finditer(r"^@@ -(\d+)", diff, re.M)]
     check("wire unchanged: no hunk of pc_net_game.c inside the message / struct definitions except the guest-limit comment (lines %s)" % hunks[:3], all(h > 3000 or h in (186, 619, 620) for h in hunks))
     changed = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "HEAD"], capture_output=True, text=True).stdout.split()
-    check("Phase 5+ untouched: no puppet / remote-player / interest / Rover / radial / character file changed", not [f for f in changed if re.search(r"remote_player|puppet|interest|rover|radial|character|pc_net\.(c|h)$", f, re.I)])
+    check("Rover / radial menu / character files not touched (phases 5+ are covered by test_capacity_phase567.py)", not [f for f in changed if re.search(r"rover|radial|character", f, re.I)])
     bad = [n for n, ok in results if not ok]
     print("\nRESULT passed=%d failed=%d" % (len(results) - len(bad), len(bad)))
     return 1 if bad else 0
