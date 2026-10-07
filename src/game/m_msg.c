@@ -131,6 +131,7 @@ extern void mMsg_debug_draw(gfxprint_t* gfxprint) {
 extern void mMsg_Main(GAME* game) {
 #ifdef TARGET_PC
     mMsg_pc_dump_hook();
+    mMsg_pc_work_items_hook();
 #endif
     mMsg_Main_Window(&mMsg_window, game);
     mChoice_Main(&mMsg_window.choice_window, game);

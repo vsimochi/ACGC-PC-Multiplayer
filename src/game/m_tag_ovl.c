@@ -1891,6 +1891,9 @@ static void mTG_init_tag_data_item_win_sub_mail_item(Submenu* submenu, mTG_tag_c
         &mTG_init_tag_data_item_win_sub_mail_item_postoffice, &mTG_init_tag_data_item_win_sub_mail_item_sp_npc,
     };
     static u8 present_str[7] = "Present";
+#ifdef TARGET_PC
+    static u8 delivery_item_str[13] = "Delivery Item";
+#endif
 
     f32 scale = 0.875f;
     int win_type = mTG_WIN_TYPE_ITEM;
@@ -1949,6 +1952,12 @@ static void mTG_init_tag_data_item_win_sub_mail_item(Submenu* submenu, mTG_tag_c
     if (tag->str2_type == mTG_QSTR_TYPE_NONE) {
         if (itemCond == mPr_ITEM_COND_PRESENT) {
             mem_copy(tag->str0, present_str, sizeof(present_str));
+#ifdef TARGET_PC
+        } else if (itemCond == mPr_ITEM_COND_QUEST && tag->table == mTG_TABLE_ITEM && !(ITEM_NAME_GET_TYPE(itemNo) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT(itemNo) == ITEM1_CAT_MONEY)) {
+            /* a QUEST item with no recipient / sender entry (the Work Mode parcel / fetched item, a first-job item): the vanilla "Delivery for X from Y" text above is untouched; Nook's
+             * debt money keeps its own name */
+            mem_copy(tag->str0, delivery_item_str, sizeof(delivery_item_str));
+#endif
         } else if (itemNo >= ITM_MY_ORG_UMBRELLA0 && itemNo <= ITM_MY_ORG_UMBRELLA7) {
             mem_copy(tag->str0, Now_Private->my_org[(itemNo - ITM_MY_ORG_UMBRELLA0) & 7].name,
                      mNW_ORIGINAL_DESIGN_NAME_LEN);

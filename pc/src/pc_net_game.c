@@ -142,6 +142,7 @@
  * all of its connection state in one function on start, connect, disconnect and shutdown.
  * =============================================================================================
  */
+#include "m_quest.h" /* mQst_PC_SlotHasQuestEntry */
 #include "pc_net_game.h"
 #include "pc_residence.h"   /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES: the one place that knows "4 resident slots, 4 houses" */
 #include "pc_test_hooks.h"  /* test-hook guard (PC_NET_TEST_HOOKS + env AC_TEST_HOOKS=1) */
@@ -17613,6 +17614,10 @@ static uint8_t pcnetgame_work_plan(const PCNetWorkChar* w, const PCNetGameTxnTag
                 *why = "this job cannot be completed with that item at this step";
                 return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
             }
+            if (w->job_type == PC_WORK_JOB_FETCH_VILLAGER && mPr_GET_ITEM_COND(*post_conds, t->slot) != mPr_ITEM_COND_QUEST) {
+                *why = "the handed-in item is not the job's delivery item (an ordinary copy of the same item does not count)";
+                return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
             post[t->slot] = (uint16_t)EMPTY_NO;
             *post_conds = mPr_SET_ITEM_COND(*post_conds, t->slot, mPr_ITEM_COND_NORMAL);
             add = w->reward;
@@ -17630,7 +17635,7 @@ static uint8_t pcnetgame_work_plan(const PCNetWorkChar* w, const PCNetGameTxnTag
                 return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
             }
             post[t->slot] = w->carried_item;
-            *post_conds = mPr_SET_ITEM_COND(*post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+            *post_conds = mPr_SET_ITEM_COND(*post_conds, t->slot, mPr_ITEM_COND_QUEST); /* the parcel is a vanilla QUEST item: unsellable, unusable, move-only ("Delivery Item") */
             break;
         case PC_WORK_OP_VILLAGER_GIVE: /* the villager hands over the fetched item */
             if (w->job_type != PC_WORK_JOB_FETCH_VILLAGER || w->obj_state != PC_WORK_OBJ_START || t->aux_item != w->target_villager || t->item != w->obj_item) {
@@ -17638,11 +17643,15 @@ static uint8_t pcnetgame_work_plan(const PCNetWorkChar* w, const PCNetGameTxnTag
                 return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
             }
             post[t->slot] = w->obj_item;
-            *post_conds = mPr_SET_ITEM_COND(*post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+            *post_conds = mPr_SET_ITEM_COND(*post_conds, t->slot, mPr_ITEM_COND_QUEST); /* the fetched item is a vanilla QUEST item (see TAKE_PARCEL) */
             break;
         case PC_WORK_OP_VILLAGER_RECEIVE: /* the parcel is handed to its villager; the optional tip is paid */
             if (w->job_type != PC_WORK_JOB_DELIVER_VILLAGER || w->obj_state != PC_WORK_OBJ_CARRYING || t->aux_item != w->target_villager || t->item != w->carried_item) {
                 *why = "this villager is not the recipient of this character's parcel";
+                return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
+            if (mPr_GET_ITEM_COND(*post_conds, t->slot) != mPr_ITEM_COND_QUEST) {
+                *why = "the handed-over item is not the job's parcel (an ordinary copy of the same item does not count)";
                 return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
             }
             post[t->slot] = (uint16_t)EMPTY_NO;
@@ -23584,6 +23593,9 @@ static void pcnetgame_handle_client_work_state(const PCNetGameWorkStateMsg* in) 
            (unsigned)s_work_c.target_villager, (unsigned)s_work_c.reward, (unsigned)s_work_c.jobs_done, (unsigned)in->request_id);
 }
 
+static uint16_t s_work_leave_item;                                  /* the delivery item of the job a pending LEAVE abandons (0 = none): see pcnetgame_work_release_leftover() */
+static void pcnetgame_work_release_leftover(uint16_t item);         /* defined in the WORK CLIENT section */
+
 /* APPLIED of a WORK op. ENTER / LEAVE change nothing locally (the job lives on the host and arrives as WORK_STATE). The item ops and the payments take the HOST's post-image
  * (validated), or, when the local inventory moved during the round trip, only what the transaction touched. */
 static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
@@ -23599,6 +23611,10 @@ static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGame
         s_crec.next_check_ms = 0;
     }
     if (!removes && !grants && op != (uint8_t)PC_WORK_OP_REPORT) {
+        if (op == (uint8_t)PC_WORK_OP_LEAVE) {
+            pcnetgame_work_release_leftover(s_work_leave_item); /* the abandoned job's delivery item becomes an ordinary item again */
+            s_work_leave_item = 0;
+        }
         printf("[NET][WORK] client: work op %u APPLIED (request %u)\n", (unsigned)op, (unsigned)T->request_id);
         return 1;
     }
@@ -23626,7 +23642,10 @@ static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGame
         np->inventory.wallet = in->post_wallet;
     } else {
         if (removes) {
-            s = (np->inventory.pockets[t->slot] == (mActor_name_t)t->item) ? (int)t->slot : mPr_GetPossessionItemIdx(np, (mActor_name_t)t->item);
+            s = (np->inventory.pockets[t->slot] == (mActor_name_t)t->item) ? (int)t->slot : mPr_GetPossessionItemIdxWithCond(np, (mActor_name_t)t->item, mPr_ITEM_COND_QUEST);
+            if (s < 0) {
+                s = mPr_GetPossessionItemIdx(np, (mActor_name_t)t->item); /* a FRUIT job hands in an ordinary item */
+            }
             if (s >= 0) {
                 np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;
                 np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_NORMAL);
@@ -23640,7 +23659,7 @@ static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGame
                 s = t->slot; /* no free slot locally: the host's slot wins, a local item put there meanwhile is lost, never duplicated */
             }
             np->inventory.pockets[s] = (mActor_name_t)t->item;
-            np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_NORMAL);
+            np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_QUEST);
         }
         np->inventory.wallet = (np->inventory.wallet + paid > (u32)mPr_WALLET_MAX) ? (u32)mPr_WALLET_MAX : np->inventory.wallet + paid;
     }
@@ -25283,18 +25302,44 @@ int pc_net_game_work_view(PCWorkView* v) {
     return 1;
 }
 
-/* the first pocket slot holding `item` (EMPTY_NO = a free slot), or -1 */
-static int pcnetgame_work_find_pocket(uint16_t item) {
+/* the first pocket slot holding `item` (EMPTY_NO = a free slot) with the condition `cond` (-1 = any condition), or -1. The delivery / fetch hand-ins pass mPr_ITEM_COND_QUEST: an ordinary
+ * copy of the same item never matches. */
+static int pcnetgame_work_find_pocket(uint16_t item, int cond) {
     int i;
     if (Now_Private == NULL) {
         return -1;
     }
     for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
-        if ((uint16_t)Now_Private->inventory.pockets[i] == item) {
+        if ((uint16_t)Now_Private->inventory.pockets[i] == item && (cond < 0 || (int)mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, i) == cond)) {
             return i;
         }
     }
     return -1;
+}
+
+/* The pocket item a job has handed out and not yet taken back (a QUEST copy sits in the pockets), 0 = none. */
+static uint16_t pcnetgame_work_carry_item(int job_type, int obj_state, uint16_t obj_item, uint16_t carried_item) {
+    if (obj_state != PC_WORK_OBJ_CARRYING) {
+        return 0;
+    }
+    return (uint16_t)(job_type == PC_WORK_JOB_FETCH_VILLAGER ? obj_item : job_type == PC_WORK_JOB_DELIVER_VILLAGER ? carried_item : 0);
+}
+
+/* A Work job was ABANDONED (LEAVE) while its delivery item was in the pockets: that one item becomes an ordinary item again (the vanilla rule for leftovers is "they stay"; a QUEST item
+ * with no quest behind it would otherwise be unsellable, unusable and undisposable for good). Only the Work-created copy is touched: a QUEST slot of that item id that NO vanilla delivery /
+ * errand entry tracks. Nothing else is cleared or normalized. */
+static void pcnetgame_work_release_leftover(uint16_t item) {
+    int i;
+    if (Now_Private == NULL || item == 0 || item == (uint16_t)EMPTY_NO) {
+        return;
+    }
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if ((uint16_t)Now_Private->inventory.pockets[i] == item && mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, i) == mPr_ITEM_COND_QUEST && !mQst_PC_SlotHasQuestEntry(i)) {
+            Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, i, mPr_ITEM_COND_NORMAL);
+            printf("[NET][WORK] the abandoned job's delivery item 0x%04X (pocket %d) is an ordinary item again\n", (unsigned)item, i);
+            return;
+        }
+    }
 }
 
 int pc_net_game_work_villager_pending(int npc, int* op) {
@@ -25302,11 +25347,11 @@ int pc_net_game_work_villager_pending(int npc, int* op) {
     if (!pc_net_game_work_offer_available() || npc <= 0 || !pc_net_game_work_view(&v) || !v.mode_on || v.state != PC_WORK_STATE_ACTIVE || v.target_villager != npc) {
         return 0;
     }
-    if (v.job_type == PC_WORK_JOB_FETCH_VILLAGER && v.obj_state == PC_WORK_OBJ_START && pcnetgame_work_find_pocket((uint16_t)EMPTY_NO) >= 0) {
+    if (v.job_type == PC_WORK_JOB_FETCH_VILLAGER && v.obj_state == PC_WORK_OBJ_START && pcnetgame_work_find_pocket((uint16_t)EMPTY_NO, -1) >= 0) {
         *op = PC_WORK_OP_VILLAGER_GIVE;
         return 1;
     }
-    if (v.job_type == PC_WORK_JOB_DELIVER_VILLAGER && v.obj_state == PC_WORK_OBJ_CARRYING && pcnetgame_work_find_pocket((uint16_t)v.carried_item) >= 0) {
+    if (v.job_type == PC_WORK_JOB_DELIVER_VILLAGER && v.obj_state == PC_WORK_OBJ_CARRYING && pcnetgame_work_find_pocket((uint16_t)v.carried_item, mPr_ITEM_COND_QUEST) >= 0) {
         *op = PC_WORK_OP_VILLAGER_RECEIVE;
         return 1;
     }
@@ -25328,22 +25373,22 @@ static uint8_t pcnetgame_work_build(int op, int npc, uint8_t* slot, uint16_t* it
     }
     switch (op) {
         case PC_WORK_OP_DELIVER:
-            s = pcnetgame_work_find_pocket((uint16_t)v.obj_item);
+            s = pcnetgame_work_find_pocket((uint16_t)v.obj_item, v.job_type == PC_WORK_JOB_FETCH_VILLAGER ? mPr_ITEM_COND_QUEST : -1); /* FRUIT: the player's own ordinary fruit */
             *item = (uint16_t)v.obj_item;
             *aux_item = (uint16_t)(v.job_id & 0xFFFFu);
             break;
         case PC_WORK_OP_TAKE_PARCEL:
-            s = pcnetgame_work_find_pocket((uint16_t)EMPTY_NO);
+            s = pcnetgame_work_find_pocket((uint16_t)EMPTY_NO, -1);
             *item = (uint16_t)v.carried_item;
             *aux_item = (uint16_t)(v.job_id & 0xFFFFu);
             break;
         case PC_WORK_OP_VILLAGER_GIVE:
-            s = pcnetgame_work_find_pocket((uint16_t)EMPTY_NO);
+            s = pcnetgame_work_find_pocket((uint16_t)EMPTY_NO, -1);
             *item = (uint16_t)v.obj_item;
             *aux_item = (uint16_t)npc;
             break;
         case PC_WORK_OP_VILLAGER_RECEIVE:
-            s = pcnetgame_work_find_pocket((uint16_t)v.carried_item);
+            s = pcnetgame_work_find_pocket((uint16_t)v.carried_item, mPr_ITEM_COND_QUEST);
             *item = (uint16_t)v.carried_item;
             *aux_item = (uint16_t)npc;
             break;
@@ -25368,7 +25413,7 @@ static int pcnetgame_work_host_local(int op, int npc) {
     uint32_t post_conds, post_wallet, paid = 0;
     const char* why = NULL;
     uint8_t reason, slot;
-    uint16_t item, aux;
+    uint16_t item, aux, leave_item;
     int i;
     if (w == NULL) {
         s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
@@ -25379,6 +25424,7 @@ static int pcnetgame_work_host_local(int op, int npc) {
         s_ts_last_reason = reason;
         return 0;
     }
+    leave_item = (op == PC_WORK_OP_LEAVE) ? pcnetgame_work_carry_item(w->job_type, w->obj_state, w->obj_item, w->carried_item) : 0;
     memset(&t, 0, sizeof(t));
     t.slot = slot;
     t.item = item;
@@ -25401,6 +25447,9 @@ static int pcnetgame_work_host_local(int op, int npc) {
     Now_Private->inventory.item_conditions = post_conds;
     Now_Private->inventory.wallet = post_wallet;
     pcnetgame_work_commit(w, (uint8_t)op);
+    if (op == PC_WORK_OP_LEAVE) {
+        pcnetgame_work_release_leftover(leave_item);
+    }
     pcnetgame_work_save();
     printf("[NET][WORK] host: the host player's work op %d done: job %u, paid %u, wallet now %u\n", op, (unsigned)w->job_id, (unsigned)paid, (unsigned)post_wallet);
     return 3;
@@ -25434,6 +25483,10 @@ int pc_net_game_work_begin_op(int op, int npc) {
     if (!pcnetgame_capture_owner_stamp(&stamp)) {
         s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
         return 0;
+    }
+    {
+        PCWorkView lv;
+        s_work_leave_item = (op == PC_WORK_OP_LEAVE && pc_net_game_work_view(&lv)) ? pcnetgame_work_carry_item(lv.job_type, lv.obj_state, (uint16_t)lv.obj_item, (uint16_t)lv.carried_item) : 0;
     }
     s_ts_op.active = 1;
     s_ts_op.kind = kind;
@@ -25505,7 +25558,7 @@ int pc_net_game_evnpc_claim_begin(int op, int arg) {
         return -1;
     }
     s_ts_last_reason = 0;
-    slot = pcnetgame_work_find_pocket((uint16_t)EMPTY_NO);
+    slot = pcnetgame_work_find_pocket((uint16_t)EMPTY_NO, -1);
     if (slot < 0 || !pcnetgame_capture_owner_stamp(&stamp)) {
         s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND; /* no room in the pockets: nothing is sent */
         return 0;

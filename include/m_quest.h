@@ -207,6 +207,10 @@ extern void mQst_CheckGrabItem(mActor_name_t item, int pocket_idx);
 extern void mQst_CheckPutItem(mActor_name_t item, int pocket_idx);
 extern int mQst_CheckNpcExistbyItemIdx(int idx, int sender_or_receipient);
 extern int mQst_GetToFromName(u8* to_name, u8* from_name, int idx);
+#ifdef TARGET_PC
+/* 1 iff the pocket slot is tracked by a vanilla delivery / errand quest entry (a Work Mode QUEST item has none), see pc_net_game.c pcnetgame_work_release_leftover() */
+extern int mQst_PC_SlotHasQuestEntry(int idx);
+#endif
 extern int mQst_GetOccuredContestIdx(int kind);
 extern int mQst_GetFlowerSeedNum(int block_x, int block_z);
 extern int mQst_GetFlowerNum(int block_x, int block_z);

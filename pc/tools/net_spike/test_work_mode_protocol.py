@@ -15,6 +15,8 @@ The host gets AC_TEST_HOOKS=1 and AC_TEST_WORK_TYPE=1,2,3 (the job types of the 
      (a second request is refused), then DELIVER to Nook pays the Nook reward
   W5 job 3 = DELIVER_VILLAGER: TAKE_PARCEL grants the parcel once; REPORT before delivery is refused; the wrong villager takes nothing; the right villager takes the parcel + pays the optional
      tip (Bells / an item / none) ONCE; REPORT pays the Nook reward (the tip never replaces it)
+  W4q/W5q QUEST delivery items: the fetched item / the parcel are granted with the vanilla QUEST pocket condition (post image), a NORMAL copy of the same item NEVER completes the hand-in
+     (refused PRECOND, nothing consumed, nothing paid), the QUEST copy does -- also with a NORMAL decoy copy in another slot. FRUIT jobs are unchanged (an ordinary fruit)
   W6 LEAVE quits the job (state NONE, never paid, menu = 'I'd like to work' again); a later ENTER creates a NEW job
   W7 disconnect + reconnect as the SAME character: the job state is pushed again at connect (same job id / step), unchanged
   W8 a GUEST character works independently
@@ -92,6 +94,25 @@ def image(c, slot=None, item=None):
     return (pk, conds, wallet)
 
 
+QUEST_COND, NORMAL_COND = 2, 0
+
+
+def cond_at(conds, slot):
+    return (conds >> (2 * slot)) & 3
+
+
+def image_c(c, slot, item, cond, decoy_slot=None):
+    """the local pre-image with `item` at `slot` carrying pocket condition `cond`; optionally an ordinary (NORMAL) copy of the same item at `decoy_slot`"""
+    pockets, conds, wallet = c.txn_pre_image()
+    pk = list(pockets)
+    pk[slot] = item
+    conds = (conds & ~(3 << (2 * slot))) | (cond << (2 * slot))
+    if decoy_slot is not None:
+        pk[decoy_slot] = item
+        conds = conds & ~(3 << (2 * decoy_slot))
+    return (tuple(pk), conds, wallet)
+
+
 def free_slot(c):
     return TP.first_free_pocket(c)
 
@@ -121,6 +142,23 @@ def audit_source(check):
           "aQMgr_TALK_KIND_WORK" in qm and "pc_net_game_work_villager_pending" in qm and "pc_net_game_work_begin_op(l_work_op, l_work_npc)" in tw)
     check("S9 the connect-time push: the job state is sent once the record is SYNCED (connect / reconnect), with request 0",
           "wst->work_sent = 1;" in net and "pcnetgame_work_send_state((PCNetPeerId)p, &wst->bound_pid, 0);" in net)
+    tag = open(os.path.join(ROOT, "src", "game", "m_tag_ovl.c"), encoding="utf-8", errors="replace").read()
+    mq = open(os.path.join(ROOT, "src", "game", "m_quest.c"), encoding="utf-8", errors="replace").read()
+    check("S10 the parcel and the fetched item are granted as vanilla QUEST items (host plan + the client delta fallback); nothing else in the plan is marked",
+          net.count("mPr_ITEM_COND_QUEST); /* the parcel is a vanilla QUEST item") == 1 and net.count("mPr_ITEM_COND_QUEST); /* the fetched item is a vanilla QUEST item") == 1
+          and "np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_QUEST);" in net)
+    check("S11 the hand-in needs the QUEST copy: the host plan (fetch DELIVER + parcel RECEIVE) and the client lookup (pcnetgame_work_find_pocket(item, cond)) -- a FRUIT job still takes an ordinary fruit",
+          "mPr_GET_ITEM_COND(*post_conds, t->slot) != mPr_ITEM_COND_QUEST" in net and "static int pcnetgame_work_find_pocket(uint16_t item, int cond)" in net
+          and "pcnetgame_work_find_pocket((uint16_t)v.carried_item, mPr_ITEM_COND_QUEST)" in net and "v.job_type == PC_WORK_JOB_FETCH_VILLAGER ? mPr_ITEM_COND_QUEST : -1" in net)
+    check("S12 the label: the vanilla 'Delivery for X from Y' branch comes first and is untouched; 'Delivery Item' only for a QUEST item without recipient entry (Nook's debt money excluded)",
+          "static u8 delivery_item_str[13] = \"Delivery Item\";" in tag and tag.index("mQst_GetToFromName(str0, str1, idx) == TRUE") < tag.index("mem_copy(tag->str0, delivery_item_str")
+          and "itemCond == mPr_ITEM_COND_QUEST && tag->table == mTG_TABLE_ITEM" in tag and "ITEM1_CAT_MONEY" in tag[tag.index("delivery_item_str, sizeof") - 700:tag.index("delivery_item_str, sizeof")])
+    check("S13 selling / use / mail / drop need a NORMAL condition: the vanilla checks are unchanged (m_submenu.c sell filter, Nook refusal, the network sale gate)",
+          "mPr_GET_ITEM_COND(priv->inventory.item_conditions, slot_no) == mPr_ITEM_COND_NORMAL" in open(os.path.join(ROOT, "src", "game", "m_submenu.c"), encoding="utf-8", errors="replace").read()
+          and "aNSC_CHECK_BUY_REFUSE_QUEST_COND" in shop and "a quest item is never bought" in net)
+    check("S14 an abandoned job's delivery item becomes ordinary again, ONLY that item: a QUEST slot of that id that no vanilla quest entry tracks (LEAVE, client APPLIED and host-local)",
+          "static void pcnetgame_work_release_leftover(uint16_t item)" in net and "!mQst_PC_SlotHasQuestEntry(i)" in net and net.count("pcnetgame_work_release_leftover(") >= 4
+          and "extern int mQst_PC_SlotHasQuestEntry(int idx)" in mq)
 
 
 def phase_work(run):
@@ -201,11 +239,19 @@ def phase_work(run):
     mark, sent, r = op(run, a, GIVE, slot, fitem, villager2, pre=image(a))
     run.tx_ok("W4 the RIGHT villager hands over the item", r, APPLIED, R["NONE"])
     ck("W4 the item is in the pocket slot (the host post image) and the step is 1", r is not None and r.post_pockets[slot] == fitem and pk_before[slot] == 0 and (last_state(a, mark) or {}).get("step") == 1)
+    ck("W4q the fetched item is granted as a QUEST item (pocket condition %s, post image)" % (cond_at(r.post_conds, slot) if r is not None else None), r is not None and cond_at(r.post_conds, slot) == QUEST_COND)
     mark, sent, r = op(run, a, GIVE, free_slot(a), fitem, villager2, pre=image(a))
     ck("W4 a SECOND request to the villager is refused (no duplicate item): PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
     wallet0 = a.txn_pre_image()[2]
-    mark, sent, r = op(run, a, DELIVER, slot, fitem, job2 & 0xFFFF, pre=image(a))
-    run.tx_ok("W4 DELIVER of the fetched item to Nook", r, APPLIED, R["NONE"])
+    mark, sent, r = op(run, a, DELIVER, slot, fitem, job2 & 0xFFFF, pre=image_c(a, slot, fitem, NORMAL_COND))
+    ck("W4q an ORDINARY (NORMAL) copy of the fetched item does NOT complete the job: PRECOND, nothing paid", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    dslot = next(i for i in range(15) if i != slot and a.txn_pre_image()[0][i] == 0)
+    mark, sent, r = op(run, a, DELIVER, dslot, fitem, job2 & 0xFFFF, pre=image_c(a, slot, fitem, QUEST_COND, decoy_slot=dslot))
+    ck("W4q handing in the NORMAL decoy slot (the QUEST copy sits in another slot) is refused: PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    mark, sent, r = op(run, a, DELIVER, slot, fitem, job2 & 0xFFFF, pre=image_c(a, slot, fitem, QUEST_COND, decoy_slot=dslot))
+    run.tx_ok("W4 DELIVER of the fetched item to Nook (the QUEST copy, with an ordinary decoy copy elsewhere)", r, APPLIED, R["NONE"])
+    ck("W4q the QUEST slot was emptied and its condition cleared, the decoy copy stays untouched (it is the client's own ordinary item)",
+       r is not None and r.post_pockets[slot] == 0 and cond_at(r.post_conds, slot) == NORMAL_COND and r.post_pockets[dslot] == fitem and cond_at(r.post_conds, dslot) == NORMAL_COND)
     ck("W4 the Nook reward is paid by the HOST and the job is retired", r is not None and r.post_wallet == wallet0 + reward2 and (last_state(a, mark) or {}).get("state") == 0)
 
     # ---- W5: job 3 = DELIVER_VILLAGER
@@ -221,13 +267,19 @@ def phase_work(run):
     mark, sent, r = op(run, a, TAKE, slot, parcel, job3 & 0xFFFF, pre=image(a))
     run.tx_ok("W5 TAKE_PARCEL (Nook hands the parcel over)", r, APPLIED, R["NONE"])
     ck("W5 the parcel is in the pocket slot and the step is 1", r is not None and r.post_pockets[slot] == parcel and (last_state(a, mark) or {}).get("step") == 1)
+    ck("W5q the parcel is granted as a QUEST item (pocket condition %s, post image)" % (cond_at(r.post_conds, slot) if r is not None else None), r is not None and cond_at(r.post_conds, slot) == QUEST_COND)
     mark, sent, r = op(run, a, TAKE, free_slot(a), parcel, job3 & 0xFFFF, pre=image(a))
     ck("W5 a second parcel is refused (no duplicate item): PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
     mark, sent, r = op(run, a, RECEIVE, slot, parcel, (villager3 + 1) & 0xFFFF or 5, pre=image(a))
     ck("W5 the WRONG villager takes nothing: PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
     wallet0 = a.txn_pre_image()[2]
-    mark, sent, r = op(run, a, RECEIVE, slot, parcel, villager3, pre=image(a))
-    run.tx_ok("W5 the RIGHT villager takes the parcel", r, APPLIED, R["NONE"])
+    mark, sent, r = op(run, a, RECEIVE, slot, parcel, villager3, pre=image_c(a, slot, parcel, NORMAL_COND))
+    ck("W5q an ORDINARY (NORMAL) copy of the parcel item is NOT taken by the villager: PRECOND, the job is unchanged", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    pslot = next(i for i in range(15) if i != slot and a.txn_pre_image()[0][i] == 0)
+    mark, sent, r = op(run, a, RECEIVE, pslot, parcel, villager3, pre=image_c(a, slot, parcel, QUEST_COND, decoy_slot=pslot))
+    ck("W5q handing over the NORMAL decoy slot (the QUEST parcel sits in another slot) is refused: PRECOND", r is not None and r.outcome == REJECTED and r.reason == REASON_PRECOND)
+    mark, sent, r = op(run, a, RECEIVE, slot, parcel, villager3, pre=image_c(a, slot, parcel, QUEST_COND, decoy_slot=pslot))
+    run.tx_ok("W5 the RIGHT villager takes the parcel (the QUEST copy, with an ordinary decoy copy elsewhere)", r, APPLIED, R["NONE"])
     if r is not None and r.outcome == APPLIED:
         if tkind == 1:
             ck("W5 the villager tip is Bells (%d): the wallet grows by exactly the tip, the slot is empty" % tvalue, r.post_wallet == wallet0 + tvalue and r.post_pockets[slot] == 0)
@@ -236,7 +288,7 @@ def phase_work(run):
         else:
             ck("W5 no villager tip: the slot is empty, the wallet is unchanged", r.post_pockets[slot] == 0 and r.post_wallet == wallet0)
         ck("W5 the step is 2 (delivered)", (last_state(a, mark) or {}).get("step") == 2)
-    mark, sent, r2 = op(run, a, RECEIVE, slot, parcel, villager3, pre=image(a, slot, parcel))
+    mark, sent, r2 = op(run, a, RECEIVE, slot, parcel, villager3, pre=image_c(a, slot, parcel, QUEST_COND))
     ck("W5 the villager cannot be paid twice (a second RECEIVE is refused): PRECOND", r2 is not None and r2.outcome == REJECTED and r2.reason == REASON_PRECOND)
     wallet0 = a.txn_pre_image()[2]
     mark, sent, r = op(run, a, REPORT, 0, 0, job3 & 0xFFFF)

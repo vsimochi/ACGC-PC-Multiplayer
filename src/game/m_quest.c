@@ -236,6 +236,12 @@ static int mQst_GetErrandIdxbyItemIdx(int idx) {
     return d_idx;
 }
 
+#ifdef TARGET_PC
+extern int mQst_PC_SlotHasQuestEntry(int idx) {
+    return mQst_GetDeliveryIdxbyItemIdx(idx) != -1 || mQst_GetErrandIdxbyItemIdx(idx) != -1;
+}
+#endif
+
 extern int mQst_ClearQuestbyPossessionIdx(int idx) {
     int res = FALSE;
 

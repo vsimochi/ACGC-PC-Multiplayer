@@ -473,6 +473,80 @@ static void mMsg_pc_dump_hook(void) {
         }
     }
 }
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_WORK_ITEMS=1; the host is forced to job type 3 = deliver to a villager with AC_TEST_WORK_TYPE=3): the process ENTERs a job, takes Nook's parcel and quits the
+ * job through the REAL work ops (the client TXN path, the apply and the abandon cleanup), logging its pockets (item, pocket condition) after the parcel and after the quit. Never active in normal play. */
+static void mMsg_pc_work_items_dump(const char* tag, unsigned parcel) {
+    Private_c* priv = Common_Get(now_private);
+    int i;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if (priv->inventory.pockets[i] != EMPTY_NO) {
+            printf("[WORKITEM][TEST-ONLY] %s: pocket %d item 0x%04X cond %d%s\n", tag, i, (unsigned)priv->inventory.pockets[i], (int)mPr_GET_ITEM_COND(priv->inventory.item_conditions, i),
+                   (unsigned)priv->inventory.pockets[i] == parcel ? " (the parcel item)" : "");
+        }
+    }
+    printf("[WORKITEM][TEST-ONLY] %s: parcel item 0x%04X, pockets listed\n", tag, parcel);
+}
+
+static void mMsg_pc_work_items_hook(void) {
+    static int idx = 0, waiting = 0, tries = 0;
+    static uint32_t retry_ms = 0;
+    static unsigned parcel = 0;
+    static const int ops[3] = { PC_WORK_OP_ENTER, PC_WORK_OP_TAKE_PARCEL, PC_WORK_OP_LEAVE };
+    int r, finished = 0;
+
+    if (idx >= 3 || pc_test_hook_getenv("AC_TEST_WORK_ITEMS") == NULL || !pc_net_game_work_offer_available() || pc_net_game_now_ms() < retry_ms) {
+        return;
+    }
+    if (!waiting) {
+        PCWorkView v;
+        if (idx == 1 && pc_net_game_work_view(&v)) {
+            static int dumped = 0;
+            parcel = (unsigned)v.carried_item;
+            if (!dumped) {
+                dumped = 1;
+                mMsg_pc_work_items_dump("before-TAKE", parcel);
+            }
+        }
+        r = pc_net_game_work_begin_op(ops[idx], 0);
+        if (r == -1) {
+            return;
+        }
+        if (r == 1) {
+            waiting = 1;
+        } else if (r == 3) {
+            finished = 1; /* the host's own player: done at once */
+        } else if (tries++ < 20) {
+            retry_ms = pc_net_game_now_ms() + 1000u; /* a local refusal (not quite ready): again in a second */
+            return;
+        } else {
+            idx = 3;
+            return;
+        }
+    } else {
+        r = pc_net_game_ts_poll();
+        if (r == PC_NETGAME_TS_OP_PENDING) {
+            return;
+        }
+        if (r == PC_NETGAME_TS_OP_REJECTED && pc_net_game_ts_last_reject_reason() == 0 && tries++ < 20) {
+            waiting = 0;
+            retry_ms = pc_net_game_now_ms() + 1000u;
+            return;
+        }
+        finished = 1;
+    }
+    if (finished) {
+        printf("[WORKITEM][TEST-ONLY] work op %d finished\n", ops[idx]);
+        if (ops[idx] == PC_WORK_OP_TAKE_PARCEL) {
+            mMsg_pc_work_items_dump("after-TAKE", parcel);
+        } else if (ops[idx] == PC_WORK_OP_LEAVE) {
+            mMsg_pc_work_items_dump("after-LEAVE", parcel);
+        }
+        idx++;
+        waiting = 0;
+        tries = 0;
+    }
+}
 #endif
 
 extern int mMsg_ChangeMsgData(mMsg_Window_c* msg_p, int index) {
