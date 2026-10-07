@@ -640,9 +640,13 @@ static void pc_ded_cmd_status(void) {
     }
     pc_ded_printf("  peers: connected=%d ready=%d\n", transport, ready);
     {
-        int gb = 0, gc = 0;
-        if (pc_net_game_dedicated_guest_counts(&gb, &gc)) {
-            pc_ded_printf("  guests: bound=%d max_guests=%d\n", gb, gc);
+        PCNetGameDedicatedGuestAdmission ga;
+        if (pc_net_game_dedicated_guest_admission(&ga)) {
+            pc_ded_printf("  guests: bound=%d max_guests=%d (configured), admissible now %d (limited by transport capacity), available %d\n", ga.bound, ga.configured, ga.effective,
+                   ga.effective - ga.bound > 0 ? ga.effective - ga.bound : 0);
+            pc_ded_printf("  guest store: %d guest(s) stored, %d entries allocated (memory budget %d), new guests %s\n", ga.stored, ga.store_cap, ga.store_budget,
+                   ga.untrusted ? "REFUSED (host is UNTRUSTED: a guest file is unreadable / duplicated)" : (ga.allow_new ? "accepted" : "REFUSED (allow_new_guests = 0)"));
+            pc_ded_printf("  a guest is refused when: guest admission full (bound >= max_guests) | transport full (no free peer) | token invalid | host untrusted | store budget used up\n");
         }
     }
     {

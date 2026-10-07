@@ -104,7 +104,7 @@ def main():
     ng = read("pc/src/pc_net_game.c")
     code = re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", "", ng, flags=re.S))
     check("the game no longer uses a fixed guests.dat table: per-guest store API used, no s_guest_file in code", "s_guest_file" not in code and "pc_mp_gs_save" in ng and "pc_mp_gs_load" in ng and "pc_mp_gs_migrate_legacy" in ng)
-    check("Phase 4 untouched: max_guests default 4, clamp 1..8", ".max_guests = 4" in read("pc/src/pc_settings.c") and "return n > PC_NETGAME_GUEST_MAX ? PC_NETGAME_GUEST_MAX : n;" in ng)
+    check("admission default max_guests = 4 (the phase-3 1..8 clamp was lifted in phase 4: see test_capacity_phase4.py)", ".max_guests = 4" in read("pc/src/pc_settings.c"))
     check("settings: guest_memory_mb exists", "guest_memory_mb" in read("pc/src/pc_settings.c"))
     cm = read("pc/CMakeLists.txt")
     check("CMake builds pc_mp_guest_store.c", "src/pc_mp_guest_store.c" in cm)

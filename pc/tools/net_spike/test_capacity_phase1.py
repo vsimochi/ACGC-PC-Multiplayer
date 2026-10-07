@@ -83,7 +83,7 @@ int main(void) {
     ded = read("pc/src/pc_dedicated.c")
     check("status: capacity + transport counters printed", "capacity: transport slots" in ded and "pc_net_get_stats(&ns)" in ded and "pc_net_game_dedicated_capacity(" in ded)
     check("status accessor declared and defined (HOST only)", "int  pc_net_game_dedicated_capacity(" in read("pc/include/pc_dedicated.h") and "int pc_net_game_dedicated_capacity(" in ng)
-    check("Phase 1 leaves admission untouched: max_guests default 4 / clamp 1..8 / reserve rule", ".max_guests = 4" in read("pc/src/pc_settings.c") and "occupied + reserve > pc_net_peer_capacity()" in ng)
+    check("Phase 1 leaves admission untouched: max_guests default 4 / reserve rule (the 1..8 clamp itself was lifted in phase 4)", ".max_guests = 4" in read("pc/src/pc_settings.c") and "in->occupied + in->reserve > in->capacity" in read("pc/src/pc_guest_admit.c"))
 
     bad = [n for n, ok in results if not ok]
     print("test_capacity_phase1: %d checks, %d failed" % (len(results), len(bad)))

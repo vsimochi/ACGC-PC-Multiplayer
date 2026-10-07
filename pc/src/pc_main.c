@@ -1,5 +1,6 @@
 /* pc_main.c - PC entry point: SDL2/GL init and boot sequence */
 #include "pc_platform.h"
+#include "pc_guest_admit.h" /* --max-guests range */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES */
 #include "pc_test_hooks.h" /* test-hook guard (PC_NET_TEST_HOOKS + AC_TEST_HOOKS=1) */
@@ -1576,10 +1577,10 @@ int main(int argc, char* argv[]) {
             printf("                      deterministically from the identity. The name must be a valid game name\n");
             printf("                      and must not equal a resident's name (otherwise exit code 2).\n");
             printf("                      See pc_m_card.c pc_bootstrap_guest_poll().\n");
-            printf("  --max-guests N      HOST: most guests (visitors with their own character) connected at once, 1..8 (default 4 or settings.ini\n");
+            printf("  --max-guests N      HOST: most guests (visitors with their own character) connected at once, 1..254 (default 4 or settings.ini\n");
             printf("                      max_guests); a new guest beyond the cap is refused like a full server, residents are never refused.\n");
             printf("  --max-peers N       HOST: most simultaneous network peers (residents + guests + visitors still connecting), 1..254 (default 8 or settings.ini max_peers).\n");
-            printf("                      A peer beyond it is refused with a connection-lost notice. Guest admission (max_guests) is a separate, stricter limit.\n");
+            printf("                      A peer beyond it is refused with a connection-lost notice. Guest admission (max_guests) is a separate limit; a guest needs one peer, so it can never exceed this.\n");
             printf("  --allow-new-guests 0|1  HOST-only (exit 2 otherwise): 0 = refuse guests whose key this host does not know yet (known guests still return); default 1 or\n");
             printf("                      settings.ini [Network] allow_new_guests.\n");
             printf("  --resident-tokens off|tofu|required  HOST-only (exit 2 otherwise): resident credentials (default off or settings.ini resident_tokens). tofu: a resident's\n");
@@ -1874,9 +1875,9 @@ int main(int argc, char* argv[]) {
             return 2;
         } else if (strcmp(argv[i], "--max-guests") == 0) {
             /* Guests G4: HOST-side cap on simultaneously bound guests (overrides settings.ini max_guests); a bad / missing value is never ignored. */
-            const int mg = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
-            if (i + 1 >= argc || mg < 1 || mg > 8) {
-                fprintf(stderr, "[PC] --max-guests: REFUSED: the option needs a number 1..8 (most guests connected at once)\n");
+            int mg = 0;
+            if (i + 1 >= argc || !pc_guest_admit_parse(argv[i + 1], &mg)) {
+                fprintf(stderr, "[PC] --max-guests: REFUSED: the option needs a whole number 1..%d (most guests connected at once)\n", pc_guest_admit_limit());
                 return 2;
             }
             g_pc_max_guests_override = mg;

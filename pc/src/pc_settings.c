@@ -1,5 +1,6 @@
 /* pc_settings.c - runtime settings loaded from settings.ini */
 #include "pc_settings.h"
+#include "pc_guest_admit.h"
 #include "pc_net.h" /* PC_NET_RESERVED_PEER_ID, pc_peer_capacity_max (the max_peers range) */
 #include "pc_platform.h"
 #include "m_player_lib.h"
@@ -165,7 +166,7 @@ static void apply_setting(const char* key, const char* value) {
     } else if (strcmp(key, "cstick_deadzone") == 0) {
         if (val >= 0 && val <= 40) g_pc_settings.cstick_deadzone = val;
     } else if (strcmp(key, "max_guests") == 0) {
-        if (val >= 1 && val <= 8) g_pc_settings.max_guests = val;
+        { int mg; if (pc_guest_admit_parse(value, &mg)) g_pc_settings.max_guests = mg; } /* strict 1..254: malformed / out of range = ignored (default kept) */
     } else if (strcmp(key, "guest_memory_mb") == 0) {
         if (val >= 1 && val <= 1048576) g_pc_settings.guest_memory_mb = val;
     } else if (strcmp(key, "max_peers") == 0) {

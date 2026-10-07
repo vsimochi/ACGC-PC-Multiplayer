@@ -61,23 +61,24 @@ def main():
     # ------------------------------------------------------------------ S
     ck("S settings: PCSettings has max_guests, default 4 in the initializer, `g_pc_max_guests_override` default 0 (no override)",
        "int max_guests;" in st_h and ".max_guests = 4," in st_c and "int g_pc_max_guests_override = 0;" in st_c and "extern int g_pc_max_guests_override;" in st_h)
-    ck("S settings: apply_setting parses max_guests with the range 1..8 and ignores everything else (the default stays)",
-       'strcmp(key, "max_guests") == 0' in st_c and "if (val >= 1 && val <= 8) g_pc_settings.max_guests = val;" in st_c)
+    ck("S settings: apply_setting parses max_guests with the strict range 1..254 (pc_guest_admit_parse, capacity phase 4) and ignores everything else (the default stays)",
+       'strcmp(key, "max_guests") == 0' in st_c and "pc_guest_admit_parse(value, &mg)" in st_c)
     ck("S settings: the defaults text and the settings writer both carry `max_guests` under [Network]", st_c.count('"max_guests = 4\\n"') == 1 and "[Network]" in st_c
        and 'fprintf(f, "max_guests = %d\\n", g_pc_settings.max_guests);' in st_c)
     flag = re.search(r'else if \(strcmp\(argv\[i\], "--max-guests"\) == 0\) \{(.*?)\n        \} else if', main_c, re.S)
     fb = flag.group(1) if flag else ""
-    ck("S CLI: `--max-guests N` requires a value 1..8 (missing / 0 / 9 / non-numeric exits 2 with a REFUSED line) and sets g_pc_max_guests_override",
-       flag is not None and "i + 1 >= argc || mg < 1 || mg > 8" in fb and "return 2;" in fb and "g_pc_max_guests_override = mg;" in fb and "--max-guests: REFUSED" in fb)
+    ck("S CLI: `--max-guests N` requires a strict whole number 1..254 (missing / 0 / 255 / non-numeric exits 2 with a REFUSED line; capacity phase 4) and sets g_pc_max_guests_override",
+       flag is not None and "i + 1 >= argc || !pc_guest_admit_parse(argv[i + 1], &mg)" in fb and "return 2;" in fb and "g_pc_max_guests_override = mg;" in fb and "--max-guests: REFUSED" in fb)
     ck("S CLI: pc_main.c changed ONLY by the 11 added --max-guests lines vs the G3 commit (nothing removed)", numstat("pc/src/pc_main.c") == (11, 0))
     ck("S pc_settings.c / .h changed additively only", numstat("pc/src/pc_settings.c")[1] == 1 and numstat("pc/include/pc_settings.h")[1] == 0)   # 1 deleted line = the old last string line of the defaults
     mg = nb("pcnetgame_host_max_guests")
-    ck("S the effective cap: override wins over settings.ini, clamped to 1 .. PC_NETGAME_GUEST_MAX (the guest table size, 8)",
-       "g_pc_max_guests_override > 0 ? g_pc_max_guests_override : g_pc_settings.max_guests" in mg and "n < 1" in mg and "PC_NETGAME_GUEST_MAX ? PC_NETGAME_GUEST_MAX : n" in mg)
+    ck("S the effective cap: override wins over settings.ini, clamped to 1 .. pc_guest_admit_limit() (254, capacity phase 4)",
+       "g_pc_max_guests_override > 0 ? g_pc_max_guests_override : g_pc_settings.max_guests" in mg and "pc_guest_admit_clamp(" in mg)
 
     # ------------------------------------------------------------------ P
     pi = nb("pcnetgame_host_process_identity")
     gate = nb("pcnetgame_host_guest_cap_refusal")
+    ga_c = open(os.path.join(ROOT, "pc/src/pc_guest_admit.c"), encoding="utf-8").read()
     refs = [m.start() for m in re.finditer(r"pcnetgame_host_guest_cap_refusal\(", ng)]
     ck("P ONE call site of the admission gate (plus its definition), and it is inside pcnetgame_host_process_identity", len(refs) == 2 and pi != "" and "pcnetgame_host_guest_cap_refusal(peer," in pi
        and pi.count("pcnetgame_host_guest_cap_refusal(") == 1)
@@ -115,7 +116,7 @@ def main():
     ck("R the reserve counts resident records that exist (not null PersonalID), are not the host's own resident and are not bound to a READY peer",
        "mPr_NullCheckPersonalID" in rs and "i != own" in rs and "pcnetgame_host_peer_bound_to_resident(i, (PCNetPeerId)-1) < 0" in rs and "pcnetgame_host_own_resident_idx()" in rs)
     ck("R the gate refuses a guest when occupied transport peers + reserve exceed the transport capacity pc_net_peer_capacity() (log: 'more are held for residents'), checked after the max_guests cap",
-       "occupied + reserve > pc_net_peer_capacity()" in gate and "pc_net_peer_count()" in gate and "more are held for residents" in gate and gate.index("bound >= cap") < gate.index("occupied + reserve"))
+       "pc_guest_admit_decide(" in gate and "pc_net_peer_count()" in gate and "pc_net_peer_capacity()" in gate and ga_c.index("in->bound >=") < ga_c.index("in->occupied + in->reserve") and "more are held for residents" in ga_c)
 
     # ------------------------------------------------------------------ I
     rp = S.read("pc/src/pc_remote_player.c")

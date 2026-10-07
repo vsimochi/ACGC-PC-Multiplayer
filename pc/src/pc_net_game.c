@@ -184,6 +184,7 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_mp_members.h" /* M-E: save/mp/members.dat resident credentials (pure storage module) */
 #include "pc_mp_guests.h"  /* guests: the legacy save/mp/guests.dat v2 format (migrated) + save/mp/guest_token.dat client token file (pure storage module) */
 #include "pc_mp_guest_store.h" /* guests: the per-guest store (one file per guest, no size limit) */
+#include "pc_guest_admit.h" /* capacity phase 4: the pure guest admission rules (range, decision) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
 #include "m_player_lib.h" /* Stage 3: GET_PLAYER_ACTOR_NOW(), PLAYER_ACTOR, mPlayer_INDEX_*, and
@@ -616,8 +617,8 @@ _Static_assert(sizeof(PCNetGameIdentityAckMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_IDTOKEN_FLAG_NEW      0x01u
 #define PC_NETGAME_IDTOKEN_FLAG_KNOWN    0x02u
 #define PC_NETGAME_GUEST_TOKEN_LEN       16u
-/* 8 = the admission range of max_guests (1..8, policy of this phase), the size of the legacy guests.dat v2 (migrated at load) and the inline start size of the guest tables. It is NOT
- * a limit on stored guests any more: the guest store grows on demand (s_guest_cap, pcnetgame_guest_cap_ensure). */
+/* 8 = the size of the legacy guests.dat v2 (migrated at load) and the inline start size of the guest tables. It is NOT a limit on stored guests (the guest store grows on demand,
+ * s_guest_cap / pcnetgame_guest_cap_ensure) and NOT the admission range any more (max_guests is 1..pc_guest_admit_limit(), capacity phase 4). */
 #define PC_NETGAME_GUEST_MAX             8
 /* M-E resident credentials (v8 extended in place, no bump): IDENTITY_EXT flag bit1 = RESIDENT claim (exactly one of GUEST | RESIDENT; home_* = the resident's PersonalID in the
  * host town and must equal the IDENTITY's name / player_id / land_name / land_id); IDENTITY_TOKEN flag bit2 = RESIDENT (+ NEW / KNOWN; guest_slot = the resident index 0..3,
@@ -12258,14 +12259,11 @@ static int pcnetgame_host_peer_bound_to_guest(int gslot, PCNetPeerId except_peer
     return -1;
 }
 
-/* Guests G4: the host-local cap on simultaneously BOUND guests. `--max-guests N` (1..8) wins over settings.ini `max_guests` (1..8, default 4). The 1..8 range is the
- * admission policy of this phase (it is lifted later, separately from the storage, which no longer has a size limit). Never read by any resident path. */
+/* Guests G4: the host-local cap on simultaneously BOUND guests (the CONFIGURED admission capacity). `--max-guests N` wins over settings.ini `max_guests` (default 4); both are
+ * 1..pc_guest_admit_limit() (254 = one per usable wire id) and the parsers never produce anything else (the clamp only guards a direct write). It is independent of the guest
+ * STORE (any number of stored guests) and of the transport capacity (a guest also needs a peer: see pcnetgame_host_guest_cap_refusal). Never read by any resident path. */
 static int pcnetgame_host_max_guests(void) {
-    int n = g_pc_max_guests_override > 0 ? g_pc_max_guests_override : g_pc_settings.max_guests;
-    if (n < 1) {
-        n = 1;
-    }
-    return n > PC_NETGAME_GUEST_MAX ? PC_NETGAME_GUEST_MAX : n;
+    return pc_guest_admit_clamp(g_pc_max_guests_override > 0 ? g_pc_max_guests_override : g_pc_settings.max_guests);
 }
 
 /* M-D: `--allow-new-guests 0|1` wins over settings.ini allow_new_guests (default 1). Only consulted for a NEW guest key. */
@@ -12303,20 +12301,13 @@ static int pcnetgame_host_resident_peer_reserve(void) {
 /* Guests G4: admission gate for a guest `peer` that is about to be bound (a NEW key or a KNOWN key alike), evaluated BEFORE anything is minted or created.
  * Residents never reach it. Returns NULL = admitted, else the host log reason (the refusal reuses REJECT(SERVER_FULL); no wire change). */
 static const char* pcnetgame_host_guest_cap_refusal(PCNetPeerId peer, char* buf, size_t buf_size) {
-    const int cap = pcnetgame_host_max_guests();
-    const int bound = pcnetgame_host_bound_guest_count(peer);
-    const int reserve = pcnetgame_host_resident_peer_reserve();
-    const int occupied = pc_net_peer_count();
-    if (bound >= cap) {
-        snprintf(buf, buf_size, "guest limit reached (%d of max_guests=%d guests are connected)", bound, cap);
-        return buf;
-    }
-    if (occupied + reserve > pc_net_peer_capacity()) {
-        snprintf(buf, buf_size, "guest limit reached (%d of %d transport peer slots are in use and %d more are held for residents; %d of max_guests=%d guests connected)",
-                 occupied, pc_net_peer_capacity(), reserve, bound, cap);
-        return buf;
-    }
-    return NULL;
+    PCGuestAdmitIn in;
+    in.configured = pcnetgame_host_max_guests();
+    in.bound = pcnetgame_host_bound_guest_count(peer);
+    in.reserve = pcnetgame_host_resident_peer_reserve();
+    in.occupied = pc_net_peer_count();
+    in.capacity = pc_net_peer_capacity();
+    return pc_guest_admit_decide(&in, buf, buf_size) == PC_GUEST_ADMIT_OK ? NULL : buf;
 }
 
 /* THE binding -> record slot helper: -1 = not bound (or a binding that is out of range), 0..PLAYER_NUM-1 = the resident slot, PLAYER_NUM..
@@ -29802,6 +29793,12 @@ int pc_net_game_start_host(uint16_t port) {
     pcnetgame_reset_host_world_state();
     printf("[NET] hosting on UDP port %u (protocol %u), peer capacity %d (slots 0..%d, id %d reserved for the host)\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION, pc_net_peer_capacity(),
            pc_net_peer_span() - 1, (int)PC_NETGAME_HOST_WIRE_ID);
+    printf("[NET][GUEST] admission: max_guests=%d (configured, most guests bound at once), transport capacity %d, guests that can really be admitted: %d; resident slots stay %d\n",
+           pcnetgame_host_max_guests(), pc_net_peer_capacity(), pc_guest_admit_effective_cap(pcnetgame_host_max_guests(), pc_net_peer_capacity()), PLAYER_NUM);
+    if (pcnetgame_host_max_guests() > pc_net_peer_capacity()) {
+        printf("[NET][GUEST] admission: WARNING max_guests=%d is above the transport capacity %d (max_peers): at most %d guests can connect; raise max_peers to admit more\n",
+               pcnetgame_host_max_guests(), pc_net_peer_capacity(), pc_net_peer_capacity());
+    }
     PC_LOG(PCL_NET, "host listening: UDP port %u protocol %u\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION);
     return 1;
 }
@@ -35282,6 +35279,27 @@ int pc_net_game_dedicated_guest_counts(int* bound, int* cap) {
     return 1;
 }
 
+/* Capacity phase 4: the guest-admission view for the console status. configured = max_guests, effective = min(configured, transport capacity) (what can really be admitted),
+ * stored = guests in the store (bound or not), store_cap = guest entries allocated, store_budget = the most guest_memory_mb allows, untrusted = the store refuses new guests. 0 unless HOST. */
+int pc_net_game_dedicated_guest_admission(PCNetGameDedicatedGuestAdmission* out) {
+    int g;
+    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->configured = pcnetgame_host_max_guests();
+    out->effective = pc_guest_admit_effective_cap(out->configured, pc_net_peer_capacity());
+    out->bound = pcnetgame_host_bound_guest_count((PCNetPeerId)-1);
+    for (g = 0; g < s_guest_cap; g++) {
+        out->stored += s_guest[g].used ? 1 : 0;
+    }
+    out->store_cap = s_guest_cap;
+    out->store_budget = pcnetgame_guest_budget_slots();
+    out->untrusted = s_guest_untrusted ? 1 : 0;
+    out->allow_new = pcnetgame_host_allow_new_guests();
+    return 1;
+}
+
 /* Console status: transport slots in use / total, and how many of the free ones the guest admission gate currently holds back for residents that are not connected
  * (the same numbers pcnetgame_host_guest_cap_refusal compares). 0 unless HOST. */
 int pc_net_game_dedicated_capacity(int* peers_used, int* peers_total, int* resident_reserve) {
@@ -36060,9 +36078,14 @@ static int pcnetgame_dedicated_give_resolve(const char* sel, char* who, size_t w
         snprintf(msg, cap, "Unknown player ''.");
         return -1;
     }
-    if (strncmp(sel, "peer ", 5) == 0 && sel[5] >= '0' && sel[5] <= '9' && sel[6] == '\0') {
+    if (strncmp(sel, "peer ", 5) == 0 && sel[5] >= '0' && sel[5] <= '9') {
         PCNetGameDedicatedPeerInfo pi;
-        if (pc_net_game_dedicated_peer_info(sel[5] - '0', &pi) && pi.bound && pi.index >= 0) {
+        int pn = 0;
+        const char* d = sel + 5;
+        for (; *d >= '0' && *d <= '9' && pn < 1000; d++) {
+            pn = pn * 10 + (*d - '0'); /* any peer id 0..254 (capacity phase 4: more than 10 peers exist now) */
+        }
+        if (*d == '\0' && pc_net_game_dedicated_peer_info(pn, &pi) && pi.bound && pi.index >= 0) {
             found = pi.cls ? PLAYER_NUM + pi.index : pi.index;
             snprintf(who, whocap, "%s", pi.name);
             return found;

@@ -217,13 +217,16 @@ def run_h1(run, results):
         learn(i, c)
         run.release(c)
     ck("D guests 5..7 fill the table: slots 5,6,7; guests.dat holds 8 entries", [State.slot[i] for i in (5, 6, 7)] == [5, 6, 7] and len(entries(run)) == 8)
+    # capacity phase 3/4: the guest store has no 8-entry table any more -- a 9th NEW guest is simply stored (slot 8); only max_guests (bound count) / the memory budget refuse it
     off = len(run.log())
-    c9, rej9 = refused(run, 8)
+    c9 = join(run, 8)
+    learn(8, c9)
     lg = run.log()[off:]
-    ck("D the 9th NEW guest (cap not reached, 0 bound) is REFUSED with 'guest table is full' (SERVER_FULL), NOT the cap line; nothing created",
-       c9 is None and rej9 is not None and rej9.reason == FULL and "guest table is full" in lg and "guest limit reached" not in lg and len(entries(run)) == 8)
+    ck("D the 9th NEW guest is ADMITTED into slot 8 (no fixed table), 9 guests stored; no 'guest table is full', no cap line",
+       c9 is not None and State.slot[8] == 8 and len(entries(run)) == 9 and "guest table is full" not in lg and "guest limit reached" not in lg)
+    run.release(c9)
     k = join(run, 3, token=State.tok[3])
-    ck("D a known guest still reconnects with the table full", k.token_msgs[-1][1].flags == KNOWN and k.rec_pushes[-1]["data"] == State.rec[3])
+    ck("D a known guest still reconnects with 9 stored", k.token_msgs[-1][1].flags == KNOWN and k.rec_pushes[-1]["data"] == State.rec[3])
     run.release(k)
     ck("H1 host alive, no INTERNAL error", run.host.alive() and "*** INTERNAL" not in run.log())
 

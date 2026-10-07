@@ -77,6 +77,17 @@ typedef struct PCNetGameDedicatedPeerInfo {
 int  pc_net_game_dedicated_world_ready(void);   /* HOST && s_host_world_ready */
 int  pc_net_game_dedicated_peer_slots(void);    /* number of transport slots to iterate (0 unless HOST) */
 int  pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out); /* 1 iff the slot is not DISCONNECTED */
+typedef struct PCNetGameDedicatedGuestAdmission {
+    int configured;   /* max_guests */
+    int effective;    /* min(max_guests, transport capacity) */
+    int bound;        /* guests bound now */
+    int stored;       /* guests in the store */
+    int store_cap;    /* guest entries allocated */
+    int store_budget; /* the most guest_memory_mb allows */
+    int untrusted;    /* the guest store refuses new guests */
+    int allow_new;    /* allow_new_guests */
+} PCNetGameDedicatedGuestAdmission;
+int  pc_net_game_dedicated_guest_admission(PCNetGameDedicatedGuestAdmission* out); /* capacity phase 4: 1 iff HOST */
 int  pc_net_game_dedicated_guest_counts(int* bound, int* cap); /* G4: guests bound now / the max_guests cap; 1 iff HOST */
 int  pc_net_game_dedicated_capacity(int* peers_used, int* peers_total, int* resident_reserve); /* transport slots used / total / held for absent residents; 1 iff HOST */
 /* Guests G6.2: host operator tools (HOST only, main thread). `guests` lists through _guest_info (never the token); _guest_admin: op 0 = remove, 1 = reset-token.
