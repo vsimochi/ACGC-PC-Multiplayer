@@ -1,4 +1,6 @@
 /* pc_character.c - the local character store (see pc_character.h). Pure C: libc + OS file APIs + pc_guest_profile.c / pc_mp_guests.c helpers. */
+#include "pc_town_sanitize.h"
+#include "pc_town_cache.h"
 #include "pc_character.h"
 #include "pc_guest_profile.h"
 #include "pc_mp_guests.h"
@@ -1433,6 +1435,158 @@ int pc_character_delete(const char* dir, const char* uuid, char* err, size_t err
     if (x.fail) {
         seterr(err, errcap, "some files of the character could not be removed", NULL, NULL);
         return 0;
+    }
+    return 1;
+}
+
+/* ---------------- import resident identities from a standalone save ---------------- */
+
+#define GCI_MAIN_OFF 0x26040u
+#define GCI_SLOT0 (0x40u + 0x26000u + 0x20u)
+#define GCI_SLOT_STRIDE 0x2440u
+
+/* ASCII text of 8 raw font codes: trailing CHAR_SPACE (0x20) trimmed, every other code must be a character the character store accepts. 0 = not representable unchanged. */
+static int gci_name_text(const uint8_t b[8], char out[9]) {
+    int n = 8, i;
+    while (n > 0 && b[n - 1] == 0x20) {
+        n--;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        const uint8_t c = b[i];
+        const int ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == ' ' || c == '.' || c == '\'' || c == '-';
+        if (!ok) {
+            return 0;
+        }
+        out[i] = (char)c;
+    }
+    out[n] = '\0';
+    return 1;
+}
+
+static void imp_note(PCCharImportReport* rep, const char* who, const char* why) {
+    if (rep->nnotes < 4) {
+        snprintf(rep->notes[rep->nnotes++], sizeof(rep->notes[0]), "%.20s could not be imported: %s.", who, why);
+    }
+    rep->skipped++;
+}
+
+int pc_character_import_gci(const char* dir, const char* path, PCCharImportReport* rep, char* err, size_t errcap) {
+    static uint8_t buf[PC_TOWN_GCI_SIZE + 16];
+    static PCCharacter all[PC_CHARACTER_MAX];
+    FILE* f;
+    size_t got;
+    int n, slot;
+    PCCharImportReport r0;
+    if (rep == NULL) {
+        rep = &r0;
+    }
+    memset(rep, 0, sizeof(*rep));
+    dir = dir_or_default(dir);
+    f = fopen(path != NULL ? path : "", "rb"); /* read-only */
+    if (f == NULL) {
+        seterr(err, errcap, "%s", "cannot open that file", NULL);
+        return 0;
+    }
+    got = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    if (got != (size_t)PC_TOWN_GCI_SIZE) {
+        seterr(err, errcap, "%s", "not a supported save (it must be exactly 467008 bytes)", NULL);
+        return 0;
+    }
+    if (memcmp(buf, "GAFE", 4) != 0) {
+        seterr(err, errcap, "%s", "not a GAFE01 (NTSC-U) Animal Crossing save", NULL);
+        return 0;
+    }
+    if (pc_town_gci_is_sanitized(buf, got)) {
+        seterr(err, errcap, "%s", "that is a sanitized town image, not a player save", NULL);
+        return 0;
+    }
+    n = pc_character_list(dir, all, PC_CHARACTER_MAX, NULL);
+    for (slot = 0; slot < 4; slot++) {
+        const uint8_t* p = buf + GCI_SLOT0 + (size_t)slot * GCI_SLOT_STRIDE;
+        PCCharacter c;
+        uint8_t pid[20];
+        char why[300], who[12];
+        uint16_t lid;
+        int i, dup = 0, r;
+        if (p[0x1086] != 1) {
+            continue;
+        }
+        lid = (uint16_t)((p[0x12] << 8) | p[0x13]);
+        if (((lid & 0xFF00u) != 0x3000u) || (lid == 0xFFFFu && gci_name_text(p, who) == 0)) { /* land id not a real town id (an empty / null PersonalID has 0xFFFF) */
+            continue;
+        }
+        rep->found++;
+        memset(&c, 0, sizeof(c));
+        c.storage = PC_CHARACTER_STORAGE_STORE;
+        snprintf(who, sizeof(who), "slot %d", slot + 1);
+        if (!gci_name_text(p, c.name)) {
+            imp_note(rep, who, "unsupported character name");
+            continue;
+        }
+        snprintf(who, sizeof(who), "%s", c.name);
+        if (!gci_name_text(p + 8, c.home_town)) {
+            imp_note(rep, who, "unsupported town name");
+            continue;
+        }
+        memcpy(c.name_bytes, p, 8);
+        memcpy(c.home_town_bytes, p + 8, 8);
+        c.player_id = (uint16_t)((p[0x10] << 8) | p[0x11]);
+        c.land_id = lid;
+        if (p[0x14] > 1) {
+            imp_note(rep, who, "unsupported gender");
+            continue;
+        }
+        c.gender = p[0x14];
+        if (p[0x15] > 7) {
+            imp_note(rep, who, "unsupported face");
+            continue;
+        }
+        c.face = p[0x15];
+        pc_character_home_pid_be(&c, pid);
+        for (i = 0; i < n && !dup; i++) {
+            uint8_t q[20];
+            pc_character_home_pid_be(&all[i], q);
+            dup = memcmp(q, pid, 20) == 0;
+        }
+        if (dup) {
+            rep->existing++;
+            continue;
+        }
+        c.created = (uint32_t)time(NULL);
+        {
+            int tries = 0, clash;
+            do {
+                if (!uuid_new(c.uuid)) {
+                    imp_note(rep, who, "the OS random source failed");
+                    clash = -1;
+                    break;
+                }
+                for (clash = 0, i = 0; i < n; i++) {
+                    if (strcmp(all[i].uuid, c.uuid) == 0) {
+                        clash = 1;
+                    }
+                }
+            } while (clash == 1 && ++tries < 8);
+            if (clash != 0) {
+                if (clash == 1) imp_note(rep, who, "could not draw a unique id");
+                continue;
+            }
+        }
+        r = pc_character_write_exclusive(dir, &c, why, sizeof(why)); /* re-parses + validates what it writes: an identity the store cannot hold is refused here, not altered */
+        if (r != 1) {
+            imp_note(rep, who, r == 0 ? "the character already exists" : "its identity is not accepted by the character store");
+            continue;
+        }
+        char_file(dir, c.uuid, c.path, sizeof(c.path));
+        rep->imported++;
+        snprintf(rep->last_uuid, sizeof(rep->last_uuid), "%s", c.uuid);
+        if (n < PC_CHARACTER_MAX) {
+            all[n++] = c;
+        }
     }
     return 1;
 }

@@ -104,6 +104,19 @@ int pc_character_move(const char* dir, const char* uuid, int delta);
 int pc_character_resident_count(const char* dir, const char* uuid);
 int pc_character_delete(const char* dir, const char* uuid, char* err, size_t errcap);
 
+/* Import resident identities from a standalone GAFE01 .gci (read-only, in memory; the file is never modified, copied or loaded as the live save). Needs exactly PC_TOWN_GCI_SIZE
+ * bytes, a "GAFE" header and no sanitized-image marker. Every slot with exists == 1, a non-null PersonalID and a valid land id is a candidate; one whose identity cannot be stored
+ * UNCHANGED (non-ASCII name / town codes, gender other than 0 / 1, face out of range ...) is SKIPPED with a note (never sanitized), one whose 20-byte PersonalID matches an existing
+ * character (store or legacy row) is "already imported". No town membership or token is created (a save carries no credentials). Returns 1 when the file was readable (the report
+ * says what happened), 0 + err when it is not a usable save (nothing written). */
+typedef struct PCCharImportReport {
+    int  found, imported, existing, skipped;
+    char notes[4][72];                            /* the first skip reasons: "Barry could not be imported: unsupported character name." */
+    int  nnotes;
+    char last_uuid[PC_CHARACTER_UUID_LEN + 1];    /* the last character created ("" = none) */
+} PCCharImportReport;
+int pc_character_import_gci(const char* dir, const char* path, PCCharImportReport* rep, char* err, size_t errcap);
+
 /* characters.ini default = <uuid>. get: 1 + uuid in out[33], else 0. set: atomic replace; 1 / 0. */
 int pc_character_default_get(const char* dir, char out[PC_CHARACTER_UUID_LEN + 1]);
 int pc_character_default_set(const char* dir, const char* uuid);
