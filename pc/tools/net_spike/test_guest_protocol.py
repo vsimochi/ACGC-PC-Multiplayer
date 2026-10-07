@@ -77,6 +77,8 @@ def guests_path():
 
 def parse_guests(path):
     """Independent parser of the guests.dat v2 layout (pc_mp_guests.h). Returns {'gen', 'e': [dict]}; raises AssertionError on any violation."""
+    if not os.path.exists(path):
+        return parse_guest_store(path[:-len(".dat")] if path.endswith(".dat") else path)
     with open(path, "rb") as f:
         b = f.read()
     assert len(b) == GUEST_FILE, "size %d != %d" % (len(b), GUEST_FILE)
@@ -99,6 +101,33 @@ def parse_guests(path):
             assert tr == 0 and d["crc"] == (zlib.crc32(d["record"]) & 0xFFFFFFFF), "record crc32 / town reserved"
             assert d["record"][:20] == d["pid"] and d["record"][0x1086] == 1, "record belongs to the key and exists"
         ents.append(d)
+    return {"gen": gen, "e": ents}
+
+
+def parse_guest_store(d):
+    """Capacity phase 3: the host migrates guests.dat to one file per guest (<dir>/<32 hex>.gst, pc_mp_guest_store.h). Same result shape as parse_guests:
+    entries ordered by mint age (== slot order), padded with empty slots to at least 8; 'gen' = the highest per-guest generation."""
+    import glob
+    ents, gen = [], 0
+    for fn in sorted(glob.glob(os.path.join(d, "*.gst"))):
+        with open(fn, "rb") as f:
+            b = f.read()
+        assert len(b) == 32 + 16 + GUEST_ENTRY + 4, "guest file size %d" % len(b)
+        assert b[:8] == b"ACMPGS1\x00" and struct.unpack("<I", b[8:12])[0] == 3
+        assert struct.unpack("<I", b[-4:])[0] == (zlib.crc32(b[:-4]) & 0xFFFFFFFF), "guest file crc32"
+        gen = max(gen, struct.unpack("<I", b[20:24])[0])
+        e = b[48:48 + GUEST_ENTRY]
+        assert e[0] == 1
+        r = {"present": 1, "confirmed": e[1], "pid": bytes(e[4:24]), "token": bytes(e[24:40])}
+        r["epoch"], r["rev"], r["age"], r["crc"] = struct.unpack("<4I", e[40:56])
+        r["town_land_name"] = bytes(e[56:64])
+        r["town_land_id"], _tr, r["town_terrain_hash"] = struct.unpack("<HHI", e[64:72])
+        r["record"] = bytes(e[72:])
+        assert r["crc"] == (zlib.crc32(r["record"]) & 0xFFFFFFFF)
+        ents.append(r)
+    ents.sort(key=lambda r: r["age"])
+    while len(ents) < 8:
+        ents.append({"present": 0})
     return {"gen": gen, "e": ents}
 
 

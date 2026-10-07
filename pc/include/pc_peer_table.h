@@ -76,6 +76,29 @@ typedef struct PCPeerTable {
 int  pc_peer_tables_resize(PCPeerTable* t, int n, int inline_n, int span);
 /* Back to the zeroed inline storage (frees any heap). */
 void pc_peer_tables_release(PCPeerTable* t, int n, int inline_n);
+/* Growable tables (the guest store: one element per guest, and the record slots that follow the 4 residents in the shared slot index space). Same inline-first idea as above,
+ * but the count GROWS at run time and the contents are KEPT: pc_grow_tables_ensure() reallocates every table to base + want elements, copies the base + have in use, rebinds
+ * the pointers and frees the old heap block. All-or-nothing. POINTERS INTO A TABLE ARE INVALID AFTER A GROWTH: take element addresses only after the call. */
+typedef struct PCGrowTable {
+    void (*bind)(void* base);
+    void*  inline_buf; /* static storage, base + inline_n elements */
+    size_t elem;       /* sizeof one element (a row for a 2-D table) */
+    int    base;       /* elements that exist whatever the count (e.g. the 4 resident record slots) */
+    void*  heap;       /* current heap block, NULL while inline */
+    void*  cur;        /* the storage currently bound (set by the helper; initialise to inline_buf) */
+} PCGrowTable;
+#define PC_GROW_TABLE(TYPE, NAME, BASE, INLINE_N)                            \
+    static TYPE NAME##_inl[(BASE) + (INLINE_N)];                             \
+    static TYPE* NAME = NAME##_inl;                                          \
+    static void NAME##_bind(void* b) { NAME = (TYPE*)b; }
+#define PC_GROW_TABLE2(TYPE, NAME, BASE, INLINE_N, DIM)                      \
+    static TYPE NAME##_inl[(BASE) + (INLINE_N)][DIM];                        \
+    static TYPE (*NAME)[DIM] = NAME##_inl;                                   \
+    static void NAME##_bind(void* b) { NAME = (TYPE(*)[DIM])b; }
+#define PC_GROW_TABLE_ENTRY(NAME, BASE) { NAME##_bind, NAME##_inl, sizeof(NAME##_inl[0]), (BASE), NULL, NAME##_inl }
+/* want <= have: nothing to do (1). Otherwise every table gets base + want elements (the new ones zeroed). 0 = an allocation failed and NOTHING changed. */
+int pc_grow_tables_ensure(PCGrowTable* t, int n, int have, int want);
+
 /* TEST SEAM: replaces calloc / free (NULL = the C library, the only production value). */
 void pc_peer_tables_set_allocator(void* (*alloc)(size_t count, size_t size), void (*release)(void*));
 

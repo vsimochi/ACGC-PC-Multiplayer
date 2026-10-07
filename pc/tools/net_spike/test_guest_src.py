@@ -139,8 +139,8 @@ def main():
 
     # ------------------------------------------------------------------------------------------------ A
     ck("A pcnetgame_rec_priv_ptr is defined exactly once and is the only accessor of both record spaces: resident slot < PLAYER_NUM -> private_data, "
-       "guest slot < PC_NETGAME_REC_SLOTS and the entry used -> s_guest_rec", len(re.findall(r"^static Private_c\* pcnetgame_rec_priv_ptr\(", c, re.M)) == 1
-       and "slot >= 0 && slot < PLAYER_NUM" in fb("pcnetgame_rec_priv_ptr") and "slot >= PLAYER_NUM && slot < PC_NETGAME_REC_SLOTS && s_guest[slot - PLAYER_NUM].used" in fb("pcnetgame_rec_priv_ptr")
+       "guest slot < pcnetgame_rec_slots() (the guest part of the index space GROWS) and the entry used -> s_guest_rec", len(re.findall(r"^static Private_c\* pcnetgame_rec_priv_ptr\(", c, re.M)) == 1
+       and "slot >= 0 && slot < PLAYER_NUM" in fb("pcnetgame_rec_priv_ptr") and "slot >= PLAYER_NUM && slot < pcnetgame_rec_slots() && s_guest[slot - PLAYER_NUM].used" in fb("pcnetgame_rec_priv_ptr")
        and "&s_guest_rec[slot - PLAYER_NUM]" in fb("pcnetgame_rec_priv_ptr") and c.count("&s_guest_rec[") >= 4)
     ck("A s_guest_rec[] is addressed ONLY through the accessor, the guest table lifecycle functions (install / create / rollback) and the G6.2 operator tools (remove: "
        "pc_net_game_dedicated_guest_admin) and nothing else",
@@ -228,7 +228,7 @@ def main():
        and before("pcnetgame_host_mbox_tick", "idx < 0 || idx >= PLAYER_NUM", "Save_Get(private_data)[idx]") and "idx = st->bound_resident_idx;" in fb("pcnetgame_host_mbox_tick")
        and before("pcnetgame_host_remail_tick", "idx < 0 || idx >= PLAYER_NUM", "Save_Get(private_data)[idx]") and "idx = st->bound_resident_idx;" in fb("pcnetgame_host_remail_tick"))
     ck("A pcnetgame_rec_slot: the guest range returns BEFORE the first private_data subscript; the resident path keeps its range check",
-       before("pcnetgame_rec_slot", "idx >= PLAYER_NUM && idx < PC_NETGAME_REC_SLOTS", "Save_Get(private_data)[idx]") and "idx < 0 || idx >= PLAYER_NUM" in fb("pcnetgame_rec_slot"))
+       before("pcnetgame_rec_slot", "idx >= PLAYER_NUM && idx < pcnetgame_rec_slots()", "Save_Get(private_data)[idx]") and "idx < 0 || idx >= PLAYER_NUM" in fb("pcnetgame_rec_slot"))
     g = fb("pcnetgame_rec_gate")
     ck("A pcnetgame_rec_gate: the GUEST branch (bound_class GUEST -> PLAYER_NUM + guest slot, entry used, key equals the bind-time key) returns before the resident branch "
        "(idx = bound_resident_idx, own-resident test, bind-time PersonalID re-check) -- the resident gate text is unchanged",
@@ -244,12 +244,12 @@ def main():
     ts = fb("pcnetgame_handle_host_ts_txn")
     shop = ts[ts.index("if (is_shop) {"):ts.index("} else if (is_donate) {")]
     ck("D the SHOP is NOT refused for a guest (no PLAYER_NUM test in the shop branch): guests are full participants of buying / selling", "PLAYER_NUM" not in shop)
-    ck("D guest slots in the txn index space: s_rec_slot / s_rec_backup / s_txn_res are sized PC_NETGAME_REC_SLOTS = PLAYER_NUM + PC_NETGAME_GUEST_MAX; the resident-only "
+    ck("D guest slots in the txn index space: s_rec_slot / s_rec_backup / s_txn_res are growable tables of PLAYER_NUM + s_guest_cap elements (pcnetgame_rec_slots()); the resident-only "
        "arrays (s_mbox_host, s_remail_day) stay PLAYER_NUM",
-       "#define PC_NETGAME_REC_SLOTS (PLAYER_NUM + PC_NETGAME_GUEST_MAX)" in raw and "static PCNetGameRecSlot s_rec_slot[PC_NETGAME_REC_SLOTS];" in raw
-       and "static uint8_t  s_rec_backup[PC_NETGAME_REC_SLOTS][PC_NETGAME_REC_SIZE];" in raw and "static PCNetGameTxnResident s_txn_res[PC_NETGAME_REC_SLOTS];" in raw
+       "return PLAYER_NUM + s_guest_cap;" in raw and "PC_GROW_TABLE(PCNetGameRecSlot, s_rec_slot, PLAYER_NUM, PCNG_GUEST_INLINE)" in raw
+       and "PC_GROW_TABLE2(uint8_t, s_rec_backup, PLAYER_NUM, PCNG_GUEST_INLINE, PC_NETGAME_REC_SIZE)" in raw and "PC_GROW_TABLE(PCNetGameTxnResident, s_txn_res, PLAYER_NUM, PCNG_GUEST_INLINE)" in raw
        and "s_mbox_host[PLAYER_NUM][PC_NETGAME_MBOX_SLOTS]" in raw and "s_remail_day[PLAYER_NUM]" in raw
-       and "else if (idx < PC_NETGAME_REC_SLOTS) {" in fb("pcnetgame_txn_journal_clear"))
+       and "else if (idx < pcnetgame_rec_slots()) {" in fb("pcnetgame_txn_journal_clear"))
 
     # ------------------------------------------------------------------------------------------------ B
     ck("B bound_valid is assigned 1 in exactly one place (process_identity); bound_class / bound_guest_slot are assigned only there (+ the per-peer reset)",
@@ -258,8 +258,8 @@ def main():
        and sorted({n for a, b, n in funcs if re.search(r"bound_guest_slot = ", c[a:b])}) == ["pcnetgame_host_process_identity", "pcnetgame_reset_all_host_peer_state"]
        and "s_host_peer[peer].bound_guest_slot = -1;" in fb("pcnetgame_reset_all_host_peer_state"))
     slotfn = fb("pcnetgame_peer_rec_slot")
-    ck("B pcnetgame_peer_rec_slot derives the slot ONLY from the binding (bound_valid, bound_class, bound_guest_slot < PC_NETGAME_GUEST_MAX / bound_resident_idx < PLAYER_NUM), never a message",
-       "!st->bound_valid" in slotfn and "st->bound_guest_slot >= 0 && st->bound_guest_slot < PC_NETGAME_GUEST_MAX" in slotfn
+    ck("B pcnetgame_peer_rec_slot derives the slot ONLY from the binding (bound_valid, bound_class, bound_guest_slot < s_guest_cap / bound_resident_idx < PLAYER_NUM), never a message",
+       "!st->bound_valid" in slotfn and "st->bound_guest_slot >= 0 && st->bound_guest_slot < s_guest_cap" in slotfn
        and "st->bound_resident_idx >= 0 && st->bound_resident_idx < PLAYER_NUM" in slotfn and "in->" not in slotfn)
     ck("B PLAYER_NUM + <guest slot> is only computed from the binding (peer_rec_slot, note_peer_gone)",
        sorted({n for a, b, n in funcs if re.search(r"PLAYER_NUM \+ st->bound_guest_slot", c[a:b])}) == ["pcnetgame_peer_rec_slot", "pcnetgame_rec_note_peer_gone"])
@@ -344,9 +344,10 @@ def main():
        "pcnetgame_host_peer_bound_to_guest(guest_slot, peer)" in pi and "pc_net_evict(" in pi and pi.count("pc_net_evict(") == 1 and "PC_NETGAME_DUP_PARK_MAX_MS" in pi)
 
     # ------------------------------------------------------------------------------------------------ P
-    ck("P guests.dat is touched only through pc_mp_guests_load / pc_mp_guests_save (one call site each), no fopen / .gci / card_ path in pc_net_game.c's guest code",
-       c.count("pc_mp_guests_load(") == 1 and c.count("pc_mp_guests_save(") == 1 and not re.search(r"\bfopen\b|card_a|card_b", blk) and ".gci" not in blk
-       and '#define PC_MP_GUESTS_PATH         "save/mp/guests.dat"' in gh)
+    ck("P the guest store is touched only through pc_mp_gs_load / pc_mp_gs_save / pc_mp_gs_retire (one load and one save call site; the legacy guests.dat only through pc_mp_gs_migrate_legacy), "
+       "no fopen / .gci / card_ path in pc_net_game.c's guest code",
+       c.count("pc_mp_gs_load(") == 1 and c.count("pc_mp_gs_save(") == 1 and c.count("pc_mp_gs_migrate_legacy(") == 1 and c.count("pc_mp_guests_load(") == 0 and c.count("pc_mp_guests_save(") == 0
+       and not re.search(r"\bfopen\b|card_a|card_b", blk) and ".gci" not in blk and '#define PC_MP_GUESTS_PATH         "save/mp/guests.dat"' in gh)
     ck("P guests.dat is written (1) when a token is minted / re-minted (durable, before the token is sent), (2) when an entry is rolled back, (3) when an entry is confirmed, (4) by the "
        "GCI-save hook, (5) by the G6.2 operator removal (pc_net_game_dedicated_guest_admin, after a backup) -- and never while UNTRUSTED",
        sorted({n for a, b, n in funcs if "pcnetgame_guest_store_write(" in c[a:b] and n != "pcnetgame_guest_store_write"})
@@ -355,7 +356,7 @@ def main():
                   "pc_net_game_dedicated_give", "pcnetgame_promote_exec", "pcnetgame_guest_drop_promoted"]))  # lifecycle hardening: + the stale-entry removal (resident confirm / sweep)
     give = fb("pc_net_game_dedicated_give")
     prom = fb("pcnetgame_promote_exec")  # the console command pc_net_game_dedicated_promote is a thin wrapper of it
-    pord = ["s_guest_untrusted", "pc_mp_guests_backup_file(pc_server_guests_path()", "pc_mp_promote_create("]
+    pord = ["s_guest_untrusted", "pcnetgame_guest_backup(g, bak_g", "pc_mp_promote_create("]
     pord2 = ["pcnetgame_members_commit(&nf", "pc_save_write_authoritative_durable()", 'pcnetgame_guest_store_write("guest promoted to a resident")']  # lifecycle hardening (B3a): the DURABLE variant (FALSE unless the GCI was really written)
     ck("P the two further guests.dat writers are guarded: dedicated_give refuses a guest while UNTRUSTED (`if (is_guest && s_guest_untrusted) {`) BEFORE the inventory write and its failure path "
        "says the gift was rolled back; dedicated_promote refuses while UNTRUSTED, THEN backs guests.dat up, THEN creates the resident, and commits in the order members.dat -> authoritative "
@@ -365,7 +366,7 @@ def main():
        and all(x in prom for x in pord + pord2) and [prom.index(x) for x in pord] == sorted(prom.index(x) for x in pord)
        and [prom.index(x) for x in pord2] == sorted(prom.index(x) for x in pord2))
     ck("P the store write refuses while UNTRUSTED (a write would lift the operator lock) and while nothing was loaded; the epoch alone never forces a rewrite; failures are logged, never fatal",
-       "if (!s_guest_store_loaded || s_guest_untrusted) {" in fb("pcnetgame_guest_store_write") and "cmp.e[g].epoch = s_guest_file.e[g].epoch;" in fb("pcnetgame_guest_store_write")
+       "if (!s_guest_store_loaded || s_guest_untrusted) {" in fb("pcnetgame_guest_store_write") and "dg = pc_mp_gs_entry_digest(&rec.e);" in fb("pcnetgame_guest_store_write") and "epoch alone changing" in raw
        and "return 0;" in fb("pcnetgame_guest_store_write") and "exit(" not in fb("pcnetgame_guest_store_write") and "abort(" not in fb("pcnetgame_guest_store_write"))
     ck("P the hook writes the guest table FIRST (independent of the town / resident lineage) in the same GCI-save hook as the resident sidecar; the guest table is loaded with the host world",
        fb("pc_net_game_record_after_gci_save").index("pcnetgame_guest_store_write(\"after the GCI save\")") < fb("pc_net_game_record_after_gci_save").index("pcnetgame_rec_store_write(")
@@ -420,7 +421,7 @@ def main():
     ck("M1 the HOST table is keyed by (host town identity, guest key): every entry carries its town, pcnetgame_guest_find() matches the CURRENT town only (entries of other towns are kept but "
        "inactive), create stamps the town, guests.dat v2 stores it per entry",
        "PCNetGameTownIdentity town;" in gdef and "pcnetgame_town_equal(&s_guest[g].town, &s_host_town)" in fb("pcnetgame_guest_find")
-       and "s_guest[g].town = s_host_town;" in fb("pcnetgame_guest_create") and "memcpy(e->town_land_name, s_guest[g].town.land_name, PC_NETGAME_LAND_LEN);" in fb("pcnetgame_guest_store_build")
+       and "s_guest[g].town = s_host_town;" in fb("pcnetgame_guest_create") and "memcpy(e->town_land_name, s_guest[g].town.land_name, PC_NETGAME_LAND_LEN);" in fb("pcnetgame_guest_entry_build")
        and "s_guest[g].town.land_id = fe->town_land_id;" in fb("pcnetgame_guest_install") and "#define PC_MP_GUEST_VERSION       2u" in gh
        and sorted({n for a, b, n in funcs if "pcnetgame_guest_find(" in c[a:b] and n != "pcnetgame_guest_find"}) == ["pcnetgame_host_guest_check"])
     ck("L4 the re-validation re-applies the town rule after a town change: the bound entry must still be THIS town's and its key's home land must not be this town's land",

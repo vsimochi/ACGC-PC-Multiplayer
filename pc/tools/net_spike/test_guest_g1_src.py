@@ -189,7 +189,7 @@ def main():
     gg = nb("pcnetgame_guest_name_conflict_guest")
     ck("E host guest-name check: only entries of THIS town (inactive other-town entries ignored), only OTHER keys (a different full PersonalID), 8-byte name compare",
        "s_guest[g].used && pcnetgame_town_equal(&s_guest[g].town, &s_host_town)" in gg and "memcmp(&s_guest[g].key, key, sizeof(*key)) != 0" in gg
-       and "memcmp(s_guest[g].key.player_name, key->player_name, PLAYER_NAME_LEN) == 0" in gg and "g < PC_NETGAME_GUEST_MAX" in gg)
+       and "memcmp(s_guest[g].key.player_name, key->player_name, PLAYER_NAME_LEN) == 0" in gg and "g < s_guest_cap" in gg)
     rv = nb("pcnetgame_host_revalidate_bound_peers")
     ck("E (G1.1) the world-ready revalidation still closes a bound guest whose KEY became a resident / house-owner identity, but NO LONGER one whose NAME a resident now carries "
        "(an authenticated returning guest is never closed for it)", "pcnetgame_guest_key_conflict(&st->bound_pid)" in rv and "pcnetgame_guest_name_conflict_resident" not in rv

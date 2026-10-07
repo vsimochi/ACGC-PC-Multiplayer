@@ -710,13 +710,14 @@ static int pc_ded_stricmp(const char* a, const char* b) {
 /* G6.2: `guests` (list, never the token) and the two guarded operator commands. */
 static void pc_ded_cmd_guests(void) {
     int g, n = 0;
-    for (g = 0; g < 8; g++) {
+    const int slots = pc_net_game_dedicated_guest_slots();
+    for (g = 0; g < slots; g++) {
         PCNetGameDedicatedGuestInfo gi;
         if (!pc_net_game_dedicated_guest_info(g, &gi)) {
             continue;
         }
         if (n == 0) {
-            pc_ded_printf("[DEDICATED] guests (host guest table, all towns; %s):\n", gi.untrusted ? "guests.dat is UNTRUSTED" : "tokens are never printed");
+            pc_ded_printf("[DEDICATED] guests (host guest table, all towns; %s):\n", gi.untrusted ? "the guest store is UNTRUSTED" : "tokens are never printed");
         }
         n++;
         pc_ded_printf("  slot %d: name=\"%s\" home_town=\"%s\" host_town=\"%s\"%s confirmed=%s rev=%u bound=%s%s\n", gi.slot, gi.name, gi.home_town, gi.town,

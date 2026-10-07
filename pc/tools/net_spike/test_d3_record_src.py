@@ -158,7 +158,7 @@ def main():
           not re.search(r"\b(?:fopen|fwrite|fread|remove|rename|records\.dat|\.gci)\b", blk_no_glue)
           and not re.search(r"\b(?:fopen|fwrite|fread|remove|rename|fclose|_commit|fsync)\b", glue) and "pc_mp_records_load(" in glue and "pc_mp_records_save(" in glue)
     check("I the host-field watcher only reads (digest), the slot lineage lives in static memory (PCNetGameRecSlot)",
-          "static PCNetGameRecSlot s_rec_slot[PC_NETGAME_REC_SLOTS];" in c_raw and "pcnetgame_rec_hostfield_digest(const Private_c* r)" in blk)
+          "PC_GROW_TABLE(PCNetGameRecSlot, s_rec_slot, PLAYER_NUM, PCNG_GUEST_INLINE)" in c_raw and "pcnetgame_rec_hostfield_digest(const Private_c* r)" in blk)
 
     # ------------------------------------------------------------------ O: ownership table
     rows = [(int(a, 16), int(l, 16), o) for a, l, o in re.findall(r"\{\s*(0x[0-9A-Fa-f]+)u,\s*(0x[0-9A-Fa-f]+)u,\s*PC_NETGAME_REC_OWN_(\w+)\s*\}", blk)]

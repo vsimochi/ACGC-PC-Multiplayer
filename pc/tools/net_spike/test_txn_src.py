@@ -234,9 +234,9 @@ def main():
           "pcnetgame_rec_txn_write_inventory()" in d3_raw[:d3_raw.index("D3-0 (b)")] and "outside this one" in d3_raw[:d3_raw.index("D3-0 (b)")])
 
     # ------------------------------------------------------------------ J: journal
-    check("J the journal is a bounded ring per record SLOT (residents + guests, guests G1): PC_NETGAME_TXN_RING 16 entries, 4 fenced nonces, array [PC_NETGAME_REC_SLOTS] (PLAYER_NUM + PC_NETGAME_GUEST_MAX), eviction by head advance",
-          "#define PC_NETGAME_TXN_RING       16" in c_raw and "#define PC_NETGAME_TXN_FENCED_NUM 4" in c_raw and "static PCNetGameTxnResident s_txn_res[PC_NETGAME_REC_SLOTS];" in c_raw
-          and "#define PC_NETGAME_REC_SLOTS (PLAYER_NUM + PC_NETGAME_GUEST_MAX)" in c_raw
+    check("J the journal is a bounded ring per record SLOT (residents + guests, guests G1): PC_NETGAME_TXN_RING 16 entries, 4 fenced nonces, a growable table of PLAYER_NUM + s_guest_cap slots, eviction by head advance",
+          "#define PC_NETGAME_TXN_RING       16" in c_raw and "#define PC_NETGAME_TXN_FENCED_NUM 4" in c_raw and "PC_GROW_TABLE(PCNetGameTxnResident, s_txn_res, PLAYER_NUM, PCNG_GUEST_INLINE)" in c_raw
+          and "return PLAYER_NUM + s_guest_cap;" in c_raw
           and "PCNetGameTxnLog ring[PC_NETGAME_TXN_RING];" in blk and "R->head = (uint8_t)(((int)R->head + 1) % PC_NETGAME_TXN_RING);" in blk
           and "_Static_assert(sizeof(PCNetGameTxnLog) == 28" in blk and L.PC_NETGAME_TXN_RING == 16 and L.PC_NETGAME_TXN_FENCED_NUM == 4)
     check("J a new nonce fences the old one (FIFO memmove), wipes the ring and max_seq; replays compare the hash over the whole 72-byte message",

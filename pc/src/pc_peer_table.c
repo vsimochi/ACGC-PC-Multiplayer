@@ -145,3 +145,31 @@ int pc_peer_tables_resize(PCPeerTable* t, int n, int inline_n, int span) {
 void pc_peer_tables_release(PCPeerTable* t, int n, int inline_n) {
     (void)pc_peer_tables_resize(t, n, inline_n, inline_n);
 }
+
+int pc_grow_tables_ensure(PCGrowTable* t, int n, int have, int want) {
+    int i, j;
+    void* fresh[64];
+    if (t == NULL || n < 1 || n > 64 || have < 0 || want < 1) {
+        return 0;
+    }
+    if (want <= have) {
+        return 1;
+    }
+    for (i = 0; i < n; i++) {
+        fresh[i] = t[i].elem != 0u ? pt_alloc((size_t)(t[i].base + want), t[i].elem) : NULL;
+        if (fresh[i] == NULL) {
+            for (j = 0; j < i; j++) {
+                pt_free(fresh[j]);
+            }
+            return 0;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        memcpy(fresh[i], t[i].cur, (size_t)(t[i].base + have) * t[i].elem);
+        t[i].bind(fresh[i]);
+        pt_free(t[i].heap);
+        t[i].heap = fresh[i];
+        t[i].cur = fresh[i];
+    }
+    return 1;
+}

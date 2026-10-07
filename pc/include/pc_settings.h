@@ -22,6 +22,7 @@ typedef struct {
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */
     int cstick_deadzone;  /* Gamepad C-stick deadzone, percent 0-40 (default 12) */
     int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..8 (default 4); out of range = ignored */
+    int guest_memory_mb;  /* HOST only (capacity phase 3): memory budget of the guest store in MB (default 256, 1..1048576): how many guests the host keeps = budget / ~28 KB per guest; there is no fixed guest table any more */
     int max_peers;        /* HOST only (capacity phase 2): most simultaneous transport peers (residents + guests + a connecting town-fetch client), 1..254 (default 8); out of range = ignored */
     int allow_new_guests; /* HOST only (M-D): 1 = a NEW guest key may be admitted (default), 0 = only guests already known to guests.dat; a new key is refused (SERVER_FULL) */
     int resident_tokens;  /* HOST only (M-E): 0 = off (default, nothing minted / checked), 1 = tofu, 2 = required (see docs/multiplayer-guest-roadmap.md) */

@@ -255,6 +255,61 @@ static int commit_file(FILE* fp) {
 
 /* ================= HOST: guests.dat ================= */
 
+/* One entry <-> PC_MP_GUEST_ENTRY_SIZE bytes (the exact layout of guests.dat v2 and of the per-guest files). */
+void pc_mp_guests_entry_encode(const PCMpGuestEntry* e, uint8_t* p) {
+    memset(p, 0, PC_MP_GUEST_ENTRY_SIZE);
+    if (!e->present) {
+        return; /* absent entries are all-zero */
+    }
+    p[0] = 1;
+    p[1] = e->confirmed ? 1 : 0;
+    memcpy(p + 4, e->pid, PC_MP_GUEST_PID_SIZE);
+    memcpy(p + 24, e->token, PC_MP_GUEST_TOKEN_SIZE);
+    put32(p + 40, e->epoch);
+    put32(p + 44, e->rev);
+    put32(p + 48, e->age);
+    put32(p + 52, pc_mp_records_crc32(e->record, PC_MP_GUEST_PRIVATE_SIZE));
+    memcpy(p + 56, e->town_land_name, PC_MP_GUEST_TOWN_NAME_SIZE);
+    p[64] = (uint8_t)(e->town_land_id & 0xFFu);
+    p[65] = (uint8_t)(e->town_land_id >> 8);
+    put32(p + 68, e->town_terrain_hash);
+    memcpy(p + 72, e->record, PC_MP_GUEST_PRIVATE_SIZE);
+}
+
+int pc_mp_guests_entry_decode(const uint8_t* p, PCMpGuestEntry* e) {
+    memset(e, 0, sizeof(*e));
+    if (p[0] > 1 || p[1] > 1 || p[2] != 0 || p[3] != 0) {
+        return PC_MP_GST_ERR_FIELD;
+    }
+    if (p[0] == 0) {
+        return all_zero(p, PC_MP_GUEST_ENTRY_SIZE) ? PC_MP_GST_OK : PC_MP_GST_ERR_FIELD;
+    }
+    e->present = 1;
+    e->confirmed = p[1];
+    memcpy(e->pid, p + 4, PC_MP_GUEST_PID_SIZE);
+    memcpy(e->token, p + 24, PC_MP_GUEST_TOKEN_SIZE);
+    e->epoch = get32(p + 40);
+    e->rev = get32(p + 44);
+    e->age = get32(p + 48);
+    memcpy(e->town_land_name, p + 56, PC_MP_GUEST_TOWN_NAME_SIZE);
+    e->town_land_id = (uint16_t)(p[64] | ((uint16_t)p[65] << 8));
+    e->town_terrain_hash = get32(p + 68);
+    if (p[66] != 0 || p[67] != 0 || all_zero(e->town_land_name, PC_MP_GUEST_TOWN_NAME_SIZE)) {
+        return PC_MP_GST_ERR_FIELD;
+    }
+    if (all_zero(e->pid, PC_MP_GUEST_PID_SIZE) || all_zero(e->token, PC_MP_GUEST_TOKEN_SIZE) || e->epoch == 0 || e->rev > PC_MP_GUEST_MAX_REV) {
+        return PC_MP_GST_ERR_FIELD;
+    }
+    memcpy(e->record, p + 72, PC_MP_GUEST_PRIVATE_SIZE);
+    if (get32(p + 52) != pc_mp_records_crc32(e->record, PC_MP_GUEST_PRIVATE_SIZE)) {
+        return PC_MP_GST_ERR_RECORD_CRC;
+    }
+    if (memcmp(e->record, e->pid, PC_MP_GUEST_PID_SIZE) != 0 || e->record[PC_MP_GUEST_EXISTS_OFF] != 1) {
+        return PC_MP_GST_ERR_FIELD; /* the record must belong to the key and exist */
+    }
+    return PC_MP_GST_OK;
+}
+
 int pc_mp_guests_serialize(const PCMpGuestFile* f, uint8_t* out, size_t cap) {
     int i;
     uint8_t* p;
@@ -272,22 +327,7 @@ int pc_mp_guests_serialize(const PCMpGuestFile* f, uint8_t* out, size_t cap) {
     for (i = 0; i < PC_MP_GUEST_SLOTS; i++) {
         const PCMpGuestEntry* e = &f->e[i];
         p = out + PC_MP_GUEST_HEADER_SIZE + (size_t)i * PC_MP_GUEST_ENTRY_SIZE;
-        if (!e->present) {
-            continue; /* absent entries are all-zero */
-        }
-        p[0] = 1;
-        p[1] = e->confirmed ? 1 : 0;
-        memcpy(p + 4, e->pid, PC_MP_GUEST_PID_SIZE);
-        memcpy(p + 24, e->token, PC_MP_GUEST_TOKEN_SIZE);
-        put32(p + 40, e->epoch);
-        put32(p + 44, e->rev);
-        put32(p + 48, e->age);
-        put32(p + 52, pc_mp_records_crc32(e->record, PC_MP_GUEST_PRIVATE_SIZE));
-        memcpy(p + 56, e->town_land_name, PC_MP_GUEST_TOWN_NAME_SIZE);
-        p[64] = (uint8_t)(e->town_land_id & 0xFFu);
-        p[65] = (uint8_t)(e->town_land_id >> 8);
-        put32(p + 68, e->town_terrain_hash);
-        memcpy(p + 72, e->record, PC_MP_GUEST_PRIVATE_SIZE);
+        pc_mp_guests_entry_encode(e, p); /* an absent entry stays all-zero */
     }
     put32(out + PC_MP_GUEST_FILE_SIZE - 4, pc_mp_records_crc32(out, PC_MP_GUEST_FILE_SIZE - 4));
     return PC_MP_GST_OK;
@@ -331,38 +371,12 @@ int pc_mp_guests_parse(const uint8_t* buf, size_t len, PCMpGuestFile* out) {
     for (i = 0; i < PC_MP_GUEST_SLOTS; i++) {
         const uint8_t* p = buf + PC_MP_GUEST_HEADER_SIZE + (size_t)i * PC_MP_GUEST_ENTRY_SIZE;
         PCMpGuestEntry* e = &tmp.e[i];
-        if (p[0] > 1 || p[1] > 1 || p[2] != 0 || p[3] != 0) {
-            return PC_MP_GST_ERR_FIELD;
+        const int dr = pc_mp_guests_entry_decode(p, e);
+        if (dr != PC_MP_GST_OK) {
+            return dr;
         }
-        if (p[0] == 0) {
-            if (!all_zero(p, PC_MP_GUEST_ENTRY_SIZE)) {
-                return PC_MP_GST_ERR_FIELD;
-            }
+        if (!e->present) {
             continue;
-        }
-        e->present = 1;
-        e->confirmed = p[1];
-        memcpy(e->pid, p + 4, PC_MP_GUEST_PID_SIZE);
-        memcpy(e->token, p + 24, PC_MP_GUEST_TOKEN_SIZE);
-        e->epoch = get32(p + 40);
-        e->rev = get32(p + 44);
-        e->age = get32(p + 48);
-        memcpy(e->town_land_name, p + 56, PC_MP_GUEST_TOWN_NAME_SIZE);
-        e->town_land_id = (uint16_t)(p[64] | ((uint16_t)p[65] << 8));
-        e->town_terrain_hash = get32(p + 68);
-        if (p[66] != 0 || p[67] != 0 || all_zero(e->town_land_name, PC_MP_GUEST_TOWN_NAME_SIZE)) {
-            return PC_MP_GST_ERR_FIELD;
-        }
-        if (all_zero(e->pid, PC_MP_GUEST_PID_SIZE) || all_zero(e->token, PC_MP_GUEST_TOKEN_SIZE) || e->epoch == 0 ||
-            e->rev > PC_MP_GUEST_MAX_REV) {
-            return PC_MP_GST_ERR_FIELD;
-        }
-        memcpy(e->record, p + 72, PC_MP_GUEST_PRIVATE_SIZE);
-        if (get32(p + 52) != pc_mp_records_crc32(e->record, PC_MP_GUEST_PRIVATE_SIZE)) {
-            return PC_MP_GST_ERR_RECORD_CRC;
-        }
-        if (memcmp(e->record, e->pid, PC_MP_GUEST_PID_SIZE) != 0 || e->record[PC_MP_GUEST_EXISTS_OFF] != 1) {
-            return PC_MP_GST_ERR_FIELD; /* the record must belong to the key and exist */
         }
         for (j = 0; j < i; j++) {
             if (tmp.e[j].present &&

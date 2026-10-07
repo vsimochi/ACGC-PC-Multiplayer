@@ -50,6 +50,10 @@ PC_PEER_TABLE(uint16_t, t_small, INL)
 PC_PEER_TABLE2(uint8_t, t_rows, INL, 100)
 static PCPeerTable s_tabs[] = { PC_PEER_TABLE_ENTRY(t_big), PC_PEER_TABLE_ENTRY(t_small), PC_PEER_TABLE_ENTRY(t_rows) };
 #define NT 3
+PC_GROW_TABLE(Big, g_big, 4, 8)
+PC_GROW_TABLE(uint16_t, g_small, 4, 8)
+PC_GROW_TABLE2(uint8_t, g_rows, 4, 8, 100)
+static PCGrowTable g_tabs[] = { PC_GROW_TABLE_ENTRY(g_big, 4), PC_GROW_TABLE_ENTRY(g_small, 4), PC_GROW_TABLE_ENTRY(g_rows, 4) };
 
 static int all_zero(const void* p, size_t n) {
     const unsigned char* c = (const unsigned char*)p;
@@ -198,6 +202,39 @@ int main(void) {
     check("bad arguments are refused", !pc_peer_tables_resize(NULL, NT, INL, 8) && !pc_peer_tables_resize(s_tabs, 0, INL, 8) && !pc_peer_tables_resize(s_tabs, NT, INL, 0));
     pc_peer_tables_set_allocator(NULL, NULL);
     check("with the default allocator a resize works too", pc_peer_tables_resize(s_tabs, NT, INL, 64) && t_big != t_big_inl && (pc_peer_tables_release(s_tabs, NT, INL), t_big == t_big_inl));
+
+    /* ---- growable tables (the guest store's arrays: 4 resident slots + a growing number of guests) ---- */
+    pc_peer_tables_set_allocator(test_alloc, test_free);
+    {
+        int have = 8, k;
+        s_allocs = s_frees = 0;
+        for (k = 0; k < 4 + 8; k++) { g_big[k].a[1] = (uint32_t)(1000 + k); g_small[k] = (uint16_t)(2000 + k); g_rows[k][5] = (uint8_t)(k + 1); }
+        check("grow: tables start inline (base 4 + 8)", g_big == g_big_inl && g_small == g_small_inl && (void*)g_rows == (void*)g_rows_inl);
+        check("grow: want <= have is a no-op (no allocation)", pc_grow_tables_ensure(g_tabs, NT, have, 8) && s_allocs == 0 && g_big == g_big_inl);
+        check("grow 8 -> 9: one block per table, every element KEPT (4 base + 8 used), the new one zeroed", pc_grow_tables_ensure(g_tabs, NT, have, 9) && s_allocs == NT && s_frees == 0 &&
+              g_big != g_big_inl);
+        ok = 1;
+        for (k = 0; k < 4 + 8; k++) ok = ok && g_big[k].a[1] == (uint32_t)(1000 + k) && g_small[k] == (uint16_t)(2000 + k) && g_rows[k][5] == (uint8_t)(k + 1);
+        ok = ok && all_zero(&g_big[12], sizeof(Big)) && g_small[12] == 0 && all_zero(g_rows[12], 100);
+        check("grow: old contents identical, the added element is zero", ok);
+        have = 9;
+        s_allocs = s_frees = 0;
+        check("grow 9 -> 40 frees the previous heap block and keeps everything", pc_grow_tables_ensure(g_tabs, NT, have, 40) && s_allocs == NT && s_frees == NT && g_big[3].a[1] == 1003 && g_big[11].a[1] == 1011 && g_rows[11][5] == 12);
+        have = 40;
+        g_big[43].a[0] = 4343;
+        {
+            Big* b_before = g_big;
+            s_allocs = s_frees = 0;
+            s_fail_at = 2;
+            ok = pc_grow_tables_ensure(g_tabs, NT, have, 400) == 0;
+            s_fail_at = 0;
+            check("a failed growth fails as a whole and changes nothing (pointers, contents, no leak)", ok && g_big == b_before && g_big[43].a[0] == 4343 && s_frees == s_allocs - 1);
+        }
+        s_allocs = s_frees = 0;
+        check("growth to 5000 guests works and the last element is addressable", pc_grow_tables_ensure(g_tabs, NT, have, 5000) && (g_big[4 + 4999].a[0] = 9, g_rows[4 + 4999][99] = 7, g_big[43].a[0] == 4343 && g_big[4 + 4999].a[0] == 9));
+        check("grow: bad arguments are refused", !pc_grow_tables_ensure(NULL, NT, 8, 9) && !pc_grow_tables_ensure(g_tabs, 0, 8, 9) && !pc_grow_tables_ensure(g_tabs, NT, -1, 9) && !pc_grow_tables_ensure(g_tabs, NT, 8, 0));
+        pc_peer_tables_set_allocator(NULL, NULL);
+    }
 
     printf("RESULT passed=%d failed=%d\n", s_pass, s_fail);
     return s_fail == 0 ? 0 : 1;

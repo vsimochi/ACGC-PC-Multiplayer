@@ -182,7 +182,8 @@
 #include "pc_server.h" /* dedicated server storage tree: servers/<id>/ (host-owned file paths) */
 static void pcnetgame_server_init_members(void); /* first launch of a dedicated server: creates residents/members.dat (defined with the members store) */
 #include "pc_mp_members.h" /* M-E: save/mp/members.dat resident credentials (pure storage module) */
-#include "pc_mp_guests.h"  /* guests: save/mp/guests.dat host table + save/mp/guest_token.dat client token file (pure storage module) */
+#include "pc_mp_guests.h"  /* guests: the legacy save/mp/guests.dat v2 format (migrated) + save/mp/guest_token.dat client token file (pure storage module) */
+#include "pc_mp_guest_store.h" /* guests: the per-guest store (one file per guest, no size limit) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
 #include "m_player_lib.h" /* Stage 3: GET_PLAYER_ACTOR_NOW(), PLAYER_ACTOR, mPlayer_INDEX_*, and
@@ -615,6 +616,8 @@ _Static_assert(sizeof(PCNetGameIdentityAckMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_IDTOKEN_FLAG_NEW      0x01u
 #define PC_NETGAME_IDTOKEN_FLAG_KNOWN    0x02u
 #define PC_NETGAME_GUEST_TOKEN_LEN       16u
+/* 8 = the admission range of max_guests (1..8, policy of this phase), the size of the legacy guests.dat v2 (migrated at load) and the inline start size of the guest tables. It is NOT
+ * a limit on stored guests any more: the guest store grows on demand (s_guest_cap, pcnetgame_guest_cap_ensure). */
 #define PC_NETGAME_GUEST_MAX             8
 /* M-E resident credentials (v8 extended in place, no bump): IDENTITY_EXT flag bit1 = RESIDENT claim (exactly one of GUEST | RESIDENT; home_* = the resident's PersonalID in the
  * host town and must equal the IDENTITY's name / player_id / land_name / land_id); IDENTITY_TOKEN flag bit2 = RESIDENT (+ NEW / KNOWN; guest_slot = the resident index 0..3,
@@ -646,8 +649,8 @@ _Static_assert(sizeof(PCNetGameIdentityExtMsg) <= 64 && sizeof(PCNetGameIdentity
 typedef struct PCNetGameIdentityTokenMsg {
     uint8_t msg_type;      /* PC_NETGAME_MSG_IDENTITY_TOKEN */
     uint8_t flags;         /* PC_NETGAME_IDTOKEN_FLAG_* */
-    uint8_t guest_slot;    /* 0..PC_NETGAME_GUEST_MAX-1 */
-    uint8_t table_size;    /* PC_NETGAME_GUEST_MAX */
+    uint8_t guest_slot;    /* the guest table slot (informational: the low byte) */
+    uint8_t table_size;    /* the number of guest table entries allocated, saturated at 255 (informational) */
     uint8_t token[PC_NETGAME_GUEST_TOKEN_LEN];
 } PCNetGameIdentityTokenMsg;
 _Static_assert(sizeof(PCNetGameIdentityTokenMsg) == 20, "PCNetGameIdentityTokenMsg wire size drifted");
@@ -3821,16 +3824,25 @@ typedef struct PCNetGameRecSlot {
     uint32_t     hf_digest;       /* digest of the host-owned ranges at the last accepted state */
 } PCNetGameRecSlot;
 /* Guests (G1): ONE slot index space for every record / transaction site: 0..PLAYER_NUM-1 = the host save's residents
- * (Save_Get(private_data)[slot]), PLAYER_NUM..PC_NETGAME_REC_SLOTS-1 = the guest table entries (s_guest_rec[slot - PLAYER_NUM], OUTSIDE
+ * (Save_Get(private_data)[slot]), PLAYER_NUM..pcnetgame_rec_slots()-1 = the guest table entries (s_guest_rec[slot - PLAYER_NUM], OUTSIDE
  * Save_t). pcnetgame_rec_priv_ptr() is the ONE accessor that turns a slot into a record pointer; the slot itself comes only from
  * pcnetgame_peer_rec_slot() / pcnetgame_rec_gate() (the host-derived binding), never from a message. */
-#define PC_NETGAME_REC_SLOTS (PLAYER_NUM + PC_NETGAME_GUEST_MAX)
-static PCNetGameRecSlot s_rec_slot[PC_NETGAME_REC_SLOTS];
-static uint8_t  s_rec_backup[PC_NETGAME_REC_SLOTS][PC_NETGAME_REC_SIZE]; /* BE image of the host record a MIGRATE import replaced */
+/* The guest part of that index space GROWS: s_guest_cap = how many guest entries are allocated right now (NOT a limit on guests: the store grows on demand until the memory
+ * budget `guest_memory_mb` is used, pcnetgame_guest_cap_ensure). The first PCNG_GUEST_INLINE (8: the old fixed table) live in static storage, the rest on the heap. Tables that
+ * grow are PC_GROW_TABLEs: a growth RELOCATES them, so a pointer into s_guest / s_guest_rec / s_rec_slot / s_rec_backup / s_txn_res must never be kept across a call that can add a guest
+ * (only pcnetgame_guest_create does). */
+#define PCNG_GUEST_INLINE PC_NETGAME_GUEST_MAX
+static int s_guest_cap = PCNG_GUEST_INLINE;
+static int pcnetgame_rec_slots(void) {
+    return PLAYER_NUM + s_guest_cap;
+}
+static int pcnetgame_guest_cap_ensure(int want); /* defined after the tables it grows (below s_txn_res) */
+PC_GROW_TABLE(PCNetGameRecSlot, s_rec_slot, PLAYER_NUM, PCNG_GUEST_INLINE)
+PC_GROW_TABLE2(uint8_t, s_rec_backup, PLAYER_NUM, PCNG_GUEST_INLINE, PC_NETGAME_REC_SIZE) /* BE image of the host record a MIGRATE import replaced */
 
-/* The host's GUEST TABLE (bounded, PC_NETGAME_GUEST_MAX entries; persisted in save/mp/guests.dat). An entry is created at a guest's first
- * contact (token minted) and removed only by the M3 eviction (the OLDEST unconfirmed, data-less, idle entry when the table is full; a full table
- * with no such entry refuses the next new guest). `key` = the guest's HOME
+/* The host's GUEST TABLE (grows on demand; one file per guest in the guest store directory, see pc_mp_guest_store.h). An entry is created at a guest's first
+ * contact (token minted) and removed only by the M3 eviction (the OLDEST unconfirmed, data-less, idle entry when the memory budget is used up; then, with no such entry,
+ * the next new guest is refused). `key` = the guest's HOME
  * PersonalID (public), `token` = the host-issued 16-byte secret. The guest's PERSONAL RECORD lives in s_guest_rec[] (a Private_c,
  * never part of Save_t, never written to a GCI). */
 typedef struct PCNetGameGuest {
@@ -3851,11 +3863,23 @@ typedef struct PCNetGameGuest {
     uint8_t      recovery;
     uint32_t     recovery_since_ms;
 } PCNetGameGuest;
-static PCNetGameGuest s_guest[PC_NETGAME_GUEST_MAX];
-static Private_c      s_guest_rec[PC_NETGAME_GUEST_MAX];
-static PCMpGuestFile     s_guest_file;            /* in-memory mirror of the last loaded / successfully written guests.dat */
+/* What the guest store directory holds for a guest slot: kept SEPARATE from PCNetGameGuest because the removal paths memset the entry, and the file that belongs to it must still
+ * be found to be retired. digest = pc_mp_gs_entry_digest of the entry as last written / loaded (equal = nothing to write). */
+typedef struct PCNetGameGuestPers {
+    uint8_t  has_file;
+    uint8_t  id[PC_MP_GS_ID_SIZE];
+    uint32_t gen;
+    uint32_t digest;
+    uint8_t  retire_pending; /* the slot was reused (eviction): the file `retire_id` still holds the previous guest and is moved aside once the new guest is durable */
+    uint8_t  retire_id[PC_MP_GS_ID_SIZE];
+} PCNetGameGuestPers;
+PC_GROW_TABLE(PCNetGameGuest, s_guest, 0, PCNG_GUEST_INLINE)
+PC_GROW_TABLE(Private_c, s_guest_rec, 0, PCNG_GUEST_INLINE)
+PC_GROW_TABLE(PCNetGameGuestPers, s_guest_pers, 0, PCNG_GUEST_INLINE)
+static char              s_guest_dir[320];        /* the guest store directory (<guests.dat path without .dat>) */
+static uint32_t          s_guest_store_gen = 0;   /* store-wide count of durable writes (log only) */
 static int               s_guest_store_loaded = 0;
-static int               s_guest_untrusted = 0;   /* guests.dat existed but no generation is readable: NO guest is admitted (tokens are unknown) */
+static int               s_guest_untrusted = 0;   /* a guest file (or the legacy guests.dat) is unreadable / inconsistent: NO guest is admitted (tokens are unknown) */
 static PCMpGuestLoadMode s_guest_store_mode = PC_MP_GST_LOAD_MISSING;
 static int               s_guest_store_last_failed = 0; /* the last guests.dat write failed: a guest's FIRST migration is refused (BUSY) until a write succeeds */
 static uint32_t          s_guest_store_fail_count = 0;
@@ -3871,7 +3895,7 @@ static Private_c* pcnetgame_rec_priv_ptr(int slot) {
     if (slot >= 0 && slot < PLAYER_NUM) {
         return &Save_Get(private_data)[slot];
     }
-    if (slot >= PLAYER_NUM && slot < PC_NETGAME_REC_SLOTS && s_guest[slot - PLAYER_NUM].used) {
+    if (slot >= PLAYER_NUM && slot < pcnetgame_rec_slots() && s_guest[slot - PLAYER_NUM].used) {
         return &s_guest_rec[slot - PLAYER_NUM];
     }
     return NULL;
@@ -3885,10 +3909,10 @@ static void pcnetgame_rec_note_peer_gone(const PCNetGameHostPeerState* st) {
     int slot = -1;
     if (st->bound_valid) {
         slot = st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST
-                   ? (st->bound_guest_slot >= 0 && st->bound_guest_slot < PC_NETGAME_GUEST_MAX ? PLAYER_NUM + st->bound_guest_slot : -1)
+                   ? (st->bound_guest_slot >= 0 && st->bound_guest_slot < s_guest_cap ? PLAYER_NUM + st->bound_guest_slot : -1)
                    : st->bound_resident_idx;
     }
-    if (slot >= 0 && slot < PC_NETGAME_REC_SLOTS && s_rec_slot[slot].init && s_rec_slot[slot].dirty_unsaved) {
+    if (slot >= 0 && slot < pcnetgame_rec_slots() && s_rec_slot[slot].init && s_rec_slot[slot].dirty_unsaved) {
         s_rec_early_save_request = 1; /* a guest's accepted change also asks for the early host save: its guests.dat write rides the same hook */
     }
 }
@@ -12234,8 +12258,8 @@ static int pcnetgame_host_peer_bound_to_guest(int gslot, PCNetPeerId except_peer
     return -1;
 }
 
-/* Guests G4: the host-local cap on simultaneously BOUND guests. `--max-guests N` (1..8) wins over settings.ini `max_guests` (1..8, default 4); either is
- * clipped to the guest table size. Never read by any resident path. */
+/* Guests G4: the host-local cap on simultaneously BOUND guests. `--max-guests N` (1..8) wins over settings.ini `max_guests` (1..8, default 4). The 1..8 range is the
+ * admission policy of this phase (it is lifted later, separately from the storage, which no longer has a size limit). Never read by any resident path. */
 static int pcnetgame_host_max_guests(void) {
     int n = g_pc_max_guests_override > 0 ? g_pc_max_guests_override : g_pc_settings.max_guests;
     if (n < 1) {
@@ -12296,7 +12320,7 @@ static const char* pcnetgame_host_guest_cap_refusal(PCNetPeerId peer, char* buf,
 }
 
 /* THE binding -> record slot helper: -1 = not bound (or a binding that is out of range), 0..PLAYER_NUM-1 = the resident slot, PLAYER_NUM..
- * PC_NETGAME_REC_SLOTS-1 = PLAYER_NUM + the guest table slot. Derived ONLY from the host-side binding (never from a message). */
+ * pcnetgame_rec_slots()-1 = PLAYER_NUM + the guest table slot. Derived ONLY from the host-side binding (never from a message). */
 static int pcnetgame_peer_rec_slot(PCNetPeerId peer) {
     const PCNetGameHostPeerState* st;
     if (peer < 0 || peer >= pcnetgame_peer_span()) {
@@ -12307,7 +12331,7 @@ static int pcnetgame_peer_rec_slot(PCNetPeerId peer) {
         return -1;
     }
     if (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
-        return (st->bound_guest_slot >= 0 && st->bound_guest_slot < PC_NETGAME_GUEST_MAX) ? PLAYER_NUM + st->bound_guest_slot : -1;
+        return (st->bound_guest_slot >= 0 && st->bound_guest_slot < s_guest_cap) ? PLAYER_NUM + st->bound_guest_slot : -1;
     }
     return (st->bound_resident_idx >= 0 && st->bound_resident_idx < PLAYER_NUM) ? st->bound_resident_idx : -1;
 }
@@ -12400,7 +12424,7 @@ static const char* pcnetgame_guest_name_conflict_resident(const PersonalID_c* ke
  * Existing entries are never re-judged here, so a guest admitted before this rule existed is not locked out. Returns a reason string or NULL. */
 static const char* pcnetgame_guest_name_conflict_guest(const PersonalID_c* key) {
     int g;
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+    for (g = 0; g < s_guest_cap; g++) {
         if (s_guest[g].used && pcnetgame_town_equal(&s_guest[g].town, &s_host_town) && memcmp(&s_guest[g].key, key, sizeof(*key)) != 0 &&
             memcmp(s_guest[g].key.player_name, key->player_name, PLAYER_NAME_LEN) == 0) {
             return "the guest name is already used by another guest of this town";
@@ -12422,7 +12446,7 @@ static void pcnetgame_host_revalidate_bound_peers(void) {
             /* Guests (G1): the host's save may have changed while paused: the entry must still exist for this key and the key must not
              * (now) be an identity of the host's town. */
             const int g = st->bound_guest_slot;
-            if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used || memcmp(&s_guest[g].key, &st->bound_pid, sizeof(st->bound_pid)) != 0) {
+            if (g < 0 || g >= s_guest_cap || !s_guest[g].used || memcmp(&s_guest[g].key, &st->bound_pid, sizeof(st->bound_pid)) != 0) {
                 why = "bound guest table entry is gone or changed";
             } else if (!pcnetgame_town_equal(&s_guest[g].town, &s_host_town) ||
                        (st->bound_pid.land_id == s_host_town.land_id &&
@@ -12727,7 +12751,7 @@ static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer); /* M3: def
 static PCNetGameRecSlot* pcnetgame_rec_slot(int idx) {
     PCNetGameRecSlot* s;
     Private_c* rec;
-    if (idx >= PLAYER_NUM && idx < PC_NETGAME_REC_SLOTS) {
+    if (idx >= PLAYER_NUM && idx < pcnetgame_rec_slots()) {
         /* Guests (G1): the lineage of a guest slot is created at admission / loaded from guests.dat (never re-resolved from records.dat) */
         return (s_guest[idx - PLAYER_NUM].used && s_rec_slot[idx].init) ? &s_rec_slot[idx] : NULL;
     }
@@ -12737,9 +12761,9 @@ static PCNetGameRecSlot* pcnetgame_rec_slot(int idx) {
     if (s_rec_host_session == 0) {
         s_rec_host_session = pcnetgame_rec_rand32();
     }
-    s = &s_rec_slot[idx];
     rec = &Save_Get(private_data)[idx];
-    pcnetgame_rec_store_resolve(); /* D3-4: lineage from records.dat (no-op once resolved) before the first slot is used */
+    pcnetgame_rec_store_resolve(); /* D3-4: lineage from records.dat (no-op once resolved) before the first slot is used. It may LOAD (grow) the guest store: take the slot pointer AFTER it */
+    s = &s_rec_slot[idx];
     if (!s->init || mPr_CheckCmpPersonalID(&s->pid, &rec->player_ID) != TRUE) {
         /* A backup belongs to ONE PersonalID (never attributed to the new occupant). The new occupant's lineage is derived from the
          * stored entry like at resolve time: if its PersonalID matches what is on disk (e.g. A left the slot and A came back in
@@ -12777,7 +12801,7 @@ static void pcnetgame_rec_on_world_reset(void) {
 
 static void pcnetgame_rec_on_save_back(void) {
     int i;
-    for (i = 0; i < PC_NETGAME_REC_SLOTS; i++) { /* guests too: their lineage cannot be proven across a save pause either */
+    for (i = 0; i < pcnetgame_rec_slots(); i++) { /* guests too: their lineage cannot be proven across a save pause either */
         if (s_rec_slot[i].init) {
             s_rec_slot[i].epoch = pcnetgame_rec_rand32();
             s_rec_slot[i].hf_pending = 0;
@@ -15064,106 +15088,176 @@ static void pcnetgame_guest_install(int g, const PCMpGuestEntry* fe) {
     pcnetgame_txn_journal_clear(PLAYER_NUM + g);
 }
 
+/* The load visitor: every readable guest file takes the next slot (the table grows as far as the memory budget allows; a guest that does not fit aborts the load = UNTRUSTED,
+ * never a silently dropped guest). */
+typedef struct PCNetGameGuestLoadCtx {
+    int next;
+} PCNetGameGuestLoadCtx;
+
+static int pcnetgame_guest_load_visit(void* ctx, const PCMpGsRecord* rec, int from_backup) {
+    PCNetGameGuestLoadCtx* lc = (PCNetGameGuestLoadCtx*)ctx;
+    int g = lc->next;
+    if (!pcnetgame_guest_cap_ensure(g + 1)) {
+        return 0;
+    }
+    lc->next++;
+    pcnetgame_guest_install(g, &rec->e);
+    memset(&s_guest_pers[g], 0, sizeof(s_guest_pers[g]));
+    s_guest_pers[g].has_file = 1;
+    memcpy(s_guest_pers[g].id, rec->id, PC_MP_GS_ID_SIZE);
+    s_guest_pers[g].gen = rec->generation;
+    s_guest_pers[g].digest = from_backup > 0 ? 0u : pc_mp_gs_entry_digest(&rec->e); /* recovered from a backup: rewrite the primary at the next write */
+    return 1;
+}
+
 static void pcnetgame_guest_store_load(void) {
-    PCMpGuestLoadInfo info;
-    int g, n = 0;
+    PCMpGsLoadInfo info;
+    PCMpGsMigInfo mi;
+    PCNetGameGuestLoadCtx lc;
+    char legacy[320];
+    int g, n = 0, mig, ok, untrusted_why_migration = 0;
     if (s_guest_store_loaded) {
         return;
     }
     s_guest_store_loaded = 1;
-    s_guest_store_mode = pc_mp_guests_load(pc_server_guests_path(), &s_guest_file, &info);
-    s_guest_untrusted = (s_guest_store_mode == PC_MP_GST_LOAD_UNTRUSTED);
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
-        if (s_guest_file.e[g].present) {
-            pcnetgame_guest_install(g, &s_guest_file.e[g]);
-            n++;
-        }
+    snprintf(legacy, sizeof(legacy), "%s", pc_server_guests_path());
+    pc_mp_gs_dir_for_legacy(legacy, s_guest_dir, sizeof(s_guest_dir));
+    /* an existing guests.dat (v2, fixed 8 entries) becomes one file per guest, once; never overwrites a guest that is already in the store */
+    mig = pc_mp_gs_migrate_legacy(legacy, s_guest_dir, &mi);
+    if (mig == PC_MP_GS_MIG_DONE) {
+        printf("[NET][GUEST] store: MIGRATED the fixed guests file '%s' (%d guest(s), %d written, %d already in the store) to one file per guest in '%s'; the old file is kept as '%s'\n", legacy,
+               mi.legacy_entries, mi.written, mi.skipped_existing, s_guest_dir, mi.retired);
+    } else if (mig == PC_MP_GS_MIG_FAILED || mig == PC_MP_GS_MIG_LEGACY_UNTRUSTED) {
+        untrusted_why_migration = 1;
+        printf("[NET][GUEST] store: *** the guests file '%s' could NOT be migrated (%s): UNTRUSTED mode -- it is left as it is; fix it and restart ***\n", legacy, mi.error);
     }
+    lc.next = 0;
+    ok = pc_mp_gs_load(s_guest_dir, pcnetgame_guest_load_visit, &lc, &info);
+    n = lc.next;
+    s_guest_untrusted = untrusted_why_migration || info.untrusted || !ok;
+    s_guest_store_mode = s_guest_untrusted ? PC_MP_GST_LOAD_UNTRUSTED : info.from_backup > 0 ? PC_MP_GST_LOAD_OK_BACKUP : (n > 0 || mig == PC_MP_GS_MIG_DONE) ? PC_MP_GST_LOAD_OK : PC_MP_GST_LOAD_MISSING;
     if (pc_host_observer_active()) {
-        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+        for (g = 0; g < s_guest_cap; g++) {
             if (s_guest[g].used && pc_host_observer_id_matches(&s_guest[g].key)) {
-                printf("[NET][OBSERVER] host: guests.dat entry %d carries the observer's reserved PersonalID -- that guest is refused (key conflict)\n", g);
+                printf("[NET][OBSERVER] host: guest store entry %d carries the observer's reserved PersonalID -- that guest is refused (key conflict)\n", g);
             }
         }
     }
-    printf("[NET][GUEST] store: guests file '%s' load mode=%s (generation used %d, %d unreadable file(s) preserved), %d guest(s) restored\n",
-           pc_server_guests_path(), s_guest_store_mode == PC_MP_GST_LOAD_MISSING ? "MISSING" : s_guest_store_mode == PC_MP_GST_LOAD_OK ? "OK" :
-           s_guest_store_mode == PC_MP_GST_LOAD_OK_BACKUP ? "OK_BACKUP" : "UNTRUSTED", info.gen_used, info.moved_aside, n);
+    printf("[NET][GUEST] store: guest store '%s' load mode=%s (%d file(s), %d recovered from a backup, %d unreadable file(s) preserved), %d guest(s) restored\n",
+           s_guest_dir, s_guest_store_mode == PC_MP_GST_LOAD_MISSING ? "MISSING" : s_guest_store_mode == PC_MP_GST_LOAD_OK ? "OK" :
+           s_guest_store_mode == PC_MP_GST_LOAD_OK_BACKUP ? "OK_BACKUP" : "UNTRUSTED", info.files, info.from_backup, info.moved_aside, n);
     if (s_guest_untrusted) {
-        printf("[NET][GUEST] store: *** UNTRUSTED MODE: guests.dat existed but no generation is readable. NO guest is admitted (their tokens "
-               "are unknown, so a squatter could not be told from the real guest); residents are unaffected. To reset deliberately remove "
-               "guests.dat, its .bak files AND the *.corrupt-* files ***\n");
+        printf("[NET][GUEST] store: *** UNTRUSTED MODE: the guest store is unreadable or inconsistent (%s). NO guest is admitted (their tokens "
+               "are unknown, so a squatter could not be told from the real guest); residents are unaffected. To reset deliberately remove the "
+               "affected guest files AND their *.corrupt-* files from '%s' ***\n", info.first_problem[0] ? info.first_problem : mi.error[0] ? mi.error : "see the log above", s_guest_dir);
     }
 }
 
-/* Builds the file image from the live table (all-zero padding: the caller compares images with memcmp). */
-static void pcnetgame_guest_store_build(PCMpGuestFile* nf) {
+/* Builds the durable entry of guest slot `g` from the live table into `rec` (not the id / generation). */
+static void pcnetgame_guest_entry_build(int g, PCMpGuestEntry* e) {
     static uint8_t be[PC_NETGAME_REC_SIZE];
-    int g;
-    memset(nf, 0, sizeof(*nf));
-    nf->generation = s_guest_file.generation + 1u;
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
-        PCMpGuestEntry* e = &nf->e[g];
-        if (!s_guest[g].used || !s_rec_slot[PLAYER_NUM + g].init) {
-            continue;
-        }
-        pcnetgame_rec_export_be(PLAYER_NUM + g, be);
-        e->present = 1;
-        memcpy(e->pid, be, PC_MP_GUEST_PID_SIZE);
-        memcpy(e->token, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN);
-        e->epoch = s_rec_slot[PLAYER_NUM + g].epoch;
-        e->rev = s_rec_slot[PLAYER_NUM + g].rev;
-        memcpy(e->record, be, PC_NETGAME_REC_SIZE);
-        memcpy(e->town_land_name, s_guest[g].town.land_name, PC_NETGAME_LAND_LEN);
-        e->town_land_id = s_guest[g].town.land_id;
-        e->town_terrain_hash = s_guest[g].town.terrain_hash;
-        e->confirmed = s_guest[g].confirmed ? 1u : 0u;
-        e->age = s_guest[g].age;
-    }
+    memset(e, 0, sizeof(*e));
+    pcnetgame_rec_export_be(PLAYER_NUM + g, be);
+    e->present = 1;
+    memcpy(e->pid, be, PC_MP_GUEST_PID_SIZE);
+    memcpy(e->token, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN);
+    e->epoch = s_rec_slot[PLAYER_NUM + g].epoch;
+    e->rev = s_rec_slot[PLAYER_NUM + g].rev;
+    memcpy(e->record, be, PC_NETGAME_REC_SIZE);
+    memcpy(e->town_land_name, s_guest[g].town.land_name, PC_NETGAME_LAND_LEN);
+    e->town_land_id = s_guest[g].town.land_id;
+    e->town_terrain_hash = s_guest[g].town.terrain_hash;
+    e->confirmed = s_guest[g].confirmed ? 1u : 0u;
+    e->age = s_guest[g].age;
 }
 
-/* Writes guests.dat if the durable content would change. 1 = durable (or nothing to write / nothing loaded), 0 = failed or refused
- * (loud log; retried at the next host save). NEVER writes while UNTRUSTED (a write would silently turn the file into a valid empty one and lift
- * the lock the operator must lift deliberately). The epoch alone changing (a re-roll after a save pause) is not a reason to rewrite. */
+/* Makes the guest store directory match the live table: every guest whose durable content changed is written to ITS OWN file (one 9.4 KB file, not the table), a slot that no longer
+ * holds a guest has its file moved aside (never deleted). 1 = durable (or nothing to write / nothing loaded), 0 = failed or refused (loud log; retried at the next host save).
+ * NEVER writes while UNTRUSTED (the operator must lift that deliberately). The epoch alone changing (a re-roll after a save pause) is not a reason to rewrite. */
 static int pcnetgame_guest_store_write(const char* why) {
-    static PCMpGuestFile nf, cmp;
-    int g, r, count = 0;
+    static PCMpGsRecord rec;
+    int g, count = 0, written = 0, retired = 0, failed = 0;
     if (!s_guest_store_loaded || s_guest_untrusted) {
         return 1;
     }
-    pcnetgame_guest_store_build(&nf);
-    cmp = nf;
-    cmp.generation = s_guest_file.generation;
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
-        if (cmp.e[g].present && s_guest_file.e[g].present) {
-            cmp.e[g].epoch = s_guest_file.e[g].epoch;
-        }
-    }
-    if (memcmp(cmp.e, s_guest_file.e, sizeof(cmp.e)) == 0) {
-        s_guest_store_last_failed = 0;
-        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
-            s_rec_slot[PLAYER_NUM + g].dirty_unsaved = 0; /* the durable image already says exactly this */
-        }
-        return 1;
-    }
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
-        count += nf.e[g].present ? 1 : 0;
-    }
-    r = pc_mp_guests_save(pc_server_guests_path(), &nf);
-    if (r == PC_MP_GST_OK) {
-        s_guest_file = nf;
-        s_guest_store_last_failed = 0;
-        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+    for (g = 0; g < s_guest_cap; g++) {
+        PCNetGameGuestPers* ps = &s_guest_pers[g];
+        if (s_guest[g].used && s_rec_slot[PLAYER_NUM + g].init) {
+            uint32_t dg;
+            count++;
+            pcnetgame_guest_entry_build(g, &rec.e);
+            dg = pc_mp_gs_entry_digest(&rec.e);
+            if (ps->has_file && ps->digest == dg) {
+                s_rec_slot[PLAYER_NUM + g].dirty_unsaved = 0; /* the durable file already says exactly this */
+            } else {
+                if (ps->has_file) {
+                    memcpy(rec.id, ps->id, PC_MP_GS_ID_SIZE);
+                } else if (!pc_mp_gs_new_id(rec.id)) {
+                    failed++; /* no OS randomness: never invent an id */
+                    continue;
+                }
+                rec.generation = ps->gen + 1u;
+                if (pc_mp_gs_save(s_guest_dir, &rec) == PC_MP_GST_OK) {
+                    ps->has_file = 1;
+                    memcpy(ps->id, rec.id, PC_MP_GS_ID_SIZE);
+                    ps->gen = rec.generation;
+                    ps->digest = dg;
+                    s_rec_slot[PLAYER_NUM + g].dirty_unsaved = 0;
+                    written++;
+                } else {
+                    failed++;
+                    continue;
+                }
+            }
+            if (ps->retire_pending) { /* the slot was reused for this guest: the previous guest's file goes aside now that this one is durable */
+                if (pc_mp_gs_retire(s_guest_dir, ps->retire_id, NULL, 0)) {
+                    ps->retire_pending = 0;
+                    retired++;
+                } else {
+                    failed++;
+                }
+            }
+        } else {
+            if (ps->has_file) { /* removed / evicted / rolled back: the file moves aside */
+                if (pc_mp_gs_retire(s_guest_dir, ps->id, NULL, 0)) {
+                    ps->has_file = 0;
+                    retired++;
+                } else {
+                    failed++;
+                }
+            }
+            if (ps->retire_pending) {
+                if (pc_mp_gs_retire(s_guest_dir, ps->retire_id, NULL, 0)) {
+                    ps->retire_pending = 0;
+                    retired++;
+                } else {
+                    failed++;
+                }
+            }
             s_rec_slot[PLAYER_NUM + g].dirty_unsaved = 0;
         }
-        printf("[NET][GUEST] store: guests.dat written (%s; generation %u, %d guest(s))\n", why, (unsigned)nf.generation, count);
+    }
+    if (failed == 0) {
+        s_guest_store_last_failed = 0;
+        if (written > 0 || retired > 0) {
+            s_guest_store_gen++;
+            printf("[NET][GUEST] store: guests written (%s; generation %u, %d guest(s); %d file(s) written, %d retired)\n", why, (unsigned)s_guest_store_gen, count, written, retired);
+        }
         return 1;
     }
     s_guest_store_fail_count++;
     s_guest_store_last_failed = 1;
-    printf("[NET][GUEST] store: *** guests.dat write FAILED (%s, %s); the table stays in memory, retried at the next host save "
-           "(failure #%u) ***\n", pc_mp_guests_strerror(r), why, (unsigned)s_guest_store_fail_count);
+    printf("[NET][GUEST] store: *** guest store write FAILED (%d guest file(s), %s); the table stays in memory, retried at the next host save "
+           "(failure #%u) ***\n", failed, why, (unsigned)s_guest_store_fail_count);
     return 0;
+}
+
+/* The operator backup of ONE guest's file before a command changes / removes it (the legacy command backed up the whole guests.dat). 1 = done. */
+static int pcnetgame_guest_backup(int g, char* bak, size_t cap) {
+    if (g < 0 || g >= s_guest_cap || !s_guest_pers[g].has_file) {
+        return 0;
+    }
+    return pc_mp_gs_backup(s_guest_dir, s_guest_pers[g].id, bak, cap);
 }
 
 /* The guest KEY validity (beyond the vanilla null test): real names, a real land id. */
@@ -15175,7 +15269,7 @@ static int pcnetgame_guest_key_valid(const PersonalID_c* key) {
 /* M1: the table key is (the host's CURRENT town identity, the guest key): an entry of another town is never matched (kept, inactive). */
 static int pcnetgame_guest_find(const PersonalID_c* key) {
     int g;
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+    for (g = 0; g < s_guest_cap; g++) {
         if (s_guest[g].used && pcnetgame_town_equal(&s_guest[g].town, &s_host_town) && memcmp(&s_guest[g].key, key, sizeof(*key)) == 0) {
             return g;
         }
@@ -15186,7 +15280,7 @@ static int pcnetgame_guest_find(const PersonalID_c* key) {
 /* G6.2: the operator recovery window (ms) of a guest-reset-token. */
 #define PC_NETGAME_GUEST_RECOVERY_MS 600000u
 static int pcnetgame_guest_recovery_active(int g) {
-    if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used || !s_guest[g].recovery) {
+    if (g < 0 || g >= s_guest_cap || !s_guest[g].used || !s_guest[g].recovery) {
         return 0;
     }
     if ((uint32_t)(pcnetgame_now_ms() - s_guest[g].recovery_since_ms) >= PC_NETGAME_GUEST_RECOVERY_MS) {
@@ -15253,28 +15347,36 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
     PCNetGameGuest old_g;
     Private_c old_rec;
     PCNetGameRecSlot old_rs;
+    PCNetGameGuestPers old_pers;
     int evicted = 0;
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+    for (g = 0; g < s_guest_cap; g++) {
         if (!s_guest[g].used) {
             break;
         }
     }
-    if (g >= PC_NETGAME_GUEST_MAX) {
-        for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
-            if (pcnetgame_guest_entry_disposable(g) && (evict < 0 || (int32_t)(s_guest[g].age - s_guest[evict].age) < 0)) {
-                evict = g;
+    if (g >= s_guest_cap) {
+        /* no free entry: GROW the store (the only thing that bounds it is the memory budget) ... */
+        const int first_new = s_guest_cap;
+        if (pcnetgame_guest_cap_ensure(first_new + 1)) {
+            g = first_new; /* NOTE: the tables moved: every pointer into them was re-taken below */
+        } else {
+            /* ... and only when the budget is used up (or the allocation failed) free the OLDEST disposable (unconfirmed, data-less, idle) entry (M3) */
+            for (g = 0; g < s_guest_cap; g++) {
+                if (pcnetgame_guest_entry_disposable(g) && (evict < 0 || (int32_t)(s_guest[g].age - s_guest[evict].age) < 0)) {
+                    evict = g;
+                }
             }
+            if (evict < 0) {
+                return -1;
+            }
+            g = evict;
+            evicted = 1;
         }
-        if (evict < 0) {
-            return -1;
-        }
-        g = evict;
-        evicted = 1;
     }
     if (!pcnetgame_guest_token_fresh(token_out)) {
         return -2;
     }
-    for (evict = 0; evict < PC_NETGAME_GUEST_MAX; evict++) {
+    for (evict = 0; evict < s_guest_cap; evict++) {
         if (s_guest[evict].used && (int32_t)(s_guest[evict].age - age_max) > 0) {
             age_max = s_guest[evict].age;
         }
@@ -15282,6 +15384,18 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
     old_g = s_guest[g];
     old_rec = s_guest_rec[g];
     old_rs = s_rec_slot[PLAYER_NUM + g];
+    old_pers = s_guest_pers[g];
+    if (s_guest_pers[g].has_file) {
+        /* the slot is reused (eviction / a removal whose file move failed): that guest's file must go aside once THIS guest is durable, and this guest gets a file of its own */
+        if (s_guest_pers[g].retire_pending && !pc_mp_gs_retire(s_guest_dir, s_guest_pers[g].retire_id, NULL, 0)) {
+            return -3; /* two pending retirements cannot be held: refuse rather than lose track of a file */
+        }
+        s_guest_pers[g].retire_pending = 1;
+        memcpy(s_guest_pers[g].retire_id, s_guest_pers[g].id, PC_MP_GS_ID_SIZE);
+        s_guest_pers[g].has_file = 0;
+        s_guest_pers[g].digest = 0;
+        s_guest_pers[g].gen = 0;
+    }
     if (evicted) {
         char who[96];
         pcnetgame_format_town(&old_g.town, who, sizeof(who));
@@ -15308,6 +15422,9 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
     memset(s_rec_backup[PLAYER_NUM + g], 0, PC_NETGAME_REC_SIZE);
     pcnetgame_txn_journal_clear(PLAYER_NUM + g);
     if (!pcnetgame_guest_store_write("new guest token minted")) {
+        if (s_guest_pers[g].has_file) {
+            (void)pc_mp_gs_retire(s_guest_dir, s_guest_pers[g].id, NULL, 0); /* the new guest's file got written but the token will never be sent: no orphan may stay */
+        }
         if (evicted) {
             s_guest[g] = old_g; /* the eviction was never made durable: the old (disposable) entry stays exactly as it was */
             s_guest_rec[g] = old_rec;
@@ -15317,6 +15434,7 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
             memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
             memset(rs, 0, sizeof(*rs));
         }
+        s_guest_pers[g] = old_pers;
         return -3;
     }
     *out_g = g;
@@ -15346,7 +15464,7 @@ static int pcnetgame_guest_remint(int g, uint8_t* token_out, uint8_t* old_token_
         printf("[NET][GUEST] host: operator recovery of guest slot %d used: re-minting its token (the stored record is kept)\n", g);
     }
     memcpy(old_token_out, s_guest[g].token, PC_NETGAME_GUEST_TOKEN_LEN);
-    for (k = 0; k < PC_NETGAME_GUEST_MAX; k++) {
+    for (k = 0; k < s_guest_cap; k++) {
         if (s_guest[k].used && (int32_t)(s_guest[k].age - age_max) > 0) {
             age_max = s_guest[k].age;
         }
@@ -15366,7 +15484,7 @@ static int pcnetgame_guest_remint(int g, uint8_t* token_out, uint8_t* old_token_
 }
 
 static void pcnetgame_guest_remint_rollback(int g, const uint8_t* old_token) {
-    if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used) {
+    if (g < 0 || g >= s_guest_cap || !s_guest[g].used) {
         return;
     }
     memcpy(s_guest[g].token, old_token, PC_NETGAME_GUEST_TOKEN_LEN);
@@ -15382,7 +15500,7 @@ static void pcnetgame_guest_remint_rollback(int g, const uint8_t* old_token) {
  * durable. Only ever called for an entry created by the SAME admission. (An entry that EVICTED another one is not restored: the evicted entry was
  * disposable by definition, and the new one is gone again.) */
 static void pcnetgame_guest_rollback_create(int g) {
-    if (g < 0 || g >= PC_NETGAME_GUEST_MAX) {
+    if (g < 0 || g >= s_guest_cap) {
         return;
     }
     memset(&s_guest[g], 0, sizeof(s_guest[g]));
@@ -15401,7 +15519,7 @@ static void pcnetgame_guest_confirm_on_record_step(PCNetPeerId peer) {
         return;
     }
     g = st->bound_guest_slot;
-    if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used || s_guest[g].confirmed) {
+    if (g < 0 || g >= s_guest_cap || !s_guest[g].used || s_guest[g].confirmed) {
         return;
     }
     s_guest[g].confirmed = 1;
@@ -15803,7 +15921,7 @@ static int pcnetgame_guest_drop_promoted(const uint8_t aux[PC_MP_MEMBERS_PID_SIZ
     if (!s_guest_store_loaded || s_guest_untrusted) {
         return 0;
     }
-    for (g = 0; g < PC_NETGAME_GUEST_MAX && found < 0; g++) {
+    for (g = 0; g < s_guest_cap && found < 0; g++) {
         if (!s_guest[g].used || !pcnetgame_town_equal(&s_guest[g].town, &s_host_town)) {
             continue;
         }
@@ -15820,8 +15938,8 @@ static int pcnetgame_guest_drop_promoted(const uint8_t aux[PC_MP_MEMBERS_PID_SIZ
         return 0;
     }
     bak[0] = '\0';
-    if (!pc_mp_guests_backup_file(pc_server_guests_path(), bak, sizeof(bak))) {
-        printf("[NET][PROMOTE] host: the stale guest entry %d of a promoted guest could not be removed: the backup of %s failed (entry kept, retried later)\n", g, pc_server_guests_path());
+    if (!pcnetgame_guest_backup(g, bak, sizeof(bak))) {
+        printf("[NET][PROMOTE] host: the stale guest entry %d of a promoted guest could not be removed: the backup of its guest file in %s failed (entry kept, retried later)\n", g, s_guest_dir);
         return 0;
     }
     {
@@ -16067,14 +16185,67 @@ typedef struct PCNetGameTxnResident {
     uint8_t         head, n;                             /* ring[head .. head+n) */
     PCNetGameTxnLog ring[PC_NETGAME_TXN_RING];
 } PCNetGameTxnResident;
-static PCNetGameTxnResident s_txn_res[PC_NETGAME_REC_SLOTS]; /* ~2 KB per slot (residents + guests, the shared slot index space); host_session scope, NOT per peer */
+PC_GROW_TABLE(PCNetGameTxnResident, s_txn_res, PLAYER_NUM, PCNG_GUEST_INLINE) /* ~2 KB per slot (residents + guests, the shared slot index space); host_session scope, NOT per peer */
 
 static void pcnetgame_txn_journal_clear(int idx) {
     if (idx < 0) {
-        memset(s_txn_res, 0, sizeof(s_txn_res));
-    } else if (idx < PC_NETGAME_REC_SLOTS) {
+        memset(s_txn_res, 0, (size_t)pcnetgame_rec_slots() * sizeof(s_txn_res[0]));
+    } else if (idx < pcnetgame_rec_slots()) {
         memset(&s_txn_res[idx], 0, sizeof(s_txn_res[idx]));
     }
+}
+
+/* The memory budget of the guest store: `guest_memory_mb` (settings.ini [Network], default 256) / the bytes one guest costs in memory (the entry, its record, the persistence
+ * state, the record lineage slot, the MIGRATE backup image and the transaction journal) = the most guests the host will keep, with the oldest-unconfirmed-first eviction when it is used up. */
+static PCGrowTable s_guest_tables[] = {
+    PC_GROW_TABLE_ENTRY(s_rec_slot, PLAYER_NUM), PC_GROW_TABLE_ENTRY(s_rec_backup, PLAYER_NUM), PC_GROW_TABLE_ENTRY(s_txn_res, PLAYER_NUM),
+    PC_GROW_TABLE_ENTRY(s_guest, 0), PC_GROW_TABLE_ENTRY(s_guest_rec, 0), PC_GROW_TABLE_ENTRY(s_guest_pers, 0),
+};
+#define PCNG_GUEST_TABLE_COUNT ((int)(sizeof(s_guest_tables) / sizeof(s_guest_tables[0])))
+
+static size_t pcnetgame_guest_slot_bytes(void) {
+    return sizeof(PCNetGameGuest) + sizeof(Private_c) + sizeof(PCNetGameGuestPers) + sizeof(PCNetGameRecSlot) + PC_NETGAME_REC_SIZE + sizeof(PCNetGameTxnResident);
+}
+
+static int pcnetgame_guest_budget_slots(void) {
+    const unsigned long long mb = g_pc_settings.guest_memory_mb >= 1 ? (unsigned long long)g_pc_settings.guest_memory_mb : 256ull;
+    unsigned long long n = mb * 1048576ull / (unsigned long long)pcnetgame_guest_slot_bytes();
+    if (n < (unsigned long long)PCNG_GUEST_INLINE) {
+        n = PCNG_GUEST_INLINE;
+    }
+    return n > 0x3FFFFFFFull ? 0x3FFFFFFF : (int)n;
+}
+
+/* Makes room for `want` guest entries (geometric growth, never past the memory budget). All-or-nothing: 0 = the budget is used up or the allocation failed, nothing changed.
+ * RELOCATES the guest tables (see s_guest_cap). */
+static int pcnetgame_guest_cap_ensure(int want) {
+    static int s_budget_logged = 0;
+    const int budget = pcnetgame_guest_budget_slots();
+    int target;
+    if (want <= s_guest_cap) {
+        return 1;
+    }
+    if (want > budget) {
+        if (!s_budget_logged) {
+            s_budget_logged = 1;
+            printf("[NET][GUEST] store: the guest memory budget (%d MB = %d guests) is used up: no room for guest %d (raise guest_memory_mb in settings.ini [Network])\n", g_pc_settings.guest_memory_mb, budget, want);
+        }
+        return 0;
+    }
+    target = s_guest_cap > budget / 2 ? budget : s_guest_cap * 2;
+    if (target < want) {
+        target = want;
+    }
+    if (target > budget) {
+        target = budget;
+    }
+    if (!pc_grow_tables_ensure(s_guest_tables, PCNG_GUEST_TABLE_COUNT, s_guest_cap, target)) {
+        printf("[NET][GUEST] store: out of memory growing the guest store from %d to %d entries\n", s_guest_cap, target);
+        return 0;
+    }
+    printf("[NET][GUEST] store: guest store grown to %d entries (%.1f MB, budget %d guests)\n", target, (double)target * (double)pcnetgame_guest_slot_bytes() / 1048576.0, budget);
+    s_guest_cap = target;
+    return 1;
 }
 
 static int pcnetgame_txn_nonce_fenced(const PCNetGameTxnResident* R, uint32_t nonce) {
@@ -16327,7 +16498,7 @@ static void pcnetgame_txn_send_applied(PCNetPeerId peer, int idx, const PCNetGam
  * released; NOT_PENDING has none). */
 static void pcnetgame_txn_reject(PCNetPeerId peer, int idx, const PCNetGameRecSlot* slot, const PCNetGameTxnCommitMsg* in,
                                  uint32_t hash, uint8_t reason, int journal, PCNetGameHostInteraction* release, const char* why) {
-    if (journal && idx >= 0 && idx < PC_NETGAME_REC_SLOTS) {
+    if (journal && idx >= 0 && idx < pcnetgame_rec_slots()) {
         pcnetgame_txn_journal_add(&s_txn_res[idx], in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, reason,
                                   slot != NULL ? slot->rev : 0);
     }
@@ -26450,8 +26621,26 @@ static void pcnetgame_host_admission_refuse_identity_text(PCNetGameAdmission* a,
 
 /* M-H: builds the pure resolver's input from the host state (the host's 4 private_data records, the in-memory guests / members mirrors) and runs it. `home` = the EXT home PersonalID
  * (only read for ext_kind GUEST). The members file counts only when resident_tokens != off (off never touches it) and it is trusted; guests.dat only when trusted. */
+/* The guest table as membership rows (pc_mp_membership.h PCMpGuestSource): any number of guests. */
+static int pcnetgame_guest_row(void* ctx, int idx, PCMpGuestRow* row) {
+    (void)ctx;
+    if (idx < 0 || idx >= s_guest_cap) {
+        return 0;
+    }
+    if (s_guest[idx].used && s_rec_slot[PLAYER_NUM + idx].init) {
+        row->present = 1;
+        row->confirmed = s_guest[idx].confirmed ? 1 : 0;
+        pcnetgame_resident_pid_be(&s_guest[idx].key, row->pid);
+        memcpy(row->town_land_name, s_guest[idx].town.land_name, PC_NETGAME_LAND_LEN);
+        row->town_land_id = s_guest[idx].town.land_id;
+        row->town_terrain_hash = s_guest[idx].town.terrain_hash;
+    }
+    return 1;
+}
+
 static void pcnetgame_host_admission_resolve_view(const PCNetGameIdentityMsg* in, int ext_kind, const PersonalID_c* home, int own_idx, PCMpAdmitView* view) {
     PCMpAdmitIn ai;
+    PCMpGuestSource gsrc;
     PersonalID_c claim;
     int i;
     memset(&ai, 0, sizeof(ai));
@@ -26471,7 +26660,10 @@ static void pcnetgame_host_admission_resolve_view(const PCNetGameIdentityMsg* in
         ai.res[i].valid = (mLd_CHECK_LAND_ID(p->land_id) && mPr_NullCheckPersonalID(p) == FALSE) ? 1 : 0;
         ai.res[i].exists = Save_Get(private_data)[i].exists == TRUE ? 1 : 0;
     }
-    ai.guests = (s_guest_store_loaded && !s_guest_untrusted) ? &s_guest_file : NULL;
+    gsrc.fn = pcnetgame_guest_row;
+    gsrc.ctx = NULL;
+    ai.guests = NULL;
+    ai.guest_src = (s_guest_store_loaded && !s_guest_untrusted) ? &gsrc : NULL;
     ai.members = (pcnetgame_resident_policy() != PC_NETGAME_RESTOK_OFF && s_members_loaded && !s_members_untrusted) ? &s_members_file : NULL;
     ai.own_idx = own_idx;
     (void)pc_mp_membership_resolve(&ai, view);
@@ -26844,8 +27036,8 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
             memset(&tk, 0, sizeof(tk));
             tk.msg_type = (uint8_t)PC_NETGAME_MSG_IDENTITY_TOKEN;
             tk.flags = (guest_new || guest_remint) ? (uint8_t)PC_NETGAME_IDTOKEN_FLAG_NEW : (uint8_t)PC_NETGAME_IDTOKEN_FLAG_KNOWN;
-            tk.guest_slot = (uint8_t)guest_slot;
-            tk.table_size = (uint8_t)PC_NETGAME_GUEST_MAX;
+            tk.guest_slot = (uint8_t)(guest_slot & 0xFF); /* informational only (the client logs it): the store has no 256-guest limit, the byte just wraps */
+            tk.table_size = (uint8_t)(s_guest_cap > 255 ? 255 : s_guest_cap);
             memcpy(tk.token, guest_token, PC_NETGAME_GUEST_TOKEN_LEN);
             if (!pc_net_send(peer, PC_NET_RELIABLE, &tk, (uint16_t)sizeof(tk))) {
                 printf("[NET] host: peer %d IDENTITY_TOKEN could not be queued -- dropping peer\n", (int)peer);
@@ -35104,7 +35296,7 @@ int pc_net_game_dedicated_capacity(int* peers_used, int* peers_total, int* resid
 
 /* ===== GUESTS G6.2: host operator tools (dedicated console: guests / guest-remove / guest-reset-token). Main thread only, HOST only. ===== */
 int pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out) {
-    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= PC_NETGAME_GUEST_MAX || !s_guest_store_loaded || !s_guest[slot].used) {
+    if (out == NULL || s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= s_guest_cap || !s_guest_store_loaded || !s_guest[slot].used) {
         return 0;
     }
     memset(out, 0, sizeof(*out));
@@ -35125,16 +35317,16 @@ int pc_net_game_dedicated_guest_info(int slot, PCNetGameDedicatedGuestInfo* out)
 int pc_net_game_dedicated_members(PCNetGameDedicatedMemberInfo* rows, int cap) {
     uint8_t res_pid[4][20];
     uint8_t res_exists[4];
-    static PCMpGuestFile gf;
-    PCMpMembership mm[4 + PC_MP_GUEST_SLOTS];
+    PCMpGuestSource gsrc;
+    PCMpMembership* mm;
     PCMpTownKey tk;
+    const int mm_cap = 4 + s_guest_cap;
     int i, n, out_n = 0;
     if (rows == NULL || s_role != PC_NETGAME_ROLE_HOST || !s_guest_store_loaded) {
         return 0;
     }
     memset(res_pid, 0, sizeof(res_pid));
     memset(res_exists, 0, sizeof(res_exists));
-    memset(&gf, 0, sizeof(gf));
     for (i = 0; i < 4; i++) {
         PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
         if (mPr_NullCheckPersonalID(p) == FALSE) {
@@ -35147,28 +35339,16 @@ int pc_net_game_dedicated_members(PCNetGameDedicatedMemberInfo* rows, int cap) {
             res_exists[i] = 1;
         }
     }
-    for (i = 0; i < PC_NETGAME_GUEST_MAX && i < PC_MP_GUEST_SLOTS; i++) {
-        const PersonalID_c* k = &s_guest[i].key;
-        PCMpGuestEntry* e = &gf.e[i];
-        if (!s_guest[i].used) {
-            continue;
-        }
-        e->present = 1;
-        e->confirmed = s_guest[i].confirmed ? 1 : 0;
-        memcpy(e->pid, k->player_name, PC_NETGAME_NAME_LEN);
-        memcpy(e->pid + 8, k->land_name, PC_NETGAME_LAND_LEN);
-        e->pid[16] = (uint8_t)(k->player_id >> 8);
-        e->pid[17] = (uint8_t)k->player_id;
-        e->pid[18] = (uint8_t)(k->land_id >> 8);
-        e->pid[19] = (uint8_t)k->land_id;
-        memcpy(e->town_land_name, s_guest[i].town.land_name, PC_NETGAME_LAND_LEN);
-        e->town_land_id = s_guest[i].town.land_id;
-        e->town_terrain_hash = s_guest[i].town.terrain_hash;
-    }
+    gsrc.fn = pcnetgame_guest_row;
+    gsrc.ctx = NULL;
     memcpy(tk.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN);
     tk.land_id = s_host_town.land_id;
     tk.terrain_hash = s_host_town.terrain_hash;
-    n = pc_mp_membership_list(&tk, (const uint8_t(*)[20])res_pid, res_exists, &gf, mm, (int)(sizeof(mm) / sizeof(mm[0])));
+    mm = (PCMpMembership*)malloc((size_t)mm_cap * sizeof(*mm));
+    if (mm == NULL) {
+        return 0;
+    }
+    n = pc_mp_membership_list_src(&tk, (const uint8_t(*)[20])res_pid, res_exists, &gsrc, mm, mm_cap);
     for (i = 0; i < n && out_n < cap; i++) {
         const int gr = mm[i].guest_slot >= 0 && mm[i].res_index < 0;
         rows[out_n].kind = mm[i].kind;
@@ -35179,7 +35359,13 @@ int pc_net_game_dedicated_members(PCNetGameDedicatedMemberInfo* rows, int cap) {
         pcnetgame_dedicated_ascii_name(mm[i].pid + 8, rows[out_n].home_town);
         out_n++;
     }
+    free(mm);
     return out_n;
+}
+
+/* How many guest table entries exist right now (the console loops over them): the allocated slot count, 0 unless a HOST has loaded the store. */
+int pc_net_game_dedicated_guest_slots(void) {
+    return (s_role == PC_NETGAME_ROLE_HOST && s_guest_store_loaded) ? s_guest_cap : 0;
 }
 
 static int pcnetgame_dedicated_ieq(const char* a, const char* b) {
@@ -35193,7 +35379,7 @@ static int pcnetgame_dedicated_ieq(const char* a, const char* b) {
     return *a == *b;
 }
 
-/* sel: a single digit 0..7 = the guest table slot, otherwise the guest name (case-insensitive; it must name exactly ONE entry). */
+/* sel: a number = the guest table slot, otherwise the guest name (case-insensitive; it must name exactly ONE entry). */
 static int pcnetgame_dedicated_guest_resolve(const char* sel, char* msg, size_t cap) {
     int g, found = -1, n = 0;
     char nm[PC_NETGAME_NAME_LEN + 1];
@@ -35201,15 +35387,23 @@ static int pcnetgame_dedicated_guest_resolve(const char* sel, char* msg, size_t 
         snprintf(msg, cap, "missing <slot|name> (see `guests`)");
         return -1;
     }
-    if (sel[0] >= '0' && sel[0] <= '7' && sel[1] == '\0') {
-        g = sel[0] - '0';
-        if (g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used) {
-            snprintf(msg, cap, "guest slot %d is not in use (see `guests`)", g);
-            return -1;
+    {
+        const char* d = sel;
+        long v = 0;
+        while (*d >= '0' && *d <= '9' && v < 100000000L) {
+            v = v * 10 + (*d - '0');
+            d++;
         }
-        return g;
+        if (d != sel && *d == '\0') { /* all digits: a guest slot number (a name that merely starts with a digit falls through to the name search) */
+            g = v > 0x7FFFFFFF ? 0x7FFFFFFF : (int)v;
+            if (g >= s_guest_cap || !s_guest[g].used) {
+                snprintf(msg, cap, "guest slot %d is not in use (see `guests`)", g);
+                return -1;
+            }
+            return g;
+        }
     }
-    for (g = 0; g < PC_NETGAME_GUEST_MAX; g++) {
+    for (g = 0; g < s_guest_cap; g++) {
         if (!s_guest[g].used) {
             continue;
         }
@@ -35271,9 +35465,9 @@ int pc_net_game_dedicated_guest_admin(int op, const char* sel, int confirm, char
         }
         return 2;
     }
-    if (!pc_mp_guests_backup_file(pc_server_guests_path(), bak, sizeof(bak))) {
-        snprintf(msg, cap, "refused: could not back up %s first (nothing was changed)", pc_server_guests_path());
-        printf("[NET][GUEST] ADMIN: %s of guest slot %d refused: backup of %s failed\n", op == 0 ? "remove" : "reset-token", g, pc_server_guests_path());
+    if (!pcnetgame_guest_backup(g, bak, sizeof(bak))) {
+        snprintf(msg, cap, "refused: could not back up the guest file in %s first (nothing was changed)", s_guest_dir);
+        printf("[NET][GUEST] ADMIN: %s of guest slot %d refused: backup of its guest file in %s failed\n", op == 0 ? "remove" : "reset-token", g, s_guest_dir);
         return 0;
     }
     if (op == 1) {
@@ -35455,7 +35649,7 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     }
     if (online) {
         g = gfixed;
-        if (g < 0 || g >= PC_NETGAME_GUEST_MAX || !s_guest[g].used) {
+        if (g < 0 || g >= s_guest_cap || !s_guest[g].used) {
             PROMOTE_REFUSE_R(PC_NETGAME_TXN_REASON_NOT_BOUND, "refused: the requesting guest has no guest table entry");
         }
     } else {
@@ -35528,8 +35722,8 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
         return 2;
     }
     bak_g[0] = bak_m[0] = bak_r[0] = '\0';
-    if (!pc_mp_guests_backup_file(pc_server_guests_path(), bak_g, sizeof(bak_g))) {
-        PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", pc_server_guests_path());
+    if (!pcnetgame_guest_backup(g, bak_g, sizeof(bak_g))) {
+        PROMOTE_REFUSE("refused: could not back up the guest file in %s first (nothing was changed)", s_guest_dir);
     }
     if (pcnetgame_promote_file_exists(pc_server_members_path()) && !pc_mp_guests_backup_file(pc_server_members_path(), bak_m, sizeof(bak_m))) {
         PROMOTE_REFUSE("refused: could not back up %s first (nothing was changed)", pc_server_members_path());
@@ -35887,7 +36081,7 @@ static int pcnetgame_dedicated_give_resolve(const char* sel, char* who, size_t w
             n++;
         }
     }
-    for (i = 0; i < PC_NETGAME_GUEST_MAX; i++) {
+    for (i = 0; i < s_guest_cap; i++) {
         if (!s_guest[i].used || !s_guest_store_loaded || !pcnetgame_town_equal(&s_guest[i].town, &s_host_town)) {
             continue; /* another host town's guest: inactive, never matched */
         }

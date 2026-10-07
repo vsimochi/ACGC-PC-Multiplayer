@@ -130,6 +130,12 @@ void pc_mp_guests_set_fault(const PCMpGuestFault* f);
 
 const char* pc_mp_guests_strerror(int err);
 
+/* One entry <-> PC_MP_GUEST_ENTRY_SIZE bytes (the layout shared by guests.dat v2 and the per-guest store files of pc_mp_guest_store.h). encode: an absent entry is all-zero.
+ * decode: every field rule of one entry (flags, non-zero pid / token / epoch, rev bound, land name, record CRC, record belongs to the pid and exists); the cross-entry
+ * duplicate rules belong to the container. Returns PC_MP_GST_OK or the error. */
+void pc_mp_guests_entry_encode(const PCMpGuestEntry* e, uint8_t* p);
+int  pc_mp_guests_entry_decode(const uint8_t* p, PCMpGuestEntry* e);
+
 /* Pure buffer functions. serialize: `out` must hold PC_MP_GUEST_FILE_SIZE bytes. */
 int pc_mp_guests_serialize(const PCMpGuestFile* f, uint8_t* out, size_t cap);
 int pc_mp_guests_parse(const uint8_t* buf, size_t len, PCMpGuestFile* out);

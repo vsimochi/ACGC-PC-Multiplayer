@@ -15,6 +15,22 @@
 extern "C" {
 #endif
 
+/* The guest table as the membership layer sees it: one lightweight ROW per guest (no record), read through a callback so that a store of ANY size can be searched (the fixed
+ * 8-entry PCMpGuestFile is just one source of rows). fn returns 1 while `idx` is inside the table (the row may be absent: present = 0) and 0 past its end. */
+typedef struct PCMpGuestRow {
+    uint8_t  present;
+    uint8_t  confirmed;
+    uint8_t  pid[20];
+    uint8_t  town_land_name[8];
+    uint16_t town_land_id;
+    uint32_t town_terrain_hash;
+} PCMpGuestRow;
+typedef int (*PCMpGuestRowFn)(void* ctx, int idx, PCMpGuestRow* row);
+typedef struct PCMpGuestSource {
+    PCMpGuestRowFn fn;
+    void*          ctx;
+} PCMpGuestSource;
+
 enum { PC_MP_MEMBER_NONE = 0, PC_MP_MEMBER_RESIDENT = 1, PC_MP_MEMBER_GUEST = 2, PC_MP_MEMBER_AMBIGUOUS = 3 };
 
 typedef struct PCMpTownKey {
@@ -26,7 +42,7 @@ typedef struct PCMpTownKey {
 typedef struct PCMpMembership {
     int     kind;        /* PC_MP_MEMBER_* */
     int     res_index;   /* resident slot 0..3, -1 if none */
-    int     guest_slot;  /* guest table slot 0..7, -1 if none */
+    int     guest_slot;  /* guest table slot (0 .. the table size - 1), -1 if none */
     int     confirmed;   /* guest entry confirmed flag */
     uint8_t pid[20];
 } PCMpMembership;
@@ -34,6 +50,12 @@ typedef struct PCMpMembership {
 /* Returns the kind; `out` (optional) is filled. res_exists[i] != 0 marks a used resident slot. guests may be NULL. */
 int pc_mp_membership_lookup(const uint8_t pid_be[20], const PCMpTownKey* town, const uint8_t res_pid[4][20], const uint8_t res_exists[4],
                             const PCMpGuestFile* guests, PCMpMembership* out);
+
+/* The same two functions over any guest source (the host's per-guest store of any size); `guests` NULL = no guests. Identical results to the PCMpGuestFile forms for the same rows. */
+int pc_mp_membership_lookup_src(const uint8_t pid_be[20], const PCMpTownKey* town, const uint8_t res_pid[4][20], const uint8_t res_exists[4],
+                                const PCMpGuestSource* guests, PCMpMembership* out);
+int pc_mp_membership_list_src(const PCMpTownKey* town, const uint8_t res_pid[4][20], const uint8_t res_exists[4], const PCMpGuestSource* guests,
+                              PCMpMembership* rows, int cap);
 
 /* Lists every member of `town`: residents first (slot order), then the active guests (table order). Returns the number of rows written (<= cap). */
 int pc_mp_membership_list(const PCMpTownKey* town, const uint8_t res_pid[4][20], const uint8_t res_exists[4], const PCMpGuestFile* guests,
@@ -65,6 +87,7 @@ typedef struct PCMpAdmitIn {
     PCMpTownKey          town;
     PCMpAdmitRes         res[4];
     const PCMpGuestFile* guests;            /* NULL = none / untrusted */
+    const PCMpGuestSource* guest_src;       /* used when `guests` is NULL: the same table as rows of ANY size (NULL = none) */
     const PCMpMemberFile* members;          /* NULL = none / untrusted / not loaded */
     int                  own_idx;           /* the host's own active resident, -1 none */
 } PCMpAdmitIn;

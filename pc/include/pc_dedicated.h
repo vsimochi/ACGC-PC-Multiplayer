@@ -127,6 +127,7 @@ typedef struct PCNetGameDedicatedMemberInfo {
     char home_town[PC_NETGAME_NAME_LEN + 1];
 } PCNetGameDedicatedMemberInfo;
 int  pc_net_game_dedicated_members(PCNetGameDedicatedMemberInfo* rows, int cap);
+int  pc_net_game_dedicated_guest_slots(void); /* guest table entries allocated right now (the `guests` console loops 0..n-1); 0 unless a HOST has loaded the store */
 /* Host admin item tools (HOST only, main thread, no wire change). _item_giveblock: NULL when `id` may be given, else a short reason (invalid pocket id, money, tickets,
  * my-design items, furniture id with rotation bits). _give: fill `qty` (1..15) EMPTY pockets of a resident / guest (name or `peer N`) with `id`, all-or-nothing; 1 = given,
  * 0 = refused (msg = the text that follows "GIVE FAILED: "). A connected owner receives a PUSH_FULL record push (client-unsynced edits are discarded on adoption). */
