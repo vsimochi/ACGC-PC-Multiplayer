@@ -53,6 +53,7 @@ BOOL PADInit(void) {
 }
 
 #include "pc_tool_wheel.h"
+#include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
 
 u32 PADRead(PADStatus* status) {
     memset(status, 0, sizeof(PADStatus) * 4);
@@ -172,6 +173,12 @@ u32 PADRead(PADStatus* status) {
 
         status[0].triggerLeft  = pad_trigger_value(pb->l);
         status[0].triggerRight = pad_trigger_value(pb->r);
+    }
+
+    /* a text field has the keyboard (the Play Online menu's name / address entry): its letters are TEXT, the wheel key (G by default) must not open the wheel. The in-game editor's typing mode
+     * already cleared wheel_kb above (the whole keyboard mapping is skipped). The controller wheel button is not a letter and is untouched. */
+    if (pc_play_online_menu_text_blocking()) {
+        wheel_kb = 0;
     }
 
     pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
