@@ -5,6 +5,7 @@
 #include "pc_text_draw.h"
 #include "m_common_data.h"
 #include "m_play.h"
+#include "m_event.h"
 #include "m_field_info.h"
 #include "m_name_table.h"
 #include "m_private.h"
@@ -42,6 +43,9 @@ static int wheel_can_use(void) {
     }
     if (mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELDTYPE2_FG) {
         return 0;
+    }
+    if (mEv_CheckTitleDemo() != mEv_TITLEDEMO_NONE) {
+        return 0; /* the title scene (main menu, Play Online, Options) runs in a town field: no tool wheel behind menus */
     }
     return !play->submenu.start_refuse && play->submenu.current_menu_type == mSM_OVL_NONE && play->submenu.menu_type == mSM_OVL_NONE;
 }

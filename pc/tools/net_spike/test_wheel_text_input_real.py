@@ -4,9 +4,10 @@ driven by synthetic key events (game_input.py; keys are only sent to the game wi
 
 The wheel state is read from the live process with a read-only gdb attach that CALLS the exported pc_tool_wheel_is_open() while the key is held (nothing is written; the process is detached
 right after):
-  W1 title menu, no text field: holding G opens the radial menu (the unchanged behaviour: positive control)
+  W1 title / main menu, no text field: holding G leaves the radial menu closed
   W2 Play Online -> server -> Connect -> New character (a text field has the keyboard): holding G does NOT open it
-  W4 leaving the text field (Escape): holding G opens the radial menu again
+  W4 leaving the text field (Escape), on the Play Online menu page: holding G still leaves the radial menu closed
+  W5 gameplay (a host process booted into the town): holding G opens the radial menu normally
   W3 a second entry: a held G is text (wheel closed), then Shift+G, x, g typed with real key events and confirmed: the game's own log names the new character 'gGxg'
 Usage: python test_wheel_text_input_real.py"""
 import os
@@ -78,7 +79,7 @@ def main():
         ck("the radial wheel query works (a gdb attach can call pc_tool_wheel_is_open: %s)" % wheel_open(proc.pid), wheel_open(proc.pid) == 0)
 
         v = hold_and_sample(win, proc.pid)
-        ck("W1 title menu, no text field: holding G opens the radial menu (unchanged behaviour): is_open=%s" % v, v == 1)
+        ck("W1 title / main menu, no text field: holding G leaves the radial menu closed: is_open=%s" % v, v == 0)
         time.sleep(1.0)
 
         win.press("START")  # Play Online
@@ -92,7 +93,7 @@ def main():
         # leave the text field with Escape (the typed 'g' is discarded), then the wheel must work again on the menu page
         win.press("Escape", hold=0.12, after=0.8)
         v = hold_and_sample(win, proc.pid)
-        ck("W4 after the text entry ended (Escape), holding G opens the radial menu again: is_open=%s" % v, v == 1)
+        ck("W4 after the text entry ended (Escape), on the Play Online menu page: holding G still leaves the radial menu closed: is_open=%s" % v, v == 0)
         time.sleep(1.0)
 
         # a second entry: G (held, sampled), then Shift+G, x, g through real key events (SDL text input), confirmed with Return
@@ -114,6 +115,23 @@ def main():
         txt = open(log, errors="replace").read()
         ck("W3 the typed letters were TEXT: the new character's name is 'gGxg' (the game's own log of it)", "character 'gGxg' does not exist yet" in txt)
         ck("the process is still alive", proc.poll() is None)
+        proc.terminate()
+        proc.wait(8)
+
+        # gameplay: a host process booted straight into the town (bootstrap resident): holding G opens the radial menu normally
+        host = L.HostProcess(port=9897, extra_args=["--bootstrap-resident", str(L.TEST_HOST_RESIDENT)], log_path=os.path.join(HERE, "wheel_text_input_host.log"), bin_dir=cdir).start()
+        try:
+            ck("the host process is in the town", host.wait_listening(60.0) and host.boot_to_field(timeout=90.0, slot=L.TEST_HOST_RESIDENT))
+            hwin = G.GameWindow(host.proc.pid)
+            for _ in range(80):
+                if hwin.ready():
+                    break
+                time.sleep(0.25)
+            time.sleep(2.0)
+            v = hold_and_sample(hwin, host.proc.pid)
+            ck("W5 gameplay (the town): holding G opens the radial menu normally: is_open=%s" % v, v == 1)
+        finally:
+            host.stop()
     finally:
         try:
             proc.terminate()
