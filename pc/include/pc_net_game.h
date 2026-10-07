@@ -29,6 +29,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "pc_net.h" /* PC_NET_MAX_PEERS: the host wire id below must stay above the peer table */
 
 #ifdef __cplusplus
 extern "C" {
@@ -191,7 +192,12 @@ typedef struct PCNetPlayerContext {
  * its single link to the host) still tell apart "the host's own movement" from "another client's
  * movement, relayed by the host" once both arrive tagged with a PCNetPlayerId. */
 typedef int32_t PCNetPlayerId;
-#define PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NET_MAX_PEERS)
+/* The host's wire id is its OWN constant, no longer defined as the peer-table size. It is still 8: every shipped client rejects a net_player_id above 8 (and a
+ * client with MORE than 8 peers would collide with it), so the value is frozen on the wire until a protocol version change moves it (the ids are uint8_t, 0..254
+ * are usable, 0xFF = "nobody" in NPC_LEASE). Until then the peer table may not outgrow it: client ids are the transport slots 0..PC_NET_MAX_PEERS-1. */
+#define PC_NETGAME_HOST_WIRE_ID 8
+#define PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NETGAME_HOST_WIRE_ID)
+_Static_assert(PC_NET_MAX_PEERS <= PC_NETGAME_HOST_WIRE_ID, "client player ids (peer slots) must stay below the host's wire id: moving the host id is a protocol change");
 
 /* A small, PC-only, deliberately coarse classification of what the local player's real
  * (~121-value) now_main_index is currently doing -- see pc_net_game.c's classifier. Never an

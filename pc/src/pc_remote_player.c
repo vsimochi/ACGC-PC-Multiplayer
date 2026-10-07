@@ -336,11 +336,29 @@ typedef struct PCRemotePlayerOffset {
 /* Small fixed per-peer spawn offsets (world units, relative to the local player), used only as
  * the actor's initial spawn position before any real movement data has arrived (see
  * pc_remote_player_mv()) -- not a layout with any other meaning. Sized/indexed like s_slots. */
-static const PCRemotePlayerOffset s_offset_table[PC_REMOTE_PLAYER_SLOT_COUNT] = {
+static const PCRemotePlayerOffset s_offset_table[] = {
     { 60.0f, 0.0f },   { -60.0f, 0.0f },  { 0.0f, 60.0f },   { 0.0f, -60.0f },
     { 60.0f, 60.0f },  { -60.0f, 60.0f }, { 60.0f, -60.0f }, { -60.0f, -60.0f },
     { 0.0f, 100.0f },
 };
+#define PC_REMOTE_OFFSET_TABLE_N ((int)(sizeof(s_offset_table) / sizeof(s_offset_table[0])))
+
+/* The spawn offset of slot `id`: the table above for the historical first slots (unchanged), a deterministic ring pattern for any id past it (8 per ring, 40 units
+ * further out per ring), so the slot count is no longer tied to the number of hand-written entries. */
+static PCRemotePlayerOffset pc_remote_spawn_offset(int id) {
+    PCRemotePlayerOffset o;
+    if (id >= 0 && id < PC_REMOTE_OFFSET_TABLE_N) {
+        return s_offset_table[id];
+    }
+    {
+        const int k = id - PC_REMOTE_OFFSET_TABLE_N;
+        const f32 radius = 140.0f + 40.0f * (f32)(k / 8);
+        const f32 ang = (f32)(k % 8) * (6.2831853f / 8.0f);
+        o.x = radius * cosf(ang);
+        o.z = radius * sinf(ang);
+    }
+    return o;
+}
 
 /* One accepted movement sample, timestamped in THIS process's own local clock -- never the
  * sender's. See pc_net_game.h's PCNetMoveSample doc for why sender_frame itself is not stored
@@ -2562,6 +2580,7 @@ static void pc_remote_player_collide_update(PCRemotePlayerActor* self, PCRemoteP
 #define PC_PUPPET_FOOT_COOLDOWN_FRAMES 8.0  /* min spacing between two foot triggers of one puppet (WALK/IDLE flicker) */
 #define PC_PUPPET_EDGE_COOLDOWN_FRAMES 30.0 /* min spacing between two identical one-shot edges (skid in/out, tumble) */
 #define PC_PUPPET_FX_ITEM_NAME_BASE 0xFFE0u /* + slot: per-puppet effect item_name (the local player uses RSV_NO 0xFFFF) */
+_Static_assert(PC_REMOTE_PLAYER_SLOT_COUNT <= 0x11, "PC_PUPPET_FX_ITEM_NAME_BASE + slot must stay below the PC_TID_* ids (0xFFF1..): remap the puppet effect ids before raising PC_NET_MAX_PEERS");
 #define PC_PUPPET_FOOT_STALE_FRAMES 3       /* captured foot data older than this (game frames) is replaced by the fallback */
 #define PC_PUPPET_FOOT_FALLBACK_OFFSET 7.0f /* lateral offset (world units) of the fallback foot positions */
 #define PC_PUPPET_FX_DIAG_MAX_OK 40         /* diag lines per puppet actor and (cosmetic name) when it was spawned */
@@ -5472,7 +5491,7 @@ void pc_remote_player_poll(void) {
     for (i = 0; i < PC_REMOTE_PLAYER_SLOT_COUNT; i++) {
         PCRemotePlayerSlot* slot = &s_slots[i];
         ACTOR* actor;
-        const PCRemotePlayerOffset* ofs;
+        PCRemotePlayerOffset ofs_v;
         f32 x, y, z;
 
         /* Real-client crash fix: retry resolving any appearance that arrived while gamePT was NULL
@@ -5571,10 +5590,10 @@ void pc_remote_player_poll(void) {
             continue;
         }
 
-        ofs = &s_offset_table[i];
-        x = local->actor_class.world.position.x + ofs->x;
+        ofs_v = pc_remote_spawn_offset(i);
+        x = local->actor_class.world.position.x + ofs_v.x;
         y = local->actor_class.world.position.y;
-        z = local->actor_class.world.position.z + ofs->z;
+        z = local->actor_class.world.position.z + ofs_v.z;
 
         actor = pc_actor_make_from_profile(&play->actor_info, gamePT, &s_remote_player_profile,
                                            &s_remote_player_dlftbl, x, y, z, 0, 0, 0,

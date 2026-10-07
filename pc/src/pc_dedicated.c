@@ -5,6 +5,7 @@
 #include "pc_residence.h" /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES */
 #include "pc_host_observer.h"
 #include "pc_net_game.h"
+#include "pc_net.h"       /* PCNetStats (status line) */
 #include "pc_log.h"
 #include "pc_server.h" /* servers/<id>/ storage tree (status line, server.log) */
 #include "m_name_table.h" /* item ids / categories for the host item tools (finditem, iteminfo, items, give) */
@@ -643,6 +644,17 @@ static void pc_ded_cmd_status(void) {
         if (pc_net_game_dedicated_guest_counts(&gb, &gc)) {
             pc_ded_printf("  guests: bound=%d max_guests=%d\n", gb, gc);
         }
+    }
+    {
+        int pu = 0, pt = 0, rr = 0;
+        PCNetStats ns;
+        if (pc_net_game_dedicated_capacity(&pu, &pt, &rr)) {
+            pc_ded_printf("  capacity: transport slots %d/%d used, %d held for absent residents, %d free for guests\n", pu, pt, rr, pt - pu - rr > 0 ? pt - pu - rr : 0);
+        }
+        pc_net_get_stats(&ns);
+        pc_ded_printf("  transport: reliable sent=%lu retransmits=%lu received=%lu out_of_window=%lu | events dropped: unreliable=%lu control=%lu | budget disconnects=%lu\n",
+               (unsigned long)ns.rdata_sent, (unsigned long)ns.rdata_retransmits, (unsigned long)ns.rdata_received, (unsigned long)ns.rdata_out_of_window,
+               (unsigned long)ns.events_dropped_unreliable, (unsigned long)ns.events_dropped_control, (unsigned long)ns.reliable_budget_disconnects);
     }
     if (s_last_save_ok < 0) {
         pc_ded_printf("  last save: none yet\n");

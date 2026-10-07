@@ -5495,13 +5495,14 @@ static void pcnetgame_host_expire_reservations(void) {
  * safety net for a lost END only: a real dialogue longer than that releases the hold early (X resumes walking on
  * the host and the client snaps at its lease end -- the pre-hold behaviour). */
 typedef struct PCNetGameNpcTalkHold {
-    uint16_t peer_mask; /* bit i = PCNetPeerId i currently holds this slot */
+    uint16_t peer_mask; /* bit i = PCNetPeerId i currently holds this slot (u16: widen before PC_NET_MAX_PEERS exceeds 16, see the assert below) */
     uint16_t npc_id;    /* identity the mask was set for */
     uint32_t last_ms;   /* pcnetgame_now_ms() of the last valid BEGIN */
     uint8_t  indoor;     /* Patch 8: the owner began inside the villager's house (so leaving the house ends it, and so does going outdoors) */
     uint8_t  host_owned; /* Patch 8: the HOST's own player owns the conversation (peer_mask is then 0: the host never holds its own villager) */
     uint32_t host_ms;    /* pcnetgame_now_ms() of the host player's last "still talking" call */
 } PCNetGameNpcTalkHold;
+_Static_assert(PC_NET_MAX_PEERS <= 16, "PCNetGameNpcTalkHold.peer_mask is 16 bits: widen it (and every (uint16_t)(1u << peer) use) before raising PC_NET_MAX_PEERS");
 static PCNetGameNpcTalkHold s_host_talk_hold[ANIMAL_NUM_MAX];
 static uint16_t s_host_talk_last_seq[PC_NET_MAX_PEERS];
 static uint8_t  s_host_talk_seq_valid[PC_NET_MAX_PEERS];
@@ -35023,6 +35024,18 @@ int pc_net_game_dedicated_guest_counts(int* bound, int* cap) {
     }
     *bound = pcnetgame_host_bound_guest_count((PCNetPeerId)-1);
     *cap = pcnetgame_host_max_guests();
+    return 1;
+}
+
+/* Console status: transport slots in use / total, and how many of the free ones the guest admission gate currently holds back for residents that are not connected
+ * (the same numbers pcnetgame_host_guest_cap_refusal compares). 0 unless HOST. */
+int pc_net_game_dedicated_capacity(int* peers_used, int* peers_total, int* resident_reserve) {
+    if (peers_used == NULL || peers_total == NULL || resident_reserve == NULL || s_role != PC_NETGAME_ROLE_HOST) {
+        return 0;
+    }
+    *peers_used = pc_net_peer_count();
+    *peers_total = PC_NET_MAX_PEERS;
+    *resident_reserve = pcnetgame_host_resident_peer_reserve();
     return 1;
 }
 

@@ -78,6 +78,7 @@ int  pc_net_game_dedicated_world_ready(void);   /* HOST && s_host_world_ready */
 int  pc_net_game_dedicated_peer_slots(void);    /* number of transport slots to iterate (0 unless HOST) */
 int  pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out); /* 1 iff the slot is not DISCONNECTED */
 int  pc_net_game_dedicated_guest_counts(int* bound, int* cap); /* G4: guests bound now / the max_guests cap; 1 iff HOST */
+int  pc_net_game_dedicated_capacity(int* peers_used, int* peers_total, int* resident_reserve); /* transport slots used / total / held for absent residents; 1 iff HOST */
 /* Guests G6.2: host operator tools (HOST only, main thread). `guests` lists through _guest_info (never the token); _guest_admin: op 0 = remove, 1 = reset-token.
  * Returns 1 = done, 2 = nothing changed (no `confirm`: msg says what would happen), 0 = refused (msg says why). Both refuse while the guest is bound / guests.dat is
  * UNTRUSTED, and back guests.dat up (guests.dat.bak-<timestamp>) before changing anything. */
