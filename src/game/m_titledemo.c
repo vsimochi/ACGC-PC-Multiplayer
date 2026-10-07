@@ -236,7 +236,8 @@ extern void title_demo_move(GAME_PLAY* play) {
         {
             extern int pc_settings_menu_active(void);
             extern int pc_play_online_menu_active(void); /* Play Online (server / character pages) must not be reset by the 60 s demo timer either */
-            if (pc_settings_menu_active() || pc_play_online_menu_active()) {
+            extern int pc_play_online_title_hold(void);  /* ... nor while its direct transition into the town is pending (pc_main.c) */
+            if (pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_online_title_hold()) {
                 mPlib_SetData1_controller_data_for_title_demo(0, 0, 0.0f, 0.0f);
                 return;
             }
@@ -247,7 +248,11 @@ extern void title_demo_move(GAME_PLAY* play) {
         set_player_demo_keydata_hold(delta_time);
         S_tdemo_time += delta_time;
 
-        if (S_tdemo_time >= mTD_LENGTH_SECONDS) {
+        if (S_tdemo_time >= mTD_LENGTH_SECONDS
+#ifdef TARGET_PC
+            && play->fb_fade_type == FADE_TYPE_NONE /* a scene change (the Play Online direct transition, a door) already owns the fade: never overwrite it with the demo end */
+#endif
+        ) {
             mTD_game_end_init(play);
         }
     }

@@ -1053,16 +1053,19 @@ static int pc_main_prepare_store_character(void) {
 /* ===== Play Online WITHOUT relaunch =====
  * The Play Online menu (pc_play_online_menu.c) files a request; pc_main_play_online_poll() (pc_vi.c, every frame, between pc_net_game_poll and the bootstrap polls) executes it
  * in THIS process: the steps are exactly what a relaunched `--connect H:P (--character U | --guest-profile N | --guest) --town-fetch --online-ui` process does before and at its
- * first title frame, then the play scene fades back to the title with the vanilla FADE_TYPE_OUT_RETURN_TITLE (trademark_init -> common_data_reinit -> pc_save_reload of the
- * fetched town), and only after the scene was left the existing one-shot bootstrap polls are armed so they fire on the NEW title:
+ * first title frame, then (menu-started connect) the existing one-shot bootstrap polls are armed on the LIVE title (no trademark / title reload, see PO_FADING: direct); only the
+ * guest-first REJOIN, which starts from a live field / building scene, still fades back to the title with the vanilla FADE_TYPE_OUT_RETURN_TITLE (trademark_init ->
+ * common_data_reinit -> pc_save_reload of the fetched town) and arms the polls after that scene was left:
  *   1 guards (role NONE, idle play scene, menu open) 2 snapshot 3 session + character 4 pre-boot town fetch (blocking, up to ~30 s; Retry / Use saved copy / Quit boxes)
- *   5 membership + GCI check 6 pc_net_game_start_client 7 COMMIT: load the fetched town (role is CLIENT before any sanitized image is read) 8 fade to the title
- *   9 arm the bootstrap polls once the scene is gone.
+ *   5 membership + GCI check 6 pc_net_game_start_client 7 COMMIT: load the fetched town (role is CLIENT before any sanitized image is read) 8 direct: arm the polls on the idle title (rejoin: fade to the title first)
+ *   9 (rejoin only) arm the bootstrap polls once the scene is gone.
  * Any failure before the fade ROLLS BACK everything (town dir, session, guest selection, globals, net, save flags; the single-player town is re-read from save/card_a only if the
  * RAM save was already replaced) and returns to the menu with a message. Known limits: the fetch blocks the frame loop (window title shows the progress); an arrival failure after
  * the fade still exits(2) like the CLI path; the promoted-guest relaunch (pc_main_relaunch_poll) stays a relaunch. */
 extern int  pc_play_online_scene_ready(void);                 /* pc_m_card.c */
 extern int  pc_play_online_scene_left(void);
+extern int  pc_play_online_direct_ready(void);
+extern int  pc_play_online_direct_prepare(void);
 extern void pc_play_online_begin_return_title(void);
 extern int  pc_play_online_save_load(void);
 extern int  pc_play_online_save_flags_get(int* ready);
@@ -1080,6 +1083,7 @@ static struct {
     int  wait;       /* frames waiting for an idle title scene */
     int  arm_guest;  /* arm g_pc_bootstrap_guest once the scene was left */
     int  arm_pid;    /* arm g_pc_bootstrap_resident_pid_set once the scene was left */
+    int  direct;     /* menu-started connect, committed: the bootstrap polls are armed on the LIVE title as soon as it is idle (no trademark / title reload) */
     int  rejoin;     /* guest-first purchase: the promoted guest re-joins as the resident from a LIVE (field / building) scene, no Play Online menu is open */
 } s_po;
 static char s_po_character[48]; /* backing store of g_pc_character_spec for the in-process connect */
@@ -1332,10 +1336,15 @@ static int pc_po_connect(char* err, size_t errcap) {
            (unsigned long)getpid()
 #endif
     );
-    printf("[PC] play-online: connected to %s:%d as %s, town dir %s: fading back to the title to enter the town\n", g_pc_net_host_ip, (int)g_pc_net_port,
-           ss->storage == PC_CHARACTER_STORAGE_STORE ? ss->character.uuid : "(legacy guest)", pc_card_town_dir() != NULL ? pc_card_town_dir() : "save/card_a");
+    printf("[PC] play-online: connected to %s:%d as %s, town dir %s: entering the town%s\n", g_pc_net_host_ip, (int)g_pc_net_port,
+           ss->storage == PC_CHARACTER_STORAGE_STORE ? ss->character.uuid : "(legacy guest)", pc_card_town_dir() != NULL ? pc_card_town_dir() : "save/card_a",
+           s_po.rejoin ? " (fading back to the title first)" : " directly (no title reload)");
     s_po_inproc = 0;
-    pc_play_online_begin_return_title();
+    if (s_po.rejoin) {
+        pc_play_online_begin_return_title(); /* a LIVE field / building scene: it is left through the vanilla fade to the title (unchanged) */
+    } else {
+        s_po.direct = 1; /* the title is already running: the polls are armed there (PO_FADING below), the scene change is the bootstrap's own goto_other_scene */
+    }
     return 1;
 
 rollback:
@@ -1371,6 +1380,11 @@ rollback:
     }
     pc_play_online_save_flags_set(loaded_snap, ready_snap);
     return 0;
+}
+
+/* 1 while a committed menu-started connect still waits to arm the bootstrap on the title: the title-demo timer (m_titledemo.c) must not end the demo meanwhile. */
+int pc_play_online_title_hold(void) {
+    return s_po.state == PO_FADING && s_po.direct;
 }
 
 void pc_main_play_online_poll(void) {
@@ -1429,7 +1443,32 @@ void pc_main_play_online_poll(void) {
         }
         return;
     }
-    /* PO_FADING: the fade-to-title runs in the play scene; arm the one-shot bootstrap polls only after the scene was left, otherwise they would fire on the OLD title */
+    /* PO_FADING. Menu-started connect (direct): the live title is the scene the polls fire on (the CLI flow fires them on exactly such a title); arm them once it is idle, after
+     * the menu is closed and, for the resident bind, the fetched town was re-read (the vanilla Start path does the same: the title demo mutated Save_t in RAM). A refused
+     * re-read leaves the polls unarmed and the title shows why. */
+    if (s_po.direct) {
+        if (!pc_play_online_direct_ready()) {
+            return; /* title busy (wipe / fade / no player actor yet): the title-demo timer stays held (pc_play_online_title_hold) */
+        }
+        pc_play_online_menu_close();
+        if (s_po.arm_pid && !pc_play_online_direct_prepare()) {
+            pc_title_notice_post("Could not play this character:", "the town save could not be re-read from disk (see the log).", 600);
+            s_po.state = PO_IDLE;
+            s_po.direct = 0;
+            return;
+        }
+        if (s_po.arm_guest) {
+            g_pc_bootstrap_guest = g_pc_guest_spec;
+        }
+        if (s_po.arm_pid) {
+            g_pc_bootstrap_resident_pid_set = 1;
+        }
+        printf("[PC] play-online: direct transition: bootstrap %s armed on the live title (no trademark / title reload)\n", s_po.arm_pid ? "resident-by-PID" : s_po.arm_guest ? "guest arrival" : "(none)");
+        s_po.state = PO_IDLE;
+        s_po.direct = 0;
+        return;
+    }
+    /* the fade-to-title (rejoin) runs in the play scene; arm the one-shot bootstrap polls only after the scene was left, otherwise they would fire on the OLD title */
     if (pc_play_online_scene_left()) {
         if (s_po.arm_guest) {
             g_pc_bootstrap_guest = g_pc_guest_spec;

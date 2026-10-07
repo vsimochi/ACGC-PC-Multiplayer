@@ -17,6 +17,7 @@ of the matched display. All game processes are closed at the end.
 Usage: python test_play_online_inprocess_real.py [--port 12100] [--display samsung] [--skip-cancel]
 """
 import argparse
+import glob
 import ctypes
 import ctypes.wintypes as wt
 import os
@@ -151,8 +152,7 @@ def drive_to_menu(c, ck, label):
     """title (logo -> menu) -> Play Online -> server 0 -> Connect: leaves the character page open (selection = the first / only character)."""
     ck(label + " title menu reached", c.wait(r"aAL_setupAction: 2 -> 3", 120.0) is not None)
     time.sleep(2.0)
-    c.press("DOWN")
-    c.shot("title_menu_playonline")
+    c.shot("title_menu_playonline")  # Play Online is the first item of the title menu (no DOWN)
     c.press("START")   # Play Online
     c.shot("servers")
     c.press("START")   # the server
@@ -176,8 +176,9 @@ def main():
         if uuid is None:
             return L.summary_and_exit_code(results)
         for i in range(3):
-            host = L.HostProcess(port=args.port, extra_args=["--dedicated"], log_path=T.log_path("ipc_host_try%d.log" % i), bin_dir=HOST_DIR, stdin_pipe=True, verbose=False,
+            host = L.HostProcess(port=args.port, extra_args=["--dedicated", "--resident-tokens", "tofu"], log_path=T.log_path("ipc_host_try%d.log" % i), bin_dir=HOST_DIR, stdin_pipe=True, verbose=False,
                                  new_group=True).start()
+            host.send_line("1")  # the dedicated server's "use this town / generate a new one" prompt (the fixture save is a legacy town)
             if host.wait_listening(60.0) and host.boot_to_dedicated(timeout=120.0):
                 break
             host.stop()
@@ -223,13 +224,14 @@ def main():
         ck("S1 the connect request ran: in-process connect line", client.wait(r"\[PC\] play-online: in-process connect pid=(\d+) \(no relaunch\)", 90.0, off0) is not None)
         mo = re.search(r"play-online: in-process connect pid=(\d+) \(no relaunch\)", client.log())
         ck("S1 the in-process line carries the client's PID", mo is not None and int(mo.group(1)) == pid0)
-        ck("S1 the title scene was left and the bootstrap armed", client.wait(r"play-online: title scene left: bootstrap (guest arrival|resident-by-PID) armed", 90.0, off0) is not None)
+        ck("S1 direct transition: the bootstrap was armed on the live title", client.wait(r"play-online: direct transition: bootstrap (guest arrival|resident-by-PID) armed on the live title", 90.0, off0) is not None)
         client.shot("fading")
         mo = client.wait(r"-> READY", 150.0, off0)
         time.sleep(3.0)
         client.shot("after_ready")
         clog = client.log()
         ck("S1 the client reached READY", mo is not None)
+        ck("S1 no trademark / Nintendo-logo / title reload after the connect (no trademark_init after the in-process connect line)", "trademark_init: enter" not in clog[clog.index("in-process connect pid"):])
         ck("S1 the guest arrival ran after the town load (town save re-read before the arrival)", "town save re-read from disk before the arrival" in clog)
         ck("S1 no relaunch: no 'RELAUNCH' (incl. 'RELAUNCH DRYRUN') in the client log", "RELAUNCH" not in clog)
         ck("S1 pc_net_game started once as a client after the fetch (fetch: installed/up-to-date town line present)", re.search(r"fetch: (installed town|up to date|town)", clog, re.I) is not None or "[NET][TOWN]" in clog)
@@ -254,6 +256,40 @@ def main():
         client = None
         time.sleep(1.0)
         ck("S1 closed: no client process left", len(procs_in(CLIENT_DIR)) == 0)
+
+        # ------------------------------------------------------------------ S3 (resident, direct transition)
+        # membership.ini written by S1 (role = guest) is replaced by role = resident + the PersonalID of fixture resident 1: the SAME in-process connect binds the resident by PID
+        # on the live title (pc_bootstrap_resident_pid_poll -> pc_bootstrap_resident_poll: mSDI_StartDataInit + goto_other_scene to the home door), never through trademark.
+        towns = glob.glob(os.path.join(CLIENT_DIR, "save", "mp", "characters", uuid, "towns", "*"))
+        ck("S3 setup: one town directory (membership) under the character", len(towns) == 1)
+        if len(towns) == 1:
+            with open(os.path.join(HOST_DIR, L.SAVE_GCI_REL), "rb") as f:
+                f.seek(L._GCI_PRIVATE_BASE + 1 * L._GCI_PRIVATE_STRIDE)
+                rpid = f.read(20).hex()
+            with open(os.path.join(towns[0], "membership.ini"), "w", newline="") as f:
+                f.write("role = resident\ntown_pid = %s\nlast_server = ipcsrv\n" % rpid)
+            client = Client(CLIENT_DIR, "s3", args.display)
+            pid3 = client.proc.pid
+            client.wait(r"aAL_setupAction: 2 -> 3", 120.0)
+            for _ in range(80):
+                if client.win.ready():
+                    break
+                time.sleep(0.25)
+            off3 = len(client.log())
+            drive_to_menu(client, ck, "S3")
+            client.press("START", after=0.2)
+            ck("S3 direct transition: the resident bootstrap was armed on the live title", client.wait(r"direct transition: bootstrap resident-by-PID armed on the live title", 90.0, off3) is not None)
+            mo = client.wait(r"-> READY", 150.0, off3)
+            time.sleep(3.0)
+            client.shot("s3_after_ready")
+            c3 = client.log()
+            ck("S3 the PID resolved to slot 1 and the resident was bound / sent to the town", "--resident-by-pid: resident PersonalID matches slot 1" in c3 and "--bootstrap-resident 1: resident bound" in c3)
+            ck("S3 the client reached READY as the resident (no guest arrival)", mo is not None and "[NET][GUEST] client: playing a guest" not in c3)
+            ck("S3 no trademark_init after the in-process connect", "trademark_init: enter" not in c3[c3.index("in-process connect pid"):] if "in-process connect pid" in c3 else False)
+            ck("S3 same process, no RELAUNCH", client.proc.poll() is None and client.proc.pid == pid3 and "RELAUNCH" not in c3)
+            client.stop()
+            client = None
+            time.sleep(1.0)
 
         # ------------------------------------------------------------------ S2 (cancel)
         if not args.skip_cancel:

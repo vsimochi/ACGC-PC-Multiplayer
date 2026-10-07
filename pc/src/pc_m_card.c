@@ -2262,6 +2262,27 @@ int pc_play_online_scene_left(void) {
     return gamePT == NULL || gamePT->exec != play_main;
 }
 
+/* 1 iff the LIVE title can take the direct Play Online transition: an idle play scene (no wipe, no fade running, so the title demo did not just start its own end fade) with its
+ * player actor (goto_other_scene needs exactly that, as pc_guest_arrive does). */
+int pc_play_online_direct_ready(void) {
+    GAME_PLAY* play;
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    return play->fb_wipe_mode == WIPE_MODE_NONE && play->fb_fade_type == FADE_TYPE_NONE && get_player_actor_withoutCheck(play) != NULL;
+}
+
+/* Resident direct transition: the town the connect loaded is read again from disk right before the bind (pc_guest_arrive does the same for a guest), because the title scene
+ * has been running on it. 1 = ok. */
+int pc_play_online_direct_prepare(void) {
+    if (pc_save_loaded && !pc_save_reload()) {
+        OSReport("[PC] play-online: direct transition: the town save could not be re-read from disk\n");
+        return 0;
+    }
+    return mFRm_CheckSaveData() != FALSE;
+}
+
 /* The vanilla "back to the title" request (ac_npc_restart_schedule.c_inc aNRST_think_title: the fade + wipe; m_play.c then goes to trademark -> common_data_reinit ->
  * pc_save_reload). Only the two fade fields: the vanilla think function also invades the player actor, which does not exist on the title. */
 void pc_play_online_begin_return_title(void) {
