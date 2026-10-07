@@ -56,7 +56,7 @@ def audit(check):
           "int pc_net_game_evnpc_synced(int npc_id)" in net and "pcnetgame_evnpc_field_scene()" in net and "pcnetgame_evnpc_client_tick" in net and "pc_net_game_evnpc_suppress_spawn((int)name)" in ctrl)
     check("S2 the host creates event NPCs without the 'a player is nearby' gate (every one of the three show_actor_at_wade variants)", em.count("aEvMgr_HOST_UNBOUNDED(") >= 5)
     check("S3 the outcome is decided by ONE plan on the host (Gulliver: the gift check rolls with the host RNG; K.K.: the per-player bit is host-held) and the flag is set in the SAME step the item is granted",
-          "static uint8_t pcnetgame_evnpc_plan(" in net and "pcnetgame_evnpc_commit(idx < PLAYER_NUM ? idx : -1, t->aux_cond)" in net and "mSP_SelectRandomItem_New" in dz
+          "static uint8_t pcnetgame_evnpc_plan(" in net and "pcnetgame_evnpc_commit(idx, t->aux_cond)" in net and "mSP_SelectRandomItem_New" in dz
           and "aNTT_pc_host_song_commit" in kk)
     check("S4 a READY client never rolls / grants itself: Gulliver and K.K. take the claim path (pc_net_game_evnpc_claim_active)", "pc_net_game_evnpc_claim_active()" in dz and "pc_net_game_evnpc_claim_active()" in kk)
 

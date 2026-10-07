@@ -357,7 +357,7 @@ def phase_work(run):
     s9 = states(a3)
     ck("W9 the persisted job survived the restart and is pushed at connect (same id / type / step / villager / reward)",
        len(s9) >= 1 and s9[0]["job_id"] == jobA["job_id"] and s9[0]["type"] == jobA["type"] and s9[0]["villager"] == jobA["villager"] and s9[0]["reward"] == jobA["reward"] and s9[0]["state"] == 1)
-    ck("W9 the host loaded work_jobs.dat", run.n_log(r"\[NET\]\[WORK\] host: loaded .*work_jobs\.dat \(next job id \d+\)") == 1)
+    ck("W9 the host loaded work_jobs.dat", run.n_log(r"\[NET\]\[WORK\] host: loaded .*work_jobs\.dat \(next job id \d+(?:, \d+ character\(s\), file version \d)?\)") == 1)
     mark, sent, r = op(run, a3, DELIVER, slot, fitem, job2 & 0xFFFF, pre=image(a3, slot, fitem))
     ck("W9 a completion of a job paid BEFORE the restart is still refused (no duplicate reward across a restart)", r is not None and r.outcome == REJECTED and r.reason in (REASON_STALE_JOB, REASON_NO_JOB))
     mark, sent, r = op(run, a3, LEAVE)

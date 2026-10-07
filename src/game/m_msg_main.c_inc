@@ -425,6 +425,16 @@ static void mMsg_pc_dump_hook(void) {
         return;
     }
     id = (unsigned)strtoul(e, NULL, 0);
+    if (step == 0) { /* the host's WORK_STATE follows READY by a few frames: wait for it (at most 8 s: a character the host does not answer for still gets its 'initial' dump) */
+        static uint32_t first_ms = 0;
+        PCWorkView wv;
+        if (first_ms == 0) {
+            first_ms = pc_net_game_now_ms();
+        }
+        if (!pc_net_game_work_view(&wv) && pc_net_game_now_ms() - first_ms < 8000u) {
+            return;
+        }
+    }
     switch (step) {
         case 0:
             mMsg_pc_dump_one(id, "initial");
@@ -462,7 +472,7 @@ static void mMsg_pc_dump_hook(void) {
         }
         case 3:
             mMsg_pc_dump_one(id, "after-ENTER");
-            step = 4;
+            step = (pc_test_hook_getenv("AC_TEST_WORK_KEEP") != NULL) ? 6 : 4; /* AC_TEST_WORK_KEEP=1: stay in Work Mode (no LEAVE); "final" is then the same state as after-ENTER */
             break;
     }
     if (step == 6 && pc_test_hook_getenv("AC_TEST_WORK_ENTER") != NULL) {

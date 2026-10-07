@@ -39,8 +39,18 @@ The 9th client of a host gets wire id **9** (8 is the host's): it received the r
 | mailbox host state, mail replies (`s_mbox_host[PLAYER_NUM]`, `s_remail_day[PLAYER_NUM]`), houses (`PC_NETGAME_HOUSE_NUM` 4), resident credentials | A | residents only: guests have no house, no mailbox, no resident credential |
 | event NPC table (`PC_EVNPC_MAX` 8), tree-cut slots, money rocks, field-action queue (client side), per-address token issuance (3 / 60 s), town-transfer backlog and rate | D | gameplay or abuse limits, not guest counts |
 
+## Phase 7 runtime verification (real game processes)
+
+`tools/net_spike/test_kk_work_guests_real.py` (K.K. 17 checks, Work Mode 40) and `test_kk_work_promotion_real.py` (13) run a REAL host with REAL guest / resident client processes on a disposable fixture
+(TEST-ONLY hooks: `AC_TEST_KK_CONCERT`, `AC_TEST_KK_DAY_FILE`, `AC_TEST_EVNPC_CLAIM`, `AC_TEST_WORK_ENTER` / `AC_TEST_WORK_KEEP`). Seen in the host logs: a guest that took its song, left, and came back
+under another wire id is refused (`EVNPC_DONE`); another guest that was handed the freed wire id is served; the shared foreigner bit stays 0 through every guest claim; the next day claims again; five
+guests with different PersonalIDs hold independent work records; a reconnect or a host restart finds the same record; a version 2 file (64 rows) is read and rewritten as version 3 and the 65th and
+the 265th characters work; promotion re-keys the work record (same bytes, new key) and moves the claim to the new resident slot's vanilla bit (a promoted guest cannot take a second song of the same concert).
+Not driven (GUI): the K.K. / Nook dialogue on screen; the claim and work requests are the exact calls the dialogue seams make.
+Harness limits seen (kept, class D): `max_guests` (default 4), `max_peers`, 3 new guest tokens per address per 60 s.
+
 ## What is NOT claimed
 
-Nothing here was run in the real game. The native tests are model / logic tests of the pure modules plus the real transport over loopback for Phase 4; the game layer is only syntax-checked.
+Phases 5 and 6 were later run in the real game (the 9th guest works); Phase 7 is covered by the section above. The native tests are model / logic tests of the pure modules plus the real transport over loopback for Phase 4.
 A crowd is still bounded by: the wire ids (254 peers), `max_peers`, `max_guests`, `guest_memory_mb`, the scene's 200 actors, 50 colliders, the renderer's cost of many animated puppets, and the
 remaining O(N^2) of the host's per-peer relays (MOVE is thinned, appearance / scene are deltas; reliable gameplay broadcasts are unchanged).

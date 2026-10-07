@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(p, m) _mkdir(p)
+#endif
 
 #include "pc_dayclaims.h"
 #include "pc_keytab.h"

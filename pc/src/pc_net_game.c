@@ -17595,6 +17595,7 @@ extern int aEDZ_pc_host_gift_check(mActor_name_t* item); /* ac_ev_dozaemon_move.
 extern void aEDZ_pc_host_gift_commit(void);
 extern int aNTT_pc_host_song_check(int claimant, int request, int* song); /* ac_npc_totakeke_talk.c_inc */
 extern void aNTT_pc_host_song_commit(int claimant);
+extern int aNTT_pc_host_song_bits(unsigned* resident_bits, unsigned* foreigner_bits);
 
 /* ---- K.K. concert claims of GUESTS (capacity phase 7) ----
  * Vanilla keeps "this player already got K.K.'s song of this concert" as one bit per RESIDENT (save->bitfield bit `slot`) and ONE bit shared by every foreigner
@@ -17605,7 +17606,41 @@ extern void aNTT_pc_host_song_commit(int claimant);
 static PCDayClaims s_kk_claims;
 
 static uint32_t pcnetgame_kk_today(void) {
-    return ((uint32_t)Common_Get(time.rtc_time).year << 9) | ((uint32_t)Common_Get(time.rtc_time).month << 5) | (uint32_t)Common_Get(time.rtc_time).day;
+    uint32_t day = ((uint32_t)Common_Get(time.rtc_time).year << 9) | ((uint32_t)Common_Get(time.rtc_time).month << 5) | (uint32_t)Common_Get(time.rtc_time).day;
+    /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_KK_DAY_FILE=<file>): the integer in that file is added to the day stamp, so a test can move "today" while the host runs (the concert itself is not
+     * re-checked: only the once-per-day bookkeeping is exercised). Never active in normal play. */
+    const char* df = pc_test_hook_getenv("AC_TEST_KK_DAY_FILE");
+    if (df != NULL && df[0] != 0) {
+        FILE* f = fopen(df, "rb");
+        int n = 0;
+        if (f != NULL) {
+            if (fscanf(f, "%d", &n) != 1) {
+                n = 0;
+            }
+            fclose(f);
+        }
+        day += (uint32_t)n;
+    }
+    return day;
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_KK_CONCERT=1, host): pretend K.K.'s concert is on (weekly event + the event save / common areas the claim reads) so the claim path can be exercised
+ * in a real run on any weekday. The areas are only reserved when absent (reserving an existing one would clear the claim bits). Never active in normal play. */
+static void pcnetgame_kk_test_force_concert(void) {
+    const char* e = pc_test_hook_getenv("AC_TEST_KK_CONCERT");
+    if (e == NULL || e[0] != '1') {
+        return;
+    }
+    if (Save_Get(event_save_common).weekly_event.type != mEv_EVENT_KK_SLIDER) {
+        Save_Get(event_save_common).weekly_event.type = mEv_EVENT_KK_SLIDER;
+        printf("[NET][KK][TEST-ONLY] host: forcing K.K.'s concert on (weekly event = KK_SLIDER)\n");
+    }
+    if (mEv_get_save_area(mEv_EVENT_KK_SLIDER, 0xa) == NULL) {
+        (void)mEv_reserve_save_area(mEv_EVENT_KK_SLIDER, 0xa);
+    }
+    if (mEv_get_common_area(mEv_EVENT_KK_SLIDER, 0x10) == NULL) {
+        (void)mEv_reserve_common_area(mEv_EVENT_KK_SLIDER, 0x10);
+    }
 }
 
 static int pcnetgame_kk_guest_key(int rec_idx, PersonalID_c* out) {
@@ -17628,6 +17663,15 @@ static int pcnetgame_kk_guest_mark(const PersonalID_c* key) {
     return pc_dayclaims_mark(&s_kk_claims, key, pcnetgame_kk_today());
 }
 
+/* a guest was promoted to resident slot `slot`: its character keeps the once-per-concert rule. The claim was recorded under the guest's old identity; the resident is judged by the vanilla
+ * bit of its slot, which is clear, so the claim is carried over to that bit (otherwise buying a house right after K.K.'s song would give a second song at the same concert). */
+static void pcnetgame_kk_guest_promoted(const PersonalID_c* from, int slot) {
+    if (slot >= 0 && slot < PLAYER_NUM && s_kk_claims.ready && pcnetgame_kk_guest_claimed(from)) {
+        aNTT_pc_host_song_commit(slot);
+        printf("[NET][KK] host: the promoted guest had already taken K.K.'s song today: the claim moved to resident slot %d's vanilla bit\n", slot);
+    }
+}
+
 static uint8_t pcnetgame_evnpc_plan(int claimant, const PCNetGameTxnTag* t, uint16_t* post, uint32_t* post_conds, uint16_t* granted, const char** why) {
     mActor_name_t item = (mActor_name_t)EMPTY_NO;
     int song = 0, r;
@@ -17639,7 +17683,9 @@ static uint8_t pcnetgame_evnpc_plan(int claimant, const PCNetGameTxnTag* t, uint
         }
     } else if (t->aux_cond == (uint8_t)PC_EVNPC_OP_KK_SONG) {
         PersonalID_c gk;
-        const int is_guest = claimant >= PLAYER_NUM && pcnetgame_kk_guest_key(claimant, &gk);
+        int is_guest;
+        pcnetgame_kk_test_force_concert();
+        is_guest = claimant >= PLAYER_NUM && pcnetgame_kk_guest_key(claimant, &gk);
         r = aNTT_pc_host_song_check(is_guest ? -2 : (claimant < PLAYER_NUM ? claimant : -1), t->aux_item == 0xFFFFu ? 0xFFFF : (int)t->aux_item, &song);
         if (r == 1 && is_guest && pcnetgame_kk_guest_claimed(&gk)) {
             r = 2; /* THIS guest already got a song at this concert (other guests are unaffected) */
@@ -17664,11 +17710,17 @@ static void pcnetgame_evnpc_commit(int claimant, uint8_t op) {
         aEDZ_pc_host_gift_commit();
     } else if (op == (uint8_t)PC_EVNPC_OP_KK_SONG) {
         PersonalID_c gk;
-        if (claimant >= PLAYER_NUM && pcnetgame_kk_guest_key(claimant, &gk)) {
+        unsigned rb = 0, fb = 0;
+        const int is_guest = claimant >= PLAYER_NUM && pcnetgame_kk_guest_key(claimant, &gk);
+        if (is_guest) {
             (void)pcnetgame_kk_guest_mark(&gk);
             aNTT_pc_host_song_commit(-2);
         } else {
             aNTT_pc_host_song_commit(claimant < PLAYER_NUM ? claimant : -1);
+        }
+        if (aNTT_pc_host_song_bits(&rb, &fb)) {
+            printf("[NET][KK] host: song claim recorded for %s (record slot %d); guest claims today %d; vanilla bits now: resident 0x%02X foreigner 0x%02X\n", is_guest ? "a GUEST identity" : "a resident",
+                   claimant, pc_dayclaims_count(&s_kk_claims), rb, fb);
         }
     }
 }
@@ -36129,6 +36181,7 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
     old_rec = s_guest_rec[g];
     old_grs = s_rec_slot[PLAYER_NUM + g];
     pcnetgame_work_rekey(&old_g.key, &Save_Get(private_data)[s].player_ID); /* Nook Work Mode: the character keeps its job under its new resident PID */
+    pcnetgame_kk_guest_promoted(&old_g.key, s); /* K.K.: the character keeps its once-per-concert claim */
     memset(&s_guest[g], 0, sizeof(s_guest[g]));
     memset(&s_guest_rec[g], 0, sizeof(s_guest_rec[g]));
     memset(&s_rec_slot[PLAYER_NUM + g], 0, sizeof(s_rec_slot[0]));
