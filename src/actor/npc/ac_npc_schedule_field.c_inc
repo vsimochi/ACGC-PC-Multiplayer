@@ -16,6 +16,29 @@ static void aNPC_field_schedule_think_init(NPC_ACTOR* nactorx, GAME_PLAY* play, 
     aNPC_set_hide_flg(nactorx, hide_flg[step]);
 }
 
+#ifdef TARGET_PC
+/* Host: a client reported (PC_NETGAME_MSG_NPC_HOME_EXIT) that this villager walked out of its house in the client's room scene and the host accepted it (Save_t is_home is FALSE already). If this
+ * actor is still hidden at home (the LEAVE_HOUSE step) it comes out now: the WANDER step (visible, at the house door where the LEAVE_HOUSE step parked it), exactly the state the vanilla leave
+ * produces. Called from aNPC_actor_move_hide() BEFORE the NPC_STATE dirty-check, so the host reports is_home=0 hide=0 and never a transient is_home=0 hide=1. */
+static void aNPC_pc_host_apply_home_exit(NPC_ACTOR* nactorx, GAME_PLAY* play) {
+    Animal_c* animal = aNPC_GET_ANM(nactorx);
+    int slot;
+
+    if (animal == NULL) {
+        return;
+    }
+    slot = (int)(animal - Save_Get(animals));
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || !pc_net_game_host_take_npc_home_exit(slot, (uint16_t)animal->id.npc_id)) {
+        return;
+    }
+    if (nactorx->schedule.type == aNPC_SCHEDULE_TYPE_FIELD && nactorx->schedule.step == aNPC_SCHEDULE_FIELD_STEP_LEAVE_HOUSE && nactorx->condition_info.hide_flg == TRUE) {
+        animal->is_home = FALSE;
+        aNPC_field_schedule_think_init(nactorx, play, aNPC_SCHEDULE_FIELD_STEP_WANDER);
+        printf("[NPC][HOMEEXIT] host: outdoor villager slot %d came out of its house (reported by a client)\n", slot);
+    }
+}
+#endif
+
 static void aNPC_field_schedule_main_proc(NPC_ACTOR* nactorx, GAME_PLAY* play) {
     aNPC_think_main_proc(nactorx, play);
     if (nactorx->think.end_flag == TRUE) {

@@ -14,12 +14,28 @@ static u8 aNPC_wait_action[] = {
 
 static void aNPC_set_be_out_home(NPC_ACTOR* nactorx) {
     mNpc_NpcList_c* list_p;
+#ifdef TARGET_PC
+    const int pc_was_home = aNPC_GET_ANM(nactorx)->is_home;
+#endif
 
     aNPC_GET_ANM(nactorx)->is_home = FALSE;
     list_p = nactorx->npc_info.list;
     list_p->position.x = list_p->house_position.x + mFI_UT_WORLDSIZE_HALF_X_F;
     list_p->position.y = list_p->house_position.y;
     list_p->position.z = list_p->house_position.z + mFI_UT_WORLDSIZE_HALF_Z_F;
+#ifdef TARGET_PC
+    /* A multiplayer CLIENT in the villager's own house: the host owns is_home / hide of every villager (NPC_STATE) and does not know this villager just walked out, so the new outdoor actor
+     * would be overwritten with the host's stale "at home" state. Report the EVENT once (only on the TRUE -> FALSE edge: aNPC_actor_save_for_normal may call this a second time); the
+     * host validates it and answers with the authoritative NPC_STATE. A host / single-player process sends nothing. */
+    if (pc_was_home == TRUE && pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && Save_Get(scene_no) == SCENE_NPC_HOUSE) {
+        Animal_c* pc_animal = aNPC_GET_ANM(nactorx);
+        const int pc_slot = (int)(pc_animal - Save_Get(animals));
+
+        if (pc_slot >= 0 && pc_slot < ANIMAL_NUM_MAX && (u16)pc_animal->id.npc_id == (u16)Common_Get(house_owner_name)) {
+            pc_net_game_notify_local_npc_home_exit(pc_slot, (uint16_t)pc_animal->id.npc_id);
+        }
+    }
+#endif
 }
 
 static int aNPC_check_arrive_destination(NPC_ACTOR* nactorx) {

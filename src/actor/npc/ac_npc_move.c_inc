@@ -1312,6 +1312,10 @@ static void aNPC_pc_client_consume_state(NPC_ACTOR* nactorx) {
 }
 #endif
 
+#ifdef TARGET_PC
+static void aNPC_pc_host_apply_home_exit(NPC_ACTOR* nactorx, GAME_PLAY* play); /* ac_npc_schedule_field.c_inc */
+#endif
+
 static void aNPC_actor_move_hide(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
@@ -1323,6 +1327,9 @@ static void aNPC_actor_move_hide(ACTOR* actorx, GAME* game) {
      * (client) regardless of hide status -- unlike NPC_MOVE, which only ever samples a VISIBLE
      * actor's position, this is exactly the case (a hidden/indoors villager) the audit called out as
      * needing its own hook independent of aNPC_actor_move_show_before()'s. */
+    if (!pc_client_consumer) {
+        aNPC_pc_host_apply_home_exit(nactorx, play); /* a client's reported house exit, accepted by the host (pc_net_game.c), BEFORE the state is reported below */
+    }
     if (pc_client_consumer) {
         aNPC_pc_client_consume_state(nactorx);
     } else {

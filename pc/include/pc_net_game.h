@@ -402,6 +402,11 @@ int pc_net_game_get_peer_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
  * (begin = 1 rising, 0 falling/destroyed). Client only; 0 (nothing sent) for single-player/host/not READY or
  * when the reliable send fails. Never sends positions. */
 int pc_net_game_notify_local_npc_talk(int slot, uint16_t npc_id, int begin);
+/* Villager house exit (PC_NETGAME_MSG_NPC_HOME_EXIT): a READY CLIENT whose in-room copy of a villager just walked out of its own house (aNPC_set_be_out_home, ac_npc2_action.c_inc) tells the host
+ * so. The client reports the EVENT only (slot + npc id); the host validates it and decides the resulting state. 1 = queued; 0 = not a READY client, bad slot or a duplicate within 3 s. */
+int pc_net_game_notify_local_npc_home_exit(int slot, uint16_t npc_id);
+/* Host only: 1 exactly once after the host accepted a client's house-exit report for this villager (the outdoor actor then leaves its hidden "at home" state: ac_npc_schedule_field.c_inc). */
+int pc_net_game_host_take_npc_home_exit(int slot, uint16_t npc_id);
 /* M9-C keepalive: while a BEGIN is outstanding pc_net_game_poll() re-sends it (fresh seq, same message) every 10 s
  * (PC_NPC_TALKHOLD_REFRESH_MS, test only; 0 disables) iff this probe -- registered by the NPC code -- still reports
  * the local talk lease active for (slot, npc_id). A NULL probe or a 0 result stops the refreshes for that slot. */

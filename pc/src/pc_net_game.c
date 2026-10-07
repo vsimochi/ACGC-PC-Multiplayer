@@ -527,6 +527,9 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_PAGE                  = 71, /* Town-shared pages (Patch 6b; v8 unreleased: extended in place, NO version bump), BOTH directions, RELIABLE, 560 bytes. One page of the notice board /
                                              * the Able Sisters designs: host -> client the canonical page (push at join, on change, and as the reply to a write), client -> host a write built on a
                                              * revision. The host applies a write iff the revision still matches, otherwise STALE with the canonical copy. See PCNetGamePageMsg. */
+    PC_NETGAME_MSG_NPC_HOME_EXIT         = 72, /* Villager house exit (v8 unreleased: extended in place, NO version bump), client -> host ONLY, RELIABLE, 8 bytes. "The villager of animal slot N walked out of its own
+                                             * house in MY copy of the room": the EVENT only (slot + npc id), never a position or an is_home value. The host validates it, sets the villager outside and
+                                             * broadcasts the resulting NPC_STATE. An old host drops it. See PCNetGameNpcHomeExitMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2029,6 +2032,17 @@ typedef struct PCNetGameNpcTalkMsg {
 _Static_assert(sizeof(PCNetGameNpcTalkMsg) == 8, "PCNetGameNpcTalkMsg wire size drifted");
 _Static_assert(sizeof(PCNetGameNpcTalkMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameNpcTalkMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
+
+/* Villager house exit, id 72, client -> host, RELIABLE, 8 bytes. `slot` = Save_t.animals[] index, `npc_id` = the identity guard (same pairing as NPC_STATE / NPC_TALK). */
+typedef struct PCNetGameNpcHomeExitMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_NPC_HOME_EXIT */
+    uint8_t  slot;
+    uint16_t npc_id;
+    uint32_t _reserved0; /* must be 0 */
+} PCNetGameNpcHomeExitMsg;
+_Static_assert(sizeof(PCNetGameNpcHomeExitMsg) == 8, "PCNetGameNpcHomeExitMsg wire size drifted");
+_Static_assert(sizeof(PCNetGameNpcHomeExitMsg) <= PC_NET_MAX_PAYLOAD,
+               "PCNetGameNpcHomeExitMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
 /* M9-C (protocol v7): PLAYER_ACTION, id 46, exactly 10 bytes, RELIABLE, host -> client ONLY. PRESENTATION ONLY: the
  * receiver never changes the field, inventory or any other state from it (the FIELD_UPDATE / host-authoritative
@@ -5690,6 +5704,103 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
         printf("[NPC][TALKNET] HOLD slot=%u npc=0x%04X peers=0x%04X\n", (unsigned)in->slot, (unsigned)in->npc_id,
                (unsigned)h->peer_mask);
     }
+}
+
+/* ---- Villager house exit (PC_NETGAME_MSG_NPC_HOME_EXIT, id 72) ----
+ * A client that is inside a villager's house sees that villager walk out (the vanilla NPC2 schedule: aNPC_set_be_out_home) and used to keep that to itself: the host's NPC_STATE still said
+ * is_home=1 hide=1, so the client's outdoor villager was overwritten with it the moment it left the house. The client now reports the event and the HOST stays authoritative:
+ * it checks the sender / identity / that the villager really is at home, sets is_home = FALSE and the outdoor list position EXACTLY as aNPC_set_be_out_home does (it never takes a position or an
+ * is_home value from the client), lets its own outdoor actor come out (pc_net_game_host_take_npc_home_exit -> ac_npc_schedule_field.c_inc) and broadcasts the resulting NPC_STATE. */
+static uint16_t s_host_home_exit_npc[ANIMAL_NUM_MAX];
+static uint32_t s_host_home_exit_ms[ANIMAL_NUM_MAX];
+static int      s_host_home_exit_logs = 0;
+static uint16_t s_client_home_exit_npc[ANIMAL_NUM_MAX];
+static uint32_t s_client_home_exit_ms[ANIMAL_NUM_MAX];
+
+static void pcnetgame_host_home_exit_reject(PCNetPeerId peer, const PCNetGameNpcHomeExitMsg* in, const char* reason) {
+    if (s_host_home_exit_logs < 40) {
+        s_host_home_exit_logs++;
+        printf("[NPC][HOMEEXIT] host: REJECT peer=%d slot=%u npc=0x%04X: %s\n", (int)peer, (unsigned)in->slot, (unsigned)in->npc_id, reason);
+    }
+}
+
+static void pcnetgame_handle_host_npc_home_exit(PCNetPeerId peer, const PCNetGameNpcHomeExitMsg* in) {
+    Animal_c* animal;
+    mNpc_NpcList_c* list;
+    PCNetPlayerScene sc;
+    PCNetNpcStateShadow* sh;
+
+    if (peer < 0 || peer >= PC_NET_MAX_PEERS || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (in->slot >= ANIMAL_NUM_MAX || in->_reserved0 != 0) {
+        pcnetgame_host_home_exit_reject(peer, in, "bad slot or reserved field");
+        return;
+    }
+    animal = Save_GetPointer(animals[in->slot]);
+    if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC || (uint16_t)animal->id.npc_id != in->npc_id) {
+        pcnetgame_host_home_exit_reject(peer, in, "npc_id does not match the host animal table");
+        return;
+    }
+    if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) || sc.scene_id != (uint8_t)SCENE_NPC_HOUSE || sc.owner != in->npc_id) {
+        pcnetgame_host_home_exit_reject(peer, in, "the sender is not inside that villager's own house");
+        return;
+    }
+    if (animal->is_home != TRUE) {
+        pcnetgame_host_home_exit_reject(peer, in, "the villager is not at home on the host (already outside)");
+        return;
+    }
+    /* the same two writes as aNPC_set_be_out_home (ac_npc2_action.c_inc): outside, at the house door */
+    list = Common_GetPointer(npclist[in->slot]);
+    animal->is_home = FALSE;
+    list->position.x = list->house_position.x + mFI_UT_WORLDSIZE_HALF_X_F;
+    list->position.y = list->house_position.y;
+    list->position.z = list->house_position.z + mFI_UT_WORLDSIZE_HALF_Z_F;
+    s_host_home_exit_npc[in->slot] = in->npc_id;
+    s_host_home_exit_ms[in->slot] = pcnetgame_now_ms();
+    printf("[NPC][HOMEEXIT] host: ACCEPTED peer=%d slot=%u npc=0x%04X: the villager is outside now (is_home=0), list position (%.1f,%.1f)\n", (int)peer, (unsigned)in->slot, (unsigned)in->npc_id,
+           (double)list->position.x, (double)list->position.z);
+    /* every client (the reporter included) learns the authoritative state now; the host's own outdoor actor, if it exists, reports the same (is_home=0 hide=0) once it came out (deduplicated) */
+    sh = &s_npc_state_shadow[in->slot];
+    if (!(sh->have_sent && sh->cached_npc_id == in->npc_id && sh->forced_active)) {
+        pc_net_game_notify_npc_state((int)in->slot, in->npc_id, 0, 0, (sh->have_sent && sh->cached_npc_id == in->npc_id) ? sh->forced_type : 0, 0);
+    }
+}
+
+int pc_net_game_host_take_npc_home_exit(int slot, uint16_t npc_id) {
+    if (s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= ANIMAL_NUM_MAX || s_host_home_exit_npc[slot] == 0) {
+        return 0;
+    }
+    if (s_host_home_exit_npc[slot] != npc_id) {
+        return 0; /* another occupant of the slot: left for its own exit report / expiry */
+    }
+    s_host_home_exit_npc[slot] = 0;
+    return (uint32_t)(pcnetgame_now_ms() - s_host_home_exit_ms[slot]) < 120000u;
+}
+
+int pc_net_game_notify_local_npc_home_exit(int slot, uint16_t npc_id) {
+    PCNetGameNpcHomeExitMsg msg;
+    uint32_t now;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return 0;
+    }
+    now = pcnetgame_now_ms();
+    if (s_client_home_exit_npc[slot] == npc_id && s_client_home_exit_ms[slot] != 0 && (uint32_t)(now - s_client_home_exit_ms[slot]) < 3000u) {
+        return 0; /* the same transition reported twice */
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_NPC_HOME_EXIT;
+    msg.slot = (uint8_t)slot;
+    msg.npc_id = npc_id;
+    if (!pc_net_send(0, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+        printf("[NPC][HOMEEXIT] client: SEND FAILED slot=%d npc=0x%04X\n", slot, (unsigned)npc_id);
+        return 0;
+    }
+    s_client_home_exit_npc[slot] = npc_id;
+    s_client_home_exit_ms[slot] = now ? now : 1u;
+    printf("[NPC][HOMEEXIT] client: SEND slot=%d npc=0x%04X (the villager walked out of its house)\n", slot, (unsigned)npc_id);
+    return 1;
 }
 
 /* See pc_net_game.h. Host-only gate query (called every frame per villager by ac_npc_move.c_inc). */
@@ -27413,6 +27524,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         PCNetGameNpcTalkMsg nt;
         memcpy(&nt, data, sizeof(nt));
         pcnetgame_handle_host_npc_talk(peer, &nt);
+        return;
+    }
+
+    if (size == sizeof(PCNetGameNpcHomeExitMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_HOME_EXIT) {
+        PCNetGameNpcHomeExitMsg he;
+        memcpy(&he, data, sizeof(he));
+        pcnetgame_handle_host_npc_home_exit(peer, &he);
         return;
     }
 
