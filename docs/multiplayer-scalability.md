@@ -54,3 +54,20 @@ Harness limits seen (kept, class D): `max_guests` (default 4), `max_peers`, 3 ne
 Phases 5 and 6 were later run in the real game (the 9th guest works); Phase 7 is covered by the section above. The native tests are model / logic tests of the pure modules plus the real transport over loopback for Phase 4.
 A crowd is still bounded by: the wire ids (254 peers), `max_peers`, `max_guests`, `guest_memory_mb`, the scene's 200 actors, 50 colliders, the renderer's cost of many animated puppets, and the
 remaining O(N^2) of the host's per-peer relays (MOVE is thinned, appearance / scene are deltas; reliable gameplay broadcasts are unchanged).
+
+## Shared wildlife: one simulation, hosted by the host
+
+Fish and bugs are a single simulation that runs on the host. Authority is ON by default for a hosting process (`--no-authoritative-wildlife` turns it off; single player never uses it).
+
+| step | where | what |
+|---|---|---|
+| spawn | host | the unmodified vanilla roll (`aSOI_insect_set` / `aSOG_gyoei_set`) on every ENTRY into an acre, for the acre the player enters; one record per creature (`entity_id`, kind, species, ABSOLUTE world position). A record lives while a player is in or near its acre (12 s unattended releases it, so the acre re-rolls like vanilla). |
+| show | all | `WILDLIFE_SPAWN` (reliable) creates the creature; a player entering an acre is re-sent that acre's live creatures; a late joiner gets the snapshot. |
+| simulate | host | the vanilla fish / insect AI runs on the host for every record. Its inputs are the host's player **and every connected player** (position, dash, net / axe / shovel use from the synced move state) and **every remote bobber** (a real `UKI_ACTOR` proxy filled from `BOBBER_STATE`). The host's actors are not culled while any player attends them. |
+| state | host -> all | `WILDLIFE_STATE` (id 73, unreliable, ~5 Hz, `8 + 20 * n` bytes): `entity_id`, world x/y/z, heading, action, engaged-by. A client's local actor still runs its animation tick, then is pulled toward that state (snap beyond 200 units). |
+| fishing | client <-> host | the angler's bobber is sent to the host (`BOBBER_STATE`, id 74, ~10 Hz and at once on every stage change). The host's fish AI decides near / nibble / bite / release against that proxy and sends `BOBBER_EVENT` (id 75, reliable) to the angler, whose own bobber and fish copy then play the vanilla animation. The client never decides a wildlife outcome (no self-targeting, no bite decision); the trash roll stays with the angler (it depends on that player's pockets). |
+| catch | client -> host | unchanged: `CATCH_REQUEST` -> the host validates, removes the record once, grants the item in its transaction, broadcasts `WILDLIFE_DESPAWN`. The record's position follows the creature so the reach check measures where it is. |
+
+Not simulated / known limits: ants (no actor), bees and other special-event insects, latent bugs' reveal state, fishing tournaments; each process still has vanilla's actor pools (2 fish, 9 insects), so a crowd of creatures beyond that has no actor on a process; a creature a client never walked near has no actor there until that player enters its acre (the host replays it). Net hits of a remote player on a bug are decided by the netter's own copy, which trails the host's by up to ~0.3 s.
+
+Runtime proof: `tools/net_spike/test_wildlife_sim_real.py` plays a host and two clients with the real rod and net (the TEST-ONLY autopilot only moves the players and presses buttons).

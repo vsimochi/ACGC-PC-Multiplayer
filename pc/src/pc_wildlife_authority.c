@@ -136,6 +136,7 @@
 #include "m_play.h"
 #include "m_common_data.h"
 #include "m_clip.h"
+#include "m_player_lib.h"
 #include "ac_set_manager.h"
 #include "ac_set_ovl_insect.h"
 #include "ac_set_ovl_gyoei.h"
@@ -147,8 +148,11 @@
 #include "pc_field_authority.h"
 #include "pc_net_game.h"
 #include "pc_log.h"
+#include "pc_test_hooks.h" /* pc_test_hook_getenv(): AC_TEST_WILDLIFE_REROLL */
 
 #include <string.h>
+#include <math.h>
+#include "ac_uki.h" /* host-authoritative simulation: the remote bobber proxy is a UKI_ACTOR */
 #include <stdio.h>
 #include <time.h>
 
@@ -179,6 +183,8 @@ typedef struct PcWildlifeSlot {
                                     pcwld_host_check_idle()'s own doc below for why this exists and
                                     why a time-based expiry (rather than an exist-flag-based one) was
                                     chosen. */
+    uint8_t          recreates;     /* how many times pcwld_host_ensure_actors() brought this record's host actor back (capped: a creature that dies at once every time is left alone) */
+    float            absent_frames; /* consecutive 60 fps frames in which no player attended this record (pcwld_host_collect_unattended()) */
 } PcWildlifeSlot;
 
 static PcWildlifeSlot s_table[PCWLD_MAX_ENTITIES];
@@ -468,6 +474,39 @@ void pcwld_host_check_idle(void) {
     }
 }
 
+#define PCWLD_UNATTENDED_GRACE_FRAMES (60.0f * 12.0f) /* 12 s without any player in / near the record's acre */
+
+int pcwld_host_acre_records(int bx, int bz, PcWildlifeRecord* out, int max) {
+    int i, n = 0;
+    for (i = 0; i < PCWLD_MAX_ENTITIES && n < max; i++) {
+        if (s_table[i].active && s_table[i].rec.bx == bx && s_table[i].rec.bz == bz) {
+            out[n++] = s_table[i].rec;
+        }
+    }
+    return n;
+}
+
+int pcwld_host_collect_unattended(int (*attended)(const PcWildlifeRecord*), float dt_frames, uint32_t* out_ids, int max) {
+    int i, n = 0;
+    for (i = 0; i < PCWLD_MAX_ENTITIES; i++) {
+        if (!s_table[i].active) {
+            continue;
+        }
+        if (attended(&s_table[i].rec)) {
+            s_table[i].absent_frames = 0.0f;
+            continue;
+        }
+        s_table[i].absent_frames += dt_frames;
+        if (s_table[i].absent_frames >= PCWLD_UNATTENDED_GRACE_FRAMES && n < max) {
+            printf("[NET][WILDLIFE] host: entity %u (kind %d species %d acre %d,%d) released -- no player in or near its acre for 12 s (its acre re-rolls on the next entry)\n",
+                   (unsigned)s_table[i].rec.entity_id, s_table[i].rec.kind, s_table[i].rec.species, s_table[i].rec.bx, s_table[i].rec.bz);
+            out_ids[n++] = s_table[i].rec.entity_id;
+            memset(&s_table[i], 0, sizeof(s_table[i]));
+        }
+    }
+    return n;
+}
+
 /* Allocates a never-before-issued, never-still-in-use id. A u32 counter is enormous headroom for a
  * play session (over 4 billion spawns); the only real wraparound concern is landing back on an id
  * some ancient, still-live record happens to still hold (impossible in practice given
@@ -516,6 +555,7 @@ static uint32_t pcwld_table_insert(int kind, int species, int bx, int bz, float 
     s_table[slot].active         = 1;
     s_table[slot].age_accum      = 0.0f; /* T1 review fix: fresh record starts un-aged -- see
                                              pcwld_host_check_idle()'s own doc */
+    s_table[slot].absent_frames  = 0.0f;
     s_table[slot].rec.entity_id  = id;
     s_table[slot].rec.kind       = kind;
     s_table[slot].rec.species    = species;
@@ -605,7 +645,17 @@ static int pcwld_shim_make_gyoei_proc(aGYO_Init_c* init) {
 
 /* ---- adapter -------------------------------------------------------------------------------- */
 
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_WILDLIFE_REROLL=<n>): an automated gameplay test cannot wait for the vanilla roll to produce a bug / a fish (it often produces nothing). With this set
+ * the host repeats the UNMODIFIED vanilla decision (aSOI_insect_set / aSOG_gyoei_set, same RNG stream, same rules) up to n times per kind until the acre holds a creature of that kind. Nothing
+ * is rolled or chosen by this file; 1 (the default, and always in normal play) is exactly one decision per kind. */
+static int pcwld_test_reroll_count(void) {
+    const char* e = pc_test_hook_getenv("AC_TEST_WILDLIFE_REROLL");
+    int n = (e != NULL) ? atoi(e) : 1;
+    return n < 1 ? 1 : (n > 200 ? 200 : n);
+}
+
 int pcwld_host_spawn_trigger(int bx, int bz) {
+    int reroll, tries;
     aINS_Clip_c* insect_clip;
     aGYO_Clip_c* gyo_clip;
     aINS_Clip_c saved_insect_clip;
@@ -643,25 +693,36 @@ int pcwld_host_spawn_trigger(int bx, int bz) {
 
     /* ---- insects (frame N in a real wade sequence) ---- */
     saved_insect_clip = *insect_clip;
-    insect_clip->chk_live_insect_proc = pcwld_shim_chk_live_insect_proc;
-    insect_clip->make_insect_proc     = pcwld_shim_make_insect_proc;
-    insect_clip->make_ant_proc        = pcwld_shim_make_ant_proc;
+    reroll = pcwld_test_reroll_count();
+    for (tries = 0; tries < reroll; tries++) {
+        insect_clip->chk_live_insect_proc = pcwld_shim_chk_live_insect_proc;
+        insect_clip->make_insect_proc     = pcwld_shim_make_insect_proc;
+        insect_clip->make_ant_proc        = pcwld_shim_make_ant_proc;
 
-    aSOI_insect_set(&s_scratch_set_manager, play);
+        aSOI_insect_set(&s_scratch_set_manager, play);
 
-    insect_clip->chk_live_insect_proc = saved_insect_clip.chk_live_insect_proc;
-    insect_clip->make_insect_proc     = saved_insect_clip.make_insect_proc;
-    insect_clip->make_ant_proc        = saved_insect_clip.make_ant_proc;
+        insect_clip->chk_live_insect_proc = saved_insect_clip.chk_live_insect_proc;
+        insect_clip->make_insect_proc     = saved_insect_clip.make_insect_proc;
+        insect_clip->make_ant_proc        = saved_insect_clip.make_ant_proc;
+        if (pcwld_acre_has_kind(bx, bz, PC_WILDLIFE_KIND_BUG)) {
+            break;
+        }
+    }
 
     /* ---- fish (frame N+1 in a real wade sequence -- see this file's own deviation doc) ---- */
     saved_gyo_clip = *gyo_clip;
-    gyo_clip->chk_live_gyoei_proc = pcwld_shim_chk_live_gyoei_proc;
-    gyo_clip->make_gyoei_proc     = pcwld_shim_make_gyoei_proc;
+    for (tries = 0; tries < reroll; tries++) {
+        gyo_clip->chk_live_gyoei_proc = pcwld_shim_chk_live_gyoei_proc;
+        gyo_clip->make_gyoei_proc     = pcwld_shim_make_gyoei_proc;
 
-    aSOG_gyoei_set(&s_scratch_set_manager, play);
+        aSOG_gyoei_set(&s_scratch_set_manager, play);
 
-    gyo_clip->chk_live_gyoei_proc = saved_gyo_clip.chk_live_gyoei_proc;
-    gyo_clip->make_gyoei_proc     = saved_gyo_clip.make_gyoei_proc;
+        gyo_clip->chk_live_gyoei_proc = saved_gyo_clip.chk_live_gyoei_proc;
+        gyo_clip->make_gyoei_proc     = saved_gyo_clip.make_gyoei_proc;
+        if (pcwld_acre_has_kind(bx, bz, PC_WILDLIFE_KIND_FISH)) {
+            break;
+        }
+    }
 
     /* T1: host self-presentation. Both clip structs are back to their real vanilla function
      * pointers at this point -- drain whatever pcwld_table_insert() queued during either shim
@@ -719,6 +780,22 @@ static int pcwld_position_component_sane(float v) {
     return v > -100000.0f && v < 100000.0f;
 }
 
+static int pcwld_bug_presentation_actor_still_alive(const PcWildlifePresentationSlot* slot);
+
+/* 1 iff the local actor of this presentation entry is still there. A deferred ant has no actor and is "handled" for good. */
+static int pcwld_presentation_actor_alive(const PcWildlifePresentationSlot* s) {
+    if (s->kind == PC_WILDLIFE_KIND_BUG && s->species == aINS_INSECT_TYPE_ANT) {
+        return 1; /* an ant never has an actor: it is "handled" for good */
+    }
+    if (!s->has_actor || !pcfa_scene_is_town()) {
+        return 0; /* its actor was lost (pool slot reused, scene unloaded...) */
+    }
+    if (!pcfa_scene_is_town()) {
+        return 0;
+    }
+    return s->kind == PC_WILDLIFE_KIND_BUG ? pcwld_bug_presentation_actor_still_alive(s) : aGYO_pc_entity_alive((u32)s->entity_id);
+}
+
 int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx, int bz, float x,
                               float y, float z) {
     int slot;
@@ -730,7 +807,19 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
         return 0;
     }
     if (pcwld_presentation_has(entity_id)) {
-        return 1; /* duplicate -- ignore, never replace a live actor (see this file's own doc) */
+        /* A duplicate of an actor that is still alive is ignored (never replace a live actor). A duplicate whose actor is GONE is a creature the host still holds and this process has
+         * lost (vanilla destroys an insect / fish the player walked away from): the host replays an acre's records to a player entering it, so create the actor again. */
+        int k;
+        for (k = 0; k < PCWLDP_MAX_LOCAL; k++) {
+            if (s_presentation[k].active && s_presentation[k].entity_id == entity_id) {
+                break;
+            }
+        }
+        if (k >= PCWLDP_MAX_LOCAL || pcwld_presentation_actor_alive(&s_presentation[k])) {
+            return 1;
+        }
+        memset(&s_presentation[k], 0, sizeof(s_presentation[k]));
+        printf("[NET][WILDLIFE] presentation: entity %u has no local actor any more -- re-materializing it for the player entering its acre\n", (unsigned)entity_id);
     }
     if (kind < 0 || kind >= PC_WILDLIFE_KIND_NUM) {
         printf("[NET][WILDLIFE] presentation: entity %u rejected -- unknown kind %d\n",
@@ -945,6 +1034,14 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
          * entity() simply reports "not locally materialized" for this entity_id, the same documented
          * residual gap fish already have for their own recovery-failure case. */
         local_actor_out = (kind == PC_WILDLIFE_KIND_BUG) ? (void*)created_actor : NULL;
+
+        /* TRACE (diagnostics only): where the actor really is right after the vanilla constructor and the acre stamp, against the position the record asked for */
+        if (created_actor != NULL) {
+            printf("[NET][WILDLIFE][TRACE] entity %u kind %d species %d record_acre(%d,%d) requested(%.1f,%.1f,%.1f) -> actor %p world(%.1f,%.1f,%.1f) home(%.1f,%.1f,%.1f) block(%d,%d)\n",
+                   (unsigned)entity_id, kind, species, bx, bz, x, y, z, (void*)created_actor, created_actor->world.position.x, created_actor->world.position.y,
+                   created_actor->world.position.z, created_actor->home.position.x, created_actor->home.position.y, created_actor->home.position.z, (int)created_actor->block_x,
+                   (int)created_actor->block_z);
+        }
     }
 
     /* T8 audit fix (Bug 2 part a): a bug's local_actor pointer identifies a POOL SLOT, not a specific bug
@@ -1026,6 +1123,50 @@ static int pcwld_bug_presentation_actor_still_alive(const PcWildlifePresentation
     return insect->exist_flag == TRUE && insect->type == slot->species;
 }
 
+/* TEST-ONLY (the autopilot's `bugs` command, pc_net_game.c): the idx-th (0-based) bug entity that has a LIVE local actor right now, with the actor's position. 0 when there is none. */
+/* TEST-ONLY (the autopilot's `pres` command): one log line per presentation entry with the state of its local actor, to see why a creature is (not) catchable. */
+void pcwld_test_dump_presentation(void) {
+    int i;
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        const PcWildlifePresentationSlot* s = &s_presentation[i];
+        if (!s->active) {
+            continue;
+        }
+        if (s->kind == PC_WILDLIFE_KIND_BUG && s->has_actor && s->local_actor != NULL && pcfa_scene_is_town()) {
+            const aINS_INSECT_ACTOR* in = (const aINS_INSECT_ACTOR*)s->local_actor;
+            printf("[AUTO] pres entity %u bug species %d actor %p exist=%d type=%d pos=(%.0f,%.0f)\n", (unsigned)s->entity_id, s->species, s->local_actor, in->exist_flag, in->type,
+                   (double)in->tools_actor.actor_class.world.position.x, (double)in->tools_actor.actor_class.world.position.z);
+        } else {
+            printf("[AUTO] pres entity %u kind %d species %d has_actor=%d alive=%d\n", (unsigned)s->entity_id, s->kind, s->species, s->has_actor, pcwld_presentation_actor_alive(s));
+        }
+    }
+}
+
+int pcwld_test_live_bug(int idx, uint32_t* entity_id, int* species, float* x, float* z) {
+    int i, n = 0;
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        if (s_presentation[i].active && pcwld_bug_presentation_actor_still_alive(&s_presentation[i])) {
+            if (n++ == idx) {
+                const ACTOR* a = (const ACTOR*)s_presentation[i].local_actor;
+                *entity_id = s_presentation[i].entity_id;
+                *species = s_presentation[i].species;
+                *x = a->world.position.x;
+                *z = a->world.position.z;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+void pcwld_host_replay_acre_local(int bx, int bz) {
+    PcWildlifeRecord recs[16];
+    int i, n = pcwld_host_acre_records(bx, bz, recs, 16);
+    for (i = 0; i < n; i++) {
+        (void)pcwld_presentation_create(recs[i].entity_id, recs[i].kind, recs[i].species, recs[i].bx, recs[i].bz, recs[i].pos_x, recs[i].pos_y, recs[i].pos_z);
+    }
+}
+
 /* T2: late-join/reconnect snapshot reconciliation -- see pc_wildlife_authority.h's own doc for the
  * full contract. Purely local bookkeeping cleanup: clears the slot exactly like pcwld_presentation_
  * check_idle()'s own idle-expiry path does (never touches a real actor, never calls back into the
@@ -1085,6 +1226,45 @@ int pcwld_presentation_reconcile(const uint32_t* keep_ids, int keep_count) {
  * already-expired-but-still-actually-alive entity_id would be treated as new and materialize a
  * second actor). Safe to call with no active town/gamePT (a no-op, same "no work to do yet" shape as
  * every other per-poll tick in this codebase). */
+/* TRACE (diagnostics only): every ~5 s the current world position of every live presentation actor, to compare one entity between processes */
+static void pcwld_trace_positions(float dt) {
+    static float accum = 0.0f;
+    static float interval = -1.0f;
+    int i;
+    if (interval < 0.0f) {
+        const char* e = pc_test_hook_getenv("AC_TEST_WILDLIFE_TRACE_FRAMES"); /* TEST-ONLY: finer trace interval for a diagnosis run */
+        interval = (e != NULL && atoi(e) > 0) ? (float)atoi(e) : 300.0f;
+    }
+    accum += dt;
+    if (accum < interval) {
+        return;
+    }
+    accum = 0.0f;
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        const PcWildlifePresentationSlot* s = &s_presentation[i];
+        if (!s->active || !s->has_actor) {
+            continue;
+        }
+        if (s->kind == PC_WILDLIFE_KIND_BUG && pcwld_bug_presentation_actor_still_alive(s)) {
+            const ACTOR* a = (const ACTOR*)s->local_actor;
+            printf("[NET][WILDLIFE][TRACE] now entity %u bug species %d world(%.1f,%.1f,%.1f) block(%d,%d)\n", (unsigned)s->entity_id, s->species, a->world.position.x, a->world.position.y,
+                   a->world.position.z, (int)a->block_x, (int)a->block_z);
+        } else if (s->kind == PC_WILDLIFE_KIND_FISH) {
+            float p[8];
+            int fbx = 0, fbz = 0;
+            if (aGYO_pc_entity_position((u32)s->entity_id, p, &fbx, &fbz)) {
+                const PLAYER_ACTOR* pl = (gamePT != NULL) ? get_player_actor_withoutCheck((GAME_PLAY*)gamePT) : NULL;
+                printf("[NET][WILDLIFE][TRACE] now entity %u fish species %d world(%.1f,%.1f,%.1f) home(%.1f,%.1f,%.1f) block(%d,%d) action=%d state=0x%X localplayer(%.0f,%.0f)\n",
+                       (unsigned)s->entity_id, s->species, p[0], p[1], p[2], p[3], p[4], p[5], fbx, fbz, (int)p[6], (unsigned)p[7],
+                       pl != NULL ? (double)pl->actor_class.world.position.x : 0.0, pl != NULL ? (double)pl->actor_class.world.position.z : 0.0);
+            }
+        }
+    }
+}
+
 void pcwld_presentation_check_idle(void) {
     int i;
     float dt;
@@ -1093,6 +1273,7 @@ void pcwld_presentation_check_idle(void) {
         return;
     }
     dt = (float)gamePT->graph->dt_num_60fps_frames;
+    pcwld_trace_positions(dt);
 
     for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
         if (!s_presentation[i].active) {
@@ -1303,4 +1484,551 @@ int pcwld_bug_handle_wildlife_despawn(uint32_t entity_id) {
 /* T8 audit fix (Bug 3): see this function's own doc, pc_wildlife_authority.h. */
 int pcwld_should_suppress_local_wildlife(void) {
     return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT;
+}
+
+/* ================================================================================================
+ * HOST-AUTHORITATIVE WILDLIFE SIMULATION (see pc_wildlife_authority.h)
+ * ================================================================================================ */
+
+int pcwld_sim_is_client(void) {
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && pc_net_game_authoritative_wildlife_enabled();
+}
+
+int pcwld_sim_is_host(void) {
+    return pc_net_game_role() == PC_NETGAME_ROLE_HOST && pc_net_game_authoritative_wildlife_enabled();
+}
+
+/* ---- the host's AI sees the connected players ---- */
+
+int pcwld_remote_scare(float x, float z, int16_t* angle_to_player) {
+    PcWldRemotePlayer rp[PCWLD_MAX_REMOTE_PLAYERS];
+    int i, n = pc_net_game_wildlife_remote_players(rp, PCWLD_MAX_REMOTE_PLAYERS);
+    xyz_t from, to;
+
+    from.x = x;
+    from.y = 0.0f;
+    from.z = z;
+    for (i = 0; i < n; i++) {
+        const float dx = rp[i].x - x, dz = rp[i].z - z;
+        const float dist = sqrtf(dx * dx + dz * dz);
+        if ((rp[i].dash && dist < 110.0f) || (rp[i].tool != 0 && dist < 150.0f)) {
+            to.x = rp[i].x;
+            to.y = rp[i].y;
+            to.z = rp[i].z;
+            *angle_to_player = search_position_angleY(&from, &to);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int pcwld_nearest_remote_player(float x, float z, float* px, float* py, float* pz) {
+    PcWldRemotePlayer rp[PCWLD_MAX_REMOTE_PLAYERS];
+    int i, best = -1, n = pc_net_game_wildlife_remote_players(rp, PCWLD_MAX_REMOTE_PLAYERS);
+    float best_d = 0.0f;
+
+    for (i = 0; i < n; i++) {
+        const float d = (rp[i].x - x) * (rp[i].x - x) + (rp[i].z - z) * (rp[i].z - z);
+        if (best < 0 || d < best_d) {
+            best = i;
+            best_d = d;
+        }
+    }
+    if (best < 0) {
+        return 0;
+    }
+    *px = rp[best].x;
+    *py = rp[best].y;
+    *pz = rp[best].z;
+    return 1;
+}
+
+int pcwld_remote_player_in_block(int bx, int bz) {
+    PcWldRemotePlayer rp[PCWLD_MAX_REMOTE_PLAYERS];
+    int i, n = pc_net_game_wildlife_remote_players(rp, PCWLD_MAX_REMOTE_PLAYERS);
+
+    for (i = 0; i < n; i++) {
+        if ((int)(rp[i].x / 640.0f) == bx && (int)(rp[i].z / 640.0f) == bz) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- a remote angler's bobber, as a real UKI_ACTOR-shaped proxy the unmodified fish AI can read and write ---- */
+
+#define PCWLD_PROXY_MAX 8
+#define PCWLD_PROXY_LIFE_MS 800u /* a BOBBER_STATE stream stops: the proxy stops being a target after this */
+
+typedef struct PcWldProxy {
+    int        used;
+    int        peer;
+    uint32_t   until_ms;
+    int        active;
+    int        prev_cmd;
+    uint32_t   prev_entity;
+    float      last_fish[3];
+    int16_t    last_angle;
+    UKI_ACTOR  uki;
+} PcWldProxy;
+
+static PcWldProxy s_proxy[PCWLD_PROXY_MAX];
+
+static PcWldProxy* pcwld_proxy_find(int peer, int create) {
+    int i, free_i = -1;
+    for (i = 0; i < PCWLD_PROXY_MAX; i++) {
+        if (s_proxy[i].used && s_proxy[i].peer == peer) {
+            return &s_proxy[i];
+        }
+        if (!s_proxy[i].used && free_i < 0) {
+            free_i = i;
+        }
+    }
+    if (create && free_i >= 0) {
+        memset(&s_proxy[free_i], 0, sizeof(s_proxy[free_i]));
+        s_proxy[free_i].used = 1;
+        s_proxy[free_i].peer = peer;
+        return &s_proxy[free_i];
+    }
+    return NULL;
+}
+
+void pcwld_host_set_bobber(const PcWldBobber* b) {
+    PcWldProxy* p;
+    UKI_ACTOR* u;
+
+    if (!pcwld_sim_is_host() || b == NULL) {
+        return;
+    }
+    p = pcwld_proxy_find(b->peer, b->active != 0);
+    if (p == NULL) {
+        return;
+    }
+    u = &p->uki;
+    if (!b->active) { /* the bobber is gone: a fish still tied to it lets go (the vanilla "player reeled in" path: status COMEBACK) */
+        u->status = aUKI_STATUS_COMEBACK;
+        u->gyo_status = 0;
+        p->active = 0;
+        p->until_ms = pc_net_game_now_ms() + PCWLD_PROXY_LIFE_MS;
+        return;
+    }
+    u->actor_class.world.position.x = b->x;
+    u->actor_class.world.position.y = b->y;
+    u->actor_class.world.position.z = b->z;
+    u->actor_class.world.angle.y = b->angle;
+    u->actor_class.shape_info.rotation.y = b->angle;
+    u->status = b->uki_status;
+    u->gyo_status = b->gyo_status;
+    u->command = b->command;
+    u->hit_water_flag = b->hit_water;
+    u->cast_timer = b->cast_timer;
+    u->uki_pos.x = b->ux;
+    u->uki_pos.y = b->uy;
+    u->uki_pos.z = b->uz;
+    u->actor_class.bg_collision_check.result.unit_attribute = mCoBG_Wpos2Attribute(u->actor_class.world.position, NULL);
+    p->active = 1;
+    p->until_ms = pc_net_game_now_ms() + PCWLD_PROXY_LIFE_MS;
+}
+
+void pcwld_host_clear_bobber(int peer) {
+    PcWldProxy* p = pcwld_proxy_find(peer, 0);
+    if (p != NULL) {
+        memset(p, 0, sizeof(*p));
+    }
+}
+
+int pcwld_remote_bobbers(void** out, int max) {
+    int i, n = 0;
+    const uint32_t now = pc_net_game_now_ms();
+
+    for (i = 0; i < PCWLD_PROXY_MAX && n < max; i++) {
+        if (s_proxy[i].used && s_proxy[i].active && (int32_t)(s_proxy[i].until_ms - now) > 0) {
+            out[n++] = &s_proxy[i].uki;
+        }
+    }
+    return n;
+}
+
+int pcwld_uki_is_proxy(const void* uki) {
+    int i;
+    for (i = 0; i < PCWLD_PROXY_MAX; i++) {
+        if (uki == (const void*)&s_proxy[i].uki) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int pcwld_host_bobber_events(PcWldBobberEvent* out, int max) {
+    int i, n = 0;
+
+    for (i = 0; i < PCWLD_PROXY_MAX; i++) {
+        PcWldProxy* p = &s_proxy[i];
+        UKI_ACTOR* u = &p->uki;
+        const int cmd = u->gyo_command;
+
+        if (!p->used) {
+            continue;
+        }
+        if (cmd != p->prev_cmd && n < max) {
+            PcWldBobberEvent* e = &out[n];
+            ACTOR* fish = u->child_actor;
+            memset(e, 0, sizeof(*e));
+            e->peer = (uint8_t)p->peer;
+            if (cmd != 0 && fish != NULL) {
+                p->prev_entity = aGYO_pc_get_entity_id_stamp(fish);
+                p->last_fish[0] = fish->world.position.x;
+                p->last_fish[1] = fish->world.position.y;
+                p->last_fish[2] = fish->world.position.z;
+                p->last_angle = fish->world.angle.y;
+            }
+            e->entity_id = p->prev_entity;
+            e->gyo_type = (int16_t)u->gyo_type;
+            e->x = p->last_fish[0];
+            e->y = p->last_fish[1];
+            e->z = p->last_fish[2];
+            e->angle = p->last_angle;
+            e->ev = (cmd == 1) ? PCWLD_BEV_NEAR_TOUCH : (cmd == 2) ? PCWLD_BEV_BITE : (p->prev_cmd != 0 ? PCWLD_BEV_RELEASE : 0);
+            if (e->ev != 0 && e->entity_id != 0) {
+                printf("[NET][WILDLIFE][BOBBER] host: peer %d bobber event %d entity %u (gyo_command %d -> %d, fish type %d)\n", p->peer, e->ev, (unsigned)e->entity_id, p->prev_cmd, cmd,
+                       (int)e->gyo_type);
+                n++;
+            }
+            p->prev_cmd = cmd;
+        }
+        if (u->touched_flag) { /* the fish nibbled: nobody consumes this flag on the proxy */
+            u->touched_flag = FALSE;
+            if (u->child_actor != NULL && n < max) {
+                PcWldBobberEvent* e = &out[n];
+                memset(e, 0, sizeof(*e));
+                e->peer = (uint8_t)p->peer;
+                e->ev = PCWLD_BEV_NUDGE;
+                e->entity_id = aGYO_pc_get_entity_id_stamp(u->child_actor);
+                if (e->entity_id != 0) {
+                    n++;
+                }
+            }
+        }
+        if (p->used && !p->active && (int32_t)(p->until_ms - pc_net_game_now_ms()) < 0 && u->gyo_command == 0) {
+            memset(p, 0, sizeof(*p)); /* idle and silent: free the slot */
+        }
+    }
+    return n;
+}
+
+/* ---- what the host tells everybody ---- */
+
+static int pcwld_find_presentation(uint32_t entity_id) {
+    int i;
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        if (s_presentation[i].active && s_presentation[i].entity_id == entity_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int pcwld_host_collect_state(PcWldStateEntry* out, int max) {
+    int i, n = 0;
+
+    if (!pcwld_sim_is_host() || !pcfa_scene_is_town()) {
+        return 0;
+    }
+    for (i = 0; i < PCWLD_MAX_ENTITIES && n < max; i++) {
+        PcWldStateEntry* e = &out[n];
+        const PcWildlifeRecord* r;
+        int ps;
+        if (!s_table[i].active) {
+            continue;
+        }
+        r = &s_table[i].rec;
+        memset(e, 0, sizeof(*e));
+        e->entity_id = r->entity_id;
+        e->engaged = 0xFF;
+        if (r->kind == PC_WILDLIFE_KIND_FISH) {
+            float xyz[3];
+            int16_t ang;
+            int act;
+            ACTOR* fish = NULL;
+            if (!aGYO_pc_entity_state(r->entity_id, xyz, &ang, &act)) {
+                continue; /* no live host actor: nothing simulated for it */
+            }
+            e->x = xyz[0];
+            e->y = xyz[1];
+            e->z = xyz[2];
+            e->angle = ang;
+            e->action = (uint8_t)act;
+            if (act >= 3 && aGYO_pc_find_entity(r->entity_id, &fish) && ((aGYO_CTRL_ACTOR*)fish)->linked_actor != NULL) {
+                int k;
+                e->engaged = 0xFE;
+                for (k = 0; k < PCWLD_PROXY_MAX; k++) {
+                    if (s_proxy[k].used && (ACTOR*)&s_proxy[k].uki == ((aGYO_CTRL_ACTOR*)fish)->linked_actor) {
+                        e->engaged = (uint8_t)s_proxy[k].peer;
+                    }
+                }
+            }
+        } else {
+            const aINS_INSECT_ACTOR* in;
+            ps = pcwld_find_presentation(r->entity_id);
+            if (ps < 0 || !pcwld_bug_presentation_actor_still_alive(&s_presentation[ps])) {
+                continue;
+            }
+            in = (const aINS_INSECT_ACTOR*)s_presentation[ps].local_actor;
+            e->x = in->tools_actor.actor_class.world.position.x;
+            e->y = in->tools_actor.actor_class.world.position.y;
+            e->z = in->tools_actor.actor_class.world.position.z;
+            e->angle = in->tools_actor.actor_class.shape_info.rotation.y;
+            e->action = (uint8_t)in->action;
+        }
+        /* the record follows the creature: the catch reach check (pcnetgame_validate_catch) must measure against where it IS */
+        s_table[i].rec.pos_x = e->x;
+        s_table[i].rec.pos_y = e->y;
+        s_table[i].rec.pos_z = e->z;
+        n++;
+    }
+    return n;
+}
+
+void pcwld_host_ensure_actors(int (*attended)(const PcWildlifeRecord*)) {
+    static float accum = 0.0f;
+    int i;
+
+    if (!pcwld_sim_is_host() || gamePT == NULL || !pcfa_scene_is_town()) {
+        return;
+    }
+    accum += (float)gamePT->graph->dt_num_60fps_frames;
+    if (accum < 60.0f) {
+        return;
+    }
+    accum = 0.0f;
+    for (i = 0; i < PCWLD_MAX_ENTITIES; i++) {
+        const PcWildlifeRecord* r;
+        int alive;
+        if (!s_table[i].active) {
+            continue;
+        }
+        r = &s_table[i].rec;
+        if (r->kind == PC_WILDLIFE_KIND_BUG && r->species == aINS_INSECT_TYPE_ANT) {
+            continue;
+        }
+        if (r->kind == PC_WILDLIFE_KIND_FISH) {
+            alive = aGYO_pc_entity_alive((u32)r->entity_id);
+        } else {
+            const int ps = pcwld_find_presentation(r->entity_id);
+            alive = ps >= 0 && pcwld_bug_presentation_actor_still_alive(&s_presentation[ps]);
+        }
+        if (!alive && s_table[i].recreates < 5 && attended(r)) {
+            s_table[i].recreates++;
+            printf("[NET][WILDLIFE] host: entity %u (kind %d) is attended but has no host actor -- re-creating it where it was (%.0f,%.0f)\n", (unsigned)r->entity_id, r->kind, r->pos_x, r->pos_z);
+            (void)pcwld_presentation_create(r->entity_id, r->kind, r->species, r->bx, r->bz, r->pos_x, r->pos_y, r->pos_z);
+        }
+    }
+}
+
+/* ---- what a client does with it ---- */
+
+#define PCWLD_TARGET_STALE_MS 2500u
+
+typedef struct PcWldTarget {
+    int            used;
+    PcWldStateEntry e;
+    uint32_t       ms;
+} PcWldTarget;
+
+static PcWldTarget s_target[PCWLD_PUBLIC_MAX_ENTITIES];
+
+/* A creature the host still simulates whose local actor vanilla culled (the player drifted away from it) comes back as soon as the
+ * player is near it again: the host keeps broadcasting its state, so the client re-creates the local copy where the host says it is. */
+static void pcwld_client_rematerialize(const PcWldStateEntry* e) {
+    static uint32_t s_last_try_ms;
+    const uint32_t now = pc_net_game_now_ms();
+    const PLAYER_ACTOR* pl;
+    int k, bx = 0, bz = 0;
+    xyz_t wp;
+    float dx, dz;
+
+    if (s_last_try_ms != 0 && (int32_t)(now - s_last_try_ms) < 1000) {
+        return;
+    }
+    for (k = 0; k < PCWLDP_MAX_LOCAL; k++) {
+        if (s_presentation[k].active && s_presentation[k].entity_id == e->entity_id) {
+            break;
+        }
+    }
+    if (k >= PCWLDP_MAX_LOCAL || !s_presentation[k].has_actor || pcwld_presentation_actor_alive(&s_presentation[k])) {
+        return;
+    }
+    pl = (gamePT != NULL) ? get_player_actor_withoutCheck((GAME_PLAY*)gamePT) : NULL;
+    if (pl == NULL) {
+        return;
+    }
+    dx = e->x - pl->actor_class.world.position.x;
+    dz = e->z - pl->actor_class.world.position.z;
+    if (dx * dx + dz * dz > 450.0f * 450.0f) {
+        return;
+    }
+    wp.x = e->x; wp.y = 0.0f; wp.z = e->z;
+    if (!mFI_Wpos2BlockNum(&bx, &bz, wp)) {
+        return;
+    }
+    s_last_try_ms = now;
+    pcwld_presentation_create(e->entity_id, s_presentation[k].kind, s_presentation[k].species, bx, bz, e->x, e->y, e->z);
+}
+
+void pcwld_client_set_state(const PcWldStateEntry* e) {
+    int i, free_i = -1;
+    pcwld_client_rematerialize(e);
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        if (s_target[i].used && s_target[i].e.entity_id == e->entity_id) {
+            s_target[i].e = *e;
+            s_target[i].ms = pc_net_game_now_ms();
+            return;
+        }
+        if (!s_target[i].used && free_i < 0) {
+            free_i = i;
+        }
+    }
+    if (free_i < 0) { /* full: reuse the stalest */
+        uint32_t oldest = 0;
+        const uint32_t now = pc_net_game_now_ms();
+        free_i = 0;
+        for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+            if (now - s_target[i].ms > oldest) {
+                oldest = now - s_target[i].ms;
+                free_i = i;
+            }
+        }
+    }
+    s_target[free_i].used = 1;
+    s_target[free_i].e = *e;
+    s_target[free_i].ms = pc_net_game_now_ms();
+}
+
+static const PcWldTarget* pcwld_find_target(uint32_t entity_id) {
+    int i;
+    const uint32_t now = pc_net_game_now_ms();
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        if (s_target[i].used && s_target[i].e.entity_id == entity_id) {
+            return (now - s_target[i].ms) <= PCWLD_TARGET_STALE_MS ? &s_target[i] : NULL; /* a host that went quiet: the local AI is free again */
+        }
+    }
+    return NULL;
+}
+
+static void pcwld_ease_actor(ACTOR* a, const PcWldStateEntry* t, float k) {
+    const float dx = t->x - a->world.position.x, dz = t->z - a->world.position.z;
+    const float d = sqrtf(dx * dx + dz * dz);
+    int bx, bz;
+    xyz_t wp;
+
+    if (d > 200.0f) {
+        k = 1.0f; /* far off: snap */
+    }
+    a->world.position.x += dx * k;
+    a->world.position.z += dz * k;
+    a->world.position.y += (t->y - a->world.position.y) * k;
+    a->world.angle.y = t->angle;
+    a->shape_info.rotation.y = t->angle;
+    wp = a->world.position;
+    if (mFI_Wpos2BlockNum(&bx, &bz, wp)) {
+        a->block_x = (int8_t)bx;
+        a->block_z = (int8_t)bz;
+    }
+}
+
+int pcwld_fish_is_driven(const void* fish_actor) {
+    return pcwld_sim_is_client() && aGYO_pc_get_entity_id_stamp((ACTOR*)fish_actor) != 0;
+}
+
+void pcwld_drive_fish(void* fish_actor) {
+    ACTOR* a = (ACTOR*)fish_actor;
+    uint32_t entity;
+    const PcWldTarget* t;
+    int act;
+
+    if (!pcwld_sim_is_client()) {
+        return;
+    }
+    entity = aGYO_pc_get_entity_id_stamp(a);
+    if (entity == 0 || (t = pcwld_find_target(entity)) == NULL) {
+        return;
+    }
+    act = aGTT_pc_action(a);
+    if (act >= 3 && act <= 6 && ((aGYO_CTRL_ACTOR*)a)->linked_actor != NULL) {
+        return; /* engaged with THIS player's bobber (near / touch / bite / hooked): the vanilla bobber code plays it */
+    }
+    pcwld_ease_actor(a, &t->e, 0.2f);
+}
+
+void pcwld_drive_insect(void* insect_actor) {
+    aINS_INSECT_ACTOR* in = (aINS_INSECT_ACTOR*)insect_actor;
+    ACTOR* a = (ACTOR*)insect_actor;
+    uint32_t entity;
+    const PcWldTarget* t;
+    float k;
+
+    if (!pcwld_sim_is_client()) {
+        return;
+    }
+    if ((ACTOR*)mPlib_Get_item_net_catch_label() == a) {
+        return; /* in this player's net */
+    }
+    entity = pcwld_bug_entity_id_for_local_actor(insect_actor, in->type);
+    if (entity == 0 || (t = pcwld_find_target(entity)) == NULL) {
+        return;
+    }
+    k = 0.25f * (float)gamePT->graph->dt_num_60fps_frames;
+    pcwld_ease_actor(a, &t->e, k > 1.0f ? 1.0f : k);
+}
+
+void pcwld_client_bobber_event(uint32_t entity_id, int ev, int gyo_type, float x, float y, float z, int16_t angle) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    ACTOR* fish = NULL;
+    UKI_ACTOR* uki;
+
+    if (!pcwld_sim_is_client() || play == NULL || !pcfa_scene_is_town()) {
+        return;
+    }
+    uki = (UKI_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_UKI, ACTOR_PART_BG);
+    if (uki == NULL) {
+        return;
+    }
+    if (!aGYO_pc_find_entity(entity_id, &fish)) {
+        int bx = (int)(x / 640.0f), bz = (int)(z / 640.0f);
+        if (ev != PCWLD_BEV_NEAR_TOUCH || !pcwld_presentation_create(entity_id, PC_WILDLIFE_KIND_FISH, gyo_type, bx, bz, x, y, z) || !aGYO_pc_find_entity(entity_id, &fish)) {
+            printf("[NET][WILDLIFE][BOBBER] client: event %d for entity %u dropped -- no local fish actor\n", ev, (unsigned)entity_id);
+            return;
+        }
+    }
+    printf("[NET][WILDLIFE][BOBBER] client: event %d entity %u applied=%d (bobber gyo_status %d, fish action %d)\n", ev, (unsigned)entity_id,
+           aGTT_pc_apply_bobber_event(fish, (ACTOR*)uki, ev, gyo_type, x, y, z, angle), (int)uki->gyo_status, aGTT_pc_action(fish));
+}
+
+int pcwld_client_collect_bobber(PcWldBobber* out) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    UKI_ACTOR* uki;
+
+    if (play == NULL || !pcfa_scene_is_town()) {
+        return 0;
+    }
+    uki = (UKI_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_UKI, ACTOR_PART_BG);
+    if (uki == NULL || uki->status < aUKI_STATUS_CAST) { /* the rod is out but not cast: the host's fish have nothing to look at */
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->active = 1;
+    out->uki_status = (uint8_t)uki->status;
+    out->gyo_status = (int8_t)uki->gyo_status;
+    out->command = (int8_t)uki->command;
+    out->hit_water = uki->hit_water_flag;
+    out->cast_timer = (uint8_t)(uki->cast_timer > 255 ? 255 : (uki->cast_timer < 0 ? 0 : uki->cast_timer));
+    out->rod_type = (Now_Private != NULL && Now_Private->equipment == ITM_GOLDEN_ROD) ? 1 : 0;
+    out->x = uki->actor_class.world.position.x;
+    out->y = uki->actor_class.world.position.y;
+    out->z = uki->actor_class.world.position.z;
+    out->ux = uki->uki_pos.x;
+    out->uy = uki->uki_pos.y;
+    out->uz = uki->uki_pos.z;
+    out->angle = uki->actor_class.world.angle.y;
+    return 1;
 }

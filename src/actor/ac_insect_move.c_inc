@@ -30,15 +30,28 @@ static void aINS_set_player_info(ACTOR* actorx, PLAYER_ACTOR* player) {
     if (player != NULL) {
         f32 distXZ;
         f32 distY;
+        xyz_t nearest = player->actor_class.world.position;
 
-        distXZ = search_position_distanceXZ(&actorx->world.position, &player->actor_class.world.position);
+#ifdef TARGET_PC
+        if (pcwld_sim_is_host()) { /* the host simulates for every connected player: the AI reacts to the NEAREST one */
+            float rx, ry, rz;
+            if (pcwld_nearest_remote_player(actorx->world.position.x, actorx->world.position.z, &rx, &ry, &rz) &&
+                SQ(rx - actorx->world.position.x) + SQ(rz - actorx->world.position.z) <
+                    SQ(nearest.x - actorx->world.position.x) + SQ(nearest.z - actorx->world.position.z)) {
+                nearest.x = rx;
+                nearest.y = ry;
+                nearest.z = rz;
+            }
+        }
+#endif
+        distXZ = search_position_distanceXZ(&actorx->world.position, &nearest);
         actorx->player_distance_xz = distXZ;
 
-        distY = player->actor_class.world.position.y - actorx->world.position.y;
+        distY = nearest.y - actorx->world.position.y;
         actorx->player_distance_y = distY;
 
         actorx->player_distance = SQ(distXZ) + SQ(distY);
-        actorx->player_angle_y = search_position_angleY(&actorx->world.position, &player->actor_class.world.position);
+        actorx->player_angle_y = search_position_angleY(&actorx->world.position, &nearest);
     } else {
         actorx->player_distance_xz = 0.0f;
         actorx->player_distance_y = 0.0f;
@@ -276,6 +289,9 @@ static void aINS_cull_check(ACTOR* actorx, GAME* game) {
             /* Despawn if player is more than 15 units away and in another acre and has not caught it */
             if (actorx->player_distance_xz > 600.0f &&
                 (actorx->block_x != play->block_table.block_x || actorx->block_z != play->block_table.block_z) &&
+#ifdef TARGET_PC
+                !(pcwld_sim_is_host() && pcwld_remote_player_in_block(actorx->block_x, actorx->block_z)) &&
+#endif
                 (ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
                 aINS_destruct(actorx, game);
             }
@@ -385,6 +401,9 @@ static void aINS_actor_move(ACTOR* actorx, GAME* game) {
                 aINS_calc_life_time(insect, game);
                 aINS_calc_alpha_time(insect, game);
                 (*actorx->mv_proc)(actorx, game);
+#ifdef TARGET_PC
+                pcwld_drive_insect(insect); /* a CLIENT shows the host's position / heading of a creature the host simulates */
+#endif
                 Actor_world_to_eye(actorx, 0.0f);
                 aINS_set_catch_range(actorx);
             }

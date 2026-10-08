@@ -37,6 +37,20 @@ static void aGYO_cull_check(ACTOR* actorx, GAME_PLAY* play) {
 
         actorx->state_bitfield &= ~ACTOR_STATE_NO_CULL;
         dist = search_position_distance(&actorx->world.position, &playerx->world.position);
+#ifdef TARGET_PC
+        if (pcwld_sim_is_host()) { /* the host simulates the wildlife for EVERY connected player: a creature a remote player is near (or stands in the acre of) is not culled */
+            float rx, ry, rz;
+            if (pcwld_nearest_remote_player(actorx->world.position.x, actorx->world.position.z, &rx, &ry, &rz)) {
+                const float rd = sqrtf((rx - actorx->world.position.x) * (rx - actorx->world.position.x) + (rz - actorx->world.position.z) * (rz - actorx->world.position.z));
+                if (rd < dist) {
+                    dist = rd;
+                }
+            }
+            if (pcwld_remote_player_in_block(actorx->block_x, actorx->block_z)) {
+                dist = 0.0f;
+            }
+        }
+#endif
         if (dist > 600.0f && (actorx->block_x != play->block_table.block_x || actorx->block_z != play->block_table.block_z)) {
             aGYO_destruct(actorx, (GAME*)play);
         }
@@ -100,6 +114,9 @@ static void aGYO_actor_move(ACTOR* actorx, GAME* game) {
                     }
 
                     (*((ACTOR*)ctrl)->mv_proc)((ACTOR*)ctrl, game);
+#ifdef TARGET_PC
+                    pcwld_drive_fish(ctrl); /* a CLIENT shows the host's position / heading of a creature the host simulates */
+#endif
                     Actor_world_to_eye((ACTOR*)ctrl, 0.0f);
                 }
 

@@ -147,10 +147,15 @@ def main():
     new_msg, old_msg = typedef_blocks(ng, "Msg"), typedef_blocks(parent("pc/src/pc_net_game.c"), "Msg")
     changed = sorted(n for n in old_msg if n.endswith("Msg") and new_msg.get(n) != old_msg[n])
     added = sorted(n for n in new_msg if n.endswith("Msg") and n not in old_msg)
-    check("WIRE: no PCNet*Msg struct changed or was added (%d compared)" % len([n for n in old_msg if n.endswith("Msg")]), len(old_msg) > 20 and not changed and not added)
+    wild_sim = ["PCNetGameBobberEventMsg", "PCNetGameBobberStateMsg", "PCNetGameWildlifeStateMsg"]  # the host-authoritative wildlife simulation (ids 73-75) came after this milestone
+    check("WIRE: no existing PCNet*Msg struct changed (%d compared); the only additions are the wildlife simulation messages %s" % (len([n for n in old_msg if n.endswith("Msg")]), added),
+          len(old_msg) > 20 and not changed and added == wild_sim)
     enum_new = re.search(r"typedef enum PCNetGameMsgType \{.*?\} PCNetGameMsgType;", ng, re.S)
     enum_old = re.search(r"typedef enum PCNetGameMsgType \{.*?\} PCNetGameMsgType;", parent("pc/src/pc_net_game.c"), re.S)
-    check("WIRE: the message-id enum is byte-identical to the parent commit (no new message, no protocol bump)", enum_new is not None and enum_new.group(0) == enum_old.group(0))
+    ids_old = dict(re.findall(r"(PC_NETGAME_MSG_[A-Z_0-9]+)\s*=\s*(\d+)", enum_old.group(0)))
+    ids_new = dict(re.findall(r"(PC_NETGAME_MSG_[A-Z_0-9]+)\s*=\s*(\d+)", enum_new.group(0)))
+    check("WIRE: every message id of the parent commit is unchanged; the only new ones are WILDLIFE_STATE 73, BOBBER_STATE 74, BOBBER_EVENT 75 (no protocol bump)",
+          enum_new is not None and all(ids_new.get(k) == v for k, v in ids_old.items()) and {k: v for k, v in ids_new.items() if k not in ids_old} == {"PC_NETGAME_MSG_WILDLIFE_STATE": "73", "PC_NETGAME_MSG_BOBBER_STATE": "74", "PC_NETGAME_MSG_BOBBER_EVENT": "75"})
     check("WIRE: uint8_t wire ids kept; the host id is still 8 and 0xFF stays 'nobody'", "#define PC_NETGAME_HOST_WIRE_ID 8" in read("pc/include/pc_net_game.h") and "PC_PEER_ID_LAST" in read("pc/include/pc_net_game.h"))
     check("PHASE 7: K.K.'s claim is per guest identity: claimant -2 skips the shared foreigner bit and the host's day-claim table records it", "aNTT_pc_host_song_check(is_guest ? -2" in ng and "pc_dayclaims_mark(&s_kk_claims" in ng and
           "claimant == -2" in read("src/actor/npc/ac_npc_totakeke_talk.c_inc") and "pcnetgame_evnpc_plan(idx, t, post," in ng)

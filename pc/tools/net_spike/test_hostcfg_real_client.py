@@ -6,7 +6,7 @@ TIER: REAL HOST + REAL CLIENT game processes (no GUI automation, no manual play,
   H1  host  = `AnimalCrossing.exe --host <port> --bootstrap-resident 0 --authoritative-wildlife`
       client = `AnimalCrossing.exe --connect 127.0.0.1:<port> --bootstrap-resident <slot>`   (NO --authoritative-wildlife)
       -> the client adopts authoritative wildlife from the host's HOST_CONFIG (log marker), before any wildlife snapshot line, no mode change
-  H2  host  = same WITHOUT --authoritative-wildlife; client = same WITH --authoritative-wildlife
+  H2  host  = same with --no-authoritative-wildlife (the default is ON); client = same WITH --authoritative-wildlife
       -> the client logs that its own flag is IGNORED, adopts authoritative_wildlife=0
       then (A3) the host process is stopped while the client keeps running: after > 3 s the client prints the loud '[NET][NOTICE] ... NOT CONNECTED'
       line (the on-screen notice is drawn by the same condition; rendering itself is NOT asserted, no screenshot automation) and does not crash.
@@ -50,8 +50,8 @@ def run(args, results, ip, rig):
         ct = cl.log_text()
         ht = host.log_text()
         adopted = re.search(r"\[NET\]\[HOSTCFG\] client: adopted authoritative_wildlife=(\d) from the host \(previous (\w+); this client's own --authoritative-wildlife=(\d) is ignored\)", ct)
-        check("%s the client adopted authoritative_wildlife=%d from the host (previous: unknown; own flag %d is irrelevant)" % (tag, want, 1 if client_flags else 0),
-              adopted is not None and int(adopted.group(1)) == want and adopted.group(2) == "unknown" and int(adopted.group(3)) == (1 if client_flags else 0))
+        check("%s the client adopted authoritative_wildlife=%d from the host (previous: unknown; own flag %d is irrelevant)" % (tag, want, 1 if "--authoritative-wildlife" in client_flags else 0),
+              adopted is not None and int(adopted.group(1)) == want and adopted.group(2) == "unknown" and int(adopted.group(3)) == (1 if "--authoritative-wildlife" in client_flags else 0))
         check("%s the client applied service 4 (HOSTCFG) with len 8 exactly once" % tag,
               count(r"\[NET\]\[TS\] client: applied service 4 \(HOSTCFG\) seq \d+ digest 0x[0-9A-F]{8} len 8", ct) == 1)
         pushed = re.search(r"\[NET\]\[HOSTCFG\] host: pushed HOST_CONFIG authoritative_wildlife=(\d) seq (\d+) to peer \d+ \(at READY, before the snapshot\)", ht)
@@ -63,7 +63,7 @@ def run(args, results, ip, rig):
         check("%s no mode CHANGE, no refused / unknown TOWN_SVC_STATE" % tag,
               "wildlife mode changed" not in ct and "refused" not in "".join(re.findall(r"\[NET\]\[TS\] client: TOWN_SVC_STATE service 4[^\n]*", ct))
               and "reserved / unknown" not in ct)
-        if client_flags:
+        if "--authoritative-wildlife" in client_flags:
             check("%s the client logged that its own --authoritative-wildlife flag is IGNORED" % tag,
                   "client: --authoritative-wildlife is IGNORED on a client" in ct)
         else:
@@ -71,7 +71,7 @@ def run(args, results, ip, rig):
         return host, cl
 
     if "h1" in args.only:
-        host, cl = case("h1", args.port, ["--authoritative-wildlife"], [], 1)
+        host, cl = case("h1", args.port, ["--authoritative-wildlife"], ["--no-authoritative-wildlife"], 1)
         if cl is not None:
             check("H1 client still alive", cl.alive())
             cl.stop()
@@ -80,7 +80,7 @@ def run(args, results, ip, rig):
             rig.host = None
 
     if "h2" in args.only:
-        host, cl = case("h2", args.port + 1, [], ["--authoritative-wildlife"], 0)
+        host, cl = case("h2", args.port + 1, ["--no-authoritative-wildlife"], ["--authoritative-wildlife"], 0)
         if cl is not None:
             ht_off = len(cl.log_text())
             host.stop()

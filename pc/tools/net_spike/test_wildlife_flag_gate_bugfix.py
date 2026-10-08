@@ -91,7 +91,7 @@ def collect_spawns(client, duration):
 def scenario_a(port, log_dir, results):
     print("=" * 72)
     print("[bug1] Scenario A: flag-OFF host + a peer sending WILDLIFE_SPAWN_TRIGGER_REQUEST")
-    host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", "0"],
+    host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", "0", "--no-authoritative-wildlife"],
                          log_path=os.path.join(log_dir, "bug1_scenA_host.log")).start()
     try:
         if not host.wait_listening(60.0):
@@ -288,8 +288,11 @@ def main():
     os.makedirs(a.log_dir, exist_ok=True)
     results = []
     scenario_a(a.port, a.log_dir, results)
-    scenario_b(a.port + 1, a.log_dir, results)
-    scenario_c(a.port + 2, a.log_dir, results)
+    # Scenarios B and C exercised a client WITHOUT the flag under a flag-ON host. Since the host now
+    # publishes its wildlife mode in HOST_CONFIG and the client follows it (a client can no longer opt out
+    # on its own), that combination cannot occur; the client-side ignore-gates are covered by
+    # test_wildlife_sim_real.py instead.
+    print("[bug1] Scenarios B and C retired: the client now follows the host's HOST_CONFIG wildlife mode")
     return summary_and_exit_code(results)
 
 

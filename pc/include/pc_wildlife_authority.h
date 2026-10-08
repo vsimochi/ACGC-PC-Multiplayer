@@ -344,6 +344,122 @@ int pcwld_should_suppress_local_wildlife(void);
  * normal (non-test-flag-gated) code path. */
 void pcwld_test_set_ttl_override_frames(float frames);
 
+/* TEST-ONLY (the autopilot's `bugs` command): the idx-th (0-based) bug entity with a LIVE local actor, plus the actor's world position; 0 when there is none. */
+int pcwld_test_live_bug(int idx, uint32_t* entity_id, int* species, float* x, float* z);
+/* TEST-ONLY (the autopilot's `pres` command): logs every presentation entry and the state of its local actor. */
+void pcwld_test_dump_presentation(void);
+
+/* ================================================================================================
+ * Record lifetime = actor lifetime (attendance), and entry replay
+ * ================================================================================================
+ * A vanilla insect / fish actor lives only while a player is near it (aINS_cull_check(): destroyed once the player is more than 600 units away, in another acre and it is off screen; fish
+ * likewise). The host's record used to outlive that by a blind 10 minutes, and while it stood the acre's "already has this kind" gate blocked every re-roll: after the first spawn in an
+ * acre nobody ever saw wildlife there again, and a player who walked in later saw nothing of what another player was looking at. Two small, additive pieces fix it: */
+
+/* HOST-ONLY. Fills `out` with the live records of acre (bx, bz) (up to `max`), returns the count. */
+int pcwld_host_acre_records(int bx, int bz, PcWildlifeRecord* out, int max);
+
+/* HOST-ONLY. One tick of the attendance rule. `attended(rec)` says whether any player is near / in the record's acre (the caller knows the players; this module does not). A record nobody
+ * attends for PCWLD_UNATTENDED_GRACE (12 s) is removed (its acre re-rolls on the next entry, like vanilla); its entity_id is stored in out_ids (up to `max`) so the caller can broadcast the
+ * despawn. Returns the number removed. `dt_frames` = 60 fps frames since the last call. */
+int pcwld_host_collect_unattended(int (*attended)(const PcWildlifeRecord*), float dt_frames, uint32_t* out_ids, int max);
+
+/* Callable from any role. (Re)creates the LOCAL actor of every live record of acre (bx, bz) whose actor is gone (or never existed here) - the host's own player entering an acre. A record
+ * whose actor is still alive is left alone. */
+void pcwld_host_replay_acre_local(int bx, int bz);
+
+/* ================================================================================================
+ * HOST-AUTHORITATIVE WILDLIFE SIMULATION
+ * ================================================================================================
+ * The host runs the vanilla fish / insect AI for every record; clients show the host's state. See pc_net_game.c (WILDLIFE_STATE / BOBBER_STATE / BOBBER_EVENT) for the wire side.
+ *  - host inputs: the vanilla AI looks at ONE local player and ONE local bobber; the adapters below add the connected players (their position, dash, tool use) and their bobbers.
+ *  - client output: a creature the host simulates is pulled toward the host's position / heading after the local actor ran its (cosmetic) animation tick; a client never decides a
+ *    wildlife outcome (no self-targeting of its bobber, no bite decision): it applies the host's BOBBER_EVENTs to its own bobber and fish copy, which then play the vanilla animation. */
+
+/* 1 = this process is a CLIENT following a host that simulates the wildlife / 1 = this process is the HOST of authoritative wildlife. */
+int pcwld_sim_is_client(void);
+int pcwld_sim_is_host(void);
+
+/* a connected player as the host's AI sees it (positions of the puppets) */
+typedef struct PcWldRemotePlayer {
+    float   x, y, z;
+    int16_t angle;
+    uint8_t peer;
+    uint8_t dash; /* running flat out: scares fish within 110 units */
+    uint8_t tool; /* 0 none, 1 net swing, 2 axe, 3 scoop / shovel: scares within 150 units */
+    uint8_t _pad;
+} PcWldRemotePlayer;
+#define PCWLD_MAX_REMOTE_PLAYERS 16
+
+/* HOST: 1 iff some connected player scares a fish at (x, z) (dash within 110, a tool within 150); *angle_to_player = the angle from (x, z) to that player. */
+int pcwld_remote_scare(float x, float z, int16_t* angle_to_player);
+/* HOST: the connected player nearest to (x, z); 0 when there is none. */
+int pcwld_nearest_remote_player(float x, float z, float* px, float* py, float* pz);
+/* HOST: 1 iff a connected player stands in acre block (bx, bz). */
+int pcwld_remote_player_in_block(int bx, int bz);
+
+/* a remote player's bobber as the host's fish AI sees it (a real UKI_ACTOR-shaped proxy, filled from BOBBER_STATE). */
+typedef struct PcWldBobber {
+    uint8_t peer;
+    uint8_t active;
+    uint8_t uki_status; /* aUKI_STATUS_* */
+    int8_t  gyo_status;
+    int8_t  command;    /* the player's command to the bobber (6 = hook / reel in) */
+    uint8_t hit_water;
+    uint8_t cast_timer;
+    uint8_t rod_type;
+    float   x, y, z;    /* the bobber */
+    float   ux, uy, uz; /* uki_pos */
+    int16_t angle;
+} PcWldBobber;
+
+/* an event the host's fish AI produced for a remote bobber, to be sent to that peer. */
+enum { PCWLD_BEV_NEAR_TOUCH = 1, PCWLD_BEV_NUDGE = 2, PCWLD_BEV_BITE = 3, PCWLD_BEV_RELEASE = 4 };
+typedef struct PcWldBobberEvent {
+    uint8_t  peer;
+    uint8_t  ev;
+    int16_t  gyo_type;
+    uint32_t entity_id;
+    float    x, y, z; /* the fish */
+    int16_t  angle;
+} PcWldBobberEvent;
+#define PCWLD_MAX_BOBBER_EVENTS 8
+
+void pcwld_host_set_bobber(const PcWldBobber* b);
+void pcwld_host_clear_bobber(int peer);
+/* HOST, once per poll: fills the events the fish AI produced since the last call (a bobber's gyo_command changed, the fish nibbled); returns the count. */
+int pcwld_host_bobber_events(PcWldBobberEvent* out, int max);
+/* the proxies the fish AI may target (UKI_ACTOR*), and whether a UKI is one of them */
+int pcwld_remote_bobbers(void** out, int max);
+int pcwld_uki_is_proxy(const void* uki);
+
+/* the periodic state of a creature the host simulates */
+typedef struct PcWldStateEntry {
+    uint32_t entity_id;
+    float    x, y, z;
+    int16_t  angle;
+    uint8_t  action;
+    uint8_t  engaged; /* 0xFF nobody, 0xFE the host's own bobber, else the peer whose bobber the fish follows */
+} PcWldStateEntry;
+#define PCWLD_STATE_MAX 40
+
+/* HOST: the state of every record the host has a live actor for (and refreshes the record's position from it). */
+int pcwld_host_collect_state(PcWldStateEntry* out, int max);
+/* HOST, about once a second: a record somebody attends whose host actor is gone (vanilla destroys a fish whose angler lost it, an insect that wandered off...) gets its actor back at the
+ * record's last known position, so the host keeps simulating every creature that is alive. */
+void pcwld_host_ensure_actors(int (*attended)(const PcWildlifeRecord*));
+/* CLIENT: remember the host's latest state of a creature. */
+void pcwld_client_set_state(const PcWldStateEntry* e);
+/* CLIENT: pull the actor of a driven creature toward the host's state (after its local animation tick). */
+void pcwld_drive_fish(void* fish_actor);
+void pcwld_drive_insect(void* insect_actor);
+/* CLIENT: the host sent a fish / bobber event for this client's own bobber. */
+void pcwld_client_bobber_event(uint32_t entity_id, int ev, int gyo_type, float x, float y, float z, int16_t angle);
+/* CLIENT: the local bobber as BOBBER_STATE wants it; returns 1 when a bobber exists. */
+int pcwld_client_collect_bobber(PcWldBobber* out);
+/* 1 iff this CLIENT's fish actor is a stamped creature of the host (its AI must not decide wildlife outcomes). */
+int pcwld_fish_is_driven(const void* fish_actor);
+
 #ifdef __cplusplus
 }
 #endif

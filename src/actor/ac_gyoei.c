@@ -8,6 +8,9 @@
 #include "m_skin_matrix.h"
 #include "m_rcp.h"
 #include "m_player_lib.h"
+#ifdef TARGET_PC
+#include "pc_wildlife_authority.h" /* host-authoritative wildlife simulation hooks (ac_gyoei_move.c_inc) */
+#endif
 
 static void aGYO_actor_ct(ACTOR* actorx, GAME* game);
 static void aGYO_actor_dt(ACTOR* actorx, GAME* game);
@@ -186,6 +189,79 @@ int aGYO_pc_handle_wildlife_despawn(u32 entity_id) {
     /* else: gyo_status >= 5 (engaged AND at/past the point of no return), or the defensive
        engaged-but-flag-mismatch edge case -- leave completely untouched, see this function's own doc. */
 
+    return 1;
+}
+
+int aGYO_pc_entity_alive(u32 entity_id) {
+    GYOEI_ACTOR* gyoei = (GYOEI_ACTOR*)aGYO_ctrlActor;
+    int i;
+
+    if (gyoei == NULL || entity_id == 0) {
+        return 0;
+    }
+    for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        if (gyoei->ctrl[i].exist && (u32)gyoei->ctrl[i]._1F8 == entity_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* diagnostics: world and home position + block of the live fish actor stamped with entity_id; 0 when none */
+int aGYO_pc_entity_position(u32 entity_id, float* out6, int* bx, int* bz) {
+    /* out6[6] = action, out6[7] = state_bitfield: the array has 8 entries */
+    GYOEI_ACTOR* gyoei = (GYOEI_ACTOR*)aGYO_ctrlActor;
+    int i;
+
+    if (gyoei == NULL || entity_id == 0) {
+        return 0;
+    }
+    for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        if (gyoei->ctrl[i].exist && (u32)gyoei->ctrl[i]._1F8 == entity_id) {
+            const ACTOR* a = (const ACTOR*)&gyoei->ctrl[i];
+            out6[0] = a->world.position.x;
+            out6[1] = a->world.position.y;
+            out6[2] = a->world.position.z;
+            out6[3] = a->home.position.x;
+            out6[4] = a->home.position.y;
+            out6[5] = a->home.position.z;
+            out6[6] = (float)gyoei->ctrl[i].action;
+            out6[7] = (float)a->state_bitfield;
+            *bx = a->block_x;
+            *bz = a->block_z;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int aGYO_pc_find_entity(u32 entity_id, ACTOR** out) {
+    GYOEI_ACTOR* gyoei = (GYOEI_ACTOR*)aGYO_ctrlActor;
+    int i;
+
+    if (gyoei == NULL || entity_id == 0) {
+        return 0;
+    }
+    for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        if (gyoei->ctrl[i].exist && (u32)gyoei->ctrl[i]._1F8 == entity_id) {
+            *out = (ACTOR*)&gyoei->ctrl[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int aGYO_pc_entity_state(u32 entity_id, float* xyz, s16* angle, int* action) {
+    ACTOR* a;
+
+    if (!aGYO_pc_find_entity(entity_id, &a)) {
+        return 0;
+    }
+    xyz[0] = a->world.position.x;
+    xyz[1] = a->world.position.y;
+    xyz[2] = a->world.position.z;
+    *angle = a->world.angle.y;
+    *action = ((aGYO_CTRL_ACTOR*)a)->action;
     return 1;
 }
 

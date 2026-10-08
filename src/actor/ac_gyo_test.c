@@ -3,6 +3,9 @@
 #include "m_common_data.h"
 #include "m_player_lib.h"
 #include "ac_uki.h"
+#ifdef TARGET_PC
+#include "pc_wildlife_authority.h" /* host-authoritative wildlife simulation: remote players / bobbers as AI inputs, client driven mode */
+#endif
 
 enum {
     aGTT_ACTION_SWIM,
@@ -297,9 +300,40 @@ static f32 aGTT_Get_water_surface_position_y(xyz_t pos) {
     return ret - 8.0f;
 }
 
+static int aGTT_search_Uki_one(ACTOR* actorx, GAME* game, UKI_ACTOR* uki); /* 1 = target found, 0 = none, -1 = it scared the fish off */
+
 static int aGTT_search_Uki(ACTOR* actorx, GAME* game) {
     aGYO_CTRL_ACTOR* gyo = (aGYO_CTRL_ACTOR*)actorx;
-    GAME_PLAY* play;
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    UKI_ACTOR* local_uki = (UKI_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_UKI, ACTOR_PART_BG);
+#ifdef TARGET_PC
+    if (pcwld_sim_is_client() && pcwld_fish_is_driven(actorx)) {
+        gyo->linked_actor = (ACTOR*)local_uki;
+        return FALSE; /* the HOST decides which bobber a fish goes for (BOBBER_EVENT NEAR_TOUCH) */
+    }
+    if (pcwld_sim_is_host()) {
+        void* remote[8];
+        int n = pcwld_remote_bobbers(remote, 8);
+        int i;
+        int r = aGTT_search_Uki_one(actorx, game, local_uki);
+        if (r != 0) {
+            return r > 0 ? TRUE : FALSE;
+        }
+        for (i = 0; i < n; i++) {
+            r = aGTT_search_Uki_one(actorx, game, (UKI_ACTOR*)remote[i]);
+            if (r != 0) {
+                return r > 0 ? TRUE : FALSE;
+            }
+        }
+        gyo->linked_actor = (ACTOR*)local_uki;
+        return FALSE;
+    }
+#endif
+    return aGTT_search_Uki_one(actorx, game, local_uki) > 0 ? TRUE : FALSE;
+}
+
+static int aGTT_search_Uki_one(ACTOR* actorx, GAME* game, UKI_ACTOR* uki) {
+    aGYO_CTRL_ACTOR* gyo = (aGYO_CTRL_ACTOR*)actorx;
     f32 target_dist;
     f32 target_y;
     f32 escape_dist;
@@ -308,11 +342,9 @@ static int aGTT_search_Uki(ACTOR* actorx, GAME* game) {
     s16 search_area;
     int ret;
 
-    play = (GAME_PLAY*)game;
     search_area = gyoei_type[gyo->gyo_type].search_area;
     ret = FALSE;
     {
-        UKI_ACTOR* uki = (UKI_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_UKI, ACTOR_PART_BG);
         gyo->linked_actor = (ACTOR*)uki;
         if (uki != NULL) {
             target_dist = search_position_distance(&actorx->world.position, &uki->actor_class.world.position);
@@ -329,6 +361,7 @@ static int aGTT_search_Uki(ACTOR* actorx, GAME* game) {
             if (uki->hit_water_flag && target_dist < escape_dist) {
                 aGTT_set_angle(actorx, target_angle + DEG2SHORT_ANGLE2(180.0f));
                 aGTT_setupAction(gyo, aGTT_ACTION_ESCAPE);
+                ret = -1;
             } else {
                 int rod_type = aGYO_get_uki_type();
 
@@ -356,6 +389,16 @@ static int aGTT_player_near(ACTOR* actorx, GAME* game) {
     dist = search_position_distance(&actorx->world.position, &playerx->world.position);
     target_angle = search_position_angleY(&actorx->world.position, &playerx->world.position);
 
+    int remote_scare = FALSE;
+#ifdef TARGET_PC
+    if (pcwld_sim_is_host()) {
+        int16_t remote_angle = 0;
+        if (pcwld_remote_scare(actorx->world.position.x, actorx->world.position.z, &remote_angle)) {
+            target_angle = remote_angle; /* a connected player scares it: flee from THAT player */
+            remote_scare = TRUE;
+        }
+    }
+#endif
     if (
         // clang-format off
         ((dist < 110.0f && mPlib_get_player_actor_main_index(game) == mPlayer_INDEX_DASH) ||
@@ -364,7 +407,7 @@ static int aGTT_player_near(ACTOR* actorx, GAME* game) {
             mPlib_Check_StopNet(&pos) ||
             mPlib_Check_HitScoop(&pos)
         ))) ||
-        gyo->escape_flag
+        gyo->escape_flag || remote_scare
         // clang-format on
     ) {
         aGTT_set_angle(actorx, target_angle + DEG2SHORT_ANGLE2(180.0f));
@@ -583,13 +626,21 @@ static void aGTT_touch(ACTOR* actorx, GAME* game) {
         aGTT_set_angle(actorx, angle);
         target_dist = search_position_distance(&actorx->world.position, &uki->actor_class.world.position);
 
-        if (target_dist < aGTT_touch_distance[gyo->size_type]) {
+        if (target_dist < aGTT_touch_distance[gyo->size_type]
+#ifdef TARGET_PC
+            && !(pcwld_sim_is_client() && pcwld_fish_is_driven(actorx)) /* the host decides when a fish nibbles / bites (BOBBER_EVENT) */
+#endif
+        ) {
             if ((aGTT_random_check(4.0f) != FALSE && (aGYO_check_fall(gyo) == TRUE)) || DECREMENT_TIMER(gyo->touch_counter) == 0) {
                 if (uki->gyo_status == 2) {
                     uki->gyo_command = 2;
 
                     // If a free space exists, 1/20 chance of switching the fish out for trash
-                    if (mPlib_Get_space_putin_item() >= 0 && aGTT_random_check(20.0f) != 0) {
+                    if (
+#ifdef TARGET_PC
+                        !pcwld_uki_is_proxy(uki) && /* a remote angler rolls the trash itself, against ITS pockets, when it receives the BITE */
+#endif
+                        mPlib_Get_space_putin_item() >= 0 && aGTT_random_check(20.0f) != 0) {
                         static int gomi[] = { aGYO_TYPE_EMPTY_CAN, aGYO_TYPE_EMPTY_CAN, aGYO_TYPE_BOOT, aGYO_TYPE_BOOT, aGYO_TYPE_BOOT, aGYO_TYPE_OLD_TIRE, aGYO_TYPE_OLD_TIRE, aGYO_TYPE_OLD_TIRE };
 
                         gyo->gyo_type = gomi[gyo->size_type];
@@ -870,3 +921,68 @@ static void aGTT_actor_move(ACTOR* actorx, GAME* game) {
         gyo->gyo_flags |= 0x20;
     }
 }
+
+#ifdef TARGET_PC
+int aGTT_pc_action(const ACTOR* fish) {
+    return ((const aGYO_CTRL_ACTOR*)fish)->action;
+}
+
+/* A CLIENT applies a fish event the HOST decided to this client's own bobber, so the vanilla bobber / fish code plays the nibble, bite and hook animations. The decisions themselves
+ * (which bobber, when it nibbles, when it bites) were made by the host's copy of the same AI against this player's bobber (a proxy). ev = PCWLD_BEV_*. */
+int aGTT_pc_apply_bobber_event(ACTOR* fish, ACTOR* uki_actor, int ev, int gyo_type, float x, float y, float z, s16 angle) {
+    aGYO_CTRL_ACTOR* gyo = (aGYO_CTRL_ACTOR*)fish;
+    UKI_ACTOR* uki = (UKI_ACTOR*)uki_actor;
+
+    switch (ev) {
+        case PCWLD_BEV_NEAR_TOUCH:
+            if (uki->gyo_status != 1) {
+                return 0; /* the bobber is busy (the vanilla aGTT_near makes the same test) */
+            }
+            fish->world.position.x = x;
+            fish->world.position.y = y;
+            fish->world.position.z = z;
+            fish->world.angle.y = angle;
+            fish->shape_info.rotation.y = angle;
+            gyo->linked_actor = uki_actor;
+            gyo->gyo_flags |= 2;
+            uki->gyo_command = 1;
+            uki->gyo_type = gyo->gyo_type;
+            uki->child_actor = fish;
+            uki->actor_class.world.angle.y = fish->world.angle.y;
+            uki->actor_class.shape_info.rotation.y = fish->shape_info.rotation.y;
+            aGTT_setupAction(gyo, aGTT_ACTION_TOUCH);
+            return 1;
+        case PCWLD_BEV_NUDGE:
+            if (gyo->action != aGTT_ACTION_TOUCH) {
+                return 0;
+            }
+            uki->touched_flag = TRUE;
+            gyo->work0 = (int)((aGTT_touch_count[gyo->size_type] + RANDOM2_F(30.0f)) * 2.0f);
+            fish->speed = aGTT_back_speed[gyo->size_type] + RANDOM2_F(0.2f);
+            return 1;
+        case PCWLD_BEV_BITE:
+            if (gyo->action != aGTT_ACTION_TOUCH || uki->gyo_status != 2) {
+                return 0;
+            }
+            uki->gyo_command = 2;
+            if (mPlib_Get_space_putin_item() >= 0 && aGTT_random_check(20.0f) != 0) { /* the same 1/20 trash roll as aGTT_touch(), against THIS player's pockets */
+                static int gomi[] = { aGYO_TYPE_EMPTY_CAN, aGYO_TYPE_EMPTY_CAN, aGYO_TYPE_BOOT, aGYO_TYPE_BOOT, aGYO_TYPE_BOOT, aGYO_TYPE_OLD_TIRE, aGYO_TYPE_OLD_TIRE, aGYO_TYPE_OLD_TIRE };
+
+                gyo->gyo_type = gomi[gyo->size_type];
+                uki->gyo_type = gyo->gyo_type;
+            }
+            aGTT_setupAction(gyo, aGTT_ACTION_BITE);
+            return 1;
+        case PCWLD_BEV_RELEASE:
+            if (gyo->action == aGTT_ACTION_TOUCH || gyo->action == aGTT_ACTION_BITE || gyo->action == aGTT_ACTION_NEAR) {
+                uki->gyo_command = 0;
+                gyo->linked_actor = NULL;
+                gyo->gyo_flags &= ~2;
+                aGTT_setupAction(gyo, aGTT_ACTION_ESCAPE);
+                return 1;
+            }
+            return 0;
+    }
+    return 0;
+}
+#endif

@@ -526,7 +526,7 @@ int g_pc_bury_test_seed = 0;
  * pc_platform.h's own doc comment on this global for why it is a persistent MODE flag (like --host/
  * --connect) rather than a one-shot TEST trigger, and exactly what falls through to pre-T0 vanilla
  * behavior when it is not passed. */
-int g_pc_authoritative_wildlife = 0;
+int g_pc_authoritative_wildlife = 1; /* ON by default for a hosting process; --no-authoritative-wildlife turns it off (single player never uses it) */
 
 /* Furniture sync (Stage 1): --house-sync (HOST decides, like --authoritative-wildlife; announced to every client in HOST_CONFIG byte 1 bit 0). Off by
  * default: without it nothing about player houses is networked and no client gate is armed. TEST-ONLY: --house-test-host-in-house H (the host treats
@@ -1625,13 +1625,9 @@ int main(int argc, char* argv[]) {
             printf("  --no-house-sync     HOST: turn OFF furniture / house sync, which every host enables by default.\n");
             printf("  --house-sync        HOST: the host is authoritative for the furniture of player houses (the owner's edits are committed to the host together with the pocket record;\n");
             printf("                      announced to every client in HOST_CONFIG). This is the DEFAULT for every --host (dedicated or not); --no-house-sync disables it.\n");
-            printf("  --authoritative-wildlife  Opt-in MODE flag (persistent, like --host/--connect --\n");
-            printf("                      not a one-shot test hook): activates the host-authoritative\n");
-            printf("                      fish/bug spawn adapter (pc_wildlife_authority.c). Off by default;\n");
-            printf("                      without it, every role spawns wildlife locally exactly as before\n");
-            printf("                      this milestone -- see pc_platform.h and ac_set_manager.c.\n");
-            printf("                      HOST decides: the host announces the mode to every client at READY\n");
-            printf("                      (TOWN_SVC_STATE service 4); on a CLIENT the flag is ignored.\n");
+            printf("  --no-authoritative-wildlife  HOST: turn OFF the shared wildlife. By default (and with the old --authoritative-wildlife) a HOST owns the town's fish and bugs:\n");
+            printf("                      the host runs the vanilla spawn decision, clients show the host's creatures, one catch per creature. With this flag every process spawns its own, as\n");
+            printf("                      before. The host announces the mode to every client at READY (TOWN_SVC_STATE service 4); on a CLIENT the flag is ignored; single player never uses it.\n");
             printf("  --force-villager-grow    Host-only test hook: force a villager to grow in once the\n");
             printf("                      world is ready, bypassing the real (multi-day) trigger condition\n");
             printf("                      only -- see pc_net_game.c.\n");
@@ -2017,8 +2013,10 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--dedicated") == 0) {
             g_pc_dedicated = 1;
             pc_dedicated_early_console(); /* attach/allocate a console now so even the refusal text below is visible (valid redirected handles are kept) */
+        } else if (strcmp(argv[i], "--no-authoritative-wildlife") == 0) {
+            g_pc_authoritative_wildlife = 0; /* a HOST then lets every process roll its own vanilla fish / bugs again (clients follow the host's HOST_CONFIG) */
         } else if (strcmp(argv[i], "--authoritative-wildlife") == 0) {
-            g_pc_authoritative_wildlife = 1;
+            g_pc_authoritative_wildlife = 1; /* the default; kept for old command lines */
         } else if (strcmp(argv[i], "--house-sync") == 0) {
             g_pc_house_sync = 1;
             s_house_sync_explicit = 1;

@@ -225,6 +225,19 @@ int aGYO_pc_handle_wildlife_despawn(u32 entity_id);
  * function's caller (pcwld_handle_wildlife_despawn(), pc_wildlife_authority.c) for the exact pattern.
  * A no-op if aGYO_ctrlActor is NULL (no fish-actor pool exists at all right now). */
 void aGYO_pc_clear_all_entity_stamps(void);
+
+/* 1 iff a live local fish actor currently carries entity_id's stamp (aGYO_pc_stamp_entity_id()). Used to decide whether a replayed WILDLIFE_SPAWN for an entity this process already
+ * knows must re-create the actor (vanilla culls a fish that is far from the player) or is a duplicate of a fish that is still there. */
+int aGYO_pc_entity_alive(u32 entity_id);
+
+/* diagnostics: out6 = world xyz + home xyz of the live fish actor stamped with entity_id, plus its block_x / block_z; 0 when there is none. */
+int aGYO_pc_entity_position(u32 entity_id, float* out6, int* bx, int* bz);
+
+/* host-authoritative wildlife simulation (see pc_wildlife_authority.h): the live fish actor of an entity, its state (xyz, heading, vanilla action), and the bobber-event entry (ac_gyo_test.c). */
+int aGYO_pc_find_entity(u32 entity_id, ACTOR** out);
+int aGYO_pc_entity_state(u32 entity_id, float* xyz, s16* angle, int* action);
+int aGTT_pc_action(const ACTOR* fish);
+int aGTT_pc_apply_bobber_event(ACTOR* fish, ACTOR* uki, int ev, int gyo_type, float x, float y, float z, s16 angle);
 #endif /* TARGET_PC */
 
 #ifdef __cplusplus

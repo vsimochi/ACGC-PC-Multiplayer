@@ -388,7 +388,7 @@ def test_b(port, log_dir, results):
               "--force-bug-catch active:" in client_log, results)
         check("TEST B: client's catch was accepted and a real item was granted to its own pockets "
               "(pcnetgame_handle_client_catch_result(), the REAL production client-side grant seam)",
-              "accepted -- item" in client_log and "granted to a free pocket slot" in client_log, results)
+              "accepted -- item" in client_log and ("granted from the host transaction" in client_log or "granted to a free pocket slot" in client_log), results)
 
         host_peer_match = HOST_PEER_CATCH_RE.search(host_log)
         check("TEST B: host log shows a peer CATCH acceptance (removal) naming a specific entity_id",

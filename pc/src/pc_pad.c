@@ -53,6 +53,7 @@ BOOL PADInit(void) {
 }
 
 #include "pc_tool_wheel.h"
+#include "pc_net_game.h"
 #include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
 
 u32 PADRead(PADStatus* status) {
@@ -181,6 +182,13 @@ u32 PADRead(PADStatus* status) {
         wheel_kb = 0;
     }
 
+    { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_AUTOPILOT=1): an automated test plays through the real game code; 0 / zero stick otherwise */
+        signed char ax = 0, ay = 0;
+        const unsigned af = pc_net_game_test_autopilot_pad(&ax, &ay);
+        if (af & 1u) buttons |= PAD_BUTTON_A;
+        if (af & 2u) buttons |= PAD_BUTTON_RIGHT;
+        if (ax != 0 || ay != 0) { stickX = (s8)ax; stickY = (s8)ay; }
+    }
     pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
 
     if (pc_tool_wheel_is_open()) { /* the analog L/R triggers must not leak into the game while the wheel is up either */

@@ -5477,6 +5477,19 @@ int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out
     return 1;
 }
 
+int pc_remote_player_get_last_motion(PCNetPlayerId player_id, uint8_t* out_move_state, uint8_t* out_action_index) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    int newest;
+
+    if (slot == NULL || out_move_state == NULL || out_action_index == NULL || slot->snapshot_count == 0) {
+        return 0;
+    }
+    newest = (slot->snapshot_head - 1 + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    *out_move_state = slot->snapshots[newest].move_state;
+    *out_action_index = slot->snapshots[newest].action_valid ? slot->snapshots[newest].action_index : 0;
+    return 1;
+}
+
 /* Stage 3 diagnostic: periodically logs each tracked remote player's current (interpolated)
  * actor position, purely so movement replication can be verified from stdout/log output alone --
  * there is no other way to observe a remote actor's live state without a graphical session. Not

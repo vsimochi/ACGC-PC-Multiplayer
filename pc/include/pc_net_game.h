@@ -29,6 +29,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "pc_wildlife_authority.h" /* PcWldRemotePlayer (decomp-independent) */
 #include "pc_net.h" /* PC_NET_RESERVED_PEER_ID, pc_peer_* (the host wire id below is skipped by the peer allocator) */
 
 #ifdef __cplusplus
@@ -1152,6 +1153,8 @@ int  pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, 
 /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_ROOM_ENTER=<animal idx>,<enter ms>[,<talk start ms>,<talk end ms>[,<leave ms>[,<reenter ms>]]]): drives a real process into a villager's house, forces the
  * "talking" flag for a window, leaves and re-enters. pc_net_game_room_test_talking() = 1 inside the forced-talk window. */
 int pc_net_game_room_test_talking(void);
+/* TEST-ONLY autopilot (AC_TEST_HOOKS=1, AC_TEST_AUTOPILOT=1; see pc_net_game.c): called by PADRead; returns flags (bit0 = A, bit1 = D-pad right) and fills the stick. 0 / zero stick in normal play. */
+unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy);
 
 /* Event NPC authority (Patch 4). evnpc_synced: the allowlist of event NPC ids the host owns (Gulliver, K.K., the Wisp, the peddlers, ...). suppress_spawn: 1 on a READY client for such an id
  * (aNPC_setupActor_proc then creates nothing: the host's table drives the local actors). host_unbounded: 1 on the host for such an id (the event manager creates it without the
@@ -1223,6 +1226,9 @@ int pc_net_game_request_snowman_break(int ut_x, int ut_z);
  * below, in each case IN ADDITION TO (never instead of) the existing
  * pc_net_game_world_is_host_authoritative()/pc_net_game_role() checks. */
 int pc_net_game_authoritative_wildlife_enabled(void);
+
+/* HOST: the connected players the wildlife AI must consider (position, heading, dash / tool use from the newest MOVE sample), in the town scene only. See pc_wildlife_authority.h. */
+int pc_net_game_wildlife_remote_players(PcWldRemotePlayer* out, int max);
 
 /* Batch A (A1): the authoritative wildlife mode is decided by the HOST. A CLIENT adopts the mode from the host's TOWN_SVC_STATE service 4 (HOST_CONFIG,
  * sent at READY before the snapshot); its own --authoritative-wildlife is ignored. pc_net_game_authoritative_wildlife_enabled() therefore returns, for

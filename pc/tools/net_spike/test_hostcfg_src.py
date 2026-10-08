@@ -51,12 +51,12 @@ def main():
     check("A1 wire: the wire_baseline pins cover the new constants (TS_C_PINS + lib pins) and its self-test mutations for them exist",
           '"#define PC_NETGAME_TS_HOSTCFG  4u"' in read("pc/tools/net_spike/wire_baseline.py") and '"PC_NETGAME_TS_HOSTCFG_LEN": \'8\'' in read("pc/tools/net_spike/wire_baseline.py")
           and '"hostcfg service id"' in read("pc/tools/net_spike/wire_baseline.py"))
-    check("A1 the host flag's DEFAULT stays OFF (int g_pc_authoritative_wildlife = 0;) and the CLI parse only ever sets it to 1",
-          "int g_pc_authoritative_wildlife = 0;" in main_c and len(re.findall(r"g_pc_authoritative_wildlife = ", main_c)) == 2)
+    check("A1 the host flag's DEFAULT is ON (int g_pc_authoritative_wildlife = 1;): --no-authoritative-wildlife sets 0, the old --authoritative-wildlife sets 1; solo never uses it (the predicate returns 0 outside a host / client)",
+          "int g_pc_authoritative_wildlife = 1;" in main_c and len(re.findall(r"g_pc_authoritative_wildlife = ", main_c)) == 3 and '"--no-authoritative-wildlife"' in main_c)
     # ------------------------------------------------------------------ A1 host
     build = func_body(c, "pcnetgame_ts_build")
     check("A1 host: service 4 blob = 8 bytes, byte 0 = the host's own flag (0/1), the rest zero (memset), len 8; refreshed with the other services (digest / seq like them)",
-          "svc == (int)PC_NETGAME_TS_HOSTCFG" in build and "memset(blob, 0, PC_NETGAME_TS_HOSTCFG_LEN);" in build and "blob[0] = g_pc_authoritative_wildlife ? 1u : 0u;" in build
+          "svc == (int)PC_NETGAME_TS_HOSTCFG" in build and "memset(blob, 0, PC_NETGAME_TS_HOSTCFG_LEN);" in build and "blob[0] = pcnetgame_wildlife_auth_on() ? 1u : 0u;" in build
           and "pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);" in func_body(c, "pcnetgame_ts_refresh_all"))
     check("A1 host: the tick push loop covers service 4 (retry on a failed send / change), and HOST_CONFIG is pushed at READY BEFORE pcnetgame_host_start_snapshot",
           "svc <= (int)PC_NETGAME_TS_EVENT; svc++" in func_body(c, "pcnetgame_host_ts_push_peer")  # events: the loop bound is now service 5
@@ -75,8 +75,8 @@ def main():
           "client-originated TOWN_SVC_STATE" in c and hd.lstrip().startswith("PCNetGameTownSvcStateMsg m;") and "s_client_link != PC_NETGAME_LINK_READY" in hd[:300])
     gate = func_body(c, "pcnetgame_wildlife_auth_on")
     check("A1 the ONE predicate: a CLIENT follows s_client_wildlife_mode == 1 (own flag ignored), host / solo use g_pc_authoritative_wildlife; mode starts at -1 (unknown) and is reset to -1 at start_client",
-          "s_role == PC_NETGAME_ROLE_CLIENT" in gate and "return s_client_wildlife_mode == 1;" in gate and "return g_pc_authoritative_wildlife ? 1 : 0;" in gate
-          and "static int8_t                   s_client_wildlife_mode = -1;" in c and "s_client_wildlife_mode = -1; /* batch A (A1)" in func_body(c, "pc_net_game_start_client"))
+          "s_role == PC_NETGAME_ROLE_CLIENT" in gate and "return s_client_wildlife_mode == 1;" in gate and "return g_pc_authoritative_wildlife ? 1 : 0;" in gate and "s_role == PC_NETGAME_ROLE_HOST" in gate and "return 0; /* single player" in gate
+          and "static int8_t                   s_client_wildlife_mode = -1;" in c and "s_client_wildlife_mode = -1; /* batch A (A1)" in c)  # the reset lives in pcnetgame_client_begin_attempt() since the reconnect work
     code_refs = [m.start() for m in re.finditer(r"g_pc_authoritative_wildlife", cs)]
     allowed = ["pcnetgame_wildlife_auth_on", "pcnetgame_ts_build", "pcnetgame_client_wildlife_mode_apply", "pc_net_game_start_client"]
     bad = []
@@ -87,7 +87,7 @@ def main():
         if name not in allowed:
             bad.append(name)
     check("A1 NO wildlife gate of pc_net_game.c reads g_pc_authoritative_wildlife directly any more (only the predicate, the host blob builder, the adopt log and the start_client log; bad: %s)" % bad,
-          not bad and len(code_refs) == 4 and cs.count("pcnetgame_wildlife_auth_on()") >= 14)
+          not bad and len(code_refs) == 3 and cs.count("pcnetgame_wildlife_auth_on()") >= 14)
     check("A1 pc_net_game_authoritative_wildlife_enabled() returns the predicate; pc_net_game_wildlife_mode_pending() == CLIENT && mode < 0; both declared",
           "return pcnetgame_wildlife_auth_on();" in func_body(c, "pc_net_game_authoritative_wildlife_enabled")
           and "return s_role == PC_NETGAME_ROLE_CLIENT && s_client_wildlife_mode < 0;" in func_body(c, "pc_net_game_wildlife_mode_pending")
@@ -103,8 +103,8 @@ def main():
           "if (prev >= 0 && prev != (int)s_client_wildlife_mode) {" in ap and all(x in ap for x in ("pcwld_presentation_reset();", "pcwld_clear_local_actor_stamps();",
                                                                                                "s_client_wildlife_known_generation = 0;", "s_client_wildlife_snap_active = 0;"))
           and "Actor_delete" not in ap and "destruct" not in ap)
-    check("A1 the host's own gates are unchanged semantically: the host (and solo) take the flag branch of the predicate",
-          "return g_pc_authoritative_wildlife ? 1 : 0;" in gate)
+    check("A1 the host takes the flag branch of the predicate (ON by default); single player is OFF whatever the flag says",
+          "return g_pc_authoritative_wildlife ? 1 : 0;" in gate and "return 0; /* single player" in gate)
     # ------------------------------------------------------------------ A2
     hook = func_body(c, "pc_net_game_host_remote_player_in_acre")
     hs = strip_comments(hook)

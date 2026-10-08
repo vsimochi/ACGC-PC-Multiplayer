@@ -128,6 +128,10 @@ int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, fl
  * (returns 0). */
 int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out_angle);
 
+/* The newest accepted sample's coarse move state (PCMoveState), the sender's mPlayer_INDEX_* main index (0 when unknown) - same sample as the two getters above. The host's
+ * wildlife AI uses it to see a remote player dash / swing a net, an axe or a shovel. */
+int pc_remote_player_get_last_motion(PCNetPlayerId player_id, uint8_t* out_move_state, uint8_t* out_action_index);
+
 /* M9-A: per-player scene presence (see PCNetPlayerScene, pc_net_game.h), stored in the same per-slot state as
  * everything else about a remote player and therefore cleared by the same paths (on_ready, on_disconnect,
  * relay-liveness timeout, shutdown). on_scene() returns 1 and stores it iff `scene` is valid and its seq is
