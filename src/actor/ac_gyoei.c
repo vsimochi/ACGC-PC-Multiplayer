@@ -71,6 +71,17 @@ static void aGYO_actor_dt(ACTOR* actorx, GAME* game) {
     int i;
     aGYO_CTRL_ACTOR* ctrl = gyoei->ctrl;
 
+#ifdef TARGET_PC
+    /* The controller (and with it every fish ctrl slot) is about to be freed with the town scene. A fish that is still alive never passes through aGYO_destruct(), so a remote
+     * angler's bobber proxy that still has it tied would keep a pointer into this storage (and a non-zero gyo_command that stops the proxy from being released). Let go of them now,
+     * before the storage becomes invalid. */
+    for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        if (ctrl[i].exist) {
+            pcwld_fish_destroyed(&ctrl[i]);
+        }
+    }
+#endif
+
     for (i = 0; i < aGYO_MAX_GYOEI; i++) {
         if (ctrl->overlay_p != NULL) {
             ctrl->overlay_p = NULL;
@@ -265,6 +276,31 @@ int aGYO_pc_entity_state(u32 entity_id, float* xyz, s16* angle, int* action) {
     return 1;
 }
 
+/* diagnostics (the autopilot's `pres` command): how many live fish actors carry entity_id's stamp, and how many fish actors are alive in all */
+int aGYO_pc_stamp_count(u32 entity_id) {
+    GYOEI_ACTOR* gyoei = (GYOEI_ACTOR*)aGYO_ctrlActor;
+    int i, n = 0;
+    if (gyoei == NULL || entity_id == 0) {
+        return 0;
+    }
+    for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        n += (gyoei->ctrl[i].exist && (u32)gyoei->ctrl[i]._1F8 == entity_id) ? 1 : 0;
+    }
+    return n;
+}
+
+int aGYO_pc_live_fish_count(void) {
+    GYOEI_ACTOR* gyoei = (GYOEI_ACTOR*)aGYO_ctrlActor;
+    int i, n = 0;
+    if (gyoei == NULL) {
+        return 0;
+    }
+    for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        n += gyoei->ctrl[i].exist ? 1 : 0;
+    }
+    return n;
+}
+
 void aGYO_pc_clear_all_entity_stamps(void) {
     GYOEI_ACTOR* gyoei = (GYOEI_ACTOR*)aGYO_ctrlActor;
     int i;
@@ -273,6 +309,12 @@ void aGYO_pc_clear_all_entity_stamps(void) {
         return;
     }
     for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        if (gyoei->ctrl[i].exist && gyoei->ctrl[i]._1F8 != 0) {
+            /* A fish of the SUPERSEDED session must not survive as an anonymous vanilla fish: it would be fishable with no authoritative record behind it. Retire it with the same
+             * cases a WILDLIFE_DESPAWN uses (deferred destroy, or let go of this process's own bobber before the point of no return; a fish already hooked is left alone and, with its
+             * stamp cleared below, a catch of it is denied -- see Player_actor_setup_main_Notice_rod()). */
+            (void)aGYO_pc_handle_wildlife_despawn((u32)gyoei->ctrl[i]._1F8);
+        }
         gyoei->ctrl[i]._1F8 = 0;
     }
 }

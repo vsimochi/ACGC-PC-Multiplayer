@@ -122,7 +122,7 @@ def cross(p, tries=6):
 
 def ensure_creature(S, who, kind):
     """a live fish (kind 0) / bug (kind 1) in the host's table; `who` walks in and out of acre (4,2) until the host rolled one"""
-    for _ in range(8):
+    for _ in range(16):
         e = live_kind(S, kind)
         if e:
             return e[-1]
@@ -191,14 +191,14 @@ def catch_fish(S, who, observers, tag):
     if who == "host":
         enter_acre(P, 4, 2)  # the host walks to the fish's acre like any player
     off = {w: len(S.log(w)) for w in ["host", "A", "B"] if w == "host" or w in S.clients}
-    ans = P.cmd("fish %d" % ent, 270)
+    ans = P.cmd("catch fish %d" % ent, 270)
     if ans is not None and "no local fish actor" in ans:
         # the fish swam out of the angler's range and its local copy was culled; walking back into its acre
         # makes the host replay it (the same thing a player walking back would see)
         L.info("%s: the fish left %s's range -- walking back to its acre and trying again" % (tag, who))
         enter_acre(P, 4, 2)
         time.sleep(3)
-        ans = P.cmd("fish %d" % ent, 270)
+        ans = P.cmd("catch fish %d" % ent, 270)
     check("%s %s hooked the fish with the real rod (%s)" % (tag, who, ans), ans is not None and " ok" in ans)
     P.cmd("mash 30", 60)  # dismiss the catch / item windows so the next step is not blocked behind a message
     time.sleep(3)
@@ -222,8 +222,11 @@ def net_catch(S, who, tag, exclude=()):
     check = S.check
     P = S.players[who]
     ent = None
-    for _ in range(8):
-        ents = [e for e in live_kind(S, 1) if e not in exclude]
+    dec_ = decisions(S.log("host"))
+    for _ in range(16):  # the target is a bug that sits on the ground (a flier at 170 units height cannot be netted by anyone)
+        dec_ = decisions(S.log("host"))
+        ents = sorted([e for e in live_kind(S, 1) if e not in exclude], key=lambda e: (dec_[e][1] not in CALM, e))
+        ents = ents[:1]
         if ents:
             ent = ents[-1]
             break
@@ -238,14 +241,11 @@ def net_catch(S, who, tag, exclude=()):
     live = sorted(P.bugs(), key=lambda b: (b[1] not in CALM, b[0]))
     live = [b for b in live if b[0] not in exclude]
     check("%s %s sees a live bug" % (tag, who), bool(live))
-    attempts = [b for b in live[:4] for _ in range(3)]  # a hopping bug can slip away from a swing: up to three tries per bug, like a player
+    attempts = [b for b in live[:4] for _ in range(2)]  # the auto-catch keeps re-acquiring the bug's CURRENT position itself; a second try only covers a bug that slipped away for good
     for (e, sp, bx, bz) in attempts:
-        cur = {b[0]: b for b in P.bugs()}.get(e)
-        if cur is None:
+        if e not in {b[0] for b in P.bugs()}:
             continue
-        P.cmd("tp %.1f %.1f" % (cur[2], cur[3] + 40), 20)
-        time.sleep(1.5)
-        ans = P.cmd("net %d" % e, 75)
+        ans = P.cmd("catch bug %d" % e, 90)
         if ans is None or " ok" not in ans:
             L.info("%s: no catch on bug %d (%s), trying again" % (tag, e, ans))
             continue
@@ -266,7 +266,7 @@ def net_catch(S, who, tag, exclude=()):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=12800)
-    ap.add_argument("--only", default="s1,f1,f2,f3,b1,b2,b3,r1,d1")
+    ap.add_argument("--only", default="s1,f1,f2,f3,b1,b2,b3,r1,r2,d1")
     args = ap.parse_args()
     results = []
     S = Session(args, results)
@@ -292,6 +292,8 @@ def main():
             net_catch(S, "host", "B3")
         if "r1" in only and "B" in S.clients:
             race(S)
+        if "r2" in only and "B" in S.clients:
+            race_fish(S)
         if "d1" in only and "B" in S.clients:
             disconnect(S)
     finally:
@@ -303,7 +305,7 @@ def race(S):
     check = S.check
     A, B = S.players["A"], S.players["B"]
     ent = None
-    for _ in range(8):
+    for _ in range(16):
         mine = sorted(A.bugs(), key=lambda t: (t[1] not in CALM, t[0]))
         if not mine:
             cross(A)
@@ -320,29 +322,42 @@ def race(S):
     check("R1 A and B both see the same live bug", ent is not None)
     if ent is None:
         return
-    for _try in range(4):  # a hopping bug can slip out of a swing: both players swing again, like real players
-        cur = {x_[0]: x_ for x_ in A.bugs()}.get(ent)
-        if cur is None:
-            break
-        _e, sp, x, z = cur
-        for w, side in (("A", 40), ("B", -40)):
-            S.players[w].cmd("tp %.1f %.1f" % (x, z + side), 20)
-            S.players[w].cmd("dpad", 20)
-        time.sleep(1.5)
-        ca, cb = A.send("net %d" % ent), B.send("net %d" % ent)
-        ra, rb = A.wait(ca, 75), B.wait(cb, 75)
-        L.info("A: %s | B: %s" % (ra, rb))
-        A.cmd("mash 10", 30)
-        B.cmd("mash 10", 30)
-        if re.search(r"peer \d+ CATCH entity %d .*accepted -- removed" % ent, S.log("host")):
-            break
+    race_both(S, "R1", "bug", ent)
+
+
+def race_fish(S):
+    check = S.check
+    ent = ensure_creature(S, "A", 0)
+    check("R2 a live fish exists", ent is not None)
+    if ent is None:
+        return
+    for w in ("A", "B"):
+        S.players[w].cmd("mash 6", 20)
+        enter_acre(S.players[w], 4, 2)
+    race_both(S, "R2", "fish", ent)
+
+
+def race_both(S, tag, kind, ent):
+    """A and B both auto-catch entity ENT at (nearly) the same moment: the command files are written back to back, nothing serializes them"""
+    check = S.check
+    A, B = S.players["A"], S.players["B"]
+    ca, cb = A.send("catch %s %d" % (kind, ent)), B.send("catch %s %d" % (kind, ent))
+    ra, rb = A.wait(ca, 300), B.wait(cb, 300)
+    L.info("%s: A: %s | B: %s" % (tag, ra, rb))
+    verdicts = [("ok" if (r and " ok" in r) else ("rejected" if (r and " rejected" in r) else ("gone" if (r and " gone" in r) else "fail"))) for r in (ra, rb)]
+    check("%s exactly one of the two auto-catches succeeded (A: %s, B: %s)" % (tag, verdicts[0], verdicts[1]), verdicts.count("ok") == 1 and all(v in ("ok", "rejected", "gone") for v in verdicts))
+    A.cmd("mash 6", 20)
+    B.cmd("mash 6", 20)
     time.sleep(2)
     hl = S.log("host")
     acc = re.findall(r"peer (\d+) CATCH entity %d .*accepted -- removed" % ent, hl)
-    check("R1 the host accepted exactly ONE of the two catches of entity %d (peers %s)" % (ent, acc), len(acc) == 1)
+    check("%s the host accepted exactly ONE of the two catches of entity %d (peers %s)" % (tag, ent, acc), len(acc) == 1)
     grants = sum(len(re.findall(r"CATCH request \d+ \(entity %d\) accepted -- item 0x[0-9A-F]+ granted" % ent, S.log(w))) for w in ("A", "B"))
-    check("R1 exactly one item was granted in total (%d)" % grants, grants == 1)
-    check("R1 the bug is gone from the host's table", ent not in table_now(S))
+    check("%s exactly one item was granted in total (%d)" % (tag, grants), grants == 1)
+    check("%s the entity is gone from the host's table" % tag, ent not in table_now(S))
+    despawns = len(re.findall(r"WILDLIFE_DESPAWN[^\n]*entity %d\b|despawn[^\n]*entity %d\b" % (ent, ent), hl))
+    for w in ("A", "B"):
+        check("%s %s no longer shows entity %d" % (tag, w, ent), ent not in {x[0] for x in S.players[w].bugs()} if kind == "bug" else True)
 
 
 def disconnect(S):

@@ -65,7 +65,7 @@ class Player:
         return self.wait(self.send(line), timeout)
 
     def wait(self, cid, timeout=60.0):
-        m = self.proc.wait_for_log(r"\[AUTO\] (?:done %d \S+ (ok|fail)[^\r\n]*|pos %d [^\r\n]*|tp %d [^\r\n]*|bugs %d\b[^\r\n]*|pres %d end)" % (cid, cid, cid, cid, cid), timeout)
+        m = self.proc.wait_for_log(r"\[AUTO\] (?:done %d \S+ (ok|fail|rejected|gone)[^\r\n]*|pos %d [^\r\n]*|tp %d [^\r\n]*|bugs %d\b[^\r\n]*|pres %d end|give %d [^\r\n]*|killfish %d [^\r\n]*|resetstamps %d done|pspawn %d [^\r\n]*|pdespawn %d [^\r\n]*|hspawn %d [^\r\n]*)" % (cid, cid, cid, cid, cid, cid, cid, cid, cid, cid, cid), timeout)
         return None if m is None else m.group(0)
 
     def pos(self):

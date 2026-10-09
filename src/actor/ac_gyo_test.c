@@ -97,6 +97,21 @@ static int aGYO_get_uki_type(void) {
     return ret;
 }
 
+#ifdef TARGET_PC
+/* The rod that judges `uki`: a remote angler's proxy bobber is judged with THAT angler's rod, the local player's own bobber with the local rod. */
+static int aGYO_get_uki_type_for(const UKI_ACTOR* uki) {
+    if (uki != NULL) {
+        const int t = pcwld_proxy_rod_type(uki);
+        if (t >= 0) {
+            return t == 0 ? aGYO_ROD_NORMAL : aGYO_ROD_GOLDEN;
+        }
+    }
+    return aGYO_get_uki_type();
+}
+#else
+#define aGYO_get_uki_type_for(uki) aGYO_get_uki_type()
+#endif
+
 static void aGTT_speed_reset(ACTOR* actorx) {
     actorx->speed = 0.0f;
     actorx->max_velocity_y = 0.0f;
@@ -363,7 +378,7 @@ static int aGTT_search_Uki_one(ACTOR* actorx, GAME* game, UKI_ACTOR* uki) {
                 aGTT_setupAction(gyo, aGTT_ACTION_ESCAPE);
                 ret = -1;
             } else {
-                int rod_type = aGYO_get_uki_type();
+                int rod_type = aGYO_get_uki_type_for(uki);
 
                 if ((gyo->gyo_flags & 1) == 0 && uki->cast_timer == 0 &&
                     target_dist < aGYO_search_area[rod_type][search_area] && fabsf(target_y) < 10.0f &&
@@ -583,7 +598,7 @@ static void aGTT_near(ACTOR* actorx, GAME* game) {
     s16 angle_y;
     UKI_ACTOR* uki = (UKI_ACTOR*)gyo->linked_actor;
     s16 search_area = gyoei_type[gyo->gyo_type].search_area;
-    int rod_type = aGYO_get_uki_type();
+    int rod_type = aGYO_get_uki_type_for(uki);
     
     angle_y = search_position_angleY(&actorx->world.position, &uki->actor_class.world.position);
     aGTT_set_angle(actorx, angle_y);
@@ -856,7 +871,7 @@ static void aGTT_touch_init(aGYO_CTRL_ACTOR* gyo) {
 }
 
 static void aGTT_bite_init(aGYO_CTRL_ACTOR* gyo) {    
-    gyo->work0 = (int)(aGYO_bite_time[aGYO_get_uki_type()][gyoei_type[gyo->gyo_type].bite_time] * 2.0f);
+    gyo->work0 = (int)(aGYO_bite_time[aGYO_get_uki_type_for((const UKI_ACTOR*)gyo->linked_actor)][gyoei_type[gyo->gyo_type].bite_time] * 2.0f);
     gyo->swork0 = 3;
     aGTT_speed_reset((ACTOR*)gyo);
 }
@@ -924,6 +939,9 @@ static void aGTT_actor_move(ACTOR* actorx, GAME* game) {
 
 #ifdef TARGET_PC
 int aGTT_pc_action(const ACTOR* fish) {
+    if (aGKK_pc_is_kaseki(fish)) {
+        return aGKK_pc_action(fish);
+    }
     return ((const aGYO_CTRL_ACTOR*)fish)->action;
 }
 
@@ -932,6 +950,10 @@ int aGTT_pc_action(const ACTOR* fish) {
 int aGTT_pc_apply_bobber_event(ACTOR* fish, ACTOR* uki_actor, int ev, int gyo_type, float x, float y, float z, s16 angle) {
     aGYO_CTRL_ACTOR* gyo = (aGYO_CTRL_ACTOR*)fish;
     UKI_ACTOR* uki = (UKI_ACTOR*)uki_actor;
+
+    if (aGKK_pc_is_kaseki(fish)) {
+        return aGKK_pc_apply_bobber_event(fish, uki_actor, ev, gyo_type, x, y, z, angle);
+    }
 
     switch (ev) {
         case PCWLD_BEV_NEAR_TOUCH:

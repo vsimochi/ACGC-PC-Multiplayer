@@ -146,6 +146,10 @@
 #include "pc_net_game.h"
 #include "pc_residence.h"   /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES: the one place that knows "4 resident slots, 4 houses" */
 #include "pc_test_hooks.h"  /* test-hook guard (PC_NET_TEST_HOOKS + env AC_TEST_HOOKS=1) */
+#ifdef PC_NET_TEST_HOOKS
+static uint32_t s_ac_result_entity; /* TEST-ONLY auto-catch: the last catch outcome this client received from the host */
+static int      s_ac_result;        /* 1 accepted, 2 rejected */
+#endif
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the dialogue-side helpers defined near the house purchase seam */
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
 #include "pc_adopt_clock.h" /* client record-adoption watchdog clock (scene lifecycle time does not count towards the 10 s) */
@@ -2098,7 +2102,8 @@ typedef struct PCNetGameBobberStateMsg {
     float    x, y, z;
     float    ux, uy, uz;
     int16_t  angle;
-    int16_t  _reserved0;
+    int16_t  seq; /* the sender's running count of BOBBER_STATE messages (never 0; a sender that leaves it 0 is not ordered): the host drops a message older than one it already applied, e.g. an
+                     unreliable 'active' that arrives after the reliable 'gone' of the same bobber (this was the always-0 reserved field, so the size and layout are unchanged) */
 } PCNetGameBobberStateMsg;
 _Static_assert(sizeof(PCNetGameBobberStateMsg) == 36, "PCNetGameBobberStateMsg wire size drifted");
 
@@ -7713,6 +7718,34 @@ static void pcnetgame_friendship_snapshot_redact(PCNetGameFriendshipSnapshotEntr
     memset(fe->letter, 0, sizeof(fe->letter));
 }
 
+#ifdef PC_NET_TEST_HOOKS
+static void pcnetgame_commit_catch_despawn(uint32_t entity_id);
+
+/* TEST-ONLY (host env AC_TEST_WLD_SNAPSHOT_RACE=1): once, right after the FIRST wildlife snapshot entry of a peer went out, the table changes under the walk: the record of slot 0 (already sent)
+ * is removed and announced gone, a new one is recorded (the freed slot 0, BEHIND the cursor), the record of slot 1 (not yet sent) is removed, and a new one is recorded (slot 1, ahead of the
+ * cursor). The peer must end up with exactly the two new records. */
+static void pcnetgame_test_wld_snapshot_race(void) {
+    static int done;
+    PcWildlifeRecord r0, r1;
+    uint32_t n0, n1;
+
+    if (done || pc_test_hook_getenv("AC_TEST_WLD_SNAPSHOT_RACE") == NULL) {
+        return;
+    }
+    done = 1;
+    if (!pcwld_get_by_slot(0, &r0) || !pcwld_get_by_slot(1, &r1)) {
+        return;
+    }
+    (void)pcwld_remove_by_id(r0.entity_id);
+    pcnetgame_commit_catch_despawn(r0.entity_id);
+    n0 = pcwld_test_host_inject(r0.species, r0.pos_x, r0.pos_z);
+    (void)pcwld_remove_by_id(r1.entity_id);
+    pcnetgame_commit_catch_despawn(r1.entity_id);
+    n1 = pcwld_test_host_inject(r1.species, r1.pos_x, r1.pos_z);
+    printf("[NET][WILDLIFE][RACE-TEST] during a snapshot walk: removed %u (sent) and %u (not yet sent), recorded %u (behind the cursor) and %u (ahead of it)\n", (unsigned)r0.entity_id, (unsigned)r1.entity_id, (unsigned)n0, (unsigned)n1);
+}
+#endif
+
 static void pcnetgame_host_pump_snapshots(void) {
     int i;
 
@@ -7855,6 +7888,11 @@ static void pcnetgame_host_pump_snapshots(void) {
                 }
                 st->snap_wildlife_sent_count++;
                 st->snap_next_wildlife_idx++;
+#ifdef PC_NET_TEST_HOOKS
+                if (st->snap_wildlife_sent_count == 1) {
+                    pcnetgame_test_wld_snapshot_race(); /* TEST-ONLY: wildlife changes in the middle of this peer's table walk */
+                }
+#endif
             } else if (st->snap_stage == 4) {
                 /* Friendship/mail sync milestone: one PCNetGameFriendshipSnapshotEntryMsg per
                  * OCCUPIED Anmmem_c entry, flat-iterated over (slot, memory_idx) pairs; empty
@@ -10509,6 +10547,7 @@ static void pcnetgame_handle_host_snowman_build_request(PCNetPeerId peer, const 
    (pcnetgame_commit_catch_despawn()) before that point in the file -- same forward-declaration shape
    already used elsewhere in this file for other later-defined helpers. */
 static void pcnetgame_broadcast_villager_msg(const void* msg, size_t msg_size);
+static void pcnetgame_broadcast_wildlife_msg(const void* msg, size_t msg_size);
 
 /* Broadcasts WILDLIFE_DESPAWN to every READY client (pcnetgame_broadcast_villager_msg() -- see that
  * function's own doc: peers mid-snapshot are skipped, since their own in-flight snapshot, built from the
@@ -10524,7 +10563,7 @@ static void pcnetgame_commit_catch_despawn(uint32_t entity_id) {
     memset(&msg, 0, sizeof(msg));
     msg.msg_type = (uint8_t)PC_NETGAME_MSG_WILDLIFE_DESPAWN;
     msg.entity_id = entity_id;
-    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+    pcnetgame_broadcast_wildlife_msg(&msg, sizeof(msg));
 
     pcwld_handle_wildlife_despawn(entity_id);
 }
@@ -24406,6 +24445,10 @@ static void pcnetgame_handle_client_txn_result(const PCNetGameTxnResultMsg* in) 
         pcnetgame_ts_op_resolve(T.kind, T.request_id, 0); /* town services: the UI seam gets "rejected" (give-back / refusal path) */
         if (T.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
             pcnetgame_txn_catch_outcome(&T, 0);
+#ifdef PC_NET_TEST_HOOKS
+            s_ac_result_entity = T.entity_id;
+            s_ac_result = 2;
+#endif
             printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) rejected by host -- no item granted\n", (unsigned)T.request_id,
                    (unsigned)T.entity_id);
         }
@@ -24443,6 +24486,10 @@ static void pcnetgame_handle_client_txn_result(const PCNetGameTxnResultMsg* in) 
                     mSM_COLLECT_INSECT_SET(T.claimed_species);
                 }
             }
+#ifdef PC_NET_TEST_HOOKS
+            s_ac_result_entity = T.entity_id;
+            s_ac_result = 1;
+#endif
             printf("[NET][WILDLIFE] client: CATCH request %u (entity %u) accepted -- item 0x%04X %s\n", (unsigned)T.request_id,
                    (unsigned)T.entity_id, (unsigned)T.tag.item, T.tag.dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET ? "granted from the host transaction" : "(full pockets, nothing granted)");
         }
@@ -32025,11 +32072,6 @@ void pc_net_game_poll(void) {
                judged (it simply re-derives its hit count fresh either way, but this keeps the ordering
                consistent with every other per-poll expiry tick in this function). */
             pcnetgame_host_check_tree_cut();
-            /* World Ecology T1 review fix: authoritative wildlife-table idle expiry -- host-only,
-             * same "before this poll's events" placement as the other per-poll expiry ticks above.
-             * See pcwld_host_check_idle()'s own doc (pc_wildlife_authority.c/.h) for the bug this
-             * closes. */
-            pcwld_host_check_idle();
             pcnetgame_host_check_wildlife_attendance();
         }
         /* World Ecology T1 review fix: local presentation-map idle expiry -- ANY role (a client
@@ -33684,6 +33726,31 @@ static void pcnetgame_broadcast_villager_msg(const void* msg, size_t msg_size) {
     }
 }
 
+/* WILDLIFE_SPAWN / WILDLIFE_DESPAWN fan-out. Like pcnetgame_broadcast_villager_msg(), except for a peer that is mid-snapshot: that peer is skipped only while its wildlife stage has NOT
+ * started (snap_stage < 3, or stage 3 before its WILDLIFE_SNAPSHOT_BEGIN) -- the table walk that follows will carry the current table. Once the walk has begun, entries are sent in table
+ * order, so a creature added behind the cursor or removed after its entry went out would be missed or left behind; the message goes out too (reliable and ordered after the entries
+ * already sent). The receiving handlers are idempotent (a SPAWN for a live entity is ignored, a DESPAWN for an unknown one is a no-op), and the client counts a SPAWN that arrives
+ * during the pass as named by it, so the final reconcile at the end of the pass leaves the peer's presentation equal to the current authoritative table. */
+static void pcnetgame_broadcast_wildlife_msg(const void* msg, size_t msg_size) {
+    int i;
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        int backlog;
+        if (s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (s_host_peer[i].snap_active && (s_host_peer[i].snap_stage < 3 || (s_host_peer[i].snap_stage == 3 && !s_host_peer[i].snap_wildlife_begin_sent))) {
+            continue;
+        }
+        backlog = pc_net_reliable_backlog((PCNetPeerId)i);
+        if (backlog < 0) {
+            continue;
+        }
+        if (backlog + 1 > PC_NET_RELIABLE_WINDOW - PC_NETGAME_WINDOW_HEADROOM || !pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, msg, (uint16_t)msg_size)) {
+            pcnetgame_host_start_snapshot((PCNetPeerId)i, "wildlife send failed");
+        }
+    }
+}
+
 /* See pc_net_game.h. Called from mNpc_InitNpcData() (m_npc.c), right after mNpc_SetNpcHome() has
  * finished assigning `slot`'s home_info -- Save_t.animals[slot] is fully populated by the time this
  * runs. A no-op for single-player and for a client (mirrors every other pc_net_game_notify_local_*()
@@ -34326,6 +34393,7 @@ static void pcnetgame_goto_test_hook(void) {
     printf("[NET][TEST-ONLY] goto %c %d: player parked at (%.1f, %.1f)%s", kind, slot, (double)pa->actor_class.world.position.x, (double)pa->actor_class.world.position.z, "\n");
 }
 
+#ifdef PC_NET_TEST_HOOKS
 /* TEST-ONLY AUTOPILOT (AC_TEST_HOOKS=1 and AC_TEST_AUTOPILOT=1): lets an automated test PLAY the game through the real player code instead of the --force-* shortcuts. It only injects
  * CONTROLLER INPUT at the single place the game reads one (PADRead -> pc_net_game_test_autopilot_pad): a stick direction and the A / D-pad-right buttons. The player actor, the tool
  * code (rod / net), the wade trigger, the catch seams are all the real, unmodified game. Commands arrive in the file `ac_auto.txt` of the working directory (one line `<id> <cmd> [args]`,
@@ -34352,13 +34420,83 @@ static struct {
     float    chk_x, chk_z;
     uint32_t chk_ms, detour_until;
     int      detour_dir, detours;
+    int      ac, ac_state, ac_fish; /* the `catch` command (auto-catch): on, current state, 1 = fish / 0 = bug */
+    uint32_t ac_log, ac_gone;
+    int      ac_cleaning; /* 1 = the attempt is over but the rod is still out: reel it in first; 2 = that is done, report now */
 } s_ap;
+static char s_ap_cleanup_text[24]; /* the verdict to report once the rod is put away */
 
 static char s_ap_file[160] = "ac_auto.txt"; /* AC_TEST_AUTOPILOT=<file> names the command file (several processes share one working directory); "1" = ac_auto.txt */
 
 static void pcnetgame_ap_done(const char* result, const char* detail) {
     printf("[AUTO] done %d %s %s %s\n", s_ap.id, s_ap.cmd, result, detail != NULL ? detail : "");
     s_ap.active = 0;
+}
+
+/* AUTO-CATCH: `catch fish|bug [ENTITY]` plays the REAL interaction (rod cast / bobber / bite / hook, or net swing) at a creature, re-acquiring its CURRENT position every tick, until the host answers the
+ * game's own CATCH request. It never grants an item or removes an entity itself: the catch request, the host's validation, the result and the despawn are the game's. ENTITY 0 / omitted = the nearest. */
+enum { AC_SEARCHING, AC_TARGET_FOUND, AC_MOVING, AC_IN_RANGE, AC_INTERACTING, AC_WAITING, AC_SUCCESS, AC_FAILURE };
+
+static void pcnetgame_ac_state(int st) {
+    static const char* const names[] = { "SEARCHING", "TARGET_FOUND", "MOVING_TO_TARGET", "IN_RANGE", "INTERACTING", "WAITING_FOR_RESULT", "SUCCESS", "FAILURE" };
+    if (!s_ap.ac || s_ap.ac_state == st) {
+        return;
+    }
+    s_ap.ac_state = st;
+    printf("[AUTO-CATCH] kind=%s entity=%u state=%s\n", s_ap.ac_fish ? "FISH" : "BUG", (unsigned)s_ap.entity, names[st]);
+}
+
+static uint32_t pcnetgame_ac_nearest(int fish, float px, float pz) {
+    uint32_t best = 0, e;
+    float bd = 1e30f, x, z;
+    int sp, i;
+    for (i = 0; (fish ? pcwld_test_live_fish(i, &e, &sp, &x, &z) : pcwld_test_live_bug(i, &e, &sp, &x, &z)); i++) {
+        const float d = (x - px) * (x - px) + (z - pz) * (z - pz);
+        if (d < bd) {
+            bd = d;
+            best = e;
+        }
+    }
+    return best;
+}
+
+/* the answer of an auto-catch: the host's verdict on THIS client's catch request for the target (ok = accepted, rejected = the host refused it, e.g. another player won the race) */
+static int pcnetgame_ap_rod_out(void) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    PLAYER_ACTOR* pa;
+    UKI_ACTOR* uki;
+    if (play == NULL || !pcfa_scene_is_town() || Now_Private == NULL) {
+        return 0;
+    }
+    pa = get_player_actor_withoutCheck(play);
+    uki = (UKI_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_UKI, ACTOR_PART_BG);
+    return (uki != NULL && uki->status != aUKI_STATUS_CARRY) || (pa != NULL && pa->now_main_index >= mPlayer_INDEX_READY_ROD && pa->now_main_index <= mPlayer_INDEX_PUTAWAY_ROD);
+}
+
+static void pcnetgame_ac_finish(const char* gone_text) {
+    const int got = (s_ac_result != 0 && s_ac_result_entity == s_ap.entity);
+    if (!got && s_ap.ac_fish && s_ap.ac_cleaning == 0 && pcnetgame_ap_rod_out()) {
+        /* the attempt ends without a verdict (the fish is gone, a timeout) while the rod is still out: the player would stay frozen in the rod state, so reel in first (stage 8) */
+        snprintf(s_ap_cleanup_text, sizeof(s_ap_cleanup_text), "%s", gone_text);
+        s_ap.ac_cleaning = 1;
+        s_ap.stage = 8;
+        s_ap.stage_ms = pcnetgame_now_ms();
+        s_ap.chk_ms = 0u;
+        return;
+    }
+    if (got && s_ac_result == 1) {
+        pcnetgame_ac_state(AC_SUCCESS);
+        printf("[AUTO-CATCH] kind=%s entity=%u result=SUCCESS\n", s_ap.ac_fish ? "FISH" : "BUG", (unsigned)s_ap.entity);
+        pcnetgame_ap_done("ok", "catch accepted by the host");
+    } else if (got) {
+        pcnetgame_ac_state(AC_FAILURE);
+        printf("[AUTO-CATCH] kind=%s entity=%u result=REJECTED\n", s_ap.ac_fish ? "FISH" : "BUG", (unsigned)s_ap.entity);
+        pcnetgame_ap_done("rejected", "the host refused the catch");
+    } else {
+        pcnetgame_ac_state(AC_FAILURE);
+        printf("[AUTO-CATCH] kind=%s entity=%u result=%s\n", s_ap.ac_fish ? "FISH" : "BUG", (unsigned)s_ap.entity, gone_text);
+        pcnetgame_ap_done(strcmp(gone_text, "GONE") == 0 ? "gone" : "fail", gone_text);
+    }
 }
 
 static int pcnetgame_ap_player_pos(float* x, float* z) {
@@ -34458,18 +34596,81 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             s_ap.active = 0;
         } else if (strcmp(cmd, "mash") == 0 && sscanf(line, "%*d %*s %f", &a) == 1) { /* press A about twice a second for `a` seconds (dismisses the catch dialogue) */
             s_ap.tx = a * 1000.0f;
+        } else if (strcmp(cmd, "killfish") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY: destroys this process's actor of fish ENT the way vanilla's cull does (deferred destroy flag) */
+            ACTOR* kf = NULL;
+            const int found = aGYO_pc_find_entity((u32)ent, &kf);
+            if (found) {
+                ((aGYO_CTRL_ACTOR*)kf)->gyo_flags |= 0x20;
+            }
+            printf("[AUTO] killfish %d entity %lu %s\n", id, ent, found ? "actor flagged for destruction" : "no such local actor");
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "hspawn") == 0) { /* TEST-ONLY, host: hspawn NAME|NUMBER X Z -- an authoritative fish of that species (seabass snapper coelacanth jellyfish knifejaw whale salmon2) */
+            char nm[24] = { 0 };
+            float fx = 0.0f, fz = 0.0f;
+            int sp = -1;
+            if (sscanf(line, "%*d %*s %23s %f %f", nm, &fx, &fz) == 3) {
+                if (strcmp(nm, "seabass") == 0) sp = aGYO_TYPE_SEA_BASS;
+                else if (strcmp(nm, "snapper") == 0) sp = aGYO_TYPE_RED_SNAPPER;
+                else if (strcmp(nm, "coelacanth") == 0) sp = aGYO_TYPE_COELACANTH;
+                else if (strcmp(nm, "jellyfish") == 0) sp = aGYO_TYPE_JELLYFISH;
+                else if (strcmp(nm, "knifejaw") == 0) sp = aGYO_TYPE_BARRED_KNIFEJAW;
+                else if (strcmp(nm, "whale") == 0) sp = aGYO_TYPE_WHALE;
+                else if (strcmp(nm, "salmon2") == 0) sp = aGYO_TYPE_SALMON2;
+                else sp = atoi(nm);
+            }
+            {
+                const uint32_t hid = (sp >= 0) ? pcwld_test_host_inject(sp, fx, fz) : 0u;
+                printf("[AUTO] hspawn %d species %d entity %u\n", id, sp, (unsigned)hid);
+            }
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "pspawn") == 0) { /* TEST-ONLY: pspawn ENTITY SPECIES X Z -- this client receives a (made-up) WILDLIFE_SPAWN of a fish: the real presentation path, which defers when the pool is full */
+            unsigned long sp = 0;
+            float fx = 0.0f, fz = 0.0f;
+            int ok2 = (sscanf(line, "%*d %*s %lu %lu %f %f", &ent, &sp, &fx, &fz) == 4);
+            const int made = ok2 ? pcwld_presentation_create((uint32_t)ent, PC_WILDLIFE_KIND_FISH, (int)sp, (int)(fx / 640.0f), (int)(fz / 640.0f), fx, 0.0f, fz) : -1;
+            printf("[AUTO] pspawn %d entity %lu created=%d deferred=%d\n", id, ent, made, pcwld_presentation_deferred_count());
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "pdespawn") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY: this client receives a WILDLIFE_DESPAWN for ENTITY */
+            (void)pcwld_handle_wildlife_despawn((uint32_t)ent);
+            printf("[AUTO] pdespawn %d entity %lu deferred=%d\n", id, ent, pcwld_presentation_deferred_count());
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "resetstamps") == 0) { /* TEST-ONLY: the client-side wildlife session reset (new generation): presentation bookkeeping and actor stamps */
+            pcwld_presentation_reset();
+            pcwld_clear_local_actor_stamps();
+            printf("[AUTO] resetstamps %d done\n", id);
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "give") == 0 && sscanf(line, "%*d %*s %lx", &ent) == 1) { /* a POSITIONING AID for fixtures: put item ENT (hex) in a free pocket of the local player (a guest starts with an empty bag) */
+            const int gave = mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)ent, mPr_ITEM_COND_NORMAL);
+            printf("[AUTO] give %d item 0x%04lX %s\n", id, ent, gave ? "put in a pocket" : "no free pocket");
+            s_ap.active = 0;
         } else if (strcmp(cmd, "dpad") == 0) {
             s_ap.press_dpad = 6; /* frames */
         } else if (strcmp(cmd, "fish") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* fish creature ENT with the real rod: equip, stand where the cast lands on it, cast, hook the bite */
             s_ap.entity = (uint32_t)ent;
         } else if (strcmp(cmd, "net") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) {
             s_ap.entity = (uint32_t)ent;
+        } else if (strcmp(cmd, "catch") == 0) { /* catch fish|bug [ENTITY] */
+            char kind[8] = {0};
+            ent = 0;
+            sscanf(line, "%*d %*s %7s %lu", kind, &ent);
+            if (strcmp(kind, "fish") == 0 || strcmp(kind, "bug") == 0) {
+                s_ap.ac = 1;
+                s_ap.ac_fish = (kind[0] == 'f');
+                s_ap.ac_state = -1;
+                s_ap.entity = (uint32_t)ent;
+                snprintf(s_ap.cmd, sizeof(s_ap.cmd), "%s", s_ap.ac_fish ? "fish" : "net"); /* the same real-interaction code as the `fish` / `net` commands */
+                s_ac_result = 0;
+                s_ac_result_entity = 0;
+                pcnetgame_ac_state(AC_SEARCHING);
+            } else {
+                pcnetgame_ap_done("fail", "catch: kind must be fish or bug");
+            }
         } else {
             pcnetgame_ap_done("fail", "unknown command");
         }
         return 0;
     }
-    if ((uint32_t)(now - s_ap.t0) > (strcmp(s_ap.cmd, "fish") == 0 ? 250000u : strcmp(s_ap.cmd, "net") == 0 ? 60000u : 40000u)) {
+    if ((uint32_t)(now - s_ap.t0) > (strcmp(s_ap.cmd, "fish") == 0 ? 250000u : strcmp(s_ap.cmd, "net") == 0 ? (s_ap.ac ? 120000u : 60000u) : 40000u)) {
         char d2[96];
         snprintf(d2, sizeof(d2), "timeout at x=%.1f z=%.1f", (double)px, (double)pz);
         pcnetgame_ap_done("fail", d2);
@@ -34504,6 +34705,37 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             s_ap.last_log = now;
             printf("[AUTO] %d fish: stage %d casts %d main_index %d equipment 0x%04X bobber %s\n", s_ap.id, s_ap.stage, s_ap.casts, mi, (unsigned)Now_Private->equipment, uki != NULL ? "yes" : "no");
         }
+        if (s_ap.ac) {
+            if (s_ap.entity == 0) {
+                s_ap.entity = pcnetgame_ac_nearest(1, px, pz);
+                if (s_ap.entity == 0) {
+                    pcnetgame_ac_state(AC_SEARCHING);
+                    if ((uint32_t)(now - s_ap.t0) > 30000u) {
+                        pcnetgame_ac_finish("NO_TARGET");
+                    }
+                    return 0;
+                }
+                s_ap.ac_state = -1;
+            }
+            if (s_ap.ac_state < AC_TARGET_FOUND) {
+                pcnetgame_ac_state(AC_TARGET_FOUND);
+            }
+            if (s_ap.stage < 6) { /* the creature vanished from this process (another player caught it, or it left for good): stop, do not wait out the bobber */
+                ACTOR* chk = NULL;
+                if (aGYO_pc_find_entity(s_ap.entity, &chk)) {
+                    s_ap.ac_gone = 0;
+                } else if (s_ap.ac_gone == 0) {
+                    s_ap.ac_gone = now;
+                } else if ((uint32_t)(now - s_ap.ac_gone) > 6000u) {
+                    pcnetgame_ac_finish("GONE");
+                    return 0;
+                }
+            }
+            if (s_ac_result != 0 && s_ac_result_entity == s_ap.entity && s_ap.stage < 6) { /* the host already answered (e.g. the race was lost before our own request) */
+                pcnetgame_ac_finish("");
+                return 0;
+            }
+        }
         switch (s_ap.stage) {
             case 0: /* equip the rod with the game's own D-pad tool cycle */
                 if (Now_Private->equipment == (mActor_name_t)ITM_ROD) {
@@ -34527,10 +34759,15 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 }
                 if (!aGYO_pc_find_entity(s_ap.entity, &fish)) {
                     if ((uint32_t)(now - s_ap.stage_ms) > 10000u) {
-                        pcnetgame_ap_done("fail", "fish: no local fish actor for that entity");
+                        if (s_ap.ac) {
+                            pcnetgame_ac_finish("GONE");
+                        } else {
+                            pcnetgame_ap_done("fail", "fish: no local fish actor for that entity");
+                        }
                     }
                     return 0;
                 }
+                pcnetgame_ac_state(AC_MOVING); /* the fish's CURRENT position and heading are read again on every attempt */
                 { /* cast AHEAD of the fish (a fish only goes for a bobber it is heading toward): 45 units along its heading */
                     const float fa = (float)fish->world.angle.y * (6.2831853f / 65536.0f);
                     cx = fish->world.position.x + 45.0f * sinf(fa);
@@ -34573,6 +34810,7 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 }
                 s_ap.stage = 2;
                 s_ap.stage_ms = now;
+                pcnetgame_ac_state(AC_IN_RANGE);
                 return 0;
             }
             case 2: /* settle, then cast (A) */
@@ -34581,6 +34819,7 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                     s_ap.casts++;
                     s_ap.stage = 3;
                     s_ap.stage_ms = now;
+                    pcnetgame_ac_state(AC_INTERACTING);
                 }
                 return 0;
             case 3: /* the cast, the float, the wait for a bite */
@@ -34614,12 +34853,83 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                     return 1u;
                 }
                 if (mi == mPlayer_INDEX_NOTICE_ROD || mi == mPlayer_INDEX_COLLECT_ROD) {
+                    if (s_ap.ac) { /* hooked: now the game's own catch flow sends the CATCH request; press through its dialogue until the host answers */
+                        s_ap.stage = 6;
+                        s_ap.stage_ms = now;
+                        pcnetgame_ac_state(AC_WAITING);
+                        return 0;
+                    }
                     pcnetgame_ap_done("ok", "hooked: the game reached its catch notice");
                     return 0;
                 }
                 if ((uint32_t)(now - s_ap.stage_ms) > 9000u) { /* it got away */
                     s_ap.stage = 1;
                     s_ap.stage_ms = now;
+                }
+                return 0;
+            case 8: /* auto-catch: the attempt is over without a verdict and the rod is out -- press A only while it is (A reels the bobber in) until the player stands free */
+                if (s_ap.a_until != 0u && (int32_t)(s_ap.a_until - now) > 0) {
+                    return 1u;
+                }
+                if (mi >= mPlayer_INDEX_WAIT && mi <= mPlayer_INDEX_DASH && (uki == NULL || uki->status == aUKI_STATUS_CARRY)) {
+                    if (s_ap.chk_ms == 0u) {
+                        s_ap.chk_ms = now;
+                    } else if ((uint32_t)(now - s_ap.chk_ms) > 1000u) {
+                        s_ap.ac_cleaning = 2;
+                        pcnetgame_ac_finish(s_ap_cleanup_text);
+                    }
+                    return 0;
+                }
+                s_ap.chk_ms = 0u;
+                if ((uint32_t)(now - s_ap.stage_ms) > 20000u) {
+                    s_ap.ac_cleaning = 2;
+                    pcnetgame_ac_finish(s_ap_cleanup_text);
+                    return 0;
+                }
+                if ((uint32_t)(now - s_ap.last_act) > 700u && (mi == mPlayer_INDEX_RELAX_ROD || mi == mPlayer_INDEX_NOTICE_ROD || mi == mPlayer_INDEX_COLLECT_ROD || mi == mPlayer_INDEX_PUTAWAY_ROD)) {
+                    s_ap.last_act = now;
+                    s_ap.a_until = now + 120u;
+                }
+                return 0;
+            case 6: /* auto-catch: WAITING_FOR_RESULT (the CATCH request was sent by the game's own flow at the catch notice; A only dismisses its dialogue) */
+                if (s_ap.a_until != 0u && (int32_t)(s_ap.a_until - now) > 0) {
+                    return 1u;
+                }
+                if (s_ac_result != 0 && s_ac_result_entity == s_ap.entity) {
+                    s_ap.stage = 7;
+                    s_ap.stage_ms = now;
+                    s_ap.chk_ms = 0u;
+                    return 0;
+                }
+                if ((uint32_t)(now - s_ap.stage_ms) > 25000u) {
+                    pcnetgame_ac_finish("TIMEOUT");
+                    return 0;
+                }
+                if ((mi == mPlayer_INDEX_NOTICE_ROD || mi == mPlayer_INDEX_COLLECT_ROD) && (uint32_t)(now - s_ap.last_act) > 700u) {
+                    s_ap.last_act = now;
+                    s_ap.a_until = now + 120u;
+                }
+                return 0;
+            case 7: /* auto-catch: the host has answered; press A ONLY while a rod dialogue is up, until the player stands free with the rod put away (a stray A would cast again) */
+                if (s_ap.a_until != 0u && (int32_t)(s_ap.a_until - now) > 0) {
+                    return 1u;
+                }
+                if (mi >= mPlayer_INDEX_WAIT && mi <= mPlayer_INDEX_DASH && (uki == NULL || uki->status == aUKI_STATUS_CARRY)) {
+                    if (s_ap.chk_ms == 0u) {
+                        s_ap.chk_ms = now;
+                    } else if ((uint32_t)(now - s_ap.chk_ms) > 1000u) {
+                        pcnetgame_ac_finish("");
+                    }
+                    return 0;
+                }
+                s_ap.chk_ms = 0u;
+                if ((uint32_t)(now - s_ap.stage_ms) > 20000u) {
+                    pcnetgame_ac_finish("");
+                    return 0;
+                }
+                if ((uint32_t)(now - s_ap.last_act) > 700u && (mi == mPlayer_INDEX_NOTICE_ROD || mi == mPlayer_INDEX_COLLECT_ROD || mi == mPlayer_INDEX_PUTAWAY_ROD)) {
+                    s_ap.last_act = now;
+                    s_ap.a_until = now + 120u;
                 }
                 return 0;
             case 5: /* reeling in after a long wait */
@@ -34654,12 +34964,49 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             }
             return 0;
         }
+        if (s_ap.ac) {
+            if (s_ap.entity == 0) {
+                s_ap.entity = pcnetgame_ac_nearest(0, px, pz);
+                if (s_ap.entity == 0) {
+                    pcnetgame_ac_state(AC_SEARCHING);
+                    if ((uint32_t)(now - s_ap.t0) > 30000u) {
+                        pcnetgame_ac_finish("NO_TARGET");
+                    }
+                    return 0;
+                }
+                s_ap.ac_state = -1;
+            }
+            if (s_ap.ac_state < AC_TARGET_FOUND) {
+                pcnetgame_ac_state(AC_TARGET_FOUND);
+            }
+            if (s_ap.stage == 6) { /* WAITING_FOR_RESULT: the game's catch flow has the bug; press through its dialogue until the host answers */
+                if (s_ac_result != 0 && s_ac_result_entity == s_ap.entity) {
+                    pcnetgame_ac_finish("");
+                    return 0;
+                }
+                if ((uint32_t)(now - s_ap.stage_ms) > 25000u) {
+                    pcnetgame_ac_finish("TIMEOUT");
+                    return 0;
+                }
+                return (((now - s_ap.stage_ms) / 250u) & 1u) ? 1u : 0u;
+            }
+        }
         bug = (const ACTOR*)pcwld_bug_local_actor_for_entity(s_ap.entity, &sp);
         if (bug == NULL) {
-            pcnetgame_ap_done("ok", "entity no longer present locally");
+            if (s_ap.ac) {
+                pcnetgame_ac_finish("GONE");
+            } else {
+                pcnetgame_ap_done("ok", "entity no longer present locally");
+            }
             return 0;
         }
         if ((const ACTOR*)mPlib_Get_item_net_catch_label() == bug) { /* the game's own net code has caught it: the catch flow (request, dialogue) takes over */
+            if (s_ap.ac) {
+                s_ap.stage = 6;
+                s_ap.stage_ms = now;
+                pcnetgame_ac_state(AC_WAITING);
+                return 0;
+            }
             pcnetgame_ap_done("ok", "net engaged the bug");
             return 0;
         }
@@ -34680,7 +35027,43 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             pa4->actor_class.shape_info.rotation.y = face;
             pa4->actor_class.world.angle.y = face;
         }
-        if (d < 40.0f && (uint32_t)(now - s_ap.last_act) > 700u) { /* close enough: swing */
+        if (s_ap.ac) {
+            if (bug->world.position.y - get_player_actor_withoutCheck((GAME_PLAY*)gamePT)->actor_class.world.position.y > 60.0f) { /* a flier cruising far above the net's reach */
+                if (s_ap.ac_gone == 0u) {
+                    s_ap.ac_gone = now;
+                } else if ((uint32_t)(now - s_ap.ac_gone) > 12000u) {
+                    printf("[AUTO-CATCH] kind=BUG entity=%u the bug stays high above the net's reach (y=%.0f)\n", (unsigned)s_ap.entity, (double)bug->world.position.y);
+                    pcnetgame_ac_finish("OUT_OF_REACH");
+                    return 0;
+                }
+            } else {
+                s_ap.ac_gone = 0u;
+            }
+            if ((uint32_t)(now - s_ap.ac_log) > 2000u) {
+                s_ap.ac_log = now;
+                printf("[AUTO-CATCH] kind=BUG entity=%u distance=%.1f\n", (unsigned)s_ap.entity, (double)d);
+            }
+            if (s_ap.ac_state != AC_INTERACTING) {
+                pcnetgame_ac_state(d < 45.0f ? AC_IN_RANGE : AC_MOVING);
+            }
+        }
+        if (s_ap.ac && d >= 45.0f && (uint32_t)(now - s_ap.last_act) > 5000u) { /* cut off from it (river, wall) for a while: stand next to where it is NOW (positioning aid) */
+            PLAYER_ACTOR* pa6 = get_player_actor_withoutCheck((GAME_PLAY*)gamePT);
+            pa6->actor_class.world.position.x = bug->world.position.x;
+            pa6->actor_class.world.position.z = bug->world.position.z + 30.0f;
+            s_ap.last_act = now;
+        }
+        if (s_ap.ac && d < 45.0f && (uint32_t)(now - s_ap.last_act) > 700u) { /* the bug hops: right before every swing stand 22 units south of where it is NOW, face north, swing */
+            PLAYER_ACTOR* pa5 = get_player_actor_withoutCheck((GAME_PLAY*)gamePT);
+            const s16 face5 = (s16)0x8000;
+            pa5->actor_class.world.position.x = bug->world.position.x;
+            pa5->actor_class.world.position.z = bug->world.position.z + 22.0f;
+            pa5->actor_class.shape_info.rotation.y = face5;
+            pa5->actor_class.world.angle.y = face5;
+            s_ap.last_act = now;
+            s_ap.a_until = now + 120u;
+            pcnetgame_ac_state(AC_INTERACTING);
+        } else if (!s_ap.ac && d < 40.0f && (uint32_t)(now - s_ap.last_act) > 700u) { /* close enough: swing */
             s_ap.last_act = now;
             s_ap.a_until = now + 120u;
         }
@@ -34729,6 +35112,14 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
     }
     return flags;
 }
+
+#else
+unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) { /* release build: no autopilot */
+    *sx = 0;
+    *sy = 0;
+    return 0;
+}
+#endif /* PC_NET_TEST_HOOKS */
 
 /* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_ROOM_ENTER=<animal idx>,<enter ms>[,<talk start>,<talk end>[,<leave>[,<reenter>]]] (all ms; talk / leave relative to the room entry, reenter to the
  * return to the field). A REAL process (host or client) walks itself into a villager's house through the game's own scene change (goto_other_scene, the door data aHUS_rewrite_out_data builds),
@@ -35507,6 +35898,10 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
 
     accepted = pcnetgame_validate_and_commit_catch(1, (PCNetPeerId)0, entity_id, pcwld_session_generation(),
                                                    claimed_species);
+#ifdef PC_NET_TEST_HOOKS
+    s_ac_result_entity = entity_id;
+    s_ac_result = accepted ? 1 : 2;
+#endif
     if (accepted) {
         printf("[NET][WILDLIFE] host: local CATCH entity %u (species claim %d) accepted -- removed from "
                "authoritative table\n",
@@ -35617,6 +36012,14 @@ static void pcnetgame_handle_client_wildlife_spawn(const PCNetGameWildlifeSpawnM
      * suppression are pcwld_presentation_create()'s own job -- shared, byte-for-byte, with the
      * host's own self-presentation call (pcwld_host_spawn_trigger(), pc_wildlife_authority.c) so
      * both roles apply exactly the same rules to exactly the same data. */
+    if (s_client_wildlife_snap_active && s_client_wildlife_seen_count < PCWLD_PUBLIC_MAX_ENTITIES) {
+        int k;
+        for (k = 0; k < s_client_wildlife_seen_count && s_client_wildlife_seen[k] != in->entity_id; k++) {
+        }
+        if (k == s_client_wildlife_seen_count) {
+            s_client_wildlife_seen[s_client_wildlife_seen_count++] = in->entity_id; /* a spawn that arrives inside a snapshot pass counts as named by it (the final reconcile must not drop it) */
+        }
+    }
     pcwld_presentation_create(in->entity_id, (int)in->kind, (int)in->species, (int)in->bx,
                               (int)in->bz, in->pos_x, in->pos_y, in->pos_z);
 
@@ -35738,6 +36141,14 @@ static uint32_t s_wld_next_bobber_ms;
 static uint8_t  s_wld_bobber_sent_active;
 static uint8_t  s_wld_bobber_gone_repeats;
 static PCNetGameBobberStateMsg s_wld_bobber_last;
+static uint16_t s_wld_bobber_seq;
+
+static int16_t pcnetgame_wld_next_bobber_seq(void) {
+    if (++s_wld_bobber_seq == 0u) {
+        s_wld_bobber_seq = 1u; /* 0 means 'not ordered' */
+    }
+    return (int16_t)s_wld_bobber_seq;
+}
 
 static void pcnetgame_wildlife_sim_tick(void) {
     const uint32_t now = pcnetgame_now_ms();
@@ -35747,8 +36158,14 @@ static void pcnetgame_wildlife_sim_tick(void) {
     }
     if (s_role == PC_NETGAME_ROLE_HOST) {
         PcWldBobberEvent ev[PCWLD_MAX_BOBBER_EVENTS];
+        uint32_t abandoned[PCWLD_PUBLIC_MAX_ENTITIES];
+        int i, n, na;
         pcwld_host_ensure_actors(pcnetgame_wildlife_record_attended);
-        int i, n = pcwld_host_bobber_events(ev, PCWLD_MAX_BOBBER_EVENTS);
+        na = pcwld_host_collect_abandoned(abandoned, PCWLD_PUBLIC_MAX_ENTITIES);
+        for (i = 0; i < na; i++) {
+            pcnetgame_commit_catch_despawn(abandoned[i]); /* the record is gone: tell everybody */
+        }
+        n = pcwld_host_bobber_events(ev, PCWLD_MAX_BOBBER_EVENTS);
         for (i = 0; i < n; i++) {
             PCNetGameBobberEventMsg m;
             memset(&m, 0, sizeof(m));
@@ -35795,6 +36212,7 @@ static void pcnetgame_wildlife_sim_tick(void) {
     } else if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY) {
         PcWldBobber b;
         int changed = 0;
+        memset(&b, 0, sizeof(b)); /* pcwld_client_collect_bobber() writes nothing when there is no bobber */
         (void)pcwld_client_collect_bobber(&b);
         if (b.active && (b.uki_status != s_wld_bobber_last.uki_status || b.gyo_status != s_wld_bobber_last.gyo_status || b.command != s_wld_bobber_last.command ||
                          b.hit_water != s_wld_bobber_last.hit_water)) {
@@ -35823,6 +36241,7 @@ static void pcnetgame_wildlife_sim_tick(void) {
             m.uy = b.uy;
             m.uz = b.uz;
             m.angle = b.angle;
+            m.seq = pcnetgame_wld_next_bobber_seq();
             (void)pc_net_send(0, changed ? PC_NET_RELIABLE : PC_NET_UNRELIABLE, &m, (uint16_t)sizeof(m));
             s_wld_bobber_last = m;
             s_wld_bobber_sent_active = 1;
@@ -35832,6 +36251,7 @@ static void pcnetgame_wildlife_sim_tick(void) {
             memset(&m, 0, sizeof(m));
             m.msg_type = (uint8_t)PC_NETGAME_MSG_BOBBER_STATE;
             m.active = 0;
+            m.seq = pcnetgame_wld_next_bobber_seq();
             (void)pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m)); /* the bobber is gone: reliable, so a fish never stays tied to a bobber that does not exist */
             if (++s_wld_bobber_gone_repeats >= 1) {
                 s_wld_bobber_sent_active = 0;
@@ -35864,6 +36284,7 @@ static void pcnetgame_handle_host_bobber_state(PCNetPeerId peer, const PCNetGame
     b.uy = in->uy;
     b.uz = in->uz;
     b.angle = in->angle;
+    b.seq = in->seq;
     pcwld_host_set_bobber(&b);
 }
 
@@ -35956,7 +36377,7 @@ void pc_net_game_notify_wildlife_spawn(uint32_t entity_id, int kind, int species
     msg.pos_x      = pos_x;
     msg.pos_y      = pos_y;
     msg.pos_z      = pos_z;
-    pcnetgame_broadcast_villager_msg(&msg, sizeof(msg));
+    pcnetgame_broadcast_wildlife_msg(&msg, sizeof(msg));
 }
 
 /* ============================================================================================

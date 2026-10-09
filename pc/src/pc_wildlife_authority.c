@@ -179,11 +179,8 @@ static uint32_t s_wildlife_session_gen = 0;
 typedef struct PcWildlifeSlot {
     int              active;
     PcWildlifeRecord rec;
-    float            age_accum; /* T1 review fix: 60fps-frame-unit age since insertion -- see
-                                    pcwld_host_check_idle()'s own doc below for why this exists and
-                                    why a time-based expiry (rather than an exist-flag-based one) was
-                                    chosen. */
-    uint8_t          recreates;     /* how many times pcwld_host_ensure_actors() brought this record's host actor back (capped: a creature that dies at once every time is left alone) */
+    uint8_t          recreates;     /* CONSECUTIVE times pcwld_host_ensure_actors() had to bring this record's host actor back without it surviving to the next check (reset as soon as it is seen alive) */
+    uint8_t          abandoned;     /* set when that kept failing: the record is released (pcwld_host_collect_abandoned()) so its acre can re-roll and every peer is told */
     float            absent_frames; /* consecutive 60 fps frames in which no player attended this record (pcwld_host_collect_unattended()) */
 } PcWildlifeSlot;
 
@@ -229,8 +226,7 @@ typedef struct PcWildlifePresentationSlot {
     int      species;
     int      has_actor; /* 0 for a deferred species (currently: ants) recorded as "handled" with no
                             real actor -- see pcwld_presentation_create()'s own doc */
-    float    age_accum; /* T1 review fix: 60fps-frame-unit age since this slot was populated -- see
-                            pcwld_presentation_check_idle()'s own doc below */
+    uint8_t  despawned; /* the host announced the creature gone (WILDLIFE_DESPAWN): the entry is freed by pcwld_presentation_check_idle() as soon as its local actor is gone too */
     void*    local_actor; /* T4 (ordinary bug catching): PC_WILDLIFE_KIND_BUG only -- the exact
                               aINS_INSECT_ACTOR* pointer make_insect_proc() returned for this entity_id,
                               opaque here (void*) so this file's own kind-agnostic bookkeeping never
@@ -384,94 +380,14 @@ int pcwld_remove_by_id(uint32_t entity_id) {
     return 1;
 }
 
-/* T1 review fix (BUG: neither this table nor s_presentation[] had ANY caller of pcwld_remove_by_id()
- * or any other free/reuse path -- once a fish/bug decision is recorded in an acre, pcwld_acre_has_kind()
- * keeps returning true for that acre+kind FOREVER, so that acre can never spawn wildlife of that kind
- * again for the rest of the hosting session; separately, s_presentation[] (now PCWLDP_MAX_LOCAL slots,
- * see its own doc) would eventually fill and refuse every further local materialization, permanently,
- * on every peer. Together this makes wildlife dry up permanently within a session.
- *
- * CHOICE OF FIX: a time-based idle expiry, mirroring the EXACT precedent already used for tree-cut
- * cut-count bookkeeping (PCNetGameTreeCutSlot/pcnetgame_host_check_tree_cut_idle(), above in
- * pc_net_game.c) -- age_accum in 60fps-frame units, incremented once per poll by gamePT->graph->
- * dt_num_60fps_frames, freeing the slot once past a conservative threshold. This is a REAL removal
- * path (not just a capacity bump), but it is explicitly a STOPGAP, not a byte-exact despawn policy:
- * a full policy is still later work (per this milestone's own explicit brief). Rejected alternative
- * (Option B as literally suggested: detect via the underlying vanilla actor's exist flag): NOT used
- * here because (a) this file's own top-of-file T1 doc deliberately avoids keeping any actor pointer
- * or reverse actor->entity_id link in s_presentation[]/s_table (an intentional safety choice --
- * see "Despawn safety" above -- reversing it to add a back-link is a materially bigger, riskier
- * change than this narrow bugfix pass should make), and (b) even if the HOST checked its OWN local
- * pool's exist flags, that can only ever observe the HOST's own local actor -- it has no way to know
- * whether a REMOTE peer's presentation actor for that same entity_id is still alive, so it is not
- * actually a more correct signal for the AUTHORITATIVE table (which must stay valid for every peer,
- * not just the host) than a plain elapsed-time bound is. A time-based bound is peer-agnostic and
- * uniformly conservative instead.
- *
- * THRESHOLD: 10 real-world minutes (continuous, NOT gated on culling/visibility the way vanilla's own
- * insect life_time is -- see aINS_calc_life_time()/ac_insect_move.c_inc, which only decrements while
- * NOT culled, making its 216000-frame constant equivalent to up to 60 minutes of ACTIVE/visible time,
- * context-dependent and not practically reproducible here without new coupling into vanilla's culling
- * state). 10 minutes is a deliberately conservative, simple approximation -- long enough that a still
- * "in play" record is very unlikely to be recycled out from under a live actor, short enough that an
- * acre's spawn gate reliably clears well within an ordinary play session. Documented here as a
- * stopgap value, not a tuned/validated one.
- *
- * KNOWN TRADEOFF (spawn density, not fixed here): this record blocks re-spawn of that kind in that
- * acre for up to the full 10-minute TTL regardless of whether the underlying actor already despawned
- * -- unlike vanilla, which re-rolls chk_live_*_proc fresh on every wade-in after a despawn. So under
- * --authoritative-wildlife, effective spawn density/variety in a given acre can be noticeably LOWER
- * than vanilla for as long as this stopgap TTL stands between despawn and record expiry. Acceptable
- * for this stopgap pass; a real despawn-driven removal path would close the gap. */
-#define PCWLD_RECORD_MAX_AGE_60FPS_FRAMES (60.0f * 60.0f * 10.0f) /* ~10 minutes */
+/* A host record has NO wall-clock lifetime. It lives until (a) a catch removes it (pcwld_remove_by_id() + WILDLIFE_DESPAWN), (b) nobody has been in or near its acre for 12 s
+ * (pcwld_host_collect_unattended() below, which also broadcasts the despawn), or (c) the session resets. Every record is covered by one of them, so nothing can stay allocated for good.
+ * (An earlier stopgap aged every record out after 10 minutes whether or not anybody was still there: the host actor stayed, but the record -- and with it the state broadcast and the
+ * catch validation -- was gone, so a player fishing one pond for 10 minutes caught nothing.) */
 
-/* T8 audit verification, TEST-ONLY: --diag-bug-ttl-lookup <frames> (pc_platform.h/pc_main.c) needs a way
- * to cross the idle-expiry threshold within a short automated test run, without permanently touching the
- * real ~10-minute production constant above. 0 (the default) means "no override -- use the real constant
- * unmodified"; set only by pcnetgame_run_bug_ttl_lookup_diag_host() (pc_net_game.c), gated behind that same
- * CLI flag, never touched by any normal code path. */
-static float s_ttl_override_frames = 0.0f;
-
+/* TEST-ONLY, kept so --diag-bug-ttl-lookup (pc_platform.h) still links: there is no idle TTL any more, the value is accepted and ignored. */
 void pcwld_test_set_ttl_override_frames(float frames) {
-    s_ttl_override_frames = frames;
-}
-
-static float pcwld_effective_ttl_frames(void) {
-    return (s_ttl_override_frames > 0.0f) ? s_ttl_override_frames : PCWLD_RECORD_MAX_AGE_60FPS_FRAMES;
-}
-
-/* HOST-ONLY. Per-poll idle-expiry tick for the authoritative table -- see this function's own
- * "review fix" doc above (pcwld_remove_by_id()) for the bug this closes and why this specific fix was
- * chosen. Called from pc_net_game_poll(), host branch only, alongside
- * pcnetgame_host_check_tree_cut()/pcnetgame_host_check_field_action_money_rock() (pc_net_game.c) --
- * same "run once per poll, before this poll's events are handled" placement. Never mutates anything
- * other than this table; freeing a slot here only means a FUTURE spawn decision for that acre/kind is
- * no longer blocked -- any real actor a peer already materialized for the expired record is completely
- * unaffected (see this file's own top-of-file despawn-safety doc: this module never destroys a real
- * actor). */
-void pcwld_host_check_idle(void) {
-    int i;
-    float dt;
-
-    if (gamePT == NULL) {
-        return;
-    }
-    dt = (float)gamePT->graph->dt_num_60fps_frames;
-
-    for (i = 0; i < PCWLD_MAX_ENTITIES; i++) {
-        if (!s_table[i].active) {
-            continue;
-        }
-        s_table[i].age_accum += dt;
-        if (s_table[i].age_accum >= pcwld_effective_ttl_frames()) {
-            printf("[NET][WILDLIFE] host: entity %u (kind %d species %d acre %d,%d) idle-expired -- "
-                   "acre/kind spawn gate released (stopgap TTL, see pc_wildlife_authority.c's own "
-                   "doc)\n",
-                   (unsigned)s_table[i].rec.entity_id, s_table[i].rec.kind, s_table[i].rec.species,
-                   s_table[i].rec.bx, s_table[i].rec.bz);
-            memset(&s_table[i], 0, sizeof(s_table[i]));
-        }
-    }
+    (void)frames;
 }
 
 #define PCWLD_UNATTENDED_GRACE_FRAMES (60.0f * 12.0f) /* 12 s without any player in / near the record's acre */
@@ -553,8 +469,6 @@ static uint32_t pcwld_table_insert(int kind, int species, int bx, int bz, float 
     }
 
     s_table[slot].active         = 1;
-    s_table[slot].age_accum      = 0.0f; /* T1 review fix: fresh record starts un-aged -- see
-                                             pcwld_host_check_idle()'s own doc */
     s_table[slot].absent_frames  = 0.0f;
     s_table[slot].rec.entity_id  = id;
     s_table[slot].rec.kind       = kind;
@@ -744,6 +658,23 @@ int pcwld_host_spawn_trigger(int bx, int bz) {
     return 1;
 }
 
+/* TEST-ONLY (the autopilot's `hspawn`): records a fish of `species` at (x, z) in the authoritative table, broadcasts its WILDLIFE_SPAWN and gives the host its own actor, exactly like a
+ * spawn decision does -- but with a species the test chooses (a kaseki-program fish cannot be rolled on demand). Returns the entity id, 0 on failure. */
+uint32_t pcwld_test_host_inject(int species, float x, float z) {
+    uint32_t id;
+    int i;
+
+    if (!pcwld_sim_is_host() || gamePT == NULL || !pcfa_scene_is_town() || s_in_progress) {
+        return 0;
+    }
+    id = pcwld_table_insert(PC_WILDLIFE_KIND_FISH, species, (int)(x / 640.0f), (int)(z / 640.0f), x, 0.0f, z);
+    for (i = 0; i < s_pending_count; i++) {
+        (void)pcwld_presentation_create(s_pending[i].entity_id, s_pending[i].kind, s_pending[i].species, s_pending[i].bx, s_pending[i].bz, s_pending[i].x, s_pending[i].y, s_pending[i].z);
+    }
+    s_pending_count = 0;
+    return id;
+}
+
 /* ---- T1: local presentation ------------------------------------------------------------------ */
 
 int pcwld_presentation_has(uint32_t entity_id) {
@@ -759,8 +690,89 @@ int pcwld_presentation_has(uint32_t entity_id) {
     return 0;
 }
 
+/* A CLIENT can be told about a creature at a moment it cannot show it: it is indoors, its town scene is still loading, the 2-fish / 8-bug actor pools are full, the presentation map is full.
+ * The authoritative record exists regardless, so the failed creation is remembered here (parameters only, no actor) and retried by pcwld_presentation_check_idle() once a second
+ * until it works, the host announces the creature gone (WILDLIFE_DESPAWN), a snapshot no longer lists it, or the session resets. It never exceeds the pools: a retry is an ordinary
+ * pcwld_presentation_create(), which simply fails again while there is no room. */
+typedef struct PcWldDeferred {
+    uint32_t entity_id; /* 0 = free */
+    int      kind, species, bx, bz;
+    float    x, y, z;
+} PcWldDeferred;
+
+static PcWldDeferred s_deferred[PCWLD_PUBLIC_MAX_ENTITIES];
+
+static void pcwld_deferred_remove(uint32_t entity_id) {
+    int i;
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        if (s_deferred[i].entity_id == entity_id) {
+            memset(&s_deferred[i], 0, sizeof(s_deferred[i]));
+        }
+    }
+}
+
+static void pcwld_deferred_add(uint32_t entity_id, int kind, int species, int bx, int bz, float x, float y, float z) {
+    int i, free_i = -1;
+    if (entity_id == 0 || !pcwld_sim_is_client()) {
+        return; /* the host re-creates its own actors itself (pcwld_host_ensure_actors) */
+    }
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        if (s_deferred[i].entity_id == entity_id) {
+            return;
+        }
+        if (s_deferred[i].entity_id == 0 && free_i < 0) {
+            free_i = i;
+        }
+    }
+    if (free_i < 0) {
+        return; /* as many deferred creatures as the authoritative table can hold: cannot happen in practice */
+    }
+    s_deferred[free_i].entity_id = entity_id;
+    s_deferred[free_i].kind = kind;
+    s_deferred[free_i].species = species;
+    s_deferred[free_i].bx = bx;
+    s_deferred[free_i].bz = bz;
+    s_deferred[free_i].x = x;
+    s_deferred[free_i].y = y;
+    s_deferred[free_i].z = z;
+}
+
+int pcwld_presentation_deferred_count(void) {
+    int i, n = 0;
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        n += (s_deferred[i].entity_id != 0) ? 1 : 0;
+    }
+    return n;
+}
+
+/* about once a second, one deferred creature gets one more attempt (round robin) */
+static void pcwld_deferred_retry(float dt_frames) {
+    static float accum = 0.0f;
+    static int cursor = 0;
+    int k;
+
+    accum += dt_frames;
+    if (accum < 60.0f) {
+        return;
+    }
+    accum = 0.0f;
+    if (!pcwld_sim_is_client() || gamePT == NULL || !pcfa_scene_is_town()) {
+        return;
+    }
+    for (k = 0; k < PCWLD_PUBLIC_MAX_ENTITIES; k++) {
+        const int i = (cursor + k) % PCWLD_PUBLIC_MAX_ENTITIES;
+        if (s_deferred[i].entity_id != 0) {
+            const PcWldDeferred d = s_deferred[i];
+            cursor = (i + 1) % PCWLD_PUBLIC_MAX_ENTITIES;
+            (void)pcwld_presentation_create(d.entity_id, d.kind, d.species, d.bx, d.bz, d.x, d.y, d.z); /* success removes the entry, failure keeps it */
+            return;
+        }
+    }
+}
+
 void pcwld_presentation_reset(void) {
     memset(s_presentation, 0, sizeof(s_presentation));
+    memset(s_deferred, 0, sizeof(s_deferred));
 }
 
 static int pcwld_presentation_alloc_slot(void) {
@@ -866,6 +878,7 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
     }
 
     if (!pcfa_scene_is_town() || gamePT == NULL) {
+        pcwld_deferred_add(entity_id, kind, species, bx, bz, x, y, z); /* shown as soon as this process is in the town again */
         /* Not a protocol error -- e.g. this process's own town scene hasn't finished loading yet.
          * Nothing to retry: the one-shot WILDLIFE_SPAWN is simply missed locally, same accepted-gap
          * shape as every other "arrived before we were ready" case in this codebase. Not recorded in
@@ -879,6 +892,7 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
     insect_clip = Common_Get(clip).insect_clip;
     gyo_clip    = Common_Get(clip.gyo_clip);
     if (insect_clip == NULL || gyo_clip == NULL) {
+        pcwld_deferred_add(entity_id, kind, species, bx, bz, x, y, z);
         printf("[NET][WILDLIFE] presentation: entity %u dropped -- clip not (yet) wired up\n",
                (unsigned)entity_id);
         return 0;
@@ -886,6 +900,7 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
 
     slot = pcwld_presentation_alloc_slot();
     if (slot < 0) {
+        pcwld_deferred_add(entity_id, kind, species, bx, bz, x, y, z);
         printf("[NET][WILDLIFE] presentation: local table full (%d) -- entity %u dropped\n",
                PCWLDP_MAX_LOCAL, (unsigned)entity_id);
         return 0;
@@ -902,7 +917,6 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
         s_presentation[slot].kind      = kind;
         s_presentation[slot].species   = species;
         s_presentation[slot].has_actor = 0;
-        s_presentation[slot].age_accum = 0.0f; /* T1 review fix -- see pcwld_presentation_check_idle() */
         printf("[NET][WILDLIFE] presentation: entity %u species ANT DEFERRED (T1 does not "
                "materialize ants -- see pc_wildlife_authority.c's own doc)\n",
                (unsigned)entity_id);
@@ -958,6 +972,7 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
         }
 
         if (!ok) {
+            pcwld_deferred_add(entity_id, kind, species, bx, bz, x, y, z); /* pool full: retried once a second */
             printf("[NET][WILDLIFE] presentation: entity %u local actor creation failed (pool full "
                    "or clip not ready)\n",
                    (unsigned)entity_id);
@@ -1081,7 +1096,7 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
     s_presentation[slot].species     = species;
     s_presentation[slot].has_actor   = 1;
     s_presentation[slot].local_actor = local_actor_out;
-    s_presentation[slot].age_accum = 0.0f; /* T1 review fix -- see pcwld_presentation_check_idle() */
+    pcwld_deferred_remove(entity_id);
 
     /* T8 audit verification aid: local_actor logged for BUG entities specifically (NULL for fish/ants,
        where it is never meaningful) so a pool-slot reuse collision (Bug 2) is directly grep-able from an
@@ -1137,9 +1152,11 @@ void pcwld_test_dump_presentation(void) {
             printf("[AUTO] pres entity %u bug species %d actor %p exist=%d type=%d pos=(%.0f,%.0f)\n", (unsigned)s->entity_id, s->species, s->local_actor, in->exist_flag, in->type,
                    (double)in->tools_actor.actor_class.world.position.x, (double)in->tools_actor.actor_class.world.position.z);
         } else {
-            printf("[AUTO] pres entity %u kind %d species %d has_actor=%d alive=%d\n", (unsigned)s->entity_id, s->kind, s->species, s->has_actor, pcwld_presentation_actor_alive(s));
+            printf("[AUTO] pres entity %u kind %d species %d has_actor=%d alive=%d despawned=%d actors=%d\n", (unsigned)s->entity_id, s->kind, s->species, s->has_actor, pcwld_presentation_actor_alive(s), (int)s->despawned,
+                   (s->kind == PC_WILDLIFE_KIND_FISH && pcfa_scene_is_town()) ? aGYO_pc_stamp_count((u32)s->entity_id) : 0);
         }
     }
+    printf("[AUTO] pres deferred %d fishpool %d\n", pcwld_presentation_deferred_count(), pcfa_scene_is_town() ? aGYO_pc_live_fish_count() : 0);
 }
 
 int pcwld_test_live_bug(int idx, uint32_t* entity_id, int* species, float* x, float* z) {
@@ -1152,6 +1169,24 @@ int pcwld_test_live_bug(int idx, uint32_t* entity_id, int* species, float* x, fl
                 *species = s_presentation[i].species;
                 *x = a->world.position.x;
                 *z = a->world.position.z;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int pcwld_test_live_fish(int idx, uint32_t* entity_id, int* species, float* x, float* z) {
+    int i, n = 0;
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        float p[8];
+        int fbx = 0, fbz = 0;
+        if (s_presentation[i].active && s_presentation[i].kind == PC_WILDLIFE_KIND_FISH && s_presentation[i].has_actor && aGYO_pc_entity_position((u32)s_presentation[i].entity_id, p, &fbx, &fbz)) {
+            if (n++ == idx) {
+                *entity_id = s_presentation[i].entity_id;
+                *species = s_presentation[i].species;
+                *x = p[0];
+                *z = p[2];
                 return 1;
             }
         }
@@ -1196,17 +1231,38 @@ int pcwld_presentation_reconcile(const uint32_t* keep_ids, int keep_count) {
             /* T8 audit fix (Bug 1): a missing-from-snapshot bug whose local actor is STILL ALIVE must not
                be reconciled away -- see pcwld_bug_presentation_actor_still_alive()'s own doc just above. */
             if (pcwld_bug_presentation_actor_still_alive(&s_presentation[i])) {
+                s_presentation[i].despawned = 1;
+                (void)pcwld_bug_handle_wildlife_despawn(s_presentation[i].entity_id); /* retire the ghost bug; the entry stays until the actor is really gone */
                 printf("[NET][WILDLIFE] presentation: entity %u missing from snapshot but its local bug "
                        "actor is still alive -- reconciliation DEFERRED (Bug 1 fix, see pc_wildlife_"
                        "authority.c's own doc)\n",
                        (unsigned)s_presentation[i].entity_id);
                 continue;
             }
+            if (s_presentation[i].kind == PC_WILDLIFE_KIND_FISH && pcfa_scene_is_town()) {
+                (void)aGYO_pc_handle_wildlife_despawn((u32)s_presentation[i].entity_id); /* the host does not have it: no ghost fish may stay behind */
+            }
             printf("[NET][WILDLIFE] presentation: entity %u stale after snapshot reconciliation -- "
                    "local bookkeeping cleared (real actor, if any, left untouched -- see "
                    "pcwld_presentation_reconcile()'s own doc)\n",
                    (unsigned)s_presentation[i].entity_id);
             memset(&s_presentation[i], 0, sizeof(s_presentation[i]));
+            removed++;
+        }
+    }
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) { /* a creature the snapshot no longer lists is not waiting to be shown either */
+        int keep = 0;
+        if (s_deferred[i].entity_id == 0) {
+            continue;
+        }
+        for (j = 0; j < keep_count; j++) {
+            if (keep_ids[j] == s_deferred[i].entity_id) {
+                keep = 1;
+                break;
+            }
+        }
+        if (!keep) {
+            memset(&s_deferred[i], 0, sizeof(s_deferred[i]));
             removed++;
         }
     }
@@ -1265,40 +1321,34 @@ static void pcwld_trace_positions(float dt) {
     }
 }
 
+/* Per-poll tick for the local presentation map (any role). An entry has no wall-clock lifetime: it lives as long as the host's record for the creature does -- so a creature whose
+ * actor vanilla culled can be re-created from the host's state (pcwld_client_rematerialize()) however long that takes. It is freed when the host has announced the creature gone
+ * (WILDLIFE_DESPAWN marks it, pcwld_presentation_mark_despawned()) AND its local actor no longer exists. A reconnect or a snapshot (pcwld_presentation_reconcile()) removes the
+ * entries the host no longer lists. No-op without a game state. */
 void pcwld_presentation_check_idle(void) {
     int i;
-    float dt;
 
     if (gamePT == NULL) {
         return;
     }
-    dt = (float)gamePT->graph->dt_num_60fps_frames;
-    pcwld_trace_positions(dt);
+    pcwld_trace_positions((float)gamePT->graph->dt_num_60fps_frames);
+    pcwld_deferred_retry((float)gamePT->graph->dt_num_60fps_frames);
 
     for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
-        if (!s_presentation[i].active) {
+        const PcWildlifePresentationSlot* s = &s_presentation[i];
+        int alive;
+
+        if (!s->active || !s->despawned) {
             continue;
         }
-        /* T8 audit fix (Bug 1): never age out a BUG entry whose local actor is still genuinely alive --
-           see pcwld_bug_presentation_actor_still_alive()'s own doc above pcwld_presentation_reconcile().
-           The age timer is simply paused (not reset) while the actor stays alive, so a bug that later
-           does despawn/flee/get culled starts aging from its true remaining budget, not from zero. */
-        if (pcwld_bug_presentation_actor_still_alive(&s_presentation[i])) {
-            if (s_presentation[i].age_accum >= pcwld_effective_ttl_frames()) {
-                /* Would have expired under the pre-fix logic -- logged only past the threshold (not
-                   every poll) so this stays a rare, targeted diagnostic line rather than log spam. */
-                printf("[NET][WILDLIFE] presentation: entity %u past idle-expiry threshold but its local "
-                       "bug actor is still alive -- expiry SKIPPED (Bug 1 fix, see pc_wildlife_"
-                       "authority.c's own doc)\n",
-                       (unsigned)s_presentation[i].entity_id);
-            }
-            continue;
+        if (!s->has_actor || !pcfa_scene_is_town()) {
+            alive = 0; /* an ant (never materialized), or the town scene (and with it every local actor) is gone */
+        } else if (s->kind == PC_WILDLIFE_KIND_BUG) {
+            alive = pcwld_bug_presentation_actor_still_alive(s);
+        } else {
+            alive = aGYO_pc_entity_alive((u32)s->entity_id);
         }
-        s_presentation[i].age_accum += dt;
-        if (s_presentation[i].age_accum >= pcwld_effective_ttl_frames()) {
-            printf("[NET][WILDLIFE] presentation: entity %u idle-expired -- local slot freed for "
-                   "reuse (stopgap TTL, see pc_wildlife_authority.c's own doc)\n",
-                   (unsigned)s_presentation[i].entity_id);
+        if (!alive) {
             memset(&s_presentation[i], 0, sizeof(s_presentation[i]));
         }
     }
@@ -1337,7 +1387,20 @@ void pcwld_clear_local_actor_stamps(void) {
     aGYO_pc_clear_all_entity_stamps();
 }
 
+/* The host announced entity_id gone: mark its entry so pcwld_presentation_check_idle() frees it once the local actor is gone. Done before the town-scene gate of
+ * pcwld_handle_wildlife_despawn() -- a despawn that arrives while this process is indoors must not leave the entry behind. */
+static void pcwld_presentation_mark_despawned(uint32_t entity_id) {
+    int i;
+    pcwld_deferred_remove(entity_id); /* a creature that never made it into the presentation is simply forgotten */
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        if (s_presentation[i].active && s_presentation[i].entity_id == entity_id) {
+            s_presentation[i].despawned = 1;
+        }
+    }
+}
+
 int pcwld_handle_wildlife_despawn(uint32_t entity_id) {
+    pcwld_presentation_mark_despawned(entity_id);
     /* Bug fix (post-T3 review): aGYO_actor_dt() (ac_gyoei.c) never resets aGYO_ctrlActor to NULL nor
      * clears ctrl[].exist when the GYOEI controller actor itself is torn down -- which happens whenever
      * THIS process's own town scene is unloaded (entering a house/shop/museum etc). Without this gate,
@@ -1566,6 +1629,8 @@ typedef struct PcWldProxy {
     uint32_t   until_ms;
     int        active;
     int        prev_cmd;
+    int16_t    last_seq; /* the newest BOBBER_STATE.seq applied (0 = none yet): an older one is a reordered leftover */
+    uint8_t    rod_type; /* 0 normal, 1 golden: the ANGLER's rod (BOBBER_STATE.rod_type), which the fish AI must use to judge this bobber */
     uint32_t   prev_entity;
     float      last_fish[3];
     int16_t    last_angle;
@@ -1573,6 +1638,22 @@ typedef struct PcWldProxy {
 } PcWldProxy;
 
 static PcWldProxy s_proxy[PCWLD_PROXY_MAX];
+
+static int pcwld_proxy_in_use(void) { /* TEST-ONLY diagnostics (AC_TEST_PROXY_DIAG=1 with the test hooks) */
+    int i, n = 0;
+    for (i = 0; i < PCWLD_PROXY_MAX; i++) {
+        n += s_proxy[i].used ? 1 : 0;
+    }
+    return n;
+}
+
+static int pcwld_proxy_diag(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = (pc_test_hook_getenv("AC_TEST_PROXY_DIAG") != NULL) ? 1 : 0;
+    }
+    return on;
+}
 
 static PcWldProxy* pcwld_proxy_find(int peer, int create) {
     int i, free_i = -1;
@@ -1588,7 +1669,12 @@ static PcWldProxy* pcwld_proxy_find(int peer, int create) {
         memset(&s_proxy[free_i], 0, sizeof(s_proxy[free_i]));
         s_proxy[free_i].used = 1;
         s_proxy[free_i].peer = peer;
+        if (pcwld_proxy_diag())
+        printf("[NET][WILDLIFE][PROXY-DIAG] alloc slot %d for peer %d (slots in use now: %d/%d)\n", free_i, peer, pcwld_proxy_in_use(), PCWLD_PROXY_MAX);
         return &s_proxy[free_i];
+    }
+    if (create && pcwld_proxy_diag()) {
+        printf("[NET][WILDLIFE][PROXY-DIAG] ALLOC FAILED for peer %d: all %d slots in use\n", peer, PCWLD_PROXY_MAX);
     }
     return NULL;
 }
@@ -1603,6 +1689,12 @@ void pcwld_host_set_bobber(const PcWldBobber* b) {
     p = pcwld_proxy_find(b->peer, b->active != 0);
     if (p == NULL) {
         return;
+    }
+    if (b->seq != 0) {
+        if (p->last_seq != 0 && (int16_t)(b->seq - p->last_seq) <= 0) {
+            return; /* older than what was already applied (an unreliable 'active' overtaken by the reliable 'gone', a duplicate...) */
+        }
+        p->last_seq = b->seq;
     }
     u = &p->uki;
     if (!b->active) { /* the bobber is gone: a fish still tied to it lets go (the vanilla "player reeled in" path: status COMEBACK) */
@@ -1626,6 +1718,7 @@ void pcwld_host_set_bobber(const PcWldBobber* b) {
     u->uki_pos.y = b->uy;
     u->uki_pos.z = b->uz;
     u->actor_class.bg_collision_check.result.unit_attribute = mCoBG_Wpos2Attribute(u->actor_class.world.position, NULL);
+    p->rod_type = (b->rod_type != 0) ? 1 : 0;
     p->active = 1;
     p->until_ms = pc_net_game_now_ms() + PCWLD_PROXY_LIFE_MS;
 }
@@ -1649,6 +1742,16 @@ int pcwld_remote_bobbers(void** out, int max) {
     return n;
 }
 
+int pcwld_proxy_rod_type(const void* uki) {
+    int i;
+    for (i = 0; i < PCWLD_PROXY_MAX; i++) {
+        if (uki == (const void*)&s_proxy[i].uki) {
+            return s_proxy[i].rod_type ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
 int pcwld_uki_is_proxy(const void* uki) {
     int i;
     for (i = 0; i < PCWLD_PROXY_MAX; i++) {
@@ -1668,6 +1771,10 @@ void pcwld_fish_destroyed(const void* fish_ctrl) {
     for (i = 0; i < PCWLD_PROXY_MAX; i++) {
         PcWldProxy* p = &s_proxy[i];
         if (p->used && p->uki.child_actor == (ACTOR*)fish_ctrl) {
+            if (pcwld_proxy_diag()) {
+                printf("[NET][WILDLIFE][PROXY-DIAG] fish of slot %d (peer %d) destroyed: proxy lets go (gyo_command %d -> 0, child cleared, active=%d)\n", i, p->peer, (int)p->uki.gyo_command,
+                       p->active);
+            }
             p->uki.gyo_command = 0;
             p->uki.child_actor = NULL;
         }
@@ -1684,6 +1791,15 @@ int pcwld_host_bobber_events(PcWldBobberEvent* out, int max) {
 
         if (!p->used) {
             continue;
+        }
+        if (pcwld_proxy_diag()) { /* TEST-ONLY: once a second per live proxy */
+            static uint32_t s_last_dump[PCWLD_PROXY_MAX];
+            const uint32_t t_now = pc_net_game_now_ms();
+            if (s_last_dump[i] == 0u || (uint32_t)(t_now - s_last_dump[i]) >= 1000u) {
+                s_last_dump[i] = t_now;
+                printf("[NET][WILDLIFE][PROXY-DIAG] slot %d peer %d active=%d until_in=%d ms uki_status=%d gyo_status=%d gyo_command=%d child=%s\n", i, p->peer, p->active,
+                       (int)(int32_t)(p->until_ms - t_now), (int)u->status, (int)u->gyo_status, cmd, u->child_actor != NULL ? "yes" : "no");
+            }
         }
         if (cmd != p->prev_cmd && n < max) {
             PcWldBobberEvent* e = &out[n];
@@ -1725,6 +1841,8 @@ int pcwld_host_bobber_events(PcWldBobberEvent* out, int max) {
             }
         }
         if (p->used && !p->active && (int32_t)(p->until_ms - pc_net_game_now_ms()) < 0 && u->gyo_command == 0) {
+            if (pcwld_proxy_diag())
+            printf("[NET][WILDLIFE][PROXY-DIAG] release slot %d of peer %d (idle, bobber gone, gyo_command 0)\n", i, p->peer);
             memset(p, 0, sizeof(*p)); /* idle and silent: free the slot */
         }
     }
@@ -1832,12 +1950,38 @@ void pcwld_host_ensure_actors(int (*attended)(const PcWildlifeRecord*)) {
             const int ps = pcwld_find_presentation(r->entity_id);
             alive = ps >= 0 && pcwld_bug_presentation_actor_still_alive(&s_presentation[ps]);
         }
-        if (!alive && s_table[i].recreates < 5 && attended(r)) {
+        if (alive) {
+            s_table[i].recreates = 0; /* it survived: whatever killed it before was transient */
+            continue;
+        }
+        if (!attended(r)) {
+            continue; /* nobody is there: the attendance release deals with the record */
+        }
+        if (s_table[i].recreates >= 5) {
+            s_table[i].abandoned = 1; /* five attempts in a row that did not survive one check: the creature is gone for good */
+            continue;
+        }
+        {
             s_table[i].recreates++;
             printf("[NET][WILDLIFE] host: entity %u (kind %d) is attended but has no host actor -- re-creating it where it was (%.0f,%.0f)\n", (unsigned)r->entity_id, r->kind, r->pos_x, r->pos_z);
             (void)pcwld_presentation_create(r->entity_id, r->kind, r->species, r->bx, r->bz, r->pos_x, r->pos_y, r->pos_z);
         }
     }
+}
+
+/* HOST: removes the records pcwld_host_ensure_actors() gave up on (see PcWildlifeSlot::abandoned) and returns their ids; the caller broadcasts the despawn exactly like an attendance release.
+ * A record must not stay attended for good without a host actor: it blocks its acre's re-roll and leaves a creature on the clients that nothing simulates. */
+int pcwld_host_collect_abandoned(uint32_t* out_ids, int max) {
+    int i, n = 0;
+    for (i = 0; i < PCWLD_MAX_ENTITIES && n < max; i++) {
+        if (s_table[i].active && s_table[i].abandoned) {
+            printf("[NET][WILDLIFE] host: entity %u (kind %d species %d acre %d,%d) released -- its host actor could not be kept alive (5 re-creations in a row); its acre re-rolls on the next entry\n", (unsigned)s_table[i].rec.entity_id, s_table[i].rec.kind, s_table[i].rec.species, s_table[i].rec.bx,
+                   s_table[i].rec.bz);
+            out_ids[n++] = s_table[i].rec.entity_id;
+            memset(&s_table[i], 0, sizeof(s_table[i]));
+        }
+    }
+    return n;
 }
 
 /* ---- what a client does with it ---- */

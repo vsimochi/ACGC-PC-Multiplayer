@@ -104,7 +104,8 @@ static void Player_actor_request_proc_index_fromPutaway_rod(ACTOR* actor, GAME* 
              * defaulting to grant (which is exactly the bug being fixed here).
              * ACCEPTED or NONE (not a host-authoritative catch at all, e.g. authoritative wildlife
              * disabled): fall through and proceed with the exchange screen exactly as before. */
-            if (status == PC_NETGAME_CATCH_STATUS_REJECTED || status == PC_NETGAME_CATCH_STATUS_PENDING) {
+            if (status == PC_NETGAME_CATCH_STATUS_REJECTED || status == PC_NETGAME_CATCH_STATUS_PENDING ||
+                (entity_id == 0 && pc_net_game_authoritative_wildlife_enabled() && pcwld_should_suppress_local_wildlife())) { /* an untracked fish was denied in Notice_rod: no exchange either */
                 /* Log-observable for test purposes, mirroring this milestone's own established
                    "[NET][WILDLIFE]" log-based verification convention (pc_net_game.c) -- this is the
                    ONLY place in this file's own gameplay logic that logs, deliberately, since it is the

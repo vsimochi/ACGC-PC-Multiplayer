@@ -136,6 +136,12 @@ static void Player_actor_setup_main_Notice_rod(ACTOR* actor, GAME* game) {
                        the exchange; otherwise the query returns NONE and the exchange grants a duplicate. */
                     pc_net_game_record_local_catch_denied(entity_id);
                     grant_handled = TRUE;
+                } else if (entity_id == 0 && pcwld_should_suppress_local_wildlife()) {
+                    /* A client under host-authoritative wildlife whose fish carries no entity stamp (a leftover of a superseded session, or one whose actor could not be recovered):
+                       the host has no record of it, so a vanilla grant would hand out a fish the authoritative table never had -- and, for a fish that IS still live there, a duplicate.
+                       Deny it, exactly like a host REJECT: no item, no collection-bit write. */
+                    printf("[NET][WILDLIFE] client: catch of an untracked fish denied locally (no entity stamp: leftover of a superseded wildlife session)\n");
+                    grant_handled = TRUE;
                 }
                 /* entity_id == 0 (no stamp -- e.g. this fish predates T-catch tracking, or its actor
                    could not be recovered when it was materialized; see pcwld_presentation_create()'s own

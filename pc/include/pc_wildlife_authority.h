@@ -82,16 +82,6 @@ int pcwld_count_in_acre(int bx, int bz);
  * policy. */
 int pcwld_remove_by_id(uint32_t entity_id);
 
-/* HOST-ONLY. T1 review fix: per-poll idle-expiry tick for the authoritative table -- closes the bug
- * where NOTHING ever called pcwld_remove_by_id(), so an acre's "already has a fish/bug of this kind"
- * gate (pcwld_acre_has_kind()) never cleared and that acre/kind combo could never spawn again for the
- * rest of the hosting session. A conservative, time-based (NOT vanilla-despawn-accurate) stopgap --
- * see pc_wildlife_authority.c's own doc at this function's definition for the full rationale and why
- * a time-based bound was chosen over inspecting the underlying vanilla actor's exist flag. Call once
- * per poll, host branch only, same placement as pcnetgame_host_check_tree_cut()/
- * pcnetgame_host_check_field_action_money_rock() (pc_net_game.c). No-op if gamePT is not yet valid. */
-void pcwld_host_check_idle(void);
-
 /* HOST-ONLY. The narrow adapter around the existing, UNMODIFIED aSOI_insect_set()/aSOG_gyoei_set()
  * vanilla decision functions -- see pc_wildlife_authority.c for the full design (clip-shim
  * strategy, re-entrancy guard, why both overlays run synchronously per call). `bx`/`bz` are the
@@ -211,14 +201,13 @@ uint32_t pcwld_session_generation(void);
  * is stale). */
 int pcwld_presentation_reconcile(const uint32_t* keep_ids, int keep_count);
 
-/* T1 review fix: per-poll idle-expiry tick for the local presentation map -- callable from ANY role.
- * Closes the bug where this fixed-size map (PCWLDP_MAX_LOCAL slots) had no free/reuse path at all, so
- * it would eventually fill permanently within a session and refuse every further local wildlife
- * materialization from then on. Same conservative time-based stopgap as pcwld_host_check_idle() --
- * see that function's own doc and pc_wildlife_authority.c's definition of this function for the full
- * rationale. Call once per poll from any role (both a host and a client maintain their own local
- * presentation map). No-op if gamePT is not yet valid. */
+/* Per-poll tick for the local presentation map -- callable from ANY role. An entry has no wall-clock lifetime: it lives as long as the host's record does, and is freed once the host
+ * announced the creature gone (WILDLIFE_DESPAWN) and its local actor no longer exists (the snapshot reconcile removes entries the host no longer lists). No-op without a game state. */
 void pcwld_presentation_check_idle(void);
+/* CLIENT: how many creatures the host announced that this process could not show yet (indoors, full actor pool...) and keeps retrying. */
+int pcwld_presentation_deferred_count(void);
+/* TEST-ONLY (the autopilot's `hspawn`): a host-authoritative fish record of the given species (kaseki-program fish cannot be rolled on demand). Returns the entity id, 0 on failure. */
+uint32_t pcwld_test_host_inject(int species, float x, float z);
 
 /* ================================================================================================
  * T-catch: ordinary fish catching only (see this milestone's own ABSOLUTE SCOPE LIMIT -- no bug
@@ -336,16 +325,13 @@ int pcwld_bug_handle_wildlife_despawn(uint32_t entity_id);
  * definition of) pc_net_game_world_is_host_authoritative(). */
 int pcwld_should_suppress_local_wildlife(void);
 
-/* T8 audit verification, TEST-ONLY: overrides the idle-expiry TTL both pcwld_host_check_idle() and
- * pcwld_presentation_check_idle() use (normally the fixed ~10-minute PCWLD_RECORD_MAX_AGE_60FPS_FRAMES
- * constant, pc_wildlife_authority.c) to `frames` 60fps-frame-units instead, so a short automated test run
- * can actually cross the threshold -- see --diag-bug-ttl-lookup's own doc, pc_platform.h. Pass 0 (or never
- * call this) to use the real production constant unmodified; this is the default. Never called from any
- * normal (non-test-flag-gated) code path. */
+/* TEST-ONLY, kept for --diag-bug-ttl-lookup (pc_platform.h): there is no idle-expiry TTL any more, so this is accepted and ignored. */
 void pcwld_test_set_ttl_override_frames(float frames);
 
 /* TEST-ONLY (the autopilot's `bugs` command): the idx-th (0-based) bug entity with a LIVE local actor, plus the actor's world position; 0 when there is none. */
 int pcwld_test_live_bug(int idx, uint32_t* entity_id, int* species, float* x, float* z);
+/* TEST-ONLY (the auto-catch hook): the same for fish entities with a live local actor. */
+int pcwld_test_live_fish(int idx, uint32_t* entity_id, int* species, float* x, float* z);
 /* TEST-ONLY (the autopilot's `pres` command): logs every presentation entry and the state of its local actor. */
 void pcwld_test_dump_presentation(void);
 
@@ -411,6 +397,7 @@ typedef struct PcWldBobber {
     float   x, y, z;    /* the bobber */
     float   ux, uy, uz; /* uki_pos */
     int16_t angle;
+    int16_t seq;        /* BOBBER_STATE.seq: 0 = unordered */
 } PcWldBobber;
 
 /* an event the host's fish AI produced for a remote bobber, to be sent to that peer. */
@@ -432,6 +419,8 @@ int pcwld_host_bobber_events(PcWldBobberEvent* out, int max);
 /* the proxies the fish AI may target (UKI_ACTOR*), and whether a UKI is one of them */
 int pcwld_remote_bobbers(void** out, int max);
 int pcwld_uki_is_proxy(const void* uki);
+/* The rod type (0 normal, 1 golden) of the remote angler that owns this proxy bobber; -1 when `uki` is not a proxy (the caller then uses the local player's rod). */
+int pcwld_proxy_rod_type(const void* uki);
 /* A fish actor is being destroyed (caught, despawned, culled): a remote angler's bobber proxy that still has it tied (child_actor / gyo_command) lets go of it, exactly like the
  * vanilla bobber does when its fish goes away. Without it the proxy would keep a stale fish reference for good and never become reusable (pcwld_host_bobber_events). */
 void pcwld_fish_destroyed(const void* fish_ctrl);
@@ -451,6 +440,8 @@ int pcwld_host_collect_state(PcWldStateEntry* out, int max);
 /* HOST, about once a second: a record somebody attends whose host actor is gone (vanilla destroys a fish whose angler lost it, an insect that wandered off...) gets its actor back at the
  * record's last known position, so the host keeps simulating every creature that is alive. */
 void pcwld_host_ensure_actors(int (*attended)(const PcWildlifeRecord*));
+/* HOST: ids of the records pcwld_host_ensure_actors() gave up on (5 consecutive failed re-creations); they are removed from the table here, the caller broadcasts the despawn. */
+int pcwld_host_collect_abandoned(uint32_t* out_ids, int max);
 /* CLIENT: remember the host's latest state of a creature. */
 void pcwld_client_set_state(const PcWldStateEntry* e);
 /* CLIENT: pull the actor of a driven creature toward the host's state (after its local animation tick). */

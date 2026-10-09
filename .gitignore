@@ -48,3 +48,23 @@ temp/
 include/PR/
 include/gcc/
 include/compiler/gcc/stdlib.h
+
+# Multiplayer test output (net_spike tests write logs and run output next to the scripts)
+pc/tools/net_spike/*.log
+pc/tools/net_spike/logs/
+pc/tools/net_spike/ac_auto_*.txt
+pc/tools/net_spike/regress_*.txt
+pc/tools/net_spike/reg_*.txt
+pc/tools/net_spike/full_*.txt
+pc/tools/net_spike/life*.txt
+pc/tools/net_spike/proxycap_*.txt
+pc/tools/net_spike/*_run.txt
+pc/tools/net_spike/*_run?.txt
+pc/tools/net_spike/run_?.txt
+pc/tools/net_spike/pres_life.txt
+pc/tools/net_spike/final_sim_full.txt
+pc/tools/net_spike/wild_regress_summary.txt
+
+# Per-machine runtime config the game writes next to wherever it was started
+/settings.ini
+/keybindings.ini
