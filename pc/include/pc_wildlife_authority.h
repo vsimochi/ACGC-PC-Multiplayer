@@ -432,6 +432,9 @@ int pcwld_host_bobber_events(PcWldBobberEvent* out, int max);
 /* the proxies the fish AI may target (UKI_ACTOR*), and whether a UKI is one of them */
 int pcwld_remote_bobbers(void** out, int max);
 int pcwld_uki_is_proxy(const void* uki);
+/* A fish actor is being destroyed (caught, despawned, culled): a remote angler's bobber proxy that still has it tied (child_actor / gyo_command) lets go of it, exactly like the
+ * vanilla bobber does when its fish goes away. Without it the proxy would keep a stale fish reference for good and never become reusable (pcwld_host_bobber_events). */
+void pcwld_fish_destroyed(const void* fish_ctrl);
 
 /* the periodic state of a creature the host simulates */
 typedef struct PcWldStateEntry {

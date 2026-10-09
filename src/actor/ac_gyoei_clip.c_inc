@@ -24,6 +24,9 @@ static void aGYO_change_data_area(Object_Exchange_c* exc) {
 static void aGYO_destruct(ACTOR* actorx, GAME* game) {
     aGYO_CTRL_ACTOR* ctrl = (aGYO_CTRL_ACTOR*)actorx;
 
+#ifdef TARGET_PC
+    pcwld_fish_destroyed(actorx); /* a remote angler's bobber proxy must not keep this fish tied */
+#endif
     ctrl->exist = FALSE;
     ctrl->gyo_flags = 0;
     ClObjPipe_dt(game, &ctrl->col_pipe);

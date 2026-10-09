@@ -1659,6 +1659,21 @@ int pcwld_uki_is_proxy(const void* uki) {
     return 0;
 }
 
+void pcwld_fish_destroyed(const void* fish_ctrl) {
+    int i;
+
+    if (fish_ctrl == NULL) {
+        return;
+    }
+    for (i = 0; i < PCWLD_PROXY_MAX; i++) {
+        PcWldProxy* p = &s_proxy[i];
+        if (p->used && p->uki.child_actor == (ACTOR*)fish_ctrl) {
+            p->uki.gyo_command = 0;
+            p->uki.child_actor = NULL;
+        }
+    }
+}
+
 int pcwld_host_bobber_events(PcWldBobberEvent* out, int max) {
     int i, n = 0;
 
