@@ -6,6 +6,8 @@
   L3  B-7   a host fish actor that is destroyed again and again is released (despawned everywhere) instead of staying attended without an actor; the acre rolls a new fish afterwards
   L4  B-9   a session reset on the client retires the stamped fish actor (no anonymous vanilla fish is left), and re-entering the acre brings back exactly ONE
   L5  B-3   a fish announced while the actor pool is full is deferred, shown once a slot frees (no duplicate, pool never exceeded); a deferred fish the host then despawns is forgotten
+  L7  WS1   an insect that its own species program ends (butterfly / dragonfly / ... destroy themselves) is GONE, like in vanilla: the host releases its record at once and tells everybody, it
+            does not re-create the actor five times at a spot where the species' own spawn check fails
   L6  B-11  fish of the KASEKI program (sea bass, red snapper, ...: a different actor program than the common fish) are tied to the remote angler's bobber by the host, bite through the
             host's decision, and are caught through the host's catch transaction like any other fish (hspawn puts one in the authoritative table)
 
@@ -228,10 +230,51 @@ def l6(R):
         check("L6 %s: it is gone from the client (%s)" % (name, e2.get(ent)), ent not in e2)
 
 
+def l7(R):
+    check = R.check
+    H = R.players["host"]
+    ent = None
+    for _ in range(10):
+        ents = [e for e in T.live_kind(R, 1)]
+        if ents:
+            ent = ents[-1]
+            break
+        T.cross(R.players["A"])
+        time.sleep(2)
+    check("L7 a live bug exists", ent is not None)
+    if ent is None:
+        return
+    d = T.decisions(R.log("host")).get(ent)
+    T.enter_acre(R.players["A"], d[2], d[3])
+    alive = wait_until(lambda: ent in {b[0] for b in H.bugs()}, 15)
+    check("L7 the host has a live actor for it", bool(alive))
+    if not alive:
+        return
+    off = len(R.log("host"))
+    ans = H.cmd("endbug %d" % ent, 20)
+    check("L7 the host's insect ends the way a species program ends it (%s)" % ans, ans is not None and "flagged" in ans)
+    rel = wait_until(lambda: re.search(r"entity %d \(kind 1 species \d+ acre \d+,\d+\) released" % ent, R.log("host")[off:]), 4)
+    hl = R.log("host")[off:]
+    rec = len(re.findall(r"entity %d \(kind 1\) is attended but has no host actor -- re-creating" % ent, hl))
+    check("L7 the record is released within 4 s (%s) without any re-creation (re-creations: %d)" % (bool(rel), rec), bool(rel) and rec == 0)
+    gone = wait_until(lambda: ent not in pres(R, "A")[0] and ent not in {b[0] for b in R.players["A"].bugs()}, 10)
+    check("L7 the client dropped it too", bool(gone))
+    before = set(T.decisions(R.log("host")))
+    nxt = None
+    for _ in range(25):  # the roll is random (a bug needs the right season / time / weather conditions): give it many entries
+        T.cross(R.players["A"])
+        time.sleep(2)
+        new = [e for e in T.decisions(R.log("host")) if e not in before and T.decisions(R.log("host"))[e][0] == 1]
+        if new:
+            nxt = new[-1]
+            break
+    check("L7 the acre rolls a new bug afterwards (entity %s)" % nxt, nxt is not None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=12990)
-    ap.add_argument("--only", default="l1,l3,l4,l5,l6")
+    ap.add_argument("--only", default="l1,l3,l4,l5,l6,l7")
     args = ap.parse_args()
     results = []
     R = Rig(args, results)
@@ -250,6 +293,8 @@ def main():
             l5(R)
         if "l6" in only:
             l6(R)
+        if "l7" in only:
+            l7(R)
     finally:
         R.stop_all()
     return L.summary_and_exit_code(results)

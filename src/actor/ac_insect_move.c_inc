@@ -245,6 +245,9 @@ static void aINS_calc_alpha_time(aINS_INSECT_ACTOR* insect, GAME* game) {
                 insect->alpha0 = 0;
                 insect->alpha1 = 0;
                 insect->insect_flags.destruct = TRUE;
+#ifdef TARGET_PC
+                pcwld_insect_diag(1, insect);
+#endif
             }
 
             insect->alpha2 = alpha;
@@ -257,6 +260,9 @@ static void aINS_calc_alpha_time(aINS_INSECT_ACTOR* insect, GAME* game) {
             if (alpha <= 0) {
                 alpha = 0;
                 insect->insect_flags.destruct = TRUE;
+#ifdef TARGET_PC
+                pcwld_insect_diag(1, insect);
+#endif
             }
 
             insect->alpha0 = alpha;
@@ -272,12 +278,19 @@ static void aINS_cull_check(ACTOR* actorx, GAME* game) {
                              &actorx->camera_w);
 
     if (insect->insect_flags.destruct && (ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
+#ifdef TARGET_PC
+        pcwld_insect_diag(2, insect);
+        pcwld_insect_ended_naturally(insect);
+#endif
         aINS_destruct(actorx, game);
     }
 
     if (Actor_draw_actor_no_culling_check(actorx) == FALSE) {
         if (actorx->actor_specific == 1) {
             if ((ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
+#ifdef TARGET_PC
+                pcwld_insect_diag(3, insect);
+#endif
                 aINS_destruct(actorx, game);
             }
         } else {
@@ -293,6 +306,9 @@ static void aINS_cull_check(ACTOR* actorx, GAME* game) {
                 !(pcwld_sim_is_host() && pcwld_remote_player_in_block(actorx->block_x, actorx->block_z)) &&
 #endif
                 (ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
+#ifdef TARGET_PC
+                pcwld_insect_diag(4, insect);
+#endif
                 aINS_destruct(actorx, game);
             }
         }

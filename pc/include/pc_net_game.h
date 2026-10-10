@@ -1226,6 +1226,8 @@ int pc_net_game_request_snowman_break(int ut_x, int ut_z);
  * below, in each case IN ADDITION TO (never instead of) the existing
  * pc_net_game_world_is_host_authoritative()/pc_net_game_role() checks. */
 int pc_net_game_authoritative_wildlife_enabled(void);
+/* CLIENT: the host is connected and currently NOT in its town scene (indoors); see pc_net_game.c. */
+int pc_net_game_host_out_of_town(void);
 
 /* HOST: the connected players the wildlife AI must consider (position, heading, dash / tool use from the newest MOVE sample), in the town scene only. See pc_wildlife_authority.h. */
 int pc_net_game_wildlife_remote_players(PcWldRemotePlayer* out, int max);

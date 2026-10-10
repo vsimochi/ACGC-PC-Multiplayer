@@ -101,14 +101,15 @@ def force_spawn_one_fish(client, tag):
     SINGLE, unambiguous target entity_id so the racer can be pre-positioned on it (by the fish's own
     already-known spawn position) before the real client even boots, eliminating any timing ambiguity
     about which of several candidate fish the client's own late-join snapshot will latch onto."""
-    for bx, bz in ACRES:
-        client.send_reliable(build_trigger(bx, bz))
-        spawns = collect_spawns(client, 0.15)
-        fish = [s for s in spawns if s["kind"] == KIND_FISH]
-        if fish:
-            print(f"[exchange-gate] {tag}: single-fish seed found entity {fish[0]['entity_id']} at acre "
-                  f"({bx},{bz})")
-            return fish[0]
+    for _pass in range(3):  # the roll is random (a pass may produce no fish at all): an acre without a fish record rolls again on the next trigger
+        for bx, bz in ACRES:
+            client.send_reliable(build_trigger(bx, bz))
+            spawns = collect_spawns(client, 0.15)
+            fish = [s for s in spawns if s["kind"] == KIND_FISH]
+            if fish:
+                print(f"[exchange-gate] {tag}: single-fish seed found entity {fish[0]['entity_id']} at acre "
+                      f"({bx},{bz})")
+                return fish[0]
     spawns = collect_spawns(client, 0.5)
     fish = [s for s in spawns if s["kind"] == KIND_FISH]
     return fish[0] if fish else None
@@ -116,10 +117,13 @@ def force_spawn_one_fish(client, tag):
 
 def force_spawn_fish(client, tag):
     spawns = []
-    for bx, bz in ACRES:
-        client.send_reliable(build_trigger(bx, bz))
-        spawns.extend(collect_spawns(client, 0.15))
-    spawns.extend(collect_spawns(client, 0.5))
+    for _pass in range(3):  # random roll: repeat the stimulus (up to 3 passes) until at least two fish exist
+        for bx, bz in ACRES:
+            client.send_reliable(build_trigger(bx, bz))
+            spawns.extend(collect_spawns(client, 0.15))
+        spawns.extend(collect_spawns(client, 0.5))
+        if len([s for s in spawns if s["kind"] == KIND_FISH]) >= 2:
+            break
     fish = [s for s in spawns if s["kind"] == KIND_FISH]
     print(f"[exchange-gate] {tag}: forced spawn burst produced {len(spawns)} total spawn(s), {len(fish)} FISH")
     return fish

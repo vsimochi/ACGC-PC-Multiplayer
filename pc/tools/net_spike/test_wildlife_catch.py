@@ -188,10 +188,13 @@ def collect_snapshot_begins(client, duration):
 
 def force_spawn_fish(client, tag):
     spawns = []
-    for bx, bz in ACRES:
-        client.send_reliable(build_trigger(bx, bz))
-        spawns.extend(collect_spawns(client, 0.15))
-    spawns.extend(collect_spawns(client, 0.5))
+    for _pass in range(3):  # random roll: repeat the stimulus (up to 3 passes) until at least two fish exist
+        for bx, bz in ACRES:
+            client.send_reliable(build_trigger(bx, bz))
+            spawns.extend(collect_spawns(client, 0.15))
+        spawns.extend(collect_spawns(client, 0.5))
+        if len([s for s in spawns if s["kind"] == KIND_FISH]) >= 2:
+            break
     fish = [s for s in spawns if s["kind"] == KIND_FISH]
     print(f"[catch] {tag}: forced spawn burst produced {len(spawns)} total spawn(s), {len(fish)} FISH")
     return fish

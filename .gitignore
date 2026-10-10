@@ -68,3 +68,15 @@ pc/tools/net_spike/wild_regress_summary.txt
 # Per-machine runtime config the game writes next to wherever it was started
 /settings.ini
 /keybindings.ini
+
+# Disposable evidence output of the wildlife test sprints (kept locally, summarised in TODO.md)
+pc/tools/net_spike/ws[0-9]_*.txt
+pc/tools/net_spike/ws[0-9]_*/
+pc/tools/net_spike/proto_*.txt
+pc/tools/net_spike/stab_*.txt
+pc/tools/net_spike/stab_chain*/
+pc/tools/net_spike/routine_*.txt
+pc/tools/net_spike/ant_repeat.txt
+pc/tools/net_spike/bench_*_baseline.txt
+pc/ws_clean_build*.txt
+pc/routine_build.txt

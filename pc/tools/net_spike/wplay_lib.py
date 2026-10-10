@@ -41,6 +41,10 @@ def make_fixture():
     open(p, "wb").write(bytes(g))
 
 
+class PlayerStuck(RuntimeError):
+    """the real player is inside a dialogue / rod state that the autopilot cannot leave (see Player.check_stuck)"""
+
+
 class Player:
     """one game process (host or client) with an autopilot"""
 
@@ -65,7 +69,7 @@ class Player:
         return self.wait(self.send(line), timeout)
 
     def wait(self, cid, timeout=60.0):
-        m = self.proc.wait_for_log(r"\[AUTO\] (?:done %d \S+ (ok|fail|rejected|gone)[^\r\n]*|pos %d [^\r\n]*|tp %d [^\r\n]*|bugs %d\b[^\r\n]*|pres %d end|give %d [^\r\n]*|killfish %d [^\r\n]*|resetstamps %d done|pspawn %d [^\r\n]*|pdespawn %d [^\r\n]*|hspawn %d [^\r\n]*)" % (cid, cid, cid, cid, cid, cid, cid, cid, cid, cid, cid), timeout)
+        m = self.proc.wait_for_log(r"\[AUTO\] (?:done %d \S+ (ok|fail|rejected|gone)[^\r\n]*|pos %d [^\r\n]*|tp %d [^\r\n]*|bugs %d\b[^\r\n]*|pres %d end|give %d [^\r\n]*|killfish %d [^\r\n]*|resetstamps %d done|pspawn %d [^\r\n]*|pdespawn %d [^\r\n]*|hspawn %d [^\r\n]*|endbug %d [^\r\n]*|hdespawn %d [^\r\n]*|place %d [^\r\n]*)" % (cid, cid, cid, cid, cid, cid, cid, cid, cid, cid, cid, cid, cid, cid), timeout)
         return None if m is None else m.group(0)
 
     def pos(self):
@@ -73,9 +77,34 @@ class Player:
         m = re.search(r"x=([-\d.]+) z=([-\d.]+) block=\((\d+),(\d+)\)", a or "")
         return (float(m.group(1)), float(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
 
+    def state(self):
+        """(main_index, free) of the player right now, from the autopilot's pos line; None if unanswered / not in a town scene. free = standing / walking / dashing (a walk can move it)"""
+        a = self.cmd("pos", 20.0) or ""
+        m = re.search(r"main_index=(-?\d+) free=(\d)", a)
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
     def walk(self, x, z, timeout=60.0, radius=20):
         a = self.cmd("walk %.1f %.1f %d" % (x, z, radius), timeout)
-        return a is not None and " ok" in a, a
+        ok = a is not None and " ok" in a
+        if not ok:
+            self.check_stuck("walk %.0f,%.0f" % (x, z))
+        return ok, a
+
+    def check_stuck(self, what):
+        """A walk that failed because the player is inside a dialogue / rod state (it can never move) used to be retried for hours by the callers. Try to recover once with A presses (the catch
+        notice / item dialogue waits for A); if the player is still not free raise PlayerStuck with the evidence, so the test stops with a diagnosis instead of a silent stall."""
+        st = self.state()
+        if st is None or st[1]:
+            return
+        for _ in range(2):
+            self.cmd("mash 4", 30.0)
+            time.sleep(1.0)
+            st = self.state()
+            if st is None or st[1]:
+                self.L.info("%s: the player was stuck in main_index %s and recovered with A presses" % (self.label, st))
+                return
+        tail = [l for l in self.log().splitlines() if "[AUTO" in l][-12:]
+        raise PlayerStuck("%s: the player cannot move after '%s': main_index %d is not a free state (A presses did not help). Last autopilot lines: %s" % (self.label, what, st[0], " | ".join(tail)))
 
     def bugs(self):
         """[(entity, species, x, z)] bug entities with a LIVE local actor in this process"""

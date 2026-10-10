@@ -95,6 +95,8 @@ def fish_once(R, label, tag):
         T.enter_acre(P, d[2] if d else 4, d[3] if d else 2)
         time.sleep(3)
         ans = P.cmd("catch fish %d" % ent, 270)
+    if ans is not None and "NOT free" in ans:
+        P.check_stuck("after the catch of %s" % tag)  # recovers with A presses or raises PlayerStuck with the evidence (instead of stalling the next steps)
     time.sleep(2)
     hl = R.log("host")[off:]
     peers = sorted({int(x) for x in re.findall(r"\[BOBBER\] host: peer (\d+) bobber event \d entity %d " % ent, hl)})

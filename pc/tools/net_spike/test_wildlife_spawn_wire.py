@@ -151,9 +151,14 @@ def main():
         target_acre, existing_kinds = next(iter(by_acre.items()))
         a.send_reliable(build_trigger(*target_acre))
         retrigger_spawns = collect_spawns(a, 0.5)
-        dup_kind = [s for s in retrigger_spawns if s["kind"] in existing_kinds]
+        # re-entering an acre replays its live records (the host re-announces the SAME entities to the player entering it, so that a creature the peer lost is shown again); what must never
+        # happen is a SECOND record of the same kind, i.e. a replayed/rolled spawn with an entity_id that W3 never saw
+        known_ids = {s["entity_id"] for s in all_spawns}
+        dup_kind = [s for s in retrigger_spawns if s["kind"] in existing_kinds and s["entity_id"] not in known_ids]
+        replayed = [s for s in retrigger_spawns if s["entity_id"] in known_ids]
+        print(f"[wildlife] W4: the re-trigger replayed {len(replayed)} known record(s) and produced {len(dup_kind)} new same-kind record(s)")
         check(f"Test W4: re-triggering acre {target_acre} (already has kind(s) {existing_kinds}) "
-              f"produced no duplicate-kind spawn", len(dup_kind) == 0, results)
+              f"produced no NEW same-kind record (a replay of the existing one is expected)", len(dup_kind) == 0, results)
         check("Test W4: host still connected/READY after the re-trigger", a.is_connected(), results)
     else:
         print("[wildlife] W4: skipped (no spawn observed in W3 to re-trigger against)")

@@ -17,5 +17,8 @@ step proxy_life python -u test_wildlife_proxy_lifecycle_real.py --parts rep,conc
 step lifecycle python -u test_wildlife_lifecycle_real.py
 step bobber_order python -u test_wildlife_bobber_order_real.py
 step snapshot_race python -u test_wildlife_snapshot_race_real.py
+step rod_type python -u test_wildlife_rod_type_real.py
+step indoor_spawn python -u test_wildlife_indoor_spawn_real.py
+step protocol python -u run_wildlife_protocol_tests.py
 step sim_full python -u test_wildlife_sim_real.py
 echo "$(date +%T) ALL DONE" >> wild_regress_summary.txt

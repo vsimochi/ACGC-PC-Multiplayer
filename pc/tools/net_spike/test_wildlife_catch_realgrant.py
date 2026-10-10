@@ -98,10 +98,13 @@ def seed_fish_via_fake_client_list(port):
     fc.connect_and_ready()
     fc.drain_field_updates(timeout=0.3)
     spawns = []
-    for bx, bz in ACRES:
-        fc.send_reliable(build_trigger(bx, bz))
-        spawns.extend(collect_spawns(fc, 0.15))
-    spawns.extend(collect_spawns(fc, 0.5))
+    for _pass in range(3):  # random roll: repeat the stimulus (up to 3 passes) until at least two fish exist
+        for bx, bz in ACRES:
+            fc.send_reliable(build_trigger(bx, bz))
+            spawns.extend(collect_spawns(fc, 0.15))
+        spawns.extend(collect_spawns(fc, 0.5))
+        if len([s for s in spawns if s[1] == 0]) >= 2:
+            break
     fish = [s for s in spawns if s[1] == 0]  # kind field, index 1; KIND_FISH == 0
     fc.close()
     return fish

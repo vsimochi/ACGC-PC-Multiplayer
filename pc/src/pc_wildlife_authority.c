@@ -402,13 +402,24 @@ int pcwld_host_acre_records(int bx, int bz, PcWildlifeRecord* out, int max) {
     return n;
 }
 
+/* TEST-ONLY (env AC_TEST_WILDLIFE_KEEP_RECORDS=1 with the test hooks): the host never releases a record by itself (no attendance release, no abandonment, no natural-end release), the way records
+ * behaved when they lived for 10 minutes. The older catch-PROTOCOL tests (test_wildlife_catch*.py, test_wildlife_bug_catch.py ...) seed records with a scripted peer that leaves again, then boot
+ * a second process for 30-60 s and expect the records to still be there; their subject is the catch/validation protocol, not the record lifetime (that is covered by the lifecycle tests). */
+static int pcwld_test_keep_records(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = (pc_test_hook_getenv("AC_TEST_WILDLIFE_KEEP_RECORDS") != NULL) ? 1 : 0;
+    }
+    return on;
+}
+
 int pcwld_host_collect_unattended(int (*attended)(const PcWildlifeRecord*), float dt_frames, uint32_t* out_ids, int max) {
     int i, n = 0;
     for (i = 0; i < PCWLD_MAX_ENTITIES; i++) {
         if (!s_table[i].active) {
             continue;
         }
-        if (attended(&s_table[i].rec)) {
+        if (pcwld_test_keep_records() || attended(&s_table[i].rec)) {
             s_table[i].absent_frames = 0.0f;
             continue;
         }
@@ -675,6 +686,16 @@ uint32_t pcwld_test_host_inject(int species, float x, float z) {
     return id;
 }
 
+/* TEST-ONLY (the autopilot's `hdespawn`): the host releases the record of `entity_id` as if it had been abandoned; the simulation tick then removes it and broadcasts the WILDLIFE_DESPAWN. */
+int pcwld_test_host_release(uint32_t entity_id) {
+    const int slot = pcwld_find_slot_by_id(entity_id);
+    if (!pcwld_sim_is_host() || slot < 0 || !s_table[slot].active) {
+        return 0;
+    }
+    s_table[slot].abandoned = 1;
+    return 1;
+}
+
 /* ---- T1: local presentation ------------------------------------------------------------------ */
 
 int pcwld_presentation_has(uint32_t entity_id) {
@@ -727,6 +748,7 @@ static void pcwld_deferred_add(uint32_t entity_id, int kind, int species, int bx
     if (free_i < 0) {
         return; /* as many deferred creatures as the authoritative table can hold: cannot happen in practice */
     }
+    printf("[NET][WILDLIFE] presentation: entity %u deferred (%d waiting)%s", (unsigned)entity_id, pcwld_presentation_deferred_count() + 1, "\n");
     s_deferred[free_i].entity_id = entity_id;
     s_deferred[free_i].kind = kind;
     s_deferred[free_i].species = species;
@@ -1157,6 +1179,29 @@ void pcwld_test_dump_presentation(void) {
         }
     }
     printf("[AUTO] pres deferred %d fishpool %d\n", pcwld_presentation_deferred_count(), pcfa_scene_is_town() ? aGYO_pc_live_fish_count() : 0);
+}
+
+/* TEST-ONLY (env AC_TEST_INSECT_DIAG=1 with the test hooks): why a wildlife insect actor is being destroyed -- the reason code of the call site, the insect's own timers and its distance to the player */
+void pcwld_insect_diag(int why, const void* insect_actor) {
+    static int on = -1;
+    const aINS_INSECT_ACTOR* in = (const aINS_INSECT_ACTOR*)insect_actor;
+    uint32_t ent = 0;
+    int i;
+
+    if (on < 0) {
+        on = (pc_test_hook_getenv("AC_TEST_INSECT_DIAG") != NULL) ? 1 : 0;
+    }
+    if (!on || in == NULL) {
+        return;
+    }
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        if (s_presentation[i].active && s_presentation[i].kind == PC_WILDLIFE_KIND_BUG && s_presentation[i].local_actor == insect_actor) {
+            ent = s_presentation[i].entity_id;
+        }
+    }
+    printf("[NET][WILDLIFE][INSDIAG] why=%d entity=%u type=%d life_time=%.1f alpha_time=%.1f destruct=%d player_dist_xz=%.0f block=(%d,%d) pos=(%.0f,%.0f,%.0f)\n", why, (unsigned)ent, (int)in->type, (double)in->life_time, (double)in->alpha_time,
+           (int)in->insect_flags.destruct, (double)in->tools_actor.actor_class.player_distance_xz, (int)in->tools_actor.actor_class.block_x, (int)in->tools_actor.actor_class.block_z,
+           (double)in->tools_actor.actor_class.world.position.x, (double)in->tools_actor.actor_class.world.position.y, (double)in->tools_actor.actor_class.world.position.z);
 }
 
 int pcwld_test_live_bug(int idx, uint32_t* entity_id, int* species, float* x, float* z) {
@@ -1630,6 +1675,7 @@ typedef struct PcWldProxy {
     int        active;
     int        prev_cmd;
     int16_t    last_seq; /* the newest BOBBER_STATE.seq applied (0 = none yet): an older one is a reordered leftover */
+    int8_t     rod_judged; /* TEST-ONLY diagnostics: 1 + the rod the fish AI last judged this bobber with (0 = never) */
     uint8_t    rod_type; /* 0 normal, 1 golden: the ANGLER's rod (BOBBER_STATE.rod_type), which the fish AI must use to judge this bobber */
     uint32_t   prev_entity;
     float      last_fish[3];
@@ -1718,6 +1764,9 @@ void pcwld_host_set_bobber(const PcWldBobber* b) {
     u->uki_pos.y = b->uy;
     u->uki_pos.z = b->uz;
     u->actor_class.bg_collision_check.result.unit_attribute = mCoBG_Wpos2Attribute(u->actor_class.world.position, NULL);
+    if (pcwld_proxy_diag() && p->rod_type != ((b->rod_type != 0) ? 1 : 0)) {
+        printf("[NET][WILDLIFE][PROXY-DIAG] peer %d bobber rod: wire value %u -> stored as %s rod%s", (int)b->peer, (unsigned)b->rod_type, (b->rod_type != 0) ? "golden" : "normal", "\n");
+    }
     p->rod_type = (b->rod_type != 0) ? 1 : 0;
     p->active = 1;
     p->until_ms = pc_net_game_now_ms() + PCWLD_PROXY_LIFE_MS;
@@ -1746,6 +1795,10 @@ int pcwld_proxy_rod_type(const void* uki) {
     int i;
     for (i = 0; i < PCWLD_PROXY_MAX; i++) {
         if (uki == (const void*)&s_proxy[i].uki) {
+            if (pcwld_proxy_diag() && s_proxy[i].rod_judged != 1 + (s_proxy[i].rod_type ? 1 : 0)) {
+                s_proxy[i].rod_judged = (int8_t)(1 + (s_proxy[i].rod_type ? 1 : 0));
+                printf("[NET][WILDLIFE][PROXY-DIAG] peer %d bobber is judged by the fish AI with the %s rod%s", s_proxy[i].peer, s_proxy[i].rod_type ? "golden" : "normal", "\n");
+            }
             return s_proxy[i].rod_type ? 1 : 0;
         }
     }
@@ -1969,10 +2022,32 @@ void pcwld_host_ensure_actors(int (*attended)(const PcWildlifeRecord*)) {
     }
 }
 
+/* HOST: a wildlife insect's own species program ended it (it set 'destruct' -- a butterfly that left its flowers, a dragonfly away from water, ...). In vanilla the insect is simply gone; here the
+ * record must follow at once. Re-creating the actor where it was would run the species' spawn check again, fail it the same way and burn five attempts before the release. */
+void pcwld_insect_ended_naturally(const void* insect_actor) {
+    int i;
+    if (!pcwld_sim_is_host() || insect_actor == NULL) {
+        return;
+    }
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        if (s_presentation[i].active && s_presentation[i].kind == PC_WILDLIFE_KIND_BUG && s_presentation[i].local_actor == insect_actor) {
+            const int slot = pcwld_find_slot_by_id(s_presentation[i].entity_id);
+            if (slot >= 0 && s_table[slot].active) {
+                s_table[slot].abandoned = 1;
+                printf("[NET][WILDLIFE] host: entity %u ended by its own species program -- releasing the record%s", (unsigned)s_presentation[i].entity_id, "\n");
+            }
+            return;
+        }
+    }
+}
+
 /* HOST: removes the records pcwld_host_ensure_actors() gave up on (see PcWildlifeSlot::abandoned) and returns their ids; the caller broadcasts the despawn exactly like an attendance release.
  * A record must not stay attended for good without a host actor: it blocks its acre's re-roll and leaves a creature on the clients that nothing simulates. */
 int pcwld_host_collect_abandoned(uint32_t* out_ids, int max) {
     int i, n = 0;
+    if (pcwld_test_keep_records()) {
+        return 0;
+    }
     for (i = 0; i < PCWLD_MAX_ENTITIES && n < max; i++) {
         if (s_table[i].active && s_table[i].abandoned) {
             printf("[NET][WILDLIFE] host: entity %u (kind %d species %d acre %d,%d) released -- its host actor could not be kept alive (5 re-creations in a row); its acre re-rolls on the next entry\n", (unsigned)s_table[i].rec.entity_id, s_table[i].rec.kind, s_table[i].rec.species, s_table[i].rec.bx,
@@ -2063,12 +2138,26 @@ void pcwld_client_set_state(const PcWldStateEntry* e) {
     s_target[free_i].ms = pc_net_game_now_ms();
 }
 
+/* TEST-ONLY (env AC_TEST_NO_INDOOR_HOLD=1 with the test hooks): switches the B-6 "hold the creatures while the host is indoors" behaviour off, so a test can show the behaviour before the change. */
+static int pcwld_test_no_indoor_hold(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = (pc_test_hook_getenv("AC_TEST_NO_INDOOR_HOLD") != NULL) ? 1 : 0;
+    }
+    return on;
+}
+
 static const PcWldTarget* pcwld_find_target(uint32_t entity_id) {
     int i;
     const uint32_t now = pc_net_game_now_ms();
     for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
         if (s_target[i].used && s_target[i].e.entity_id == entity_id) {
-            return (now - s_target[i].ms) <= PCWLD_TARGET_STALE_MS ? &s_target[i] : NULL; /* a host that went quiet: the local AI is free again */
+            if ((now - s_target[i].ms) <= PCWLD_TARGET_STALE_MS) {
+                return &s_target[i];
+            }
+            /* a host that went quiet: the local AI is free again -- EXCEPT while the host is known to be indoors (it simulates wildlife only inside its town scene and broadcasts nothing meanwhile): then the
+             * creature is held where the host left it, instead of every client's local AI running its own, different, fish (B-6) */
+            return (pc_net_game_host_out_of_town() && !pcwld_test_no_indoor_hold()) ? &s_target[i] : NULL;
         }
     }
     return NULL;

@@ -2960,7 +2960,7 @@ static void pcnetgame_wildlife_sim_tick(void);
 static void pcnetgame_handle_host_bobber_state(PCNetPeerId peer, const PCNetGameBobberStateMsg* in);
 static void pcnetgame_handle_client_wildlife_state(const uint8_t* data, size_t size);
 static void pcnetgame_handle_client_bobber_event(const PCNetGameBobberEventMsg* in);
-static void pcnetgame_wildlife_replay_acre_to_peer(PCNetPeerId peer, int bx, int bz);
+static void pcnetgame_wildlife_replay_acre_to_peer(PCNetPeerId peer, const PcWildlifeRecord* recs, int n, int bx, int bz);
 static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in);
 static void pcnetgame_handle_client_room_npc(const PCNetGameRoomNpcMsg* in);
 
@@ -4787,8 +4787,42 @@ static void pcnetgame_interest_view(int id, PCInterestView* v);
  * avatar nor poison the position later read by pickup/drop validation), plus stale/duplicate
  * rejection inside pc_remote_player_on_move(). No movement/physics validation, no anti-cheat --
  * explicitly out of scope for Stage 3. */
+/* TEST-ONLY profiler of the host's MOVE relay (env AC_TEST_MOVE_PROFILE=1 with the test hooks): per 5 s it prints how many MOVEs were handled, how many destination iterations they caused, how many were
+ * relayed / thinned and where the time went (the whole handler, the pc_net_send calls, the rest = interest views + tier decision + message copy). Costs two SDL_GetPerformanceCounter() reads per MOVE and
+ * two per actual send, only when enabled. */
+static struct {
+    int      on;
+    uint64_t moves, iters, relayed, thinned, t_total, t_send, t_start;
+} s_mvprof = { -1, 0, 0, 0, 0, 0, 0, 0 };
+
+static void pcnetgame_mvprof_report(uint64_t now) {
+    const double hz = (double)SDL_GetPerformanceFrequency();
+    const double secs = (double)(now - s_mvprof.t_start) / hz;
+    if (s_mvprof.moves > 0 && s_mvprof.iters > 0) {
+        const double total_us = (double)s_mvprof.t_total * 1e6 / hz;
+        const double send_us = (double)s_mvprof.t_send * 1e6 / hz;
+        printf("[NET][PROFILE] host MOVE relay: %.1f s, %llu moves (%.0f/s), %llu destination iterations (%.1f per move), %llu relayed, %llu thinned; handler %.2f us/move total = pc_net_send %.2f us/move (%.2f us/send) + lookup/tier/copy %.2f us/move (%.3f us/iteration); CPU share of one core %.2f%%\n",
+               secs, (unsigned long long)s_mvprof.moves, (double)s_mvprof.moves / secs, (unsigned long long)s_mvprof.iters, (double)s_mvprof.iters / (double)s_mvprof.moves,
+               (unsigned long long)s_mvprof.relayed, (unsigned long long)s_mvprof.thinned, total_us / (double)s_mvprof.moves, send_us / (double)s_mvprof.moves,
+               s_mvprof.relayed > 0 ? send_us / (double)s_mvprof.relayed : 0.0, (total_us - send_us) / (double)s_mvprof.moves, (total_us - send_us) / (double)s_mvprof.iters,
+               100.0 * (total_us / 1e6) / secs);
+    }
+    s_mvprof.moves = s_mvprof.iters = s_mvprof.relayed = s_mvprof.thinned = s_mvprof.t_total = s_mvprof.t_send = 0;
+    s_mvprof.t_start = now;
+}
+
 static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_wire) {
     PCNetMoveMsg msg = *in_wire; /* private copy: action_state may be zeroed below (never the position fields) */
+    uint64_t prof_t0 = 0;
+    if (s_mvprof.on < 0) {
+        s_mvprof.on = (pc_test_hook_getenv("AC_TEST_MOVE_PROFILE") != NULL) ? 1 : 0;
+    }
+    if (s_mvprof.on) {
+        prof_t0 = SDL_GetPerformanceCounter();
+        if (s_mvprof.t_start == 0) {
+            s_mvprof.t_start = prof_t0;
+        }
+    }
     const PCNetMoveMsg* in = &msg;
     PCNetMoveSample sample;
     int i;
@@ -4828,15 +4862,30 @@ static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_
                     pcnetgame_interest_view(i, &dv);
                     tier = pc_interest_tier(&sv, &dv);
                 }
+                s_mvprof.iters += (uint64_t)s_mvprof.on;
                 if (pc_interest_relay(tier, count, boost)) {
                     PCNetMoveMsg out = *in;
+                    uint64_t ts = s_mvprof.on ? SDL_GetPerformanceCounter() : 0;
                     out.net_player_id = (uint8_t)peer;
                     pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &out, (uint16_t)sizeof(out));
+                    if (s_mvprof.on) {
+                        s_mvprof.t_send += SDL_GetPerformanceCounter() - ts;
+                        s_mvprof.relayed++;
+                    }
                     s_scale_stats.move_relayed[tier]++;
                 } else {
+                    s_mvprof.thinned += (uint64_t)s_mvprof.on;
                     s_scale_stats.move_thinned[tier]++;
                 }
             }
+        }
+    }
+    if (s_mvprof.on) {
+        const uint64_t tn = SDL_GetPerformanceCounter();
+        s_mvprof.t_total += tn - prof_t0;
+        s_mvprof.moves++;
+        if ((double)(tn - s_mvprof.t_start) >= 5.0 * (double)SDL_GetPerformanceFrequency()) {
+            pcnetgame_mvprof_report(tn);
         }
     }
 }
@@ -34413,6 +34462,7 @@ static struct {
     uint32_t entity;
     uint32_t t0, last_act, last_log;
     int      press_dpad;
+    int      golden;      /* TEST-ONLY: `fish` / `catch fish` with the word "golden": cycle the tool with the D-pad until the GOLDEN rod is the equipped item (instead of the normal rod) */
     int      stage, casts; /* the `fish` command */
     uint32_t stage_ms;
     uint32_t a_until;
@@ -34473,6 +34523,26 @@ static int pcnetgame_ap_rod_out(void) {
     return (uki != NULL && uki->status != aUKI_STATUS_CARRY) || (pa != NULL && pa->now_main_index >= mPlayer_INDEX_READY_ROD && pa->now_main_index <= mPlayer_INDEX_PUTAWAY_ROD);
 }
 
+/* TEST-ONLY: the local player's main_index and whether it is "free" (standing / walking / dashing, so that a walk command can move it). -1 when there is no town player. */
+static int pcnetgame_ap_player_state(int* free_out) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    PLAYER_ACTOR* pa;
+    if (free_out != NULL) {
+        *free_out = 0;
+    }
+    if (play == NULL || !pcfa_scene_is_town() || Now_Private == NULL) {
+        return -1;
+    }
+    pa = get_player_actor_withoutCheck(play);
+    if (pa == NULL) {
+        return -1;
+    }
+    if (free_out != NULL) {
+        *free_out = (pa->now_main_index >= mPlayer_INDEX_WAIT && pa->now_main_index <= mPlayer_INDEX_DASH) ? 1 : 0;
+    }
+    return (int)pa->now_main_index;
+}
+
 static void pcnetgame_ac_finish(const char* gone_text) {
     const int got = (s_ac_result != 0 && s_ac_result_entity == s_ap.entity);
     if (!got && s_ap.ac_fish && s_ap.ac_cleaning == 0 && pcnetgame_ap_rod_out()) {
@@ -34485,9 +34555,18 @@ static void pcnetgame_ac_finish(const char* gone_text) {
         return;
     }
     if (got && s_ac_result == 1) {
+        int fr = 0;
+        const int mi = pcnetgame_ap_player_state(&fr);
+        char det[96];
         pcnetgame_ac_state(AC_SUCCESS);
         printf("[AUTO-CATCH] kind=%s entity=%u result=SUCCESS\n", s_ap.ac_fish ? "FISH" : "BUG", (unsigned)s_ap.entity);
-        pcnetgame_ap_done("ok", "catch accepted by the host");
+        if (!fr) { /* the verdict is in but the player is still inside a rod / net dialogue: say so, the next command would otherwise stall on a player that cannot move */
+            printf("[AUTO-CATCH] WARNING: finishing with the player NOT free (main_index %d, rod out %d)\n", mi, pcnetgame_ap_rod_out());
+            snprintf(det, sizeof(det), "catch accepted by the host (player NOT free: main_index %d)", mi);
+        } else {
+            snprintf(det, sizeof(det), "catch accepted by the host");
+        }
+        pcnetgame_ap_done("ok", det);
     } else if (got) {
         pcnetgame_ac_state(AC_FAILURE);
         printf("[AUTO-CATCH] kind=%s entity=%u result=REJECTED\n", s_ap.ac_fish ? "FISH" : "BUG", (unsigned)s_ap.entity);
@@ -34561,7 +34640,9 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
         s_ap.t0 = s_ap.last_log = now;
         s_ap.active = 1;
         if (strcmp(cmd, "pos") == 0) {
-            printf("[AUTO] pos %d x=%.1f z=%.1f block=(%d,%d)\n", id, (double)px, (double)pz, (int)(px / 640.0f), (int)(pz / 640.0f));
+            int pfree = 0;
+            const int pmi = pcnetgame_ap_player_state(&pfree);
+            printf("[AUTO] pos %d x=%.1f z=%.1f block=(%d,%d) main_index=%d free=%d\n", id, (double)px, (double)pz, (int)(px / 640.0f), (int)(pz / 640.0f), pmi, pfree);
             s_ap.active = 0;
         } else if (strcmp(cmd, "walk") == 0 && sscanf(line, "%*d %*s %f %f", &a, &b) == 2) {
             float rad = 20.0f;
@@ -34604,6 +34685,17 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             }
             printf("[AUTO] killfish %d entity %lu %s\n", id, ent, found ? "actor flagged for destruction" : "no such local actor");
             s_ap.active = 0;
+        } else if (strcmp(cmd, "endbug") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY: this process's actor of bug ENT ends the way a species program ends its insect (the destruct flag) */
+            int sp2 = 0;
+            aINS_INSECT_ACTOR* eb = (aINS_INSECT_ACTOR*)pcwld_bug_local_actor_for_entity((uint32_t)ent, &sp2);
+            if (eb != NULL) {
+                eb->insect_flags.destruct = TRUE;
+            }
+            printf("[AUTO] endbug %d entity %lu %s\n", id, ent, eb != NULL ? "flagged as ended" : "no such local actor");
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "hdespawn") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY, host: release the authoritative record of ENT (it is despawned on every client) */
+            printf("[AUTO] hdespawn %d entity %lu %s\n", id, ent, pcwld_test_host_release((uint32_t)ent) ? "released" : "no such record");
+            s_ap.active = 0;
         } else if (strcmp(cmd, "hspawn") == 0) { /* TEST-ONLY, host: hspawn NAME|NUMBER X Z -- an authoritative fish of that species (seabass snapper coelacanth jellyfish knifejaw whale salmon2) */
             char nm[24] = { 0 };
             float fx = 0.0f, fz = 0.0f;
@@ -34643,9 +34735,22 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             const int gave = mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)ent, mPr_ITEM_COND_NORMAL);
             printf("[AUTO] give %d item 0x%04lX %s\n", id, ent, gave ? "put in a pocket" : "no free pocket");
             s_ap.active = 0;
+        } else if (strcmp(cmd, "place") == 0) { /* TEST-ONLY: place ITEM_HEX UT_X UT_Z (tile units: world / 40) -- put an item on a town ground tile through the field-authority API (a deterministic fixture, e.g. candy for the ant spawn rule) */
+            unsigned long it = 0;
+            int ux = 0, uz = 0, acre = 0, tile = 0, okp = 0;
+            if (sscanf(line, "%*d %*s %lx %d %d", &it, &ux, &uz) == 3 && pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile)) {
+                okp = pcfa_set_tile(acre, tile, (uint16_t)it);
+            }
+            printf("[AUTO] place %d item 0x%04lX at ut(%d,%d) %s\n", id, it, ux, uz, okp ? "placed" : "NOT placed");
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "equip") == 0 && sscanf(line, "%*d %*s %lx", &ent) == 1) { /* TEST-ONLY: equip ITEM_HEX -- the game's own D-pad tool cycle until that item is the equipped one (it must be in a pocket) */
+            s_ap.entity = (uint32_t)ent;
+            s_ap.press_dpad = 0;
+            s_ap.last_act = 0;
         } else if (strcmp(cmd, "dpad") == 0) {
             s_ap.press_dpad = 6; /* frames */
-        } else if (strcmp(cmd, "fish") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* fish creature ENT with the real rod: equip, stand where the cast lands on it, cast, hook the bite */
+        } else if (strcmp(cmd, "fish") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) {
+            s_ap.golden = (strstr(line, "golden") != NULL); /* fish creature ENT with the real rod: equip, stand where the cast lands on it, cast, hook the bite */
             s_ap.entity = (uint32_t)ent;
         } else if (strcmp(cmd, "net") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) {
             s_ap.entity = (uint32_t)ent;
@@ -34653,6 +34758,7 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             char kind[8] = {0};
             ent = 0;
             sscanf(line, "%*d %*s %7s %lu", kind, &ent);
+            s_ap.golden = (strstr(line, "golden") != NULL);
             if (strcmp(kind, "fish") == 0 || strcmp(kind, "bug") == 0) {
                 s_ap.ac = 1;
                 s_ap.ac_fish = (kind[0] == 'f');
@@ -34682,6 +34788,21 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             return 0;
         }
         return (((now - s_ap.t0) / 250u) & 1u) ? 1u : 0u;
+    }
+    if (strcmp(s_ap.cmd, "equip") == 0) {
+        if (Now_Private->equipment == (mActor_name_t)s_ap.entity) {
+            pcnetgame_ap_done("ok", "equipped");
+            return 0;
+        }
+        if (s_ap.press_dpad > 0) {
+            s_ap.press_dpad--;
+            return 2u;
+        }
+        if ((uint32_t)(now - s_ap.last_act) > 1500u) {
+            s_ap.last_act = now;
+            s_ap.press_dpad = 6;
+        }
+        return 0;
     }
     if (strcmp(s_ap.cmd, "dpad") == 0) {
         if (s_ap.press_dpad-- > 0) {
@@ -34732,13 +34853,21 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 }
             }
             if (s_ac_result != 0 && s_ac_result_entity == s_ap.entity && s_ap.stage < 6) { /* the host already answered (e.g. the race was lost before our own request) */
+                if (s_ap.ac_fish && pcnetgame_ap_rod_out()) {
+                    /* ...but the player may still be in the middle of the catch (hooking / the catch notice): finishing now leaves it inside the notice dialogue, where no later command can move it
+                     * (the "proxy_life stall": main_index NOTICE_ROD). Settle first: stage 7 presses A only while a rod dialogue is up and finishes when the player stands free. */
+                    s_ap.stage = 7;
+                    s_ap.stage_ms = now;
+                    s_ap.chk_ms = 0u;
+                    return 0;
+                }
                 pcnetgame_ac_finish("");
                 return 0;
             }
         }
         switch (s_ap.stage) {
             case 0: /* equip the rod with the game's own D-pad tool cycle */
-                if (Now_Private->equipment == (mActor_name_t)ITM_ROD) {
+                if (Now_Private->equipment == (mActor_name_t)(s_ap.golden ? ITM_GOLDEN_ROD : ITM_ROD)) {
                     s_ap.stage = 1;
                     s_ap.stage_ms = now;
                 } else if (s_ap.press_dpad > 0) {
@@ -35964,9 +36093,14 @@ static void pcnetgame_handle_host_wildlife_spawn_trigger_request(PCNetPeerId pee
         (int)in->bz - 1 >= PCFA_ACRE_Z_NUM) {
         return;
     }
-    pcwld_host_spawn_trigger((int)in->bx, (int)in->bz);
-    pcwld_host_replay_acre_local((int)in->bx, (int)in->bz); /* the HOST simulates the creatures of any acre a connected player is in: make sure its own actors exist */
-    pcnetgame_wildlife_replay_acre_to_peer(peer, (int)in->bx, (int)in->bz); /* the creatures that already live in this acre are shown to the player entering it */
+    {
+        /* the creatures that ALREADY live in this acre are shown to the player entering it; the ones this very trigger rolls are broadcast to everybody (this peer included), so they are not replayed */
+        PcWildlifeRecord existing[16];
+        const int n_existing = pcwld_host_acre_records((int)in->bx, (int)in->bz, existing, 16);
+        pcwld_host_spawn_trigger((int)in->bx, (int)in->bz);
+        pcwld_host_replay_acre_local((int)in->bx, (int)in->bz); /* the HOST simulates the creatures of any acre a connected player is in: make sure its own actors exist */
+        pcnetgame_wildlife_replay_acre_to_peer(peer, existing, n_existing, (int)in->bx, (int)in->bz);
+    }
 }
 
 /* T1 client handler: validates the message (a TRUST BOUNDARY -- this data comes straight off the
@@ -36096,6 +36230,19 @@ static void pcnetgame_host_check_wildlife_attendance(void) {
 }
 
 /* ---- host-authoritative wildlife simulation: the wire side (see pc_wildlife_authority.h) ---- */
+
+/* CLIENT: 1 while the host is connected (READY) and its last announced scene is NOT the town (it is inside a house / shop / museum ...). The host simulates all wildlife inside its own town scene, so it
+ * broadcasts nothing while it is indoors; a client uses this to hold the creatures where the host left them instead of letting its local vanilla AI run them off (B-6). */
+int pc_net_game_host_out_of_town(void) {
+    PCNetPlayerScene sc;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (!pc_remote_player_get_scene((PCNetPlayerId)PC_NETGAME_HOST_PLAYER_ID, &sc)) {
+        return 0;
+    }
+    return (sc.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0;
+}
 
 int pc_net_game_wildlife_remote_players(PcWldRemotePlayer* out, int max) {
     int p, n = 0;
@@ -36332,13 +36479,11 @@ static void pcnetgame_handle_client_bobber_event(const PCNetGameBobberEventMsg* 
 }
 
 /* host -> ONE peer: the live records of the acre it just entered, as ordinary WILDLIFE_SPAWN messages (a duplicate of an actor the peer still has is ignored, one it lost is re-created). */
-static void pcnetgame_wildlife_replay_acre_to_peer(PCNetPeerId peer, int bx, int bz) {
-    PcWildlifeRecord recs[16];
-    int i, n;
+static void pcnetgame_wildlife_replay_acre_to_peer(PCNetPeerId peer, const PcWildlifeRecord* recs, int n, int bx, int bz) {
+    int i;
     if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    n = pcwld_host_acre_records(bx, bz, recs, 16);
     for (i = 0; i < n; i++) {
         PCNetGameWildlifeSpawnMsg msg;
         memset(&msg, 0, sizeof(msg));

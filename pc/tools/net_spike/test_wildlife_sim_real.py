@@ -120,12 +120,34 @@ def cross(p, tries=6):
     return False
 
 
-def ensure_creature(S, who, kind):
+def ensure_creature(S, who, kind, free_others=False):
     """a live fish (kind 0) / bug (kind 1) in the host's table; `who` walks in and out of acre (4,2) until the host rolled one"""
     for _ in range(16):
         e = live_kind(S, kind)
         if e:
+            if free_others and kind == 0 and len(e) > 1:
+                # the host (and each client) has only 2 fish actors for ALL players (vanilla pool, TODO W-05): fish records left over from earlier steps would take the pool and the chosen fish would
+                # get no host actor (the host then releases it). Release the others (the host's own test command) so the fish under test has room.
+                for other in e[:-1]:
+                    S.players["host"].cmd("hdespawn %d" % other, 20)
+                time.sleep(3)
             return e[-1]
+        cross(S.players[who])
+        time.sleep(2)
+    return None
+
+
+def surviving_fish(S, who):
+    """a live fish that is STILL in the host's table 9 s after it was picked. A fish whose own program destroys it as soon as it is (re-)created (the host re-creates it up to 5 times, then releases
+    the record like a creature that is simply gone) cannot be fished by anybody; it is not what these tests are about."""
+    for _ in range(4):
+        e = ensure_creature(S, who, 0, free_others=True)
+        if e is None:
+            return None
+        time.sleep(9)
+        if e in table_now(S):
+            return e
+        L.info("fish %d ended by itself (released by the host), picking another" % e)
         cross(S.players[who])
         time.sleep(2)
     return None
@@ -167,12 +189,20 @@ def s1(S):
     names = ["host", "A", "B"]
     since = {w: len(S.log(w)) for w in names}
     time.sleep(40)
+    alive_end = set(table_now(S))
+    survivors = 0
     for e in ents:
         sp = spread(S, names, since, e)
+        if e not in alive_end:
+            # an insect whose own species program ended it is released by the host at once (like vanilla it is simply gone), and every process drops it: it cannot have 40 s of samples
+            L.info("S1 entity %d ended during the 40 s window (released by the host; %d samples while it lived)" % (e, len(sp)))
+            continue
+        survivors += 1
         if len(sp) >= 20:
             check("S1 entity %d: host, A and B copies stay together for %d s (max %.0f, mean %.0f units apart)" % (e, len(sp), max(sp), sum(sp) / len(sp)), max(sp) < 90 and sum(sp) / len(sp) < 35)
         else:
             check("S1 entity %d has a trace in every process (%d samples)" % (e, len(sp)), False)
+    check("S1 at least one of the rolled creatures lived through the whole window (%d of %d)" % (survivors, len(ents)), survivors >= 1)
     hm = {e: traces(S, "host", since["host"]).get(e, []) for e in ents}
     check("S1 the host's creatures really moved while the host player stood far away (some creature moved > 12 units in 40 s)",
           any(len(v) > 1 and max(((p[0] - v[0][0]) ** 2 + (p[1] - v[0][1]) ** 2) ** 0.5 for p in v) > 12 for v in hm.values()))
@@ -181,7 +211,7 @@ def s1(S):
 def catch_fish(S, who, observers, tag):
     check = S.check
     P = S.players[who]
-    ent = ensure_creature(S, "A" if who != "A" else "A", 0)
+    ent = surviving_fish(S, "A")
     check("%s a live fish exists" % tag, ent is not None)
     if ent is None:
         return None
@@ -219,7 +249,21 @@ def catch_fish(S, who, observers, tag):
 
 
 def net_catch(S, who, tag, exclude=()):
-    check = S.check
+    """A bug can end by its own species program before the net reaches it (the host then releases it, like vanilla), or sit too high to net: a round that finds no catchable bug re-rolls fresh bugs
+    (crossing acres) and tries again, up to 3 rounds. Only the last round records failures, and a catch that happened is always checked in full."""
+    for rnd in (1, 2, 3):
+        r = _net_catch_round(S, who, tag, exclude, rnd == 3)
+        if r is not None:
+            return r
+        if rnd < 3:
+            L.info("%s: round %d found no catchable bug, re-rolling" % (tag, rnd))
+            cross(S.players["A"])
+            time.sleep(3)
+    return None
+
+
+def _net_catch_round(S, who, tag, exclude, last):
+    check = S.check if last else (lambda msg, ok: ok)
     P = S.players[who]
     ent = None
     dec_ = decisions(S.log("host"))
@@ -252,15 +296,14 @@ def net_catch(S, who, tag, exclude=()):
         P.cmd("mash 10", 30)
         time.sleep(3)
         hl = S.log("host")
-        check("%s %s's net caught bug %d; the host accepted exactly one catch" % (tag, who, e), len(re.findall(r"CATCH entity %d .*accepted" % e, hl)) == 1)
+        S.check("%s %s's net caught bug %d; the host accepted exactly one catch" % (tag, who, e), len(re.findall(r"CATCH entity %d .*accepted" % e, hl)) == 1)
         if who != "host":
-            check("%s %s got the item once" % (tag, who), len(re.findall(r"CATCH request \d+ \(entity %d\) accepted -- item 0x[0-9A-F]+ granted" % e, S.log(who))) == 1)
+            S.check("%s %s got the item once" % (tag, who), len(re.findall(r"CATCH request \d+ \(entity %d\) accepted -- item 0x[0-9A-F]+ granted" % e, S.log(who))) == 1)
         for o in [w for w in ["A", "B"] if w != who and w in S.clients]:
-            check("%s %s got nothing for bug %d" % (tag, o, e), not re.search(r"CATCH request \d+ \(entity %d\) accepted" % e, S.log(o)))
-        check("%s bug %d is gone everywhere (host table + %s)" % (tag, e, who), e not in table_now(S) and e not in {b[0] for b in P.bugs()})
+            S.check("%s %s got nothing for bug %d" % (tag, o, e), not re.search(r"CATCH request \d+ \(entity %d\) accepted" % e, S.log(o)))
+        S.check("%s bug %d is gone everywhere (host table + %s)" % (tag, e, who), e not in table_now(S) and e not in {b[0] for b in P.bugs()})
         return e
-    check("%s caught one of the live bugs with the real net" % tag, False)
-    return None
+    return check("%s caught one of the live bugs with the real net" % tag, False) and None
 
 
 def main():
@@ -304,30 +347,37 @@ def main():
 def race(S):
     check = S.check
     A, B = S.players["A"], S.players["B"]
-    ent = None
-    for _ in range(16):
-        mine = sorted(A.bugs(), key=lambda t: (t[1] not in CALM, t[0]))
-        if not mine:
+    for attempt in range(3):  # a bug can end by its own species program while both players walk to it (the host then releases it, like vanilla): such a round is repeated with a fresh bug
+        ent = None
+        for _ in range(16):
+            mine = sorted(A.bugs(), key=lambda t: (t[1] not in CALM, t[0]))
+            if not mine:
+                cross(A)
+                time.sleep(2)
+                continue
+            t = mine[0]
+            enter_acre(B, int(t[2] // 640), int(t[3] // 640))
+            time.sleep(3)
+            a, b = {x[0]: x for x in A.bugs()}, {x[0]: x for x in B.bugs()}
+            if t[0] in a and t[0] in b:
+                ent = t[0]
+                break
             cross(A)
-            time.sleep(2)
+        if attempt == 2 or ent is None:
+            check("R1 A and B both see the same live bug", ent is not None)
+        if ent is None:
+            if attempt == 2:
+                return
             continue
-        t = mine[0]
-        enter_acre(B, int(t[2] // 640), int(t[3] // 640))
-        time.sleep(3)
-        a, b = {x[0]: x for x in A.bugs()}, {x[0]: x for x in B.bugs()}
-        if t[0] in a and t[0] in b:
-            ent = t[0]
-            break
-        cross(A)
-    check("R1 A and B both see the same live bug", ent is not None)
-    if ent is None:
-        return
-    race_both(S, "R1", "bug", ent)
+        if race_both(S, "R1", "bug", ent, final=(attempt == 2)) is not False:
+            if attempt < 2:
+                check("R1 A and B both see the same live bug", True)
+            return
 
 
 def race_fish(S):
     check = S.check
-    ent = ensure_creature(S, "A", 0)
+    ent = surviving_fish(S, "A")
     check("R2 a live fish exists", ent is not None)
     if ent is None:
         return
@@ -337,13 +387,18 @@ def race_fish(S):
     race_both(S, "R2", "fish", ent)
 
 
-def race_both(S, tag, kind, ent):
+def race_both(S, tag, kind, ent, final=True):
     """A and B both auto-catch entity ENT at (nearly) the same moment: the command files are written back to back, nothing serializes them"""
     check = S.check
     A, B = S.players["A"], S.players["B"]
     ca, cb = A.send("catch %s %d" % (kind, ent)), B.send("catch %s %d" % (kind, ent))
     ra, rb = A.wait(ca, 300), B.wait(cb, 300)
     L.info("%s: A: %s | B: %s" % (tag, ra, rb))
+    if not final and kind == "bug" and all(r and (" gone" in r or " rejected" in r) for r in (ra, rb)) and ent not in table_now(S):
+        L.info("%s: the bug %d ended before either catch could be granted (released by the host: both players gone / refused) -- repeating the race with a fresh bug" % (tag, ent))
+        A.cmd("mash 6", 20)
+        B.cmd("mash 6", 20)
+        return False
     verdicts = [("ok" if (r and " ok" in r) else ("rejected" if (r and " rejected" in r) else ("gone" if (r and " gone" in r) else "fail"))) for r in (ra, rb)]
     check("%s exactly one of the two auto-catches succeeded (A: %s, B: %s)" % (tag, verdicts[0], verdicts[1]), verdicts.count("ok") == 1 and all(v in ("ok", "rejected", "gone") for v in verdicts))
     A.cmd("mash 6", 20)
@@ -363,7 +418,7 @@ def race_both(S, tag, kind, ent):
 def disconnect(S):
     check = S.check
     B = S.players["B"]
-    ent = ensure_creature(S, "A", 0)
+    ent = ensure_creature(S, "A", 0, free_others=True)
     check("D1 a live fish exists", ent is not None)
     if ent is None:
         return

@@ -212,28 +212,41 @@ def collect_snapshot_begins(client, duration):
 
 def force_spawn_bugs(client, tag):
     spawns = []
-    for bx, bz in ACRES:
-        client.send_reliable(build_trigger(bx, bz))
-        spawns.extend(collect_spawns(client, 0.15))
-    spawns.extend(collect_spawns(client, 0.5))
+    for _pass in range(6):  # random roll: repeat the stimulus (up to 6 passes) until at least two ordinary bugs exist
+        for bx, bz in ACRES:
+            client.send_reliable(build_trigger(bx, bz))
+            spawns.extend(collect_spawns(client, 0.15))
+        spawns.extend(collect_spawns(client, 0.5))
+        if len([s for s in spawns if s["kind"] == KIND_BUG and s["species"] != AINS_INSECT_TYPE_ANT]) >= 2:
+            break
     bugs = [s for s in spawns if s["kind"] == KIND_BUG]
     print(f"[bug-catch] {tag}: forced spawn burst produced {len(spawns)} total spawn(s), {len(bugs)} BUG")
     return bugs
 
 
-def force_spawn_one_ordinary_bug(client, tag):
+def force_spawn_one_ordinary_bug(client, tag, host_player=None):
     """Like force_spawn_bugs(), but stops at the first NON-ANT bug (an ordinary catchable target) --
     mirrors test_wildlife_catch_exchange_gate.py's own force_spawn_one_fish() precedent: a single,
     unambiguous target entity_id is needed wherever a racer must be pre-positioned before a real client
     even boots."""
-    for bx, bz in ACRES:
-        client.send_reliable(build_trigger(bx, bz))
-        spawns = collect_spawns(client, 0.15)
-        ordinary = [s for s in spawns if s["kind"] == KIND_BUG and s["species"] != AINS_INSECT_TYPE_ANT]
-        if ordinary:
-            print(f"[bug-catch] {tag}: single-bug seed found entity {ordinary[0]['entity_id']} "
-                  f"(species {ordinary[0]['species']}) at acre ({bx},{bz})")
-            return ordinary[0]
+    seen_bugs = set()
+    for _pass in range(3):  # the roll is random (a pass may produce no bug at all): an acre without a bug record rolls again on the next trigger
+        for bx, bz in ACRES:
+            client.send_reliable(build_trigger(bx, bz))
+            spawns = collect_spawns(client, 0.15)
+            seen_bugs.update(s["entity_id"] for s in spawns if s["kind"] == KIND_BUG)
+            ordinary = [s for s in spawns if s["kind"] == KIND_BUG and s["species"] != AINS_INSECT_TYPE_ANT]
+            if ordinary:
+                print(f"[bug-catch] {tag}: single-bug seed found entity {ordinary[0]['entity_id']} "
+                      f"(species {ordinary[0]['species']}) at acre ({bx},{bz}); {len(seen_bugs) - 1} other bug record(s) exist")
+                if host_player is not None:
+                    # One roll can announce several bugs at once (a whole swarm in one acre) and every record persists: the real client would latch an arbitrary one of them. A single, unambiguous
+                    # target is the premise of the race, so the host releases every other bug record (test-only `hdespawn`).
+                    for other in sorted(seen_bugs - {ordinary[0]["entity_id"]}):
+                        host_player.cmd("hdespawn %d" % other, 20)
+                    time.sleep(1.0)
+                    collect_despawns(client, 0.5)
+                return ordinary[0]
     spawns = collect_spawns(client, 0.5)
     ordinary = [s for s in spawns if s["kind"] == KIND_BUG and s["species"] != AINS_INSECT_TYPE_ANT]
     return ordinary[0] if ordinary else None
@@ -417,8 +430,12 @@ def test_b(port, log_dir, results):
 # ---------------------------------------------------------------------------------------------------
 def test_protocol_suite(port, log_dir, results):
     log_path = os.path.join(log_dir, "bugcatch_protocol_host.log")
+    # A fixture for TEST ANT: ants spawn only ON_CANDY / ON_TRASH (a candy / spoiled turnip lying in the acre, no rain or snow -- ac_set_ovl_insect.c), and the fixture town has neither. The test-only
+    # autopilot `place` command puts candy on a ground tile of every acre the seeding triggers, through the field-authority API. Normal gameplay and the spawn rules are untouched.
+    import wplay_lib as W
+    W.make_fixture()  # always the freshly built executable
     host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", "0", "--authoritative-wildlife"],
-                         log_path=log_path).start()
+                         env={"AC_TEST_AUTOPILOT": "ac_auto_host.txt"}, bin_dir=W.BIN, log_path=log_path).start()
     try:
         if not host.wait_listening(60.0):
             check("protocol suite: host reached listening state", False, results)
@@ -427,6 +444,8 @@ def test_protocol_suite(port, log_dir, results):
             check("protocol suite: host reached genuine field-ready state (boot_to_field)", False, results)
             return
         check("protocol suite: host reached genuine field-ready state (boot_to_field)", True, results)
+
+        hp = W.Player(L, "host", host)
 
         a = FakeClient("A", "127.0.0.1", port)
         a.connect_and_ready()
@@ -516,11 +535,19 @@ def test_protocol_suite(port, log_dir, results):
         # -----------------------------------------------------------------------------------------
         print("=" * 72)
         print("[bug-catch] TEST ANT: explicit ant-exclusion guard")
-        ant_retry = 0
-        while not ants and ant_retry < 6:
-            more = force_spawn_bugs(a, f"ant-seed-{ant_retry}")
+        # The fixture: ONE acre gets a candy on its centre tile (16 tiles of 40 units per acre). With candy lying in an acre the spawn roll of that acre produces ants (and only ants), so it is
+        # kept to a single, otherwise unused acre that is triggered on its own -- candy in every acre would crowd out the ordinary bugs the other tests need.
+        ant_acre = (5, 3)  # an acre none of the other seeding triggers: an acre that already holds a bug record only replays it instead of rolling again
+        r = hp.cmd("place 2806 %d %d" % (ant_acre[0] * 16 + 8, ant_acre[1] * 16 + 8), 20)  # ITM_FOOD_CANDY == 0x2806
+        check(f"TEST ANT: the ant fixture (candy on the ground) was placed in acre {ant_acre} ({r})", r is not None and "NOT placed" not in r, results)
+        ants = []
+        for ant_retry in range(6):
+            a.send_reliable(build_trigger(*ant_acre))
+            more = collect_spawns(a, 0.5)
             ants = [b for b in more if b["species"] == AINS_INSECT_TYPE_ANT]
-            ant_retry += 1
+            print(f"[bug-catch] ant-seed-{ant_retry}: trigger of acre {ant_acre} produced {len(more)} spawn(s), {len(ants)} ANT")
+            if ants:
+                break
         check("TEST ANT: at least one real ANT spawn observed for testing (RNG-dependent -- ants DO get "
               "a real entity_id and ARE broadcast, per pcwld_shim_make_ant_proc()'s own doc, even though "
               "T1 never gives them a local presentation actor)",
@@ -649,8 +676,9 @@ def test_label_race(port, log_dir, results):
     print("=" * 72)
     print("[bug-catch] TEST LABEL-RACE: losing peer's local actor still holds the net-catch label when "
           "the winner's WILDLIFE_DESPAWN lands (T8 review fix regression)")
+    import wplay_lib as W
     host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", "0", "--authoritative-wildlife",
-                                               "--diag-bug-despawn-label-race"],
+                                               "--diag-bug-despawn-label-race"], env={"AC_TEST_AUTOPILOT": "ac_auto_host.txt"}, bin_dir=W.BIN,
                          log_path=os.path.join(log_dir, "bugcatch_labelrace_host.log")).start()
     racer = None
     try:
@@ -673,7 +701,7 @@ def test_label_race(port, log_dir, results):
         seed = FakeClient("seed", "127.0.0.1", port)
         seed.connect_and_ready()
         seed.drain_field_updates(timeout=0.3)
-        target = force_spawn_one_ordinary_bug(seed, "seed")
+        target = force_spawn_one_ordinary_bug(seed, "seed", W.Player(L, "host", host))
         check("LABEL-RACE: at least one real ordinary (non-ant) BUG spawn seeded on the host "
               "(RNG-dependent)", target is not None, results)
         if target is None:
@@ -816,7 +844,8 @@ def test_exchange_h(port, log_dir, results):
     print("=" * 72)
     print("[bug-catch] TEST EXCHANGE-H: client-side race -- loser's query_catch_outcome() must read "
           "REJECTED")
-    host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", "0", "--authoritative-wildlife"],
+    import wplay_lib as W
+    host = L.HostProcess(port=port, extra_args=["--bootstrap-resident", "0", "--authoritative-wildlife"], env={"AC_TEST_AUTOPILOT": "ac_auto_host.txt"}, bin_dir=W.BIN,
                          log_path=os.path.join(log_dir, "bugcatch_exchangeH_host.log")).start()
     client = None
     racer = None
@@ -832,7 +861,7 @@ def test_exchange_h(port, log_dir, results):
         seed = FakeClient("seed", "127.0.0.1", port)
         seed.connect_and_ready()
         seed.drain_field_updates(timeout=0.3)
-        target = force_spawn_one_ordinary_bug(seed, "seed")
+        target = force_spawn_one_ordinary_bug(seed, "seed", W.Player(L, "host", host))
         check("EXCHANGE-H: at least one real ordinary BUG spawn produced for the race (RNG-dependent)",
               target is not None, results)
         if target is None:
