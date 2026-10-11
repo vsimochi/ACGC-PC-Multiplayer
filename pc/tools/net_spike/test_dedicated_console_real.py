@@ -41,6 +41,10 @@ def screen(pid):
     return json.load(open(out))
 
 
+def resize(pid, w, h=30):
+    return subprocess.run([sys.executable, HELPER, str(pid), "resize", str(w), str(h)], capture_output=True, text=True, timeout=30).returncode == 0
+
+
 def send(pid, spec):
     r = subprocess.run([sys.executable, HELPER, str(pid), "send", spec], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
@@ -172,10 +176,54 @@ def main():
         n_before = sum(1 for r in s["rows"] if "dedicated: yes" in r)
         send(pid, "{ENTER}")
         s = wait_for(pid, lambda x: sum(1 for r in x["rows"] if "dedicated: yes" in r) > n_before, 20)
-        time.sleep(1.0)
-        s = screen(pid)
+        prev = None
+        for _ in range(12):  # the response arrives in several writes: read the screen once it has stopped changing
+            time.sleep(0.8)
+            s = screen(pid)
+            if s is not None and prev is not None and s["rows"] == prev["rows"]:
+                break
+            prev = s
         ck("R5 `status` ran exactly once (one 'dedicated: yes' response)", s is not None and sum(1 for r in s["rows"] if "dedicated: yes" in r) == n_before + 1, None if s is None else [r for r in s["rows"] if "dedicated" in r])
-        ck("R5b the submitted command stays in the scrollback as '> status' once, and a fresh empty prompt follows", s is not None and sum(1 for r in s["rows"] if r == "> status") == 1 and prompt_row(s) == ">", None if s is None else s["rows"][-12:])
+        ck("R5b the submitted command stays in the scrollback as '> status' once, and a fresh empty prompt follows", s is not None and sum(1 for r in s["rows"] if r == "> status") == 1 and prompt_row(s) == ">", None if s is None else (sum(1 for r in s["rows"] if r == "> status"), prompt_row(s), s["rows"][-3:]))
+
+        # ---- command responses use the shared format and adapt to the window width (resized for real through the console API) ----
+        def run_cmd(cmd, wait_rx, timeout=20):
+            before_rows = len(screen(pid)["rows"])
+            send(pid, cmd + "{ENTER}")
+            got = wait_for(pid, lambda x: any(re.search(wait_rx, r) for r in x["rows"][before_rows - 1:]), timeout)
+            time.sleep(0.5)
+            got = screen(pid)
+            return got["rows"][before_rows - 1:] if got else None
+
+        def words(rows):
+            return " ".join(" ".join(r.split()) for r in rows).split()
+        stop_line = "graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit"
+        ck("R8 the console window really changed size to 120 columns (the resize call worked)", resize(pid, 120) and screen(pid)["width"] == 120, screen(pid)["width"])
+        rows = run_cmd("help", r"graceful shutdown")
+        hdr = [r for r in (rows or []) if "commands (case-insensitive)" in r]
+        ck("R9 `help` at 120 columns: the headline is formatted like every notice ('HH:MM:SS INFO  DEDICATED   commands (case-insensitive):'): %s" % hdr[:1],
+           len(hdr) == 1 and re.match(r"\d\d:\d\d:\d\d INFO  DEDICATED +commands \(case-insensitive\):$", hdr[0]) is not None, rows)
+        ck("R9b every command entry is an indented body line, none is time-stamped; the stop entry is complete", rows is not None and all(any(r.startswith("  %s " % c) for r in rows) for c in ("help", "status", "players", "save", "guests", "stop"))
+           and stop_line in " ".join(words(rows)) and not any(re.match(r"\d\d:\d\d:\d\d", r) and "commands" not in r and "PROMPT" in r for r in rows), rows)
+        ck("R9c no row is longer than the window (nothing broke at the console's own edge)", rows is not None and all(len(r) <= 119 for r in rows), [len(r) for r in (rows or [])])
+        ck("R10 the response block and its command echo kept the order: '> help' echo, headline, entries, fresh prompt", prompt_row(screen(pid)) == ">")
+        ck("R11 the console window really changed size to 56 columns (buffer and window): %s" % ((lambda q: (q["width"], q["win_w"]))(screen(pid)),), resize(pid, 56) and screen(pid)["width"] == 56 and screen(pid)["win_w"] == 56, (screen(pid)["width"], screen(pid)["win_w"]))
+        rows = run_cmd("help", r"aliases: quit|quit, exit")
+        hdr = [r for r in (rows or []) if "commands (case-insensitive)" in r]
+        ck("R12 `help` at 56 columns: narrow layout 'INFO  [DEDICATED] commands (case-insensitive):' (the LEVEL word kept, no time column): %s" % hdr[:1], len(hdr) == 1 and hdr[0].startswith("INFO  [DEDICATED] commands"), rows)
+        si = [i for i, r in enumerate(rows or []) if r.startswith("  stop     graceful")]
+        tail_rows = [r for r in (rows or [])[(si[0] + 1 if si else 0):] if r != ">" and r != ""]
+        ck("R12b at 56 columns every row fits, the stop entry is complete across its wrapped rows, and the wrapped rows are aligned under the description (11 spaces)",
+           rows is not None and si and all(len(r) <= 55 for r in rows) and stop_line in " ".join(words(rows)) and tail_rows and all(r.startswith(" " * 11) and not r.startswith(" " * 12) for r in tail_rows), rows)
+        send(pid, "abc")
+        ck("R13 narrowing the window while 'abc' is typed keeps it: prompt row '> abc', cursor after it", resize(pid, 40) and (lambda s: prompt_row(s) == "> abc" and s["cx"] == 5)(screen(pid)), (prompt_row(screen(pid)), screen(pid)["cx"]))
+        ck("R13b widening it again too", resize(pid, 100) and (lambda s: prompt_row(s) == "> abc" and s["cx"] == 5)(screen(pid)), (prompt_row(screen(pid)), screen(pid)["cx"]))
+        send(pid, "{ESC}")
+        rows = run_cmd("give", r"GIVE FAILED|usage")
+        ck("R14 an error response carries its LEVEL: 'ERROR' for 'GIVE FAILED: ...' at 100 columns, wrapped inside the window: %s" % (rows[:2] if rows else rows),
+           rows is not None and any(re.match(r"\d\d:\d\d:\d\d ERROR DEDICATED +GIVE FAILED", r) for r in rows) and all(len(r) <= 99 for r in rows), rows)
+        resize(pid, 120)
+        send(pid, "{ESC}")
 
         # ---- shutdown while the console waits for input ----
         send(pid, "sto")

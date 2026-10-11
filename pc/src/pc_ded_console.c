@@ -211,10 +211,6 @@ int pc_dedc_classify(const char* raw) {
     return 0;
 }
 
-#define PFX_LEVEL 5   /* INFO / WARN / ERROR (padded) */
-#define PFX_SUB 14    /* subsystem column */
-#define PFX_TOTAL (8 + 1 + PFX_LEVEL + 1 + PFX_SUB + 1)
-
 /* "[TAG]" at s -> copies TAG (upper case, max 15) to tag and returns the length of "[TAG]", else 0 */
 static size_t take_tag(const char* s, char* tag) {
     size_t n = 0;
@@ -260,6 +256,133 @@ static const char* skip_timestamp(const char* s) {
     return s;
 }
 
+#define PFX_LEVEL 5   /* INFO / WARN / ERROR (padded) */
+#define PFX_SUB 14    /* subsystem column */
+#define PFX_TOTAL (8 + 1 + PFX_LEVEL + 1 + PFX_SUB + 1)
+
+/* How much of the prefix fits: wide windows get the full "HH:MM:SS LEVEL SUBSYSTEM " (30 columns), medium ones "HH:MM:SS LEVEL " (15, the subsystem moves into the message as [TAG]), narrow ones just "LEVEL "
+ * (6). The LEVEL word is always there. width <= 0 = unknown: the full prefix, no wrapping. */
+#define PFX_MODE_FULL 0
+#define PFX_MODE_MEDIUM 1
+#define PFX_MODE_NARROW 2
+static int pfx_mode(int width) {
+    return (width <= 0 || width >= 100) ? PFX_MODE_FULL : (width >= 60 ? PFX_MODE_MEDIUM : PFX_MODE_NARROW);
+}
+static int pfx_cols(int mode) {
+    return mode == PFX_MODE_FULL ? PFX_TOTAL : (mode == PFX_MODE_MEDIUM ? 8 + 1 + PFX_LEVEL + 1 : PFX_LEVEL + 1);
+}
+
+/* Writes `text` wrapped (a word is never cut unless it is longer than a whole row). The first row is written where the cursor is and may hold `first_avail` characters; every following row starts on a
+ * new line with `indent` spaces and holds `cont_avail` characters. Spaces that only existed at a break are dropped, nothing else is. */
+static void put_wrapped(Ob* o, const char* text, int first_avail, int cont_avail, int indent) {
+    const char* p = text;
+    int first = 1;
+    if (first_avail < 8) {
+        first_avail = 8;
+    }
+    if (cont_avail < 8) {
+        cont_avail = 8;
+    }
+    if ((int)strlen(text) <= first_avail) {
+        ob_puts(o, text);
+        return;
+    }
+    while (*p != '\0') {
+        int len = (int)strlen(p);
+        int avail = first ? first_avail : cont_avail;
+        int cut = len;
+        int k;
+        if (len > avail) {
+            cut = avail;
+            for (k = avail; k > avail / 3; k--) {
+                if (p[k] == ' ') {
+                    cut = k;
+                    break;
+                }
+            }
+        }
+        if (!first) {
+            int i;
+            ob_putc(o, '\n');
+            for (i = 0; i < indent; i++) {
+                ob_putc(o, ' ');
+            }
+        }
+        ob_putn(o, p, (size_t)cut);
+        p += cut;
+        while (*p == ' ') {
+            p++;
+        }
+        first = 0;
+    }
+}
+
+/* the column where the description of a table-like body line starts ("  help     list the commands" -> 11): the end of the first run of 2+ spaces after the first word; otherwise the line's
+ * own indent + 2 */
+static int hanging_indent(const char* line) {
+    int ind = 0;
+    int i;
+    while (line[ind] == ' ') {
+        ind++;
+    }
+    i = ind;
+    while (line[i] != '\0') {
+        if (line[i] == ' ' && line[i + 1] == ' ') {
+            int j = i;
+            while (line[j] == ' ') {
+                j++;
+            }
+            return line[j] != '\0' ? j : ind + 2;
+        }
+        i++;
+    }
+    return ind + 2;
+}
+
+size_t pc_dedc_wrap_body(const char* raw, int width, char* out, size_t cap) {
+    Ob o;
+    char line[PC_DEDC_LINE_MAX * 2 + 8];
+    size_t n = strlen(raw);
+    int ind = 0;
+    int hang;
+    int avail;
+    if (n >= sizeof(line)) {
+        n = sizeof(line) - 1;
+    }
+    memcpy(line, raw, n);
+    line[n] = '\0';
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+        line[--n] = '\0';
+    }
+    ob_init(&o, out, cap);
+    width = clamp_width(width);
+    avail = width - 1;
+    while (line[ind] == ' ') {
+        ind++;
+    }
+    hang = hanging_indent(line);
+    if (hang > avail / 3) {
+        hang = ind + 2 > avail / 3 ? 0 : ind + 2; /* a very narrow window: keep the text, give up the deep alignment */
+    }
+    /* the first row keeps the line's own indent; continuation rows are aligned at `hang` */
+    {
+        Ob tmp;
+        char row[PC_DEDC_LINE_MAX * 2 + 8];
+        ob_init(&tmp, row, sizeof(row));
+        put_wrapped(&tmp, line + ind, avail - ind, avail - hang, hang);
+        /* put_wrapped measured the first row without its indent: write the indent, then the text */
+        {
+            int i;
+            for (i = 0; i < ind; i++) {
+                ob_putc(&o, ' ');
+            }
+        }
+        /* continuation rows were indented by `hang` already relative to column 0 */
+        ob_puts(&o, row);
+    }
+    return o.n;
+}
+
 size_t pc_dedc_format(const char* raw, int hh, int mm, int ss, int color, int width, char* out, size_t cap) {
     static const char* const lvl_name[3] = { "INFO ", "WARN ", "ERROR" };
     static const char* const lvl_col[3] = { "\x1b[0m", "\x1b[33m", "\x1b[1;31m" };
@@ -267,12 +390,15 @@ size_t pc_dedc_format(const char* raw, int hh, int mm, int ss, int color, int wi
     char tag[40];
     char sub[16];
     char t1[16];
+    char body[PC_DEDC_LINE_MAX * 2 + 64];
     size_t n;
     int lvl;
+    int mode;
+    int pcols;
+    int avail;
     const char* msg;
     Ob o;
     char pfx[64];
-    int body_w;
 
     /* strip the line ending(s) */
     n = strlen(raw);
@@ -286,13 +412,35 @@ size_t pc_dedc_format(const char* raw, int hh, int mm, int ss, int color, int wi
     }
 
     ob_init(&o, out, cap);
+    mode = pfx_mode(width);
+    pcols = pfx_cols(mode);
+    avail = width > 0 ? clamp_width(width) - 1 - pcols : 0;
     lvl = pc_dedc_classify(line);
     if (line[0] == ' ' || line[0] == '\t') {
-        /* continuation of the previous message: indented under it, no prefix */
-        memset(pfx, ' ', PFX_TOTAL);
-        pfx[PFX_TOTAL] = '\0';
-        ob_puts(&o, pfx);
-        ob_puts(&o, line + 1);
+        /* continuation of the previous message: indented under it, no prefix; its own indentation is kept and long rows wrap under it */
+        int i;
+        for (i = 0; i < pcols; i++) {
+            ob_putc(&o, ' ');
+        }
+        if (avail > 0) {
+            char wrapped[PC_DEDC_LINE_MAX * 2 + 64];
+            char* r;
+            char* nl;
+            pc_dedc_wrap_body(line + 1, avail + 1, wrapped, sizeof(wrapped));
+            /* pc_dedc_wrap_body indents continuation rows relative to column 0: shift them under the prefix */
+            r = wrapped;
+            while ((nl = strchr(r, '\n')) != NULL) {
+                ob_putn(&o, r, (size_t)(nl - r));
+                ob_putc(&o, '\n');
+                for (i = 0; i < pcols; i++) {
+                    ob_putc(&o, ' ');
+                }
+                r = nl + 1;
+            }
+            ob_puts(&o, r);
+        } else {
+            ob_puts(&o, line + 1);
+        }
         return o.n;
     }
 
@@ -334,12 +482,21 @@ size_t pc_dedc_format(const char* raw, int hh, int mm, int ss, int color, int wi
     } else {
         snprintf(tag, sizeof(tag), "%s", "GAME");
     }
+
+    /* the message text; in the medium / narrow layouts the subsystem travels with it as [TAG] */
+    if (mode == PFX_MODE_FULL) {
+        snprintf(body, sizeof(body), "%s", msg);
+    } else {
+        snprintf(body, sizeof(body), "[%s] %s", tag, msg);
+    }
     if (strlen(tag) > PFX_SUB) {
         tag[PFX_SUB] = '\0';
     }
 
-    snprintf(pfx, sizeof(pfx), "%02d:%02d:%02d ", hh % 100, mm % 100, ss % 100);
-    ob_puts(&o, pfx);
+    if (mode != PFX_MODE_NARROW) {
+        snprintf(pfx, sizeof(pfx), "%02d:%02d:%02d ", hh % 100, mm % 100, ss % 100);
+        ob_puts(&o, pfx);
+    }
     if (color) {
         ob_puts(&o, lvl_col[lvl]);
     }
@@ -348,55 +505,18 @@ size_t pc_dedc_format(const char* raw, int hh, int mm, int ss, int color, int wi
         ob_puts(&o, "\x1b[0m");
     }
     ob_putc(&o, ' ');
-    if (color) {
-        ob_puts(&o, "\x1b[36m");
-    }
-    {
+    if (mode == PFX_MODE_FULL) {
         char col[64];
+        if (color) {
+            ob_puts(&o, "\x1b[36m");
+        }
         snprintf(col, sizeof(col), "%-*.*s", PFX_SUB, PFX_SUB, tag);
         ob_puts(&o, col);
-    }
-    if (color) {
-        ob_puts(&o, "\x1b[0m");
-    }
-    ob_putc(&o, ' ');
-
-    body_w = width > 0 ? clamp_width(width) - PFX_TOTAL - 1 : 0;
-    if (body_w < 20) {
-        body_w = 0; /* too narrow to wrap sensibly */
-    }
-    if (body_w == 0 || (int)strlen(msg) <= body_w) {
-        ob_puts(&o, msg);
-    } else {
-        /* wrap at spaces; continuation rows are indented under the message */
-        const char* p = msg;
-        int first = 1;
-        while (*p != '\0') {
-            int len = (int)strlen(p);
-            int cut = len;
-            int k;
-            if (len > body_w) {
-                cut = body_w;
-                for (k = body_w; k > body_w / 2; k--) {
-                    if (p[k] == ' ') {
-                        cut = k;
-                        break;
-                    }
-                }
-            }
-            if (!first) {
-                ob_putc(&o, '\n');
-                memset(pfx, ' ', PFX_TOTAL);
-                pfx[PFX_TOTAL] = '\0';
-                ob_puts(&o, pfx);
-            }
-            ob_putn(&o, p, (size_t)cut);
-            p += cut;
-            while (*p == ' ') {
-                p++;
-            }
-            first = 0;
+        if (color) {
+            ob_puts(&o, "\x1b[0m");
         }
+        ob_putc(&o, ' ');
     }
+    put_wrapped(&o, body, avail > 0 ? avail : (int)strlen(body) + 1, avail > 0 ? avail : (int)strlen(body) + 1, pcols);
     return o.n;
 }

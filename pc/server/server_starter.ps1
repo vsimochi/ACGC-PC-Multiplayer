@@ -6,15 +6,24 @@
 #
 #   -CheckOnly          validate and print what would be done (the arguments, the settings.ini changes); change nothing, start nothing. Exit code 0 = valid, 2 = invalid.
 #   -WriteSettingsOnly  validate, apply the settings.ini changes, start nothing (used to test the settings.ini updater).
+#   -SkipUpdateCheck    do not look for a new release this time (server_config.ini check_updates = 0 turns it off for good).
+#   -UpdateAnswer yes|no  answer the "update now?" question on the command line (explicit consent for scripted starts); without it a start with no console to ask on NEVER installs anything.
 #
-# Exit codes: 0 ok, 2 invalid configuration / refused to start, 3 could not start or the server did not stay running.
+# STARTUP UPDATE CHECK (check_updates = 1, the default): before the server starts, ACLauncher.exe is asked - headless, no window, the game is not started - whether a newer STABLE release exists
+# (--updater-check-only). If so the version numbers are shown and the question is asked HERE, on this console. Only a "yes" runs the launcher's own verified installer (--updater-install-now: download,
+# SHA-256, package validation, staging, backup, swap, rollback; it never touches server_config.ini, settings.ini, rom\, save\, servers\ or logs). Offline / error / rate limit / bad metadata: the reason
+# is shown and the installed version starts. The launcher is always started with --updater-skip so it does not ask a second time.
+#
+# Exit codes: 0 ok, 2 invalid configuration / refused to start, 3 could not start or the server did not stay running, 6 stopped by the operator's answer or because an update was left half done.
 # PowerShell 5.1 compatible (the one that ships with Windows 10/11).
 [CmdletBinding()]
 param(
     [string]$Root = $PSScriptRoot,
     [string]$ConfigPath = '',
     [switch]$CheckOnly,
-    [switch]$WriteSettingsOnly
+    [switch]$WriteSettingsOnly,
+    [switch]$SkipUpdateCheck,
+    [ValidateSet('', 'yes', 'no')][string]$UpdateAnswer = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +42,7 @@ $Defaults = @{
     interest_management = '1'
     guest_memory_mb     = '256'
     debug_categories    = ''
-    check_updates       = '0'
+    check_updates       = '1'
 }
 # the game's -debug categories (names and aliases, from pc_log.c; a test keeps this list in step with the source) plus 'all'
 $DebugNames = @('general', 'network', 'net', 'players', 'player', 'villagers', 'villager', 'npc', 'buildings', 'building', 'houses', 'items', 'item', 'wildlife', 'fish', 'bugs',
@@ -132,7 +141,7 @@ function New-ServerPlan($cfg) {
     if ($serve -ne 'auto') { $launchArgs += @('--town-serve', $serve) }
     if ($psync -ne 'auto') { $launchArgs += @('--personal-sync', $psync) }
     if ($dbg.Count -gt 0) { $launchArgs += "--debug=$($dbg -join ',')" }
-    if ($upd -eq 0) { $launchArgs += '--updater-skip' }
+    $launchArgs += '--updater-skip' # the starter does the update check itself (check_updates = 1) or none (0): the launcher never asks a second time
 
     # settings that live only in settings.ini: no command-line switch exists. "auto" has no switch either: it is written so a stale value (for example an old 'full') cannot apply.
     $ini = [ordered]@{ interest_management = "$interest"; guest_memory_mb = "$mem" }
@@ -206,21 +215,168 @@ function Update-SettingsIni([string]$path, $wanted, [bool]$apply) {
     return , $changes
 }
 
-function Find-RunningServer([string]$exePath) {
-    $found = @()
-    foreach ($p in (Get-Process -Name 'AnimalCrossing' -ErrorAction SilentlyContinue)) {
-        $pp = $null
-        try { $pp = $p.Path } catch { $pp = $null }
-        if (-not $pp) {
-            # an elevated (administrator) process hides its path from a normal window: say so instead of silently assuming it is not ours
-            Write-Host "Note: could not read the location of AnimalCrossing.exe (process $($p.Id)). If that is your server, close it before starting another." -ForegroundColor Yellow
-        }
-        if ($pp -and ([System.IO.Path]::GetFullPath($pp) -ieq [System.IO.Path]::GetFullPath($exePath))) { $found += $p }
+# What kind of AnimalCrossing.exe process is this, relative to THIS folder's game? The dedicated server keeps its town and every host-owned file in servers\default\ and never touches save\ (the
+# folder of a normal game / client: save\card_a, save\mp), so an ordinary game of this folder can run next to it. Two dedicated servers of the same folder would write the same servers\default\ town.
+#   other      - the game of another folder (its own servers\ tree)
+#   dedicated  - this folder's game started with --dedicated: the server (or a second one)
+#   client     - this folder's game without --dedicated: a normal game / client / GUI host
+#   unknown    - the executable path or the command line cannot be read (a protected / administrator process): it cannot be ruled out that it is a server of this folder
+function Get-ProcessKind([string]$procPath, [string]$cmdLine, [string]$gamePath) {
+    if (-not $procPath) { return 'unknown' }
+    $same = $false
+    try { $same = ([System.IO.Path]::GetFullPath($procPath) -ieq [System.IO.Path]::GetFullPath($gamePath)) } catch { return 'unknown' }
+    if (-not $same) { return 'other' }
+    if (-not $cmdLine) { return 'unknown' }
+    # the arguments only: drop the program path at the front (quoted or not) so a folder name that contains "--dedicated" cannot be mistaken for the switch
+    $rest = $cmdLine.Trim()
+    if ($rest.StartsWith('"')) {
+        $q = $rest.IndexOf('"', 1)
+        if ($q -lt 0) { return 'unknown' }
+        $rest = $rest.Substring($q + 1)
+    } else {
+        $sp = $rest.IndexOf(' ')
+        $rest = $(if ($sp -lt 0) { '' } else { $rest.Substring($sp) })
     }
-    return , $found
+    if ($rest -match '(^|\s)"?--dedicated"?(\s|$)') { return 'dedicated' }
+    return 'client'
+}
+
+function Get-GameProcesses([string]$gamePath) {
+    $out = @()
+    foreach ($p in (Get-CimInstance -ClassName Win32_Process -Filter "Name='AnimalCrossing.exe'" -ErrorAction SilentlyContinue)) {
+        $out += [pscustomobject]@{ Id = $p.ProcessId; Path = $p.ExecutablePath; CmdLine = $p.CommandLine; Kind = (Get-ProcessKind $p.ExecutablePath $p.CommandLine $gamePath) }
+    }
+    return $out # unrolled: callers wrap the result in @()
+}
+
+function Find-RunningServer([string]$gamePath) {
+    return @(Get-GameProcesses $gamePath | Where-Object { $_.Kind -eq 'dedicated' })
 }
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# startup update check
+$UpdateCapMarker = 'ACLAUNCHER-CAPS:headless-update-v1' # text inside a launcher that knows --updater-check-only / --updater-install-now (an older one would run its normal flow and START THE GAME instead)
+
+function Test-LauncherCanUpdate([string]$launcherPath) {
+    try { return [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($launcherPath)).Contains($UpdateCapMarker) } catch { return $false }
+}
+
+# One answer, never ambiguous: y / yes = yes, n / no = no, anything else asks again (3 tries), then it is a NO. End of input is a NO.
+function Read-YesNo([scriptblock]$reader) {
+    for ($i = 0; $i -lt 3; $i++) {
+        $a = & $reader
+        if ($null -eq $a) { return 'no' }
+        $t = ([string]$a).Trim().ToLowerInvariant()
+        if ($t -eq 'y' -or $t -eq 'yes') { return 'yes' }
+        if ($t -eq 'n' -or $t -eq 'no') { return 'no' }
+        Write-Host 'Please answer Y or N.'
+    }
+    Write-Host 'No valid answer: treated as No. Nothing was changed.'
+    return 'no'
+}
+
+# Runs ACLauncher.exe in one of its headless modes and returns its result file as a hashtable (STATUS, INSTALLED, LATEST, MESSAGE). Bounded wait; the launcher is never killed.
+function Invoke-LauncherHeadless([string]$launcher, [string]$workDir, [string]$mode, [int]$timeoutSec) {
+    $res = Join-Path ([System.IO.Path]::GetTempPath()) ('ac-update-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $argList = @($mode, '--updater-result', ('"' + $res + '"'))
+    if ($env:AC_UPDATER_TEST -eq '1' -and $env:AC_UPDATER_TEST_API) { $argList += @('--updater-test-api', $env:AC_UPDATER_TEST_API) } # the launcher honours it only with AC_UPDATER_TEST=1 as well
+    $p = Start-Process -FilePath $launcher -ArgumentList ($argList -join ' ') -WorkingDirectory $workDir -PassThru -WindowStyle Hidden
+    $null = $p.Handle
+    if (-not $p.WaitForExit($timeoutSec * 1000)) { return @{ STATUS = 'TIMEOUT'; MESSAGE = "the updater did not finish within $timeoutSec seconds"; INSTALLED = ''; LATEST = '' } }
+    $r = @{ STATUS = 'NORESULT'; MESSAGE = "the updater wrote no result (exit code $($p.ExitCode))"; INSTALLED = ''; LATEST = '' }
+    if (Test-Path -LiteralPath $res) {
+        foreach ($l in [System.IO.File]::ReadAllText($res).Split("`n")) {
+            $eq = $l.IndexOf('=')
+            if ($eq -gt 0) { $r[$l.Substring(0, $eq).Trim()] = $l.Substring($eq + 1).Trim() }
+        }
+        Remove-Item -LiteralPath $res -Force -ErrorAction SilentlyContinue
+    }
+    return $r
+}
+
+# "Continue with the installed version?" after a failed check / update. Without a console to ask on: continue (nothing was installed).
+function Confirm-Continue([string]$installed, [bool]$interactive, [scriptblock]$reader) {
+    if (-not $interactive) { Write-Host "Continuing with the installed version $installed." ; return $true }
+    Write-Host "Start the server with the installed version $installed? [Y/N]" -NoNewline
+    Write-Host ' ' -NoNewline
+    return ((Read-YesNo $reader) -eq 'yes')
+}
+
+# Returns $true to go on starting the server, $false when the operator chose to stop (exit 6).
+function Invoke-StartupUpdate([string]$root, [string]$launcher, [bool]$interactive, [string]$answerArg, [scriptblock]$reader) {
+    $gamePath = Join-Path $root 'AnimalCrossing.exe'
+    if (-not (Test-LauncherCanUpdate $launcher)) {
+        Write-Host 'Update check skipped: this ACLauncher.exe is older and cannot check from here.' -ForegroundColor Yellow
+        Write-Host '  One-time step: open the newest ACGC-PC-Multiplayer-<version>-win64-first-install.zip (https://github.com/vsimochi/ACGC-PC-Multiplayer/releases/latest) and copy ONLY ACLauncher.exe,' -ForegroundColor Yellow
+        Write-Host '  Start Server.bat, server_starter.ps1 and SERVER_SETUP.txt over the ones in this folder (never server_config.ini, settings.ini, rom, save or servers). Details: SERVER_SETUP.txt.' -ForegroundColor Yellow
+        Write-Host '  Meanwhile start ACLauncher.exe normally to be asked about updates in a window. The server starts now.' -ForegroundColor Yellow
+        return $true
+    }
+    Write-Host 'Checking GitHub for a newer release ...'
+    $r = Invoke-LauncherHeadless $launcher $root '--updater-check-only' 120
+    $inst = $r['INSTALLED']
+    switch ($r['STATUS']) {
+        'UPTODATE' { Write-Host "Animal Crossing PC Multiplayer $inst is up to date."; return $true }
+        'UNSUPPORTED' { Write-Host "Update check not available here: $($r['MESSAGE'])" -ForegroundColor Yellow; return $true }
+        'DISABLED' { Write-Host "Update check disabled: $($r['MESSAGE'])" -ForegroundColor Yellow; return $true }
+        'AVAILABLE' { }
+        default {
+            Write-Host "The update check did not work: $($r['MESSAGE'])" -ForegroundColor Yellow
+            return (Confirm-Continue $(if ($inst) { $inst } else { 'now installed' }) $interactive $reader)
+        }
+    }
+    $latest = $r['LATEST']
+    Write-Host ''
+    Write-Host 'A newer version of Animal Crossing PC Multiplayer is available.'
+    Write-Host "Installed version: $inst"
+    Write-Host "Available version: $latest"
+    $ans = ''
+    if ($answerArg -ne '') {
+        $ans = $answerArg
+        Write-Host "Would you like to download and install the update now? [Y/N]  (answered on the command line: $ans)"
+    } elseif ($interactive) {
+        Write-Host 'Would you like to download and install the update now? [Y/N]' -NoNewline
+        Write-Host ' ' -NoNewline
+        $ans = Read-YesNo $reader
+    } else {
+        Write-Host 'Not installing: there is no console to ask on (input is redirected). Start Start Server.bat from a console window, or add -UpdateAnswer yes, to update.' -ForegroundColor Yellow
+        return $true
+    }
+    if ($ans -ne 'yes') { Write-Host "Not updating. Starting the installed version $inst."; return $true }
+
+    # an update never replaces a running game: say so instead of failing half way
+    while ($true) {
+        $clients = @(Get-GameProcesses $gamePath | Where-Object { $_.Kind -ne 'other' })
+        if ($clients.Count -eq 0) { break }
+        Write-Host "The update cannot be installed while the game of this folder is running (process $(($clients | ForEach-Object { $_.Id }) -join ', ')). Your game is not touched." -ForegroundColor Yellow
+        if (-not $interactive -or $answerArg -ne '') { Write-Host "Skipping the update; starting the installed version $inst."; return $true }
+        Write-Host 'Close it and press Enter to try again, or type S to skip the update:' -NoNewline
+        Write-Host ' ' -NoNewline
+        $x = & $reader
+        if ($null -eq $x -or $x.Trim().ToLowerInvariant() -eq 's') { Write-Host "Skipping the update; starting the installed version $inst."; return $true }
+    }
+    Write-Host "Downloading and installing $latest (the launcher verifies the SHA-256 and keeps a backup) ..."
+    $u = Invoke-LauncherHeadless $launcher $root '--updater-install-now' 900
+    if ($u['STATUS'] -eq 'TIMEOUT') {
+        throw [System.OperationCanceledException]::new("The updater is still running after 15 minutes. The server was NOT started so that it cannot start from a half-updated folder. Wait for it to finish (see updater.log), then run Start Server.bat again.")
+    }
+    if ($u['STATUS'] -eq 'UPDATED') {
+        $ver = ''
+        try { $ver = ([System.IO.File]::ReadAllText((Join-Path $root 'version.txt'))).Trim() } catch { $ver = '' }
+        if ($ver -eq $latest -and (Test-Path -LiteralPath $gamePath)) {
+            Write-Host "Updated $inst -> $latest (verified). Starting the updated server." -ForegroundColor Green
+            return $true
+        }
+        throw [System.OperationCanceledException]::new("The updater reported success but version.txt says '$ver' (expected $latest). The server was NOT started; see updater.log and .update\backup-$inst .")
+    }
+    Write-Host "The update was not installed: $($u['MESSAGE'])" -ForegroundColor Red
+    Write-Host "Your installed version $inst was kept (see updater.log)."
+    return (Confirm-Continue $inst $interactive $reader)
+}
+
+if ($MyInvocation.InvocationName -eq '.') { return } # dot-sourced (tests): only define the functions
+
 $code = 0
 try {
     $Root = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
@@ -242,6 +398,7 @@ try {
         foreach ($a in $plan.Args) { Write-Host "ARG: $a" }
         $ch = Update-SettingsIni $settingsPath $plan.Ini $false
         foreach ($c in $ch) { Write-Host "INI: $c" }
+        Write-Host ("UPDATE-CHECK: " + $(if ($plan.CheckUpdates -eq 1 -and -not $SkipUpdateCheck) { 'on (asked at start)' } else { 'off' }))
         Write-Host 'The configuration is valid.'
         exit 0
     }
@@ -254,9 +411,31 @@ try {
 
     if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { Fail "ACLauncher.exe was not found in:`n  $Root`nPut Start Server.bat and server_config.ini in the game folder, next to ACLauncher.exe." }
     if (-not (Test-Path -LiteralPath $game -PathType Leaf)) { Fail "AnimalCrossing.exe was not found in:`n  $Root`nThe game files are incomplete." }
-    $running = Find-RunningServer $game
-    if ($running.Count -gt 0) {
-        Fail "The game from this folder is already running (process $(($running | ForEach-Object { $_.Id }) -join ', ')). Close it first; if it is the server, type  stop  in the server console window. Two programs must never use the same save."
+    $procs = @(Get-GameProcesses $game)
+    $ded = @($procs | Where-Object { $_.Kind -eq 'dedicated' })
+    $unk = @($procs | Where-Object { $_.Kind -eq 'unknown' })
+    $cli = @($procs | Where-Object { $_.Kind -eq 'client' })
+    if ($ded.Count -gt 0) {
+        Fail "A dedicated server from this folder is already running (process $(($ded | ForEach-Object { $_.Id }) -join ', ')). Two servers must never use the same town (servers\default). Type  stop  in its console window first."
+    }
+    if ($unk.Count -gt 0) {
+        Fail "An AnimalCrossing.exe process (id $(($unk | ForEach-Object { $_.Id }) -join ', ')) is running and its program path or command line cannot be read (a protected or administrator process), so it cannot be ruled out that it is a dedicated server of this folder. Close it, or start Start Server.bat the same way it was started (both as administrator, or both not)."
+    }
+    if ($cli.Count -gt 0) {
+        Write-Host "A game of this folder is running (process $(($cli | ForEach-Object { $_.Id }) -join ', ')); it is left alone. That is fine: the server keeps its town in servers\default\ and never touches save\ (your own game's saves)." -ForegroundColor Cyan
+        Write-Host "  Connect your game to the server: Play Online -> add server 127.0.0.1, port $($plan.Port)." -ForegroundColor Cyan
+        Write-Host ''
+    }
+
+    if ($plan.CheckUpdates -eq 1 -and -not $SkipUpdateCheck) {
+        $interactive = $false
+        try { $interactive = -not [Console]::IsInputRedirected } catch { $interactive = $false }
+        if (-not (Invoke-StartupUpdate $Root $launcher $interactive $UpdateAnswer { [Console]::ReadLine() })) {
+            throw [System.OperationCanceledException]::new('The server was not started (you chose not to continue).')
+        }
+        Write-Host ''
+    } elseif ($plan.CheckUpdates -eq 1) {
+        Write-Host 'Update check skipped (-SkipUpdateCheck).'
     }
 
     $changes = Update-SettingsIni $settingsPath $plan.Ini $true
@@ -270,11 +449,11 @@ try {
     $p = Start-Process -FilePath $launcher -ArgumentList ($plan.Args -join ' ') -WorkingDirectory $Root -PassThru
     $null = $p.Handle # keeps the process handle so ExitCode can be read after it ends
     $up = $false
-    $deadline = (Get-Date).AddSeconds($(if ($plan.CheckUpdates -eq 0) { 25 } else { 60 }))
+    $deadline = (Get-Date).AddSeconds(25)
     $seenAt = $null
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
-        if ((Find-RunningServer $game).Count -gt 0) {
+        if (@(Find-RunningServer $game).Count -gt 0) { # a dedicated server of this folder (a game client of the folder does not count)
             if ($null -eq $seenAt) { $seenAt = Get-Date }
             if (((Get-Date) - $seenAt).TotalSeconds -ge 6) { $up = $true; break }
         } elseif ($null -ne $seenAt) {
@@ -295,9 +474,12 @@ try {
         try { if ($p.HasExited) { $lrc = $p.ExitCode } } catch { $lrc = $null }
         if ($null -ne $lrc -and $lrc -ne 0) { Write-Host "  - ACLauncher.exe itself ended with error code $lrc (it could not start the game)." -ForegroundColor Red }
         Write-Host '  - Look at updater.log and servers\default\logs\server.log in this folder.'
-        if ($plan.CheckUpdates -ne 0) { Write-Host '  - check_updates = 1: the launcher may be waiting for you to answer an update window.' }
         Write-Host '  - Another program may already use the port, or the game files may be damaged.'
     }
+} catch [System.OperationCanceledException] {
+    Write-Host ''
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    $code = 6
 } catch [System.InvalidOperationException] {
     Write-Host ''
     Write-Host 'The server was NOT started.' -ForegroundColor Red

@@ -3,6 +3,7 @@ r"""ded_con_helper.py - attaches to ANOTHER process's console (the dedicated ser
 This is the console-API equivalent of looking at the window and typing into it, WITHOUT the OS keyboard / mouse / focus (WriteConsoleInputW queues key events straight into that console's input buffer;
 the server reads them through the same ReadConsoleInputW it uses for real keystrokes). Runs as its own short-lived process because AttachConsole changes the calling process's console.
 Usage:  python ded_con_helper.py PID read OUT.json
+        python ded_con_helper.py PID resize WIDTH HEIGHT        (sets the console's window + buffer size, as dragging the window edge does)
         python ded_con_helper.py PID send "text with {BS} {LEFT} {RIGHT} {HOME} {END} {DEL} {ENTER} {ESC} tokens"  """
 import ctypes
 import json
@@ -68,7 +69,21 @@ def read_screen(out_path):
     for y in range(0, last + 1):
         k32.ReadConsoleOutputCharacterW(h, buf, width, COORD(0, y), ctypes.byref(got))
         rows.append(buf.value[:got.value].rstrip())
-    json.dump({"rows": rows, "cx": ci.dwCursorPosition.X, "cy": ci.dwCursorPosition.Y, "width": width}, open(out_path, "w"))
+    json.dump({"rows": rows, "cx": ci.dwCursorPosition.X, "cy": ci.dwCursorPosition.Y, "width": width, "win_w": ci.srWindow.Right - ci.srWindow.Left + 1, "win_h": ci.srWindow.Bottom - ci.srWindow.Top + 1}, open(out_path, "w"))
+
+
+def resize(width, height):
+    h = open_dev("CONOUT$", GENERIC_READ | GENERIC_WRITE)
+    ci = CSBI()
+    k32.GetConsoleScreenBufferInfo(h, ctypes.byref(ci))
+    cur_w = ci.srWindow.Right - ci.srWindow.Left + 1
+    win = SMALL_RECT(0, 0, width - 1, height - 1)
+    if width < cur_w:  # shrinking: the window first, then the buffer
+        k32.SetConsoleWindowInfo(h, True, ctypes.byref(win))
+        k32.SetConsoleScreenBufferSize(h, COORD(width, max(ci.dwSize.Y, height)))
+    else:
+        k32.SetConsoleScreenBufferSize(h, COORD(width, max(ci.dwSize.Y, height)))
+        k32.SetConsoleWindowInfo(h, True, ctypes.byref(win))
 
 
 def send(spec):
@@ -108,5 +123,7 @@ if __name__ == "__main__":
     attach(pid)
     if sys.argv[2] == "read":
         read_screen(sys.argv[3])
+    elif sys.argv[2] == "resize":
+        resize(int(sys.argv[3]), int(sys.argv[4]))
     else:
         send(sys.argv[3])

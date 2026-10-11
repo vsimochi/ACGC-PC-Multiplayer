@@ -135,9 +135,12 @@ def main():
            "--debug=network,guests", "--updater-skip"]
     check("A1 every setting becomes exactly its verified argument: %s" % " ".join(a), rc == 0 and a == exp)
     rc, out, a = check_args(d, check_updates="1")
-    check("A2 check_updates = 1 passes no --updater-skip (the launcher's own updater.ini decides)", rc == 0 and "--updater-skip" not in a)
+    check("A2 check_updates = 1: the STARTER asks about updates, so the launcher is still started with --updater-skip (it never asks a second time); -CheckOnly says the check is on", rc == 0 and a[-1] == "--updater-skip" and "UPDATE-CHECK: on" in out, out[-200:])
     rc, out, a = check_args(d, check_updates="0")
-    check("A3 check_updates = 0 passes --updater-skip", "--updater-skip" in a)
+    check("A3 check_updates = 0: --updater-skip too, and -CheckOnly says the check is off", a[-1] == "--updater-skip" and "UPDATE-CHECK: off" in out)
+    write_cfg(d, check_updates="1")
+    rc, out = run_ps(d, "-CheckOnly", "-SkipUpdateCheck")
+    check("A3b -SkipUpdateCheck turns the check off for one start (and -CheckOnly never touches the network)", "UPDATE-CHECK: off" in out)
     rc, out, a = check_args(d, debug_categories="all")
     check("A4 debug_categories = all -> --debug=all; empty / none -> no debug argument", a[-2:] == ["--debug=all", "--updater-skip"] and "--debug" not in " ".join(check_args(d, debug_categories="none")[2]))
     check("A5 the arguments never contain a test hook or an override flag", not any(re.search(r"force|bootstrap|clock|weather|test|full|timeout|lease", x) for x in a))
@@ -219,10 +222,15 @@ int main(int argc, char** argv) {
         sprintf(p, "%s\\AnimalCrossing.exe", dir);
         memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
         if (getenv("STUB_LAUNCHER_RC")) return atoi(getenv("STUB_LAUNCHER_RC"));
-        if (!getenv("STUB_NO_GAME")) CreateProcessA(p, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi);
+        if (!getenv("STUB_NO_GAME")) {
+            char cmd[2048];
+            snprintf(cmd, sizeof(cmd), "\"%s\"", p);
+            for (i = 1; i < argc; i++) { strcat(cmd, " "); strcat(cmd, argv[i]); }
+            CreateProcessA(p, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi);
+        }
         return 0;
     }
-    Sleep(20000);
+    Sleep(60000);
     return 0;
 }
 ''')
@@ -260,6 +268,129 @@ int main(int argc, char** argv) {
         os.remove(os.path.join(ld, "ACLauncher.exe"))
         rc4, out4 = run_ps(ld, timeout=60)
         check("L5 a missing ACLauncher.exe is refused with its path (no silent fallback to another exe)", rc4 == 2 and "ACLauncher.exe was not found" in out4)
+
+    # ---- running games of the same folder: a client may coexist, a second dedicated server may not ----
+    kinds = [
+        # (process path, command line, game path, expected kind)
+        (r"C:\G\AnimalCrossing.exe", r'"C:\G\AnimalCrossing.exe" --host 7777 --dedicated --max-peers 254', r"C:\G\AnimalCrossing.exe", "dedicated"),
+        (r"C:\G\AnimalCrossing.exe", r"C:\G\AnimalCrossing.exe --dedicated --host 7777", r"C:\G\AnimalCrossing.exe", "dedicated"),
+        (r"c:\g\ANIMALCROSSING.EXE", r'"c:\g\ANIMALCROSSING.EXE" --host 1 --dedicated', r"C:\G\AnimalCrossing.exe", "dedicated"),
+        (r"C:\G\AnimalCrossing.exe", r'"C:\G\AnimalCrossing.exe" --connect 127.0.0.1:7777', r"C:\G\AnimalCrossing.exe", "client"),
+        (r"C:\G\AnimalCrossing.exe", r'"C:\G\AnimalCrossing.exe"', r"C:\G\AnimalCrossing.exe", "client"),
+        (r"C:\G\AnimalCrossing.exe", r'"C:\G\AnimalCrossing.exe" --host 7777', r"C:\G\AnimalCrossing.exe", "client"),
+        (r"C:\x --dedicated\AnimalCrossing.exe", r'"C:\x --dedicated\AnimalCrossing.exe" --connect a:1', r"C:\x --dedicated\AnimalCrossing.exe", "client"),
+        (r"C:\Other\AnimalCrossing.exe", r'"C:\Other\AnimalCrossing.exe" --host 7777 --dedicated', r"C:\G\AnimalCrossing.exe", "other"),
+        (None, r'"C:\G\AnimalCrossing.exe" --dedicated', r"C:\G\AnimalCrossing.exe", "unknown"),
+        (r"C:\G\AnimalCrossing.exe", None, r"C:\G\AnimalCrossing.exe", "unknown"),
+        (r"C:\G\AnimalCrossing.exe", "", r"C:\G\AnimalCrossing.exe", "unknown"),
+        (r"C:\G\AnimalCrossing.exe", '"C:\\G\\AnimalCrossing.exe --dedicated', r"C:\G\AnimalCrossing.exe", "unknown"),
+    ]
+    calls = []
+    for pth, cmd, game, _want in kinds:
+        q = lambda x: "$null" if x is None else "'" + x.replace("'", "''") + "'"  # noqa: E731
+        calls.append("Get-ProcessKind %s %s %s" % (q(pth), q(cmd), q(game)))
+    script = ". '%s' -Root '%s'; " % (PS1.replace("'", "''"), HERE.replace("'", "''")) + "; ".join(calls)
+    r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    got = r.stdout.split()
+    for (pth, cmd, game, want), g in zip(kinds, got + [None] * len(kinds)):
+        check("K1 process classification %-9s: path=%s cmd=%s" % (want, pth, (cmd or "")[:60]), g == want, "got %s" % g)
+    check("K1b every case was classified (%d)" % len(got), len(got) == len(kinds), r.stderr[-300:])
+
+    if gcc is not None:
+        cd = make_dir("coexist dir (1)")
+        shutil.copy(os.path.join(ld, "AnimalCrossing.exe"), os.path.join(cd, "AnimalCrossing.exe"))
+        shutil.copy(os.path.join(ld, "AnimalCrossing.exe"), os.path.join(cd, "ACLauncher.exe"))
+        write_cfg(cd, port="7457", max_peers="254", max_guests="254", check_updates="0")
+        cfg_before = open(os.path.join(cd, "server_config.ini"), "rb").read()
+        stub = os.path.join(cd, "AnimalCrossing.exe")
+        killer2 = os.path.join(cd, "kill_all.ps1")
+        open(killer2, "w").write("\n".join(["param([string]$P)", "$n = 0",
+                                            "Get-CimInstance Win32_Process -Filter \"Name='AnimalCrossing.exe'\" | Where-Object { $_.ExecutablePath -ieq $P } | ForEach-Object { $n++; Stop-Process -Id $_.ProcessId -Force }",
+                                            "Write-Output $n", ""]))
+
+        def stop_stubs():
+            for _ in range(20):
+                rr = subprocess.run(["powershell.exe", "-NoProfile", "-File", killer2, "-P", os.path.normpath(stub)], capture_output=True, text=True, timeout=60)
+                if rr.stdout.strip() == "0":
+                    break
+                time.sleep(0.5)
+            time.sleep(0.5)
+
+        def alive(pid):
+            rr = subprocess.run(["powershell.exe", "-NoProfile", "-Command", "if (Get-Process -Id %d -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }" % pid], capture_output=True, text=True, timeout=60)
+            return rr.stdout.strip() == "yes"
+        try:
+            # a game CLIENT of this folder is running (the user's own game)
+            client = subprocess.Popen([stub, "--connect", "127.0.0.1:7457"], cwd=cd)
+            time.sleep(1.0)
+            rc, out = run_ps(cd, timeout=90)
+            args = open(os.path.join(cd, "launcher_args.txt")).read().split() if os.path.exists(os.path.join(cd, "launcher_args.txt")) else []
+            check("C1 an ordinary game client of the same folder is running: the dedicated server STARTS (exit 0), says the client is left alone, and the configured 254 / 254 limits reach the launcher: %s" % args,
+                  rc == 0 and "is running" in out and "left alone" in out and "is running in its own window" in out and args[args.index("--max-peers") + 1] == "254" and args[args.index("--max-guests") + 1] == "254", out[-500:])
+            check("C1b the client process was not touched (still alive)", alive(client.pid))
+            check("C1c server_config.ini was not modified by the start (the 254 / 254 values are exactly as the user wrote them)", open(os.path.join(cd, "server_config.ini"), "rb").read() == cfg_before)
+            # the server is up now: a SECOND start must be refused although a client is also there
+            rc2, out2 = run_ps(cd, timeout=90)
+            check("C2 a dedicated server of the same folder is already running: a second start is refused (exit 2) with the reason, and nothing is closed", rc2 == 2 and "dedicated server from this folder is already running" in out2
+                  and alive(client.pid), out2[-400:])
+        finally:
+            stop_stubs()
+        # only a client running: the post-launch check must see the SERVER (not the client) before it says "running"
+        client = subprocess.Popen([stub, "--connect", "127.0.0.1:7457"], cwd=cd)
+        time.sleep(1.0)
+        os.environ["STUB_NO_GAME"] = "1"
+        rc3, out3 = run_ps(cd, timeout=90)
+        del os.environ["STUB_NO_GAME"]
+        check("C3 a running client is not mistaken for the server: when the launcher produces no server the start is reported as failed (exit 3)", rc3 == 3 and "did not start" in out3, out3[-300:])
+        check("C3b ...and the client is still alive", alive(client.pid))
+        stop_stubs()
+        # a process whose program path / command line cannot be read: conservative refusal. (A protected process cannot be created here: the real branch is exercised by the classifier cases K1 and by
+        # this source check of the message the main flow gives for kind 'unknown'.)
+        ps_text = open(PS1, encoding="utf-8").read()
+        check("C4 an unreadable process is handled conservatively and clearly: kind 'unknown' refuses the start naming the process id and what to do",
+              "$_.Kind -eq 'unknown'" in ps_text and "cannot be read (a protected or administrator process)" in ps_text and "cannot be ruled out" in ps_text and "Close it" in ps_text)
+        check("C4b the starter never closes or kills a game process (no Stop-Process / Kill / taskkill in it)", not re.search(r"Stop-Process|\.Kill\(|taskkill", ps_text))
+
+    # ---- the first-install package: built with the repo's own packager from a stand-in build (temp only), extracted into a path with spaces and parentheses, started through the .bat ----
+    if gcc is not None:
+        import zipfile
+        pk = tempfile.mkdtemp(prefix="acpkg ")
+        TEMPS.append(pk)
+        fb = os.path.join(pk, "fake build")
+        os.makedirs(os.path.join(fb, "shaders"))
+        shutil.copy(os.path.join(ld, "AnimalCrossing.exe"), os.path.join(fb, "AnimalCrossing.exe"))
+        for n, data in (("SDL2.dll", b"MZ"), ("LICENSE", b"license\n"), ("RELEASE_NOTES.txt", b"notes\n"), ("UPDATING.txt", b"updating\n"), ("shaders/default.vert", b"v\n"), ("shaders/default.frag", b"f\n")):
+            open(os.path.join(fb, *n.split("/")), "wb").write(data)
+        stub_launcher = os.path.join(pk, "ACLauncher.exe")
+        shutil.copy(os.path.join(ld, "AnimalCrossing.exe"), stub_launcher)
+        mk = subprocess.run([sys.executable, os.path.join(REPO, "pc", "updater", "make_release_package.py"), "build", "--version", "0.1.0", "--build-dir", fb, "--launcher", stub_launcher, "--out", os.path.join(pk, "dist")],
+                            capture_output=True, text=True, timeout=120)
+        fz = os.path.join(pk, "dist", "ACGC-PC-Multiplayer-0.1.0-win64-first-install.zip")
+        uz = os.path.join(pk, "dist", "ACGC-PC-Multiplayer-0.1.0-win64.zip")
+        check("PK1 the repo's packager builds the first-install bundle from the current pc/server files", mk.returncode == 0 and os.path.isfile(fz), mk.stdout[-200:] + mk.stderr[-300:])
+        if os.path.isfile(fz):
+            names = zipfile.ZipFile(fz).namelist()
+            check("PK2 the bundle carries the four starter files next to ACLauncher.exe; the update zip does not (updates never overwrite the user's server_config.ini)",
+                  all(f in names for f in ("Start Server.bat", "server_starter.ps1", "server_config.ini", "SERVER_SETUP.txt", "ACLauncher.exe")) and not any(f in zipfile.ZipFile(uz).namelist() for f in ("server_config.ini", "Start Server.bat")))
+            ex = os.path.join(pk, "My Games (copy) 1", "Animal Crossing (v0.1.0)")
+            zipfile.ZipFile(fz).extractall(ex)
+            write_cfg(ex, port="7458", max_peers="254", max_guests="254", check_updates="0")  # the user's own values
+            user_cfg = open(os.path.join(ex, "server_config.ini"), "rb").read()
+            r = subprocess.run('"%s"' % os.path.join(ex, "Start Server.bat"), shell=True, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+            args = open(os.path.join(ex, "launcher_args.txt")).read().split() if os.path.exists(os.path.join(ex, "launcher_args.txt")) else []
+            check("PK3 the extracted bundle (path with spaces and parentheses) starts through Start Server.bat: exit 0, the launcher got 254 / 254 and port 7458: %s" % args[:6],
+                  r.returncode == 0 and args[:2] == ["--host", "7458"] and args[args.index("--max-peers") + 1] == "254" and args[args.index("--max-guests") + 1] == "254" and "is running in its own window" in r.stdout, r.stdout[-500:] + r.stderr[-200:])
+            check("PK4 the user's server_config.ini in the extracted folder is exactly as written (not reset, not rewritten)", open(os.path.join(ex, "server_config.ini"), "rb").read() == user_cfg)
+            kk = os.path.join(ex, "kill_ex.ps1")
+            open(kk, "w").write("\n".join(["param([string]$P)", "Get-CimInstance Win32_Process -Filter \"Name='AnimalCrossing.exe'\" | Where-Object { $_.ExecutablePath -ieq $P } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }", ""]))
+            subprocess.run(["powershell.exe", "-NoProfile", "-File", kk, "-P", os.path.normpath(os.path.join(ex, "AnimalCrossing.exe"))], capture_output=True, timeout=60)
+
+    # ---- the server and a client really keep separate writable state (source of the decision) ----
+    srv_c = rd("pc", "src", "pc_server.c")
+    srv_h = rd("pc", "include", "pc_server.h")
+    check("I1 the dedicated server's writable tree is servers/<id>/ (PC_SERVER_ROOT) and its town is Card A there, not save/card_a", '#define PC_SERVER_ROOT       "servers"' in srv_h and "pc_card_set_town_dir(s_town_dir)" in srv_c)
+    check("I2 the server's host-owned files (guests, members, records, restock, work jobs, log) are all under servers/<id>/", all(x in srv_c for x in ('"%s/citizens/guests.dat"', '"%s/residents/members.dat"', '"%s/residents/records.dat"', '"%s/shop_restock.ini"', '"%s/work_jobs.dat"', '"%s/logs/server.log"')))
+    check("I3 the only reads of the client tree are the optional first-start legacy adoption by COPY (the originals stay untouched, the choice is asked)", "adopted the legacy town" in srv_c and "ps_copy_new(legacy_gci, p)" in srv_c and "ps_ask_legacy_town" in srv_c)
 
     # ---- drift: the starter against the game's own source ----
     main_c = rd("pc", "src", "pc_main.c")

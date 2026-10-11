@@ -142,6 +142,11 @@ class Server:
 # ------------------------------------------------------------------ install fixture
 USER_FILES = {
     "settings.ini": b"[settings]\nmax_fps=60\n",
+    "server_config.ini": b"port = 7777\nmax_peers = 254\nmax_guests = 254\ncheck_updates = 1\n",
+    "servers/default/residents/members.dat": os.urandom(256),
+    "servers/default/residents/records.dat": os.urandom(256),
+    "servers/default/work_jobs.dat": os.urandom(128),
+    "servers/default/logs/server.log": b"server log\n",
     "keybindings.ini": b"[keys]\na=Z\n",
     "rom/GAFE01_00.iso": b"NOT-A-REAL-DISC-IMAGE-" * 100,
     "save/card_a/Animal Crossing.gci": os.urandom(4096),

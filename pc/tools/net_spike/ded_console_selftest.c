@@ -1,5 +1,6 @@
 /* ded_console_selftest.c - a scripted driver around the pure console module (pc/src/pc_ded_console.c) for test_dedicated_console.py.
  * stdin lines:  width N | prompt TEXT | key CODE (decimal; 32..126 = a character) | type TEXT | log TEXT | format HH MM SS COLOR WIDTH RAW | classify RAW | echo
+ *               body WIDTH RAW  (pc_dedc_wrap_body)
  * stdout lines: OUT <text with \r \n \e escaped>   (bytes the console would receive)
  *               LINE <submitted command>            (an ENTER handed this line over)
  *               FMT <text, \n escaped>  /  CLS <0|1|2>
@@ -69,6 +70,12 @@ int main(void) {
             if (sscanf(line + 7, "%d %d %d %d %d%n", &hh, &mm, &ss, &col, &w, &off) >= 5) {
                 pc_dedc_format(line + 7 + off + 1, hh, mm, ss, col, w, out, sizeof(out));
                 put_escaped("FMT", out);
+            }
+        } else if (strncmp(line, "body ", 5) == 0) {
+            int w, off = 0;
+            if (sscanf(line + 5, "%d%n", &w, &off) >= 1) {
+                pc_dedc_wrap_body(line + 5 + off + 1, w, out, sizeof(out));
+                put_escaped("BODY", out);
             }
         } else if (strncmp(line, "classify ", 9) == 0) {
             printf("CLS %d\n", pc_dedc_classify(line + 9));

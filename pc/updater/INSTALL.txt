@@ -9,6 +9,10 @@ INSTALL
 2. Copy your disc image into the "rom" folder.
 3. Start ACLauncher.exe (not AnimalCrossing.exe). It checks GitHub for a newer release, asks before changing anything, then starts the game.
 
+NEW INSTALL OR UPGRADE
+- A new install is the steps above with the newest ...-win64-first-install.zip.
+- An existing installation is brought up to date by ACLauncher.exe (it asks first) or, for the server, by the question Start Server.bat asks. Both replace ONLY the program files (AnimalCrossing.exe, SDL2.dll, shaders, licenses, notes). They do NOT update ACLauncher.exe itself, Start Server.bat, server_starter.ps1, SERVER_SETUP.txt, INSTALL.txt or docs\: those exist only in the first-install zip. If a release needs a newer launcher or starter, UPDATING.txt says which four files to copy once (never server_config.ini, settings.ini, rom\, save\, servers\).
+
 PLAYING ALONE
 Start ACLauncher.exe and play; the game runs like the normal PC port.
 

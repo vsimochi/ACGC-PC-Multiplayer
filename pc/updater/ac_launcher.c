@@ -35,7 +35,10 @@
 #define MAX_PKG_BYTES (512ull * 1024ull * 1024ull)
 #define MAX_UNPACKED_BYTES (1024ull * 1024ull * 1024ull)
 #define MAX_ZIP_ENTRIES 4096
-#define LAUNCHER_VERSION "1"
+#define LAUNCHER_VERSION "2"
+/* Capability marker: Start Server.bat (pc/server/server_starter.ps1) looks for this exact text inside ACLauncher.exe before it uses --updater-check-only / --updater-install-now. An older launcher
+ * does not know those switches and would run its normal "check, dialog, launch the game" flow instead, so the starter must never send them to one. */
+static const char k_caps[] = "ACLAUNCHER-CAPS:headless-update-v1";
 
 /* ------------------------------------------------------------------ state / config */
 typedef struct {
@@ -50,6 +53,8 @@ typedef struct {
     int answer;        /* test: -1 ask, 0 no, 1 yes */
     int noui;          /* test: no dialogs / progress window */
     int skip;          /* --updater-skip */
+    int mode;          /* 0 = normal launcher, 1 = --updater-check-only, 2 = --updater-install-now (headless modes used by the dedicated-server starter: no dialogs, no progress window, the game is NOT launched) */
+    wchar_t result[MAX_PATH]; /* --updater-result <file>: where the headless modes write their outcome */
 } Cfg;
 
 static Cfg g;
@@ -1223,6 +1228,59 @@ static int launch_game(int argc, wchar_t** argv, const int* is_ours) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ headless modes (the dedicated-server starter asks the questions on ITS console; this only does the work)
+ * --updater-check-only : version.txt + the same GitHub check as the normal flow; reports AVAILABLE / UPTODATE / CHECKFAILED / DISABLED, changes nothing, launches nothing.
+ * --updater-install-now: the caller already got the user's "yes". Same check, then the SAME do_update() (download, SHA-256, validation, staging, backup, swap, rollback); reports UPDATED / UPDATEFAILED.
+ * Both write STATUS= / INSTALLED= / LATEST= / MESSAGE= lines to the --updater-result file (UTF-8) and never show a window. updater.ini supplies repository / allow_prerelease as always; its check_updates
+ * does not apply (the caller decided to ask). Exit code: 0 ok (UPTODATE / AVAILABLE / UPDATED), 3 check failed, 4 update failed (the installed version was kept), 5 not applicable (disabled / development tree / no version). */
+static void write_result(const char* status, const char* installed, const char* latest, const char* msg) {
+    FILE* f;
+    char m[600];
+    size_t i;
+    logf_("headless result: %s installed=%s latest=%s %s", status, installed, latest, msg);
+    if (g.result[0] == 0) {
+        return;
+    }
+    f = _wfopen(g.result, L"wb");
+    if (f == NULL) {
+        return;
+    }
+    snprintf(m, sizeof(m), "%s", msg);
+    for (i = 0; m[i]; i++) {
+        if (m[i] == '\r' || m[i] == '\n') m[i] = ' ';
+    }
+    fprintf(f, "STATUS=%s\nINSTALLED=%s\nLATEST=%s\nMESSAGE=%s\nLAUNCHER=%s\n", status, installed, latest, m, LAUNCHER_VERSION);
+    fclose(f);
+}
+
+static int headless_run(void) {
+    char vtxt[64], inst_ver[64] = "", err[500] = "";
+    wchar_t vp[MAX_PATH];
+    Ver iv;
+    Release rel;
+    int rc;
+    { wchar_t e[8]; if (GetEnvironmentVariableW(L"AC_UPDATER_DISABLE", e, 8) > 0 && e[0] == L'1') { write_result("DISABLED", "", "", "AC_UPDATER_DISABLE=1"); return 5; } }
+    if (dev_checkout(g.dir)) { write_result("UNSUPPORTED", "", "", "this directory is inside a Git / CMake build tree: updates are disabled for development checkouts"); return 5; }
+    swprintf(vp, MAX_PATH, L"%ls\\version.txt", g.dir);
+    if (!read_small_file(vp, vtxt, sizeof(vtxt))) { write_result("UNSUPPORTED", "", "", "no version.txt: not a packaged installation"); return 5; }
+    vtxt[strcspn(vtxt, "\r\n")] = 0;
+    if (!ver_parse(vtxt, &iv, inst_ver, sizeof(inst_ver))) { write_result("UNSUPPORTED", "", "", "version.txt is not a valid version"); return 5; }
+    logf_("headless mode %d: installed version %s; checking %s/%s", g.mode, inst_ver, g.owner, g.repo);
+    rc = find_latest(&rel, err, sizeof(err));
+    if (rc == -1) { write_result("UPTODATE", inst_ver, inst_ver, err); return 0; } /* no official release published yet: nothing newer exists */
+    if (rc == 0) { write_result("CHECKFAILED", inst_ver, "", err); return 3; }
+    if (ver_cmp(&rel.v, &iv) <= 0) { write_result("UPTODATE", inst_ver, rel.ver, "installed version is current"); return 0; }
+    if (g.mode == 1) { write_result("AVAILABLE", inst_ver, rel.ver, "a newer release is available"); return 0; }
+    if (do_update(&rel, inst_ver, err, sizeof(err))) {
+        logf_("RESULT: updated %s -> %s", inst_ver, rel.ver);
+        write_result("UPDATED", inst_ver, rel.ver, "installed and verified");
+        return 0;
+    }
+    logf_("RESULT: update failed, installed version %s kept: %s", inst_ver, err);
+    write_result("UPDATEFAILED", inst_ver, rel.ver, err);
+    return 4;
+}
+
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int sw) {
     int argc = 0, i, rc;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1245,6 +1303,9 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int sw) {
         if (wcsncmp(argv[i], L"--updater-", 10) != 0) continue;
         ours[i] = 1;
         if (wcscmp(argv[i], L"--updater-skip") == 0) g.skip = 1;
+        else if (wcscmp(argv[i], L"--updater-check-only") == 0) g.mode = 1;
+        else if (wcscmp(argv[i], L"--updater-install-now") == 0) g.mode = 2;
+        else if (i + 1 < argc && wcscmp(argv[i], L"--updater-result") == 0) { ours[++i] = 1; wcsncpy(g.result, argv[i], MAX_PATH - 1); }
         else if (wcscmp(argv[i], L"--updater-no-ui") == 0) g.noui = g.test; /* test-only switches: consumed (never passed to the game) but honoured only with AC_UPDATER_TEST=1 */
         else if (i + 1 < argc && (wcscmp(argv[i], L"--updater-answer") == 0 || wcscmp(argv[i], L"--updater-test-api") == 0 || wcscmp(argv[i], L"--updater-dir") == 0)) {
             const wchar_t* sw = argv[i];
@@ -1265,8 +1326,15 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int sw) {
         if (GetFileAttributesExW(lp, GetFileExInfoStandard, &ad) && ad.nFileSizeLow > 262144) DeleteFileW(lp);
     }
     s_log = _wfopen(lp, L"ab");
-    logf_("launcher %s start, dir=%ls", LAUNCHER_VERSION, g.dir);
+    logf_("launcher %s start, dir=%ls (%s)", LAUNCHER_VERSION, g.dir, k_caps);
     read_ini();
+    if (g.mode != 0) { /* headless: no windows at all, and the game is not launched */
+        int hc;
+        g.noui = 1;
+        hc = headless_run();
+        if (s_log != NULL) fclose(s_log);
+        return hc;
+    }
     { wchar_t e[8]; if (GetEnvironmentVariableW(L"AC_UPDATER_DISABLE", e, 8) > 0 && e[0] == L'1') g.skip = 1; }
     if (g.skip || !g.check) { logf_("update check disabled"); goto launch; }
     if (!g.test && dev_checkout(g.dir)) { logf_("this directory is inside a Git / CMake build tree: automatic updates are disabled for development checkouts"); goto launch; }

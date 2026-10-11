@@ -169,6 +169,105 @@ static void pc_ded_con_write_log(const char* text) {
 }
 #endif
 
+/* COMMAND RESPONSES. The console commands print their answers with pc_ded_printf(), which until now wrote them raw: not wrapped, a different style from the formatted notices (pc_dedicated_say). While a
+ * command runs (s_ded_cmd_depth, set by pc_ded_execute) the interactive console routes those answers here instead, line by line, through the SAME formatter:
+ *   "[TAG] text"                      a headline: formatted like every notice (time / LEVEL / subsystem, wrapped to the window)
+ *   a plain line that says FAILED / REFUSED / UNSUPPORTED / usage / an error   the same, as a DEDICATED notice (so errors carry their LEVEL)
+ *   an indented line (help entries, status fields, table rows)       a body line: indentation kept, long rows wrap under the description column
+ *   any other plain line (data rows such as "0x2203 - Name - Category", page footers)   wrapped, no prefix, so a listing is not buried under a time stamp per row
+ *   a blank line                                                     kept
+ * Redirected output never comes here (it is the plain text the tests read). */
+static int s_ded_cmd_depth = 0;
+
+#ifdef _WIN32
+static int pc_ded_response_is_notice(const char* line) {
+    if (line[0] == '[') {
+        char t[16];
+        const char* e = strchr(line, ']');
+        if (e != NULL && e - line - 1 > 0 && e - line - 1 < 15) {
+            memcpy(t, line + 1, (size_t)(e - line - 1));
+            t[e - line - 1] = '\0';
+            return 1;
+        }
+    }
+    return strstr(line, "FAILED") != NULL || strstr(line, "REFUSED") != NULL || strstr(line, "UNSUPPORTED") != NULL || strncmp(line, "usage", 5) == 0 || strstr(line, "usage:") != NULL ||
+           strstr(line, "Invalid") != NULL || strstr(line, "invalid") != NULL;
+}
+
+static void pc_ded_con_write_response(const char* text) {
+    size_t tl = strlen(text);
+    size_t cap = tl * 4 + 2048;
+    char* out = (char*)malloc(cap);
+    char* line = (char*)malloc(tl + 1);
+    char* row = (char*)malloc(tl * 3 + 1024);
+    SYSTEMTIME st;
+    const char* p = text;
+    size_t n = 0;
+    int width = pc_ded_con_width();
+    if (out == NULL || line == NULL || row == NULL) {
+        free(out);
+        free(line);
+        free(row);
+        return;
+    }
+    out[0] = '\0';
+    GetLocalTime(&st);
+    while (*p != '\0') {
+        const char* nl = strchr(p, '\n');
+        size_t full = nl != NULL ? (size_t)(nl - p) : strlen(p);
+        size_t ll = full;
+        size_t rn;
+        memcpy(line, p, ll);
+        line[ll] = '\0';
+        if (ll > 0 && line[ll - 1] == '\r') {
+            line[--ll] = '\0';
+        }
+        if (nl == NULL && ll > 0 && text[tl - 1] != '\n') {
+            /* a fragment without its newline (a prompt-style text): written as it is */
+            memcpy(out + n, line, ll);
+            n += ll;
+            out[n] = '\0';
+            break;
+        }
+        if (ll == 0) {
+            out[n++] = '\n';
+        } else if (line[0] == ' ' || line[0] == '\t') {
+            rn = pc_dedc_wrap_body(line, width, row, tl * 3 + 1024);
+            memcpy(out + n, row, rn);
+            n += rn;
+            out[n++] = '\n';
+        } else if (pc_ded_response_is_notice(line)) {
+            char tagged[PC_DEDC_LINE_MAX * 2 + 32];
+            if (line[0] == '[') {
+                snprintf(tagged, sizeof(tagged), "%s", line);
+            } else {
+                snprintf(tagged, sizeof(tagged), "[DEDICATED] %s", line);
+            }
+            rn = pc_dedc_format(tagged, st.wHour, st.wMinute, st.wSecond, s_con_color, width, row, tl * 3 + 1024);
+            memcpy(out + n, row, rn);
+            n += rn;
+            out[n++] = '\n';
+        } else {
+            rn = pc_dedc_wrap_body(line, width, row, tl * 3 + 1024);
+            memcpy(out + n, row, rn);
+            n += rn;
+            out[n++] = '\n';
+        }
+        out[n] = '\0';
+        p += full + (nl != NULL ? (size_t)1 : 0);
+        if (nl == NULL) {
+            break;
+        }
+    }
+    if (n > 0) {
+        pc_ded_con_write(out);
+    }
+    free(out);
+    free(line);
+    free(row);
+}
+#endif
+
 static FILE* pc_ded_stream(void) {
     return s_ded_out != NULL ? s_ded_out : stdout;
 }
@@ -196,7 +295,11 @@ static int pc_ded_printf(const char* fmt, ...) {
         va_start(ap, fmt);
         vsnprintf(buf, (size_t)n + 1, fmt, ap);
         va_end(ap);
-        pc_ded_con_write(buf);
+        if (s_ded_cmd_depth > 0) {
+            pc_ded_con_write_response(buf);
+        } else {
+            pc_ded_con_write(buf);
+        }
         free(buf);
         return n;
     }
@@ -525,7 +628,7 @@ static int pc_ded_enable_editor(void) {
         snprintf(s_con_edit_why, sizeof(s_con_edit_why), "this console has no virtual-terminal output (error %lu)", (unsigned long)GetLastError());
         return 0;
     }
-    if (!SetConsoleMode(hi, (mi & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_PROCESSED_INPUT)) {
+    if (!SetConsoleMode(hi, (mi & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_PROCESSED_INPUT | ENABLE_WINDOW_INPUT)) {
         snprintf(s_con_edit_why, sizeof(s_con_edit_why), "console input mode could not be changed (error %lu)", (unsigned long)GetLastError());
         SetConsoleMode(ho, mo);
         return 0;
@@ -566,6 +669,10 @@ static unsigned __stdcall pc_ded_editor_thread(void* arg) {
             const KEY_EVENT_RECORD* k;
             int key = 0;
             int rep, r;
+            if (rec[i].EventType == WINDOW_BUFFER_SIZE_EVENT) {
+                pc_ded_con_redraw(); /* the window was resized: the prompt line is re-fitted to the new width (the width is read at every write) */
+                continue;
+            }
             if (rec[i].EventType != KEY_EVENT || !rec[i].Event.KeyEvent.bKeyDown) {
                 continue;
             }
@@ -2372,7 +2479,9 @@ void pc_dedicated_console_poll(void) {
             if (ln.truncated) {
                 pc_ded_printf("[DEDICATED] warning: console line truncated to %d characters\n", PC_DED_LINE_MAX);
             }
+            s_ded_cmd_depth++;
             pc_ded_execute(ln.text);
+            s_ded_cmd_depth--;
         }
     }
     if (s_stdin_eof && !s_stdin_eof_reported) {

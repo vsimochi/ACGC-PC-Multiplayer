@@ -1,5 +1,5 @@
 Animal Crossing Multiplayer - how updating works (user guide)
-Full guide: docs\updater.md (first-install bundle) or https://github.com/vsimochi/ACGC-PC-Multiplayer/blob/v0.1.0/docs/updater.md
+Full guide: docs\updater.md (first-install bundle) or https://github.com/vsimochi/ACGC-PC-Multiplayer/blob/v0.1.1/docs/updater.md
 
 START THE GAME WITH ACLauncher.exe (not AnimalCrossing.exe). It checks GitHub for the latest stable release, then starts the game.
 - No newer version: the game starts.
@@ -8,10 +8,18 @@ START THE GAME WITH ACLauncher.exe (not AnimalCrossing.exe). It checks GitHub fo
 - The update fails at any point (interrupted download, checksum mismatch, bad package, disk full, a file in use): everything is rolled back and your installed version starts. Close the game before updating; the launcher refuses to update while this folder's game is running.
 
 FILES THE UPDATER REPLACES: AnimalCrossing.exe, SDL2.dll, shaders\*, licenses\*, version.txt, LICENSE, RELEASE_NOTES.txt, UPDATING.txt.
+NOT UPDATED BY THE UPDATER (they come only with the first-install zip): ACLauncher.exe itself, Start Server.bat, server_starter.ps1, SERVER_SETUP.txt, INSTALL.txt, docs\. Nothing updates the launcher or the starter on its own.
 NEVER TOUCHED: rom\ (your disc image), save\, servers\, settings.ini, keybindings.ini, texture_pack\, shader_cache.bin, logs, updater.ini, ACLauncher.exe, and every other file.
 
 RECOVERY: the previous program files are kept in .update\backup-<oldversion>\ (newest only). To go back by hand: close the game and copy those files over the ones in the folder above. updater.log (next to ACLauncher.exe) records every launch: version check, your answer, result and errors.
 
 SETTINGS (updater.ini): check_updates=0 turns the check off; allow_prerelease=1 also offers prereleases; show_check_errors=0 hides check-failure messages; repository=owner/name selects the release source. For one launch only: start ACLauncher.exe with --updater-skip, or set AC_UPDATER_DISABLE=1.
+
+ONE-TIME STEP FOR AN EXISTING 0.1.0 INSTALLATION - and for any installation whose launcher or starter is older than the release you want to use (why: the updater only replaces AnimalCrossing.exe, SDL2.dll, shaders\, licenses\ and the notes; it cannot replace ACLauncher.exe, Start Server.bat or server_starter.ps1, and a 0.1.0 launcher does not know the startup update check)
+1. Close your game and the server (type  stop  in the server window).
+2. Download ACGC-PC-Multiplayer-<version>-win64-first-install.zip from https://github.com/vsimochi/ACGC-PC-Multiplayer/releases/latest and open it (do not extract it over the folder).
+3. Copy ONLY these four files from it into your game folder, replacing the old ones: ACLauncher.exe, Start Server.bat, server_starter.ps1, SERVER_SETUP.txt. Do NOT copy server_config.ini, settings.ini, rom\, save\ or servers\: they stay yours (server_config.ini keeps your values, for example 254 / 254).
+4. Start as usual. From then on the update check at server start works and the program files update from the question it asks.
+Until you do this, nothing breaks: the old launcher and starter keep working with the updated program files (start ACLauncher.exe normally to be asked about updates in a window).
 
 The SHA-256 checksum detects corruption and a wrong file. It is not a signature: the executables are unsigned and Windows SmartScreen / antivirus may warn.

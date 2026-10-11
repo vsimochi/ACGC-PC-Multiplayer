@@ -149,11 +149,30 @@ def main():
               all(f in fnames for f in starter) and same_srv and not any(f in names for f in starter))
         cfg = zf.read("server_config.ini").decode()
         defaults = {"port": "7777", "max_peers": "8", "max_guests": "4", "allow_new_guests": "1", "resident_tokens": "off", "town_serve": "auto", "personal_sync": "auto",
-                    "interest_management": "1", "guest_memory_mb": "256", "debug_categories": "", "check_updates": "0"}
+                    "interest_management": "1", "guest_memory_mb": "256", "debug_categories": "", "check_updates": "1"}
         got = {m.group(1): m.group(2).strip() for m in re.finditer(r"^([a-z_]+) =(.*)$", cfg, re.M)}
         check("P2n the shipped server_config.ini has exactly the documented defaults (town_serve is never 'full')", got == defaults)
         ps = zf.read("server_starter.ps1").decode()
-        check("P2o the starter script refuses town_serve = full and passes --updater-skip when check_updates = 0", "town_serve = full is not available" in ps and "--updater-skip" in ps)
+        check("P2o the starter script refuses town_serve = full and always passes --updater-skip (the starter does the update check itself)", "town_serve = full is not available" in ps and "--updater-skip" in ps)
+        # ---- P2p-P2s: the texts of this release (no draft wording, the migration, no self-update claim) and the build (no test-only code)
+        zu, zf = zipfile.ZipFile(zpath), zipfile.ZipFile(fpath)
+        notes = zu.read("RELEASE_NOTES.txt").decode("utf-8", "replace")
+        alltext = {n: z.read(n).decode("utf-8", "replace") for z in (zu, zf) for n in z.namelist() if n.lower().endswith((".txt", ".md"))}
+        draft = sorted(n for n, t in alltext.items() if re.search(r"DRAFT|not published|TODO:|FIXME|lorem ipsum", t))
+        check("P2p no packaged text contains draft wording (DRAFT, 'not published', TODO / FIXME; the lower-case word is legitimate in the GitHub-draft sense): %s" % draft, not draft)
+        check("P2q RELEASE_NOTES.txt (identical in both zips) documents the console, the startup update check, same-PC hosting and the one-time manual step for 0.1.0 installations, and says nothing updates the launcher / starter",
+              zf.read("RELEASE_NOTES.txt") == zu.read("RELEASE_NOTES.txt") and all(x in notes for x in ("Dedicated server console", "startup update check", "Host and play on the same PC", "One-time step for existing 0.1.0 installations", "ACLauncher.exe", "Start Server.bat", "server_starter.ps1",
+              "Nothing updates the launcher or the server starter", "Never copy `server_config.ini`")) and ("Beta " + ver) in notes.splitlines()[0])
+        upd, inst2, setup = zu.read("UPDATING.txt").decode(), zf.read("INSTALL.txt").decode(), zf.read("SERVER_SETUP.txt").decode()
+        check("P2r UPDATING.txt / INSTALL.txt / SERVER_SETUP.txt: the updater does not update ACLauncher.exe, Start Server.bat or server_starter.ps1; the one-time copy step names the four files and never server_config.ini",
+              "NOT UPDATED BY THE UPDATER" in upd and "ONE-TIME STEP" in upd and "Nothing updates the launcher or the starter on its own" in upd and "NEW INSTALL OR UPGRADE" in inst2 and "do NOT update ACLauncher.exe itself" in inst2
+              and "are NOT part of the update package" in setup and "ONE manual step" in setup and all(x in upd for x in ("ACLauncher.exe, Start Server.bat, server_starter.ps1, SERVER_SETUP.txt", "Do NOT copy server_config.ini"))
+)
+        exe_bytes = zu.read("AnimalCrossing.exe")
+        check("P2s the packaged game exe has no test-only code (no PC_NET_TEST_HS_BUSY_MAX_MS cap override, no AC_TEST_AUTOPILOT), and the first-install launcher carries the headless-update capability marker while the update zip has no launcher",
+              b"PC_NET_TEST_HS_BUSY_MAX_MS" not in exe_bytes and b"AC_TEST_AUTOPILOT" not in exe_bytes and b"ACLAUNCHER-CAPS:headless-update-v1" in zf.read("ACLauncher.exe") and "ACLauncher.exe" not in names)
+        check("P2t both .sha256 sidecars are '<hex>  <exact file name>' and match the exact ZIP bytes",
+              all(open(z + ".sha256", "rb").read().decode().strip().split() == [hashlib.sha256(open(z, "rb").read()).hexdigest(), os.path.basename(z)] for z in (zpath, fpath)))
         # ---- P3: the real zip through the real launcher
         launcher = launcher or os.path.join(HERE, "out", "ACLauncher.exe")
         srv = TU.Server()

@@ -114,7 +114,10 @@ def first_install(a, files, name):
         for f in SERVER_FILES:
             z.write(os.path.join(srv, f), f)
         z.writestr("rom/PUT-YOUR-DISC-IMAGE-HERE.txt", "Place your own Animal Crossing (USA, GAFE01_00) disc image in this folder. It is not included and is never downloaded by the updater.\n")
-    print("wrote %s (first-install bundle: unzip into a writable folder, then start ACLauncher.exe)" % fpath)
+    fdigest = sha256_of(fpath)
+    with open(fpath + ".sha256", "w", newline="\n") as sf:  # same "<hex>  <file name>" format as the update zip's sidecar (it was written by hand for 0.1.0)
+        sf.write("%s  %s\n" % (fdigest, os.path.basename(fpath)))
+    print("wrote %s (first-install bundle: unzip into a writable folder, then start ACLauncher.exe)\nsha256 %s" % (fpath, fdigest))
 
 
 def verify_zip(zpath):

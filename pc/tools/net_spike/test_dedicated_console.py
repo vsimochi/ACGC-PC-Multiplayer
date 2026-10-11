@@ -129,7 +129,7 @@ def fmt(exe, raw, hh=12, mm=3, ss=9, color=0, width=0):
 
 def main():
     results = []
-    ck = lambda d, c, x="": L.check(d + ((" :: " + x) if (x and not c) else ""), bool(c), results)  # noqa: E731
+    ck = lambda d, c, x="": L.check(d + ((" :: " + str(x)[:400]) if (x and not c) else ""), bool(c), results)  # noqa: E731
     exe = build()
     if exe is None:
         print("FAIL - no gcc to build the console self-test")
@@ -263,10 +263,10 @@ def main():
     ck("F3 with colour the LEVEL word is still printed (colour is never the only signal) inside well-formed SGR codes: %r" % c, c is not None and "[1;31mERROR[0m" in c and re.sub(r"\[[0-9;]*m", "", c) == "12:03:09 ERROR SAVE           host: save FAILED", c)
     nocol = fmt(exe, "[SAVE] host: save FAILED", color=0)
     ck("F3b without colour there is no escape sequence at all", nocol is not None and "\x1b" not in nocol)
-    wrapped = fmt(exe, "[NET] host: " + "word " * 40, width=80)
+    wrapped = fmt(exe, "[NET] host: " + "word " * 40, width=120)
     rows = wrapped.split("\n")
     ck("F4 a long message wraps at spaces with a hanging indent, never beyond the width, nothing lost: %d rows" % len(rows),
-       len(rows) > 1 and all(len(r) <= 80 for r in rows) and all(r.startswith(" " * 30) for r in rows[1:]) and " ".join(r.strip() for r in [rows[0][30:]] + rows[1:]) == "host: " + ("word " * 40).strip())
+       len(rows) > 1 and all(len(r) <= 119 for r in rows) and all(r.startswith(" " * 30) for r in rows[1:]) and " ".join(r.strip() for r in [rows[0][30:]] + rows[1:]) == "host: " + ("word " * 40).strip())
     twice = fmt(exe, "[NET] [NET] x")
     ck("F5 no duplicated category prefix is added for a plain tagged line (the tag appears once): %r" % twice, twice is not None and twice.count("NETWORK") == 1)
     ck("F6 the same input always gives the same output (stable)", fmt(exe, "[NET] host: x") == fmt(exe, "[NET] host: x"))
@@ -277,6 +277,53 @@ def main():
             continue  # classified through its tag in pc_dedc_format (F-checks above)
         ck("F7 severity of %r is %d" % (raw, want), got == want, str(got))
 
+    # ---- 7b. command responses, narrow windows (the shared formatter / wrapper) ----
+    def body(w, text):
+        p = subprocess.run([exe], input="body %d %s\n" % (w, text), capture_output=True, text=True, timeout=30)
+        m = re.search(r"^BODY (.*)$", p.stdout, re.M)
+        return unesc(m.group(1)) if m else None
+
+    def words(rows):
+        return " ".join(" ".join(r.split()) for r in rows).split()
+
+    helpline = "  status   server status: observer, network role/port, world+save readiness, uptime, peers, last save"
+    for w in (120, 100, 80, 60, 40, 30, 20):
+        rows = body(w, helpline).split("\n")
+        ck("H1 help entry at width %d: every row fits (<= %d columns), no word lost or reordered (%d rows)" % (w, max(w, 20) - 1, len(rows)),
+           all(len(r) <= max(w, 20) - 1 for r in rows) and words(rows) == words([helpline]), rows)
+    rows = body(100, helpline).split("\n")
+    ck("H2 a wrapped help entry keeps its own indent on row 1 and continues UNDER the description column (col 11): %s" % rows[:2],
+       rows[0].startswith("  status   server") and len(rows) > 1 and all(r.startswith(" " * 11) and not r.startswith(" " * 12) for r in rows[1:]))
+    rows = body(40, helpline).split("\n")
+    ck("H3 at 40 columns the alignment is kept when it leaves room for text (hang 11 of 39) and rows still fit", all(len(r) <= 39 for r in rows) and len(rows) > 2)
+    rows = body(24, helpline).split("\n")
+    ck("H4 at 24 columns (too narrow for the deep alignment) it falls back to a small hanging indent, nothing is lost", all(len(r) <= 23 for r in rows) and words(rows) == words([helpline]) and all(len(r) - len(r.lstrip()) <= 4 for r in rows[1:]), rows)
+    ck("H5 a short line is untouched and a blank/indent-only structure is preserved", body(100, "  help     list the commands") == "  help     list the commands" and body(100, "    nested field: value") == "    nested field: value")
+    long_err = "GIVE FAILED: " + "the quantity must be between one and fifteen and the player needs enough free pockets " * 3
+    for w in (140, 90, 55, 30):
+        r = fmt(exe, "[DEDICATED] " + long_err, width=w)
+        rows = r.split("\n")
+        ck("E1 a 3-line long ERROR notice at width %d: rows fit (<= %d), the content is complete, the LEVEL word leads (%d rows)" % (w, w - 1, len(rows)),
+           all(len(x) <= w - 1 for x in rows) and rows[0].lstrip("0123456789: ").startswith("ERROR") and words([x[len(x) - len(x.lstrip()):] if i else x for i, x in enumerate(rows)])[-12:] == words([long_err])[-12:] and
+           " ".join(words(rows)).count("fifteen") == 3, rows[:3])
+    for w, pc in ((140, 30), (99, 15), (59, 6)):
+        r = fmt(exe, "[SAVE] host: " + "word " * 60, width=w)
+        rows = r.split("\n")
+        ck("P1 prefix accounted for at width %d (prefix %d columns): rows fit and continuation rows are indented exactly %d" % (w, pc, pc), all(len(x) <= w - 1 for x in rows) and len(rows) > 1 and all(len(x) - len(x.lstrip()) == pc for x in rows[1:]), rows[:3])
+    r = fmt(exe, "[SAVE] host: periodic save OK", width=70)
+    ck("P2 medium window: 'HH:MM:SS LEVEL [SUBSYSTEM] message' (no subsystem column): %r" % r, r == "12:03:09 INFO  [SAVE] host: periodic save OK", r)
+    r = fmt(exe, "[SAVE] host: periodic save OK", width=40)
+    ck("P3 narrow window: 'LEVEL [SUBSYSTEM] message' (the LEVEL word is kept): %r" % r, r == "INFO  [SAVE] host: periodic save OK", r)
+    cont = fmt(exe, "      field: " + "value " * 30, width=100).split("\n")
+    ck("M1 a continuation line of a multi-line message keeps its own indentation under the prefix and wraps under itself", cont[0].startswith(" " * 30 + "     field:") and all(len(x) <= 99 for x in cont) and len(cont) > 1, cont[:2])
+    d = Driver(exe, width=60)
+    d.type("pla")
+    d.log("12:03:09 WARN  [NET] a wrapped notice that is longer than the window\\n                that continues on a second row\\n   and a third row")
+    d.type("yers")
+    d.log("[SAVE] after the multi-row response")
+    d.run()
+    ck("A7 a multi-row response arriving while 'pla' is typed: every row printed, the typed command intact on the prompt row with the cursor after it", d.screen.visible_line() == "> players" and d.screen.c == 9, (d.screen.visible_line(), d.screen.c))
+
     # ---- 8. source-level guarantees of the Win32 layer (the part these tests cannot run) ----
     src = open(os.path.join(REPO, "pc", "src", "pc_dedicated.c"), encoding="utf-8", errors="replace").read()
     ck("S1 every console writer of the interactive mode goes through pc_ded_con_write under s_con_lock (printf helper, say, fatal)",
@@ -284,6 +331,9 @@ def main():
     ck("S2 the editor turns the console line input and echo OFF and keeps processed input (Ctrl+C still reaches the handler)", "~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_PROCESSED_INPUT" in src)
     ck("S3 a failure to switch the console modes leaves the old cooked reader in use (no editor)", "SetConsoleMode(ho, mo);\n        return 0;" in src and "pc_ded_enable_editor()" in src)
     ck("S4 redirected / non-interactive runs are untouched: the editor needs s_ded_interactive and a console input handle", "if (!s_ded_interactive || s_ded_out == NULL || hi == NULL" in src)
+    ck("S6 command output is routed through the shared formatter while a command runs (response writer + command depth), and the plain redirected path is untouched",
+       "pc_ded_con_write_response(buf)" in src and "s_ded_cmd_depth++;" in src and "if (s_con_edit) {" in src)
+    ck("S7 window resizes are handled: the editor asks for window events, redraws the prompt on WINDOW_BUFFER_SIZE_EVENT, and the width is read at every write", "ENABLE_WINDOW_INPUT" in src and "WINDOW_BUFFER_SIZE_EVENT" in src and "pc_ded_con_width()" in src)
     ck("S5 ENTER hands the line to the SAME bounded queue the stdin reader uses, once, outside the console lock", "pc_ded_enqueue(line, strlen(line), 0);" in src and src.index("LeaveCriticalSection(&s_con_lock);\n                if (done)") > 0)
     shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
     return L.summary_and_exit_code(results)

@@ -4,7 +4,8 @@ A dedicated server hosts the town without anyone playing on it: your friends joi
 
 WHAT YOU NEED
 - The game folder you already use (ACLauncher.exe, AnimalCrossing.exe, the "rom" folder with your own game disc image - see INSTALL.txt).
-- These three files in that SAME folder, next to ACLauncher.exe:  Start Server.bat   server_config.ini   server_starter.ps1
+- These files in that SAME folder, next to ACLauncher.exe:  Start Server.bat   server_config.ini   server_starter.ps1   SERVER_SETUP.txt
+  The first-install package puts them there. They are NOT part of the update package: the updater never replaces or changes them, and neither does anything else automatically (see UPDATES below).
 - Windows 10 or 11 (PowerShell, which is part of Windows, runs the settings check). Nothing else to install.
 
 START THE SERVER
@@ -18,6 +19,13 @@ FIRST START - THE SERVER ASKS QUESTIONS (answer them in the SERVER window)
 - If the server has no town yet, it asks for the TOWN NAME (1-8 characters).
 - The server_config.ini file does NOT contain a town name or these answers: they are asked once, the first time. Automatic answers are deliberately not offered: a wrong automatic answer could replace the wrong town. (If the console input is closed the server refuses to pick a legacy town, and for a brand-new server falls back to a default town name.)
 - Your town is stored under  servers\default\  (town save, residents, guests, logs\server.log, backups). Back that folder up now and then.
+
+HOST AND PLAY ON THE SAME PC
+- You can run the server and your own game from the SAME folder at the same time: start Start Server.bat first, then start ACLauncher.exe, choose Play Online, add a server with address 127.0.0.1 and the server's port (7777 by default), and connect. Other players use your public address as usual.
+- They do not share saves: the server keeps its town and everything it owns in  servers\default\  (the starter never touches save\), your own game uses  save\  (your single-player town, characters and server list). The only shared files are settings.ini and keybindings.ini (the server reads settings.ini once at start) and the game's shader cache.
+- Do not start your game with --host on the same UDP port as the server (the port is taken). Starting a SECOND dedicated server from the same folder is refused: it would write the same town.
+- If the server asks on its first start whether to use the town found in save\card_a, choosing "Use this town" COPIES your single-player town into the server (your original stays untouched); the two towns are separate from then on.
+- The starter refuses to start (and says why) when it finds a dedicated server of this folder already running, or an AnimalCrossing.exe whose path / command line it cannot read (for example one started as administrator). It never closes any game for you.
 
 STOP THE SERVER
 - Type  stop  in the server window and press Enter. The server saves the town first. Do not just close the window or shut the computer down while it runs.
@@ -38,9 +46,22 @@ LET FRIENDS CONNECT
 4. FRIENDS CONNECT in the game: title screen -> "Play Online" -> add a server (name, address, port) -> pick or create a character -> connect. Or start ACLauncher.exe --connect 203.0.113.5:7777.
 - Only host games with people you trust; the original game was not designed with network security in mind. Treat resident_tokens (see server_config.ini) as a convenience lock, not strong security.
 
-UPDATES
-- check_updates = 0 (default) lets the server start unattended. Update by hand when a new release is published (UPDATING.txt) and tell your friends: a client with a different release is refused.
-- Back up the  save  and  servers  folders before updating.
+UPDATES (the update check at start)
+- With check_updates = 1 (the default in server_config.ini) Start Server.bat asks GitHub, before the server starts, whether a newer STABLE release exists. Nothing opens and your game is not started.
+- Up to date: the server just starts. Newer release: you see "Installed version" and "Available version" and the question "Would you like to download and install the update now? [Y/N]". Only Y installs it,
+  using ACLauncher.exe's own updater: it downloads the update package and its .sha256, verifies the SHA-256 and the package, keeps a backup of the old program files and rolls back on any problem. Then the
+  updated server starts. N (or anything unclear) leaves everything as it is and starts the version you have.
+- No internet, GitHub busy / rate-limited, bad release data or a failed update: the reason is shown, your installed version is kept and you are asked whether to start it anyway.
+- An update replaces only the program files (AnimalCrossing.exe, SDL2.dll, shaders, licenses, notes). server_config.ini, settings.ini, keybindings.ini, rom\, save\, servers\ (your town, guests, members,
+  records), logs and every other file are not touched. Start Server.bat, server_starter.ps1 and SERVER_SETUP.txt are NOT updated by it (they come with the first-install package).
+- It never installs while the game of this folder is running (your own game included): it tells you, you close the game and press Enter to retry, or type S to skip. Nothing is closed for you.
+- Started without a console to ask on (a scheduled task, redirected input) it only says that an update exists. -UpdateAnswer yes gives consent on the command line, -UpdateAnswer no declines, and
+  -SkipUpdateCheck skips the check once. check_updates = 0 turns the check off for good (the right choice for a server that restarts by itself).
+- This needs the newer ACLauncher.exe. The updater cannot replace ACLauncher.exe, Start Server.bat or server_starter.ps1 (it replaces only AnimalCrossing.exe, SDL2.dll, shaders, licenses and the notes), so an
+  installation made with 0.1.0 needs ONE manual step: open the newest ...-win64-first-install.zip from https://github.com/vsimochi/ACGC-PC-Multiplayer/releases/latest and copy only ACLauncher.exe,
+  Start Server.bat, server_starter.ps1 and SERVER_SETUP.txt over the ones in your folder (never server_config.ini, settings.ini, rom\, save\ or servers\). With an older launcher the starter says exactly
+  this and skips the check; nothing else changes. Start ACLauncher.exe normally to be asked about updates in a window.
+- Update by hand otherwise (UPDATING.txt) and tell your friends: a client with a different release is refused. Back up the  save  and  servers  folders before updating.
 
 IF IT DOES NOT START
 - Read the red message in the starter window first (it names the setting or file).

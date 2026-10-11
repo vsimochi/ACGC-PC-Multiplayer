@@ -251,6 +251,7 @@ def run(args, results):
         gci_m0 = os.path.getmtime(L.host_gci())  # a DEDICATED host saves into servers/default/town/card_a (the legacy fixture file only seeds it)
         rec_path = L.server_file("records.dat")
         rec_m0 = os.path.getmtime(rec_path) if os.path.isfile(rec_path) else None
+        rec_b0 = open(rec_path, "rb").read() if rec_m0 is not None else None
         time.sleep(1.1)
         off = len(h.log_text())
         h.send_line("save")
@@ -260,8 +261,17 @@ def run(args, results):
               and seg.index("save: requested") < seg.index("save result: OK") < seg.index("save: OK"))
         check("A the GCI mtime advanced (a real authoritative save ran)", os.path.getmtime(L.host_gci()) > gci_m0)
         rec_m1 = os.path.getmtime(rec_path) if os.path.isfile(rec_path) else None
-        check("A the records sidecar hook ran with that save (servers/default/residents/records.dat exists%s)" % (" and its mtime advanced" if rec_m0 is not None else ""),
-              rec_m1 is not None and (rec_m0 is None or rec_m1 > rec_m0))
+        # records.dat is written only when the lineage image CHANGED (pcnetgame_rec_store_write coalesces an unchanged image on purpose: it keeps the .bak generations from being flushed by clones).
+        # With no records.dat yet (a clean fixture) the first save must create it; with one already there and a session that changes no record (this run's clients are no-ops) the file must be
+        # left exactly as it was - an mtime that advances there would be the bug, not the absence of one. Either way the save must not report a records write failure.
+        rec_b1 = open(rec_path, "rb").read() if rec_m1 is not None else None
+        rec_bad = re.search(r"\[NET\]\[REC\] store: \*\*\* records\.dat write (FAILED|SKIPPED)|could not durably flush", seg)
+        if rec_m0 is None:
+            check("A the records sidecar hook ran with that save: no records.dat existed before, so the first save CREATED it and logged 'records.dat written'",
+                  rec_m1 is not None and re.search(r"\[NET\]\[REC\] store: records\.dat written", h.log_text()) is not None and not rec_bad)
+        else:
+            check("A the records sidecar hook ran with that save: a records.dat already existed and no record changed, so it was loaded ('load mode=OK'), NOT rewritten (bytes identical, coalesced by design), "
+                  "and no write failure was logged", rec_m1 is not None and rec_b1 == rec_b0 and re.search(r"\[NET\]\[REC\] store: records file .* load mode=OK", h.log_text()) is not None and not rec_bad)
         check("A the save-result notice states the result once per save ('[DEDICATED] save result: OK')", len(re.findall(r"\[DEDICATED\] save result: OK", seg)) == 1)
 
         # --- disconnect notice

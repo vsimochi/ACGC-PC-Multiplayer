@@ -52,8 +52,12 @@ size_t pc_dedc_commit_echo(const char* prompt, const char* line, char* out, size
 /* Console formatting of ONE log line (no newline in raw): "HH:MM:SS LEVEL  SUBSYSTEM   message". LEVEL is INFO / WARN / ERROR (decided from the line, see pc_dedc_classify), SUBSYSTEM is the line's
  * leading [TAG] (a second [TAG] becomes TAG/SUB), NETWORK for NET, DEDICATED for the server notices, GAME when there is none. A timestamp already in the line and the tag are NOT repeated. A
  * line that starts with whitespace is a continuation: it is indented under the message with no prefix. color != 0 wraps LEVEL and SUBSYSTEM in SGR colours (the word LEVEL is always printed,
- * colour is never the only signal). width > 0 wraps long messages at spaces with a hanging indent. Returns the length written. */
+ * colour is never the only signal). width > 0 wraps long messages at spaces with a hanging indent, and picks the prefix that fits: width >= 100 the full prefix, 60..99 "HH:MM:SS LEVEL [SUBSYSTEM] message", below 60 "LEVEL [SUBSYSTEM] message". Returns the length written. */
 size_t pc_dedc_format(const char* raw, int hh, int mm, int ss, int color, int width, char* out, size_t cap);
+/* A response line that is NOT a notice (an indented body line of `help` / `status` / a table row): its own indentation is kept and, when it is wider than the window, it wraps at spaces with continuation
+ * rows aligned under the description column of the line ("  help     list the commands" -> rows continue under "list"). Nothing is dropped except the spaces at a break; a window too narrow for the
+ * alignment falls back to a small hanging indent. Several rows are separated by '\n' (no trailing newline). */
+size_t pc_dedc_wrap_body(const char* raw, int width, char* out, size_t cap);
 /* 0 = INFO, 1 = WARN, 2 = ERROR (heuristic on the words of the line; a [TAG] such as [FATAL] counts) */
 int    pc_dedc_classify(const char* raw);
 
