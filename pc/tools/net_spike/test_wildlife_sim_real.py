@@ -377,14 +377,22 @@ def race(S):
 
 def race_fish(S):
     check = S.check
-    ent = surviving_fish(S, "A")
-    check("R2 a live fish exists", ent is not None)
-    if ent is None:
-        return
-    for w in ("A", "B"):
-        S.players[w].cmd("mash 6", 20)
-        enter_acre(S.players[w], 4, 2)
-    race_both(S, "R2", "fish", ent)
+    for attempt in range(3):  # a fish can swim out of BOTH players' range before they cast (their local actors are then culled): such a round is repeated with a fresh fish
+        ent = surviving_fish(S, "A")
+        if attempt == 2 or ent is None:
+            check("R2 a live fish exists", ent is not None)
+        if ent is None:
+            if attempt == 2:
+                return
+            continue
+        d = decisions(S.log("host")).get(ent)
+        for w in ("A", "B"):
+            S.players[w].cmd("mash 6", 20)
+            enter_acre(S.players[w], d[2] if d else 4, d[3] if d else 2)
+        if race_both(S, "R2", "fish", ent, final=(attempt == 2)) is not False:
+            if attempt < 2:
+                check("R2 a live fish exists", True)
+            return
 
 
 def race_both(S, tag, kind, ent, final=True):
@@ -394,8 +402,8 @@ def race_both(S, tag, kind, ent, final=True):
     ca, cb = A.send("catch %s %d" % (kind, ent)), B.send("catch %s %d" % (kind, ent))
     ra, rb = A.wait(ca, 300), B.wait(cb, 300)
     L.info("%s: A: %s | B: %s" % (tag, ra, rb))
-    if not final and kind == "bug" and all(r and (" gone" in r or " rejected" in r) for r in (ra, rb)) and ent not in table_now(S):
-        L.info("%s: the bug %d ended before either catch could be granted (released by the host: both players gone / refused) -- repeating the race with a fresh bug" % (tag, ent))
+    if not final and all(r and (" gone" in r or " rejected" in r) for r in (ra, rb)) and (kind == "fish" or ent not in table_now(S)):
+        L.info("%s: %s %d was gone / refused for BOTH players (a bug ended by its species program, or a fish that swam out of both players' range) -- repeating the race with a fresh one" % (tag, kind, ent))
         A.cmd("mash 6", 20)
         B.cmd("mash 6", 20)
         return False

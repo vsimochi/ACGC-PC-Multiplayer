@@ -531,6 +531,16 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\nto someone else, I'm afraid.\nMaybe next time!");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_PORTER_STATION:
+            nk_text(&b, "Welcome to the station!");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nThis station only serves\nthis town, you see.");
+            nk_page(&b);
+            nk_text(&b, "Visits with other players");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nare arranged online, by\nconnecting to a host.");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_WORK_V_FAIL:
             nk_text(&b, "Hm? I do not know what");
             nk_pause(&b, 6);

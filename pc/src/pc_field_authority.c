@@ -396,6 +396,8 @@ int pcfa_net_apply_active(void) {
 }
 
 /* ---- hooks (called from src/game/m_field_info.c, PC build only) --------------------------- */
+void pcnetgame_gyroid_tile_note(const char* what, int acre, int tile, unsigned old_v, unsigned new_v); /* pc_net_game.c, logging only */
+
 void pcfa_note_tile_write(const uint16_t* slot, uint16_t old_value, uint16_t new_value) {
     int acre;
     int tile;
@@ -408,6 +410,7 @@ void pcfa_note_tile_write(const uint16_t* slot, uint16_t old_value, uint16_t new
     }
     pcfa_mark_acre_dirty(acre);
     pcfa_guard_log("tile", acre, tile, old_value, new_value);
+    pcnetgame_gyroid_tile_note(pcfa_net_apply_active() ? "tile-write (network apply)" : "tile-write (local/vanilla)", acre, tile, old_value, new_value); /* TEST-ONLY diagnostics, logging only (AC_TEST_GYROID_DIAG) */
 }
 
 void pcfa_note_deposit_write(const uint16_t* row, uint16_t old_bits, uint16_t new_bits) {

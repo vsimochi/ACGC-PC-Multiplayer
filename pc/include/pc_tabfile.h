@@ -17,7 +17,7 @@ enum { PC_TABFILE_BAD = -1, PC_TABFILE_MISSING = 0, PC_TABFILE_OK = 1 };
 
 uint32_t pc_tabfile_fnv(const void* p, size_t n);
 int pc_tabfile_save(const char* path, uint32_t magic, uint32_t version, uint32_t aux, const PCKeyTab* t); /* 1 = written + renamed, 0 = failed (the old file is untouched) */
-/* Loads into `t` (replacing its content). legacy_version / legacy_count = 0 disables the v2 reader. *aux_out / *version_out (optional) are set on success. */
+/* Loads into `t` (replacing its content). used_off = offset of a byte that is non-zero in a live record ((size_t)-1: keep every record). legacy_version / legacy_count = 0 disables the v2 reader. *aux_out / *version_out (optional) are set on success. */
 int pc_tabfile_load(const char* path, uint32_t magic, uint32_t version, uint32_t legacy_version, int legacy_count, size_t used_off, PCKeyTab* t, uint32_t* aux_out, uint32_t* version_out, int* kept_out);
 
 #ifdef __cplusplus

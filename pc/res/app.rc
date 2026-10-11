@@ -3,11 +3,12 @@
 
 1 RT_MANIFEST "app.manifest"
 
-1 ICON "icon.ico"
+/* the previous icon.ico (provenance unconfirmed, see THIRD_PARTY_NOTICES.md) is kept in the repository; the build uses the project's own generic icon */
+1 ICON "icon_generic.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,9,3,0
-PRODUCTVERSION  0,9,3,0
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -18,12 +19,12 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription",  "Animal Crossing PC Port"
-            VALUE "FileVersion",      "0.9.3.0"
+            VALUE "FileDescription",  "Unofficial Animal Crossing PC port with multiplayer (fan project, not affiliated with Nintendo)"
+            VALUE "FileVersion",      "0.1.0.0"
             VALUE "InternalName",     "AnimalCrossing"
             VALUE "OriginalFilename", "AnimalCrossing.exe"
-            VALUE "ProductName",      "Animal Crossing"
-            VALUE "ProductVersion",   "0.9.3.0"
+            VALUE "ProductName",      "Animal Crossing PC Multiplayer (unofficial)"
+            VALUE "ProductVersion",   "0.1.0.0"
         END
     END
     BLOCK "VarFileInfo"

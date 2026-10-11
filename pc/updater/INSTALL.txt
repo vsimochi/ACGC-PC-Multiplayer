@@ -1,0 +1,39 @@
+Animal Crossing Multiplayer - Beta first install   (UNOFFICIAL fan project, not affiliated with or endorsed by Nintendo)
+
+WHAT YOU NEED
+- Windows 10/11, 64-bit, and a GPU/driver with OpenGL 3.3 core profile.
+- YOUR OWN legally obtained disc image of Animal Crossing for the GameCube, USA, Rev 0 (game ID GAFE01_00), as .iso, .gcm or .ciso. Other regions / revisions are not supported. This package contains no disc image and no intentionally bundled extracted game data, and nothing in it is a licence to the original game.
+
+INSTALL
+1. Unzip this folder somewhere you can write (for example C:\Games\ACMultiplayer). Do not put it in a Git checkout or in Program Files.
+2. Copy your disc image into the "rom" folder.
+3. Start ACLauncher.exe (not AnimalCrossing.exe). It checks GitHub for a newer release, asks before changing anything, then starts the game.
+
+PLAYING ALONE
+Start ACLauncher.exe and play; the game runs like the normal PC port.
+
+PLAYING MULTIPLAYER (everyone needs the SAME release: a host rejects a client with a different network protocol version)
+- Host: start ACLauncher.exe --host     (UDP port 7777; or  --host 7778  for another port). The game plays normally while it waits. Add --dedicated for an unattended server with no player (no game window; it opens its own console window where you type commands such as status / players / save / stop, see docs\console-commands.md).
+- DEDICATED SERVER, EASY WAY: edit server_config.ini with Notepad (every setting is explained in it), then double-click "Start Server.bat". It checks the settings before anything starts and tells you what is wrong. See SERVER_SETUP.txt (first start, stopping with "stop", Windows Firewall, router port forwarding, how friends connect). These four starter files are in the first-install bundle only; updates never change them.
+- Join: on the title screen choose "Play Online", add a server (name, address, port), pick or create a character, connect. Or start ACLauncher.exe --connect HOST_IP:7777 .
+- Network: the host must allow inbound UDP on the port in its firewall and, over the internet, forward that UDP port in its router. The game does not open ports for you. Others connect to the host's IP address. Defaults: 4 guests, 8 peers at once (--max-guests N, --max-peers N).
+- Only host or join games with people you trust; the original game was not designed with network security in mind.
+- To pass options when starting by double-click, make a shortcut to ACLauncher.exe and add them to its Target (for example ...\ACLauncher.exe --host).
+- Not shared yet / known problems are listed in RELEASE_NOTES.txt.
+
+BEFORE YOU PLAY
+- This is a BETA. Multiplayer can desync and a bug could damage a save. BACK UP the "save" folder before playing and before every update (copy it somewhere else).
+- Only host or join games with people you trust.
+
+TROUBLESHOOTING
+- "No game data found" / "Missing ROM": the disc image is not in "rom" or is not a supported GAFE01_00 image.
+- Windows SmartScreen / antivirus warning: the executables are unsigned.
+- Update problems / recovery: see UPDATING.txt and docs\updater.md (previous program files are in .update\backup-<version>); updater.log records every launch.
+- Settings: updater.ini (update checks), settings.ini / keybindings.ini (created by the game).
+- Updates never touch rom\, save\, servers\, settings.ini, keybindings.ini, texture_pack\ or logs.
+
+GETTING HELP
+Read this file, UPDATING.txt and updater.log first. The project page is https://github.com/vsimochi/ACGC-PC-Multiplayer (its Issues tab is currently switched off; the maintainer should name a contact or enable it before release). When asking for help include: Windows version, GPU, the contents of updater.log and the game's console/log output, and whether you host or join.
+
+LEGAL / NOTICES
+See LICENSE and licenses\THIRD_PARTY_NOTICES.txt / THIRD_PARTY_NOTICES.md. Some licensing questions about this project are still open and are listed there; the package is not described as "cleared".

@@ -666,7 +666,11 @@ const char* pc_test_hook_getenv(const char* name) {
 
 /* 1 for the flags that inject state / bypass a rule (guarded). */
 static int pc_is_test_hook_flag(const char* a) {
-    static const char* const pre[] = { "--house-buy-test", "--nook-test", "--house-test-host-edit", "--mail-test-", "--txn-fault", "--promote-fault", "--d3-test-wallet-add", NULL };
+    /* F-03: every flag that injects state or bypasses a rule is a test hook (refused unless this is a test build AND AC_TEST_HOOKS=1): the older ones by name, the later families by prefix.
+     * --lowaddr-selftest / --rng-selftest only check the engine and stay open. */
+    static const char* const pre[] = { "--house-buy-test", "--nook-test", "--house-test-host-edit", "--mail-test-", "--txn-fault", "--promote-fault", "--d3-test-wallet-add",
+                                       "--force-", "--diag-", "--pickup-test-seed", "--field-action-test-seed", "--bury-test-seed", "--scene-test-", "--collide-test-", "--txn-test-", "--ts-test-",
+                                       "--world-test-", "--shop-test-", "--house-test-", "--guest-creation-test", NULL };
     int k;
     for (k = 0; pre[k] != NULL; k++) {
         if (strncmp(a, pre[k], strlen(pre[k])) == 0) {
@@ -2504,6 +2508,7 @@ int main(int argc, char* argv[]) {
     } else {
         setvbuf(stdout, NULL, _IONBF, 0);
         setvbuf(stderr, NULL, _IONBF, 0);
+        pc_dedicated_note_stdout_console(); /* the game's own stdout / stderr stay on the console (--verbose / -debug* / PC_LOG / profiling) */
     }
     if (g_pc_dedicated) {
         pc_dedicated_startup(g_pc_net_port); /* "[DEDICATED] ..." startup line + the stdin command reader (only enqueues; drained on the main thread) */

@@ -1,4 +1,7 @@
 /* pc_tabfile.c - see pc_tabfile.h. */
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "pc_tabfile.h"
 
 #include <stdio.h>
@@ -45,11 +48,19 @@ int pc_tabfile_save(const char* path, uint32_t magic, uint32_t version, uint32_t
         remove(tmp);
         return 0;
     }
-    remove(path);
+    /* Replace the old file in ONE step. remove()+rename() left a window with NO file at all (a crash between the two lost work_jobs.dat / the K.K. tables); MoveFileEx with REPLACE_EXISTING
+     * (and WRITE_THROUGH) swaps atomically on Windows, POSIX rename() already replaces atomically. */
+#ifdef _WIN32
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        remove(tmp);
+        return 0;
+    }
+#else
     if (rename(tmp, path) != 0) {
         remove(tmp);
         return 0;
     }
+#endif
     return 1;
 }
 
@@ -87,7 +98,7 @@ int pc_tabfile_load(const char* path, uint32_t magic, uint32_t version, uint32_t
                 (void)pc_keytab_load(t, NULL, 0);
                 for (i = 0; i < n; i++) {
                     const unsigned char* r = recs + (size_t)i * t->elem;
-                    if (r[used_off] != 0) {
+                    if (used_off == (size_t)-1 || r[used_off] != 0) { /* (size_t)-1 = every stored record is live (no "used" byte) */
                         void* dst = pc_keytab_get_or_create(t, r + t->key_off, NULL);
                         if (dst != NULL) {
                             memcpy(dst, r, t->elem);

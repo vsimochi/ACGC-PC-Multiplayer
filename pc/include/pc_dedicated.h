@@ -36,6 +36,8 @@ void pc_dedicated_early_console(void);
 /* 1 when the server console is its OWN window (interactive launch of the GUI-subsystem exe): stdout / stderr then go to NUL (non-verbose) so debug printf noise
  * cannot tear the line being typed; [DEDICATED] lines and command output use the console stream directly. 0 for redirected runs / console builds. */
 int  pc_dedicated_stdout_quiet(void);
+/* pc_main.c: stdout / stderr were NOT sent to NUL (the game's own output reaches the console). In the interactive console that output is then routed through the same locked writer as everything else. */
+void pc_dedicated_note_stdout_console(void);
 
 /* pc_main.c, after the output routing is decided: remember the listen port, print the "[DEDICATED] ..." startup line, start the stdin reader. */
 void pc_dedicated_startup(uint16_t port);
@@ -162,6 +164,13 @@ int  pc_net_game_dedicated_give(const char* sel, unsigned id, int qty, char* who
 void pc_net_game_dedicated_announce(int peer, int what);
 
 /* Always-on "[DEDICATED] ..." console line (dedicated mode only; main thread). */
+/* Same notice, but a LOW-LEVEL diagnostic (a transport connect / disconnect): always written to servers/<id>/logs/server.log, and to the console too - except in the interactive console, where the
+ * player-facing lifecycle lines ("A client is connecting...", "<name> arrived into town", "<name> left town") replace it unless -debugnetwork / --verbose asked for the detail. */
+void pc_dedicated_say_detail(const char* fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    ;
 void pc_dedicated_say(const char* fmt, ...)
 #if defined(__GNUC__)
     __attribute__((format(printf, 1, 2)))

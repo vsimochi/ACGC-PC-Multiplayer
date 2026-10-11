@@ -3,6 +3,8 @@
 
 #include <string.h>
 
+#include "pc_tabfile.h"
+
 int pc_dayclaims_init(PCDayClaims* c, size_t key_len, int max) {
     if (c == NULL || key_len == 0 || key_len > PC_DAYCLAIM_KEY_MAX) {
         return 0;
@@ -58,6 +60,36 @@ int pc_dayclaims_mark(PCDayClaims* c, const void* key, uint32_t day) {
     }
     e->day = day;
     return 1;
+}
+
+int pc_dayclaims_save(const PCDayClaims* c, const char* path, uint32_t magic) {
+    if (c == NULL || !c->ready || path == NULL) {
+        return 0;
+    }
+    return pc_tabfile_save(path, magic, 1u, 0u, &c->tab);
+}
+
+int pc_dayclaims_load(PCDayClaims* c, const char* path, uint32_t magic) {
+    int rc;
+    if (c == NULL || !c->ready || path == NULL) {
+        return -1;
+    }
+    rc = pc_tabfile_load(path, magic, 1u, 0u, 0, (size_t)-1, &c->tab, NULL, NULL, NULL);
+    return rc == PC_TABFILE_OK ? 1 : (rc == PC_TABFILE_MISSING ? 0 : -1);
+}
+
+int pc_dayclaims_has_room(const PCDayClaims* c, uint32_t day) {
+    int i, today = 0;
+    if (c == NULL || !c->ready) {
+        return 0;
+    }
+    for (i = pc_keytab_count(&c->tab) - 1; i >= 0; i--) {
+        const PCDayClaim* o = (const PCDayClaim*)pc_keytab_at(&c->tab, i);
+        if (o != NULL && o->day == day) {
+            today++;
+        }
+    }
+    return today < c->tab.max;
 }
 
 int pc_dayclaims_count(const PCDayClaims* c) {

@@ -140,6 +140,18 @@ int main(int argc, char** argv) {
     snprintf(p2, sizeof(p2), "%.390s.tmp", p);
     check("...and no temporary file remains", fopen(p2, "rb") == NULL);
     {
+        /* saving OVER an existing file replaces it in one step (MoveFileEx / rename): the old content is never missing, the new one is complete, no .tmp is left */
+        uint32_t aux2 = 0, ver2 = 0;
+        int kept2 = 0;
+        PCKeyTab tover;
+        check("saving over the existing file succeeds", pc_tabfile_save(p, 0x4B574341u, 3u, 99999u, &t));
+        check("...no temporary file remains after the overwrite", fopen(p2, "rb") == NULL);
+        check("...and the file now carries the new aux value, whole", pc_keytab_init(&tover, sizeof(WorkChar), 0, 20, 1000000) &&
+              pc_tabfile_load(p, 0x4B574341u, 3u, 2u, 64, offsetof(WorkChar, used), &tover, &aux2, &ver2, &kept2) == PC_TABFILE_OK && aux2 == 99999u && kept2 == 5000);
+        pc_keytab_free(&tover);
+        check("restore the original aux for the checks below", pc_tabfile_save(p, 0x4B574341u, 3u, 12345u, &t));
+    }
+    {
         uint32_t aux = 0, ver = 0;
         int kept = 0;
         check("load v3 into a fresh table: OK, aux, version and record count are right", pc_tabfile_load(p, 0x4B574341u, 3u, 2u, 64, offsetof(WorkChar, used), &t2, &aux, &ver, &kept) == PC_TABFILE_OK && aux == 12345u && ver == 3u && kept == 5000 && pc_keytab_count(&t2) == 5000);
@@ -251,6 +263,18 @@ int main(int argc, char** argv) {
         check("nobody has claimed anything yet", !pc_dayclaims_has(&c, a, sat) && !pc_dayclaims_has(&c, b, sat));
         check("REGRESSION (K.K.): guest A claims its song; guest B can STILL claim (the old shared foreigner bit blocked B)", pc_dayclaims_mark(&c, a, sat) && pc_dayclaims_has(&c, a, sat) && !pc_dayclaims_has(&c, b, sat));
         check("guest B claims too; both are recorded independently", pc_dayclaims_mark(&c, b, sat) && pc_dayclaims_has(&c, a, sat) && pc_dayclaims_has(&c, b, sat) && pc_dayclaims_count(&c) == 2);
+        check("has_room: true while the table is far from its budget", pc_dayclaims_has_room(&c, sat));
+        {
+            /* the claims survive a host restart: save, load into a fresh table, today's claims are there, an earlier day's no longer count */
+            char cp[400];
+            PCDayClaims c2;
+            path_of(cp, sizeof(cp), "kk_claims.dat");
+            check("persist: save the claims", pc_dayclaims_save(&c, cp, 0x4B4B4443u));
+            check("persist: load into a fresh table (the 'host restart'): both guests' claims of that day are back, and not for another day",
+                  pc_dayclaims_init(&c2, 20, 100) && pc_dayclaims_load(&c2, cp, 0x4B4B4443u) == 1 && pc_dayclaims_has(&c2, a, sat) && pc_dayclaims_has(&c2, b, sat) && !pc_dayclaims_has(&c2, a, sat + 1u) && pc_dayclaims_count(&c2) == 2);
+            check("persist: a missing file loads as 0 and leaves the table alone", pc_dayclaims_load(&c2, "no/such/kk.dat", 0x4B4B4443u) == 0 && pc_dayclaims_count(&c2) == 2);
+            pc_dayclaims_free(&c2);
+        }
         check("a claim is per identity: the SAME guest asking again (a reconnect, another peer id / table slot, a client restart) is still 'already got one'", pc_dayclaims_has(&c, a, sat));
         check("the next day the claim no longer counts", !pc_dayclaims_has(&c, a, sun));
         check("marking on the next day sweeps the old claims (only the new one remains)", pc_dayclaims_mark(&c, a, sun) && pc_dayclaims_count(&c) == 1 && pc_dayclaims_has(&c, a, sun) && !pc_dayclaims_has(&c, b, sun));
@@ -258,6 +282,7 @@ int main(int argc, char** argv) {
         for (i = 0; i < 1000; i++) { key_of(a, 5000 + i); ok = ok && pc_dayclaims_mark(&c, a, sun); }
         key_of(a, 6000);
         check("1000 guests can all claim on one day (+ the earlier one: the table holds up to its budget), then the budget refuses a NEW claimant without disturbing the others", ok && pc_dayclaims_count(&c) == 1001 && !pc_dayclaims_mark(&c, a, sun) && (key_of(a, 5500), pc_dayclaims_has(&c, a, sun)));
+        check("has_room: false once today's claims fill the budget (the host refuses the K.K. claim BEFORE granting), true again on the next day (old claims are swept)", !pc_dayclaims_has_room(&c, sun) && pc_dayclaims_has_room(&c, sun + 1u));
         pc_dayclaims_free(&c);
         check("uninitialised / freed claims are inert", !pc_dayclaims_has(&c, a, sat) && !pc_dayclaims_mark(&c, a, sat) && pc_dayclaims_count(&c) == 0);
     }

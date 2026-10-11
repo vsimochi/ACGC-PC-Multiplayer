@@ -77,6 +77,9 @@
  *   when any fault is enabled.
  */
 #include "pc_net.h"
+#ifdef PC_NET_TEST_HOOKS
+#include "pc_test_hooks.h" /* the PC_NET_FAULT_* switches are test hooks */
+#endif
 
 /* Stage 0/1 scope is explicitly Windows/Winsock only (see pc_net.h). On any other platform this
  * whole module compiles down to a safe "networking is simply unavailable" stub: every entry
@@ -379,10 +382,17 @@ static uint32_t pcnet_make_nonce(void) {
 /* ------------------------------------------------------------------------------------------ */
 /* fault injection (test seam; inert unless enabled by environment at pc_net_init())           */
 
+/* The PC_NET_FAULT_* switches drop / duplicate / reorder real traffic: they exist ONLY in a PC_TEST_HOOKS build and then need AC_TEST_HOOKS=1 (a release build
+ * ignores them, so an environment variable can never degrade a player's connection). */
 static uint32_t pcnet_env_u32(const char* name) {
-    const char* v = getenv(name);
+#ifdef PC_NET_TEST_HOOKS
+    const char* v = pc_test_hook_getenv(name);
     if (v == NULL || *v == '\0') return 0;
     return (uint32_t)strtoul(v, NULL, 10);
+#else
+    (void)name;
+    return 0;
+#endif
 }
 
 /* PC_NET_FAULT_* env vars are TEST-ONLY: read once here at init, never set in normal play. */
@@ -1174,7 +1184,48 @@ static int pcnet_send_unreliable_to_slot(int i, const void* data, uint16_t size)
     return 1;
 }
 
+#ifdef PC_NET_TEST_HOOKS
+/* TEST-ONLY (PC_NET_TEST_HOOKS build, armed by the autopilot `refusesend`): the next `left` RELIABLE sends whose first payload byte is `type` are refused (return 0, exactly like a full window or a
+ * gone peer), and the ACCEPTED sends of that type are counted, so a test can prove that a sender that was refused does not record the message as sent and retries it. */
+static int      s_test_ref_type = -1;
+static int      s_test_ref_left = 0;
+static unsigned s_test_ref_refused = 0;
+static unsigned s_test_ref_accepted = 0;
+
+void pc_net_test_refuse_reliable(int type, int count) {
+    s_test_ref_type = type;
+    s_test_ref_left = count;
+    s_test_ref_refused = 0;
+    s_test_ref_accepted = 0;
+}
+
+void pc_net_test_refuse_stats(unsigned* refused, unsigned* accepted, int* left) {
+    if (refused != NULL) *refused = s_test_ref_refused;
+    if (accepted != NULL) *accepted = s_test_ref_accepted;
+    if (left != NULL) *left = s_test_ref_left;
+}
+#endif
+
+static int pcnet_send_impl(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t size);
+
 int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t size) {
+#ifdef PC_NET_TEST_HOOKS
+    if (kind == PC_NET_RELIABLE && s_test_ref_type >= 0 && size > 0 && data != NULL && ((const uint8_t*)data)[0] == (uint8_t)s_test_ref_type) {
+        int ok;
+        if (s_test_ref_left > 0) {
+            s_test_ref_left--;
+            s_test_ref_refused++;
+            return 0;
+        }
+        ok = pcnet_send_impl(peer, kind, data, size);
+        s_test_ref_accepted += (unsigned)(ok != 0);
+        return ok;
+    }
+#endif
+    return pcnet_send_impl(peer, kind, data, size);
+}
+
+static int pcnet_send_impl(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t size) {
     int i;
     if (s_socket == INVALID_SOCKET) return 0;
     if (size > PC_NET_MAX_PAYLOAD) return 0;

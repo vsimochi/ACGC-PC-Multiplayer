@@ -251,6 +251,12 @@ void pc_net_evict(PCNetPeerId peer);
  * Client: pass PC_NET_INVALID_PEER to leave the current host. */
 void pc_net_disconnect(PCNetPeerId peer);
 
+#ifdef PC_NET_TEST_HOOKS
+/* TEST-ONLY: refuse the next `count` RELIABLE sends whose first payload byte is `type` (see pc_net.c); stats = refused so far, accepted since arming, refusals still pending. */
+void pc_net_test_refuse_reliable(int type, int count);
+void pc_net_test_refuse_stats(unsigned* refused, unsigned* accepted, int* left);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

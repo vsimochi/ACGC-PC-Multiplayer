@@ -1,0 +1,8 @@
+# ACLauncher.exe settings (this file is YOURS: updates never overwrite it)
+repository=vsimochi/ACGC-PC-Multiplayer
+# 0 = never check for updates (the game is launched directly)
+check_updates=1
+# 1 = also offer prereleases (default: stable releases only)
+allow_prerelease=0
+# 1 = show a message when the update check fails (offline, GitHub error); the game is launched either way
+show_check_errors=1

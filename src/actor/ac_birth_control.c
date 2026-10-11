@@ -5,6 +5,9 @@
 #include "m_common_data.h"
 #include "GBA2/gba2.h"
 #include "m_player_lib.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#endif
 
 static void aBC_actor_ct(ACTOR*, GAME*);
 static void aBC_actor_move(ACTOR*, GAME*);
@@ -86,6 +89,10 @@ static void aBC_deleteActor_part(GAME_PLAY* play, int part) {
   }
 }
 
+#ifdef TARGET_PC
+static const char* aBC_diag_reason = "?"; /* TEST-ONLY diagnostics: which birth-control path asked for the spawn (only read by the logging) */
+#endif
+
 static int aBC_setupOtherActor(GAME_PLAY* play, mActor_name_t actor_id, s16 profile, f32 pos_x, f32 pos_z,
                                mActor_name_t clear_item, int bx, int bz) {
   ACTOR* actor;
@@ -95,6 +102,11 @@ static int aBC_setupOtherActor(GAME_PLAY* play, mActor_name_t actor_id, s16 prof
   pos.x = pos_x;
   pos.z = pos_z;
   pos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
+#ifdef TARGET_PC
+  if (actor_id >= ACTOR_PROP_HANIWA0 && actor_id <= ACTOR_PROP_HANIWA3) {
+    { mActor_name_t* fgp = mFI_GetUnitFG(pos); pc_net_game_gyroid_diag("spawn-request", aBC_diag_reason, NULL, actor_id, pos.x, pos.z, bx, bz, fgp != NULL ? (unsigned)*fgp : 0xFFFEu); }
+  }
+#endif
   actor = Actor_info_make_actor(
     &play->actor_info,
     (GAME*)play,
@@ -337,6 +349,9 @@ static void aBC_spawn_actors_in_nearby_blocks(BIRTH_CONTROL_ACTOR* birth_control
       f32 pos_z;
       u16 bit_data;
 
+#ifdef TARGET_PC
+      aBC_diag_reason = "nearby-blocks";
+#endif
       aBC_setupActor(birth_control, play, bx, bz);
 
       birth_control->move_actor_data[1 + i] = mFI_MoveActorListDma(bx, bz);
@@ -412,6 +427,9 @@ static void aBC_actor_move(ACTOR* actorx, GAME* game) {
   if (play->game.pad_initialized == TRUE) {
     if (birth_control->setup_actor_flag) {
       aBC_deleteActor_part(play, ACTOR_PART_ITEM);
+#ifdef TARGET_PC
+      aBC_diag_reason = "setup_actor_flag";
+#endif
       aBC_setupActor(birth_control, play, play->block_table.block_x, play->block_table.block_z);
     }
 

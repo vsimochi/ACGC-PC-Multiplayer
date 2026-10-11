@@ -548,6 +548,8 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_BOBBER_STATE          = 74, /* client -> host ONLY, UNRELIABLE, 36 bytes, about 10 Hz while the player's bobber exists: the bobber fields the host's fish AI reads (see PCWldBobber). */
     PC_NETGAME_MSG_BOBBER_EVENT          = 75, /* host -> ONE client, RELIABLE, 24 bytes: a decision the host's fish AI made against that client's bobber (near / nibble / bite / release) which the
                                              * client applies to its own bobber and fish copy so the vanilla fishing animation plays. */
+    PC_NETGAME_MSG_HANDSHAKE_BUSY        = 76, /* client -> host ONLY, RELIABLE, 4 bytes (v8 unreleased: extended in place, NO version bump): "I am connected and still getting ready to send my IDENTITY" (the first-run
+                                             * character creation in Rover's train scene, a long town load). The host restarts its identity-handshake deadline (N-05) on it, up to a cap since the connect. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2057,6 +2059,13 @@ _Static_assert(sizeof(PCNetGameNpcTalkMsg) == 8, "PCNetGameNpcTalkMsg wire size 
 _Static_assert(sizeof(PCNetGameNpcTalkMsg) <= PC_NET_MAX_PAYLOAD,
                "PCNetGameNpcTalkMsg exceeds PC_NET_MAX_PAYLOAD (pc_net.h) -- pc_net would drop it");
 
+/* Handshake keepalive, id 76, client -> host, RELIABLE, 4 bytes: sent about every 10 s by a client that is transport-connected but cannot send its IDENTITY yet. */
+typedef struct PCNetGameHandshakeBusyMsg {
+    uint8_t msg_type; /* PC_NETGAME_MSG_HANDSHAKE_BUSY */
+    uint8_t _reserved[3]; /* must be 0 */
+} PCNetGameHandshakeBusyMsg;
+_Static_assert(sizeof(PCNetGameHandshakeBusyMsg) == 4, "PCNetGameHandshakeBusyMsg wire size drifted");
+
 /* Villager house exit, id 72, client -> host, RELIABLE, 8 bytes. `slot` = Save_t.animals[] index, `npc_id` = the identity guard (same pairing as NPC_STATE / NPC_TALK). */
 typedef struct PCNetGameNpcHomeExitMsg {
     uint8_t  msg_type; /* PC_NETGAME_MSG_NPC_HOME_EXIT */
@@ -2959,6 +2968,8 @@ static void pcnetgame_host_check_wildlife_attendance(void);
 static void pcnetgame_wildlife_sim_tick(void);
 static void pcnetgame_handle_host_bobber_state(PCNetPeerId peer, const PCNetGameBobberStateMsg* in);
 static void pcnetgame_handle_client_wildlife_state(const uint8_t* data, size_t size);
+static uint32_t s_client_wld_state_last;    /* W-14 (tentative definitions: the real ones sit next to the handler; the autopilot test hooks above it read them) */
+static unsigned s_client_wld_state_dropped;
 static void pcnetgame_handle_client_bobber_event(const PCNetGameBobberEventMsg* in);
 static void pcnetgame_wildlife_replay_acre_to_peer(PCNetPeerId peer, const PcWildlifeRecord* recs, int n, int bx, int bz);
 static void pcnetgame_handle_host_room_npc(PCNetPeerId peer, const PCNetGameRoomNpcMsg* in);
@@ -3730,6 +3741,10 @@ typedef struct PCNetGameHostPeerState {
     /* "closing" (see pcnetgame_host_reject_and_close()): a REJECT was sent, transport still up */
     int                  closing;
     uint32_t             closing_since_ms;
+    uint32_t             hs_since_ms; /* N-05: when the transport connected / the last HANDSHAKE_BUSY arrived (0 = not waiting for an identity); see PC_NETGAME_HANDSHAKE_DEADLINE_MS */
+    int                  hs_busy_logged;
+    int                  hs_busy_cap_logged;
+    uint32_t             hs_first_ms; /* when the transport connected: HANDSHAKE_BUSY keepalives stop extending the deadline PC_NETGAME_HANDSHAKE_BUSY_MAX_MS after this */
     /* PLAYER_CONTEXT */
     int                  ctx_valid;
     PCNetPlayerContext   ctx;
@@ -5023,6 +5038,7 @@ static void pcnetgame_scene_pack(PCNetGamePlayerSceneMsg* msg, uint8_t net_playe
     msg->seq = s->seq;
 }
 
+static void pcnetgame_ded_life_arrived(PCNetPeerId peer, const PCNetPlayerScene* s); /* dedicated console lifecycle (defined before pcnetgame_reset_all_host_peer_state) */
 /* M9-C: defined with the host talk-hold table further down. */
 static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* why, int reset_seq);
 static void pcnetgame_host_talk_hold_scene_left(PCNetPeerId peer, const PCNetPlayerScene* s);
@@ -5052,6 +5068,7 @@ static void pcnetgame_handle_host_player_scene(PCNetPeerId peer, const PCNetGame
     }
     printf("[NET][SCENE] host: peer %d now in scene %u (kind %u, owner 0x%04X, flags 0x%02X, seq %u)\n", (int)peer,
            (unsigned)s.scene_id, (unsigned)s.kind, (unsigned)s.owner, (unsigned)s.flags, (unsigned)s.seq);
+    pcnetgame_ded_life_arrived(peer, &s);
     s_move_boost[peer] = PC_INTEREST_BOOST_SAMPLES; /* capacity phase 5: its place changed: every receiver gets its next samples at full rate */
     pc_roster_changed(&s_roster_scn, (int)peer);    /* a roster delta: relayed (TRUE originating id, normalized fields) by pcnetgame_roster_pump, retried if a window is full */
 }
@@ -6323,8 +6340,11 @@ static void pcnetgame_npc_lease_host_tick(void) {
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         if (s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
             if (s_host_peer[p].nlease_seq != s_lease_host.seq && s_lease_host_seq != 0) {
-                s_host_peer[p].nlease_seq = s_lease_host.seq;
-                (void)pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &s_lease_host, (uint16_t)sizeof(s_lease_host));
+                /* "sent" is recorded only when the reliable queue ACCEPTED the message (F-01): with a full window the old code marked it sent and the peer never learned the lease change;
+                 * now the next call simply tries again. */
+                if (pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &s_lease_host, (uint16_t)sizeof(s_lease_host))) {
+                    s_host_peer[p].nlease_seq = s_lease_host.seq;
+                }
             }
         } else {
             s_host_peer[p].nlease_seq = 0;
@@ -6443,7 +6463,49 @@ static void pcnetgame_client_talk_refresh_tick(void) {
  * s_host_drop_state's doc gives. This is only the dispatch point. Safe to call for an
  * out-of-range peer, because every callee already treats that as a no-op. */
 static void pcnetgame_townsrv_reset(PCNetPeerId peer); /* M-B: frees the peer's town snapshot (defined with the TOWN TRANSFER host block) */
+
+/* Dedicated console: the player-facing lifecycle of one transport session, per peer slot (kept OUTSIDE s_host_peer on purpose: the departure line needs the name AFTER the peer's own state is
+ * wiped). connecting: "A client is connecting..." was said (once per session); arrived: "<name> arrived into town" was said, so a departure is owed. Cleared with the slot. */
+typedef struct PCNetGameDedLife {
+    uint8_t connecting;
+    uint8_t arrived;
+    char    name[24];
+} PCNetGameDedLife;
+static PCNetGameDedLife s_ded_life[PC_NETGAME_WIRE_ID_SPACE];
+static void pcnetgame_dedicated_ascii_name(const uint8_t* src, char* out); /* defined with the dedicated console tools */
+
+/* the first message that proves the transport connection belongs to a real joining client (identity claim / "still getting ready" keepalive); a town-fetch connection never sends these */
+static void pcnetgame_ded_life_connecting(PCNetPeerId peer) {
+    if (!g_pc_dedicated || peer < 0 || peer >= PC_NETGAME_WIRE_ID_SPACE || s_ded_life[peer].connecting) {
+        return;
+    }
+    s_ded_life[peer].connecting = 1;
+    pc_dedicated_say("A client is connecting to the server...");
+}
+
+/* the host's own authoritative record of this peer's first accepted scene: the player is standing in the home town field */
+static void pcnetgame_ded_life_arrived(PCNetPeerId peer, const PCNetPlayerScene* s) {
+    if (!g_pc_dedicated || peer < 0 || peer >= PC_NETGAME_WIRE_ID_SPACE || s_ded_life[peer].arrived || s->kind != (uint8_t)PC_NETSCENE_KIND_FIELD ||
+        (s->flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0 || !s_host_peer[peer].ready_identity_valid) {
+        return;
+    }
+    pcnetgame_dedicated_ascii_name(s_host_peer[peer].ready_player_name, s_ded_life[peer].name);
+    s_ded_life[peer].arrived = 1;
+    pc_dedicated_say("%s arrived into town", s_ded_life[peer].name);
+}
+
+static void pcnetgame_ded_life_end(PCNetPeerId peer) {
+    if (peer < 0 || peer >= PC_NETGAME_WIRE_ID_SPACE) {
+        return;
+    }
+    if (s_ded_life[peer].arrived && g_pc_dedicated) {
+        pc_dedicated_say("%s left town", s_ded_life[peer].name);
+    }
+    memset(&s_ded_life[peer], 0, sizeof(s_ded_life[peer]));
+}
+
 static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
+    pcnetgame_ded_life_end(peer); /* the departure line (a town-present player) + a clean lifecycle for a reused slot */
     pcnetgame_townsrv_reset(peer);
     /* Stage 5A / 5B-1 / two-phase: clear the dedup records AND release any reservation they hold (the
      * reservation table is the set of PENDING records, so this is the single place a dead or reused
@@ -8060,12 +8122,61 @@ static void pcnetgame_host_reject_and_close(PCNetPeerId peer, int sent_ok) {
 }
 
 /* Once per poll: finishes every closing peer whose REJECT was acknowledged or whose linger expired. */
+/* N-05: a peer that is transport-connected (it keeps the transport alive with heartbeats) but never completes the IDENTITY handshake used to hold its slot for ever. It is dropped after this
+ * deadline; the clock only runs while the host's world service is ready (a host that is itself still loading answers no identity, which is not the peer's fault). */
+#define PC_NETGAME_HANDSHAKE_DEADLINE_MS 60000u
+
+/* HANDSHAKE_BUSY: the first-run Rover scene (character creation), a long town load: a client that cannot send its IDENTITY yet tells the host it is alive, which restarts the 60 s clock.
+ * The extension is capped so that a peer that never finishes still cannot hold a slot for ever: PC_NETGAME_HANDSHAKE_BUSY_MAX_MS after the connect no keepalive extends the deadline. */
+#define PC_NETGAME_HANDSHAKE_BUSY_MAX_MS 1800000u
+
+static uint32_t pcnetgame_hs_busy_max_ms(void) {
+#ifdef PC_NET_TEST_HOOKS
+    const char* e = pc_test_hook_getenv("PC_NET_TEST_HS_BUSY_MAX_MS"); /* test only (AC_TEST_HOOKS=1): a short cap so the cap itself can be tested */
+    if (e != NULL && atoi(e) > 0) {
+        return (uint32_t)atoi(e);
+    }
+#endif
+    return PC_NETGAME_HANDSHAKE_BUSY_MAX_MS;
+}
+
+static void pcnetgame_handle_host_handshake_busy(PCNetPeerId peer) {
+    const uint32_t now = pcnetgame_now_ms();
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_HANDSHAKE || s_host_peer[peer].closing || s_host_peer[peer].hs_since_ms == 0u) {
+        return; /* only a peer that is still waiting to identify itself; READY / closing peers ignore it */
+    }
+    if ((uint32_t)(now - s_host_peer[peer].hs_first_ms) >= pcnetgame_hs_busy_max_ms()) {
+        if (!s_host_peer[peer].hs_busy_cap_logged) {
+            s_host_peer[peer].hs_busy_cap_logged = 1;
+            printf("[NET] host: peer %d is still not identified %u s after it connected: its keepalives no longer extend the handshake deadline\n", (int)peer, (unsigned)((now - s_host_peer[peer].hs_first_ms) / 1000u));
+        }
+        return;
+    }
+    if (!s_host_peer[peer].hs_busy_logged) {
+        s_host_peer[peer].hs_busy_logged = 1;
+        printf("[NET] host: peer %d is getting ready (first-run character creation / loading): handshake deadline extended while it keeps reporting\n", (int)peer);
+    }
+    s_host_peer[peer].hs_since_ms = now;
+}
+
 static void pcnetgame_host_closing_tick(void) {
     uint32_t now = 0;
     int i;
 
     for (i = 0; i < pcnetgame_peer_span(); i++) {
         int backlog;
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_HANDSHAKE && !s_host_peer[i].closing && s_host_peer[i].hs_since_ms != 0u) {
+            if (now == 0) {
+                now = pcnetgame_now_ms();
+            }
+            if (!s_host_world_ready) {
+                s_host_peer[i].hs_since_ms = now; /* the host cannot answer yet: do not count this time against the peer */
+            } else if ((uint32_t)(now - s_host_peer[i].hs_since_ms) >= PC_NETGAME_HANDSHAKE_DEADLINE_MS) {
+                printf("[NET] host: peer %d never completed the identity handshake within %u s -- dropping it (N-05)%s", i, (unsigned)(PC_NETGAME_HANDSHAKE_DEADLINE_MS / 1000u), "\n");
+                pcnetgame_host_drop_peer((PCNetPeerId)i);
+                continue;
+            }
+        }
         if (!s_host_peer[i].closing) {
             continue;
         }
@@ -11722,6 +11833,8 @@ static int pcnetgame_client_is_parked(int acre, int tile) {
 /* Writes one tile's authoritative state into the persistent field, unless the LOCAL tile is not
  * overwritable right now (pcnetgame_client_local_overwritable()) -- then the host value is parked
  * and written by pcnetgame_client_retry_deferred() once it is. */
+void pcnetgame_gyroid_tile_note(const char* what, int acre, int tile, unsigned old_v, unsigned new_v);
+
 static void pcnetgame_client_apply_tile(int acre, int tile, uint16_t value, int dep_valid, int dep_on) {
     uint16_t local;
 
@@ -11732,10 +11845,14 @@ static void pcnetgame_client_apply_tile(int acre, int tile, uint16_t value, int 
         return;
     }
     if (!pcnetgame_client_local_overwritable(acre, tile, local, pcnetgame_client_is_parked(acre, tile))) {
+        pcnetgame_gyroid_tile_note("net-tile PARKED (local value is a live placeholder)", acre, tile, local, value);
         pcnetgame_client_defer_store(acre, tile, value, dep_valid, dep_on, local);
         return;
     }
     pcnetgame_client_defer_clear(acre, tile);
+    if (local != value) {
+        pcnetgame_gyroid_tile_note("net-tile WRITE", acre, tile, local, value);
+    }
 
     pcfa_set_net_apply_active(1);
     if (dep_valid && pcfa_get_deposit(acre, tile) != (dep_on ? 1 : 0)) {
@@ -11775,6 +11892,7 @@ static void pcnetgame_client_apply_block(const PCNetGameFieldBlockMsg* fb, int c
             continue; /* host knows no stable value for this tile -- keep local */
         }
         if (!pcnetgame_client_local_overwritable(acre, t, items[t], pcnetgame_client_is_parked(acre, t))) {
+            pcnetgame_gyroid_tile_note("net-block PARKED (local value is a live placeholder)", acre, t, items[t], in_v);
             pcnetgame_client_defer_store(acre, t, in_v, 1, in_d, items[t]);
             if (count_stats) {
                 const char* why = (pcfa_transient_kind(items[t]) == PCFA_VALUE_TRANSIENT) ? "local live-placeholder"
@@ -11786,6 +11904,9 @@ static void pcnetgame_client_apply_block(const PCNetGameFieldBlockMsg* fb, int c
             continue;
         }
         pcnetgame_client_defer_clear(acre, t);
+        if (items[t] != in_v) {
+            pcnetgame_gyroid_tile_note("net-block WRITE", acre, t, items[t], in_v);
+        }
         if (count_stats && (items[t] != in_v || pcnetgame_dep_bit(deposit, t) != in_d)) {
             int old_d = pcnetgame_dep_bit(deposit, t);
             acre_changed = 1;
@@ -17531,8 +17652,8 @@ static int pcnetgame_evnpc_scan(PCNetGameEvNpcEntry* out, int cap) {
     return n;
 }
 
-static void pcnetgame_evnpc_send(PCNetPeerId peer) {
-    pc_net_send(peer, PC_NET_RELIABLE, &s_evnpc_host, (uint16_t)sizeof(s_evnpc_host));
+static int pcnetgame_evnpc_send(PCNetPeerId peer) {
+    return pc_net_send(peer, PC_NET_RELIABLE, &s_evnpc_host, (uint16_t)sizeof(s_evnpc_host)); /* 0 = the reliable queue refused it (window full): the caller must not record it as sent */
 }
 
 /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_EVNPC_SPAWN=<npc id hex>,bx,bz,ux,uz): once the host's town field is up, create that event NPC directly (the event manager would need the right
@@ -17626,8 +17747,9 @@ static void pcnetgame_evnpc_host_tick(void) {
     }
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         if (s_host_peer_link[p] == PC_NETGAME_LINK_READY && s_host_peer[p].evnpc_seq != s_evnpc_host.seq && s_evnpc_host_seq != 0) {
-            s_host_peer[p].evnpc_seq = s_evnpc_host.seq;
-            pcnetgame_evnpc_send((PCNetPeerId)p);
+            if (pcnetgame_evnpc_send((PCNetPeerId)p)) { /* F-01: "sent" only when accepted; otherwise the next tick tries again */
+                s_host_peer[p].evnpc_seq = s_evnpc_host.seq;
+            }
         } else if (s_host_peer_link[p] != PC_NETGAME_LINK_READY) {
             s_host_peer[p].evnpc_seq = 0;
         }
@@ -17809,21 +17931,86 @@ static int pcnetgame_kk_guest_key(int rec_idx, PersonalID_c* out) {
     return 1;
 }
 
-static int pcnetgame_kk_guest_claimed(const PersonalID_c* key) {
-    return pc_dayclaims_has(&s_kk_claims, key, pcnetgame_kk_today());
+/* The guests' once-per-concert claims survive a host restart (ID-F6 / WS-03): without this a host restart on the same concert day forgot them and a guest could take a SECOND song. The file
+ * (kk_claims.dat next to work_jobs.dat) is written atomically (pc_tabfile) after every recorded claim and read once, the first time the table is used. Claims of an earlier day are ignored by
+ * pc_dayclaims_has() and swept by the next mark, so an old file does no harm. */
+#define PC_KK_CLAIMS_MAGIC 0x4B4B4443u /* "KKDC" */
+static int  s_kk_claims_loaded;
+static char s_kk_claims_path[260];
+
+static const char* pcnetgame_kk_claims_path(void) {
+    const char* wp = pc_server_work_path();
+    const char* slash;
+    size_t dir;
+    if (s_kk_claims_path[0] != 0) {
+        return s_kk_claims_path;
+    }
+    if (wp == NULL || wp[0] == 0) {
+        return NULL;
+    }
+    slash = strrchr(wp, '/');
+    if (strrchr(wp, '\\') != NULL && (slash == NULL || strrchr(wp, '\\') > slash)) {
+        slash = strrchr(wp, '\\');
+    }
+    dir = (slash != NULL) ? (size_t)(slash - wp) + 1u : 0u;
+    if (dir + sizeof("kk_claims.dat") > sizeof(s_kk_claims_path)) {
+        return NULL;
+    }
+    memcpy(s_kk_claims_path, wp, dir);
+    memcpy(s_kk_claims_path + dir, "kk_claims.dat", sizeof("kk_claims.dat"));
+    return s_kk_claims_path;
 }
 
-static int pcnetgame_kk_guest_mark(const PersonalID_c* key) {
+static int pcnetgame_kk_claims_ensure(void) {
     if (!s_kk_claims.ready && !pc_dayclaims_init(&s_kk_claims, sizeof(PersonalID_c), pcnetgame_guest_budget_slots())) {
         return 0;
     }
-    return pc_dayclaims_mark(&s_kk_claims, key, pcnetgame_kk_today());
+    if (!s_kk_claims_loaded) {
+        const char* path = pcnetgame_kk_claims_path();
+        s_kk_claims_loaded = 1;
+        if (path != NULL) {
+            const int rc = pc_dayclaims_load(&s_kk_claims, path, PC_KK_CLAIMS_MAGIC);
+            if (rc > 0) {
+                printf("[NET][KK] host: loaded %s (%d guest claim(s); only today's count)%s", path, pc_dayclaims_count(&s_kk_claims), "\n");
+            } else if (rc < 0) {
+                printf("[NET][KK] host: %s is unreadable -- starting with no guest claims%s", path, "\n");
+            }
+        }
+    }
+    return 1;
+}
+
+static int pcnetgame_kk_guest_claimed(const PersonalID_c* key) {
+    if (!pcnetgame_kk_claims_ensure()) {
+        return 0;
+    }
+    return pc_dayclaims_has(&s_kk_claims, key, pcnetgame_kk_today());
+}
+
+/* plan-time check: a guest's claim can only be refused AFTER the grant if the mark fails, so the plan refuses the claim up front when the mark could not be recorded (table missing / full). */
+static int pcnetgame_kk_guest_can_mark(void) {
+    if (!pcnetgame_kk_claims_ensure()) {
+        return 0;
+    }
+    return pc_dayclaims_has_room(&s_kk_claims, pcnetgame_kk_today());
+}
+
+static int pcnetgame_kk_guest_mark(const PersonalID_c* key) {
+    int ok;
+    if (!pcnetgame_kk_claims_ensure()) {
+        return 0;
+    }
+    ok = pc_dayclaims_mark(&s_kk_claims, key, pcnetgame_kk_today());
+    if (ok && pcnetgame_kk_claims_path() != NULL && !pc_dayclaims_save(&s_kk_claims, pcnetgame_kk_claims_path(), PC_KK_CLAIMS_MAGIC)) {
+        printf("[NET][KK] host: could not write %s (the claim would not survive a host restart)%s", pcnetgame_kk_claims_path(), "\n");
+    }
+    return ok;
 }
 
 /* a guest was promoted to resident slot `slot`: its character keeps the once-per-concert rule. The claim was recorded under the guest's old identity; the resident is judged by the vanilla
  * bit of its slot, which is clear, so the claim is carried over to that bit (otherwise buying a house right after K.K.'s song would give a second song at the same concert). */
 static void pcnetgame_kk_guest_promoted(const PersonalID_c* from, int slot) {
-    if (slot >= 0 && slot < PLAYER_NUM && s_kk_claims.ready && pcnetgame_kk_guest_claimed(from)) {
+    if (slot >= 0 && slot < PLAYER_NUM && pcnetgame_kk_guest_claimed(from)) {
         aNTT_pc_host_song_commit(slot);
         printf("[NET][KK] host: the promoted guest had already taken K.K.'s song today: the claim moved to resident slot %d's vanilla bit\n", slot);
     }
@@ -17846,6 +18033,10 @@ static uint8_t pcnetgame_evnpc_plan(int claimant, const PCNetGameTxnTag* t, uint
         r = aNTT_pc_host_song_check(is_guest ? -2 : (claimant < PLAYER_NUM ? claimant : -1), t->aux_item == 0xFFFFu ? 0xFFFF : (int)t->aux_item, &song);
         if (r == 1 && is_guest && pcnetgame_kk_guest_claimed(&gk)) {
             r = 2; /* THIS guest already got a song at this concert (other guests are unaffected) */
+        }
+        if (r == 1 && is_guest && !pcnetgame_kk_guest_can_mark()) {
+            *why = "the host cannot record this guest's K.K. claim (claim table full): refused instead of granting without a record";
+            return (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
         }
         if (r != 1) {
             *why = r == 2 ? "this player already got K.K.'s song of this concert" : "there is no K.K. concert (or the song is invalid)";
@@ -17870,7 +18061,9 @@ static void pcnetgame_evnpc_commit(int claimant, uint8_t op) {
         unsigned rb = 0, fb = 0;
         const int is_guest = claimant >= PLAYER_NUM && pcnetgame_kk_guest_key(claimant, &gk);
         if (is_guest) {
-            (void)pcnetgame_kk_guest_mark(&gk);
+            if (!pcnetgame_kk_guest_mark(&gk)) {
+                printf("[NET][KK] host: *** the claim of a guest could not be recorded after the grant (the plan checked room first; this should not happen)\n");
+            }
             aNTT_pc_host_song_commit(-2);
         } else {
             aNTT_pc_host_song_commit(claimant < PLAYER_NUM ? claimant : -1);
@@ -18291,10 +18484,10 @@ static void pcnetgame_work_pack_state(PCNetGameWorkStateMsg* m, const PCNetWorkC
     m->request_id = request_id;
 }
 
-static void pcnetgame_work_send_state(PCNetPeerId peer, const PersonalID_c* key, uint32_t request_id) {
+static int pcnetgame_work_send_state(PCNetPeerId peer, const PersonalID_c* key, uint32_t request_id) {
     PCNetGameWorkStateMsg m;
     pcnetgame_work_pack_state(&m, pcnetgame_work_find(key, 0), request_id);
-    pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+    return pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m)); /* 0 = refused (window full / peer gone) */
 }
 /* ===== WORK HOST END ===== */
 
@@ -18871,8 +19064,7 @@ static void pcnetgame_host_ts_tick(void) {
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !wst->bound_valid || wst->rec_state != PC_NETGAME_RECS_SYNCED) {
             wst->work_sent = 0;
         } else if (!wst->work_sent) {
-            wst->work_sent = 1;
-            pcnetgame_work_send_state((PCNetPeerId)p, &wst->bound_pid, 0);
+            wst->work_sent = pcnetgame_work_send_state((PCNetPeerId)p, &wst->bound_pid, 0) ? 1 : 0; /* F-01: stays 0 (retried next tick) when the send was refused */
         }
     }
 }
@@ -26105,12 +26297,15 @@ int pc_net_game_work_villager_name(int npc, unsigned char* out8) {
 /* ===== WORK CLIENT END ===== */
 
 /* ===== EVNPC CLAIM CLIENT BEGIN: the event NPC dialogue seams (Gulliver: ac_ev_dozaemon_move.c_inc, K.K.: ac_npc_totakeke_talk.c_inc). The HOST decides the outcome =====
- *   pc_net_game_evnpc_claim_active()   1 = this process is a READY client (the event NPC talk must ask the host instead of deciding), 0 = host / solo (vanilla path).
+ *   pc_net_game_evnpc_claim_active()   1 = this process is a CLIENT (the event NPC talk must ask the host instead of deciding; claim_begin refuses while the link is not READY), 0 = host / solo (vanilla path).
  *   pc_net_game_evnpc_claim_begin(op, arg)  op 1 Gulliver's gift, op 2 K.K.'s song (arg = the song or 0xFFFF): 1 = request sent (poll pc_net_game_ts_poll()), 0 = refused locally
  *                                      (pc_net_game_ts_last_reject_reason()), -1 = busy (retry next frame).
  *   pc_net_game_evnpc_claim_item()     the item the last APPLIED claim granted (the host's post-image is already in the pockets). */
 int pc_net_game_evnpc_claim_active(void) {
-    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && Now_Private != NULL;
+    /* F3: ANY client asks the host, not only a READY one. A client whose link is not READY (still connecting, or the connection dropped) used to fall back to the vanilla local grant, i.e. it
+     * decided Gulliver's gift / K.K.'s song on its own copy while the host's per-visit / per-concert state knew nothing about it (a second grant later). pc_net_game_evnpc_claim_begin()
+     * refuses such a claim (nothing is granted, the dialogue takes its normal "refused" ending) until the link is READY again. Host and solo play are unchanged (vanilla path). */
+    return s_role == PC_NETGAME_ROLE_CLIENT && Now_Private != NULL;
 }
 
 int pc_net_game_evnpc_claim_item(void) {
@@ -26121,8 +26316,8 @@ int pc_net_game_evnpc_claim_begin(int op, int arg) {
     PCNetGameOwnerStamp stamp;
     const uint8_t kind = (uint8_t)PC_NETGAME_TXN_KIND_EVNPC;
     int slot;
-    if (!pc_net_game_evnpc_claim_active()) {
-        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+    if (!pc_net_game_evnpc_claim_active() || s_client_link != PC_NETGAME_LINK_READY) {
+        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND; /* not READY: refused, never a local grant (F3) */
         return 0;
     }
     if (s_ts_op.active && s_ts_op.done) {
@@ -28128,6 +28323,16 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (s_host_peer_link[peer] == PC_NETGAME_LINK_HANDSHAKE &&
+        (data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY || data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY_EXT || data[0] == (uint8_t)PC_NETGAME_MSG_HANDSHAKE_BUSY)) {
+        pcnetgame_ded_life_connecting(peer); /* a real joining client (not a town-fetch connection: those returned above) */
+    }
+
+    if (size == sizeof(PCNetGameHandshakeBusyMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_HANDSHAKE_BUSY) {
+        pcnetgame_handle_host_handshake_busy(peer);
+        return;
+    }
+
     if (data[0] == (uint8_t)PC_NETGAME_MSG_IDENTITY && size >= 8) {
         pcnetgame_handle_host_identity(peer, data, size);
         return;
@@ -29783,7 +29988,7 @@ static uint32_t pcnetgame_page_digest(unsigned kind, unsigned index) {
     uint8_t* p = pcnetgame_page_ptr(kind, index, &len);
     return p != NULL ? pcnetgame_fnv1a32(p, len) : 0u;
 }
-static void pcnetgame_page_send(PCNetPeerId peer, unsigned kind, unsigned index, uint32_t rev, uint8_t flags, uint32_t aux, const uint8_t* data, uint16_t len) {
+static int pcnetgame_page_send(PCNetPeerId peer, unsigned kind, unsigned index, uint32_t rev, uint8_t flags, uint32_t aux, const uint8_t* data, uint16_t len) {
     PCNetGamePageMsg m;
     memset(&m, 0, sizeof(m));
     m.msg_type = (uint8_t)PC_NETGAME_MSG_PAGE;
@@ -29794,7 +29999,7 @@ static void pcnetgame_page_send(PCNetPeerId peer, unsigned kind, unsigned index,
     m.aux = aux;
     m.len = len;
     memcpy(m.data, data, len);
-    (void)pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+    return pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m)); /* 0 = refused (window full / peer gone) */
 }
 
 /* ---- host ---- */
@@ -29842,7 +30047,9 @@ static void pcnetgame_page_host_tick(void) {
                 uint8_t* d;
                 pcnetgame_page_of_slot(i, &k, &x);
                 d = pcnetgame_page_ptr(k, x, &len);
-                pcnetgame_page_send((PCNetPeerId)p, k, x, s_pg_rev[i], 0, 0, d, len);
+                if (!pcnetgame_page_send((PCNetPeerId)p, k, x, s_pg_rev[i], 0, 0, d, len)) {
+                    break; /* F-01: the reliable window is full -- do not record the page as sent, try again on the next tick */
+                }
                 s_pg_sent[p][i] = s_pg_rev[i];
                 budget--;
             }
@@ -30017,6 +30224,26 @@ static void pcnetgame_page_handle_client(const PCNetGamePageMsg* in) {
 
 /* v2 client, once per poll after events: deferred IDENTITY send, save pause/resume + resync,
  * town-change detection, PLAYER_CONTEXT change detection, parked-tile retry. */
+/* A client that is transport-connected but cannot send its IDENTITY yet (the first-run character creation in Rover's train scene can take minutes; a big town load too) tells the host
+ * every 10 s that it is alive, otherwise the host's 60 s identity-handshake deadline (N-05) would drop it in the middle of the cutscene and it would have to reconnect. */
+#define PC_NETGAME_HANDSHAKE_BUSY_PERIOD_MS 10000u
+static void pcnetgame_client_handshake_busy_tick(void) {
+    static uint32_t s_last_ms = 0u;
+    const uint32_t now = pcnetgame_now_ms();
+    PCNetGameHandshakeBusyMsg m;
+    if (s_last_ms != 0u && (uint32_t)(now - s_last_ms) < PC_NETGAME_HANDSHAKE_BUSY_PERIOD_MS) {
+        return;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_HANDSHAKE_BUSY;
+    if (pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+        if (s_last_ms == 0u) {
+            printf("[NET] client: connected, getting ready to identify (first-run character creation / loading): sending handshake keepalives every %u s\n", PC_NETGAME_HANDSHAKE_BUSY_PERIOD_MS / 1000u);
+        }
+        s_last_ms = now;
+    }
+}
+
 static void pcnetgame_client_tick(void) {
     int ready = s_local_world_latched;
 
@@ -30033,6 +30260,7 @@ static void pcnetgame_client_tick(void) {
                 s_client_identity_create_logged = 1;
                 printf("[NET][GUEST] client: first-run guest creation in progress -- the identity claim waits for the Rover scene to finish\n");
             }
+            pcnetgame_client_handshake_busy_tick();
         } else if (ready) {
             PCNetGameIdentityMsg msg;
             char buf[96];
@@ -30065,9 +30293,12 @@ static void pcnetgame_client_tick(void) {
                 pcnetgame_format_town(&s_client_claimed_town, buf, sizeof(buf));
                 printf("[NET] client: save loaded -- sending identity (%s)\n", buf);
             }
-        } else if (!s_client_identity_defer_logged) {
-            s_client_identity_defer_logged = 1;
-            printf("[NET] client: waiting for a loaded save before sending identity\n");
+        } else {
+            if (!s_client_identity_defer_logged) {
+                s_client_identity_defer_logged = 1;
+                printf("[NET] client: waiting for a loaded save before sending identity\n");
+            }
+            pcnetgame_client_handshake_busy_tick();
         }
         return;
     }
@@ -32141,6 +32372,8 @@ void pc_net_game_poll(void) {
                          * the previous occupant's disconnect was never observed here. */
                         pcnetgame_reset_all_host_peer_state(ev.peer);
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_HANDSHAKE;
+                        s_host_peer[ev.peer].hs_since_ms = pcnetgame_now_ms();
+                        s_host_peer[ev.peer].hs_first_ms = s_host_peer[ev.peer].hs_since_ms;
                     }
                     printf("[NET] host: peer %d transport-connected, awaiting identity\n", (int)ev.peer);
                     if (g_pc_dedicated) pc_net_game_dedicated_announce((int)ev.peer, 0);
@@ -34685,6 +34918,51 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             }
             printf("[AUTO] killfish %d entity %lu %s\n", id, ent, found ? "actor flagged for destruction" : "no such local actor");
             s_ap.active = 0;
+        } else if (strcmp(cmd, "wldstate") == 0) { /* TEST-ONLY (client): wldstate SEQ ENT X Z -- hand ONE synthetic WILDLIFE_STATE to the real client handler (seq check included) and report the result */
+            unsigned long wseq = 0, went = 0;
+            float wx = 0.0f, wz = 0.0f, tx = 0.0f, tz = 0.0f;
+            int got = 0;
+            if (sscanf(line, "%*d %*s %lu %lu %f %f", &wseq, &went, &wx, &wz) == 4) {
+                PCNetGameWildlifeStateMsg wm;
+                const unsigned before = s_client_wld_state_dropped;
+                memset(&wm, 0, sizeof(wm));
+                wm.msg_type = (uint8_t)PC_NETGAME_MSG_WILDLIFE_STATE;
+                wm.count = 1;
+                wm.seq = (uint32_t)wseq;
+                wm.e[0].entity_id = (uint32_t)went;
+                wm.e[0].x = wx;
+                wm.e[0].z = wz;
+                wm.e[0].engaged = 0xFF;
+                pcnetgame_handle_client_wildlife_state((const uint8_t*)&wm, 8 + 20);
+                got = pcwld_test_get_target((uint32_t)went, &tx, &tz); /* before the printf: argument evaluation order is unspecified */
+                printf("[AUTO] wldstate %d seq=%lu ent=%lu fed=(%.1f,%.1f) last=%u dropped=%u (this call dropped=%d) target=%s(%.1f,%.1f)\n", id, wseq, went, (double)wx, (double)wz, (unsigned)s_client_wld_state_last, s_client_wld_state_dropped,
+                       (int)(s_client_wld_state_dropped != before), got ? "" : "NONE", (double)tx, (double)tz);
+            } else {
+                printf("[AUTO] wldstate %d bad arguments\n", id);
+            }
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "wldlast") == 0) { /* TEST-ONLY (client): the last applied WILDLIFE_STATE seq and how many were dropped */
+            printf("[AUTO] wldlast %d last=%u dropped=%u\n", id, (unsigned)s_client_wld_state_last, s_client_wld_state_dropped);
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "evclaim") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY (client): evclaim OP [ARG] -- call the event-NPC claim entry the dialogue seams use and report it */
+            unsigned long earg = 0xFFFFul;
+            int er;
+            (void)sscanf(line, "%*d %*s %*lu %lu", &earg);
+            er = pc_net_game_evnpc_claim_begin((int)ent, (int)earg);
+            printf("[AUTO] evclaim %d op=%lu ret=%d claim_active=%d link_ready=%d reason=%d\n", id, ent, er, pc_net_game_evnpc_claim_active(), (int)(s_client_link == PC_NETGAME_LINK_READY), pc_net_game_ts_last_reject_reason());
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "refusesend") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY: refusesend TYPE COUNT -- the next COUNT reliable sends of message TYPE are refused by the transport */
+            unsigned long rcount = 0;
+            (void)sscanf(line, "%*d %*s %*lu %lu", &rcount);
+            pc_net_test_refuse_reliable((int)ent, (int)rcount);
+            printf("[AUTO] refusesend %d type=%lu count=%lu armed\n", id, ent, rcount);
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "refusestats") == 0) { /* TEST-ONLY: refused so far / accepted since arming / refusals still pending */
+            unsigned rf = 0, ac = 0;
+            int lf = 0;
+            pc_net_test_refuse_stats(&rf, &ac, &lf);
+            printf("[AUTO] refusestats %d refused=%u accepted=%u pending=%d\n", id, rf, ac, lf);
+            s_ap.active = 0;
         } else if (strcmp(cmd, "endbug") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY: this process's actor of bug ENT ends the way a species program ends its insect (the destruct flag) */
             int sp2 = 0;
             aINS_INSECT_ACTOR* eb = (aINS_INSECT_ACTOR*)pcwld_bug_local_actor_for_entity((uint32_t)ent, &sp2);
@@ -35423,9 +35701,17 @@ void pc_net_game_notify_npc_state(int slot, uint16_t npc_id, uint8_t is_home, ui
                (unsigned)msg.state_seq);
     }
 
-    for (i = 0; i < pcnetgame_peer_span(); i++) {
-        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
-            pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg));
+    {
+        int failed = 0;
+        for (i = 0; i < pcnetgame_peer_span(); i++) {
+            if (s_host_peer_link[i] == PC_NETGAME_LINK_READY && !pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &msg, (uint16_t)sizeof(msg))) {
+                failed = 1;
+            }
+        }
+        if (failed) {
+            /* F-01 / N-02: a READY peer's reliable window was full, so it never learned this change and the shadow above already says "sent". Forget the shadow: this function is called
+             * every frame per villager, so the next call sees the state as changed again and re-broadcasts it (receivers keep the newest state_seq, a repeat is harmless). */
+            sh->have_sent = 0;
         }
     }
 }
@@ -36181,7 +36467,7 @@ static void pcnetgame_handle_client_wildlife_spawn(const PCNetGameWildlifeSpawnM
  * A vanilla insect / fish actor lives only while a player is near it, so the host's record must not outlive that (it used to: 10 blind minutes, during which the acre never re-rolled and
  * nobody entering it saw the creatures another player saw). A record is ATTENDED while any player is in its acre or within PC_WILDLIFE_ATTEND_UNITS of it (vanilla's own cull distance is 600
  * and "another acre"); a player indoors attends nothing. Unknown positions fail open for a connected peer. 12 s unattended releases the record (pcwld_host_collect_unattended()). */
-#define PC_WILDLIFE_ATTEND_UNITS 700.0f
+#define PC_WILDLIFE_ATTEND_UNITS PCWLD_ATTEND_UNITS /* pc_wildlife_authority.h: shared with the host fish cull (W-04) */
 
 static int pcnetgame_wildlife_record_attended(const PcWildlifeRecord* r) {
     int p;
@@ -36242,6 +36528,51 @@ int pc_net_game_host_out_of_town(void) {
         return 0;
     }
     return (sc.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0;
+}
+
+static int pcnetgame_gyroid_diag_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = (pc_test_hook_getenv("AC_TEST_GYROID_DIAG") != NULL) ? 1 : 0;
+    }
+    return on;
+}
+
+/* TEST-ONLY: a network write / parked write over a tile that is (or becomes) a gyroid prop or its live-actor placeholder (0xA004..0xA007, DUMMY_HANIWA 0xF0FB..0xF0FE). */
+void pcnetgame_gyroid_tile_note(const char* what, int acre, int tile, unsigned old_v, unsigned new_v) {
+#define PCNG_IS_GYROID_VALUE(v) (((v) >= 0xA004u && (v) <= 0xA007u) || ((v) >= 0xF0FBu && (v) <= 0xF0FEu))
+    if (!pcnetgame_gyroid_diag_on() || (!PCNG_IS_GYROID_VALUE(old_v) && !PCNG_IS_GYROID_VALUE(new_v))) {
+        return;
+    }
+    printf("[NET][GYROID] %s acre=%d tile=%d old=0x%04X new=0x%04X role=%d scene_town=%d frame=%u%s", what, acre, tile, old_v, new_v, (int)s_role, pcfa_scene_is_town() ? 1 : 0, (unsigned)pcnetgame_now_ms(), "\n");
+#undef PCNG_IS_GYROID_VALUE
+}
+
+void pc_net_game_gyroid_diag(const char* what, const char* reason, const void* actor, unsigned npc_id, float x, float z, int bx, int bz, unsigned fg_tile) {
+    int live_same = 0, live_all = 0;
+    char existing[320];
+    int ne = 0;
+    existing[0] = 0;
+    if (!pcnetgame_gyroid_diag_on()) {
+        return;
+    }
+    if (gamePT != NULL && gamePT->exec == play_main) {
+        const GAME_PLAY* play = (const GAME_PLAY*)gamePT;
+        const ACTOR* a;
+        for (a = play->actor_info.list[ACTOR_PART_BG].actor; a != NULL; a = a->next_actor) {
+            if (a->id == mAc_PROFILE_HANIWA) {
+                live_all++;
+                if (a->npc_id == (mActor_name_t)npc_id) {
+                    live_same++;
+                    if (a != (const ACTOR*)actor && ne < 4) {
+                        ne += snprintf(existing + ne, sizeof(existing) - (size_t)ne, " %p@(%.0f,%.0f)restore_fg=%d", (const void*)a, (double)a->world.position.x, (double)a->world.position.z, (int)a->restore_fg);
+                    }
+                }
+            }
+        }
+    }
+    printf("[NET][GYROID] %s reason=%s actor=%p prop=0x%04X pos=(%.0f,%.0f) block=(%d,%d) fg_tile=0x%04X live_gyroids_same_prop=%d live_gyroids_all=%d other_live_same_prop=[%s ] role=%d scene_town=%d frame=%u%s", what, reason != NULL ? reason : "-", actor, npc_id, (double)x, (double)z, bx, bz, fg_tile,
+           live_same, live_all, existing, (int)s_role, pcfa_scene_is_town() ? 1 : 0, (unsigned)pcnetgame_now_ms(), "\n");
 }
 
 int pc_net_game_wildlife_remote_players(PcWldRemotePlayer* out, int max) {
@@ -36435,6 +36766,12 @@ static void pcnetgame_handle_host_bobber_state(PCNetPeerId peer, const PCNetGame
     pcwld_host_set_bobber(&b);
 }
 
+/* W-14: WILDLIFE_STATE is unreliable, so a datagram can arrive after a newer one; applying it would pull every driven creature BACK to an older position (a visible jump). The client keeps
+ * the last applied seq and drops anything not newer (wrap-safe). It restarts from 0 at every wildlife snapshot (a join, a reconnect, a resync, a host restart all begin with one), so a
+ * restarted host (seq counting from 1 again) is never ignored. */
+static uint32_t s_client_wld_state_last;
+static unsigned s_client_wld_state_dropped;
+
 static void pcnetgame_handle_client_wildlife_state(const uint8_t* data, size_t size) {
     PCNetGameWildlifeStateMsg m;
     int i, cnt;
@@ -36446,6 +36783,15 @@ static void pcnetgame_handle_client_wildlife_state(const uint8_t* data, size_t s
     cnt = m.count;
     if (cnt > PCWLD_STATE_MAX || size != (size_t)(8 + 20 * cnt)) {
         return;
+    }
+    if (s_client_wld_state_last != 0u && m.seq != 0u && (int32_t)(m.seq - s_client_wld_state_last) <= 0) {
+        if ((++s_client_wld_state_dropped % 50u) == 1u) {
+            printf("[NET][WILDLIFE][STATE] client: dropped a reordered / duplicate WILDLIFE_STATE (seq %u, last applied %u); %u dropped so far%s", (unsigned)m.seq, (unsigned)s_client_wld_state_last, s_client_wld_state_dropped, "\n");
+        }
+        return;
+    }
+    if (m.seq != 0u) {
+        s_client_wld_state_last = m.seq;
     }
     {
         static unsigned logged;
@@ -36578,6 +36924,7 @@ static int pcnetgame_build_wildlife_snapshot_entry(PCNetGameWildlifeSnapshotEntr
  * this milestone: entity 100, still alive and still authoritative, must NOT be destroyed and
  * recreated just because the client's transport connection blipped). */
 static void pcnetgame_handle_client_wildlife_snapshot_begin(const PCNetGameWildlifeSnapshotBeginMsg* in) {
+    s_client_wld_state_last = 0u; /* W-14: a snapshot starts a new state stream (see s_client_wld_state_last) */
     if (!pcnetgame_wildlife_auth_on()) {
         /* Opt-in gate off -- ignore. Without this check a flag-off client joining LATE (after
          * wildlife already exists on the host) would still run the known-generation/reset logic
@@ -37955,11 +38302,11 @@ void pc_net_game_dedicated_announce(int peer, int what) {
         return;
     }
     if (what == 0) {
-        pc_dedicated_say("peer %d connected (transport; awaiting identity)", peer);
+        pc_dedicated_say_detail("peer %d connected (transport; awaiting identity)", peer);
     } else if (pc_net_game_dedicated_peer_info(peer, &pi) && pi.bound) {
-        pc_dedicated_say("peer %d %s: %s %d name=\"%s\"", peer, what == 1 ? "READY" : "disconnected (was READY)", pi.cls ? "GUEST slot" : "RESIDENT idx",
-                         pi.index, pi.name);
+        pc_dedicated_say_detail("peer %d %s: %s %d name=\"%s\"", peer, what == 1 ? "READY" : "disconnected (was READY)", pi.cls ? "GUEST slot" : "RESIDENT idx",
+                                pi.index, pi.name);
     } else {
-        pc_dedicated_say("peer %d disconnected", peer);
+        pc_dedicated_say_detail("peer %d disconnected", peer);
     }
 }

@@ -287,6 +287,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_log.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dedicated.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ded_console.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gx.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gx_tev.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gx_texture.c
@@ -520,6 +521,7 @@ if(PC_TEST_HOOKS)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_main.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_m_card.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_relaunch.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c

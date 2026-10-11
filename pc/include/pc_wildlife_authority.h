@@ -210,6 +210,11 @@ int pcwld_presentation_deferred_count(void);
 uint32_t pcwld_test_host_inject(int species, float x, float z);
 /* TEST-ONLY: the host releases (despawns everywhere) the record of that entity; 1 if it existed. */
 int pcwld_test_host_release(uint32_t entity_id);
+/* W-04: a creature is "attended" (its record lives) while some player is within this many world units of it, and the host's fish cull (aGYO_cull_check) exempts a creature from culling within the
+ * SAME distance of a remote player. They used to differ (700 vs 600): a fish 600-700 units from the only remote player was attended, culled, re-created and finally released. */
+#define PCWLD_ATTEND_UNITS 700.0f
+/* TEST-ONLY: the stored host target (x, z) of an entity on a client, fresh or stale; 1 = there is one. */
+int pcwld_test_get_target(uint32_t entity_id, float* x, float* z);
 /* TEST-ONLY diagnostics (AC_TEST_INSECT_DIAG=1): logs why a wildlife insect actor is being destroyed (1 life-time fade, 2 destruct flag, 3 culled + 'actor_specific', 4 culled and far). */
 void pcwld_insect_diag(int why, const void* insect_actor);
 /* HOST: the insect's own species program ended it (destruct flag); its record is released instead of re-created. */

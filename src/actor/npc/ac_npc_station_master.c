@@ -10,6 +10,9 @@
 #include "m_train_control.h"
 #include "ac_intro_demo.h"
 #include "ac_ride_off_demo.h"
+#ifdef TARGET_PC
+#include "pc_nook_house.h" /* the generated Porter message that replaces the vanilla "go back to your village" offer */
+#endif
 
 enum {
     aSTM_THINK_GET_OFF_WAIT,

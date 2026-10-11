@@ -377,7 +377,20 @@ static void aNG2_approach(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
 }
 
 static void aNG2_set_talk_info_talk_start_wait(ACTOR* actorx) {
-    mMsg_SET_FREE_STR(mMsg_FREE_STR0, aNG2_getP_other_pl_name(), PLAYER_NAME_LEN);
+    u8* other_name = aNG2_getP_other_pl_name();
+    int other_len = PLAYER_NAME_LEN;
+
+#ifdef TARGET_PC
+    /* Rover's lines 0x2AD9 ("Ah yes! <FREE0>, I believe.") and 0x2ADC ("<FREE0> was the same way!") name ANOTHER traveller. The vanilla game only reaches this scene when the town already has
+     * a resident, but a multiplayer guest (or a first character) can create its profile with NO other resident in the local save: aNG2_getP_other_pl_name() is then NULL, mMsg_Set_free_str()
+     * ignores a NULL string and FREE0 keeps whatever the buffer held before (shown as "iiiiiiiiii"). Give the line a plain stand-in that reads naturally in both places. */
+    if (other_name == NULL) {
+        static u8 no_other_name[] = { CHAR_A, CHAR_SPACE, CHAR_t, CHAR_r, CHAR_a, CHAR_v, CHAR_e, CHAR_l, CHAR_e, CHAR_r }; /* "A traveler" */
+        other_name = no_other_name;
+        other_len = (int)sizeof(no_other_name); /* 10 <= mMsg_FREE_STRING_LEN (16) */
+    }
+#endif
+    mMsg_SET_FREE_STR(mMsg_FREE_STR0, other_name, other_len);
     mDemo_Set_msg_num(0x2AD5);
     aNG2_set_default_talk_info();
     ((NPC_GUIDE2_ACTOR*)actorx)->obj_look_type = aNG2_OBJ_LOOK_TYPE_TALK;

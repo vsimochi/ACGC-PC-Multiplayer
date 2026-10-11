@@ -20,6 +20,9 @@
 #include "m_submenu.h"
 #include "m_field_info.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#endif
 
 extern cKF_Skeleton_R_c cKF_bs_r_hnw;
 extern cKF_Animation_R_c cKF_ba_r_hnw_move;
@@ -68,11 +71,17 @@ static void aHNW_actor_ct(ACTOR* actor, GAME* game) {
     haniwa->common_actor_class.anime.anime_no = 2;
     haniwa->house_idx = actor->npc_id - ACTOR_PROP_HANIWA0;
     actor->talk_distance = 43.0f;
+#ifdef TARGET_PC
+    { mActor_name_t* fgp = mFI_GetUnitFG(actor->world.position); pc_net_game_gyroid_diag("ct", NULL, actor, actor->npc_id, actor->world.position.x, actor->world.position.z, actor->block_x, actor->block_z, fgp != NULL ? (unsigned)*fgp : 0xFFFEu); }
+#endif
 }
 
 static void aHNW_actor_dt(ACTOR* actor, GAME* game) {
     HANIWA_ACTOR* haniwa = (HANIWA_ACTOR*)actor;
 
+#ifdef TARGET_PC
+    { mActor_name_t* fgp = mFI_GetUnitFG(actor->world.position); pc_net_game_gyroid_diag("dt", NULL, actor, actor->npc_id, actor->world.position.x, actor->world.position.z, actor->block_x, actor->block_z, fgp != NULL ? (unsigned)*fgp : 0xFFFEu); }
+#endif
     if (haniwa->playing_save_bgm) {
         mBGMPsComp_delete_ps_demo(BGM_ENTER_HOUSE, 0x168);
     }

@@ -1,0 +1,86 @@
+Files in src/ and include/ touched by non-FlyingMeta authors whose committed content has no TARGET_PC mention (74 files at HEAD 16e42a3; 73 when the uncommitted working tree is used, because the uncommitted edit of src/actor/ac_haniwa.c adds a TARGET_PC block).
+Compared with flyngmt/ACGC-PC-Port (original port) and ACreTeam/ac-decomp. LICENSE scope text: "pc/ directory and all #ifdef TARGET_PC additions to decomp files" = MIT.
+
+A. Third-party commits (Cuyler36, oprel) that already exist in the ORIGINAL port history; byte-identical in this fork  [25 files]
+   include/ac_animal_logo.h
+   include/ac_weather.h
+   include/c_keyframe.h
+   include/evw_anime.h
+   include/m_camera2.h
+   include/m_lib.h
+   include/m_private.h
+   include/m_trademark.h
+   src/actor/ac_weather_leaf.c
+   src/actor/ac_weather_rain.c
+   src/actor/ac_weather_sakura.c
+   src/actor/ac_weather_snow.c
+   src/evw_anime.c
+   src/game/m_camera2.c
+   src/game/m_lib.c
+   src/game/m_msg_cursol.c_inc
+   src/game/m_player_controller.c_inc
+   src/game/m_player_main_demo_wade.c_inc
+   src/game/m_player_main_demo_walk.c_inc
+   src/game/m_player_main_turn_dash.c_inc
+   src/game/m_player_main_wade.c_inc
+   src/game/m_player_main_walk.c_inc
+   src/game/m_submenu.c
+   src/game/m_watch_my_step.c
+   src/static/jaudio_NES/internal/ja_calc.c
+
+B. Fork-authored modifications of decompilation files (64-bit pointer width, RNG domains, hooks, comments) outside literal TARGET_PC blocks  [17 files]
+   include/JSystem/JKernel/JKRArchive.h
+   include/JSystem/JKernel/JKRExpHeap.h
+   include/jaudio_NES/bx.h
+   include/jaudio_NES/heapctrl.h
+   include/libc64/qrand.h
+   include/m_npc_schedule.h
+   include/m_scene.h
+   include/m_shop.h
+   include/sys_math.h
+   src/game/m_choice_main_normal.c_inc
+   src/static/JSystem/JKernel/JKRExpHeap.cpp
+   src/static/jaudio_NES/internal/bankdrv.c
+   src/static/jaudio_NES/internal/bankread.c
+   src/static/jaudio_NES/internal/connect.c
+   src/static/jaudio_NES/internal/memory.c
+   src/static/jaudio_NES/internal/oneshot.c
+   src/static/jaudio_NES/internal/waveread.c
+
+C. Mechanical relocation of upstream display-list / vertex / texture data into new files (93-99% of removed lines reappear verbatim) and C++ wrapper units  [27 files]
+   src/actor/ac_field_draw.c
+   src/actor/ac_field_draw_gfx.c_inc
+   src/actor/ac_mailbox_gfx.c_inc
+   src/actor/ac_mbg.c
+   src/data/pc_split/ac_field_draw.c
+   src/data/pc_split/ac_field_draw_split.h
+   src/data/pc_split/ac_haniwa.c
+   src/data/pc_split/ac_mailbox.c
+   src/data/pc_split/ac_mailbox_split.h
+   src/data/pc_split/ac_mbg.c
+   src/data/pc_split/ac_mbg_split.h
+   src/data/pc_split/dvderr.c
+   src/data/pc_split/dvderr_split.h
+   src/data/pc_split/initial_menu.c
+   src/data/pc_split/initial_menu_split.h
+   src/data/pc_split/m_choice.c
+   src/data/pc_split/m_choice_split.h
+   src/data/pc_split/m_fbdemo_wipe1.c
+   src/data/pc_split/m_fbdemo_wipe1_split.h
+   src/data/pc_split/m_msg.c
+   src/data/pc_split/m_msg_split.h
+   src/data/pc_split/m_player_tools.c
+   src/data/pc_split/m_player_tools_split.h
+   src/game/m_choice_draw.c_inc
+   src/static/dvderr.c
+   src/static/initial_menu.c
+   src/static/initial_menu_gfx.c_inc
+
+D. New fork support files  [4 files]
+   include/jaudio_NES/ja_fileptr.h
+   include/libc64/qrand_domains.h
+   include/pc_split.h
+   src/static/libc64/qrand_domains.c
+
+E. Mixed (relocation + uncommitted multiplayer diagnostics)  [1 files]
+   src/actor/ac_haniwa.c

@@ -1,0 +1,17 @@
+Animal Crossing Multiplayer - how updating works (user guide)
+Full guide: docs\updater.md (first-install bundle) or https://github.com/vsimochi/ACGC-PC-Multiplayer/blob/v0.1.0/docs/updater.md
+
+START THE GAME WITH ACLauncher.exe (not AnimalCrossing.exe). It checks GitHub for the latest stable release, then starts the game.
+- No newer version: the game starts.
+- Newer version: a dialog shows "Installed version" and "Latest version". YES = download, verify (SHA-256) and install, then start the new version. NO = start the version you have; nothing is changed.
+- The check fails (offline, GitHub error or rate limit, release without a valid package): you get a message and the installed game starts. A failed check never means "up to date".
+- The update fails at any point (interrupted download, checksum mismatch, bad package, disk full, a file in use): everything is rolled back and your installed version starts. Close the game before updating; the launcher refuses to update while this folder's game is running.
+
+FILES THE UPDATER REPLACES: AnimalCrossing.exe, SDL2.dll, shaders\*, licenses\*, version.txt, LICENSE, RELEASE_NOTES.txt, UPDATING.txt.
+NEVER TOUCHED: rom\ (your disc image), save\, servers\, settings.ini, keybindings.ini, texture_pack\, shader_cache.bin, logs, updater.ini, ACLauncher.exe, and every other file.
+
+RECOVERY: the previous program files are kept in .update\backup-<oldversion>\ (newest only). To go back by hand: close the game and copy those files over the ones in the folder above. updater.log (next to ACLauncher.exe) records every launch: version check, your answer, result and errors.
+
+SETTINGS (updater.ini): check_updates=0 turns the check off; allow_prerelease=1 also offers prereleases; show_check_errors=0 hides check-failure messages; repository=owner/name selects the release source. For one launch only: start ACLauncher.exe with --updater-skip, or set AC_UPDATER_DISABLE=1.
+
+The SHA-256 checksum detects corruption and a wrong file. It is not a signature: the executables are unsigned and Windows SmartScreen / antivirus may warn.

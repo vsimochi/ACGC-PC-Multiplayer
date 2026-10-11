@@ -42,7 +42,9 @@ static void aGYO_cull_check(ACTOR* actorx, GAME_PLAY* play) {
             float rx, ry, rz;
             if (pcwld_nearest_remote_player(actorx->world.position.x, actorx->world.position.z, &rx, &ry, &rz)) {
                 const float rd = sqrtf((rx - actorx->world.position.x) * (rx - actorx->world.position.x) + (rz - actorx->world.position.z) * (rz - actorx->world.position.z));
-                if (rd < dist) {
+                if (rd <= PCWLD_ATTEND_UNITS) { /* W-04: the same radius that keeps the record attended (it used to be 600 here and 700 there) */
+                    dist = 0.0f;
+                } else if (rd < dist) {
                     dist = rd;
                 }
             }

@@ -65,6 +65,17 @@ static void aSTM_set_norm_talk_info(ACTOR* actorx) {
         if (actor->talk_idx == 2 && !Save_Get(save_exist)) {
             mDemo_Set_msg_num(0x0945);
             actor->talk_proc = (aSTM_TALK_PROC)none_proc1;
+#ifdef TARGET_PC
+        } else if (data_p->talk_idx == aSTM_TALK_CHK_LEAVE_TALK) {
+            /* PC multiplayer: the vanilla offer here (0x0943 / 0x095C: "going somewhere?" -> Yes -> the memory-card / passport trip back to another village) leads to a
+             * route that does not exist in this version. Porter says what the station is for instead, and the talk simply ends (the same END_WAIT the "No" answer used). */
+            mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_PORTER_STATION));
+            if (CLIP(station_clip) != NULL) {
+                CLIP(station_clip)->change_talk_proc(actorx, aSTM_TALK_END_WAIT);
+            } else {
+                actor->talk_proc = (aSTM_TALK_PROC)none_proc1;
+            }
+#endif
         } else {
             mDemo_Set_msg_num(data_p->msg_no);
             if (CLIP(station_clip) != NULL) {

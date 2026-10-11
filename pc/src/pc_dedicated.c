@@ -7,12 +7,23 @@
 #include "pc_net_game.h"
 #include "pc_net.h"       /* PCNetStats (status line) */
 #include "pc_log.h"
+#include "pc_ded_console.h" /* the pure line editor / redraw text / log formatter of the interactive console */
 #include "pc_server.h" /* servers/<id>/ storage tree (status line, server.log) */
 #include "m_name_table.h" /* item ids / categories for the host item tools (finditem, iteminfo, items, give) */
+#include "m_common_data.h" /* time.rtc_time (`time get`) and the event schedule reads (`event list/status`) */
+#include "m_event.h"
+#include "pc_wildlife_authority.h" /* `wildlife` commands: the host's authoritative table */
+#include "pc_remote_player.h"      /* `where`: the last position a peer reported */
+#include "ac_gyoei.h"              /* fish species ids for `wildlife spawn` */
+#include "pc_test_hooks.h"         /* test-hook gate of the behaviour-changing commands */
 #include "m_item_name.h"  /* mIN_copy_name_str(): the game's own item name tables (filled from the ROM by pc_assets_init) */
 
 #include <stdarg.h>
 #include <ctype.h>
+#include <stdlib.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#endif
 
 #ifdef _WIN32
 #include <process.h>
@@ -58,6 +69,106 @@ static int   s_ded_interactive = 0;
 static HANDLE s_ded_conin = NULL; /* interactive mode: the server console's OWN input buffer, opened directly (not through the CRT stdin) */
 #endif
 
+#define PC_DED_PROMPT "> "
+
+#ifdef _WIN32
+/* The interactive console's line editor (pc_ded_console.h). While it owns the console (s_con_edit) EVERY write goes through pc_ded_con_write(): under one lock it erases the prompt line, writes the
+ * text and draws the prompt line (the partially typed command, the cursor) again, so a log line can never land in the middle of what the operator is typing. */
+static CRITICAL_SECTION s_con_lock;
+static int        s_con_lock_ready = 0;
+static int        s_con_edit = 0;    /* 1 = the editor owns the console input and output */
+static int        s_con_color = 0;
+static int        s_con_partial = 0; /* the last write did not end with a newline (a prompt text): no prompt line is drawn until it does */
+static PCDedcEdit s_con_ed;
+static HANDLE     s_con_out_h = NULL;
+static DWORD      s_con_in_old_mode = 0;
+
+static int pc_ded_con_width(void) {
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    if (s_con_out_h != NULL && GetConsoleScreenBufferInfo(s_con_out_h, &ci)) {
+        return (int)(ci.srWindow.Right - ci.srWindow.Left + 1);
+    }
+    return 80;
+}
+
+/* ONE WriteFile per redraw: the console applies a single write atomically, so nobody (a screen reader, the window) can see the prompt line half erased */
+static void pc_ded_con_put_locked(const char* s, size_t n) {
+    DWORD wr = 0;
+    while (n > 0) {
+        DWORD chunk = n > 32768u ? 32768u : (DWORD)n;
+        if (!WriteFile(s_con_out_h, s, chunk, &wr, NULL) || wr == 0) {
+            break;
+        }
+        s += wr;
+        n -= wr;
+    }
+}
+
+/* raw text (a command response, a prompt): not formatted */
+static void pc_ded_con_write(const char* text) {
+    size_t tl = strlen(text);
+    size_t cap = tl + 1600;
+    char* out = (char*)malloc(cap);
+    size_t n = 0;
+    int complete = tl > 0 && text[tl - 1] == '\n';
+    if (out == NULL) {
+        return;
+    }
+    EnterCriticalSection(&s_con_lock);
+    if (!s_con_partial) {
+        memcpy(out, "\r\x1b[2K", 5);
+        n = 5;
+    }
+    memcpy(out + n, text, tl);
+    n += tl;
+    if (complete) {
+        n += pc_dedc_render(&s_con_ed, PC_DED_PROMPT, pc_ded_con_width(), out + n, cap - n);
+        s_con_partial = 0;
+    } else if (tl > 0) {
+        s_con_partial = 1;
+    }
+    out[n] = '\0';
+    pc_ded_con_put_locked(out, n);
+    LeaveCriticalSection(&s_con_lock);
+    free(out);
+}
+
+/* log text: every line gets the console format (time, level, subsystem) */
+static void pc_ded_con_write_log(const char* text) {
+    size_t tl = strlen(text);
+    size_t cap = tl * 3 + 1024;
+    char* out = (char*)malloc(cap);
+    char* line = (char*)malloc(tl + 1);
+    SYSTEMTIME st;
+    const char* p = text;
+    size_t n = 0;
+    if (out == NULL || line == NULL) {
+        free(out);
+        free(line);
+        return;
+    }
+    out[0] = '\0';
+    GetLocalTime(&st);
+    while (*p != '\0') {
+        const char* nl = strchr(p, '\n');
+        size_t ll = nl != NULL ? (size_t)(nl - p) : strlen(p);
+        memcpy(line, p, ll);
+        line[ll] = '\0';
+        if (ll > 0 || nl == NULL) {
+            n += pc_dedc_format(line, st.wHour, st.wMinute, st.wSecond, s_con_color, pc_ded_con_width(), out + n, cap - n - 2);
+            out[n++] = '\n';
+            out[n] = '\0';
+        }
+        p += ll + (nl != NULL ? 1 : 0);
+    }
+    if (n > 0) {
+        pc_ded_con_write(out);
+    }
+    free(out);
+    free(line);
+}
+#endif
+
 static FILE* pc_ded_stream(void) {
     return s_ded_out != NULL ? s_ded_out : stdout;
 }
@@ -69,10 +180,36 @@ static void pc_ded_flush(void) {
 static int pc_ded_printf(const char* fmt, ...) {
     va_list ap;
     int n;
+#ifdef _WIN32
+    if (s_con_edit) {
+        char* buf;
+        va_start(ap, fmt);
+        n = vsnprintf(NULL, 0, fmt, ap);
+        va_end(ap);
+        if (n < 0) {
+            return n;
+        }
+        buf = (char*)malloc((size_t)n + 1);
+        if (buf == NULL) {
+            return -1;
+        }
+        va_start(ap, fmt);
+        vsnprintf(buf, (size_t)n + 1, fmt, ap);
+        va_end(ap);
+        pc_ded_con_write(buf);
+        free(buf);
+        return n;
+    }
+#endif
     va_start(ap, fmt);
     n = vfprintf(pc_ded_stream(), fmt, ap);
     va_end(ap);
     return n;
+}
+
+static int s_stdout_console = 0; /* pc_main.c did not redirect stdout to NUL */
+void pc_dedicated_note_stdout_console(void) {
+    s_stdout_console = 1;
 }
 
 int pc_dedicated_stdout_quiet(void) {
@@ -84,12 +221,25 @@ void pc_dedicated_say(const char* fmt, ...) {
     if (!g_pc_dedicated) {
         return;
     }
-    fputs("[DEDICATED] ", pc_ded_stream());
-    va_start(ap, fmt);
-    vfprintf(pc_ded_stream(), fmt, ap);
-    va_end(ap);
-    fputc('\n', pc_ded_stream());
-    pc_ded_flush();
+#ifdef _WIN32
+    if (s_con_edit) {
+        char msg[1200];
+        char full[1300];
+        va_start(ap, fmt);
+        vsnprintf(msg, sizeof(msg), fmt, ap);
+        va_end(ap);
+        snprintf(full, sizeof(full), "[DEDICATED] %s", msg);
+        pc_ded_con_write_log(full); /* interactive console: formatted (time / level / subsystem), drawn around the prompt line */
+    } else
+#endif
+    {
+        fputs("[DEDICATED] ", pc_ded_stream());
+        va_start(ap, fmt);
+        vfprintf(pc_ded_stream(), fmt, ap);
+        va_end(ap);
+        fputc('\n', pc_ded_stream());
+        pc_ded_flush();
+    }
     {
         char line[400];
         va_list ap2;
@@ -100,9 +250,35 @@ void pc_dedicated_say(const char* fmt, ...) {
     }
 }
 
+void pc_dedicated_say_detail(const char* fmt, ...) {
+    char msg[1200];
+    va_list ap;
+    if (!g_pc_dedicated) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+#ifdef _WIN32
+    if (s_con_edit && !(g_pc_log_mask & PCL_NET) && !g_pc_verbose) {
+        pc_server_log("%s", msg); /* the interactive console shows the friendly lines instead; the detail stays in server.log */
+        return;
+    }
+#endif
+    pc_dedicated_say("%s", msg);
+}
+
 /* FATAL notices: stderr, or the server console when stderr is going to NUL (interactive mode) so they are never lost. */
 static void pc_ded_fatal(const char* msg_a, const char* arg) {
     FILE* f = s_ded_interactive ? pc_ded_stream() : stderr;
+#ifdef _WIN32
+    if (s_con_edit) {
+        char msg[700];
+        snprintf(msg, sizeof(msg), msg_a, arg);
+        pc_ded_con_write_log(msg);
+        return;
+    }
+#endif
     fprintf(f, msg_a, arg);
     fflush(f);
 }
@@ -169,6 +345,10 @@ void pc_dedicated_early_console(void) {
             AllocConsole();
         }
         SetConsoleTitleA("Animal Crossing dedicated server console");
+        if (!s_con_lock_ready) {
+            InitializeCriticalSection(&s_con_lock);
+            s_con_lock_ready = 1;
+        }
         s_ded_conin = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (s_ded_conin == INVALID_HANDLE_VALUE) {
             s_ded_conin = NULL;
@@ -318,6 +498,208 @@ static void* pc_ded_reader_thread(void* arg) {
 }
 #endif
 
+#ifdef _WIN32
+static void pc_ded_con_restore(void) {
+    if (s_con_edit && s_ded_conin != NULL) {
+        SetConsoleMode(s_ded_conin, s_con_in_old_mode);
+    }
+}
+
+/* Takes the server console over: no console line input / echo (the editor does both), VT output. Any failure leaves the console exactly as it was (the old cooked line reader stays in use). */
+static char s_con_edit_why[96] = "";
+
+static int pc_ded_enable_editor(void) {
+    HANDLE hi = s_ded_conin;
+    HANDLE ho;
+    DWORD mi = 0, mo = 0;
+    if (!s_ded_interactive || s_ded_out == NULL || hi == NULL || !s_con_lock_ready) {
+        return 0; /* not the interactive console: nothing to report */
+    }
+    /* the FILE opened on CONOUT$ is write-only; querying / changing the console mode needs a handle with read access too (error 5 otherwise). The mode belongs to the screen buffer, so it applies to the FILE as well. */
+    ho = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (ho == INVALID_HANDLE_VALUE || !GetConsoleMode(hi, &mi) || !GetConsoleMode(ho, &mo)) {
+        snprintf(s_con_edit_why, sizeof(s_con_edit_why), "console modes unreadable (error %lu)", (unsigned long)GetLastError());
+        return 0;
+    }
+    if (!SetConsoleMode(ho, mo | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        snprintf(s_con_edit_why, sizeof(s_con_edit_why), "this console has no virtual-terminal output (error %lu)", (unsigned long)GetLastError());
+        return 0;
+    }
+    if (!SetConsoleMode(hi, (mi & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_PROCESSED_INPUT)) {
+        snprintf(s_con_edit_why, sizeof(s_con_edit_why), "console input mode could not be changed (error %lu)", (unsigned long)GetLastError());
+        SetConsoleMode(ho, mo);
+        return 0;
+    }
+    s_con_in_old_mode = mi;
+    s_con_out_h = ho;
+    pc_dedc_init(&s_con_ed);
+    s_con_color = getenv("NO_COLOR") == NULL;
+    s_con_edit = 1;
+    atexit(pc_ded_con_restore);
+    return 1;
+}
+
+static void pc_ded_con_redraw(void) {
+    char out[1300];
+    size_t n;
+    EnterCriticalSection(&s_con_lock);
+    if (!s_con_partial) {
+        n = pc_dedc_render(&s_con_ed, PC_DED_PROMPT, pc_ded_con_width(), out, sizeof(out));
+        pc_ded_con_put_locked(out, n);
+    }
+    LeaveCriticalSection(&s_con_lock);
+}
+
+static void pc_ded_enqueue(const char* text, size_t len, int truncated);
+
+/* the keyboard reader of the editor: keys -> editor -> redraw; ENTER hands the line over once (the same bounded queue the stdin reader uses) */
+static unsigned __stdcall pc_ded_editor_thread(void* arg) {
+    INPUT_RECORD rec[16];
+    DWORD got, i;
+    (void)arg;
+    pc_ded_con_redraw();
+    for (;;) {
+        if (!ReadConsoleInputW(s_ded_conin, rec, 16, &got) || got == 0) {
+            break;
+        }
+        for (i = 0; i < got; i++) {
+            const KEY_EVENT_RECORD* k;
+            int key = 0;
+            int rep, r;
+            if (rec[i].EventType != KEY_EVENT || !rec[i].Event.KeyEvent.bKeyDown) {
+                continue;
+            }
+            k = &rec[i].Event.KeyEvent;
+            switch (k->wVirtualKeyCode) {
+                case VK_BACK: key = PC_DEDC_KEY_BACKSPACE; break;
+                case VK_DELETE: key = PC_DEDC_KEY_DELETE; break;
+                case VK_LEFT: key = PC_DEDC_KEY_LEFT; break;
+                case VK_RIGHT: key = PC_DEDC_KEY_RIGHT; break;
+                case VK_HOME: key = PC_DEDC_KEY_HOME; break;
+                case VK_END: key = PC_DEDC_KEY_END; break;
+                case VK_RETURN: key = PC_DEDC_KEY_ENTER; break;
+                case VK_ESCAPE: key = PC_DEDC_KEY_CLEAR; break;
+                default:
+                    if (k->uChar.UnicodeChar == 0x15) {
+                        key = PC_DEDC_KEY_CLEAR; /* Ctrl+U */
+                    } else if (k->uChar.UnicodeChar >= 32 && k->uChar.UnicodeChar <= 126) {
+                        key = (int)k->uChar.UnicodeChar;
+                    }
+                    break;
+            }
+            if (key == 0) {
+                continue;
+            }
+            rep = k->wRepeatCount > 0 ? (int)k->wRepeatCount : 1;
+            for (r = 0; r < rep; r++) {
+                char line[PC_DEDC_LINE_MAX + 1];
+                char draw[1300];
+                int done;
+                EnterCriticalSection(&s_con_lock);
+                done = pc_dedc_key(&s_con_ed, key, line, sizeof(line));
+                if (done) {
+                    char echo[PC_DEDC_LINE_MAX + 16];
+                    size_t en = pc_dedc_commit_echo(PC_DED_PROMPT, line, echo, sizeof(echo));
+                    size_t dn = pc_dedc_render(&s_con_ed, PC_DED_PROMPT, pc_ded_con_width(), draw, sizeof(draw));
+                    pc_ded_con_put_locked(echo, en);
+                    pc_ded_con_put_locked(draw, dn);
+                    s_con_partial = 0;
+                } else if (!s_con_partial) {
+                    size_t dn = pc_dedc_render(&s_con_ed, PC_DED_PROMPT, pc_ded_con_width(), draw, sizeof(draw));
+                    pc_ded_con_put_locked(draw, dn);
+                }
+                LeaveCriticalSection(&s_con_lock);
+                if (done) {
+                    pc_ded_enqueue(line, strlen(line), 0);
+                }
+            }
+        }
+    }
+    s_stdin_eof = 1;
+    return 0;
+}
+
+/* With -debug* / --verbose the game's own stdout / stderr stay on the console. They are routed through a pipe into the SAME locked writer, so those lines cannot tear the prompt line either. */
+static HANDLE s_pump_read = NULL;
+static unsigned __stdcall pc_ded_pump_thread(void* arg) {
+    char buf[1024];
+    char line[PC_DEDC_LINE_MAX * 2 + 8];
+    size_t len = 0;
+    DWORD got;
+    (void)arg;
+    for (;;) {
+        DWORD avail = 0;
+        DWORD i;
+        /* stdout is unbuffered: one printf can arrive as several pieces. A partial line is held until its newline comes; only when nothing more arrives for 50 ms (a prompt-style text without a
+         * newline) is it shown as it is, so a line is never split in the middle. */
+        if (len > 0 && PeekNamedPipe(s_pump_read, NULL, 0, NULL, &avail, NULL) && avail == 0) {
+            Sleep(50);
+            if (PeekNamedPipe(s_pump_read, NULL, 0, NULL, &avail, NULL) && avail == 0) {
+                line[len] = '\0';
+                pc_ded_con_write_log(line);
+                len = 0;
+            }
+        }
+        if (!ReadFile(s_pump_read, buf, sizeof(buf), &got, NULL) || got == 0) {
+            break;
+        }
+        for (i = 0; i < got; i++) {
+            char c = buf[i];
+            if (c == '\n') {
+                line[len] = '\0';
+                pc_ded_con_write_log(len > 0 ? line : " ");
+                len = 0;
+            } else if (c != '\r' && len < sizeof(line) - 2) {
+                line[len++] = c;
+            }
+        }
+    }
+    return 0;
+}
+
+static void pc_ded_install_log_pump(void) {
+    HANDLE r = NULL, w = NULL;
+    int fd;
+    uintptr_t th;
+    /* the CRT descriptors of the stdout / stderr FILEs (a GUI-subsystem exe that reopened them on CONOUT$ does not necessarily have them on fd 1 / 2) */
+    int fdo = _fileno(stdout);
+    int fde = _fileno(stderr);
+    intptr_t so = fdo >= 0 ? _get_osfhandle(fdo) : -1;
+    /* pc_main.c sends stdout / stderr to NUL (also a "character device", and not told apart by its type) unless --verbose / a -debug* flag / PC_LOG / profiling asked for them: only then does
+     * game output reach the console and need routing. Routing a NUL stdout would turn the game's thousands of discarded debug lines into console output. */
+    if (!s_stdout_console) {
+        return;
+    }
+    if (so == -1 || so == -2 || GetFileType((HANDLE)so) != FILE_TYPE_CHAR) {
+        return; /* stdout is NUL / a file / nothing: nothing reaches the console */
+    }
+    if (!CreatePipe(&r, &w, NULL, 1 << 16)) {
+        pc_dedicated_say("console: debug output capture unavailable (CreatePipe error %lu); debug lines may interrupt typing", (unsigned long)GetLastError());
+        return;
+    }
+    fd = _open_osfhandle((intptr_t)w, _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(r);
+        CloseHandle(w);
+        pc_dedicated_say("console: debug output capture unavailable (_open_osfhandle); debug lines may interrupt typing");
+        return;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    if (_dup2(fd, fdo) != 0 || (fde >= 0 && fde != fdo && _dup2(fd, fde) != 0)) {
+        pc_dedicated_say("console: debug output capture unavailable (_dup2); debug lines may interrupt typing");
+        return;
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    s_pump_read = r;
+    th = _beginthreadex(NULL, 0, pc_ded_pump_thread, NULL, 0, NULL);
+    if (th != 0) {
+        CloseHandle((HANDLE)th);
+    }
+}
+#endif
+
 /* Starts the reader. DETACHED on purpose: it blocks in a raw read and is never joined, so process exit never waits for it. */
 static int pc_ded_start_stdin_thread(void) {
 #ifdef _WIN32
@@ -330,6 +712,17 @@ static int pc_ded_start_stdin_thread(void) {
     }
     s_stdin_handle = (HANDLE)h;
     InitializeCriticalSection(&s_q_lock);
+    if (s_ded_conin != NULL && pc_ded_enable_editor()) {
+        th = _beginthreadex(NULL, 0, pc_ded_editor_thread, NULL, 0, NULL);
+        if (th == 0) {
+            pc_ded_con_restore();
+            s_con_edit = 0;
+            return 0;
+        }
+        CloseHandle((HANDLE)th);
+        pc_ded_install_log_pump();
+        return 1;
+    }
     th = _beginthreadex(NULL, 0, pc_ded_reader_thread, NULL, 0, NULL);
     if (th == 0) {
         return 0;
@@ -355,6 +748,11 @@ void pc_dedicated_startup(uint16_t port) {
     pc_dedicated_say("dedicated server starting: role=host port=%u observer=on (--host-observer init reused) console=on", (unsigned)port);
     PC_LOG(PCL_GENERAL, "dedicated mode: port=%u observer=on console=on\n", (unsigned)port);
     s_stdin_started = pc_ded_start_stdin_thread();
+#ifdef _WIN32
+    if (s_ded_interactive && !s_con_edit) {
+        pc_dedicated_say("console: the line editor is not available (%s); typing may be interrupted by log lines", s_con_edit_why[0] ? s_con_edit_why : "the editor could not start");
+    }
+#endif
     if (s_stdin_started) {
         pc_dedicated_say("console input: reading commands from stdin (type help)");
     } else {
@@ -428,6 +826,16 @@ int pc_dedicated_read_line_blocking(char* buf, size_t cap) {
     return 1;
 }
 
+/* "> " for the plain stdin prompts; the interactive editor draws its own prompt, so nothing is added there */
+static const char* pc_ded_prompt_suffix(void) {
+#ifdef _WIN32
+    if (s_con_edit) {
+        return "";
+    }
+#endif
+    return PC_DED_PROMPT;
+}
+
 void pc_dedicated_prompt_town_name(void) {
     uint8_t codes[8];
     char err[96], text[24];
@@ -438,7 +846,7 @@ void pc_dedicated_prompt_town_name(void) {
     pc_ded_printf("\n========================================\n Animal Crossing Dedicated Host\n========================================\n\n");
     pc_ded_printf("No town exists for this server.\n\n");
     for (;;) {
-        pc_ded_printf("Enter town name (1-8 characters):\n> ");
+        pc_ded_printf("Enter town name (1-8 characters):\n%s", pc_ded_prompt_suffix());
         pc_ded_flush();
         pc_server_log("waiting for the town name on the console");
         while (!pc_ded_pop_line(&ln)) {
@@ -589,6 +997,13 @@ static void pc_ded_cmd_help(void) {
            "  iteminfo <id>            name, category and whether it can be given (id = 0x2203 or decimal)\n"
            "  items <furniture|tools|clothing|wallpaper|carpet|miscellaneous|all> [page]   list items by category (categories are incomplete; see docs)\n"
            "  give <player|peer N|\"name\"> <id> [qty]   put qty (1-15, default 1) copies in the player's FREE pockets, all-or-nothing; player = resident or guest name (see `players`, `guests`)\n"
+           "  where [<player>|peer N]   last reported position (x, y, z, acre) of one / every connected player (the server has no player of its own)\n"
+           "  net status|peers|resync   network role / transport counters / per-peer state; resync is reported unsupported (no general resync exists)\n"
+           "  time get   the game clock (date, time, weekday)\n"
+           "  event list|status [name]   today's event schedule from the game's own tables (scheduled / active / running); start|stop|reset are refused with the reason\n"
+           "  wildlife list|info <id>   the host's authoritative wildlife records; wildlife spawn fish <species> <x> <z> / despawn <id> need AC_TEST_HOOKS=1\n"
+           "  test status|help   whether the test hooks are enabled and what they gate\n"
+           "  tp / bell   unsupported on the server (no local player; no host bell admin API) -- see docs/console-commands.md\n"
            "  stop     graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit\n");
     pc_ded_flush();
 }
@@ -1443,6 +1858,394 @@ static void pc_ded_cmd_give(char* args) {
     pc_ded_flush();
 }
 
+/* ---- developer commands (where / net / time / event / wildlife / test). Read-only unless noted; every refusal says why. ---- */
+static const char* const s_ded_event_names[] = {
+    "rumor_new_years_day",
+    "new_years_day",
+    "rumor_kamakura",
+    "kamakura",
+    "soncho_vacation_january",
+    "soncho_vacation_february",
+    "rumor_groundhog_day",
+    "groundhog_day",
+    "rumor_valentines_day",
+    "valentines_day",
+    "rumor_spring_sports_fair",
+    "spring_equinox",
+    "sports_fair_ball_toss",
+    "sports_fair_aerobics",
+    "sports_fair_tug_of_war",
+    "sports_fair_foot_race",
+    "sports_fair",
+    "aprilfools_day",
+    "rumor_aprilfools_day",
+    "rumor_cherry_blossom_festival",
+    "cherry_blossom_festival",
+    "nature_day",
+    "spring_cleaning",
+    "mothers_day",
+    "summer_camper",
+    "graduation_day",
+    "fathers_day",
+    "rumor_fishing_tourney_1",
+    "talk_fishing_tourney_1",
+    "fishing_tourney_1",
+    "town_day",
+    "rumor_fireworks_show",
+    "fireworks_show",
+    "rumor_morning_aerobics",
+    "talk_morning_aerobics",
+    "morning_aerobics",
+    "rumor_meteor_shower",
+    "meteor_shower",
+    "founders_day",
+    "labor_day",
+    "rumor_fall_sports_fair",
+    "autumn_equinox",
+    "rumor_harvest_moon_day",
+    "harvest_moon_festival",
+    "explorers_day",
+    "rumor_mushroom_season",
+    "talk_mushroom_season",
+    "mushroom_season",
+    "rumor_halloween",
+    "halloween",
+    "mayors_day",
+    "officers_day",
+    "rumor_fishing_tourney_2",
+    "talk_fishing_tourney_2",
+    "fishing_tourney_2",
+    "rumor_harvest_festival",
+    "harvest_festival",
+    "sale_day",
+    "snow_day",
+    "toy_day_soncho",
+    "rumor_toy_day",
+    "toy_day_jingle",
+    "snowman_season",
+    "rumor_new_years_eve_countdown",
+    "new_years_eve_countdown",
+    "cherry_blossom_petals",
+    "talk_toy_day",
+    "player_birthday",
+    "dozaemon",
+    "kabu_peddler",
+    "lottery",
+    "kk_slider",
+    "handbill_broker",
+    "handbill_shop_sale",
+    "artist",
+    "broker_sale",
+    "designer",
+    "gypsy",
+    "shop_sale",
+    "carpet_peddler",
+    "soncho_new_years_day",
+    "soncho_groundhog_day",
+    "soncho_spring_sports_fair",
+    "soncho_aprilfools_day",
+    "soncho_cherry_blossom_festival",
+    "soncho_nature_day",
+    "soncho_spring_cleaning",
+    "soncho_mothers_day",
+    "soncho_graduation_day",
+    "soncho_fathers_day",
+    "soncho_fishing_tourney_1",
+    "soncho_town_day",
+    "soncho_fireworks_show",
+    "soncho_meteor_shower",
+    "soncho_founders_day",
+    "soncho_labor_day",
+    "soncho_fall_sports_fair",
+    "soncho_harvest_moon_festival",
+    "soncho_explorers_day",
+    "soncho_halloween",
+    "soncho_mayors_day",
+    "soncho_officers_day",
+    "soncho_fishing_tourney_2",
+    "soncho_harvest_festival",
+    "soncho_sale_day",
+    "soncho_snow_day",
+    "soncho_toy_day",
+    "talk_new_years_countdown",
+    "harvest_festival_franklin",
+    "weather_clear",
+    "weather_snow",
+    "weather_sports_fair",
+    "bridge_make",
+    "soncho_bridge_make",
+    "ghost",
+    "mask_npc",
+    "74",
+    "koinobori",
+    "76"
+};
+#define PC_DED_EVENT_COUNT ((int)(sizeof(s_ded_event_names) / sizeof(s_ded_event_names[0])))
+
+static char* pc_ded_skip_ws(char* p) {
+    while (p != NULL && *p != '\0' && isspace((unsigned char)*p)) {
+        p++;
+    }
+    return p;
+}
+
+/* splits "sub rest" in place: returns the sub-command, *rest = the remaining text (never NULL) */
+static char* pc_ded_split_sub(char* args, char** rest) {
+    char* sub = pc_ded_skip_ws(args);
+    char* r = sub;
+    if (sub == NULL) {
+        static char empty[1] = { 0 };
+        *rest = empty;
+        return empty;
+    }
+    while (*r != '\0' && !isspace((unsigned char)*r)) {
+        r++;
+    }
+    if (*r != '\0') {
+        *r++ = '\0';
+        r = pc_ded_skip_ws(r);
+    }
+    *rest = r;
+    return sub;
+}
+
+static int pc_ded_find_peer(char* args, PCNetGameDedicatedPeerInfo* out) {
+    int i, n = pc_net_game_dedicated_peer_slots();
+    unsigned long pv;
+    args = pc_ded_skip_ws(args);
+    if (args == NULL || *args == '\0') {
+        return 0;
+    }
+    if (strncmp(args, "peer ", 5) == 0 && pc_ded_parse_num(args + 5, &pv)) {
+        return pv < (unsigned long)n && pc_net_game_dedicated_peer_info((int)pv, out) ? 1 : 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (pc_net_game_dedicated_peer_info(i, out) && pc_ded_stricmp(out->name, args) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pc_ded_print_where(const PCNetGameDedicatedPeerInfo* pi) {
+    float x, y, z;
+    if (pc_remote_player_get_last_position((PCNetPlayerId)pi->peer, &x, &y, &z)) {
+        pc_ded_printf("  peer %d \"%s\": x=%.1f y=%.1f z=%.1f acre=(%d,%d) link=%s\n", pi->peer, pi->name, (double)x, (double)y, (double)z, (int)(x / 640.0f), (int)(z / 640.0f), pc_ded_link_name(pi->link));
+    } else {
+        pc_ded_printf("  peer %d \"%s\": no position reported yet (link=%s)\n", pi->peer, pi->name, pc_ded_link_name(pi->link));
+    }
+}
+
+static void pc_ded_cmd_where(char* args) {
+    PCNetGameDedicatedPeerInfo pi;
+    int i, n = pc_net_game_dedicated_peer_slots(), listed = 0;
+    args = pc_ded_skip_ws(args);
+    if (args != NULL && *args != '\0') {
+        if (pc_ded_find_peer(args, &pi)) {
+            pc_ded_printf("[DEDICATED] where:\n");
+            pc_ded_print_where(&pi);
+        } else {
+            pc_ded_printf("WHERE FAILED: no connected player '%s' (see `players`; `peer <N>` also works)\n", args);
+        }
+        pc_ded_flush();
+        return;
+    }
+    pc_ded_printf("[DEDICATED] where: the server has no player of its own; connected players (world units; acre = x/640, z/640):\n");
+    for (i = 0; i < n; i++) {
+        if (pc_net_game_dedicated_peer_info(i, &pi)) {
+            pc_ded_print_where(&pi);
+            listed++;
+        }
+    }
+    if (listed == 0) {
+        pc_ded_printf("  (no players connected)\n");
+    }
+    pc_ded_flush();
+}
+
+static void pc_ded_cmd_net(char* args) {
+    PCNetStats ns;
+    int i, n = pc_net_game_dedicated_peer_slots(), ready = 0, tr = 0;
+    args = pc_ded_skip_ws(args);
+    if (args != NULL && pc_ded_stricmp(args, "status") == 0) {
+        for (i = 0; i < n; i++) {
+            PCNetGameDedicatedPeerInfo pi;
+            if (pc_net_game_dedicated_peer_info(i, &pi)) {
+                tr++;
+                ready += pi.link == PC_NETGAME_LINK_READY;
+            }
+        }
+        pc_net_get_stats(&ns);
+        pc_ded_printf("[DEDICATED] net status: role=%s port=%u peers=%d ready=%d reliable sent=%lu retransmits=%lu events dropped unreliable=%lu control=%lu\n", pc_ded_role_name(), (unsigned)s_port, tr, ready,
+               (unsigned long)ns.rdata_sent, (unsigned long)ns.rdata_retransmits, (unsigned long)ns.events_dropped_unreliable, (unsigned long)ns.events_dropped_control);
+    } else if (args != NULL && pc_ded_stricmp(args, "peers") == 0) {
+        pc_ded_cmd_players();
+        return;
+    } else if (args != NULL && pc_ded_stricmp(args, "resync") == 0) {
+        pc_ded_printf("NET RESYNC UNSUPPORTED: there is no general resynchronisation API. Each system resyncs itself on (re)connect (field, wildlife session generation, roster); nothing was sent.\n");
+    } else {
+        pc_ded_printf("usage: net status | net peers | net resync\n");
+    }
+    pc_ded_flush();
+}
+
+static void pc_ded_cmd_time(char* args) {
+    static const char* const wd[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    args = pc_ded_skip_ws(args);
+    if (args == NULL || pc_ded_stricmp(args, "get") != 0) {
+        pc_ded_printf("usage: time get   (changing the game clock is not offered)\n");
+    } else if (!pc_net_game_dedicated_world_ready()) {
+        pc_ded_printf("TIME FAILED: the world is not ready yet\n");
+    } else {
+        const lbRTC_time_c t = Common_Get(time.rtc_time);
+        pc_ded_printf("[DEDICATED] time: %04d-%02d-%02d %02d:%02d:%02d %s\n", (int)t.year, (int)t.month, (int)t.day, (int)t.hour, (int)t.min, (int)t.sec, (t.weekday < 7) ? wd[t.weekday] : "?");
+    }
+    pc_ded_flush();
+}
+
+static int pc_ded_find_event(const char* name) {
+    int i;
+    unsigned long v;
+    for (i = 0; i < PC_DED_EVENT_COUNT; i++) {
+        if (pc_ded_stricmp(s_ded_event_names[i], name) == 0) {
+            return i;
+        }
+    }
+    return pc_ded_parse_num(name, &v) && v < (unsigned long)PC_DED_EVENT_COUNT ? (int)v : -1;
+}
+
+static void pc_ded_print_event(int ev) {
+    pc_ded_printf("  %3d %-34s scheduled-today=%s active-now=%s status:%s%s%s\n", ev, s_ded_event_names[ev], mEv_check_run_today(ev) ? "yes" : "no", mEv_check_schedule(ev) ? "yes" : "no",
+           mEv_check_status(ev, mEv_STATUS_RUN) ? " RUN" : "", mEv_check_status(ev, mEv_STATUS_ACTIVE) ? " ACTIVE" : "", mEv_check_status(ev, mEv_STATUS_ERROR) ? " ERROR" : "");
+}
+
+static void pc_ded_cmd_event(char* args) {
+    char* rest;
+    char* sub = pc_ded_split_sub(args, &rest);
+    int i, ev, shown = 0;
+    if (*sub == '\0') {
+        pc_ded_printf("usage: event list | event status [name] | event start|stop|reset <name>\n");
+    } else if (pc_ded_stricmp(sub, "start") == 0 || pc_ded_stricmp(sub, "stop") == 0 || pc_ded_stricmp(sub, "reset") == 0) {
+        pc_ded_printf("EVENT %s REFUSED: no safe forced start exists. The only game entry (mEv_init_force) re-rolls the WHOLE day's event schedule and renewal, which would change ordinary scheduling and can\n"
+                      "duplicate reward / claim state; setting a status flag alone would not create the event's actors. Nothing was changed. `event status <name>` shows when an event runs; events need the right\n"
+                      "date and hour, their NPC, and on a client a READY host.\n", sub);
+    } else if (!pc_net_game_dedicated_world_ready()) {
+        pc_ded_printf("EVENT FAILED: the world is not ready yet\n");
+    } else if (pc_ded_stricmp(sub, "list") == 0 || (pc_ded_stricmp(sub, "status") == 0 && *rest == '\0')) {
+        const int all = pc_ded_stricmp(sub, "list") == 0;
+        pc_ded_printf("[DEDICATED] events (the game's schedule for today; `event list` = every type, `event status` = only scheduled / running ones):\n");
+        for (i = 0; i < PC_DED_EVENT_COUNT; i++) {
+            if (all || mEv_check_run_today(i) || mEv_check_status(i, mEv_STATUS_RUN) || mEv_check_status(i, mEv_STATUS_ACTIVE)) {
+                pc_ded_print_event(i);
+                shown++;
+            }
+        }
+        if (shown == 0) {
+            pc_ded_printf("  (no event is scheduled or running today)\n");
+        }
+    } else if (pc_ded_stricmp(sub, "status") == 0) {
+        ev = pc_ded_find_event(rest);
+        if (ev < 0) {
+            pc_ded_printf("EVENT FAILED: unknown event '%s' (see `event list`)\n", rest);
+        } else {
+            pc_ded_print_event(ev);
+        }
+    } else {
+        pc_ded_printf("usage: event list | event status [name] | event start|stop|reset <name>\n");
+    }
+    pc_ded_flush();
+}
+
+static int pc_ded_fish_species(const char* nm) {
+    unsigned long v;
+    if (pc_ded_stricmp(nm, "seabass") == 0) return aGYO_TYPE_SEA_BASS;
+    if (pc_ded_stricmp(nm, "snapper") == 0) return aGYO_TYPE_RED_SNAPPER;
+    if (pc_ded_stricmp(nm, "coelacanth") == 0) return aGYO_TYPE_COELACANTH;
+    if (pc_ded_stricmp(nm, "jellyfish") == 0) return aGYO_TYPE_JELLYFISH;
+    if (pc_ded_stricmp(nm, "knifejaw") == 0) return aGYO_TYPE_BARRED_KNIFEJAW;
+    if (pc_ded_stricmp(nm, "whale") == 0) return aGYO_TYPE_WHALE;
+    if (pc_ded_stricmp(nm, "salmon2") == 0) return aGYO_TYPE_SALMON2;
+    return pc_ded_parse_num(nm, &v) && v < 256ul ? (int)v : -1;
+}
+
+static void pc_ded_print_wl(const PcWildlifeRecord* r) {
+    pc_ded_printf("  id %u %s species %d acre (%d,%d) at (%.1f, %.1f, %.1f)\n", (unsigned)r->entity_id, r->kind == PC_WILDLIFE_KIND_FISH ? "fish" : "bug", r->species, r->bx, r->bz, (double)r->pos_x,
+           (double)r->pos_y, (double)r->pos_z);
+}
+
+static void pc_ded_cmd_wildlife(char* args) {
+    char* rest;
+    char* sub = pc_ded_split_sub(args, &rest);
+    PcWildlifeRecord r;
+    unsigned long id;
+    int i;
+    if (*sub == '\0') {
+        pc_ded_printf("usage: wildlife list | info <id> | spawn fish <species> <x> <z> | despawn <id>   (spawn / despawn: AC_TEST_HOOKS=1)\n");
+    } else if (pc_ded_stricmp(sub, "list") == 0) {
+        pc_ded_printf("[DEDICATED] wildlife: %d authoritative record(s), session generation %u\n", pcwld_active_count(), (unsigned)pcwld_session_generation());
+        for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+            if (pcwld_get_by_slot(i, &r)) {
+                pc_ded_print_wl(&r);
+            }
+        }
+    } else if (pc_ded_stricmp(sub, "info") == 0) {
+        if (!pc_ded_parse_num(rest, &id) || id <= 0) {
+            pc_ded_printf("usage: wildlife info <id>\n");
+        } else if (!pcwld_find_by_id((uint32_t)id, &r)) {
+            pc_ded_printf("WILDLIFE FAILED: no authoritative record with id %lu (see `wildlife list`)\n", id);
+        } else {
+            pc_ded_printf("[DEDICATED] wildlife record:\n");
+            pc_ded_print_wl(&r);
+        }
+    } else if (pc_ded_stricmp(sub, "spawn") == 0 || pc_ded_stricmp(sub, "despawn") == 0) {
+        const int spawn = pc_ded_stricmp(sub, "spawn") == 0;
+        if (!pc_test_hooks_enabled()) {
+            pc_ded_printf("WILDLIFE %s REFUSED: test-only command; needs a test-hook build and AC_TEST_HOOKS=1 (nothing changed)\n", spawn ? "SPAWN" : "DESPAWN");
+        } else if (!pc_net_game_dedicated_world_ready()) {
+            pc_ded_printf("WILDLIFE FAILED: the world is not ready yet\n");
+        } else if (spawn) {
+            char kind[16] = { 0 }, sp[24] = { 0 };
+            float x = 0.0f, z = 0.0f;
+            if (sscanf(rest, "%15s %23s %f %f", kind, sp, &x, &z) != 4 || pc_ded_stricmp(kind, "fish") != 0) {
+                pc_ded_printf("usage: wildlife spawn fish <seabass|snapper|coelacanth|jellyfish|knifejaw|whale|salmon2|N> <x> <z>   (bugs: UNSUPPORTED, there is no host bug-injection path)\n");
+            } else if (!(x > -1.0f && x < 3200.0f && z > -1.0f && z < 3840.0f)) { /* NaN / inf compare false; the town is 5 x 6 acres of 640 */
+                pc_ded_printf("WILDLIFE SPAWN FAILED: coordinates outside the town (x 0..3200, z 0..3840) or not a number\n");
+            } else if (pc_ded_fish_species(sp) < 0) {
+                pc_ded_printf("WILDLIFE SPAWN FAILED: unknown fish species '%s'\n", sp);
+            } else {
+                const uint32_t nid = pcwld_test_host_inject(pc_ded_fish_species(sp), x, z);
+                if (nid != 0u) {
+                    pc_ded_printf("WILDLIFE SPAWN: fish species %d created as authoritative record %u at (%.1f, %.1f)\n", pc_ded_fish_species(sp), (unsigned)nid, (double)x, (double)z);
+                } else {
+                    pc_ded_printf("WILDLIFE SPAWN FAILED: the host refused the injection (no field scene, no usable spot, or the table / actor pool is full)\n");
+                }
+            }
+        } else if (!pc_ded_parse_num(rest, &id) || id <= 0) {
+            pc_ded_printf("usage: wildlife despawn <id>\n");
+        } else if (pcwld_test_host_release((uint32_t)id)) {
+            pc_ded_printf("WILDLIFE DESPAWN: record %lu released (clients despawn it)\n", id);
+        } else {
+            pc_ded_printf("WILDLIFE DESPAWN FAILED: no record with id %lu\n", id);
+        }
+    } else if (pc_ded_stricmp(sub, "sync") == 0) {
+        pc_ded_printf("WILDLIFE SYNC UNSUPPORTED: wildlife state streams automatically (5 Hz) and a (re)connecting client gets the full table; there is no manual trigger. See `wildlife list`.\n");
+    } else {
+        pc_ded_printf("usage: wildlife list | info <id> | spawn fish <species> <x> <z> | despawn <id>\n");
+    }
+    pc_ded_flush();
+}
+
+static void pc_ded_cmd_test(char* args) {
+    args = pc_ded_skip_ws(args);
+    if (args != NULL && pc_ded_stricmp(args, "help") == 0) {
+        pc_ded_printf("[DEDICATED] test hooks: behaviour-changing commands (wildlife spawn / despawn) and the --force-* / --*-test-* flags need a test-hook build (-DPC_TEST_HOOKS=ON) AND AC_TEST_HOOKS=1.\n"
+                      "  Read-only commands (where, net, time, event list/status, wildlife list/info, items) always work. A refused command prints the reason and changes nothing.\n");
+    } else {
+        pc_ded_printf("[DEDICATED] test status: hooks %s\n", pc_test_hooks_enabled() ? "ENABLED (test-hook build and AC_TEST_HOOKS=1)" : "DISABLED (not a test-hook build, or AC_TEST_HOOKS is not 1)");
+    }
+    pc_ded_flush();
+}
+
 static void pc_ded_cmd_stop(void) {
     if (s_stop_requested) {
         pc_ded_printf("[DEDICATED] already stopping...\n");
@@ -1509,6 +2312,21 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_items(args);
     } else if (strcmp(cmd, "give") == 0) {
         pc_ded_cmd_give(args);
+    } else if (strcmp(cmd, "where") == 0) {
+        pc_ded_cmd_where(args);
+    } else if (strcmp(cmd, "net") == 0) {
+        pc_ded_cmd_net(args);
+    } else if (strcmp(cmd, "time") == 0) {
+        pc_ded_cmd_time(args);
+    } else if (strcmp(cmd, "event") == 0) {
+        pc_ded_cmd_event(args);
+    } else if (strcmp(cmd, "wildlife") == 0) {
+        pc_ded_cmd_wildlife(args);
+    } else if (strcmp(cmd, "test") == 0) {
+        pc_ded_cmd_test(args);
+    } else if (strcmp(cmd, "tp") == 0 || strcmp(cmd, "bell") == 0) {
+        pc_ded_printf("%s UNSUPPORTED on the dedicated server: %s\n", cmd, strcmp(cmd, "tp") == 0 ? "it has no local player, and a remote player's movement is owned by that client (the host never moves it)" : "bells are per-player save data with no host-side admin API in this build; use `give` for items");
+        pc_ded_flush();
     } else if (strcmp(cmd, "save") == 0) {
         if (s_save_pending) {
             pc_ded_printf("[DEDICATED] save: already requested (waiting for the next safe point)\n");

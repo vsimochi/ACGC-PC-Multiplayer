@@ -1228,6 +1228,10 @@ int pc_net_game_request_snowman_break(int ut_x, int ut_z);
 int pc_net_game_authoritative_wildlife_enabled(void);
 /* CLIENT: the host is connected and currently NOT in its town scene (indoors); see pc_net_game.c. */
 int pc_net_game_host_out_of_town(void);
+/* TEST-ONLY diagnostics (env AC_TEST_GYROID_DIAG=1 with the test hooks): logs the life of the per-house "save gyroid" prop actors (ac_haniwa.c, spawned by ac_birth_control.c from the field tiles
+ * ACTOR_PROP_HANIWA0..3). `what` = "spawn-request" / "ct" / "dt"; reason = which birth-control path asked for the spawn (spawn-request only); npc_id = the actor's / tile's prop id; fg_tile = the field tile value at the actor's
+ * position at that moment (0xFFFE = no tile). spawn-request also lists the already-live gyroids of the same prop. Pure logging, nothing is changed. */
+void pc_net_game_gyroid_diag(const char* what, const char* reason, const void* actor, unsigned npc_id, float x, float z, int bx, int bz, unsigned fg_tile);
 
 /* HOST: the connected players the wildlife AI must consider (position, heading, dash / tool use from the newest MOVE sample), in the town scene only. See pc_wildlife_authority.h. */
 int pc_net_game_wildlife_remote_players(PcWldRemotePlayer* out, int max);

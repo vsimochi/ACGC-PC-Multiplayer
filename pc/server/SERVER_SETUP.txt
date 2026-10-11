@@ -1,0 +1,53 @@
+Animal Crossing Multiplayer - running a dedicated server on Windows   (UNOFFICIAL fan project, not affiliated with or endorsed by Nintendo)
+
+A dedicated server hosts the town without anyone playing on it: your friends join, you can leave the window running. Everyone must run the SAME game release as the server.
+
+WHAT YOU NEED
+- The game folder you already use (ACLauncher.exe, AnimalCrossing.exe, the "rom" folder with your own game disc image - see INSTALL.txt).
+- These three files in that SAME folder, next to ACLauncher.exe:  Start Server.bat   server_config.ini   server_starter.ps1
+- Windows 10 or 11 (PowerShell, which is part of Windows, runs the settings check). Nothing else to install.
+
+START THE SERVER
+1. Open server_config.ini with Notepad. Every setting is explained right above it. The defaults are fine for a server among friends: just save the file if you change nothing.
+2. Double-click  Start Server.bat.
+3. It checks the settings first. If something is wrong it says WHICH setting and why, and the server is not started: fix the file and run it again.
+4. The server opens its own console window called "Animal Crossing dedicated server console". The starter window stays open so you can read what happened; press a key to close it (the server keeps running).
+
+FIRST START - THE SERVER ASKS QUESTIONS (answer them in the SERVER window)
+- If an older single-player/host save exists in save\card_a, the server asks:  [1] Use this town  /  [2] Generate new town.  Nothing is chosen for you and nothing is copied or overwritten until you answer. Choosing 1 copies the old town into the server (the original is left untouched).
+- If the server has no town yet, it asks for the TOWN NAME (1-8 characters).
+- The server_config.ini file does NOT contain a town name or these answers: they are asked once, the first time. Automatic answers are deliberately not offered: a wrong automatic answer could replace the wrong town. (If the console input is closed the server refuses to pick a legacy town, and for a brand-new server falls back to a default town name.)
+- Your town is stored under  servers\default\  (town save, residents, guests, logs\server.log, backups). Back that folder up now and then.
+
+STOP THE SERVER
+- Type  stop  in the server window and press Enter. The server saves the town first. Do not just close the window or shut the computer down while it runs.
+- Other commands (status, players, save, ...): type  help  in the server window; see docs\console-commands.md.
+
+CHANGE SETTINGS
+- Edit server_config.ini, save, then STOP the server (above) and run Start Server.bat again. Settings are read only when the server starts; changing the file while it runs does nothing.
+- interest_management and guest_memory_mb have no command-line switch, so Start Server.bat writes them into the game's own settings.ini ([Network] section) each time it starts. It changes only those lines (plus town_serve / personal_sync when they are "auto", so an old value cannot stay behind) and leaves everything else in settings.ini alone. The other settings are given to the game on its command line; a value in settings.ini for the same setting is overridden by it, so do not look for those in settings.ini.
+- Do not start the game by other means (ACLauncher.exe --host ...) at the same time as the server from the same folder: the starter refuses to start while a game from this folder is running.
+- Starting the game by hand with options still works exactly as before (for example  ACLauncher.exe --host 7777 --dedicated ). Start Server.bat is only a safer way to do it.
+
+LET FRIENDS CONNECT
+1. WINDOWS FIREWALL: allow inbound UDP on your port (default 7777) for AnimalCrossing.exe. The first time Windows asks "allow access?", choose Private networks (and Public only if you must). Or, in an Administrator command prompt:
+     netsh advfirewall firewall add rule name="AC Multiplayer Server" dir=in action=allow protocol=UDP localport=7777
+   (use your port number if you changed it). The game does not change firewall settings for you.
+2. ROUTER (only for friends outside your home network): in your router's settings add a UDP port forward: external UDP port 7777 -> your computer's local address, UDP port 7777. Give the computer a fixed local address (a DHCP reservation) so the forward keeps working. Some internet providers share one public address between customers (CGNAT); then port forwarding cannot work and you need a VPN/relay service.
+3. TELL FRIENDS YOUR ADDRESS: on a home network use the computer's local address (ipconfig, "IPv4 Address"); over the internet use your public IP address or a DNS name that points at it, plus the port, for example  203.0.113.5:7777.
+4. FRIENDS CONNECT in the game: title screen -> "Play Online" -> add a server (name, address, port) -> pick or create a character -> connect. Or start ACLauncher.exe --connect 203.0.113.5:7777.
+- Only host games with people you trust; the original game was not designed with network security in mind. Treat resident_tokens (see server_config.ini) as a convenience lock, not strong security.
+
+UPDATES
+- check_updates = 0 (default) lets the server start unattended. Update by hand when a new release is published (UPDATING.txt) and tell your friends: a client with a different release is refused.
+- Back up the  save  and  servers  folders before updating.
+
+IF IT DOES NOT START
+- Read the red message in the starter window first (it names the setting or file).
+- "did not start or did not stay running": see updater.log and servers\default\logs\server.log in the game folder; make sure no other program uses the UDP port and no other copy of the game from this folder is running.
+- Anti-virus / SmartScreen may warn about the unsigned game files (see INSTALL.txt).
+
+KNOWN LIMITATIONS
+- Settings are read once at start; there is no reload. The server console window is separate from the starter window by design (the game is a windowed program and opens its own console so keyboard input goes only to it).
+- The first-start questions must be answered by a person.
+- Start Server.bat does not install a Windows service and does not restart the server after a crash.

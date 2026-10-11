@@ -80,3 +80,6 @@ pc/tools/net_spike/ant_repeat.txt
 pc/tools/net_spike/bench_*_baseline.txt
 pc/ws_clean_build*.txt
 pc/routine_build.txt
+pc/tools/net_spike/gyroid_*.txt
+pc/gyroid_start*.txt
+pc/tools/net_spike/m_*.txt

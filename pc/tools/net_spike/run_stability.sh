@@ -2,7 +2,7 @@
 # Repeated real-game acceptance runs against ONE frozen executable (Samsung display, volume 1). One line per step in stab_summary.txt, full output in stab_<name>.txt.
 # Every step is bounded by `timeout` (a stalled test is stopped, and only the game processes of the test fixture directory are killed -- never another game); the fixture is refreshed ONCE.
 # Usage: bash run_stability.sh [proxy_reps] [sim_reps]     (defaults 5 and 3)
-export PATH=/c/msys64/ucrt64/bin:$PATH AC_DISPLAY_NAME=samsung AC_MASTER_VOLUME=1
+export PATH=/c/msys64/ucrt64/bin:$PATH AC_DISPLAY_NAME=samsung AC_MASTER_VOLUME=${AC_MASTER_VOLUME:-0}
 cd "$(dirname "$0")"
 PROXY_REPS=${1:-5}
 SIM_REPS=${2:-3}

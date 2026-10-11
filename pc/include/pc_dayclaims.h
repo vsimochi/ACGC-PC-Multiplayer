@@ -30,6 +30,9 @@ void pc_dayclaims_free(PCDayClaims* c);
 int  pc_dayclaims_has(const PCDayClaims* c, const void* key, uint32_t day);  /* 1 = this key claimed on exactly `day` */
 int  pc_dayclaims_mark(PCDayClaims* c, const void* key, uint32_t day);       /* 1 = recorded (earlier days swept); 0 = full / out of memory (nothing changed for others) */
 int  pc_dayclaims_count(const PCDayClaims* c);
+int  pc_dayclaims_save(const PCDayClaims* c, const char* path, uint32_t magic); /* 1 = written atomically (pc_tabfile), 0 = failed */
+int  pc_dayclaims_load(PCDayClaims* c, const char* path, uint32_t magic);       /* 1 = loaded (the table was replaced), 0 = no file, -1 = unreadable / corrupt (the table is untouched) */
+int  pc_dayclaims_has_room(const PCDayClaims* c, uint32_t day);              /* 1 = a mark for a NEW key on `day` would succeed (claims of earlier days are swept by a mark, so only today's count against the cap) */
 
 #ifdef __cplusplus
 }

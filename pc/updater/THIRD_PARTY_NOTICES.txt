@@ -1,0 +1,23 @@
+Animal Crossing Multiplayer - third-party notices (Beta 0.1.0)
+
+UNOFFICIAL fan project. Not affiliated with, authorised or endorsed by Nintendo. No game disc image and no intentionally bundled extracted game data are in this package: you must supply your own legally obtained USA (GAFE01_00) disc image. That does NOT settle every licensing question about the compiled program - see the section "Unresolved" below and THIRD_PARTY_NOTICES.md in this folder (the full per-component table with evidence and statuses).
+
+Licence texts shipped in this folder (verification sources: SOURCES.txt). This is an information list, not legal advice.
+
+1. Animal Crossing decompilation (ACreTeam/ac-decomp): labelled CC0 1.0 Universal by its authors; the PC port layer (pc/ and TARGET_PC changes) is MIT. See ..\LICENSE (the inherited file, unchanged). CC0 does not clear rights that Nintendo or other third parties may hold.
+2. SDL2 (SDL2.dll, 2.32.10, https://libsdl.org) - zlib license: SDL2-LICENSE.txt
+3. FIX94 fixNES (NES emulator core, compiled into AnimalCrossing.exe) - MIT: fixnes-LICENSE.txt
+4. glad 2.0.8 generated OpenGL 3.3 core loader (compiled in). The generated files declare "SPDX-License-Identifier: (WTFPL OR CC0-1.0) AND Apache-2.0"; the Apache-2.0 part concerns the Khronos OpenGL registry material: Apache-2.0.txt
+5. Khronos KHR/khrplatform.h (compiled in via glad) - permission notice reproduced verbatim from the file header: Khronos-khrplatform-NOTICE.txt
+6. MinGW-w64 winpthreads (statically linked) - winpthreads-COPYING.txt
+7. GCC runtime libraries libgcc / libstdc++ (statically linked) - GPLv3 with the GCC Runtime Library Exception 3.1: gcc-COPYING.RUNTIME.txt and GPL-3.0-gcc-COPYING3.txt (both from the MSYS2 gcc 16.2.0-4 package; whether the GPL text is required is an open question, shipped as the conservative choice).
+8. xxHash (BSD-2-Clause, Yann Collet): xxHash-LICENSE.txt - shipped as a PRECAUTION. The XXHash64 function in pc_texture_pack.c has no recorded provenance; this package does not claim it is derived from xxHash and does not claim it is not.
+9. zlib 1.3.2 (statically linked into ACLauncher.exe only) - zlib-LICENSE.txt
+
+Unresolved (not cleared; details in THIRD_PARTY_NOTICES.md):
+- Whether the compiled program may be redistributed given the SGI/Nintendo-marked SDK headers (include/PR/*.h) whose macros are compiled in, and the reconstructed Nintendo libraries and data tables (JSystem, jaudio_NES, Famicom, libforest/emu64, libc64/libu64, src/data) compiled into AnimalCrossing.exe.
+- Licence terms of contributions by Cuyler36 and oprel to files outside the licence's stated scope, and of this fork's edits to decompiled files outside TARGET_PC blocks.
+- The multiplayer additions have no licence statement of their own yet (proposed: the same MIT terms as pc/, to be confirmed by the repository owner).
+- The executable uses a generic icon created for this project (no third-party artwork); the previous icon's provenance is unconfirmed and it is not used.
+
+"Animal Crossing" and all original game data are property of Nintendo. You must supply your own legally obtained disc image.

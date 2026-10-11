@@ -1,9 +1,9 @@
 #!/bin/bash
-# ROUTINE validation, hard budget 18 minutes (leaves 2 of the 20 for the summary), Samsung display, volume 1. One line per step in routine_summary.txt, full output in routine_<step>.txt.
+# ROUTINE validation, hard budget 18 minutes (leaves 2 of the 20 for the summary), Samsung display, volume from AC_MASTER_VOLUME (default 0). One line per step in routine_summary.txt, full output in routine_<step>.txt.
 # Steps run in RISK order. A step is only STARTED when its estimated duration still fits in the remaining budget (otherwise "NOT RUN (budget)"), and its `timeout` is capped by the remaining
 # budget, so the total can never exceed the budget; a timed-out step keeps its log. Nothing is retried, no assertion is skipped: the tests are the same ones as in the extended tier.
 # Estimates are the measured durations of the last extended run (see TODO.md "Validation tiers"). Usage: bash run_routine.sh [budget_seconds=1080]
-export PATH=/c/msys64/ucrt64/bin:$PATH AC_DISPLAY_NAME=samsung AC_MASTER_VOLUME=1
+export PATH=/c/msys64/ucrt64/bin:$PATH AC_DISPLAY_NAME=samsung AC_MASTER_VOLUME=${AC_MASTER_VOLUME:-0}
 cd "$(dirname "$0")"
 BUDGET=${1:-1080}
 T0=$(date +%s)

@@ -21,6 +21,19 @@ Not planned. Putting aside the amount of work needed to include multiplayer, the
 original game was never designed with network security in mind. Adding online play
 onto that would be a likely security nightmare.
 
+*(This answer is the original port author's and describes the original port. This
+multiplayer fork does add host/client and dedicated-server play as an unofficial,
+beta-quality extension; it has not been endorsed by the original port's author, and
+the security concern above still applies: only play with people you trust.)*
+
+## Is this fork official, and does it include the game?
+
+No. It is an unofficial fan project, not affiliated with or endorsed by Nintendo. The
+download contains no game disc image and no intentionally bundled extracted game data;
+you must provide your own legally obtained USA (GAFE01_00) disc image. That requirement
+does not by itself settle every licensing question about the compiled program; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Does it work on Linux / Steam Deck?
 
 The Windows binary runs under Proton/Wine and seems to work fine from what I've

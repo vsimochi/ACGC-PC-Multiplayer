@@ -2147,6 +2147,23 @@ static int pcwld_test_no_indoor_hold(void) {
     return on;
 }
 
+/* TEST-ONLY (autopilot `wldstate`): the stored host target of an entity, fresh or stale. 1 = there is one. */
+int pcwld_test_get_target(uint32_t entity_id, float* x, float* z) {
+    int i;
+    for (i = 0; i < PCWLD_PUBLIC_MAX_ENTITIES; i++) {
+        if (s_target[i].used && s_target[i].e.entity_id == entity_id) {
+            if (x != NULL) {
+                *x = s_target[i].e.x;
+            }
+            if (z != NULL) {
+                *z = s_target[i].e.z;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const PcWldTarget* pcwld_find_target(uint32_t entity_id) {
     int i;
     const uint32_t now = pc_net_game_now_ms();
