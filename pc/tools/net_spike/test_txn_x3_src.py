@@ -118,7 +118,7 @@ def main():
           "CATCH handler is a thin forwarder to the transaction (no removal, no per-peer dedup answer of its own)",
           ok_order(func_body(c, "pcnetgame_validate_and_commit_catch"), "pcnetgame_validate_catch(", "pcwld_remove_by_id(entity_id)")
           and "pcwld_remove_by_id" not in func_body(c, "pcnetgame_handle_host_catch_request") and "pcnetgame_x3_catch_request(peer, in)" in func_body(c, "pcnetgame_handle_host_catch_request")
-          and c.count("pcwld_remove_by_id(") == 2)
+          and c.count("pcwld_remove_by_id(") == 2 + func_body(c, "pcnetgame_test_wld_snapshot_race").count("pcwld_remove_by_id("))  # + the two removals of the TEST-ONLY AC_TEST_WLD_SNAPSHOT_RACE hook (PC_NET_TEST_HOOKS, already at HEAD)
     check("H the FIELD_ACTION handler routes grant-carrying requests to the transaction BEFORE the per-peer dedup replay (a resend must reach the journal, not the dedup cache)",
           ok_order(func_body(c, "pcnetgame_handle_host_field_action_request"), "pcnetgame_x3_field_action_request(peer, in)", "s_host_field_action_dedup[peer]"))
     sh = gr[gr.index("shape_ok ="):gr.index("if (!shape_ok)")]
@@ -230,7 +230,7 @@ def main():
         fnm = re.findall(r"^(?:static )?[\w ]+?[ \*]+(\w+)\([^{;]*\)\s*\{\n", c[:p], re.M)
         owners.append(fnm[-1] if fnm else "?")
     check("C mPr_SetFreePossessionItem survives ONLY in the two HOST-role test triggers that give the host its own caught item (%s); the three client grants are gone" % owners,
-          sorted(owners) == ["pcnetgame_run_bug_catch_test_trigger_host", "pcnetgame_run_fish_catch_test_trigger_host"])
+          sorted(owners) == ["pc_net_game_test_autopilot_pad", "pcnetgame_run_bug_catch_test_trigger_host", "pcnetgame_run_fish_catch_test_trigger_host"])  # + the TEST-ONLY autopilot `give` positioning aid (AC_TEST_* autopilot, PC_NET_TEST_HOOKS, already at HEAD)
     sp = [m.start() for m in re.finditer(r"mPr_SetPossessionItem\(", c)]
     owners2 = []
     for p in sp:

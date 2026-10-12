@@ -795,6 +795,8 @@ static void aNPC_pc_host_held_position_move(ACTOR* actorx) {
 
     actorx->speed = 0.0f;
     nactorx->movement.speed.max_speed = 0.0f;
+    actorx->status_data.collision_vec.x = 0.0f; /* a villager a client is talking to is never shoved (host player OC push dropped) */
+    actorx->status_data.collision_vec.z = 0.0f;
     aNPC_position_move(actorx);
     nactorx->movement.speed.max_speed = saved_max;
     {   /* Patch 8: conversation facing -- the held villager turns toward the player that owns the lease (the host's own player is handled by the vanilla talk) */
@@ -888,7 +890,8 @@ static int s_th_listen_logged = 0;
 static u32 s_th_last_frame = 0xFFFFFFFF;
 static int s_th_other_logs = 0;
 static int s_th_pulse_logs = 0;
-static int s_th_hold_ms = -1;      /* PC_FORCE_TALK_HOLD_SECONDS (test-only, default 0): keep the dialogue open this long */
+static int s_th_delay = -1;        /* PC_FORCE_TALK_DELAY_FRAMES (test-only, default 0) */
+static int s_th_hold_ms = -1;     /* PC_FORCE_TALK_HOLD_SECONDS (test-only, default 0): keep the dialogue open this long */
 static u32 s_th_hold_t0 = 0;
 
 static void aNPC_pc_talk_hook_check_inventory(void) {
@@ -976,7 +979,11 @@ static void aNPC_pc_talk_hook(NPC_ACTOR* nactorx, GAME_PLAY* play, int consumer)
         if (s_slot_env >= 0 && nactorx->npc_info.animal != NULL && aNPC_get_animal_idx(nactorx) != s_slot_env) {
             return;
         }
-        if (frame - s_th_first < 600 || nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0 ||
+        if (s_th_delay < 0) {
+            const char* e = getenv("PC_FORCE_TALK_DELAY_FRAMES"); /* test-only (worker 7): extra frames before the host hook starts (a pause can be set first); default 0 = unchanged */
+            s_th_delay = (e != NULL && atoi(e) > 0) ? atoi(e) : 0;
+        }
+        if (frame - s_th_first < (u32)(600 + s_th_delay) || nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0 ||
             nactorx->condition_info.hide_flg || nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE ||
             main_idx != mPlayer_INDEX_WAIT) {
             return;
@@ -1354,6 +1361,49 @@ static void aNPC_actor_move_hide(ACTOR* actorx, GAME* game) {
     aNPC_check_feel_tim(nactorx);
 }
 
+#ifdef TARGET_PC
+extern int pc_remote_player_host_npc_push(GAME* game, const ACTOR* npc, float npc_radius, float npc_offset, float npc_height,
+                                          int npc_pipe_flags0, float* out_dx, float* out_dz); /* pc_remote_player.c */
+
+/* HOST only: remote players (puppets) push synchronized villagers. The puppet's OC pipe pairs only with the local player, so
+ * without this a client walking into a villager never moved it on the host, and the client's own local push is overwritten by
+ * the host pose every frame (the villager acted as an unmovable wall). Adds to collision_vec exactly what the vanilla OC pass
+ * would add for a real player pipe at each eligible puppet (pc_remote_player_host_npc_push); aNPC_position_move() then applies
+ * it and aNPC_BGcheck() corrects walls/water, and the new pose reaches clients through NPC_MOVE. Never for a villager that is
+ * talking (host's own talk) or held for a client talk (that path does not call this), or that skips OC this frame. */
+static void aNPC_pc_host_puppet_push(NPC_ACTOR* nactorx, GAME* game) {
+    static int s_diag = -1;
+    float dx, dz;
+    int n;
+
+    if (pc_net_game_role() != PC_NETGAME_ROLE_HOST || nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0) {
+        return;
+    }
+    if (nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK ||
+        (nactorx->condition_info.demo_flg & aNPC_COND_DEMO_SKIP_OBJ_COL_CHECK) != 0) {
+        return;
+    }
+    n = pc_remote_player_host_npc_push(game, &nactorx->actor_class, (float)nactorx->collision.pipe.attribute.pipe.radius,
+                                       (float)nactorx->collision.pipe.attribute.pipe.offset,
+                                       (float)nactorx->collision.pipe.attribute.pipe.height,
+                                       (int)nactorx->collision.pipe.collision_obj.collision_flags0, &dx, &dz);
+    if (n <= 0) {
+        return;
+    }
+    nactorx->actor_class.status_data.collision_vec.x += dx;
+    nactorx->actor_class.status_data.collision_vec.z += dz;
+    if (s_diag < 0) {
+        const char* e = getenv("PC_NPC_PUSH_DIAG");
+        s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    if (s_diag && (game->frame_counter % 10) == 0) {
+        printf("[NPC][PUPPET_PUSH] slot=%d contacts=%d push=(%.2f,%.2f) pos=(%.2f,%.2f)\n", aNPC_get_animal_idx(nactorx), n,
+               (double)dx, (double)dz, (double)nactorx->actor_class.world.position.x,
+               (double)nactorx->actor_class.world.position.z);
+    }
+}
+#endif
+
 static void aNPC_actor_move_show_before(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
 
@@ -1371,6 +1421,9 @@ static void aNPC_actor_move_show_before(ACTOR* actorx, GAME* game) {
     } else
 #endif
     {
+#ifdef TARGET_PC
+        aNPC_pc_host_puppet_push(nactorx, game); /* HOST only: remote players push villagers (no-op otherwise) */
+#endif
         aNPC_position_move(actorx);
     }
     aNPC_BGcheck(nactorx, actorx);

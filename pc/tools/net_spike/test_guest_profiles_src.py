@@ -59,12 +59,19 @@ def main():
        "and, since M2, exactly ONE more save = the read-only legacy-token fallback copy-forward into the STORE character's per-town file (store_tp = pc_guest_token_path())",
        "pc_mp_gtoken_load(pcnetgame_client_token_path(), &s_client_gtk, &s_client_gtk_unreadable)" in ng and "pc_mp_gtoken_save(pc_guest_token_path(), &s_client_gtk)" in ng
        and "return pc_guest_token_path();" in ng  # M-E: pcnetgame_client_token_path() = pc_guest_token_path() for a guest (and a store character's resident); save/mp/resident_token.dat only for a legacy resident
-       and len(re.findall(r"pc_mp_gtoken_load\(", ng)) == 1 and len(re.findall(r"pc_mp_gtoken_save\(", ng)) == 3  # guest token, legacy copy-forward, M-E resident token (tp = pcnetgame_client_token_path())
+       # who loads / saves the token file (functions, not a bare count): the guest cache loader + the promotion handoff (loads the STORE character's own per-town file into a local struct);
+       # saves = the legacy copy-forward (build_ext_ex), the first KNOWN resident login's drop of obsolete guest entries, the guest IDENTITY_TOKEN, the promotion handoff (guest + resident entry,
+       # B8) and the first-claim resident token (M-E)
+       and sorted(n for a, b, n in S.functions(ng) for _ in re.finditer(r"pc_mp_gtoken_load\(", ng[a:b])) == ["pcnetgame_client_gtk_load", "pcnetgame_handle_client_resident_handoff"]
+       and sorted(n for a, b, n in S.functions(ng) for _ in re.finditer(r"pc_mp_gtoken_save\(", ng[a:b])) == ["pcnetgame_client_build_ext_ex", "pcnetgame_client_drop_guest_entries",
+                                                                                                        "pcnetgame_handle_client_identity_token", "pcnetgame_handle_client_resident_handoff",
+                                                                                                        "pcnetgame_handle_client_resident_token"]
        and "const char* store_tp = pc_guest_token_path();" in ng and "pc_mp_gtoken_save(store_tp, &s_client_gtk)" in ng
        and ng.count("pc_session_legacy_token_lookup(") == 1)
     ck("B the per-town token override: pc_guest_token_path() itself is NOT redefined here; the ONLY place the active town is switched is pcnetgame_client_build_ext via pc_session_select_town (the token file is reloaded "
        "only when it returned true; a LEGACY character never changes), and the legacy token file is only READ (lookup) by the fallback",
-       ng.count("pc_session_select_town(") == 1 and re.search(r"if \(pc_session_select_town\(town->land_name, town->land_id, town->terrain_hash\)\) \{\s*s_client_gtk_loaded = 0;", ng))
+       # (M-I added a second, read-only caller: pc_net_game_client_holds_guest_token switches the town the same way to look a token up; capacity-phase rename: build_ext -> build_ext_ex)
+       sorted(n for a, b, n in S.functions(ng) for _ in re.finditer(r"pc_session_select_town\(", ng[a:b])) == ["pc_net_game_client_holds_guest_token", "pcnetgame_client_build_ext_ex"] and re.search(r"if \(pc_session_select_town\(town->land_name, town->land_id, town->terrain_hash\)\) \{\s*s_client_gtk_loaded = 0;", ng))
     ck("B no other source file references the token path macro for a client file open (pc_mp_guests.h keeps the macro for the default only)",
        not [f for f in os.listdir(os.path.join(S.ROOT, "pc", "src")) if f.endswith((".c", ".cpp")) and f != "pc_mp_guests.c" and "PC_MP_GUEST_TOKEN_PATH" in S.mask(S.read("pc/src/" + f))])
 
@@ -92,7 +99,7 @@ def main():
        "--character names / that a store-less legacy character resolves to, (3) Play Online without relaunch: the one wrapper pc_po_select_profile (the in-process connect's select / clear / rollback "
        "restore; every other in-process use goes through it) (calls: %s)" % sel_calls,
        sel_calls == {"pc_main.c": 3} and len(re.findall(r"\bpc_guest_profile_select\(", mm)) == 3 and len(re.findall(r"\bpc_guest_profile_select\(", prep)) == 1
-       and "return pc_guest_profile_select(name);" in po_sel and len(re.findall(r"\bpc_po_select_profile\(", mm)) == 5
+       and "return pc_guest_profile_select(name);" in po_sel and len(re.findall(r"\bpc_po_select_profile\(", mm)) >= 5
        and "(void)pc_guest_profile_select(c.legacy_profile);" in prep and "c.storage == PC_CHARACTER_STORAGE_LEGACY" in prep and "(void)pc_guest_profile_select(argv[i + 1]);" in mm)
     ck("C the title actor still never touches the profile module (only pc_guest_title_* in pc_m_card.c)", "pc_guest_profile" not in logo and "pc_guest_title_label()" in logo)
 

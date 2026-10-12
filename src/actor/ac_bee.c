@@ -7,6 +7,9 @@
 #include "m_player_lib.h"
 #include "m_common_data.h"
 #include "ac_set_ovl_insect.h"
+#ifdef TARGET_PC
+#include "pc_bee_sync.h" /* multiplayer: owner lifecycle report + cosmetic observer proxy (PRESENTATION ONLY) */
+#endif
 
 enum {
     aBEE_ACT_APPEAR,
@@ -22,6 +25,12 @@ enum {
 static void aBEE_actor_ct(ACTOR* actorx, GAME* game);
 static void aBEE_actor_move(ACTOR* actorx, GAME* game);
 static void aBEE_actor_draw(ACTOR* actorx, GAME* game);
+#ifdef TARGET_PC
+static void aBEE_actor_dt(ACTOR* actorx, GAME* game);
+#define aBEE_DT_PROC &aBEE_actor_dt
+#else
+#define aBEE_DT_PROC mActor_NONE_PROC1
+#endif
 
 // clang-format off
 ACTOR_PROFILE Bee_Profile = {
@@ -32,7 +41,7 @@ ACTOR_PROFILE Bee_Profile = {
     ACTOR_OBJ_BANK_BEE,
     sizeof(BEE_ACTOR),
     &aBEE_actor_ct,
-    mActor_NONE_PROC1,
+    aBEE_DT_PROC,
     &aBEE_actor_move,
     &aBEE_actor_draw,
     NULL,
@@ -40,6 +49,14 @@ ACTOR_PROFILE Bee_Profile = {
 // clang-format on
 
 static void aBEE_setupAction(BEE_ACTOR* bee, int action, GAME* game);
+
+#ifdef TARGET_PC
+/* Owner-side lifecycle report (ignored unless this is the local bee reported at its spawn; inert in single player). */
+#define aBEE_PC_REPORT(actorx, ev) \
+    pc_bee_sync_local_event((actorx), (ev), (actorx)->world.position.x, (actorx)->world.position.y, (actorx)->world.position.z)
+#else
+#define aBEE_PC_REPORT(actorx, ev) ((void)0)
+#endif
 
 extern cKF_Skeleton_R_c cKF_bs_r_act_bee;
 extern cKF_Animation_R_c cKF_ba_r_act_bee;
@@ -57,8 +74,21 @@ static void aBEE_actor_ct(ACTOR* actorx, GAME* game) {
     bee->start_frame = 90.0f;
     bzero(&actorx->scale, sizeof(actorx->scale));
     actorx->mv_proc = &aBEE_actor_move; // @cleanup - this is unnecessary
+#ifdef TARGET_PC
+    if (pc_bee_sync_is_proxy(actorx)) {
+        actorx->state_bitfield &= ~ACTOR_STATE_NO_MOVE_WHILE_CULLED; /* a proxy always runs its move, so its cleanup checks always run */
+        { extern int g_pc_verbose; if (g_pc_verbose) printf("[NET][BEE] aBEE proxy ct ran (object bank loaded)\n"); }
+    }
+#endif
     aBEE_setupAction(bee, aBEE_ACT_APPEAR, game);
 }
+
+#ifdef TARGET_PC
+static void aBEE_actor_dt(ACTOR* actorx, GAME* game) {
+    (void)game;
+    pc_bee_sync_actor_gone(actorx); /* no-op in single player (nothing is ever registered there) */
+}
+#endif
 
 static f32 aBEE_calc_scale_sub(f32* scale_p, f32 target, f32 frac, f32 max_step) {
     return add_calc(scale_p, target, CALC_EASE(frac), max_step * 0.5f, 0.0f);
@@ -168,6 +198,7 @@ static void aBEE_fly(ACTOR* actorx, GAME* game) {
 
     aBEE_calc_fly_angle(actorx);
     if ((u32)bee == mPlib_Get_item_net_catch_label()) {
+        aBEE_PC_REPORT(actorx, PC_BEE_EV_CAUGHT);
         aBEE_setupAction(bee, aBEE_ACT_CAUGHT, game);
     } else if (actorx->shape_info.rotation.x <= DEG2SHORT_ANGLE2(22.5f)) {
         if (mPlib_check_player_actor_main_index_Pitfall(game)) {
@@ -180,6 +211,7 @@ static void aBEE_fly(ACTOR* actorx, GAME* game) {
                 case mPlayer_STATUS_FOR_BEE_ATTACK:
                     if (actorx->player_distance_xz < 30.0f) {
                         mPlib_request_main_stung_bee_type1(game);
+                        aBEE_PC_REPORT(actorx, PC_BEE_EV_STING);
                         aBEE_setupAction(bee, aBEE_ACT_ATTACK, game);
                         return;
                     }
@@ -257,6 +289,7 @@ static void aBEE_attack_wait(ACTOR* actorx, GAME* game) {
             case mPlayer_STATUS_FOR_BEE_ATTACK:
                 if (actorx->player_distance_xz < 30.0f) {
                     mPlib_request_main_stung_bee_type1(game);
+                    aBEE_PC_REPORT(actorx, PC_BEE_EV_STING);
                     aBEE_setupAction((BEE_ACTOR*)actorx, aBEE_ACT_ATTACK, game);
                 }
                 break;
@@ -307,6 +340,11 @@ static void aBEE_appear_init(BEE_ACTOR* bee, GAME* game) {
 
     xyz_t_move(&bee->size, &Size_data);
     bee->alpha = 0.0f;
+#ifdef TARGET_PC
+    if (pc_bee_sync_is_proxy(bee)) {
+        return; /* a cosmetic proxy never touches the local player's chase state */
+    }
+#endif
     Common_Set(player_bee_chase_flag, TRUE);
 }
 
@@ -319,6 +357,7 @@ static void aBEE_caught_init(BEE_ACTOR* bee, GAME* game) {
 }
 
 static void aBEE_disappear_init(BEE_ACTOR* bee, GAME* game) {
+    aBEE_PC_REPORT(&bee->actor_class, PC_BEE_EV_DISAPPEAR); /* no-op if CAUGHT was already reported */
     bee->actor_class.speed = 9.7f;
     bee->actor_class.shape_info.rotation.x = 0;
     bee->actor_class.shape_info.rotation.z = 0;
@@ -350,9 +389,54 @@ static void aBEE_setupAction(BEE_ACTOR* bee, int action, GAME* game) {
     (*init_proc[action])(bee, game);
 }
 
+#ifdef TARGET_PC
+/* Multiplayer observer proxy (PRESENTATION ONLY): orbits the owner's puppet instead of the local player.
+ * Uses only the pure helpers (appear / fly_move_common / disappear / anime); never the fly / attack procs,
+ * so it never calls mPlib_*, never requests a net catch and never stings the local player. */
+static void aBEE_proxy_move(ACTOR* actorx, GAME* game) {
+    BEE_ACTOR* bee = (BEE_ACTOR*)actorx;
+    float tx, ty, tz;
+    int alive = pc_bee_sync_proxy_target(actorx, &tx, &ty, &tz);
+
+    sAdo_OngenPos((u32)actorx, NA_SE_B0, &actorx->world.position);
+    if (!alive && bee->action != aBEE_ACT_DISAPPEAR) {
+        aBEE_setupAction(bee, aBEE_ACT_DISAPPEAR, game);
+    }
+    Actor_position_moveF(actorx);
+    if (bee->action == aBEE_ACT_DISAPPEAR) {
+        aBEE_disappear(actorx, game);
+    } else {
+        f32 dx = tx - actorx->world.position.x;
+        f32 dz = tz - actorx->world.position.z;
+
+        actorx->player_angle_y = atans_table(dz, dx);
+        actorx->player_distance_xz = sqrtf(dx * dx + dz * dz);
+        if (bee->action == aBEE_ACT_APPEAR) {
+            aBEE_appear(actorx, game);
+            bee->pos_y = ty + 50.0f;
+        } else {
+            bee->action = pc_bee_sync_proxy_stung(actorx) ? aBEE_ACT_ATTACK : aBEE_ACT_FLY; /* only selects the orbit tightness */
+            aBEE_calc_fly_angle(actorx);
+            if (actorx->shape_info.rotation.x <= DEG2SHORT_ANGLE2(22.5f)) {
+                aBEE_fly_move_common(bee, game);
+                bee->pos_y = ty + 50.0f + 5.0f * sin_s(bee->bobbing_counter);
+            }
+        }
+    }
+    aBEE_anime_proc(bee);
+    add_calc(&actorx->world.position.y, bee->pos_y, CALC_EASE(0.3f), 1.5f, 0.0f);
+}
+#endif
+
 static void aBEE_actor_move(ACTOR* actorx, GAME* game) {
     BEE_ACTOR* bee = (BEE_ACTOR*)actorx;
-    
+
+#ifdef TARGET_PC
+    if (pc_bee_sync_is_proxy(actorx)) {
+        aBEE_proxy_move(actorx, game);
+        return;
+    }
+#endif
     sAdo_OngenPos((u32)actorx, NA_SE_B0, &actorx->world.position);
     if ((actorx->world.position.x < 0.0f && actorx->world.position.z < 0.0f)) {
         // empty block, maybe for debug?

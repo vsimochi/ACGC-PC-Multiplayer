@@ -76,6 +76,9 @@ static int aNSM_check_safe_zone(NPC_SHOP_MASTER_ACTOR* shop_master, ACTOR* playe
 #define aNSC_ANIME_FILE "../src/actor/npc/ac_npc_shop_master_anime.c"
 #define aNSC_POS_Z_MAX 260.0f
 
+#ifdef TARGET_PC
+#define aNSC_PC_EXPORT_MAP_GRANT /* the ONE includer that defines the exported test-hook wrapper (ac_npc_shop_common.c is included by 5 actors) */
+#endif
 #include "../src/actor/npc/ac_npc_shop_common.c"
 
 #undef aNSC_get_zone

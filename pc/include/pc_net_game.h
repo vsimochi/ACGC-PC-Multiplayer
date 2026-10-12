@@ -684,6 +684,37 @@ int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item);
 int pc_net_game_ts_begin_police_claim(int pocket_slot, int police_idx, int item);
 int pc_net_game_ts_poll(void);
 
+/* Dresser storage (agent 12, TXN kind 18): the EXTRA pool of the bound resident on a host with the feature ON (see pc_net_game.c DRESSER blocks).
+ * available() is 0 for the host, solo play, an old host or a host with the feature off: the dresser UI then stays the vanilla 3-slot UI. begin as above
+ * (op 1 PUT pocket -> pool, pool_slot 0xFF = first free; op 2 TAKE pool -> pocket); poll = pc_net_game_ts_poll(). */
+#define PC_NETGAME_DRESSER_SLOTS 27 /* 6r (v3): all 27 cells of a dresser are host slots */
+int pc_net_game_dresser_available(void);
+int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr_item); /* v2: select a dresser of the own house; returns the generation, 0 = refused */
+int pc_net_game_dresser_view_ready(void); /* the host STATE of the current selection arrived */
+int pc_net_game_dresser_cell_has_extra(int floor, int layer, int ut_x, int ut_z, int ftr_item); /* Option A: 1 = that dresser holds extra items (no move / pickup) */
+void pc_net_game_dresser_move_denied(void); /* Option A refusal: pc_net_game_room_edit_notice() returns 3 for ~3 s */
+int pc_net_game_dresser_move_state(int floor, int layer, int ut_x, int ut_z, int ftr_item); /* 0 allowed, 1 holds extras, -1 unknown (refuse + ask) */
+int pc_net_game_dresser_cell_committed(int floor, int layer, int ut_x, int ut_z, int ftr_item); /* 1 in the host image, 0 not (uncommitted move), -1 unknown */
+int pc_net_game_dresser_open_gate(int floor, int layer, int ut_x, int ut_z, int ftr_item);      /* 0 open, 1 refuse for now (notice 4), -1 open -> vanilla */
+void pc_net_game_dresser_move_attempt(int action, int ftr_item, int ut_x, int ut_z); /* 6l diagnostics: ONE count per refused action attempt (1 pickup 2 pull 3 push 4 rotate) */
+unsigned pc_net_game_dresser_move_attempt_count(int action);                       /* 0 = all attempts; 1..4 = per action */
+int pc_net_game_dresser_last_block(void); /* 6p: notice kind of the latest refused extra-slot begin (5 = uncommitted room edits), 0 after a sent one */
+int  pc_net_game_dresser_pocket_storable(int slot); /* 6r: pocket holds a NORMAL storable item */
+int  pc_net_game_dresser_pocket_swap(int a, int b);  /* 6r: the plain local pocket move / swap of the grab (1 = done) */
+void pc_net_game_dresser_ui_notice(int kind); /* 6q: a dresser-screen notice (8 = the last 3 slots can only be taken out) */
+void pc_net_game_saving_notice(void);     /* 6p: notice 4 ("The room is being saved...") for ~3 s */
+void pc_net_game_dresser_move_wait(int uncommitted); /* 6l: move lock with an UNKNOWN state: notice 4 (cell not committed) / 6 (asking the host) / 2 */
+int pc_net_game_dresser_keep_lock(int floor, int layer, int ut_x, int ut_z, int ftr_item, int live_keep); /* 6l 27-slot lock: 0 free, 1 live keep items, 2 canonical keep items */
+void pc_net_game_dresser_room_visit(void);        /* the own-room actor was constructed (a new room visit) */
+unsigned int pc_net_game_dresser_visit(void);     /* the current room visit number */
+int pc_net_game_dresser_free_pocket(void);       /* the first free NORMAL pocket (-1 = none) */
+int pc_net_game_dresser_pocket_item(int slot);   /* the NORMAL item of that pocket, else 0 */
+int pc_net_game_dresser_item(int pool_slot);
+int pc_net_game_dresser_count(void);
+int pc_net_game_dresser_item_storable(int item);
+int pc_net_game_dresser_begin(int op, int pool_slot, int pocket_slot, int item);
+int pc_net_game_dresser_poll(void);
+
 /* Town services milestone 2 (NOOK'S SHOP): the client seams of a purchase / a sale. SHOP_BUY / SHOP_SELL are host transactions (TXN_COMMIT kind 10 / 11)
  * on the same machinery; the HOST computes the price / the sale value, validates the stock slot, pays, marks the stock sold and credits sales_sum. Only
  * ever called with pc_net_game_role() == PC_NETGAME_ROLE_CLIENT. begin return values as above.
@@ -1155,6 +1186,7 @@ int  pc_net_game_room_npc_follow(int scene_id, uint16_t owner, uint16_t npc_id, 
 int pc_net_game_room_test_talking(void);
 /* TEST-ONLY autopilot (AC_TEST_HOOKS=1, AC_TEST_AUTOPILOT=1; see pc_net_game.c): called by PADRead; returns flags (bit0 = A, bit1 = D-pad right) and fills the stick. 0 / zero stick in normal play. */
 unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy);
+unsigned pc_net_game_test_dresser_pad(void); /* TEST-ONLY dresser gyroid-overlay script: 1 A, 2 right, 4 left, 8 B, 16 L, 32 R, 64 C-down; 0 in normal play */
 
 /* Event NPC authority (Patch 4). evnpc_synced: the allowlist of event NPC ids the host owns (Gulliver, K.K., the Wisp, the peddlers, ...). suppress_spawn: 1 on a READY client for such an id
  * (aNPC_setupActor_proc then creates nothing: the host's table drives the local actors). host_unbounded: 1 on the host for such an id (the event manager creates it without the

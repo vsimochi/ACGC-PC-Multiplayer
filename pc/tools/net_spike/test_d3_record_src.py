@@ -67,10 +67,13 @@ def main():
     # ------------------------------------------------------------------ W: wire
     enum_body = c_raw[c_raw.index("typedef enum PCNetGameMsgType {"):c_raw.index("} PCNetGameMsgType;")]
     ids = [(m.group(1), int(m.group(2))) for m in re.finditer(r"^\s*(PC_NETGAME_MSG_\w+)\s*=\s*(\d+),", enum_body, re.M)]
-    nums = [v for _n, v in ids]
     N = wire_baseline.EXPECTED_MAX_MSG_ID
-    check("W message ids are 1..%d (wire_baseline.EXPECTED_MAX_MSG_ID), contiguous and unique (%d ids)" % (N, len(ids)),
-          sorted(nums) == list(range(1, N + 1)) and len(set(nums)) == N and len(ids) == N)
+    extras = [v for _n, v in ids if v > N]  # documented master-sprint additions (wire_baseline.SPRINT_EXTRA_MSG_IDS), also audited by the wire checks below
+    ids = [(n, v) for n, v in ids if v <= N]
+    nums = [v for _n, v in ids]
+    check("W message ids are 1..%d (wire_baseline.EXPECTED_MAX_MSG_ID), contiguous and unique (%d ids) plus only documented extras %s" % (N, len(ids), extras),
+          sorted(nums) == list(range(1, N + 1)) and len(set(nums)) == N and len(ids) == N
+          and all(v in wire_baseline.SPRINT_EXTRA_MSG_IDS for v in extras) and len(set(extras)) == len(extras))
     check("W RECORD_HELLO/BEGIN/CHUNK/ACK are exactly 47/48/49/50",
           dict((n, v) for n, v in ids if "RECORD" in n) == {"PC_NETGAME_MSG_RECORD_HELLO": 47, "PC_NETGAME_MSG_RECORD_BEGIN": 48,
                                                          "PC_NETGAME_MSG_RECORD_CHUNK": 49, "PC_NETGAME_MSG_RECORD_ACK": 50})
@@ -366,7 +369,7 @@ def main():
           and tick.index("s_crec.state != PC_NETGAME_CRS_SYNCED") < tick.index("g_pc_d3_test_wallet_add_late != 0")
           and cli_raw.count("[NET][REC][TEST-ONLY]") >= 2 and "TEST-ONLY" in plat_h)
     check("C the client sends HELLO from its first READY tick (hello_sent retried until queued), so the host's 5 s HELLO timeout is met",
-          "if (!s_crec.hello_sent && " in tick and "pcnetgame_crec_send_hello();" in tick)
+          re.search(r"if \(!s_crec\.hello_sent &&\s*\(", tick) is not None and "pcnetgame_crec_send_hello();" in tick)
     check("C client log lines use the [NET][REC] prefix, loud ones are marked", cli_raw.count("[NET][REC]") >= 25 and "***" in cli_raw)
 
     # ------------------------------------------------------------------ R: D3 review fixes (host half)

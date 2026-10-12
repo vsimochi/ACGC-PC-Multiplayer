@@ -216,11 +216,50 @@ static void Needlework_Indoor_Actor_draw(ACTOR* actorx, GAME* game) {
     aNI_DrawUmbrella(actorx, game);
 }
 
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+/* Multiplayer live refresh: the shared Able Sisters designs (Save_t.needlework.original_design[0..7]) travel as PAGE (msg 71) kind DESIGN;
+ * an applied page (client: the host's canonical copy; host: a client's accepted write) changes the Save copy while this player stands in
+ * the shop, but the mannequins / umbrellas draw the actor's private double-buffered copy made at ct. Re-copy a changed design through the
+ * vanilla runtime path (aNI_Copy*Data: flips the buffer, copies; the Save self-copy is a bcopy no-op), without the sound. Only while no
+ * menu is open and no local request is pending (a local exchange writes the Save and the buffer together, so it never shows as a change).
+ * Never runs single-player. */
+static void aNI_PcRefreshFromSave(NEEDLEWORK_INDOOR_ACTOR* actor) {
+    int i;
+
+    if (pc_net_game_role() == PC_NETGAME_ROLE_NONE || actor->clip.copy_cloth_data_requested || actor->clip.exchange_cloth_data_requested ||
+        actor->clip.copy_umb_data_requested || actor->clip.exchange_umb_data_requested) {
+        return;
+    }
+    for (i = 0; i < mNW_CLOTH_DESIGN_NUM; i++) {
+        mNW_original_design_c* save = &Save_Get(needlework).original_design[i & 3];
+
+        if (memcmp(actor->data[actor->design_buf_idx[mNW_TYPE_MANEKIN][i] & 1][mNW_TYPE_MANEKIN][i], save, sizeof(*save)) != 0) {
+            aNI_CopyClothData(i, save, FALSE);
+            printf("[NET][ABLE] mannequin %d redrawn from the shared design (live refresh)\n", i);
+        }
+    }
+    for (i = 0; i < mNW_UMBRELLA_DESIGN_NUM; i++) {
+        mNW_original_design_c* save = &Save_Get(needlework).original_design[mNW_CLOTH_DESIGN_NUM + (i & 3)];
+
+        if (memcmp(actor->data[actor->design_buf_idx[mNW_TYPE_UMBRELLA][i] & 1][mNW_TYPE_UMBRELLA][i], save, sizeof(*save)) != 0) {
+            aNI_CopyUmbData(i, save, FALSE);
+            printf("[NET][ABLE] umbrella %d redrawn from the shared design (live refresh)\n", i);
+        }
+    }
+}
+#endif
+
 static void Needlework_Indoor_Actor_move(ACTOR* actorx, GAME* game) {
     NEEDLEWORK_INDOOR_ACTOR* actor = (NEEDLEWORK_INDOOR_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
     Submenu* submenu = &play->submenu;
 
+#ifdef TARGET_PC
+    if (submenu->process_status == mSM_PROCESS_WAIT) {
+        aNI_PcRefreshFromSave(actor);
+    }
+#endif
     if (submenu->process_status == mSM_PROCESS_WAIT) {
         if (actor->clip.copy_cloth_data_requested == TRUE) {
             aNI_CopyClothData(actor->clip.copy_cloth_data_idx, actor->clip.copy_cloth_data_design_p, TRUE);

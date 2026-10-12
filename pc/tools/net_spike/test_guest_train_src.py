@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PC = os.path.abspath(os.path.join(HERE, "..", ".."))
 ROOT = os.path.abspath(os.path.join(PC, ".."))
 BASELINE = "018344c"
-FIX_COMMIT = None  # (filled by orchestrator after commit) None = the working tree
+FIX_COMMIT = "b67775d"  # the commit that landed this work (parent 018344c): BASELINE..FIX_COMMIT. The working tree carries 90+ unrelated later commits (m_player.c, pc_net_game.c, ...)
 
 FILES = ["src/game/m_train_control.c", "src/game/m_player_common.c_inc", "src/game/m_player.c"]
 

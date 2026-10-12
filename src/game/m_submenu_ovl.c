@@ -1,4 +1,8 @@
 #include "m_submenu_ovl.h"
+#ifdef TARGET_PC
+#include "pc_dresser_ui.h" /* 6s: dresser-mode backdrop / grabbed-item origin */
+#include "pc_platform.h"
+#endif
 
 #include "m_font.h"
 #include "m_play.h"

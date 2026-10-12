@@ -98,10 +98,14 @@ def main():
     # removing exactly those blocks from the working file must give the G5 blob byte for byte.
     lock_rx = re.compile(r"#ifdef TARGET_PC\n    /\*[^\n]*\*/\n    if \(pc_net_game_client_room_edit_locked\(\)\) \{\n(?:        [^\n]*\n)*?    \}\n#endif\n")
     lock_blocks = [mm.group(0) for mm in lock_rx.finditer(tg_new)]
+    # Also later (b291f8e, "mark work delivery items as quest items"): +9 lines in mTG_init_tag_data_item_win_sub_mail_item, two `#ifdef TARGET_PC` blocks: the static "Delivery Item" string
+    # and a QUEST-condition branch (no recipient entry -> the generic name; money keeps its own). Pure additions too.
+    dq_rx = re.compile(r"#ifdef TARGET_PC\n    static u8 delivery_item_str\[13\] = \"Delivery Item\";\n#endif\n|#ifdef TARGET_PC\n        \} else if \(itemCond == mPr_ITEM_COND_QUEST[^\n]*\n(?:[^\n]*\n)*?#endif\n")
+    dq_blocks = [mm.group(0) for mm in dq_rx.finditer(tg_new)]
     ck("A.c m_tag_ovl.c vs the G5 blob: ONLY pure additions of %d `#ifdef TARGET_PC` house edit-lock refusal blocks (each: pc_net_game_client_room_edit_locked() -> pc_net_game_room_edit_denied() -> "
-       "warning window -> return), +48 / -0; the worktree minus those blocks IS the G5 blob" % 6,
-       numstat_to_wt("src/game/m_tag_ovl.c", G5_COMMIT) == (48, 0) and len(lock_blocks) == 6
-       and all("pc_net_game_room_edit_denied();" in b_ and "return;" in b_ for b_ in lock_blocks) and lock_rx.sub("", tg_new) == tg_g5)
+       "warning window -> return), +48 / -0 (+9 more for the 2 delivery-item blocks of b291f8e: +57 / -0 in all); the worktree minus those blocks IS the G5 blob" % 6,
+       numstat_to_wt("src/game/m_tag_ovl.c", G5_COMMIT) == (57, 0) and len(lock_blocks) == 6 and len(dq_blocks) == 2
+       and all("pc_net_game_room_edit_denied();" in b_ and "return;" in b_ for b_ in lock_blocks) and dq_rx.sub("", lock_rx.sub("", tg_new)) == tg_g5)
     k = tg_new.index("static int mTG_client_mail_is_mailbox")
     ck("A.c the function is TARGET_PC-only (inside the existing #ifdef TARGET_PC block of the mail milestone 2 helpers)",
        tg_new.rfind("#ifdef TARGET_PC", 0, k) > tg_new.rfind("#endif", 0, k))

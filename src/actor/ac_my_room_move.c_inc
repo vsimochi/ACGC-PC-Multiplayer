@@ -1030,6 +1030,9 @@ static int aMR_ManageMoveBottun(MY_ROOM_ACTOR* my_room, GAME* game, aMR_contact_
                 pc_net_game_room_edit_denied();
                 return FALSE;
             }
+            /* dresser storage (Option A): NOT checked at the grab itself: a short A tap on a dresser is how it is OPENED (grab, release -> open demo); the
+             * actual pull / push / rotate starts are refused instead (ac_my_room_action.c_inc aMR_PlacePullFurniture / aMR_PlacePushFurniture /
+             * aMR_PlaceKurukuruFurniture) */
 #endif
             aMR_SetNicePos(&nice_pos, player->actor_class.world.position, contact_info0->contact_edge_start,
                            contact_info0->contact_edge_end, contact_info0, 1);
@@ -1623,6 +1626,12 @@ static int aMR_JudgePickUpCommon(mActor_name_t* pickup_item_p, ACTOR* actorx, in
     int item_count = aMR_GetItemCountInFurniture(ftr_actor);
     aFTR_PROFILE* profile = aMR_GetFurnitureProfile(ftr_actor->name);
 
+#ifdef TARGET_PC
+    /* dresser storage (Option A): a dresser holding EXTRA items cannot be picked up (they would be orphaned); take them out first */
+    if (aMR_PcDresserMoveLocked(my_room, ftr_actor, aMR_PC_MOVE_PICKUP)) {
+        return FALSE;
+    }
+#endif
     if (item_count == 0 && my_room->demo_flag == FALSE && my_room->msg_type == aMR_MSG_STATE_NONE) {
         int unused_free_space = mPr_GetPossessionItemSumWithCond(Now_Private, EMPTY_NO, mPr_ITEM_COND_NORMAL);
 
@@ -2824,6 +2833,40 @@ static void aMR_PreparePlayerAction(ACTOR* actorx, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* DIRECT OPEN (user requirement, docs/dresser-storage-redesign-plan.md 6f): A on the OWNER's item-storage furniture (drawers / wardrobe / closet) in the own
+ * house, with the feature available and the room not edit-locked, opens the 27-slot screen directly (no intermediate vanilla menu). Called every frame of the
+ * open demo's WAIT_MSG (my_room->msg_timer counts them): selects the piece on the host and waits for ITS view; TRUE = handled this frame (opened or still
+ * waiting). After aMR_PC_DIRECT_OPEN_TIMEOUT frames without the view (slow / refusing / disconnected host) FALSE = the unchanged vanilla message flow, so the
+ * furniture never becomes unusable. Visitors, NPC houses, other furniture, a disabled feature: FALSE at once (vanilla). */
+#define aMR_PC_DIRECT_OPEN_TIMEOUT 180
+static int aMR_PcDresserDirectOpen(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor, u32 player_no) {
+    int floor, ut_x, ut_z, item;
+
+    if (!aMR_PcDresserOn() || !aMR_CheckRoomOwner(player_no, my_room) || Save_Get(scene_no) == SCENE_NPC_HOUSE || Save_Get(scene_no) == SCENE_COTTAGE_NPC ||
+        aMR_PcEditLocked() || !aMR_PcDresserIdent(my_room, ftr_actor, &floor, &ut_x, &ut_z, &item) || !aMR_pc_ftr_is_item_storage(item)) {
+        return FALSE;
+    }
+    if (pc_net_game_dresser_cell_committed(floor, ftr_actor->layer, ut_x, ut_z, item) == 0) {
+        return FALSE; /* 6j: the open gate let an UNCOMMITTED dresser open (cap / in-room commits impossible): the host would refuse its SELECT -> vanilla menu now */
+    }
+    aMR_PcDresserSelectFtr(my_room, ftr_actor); /* no-op while this piece's selection is pending / answered; re-asked after ~3 s */
+    if (pc_net_game_dresser_view_ready()) {
+        printf("[NET][DRESSER] direct open: dresser 0x%04X (floor %d cell %d,%d) -> 27-slot screen after %d frame(s)\n", (unsigned)item, floor, ut_x, ut_z,
+               my_room->msg_timer);
+        aMR_pc_dresser_page = 0;
+        my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_GYROID; /* no message window is open: the gyroid overlay opens and closes the piece itself */
+        return TRUE;
+    }
+    if (my_room->msg_timer <= aMR_PC_DIRECT_OPEN_TIMEOUT) {
+        return TRUE; /* the host view of THIS dresser is on the way */
+    }
+    printf("[NET][DRESSER] direct open: no host view of dresser 0x%04X after %d frames -> the vanilla menu (fallback)\n", (unsigned)item, my_room->msg_timer);
+    return FALSE;
+}
+
+#endif
+
 static void aMR_SetFtrDemoMsg(MY_ROOM_ACTOR* my_room) {
     if (my_room->msg_type == aMR_MSG_STATE_WAIT_MSG || my_room->msg_type == aMR_MSG_STATE_WAIT_MD) {
         my_room->msg_timer++;
@@ -2835,6 +2878,11 @@ static void aMR_SetFtrDemoMsg(MY_ROOM_ACTOR* my_room) {
             u32 player_no = Common_Get(player_no);
 
             if (my_room->msg_timer > 0) {
+#ifdef TARGET_PC
+                if (aMR_PcDresserDirectOpen(my_room, ftr_actor, player_no)) {
+                    return; /* dresser storage: the 27-slot screen opens directly (or its host view is still on the way) */
+                }
+#endif
                 if (aMR_GetItemCountInFurniture(ftr_actor) <= 0) {
                     if (aMR_CheckRoomOwner(player_no, my_room)) {
                         my_room->requested_msg_type = aMR_MSG_STATE_OWNER_NO_ITEM;
@@ -2878,6 +2926,23 @@ static void aMR_SetFtrDemoMsg(MY_ROOM_ACTOR* my_room) {
                         }
                     }
                 }
+#ifdef TARGET_PC
+                {
+                    /* dresser storage: the empty / 1-item / 2-item OWNER dresser message gets "More storage" when the host offers the pool (else the arm is cleared) */
+                    const int t = my_room->requested_msg_type;
+                    int cf, cx, cz, ci;
+                    /* 6j: a dresser whose move of this visit is not committed cannot be selected on the host: no "More storage" and no SELECT for it */
+                    const int committed = !aMR_PcDresserIdent(my_room, ftr_actor, &cf, &cx, &cz, &ci) ||
+                                          pc_net_game_dresser_cell_committed(cf, ftr_actor->layer, cx, cz, ci) != 0;
+                    pc_dresser_msg_arm((aMR_PcDresserOn() && committed && (t == aMR_MSG_STATE_OWNER_NO_ITEM || t == aMR_MSG_STATE_OWNER_EXIST_ITEM ||
+                                                                           t == aMR_MSG_STATE_OWNER_EXIST_ITEM_ITEM_COUNT2))
+                                           ? aMR_msg_no_table[t]
+                                           : -1);
+                    if (aMR_PcDresserOn() && committed && aMR_CheckRoomOwner(player_no, my_room)) {
+                        aMR_PcDresserSelectFtr(my_room, ftr_actor); /* v2: this dresser's extra storage (re-sent only when another dresser is opened) */
+                    }
+                }
+#endif
             }
         } else if (my_room->msg_type == aMR_MSG_STATE_WAIT_MD) {
             int demo_ftrID = my_room->demo_ftrID;
@@ -3039,6 +3104,12 @@ static void My_Room_Actor_move(ACTOR* actorx, GAME* game) {
 
     aMR_SetFtrDemoMsg(my_room);
     aMR_MessageControl(actorx, game);
+#if defined(TARGET_PC) && defined(PC_NET_TEST_HOOKS)
+    aMR_PcDresserUiTestHook(actorx); /* TEST-ONLY (AC_TEST_DRESSER_UI): never active in normal play */
+#endif
+#ifdef TARGET_PC
+    aMR_pc_museum_fossil_tick(actorx, game); /* multiplayer only: a fossil donated by another player appears live in the fossil room */
+#endif
     aMR_ClearChangeSwitchFlag();
 }
 

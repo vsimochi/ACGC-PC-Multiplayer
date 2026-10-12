@@ -179,6 +179,204 @@ static int aMR_PcEditLocked(void) {
 #define aMR_PcEditLocked() FALSE
 #endif
 
+#ifdef TARGET_PC
+/* Dresser storage (multiplayer CLIENT on a host with the feature ON: pc_net_game_dresser_available()). The take-out list of a dresser gets one extra
+ * choice "More storage" (before Cancel) that opens a paged list of the host-side pool (<= 3 items + Put in + Next + Cancel <= 6 choices). Every pool
+ * change is a host transaction (TXN kind 18): the pockets change ONLY through the host's post-image; the dresser stays open (the player cannot use the
+ * pockets) until the result is in. available() == 0 (single player, the host's own dresser, an old host, feature off): nothing below is reached. */
+static int aMR_pc_storage_choice = -1; /* the choice index of "More storage" in the current take-out list, -1 = not offered */
+static int aMR_pc_dresser_page = 0;
+static int aMR_pc_dresser_map[mChoice_CHOICE_NUM]; /* >= 0 pool slot (take out), -1 put in, -2 next page, -3 cancel */
+static int aMR_pc_dresser_putin = FALSE;   /* the next ITEM_PUT_IN goes to the pool */
+static int aMR_pc_txn_from_submenu = FALSE;
+static int aMR_pc_txn_resolved = FALSE;
+static int aMR_pc_txn_last = 0; /* PC_NETGAME_TS_OP_* of the last resolved dresser transaction */
+#ifdef PC_NET_TEST_HOOKS
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "pc_test_hooks.h"
+static int aMR_pc_ui_test = FALSE; /* TEST-ONLY: the UI states are driven by aMR_PcDresserUiTestHook (no real window) */
+static int aMR_pc_ui_mode = 0;     /* TEST-ONLY: 0 put + take, 1 put only, 2 take only */
+static int aMR_pc_ui_sel_ftr = -1; /* TEST-ONLY: the furniture actor the UI test uses as the dresser */
+extern void pc_net_game_dresser_test_left_room(void);
+#endif
+
+#include "pc_dresser_ui.h" /* the dresser mode of the gyroid overlay */
+#include "pc_dresser_items.h" /* the vanilla-slot filter */
+#include "pc_nook_house.h" /* pc_dresser_msg_arm / pc_dresser_msg_more_choice (the "More storage" choice patch), pc_nook_msg_id (the refusal line) */
+
+/* "More storage" picked in a patched empty / 1-item / 2-item owner dresser message: "which one?" then the pool page. 1 = handled. */
+/* "More storage": the GYROID-STYLE overlay in dresser mode (pc_dresser_ui) when the opened dresser's host view is ready; the paged choice list only as the
+ * fallback (no view yet). */
+static void aMR_PcDresserOpenStorage(MY_ROOM_ACTOR* my_room) {
+    aMR_pc_dresser_page = 0;
+    if (pc_net_game_dresser_view_ready()) {
+        my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_GYROID;
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+    } else {
+        my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_WAIT_PAGE;
+        mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), 0x2F1E);
+    }
+    mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+}
+
+static int aMR_PcDresserMoreChoice(MY_ROOM_ACTOR* my_room, int msg_no, int choice) {
+    if (choice < 0 || choice != pc_dresser_msg_more_choice(msg_no)) {
+        return FALSE;
+    }
+    pc_dresser_msg_arm(-1);
+    aMR_PcDresserOpenStorage(my_room);
+    return TRUE;
+}
+
+/* v2 per-dresser identity of a furniture actor of the OWN room: floor, layer, origin cell (the cell the house image stores the furniture id in, the same cell
+ * aMR_KeepItem2Fg writes the vanilla keep items above) and the furniture item. 0 = not resolvable (not the own room, not a player house floor). */
+static int aMR_CheckRoomOwner(u32 player_no, MY_ROOM_ACTOR* my_room); /* ac_my_room.c */
+int aMR_pc_ftr_is_item_storage(int ftr_item);                        /* ac_my_room.c (TARGET_PC) */
+static int aMR_PcDresserIdent(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor, int* floor, int* ut_x, int* ut_z, int* item) {
+    if (my_room == NULL || ftr_actor == NULL || !aMR_CheckRoomOwner(Common_Get(player_no), my_room) || my_room->scene == SCENE_COTTAGE_MY) {
+        return FALSE;
+    }
+    *floor = mFI_GetPlayerHouseFloorNo(my_room->scene);
+    if (*floor < 0 || *floor > 2 || !aMR_Wpos2PlaceNumber(ut_x, ut_z, ftr_actor->position, ftr_actor->shape_type) || *ut_x < 0 || *ut_z < 0) {
+        return FALSE;
+    }
+    *item = (int)mRmTp_FtrIdx2FtrItemNo(ftr_actor->name, mRmTp_DIRECT_SOUTH);
+    return TRUE;
+}
+
+/* Option A: a dresser of the own room whose EXTRA storage is not empty may not be moved / rotated / picked up (the extra items stay with this cell on the host).
+ * 1 = refuse. Single player / feature off / an empty dresser: 0 (vanilla). */
+static void aMR_PcDresserSelectFtr(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor);
+static int aMR_PcDresserOn(void);
+static int aMR_CheckRoomOwner(u32 player_no, MY_ROOM_ACTOR* my_room);
+
+/* 6j: TRUE = do not start the open demo of this own item-storage piece now (its move of this visit is not committed yet; notice 4). Owner / own house / feature on /
+ * not edit-locked only; anything else FALSE (vanilla). */
+static int aMR_PcDresserOpenRefused(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor) {
+    int floor, ut_x, ut_z, item;
+    if (!aMR_PcDresserOn() || !aMR_CheckRoomOwner(Common_Get(player_no), my_room) || Save_Get(scene_no) == SCENE_NPC_HOUSE ||
+        Save_Get(scene_no) == SCENE_COTTAGE_NPC || aMR_PcEditLocked() || !aMR_PcDresserIdent(my_room, ftr_actor, &floor, &ut_x, &ut_z, &item) ||
+        !aMR_pc_ftr_is_item_storage(item)) {
+        return FALSE;
+    }
+    return pc_net_game_dresser_open_gate(floor, ftr_actor->layer, ut_x, ut_z, item) == 1;
+}
+
+/* Option A move lock (pickup / push / pull / rotate grab), AUTHORITATIVE: only an item-storage furniture of the own room can be locked; it is allowed only when
+ * the host answered a SELECT of THIS dresser in THIS room visit with 0 extra items (or no extra storage can exist: offline / host without the feature). Extra
+ * items -> refused; state unknown -> refused too (fail safe) and the host is asked, so a later attempt can succeed. Refusals show notice 3. */
+#define aMR_PC_MOVE_PICKUP 1 /* the action of a move-lock check (diagnostics only: pc_net_game_dresser_move_attempt) */
+#define aMR_PC_MOVE_PULL 2
+#define aMR_PC_MOVE_PUSH 3
+#define aMR_PC_MOVE_ROTATE 4
+static int aMR_PcDresserMoveLocked(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor, int action) {
+    int floor, ut_x, ut_z, item, st;
+    if (action != aMR_PC_MOVE_PICKUP) {
+        return FALSE; /* 6q (S2): push / pull / rotate of a dresser holding items are allowed (the host carries its storage to the new cell); only pickup stays locked */
+    }
+    if (!aMR_PcDresserIdent(my_room, ftr_actor, &floor, &ut_x, &ut_z, &item) || !aMR_pc_ftr_is_item_storage(item)) {
+        return FALSE;
+    }
+    { /* 6l, 27-slot lock (feature on only): the 3 vanilla keep slots count too -- the live room's keep items, or the host's canonical ones (a take-out not
+       * committed yet: the host's step 9b would refuse the move) */
+        static int keep_logged = 0, wait_logged = 0;
+        int i, live = 0, kl;
+        for (i = 0; i < aFTR_KEEP_ITEM_COUNT; i++) {
+            live |= ftr_actor->items[i] != EMPTY_NO;
+        }
+        kl = pc_net_game_dresser_keep_lock(floor, ftr_actor->layer, ut_x, ut_z, item, live);
+        if (kl == 1) {
+            pc_net_game_dresser_move_denied(); /* notice 3: "Take the stored items out first" */
+            pc_net_game_dresser_move_attempt(action, item, ut_x, ut_z);
+            if (keep_logged++ < 20)
+            printf("[NET][DRESSER] client: dresser 0x%04X cell %d,%d holds vanilla keep item(s): move / rotate / pickup REFUSED (27-slot lock)\n", (unsigned)item, ut_x, ut_z);
+            return TRUE;
+        }
+        if (kl == 2) {
+            pc_net_game_dresser_move_wait(1); /* notice 4: the take-out is being saved */
+            pc_net_game_dresser_move_attempt(action, item, ut_x, ut_z);
+            if (wait_logged++ < 20)
+            printf("[NET][DRESSER] client: dresser 0x%04X cell %d,%d: keep items taken out but not committed yet: move / rotate / pickup REFUSED for now (27-slot lock)\n",
+                   (unsigned)item, ut_x, ut_z);
+            return TRUE;
+        }
+    }
+    st = pc_net_game_dresser_move_state(floor, ftr_actor->layer, ut_x, ut_z, item);
+    if (st == 0) {
+        return FALSE;
+    }
+    pc_net_game_dresser_move_attempt(action, item, ut_x, ut_z); /* 6l diagnostics: one count per refused attempt */
+    if (st > 0) {
+        pc_net_game_dresser_move_denied(); /* "Take the stored items out first" (the refused-house-edit notice line, value 3) */
+    } else {
+        /* 6l: UNKNOWN is never shown as "take the items out": notice 4 when the piece's cell is not committed yet (the room is being saved), else 6 (asking) */
+        pc_net_game_dresser_move_wait(pc_net_game_dresser_cell_committed(floor, ftr_actor->layer, ut_x, ut_z, item) == 0);
+    }
+    if (st < 0) {
+        static int logged = 0;
+        if (logged++ < 20) {
+            printf("[NET][DRESSER] client: dresser 0x%04X cell %d,%d: extra storage state UNKNOWN in this room visit -> refused, asking the host\n", (unsigned)item, ut_x,
+                   ut_z);
+        }
+        if (pc_net_game_dresser_cell_committed(floor, ftr_actor->layer, ut_x, ut_z, item) != 0) {
+            aMR_PcDresserSelectFtr(my_room, ftr_actor); /* 6j: never for a cell whose move is not committed (the host would refuse it) */
+        }
+    }
+    return TRUE;
+}
+
+/* Selects the opened dresser on the host (v2): its STATE (the extra items) arrives shortly; the menus read pc_net_game_dresser_item() only when it did. */
+static void aMR_PcDresserSelectFtr(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor) {
+    static int last[5] = { -1, -1, -1, -1, -1 };
+    static int waited = 0;
+    static unsigned int last_visit = 0;
+    int floor, ut_x, ut_z, item;
+    if (last_visit != pc_net_game_dresser_visit()) { /* a new room visit: every dresser is asked again (the move lock needs THIS visit's answer) */
+        last_visit = pc_net_game_dresser_visit();
+        last[0] = last[1] = last[2] = last[3] = last[4] = -1;
+        waited = 0;
+    }
+    if (pc_net_game_dresser_available() && aMR_PcDresserIdent(my_room, ftr_actor, &floor, &ut_x, &ut_z, &item)) {
+        if (last[0] == floor && last[1] == ftr_actor->layer && last[2] == ut_x && last[3] == ut_z && last[4] == item &&
+            (pc_net_game_dresser_view_ready() || ++waited < 180)) {
+            return; /* already selected / its answer is on the way (this function runs every frame of the open-wait); re-asked after ~3 s without an answer */
+        }
+        waited = 0;
+        if (pc_net_game_dresser_select(floor, ftr_actor->layer, ut_x, ut_z, item) != 0) {
+            last[0] = floor;
+            last[1] = ftr_actor->layer;
+            last[2] = ut_x;
+            last[3] = ut_z;
+            last[4] = item;
+        }
+    }
+}
+
+static int aMR_PcDresserOn(void) {
+    return pc_net_game_dresser_available() && !pc_net_game_client_room_edit_locked();
+}
+
+/* The put-in submenu already removed `item` from pocket `slot` locally: put it BACK (the pre-image the host validates) and ask the host to move it into the
+ * pool. 1 = the transaction runs (state PC_DRESSER_TXN), 0 = refused locally (the item stays in the pocket). Never touches the 3 vanilla slots. */
+static int aMR_PcDresserPutInPool(MY_ROOM_ACTOR* my_room, mActor_name_t item, int slot) {
+    Private_c* priv = Common_Get(now_private);
+
+    if (item == EMPTY_NO || slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT || priv->inventory.pockets[slot] != EMPTY_NO) {
+        return FALSE;
+    }
+    mPr_SetPossessionItem(priv, slot, item, mPr_ITEM_COND_NORMAL);
+    if (pc_net_game_dresser_begin(1, 0xFF, slot, item) != 1) {
+        return FALSE;
+    }
+    aMR_pc_txn_from_submenu = TRUE;
+    aMR_pc_txn_resolved = FALSE;
+    my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_TXN;
+    return TRUE;
+}
+#endif
+
 static void aMR_MsgControlOwnerNoItem(ACTOR* actorx, GAME* game) {
     MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
     int choice = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
@@ -189,6 +387,12 @@ static void aMR_MsgControlOwnerNoItem(ACTOR* actorx, GAME* game) {
         mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
         return;
     }
+#ifdef TARGET_PC
+    if (aMR_PcDresserMoreChoice(my_room, MSG_2570, choice)) {
+        mChoice_Clear_ChoseNum(mChoice_Get_base_window_p());
+        return;
+    }
+#endif
 
     if (choice != -1) {
         switch (choice) {
@@ -261,6 +465,25 @@ static void aMR_MsgInitOwnerWhichPutOut(ACTOR* actorx) {
                                 mIN_ITEM_NAME_LEN, item_name_table[2], mIN_ITEM_NAME_LEN, cancel_str,
                                 mChoice_CHOICE_STRING_LEN, NULL, mIN_ITEM_NAME_LEN, NULL, mIN_ITEM_NAME_LEN);
     }
+#ifdef TARGET_PC
+    aMR_pc_storage_choice = -1;
+    if (count >= 1 && count <= 3 && aMR_PcDresserOn()) {
+        /* the same list + "More storage" right before Cancel (<= 5 choices) */
+        static u8 storage_str[] = "More storage";
+        u8* s[mChoice_CHOICE_NUM] = { NULL, NULL, NULL, NULL, NULL, NULL };
+        int l[mChoice_CHOICE_NUM] = { 0, 0, 0, 0, 0, 0 };
+        for (i = 0; i < count; i++) {
+            s[i] = item_name_table[i];
+            l[i] = mIN_ITEM_NAME_LEN;
+        }
+        s[count] = storage_str;
+        l[count] = (int)sizeof(storage_str) - 1;
+        s[count + 1] = cancel_str;
+        l[count + 1] = mChoice_CHOICE_STRING_LEN;
+        aMR_pc_storage_choice = count;
+        mChoice_Set_choice_data(choice_win, s[0], l[0], s[1], l[1], s[2], l[2], s[3], l[3], s[4], l[4], s[5], l[5]);
+    }
+#endif
 }
 
 static void aMR_MsgControlOwnerWhichPutOut(ACTOR* actorx, GAME* game) {
@@ -274,6 +497,14 @@ static void aMR_MsgControlOwnerWhichPutOut(ACTOR* actorx, GAME* game) {
         mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
         return;
     }
+#ifdef TARGET_PC
+    if (choice_no != -1 && aMR_pc_storage_choice >= 0 && choice_no == aMR_pc_storage_choice) {
+        /* "More storage": the gyroid-style dresser overlay (fallback: "which one?" + the paged pool list) */
+        aMR_pc_storage_choice = -1;
+        aMR_PcDresserOpenStorage(my_room);
+        return;
+    }
+#endif
     if (choice_no != -1) {
         FTR_ACTOR* ftr_actor = aMR_GetNowDemoFtr(actorx);
 
@@ -347,6 +578,11 @@ static void aMR_MsgControlOwnerExistItem(ACTOR* actorx, GAME* game) {
         return;
     }
 
+#ifdef TARGET_PC
+    if (aMR_PcDresserMoreChoice(my_room, MSG_2571, choice_no)) {
+        return;
+    }
+#endif
     if (choice_no != -1) {
         if (choice_no == mChoice_CHOICE0) {
             if (mSM_check_open_inventory_itemlist(mSM_IV_OPEN_PUTIN_FTR, 0) == FALSE) {
@@ -398,6 +634,11 @@ static void aMR_MsgControlOwnerExistItem_ItemCount2(ACTOR* actorx, GAME* game) {
         return;
     }
 
+#ifdef TARGET_PC
+    if (aMR_PcDresserMoreChoice(my_room, MSG_12058, choice_no)) {
+        return;
+    }
+#endif
     if (choice_no != -1) {
         if (choice_no == mChoice_CHOICE0) {
             if (mSM_check_open_inventory_itemlist(mSM_IV_OPEN_PUTIN_FTR, 0) == FALSE) {
@@ -476,6 +717,22 @@ static void aMR_MsgControlItemPutIn(ACTOR* actorx, GAME* game) {
     if (submenu->process_status == mSM_PROCESS_WAIT) {
         Submenu_Item_c* submenu_item = submenu->item_p;
 
+#ifdef TARGET_PC
+        if (aMR_pc_dresser_putin) {
+            /* dresser storage: the submenu already took the item out of the pocket locally; put it BACK (the pre-image the host validates) and let the host
+             * move it into the pool. The item never goes into the 3 vanilla slots (consumed here). */
+            aMR_pc_dresser_putin = FALSE;
+            if (submenu_item != NULL && submenu_item->item != EMPTY_NO) {
+                const mActor_name_t item = submenu_item->item;
+                const int slot = submenu_item->slot_no;
+
+                submenu_item->item = EMPTY_NO;
+                if (aMR_PcDresserPutInPool(my_room, item, slot)) {
+                    return;
+                }
+            }
+        }
+#endif
         if (submenu_item != NULL && submenu_item->item != EMPTY_NO) {
             FTR_ACTOR* ftr_actor = aMR_GetNowDemoFtr(actorx);
 
@@ -1568,6 +1825,1309 @@ typedef void (*aMR_MSG_INIT_PROC)(ACTOR*);
 typedef void (*aMR_MSG_CTRL_PROC)(ACTOR*, GAME*);
 
 // clang-format off
+#ifdef TARGET_PC
+/* ---- dresser storage states (see aMR_PcDresserOn) ---- */
+static void aMR_PcDresserClose(MY_ROOM_ACTOR* my_room, int cont_msg) {
+    my_room->requested_msg_type = aMR_MSG_STATE_REQUEST_CLOSE_FTR;
+    if (cont_msg >= 0) {
+        mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), cont_msg);
+    } else {
+        mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+    }
+    mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+}
+
+static void aMR_MsgInitPcDresserWaitPage(ACTOR* actorx) {
+    MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
+
+    if (mMsg_Check_MainNormalContinue(mMsg_Get_base_window_p())) {
+        my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_PAGE;
+        mChoice_no_b_close_set(mChoice_Get_base_window_p());
+    }
+}
+
+static void aMR_MsgControlPcDresserWaitPage(ACTOR* actorx, GAME* game) {
+    aMR_MsgInitPcDresserWaitPage(actorx);
+}
+
+/* One page: up to 3 pool items, then "Put in" (pool not full), "Next" (more items), Cancel (<= 6 choices). */
+static void aMR_MsgInitPcDresserPage(ACTOR* actorx) {
+    static u8 names[3][mIN_ITEM_NAME_LEN];
+    static u8 putin_str[] = "Put in";
+    static u8 next_str[] = "Next";
+    static u8 cancel_str[mChoice_CHOICE_STRING_LEN];
+    u8* s[mChoice_CHOICE_NUM] = { NULL, NULL, NULL, NULL, NULL, NULL };
+    int l[mChoice_CHOICE_NUM] = { 0, 0, 0, 0, 0, 0 };
+    mChoice_c* choice_win = mChoice_Get_base_window_p();
+    int n = 0, seen = 0, more = FALSE, i;
+
+    mChoice_Clear_ChoseNum(choice_win);
+    for (i = 0; i < mChoice_CHOICE_NUM; i++) {
+        aMR_pc_dresser_map[i] = -3;
+    }
+    for (i = 0; i < PC_NETGAME_DRESSER_SLOTS; i++) {
+        const int it = pc_net_game_dresser_item(i);
+
+        if (it == 0) {
+            continue;
+        }
+        if (seen++ < aMR_pc_dresser_page * 3) {
+            continue;
+        }
+        if (n == 3) {
+            more = TRUE;
+            break;
+        }
+        mIN_copy_name_str(names[n], (mActor_name_t)it);
+        s[n] = names[n];
+        l[n] = mIN_ITEM_NAME_LEN;
+        aMR_pc_dresser_map[n] = i;
+        n++;
+    }
+    if (pc_net_game_dresser_count() < PC_NETGAME_DRESSER_SLOTS) {
+        s[n] = putin_str;
+        l[n] = (int)sizeof(putin_str) - 1;
+        aMR_pc_dresser_map[n++] = -1;
+    }
+    if (more) {
+        s[n] = next_str;
+        l[n] = (int)sizeof(next_str) - 1;
+        aMR_pc_dresser_map[n++] = -2;
+    }
+    mChoice_Load_ChoseStringFromRom(choice_win, cancel_str, 0x29, NULL);
+    s[n] = cancel_str;
+    l[n] = mChoice_CHOICE_STRING_LEN;
+    aMR_pc_dresser_map[n++] = -3;
+    mChoice_Set_choice_data(choice_win, s[0], l[0], s[1], l[1], s[2], l[2], s[3], l[3], s[4], l[4], s[5], l[5]);
+}
+
+static void aMR_PcDresserPick(MY_ROOM_ACTOR* my_room, int choice_no);
+
+static void aMR_MsgControlPcDresserPage(ACTOR* actorx, GAME* game) {
+    MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
+    int choice_no = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
+
+    if (choice_no == -1) {
+        return;
+    }
+    mChoice_Clear_ChoseNum(mChoice_Get_base_window_p());
+    aMR_PcDresserPick(my_room, choice_no);
+}
+
+/* The page choice `choice_no` (shared by the page state and the TEST-ONLY UI hook). */
+static void aMR_PcDresserPick(MY_ROOM_ACTOR* my_room, int choice_no) {
+    int m;
+
+    if (aMR_PcEditLocked() || !pc_net_game_dresser_available() || choice_no < 0 || choice_no >= mChoice_CHOICE_NUM) {
+        aMR_PcDresserClose(my_room, -1);
+        return;
+    }
+    m = aMR_pc_dresser_map[choice_no];
+    if (m >= 0) {
+        const int item = pc_net_game_dresser_item(m);
+        const int idx = mPr_GetPossessionItemIdxWithCond(Common_Get(now_private), EMPTY_NO, mPr_ITEM_COND_NORMAL);
+
+        if (idx == -1) {
+            aMR_PcDresserClose(my_room, 0x0A0E); /* full pockets (the vanilla take-out text) */
+        } else if (item == 0 || pc_net_game_dresser_begin(2, m, idx, item) != 1) {
+            aMR_PcDresserClose(my_room, -1);
+        } else {
+            /* the message stays locked (the player cannot act) until the host answers */
+            aMR_pc_txn_from_submenu = FALSE;
+            aMR_pc_txn_resolved = FALSE;
+            my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_TXN;
+        }
+    } else if (m == -1) {
+        if (mSM_check_open_inventory_itemlist(mSM_IV_OPEN_PUTIN_FTR, 0) == FALSE) {
+            aMR_PcDresserClose(my_room, 0x0A10); /* nothing that can be put in (the vanilla text) */
+        } else {
+            aMR_pc_dresser_putin = TRUE;
+            my_room->requested_msg_type = aMR_MSG_STATE_OPEN_SUBMENU;
+            mMsg_Set_CancelNormalContinue(mMsg_Get_base_window_p());
+            mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        }
+    } else if (m == -2) {
+        aMR_pc_dresser_page++;
+        my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_WAIT_PAGE;
+        mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), 0x2F1E);
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+    } else {
+        aMR_PcDresserClose(my_room, -1);
+    }
+}
+
+/* The gyroid-style overlay in dresser mode: once the message is gone, opens the inventory with the gyroid panel (mSM_IV_OPEN_HANIWA_ENTRUST; the overlays show
+ * the dresser page instead of the save's gyroid while pc_dresser_ui is active), waits until it closes, then closes the dresser like vanilla. */
+/* The dresser the gyroid-style overlay shows (set when it opens) and its vanilla keep-slot operations: exactly the vanilla take-out / put-in effects
+ * (aMR_MsgControlOwnerWhichPutOut / mTG_putin_proc + aMR_ItemPutInFurniture) on the live actor; furniture sync commits them with the house image. */
+static FTR_ACTOR* aMR_pc_gyroid_ftr = NULL;
+
+static void aMR_PcGyroidRefreshVanilla(void) {
+    unsigned short vanilla[PC_DRESSER_UI_VANILLA];
+    int i;
+
+    for (i = 0; i < PC_DRESSER_UI_VANILLA; i++) {
+        vanilla[i] = aMR_pc_gyroid_ftr != NULL ? (unsigned short)aMR_pc_gyroid_ftr->items[i] : 0;
+    }
+    pc_dresser_ui_set_vanilla(vanilla);
+}
+
+static int aMR_PcGyroidVanillaTake(int index) {
+    Private_c* priv = Common_Get(now_private);
+    mActor_name_t item;
+    int idx;
+
+    if (aMR_pc_gyroid_ftr == NULL || index < 0 || index >= aFTR_KEEP_ITEM_COUNT || aMR_PcEditLocked()) {
+        return -1;
+    }
+    item = aMR_pc_gyroid_ftr->items[index];
+    if (item == EMPTY_NO) {
+        return -1;
+    }
+    idx = mPr_GetPossessionItemIdxWithCond(priv, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+    if (idx == -1) {
+        return 0; /* full pockets */
+    }
+    aMR_pc_gyroid_ftr->items[index] = EMPTY_NO;
+    aMR_TidyItemInFurniture(aMR_pc_gyroid_ftr);
+    mPr_SetPossessionItem(priv, idx, item, mPr_ITEM_COND_NORMAL);
+    aMR_PcGyroidRefreshVanilla();
+    return 1;
+}
+
+static int aMR_PcGyroidVanillaPut(int item, int pocket_slot) {
+    Private_c* priv = Common_Get(now_private);
+
+    if (aMR_pc_gyroid_ftr == NULL || pocket_slot < 0 || pocket_slot >= mPr_POCKETS_SLOT_COUNT || aMR_PcEditLocked() ||
+        priv->inventory.pockets[pocket_slot] != (mActor_name_t)item) {
+        return -1;
+    }
+    if (!pc_dresser_item_vanilla_ok((unsigned)item) || !aMR_ItemPutInFurniture(aMR_pc_gyroid_ftr, (mActor_name_t)item)) {
+        return 0; /* not a vanilla-slot item (the vanilla filter) / the 3 vanilla slots are full: the caller uses the extra storage */
+    }
+    mPr_SetPossessionItem(priv, pocket_slot, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+    aMR_PcGyroidRefreshVanilla();
+    return 1;
+}
+
+static void aMR_MsgControlPcDresserGyroid(ACTOR* actorx, GAME* game) {
+    static int phase = 0; /* 0 open, 1 open requested, 2 closing */
+    MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    Submenu* submenu = &play->submenu;
+
+    if (phase == 0) {
+        if (mDemo_CheckDemo() == FALSE) {
+            FTR_ACTOR* ftr_actor = aMR_GetNowDemoFtr(actorx);
+            unsigned short vanilla[PC_DRESSER_UI_VANILLA];
+            int i;
+
+            for (i = 0; i < PC_DRESSER_UI_VANILLA; i++) {
+                vanilla[i] = (unsigned short)ftr_actor->items[i]; /* a read-only copy: the vanilla keep slots stay in the actor / house image */
+            }
+            pc_dresser_ui_begin(vanilla);
+            aMR_pc_gyroid_ftr = ftr_actor;
+            pc_dresser_ui_set_vanilla_ops(aMR_PcGyroidVanillaTake, aMR_PcGyroidVanillaPut);
+            {
+                /* 6r (A1): the 27 cells are host slots; items still sitting in this piece's VANILLA keep slots (stored before 6r, or by an old client) are
+                 * taken out to free pockets now, through the vanilla take-out (pocket + keep slot change in one call; the room commit carries it under the
+                 * conservation check): never lost, never duplicated. What does not fit stays in the keep slot (reachable on the next open); notice 9 / 10. */
+                int moved = 0, left = 0, k;
+                while (ftr_actor->items[0] != EMPTY_NO && aMR_PcGyroidVanillaTake(0) == 1) { /* the take tidies the slots: slot 0 is always the next one */
+                    moved++;
+                }
+                for (k = 0; k < PC_DRESSER_UI_VANILLA; k++) {
+                    left += ftr_actor->items[k] != EMPTY_NO;
+                }
+                if (moved > 0 || left > 0) {
+                    printf("[NET][DRESSER] dresser screen: %d old keep-slot item(s) moved to the pockets, %d left in the keep slots (no free pocket)\n", moved, left);
+                    pc_net_game_dresser_ui_notice(left > 0 ? 10 : 9);
+                }
+            }
+            mSM_open_submenu(submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, (int)mFI_GET_PLAYER_ROOM_NO(mFI_GetFieldId()));
+            mChoice_Clear_ChoseNum(mChoice_Get_base_window_p());
+            phase = 1;
+        }
+        return;
+    }
+    if (phase == 1) {
+        static int seen_open = FALSE;
+        static int wait_frames = 0;
+
+        if (submenu->open_flag || submenu->process_status != mSM_PROCESS_WAIT) {
+            seen_open = TRUE; /* the overlay is up */
+            return;
+        }
+        if (!seen_open && ++wait_frames < 120) {
+            return; /* the open request is processed on a later frame */
+        }
+        seen_open = FALSE;
+        wait_frames = 0;
+        if (pc_dresser_ui_pending()) {
+            (void)pc_dresser_ui_poll(); /* closed while a host transaction is in flight: the dresser stays open until it resolves */
+            return;
+        }
+        pc_dresser_ui_set_vanilla_ops(NULL, NULL);
+        aMR_pc_gyroid_ftr = NULL;
+        pc_dresser_ui_end();
+        phase = 2;
+    }
+#ifdef PC_NET_TEST_HOOKS
+    if (aMR_pc_ui_test) {
+        my_room->requested_msg_type = aMR_MSG_STATE_NONE; /* TEST-ONLY drive: the furniture was never opened by the player */
+        phase = 0;
+        return;
+    }
+#endif
+    if (mPlib_request_main_close_furniture_type1(game)) {
+        aMR_ChangeDemoFtrStatus(actorx, 5);
+        my_room->requested_msg_type = aMR_MSG_STATE_WAIT_CLOSE_FTR;
+        phase = 0;
+    }
+}
+
+/* Waits for the host's answer (no local pocket change here: the transaction layer applies the host post-image), then closes the dresser like vanilla. */
+static void aMR_MsgControlPcDresserTxn(ACTOR* actorx, GAME* game) {
+    MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
+
+    if (!aMR_pc_txn_resolved) {
+        const int r = pc_net_game_dresser_poll();
+
+        if (r == PC_NETGAME_TS_OP_PENDING) {
+            return;
+        }
+        aMR_pc_txn_last = r;
+        aMR_pc_txn_resolved = TRUE;
+    }
+#ifdef PC_NET_TEST_HOOKS
+    if (aMR_pc_ui_test) {
+        /* TEST-ONLY UI drive: no furniture / message window is really open; just leave the state */
+        aMR_pc_txn_resolved = FALSE;
+        my_room->requested_msg_type = aMR_MSG_STATE_NONE;
+        return;
+    }
+#endif
+    if (aMR_pc_txn_from_submenu) {
+        if (mPlib_request_main_close_furniture_type1(game)) {
+            aMR_ChangeDemoFtrStatus(actorx, 5);
+            my_room->requested_msg_type = aMR_MSG_STATE_WAIT_CLOSE_FTR;
+            aMR_pc_txn_resolved = FALSE;
+        }
+    } else {
+        aMR_pc_txn_resolved = FALSE;
+        /* a refused take-out: one generated system line ("nothing was moved") instead of a silent close */
+        aMR_PcDresserClose(my_room, aMR_pc_txn_last == PC_NETGAME_TS_OP_APPLIED ? -1 : pc_nook_msg_id(PC_NOOK_MSG_DRESSER_REFUSED));
+    }
+}
+
+#ifdef PC_NET_TEST_HOOKS
+/* TEST-ONLY (PC_NET_TEST_HOOKS build + AC_TEST_HOOKS=1 + AC_TEST_DRESSER_UI=1; the client is in its OWN room, see AC_TEST_DRESSER_ROOM in pc_net_game.c): drives the dresser
+ * storage UI states without a GUI: builds the real pool page (aMR_MsgInitPcDresserPage), picks "Put in" through the real page handler (aMR_PcDresserPick), emulates
+ * the put-in submenu (the pocket item leaves the pocket locally exactly like mTG_putin_proc) and runs the real pool put-in (aMR_PcDresserPutInPool) + the real wait
+ * state; then picks the stored item on a rebuilt page (TAKE) and logs the pockets + pool count of the item. The windows themselves are not shown. */
+static int aMR_PcDresserUiTestCount(mActor_name_t item) {
+    Private_c* priv = Common_Get(now_private);
+    int i, n = 0;
+
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        n += priv->inventory.pockets[i] == item;
+    }
+    for (i = 0; i < PC_NETGAME_DRESSER_SLOTS; i++) {
+        n += pc_net_game_dresser_item(i) == (int)item;
+    }
+    return n;
+}
+
+/* TEST-ONLY "lock" mode (AC_TEST_DRESSER_UI=lock): the Option-A refusal through the REAL input path. The player is placed on a free unit next to the
+ * selected chest (which holds extra items), facing it, and the REAL pad path presses B (pickup: Player_actor_CheckController_forPickup ->
+ * aMR_SearchPickupFurniture -> aMR_JudgePickUpCommon) and A (push / pull / rotate grab: the contact-grab judge); both must be refused (notice 3) and the
+ * chest must stay. Then the extra item is taken out through the real dresser page + kind-18 TAKE and B is pressed again: the pickup must now be ALLOWED. */
+extern void pc_net_game_test_set_lock_pad(unsigned bits);
+extern unsigned pc_net_game_dresser_move_denied_count(void);
+
+static int aMR_PcLockPlace(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr, int apply) {
+    static const int dx[4] = { 0, 0, -1, 1 }, dz[4] = { 1, -1, 0, 0 };
+    static const s16 face[4] = { (s16)0x8000, 0, 0x4000, (s16)0xC000 }; /* look back at the chest: x = sin, z = cos */
+    mActor_name_t* fg0 = aMR_GetLayerTopFg(mCoBG_LAYER0);
+    PLAYER_ACTOR* pl = GET_PLAYER_ACTOR((GAME_PLAY*)gamePT);
+    int floor, ux, uz, item, d;
+    if (fg0 == NULL || pl == NULL || !aMR_PcDresserIdent(my_room, ftr, &floor, &ux, &uz, &item)) {
+        return -1;
+    }
+    for (d = 0; d < 4; d++) {
+        const int nx = ux + dx[d], nz = uz + dz[d];
+        if (nx >= 1 && nx < UT_X_NUM - 1 && nz >= 1 && nz < UT_Z_NUM - 1 && fg0[nx + nz * UT_X_NUM] == EMPTY_NO) {
+            if (apply) {
+                xyz_t pos;
+                mFI_UtNum2CenterWpos(&pos, nx, nz);
+                pos.y = pl->actor_class.world.position.y;
+                pl->actor_class.world.position = pos;
+                pl->actor_class.shape_info.rotation.y = face[d];
+                pl->actor_class.world.angle.y = face[d];
+            }
+            return d;
+        }
+    }
+    return -1;
+}
+
+static int aMR_PcLockChestThere(FTR_ACTOR* ftr, int ftr_id, xyz_t at) {
+    return l_aMR_work.used_list[ftr_id] && ftr->position.x == at.x && ftr->position.z == at.z;
+}
+
+/* TEST-ONLY 6l: push (A held + stick into the chest), pull (A held + stick away) and rotate (A held + stick sideways) through the REAL pad path, each judged by the
+ * refusal counter + the chest's position / angle; anything that opened (a short A is how a dresser opens) is closed with B pulses. `what` names the case
+ * in the log. Returns 1 when done (*frames counts the frames of the whole sequence). */
+static int aMR_PcLockMoves(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr, int ftr_id, xyz_t at, const char* what, int* frames) {
+    static const unsigned toward[4] = { 128u, 64u, 2u, 4u }, away[4] = { 64u, 128u, 4u, 2u }, side[4] = { 2u, 2u, 128u, 128u };
+    static unsigned denied0 = 0, att0[5];
+    static s16 angle0 = 0;
+    static int d = 0;
+    const int f = (*frames)++;
+    int k;
+    if (f == 0) {
+        for (k = 0; k < 5; k++) {
+            att0[k] = pc_net_game_dresser_move_attempt_count(k); /* 6l: the per-ACTION refusal counter (one per attempt) */
+        }
+        d = aMR_PcLockPlace(my_room, ftr, 0);
+        d = d < 0 ? 0 : d;
+        denied0 = pc_net_game_dresser_move_denied_count();
+        angle0 = ftr->s_angle_y;
+    }
+    if (f < 30 || f == 125 || f == 265) {
+        (void)aMR_PcLockPlace(my_room, ftr, 1);
+    }
+    if (f < 30) {
+        pc_net_game_test_set_lock_pad(0u);
+    } else if (f < 120) {
+        pc_net_game_test_set_lock_pad(1u | (f >= 40 ? toward[d] : 0u)); /* push: A held (grab), then the stick into the chest */
+    } else if (f == 120) {
+        const int there = aMR_PcLockChestThere(ftr, ftr_id, at);
+        printf("[NET][DRESSER][TEST-ONLY] lock: push (A held + stick into the chest) with %s: %s (refusals %u -> %u, notice %d, room state %d, chest still there %d)\n", what,
+               (there && pc_net_game_dresser_move_denied_count() > denied0) ? "REFUSED" : "NOT REFUSED", denied0, pc_net_game_dresser_move_denied_count(),
+               pc_net_game_room_edit_notice(), (int)my_room->state, there);
+        printf("[NET][DRESSER][TEST-ONLY] lock: push (A held + stick into the chest) with %s: ONE held input -> %u refused attempt(s) of this action (per-frame refusal calls %u)\n", what,
+               pc_net_game_dresser_move_attempt_count(3) - att0[3], pc_net_game_dresser_move_denied_count() - denied0);
+        denied0 = pc_net_game_dresser_move_denied_count();
+        pc_net_game_test_set_lock_pad(toward[d]); /* release A while still pushing (no open on release) */
+    } else if (f < 130) {
+        pc_net_game_test_set_lock_pad(0u);
+    } else if (f < 255) {
+        pc_net_game_test_set_lock_pad(1u | (f >= 140 ? away[d] : 0u)); /* pull: A held (grab), then the stick away from the chest */
+    } else if (f == 255) {
+        const int there = aMR_PcLockChestThere(ftr, ftr_id, at);
+        printf("[NET][DRESSER][TEST-ONLY] lock: pull (A held + stick away) with %s: %s (refusals %u -> %u, notice %d, room state %d, chest still there %d)\n", what,
+               (there && pc_net_game_dresser_move_denied_count() > denied0) ? "REFUSED" : "NOT REFUSED", denied0, pc_net_game_dresser_move_denied_count(),
+               pc_net_game_room_edit_notice(), (int)my_room->state, there);
+        printf("[NET][DRESSER][TEST-ONLY] lock: pull (A held + stick away) with %s: ONE held input -> %u refused attempt(s) of this action (per-frame refusal calls %u)\n", what,
+               pc_net_game_dresser_move_attempt_count(2) - att0[2], pc_net_game_dresser_move_denied_count() - denied0);
+        denied0 = pc_net_game_dresser_move_denied_count();
+        pc_net_game_test_set_lock_pad(away[d]); /* release A while still moving away (no open on release) */
+    } else if (f < 270) {
+        pc_net_game_test_set_lock_pad(0u);
+    } else if (f < 395) {
+        pc_net_game_test_set_lock_pad(1u | (f >= 280 ? side[d] : 0u)); /* rotate: A held, then the stick sideways */
+    } else if (f == 395) {
+        const int there = aMR_PcLockChestThere(ftr, ftr_id, at);
+        printf("[NET][DRESSER][TEST-ONLY] lock: rotate (A held + stick sideways) with %s: %s (refusals %u -> %u, notice %d, angle 0x%04X -> 0x%04X, chest still there %d)\n",
+               what, (there && ftr->s_angle_y == angle0 && pc_net_game_dresser_move_denied_count() > denied0) ? "REFUSED" : "NOT REFUSED", denied0,
+               pc_net_game_dresser_move_denied_count(), pc_net_game_room_edit_notice(), (unsigned)(u16)angle0, (unsigned)(u16)ftr->s_angle_y, there);
+        printf("[NET][DRESSER][TEST-ONLY] lock: rotate (A held + stick sideways) with %s: ONE held input -> %u refused attempt(s) of this action (per-frame refusal calls %u)\n", what,
+               pc_net_game_dresser_move_attempt_count(4) - att0[4], pc_net_game_dresser_move_denied_count() - denied0);
+        pc_net_game_test_set_lock_pad(side[d]);
+    } else if (f < 410) {
+        pc_net_game_test_set_lock_pad(0u);
+    } else {
+        /* close whatever opened (B pulses also run while an overlay / menu holds the frame) */
+        if (pc_dresser_ui_active() || my_room->msg_type != aMR_MSG_STATE_NONE || my_room->requested_msg_type != aMR_MSG_STATE_NONE || my_room->demo_flag) {
+            pc_net_game_test_set_lock_pad(0x100u | 8u);
+            if (f < 1400) {
+                return 0;
+            }
+        }
+        pc_net_game_test_set_lock_pad(0u);
+        *frames = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* TEST-ONLY 6l: a vanilla keep-slot put / take on the chest through the room's own vanilla operations (aMR_PcGyroidVanillaPut / Take = mTG_putin_proc +
+ * aMR_ItemPutInFurniture / the vanilla take-out). Returns the item moved (0 = nothing). */
+static int aMR_PcLockKeep(FTR_ACTOR* ftr, int put) {
+    Private_c* priv = Common_Get(now_private);
+    int i, r = 0, item = 0;
+    aMR_pc_gyroid_ftr = ftr;
+    if (put) {
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            item = (int)priv->inventory.pockets[i];
+            if (item != EMPTY_NO && pc_dresser_item_vanilla_ok((unsigned)item) &&
+                mPr_GET_ITEM_COND(priv->inventory.item_conditions, i) == mPr_ITEM_COND_NORMAL) {
+                r = aMR_PcGyroidVanillaPut(item, i);
+                break;
+            }
+        }
+    } else {
+        item = (int)ftr->items[0];
+        r = aMR_PcGyroidVanillaTake(0);
+    }
+    aMR_pc_gyroid_ftr = NULL;
+    return r == 1 ? item : 0;
+}
+
+static int s_store_v = 0, s_store_f = 0, s_store_vs = -1, s_store_fs = -1; /* TEST-ONLY 6l "store" */
+static int s_moved_done = 0; /* TEST-ONLY "moved": the pickup + placement happened (the second open is the check) */
+static int s_moved_tries = 0;
+static void aMR_PcDresserLockTest(MY_ROOM_ACTOR* my_room, ACTOR* actorx, int* stage) {
+    static int frames = 0;
+    static unsigned denied0 = 0;
+    static xyz_t at;
+    static mActor_name_t chest = EMPTY_NO;
+    FTR_ACTOR* ftr = &l_aMR_work.ftr_actor_list[aMR_pc_ui_sel_ftr];
+    Private_c* priv = Common_Get(now_private);
+    int i, c, inpk = 0;
+
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        inpk += chest != EMPTY_NO && (priv->inventory.pockets[i] & ~3) == (chest & ~3);
+    }
+    switch (*stage) {
+        case 10: /* place next to the chest, facing it, for 40 frames */
+            if (frames == 0) {
+                {
+                    int fl0, ux0, uz0, it0;
+                    chest = aMR_PcDresserIdent(my_room, ftr, &fl0, &ux0, &uz0, &it0) ? (mActor_name_t)it0 : EMPTY_NO; /* the furniture ITEM id (a pocket holds it) */
+                }
+                at = ftr->position;
+                denied0 = pc_net_game_dresser_move_denied_count();
+                printf("[NET][DRESSER][TEST-ONLY] lock: chest 0x%04X holds %d extra item(s); placing the player next to it (side %d)\n", (unsigned)chest,
+                       pc_net_game_dresser_count(), aMR_PcLockPlace(my_room, ftr, 0));
+            }
+            if (aMR_PcLockPlace(my_room, ftr, 1) < 0) {
+                printf("[NET][DRESSER][TEST-ONLY] lock: SKIPPED (no free unit next to the chest)\n");
+                *stage = 3;
+                return;
+            }
+            if (++frames >= 40) {
+                frames = 0;
+                *stage = 11;
+            }
+            return;
+        case 11: /* B = pickup, through the real pad path */
+        case 14:
+            pc_net_game_test_set_lock_pad(frames < 4 ? 8u : 0u);
+            if (++frames < 90) {
+                return;
+            }
+            frames = 0;
+            if (*stage == 11) {
+                const int there = aMR_PcLockChestThere(ftr, aMR_pc_ui_sel_ftr, at);
+                printf("[NET][DRESSER][TEST-ONLY] lock: B (pickup) with extra items: %s (refusals %u -> %u, notice %d, chest still there %d, chest in pockets %d)\n",
+                       (there && inpk == 0 && pc_net_game_dresser_move_denied_count() > denied0) ? "REFUSED" : "NOT REFUSED", denied0,
+                       pc_net_game_dresser_move_denied_count(), pc_net_game_room_edit_notice(), there, inpk);
+                denied0 = pc_net_game_dresser_move_denied_count();
+                *stage = 12;
+            } else {
+                const int there = aMR_PcLockChestThere(ftr, aMR_pc_ui_sel_ftr, at);
+                printf("[NET][DRESSER][TEST-ONLY] lock: B (pickup) after the extras were taken out: %s (refusals %u -> %u, chest still there %d, chest in pockets %d)\n",
+                       (!there && inpk == 1) ? "ALLOWED" : "NOT ALLOWED", denied0, pc_net_game_dresser_move_denied_count(), there, inpk);
+                frames = 0;
+                *stage = 4; /* leave the room: the furniture-sync commit carries the pickup */
+            }
+            return;
+        case 12: /* 6l: push / pull / rotate with extra items (a short A tap OPENS the dresser: the grab is A held + the stick) */
+            if (!aMR_PcLockMoves(my_room, ftr, aMR_pc_ui_sel_ftr, at, "extra items", &frames)) {
+                return;
+            }
+            at = ftr->position; /* 6q (S2): push / pull / rotate are allowed now: the chest may stand elsewhere */
+            frames = 0;
+            *stage = 13;
+            return;
+        case 13: /* take the extra item out (the real dresser page + kind-18 TAKE) */
+            if (frames == 0) {
+                aMR_pc_ui_test = TRUE;
+                aMR_pc_dresser_page = 0;
+                aMR_MsgInitPcDresserPage(actorx);
+                for (c = 0; c < mChoice_CHOICE_NUM && aMR_pc_dresser_map[c] < 0; c++) {
+                }
+                if (c == mChoice_CHOICE_NUM) {
+                    printf("[NET][DRESSER][TEST-ONLY] lock: no extra item to take out\n");
+                    *stage = 3;
+                    return;
+                }
+                aMR_PcDresserPick(my_room, c);
+                frames = 1;
+                return;
+            }
+            if (my_room->msg_type != aMR_MSG_STATE_NONE || my_room->requested_msg_type != aMR_MSG_STATE_NONE || pc_net_game_dresser_count() > 0) {
+                if (++frames < 600) {
+                    return;
+                }
+            }
+            aMR_pc_ui_test = FALSE;
+            printf("[NET][DRESSER][TEST-ONLY] lock: TAKE %s, the chest holds %d extra item(s) now\n", aMR_pc_txn_last == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED",
+                   pc_net_game_dresser_count());
+            frames = 0;
+            *stage = (pc_net_game_dresser_count() == 0) ? 40 : 3;
+            return;
+        case 20: /* "direct": A in front of the chest through the real pad path: the 27-slot screen opens directly, or the vanilla menu (fallback) */
+            if (frames < 40) {
+                (void)aMR_PcLockPlace(my_room, ftr, 1);
+            }
+            pc_net_game_test_set_lock_pad((frames >= 40 && frames < 44) ? 1u : 0u);
+            frames++;
+            if (pc_dresser_ui_active()) {
+                printf("[NET][DRESSER][TEST-ONLY] direct: the 27-slot screen is OPEN (%d extra item(s)) after %d frames\n", pc_net_game_dresser_count(), frames);
+                pc_net_game_test_set_lock_pad(0x100u | 8u); /* B pulses while the overlay runs (this hook is not called then) */
+                frames = 0;
+                *stage = 21;
+                return;
+            }
+            if (my_room->msg_type >= aMR_MSG_STATE_OWNER_NO_ITEM && my_room->msg_type <= aMR_MSG_STATE_OWNER_WHICH_PUT_OUT3) {
+                printf("[NET][DRESSER][TEST-ONLY] direct: the VANILLA dresser menu opened (msg state %d) after %d frames\n", (int)my_room->msg_type, frames);
+                pc_net_game_test_set_lock_pad(0x100u | 8u);
+                frames = 0;
+                *stage = 21;
+                return;
+            }
+            if (s_moved_done && frames > 120 && s_moved_tries < 40) { /* "moved": the open was refused for now (notice 4): try again until it opens */
+                s_moved_tries++;
+                printf("[NET][DRESSER][TEST-ONLY] moved: nothing opened (try %d, notice %d) -- A again\n", s_moved_tries, pc_net_game_room_edit_notice());
+                pc_net_game_test_set_lock_pad(0u);
+                frames = 0;
+                return;
+            }
+            if (frames > 600) {
+                printf("[NET][DRESSER][TEST-ONLY] direct: nothing opened (A not taken as an open, msg %d demo %d)\n", (int)my_room->msg_type, (int)my_room->demo_flag);
+                pc_net_game_test_set_lock_pad(0u);
+                frames = 0;
+                *stage = 4;
+            }
+            return;
+        case 21: /* close whatever opened with B (pulsed by the pad hook), then leave the room */
+            pc_net_game_test_set_lock_pad(0x100u | 8u);
+            frames++;
+            if ((!pc_dresser_ui_active() && my_room->msg_type == aMR_MSG_STATE_NONE && my_room->requested_msg_type == aMR_MSG_STATE_NONE && frames > 60) || frames > 900) {
+                pc_net_game_test_set_lock_pad(0u);
+                printf("[NET][DRESSER][TEST-ONLY] direct: closed (msg %d, screen %d)\n", (int)my_room->msg_type, pc_dresser_ui_active());
+                frames = 0;
+                *stage = 4;
+                if (strcmp(pc_test_hook_getenv("AC_TEST_DRESSER_UI"), "moved") == 0 && !s_moved_done) {
+                    *stage = 33; /* "moved": now pick the (empty) dresser up and place it again, then open it again */
+                }
+            }
+            return;
+        case 33: /* "moved" (the user's 10:3x sequence): B = a REAL pickup of the EMPTY chest into a pocket, then it is placed again in front of the player
+                  * through the inventory's own drop path (m_tag_ovl.c mTG_drop_furniture: judge_breed_new_ftr_proc + reserve_ftr_proc, the pocket
+                  * emptied, mMkRm_ReportChangePlayerRoom) -- the menu navigation itself is not scripted */
+        {
+            static int item0 = 0;
+            if (frames == 0) {
+                int fl0, ux0, uz0;
+                at = ftr->position;
+                item0 = 0;
+                (void)aMR_PcDresserIdent(my_room, ftr, &fl0, &ux0, &uz0, &item0);
+            }
+            if (frames < 40) {
+                (void)aMR_PcLockPlace(my_room, ftr, 1);
+            }
+            pc_net_game_test_set_lock_pad((frames >= 40 && frames < 44) ? 8u : 0u);
+            if (++frames < 160) {
+                return;
+            }
+            {
+                int k, slot = -1, idx = -1;
+                for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                    if (item0 != 0 && (priv->inventory.pockets[k] & ~3) == (mActor_name_t)(item0 & ~3)) {
+                        slot = k;
+                    }
+                }
+                printf("[NET][DRESSER][TEST-ONLY] moved: B pickup of the chest 0x%04X: %s (pocket %d)\n", (unsigned)item0, slot >= 0 ? "IN A POCKET" : "NOT picked up", slot);
+                if (slot >= 0 && aMR_CLIP != NULL) {
+                    int sq_ofs, layer, ux, uz, d;
+                    u16 rot;
+                    {
+                        /* stand on a free cell next to the ORIGINAL cell, facing away from it: the drop then lands TWO cells away (a real move, like the user's) */
+                        static const int dx[4] = { 0, 0, 1, -1 }, dz[4] = { 1, -1, 0, 0 };
+                        static const s16 face[4] = { 0, (s16)0x8000, 0x4000, (s16)0xC000 };
+                        mActor_name_t* fg0 = aMR_GetLayerTopFg(mCoBG_LAYER0);
+                        PLAYER_ACTOR* pl = GET_PLAYER_ACTOR((GAME_PLAY*)gamePT);
+                        int ox = -1, oz = -1;
+                        (void)aMR_Wpos2PlaceNumber(&ox, &oz, at, 0);
+                        for (d = 0; fg0 != NULL && pl != NULL && d < 4; d++) {
+                            const int x1 = ox + dx[d], z1 = oz + dz[d], x2 = ox + 2 * dx[d], z2 = oz + 2 * dz[d];
+                            if (x2 >= 1 && x2 < UT_X_NUM - 1 && z2 >= 1 && z2 < UT_Z_NUM - 1 && fg0[x1 + z1 * UT_X_NUM] == EMPTY_NO && fg0[x2 + z2 * UT_X_NUM] == EMPTY_NO) {
+                                xyz_t pos;
+                                mFI_UtNum2CenterWpos(&pos, x1, z1);
+                                pos.y = pl->actor_class.world.position.y;
+                                pl->actor_class.world.position = pos;
+                                pl->actor_class.shape_info.rotation.y = face[d];
+                                pl->actor_class.world.angle.y = face[d];
+                                printf("[NET][DRESSER][TEST-ONLY] moved: player at cell %d,%d facing away from the old cell %d,%d\n", x1, z1, ox, oz);
+                                break;
+                            }
+                        }
+                    }
+                    const mActor_name_t put_item = priv->inventory.pockets[slot];
+                    const u16 ftrIdx = (u16)mRmTp_FtrItemNo2FtrIdx(put_item);
+                    idx = aMR_CLIP->judge_breed_new_ftr_proc(gamePT, ftrIdx, &ux, &uz, &rot, &sq_ofs, &layer);
+                    if (idx >= 0) {
+                        aMR_CLIP->reserve_ftr_proc(gamePT, ftrIdx, idx, ux, uz, rot, sq_ofs, layer);
+                        mPr_SetPossessionItem(priv, slot, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+                        mMkRm_ReportChangePlayerRoom();
+                    }
+                    printf("[NET][DRESSER][TEST-ONLY] moved: placed again from pocket %d (drop path: free %d, cell %d,%d, layer %d)\n", slot, idx, ux, uz, layer);
+                    {
+                        extern void pc_net_game_test_hold_inroom_commit(unsigned ms);
+                        const char* hold = pc_test_hook_getenv("AC_TEST_HCL_HOLD_MS");
+                        if (hold != NULL) {
+                            pc_net_game_test_hold_inroom_commit((unsigned)strtoul(hold, NULL, 10)); /* the commit lands only after this: A in between meets notice 4 */
+                        }
+                    }
+                }
+            }
+            frames = 0;
+            *stage = 34;
+            return;
+        }
+        case 34: /* wait while the room settles (the in-room commit may land), then find the placed chest (a NEW furniture actor) and open it again */
+            pc_net_game_test_set_lock_pad(0u);
+            if (++frames < 30) { /* the user's case: A again SHORTLY after the placement (the move is not committed yet) */
+                return;
+            }
+            {
+                int i;
+                for (i = 0; i < l_aMR_work.list_size; i++) {
+                    int fl1, ux1, uz1, it1;
+                    if (l_aMR_work.used_list[i] &&
+                        aMR_PcDresserIdent(my_room, &l_aMR_work.ftr_actor_list[i], &fl1, &ux1, &uz1, &it1) && aMR_pc_ftr_is_item_storage(it1)) {
+                        aMR_pc_ui_sel_ftr = i;
+                        printf("[NET][DRESSER][TEST-ONLY] moved: the chest now stands at cell %d,%d (furniture %d)\n", ux1, uz1, i);
+                        break;
+                    }
+                }
+            }
+            s_moved_done = 1;
+            frames = 0;
+            *stage = 35;
+            return;
+        case 35: /* 6l "moved": B (pickup) on the moved chest whose cell is not committed yet: UNKNOWN -> refused for now with notice 4 (never notice 3) */
+        {
+            static int born = 0;
+            if (frames == 0 && born == 0) {
+                denied0 = pc_net_game_dresser_move_denied_count();
+                at = ftr->position;
+            }
+            if (born == 0) { /* the placed piece first plays its birth animation (no pickup / open judge before it stops) */
+                if (ftr->state != aFTR_STATE_STOP && ++frames < 400) {
+                    return;
+                }
+                born = 1;
+                frames = 0;
+            }
+            if (frames < 20) {
+                (void)aMR_PcLockPlace(my_room, ftr, 1);
+            }
+            pc_net_game_test_set_lock_pad((frames >= 20 && frames < 24) ? 8u : 0u);
+            if (++frames < 40) {
+                return;
+            }
+        }
+            {
+                const int there = aMR_PcLockChestThere(ftr, aMR_pc_ui_sel_ftr, at);
+                printf("[NET][DRESSER][TEST-ONLY] moved: B (pickup) of the uncommitted chest: %s (refusals %u -> %u, notice %d, chest still there %d, chest in pockets %d)\n",
+                       (there && inpk == 0 && pc_net_game_dresser_move_denied_count() > denied0) ? "REFUSED" : "NOT REFUSED", denied0,
+                       pc_net_game_dresser_move_denied_count(), pc_net_game_room_edit_notice(), there, inpk);
+            }
+            frames = 0;
+            *stage = 20;
+            return;
+        case 40: /* 6l 27-slot lock: one ordinary pocket item into a VANILLA keep slot, then wait until the host's canonical image holds it (in-room commit) */
+        {
+            static int keep_item = 0;
+            int fl0, ux0, uz0, it0;
+            if (frames == 0) {
+                keep_item = aMR_PcLockKeep(ftr, 1);
+                printf("[NET][DRESSER][TEST-ONLY] lock: vanilla keep put of 0x%04X into the chest: %s\n", (unsigned)keep_item, keep_item != 0 ? "DONE" : "NOTHING TO PUT");
+                if (keep_item == 0) {
+                    *stage = 3;
+                    return;
+                }
+            }
+            frames++;
+            if (aMR_PcDresserIdent(my_room, ftr, &fl0, &ux0, &uz0, &it0) && pc_net_game_dresser_keep_lock(fl0, ftr->layer, ux0, uz0, it0, 0) == 2) {
+                printf("[NET][DRESSER][TEST-ONLY] lock: the keep item 0x%04X is COMMITTED (host canonical image) after %d frames\n", (unsigned)keep_item, frames);
+                frames = 0;
+                *stage = 41;
+                return;
+            }
+            if (frames > 1500) {
+                printf("[NET][DRESSER][TEST-ONLY] lock: the keep put was NOT committed after %d frames\n", frames);
+                frames = 0;
+                *stage = 41;
+            }
+            return;
+        }
+        case 41: /* B = pickup with a vanilla keep item */
+            if (frames == 0) {
+                denied0 = pc_net_game_dresser_move_denied_count();
+            }
+            if (frames < 30) {
+                (void)aMR_PcLockPlace(my_room, ftr, 1);
+            }
+            pc_net_game_test_set_lock_pad((frames >= 30 && frames < 34) ? 8u : 0u);
+            if (++frames < 120) {
+                return;
+            }
+            {
+                const int there = aMR_PcLockChestThere(ftr, aMR_pc_ui_sel_ftr, at);
+                printf("[NET][DRESSER][TEST-ONLY] lock: B (pickup) with a vanilla keep item: %s (refusals %u -> %u, notice %d, chest still there %d, chest in pockets %d)\n",
+                       (there && inpk == 0 && pc_net_game_dresser_move_denied_count() > denied0) ? "REFUSED" : "NOT REFUSED", denied0,
+                       pc_net_game_dresser_move_denied_count(), pc_net_game_room_edit_notice(), there, inpk);
+            }
+            frames = 0;
+            *stage = 42;
+            return;
+        case 42: /* push / pull / rotate with a vanilla keep item */
+            if (!aMR_PcLockMoves(my_room, ftr, aMR_pc_ui_sel_ftr, at, "a vanilla keep item", &frames)) {
+                return;
+            }
+            at = ftr->position; /* 6q (S2) */
+            frames = 0;
+            *stage = 43;
+            return;
+        case 43: /* take the keep item out (vanilla) and press B AT ONCE: the take-out is not committed yet -> refused for now (notice 4) */
+            if (frames == 0) {
+                const int it = aMR_PcLockKeep(ftr, 0);
+                printf("[NET][DRESSER][TEST-ONLY] lock: vanilla keep take of 0x%04X out of the chest: %s\n", (unsigned)it, it != 0 ? "DONE" : "FAILED");
+                denied0 = pc_net_game_dresser_move_denied_count();
+                (void)aMR_PcLockPlace(my_room, ftr, 1);
+            }
+            pc_net_game_test_set_lock_pad(frames < 4 ? 8u : 0u);
+            if (++frames < 20) {
+                return;
+            }
+            {
+                const int there = aMR_PcLockChestThere(ftr, aMR_pc_ui_sel_ftr, at);
+                printf("[NET][DRESSER][TEST-ONLY] lock: B (pickup) right after the uncommitted keep take-out: %s (refusals %u -> %u, notice %d, chest still there %d, chest in pockets %d)\n",
+                       (there && inpk == 0 && pc_net_game_dresser_move_denied_count() > denied0) ? "REFUSED" : "NOT REFUSED", denied0,
+                       pc_net_game_dresser_move_denied_count(), pc_net_game_room_edit_notice(), there, inpk);
+            }
+            frames = 0;
+            *stage = 44;
+            return;
+        case 44: /* wait until the take-out is committed (the canonical keep slots are empty again), then the allowed pickup (15 -> 14) */
+        {
+            int fl0, ux0, uz0, it0;
+            pc_net_game_test_set_lock_pad(0u);
+            frames++;
+            if ((aMR_PcDresserIdent(my_room, ftr, &fl0, &ux0, &uz0, &it0) && pc_net_game_dresser_keep_lock(fl0, ftr->layer, ux0, uz0, it0, 0) == 0 && frames > 60) ||
+                frames > 1500) {
+                printf("[NET][DRESSER][TEST-ONLY] lock: the keep take-out is %s after %d frames\n", frames > 1500 ? "NOT committed" : "COMMITTED", frames);
+                denied0 = pc_net_game_dresser_move_denied_count();
+                frames = 0;
+                *stage = 15;
+            }
+            return;
+        }
+        case 50: /* 6l "store" (AC_TEST_DRESSER_UI=store): the dresser screen's own put / take logic (pc_dresser_ui_put / _take / _poll with the room's vanilla
+                  * keep-slot operations, exactly what the 27-slot screen calls; the pad / window are not driven): an ordinary item goes into a VANILLA slot, then a
+                  * furniture item (extras only) right after it is refused because the room holds that uncommitted edit -> notice 5 (never "full") */
+        {
+            unsigned short van[PC_DRESSER_UI_VANILLA];
+            int k, r1 = -1, r2 = -1;
+            s_store_v = s_store_f = 0;
+            s_store_vs = s_store_fs = -1;
+            for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                const int it = (int)priv->inventory.pockets[k];
+                if (it == EMPTY_NO || mPr_GET_ITEM_COND(priv->inventory.item_conditions, k) != mPr_ITEM_COND_NORMAL || !pc_net_game_dresser_item_storable(it)) {
+                    continue;
+                }
+                if (s_store_vs < 0 && pc_dresser_item_vanilla_ok((unsigned)it)) {
+                    s_store_vs = k;
+                    s_store_v = it;
+                } else if (s_store_fs < 0 && !pc_dresser_item_vanilla_ok((unsigned)it)) {
+                    s_store_fs = k;
+                    s_store_f = it;
+                }
+            }
+            if (s_store_vs < 0 || s_store_fs < 0) {
+                printf("[NET][DRESSER][TEST-ONLY] store: SKIPPED (pockets need an ordinary item and a furniture item: %d %d)\n", s_store_vs, s_store_fs);
+                *stage = 3;
+                return;
+            }
+            aMR_pc_gyroid_ftr = ftr;
+            for (k = 0; k < PC_DRESSER_UI_VANILLA; k++) {
+                van[k] = (unsigned short)ftr->items[k];
+            }
+            pc_dresser_ui_begin(van);
+            pc_dresser_ui_set_vanilla_ops(aMR_PcGyroidVanillaTake, aMR_PcGyroidVanillaPut);
+            r1 = pc_dresser_ui_put(s_store_vs);
+            printf("[NET][DRESSER][TEST-ONLY] store: put of the ordinary item 0x%04X (pocket %d) -> act %d (vanilla slots 0x%04X 0x%04X 0x%04X)\n", (unsigned)s_store_v,
+                   s_store_vs, r1, (unsigned)ftr->items[0], (unsigned)ftr->items[1], (unsigned)ftr->items[2]);
+            r2 = pc_dresser_ui_put(s_store_fs);
+            printf("[NET][DRESSER][TEST-ONLY] store: put of the furniture 0x%04X (pocket %d) right after it -> act %d (%s), notice %d, extras %d, pocket still 0x%04X\n",
+                   (unsigned)s_store_f, s_store_fs, r2, r2 == PC_DRESSER_UI_ACT_REFUSED ? "REFUSED" : r2 == PC_DRESSER_UI_ACT_FULL ? "FULL" : r2 == PC_DRESSER_UI_ACT_PENDING ? "DEFERRED" : "other",
+                   pc_net_game_room_edit_notice(), pc_net_game_dresser_count(), (unsigned)priv->inventory.pockets[s_store_fs]);
+            pc_dresser_ui_set_vanilla_ops(NULL, NULL);
+            pc_dresser_ui_end(); /* "close the dresser" */
+            aMR_pc_gyroid_ftr = NULL;
+            frames = 0;
+            *stage = 51;
+            return;
+        }
+        case 51: /* wait until the vanilla put is committed (the host's canonical image holds the keep item) */
+        {
+            int fl0, ux0, uz0, it0;
+            frames++;
+            if ((aMR_PcDresserIdent(my_room, ftr, &fl0, &ux0, &uz0, &it0) && pc_net_game_dresser_keep_lock(fl0, ftr->layer, ux0, uz0, it0, 0) == 2) || frames > 1500) {
+                printf("[NET][DRESSER][TEST-ONLY] store: the vanilla put is %s after %d frames\n", frames > 1500 ? "NOT committed" : "COMMITTED", frames);
+                frames = 0;
+                *stage = 52;
+            }
+            return;
+        }
+        case 52: /* "reopen" and put the furniture again: an extra slot now */
+        {
+            unsigned short van[PC_DRESSER_UI_VANILLA];
+            int k, r;
+            aMR_pc_gyroid_ftr = ftr;
+            for (k = 0; k < PC_DRESSER_UI_VANILLA; k++) {
+                van[k] = (unsigned short)ftr->items[k];
+            }
+            pc_dresser_ui_begin(van);
+            pc_dresser_ui_set_vanilla_ops(aMR_PcGyroidVanillaTake, aMR_PcGyroidVanillaPut);
+            r = pc_dresser_ui_put(s_store_fs);
+            printf("[NET][DRESSER][TEST-ONLY] store: reopened; put of the furniture 0x%04X -> act %d (%s)\n", (unsigned)s_store_f, r,
+                   r == PC_DRESSER_UI_ACT_PENDING ? "host transaction" : "not sent");
+            frames = 0;
+            *stage = r == PC_DRESSER_UI_ACT_PENDING ? 53 : 55;
+            return;
+        }
+        case 53: /* the host's answer to the extra put, then take the extra item back */
+        case 54: /* the host's answer to the extra take, then take the vanilla item back */
+        {
+            const int r = pc_dresser_ui_poll();
+            int k, col = -1, t;
+            if (r == PC_DRESSER_UI_ACT_PENDING && ++frames < 900) {
+                return;
+            }
+            printf("[NET][DRESSER][TEST-ONLY] store: extra %s of 0x%04X -> host answer %s (extras %d)\n", *stage == 53 ? "PUT" : "TAKE", (unsigned)s_store_f,
+                   r == PC_DRESSER_UI_ACT_DONE ? "APPLIED" : "NOT APPLIED", pc_net_game_dresser_count());
+            frames = 0;
+            if (*stage == 53) {
+                for (k = 0; k < PC_NETGAME_DRESSER_SLOTS; k++) {
+                    if (pc_net_game_dresser_item(k) == s_store_f) {
+                        col = pc_dresser_ui_col(PC_DRESSER_UI_SLOT_EXTRA, k); /* 6q mapping */
+                        break;
+                    }
+                }
+                t = col >= 0 ? pc_dresser_ui_take(col) : -1;
+                printf("[NET][DRESSER][TEST-ONLY] store: take of the extra slot (grid %d) -> act %d\n", col, t);
+                *stage = t == PC_DRESSER_UI_ACT_PENDING ? 54 : 55;
+                return;
+            }
+            for (k = 0; k < PC_DRESSER_UI_VANILLA; k++) {
+                if ((int)ftr->items[k] == s_store_v) {
+                    col = k;
+                    break;
+                }
+            }
+            t = col >= 0 ? pc_dresser_ui_take(pc_dresser_ui_col(PC_DRESSER_UI_SLOT_VANILLA, col)) : -1;
+            printf("[NET][DRESSER][TEST-ONLY] store: take of the vanilla slot %d -> act %d\n", col, t);
+            *stage = 55;
+            return;
+        }
+        case 55:
+        {
+            int k, nv = 0, nf = 0;
+            for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                nv += (int)priv->inventory.pockets[k] == s_store_v;
+                nf += (int)priv->inventory.pockets[k] == s_store_f;
+            }
+            printf("[NET][DRESSER][TEST-ONLY] store: done: the ordinary item 0x%04X in pockets %d, the furniture 0x%04X in pockets %d, extras %d, vanilla slots 0x%04X 0x%04X 0x%04X\n",
+                   (unsigned)s_store_v, nv, (unsigned)s_store_f, nf, pc_net_game_dresser_count(), (unsigned)ftr->items[0], (unsigned)ftr->items[1],
+                   (unsigned)ftr->items[2]);
+            pc_dresser_ui_set_vanilla_ops(NULL, NULL);
+            pc_dresser_ui_end();
+            aMR_pc_gyroid_ftr = NULL;
+            frames = 0;
+            *stage = 4; /* leave the room: the vanilla take-out is committed by furniture sync */
+            return;
+        }
+        case 60: /* 6l "keep": one ordinary pocket item into a VANILLA keep slot, wait until the host's canonical image holds it, then leave the room */
+        {
+            int fl0, ux0, uz0, it0;
+            if (frames == 0) {
+                const int it = aMR_PcLockKeep(ftr, 1);
+                printf("[NET][DRESSER][TEST-ONLY] keep: vanilla keep put of 0x%04X into the chest: %s\n", (unsigned)it, it != 0 ? "DONE" : "NOTHING TO PUT");
+                if (it == 0) {
+                    *stage = 3;
+                    return;
+                }
+            }
+            frames++;
+            if ((aMR_PcDresserIdent(my_room, ftr, &fl0, &ux0, &uz0, &it0) && pc_net_game_dresser_keep_lock(fl0, ftr->layer, ux0, uz0, it0, 0) == 2) || frames > 1500) {
+                printf("[NET][DRESSER][TEST-ONLY] keep: the keep item is %s after %d frames (cell %d,%d)\n", frames > 1500 ? "NOT committed" : "COMMITTED", frames, ux0, uz0);
+                frames = 0;
+                *stage = 4;
+            }
+            return;
+        }
+        case 70: /* 6o "ftrmix" (the user's 13:2x session): FURNITURE put first (extras, host transaction) */
+        case 72: /* reopened: take the furniture back (extras) */
+        {
+            unsigned short van[PC_DRESSER_UI_VANILLA];
+            int k, r = -1;
+            if (*stage == 70) {
+                s_store_v = s_store_f = 0;
+                s_store_vs = s_store_fs = -1;
+                for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                    const int it = (int)priv->inventory.pockets[k];
+                    if (it == EMPTY_NO || mPr_GET_ITEM_COND(priv->inventory.item_conditions, k) != mPr_ITEM_COND_NORMAL || !pc_net_game_dresser_item_storable(it)) {
+                        continue;
+                    }
+                    if (s_store_vs < 0 && pc_dresser_item_vanilla_ok((unsigned)it)) {
+                        s_store_vs = k;
+                        s_store_v = it;
+                    } else if (s_store_fs < 0 && !pc_dresser_item_vanilla_ok((unsigned)it)) {
+                        s_store_fs = k;
+                        s_store_f = it;
+                    }
+                }
+                if (s_store_vs < 0 || s_store_fs < 0) {
+                    printf("[NET][DRESSER][TEST-ONLY] ftrmix: SKIPPED (pockets need an ordinary item and a furniture item)\n");
+                    *stage = 3;
+                    return;
+                }
+            }
+            aMR_pc_gyroid_ftr = ftr;
+            for (k = 0; k < PC_DRESSER_UI_VANILLA; k++) {
+                van[k] = (unsigned short)ftr->items[k];
+            }
+            pc_dresser_ui_begin(van);
+            pc_dresser_ui_set_vanilla_ops(aMR_PcGyroidVanillaTake, aMR_PcGyroidVanillaPut);
+            if (*stage == 70) {
+                r = pc_dresser_ui_put(s_store_fs);
+                printf("[NET][DRESSER][TEST-ONLY] ftrmix: put of the furniture 0x%04X (pocket %d) -> act %d\n", (unsigned)s_store_f, s_store_fs, r);
+            } else {
+                for (k = 0; k < PC_NETGAME_DRESSER_SLOTS; k++) {
+                    if (pc_net_game_dresser_item(k) == s_store_f) {
+                        r = pc_dresser_ui_take(pc_dresser_ui_col(PC_DRESSER_UI_SLOT_EXTRA, k));
+                        printf("[NET][DRESSER][TEST-ONLY] ftrmix: reopened; take of the furniture 0x%04X from grid %d -> act %d (notice %d)\n", (unsigned)s_store_f,
+                               pc_dresser_ui_col(PC_DRESSER_UI_SLOT_EXTRA, k), r, pc_net_game_room_edit_notice());
+                        break;
+                    }
+                }
+            }
+            frames = 0;
+            *stage = r == PC_DRESSER_UI_ACT_PENDING ? *stage + 1 + 100 : 75; /* 171 / 173: wait for the host answer */
+            return;
+        }
+        case 171: /* the furniture PUT answered: put the ordinary item (vanilla slot = a room edit), close the screen */
+        case 173: /* the furniture TAKE answered: take the ordinary item back (vanilla), close, leave */
+        {
+            const int r = pc_dresser_ui_poll();
+            int k, t;
+            if (r == PC_DRESSER_UI_ACT_PENDING && ++frames < 900) {
+                return;
+            }
+            printf("[NET][DRESSER][TEST-ONLY] ftrmix: extra %s of 0x%04X -> host answer %s (extras %d)\n", *stage == 171 ? "PUT" : "TAKE", (unsigned)s_store_f,
+                   r == PC_DRESSER_UI_ACT_DONE ? "APPLIED" : "NOT APPLIED", pc_net_game_dresser_count());
+            if (*stage == 171) {
+                t = pc_dresser_ui_put(s_store_vs);
+                printf("[NET][DRESSER][TEST-ONLY] ftrmix: put of the ordinary item 0x%04X -> act %d (vanilla slots 0x%04X 0x%04X 0x%04X)\n", (unsigned)s_store_v, t,
+                       (unsigned)ftr->items[0], (unsigned)ftr->items[1], (unsigned)ftr->items[2]);
+            } else {
+                for (k = 0, t = -1; k < PC_DRESSER_UI_VANILLA; k++) {
+                    if ((int)ftr->items[k] == s_store_v) {
+                        t = pc_dresser_ui_take(pc_dresser_ui_col(PC_DRESSER_UI_SLOT_VANILLA, k));
+                        break;
+                    }
+                }
+                printf("[NET][DRESSER][TEST-ONLY] ftrmix: take of the ordinary item from vanilla slot %d -> act %d\n", k, t);
+            }
+            pc_dresser_ui_set_vanilla_ops(NULL, NULL);
+            pc_dresser_ui_end(); /* close the dresser */
+            aMR_pc_gyroid_ftr = NULL;
+            frames = 0;
+            *stage = *stage == 171 ? 71 : 75;
+            return;
+        }
+        case 71: /* closed: wait until the vanilla put is committed in the room (or give up after 1500 frames), then reopen */
+        {
+            int fl0, ux0, uz0, it0;
+            frames++;
+            if ((aMR_PcDresserIdent(my_room, ftr, &fl0, &ux0, &uz0, &it0) && pc_net_game_dresser_keep_lock(fl0, ftr->layer, ux0, uz0, it0, 0) == 2) || frames > 1500) {
+                printf("[NET][DRESSER][TEST-ONLY] ftrmix: the vanilla put is %s after %d frames\n", frames > 1500 ? "NOT committed" : "COMMITTED", frames);
+                frames = 0;
+                *stage = 72;
+            }
+            return;
+        }
+        case 75:
+        {
+            int k, nv = 0, nf = 0;
+            if (pc_dresser_ui_active()) {
+                pc_dresser_ui_set_vanilla_ops(NULL, NULL);
+                pc_dresser_ui_end();
+                aMR_pc_gyroid_ftr = NULL;
+            }
+            for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                nv += (int)priv->inventory.pockets[k] == s_store_v;
+                nf += (int)priv->inventory.pockets[k] == s_store_f;
+            }
+            printf("[NET][DRESSER][TEST-ONLY] ftrmix: done: the ordinary item 0x%04X in pockets %d, the furniture 0x%04X in pockets %d, extras %d\n", (unsigned)s_store_v, nv,
+                   (unsigned)s_store_f, nf, pc_net_game_dresser_count());
+            frames = 0;
+            *stage = 4;
+            return;
+        }
+        case 15: /* placed again, then B */
+            (void)aMR_PcLockPlace(my_room, ftr, 1);
+            if (++frames >= 40) {
+                frames = 0;
+                *stage = 14;
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+static void aMR_PcDresserUiTestHook(ACTOR* actorx) {
+    static int stage = 0; /* 0 wait, 1 PUT running, 2 TAKE running, 3 done */
+    static int frames = 0, before = 0;
+    static mActor_name_t item = EMPTY_NO;
+    MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
+    Private_c* priv = Common_Get(now_private);
+    int i, c;
+
+    if (stage == 3 || priv == NULL) {
+        return;
+    }
+    if (stage >= 10) {
+        aMR_PcDresserLockTest(my_room, actorx, &stage);
+        if (stage == 4) {
+            frames = 0;
+        }
+        return;
+    }
+    if (stage == 0) {
+        if (pc_test_hook_getenv("AC_TEST_DRESSER_UI") == NULL) {
+            stage = 3;
+            return;
+        }
+        static int off_frames = 0; /* "direct" against a host WITHOUT the feature: proceed after ~900 frames (the vanilla menu is the expected result) */
+        const int direct_mode = strcmp(pc_test_hook_getenv("AC_TEST_DRESSER_UI"), "direct") == 0 || strcmp(pc_test_hook_getenv("AC_TEST_DRESSER_UI"), "moved") == 0;
+        if ((!aMR_PcDresserOn() && !(direct_mode && ++off_frames > 900)) || my_room->requested_msg_type != aMR_MSG_STATE_NONE ||
+            my_room->msg_type != aMR_MSG_STATE_NONE || ++frames < 120) {
+            static int diag = 0;
+
+            if ((++diag % 300) == 1) {
+                printf("[NET][DRESSER][TEST-ONLY] ui: waiting (available=%d edit_locked=%d requested=%d msg_type=%d frames=%d)\n", pc_net_game_dresser_available(),
+                       pc_net_game_client_room_edit_locked(), (int)my_room->requested_msg_type, (int)my_room->msg_type, frames);
+            }
+            return;
+        }
+        {
+            /* v2: select a real furniture of the own room first (the first used actor whose identity resolves) and wait for its STATE */
+            static int selected_ftr = -1;
+            if (selected_ftr < 0) {
+                const char* want_e = pc_test_hook_getenv("AC_TEST_DRESSER_UI_FTR"); /* optional: the furniture item (hex) to use as the dresser */
+                const int want = want_e != NULL ? (int)strtol(want_e, NULL, 16) : -1;
+                for (i = 0; i < l_aMR_work.list_size; i++) {
+                    int fl, ux, uz, it;
+                    if (l_aMR_work.used_list[i] && aMR_PcDresserIdent(my_room, &l_aMR_work.ftr_actor_list[i], &fl, &ux, &uz, &it) &&
+                        aMR_pc_ftr_is_item_storage(it) && (want < 0 || (it & ~3) == (want & ~3))) {
+                        selected_ftr = i;
+                        aMR_pc_ui_sel_ftr = i;
+                        if (strcmp(pc_test_hook_getenv("AC_TEST_DRESSER_UI"), "direct") != 0 && strcmp(pc_test_hook_getenv("AC_TEST_DRESSER_UI"), "moved") != 0) {
+                            /* "direct" / "moved": the A press itself selects (the real path) */
+                            aMR_PcDresserSelectFtr(my_room, &l_aMR_work.ftr_actor_list[i]);
+                        }
+                        printf("[NET][DRESSER][TEST-ONLY] ui: selected the room furniture %d (floor %d layer %d cell %d,%d item 0x%04X)\n", i, fl,
+                               (int)l_aMR_work.ftr_actor_list[i].layer, ux, uz, (unsigned)it);
+                        break;
+                    }
+                }
+                if (selected_ftr < 0) {
+                    printf("[NET][DRESSER][TEST-ONLY] ui: SKIPPED (no furniture in the own room)\n");
+                    stage = 3;
+                }
+                return;
+            }
+            if (strcmp(pc_test_hook_getenv("AC_TEST_DRESSER_UI"), "direct") == 0 || strcmp(pc_test_hook_getenv("AC_TEST_DRESSER_UI"), "moved") == 0) {
+                stage = 20; /* "direct": no pre-selection, no view wait (the timeout / refusal fallbacks must stay reachable) */
+                return;
+            }
+            if (!pc_net_game_dresser_view_ready()) {
+                aMR_PcDresserSelectFtr(my_room, &l_aMR_work.ftr_actor_list[selected_ftr]); /* re-asks after ~3 s without an answer */
+                return;
+            }
+        }
+        aMR_pc_ui_test = TRUE;
+        {
+            /* "gyroid": the REAL gyroid-style overlay in dresser mode, driven by the scripted pad input (AC_TEST_DRESSER_GYROID, pc_pad.c) */
+            const char* g = pc_test_hook_getenv("AC_TEST_DRESSER_UI");
+            if (g != NULL && strcmp(g, "lock") == 0) {
+                aMR_pc_ui_test = FALSE;
+                stage = 10;
+                return;
+            }
+            if (g != NULL && strcmp(g, "ftrmix") == 0) { /* 6o: the user's sequence: furniture -> extras, ordinary -> vanilla, close, reopen, take both */
+                aMR_pc_ui_test = FALSE;
+                stage = 70;
+                return;
+            }
+            if (g != NULL && strcmp(g, "keep") == 0) { /* 6l: a committed vanilla keep item, then the room exit (the commit-guard test) */
+                aMR_pc_ui_test = FALSE;
+                stage = 60;
+                return;
+            }
+            if (g != NULL && strcmp(g, "store") == 0) { /* 6l: vanilla put, refused extra put (notice 5), commit, extra put, take both */
+                aMR_pc_ui_test = FALSE;
+                stage = 50;
+                return;
+            }
+            if (g != NULL && (strcmp(g, "direct") == 0 || strcmp(g, "moved") == 0)) { /* the direct-open path: the player presses A itself (no test-driven state) */
+                aMR_pc_ui_test = FALSE;
+                stage = 20;
+                return;
+            }
+            if (g != NULL && strcmp(g, "gyroid") == 0) {
+                my_room->demo_ftrID = aMR_pc_ui_sel_ftr;
+                my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_GYROID;
+                printf("[NET][DRESSER][TEST-ONLY] ui: gyroid overlay requested (dresser furniture %d, %d extra item(s))\n", aMR_pc_ui_sel_ftr, pc_net_game_dresser_count());
+                stage = 6;
+                return;
+            }
+        }
+        {
+            const char* e = pc_test_hook_getenv("AC_TEST_DRESSER_UI");
+            aMR_pc_ui_mode = (strcmp(e, "put") == 0) ? 1 : (strcmp(e, "take") == 0) ? 2 : 0; /* 0 put + take, 1 put only, 2 take only (the pool's first item) */
+        }
+        if (aMR_pc_ui_mode == 2) {
+            aMR_pc_dresser_page = 0;
+            aMR_MsgInitPcDresserPage(actorx);
+            for (c = 0; c < mChoice_CHOICE_NUM && aMR_pc_dresser_map[c] < 0; c++) {
+            }
+            if (c == mChoice_CHOICE_NUM) {
+                printf("[NET][DRESSER][TEST-ONLY] ui: take-only: the pool is empty\n");
+                stage = 3;
+                return;
+            }
+            item = (mActor_name_t)pc_net_game_dresser_item(aMR_pc_dresser_map[c]);
+            before = aMR_PcDresserUiTestCount(item);
+            printf("[NET][DRESSER][TEST-ONLY] ui: take-only: item 0x%04X, count before %d\n", (unsigned)item, before);
+            aMR_PcDresserPick(my_room, c);
+            printf("[NET][DRESSER][TEST-ONLY] ui: pool item choice %d picked -> %s\n", c, my_room->requested_msg_type == aMR_MSG_STATE_PC_DRESSER_TXN ? "TAKE running" : "refused");
+            stage = my_room->requested_msg_type == aMR_MSG_STATE_PC_DRESSER_TXN ? 2 : 3;
+            return;
+        }
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            if (pc_net_game_dresser_item_storable(priv->inventory.pockets[i]) &&
+                mPr_GET_ITEM_COND(priv->inventory.item_conditions, i) == mPr_ITEM_COND_NORMAL) {
+                break;
+            }
+        }
+        if (i == mPr_POCKETS_SLOT_COUNT) {
+            printf("[NET][DRESSER][TEST-ONLY] ui: SKIPPED (no storable pocket item)\n");
+            stage = 3;
+            return;
+        }
+        item = priv->inventory.pockets[i];
+        before = aMR_PcDresserUiTestCount(item);
+        aMR_pc_dresser_page = 0;
+        aMR_MsgInitPcDresserPage(actorx);
+        for (c = 0; c < mChoice_CHOICE_NUM && aMR_pc_dresser_map[c] != -1; c++) {
+        }
+        printf("[NET][DRESSER][TEST-ONLY] ui: page 0 built (put-in choice %d), item 0x%04X pocket %d, count before %d\n", c, (unsigned)item, i, before);
+        if (c == mChoice_CHOICE_NUM) {
+            stage = 3;
+            return;
+        }
+        aMR_PcDresserPick(my_room, c);
+        printf("[NET][DRESSER][TEST-ONLY] ui: 'Put in' picked -> %s\n", aMR_pc_dresser_putin ? "put-in submenu requested" : "refused");
+        if (!aMR_pc_dresser_putin) {
+            stage = 3;
+            return;
+        }
+        /* emulate the put-in submenu: mTG_putin_proc empties the pocket, the submenu returns (item, slot) */
+        aMR_pc_dresser_putin = FALSE;
+        my_room->requested_msg_type = aMR_MSG_STATE_NONE;
+        mPr_SetPossessionItem(priv, i, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+        if (!aMR_PcDresserPutInPool(my_room, item, i)) {
+            printf("[NET][DRESSER][TEST-ONLY] ui: pool put-in refused locally (pocket %d restored: 0x%04X)\n", i, (unsigned)priv->inventory.pockets[i]);
+            stage = 3;
+            return;
+        }
+        stage = 1;
+        return;
+    }
+    if (my_room->requested_msg_type != aMR_MSG_STATE_NONE || my_room->msg_type != aMR_MSG_STATE_NONE) {
+        return; /* the real wait state is still running */
+    }
+    if (stage == 6) {
+        if (pc_dresser_ui_active()) {
+            return;
+        }
+        printf("[NET][DRESSER][TEST-ONLY] ui: gyroid overlay closed (%d extra item(s) now)\n", pc_net_game_dresser_count());
+        aMR_pc_ui_test = FALSE;
+        frames = 0;
+        stage = 4;
+        return;
+    }
+    if (stage == 1) {
+        printf("[NET][DRESSER][TEST-ONLY] ui: PUT %s, count %d (before %d)\n", aMR_pc_txn_last == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED", aMR_PcDresserUiTestCount(item), before);
+        if (aMR_pc_txn_last != PC_NETGAME_TS_OP_APPLIED) {
+            stage = 3;
+            return;
+        }
+        if (aMR_pc_ui_mode == 1) {
+            printf("[NET][DRESSER][TEST-ONLY] ui: put-only: item 0x%04X pockets+pool count %d before %d -> %s\n", (unsigned)item, aMR_PcDresserUiTestCount(item), before,
+                   aMR_PcDresserUiTestCount(item) == before ? "CONSERVED" : "MISMATCH");
+            aMR_pc_ui_test = FALSE;
+            frames = 0;
+            stage = 4;
+            return;
+        }
+        aMR_pc_dresser_page = 0;
+        aMR_MsgInitPcDresserPage(actorx);
+        for (c = 0; c < mChoice_CHOICE_NUM && !(aMR_pc_dresser_map[c] >= 0 && pc_net_game_dresser_item(aMR_pc_dresser_map[c]) == (int)item); c++) {
+        }
+        if (c == mChoice_CHOICE_NUM) {
+            printf("[NET][DRESSER][TEST-ONLY] ui: the stored item is not on page 0\n");
+            stage = 3;
+            return;
+        }
+        aMR_PcDresserPick(my_room, c);
+        printf("[NET][DRESSER][TEST-ONLY] ui: pool item choice %d picked -> %s\n", c, my_room->requested_msg_type == aMR_MSG_STATE_PC_DRESSER_TXN ? "TAKE running" : "refused");
+        stage = my_room->requested_msg_type == aMR_MSG_STATE_PC_DRESSER_TXN ? 2 : 3;
+        return;
+    }
+    if (stage == 2) {
+        printf("[NET][DRESSER][TEST-ONLY] ui: TAKE %s, item 0x%04X pockets+pool count %d before %d -> %s\n", aMR_pc_txn_last == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED", (unsigned)item,
+               aMR_PcDresserUiTestCount(item), before,
+               (aMR_pc_txn_last == PC_NETGAME_TS_OP_APPLIED && aMR_PcDresserUiTestCount(item) == before) ? "CONSERVED" : "MISMATCH");
+        aMR_pc_ui_test = FALSE;
+        frames = 0;
+        stage = 4;
+        return;
+    }
+    /* stage 4: leave the room through the exit door data the room was entered with (the furniture-sync leave path runs for real) */
+    if (++frames == 90) {
+        printf("[NET][DRESSER][TEST-ONLY] ui: leaving the room\n");
+        if (goto_other_scene((GAME_PLAY*)gamePT, Common_GetPointer(structure_exit_door_data), FALSE) == 1) {
+            pc_net_game_dresser_test_left_room(); /* the house-edit test hook (AC_TEST_HOUSE_CLIENT_SWAP) may run now */
+            stage = 3;
+        } else {
+            frames = 0;
+        }
+    }
+}
+#endif
+#endif
+
 static aMR_MSG_INIT_PROC msg_init_table[aMR_MSG_STATE_NUM] = {
     &aMR_NoMsgInit,
     &aMR_NoMsgInit,
@@ -1634,6 +3194,12 @@ static aMR_MSG_INIT_PROC msg_init_table[aMR_MSG_STATE_NUM] = {
     &aMR_MsgInitDeleteAgbProgramQ,
     &aMR_MsgInitStartEmuDownLoad,
     &aMR_MsgInitRecheckAgbConnect,
+#ifdef TARGET_PC
+    &aMR_MsgInitPcDresserWaitPage,
+    &aMR_MsgInitPcDresserPage,
+    &aMR_NoMsgInit,
+    &aMR_NoMsgInit,
+#endif
 };
 // clang-format on
 
@@ -1704,6 +3270,12 @@ static aMR_MSG_CTRL_PROC msg_ctrl_table[aMR_MSG_STATE_NUM] = {
     &aMR_MsgControlDeleteAgbProgramQ,
     &aMR_MsgControlStartEmuDownLoad,
     &aMR_MsgControlRecheckAgbConnect,
+#ifdef TARGET_PC
+    &aMR_MsgControlPcDresserWaitPage,
+    &aMR_MsgControlPcDresserPage,
+    &aMR_MsgControlPcDresserTxn,
+    &aMR_MsgControlPcDresserGyroid,
+#endif
 };
 // clang-format on
 
@@ -1776,6 +3348,12 @@ static int aMR_msg_no_table[aMR_MSG_STATE_NUM] = {
     aMR_NO_MSG,
     aMR_NO_MSG,
     aMR_NO_MSG,
+#ifdef TARGET_PC
+    aMR_NO_MSG,
+    aMR_NO_MSG,
+    aMR_NO_MSG,
+    aMR_NO_MSG,
+#endif
 };
 // clang-format on
 
@@ -1846,6 +3424,12 @@ static int aMR_none_talk_proc[aMR_MSG_STATE_NUM] = {
     FALSE,
     FALSE,
     FALSE,
+#ifdef TARGET_PC
+    FALSE,
+    FALSE,
+    TRUE, /* PC_DRESSER_TXN: polls the host answer also when no message window is up (put-in from the submenu) */
+    TRUE, /* PC_DRESSER_GYROID: runs while the submenu is open (no message window) */
+#endif
 };
 // clang-format on
 
@@ -1916,6 +3500,12 @@ static int aMR_force_talk_flag[aMR_MSG_STATE_NUM] = {
     FALSE,
     FALSE,
     FALSE,
+#ifdef TARGET_PC
+    FALSE,
+    FALSE,
+    FALSE,
+    FALSE,
+#endif
 };
 // clang-format on
 
@@ -1986,6 +3576,12 @@ static int aMR_window_se_flag[aMR_MSG_STATE_NUM] = {
     TRUE,
     TRUE,
     TRUE,
+#ifdef TARGET_PC
+    FALSE,
+    FALSE,
+    FALSE,
+    FALSE,
+#endif
 };
 // clang-format on
 

@@ -323,9 +323,21 @@ def main():
     rem, add = diff_lines("pc/src/pc_vi.c")
     ck("S pc_vi.c: the diff is ONLY the observer poll call block (no line removed; the periodic / early save logic is untouched)", not rem and all(("observer" in a or a in ("{", "}", "pc_host_observer_poll();")) or a.startswith("/*") for a in add))
     obs_all = "".join(blocks)
+    # The dedicated server FIRST LAUNCH (HEAD, pc_server.h) generates and saves a brand-new town from inside the observer poll (pc_server_generate_town: mSDI_StartDataInit(NEW), private_data
+    # cleared, ONE pc_save_write_authoritative). That write is the ONLY serialisation in the observer blocks and is carved out here; it cannot carry an observer record because it runs BEFORE the
+    # observer record is built (mPr_InitPrivateInfo(rec)) and bound (player_no = mPr_FOREIGNER), which the order check below pins.
+    gen_i = obs_all.find("static int pc_server_generate_town(GAME_PLAY* play) {")
+    gen_j = obs_all.find("\n}\n", gen_i) + 3 if gen_i >= 0 else -1
+    gen_fn = obs_all[gen_i:gen_j] if gen_i >= 0 else ""
+    obs_scan = obs_all.replace(gen_fn, "") if gen_fn else obs_all
+    poll_i = obs_all.find("pc_server_generate_town(play)")
+    gen_ok = (bool(gen_fn) and gen_fn.count("pc_save_write_authoritative()") == 1 and "mPr_ClearPrivateInfo(Save_GetPointer(private_data[i]));" in gen_fn
+              and "Common_Set(player_no" not in gen_fn and "mPr_InitPrivateInfo" not in gen_fn and poll_i >= 0
+              and poll_i < obs_all.index("mPr_InitPrivateInfo(rec);", poll_i) < obs_all.index("Common_Set(player_no, mPr_FOREIGNER);", poll_i)
+              and obs_all.count("pc_server_generate_town(play)") == 1)
     ck("S nothing inside an observer block writes or serialises: no pc_save_write*, fwrite, private_data assignment, mPr_CopyPrivateInfo, mPr_LoadPak, bcopy into Save (the only pc_save_ready "
-       "writes are the arming after a successful init and the disarm after a failed scene change)",
-       not re.search(r"pc_save_write|fwrite|fopen|Save_Set\(|mPr_CopyPrivateInfo|mPr_LoadPak|bcopy|private_data\[[^\]]*\]\s*=|memcpy\(\s*&?Save", mask(obs_all)))
+       "writes are the arming after a successful init and the disarm after a failed scene change); the one exception is the dedicated first-launch town generation, which runs before the observer record exists",
+       gen_ok and not re.search(r"pc_save_write|fwrite|fopen|Save_Set\(|mPr_CopyPrivateInfo|mPr_LoadPak|bcopy|private_data\[[^\]]*\]\s*=|memcpy\(\s*&?Save", mask(obs_scan)))
     ck("S the guards: pre-write side effects, InitGameStart, SaveHome, SaveStation_NextLand and toNextLand each start (before any write / travel statement) with the observer refusal",
        all(G in cb(n) for n in ("pc_save_pre_write_side_effects", "mCD_InitGameStart_bg", "mCD_SaveHome_bg", "mCD_SaveStation_NextLand_bg", "mCD_toNextLand"))
        and cb("mCD_SaveHome_bg").index(G) < cb("mCD_SaveHome_bg").index("pc_save_pre_write_side_effects(")

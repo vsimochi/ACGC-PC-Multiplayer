@@ -7,6 +7,7 @@
 #include "pc_settings.h"
 #include <SDL.h>
 #include "pc_net_game.h" /* batch A (A3): pc_net_game_client_notice_visible() */
+#include "pc_dresser_ui.h" /* 6q: the dresser screen's "Move" target hint */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -332,7 +333,22 @@ void pc_net_notice_draw(struct game_s* game) {
         const int edit_notice = pc_net_game_room_edit_notice();
         if (edit_notice != 0) {
             mFont_SetMatrix(game->graph, mFont_MODE_FONT);
-            pc_menu_draw_centered(game, edit_notice == 1 ? "Not connected - house changes are disabled" : "Leave the house to resync", 62.0f, 255, 200, 90, 255, 1.0f);
+            pc_menu_draw_centered(game,
+                                  edit_notice == 1   ? "Not connected - house changes are disabled"
+                                  : edit_notice == 3 ? "Take the stored items out first" /* dresser storage: a dresser with extra items stays put */
+                                  : edit_notice == 4 ? "The room is being saved..."      /* dresser storage: a just-moved dresser opens once its move is committed */
+                                  : edit_notice == 5 ? "Close the dresser to save room changes," /* + the 2nd line below (one line is too wide) */
+                                  : edit_notice == 6 ? "Try again in a moment"           /* dresser storage: a transient refusal */
+                                  : edit_notice == 7 ? "Not connected - extra storage is unavailable"
+                                  : edit_notice == 8 ? "Items in the last 3 slots can only be taken out" /* 6q (no longer raised since 6r) */
+                                  : edit_notice == 9 ? "Old drawer items were moved to your pockets"      /* 6r: residual vanilla keep items */
+                                  : edit_notice == 10 ? "Make room in your pockets for the old drawer items"
+                                  : edit_notice == 11 ? "That item can't be stored in a dresser"         /* 6r: grab swap / put predicate */
+                                                     : "Leave the house to resync",
+                                  62.0f, 255, 200, 90, 255, 1.0f);
+            if (edit_notice == 5) { /* dresser storage 6l: an extra-slot transaction refused because the room holds uncommitted edits */
+                pc_menu_draw_centered(game, "then reopen it to store more items.", 74.0f, 255, 200, 90, 255, 1.0f);
+            }
             mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
         }
     }

@@ -324,8 +324,9 @@ typedef struct PCRemotePlayerActor {
 static ClObjPipeData_c s_remote_player_pipe_data = {
     { 0x09, 0x10, ClObj_TYPE_PIPE }, /* ClObjData_c */
     { 0x01 },                        /* ClObjElemData_c */
-    { { 20, 60, 0, { 0, 0, 0 } } },  /* ClObjPipeAttrData_c: radius 20, height 60 (same as the player's) */
+    { { 16, 60, 0, { 0, 0, 0 } } },  /* ClObjPipeAttrData_c: radius 16 (player 20; easier to pass), height 60 */
 };
+#define PC_REMOTE_PLAYER_PUSH_WEIGHT 2 /* light NORMAL mass type (<0xFE): see puppet ct */
 
 #define PC_REMOTE_PLAYER_COLLIDE_RANGE 150.0f       /* XZ units; only nearby puppets enter the 50-entry OC table */
 #define PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST 80.0f    /* a single-frame puppet XZ jump larger than this = teleport snap */
@@ -5353,6 +5354,76 @@ int pc_remote_player_collide_test_target(float* out_x, float* out_y, float* out_
     return 0;
 }
 
+/* HOST villager push (called only from ac_npc_move.c_inc aNPC_pc_host_puppet_push, which is HOST-role gated). The puppet pipe
+ * pairs only with the local player (flags {0x09,0x10}), so on the host a CLIENT player walking into a villager never pushed it,
+ * and the client's own push is overwritten by the host pose (the villager behaved like a wall). This replays, for one
+ * villager, exactly what CollisionCheck_setOC_HitInfo would add to the NPC's collision_vec for a real player pipe at each
+ * eligible puppet's position: player pipe radius 20 / height 60, player NORMAL weight 50 (not the puppet's light passability
+ * weight), NPC fraction 50/(w+50) for a NORMAL NPC, 0 for HEAVY/IMMOVABLE/priority/DONT_UPDATE_POS. It does NOT touch the OC
+ * collider table (cannot starve the player<->puppet pair) or collided_actor. Eligible puppet: live, town FIELD scene shared with
+ * this process, visible, initialised, no door/knock/outdoor row, not stale (collide_hold is NOT consulted: it is only decremented
+ * on the armed local-player path, so it sticks on an observer host / out of range). Returns the number of contacts. */
+int pc_remote_player_host_npc_push(GAME* game, const ACTOR* npc, float npc_radius, float npc_offset, float npc_height,
+                                   int npc_pipe_flags0, float* out_dx, float* out_dz) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    float frac;
+    int i;
+    int contacts = 0;
+    u8 w;
+
+    *out_dx = 0.0f;
+    *out_dz = 0.0f;
+    if (game == NULL || npc == NULL || _Game_play_isPause(play) == 1 ||
+        (npc_pipe_flags0 & (ClObj_FLAG_DONT_UPDATE_POS | ClObj_FLAG_COLLISION_PRIORITY)) != 0) {
+        return 0;
+    }
+    w = npc->status_data.weight;
+    if (w == MASSTYPE_IMMOVABLE || w == MASSTYPE_HEAVY) {
+        return 0; /* NORMAL player vs HEAVY/IMMOVABLE NPC: the NPC takes none of the push */
+    }
+    frac = 50.0f / ((float)w + 50.0f);
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        PCRemotePlayerActor* self;
+        float dx, dz, dist, overlap;
+        float py, ny;
+
+        if (!slot->in_use || !pc_remote_player_actor_is_live(slot) || (uint64_t)(uintptr_t)slot->actor >= PC_LOWADDR_LIMIT) {
+            continue;
+        }
+        self = (PCRemotePlayerActor*)slot->actor;
+        if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized ||
+            slot->snap_req || pc_remote_player_body_hidden(self) ||
+            (self->visual.row_active && (self->visual.row_idx == (int)mPlayer_INDEX_KNOCK_DOOR ||
+                                         self->visual.row_idx == (int)mPlayer_INDEX_DOOR ||
+                                         self->visual.row_idx == (int)mPlayer_INDEX_OUTDOOR)) ||
+            (graph_dt_frame_time(game) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+            continue;
+        }
+        /* Math3D_pipeVsPipe_cl: XZ distance <= r1 + r2 and overlapping vertical spans */
+        dx = npc->world.position.x - self->actor_class.world.position.x;
+        dz = npc->world.position.z - self->actor_class.world.position.z;
+        dist = sqrtf(dx * dx + dz * dz);
+        if (!(dist <= npc_radius + 20.0f)) {
+            continue; /* also rejects NaN */
+        }
+        py = self->actor_class.world.position.y;
+        ny = npc->world.position.y + npc_offset;
+        if (py + 60.0f < ny || py > ny + npc_height) {
+            continue;
+        }
+        overlap = npc_radius + 20.0f - dist;
+        if (dist != 0.0f) {
+            *out_dx += dx * (overlap / dist) * frac;
+            *out_dz += dz * (overlap / dist) * frac;
+        } else {
+            *out_dx += overlap * frac;
+        }
+        contacts++;
+    }
+    return contacts;
+}
+
 int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
     PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
     if (slot == NULL || out == NULL || !slot->scene.valid) {
@@ -5689,7 +5760,13 @@ void pc_remote_player_poll(void) {
          * puppet none; an idle (also HEAVY) local player takes half. */
         ClObjPipe_ct(gamePT, &((PCRemotePlayerActor*)actor)->col_pipe);
         ClObjPipe_set5(gamePT, &((PCRemotePlayerActor*)actor)->col_pipe, actor, &s_remote_player_pipe_data);
-        actor->status_data.weight = MASSTYPE_HEAVY;
+        /* Passability: remote players must be easy to walk past. OC (CollisionCheck_setOC_HitInfo) gives the
+         * local player a push fraction weight_puppet / (weight_puppet + weight_player); the moving player has
+         * weight 50, so weight 2 = 3.8% of the overlap per frame (an equilibrium overlap of speed/0.038 >> the
+         * 36-unit radius sum, i.e. a normal walk passes straight through; a slow walk gets a soft nudge). An
+         * idle (HEAVY) player takes 0 vs a NORMAL puppet. Never MASSTYPE_HEAVY (full push) and never 0 for both
+         * (comweight==0 fallback). The puppet's own collision_vec is never applied, so its weight is free. */
+        actor->status_data.weight = PC_REMOTE_PLAYER_PUSH_WEIGHT;
 
         /* Stage 4A: same scale/ofs_y the real player uses (Player_actor_init_value()/
          * Player_actor_ct(), src/game/m_player.c) -- required for the generic Actor_draw()'s

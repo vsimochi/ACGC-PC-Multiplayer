@@ -8,9 +8,17 @@ static int Player_actor_request_main_fly_rod(GAME* game, int priority) {
     return FALSE;
 }
 
+#ifdef TARGET_PC
+#define PC_FLY_ROD_WATCHDOG_FRAMES (20 * 60)
+static f32 s_fly_rod_wait_frames; /* f32, not int: dt_num_60fps_frames is < 1.0 above 60 fps and would truncate to 0 */
+#endif
+
 static void Player_actor_setup_main_Fly_rod(ACTOR* actor, GAME* game) {
     PLAYER_ACTOR* player = (PLAYER_ACTOR*)actor;
     int kind = Player_actor_Get_ItemKind_from_submenu();
+#ifdef TARGET_PC
+    s_fly_rod_wait_frames = 0.0f;
+#endif
 
     Player_actor_SetupItem_Base2(actor, kind, mPlayer_ANIM_TRANS_WAIT1, mPlayer_INDEX_INVADE, -5.0f, -1.0f, 0);
     Player_actor_InitAnimation_Base2(actor, game, mPlayer_ANIM_GET_T1, mPlayer_ANIM_GET_T1, 1.0f, 1.0f, 0.5f, 0.0f, 0,
@@ -49,6 +57,34 @@ static void Player_actor_request_proc_index_fromFly_rod(ACTOR* actor, GAME* game
     if (ready && status != 0) {
         Player_actor_request_main_notice_rod(game, actor->shape_info.rotation.y, mPlayer_REQUEST_PRIORITY_28);
     }
+#ifdef TARGET_PC
+    /* Fishing-softlock watchdog (multiplayer only): FLY_ROD waits for the uki to reach CATCH with no timeout in
+     * vanilla. If the bobber was reset under us (uki gone, or gyo_status back to 1 = aUKI_set_proc_wait() ran) or
+     * CATCH never arrives within ~20 s, leave fishing exactly like collect_rod does (no item is granted: grants
+     * stay host-driven via CATCH_REQUEST/TXN_RESULT). Single-player (role NONE) is untouched. */
+    else if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+        PLAYER_ACTOR* player = (PLAYER_ACTOR*)actor;
+        UKI_ACTOR* uki = (UKI_ACTOR*)player->fishing_rod_actor_p;
+
+        s_fly_rod_wait_frames += (f32)gamePT->graph->dt_num_60fps_frames;
+        if (uki == NULL || uki->gyo_status == 1 || s_fly_rod_wait_frames > (f32)PC_FLY_ROD_WATCHDOG_FRAMES) {
+            printf("[NET][FISH] fly_rod watchdog: leaving fishing (uki=%d gyo_status=%d waited=%d)\n", uki != NULL,
+                   uki != NULL ? (int)uki->gyo_status : -1, (int)s_fly_rod_wait_frames);
+            s_fly_rod_wait_frames = 0.0f;
+            if (uki != NULL) {
+                uki->gyo_command = 0;
+            }
+            Player_actor_SettleRequestMainIndexPriority(actor);
+            /* Runtime-found (worker 8): FLY_ROD has no entry in the settle table (priority NONE), so the priority FLY_ROD was entered with stays pending and a
+             * PRIORITY_1 wait request was refused every frame -- the watchdog logged on every frame and the player stayed in FLY_ROD forever. With no
+             * request pending, drop that stale priority so the wait request below is accepted. */
+            if (player->requested_main_index_changed == FALSE) {
+                player->requested_main_index_priority = mPlayer_REQUEST_PRIORITY_NONE;
+            }
+            Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_1);
+        }
+    }
+#endif
 }
 
 static void Player_actor_main_Fly_rod(ACTOR* actor, GAME* game) {

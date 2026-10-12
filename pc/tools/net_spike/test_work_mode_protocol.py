@@ -141,7 +141,7 @@ def audit_source(check):
     check("S8 the villager side runs in the villager's own talk (quest manager talk kind WORK): the hello plays, the host transaction is sent meanwhile, the generated row ends the talk",
           "aQMgr_TALK_KIND_WORK" in qm and "pc_net_game_work_villager_pending" in qm and "pc_net_game_work_begin_op(l_work_op, l_work_npc)" in tw)
     check("S9 the connect-time push: the job state is sent once the record is SYNCED (connect / reconnect), with request 0",
-          "wst->work_sent = 1;" in net and "pcnetgame_work_send_state((PCNetPeerId)p, &wst->bound_pid, 0);" in net)
+          "wst->work_sent = pcnetgame_work_send_state((PCNetPeerId)p, &wst->bound_pid, 0) ? 1 : 0;" in net)  # F-01: a refused send is retried next tick
     tag = open(os.path.join(ROOT, "src", "game", "m_tag_ovl.c"), encoding="utf-8", errors="replace").read()
     mq = open(os.path.join(ROOT, "src", "game", "m_quest.c"), encoding="utf-8", errors="replace").read()
     check("S10 the parcel and the fetched item are granted as vanilla QUEST items (host plan + the client delta fallback); nothing else in the plan is marked",

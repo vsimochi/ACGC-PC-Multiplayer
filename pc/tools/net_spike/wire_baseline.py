@@ -59,7 +59,14 @@ REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
 # Indoor villagers (Patch 2, deliberate, v8 still unreleased): 67 = ROOM_NPC (both directions, UNRELIABLE, 28 B): the pose of the villager standing in its own house.
 # Nook Work Mode (Patch 3, deliberate, v8 still unreleased): 68 = WORK_STATE (host -> the requesting client, RELIABLE, 28 B): the character's job as the host holds it.
 # Event NPC authority (Patch 4, deliberate, v8 still unreleased): 69 = EVNPC_STATE (host -> every READY client, RELIABLE, 104 B): the event NPCs the host has in its town.
-EXPECTED_MAX_MSG_ID = 71
+EXPECTED_MAX_MSG_ID = 76
+# HEAD 1c67a1a (v0.1.1 + later) already carries 72 NPC_HOME_EXIT, 73 WILDLIFE_STATE, 74 BOBBER_STATE, 75 BOBBER_EVENT, 76 HANDSHAKE_BUSY, so the
+# contiguous baseline is 1..76.  Master sprint 2 documented additions (PRESENTATION / sprint messages, no protocol bump) live in this reviewed
+# range and may be present or absent while workers land: 77 TREE_DROP, 78 SHOP_PREVIEW, 79 / 80 ball, 81 BEE_SWARM, 82 bees spare,
+# 83 / 84 dresser storage.  Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
+SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 85))
+SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*)Msg"
+_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-4])\s*,?"
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -243,11 +250,29 @@ V8_LIB_ADD_RE = re.compile(r"^(?:PC_NETGAME_MSG_RECORD_(?:HELLO|BEGIN|CHUNK|ACK)
                            r"|PC_NETGAME_MSG_(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)|(?:FIELD_ACTION|CATCH)_(?:REQUEST|RESULT)_FMT) = ")
 
 
-def c_message_ids(game_c_text):
+def c_message_ids_raw(game_c_text):
     """[(name, value)] of every PC_NETGAME_MSG_* = N in the PCNetGameMsgType enum of pc_net_game.c text (comments included in the
-    scan, but only `NAME = N,` at the start of a line counts), in source order."""
+    scan, but only `NAME = N,` at the start of a line counts), in source order. Includes the documented sprint extras."""
     body = game_c_text[game_c_text.index("typedef enum PCNetGameMsgType {"):game_c_text.index("} PCNetGameMsgType;")]
     return [(m.group(1), int(m.group(2))) for m in re.finditer(r"^\s*(PC_NETGAME_MSG_\w+)\s*=\s*(\d+),", body, re.M)]
+
+
+def c_message_ids(game_c_text):
+    """The baseline ids 1..EXPECTED_MAX_MSG_ID only: the documented sprint extras (SPRINT_EXTRA_MSG_IDS) are excluded here (older
+    source tests assert 'contiguous 1..EXPECTED_MAX_MSG_ID') and audited by audit_texts via c_message_ids_raw."""
+    return [(n, v) for n, v in c_message_ids_raw(game_c_text) if v <= EXPECTED_MAX_MSG_ID]
+
+
+def c_message_ids_all(game_c_text):
+    """Every message id of the enum, including the documented sprint additions (SPRINT_EXTRA_MSG_IDS)."""
+    return c_message_ids_raw(game_c_text)
+
+
+def ids_contiguous(values):
+    """True when `values` (message ids) are unique, contain EXACTLY 1..EXPECTED_MAX_MSG_ID and nothing else (the documented sprint extras
+    are filtered out by c_message_ids and audited by the enum / unique checks of audit_texts)."""
+    values = list(values)
+    return len(values) == len(set(values)) and sorted(values) == list(range(1, EXPECTED_MAX_MSG_ID + 1))
 # Exact values of every v8 net_spike_lib wire line (trailing comment stripped): a changed id / kind / status / format fails the audit.
 V8_LIB_PINNED = {
     "PC_NETGAME_MSG_RECORD_HELLO": '47',
@@ -336,6 +361,15 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_KIND_HOUSE_PURCHASE": '14',
     "PC_NETGAME_TXN_KIND_SHOP_RESTOCK": '15',
     "PC_NETGAME_TXN_REASON_RESTOCKING": '31',
+    "PC_NETGAME_TXN_REASON_STALE_CATALOG": '32',
+    "PC_NETGAME_TXN_KIND_WORK": '16',
+    "PC_NETGAME_TXN_REASON_WORK_NO_JOB": '33',
+    "PC_NETGAME_TXN_REASON_WORK_STALE_JOB": '34',
+    "PC_NETGAME_TXN_REASON_WORK_WALLET_FULL": '35',
+    "PC_NETGAME_TXN_KIND_EVNPC": '17',
+    "PC_NETGAME_TXN_REASON_EVNPC_DONE": '36',
+    "PC_NETGAME_TXN_KIND_DRESSER": '18',
+    "PC_NETGAME_TXN_REASON_DRESSER_DISABLED": '37',
     "PC_NETGAME_HOUSE_AUTO": '0xFF',
     "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',
     "PC_NETGAME_TXN_KIND_MAIL_TAKE": '13',
@@ -519,6 +553,8 @@ def audit_texts(head, cur):
     cb, hb = typedef_blocks(cur["game_c"], r"PCNet\w*"), typedef_blocks(head["game_c"], r"PCNet\w*")
     diff = sorted(k for k in set(cb) | set(hb) if cb.get(k) != hb.get(k) and k not in HOST_ONLY and k not in V8_NEW_STRUCTS
                   and k not in X3_CHANGED_STRUCTS  # the two request structs that gained the tag are pinned by the X3 check below
+                  and not (k not in hb and re.fullmatch(SPRINT_EXTRA_STRUCT_RE, k)  # a documented sprint message struct, new in the tree ...
+                           and re.search(r"_Static_assert\(sizeof\(%s\)\s*==\s*\d+" % k, cur["game_c"]))  # ... with a pinned exact size
                   and k != "PCNetGameMsgType"  # the id enum has its own v8-aware check below
                   and k != "PCNetGameRejectReason"  # the reject enum has its own check below (M-E reason 5)
                   and not (k in REMOVED_CLIENT_ONLY and k not in cb))  # a deliberately deleted client-only struct (X1b)
@@ -543,7 +579,7 @@ def audit_texts(head, cur):
     add("wire: WEEDS -- FIELD_ACTION kinds 10 WEED_PULL / 11 FLOWER_TRAMPLE are pinned in pc_net_game.c (and 9 SNOWMAN_BREAK still precedes them); "
         "the request / result structs they ride are the already pinned ones (no layout change)",
         all(a in cur["game_c"] for a in WEEDS_C_PINS))
-    strip_v8 = lambda b: re.sub(_V8_ENUM_RE, "", b).strip()
+    strip_v8 = lambda b: re.sub(_SPRINT_ENUM_RE, "", re.sub(_V8_ENUM_RE, "", b)).strip()
     ids = lambda b: re.findall(r"(PC_NETGAME_MSG_(?:RECORD_(?:HELLO|BEGIN|CHUNK|ACK)|TXN_(?:COMMIT|RESULT|RESERVED_5[34])|TOWN_SVC_STATE|MAILBOX_LETTER|IDENTITY_(?:EXT|TOKEN)|HOUSE_(?:BEGIN|CHUNK|ACK)|TOWN_(?:FETCH_REQ|INFO|CHUNK|DONE)|RESIDENT_HANDOFF|ROOM_NPC|WORK_STATE|EVNPC_STATE|NPC_LEASE|PAGE))\s*=\s*(\d+),", b)
     # HEAD may contain none of the v8 ids (pre-v8), the D3 ids 47-50 only (a D3-only commit), D3 + X1 (47-52), + town services (47-55), + mailbox (47-56) or all of them
     head_ids_ok = (ids(hb["PCNetGameMsgType"]) in ([], V8_NEW_ENUMS[:4], V8_NEW_ENUMS[:6], V8_NEW_ENUMS[:9], V8_NEW_ENUMS[:10], V8_NEW_ENUMS[:12], V8_NEW_ENUMS[:15], V8_NEW_ENUMS[:19], V8_NEW_ENUMS[:-3], V8_NEW_ENUMS[:-2], V8_NEW_ENUMS[:-1], V8_NEW_ENUMS[:-2], V8_NEW_ENUMS[:-1], V8_NEW_ENUMS)
@@ -552,11 +588,13 @@ def audit_texts(head, cur):
         "PCNetGameMsgType" in cb and "PCNetGameMsgType" in hb
         and " ".join(strip_v8(cb["PCNetGameMsgType"]).split()) == " ".join(strip_v8(hb["PCNetGameMsgType"]).split())
         and ids(cb["PCNetGameMsgType"]) == V8_NEW_ENUMS and head_ids_ok
-        and cb["PCNetGameMsgType"].rstrip(" ,").endswith("PC_NETGAME_MSG_PAGE = 71"))
-    nums = [v for _n, v in c_message_ids(cur["game_c"])]
-    add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c (max %s)"
+        and re.search(r"PC_NETGAME_MSG_HANDSHAKE_BUSY\s*=\s*76", cb["PCNetGameMsgType"])
+        and "PC_NETGAME_MSG_PAGE = 71" in cb["PCNetGameMsgType"])
+    nums = [v for _n, v in c_message_ids_raw(cur["game_c"])]
+    add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c plus only the documented sprint extras 77..84 (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
-        len(nums) == len(set(nums)) and sorted(nums) == list(range(1, EXPECTED_MAX_MSG_ID + 1)))
+        len(nums) == len(set(nums)) and sorted(v for v in nums if v <= EXPECTED_MAX_MSG_ID) == list(range(1, EXPECTED_MAX_MSG_ID + 1))
+        and all(v in SPRINT_EXTRA_MSG_IDS for v in nums if v > EXPECTED_MAX_MSG_ID))
     # M-E: the frozen reasons 1..4 are unchanged; reason 5 RESIDENT_CREDENTIAL (8-byte form) is the ONE deliberate addition (pinned exactly; comments are stripped by typedef_blocks)
     # M-F: reason 6 PROMOTED (8-byte form, preceded by a RESIDENT_HANDOFF) is the second pinned addition
     _rej_new = "PC_NETGAME_REJECT_RESIDENT_CREDENTIAL = 5,"

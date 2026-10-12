@@ -32,6 +32,24 @@ static void Player_actor_setup_main_Get_scoop(ACTOR* actor, GAME* game) {
     main_scoop->msg_mode = 0;
     main_scoop->submenu_flag = FALSE;
 
+#ifdef TARGET_PC
+    /* Presentation-only entry (pc_player_present_dig_pocket()): the host-applied grant already wrote the pocket, so
+     * this run must NOT putin_item() again. One-shot flag, consumed here. */
+    if (s_pc_get_scoop_present_only) {
+        s_pc_get_scoop_present_only = FALSE;
+        free_space = -1;
+        main_scoop->item = item;
+        fg_unit = mFI_GetUnitFG(req_scoop->dig_pos);
+        fg_item = (fg_unit != NULL && *fg_unit == SHINE_SPOT) ? SHINE_SPOT : item;
+        Common_Get(clip).bg_item_clip->dig_hole_effect_entry_proc(fg_item, &req_scoop->dig_pos, 12, 40);
+        main_scoop->success_flag = TRUE; /* no "pockets full" prompt, no drop_entry in settle */
+        Player_actor_InitAnimation_Base2(actor, game, mPlayer_ANIM_GET_D1, mPlayer_ANIM_GET_D1, 1.0f, 1.0f, 0.5f,
+                                         -5.0f, 0, 0);
+        Player_actor_setup_main_Base(actor, game);
+        mISL_SetNowPlayerAction(mISL_PLAYER_ACTION_DIG_SCOOP);
+        return;
+    }
+#endif
     free_space = mPlib_Get_space_putin_item_forTICKET(&item);
 
     fg_unit = mFI_GetUnitFG(req_scoop->dig_pos);

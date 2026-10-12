@@ -140,10 +140,10 @@ def main():
     ck("D (G3 update of the G2 pin 'no G3 work') the G2 guarantees that remain: the title actor never touches the profile module itself (it only calls pc_guest_title_* in pc_m_card.c) and "
        "the guest.ini writer is still the module's atomic writer only (see B)",
        "pc_guest_profile" not in S.read("src/actor/ac_animal_logo.c") and "pc_guest_title_join" in S.read("src/actor/ac_animal_logo.c"))
-    eol_ok = True
-    for rel, crlf in (("pc/src/pc_net_game.c", False), ("pc/src/pc_main.c", False), ("pc/CMakeLists.txt", None), ("pc/src/pc_mp_guests.c", False), ("pc/include/pc_mp_guests.h", False),
-                      ("pc/src/pc_guest_profile.c", False), ("pc/include/pc_guest_profile.h", False), ("pc/tools/net_spike/guest_g2_selftest.c", False),
-                      ("pc/tools/net_spike/test_guest_g2_unit.py", False), ("pc/tools/net_spike/test_guest_g2_protocol.py", False), ("pc/tools/net_spike/test_guest_g2_src.py", False)):
+    eol_ok = True  # the working-tree EOL is a checkout convention (core.autocrlf: git stores LF, worktree files are LF or CRLF per file and per time): the invariant is "never MIXED", not a fixed EOL per file
+    for rel, crlf in (("pc/src/pc_net_game.c", None), ("pc/src/pc_main.c", None), ("pc/CMakeLists.txt", None), ("pc/src/pc_mp_guests.c", None), ("pc/include/pc_mp_guests.h", None),
+                      ("pc/src/pc_guest_profile.c", None), ("pc/include/pc_guest_profile.h", None), ("pc/tools/net_spike/guest_g2_selftest.c", None),
+                      ("pc/tools/net_spike/test_guest_g2_unit.py", None), ("pc/tools/net_spike/test_guest_g2_protocol.py", None), ("pc/tools/net_spike/test_guest_g2_src.py", None)):
         b = raw_bytes(rel)
         n_crlf, n_lf = b.count(b"\r\n"), b.count(b"\n")
         good = True if crlf is None else ((n_crlf == n_lf) if crlf else (n_crlf == 0))

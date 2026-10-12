@@ -47,7 +47,9 @@ def func_body(src, name):
 def strip_hook_bodies(text):
     """`text` without the bodies of the TEST-ONLY hook functions (the shop hook since milestone 2) (they read / write pockets by design)."""
     for name in ("pcnetgame_ts_test_log_state", "pcnetgame_run_ts_test_hook", "pcnetgame_run_shop_test_hook",
-                 "pcnetgame_run_house_buy_test_hook", "pcnetgame_run_nook_test_hook"):
+                 "pcnetgame_run_house_buy_test_hook", "pcnetgame_run_nook_test_hook",
+                 # work-reward overflow hook (PC_NET_TEST_HOOKS, AC_TEST_WORK_REWARD): its wallet / money-bag total helper and driver read / write pockets by design
+                 "pcnetgame_work_reward_total", "pcnetgame_run_work_reward_test_hook"):
         body = func_body(text, name)
         if body:
             text = text.replace(body, "")

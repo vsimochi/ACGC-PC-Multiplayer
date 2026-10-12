@@ -157,7 +157,9 @@ def main():
     documented = {"m_common_data.h", "ac_boat_demo_move.c_inc", "ac_br_shop.c", "ac_br_shop_move.c_inc", "ac_broker_design.c", "ac_event_manager.c",
                   "ac_quest_talk_normal_init.c", "ac_s_car.c", "ac_shop_design.c", "ac_ev_artist.c", "ac_ev_artist_move.c_inc", "ac_ev_broker2_move.c_inc",
                   "ac_ev_broker_move.c_inc", "ac_ev_carpetPeddler.c_inc", "ac_ev_designer_talk.c_inc", "ac_ev_dozaemon.c", "ac_ev_dozaemon_move.c_inc",
-                  "ac_ev_ghost_talk.c_inc", "ac_ev_kabuPeddler_move.c_inc", "ac_ev_soncho_talk.c_inc", "m_event.c", "m_shop.c", "m_start_data_init.c"}
+                  "ac_ev_ghost_talk.c_inc", "ac_ev_kabuPeddler_move.c_inc", "ac_ev_soncho_talk.c_inc", "m_event.c", "m_shop.c", "m_start_data_init.c",
+                  # K.K. song claim (event NPC authority, already at HEAD): aNTT_pc_host_song_check is a pure READ of weekly_event.type on the host (no write to either block)
+                  "ac_npc_totakeke_talk.c_inc"}
     check("E5 inventory: the set of game source files that touch event_save_data / event_save_common equals the DOCUMENTED set (client-side writers = the visitor NPC "
           "interaction files: broker/broker2/designer/artist/carpet/kabu peddler/dozaemon/ghost talk; they write the client's LOCAL copy, never the host's, and a later host "
           "change overwrites them: see impl_notes_events.md). New or removed: %s" % sorted(found ^ documented), found == documented)

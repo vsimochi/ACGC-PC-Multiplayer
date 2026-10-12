@@ -114,10 +114,27 @@ extern void Shape_Info_init(ACTOR* actor, f32 ofs_y, mActor_shadow_proc shadow_p
     actor->shape_info.unk_2D = 0;
 }
 
+#ifdef TARGET_PC
+/* Submenu world tick (multiplayer HOST only, see m_play.c Game_play_pc_submenu_world_tick): non-zero ONLY while the host runs
+ * the villager move procs with a submenu open. While set no actor may be created (Actor_info_make_actor -> NULL, the vanilla
+ * "bank/heap not ready" failure every caller already handles and retries) and no exchange bank may be allocated
+ * (mSc_secure_exchange_keep_bank -> NULL). Actor_delete only marks (mv/dw = NULL) and the unlink/free happens in
+ * Actor_info_call_actor, which does not run while the submenu is open: deletes are deferred by construction. Always 0 in
+ * single player / on a client. */
+int g_pc_submenu_world_tick = 0;
+unsigned g_pc_submenu_tick_refused_make = 0;
+unsigned g_pc_submenu_tick_deferred_delete = 0;
+#endif
+
 extern void Actor_delete(ACTOR* actor) {
     if (actor == NULL) {
         return;
     }
+#ifdef TARGET_PC
+    if (g_pc_submenu_world_tick && actor->mv_proc != NULL) {
+        g_pc_submenu_tick_deferred_delete++;
+    }
+#endif
 
     actor->mv_proc = NULL;
     actor->dw_proc = NULL;
@@ -749,6 +766,12 @@ extern ACTOR* Actor_info_make_actor(Actor_info* actor_info, GAME* game, s16 prof
     if (actor_info->total_num > mAc_MAX_ACTORS) {
         return NULL;
     }
+#ifdef TARGET_PC
+    if (g_pc_submenu_world_tick) {
+        g_pc_submenu_tick_refused_make++;
+        return NULL; /* submenu world tick: creation deferred (the caller retries after the menu closes) */
+    }
+#endif
 
     profile = dlftbl->profile;
 #ifdef TARGET_PC

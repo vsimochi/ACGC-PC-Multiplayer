@@ -1594,6 +1594,21 @@ static int aNSC_pc_sell_primary;
 static mActor_name_t aNSC_pc_sell_item;
 static int aNSC_pc_sell_bags_before;
 
+/* MAP LINE: one-shot "this purchase just granted the town map" flag. Set at the grant (host: aNSC_pc_host_first_purchase_map_grant_impl; client: the host's APPLIED of a purchase
+ * that granted, pc_net_game_take_map_granted), consumed by aNSC_pc_map_chain() right after the thanks message of THAT purchase was selected: the message is then armed in
+ * pc_nook_house.c and gets one extra page when it is loaded. A purchase that did not grant never touches any of this. */
+extern int pc_net_game_take_map_granted(void);
+static int aNSC_pc_map_just_granted;
+static int aNSC_pc_map_flag_sets; /* how many times the flag was set in this process (test hook / log) */
+
+static void aNSC_pc_map_chain_msg(int msg_index) {
+    if (aNSC_pc_map_just_granted) {
+        aNSC_pc_map_just_granted = 0;
+        pc_nook_map_line_arm(msg_index);
+        printf("[NET][SHOP] nook dialogue: map line armed for thanks message 0x%04X (one-shot flag consumed)\n", msg_index);
+    }
+}
+
 #define aNSC_PC_ROW_REFUSED 11 /* aNSC_sell_answer0 row 11: a refused purchase (sold out / host refusal): the existing "cancel" text */
 
 static void aNSC_pc_reset_waits(void) {
@@ -1632,6 +1647,10 @@ static int aNSC_pc_buy_step(NPC_SHOP_COMMON_ACTOR* shop_common) {
     }
     aNSC_pc_buy_wait = 0;
     if (r == PC_NETGAME_TS_OP_APPLIED) {
+        if (pc_net_game_take_map_granted()) { /* this very purchase granted the town map (derived in pcnetgame_txn_apply_shop) */
+            aNSC_pc_map_just_granted = 1;
+            aNSC_pc_map_flag_sets++;
+        }
         return 0;
     }
     reason = pc_net_game_ts_last_reject_reason();
@@ -3191,7 +3210,9 @@ static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pla
         if (pc_next == 0) {
             pc_next = aNSC_pc_buy_success_row(shop_common->sell_item);
         }
+        pc_nook_map_line_clear(); /* a stale arm never reaches a purchase that did not grant */
         aNSC_Set_continue_msg_num(mMsg_Get_base_window_p(), shop_common, aNSC_get_msg_no(msg_no[pc_next]));
+        aNSC_pc_map_chain_msg(shop_common->msg_no); /* a no-op unless THIS purchase just granted the map (the flag is only set on APPLIED) */
         mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
         aNSC_setupAction(shop_common, play, next_act_idx[pc_next]);
         return;
@@ -3275,6 +3296,9 @@ static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pla
                     }
                 }
             }
+#ifdef TARGET_PC
+            pc_nook_map_line_clear(); /* a stale arm never reaches a purchase that did not grant (the host's grant arms later, in aNSC_sell_item_init) */
+#endif
             aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
             mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
             aNSC_setupAction(shop_common, play, next_act_idx[next]);
@@ -3878,10 +3902,48 @@ static void aNSC_sell_answer1_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
     shop_common->sell_item = EMPTY_NO;
 }
 
+#ifdef TARGET_PC
+/* MAP GRANT for the networked HOST's own player (a client's grant is made by the host in the mirror + its APPLIED): the first completed purchase
+ * records this land in Private_c.maps[] (mPr_SetNewMap skips a land already present: idempotent) and unlocks the town map. Solo (ROLE_NONE) untouched.
+ * This file is #included by several shop actors, so the function is static here (one copy per includer); the PC_NET_TEST_HOOKS host hook
+ * (AC_TEST_HOST_MAP_GRANT) reaches the SAME code through ONE exported wrapper, defined only in the includer that sets aNSC_PC_EXPORT_MAP_GRANT.
+ * Returns 1 when the entry was added. */
+static int aNSC_pc_host_first_purchase_map_grant_impl(void) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_HOST && Now_Private != NULL &&
+        mPr_GetThisLandMapIdx(Now_Private->maps, mPr_FOREIGN_MAP_COUNT) == -1) {
+        mPr_SetNewMap(Now_Private->maps, mPr_FOREIGN_MAP_COUNT);
+        Common_Set(map_flag, TRUE);
+        aNSC_pc_map_just_granted = 1; /* the one-shot MAP LINE flag: consumed by aNSC_pc_map_chain_msg() in aNSC_sell_item_init */
+        aNSC_pc_map_flag_sets++;
+        printf("[NET][SHOP] host: own purchase granted the town map (one-shot map-line flag set, total %d)\n", aNSC_pc_map_flag_sets);
+        return 1;
+    }
+    return 0;
+}
+#ifdef aNSC_PC_EXPORT_MAP_GRANT
+int aNSC_pc_host_first_purchase_map_grant(void) {
+    return aNSC_pc_host_first_purchase_map_grant_impl();
+}
+/* TEST-ONLY reach into the single exported copy's one-shot state (the PC_NET_TEST_HOOKS map-grant hook): returns the flag, *total = times it was set;
+ * chain_test(msg) runs the same consume-and-arm step aNSC_sell_item_init runs (no dialogue is driven). */
+int aNSC_pc_map_oneshot_state(int* total) {
+    if (total != NULL) {
+        *total = aNSC_pc_map_flag_sets;
+    }
+    return aNSC_pc_map_just_granted;
+}
+void aNSC_pc_map_chain_test(int msg_index) {
+    aNSC_pc_map_chain_msg(msg_index);
+}
+#endif
+#endif
+
 static void aNSC_sell_item_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
 #ifdef TARGET_PC
     if (!aNSC_PC_IS_CLIENT()) {
         aNSC_get_sell_price(shop_common->value);
+        (void)aNSC_pc_host_first_purchase_map_grant_impl();
+        aNSC_pc_map_chain_msg(shop_common->msg_no); /* the thanks message was selected by aNSC_sell_answer0 just before this init: arm the extra page iff this purchase granted */
     } /* else: a CLIENT's bells already left with the host's post-image (APPLIED); the report below only redraws the floor on a client */
 #else
     aNSC_get_sell_price(shop_common->value);

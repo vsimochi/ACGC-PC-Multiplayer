@@ -255,10 +255,125 @@ int pc_nook_first_page_work(void) {
     return s_first_page_work;
 }
 
+/* ---- MAP LINE (see pc_nook_house.h): one extra page appended to the armed vanilla thanks message ---- */
+static int s_map_arm_idx = -1;
+static int s_map_patched = 0;
+
+void pc_nook_map_line_arm(int msg_index) {
+    s_map_arm_idx = msg_index;
+}
+
+void pc_nook_map_line_clear(void) {
+    s_map_arm_idx = -1;
+}
+
+int pc_nook_map_line_armed(void) {
+    return s_map_arm_idx;
+}
+
+int pc_nook_map_line_patched_count(void) {
+    return s_map_patched;
+}
+
+/* the vanilla message must end exactly with MSGEND (7F 00): that END becomes "button, clear, map page, END". Returns the new length, 0 = untouched. */
+static int nk_map_line_patch(unsigned char* data, int len, int cap) {
+    unsigned char tmp[160];
+    NkBuf b;
+    if (data == NULL || len < 2 || data[len - 2] != NK_CC || data[len - 1] != NK_END) {
+        return 0;
+    }
+    b.d = tmp;
+    b.n = 0;
+    b.cap = (int)sizeof(tmp);
+    b.err = 0;
+    nk_page(&b);
+    nk_text(&b, "Oh, and one more thing!");
+    nk_pause(&b, 6);
+    nk_text(&b, "\nHere is a map of the town,");
+    nk_pause(&b, 6);
+    nk_text(&b, "\non the house, hm?");
+    nk_code(&b, NK_END);
+    if (b.err || len - 2 + b.n > cap) {
+        return 0;
+    }
+    memcpy(&data[len - 2], tmp, (size_t)b.n);
+    return len - 2 + b.n;
+}
+
 /* Patches the loaded vanilla first page: SETSELSTR4 (7F 18 + 4 string ids) becomes SETSELSTR5 (7F 79 + 5 ids) with the work choice inserted before the last one. */
+/* Dresser storage (worker 3): a ONE-SHOT arm for the next load of one dresser message (empty / 1-item / 2-item owner dresser): its choice list gets
+ * "More storage" (PC_NOOK_SEL_DRESSER_MORE) inserted right before the last (cancel) choice. Armed by ac_my_room only when pc_net_game_dresser_available(). */
+static int s_dr_arm_idx = -1, s_dr_patched_idx = -1, s_dr_more_choice = -1;
+
+void pc_dresser_msg_arm(int index) {
+    s_dr_arm_idx = index;
+    s_dr_patched_idx = -1;
+    s_dr_more_choice = -1;
+}
+
+int pc_dresser_msg_more_choice(int index) {
+    return (index >= 0 && s_dr_patched_idx == index) ? s_dr_more_choice : -1;
+}
+
+static int nk_dresser_patch(unsigned char* data, int len, int cap) {
+    static const unsigned char k_sel[7] = { 0, 0, NK_SEL2, NK_SEL3, NK_SEL4, NK_SEL5, NK_SEL6 };
+    int i, k, last;
+    if (data == NULL || len < 4 || len + 2 > cap) {
+        return 0;
+    }
+    for (i = 0; i + 1 < len; i++) {
+        if (data[i] != NK_CC) {
+            continue;
+        }
+        for (k = 2; k <= 5; k++) {
+            if (data[i + 1] == k_sel[k]) {
+                break;
+            }
+        }
+        if (k > 5) {
+            continue;
+        }
+        last = i + 2 + 2 * (k - 1); /* the cancel id (the last of the k ids) */
+        if (last + 2 > len) {
+            return 0;
+        }
+        memmove(&data[last + 2], &data[last], (size_t)(len - last));
+        data[last] = (unsigned char)((PC_NOOK_SEL_DRESSER_MORE >> 8) & 0xFF);
+        data[last + 1] = (unsigned char)(PC_NOOK_SEL_DRESSER_MORE & 0xFF);
+        data[i + 1] = k_sel[k + 1];
+        s_dr_more_choice = k - 1;
+        return len + 2;
+    }
+    return 0;
+}
+
 int pc_nook_msg_patch(int index, unsigned char* data, int len, int cap) {
     PCWorkView v;
     int i, id;
+    if (s_dr_arm_idx >= 0 && index == s_dr_arm_idx) {
+        int n;
+        s_dr_arm_idx = -1; /* one-shot */
+        n = nk_dresser_patch(data, len, cap);
+        if (n > 0) {
+            s_dr_patched_idx = index;
+            printf("[NET][DRESSER] dresser message 0x%04X: 'More storage' added as choice %d (len %d -> %d)\n", index, s_dr_more_choice, len, n);
+        } else {
+            printf("[NET][DRESSER] dresser message 0x%04X: no choice list found -- not patched\n", index);
+        }
+        return n;
+    }
+    if (s_map_arm_idx >= 0 && index == s_map_arm_idx) {
+        int n;
+        s_map_arm_idx = -1; /* one-shot: consumed by the first load of the armed message */
+        n = nk_map_line_patch(data, len, cap);
+        if (n > 0) {
+            s_map_patched++;
+            printf("[NET][SHOP] nook dialogue: map line appended to message 0x%04X (len %d -> %d)\n", index, len, n);
+        } else {
+            printf("[NET][SHOP] nook dialogue: map line skipped for message 0x%04X (it does not end with MSGEND)\n", index);
+        }
+        return n; /* never the first page (0x1092 is not a thanks row) */
+    }
     if (index != s_first_page_id) {
         return 0;
     }
@@ -541,6 +656,12 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\nare arranged online, by\nconnecting to a host.");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_DRESSER_REFUSED:
+            nk_text(&b, "The storage could not be");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nused just now. Nothing\nwas moved.");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_WORK_V_FAIL:
             nk_text(&b, "Hm? I do not know what");
             nk_pause(&b, 6);
@@ -709,6 +830,9 @@ int pc_nook_sel_build(int id, unsigned char* dst16) {
         case PC_NOOK_SEL_WORK_REPORT:
             snprintf(tmp, sizeof(tmp), "I delivered it.");
             break;
+        case PC_NOOK_SEL_DRESSER_MORE:
+            snprintf(tmp, sizeof(tmp), "More storage"); /* dresser storage (worker 3): the host-side pool of the own dresser */
+            break;
         default:
             snprintf(tmp, sizeof(tmp), "House %d.", id - PC_NOOK_SEL_HOUSE1 + 1);
             break;
@@ -777,6 +901,41 @@ int pc_nook_house_selftest(void) {
                 bad++;
             }
         }
+    }
+    {   /* the map line: a message ending with MSGEND gets exactly one extra page, once; one ending with MSGCONTINUE is untouched; both consume the arm */
+        unsigned char m[256] = { 'T', 'h', 'a', 'n', 'k', 's', '!', NK_CC, NK_END };
+        unsigned char c[256] = { 'T', 'i', 'c', 'k', 'e', 't', NK_CC, NK_CONTINUE };
+        int n, pre = s_map_patched, saved = s_map_arm_idx;
+        pc_nook_map_line_arm(0x2345);
+        if (pc_nook_msg_patch(0x2344, m, 9, (int)sizeof(m)) != 0 || pc_nook_map_line_armed() != 0x2345) { /* another index: neither patched nor consumed */
+            bad++;
+        }
+        n = pc_nook_msg_patch(0x2345, m, 9, (int)sizeof(m));
+        if (n <= 9 || m[n - 2] != NK_CC || m[n - 1] != NK_END || m[7] != NK_CC || m[8] != NK_BTN || pc_nook_map_line_armed() != -1 || s_map_patched != pre + 1) {
+            bad++;
+        }
+        for (i = 9; i < n - 2; i++) {
+            if (m[i] == NK_CC) {
+                i += (m[i + 1] == NK_PAUSE) ? 2 : 1;
+            } else if (!nk_char_ok(m[i]) && m[i] != NK_NEWLINE) {
+                bad++;
+            }
+        }
+        if (pc_nook_msg_patch(0x2345, m, n, (int)sizeof(m)) != 0) { /* the second load is not armed any more */
+            bad++;
+        }
+        pc_nook_map_line_arm(0x2346);
+        if (pc_nook_msg_patch(0x2346, c, 8, (int)sizeof(c)) != 0 || c[6] != NK_CC || c[7] != NK_CONTINUE || pc_nook_map_line_armed() != -1 || s_map_patched != pre + 1) {
+            bad++;
+        }
+        pc_nook_map_line_arm(0x2347);
+        memcpy(m, "Thanks!", 7);
+        m[7] = NK_CC;
+        m[8] = NK_END;
+        if (pc_nook_msg_patch(0x2347, m, 9, 10) != 0 || pc_nook_map_line_armed() != -1) { /* no room: untouched, consumed */
+            bad++;
+        }
+        s_map_arm_idx = saved;
     }
     return bad;
 }

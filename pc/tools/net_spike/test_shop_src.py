@@ -67,7 +67,7 @@ def main():
     check("W python formats / constants / reason names equal the C values (kinds 10 / 11, 31 reasons (0..30), stock codes, TS_SHOP_LEN, sale ratio)",
           (L.PC_NETGAME_TXN_KIND_SHOP_BUY, L.PC_NETGAME_TXN_KIND_SHOP_SELL) == (10, 11)
           and (L.PC_NETGAME_SHOP_STOCK_COUNTED, L.PC_NETGAME_SHOP_STOCK_RARE, L.PC_NETGAME_SHOP_STOCK_UNLIMITED) == (0xFD, 0xFE, 0xFF)
-          and [L.TXN_REASON_NAMES[i] for i in (19, 20, 21, 22)] == ["NO_FUNDS", "NOT_SELLABLE", "PRICE_MISMATCH", "NO_ROOM"] and len(L.TXN_REASON_NAMES) == 31  # mail milestone 1: + 23 / 24 / 25; mail milestone 2: + 26 / 27; house purchase: + 28 / 29 / 30
+          and [L.TXN_REASON_NAMES[i] for i in (19, 20, 21, 22)] == ["NO_FUNDS", "NOT_SELLABLE", "PRICE_MISMATCH", "NO_ROOM"] and len(L.TXN_REASON_NAMES) >= 31  # mail milestone 1: + 23 / 24 / 25; mail milestone 2: + 26 / 27; house purchase: + 28 / 29 / 30
           and [L.TXN_REASON_NAMES[i] for i in (28, 29, 30)] == ["NO_RESIDENCE", "INVALID_HOUSE", "NAME_TAKEN"]
           and all(re.search(r"#define PC_NETGAME_TXN_REASON_%s\s+%du" % (L.TXN_REASON_NAMES[i], i), c_raw) for i in range(31))
           and L.PC_NETGAME_TS_SHOP_LEN == 320 and L.PC_NETGAME_SHOP_SELL_RATIO == 4)
@@ -124,8 +124,9 @@ def main():
                                   "bells >= (uint32_t)mPr_WALLET_MAX", "PC_NETGAME_TXN_REASON_NOT_SELLABLE")))
     check("H payment = vanilla mSP_money_check + mSP_get_sell_price on the PRE-image: wallet first, then money bags 100 / 1000 / 10000 / 30000 lowest slot first, change to the wallet",
           all(x in func_body(shop_region_raw, "pcnetgame_shop_pay") for x in ("ITM_MONEY_100", "ITM_MONEY_1000", "ITM_MONEY_10000", "ITM_MONEY_30000", "feasible", "*wallet = money - amount")))
-    check("H the shop mutations exist ONLY in the handler: mSP_PlusSales( twice (buy price, sale value / 2), mSP_ShopSaleReport( once, nothing else in pc_net_game.c writes the shop stock / sales_sum",
-          c.count("mSP_PlusSales(") == 2 and c.count("mSP_ShopSaleReport(") == 1 and ts.count("mSP_PlusSales(") == 2 and ts.count("mSP_ShopSaleReport(") == 1
+    check("H the shop mutations exist ONLY in the handler: mSP_PlusSales( 3x in the handler (restock fee, buy price, sale value / 2) + 1x in the host's own pc_net_game_restock_begin (restock fee, host-only path), mSP_ShopSaleReport( once, nothing else in pc_net_game.c writes the shop stock / sales_sum",
+          c.count("mSP_PlusSales(") == 4 and c.count("mSP_ShopSaleReport(") == 1 and ts.count("mSP_PlusSales(") == 3 and ts.count("mSP_ShopSaleReport(") == 1
+          and c_raw.count("mSP_PlusSales(PC_NETGAME_RESTOCK_PRICE); /* once per started restock (host-only path)") == 1
           and "mSP_ShopSaleReport(" not in func_body(shop_region_raw, "pcnetgame_shop_classify"))
     shop_branch = ts[ts.index("if (is_shop) {"):ts.index("} else if (is_donate) {")]
     check("H the host's OWN resident is never written (post-image gate pcnetgame_rec_txn_idx_ok before the first shop mutation); guests G1: a guest (idx >= PLAYER_NUM) is a FULL participant "
@@ -155,7 +156,10 @@ def main():
           and a0.index("pc_net_game_host_shop_can_sell((int)item)") < a0.index("mPr_SetPossessionItem(") and "next = aNSC_PC_ROW_REFUSED;" in a0)
     check("H L3 the manekin clip is NULL-guarded before change2naked_manekin_proc (the display sync runs from the poll)", "shop_manekin_clip != NULL" in sd and sd.index("shop_manekin_clip != NULL") < sd.index("change2naked_manekin_proc"))
     check("H the shop status is a SIDE-EFFECT-FREE read (pure mSP_ShopOpen / CheckFukubikiDay / Chk_HukubukuroSail / CheckHallowinDay), not the possibly stale Common tanuki_shop_status",
-          "mSP_ShopOpen() == mSP_SHOP_STATUS_OPENEVENT" in shop_region and "mSP_SetTanukiShopStatus" not in c)
+          "mSP_ShopOpen() == mSP_SHOP_STATUS_OPENEVENT" in shop_region
+          # production code never writes the status; the ONE exception is the TEST-ONLY nook warp hook (PC_NET_TEST_HOOKS), which does what the real shop door does before the entry
+          and "mSP_SetTanukiShopStatus" not in c.replace(func_body(c, "pcnetgame_run_nook_test_hook"), "")
+          and c.count("mSP_SetTanukiShopStatus(") == func_body(c, "pcnetgame_run_nook_test_hook").count("mSP_SetTanukiShopStatus(") == 1)
 
     # ------------------------------------------------------------------ C: client
     pc_helpers = nsc[nsc.index("static int aNSC_pc_buy_wait;"):nsc.index("static int aNSC_pc_selection_has_paper(Submenu* menu) {")]

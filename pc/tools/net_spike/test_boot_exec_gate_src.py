@@ -68,6 +68,33 @@ GUARDS = {
     ("pc_net_game.c", "pcnetgame_run_bug_despawn_label_race_diag"): "pcnetgame_is_real_player_actor(local) right after the read (now exec-gated)",
     ("pc_net_game.c", "pc_net_game_poll"): "explicit gamePT->exec == play_main in the movement-send condition (+ is_real_player_actor)",
     ("pc_remote_player.c", "pc_remote_player_poll"): "entry gate: gamePT == NULL || gamePT->exec != play_main -> return",
+    # Sites that already existed at HEAD 1c67a1a (or earlier working-tree milestones) but were never listed (this audit failed on the clean baseline). Each was reviewed:
+    # (a) pc_m_card.c: the title / Rover scene helpers all begin with `gamePT == NULL || gamePT->exec != play_main` -> return (A7 below verifies it textually).
+    ("pc_m_card.c", "pc_guest_arrive"): "early return unless gamePT->exec == play_main (before the play cast)",
+    ("pc_m_card.c", "pc_guest_creation_test_poll"): "early return unless gamePT->exec == play_main (before the play cast)",
+    ("pc_m_card.c", "pc_play_online_direct_ready"): "early return unless gamePT->exec == play_main (before the play cast)",
+    # (b) own-room / visitor house sync: reached only through pcnetgame_hcl_live_room_house() (gamePT->exec != play_main -> -1) or pcnetgame_local_house_unsafe() (same gate), then is_real_player_actor.
+    ("pc_net_game.c", "pcnetgame_hcl_live_room_house"): "early return unless gamePT->exec == play_main, then pcnetgame_is_real_player_actor",
+    ("pc_net_game.c", "pcnetgame_hcl_live_apply"): "its first condition is pcnetgame_hcl_live_room_house(0) != h (exec-gated -> -1); the read is followed by pcnetgame_is_real_player_actor",
+    ("pc_net_game.c", "pcnetgame_hcl_reconcile_plan"): "callers reconcile_ready / reconcile_apply require pcnetgame_hcl_live_room_house(1) == h (exec-gated); the read is followed by pcnetgame_is_real_player_actor",
+    ("pc_net_game.c", "pcnetgame_interest_view"): "`gamePT != NULL && gamePT->exec == play_main && pcnetgame_is_real_player_actor(...)` in the same condition",
+    ("pc_net_game.c", "pcnetgame_look_reload_poll"): "early return unless gamePT->exec == play_main, then is_real_player_actor",
+    ("pc_net_game.c", "pcnetgame_run_nook_test_hook"): "early return unless gamePT->exec == play_main, then is_real_player_actor (TEST-ONLY hook)",
+    ("pc_net_game.c", "pcnetgame_crec_diag_snapshot"): "the actor is read only when `gamePT->exec == play_main` (play != NULL), then is_real_player_actor (diagnostic)",
+    # (c) TEST-ONLY autopilot / env-armed hooks (PC_NET_TEST_HOOKS builds, off unless an AC_TEST_* variable / autopilot console is used). They gate on the field-info predicate
+    #     pcfa_scene_is_town() (g_fdinfo is only valid inside a play scene) or on an env var + a trigger file, not on exec; reviewed as low risk, never compiled into a release build.
+    ("pc_net_game.c", "pc_net_game_test_autopilot_pad"): "TEST-ONLY autopilot PADRead hook (AC_TEST_AUTOPILOT); reads only behind its scene_is_town / state-machine checks",
+    ("pc_net_game.c", "pcnetgame_ap_player_pos"): "TEST-ONLY autopilot helper: play != NULL && pcfa_scene_is_town() (g_fdinfo valid only in a play scene)",
+    ("pc_net_game.c", "pcnetgame_ap_player_state"): "TEST-ONLY autopilot helper: play != NULL && pcfa_scene_is_town()",
+    ("pc_net_game.c", "pcnetgame_ap_rod_out"): "TEST-ONLY autopilot helper: play != NULL && pcfa_scene_is_town()",
+    ("pc_m_card.c", "pc_host_renewshop_poll"): "master sprint 2 (host shop renewal): HOST role + `gamePT == NULL || gamePT->exec != play_main` -> return before the play cast / actor read",
+    ("pc_net_game.c", "pcnetgame_museum_warp_test_hook"): "master sprint 2 TEST-ONLY env-armed hook (AC_TEST_MUSEUM_ROOM); like the goto / room-enter hooks no exec gate (known low-risk gap, test builds only)",
+    ("pc_net_game.c", "pcnetgame_dresser_room_warp_test_hook"): "master sprint 2 TEST-ONLY env-armed hook (AC_TEST_DRESSER_ROOM, client): reads the actor behind play != NULL, then pcnetgame_is_real_player_actor(pa) (exec-gated) before any use",
+    ("pc_net_game.c", "pcnetgame_goto_test_hook"): "TEST-ONLY env-armed hook (AC_TEST_GOTO + ac_goto.txt), 500 ms paced; no exec gate (known low-risk gap, test builds only)",
+    ("pc_net_game.c", "pcnetgame_room_enter_test_hook"): "TEST-ONLY env-armed hook (AC_TEST_ROOM_ENTER); the read follows the local scene classification; no exec gate (known low-risk gap, test builds only)",
+    # (d) wildlife presentation: only reached with a live presentation actor (has_actor entries exist only inside a play scene) and pcfa_scene_is_town() for the trace.
+    ("pc_wildlife_authority.c", "pcwld_client_rematerialize"): "reached only for an entity that has a presentation slot with a (culled) local actor; pl == NULL -> return",
+    ("pc_wildlife_authority.c", "pcwld_trace_positions"): "TRACE only (PC_WILDLIFE_TRACE logging): behind pcfa_scene_is_town(); the actor read is a log argument",
 }
 
 
@@ -139,8 +166,15 @@ def audit(check):
             ok_hooks = False
     check("A6 the --force-* test hooks check pcnetgame_is_real_player_actor(local) immediately after the read (a plain read of gamePT+0x2EF0 never dereferences)", ok_hooks)
     # pc_vi.c / pc_field_authority.c / pc_main.c do not read the player actor per frame
-    others = [fn for fn in ("pc_vi.c", "pc_field_authority.c", "pc_main.c", "pc_wildlife_authority.c", "pc_m_card.c")
+    others = [fn for fn in ("pc_vi.c", "pc_field_authority.c", "pc_main.c")
               if re.search(r"GET_PLAYER_ACTOR_NOW|get_player_actor_withoutCheck|GET_PLAYER_ACTOR_ACTOR", strip_comments(read("pc/src/" + fn)))]
+    # pc_m_card.c (title / Rover guest helpers) and pc_wildlife_authority.c (presentation) DO read the player actor at HEAD already; they are audited sites in GUARDS above and here:
+    # every pc_m_card.c site sits in a function whose exec == play_main gate precedes the first read.
+    mc_code = strip_comments(read("pc/src/pc_m_card.c"))
+    for mm in re.finditer(r"GET_PLAYER_ACTOR_NOW\(\)|get_player_actor_withoutCheck\(", mc_code):
+        fb_ = func_body(mc_code, enclosing_function(mc_code, mm.start()) or "?")
+        if not (fb_ and "gamePT->exec != play_main" in fb_ and fb_.index("gamePT->exec != play_main") < fb_.index(mm.group(0))):
+            others.append("pc_m_card.c:" + str(enclosing_function(mc_code, mm.start())))
     check("A7 pc_vi.c / pc_field_authority.c / pc_main.c / pc_wildlife_authority.c / pc_m_card.c contain no player-actor read (their GAME_PLAY casts are exec-gated or behind pcfa_save_ready; audited: pc_m_card.c:1052/1141 gated by exec == play_main, pc_wildlife_authority.c host trigger called only from play-scene host code)",
           others == [])
     check("A8 persistence-latch fix present (pcnetgame_rec_store_write coalesce branch clears s_rec_store_last_failed)",

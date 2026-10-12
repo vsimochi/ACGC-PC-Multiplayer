@@ -45,6 +45,23 @@ def fns(src):
     return m, S.functions(m)
 
 
+def drop_later_additions(body):
+    """The observer poll gained two documented, later additions (not G3): the dedicated first-launch town generation block (HEAD, `pc_server_town_missing`) and the host shop-renewal
+    poll call (`pc_host_renewshop_poll();`, master sprint 2). Remove exactly those lines; everything else must still equal the G3 baseline."""
+    out, skip_depth = [], 0
+    for ln in body.split("\n"):
+        if skip_depth:
+            skip_depth += ln.count("{") - ln.count("}")
+            continue
+        if "pc_server_town_missing()" in ln and ln.rstrip().endswith("{"):
+            skip_depth = 1
+            continue
+        if ln.strip() == "pc_host_renewshop_poll();":
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
 def main():
     results = []
     ck = lambda d, c: L.check(d, bool(c), results)
@@ -98,7 +115,7 @@ def main():
     ck("G3.1 pc_guest_arrive never arms pc_save_ready, never writes a save, never writes private_data / homes (only the read-only name check function reads private_data)",
        "pc_save_ready" not in arr and "pc_save_write" not in arr and "private_data" not in arr and "homes" not in arr)
     ck("G3.1 resident path untouched: pc_bootstrap_resident_poll, the observer poll and the resident-name conflict function are byte-identical to the baseline blob",
-       all(S.body(cm, cf, n) == S.body(*fns(blob("pc/src/pc_m_card.c")), n) != "" for n in ("pc_bootstrap_resident_poll", "pc_host_observer_poll", "pc_guest_resident_name_conflict")))
+       all(drop_later_additions(S.body(cm, cf, n)) == S.body(*fns(blob("pc/src/pc_m_card.c")), n) != "" for n in ("pc_bootstrap_resident_poll", "pc_host_observer_poll", "pc_guest_resident_name_conflict")))
     # pc_guest_build_fresh_record differs from the baseline ONLY by the shirt-helper extraction (the G6 first-run creation shares the shirt): substituting the helper call with the
     # old inline expression (and re-declaring the old local) must give the baseline body byte for byte; the helper itself is pinned separately.
     _bld_new = cb("pc_guest_build_fresh_record")

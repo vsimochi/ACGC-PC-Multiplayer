@@ -17,7 +17,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PC = os.path.abspath(os.path.join(HERE, "..", ".."))
 ROOT = os.path.abspath(os.path.join(PC, ".."))
 BASELINE = "f660cc7"
-FIX_COMMIT = None  # (filled by orchestrator after commit) None = the working tree
+FIX_COMMIT = None  # None = the working tree (content checks). The DIFF checks use the two feature commits below (BASELINE..T3_FIX, T4_BASE..T4_FIX), not the whole BASELINE..HEAD range (80+ unrelated commits).
+
+
+# The two feature commits this audit covers (each one's parent is the diff baseline): T3 puppet rows = 98c61c8 (parent f660cc7 = BASELINE), T4 shared arrival = cad5984 (parent b291f8e).
+# A diff against BASELINE over the whole range to the working tree also contains 80+ unrelated later commits (doors, event NPCs, wildlife, ...), so the "untouched" / "byte-identical"
+# checks are made per feature commit instead: neither commit may touch the listed files.
+T3_FIX = "98c61c8"
+T4_BASE, T4_FIX = "b291f8e", "cad5984"
+FEATURE_PAIRS = ((BASELINE, T3_FIX), (T4_BASE, T4_FIX))
 
 
 def blob(commit, path):
@@ -31,13 +39,25 @@ def cur(path):
 
 
 def unchanged(paths):
-    args = ["git", "-C", ROOT, "diff", "--quiet", "--ignore-cr-at-eol", BASELINE] + ([FIX_COMMIT] if FIX_COMMIT else []) + ["--"] + list(paths)
-    return subprocess.run(args, timeout=60).returncode == 0
+    """True when NEITHER feature commit (T3, T4) touches any of `paths`."""
+    for base, fix in FEATURE_PAIRS:
+        args = ["git", "-C", ROOT, "diff", "--quiet", "--ignore-cr-at-eol", base, fix, "--"] + list(paths)
+        if subprocess.run(args, timeout=60).returncode != 0:
+            return False
+    return True
 
 
-def diff_lines(path):
-    """(added, removed) lines of path vs the baseline (-U0, CR at EOL ignored)."""
-    args = ["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", BASELINE] + ([FIX_COMMIT] if FIX_COMMIT else []) + ["--", path]
+def changed_files():
+    """Union of the files the two feature commits change."""
+    out = set()
+    for base, fix in FEATURE_PAIRS:
+        out |= set(subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--ignore-cr-at-eol", base, fix], capture_output=True, text=True, timeout=60).stdout.split())
+    return sorted(out)
+
+
+def diff_lines(path, base=BASELINE, fix=T3_FIX):
+    """(added, removed) lines of path between two commits (-U0, CR at EOL ignored); default = the T3 feature commit."""
+    args = ["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", base, fix, "--", path]
     out = subprocess.run(args, capture_output=True, text=True, timeout=60).stdout.split("\n")
     add = [l[1:] for l in out if l.startswith("+") and not l.startswith("+++")]
     rem = [l[1:] for l in out if l.startswith("-") and not l.startswith("---")]
@@ -131,19 +151,25 @@ def main():
 
     # ---------------- T3 / T4: the puppet side ----------------
     rp = cur("pc/src/pc_remote_player.c")
-    add, rem = diff_lines("pc/src/pc_remote_player.c")
-    ck("diff: pc_remote_player.c: exactly THREE baseline lines were replaced (the DEMO_WALK, DEMO_GETOFF_TRAIN and DEMO_STANDING_TRAIN PCFB rows), nothing else removed (%d removed)" % len(rem),
-       len(rem) == 3 and sum(1 for l in rem if "[mPlayer_INDEX_DEMO_WALK] = PCFB" in l) == 1 and sum(1 for l in rem if "[mPlayer_INDEX_DEMO_GETOFF_TRAIN] = PCFB" in l) == 1
+    add, rem = diff_lines("pc/src/pc_remote_player.c")  # the T3 feature commit (BASELINE..T3_FIX)
+    add4, rem4 = diff_lines("pc/src/pc_remote_player.c", T4_BASE, T4_FIX)  # the T4 feature commit only adds
+    ck("diff: pc_remote_player.c: exactly THREE baseline lines were replaced by the T3 commit (the DEMO_WALK, DEMO_GETOFF_TRAIN and DEMO_STANDING_TRAIN PCFB rows), nothing else removed (%d removed; the T4 commit removes %d)" % (len(rem), len(rem4)),
+       len(rem) == 3 and not rem4 and sum(1 for l in rem if "[mPlayer_INDEX_DEMO_WALK] = PCFB" in l) == 1 and sum(1 for l in rem if "[mPlayer_INDEX_DEMO_GETOFF_TRAIN] = PCFB" in l) == 1
        and sum(1 for l in rem if "[mPlayer_INDEX_DEMO_STANDING_TRAIN] = PCFB" in l) == 1)
     rows = {}
     for m in re.finditer(r"\[mPlayer_INDEX_(\w+)\]\s*=\s*(PCROW_BODY|PCROW_ITEM|PCROW|PCFB)\(\s*\"([^\"]*)\"", rp):
         rows[m.group(1)] = (m.group(2), m.group(3))
+    rows3 = {}  # the table as the T3 commit left it (the working tree has gained door rows since; the three T3 rows must still be what T3 made them)
+    for m in re.finditer(r"\[mPlayer_INDEX_(\w+)\]\s*=\s*(PCROW_BODY|PCROW_ITEM|PCROW|PCFB)\(\s*\"([^\"]*)\"", blob(T3_FIX, "pc/src/pc_remote_player.c")):
+        rows3[m.group(1)] = (m.group(2), m.group(3))
     bro = {}
     for m in re.finditer(r"\[mPlayer_INDEX_(\w+)\]\s*=\s*(PCROW_BODY|PCROW_ITEM|PCROW|PCFB)\(\s*\"([^\"]*)\"", blob(BASELINE, "pc/src/pc_remote_player.c")):
         bro[m.group(1)] = (m.group(2), m.group(3))
-    changed_rows = sorted(k for k in rows if rows[k] != bro.get(k))
-    ck("T3: the state-row table differs from the baseline in exactly DEMO_STANDING_TRAIN, DEMO_WALK and DEMO_GETOFF_TRAIN (%s) and has the same 121 indexes" % changed_rows,
-       changed_rows == ["DEMO_GETOFF_TRAIN", "DEMO_STANDING_TRAIN", "DEMO_WALK"] and sorted(rows) == sorted(bro) and len(rows) == 121)
+    changed_rows = sorted(k for k in rows3 if rows3[k] != bro.get(k))
+    ck("T3: the state-row table differs from the baseline in exactly DEMO_STANDING_TRAIN, DEMO_WALK and DEMO_GETOFF_TRAIN (%s) and has the same 121 indexes (at the T3 commit; "
+       "the working tree still has those three rows as T3 made them and keeps every baseline index)" % changed_rows,
+       changed_rows == ["DEMO_GETOFF_TRAIN", "DEMO_STANDING_TRAIN", "DEMO_WALK"] and sorted(rows3) == sorted(bro) and len(rows3) == 121
+       and all(rows.get(k) == rows3[k] for k in changed_rows) and set(bro) <= set(rows))
     ck("T3: DEMO_STANDING_TRAIN is a filled row 'standing_train' with PC_ROWF_HIDE_BODY (REPEAT, the HIDE row mechanism)",
        rows.get("DEMO_STANDING_TRAIN") == ("PCROW", "standing_train")
        and re.search(r"\[mPlayer_INDEX_DEMO_STANDING_TRAIN\] = PCROW\(\"standing_train\", mPlayer_ANIM_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0\.5f, 1\.0f, PC_ROWF_HIDE_BODY,", rp))
@@ -160,7 +186,8 @@ def main():
        "(active->flags & PC_ROWF_HIDE_BODY)" in rp_pre and 'pc_remote_player_row_release(self, snapped ? "snap" : "gap");' in rp_pre
        and "slot->latch_clear_req" in rp_pre and 'pc_remote_player_row_release(self, "scene");' in rp_pre)
     ck("T3: any other state releases the row (fallback / another row start) and the draw skips only while the HIDE_BODY row is ACTIVE",
-       'pc_remote_player_row_release(self, "finished");' in rp_pre and rp.count("(hrow->flags & PC_ROWF_HIDE_BODY)") >= 3
+       'pc_remote_player_row_release(self, "finished");' in rp_pre and rp.count("pc_remote_player_body_hidden(") >= 3
+       and "(hrow->flags & PC_ROWF_HIDE_BODY)" in T.func(rp, "pc_remote_player_body_hidden")  # the draw skips were folded into ONE helper (building doors)
        and "pc_remote_player_row_release(" in rp)
     ck("T3: the hide flag is only ever set by table rows (no runtime writer): exactly two rows carry PC_ROWF_HIDE_BODY (HIDE, DEMO_STANDING_TRAIN)",
        len(re.findall(r"PC_ROWF_HIDE_BODY, -1, -1,", rp)) == 2)
@@ -177,7 +204,13 @@ def main():
        not re.search(r"Common_Set\(train_|train_coming_flag|train_action", rp.replace("mTRC_pc_remote_arrival", "")))
     ck("T4: the per-puppet latch lives in the per-actor visual struct (zero at creation: a re-created puppet is a new arrival)",
        "int                   train_standing_latched;" in rp and "int                   rebind_from_row;" in rp)
-    ck("T4: the includes of the train API / pure header are TARGET_PC guarded", re.search(r"#ifdef TARGET_PC\n#include \"m_train_control.h\"[^\n]*\n#include \"pc_remote_arrival_logic.h\"[^\n]*\n#endif", rp) is not None)
+    inc_i = rp.index('#include "m_train_control.h"')
+    pre_dirs = [l.strip() for l in rp[:inc_i].split("\n") if l.startswith(("#if", "#else", "#endif", "#elif"))]
+    post_dirs = [l.strip() for l in rp[inc_i:].split("\n") if l.startswith("#")][:3]
+    # the two includes sit inside a `#ifdef TARGET_PC` region (shared with the building-door includes now): the last conditional directive before them opens it, the first one after closes it
+    ck("T4: the includes of the train API / pure header are TARGET_PC guarded",
+       bool(pre_dirs) and pre_dirs[-1] == "#ifdef TARGET_PC" and len(post_dirs) == 3 and post_dirs[0].startswith('#include "m_train_control.h"')
+       and post_dirs[1].startswith('#include "pc_remote_arrival_logic.h"') and post_dirs[2] == "#endif")
 
     # ---------------- vanilla index set / header ----------------
     mp = cur("include/m_player.h")
@@ -191,7 +224,7 @@ def main():
     ngc = cur("pc/include/pc_net_game.h")
     ck("wire: PC_NETGAME_PROTOCOL_VERSION is still 8", "#define PC_NETGAME_PROTOCOL_VERSION 8u" in ngc)
     ck("wire: the wire baseline file (if any) is unchanged", unchanged(["pc/tools/net_spike/wire_baseline"]) if os.path.exists(os.path.join(HERE, "wire_baseline")) else True)
-    changed = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--ignore-cr-at-eol", BASELINE] + ([FIX_COMMIT] if FIX_COMMIT else []), capture_output=True, text=True, timeout=60).stdout.split()
+    changed = changed_files()  # what the two feature commits changed
     ck("wire: no pc_net* / protocol source file is in the change set (%s)" % ",".join(changed), not any(re.search(r"pc_net|protocol", c) and not c.endswith((".py", ".md")) for c in changed))
 
     bad = [d for d, ok in results if not ok]

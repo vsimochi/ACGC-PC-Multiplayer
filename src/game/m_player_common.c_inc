@@ -4525,6 +4525,50 @@ static int Player_actor_CheckAndRequest_main_scoop_all(GAME* game, int priority)
     return FALSE;
 }
 
+#ifdef TARGET_PC
+/* One-shot: the NEXT get_scoop setup is presentation-only (no putin_item). Consumed in
+ * Player_actor_setup_main_Get_scoop() (m_player_main_get_scoop.c_inc). */
+static int s_pc_get_scoop_present_only = FALSE;
+
+/* Client dig-up pocket animation (cosmetic ONLY). pc_net_game.c calls this after a host-APPLIED dig grant whose pocket write was already
+ * applied by the transaction code; it enters the vanilla GET_SCOOP state in presentation-only mode so the item is NOT granted a second time.
+ * Never called on reject/expiry/fault. Silently does nothing if the player is no longer able to take the request (changed state / item). */
+int pc_player_present_dig_pocket(int ut_x, int ut_z, int item) {
+    GAME* game = (GAME*)gamePT;
+    PLAYER_ACTOR* player;
+    xyz_t pos;
+
+    { extern int g_pc_verbose; if (g_pc_verbose) printf("[NET][DIG] present pocket anim called ut(%d,%d) item 0x%04X\n", ut_x, ut_z, (unsigned)item); }
+    if (game == NULL || pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        return FALSE;
+    }
+    player = GET_PLAYER_ACTOR_GAME(game);
+    if (player == NULL || !mPlayer_ITEM_IS_SHOVEL(player->item_kind)) {
+        return FALSE;
+    }
+    /* The player must still be standing (WAIT) near the dug tile: if they already walked off / started another action / changed scene, the
+     * purely cosmetic animation is skipped (the grant is already in the pocket). */
+    if (player->now_main_index != mPlayer_INDEX_WAIT) {
+        return FALSE;
+    }
+    mFI_UtNum2CenterWpos(&pos, ut_x, ut_z);
+    {
+        const f32 ddx = player->actor_class.world.position.x - pos.x;
+        const f32 ddz = player->actor_class.world.position.z - pos.z;
+        if (ddx * ddx + ddz * ddz > 80.0f * 80.0f) {
+            return FALSE;
+        }
+    }
+    s_pc_get_scoop_present_only = TRUE;
+    if (!Player_actor_request_main_get_scoop_all(game, &pos, (mActor_name_t)item, mPlayer_REQUEST_PRIORITY_4)) {
+        s_pc_get_scoop_present_only = FALSE;
+        return FALSE;
+    }
+    { extern int g_pc_verbose; if (g_pc_verbose) printf("[NET][DIG] present pocket anim started\n"); }
+    return TRUE;
+}
+#endif
+
 static void Player_actor_cancel_request_change_proc_index_by_A_btn(ACTOR* actorx) {
     PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
 

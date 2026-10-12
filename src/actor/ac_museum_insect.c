@@ -1049,10 +1049,55 @@ void Museum_Insect_Actor_dt(ACTOR* actor, GAME* game) {
     return;
 }
 
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+/* Multiplayer live refresh: another player's donation (client: the host's TOWN_SVC_STATE museum mirror; host: a client's MUSEUM_DONATE
+ * commit) changes Save_t.museum_display while this player already stands in the insect room. The ct only builds the insects donated at
+ * construction, so build each NEWLY donated insect in place with exactly the ct's per-insect steps (bit 1 of privInsects[i]._8C is only
+ * set by the ct and never cleared for privInsects). Slot reservations (_2F9C perches, point lights) are the live runtime ones the
+ * process_init functions already use. A stag-beetle pair (0x15/0x1d, 0x1e/0x1f) whose partner was built alone also gets the "partner
+ * present" bit + sway angle its ct would have set. Additive only; no allocation; never runs single-player. */
+static void Museum_Insect_PcRefreshDonations(MUSEUM_INSECT_ACTOR* actor, GAME* game) {
+    int i;
+    int added = FALSE;
+
+    if (pc_net_game_role() == PC_NETGAME_ROLE_NONE) {
+        return;
+    }
+    for (i = 0; i < aINS_INSECT_TYPE_NUM; i++) {
+        if ((actor->privInsects[i]._8C & 1) == 0 && mMmd_InsectInfo(i)) {
+            int partner = i == 0x15 ? 0x1d : i == 0x1d ? 0x15 : i == 0x1e ? 0x1f : i == 0x1f ? 0x1e : -1;
+
+            actor->privInsects[i]._8C |= 1;
+            actor->privInsects[i]._00 = i;
+            actor->privInsects[i]._14 = minsect_scale_tbl[i];
+            set_relax_active_time(&actor->privInsects[i], game);
+            minsect_ct[i](&actor->privInsects[i], game);
+            if (partner >= 0 && (actor->privInsects[partner]._8C & 1) && (actor->privInsects[partner]._8C & 0x10) == 0) {
+                MUSEUM_INSECT_PRIVATE_DATA* p = &actor->privInsects[partner];
+                xyz_t d;
+
+                p->_8C |= 0x10;
+                xyz_t_sub(&kuwagata_base_pos[(partner == 0x1e || partner == 0x15) ? p->_70 + 1 : p->_70 - 1], &kuwagata_base_pos[p->_70], &d);
+                p->_74 = atans_table(d.y, -d.x);
+            }
+            added = TRUE;
+            printf("[NET][MUSEUM] insect room: newly donated insect %d now on display (live refresh)\n", i);
+        }
+    }
+    if (added) {
+        Museum_Insect_CopyLogicState(actor); /* the draw interpolates prev -> current: give the new insect a valid previous state */
+    }
+}
+#endif
+
 void Museum_Insect_Actor_move(ACTOR* actorx, GAME* game) {
     MUSEUM_INSECT_ACTOR* actor = (MUSEUM_INSECT_ACTOR*)actorx;
     int ticks;
 
+#ifdef TARGET_PC
+    Museum_Insect_PcRefreshDonations(actor, game);
+#endif
     actorx->world.position.y = 4000.f;
     Museum_Insect_Talk_process(actorx, game);
 

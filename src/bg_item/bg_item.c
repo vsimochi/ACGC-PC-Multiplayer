@@ -246,10 +246,71 @@ int pc_tree_birth_bee_visual(int ut_x, int ut_z, xyz_t* out_drop_pos) {
             Actor_delete(actor);
             return 0;
         }
+        {
+            /* pc_bee_sync.h: report this shaker's bee to the other players in the scene (presentation only; inert in single player) */
+            extern void pc_bee_sync_local_spawn(void* actor, float x, float y, float z);
+            pc_bee_sync_local_spawn(actor, out_drop_pos->x, out_drop_pos->y, out_drop_pos->z);
+        }
         return 1;
     }
     xyz_t_move(out_drop_pos, &wait_pos);
     return 0;
+}
+#endif
+
+#ifdef TARGET_PC
+/* Multiplayer, PRESENTATION ONLY (PC_NETGAME_MSG_TREE_DROP receiver): the falling-item animation of one shaken-tree drop, with flag 0x4 set so the
+ * landing NEVER calls mFI_SetFG_common() (and entry never writes RSV_NO): the authoritative tile is only ever written by the host / tile sync.
+ * Mirrors fruit_set()'s normal-drop arc (same start offsets / speeds); the item actor simply disappears after its bounce. Returns TRUE if spawned. */
+int pc_bg_item_present_tree_drop(mActor_name_t fg_item, int tree_ut_x, int tree_ut_z, int drop_ut_x, int drop_ut_z, int index) {
+    static const xyz_t pos_part[3] = { { -22.5f, 65.0f, 17.5f }, { 22.5f, 72.0f, 12.5f }, { -2.5f, 97.5f, 7.5f } };
+    bg_item_drop_c drop;
+    xyz_t tree_wpos, drop_pos, fruit_pos;
+    f32 dist_xz;
+
+    if (bIT_CLIP == NULL || bIT_CLIP->bg_item_common_p == NULL || fg_item == EMPTY_NO || fg_item == HONEYCOMB) {
+        return FALSE;
+    }
+    if (index < 0 || index > 2) {
+        index = 0;
+    }
+    mFI_UtNum2CenterWpos(&tree_wpos, tree_ut_x, tree_ut_z);
+    tree_wpos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(tree_wpos, -1.0f);
+    mFI_UtNum2CenterWpos(&drop_pos, drop_ut_x, drop_ut_z);
+    drop_pos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(drop_pos, -1.0f);
+    xyz_t_add(&pos_part[index], &tree_wpos, &fruit_pos);
+
+    bzero(&drop, sizeof(drop));
+    drop.actorx_p = NULL;
+    drop.fg_item = fg_item;
+    xyz_t_move(&drop.position, &fruit_pos);
+    xyz_t_move(&drop.target_position, &drop_pos);
+    drop.flags = (ITEM_IS_FTR(fg_item) ? 0x200 : 0x100) | 0x4; /* 0x4: NEVER write the tile on landing */
+    drop.layer = 0;
+    drop._7C = 0.25f;
+    if (drop.flags & 0x200) {
+        drop._8A = 1;
+        drop.drop_speed = 26;
+        drop.acceleration_y = 0.15f;
+        drop._6E = 0;
+    } else {
+        drop.drop_speed = 14 + index * 4;
+        drop._8A = 1 + index * 4;
+        drop.acceleration_y = -1.2f;
+        drop._6E = 1;
+    }
+    drop.wait_counter = 0;
+    dist_xz = search_position_distanceXZ(&drop.target_position, &drop.position);
+    func_calc_spec_drop_time(dist_xz, drop.target_position.y - drop.position.y, drop.drop_speed, drop.acceleration_y,
+                             &drop.velocity_xz, &drop.velocity_y);
+    {
+        extern int g_pc_verbose;
+        const int spawned = bIT_actor_drop_entry_main(&bIT_CLIP->bg_item_common_p->fruit_drop_info, &drop) ? TRUE : FALSE;
+        if (g_pc_verbose) {
+            printf("[NET][TREE] tree drop present item 0x%04X tree(%d,%d) drop(%d,%d) idx %d spawned=%d\n", (unsigned)fg_item, tree_ut_x, tree_ut_z, drop_ut_x, drop_ut_z, index, spawned);
+        }
+        return spawned;
+    }
 }
 #endif
 

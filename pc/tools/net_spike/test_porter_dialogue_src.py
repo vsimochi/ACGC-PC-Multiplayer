@@ -37,7 +37,8 @@ def main():
     enum = re.search(r"enum \{\n    PC_NOOK_MSG_INTRO = 0.*?\n\};", hdr, re.S).group(0)
     names = re.findall(r"^\s*(PC_NOOK_MSG_[A-Z0-9_]+)", enum, re.M)
     count = int(re.search(r"#define PC_NOOK_MSG_COUNT (\d+)", hdr).group(1))
-    ck("S1 PC_NOOK_MSG_PORTER_STATION is the last generated row and PC_NOOK_MSG_COUNT covers it (%d rows, count %d)" % (len(names), count), names[-1] == "PC_NOOK_MSG_PORTER_STATION" and count == len(names))
+    # later rows were appended after the porter row (dresser storage: PC_NOOK_MSG_DRESSER_REFUSED); the porter row must exist and the count must cover every row
+    ck("S1 PC_NOOK_MSG_PORTER_STATION is a generated row and PC_NOOK_MSG_COUNT covers every row (%d rows, count %d)" % (len(names), count), "PC_NOOK_MSG_PORTER_STATION" in names and count == len(names))
     body = re.search(r"case PC_NOOK_MSG_PORTER_STATION:\n(.*?)break;", src, re.S).group(1)
     ck("S1 the row ends with NK_END and has no choice / select code", "nk_code(&b, NK_END);" in body and "nk_choice" not in body and "NK_SEL" not in body)
     lits = re.findall(r'nk_text\(&b, "((?:[^"\\]|\\.)*)"\)', body)

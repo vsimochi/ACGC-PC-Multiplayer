@@ -975,6 +975,9 @@ int aGKK_pc_apply_bobber_event(ACTOR* fish, ACTOR* uki_actor, int ev, int gyo_ty
             aGKK_setupAction(gyo, aGKK_ACTION_BITE);
             return 1;
         case PCWLD_BEV_RELEASE:
+            if (uki->gyo_status >= 4) {
+                return 0; /* committed (A pressed / hooked): same fishing-softlock guard as aGTT_pc_apply_bobber_event(), kept here for any direct caller */
+            }
             if (gyo->action == aGKK_ACTION_TOUCH || gyo->action == aGKK_ACTION_BITE || gyo->action == aGKK_ACTION_NEAR) {
                 uki->gyo_command = 0;
                 gyo->linked_actor = NULL;

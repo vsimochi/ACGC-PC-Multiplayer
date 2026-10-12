@@ -1312,6 +1312,17 @@ extern int mSP_SetNewVisitor() {
     return FALSE;
 }
 
+#ifdef TARGET_PC
+/* Multiplayer HOST: mSP_SetNewVisitor for a remote foreign-town shopper (a guest's applied purchase, pc_net_game.c). Idempotent: 1 = newly set, 0 = was already set. */
+int mSP_PC_SetVisitorRemote(void) {
+    if (Save_Get(shop).visitor_flag != FALSE) {
+        return 0;
+    }
+    Save_Get(shop).visitor_flag = TRUE;
+    return 1;
+}
+#endif
+
 extern u32 mSP_GetSalesSum() {
     return Save_Get(shop).sales_sum;
 }

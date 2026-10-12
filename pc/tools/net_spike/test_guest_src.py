@@ -163,7 +163,9 @@ def main():
               "pc_residence_find_free", "pc_residence_check", "pcres_first_free_slot", "pcnetgame_promoted_guest_sweep",
               # reviewed now (they were already at HEAD, unpinned): the personal-data (diary) sync code walks private_data with loop-bounded indices (slot < PLAYER_NUM; the client side
               # returns -1 for a guest claim / a non-resident before the loop)
-              "pcnetgame_pdata_host_tick", "pcnetgame_pdc_own_slot"]
+              "pcnetgame_pdata_host_tick", "pcnetgame_pdc_own_slot",
+              # TEST-ONLY host hook (AC_TEST_MUSEUM_BITS; HEAD already had it, unpinned): slot >= PLAYER_NUM is refused before the subscript
+              "pcnetgame_museum_bits_test_hook"]
     users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(private_data\)\[", c[a:b])})
     pinned = sorted(pinned)
     ck("A the functions that subscript Save_Get(private_data)[...] are exactly the %d reviewed ones (a new one needs a guest-safety review): %s" % (len(pinned), users),
@@ -179,7 +181,11 @@ def main():
                               # furniture sync, reviewed (guest-safety review of da9074a): live apply / reconcile plan / room track (client shadows, range-checked house index),
                               # the client reconcile apply (own house only, no guest claim)
                               "pcnetgame_hcl_live_apply", "pcnetgame_hcl_reconcile_plan", "pcnetgame_hcl_room_track", "pcnetgame_house_client_reconcile_apply",
-                              "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit"]))  # lifecycle hardening: the residence allocator (pc_residence_check: range-checked house; pcres_house_free: bounds-checked) replaced the open-coded loops of promote_exec / precheck / free_list
+                              "pcnetgame_house_owned", "pcnetgame_house_process_commit", "pcnetgame_house_test_host_edit",
+                              # master sprint 2 (dresser storage, kind 18): the host handler indexes homes[sc.owner] only after the guest refusal (idx >= PLAYER_NUM) and `sc.owner >= PLAYER_NUM ||`, and requires its ownerID == the bound PersonalID
+                              "pcnetgame_handle_host_dresser_txn",
+                              "pcnetgame_dresser_room_warp_test_hook",  # TEST-ONLY client hook (AC_TEST_DRESSER_ROOM): the house index is found by a loop bounded by PLAYER_NUM matching the local ownerID
+                              "pcnetgame_house_test_client_swap"]))  # TEST-ONLY client hook (HEAD already had it): the house index comes from pcnetgame_hcl_own_house() and is range checked  # lifecycle hardening: the residence allocator (pc_residence_check: range-checked house; pcres_house_free: bounds-checked) replaced the open-coded loops of promote_exec / precheck / free_list
     # reviewed guards of the furniture-sync / promote code that subscripts homes[] / private_data[] (a guest can never reach them with an out-of-range index)
     hcl_own = fb("pcnetgame_hcl_own_house")
     prm_idx = fb("pcnetgame_promote_parse_index")

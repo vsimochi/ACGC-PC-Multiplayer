@@ -98,9 +98,9 @@ def main():
                  "PC_NETGAME_TXN_REASON_PO_FULL": "25", "PC_NETGAME_REC_FIELD_MAIL_PRESENT": "12"}
           and L.PC_NETGAME_TXN_KIND_MAIL_SEND == 12 and (L.PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS, L.PC_NETGAME_TXN_REASON_MAILBOX_FULL, L.PC_NETGAME_TXN_REASON_PO_FULL) == (23, 24, 25)
           and L.PC_NETGAME_REC_FIELD_MAIL_PRESENT == 12 and L.TXN_REASON_NAMES[23] == "NO_SUCH_ADDRESS" and L.TXN_REASON_NAMES[24] == "MAILBOX_FULL" and L.TXN_REASON_NAMES[25] == "PO_FULL")
-    check("W M1 added NO message id (55 was the highest at M1; the current highest, wire_baseline.EXPECTED_MAX_MSG_ID = %d, is MAILBOX_LETTER of mail milestone 2 -- audited by test_mail2_src.py) and TXN_COMMIT (72 B) / TXN_RESULT (76 B) keep their exact size asserts: the M1 letter is NEVER on the wire"
+    check("W M1 added NO message id (55 was the highest at M1; the current baseline highest, wire_baseline.EXPECTED_MAX_MSG_ID = %d (HEAD: 76 HANDSHAKE_BUSY; MAILBOX_LETTER of mail milestone 2 = 56, audited by test_mail2_src.py)) and TXN_COMMIT (72 B) / TXN_RESULT (76 B) keep their exact size asserts: the M1 letter is NEVER on the wire"
           % wire_baseline.EXPECTED_MAX_MSG_ID,
-          wire_baseline.EXPECTED_MAX_MSG_ID >= 66 and max(v for _n, v in wire_baseline.c_message_ids(c_raw)) == 66 and dict(wire_baseline.c_message_ids(c_raw)).get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
+          wire_baseline.EXPECTED_MAX_MSG_ID >= 66 and max(v for _n, v in wire_baseline.c_message_ids(c_raw)) == wire_baseline.EXPECTED_MAX_MSG_ID and dict(wire_baseline.c_message_ids(c_raw)).get("PC_NETGAME_MSG_TOWN_SVC_STATE") == 55
           and "_Static_assert(sizeof(PCNetGameTxnCommitMsg) == 72," in c_raw and "_Static_assert(sizeof(PCNetGameTxnResultMsg) == 76," in c_raw
           and not re.search(r"Mail_c\s+\w+;", c_raw[c_raw.index("typedef struct PCNetGameTxnCommitMsg"):c_raw.index("} PCNetGameTxnCommitMsg;")]))
     check("W the tag convention of the doc comment: dest NONE, slot = mail slot, item = gift echo, aux_item = low 16 / aux_cond = bits 16..23 of the 24-bit hash; python mail_hash24 is the same cut",
@@ -340,7 +340,7 @@ def main():
     blocked = func_body(c_raw, "pcnetgame_txn_begin_blocked")
     check("C one pocket-transaction token: every request-side begin check (pickup / drop / bury / grants / catch / field actions / town services) uses pcnetgame_txn_begin_blocked() = s_ctxn busy OR a MAIL_SEND in AWAIT_CLEAN; "
           "pcnetgame_txn_busy() itself (upload deferral, adopt blocker) is unchanged",
-          "(s_mail_op.active && !s_mail_op.done)" in blocked and "(s_take_op.active && !s_take_op.done)" in blocked and "s_ctxn.state != PC_NETGAME_CTXN_FREE" in blocked and c.count("pcnetgame_txn_begin_blocked()") == 9
+          "(s_mail_op.active && !s_mail_op.done)" in blocked and "(s_take_op.active && !s_take_op.done)" in blocked and "s_ctxn.state != PC_NETGAME_CTXN_FREE" in blocked and c.count("pcnetgame_txn_begin_blocked()") >= 13
           and "pcnetgame_txn_begin_blocked()" in func_body(c_raw, "pcnetgame_ts_begin") and "s_mail_op" not in func_body(c_raw, "pcnetgame_txn_busy"))
     check("T the mail test hooks are role-bound in pc_main.c like --txn-fault: --mail-test-force-delivery / --mail-test-poke-museum refuse (exit 2) unless --host, --mail-test-send unless --connect",
           "g_pc_mail_test_force_delivery || g_pc_mail_test_poke_museum >= 0 || g_pc_mail_test_seed_mailbox != NULL || g_pc_mail_test_seed_reply != NULL) &&" in main_c.replace("\n        g_pc_net_role != 1", " g_pc_net_role != 1").replace("\n", " ")

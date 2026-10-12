@@ -416,6 +416,12 @@ def main():
     pinned = {}
     for fn in ("pc_save_write_gci_to", "pc_save_write_gci", "pc_save_read_gci"):
         cb, bb = func_body(cur_card, fn), func_body(strip_obs(base_card_raw), fn)
+        # documented sprint addition: pc_save_read_gci may gain EXACTLY ONE post-load call of the in-memory notice-board repair (touches only an all-zero post, never
+        # the GCI layout / byte order / file I/O); everything else of the body must stay byte-identical to a74740b.
+        if fn == "pc_save_read_gci":
+            _rep = [l for l in cb.split("\n") if "pc_board_repair_zeroed_posts(common_data.save.save.noticeboard, mNtc_BOARD_POST_COUNT);" in l]
+            if len(_rep) == 1 and cb.count("pc_board_repair_zeroed_posts(") == 1:
+                cb = "\n".join(l for l in cb.split("\n") if l != _rep[0])
         pinned[fn] = bool(cb) and cb == bb
     check(f"S9 pc_save_write_gci_to / pc_save_write_gci / pc_save_read_gci bodies byte-identical to a74740b ({pinned})", all(pinned.values()))
     # (2) diff vs 0c9bc72: every changed layout / serialisation line must be inside a NEW function (not defined in 0c9bc72: pc_ts_*, pc_mp_promote_*,

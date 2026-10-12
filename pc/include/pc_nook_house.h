@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 34
+#define PC_NOOK_MSG_COUNT 35
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -46,11 +46,13 @@ enum {
     PC_NOOK_MSG_WORK_V_RECEIVE,  /* the villager receives the parcel (+ the optional tip) */
     PC_NOOK_MSG_WORK_V_FAIL,     /* the villager does not know what this is about */
     PC_NOOK_MSG_EVNPC_GIFT_GONE, /* Gulliver: his gift of this visit was already given away (the host decided) */
-    PC_NOOK_MSG_PORTER_STATION   /* Porter (station master): replaces the vanilla "going somewhere? / return to your village" offer, which has no meaning in this multiplayer version */
+    PC_NOOK_MSG_PORTER_STATION,  /* Porter (station master): replaces the vanilla "going somewhere? / return to your village" offer, which has no meaning in this multiplayer version */
+    PC_NOOK_MSG_DRESSER_REFUSED  /* dresser storage (worker 3): a REJECTED / unanswered dresser request (system text: nothing changed) */
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */
 enum { PC_NOOK_SEL_BUY_HOUSE = PC_NOOK_SEL_BASE, PC_NOOK_SEL_HOUSE1, PC_NOOK_SEL_HOUSE2, PC_NOOK_SEL_HOUSE3, PC_NOOK_SEL_HOUSE4, PC_NOOK_SEL_ANY_HOUSE, PC_NOOK_SEL_REFRESH, PC_NOOK_SEL_WORK, PC_NOOK_SEL_WORK_HERE, PC_NOOK_SEL_WORK_LATER, PC_NOOK_SEL_WORK_LEAVE, PC_NOOK_SEL_JOB, PC_NOOK_SEL_WORK_TAKE, PC_NOOK_SEL_WORK_REPORT,
+       PC_NOOK_SEL_DRESSER_MORE, /* dresser storage: "More storage" (appended: every earlier id keeps its value) */
        PC_NOOK_SEL_COUNT_END };
 /* one choice string per house: a different PC_RESIDENCE_HOUSES needs more PC_NOOK_SEL_HOUSEn entries (and Nook's choice paging beyond 6 choices; see the roadmap) */
 _Static_assert(PC_NOOK_SEL_ANY_HOUSE - PC_NOOK_SEL_HOUSE1 == 4, "one PC_NOOK_SEL_HOUSEn per house (PC_RESIDENCE_HOUSES)");
@@ -132,7 +134,19 @@ int pc_nook_work_row(const PCWorkView* v, int* acts, int cap);
  * authoritative job state at the moment the message is loaded. Returns the new length (0 = not patched). pc_nook_first_page_work() = 1 when the message on screen carries the
  * extra choice (the actor then reads choice 3 as Work Mode). */
 int pc_nook_msg_patch(int index, unsigned char* data, int len, int cap);
+/* Dresser storage (worker 3): arm the next load of dresser message `index` to get "More storage" before its last choice; more_choice = that choice index
+ * when the last load of `index` was patched, else -1 (the vanilla choice list: the caller keeps the vanilla mapping). */
+void pc_dresser_msg_arm(int index);
+int pc_dresser_msg_more_choice(int index);
 int pc_nook_first_page_work(void);
+
+/* MAP LINE (first purchase): right after a purchase that granted the town map, the actor arms the vanilla thanks message it just selected (its message index). When that message is loaded,
+ * pc_nook_msg_patch() appends one extra page ("here is a map of the town") in place of its final MSGEND, ONCE: the arm is consumed by the first load of that index whether or not it was
+ * patched (a message that ends with MSGCONTINUE, e.g. the ticket rows, is left byte-identical). Nothing else changes: no new action, no new message id. clear() drops a stale arm. */
+void pc_nook_map_line_arm(int msg_index);
+void pc_nook_map_line_clear(void);
+int pc_nook_map_line_armed(void); /* the armed message index or -1 */
+int pc_nook_map_line_patched_count(void);
 
 /* Source audit helper: builds every PC message, returns 0 when all bytes are in the charset and every message ends with MSGEND / MSGCONTINUE. */
 int pc_nook_house_selftest(void);

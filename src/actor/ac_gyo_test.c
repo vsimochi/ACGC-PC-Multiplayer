@@ -951,6 +951,9 @@ int aGTT_pc_apply_bobber_event(ACTOR* fish, ACTOR* uki_actor, int ev, int gyo_ty
     aGYO_CTRL_ACTOR* gyo = (aGYO_CTRL_ACTOR*)fish;
     UKI_ACTOR* uki = (UKI_ACTOR*)uki_actor;
 
+    if (ev == PCWLD_BEV_RELEASE && uki->gyo_status >= 4) {
+        return 0; /* the committed-catch guard below, applied BEFORE the kaseki dispatch so a coelacanth gets it too */
+    }
     if (aGKK_pc_is_kaseki(fish)) {
         return aGKK_pc_apply_bobber_event(fish, uki_actor, ev, gyo_type, x, y, z, angle);
     }
@@ -996,6 +999,13 @@ int aGTT_pc_apply_bobber_event(ACTOR* fish, ACTOR* uki_actor, int ev, int gyo_ty
             aGTT_setupAction(gyo, aGTT_ACTION_BITE);
             return 1;
         case PCWLD_BEV_RELEASE:
+            /* Fishing-softlock guard: once the player has committed (aUKI_bite() gyo_status 4 = A pressed, 5+ =
+             * hooked) a late host RELEASE must NOT clear gyo_command: aUKI_bite() would fall to
+             * aUKI_set_proc_wait() (gyo_status=1, child_actor=NULL) and the player's FLY_ROD state would wait
+             * forever for CATCH. The host arbitrates the committed catch via CATCH_REQUEST instead. */
+            if (uki->gyo_status >= 4) {
+                return 0;
+            }
             if (gyo->action == aGTT_ACTION_TOUCH || gyo->action == aGTT_ACTION_BITE || gyo->action == aGTT_ACTION_NEAR) {
                 uki->gyo_command = 0;
                 gyo->linked_actor = NULL;

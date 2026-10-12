@@ -190,9 +190,11 @@ def run_p1(rig):
     b = rig.join(ib, "B")
     # --- HOST_CONFIG + the initial canonical pushes
     hc = a.ts_latest(L.PC_NETGAME_TS_HOSTCFG)
-    check("P1 HOST_CONFIG reached client A with byte 1 bit 0 (house sync) set and every other byte zero (byte 0 = wildlife off)",
-          hc is not None and len(hc[1]) == 8 and hc[1][0] == 0 and hc[1][1] == L.PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC and hc[1][2:] == bytes(6))
-    check("P1 HOST_CONFIG reached client B too", b.ts_latest(L.PC_NETGAME_TS_HOSTCFG) is not None and b.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[1][1] == 1)
+    # HOST_CONFIG layout now: byte 0 wildlife, byte 1 flags (bit 0 house sync, bit 1 personal-data sync), byte 2 shop RESTOCKING (0/1), byte 3 catalog generation, bytes 4..7
+    # the restock generation (both arbitrary values): only the bytes this test owns are pinned
+    check("P1 HOST_CONFIG reached client A with byte 1 bit 0 (house sync) set, no unknown flag bit, byte 0 = wildlife mode 0/1, byte 2 = not restocking (%s)" % (hc[1].hex() if hc else None),
+          hc is not None and len(hc[1]) == 8 and hc[1][0] in (0, 1) and (hc[1][1] & L.PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC) != 0 and (hc[1][1] & ~0x03) == 0 and hc[1][2] == 0)
+    check("P1 HOST_CONFIG reached client B too", b.ts_latest(L.PC_NETGAME_TS_HOSTCFG) is not None and (b.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[1][1] & 1) == 1)
     pa, pb = pushes_by_house(a), pushes_by_house(b)
     check("P1 client A received a digest-ok CANON_PUSH of every owned house (0..3), 7 chunks each, kind CANON_PUSH, image 0x1A44 B",
           sorted(pa) == [0, 1, 2, 3] and all(p["count"] == 7 and p["kind"] == 2 and len(p["data"]) == 0x1A44 for p in pa.values()))

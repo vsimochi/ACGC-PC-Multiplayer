@@ -48,6 +48,9 @@
 #include "pc_field_authority.h"
 #include "m_player_lib.h"
 #include "ac_birth_control.h"
+#include "m_shop.h"           /* host shop-renewal reload (pc_host_renewshop_poll) */
+#include "m_field_info.h"
+#include "m_collision_bg.h"
 /* OBSERVER-END */
 
 #include <stdio.h>
@@ -686,6 +689,48 @@ int pc_net_game_role_is_client(void) {
     return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT;
 }
 
+/* BOARD REPAIR (the "iiiii" bulletin board): a first-launch dedicated town used to leave Save.noticeboard zeroed, and a slot only counts as empty when post_time == the
+ * clear code (all 0xFF), so a zeroed board reads as 15 written posts of 192 x 0x00 (renders as repeated 'i'). A post is "demonstrably zeroed" ONLY when its whole 0xC0 message
+ * body AND its whole post_time are 0x00 -- a written post always has a real time, an empty slot has the 0xFF clear code, so no legitimate post can match. Such a post becomes
+ * an empty slot exactly like mNtc_ClearPage() (body CHAR_SPACE, post_time = mTM_rtcTime_clear_code); then the remaining posts are compacted forward (stable) because
+ * mNtc_notice_write_num() stops at the first empty slot. Returns the number of repaired posts. Any post with a single nonzero byte is never touched. */
+static int pc_board_post_is_zeroed(const mNtc_board_post_c* post) {
+    const u8* p = (const u8*)post;
+    size_t i;
+    for (i = 0; i < sizeof(mNtc_board_post_c); i++) {
+        if (p[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int pc_board_repair_zeroed_posts(mNtc_board_post_c* board, int count) {
+    int i, repaired = 0;
+    for (i = 0; i < count; i++) {
+        if (pc_board_post_is_zeroed(&board[i])) {
+            board[i].post_time = mTM_rtcTime_clear_code;
+            memset(board[i].message, CHAR_SPACE, MAIL_BODY_LEN);
+            repaired++;
+        }
+    }
+    if (repaired > 0) {
+        int w = 0;
+        for (i = 0; i < count; i++) {
+            if (lbRTC_IsEqualTime(&board[i].post_time, &mTM_rtcTime_clear_code, lbRTC_CHECK_ALL) != TRUE) {
+                if (w != i) {
+                    mNtc_board_post_c tmp = board[i];
+                    board[i] = board[w];
+                    board[w] = tmp;
+                }
+                w++;
+            }
+        }
+        OSReport("[BOARD] repaired %d zeroed notice-board post(s) (empty slots restored)\n", repaired);
+    }
+    return repaired;
+}
+
 /* Read a GCI file into common_data (for home town / Card A) */
 static int pc_save_read_gci(const char* path) {
     FILE* fp;
@@ -763,6 +808,7 @@ static int pc_save_read_gci(const char* path) {
 
     memcpy(&common_data.save.save, save_src, sizeof(Save_t));
     pc_save_bswap(&common_data.save.save, PC_BSWAP_FROM_BE);
+    pc_board_repair_zeroed_posts(common_data.save.save.noticeboard, mNtc_BOARD_POST_COUNT); /* only ever touches an all-zero post (never a legitimate one) */
 
     /* --- Load ARAM blocks from Others section ---
      * Current saves (PC + Dolphin/GC) use order: mail, original, diary.
@@ -2486,6 +2532,9 @@ static int pc_server_generate_town(GAME_PLAY* play) {
         Save_Get(land_info).name[i] = (u8)name[i];
     }
     Save_Get(land_info).exists = TRUE;
+    /* The Rover intro is the only vanilla caller of mNtc_SetInitData(); without it the board stays zeroed (15 posts of 0x00 = "iiiii"). Needs only
+     * Common_Get(time.rtc_time) (set up by the initialiser above) and the handbill ROM. */
+    mNtc_SetInitData();
     mFRm_SetSaveCheckData(Save_GetPointer(save_check));
     was_ready = pc_save_ready;
     pc_save_ready = 1; /* the writer is a no-op while the save is not armed */
@@ -2501,11 +2550,142 @@ static int pc_server_generate_town(GAME_PLAY* play) {
     return TRUE;
 }
 
+/* SHOP RENEWAL on a host that stays outdoors (HOST role only; single-player / clients never reach it). Vanilla finishes a scheduled shop upgrade ONLY in
+ * Shop_Level_Actor_ct -> aSL_RenewShop (a control actor of SCENE_FG, so: at an outdoor scene LOAD), while mSP_InRenewal() reports the shop closed from
+ * renewal_time - 1 day until that ct has run. A dedicated host's observer (and an idle listen host) never reloads the town, so every SHOP_BUY was refused
+ * NOT_AVAILABLE forever. Here, when the EXACT aSL_RenewShop condition holds (FG field, SCENE_FG, mEv_SAVED_RENEWSHOP, now >= renewal_time or the same day),
+ * the upgrade can really happen (a shop block exists, the qualifying level differs) and nobody is inside a shop building, the host does ONE same-position
+ * SCENE_FG reload (the observer-init / G3.3 look-reload goto_other_scene path) so the vanilla actor ct performs the renewal. Idempotent: at most one reload
+ * per renewal_time value (no loop if the renewal still does not happen). Never writes shop_level / renewal_time / the event itself. */
+static int pc_host_renewshop_scene_is_shop(int scene) {
+    return scene == SCENE_SHOP0 || scene == SCENE_CONVENI || scene == SCENE_SUPER || scene == SCENE_DEPART || scene == SCENE_DEPART_2;
+}
+
+static void pc_host_renewshop_poll(void) {
+    static int l_have_key = 0;
+    static lbRTC_time_c l_key; /* the renewal_time a reload was already issued for */
+    static int l_verify = 0;
+    GAME_PLAY* play;
+    PLAYER_ACTOR* pl;
+    lbRTC_time_c renew_time, now_time;
+    Door_data_c door;
+    xyz_t pos;
+    int bx, bz, slot, span, res;
+#ifdef PC_NET_TEST_HOOKS
+    static int l_hook_state = -1; /* -1 = env not read, 0 = off, 1 = armed (reload allowed), 2 = armed, reload suppressed ("hold") */
+    static int l_hook_done = 0;
+    static int l_hook_rearmed = 0;
+#endif
+
+    if (pc_net_game_role() != PC_NETGAME_ROLE_HOST || gamePT == NULL || gamePT->exec != play_main) {
+        return;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE || play->fb_fade_type != FADE_TYPE_NONE || !Common_Get(player_actor_exists)) {
+        return; /* a transition is running */
+    }
+    if (play->scene_id != SCENE_FG || Save_Get(scene_no) != SCENE_FG || mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELD_FG ||
+        !pc_net_game_dedicated_world_ready() || (g_pc_host_observer && !pc_host_observer_ready())) {
+        return;
+    }
+    if (l_verify) {
+        l_verify = 0;
+        printf("[NET][SHOP] host: shop renewal reload done: event %s, shop level %d (qualifying %d)\n",
+               mEv_CheckEvent(mEv_SAVED_RENEWSHOP) ? "STILL SET (not renewed; no further reload for this renewal date)" : "cleared (renewed)",
+               mSP_GetShopLevel(), mSP_GetRealShopLevel());
+#ifdef PC_NET_TEST_HOOKS
+        if (l_hook_state == 3 && l_hook_rearmed == 0) {
+            l_hook_rearmed = 1;
+            l_hook_done = 0; /* TEST-ONLY "twice": arm a SECOND due renewal (next tier) right after the first one */
+        }
+#endif
+    }
+#ifdef PC_NET_TEST_HOOKS
+    if (l_hook_state < 0) {
+        const char* e = getenv("AC_TEST_RENEWSHOP_DUE");
+        l_hook_state = (e == NULL || e[0] == '\0' || e[0] == '0') ? 0 : strcmp(e, "hold") == 0 ? 2 : strcmp(e, "twice") == 0 ? 3 : 1;
+    }
+    if (l_hook_state > 0 && !l_hook_done && pc_net_game_host_ready_peer_count() > 0) { /* armed once a READY peer is connected (it then sees the reload) */
+        /* TEST-ONLY: a renewal that is already due at host start (sales just reach the next tier, the event set, renewal_time = now). */
+        const int lvl = mSP_GetShopLevel();
+        const u32 target = (lvl == mSP_SHOP_TYPE_ZAKKA) ? (u32)mSP_COMBINI_SUM : (lvl == mSP_SHOP_TYPE_COMBINI) ? (u32)mSP_SUPER_SUM : (u32)mSP_DSUPER_SUM;
+        l_hook_done = 1;
+        if (lvl < mSP_SHOP_TYPE_SUPER) {
+            if (mSP_GetSalesSum() < target) {
+                mSP_PlusSales(target - mSP_GetSalesSum());
+            }
+            mEv_EventON(mEv_SAVED_RENEWSHOP);
+            Save_Get(shop).renewal_time = Common_Get(time.rtc_time);
+            Save_Get(shop).shop_info.upgrading_today = TRUE;
+        }
+        printf("[NET][SHOP][TEST-ONLY] AC_TEST_RENEWSHOP_DUE=%s: renewal armed: level %d qualifying %d sales %u event %d shop_open %d\n",
+               l_hook_state == 2 ? "hold" : l_hook_state == 3 ? "twice" : "1", mSP_GetShopLevel(), mSP_GetRealShopLevel(), (unsigned)mSP_GetSalesSum(),
+               mEv_CheckEvent(mEv_SAVED_RENEWSHOP), mSP_ShopOpen());
+        return;
+    }
+#endif
+    if (mEv_CheckEvent(mEv_SAVED_RENEWSHOP) != TRUE) {
+        return;
+    }
+    renew_time = Save_Get(shop).renewal_time;
+    now_time = Common_Get(time.rtc_time);
+    if (!(lbRTC_IsOverTime(&renew_time, &now_time) == lbRTC_OVER ||
+          lbRTC_IsEqualTime(&now_time, &renew_time, lbRTC_CHECK_YEARS | lbRTC_CHECK_MONTHS | lbRTC_CHECK_DAYS))) {
+        return; /* not due yet (the day before is vanilla's "closed for construction" day) */
+    }
+    if (l_have_key && lbRTC_IsEqualTime(&l_key, &renew_time, lbRTC_CHECK_ALL)) {
+        return; /* already reloaded once for this renewal */
+    }
+    if (mSP_GetShopLevel() == mSP_GetRealShopLevel() || !mFI_BlockKind2BkNum(&bx, &bz, mRF_BLOCKKIND_SHOP)) {
+        return; /* aSL_RenewShop could not renew: a reload would not help */
+    }
+    span = pc_net_game_dedicated_peer_slots();
+    for (slot = 0; slot < span; slot++) {
+        PCNetPlayerScene sc;
+        if (slot != PC_NETGAME_HOST_PLAYER_ID && pc_net_game_get_peer_scene((PCNetPlayerId)slot, &sc) && sc.valid &&
+            pc_host_renewshop_scene_is_shop((int)sc.scene_id)) {
+            return; /* a player is inside a shop building: wait */
+        }
+    }
+    pl = GET_PLAYER_ACTOR_NOW();
+    if (pl == NULL || play->submenu.process_status != mSM_PROCESS_WAIT ||
+        (!pc_host_observer_active() && !mPlib_able_submenu_type1((GAME*)play))) {
+        return; /* the host's own player is busy (menu / talk / action): wait */
+    }
+#ifdef PC_NET_TEST_HOOKS
+    if (l_hook_state == 2) {
+        return; /* TEST-ONLY "hold": the renewal stays pending (shows the pre-fix NOT_AVAILABLE) */
+    }
+#endif
+    pos = pl->actor_class.world.position;
+    memset(&door, 0, sizeof(door));
+    door.next_scene_id = SCENE_FG;
+    door.exit_orientation = mSc_DIRECT_SOUTH;
+    door.exit_type = 0;
+    door.extra_data = 0;
+    door.exit_position.x = (s16)pos.x;
+    door.exit_position.y = (s16)mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
+    door.exit_position.z = (s16)pos.z;
+    door.door_actor_name = EMPTY_NO;
+    door.wipe_type = WIPE_TYPE_FADE_BLACK;
+    Common_Set(demo_profiles[0], mAc_PROFILE_NUM); /* never replay a demo (train arrival) on the reload */
+    Common_Set(demo_profiles[1], mAc_PROFILE_NUM);
+    res = goto_other_scene(play, &door, TRUE);
+    printf("[NET][SHOP] host: shop renewal due (renewal %04d-%02d-%02d, level %d -> %d): same-position SCENE_FG reload so the vanilla shop actor renews: res=%d\n",
+           (int)renew_time.year, (int)renew_time.month, (int)renew_time.day, mSP_GetShopLevel(), mSP_GetRealShopLevel(), res);
+    if (res == 1) {
+        l_key = renew_time;
+        l_have_key = 1;
+        l_verify = 1;
+    }
+}
+
 void pc_host_observer_poll(void) {
     static int l_started = 0;
     static int l_init_ok = 0;
     GAME_PLAY* play;
 
+    pc_host_renewshop_poll(); /* HOST role only (any host: observer / dedicated / listen); a no-op otherwise */
     if (!g_pc_host_observer || pc_net_game_role() != PC_NETGAME_ROLE_HOST) {
         return;
     }

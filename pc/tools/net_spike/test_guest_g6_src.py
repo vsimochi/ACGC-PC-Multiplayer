@@ -115,7 +115,7 @@ def main():
        "not-connected notice unchanged; graph_main still calls it every frame (title + in game) under TARGET_PC",
        nd.index("pc_net_game_join_message(&join_warning)") < nd.index("pc_net_game_client_notice_visible()") and "pc_net_join_message_draw(game, join_msg, join_warning);" in nd
        and "Cannot join the host:" in pm and "Waiting for the host:" in pm and "Not connected to the host" in pm
-       and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None and numstat("src/graph.c") == (0, 0))
+       and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n(?:    pc_tool_wheel_draw\(game\);[^\n]*\n)?    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None and numstat("src/graph.c") == (0, 0))  # (the PC radial tool menu draw now sits between the two)
     ck("A the declaration is in pc_net_game.h next to the existing notice accessor", S.read("pc/include/pc_net_game.h").count("const char* pc_net_game_join_message(int* is_warning);") == 1)
 
     # ------------------------------------------------------------------ B
@@ -135,13 +135,14 @@ def main():
     ck("B the info struct has no token member", "PCNetGameDedicatedGuestInfo" in st and not re.search(r"\btoken\b\s*[\[;]", S.mask(re.search(r"typedef struct PCNetGameDedicatedGuestInfo \{.*?\} PCNetGameDedicatedGuestInfo;", st, re.S).group(0))))
     ad = fr("pc_net_game_dedicated_guest_admin")
     order = [ad.index(x) for x in ("s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready", "if (s_guest_untrusted) {", "pcnetgame_dedicated_guest_resolve(sel, msg, cap)", "if (peer >= 0) {",
-                                   "if (!confirm) {", "pc_mp_guests_backup_file(PC_MP_GUESTS_PATH, bak, sizeof(bak))", "s_guest[g].recovery = 1;", "memset(&s_guest[g], 0, sizeof(s_guest[g]));")]
+                                   "if (!confirm) {", "pcnetgame_guest_backup(g, bak, sizeof(bak))", "s_guest[g].recovery = 1;", "memset(&s_guest[g], 0, sizeof(s_guest[g]));")]
     ck("B the admin function's order: host+world -> UNTRUSTED refusal -> selector (unknown / ambiguous) -> BOUND refusal -> `confirm` -> BACKUP -> only then the table is touched", order == sorted(order))
     ck("B a failed backup REFUSES the command (nothing is changed) and the removal is ROLLED BACK when guests.dat cannot be written",
-       re.search(r"if \(!pc_mp_guests_backup_file\(PC_MP_GUESTS_PATH, bak, sizeof\(bak\)\)\) \{[^}]*return 0;", ad, re.S) is not None
+       re.search(r"if \(!pcnetgame_guest_backup\(g, bak, sizeof\(bak\)\)\) \{[^}]*return 0;", ad, re.S) is not None  # capacity phase 3: the per-guest store backs up that guest's own file
        and re.search(r'if \(!pcnetgame_guest_store_write\("operator removed a guest"\)\) \{\s*s_guest\[g\] = old_g;\s*s_guest_rec\[g\] = old_rec;\s*s_rec_slot\[PLAYER_NUM \+ g\] = old_rs;', ad) is not None)
-    ck("B the bound check uses the host's own binding table (READY peers bound to the guest slot), the selector is a single digit 0..7 or a unique case-insensitive name", "pcnetgame_host_peer_bound_to_guest(g, (PCNetPeerId)-1)" in ad
-       and "matches %d guest entries" in fr("pcnetgame_dedicated_guest_resolve") and "sel[0] >= '0' && sel[0] <= '7' && sel[1] == '\\0'" in fr("pcnetgame_dedicated_guest_resolve"))
+    ck("B the bound check uses the host's own binding table (READY peers bound to the guest slot), the selector is an all-digit slot number bounded by the guest table (capacity phase 3: s_guest_cap, no longer a single digit 0..7) or a unique case-insensitive name", "pcnetgame_host_peer_bound_to_guest(g, (PCNetPeerId)-1)" in ad
+       and "matches %d guest entries" in fr("pcnetgame_dedicated_guest_resolve") and "while (*d >= '0' && *d <= '9' && v < 100000000L)" in fr("pcnetgame_dedicated_guest_resolve")
+       and "g >= s_guest_cap || !s_guest[g].used" in fr("pcnetgame_dedicated_guest_resolve"))
     inf = fr("pc_net_game_dedicated_guest_info")
     ck("B guest_info copies ASCII names / flags only (no token member is read)", ".token" not in inf)
     bld = fr("pcnetgame_guest_store_build")

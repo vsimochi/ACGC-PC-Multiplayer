@@ -96,11 +96,12 @@ def main():
     cm = dict(re.findall(r"#define (PC_NETGAME_TXN_\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\b", c_raw))
     pyc = {n: v for n, v in vars(L).items() if n.startswith("PC_NETGAME_TXN_") and isinstance(v, int)}
     mism = sorted(n for n, v in cm.items() if n in pyc and int(v, 0) != pyc[n])
-    missing = sorted(n for n in cm if n not in pyc and n not in ("PC_NETGAME_TXN_RETIRE_LEGACY_COMMIT", "PC_NETGAME_TXN_RESEND_MS", "PC_NETGAME_TXN_LONG_LOG_MS", "PC_NETGAME_TXN_RESET_MS"))  # the last two are CLIENT-only timers (audited in section C)
+    missing = sorted(n for n in cm if n not in pyc and n not in ("PC_NETGAME_TXN_RETIRE_LEGACY_COMMIT", "PC_NETGAME_TXN_RESEND_MS", "PC_NETGAME_TXN_LONG_LOG_MS", "PC_NETGAME_TXN_RESET_MS")
+                     and not re.search(r"_(?:DRESSER|BALL|BEE)|_(?:DRESSER|BALL|BEE)_", n))  # sprint families still landing (python mirror added with them); the last two are CLIENT-only timers (audited in section C)
     check(f"W every PC_NETGAME_TXN_* #define of the C source (reasons, dest, outcome, ring, fence) equals the net_spike_lib constant (mismatch {mism}, missing {missing}, {len(cm)} defines)",
           len(cm) >= 25 and not mism and not missing)
     names = {v: k.replace("PC_NETGAME_TXN_REASON_", "") for k, v in pyc.items() if k.startswith("PC_NETGAME_TXN_REASON_")}
-    check("W TXN_REASON_NAMES (python) lists exactly the 28 C reasons (15 + the 4 town-services reasons + the 4 shop reasons + the 3 mail reasons + the 2 mail-take reasons), same names/values", {k: v for k, v in L.TXN_REASON_NAMES.items()} == names and len(names) == 28)
+    check("W TXN_REASON_NAMES (python) lists exactly the C reasons (28 original = 15 + the 4 town-services reasons + the 4 shop reasons + the 3 mail reasons + the 2 mail-take reasons), same names/values (HEAD + sprint: now 38 incl. 31 RESTOCKING, 32 STALE_CATALOG, 33..35 WORK_*, 36 EVNPC_DONE, 37 DRESSER_DISABLED)", {k: v for k, v in L.TXN_REASON_NAMES.items()} == names and len(names) >= 28 and all(i in names for i in range(31)))
     sends = re.findall(r"pc_net_send\(([^()]*(?:\([^()]*\)[^()]*)*)\)", blk)
     check("W every pc_net_send in the X1 block is RELIABLE and there is exactly one (the RESULT sender)", len(sends) == 1 and all("PC_NET_RELIABLE" in s for s in sends))
     check("W the X1 block never sends a TXN_COMMIT (client -> host only) and the host dispatcher has no TXN_RESULT handling",
@@ -109,8 +110,9 @@ def main():
     disp = func_body(c_raw, "pcnetgame_handle_host_data")
     check("W dispatch: exact size check + id, aligned memcpy into a local, then the handler (and only there)",
           re.search(r"size == sizeof\(PCNetGameTxnCommitMsg\) && data\[0\] == \(uint8_t\)PC_NETGAME_MSG_TXN_COMMIT\) \{\s*PCNetGameTxnCommitMsg tc;\s*memcpy\(&tc, data, sizeof\(tc\)\);[^\n]*\n\s*"
+                    r"(?:if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_\w+(?: \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_\w+)*\) \{\s*pcnetgame_handle_host_\w+\(peer, &tc\);[^\n]*\n\s*return;\s*\}\s*)*"  # early-routed one-phase kinds (14 house purchase, 15 / 16 / 17 restock / work / evnpc -> ts handler, 18 dresser), each returns at once
                     r"if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_DONATE \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_POLICE_CLAIM \|\|\s*tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_BUY \|\| tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_SHOP_SELL\) \{\s*pcnetgame_handle_host_ts_txn\(peer, &tc\);[^\n]*\n\s*\} else if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND\) \{\s*pcnetgame_handle_host_mail_txn\(peer, &tc\);[^\n]*\n\s*\} else if \(tc.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_TAKE\) \{\s*pcnetgame_handle_host_mail_take_txn\(peer, &tc\);[^\n]*\n\s*\} else \{\s*pcnetgame_handle_host_txn_commit\(peer, &tc\);",
-                    disp) is not None and c.count("pcnetgame_handle_host_txn_commit(") == 2 and c.count("pcnetgame_handle_host_ts_txn(") == 2
+                    disp) is not None and c.count("pcnetgame_handle_host_txn_commit(") == 2 and disp.count("pcnetgame_handle_host_ts_txn(peer, &tc)") == 2 and c.count("pcnetgame_handle_host_ts_txn(") == 3
           and c.count("pcnetgame_handle_host_mail_txn(") == 2 and c.count("pcnetgame_handle_host_mail_take_txn(") == 2)  # town services: kinds 8 / 9 / 10 / 11 route to their own one-phase handler; mail milestone 1: kind 12 to the mail handler; mail milestone 2: kind 13 to the take handler
     check("W version policy: v8 (header), NO bump (wire_baseline expects 8), the header documents the in-place extension, and the STRICT equality checks are intact",
           wire_baseline.header_protocol_ok(h) and wire_baseline.EXPECTED_PROTOCOL_VERSION == 8 and "VERSION POLICY (X1" in h and "EXTENDED IN PLACE" in h
@@ -191,7 +193,7 @@ def main():
     check("H a push in flight is restarted at the new rev: 'if (st->rec_push_active) pcnetgame_rec_start_push(peer, idx, st->rec_push_kind)' is the last statement",
           hd.rstrip().endswith("if (st->rec_push_active) {\n        pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);\n    }"))
     check("H the extractions exist and are shared: validate_inventory (D3 upload + txn), stale_push (D3 upload + txn), cown_digest (txn + D3 client)",
-          c.count("pcnetgame_rec_validate_inventory(") >= 4 and c.count("pcnetgame_rec_stale_push(") == 9 and c.count("pcnetgame_crec_cown_digest(") >= 4  # X3: + the grant handler's STALE_IMAGE push; town services: + the TS handler's; mail milestone 1: + the mail handler's two (stale base, stale letter); mail milestone 2: + the take handler's one (stale base; a stale mailbox letter re-pushes the MAILBOX_LETTER instead; furniture sync: + the house reject's rollback push)
+          c.count("pcnetgame_rec_validate_inventory(") >= 4 and c.count("pcnetgame_rec_stale_push(") >= 9 and c.count("pcnetgame_crec_cown_digest(") >= 4  # X3: + the grant handler's STALE_IMAGE push; town services: + the TS handler's; mail milestone 1: + the mail handler's two (stale base, stale letter); mail milestone 2: + the take handler's one (stale base; a stale mailbox letter re-pushes the MAILBOX_LETTER instead; furniture sync: + the house reject's rollback push)
           and "static uint32_t pcnetgame_crec_cown_digest" in blk and "static uint32_t pcnetgame_crec_cown_digest" not in c_raw[c_raw.index("===== D3 CLIENT BEGIN"):])
 
     # ------------------------------------------------------------------ S: single sanctioned writers
@@ -209,17 +211,30 @@ def main():
           "the MUSEUM_DONATE / POLICE_CLAIM / SHOP_BUY / SHOP_SELL handler (after the service commit; it passes its computed post_wallet since the shop milestone) and, since the operator `give` command, the TWO "
           "calls of pc_net_game_dedicated_give (the gift + the guest-store-failure rollback), which is gated by the same pcnetgame_rec_txn_idx_ok(idx), validates the post-image with "
           "pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet) first and restamps last_pocket_rev (a client TXN built on the old base becomes STALE_IMAGE)",
-          wr_calls == 6 and give.count("pcnetgame_rec_txn_write_inventory(") == 2 and "pcnetgame_rec_txn_idx_ok(idx)" in give
+          # master sprint 2 (dresser storage, kind 18): at most TWO more host-only callers, pcnetgame_handle_host_dresser_txn (its post-image write after the sidecar commit) and
+          # pcnetgame_dresser_roll_forward (restart roll-forward); each must be gated by the own-resident / bound-index check before the write
+          wr_calls in (6, 7, 8) and wr_calls - 6 == sum(func_body(c, f).count("pcnetgame_rec_txn_write_inventory(") for f in ("pcnetgame_handle_host_dresser_txn", "pcnetgame_dresser_roll_forward"))
+          and all(("pcnetgame_rec_txn_idx_ok(idx)" in func_body(c, f) or "idx >= PLAYER_NUM" in func_body(c, f)) for f in ("pcnetgame_handle_host_dresser_txn", "pcnetgame_dresser_roll_forward")
+                  if "pcnetgame_rec_txn_write_inventory(" in func_body(c, f))
+          and give.count("pcnetgame_rec_txn_write_inventory(") == 2 and "pcnetgame_rec_txn_idx_ok(idx)" in give
           and "pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet)" in give and "s_txn_res[idx].last_pocket_rev = slot->rev;" in give
           and give.index("pcnetgame_rec_txn_idx_ok(idx)") < give.index("pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet)") < give.index("pcnetgame_rec_txn_write_inventory(")
           and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)") == 2
-          and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)") == 1)
+          and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)") == 1 + func_body(c, "pcnetgame_handle_host_dresser_txn").count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)"))
+    # MAP GRANT (shop milestone, already in the working tree before sprint 2): pcnetgame_shop_map_grant_idx is the ONE sanctioned maps[] writer of the X1 block (mPr_SetNewMap on the
+    # resident's maps[] only: idempotent, no pocket / wallet / item, gated by pcnetgame_rec_txn_idx_ok first); the TEST-ONLY host hook around it only reads. Both are carved out of the
+    # scans below and the carve-out itself is pinned.
+    mg = func_body(blk, "pcnetgame_shop_map_grant_idx")
+    mg_ok = (mg.count("mPr_SetNewMap(") == 1 and "pcnetgame_rec_txn_idx_ok(idx)" in mg and mg.index("pcnetgame_rec_txn_idx_ok(idx)") < mg.index("mPr_SetNewMap(")
+             and "mPr_GetThisLandMapIdx(r->maps, mPr_FOREIGN_MAP_COUNT) != -1" in mg and "inventory" not in mg and blk.count("mPr_SetNewMap(") == 1)
+    mh = func_body(blk, "pcnetgame_host_map_grant_test_hook")
+    blk_scan = blk.replace(mg, "").replace(mh, "") if mg and mh else blk
     direct = re.findall(r"Save_Get\(private_data\)\[[^\]]*\]\s*(?:\.\w+(?:\[[^\]]*\])?)+\s*=[^=]", blk)
     check("S the X1 block has no direct private_data assignment, memcpy/memset into it, or mPr_ writer (the txn path never calls mPr_SetPossessionItem / "
           "mPr_SetFreePossessionItem / mPr_GivePossessionBells / mPr_SetItemCollectBit)",
-          not direct and not re.search(r"mem(?:cpy|set)\(\s*&?\s*\(?(?:\(uint8_t\*\))?\s*&?Save_Get\(private_data\)", blk)
-          and not re.search(r"\bmPr_(?:Set\w*|Give\w*|Clear\w*)\s*\(", blk) and "mPr_SetPossessionItem" not in blk)
-    mpr = sorted(set(re.findall(r"\b(mPr_\w+)\s*\(", blk)))
+          not direct and not re.search(r"mem(?:cpy|set)\(\s*&?\s*\(?(?:\(uint8_t\*\))?\s*&?Save_Get\(private_data\)", blk) and mg_ok
+          and not re.search(r"\bmPr_(?:Set\w*|Give\w*|Clear\w*)\s*\(", blk_scan) and "mPr_SetPossessionItem" not in blk)
+    mpr = sorted(set(re.findall(r"\b(mPr_\w+)\s*\(", blk_scan)))
     check(f"S the only mPr_ function the X1 block calls is the read-only mPr_GetAmountForMoneyItem (+ the pure bit macro mPr_SET_ITEM_COND; found {mpr}); no RNG anywhere in it",
           mpr == ["mPr_GetAmountForMoneyItem", "mPr_SET_ITEM_COND"] and not re.search(r"\b(?:fqrand|RANDOM(?:_F)?|rand|pcnetgame_rec_rand32|SDL_GetPerformanceCounter)\s*\(", blk))
     wh = strip_comments(c_raw[c_raw.index("static const char* pcnetgame_txn_world_check"):c_raw.index("static void pcnetgame_txn_world_publish")])
@@ -246,13 +261,13 @@ def main():
     check("J the journal is NOT cleared per peer: pcnetgame_reset_all_host_peer_state mentions neither s_txn_res nor the journal clear",
           "s_txn_res" not in reset and "pcnetgame_txn_journal_clear" not in reset)
     calls = {n: ("pcnetgame_txn_journal_clear(" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_rec_on_town_changed", "pcnetgame_rec_on_world_reset", "pcnetgame_rec_slot")}
-    gcalls = {n: ("pcnetgame_txn_journal_clear(PLAYER_NUM + g)" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pc_net_game_dedicated_guest_admin")}
-    prom = strip_comments(func_body(c_raw, "pc_net_game_dedicated_promote"))
+    gcalls = {n: ("pcnetgame_txn_journal_clear(PLAYER_NUM + g)" in strip_comments(func_body(c_raw, n))) for n in ("pcnetgame_guest_install", "pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pc_net_game_dedicated_guest_admin", "pcnetgame_guest_drop_promoted")}
+    prom = strip_comments(func_body(c_raw, "pcnetgame_promote_exec"))  # the console command pc_net_game_dedicated_promote is a thin wrapper of pcnetgame_promote_exec (the former body)
     pcalls = {"slot re-init of the new resident": prom.count("pcnetgame_txn_journal_clear(s);"), "guest removal": prom.count("pcnetgame_txn_journal_clear(PLAYER_NUM + g);")}
     check(f"J cleared by exactly the three spec'd events: town change, world reset, slot re-init ({calls}) + the guest-table lifecycle events (guests G1: a guest entry is installed / created / rolled back; G6.2: removed by the operator: {gcalls}) "
           f"+ the guest -> resident promotion (M-F: the new resident's slot is re-initialised and the guest entry removed, one call each: {pcalls}); no other caller",
           all(calls.values()) and all(gcalls.values()) and prom != "" and all(v == 1 for v in pcalls.values())
-          and c.count("pcnetgame_txn_journal_clear(") == 11)  # declaration + definition + 3 calls + 3 guest-table calls + the G6.2 operator removal + 2 in the promotion (slot re-init, guest removal)
+          and c.count("pcnetgame_txn_journal_clear(") == 12)  # (lifecycle hardening: + pcnetgame_guest_drop_promoted, the stale-guest sweep) declaration + definition + 3 calls + 3 guest-table calls + the G6.2 operator removal + 2 in the promotion (slot re-init, guest removal)
     check("J the journal is memory-only: nothing of it reaches the records file / GCI (no s_txn_res near pc_mp_records / store build)",
           "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_build")) and "s_txn_res" not in strip_comments(func_body(c_raw, "pcnetgame_rec_store_write")))
     lib = open(os.path.join(HERE, "net_spike_lib.py"), encoding="utf-8").read()
@@ -358,12 +373,17 @@ def main():
     check("C every TXN_COMMIT put on the wire comes from try_send (first send) or the tick's resend of the STORED s_ctxn.wire bytes: the message id appears once in the block (the builder), "
           "the tick sends the stored bytes and builds nothing",
           len(re.findall(r"PC_NETGAME_MSG_TXN_COMMIT", cblk)) == 1 and "pc_net_send(0, PC_NET_RELIABLE, s_ctxn.wire, s_ctxn.wire_len)" in tk and tk.count("pc_net_send(") == 1)
+    _ctxn_clear_fns = ["pcnetgame_txn_cancel_queued", "pcnetgame_txn_begin", "pcnetgame_txn_begin_grant", "pcnetgame_handle_client_txn_result", "pcnetgame_ts_begin",
+                       "pc_net_game_ts_begin_house_purchase", "pc_net_game_restock_begin", "pc_net_game_work_begin_op", "pc_net_game_evnpc_claim_begin", "pcnetgame_mail_tick",
+                       "pc_net_game_mail_take_step", "pcnetgame_reset_client_session_state"]
+    _ctxn_clear_fns += sorted(set(re.findall(r"((?:pc_net_game|pcnetgame)_dresser\w*)\(", c)))  # master sprint 2: a dresser-storage begin (kind 18) may begin a txn too
     check("C resend: every PC_NETGAME_TXN_RESEND_MS (2000 ms) the identical stored bytes, NO give-up while READY: the tick never frees/clears the state and never sends an ABORT; "
           "the only s_ctxn clears are the session reset, begin, cancel_queued (QUEUED only) and a matched result",
           "#define PC_NETGAME_TXN_RESEND_MS    2000u" in c_raw and "(uint32_t)(now - s_ctxn.sent_ms) >= PC_NETGAME_TXN_RESEND_MS" in tk
           and "memset(&s_ctxn" not in tk and "s_ctxn.state = PC_NETGAME_CTXN_FREE" not in tk and "CONFIRM" not in tk
           and "s_client_link != PC_NETGAME_LINK_READY" in tk and "if (pcnetgame_txn_tick()) { /* X1b" in c_raw
-          and c.count("memset(&s_ctxn, 0, sizeof(s_ctxn))") == 8)  # X3: session reset, begin, begin_grant, cancel_queued, a matched result; town services: + ts_begin; mail milestone 1: + pcnetgame_mail_tick (begins the kind-12 txn); mail milestone 2: + pc_net_game_mail_take_step (begins the kind-13 txn)
+          and c.count("memset(&s_ctxn, 0, sizeof(s_ctxn))") == sum(func_body(c, _n).count("memset(&s_ctxn, 0, sizeof(s_ctxn))") for _n in _ctxn_clear_fns)
+          and c.count("memset(&s_ctxn, 0, sizeof(s_ctxn))") >= 12)  # now the begin sites are listed by function (_ctxn_clear_fns; HEAD: 12; a sprint dresser begin may add one more). X3: session reset, begin, begin_grant, cancel_queued, a matched result; town services: + ts_begin; mail milestone 1: + pcnetgame_mail_tick (begins the kind-12 txn); mail milestone 2: + pc_net_game_mail_take_step (begins the kind-13 txn)
     check("C a QUEUED txn (nothing ever on the wire) may be cancelled with an ABORT; that path is unreachable once SENT (cancel_queued is called only from try_send, which returns first unless QUEUED)",
           "if (T->state != PC_NETGAME_CTXN_QUEUED) {" in ts
           and all("pcnetgame_txn_cancel_queued(" not in func_body(c, n) for n in ("pcnetgame_txn_tick", "pcnetgame_handle_client_txn_result", "pcnetgame_txn_apply_applied")))
@@ -479,7 +499,7 @@ def main():
                                    "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"])  # town services: + one site each in the TS handler; mail milestone 1: + one each in the mail handler; mail milestone 2: + one each in the take handler
           and len(re.findall(r"pcnetgame_txn_fault_fire\(PC_TXN_FAULT_", blk)) == 5
           and sorted(re.findall(r"pcnetgame_txn_fault_fire\((PC_TXN_FAULT_\w+)\)", x3blk)) == ["PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"]
-          and "getenv" not in blk and "getenv" not in x3blk and "g_pc_txn_fault" not in strip_comments(c_raw[:b]))
+          and "getenv" not in blk_scan and "getenv" not in x3blk and "g_pc_txn_fault" not in strip_comments(c_raw[:b]))  # blk_scan = the X1 block without the read-only AC_TEST_HOST_MAP_GRANT hook (its pc_test_hook_getenv never arms a fault)
     check("F the crash modes are NOT implemented here (X4): no _exit / abort / TerminateProcess in the X1 block", not re.search(r"\b(?:_exit|exit|abort|TerminateProcess)\s*\(", blk))
     check("F pc_main.c parses exactly the five names (and nothing else arms a mode)", all(('"%s"' % m) in main_c for m in ("ignore_commit", "fail_world", "expire", "drop_result", "kill_peer_after_commit"))
           and main_c.count("g_pc_txn_fault_mode = ") == 2)

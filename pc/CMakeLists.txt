@@ -346,10 +346,16 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_keytab.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_tabfile.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dayclaims.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_store.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_ui.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_layout.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_items.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_guest_store.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_remote_player.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_bee_sync.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ball_authority.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_field_authority.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_wildlife_authority.c
 )
@@ -526,7 +532,16 @@ if(PC_TEST_HOOKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_relaunch.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c
         ${DECOMP_ROOT}/src/game/m_choice.c
+        ${DECOMP_ROOT}/src/actor/ac_my_room.c # dresser storage UI-drive hook (AC_TEST_DRESSER_UI)
         PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS)
+endif()
+
+# Dresser storage (docs/dresser-storage-redesign-plan.md 6x): the HOST feature now defaults to ON in every build (27 host-side slots per dresser, grab/move,
+# movable occupied dressers). Host env AC_MP_DRESSER_STORAGE=0 disables it; configure with -DPC_DRESSER_STORAGE_DEFAULT_ON=OFF for an opt-in build.
+# Appended to the ONE file that reads the switch (keeps PC_NET_TEST_HOOKS).
+option(PC_DRESSER_STORAGE_DEFAULT_ON "dresser storage defaults to ON (env AC_MP_DRESSER_STORAGE=0 disables)" ON)
+if(PC_DRESSER_STORAGE_DEFAULT_ON)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c APPEND PROPERTY COMPILE_DEFINITIONS PC_DRESSER_STORAGE_DEFAULT_ON=1)
 endif()
 
 add_executable(ac_pc

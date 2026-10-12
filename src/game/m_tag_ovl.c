@@ -30,6 +30,9 @@
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Stage 5B-1: pc_net_game_role()/pc_net_game_request_drop()/
                            * pc_net_game_is_droppable_item() -- see mTG_field_put_proc's seam. */
+#include <stdio.h>
+#include "pc_dresser_ui.h"
+extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
 #endif
 
 static void mTG_mark_main_CLR(Submenu* submenu, const mSM_MenuInfo_c* menu_info);
@@ -156,6 +159,25 @@ static mTG_tag_data_table_c mTG_table_data[] = {
     { 2, 4, mTG_gba_nw_col_pos, mTG_gba_nw_line_pos },                     /* mTG_TABLE_CARD_NW */
 };
 
+#ifdef TARGET_PC
+/* dresser mode (U3, docs/dresser-storage-redesign-plan.md): the gyroid table becomes ONE 9 x 3 grid of all 27 dresser slots, drawn where the gyroid portrait,
+ * dialogue box and 4-slot strip were. The gyroid window is ENLARGED in dresser mode (pc_dresser_layout: 9-slice, window x -144..108, y 2..118, inner
+ * rectangle x -120..84, y 26..94 inside the 24-unit orange border ring). Cell pitch 22, centres x = -18 + 22 (c - 4), y = 82 / 60 / 38.
+ * 6s: the icons / hand use the cell centres AS THEY ARE, like vanilla (mTG_haniwa_col_pos {-35,-11,13,37} / line 46 are the gyroid strip's cell centres):
+ * the icon draw's x * 0.975 (mSM_set_dl_item) is the same mapping the window gets on screen. The 6c..6r values were x / 0.975 ({-109,-86,-64,-41,-18,4,
+ * 27,49,72}), which pushed every icon outward by 2.5 % of x: -2.7 units in column 0 .. +1.8 in column 8. */
+static s16 mTG_pc_dresser_col_pos[9] = { -106, -84, -62, -40, -18, 4, 26, 48, 70 };
+static s16 mTG_pc_dresser_line_pos[3] = { 82, 60, 38 }; /* = pc_dresser_layout_row_y(): the enlarged window's inner rectangle y 26..94 */
+static mTG_tag_data_table_c mTG_pc_dresser_table = { 9, 3, mTG_pc_dresser_col_pos, mTG_pc_dresser_line_pos };
+
+static mTG_tag_data_table_c* mTG_pc_table(int table) {
+    if (table == mTG_TABLE_HANIWA && pc_dresser_ui_active()) {
+        return &mTG_pc_dresser_table;
+    }
+    return &mTG_table_data[table];
+}
+#endif
+
 static u8 str_omikuji[7] = "fortune";
 static u8 str_happy_room[7] = "the HRA";
 static u8 postoffice_str[15] = "the post office";
@@ -239,6 +261,14 @@ static mTG_tag_word_c mTG_tag_word_itadaku = {
     "Take it         ",
     &mTG_get_proc,
 };
+
+#ifdef TARGET_PC
+static void mTG_pc_dresser_grab_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info);
+static mTG_tag_word_c mTG_tag_word_pc_grab = { /* 6r (B): dresser mode: grab a stored item / a pocket item and place it on any cell or pocket */
+    "Grab            ",
+    &mTG_pc_dresser_grab_proc,
+};
+#endif
 
 static mTG_tag_word_c mTG_tag_word_dump_item = {
     "Yes             ",
@@ -879,6 +909,19 @@ static mTG_tag_word_c* mTG_haniwa_get_item[] = {
     &mTG_tag_word_yameru,
 };
 
+#ifdef TARGET_PC
+static mTG_tag_word_c* mTG_pc_dresser_get_item[] = { /* 6r (B): the dresser screen's cell tag: Take it / Grab / Quit */
+    &mTG_tag_word_itadaku,
+    &mTG_tag_word_pc_grab,
+    &mTG_tag_word_yameru,
+};
+static mTG_tag_word_c* mTG_pc_dresser_putin_item[] = { /* 6r (B): a pocket item in the dresser screen: Put Away / Grab / Quit */
+    &mTG_tag_word_korewoireru,
+    &mTG_tag_word_pc_grab,
+    &mTG_tag_word_yameru,
+};
+#endif
+
 static mTG_tag_word_c* mTG_haniwa_price[] = {
     &mTG_tag_word_okane,
     &mTG_tag_word_beru,
@@ -1181,7 +1224,11 @@ static f32 mTG_set_hand_pos_offset(Submenu* submenu, int table) {
 }
 
 static void mTG_set_hand_pos(Submenu* submenu, f32* pos, int table, int idx) {
+#ifdef TARGET_PC
+    mTG_tag_data_table_c* data_p = mTG_pc_table(table);
+#else
     mTG_tag_data_table_c* data_p = &mTG_table_data[table];
+#endif
     f32 ofs = mTG_set_hand_pos_offset(submenu, table);
     int col = idx % data_p->col_num;
     int row;
@@ -1451,7 +1498,11 @@ static void mTG_set_tag_win_scale_p(mTG_tag_c* tag, int win_type, f32 x, f32 y) 
 }
 
 static int mTG_get_table_idx(mTG_tag_c* tag) {
+#ifdef TARGET_PC
+    int idx = tag->tag_col + tag->tag_row * mTG_pc_table(tag->table)->col_num;
+#else
     int idx = tag->tag_col + tag->tag_row * mTG_table_data[tag->table].col_num;
+#endif
 
     if (idx >= 0) {
         return idx;
@@ -2049,6 +2100,12 @@ static void mTG_init_tag_data_set_itemNo(mActor_name_t* itemNo, Mail_c** mail_pp
             *itemNo = Now_Private->equipment;
             break;
         case mTG_TABLE_HANIWA:
+#ifdef TARGET_PC
+            if (pc_dresser_ui_active()) {
+                *itemNo = (mActor_name_t)pc_dresser_ui_slot_item(idx); /* dresser mode: the dresser page's item name */
+                break;
+            }
+#endif
             *itemNo = Save_Get(homes[submenu->overlay->menu_info[mSM_OVL_HANIWA].data1]).haniwa.items[idx].item;
             break;
         case mTG_TABLE_COLLECT: {
@@ -2510,7 +2567,11 @@ static void mTG_init_tag_data(Submenu* submenu, int table, int type, f32 base_x,
 
 static void mTG_chg_tag_func(Submenu* submenu, int table, int type, int idx, f32 base_x, f32 base_y) {
     mTG_Ovl_c* tag_ovl = submenu->overlay->tag_ovl;
+#ifdef TARGET_PC
+    mTG_tag_data_table_c* data_table = mTG_pc_table(table);
+#else
     mTG_tag_data_table_c* data_table = &mTG_table_data[table];
+#endif
     int idx_x;
     int idx_y;
 
@@ -2981,6 +3042,12 @@ static void mTG_catch_item_from_table(Submenu* submenu, Mail_c* mail, mActor_nam
                                       int table_idx) {
     mHD_Ovl_c* hand_ovl = submenu->overlay->hand_ovl;
 
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        return; /* dresser mode: nothing is ever carried by the hand (every change is a host transaction) */
+    }
+#endif
+
     if (table == mTG_TABLE_PLAYER) {
         hand_ovl->info.wait_timer = 16;
         submenu->overlay->segment.change_player_main_anime_idx = mIV_ANIM_CATCH;
@@ -3297,6 +3364,38 @@ static void mTG_sell_all_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     }
 }
 
+#ifdef TARGET_PC
+/* 6r (B) "Grab" on a dresser cell or a pocket item: it is carried (the hand draws it); the next A on a cell / pocket places it (mTG_select_tag_decide_haniwa /
+ * mTG_select_tag_decide_item), B cancels (mTG_move_base). Nothing changes before the placement. */
+static void mTG_pc_dresser_grab_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+    mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
+
+    (void)menu_info;
+    pc_dresser_ui_note_input();
+    if (pc_dresser_ui_grab(tag->table == mTG_TABLE_ITEM, mTG_get_table_idx(tag))) {
+        sAdo_SysTrgStart(NA_SE_32);
+    } else {
+        sAdo_SysTrgStart(MONO(NA_SE_3));
+    }
+    mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+}
+
+/* Dresser mode of the gyroid overlay: the answer of a take / put, with the gyroid's own status lines ("Got it!" / "You don't have room."); a transaction in flight
+ * shows nothing until it resolves (m_haniwa_ovl polls it). The tag window closes like the gyroid's own take. */
+static void mTG_dresser_result(Submenu* submenu, mTG_tag_c* tag, int act) {
+    pc_dresser_ui_note_input();
+    if (act == PC_DRESSER_UI_ACT_DONE) {
+        submenu->overlay->haniwa_ovl->set_interrupt_message_proc(submenu, tag, mHW_MSG_KASIKO);
+    } else if (act == PC_DRESSER_UI_ACT_NO_ROOM || act == PC_DRESSER_UI_ACT_FULL) {
+        submenu->overlay->haniwa_ovl->set_interrupt_message_proc(submenu, tag, mHW_MSG_MOU);
+        sAdo_SysTrgStart(MONO(NA_SE_3));
+    } else if (act == PC_DRESSER_UI_ACT_REFUSED) {
+        sAdo_SysTrgStart(MONO(NA_SE_3));
+    }
+    mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+}
+#endif
+
 static void mTG_get_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     static mActor_name_t mTG_money_name[] = { ITM_MONEY_100, ITM_MONEY_1000, ITM_MONEY_10000, ITM_MONEY_30000 };
     static u32 mTG_money_amount[] = { 100, 1000, 10000, 30000 };
@@ -3317,6 +3416,12 @@ static void mTG_get_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     u32* money_amount_p;
     int change_money;
 
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        mTG_dresser_result(submenu, tag, pc_dresser_ui_take(mTG_get_table_idx(tag))); /* the grid index 0..26 */
+        return;
+    }
+#endif
     if (idx == -1) {
         haniwa_ovl = submenu->overlay->haniwa_ovl;
 
@@ -3860,6 +3965,13 @@ static void mTG_putin_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
     int idx = mTG_get_table_idx(tag);
     Submenu_Item_c* item_p = submenu->item_p;
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        mTG_dresser_result(submenu, tag, pc_dresser_ui_put(idx)); /* no local pocket write: vanilla slot path or a host transaction */
+        return;
+    }
+#endif
 
 #ifdef TARGET_PC
     /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
@@ -6433,7 +6545,11 @@ static int mTG_move_cursol_base_left(mTG_tag_c* tag) {
 static int mTG_move_cursol_base_right(mTG_tag_c* tag) {
     int res;
 
+#ifdef TARGET_PC
+    if (tag->tag_col < (mTG_pc_table(tag->table)->col_num - 1)) {
+#else
     if (tag->tag_col < (mTG_table_data[tag->table].col_num - 1)) {
+#endif
         tag->tag_col++;
         res = TRUE;
     } else {
@@ -6459,7 +6575,11 @@ static int mTG_move_cursol_base_upper(mTG_tag_c* tag) {
 static int mTG_move_cursol_base_lower(mTG_tag_c* tag) {
     int res;
 
+#ifdef TARGET_PC
+    if (tag->tag_row < (mTG_pc_table(tag->table)->row_num - 1)) {
+#else
     if (tag->tag_row < (mTG_table_data[tag->table].row_num - 1)) {
+#endif
         tag->tag_row++;
         res = TRUE;
     } else {
@@ -6808,6 +6928,40 @@ static int mTG_move_cursol_between_table_music(Submenu* submenu, mTG_tag_c* tag,
 static int mTG_move_cursol_between_table_haniwa(mTG_tag_c* tag, u32 trigger) {
     int res = FALSE;
 
+#ifdef TARGET_PC
+    /* dresser mode (U3 9 x 3 grid): down from the bottom grid row -> the pockets' top row, up from the pockets' top row -> the bottom grid row, each to the
+     * nearest column by position; left / right stop at the grid edge (one page: no paging) */
+    if (pc_dresser_ui_active()) {
+        static const s16 pocket_x[5] = { -77, -53, -29, -5, 19 }; /* mTG_item_col_pos */
+        int i;
+        int best = 0;
+
+        if ((trigger & BUTTON_CDOWN) != 0 && tag->table == mTG_TABLE_HANIWA) {
+            for (i = 1; i < 5; i++) {
+                if (ABS(pocket_x[i] - mTG_pc_dresser_col_pos[tag->tag_col]) < ABS(pocket_x[best] - mTG_pc_dresser_col_pos[tag->tag_col])) {
+                    best = i;
+                }
+            }
+            tag->table = mTG_TABLE_ITEM;
+            tag->tag_col = best;
+            tag->tag_row = 0;
+            return TRUE;
+        }
+        if ((trigger & BUTTON_CUP) != 0 && tag->table == mTG_TABLE_ITEM) {
+            for (i = 1; i < 9; i++) {
+                if (ABS(mTG_pc_dresser_col_pos[i] - pocket_x[tag->tag_col]) < ABS(mTG_pc_dresser_col_pos[best] - pocket_x[tag->tag_col])) {
+                    best = i;
+                }
+            }
+            tag->table = mTG_TABLE_HANIWA;
+            tag->tag_col = best;
+            tag->tag_row = 2;
+            return TRUE;
+        }
+        return FALSE;
+    }
+#endif
+
     if ((trigger & BUTTON_CDOWN) != 0 && tag->table == mTG_TABLE_HANIWA) {
         if (tag->tag_col == 3) {
             tag->tag_col = 4;
@@ -7035,6 +7189,16 @@ static int mTG_move_cursol_between_table_inventory(Submenu* submenu, mTG_tag_c* 
 static int mTG_move_cursol_base(Submenu* submenu, mTG_tag_c* tag, mSM_MenuInfo_c* menu_info) {
     u32 trigger = submenu->overlay->menu_control.trigger;
     int res = FALSE;
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active() && (trigger & (BUTTON_CLEFT | BUTTON_CDOWN | BUTTON_CUP | BUTTON_CRIGHT)) != 0) {
+        pc_dresser_ui_note_input(); /* the scripted UI test releases its press when the menu consumed it */
+    }
+    if (pc_dresser_ui_active() && trigger != 0 && g_pc_verbose) {
+        printf("[NET][DRESSER] gyroid overlay: cursor trigger 0x%08X on table %d col %d (menu %d)\n", (unsigned)trigger, (int)tag->table, (int)tag->tag_col,
+               (int)menu_info->menu_type);
+    }
+#endif
 
     if ((trigger & (BUTTON_CLEFT | BUTTON_CDOWN | BUTTON_CUP | BUTTON_CRIGHT)) != 0 ||
         (tag->table == mTG_TABLE_CATALOG &&
@@ -7268,6 +7432,24 @@ static int mTG_select_tag_decide_item(Submenu* submenu, mSM_MenuInfo_c* menu_inf
     mIV_Ovl_c* inv_ovl = submenu->overlay->inventory_ovl;
     int ret_tag_type = mTG_TYPE_NONE;
 
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        /* dresser mode: a pocket item offers "Put Away" / "Grab" / "Quit" (never the vanilla hand carry: a drop would write the save's gyroid); 6r (B): with
+         * a grabbed item, A on a pocket is its TARGET (empty = take / move, occupied = swap, the origin = cancel) */
+        pc_dresser_ui_note_input();
+        if (pc_dresser_ui_carry_item() != 0) {
+            const int act = pc_dresser_ui_place(1, idx);
+            sAdo_SysTrgStart(act == PC_DRESSER_UI_ACT_REFUSED ? MONO(NA_SE_3) : NA_SE_32);
+            return mTG_TYPE_NONE;
+        }
+        mTG_label_table[mTG_TYPE_PUTIN_ITEM].words = mTG_pc_dresser_putin_item;
+        mTG_label_table[mTG_TYPE_PUTIN_ITEM].lines = ARRAY_COUNT(mTG_pc_dresser_putin_item);
+        return (!pc_dresser_ui_pending() && item != EMPTY_NO && pc_net_game_dresser_pocket_item(idx) != 0) ? mTG_TYPE_PUTIN_ITEM : mTG_TYPE_NONE;
+    }
+    mTG_label_table[mTG_TYPE_PUTIN_ITEM].words = mTG_putin_item; /* every other put-in screen keeps the vanilla tag */
+    mTG_label_table[mTG_TYPE_PUTIN_ITEM].lines = ARRAY_COUNT(mTG_putin_item);
+#endif
+
     if (item != EMPTY_NO) {
         if (menu_info->menu_type == mSM_OVL_INVENTORY) {
             switch (menu_info->data0) {
@@ -7463,8 +7645,31 @@ static int mTG_select_tag_decide_bg(Submenu* submenu, mSM_MenuInfo_c* menu_info,
 }
 
 static int mTG_select_tag_decide_haniwa(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c* tag) {
+#ifdef TARGET_PC
+    /* dresser mode: the save's gyroid is never read (the dresser page decides, see below) */
+    mActor_name_t item = pc_dresser_ui_active() ? (mActor_name_t)EMPTY_NO : Save_Get(homes[menu_info->data1]).haniwa.items[tag->tag_col].item;
+#else
     mActor_name_t item = Save_Get(homes[menu_info->data1]).haniwa.items[tag->tag_col].item;
+#endif
     int ret_tag_type = mTG_TYPE_NONE;
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        /* dresser mode: a filled cell offers "Take it" / "Grab" / "Quit"; nothing while a host transaction is in flight. 6r (B): with a grabbed item, A on a
+         * cell is its TARGET (empty = move / put, occupied = swap, the origin = cancel) */
+        pc_dresser_ui_note_input();
+        if (pc_dresser_ui_carry_item() != 0) {
+            const int act = pc_dresser_ui_place(0, mTG_get_table_idx(tag));
+            sAdo_SysTrgStart(act == PC_DRESSER_UI_ACT_REFUSED ? MONO(NA_SE_3) : NA_SE_32);
+            return mTG_TYPE_NONE;
+        }
+        mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_pc_dresser_get_item;
+        mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].lines = ARRAY_COUNT(mTG_pc_dresser_get_item);
+        return (!pc_dresser_ui_pending() && pc_dresser_ui_slot_item(mTG_get_table_idx(tag)) != 0) ? mTG_TYPE_HANIWA_GET_ITEM : mTG_TYPE_NONE;
+    }
+    mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_haniwa_get_item; /* the vanilla gyroid keeps its own tag */
+    mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].lines = ARRAY_COUNT(mTG_haniwa_get_item);
+#endif
 
     if (item != EMPTY_NO) {
         if (menu_info->data0 == 0) {
@@ -8158,6 +8363,20 @@ static void mTG_move_move(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
 static void mTG_move_base(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c* tag) {
     u32 trigger = submenu->overlay->menu_control.trigger;
 
+#ifdef TARGET_PC
+    /* 6r (B): B while carrying a grabbed item cancels the grab only (the screen stays open; nothing moved) */
+    if (pc_dresser_ui_active() && pc_dresser_ui_carry_item() != 0 && (trigger & BUTTON_B) != 0) {
+        pc_dresser_ui_carry_cancel();
+        pc_dresser_ui_note_input();
+        sAdo_SysTrgStart(NA_SE_3);
+        return;
+    }
+    /* dresser mode: L / R do nothing (one page; vanilla L = catch into the hand, R = change window: neither applies to the dresser grid) */
+    if (pc_dresser_ui_active() && menu_info->menu_type == mSM_OVL_HANIWA && (trigger & (BUTTON_B | BUTTON_START | BUTTON_Y | BUTTON_A)) == 0 &&
+        (trigger & (BUTTON_L | BUTTON_R)) != 0) {
+        return;
+    }
+#endif
     if (trigger & (BUTTON_B | BUTTON_START | BUTTON_Y)) {
         mTG_move_cancel(submenu, menu_info, tag);
     } else if (trigger & BUTTON_A) {
@@ -8443,8 +8662,21 @@ static void mTG_select_tag_base(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG
             sAdo_SysTrgStart(MONO(NA_SE_3));
         }
     } else if (trigger & (BUTTON_A)) {
+#ifdef TARGET_PC
+        if (pc_dresser_ui_active()) {
+            pc_dresser_ui_note_input(); /* the tag window's option was chosen */
+            if (g_pc_verbose) {
+                printf("[NET][DRESSER] tag window: A on option row %d (type %d)\n", (int)tag->tag_row, (int)tag->type);
+            }
+        }
+#endif
         mTG_label_table[tag->type].words[tag->tag_row]->move_proc(submenu, menu_info);
     } else {
+#ifdef TARGET_PC
+        if (pc_dresser_ui_active() && (trigger & (BUTTON_CDOWN | BUTTON_CUP)) != 0) {
+            pc_dresser_ui_note_input();
+        }
+#endif
         int max = mTG_label_table[tag->type].lines - 1;
 
         if (trigger & (BUTTON_CDOWN | BUTTON_CUP)) {
@@ -8540,6 +8772,15 @@ static void mTG_move_func(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     if (tag_ovl->sel_tag_idx < 0 || tag_ovl->sel_tag_idx >= mTG_TAG_NUM) {
         return;
     }
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active() && g_pc_verbose && submenu->overlay->menu_control.trigger != 0) { /* dresser-mode input diagnostic: which gate the tag handler is in */
+        printf("[NET][DRESSER] tag move: trigger 0x%X wait %d move_flag %d act %d sel %d ret %d type %d scale %.2f row %d table %d col %d cur_menu %d menu %d\n",
+               (unsigned)submenu->overlay->menu_control.trigger, (int)hand_ovl->info.wait_timer, (int)hand_ovl->info.move_flag, (int)hand_ovl->info.act,
+               (int)tag_ovl->sel_tag_idx, (int)tag_ovl->ret_tag_idx, (int)tag->type, (double)tag->scale, (int)tag->tag_row, (int)tag->table, (int)tag->tag_col,
+               (int)submenu->current_menu_type, (int)menu_info->menu_type);
+    }
+#endif
 
     if (hand_ovl->info.wait_timer > 0 && inv_ovl != NULL) {
         static f32 wait_accum = 0.0f;

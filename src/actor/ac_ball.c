@@ -44,6 +44,13 @@ ACTOR_PROFILE Ball_Profile = {
 
 BALL_ACTOR* Global_Actor_p;
 
+#ifdef TARGET_PC
+#include "pc_ball_authority.h" /* multiplayer: host-authoritative ball (BALL_STATE / BALL_KICK_REQUEST); inert in single player */
+static int s_pc_ball_mode = PC_BALL_MODE_VANILLA; /* decided in ct: VANILLA (single player), HOST (simulate + publish), CLIENT (proxy) */
+static int s_pc_ball_hidden = 0;                  /* client proxy: no host state yet / host ball DEAD */
+static int s_pc_ball_live = 0; /* live ball actors in this process (must stay <= 1); logged only when pc_net_game_ball_diag() (dev test-hook builds) */
+#endif
+
 static f32 aBALL_dt_step(GAME* game, f32 step) {
     return step * (f32)game->graph->dt_num_60fps_frames;
 }
@@ -150,6 +157,19 @@ static void aBALL_actor_ct(ACTOR* actor, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
 
     Global_Actor_p = ball;
+#ifdef TARGET_PC
+    s_pc_ball_mode = pc_net_game_ball_mode();
+    s_pc_ball_hidden = 0;
+    s_pc_ball_live++;
+    if (pc_net_game_ball_diag()) { /* test diagnostics (dev builds only): one line per ball actor life, with the live count */
+        printf("[NET][BALL] ball actor ct (mode %d, live %d, vanilla_spawn %d)\n", s_pc_ball_mode, s_pc_ball_live,
+               (0.0f == Common_Get(ball_pos).x && 0.0f == Common_Get(ball_pos).y && 0.0f == Common_Get(ball_pos).z) ? 1 : 0);
+    }
+    if (s_pc_ball_mode == PC_BALL_MODE_CLIENT) {
+        pc_net_game_ball_client_begin(); /* hidden until the host's BALL_STATE arrives (vanilla ball after the fallback timeout) */
+        s_pc_ball_hidden = 1;
+    }
+#endif
 
     if ((0.0f == Common_Get(ball_pos).x) && (0.0f == Common_Get(ball_pos).y) && (0.0f == Common_Get(ball_pos).z)) {
         if (aBALL_Random_pos_set(&actor->world.position) == 0) {
@@ -203,6 +223,17 @@ static void aBALL_actor_dt(ACTOR* actor, GAME* game) {
     }
     Common_Get(clip).ball_redma_proc = NULL;
     ClObjPipe_dt(game, &ball->ball_pipe);
+#ifdef TARGET_PC
+    if (s_pc_ball_mode == PC_BALL_MODE_HOST) {
+        pc_net_game_ball_host_gone(); /* clients get the resting Common ball_pos (or DEAD) from the host tick */
+    }
+    s_pc_ball_live--;
+    if (pc_net_game_ball_diag()) {
+        printf("[NET][BALL] ball actor dt (mode %d, live %d)\n", s_pc_ball_mode, s_pc_ball_live);
+    }
+    s_pc_ball_mode = PC_BALL_MODE_VANILLA;
+    s_pc_ball_hidden = 0;
+#endif
 }
 
 static void aBALL_position_move(BALL_ACTOR* actor, GAME* game) {
@@ -303,9 +334,9 @@ static void aBALL_BGcheck(BALL_ACTOR* actor) {
     }
 }
 
-static void aBALL_OBJcheck(BALL_ACTOR* actor, GAME* game) {
-    int wade;
-    ACTOR* collided;
+/* The kick impulse of a fresh collider contact (vanilla aBALL_OBJcheck body, lifted unchanged): it depends only on the
+ * collider's world position and position_speed, so the multiplayer host can replay a client's kick on its own ball. */
+static void aBALL_apply_kick(BALL_ACTOR* actor, const xyz_t* collider_pos, const xyz_t* collider_spd) {
     xyz_t pos_speed;
     s16 angle;
     f32 sin;
@@ -321,6 +352,57 @@ static void aBALL_OBJcheck(BALL_ACTOR* actor, GAME* game) {
     f32 newFact;
     f32 speedFactor;
     int speedAngle;
+
+    pos_speed = *collider_spd;
+    actor->unk20C = GETREG(TAKREG, 15) + 30;
+    actor->collider_timer_accum = 0.0f;
+    angle = atans_table(actor->actor_class.world.position.z - collider_pos->z,
+                        actor->actor_class.world.position.x - collider_pos->x);
+    sin = sin_s(angle);
+    cos = cos_s(angle);
+    colliderSpeed = (sin * actor->actor_class.position_speed.x) + (cos * actor->actor_class.position_speed.z);
+
+    fact = sqrtf((pos_speed.x * pos_speed.x) + (pos_speed.z * pos_speed.z));
+
+    xyz_t_mult_v(&pos_speed, ((24.0f / 180.0f) * fact) * 0.9f + 0.1f);
+    collidedSpeed = (sin * pos_speed.x) + (cos * pos_speed.z);
+    abs = ABS(colliderSpeed + collidedSpeed);
+
+    newSins = abs * sin_s(angle);
+    newCos = abs * cos_s(angle);
+
+    newSpeedX = actor->actor_class.position_speed.x + newSins;
+    newSpeedZ = actor->actor_class.position_speed.z + newCos;
+
+    newFact = sqrtf((newSpeedX * newSpeedX) + (newSpeedZ * newSpeedZ));
+    newFact = CLAMP_MAX(newFact, 11.0f);
+
+    speedFactor = newFact / 11.0f;
+    if (actor->actor_class.bg_collision_check.result.on_ground) {
+        /* TODO: this is fakematch right? */
+        if (!actor->actor_class.speed) {
+            f32 angle = ((speedFactor * 90.0f) + (speedFactor * 35.0f) * fqrand2());
+            speedAngle = DEG2SHORT_ANGLE(angle);
+
+            actor->actor_class.speed = cos_s(speedAngle) * newFact;
+            actor->actor_class.position_speed.y = sin_s(speedAngle) * newFact;
+        } else {
+            actor->actor_class.speed = newFact * 0.75f;
+        }
+    } else {
+        actor->actor_class.speed = newFact * 0.75f;
+    }
+
+    actor->actor_class.world.angle.y = atans_table(newSpeedZ, newSpeedX);
+    actor->actor_class.speed *= 0.9f;
+    sAdo_OngenTrgStartSpeed(actor->actor_class.speed, NA_SE_25, &actor->actor_class.world.position);
+    actor->unk20C = GETREG(TAKREG, 15) + 30;
+    actor->collider_timer_accum = 0.0f;
+}
+
+static void aBALL_OBJcheck(BALL_ACTOR* actor, GAME* game) {
+    int wade;
+    ACTOR* collided;
     xyz_t collisionSpeed;
     xyz_t collision;
 
@@ -337,53 +419,8 @@ static void aBALL_OBJcheck(BALL_ACTOR* actor, GAME* game) {
         } else if ((collided != NULL) && (!(actor->state_flags & aBALL_STATE_IN_HOLE)) && (wade != mFI_WADE_START) &&
                    (wade != mFI_WADE_INPROGRESS)) {
             if (actor->collider != collided) {
-                pos_speed = collided->position_speed;
                 actor->collider = collided;
-                actor->unk20C = GETREG(TAKREG, 15) + 30;
-                actor->collider_timer_accum = 0.0f;
-                angle = atans_table(actor->actor_class.world.position.z - collided->world.position.z,
-                                    actor->actor_class.world.position.x - collided->world.position.x);
-                sin = sin_s(angle);
-                cos = cos_s(angle);
-                colliderSpeed =
-                    (sin * actor->actor_class.position_speed.x) + (cos * actor->actor_class.position_speed.z);
-
-                fact = sqrtf((pos_speed.x * pos_speed.x) + (pos_speed.z * pos_speed.z));
-
-                xyz_t_mult_v(&pos_speed, ((24.0f / 180.0f) * fact) * 0.9f + 0.1f);
-                collidedSpeed = (sin * pos_speed.x) + (cos * pos_speed.z);
-                abs = ABS(colliderSpeed + collidedSpeed);
-
-                newSins = abs * sin_s(angle);
-                newCos = abs * cos_s(angle);
-
-                newSpeedX = actor->actor_class.position_speed.x + newSins;
-                newSpeedZ = actor->actor_class.position_speed.z + newCos;
-
-                newFact = sqrtf((newSpeedX * newSpeedX) + (newSpeedZ * newSpeedZ));
-                newFact = CLAMP_MAX(newFact, 11.0f);
-
-                speedFactor = newFact / 11.0f;
-                if (actor->actor_class.bg_collision_check.result.on_ground) {
-                    /* TODO: this is fakematch right? */
-                    if (!actor->actor_class.speed) {
-                        f32 angle = ((speedFactor * 90.0f) + (speedFactor * 35.0f) * fqrand2());
-                        speedAngle = DEG2SHORT_ANGLE(angle);
-
-                        actor->actor_class.speed = cos_s(speedAngle) * newFact;
-                        actor->actor_class.position_speed.y = sin_s(speedAngle) * newFact;
-                    } else {
-                        actor->actor_class.speed = newFact * 0.75f;
-                    }
-                } else {
-                    actor->actor_class.speed = newFact * 0.75f;
-                }
-
-                actor->actor_class.world.angle.y = atans_table(newSpeedZ, newSpeedX);
-                actor->actor_class.speed *= 0.9f;
-                sAdo_OngenTrgStartSpeed(actor->actor_class.speed, NA_SE_25, &actor->actor_class.world.position);
-                actor->unk20C = GETREG(TAKREG, 15) + 30;
-                actor->collider_timer_accum = 0.0f;
+                aBALL_apply_kick(actor, &collided->world.position, &collided->position_speed);
             } else {
                 collision = actor->actor_class.status_data.collision_vec;
 
@@ -774,10 +811,161 @@ static void aBALL_status_check(ACTOR* actor, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* The multiplayer role can change while the ball lives (hosting started / client link lost): re-evaluate every frame. */
+static void aBALL_pc_refresh_mode(void) {
+    int mode = pc_net_game_ball_mode();
+    if (mode == s_pc_ball_mode) {
+        return;
+    }
+    if (s_pc_ball_mode == PC_BALL_MODE_HOST) {
+        pc_net_game_ball_host_gone();
+    }
+    if (pc_net_game_ball_diag()) {
+        printf("[NET][BALL] ball actor mode %d -> %d (same actor, live %d)\n", s_pc_ball_mode, mode, s_pc_ball_live);
+    }
+    s_pc_ball_mode = mode;
+    s_pc_ball_hidden = 0;
+    if (mode == PC_BALL_MODE_CLIENT) {
+        pc_net_game_ball_client_begin();
+        s_pc_ball_hidden = 1;
+    }
+}
+
+static void aBALL_pc_host_publish(BALL_ACTOR* ball) {
+    ACTOR* a = &ball->actor_class;
+    float pos[3];
+    float spd[3];
+    int flags = 0;
+
+    pos[0] = a->world.position.x;
+    pos[1] = a->world.position.y;
+    pos[2] = a->world.position.z;
+    spd[0] = a->position_speed.x;
+    spd[1] = a->position_speed.y;
+    spd[2] = a->position_speed.z;
+    if (ball->state_flags & aBALL_STATE_IN_HOLE) {
+        flags |= PC_BALL_FLAG_IN_HOLE;
+    }
+    if (ball->state_flags & aBALL_STATE_DEAD) {
+        flags |= PC_BALL_FLAG_DEAD;
+    }
+    pc_net_game_ball_host_publish(pos, spd, a->world.angle.y, ball->type, flags);
+}
+
+/* Host: replay a validated client kick with the vanilla impulse (the claimed kicker position + xz speed act as the collider). */
+static void aBALL_pc_host_move_pre(BALL_ACTOR* ball) {
+    float pos[3];
+    float spd[2];
+
+    if (pc_net_game_ball_host_take_kick(pos, spd) && !(ball->state_flags & (aBALL_STATE_IN_HOLE | aBALL_STATE_DEAD))) {
+        xyz_t cpos;
+        xyz_t cspd;
+
+        cpos.x = pos[0];
+        cpos.y = pos[1];
+        cpos.z = pos[2];
+        cspd.x = spd[0];
+        cspd.y = 0.0f;
+        cspd.z = spd[1];
+        ball->collider = NULL; /* the next local contact counts as a fresh one */
+        aBALL_apply_kick(ball, &cpos, &cspd);
+    }
+    aBALL_pc_host_publish(ball); /* also while culled at rest (the vanilla move returns early then) */
+}
+
+/* Client proxy: position / speed / angle come from the host's BALL_STATE; no BG check, physics or quest/tool handling runs
+ * here. A contact of the LOCAL player's pipe becomes a BALL_KICK_REQUEST (rate-limited); the host's impulse comes back in the
+ * next states. Scoop / axe hits on the proxy are dropped (not forwarded). Returns 0 => run the vanilla move instead. */
+static int aBALL_pc_client_move(ACTOR* actor, GAME* game) {
+    BALL_ACTOR* ball = (BALL_ACTOR*)actor;
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    float cur[3];
+    float spd[3];
+    int16_t ang = 0;
+    int type = 0;
+    int flags = 0;
+    int rc;
+
+    cur[0] = actor->world.position.x;
+    cur[1] = actor->world.position.y;
+    cur[2] = actor->world.position.z;
+    rc = pc_net_game_ball_client_drive(cur, spd, &ang, &type, &flags);
+    if (rc < 0) {
+        s_pc_ball_hidden = 0; /* no host state (old host / fallback): the vanilla local ball */
+        return 0;
+    }
+    ball->ball_pipe.collision_obj.collision_flags0 &= ~ClObj_FLAG_COLLIDED;
+    ball->state_flags &= ~(aBALL_STATE_PLAYER_HIT_SCOOP | aBALL_STATE_PLAYER_HIT_AXE);
+    if (rc == 0) {
+        s_pc_ball_hidden = 1;
+        actor->shape_info.draw_shadow = FALSE;
+        return 1;
+    }
+    s_pc_ball_hidden = (flags & PC_BALL_FLAG_DEAD) != 0;
+    actor->world.position.x = cur[0];
+    actor->world.position.y = cur[1];
+    actor->world.position.z = cur[2];
+    actor->position_speed.x = spd[0];
+    actor->position_speed.y = spd[1];
+    actor->position_speed.z = spd[2];
+    actor->world.angle.y = ang;
+    actor->speed = sqrtf(spd[0] * spd[0] + spd[2] * spd[2]);
+    ball->type = (u8)type;
+    Common_Set(ball_type, type);
+    ball->state_flags &= ~(aBALL_STATE_IN_HOLE | aBALL_STATE_DEAD);
+    if (flags & PC_BALL_FLAG_IN_HOLE) {
+        ball->state_flags |= aBALL_STATE_IN_HOLE;
+    }
+    if (flags & PC_BALL_FLAG_DEAD) {
+        ball->state_flags |= aBALL_STATE_DEAD;
+    }
+    actor->shape_info.draw_shadow = s_pc_ball_hidden ? FALSE : TRUE;
+    if (s_pc_ball_hidden) {
+        return 1;
+    }
+    Common_Set(ball_pos, actor->world.position); /* insects / villagers / events read the same ball as the host */
+    CollisionCheck_Uty_ActorWorldPosSetPipeC(&ball->actor_class, &ball->ball_pipe);
+    CollisionCheck_setOC(game, &play->collision_check, &ball->ball_pipe.collision_obj);
+    aBALL_calc_axis(actor, game);
+    return 1;
+}
+
+/* Client: called right after the OC pass set the collided flag (next frame's move, before it is cleared above). */
+static void aBALL_pc_client_kick_check(BALL_ACTOR* ball, GAME* game) {
+    PLAYER_ACTOR* player = GET_PLAYER_ACTOR((GAME_PLAY*)game);
+    float pos[3];
+
+    if (s_pc_ball_hidden || player == NULL || !ClObj_DID_COLLIDE(ball->ball_pipe.collision_obj) ||
+        ball->ball_pipe.collision_obj.collided_actor != (ACTOR*)player || (ball->state_flags & aBALL_STATE_IN_HOLE)) {
+        return;
+    }
+    if ((player->actor_class.position_speed.x * player->actor_class.position_speed.x) +
+            (player->actor_class.position_speed.z * player->actor_class.position_speed.z) < 0.25f) {
+        return; /* a standing contact carries no impulse (and must not consume the 0.5 s kick slot of the next moving one) */
+    }
+    pos[0] = player->actor_class.world.position.x;
+    pos[1] = player->actor_class.world.position.y;
+    pos[2] = player->actor_class.world.position.z;
+    pc_net_game_ball_client_kick(pos, player->actor_class.position_speed.x, player->actor_class.position_speed.z);
+}
+#endif
+
 static void aBALL_actor_move(ACTOR* actor, GAME* game) {
     BALL_ACTOR* ball = (BALL_ACTOR*)actor;
     GAME_PLAY* play = (GAME_PLAY*)game;
 
+#ifdef TARGET_PC
+    aBALL_pc_refresh_mode();
+    if (s_pc_ball_mode == PC_BALL_MODE_CLIENT) {
+        aBALL_pc_client_kick_check(ball, game);
+        if (aBALL_pc_client_move(actor, game)) {
+            return;
+        }
+    } else if (s_pc_ball_mode == PC_BALL_MODE_HOST) {
+        aBALL_pc_host_move_pre(ball);
+    }
+#endif
     aBALL_House_Tree_Rev_Check(ball);
 
     if (!(actor->state_bitfield & ACTOR_STATE_NO_CULL)) {
@@ -798,6 +986,11 @@ static void aBALL_actor_move(ACTOR* actor, GAME* game) {
     CollisionCheck_setOC(game, &play->collision_check, &ball->ball_pipe.collision_obj);
     aBALL_calc_axis(actor, game);
     aBALL_status_check(actor, game);
+#ifdef TARGET_PC
+    if (s_pc_ball_mode == PC_BALL_MODE_HOST) {
+        aBALL_pc_host_publish(ball);
+    }
+#endif
 }
 
 static void aBALL_actor_draw(ACTOR* actor, GAME* game) {
@@ -805,6 +998,11 @@ static void aBALL_actor_draw(ACTOR* actor, GAME* game) {
     GRAPH* graph;
     Gfx* gfx;
 
+#ifdef TARGET_PC
+    if (s_pc_ball_mode == PC_BALL_MODE_CLIENT && s_pc_ball_hidden) {
+        return; /* client proxy waiting for the host's first BALL_STATE, or the host ball sank */
+    }
+#endif
     graph = game->graph;
 
     OPEN_DISP(graph);

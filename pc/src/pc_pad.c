@@ -189,6 +189,21 @@ u32 PADRead(PADStatus* status) {
         if (af & 2u) buttons |= PAD_BUTTON_RIGHT;
         if (ax != 0 || ay != 0) { stickX = (s8)ax; stickY = (s8)ay; }
     }
+    { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_DRESSER_GYROID=1): the scripted input of the dresser gyroid-overlay UI test; 0 otherwise (never in normal play) */
+        const unsigned df = pc_net_game_test_dresser_pad();
+        if (df & 1u) buttons |= PAD_BUTTON_A;
+        if (df & 2u) buttons |= PAD_BUTTON_RIGHT;
+        if (df & 4u) buttons |= PAD_BUTTON_LEFT;
+        if (df & 8u) buttons |= PAD_BUTTON_B;
+        if (df & 16u) buttons |= PAD_TRIGGER_L;
+        if (df & 32u) buttons |= PAD_TRIGGER_R;
+        if (df & 2u) stickX = (s8)STICK_MAGNITUDE;   /* the menus move the cursor with the stick */
+        if (df & 4u) stickX = (s8)-STICK_MAGNITUDE;
+        if (df & 64u) stickY = (s8)-STICK_MAGNITUDE; /* cursor down (to the pockets) */
+        if (df & 128u) stickY = (s8)STICK_MAGNITUDE; /* cursor up */
+        if (df & 256u) buttons |= PAD_BUTTON_START;
+        if (df & 512u) buttons |= PAD_TRIGGER_Z;
+    }
     pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
 
     if (pc_tool_wheel_is_open()) { /* the analog L/R triggers must not leak into the game while the wheel is up either */

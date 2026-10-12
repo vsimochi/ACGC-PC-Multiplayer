@@ -155,7 +155,8 @@ def main():
     en = func_body(c, "pcnetgame_pdata_host_enabled")
     ck("D defaults: HOST only; --personal-sync on|off > settings.ini personal_sync (auto / on / off) > AUTO = on only while town_serve != off; settings default -1 (auto); the CLI option is host-only (exit 2) "
        "and prints in --help",
-       "s_role != PC_NETGAME_ROLE_HOST" in en and in_order(en, ["g_pc_personal_sync_override >= 0", "g_pc_settings.personal_sync >= 0", "g_pc_town_serve_override", "g_pc_settings.town_serve", "return m != 0;"])[0]
+       "s_role != PC_NETGAME_ROLE_HOST" in en and in_order(en, ["g_pc_personal_sync_override >= 0", "g_pc_settings.personal_sync >= 0", "pc_settings_town_serve_effective()", "return m != 0;"])[0]
+       and in_order(func_body(main_c, "pc_settings_town_serve_effective"), ["g_pc_town_serve_override >= 0", "g_pc_settings.town_serve >= 0"])[0]  # the AUTO resolution (override > settings.ini > dedicated host) lives in pc_main.c
        and ".personal_sync = -1," in stc and "int g_pc_personal_sync_override = -1;" in stc and 'strcmp(key, "personal_sync") == 0' in stc and "int personal_sync;" in sth
        and "extern int g_pc_personal_sync_override;" in sth and '"--personal-sync"' in main_c and "g_pc_personal_sync_override >= 0 && g_pc_net_role != 1" in main_c and "--personal-sync on|off HOST-only" in main_c)
     ed = read("src/game/m_editor_ovl.c")

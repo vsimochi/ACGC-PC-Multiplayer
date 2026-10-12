@@ -182,8 +182,11 @@ int aGYO_pc_handle_wildlife_despawn(u32 entity_id) {
         /* Case 1: never hooked by THIS process's own bobber -- the same deferred-destroy flag vanilla's
            own aGYO_actor_move() already consumes every tick (ac_gyoei_move.c_inc). */
         ctrl[found].gyo_flags |= 0x20;
-    } else if (engaged_by_this_process && uki->gyo_status < 5) {
-        /* Case 2: engaged by this process, before aUKI_bite()'s point of no return -- exact same pair
+    } else if (engaged_by_this_process && uki->gyo_status < 4) {
+        /* Case 2 (fishing-softlock guard: < 4, not < 5): gyo_status 4 means the player already pressed A in
+           aUKI_bite(); clearing gyo_command then drops the uki into aUKI_set_proc_wait() while the player's
+           FLY_ROD state waits forever for CATCH. A committed fish is left to the host's CATCH_REQUEST
+           arbitration (falls through to the untouched branch). Engaged by this process, before the commit -- exact same pair
            of writes as vanilla's own bite-timeout escape path (ac_gyo_test.c). */
         uki->gyo_command = 0;
         ctrl[found].gyo_flags |= 0x20;

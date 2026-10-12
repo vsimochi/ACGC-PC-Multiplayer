@@ -1,4 +1,7 @@
 #include "m_inventory_ovl.h"
+#ifdef TARGET_PC
+#include "pc_dresser_ui.h" /* 6s: dresser-mode backdrop / grabbed-item origin */
+#endif
 
 #include "m_player_lib.h"
 #include "ac_set_ovl_gyoei.h"
@@ -1649,6 +1652,11 @@ static void mIV_set_item(Submenu* submenu, mSM_MenuInfo_c* menu_info, GRAPH* gra
 
     no_wc_flag = inv_ovl->wc_flag;
     for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++, item++, scale_type++) {
+#ifdef TARGET_PC
+        if (pc_dresser_ui_carry_hides(1, i)) {
+            continue; /* 6s: the dresser screen's grabbed pocket item is drawn by the hand only (view only: the pocket is unchanged) */
+        }
+#endif
         if (*item != EMPTY_NO) {
             submenu->overlay->tag_ovl->set_hand_pos_proc(submenu, hand_pos, mTG_TABLE_ITEM, i);
             if (tag->table == mTG_TABLE_ITEM) {

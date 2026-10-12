@@ -39,6 +39,14 @@ extern char* mSc_secure_exchange_keep_bank(Object_Exchange_c* exchange, s16 bank
     char* area = NULL;
     Object_Bank_c* bank = exchange->banks + exchange->bank_idx;
 
+#ifdef TARGET_PC
+    {
+        extern int g_pc_submenu_world_tick; /* m_actor.c: host submenu world tick, never allocate while set */
+        if (g_pc_submenu_world_tick) {
+            return NULL;
+        }
+    }
+#endif
     if (exchange->bank_idx < mSc_OBJECT_BANK_NUM) {
         area = (char*)ALIGN_NEXT((u32)exchange->next_bank_ram_address + size, 32);
 

@@ -47,6 +47,13 @@ def hdr_additions_only(rel, old_ref=BASELINE, new_ref=None):
     return len(removed), code
 
 
+def hdr_removed_code(rel, old_ref, new_ref=None):
+    """Removed NON-comment, non-blank lines of rel between old_ref and new_ref (None = working tree)."""
+    out = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", old_ref] + ([new_ref] if new_ref else []) + ["--", rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace")
+    rem = [l[1:].rstrip("\r") for l in out.split("\n") if l.startswith("-") and not l.startswith("---")]
+    return [l for l in rem if l.strip() and not l.strip().startswith(("/*", "*", "//"))]
+
+
 def main():
     results = []
     ck = lambda d, c: L.check(d, bool(c), results)
@@ -94,7 +101,7 @@ def main():
        "(nothing is minted / created before the cap is judged)", i_dup < i_isg < i_cap < i_mint < i_rem < i_cre)
     ck("P the refusal is REJECT(SERVER_FULL) through the existing refuse path (use_no_save 0) and returns before anything else: log text names the cap ('guest limit reached (%d of max_guests=%d ...)')",
        i_cap < i_rej < i_mint and "pcnetgame_host_refuse_identity(peer, cap_msg, 0);\n            return;" in pi
-       and "guest limit reached (%d of max_guests=%d guests are connected)" in ng_raw)
+       and "guest limit reached (%d of max_guests=%d guests are connected)" in ga_c)  # capacity phase 4: the decision text lives in the pure pc_guest_admit.c (pc_guest_admit_decide), called by the gate
     ck("P the gate sits in the guest-only block: the text between `if (is_guest) {` and the gate contains no resident path, and the resident classification / own-resident / duplicate code "
        "before it never mentions the cap helpers",
        all(x not in pi[:i_isg] for x in ("pcnetgame_host_max_guests", "pcnetgame_host_bound_guest_count", "pcnetgame_host_guest_cap_refusal", "pcnetgame_host_resident_peer_reserve", "max_guests")))
@@ -103,9 +110,11 @@ def main():
         users[fn] = sorted({n for a, b, n in nf if re.search(r"\b%s\(" % fn, ng[a:b]) and n != fn})
     ck("P who calls what: the cap helpers are used ONLY by the gate, the dedicated counts accessor and each other (never by a resident / record / transport function): %s" % users,
        users["pcnetgame_host_guest_cap_refusal"] == ["pcnetgame_host_process_identity"]
-       and users["pcnetgame_host_max_guests"] == ["pc_net_game_dedicated_guest_counts", "pcnetgame_host_guest_cap_refusal"]
-       and users["pcnetgame_host_bound_guest_count"] == ["pc_net_game_dedicated_guest_counts", "pcnetgame_host_guest_cap_refusal"]
-       and users["pcnetgame_host_resident_peer_reserve"] == ["pcnetgame_host_guest_cap_refusal"])
+       # capacity phases 4+: the read-only console accessors (status / capacity: pc_net_game_dedicated_*) and the host-start banner (pc_net_game_start_host logs max_guests) read the cap too;
+       # never a resident / record / transport function.
+       and users["pcnetgame_host_max_guests"] == ["pc_net_game_dedicated_guest_admission", "pc_net_game_dedicated_guest_counts", "pc_net_game_start_host", "pcnetgame_host_guest_cap_refusal"]
+       and users["pcnetgame_host_bound_guest_count"] == ["pc_net_game_dedicated_guest_admission", "pc_net_game_dedicated_guest_counts", "pcnetgame_host_guest_cap_refusal"]
+       and users["pcnetgame_host_resident_peer_reserve"] == ["pc_net_game_dedicated_capacity", "pcnetgame_host_guest_cap_refusal"])
     ck("P the gate counts READY peers bound with class GUEST (never residents), excluding the asking peer: link READY, bound_valid, PC_NETGAME_REC_CLASS_GUEST",
        "s_host_peer_link[j] == PC_NETGAME_LINK_READY" in nb("pcnetgame_host_bound_guest_count") and "PC_NETGAME_REC_CLASS_GUEST" in nb("pcnetgame_host_bound_guest_count")
        and "j != (int)except_peer" in nb("pcnetgame_host_bound_guest_count"))
@@ -135,7 +144,8 @@ def main():
        and "pcnetgame_host_peer_bound_to_guest(guest_slot, peer)" in pi)
     ded = S.read("pc/src/pc_dedicated.c")
     ck("I dedicated `status` prints `guests: bound=%d max_guests=%d` from pc_net_game_dedicated_guest_counts (HOST only)",
-       'printf("  guests: bound=%d max_guests=%d\\n", gb, gc);' in ded and "int pc_net_game_dedicated_guest_counts(int* bound, int* cap) {" in ng_raw
+       'pc_ded_printf("  guests: bound=%d max_guests=%d (configured)' in ded and "ga.bound, ga.configured" in ded  # capacity phase 4: the line also reports the admissible count (pc_net_game_dedicated_guest_admission)
+       and "int pc_net_game_dedicated_guest_counts(int* bound, int* cap) {" in ng_raw and "pc_net_game_dedicated_guest_admission(&ga)" in ded
        and "pc_net_game_dedicated_guest_counts" in S.read("pc/include/pc_dedicated.h"))
 
     # ------------------------------------------------------------------ W
@@ -144,8 +154,15 @@ def main():
        # pc_net_game.h since the G3 commit: ADDITIONS ONLY (later milestones added function prototypes): nothing removed, every added non-comment line is a function prototype,
        # no #define / typedef / struct / enum (so no wire struct, enum value or constant changed)
        # (the COMMITTED state, G3 commit..HEAD: strict; uncommitted work in progress on top of HEAD may add declarations / constants but must still remove nothing and add no typedef / struct / enum)
-       and hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[0] == 0 and hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[1]
-       and all(re.match(r"^\w[\w\s\*]*\(.*\);", l) and not re.search(r"#\s*define|typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[1])
+       # G4 itself (BASELINE..G4_COMMIT): strictly additive prototypes
+       and hdr_additions_only("pc/include/pc_net_game.h", BASELINE, G4_COMMIT)[0] == 0
+       and all(re.match(r"^\w[\w\s\*]*\(.*\);", l) and not re.search(r"#\s*define|typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", BASELINE, G4_COMMIT)[1])
+       # the later COMMITTED milestones (BASELINE..HEAD: capacity phases etc.) added prototypes, #defines and includes, but no typedef / struct / enum and removed exactly ONE code line: the
+       # capacity-phase-1 rewrite of PC_NETGAME_HOST_PLAYER_ID from ((PCNetPlayerId)PC_NET_MAX_PEERS) (== 8) to the same value through PC_NETGAME_HOST_WIRE_ID (== 8, pinned by a _Static_assert
+       # against PC_NET_RESERVED_PEER_ID); wire_baseline (below) pins every HEAD typedef block and #define of the header
+       and not any(re.search(r"typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[1])
+       and hdr_removed_code("pc/include/pc_net_game.h", BASELINE, "HEAD") == ["#define PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NET_MAX_PEERS)"]
+       and "#define PC_NETGAME_HOST_WIRE_ID 8" in S.read("pc/include/pc_net_game.h") and "#define PC_NET_RESERVED_PEER_ID 8" in S.read("pc/include/pc_net.h")
        and hdr_additions_only("pc/include/pc_net_game.h", "HEAD")[0] == 0
        and not any(re.search(r"typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", "HEAD")[1])
        and S.read("pc/include/pc_net_game.h").count("const char* pc_net_game_join_message(int* is_warning);") == 1

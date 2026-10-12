@@ -1202,7 +1202,9 @@ TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED
                     7: "CONFLICT", 8: "BAD_IMAGE", 9: "PRECOND", 10: "STALE_IMAGE", 11: "BAD_SHAPE", 12: "BUSY", 13: "FAULT",
                     14: "REPLAYED", 15: "ALREADY_DONATED", 16: "NOT_AVAILABLE", 17: "NOT_DONATABLE", 18: "NO_DONOR_SLOT", 19: "NO_FUNDS",
                     20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM", 23: "NO_SUCH_ADDRESS", 24: "MAILBOX_FULL", 25: "PO_FULL",
-                    26: "NO_SUCH_LETTER", 27: "MAIL_CHANGED", 28: "NO_RESIDENCE", 29: "INVALID_HOUSE", 30: "NAME_TAKEN"}
+                    26: "NO_SUCH_LETTER", 27: "MAIL_CHANGED", 28: "NO_RESIDENCE", 29: "INVALID_HOUSE", 30: "NAME_TAKEN",
+                    31: "RESTOCKING", 32: "STALE_CATALOG", 33: "WORK_NO_JOB", 34: "WORK_STALE_JOB", 35: "WORK_WALLET_FULL", 36: "EVNPC_DONE",
+                    37: "DRESSER_DISABLED"}
 
 # --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
 # CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
@@ -1224,6 +1226,16 @@ PC_NETGAME_TXN_KIND_MAIL_TAKE = 13      # mail (milestone 2): dest NONE, slot = 
 PC_NETGAME_TXN_KIND_HOUSE_PURCHASE = 14  # guest-first town: a GUEST pays the whole house price and becomes a resident. dest NONE, slot 0, item 0, flags 0, aux_item = the price (18400), aux_cond = the house 0..3 or 0xFF = auto
 PC_NETGAME_TXN_KIND_SHOP_RESTOCK = 15  # Nook's manual shop restock: dest NONE, slot 0, item 0, flags 0, aux_cond 0, aux_item = the price (500)
 PC_NETGAME_TXN_REASON_RESTOCKING = 31  # shop restock: a restock is already running (nothing charged)
+# Reasons / kinds the C source already carried (HEAD 1c67a1a + master sprint 2) that the python mirror had never listed (test_txn_src audits C == python).
+PC_NETGAME_TXN_REASON_STALE_CATALOG = 32  # shop: a SHOP_BUY made against another catalog generation than the host's (nothing charged)
+PC_NETGAME_TXN_KIND_WORK = 16             # Nook Work Mode job transaction
+PC_NETGAME_TXN_REASON_WORK_NO_JOB = 33
+PC_NETGAME_TXN_REASON_WORK_STALE_JOB = 34
+PC_NETGAME_TXN_REASON_WORK_WALLET_FULL = 35
+PC_NETGAME_TXN_KIND_EVNPC = 17            # event NPC reward
+PC_NETGAME_TXN_REASON_EVNPC_DONE = 36
+PC_NETGAME_TXN_KIND_DRESSER = 18          # dresser storage (master sprint 2, worker 12)
+PC_NETGAME_TXN_REASON_DRESSER_DISABLED = 37
 PC_NETGAME_HOUSE_AUTO = 0xFF
 PC_NETGAME_HOUSE_PRICE_DIRECT = 18400   # 1,000 down payment + 17,400 loan (mPlayer_DEBT0), wallet only
 PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD    # SHOP_BUY aux_cond: a counted candy / grab bag (Shop_c.flowers_candy_grab_bag_count)

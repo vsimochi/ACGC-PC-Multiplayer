@@ -1027,6 +1027,7 @@ static int bIT_fruit_set(mActor_name_t fg_item, int ut_x, int ut_z, s16 count, i
     return fruit_set(fg_item, ut_x, ut_z, count, type, &tmp, NULL);
 }
 
+
 typedef struct fruit_drop_s {
     mActor_name_t src_tree_item;
     mActor_name_t dropped_item;

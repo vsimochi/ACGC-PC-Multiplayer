@@ -42,6 +42,8 @@
 #ifdef TARGET_PC
 #include "pc_diag.h"
 #include "pc_platform.h"
+#include "ac_npc.h"      /* NPC_ACTOR / aNPC_ACTION_TYPE_* for the host submenu world hold */
+#include "pc_net_game.h" /* pc_net_game_notify_npc_move */
 #endif
 
 #define Game_play_HYRAL_SIZE 0x3E800 // 256,000 bytes
@@ -499,6 +501,153 @@ extern void play_init(GAME* game) {
     mEA_GetCardDLProgram();
 }
 
+#ifdef TARGET_PC
+/* Esc-pause talk guard (multiplayer HOST only). Game_play_move() keeps the world running while the host sits in the Esc menu
+ * with at least one READY client, but the host's own input is blocked, so no demo may START for the local player then: a
+ * villager's forced SPEAK, an event REPORT/SPEECH/EVENTMSG, or a door/scene demo would open a message window or a transition
+ * that nobody can answer. mDemo_Main() is the only place a queued mDemo_Request() is accepted (choice_demo()), and
+ * mDemo_stock_clear() drops the unaccepted queue every frame, so skipping it is exactly the vanilla submenu rule ("demos only
+ * run while process_status == WAIT"): requesters re-request every frame and simply wait; an already running demo is held,
+ * as the vanilla full freeze held it. Returns 0 in single player, on a client, and on a host with no READY client (that host
+ * never gets here while paused: Game_play_move() returns early). */
+static int Game_play_pc_host_paused_live(void) {
+    extern int g_pc_paused;
+    extern int pc_net_game_host_ready_peer_count(void);
+
+    return g_pc_paused && pc_net_game_host_ready_peer_count() > 0;
+}
+
+/* Submenu world hold (multiplayer HOST with >= 1 READY client, process_status != WAIT). Vanilla freezes every actor while a
+ * submenu is open and that stays so: running villager/wildlife AI here is NOT safe (villager action/think code births tool
+ * actors and registers banks in the shared object_exchange that mSM_move_End repacks with mSc_dmacopy_all_exchange_bank,
+ * the NPC control actor spawns/deletes actors, a submenu opened from a conversation would run the talking NPC against stale
+ * message state, and the OC collider register/clear pair would drop the frozen player). What this does instead is purely
+ * presentational and read-only: it keeps the NPC_MOVE stream alive with each visible villager's TRUE (held) pose, and maps a
+ * walk/run action to the matching wait action, so the clients show the villagers standing still instead of walking in place
+ * at the last sampled spot. No actor/bank/save/collision state is touched; the next real sample after the menu closes is the
+ * same position, so there is no snap. Single player, a client and a host with no READY client never get here.
+ * F2 (supersedes the "NOT safe" above for a subset): an idle/walking villager that is not talking and has no pending tool or
+ * hand-over-item birth runs its REAL move proc under g_pc_submenu_world_tick (m_actor.c / m_scene.c refuse every actor
+ * creation and exchange bank allocation while it is set, Actor_delete is mark-only = deferred to the first frame after the
+ * menu). The NPC control actor (spawns, cloth bank registration) and every other actor stay frozen; anything else keeps the
+ * held pose above. Submenu overlays on PC do not write into object_exchange RAM (no *_ovl.c touches it), so the bank data
+ * the move proc reads is intact while the menu is open. */
+static int s_pc_submenu_hold_frames = 0;
+static int s_pc_submenu_hold_actors0 = 0;
+static int s_pc_submenu_tick_count = 0; /* F2: villager move procs run while the submenu was open */
+static int s_pc_submenu_bank_idx0 = 0;
+extern unsigned g_pc_submenu_tick_refused_make;    /* m_actor.c */
+extern unsigned g_pc_submenu_tick_deferred_delete; /* m_actor.c */
+
+static int Game_play_pc_actor_total(GAME_PLAY* play) {
+    int part, n = 0;
+
+    for (part = 0; part < ACTOR_PART_NUM; part++) {
+        n += play->actor_info.list[part].num_actors;
+    }
+    return n;
+}
+
+static void Game_play_pc_submenu_world_hold(GAME_PLAY* play) {
+    Actor_list* list;
+    ACTOR* a;
+    int k, slot;
+    int tick_ok;
+
+    if (pc_net_game_host_ready_peer_count() <= 0) {
+        return;
+    }
+    if (s_pc_submenu_hold_frames++ == 0) {
+        s_pc_submenu_hold_actors0 = Game_play_pc_actor_total(play);
+        s_pc_submenu_tick_count = 0;
+        s_pc_submenu_bank_idx0 = play->object_exchange.bank_idx;
+        g_pc_submenu_tick_refused_make = 0;
+        g_pc_submenu_tick_deferred_delete = 0;
+        printf("[NET][SUBMENU] host submenu world hold BEGIN menu_type=%d actors=%d\n", (int)play->submenu.menu_type,
+               s_pc_submenu_hold_actors0);
+    }
+    /* F2 gate: the real villager tick runs only while the submenu itself is fully open (PLAY: not while it is being
+     * linked/prerendered/torn down), outside any conversation (no talk actor, message window hidden: a submenu opened
+     * from a conversation keeps the held pose), with no fade/wipe (scene change), and in the town field. */
+    tick_ok = play->submenu.process_status == mSM_PROCESS_PLAY && play->fb_fade_type == FADE_TYPE_NONE &&
+              play->fb_wipe_mode == WIPE_MODE_NONE && mDemo_Get_talk_actor() == NULL &&
+              mMsg_Check_main_hide(mMsg_Get_base_window_p()) == TRUE && mFI_GET_TYPE(mFI_GetFieldId()) == mFI_FIELD_FG;
+    list = &play->actor_info.list[ACTOR_PART_NPC];
+    a = list->actor;
+    for (k = list->num_actors; k > 0 && a != NULL; k--, a = a->next_actor) {
+        NPC_ACTOR* n;
+        u8 act;
+
+        if (a->mv_proc == NULL) {
+            continue; /* already being deleted */
+        }
+        for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+            if ((u16)a->npc_id == (u16)Save_Get(animals[slot]).id.npc_id) {
+                break;
+            }
+        }
+        if (slot >= ANIMAL_NUM_MAX) {
+            continue; /* not a resident villager (shopkeepers, event NPCs, ...) */
+        }
+        n = (NPC_ACTOR*)a;
+        if (n->npc_info.animal != Save_GetPointer(animals[slot]) || n->condition_info.hide_flg) {
+            continue; /* identity guard (a villager actor always points at its own Animal_c) / hidden: not sampled by N2 either */
+        }
+        if (tick_ok && a->ct_proc == NULL && !mDemo_IS_ACTOR_TALKING(a) &&
+            n->condition_info.talk_condition == aNPC_TALK_TYPE_NONE &&
+            n->right_hand.requested_item_type == aNPC_ITEM_TYPE_NONE &&
+            n->left_hand.requested_item_type == aNPC_ITEM_TYPE_NONE) {
+            /* F2: the villager's own move proc, exactly as Actor_info_call_actor runs it (m_actor.c, ACTOR_PART_NPC branch),
+             * under g_pc_submenu_world_tick (no actor create, no exchange bank, deletes only marked). The move proc also
+             * reports its own NPC_MOVE sample (aNPC_pc_host_sample_move). OC colliders it registers are dropped again
+             * (collider_num restored): NPC<->NPC/player pushes are skipped for the stage, and the frozen frame's entries
+             * (the player's included) stay intact for the first OC pass after the menu closes. */
+            extern int g_pc_submenu_world_tick;
+            PLAYER_ACTOR* pl = GET_PLAYER_ACTOR(play);
+            int oc_num = play->collision_check.collider_num;
+
+            xyz_t_move(&a->last_world_position, &a->world.position);
+            if (pl != NULL) {
+                a->player_distance_xz = search_position_distanceXZ(&a->world.position, &pl->actor_class.world.position);
+                a->player_distance_y = pl->actor_class.world.position.y - a->world.position.y;
+                a->player_distance =
+                    a->player_distance_xz * a->player_distance_xz + a->player_distance_y * a->player_distance_y;
+                a->player_angle_y = search_position_angleY(&a->world.position, &pl->actor_class.world.position);
+            }
+            a->state_bitfield &= ~ACTOR_STATE_24;
+            g_pc_submenu_world_tick = 1;
+            (*a->mv_proc)(a, (GAME*)play);
+            g_pc_submenu_world_tick = 0;
+            if (play->collision_check.collider_num > oc_num) {
+                play->collision_check.collider_num = oc_num;
+            }
+            CollisionCheck_Status_Clear(&a->status_data);
+            s_pc_submenu_tick_count++;
+            continue;
+        }
+        act = n->condition_info.action;
+        if (act >= aNPC_ACTION_TYPE_WALK && act <= aNPC_ACTION_TYPE_WALK_AI) {
+            act = (u8)(aNPC_ACTION_TYPE_WAIT + (act - aNPC_ACTION_TYPE_WALK));
+        } else if (act >= aNPC_ACTION_TYPE_RUN && act <= aNPC_ACTION_TYPE_RUN_AI) {
+            act = (u8)(aNPC_ACTION_TYPE_WAIT + (act - aNPC_ACTION_TYPE_RUN));
+        }
+        pc_net_game_notify_npc_move(slot, (uint16_t)n->npc_info.animal->id.npc_id, a->world.position.x,
+                                    a->world.position.y, a->world.position.z, a->world.angle.y, act);
+    }
+}
+
+static void Game_play_pc_submenu_world_hold_end(GAME_PLAY* play) {
+    if (s_pc_submenu_hold_frames != 0) {
+        printf("[NET][SUBMENU] host submenu world hold END frames=%d actors_open=%d actors_close=%d ticks=%d "
+               "refused_make=%u deferred_delete=%u bank_idx_open=%d bank_idx_close=%d\n",
+               s_pc_submenu_hold_frames, s_pc_submenu_hold_actors0, Game_play_pc_actor_total(play),
+               s_pc_submenu_tick_count, g_pc_submenu_tick_refused_make, g_pc_submenu_tick_deferred_delete,
+               s_pc_submenu_bank_idx0, play->object_exchange.bank_idx);
+        s_pc_submenu_hold_frames = 0;
+    }
+}
+#endif
+
 static void Game_play_move_fbdemo_not_move(GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
 
@@ -510,7 +659,12 @@ static void Game_play_move_fbdemo_not_move(GAME* game) {
 
     if (play->submenu.process_status == mSM_PROCESS_WAIT) {
         game->doing_point = 2;
-        mDemo_Main(play);
+#ifdef TARGET_PC
+        if (!Game_play_pc_host_paused_live())
+#endif
+        {
+            mDemo_Main(play);
+        }
         game->doing_point = 3;
         mEv_run(&play->event);
     }
@@ -523,6 +677,9 @@ static void Game_play_move_fbdemo_not_move(GAME* game) {
     mSM_submenu_move(&play->submenu);
 
     if (play->submenu.process_status == mSM_PROCESS_WAIT) {
+#ifdef TARGET_PC
+        Game_play_pc_submenu_world_hold_end(play); /* before Actor_info_call_actor: counts the menu period only */
+#endif
         play->game_frame++;
         mVibctl_clr_force_stop(2);
         game->doing_point = 7;
@@ -541,6 +698,9 @@ static void Game_play_move_fbdemo_not_move(GAME* game) {
         mMsg_Main(game);
     } else {
         mVibctl_set_force_stop(2);
+#ifdef TARGET_PC
+        Game_play_pc_submenu_world_hold(play);
+#endif
     }
 
     fbdemo_fade_move(&play->color_fade, game_GameFrame);
@@ -553,7 +713,11 @@ static void Game_play_move(GAME* game) {
 #ifdef TARGET_PC
     {
         extern int g_pc_paused;
-        if (g_pc_paused) return;
+        extern int pc_net_game_host_ready_peer_count(void);
+        /* Multiplayer HOST with at least one READY client: the Esc menu must not freeze everyone else's world (host-authoritative villagers, wildlife, puppets, time). The menu
+         * still blocks the host's own input (padmgr zeroes the pads and pc_main swallows the keys while g_pc_paused), so the local player simply stands idle. Single player and
+         * a host with nobody connected (pc_net_game_host_ready_peer_count() == 0) keep the vanilla full freeze. */
+        if (g_pc_paused && pc_net_game_host_ready_peer_count() == 0) return;
     }
 #endif
 

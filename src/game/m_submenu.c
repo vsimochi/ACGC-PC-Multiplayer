@@ -12,6 +12,77 @@
 #include "m_museum_display.h"
 #endif
 
+#if defined(TARGET_PC) /* test hook: runtime-gated by pc_test_hook_getenv (AC_TEST_HOOKS=1 in a PC_TEST_HOOKS build), same as m_msg_main.c_inc */
+#include "pc_test_hooks.h"
+#include "pc_net_game.h"
+#include <stdio.h>
+#include <stdlib.h>
+/* TEST-ONLY (AC_TEST_HOOKS=1 + AC_TEST_HOST_SUBMENU="open_after_ms,hold_ms"): on a HOST with a READY client, open the
+ * inventory once open_after_ms after the first READY peer is seen, and close it through the overlay's own close path
+ * hold_ms later; logs a pockets+wallet checksum at open and at close so a test can prove nothing changed. Zero effect
+ * otherwise: pc_test_hook_getenv returns NULL unless PC_TEST_HOOKS build + AC_TEST_HOOKS=1, read once, then stage 3. */
+static int s_pc_th_sm_stage = 0; /* 0 idle, 1 opened, 2 close requested, 3 done */
+static unsigned s_pc_th_sm_t0 = 0, s_pc_th_sm_t_open = 0, s_pc_th_sm_hold = 0;
+
+static unsigned mSM_pc_th_pocket_sum(void) {
+    Private_c* priv = Common_Get(now_private);
+    unsigned sum = 0;
+    int i;
+
+    if (priv == NULL) {
+        return 0;
+    }
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        sum = sum * 31u + (unsigned)priv->inventory.pockets[i];
+    }
+    return sum * 31u + (unsigned)priv->inventory.wallet;
+}
+
+static int mSM_pc_th_want_open(void) {
+    static int parsed = 0;
+    static unsigned after_ms = 0;
+    const char* e;
+    unsigned now;
+
+    if (s_pc_th_sm_stage != 0) {
+        return FALSE;
+    }
+    if (!parsed) {
+        unsigned a = 0, h = 0;
+        parsed = 1;
+        if ((e = pc_test_hook_getenv("AC_TEST_HOST_SUBMENU")) == NULL || sscanf(e, "%u,%u", &a, &h) != 2) {
+            s_pc_th_sm_stage = 3;
+            return FALSE;
+        }
+        after_ms = a;
+        s_pc_th_sm_hold = h;
+    }
+    if (pc_net_game_host_ready_peer_count() <= 0) {
+        return FALSE;
+    }
+    now = (unsigned)pc_net_game_now_ms();
+    if (s_pc_th_sm_t0 == 0) {
+        s_pc_th_sm_t0 = now | 1u;
+    }
+    return (unsigned)(now - s_pc_th_sm_t0) >= after_ms;
+}
+
+static void mSM_pc_th_play_tick(Submenu* submenu) {
+    mSM_MenuInfo_c* mi;
+
+    if (s_pc_th_sm_stage != 1 || submenu->menu_type != mSM_OVL_INVENTORY || submenu->overlay == NULL ||
+        (unsigned)(pc_net_game_now_ms() - s_pc_th_sm_t_open) < s_pc_th_sm_hold) {
+        return;
+    }
+    mi = &submenu->overlay->menu_info[mSM_OVL_INVENTORY];
+    if (mi->proc_status == mSM_OVL_PROC_PLAY) {
+        submenu->overlay->move_chg_base_proc(mi, mSM_MOVE_OUT_RIGHT);
+        s_pc_th_sm_stage = 2;
+        printf("[TEST][SUBMENU] host inventory close requested\n");
+    }
+}
+#endif
+
 static mSM_dlftbl_c SubmenuArea_dlftbl[mSM_DLF_NUM] = { { NULL, 0, 0, 0, 0, 0, "submenu_ovl" },
                                                         { NULL, 0, 0, 0, 0, 0, "player_actor" } };
 
@@ -270,6 +341,15 @@ extern void mSM_submenu_ctrl(GAME_PLAY* play) {
     if (chkTrigger(mSM_INV_BUTTON_0) || chkTrigger(mSM_INV_BUTTON_1)) {
         open_inventory = TRUE;
     }
+#if defined(TARGET_PC) /* test hook: runtime-gated by pc_test_hook_getenv (AC_TEST_HOOKS=1 in a PC_TEST_HOOKS build), same as m_msg_main.c_inc */
+    if (!open_inventory && mSM_pc_th_want_open() && mPlib_able_submenu_type1((GAME*)play)) {
+        open_inventory = TRUE;
+        s_pc_th_sm_stage = 1;
+        s_pc_th_sm_t_open = (unsigned)pc_net_game_now_ms();
+        printf("[TEST][SUBMENU] host inventory OPEN pockets_sum=%08X ready_peers=%d\n", mSM_pc_th_pocket_sum(),
+               pc_net_game_host_ready_peer_count());
+    }
+#endif
 
     if (((open_inventory && Common_Get(reset_flag) == FALSE) ||
          (mSM_check_open_map_new(play) == TRUE && Common_Get(reset_flag) == FALSE)) &&
@@ -382,6 +462,9 @@ static void mSM_move_LINKWait(Submenu* submenu) {
 }
 
 static void mSM_move_Play(Submenu* submenu) {
+#if defined(TARGET_PC) /* test hook: runtime-gated by pc_test_hook_getenv (AC_TEST_HOOKS=1 in a PC_TEST_HOOKS build), same as m_msg_main.c_inc */
+    mSM_pc_th_play_tick(submenu);
+#endif
     (*submenu->move_proc)(submenu);
 }
 
@@ -395,6 +478,12 @@ static void mSM_move_End(Submenu* submenu) {
     submenu->wait_timer = 2;
     submenu->open_flag = FALSE;
     SetGameFrame(1);
+#if defined(TARGET_PC) /* test hook: runtime-gated by pc_test_hook_getenv (AC_TEST_HOOKS=1 in a PC_TEST_HOOKS build), same as m_msg_main.c_inc */
+    if (s_pc_th_sm_stage == 1 || s_pc_th_sm_stage == 2) {
+        s_pc_th_sm_stage = 3;
+        printf("[TEST][SUBMENU] host inventory CLOSED pockets_sum=%08X\n", mSM_pc_th_pocket_sum());
+    }
+#endif
 
     if (submenu->mode != mSM_MODE_OTHER) {
         mMsg_Window_c* msg_win = mMsg_Get_base_window_p();

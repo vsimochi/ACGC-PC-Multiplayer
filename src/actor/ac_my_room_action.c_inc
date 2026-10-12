@@ -413,6 +413,12 @@ static void aMR_PlacePullFurniture(MY_ROOM_ACTOR* my_room, aMR_contact_info_c* c
             if (aMR_JudgeStickFull(direct, game) == TRUE) {
                 xyz_t* target_pos = &target_table[direct];
 
+#ifdef TARGET_PC
+                if (aMR_PcDresserMoveLocked(my_room, ftr_actor, aMR_PC_MOVE_PULL)) {
+                    return; /* dresser storage (Option A): a dresser holding extra items is not pulled (notice 3) */
+                }
+#endif
+
                 if (aMR_CheckPullPlayerObstacle(&my_room->pull_target_pos0, &my_room->pull_target_pos1, player,
                                                 *target_pos, direct) == FALSE) {
                     if (aMR_CheckPullPlayerObstacle2(&my_room->pull_target_pos0, &my_room->pull_target_pos1,
@@ -500,6 +506,12 @@ static void aMR_PlacePushFurniture(MY_ROOM_ACTOR* my_room, aMR_contact_info_c* c
 
             if (aMR_JudgeStickFull(aMR_PullDirect2PushDirect(direct), game)) {
                 xyz_t* target_pos = &push_target_table[direct];
+
+#ifdef TARGET_PC
+                if (aMR_PcDresserMoveLocked(my_room, ftr_actor, aMR_PC_MOVE_PUSH)) {
+                    return; /* dresser storage (Option A): a dresser holding extra items is not pushed (notice 3) */
+                }
+#endif
 
                 aMR_SetInfoFurnitureTable(ftr_actor->shape_type, ut, aMR_NO_FTR_ID, ftr_actor->layer);
                 aMR_SetFurniture2FG(ftr_actor, ftr_actor->position, FALSE);
@@ -1167,6 +1179,13 @@ static int aMR_JudgeDemoStart(MY_ROOM_ACTOR* my_room, aMR_contact_info_c* contac
         FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[contact_info->ftrID];
         aFTR_PROFILE* profile = aMR_GetFurnitureProfile(ftr_actor->name);
 
+#ifdef TARGET_PC
+        if (profile != NULL && contact_info->contact_direction == aMR_CONTACT_DIR_FRONT && ftr_actor->demo_status == FALSE &&
+            aMR_PcDresserOpenRefused(my_room, ftr_actor)) {
+            my_room->force_open_demo_flag = FALSE; /* 6j: a just-moved dresser: no open demo until its move is committed (notice 4); the player stays free */
+            return FALSE;
+        }
+#endif
         if (profile != NULL) {
             if (contact_info->contact_direction == aMR_CONTACT_DIR_FRONT &&
                 (aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_WARDROBE) ||
@@ -1225,6 +1244,11 @@ static void aMR_PlaceKurukuruFurniture(MY_ROOM_ACTOR* my_room, aMR_contact_info_
 
             if (aMR_DecideKurukuruDirect(my_room, &rotation_state, contact_info, ftr_actor, game)) {
                 u8 shape = ftr_actor->shape_type;
+#ifdef TARGET_PC
+                if (aMR_PcDresserMoveLocked(my_room, ftr_actor, aMR_PC_MOVE_ROTATE)) {
+                    return; /* dresser storage (Option A): a dresser holding extra items is not rotated (notice 3) */
+                }
+#endif
                 int ftr_ut_x;
                 int ftr_ut_z;
                 int ftr_ut;

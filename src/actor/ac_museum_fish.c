@@ -899,10 +899,43 @@ static void Museum_Fish_UpdatePlayerArea(MUSEUM_FISH_ACTOR* actor, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+/* Multiplayer live refresh: another player's donation (client: the host's TOWN_SVC_STATE museum mirror; host: a client's MUSEUM_DONATE
+ * commit) changes Save_t.museum_display while this player already stands in the fish room. The ct only builds the fish that were donated
+ * at construction, so build each NEWLY donated fish in place with exactly the ct's per-fish steps (bit 1 of _62E_flags is only ever written
+ * by the ct, so it records what was built). Additive only: a donation is never taken back. No allocation, no object bank, no other actor
+ * is touched; a fish's private data was zero / untouched until now, as at ct time. Never runs single-player (museum_display cannot change
+ * while the player stands in this room there). */
+static void Museum_Fish_PcRefreshDonations(MUSEUM_FISH_ACTOR* actor, GAME* game) {
+    MUSEUM_FISH_PRIVATE_DATA* prv = actor->prvFish;
+    int i;
+
+    if (pc_net_game_role() == PC_NETGAME_ROLE_NONE) {
+        return;
+    }
+    for (i = 0; i < aGYO_TYPE_NUM; i++, prv++) {
+        if ((prv->_62E_flags & 1) == 0 && mMmd_FishInfo(i)) {
+            if (i == aGYO_TYPE_FROG) {
+                prv->hasu_p = &actor->_14788; /* as the ct: the frog owns the lily pad (kaeru_ct re-inits it in place) */
+            }
+            prv->kf._54C = mfish_model_tbl[i];
+            prv->kf._550[0] = mfish_anime_init_tbl[i];
+            prv->_62E_flags |= 1;
+            Museum_Fish_Prv_data_init(prv, game, i, 1);
+            printf("[NET][MUSEUM] fish room: newly donated fish %d now on display (live refresh)\n", i);
+        }
+    }
+}
+#endif
+
 void Museum_Fish_Actor_move(ACTOR* actorx, GAME* game) {
     MUSEUM_FISH_ACTOR* actor = (MUSEUM_FISH_ACTOR*)actorx;
     int ticks;
 
+#ifdef TARGET_PC
+    Museum_Fish_PcRefreshDonations(actor, game);
+#endif
     mfish_point_light_mv(actor, game);
     Museum_Fish_Talk_process(actor, game);
 

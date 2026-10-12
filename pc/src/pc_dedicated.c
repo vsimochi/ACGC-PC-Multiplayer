@@ -17,6 +17,7 @@
 #include "ac_gyoei.h"              /* fish species ids for `wildlife spawn` */
 #include "pc_test_hooks.h"         /* test-hook gate of the behaviour-changing commands */
 #include "m_item_name.h"  /* mIN_copy_name_str(): the game's own item name tables (filled from the ROM by pc_assets_init) */
+#include "m_shop.h"       /* `shop-level-boost`: mSP_PlusSales / thresholds */
 
 #include <stdarg.h>
 #include <ctype.h>
@@ -1110,6 +1111,7 @@ static void pc_ded_cmd_help(void) {
            "  event list|status [name]   today's event schedule from the game's own tables (scheduled / active / running); start|stop|reset are refused with the reason\n"
            "  wildlife list|info <id>   the host's authoritative wildlife records; wildlife spawn fish <species> <x> <z> / despawn <id> need AC_TEST_HOOKS=1\n"
            "  test status|help   whether the test hooks are enabled and what they gate\n"
+           "  shop-level-boost [confirm]   add the sales still missing to the NEXT shop tier once (mSP_PlusSales); the upgrade itself follows the vanilla 2-day schedule\n"
            "  tp / bell   unsupported on the server (no local player; no host bell admin API) -- see docs/console-commands.md\n"
            "  stop     graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit\n");
     pc_ded_flush();
@@ -2353,6 +2355,47 @@ static void pc_ded_cmd_test(char* args) {
     pc_ded_flush();
 }
 
+/* `shop-level-boost [confirm]`: dev/admin progression aid. Adds (once, through the game's own mSP_PlusSales) exactly the Bells still missing to the NEXT shop tier's
+ * sales threshold. It never writes shop_level, renewal_time or mEv_SAVED_RENEWSHOP: the vanilla Shop_Level actor (present in SCENE_FG, where the observer stands) then schedules
+ * the renewal (aSL_JudgeRenewShop: 2 days, skipped while a sale / lottery day is near) exactly as if the Bells had been spent. Without `confirm` it only prints what it would do. */
+static void pc_ded_cmd_shop_level_boost(char* args) {
+    static const char* names[] = { "Nook's Cranny", "Nook 'n' Go", "Nookway", "Nookington's" };
+    const int level = mSP_GetShopLevel();
+    const u32 sum = mSP_GetSalesSum();
+    u32 target;
+    int real_after;
+
+    args = pc_ded_skip_ws(args);
+    if (!pc_net_game_dedicated_world_ready() || !pcfa_save_ready()) {
+        pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: the world / save is not ready yet (see `status`)\n");
+    } else if (level < mSP_SHOP_TYPE_ZAKKA || level >= mSP_SHOP_TYPE_DSUPER) {
+        pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: the shop is already at the maximum tier (level %d)\n", level);
+    } else if (pc_net_game_shop_restocking()) {
+        pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: Nook's shop is restocking; try again when it is open\n");
+    } else if (mEv_CheckEvent(mEv_SAVED_RENEWSHOP)) {
+        pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: an upgrade is already scheduled (mEv_SAVED_RENEWSHOP is set); it happens at the scheduled renewal time\n");
+    } else if ((target = (level == mSP_SHOP_TYPE_ZAKKA) ? (u32)mSP_COMBINI_SUM : (level == mSP_SHOP_TYPE_COMBINI) ? (u32)mSP_SUPER_SUM : (u32)mSP_DSUPER_SUM) <= sum) {
+        pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: sales already reached the next threshold (%u >= %u)%s\n", (unsigned)sum, (unsigned)target,
+                      level == mSP_SHOP_TYPE_SUPER ? "; Nookington's also needs a foreign-town shopper (visitor_flag) unless disable_shop_visitor_req = 1" : "");
+    } else if (args == NULL || pc_ded_stricmp(args, "confirm") != 0) {
+        pc_ded_printf("SHOP-LEVEL-BOOST (dry run): %s (level %d), sales %u; would add %u Bells of sales once (mSP_PlusSales) to reach %u (%s). Nothing changed; type `shop-level-boost confirm`.\n",
+                      names[level], level, (unsigned)sum, (unsigned)(target - sum), (unsigned)target, names[level + 1]);
+    } else {
+        mSP_PlusSales(target - sum);
+        real_after = mSP_GetRealShopLevel();
+        pc_ded_printf("SHOP-LEVEL-BOOST: sales %u -> %u (added %u once via mSP_PlusSales); shop level stays %d now, qualifying level %d.\n", (unsigned)sum,
+                      (unsigned)mSP_GetSalesSum(), (unsigned)(target - sum), level, real_after);
+        if (real_after > level) {
+            pc_ded_printf("  NOT immediate: the vanilla shop actor schedules the renewal on its next town frame and the new shop opens about 2 days later (renewal_time); a sale / lottery day within 2 days postpones the scheduling. Not written here: shop_level, renewal_time.\n");
+        } else {
+            pc_ded_printf("  No upgrade will be scheduled yet: Nookington's needs a foreign-town shopper (visitor_flag) unless disable_shop_visitor_req = 1 in settings.\n");
+        }
+        pc_ded_printf("  The change is in memory; it is written to disk by the next save (`save`).\n");
+        PC_LOG(PCL_GENERAL, "dedicated: shop-level-boost: sales %u -> %u\n", (unsigned)sum, (unsigned)mSP_GetSalesSum());
+    }
+    pc_ded_flush();
+}
+
 static void pc_ded_cmd_stop(void) {
     if (s_stop_requested) {
         pc_ded_printf("[DEDICATED] already stopping...\n");
@@ -2431,6 +2474,8 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_wildlife(args);
     } else if (strcmp(cmd, "test") == 0) {
         pc_ded_cmd_test(args);
+    } else if (strcmp(cmd, "shop-level-boost") == 0) {
+        pc_ded_cmd_shop_level_boost(args);
     } else if (strcmp(cmd, "tp") == 0 || strcmp(cmd, "bell") == 0) {
         pc_ded_printf("%s UNSUPPORTED on the dedicated server: %s\n", cmd, strcmp(cmd, "tp") == 0 ? "it has no local player, and a remote player's movement is owned by that client (the host never moves it)" : "bells are per-player save data with no host-side admin API in this build; use `give` for items");
         pc_ded_flush();

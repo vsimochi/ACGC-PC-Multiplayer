@@ -116,11 +116,11 @@ def main():
        "ok = (nv == (mActor_name_t)RSV_FE1F || pcnetgame_is_pocket_legal_item(nv)) &&" in pc and "(ov == (mActor_name_t)EMPTY_NO || ov == (mActor_name_t)RSV_FE1F || ITEM_IS_FTR(ov) || ITEM_IS_ITEM1(ov));" in pc
        and "pcnetgame_house_floor_exists(&Save_Get(homes[h]), f)" in pc and "memcmp(nf, of, PC_NETGAME_HOUSE_FLOOR_OWNER_BYTES) != 0" in pc
        and "nf[0x8A0] >= (u8)FLOOR_ALL_NUM" in pc and "nf[0x8A1] >= (u8)WALL_ALL_NUM" in pc)
-    cnt = func_body(c, "pcnetgame_house_count_id")
+    cnt = func_body(c, "pcnetgame_house_count_class") + func_body(c, "pcnetgame_house_count_id")  # 6o: the class rules live in pcnetgame_house_count_class (shared with the dresser rebase)
     ck("H conservation: normalisation N skips EMPTY / reserved / structural ids, maps furniture through mRmTp_FtrItemNo2Item1ItemNo(.., TRUE) to a rotation-free id, skips my-design mannequins / umbrellas, counts all four turnip ids as one class; "
        "wallpaper / carpet / disc classes may DECREASE, every other class must be exactly equal, the first 4 differing ids are logged",
        "mRmTp_FtrItemNo2Item1ItemNo(id, TRUE)" in cnt and "(mActor_name_t)(id & ~3u)" in cnt and "ITEM_IS_MYMANNIQUIN(id) || ITEM_IS_MYUMBRELLA(id)" in cnt
-       and "ITM_KABU_START" in cnt and "default:\n            return;" in cnt and "ITEM_IS_MYUMBRELLA_TOOL(id)" in cnt
+       and "ITM_KABU_START" in cnt and "default:\n            return -1;" in cnt and "const int y = pcnetgame_house_count_class(id);" in cnt and "ITEM_IS_MYUMBRELLA_TOOL(id)" in cnt
        and "if (nc[id] < oc[id] && pcnetgame_house_class_decreasable(id))" in func_body(c, "pcnetgame_house_conserved")
        and "first differing item ids (old -> new)" in pc and "diff[(*ndiff)++]" in func_body(c, "pcnetgame_house_conserved") and "*ndiff < 4" in func_body(c, "pcnetgame_house_conserved"))
     cr = func_body(c, "pcnetgame_house_count_record")
@@ -208,8 +208,8 @@ def main():
     fa = func_body(c, "pcnetgame_house_client_on_full_adopt")
     lw = func_body(c, "pcnetgame_hcl_live_apply")
     ck("S the ONLY client write of a received house into the save is pcnetgame_hcl_write_save() -> pcnetgame_house_copy_canon() (one call each); its callers are the stash writer, the FULL-adoption restore "
-       "and the two live-apply paths of a VISITOR (no-rebuild path / the rebuild callback)",
-       cs.count("pcnetgame_house_copy_canon(&Save_Get(homes[h]), &s_hs_native);") == 1 and cs.count("pcnetgame_hcl_write_save(") == 7 and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in ap_
+       "and the two live-apply paths of a VISITOR (no-rebuild path / the rebuild callback); 6h: + the dresser commit guard's correction of the OWN save (out of the room only)",
+       cs.count("pcnetgame_house_copy_canon(&Save_Get(homes[h]), &s_hs_native);") == 1 and cs.count("pcnetgame_hcl_write_save(") == 8 and "(void)pcnetgame_hcl_write_save(h, s_hcl_tx);" in func_body(c, "pcnetgame_hcl_build_pair") and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in ap_
        and "pcnetgame_hcl_write_save(h, img)" in fa and "pcnetgame_house_copy_canon(" in ws and "pcnetgame_hcl_write_save(h, s_hcp.stash_img[h])" in lw
        and "pcnetgame_hcl_write_save(*(int*)ctx, s_hcp.stash_img[*(int*)ctx])" in func_body(c, "pcnetgame_hcl_live_write_cb"))
     ck("S both writers check pcnetgame_local_house_unsafe() BEFORE writing; the stash writer also refuses while the own house is dirty or its commit is in flight and while the local save is unusable",
@@ -250,7 +250,7 @@ def main():
                              "play->submenu.menu_type != mSM_OVL_NONE", "play->submenu.mode != mSM_MODE_IDLE", "mDemo_CheckDemo() != FALSE", "!mMsg_Check_MainHide(mMsg_Get_base_window_p())",
                              "pl->requested_main_index_changed", "mPlayer_INDEX_WAIT", "mPlayer_INDEX_WALK", "mPlayer_INDEX_RUN", "mPlayer_INDEX_DASH", "aMR_pc_room_quiet()",
                              "need_own_room && Common_Get(field_type) != mFI_FIELDTYPE2_PLAYER_ROOM"))
-       and num(c, "PC_NETGAME_HCL_QUIET_FRAMES") == 30 and "->game_frame" in func_body(c, "pcnetgame_hcl_quiet_frames") and "pcnetgame_hcl_quiet_update();\n    pcnetgame_hcl_room_track();" in func_body(c, "pcnetgame_house_client_tick"))
+       and num(c, "PC_NETGAME_HCL_QUIET_FRAMES") == 30 and "->game_frame" in func_body(c, "pcnetgame_hcl_quiet_clock") and "pcnetgame_hcl_quiet_clock(s_hcl_q_dresser)" in func_body(c, "pcnetgame_hcl_quiet_frames") and "pcnetgame_hcl_quiet_update();\n    pcnetgame_hcl_room_track();" in func_body(c, "pcnetgame_house_client_tick"))
     ik = strip_comments(func_body(c, "pcnetgame_hcl_inroom_ok"))
     ck("L an in-room commit needs: a baseline captured at room entry, no refusal this visit, no rollback, no commit in flight, the OWN room quiescent NOW (live_room_house(1)) and for >= 30 frames; the dirty test is the snapshot digest vs canon",
        all(k in ik for k in ("!s_hcl.room_base_valid || s_hcl.room_stopped || s_hcl.rollback || s_hcl.c_active", "pcnetgame_hcl_live_room_house(1) != h", "pcnetgame_hcl_quiet_frames(h) >= PC_NETGAME_HCL_QUIET_FRAMES"))
@@ -345,7 +345,7 @@ def main():
     pmn = strip_comments(read("pc/src/pc_pause_menu.c"))
     ck("O the notice: one short rate-limited line drawn by pc_net_notice_draw ('Not connected - house changes are disabled' / 'Leave the house to resync')",
        "pc_net_game_room_edit_notice()" in pmn and "Not connected - house changes are disabled" in read("pc/src/pc_pause_menu.c") and "Leave the house to resync" in read("pc/src/pc_pause_menu.c")
-       and "(uint32_t)(pcnetgame_now_ms() - s_edit_denied_ms) >= 3000u" in cs)
+       and "(int32_t)(pcnetgame_now_ms() - s_edit_denied_ms) >= 3000" in cs)  # signed age: the now | 1 stamp may be 1 ms ahead (same-ms read)
     pall = strip_comments(read("src/game/m_player_common.c_inc")).replace("\r", "")
     pa = pall[pall.index("static int Player_actor_CheckAndRequest_main_pickup_all(GAME* game) {"):]
     pa = pa[:pa.index("pc_net_game_client_room_edit_locked") + 400]
@@ -362,8 +362,12 @@ def main():
        mv.index("pc_net_game_client_room_edit_locked()") < mv.index("mPlib_request_main_hold_type1(game, contact_info0->ftrID") and mv.count("pc_net_game_client_room_edit_locked()") == 1)
     ck("O lock gate: wallpaper / carpet (4 procs) and putin are refused in the CALLERS in m_tag_ovl.c (ac_my_indoor's reserve procs return the old item, which would erase the pocket item), warning row + return before any change",
        tg.count("pc_net_game_client_room_edit_locked()") == 6)
-    ck("O lock gate: the drawer / music-box choices (put in, take out, MD switch) are treated as cancel while locked (aMR_PcEditLocked in 6 handlers + its definition); the pickup seam has the belt-and-braces gate",
-       mc.count("aMR_PcEditLocked()") == 7 and mc.count("pc_net_game_client_room_edit_locked()") == 1 and "(slot_idx < 0 || pc_net_game_client_room_edit_locked())" in pks)
+    # dresser storage (worker 3): + 1 aMR_PcEditLocked() in the pool page handler (aMR_PcDresserPick), + 1 pc_net_game_client_room_edit_locked() in aMR_PcDresserOn
+    # and + 1 in its TEST-ONLY waiting diagnostic; + 2 aMR_PcEditLocked() in the gyroid-overlay vanilla keep-slot take / put; all TARGET_PC, all refusing while locked
+    ck("O lock gate: the drawer / music-box choices (put in, take out, MD switch) are treated as cancel while locked (aMR_PcEditLocked in 6 handlers + the dresser pool page + its definition); the pickup seam has the belt-and-braces gate",
+       mc.count("aMR_PcEditLocked()") == 11 and  # 6j: + 1 in aMR_PcDresserOpenRefused (the just-moved dresser open gate: no gate while locked)
+       mc.count("pc_net_game_client_room_edit_locked()") == 3 and "if (aMR_PcEditLocked() || !pc_net_game_dresser_available()" in mc
+       and "(slot_idx < 0 || pc_net_game_client_room_edit_locked())" in pks)
     ra = strip_comments(func_body(c, "pcnetgame_house_client_reconcile_apply"))
     rr = strip_comments(func_body(c, "pcnetgame_hcl_reconcile_ready"))
     rpl = strip_comments(func_body(c, "pcnetgame_hcl_reconcile_plan"))

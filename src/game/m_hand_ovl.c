@@ -1,4 +1,7 @@
 #include "m_hand_ovl.h"
+#ifdef TARGET_PC
+#include "pc_dresser_ui.h" /* 6r (B): the dresser screen's grabbed item is drawn by the hand */
+#endif
 
 #include "m_submenu_ovl.h"
 #include "m_tag_ovl.h"
@@ -844,15 +847,23 @@ extern Gfx inv_item_mode[];
 
 static void mHD_draw_item(Submenu* submenu, GRAPH* graph, f32* pos) {
     mHD_Ovl_c* hand_ovl = submenu->overlay->hand_ovl;
+    mActor_name_t held = hand_ovl->info.item;
+    u32 held_cond = hand_ovl->info.item_cond;
 
-    if (hand_ovl->info.item != EMPTY_NO &&
-        (!ITEM_IS_RSVCLOTH(hand_ovl->info.item) &&
-         !(hand_ovl->info.item >= ITM_MY_ORG_UMBRELLA0 && hand_ovl->info.item <= ITM_MY_ORG_UMBRELLA7) &&
-         !ITEM_IS_RSVNWORG(hand_ovl->info.item) && /* Needlework designs */
-         !ITEM_IS_RSVCPORG(hand_ovl->info.item) && /* Stored original designs */
-         !ITEM_IS_RSVGBAORG(hand_ovl->info.item)   /* GBA designs */
+#ifdef TARGET_PC
+    if (held == EMPTY_NO && pc_dresser_ui_active() && pc_dresser_ui_carry_item() != 0) {
+        held = (mActor_name_t)pc_dresser_ui_carry_item(); /* 6r (B): the dresser screen's grabbed item, drawn like a held item (view only) */
+        held_cond = 0;
+    }
+#endif
+    if (held != EMPTY_NO &&
+        (!ITEM_IS_RSVCLOTH(held) &&
+         !(held >= ITM_MY_ORG_UMBRELLA0 && held <= ITM_MY_ORG_UMBRELLA7) &&
+         !ITEM_IS_RSVNWORG(held) && /* Needlework designs */
+         !ITEM_IS_RSVCPORG(held) && /* Stored original designs */
+         !ITEM_IS_RSVGBAORG(held)   /* GBA designs */
          )) {
-        int present_flag = hand_ovl->info.item_cond & mPr_ITEM_COND_PRESENT;
+        int present_flag = held_cond & mPr_ITEM_COND_PRESENT;
         Gfx* gfx;
 
         /* Draw item shadow */
@@ -861,7 +872,7 @@ static void mHD_draw_item(Submenu* submenu, GRAPH* graph, f32* pos) {
         gSPDisplayList(gfx++, inv_item_shadow_mode);
         SET_POLY_OPA_DISP(gfx);
         CLOSE_DISP(graph);
-        submenu->overlay->draw_item_proc(graph, pos[0] + 4.0f, pos[1] - 4.0f, 1.0f, hand_ovl->info.item, present_flag,
+        submenu->overlay->draw_item_proc(graph, pos[0] + 4.0f, pos[1] - 4.0f, 1.0f, held, present_flag,
                                          TRUE, 0, TRUE, FALSE);
 
         /* Draw item icon */
@@ -870,7 +881,7 @@ static void mHD_draw_item(Submenu* submenu, GRAPH* graph, f32* pos) {
         gSPDisplayList(gfx++, inv_item_mode);
         SET_POLY_OPA_DISP(gfx);
         CLOSE_DISP(graph);
-        submenu->overlay->draw_item_proc(graph, pos[0], pos[1], 1.0f, hand_ovl->info.item, present_flag, TRUE, 0, FALSE,
+        submenu->overlay->draw_item_proc(graph, pos[0], pos[1], 1.0f, held, present_flag, TRUE, 0, FALSE,
                                          FALSE);
     }
 }

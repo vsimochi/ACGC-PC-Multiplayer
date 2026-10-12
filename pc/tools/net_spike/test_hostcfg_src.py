@@ -70,7 +70,11 @@ def main():
           "WITHOUT a usable save (before the pcfa_save_ready stash)",
           "svc != (int)PC_NETGAME_TS_HOSTCFG" in hd and "(uint16_t)PC_NETGAME_TS_HOSTCFG_LEN" in hd and "pcnetgame_ts_valid_hostcfg_blob(m.blob)" in hd
           and in_order(hd, ["pcnetgame_fnv1a32(m.blob, m.len) != m.digest", "m.seq == 0u", "pcnetgame_ts_valid_hostcfg_blob", "if (svc == (int)PC_NETGAME_TS_HOSTCFG) {", "if (!pcfa_save_ready())"])[0]
-          and "blob[0] > 1u" in func_body(c, "pcnetgame_ts_valid_hostcfg_blob") and "blob[i] != 0u" in func_body(c, "pcnetgame_ts_valid_hostcfg_blob"))
+          # the blob grew (house sync / personal sync flags in byte 1, shop restocking in byte 2, catalog + restock generations in bytes 3..7): byte 0 in {0,1}, byte 1 only the KNOWN flag bits
+          # (an unknown bit is refused), byte 2 in {0,1}; bytes 3..7 are generations (any value) -- the old "all reserved bytes zero" rule no longer exists
+          and "blob[0] > 1u" in func_body(c, "pcnetgame_ts_valid_hostcfg_blob")
+          and "(blob[1] & ~(uint8_t)(PC_NETGAME_HOSTCFG_FLAG_HOUSE_SYNC | PC_NETGAME_HOSTCFG_FLAG_PERSONAL_SYNC)) != 0u" in func_body(c, "pcnetgame_ts_valid_hostcfg_blob")
+          and "blob[2] > 1u" in func_body(c, "pcnetgame_ts_valid_hostcfg_blob"))
     check("A1 client: a client-originated TOWN_SVC_STATE is still dropped by the host (unchanged), the READY gate is the first check of the client handler",
           "client-originated TOWN_SVC_STATE" in c and hd.lstrip().startswith("PCNetGameTownSvcStateMsg m;") and "s_client_link != PC_NETGAME_LINK_READY" in hd[:300])
     gate = func_body(c, "pcnetgame_wildlife_auth_on")
@@ -135,11 +139,11 @@ def main():
     check("A3 draw: the existing PC font overlay path only (pc_menu_draw_centered inside mFont_SetMatrix / UnSetMatrix, like the pause overlay), no-op while paused / no graph (G6.1: the join-failure message is drawn first, in the same path, and returns; the not-connected notice is unchanged); "
           "called from graph_main right after pc_pause_menu_draw, under TARGET_PC",
           "if (g_pc_paused || game == NULL || game->graph == NULL) return;" in dr and "if (!pc_net_game_client_notice_visible()) return;" in dr
-          and dr.index("pc_net_game_join_message(&join_warning)") < dr.index("if (!pc_net_game_client_notice_visible()) return;") and dr.count("pc_menu_draw_centered(") == 2
+          and dr.index("pc_net_game_join_message(&join_warning)") < dr.index("if (!pc_net_game_client_notice_visible()) return;") and dr.count("pc_menu_draw_centered(") >= 2  # (the two not-connected lines + later: the house edit-lock notice and the reconnect status lines, all through the same overlay path)
           and "mFont_SetMatrix(game->graph, mFont_MODE_FONT);" in dr and "mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);" in dr
           and "void pc_net_notice_draw(struct game_s* game);" in pmh
           and gr.index("pc_pause_menu_draw(game);") < gr.index("pc_net_notice_draw(game);") and gr.count("pc_net_notice_draw(game);") == 1
-          and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None)
+          and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n(?:    pc_tool_wheel_draw\(game\);[^\n]*\n)?    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None)  # (the PC radial tool menu draw may sit between the two)
     return L.summary_and_exit_code(results)
 
 

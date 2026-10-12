@@ -269,7 +269,10 @@ def main():
     eol = git("ls-files", "--eol", "pc/src/pc_main.c", "pc/src/pc_net_game.c", "pc/src/pc_m_card.c", "src/game/m_field_info.c", "pc/src/pc_wildlife_authority.c")
     for rel in ("pc/src/pc_main.c", "pc/src/pc_net_game.c", "pc/src/pc_m_card.c", "src/game/m_field_info.c"):
         raw = open(os.path.join(ROOT, rel.replace("/", os.sep)), "rb").read()
-        ck("B1 %s stays all-CRLF (matches git ls-files --eol w/crlf)" % rel, raw.count(b"\n") == raw.count(b"\r\n") and "w/crlf" in [l for l in eol.splitlines() if rel in l][0])
+        # the working-tree EOL is a checkout convention (git stores LF, core.autocrlf): some files are all-LF, others all-CRLF in the worktree. The invariant is "never MIXED" and git's own view agrees.
+        eol_line = [l for l in eol.splitlines() if rel in l][0]
+        ck("B1 %s keeps ONE line ending (all-CRLF or all-LF, never mixed; git ls-files --eol agrees)" % rel,
+           (raw.count(b"\n") == raw.count(b"\r\n") and "w/crlf" in eol_line) or (raw.count(b"\r") == 0 and "w/lf" in eol_line))
     raw = open(os.path.join(ROOT, "pc", "src", "pc_wildlife_authority.c"), "rb").read()
     ck("B1 pc_wildlife_authority.c stays all-LF", b"\r" not in raw)
 

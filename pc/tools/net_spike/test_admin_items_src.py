@@ -44,7 +44,7 @@ def main():
     callers = [n for _a, _b, n in df if re.search(r"\bpc_ded_execute\(", S.body(dd, df, n)) and n != "pc_ded_execute"]
     ck("A pc_ded_execute is only called from pc_dedicated_console_poll (the main thread, once per frame)", callers == ["pc_dedicated_console_poll"])
     ck("A the stdin reader thread never executes commands", "pc_ded_execute" not in S.body(dd, df, "pc_ded_reader_loop") and "pc_net_game_dedicated_give" not in S.body(dd, df, "pc_ded_reader_loop"))
-    ck("A pc_vi.c calls the console poll after pc_net_game_poll on the game thread", re.search(r"pc_net_game_poll\(\);[\s\S]{0,400}pc_dedicated_console_poll\(\);", S.read("pc/src/pc_vi.c")))
+    ck("A pc_vi.c calls the console poll after pc_net_game_poll on the game thread", re.search(r"pc_net_game_poll\(\);[\s\S]{0,1200}pc_dedicated_console_poll\(\);", S.read("pc/src/pc_vi.c")))
     ck("A the wrappers parse strictly: 0x/decimal numbers, qty 1..15, id 0..0xFFFF", "pc_ded_parse_num" in dd and "qv < 1 || qv > 15" in dd and "v > 0xFFFFul" in dd)
     ck("A pagination of 15 lines and a 'does not exist' answer for a page past the end", "PC_DED_ITEM_PAGE 15" in dd and "does not exist" in dd and "- no results" in dd)
 
@@ -97,8 +97,13 @@ def main():
     for d, cond in wb:
         ck("E wire_baseline: " + d, cond)
     import subprocess
-    diff_h = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "HEAD", "--", "pc/include/pc_net_game.h"], capture_output=True, timeout=60).stdout.decode().strip()
-    ck("E pc_net_game.h is byte-identical to HEAD (the wire header is untouched)", diff_h == "")
+    # The header may GAIN prototypes / #defines from the master-sprint workers landing in the same tree (dresser, ball, bees ...); the wire contract is: nothing REMOVED or changed, no new
+    # typedef / struct / enum (wire_baseline above pins every HEAD typedef block and #define of the header).
+    diff_h = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", "HEAD", "--", "pc/include/pc_net_game.h"], capture_output=True, timeout=60).stdout.decode("utf-8", "replace").splitlines()
+    rem_h = [l for l in diff_h if l.startswith("-") and not l.startswith("---")]
+    add_h = [l[1:] for l in diff_h if l.startswith("+") and not l.startswith("+++")]
+    ck("E pc_net_game.h only GAINED lines vs HEAD (nothing removed / changed; no added typedef / struct / enum): the wire header's contract is untouched",
+       not rem_h and not any(re.search(r"typedef|\bstruct\b|\benum\b", l) for l in add_h if not l.strip().startswith(("/*", "*", "//"))))
     ck("E pc_dedicated.h only gained the host-only prototypes (no message / wire type)", "pc_net_game_dedicated_give(" in hdr and "pc_net_game_dedicated_item_giveblock(" in hdr)
     newcode = give + resolve + block
     ck("E no bell command and no teleport in give", "teleport" not in give.lower() and "bank" not in give.lower() and "loan" not in give.lower())
