@@ -49,6 +49,7 @@
 #include "m_player_lib.h"
 #include "ac_birth_control.h"
 #include "m_shop.h"           /* host shop-renewal reload (pc_host_renewshop_poll) */
+#include "pc_shop_upgrade.h" /* the announced shop upgrade gates the vanilla due-renewal reload */
 #include "m_field_info.h"
 #include "m_collision_bg.h"
 /* OBSERVER-END */
@@ -2627,6 +2628,9 @@ static void pc_host_renewshop_poll(void) {
     if (mEv_CheckEvent(mEv_SAVED_RENEWSHOP) != TRUE) {
         return;
     }
+    if (!pc_shop_upgrade_vanilla_renewal_allowed()) {
+        return; /* the announced shop upgrade replaces the vanilla schedule: only ITS renewal (RENEWING) may reload here; a stale vanilla state is taken over by it */
+    }
     renew_time = Save_Get(shop).renewal_time;
     now_time = Common_Get(time.rtc_time);
     if (!(lbRTC_IsOverTime(&renew_time, &now_time) == lbRTC_OVER ||
@@ -2678,6 +2682,94 @@ static void pc_host_renewshop_poll(void) {
         l_have_key = 1;
         l_verify = 1;
     }
+}
+
+/* Multiplayer shop upgrade (pc_shop_upgrade.h), CLIENT side of the reopening: a client standing in the town while the host renewed the shop still has the OLD shop structure
+ * actor; at its teardown restore_fgdata() would write the OLD structure tile (its npc_id) back into the field, and the old building / door stay until a town load.
+ * pc_town_shop_structure_patch(level): the live shop structure actor (npc_id SHOP0..SHOP3, the actor that put DUMMY_SHOPn on its tile) gets npc_id SHOP0 + level, so the teardown
+ * restores the NEW tile. Returns the number of actors patched (0 = none: not in the town scene). */
+int pc_town_shop_structure_patch(int level) {
+    GAME_PLAY* play;
+    ACTOR* actor;
+    int part, n = 0;
+    if (gamePT == NULL || gamePT->exec != play_main || level < 0 || level > 3) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    for (part = 0; part < ACTOR_PART_NUM; part++) {
+        for (actor = play->actor_info.list[part].actor; actor != NULL; actor = actor->next_actor) {
+            if (actor->npc_id >= SHOP0 && actor->npc_id <= SHOP3) {
+                if (actor->npc_id != (mActor_name_t)(SHOP0 + level)) {
+                    printf("[NET][SHOPUP] client: the live shop structure actor (0x%04X) will restore 0x%04X at its teardown\n", (unsigned)actor->npc_id, (unsigned)(SHOP0 + level));
+                    actor->npc_id = (mActor_name_t)(SHOP0 + level);
+                }
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* The unit of the live shop structure actor (npc_id SHOP0..SHOP3): while the town scene is loaded the structure tile itself holds RSV_NO (ac_structure_clip setup) or
+ * DUMMY_SHOPn (the actor's init), and the actor restores its npc_id at its home position. 1 = found (block bx / bz, unit index uz * 16 + ux). */
+int pc_town_shop_structure_unit(int* bx, int* bz, int* tile) {
+    GAME_PLAY* play;
+    ACTOR* actor;
+    int part, ux, uz;
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    for (part = 0; part < ACTOR_PART_NUM; part++) {
+        for (actor = play->actor_info.list[part].actor; actor != NULL; actor = actor->next_actor) {
+            if (actor->npc_id >= SHOP0 && actor->npc_id <= SHOP3 && mFI_Wpos2BkandUtNuminBlock(bx, bz, &ux, &uz, actor->home.position)) {
+                *tile = uz * UT_X_NUM + ux;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* The same-position SCENE_FG reload of pc_host_renewshop_poll for any role (the shop upgrade's client refresh): only in the town scene, no transition, the local player idle (no menu,
+ * no talk, no demo). 1 = the reload started, 0 = not now (retry later), -1 = not in the town scene (nothing to refresh). */
+int pc_town_same_position_reload(const char* why) {
+    GAME_PLAY* play;
+    PLAYER_ACTOR* pl;
+    Door_data_c door;
+    xyz_t pos;
+    int res;
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE || play->fb_fade_type != FADE_TYPE_NONE || !Common_Get(player_actor_exists)) {
+        return 0;
+    }
+    if (play->scene_id != SCENE_FG || Save_Get(scene_no) != SCENE_FG || mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELD_FG) {
+        return -1;
+    }
+    pl = GET_PLAYER_ACTOR_NOW();
+    if (pl == NULL || play->submenu.process_status != mSM_PROCESS_WAIT || mDemo_CheckDemo() != FALSE ||
+        (!pc_host_observer_active() && !mPlib_able_submenu_type1((GAME*)play))) {
+        return 0;
+    }
+    pos = pl->actor_class.world.position;
+    memset(&door, 0, sizeof(door));
+    door.next_scene_id = SCENE_FG;
+    door.exit_orientation = mSc_DIRECT_SOUTH;
+    door.exit_type = 0;
+    door.extra_data = 0;
+    door.exit_position.x = (s16)pos.x;
+    door.exit_position.y = (s16)mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
+    door.exit_position.z = (s16)pos.z;
+    door.door_actor_name = EMPTY_NO;
+    door.wipe_type = WIPE_TYPE_FADE_BLACK;
+    Common_Set(demo_profiles[0], mAc_PROFILE_NUM); /* never replay a demo (train arrival) on the reload */
+    Common_Set(demo_profiles[1], mAc_PROFILE_NUM);
+    res = goto_other_scene(play, &door, TRUE);
+    printf("[NET][SHOPUP] %s: same-position SCENE_FG reload (%s): res=%d\n", pc_net_game_role() == PC_NETGAME_ROLE_HOST ? "host" : "client", why, res);
+    return res == 1 ? 1 : 0;
 }
 
 void pc_host_observer_poll(void) {

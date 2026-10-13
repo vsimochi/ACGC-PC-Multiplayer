@@ -15,6 +15,7 @@
 #ifdef TARGET_PC
 #include "pc_settings.h"
 #include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#include "pc_shop_upgrade.h" /* multiplayer: the announced 5-minute shop upgrade closure (host state / client mirror) */
 #endif
 
 extern mActor_name_t* mSP_ftr_list[];
@@ -1773,6 +1774,10 @@ extern lbRTC_hour_t mSP_GetShopCloseTime_Bgm() {
 
 extern int mSP_InRenewal() {
 #ifdef TARGET_PC
+    /* Multiplayer shop upgrade: the announced closure (host: its own state, client: the host's mirrored service 6). 0 in single player / feature off / an old host. */
+    if (pc_shop_upgrade_closed()) {
+        return TRUE;
+    }
     /* Stage 0 safe degrade: a client no longer runs aSL_RenewShop, so it would never leave the "in renewal" window if
      * its save copy had mEv_SAVED_RENEWSHOP set; report "not in renewal" so its shop is never closed forever. */
     if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
@@ -1802,6 +1807,13 @@ extern int mSP_ShopOpen() {
     lbRTC_time_c rtc_time = Common_Get(time.rtc_time);
     lbRTC_hour_t now_hour;
 
+#ifdef TARGET_PC
+    /* Multiplayer shop upgrade: closed for EVERYBODY while the announced 5-minute upgrade runs -- before the first-job override (a player doing the chores would otherwise
+     * walk in and be shown out again by the shop interior) and before the sale-event branch (which would otherwise ignore a renewal). 0 in single player / feature off. */
+    if (pc_shop_upgrade_closed()) {
+        return mSP_SHOP_STATUS_RENEW;
+    }
+#endif
     if (mEv_CheckFirstJob()) {
         return mSP_SHOP_STATUS_OPEN; // shop is forcefully open during chores
     }

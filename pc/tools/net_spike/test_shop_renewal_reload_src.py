@@ -56,6 +56,11 @@ def main():
     po = re.search(r"void pc_host_observer_poll\(void\) \{(.*?)\n\}\n", mc, re.S).group(1)
     ck("R7 polled every frame from pc_host_observer_poll BEFORE its observer-flag early return (also covers a listen host)",
        "pc_host_renewshop_poll();" in po and po.index("pc_host_renewshop_poll();") < po.index("if (!g_pc_host_observer"))
+    # the announced shop upgrade (deliberate addition): with AC_MP_SHOP_UPGRADE on (default) a due VANILLA renewal state is not performed here unless the upgrade itself armed it
+    # (RENEWING); a stale vanilla schedule is taken over by the upgrade (Nook announces first). With the switch off this poll is unchanged.
+    ck("R8 the reload is gated by pc_shop_upgrade_vanilla_renewal_allowed() right after the event test (switch off / the upgrade's own RENEWING only)",
+       "if (!pc_shop_upgrade_vanilla_renewal_allowed()) {\n        return;" in prod and prod.index("mEv_CheckEvent(mEv_SAVED_RENEWSHOP) != TRUE") < prod.index("pc_shop_upgrade_vanilla_renewal_allowed()")
+       < prod.index("renew_time = Save_Get(shop).renewal_time;"))
     print("\n%d/%d passed" % (sum(res), len(res)))
     return 0 if all(res) else 1
 

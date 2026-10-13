@@ -474,6 +474,8 @@ static void Shop_Indoor_Actor_draw(ACTOR* actorx, GAME* game) {
  * display shows the old catalog), never in the middle of it. The forced exit of a busy player (a stuck state) applies only while the shop is STILL closed and only after
  * aSI_PC_EJECT_HARD_CAP frames of waiting (far beyond the 60 s restock); a busy player is never forced out once the restock is over. Reset when a shop room is built. */
 extern int pc_net_game_shop_restocking(void);
+/* Multiplayer shop upgrade (pc_shop_upgrade.h): the announced 5-minute closure shows everyone out the same way (the announcing player once Nook's talk is over). */
+extern int pc_shop_upgrade_closed(void);
 #define aSI_PC_EJECT_HARD_CAP 18000
 static int aSI_pc_eject_wait = 0;
 static int aSI_pc_eject_pending = 0;
@@ -483,7 +485,7 @@ static void aSI_pc_restock_eject_reset(void) {
 }
 static void aSI_pc_restock_eject(GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
-    const int restocking = pc_net_game_shop_restocking();
+    const int restocking = pc_net_game_shop_restocking() || pc_shop_upgrade_closed(); /* closed for a restock OR for the upgrade */
     int busy;
 
     if (restocking) {
@@ -515,7 +517,8 @@ static void aSI_pc_restock_eject(GAME* game) {
         return; /* no valid way out was recorded (a door always writes it): never warp into scene 0; keep waiting */
     }
     if (goto_other_scene(play, Common_GetPointer(structure_exit_door_data), FALSE)) {
-        printf("[NET][RESTOCK] shop %s: the player was shown out (waited %d frames%s)\n", restocking ? "restocking" : "restocked while talking", aSI_pc_eject_wait,
+        printf("[NET][RESTOCK] shop %s: the player was shown out (waited %d frames%s)\n",
+               !restocking ? "restocked while talking" : pc_shop_upgrade_closed() ? "closed for the upgrade" : "restocking", aSI_pc_eject_wait,
                busy ? ", FORCED after the hard cap" : "");
         aSI_pc_eject_pending = 0;
     }

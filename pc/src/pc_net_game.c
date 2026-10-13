@@ -151,6 +151,7 @@ static uint32_t s_ac_result_entity; /* TEST-ONLY auto-catch: the last catch outc
 static int      s_ac_result;        /* 1 accepted, 2 rejected */
 #endif
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the dialogue-side helpers defined near the house purchase seam */
+#include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the announced 5-minute closure (SHOP UPGRADE block at the end of this file) */
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
 #include "pc_adopt_clock.h" /* client record-adoption watchdog clock (scene lifecycle time does not count towards the 10 s) */
 #include "pc_log.h" /* category-based PC_LOG()/PC_LOG_RL() lines (new, [CAT]-prefixed; every pre-existing printf is untouched) */
@@ -559,6 +560,9 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_DRESSER_QUERY         = 84, /* dresser storage: client -> host ONLY, RELIABLE, 8 bytes: "send me my pool". An old host ignores it (no answer = no feature). See PCNetGameDresserQueryMsg. */
     PC_NETGAME_MSG_BALL_STATE            = 79, /* soccer ball / basketball (ac_ball.c) host-authoritative snapshot, host -> READY clients in the town field, UNRELIABLE, 32 bytes, ~10 Hz moving / 1 Hz resting. See PCBallStateMsg / pc_ball_authority.h. */
     PC_NETGAME_MSG_BALL_KICK_REQUEST     = 80, /* client -> host ONLY, RELIABLE, 24 bytes: "my player touched the ball here at this xz speed"; the host validates and runs the vanilla impulse on its ball. See PCBallKickMsg. */
+    PC_NETGAME_MSG_SHOP_UPGRADE_REQ      = 85, /* multiplayer shop upgrade (v8 unreleased: extended in place, NO version bump), client -> host ONLY, RELIABLE, 8 bytes: "Nook just announced upgrade
+                                             * <gen> to my player inside the shop: close the shop". The answer is town service 6 (SHOP_UPGRADE). An old host ignores the unknown id (the dialogue
+                                             * falls back after its timeout). See PCNetGameShopUpgradeReqMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2685,12 +2689,16 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_TS_SHOP     3u   /* milestone 2: Save_t.shop, the 320 raw bytes of Shop_c (little-endian PC image, host == client build) */
 #define PC_NETGAME_TS_HOSTCFG  4u   /* batch A (A1): HOST_CONFIG, the host's session configuration (NOT a Save_t region): blob = u8 authoritative_wildlife (0/1) + 7 reserved zero bytes */
 #define PC_NETGAME_TS_EVENT    5u   /* events: the host's special event / visitor / weekly event decision state (a SUBSET of Save_t.event_save_data + event_save_common, see the EVENTS block) */
-#define PC_NETGAME_TS_NUM      6u   /* array bound: services 1..5 named (index 0 unused), 6+ reserved */
+#define PC_NETGAME_TS_UPGRADE  6u   /* multiplayer shop upgrade (pc_shop_upgrade.h): the host's upgrade state machine, NOT a save region. 16 bytes: u8 state (0 IDLE, 1 PENDING, 2 CLOSED,
+                                     * 3 RENEWING), u8 from_level, u8 target_level, u8 flags (bit 0 = the feature is on), u32 generation (LE), u16 minutes of the closure left (rounded up),
+                                     * u16 closure length in seconds, 4 reserved zero bytes. An old client ignores the unknown service. */
+#define PC_NETGAME_TS_NUM      7u   /* array bound: services 1..6 named (index 0 unused), 7+ reserved */
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
 #define PC_NETGAME_TS_MUSEUM_LEN 63u
 #define PC_NETGAME_TS_SHOP_LEN   320u
 #define PC_NETGAME_TS_HOSTCFG_LEN 8u
+#define PC_NETGAME_TS_UPGRADE_LEN 16u
 #define PC_NETGAME_TS_EVENT_LEN 214u /* 84 (mEv_special_c) + 100 (mEv_weekly_u) + 30 (decision fields of event_save_common + event_year) */
 typedef struct PCNetGameTownSvcStateMsg {
     uint8_t  msg_type;   /* PC_NETGAME_MSG_TOWN_SVC_STATE */
@@ -5238,6 +5246,17 @@ typedef struct PCNetGameShopPreviewMsg {
     uint16_t rsv;      /* 0 */
 } PCNetGameShopPreviewMsg;
 _Static_assert(sizeof(PCNetGameShopPreviewMsg) == 10, "PCNetGameShopPreviewMsg is a fixed 10-byte wire struct");
+
+/* ---- Multiplayer shop upgrade (PC_NETGAME_MSG_SHOP_UPGRADE_REQ, client -> host): see the SHOP UPGRADE block at the end of this file ---- */
+typedef struct PCNetGameShopUpgradeReqMsg {
+    uint8_t  msg_type;     /* PC_NETGAME_MSG_SHOP_UPGRADE_REQ */
+    uint8_t  op;           /* 1 = START the announced closure */
+    uint8_t  target_level; /* the target shop level of service 6 the client saw */
+    uint8_t  _rsv0;        /* 0 */
+    uint32_t gen;          /* the upgrade generation of service 6 the client saw (a stale one never starts anything) */
+} PCNetGameShopUpgradeReqMsg;
+_Static_assert(sizeof(PCNetGameShopUpgradeReqMsg) == 8, "PCNetGameShopUpgradeReqMsg is a fixed 8-byte wire struct");
+_Static_assert(sizeof(PCNetGameShopUpgradeReqMsg) <= PC_NET_MAX_PAYLOAD, "PCNetGameShopUpgradeReqMsg exceeds PC_NET_MAX_PAYLOAD");
 
 extern int aSI_pc_apply_remote_preview(int kind, uint16_t item); /* ac_shop_indoor.c: runs the clip proc with the sound muted; 0 when there is no shop room live */
 static uint8_t s_shop_prev_scene[PC_NETGAME_WIRE_ID_SPACE]; /* host: the shop scene each origin id is currently previewing in (0 = none) */
@@ -19460,6 +19479,27 @@ static int pcnetgame_restock_start(const char* who);
 static void pcnetgame_restock_finish(const char* why);
 static void pcnetgame_restock_host_tick(uint32_t now);
 
+/* Multiplayer shop upgrade (pc_shop_upgrade.h): the state of the SHOP UPGRADE block at the end of this file. HOST: state / levels / generation / the deadline (host monotonic
+ * end_tick; end_wall_ms only for the restart file). CLIENT: c_* = the last service 6, req_* = the start request in flight, c_refresh_* = the town refresh after a reopening. */
+static struct {
+    int      loaded, state, from_level, target_level, failed_target, reload_tries;
+    uint32_t gen, end_tick, total_ms, renew_since, event_armed_ms;
+    uint64_t end_wall_ms;
+    int      c_have, c_enabled, c_state, c_from, c_target, c_total_s, c_refresh_level;
+    uint32_t c_gen, c_min_left, c_refresh_since, c_verify_ms;
+    int      req_active;
+    uint32_t req_gen, req_ms;
+    int      notice_kind, notice_minutes;
+    uint32_t notice_until;
+} s_up = { 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1 };
+static void pcnetgame_ts_build_upgrade(uint8_t* blob);
+static int pcnetgame_ts_valid_upgrade_blob(const uint8_t* blob);
+static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob);
+static void pcnetgame_shopup_host_tick(uint32_t now);
+static void pcnetgame_shopup_client_tick(void);
+static void pcnetgame_shopup_client_reset(void);
+static void pcnetgame_handle_host_shopup_req(PCNetPeerId peer, const PCNetGameShopUpgradeReqMsg* m);
+
 /* 1 while Nook's shop is restocking (HOST: the real state, CLIENT: the last HOST_CONFIG). Read by mSP_ShopOpen() and the shop interior (ejection). */
 int pc_net_game_shop_restocking(void) {
     if (s_role == PC_NETGAME_ROLE_HOST) {
@@ -19473,7 +19513,7 @@ int pc_net_game_shop_restocking(void) {
 
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
-           : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : "?";
+           : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : svc == (int)PC_NETGAME_TS_UPGRADE ? "SHOP_UPGRADE" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -19519,6 +19559,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
     if (svc == (int)PC_NETGAME_TS_EVENT) {
         pcnetgame_ts_build_event(blob);
         *len = (uint16_t)PC_NETGAME_TS_EVENT_LEN;
+        return 1;
+    }
+    if (svc == (int)PC_NETGAME_TS_UPGRADE) {
+        pcnetgame_ts_build_upgrade(blob); /* multiplayer shop upgrade: the host's state machine (a session state, not a save region) */
+        *len = (uint16_t)PC_NETGAME_TS_UPGRADE_LEN;
         return 1;
     }
     return 0;
@@ -19578,6 +19623,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVENT);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_UPGRADE);
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -19605,7 +19651,7 @@ static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
     if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    for (svc = (int)PC_NETGAME_TS_POLICE; svc <= (int)PC_NETGAME_TS_EVENT; svc++) {
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc < (int)PC_NETGAME_TS_NUM; svc++) { /* 1..6 (6 = SHOP_UPGRADE) */
         PCNetGameHostPeerState* st = &s_host_peer[peer];
         if (s_ts_host[svc].valid && st->ts_sent_seq[svc] != s_ts_host[svc].seq) {
             if (pcnetgame_ts_send_to_peer(peer, svc)) {
@@ -19785,6 +19831,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_world_test_force();
     pcnetgame_world_test_poke_event();
     pcnetgame_restock_host_tick(now);
+    pcnetgame_shopup_host_tick(now); /* multiplayer shop upgrade: qualification, the closure timer, the renewal (inert with the feature off) */
     if ((uint32_t)(now - s_ts_next_check_ms) >= PC_NETGAME_TS_CHECK_MS || !s_ts_host[PC_NETGAME_TS_POLICE].valid) {
         s_ts_next_check_ms = now;
         pcnetgame_ts_refresh_all();
@@ -20308,6 +20355,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
         if (s_restock.active) {
             fail = "the shop is already restocking";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_RESTOCKING;
+        } else if (pc_shop_upgrade_closed()) {
+            fail = "the shop is closed for its upgrade (nothing charged)";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
         } else if ((uint32_t)t->aux_item != PC_NETGAME_RESTOCK_PRICE) {
             fail = "the client's expected price differs from the host price";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRICE_MISMATCH;
@@ -20332,6 +20382,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
             if (s_restock.active || shop_status == mSP_SHOP_STATUS_RESTOCK) {
                 fail = "the shop is closed for a restock";
                 fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_RESTOCKING;
+            } else if (pc_shop_upgrade_closed()) {
+                fail = "the shop is closed for its upgrade (announced 5-minute closure)";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
             } else if (shop_status != mSP_SHOP_STATUS_OPEN && shop_status != mSP_SHOP_STATUS_OPENEVENT) {
                 fail = "the shop is closed";
                 fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
@@ -20351,6 +20404,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
                 post[t->slot] = t->item;
                 post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
             }
+        } else if (pc_shop_upgrade_closed()) {
+            fail = "the shop is closed for its upgrade (announced 5-minute closure)";
+            fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
         } else {
             fail_reason = pcnetgame_shop_sell_plan(t->pre_pockets, t->pre_conds, t->pre_wallet, t->aux_item, post, &post_conds, &post_wallet, &sell_value, &fail);
             if (fail_reason != 0) {
@@ -27424,14 +27480,15 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     memcpy(&m, data, size);
     svc = (int)m.service;
     if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG &&
-        svc != (int)PC_NETGAME_TS_EVENT) {
+        svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
     expect = (svc == (int)PC_NETGAME_TS_POLICE) ? (uint16_t)PC_NETGAME_TS_POLICE_LEN
              : (svc == (int)PC_NETGAME_TS_SHOP) ? (uint16_t)PC_NETGAME_TS_SHOP_LEN
              : (svc == (int)PC_NETGAME_TS_HOSTCFG) ? (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN
-             : (svc == (int)PC_NETGAME_TS_EVENT) ? (uint16_t)PC_NETGAME_TS_EVENT_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_EVENT) ? (uint16_t)PC_NETGAME_TS_EVENT_LEN
+             : (svc == (int)PC_NETGAME_TS_UPGRADE) ? (uint16_t)PC_NETGAME_TS_UPGRADE_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -27450,10 +27507,18 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     if (!(svc == (int)PC_NETGAME_TS_POLICE ? pcnetgame_ts_valid_police_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_SHOP ? pcnetgame_ts_valid_shop_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_HOSTCFG ? pcnetgame_ts_valid_hostcfg_blob(m.blob)
-          : svc == (int)PC_NETGAME_TS_EVENT ? pcnetgame_ts_valid_event_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_EVENT ? pcnetgame_ts_valid_event_blob(m.blob)
+          : svc == (int)PC_NETGAME_TS_UPGRADE ? pcnetgame_ts_valid_upgrade_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
                svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
-               : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : "museum");
+               : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : svc == (int)PC_NETGAME_TS_UPGRADE ? "shop upgrade" : "museum");
+        return;
+    }
+    if (svc == (int)PC_NETGAME_TS_UPGRADE) {
+        pcnetgame_ts_client_apply_upgrade(m.blob); /* a session state, not a save region: no usable save needed */
+        s_ts_client_seq[svc] = m.seq;
+        s_ts_client_have[svc] = 1;
+        printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq, (unsigned)m.digest, (unsigned)m.len);
         return;
     }
     if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
@@ -28473,6 +28538,9 @@ int pc_net_game_restock_precheck(void) {
     }
     if (pc_net_game_shop_restocking()) {
         return (int)PC_NETGAME_TXN_REASON_RESTOCKING;
+    }
+    if (pc_shop_upgrade_closed()) {
+        return (int)PC_NETGAME_TXN_REASON_NOT_AVAILABLE; /* multiplayer shop upgrade: closed for the upgrade (nothing charged) */
     }
     if (Now_Private->inventory.wallet < PC_NETGAME_RESTOCK_PRICE) {
         return (int)PC_NETGAME_TXN_REASON_NO_FUNDS;
@@ -31606,6 +31674,12 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         pcnetgame_handle_host_dresser_query(peer, &dq); /* dresser storage (agent 12): answered only with the feature ON */
         return;
     }
+    if (size == sizeof(PCNetGameShopUpgradeReqMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_SHOP_UPGRADE_REQ) {
+        PCNetGameShopUpgradeReqMsg ur;
+        memcpy(&ur, data, sizeof(ur));
+        pcnetgame_handle_host_shopup_req(peer, &ur); /* multiplayer shop upgrade: the first valid request starts the announced closure; the answer is service 6 */
+        return;
+    }
 
     if (data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION) {
         /* M9-C: PLAYER_ACTION is host -> client only; a client never originates it. Dropped, never relayed. */
@@ -32773,6 +32847,7 @@ static void pcnetgame_reset_client_session_state(void) {
     s_mbox_host_fed = 0;
     memset(s_ts_client_have, 0, sizeof(s_ts_client_have));
     s_restock.client_active = 0; /* the shop mirror is host-fed: the next HOST_CONFIG (at READY) says whether a restock is still running */
+    pcnetgame_shopup_client_reset(); /* the shop upgrade mirror is host-fed too: service 6 comes again at READY */
     memset(s_ts_client_stash_valid, 0, sizeof(s_ts_client_stash_valid));
     memset(s_field_action_queue, 0, sizeof(s_field_action_queue)); /* T0-C: whole queue, not one slot */
     s_field_action_queue_len = 0;
@@ -36029,6 +36104,7 @@ void pc_net_game_poll(void) {
     /* Town services: apply a mirror message that arrived before the local save was usable, then the TEST-ONLY real-client hooks
      * (--ts-test-donate / --ts-test-claim; complete no-ops by default, client role only). */
     pcnetgame_ts_client_tick();
+    pcnetgame_shopup_client_tick(); /* multiplayer shop upgrade: the town refresh after a reopening (client role only) */
     pcnetgame_mbox_client_tick(); /* mail milestone 2: stashed MAILBOX_LETTERs, and the shadow revert */
     pcnetgame_run_ts_test_hook();
     pcnetgame_run_shop_test_hook(); /* shop milestone: --shop-test-buy / --shop-test-sell (client role, default OFF) */
@@ -42044,3 +42120,784 @@ void pc_net_game_dedicated_announce(int peer, int what) {
         pc_dedicated_say_detail("peer %d disconnected", peer);
     }
 }
+
+/* ===== SHOP UPGRADE BEGIN: the announced 5-minute shop upgrade (multiplayer; pc_shop_upgrade.h, docs "Shop upgrade: announced 5-minute closure") =====
+ * HOST: the state machine IDLE -> PENDING -> CLOSED -> RENEWING -> IDLE (see pc_shop_upgrade.h), its restart file (shop_upgrade.ini next to shop_restock.ini: written before the
+ * closure is published, atomically replaced, removed after the renewal was saved), the renewal (the vanilla body: through a town reload when the host is in the town scene, directly
+ * on the save otherwise) and its publication (the shop acre from the host shadow, the SHOP / POLICE mirrors, service 6). CLIENT: the mirror of service 6, the start request
+ * (SHOP_UPGRADE_REQ), the town refresh after the reopening, the notices. Every entry point is inert unless the role is HOST / a READY CLIENT and the feature is on. */
+#include "m_random_field_h.h" /* mRF_BLOCKKIND_SHOP */
+#ifdef _WIN32
+#include <io.h> /* _commit: the restart file reaches the disk before the closure is published */
+#endif
+extern int aSL_PC_RenewShopDirect(void);
+extern int aSL_PC_ShopFootprint(int level, int* acre, int* struct_tile, int* tiles, int cap);
+extern int pc_town_shop_structure_patch(int level);   /* pc_m_card.c */
+extern int pc_town_same_position_reload(const char* why); /* pc_m_card.c */
+extern int pc_save_write_authoritative_durable(void);  /* pc_m_card.c */
+
+#define PCNG_SHOPUP_REQ_TIMEOUT_MS 5000u
+#define PCNG_SHOPUP_NOTICE_MS 8000u
+#define PCNG_SHOPUP_RELOAD_RETRY_MS 15000u
+#define PCNG_SHOPUP_RELOAD_TRIES 3
+
+static int pcnetgame_shopup_ieq(const char* a, const char* b) {
+    for (; *a != '\0' && *b != '\0'; a++, b++) {
+        if ((*a | 0x20) != (*b | 0x20)) {
+            return 0;
+        }
+    }
+    return *a == *b;
+}
+
+static int pcnetgame_shopup_enabled(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("AC_MP_SHOP_UPGRADE");
+        s_on = !(e != NULL && (strcmp(e, "0") == 0 || pcnetgame_shopup_ieq(e, "off") || pcnetgame_shopup_ieq(e, "false")));
+        printf("[NET][SHOPUP] announced 5-minute shop upgrade: %s%s\n", s_on ? "ON" : "OFF (the vanilla 2-day renewal schedule)", (e != NULL && e[0] != '\0') ? " (AC_MP_SHOP_UPGRADE)" : " (default)");
+    }
+    return s_on;
+}
+
+static uint32_t pcnetgame_shopup_total_ms(void) {
+    static long s_total = -1;
+    if (s_total < 0) {
+        s_total = (long)PC_SHOP_UPGRADE_SECONDS;
+        {
+            /* TEST-ONLY (PC_TEST_HOOKS build + AC_TEST_HOOKS=1): a shorter / longer closure so the tests do not wait 5 minutes; production is always PC_SHOP_UPGRADE_SECONDS */
+            const char* e = pc_test_hook_getenv("AC_TEST_SHOP_UPGRADE_SECONDS");
+            if (e != NULL) {
+                const long v = strtol(e, NULL, 10);
+                if (v >= 5 && v <= 3600) {
+                    s_total = v;
+                    printf("[NET][SHOPUP][TEST-ONLY] AC_TEST_SHOP_UPGRADE_SECONDS=%ld: the closure lasts %ld s instead of %d (NOT active in normal play)\n", v, v, PC_SHOP_UPGRADE_SECONDS);
+                }
+            }
+        }
+    }
+    return (uint32_t)s_total * 1000u;
+}
+
+static const char* pcnetgame_shopup_state_name(int st) {
+    return st == PC_SHOP_UPGRADE_IDLE ? "IDLE" : st == PC_SHOP_UPGRADE_PENDING ? "PENDING" : st == PC_SHOP_UPGRADE_CLOSED ? "CLOSED" : st == PC_SHOP_UPGRADE_RENEWING ? "RENEWING" : "?";
+}
+
+static const char* pcnetgame_shopup_level_name(int lvl) {
+    static const char* names[] = { "Nook's Cranny", "Nook 'n' Go", "Nookway", "Nookington's" };
+    return (lvl >= 0 && lvl <= 3) ? names[lvl] : "?";
+}
+
+static int pcnetgame_shopup_scene_is_shop(int scene) {
+    return scene == SCENE_SHOP0 || scene == SCENE_CONVENI || scene == SCENE_SUPER || scene == SCENE_DEPART || scene == SCENE_DEPART_2;
+}
+
+static uint32_t pcnetgame_shopup_left_ms(uint32_t now) {
+    if (s_up.state != PC_SHOP_UPGRADE_CLOSED) {
+        return 0;
+    }
+    return ((int32_t)(s_up.end_tick - now) > 0) ? (uint32_t)(s_up.end_tick - now) : 0u;
+}
+
+static void pcnetgame_shopup_notice_set(int kind, int minutes) {
+    s_up.notice_kind = kind;
+    s_up.notice_minutes = minutes;
+    s_up.notice_until = pcnetgame_now_ms() + PCNG_SHOPUP_NOTICE_MS;
+    if (s_up.notice_until == 0) {
+        s_up.notice_until = 1;
+    }
+}
+
+/* ---- the restart file (HOST) ---- */
+static int pcnetgame_shopup_path(char* out, size_t cap) {
+    const char* rp = pc_server_restock_path();
+    const char* slash = strrchr(rp, '/');
+    const char* bslash = strrchr(rp, '\\');
+    size_t dir;
+    if (bslash != NULL && (slash == NULL || bslash > slash)) {
+        slash = bslash;
+    }
+    dir = (slash != NULL) ? (size_t)(slash - rp + 1) : 0u;
+    if (dir + sizeof("shop_upgrade.ini") > cap) {
+        return 0;
+    }
+    memcpy(out, rp, dir);
+    memcpy(out + dir, "shop_upgrade.ini", sizeof("shop_upgrade.ini"));
+    return 1;
+}
+
+static void pcnetgame_shopup_file_write(void) {
+    char path[180], tmp[200], key[PC_CHARACTER_TOWNKEY_LEN + 1];
+    FILE* f;
+    if (!pcnetgame_shopup_path(path, sizeof(path)) || !s_host_town_valid) {
+        printf("[NET][SHOPUP] host: *** no restart file path: a host restart would not resume this upgrade ***\n");
+        return;
+    }
+    pcnetgame_restock_town_key(key);
+    {
+        size_t i2;
+        snprintf(tmp, sizeof(tmp), "%s", path);
+        for (i2 = 1; tmp[i2] != 0; i2++) { /* the parent directories (save/mp of a listen host, servers/<id>) may not exist yet */
+            if (tmp[i2] == '/' || tmp[i2] == '\\') {
+                const char c = tmp[i2];
+                tmp[i2] = 0;
+#ifdef _WIN32
+                _mkdir(tmp);
+#else
+                mkdir(tmp, 0755);
+#endif
+                tmp[i2] = c;
+            }
+        }
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (f == NULL) {
+        printf("[NET][SHOPUP] host: *** could not write %s (a host restart would not resume this upgrade) ***\n", tmp);
+        return;
+    }
+    fprintf(f, "# multiplayer shop upgrade (announced closure); written by the host, removed after the renewal was saved\nversion = 1\ntown = %s\ngen = %u\nstate = %s\nfrom_level = %d\n"
+               "target_level = %d\ntotal_ms = %u\nend_wall_ms = %llu\n",
+            key, (unsigned)s_up.gen, s_up.state == PC_SHOP_UPGRADE_RENEWING ? "renewing" : "closed", s_up.from_level, s_up.target_level, (unsigned)s_up.total_ms,
+            (unsigned long long)s_up.end_wall_ms);
+    fflush(f);
+#ifdef _WIN32
+    (void)_commit(_fileno(f)); /* durable before the atomic replace (and before any client is told the shop closed) */
+#endif
+    fclose(f);
+    remove(path);
+    if (rename(tmp, path) != 0) {
+        printf("[NET][SHOPUP] host: *** could not replace %s ***\n", path);
+    }
+}
+
+static void pcnetgame_shopup_file_remove(void) {
+    char path[180];
+    if (pcnetgame_shopup_path(path, sizeof(path))) {
+        remove(path);
+    }
+}
+
+/* ---- host transitions ---- */
+static void pcnetgame_shopup_publish_state(void) {
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_UPGRADE);
+    pcnetgame_host_ts_push_all();
+}
+
+/* PENDING -> CLOSED. `who` = log text. 1 = started now, 0 = refused (fail = why). */
+static int pcnetgame_shopup_start(const char* who, uint32_t gen, int target, const char** fail) {
+    const uint32_t now = pcnetgame_now_ms();
+    const int status = mSP_ShopOpen();
+    *fail = NULL;
+    if (s_up.state != PC_SHOP_UPGRADE_PENDING) {
+        *fail = (s_up.state == PC_SHOP_UPGRADE_CLOSED || s_up.state == PC_SHOP_UPGRADE_RENEWING) ? "the closure was already started" : "no upgrade is pending";
+    } else if (gen != s_up.gen || target != s_up.target_level) {
+        *fail = "the request names another upgrade (generation / target level) than the host's";
+    } else if (s_restock.active || status != mSP_SHOP_STATUS_OPEN) {
+        *fail = "the shop is not plainly open (restock / sale event / raffle day)";
+    }
+    if (*fail != NULL) {
+        return 0;
+    }
+    s_up.total_ms = pcnetgame_shopup_total_ms();
+    s_up.state = PC_SHOP_UPGRADE_CLOSED;
+    s_up.end_tick = now + s_up.total_ms;
+    s_up.end_wall_ms = pcnetgame_restock_wall_ms() + s_up.total_ms;
+    pcnetgame_shopup_file_write(); /* durable BEFORE anybody is told the shop closed */
+    printf("[NET][SHOPUP] host: CLOSED: the upgrade %u (%s -> %s) was announced by %s; the shop is closed for %u s of host time\n", (unsigned)s_up.gen,
+           pcnetgame_shopup_level_name(s_up.from_level), pcnetgame_shopup_level_name(s_up.target_level), who, (unsigned)(s_up.total_ms / 1000u));
+    if (g_pc_dedicated) {
+        pc_dedicated_say("Nook's shop closed for %u minute(s) for its upgrade to %s.", (unsigned)((s_up.total_ms + 59999u) / 60000u), pcnetgame_shopup_level_name(s_up.target_level));
+    }
+    pcnetgame_shopup_notice_set(1, (int)((s_up.total_ms + 59999u) / 60000u));
+    pcnetgame_shopup_publish_state();
+    return 1;
+}
+
+static void pcnetgame_shopup_enter_renewing(const char* why) {
+    s_up.state = PC_SHOP_UPGRADE_RENEWING;
+    s_up.renew_since = pcnetgame_now_ms();
+    s_up.reload_tries = 0;
+    s_up.event_armed_ms = 0;
+    Save_Get(shop).shop_info.send_upgrade_notice = FALSE; /* the vanilla "closed on <date>" leaflet has no meaning for a 5-minute closure: Nook announced it */
+    Save_Get(shop).shop_info.upgrading_today = TRUE;      /* the vanilla reopening leaflet (mSP_SetRenewalChiraswhi_AppoDay) follows the renewal */
+    pcnetgame_shopup_file_write();
+    printf("[NET][SHOPUP] host: RENEWING (%s): performing the renewal %s -> %s\n", why, pcnetgame_shopup_level_name(s_up.from_level), pcnetgame_shopup_level_name(s_up.target_level));
+    pcnetgame_shopup_publish_state();
+}
+
+/* The renewed shop reaches the clients: the shop acre is published from the host shadow with the AUTHORITATIVE values (the structure tile SHOP0 + level even while a live host
+ * structure actor holds DUMMY_SHOPn on it, the ground-cleaned footprint RSV_NO even while the host stands in the town, where the diff withholds AMBIGUOUS values). */
+static void pcnetgame_shopup_publish_acre(int level) {
+    int tiles[32], n, i, acre = -1, st = -1;
+    uint16_t items[PCFA_TILE_NUM], deposit[PCFA_DEPOSIT_ROWS];
+    PCNetGameOutMsg* om;
+    if (!s_host_world_ready || (n = aSL_PC_ShopFootprint(level, &acre, &st, tiles, 32)) <= 0 || acre < 0 || acre >= PCFA_ACRE_NUM || !pcfa_read_acre(acre, items, deposit)) {
+        printf("[NET][SHOPUP] host: *** the shop acre could not be published (no shop block / structure tile) ***\n");
+        return;
+    }
+    s_shadow_items[acre][st] = (uint16_t)(SHOP0 + level);
+    pcnetgame_set_dep_bit(s_shadow_deposit[acre], st, pcnetgame_dep_bit(deposit, st));
+    pcnetgame_set_dep_bit(s_shadow_known[acre], st, 1);
+    for (i = 0; i < n; i++) {
+        const int t = tiles[i];
+        if (pcfa_transient_kind(items[t]) == PCFA_VALUE_TRANSIENT) {
+            continue; /* a live placeholder: its owner restores a stable value later (the normal diff sends it) */
+        }
+        s_shadow_items[acre][t] = items[t];
+        pcnetgame_set_dep_bit(s_shadow_deposit[acre], t, pcnetgame_dep_bit(deposit, t));
+        pcnetgame_set_dep_bit(s_shadow_known[acre], t, 1);
+        s_host_ambig_since[acre][t] = 0;
+    }
+    pcnetgame_out_reset();
+    ++s_world_seq;
+    om = pcnetgame_out_append();
+    if (om != NULL) {
+        pcnetgame_build_field_block(&om->u.fb, acre, 0, 0);
+        om->size = (uint16_t)sizeof(om->u.fb);
+        pcnetgame_host_send_out_list();
+    }
+    printf("[NET][SHOPUP] host: published the shop acre %d: structure tile %d = 0x%04X, %d footprint tile(s) (world_seq %u)\n", acre, st, (unsigned)(SHOP0 + level), n,
+           (unsigned)s_world_seq);
+}
+
+static void pcnetgame_shopup_finish(const char* how) {
+    const int level = mSP_GetShopLevel();
+    s_up.state = PC_SHOP_UPGRADE_IDLE;
+    s_up.event_armed_ms = 0;
+    pcnetgame_shopup_publish_acre(level);
+    mSP_SetRenewalChiraswhi_AppoDay(); /* the vanilla reopening leaflet (upgrading_today + the event off), at once instead of at the next town frame */
+    printf("[NET][SHOPUP] host: the shop was upgraded (%s): level %d (%s), the shop is OPEN again\n", how, level, pcnetgame_shopup_level_name(level));
+    if (g_pc_dedicated) {
+        pc_dedicated_say("Nook's shop was upgraded to %s and is open again.", pcnetgame_shopup_level_name(level));
+    }
+    pcnetgame_shopup_notice_set(2, 0);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_POLICE);
+    pcnetgame_shopup_publish_state();
+    if (pc_save_write_authoritative_durable()) {
+        printf("[NET][SHOPUP] host: the renewed shop was saved durably\n");
+        pcnetgame_shopup_file_remove();
+    } else {
+        printf("[NET][SHOPUP] host: the renewed shop is NOT saved yet (no durable write possible now): shop_upgrade.ini is kept until the next start sees the new level\n");
+    }
+}
+
+/* the restart file, once per host process (world ready): resume a closure / a renewal; ignore another town's file */
+static void pcnetgame_shopup_load(uint32_t now) {
+    char path[180], key[PC_CHARACTER_TOWNKEY_LEN + 1], line[220], fkey[PC_CHARACTER_TOWNKEY_LEN + 8], st[24];
+    unsigned long long end_wall = 0;
+    unsigned gen = 0, total = 0;
+    int from = -1, target = -1, have_key = 0, have_end = 0, renewing = 0;
+    FILE* f;
+    if (!pcnetgame_shopup_path(path, sizeof(path)) || (f = fopen(path, "rb")) == NULL) {
+        return;
+    }
+    pcnetgame_restock_town_key(key);
+    fkey[0] = '\0';
+    st[0] = '\0';
+    while (fgets(line, (int)sizeof(line), f) != NULL) {
+        if (sscanf(line, "town = %39s", fkey) == 1) {
+            have_key = 1;
+        } else if (sscanf(line, "gen = %u", &gen) == 1 || sscanf(line, "from_level = %d", &from) == 1 || sscanf(line, "target_level = %d", &target) == 1 ||
+                   sscanf(line, "total_ms = %u", &total) == 1) {
+            /* ok */
+        } else if (sscanf(line, "state = %23s", st) == 1) {
+            renewing = strcmp(st, "renewing") == 0;
+        } else if (sscanf(line, "end_wall_ms = %llu", &end_wall) == 1) {
+            have_end = 1;
+        }
+    }
+    fclose(f);
+    if (!have_key || !have_end || strcmp(fkey, key) != 0 || target < 1 || target > 3 || from < 0 || from >= target) {
+        printf("[NET][SHOPUP] host: %s belongs to another town / is unreadable -- ignored\n", path);
+        return;
+    }
+    if (mSP_GetShopLevel() >= target) {
+        printf("[NET][SHOPUP] host: %s: the shop is already at level %d (the renewal was saved before the stop) -- removed\n", path, mSP_GetShopLevel());
+        pcnetgame_shopup_file_remove();
+        return;
+    }
+    s_up.gen = gen;
+    s_up.from_level = from;
+    s_up.target_level = target;
+    s_up.total_ms = (total >= 5000u && total <= 3600000u) ? total : pcnetgame_shopup_total_ms();
+    s_up.end_wall_ms = end_wall;
+    {
+        const uint64_t wall = pcnetgame_restock_wall_ms();
+        uint64_t left = (end_wall > wall) ? (end_wall - wall) : 0u;
+        if (left > s_up.total_ms) {
+            left = s_up.total_ms; /* the wall clock went backwards while the host was down: never longer than one closure */
+        }
+        s_up.state = PC_SHOP_UPGRADE_CLOSED;
+        s_up.end_tick = now + (uint32_t)left;
+        printf("[NET][SHOPUP] host: resuming the upgrade %u (%s -> %s) after a host restart: %s, %u ms of the closure remaining\n", gen, pcnetgame_shopup_level_name(from),
+               pcnetgame_shopup_level_name(target), renewing ? "the renewal was due" : "closed", (unsigned)left);
+        if (renewing || left == 0) {
+            pcnetgame_shopup_enter_renewing(renewing ? "resumed after a host restart" : "the deadline passed while the host was down");
+            return;
+        }
+    }
+    pcnetgame_shopup_publish_state();
+}
+
+/* RENEWING: the vanilla renewal body. In the town scene through the vanilla actor ct (pc_host_renewshop_poll's same-position reload, armed by the vanilla event state: the live
+ * structure actor is torn down first, then Shop_Level_Actor_ct renews); in a shop scene wait (the player is shown out); elsewhere directly on the save. */
+static void pcnetgame_shopup_renew_tick(uint32_t now) {
+    GAME_PLAY* play;
+    int scene;
+    if (mSP_GetShopLevel() >= s_up.target_level) {
+        pcnetgame_shopup_finish(s_up.event_armed_ms != 0 ? "the vanilla shop actor renewed it at the town reload" : "renewed");
+        return;
+    }
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE || play->fb_fade_type != FADE_TYPE_NONE) {
+        return;
+    }
+    scene = (int)play->scene_id;
+    if (scene == SCENE_FG && pcfa_scene_is_town()) {
+        if (s_up.event_armed_ms == 0 || (uint32_t)(now - s_up.event_armed_ms) >= PCNG_SHOPUP_RELOAD_RETRY_MS) {
+            if (s_up.event_armed_ms != 0 && ++s_up.reload_tries >= PCNG_SHOPUP_RELOAD_TRIES) {
+                printf("[NET][SHOPUP] host: *** the renewal did not happen after %d town reload attempt(s): the shop REOPENS without the upgrade (it is not offered again in this host run) ***\n",
+                       s_up.reload_tries);
+                mEv_EventOFF(mEv_SAVED_RENEWSHOP);
+                Save_Get(shop).shop_info.upgrading_today = FALSE;
+                s_up.failed_target = s_up.target_level;
+                s_up.state = PC_SHOP_UPGRADE_IDLE;
+                s_up.event_armed_ms = 0;
+                pcnetgame_shopup_file_remove();
+                pcnetgame_shopup_publish_state();
+                return;
+            }
+            /* the vanilla due-renewal state; renewal_time = now (+ the attempt in seconds: a NEW key for the once-per-renewal_time reload of pc_host_renewshop_poll) */
+            mEv_EventON(mEv_SAVED_RENEWSHOP);
+            Save_Get(shop).renewal_time = Common_Get(time.rtc_time);
+            Save_Get(shop).renewal_time.sec = (lbRTC_sec_t)((Save_Get(shop).renewal_time.sec + s_up.reload_tries) % 60);
+            Save_Get(shop).shop_info.send_upgrade_notice = FALSE;
+            Save_Get(shop).shop_info.upgrading_today = TRUE;
+            s_up.event_armed_ms = now;
+            printf("[NET][SHOPUP] host: the host is in the town: the vanilla renewal is armed (attempt %d), pc_host_renewshop_poll reloads the town when nobody is in a shop\n",
+                   s_up.reload_tries + 1);
+        }
+        return;
+    }
+    if (pcnetgame_shopup_scene_is_shop(scene)) {
+        return; /* the host's own player is still inside (being shown out) */
+    }
+    /* the host's player is indoors elsewhere (a listen host in a house, the museum...): no live town actor exists, the save holds the town field */
+    if (aSL_PC_RenewShopDirect()) {
+        pcnetgame_shopup_finish("renewed directly on the save while the host player is not in the town");
+    } else if (s_up.event_armed_ms == 0) {
+        s_up.event_armed_ms = now; /* log once; the in-town path (or the next tick) retries */
+        printf("[NET][SHOPUP] host: *** the direct renewal failed (scene %d): waiting for the town scene ***\n", scene);
+    }
+}
+
+static void pcnetgame_shopup_host_tick(uint32_t now) {
+    static uint32_t s_next_ms = 0;
+    if (!s_up.loaded) {
+        s_up.loaded = 1;
+        s_up.gen = (uint32_t)(pcnetgame_restock_wall_ms() / 1000u) & 0x00FFFFFFu; /* a fresh generation per host process (a stale client request never matches) */
+        s_up.failed_target = -1;
+        if (!pcnetgame_shopup_enabled()) {
+            return;
+        }
+        pcnetgame_shopup_load(now);
+    }
+    if (!pcnetgame_shopup_enabled()) {
+        return;
+    }
+    if (s_up.state == PC_SHOP_UPGRADE_CLOSED) {
+        if ((int32_t)(now - s_up.end_tick) >= 0) {
+            pcnetgame_shopup_enter_renewing("the closure time elapsed");
+        }
+        return;
+    }
+    if (s_up.state == PC_SHOP_UPGRADE_RENEWING) {
+        pcnetgame_shopup_renew_tick(now);
+        return;
+    }
+    if ((uint32_t)(now - s_next_ms) < 500u) {
+        return;
+    }
+    s_next_ms = now;
+    if (mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == TRUE) {
+        /* a vanilla renewal schedule (an older save / single-player play / a test hook): this host replaces it -- Nook announces instead */
+        mEv_EventOFF(mEv_SAVED_RENEWSHOP);
+        Save_Get(shop).shop_info.upgrading_today = FALSE;
+        Save_Get(shop).shop_info.send_upgrade_notice = FALSE;
+        printf("[NET][SHOPUP] host: a vanilla shop renewal schedule was found (mEv_SAVED_RENEWSHOP): replaced by the announced upgrade\n");
+    }
+    {
+        const int level = mSP_GetShopLevel();
+        const int real = mSP_GetRealShopLevel();
+        int bx, bz;
+        const int qualifies = real > level && real != s_up.failed_target && mFI_BlockKind2BkNum(&bx, &bz, mRF_BLOCKKIND_SHOP);
+        if (s_up.state == PC_SHOP_UPGRADE_IDLE && qualifies) {
+            s_up.state = PC_SHOP_UPGRADE_PENDING;
+            s_up.gen++;
+            s_up.from_level = level;
+            s_up.target_level = real;
+            printf("[NET][SHOPUP] host: PENDING: the town qualifies for %s (sales %u, level %d -> %d), upgrade %u: Nook announces it at the next talk\n",
+                   pcnetgame_shopup_level_name(real), (unsigned)mSP_GetSalesSum(), level, real, (unsigned)s_up.gen);
+            if (g_pc_dedicated) {
+                pc_dedicated_say("The town qualifies for %s: Tom Nook announces the upgrade to the next player who talks to him.", pcnetgame_shopup_level_name(real));
+            }
+            pcnetgame_shopup_publish_state();
+        } else if (s_up.state == PC_SHOP_UPGRADE_PENDING && (!qualifies || real != s_up.target_level)) {
+            printf("[NET][SHOPUP] host: the pending upgrade %u no longer applies (level %d, qualifying %d): IDLE\n", (unsigned)s_up.gen, level, real);
+            s_up.state = PC_SHOP_UPGRADE_IDLE;
+            pcnetgame_shopup_publish_state();
+        }
+    }
+#ifdef PC_NET_TEST_HOOKS
+    {
+        /* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_SHOP_UPGRADE_QUALIFY=1 adds the sales still missing to the next tier once a READY peer is connected (what `shop-level-boost confirm` does);
+         * AC_TEST_SHOP_UPGRADE_HOST_START=<s> lets the HOST start the closure itself <s> seconds after PENDING (as if the host player had heard the announcement). */
+        static int s_q = -1, s_hs = -2;
+        static uint32_t s_pending_ms = 0;
+        if (s_q < 0) {
+            const char* e = pc_test_hook_getenv("AC_TEST_SHOP_UPGRADE_QUALIFY");
+            s_q = (e != NULL && e[0] == '1') ? 1 : 0;
+        }
+        if (s_hs == -2) {
+            const char* e = pc_test_hook_getenv("AC_TEST_SHOP_UPGRADE_HOST_START");
+            s_hs = (e != NULL) ? (int)strtol(e, NULL, 10) : -1;
+        }
+        if (s_q == 1 && pc_net_game_host_ready_peer_count() > 0 && mSP_GetShopLevel() < mSP_SHOP_TYPE_SUPER && s_up.state == PC_SHOP_UPGRADE_IDLE) {
+            const int lvl = mSP_GetShopLevel();
+            const u32 target = (lvl == mSP_SHOP_TYPE_ZAKKA) ? (u32)mSP_COMBINI_SUM : (u32)mSP_SUPER_SUM;
+            s_q = 2;
+            if (mSP_GetSalesSum() < target) {
+                mSP_PlusSales(target - mSP_GetSalesSum());
+            }
+            printf("[NET][SHOPUP][TEST-ONLY] AC_TEST_SHOP_UPGRADE_QUALIFY: sales %u (level %d, qualifying %d)\n", (unsigned)mSP_GetSalesSum(), lvl, mSP_GetRealShopLevel());
+        }
+        if (s_up.state != PC_SHOP_UPGRADE_PENDING) {
+            s_pending_ms = 0;
+        } else if (s_hs >= 0) {
+            if (s_pending_ms == 0) {
+                s_pending_ms = now == 0 ? 1 : now;
+            } else if ((uint32_t)(now - s_pending_ms) >= (uint32_t)s_hs * 1000u) {
+                const char* fail = NULL;
+                s_hs = -1;
+                if (!pcnetgame_shopup_start("the TEST-ONLY host start hook", s_up.gen, s_up.target_level, &fail)) {
+                    printf("[NET][SHOPUP][TEST-ONLY] host start hook refused: %s\n", fail);
+                }
+            }
+        }
+    }
+#endif
+}
+
+/* SHOP_UPGRADE_REQ (client -> host): "Nook just announced upgrade <gen> to me: close the shop". The first valid request starts the closure; every other one is ignored (logged): the
+ * requesting client learns the outcome from service 6 (CLOSED with its generation = the closure runs, whoever started it). */
+static void pcnetgame_handle_host_shopup_req(PCNetPeerId peer, const PCNetGameShopUpgradeReqMsg* m) {
+    PCNetPlayerScene sc;
+    const char* fail = NULL;
+    char who[48];
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY || s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pcnetgame_shopup_enabled() || !s_host_world_ready) {
+        fail = "the feature is off / the host world is not ready";
+    } else if (m->op != 1u || m->_rsv0 != 0u) {
+        fail = "malformed request";
+    } else if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) || !sc.valid || !pcnetgame_shopup_scene_is_shop((int)sc.scene_id)) {
+        fail = "the requester is not inside the shop (announced scene)";
+    }
+    snprintf(who, sizeof(who), "peer %d", (int)peer);
+    if (fail == NULL) {
+        (void)pcnetgame_shopup_start(who, m->gen, (int)m->target_level, &fail);
+    }
+    if (fail != NULL) {
+        printf("[NET][SHOPUP] host: peer %d start request (upgrade %u, target %u) IGNORED: %s (state %s, upgrade %u)\n", (int)peer, (unsigned)m->gen, (unsigned)m->target_level, fail,
+               pcnetgame_shopup_state_name(s_up.state), (unsigned)s_up.gen);
+        pcnetgame_host_ts_push_peer(peer); /* the requester gets the current state at once (no-op when it has it) */
+    }
+}
+
+/* ---- service 6 blob ---- */
+static void pcnetgame_ts_build_upgrade(uint8_t* blob) {
+    const uint32_t now = pcnetgame_now_ms();
+    const uint32_t left = pcnetgame_shopup_left_ms(now);
+    const uint32_t total_s = pcnetgame_shopup_total_ms() / 1000u;
+    const uint32_t min_left = (left + 59999u) / 60000u;
+    memset(blob, 0, PC_NETGAME_TS_UPGRADE_LEN);
+    if (!pcnetgame_shopup_enabled()) {
+        return; /* flags bit 0 = 0: a client keeps the old behaviour */
+    }
+    blob[0] = (uint8_t)s_up.state;
+    blob[1] = (uint8_t)(s_up.state == PC_SHOP_UPGRADE_IDLE ? mSP_GetShopLevel() : s_up.from_level);
+    blob[2] = (uint8_t)(s_up.state == PC_SHOP_UPGRADE_IDLE ? mSP_GetShopLevel() : s_up.target_level);
+    blob[3] = 1u;
+    blob[4] = (uint8_t)(s_up.gen & 0xFFu);
+    blob[5] = (uint8_t)((s_up.gen >> 8) & 0xFFu);
+    blob[6] = (uint8_t)((s_up.gen >> 16) & 0xFFu);
+    blob[7] = (uint8_t)((s_up.gen >> 24) & 0xFFu);
+    blob[8] = (uint8_t)(min_left & 0xFFu);
+    blob[9] = (uint8_t)((min_left >> 8) & 0xFFu);
+    blob[10] = (uint8_t)(total_s & 0xFFu);
+    blob[11] = (uint8_t)((total_s >> 8) & 0xFFu);
+}
+
+static int pcnetgame_ts_valid_upgrade_blob(const uint8_t* blob) {
+    int i;
+    if (blob[0] > (uint8_t)PC_SHOP_UPGRADE_RENEWING || blob[1] > 3u || blob[2] > 3u || (blob[3] & ~1u) != 0u) {
+        return 0;
+    }
+    for (i = 12; i < (int)PC_NETGAME_TS_UPGRADE_LEN; i++) {
+        if (blob[i] != 0u) {
+            return 0;
+        }
+    }
+    if (blob[3] == 0u) {
+        return blob[0] == 0u; /* feature off: nothing else */
+    }
+    return (blob[10] | (blob[11] << 8)) != 0 && (blob[0] == (uint8_t)PC_SHOP_UPGRADE_IDLE || blob[2] > blob[1]);
+}
+
+static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob) {
+    const int prev_state = s_up.c_have ? s_up.c_state : -1;
+    const uint32_t prev_gen = s_up.c_gen;
+    const int prev_target = s_up.c_target;
+    s_up.c_enabled = blob[3] & 1u;
+    s_up.c_state = blob[0];
+    s_up.c_from = blob[1];
+    s_up.c_target = blob[2];
+    s_up.c_gen = (uint32_t)blob[4] | ((uint32_t)blob[5] << 8) | ((uint32_t)blob[6] << 16) | ((uint32_t)blob[7] << 24);
+    s_up.c_min_left = (uint32_t)blob[8] | ((uint32_t)blob[9] << 8);
+    s_up.c_total_s = (int)((uint32_t)blob[10] | ((uint32_t)blob[11] << 8));
+    s_up.c_have = 1;
+    if (prev_state != s_up.c_state || prev_gen != s_up.c_gen) {
+        printf("[NET][SHOPUP] client: the host says the shop upgrade is %s (upgrade %u, level %d -> %d, %u min left, closure %d s)%s\n", pcnetgame_shopup_state_name(s_up.c_state),
+               (unsigned)s_up.c_gen, s_up.c_from, s_up.c_target, (unsigned)s_up.c_min_left, s_up.c_total_s, s_up.c_enabled ? "" : " [feature off on the host]");
+    }
+    if (!s_up.c_enabled) {
+        return;
+    }
+    if (s_up.c_state == PC_SHOP_UPGRADE_CLOSED && (prev_state != PC_SHOP_UPGRADE_CLOSED || prev_gen != s_up.c_gen)) {
+        pcnetgame_shopup_notice_set(1, (int)s_up.c_min_left);
+    } else if (s_up.c_state == PC_SHOP_UPGRADE_IDLE && (prev_state == PC_SHOP_UPGRADE_CLOSED || prev_state == PC_SHOP_UPGRADE_RENEWING)) {
+        pcnetgame_shopup_notice_set(2, 0);
+        s_up.c_refresh_level = (s_up.c_target > prev_target) ? s_up.c_target : prev_target; /* IDLE carries the new level in from/target */
+        s_up.c_refresh_since = pcnetgame_now_ms();
+        printf("[NET][SHOPUP] client: the shop reopened at level %d: the town view is refreshed when the player is idle in the town\n", s_up.c_refresh_level);
+    }
+}
+
+/* CLIENT, every frame: the town refresh after a reopening (the live shop structure actor restores the NEW tile, then a same-position reload builds the new shop), and the TEST-ONLY
+ * client start hook. */
+static void pcnetgame_shopup_client_tick(void) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+    if (s_up.c_refresh_level >= 0) {
+        int r;
+        if (s_client_link != PC_NETGAME_LINK_READY || (uint32_t)(pcnetgame_now_ms() - s_up.c_refresh_since) > 600000u) {
+            s_up.c_refresh_level = -1; /* the session ended / waited 10 minutes: the next town load builds the shop from the field anyway */
+        } else if (pc_town_shop_structure_patch(s_up.c_refresh_level) == 0) {
+            int ac = -1, st = -1, tl[32];
+            uint16_t v = 0;
+            s_up.c_refresh_level = -1; /* no live shop structure actor (not in the town scene / the shop acre is not loaded): the field already holds the new tile, the shop is built from it */
+            if (aSL_PC_ShopFootprint(s_up.c_target, &ac, &st, tl, 32) > 0) {
+                (void)pcfa_get_tile(ac, st, &v);
+            }
+            printf("[NET][SHOPUP] client: no live shop structure actor (not in the town / the shop acre is not loaded): the new shop appears when it is loaded; "
+                   "local structure tile acre %d tile %d = 0x%04X\n", ac, st, (unsigned)v);
+        } else if ((r = pc_town_same_position_reload("the shop was upgraded")) != 0) {
+            s_up.c_refresh_level = -1;
+            s_up.c_verify_ms = pcnetgame_now_ms() + 6000u;
+            if (s_up.c_verify_ms == 0) {
+                s_up.c_verify_ms = 1;
+            }
+        }
+    }
+    if (s_up.c_verify_ms != 0 && (int32_t)(pcnetgame_now_ms() - s_up.c_verify_ms) >= 0) {
+        int ac = -1, st = -1, tl[32];
+        uint16_t v = 0;
+        s_up.c_verify_ms = 0;
+        if (aSL_PC_ShopFootprint(s_up.c_target, &ac, &st, tl, 32) > 0) {
+            (void)pcfa_get_tile(ac, st, &v);
+        }
+        printf("[NET][SHOPUP] client: after the town reload the local structure tile acre %d tile %d = 0x%04X (shop level %d)\n", ac, st, (unsigned)v, mSP_GetShopLevel());
+    }
+#ifdef PC_NET_TEST_HOOKS
+    {
+        /* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_SHOP_UPGRADE_CLIENT_START=1 makes this client send the start request once the upgrade is PENDING and its player stands in the shop
+         * (what Nook's announcement dialogue does after the acknowledgement); no GUI needed. */
+        static int s_cs = -1;
+        if (s_cs < 0) {
+            const char* e = pc_test_hook_getenv("AC_TEST_SHOP_UPGRADE_CLIENT_START");
+            s_cs = (e != NULL && e[0] == '1') ? 1 : 0;
+        }
+        if (s_cs == 1 && pc_shop_upgrade_announce_due() && s_local_scene.valid && pcnetgame_shopup_scene_is_shop((int)s_local_scene.scene_id)) {
+            s_cs = 2;
+            printf("[NET][SHOPUP][TEST-ONLY] client start hook: begin=%d\n", pc_shop_upgrade_begin());
+        }
+    }
+#endif
+}
+
+static void pcnetgame_shopup_client_reset(void) {
+    s_up.c_have = 0;
+    s_up.c_state = 0;
+    s_up.c_enabled = 0;
+    s_up.req_active = 0;
+}
+
+/* ---- public API (pc_shop_upgrade.h) ---- */
+int pc_shop_upgrade_host_replaces_vanilla(void) {
+    return s_role == PC_NETGAME_ROLE_HOST && pcnetgame_shopup_enabled();
+}
+
+int pc_shop_upgrade_vanilla_renewal_allowed(void) {
+    return !pc_shop_upgrade_host_replaces_vanilla() || s_up.state == PC_SHOP_UPGRADE_RENEWING;
+}
+
+int pc_shop_upgrade_closed(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return pcnetgame_shopup_enabled() && (s_up.state == PC_SHOP_UPGRADE_CLOSED || s_up.state == PC_SHOP_UPGRADE_RENEWING);
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        return s_up.c_have && s_up.c_enabled && (s_up.c_state == PC_SHOP_UPGRADE_CLOSED || s_up.c_state == PC_SHOP_UPGRADE_RENEWING);
+    }
+    return 0;
+}
+
+int pc_shop_upgrade_announce_due(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return pcnetgame_shopup_enabled() && s_host_world_ready && s_up.state == PC_SHOP_UPGRADE_PENDING && mSP_ShopOpen() == mSP_SHOP_STATUS_OPEN;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        return s_client_link == PC_NETGAME_LINK_READY && s_up.c_have && s_up.c_enabled && s_up.c_state == PC_SHOP_UPGRADE_PENDING && mSP_GetShopLevel() == s_up.c_from &&
+               mSP_ShopOpen() == mSP_SHOP_STATUS_OPEN;
+    }
+    return 0;
+}
+
+int pc_shop_upgrade_begin(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        const char* fail = NULL;
+        if (!pcnetgame_shopup_enabled()) {
+            return 0;
+        }
+        if (s_up.state == PC_SHOP_UPGRADE_CLOSED || s_up.state == PC_SHOP_UPGRADE_RENEWING) {
+            return 3;
+        }
+        if (pcnetgame_shopup_start("the host player", s_up.gen, s_up.target_level, &fail)) {
+            return 3;
+        }
+        printf("[NET][SHOPUP] host: the host player's start was refused: %s\n", fail);
+        return 0;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        PCNetGameShopUpgradeReqMsg m;
+        if (s_client_link != PC_NETGAME_LINK_READY || !s_up.c_have || !s_up.c_enabled) {
+            return 0;
+        }
+        if (s_up.c_state == PC_SHOP_UPGRADE_CLOSED || s_up.c_state == PC_SHOP_UPGRADE_RENEWING) {
+            return 3; /* already closing (another player was faster) */
+        }
+        if (s_up.c_state != PC_SHOP_UPGRADE_PENDING) {
+            return 0;
+        }
+        memset(&m, 0, sizeof(m));
+        m.msg_type = (uint8_t)PC_NETGAME_MSG_SHOP_UPGRADE_REQ;
+        m.op = 1u;
+        m.target_level = (uint8_t)s_up.c_target;
+        m.gen = s_up.c_gen;
+        if (!pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+            return 0;
+        }
+        s_up.req_active = 1;
+        s_up.req_gen = s_up.c_gen;
+        s_up.req_ms = pcnetgame_now_ms();
+        printf("[NET][SHOPUP] client: start request sent (upgrade %u, target level %d)\n", (unsigned)m.gen, (int)m.target_level);
+        return 1;
+    }
+    return 0;
+}
+
+int pc_shop_upgrade_poll(void) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || !s_up.req_active) {
+        return pc_shop_upgrade_closed() ? 1 : -1;
+    }
+    if (s_client_link != PC_NETGAME_LINK_READY) {
+        s_up.req_active = 0;
+        return -1;
+    }
+    if ((s_up.c_state == PC_SHOP_UPGRADE_CLOSED || s_up.c_state == PC_SHOP_UPGRADE_RENEWING) && s_up.c_gen == s_up.req_gen) {
+        s_up.req_active = 0;
+        printf("[NET][SHOPUP] client: the host closed the shop for upgrade %u\n", (unsigned)s_up.c_gen);
+        return 1;
+    }
+    if (s_up.c_state != PC_SHOP_UPGRADE_PENDING || s_up.c_gen != s_up.req_gen || (uint32_t)(pcnetgame_now_ms() - s_up.req_ms) > PCNG_SHOPUP_REQ_TIMEOUT_MS) {
+        s_up.req_active = 0;
+        printf("[NET][SHOPUP] client: the start request failed (state %s, upgrade %u, waited %u ms)\n", pcnetgame_shopup_state_name(s_up.c_state), (unsigned)s_up.c_gen,
+               (unsigned)(pcnetgame_now_ms() - s_up.req_ms));
+        return -1;
+    }
+    return 0;
+}
+
+int pc_shop_upgrade_minutes_total(void) {
+    int s = (s_role == PC_NETGAME_ROLE_CLIENT) ? s_up.c_total_s : (int)(pcnetgame_shopup_total_ms() / 1000u);
+    if (s <= 0) {
+        s = PC_SHOP_UPGRADE_SECONDS;
+    }
+    return (s + 59) / 60;
+}
+
+int pc_shop_upgrade_minutes_left(void) {
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        return (int)s_up.c_min_left;
+    }
+    return (int)((pcnetgame_shopup_left_ms(pcnetgame_now_ms()) + 59999u) / 60000u);
+}
+
+int pc_shop_upgrade_notice(char* line, int cap) {
+    if (s_up.notice_kind == 0 || line == NULL || cap < 8) {
+        return 0;
+    }
+    if ((int32_t)(pcnetgame_now_ms() - s_up.notice_until) >= 0) {
+        s_up.notice_kind = 0;
+        return 0;
+    }
+    if (s_up.notice_kind == 1) {
+        const int m = s_up.notice_minutes < 1 ? 1 : s_up.notice_minutes;
+        snprintf(line, (size_t)cap, "Nook's shop is closed for %d minute%s for an upgrade", m, m == 1 ? "" : "s");
+    } else {
+        snprintf(line, (size_t)cap, "Nook's shop has been upgraded and is open again!");
+    }
+    return 1;
+}
+
+int pc_shop_upgrade_console_start(char* out, int cap) {
+    const char* fail = NULL;
+    if (s_role != PC_NETGAME_ROLE_HOST || !pcnetgame_shopup_enabled() || !s_host_world_ready) {
+        snprintf(out, (size_t)cap, "REFUSED: not a host with the announced shop upgrade on / the world is not ready");
+        return 0;
+    }
+    if (pcnetgame_shopup_start("the dedicated console", s_up.gen, s_up.target_level, &fail)) {
+        return 1;
+    }
+    snprintf(out, (size_t)cap, "REFUSED: %s", fail != NULL ? fail : "?");
+    return 0;
+}
+
+void pc_shop_upgrade_describe(char* out, int cap) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        snprintf(out, (size_t)cap, "not a host");
+    } else if (!pcnetgame_shopup_enabled()) {
+        snprintf(out, (size_t)cap, "OFF (AC_MP_SHOP_UPGRADE=0: the vanilla 2-day renewal schedule); level %d, qualifying %d", mSP_GetShopLevel(), mSP_GetRealShopLevel());
+    } else {
+        snprintf(out, (size_t)cap, "%s; upgrade %u; level %d (%s), qualifying %d; sales %u; %u s of the closure left (closure %u s)", pcnetgame_shopup_state_name(s_up.state),
+                 (unsigned)s_up.gen, mSP_GetShopLevel(), pcnetgame_shopup_level_name(mSP_GetShopLevel()), mSP_GetRealShopLevel(), (unsigned)mSP_GetSalesSum(),
+                 (unsigned)(pcnetgame_shopup_left_ms(pcnetgame_now_ms()) / 1000u), (unsigned)(pcnetgame_shopup_total_ms() / 1000u));
+    }
+}
+/* ===== SHOP UPGRADE END ===== */

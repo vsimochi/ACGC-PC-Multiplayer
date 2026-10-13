@@ -71,7 +71,7 @@ def main():
     # ---- S0-1 shop
     shop = read("src/game/m_shop.c")
     check("S0-1: m_shop.c includes pc_net_game.h under TARGET_PC",
-          re.search(r'#ifdef TARGET_PC\n#include "pc_settings.h"\n#include "pc_net_game.h"[^\n]*\n#endif', shop) is not None,
+          re.search(r'#ifdef TARGET_PC\n#include "pc_settings.h"\n#include "pc_net_game.h"[^\n]*\n(?:#include "pc_shop_upgrade.h"[^\n]*\n)?#endif', shop) is not None,
           results)
     ex = func_body(shop, r"\nextern void mSP_ExchangeLineUp_InGame\(GAME\* game\) \{")
     check("S0-1: mSP_ExchangeLineUp_InGame found", bool(ex), results)

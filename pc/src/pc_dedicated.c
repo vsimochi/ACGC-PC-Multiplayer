@@ -18,6 +18,7 @@
 #include "pc_test_hooks.h"         /* test-hook gate of the behaviour-changing commands */
 #include "m_item_name.h"  /* mIN_copy_name_str(): the game's own item name tables (filled from the ROM by pc_assets_init) */
 #include "m_shop.h"       /* `shop-level-boost`: mSP_PlusSales / thresholds */
+#include "pc_shop_upgrade.h" /* `shop-upgrade`: the announced 5-minute shop upgrade state */
 
 #include <stdarg.h>
 #include <ctype.h>
@@ -1111,7 +1112,8 @@ static void pc_ded_cmd_help(void) {
            "  event list|status [name]   today's event schedule from the game's own tables (scheduled / active / running); start|stop|reset are refused with the reason\n"
            "  wildlife list|info <id>   the host's authoritative wildlife records; wildlife spawn fish <species> <x> <z> / despawn <id> need AC_TEST_HOOKS=1\n"
            "  test status|help   whether the test hooks are enabled and what they gate\n"
-           "  shop-level-boost [confirm]   add the sales still missing to the NEXT shop tier once (mSP_PlusSales); the upgrade itself follows the vanilla 2-day schedule\n"
+           "  shop-level-boost [confirm]   add the sales still missing to the NEXT shop tier once (mSP_PlusSales); Nook then announces the upgrade (5-minute closure)\n"
+           "  shop-upgrade   the announced shop upgrade: state (IDLE / PENDING / CLOSED / RENEWING), level, qualifying level, time left\n"
            "  tp / bell   unsupported on the server (no local player; no host bell admin API) -- see docs/console-commands.md\n"
            "  stop     graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit\n");
     pc_ded_flush();
@@ -2372,6 +2374,8 @@ static void pc_ded_cmd_shop_level_boost(char* args) {
         pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: the shop is already at the maximum tier (level %d)\n", level);
     } else if (pc_net_game_shop_restocking()) {
         pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: Nook's shop is restocking; try again when it is open\n");
+    } else if (pc_shop_upgrade_host_replaces_vanilla() && mSP_GetRealShopLevel() > level) {
+        pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: the town already qualifies for the next tier; Tom Nook announces the upgrade (see `shop-upgrade`)\n");
     } else if (mEv_CheckEvent(mEv_SAVED_RENEWSHOP)) {
         pc_ded_printf("SHOP-LEVEL-BOOST REFUSED: an upgrade is already scheduled (mEv_SAVED_RENEWSHOP is set); it happens at the scheduled renewal time\n");
     } else if ((target = (level == mSP_SHOP_TYPE_ZAKKA) ? (u32)mSP_COMBINI_SUM : (level == mSP_SHOP_TYPE_COMBINI) ? (u32)mSP_SUPER_SUM : (u32)mSP_DSUPER_SUM) <= sum) {
@@ -2385,7 +2389,10 @@ static void pc_ded_cmd_shop_level_boost(char* args) {
         real_after = mSP_GetRealShopLevel();
         pc_ded_printf("SHOP-LEVEL-BOOST: sales %u -> %u (added %u once via mSP_PlusSales); shop level stays %d now, qualifying level %d.\n", (unsigned)sum,
                       (unsigned)mSP_GetSalesSum(), (unsigned)(target - sum), level, real_after);
-        if (real_after > level) {
+        if (real_after > level && pc_shop_upgrade_host_replaces_vanilla()) {
+            pc_ded_printf("  NOT immediate: the next player who talks to Tom Nook hears the upgrade announcement; the shop then closes for %d minute(s) and reopens upgraded (see `shop-upgrade`).\n",
+                          pc_shop_upgrade_minutes_total());
+        } else if (real_after > level) {
             pc_ded_printf("  NOT immediate: the vanilla shop actor schedules the renewal on its next town frame and the new shop opens about 2 days later (renewal_time); a sale / lottery day within 2 days postpones the scheduling. Not written here: shop_level, renewal_time.\n");
         } else {
             pc_ded_printf("  No upgrade will be scheduled yet: Nookington's needs a foreign-town shopper (visitor_flag) unless disable_shop_visitor_req = 1 in settings.\n");
@@ -2476,6 +2483,18 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_test(args);
     } else if (strcmp(cmd, "shop-level-boost") == 0) {
         pc_ded_cmd_shop_level_boost(args);
+    } else if (strcmp(cmd, "shop-upgrade") == 0) {
+        char line[256];
+        char* sub = pc_ded_skip_ws(args);
+        if (sub != NULL && pc_ded_stricmp(sub, "start confirm") == 0) {
+            /* operator override: start the announced closure now (e.g. every player runs an older client that cannot hear Nook's announcement) */
+            pc_ded_printf("SHOP-UPGRADE START: %s\n", pc_shop_upgrade_console_start(line, (int)sizeof(line)) ? "the closure started" : line);
+        } else if (sub != NULL && sub[0] != '\0') {
+            pc_ded_printf("SHOP-UPGRADE: usage: shop-upgrade [start confirm]\n");
+        }
+        pc_shop_upgrade_describe(line, (int)sizeof(line));
+        pc_ded_printf("SHOP-UPGRADE: %s\n", line);
+        pc_ded_flush();
     } else if (strcmp(cmd, "tp") == 0 || strcmp(cmd, "bell") == 0) {
         pc_ded_printf("%s UNSUPPORTED on the dedicated server: %s\n", cmd, strcmp(cmd, "tp") == 0 ? "it has no local player, and a remote player's movement is owned by that client (the host never moves it)" : "bells are per-player save data with no host-side admin API in this build; use `give` for items");
         pc_ded_flush();

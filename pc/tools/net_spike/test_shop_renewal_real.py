@@ -6,6 +6,10 @@ Phases (one host each, --host --bootstrap-resident 0, the host's own player park
   RN-hold  AC_TEST_RENEWSHOP_DUE=hold (TEST-ONLY): a renewal due NOW is armed and the fix's reload is suppressed -> the pre-fix state: SHOP_BUY REJECTED NOT_AVAILABLE.
   RN-fix   AC_TEST_RENEWSHOP_DUE=1: the same due renewal; the host does ONE same-position SCENE_FG reload, the vanilla Shop_Level ct renews (event cleared,
            level 0 -> 1, the mirror shows the new level) and a SHOP_BUY from the NEW stock is APPLIED; no second reload.
+  RN-takeover  (the announced shop upgrade, feature ON) AC_TEST_RENEWSHOP_DUE=1 arms the same vanilla due renewal, but the host REPLACES the vanilla schedule: the event is
+           cleared ('a vanilla shop renewal schedule was found ... replaced by the announced upgrade'), the upgrade becomes PENDING (Nook announces it), no vanilla reload happens.
+The RN-base / RN-hold / RN-fix / RN-twice phases pin the LEGACY vanilla 2-day renewal path and therefore run with the A/B switch AC_MP_SHOP_UPGRADE=0 (deliberate change: with
+the announced shop upgrade ON, the default, a host never keeps a vanilla renewal schedule; that path is covered by test_shop_upgrade_protocol.py).
 Usage: NET_SPIKE_GAME_BIN=<pc\\build64\\bin_fixture4_wN> python test_shop_renewal_real.py [--port 16100]
 """
 import argparse
@@ -102,7 +106,22 @@ def phase_twice(run):
     after_reloads(run, a, 2, "RN-twice")
 
 
-PHASES = [("RN-base", None, phase_base), ("RN-hold", "hold", phase_hold), ("RN-fix", "1", phase_fix), ("RN-twice", "twice", phase_twice)]
+def phase_takeover(run):
+    run.ready("A", run.r1)
+    end = time.time() + 20.0
+    while time.time() < end and "PENDING: the town qualifies" not in run.log():
+        L.pump_sleep(0.25)
+    log = run.log()
+    run.check("RN-takeover the armed vanilla renewal was REPLACED (event cleared) by the announced upgrade",
+              "a vanilla shop renewal schedule was found (mEv_SAVED_RENEWSHOP): replaced by the announced upgrade" in log)
+    run.check("RN-takeover the upgrade is PENDING (Nook announces it at the next talk)", "PENDING: the town qualifies" in log)
+    L.pump_sleep(3.0)
+    run.check("RN-takeover no vanilla renewal reload was issued", "same-position SCENE_FG reload so the vanilla shop actor renews" not in run.log())
+
+
+# (tag, AC_TEST_RENEWSHOP_DUE, body, AC_MP_SHOP_UPGRADE): the legacy phases pin the vanilla 2-day path (A/B switch off); RN-takeover runs with the default (ON)
+PHASES = [("RN-base", None, phase_base, "0"), ("RN-hold", "hold", phase_hold, "0"), ("RN-fix", "1", phase_fix, "0"), ("RN-twice", "twice", phase_twice, "0"),
+          ("RN-takeover", "1", phase_takeover, None)]
 
 
 def observer_phase(results, port, tag, body, restore):
@@ -157,19 +176,24 @@ def main():
         shutil.copytree(snap_dir, save_dir)
 
     try:
-        for i, (tag, val, body) in enumerate(PHASES):
+        for i, (tag, val, body, upg) in enumerate(PHASES):
             if only and tag not in only:
                 continue
             if val is None:
                 os.environ.pop(ENV, None)
             else:
                 os.environ[ENV] = val
+            if upg is None:
+                os.environ.pop("AC_MP_SHOP_UPGRADE", None)
+            else:
+                os.environ["AC_MP_SHOP_UPGRADE"] = upg
             if args.observer:
                 observer_phase(results, args.port + 10 + i, tag + "-obs", body, restore)
             else:
                 TS.run_phase(results, "127.0.0.1", args.port + i, tag, [], body, snap_gci, restore)
     finally:
         os.environ.pop(ENV, None)
+        os.environ.pop("AC_MP_SHOP_UPGRADE", None)
         restore()
         shutil.rmtree(snap_dir, ignore_errors=True)
     return L.summary_and_exit_code(results)

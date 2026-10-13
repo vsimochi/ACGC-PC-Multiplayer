@@ -51,7 +51,11 @@ def main():
     play = rd("src", "game", "m_play.c")
     ck("T3 the FG scene (scene_word_data[7] = test_fd_npc_land, where the observer stands) spawns the Shop_Level actor",
        "mAc_PROFILE_SHOP_LEVEL" in fg and re.search(r"npc_room01_info,\s*test_fd_npc_land_info,", play) is not None)
-    ck("T3 the host (not a client) schedules the renewal: aSL_JudgeRenewShop returns only for CLIENT", "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {\n        return;\n    }\n#endif\n    if (Save_Get(scene_no) == SCENE_FG && mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == FALSE)" in lvl)
+    # the announced shop upgrade (deliberate change): a host with AC_MP_SHOP_UPGRADE on (default) never schedules the vanilla 2-day renewal; with the switch off (and in single
+    # player) the vanilla scheduling block is unchanged
+    ck("T3 the host (not a client) schedules the renewal: aSL_JudgeRenewShop returns only for CLIENT; the vanilla scheduling is skipped only when the host replaces it with the announced upgrade",
+       "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {\n        return;\n    }\n#endif\n    if (Save_Get(scene_no) == SCENE_FG && mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == FALSE\n#ifdef TARGET_PC\n" in lvl
+       and "        && !pc_shop_upgrade_host_replaces_vanilla()\n#endif\n    ) {\n        if (mSP_GetShopLevel() < mSP_GetRealShopLevel()) {" in lvl)
     buy = re.search(r"\} else if \(is_buy\) \{\n        mSP_PlusSales\(shop_price\);.*?\n    \} else if \(is_sell\) \{", ng, re.S)
     bb = buy.group(0) if buy else ""
     ck("T4 a guest's APPLIED purchase records the foreign shopper on the host (idempotent, guest records only)",

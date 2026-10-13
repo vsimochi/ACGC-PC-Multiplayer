@@ -47,6 +47,11 @@ def main():
     hblk_raw, cblk_raw = c_raw[hb:he], c_raw[cb:ce]
     hblk, cblk = strip_comments(hblk_raw), strip_comments(cblk_raw)
     # the handler + the SHOP host helpers sit between the TS host helpers and "TS HOST END"
+    # the announced shop upgrade (SHOP UPGRADE block, host-only): it writes ONLY the vanilla renewal state of Save_t.shop (send_upgrade_notice / upgrading_today / renewal_time)
+    # and calls mSP_PlusSales only in its TEST-ONLY qualify hook; it is excluded from the "nothing else writes the shop" scans below and pinned by its own checks instead.
+    ub, ue = c_raw.index("===== SHOP UPGRADE BEGIN"), c_raw.index("===== SHOP UPGRADE END")
+    up_raw = c_raw[ub:ue]
+    c_noup = strip_comments(c_raw[:ub] + c_raw[ue:])
     shop_region_raw = c_raw[c_raw.index("---- SHOP (service 3): host helpers"):he]
     shop_region = strip_comments(shop_region_raw)
     ts_raw = func_body(shop_region_raw, "pcnetgame_handle_host_ts_txn")
@@ -81,7 +86,7 @@ def main():
     build = func_body(hblk_raw, "pcnetgame_ts_build")
     check("M service 3 is built from the host's raw Save_Get(shop) (320 B) and the refresh_all / push loops cover it",
           "memcpy(blob, &Save_Get(shop), PC_NETGAME_TS_SHOP_LEN)" in build and "pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP)" in func_body(hblk_raw, "pcnetgame_ts_refresh_all")
-          and "svc <= (int)PC_NETGAME_TS_EVENT" in func_body(hblk_raw, "pcnetgame_host_ts_push_peer"))  # batch A: the loop bound is now service 4 (HOST_CONFIG), which still covers the shop (3)
+          and "svc < (int)PC_NETGAME_TS_NUM" in func_body(hblk_raw, "pcnetgame_host_ts_push_peer"))  # the loop bound is the service array bound (now 7: services 1..6), which still covers the shop (3)
     check("M the host runs the CLIENT validator on its own shop blob and logs a loud warning if clients would refuse it; the validator checks every stock / lottery / rare entry, the bag count, sales_sum and the visitor flag",
           "pcnetgame_ts_valid_shop_blob(blob)" in func_body(hblk_raw, "pcnetgame_ts_refresh") and "would be REFUSED by clients" in hblk_raw
           and all(x in func_body(hblk_raw, "pcnetgame_ts_valid_shop_blob") for x in ("s.items[i]", "s.lottery_items[i]", "s.rare_item", "flowers_candy_grab_bag_count", "s.visitor_flag")))
@@ -94,7 +99,7 @@ def main():
     ap = func_body(cblk_raw, "pcnetgame_ts_client_apply")
     check("M the client's local Save_Get(shop) is written ONLY by the mirror apply (one memcpy of the blob); the host never overwrites its own shop from a peer (client-originated TOWN_SVC_STATE is dropped)",
           "memcpy(&Save_Get(shop), m->blob, PC_NETGAME_TS_SHOP_LEN)" in ap and len(re.findall(r"memcpy\(&Save_Get\(shop\)", c)) == 1
-          and not re.search(r"Save_Get\(shop\)(?:\.\w+(?:\[[^\]]*\])?)+\s*(?:\+\+|--|[+\-*]?=[^=])", c)
+          and not re.search(r"Save_Get\(shop\)(?:\.\w+(?:\[[^\]]*\])?)+\s*(?:\+\+|--|[+\-*]?=[^=])", c_noup)
           and "pcnetgame_handle_client_town_svc" not in func_body(c, "pcnetgame_handle_host_data"))
     check("M an applied shop mirror redraws the shop floor ONLY when the client stands in a shop (aSD_PC_SyncDisplayWithStock; items that appeared since show at the next entry: documented)",
           "svc == (int)PC_NETGAME_TS_SHOP && pcnetgame_shop_local_scene_is_shop()" in ap and "aSD_PC_SyncDisplayWithStock()" in ap and "NOT added in place" in ap)
@@ -125,9 +130,16 @@ def main():
     check("H payment = vanilla mSP_money_check + mSP_get_sell_price on the PRE-image: wallet first, then money bags 100 / 1000 / 10000 / 30000 lowest slot first, change to the wallet",
           all(x in func_body(shop_region_raw, "pcnetgame_shop_pay") for x in ("ITM_MONEY_100", "ITM_MONEY_1000", "ITM_MONEY_10000", "ITM_MONEY_30000", "feasible", "*wallet = money - amount")))
     check("H the shop mutations exist ONLY in the handler: mSP_PlusSales( 3x in the handler (restock fee, buy price, sale value / 2) + 1x in the host's own pc_net_game_restock_begin (restock fee, host-only path), mSP_ShopSaleReport( once, nothing else in pc_net_game.c writes the shop stock / sales_sum",
-          c.count("mSP_PlusSales(") == 4 and c.count("mSP_ShopSaleReport(") == 1 and ts.count("mSP_PlusSales(") == 3 and ts.count("mSP_ShopSaleReport(") == 1
+          c_noup.count("mSP_PlusSales(") == 4 and c.count("mSP_ShopSaleReport(") == 1 and ts.count("mSP_PlusSales(") == 3 and ts.count("mSP_ShopSaleReport(") == 1
           and c_raw.count("mSP_PlusSales(PC_NETGAME_RESTOCK_PRICE); /* once per started restock (host-only path)") == 1
           and "mSP_ShopSaleReport(" not in func_body(shop_region_raw, "pcnetgame_shop_classify"))
+    up = strip_comments(up_raw)
+    up_writes = set(m.group(1) for m in re.finditer(r"Save_Get\(shop\)((?:\.\w+)+)\s*=[^=]", up))
+    up_prod = re.sub(r"#ifdef PC_NET_TEST_HOOKS.*?#endif", "", up, flags=re.S)
+    check("H the SHOP UPGRADE block writes ONLY the vanilla renewal state of the host's shop (shop_info.send_upgrade_notice / upgrading_today, renewal_time[.sec]) and adds sales "
+          "only in its TEST-ONLY qualify hook (production: no mSP_PlusSales, no stock write); the renewal itself is the vanilla body (aSL_PC_RenewShopDirect / the actor ct)",
+          up_writes and up_writes <= {".shop_info.send_upgrade_notice", ".shop_info.upgrading_today", ".renewal_time", ".renewal_time.sec"}
+          and "mSP_PlusSales(" not in up_prod and "mSP_PlusSales(" in up and "Save_Get(shop).items" not in up and "aSL_PC_RenewShopDirect()" in up_prod)
     shop_branch = ts[ts.index("if (is_shop) {"):ts.index("} else if (is_donate) {")]
     check("H the host's OWN resident is never written (post-image gate pcnetgame_rec_txn_idx_ok before the first shop mutation); guests G1: a guest (idx >= PLAYER_NUM) is a FULL participant "
           "of the shop (NO idx >= PLAYER_NUM refusal in the shop branch; its record is written through the same gate), while the museum donation of a guest stays refused with NO_DONOR_SLOT",

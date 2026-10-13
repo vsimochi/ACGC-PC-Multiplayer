@@ -2,6 +2,7 @@
 #include "pc_net_game.h" /* Batch G2/G3: pc_net_game_role() */
 #include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated messages / choice strings */
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES (lifecycle hardening: the one place that knows the house count) */
+#include "pc_shop_upgrade.h" /* multiplayer shop upgrade: Nook's announcement of the 5-minute closure */
 #include <string.h>
 /* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
  * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
@@ -1800,7 +1801,10 @@ enum {
     aNSC_PC_RS_PENDING,     /* the SHOP_RESTOCK transaction is in flight */
     aNSC_PC_WK_OP_BEGIN,    /* Work Mode: begin the op in aNSC_pc_wk_op (retried while another transaction is unresolved) */
     aNSC_PC_WK_OP_PENDING,  /* the work transaction is in flight */
-    aNSC_PC_WK_ASK          /* the job row is up: its choices come from pc_nook_work_row() */
+    aNSC_PC_WK_ASK,         /* the job row is up: its choices come from pc_nook_work_row() */
+    aNSC_PC_UP_ASK,         /* shop upgrade: the announcement is up, waiting for its acknowledgement choice */
+    aNSC_PC_UP_BEGIN,       /* shop upgrade: start the closure (host: at once; client: the request) */
+    aNSC_PC_UP_PENDING      /* shop upgrade: the client's start request is in flight (the host's service 6 answers) */
 };
 
 static int aNSC_pc_hs_state;
@@ -2023,6 +2027,20 @@ static void aNSC_pc_rs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     aNSC_pc_hs_state = aNSC_PC_RS_ASK;
 }
 
+/* ---- Multiplayer shop upgrade (pc_shop_upgrade.h): the NEXT talk after the town qualified for the next shop tier ----
+ * Nook announces the upgrade (PC_NOOK_MSG_UPGRADE_ANNOUNCE, two acknowledgement choices), then the closure starts: pc_shop_upgrade_begin() (host: at once, client: one request, the
+ * host's service 6 is the answer, polled by pc_shop_upgrade_poll()) -> the closing row (the shop interior then shows everybody out once the talk is over) / the fallback row when the
+ * start failed (the shop stays open; the next talk announces again). The HOST owns the state, the timer and the renewal; nothing here is authoritative. */
+static void aNSC_pc_up_after_begin(NPC_SHOP_COMMON_ACTOR* shop_common, int r) {
+    if (r == 1) {
+        printf("[NET][SHOPUP] nook dialogue: the closure of the upgrade was started -> closing row\n");
+        aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_UPGRADE_CLOSING, 0);
+    } else {
+        printf("[NET][SHOPUP] nook dialogue: the upgrade could not be started (outcome %d) -> fallback row, the shop stays open\n", r);
+        aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_UPGRADE_LATER, 0);
+    }
+}
+
 /* Yes. of the offer / the "Buy a house." choice: price, then the free houses. */
 static void aNSC_pc_hs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     int r = pc_net_game_house_purchase_precheck(-1);
@@ -2056,6 +2074,22 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
         pc_nook_house_rejoin_hold_touch(); /* heartbeat: the rejoin hold lives only while this proc runs (PENDING / END) */
     }
     switch (aNSC_pc_hs_state) {
+        case aNSC_PC_UP_BEGIN:
+            r = pc_shop_upgrade_begin();
+            if (r == 3) {
+                aNSC_pc_up_after_begin(shop_common, 1); /* the host's own player: started (or already closing) */
+            } else if (r == 1) {
+                aNSC_pc_hs_state = aNSC_PC_UP_PENDING; /* the announcement stays up until the host's state answers */
+            } else {
+                aNSC_pc_up_after_begin(shop_common, pc_shop_upgrade_closed() ? 1 : -1); /* refused locally: somebody else may have started it already */
+            }
+            break;
+        case aNSC_PC_UP_PENDING:
+            r = pc_shop_upgrade_poll();
+            if (r != 0) {
+                aNSC_pc_up_after_begin(shop_common, r);
+            }
+            break;
         case aNSC_PC_WK_OP_BEGIN:
             aNSC_pc_wk_begin(shop_common);
             break;
@@ -2088,6 +2122,7 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 aNSC_pc_rs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
             }
             break;
+        case aNSC_PC_UP_ASK:
         case aNSC_PC_WK_ASK:
         case aNSC_PC_RS_ASK:
         case aNSC_PC_HS_ASK_INTRO:
@@ -2097,7 +2132,10 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 return;
             }
             k = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
-            if (aNSC_pc_hs_state == aNSC_PC_WK_ASK) {
+            if (aNSC_pc_hs_state == aNSC_PC_UP_ASK) {
+                printf("[NET][SHOPUP] nook dialogue: the announcement was acknowledged (choice %d): starting the closure\n", k);
+                aNSC_pc_hs_state = aNSC_PC_UP_BEGIN; /* every choice is an acknowledgement: the upgrade is Nook's decision */
+            } else if (aNSC_pc_hs_state == aNSC_PC_WK_ASK) {
                 int acts[4];
                 int n = pc_nook_work_row(&aNSC_pc_wk_view, acts, 4);
                 int act = (k >= 0 && k < n) ? acts[k] : PC_NOOK_WACT_LATER;
@@ -2218,6 +2256,16 @@ static void aNSC_pc_hs_enter(NPC_SHOP_COMMON_ACTOR* shop_common, int state) {
 static void aNSC_pc_set_talk_info_intro(ACTOR* actorx) {
     mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_INTRO));
     ((NPC_SHOP_COMMON_ACTOR*)actorx)->next_action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT;
+}
+
+static void aNSC_pc_set_talk_info_upgrade(ACTOR* actorx) {
+    mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_UPGRADE_ANNOUNCE));
+    ((NPC_SHOP_COMMON_ACTOR*)actorx)->next_action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT;
+}
+
+/* 1 = this talk is the shop upgrade announcement: the town qualified (host state / the client's mirror), not during the local player's first-job chores (their own Nook flow). */
+static int aNSC_pc_up_due(void) {
+    return pc_shop_upgrade_announce_due() && !mEv_CheckFirstJob();
 }
 #endif
 
@@ -2427,6 +2475,10 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         /* Guest-first town M4: a GUEST that was never offered a house: Nook introduces himself and asks (first greeting only) */
         wait_type = aNSC_WAIT_TYPE_PC_HOUSE;
     }
+    if (wait_type != aNSC_WAIT_TYPE_HRATALK && aNSC_pc_up_due()) {
+        /* Multiplayer shop upgrade: the NEXT talk after the town qualified is Nook's announcement (a house reminder / balloon / guest intro simply waits for the next talk) */
+        wait_type = aNSC_WAIT_TYPE_PC_UPGRADE;
+    }
 #endif
 
     if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == TRUE && mDemo_Check_ListenAble() == FALSE) {
@@ -2442,6 +2494,7 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
                 break;
 #ifdef aNSC_PC_HOUSE
             case aNSC_WAIT_TYPE_PC_HOUSE:
+            case aNSC_WAIT_TYPE_PC_UPGRADE:
                 action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT; /* a greeting that waits for a choice: same animation / position handling */
                 break;
 #endif
@@ -2476,6 +2529,9 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
 #ifdef aNSC_PC_HOUSE
         if (wait_type == aNSC_WAIT_TYPE_PC_HOUSE) {
             aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_ASK_INTRO);
+        } else if (wait_type == aNSC_WAIT_TYPE_PC_UPGRADE) {
+            printf("[NET][SHOPUP] nook dialogue: the shop upgrade announcement is shown\n");
+            aNSC_pc_hs_enter(shop_common, aNSC_PC_UP_ASK);
         }
 #endif
         return;
@@ -2501,6 +2557,9 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
 #ifdef aNSC_PC_HOUSE
         case aNSC_WAIT_TYPE_PC_HOUSE:
             proc = aNSC_pc_set_talk_info_intro;
+            break;
+        case aNSC_WAIT_TYPE_PC_UPGRADE:
+            proc = aNSC_pc_set_talk_info_upgrade;
             break;
 #endif
     }

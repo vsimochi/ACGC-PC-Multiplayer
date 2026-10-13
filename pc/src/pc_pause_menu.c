@@ -8,6 +8,7 @@
 #include <SDL.h>
 #include "pc_net_game.h" /* batch A (A3): pc_net_game_client_notice_visible() */
 #include "pc_dresser_ui.h" /* 6q: the dresser screen's "Move" target hint */
+#include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure / reopening notice */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -349,6 +350,15 @@ void pc_net_notice_draw(struct game_s* game) {
             if (edit_notice == 5) { /* dresser storage 6l: an extra-slot transaction refused because the room holds uncommitted edits */
                 pc_menu_draw_centered(game, "then reopen it to store more items.", 74.0f, 255, 200, 90, 255, 1.0f);
             }
+            mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+        }
+    }
+    {
+        /* Multiplayer shop upgrade: "closed for N minutes for an upgrade" / "upgraded and open again", ~8 s after the change (drawn in addition to the other notices). */
+        char up_line[96];
+        if (pc_shop_upgrade_notice(up_line, (int)sizeof(up_line))) {
+            mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+            pc_menu_draw_centered(game, up_line, 46.0f, 255, 230, 140, 255, 1.0f);
             mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
         }
     }

@@ -7,6 +7,8 @@
 #include "m_string.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#include "pc_shop_upgrade.h" /* multiplayer: the announced 5-minute shop upgrade replaces the vanilla 2-day schedule on a host */
+#include <stdio.h>
 #endif
 
 static void Shop_Level_Actor_ct(ACTOR* actorx, GAME* game);
@@ -253,6 +255,93 @@ static void aSL_RenewShop(ACTOR* actorx, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* Multiplayer shop upgrade (pc_shop_upgrade.h): the vanilla renewal body of aSL_RenewShop without its actor, for a HOST whose player is NOT in the town scene (a listen host
+ * indoors): the town field then lives only in the save (Save_t.fg / deposit), exactly what Shop_Level_Actor_ct sees at a town load, and no live structure actor exists that could
+ * write the old structure tile back at its teardown. Same steps and order as aSL_RenewShop: structure tile, ground clean (displaced items -> police box), level, event off, new
+ * exchange day + lineup. The caller (pc_net_game.c) never calls it while the host is in the town scene (that case uses the vanilla actor ct through a town reload). */
+static mActor_name_t* aSL_PC_ShopBlockFg(int* bx, int* bz) {
+    if (!mFI_BlockKind2BkNum(bx, bz, mRF_BLOCKKIND_SHOP) || *bx < 1 || *bz < 1 || *bx > FG_BLOCK_X_NUM || *bz > FG_BLOCK_Z_NUM) {
+        return NULL;
+    }
+    return Save_Get(fg[*bz - 1][*bx - 1]).items[0];
+}
+
+static int aSL_PC_FindStructureTile(const mActor_name_t* fg_p) {
+    int i;
+    for (i = 0; i < UT_TOTAL_NUM; i++) {
+        if ((fg_p[i] >= SHOP0 && fg_p[i] <= SHOP3) || (fg_p[i] >= DUMMY_SHOP0 && fg_p[i] <= DUMMY_SHOP3)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int aSL_PC_RenewShopDirect(void) {
+    int bx, bz, i;
+    mActor_name_t* fg_p = aSL_PC_ShopBlockFg(&bx, &bz);
+    const int level = mSP_GetShopLevel();
+    const int next_level = mSP_GetRealShopLevel();
+
+    if (fg_p == NULL || next_level <= level) {
+        return FALSE;
+    }
+    for (i = 0; i < UT_TOTAL_NUM; i++) {
+        if (fg_p[i] >= SHOP0 && fg_p[i] <= SHOP3) { /* never a DUMMY_SHOP*: that would be a live structure actor (the town scene), which this path must not run in */
+            fg_p[i] = SHOP0 + next_level;
+            aSL_GroundClean((s16)level, (s16)next_level, fg_p, bx, bz, i & 0xF, (i >> 4) & 0xF);
+            if (mSP_RenewShopLevel()) {
+                mEv_EventOFF(mEv_SAVED_RENEWSHOP);
+                mSP_NewExchangeDay();
+                mSP_ExchangeLineUp_ZeldaMalloc();
+                return TRUE;
+            }
+            return FALSE;
+        }
+    }
+    return FALSE;
+}
+
+extern int pc_town_shop_structure_unit(int* bx, int* bz, int* tile); /* pc_m_card.c: the unit of the live shop structure actor (town scene) */
+
+int aSL_PC_ShopFootprint(int level, int* acre, int* struct_tile, int* tiles, int cap) {
+    static const aSL_rewrite_ofs_c* table[] = { aSL_zakka_rw, aSL_conveni_rw, aSL_super_rw, aSL_super_rw };
+    static const int rw_cnt[] = { ARRAY_COUNT(aSL_zakka_rw), ARRAY_COUNT(aSL_conveni_rw), ARRAY_COUNT(aSL_super_rw), ARRAY_COUNT(aSL_super_rw) };
+    int bx, bz, i, n = 0, ux, uz, st = -1;
+    const mActor_name_t* fg_p = aSL_PC_ShopBlockFg(&bx, &bz);
+
+    if (fg_p != NULL && (st = aSL_PC_FindStructureTile(fg_p)) < 0) {
+        /* the town scene is loaded: the live structure actor owns the tile (RSV_NO / DUMMY_SHOPn there), its home position is the structure tile */
+        int abx, abz, at;
+        if (pc_town_shop_structure_unit(&abx, &abz, &at) && abx == bx && abz == bz) {
+            st = at;
+        }
+    }
+    if (fg_p == NULL || st < 0) {
+        if (fg_p == NULL) {
+            printf("[NET][SHOPUP] aSL_PC_ShopFootprint: no shop block\n");
+        } else {
+            printf("[NET][SHOPUP] aSL_PC_ShopFootprint: no structure tile in block (%d,%d):", bx, bz);
+            for (i = 0; i < UT_TOTAL_NUM; i++) {
+                if (fg_p[i] >= 0x5000 && fg_p[i] != RSV_NO) {
+                    printf(" [%d]=0x%04X", i, (unsigned)fg_p[i]);
+                }
+            }
+            printf("\n");
+        }
+        return 0;
+    }
+    ux = st & 0xF;
+    uz = (st >> 4) & 0xF;
+    *acre = (bz - 1) * FG_BLOCK_X_NUM + (bx - 1);
+    *struct_tile = st;
+    for (i = 0; i < rw_cnt[level & 3] && n < cap; i++) {
+        tiles[n++] = ((uz + table[level & 3][i].ofs_uz) & 0xF) * UT_X_NUM + ((ux + table[level & 3][i].ofs_ux) & 0xF);
+    }
+    return n;
+}
+#endif
+
 static void Shop_Level_Actor_ct(ACTOR* actorx, GAME* game) {
     SHOP_LEVEL_ACTOR* shop_level = (SHOP_LEVEL_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
@@ -297,7 +386,13 @@ static void aSL_JudgeRenewShop(ACTOR* actorx, GAME* game) {
         return;
     }
 #endif
-    if (Save_Get(scene_no) == SCENE_FG && mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == FALSE) {
+    if (Save_Get(scene_no) == SCENE_FG && mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == FALSE
+#ifdef TARGET_PC
+        /* Multiplayer shop upgrade: a host with the feature on never schedules the vanilla 2-day renewal; Nook announces the upgrade and the host closes the shop
+         * for 5 minutes instead (pc_shop_upgrade.h). The flyer calls below still run (the reopening leaflet). */
+        && !pc_shop_upgrade_host_replaces_vanilla()
+#endif
+    ) {
         if (mSP_GetShopLevel() < mSP_GetRealShopLevel()) {
             lbRTC_time_c now_time = Common_Get(time.rtc_time);
             lbRTC_time_c renewal_two_days = now_time;

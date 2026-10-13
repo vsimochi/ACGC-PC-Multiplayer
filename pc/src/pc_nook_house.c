@@ -8,6 +8,7 @@
 #include "pc_platform.h"  /* SDL_GetTicks: the rejoin hold heartbeat runs on the wall clock */
 #include "m_msg_data.h"
 #include "m_name_table.h" /* ITM_FOOD_*: the Work Mode objective names */
+#include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure length / minutes left in Nook's rows and the door row */
 
 /* control code bytes (tools/msg_tool.py COMMANDS / CONT_SIZES; include/m_font.h mFont_CONT_CODE_*) */
 #define NK_CC 0x7F
@@ -168,6 +169,18 @@ int pc_nook_msg_id(int which) {
 
 int pc_nook_restock_door_msg(void) {
     return MSG_MAX + PC_NOOK_MSG_RESTOCK_DOOR; /* the shop doors (ac_*_move.c_inc) while the shop restocks */
+}
+
+int pc_nook_upgrade_door_msg(void) {
+    return MSG_MAX + PC_NOOK_MSG_UPGRADE_DOOR; /* the shop doors (ac_*_move.c_inc) while the shop is closed for the upgrade */
+}
+
+/* "5 minutes" / "1 minute" (the shop upgrade rows) */
+static void nk_minutes(char* out, size_t cap, int m) {
+    if (m < 1) {
+        m = 1;
+    }
+    snprintf(out, cap, "%d minute%s", m, m == 1 ? "" : "s");
 }
 
 int pc_nook_msg_id_valid(int id) {
@@ -668,6 +681,71 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\nthis is about.");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_UPGRADE_ANNOUNCE:
+            nk_minutes(tmp, sizeof(tmp), pc_shop_upgrade_minutes_total());
+            nk_text(&b, "Ah, ");
+            nk_code(&b, NK_PLAYERNAME);
+            nk_text(&b, "! Welcome!");
+            nk_pause(&b, 8);
+            nk_text(&b, "\nBusiness has been booming\nlately, hm!");
+            nk_page(&b);
+            nk_text(&b, "I've been thinking about");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nupgrading the shop, hm.");
+            nk_page(&b);
+            nk_text(&b, "A bigger store would");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nhelp everyone out here\nin town!");
+            nk_page(&b);
+            nk_text(&b, "So the shop will close");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nfor ");
+            nk_text(&b, tmp);
+            nk_text(&b, " while\nthe work is done.");
+            nk_page(&b);
+            nk_text(&b, "Everyone inside will be");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nshown out. Please come\nback soon, hm?");
+            ids[0] = PC_NOOK_SEL_UP_GREAT;
+            ids[1] = PC_NOOK_SEL_UP_OK;
+            nk_choice(&b, ids, 2);
+            break;
+        case PC_NOOK_MSG_UPGRADE_CLOSING:
+            nk_minutes(tmp, sizeof(tmp), pc_shop_upgrade_minutes_total());
+            nk_text(&b, "Splendid! I'll close up");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nright away.");
+            nk_page(&b);
+            nk_text(&b, "See you in ");
+            nk_text(&b, tmp);
+            nk_text(&b, ",");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nhm! Do come back soon!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_UPGRADE_LATER:
+            nk_text(&b, "Hm, on second thought...");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nlet me look over the\nplans a little longer.");
+            nk_page(&b);
+            nk_text(&b, "Let's talk about it");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nanother time, hm!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_UPGRADE_DOOR:
+            nk_minutes(tmp, sizeof(tmp), pc_shop_upgrade_minutes_left());
+            nk_text(&b, "Sorry, sorry!");
+            nk_pause(&b, 8);
+            nk_text(&b, "\nThe shop is closed for\nits upgrade.");
+            nk_page(&b);
+            nk_text(&b, "Please come back in about");
+            nk_pause(&b, 6);
+            nk_text(&b, "\n");
+            nk_text(&b, tmp);
+            nk_text(&b, ", hm?");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_RESTOCK_DOOR:
             nk_text(&b, "Sorry, sorry!");
             nk_pause(&b, 8);
@@ -832,6 +910,12 @@ int pc_nook_sel_build(int id, unsigned char* dst16) {
             break;
         case PC_NOOK_SEL_DRESSER_MORE:
             snprintf(tmp, sizeof(tmp), "More storage"); /* dresser storage (worker 3): the host-side pool of the own dresser */
+            break;
+        case PC_NOOK_SEL_UP_GREAT:
+            snprintf(tmp, sizeof(tmp), "Sounds great!"); /* shop upgrade announcement */
+            break;
+        case PC_NOOK_SEL_UP_OK:
+            snprintf(tmp, sizeof(tmp), "All right.");
             break;
         default:
             snprintf(tmp, sizeof(tmp), "House %d.", id - PC_NOOK_SEL_HOUSE1 + 1);

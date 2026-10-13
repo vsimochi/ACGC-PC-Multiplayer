@@ -63,10 +63,11 @@ EXPECTED_MAX_MSG_ID = 76
 # HEAD 1c67a1a (v0.1.1 + later) already carries 72 NPC_HOME_EXIT, 73 WILDLIFE_STATE, 74 BOBBER_STATE, 75 BOBBER_EVENT, 76 HANDSHAKE_BUSY, so the
 # contiguous baseline is 1..76.  Master sprint 2 documented additions (PRESENTATION / sprint messages, no protocol bump) live in this reviewed
 # range and may be present or absent while workers land: 77 TREE_DROP, 78 SHOP_PREVIEW, 79 / 80 ball, 81 BEE_SWARM, 82 bees spare,
-# 83 / 84 dresser storage.  Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
-SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 85))
-SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*)Msg"
-_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-4])\s*,?"
+# 83 / 84 dresser storage, 85 SHOP_UPGRADE_REQ (the announced 5-minute shop upgrade, client -> host, 8 B; deliberate, no protocol bump).
+# Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
+SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86))
+SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*|ShopUpgradeReq)Msg"
+_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-5])\s*,?"
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -185,7 +186,9 @@ X3_SIZE_ASSERTS = ('_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 76,
 # Town services milestone 1: exact C lines (constants + size / offset asserts) that must stay as they are.
 TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM   2u", "#define PC_NETGAME_TS_SHOP     3u",
              # batch A (A1): service 4 = HOST_CONFIG (authoritative wildlife mode), array bound 5, 8-byte blob
-             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      6u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             # the announced shop upgrade (deliberate): service 6 = SHOP_UPGRADE (16-byte state blob), array bound 7; an old client ignores service 6
+             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      7u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             "#define PC_NETGAME_TS_UPGRADE  6u", "#define PC_NETGAME_TS_UPGRADE_LEN 16u",
              # events: service 5 = EVENT_STATE (214-byte decision-state blob), array bound 6
              "#define PC_NETGAME_TS_EVENT    5u", "#define PC_NETGAME_TS_EVENT_LEN 214u",
              "#define PC_NETGAME_TS_BLOB_MAX 340u", "#define PC_NETGAME_TS_POLICE_LEN 40u", "#define PC_NETGAME_TS_MUSEUM_LEN 63u",
@@ -591,7 +594,7 @@ def audit_texts(head, cur):
         and re.search(r"PC_NETGAME_MSG_HANDSHAKE_BUSY\s*=\s*76", cb["PCNetGameMsgType"])
         and "PC_NETGAME_MSG_PAGE = 71" in cb["PCNetGameMsgType"])
     nums = [v for _n, v in c_message_ids_raw(cur["game_c"])]
-    add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c plus only the documented sprint extras 77..84 (max %s)"
+    add("wire: message ids are unique and contiguous 1..EXPECTED_MAX_MSG_ID (%d) in pc_net_game.c plus only the documented sprint extras 77..85 (max %s)"
         % (EXPECTED_MAX_MSG_ID, max(nums) if nums else None),
         len(nums) == len(set(nums)) and sorted(v for v in nums if v <= EXPECTED_MAX_MSG_ID) == list(range(1, EXPECTED_MAX_MSG_ID + 1))
         and all(v in SPRINT_EXTRA_MSG_IDS for v in nums if v > EXPECTED_MAX_MSG_ID))

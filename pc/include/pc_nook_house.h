@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 35
+#define PC_NOOK_MSG_COUNT 39
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -47,12 +47,19 @@ enum {
     PC_NOOK_MSG_WORK_V_FAIL,     /* the villager does not know what this is about */
     PC_NOOK_MSG_EVNPC_GIFT_GONE, /* Gulliver: his gift of this visit was already given away (the host decided) */
     PC_NOOK_MSG_PORTER_STATION,  /* Porter (station master): replaces the vanilla "going somewhere? / return to your village" offer, which has no meaning in this multiplayer version */
-    PC_NOOK_MSG_DRESSER_REFUSED  /* dresser storage (worker 3): a REJECTED / unanswered dresser request (system text: nothing changed) */
+    PC_NOOK_MSG_DRESSER_REFUSED, /* dresser storage (worker 3): a REJECTED / unanswered dresser request (system text: nothing changed) */
+    /* Multiplayer shop upgrade (pc_shop_upgrade.h; appended: every earlier id keeps its value): */
+    PC_NOOK_MSG_UPGRADE_ANNOUNCE, /* Nook has been thinking about upgrading the shop, it would help everyone in town, the shop closes for N minutes; 2 acknowledgement choices */
+    PC_NOOK_MSG_UPGRADE_CLOSING,  /* the closure started (this player's request or a simultaneous one): "I'll close up right away, see you in N minutes" */
+    PC_NOOK_MSG_UPGRADE_LATER,    /* the start failed (timeout / link lost / refused): "let's talk about it another time" (the shop stays open) */
+    PC_NOOK_MSG_UPGRADE_DOOR      /* the shop door while the shop is closed for the upgrade (the minutes left) */
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */
 enum { PC_NOOK_SEL_BUY_HOUSE = PC_NOOK_SEL_BASE, PC_NOOK_SEL_HOUSE1, PC_NOOK_SEL_HOUSE2, PC_NOOK_SEL_HOUSE3, PC_NOOK_SEL_HOUSE4, PC_NOOK_SEL_ANY_HOUSE, PC_NOOK_SEL_REFRESH, PC_NOOK_SEL_WORK, PC_NOOK_SEL_WORK_HERE, PC_NOOK_SEL_WORK_LATER, PC_NOOK_SEL_WORK_LEAVE, PC_NOOK_SEL_JOB, PC_NOOK_SEL_WORK_TAKE, PC_NOOK_SEL_WORK_REPORT,
        PC_NOOK_SEL_DRESSER_MORE, /* dresser storage: "More storage" (appended: every earlier id keeps its value) */
+       PC_NOOK_SEL_UP_GREAT,     /* shop upgrade announcement: "Sounds great!" */
+       PC_NOOK_SEL_UP_OK,        /* shop upgrade announcement: "All right." */
        PC_NOOK_SEL_COUNT_END };
 /* one choice string per house: a different PC_RESIDENCE_HOUSES needs more PC_NOOK_SEL_HOUSEn entries (and Nook's choice paging beyond 6 choices; see the roadmap) */
 _Static_assert(PC_NOOK_SEL_ANY_HOUSE - PC_NOOK_SEL_HOUSE1 == 4, "one PC_NOOK_SEL_HOUSEn per house (PC_RESIDENCE_HOUSES)");
@@ -113,6 +120,8 @@ int pc_nook_house_rejoin_hold(void);
 
 /* The id of PC message `which` (PC_NOOK_MSG_*), and the range tests used by the bounds checks of the message system. */
 int pc_nook_msg_id(int which);
+/* The shop door row while the shop is closed for the multiplayer shop upgrade (PC_NOOK_MSG_UPGRADE_DOOR). */
+int pc_nook_upgrade_door_msg(void);
 int pc_nook_msg_id_valid(int id);
 int pc_nook_sel_id_valid(int id);
 

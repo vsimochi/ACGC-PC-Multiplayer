@@ -117,6 +117,13 @@ static void aSPR_set_talk_info_close_wait(ACTOR* actorx) {
         extern int pc_nook_restock_door_msg(void);
         msg_no = pc_nook_restock_door_msg();
     }
+    {   /* multiplayer shop upgrade: the door explains the announced closure (vanilla RENEW keeps MSG_SHOP_RENEW in single player) */
+        extern int pc_shop_upgrade_closed(void);
+        extern int pc_nook_upgrade_door_msg(void);
+        if (pc_shop_upgrade_closed()) {
+            msg_no = pc_nook_upgrade_door_msg();
+        }
+    }
 #endif
     mDemo_Set_msg_num(msg_no);
 

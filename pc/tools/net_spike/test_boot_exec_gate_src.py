@@ -87,6 +87,7 @@ GUARDS = {
     ("pc_net_game.c", "pcnetgame_ap_player_pos"): "TEST-ONLY autopilot helper: play != NULL && pcfa_scene_is_town() (g_fdinfo valid only in a play scene)",
     ("pc_net_game.c", "pcnetgame_ap_player_state"): "TEST-ONLY autopilot helper: play != NULL && pcfa_scene_is_town()",
     ("pc_net_game.c", "pcnetgame_ap_rod_out"): "TEST-ONLY autopilot helper: play != NULL && pcfa_scene_is_town()",
+    ("pc_m_card.c", "pc_town_same_position_reload"): "shop upgrade (client town refresh): `gamePT == NULL || gamePT->exec != play_main` -> return 0 before the play cast / actor read",
     ("pc_m_card.c", "pc_host_renewshop_poll"): "master sprint 2 (host shop renewal): HOST role + `gamePT == NULL || gamePT->exec != play_main` -> return before the play cast / actor read",
     ("pc_net_game.c", "pcnetgame_museum_warp_test_hook"): "master sprint 2 TEST-ONLY env-armed hook (AC_TEST_MUSEUM_ROOM); like the goto / room-enter hooks no exec gate (known low-risk gap, test builds only)",
     ("pc_net_game.c", "pcnetgame_dresser_room_warp_test_hook"): "master sprint 2 TEST-ONLY env-armed hook (AC_TEST_DRESSER_ROOM, client): reads the actor behind play != NULL, then pcnetgame_is_real_player_actor(pa) (exec-gated) before any use",

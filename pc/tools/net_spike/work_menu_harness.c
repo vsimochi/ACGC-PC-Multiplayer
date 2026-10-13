@@ -11,6 +11,8 @@ static int g_view_known = 1;
 int pc_net_game_work_offer_available(void) { return g_offer; }
 int pc_net_game_work_view(PCWorkView* v) { *v = g_view; return g_view_known; }
 int pc_net_game_house_purchase_price(void) { return 18400; }
+int pc_shop_upgrade_minutes_total(void) { return 5; } /* the shop upgrade rows (pc_shop_upgrade.h) */
+int pc_shop_upgrade_minutes_left(void) { return 3; }
 uint32_t SDL_GetTicks(void) { return 0; }
 
 /* the vanilla message 0x1092 as dumped from a real game (AC_TEST_DUMP_MSG): "Yes, yes! What can I do for you, hm?" + SETSELSTR4 {0x000A, 0x01C4, 0x0009, 0x000B} */
