@@ -18,7 +18,18 @@
  *
  * MIGRATION from guests.dat v2 (pc_mp_gs_migrate_legacy): every present entry is written as its own file (create-only: an existing guest of the same (town, key) is never overwritten),
  * read back and compared byte for byte; only when ALL succeeded the legacy file and its .bak1 / .bak2 are renamed to <name>.v2-migrated-<timestamp> (kept, never deleted, so they cannot
- * be re-imported over later changes). A crash half way just repeats safely. A legacy file that is itself unreadable / UNTRUSTED is left untouched and reported. */
+ * be re-imported over later changes). A crash half way just repeats safely. A legacy file that is itself unreadable / UNTRUSTED is left untouched and reported.
+ *
+ * File v4 (guest mailbox, "Guest mailbox via the post office"): the v3 layout followed by ONE EXTENSION BLOCK, all of it covered by the trailing CRC (fixed size 12396 B):
+ *   header (32 B, version 4) | id (16 B) | entry (9352 B) | u32 ext_len (= 2988: the bytes of the block after this field) | u32 ext_version (1) | u32 mbox_mask (bits 0..9)
+ *   | 10 x 298 B letters (the canonical BIG-ENDIAN Mail_c image of each used slot; an unused slot is all zero bytes) | u32 crc32
+ * The guest's host-held MAILBOX (letters waiting for it at the post office) therefore lives in the SAME file as its carried letters (entry.record mail[]): a letter moved from the
+ * mailbox into mail[] (MAIL_TAKE) is ONE atomic file write, so a crash can neither duplicate nor lose it.
+ * The writer emits v4 ONLY while the mailbox holds a letter; an empty mailbox is written as plain v3 (byte-identical to the previous build). A v3 file reads as an empty mailbox.
+ * Rules of the block: ext_version != 1 -> VERSION_FUTURE (never reinterpreted); ext_len != 2988 -> SHAPE; mask bits above 9 -> FIELD; an unused slot that is not all zero / a used slot that
+ * is all zero -> FIELD. DOWNGRADE (known, accepted): an OLDER build refuses a v4 file as "a newer version" and moves it aside to *.corrupt-* (its store then becomes UNTRUSTED: no guests
+ * admitted). This build heals that on its next start: a preserved *.corrupt-* file of a guest that has no readable generation, which parses cleanly now, is copied back as the guest's
+ * primary file (the *.corrupt-* file is kept) -- see pc_mp_gs_load. */
 #ifndef PC_MP_GUEST_STORE_H
 #define PC_MP_GUEST_STORE_H
 
@@ -31,23 +42,38 @@
 extern "C" {
 #endif
 
-#define PC_MP_GS_VERSION     3u
+#define PC_MP_GS_VERSION_V3  3u /* no extension block (empty guest mailbox) */
+#define PC_MP_GS_VERSION     4u /* the newest version this build reads; written only while the guest mailbox holds a letter */
 #define PC_MP_GS_HEADER_SIZE 32
 #define PC_MP_GS_ID_SIZE     16
-#define PC_MP_GS_FILE_SIZE   (PC_MP_GS_HEADER_SIZE + PC_MP_GS_ID_SIZE + PC_MP_GUEST_ENTRY_SIZE + 4)
+#define PC_MP_GS_FILE_SIZE   (PC_MP_GS_HEADER_SIZE + PC_MP_GS_ID_SIZE + PC_MP_GUEST_ENTRY_SIZE + 4) /* a v3 file: 9404 */
+#define PC_MP_GS_MBOX_SLOTS  10   /* == HOME_MAILBOX_SIZE */
+#define PC_MP_GS_MAIL_SIZE   298  /* == sizeof(Mail_c), the canonical BE letter image */
+#define PC_MP_GS_MBOX_MASK   0x03FFu
+#define PC_MP_GS_EXT_VERSION 1u
+#define PC_MP_GS_EXT_LEN     (4 + 4 + PC_MP_GS_MBOX_SLOTS * PC_MP_GS_MAIL_SIZE) /* ext_version + mbox_mask + letters = 2988 */
+#define PC_MP_GS_FILE_SIZE_V4 (PC_MP_GS_FILE_SIZE + 4 + PC_MP_GS_EXT_LEN)     /* 12396 */
+#define PC_MP_GS_FILE_MAX    PC_MP_GS_FILE_SIZE_V4
 
 typedef struct PCMpGsRecord {
     uint8_t        id[PC_MP_GS_ID_SIZE];
     uint32_t       generation;
     PCMpGuestEntry e; /* e.present == 1 */
+    /* the guest mailbox (v4 extension): bit i of mbox_mask = slot i holds a letter, whose canonical BE image is mbox[i]; unused slots are all zero. mask 0 = written as v3. */
+    uint16_t       mbox_mask;
+    uint8_t        mbox[PC_MP_GS_MBOX_SLOTS][PC_MP_GS_MAIL_SIZE];
 } PCMpGsRecord;
 
-/* Pure buffer functions. serialize: `out` must hold PC_MP_GS_FILE_SIZE bytes. Errors are PC_MP_GST_ERR_*. */
+/* Pure buffer functions. serialize: `out` must hold pc_mp_gs_serialized_size(r) bytes (PC_MP_GS_FILE_SIZE for an empty mailbox, PC_MP_GS_FILE_SIZE_V4 otherwise).
+ * Errors are PC_MP_GST_ERR_*. */
+size_t pc_mp_gs_serialized_size(const PCMpGsRecord* r);
 int pc_mp_gs_serialize(const PCMpGsRecord* r, uint8_t* out, size_t cap);
 int pc_mp_gs_parse(const uint8_t* buf, size_t len, PCMpGsRecord* out);
 
 /* A digest of everything durable about an entry EXCEPT its epoch (an epoch re-roll alone is not a reason to rewrite): equal digests = nothing to write. */
 uint32_t pc_mp_gs_entry_digest(const PCMpGuestEntry* e);
+/* Folds the mailbox of `r` into an entry digest: returns `entry_digest` unchanged for an empty mailbox (a v3 guest keeps its digest), else a CRC over it + the mask + the letters. */
+uint32_t pc_mp_gs_ext_digest(const PCMpGsRecord* r, uint32_t entry_digest);
 
 /* Ids and names. id_hex: 33 bytes out. A file is <dir>/<hex>.gst (+ .bak1 / .bak2). */
 void pc_mp_gs_id_hex(const uint8_t id[PC_MP_GS_ID_SIZE], char out[33]);
@@ -73,6 +99,7 @@ typedef struct PCMpGsLoadInfo {
     int  moved_aside;     /* unreadable files moved aside to *.corrupt-* during this load */
     int  stray_corrupt;   /* preserved *.corrupt-* files whose id has no valid guest */
     int  duplicates;      /* guests sharing a (town, key) or a token with another guest */
+    int  restored;        /* guests whose only readable copy was a preserved *.corrupt-* file (an older build set a newer-version file aside): copied back as the primary */
     int  untrusted;       /* the caller must NOT admit new guests (see the header comment) */
     char first_problem[320];
 } PCMpGsLoadInfo;

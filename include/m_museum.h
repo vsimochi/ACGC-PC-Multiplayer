@@ -6,6 +6,7 @@
 #include "m_mail.h"
 #include "m_museum_display.h"
 #include "m_collision_bg.h"
+#include "m_private_h.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +61,12 @@ extern u8 mMsm_GetDepositBlockNum(u8 record);
 extern void mMsm_DepositFossil(u8 deposit_record, int fossil_count, u16* cancel_ut, int send_order_info);
 extern void mMsm_SetCompMail();
 extern void mMsm_SendCompMail();
+#ifdef TARGET_PC
+/* guest mailbox (host): the museum completion letter (FTR_NOG_MUSEUM) for one GUEST record, handed to `sink` once (host-owned state_flags bits are the dedupe) */
+typedef int (*mMsm_GUEST_SINK)(Mail_c* mail, void* ctx);
+extern int mMsm_MuseumComplete(void);
+extern int mMsm_GuestCompMailForSink(Private_c* gpriv, int complete, mMsm_GUEST_SINK sink, void* ctx);
+#endif
 
 #ifdef __cplusplus
 }

@@ -203,11 +203,12 @@ def m_mirror_at_ready(run, a, b):
     ck("TS2 no spam: exactly ONE TOWN_SVC_STATE per service per client after 2.5 s idle (the digest poll sends only on a change)",
        ts_count(a, SVC_POLICE) == 1 and ts_count(a, SVC_MUSEUM) == 1 and ts_count(b, SVC_POLICE) == 1 and ts_count(b, SVC_MUSEUM) == 1)
     ck("TS2 the shop (3) is mirrored since the shop milestone (exactly ONE push per client, 320 B, digest == FNV-1a32), HOST_CONFIG (4, batch A) is pushed exactly "
-       "once per client (len 8, host WITHOUT --authoritative-wildlife -> blob[0] == 0, reserved bytes zero, digest == FNV-1a32) service 5 (EVENT, events milestone) is pushed exactly once per client and no reserved service (6+) is ever sent",
+       "once per client (len 8, host WITHOUT --authoritative-wildlife -> blob[0] == 0, reserved bytes zero, digest == FNV-1a32) service 5 (EVENT, events milestone) is pushed exactly once per client and no reserved service (8+) is ever sent",
        all(ts_count(c, L.PC_NETGAME_TS_SHOP) == 1 and c.ts_latest(L.PC_NETGAME_TS_SHOP)[0].len == L.PC_NETGAME_TS_SHOP_LEN for c in (a, b))
        and all(ts_count(c, L.PC_NETGAME_TS_HOSTCFG) == 1 and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[0].len == L.PC_NETGAME_TS_HOSTCFG_LEN
                and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[1] == bytes(8) and c.ts_latest(L.PC_NETGAME_TS_HOSTCFG)[0].digest == L.fnv1a32(bytes(8)) for c in (a, b))
-       and not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM, L.PC_NETGAME_TS_SHOP, L.PC_NETGAME_TS_HOSTCFG, SVC_EVENT)])
+       # deliberate re-pin: 6 = SHOP_UPGRADE (the shop upgrade) and 7 = GUEST_DIR (letters to guests) are named services now; 8+ stay reserved
+       and not [1 for c in (a, b) for conn, g, bl in c.ts_states if g.service not in (SVC_POLICE, SVC_MUSEUM, L.PC_NETGAME_TS_SHOP, L.PC_NETGAME_TS_HOSTCFG, SVC_EVENT, 6, L.PC_NETGAME_TS_GUESTDIR)])
     ev_a, ev_b = latest(a, SVC_EVENT, 1, 5.0), latest(b, SVC_EVENT, 1, 5.0)
     ck("TS4 events: both clients received the EVENT_STATE (service 5) at READY: len 214, digest == FNV-1a32 of the blob == the digest the HOST logged for that seq, "
        "identical blob and seq for both clients, exactly ONE push per client after the idle wait",

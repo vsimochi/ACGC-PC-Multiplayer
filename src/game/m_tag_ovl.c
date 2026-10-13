@@ -33,6 +33,11 @@
 #include <stdio.h>
 #include "pc_dresser_ui.h"
 extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
+#include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest copy for a guest, else now_home's; NULL-guarded) */
+#define mTG_MAILBOX() pc_ui_mailbox()
+#define mTG_MAILBOX_USABLE() pc_ui_mailbox_usable()
+#else
+#define mTG_MAILBOX() (Common_Get(now_home)->mailbox)
 #endif
 
 static void mTG_mark_main_CLR(Submenu* submenu, const mSM_MenuInfo_c* menu_info);
@@ -1659,7 +1664,12 @@ static Mail_c* mTG_get_mail_pointer(Submenu* submenu, mHD_Ovl_c* hand_ovl) {
         case mTG_TABLE_CPMAIL:
             return &cpmail_ovl->card_mail->mail[page][idx];
         case mTG_TABLE_MBOX:
-            return &Common_Get(now_home)->mailbox[idx];
+#ifdef TARGET_PC
+            if (mTG_MAILBOX() == NULL) {
+                return NULL; /* guest mailbox: no mailbox at all (NULL now_home and not a guest client): never pointer math on NULL; unreachable through the UI (the overlay only opens on a mailbox) */
+            }
+#endif
+            return &mTG_MAILBOX()[idx];
         default:
             return &Now_Private->mail[idx];
     }
@@ -3506,9 +3516,9 @@ static void mTG_get_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 /* Mail milestone 2: 1 iff this is a network CLIENT and `mail` is one of the slots of its house mailbox (the host's mailbox, shadowed locally). Throwing a
  * mailbox letter away is refused for a client (the host's letter must not vanish without the host knowing; a discard transaction is a later milestone). */
 static int mTG_client_mail_is_mailbox(const Mail_c* mail) {
-    /* G5.0: a guest (foreigner) has no home (now_home == NULL): its letters are never mailbox letters. */
-    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && Common_Get(now_home) != NULL &&
-           mail >= Common_Get(now_home)->mailbox && mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;
+    /* G5.0: a guest (foreigner) has no home (now_home == NULL). Guest mailbox: its post office mailbox copy IS a mailbox (pc_ui_mailbox(); NULL when there is none). */
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && mTG_MAILBOX() != NULL &&
+           mail >= mTG_MAILBOX() && mail < mTG_MAILBOX() + HOME_MAILBOX_SIZE;
 }
 
 /* Mail milestone 2: one transfer tick of a client's mailbox letter through the host (MAIL_TAKE). 1 = applied (the letter is in Now_Private->mail[*dst_idx],
@@ -3541,8 +3551,8 @@ static void mTG_dump_mail_mark_exe_proc(Submenu* submenu, mSM_MenuInfo_c* menu_i
             mailbox_ovl->mark_bitfield = 0; /* mail milestone 2: throwing letters away from the (host's) mailbox is refused for a client: the marks are dropped */
         }
 #endif
-        for (i = 0; i < HOME_MAILBOX_SIZE; i++) {
-            Mail_c* mail = &Common_Get(now_home)->mailbox[i];
+        for (i = 0; i < HOME_MAILBOX_SIZE && mTG_MAILBOX() != NULL; i++) {
+            Mail_c* mail = &mTG_MAILBOX()[i];
 
             // clear selected mail if it has a present or is from the player (sending)
             if (mail->present != EMPTY_NO ||
@@ -3619,8 +3629,8 @@ static void mTG_mailbox_change_mail_proc(Submenu* submenu, mSM_MenuInfo_c* menu_
 
     inv_ovl->mail_mark_bitfield2 = 0;
 #ifdef TARGET_PC
-    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_mailbox_usable()) {
-        idx = -1; /* mail milestone M0 / 2: a client takes a mailbox letter only once the HOST fed its mailbox (then through MAIL_TAKE); otherwise the vanilla "pockets full" refusal below */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !mTG_MAILBOX_USABLE()) {
+        idx = -1; /* mail milestone M0 / 2: a client takes a mailbox letter (house or guest copy) only once the HOST fed its mailbox (then through MAIL_TAKE); otherwise the vanilla "pockets full" refusal below */
     }
 #endif
     if (idx != -1) {
@@ -6302,7 +6312,7 @@ static int mTG_trans_mail_mark(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_
                 }
             }
 
-            src = &Common_Get(now_home)->mailbox[src_idx];
+            src = &mTG_MAILBOX()[src_idx];
 #ifdef TARGET_PC
             if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                 /* mail milestone 2: the letter moves ONLY through the host (MAIL_TAKE); the overlay just waits / animates */
@@ -6348,7 +6358,7 @@ static int mTG_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
         if (dst_idx != -1) {
             int src_idx = submenu->overlay->mailbox_ovl->get_last_mail_idx_proc();
 
-            src = &Common_Get(now_home)->mailbox[src_idx];
+            src = &mTG_MAILBOX()[src_idx];
 #ifdef TARGET_PC
             if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                 /* mail milestone 2: the letter moves ONLY through the host (MAIL_TAKE); the overlay just waits / animates */
@@ -6391,9 +6401,13 @@ static int mTG_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
 static int mTG_check_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c* tag) {
     int res = FALSE;
 
-    if (mMl_count_use_mail_space(Common_Get(now_home)->mailbox, HOME_MAILBOX_SIZE) != 0
+    if (
 #ifdef TARGET_PC
-        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || pc_net_game_client_mailbox_usable()) /* mail milestone M0 / 2: a client's mailbox yields nothing until the host fed it (the empty-mailbox branch below) */
+        mTG_MAILBOX() != NULL && /* guest mailbox: no mailbox (NULL now_home, not a guest client) is an empty one */
+#endif
+        mMl_count_use_mail_space(mTG_MAILBOX(), HOME_MAILBOX_SIZE) != 0
+#ifdef TARGET_PC
+        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE()) /* mail milestone M0 / 2: a client's mailbox (house or guest post office copy) yields nothing until the host fed it (the empty-mailbox branch below) */
 #endif
     ) {
         res = mTG_trans_mail(submenu, menu_info, tag);
@@ -6410,7 +6424,7 @@ static int mTG_check_trans_mail_mark(Submenu* submenu, mSM_MenuInfo_c* menu_info
 
     if (mailbox_ovl->mark_bitfield != 0
 #ifdef TARGET_PC
-        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || pc_net_game_client_mailbox_usable()) /* mail milestone M0 / 2: marks are dropped, nothing is moved, until the host fed the mailbox */
+        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE()) /* mail milestone M0 / 2: marks are dropped, nothing is moved, until the host fed the mailbox (house or guest copy) */
 #endif
     ) {
         res = mTG_trans_mail_mark(submenu, menu_info, tag);
@@ -8615,9 +8629,9 @@ static void mTG_move_delete(Submenu* submenu, mTG_tag_c* tag) {
                         for (i = 0; i < mMB_MAIL_COUNT; i++) {
                             if ((mailbox_ovl->mark_bitfield & (1 << i)) != 0) {
 #ifdef TARGET_PC
-                                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) /* mail milestone 2: refused for a client (its marks were dropped earlier) */
+                                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT && mTG_MAILBOX() != NULL) /* mail milestone 2: refused for a client (its marks were dropped earlier) */
 #endif
-                                mMl_clear_mail(&Common_Get(now_home)->mailbox[i]);
+                                mMl_clear_mail(&mTG_MAILBOX()[i]);
                             }
                         }
 

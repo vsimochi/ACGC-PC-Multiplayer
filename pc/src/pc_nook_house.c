@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "pc_nook_house.h"
+#include "pc_guest_mail.h" /* guest mailbox: the post office girl's "Check my mail." choice patch (pc_post_mail_msg_arm / _more_choice) */
 #include "pc_net_game.h"
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES */
 #include "pc_platform.h"  /* SDL_GetTicks: the rejoin hold heartbeat runs on the wall clock */
@@ -360,9 +361,69 @@ static int nk_dresser_patch(unsigned char* data, int len, int cap) {
     return 0;
 }
 
+/* Guest mailbox (the post office girl): while armed for message `index` (the greeting / "anything else" row of the post office, set by the actor for a READY guest), EVERY
+ * load of that message gets "Check my mail." (PC_NOOK_SEL_CHECK_MAIL) inserted right before its last (cancel) choice; the arm stays until the actor disarms it (-1) at the
+ * end of the conversation, so a reload of the same row is patched the same way. The choice index is recorded per patched message. */
+static int s_pm_arm_idx = -1, s_pm_patched_idx = -1, s_pm_choice = -1;
+
+void pc_post_mail_msg_arm(int index) {
+    s_pm_arm_idx = index;
+    if (index < 0) {
+        s_pm_patched_idx = -1;
+        s_pm_choice = -1;
+    }
+}
+
+int pc_post_mail_more_choice(int index) {
+    return (index >= 0 && s_pm_patched_idx == index) ? s_pm_choice : -1;
+}
+
+static int nk_post_mail_patch(unsigned char* data, int len, int cap) {
+    static const unsigned char k_sel[7] = { 0, 0, NK_SEL2, NK_SEL3, NK_SEL4, NK_SEL5, NK_SEL6 };
+    int i, k, last;
+    if (data == NULL || len < 4 || len + 2 > cap) {
+        return 0;
+    }
+    for (i = 0; i + 1 < len; i++) {
+        if (data[i] != NK_CC) {
+            continue;
+        }
+        for (k = 2; k <= 5; k++) {
+            if (data[i + 1] == k_sel[k]) {
+                break;
+            }
+        }
+        if (k > 5) {
+            continue;
+        }
+        last = i + 2 + 2 * (k - 1); /* the cancel id (the last of the k ids) */
+        if (last + 2 > len) {
+            return 0;
+        }
+        memmove(&data[last + 2], &data[last], (size_t)(len - last));
+        data[last] = (unsigned char)((PC_NOOK_SEL_CHECK_MAIL >> 8) & 0xFF);
+        data[last + 1] = (unsigned char)(PC_NOOK_SEL_CHECK_MAIL & 0xFF);
+        data[i + 1] = k_sel[k + 1];
+        s_pm_choice = k - 1;
+        return len + 2;
+    }
+    return 0;
+}
+
 int pc_nook_msg_patch(int index, unsigned char* data, int len, int cap) {
     PCWorkView v;
     int i, id;
+    if (s_pm_arm_idx >= 0 && index == s_pm_arm_idx) {
+        const int n = nk_post_mail_patch(data, len, cap);
+        if (n > 0) {
+            s_pm_patched_idx = index;
+            printf("[NET][GUEST][MAIL] post office message 0x%04X: 'Check my mail.' added as choice %d (len %d -> %d)\n", index, s_pm_choice, len, n);
+        } else {
+            s_pm_patched_idx = -1;
+            printf("[NET][GUEST][MAIL] post office message 0x%04X: no choice list found -- not patched\n", index);
+        }
+        return n;
+    }
     if (s_dr_arm_idx >= 0 && index == s_dr_arm_idx) {
         int n;
         s_dr_arm_idx = -1; /* one-shot */
@@ -746,6 +807,24 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, ", hm?");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_POST_NOMAIL: /* guest mailbox: the post office girl, nothing waiting for the guest */
+            nk_text(&b, "Let me check...");
+            nk_pause(&b, 10);
+            nk_text(&b, "\nI'm sorry, there's no mail\nfor you right now.");
+            nk_page(&b);
+            nk_text(&b, "We keep your letters here");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nfor you, so do come back\nand check again!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_POST_DONE: /* guest mailbox: after the mailbox overlay closed */
+            nk_text(&b, "There you go!");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nAny letters you leave here\nwill stay safe with us.");
+            nk_page(&b);
+            nk_text(&b, "Please come again!");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_RESTOCK_DOOR:
             nk_text(&b, "Sorry, sorry!");
             nk_pause(&b, 8);
@@ -917,6 +996,9 @@ int pc_nook_sel_build(int id, unsigned char* dst16) {
         case PC_NOOK_SEL_UP_OK:
             snprintf(tmp, sizeof(tmp), "All right.");
             break;
+        case PC_NOOK_SEL_CHECK_MAIL:
+            snprintf(tmp, sizeof(tmp), "Check my mail."); /* guest mailbox: the post office girl */
+            break;
         default:
             snprintf(tmp, sizeof(tmp), "House %d.", id - PC_NOOK_SEL_HOUSE1 + 1);
             break;
@@ -984,6 +1066,32 @@ int pc_nook_house_selftest(void) {
                 printf("[NOOK] selftest: message %d byte %d = 0x%02X is outside the charset\n", which, i, c);
                 bad++;
             }
+        }
+    }
+    {   /* guest mailbox: an armed post office row (4 choices) gets "Check my mail." as choice 3 (before the cancel choice), on EVERY load while armed; disarmed: untouched */
+        unsigned char p[64] = { 'H', 'i', NK_CC, NK_SEL4, 0, 1, 0, 2, 0, 3, 0, 4, NK_CC, NK_CONTINUE };
+        unsigned char q[64];
+        int n;
+        memcpy(q, p, sizeof(q));
+        pc_post_mail_msg_arm(0x31D3);
+        if (pc_nook_msg_patch(0x31D2, p, 14, (int)sizeof(p)) != 0 || pc_post_mail_more_choice(0x31D2) != -1) {
+            bad++;
+        }
+        n = pc_nook_msg_patch(0x31D3, p, 14, (int)sizeof(p));
+        if (n != 16 || p[3] != NK_SEL5 || p[10] != ((PC_NOOK_SEL_CHECK_MAIL >> 8) & 0xFF) || p[11] != (PC_NOOK_SEL_CHECK_MAIL & 0xFF) || p[12] != 0 || p[13] != 4 ||
+            pc_post_mail_more_choice(0x31D3) != 3) {
+            printf("[NOOK] selftest: post office mail patch failed\n");
+            bad++;
+        }
+        if (pc_nook_msg_patch(0x31D3, q, 14, (int)sizeof(q)) != 16) { /* a reload while still armed is patched the same way */
+            bad++;
+        }
+        pc_post_mail_msg_arm(-1);
+        if (pc_nook_msg_patch(0x31D3, q, 16, (int)sizeof(q)) != 0) { /* disarmed: never patched */
+            bad++;
+        }
+        if (pc_post_mail_more_choice(0x31D3) != -1) {
+            bad++;
         }
     }
     {   /* the map line: a message ending with MSGEND gets exactly one extra page, once; one ending with MSGCONTINUE is untouched; both consume the arm */

@@ -129,6 +129,10 @@ extern int mMl_send_mail_postoffice(PersonalID_c* recipient_pid, int player_no, 
 extern int mMl_send_mail(PersonalID_c* recipient_pid, int player_no, mActor_name_t present, mActor_name_t paper,
                          int mail_no, u8* sender_name, u32 proc_type);
 extern void mMl_start_send_mail();
+#ifdef TARGET_PC
+extern void mMl_make_mail_to_player(Mail_c* mail, PersonalID_c* recipient_pid, mActor_name_t present, mActor_name_t paper, u8* sender_name, int mail_no,
+                                    u32 proc_type, u8 mail_type); /* guest mailbox: the system letter only (no house / post office) */
+#endif
 
 #ifdef __cplusplus
 }

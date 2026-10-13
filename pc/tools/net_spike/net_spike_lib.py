@@ -1204,7 +1204,7 @@ TXN_REASON_NAMES = {0: "NONE", 1: "EXPIRED", 2: "NOT_PENDING", 3: "WORLD_CHANGED
                     20: "NOT_SELLABLE", 21: "PRICE_MISMATCH", 22: "NO_ROOM", 23: "NO_SUCH_ADDRESS", 24: "MAILBOX_FULL", 25: "PO_FULL",
                     26: "NO_SUCH_LETTER", 27: "MAIL_CHANGED", 28: "NO_RESIDENCE", 29: "INVALID_HOUSE", 30: "NAME_TAKEN",
                     31: "RESTOCKING", 32: "STALE_CATALOG", 33: "WORK_NO_JOB", 34: "WORK_STALE_JOB", 35: "WORK_WALLET_FULL", 36: "EVNPC_DONE",
-                    37: "DRESSER_DISABLED"}
+                    37: "DRESSER_DISABLED", 38: "MAIL_LIMIT"}
 
 # --- X3 (same v8, extended IN PLACE): the one-phase GRANTS ride the SAME 64-byte tag. FIELD_ACTION_REQUEST (29) grows 12 -> 76 B and
 # CATCH_REQUEST (41) grows 20 -> 84 B with the trailing PCNetGameTxnTag; TXN_RESULT.kind 4..7 names the grant. An all-zero tag on a
@@ -1236,6 +1236,8 @@ PC_NETGAME_TXN_KIND_EVNPC = 17            # event NPC reward
 PC_NETGAME_TXN_REASON_EVNPC_DONE = 36
 PC_NETGAME_TXN_KIND_DRESSER = 18          # dresser storage (master sprint 2, worker 12)
 PC_NETGAME_TXN_REASON_DRESSER_DISABLED = 37
+PC_NETGAME_TXN_REASON_MAIL_LIMIT = 38      # guest mailbox: a guest's MAIL_SEND beyond its host-local daily limit (the letter stays)
+PC_NETGAME_MBOX_HOUSE_GUEST = 0xFF         # guest mailbox: MAILBOX_LETTER.house of the guest's host-held (post office) mailbox
 PC_NETGAME_HOUSE_AUTO = 0xFF
 PC_NETGAME_HOUSE_PRICE_DIRECT = 18400   # 1,000 down payment + 17,400 loan (mPlayer_DEBT0), wallet only
 PC_NETGAME_SHOP_STOCK_COUNTED = 0xFD    # SHOP_BUY aux_cond: a counted candy / grab bag (Shop_c.flowers_candy_grab_bag_count)
@@ -1259,6 +1261,8 @@ PC_NETGAME_TS_HOSTCFG = 4      # batch A (A1): HOST_CONFIG, the host's session c
 PC_NETGAME_TS_HOSTCFG_LEN = 8
 PC_NETGAME_TS_EVENT = 5        # events: the host's event DECISION state (subset of event_save_data + event_save_common), blob = 84 special + 100 weekly + 30 core
 PC_NETGAME_TS_EVENT_LEN = 214
+PC_NETGAME_TS_GUESTDIR = 7     # guest mailbox: the GUEST DIRECTORY, blob = u8 count (0..16) + 3 zero bytes + 16 x 20-byte PersonalID (raw LE PC image), unused entries zero
+PC_NETGAME_TS_GUESTDIR_LEN = 324  # 4 + 16 x 20
 TOWN_SVC_STATE_FMT = "<BBHII"  # 12-byte header (msg_type, service, len, seq, digest); the blob (len bytes) follows
 # --- Mail milestone 2 (same v8, extended IN PLACE): MAILBOX_LETTER (id 56, host -> the OWNING client only, RELIABLE, 316 B): ONE slot of the host-held house
 # mailbox as its 298 canonical BE bytes (or an "empty" indication, flags bit 0), per-(resident, slot) seq, FNV-1a32 of the 298 bytes. ---

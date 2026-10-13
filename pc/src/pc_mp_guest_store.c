@@ -72,26 +72,55 @@ static int all_zero(const uint8_t* p, size_t n) {
 
 /* ---------------- format ---------------- */
 
+/* offset of the v4 extension block (the ext_len field) = the end of the v3 body */
+#define GS_EXT_OFF (PC_MP_GS_HEADER_SIZE + PC_MP_GS_ID_SIZE + PC_MP_GUEST_ENTRY_SIZE)
+
+size_t pc_mp_gs_serialized_size(const PCMpGsRecord* r) {
+    return (r != NULL && (r->mbox_mask & PC_MP_GS_MBOX_MASK) != 0) ? (size_t)PC_MP_GS_FILE_SIZE_V4 : (size_t)PC_MP_GS_FILE_SIZE;
+}
+
 int pc_mp_gs_serialize(const PCMpGsRecord* r, uint8_t* out, size_t cap) {
-    if (r == NULL || out == NULL || cap < PC_MP_GS_FILE_SIZE || !r->e.present) {
+    size_t total;
+    int i;
+    if (r == NULL || out == NULL || !r->e.present || (r->mbox_mask & ~PC_MP_GS_MBOX_MASK) != 0) {
         return PC_MP_GST_ERR_SHAPE;
     }
-    memset(out, 0, PC_MP_GS_FILE_SIZE);
+    total = pc_mp_gs_serialized_size(r);
+    if (cap < total) {
+        return PC_MP_GST_ERR_SHAPE;
+    }
+    for (i = 0; i < PC_MP_GS_MBOX_SLOTS; i++) {
+        const int used = (r->mbox_mask >> i) & 1;
+        if (used == all_zero(r->mbox[i], PC_MP_GS_MAIL_SIZE)) {
+            return PC_MP_GST_ERR_FIELD; /* a used slot must hold bytes, an unused one must be all zero (the parser's rule: never write what cannot be read back) */
+        }
+    }
+    memset(out, 0, total);
     memcpy(out, s_magic, 8);
-    put32(out + 8, PC_MP_GS_VERSION);
+    put32(out + 8, total == PC_MP_GS_FILE_SIZE ? PC_MP_GS_VERSION_V3 : PC_MP_GS_VERSION);
     put32(out + 12, 0);
     put32(out + 16, PC_MP_GUEST_ENTRY_SIZE);
     put32(out + 20, r->generation);
     memcpy(out + PC_MP_GS_HEADER_SIZE, r->id, PC_MP_GS_ID_SIZE);
     pc_mp_guests_entry_encode(&r->e, out + PC_MP_GS_HEADER_SIZE + PC_MP_GS_ID_SIZE);
-    put32(out + PC_MP_GS_FILE_SIZE - 4, pc_mp_records_crc32(out, PC_MP_GS_FILE_SIZE - 4));
+    if (total != PC_MP_GS_FILE_SIZE) {
+        uint8_t* x = out + GS_EXT_OFF;
+        put32(x, PC_MP_GS_EXT_LEN);
+        put32(x + 4, PC_MP_GS_EXT_VERSION);
+        put32(x + 8, (uint32_t)r->mbox_mask);
+        for (i = 0; i < PC_MP_GS_MBOX_SLOTS; i++) {
+            memcpy(x + 12 + (size_t)i * PC_MP_GS_MAIL_SIZE, r->mbox[i], PC_MP_GS_MAIL_SIZE);
+        }
+    }
+    put32(out + total - 4, pc_mp_records_crc32(out, total - 4));
     return PC_MP_GST_OK;
 }
 
 int pc_mp_gs_parse(const uint8_t* buf, size_t len, PCMpGsRecord* out) {
     uint32_t ver;
+    size_t total = PC_MP_GS_FILE_SIZE;
     static PCMpGsRecord tmp;
-    int r;
+    int r, i;
     if (buf == NULL || out == NULL) {
         return PC_MP_GST_ERR_SHAPE;
     }
@@ -102,7 +131,7 @@ int pc_mp_gs_parse(const uint8_t* buf, size_t len, PCMpGsRecord* out) {
         return PC_MP_GST_ERR_MAGIC;
     }
     ver = get32(buf + 8);
-    if (ver < PC_MP_GS_VERSION) {
+    if (ver < PC_MP_GS_VERSION_V3) {
         return PC_MP_GST_ERR_VERSION_OLD;
     }
     if (ver > PC_MP_GS_VERSION) {
@@ -111,13 +140,25 @@ int pc_mp_gs_parse(const uint8_t* buf, size_t len, PCMpGsRecord* out) {
     if (get32(buf + 12) != 0 || get32(buf + 16) != PC_MP_GUEST_ENTRY_SIZE || get32(buf + 24) != 0 || get32(buf + 28) != 0) {
         return PC_MP_GST_ERR_SHAPE;
     }
-    if (len < PC_MP_GS_FILE_SIZE) {
+    if (ver == PC_MP_GS_VERSION) { /* v4: the extension block decides the length; an unknown block version is never reinterpreted */
+        if (len < (size_t)GS_EXT_OFF + 8) {
+            return PC_MP_GST_ERR_TRUNCATED;
+        }
+        if (get32(buf + GS_EXT_OFF + 4) != PC_MP_GS_EXT_VERSION) {
+            return PC_MP_GST_ERR_VERSION_FUTURE;
+        }
+        if (get32(buf + GS_EXT_OFF) != PC_MP_GS_EXT_LEN) {
+            return PC_MP_GST_ERR_SHAPE;
+        }
+        total = PC_MP_GS_FILE_SIZE_V4;
+    }
+    if (len < total) {
         return PC_MP_GST_ERR_TRUNCATED;
     }
-    if (len != PC_MP_GS_FILE_SIZE) {
+    if (len != total) {
         return PC_MP_GST_ERR_SHAPE;
     }
-    if (get32(buf + PC_MP_GS_FILE_SIZE - 4) != pc_mp_records_crc32(buf, PC_MP_GS_FILE_SIZE - 4)) {
+    if (get32(buf + total - 4) != pc_mp_records_crc32(buf, total - 4)) {
         return PC_MP_GST_ERR_CRC;
     }
     memset(&tmp, 0, sizeof(tmp));
@@ -133,6 +174,22 @@ int pc_mp_gs_parse(const uint8_t* buf, size_t len, PCMpGsRecord* out) {
     if (!tmp.e.present) {
         return PC_MP_GST_ERR_FIELD; /* a guest file always holds a guest */
     }
+    if (ver == PC_MP_GS_VERSION) {
+        const uint8_t* x = buf + GS_EXT_OFF;
+        const uint32_t mask = get32(x + 8);
+        if ((mask & ~(uint32_t)PC_MP_GS_MBOX_MASK) != 0) {
+            return PC_MP_GST_ERR_FIELD;
+        }
+        for (i = 0; i < PC_MP_GS_MBOX_SLOTS; i++) {
+            const uint8_t* L = x + 12 + (size_t)i * PC_MP_GS_MAIL_SIZE;
+            const int used = (int)((mask >> i) & 1u);
+            if (used == all_zero(L, PC_MP_GS_MAIL_SIZE)) {
+                return PC_MP_GST_ERR_FIELD; /* an unused slot with bytes / a used slot without any */
+            }
+            memcpy(tmp.mbox[i], L, PC_MP_GS_MAIL_SIZE);
+        }
+        tmp.mbox_mask = (uint16_t)mask;
+    }
     *out = tmp;
     return PC_MP_GST_OK;
 }
@@ -142,6 +199,17 @@ uint32_t pc_mp_gs_entry_digest(const PCMpGuestEntry* e) {
     pc_mp_guests_entry_encode(e, buf);
     put32(buf + 40, 0); /* the epoch alone is not a reason to rewrite a guest */
     return pc_mp_records_crc32(buf, PC_MP_GUEST_ENTRY_SIZE);
+}
+
+uint32_t pc_mp_gs_ext_digest(const PCMpGsRecord* r, uint32_t entry_digest) {
+    static uint8_t buf[8 + PC_MP_GS_MBOX_SLOTS * PC_MP_GS_MAIL_SIZE];
+    if (r == NULL || (r->mbox_mask & PC_MP_GS_MBOX_MASK) == 0) {
+        return entry_digest;
+    }
+    put32(buf, entry_digest);
+    put32(buf + 4, (uint32_t)r->mbox_mask);
+    memcpy(buf + 8, r->mbox, sizeof(r->mbox));
+    return pc_mp_records_crc32(buf, sizeof(buf));
 }
 
 /* ---------------- ids and paths ---------------- */
@@ -303,7 +371,7 @@ static int move_aside(const char* file, const char* tag, char* new_path, size_t 
 }
 
 static int read_and_parse(const char* path, PCMpGsRecord* out) {
-    static uint8_t buf[PC_MP_GS_FILE_SIZE + 1];
+    static uint8_t buf[PC_MP_GS_FILE_MAX + 1];
     size_t n = 0;
     int r = read_file(path, buf, sizeof(buf), &n);
     if (r != PC_MP_GST_OK) {
@@ -319,17 +387,19 @@ static const char* gs_strerror(int e) {
 /* ---------------- save / retire / backup ---------------- */
 
 int pc_mp_gs_save(const char* dir, const PCMpGsRecord* r) {
-    static uint8_t buf[PC_MP_GS_FILE_SIZE];
+    static uint8_t buf[PC_MP_GS_FILE_MAX];
     static PCMpGsRecord verify;
     char path[360], tmp[380], b1[380], b2[380], moved[420];
     FILE* fp;
     size_t want, wrote;
     int rc;
 
+    want = pc_mp_gs_serialized_size(r);
     rc = pc_mp_gs_serialize(r, buf, sizeof(buf));
     if (rc == PC_MP_GST_OK) {
-        rc = pc_mp_gs_parse(buf, sizeof(buf), &verify); /* self-check: never write something we could not read back */
-        if (rc == PC_MP_GST_OK && memcmp(verify.id, r->id, PC_MP_GS_ID_SIZE) != 0) {
+        rc = pc_mp_gs_parse(buf, want, &verify); /* self-check: never write something we could not read back */
+        if (rc == PC_MP_GST_OK && (memcmp(verify.id, r->id, PC_MP_GS_ID_SIZE) != 0 || verify.mbox_mask != r->mbox_mask ||
+                                   memcmp(verify.mbox, r->mbox, sizeof(verify.mbox)) != 0)) {
             rc = PC_MP_GST_ERR_FIELD;
         }
     }
@@ -348,7 +418,6 @@ int pc_mp_gs_save(const char* dir, const PCMpGsRecord* r) {
         glog("save FAILED: cannot open '%s' (errno %d); previous generation untouched\n", tmp, errno);
         return PC_MP_GST_ERR_IO;
     }
-    want = sizeof(buf);
     if (s_fault_on && s_fault.crash_partial_tmp >= 0) {
         wrote = fwrite(buf, 1, (size_t)s_fault.crash_partial_tmp < want ? (size_t)s_fault.crash_partial_tmp : want, fp);
         fflush(fp);
@@ -446,7 +515,7 @@ int pc_mp_gs_retire(const char* dir, const uint8_t id[PC_MP_GS_ID_SIZE], char* m
 }
 
 int pc_mp_gs_backup(const char* dir, const uint8_t id[PC_MP_GS_ID_SIZE], char* out_path, size_t cap) {
-    static uint8_t buf[PC_MP_GS_FILE_SIZE + 1];
+    static uint8_t buf[PC_MP_GS_FILE_MAX + 1];
     char p[380], b[460];
     size_t n = 0;
     FILE* fp;
@@ -607,11 +676,62 @@ static int classify_name(const char* name, uint8_t id[PC_MP_GS_ID_SIZE]) {
     return -1;
 }
 
+/* The names of the preserved *.corrupt-* files (for the downgrade healing below). */
+typedef struct CorruptNames {
+    char (*name)[96];
+    int n, cap;
+} CorruptNames;
+
+static int cnames_add(CorruptNames* l, const char* nm) {
+    const size_t len = strlen(nm);
+    if (len >= 96) {
+        return 1; /* not one of ours (the tagged names are < 60 characters): never healed */
+    }
+    if (l->n == l->cap) {
+        const int nc = l->cap == 0 ? 16 : l->cap * 2;
+        void* p = realloc(l->name, (size_t)nc * 96);
+        if (p == NULL) {
+            return 0;
+        }
+        l->name = (char(*)[96])p;
+        l->cap = nc;
+    }
+    memcpy(l->name[l->n++], nm, len + 1);
+    return 1;
+}
+
+/* Copies `src` byte for byte to `dst` (tmp -> commit -> rename; `dst` must not exist). 1 = done. */
+static int copy_file_new(const char* src, const char* dst) {
+    static uint8_t b[PC_MP_GS_FILE_MAX + 1];
+    char tmp[420];
+    size_t n = 0;
+    FILE* fp;
+    if (file_exists(dst) || read_file(src, b, sizeof(b), &n) != PC_MP_GST_OK || n == 0 || n > PC_MP_GS_FILE_MAX) {
+        return 0;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
+    fp = fopen(tmp, "wb");
+    if (fp == NULL) {
+        return 0;
+    }
+    if (fwrite(b, 1, n, fp) != n || commit_file(fp) != 0) {
+        fclose(fp);
+        remove(tmp);
+        return 0;
+    }
+    if (fclose(fp) != 0 || rename_over(tmp, dst) != 0) {
+        remove(tmp);
+        return 0;
+    }
+    return 1;
+}
+
 int pc_mp_gs_load(const char* dir, PCMpGsVisit visit, void* ctx, PCMpGsLoadInfo* info) {
     PCMpGsLoadInfo local;
     PCMpGsLoadInfo* inf = info != NULL ? info : &local;
     static PCMpGsRecord chosen, probe;
     IdList ids = { NULL, 0, 0 }, corrupt = { NULL, 0, 0 };
+    CorruptNames cnames = { NULL, 0, 0 };
     Tup* tups = NULL;
     uint8_t (*loaded_ids)[PC_MP_GS_ID_SIZE] = NULL;
     int n_loaded = 0, i, g, ok = 1;
@@ -638,13 +758,14 @@ int pc_mp_gs_load(const char* dir, PCMpGsVisit visit, void* ctx, PCMpGsLoadInfo*
         if (k >= 0 && k < 100) {
             ok = ok && idlist_add(&ids, id);
         } else if (k == 100) {
-            ok = ok && idlist_add(&corrupt, id);
+            ok = ok && idlist_add(&corrupt, id) && cnames_add(&cnames, de->d_name);
         }
     }
     closedir(d);
     if (!ok) {
         free(ids.ids);
         free(corrupt.ids);
+        free(cnames.name);
         inf->untrusted = 1;
         glog("*** out of memory while listing the guest store: UNTRUSTED mode ***\n");
         return 0;
@@ -665,13 +786,14 @@ int pc_mp_gs_load(const char* dir, PCMpGsVisit visit, void* ctx, PCMpGsLoadInfo*
         }
     }
     inf->files = ids.n;
-    tups = (Tup*)malloc((size_t)(ids.n > 0 ? ids.n : 1) * sizeof(Tup));
-    loaded_ids = (uint8_t(*)[PC_MP_GS_ID_SIZE])malloc((size_t)(ids.n > 0 ? ids.n : 1) * PC_MP_GS_ID_SIZE);
+    tups = (Tup*)malloc((size_t)(ids.n + corrupt.n + 1) * sizeof(Tup)); /* + corrupt.n: guests healed from a preserved file (see below) */
+    loaded_ids = (uint8_t(*)[PC_MP_GS_ID_SIZE])malloc((size_t)(ids.n + corrupt.n + 1) * PC_MP_GS_ID_SIZE);
     if (tups == NULL || loaded_ids == NULL) {
         free(tups);
         free(loaded_ids);
         free(ids.ids);
         free(corrupt.ids);
+        free(cnames.name);
         inf->untrusted = 1;
         glog("*** out of memory while loading the guest store: UNTRUSTED mode ***\n");
         return 0;
@@ -732,6 +854,60 @@ int pc_mp_gs_load(const char* dir, PCMpGsVisit visit, void* ctx, PCMpGsLoadInfo*
             ok = 0;
         }
     }
+    /* DOWNGRADE HEALING (guest mailbox, store v4): an OLDER build refuses a newer file version and moves it aside to *.corrupt-*. A guest that has NO readable generation now but
+     * whose preserved file parses cleanly with THIS build (magic, version, CRC, every field rule, the inner id == the name) is restored: its best preserved file (highest generation)
+     * is copied back as the primary <id>.gst (the *.corrupt-* file is kept) and the guest is loaded. A file that still does not parse stays exactly as it is (stray -> UNTRUSTED). */
+    for (i = 0; i < cnames.n && ok; i++) {
+        uint8_t id[PC_MP_GS_ID_SIZE];
+        char src[400], prim[380];
+        int j, best = -1, seen = 0;
+        uint32_t best_gen = 0;
+        if (classify_name(cnames.name[i], id) != 100) {
+            continue;
+        }
+        for (g = 0; g < n_loaded && !seen; g++) {
+            seen = memcmp(loaded_ids[g], id, PC_MP_GS_ID_SIZE) == 0;
+        }
+        for (j = 0; j < i && !seen; j++) { /* the id was handled with an earlier name already */
+            uint8_t id2[PC_MP_GS_ID_SIZE];
+            seen = classify_name(cnames.name[j], id2) == 100 && memcmp(id2, id, PC_MP_GS_ID_SIZE) == 0;
+        }
+        if (seen) {
+            continue;
+        }
+        for (j = i; j < cnames.n; j++) {
+            uint8_t id2[PC_MP_GS_ID_SIZE];
+            if (classify_name(cnames.name[j], id2) != 100 || memcmp(id2, id, PC_MP_GS_ID_SIZE) != 0) {
+                continue;
+            }
+            snprintf(src, sizeof(src), "%s/%s", dir, cnames.name[j]);
+            if (read_and_parse(src, &probe) == PC_MP_GST_OK && memcmp(probe.id, id, PC_MP_GS_ID_SIZE) == 0 && (best < 0 || probe.generation > best_gen)) {
+                best = j;
+                best_gen = probe.generation;
+            }
+        }
+        if (best < 0) {
+            continue;
+        }
+        snprintf(src, sizeof(src), "%s/%s", dir, cnames.name[best]);
+        pc_mp_gs_path(dir, id, 0, prim, sizeof(prim));
+        if (!copy_file_new(src, prim) || read_and_parse(prim, &chosen) != PC_MP_GST_OK || memcmp(chosen.id, id, PC_MP_GS_ID_SIZE) != 0) {
+            glog("could not restore '%s' as '%s' (left as it is)\n", src, prim);
+            continue;
+        }
+        glog("*** RESTORED guest file '%s' from the preserved '%s' (generation %u): an older build had set it aside as unreadable (a newer file version); the preserved copy is kept ***\n",
+             prim, cnames.name[best], (unsigned)chosen.generation);
+        inf->restored++;
+        tup_fill(&tups[n_loaded], &chosen.e);
+        memcpy(loaded_ids[n_loaded], id, PC_MP_GS_ID_SIZE);
+        n_loaded++;
+        inf->loaded++;
+        if (visit != NULL && !visit(ctx, &chosen, 0)) {
+            ok = 0;
+        }
+    }
+    free(cnames.name);
+    cnames.name = NULL;
     if (!ok) {
         inf->untrusted = 1;
     }
@@ -832,7 +1008,7 @@ int pc_mp_gs_migrate_legacy(const char* legacy_path, const char* dir, PCMpGsMigI
     for (i = 0; i < PC_MP_GUEST_SLOTS; i++) {
         const PCMpGuestEntry* e = &legacy.e[i];
         static PCMpGsRecord rec, back;
-        static uint8_t fbuf[PC_MP_GS_FILE_SIZE + 1];
+        static uint8_t fbuf[PC_MP_GS_FILE_MAX + 1];
         Tup t;
         char p[380];
         size_t n = 0;

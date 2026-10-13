@@ -6,13 +6,25 @@
 #include "m_player_lib.h"
 #include "m_inventory_ovl.h"
 #include "m_hand_ovl.h"
+#ifdef TARGET_PC
+#include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest's post office copy for a guest, else now_home's; NULL-guarded) */
+#define mMB_MAILBOX() pc_ui_mailbox()
+#else
+#define mMB_MAILBOX() (Common_Get(now_home)->mailbox)
+#endif
 
 static mMB_Ovl_c mail_ovl_data;
 
 static int mMB_get_last_mail_idx(void) {
-    Mail_c* mail = &Common_Get(now_home)->mailbox[HOME_MAILBOX_SIZE];
+    Mail_c* mail;
     int idx = HOME_MAILBOX_SIZE;
 
+#ifdef TARGET_PC
+    if (mMB_MAILBOX() == NULL) {
+        return 0; /* no mailbox at all: the first slot (an empty mailbox's answer) */
+    }
+#endif
+    mail = &mMB_MAILBOX()[HOME_MAILBOX_SIZE];
     do {
         mail--;
         idx--;
@@ -53,6 +65,10 @@ static void mMB_move_Wait(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 }
 
 static void mMB_move_End(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+#ifdef TARGET_PC
+    /* guest mailbox: opened at the post office counter (a talk), not by a mail jump at a house mailbox: no landing animation is requested (the post girl's talk resumes) */
+    if (!pc_ui_mailbox_is_guest())
+#endif
     mPlib_request_main_mail_land_from_submenu();
     submenu->overlay->move_End_proc(submenu, menu_info);
 }
@@ -118,7 +134,7 @@ static void mMB_set_frame_dl(Submenu* submenu, GRAPH* graph, mSM_MenuInfo_c* men
 extern Gfx inv_item_mode[];
 
 static void mMB_set_mail(Submenu* submenu, GRAPH* graph, f32 pos_x, f32 pos_y) {
-    Mail_c* mail = Common_Get(now_home)->mailbox;
+    Mail_c* mail = mMB_MAILBOX();
     mIV_Ovl_c* inv_ovl = submenu->overlay->inventory_ovl;
     mMB_Ovl_c* mailbox_ovl = submenu->overlay->mailbox_ovl;
     mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
@@ -138,6 +154,11 @@ static void mMB_set_mail(Submenu* submenu, GRAPH* graph, f32 pos_x, f32 pos_y) {
     } else {
         mark = 0;
     }
+#ifdef TARGET_PC
+    if (mail == NULL) {
+        return; /* no mailbox at all: nothing to draw */
+    }
+#endif
 
     OPEN_POLY_OPA_DISP(graph);
 

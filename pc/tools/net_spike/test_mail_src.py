@@ -82,6 +82,13 @@ def main():
     mc_raw = c_raw[mcb:mce]
     mc = strip_comments(mc_raw)
     hd_raw = func_body(mh_raw, "pcnetgame_handle_host_mail_txn")
+    # letters to guests (deliberate re-pin): the handler has a second commit block for a letter TO A GUEST (`if (tg >= 0) {` right after the sender is forced, straight into
+    # the guest's host-held mailbox, never the post office). It is audited by test_guest_letters_src.py (K); the checks below audit the vanilla post-office path, so the
+    # block is cut out of `hd` here (and its presence + shape is pinned right below).
+    _gs = "    if (tg >= 0) {\n        /* guest mailbox: a letter TO A GUEST."
+    _ge = "    if (mPO_receipt_proc(&W, mPO_SENDTYPE_MAIL) != TRUE) {"
+    guest_commit = hd_raw[hd_raw.index(_gs):hd_raw.index(_ge)] if _gs in hd_raw and _ge in hd_raw else ""
+    hd_raw = hd_raw.replace(guest_commit, "") if guest_commit else hd_raw
     hd = strip_comments(hd_raw)
     x1b, x1e = c_raw.index("===== X1 BEGIN"), c_raw.index("===== X1 END")
     x1 = strip_comments(c_raw[x1b:x1e])
@@ -140,11 +147,17 @@ def main():
     ctm = func_body(tag, "mTG_check_trans_mail")
     ctk = func_body(tag, "mTG_check_trans_mail_mark")
     cmp_ = func_body(tag, "mTG_mailbox_change_mail_proc")
-    check("O2 defense in depth (M0, refined by mail milestone 2): mTG_check_trans_mail (single letter -> pocket) and _mark (marked letters -> pocket) take the 'empty mailbox' branch for a client unless its mailbox is host-fed",
-          gate_open in ctm and ctm.index(gate_open) < ctm.index("res = mTG_trans_mail(") and gate_open in ctk and ctk.index(gate_open) < ctk.index("res = mTG_trans_mail_mark(")
-          and "&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT /*" not in ctm + ctk)
+    # guest mailbox (deliberate re-pin): the overlay's gate is the ONE helper mTG_MAILBOX_USABLE() = pc_ui_mailbox_usable() (pc_net_game.c): the house mailbox of a resident
+    # client = pc_net_game_client_mailbox_usable(), the guest's post office copy = its own host-fed state; host / solo 1
+    gate_ovl = "&& (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE())"
+    ui_us = func_body(c_raw, "pc_ui_mailbox_usable")
+    check("O2 defense in depth (M0, refined by mail milestone 2 and the guest mailbox): mTG_check_trans_mail (single letter -> pocket) and _mark (marked letters -> pocket) take the 'empty mailbox' branch for a client unless "
+          "its mailbox (house or guest copy) is host-fed; mTG_MAILBOX_USABLE() = pc_ui_mailbox_usable() keeps pc_net_game_client_mailbox_usable() for a resident",
+          gate_ovl in ctm and ctm.index(gate_ovl) < ctm.index("res = mTG_trans_mail(") and gate_ovl in ctk and ctk.index(gate_ovl) < ctk.index("res = mTG_trans_mail_mark(")
+          and "&& pc_net_game_role() != PC_NETGAME_ROLE_CLIENT /*" not in ctm + ctk and "#define mTG_MAILBOX_USABLE() pc_ui_mailbox_usable()" in tag
+          and "pc_net_game_client_mailbox_usable()" in ui_us and "pcnetgame_client_guest_mailbox_usable()" in ui_us and "return 1;" in ui_us)
     check("O2 the mailbox 'take marked letters' proc takes the vanilla 'pockets full' refusal branch for a client whose mailbox is NOT host-fed (idx = -1: marks cleared, nothing moves)",
-          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_mailbox_usable()) {\n        idx = -1;" in cmp_ and cmp_.index("idx = -1;") < cmp_.index("if (idx != -1) {"))
+          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !mTG_MAILBOX_USABLE()) {\n        idx = -1;" in cmp_ and cmp_.index("idx = -1;") < cmp_.index("if (idx != -1) {"))
     cpm = func_body(tag, "mTG_cpmail_change_mail_proc")
     check("O3 D-2: an archive -> pocket exchange (any archive letter marked) is refused for a client with the vanilla 'cannot exchange' branch; pocket -> archive only stays allowed (the gate needs cpmail_mark_cnt > 0)",
           "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && cpmail_mark_cnt > 0" in cpm and "inv_cnt = inv_mark_cnt;" in cpm and "cpmail_cnt = cpmail_mark_cnt;" in cpm
@@ -209,9 +222,9 @@ def main():
           "mPO_receipt_proc(" not in pre_commit and "pcnetgame_rec_txn_write_mail(" not in pre_commit and "slot->rev++" not in pre_commit and "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED" not in pre_commit
           and not re.search(r"(?m)^\s*\*?Save_Get\([^;]*?\)(?:\.\w+|\[[^\]]*\]|->\w+)*\s*=[^=]", pre_commit) and "mMl_copy_mail(" not in pre_commit and "mMl_clear_mail(" not in pre_commit
           and "memcpy(&Save_Get" not in pre_commit and "pcnetgame_rec_txn_write_inventory(" not in pre_commit)
-    check("H the letter comes ONLY from the HOST's mirror (L = &Save_Get(private_data)[idx].mail[t->slot]); the message carries no letter bytes: the handler never copies from `in` / `t` into a Mail_c "
-          "and only compares its 24-bit hash + gift echo",
-          "L = &Save_Get(private_data)[idx].mail[t->slot];" in hd and "memcpy(&W, in" not in hd and "memcpy(&W, t" not in hd and "memcpy(&W, L, sizeof(W));" in hd
+    check("H the letter comes ONLY from the HOST's mirror (guest mailbox re-pin: L = &mir->mail[t->slot], mir = pcnetgame_rec_priv_ptr(idx) -- the resident's private_data[idx] or the guest's record); "
+          "the message carries no letter bytes: the handler never copies from `in` / `t` into a Mail_c and only compares its 24-bit hash + gift echo",
+          "L = &mir->mail[t->slot];" in hd and "mir = pcnetgame_rec_priv_ptr(idx);" in hd and "Save_Get(private_data)[idx]" not in hd and "memcpy(&W, in" not in hd and "memcpy(&W, t" not in hd and "memcpy(&W, L, sizeof(W));" in hd
           and not re.search(r"\bW\.\w+(?:\.\w+)*\s*=\s*(?:in|t)->", hd))
     check("H the sender is forced to the BOUND identity (st->bound_pid cached at READY, never a message field) with type PLAYER, and the font is the RECEIVE font; the only other W write is none",
           "mPr_CopyPersonalID(&W.header.sender.personalID, &st->bound_pid);" in hd and "W.header.sender.type = (u8)mMl_NAME_TYPE_PLAYER;" in hd
@@ -239,9 +252,10 @@ def main():
           sorted(re.findall(r"pcnetgame_txn_fault_fire\((PC_TXN_FAULT_\w+)\)", hd)) == ["PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"])
     wr = func_body(c_raw[x1b:x1e], "pcnetgame_rec_txn_write_mail")
     check("H the mail[] writer pcnetgame_rec_txn_write_mail (X1 block) is the ONLY writer of a mirrored mail[] slot outside the D3 merge: idx must pass pcnetgame_rec_txn_idx_ok (never the host's own resident), "
-          "slot < 10, raw mMl_clear_mail / memcpy, two callers (the kind-12 handler with NULL, the kind-13 take handler with the host's letter: audited in test_mail2_src.py)",
+          "slot < 10, raw mMl_clear_mail / memcpy, four callers (the kind-12 handler with NULL, the kind-13 take handler with the host's letter -- its resident commit, its guest-mailbox commit and that "
+          "commit's rollback when the guest file cannot be written: audited in test_mail2_src.py)",
           "pcnetgame_rec_txn_idx_ok(idx)" in wr and "mail_slot >= mPr_INVENTORY_MAIL_COUNT" in wr and "mMl_clear_mail(&r->mail[mail_slot]);" in wr
-          and c.count("pcnetgame_rec_txn_write_mail(") == 3 and hd.count("pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL)") == 1
+          and c.count("pcnetgame_rec_txn_write_mail(") == 7 and hd.count("pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL)") == 1  # + the guest-recipient clear and its rollback (re-pin)
           and len(re.findall(r"(?:->|\.)mail\[[^\]]*\]\s*=[^=]", c)) == 0 and len(re.findall(r"mMl_clear_mail\(&r->mail", c)) == 1
           and "mMl_clear_mail(&Save_Get(private_data)" not in c and "Save_Get(private_data)[idx].mail" not in strip_comments(c_raw[d3b:d3e]).replace("&Save_Get(private_data)[idx].mail[t->slot]", ""))
     check("H the hash helper converts a ZEROED scratch Private_c holding one letter copy (no live record is touched); both sides use it",
@@ -251,6 +265,11 @@ def main():
     check("H the D3 upload validator checks mail[].present of every USED letter (font != 0xFF): EMPTY_NO / RSV_NO / pocket-legal, else INVALID_FIELD MAIL_PRESENT | slot << 8; python has the same code",
           "n->mail[i].content.font != 0xFF" in vf and "pr != (mActor_name_t)EMPTY_NO && pr != (mActor_name_t)RSV_NO && !pcnetgame_is_pocket_legal_item(pr)" in vf
           and "PC_NETGAME_REC_FIELD_MAIL_PRESENT | ((uint16_t)i << 8)" in vf and vf.index("PC_NETGAME_REC_FIELD_ORG_TABLE") < vf.index("PC_NETGAME_REC_FIELD_MAIL_PRESENT"))
+    check("H letters to guests (re-pin): the cut guest-recipient commit block exists, runs only for tg >= 0, delivers into the guest mailbox (never the post office) and clears the sender's "
+          "mirror slot through the sanctioned writer (its rollback re-writes the letter); details audited by test_guest_letters_src.py",
+          guest_commit and "memcpy(&s_guest_mbox[tg].box[tg_slot], &W, sizeof(W));" in guest_commit and "mPO_receipt_proc" not in guest_commit
+          and guest_commit.count("pcnetgame_rec_txn_write_mail(") == 2 and "pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL);" in guest_commit
+          and "pcnetgame_rec_txn_write_mail(idx, (int)t->slot, &old_src);" in guest_commit)
     check("H the delivery is plain vanilla on the host: the handler calls mPO_receipt_proc once and nothing else delivers (the postman / mPO_business_proc stay the only delivery path)",
           hd.count("mPO_receipt_proc(") == 1 and "mPO_delivery" not in hd and "mHS_get_pl_no" not in hd)
 
@@ -309,7 +328,8 @@ def main():
     cw = func_body(pg, "aPG_receive_menu_close_wait")
     ini = func_body(pg, "aPG_receive_menu_close_wait_init")
     check("C seam aPG_check_destination: a client + PLAYER letter passes iff the LOCAL address lookup finds a house (no stale mailbox / quota checks); client + MUSEUM + gift is still refused; both under TARGET_PC",
-          "return (mMl_hunt_for_send_address(mail) == -1) ? 1 : 0;" in cd and "mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO" in cd
+          # letters to guests (re-pin): a GUEST of the host's directory is an address too (the host re-checks it at MAIL_SEND)
+          "return (mMl_hunt_for_send_address(mail) == -1 && !pc_net_game_guest_address_known(&mail->header.recipient.personalID)) ? 1 : 0;" in cd and "mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO" in cd
           and cd.index("#ifdef TARGET_PC") < cd.index("pc_net_game_role() == PC_NETGAME_ROLE_CLIENT") < cd.index("switch (mail->header.recipient.type)"))
     check("C seam aPG_client_mail_step: restores the letter (send font, byte-identical to the refusal copy-back) into its slot BEFORE begin_send, waits NEUTRALLY while PENDING (-1: no state change), "
           "APPLIED -> 0, MAILBOX_FULL -> 2, PO_FULL -> 3, every other reason / local refusal -> 1",
@@ -320,7 +340,9 @@ def main():
     check("C seam close_wait: a client's PLAYER letter takes aPG_client_mail_step (-1 -> return, no message, no state change); the LOCAL mPO_receipt_proc() is skipped for it (the letter was removed by the host's APPLIED); "
           "every other recipient / host / solo keeps the vanilla calls; the refusal copy-back still restores the letter (idempotent); the in-flight static is reset in _init",
           "dest = client_mail ? aPG_client_mail_step(play) : aPG_check_destination(&play->submenu.mail);" in cw and "if (dest < 0) {\n                return;" in cw
-          and "if (!client_mail)" in cw and cw.index("if (!client_mail)") < cw.index("mPO_receipt_proc(&play->submenu.mail, mPO_SENDTYPE_MAIL);")
+          # letters to guests (re-pin): the host's own player's letter to a GUEST goes into the guest mailbox instead of the post office
+          and "if (!client_mail && !pc_net_game_host_guest_letter_post(&play->submenu.mail))" in cw
+          and cw.index("if (!client_mail && !pc_net_game_host_guest_letter_post(") < cw.index("mPO_receipt_proc(&play->submenu.mail, mPO_SENDTYPE_MAIL);")
           and "if (!client_mail) /* a client's player letter never left its slot" in cw and cw.index("never left its slot") < cw.index("mMl_copy_mail(&Now_Private->mail[submenu_item->slot_no], &play->submenu.mail);")
           and "dest = aPG_check_destination(&play->submenu.mail);" in cw
           and "s_aPG_client_mail_active = 0;" in ini and "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && play->submenu.mail.header.recipient.type == mMl_NAME_TYPE_PLAYER" in cw)

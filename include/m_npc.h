@@ -362,6 +362,16 @@ extern int mNpc_SendMailtoNpc(Mail_c* mail);
 extern void mNpc_ClearRemail(Anmremail_c* remail);
 extern void mNpc_Remail();
 extern void mNpc_RemailFor(Private_c* priv); /* the town-villager part of mNpc_Remail() for ONE resident's record (host: every connected resident, M2r) */
+/* guest mailbox: the same pass with the reply handed to `sink` (TRUE = taken) instead of the post office (host: every connected guest) */
+typedef int (*mNpc_REMAIL_SINK)(Mail_c* mail, void* ctx);
+extern void mNpc_RemailForSink(Private_c* priv, mNpc_REMAIL_SINK sink, void* ctx);
+#ifdef TARGET_PC
+/* guest mailbox (host): the villager EVENT letters of one GUEST key handed to `sink` (birthday cards, the Christmas card, Valentine's Day presents, goodbye letters) */
+extern int mNpc_GuestBirthdayCardsForSink(PersonalID_c* key, mNpc_REMAIL_SINK sink, void* ctx);
+extern int mNpc_GuestXmasCardForSink(PersonalID_c* key, mNpc_REMAIL_SINK sink, void* ctx);
+extern int mNpc_GuestVtdayMailForSink(PersonalID_c* keys, const u8* genders, int num, mNpc_REMAIL_SINK sink, void* ctx);
+extern int mNpc_GuestGoodbyMailForSink(PersonalID_c* key, AnmPersonalID_c* anm_id, mNpc_REMAIL_SINK sink, void* ctx);
+#endif
 extern u8 mNpc_GetPaperType();
 extern int mNpc_SendVtdayMail();
 extern int mNpc_CheckFriendship(PersonalID_c* pid, Animal_c* animal);

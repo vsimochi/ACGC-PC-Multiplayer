@@ -636,6 +636,35 @@ extern void mMsm_SetCompMail() {
     }
 }
 
+#ifdef TARGET_PC
+/* 1 = every museum section is complete on THIS process's museum_display (the condition of mMsm_SetCompMail). */
+extern int mMsm_MuseumComplete(void) {
+    return mMmd_CountDisplayedFossil() == mMmd_FOSSIL_NUM && mMmd_CountDisplayedArt() == mMmd_ART_NUM &&
+           mMmd_CountDisplayedInsect() == mMmd_INSECT_NUM && mMmd_CountDisplayedFish() == mMmd_FISH_NUM;
+}
+
+/* Guest mailbox (host): mMsm_SendCompMail for one GUEST record (outside Save_t). The museum is complete (`complete`: the caller's mMsm_MuseumComplete()) and the guest has not received the completion letter
+ * yet -> the same letter (mail 0x22F, FTR_NOG_MUSEUM, museum paper, sender "Museum") goes to `sink`; only when it was taken are the two HOST-OWNED state_flags
+ * bits (SCHEDULED | RECEIVED, persisted with the guest's record) set, so a full mailbox retries on a later pass and a received letter is never sent again. */
+extern int mMsm_GuestCompMailForSink(Private_c* gpriv, int complete, mMsm_GUEST_SINK sink, void* ctx) {
+    Mail_c* mail = &l_mmsm_mail;
+    int land_name_len;
+
+    if (gpriv == NULL || sink == NULL || mPr_NullCheckPersonalID(&gpriv->player_ID) != FALSE ||
+        (gpriv->state_flags & mPr_FLAG_MUSEUM_COMP_HANDBILL_RECEIVED) != 0 || complete == FALSE) {
+        return FALSE;
+    }
+    land_name_len = mMsg_Get_Length_String(Save_Get(land_info.name), LAND_NAME_SIZE);
+    mHandbill_Set_free_str(mHandbill_FREE_STR0, Save_Get(land_info.name), land_name_len);
+    mMl_make_mail_to_player(mail, &gpriv->player_ID, FTR_START(FTR_NOG_MUSEUM), ITM_PAPER24, l_museum_name_str, 0x22F, mMl_DATA2, mMl_TYPE_MAIL);
+    if ((*sink)(mail, ctx) != TRUE) {
+        return FALSE;
+    }
+    gpriv->state_flags |= mPr_FLAG_MUSEUM_COMP_HANDBILL_SCHEDULED | mPr_FLAG_MUSEUM_COMP_HANDBILL_RECEIVED;
+    return TRUE;
+}
+#endif
+
 extern void mMsm_SendCompMail() {
     Private_c* priv = Save_Get(private_data);
     int state_flags;

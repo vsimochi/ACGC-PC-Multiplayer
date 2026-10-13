@@ -141,9 +141,12 @@ def main():
           and in_order(tk, ["if (!pcnetgame_mbox_send(", "break;", "st->mbox_sent_seq[i] = X->seq;"]) and "st->mbox_res_plus1 != idx + 1" in tk and "memset(st->mbox_sent_seq, 0" in tk
           and "uint32_t             mbox_sent_seq[PC_NETGAME_MBOX_SLOTS];" in c_raw and "int                  mbox_res_plus1;" in c_raw)
     sd = func_body(m2h_raw, "pcnetgame_mbox_send")
-    check("S the message is built ONLY from the host table (s_mbox_host) and the owner's house, RELIABLE, exactly sizeof(PCNetGameMailboxLetterMsg); the sender is the only place that writes msg_type MAILBOX_LETTER",
-          "const PCNetGameMboxHost* X = &s_mbox_host[idx][i];" in sd and "pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))" in sd and c.count("PC_NETGAME_MSG_MAILBOX_LETTER") == 4
-          and "m.msg_type = (uint8_t)PC_NETGAME_MSG_MAILBOX_LETTER;" in sd and sd.count("pc_net_send(") == 1)
+    gsd = func_body(m2h_raw, "pcnetgame_guest_mbox_send")
+    check("S the message is built ONLY from the host table (s_mbox_host) and the owner's house, RELIABLE, exactly sizeof(PCNetGameMailboxLetterMsg); the two senders are the only places that write msg_type "
+          "MAILBOX_LETTER (guest mailbox re-pin: pcnetgame_guest_mbox_send builds a GUEST's slot from s_guest_mbox[g] with house PC_NETGAME_MBOX_HOUSE_GUEST)",
+          "const PCNetGameMboxHost* X = &s_mbox_host[idx][i];" in sd and "pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))" in sd and c.count("PC_NETGAME_MSG_MAILBOX_LETTER") == 5
+          and "m.msg_type = (uint8_t)PC_NETGAME_MSG_MAILBOX_LETTER;" in sd and sd.count("pc_net_send(") == 1
+          and "const PCNetGameGuestMbox* M = &s_guest_mbox[g];" in gsd and "m.house = (uint8_t)PC_NETGAME_MBOX_HOUSE_GUEST;" in gsd and gsd.count("pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))") == 1)
     hdl = func_body(c_raw, "pcnetgame_handle_host_data")
     check("S a client-originated MAILBOX_LETTER is dropped by the host (never applied, never relayed) before any handler",
           "data[0] == (uint8_t)PC_NETGAME_MSG_MAILBOX_LETTER" in hdl and "client-originated MAILBOX_LETTER" in hdl
@@ -159,11 +162,13 @@ def main():
     order = ["s_host_peer_link[peer] != PC_NETGAME_LINK_READY", "PC_TXN_FAULT_IGNORE_COMMIT", "pcnetgame_rec_gate(peer, 0, 0)", "st->rec_state != PC_NETGAME_RECS_SYNCED",
              "shape_ok = in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE", "pcnetgame_txn_nonce_fenced(", "pcnetgame_txn_journal_find(", "R->max_seq = t->txn_seq;",
              "pcnetgame_rec_refresh_hostfields(idx, slot);", "t->base_epoch != slot->epoch", "pcnetgame_rec_validate_inventory(t->pre_pockets",
-             "h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);", "L = &Save_Get(homes[h]).mailbox[t->slot];", "mMl_check_not_used_mail((Mail_c*)L) == TRUE",
+             "h = gslot >= 0 ? (int)PC_NETGAME_MBOX_HOUSE_GUEST : pcnetgame_mbox_house_of(&mir->player_ID);",
+             "L = gslot >= 0 ? &s_guest_mbox[gslot].box[t->slot] : &Save_Get(homes[h]).mailbox[t->slot];", "mMl_check_not_used_mail((Mail_c*)L) == TRUE",
              "PC_NETGAME_TXN_REASON_NO_SUCH_LETTER", "!= want24", "PC_NETGAME_TXN_REASON_MAIL_CHANGED", "L->present != (mActor_name_t)t->item", "mMl_FONT_NUM",
-             "pcnetgame_is_pocket_legal_item(L->present)", "mMl_check_not_used_mail(&Save_Get(private_data)[idx].mail[dst]) != TRUE", "PC_NETGAME_TXN_REASON_MAILBOX_FULL",
+             "pcnetgame_is_pocket_legal_item(L->present)", "mMl_check_not_used_mail(&mir->mail[dst]) != TRUE", "PC_NETGAME_TXN_REASON_MAILBOX_FULL",
              "PC_TXN_FAULT_FAIL_WORLD", "pcnetgame_rec_txn_idx_ok(idx)", "memcpy(&W, L, sizeof(W));", "pcnetgame_rec_txn_write_mail(idx, dst, &W);",
-             "mMl_clear_mail(&Save_Get(homes[h]).mailbox[t->slot]);", "slot->rev++;", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED",
+             "mMl_clear_mail(&s_guest_mbox[gslot].box[t->slot]);", "slot->rev++;", "pcnetgame_guest_store_write(\"guest mailbox take\")",  # guest mailbox: the guest commit + its DURABLE file write
+             "mMl_clear_mail(&Save_Get(homes[h]).mailbox[t->slot]);", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED",
              "pcnetgame_mbox_refresh_resident(idx);", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE", "if (st->rec_push_active) {"]
     check("H the algorithm order: READY gate -> ignore_commit -> binding gate -> SYNCED / world -> shape -> journal (fence, replay, conflict, max_seq) -> base -> pre-image validation -> the owner's house -> "
           "mailbox slot used (26) -> hash (27) -> gift echo -> font / recipient -> legal gift -> mirror mail[dst] free (24) -> fail_world -> writable -> COMMIT (copy, mirror write, mailbox slot cleared, rev++, journal, "
@@ -180,8 +185,10 @@ def main():
           and "t->flags < (uint8_t)mPr_INVENTORY_MAIL_COUNT" in hd and "t->slot < (uint8_t)PC_NETGAME_MBOX_SLOTS" in hd)
     check("H the take changes no pocket / condition / wallet (no inventory write; the post-image sent is the mirror's unchanged one) and delivers nothing to the post office",
           "pcnetgame_rec_txn_write_inventory(" not in hd and "inventory." not in hd.replace("t->pre_", "").replace("pcnetgame_rec_validate_inventory", "") and "mPO_" not in hd)
-    check("H a guest / extra player (a bound resident with NO house on the host) is refused with NO_DONOR_SLOT before the mailbox is read (source audited: no guest exists today)",
-          in_order(hd, ["if (h < 0) {", "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT", "L = &Save_Get(homes[h]).mailbox[t->slot];"]))
+    check("H (guest mailbox re-pin) a GUEST takes from its HOST-held mailbox s_guest_mbox[g] (never homes[] / private_data[idx]; refused with NO_DONOR_SLOT when the host switch is off); a RESIDENT without a house "
+          "(extra player) is still refused with NO_DONOR_SLOT before the mailbox is read",
+          in_order(hd, ["gslot = pcnetgame_guest_of_idx(idx);", "!pcnetgame_guest_mail_enabled()", "pcnetgame_txn_reject_guest_no_house(", "mir = pcnetgame_rec_priv_ptr(idx);",
+                        "if (gslot < 0 && h < 0) {", "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT", "&s_guest_mbox[gslot].box[t->slot]"]) and "Save_Get(private_data)[idx]" not in hd)
     check("H a stale claim (empty slot / hash mismatch) asks for a re-push of THAT mailbox slot (its seq is bumped, same bytes) instead of a record push: the client's shadow is corrected by the digest sender",
           "if (stale) {" in hd and "s_mbox_host[idx][t->slot].seq++;" in hd and "mbox_sent_seq[t->slot] = 0" not in hd and hd.count("pcnetgame_rec_stale_push(") == 1)  # the one stale push is the BASE check, like every txn kind
     rej_ok = True
@@ -197,14 +204,15 @@ def main():
     check("H the mirror mail[] has exactly three sanctioned writes outside the D3 merge, all through pcnetgame_rec_txn_write_mail (idx must pass pcnetgame_rec_txn_idx_ok = never the host's own resident, slot < 10): "
           "the kind-12 clear (NULL) and the kind-13 write (the host's letter, memcpy); no other statement assigns private_data[].mail[]",
           "pcnetgame_rec_txn_idx_ok(idx)" in wr and "mail_slot >= mPr_INVENTORY_MAIL_COUNT" in wr and "memcpy(&r->mail[mail_slot], letter, sizeof(Mail_c));" in wr
-          and c.count("pcnetgame_rec_txn_write_mail(") == 3 and hd.count("pcnetgame_rec_txn_write_mail(idx, dst, &W)") == 1 and len(re.findall(r"(?:->|\.)mail\[[^\]]*\]\s*=[^=]", c)) == 0
-          and "Save_Get(private_data)[idx].mail[dst]" in hd and not re.search(r"memcpy\(&Save_Get\(private_data\)", c))
+          and c.count("pcnetgame_rec_txn_write_mail(") == 7 and hd.count("pcnetgame_rec_txn_write_mail(idx, dst, &W)") == 2  # letters to guests re-pin: + the kind-12 guest-recipient clear and its rollback (test_mail_src / test_guest_letters_src) and hd.count("pcnetgame_rec_txn_write_mail(idx, dst, &old_dst)") == 1
+          and len(re.findall(r"(?:->|\.)mail\[[^\]]*\]\s*=[^=]", c)) == 0
+          and "mir->mail[dst]" in hd and not re.search(r"memcpy\(&Save_Get\(private_data\)", c))  # guest mailbox re-pin: resident commit, guest commit + its rollback
     hb_writes = re.findall(r"mMl_clear_mail\(&Save_Get\(homes\[[^\]]*\]\)\.mailbox\[[^\]]*\]\)|memcpy\(&Save_Get\(homes\[[^\]]*\]\)\.mailbox\[[^\]]*\]|mMl_clear_mail\(m\);", c)
     check("H writes of the HOST's homes[].mailbox in pc_net_game.c are exactly: the take handler's clear (host), the TEST-ONLY seed hook (host-only hook; mMl_clear_mail(m) on a free slot) and the CLIENT shadow writes "
           "(apply, revert, take apply) -- 1 + 1 + 4 sites (apply, the refused-slot clear, revert, take apply); nothing else (the postman / generators stay vanilla code outside this file)",
           hd.count("mMl_clear_mail(&Save_Get(homes[h]).mailbox[t->slot]);") == 1 and len(re.findall(r"mMl_clear_mail\(m\);", c)) == 1
-          and len(re.findall(r"memcpy\(&Save_Get\(homes\[h\]\)\.mailbox\[i\], ", c)) == 2 and len(re.findall(r"mMl_clear_mail\(&Save_Get\(homes\[h\]\)\.mailbox\[t->slot\]\);", c)) == 2
-          and len(hb_writes) == 6)
+          and len(re.findall(r"memcpy\(&tgt\[i\], ", c)) == 2 and len(re.findall(r"mMl_clear_mail\(&tgt\[t->slot\]\);", c)) == 1 and len(re.findall(r"mMl_clear_mail\(&tgt\[i\]\);", c)) == 1
+          and len(hb_writes) == 2 and "return h >= 0 ? Save_Get(homes[h]).mailbox : NULL;" in c)  # guest mailbox re-pin: the CLIENT writes go through tgt = pcnetgame_mbox_local_target() (house mailbox or guest copy)
 
     # ------------------------------------------------------------------ C: client
     chd = func_body(m2c_raw, "pcnetgame_handle_client_mailbox_letter")
@@ -219,7 +227,7 @@ def main():
           "recipient PersonalID == this player; only then it writes the shadow, the local mailbox slot, the seq, the slot mask and (all 10 received) the host-fed state",
           in_order(ap, ["(int)m->house != h", "pcnetgame_mail_from_be(m->letter, &L);", "empty != (mMl_check_not_used_mail(&L) == TRUE)", "(u32)L.content.font >= (u32)mMl_FONT_NUM",
                         "L.header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER", "mPr_CheckCmpPersonalID(&L.header.recipient.personalID, &Now_Private->player_ID) != TRUE",
-                        "memcpy(&s_mbox_shadow[i], &L, sizeof(Mail_c));", "memcpy(&Save_Get(homes[h]).mailbox[i], &L, sizeof(Mail_c));", "s_mbox_seq[i] = m->seq;", "s_mbox_mask |= ",
+                        "memcpy(&s_mbox_shadow[i], &L, sizeof(Mail_c));", "memcpy(&tgt[i], &L, sizeof(Mail_c));", "s_mbox_seq[i] = m->seq;", "s_mbox_mask |= ",
                         "s_mbox_host_fed = 1;"])
           and "(s_mbox_mask & PC_NETGAME_MBOX_ALL_MASK) == PC_NETGAME_MBOX_ALL_MASK" in ap and "#define PC_NETGAME_MBOX_ALL_MASK 0x03FFu" in c_raw)
     shadow_w = re.findall(r"memcpy\(&s_mbox_shadow\[|mMl_clear_mail\(&s_mbox_shadow\[|s_mbox_shadow\[[^\]]*\]\s*=[^=]", c)
@@ -231,11 +239,11 @@ def main():
     check("C the revert: every 500 ms, READY client with a usable save, a slot whose local mailbox bytes differ from the shadow is restored FROM the shadow (this neutralises every vanilla / generator writer of the dead "
           "local mailbox); the stash of an early message is applied here",
           in_order(rv, ["s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcfa_save_ready()", "pcnetgame_mbox_client_apply(&s_mbox_stash[i]);", "< 500u",
-                        "memcmp(&Save_Get(homes[h]).mailbox[i], &s_mbox_shadow[i], sizeof(Mail_c)) != 0", "memcpy(&Save_Get(homes[h]).mailbox[i], &s_mbox_shadow[i], sizeof(Mail_c));"])
+                        "memcmp(&tgt[i], &s_mbox_shadow[i], sizeof(Mail_c)) != 0", "memcpy(&tgt[i], &s_mbox_shadow[i], sizeof(Mail_c));"])
           and "pcnetgame_mbox_client_tick(); /* mail milestone 2" in c_raw)
     us = func_body(m2c_raw, "pc_net_game_client_mailbox_usable")
     check("C pc_net_game_client_mailbox_usable() is 1 only for a READY CLIENT whose shadow is host-fed (all 10 slots this session) and who owns a house; every other role / state answers 0",
-          "s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_mbox_host_fed && pcnetgame_mbox_own_house() >= 0" in us and c.count("s_mbox_host_fed = 1;") == 1)
+          "s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_mbox_host_fed && !s_mbox_guest && pcnetgame_mbox_own_house() >= 0" in us and c.count("s_mbox_host_fed = 1;") == 1)  # guest mailbox: a guest's fed copy is not a house mailbox
     rst = func_body(c_raw, "pcnetgame_reset_client_session_state")
     check("C the session reset closes the mailbox again and kills the take operation: slot mask, host-fed flag, seq memory, stash, take op, wait timer",
           all(x in rst for x in ("memset(&s_take_op, 0, sizeof(s_take_op));", "s_take_last_reason = 0;", "s_take_wait_ms = 0;", "memset(s_mbox_seq, 0, sizeof(s_mbox_seq));",
@@ -255,7 +263,7 @@ def main():
           "preferred slot when still empty else the first free one; no slot -> return 0 WITHOUT advancing the D3 base (the next upload is STALE_BASE and the host push delivers the letter); pockets / wallet are never touched",
           in_order(at, ["!s_take_op.active", "(pcnetgame_mail_be_hash(&s_take_op.letter) & 0xFFFFFFu) != want24", "no matching verified letter -- nothing applied", "mMl_check_not_used_mail(&Now_Private->mail[t->flags]) == TRUE",
                         "if (dst < 0) {", "letter NOT placed", "memcpy(&Now_Private->mail[dst], &s_take_op.letter, sizeof(Mail_c));", "mMl_clear_mail(&s_mbox_shadow[t->slot]);",
-                        "mMl_clear_mail(&Save_Get(homes[h]).mailbox[t->slot]);", "pcnetgame_crec_set_base("])
+                        "mMl_clear_mail(&tgt[t->slot]);", "pcnetgame_crec_set_base("])
           and "inventory." not in at and "mPr_Set" not in at and "mPr_Give" not in at and at.count("pcnetgame_crec_set_base(") == 1
           and "(pcnetgame_mail_be_hash(&s_mbox_shadow[t->slot]) & 0xFFFFFFu) == want24" in at
           and "in->host_session == s_crec.base_session && in->epoch == s_crec.base_epoch && in->rev > s_crec.base_rev" in at)
@@ -275,7 +283,7 @@ def main():
     st = func_body(m2c_raw, "pc_net_game_mail_take_step")
     check("C take_step: stateless for the overlay (an op for the same slot is polled, consumed exactly once; another slot's unresolved op = PENDING); begin needs a host-fed mailbox, a SYNCED record with no staged push / "
           "stopped uploads / other operation (bounded 5 s wait, then a local refusal), a used shadow slot with a legal letter, a free mail slot and an owner stamp; then it queues the kind-13 txn",
-          in_order(st, ["s_take_op.active", "!pc_net_game_client_mailbox_usable()", "s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.up_blocked || s_crec.st_valid || pcnetgame_txn_begin_blocked()",
+          in_order(st, ["s_take_op.active", "!pcnetgame_client_own_mailbox_usable()", "s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.up_blocked || s_crec.st_valid || pcnetgame_txn_begin_blocked()",
                         "PC_NETGAME_MAIL_CLEAN_TIMEOUT_MS", "mMl_chk_mail_free_space(Now_Private->mail, mPr_INVENTORY_MAIL_COUNT)", "pcnetgame_capture_owner_stamp(&stamp)",
                         "memcpy(&s_take_op.letter, sh, sizeof(Mail_c));", "s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE;", "s_ctxn.take_dst = (uint8_t)dst;", "pcnetgame_txn_try_send()"])
           and "memset(&s_take_op, 0, sizeof(s_take_op));" in st)
@@ -297,9 +305,11 @@ def main():
     ctm = func_body(tag, "mTG_check_trans_mail")
     ctk = func_body(tag, "mTG_check_trans_mail_mark")
     cmp_ = func_body(tag, "mTG_mailbox_change_mail_proc")
-    check("O2 the overlay's transfer entry points (single letter / marked letters) and the 'take marked' proc carry the same precise gate: a client whose mailbox is NOT host-fed yields nothing / takes the vanilla refusal",
-          gate_open in ctm and ctm.index(gate_open) < ctm.index("res = mTG_trans_mail(") and gate_open in ctk and ctk.index(gate_open) < ctk.index("res = mTG_trans_mail_mark(")
-          and "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_mailbox_usable()) {\n        idx = -1;" in cmp_)
+    gate_ovl = "&& (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE())"  # guest mailbox re-pin: the overlay's one helper (house mailbox or guest copy)
+    check("O2 the overlay's transfer entry points (single letter / marked letters) and the 'take marked' proc carry the same precise gate: a client whose mailbox (house or guest copy) is NOT host-fed yields nothing / "
+          "takes the vanilla refusal",
+          gate_ovl in ctm and ctm.index(gate_ovl) < ctm.index("res = mTG_trans_mail(") and gate_ovl in ctk and ctk.index(gate_ovl) < ctk.index("res = mTG_trans_mail_mark(")
+          and "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !mTG_MAILBOX_USABLE()) {\n        idx = -1;" in cmp_)
     tm = func_body(tag, "mTG_trans_mail")
     tmm = func_body(tag, "mTG_trans_mail_mark")
     vanilla = "{\n                mMl_copy_mail(&Now_Private->mail[dst_idx], src);\n                mMl_clear_mail(src);\n            }"
@@ -316,9 +326,9 @@ def main():
     dm = func_body(tag, "mTG_dump_mail_mark_exe_proc")
     check("O4 throwing letters away from the mailbox stays REFUSED for a client (kind 14 is a later milestone): the marked-discard proc drops the mailbox marks for a client before they are used; the single-letter clear is skipped "
           "when the pointer is a mailbox slot (mTG_client_mail_is_mailbox); the multi-letter clear loop is skipped for a client",
-          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {\n            mailbox_ovl->mark_bitfield = 0;" in dm and dm.index("mailbox_ovl->mark_bitfield = 0;") < dm.index("for (i = 0; i < HOME_MAILBOX_SIZE; i++) {")
-          and "if (!mTG_client_mail_is_mailbox(mTG_get_mail_pointer(submenu, NULL)))" in tag and "if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) /* mail milestone 2: refused for a client" in tag
-          and "return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && Common_Get(now_home) != NULL &&\n           mail >= Common_Get(now_home)->mailbox && mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;" in func_body(tag, "mTG_client_mail_is_mailbox"))  # G5.0: + the NULL now_home guard (a guest has no home)
+          "if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {\n            mailbox_ovl->mark_bitfield = 0;" in dm and dm.index("mailbox_ovl->mark_bitfield = 0;") < dm.index("for (i = 0; i < HOME_MAILBOX_SIZE && mTG_MAILBOX() != NULL; i++) {")
+          and "if (!mTG_client_mail_is_mailbox(mTG_get_mail_pointer(submenu, NULL)))" in tag and "if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT && mTG_MAILBOX() != NULL) /* mail milestone 2: refused for a client" in tag
+          and "return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && mTG_MAILBOX() != NULL &&\n           mail >= mTG_MAILBOX() && mail < mTG_MAILBOX() + HOME_MAILBOX_SIZE;" in func_body(tag, "mTG_client_mail_is_mailbox"))  # G5.0 + guest mailbox: the one helper (guest copy or now_home's; NULL-guarded)
     check("O5 the M0 gates that must stay: the four villager generators that write straight into homes[].mailbox return before any write for a CLIENT, the mother's letter and the system letters are not generated for a client, "
           "the archive -> pocket exchange is refused for a client (test_mail_src.py audits each in detail)",
           "#define mNpc_CLIENT_SKIPS_MAILBOX_LETTER() (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT)" in npc and npc.count("if (mNpc_CLIENT_SKIPS_MAILBOX_LETTER()) {") == 4
@@ -364,7 +374,7 @@ def main():
     th = func_body(m2c_raw, "pcnetgame_run_mail_take_test_hook")
     check("T --mail-test-take: CLIENT-only, waits for the host-fed mailbox and a SYNCED record, calls the REAL pc_net_game_mail_take_step, writes NOTHING itself (no memcpy / mMl_ / mail[] assignment), loudly checks that "
           "no pocket / mail slot changed before APPLIED",
-          "s_role != PC_NETGAME_ROLE_CLIENT" in th and "pc_net_game_client_mailbox_usable()" in th and "pc_net_game_mail_take_step(s_cur, &dst)" in th and "memcpy(" not in th and "mMl_clear_mail(" not in th
+          "s_role != PC_NETGAME_ROLE_CLIENT" in th and "pcnetgame_client_own_mailbox_usable()" in th and "pc_net_game_mail_take_step(s_cur, &dst)" in th and "memcpy(" not in th and "mMl_clear_mail(" not in th
           and "mMl_copy_mail(" not in th and not re.search(r"mail\[[^\]]*\]\s*=[^=]", th) and "CHANGED BEFORE APPLIED" in th and th.count("[NET][MAIL][TEST-ONLY]") >= 8)
     sm = func_body(m2h_raw, "pcnetgame_mail_test_seed_mailbox")
     sr = func_body(m2h_raw, "pcnetgame_mail_test_seed_reply")
@@ -379,7 +389,7 @@ def main():
           "s_take_op.mbox_idx ==" not in st and "abandoned overlay" not in st and in_order(st, ["s_take_op.active", "!s_take_op.done", "return PC_NETGAME_TS_OP_PENDING;", "dst_out = (int)s_take_op.dst;", "memset(&s_take_op, 0, sizeof(s_take_op));", "return r;"]))
     check("C review M2: a REFUSED MAILBOX_LETTER (house / empty flag / font / recipient) still counts as received: every refusal jumps to one label that clears the shadow + the local slot, records the seq and the slot "
           "mask and runs the host-fed check, so one bad slot can never keep the mailbox closed; the refusal logging is bounded",
-          ap.count("goto refused;") == 3 and "\nrefused:" in ap_raw and in_order(ap_raw[ap_raw.index("\nrefused:"):], ["mMl_clear_mail(&s_mbox_shadow[i]);", "s_mbox_seq[i] = m->seq;", "s_mbox_mask |= (uint16_t)(1u << i);", "fed_check:", "s_mbox_host_fed = 1;"])
+          ap.count("goto refused;") == 4 and "\nrefused:" in ap_raw and in_order(ap_raw[ap_raw.index("\nrefused:"):], ["mMl_clear_mail(&s_mbox_shadow[i]);", "s_mbox_seq[i] = m->seq;", "s_mbox_mask |= (uint16_t)(1u << i);", "fed_check:", "s_mbox_host_fed = 1;"])
           and "s_refused_logs" in ap_raw and ap.count("return;") == 0)
     check("C review L: the host and the client keep DISTINCT 500 ms timers (s_mbox_next_check_ms host only, s_mbox_cl_next_check_ms client only)",
           c.count("static uint32_t          s_mbox_next_check_ms = 0;") == 1 and "s_mbox_next_check_ms" not in m2c and "s_mbox_cl_next_check_ms" in m2c and c.count("static uint32_t                  s_mbox_cl_next_check_ms;") == 1)

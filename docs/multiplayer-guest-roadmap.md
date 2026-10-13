@@ -204,8 +204,8 @@ Bounded grep of the other `private_data[player_no]` / `Common_Get(player_no)` in
 ### G5.1 - refusals (nothing is lost or duplicated; the client never mutates pockets without a host APPLIED)
 
 * **Museum donation (client guard) -- SUPERSEDED by [Guest museum donation](#guest-museum-donation-host-authoritative-donor-nibble-5):** the guard was removed; guests now donate. Original G5.1 text: `pc_net_game_ts_begin_museum_donate` returns 0 for a CLIENT guest before anything is queued or sent (log `MUSEUM_DONATE refused locally`). The curator's existing code maps 0 onto its give-back row (row 2: the item stays with the player). Before G5 the same outcome came only from the host (`NO_DONOR_SLOT`) after a round trip. The host refusal stays (authoritative, not journaled, nothing mutated).
-* **Mail to a player (client guard, new):** `pc_net_game_mail_begin_send` returns 0 for a CLIENT guest (log `MAIL_SEND refused locally`); the post girl's existing row 1 ("no such address") hands the letter back; the slot is never touched. Letters to villagers use the MAIL_REQUEST path and are unchanged. Host: `NO_DONOR_SLOT` stays.
-* **Mailbox take / read, house entry:** unchanged and already safe: a guest owns no house (`pcnetgame_mbox_house_of` walks `homes[]` only), so `pc_net_game_client_mailbox_usable()` is false and the mailbox stays closed; the vanilla foreigner branch makes the doors knock only.
+* **Mail to a player -- SUPERSEDED by [Guest mailbox via the post office](#guest-mailbox-via-the-post-office):** the client guard was removed; a guest writes to residents (host daily limit). Original G5.1 text: `pc_net_game_mail_begin_send` returns 0 for a CLIENT guest (log `MAIL_SEND refused locally`); the post girl's existing row 1 ("no such address") hands the letter back; the slot is never touched. Letters to villagers use the MAIL_REQUEST path and are unchanged. Host: `NO_DONOR_SLOT` stays (now only with `AC_MP_GUEST_MAIL=0`).
+* **Mailbox take / read -- SUPERSEDED by the guest mailbox** (the guest's letters wait at the post office, "Check my mail."); **house entry:** unchanged and already safe: a guest owns no house (`pcnetgame_mbox_house_of` walks `homes[]` only), so `pc_net_game_client_mailbox_usable()` is false and the HOUSE mailbox stays closed; the vanilla foreigner branch makes the doors knock only.
 * **Catalog ordering:** already refused for EVERY network client (guests included) by the earlier town-services batch: `aNSC_msg_win_open_wait2` forces Nook's ORDER_UNAVAILABLE row before any bell is taken, and `aNSC_order_check` defends with ORDER_CANCEL before an order slot is written. No change was needed; there is no host path that could deliver a guest's order (the SHARED `catalog_orders` range is only legality-checked, the post office walks `private_data[]`).
 * **Villager letters to a guest:** none arrive (remail is resident-only, the client skips mailbox letters). Documented as deferred.
 * The visible message is the game's own dialogue row of each flow (the refusals reuse existing rows; no new on-screen notice was added because both flows already have a refusal row; `pc_net_notice` is only the link-loss notice).
@@ -224,10 +224,15 @@ Bounded grep of the other `private_data[player_no]` / `Common_Get(player_no)` in
 | villager talk / friendship / letters TO villagers | supported (keyed by the guest key) | scripted (test_guest_protocol X, pre-existing) |
 | birthday scheduling, spirit catch, discarding an inventory letter | fixed (no out-of-range read / NULL math) | source audit (g5 src A) |
 | museum donation | **supported** (host-authoritative, donor nibble 5; see "Guest museum donation") -- was: refused (G5.1) | source audit (test_guest_museum_src) + scripted (test_guest_museum_protocol) + real `--guest` client (test_guest_museum_real) |
-| mail to a player | refused (local "no such address" row + host NO_DONOR_SLOT) | source audit + scripted host refusal (pre-existing) |
-| mailbox take / read, house / room entry | refused (no house) | source audit (g5 src C) |
+| mail to a player (resident) | **supported** (host daily limit 5, MAIL_LIMIT 38; see "Guest mailbox via the post office") -- was: refused (G5.1) | source audit (test_guest_mailbox_src) + scripted (test_guest_mailbox_protocol S) |
+| guest mailbox: read / take letters | **supported at the post office** ("Check my mail.", host-held mailbox, MAIL_TAKE) -- was: refused | scripted (T / R / K) + real `--guest` client (test_guest_mailbox_real) |
+| villager -> guest letters (replies to the guest's letters) | **supported** (into the guest mailbox; a full mailbox keeps the reply owed) | scripted (test_guest_mailbox_protocol V) |
+| letters TO a guest from residents / other guests / the host player | **supported** (guest directory = TOWN_SVC_STATE service 7; MAIL_SEND into the guest mailbox; see "Letters to guests") | source audit (test_guest_letters_src) + scripted (test_guest_letters_protocol D/A/G) + real `--guest` client (test_guest_letters_real) |
+| villager birthday / Christmas / Valentine / goodbye letters, the museum completion letter to a guest | **supported** (host passes, vanilla builders and dedupe; see "Letters to guests") | scripted (test_guest_letters_protocol E/E2) + real `--guest` client (test_guest_letters_real) |
+| guest mailbox at a house purchase / promotion | **supported** (letters move to the new house mailbox, re-keyed, rolled back with the promotion) | scripted (test_guest_mailbox_protocol --promotion) |
+| house / room entry | refused (no house) | source audit (g5 src C) |
 | catalog ordering | refused (Nook's ORDER_UNAVAILABLE, all clients) | source audit (g5 src C) |
-| villager -> guest letters, mail for guests, bank / loan UI, birthday calendar | deferred | -- |
+| resident -> guest letters, event / birthday / goodbye / museum letters to guests, bank / loan UI, birthday calendar | deferred | -- |
 
 Exact results (disposable fixtures only, ONE build, protocol version unchanged, no wire change):
 
@@ -1226,6 +1231,7 @@ Called inside `pc_mp_promote_create` right after `pc_residence_assign` (the hous
 | `maps`, `backgound_texture` (a shirt or empty), `hint_count`, `destiny` (valid type), `sunburn` (valid rank), `remail`, `animal_memory` | copied |
 | deliveries / errands | quest type delivery / errand only, first-job kinds and `errand_type == FIRST_JOB` are NOT carried |
 
+Since the guest mailbox: the letters of the guest's HOST-held mailbox are carried too (into the new house mailbox, re-keyed; see "Guest mailbox via the post office").
 NOT carried: `state_flags`, `museum_record` (host-owned), `reset_code`, `ecard_letter_data`, `calendar`, the tortimer trophies. The host log prints one line `[PC] migrate: memories=N contest_quests=N fish_records=N letters=N equipment=N quests=N`. The promotion also resets the host's `s_remail_day[slot]` (a stale day of a former occupant of the slot would skip the new resident's remail pass; it is restored on the rollback paths).
 
 ### Durability gate (B3a)
@@ -1555,14 +1561,14 @@ A host crash BETWEEN the two writes restores the museum WITH the exhibit and the
 possible, a double museum entry is not (the exhibit is already marked donated, a second offer is ALREADY_DONATED).
 
 **Limitations / follow-ups.**
-* No donor attribution for guests: value 5 does not say WHICH guest donated (the plaque says "former resident"). A sidecar (e.g. a new TS service 7 + `PC_NETGAME_TS_NUM` 8; service 6 is
+* No donor attribution for guests: value 5 does not say WHICH guest donated (the plaque says "former resident"). A sidecar (e.g. a new TS service 8 + `PC_NETGAME_TS_NUM` 9 -- service 7 is now the guest directory, see "Letters to guests"; service 6 is
   SHOP_UPGRADE) was deliberately deferred.
 * Promotion (`pc_mp_promote_create`, guest -> resident): the guest's value-5 exhibits cannot be re-attributed to its new resident slot (no attribution data); they stay "former resident".
 * A guest therefore never sees "you donated this" for its own exhibits, and the museum-completion letter stays resident-only (vanilla `mMsm_SetSendCompMail` walks `private_data[0..3]`).
 * NO_DONOR_SLOT for a guest slot without a record is unreachable for a bound scripted client (a bound guest always has a record): source audited only.
 * The Blathers dialogue with a guest was not driven through the UI (no UI automation for the dialogue): its guest branches are source audited; the real `--guest` client is driven by the
   default-off `--ts-test-donate` hook through the same entry point Blathers calls. Nothing was visually verified.
-* Guest mailbox (letters from villagers / players to guests) is still deferred.
+* Guest mailbox: implemented later, see [Guest mailbox via the post office](#guest-mailbox-via-the-post-office) and [Letters to guests](#letters-to-guests) (villager replies, letters from residents / guests, villager event letters, the museum completion letter).
 
 **Real dialogue regression** (`test_guest_museum_real.py` phase B): a real `--guest` client with 3 fish + 3 insects (TEST-ONLY `AC_TEST_MUSEUM_POCKETS`), warped
 into the museum entrance (`AC_TEST_MUSEUM_ROOM=entrance`), parked in front of Blathers (`AC_TEST_GOTO`, `ac_goto.txt` `c 40`), autopilot `mashf` (A presses, every choice
@@ -1578,3 +1584,161 @@ Results (exe `pc/build64_w3/bin/AnimalCrossing.exe`, fixtures bin_fixture4_museu
 resident regressions test_ts_protocol 110/111 (TS2 "no service 6+" pin predates this change: SHOP_UPGRADE is service 6), test_ts_real_client 22/22, test_museum_bits_protocol 7/7,
 test_museum_refresh_real 14/14; test_ts_src 72/72, test_shop_src 65/65, test_stage0_town_safe_degrade 104/104. Failures in test_guest_g5_protocol (M5 catch: WORLD_CHANGED),
 test_guest_protocol (guests.dat v2 vs the per-guest store, crashes in phase R) and test_guest_g4_protocol (max-guests 9 CLI / cap) are outside the museum path; their museum checks pass.
+
+## Guest mailbox via the post office
+
+Status: **implemented, not committed** (protocol version 8 unchanged; wire: reason 38 + MAILBOX_LETTER house 0xFF, no new message id; guest store file v3 -> v4). The user's request: guests get a
+mailbox -- "use the NPC at the post office and have an option to access your mail; and whenever they buy a house the mail migrates over to the mailbox at the house".
+
+**Storage (host only).** A guest owns no house, so its letters wait in a HOST-held 10-slot mailbox per guest slot (`s_guest_mbox[g].box`, a growable table next to `s_guest_rec`). It is
+persisted in the guest's own `.gst` file as the **v4 extension block**: header (version 4) | id | the unchanged 9352-byte entry | `u32 ext_len` (2988) | `u32 ext_version` (1) | `u32 mbox_mask`
+(bits 0..9) | 10 x 298 bytes (canonical big-endian letters, an unused slot all zero) | CRC32 over everything. The mailbox and the guest's carried letters (`mail[]` of the record) are therefore
+changed by ONE atomic file write (no duplicate / lost gift across a crash). The writer emits v4 **only while the mailbox holds a letter**; an empty mailbox is written as plain v3 (byte-identical
+to the previous build), and a v3 file reads as an empty mailbox. Parse rules: an unknown `ext_version` is VERSION_FUTURE (never reinterpreted), a wrong `ext_len` SHAPE, mask bits above 9 /
+an unused slot with bytes / a used slot without bytes FIELD; the file digest folds the mailbox in (`pc_mp_gs_ext_digest`: unchanged for an empty mailbox, so no v3 guest is rewritten at the
+upgrade). The host-local counters (today's letters sent, the day of the last villager-reply pass) are **memory only** (deviation from the first plan: persisting them would keep every guest that
+ever wrote a letter in v4; a host restart resets the daily count).
+
+**Downgrade (known, accepted).** An OLDER build refuses a v4 file as "a newer version", moves it aside to `<id>.gst.corrupt-<time>` and (no other readable generation) runs its guest store
+UNTRUSTED: no guest is admitted, residents are unaffected; its log says "UNTRUSTED MODE: the guest store is unreadable or inconsistent ... remove the affected guest files AND their *.corrupt-*
+files". Nothing is deleted. Only guests that hold unread mail at that moment are affected (all others are v3). **This build heals it**: at load, a preserved `*.corrupt-*` file of a guest
+that has no readable generation and parses cleanly now is copied back as the primary (the preserved copy is kept; log `RESTORED guest file ... an older build had set it aside`). If the older
+build loaded an older v3 generation (.bak) instead, that state wins and the letters of the newer v4 generation are lost (it is the downgrade cost).
+
+**Delivery into a guest mailbox** is host-only and direct (`pcnetgame_guest_mbox_deliver`): the post office cannot be used (its load sweep deletes letters whose recipient owns no house,
+`mPO_receipt_check_mail` refuses them). Today's sources: the villager replies (below) and the TEST-ONLY hook `AC_TEST_GUEST_MAIL_SEED=<n>[,<gift hex>]`.
+
+**Copy to the guest client.** MAILBOX_LETTER (56, unchanged 316-byte layout) with `house = 0xFF` (PC_NETGAME_MBOX_HOUSE_GUEST) = the guest mailbox; the same digest / seq / all-10-slots-at-READY
+scheme as a resident's house mailbox (`pcnetgame_host_guest_mbox_push`). The client keeps a SEPARATE copy (`s_gmbox_view`, never `homes[]`); a house-0xFF slot is refused by a non-guest, a
+house slot by a guest. **An older client** refuses house 0xFF harmlessly ("house 255 is not the house this player owns", nothing written: it owns no house).
+
+**Taking a letter.** MAIL_TAKE (kind 13) with a guest branch: the source is the guest mailbox slot, the same hash / gift / font / recipient checks and reasons (NO_SUCH_LETTER / MAIL_CHANGED with a
+re-push, MAILBOX_FULL), the commit writes the guest MIRROR `mail[dst]` (`pcnetgame_rec_txn_write_mail`) and clears the mailbox slot, then **the .gst file is written durably BEFORE the journal
+APPLIED and the RESULT**; a failed write undoes both halves and answers REJECTED BUSY. Journal / replay / CONFLICT are unchanged.
+
+**UI.** The post office girl (`ac_npc_post_girl.c_inc`): for a READY guest whose guest mailbox the host fed (`pc_net_game_guest_mail_offer_available`; an older host / the switch off never
+feeds it, so no row) the greeting row and the "anything else?" row get **"Check my mail."** inserted before their last choice (`pc_post_mail_msg_arm` -> `pc_nook_msg_patch`, the same
+mechanism as the dresser's "More storage"; the choice mapping runs before the vanilla switch). With letters waiting the window closes and the VANILLA mailbox overlay opens
+(`mSM_IV_OPEN_MAILBOX`); its own automatic transfer moves the letters (one MAIL_TAKE each); after it closes the girl says "There you go! Any letters you leave here will stay safe with us. / Please
+come again!" (`PC_NOOK_MSG_POST_DONE`). Nothing waiting: "Let me check... I'm sorry, there's no mail for you right now. ..." (`PC_NOOK_MSG_POST_NOMAIL`). Every `Common_Get(now_home)->mailbox`
+use of `m_mailbox_ovl.c` / `m_tag_ovl.c` goes through ONE helper `pc_ui_mailbox()` (`pc_guest_mail.h`): the guest copy for a guest client, else the vanilla `now_home` mailbox or NULL
+(now_home is never faked; NULL-guarded). The overlay closed at the post office requests no mail-jump landing (`pc_ui_mailbox_is_guest`).
+
+**Guest -> resident letters.** MAIL_SEND (kind 12) is open to guests: the G5.1 client guard and the host refusal are gone; the letter is read from the guest mirror record
+(`pcnetgame_rec_priv_ptr`), no sender house is needed, the recipient must be a resident with a house on the host (NO_SUCH_ADDRESS), the sender is forced to the guest key. A host-local daily
+limit per guest (`AC_MP_GUEST_MAIL_PER_DAY`, default 5, 1..100) answers **MAIL_LIMIT (38)** beyond it (the post girl's "can't take more letters" row; the letter stays).
+
+**Villager replies.** `mNpc_RemailForSink` (m_npc.c) is the reply generator with a sink callback (`mNpc_RemailFor`, the resident post office path, is byte-identical); the host pass
+`pcnetgame_host_guest_remail_tick` runs it for every READY, SYNCED guest once per host calendar day per guest slot (growable table), delivering into the guest mailbox. A full mailbox stops that
+guest's pass with `send_reply` still set (retried on a later day), without affecting other guests; a delivery writes the store at once.
+
+**Promotion (house purchase / console `promote`).** `pcnetgame_promote_exec` hands the guest mailbox to `pc_mp_promote_create` (`pc_mp_promote_set_guest_mailbox`, one-shot); after the house
+is assigned and the record is migrated each letter is re-keyed (`pc_pid_rekey` of recipient / sender), an illegal gift cleared, and placed into the new house mailbox, else the post office, else
+the new resident's carried letters, else the whole promotion is rolled back (never dropped). The rollback snapshot now holds the post office (the house mailbox is part of the home). The guest
+table keeps its copy until the guest entry is retired after the durable save (its file is moved aside, kept), so a refused / rolled-back purchase loses nothing and a retry starts from the
+same state. The new resident gets the letters through the normal MAILBOX_LETTER path. In practice the assigned house's mailbox is always EMPTY (vanilla house init), so with <= 10 letters the
+overflow branch is not reachable (source audited only).
+
+**Pre-existing defect fixed (found by the promotion test).** `trademark_cleanup` (m_trademark.c) cleared every house mailbox of the in-memory save. On PC the save was just re-read by
+`trademark_init`, and a dedicated host starts its world from that in-memory save without another reload, so **every house-mailbox letter (residents' too) vanished at each host start**.
+The clear is now skipped when `pc_save_loaded` (the vanilla Start path re-reads the save anyway; no save loaded: vanilla).
+
+**Switches.** `AC_MP_GUEST_MAIL=0|off|false` (host environment, read once, default ON) turns it all off (MAIL_SEND / MAIL_TAKE answer NO_DONOR_SLOT as before, no mailbox push, no replies).
+`AC_MP_GUEST_MAIL_PER_DAY`. Test hooks (PC_TEST_HOOKS build + `AC_TEST_HOOKS=1`): `AC_TEST_GUEST_MAIL_SEED`, `AC_TEST_GUEST_MAIL_SEED_REPLY=1`, `AC_TEST_GUEST_MAIL_REPLY_EVERY_PASS=1`; client
+`AC_TEST_MUSEUM_ROOM=postoffice`, `ac_goto.txt` `g <dist>` (park in front of the post girl), autopilot `mashm` (A presses, choice "Check my mail." / cancel, B closes the overlay; new pad bit B).
+
+**Tests** (fresh fixtures `pc/build64/bin_fixture4_gmail*` with the `pc/build64_w3` exe; Samsung display, volume 1):
+`test_guest_mailbox_src.py --native` 39/39 (audits A..H incl. "host code never indexes private_data[] / homes[] with a guest index" + the native guest store selftest 96/96 with the v4
+group: round trip, v3 as empty, block rules, CRC, lazy v3 -> v4 -> v3 rewrite, downgrade healing); `test_guest_mailbox_protocol.py` S 12/12 (guest -> resident letter via the forced vanilla
+delivery, daily limit, NO_SUCH_ADDRESS), T+R 24/24 (house-0xFF sync, take APPLIED + the v4 file, REPLAYED, CONFLICT, NO_SUCH_LETTER / MAIL_CHANGED re-push, MAILBOX_FULL, host restart: mailbox XOR
+mail[]), K 7/7 (kill between COMMIT and RESULT, reconnect, replay, the letter once in the file), V 9/9 (full mailbox keeps the reply owed, after a take the reply lands in the guest mailbox);
+`--promotion` 19/19 (dedicated host: 5 letters, `fail_save` rollback with the guest file intact, retry applies once, house 3 holds the re-keyed letters, the guest file retired, the promoted
+resident receives them as MAILBOX_LETTERs after a host restart -- this check found the trademark bug); `test_guest_mailbox_real.py` 18/18 (REAL `--guest` client + real host: house-0xFF copy,
+warp into the post office, the real post girl dialogue with the patched greeting chosen by the autopilot, the overlay's own transfer took 3 letters through 3 MAIL_TAKE, the conversation ended,
+the .gst written back as v3 with the 3 letters in mail[]).
+
+**Limits / follow-ups.** Resident -> guest letters and event / birthday / goodbye / museum letters to guests: DONE, see [Letters to guests](#letters-to-guests); the villager reply's `send_reply` lives in the GCI and the reply in the .gst: a crash between the two saves can duplicate a reply (its gift); the daily send count is memory only;
+nothing was looked at by a person (texts checked by the message selftest only); the overlay was driven by its automatic transfer (taking one chosen letter by hand was not exercised).
+
+## Letters to guests
+
+Status: **implemented, not committed** (protocol version 8 unchanged; wire: TOWN_SVC_STATE **service 7 GUEST_DIR** (324 B, array bound 8); no new message id, no new reason; **no
+persistent-format change** beyond the guest store v4 of "Guest mailbox via the post office"). Follow-ups (A) letters from residents (and guests) to guests, (B) villager birthday / event /
+goodbye letters to guests, (C) museum letters to guests -- all delivered into the guest's host-held mailbox (`pcnetgame_guest_mbox_deliver`), copied to a connected guest at once
+(MAILBOX_LETTER house 0xFF), taken at the post office as before.
+
+**Who is an address (deliverable).** `pcnetgame_guest_mail_target(g)`: a used guest entry of the host's CURRENT town that is not disposable -- confirmed (its client presented the stored
+token) or holding accepted data (record rev > 0: a first-session guest that has played; such an entry is never re-minted / evicted, so its mailbox cannot be thrown away) -- whose record
+PersonalID is the key. A bare claim that never synced (rev 0, unconfirmed), a removed guest, another town's guest or a never-seen key is NOT an address (NO_SUCH_ADDRESS).
+
+**The GUEST DIRECTORY (TOWN_SVC_STATE service 7).** Chosen over a new message id 86 because the town-service mirror already gives exactly what a directory needs: a per-service seq (strictly
+increasing for the life of the host process; a client ignores <=), an FNV digest, the ordered reliable push to every READY peer at join and on every change (the 500 ms digest poll), no
+save needed on the client, and **an older client ignores an unknown service** ("service 7 is reserved / unknown -- ignored", HEAD's handler) -- a new message id would have needed its own
+seq / late-join / reconnect logic. Blob (324 B): `u8 count (0..16)`, 3 zero bytes, 16 x 20-byte PersonalID (the guest KEY: name, land name, player_id, land_id; raw little-endian PC image,
+host == client build), newest guest first, unused entries zero. Built from the guest table with the deliverability rule (listed == deliverable); **not built at all with
+`AC_MP_GUEST_MAIL=0`** (never valid, never pushed). The client validates it (count, reserved / unused zero, listed keys real) and keeps it for the session (`s_gdir_client_blob`). More than 16
+guests: only the 16 newest are listed (the address book page holds at most 8 rows anyway); the host still delivers to any deliverable key.
+
+**Address book** (`m_address_ovl.c mAD_make_player_address`, TARGET_PC): the player page lists the other residents, then the directory's guests (never the local player), then the museum.
+The page is drawn for at most 8 rows and the museum entry takes two (its gap), so the guests fill `8 - residents - (museum ? 2 : 0)`; `player_mail_name` is enlarged to 8 entries under
+TARGET_PC. Solo / an older host / the switch off: no guest listed (vanilla). **Post office girl**: on a client a PLAYER letter passes the local check when a house OR a directory guest matches
+(the host re-checks at MAIL_SEND); the HOST's own player (a non-dedicated host's resident) gets the same delivery locally (`pc_net_game_host_guest_letter_check` -> 0 / 2 = "mailbox full",
+`..._post` instead of `mPO_receipt_proc`, sender forced to the host player, receive font).
+
+**MAIL_SEND to a guest (kind 12).** After `mMl_hunt_for_send_address` finds no house: `pcnetgame_guest_mail_recipient` (switch on, PLAYER recipient, `pcnetgame_guest_find` = this town,
+deliverable). Before anything changes: no house and no guest -> NO_SUCH_ADDRESS; a guest's letter to itself -> NO_SUCH_ADDRESS; no free slot in the guest mailbox -> MAILBOX_FULL; a GUEST
+sender beyond its daily limit -> MAIL_LIMIT. Commit: sender forced to the bound identity, receive font, the letter into the free slot, the sender's mirror slot cleared through
+`pcnetgame_rec_txn_write_mail` (the gift travels inside the letter, exactly like resident -> resident: it left the pockets when the letter was written), rev++, journal APPLIED (replay /
+CONFLICT unchanged), the mailbox refresh (a connected recipient gets it on the next mailbox tick). Durability: a **guest** sender's slot and the recipient's mailbox both live in guest
+store files -> written durably BEFORE the journal (a failed write undoes both halves, REJECTED BUSY); a **resident** sender's slot lives in Save_t -> the recipient's file is written with
+the next host save (the post-save guest store write; at most the 60 s periodic save), so a host crash before that save loses both halves together (the letter is still in the sender's
+pockets) instead of duplicating the letter and its gift. Guest -> guest is allowed (same rules, the daily limit applies). **Keying**: recipient = the guest KEY (its home PersonalID); a
+reply from the guest is an ordinary letter (the resident is in its address book). At promotion the guest's mailbox letters move to the house mailbox re-keyed (`pc_pid_rekey`, unchanged);
+letters others hold FROM the guest keep the old key (harmless: AC has no reply-to); a resident's unsent letter still addressed to the promoted guest's old key gets NO_SUCH_ADDRESS (the post
+girl hands it back).
+
+**Villager event letters (B).** Defined exactly from the code:
+* **birthday** -- `ac_event_manager.c mail_event_check` (on a day change, the vanilla cursor window `(event_save_common.last_date, today]`) calls `mNpc_SendEventBirthdayCard2` for each
+  resident whose birthday is in the window: every villager whose HIGHEST-friendship memory is that player sends a card with a RARE present (furniture / clothing / umbrella).
+* **event** -- the same pass sends the **Christmas card** (Dec 25 in the window, same year, <= a week late; FTR_FAMICOM_COMMON01, festive paper) and schedules **Valentine's Day**
+  (Feb 14 10:00, `valentines_day_date`), fired by `vt_wt_mail_check` -> `mNpc_SendVtdayMail`: each villager writes to its best friend of the OTHER sex with a present typed BEST_FRIEND /
+  OK_FRIEND (>= 80) / NOT_FRIEND. (White Day exists only in the JP enum; the US code sends none.)
+* **goodbye** -- `mNpc_SetGoodbyAnimalMail` (a villager leaves: forced removal, a transfer replacing one, the return-animal swap) -> `mNpc_SendGoodbyAnimalMail`: the goodbye letter
+  (0x20E + looks * 3 + random(3), no present) to every resident.
+
+Guest passes (host, `pcnetgame_host_guest_event_tick`, switch on, world + guest table ready): `mail_event_check` hands the window over **before the cursor moves**
+(`pc_net_game_guest_event_window`); for every deliverable guest the birthday (from its record) and Christmas are checked with the SAME date rule (`pc_guest_event_due.h`, pure) and the cards
+are built by the vanilla builders (`mNpc_GuestBirthdayCardsForSink`, `mNpc_GuestXmasCardForSink`: the guest is the villager's highest-friendship memory, keyed by the guest key; the vanilla
+`birthday_present_npc` exclusion -- the villager visiting a resident's door -- does not apply to a guest). Valentine: right after the vanilla pass (`pc_net_game_guest_vtday_due`), each
+villager picks its best friend of the other sex AMONG the guests (`mNpc_GuestVtdayMailForSink`, vanilla tie and type rules). Goodbye: inside `mNpc_SetGoodbyAnimalMail` the departing
+villager's 7 memories are COPIED (`pc_net_game_guest_goodbye_note`, before every caller clears the Animal_c) and the guests it has a memory of get its goodbye letter (residents keep the
+vanilla "every resident"; a guest it never met gets none). **Dedupe without a new save format**: birthday / Christmas / Valentine use the residents' own dedupe -- the host's mail-event
+cursor (`last_date`, `valentines_day_date`, persisted by the host save): the guest letters are persisted with the NEXT guest store write (the post-save write at the latest), so a host that
+dies before saving re-sends residents' and guests' letters together at most once and never keeps a guest letter whose cursor move was lost. Goodbye is one departure (the Save_t change
+itself). A full mailbox: birthday / Christmas / Valentine letters are dropped (vanilla: a full mailbox AND a full post office drop them too); a goodbye letter waits in a bounded memory queue
+(8 departures, retried every minute; vanilla keeps its `deliver_to_bitfield` in memory too). **TODO.md "villager memory holds 7"** applies: guests compete with residents for the 7 memory
+slots, so a villager can forget a guest (no birthday card / goodbye letter for it).
+
+**Museum letters (C).** `m_museum.c`: the information letter (museum opened: `mMsm_OrderInformationMail` / `mMsm_SendInformationMail` -> it gives the "Museum" address), the result letters
+(answers to letters TO the museum carrying a gift: `mMsm_SendMuseumMail` records the gift in the SENDER's `museum_record` resolved through `mPr_GetPrivateIdx`, then `mMsm_SendResultMail`),
+the fossil letters (a fossil sent by letter), and the **completion letter** (`mMsm_SendCompMail`: every section complete -> 0x22F + FTR_NOG_MUSEUM, deduped by the host-owned state_flags bits
+SCHEDULED / RECEIVED). Decision: only the **completion letter** goes to guests (`mMsm_GuestCompMailForSink`, host pass every minute: the museum is complete, the guest has not received it;
+the two host-owned bits of the GUEST's own record are set only when the letter was taken, the host-field digest refreshed (rev++) and a bound client pushed, the .gst written at once: letter
+and dedupe in one file). Guest donations are recorded as donor 5 ("deleted player"), so a guest's museum share cannot be attributed: the letter goes to every deliverable guest, like the
+vanilla gives it to every resident. Not sent to guests, with evidence: the **result / fossil letters** answer letters TO the museum with a gift, and such a letter is still refused for EVERY
+network client by the post girl (`ac_npc_post_girl.c_inc`: client + MUSEUM + gift -> row 1; the limitation still matters: `mMsm_SendMuseumMail` resolves the sender through
+`mPr_GetPrivateIdx`, which never finds a guest, and a client's letter never reaches the host's museum path at all -- making it work needs a host transaction for museum letters); the
+**information letter** would only add the "Museum" address book entry, whose only use (a gift letter) is refused for clients.
+
+**Kill switch.** `AC_MP_GUEST_MAIL=0` also turns off: the directory (service 7 never exists), letters to guests (NO_SUCH_ADDRESS as before), the host player's local delivery, every event /
+museum letter pass. Test hook (PC_TEST_HOOKS build + `AC_TEST_HOOKS=1`): `AC_TEST_GUEST_EVENT_MAIL=<birthday,xmas,vtday,goodbye,museum>` (once, for the first synced deliverable guest: a
+villager becomes its best friend, then the REAL passes run with a forced window / a noted departure that does not remove the villager / the museum counted complete).
+
+**Tests** (fresh fixtures `pc/build64/bin_fixture4_gletters`, `_glettr` with the `pc/build64_w3` exe; Samsung display, volume 1): `test_guest_letters_src.py --native` 31/31 (audits I..N +
+the date rule 11/11 natively); `test_guest_letters_protocol.py` D/A/G 24/24 (the directory at a resident and a guest, newest first; resident -> guest with an apple: APPLIED, pushed at once,
+the guest file NOT written by the commit and written by the next periodic save; MAILBOX_FULL; REPLAYED; retry after a take; NO_SUCH_ADDRESS for a never-seen key; guest -> guest written
+durably at once; a letter to oneself refused), E + E2 15/15 (birthday, Christmas, Valentine, goodbye, museum letters in the guest mailbox; the museum bits in the .gst; after a restart the
+museum letter is not sent twice), K 4/4 (the switch: no service 7, NO_SUCH_ADDRESS, no event letter); `test_guest_letters_real.py` 20/20 (REAL `--guest` client + real host + a scripted
+resident: the real client applied service 7, received the 4 event / museum letters and the resident's letter with an apple, then took all 5 at the post office through the real overlay).
+Not exercised automatically: the address book UI itself (listing guests on a real client: source audit only), the host player's local letter to a guest, a real Valentine's / birthday day
+change (the date rule is unit-tested; the passes ran with forced windows).

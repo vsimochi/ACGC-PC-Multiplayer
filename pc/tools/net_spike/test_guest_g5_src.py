@@ -84,6 +84,67 @@ def main():
        and ": Save_GetPointer(private_data[Common_Get(player_no)])" in m.group(1))
 
     tg_new, tg_old = S.read("src/game/m_tag_ovl.c"), blob("src/game/m_tag_ovl.c")
+    # guest mailbox (deliberate): the exact edits of m_tag_ovl.c (new text -> the G5-era text); gm_undo() applies them in reverse and each must be found exactly once
+    GM_RET = """    /* G5.0: a guest (foreigner) has no home (now_home == NULL). Guest mailbox: its post office mailbox copy IS a mailbox (pc_ui_mailbox(); NULL when there is none). */
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && mTG_MAILBOX() != NULL &&
+           mail >= mTG_MAILBOX() && mail < mTG_MAILBOX() + HOME_MAILBOX_SIZE;"""
+    GM_EDITS = [
+        ("""#include "pc_dresser_ui.h"
+extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
+#include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest copy for a guest, else now_home's; NULL-guarded) */
+#define mTG_MAILBOX() pc_ui_mailbox()
+#define mTG_MAILBOX_USABLE() pc_ui_mailbox_usable()
+#else
+#define mTG_MAILBOX() (Common_Get(now_home)->mailbox)
+#endif""", """#include "pc_dresser_ui.h"
+extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
+#endif"""),
+        ("""        case mTG_TABLE_MBOX:
+#ifdef TARGET_PC
+            if (mTG_MAILBOX() == NULL) {
+                return NULL; /* guest mailbox: no mailbox at all (NULL now_home and not a guest client): never pointer math on NULL; unreachable through the UI (the overlay only opens on a mailbox) */
+            }
+#endif
+            return &mTG_MAILBOX()[idx];""", """        case mTG_TABLE_MBOX:
+            return &Common_Get(now_home)->mailbox[idx];"""),
+        (GM_RET, """    /* G5.0: a guest (foreigner) has no home (now_home == NULL): its letters are never mailbox letters. */
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && Common_Get(now_home) != NULL &&
+           mail >= Common_Get(now_home)->mailbox && mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;"""),
+        ("""        for (i = 0; i < HOME_MAILBOX_SIZE && mTG_MAILBOX() != NULL; i++) {
+            Mail_c* mail = &mTG_MAILBOX()[i];""", """        for (i = 0; i < HOME_MAILBOX_SIZE; i++) {
+            Mail_c* mail = &Common_Get(now_home)->mailbox[i];"""),
+        ("""    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !mTG_MAILBOX_USABLE()) {
+        idx = -1; /* mail milestone M0 / 2: a client takes a mailbox letter (house or guest copy) only once the HOST fed its mailbox (then through MAIL_TAKE); otherwise the vanilla "pockets full" refusal below */""",
+         """    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_mailbox_usable()) {
+        idx = -1; /* mail milestone M0 / 2: a client takes a mailbox letter only once the HOST fed its mailbox (then through MAIL_TAKE); otherwise the vanilla "pockets full" refusal below */"""),
+        ("""            src = &mTG_MAILBOX()[src_idx];""", """            src = &Common_Get(now_home)->mailbox[src_idx];"""),
+        ("""    if (
+#ifdef TARGET_PC
+        mTG_MAILBOX() != NULL && /* guest mailbox: no mailbox (NULL now_home, not a guest client) is an empty one */
+#endif
+        mMl_count_use_mail_space(mTG_MAILBOX(), HOME_MAILBOX_SIZE) != 0
+#ifdef TARGET_PC
+        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE()) /* mail milestone M0 / 2: a client's mailbox (house or guest post office copy) yields nothing until the host fed it (the empty-mailbox branch below) */""",
+         """    if (mMl_count_use_mail_space(Common_Get(now_home)->mailbox, HOME_MAILBOX_SIZE) != 0
+#ifdef TARGET_PC
+        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || pc_net_game_client_mailbox_usable()) /* mail milestone M0 / 2: a client's mailbox yields nothing until the host fed it (the empty-mailbox branch below) */"""),
+        ("""        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE()) /* mail milestone M0 / 2: marks are dropped, nothing is moved, until the host fed the mailbox (house or guest copy) */""",
+         """        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || pc_net_game_client_mailbox_usable()) /* mail milestone M0 / 2: marks are dropped, nothing is moved, until the host fed the mailbox */"""),
+        ("""                                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT && mTG_MAILBOX() != NULL) /* mail milestone 2: refused for a client (its marks were dropped earlier) */
+#endif
+                                mMl_clear_mail(&mTG_MAILBOX()[i]);""", """                                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) /* mail milestone 2: refused for a client (its marks were dropped earlier) */
+#endif
+                                mMl_clear_mail(&Common_Get(now_home)->mailbox[i]);"""),
+    ]
+
+    def gm_undo(t):
+        for new_, old_ in GM_EDITS:
+            n_ = 2 if new_ == """            src = &mTG_MAILBOX()[src_idx];""" else 1
+            if t.count(new_) != n_:
+                return None
+            t = t.replace(new_, old_)
+        return t
+
     old_ret = """    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && mail >= Common_Get(now_home)->mailbox &&
            mail < Common_Get(now_home)->mailbox + HOME_MAILBOX_SIZE;"""
     new_ret = """    /* G5.0: a guest (foreigner) has no home (now_home == NULL): its letters are never mailbox letters. */
@@ -94,7 +155,10 @@ def main():
     ck("A.c m_tag_ovl.c: the G5 change (baseline..%s) is ONLY the one pinned return statement (+3 / -2) gaining `Common_Get(now_home) != NULL` BEFORE the first dereference; undoing it in the G5 blob yields "
        "the baseline blob byte for byte; the worktree holds that guard exactly once" % G5_COMMIT,
        numstat("src/game/m_tag_ovl.c") == (3, 2) and tg_g5.count(new_ret) == 1 and tg_old.count(old_ret) == 1 and tg_g5.replace(new_ret, old_ret) == tg_old
-       and new_ret.index("!= NULL") < new_ret.index("now_home)->mailbox") and tg_new.count(new_ret) == 1)
+       and new_ret.index("!= NULL") < new_ret.index("now_home)->mailbox")
+       # guest mailbox (deliberate re-pin): the worktree guard is SUPERSEDED by the one overlay helper: the same NULL test, now on mTG_MAILBOX() (= pc_ui_mailbox(): the guest's post office
+       # copy for a guest client, else now_home's mailbox or NULL) BEFORE the first dereference
+       and tg_new.count(GM_RET) == 1 and GM_RET.index("mTG_MAILBOX() != NULL") < GM_RET.index("mail >= mTG_MAILBOX()"))
     # Later (8772e19, house-state-across-disconnect): 6 `#ifdef TARGET_PC` house-edit-lock refusals were ADDED to the pocket->room put procs (+48 / -0 vs the G5 blob). Pure additions only:
     # removing exactly those blocks from the working file must give the G5 blob byte for byte.
     lock_rx = re.compile(r"#ifdef TARGET_PC\n    /\*[^\n]*\*/\n    if \(pc_net_game_client_room_edit_locked\(\)\) \{\n(?:        [^\n]*\n)*?    \}\n#endif\n")
@@ -105,8 +169,10 @@ def main():
     dq_blocks = [mm.group(0) for mm in dq_rx.finditer(tg_new)]
     ck("A.c m_tag_ovl.c vs the G5 blob: ONLY pure additions of %d `#ifdef TARGET_PC` house edit-lock refusal blocks (each: pc_net_game_client_room_edit_locked() -> pc_net_game_room_edit_denied() -> "
        "warning window -> return), +48 / -0 (+9 more for the 2 delivery-item blocks of b291f8e: +57 / -0 in all); the worktree minus those blocks IS the G5 blob" % 6,
-       numstat_to_wt("src/game/m_tag_ovl.c", G5_COMMIT) == (57, 0) and len(lock_blocks) == 6 and len(dq_blocks) == 2
-       and all("pc_net_game_room_edit_denied();" in b_ and "return;" in b_ for b_ in lock_blocks) and dq_rx.sub("", lock_rx.sub("", tg_new)) == tg_g5)
+       numstat_to_wt("src/game/m_tag_ovl.c", G5_COMMIT)[0] >= 57 and len(lock_blocks) == 6 and len(dq_blocks) == 2
+       and all("pc_net_game_room_edit_denied();" in b_ and "return;" in b_ for b_ in lock_blocks) and gm_undo(dq_rx.sub("", lock_rx.sub("", tg_new))) == tg_g5)
+    # guest mailbox (deliberate re-pin): every Common_Get(now_home)->mailbox use of the overlay goes through mTG_MAILBOX() / mTG_MAILBOX_USABLE(); undoing exactly the GM_EDITS (each found once)
+    # is part of the comparison above, so nothing else in the vanilla bodies changed
     k = tg_new.index("static int mTG_client_mail_is_mailbox")
     ck("A.c the function is TARGET_PC-only (inside the existing #ifdef TARGET_PC block of the mail milestone 2 helpers)",
        tg_new.rfind("#ifdef TARGET_PC", 0, k) > tg_new.rfind("#endif", 0, k))
@@ -123,16 +189,16 @@ def main():
     ck("B.1 MUSEUM_DONATE (superseded by guest museum donation): the G5.1 guest guard is GONE, the function is the single pcnetgame_ts_begin call for every client",
        "pcnetgame_client_is_guest_player()" not in mus and "return 0;" not in mus
        and mus.split("{", 1)[1].strip() == "return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item, 0);")
-    ck("B.2 MAIL_SEND: the guest refusal comes right after the role / READY / Now_Private test and BEFORE s_mail_op is touched (no state, letter stays); resident clients skip it",
-       "pcnetgame_client_is_guest_player()" in ml
-       and ml.index("s_role != PC_NETGAME_ROLE_CLIENT") < ml.index("pcnetgame_client_is_guest_player()") < ml.index("memset(&s_mail_op")
-       and ml.index("pcnetgame_client_is_guest_player()") < ml.index("s_mail_op.active = 1"))
+    # SUPERSEDED by the guest mailbox (pin updated deliberately): a guest writes to residents through the same host transaction (the host reads the letter from the guest mirror and applies a
+    # daily limit); an OLD host still answers NO_DONOR_SLOT, which the post girl maps onto row 1 (the letter stays)
+    ck("B.2 MAIL_SEND (superseded by the guest mailbox): the G5.1 guest guard is GONE from pc_net_game_mail_begin_send (no guest test, no refusal log)",
+       "pcnetgame_client_is_guest_player()" not in ml and "MAIL_SEND refused locally" not in ml)
     pred = S.body(ng, nf, "pcnetgame_client_is_guest_player")
     ck("B the guest predicate is the existing one, unchanged (Now_Private set and player_no >= mPr_FOREIGNER): a resident (player_no 0..3) never matches",
        "(int)Common_Get(player_no) >= (int)mPr_FOREIGNER" in pred and pred == S.body(S.mask(blob("pc/src/pc_net_game.c")), S.functions(S.mask(blob("pc/src/pc_net_game.c"))),
                                                                                    "pcnetgame_client_is_guest_player"))
     ck("B the refusals log the reason (a console line); the in-game answer is the EXISTING give-back row (curator row 2) / 'no such address' row (post girl row 1)",
-       "MUSEUM_DONATE refused locally" not in ng_new and "MAIL_SEND refused locally: a guest cannot send letters to players" in ng_new)  # museum: superseded (guest museum donation)
+       "MUSEUM_DONATE refused locally" not in ng_new and "MAIL_SEND refused locally: a guest cannot send letters to players" not in ng_new)  # museum: superseded (guest museum donation); mail: superseded (guest mailbox)
     cur = S.read("src/actor/npc/ac_npc_curator_move.c_inc")
     post = S.read("src/actor/npc/ac_npc_post_girl.c_inc")
     ck("B the callers map a 0 return onto the existing refusal paths: curator ts_begin == 0 -> act_idx = 2 (give back, item stays; still used for a non-READY link / an old host's NO_DONOR_SLOT); post girl begin_send == 0 -> row 1 (letter handed back)",
@@ -147,9 +213,9 @@ def main():
        and shop.index("aNSC_set_ftr_order(shop_common);", shop.index("static void aNSC_order_check")) > shop.index("msg_no = aNSC_MSG_ORDER_CANCEL;", shop.index("static void aNSC_order_check")))
     ck("C the mailbox is closed to a guest: usable() needs a house owned by the client's PersonalID, and pcnetgame_mbox_house_of() walks homes[] only (a guest owns none) -> -1",
        "pcnetgame_mbox_own_house() >= 0" in S.body(ng, nf, "pc_net_game_client_mailbox_usable") and "Save_Get(homes[i]).ownerID" in S.body(ng, nf, "pcnetgame_mbox_house_of"))
-    ck("C the host refuses MUSEUM_DONATE / MAIL_SEND / MAIL_TAKE for guest slots with NO_DONOR_SLOT (existing, unchanged): the guest reasons are in the source",
-       "has no museum donor slot" in ng_new and "a guest / extra player has no house: sending mail is refused" in ng_new
-       and "has no house and no mailbox: taking mail is refused" in ng_new)
+    ck("C (guest mailbox re-pin) the host refuses MUSEUM_DONATE without a record and MAIL_SEND / MAIL_TAKE for guest slots ONLY with the host switch off (AC_MP_GUEST_MAIL=0) / no entry, with NO_DONOR_SLOT",
+       "has no museum donor slot" in ng_new and "guest mail is switched off on this host (AC_MP_GUEST_MAIL=0) / no guest entry\"" in ng_new
+       and "guest mail is switched off on this host (AC_MP_GUEST_MAIL=0) / no guest entry: a guest has no mailbox" in ng_new)
     ck("C no wire / protocol change by G5: message ids 1..66 (66 = M-F promotion handoff) (59..61 = furniture sync, 62..65 = town transfer), pc_net_game.h / pc_net.c / pc_net.h unchanged",
        sorted(dict(wire_baseline.c_message_ids(ng_new)).values()) == list(range(1, wire_baseline.EXPECTED_MAX_MSG_ID + 1)) and numstat("pc/include/pc_net_game.h") == (0, 0)
        and numstat("pc/src/pc_net.c") == (0, 0) and numstat("pc/include/pc_net.h") == (0, 0))

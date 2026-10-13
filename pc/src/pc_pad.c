@@ -187,6 +187,7 @@ u32 PADRead(PADStatus* status) {
         const unsigned af = pc_net_game_test_autopilot_pad(&ax, &ay);
         if (af & 1u) buttons |= PAD_BUTTON_A;
         if (af & 2u) buttons |= PAD_BUTTON_RIGHT;
+        if (af & 4u) buttons |= PAD_BUTTON_B; /* "mashm" (guest mailbox real test): B closes the mailbox overlay */
         if (ax != 0 || ay != 0) { stickX = (s8)ax; stickY = (s8)ay; }
     }
     { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_DRESSER_GYROID=1): the scripted input of the dresser gyroid-overlay UI test; 0 otherwise (never in normal play) */

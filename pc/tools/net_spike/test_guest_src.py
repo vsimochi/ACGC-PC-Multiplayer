@@ -154,7 +154,8 @@ def main():
               "pc_net_game_dedicated_resident_admin", "pc_net_game_dedicated_resident_info", "pcnetgame_promote_exec", "pcnetgame_host_promotion_handoff",  # M-F: promote (the guest record -> a new resident) + the handoff check (resident PID lookup)
                "pcnetgame_dedicated_resident_resolve", "pcnetgame_host_admission_resolve_view", "pcnetgame_rec_has_promote_entry",  # M-H: the resolver input builder (reads the host residents); M-G: the promote-entry probe (guarded idx < PLAYER_NUM)
               "pcnetgame_resident_arm_active", "pcnetgame_resident_cred_find", "pcnetgame_resident_mint", "pcnetgame_resident_mint_rollback",
-              "pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_host_mbox_tick",
+              # guest mailbox (re-pin): the MAIL_SEND / MAIL_TAKE handlers read the bound record through pcnetgame_rec_priv_ptr only (no private_data subscript any more)
+              "pcnetgame_guest_key_conflict", "pcnetgame_guest_name_conflict_resident", "pcnetgame_host_mbox_tick",
               "pcnetgame_host_process_identity", "pcnetgame_host_record_tick", "pcnetgame_host_remail_tick", "pcnetgame_host_revalidate_bound_peers",
               "pcnetgame_house_handle_begin", "pcnetgame_house_process_commit",  # furniture sync: guest slot -> NOT_OWNER before the first subscript (test_house_sync_src.py)
               "pcnetgame_mail_test_poke_museum", "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mail_test_seed_reply", "pcnetgame_mbox_refresh_resident",
@@ -175,8 +176,10 @@ def main():
     ck("A the functions that subscript Save_Get(homes[...]) are exactly the reviewed ones (house lookup by PersonalID, mail / mailbox paths behind the guest refusal, "
        "client-side shadows, TEST-ONLY hooks): %s" % homes_users,
        homes_users == sorted(["pc_residence_check", "pcres_house_free", "pcnetgame_guest_key_conflict", "pcnetgame_handle_host_mail_take_txn", "pcnetgame_handle_host_mail_txn", "pcnetgame_mail_test_force_delivery",
-                              "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mbox_client_apply", "pcnetgame_mbox_client_tick", "pcnetgame_mbox_house_of",
-                              "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook", "pcnetgame_txn_apply_take",
+                              "pcnetgame_mail_test_seed_mailbox", "pcnetgame_mbox_client_apply", "pcnetgame_mbox_house_of",
+                              # guest mailbox (re-pin): the client revert / take apply write through pcnetgame_mbox_local_target() (the owned house's mailbox, range-checked h >= 0, or the guest copy)
+                              "pcnetgame_mbox_local_target",
+                              "pcnetgame_mbox_refresh_resident", "pcnetgame_run_mail_take_test_hook", "pcnetgame_run_mail_test_hook",
                               # furniture sync (house index from a bound PersonalID, guest refused first; client shadows; TEST-ONLY host edit): see test_house_sync_src.py
                               "pcnetgame_hcl_build_pair", "pcnetgame_hcl_local_cown", "pcnetgame_hcl_push_complete", "pcnetgame_hcl_write_save", "pcnetgame_house_host_refresh",
                               # furniture sync, reviewed (guest-safety review of da9074a): live apply / reconcile plan / room track (client shadows, range-checked house index),
@@ -221,11 +224,16 @@ def main():
         b_ = fb(fn)
         return first in b_ and then in b_ and b_.index(first) < b_.index(then)
 
-    ck("A mail send: the guest slot (idx >= PLAYER_NUM) is refused BEFORE the first private_data / homes subscript",
-       before("pcnetgame_handle_host_mail_txn", "if (idx >= PLAYER_NUM) {", "Save_Get(private_data)[idx]") and before("pcnetgame_handle_host_mail_txn", "if (idx >= PLAYER_NUM) {", "Save_Get(homes[")
+    # guest mailbox (re-pin): a guest slot is no longer refused outright -- the guest switch / entry check comes first, the record is read ONLY through pcnetgame_rec_priv_ptr, and every
+    # homes[] subscript sits on a RESIDENT-only path (the sender house loop under `gslot < 0`, the recipient house rh of the vanilla address lookup, the take's house mailbox under gslot < 0)
+    gsw = "if (idx >= PLAYER_NUM && (gslot < 0 || !pcnetgame_guest_mail_enabled())) {"
+    ck("A mail send: the guest switch / entry check comes BEFORE the first homes subscript, no private_data subscript at all, the letter through the accessor, the sender-house loop only for a resident",
+       before("pcnetgame_handle_host_mail_txn", gsw, "Save_Get(homes[") and "Save_Get(private_data)" not in fb("pcnetgame_handle_host_mail_txn")
+       and "mir = pcnetgame_rec_priv_ptr(idx);" in fb("pcnetgame_handle_host_mail_txn") and before("pcnetgame_handle_host_mail_txn", "if (gslot < 0) {", "Save_Get(homes[i]).ownerID")
        and "pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in," in fb("pcnetgame_handle_host_mail_txn"))
-    ck("A mail take: the guest slot is refused BEFORE the first private_data / homes subscript",
-       before("pcnetgame_handle_host_mail_take_txn", "if (idx >= PLAYER_NUM) {", "Save_Get(private_data)[idx]") and before("pcnetgame_handle_host_mail_take_txn", "if (idx >= PLAYER_NUM) {", "Save_Get(homes[")
+    ck("A mail take: the guest switch / entry check comes BEFORE the first homes subscript, no private_data subscript at all, a guest's source is s_guest_mbox[gslot] (never homes[])",
+       before("pcnetgame_handle_host_mail_take_txn", gsw, "Save_Get(homes[") and "Save_Get(private_data)" not in fb("pcnetgame_handle_host_mail_take_txn")
+       and "L = gslot >= 0 ? &s_guest_mbox[gslot].box[t->slot] : &Save_Get(homes[h]).mailbox[t->slot];" in fb("pcnetgame_handle_host_mail_take_txn")
        and "pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in," in fb("pcnetgame_handle_host_mail_take_txn"))
     ck("A the guest refusal helper answers with the EXISTING NO_DONOR_SLOT reason, not journaled (no new wire value), via pcnetgame_txn_reject",
        "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT, 0, NULL, why" in fb("pcnetgame_txn_reject_guest_no_house"))
@@ -362,7 +370,12 @@ def main():
        sorted({n for a, b, n in funcs if "pcnetgame_guest_store_write(" in c[a:b] and n != "pcnetgame_guest_store_write"})
        == sorted(["pcnetgame_guest_create", "pcnetgame_guest_rollback_create", "pcnetgame_guest_remint", "pcnetgame_guest_remint_rollback",
                   "pcnetgame_guest_confirm_on_record_step", "pc_net_game_record_after_gci_save", "pc_net_game_dedicated_guest_admin",
-                  "pc_net_game_dedicated_give", "pcnetgame_promote_exec", "pcnetgame_guest_drop_promoted"]))  # lifecycle hardening: + the stale-entry removal (resident confirm / sweep)
+                  "pc_net_game_dedicated_give", "pcnetgame_promote_exec", "pcnetgame_guest_drop_promoted",  # lifecycle hardening: + the stale-entry removal (resident confirm / sweep)
+                  # guest mailbox: (6) the MAIL_TAKE commit of a guest (DURABLE before the APPLIED), (7) a villager-reply delivery, (8) the TEST-ONLY seed hook
+                  "pcnetgame_handle_host_mail_take_txn", "pcnetgame_host_guest_remail_tick", "pcnetgame_guest_mail_test_hooks",
+                  # letters to guests (deliberate re-pin): (9) a GUEST's letter to another guest (both files DURABLE before the APPLIED), (10) the event-letter finisher
+                  # (written at once only for the museum letter, whose dedupe bits live in the same file; the other event letters ride the post-save write)
+                  "pcnetgame_handle_host_mail_txn", "pcnetgame_gev_finish"]))
     give = fb("pc_net_game_dedicated_give")
     prom = fb("pcnetgame_promote_exec")  # the console command pc_net_game_dedicated_promote is a thin wrapper of it
     pord = ["s_guest_untrusted", "pcnetgame_guest_backup(g, bak_g", "pc_mp_promote_create("]
@@ -432,7 +445,11 @@ def main():
        "PCNetGameTownIdentity town;" in gdef and "pcnetgame_town_equal(&s_guest[g].town, &s_host_town)" in fb("pcnetgame_guest_find")
        and "s_guest[g].town = s_host_town;" in fb("pcnetgame_guest_create") and "memcpy(e->town_land_name, s_guest[g].town.land_name, PC_NETGAME_LAND_LEN);" in fb("pcnetgame_guest_entry_build")
        and "s_guest[g].town.land_id = fe->town_land_id;" in fb("pcnetgame_guest_install") and "#define PC_MP_GUEST_VERSION       2u" in gh
-       and sorted({n for a, b, n in funcs if "pcnetgame_guest_find(" in c[a:b] and n != "pcnetgame_guest_find"}) == ["pcnetgame_host_guest_check"])
+       and sorted({n for a, b, n in funcs if "pcnetgame_guest_find(" in c[a:b] and n != "pcnetgame_guest_find"})
+       == sorted(["pcnetgame_host_guest_check",
+                  # letters to guests (deliberate re-pin): the letter recipient, the event sink and the goodbye queue look a KEY up -- always through
+                  # pcnetgame_guest_find (the current-town rule) and then pcnetgame_guest_mail_target
+                  "pcnetgame_guest_mail_recipient", "pcnetgame_gev_sink", "pcnetgame_gev_run_goodbye"]))
     ck("L4 the re-validation re-applies the town rule after a town change: the bound entry must still be THIS town's and its key's home land must not be this town's land",
        "!pcnetgame_town_equal(&s_guest[g].town, &s_host_town)" in fb("pcnetgame_host_revalidate_bound_peers") and "st->bound_pid.land_id == s_host_town.land_id" in fb("pcnetgame_host_revalidate_bound_peers")
        and "memcmp(st->bound_pid.land_name, s_host_town.land_name, PC_NETGAME_LAND_LEN) == 0" in fb("pcnetgame_host_revalidate_bound_peers"))

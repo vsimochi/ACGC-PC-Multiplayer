@@ -5,6 +5,9 @@
 #include "m_editor_ovl.h"
 #include "m_font.h"
 #include "sys_matrix.h"
+#ifdef TARGET_PC
+#include "pc_guest_mail.h" /* guest mailbox: the GUEST DIRECTORY entries of the player page */
+#endif
 
 static mAD_Ovl_c adrs_ovl_data;
 
@@ -188,6 +191,20 @@ static void mAD_make_player_address(mAD_Ovl_c* adrs_ovl) {
             }
         }
     }
+
+#ifdef TARGET_PC
+    {
+        /* guest mailbox: the town's GUESTS (the host's guest directory) after the residents, before the museum, on the same single page. The page is drawn
+         * for at most mAD_PAGE_MAX_ENTRIES rows (mAD_address_draw_init: (count - 1) * 90 / 7) and the museum entry takes TWO rows (its extra gap), so the
+         * guests fill what is left: 8 - residents - (museum ? 2 : 0). No guest is listed for solo play / an older host / the host switch off. */
+        const int room = mAD_PAGE_MAX_ENTRIES - (int)*count_p - (mPr_CheckMuseumAddress(Now_Private) ? 2 : 0);
+        if (room > 0) {
+            const int n = pc_net_game_guest_address_list(name_p, room);
+            name_p += n;
+            *count_p += (u8)n;
+        }
+    }
+#endif
 
     if (mPr_CheckMuseumAddress(Now_Private)) {
         mMsm_GetMuseumMailName(name_p);

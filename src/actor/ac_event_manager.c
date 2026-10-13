@@ -16,6 +16,7 @@
 #include "m_random_field.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* events: pc_net_game_event_client_gate() */
+#include "pc_guest_mail.h" /* guest mailbox: the mail-event window / Valentine's Day for the guests' villager letters */
 #define aEvMgr_HOST_UNBOUNDED(name) pc_net_game_evnpc_host_unbounded((int)(name)) /* Patch 4: the host creates its event NPCs whether or not a player is near */
 #endif
 #include "zurumode.h"
@@ -4597,6 +4598,11 @@ static int mail_event_check(void) {
             }
         }
 
+#ifdef TARGET_PC
+        /* guest mailbox: the same window for the GUESTS' birthday / Christmas letters (host only; delivered by pc_net_game.c into the host-held guest mailboxes) */
+        pc_net_game_guest_event_window(last_time.raw, date.raw);
+#endif
+
         // Valentine's day
         target_date.month = lbRTC_FEBRUARY;
         target_date.day = 14;
@@ -4641,6 +4647,9 @@ static int vt_wt_mail_check(void) {
 
         if (Save_Get(event_save_common).valentines_day_date <= date.raw) {
             mNpc_SendVtdayMail();
+#ifdef TARGET_PC
+            pc_net_game_guest_vtday_due(); /* guest mailbox: the guests' Valentine's Day letters (host only) */
+#endif
             Save_Get(event_save_common).valentines_day_date = 0;
             ret = TRUE;
         } else if (date.raw < vt_date.raw) {

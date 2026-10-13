@@ -162,9 +162,15 @@ def main():
     check("PHASE 7: the work table is dynamic (PCKeyTab keyed by PersonalID, file v3 with a v2 reader); no fixed 64; a rekey removes and re-adds", "PC_WORK_MAX_CHARS" not in code and "PC_WORK_FILE_VERSION 3u" in ng and
           "pc_tabfile_load(path, PC_WORK_FILE_MAGIC, PC_WORK_FILE_VERSION, PC_WORK_FILE_VERSION_V2, 64" in ng and "pc_keytab_remove(&s_work_tab, &from_key)" in ng)
     check("RESIDENTS stay 4: PLAYER_NUM tables and the resident table size are untouched, guests never touch them", "#define PC_NETGAME_RESIDENT_TABLE_SIZE   4" in ng and "static PCNetGameMboxHost s_mbox_host[PLAYER_NUM][PC_NETGAME_MBOX_SLOTS];" in ng and "static uint32_t s_remail_day[PLAYER_NUM];" in ng)
-    for rel, why in (("pc/src/pc_mp_guest_store.c", "Phase 3 guest store"), ("pc/include/pc_mp_guest_store.h", "Phase 3 guest store header"), ("pc/src/pc_guest_admit.c", "Phase 4 admission rules"), ("pc/include/pc_guest_admit.h", "Phase 4 admission header"),
+    for rel, why in (("pc/src/pc_guest_admit.c", "Phase 4 admission rules"), ("pc/include/pc_guest_admit.h", "Phase 4 admission header"),
                      ("pc/src/pc_peer_table.c", "Phase 2 peer table")):
         check("%s unchanged by this work (%s)" % (rel, why), read(rel) == parent(rel))
+    # guest mailbox (a LATER milestone, deliberate re-pin): the per-guest store gained the v4 extension block (the guest's host-held mailbox). What this phase pinned still holds:
+    # every public declaration of the Phase 3 header is still there with the same signature (the v3 file layout is still written for an empty mailbox; guest_store_selftest.c).
+    old_h = parent("pc/include/pc_mp_guest_store.h")
+    decls = [ln.strip() for ln in old_h.splitlines() if re.match(r"^(int|void|uint32_t)\s+pc_mp_gs_\w+\(", ln.strip())]
+    check("pc/include/pc_mp_guest_store.h: every Phase 3 declaration (%d) is unchanged (the guest mailbox v4 block was ADDED by a later milestone)" % len(decls),
+          len(decls) >= 10 and all(d in read("pc/include/pc_mp_guest_store.h") for d in decls) and "#define PC_MP_GS_FILE_SIZE   (PC_MP_GS_HEADER_SIZE + PC_MP_GS_ID_SIZE + PC_MP_GUEST_ENTRY_SIZE + 4)" in read("pc/include/pc_mp_guest_store.h"))
     changed_files = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", PARENT], capture_output=True, text=True).stdout.split()
     check("Rover / radial menu / character files not touched", not [f for f in changed_files if re.search(r"rover|radial|character|nook_house|guide2", f, re.I)])
     ded = read("pc/src/pc_dedicated.c")

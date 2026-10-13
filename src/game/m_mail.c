@@ -253,6 +253,15 @@ static void mMl_get_mail_to_player_com(Mail_c* mail, PersonalID_c* recipient_pid
     mail->content.paper_type = (paper - ITM_PAPER_START) % PAPER_UNIQUE_NUM;
 }
 
+#ifdef TARGET_PC
+/* Guest mailbox (host): the system letter mMl_send_mail_box / _postoffice would make, built into `mail` only (no house, no post office): the caller hands it to a
+ * guest's host-held mailbox (m_museum.c mMsm_GuestCompMailForSink). */
+extern void mMl_make_mail_to_player(Mail_c* mail, PersonalID_c* recipient_pid, mActor_name_t present, mActor_name_t paper, u8* sender_name, int mail_no,
+                                    u32 proc_type, u8 mail_type) {
+    mMl_get_mail_to_player_com(mail, recipient_pid, present, paper, sender_name, mail_no, proc_type, mail_type);
+}
+#endif
+
 static int mMl_send_mail_box_com(PersonalID_c* recipient_pid, int player_no, Mail_c* mail, mActor_name_t present,
                                  mActor_name_t paper, int mail_no, u8* sender_name, u32 proc_type, u8 mail_type) {
     mHm_hs_c* house;

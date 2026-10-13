@@ -42,7 +42,10 @@ HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRa
              "PCNetGameAdmission", "PCNetGameAdmissionKind",  # M-D: the host's local admission decision (never on the wire)
              "PCNetGameHouseHost", "PCNetGameHouseClient",
              "PCNetRoomNpcLease",
-             "PCNetWorkChar", "PCNetWorkJobDef", "PCNetWorkMirror")  # indoor villagers: the host's per-room pose lease (local, never on the wire)  # furniture sync: the host's canonical house copy / the client's house state (local, never on the wire)
+             "PCNetWorkChar", "PCNetWorkJobDef", "PCNetWorkMirror",
+             "PCNetGameGuestMbox", "PCNetGameGuestSinkCtx",
+             "PCNetGameGevBye", "PCNetGameGevCtx")  # letters to guests: the host's goodbye-letter queue entry / the event sink context (local, never on the wire)
+             # guest mailbox (above):  # guest mailbox: the host's per-guest mailbox table entry / the villager-reply sink context (local, never on the wire)  # indoor villagers: the host's per-room pose lease (local, never on the wire)  # furniture sync: the host's canonical house copy / the client's house state (local, never on the wire)
 # Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
 # (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
 REMOVED_CLIENT_ONLY = ("PCNetGameBuryCommitted",)
@@ -187,7 +190,9 @@ X3_SIZE_ASSERTS = ('_Static_assert(sizeof(PCNetGameFieldActionRequestMsg) == 76,
 TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM   2u", "#define PC_NETGAME_TS_SHOP     3u",
              # batch A (A1): service 4 = HOST_CONFIG (authoritative wildlife mode), array bound 5, 8-byte blob
              # the announced shop upgrade (deliberate): service 6 = SHOP_UPGRADE (16-byte state blob), array bound 7; an old client ignores service 6
-             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      7u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             # letters to guests (deliberate): service 7 = GUEST_DIR (324-byte directory blob), array bound 8; an old client ignores service 7
+             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      8u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             "#define PC_NETGAME_TS_GUESTDIR 7u", "#define PC_NETGAME_TS_GUESTDIR_LEN (4u + PC_NETGAME_GUESTDIR_MAX * 20u) /* 324 */", "#define PC_NETGAME_GUESTDIR_MAX   16u",
              "#define PC_NETGAME_TS_UPGRADE  6u", "#define PC_NETGAME_TS_UPGRADE_LEN 16u",
              # events: service 5 = EVENT_STATE (214-byte decision-state blob), array bound 6
              "#define PC_NETGAME_TS_EVENT    5u", "#define PC_NETGAME_TS_EVENT_LEN 214u",
@@ -373,6 +378,9 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_EVNPC_DONE": '36',
     "PC_NETGAME_TXN_KIND_DRESSER": '18',
     "PC_NETGAME_TXN_REASON_DRESSER_DISABLED": '37',
+    # guest mailbox (deliberate, v8 extended in place): reason 38 MAIL_LIMIT; MAILBOX_LETTER (56) house 0xFF = the guest's host-held mailbox (no layout change)
+    "PC_NETGAME_TXN_REASON_MAIL_LIMIT": '38',
+    "PC_NETGAME_MBOX_HOUSE_GUEST": '0xFF',
     "PC_NETGAME_HOUSE_AUTO": '0xFF',
     "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',
     "PC_NETGAME_TXN_KIND_MAIL_TAKE": '13',
@@ -416,6 +424,8 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TS_HOSTCFG_LEN": '8',
     "PC_NETGAME_TS_EVENT": '5',
     "PC_NETGAME_TS_EVENT_LEN": '214',
+    "PC_NETGAME_TS_GUESTDIR": '7',     # letters to guests (deliberate): the GUEST DIRECTORY service
+    "PC_NETGAME_TS_GUESTDIR_LEN": '324',
     "PC_NETGAME_TS_BLOB_MAX": '340',
     "PC_NETGAME_TS_POLICE_LEN": '40',
     "PC_NETGAME_TS_MUSEUM_LEN": '63',

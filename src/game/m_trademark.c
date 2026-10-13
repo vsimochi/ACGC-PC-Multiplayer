@@ -323,7 +323,20 @@ extern void trademark_cleanup(GAME* game) {
         home->outlook_pal = i;
         home->next_outlook_pal = i;
 
+#ifdef TARGET_PC
+        {
+            /* Guest mailbox (found by its promotion test): on PC the save lives in memory and was just re-read by trademark_init (common_data_reinit ->
+             * pc_save_reload). A HOST that starts its world straight from this in-memory save (the dedicated observer, pc_host_observer_poll) never re-reads
+             * it, so the vanilla clear wiped every house mailbox of the real town at each host start (letters, gifts). The vanilla Start path re-reads the
+             * save anyway (ac_animal_logo.c), so skipping the clear for a loaded save changes nothing there. No save loaded: vanilla. */
+            extern int pc_save_loaded;
+            if (!pc_save_loaded) {
+                mMl_clear_mail_box(home->mailbox, HOME_MAILBOX_SIZE);
+            }
+        }
+#else
         mMl_clear_mail_box(home->mailbox, HOME_MAILBOX_SIZE);
+#endif
         home++;
     }
 

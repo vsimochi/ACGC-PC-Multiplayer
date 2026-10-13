@@ -165,8 +165,8 @@ def host_level(h):
 
 def source_audit(ck):
     ng = open(os.path.join(T.PC, "src", "pc_net_game.c"), encoding="utf-8", errors="replace").read().replace("\r\n", "\n")
-    ck("S wire: service 6 / 16 bytes / array bound 7 / message 85 (8 bytes) in C",
-       "#define PC_NETGAME_TS_UPGRADE  6u" in ng and "#define PC_NETGAME_TS_UPGRADE_LEN 16u" in ng and "#define PC_NETGAME_TS_NUM      7u" in ng
+    ck("S wire: service 6 / 16 bytes / array bound 8 (7 = the guest directory) / message 85 (8 bytes) in C",
+       "#define PC_NETGAME_TS_UPGRADE  6u" in ng and "#define PC_NETGAME_TS_UPGRADE_LEN 16u" in ng and "#define PC_NETGAME_TS_NUM      8u" in ng  # letters to guests (deliberate): service 7 = GUEST_DIR, array bound 8
        and "PC_NETGAME_MSG_SHOP_UPGRADE_REQ      = 85," in ng and '_Static_assert(sizeof(PCNetGameShopUpgradeReqMsg) == 8,' in ng)
     blk = ng[ng.index("===== SHOP UPGRADE BEGIN"):ng.index("===== SHOP UPGRADE END")]
     st = blk[blk.index("static int pcnetgame_shopup_start("):]

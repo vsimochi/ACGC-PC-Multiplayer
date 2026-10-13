@@ -17,6 +17,7 @@
 #include "ac_npc.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* pc_net_game_world_is_host_authoritative() -- villager population/home authority gating */
+#include "pc_guest_mail.h" /* guest mailbox: pc_net_game_guest_goodbye_note() (a departing villager's goodbye letters for the guests it knows) */
 #endif
 
 static int mNpc_CheckIslandAnimalID(AnmPersonalID_c* anm_id);
@@ -1737,6 +1738,42 @@ extern void mNpc_RemailFor(Private_c* priv) {
     }
 }
 
+/* Guest mailbox (TARGET_PC host): mNpc_RemailFor with the letter handed to `sink` instead of the post office. The post office cannot hold a letter for a player
+ * without a house (its load sweep deletes it, mPO_receipt_check_mail refuses it), so the host delivers a GUEST's villager replies straight into the guest's
+ * host-held mailbox through the sink. Same rules as mNpc_RemailFor: town villagers only, a reply is due on a later day than the letter, send_reply is cleared
+ * only when the sink took the letter, and a refused letter (the guest mailbox is full) stops the pass for this record (retried on a later pass). Reads
+ * priv->player_ID only. mNpc_RemailFor itself is unchanged (the post office sink of every resident). */
+extern void mNpc_RemailForSink(Private_c* priv, mNpc_REMAIL_SINK sink, void* ctx) {
+    Animal_c* animal = Save_Get(animals);
+    Anmmem_c* memory;
+    lbRTC_time_c* rtc_time = Common_GetPointer(time.rtc_time);
+    Mail_c* mail = &l_npc_mail;
+    int i;
+
+    if (sink == NULL || mPr_NullCheckPersonalID(&priv->player_ID) != FALSE) {
+        return;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++, animal++) {
+        int mem_idx;
+        if (mNpc_CheckFreeAnimalPersonalID(&animal->id) != FALSE) {
+            continue;
+        }
+        mem_idx = mNpc_GetAnimalMemoryIdx(&priv->player_ID, animal->memories, ANIMAL_MEMORY_NUM);
+        if (mem_idx == -1) {
+            continue;
+        }
+        memory = animal->memories + mem_idx;
+        if (memory->letter_info.send_reply && mNpc_CheckLetterTime(&memory->letter.date, rtc_time) == TRUE) {
+            mMl_clear_mail(mail);
+            mNpc_GetRemailData(mail, &priv->player_ID, &animal->id, NULL, memory->letter_info.cond, FALSE);
+            if ((*sink)(mail, ctx) != TRUE) {
+                break; /* the destination is full: send_reply stays set, a later pass retries */
+            }
+            memory->letter_info.send_reply = FALSE;
+        }
+    }
+}
+
 extern void mNpc_Remail() {
     Animal_c* animal = Save_Get(animals) + ANIMAL_NUM_MAX; /* where the vanilla loop above left its cursor (the foreign letter does not read it) */
     Anmremail_c* remail;
@@ -2071,6 +2108,108 @@ extern int mNpc_SendEventXmasCard(PersonalID_c* pid, int player_no) {
 
     return res;
 }
+
+#ifdef TARGET_PC
+/* ===== Guest mailbox: villager EVENT letters for GUESTS (host only; pc_net_game.c "GUEST MAIL HOST (events)") =====
+ * A guest owns no house, so the vanilla senders above (which write homes[mHS_get_arrange_idx(player_no)].mailbox or the post office of a RESIDENT) can never
+ * reach it. These builders make the SAME letters (same builders, same mail numbers, same presents, same friendship rules) for one guest KEY (the PersonalID the
+ * villager memories of a guest are keyed by) and hand each letter to `sink` (TRUE = taken: the host-held guest mailbox had room). Nothing here touches homes[],
+ * the post office or any Private_c; the caller owns the dedupe (the host's mail-event cursor / the departure queue). Returns the number of letters taken. */
+extern int mNpc_GuestBirthdayCardsForSink(PersonalID_c* key, mNpc_REMAIL_SINK sink, void* ctx) {
+    /* mNpc_SendEventBirthdayCard2 for a guest: every villager whose HIGHEST-friendship memory is this guest sends a card with a RARE present. The vanilla
+     * now_private->birthday_present_npc exclusion (the villager who visits the resident's door) does not apply: a guest has no door. mLd_CheckThisLand is not
+     * required: a guest key names its home town by design (G1). */
+    Animal_c* animal = Save_Get(animals);
+    Mail_c* mail = &l_npc_mail;
+    int i, best, n = 0;
+
+    if (key == NULL || sink == NULL || mPr_NullCheckPersonalID(key) != FALSE) {
+        return 0;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++, animal++) {
+        if (mNpc_CheckFreeAnimalPersonalID(&animal->id) != FALSE) {
+            continue;
+        }
+        best = mNpc_GetHighestFriendshipIdx(animal->memories, ANIMAL_MEMORY_NUM);
+        if (best == -1 || mPr_CheckCmpPersonalID(key, &animal->memories[best].memory_player_id) != TRUE) {
+            continue;
+        }
+        mMl_clear_mail(mail);
+        mNpc_GetBirthdayCard(mail, key, &animal->id);
+        if ((*sink)(mail, ctx) != TRUE) {
+            break; /* the guest mailbox is full: the remaining cards of this pass are not sent (vanilla: a full mailbox + post office drops them too) */
+        }
+        n++;
+    }
+    return n;
+}
+
+extern int mNpc_GuestXmasCardForSink(PersonalID_c* key, mNpc_REMAIL_SINK sink, void* ctx) {
+    Mail_c* mail = &l_npc_mail;
+
+    if (key == NULL || sink == NULL || mPr_NullCheckPersonalID(key) != FALSE) {
+        return 0;
+    }
+    mMl_clear_mail(mail);
+    mNpc_GetXmasCardData(mail, key);
+    return (*sink)(mail, ctx) == TRUE ? 1 : 0;
+}
+
+/* mNpc_SendVtdayMail for guests: each villager picks, among the memories of the given guests (keys[k], genders[k]) of the OTHER sex, its best friend with the
+ * vanilla tie rules (mNpc_SelectBestFriend), and sends that guest one present letter typed exactly like the vanilla (BEST_FRIEND when it is also the villager's
+ * overall best friend, OK_FRIEND at friendship >= 80, else NOT_FRIEND). Residents keep the vanilla pass (one letter per villager per resident pass). */
+extern int mNpc_GuestVtdayMailForSink(PersonalID_c* keys, const u8* genders, int num, mNpc_REMAIL_SINK sink, void* ctx) {
+    Animal_c* animal = Save_Get(animals);
+    Mail_c* mail = &l_npc_mail;
+    int i, m, k, n = 0;
+
+    if (keys == NULL || genders == NULL || num <= 0 || sink == NULL) {
+        return 0;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++, animal++) {
+        Anmmem_c* best_mem = NULL;
+        s8 best_friendship = 0;
+        int sel = -1, sel_key = -1, sex, type, overall;
+
+        if (mNpc_CheckFreeAnimalPersonalID(&animal->id) != FALSE) {
+            continue;
+        }
+        sex = (~mNpc_GetAnimalSex(animal)) & 1;
+        for (m = 0; m < ANIMAL_MEMORY_NUM; m++) {
+            Anmmem_c* mem = &animal->memories[m];
+            if (mNpc_CheckFreeAnimalMemory(mem) != FALSE) {
+                continue;
+            }
+            for (k = 0; k < num; k++) {
+                if (genders[k] == (u8)sex && mPr_CheckCmpPersonalID(&keys[k], &mem->memory_player_id) == TRUE) {
+                    break;
+                }
+            }
+            if (k < num && mNpc_SelectBestFriend(&best_mem, mem, &best_friendship) == TRUE) {
+                sel = m;
+                sel_key = k;
+            }
+        }
+        if (sel < 0) {
+            continue;
+        }
+        overall = mNpc_GetAnimalMemoryBestFriend(animal->memories, ANIMAL_MEMORY_NUM);
+        if (overall == sel) {
+            type = mNpc_EVENT_MAIL_BEST_FRIEND;
+        } else if (animal->memories[sel].friendship >= 80) {
+            type = mNpc_EVENT_MAIL_OK_FRIEND;
+        } else {
+            type = mNpc_EVENT_MAIL_NOT_FRIEND;
+        }
+        mMl_clear_mail(mail);
+        mNpc_GetEventMail(mail, &keys[sel_key], &animal->id, type, animal->id.looks);
+        if ((*sink)(mail, ctx) == TRUE) {
+            n++;
+        }
+    }
+    return n;
+}
+#endif
 
 extern int mNpc_GetPresentClothMemoryIdx(Anmmem_c* memory) {
     int i;
@@ -3633,8 +3772,35 @@ static void mNpc_SetGoodbyAnimalMail(Anm_GoodbyMail_c* goodby_mail, AnmPersonalI
 
             priv++;
         }
+#ifdef TARGET_PC
+        {
+            /* guest mailbox: the departing villager's goodbye letter for the GUESTS it knows. The memories are copied NOW (the caller clears the Animal_c
+             * right after); the host's guest pass delivers them (pc_net_game.c "GUEST MAIL HOST (events)"). A no-op unless this process is a host. */
+            int a = mNpc_SearchAnimalPersonalID(anm_id);
+            if (a >= 0) {
+                pc_net_game_guest_goodbye_note(anm_id, Save_Get(animals)[a].memories, ANIMAL_MEMORY_NUM);
+            }
+        }
+#endif
     }
 }
+
+#ifdef TARGET_PC
+/* Guest mailbox (host): the vanilla goodbye letter (mNpc_SetGoodbyMailData: mail 0x20E + looks * 3 + random(3), no present) for one guest key, handed to `sink`. */
+static int mNpc_SetGoodbyMailData(Mail_c* mail, PersonalID_c* pid, AnmPersonalID_c* anm_id);
+extern int mNpc_GuestGoodbyMailForSink(PersonalID_c* key, AnmPersonalID_c* anm_id, mNpc_REMAIL_SINK sink, void* ctx) {
+    Mail_c* mail = &l_npc_mail;
+
+    if (key == NULL || anm_id == NULL || sink == NULL || mPr_NullCheckPersonalID(key) != FALSE || mNpc_CheckFreeAnimalPersonalID(anm_id) != FALSE) {
+        return 0;
+    }
+    mMl_clear_mail(mail);
+    if (mNpc_SetGoodbyMailData(mail, key, anm_id) != TRUE) {
+        return 0;
+    }
+    return (*sink)(mail, ctx) == TRUE ? 1 : 0;
+}
+#endif
 
 static int mNpc_SetGoodbyMailData(Mail_c* mail, PersonalID_c* pid, AnmPersonalID_c* anm_id) {
     static u8 animal_name[ANIMAL_NAME_LEN];

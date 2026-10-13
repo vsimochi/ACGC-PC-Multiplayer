@@ -88,7 +88,8 @@ int aPG_check_destination(Mail_c *mail){
      * remote senders. Letters to villagers (type 1, MAIL_REQUEST path) and gift-less museum letters are unaffected. Host / solo: unchanged. */
     if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
         if (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER) {
-            return (mMl_hunt_for_send_address(mail) == -1) ? 1 : 0;
+            /* guest mailbox: a GUEST of the town (the host's guest directory) is an address too; the host re-checks it against its own guest table */
+            return (mMl_hunt_for_send_address(mail) == -1 && !pc_net_game_guest_address_known(&mail->header.recipient.personalID)) ? 1 : 0;
         }
         if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {
             return 1;
@@ -99,6 +100,16 @@ int aPG_check_destination(Mail_c *mail){
     case 0:
         {
             int addr = mMl_hunt_for_send_address(mail);
+#ifdef TARGET_PC
+            if (addr == -1) {
+                /* guest mailbox (the HOST's own player): a letter to a GUEST of the town -- 0 deliverable, 2 its mailbox is full; -1 = not a guest (vanilla) */
+                const int g = pc_net_game_host_guest_letter_check(mail);
+                if (g >= 0) {
+                    res = g;
+                    break;
+                }
+            }
+#endif
             if (addr == -1) {
                 res = 1;
             } else if (aPG_check_destination_mailbox(addr) == FALSE) {
@@ -172,6 +183,7 @@ static int aPG_client_mail_step(GAME_PLAY *play) {
     case PC_NETGAME_MAIL_REJECT_MAILBOX_FULL:
         return 2;
     case PC_NETGAME_MAIL_REJECT_PO_FULL:
+    case PC_GUEST_MAIL_REJECT_LIMIT: /* guest mailbox: a guest's daily letter limit -- the "we can't take more letters" row (the letter stays) */
         return 3;
     default:
         return 1;
@@ -179,10 +191,58 @@ static int aPG_client_mail_step(GAME_PLAY *play) {
 }
 #endif
 
+#ifdef TARGET_PC
+/* Guest mailbox: "Check my mail." was chosen (a READY guest client whose post office mailbox the host fed). Letters waiting: the window closes and the vanilla mailbox
+ * overlay opens on the guest's copy (pc_ui_mailbox(); taking a letter is the host transaction MAIL_TAKE), then a closing row. Nothing waiting: the closing "no mail" row. */
+static void aPG_pc_check_mail(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) {
+    const int n = pc_net_game_guest_mail_count();
+    mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+    printf("[NET][GUEST][MAIL] post office: the guest asked for its mail (%d letter(s) waiting)\n", n);
+    if (n > 0 && pc_net_game_guest_mail_offer_available()) {
+        postgirl->setup_action(postgirl, play, aPG_ACTION_PC_MAIL_WIN_CLOSE_WAIT);
+    } else {
+        mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), pc_nook_msg_id(PC_NOOK_MSG_POST_NOMAIL));
+        postgirl->setup_action(postgirl, play, aPG_ACTION_NONE);
+    }
+}
+
+void aPG_pc_mail_menu_close_wait(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) {
+    if (play->submenu.open_flag == FALSE) {
+        mMsg_Window_c *msg_p = mMsg_Get_base_window_p();
+        printf("[NET][GUEST][MAIL] post office: the guest's mailbox overlay closed (%d letter(s) left)\n", pc_net_game_guest_mail_count());
+        mMsg_ChangeMsgData(msg_p, pc_nook_msg_id(PC_NOOK_MSG_POST_DONE));
+        mMsg_Set_ForceNext(msg_p);
+        postgirl->next_action = aPG_ACTION_NONE;
+        postgirl->setup_action(postgirl, play, aPG_ACTION_MSG_WIN_OPEN_WAIT);
+    }
+}
+
+void aPG_pc_mail_menu_close_wait_init(ACTOR *actorx, GAME *game) {
+    GAME_PLAY *play = (GAME_PLAY *)game;
+    (void)actorx;
+    mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_MAILBOX, 0x0); /* the vanilla mailbox overlay; pc_ui_mailbox() is the guest copy */
+}
+#endif
+
 void aPG_ask_for_business(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) {
     if (mDemo_Get_OrderValue(mDemo_ORDER_NPC0, 0x9) != 0 && mMsg_Check_MainNormalContinue(mMsg_Get_base_window_p()) == TRUE) {
         int choice = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
         int action = -1;
+#ifdef TARGET_PC
+        {
+            /* guest mailbox: the row on screen got "Check my mail." before its last choice (pc_nook_msg_patch); the vanilla mapping below sees the original indices */
+            const int mc = pc_post_mail_more_choice(mMsg_Get_msg_num(mMsg_Get_base_window_p()));
+            if (mc >= 0) {
+                if (choice == mc) {
+                    aPG_pc_check_mail(postgirl, play);
+                    return;
+                }
+                if (choice > mc) {
+                    choice--;
+                }
+            }
+        }
+#endif
         switch (postgirl->status) {
         case aPG_STATUS_NONE:
         case aPG_STATUS_DESK_FULL:
@@ -390,7 +450,8 @@ void aPG_receive_menu_close_wait(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) 
             switch (dest) {
             case 0:
 #ifdef TARGET_PC
-                if (!client_mail) /* a client's letter was already handed to the host's post office (APPLIED removed it from the slot) */
+                if (!client_mail && !pc_net_game_host_guest_letter_post(&play->submenu.mail)) /* a client's letter was already handed to the host (APPLIED removed it
+                                                                                              * from the slot); the host player's letter to a GUEST went into its mailbox */
 #endif
                 mPO_receipt_proc(&play->submenu.mail, mPO_SENDTYPE_MAIL);
                 postgirl->next_action = aPG_ACTION_RECEIVE_AFTER_MSG_END_WAIT;
@@ -540,6 +601,10 @@ void aPG_repay_after_init(ACTOR *actorx, GAME *game) {
     NPC_POSTGIRL_ACTOR *postgirl = (NPC_POSTGIRL_ACTOR *)actorx;
     static int msg_no[8] = {0x31d7, 0x31d5, 0x8db, 0x8d9, 0x8df, 0x8dd, 0x8db, 0x8d9};
     aPG_set_post_status(postgirl);
+#ifdef TARGET_PC
+    /* guest mailbox: the "anything else?" row leads back to aPG_ask_for_business: it gets "Check my mail." as well */
+    pc_post_mail_msg_arm(pc_net_game_guest_mail_offer_available() ? msg_no[postgirl->status] + postgirl->npc_class.draw.draw_type : -1);
+#endif
     aPG_Set_continue_msg_num(postgirl, msg_no[postgirl->status]);
 }
 
@@ -589,7 +654,7 @@ void aPG_loop_check_init(ACTOR *actorx, GAME *game) {
 }
 
 void aPG_init_proc(ACTOR *actorx, GAME *game, int proc_idx) {
-    static aPG_INIT_PROC init_proc[30] = {
+    static aPG_INIT_PROC init_proc[aPG_ACTION_NUM] = {
 		aPG_ask_for_business_init,
 		(aPG_INIT_PROC)none_proc1,
 		aPG_msg_win_open_wait_init,
@@ -619,13 +684,17 @@ void aPG_init_proc(ACTOR *actorx, GAME *game, int proc_idx) {
 		aPG_deposit_menu_close_wait_init,
 		aPG_deposit_after_recover_init,
 		aPG_repay_after_init,
-		aPG_loop_check_init
-    }; 
+		aPG_loop_check_init,
+#ifdef TARGET_PC
+		aPG_msg_win_close_wait_init,      /* aPG_ACTION_PC_MAIL_WIN_CLOSE_WAIT */
+		aPG_pc_mail_menu_close_wait_init, /* aPG_ACTION_PC_MAIL_MENU_CLOSE_WAIT */
+#endif
+    };
     init_proc[proc_idx](actorx, game);
 }
 
 void aPG_setupAction(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play, int action) {
-    static aPG_PROC process[30] = {
+    static aPG_PROC process[aPG_ACTION_NUM] = {
 		aPG_ask_for_business,
 		(aPG_PROC)none_proc1,
 		aPG_msg_win_open_wait,
@@ -656,6 +725,10 @@ void aPG_setupAction(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play, int action) 
 		aPG_msg_win_open_wait,
 		aPG_deposit_after,
 		aPG_loop_check,
+#ifdef TARGET_PC
+		aPG_msg_win_close_wait,      /* aPG_ACTION_PC_MAIL_WIN_CLOSE_WAIT: closed -> action + 1 */
+		aPG_pc_mail_menu_close_wait, /* aPG_ACTION_PC_MAIL_MENU_CLOSE_WAIT */
+#endif
     };
     postgirl->action = action;
     postgirl->process = process[action];
@@ -672,6 +745,10 @@ void aPG_set_talk_info(ACTOR *actorx) {
         aPG_set_post_status(postgirl);
         msg = msg_no[postgirl->status] + postgirl->npc_class.draw.draw_type;
     }
+#ifdef TARGET_PC
+    /* guest mailbox: a READY guest client whose post office mailbox the host fed gets "Check my mail." on the greeting row (residents / host / solo: untouched) */
+    pc_post_mail_msg_arm(pc_net_game_guest_mail_offer_available() ? msg : -1);
+#endif
     mDemo_Set_msg_num(msg);
 }
 
@@ -692,6 +769,9 @@ int aPG_talk_end_chk(ACTOR *actorx, GAME *game) {
     postgirl->process(postgirl, (GAME_PLAY *)game);
     if (mDemo_Get_talk_actor() != actorx) {
         res = TRUE;
+#ifdef TARGET_PC
+        pc_post_mail_msg_arm(-1); /* guest mailbox: the conversation is over: no later load of these rows is patched */
+#endif
     }
     return res;
 }

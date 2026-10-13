@@ -51,7 +51,11 @@ struct address_ovl_s {
     f32 speed_x;
     f32 pile[mAD_PAGE_NUM];
     f32 goal_pile[mAD_PAGE_NUM];
+#ifdef TARGET_PC
+    Mail_nm_c player_mail_name[mAD_PAGE_MAX_ENTRIES]; // the other residents, then the GUESTS of the town (guest mailbox), the museum name last; one page
+#else
     Mail_nm_c player_mail_name[PLAYER_NUM + 1]; // last entry is the museum name
+#endif
     Mail_nm_c animal_mail_name[ANIMAL_NUM_MAX];
     Gfx* display_list; // set to the beginning of the address display list data for drawing over editor etc
 };

@@ -30,6 +30,7 @@
 #include "m_all_grow_ovl.h"
 #include "m_home.h"
 #include "m_house.h"
+#include "m_post_office.h" /* guest mailbox: mPO_receipt_proc for the promotion's overflow letters */
 #include "m_play.h"
 #include "lb_rtc.h"
 #include "game.h"
@@ -1688,9 +1689,27 @@ static struct {
     Animal_c animals[ANIMAL_NUM_MAX]; /* M-I: villager memories re-keyed to the new PID (rolled back when the save fails) */
     Animal_c island_animal;
     mFR_record_c fish[mFR_RECORD_NUM]; /* lifecycle hardening: fish records re-keyed defensively (rolled back with the rest) */
+    PostOffice_c post_office;          /* guest mailbox: letters that did not fit the new house mailbox go to the post office (rolled back with the rest);
+                                        * the house mailbox itself is part of `home` */
 } s_pc_promote_snap;
 
 void pc_mp_promote_rollback(void);
+
+/* Guest mailbox: the letters of the guest's HOST-HELD mailbox (pc_net_game.c s_guest_mbox, native Mail_c), handed over by the caller right before pc_mp_promote_create
+ * (one-shot like the paid flag: consumed at its entry). They are COPIED (the guest table keeps its copy until the guest entry is retired after the durable save, so a
+ * rollback / a retry starts from the same state: idempotent, nothing lost, nothing duplicated). */
+static Mail_c s_pc_promote_gmbox[HOME_MAILBOX_SIZE];
+static int s_pc_promote_gmbox_n = 0;
+void pc_mp_promote_set_guest_mailbox(const void* box, int n) {
+    const Mail_c* b = (const Mail_c*)box;
+    int i;
+    s_pc_promote_gmbox_n = 0;
+    for (i = 0; b != NULL && i < n && i < HOME_MAILBOX_SIZE; i++) {
+        if (mMl_check_not_used_mail((Mail_c*)&b[i]) != TRUE) {
+            s_pc_promote_gmbox[s_pc_promote_gmbox_n++] = b[i];
+        }
+    }
+}
 
 /* Guest-first paid house purchase: the NEXT pc_mp_promote_create starts the new resident with loan 0 (the guest paid the whole house price up front; the caller already
  * debited the guest record's wallet, which is copied as-is). One-shot: consumed (and cleared) at the entry of pc_mp_promote_create, so a refused promote never leaks it. */
@@ -1811,9 +1830,50 @@ int pc_mp_promote_migrate(PersonalID_c* gkey, const Private_c* g, Private_c* pri
     return mem + contest + fish + letters + equip + quests;
 }
 
+/* Guest mailbox: the guest's host-held mailbox letters move to the NEW resident (inside pc_mp_promote_create, after the house is assigned and the PID is final, before the
+ * durable save; covered by the rollback: the house (its mailbox) and the post office are in the snapshot). Per letter: recipient / sender PID == the guest key -> the new PID
+ * (pc_pid_rekey), a gift that is not pocket-legal is cleared (the MAIL_TAKE rule), then the FIRST place with room: the house mailbox, else the post office (valid now:
+ * the recipient owns a house; delivered by the postman), else a free slot of the new resident's carried letters. -1 = a letter fits nowhere (the caller rolls back:
+ * no letter is ever dropped), else the count moved. */
+static int pc_mp_promote_migrate_mailbox(PersonalID_c* gkey, Private_c* priv, mHm_hs_c* home, const Mail_c* box, int n, int* to_house, int* to_po, int* to_mail) {
+    int i;
+    *to_house = *to_po = *to_mail = 0;
+    for (i = 0; i < n; i++) {
+        Mail_c L = box[i];
+        int k;
+        (void)pc_pid_rekey(&L.header.recipient.personalID, gkey, &priv->player_ID);
+        (void)pc_pid_rekey(&L.header.sender.personalID, gkey, &priv->player_ID);
+        if (L.present != (mActor_name_t)EMPTY_NO && L.present != (mActor_name_t)RSV_NO && !pc_net_game_pocket_legal_item(L.present)) {
+            L.present = (mActor_name_t)EMPTY_NO;
+        }
+        k = mMl_chk_mail_free_space(home->mailbox, HOME_MAILBOX_SIZE);
+        if (k >= 0) {
+            home->mailbox[k] = L;
+            (*to_house)++;
+            continue;
+        }
+        if (L.header.recipient.type == (u8)mMl_NAME_TYPE_PLAYER && mPr_CheckCmpPersonalID(&L.header.recipient.personalID, &priv->player_ID) == TRUE) {
+            Mail_c W = L; /* mPO_receipt_proc may consume its argument */
+            if (mPO_receipt_proc(&W, mPO_SENDTYPE_MAIL) == TRUE) {
+                (*to_po)++;
+                continue;
+            }
+        }
+        k = mMl_chk_mail_free_space(priv->mail, mPr_INVENTORY_MAIL_COUNT);
+        if (k >= 0) {
+            priv->mail[k] = L;
+            (*to_mail)++;
+            continue;
+        }
+        return -1;
+    }
+    return *to_house + *to_po + *to_mail;
+}
+
 int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot, int house, char* err, size_t cap) {
     const Private_c* g = (const Private_c*)guest_rec;
     const int paid = s_pc_promote_paid;
+    const int gmbox_n = s_pc_promote_gmbox_n; /* guest mailbox: the letters handed over by pc_mp_promote_set_guest_mailbox (one-shot) */
     PersonalID_c* gkey = (PersonalID_c*)guest_key; /* the guest's home PersonalID = bound_pid = memory_player_id of its villager memories */
     int remapped = 0;
     Private_c* priv;
@@ -1821,6 +1881,7 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     int i, face_ok = 1;
 
     s_pc_promote_paid = 0; /* consumed above into `paid` */
+    s_pc_promote_gmbox_n = 0;
     if (err != NULL && cap > 0) {
         err[0] = '\0';
     }
@@ -1864,6 +1925,7 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     memcpy(s_pc_promote_snap.animals, Save_Get(animals), sizeof(s_pc_promote_snap.animals));
     s_pc_promote_snap.island_animal = Save_Get(island).animal;
     memcpy(s_pc_promote_snap.fish, Save_Get(fishRecord), sizeof(s_pc_promote_snap.fish));
+    s_pc_promote_snap.post_office = Save_Get(post_office);
 
     mPr_ClearPrivateInfo(priv);
     mPr_InitPrivateInfo(priv);
@@ -1926,6 +1988,16 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     /* Lifecycle hardening: everything keyed to the guest PID (villager memories, contest quests, fish records) is re-keyed and the guest record's carried-over state is
      * migrated (pc_mp_promote_migrate; ATOMIC with the promotion: inside this call, before the durable save, covered by pc_mp_promote_rollback). */
     remapped = pc_mp_promote_migrate(gkey, g, priv);
+    if (gmbox_n > 0) {
+        int th, tp, tm;
+        const int moved = pc_mp_promote_migrate_mailbox(gkey, priv, home, s_pc_promote_gmbox, gmbox_n, &th, &tp, &tm);
+        if (moved < 0) {
+            pc_mp_promote_rollback();
+            PC_PROMOTE_FAIL("the guest's %d mailbox letter(s) do not fit the house mailbox, the post office or the carried letters (everything was rolled back; nothing was lost)", gmbox_n);
+        }
+        printf("[PC] migrate: guest mailbox letters=%d -> house mailbox %d, post office %d, carried letters %d\n", moved, th, tp, tm);
+        remapped += moved;
+    }
     printf("[PC] M-F promote: resident slot %d created for '%.8s' (gender %d, face %d%s, player id 0x%04X), house %d assigned (arrangement 0x%02X), loan %u, pockets/wallet/bank carried over, %d PID-keyed / carried items migrated (see the [PC] migrate line)\n",
            slot, (const char*)priv->player_ID.player_name, (int)priv->gender, (int)priv->face, face_ok ? "" : " (the guest's face is worn by another resident: vanilla unique face kept)",
            (unsigned)priv->player_ID.player_id, house, (unsigned)Save_Get(house_arrangement), (unsigned)priv->inventory.loan, remapped);
@@ -1946,6 +2018,7 @@ void pc_mp_promote_rollback(void) {
     memcpy(Save_Get(animals), s_pc_promote_snap.animals, sizeof(s_pc_promote_snap.animals));
     Save_Get(island).animal = s_pc_promote_snap.island_animal;
     memcpy(Save_Get(fishRecord), s_pc_promote_snap.fish, sizeof(s_pc_promote_snap.fish));
+    Save_Get(post_office) = s_pc_promote_snap.post_office; /* guest mailbox: overflow letters handed to the post office */
     memset(&s_pc_promote_snap, 0, sizeof(s_pc_promote_snap));
     printf("[PC] M-F promote: the in-memory change was ROLLED BACK\n");
 }

@@ -71,7 +71,13 @@ enum ac_npc_action {
     aPG_ACTION_DEPOSIT_MENU_CLOSE_WAIT,
     aPG_ACTION_27,
     aPG_ACTION_DEPOSIT_AFTER,
-    aPG_ACTION_29
+    aPG_ACTION_29,
+#ifdef TARGET_PC
+    /* guest mailbox ("Check my mail." for a guest network client): close the window, open the mailbox overlay on the guest's post office mailbox, then the closing row */
+    aPG_ACTION_PC_MAIL_WIN_CLOSE_WAIT,
+    aPG_ACTION_PC_MAIL_MENU_CLOSE_WAIT,
+#endif
+    aPG_ACTION_NUM
 };
 
 #ifdef __cplusplus

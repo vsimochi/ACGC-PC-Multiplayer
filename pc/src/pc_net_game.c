@@ -151,6 +151,9 @@ static uint32_t s_ac_result_entity; /* TEST-ONLY auto-catch: the last catch outc
 static int      s_ac_result;        /* 1 accepted, 2 rejected */
 #endif
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the dialogue-side helpers defined near the house purchase seam */
+#include "pc_guest_mail.h" /* guest mailbox: the overlay / post office girl seams (pc_ui_mailbox, pc_net_game_guest_mail_offer_available ...) */
+#include "pc_guest_event_due.h" /* guest mailbox: the vanilla mail-event date rule (birthday / Christmas letters for guests) */
+#include "m_museum.h"          /* guest mailbox: mMsm_MuseumComplete / mMsm_GuestCompMailForSink (the museum completion letter for guests) */
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the announced 5-minute closure (SHOP UPGRADE block at the end of this file) */
 #include "pc_host_observer.h" /* --host-observer: the hidden, avatar-less host (pc_host_observer_active()) is excluded from every presence message */
 #include "pc_adopt_clock.h" /* client record-adoption watchdog clock (scene lifecycle time does not count towards the 10 s) */
@@ -2626,6 +2629,9 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
  * (PUT: the pocket item; TAKE: the item expected in the pool slot), tag.dest NONE (PUT) / POCKET (TAKE). DRESSER_DISABLED (37): the host has the feature off / its sidecar is unusable. */
 #define PC_NETGAME_TXN_KIND_DRESSER 18u
 #define PC_NETGAME_TXN_REASON_DRESSER_DISABLED 37u
+/* Guest mailbox: MAIL_SEND (12) is open to GUESTS (the letter is read from the guest mirror record; no sender house) within a host-local daily limit, MAIL_TAKE (13) takes a letter
+ * of the guest's host-held mailbox (MAILBOX_LETTER house 0xFF), see "GUEST MAIL HOST". MAIL_LIMIT (38): a guest's letter beyond today's limit (nothing changes, the letter stays). */
+#define PC_NETGAME_TXN_REASON_MAIL_LIMIT 38u
 #define PC_NETGAME_RESTOCK_PRICE         500u
 #define PC_NETGAME_RESTOCK_WAIT_MS       60000u
 #define PC_NETGAME_HOUSE_AUTO                 0xFFu
@@ -2692,13 +2698,19 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_TS_UPGRADE  6u   /* multiplayer shop upgrade (pc_shop_upgrade.h): the host's upgrade state machine, NOT a save region. 16 bytes: u8 state (0 IDLE, 1 PENDING, 2 CLOSED,
                                      * 3 RENEWING), u8 from_level, u8 target_level, u8 flags (bit 0 = the feature is on), u32 generation (LE), u16 minutes of the closure left (rounded up),
                                      * u16 closure length in seconds, 4 reserved zero bytes. An old client ignores the unknown service. */
-#define PC_NETGAME_TS_NUM      7u   /* array bound: services 1..6 named (index 0 unused), 7+ reserved */
+#define PC_NETGAME_TS_GUESTDIR 7u   /* guest mailbox: the GUEST DIRECTORY (who in this town is a guest a player may write to; NOT a save region). 324 bytes: u8 count (0..16),
+                                     * 3 reserved zero bytes, then 16 x PersonalID_c (20 raw bytes each: the guest KEY = name, land name, player_id, land_id; little-endian PC image,
+                                     * host == client build), the first `count` used (newest guest first), the rest zero. Only guests with a confirmed entry and record in the
+                                     * host's CURRENT town; not built at all with AC_MP_GUEST_MAIL=0. An old client ignores the unknown service. */
+#define PC_NETGAME_TS_NUM      8u   /* array bound: services 1..7 named (index 0 unused), 8+ reserved */
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
 #define PC_NETGAME_TS_MUSEUM_LEN 63u
 #define PC_NETGAME_TS_SHOP_LEN   320u
 #define PC_NETGAME_TS_HOSTCFG_LEN 8u
 #define PC_NETGAME_TS_UPGRADE_LEN 16u
+#define PC_NETGAME_GUESTDIR_MAX   16u
+#define PC_NETGAME_TS_GUESTDIR_LEN (4u + PC_NETGAME_GUESTDIR_MAX * 20u) /* 324 */
 #define PC_NETGAME_TS_EVENT_LEN 214u /* 84 (mEv_special_c) + 100 (mEv_weekly_u) + 30 (decision fields of event_save_common + event_year) */
 typedef struct PCNetGameTownSvcStateMsg {
     uint8_t  msg_type;   /* PC_NETGAME_MSG_TOWN_SVC_STATE */
@@ -2720,6 +2732,8 @@ _Static_assert(PC_NETGAME_TS_POLICE_LEN == sizeof(PoliceBox_c) && PC_NETGAME_TS_
                "a town-service blob does not fit PCNetGameTownSvcStateMsg (the 320-byte shop blob is checked here too)");
 _Static_assert(PC_NETGAME_TS_SHOP_LEN == sizeof(Shop_c), "PC_NETGAME_TS_SHOP_LEN is no longer sizeof(Shop_c): the shop mirror wire image changed");
 _Static_assert(PC_NETGAME_TS_HOSTCFG_LEN <= PC_NETGAME_TS_BLOB_MAX, "the HOST_CONFIG blob does not fit PCNetGameTownSvcStateMsg");
+_Static_assert(PC_NETGAME_TS_GUESTDIR_LEN == 324u && PC_NETGAME_TS_GUESTDIR_LEN <= PC_NETGAME_TS_BLOB_MAX && sizeof(PersonalID_c) == 20u,
+               "the GUEST_DIRECTORY blob (4 + 16 x 20) does not fit PCNetGameTownSvcStateMsg / PersonalID_c is no longer 20 bytes");
 _Static_assert(sizeof(mEv_special_c) == 84u && sizeof(mEv_weekly_u) == 100u && PC_NETGAME_TS_EVENT_LEN == 84u + 100u + 30u &&
                    PC_NETGAME_TS_EVENT_LEN <= PC_NETGAME_TS_BLOB_MAX,
                "the EVENT_STATE blob layout (84 + 100 + 30) no longer matches mEv_special_c / mEv_weekly_u or does not fit PCNetGameTownSvcStateMsg");
@@ -3554,6 +3568,7 @@ static uint8_t                   s_mbox_stash_valid[PC_NETGAME_MBOX_SLOTS];
 static uint32_t                  s_mbox_cl_next_check_ms;
 static int  pcnetgame_take_try_send_check(uint8_t mbox_idx, uint32_t want24, uint8_t* dst_out);
 static void pcnetgame_take_op_resolve(uint32_t request_id, int applied);
+static Mail_c* pcnetgame_mbox_local_target(void); /* guest mailbox: the local mailbox the shadow mirrors into (MAIL2 CLIENT block) */
 static uint8_t                  s_ts_last_reason; /* the PC_NETGAME_TXN_REASON_* of the last REJECTED town-service result (0 = none / a local refusal) */
 static uint32_t                 s_ts_next_rid = 0x70000000u; /* request ids only label this client's own operations (no host reservation exists) */
 /* Batch A (A1): the wildlife mode of THIS process when it is a CLIENT: -1 = the host's HOST_CONFIG has not arrived yet (local wildlife spawning is
@@ -3993,6 +4008,19 @@ typedef struct PCNetGameGuestPers {
 PC_GROW_TABLE(PCNetGameGuest, s_guest, 0, PCNG_GUEST_INLINE)
 PC_GROW_TABLE(Private_c, s_guest_rec, 0, PCNG_GUEST_INLINE)
 PC_GROW_TABLE(PCNetGameGuestPers, s_guest_pers, 0, PCNG_GUEST_INLINE)
+/* GUEST MAILBOX (see "GUEST MAIL HOST"): per guest slot, the host-held 10-letter mailbox (host-native Mail_c, persisted as the v4 extension block of the guest's
+ * .gst file together with its carried letters) and the HOST-LOCAL counters (memory only): today's letters sent to residents (the daily limit) and the day of the last
+ * villager-reply pass. Valid only while s_guest[g].used; (re)initialised whenever a slot gets a guest (install / create). Grows with the other guest tables. */
+typedef struct PCNetGameGuestMbox {
+    Mail_c   box[PC_NETGAME_MBOX_SLOTS];
+    uint32_t seq[PC_NETGAME_MBOX_SLOTS];    /* MAILBOX_LETTER seq per slot: strictly increasing for the life of the host process (never reset, also across a slot reuse) */
+    uint32_t digest[PC_NETGAME_MBOX_SLOTS]; /* FNV of the canonical BE bytes at the last refresh */
+    uint8_t  valid;                         /* the seq / digest cache was built */
+    uint32_t send_day;                      /* (year << 16 | month << 8 | day) of send_count */
+    uint16_t send_count;
+    uint32_t reply_day;                     /* the day of the last villager-reply pass of this guest */
+} PCNetGameGuestMbox;
+PC_GROW_TABLE(PCNetGameGuestMbox, s_guest_mbox, 0, PCNG_GUEST_INLINE)
 static char              s_guest_dir[320];        /* the guest store directory (<guests.dat path without .dat>) */
 static uint32_t          s_guest_store_gen = 0;   /* store-wide count of durable writes (log only) */
 static int               s_guest_store_loaded = 0;
@@ -16143,6 +16171,47 @@ typedef struct PCNetGameGuestLoadCtx {
     int next;
 } PCNetGameGuestLoadCtx;
 
+static int pcnetgame_popcount16(uint16_t v) {
+    int n = 0;
+    for (; v != 0; v = (uint16_t)(v & (v - 1u))) {
+        n++;
+    }
+    return n;
+}
+/* GUEST MAILBOX: the host-local state of guest slot `g` for a NEW occupant (empty mailbox, no counters). The seq numbers are kept (strictly increasing for the process). */
+static void pcnetgame_guest_mbox_reset(int g) {
+    int i;
+    PCNetGameGuestMbox* M = &s_guest_mbox[g];
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        mMl_clear_mail(&M->box[i]);
+    }
+    M->valid = 0;
+    M->send_day = 0;
+    M->send_count = 0;
+    M->reply_day = 0;
+}
+/* The mailbox <-> the v4 extension block of the guest's file (canonical BE letters; an unused slot is all zero in the file). */
+static void pcnetgame_guest_mbox_from_record(int g, const PCMpGsRecord* rec) {
+    int i;
+    pcnetgame_guest_mbox_reset(g);
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        if ((rec->mbox_mask >> i) & 1u) {
+            pcnetgame_mail_from_be(rec->mbox[i], &s_guest_mbox[g].box[i]);
+        }
+    }
+}
+static void pcnetgame_guest_mbox_to_record(int g, PCMpGsRecord* rec) {
+    int i;
+    rec->mbox_mask = 0;
+    memset(rec->mbox, 0, sizeof(rec->mbox));
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        if (mMl_check_not_used_mail(&s_guest_mbox[g].box[i]) != TRUE) {
+            pcnetgame_mail_to_be(&s_guest_mbox[g].box[i], rec->mbox[i]);
+            rec->mbox_mask |= (uint16_t)(1u << i);
+        }
+    }
+}
+
 static int pcnetgame_guest_load_visit(void* ctx, const PCMpGsRecord* rec, int from_backup) {
     PCNetGameGuestLoadCtx* lc = (PCNetGameGuestLoadCtx*)ctx;
     int g = lc->next;
@@ -16151,11 +16220,15 @@ static int pcnetgame_guest_load_visit(void* ctx, const PCMpGsRecord* rec, int fr
     }
     lc->next++;
     pcnetgame_guest_install(g, &rec->e);
+    pcnetgame_guest_mbox_from_record(g, rec); /* guest mailbox: a v3 file is an empty mailbox */
     memset(&s_guest_pers[g], 0, sizeof(s_guest_pers[g]));
     s_guest_pers[g].has_file = 1;
     memcpy(s_guest_pers[g].id, rec->id, PC_MP_GS_ID_SIZE);
     s_guest_pers[g].gen = rec->generation;
-    s_guest_pers[g].digest = from_backup > 0 ? 0u : pc_mp_gs_entry_digest(&rec->e); /* recovered from a backup: rewrite the primary at the next write */
+    s_guest_pers[g].digest = from_backup > 0 ? 0u : pc_mp_gs_ext_digest(rec, pc_mp_gs_entry_digest(&rec->e)); /* recovered from a backup: rewrite the primary at the next write */
+    if (rec->mbox_mask != 0) {
+        printf("[NET][GUEST][MAIL] store: guest slot %d holds %d letter(s) in its mailbox (file v4)\n", g, pcnetgame_popcount16(rec->mbox_mask));
+    }
     return 1;
 }
 
@@ -16236,6 +16309,8 @@ static int pcnetgame_guest_store_write(const char* why) {
             count++;
             pcnetgame_guest_entry_build(g, &rec.e);
             dg = pc_mp_gs_entry_digest(&rec.e);
+            pcnetgame_guest_mbox_to_record(g, &rec); /* guest mailbox: written in the SAME file as the carried letters (v4 only while it holds a letter) */
+            dg = pc_mp_gs_ext_digest(&rec, dg);
             if (ps->has_file && ps->digest == dg) {
                 s_rec_slot[PLAYER_NUM + g].dirty_unsaved = 0; /* the durable file already says exactly this */
             } else {
@@ -16397,6 +16472,7 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
     Private_c old_rec;
     PCNetGameRecSlot old_rs;
     PCNetGameGuestPers old_pers;
+    static PCNetGameGuestMbox old_mbox; /* guest mailbox (6 KB: static, main thread only) */
     int evicted = 0;
     for (g = 0; g < s_guest_cap; g++) {
         if (!s_guest[g].used) {
@@ -16434,6 +16510,8 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
     old_rec = s_guest_rec[g];
     old_rs = s_rec_slot[PLAYER_NUM + g];
     old_pers = s_guest_pers[g];
+    old_mbox = s_guest_mbox[g];
+    pcnetgame_guest_mbox_reset(g); /* guest mailbox: a new guest starts with an empty mailbox (a reused slot never shows the previous guest's letters) */
     if (s_guest_pers[g].has_file) {
         /* the slot is reused (eviction / a removal whose file move failed): that guest's file must go aside once THIS guest is durable, and this guest gets a file of its own */
         if (s_guest_pers[g].retire_pending && !pc_mp_gs_retire(s_guest_dir, s_guest_pers[g].retire_id, NULL, 0)) {
@@ -16484,6 +16562,7 @@ static int pcnetgame_guest_create(const PersonalID_c* key, int* out_g, uint8_t* 
             memset(rs, 0, sizeof(*rs));
         }
         s_guest_pers[g] = old_pers;
+        s_guest_mbox[g] = old_mbox;
         return -3;
     }
     *out_g = g;
@@ -17249,11 +17328,13 @@ static void pcnetgame_txn_journal_clear(int idx) {
 static PCGrowTable s_guest_tables[] = {
     PC_GROW_TABLE_ENTRY(s_rec_slot, PLAYER_NUM), PC_GROW_TABLE_ENTRY(s_rec_backup, PLAYER_NUM), PC_GROW_TABLE_ENTRY(s_txn_res, PLAYER_NUM),
     PC_GROW_TABLE_ENTRY(s_guest, 0), PC_GROW_TABLE_ENTRY(s_guest_rec, 0), PC_GROW_TABLE_ENTRY(s_guest_pers, 0),
+    PC_GROW_TABLE_ENTRY(s_guest_mbox, 0), /* guest mailbox */
 };
 #define PCNG_GUEST_TABLE_COUNT ((int)(sizeof(s_guest_tables) / sizeof(s_guest_tables[0])))
 
 static size_t pcnetgame_guest_slot_bytes(void) {
-    return sizeof(PCNetGameGuest) + sizeof(Private_c) + sizeof(PCNetGameGuestPers) + sizeof(PCNetGameRecSlot) + PC_NETGAME_REC_SIZE + sizeof(PCNetGameTxnResident);
+    return sizeof(PCNetGameGuest) + sizeof(Private_c) + sizeof(PCNetGameGuestPers) + sizeof(PCNetGameRecSlot) + PC_NETGAME_REC_SIZE + sizeof(PCNetGameTxnResident) +
+           sizeof(PCNetGameGuestMbox);
 }
 
 static int pcnetgame_guest_budget_slots(void) {
@@ -17382,6 +17463,7 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_WORK_NO_JOB: return "WORK_NO_JOB";
         case PC_NETGAME_TXN_REASON_WORK_STALE_JOB: return "WORK_STALE_JOB";
         case PC_NETGAME_TXN_REASON_WORK_WALLET_FULL: return "WORK_WALLET_FULL";
+        case PC_NETGAME_TXN_REASON_MAIL_LIMIT: return "MAIL_LIMIT";
         default: return "?";
     }
 }
@@ -19271,6 +19353,62 @@ typedef struct PCNetGameTsHost {
 } PCNetGameTsHost;
 static PCNetGameTsHost s_ts_host[PC_NETGAME_TS_NUM];
 static uint32_t        s_ts_next_check_ms = 0;
+
+/* ---- GUEST_DIR (service 7, guest mailbox): who in this town is a GUEST a player may write to. HOST: built from the guest table; CLIENT: the last applied blob. ---- */
+static int pcnetgame_guest_mail_enabled(void); /* GUEST MAIL HOST block */
+/* 1 = guest slot g receives town letters (players' letters, villager event letters, the museum's): a used entry of the host's CURRENT town that is NOT disposable --
+ * confirmed (its client presented the stored token) or holding accepted data (record rev > 0: a first-session guest that has played; such an entry is never re-minted
+ * or evicted, see pcnetgame_guest_entry_disposable, so its mailbox cannot be thrown away under it) -- with its record. The same rule as the directory, so "listed" ==
+ * "deliverable". A bare claim that never synced a record (rev 0, unconfirmed) is neither listed nor deliverable. */
+static int pcnetgame_guest_mail_target(int g) {
+    return g >= 0 && g < s_guest_cap && s_guest[g].used && (s_guest[g].confirmed || s_rec_slot[PLAYER_NUM + g].rev > 0) &&
+           pcnetgame_town_equal(&s_guest[g].town, &s_host_town) &&
+           mPr_NullCheckPersonalID(&s_guest[g].key) == FALSE && pcnetgame_rec_priv_ptr(PLAYER_NUM + g) != NULL && mPr_CheckCmpPersonalID(&pcnetgame_rec_priv_ptr(PLAYER_NUM + g)->player_ID, &s_guest[g].key) == TRUE;
+}
+static void pcnetgame_ts_build_guestdir(uint8_t* blob) {
+    int g, n = 0;
+    uint8_t taken[256];
+    memset(blob, 0, PC_NETGAME_TS_GUESTDIR_LEN);
+    memset(taken, 0, sizeof(taken));
+    while (n < (int)PC_NETGAME_GUESTDIR_MAX) { /* newest first (larger `age` = minted later); bounded by the 16 entries of the blob */
+        int best = -1;
+        for (g = 0; g < s_guest_cap && g < 256; g++) {
+            if (!taken[g] && pcnetgame_guest_mail_target(g) && (best < 0 || s_guest[g].age > s_guest[best].age)) {
+                best = g;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        taken[best] = 1;
+        memcpy(blob + 4 + 20 * n, &s_guest[best].key, 20);
+        n++;
+    }
+    blob[0] = (uint8_t)n;
+}
+static uint8_t s_gdir_client_blob[PC_NETGAME_TS_GUESTDIR_LEN]; /* CLIENT: the last applied GUEST_DIR blob (valid while s_ts_client_have[7] in this session) */
+static int pcnetgame_ts_valid_guestdir_blob(const uint8_t* blob) {
+    unsigned i, k;
+    if (blob[0] > PC_NETGAME_GUESTDIR_MAX || blob[1] != 0 || blob[2] != 0 || blob[3] != 0) {
+        return 0;
+    }
+    for (i = 0; i < PC_NETGAME_GUESTDIR_MAX; i++) {
+        PersonalID_c pid;
+        memcpy(&pid, blob + 4 + 20 * i, 20);
+        if (i < blob[0]) {
+            if (mPr_NullCheckPersonalID(&pid) != FALSE || pid.player_name[0] == 0) {
+                return 0; /* a listed entry is a real key */
+            }
+        } else {
+            for (k = 0; k < 20; k++) {
+                if (blob[4 + 20 * i + k] != 0) {
+                    return 0; /* the unused entries are zero */
+                }
+            }
+        }
+    }
+    return 1;
+}
 #define PC_NETGAME_TS_CHECK_MS 500u
 
 static int pcnetgame_shop_classify(mActor_name_t item, mActor_name_t* rsv_out); /* defined with the SHOP host helpers below */
@@ -19513,7 +19651,8 @@ int pc_net_game_shop_restocking(void) {
 
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
-           : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : svc == (int)PC_NETGAME_TS_UPGRADE ? "SHOP_UPGRADE" : "?";
+           : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : svc == (int)PC_NETGAME_TS_UPGRADE ? "SHOP_UPGRADE"
+           : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -19564,6 +19703,14 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
     if (svc == (int)PC_NETGAME_TS_UPGRADE) {
         pcnetgame_ts_build_upgrade(blob); /* multiplayer shop upgrade: the host's state machine (a session state, not a save region) */
         *len = (uint16_t)PC_NETGAME_TS_UPGRADE_LEN;
+        return 1;
+    }
+    if (svc == (int)PC_NETGAME_TS_GUESTDIR) {
+        if (!pcnetgame_guest_mail_enabled()) {
+            return 0; /* AC_MP_GUEST_MAIL=0: the service does not exist (nothing is ever pushed, clients list no guest: the previous behaviour) */
+        }
+        pcnetgame_ts_build_guestdir(blob); /* guest mailbox: who may be written to (a session state, not a save region) */
+        *len = (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN;
         return 1;
     }
     return 0;
@@ -19624,6 +19771,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVENT);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_UPGRADE);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_GUESTDIR);
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -19651,7 +19799,7 @@ static void pcnetgame_host_ts_push_peer(PCNetPeerId peer) {
     if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
         return;
     }
-    for (svc = (int)PC_NETGAME_TS_POLICE; svc < (int)PC_NETGAME_TS_NUM; svc++) { /* 1..6 (6 = SHOP_UPGRADE) */
+    for (svc = (int)PC_NETGAME_TS_POLICE; svc < (int)PC_NETGAME_TS_NUM; svc++) { /* 1..7 (6 = SHOP_UPGRADE, 7 = GUEST_DIR) */
         PCNetGameHostPeerState* st = &s_host_peer[peer];
         if (s_ts_host[svc].valid && st->ts_sent_seq[svc] != s_ts_host[svc].seq) {
             if (pcnetgame_ts_send_to_peer(peer, svc)) {
@@ -22320,6 +22468,102 @@ static void pcnetgame_handle_host_house_purchase_txn(PCNetPeerId peer, const PCN
 }
 /* ===== HOUSE PURCHASE HOST END ===== */
 
+/* ===== GUEST MAIL HOST BEGIN: the guest mailbox ("Guest mailbox via the post office", docs/multiplayer-guest-roadmap.md) =====
+ * A GUEST (record slot PLAYER_NUM + g, no house) gets (1) letters TO RESIDENTS through MAIL_SEND (kind 12, the letter read from the guest MIRROR record, sender = the
+ * bound guest identity, bounded by a host-local daily limit), (2) a host-held 10-letter MAILBOX (s_guest_mbox[g].box, persisted in the guest's own .gst file as the v4
+ * extension block, written atomically with its carried letters), filled DIRECTLY by the host (the post office is not used: its load sweep deletes letters whose recipient
+ * owns no house and mPO_receipt_check_mail refuses them) -- today by the villager replies to the guest's letters (pcnetgame_host_guest_remail_tick) and the test hook --,
+ * (3) a copy of that mailbox on its client through MAILBOX_LETTER (56) with house = PC_NETGAME_MBOX_HOUSE_GUEST (0xFF; an older client refuses it: "not the house this
+ * player owns", nothing is written), (4) MAIL_TAKE (kind 13) of a mailbox letter into its mail[] (the same checks as a resident; the .gst file is written DURABLY before the
+ * APPLIED), and (5) at its promotion (house purchase / `promote`) the letters move into the new resident's house mailbox (pc_m_card.c pc_mp_promote_create).
+ * Switches (host environment, read once): AC_MP_GUEST_MAIL=0 turns all of it off (the previous refusals: NO_DONOR_SLOT, no mailbox, no replies); AC_MP_GUEST_MAIL_PER_DAY=<1..100>
+ * (default PC_NETGAME_GUEST_MAIL_PER_DAY) letters a guest may send to residents per host calendar day (MAIL_LIMIT 38 beyond it; memory only: a host restart resets it). */
+#define PC_NETGAME_MBOX_HOUSE_GUEST    0xFFu /* MAILBOX_LETTER.house: the guest's virtual (post office) mailbox, not a homes[] index */
+#define PC_NETGAME_GUEST_MAIL_PER_DAY  5
+static int pcnetgame_guest_mail_enabled(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("AC_MP_GUEST_MAIL");
+        s_on = !(e != NULL && (strcmp(e, "0") == 0 || strcmp(e, "off") == 0 || strcmp(e, "OFF") == 0 || strcmp(e, "false") == 0 || strcmp(e, "FALSE") == 0));
+        printf("[NET][GUEST][MAIL] guest mailbox is %s (AC_MP_GUEST_MAIL%s%s)\n", s_on ? "ON" : "OFF", e != NULL ? "=" : " unset", e != NULL ? e : "");
+    }
+    return s_on;
+}
+static int pcnetgame_guest_mail_per_day(void) {
+    static int s_n = 0;
+    if (s_n == 0) {
+        const char* e = getenv("AC_MP_GUEST_MAIL_PER_DAY");
+        const long v = e != NULL ? strtol(e, NULL, 10) : 0;
+        s_n = (v >= 1 && v <= 100) ? (int)v : PC_NETGAME_GUEST_MAIL_PER_DAY;
+    }
+    return s_n;
+}
+static uint32_t pcnetgame_host_today(void) {
+    return ((uint32_t)Common_Get(time.rtc_time).year << 16) | ((uint32_t)Common_Get(time.rtc_time).month << 8) | (uint32_t)Common_Get(time.rtc_time).day;
+}
+/* The guest table slot of a record index (idx >= PLAYER_NUM with a used entry), else -1. */
+static int pcnetgame_guest_of_idx(int idx) {
+    const int g = idx - PLAYER_NUM;
+    return (idx >= PLAYER_NUM && g < s_guest_cap && s_guest[g].used) ? g : -1;
+}
+/* Letters a guest may still send to residents today (host calendar day). */
+static int pcnetgame_guest_mail_left_today(int g) {
+    const uint32_t today = pcnetgame_host_today();
+    const int used = s_guest_mbox[g].send_day == today ? (int)s_guest_mbox[g].send_count : 0;
+    const int left = pcnetgame_guest_mail_per_day() - used;
+    return left > 0 ? left : 0;
+}
+static void pcnetgame_guest_mail_count_send(int g) {
+    const uint32_t today = pcnetgame_host_today();
+    if (s_guest_mbox[g].send_day != today) {
+        s_guest_mbox[g].send_day = today;
+        s_guest_mbox[g].send_count = 0;
+    }
+    s_guest_mbox[g].send_count++;
+}
+/* DELIVERY into a guest mailbox (host only, direct): the first free slot gets a copy of `L`. 1 = delivered (nothing is persisted here: the caller writes the store),
+ * 0 = the mailbox is full / the letter is not addressed to this guest (the caller keeps its own state, e.g. the villager memory's send_reply). */
+static int pcnetgame_guest_mbox_deliver(int g, const Mail_c* L, const char* why) {
+    int i;
+    if (g < 0 || g >= s_guest_cap || !s_guest[g].used || L == NULL || mMl_check_not_used_mail((Mail_c*)L) == TRUE ||
+        L->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER || mPr_CheckCmpPersonalID((PersonalID_c*)&L->header.recipient.personalID, &s_guest[g].key) != TRUE) {
+        return 0;
+    }
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        if (mMl_check_not_used_mail(&s_guest_mbox[g].box[i]) == TRUE) {
+            memcpy(&s_guest_mbox[g].box[i], L, sizeof(Mail_c));
+            printf("[NET][GUEST][MAIL] host: delivered a letter (%s) into guest slot %d mailbox[%d] hash=0x%08X present=0x%04X\n", why, g, i,
+                   (unsigned)pcnetgame_mail_be_hash(L), (unsigned)L->present);
+            return 1;
+        }
+    }
+    printf("[NET][GUEST][MAIL] host: guest slot %d mailbox is FULL: the letter (%s) is not delivered now\n", g, why);
+    return 0;
+}
+/* The first free slot of guest g's mailbox, or -1 (full). */
+static int pcnetgame_guest_mbox_free_slot(int g) {
+    int i;
+    for (i = 0; g >= 0 && g < s_guest_cap && i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        if (mMl_check_not_used_mail(&s_guest_mbox[g].box[i]) == TRUE) {
+            return i;
+        }
+    }
+    return -1;
+}
+/* PLAYER -> GUEST letters: the guest slot a player's letter is addressed to (the recipient PersonalID is a guest KEY of this town that receives town letters), else -1
+ * (also with AC_MP_GUEST_MAIL=0: the previous NO_SUCH_ADDRESS). A deleted / never-seen / unconfirmed / other-town key is -1. */
+static int pcnetgame_guest_mail_recipient(const Mail_c* L) {
+    int g;
+    if (!pcnetgame_guest_mail_enabled() || L == NULL || L->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER ||
+        mPr_NullCheckPersonalID((PersonalID_c*)&L->header.recipient.personalID) != FALSE) {
+        return -1;
+    }
+    g = pcnetgame_guest_find(&L->header.recipient.personalID);
+    return pcnetgame_guest_mail_target(g) ? g : -1;
+}
+static int pcnetgame_guest_mbox_refresh(int g); /* MAIL2 HOST block */
+/* ===== GUEST MAIL HOST (helpers) END: the push / take / replies follow the resident machinery in the MAIL2 HOST block ===== */
+
 /* ===== MAIL HOST BEGIN: mail milestone 1 -- a client's letter to a PLAYER (TXN_COMMIT kind 12 MAIL_SEND) =====
  * One synchronous handler, one commit point (same machinery as pcnetgame_handle_host_ts_txn): READY gate -> binding gate -> SYNCED / world ready ->
  * shape -> journal (fence / replay / CONFLICT) -> base -> pre-image validation -> READ-ONLY letter checks on the HOST's own mirror
@@ -22334,9 +22578,10 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     const PCNetGameTxnLog* old;
     const Mail_c* L;
     Mail_c W;
+    Private_c* mir;
     uint32_t hash, now, lh, want24, wh;
     uint16_t bad;
-    int idx, shape_ok, sh = -1, rh = -1, k, po_slot = -1, stale = 0;
+    int idx, shape_ok, sh = -1, rh = -1, k, po_slot = -1, stale = 0, gslot = -1, tg = -1, tg_slot = -1;
     const char* fail = NULL;
     uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
 
@@ -22366,10 +22611,16 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
         return;
     }
 
-    /* Guests (G1) have no house: a guest slot (idx >= PLAYER_NUM, outside Save_t) is refused HERE, before anything derives a private_data[] / homes[]
-     * index from it (the same reason code as a resident without a house; nothing is journaled, nothing is mutated). */
-    if (idx >= PLAYER_NUM) {
-        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "a guest / extra player has no house: sending mail is refused until guests get one");
+    /* Guest mailbox: a GUEST (idx >= PLAYER_NUM, outside Save_t) may write to RESIDENTS. Its letter is read from ITS mirror record (pcnetgame_rec_priv_ptr), never
+     * private_data[idx] / homes[]; it needs no house of its own. With the host switch AC_MP_GUEST_MAIL=0 the previous refusal stays (nothing journaled, nothing mutated). */
+    gslot = pcnetgame_guest_of_idx(idx);
+    if (idx >= PLAYER_NUM && (gslot < 0 || !pcnetgame_guest_mail_enabled())) {
+        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "guest mail is switched off on this host (AC_MP_GUEST_MAIL=0) / no guest entry");
+        return;
+    }
+    mir = pcnetgame_rec_priv_ptr(idx);
+    if (mir == NULL) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 0, NULL, "no mirror record for the bound slot");
         return;
     }
 
@@ -22439,19 +22690,19 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     }
 
     /* 7. READ-ONLY letter checks against the HOST's own copy: the mirror letter, the host's houses, mailboxes and post office. Nothing is mutated here. */
-    L = &Save_Get(private_data)[idx].mail[t->slot];
+    L = &mir->mail[t->slot];
     want24 = ((uint32_t)t->aux_cond << 16) | (uint32_t)t->aux_item;
-    {
+    if (gslot < 0) {
         int i;
         for (i = 0; i < mHS_HOUSE_NUM; i++) {
-            if (mPr_CheckCmpPersonalID(&Save_Get(homes[i]).ownerID, &Save_Get(private_data)[idx].player_ID) == TRUE) {
-                sh = i; /* the sender's own house: a resident without a house (guest / extra player) cannot post */
+            if (mPr_CheckCmpPersonalID(&Save_Get(homes[i]).ownerID, &mir->player_ID) == TRUE) {
+                sh = i; /* the sender's own house: a RESIDENT without a house (an extra player) cannot post */
                 break;
             }
         }
     }
-    if (sh < 0) {
-        fail = "the bound resident owns no house (guests / extra players are refused until they exist)";
+    if (gslot < 0 && sh < 0) {
+        fail = "the bound resident owns no house (extra players are refused until they exist)";
         fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
     } else if (mMl_check_not_used_mail((Mail_c*)L) == TRUE) {
         fail = "the mirror letter slot is empty (the host's mirror does not hold the letter)";
@@ -22478,8 +22729,23 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
         } else {
             rh = mMl_hunt_for_send_address((Mail_c*)L); /* the vanilla address lookup, against the HOST's houses */
             if (rh < 0) {
-                fail = "no house on the host belongs to the recipient";
+                tg = pcnetgame_guest_mail_recipient(L); /* guest mailbox: a letter TO A GUEST of this town goes into its host-held mailbox (no post office) */
+            }
+            if (rh < 0 && tg < 0) {
+                fail = "no house on the host belongs to the recipient (and it is not a guest of this town)";
                 fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS;
+            } else if (tg >= 0) {
+                tg_slot = pcnetgame_guest_mbox_free_slot(tg);
+                if (tg == gslot) {
+                    fail = "a guest's letter to itself";
+                    fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_SUCH_ADDRESS;
+                } else if (tg_slot < 0) {
+                    fail = "the recipient guest's mailbox has no free slot";
+                    fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_MAILBOX_FULL;
+                } else if (gslot >= 0 && pcnetgame_guest_mail_left_today(gslot) <= 0) {
+                    fail = "the guest already sent its letters for today (host daily limit AC_MP_GUEST_MAIL_PER_DAY)";
+                    fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_MAIL_LIMIT;
+                }
             } else if (mMl_chk_mail_free_space(Save_Get(homes[rh]).mailbox, HOME_MAILBOX_SIZE) < 0) {
                 fail = "the recipient's mailbox has no free slot";
                 fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_MAILBOX_FULL;
@@ -22487,6 +22753,9 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
                        mMl_chk_mail_free_space(Save_Get(post_office).mail, mPO_MAIL_STORAGE_SIZE) < 0) {
                 fail = "the post office cannot take another letter (desk full / quota for this house)";
                 fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PO_FULL;
+            } else if (gslot >= 0 && pcnetgame_guest_mail_left_today(gslot) <= 0) {
+                fail = "the guest already sent its letters for today (host daily limit AC_MP_GUEST_MAIL_PER_DAY)";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_MAIL_LIMIT;
             }
         }
     }
@@ -22513,6 +22782,46 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     W.header.sender.type = (u8)mMl_NAME_TYPE_PLAYER;
     W.content.font = (u8)mMl_FONT_RECV;
     wh = pcnetgame_mail_be_hash(&W);
+    if (tg >= 0) {
+        /* guest mailbox: a letter TO A GUEST. Straight into the guest's host-held mailbox (the free slot found above; single-threaded, nothing changed since), the
+         * sender's mirror slot cleared (the gift travels inside the letter, exactly like resident -> resident). Durability: a GUEST sender's slot and the recipient's
+         * mailbox both live in guest store files -> written NOW, before the journal (a failed write undoes both: REJECTED BUSY). A RESIDENT sender's slot lives in
+         * Save_t -> the recipient's file is written with the next host save (the post-save guest store write), so a host crash before that save loses BOTH halves
+         * together (the letter is still in the sender's pockets) instead of duplicating the letter and its gift. */
+        Mail_c old_src;
+        memcpy(&old_src, L, sizeof(old_src));
+        memcpy(&s_guest_mbox[tg].box[tg_slot], &W, sizeof(W));
+        (void)pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL);
+        slot->rev++;
+        slot->dirty_unsaved = 1;
+        if (gslot >= 0 && !pcnetgame_guest_store_write("guest letter to a guest")) {
+            mMl_clear_mail(&s_guest_mbox[tg].box[tg_slot]);
+            (void)pcnetgame_rec_txn_write_mail(idx, (int)t->slot, &old_src); /* the rollback goes through the same sanctioned writer */
+            slot->rev--;
+            printf("[NET][GUEST][MAIL] host: *** guest slot %d letter to guest slot %d: the guest store could not be written -- undone (nothing changed) ***\n", gslot, tg);
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BUSY, 1, NULL, "the guest store could not be written durably");
+            return;
+        }
+        R->last_pocket_rev = slot->rev;
+        pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+        if (gslot >= 0) {
+            pcnetgame_guest_mail_count_send(gslot);
+        }
+        (void)pcnetgame_guest_mbox_refresh(tg); /* a connected recipient gets the MAILBOX_LETTER (house 0xFF) on the next mailbox tick */
+        printf("[NET][GUEST][MAIL] host: peer %d %s %d MAIL_SEND slot %u -> GUEST slot %d mailbox[%d] present 0x%04X letter_hash=0x%08X mirror_slot_cleared=1 committed [TXN]%s\n",
+               (int)peer, gslot >= 0 ? "guest" : "resident", idx, (unsigned)t->slot, tg, tg_slot, (unsigned)t->item, (unsigned)wh,
+               gslot >= 0 ? " (guest store written)" : " (the guest store is written with the next host save)");
+        if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
+            printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the mail commit, no RESULT sent\n", (int)peer);
+            pcnetgame_host_drop_peer(peer);
+            return; /* FAULT: no result by design */
+        }
+        pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
+        if (st->rec_push_active) {
+            pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);
+        }
+        return;
+    }
     if (mPO_receipt_proc(&W, mPO_SENDTYPE_MAIL) != TRUE) {
         /* cannot happen after the read-only checks (single-threaded); mPO_receipt_check_mail mutates nothing when it answers FALSE for a PLAYER letter */
         printf("[NET][MAIL] host: peer %d *** INTERNAL: mPO_receipt_proc refused after a passing check -- nothing mutated ***\n", (int)peer);
@@ -22530,8 +22839,12 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     slot->dirty_unsaved = 1;
     R->last_pocket_rev = slot->rev;
     pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
-    printf("[NET][MAIL] host: peer %d resident %d MAIL_SEND slot %u -> house %d present 0x%04X letter_hash=0x%08X po_slot=%d po_sum=%d mirror_slot_cleared=1 committed [TXN]\n",
-           (int)peer, idx, (unsigned)t->slot, rh, (unsigned)t->item, (unsigned)wh, po_slot, (int)mPO_get_keep_mail_sum());
+    if (gslot >= 0) {
+        pcnetgame_guest_mail_count_send(gslot);
+        printf("[NET][GUEST][MAIL] host: guest slot %d sent a letter to house %d (%d of %d today)\n", gslot, rh, (int)s_guest_mbox[gslot].send_count, pcnetgame_guest_mail_per_day());
+    }
+    printf("[NET][MAIL] host: peer %d %s %d MAIL_SEND slot %u -> house %d present 0x%04X letter_hash=0x%08X po_slot=%d po_sum=%d mirror_slot_cleared=1 committed [TXN]\n",
+           (int)peer, gslot >= 0 ? "guest" : "resident", idx, (unsigned)t->slot, rh, (unsigned)t->item, (unsigned)wh, po_slot, (int)mPO_get_keep_mail_sum());
     PC_LOG_RL(PCL_MAIL, 8, 64, "host mail send committed: peer %d resident %d house %d\n", (int)peer, idx, rh);
     if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
         printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the mail commit, no RESULT sent\n", (int)peer);
@@ -22718,6 +23031,94 @@ static int pcnetgame_mbox_send(PCNetPeerId peer, int idx, int i) {
     return pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m)) ? 1 : 0;
 }
 
+/* GUEST MAILBOX push: the same digest / seq scheme as a resident's house mailbox, over s_guest_mbox[g].box (host-held, no house). Returns how many slots changed. */
+static int pcnetgame_guest_mbox_refresh(int g) {
+    uint8_t be[PC_NETGAME_MAIL_WIRE_SIZE];
+    PCNetGameGuestMbox* M;
+    int i, changed = 0, used = 0;
+    if (g < 0 || g >= s_guest_cap || !s_guest[g].used) {
+        return 0;
+    }
+    M = &s_guest_mbox[g];
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        used += mMl_check_not_used_mail(&M->box[i]) != TRUE;
+    }
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        const int empty = mMl_check_not_used_mail(&M->box[i]) == TRUE;
+        uint32_t dig;
+        if (empty) {
+            memcpy(be, pcnetgame_mbox_empty_be(), sizeof(be));
+        } else {
+            pcnetgame_mail_to_be(&M->box[i], be);
+        }
+        dig = pcnetgame_fnv1a32(be, sizeof(be));
+        if (!M->valid || M->digest[i] != dig) {
+            M->digest[i] = dig;
+            M->seq[i]++;
+            changed++;
+            printf("[NET][GUEST][MAIL] host: guest slot %d mailbox[%d] %s -> seq %u digest 0x%08X present 0x%04X used %d\n", g, i, empty ? "EMPTY" : "LETTER", (unsigned)M->seq[i],
+                   (unsigned)dig, (unsigned)(empty ? 0u : (unsigned)M->box[i].present), used);
+        }
+    }
+    M->valid = 1;
+    return changed;
+}
+
+static int pcnetgame_guest_mbox_send(PCNetPeerId peer, int g, int i) {
+    PCNetGameMailboxLetterMsg m;
+    const PCNetGameGuestMbox* M = &s_guest_mbox[g];
+    int k, used = 0;
+    if (!M->valid) {
+        return 0;
+    }
+    for (k = 0; k < (int)PC_NETGAME_MBOX_SLOTS; k++) {
+        used += mMl_check_not_used_mail((Mail_c*)&M->box[k]) != TRUE;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_MAILBOX_LETTER;
+    m.house = (uint8_t)PC_NETGAME_MBOX_HOUSE_GUEST; /* the guest's virtual (post office) mailbox: an older client refuses it ("not the house this player owns") */
+    m.mbox_idx = (uint8_t)i;
+    m.flags = mMl_check_not_used_mail((Mail_c*)&M->box[i]) == TRUE ? (uint8_t)PC_NETGAME_MBOX_FLAG_EMPTY : (uint8_t)0;
+    if (m.flags) {
+        memcpy(m.letter, pcnetgame_mbox_empty_be(), sizeof(m.letter));
+    } else {
+        pcnetgame_mail_to_be(&M->box[i], m.letter);
+    }
+    m.seq = M->seq[i];
+    m.digest = pcnetgame_fnv1a32(m.letter, sizeof(m.letter));
+    m.used_count = (uint16_t)used;
+    return pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m)) ? 1 : 0;
+}
+
+/* The guest part of the push: a READY peer bound to guest slot g gets every slot whose seq it has not seen (an empty slot as an "empty" indication). */
+static void pcnetgame_host_guest_mbox_push(int p, int refresh) {
+    PCNetGameHostPeerState* st = &s_host_peer[p];
+    const int g = st->bound_guest_slot;
+    int i, sent = 0;
+    if (g < 0 || g >= s_guest_cap || !s_guest[g].used || !pcnetgame_guest_mail_enabled() ||
+        mPr_CheckCmpPersonalID(&st->bound_pid, &s_guest[g].key) != TRUE) {
+        return;
+    }
+    if (refresh || !s_guest_mbox[g].valid) {
+        (void)pcnetgame_guest_mbox_refresh(g);
+    }
+    if (st->mbox_res_plus1 != PLAYER_NUM + g + 1) {
+        memset(st->mbox_sent_seq, 0, sizeof(st->mbox_sent_seq)); /* a (re)binding: every slot is owed */
+        st->mbox_res_plus1 = PLAYER_NUM + g + 1;
+    }
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS && sent < PC_NETGAME_MBOX_PER_POLL; i++) {
+        if (st->mbox_sent_seq[i] != s_guest_mbox[g].seq[i]) {
+            if (!pcnetgame_guest_mbox_send((PCNetPeerId)p, g, i)) {
+                break; /* the send window is full: retried on the next poll */
+            }
+            st->mbox_sent_seq[i] = s_guest_mbox[g].seq[i];
+            sent++;
+            printf("[NET][GUEST][MAIL] host: pushed guest mailbox[%d] seq %u (%s) of guest slot %d to peer %d\n", i, (unsigned)s_guest_mbox[g].seq[i],
+                   mMl_check_not_used_mail(&s_guest_mbox[g].box[i]) == TRUE ? "EMPTY" : "LETTER", g, p);
+        }
+    }
+}
+
 static void pcnetgame_host_mbox_tick(void) {
     uint32_t now;
     int p, own, refresh;
@@ -22734,6 +23135,10 @@ static void pcnetgame_host_mbox_tick(void) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
         int idx, i, sent = 0;
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid) {
+            continue;
+        }
+        if (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
+            pcnetgame_host_guest_mbox_push(p, refresh); /* guest mailbox: the host-held virtual mailbox (house 0xFF) */
             continue;
         }
         idx = st->bound_resident_idx;
@@ -22774,9 +23179,10 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
     const PCNetGameTxnLog* old;
     const Mail_c* L;
     Mail_c W;
+    Private_c* mir;
     uint32_t hash, now, lh = 0, want24, wh;
     uint16_t bad;
-    int idx, shape_ok, h = -1, dst, stale = 0;
+    int idx, shape_ok, h = -1, dst, stale = 0, gslot = -1;
     const char* fail = NULL;
     uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
 
@@ -22806,10 +23212,16 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
         return;
     }
 
-    /* Guests (G1) have no house and no mailbox: a guest slot (idx >= PLAYER_NUM) is refused HERE, before anything derives a private_data[] / homes[]
-     * index from it (nothing is journaled, nothing is mutated). */
-    if (idx >= PLAYER_NUM) {
-        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "a guest / extra player has no house and no mailbox: taking mail is refused until guests get one");
+    /* Guest mailbox: a GUEST (idx >= PLAYER_NUM) takes from its HOST-HELD mailbox (s_guest_mbox[g].box, never homes[]); its mirror record is reached only through
+     * pcnetgame_rec_priv_ptr. With the host switch off (AC_MP_GUEST_MAIL=0) the previous refusal stays (nothing journaled, nothing mutated). */
+    gslot = pcnetgame_guest_of_idx(idx);
+    if (idx >= PLAYER_NUM && (gslot < 0 || !pcnetgame_guest_mail_enabled())) {
+        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "guest mail is switched off on this host (AC_MP_GUEST_MAIL=0) / no guest entry: a guest has no mailbox");
+        return;
+    }
+    mir = pcnetgame_rec_priv_ptr(idx);
+    if (mir == NULL) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 0, NULL, "no mirror record for the bound slot");
         return;
     }
 
@@ -22881,12 +23293,12 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
     /* 7. READ-ONLY checks against the HOST's own mailbox slot and the mirror mail[dst]. Nothing is mutated here. */
     want24 = ((uint32_t)t->aux_cond << 16) | (uint32_t)t->aux_item;
     dst = (int)t->flags;
-    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
-    if (h < 0) {
-        fail = "the bound resident owns no house (guests / extra players have no mailbox)";
+    h = gslot >= 0 ? (int)PC_NETGAME_MBOX_HOUSE_GUEST : pcnetgame_mbox_house_of(&mir->player_ID);
+    if (gslot < 0 && h < 0) {
+        fail = "the bound resident owns no house (extra players have no mailbox)";
         fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
     } else {
-        L = &Save_Get(homes[h]).mailbox[t->slot];
+        L = gslot >= 0 ? &s_guest_mbox[gslot].box[t->slot] : &Save_Get(homes[h]).mailbox[t->slot];
         if (mMl_check_not_used_mail((Mail_c*)L) == TRUE) {
             fail = "the mailbox slot is empty on the host (the client's shadow was stale)";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_SUCH_LETTER;
@@ -22904,7 +23316,7 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
         } else if (L->present != (mActor_name_t)EMPTY_NO && L->present != (mActor_name_t)RSV_NO && !pcnetgame_is_pocket_legal_item(L->present)) {
             fail = "the letter's gift is not an item that can exist in a pocket (it would be refused by the record validator)";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE;
-        } else if (mMl_check_not_used_mail(&Save_Get(private_data)[idx].mail[dst]) != TRUE) {
+        } else if (mMl_check_not_used_mail(&mir->mail[dst]) != TRUE) {
             fail = "the mirror's mail[dst] is occupied (no free mail slot for the letter)";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_MAILBOX_FULL;
         }
@@ -22918,7 +23330,11 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
         if (stale) {
             /* the client's shadow of that slot is wrong: bump that slot's seq (same bytes) so the digest sender re-pushes it and the client (which ignores a seq it has
              * already applied) accepts the correction */
-            if (s_mbox_host[idx][t->slot].valid) {
+            if (gslot >= 0) {
+                if (s_guest_mbox[gslot].valid) {
+                    s_guest_mbox[gslot].seq[t->slot]++;
+                }
+            } else if (s_mbox_host[idx][t->slot].valid) {
                 s_mbox_host[idx][t->slot].seq++;
             }
         }
@@ -22933,15 +23349,38 @@ static void pcnetgame_handle_host_mail_take_txn(PCNetPeerId peer, const PCNetGam
     /* 8. THE commit: the host's own copy of the letter (raw bytes) into the mirror mail[dst], the mailbox slot cleared, rev++ */
     memcpy(&W, L, sizeof(W));
     wh = pcnetgame_mail_be_hash(&W);
-    (void)pcnetgame_rec_txn_write_mail(idx, dst, &W);
-    mMl_clear_mail(&Save_Get(homes[h]).mailbox[t->slot]);
-    slot->rev++;
-    slot->dirty_unsaved = 1;
+    if (gslot >= 0) {
+        /* GUEST: the mailbox slot and mail[dst] live in the SAME .gst file: commit both in memory, write the file DURABLY, and only then journal + answer. A failed
+         * write puts both back exactly (nothing journaled as APPLIED: the outcome is REJECTED BUSY, the client retries). */
+        Mail_c old_dst;
+        memcpy(&old_dst, &mir->mail[dst], sizeof(old_dst));
+        (void)pcnetgame_rec_txn_write_mail(idx, dst, &W);
+        mMl_clear_mail(&s_guest_mbox[gslot].box[t->slot]);
+        slot->rev++;
+        slot->dirty_unsaved = 1;
+        if (!pcnetgame_guest_store_write("guest mailbox take")) {
+            (void)pcnetgame_rec_txn_write_mail(idx, dst, &old_dst); /* the rollback goes through the same sanctioned writer */
+            memcpy(&s_guest_mbox[gslot].box[t->slot], &W, sizeof(W));
+            slot->rev--;
+            printf("[NET][GUEST][MAIL] host: *** guest slot %d MAIL_TAKE: the guest file could not be written -- the take is undone (mailbox and mail[] as before) ***\n", gslot);
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BUSY, 1, NULL, "the guest store could not be written durably");
+            return;
+        }
+    } else {
+        (void)pcnetgame_rec_txn_write_mail(idx, dst, &W);
+        mMl_clear_mail(&Save_Get(homes[h]).mailbox[t->slot]);
+        slot->rev++;
+        slot->dirty_unsaved = 1;
+    }
     R->last_pocket_rev = slot->rev;
     pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
-    (void)pcnetgame_mbox_refresh_resident(idx); /* the cleared slot's seq now exists: the next tick sends it right after the RESULT */
-    printf("[NET][MAIL] host: peer %d resident %d MAIL_TAKE mailbox[%u] of house %d -> mirror mail[%d] present 0x%04X letter_hash=0x%08X mailbox_slot_cleared=1 committed [TXN]\n",
-           (int)peer, idx, (unsigned)t->slot, h, dst, (unsigned)t->item, (unsigned)wh);
+    if (gslot >= 0) {
+        (void)pcnetgame_guest_mbox_refresh(gslot); /* the cleared slot's seq now exists: the next tick sends it right after the RESULT */
+    } else {
+        (void)pcnetgame_mbox_refresh_resident(idx); /* the cleared slot's seq now exists: the next tick sends it right after the RESULT */
+    }
+    printf("[NET][MAIL] host: peer %d %s %d MAIL_TAKE mailbox[%u] of house %d -> mirror mail[%d] present 0x%04X letter_hash=0x%08X mailbox_slot_cleared=1 committed [TXN]%s\n",
+           (int)peer, gslot >= 0 ? "guest" : "resident", idx, (unsigned)t->slot, h, dst, (unsigned)t->item, (unsigned)wh, gslot >= 0 ? " (guest file written)" : "");
     if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
         printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the take commit, no RESULT sent\n", (int)peer);
         pcnetgame_host_drop_peer(peer);
@@ -23122,6 +23561,541 @@ static void pcnetgame_mail_test_seed_reply(void) {
     }
 }
 /* ===== MAIL2 HOST END ===== */
+
+/* ===== GUEST MAIL HOST (replies) BEGIN: the villager replies to GUESTS (outside the MAIL2 HOST block: its test hooks read the environment) ===== */
+/* ---- Guest mailbox: villager replies for every connected GUEST ----
+ * A guest's letter to a villager (MAIL_REQUEST) sets send_reply in the host-owned memory keyed by the guest key, exactly like a resident's. The reply cannot go
+ * through the post office (no house), so the same generator (mNpc_RemailForSink, m_npc.c) hands it to pcnetgame_guest_remail_sink, which puts it DIRECTLY into the
+ * guest's host-held mailbox. One pass per guest slot per host calendar day (s_guest_mbox[g].reply_day, grows with the guest table); a FULL mailbox stops that guest's
+ * pass with send_reply still set (retried on the next day's pass), without affecting the other guests. A pass that delivered something writes the guest store at once. */
+typedef struct PCNetGameGuestSinkCtx {
+    int g;
+    int delivered;
+} PCNetGameGuestSinkCtx;
+static int pcnetgame_guest_remail_sink(Mail_c* mail, void* ctx) {
+    PCNetGameGuestSinkCtx* c = (PCNetGameGuestSinkCtx*)ctx;
+    if (!pcnetgame_guest_mbox_deliver(c->g, mail, "villager reply")) {
+        return FALSE;
+    }
+    c->delivered++;
+    return TRUE;
+}
+/* TEST-ONLY (PC_TEST_HOOKS build + AC_TEST_HOOKS=1; never active in normal play), run per connected SYNCED guest right before its reply pass, once per guest slot:
+ *   AC_TEST_GUEST_MAIL_SEED=<count>[,<gift hex>]  delivers <count> villager-style letters into the guest's mailbox (the first carries the gift) through the REAL delivery
+ *                                                  function (pcnetgame_guest_mbox_deliver) and writes the store, standing in for "a villager replied" without waiting a day;
+ *   AC_TEST_GUEST_MAIL_SEED_REPLY=1               the first villager owes the guest a reply (letter dated a year ago), so the REAL pass generates it now;
+ *   AC_TEST_GUEST_MAIL_REPLY_EVERY_PASS=1         the once-per-day latch is ignored (a full mailbox is retried every second instead of the next day). */
+static int pcnetgame_guest_mail_test_hooks(int g) {
+#ifdef PC_NET_TEST_HOOKS
+    static uint8_t s_seeded[64], s_replied[64];
+    const char* e;
+    int every = pc_test_hook_getenv("AC_TEST_GUEST_MAIL_REPLY_EVERY_PASS") != NULL;
+    if (g < 0 || g >= 64) {
+        return every;
+    }
+    if (!s_seeded[g] && (e = pc_test_hook_getenv("AC_TEST_GUEST_MAIL_SEED")) != NULL) {
+        int n = (int)strtol(e, NULL, 10), w, k, gift = -1;
+        const char* c = strchr(e, ',');
+        Mail_c m;
+        s_seeded[g] = 1;
+        if (c != NULL) {
+            gift = (int)strtol(c + 1, NULL, 16);
+        }
+        for (w = 0; w < n && w < (int)PC_NETGAME_MBOX_SLOTS; w++) {
+            mMl_clear_mail(&m);
+            m.content.font = (u8)mMl_FONT_RECV;
+            m.content.mail_type = 0;
+            m.content.paper_type = (u8)(w % 8);
+            mPr_CopyPersonalID(&m.header.recipient.personalID, &s_guest[g].key);
+            m.header.recipient.type = (u8)mMl_NAME_TYPE_PLAYER;
+            mPr_ClearPersonalID(&m.header.sender.personalID);
+            for (k = 0; k < 4; k++) {
+                m.header.sender.personalID.player_name[k] = (u8)(0x41 + w + k);
+            }
+            m.header.sender.type = (u8)mMl_NAME_TYPE_NPC;
+            for (k = 0; k < 40; k++) {
+                m.content.body[k] = (u8)(0x30 + ((w * 3 + k) % 10));
+            }
+            m.present = (gift >= 0 && w == 0) ? (mActor_name_t)gift : (mActor_name_t)EMPTY_NO;
+            if (!pcnetgame_guest_mbox_deliver(g, &m, "TEST-ONLY AC_TEST_GUEST_MAIL_SEED")) {
+                break;
+            }
+        }
+        printf("[NET][GUEST][MAIL][TEST-ONLY] AC_TEST_GUEST_MAIL_SEED: %d letter(s) delivered into guest slot %d's mailbox (NOT active in normal play)\n", w, g);
+        (void)pcnetgame_guest_mbox_refresh(g);
+        (void)pcnetgame_guest_store_write("TEST-ONLY guest mailbox seed");
+    }
+    if (!s_replied[g] && pc_test_hook_getenv("AC_TEST_GUEST_MAIL_SEED_REPLY") != NULL) {
+        Animal_c* an = Save_Get(animals);
+        int a, mi;
+        s_replied[g] = 1;
+        for (a = 0; a < ANIMAL_NUM_MAX && mNpc_CheckFreeAnimalPersonalID(&an->id) != FALSE; a++, an++) {
+        }
+        if (a < ANIMAL_NUM_MAX) {
+            mi = mNpc_GetAnimalMemoryIdx(&s_guest[g].key, an->memories, ANIMAL_MEMORY_NUM);
+            if (mi < 0) {
+                mi = mNpc_ForceGetFreeAnimalMemoryIdx(an, an->memories, ANIMAL_MEMORY_NUM);
+                if (mi >= 0) {
+                    mPr_CopyPersonalID(&an->memories[mi].memory_player_id, &s_guest[g].key);
+                }
+            }
+            if (mi >= 0) {
+                an->memories[mi].letter_info.exists = TRUE;
+                an->memories[mi].letter_info.send_reply = TRUE;
+                an->memories[mi].letter_info.cond = mNpc_LETTER_RANK_OK;
+                an->memories[mi].letter.date.year = (u16)(Common_Get(time.rtc_time).year - 1);
+                an->memories[mi].letter.date.month = Common_Get(time.rtc_time).month;
+                an->memories[mi].letter.date.day = Common_Get(time.rtc_time).day;
+                printf("[NET][GUEST][MAIL][TEST-ONLY] AC_TEST_GUEST_MAIL_SEED_REPLY: villager slot %d (memory %d) now owes guest slot %d a reply (NOT active in normal play)\n", a, mi, g);
+            }
+        }
+    }
+    return every;
+#else
+    (void)g;
+    return 0;
+#endif
+}
+/* 1 = some town villager still owes guest g a reply (send_reply set): logged by the pass (rate limited) so an operator / test sees a reply waiting for room. */
+static int pcnetgame_guest_reply_pending(int g) {
+    Animal_c* an = Save_Get(animals);
+    int a, mi;
+    for (a = 0; a < ANIMAL_NUM_MAX; a++, an++) {
+        if (mNpc_CheckFreeAnimalPersonalID(&an->id) == FALSE && (mi = mNpc_GetAnimalMemoryIdx(&s_guest[g].key, an->memories, ANIMAL_MEMORY_NUM)) >= 0 &&
+            an->memories[mi].letter_info.send_reply) {
+            return 1;
+        }
+    }
+    return 0;
+}
+static void pcnetgame_host_guest_remail_tick(void) {
+    static uint32_t s_next_ms = 0;
+    uint32_t now, today;
+    int p;
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready || !pcnetgame_guest_mail_enabled()) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_next_ms != 0 && (int32_t)(now - s_next_ms) < 0) {
+        return;
+    }
+    s_next_ms = now + 1000u;
+    today = pcnetgame_host_today();
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        PCNetGameHostPeerState* st = &s_host_peer[p];
+        PCNetGameGuestSinkCtx c;
+        int g;
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid || st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST ||
+            st->rec_state != PC_NETGAME_RECS_SYNCED) {
+            continue;
+        }
+        g = st->bound_guest_slot;
+        if (g < 0 || g >= s_guest_cap || !s_guest[g].used || mPr_CheckCmpPersonalID(&st->bound_pid, &s_guest[g].key) != TRUE) {
+            continue;
+        }
+        if (pcnetgame_guest_mail_test_hooks(g) == 0 && s_guest_mbox[g].reply_day == today) {
+            continue;
+        }
+        s_guest_mbox[g].reply_day = today; /* once per day per guest, delivered or not (a full mailbox retries tomorrow, send_reply stays set) */
+        c.g = g;
+        c.delivered = 0;
+        mNpc_RemailForSink(pcnetgame_rec_priv_ptr(PLAYER_NUM + g), pcnetgame_guest_remail_sink, &c); /* the guest record through THE accessor (reads player_ID only) */
+        if (c.delivered > 0) {
+            printf("[NET][GUEST][MAIL] host: villager-reply pass for guest slot %d (peer %d): %d letter(s) delivered into its mailbox\n", g, p, c.delivered);
+            (void)pcnetgame_guest_mbox_refresh(g);
+            (void)pcnetgame_guest_store_write("villager reply to a guest");
+        } else if (pcnetgame_guest_reply_pending(g)) {
+            static uint32_t s_logged_ms = 0;
+            if ((uint32_t)(now - s_logged_ms) >= 5000u) {
+                s_logged_ms = now;
+                printf("[NET][GUEST][MAIL] host: villager-reply pass for guest slot %d: a reply is still owed (send_reply kept; the mailbox is full or the letter is from today)\n", g);
+            }
+        }
+    }
+}
+
+/* ===== GUEST MAIL HOST (replies) END ===== */
+
+/* ===== GUEST MAIL HOST (events) BEGIN: villager event letters, the museum completion letter and the host player's own letters TO GUESTS =====
+ * The vanilla senders only know RESIDENTS (private_data[0..PLAYER_NUM) + their house mailbox / the post office). For every guest that receives town letters
+ * (pcnetgame_guest_mail_target: confirmed, this town, record present -- connected or not: the mailbox is host-held) the host makes the same letters with the
+ * vanilla builders (m_npc.c mNpc_Guest*ForSink, m_museum.c mMsm_GuestCompMailForSink) and puts them into the guest mailbox:
+ *   BIRTHDAY  : the guest's birthday (its record) entered the host's mail-event cursor window -> a card + RARE present from every villager whose highest-friendship
+ *               memory is the guest (mNpc_SendEventBirthdayCard2 rule);
+ *   XMAS      : Dec 25 entered the window (same year, <= a week late) -> the Christmas card (FTR_FAMICOM_COMMON01);
+ *   VALENTINE : the vanilla Feb 14 10:00 schedule fired (mNpc_SendVtdayMail) -> each villager's other-sex best friend AMONG GUESTS gets the present letter;
+ *   GOODBYE   : a villager left the town (mNpc_SetGoodbyAnimalMail) -> its goodbye letter to every guest it has a MEMORY of (residents: every resident, vanilla);
+ *   MUSEUM    : the museum is complete (all four sections) -> the completion letter + FTR_NOG_MUSEUM, once per guest.
+ * DEDUPE (no new save format): birthday / Christmas / Valentine use the residents' own dedupe, the host's mail-event cursor (Save_t event_save_common.last_date /
+ * valentines_day_date, persisted by the host save): the window is handed over by ac_event_manager.c BEFORE the cursor moves, and the guest letters are persisted with
+ * the NEXT host save (the post-save guest store write), so a host that dies before saving re-sends both the residents' and the guests' letters at most once and never
+ * keeps a guest letter whose cursor move was lost. Goodbye is one departure (the Save_t change itself). The museum letter is deduped by the two HOST-OWNED state_flags
+ * bits of the guest's own record (mPr_FLAG_MUSEUM_COMP_HANDBILL_SCHEDULED | _RECEIVED), written in the same .gst file as the letter (one durable write).
+ * A FULL mailbox: birthday / Christmas / Valentine letters are dropped (vanilla: full mailbox + full post office drops them too); a goodbye letter waits in memory and is
+ * retried every minute (vanilla: the in-memory deliver_to bitfield); the museum letter is retried every minute (the bits stay clear). AC_MP_GUEST_MAIL=0: none of it. */
+#define PC_NETGAME_GEV_BYE_Q 8
+typedef struct PCNetGameGevBye {
+    uint8_t         used;
+    AnmPersonalID_c anm;
+    PersonalID_c    who[ANIMAL_MEMORY_NUM]; /* the departing villager's memories at the departure (cleared from Save_t right after) */
+    uint8_t         done[ANIMAL_MEMORY_NUM];
+} PCNetGameGevBye;
+static PCNetGameGevBye s_gev_bye[PC_NETGAME_GEV_BYE_Q];
+static struct {
+    uint8_t  pending;
+    uint32_t last_raw;
+    uint32_t now_raw;
+} s_gev_win;
+static uint8_t  s_gev_vtday = 0;
+static uint32_t s_gev_retry_ms = 0;
+static int      s_gev_museum_force = 0; /* TEST-ONLY: the museum counts as complete */
+
+typedef struct PCNetGameGevCtx {
+    int         delivered;
+    const char* why;
+    uint8_t     touched[64]; /* guest slots that got a letter (refresh), bounded like the test-hook tables */
+} PCNetGameGevCtx;
+/* The event sink: the letter's recipient is a guest KEY -> that guest's mailbox. TRUE = taken. */
+static int pcnetgame_gev_sink(Mail_c* mail, void* ctx) {
+    PCNetGameGevCtx* c = (PCNetGameGevCtx*)ctx;
+    const int g = pcnetgame_guest_find(&mail->header.recipient.personalID);
+    if (!pcnetgame_guest_mail_target(g) || !pcnetgame_guest_mbox_deliver(g, mail, c->why)) {
+        return FALSE;
+    }
+    c->delivered++;
+    if (g < 64) {
+        c->touched[g] = 1;
+    } else {
+        (void)pcnetgame_guest_mbox_refresh(g);
+    }
+    return TRUE;
+}
+static void pcnetgame_gev_finish(PCNetGameGevCtx* c, int write_now) {
+    int g;
+    for (g = 0; g < 64 && g < s_guest_cap; g++) {
+        if (c->touched[g]) {
+            (void)pcnetgame_guest_mbox_refresh(g); /* a connected guest gets the MAILBOX_LETTER (house 0xFF) on the next mailbox tick */
+        }
+    }
+    if (c->delivered > 0) {
+        printf("[NET][GUEST][MAIL] host: %s: %d letter(s) delivered into guest mailboxes (%s)\n", c->why, c->delivered,
+               write_now ? "guest store written now" : "persisted with the next host save, like the cursor that sent them");
+        if (write_now) {
+            (void)pcnetgame_guest_store_write(c->why);
+        }
+    }
+}
+
+/* ac_event_manager.c mail_event_check (any role; used on the HOST only): the residents' mail-event window, handed over BEFORE the cursor moves. Windows that arrive
+ * before the host world / guest table is ready are merged (earliest start, latest end) and processed once by the tick. */
+void pc_net_game_guest_event_window(u32 last_raw, u32 now_raw) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!s_gev_win.pending) {
+        s_gev_win.last_raw = last_raw;
+        s_gev_win.now_raw = now_raw;
+        s_gev_win.pending = 1;
+    } else {
+        if (last_raw < s_gev_win.last_raw) {
+            s_gev_win.last_raw = last_raw;
+        }
+        if (now_raw > s_gev_win.now_raw) {
+            s_gev_win.now_raw = now_raw;
+        }
+    }
+    printf("[NET][GUEST][MAIL] host: mail-event window (0x%08X, 0x%08X] noted for the guests' birthday / Christmas letters\n", (unsigned)last_raw, (unsigned)now_raw);
+}
+/* ac_event_manager.c vt_wt_mail_check: the vanilla Valentine's Day letters were just sent to the residents. */
+void pc_net_game_guest_vtday_due(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        s_gev_vtday = 1;
+        printf("[NET][GUEST][MAIL] host: Valentine's Day letters are due for the guests\n");
+    }
+}
+/* m_npc.c mNpc_SetGoodbyAnimalMail: a villager leaves; `mem` = its ANIMAL_MEMORY_NUM memories (copied now). */
+void pc_net_game_guest_goodbye_note(const void* anm_id, const void* memories, int n) {
+    const Anmmem_c* mem = (const Anmmem_c*)memories;
+    int q, m;
+    if (s_role != PC_NETGAME_ROLE_HOST || anm_id == NULL || mem == NULL) {
+        return;
+    }
+    for (q = 0; q < PC_NETGAME_GEV_BYE_Q && s_gev_bye[q].used; q++) {
+    }
+    if (q >= PC_NETGAME_GEV_BYE_Q) {
+        printf("[NET][GUEST][MAIL] host: the goodbye-letter queue is full: the oldest departure's undelivered guest letters are dropped\n");
+        memmove(&s_gev_bye[0], &s_gev_bye[1], sizeof(s_gev_bye) - sizeof(s_gev_bye[0]));
+        q = PC_NETGAME_GEV_BYE_Q - 1;
+    }
+    memset(&s_gev_bye[q], 0, sizeof(s_gev_bye[q]));
+    s_gev_bye[q].used = 1;
+    memcpy(&s_gev_bye[q].anm, anm_id, sizeof(AnmPersonalID_c));
+    for (m = 0; m < ANIMAL_MEMORY_NUM && m < n; m++) {
+        if (mNpc_CheckFreeAnimalMemory((Anmmem_c*)&mem[m]) == FALSE) {
+            mPr_CopyPersonalID(&s_gev_bye[q].who[m], (PersonalID_c*)&mem[m].memory_player_id);
+        }
+    }
+    printf("[NET][GUEST][MAIL] host: villager 0x%04X leaves: its goodbye letters for the guests it knows are queued (queue slot %d)\n", (unsigned)s_gev_bye[q].anm.npc_id, q);
+}
+
+/* The listed guest targets (keys + genders for the Valentine pass). */
+static int pcnetgame_gev_targets(PersonalID_c* keys, u8* genders, int* slots, int max) {
+    int g, n = 0;
+    for (g = 0; g < s_guest_cap && n < max; g++) {
+        if (pcnetgame_guest_mail_target(g)) {
+            mPr_CopyPersonalID(&keys[n], &s_guest[g].key);
+            genders[n] = (u8)(pcnetgame_rec_priv_ptr(PLAYER_NUM + g)->gender & 1); /* deliverable => the record exists (THE accessor) */
+            slots[n] = g;
+            n++;
+        }
+    }
+    return n;
+}
+
+static void pcnetgame_gev_run_window(uint32_t last_raw, uint32_t now_raw, const char* why) {
+    PCNetGameGevCtx c;
+    int g;
+    memset(&c, 0, sizeof(c));
+    c.why = why;
+    for (g = 0; g < s_guest_cap; g++) {
+        Private_c* gp;
+        if (!pcnetgame_guest_mail_target(g)) {
+            continue;
+        }
+        gp = pcnetgame_rec_priv_ptr(PLAYER_NUM + g); /* deliverable => non-NULL */
+        if (pc_guest_event_due(last_raw, now_raw, gp->birthday.month, gp->birthday.day, 0)) {
+            int k = mNpc_GuestBirthdayCardsForSink(&s_guest[g].key, pcnetgame_gev_sink, &c);
+            printf("[NET][GUEST][MAIL] host: guest slot %d's birthday (%d/%d) is in the window: %d birthday card(s)\n", g, (int)gp->birthday.month, (int)gp->birthday.day, k);
+        }
+        if (pc_guest_event_due(last_raw, now_raw, 12u, 25u, 1)) {
+            int k = mNpc_GuestXmasCardForSink(&s_guest[g].key, pcnetgame_gev_sink, &c);
+            printf("[NET][GUEST][MAIL] host: Christmas is in the window: %d card for guest slot %d\n", k, g);
+        }
+    }
+    pcnetgame_gev_finish(&c, 0);
+}
+
+static void pcnetgame_gev_run_vtday(const char* why) {
+    PersonalID_c keys[PC_NETGAME_GUESTDIR_MAX * 4];
+    u8 genders[PC_NETGAME_GUESTDIR_MAX * 4];
+    int slots[PC_NETGAME_GUESTDIR_MAX * 4];
+    PCNetGameGevCtx c;
+    int n = pcnetgame_gev_targets(keys, genders, slots, (int)(sizeof(slots) / sizeof(slots[0])));
+    memset(&c, 0, sizeof(c));
+    c.why = why;
+    if (n > 0) {
+        int k = mNpc_GuestVtdayMailForSink(keys, genders, n, pcnetgame_gev_sink, &c);
+        printf("[NET][GUEST][MAIL] host: Valentine's Day: %d present letter(s) for %d guest(s)\n", k, n);
+    }
+    pcnetgame_gev_finish(&c, 0);
+}
+
+static void pcnetgame_gev_run_goodbye(void) {
+    PCNetGameGevCtx c;
+    int q, m;
+    memset(&c, 0, sizeof(c));
+    c.why = "villager goodbye letter";
+    for (q = 0; q < PC_NETGAME_GEV_BYE_Q; q++) {
+        int left = 0;
+        if (!s_gev_bye[q].used) {
+            continue;
+        }
+        for (m = 0; m < ANIMAL_MEMORY_NUM; m++) {
+            int g;
+            if (s_gev_bye[q].done[m] || mPr_NullCheckPersonalID(&s_gev_bye[q].who[m]) != FALSE) {
+                continue;
+            }
+            g = pcnetgame_guest_find(&s_gev_bye[q].who[m]);
+            if (!pcnetgame_guest_mail_target(g)) {
+                s_gev_bye[q].done[m] = 1; /* a resident (the vanilla pass) / not a guest of this town */
+                continue;
+            }
+            if (mNpc_GuestGoodbyMailForSink(&s_guest[g].key, &s_gev_bye[q].anm, pcnetgame_gev_sink, &c) == 1) {
+                s_gev_bye[q].done[m] = 1;
+                printf("[NET][GUEST][MAIL] host: goodbye letter of villager 0x%04X delivered to guest slot %d\n", (unsigned)s_gev_bye[q].anm.npc_id, g);
+            } else {
+                left++; /* the guest mailbox is full: retried in a minute */
+            }
+        }
+        if (left == 0) {
+            memset(&s_gev_bye[q], 0, sizeof(s_gev_bye[q]));
+        }
+    }
+    pcnetgame_gev_finish(&c, 0);
+}
+
+static void pcnetgame_gev_run_museum(void) {
+    PCNetGameGevCtx c;
+    int g;
+    const int complete = mMsm_MuseumComplete() || s_gev_museum_force;
+    if (!complete) {
+        return;
+    }
+    memset(&c, 0, sizeof(c));
+    c.why = "museum completion letter";
+    for (g = 0; g < s_guest_cap; g++) {
+        if (pcnetgame_guest_mail_target(g) && mMsm_GuestCompMailForSink(pcnetgame_rec_priv_ptr(PLAYER_NUM + g), complete, pcnetgame_gev_sink, &c) == TRUE) {
+            /* the two host-owned state_flags bits changed in the guest's record: the slot's host-field digest moves (rev++, the record is dirty) and a bound
+             * client gets a full push (rate limited; an upload built before is STALE_BASE and is answered with that push too) */
+            const int idx = PLAYER_NUM + g;
+            const int p = pcnetgame_host_peer_bound_to_guest(g, -1);
+            PCNetGameRecSlot* rs = pcnetgame_rec_slot(idx);
+            if (rs != NULL) {
+                (void)pcnetgame_rec_refresh_hostfields(idx, rs);
+                if (p >= 0) {
+                    pcnetgame_rec_stale_push((PCNetPeerId)p, idx, rs, pcnetgame_now_ms());
+                }
+            }
+            printf("[NET][GUEST][MAIL] host: museum completion letter delivered to guest slot %d (state_flags 0x%08X)\n", g, (unsigned)pcnetgame_rec_priv_ptr(PLAYER_NUM + g)->state_flags);
+        }
+    }
+    pcnetgame_gev_finish(&c, 1); /* the letter and its dedupe bits live in the same .gst file: one durable write */
+}
+
+/* TEST-ONLY (PC_NET_TEST_HOOKS build + AC_TEST_HOOKS=1; never active in normal play): AC_TEST_GUEST_EVENT_MAIL=<list of birthday,xmas,vtday,goodbye,museum>, run ONCE
+ * when the first guest that receives town letters is SYNCED: the first town villager gets a best-friend memory (friendship 127, a letter on record) of that guest; then
+ * birthday = the window (the day before the guest's birthday, the birthday], xmas = (Dec 24, Dec 25] of this year, vtday = the Valentine pass, goodbye = that
+ * villager's departure is NOTED (the villager stays: only the letter path runs), museum = the museum counts as complete. Each goes through the REAL pass above. */
+static void pcnetgame_gev_test_hooks(void) {
+#ifdef PC_NET_TEST_HOOKS
+    static int s_done = 0;
+    const char* e;
+    int g, a, mi, p;
+    Animal_c* an;
+    if (s_done || (e = pc_test_hook_getenv("AC_TEST_GUEST_EVENT_MAIL")) == NULL) {
+        return;
+    }
+    for (p = 0, g = -1; p < pcnetgame_peer_span(); p++) {
+        const PCNetGameHostPeerState* st = &s_host_peer[p];
+        if (s_host_peer_link[p] == PC_NETGAME_LINK_READY && st->bound_valid && st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST &&
+            st->rec_state == PC_NETGAME_RECS_SYNCED && pcnetgame_guest_mail_target(st->bound_guest_slot)) {
+            g = st->bound_guest_slot;
+            break;
+        }
+    }
+    if (g < 0) {
+        return;
+    }
+    s_done = 1;
+    an = Save_Get(animals);
+    for (a = 0; a < ANIMAL_NUM_MAX; a++, an++) {
+        /* a villager of the OTHER sex than the guest (the Valentine pass needs it; any villager serves the others) */
+        if (mNpc_CheckFreeAnimalPersonalID(&an->id) == FALSE && ((~mNpc_GetAnimalSex(an)) & 1) == (pcnetgame_rec_priv_ptr(PLAYER_NUM + g)->gender & 1)) {
+            break;
+        }
+    }
+    if (a >= ANIMAL_NUM_MAX) {
+        an = Save_Get(animals);
+        for (a = 0; a < ANIMAL_NUM_MAX && mNpc_CheckFreeAnimalPersonalID(&an->id) != FALSE; a++, an++) {
+        }
+    }
+    if (a >= ANIMAL_NUM_MAX) {
+        printf("[NET][GUEST][MAIL][TEST-ONLY] AC_TEST_GUEST_EVENT_MAIL: no villager in town\n");
+        return;
+    }
+    mi = mNpc_GetAnimalMemoryIdx(&s_guest[g].key, an->memories, ANIMAL_MEMORY_NUM);
+    if (mi < 0) {
+        mi = mNpc_ForceGetFreeAnimalMemoryIdx(an, an->memories, ANIMAL_MEMORY_NUM);
+        if (mi >= 0) {
+            mPr_CopyPersonalID(&an->memories[mi].memory_player_id, &s_guest[g].key);
+        }
+    }
+    if (mi < 0) {
+        return;
+    }
+    an->memories[mi].friendship = 127;
+    an->memories[mi].letter_info.exists = TRUE;
+    printf("[NET][GUEST][MAIL][TEST-ONLY] AC_TEST_GUEST_EVENT_MAIL=%s: villager slot %d (npc 0x%04X, memory %d) is now guest slot %d's best friend (NOT active in normal play)\n",
+           e, a, (unsigned)an->id.npc_id, mi, g);
+    {
+        const unsigned yy = (unsigned)(Common_Get(time.rtc_time).year % 100);
+        if (strstr(e, "birthday") != NULL) {
+            const unsigned bm = pcnetgame_rec_priv_ptr(PLAYER_NUM + g)->birthday.month, bd = pcnetgame_rec_priv_ptr(PLAYER_NUM + g)->birthday.day;
+            if (bm >= 1 && bm <= 12 && bd >= 1 && bd <= 31) {
+                const uint32_t now_raw = (yy << 24) | (bm << 16) | (bd << 8) | 9u;
+                const uint32_t last_raw = bd > 1 ? ((yy << 24) | (bm << 16) | ((bd - 1) << 8) | 9u) : ((bm > 1) ? ((yy << 24) | ((bm - 1) << 16) | (28u << 8)) : ((yy << 24) | (bm << 16) | (bd << 8)));
+                printf("[NET][GUEST][MAIL][TEST-ONLY] birthday window for guest slot %d (birthday %u/%u)\n", g, bm, bd);
+                pcnetgame_gev_run_window(last_raw, now_raw, "TEST-ONLY birthday window");
+            } else {
+                printf("[NET][GUEST][MAIL][TEST-ONLY] guest slot %d has no birthday set (month %u): birthday skipped\n", g, bm);
+            }
+        }
+        if (strstr(e, "xmas") != NULL) {
+            pcnetgame_gev_run_window((yy << 24) | (12u << 16) | (24u << 8) | 9u, (yy << 24) | (12u << 16) | (25u << 8) | 9u, "TEST-ONLY Christmas window");
+        }
+    }
+    if (strstr(e, "vtday") != NULL) {
+        pcnetgame_gev_run_vtday("TEST-ONLY Valentine's Day");
+    }
+    if (strstr(e, "goodbye") != NULL) {
+        pc_net_game_guest_goodbye_note(&an->id, an->memories, ANIMAL_MEMORY_NUM);
+        pcnetgame_gev_run_goodbye();
+    }
+    if (strstr(e, "museum") != NULL) {
+        s_gev_museum_force = 1;
+        pcnetgame_gev_run_museum();
+    }
+#endif
+}
+
+static void pcnetgame_host_guest_event_tick(void) {
+    uint32_t now;
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready || !s_guest_store_loaded || !pcnetgame_guest_mail_enabled()) {
+        return; /* the window / Valentine / departures wait (memory) until the guest table is there; with the switch off they are simply never used */
+    }
+    pcnetgame_gev_test_hooks();
+    if (s_gev_win.pending) {
+        s_gev_win.pending = 0;
+        pcnetgame_gev_run_window(s_gev_win.last_raw, s_gev_win.now_raw, "villager birthday / Christmas letters");
+    }
+    if (s_gev_vtday) {
+        s_gev_vtday = 0;
+        pcnetgame_gev_run_vtday("villager Valentine's Day letters");
+    }
+    now = pcnetgame_now_ms();
+    if (s_gev_retry_ms != 0 && (int32_t)(now - s_gev_retry_ms) < 0) {
+        return;
+    }
+    s_gev_retry_ms = now + 60000u;
+    pcnetgame_gev_run_goodbye(); /* a new departure is also picked up here within a minute (the first pass right after the world is ready) */
+    pcnetgame_gev_run_museum();
+}
+
+/* ---- the HOST'S OWN player (a resident of a non-dedicated host) writing to a GUEST at the post office (ac_npc_post_girl.c_inc): the same delivery, locally ---- */
+/* -1 = not a guest letter (the vanilla path), 0 = deliverable, 2 = the guest's mailbox is full (the vanilla "mailbox full" row). */
+int pc_net_game_host_guest_letter_check(Mail_c* mail) {
+    int g;
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready || mail == NULL) {
+        return -1;
+    }
+    g = pcnetgame_guest_mail_recipient(mail);
+    if (g < 0) {
+        return -1;
+    }
+    return pcnetgame_guest_mbox_free_slot(g) >= 0 ? 0 : 2;
+}
+/* 1 = it was a letter to a guest and it is in the guest's mailbox now (the caller does not hand it to the post office); 0 = not a guest letter (vanilla path). */
+int pc_net_game_host_guest_letter_post(Mail_c* mail) {
+    Mail_c W;
+    int g;
+    if (pc_net_game_host_guest_letter_check(mail) != 0) {
+        return 0;
+    }
+    g = pcnetgame_guest_mail_recipient(mail);
+    memcpy(&W, mail, sizeof(W));
+    if (Common_Get(now_private) != NULL) {
+        mPr_CopyPersonalID(&W.header.sender.personalID, &Common_Get(now_private)->player_ID);
+    }
+    W.header.sender.type = (u8)mMl_NAME_TYPE_PLAYER;
+    W.content.font = (u8)mMl_FONT_RECV;
+    if (!pcnetgame_guest_mbox_deliver(g, &W, "the host player's letter")) {
+        return 0;
+    }
+    (void)pcnetgame_guest_mbox_refresh(g);
+    printf("[NET][GUEST][MAIL] host: the host player's letter (present 0x%04X) went into guest slot %d's mailbox (persisted with the next host save)\n", (unsigned)W.present, g);
+    return 1;
+}
+/* ===== GUEST MAIL HOST (events) END ===== */
 
 /* furniture sync (Stage 1): the HOUSE CLIENT block below the D3 CLIENT block; the D3 / X1 code consults these gates */
 static void        pcnetgame_house_client_on_ready(void);
@@ -26685,7 +27659,7 @@ static int pcnetgame_txn_apply_mail(const PCNetGameClientTxn* T, const PCNetGame
 static int pcnetgame_txn_apply_take(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
     const PCNetGameTxnTag* t = &T->tag;
     const uint32_t want24 = (((uint32_t)t->aux_cond) << 16) | (uint32_t)t->aux_item;
-    int dst, h;
+    int dst;
     if (t->slot >= (uint8_t)PC_NETGAME_MBOX_SLOTS || t->flags >= (uint8_t)mPr_INVENTORY_MAIL_COUNT || !s_take_op.active ||
         s_take_op.request_id != T->request_id || s_take_op.mbox_idx != t->slot ||
         (pcnetgame_mail_be_hash(&s_take_op.letter) & 0xFFFFFFu) != want24) {
@@ -26701,10 +27675,12 @@ static int pcnetgame_txn_apply_take(const PCNetGameClientTxn* T, const PCNetGame
     }
     memcpy(&Now_Private->mail[dst], &s_take_op.letter, sizeof(Mail_c));
     s_take_op.dst = (uint8_t)dst;
-    h = pcnetgame_mbox_house_of(&Now_Private->player_ID);
-    if (h >= 0 && (pcnetgame_mail_be_hash(&s_mbox_shadow[t->slot]) & 0xFFFFFFu) == want24) {
-        mMl_clear_mail(&s_mbox_shadow[t->slot]);
-        mMl_clear_mail(&Save_Get(homes[h]).mailbox[t->slot]);
+    {
+        Mail_c* tgt = pcnetgame_mbox_local_target(); /* guest mailbox: the guest copy, else the owned house's mailbox */
+        if (tgt != NULL && (pcnetgame_mail_be_hash(&s_mbox_shadow[t->slot]) & 0xFFFFFFu) == want24) {
+            mMl_clear_mail(&s_mbox_shadow[t->slot]);
+            mMl_clear_mail(&tgt[t->slot]);
+        }
     }
     printf("[NET][TXN] client: APPLIED request %u kind=MAIL_TAKE -- mailbox[%u] letter (present 0x%04X) is now in mail slot %d\n", (unsigned)T->request_id,
            (unsigned)t->slot, (unsigned)s_take_op.letter.present, dst);
@@ -27488,7 +28464,7 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     memcpy(&m, data, size);
     svc = (int)m.service;
     if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG &&
-        svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE) {
+        svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE && svc != (int)PC_NETGAME_TS_GUESTDIR) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
@@ -27496,7 +28472,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
              : (svc == (int)PC_NETGAME_TS_SHOP) ? (uint16_t)PC_NETGAME_TS_SHOP_LEN
              : (svc == (int)PC_NETGAME_TS_HOSTCFG) ? (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN
              : (svc == (int)PC_NETGAME_TS_EVENT) ? (uint16_t)PC_NETGAME_TS_EVENT_LEN
-             : (svc == (int)PC_NETGAME_TS_UPGRADE) ? (uint16_t)PC_NETGAME_TS_UPGRADE_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_UPGRADE) ? (uint16_t)PC_NETGAME_TS_UPGRADE_LEN
+             : (svc == (int)PC_NETGAME_TS_GUESTDIR) ? (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -27516,10 +28493,12 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
           : svc == (int)PC_NETGAME_TS_SHOP ? pcnetgame_ts_valid_shop_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_HOSTCFG ? pcnetgame_ts_valid_hostcfg_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_EVENT ? pcnetgame_ts_valid_event_blob(m.blob)
-          : svc == (int)PC_NETGAME_TS_UPGRADE ? pcnetgame_ts_valid_upgrade_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_UPGRADE ? pcnetgame_ts_valid_upgrade_blob(m.blob)
+          : svc == (int)PC_NETGAME_TS_GUESTDIR ? pcnetgame_ts_valid_guestdir_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
                svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
-               : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : svc == (int)PC_NETGAME_TS_UPGRADE ? "shop upgrade" : "museum");
+               : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : svc == (int)PC_NETGAME_TS_UPGRADE ? "shop upgrade"
+               : svc == (int)PC_NETGAME_TS_GUESTDIR ? "guest directory" : "museum");
         return;
     }
     if (svc == (int)PC_NETGAME_TS_UPGRADE) {
@@ -27531,6 +28510,14 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     }
     if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
         pcnetgame_ts_client_apply(&m); /* a session setting, not a save region: no usable save needed */
+        return;
+    }
+    if (svc == (int)PC_NETGAME_TS_GUESTDIR) {
+        memcpy(s_gdir_client_blob, m.blob, PC_NETGAME_TS_GUESTDIR_LEN); /* guest mailbox: a session state, not a save region: no usable save needed */
+        s_ts_client_seq[svc] = m.seq;
+        s_ts_client_have[svc] = 1;
+        printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u: %u guest(s) in the town's directory\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq,
+               (unsigned)m.digest, (unsigned)m.len, (unsigned)m.blob[0]);
         return;
     }
     if (!pcfa_save_ready()) {
@@ -29694,12 +30681,8 @@ int pc_net_game_mail_begin_send(int slot) {
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || Now_Private == NULL) {
         return 0;
     }
-    if (pcnetgame_client_is_guest_player()) {
-        /* G5.1: a guest has no address (it owns no house): letters to players are refused locally (the post office's existing "no such address" row),
-         * the letter stays in its slot, nothing is sent. Letters to villagers use the MAIL_REQUEST path, not this one. */
-        printf("[NET][MAIL] client: MAIL_SEND refused locally: a guest cannot send letters to players (mail slot %d stays)\n", slot);
-        return 0;
-    }
+    /* Guest post: a GUEST may write to the residents too (the G5.1 local refusal is gone): the host reads the letter from the guest's mirror record and applies
+     * its daily limit (MAIL_LIMIT). An older host still answers NO_DONOR_SLOT, which the post girl maps onto its "no such address" row (the letter stays). */
     if (slot < 0 || slot >= mPr_INVENTORY_MAIL_COUNT) {
         return 0;
     }
@@ -29948,15 +30931,41 @@ static int pcnetgame_mbox_own_house(void) {
     return Now_Private != NULL ? pcnetgame_mbox_house_of(&Now_Private->player_ID) : -1;
 }
 
+/* GUEST MAILBOX (client): a GUEST owns no house, so its shadow (s_mbox_shadow, the same verified copy as a resident's) is mirrored into s_gmbox_view instead of a homes[]
+ * mailbox: the view the mailbox overlay shows when the post office girl opens it (pc_ui_mailbox()). s_mbox_guest = the slots received this session are the guest mailbox
+ * (MAILBOX_LETTER house 0xFF). A process is a resident OR a guest for a whole session (the session reset clears both). */
+static Mail_c  s_gmbox_view[PC_NETGAME_MBOX_SLOTS];
+static uint8_t s_mbox_guest;
+
+/* The local mailbox the shadow is mirrored into: the guest view for a guest client, the owned house's mailbox for a resident, NULL without one. */
+static Mail_c* pcnetgame_mbox_local_target(void) {
+    int h;
+    if (s_role == PC_NETGAME_ROLE_CLIENT && pcnetgame_client_is_guest_player()) {
+        return s_gmbox_view;
+    }
+    h = pcnetgame_mbox_own_house();
+    return h >= 0 ? Save_Get(homes[h]).mailbox : NULL;
+}
+
 static void pcnetgame_mbox_client_apply(const PCNetGameMailboxLetterMsg* m) {
     Mail_c L;
     const int i = (int)m->mbox_idx;
-    const int h = pcnetgame_mbox_own_house();
+    const int guest_box = m->house == (uint8_t)PC_NETGAME_MBOX_HOUSE_GUEST;
+    const int h = guest_box ? (int)PC_NETGAME_MBOX_HOUSE_GUEST : pcnetgame_mbox_own_house();
+    Mail_c* tgt = NULL;
     const int empty = (m->flags & (uint8_t)PC_NETGAME_MBOX_FLAG_EMPTY) != 0;
-    if (h < 0 || (int)m->house != h) {
+    if (guest_box) {
+        if (!pcnetgame_client_is_guest_player()) {
+            printf("[NET][MAIL] client: MAILBOX_LETTER slot %d seq %u refused: a guest mailbox letter, but this player is not a guest\n", i, (unsigned)m->seq);
+            goto refused;
+        }
+        tgt = s_gmbox_view;
+    } else if (h < 0 || (int)m->house != h || pcnetgame_client_is_guest_player()) {
         printf("[NET][MAIL] client: MAILBOX_LETTER slot %d seq %u refused: house %u is not the house this player owns (%d)\n", i, (unsigned)m->seq,
                (unsigned)m->house, h);
         goto refused;
+    } else {
+        tgt = Save_Get(homes[h]).mailbox;
     }
     pcnetgame_mail_from_be(m->letter, &L);
     if (empty != (mMl_check_not_used_mail(&L) == TRUE)) {
@@ -29973,11 +30982,12 @@ static void pcnetgame_mbox_client_apply(const PCNetGameMailboxLetterMsg* m) {
         mMl_clear_mail(&L);
     }
     memcpy(&s_mbox_shadow[i], &L, sizeof(Mail_c));
-    memcpy(&Save_Get(homes[h]).mailbox[i], &L, sizeof(Mail_c));
+    memcpy(&tgt[i], &L, sizeof(Mail_c));
     s_mbox_seq[i] = m->seq;
     s_mbox_mask |= (uint16_t)(1u << i);
-    printf("[NET][MAIL] client: applied mailbox[%d] seq %u digest 0x%08X (%s, present 0x%04X, host used %u)\n", i, (unsigned)m->seq, (unsigned)m->digest,
-           empty ? "EMPTY" : "LETTER", (unsigned)(empty ? 0u : (unsigned)L.present), (unsigned)m->used_count);
+    s_mbox_guest = (uint8_t)guest_box;
+    printf("[NET][MAIL] client: applied %smailbox[%d] seq %u digest 0x%08X (%s, present 0x%04X, host used %u)\n", guest_box ? "GUEST " : "", i, (unsigned)m->seq,
+           (unsigned)m->digest, empty ? "EMPTY" : "LETTER", (unsigned)(empty ? 0u : (unsigned)L.present), (unsigned)m->used_count);
     goto fed_check;
 refused:
     /* A refused slot is still a RECEIVED slot (the host resends only on a seq change, so waiting for a good copy would keep the mailbox closed for the whole session):
@@ -29989,15 +30999,16 @@ refused:
         }
     }
     mMl_clear_mail(&s_mbox_shadow[i]);
-    if (h >= 0) {
-        mMl_clear_mail(&Save_Get(homes[h]).mailbox[i]);
+    if (tgt != NULL) {
+        mMl_clear_mail(&tgt[i]);
     }
     s_mbox_seq[i] = m->seq;
     s_mbox_mask |= (uint16_t)(1u << i);
 fed_check:
     if (!s_mbox_host_fed && (s_mbox_mask & PC_NETGAME_MBOX_ALL_MASK) == PC_NETGAME_MBOX_ALL_MASK) {
         s_mbox_host_fed = 1;
-        printf("[NET][MAIL] client: the mailbox is now HOST-FED (all %u slots received) -- the mailbox overlay may open\n", (unsigned)PC_NETGAME_MBOX_SLOTS);
+        printf("[NET][MAIL] client: the %smailbox is now HOST-FED (all %u slots received) -- the mailbox overlay may open\n", s_mbox_guest ? "GUEST " : "",
+               (unsigned)PC_NETGAME_MBOX_SLOTS);
     }
 }
 
@@ -30036,7 +31047,7 @@ static void pcnetgame_handle_client_mailbox_letter(const uint8_t* data, uint16_t
 
 static void pcnetgame_mbox_client_tick(void) {
     uint32_t now;
-    int i, h;
+    int i;
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcfa_save_ready() || Now_Private == NULL) {
         return;
     }
@@ -30056,14 +31067,16 @@ static void pcnetgame_mbox_client_tick(void) {
         return;
     }
     s_mbox_cl_next_check_ms = now;
-    h = pcnetgame_mbox_own_house();
-    if (h < 0) {
-        return;
-    }
-    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
-        if ((s_mbox_mask & (1u << i)) != 0 && memcmp(&Save_Get(homes[h]).mailbox[i], &s_mbox_shadow[i], sizeof(Mail_c)) != 0) {
-            memcpy(&Save_Get(homes[h]).mailbox[i], &s_mbox_shadow[i], sizeof(Mail_c));
-            printf("[NET][MAIL] client: local mailbox[%d] differed from the host's shadow (a local write) -- reverted\n", i);
+    {
+        Mail_c* tgt = pcnetgame_mbox_local_target(); /* guest mailbox: the guest copy, else the owned house's mailbox */
+        if (tgt == NULL || (s_mbox_guest != 0) != (tgt == s_gmbox_view)) {
+            return; /* no local mailbox, or the received slots are not this kind of mailbox */
+        }
+        for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+            if ((s_mbox_mask & (1u << i)) != 0 && memcmp(&tgt[i], &s_mbox_shadow[i], sizeof(Mail_c)) != 0) {
+                memcpy(&tgt[i], &s_mbox_shadow[i], sizeof(Mail_c));
+                printf("[NET][MAIL] client: local %smailbox[%d] differed from the host's shadow (a local write) -- reverted\n", s_mbox_guest ? "GUEST " : "", i);
+            }
         }
     }
 }
@@ -30071,14 +31084,110 @@ static void pcnetgame_mbox_client_tick(void) {
 /* 1 iff this is a READY client whose house mailbox has been fed by the host (all 10 slots received this session): the mailbox overlay / actor may open
  * and show the shadow. 0 for every other role and state (the caller combines it with its own role test: solo and the host never use it). */
 int pc_net_game_client_mailbox_usable(void) {
-    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_mbox_host_fed && pcnetgame_mbox_own_house() >= 0;
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_mbox_host_fed && !s_mbox_guest && pcnetgame_mbox_own_house() >= 0;
+}
+
+/* GUEST MAILBOX (client): 1 iff this READY client is a guest whose post office mailbox has been fed by the host (all 10 slots of the guest mailbox received). */
+static int pcnetgame_client_guest_mailbox_usable(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_mbox_host_fed && s_mbox_guest && pcnetgame_client_is_guest_player();
+}
+/* The take machinery's predicate: this client's own mailbox (house or guest copy) is host-fed. */
+static int pcnetgame_client_own_mailbox_usable(void) {
+    return pc_net_game_client_mailbox_usable() || pcnetgame_client_guest_mailbox_usable();
+}
+
+/* ---- pc_guest_mail.h seams (the overlays and the post office girl) ---- */
+Mail_c* pc_ui_mailbox(void) {
+    if (s_role == PC_NETGAME_ROLE_CLIENT && pcnetgame_client_is_guest_player()) {
+        return s_gmbox_view; /* a guest never has a now_home: its post office mailbox copy (empty until the host fed it) */
+    }
+    return Common_Get(now_home) != NULL ? Common_Get(now_home)->mailbox : NULL;
+}
+int pc_ui_mailbox_is_guest(void) {
+    return pc_ui_mailbox() == s_gmbox_view;
+}
+int pc_ui_mailbox_usable(void) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return 1;
+    }
+    return pc_ui_mailbox_is_guest() ? pcnetgame_client_guest_mailbox_usable() : pc_net_game_client_mailbox_usable();
+}
+int pc_net_game_guest_mail_offer_available(void) {
+    return pcnetgame_client_guest_mailbox_usable() && Now_Private != NULL;
+}
+int pc_net_game_guest_mail_count(void) {
+    int i, n = 0;
+    if (!pcnetgame_client_guest_mailbox_usable()) {
+        return 0;
+    }
+    for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS; i++) {
+        n += mMl_check_not_used_mail(&s_mbox_shadow[i]) != TRUE; /* the verified host copy (the view may carry a not-yet-reverted local mark) */
+    }
+    return n;
+}
+
+/* ---- Guest mailbox: the GUEST DIRECTORY as the address book / post office see it (any role) ----
+ * HOST: the host's own guest table (the same rule as the TS service 7 blob it pushes); CLIENT: the last GUEST_DIR (service 7) applied this session (an older host that
+ * never sends it = no guest listed, the previous address book); solo: none. The local player itself is never listed. */
+static int pcnetgame_guest_dir_get(PersonalID_c* out, int max) {
+    uint8_t blob[PC_NETGAME_TS_GUESTDIR_LEN];
+    int i, n = 0;
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        if (!s_host_world_ready || !pcnetgame_guest_mail_enabled()) {
+            return 0;
+        }
+        pcnetgame_ts_build_guestdir(blob);
+    } else if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        if (s_client_link != PC_NETGAME_LINK_READY || !s_ts_client_have[PC_NETGAME_TS_GUESTDIR]) {
+            return 0;
+        }
+        memcpy(blob, s_gdir_client_blob, sizeof(blob));
+    } else {
+        return 0;
+    }
+    for (i = 0; i < (int)blob[0] && i < (int)PC_NETGAME_GUESTDIR_MAX && n < max; i++) {
+        PersonalID_c pid;
+        memcpy(&pid, blob + 4 + 20 * i, 20);
+        if (Common_Get(now_private) != NULL && mPr_CheckCmpPersonalID(&pid, &Common_Get(now_private)->player_ID) == TRUE) {
+            continue; /* not oneself */
+        }
+        out[n++] = pid;
+    }
+    return n;
+}
+int pc_net_game_guest_address_list(Mail_nm_c* out, int max) {
+    PersonalID_c pids[PC_NETGAME_GUESTDIR_MAX];
+    int i, n;
+    if (out == NULL || max <= 0) {
+        return 0;
+    }
+    n = pcnetgame_guest_dir_get(pids, max < (int)PC_NETGAME_GUESTDIR_MAX ? max : (int)PC_NETGAME_GUESTDIR_MAX);
+    for (i = 0; i < n; i++) {
+        mPr_CopyPersonalID(&out[i].personalID, &pids[i]);
+        out[i].type = mMl_NAME_TYPE_PLAYER;
+    }
+    return n;
+}
+int pc_net_game_guest_address_known(const PersonalID_c* pid) {
+    PersonalID_c pids[PC_NETGAME_GUESTDIR_MAX];
+    int i, n;
+    if (pid == NULL || mPr_NullCheckPersonalID((PersonalID_c*)pid) != FALSE) {
+        return 0;
+    }
+    n = pcnetgame_guest_dir_get(pids, (int)PC_NETGAME_GUESTDIR_MAX);
+    for (i = 0; i < n; i++) {
+        if (mPr_CheckCmpPersonalID(&pids[i], (PersonalID_c*)pid) == TRUE) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* The checks of the transaction's QUEUED -> SENT step: the shadow slot still holds exactly the letter the operation began with, and a local mail slot is
  * free (the preferred one if still empty). 1 = send (the slot in *dst_out). */
 static int pcnetgame_take_try_send_check(uint8_t mbox_idx, uint32_t want24, uint8_t* dst_out) {
     int dst;
-    if (!s_take_op.active || s_take_op.done || s_take_op.mbox_idx != mbox_idx || Now_Private == NULL || !pc_net_game_client_mailbox_usable()) {
+    if (!s_take_op.active || s_take_op.done || s_take_op.mbox_idx != mbox_idx || Now_Private == NULL || !pcnetgame_client_own_mailbox_usable()) {
         return 0;
     }
     if (mMl_check_not_used_mail(&s_mbox_shadow[mbox_idx]) == TRUE || (pcnetgame_mail_be_hash(&s_mbox_shadow[mbox_idx]) & 0xFFFFFFu) != want24 ||
@@ -30135,7 +31244,7 @@ int pc_net_game_mail_take_step(int mbox_idx, int* dst_out) {
         s_take_wait_ms = 0;
         return r;
     }
-    if (!pc_net_game_client_mailbox_usable()) {
+    if (!pcnetgame_client_own_mailbox_usable()) { /* guest mailbox: a guest takes from its post office mailbox copy through the same transaction */
         s_take_last_reason = 0;
         return PC_NETGAME_TS_OP_REJECTED;
     }
@@ -30206,7 +31315,7 @@ static void pcnetgame_run_mail_take_test_hook(void) {
     if (limit <= 0 || s_stage >= 4 || s_role != PC_NETGAME_ROLE_CLIENT) {
         return;
     }
-    if (!pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL || !pc_net_game_client_mailbox_usable()) {
+    if (!pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL || !pcnetgame_client_own_mailbox_usable()) {
         return;
     }
     now = pcnetgame_now_ms();
@@ -30215,7 +31324,7 @@ static void pcnetgame_run_mail_take_test_hook(void) {
             return;
         }
         s_stage = 1;
-        printf("[NET][MAIL][TEST-ONLY] --mail-test-take: the mailbox is host-fed; taking up to %d letter(s)\n", limit);
+        printf("[NET][MAIL][TEST-ONLY] --mail-test-take: the %smailbox is host-fed; taking up to %d letter(s)\n", s_mbox_guest ? "GUEST " : "", limit);
         return;
     }
     if (s_stage == 1) {
@@ -32864,6 +33973,13 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(s_mbox_stash_valid, 0, sizeof(s_mbox_stash_valid));
     s_mbox_mask = 0;
     s_mbox_host_fed = 0;
+    s_mbox_guest = 0; /* guest mailbox: the guest copy is host-fed per session too (shown empty until the host sends it again) */
+    {
+        int k;
+        for (k = 0; k < (int)PC_NETGAME_MBOX_SLOTS; k++) {
+            mMl_clear_mail(&s_gmbox_view[k]);
+        }
+    }
     memset(s_ts_client_have, 0, sizeof(s_ts_client_have));
     s_restock.client_active = 0; /* the shop mirror is host-fed: the next HOST_CONFIG (at READY) says whether a restock is still running */
     pcnetgame_shopup_client_reset(); /* the shop upgrade mirror is host-fed too: service 6 comes again at READY */
@@ -35771,6 +36887,8 @@ void pc_net_game_poll(void) {
         pcnetgame_host_ts_tick();     /* town services: digest-poll the host's police / museum copies and push TOWN_SVC_STATE */
         pcnetgame_host_mbox_tick();   /* mail milestone 2: digest-poll the owners' house mailboxes and push MAILBOX_LETTER */
         pcnetgame_host_remail_tick(); /* mail milestone 2 (M2r): villager replies for every connected resident */
+        pcnetgame_host_guest_remail_tick(); /* guest mailbox: villager replies for every connected guest, straight into its host-held mailbox */
+        pcnetgame_host_guest_event_tick();  /* guest mailbox: villager birthday / Christmas / Valentine / goodbye letters and the museum letter for every guest */
         pcnetgame_house_host_tick();  /* furniture sync: canonical house copies, CANON_PUSH pump, commit deadlines (after the record tick: the commit shares its state) */
         pcnetgame_pdata_host_tick();  /* personal data sync (diary): page poll, PDATA_PUSH pump, commit deadline (shares the hup_* / hpush_* state of the house path) */
         pcnetgame_host_world_poll();
@@ -38186,12 +39304,19 @@ static void pcnetgame_goto_test_hook(void) {
     }
     fclose(f);
     pa = get_player_actor_withoutCheck(play);
-    if (pa == NULL || slot < 0 || (kind != 'c' && slot >= ANIMAL_NUM_MAX) || play->fb_wipe_mode != WIPE_MODE_NONE) { /* 'c': slot = the distance in front of Blathers */
+    if (pa == NULL || slot < 0 || (kind != 'c' && kind != 'g' && slot >= ANIMAL_NUM_MAX) || play->fb_wipe_mode != WIPE_MODE_NONE) { /* 'c' / 'g': slot = the distance in front of Blathers / the post girl */
         return;
     }
     remove("ac_goto.txt");
     if (kind == 'v') {
         t = Actor_info_fgName_search(&play->actor_info, Save_Get(animals)[slot].id.npc_id, ACTOR_PART_NPC);
+    } else if (kind == 'g') {
+        t = Actor_info_name_search(&play->actor_info, mAc_PROFILE_NPC_POST_GIRL, ACTOR_PART_NPC); /* "g <dist>": the post office girl (guest mailbox real test) */
+        if (t != NULL) {
+            printf("[NET][TEST-ONLY] goto g: the post girl at (%.1f, %.1f) rot 0x%04X; player parked %d units in front of her\n", (double)t->world.position.x, (double)t->world.position.z,
+                   (unsigned)(u16)t->shape_info.rotation.y, slot);
+            kind = 'c'; /* the same parking as Blathers: in front of the counter, facing north */
+        }
     } else if (kind == 'c') {
         t = Actor_info_name_search(&play->actor_info, mAc_PROFILE_NPC_CURATOR, ACTOR_PART_NPC); /* "c <dist>": Blathers (guest museum donation real test) */
     } else if (kind == 'h' || kind == 'p') {
@@ -38437,7 +39562,7 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 line[0] = 0;
             }
             fclose(f);
-            if (sscanf(line, "%d %15s %f", &id, cmd, &a) != 3 || (strcmp(cmd, "mash") != 0 && strcmp(cmd, "mashc") != 0 && strcmp(cmd, "mashf") != 0)) {
+            if (sscanf(line, "%d %15s %f", &id, cmd, &a) != 3 || (strcmp(cmd, "mash") != 0 && strcmp(cmd, "mashc") != 0 && strcmp(cmd, "mashf") != 0 && strcmp(cmd, "mashm") != 0)) {
                 return 0; /* not a mash: left in the file for the town path */
             }
             remove(s_ap_file);
@@ -38449,6 +39574,48 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             s_ap.active = 1;
             printf("[AUTO] mash %d indoors for %.1f s: player main=%d demo=%d type=%d msg_index=%d\n", id, (double)a, mPlib_get_player_actor_main_index(gamePT), mDemo_CheckDemo(),
                    mDemo_CheckDemoType(), mMsg_Get_base_window_p()->main_index);
+        }
+        if (s_ap.active && strcmp(s_ap.cmd, "mashm") == 0) {
+            /* "mashm" (guest mailbox real test): A presses; a choice window takes "Check my mail." when the row on screen carries it (pc_post_mail_more_choice), else its LAST
+             * (cancel) option; while a submenu is open (the mailbox overlay) NO A is pressed: the overlay's own automatic transfer runs (each letter = one MAIL_TAKE), and once the
+             * guest copy is empty (or 12 s passed) B closes it. The rest of the dialogue (the closing row) is dismissed with A. */
+            static uint32_t s_sub_since;
+            static int s_sub_seen_id = -1; /* the command id whose overlay already opened and closed: from then on A only while a message window is up (no new talk) */
+            static uint32_t s_sub_closed_ms;
+            GAME_PLAY* pl = (GAME_PLAY*)gamePT;
+            if (mChoice_check_main_normal(mChoice_Get_base_window_p())) {
+                mChoice_c* ch = mChoice_Get_base_window_p();
+                const int mc = pc_post_mail_more_choice(mMsg_Get_msg_num(mMsg_Get_base_window_p()));
+                if (mc >= 0 && mc < ch->data.choice_num) {
+                    ch->selected_choice_idx = mc;
+                } else if (ch->data.choice_num > 0) {
+                    ch->selected_choice_idx = ch->data.choice_num - 1;
+                }
+            }
+            if ((float)(now - s_ap.t0) >= s_ap.tx) {
+                printf("[AUTO] mashm %d end: player main=%d demo=%d submenu=%d\n", s_ap.id, mPlib_get_player_actor_main_index(gamePT), mDemo_CheckDemo(), (int)pl->submenu.open_flag);
+                pcnetgame_ap_done("ok", "indoors");
+                return 0;
+            }
+            if (pl->submenu.open_flag) {
+                if (s_sub_since == 0) {
+                    s_sub_since = now | 1u;
+                    printf("[AUTO] mashm %d: a submenu opened (guest mailbox copy holds %d letter(s))\n", s_ap.id, pc_net_game_guest_mail_count());
+                }
+                if ((pc_net_game_guest_mail_count() == 0 && (uint32_t)(now - s_sub_since) >= 3000u) || (uint32_t)(now - s_sub_since) >= 12000u) {
+                    return (((now - s_ap.t0) / 250u) & 1u) ? 4u : 0u; /* B: close the overlay */
+                }
+                return 0;
+            }
+            if (s_sub_since != 0) {
+                s_sub_seen_id = s_ap.id; /* the overlay closed */
+                s_sub_closed_ms = now | 1u;
+            }
+            s_sub_since = 0;
+            if (s_sub_seen_id == s_ap.id && (uint32_t)(now - s_sub_closed_ms) >= 2500u && mMsg_Get_base_window_p()->main_index == 0) {
+                return 0; /* the closing row was read (its window is gone): never start another talk */
+            }
+            return (((now - s_ap.t0) / 250u) & 1u) ? 1u : 0u;
         }
         if (s_ap.active && (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashc") == 0 || strcmp(s_ap.cmd, "mashf") == 0)) {
             if (strcmp(s_ap.cmd, "mashf") == 0 && mChoice_check_main_normal(mChoice_Get_base_window_p())) {
@@ -39387,7 +40554,8 @@ static void pcnetgame_museum_warp_test_hook(void) {
             return;
         }
         s_which = strncmp(e, "painting", 8) == 0 ? 1 : strncmp(e, "fossil", 6) == 0 ? 2 : strncmp(e, "insect", 6) == 0 ? 3 : strncmp(e, "fish", 4) == 0 ? 4 : strncmp(e, "needlework", 10) == 0 ? 5
-                  : strncmp(e, "entrance", 8) == 0 ? 6 : 0; /* entrance: in front of Blathers' counter (guest museum donation real test) */
+                  : strncmp(e, "entrance", 8) == 0 ? 6 : strncmp(e, "postoffice", 10) == 0 ? 7 : 0; /* entrance: in front of Blathers' counter (guest museum donation real test); postoffice: the
+                                                                                                      * post office (guest mailbox real test), with the vanilla post office door data */
         if (s_which == 0) {
             return;
         }
@@ -39413,13 +40581,14 @@ static void pcnetgame_museum_warp_test_hook(void) {
         s_t_elig = now ? now : 1;
     }
     if ((uint32_t)(now - s_t_elig) >= (uint32_t)s_delay) {
-        static const Door_data_c k_doors[6] = {
+        static const Door_data_c k_doors[7] = {
             { SCENE_MUSEUM_ROOM_PAINTING, 4, 0, 0, { 280, 0, 480 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_FOSSIL, 4, 0, 0, { 280, 0, 480 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_INSECT, 6, 0, 0, { 520, 0, 560 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_FISH, 2, 0, 0, { 120, 0, 560 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_NEEDLEWORK, mSc_DIRECT_NORTH, 0, 0, { 300, 0, 380 }, EMPTY_NO, 2, { 0, 0, 0 } }, /* Able Sisters */
             { SCENE_MUSEUM_ENTRANCE, mSc_DIRECT_NORTH, 0, 0, { 240, 0, 200 }, EMPTY_NO, 2, { 0, 0, 0 } }, /* the entrance player start, facing Blathers */
+            { SCENE_POST_OFFICE, 4, 0, 0, { 160, 0, 300 }, EMPTY_NO, 1, { 0, 0, 0 } }, /* the vanilla post office door data (ac_post_office_move.c_inc) */
         };
         Door_data_c in = k_doors[s_which - 1];
         Door_data_c* out = Common_GetPointer(structure_exit_door_data);
@@ -41459,6 +42628,7 @@ extern int  pc_mp_promote_create(const void* guest_rec, const void* guest_key, i
 extern void pc_mp_promote_rollback(void);
 extern void pc_mp_promote_commit(void);
 extern void pc_mp_promote_set_paid(int paid); /* pc_m_card.c: the NEXT pc_mp_promote_create starts the resident with loan 0 (the guest paid the whole house price) */
+extern void pc_mp_promote_set_guest_mailbox(const void* box, int n); /* pc_m_card.c: the guest's host-held mailbox letters for the NEXT pc_mp_promote_create (guest mailbox) */
 extern int  pc_save_write_authoritative(void);
 extern int  pc_save_write_authoritative_durable(void); /* pc_m_card.c: FALSE unless the GCI was REALLY written */
 extern int  pc_save_can_be_durable(void);              /* pc_m_card.c: a loaded, non-sanitized town save in a non-client process */
@@ -41684,6 +42854,9 @@ static int pcnetgame_promote_exec(const char* gsel, int gfixed, const char* ssel
         PROMOTE_REFUSE("refused: no OS randomness for the resident token (nothing was changed)");
     }
     pc_mp_promote_set_paid((flags & PROMOTE_PAID) != 0); /* the paid purchase: the new resident starts with loan 0 (consumed by the next pc_mp_promote_create) */
+    /* guest mailbox: the letters waiting in the guest's host-held mailbox move to the new resident's house mailbox (overflow: post office, then carried letters), atomically
+     * with the promotion (rolled back with it). The guest table keeps its copy until the guest entry is retired below, so a refused / rolled back promotion loses nothing. */
+    pc_mp_promote_set_guest_mailbox(s_guest_mbox[g].box, (int)PC_NETGAME_MBOX_SLOTS);
     if (!pc_mp_promote_create(&s_guest_rec[g], &s_guest[g].key, s, h, err, sizeof(err))) {
         PROMOTE_REFUSE("refused: %s (nothing was changed)", err);
     }

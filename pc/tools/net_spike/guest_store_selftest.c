@@ -216,7 +216,8 @@ int main(int argc, char** argv) {
         check("bad magic is refused", pc_mp_gs_parse(buf, PC_MP_GS_FILE_SIZE, &b) == PC_MP_GST_ERR_MAGIC);
         memcpy(buf, good, sizeof(good));
         buf[8] = 2;
-        check("an older / newer version is refused, never reinterpreted", pc_mp_gs_parse(buf, PC_MP_GS_FILE_SIZE, &b) == PC_MP_GST_ERR_VERSION_OLD && (buf[8] = 4, pc_mp_gs_parse(buf, PC_MP_GS_FILE_SIZE, &b) == PC_MP_GST_ERR_VERSION_FUTURE));
+        /* guest mailbox: version 4 is now this build's newest (an extension block follows the entry), so 5 is the "newer" one */
+        check("an older / newer version is refused, never reinterpreted", pc_mp_gs_parse(buf, PC_MP_GS_FILE_SIZE, &b) == PC_MP_GST_ERR_VERSION_OLD && (buf[8] = 5, pc_mp_gs_parse(buf, PC_MP_GS_FILE_SIZE, &b) == PC_MP_GST_ERR_VERSION_FUTURE));
         memcpy(buf, good, sizeof(good));
         check("truncated / oversized files are refused", pc_mp_gs_parse(good, PC_MP_GS_FILE_SIZE - 1, &b) == PC_MP_GST_ERR_TRUNCATED && pc_mp_gs_parse(good, 10, &b) == PC_MP_GST_ERR_TRUNCATED &&
               (buf[PC_MP_GS_FILE_SIZE] = 0, pc_mp_gs_parse(buf, PC_MP_GS_FILE_SIZE + 1, &b) == PC_MP_GST_ERR_SHAPE));
@@ -800,6 +801,175 @@ int main(int argc, char** argv) {
         ai.guest_src = NULL;
         (void)pc_mp_membership_resolve(&ai, &v);
         check("admission: no guest source (untrusted store) = no guest slot is ever matched", v.guest_slot == -1);
+    }
+
+    /* ---------------- guest mailbox: store v4 (extension block) ---------------- */
+    put_path(dir, sizeof(dir), "store_mbox");
+    rm_tree(dir);
+    {
+        static PCMpGsRecord m, back;
+        static uint8_t fb[PC_MP_GS_FILE_MAX + 8], good4[PC_MP_GS_FILE_MAX];
+        uint32_t d3, d4;
+        size_t n = 0;
+        FILE* f;
+        check("v4 sizes: the extension block is 4 + 2988 bytes, a v4 file is 12396 bytes",
+              PC_MP_GS_EXT_LEN == 2988 && PC_MP_GS_FILE_SIZE_V4 == 12396 && PC_MP_GS_FILE_MAX == PC_MP_GS_FILE_SIZE_V4);
+        memset(&m, 0, sizeof(m));
+        seq_id_source(m.id);
+        m.generation = 4;
+        make_entry(&m.e, 77);
+        check("an empty mailbox serializes as plain v3 (9404 bytes, version 3: an older build still reads it)", pc_mp_gs_serialized_size(&m) == PC_MP_GS_FILE_SIZE &&
+              pc_mp_gs_serialize(&m, fb, sizeof(fb)) == PC_MP_GST_OK && fb[8] == 3 && pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE, &back) == PC_MP_GST_OK && back.mbox_mask == 0);
+        d3 = pc_mp_gs_ext_digest(&m, pc_mp_gs_entry_digest(&m.e));
+        check("ext digest: an empty mailbox keeps the plain entry digest (a v3 guest is not rewritten at the upgrade)", d3 == pc_mp_gs_entry_digest(&m.e));
+        for (i = 0; i < PC_MP_GS_MAIL_SIZE; i++) {
+            m.mbox[2][i] = (uint8_t)(i * 7 + 1);
+            m.mbox[9][i] = (uint8_t)(i * 13 + 5);
+        }
+        m.mbox_mask = (uint16_t)((1u << 2) | (1u << 9));
+        d4 = pc_mp_gs_ext_digest(&m, pc_mp_gs_entry_digest(&m.e));
+        check("ext digest: a letter in the mailbox changes it", d4 != d3);
+        m.mbox[9][100] ^= 1;
+        check("ext digest: one letter byte changes it", pc_mp_gs_ext_digest(&m, pc_mp_gs_entry_digest(&m.e)) != d4);
+        m.mbox[9][100] ^= 1;
+        ok = pc_mp_gs_serialized_size(&m) == PC_MP_GS_FILE_SIZE_V4 && pc_mp_gs_serialize(&m, good4, sizeof(good4)) == PC_MP_GST_OK && good4[8] == 4;
+        ok = ok && pc_mp_gs_parse(good4, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_OK && back.mbox_mask == m.mbox_mask &&
+             memcmp(back.mbox, m.mbox, sizeof(m.mbox)) == 0 && memcmp(&back.e, &m.e, sizeof(m.e)) == 0 && back.generation == 4;
+        check("v4 round trip: version 4, 12396 bytes, the entry and both letters (slots 2 and 9) come back byte for byte", ok);
+        check("a v4 buffer too small for the block is refused at serialize (no partial write)", pc_mp_gs_serialize(&m, fb, PC_MP_GS_FILE_SIZE) == PC_MP_GST_ERR_SHAPE);
+        memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+        fb[PC_MP_GS_FILE_SIZE + 500] ^= 1;
+        check("v4: a flipped byte in a letter fails the CRC (the block is covered)", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_ERR_CRC);
+        check("v4: a truncated file (only the v3 length) is refused", pc_mp_gs_parse(good4, PC_MP_GS_FILE_SIZE, &back) == PC_MP_GST_ERR_TRUNCATED &&
+              pc_mp_gs_parse(good4, PC_MP_GS_FILE_SIZE_V4 - 1, &back) == PC_MP_GST_ERR_TRUNCATED);
+        memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+        fb[PC_MP_GS_FILE_SIZE_V4] = 0;
+        check("v4: an oversized file is refused", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4 + 1, &back) == PC_MP_GST_ERR_SHAPE);
+        {
+            /* field rules: re-sign every mutated buffer so the CRC passes and the RULE is what refuses it */
+            const size_t xo = PC_MP_GS_FILE_SIZE - 4; /* ext_len field */
+            uint32_t crc;
+#define RESIGN()                                                                     \
+    do {                                                                             \
+        crc = pc_mp_records_crc32(fb, PC_MP_GS_FILE_SIZE_V4 - 4);                    \
+        fb[PC_MP_GS_FILE_SIZE_V4 - 4] = (uint8_t)crc;                                \
+        fb[PC_MP_GS_FILE_SIZE_V4 - 3] = (uint8_t)(crc >> 8);                         \
+        fb[PC_MP_GS_FILE_SIZE_V4 - 2] = (uint8_t)(crc >> 16);                        \
+        fb[PC_MP_GS_FILE_SIZE_V4 - 1] = (uint8_t)(crc >> 24);                        \
+    } while (0)
+            memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+            fb[xo + 4] = 2; /* ext_version 2 */
+            RESIGN();
+            check("v4: an unknown extension version is refused as FUTURE, never reinterpreted", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_ERR_VERSION_FUTURE);
+            memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+            fb[xo] = (uint8_t)(fb[xo] + 4); /* ext_len 2992 */
+            RESIGN();
+            check("v4: a wrong extension length is refused (SHAPE)", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_ERR_SHAPE);
+            memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+            fb[xo + 9] |= 0x04; /* mask bit 10 */
+            RESIGN();
+            check("v4: a mailbox mask bit above slot 9 is refused (FIELD)", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_ERR_FIELD);
+            memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+            fb[xo + 12 + 0 * PC_MP_GS_MAIL_SIZE + 3] = 0x11; /* bytes in the UNUSED slot 0 */
+            RESIGN();
+            check("v4: an unused slot that holds bytes is refused (FIELD)", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_ERR_FIELD);
+            memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+            memset(fb + xo + 12 + 2 * PC_MP_GS_MAIL_SIZE, 0, PC_MP_GS_MAIL_SIZE); /* the USED slot 2 all zero */
+            RESIGN();
+            check("v4: a used slot without bytes is refused (FIELD)", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_ERR_FIELD);
+            memcpy(fb, good4, PC_MP_GS_FILE_SIZE_V4);
+            memset(fb + xo + 8, 0, 4); /* v4 with an EMPTY mask and empty slots: readable (nobody writes it, but it is not corrupt) */
+            memset(fb + xo + 12, 0, (size_t)PC_MP_GS_MBOX_SLOTS * PC_MP_GS_MAIL_SIZE);
+            RESIGN();
+            check("v4 with an empty mask is read as an empty mailbox", pc_mp_gs_parse(fb, PC_MP_GS_FILE_SIZE_V4, &back) == PC_MP_GST_OK && back.mbox_mask == 0);
+#undef RESIGN
+        }
+        {
+            PCMpGsRecord bad = m;
+            bad.mbox[2][0] = 0;
+            memset(bad.mbox[2], 0, PC_MP_GS_MAIL_SIZE);
+            check("serialize refuses a used slot without bytes (never writes what it could not read back)", pc_mp_gs_serialize(&bad, fb, sizeof(fb)) == PC_MP_GST_ERR_FIELD);
+            bad = m;
+            bad.mbox_mask |= 0x0400;
+            check("serialize refuses a mask bit above slot 9", pc_mp_gs_serialize(&bad, fb, sizeof(fb)) == PC_MP_GST_ERR_SHAPE);
+        }
+        /* save / load / rotation across versions */
+        {
+            static PCMpGsRecord v3;
+            Seen s2;
+            v3 = m;
+            v3.mbox_mask = 0;
+            memset(v3.mbox, 0, sizeof(v3.mbox));
+            v3.generation = 1;
+            ok = pc_mp_gs_save(dir, &v3) == PC_MP_GST_OK;
+            pc_mp_gs_path(dir, v3.id, 0, p, sizeof(p));
+            f = fopen(p, "rb");
+            n = f ? fread(fb, 1, sizeof(fb), f) : 0;
+            if (f) fclose(f);
+            check("a guest with an empty mailbox is written as a v3 file on disk (9404 bytes)", ok && n == PC_MP_GS_FILE_SIZE && fb[8] == 3);
+            m.generation = 2;
+            ok = pc_mp_gs_save(dir, &m) == PC_MP_GST_OK;
+            f = fopen(p, "rb");
+            n = f ? fread(fb, 1, sizeof(fb), f) : 0;
+            if (f) fclose(f);
+            check("the first mailbox write rewrites the guest lazily as v4 (12396 bytes); the v3 generation rotates to .bak1", ok && n == PC_MP_GS_FILE_SIZE_V4 && fb[8] == 4 &&
+                  (pc_mp_gs_path(dir, m.id, 1, p2, sizeof(p2)), exists(p2)));
+            {
+                static PCMpGsRecord got;
+                load(dir, &s2, &li);
+                ok = s2.n == 1 && !li.untrusted && li.from_backup == 0;
+                n = 0;
+                f = fopen(p, "rb");
+                n = f ? fread(fb, 1, sizeof(fb), f) : 0;
+                if (f) fclose(f);
+                ok = ok && pc_mp_gs_parse(fb, n, &got) == PC_MP_GST_OK && got.mbox_mask == m.mbox_mask && memcmp(got.mbox, m.mbox, sizeof(m.mbox)) == 0;
+                check("the v4 guest loads back trusted, mailbox intact (mailbox XOR mail[]: one file holds both)", ok);
+            }
+            /* the mailbox empties again: written as v3 */
+            v3.generation = 3;
+            ok = pc_mp_gs_save(dir, &v3) == PC_MP_GST_OK;
+            f = fopen(p, "rb");
+            n = f ? fread(fb, 1, sizeof(fb), f) : 0;
+            if (f) fclose(f);
+            check("an emptied mailbox is written as v3 again (an older build can read the guest again)", ok && n == PC_MP_GS_FILE_SIZE && fb[8] == 3);
+        }
+        /* a v4 primary whose CRC is broken falls back to the readable .bak1 (v4): the corrupt rules of v3 apply unchanged */
+        {
+            Seen s3;
+            m.generation = 4;
+            pc_mp_gs_save(dir, &m); /* primary v4, .bak1 v3 (gen 3), .bak2 v4 (gen 2) */
+            pc_mp_gs_path(dir, m.id, 0, p, sizeof(p));
+            flip(p, PC_MP_GS_FILE_SIZE + 100); /* a letter byte of the primary */
+            load(dir, &s3, &li);
+            check("a v4 primary with a damaged letter: CRC refused, preserved aside, the guest recovered from .bak1, trusted", s3.n == 1 && s3.backup == 1 && li.moved_aside == 1 && !li.untrusted);
+        }
+        /* DOWNGRADE healing: what an older build does to a v4 file (moves every generation it cannot read aside to *.corrupt-*) is healed by this build */
+        rm_tree(dir);
+        {
+            Seen s4;
+            char q[1000], hex[33];
+            m.generation = 9;
+            ok = pc_mp_gs_save(dir, &m) == PC_MP_GST_OK;
+            pc_mp_gs_path(dir, m.id, 0, p, sizeof(p));
+            snprintf(q, sizeof(q), "%s.corrupt-20260101-000000", p); /* the name an older build gives it */
+            ok = ok && rename(p, q) == 0;
+            load(dir, &s4, &li);
+            pc_mp_gs_id_hex(m.id, hex);
+            check("downgrade healing: a v4 file an older build set aside (no other generation) is restored as the primary and loaded, trusted; the preserved copy is kept",
+                  ok && s4.n == 1 && li.restored == 1 && !li.untrusted && li.stray_corrupt == 0 && exists(p) && exists(q));
+            load(dir, &s4, &li);
+            check("downgrade healing is a one-time step: the next load reads the restored primary (restored 0), still trusted", s4.n == 1 && li.restored == 0 && !li.untrusted);
+            /* a preserved file that does NOT parse stays a stray -> UNTRUSTED (the old rule) */
+            rm_tree(dir);
+            m.generation = 10;
+            pc_mp_gs_save(dir, &m);
+            ok = rename(p, q) == 0;
+            flip(q, 300);
+            load(dir, &s4, &li);
+            check("a preserved file that does not parse is never restored: UNTRUSTED as before", ok && s4.n == 0 && li.restored == 0 && li.untrusted && li.stray_corrupt == 1);
+        }
+        rm_tree(dir);
+        (void)d3;
     }
 
     printf("RESULT passed=%d failed=%d\n", s_pass, s_fail);

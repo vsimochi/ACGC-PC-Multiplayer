@@ -11,6 +11,9 @@
 #include "m_player.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#include "pc_guest_mail.h" /* guest mailbox: "Check my mail." for a guest (offer, choice patch, the guest mailbox count) */
+#include "pc_nook_house.h" /* guest mailbox: pc_nook_msg_id (the generated closing rows) */
+#include <stdio.h>
 #endif
 
 void aPG_Set_continue_msg_num(NPC_POSTGIRL_ACTOR *postgirl, int msg);

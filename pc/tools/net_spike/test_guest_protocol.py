@@ -113,8 +113,11 @@ def parse_guest_store(d):
     for fn in sorted(glob.glob(os.path.join(d, "*.gst"))):
         with open(fn, "rb") as f:
             b = f.read()
-        assert len(b) == 32 + 16 + GUEST_ENTRY + 4, "guest file size %d" % len(b)
-        assert b[:8] == b"ACMPGS1\x00" and struct.unpack("<I", b[8:12])[0] == 3
+        ver = struct.unpack("<I", b[8:12])[0]
+        # guest mailbox: v4 = the v3 layout + one extension block (u32 ext_len 2988, u32 ext_version 1, u32 mask, 10 x 298 letters) before the CRC, written only while
+        # the guest's host-held mailbox holds a letter
+        assert len(b) == 32 + 16 + GUEST_ENTRY + 4 + (4 + 2988 if ver == 4 else 0), "guest file size %d (version %d)" % (len(b), ver)
+        assert b[:8] == b"ACMPGS1\x00" and ver in (3, 4)
         assert struct.unpack("<I", b[-4:])[0] == (zlib.crc32(b[:-4]) & 0xFFFFFFFF), "guest file crc32"
         gen = max(gen, struct.unpack("<I", b[20:24])[0])
         e = b[48:48 + GUEST_ENTRY]
