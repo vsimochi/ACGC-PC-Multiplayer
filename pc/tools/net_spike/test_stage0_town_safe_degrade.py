@@ -190,7 +190,9 @@ def main():
     cm = read("src/actor/npc/ac_npc_curator_move.c_inc")
     ow = func_body(cm, r"\nstatic void aCR_msg_win_open_wait\(NPC_CURATOR_ACTOR\* curator, GAME_PLAY\* play\) \{")
     check("S0-4: aCR_msg_win_open_wait found", bool(ow), results)
-    g = ow.find("pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && act_idx >= 16")
+    # guest museum donation fix (pin updated deliberately): the branch is also entered while a transaction is awaited, so the row decided BEFORE the
+    # begin stays frozen (the museum mirror of the same donation arrives with the RESULT and would re-derive an "already donated" row)
+    g = ow.find("pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && (act_idx >= 16 || aCR_ts_waiting)")
     fish = ow.find("act_idx = aCR_get_idx_to_donate_fish(item);")
     use = ow.find("donate_act_p = &donate_act[act_idx];")
     setmsg = ow.find("mMsg_Set_continue_msg_num(msg_p, donate_act_p->msg_no);")
@@ -202,6 +204,9 @@ def main():
           and "ts_begin < 0" in ow[beg - 80:poll] and ow[g:poll].count("act_idx = 2;") == 1
           and "PC_NETGAME_TS_OP_PENDING" in ow[poll - 80:use] and "return;" in ow[poll:use]
           and "ts_res != PC_NETGAME_TS_OP_APPLIED" in ow[poll:use] and ow[poll:use].count("act_idx = 2;") == 1, results)
+    check("S0-4: the row is FROZEN at the begin (aCR_ts_act_idx) and restored on every awaited frame before PENDING returns, so APPLIED proceeds with the put-away row "
+          "decided on the pre-donation museum state", "aCR_ts_act_idx = act_idx;" in ow[beg:poll] and "act_idx = aCR_ts_act_idx;" in ow[poll:use]
+          and ow.index("act_idx = aCR_ts_act_idx;") < ow.index("PC_NETGAME_TS_OP_PENDING"), results)
     check("S0-4: the client branch itself never commits the museum bit or touches the pocket (the pocket changes only in the host-APPLIED apply step; the bit arrives by mirror)",
           "mMmd_RequestMuseumDisplay" not in ow and "mPr_SetPossessionItem" not in ow and "inventory" not in ow, results)
     check("S0-4: row 2 is the existing return-demo refusal row; rows >= 16 are the put-away rows",

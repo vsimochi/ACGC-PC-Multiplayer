@@ -14,7 +14,8 @@ Reads pc_net_game.c / pc_mp_guests.[ch] / pc_m_card.c / net_spike_lib.py and che
       is admitted only for an UNKNOWN identity with a valid EXT guest claim; a guest-flagged claim on a resident is refused; the key checks (home land,
       resident / house-owner collision, IDENTITY <-> EXT consistency); the token rules (required for a known key, plain memcmp, minted by the OS CSPRNG,
       never logged); the order mint -> durable write -> ACK -> TOKEN
-  D   house services: museum donation / mail send / mail take refuse a guest slot (NO_DONOR_SLOT) before any index is derived; the shop is NOT refused
+  D   house services: mail send / mail take refuse a guest slot (NO_DONOR_SLOT) before any index is derived; museum donation refuses only a guest slot WITHOUT a
+      record (guest museum donation: a guest with a record donates, donor nibble 5); the shop is NOT refused
   P   persistence: guests.dat only through pc_mp_guests_load/save, never .gci / card_*, written on mint (durable), by the GCI-save hook and never while
       UNTRUSTED; pc_m_card.c is unchanged (no change to the GCI path)
   K   client: IDENTITY_EXT only for a foreigner (player_no >= mPr_FOREIGNER) and before IDENTITY; IDENTITY_TOKEN persists the token at first contact and
@@ -244,9 +245,11 @@ def main():
     ck("A every record / txn / grant / town-service handler gets its slot from pcnetgame_rec_gate() (never from a message): 6 gate calls outside the gate itself + the record handlers",
        len(re.findall(r"pcnetgame_rec_gate\(peer", c)) >= 10 and "pcnetgame_rec_gate(peer, 0, 0)" in fb("pcnetgame_handle_host_txn_commit")
        and "pcnetgame_rec_gate(peer, 0, 0)" in fb("pcnetgame_x3_grant") and "pcnetgame_rec_gate(peer, 0, 0)" in fb("pcnetgame_handle_host_ts_txn"))
-    ck("A the museum donation refuses a guest slot (idx outside PLAYER_NUM -> NO_DONOR_SLOT) and Common player_no is only ever set to a resident slot",
-       "if (idx < 0 || idx >= PLAYER_NUM) {" in fb("pcnetgame_handle_host_ts_txn") and "NO_DONOR_SLOT" in fb("pcnetgame_handle_host_ts_txn")
-       and fb("pcnetgame_handle_host_ts_txn").index("idx >= PLAYER_NUM") < fb("pcnetgame_handle_host_ts_txn").index("Common_Get(player_no) = (u8)idx"))
+    # guest museum donation (pin updated deliberately): a guest slot WITH a guest record now donates (donor nibble 5); NO_DONOR_SLOT is kept for a guest slot
+    # without a record; the commit never writes Common_Get(player_no) any more (the donor nibble comes from the gate index; test_guest_museum_src.py pins the rest)
+    ck("A the museum donation refuses only a slot without a record (idx < 0, or a guest slot whose record does not exist -> NO_DONOR_SLOT) and never writes Common player_no",
+       "if (idx < 0 || (idx >= PLAYER_NUM && !pcnetgame_rec_txn_idx_ok(idx))) {" in fb("pcnetgame_handle_host_ts_txn") and "NO_DONOR_SLOT" in fb("pcnetgame_handle_host_ts_txn")
+       and not re.search(r"Common_Get\(player_no\)\s*=[^=]", fb("pcnetgame_handle_host_ts_txn")))
     ts = fb("pcnetgame_handle_host_ts_txn")
     shop = ts[ts.index("if (is_shop) {"):ts.index("} else if (is_donate) {")]
     ck("D the SHOP is NOT refused for a guest (no PLAYER_NUM test in the shop branch): guests are full participants of buying / selling", "PLAYER_NUM" not in shop)

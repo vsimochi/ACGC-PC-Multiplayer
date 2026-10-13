@@ -203,7 +203,7 @@ Bounded grep of the other `private_data[player_no]` / `Common_Get(player_no)` in
 
 ### G5.1 - refusals (nothing is lost or duplicated; the client never mutates pockets without a host APPLIED)
 
-* **Museum donation (client guard, new):** `pc_net_game_ts_begin_museum_donate` returns 0 for a CLIENT guest before anything is queued or sent (log `MUSEUM_DONATE refused locally`). The curator's existing code maps 0 onto its give-back row (row 2: the item stays with the player). Before G5 the same outcome came only from the host (`NO_DONOR_SLOT`) after a round trip. The host refusal stays (authoritative, not journaled, nothing mutated).
+* **Museum donation (client guard) -- SUPERSEDED by [Guest museum donation](#guest-museum-donation-host-authoritative-donor-nibble-5):** the guard was removed; guests now donate. Original G5.1 text: `pc_net_game_ts_begin_museum_donate` returns 0 for a CLIENT guest before anything is queued or sent (log `MUSEUM_DONATE refused locally`). The curator's existing code maps 0 onto its give-back row (row 2: the item stays with the player). Before G5 the same outcome came only from the host (`NO_DONOR_SLOT`) after a round trip. The host refusal stays (authoritative, not journaled, nothing mutated).
 * **Mail to a player (client guard, new):** `pc_net_game_mail_begin_send` returns 0 for a CLIENT guest (log `MAIL_SEND refused locally`); the post girl's existing row 1 ("no such address") hands the letter back; the slot is never touched. Letters to villagers use the MAIL_REQUEST path and are unchanged. Host: `NO_DONOR_SLOT` stays.
 * **Mailbox take / read, house entry:** unchanged and already safe: a guest owns no house (`pcnetgame_mbox_house_of` walks `homes[]` only), so `pc_net_game_client_mailbox_usable()` is false and the mailbox stays closed; the vanilla foreigner branch makes the doors knock only.
 * **Catalog ordering:** already refused for EVERY network client (guests included) by the earlier town-services batch: `aNSC_msg_win_open_wait2` forces Nook's ORDER_UNAVAILABLE row before any bell is taken, and `aNSC_order_check` defends with ORDER_CANCEL before an order slot is written. No change was needed; there is no host path that could deliver a guest's order (the SHARED `catalog_orders` range is only legality-checked, the post office walks `private_data[]`).
@@ -223,11 +223,11 @@ Bounded grep of the other `private_data[player_no]` / `Common_Get(player_no)` in
 | disconnect between COMMIT and RESULT (kill / lost result), reconnect with the token | supported: journal replay, no duplicate item / bell, host record == client | scripted (g5 K, D) |
 | villager talk / friendship / letters TO villagers | supported (keyed by the guest key) | scripted (test_guest_protocol X, pre-existing) |
 | birthday scheduling, spirit catch, discarding an inventory letter | fixed (no out-of-range read / NULL math) | source audit (g5 src A) |
-| museum donation | refused (local give-back + host NO_DONOR_SLOT) | source audit (g5 src B) + scripted host refusal (pre-existing) |
+| museum donation | **supported** (host-authoritative, donor nibble 5; see "Guest museum donation") -- was: refused (G5.1) | source audit (test_guest_museum_src) + scripted (test_guest_museum_protocol) + real `--guest` client (test_guest_museum_real) |
 | mail to a player | refused (local "no such address" row + host NO_DONOR_SLOT) | source audit + scripted host refusal (pre-existing) |
 | mailbox take / read, house / room entry | refused (no house) | source audit (g5 src C) |
 | catalog ordering | refused (Nook's ORDER_UNAVAILABLE, all clients) | source audit (g5 src C) |
-| villager -> guest letters, museum / mail for guests, bank / loan UI, birthday calendar | deferred | -- |
+| villager -> guest letters, mail for guests, bank / loan UI, birthday calendar | deferred | -- |
 
 Exact results (disposable fixtures only, ONE build, protocol version unchanged, no wire change):
 
@@ -1298,7 +1298,7 @@ Not run: the full suites, `test_house_purchase_real.py` / `test_promotion_relaun
 ## Deferred
 
 * Town transfer from the host (so a guest needs no local copy), in-game profile creation UI (vanilla name editor), changing the look of an existing guest, villager -> guest
-  letters, museum / mail / bank for guests, a real-client gameplay run for guests (needs UI automation), the deferred player_no 4 indexed uses listed under G5.0, an additive REJECT_INFO wire message (deliberately NOT implemented in G6: the frozen reject reasons are mapped to text locally), a soak test with 8 real clients (G4 follow-up),
+  letters, mail / bank for guests (museum donation: done, see "Guest museum donation"), a real-client gameplay run for guests (needs UI automation), the deferred player_no 4 indexed uses listed under G5.0, an additive REJECT_INFO wire message (deliberately NOT implemented in G6: the frozen reject reasons are mapped to text locally), a soak test with 8 real clients (G4 follow-up),
   encrypted / challenge-response token handshake, a persisted operator recovery flag.
 
 ### Own-room ground pickup (client, own player house)
@@ -1328,7 +1328,7 @@ What a guest can do today (evidence tier in brackets):
   binds it as the foreigner without the visitor gateway, and walks the vanilla train arrival at the station [real: G3 / G4 arrival and adoption; the cutscene and the title click are NOT visually verified].
 * Be admitted by the host as a guest (never a resident), receive a host-minted token at first contact, return with it and get the SAME record back (also after a host restart, after an abrupt guest kill, with several
   guests at once up to the `max_guests` cap) [scripted + real: G1, G4, G6].
-* Play with the guest record owned by the host: pickup / drop / bury / dig / shop buy and sell / police / catch / villager talk and letters to villagers are accepted and journalled; museum donation, mail to players,
+* Play with the guest record owned by the host: pickup / drop / bury / dig / shop buy and sell / police / catch / villager talk and letters to villagers are accepted and journalled; museum donation is accepted since "Guest museum donation" (donor nibble 5); mail to players,
   mailbox, house entry, catalog ordering are refused with the game's own refusal rows [scripted + source audit: G5; no real-client gameplay run].
 * Get a readable reason when the join fails (server full / guest limit, wrong town, protocol version, token problems, host unreachable) on screen and in the log [real: the cap refusal and the home-land refusal; the
   other texts by source audit; drawing not visually verified: G6.1].
@@ -1345,7 +1345,7 @@ Known limitations that materially affect play (all documented above and in "Know
 4. The arrival cutscene (train, station master), the title-menu "Join as Guest" click and the new on-screen messages were never seen by a person or a screenshot; they are verified by logs, process state and source audit only.
 5. No real-client gameplay run beyond arrival / reconnect (no UI automation): the G5 guards and the guest activity table are scripted / source audited.
 6. At most 3 real client processes were ever run together; 4..8 guests and 8 peers are scripted without puppets / rendering, so the memory and frame cost of 8 real puppets is unmeasured (default cap 4).
-7. A guest never owns a house, mailbox or museum donor slot; villager letters to guests, bank / loan UI and the birthday calendar are deferred.
+7. A guest never owns a house or mailbox (it donates to the museum with the shared donor value 5, see "Guest museum donation"); villager letters to guests, bank / loan UI and the birthday calendar are deferred.
 8. Guest identity (name, home town, ids) is permanent: changing it makes a new guest, and the old character stays on the host until the operator removes it.
 
 Verdict: ready for a supervised friends-and-LAN test of arrival, reconnection, capacity and failure handling; NOT ready to be advertised as a public / internet feature until limitations 1, 2 and 4 are addressed.
@@ -1516,3 +1516,65 @@ Known limit: game logic that auto-writes a notice post locally on a client (day-
 **Tests.** `test_shop_upgrade_src.py` (17 source pins), `test_shop_upgrade_protocol.py` (real dedicated host + FakeClients: race, stale generation, not-in-shop refusal, purchases refused, late joiner, renewal waits for a player in the shop, acre publication, restart mid-closure resumed at the original deadline, operator start, switch off: 50/50), `test_shop_upgrade_real.py` (real dedicated host + a REAL guest client warped into the shop: Nook's real announcement dialogue answered by the autopilot, the request, the closure, the real exit, the renewal and the client's town refresh: 16/16), `test_shop_upgrade_listen_real.py` (real LISTEN host: renewal in the town via the reload, indoors directly on the save, the host's own player in the shop held while Nook's greeting is open, then shown out: 34/34), `test_shop_renewal_real.py` (the legacy phases now run with `AC_MP_SHOP_UPGRADE=0`; new RN-takeover). Re-pinned deliberately: `wire_baseline.py` (service 6 / array bound 7 / message 85), `test_stage0_town_safe_degrade.py` (m_shop.c include block), `test_shop_src.py` (push loop bound, the block's allowed Save_t.shop writes), `test_shop_restock_talk_src.py` T3, `test_map_line_src.py` L10, `test_events_src.py` / `test_hostcfg_src.py` (array bound), `test_boot_exec_gate_src.py` (allowlist), `test_shop_renewal_reload_src.py` R8.
 
 **Limits / not verified.** The announcement, the door text and the notices were never looked at by a person or a screenshot (the dialogue ran in a real client, driven by the autopilot; text verified by the message selftest only). The host player's own announcement in a listen host was not driven through its dialogue (the host-start hook stands in for it). Mixed versions: an old client never hears the announcement and sees the shop open during a closure (its purchases are refused NOT_AVAILABLE); if every player is old the upgrade stays PENDING until the operator uses `shop-upgrade start confirm`. A player who keeps Nook's conversation open is shown out only when it ends (or at the existing hard cap). A listen host that stays inside a shop building delays the renewal until it leaves. The closure starts even if a resident is in its first-job chores (the chores continue after the reopening).
+
+## Guest museum donation (host-authoritative, donor nibble 5)
+
+Status: **implemented, not committed** (protocol version 8 unchanged, no wire change). Guests (non-resident players with a guest record, record index `PLAYER_NUM + guest slot`) donate fossils,
+paintings, fish and insects to Blathers through the existing MUSEUM_DONATE transaction (TXN kind 8); the G5.1 local refusal is gone.
+
+**Save format (unchanged).** `Save_t.museum_display` (63 B) keeps ONE 4-bit donor per exhibit: 0 none, 1..4 resident slot + 1, 5 `mMmd_DONATOR_DELETED_PLAYER`; 6..15 fail the save check. A guest
+donation is stored as **5**: it counts as donated everywhere (`mMmd_IS_DONATED`), the plaques show the vanilla "former resident" text (MSG_12192 / 12195 / 12197; every plaque indexes
+`private_data` only for 1..4) and nothing is ever attributed to a resident.
+
+**Host** (`pcnetgame_handle_host_ts_txn`): NO_DONOR_SLOT (reason 18) is kept only for `idx < 0` or a guest slot without a record (`pcnetgame_rec_txn_idx_ok`); everything else (READY / binding
+gate, journal: fence / REPLAYED / CONFLICT, base, pre-image, the vanilla `mMmd_GetDisplayInfo` predicate, Blathers' two returned paintings, the post-image gate) is unchanged. The commit is the
+new TARGET_PC helper `mMmd_PC_RequestMuseumDisplayDonor(item, donor)` (m_museum_display.c): the vanilla category ranges, the "not yet donated" test and the vanilla CLR + SET macros, with the donor
+from `pcnetgame_museum_donor_nibble(idx)` (resident idx + 1 = the old vanilla value, guest 5). The `Common_Get(player_no)` swap around `mMmd_RequestMuseumDisplay` is gone (it would have
+failed `mLd_PlayerManKindCheck` for a guest index). Races: the first commit wins, the other gets ALREADY_DONATED and keeps the item (two guests, guest vs resident). The museum service push
+(service 2) mirrors the result to every client; the client already accepts nibble 5.
+
+**Client.** `pc_net_game_ts_begin_museum_donate` is again the single `pcnetgame_ts_begin` call. Blathers (`ac_npc_curator_move.c_inc`): a READY guest client
+(`pc_net_game_museum_guest_donor()`) is treated as "not foreigner" so it reaches the donation menu; the four "donated by you" tests use `aCR_IS_OWN_DONATION`, which on TARGET_PC never matches
+for `player_no >= PLAYER_NUM` (a guest's `player_no + 1` IS 5, so every value-5 exhibit would otherwise read as its own): value 5 takes the DELETED_PLAYER row ("already donated", item handed
+back, no transaction). An OLD host still answers NO_DONOR_SLOT, which the curator maps onto the existing give-back row (the item stays), so no capability bit is needed (none was added:
+old clients reject unknown HOST_CONFIG bits).
+
+**Manual-test bug (fixed): Blathers said "a former resident already donated it" and played the give-back for donations the host had APPLIED.** Root cause (client, every
+network client, residents included -- pre-existing since town services milestone 1, made visible by guests): `aCR_msg_win_open_wait` re-derived the outcome row from the
+LOCAL museum on every frame. The host sends the museum mirror of a donation right behind its TXN_RESULT and the client applies both in the SAME network poll, so on the APPLIED
+frame the exhibit already read as donated: a guest got row 12..15 ("a former resident donated it"), a resident row 4..7 ("you donated it"); being < 16 the client branch was
+skipped (the APPLIED result was never consumed) and the dialogue walked the give-back demo for an item the host had already taken out of the pocket (the item is NOT duplicated:
+the hand-back demo never writes the pocket; the exhibit and the empty slot were correct, only the dialogue lied). The real-test log shows the race on 6 of 6 donations
+(`re-derived now 14/15`). Fix: the row decided on the pre-donation museum is frozen at the begin (`aCR_ts_act_idx`) and restored on every awaited frame; the branch is also
+entered while a transaction is awaited. Each decided row is logged (`[NET][TS] client: Blathers row for item ...`). Not reproduced: the report's "no transaction at all" for
+two items (0x2302 / 0x2D00) -- in the real-dialogue run every offer of an exhibit the museum lacks begins a transaction; the most likely reading is that the misleading
+give-back text made the earlier (applied) donations look refused.
+
+**Durability caveat (crash window).** The host writes the GCI (museum_display) first and the guest store (`save/mp/guests/*.gst`, the guest's pockets) right after it, in the same save hook.
+A host crash BETWEEN the two writes restores the museum WITH the exhibit and the guest record from the previous .gst, i.e. the guest still holds the donated item: an item duplicate is
+possible, a double museum entry is not (the exhibit is already marked donated, a second offer is ALREADY_DONATED).
+
+**Limitations / follow-ups.**
+* No donor attribution for guests: value 5 does not say WHICH guest donated (the plaque says "former resident"). A sidecar (e.g. a new TS service 7 + `PC_NETGAME_TS_NUM` 8; service 6 is
+  SHOP_UPGRADE) was deliberately deferred.
+* Promotion (`pc_mp_promote_create`, guest -> resident): the guest's value-5 exhibits cannot be re-attributed to its new resident slot (no attribution data); they stay "former resident".
+* A guest therefore never sees "you donated this" for its own exhibits, and the museum-completion letter stays resident-only (vanilla `mMsm_SetSendCompMail` walks `private_data[0..3]`).
+* NO_DONOR_SLOT for a guest slot without a record is unreachable for a bound scripted client (a bound guest always has a record): source audited only.
+* The Blathers dialogue with a guest was not driven through the UI (no UI automation for the dialogue): its guest branches are source audited; the real `--guest` client is driven by the
+  default-off `--ts-test-donate` hook through the same entry point Blathers calls. Nothing was visually verified.
+* Guest mailbox (letters from villagers / players to guests) is still deferred.
+
+**Real dialogue regression** (`test_guest_museum_real.py` phase B): a real `--guest` client with 3 fish + 3 insects (TEST-ONLY `AC_TEST_MUSEUM_POCKETS`), warped
+into the museum entrance (`AC_TEST_MUSEUM_ROOM=entrance`), parked in front of Blathers (`AC_TEST_GOTO`, `ac_goto.txt` `c 40`), autopilot `mashf` (A presses, every choice
+answered with its first option): all six offers take an accept row and are APPLIED, the observer's museum holds all six with value 5, six pocket slots emptied once.
+
+**Tests** (fresh fixtures `pc/build64/bin_fixture4_museum*` with the `pc/build64_w3` exe): `test_guest_museum_src.py` (source audit), `test_guest_museum_protocol.py` (FakeClients vs a real
+host: guest APPLIED with nibble 5 in the host museum service, the resident observer's mirror and the GCI after save; guest record pockets cleared; resend -> REPLAYED once; CONFLICT; two
+guests racing and guest vs resident racing; ALREADY_DONATED / NOT_DONATABLE leave the record byte-identical; host restart -> GCI and guest store agree; kill between COMMIT and RESULT then
+reconnect with the token -> pushed record without the item, the old COMMIT replays), `test_guest_museum_real.py` (a real `--guest` client + real host + a scripted resident observer).
+Pins updated deliberately: test_guest_g5_src (B.1: the guard is now pinned as REMOVED), test_guest_src (A: the NO_DONOR_SLOT condition / no player_no write), test_ts_src (H: the helper
+replaces the player_no swap), test_guest_protocol (X: a guest's apple is now NOT_DONATABLE, not NO_DONOR_SLOT).
+Results (exe `pc/build64_w3/bin/AnimalCrossing.exe`, fixtures bin_fixture4_museum / _museumh): test_guest_museum_src 32/32, test_guest_museum_protocol 52/52, test_guest_museum_real 20/20;
+resident regressions test_ts_protocol 110/111 (TS2 "no service 6+" pin predates this change: SHOP_UPGRADE is service 6), test_ts_real_client 22/22, test_museum_bits_protocol 7/7,
+test_museum_refresh_real 14/14; test_ts_src 72/72, test_shop_src 65/65, test_stage0_town_safe_degrade 104/104. Failures in test_guest_g5_protocol (M5 catch: WORLD_CHANGED),
+test_guest_protocol (guests.dat v2 vs the per-guest store, crashes in phase R) and test_guest_g4_protocol (max-guests 9 CLI / cap) are outside the museum path; their museum checks pass.

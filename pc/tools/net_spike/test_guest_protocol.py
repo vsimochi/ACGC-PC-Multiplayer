@@ -24,7 +24,8 @@ Sections (one host process, in order; <= 3 live clients at any time):
        then still connects; an unknown identity WITHOUT a valid EXT is refused exactly as before (NO_SAVE); malformed / late / flag-less EXT are ignored
        (so the claim is refused); home land == town land and IDENTITY / EXT mismatch are refused
   X    GUEST TRANSACTIONS against the guest record (slot space 4..11): pickup (pocket + money bag), drop, bury, DIG_BURIED grant, SHOP_BUY / SHOP_SELL,
-       POLICE_CLAIM work; MUSEUM_DONATE / MAIL_SEND / MAIL_TAKE are refused NO_DONOR_SLOT (no rev change), no MAILBOX_LETTER is ever pushed to a guest;
+       POLICE_CLAIM work; MAIL_SEND / MAIL_TAKE are refused NO_DONOR_SLOT (no rev change), MUSEUM_DONATE of an apple is NOT_DONATABLE (guest museum donation:
+       a guest with a record reaches the museum predicate), no MAILBOX_LETTER is ever pushed to a guest;
        FRIENDSHIP_REQUEST / MAIL_REQUEST are keyed by the guest's home PersonalID (a forged mail sender is overwritten); a new session sees the final record
   G    (Guests G1, fresh record) the first-contact upload is a FRESH character (python mirror of pc_guest_build_fresh_record), never a resident's: the host
        stores EXACTLY what the guest uploaded, a returning guest is pushed that record with no new MIGRATE, two guests are independent; the NAME rules at the
@@ -523,8 +524,10 @@ def s_transactions(run, a, tok):
     off = len(run.log())
     slot = first_free(a.txn_pre_image()[0])
     _s, r = a.txn_donate(slot, ITM_APPLE, rid=run.fresh_rid())
-    run.tx_ok("X MUSEUM_DONATE by a guest is refused (no donor slot)", r, REJECTED, R["NO_DONOR_SLOT"])
-    ck("X ... with the guest reason in the log, rev unchanged", "has no museum donor slot" in run.log()[off:] and r is not None and r.rev == rev_before)
+    # guest museum donation (pin updated deliberately): a guest WITH a record now reaches the museum predicate (donor nibble 5 on success, see
+    # test_guest_museum_protocol.py); an apple is refused by the vanilla predicate (NOT_DONATABLE) instead of the former NO_DONOR_SLOT
+    run.tx_ok("X MUSEUM_DONATE of an apple by a guest reaches the museum predicate (not a donation)", r, REJECTED, R["NOT_DONATABLE"])
+    ck("X ... nothing changed: no NO_DONOR_SLOT reason in the log, rev unchanged", "has no museum donor slot" not in run.log()[off:] and r is not None and r.rev == rev_before)
     s_m = a.send_txn_commit(L.PC_NETGAME_TXN_KIND_MAIL_SEND, run.fresh_rid(), L.PC_NETGAME_TXN_DEST_NONE, 0, 0)
     rm = a.wait_txn_result(s_m.seq, 3.0)
     run.tx_ok("X MAIL_SEND by a guest is refused (no house)", rm, REJECTED, R["NO_DONOR_SLOT"])

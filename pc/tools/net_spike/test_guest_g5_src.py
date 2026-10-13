@@ -5,7 +5,8 @@
       the pull-net include, the NULL now_home pointer maths in mTG_client_mail_is_mailbox (m_tag_ovl.c). Each guard exists, is TARGET_PC only and fires ONLY
       for the foreigner / a NULL home. Strongest pin: the working file with the pinned additions removed (m_tag_ovl.c: the pinned replacement undone) is
       BYTE-IDENTICAL to the baseline commit blob, i.e. every other byte of the vanilla function bodies (and files) is untouched.
-  B   G5.1 refusals: a guest's MUSEUM_DONATE / MAIL_SEND are refused LOCALLY before any state is touched (nothing queued, nothing sent, pocket / letter
+  B   G5.1 refusals: a guest's MAIL_SEND is refused LOCALLY before any state is touched (nothing queued, nothing sent, letter untouched). The G5.1 MUSEUM_DONATE
+      refusal is SUPERSEDED by guest museum donation (the guard is pinned as removed; test_guest_museum_src.py). Original wording: (pocket / letter
       untouched), only for a CLIENT guest; pc_net_game.c is purely additive (+15 lines) vs the baseline; resident paths are not touched (the guard tests the
       guest predicate only).
   C   facts the refusals / fixes rely on (read from the source, not changed): the shop catalog order is refused for EVERY client (and defended at order
@@ -117,10 +118,11 @@ def main():
     nf = S.functions(ng)
     mus = S.body(ng, nf, "pc_net_game_ts_begin_museum_donate")
     ml = S.body(ng, nf, "pc_net_game_mail_begin_send")
-    ck("B.1 MUSEUM_DONATE: a CLIENT guest is refused locally (return 0) BEFORE pcnetgame_ts_begin (no transaction queued, nothing sent); the vanilla call is the unchanged last statement",
-       "s_role == PC_NETGAME_ROLE_CLIENT && pcnetgame_client_is_guest_player()" in mus and mus.index("return 0;") < mus.index("return pcnetgame_ts_begin(")
-       and mus.index("pcnetgame_client_is_guest_player()") < mus.index("return pcnetgame_ts_begin(")
-       and mus.rstrip().endswith("return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item, 0);"))
+    # SUPERSEDED by guest museum donation (pin updated deliberately): the G5.1 local refusal was removed; a guest now donates through the same host
+    # transaction as a resident (donor nibble 5, see test_guest_museum_src.py). The function is again exactly the one vanilla call.
+    ck("B.1 MUSEUM_DONATE (superseded by guest museum donation): the G5.1 guest guard is GONE, the function is the single pcnetgame_ts_begin call for every client",
+       "pcnetgame_client_is_guest_player()" not in mus and "return 0;" not in mus
+       and mus.split("{", 1)[1].strip() == "return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item, 0);")
     ck("B.2 MAIL_SEND: the guest refusal comes right after the role / READY / Now_Private test and BEFORE s_mail_op is touched (no state, letter stays); resident clients skip it",
        "pcnetgame_client_is_guest_player()" in ml
        and ml.index("s_role != PC_NETGAME_ROLE_CLIENT") < ml.index("pcnetgame_client_is_guest_player()") < ml.index("memset(&s_mail_op")
@@ -130,10 +132,10 @@ def main():
        "(int)Common_Get(player_no) >= (int)mPr_FOREIGNER" in pred and pred == S.body(S.mask(blob("pc/src/pc_net_game.c")), S.functions(S.mask(blob("pc/src/pc_net_game.c"))),
                                                                                    "pcnetgame_client_is_guest_player"))
     ck("B the refusals log the reason (a console line); the in-game answer is the EXISTING give-back row (curator row 2) / 'no such address' row (post girl row 1)",
-       "MUSEUM_DONATE refused locally: a guest cannot donate" in ng_new and "MAIL_SEND refused locally: a guest cannot send letters to players" in ng_new)
+       "MUSEUM_DONATE refused locally" not in ng_new and "MAIL_SEND refused locally: a guest cannot send letters to players" in ng_new)  # museum: superseded (guest museum donation)
     cur = S.read("src/actor/npc/ac_npc_curator_move.c_inc")
     post = S.read("src/actor/npc/ac_npc_post_girl.c_inc")
-    ck("B the callers map a 0 return onto the existing refusal paths: curator ts_begin == 0 -> act_idx = 2 (give back, item stays); post girl begin_send == 0 -> row 1 (letter handed back)",
+    ck("B the callers map a 0 return onto the existing refusal paths: curator ts_begin == 0 -> act_idx = 2 (give back, item stays; still used for a non-READY link / an old host's NO_DONOR_SLOT); post girl begin_send == 0 -> row 1 (letter handed back)",
        re.search(r"aCR_ts_waiting = \(ts_begin > 0\) \? TRUE : FALSE;\s+if \(!aCR_ts_waiting\) \{\s+act_idx = 2;", cur) is not None
        and re.search(r"r = pc_net_game_mail_begin_send\(item_p->slot_no\);\s+if \(r < 0\) \{\s+return -1;\s+\}\s+if \(r == 0\) \{\s+return 1;", post) is not None)
 

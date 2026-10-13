@@ -385,10 +385,19 @@ static int aCR_get_msg_no_after_talk() {
     return msg_no[idx];
 }
 
+#ifdef TARGET_PC
+/* Guest museum donation: a guest's player_no is mPr_FOREIGNER (4), so player_no + 1 == 5 == mMmd_DONATOR_DELETED_PLAYER, the nibble that EVERY guest
+ * donation and every deleted resident's exhibit carries. For a guest it never means "donated by you": it falls to the DELETED_PLAYER row ("already
+ * donated", the item is handed back). Residents (player_no 0..3): unchanged. */
+#define aCR_IS_OWN_DONATION(donator) ((donator) == (Common_Get(player_no) + 1) && Common_Get(player_no) < PLAYER_NUM)
+#else
+#define aCR_IS_OWN_DONATION(donator) ((donator) == (Common_Get(player_no) + 1))
+#endif
+
 static int aCR_get_idx_to_donate_fossil(mActor_name_t item) {
     int donator = aCR_GetFossilPartDonator(item);
 
-    if (donator == (Common_Get(player_no) + 1)) {
+    if (aCR_IS_OWN_DONATION(donator)) {
         return 4;
     }
 
@@ -427,7 +436,7 @@ static int aCR_get_idx_to_donate_art(mActor_name_t item) {
             return 1;
     }
 
-    if (donator == (Common_Get(player_no) + 1)) {
+    if (aCR_IS_OWN_DONATION(donator)) {
         return 5;
     }
 
@@ -446,7 +455,7 @@ static int aCR_get_idx_to_donate_insect(mActor_name_t item) {
     int donator = aCR_GetInsectDonator(item);
     int res;
 
-    if (donator == (Common_Get(player_no) + 1)) {
+    if (aCR_IS_OWN_DONATION(donator)) {
         res = 7;
     } else {
         switch (donator) {
@@ -477,7 +486,7 @@ static int aCR_get_idx_to_donate_insect(mActor_name_t item) {
 static int aCR_get_idx_to_donate_fish(mActor_name_t item) {
     int donator = aCR_GetFishDonator(item);
 
-    if (donator == (Common_Get(player_no) + 1)) {
+    if (aCR_IS_OWN_DONATION(donator)) {
         return 6;
     }
 
@@ -625,6 +634,11 @@ typedef struct {
 #ifdef TARGET_PC
 /* Town services: TRUE while this client's museum donation transaction is begun and its answer is still awaited (see aCR_msg_win_open_wait). */
 static int aCR_ts_waiting = FALSE;
+/* The outcome row decided BEFORE the transaction was begun (an "accept and put away" row 16..27). It is FROZEN while the answer is awaited and used
+ * on APPLIED: the host sends the museum mirror of this very donation right behind the TXN_RESULT (usually the same network poll), so re-deriving the
+ * row after APPLIED reads the exhibit as ALREADY donated (a guest: the "a former resident donated it" row 12..15, a resident: the "you donated it"
+ * row 4..7) and walks the give-back demo for an item the host already took. */
+static int aCR_ts_act_idx = 0;
 #endif
 
 static void aCR_msg_win_open_wait(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
@@ -694,7 +708,9 @@ static void aCR_msg_win_open_wait(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
              * host post-image, so the put-away init below stays a no-op for a client); REJECTED (already donated by someone
              * else in the meantime, not a donation, host busy / unreachable) takes row 2, the existing give-back path, and
              * the item stays in the pocket. */
-            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && act_idx >= 16) {
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && (act_idx >= 16 || aCR_ts_waiting)) {
+                const int row_before = act_idx;
+
                 if (!aCR_ts_waiting) {
                     int ts_begin = pc_net_game_ts_begin_museum_donate(play->submenu.item_p->slot_no, (int)item);
 
@@ -704,11 +720,14 @@ static void aCR_msg_win_open_wait(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
                     aCR_ts_waiting = (ts_begin > 0) ? TRUE : FALSE;
                     if (!aCR_ts_waiting) {
                         act_idx = 2;
+                    } else {
+                        aCR_ts_act_idx = act_idx; /* freeze the row decided on the PRE-donation museum state */
                     }
                 }
                 if (aCR_ts_waiting) {
                     int ts_res = pc_net_game_ts_poll();
 
+                    act_idx = aCR_ts_act_idx; /* never re-derived while / after waiting: the mirror of this donation may already be applied */
                     if (ts_res == PC_NETGAME_TS_OP_PENDING) {
                         return; /* waiting for the host: no state change, no stuck UI (re-polled every frame) */
                     }
@@ -717,6 +736,9 @@ static void aCR_msg_win_open_wait(NPC_CURATOR_ACTOR* curator, GAME_PLAY* play) {
                         act_idx = 2;
                     }
                 }
+                pc_net_game_museum_note_row((int)item, row_before, act_idx);
+            } else if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                pc_net_game_museum_note_row((int)item, act_idx, act_idx); /* a row decided locally (already donated / not a donation): no transaction */
             }
 #endif
         }
@@ -1007,6 +1029,13 @@ static void aCR_set_talk_info(ACTOR* actorx) {
         if (mLd_PlayerManKindCheck() == FALSE) {
             not_foreigner = TRUE;
         }
+#ifdef TARGET_PC
+        /* Guest museum donation: a READY guest client of a host donates through the host transaction (donor nibble 5), so Blathers greets it like a
+         * resident and offers the donation menu. A foreigner in single player / on a non-READY link keeps the vanilla foreigner talk. */
+        else if (pc_net_game_museum_guest_donor()) {
+            not_foreigner = TRUE;
+        }
+#endif
 
         if (aNPC_SPNPC_BIT_GET(Common_Get(spnpc_first_talk_flags), aNPC_SPNPC_BIT_CURATOR)) {
             not_first_talk = TRUE;

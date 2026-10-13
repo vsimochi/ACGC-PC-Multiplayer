@@ -229,6 +229,56 @@ extern int mMmd_RequestMuseumDisplay(mActor_name_t item) {
   return FALSE;
 }
 
+#ifdef TARGET_PC
+/* PC multiplayer (host only, pc_net_game.c MUSEUM_DONATE commit): mMmd_RequestMuseumDisplay with an EXPLICIT donor nibble instead of
+ * Common_Get(player_no) + 1 and without the local mLd_PlayerManKindCheck (the host credits a REMOTE player, not its own). Same category
+ * ranges, same "not yet donated" test and the same CLR + SET macros as the vanilla setters. donor: 1..4 = resident slot + 1 (identical to
+ * the vanilla result), 5 = mMmd_DONATOR_DELETED_PLAYER (a guest: the 4-bit save format has no other value; 6..15 fail the save check).
+ * Returns TRUE when the exhibit was credited, FALSE (nothing written) for an invalid donor, a non-donatable item or an exhibit already held. */
+extern int mMmd_PC_RequestMuseumDisplayDonor(mActor_name_t item, int donor) {
+  int idx;
+
+  if (donor < mMmd_DONATOR_PLAYER1 || donor > mMmd_DONATOR_DELETED_PLAYER) {
+    return FALSE;
+  }
+
+  if (item >= FTR_START(FTR_DIN_TRIKERA_HEAD) && item <= FTR_END(FTR_DIN_TRILOBITE)) {
+    idx = FTR_IDX_2_NO(item - FTR_START(FTR_DIN_TRIKERA_HEAD));
+    if (idx >= 0 && idx < mMmd_FOSSIL_NUM && !mMmd_IS_DONATED(mMmd_FossilInfo(idx))) {
+      mMmd_FOSSIL_CLR(Save_Get(museum_display), idx);
+      mMmd_FOSSIL_SET(Save_Get(museum_display), idx, donor);
+      return TRUE;
+    }
+  }
+  else if (item >= FTR_START(FTR_SUM_ART01) && item <= FTR_END(FTR_SUM_ART15)) {
+    idx = FTR_IDX_2_NO(item - FTR_START(FTR_SUM_ART01));
+    if (idx >= 0 && idx < mMmd_ART_NUM && !mMmd_IS_DONATED(mMmd_ArtInfo(idx))) {
+      mMmd_ART_CLR(Save_Get(museum_display), idx);
+      mMmd_ART_SET(Save_Get(museum_display), idx, donor);
+      return TRUE;
+    }
+  }
+  else if (item >= ITM_INSECT00 && item < ITM_SPIRIT0) {
+    idx = item - ITM_INSECT_START;
+    if (idx >= 0 && idx < mMmd_INSECT_NUM && !mMmd_IS_DONATED(mMmd_InsectInfo(idx))) {
+      mMmd_INSECT_CLR(Save_Get(museum_display), idx);
+      mMmd_INSECT_SET(Save_Get(museum_display), idx, donor);
+      return TRUE;
+    }
+  }
+  else if (item >= ITM_FISH00 && item <= ITM_FISH_END) {
+    idx = item - ITM_FISH_START;
+    if (idx >= 0 && idx < mMmd_FISH_NUM && !mMmd_IS_DONATED(mMmd_FishInfo(idx))) {
+      mMmd_FISH_CLR(Save_Get(museum_display), idx);
+      mMmd_FISH_SET(Save_Get(museum_display), idx, donor);
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+#endif
+
 typedef struct museum_display_fossil_data_s {
   u8 ut;
   mActor_name_t item;

@@ -681,6 +681,8 @@ int pc_net_game_client_pocket_locked(void);
 #define PC_NETGAME_TS_OP_APPLIED  1
 #define PC_NETGAME_TS_OP_REJECTED 2
 int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item);
+void pc_net_game_museum_note_row(int item, int derived_now, int final_row); /* Blathers: log the decided outcome row of an offer (client) */
+int pc_net_game_museum_guest_donor(void); /* guest museum donation: 1 iff a READY network CLIENT whose player is a guest (Blathers' foreigner / "yours" checks) */
 int pc_net_game_ts_begin_police_claim(int pocket_slot, int police_idx, int item);
 int pc_net_game_ts_poll(void);
 

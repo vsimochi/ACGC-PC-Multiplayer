@@ -168,7 +168,7 @@ def main():
              "shape_ok = in->_rsv0 == 0", "pcnetgame_txn_nonce_fenced(", "pcnetgame_txn_journal_find(", "R->max_seq = t->txn_seq;", "pcnetgame_rec_refresh_hostfields(idx, slot)",
              "t->base_epoch != slot->epoch", "pcnetgame_rec_validate_inventory(t->pre_pockets", "memcpy(post, t->pre_pockets", "pcnetgame_shop_pay(post",
              "pcnetgame_shop_sell_plan(t->pre_pockets", "mMmd_GetDisplayInfo(", "PC_TXN_FAULT_FAIL_WORLD",
-             "pcnetgame_rec_validate_inventory(post, post_conds", "mSP_PlusSales(shop_price);", "mSP_ShopSaleReport(", "mMmd_RequestMuseumDisplay(", "mPB_copy_itemBuf(", "pcnetgame_rec_txn_write_inventory(idx, post", "slot->rev++;",
+             "pcnetgame_rec_validate_inventory(post, post_conds", "mSP_PlusSales(shop_price);", "mSP_ShopSaleReport(", "mMmd_PC_RequestMuseumDisplayDonor(", "mPB_copy_itemBuf(", "pcnetgame_rec_txn_write_inventory(idx, post", "slot->rev++;",
              "slot->dirty_unsaved = 1;", "R->last_pocket_rev = slot->rev;", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED", "pcnetgame_ts_refresh(svc);",
              "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE", "pcnetgame_host_ts_push_all(); /* a work op changes no service: nothing to mirror to the other peers */\n    }\n    /* 14.",
              "pcnetgame_rec_start_push(peer, idx, st->rec_push_kind)"]
@@ -177,26 +177,29 @@ def main():
           "fail_world, post-image validated, the service commit, mirror write, rev / dirty / journal, refresh (the echoed seq), kill fault, RESULT, push to everyone, push restart (missing %s)" % miss, ok)
     check("H the resident index comes ONLY from the gate: one 'idx = pcnetgame_rec_gate(peer, 0, 0);', no other assignment, nothing read from the message",
           ts.count("idx = pcnetgame_rec_gate(peer, 0, 0);") == 1 and len(re.findall(r"\bidx\s*=[^=]", ts)) == 1 and not re.search(r"in->\w*(?:idx|resident)\w*", ts))
-    check("H MUSEUM_DONATE: the donor is the BOUND resident: player_no is saved, set to idx, the VANILLA mMmd_RequestMuseumDisplay is the only commit, player_no is restored on the very next statement",
-          re.search(r"u8 saved_player_no = Common_Get\(player_no\);\s*int ok;\s*Common_Get\(player_no\) = \(u8\)idx;[^\n]*\n\s*ok = mMmd_RequestMuseumDisplay\(\(mActor_name_t\)t->item\);\s*"
-                    r"Common_Get\(player_no\) = saved_player_no;", ts) is not None and ts.count("mMmd_RequestMuseumDisplay(") == 1)
+    # guest museum donation (pin updated deliberately): the commit no longer swaps Common_Get(player_no); the donor nibble is derived from the gate index only
+    # (resident idx + 1 == the old vanilla result, guest record -> 5 DELETED_PLAYER) and written by the TARGET_PC helper of m_museum_display.c
+    check("H MUSEUM_DONATE: the donor is the BOUND record: donor = pcnetgame_museum_donor_nibble(idx) (resident idx + 1, guest 5), mMmd_PC_RequestMuseumDisplayDonor is the only commit, "
+          "Common_Get(player_no) is never written in the handler",
+          re.search(r"const int donor = pcnetgame_museum_donor_nibble\(idx\);\s*if \(!mMmd_PC_RequestMuseumDisplayDonor\(\(mActor_name_t\)t->item, donor\)\)", ts) is not None
+          and ts.count("mMmd_PC_RequestMuseumDisplayDonor(") == 1 and "mMmd_RequestMuseumDisplay(" not in ts and not re.search(r"Common_Get\(player_no\)\s*=[^=]", ts))
     check("H the vanilla predicate gates the donation: mMmd_GetDisplayInfo (CANNOT -> NOT_DONATABLE, ALREADY -> ALREADY_DONATED), the two paintings Blathers returns are refused, and a "
-          "resident without a donor slot (idx outside PLAYER_NUM) is refused with NO_DONOR_SLOT",
+          "record without a donor slot (an invalid index or a guest slot without a guest record) is refused with NO_DONOR_SLOT",
           "info == mMmd_DISPLAY_CANNOT_DONATE" in ts and "info == mMmd_DISPLAY_ALREADY_DONATED" in ts and "FTR_SUM_ART02" in ts and "FTR_SUM_ART03" in ts
-          and "idx < 0 || idx >= PLAYER_NUM" in ts and "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT" in ts)
+          and "idx < 0 || (idx >= PLAYER_NUM && !pcnetgame_rec_txn_idx_ok(idx))" in ts and "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT" in ts)
     check("H POLICE_CLAIM verifies (slot, EXPECTED item) against the host's keep_items, clears the slot and compacts with the vanilla mPB_copy_itemBuf; mismatch -> NOT_AVAILABLE",
           "(uint16_t)Save_Get(police_box).keep_items[pidx] != t->item" in ts and "PC_NETGAME_TXN_REASON_NOT_AVAILABLE" in ts
           and ts.index("Save_Get(police_box).keep_items[pidx] = (mActor_name_t)EMPTY_NO;") < ts.index("mPB_copy_itemBuf(Save_Get(police_box).keep_items);"))
-    check("H the TS handler is the ONLY writer of museum_display / police_box on the host: mMmd_RequestMuseumDisplay( exists once in pc_net_game.c (this handler), "
+    check("H the TS handler is the ONLY writer of museum_display / police_box on the host: mMmd_PC_RequestMuseumDisplayDonor( exists once in pc_net_game.c (this handler; the vanilla mMmd_RequestMuseumDisplay( never), "
           "mPB_keep_item( only in the host snowman path and the TEST-ONLY seed hook, mPB_copy_itemBuf( once",
-          c.count("mMmd_RequestMuseumDisplay(") == 1 and c.count("mPB_copy_itemBuf(") == 1 and len(re.findall(r"\bmPB_keep_item\(\(mActor_name_t\)", c)) == 2
+          c.count("mMmd_PC_RequestMuseumDisplayDonor(") == 1 and c.count("mMmd_RequestMuseumDisplay(") == 0 and c.count("mPB_copy_itemBuf(") == 1 and len(re.findall(r"\bmPB_keep_item\(\(mActor_name_t\)", c)) == 2
           and "mPB_keep_item(" in func_body(hblk_raw, "pcnetgame_ts_test_seed_police") and "g_pc_ts_test_seed_police" in func_body(hblk_raw, "pcnetgame_ts_test_seed_police"))
     check("H the host's OWN resident is never written: the post-image gate uses pcnetgame_rec_txn_idx_ok(idx) BEFORE the service commit (the host's own players use the vanilla local path)",
-          "!pcnetgame_rec_txn_idx_ok(idx)" in ts and ts.index("!pcnetgame_rec_txn_idx_ok(idx)") < ts.index("mMmd_RequestMuseumDisplay("))
+          "!pcnetgame_rec_txn_idx_ok(idx)" in ts and ts.index("!pcnetgame_rec_txn_idx_ok(idx)") < ts.index("mMmd_PC_RequestMuseumDisplayDonor("))
     check("H NO RNG and no mPr_ item writer on the mirror path: no RANDOM / rand / qrand / pcnetgame_rec_rand32 / mPr_Set* / mPr_Give* in the TS host block (the pocket is written raw "
           "by pcnetgame_rec_txn_write_inventory with mPr_SET_ITEM_COND values)",
           not re.search(r"\b(RANDOM|rand|qrand|pcnetgame_rec_rand32|fqrand|mPr_Set\w*|mPr_Give\w*|mPr_Clear\w*)\s*\(", hblk) and "pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)" in ts)
-    mut_tokens = ("mMmd_RequestMuseumDisplay(", "keep_items[pidx] =", "pcnetgame_rec_txn_write_inventory(", "slot->rev++", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED")
+    mut_tokens = ("mMmd_PC_RequestMuseumDisplayDonor(", "keep_items[pidx] =", "pcnetgame_rec_txn_write_inventory(", "slot->rev++", "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED")
     rej_ok = []
     for m in re.finditer(r"pcnetgame_txn_reject\(", ts):
         nxt = ts.find("return", m.end())

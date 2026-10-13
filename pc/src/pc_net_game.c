@@ -20153,6 +20153,13 @@ static int pcnetgame_shop_local_scene_is_shop(void) {
 }
 
 
+/* Guest museum donation: the 4-bit museum_display donor nibble of a gate-derived record index. A resident slot 0..3 -> slot + 1 (the vanilla value);
+ * a guest record (PLAYER_NUM + store slot) -> mMmd_DONATOR_DELETED_PLAYER (5): the save format has no room for a guest donor (6..15 fail the save
+ * check), so a guest's exhibit reads as "donated by a former resident" (plaque MSG_12192) and is never attributed to a resident. */
+static int pcnetgame_museum_donor_nibble(int idx) {
+    return (idx >= 0 && idx < PLAYER_NUM) ? idx + 1 : (int)mMmd_DONATOR_DELETED_PLAYER;
+}
+
 /* MUSEUM_DONATE / POLICE_CLAIM / SHOP_BUY / SHOP_SELL. `in` is the exact 72-byte TXN_COMMIT (kind 8 / 9 / 10 / 11). After the READY gate every path ends in one TXN_RESULT
  * (except the TEST-ONLY injected faults). */
 static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
@@ -20417,8 +20424,11 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
             }
         }
     } else if (is_donate) {
-        if (idx < 0 || idx >= PLAYER_NUM) {
-            fail = "the bound player has no museum donor slot (a guest / extra player has no house: museum donation is refused until guests get one)";
+        /* Guest museum donation: a GUEST (idx >= PLAYER_NUM) with an existing guest record donates too; it is credited with the donor nibble 5
+         * (mMmd_DONATOR_DELETED_PLAYER, the only value the 4-bit save format has besides the four residents). NO_DONOR_SLOT stays only for an
+         * invalid binding / a guest slot without a record. A resident keeps donor idx + 1 (behaviour identical). */
+        if (idx < 0 || (idx >= PLAYER_NUM && !pcnetgame_rec_txn_idx_ok(idx))) {
+            fail = "the bound player has no museum donor slot (no valid resident / guest record)";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_DONOR_SLOT;
         } else if (t->item == (uint16_t)FTR_START(FTR_SUM_ART02) || t->item == (uint16_t)FTR_START(FTR_SUM_ART03)) {
             /* Blathers' own dialogue returns these two paintings (aCR_get_idx_to_donate_art): never a donation */
@@ -20499,14 +20509,12 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     } else if (is_sell) {
         mSP_PlusSales(sell_value / 2u); /* vanilla aNSC_buy_check: half of what Nook paid counts towards the upgrade */
     } else if (is_donate) {
-        u8 saved_player_no = Common_Get(player_no);
-        int ok;
-        Common_Get(player_no) = (u8)idx; /* vanilla credits Common_Get(player_no) + 1: the BOUND resident, derived by the gate; restored below */
-        ok = mMmd_RequestMuseumDisplay((mActor_name_t)t->item);
-        Common_Get(player_no) = saved_player_no;
-        if (!ok) {
-            /* cannot happen after the read-only check (single-threaded); nothing was set when the vanilla function answers FALSE */
-            printf("[NET][TS] host: peer %d *** INTERNAL: mMmd_RequestMuseumDisplay refused after a passing check -- nothing mutated ***\n", (int)peer);
+        /* the donor nibble comes from the gate-derived index only: a resident = idx + 1 (what vanilla wrote with Common_Get(player_no) = idx), a guest = 5
+         * (DELETED_PLAYER: no persistent-format change). The host's own player_no is never touched. */
+        const int donor = pcnetgame_museum_donor_nibble(idx);
+        if (!mMmd_PC_RequestMuseumDisplayDonor((mActor_name_t)t->item, donor)) {
+            /* cannot happen after the read-only check (single-threaded); nothing was set when the helper answers FALSE */
+            printf("[NET][TS] host: peer %d *** INTERNAL: mMmd_PC_RequestMuseumDisplayDonor refused after a passing check -- nothing mutated ***\n", (int)peer);
             pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_ALREADY_DONATED, 1, NULL, "museum commit refused");
             return;
         }
@@ -20555,8 +20563,8 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
         printf("[NET][SHOP] host: peer %d resident %d SHOP_SELL mask=0x%04X value=%u wallet %u -> %u sales_sum now %u committed [TXN]\n", (int)peer, idx,
                (unsigned)t->aux_item, (unsigned)sell_value, (unsigned)t->pre_wallet, (unsigned)post_wallet, (unsigned)Save_Get(shop).sales_sum);
     } else if (is_donate) {
-        printf("[NET][MSM] host: peer %d resident %d MUSEUM_DONATE item=0x%04X slot=%u committed (donor slot %d) [TXN]\n", (int)peer, idx,
-               (unsigned)t->item, (unsigned)t->slot, idx + 1);
+        printf("[NET][MSM] host: peer %d %s %d MUSEUM_DONATE item=0x%04X slot=%u committed (donor slot %d) [TXN]\n", (int)peer, idx >= PLAYER_NUM ? "guest record" : "resident", idx,
+               (unsigned)t->item, (unsigned)t->slot, pcnetgame_museum_donor_nibble(idx));
     } else {
         printf("[NET][POLICE] host: peer %d resident %d POLICE_CLAIM item=0x%04X lost-and-found slot=%d -> pocket slot %u committed [TXN]\n",
                (int)peer, idx, (unsigned)t->item, pidx, (unsigned)t->slot);
@@ -27620,15 +27628,26 @@ static int pcnetgame_ts_begin(uint8_t kind, int slot, int aux, int item, int aux
 
 static int pcnetgame_client_is_guest_player(void);
 
+/* Guest museum donation: a READY guest CLIENT donates through the same host transaction as a resident (the G5.1 local refusal is gone). The host
+ * credits it with donor nibble 5; an OLD host still answers NO_DONOR_SLOT, which the curator maps onto its give-back row (the item stays). */
 int pc_net_game_ts_begin_museum_donate(int pocket_slot, int item) {
-    if (s_role == PC_NETGAME_ROLE_CLIENT && pcnetgame_client_is_guest_player()) {
-        /* G5.1: a guest owns no museum donor slot (the host would answer NO_DONOR_SLOT): refuse locally, nothing is sent, the pocket is untouched; the
-         * curator's existing give-back row 2 tells the player the item stays with them. */
-        printf("[NET][TS] client: MUSEUM_DONATE refused locally: a guest cannot donate to the museum (pocket slot %d item 0x%04X stays in the pocket)\n", pocket_slot,
-               (unsigned)item);
-        return 0;
-    }
     return pcnetgame_ts_begin((uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE, pocket_slot, 0, item, 0);
+}
+
+/* 1 iff this process is a READY network CLIENT whose local player is a guest (player_no == mPr_FOREIGNER). Blathers (ac_npc_curator_move.c_inc) uses it
+ * to offer the donation menu to a guest instead of the vanilla foreigner greeting, and to never read donor nibble 5 (== player_no + 1 for a guest) as
+ * "donated by you". Read-only. */
+int pc_net_game_museum_guest_donor(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && pcnetgame_client_is_guest_player();
+}
+
+/* Blathers (client): one log line per decided outcome row of a museum offer (rows: 2 give back / not accepted, 4..7 "you donated it", 8..11 "<resident>
+ * donated it", 12..15 "a former resident donated it", 16..27 accepted and put away). `derived_now` is the row re-derived from the CURRENT local museum,
+ * `final_row` the row the dialogue takes (frozen at the begin of a transaction). Log only. */
+void pc_net_game_museum_note_row(int item, int derived_now, int final_row) {
+    printf("[NET][TS] client: Blathers row for item 0x%04X: %d (%s; re-derived now %d, local museum says %d [1 can donate, 2 already donated])\n", (unsigned)item, final_row,
+           final_row >= 16 ? "accepted and put away" : final_row == 2 ? "handed back" : final_row >= 12 ? "already donated (former resident)" : final_row >= 8 ? "already donated (a resident)"
+           : final_row >= 4 ? "already donated (by you)" : "other", derived_now, (int)mMmd_GetDisplayInfo((mActor_name_t)item));
 }
 
 int pc_net_game_ts_begin_police_claim(int pocket_slot, int police_idx, int item) {
@@ -38167,12 +38186,14 @@ static void pcnetgame_goto_test_hook(void) {
     }
     fclose(f);
     pa = get_player_actor_withoutCheck(play);
-    if (pa == NULL || slot < 0 || slot >= ANIMAL_NUM_MAX || play->fb_wipe_mode != WIPE_MODE_NONE) {
+    if (pa == NULL || slot < 0 || (kind != 'c' && slot >= ANIMAL_NUM_MAX) || play->fb_wipe_mode != WIPE_MODE_NONE) { /* 'c': slot = the distance in front of Blathers */
         return;
     }
     remove("ac_goto.txt");
     if (kind == 'v') {
         t = Actor_info_fgName_search(&play->actor_info, Save_Get(animals)[slot].id.npc_id, ACTOR_PART_NPC);
+    } else if (kind == 'c') {
+        t = Actor_info_name_search(&play->actor_info, mAc_PROFILE_NPC_CURATOR, ACTOR_PART_NPC); /* "c <dist>": Blathers (guest museum donation real test) */
     } else if (kind == 'h' || kind == 'p') {
         int part;
         mActor_name_t house = (kind == 'p') ? (mActor_name_t)(HOUSE0 + slot) : (mActor_name_t)(NPC_HOUSE_START + (Save_Get(animals)[slot].id.npc_id - NPC_START)); /* 'p' = the PLAYER house of that slot */
@@ -38184,7 +38205,14 @@ static void pcnetgame_goto_test_hook(void) {
         printf("[NET][TEST-ONLY] goto %c %d: no such actor in this scene%s", kind, slot, "\n");
         return;
     }
-    if (kind == 'v') {
+    if (kind == 'c') {
+        printf("[NET][TEST-ONLY] goto c: Blathers at (%.1f, %.1f) rot 0x%04X; player parked %d units in front of him\n", (double)t->world.position.x, (double)t->world.position.z,
+               (unsigned)(u16)t->shape_info.rotation.y, slot);
+        pa->actor_class.world.position.x = t->world.position.x;
+        pa->actor_class.world.position.z = t->world.position.z + (float)slot;
+        pa->actor_class.shape_info.rotation.y = (s16)0x8000; /* face north, toward the counter */
+        pa->actor_class.world.angle.y = pa->actor_class.shape_info.rotation.y;
+    } else if (kind == 'v') {
         pa->actor_class.world.position.x = t->world.position.x + sin_s(t->shape_info.rotation.y) * 35.0f;
         pa->actor_class.world.position.z = t->world.position.z + cos_s(t->shape_info.rotation.y) * 35.0f;
         pa->actor_class.shape_info.rotation.y = (s16)(t->shape_info.rotation.y + 0x8000); /* face the villager */
@@ -38409,7 +38437,7 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 line[0] = 0;
             }
             fclose(f);
-            if (sscanf(line, "%d %15s %f", &id, cmd, &a) != 3 || (strcmp(cmd, "mash") != 0 && strcmp(cmd, "mashc") != 0)) {
+            if (sscanf(line, "%d %15s %f", &id, cmd, &a) != 3 || (strcmp(cmd, "mash") != 0 && strcmp(cmd, "mashc") != 0 && strcmp(cmd, "mashf") != 0)) {
                 return 0; /* not a mash: left in the file for the town path */
             }
             remove(s_ap_file);
@@ -38422,7 +38450,11 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             printf("[AUTO] mash %d indoors for %.1f s: player main=%d demo=%d type=%d msg_index=%d\n", id, (double)a, mPlib_get_player_actor_main_index(gamePT), mDemo_CheckDemo(),
                    mDemo_CheckDemoType(), mMsg_Get_base_window_p()->main_index);
         }
-        if (s_ap.active && (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashc") == 0)) {
+        if (s_ap.active && (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashc") == 0 || strcmp(s_ap.cmd, "mashf") == 0)) {
+            if (strcmp(s_ap.cmd, "mashf") == 0 && mChoice_check_main_normal(mChoice_Get_base_window_p())) {
+                /* "mashf": answer every choice with its FIRST option (Blathers: "donate" / "yes, more") */
+                mChoice_Get_base_window_p()->selected_choice_idx = 0;
+            }
             if (strcmp(s_ap.cmd, "mashc") == 0 && mChoice_check_main_normal(mChoice_Get_base_window_p())) {
                 /* "mashc": answer every choice with its LAST option (the cursor position vanilla's B shortcut picks, mChoice_Main_Normal_SetChoice) */
                 mChoice_c* ch = mChoice_Get_base_window_p();
@@ -39290,6 +39322,53 @@ int pc_net_game_room_test_talking(void) {
  * walks it into that museum room through the game's own goto_other_scene with the museum entrance's own door data (exit data = back to the field spot), so a harness process can stand in the room
  * while a FakeClient donates. Fires once; never active in normal play (the env var is only read in a test-hooks build). */
 #ifdef PC_NET_TEST_HOOKS
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_MUSEUM_POCKETS=<hex item>[,<hex item>...], CLIENT only): once the record is synced (4 s after adoption), puts the
+ * listed items into free LOCAL pocket slots (the hook's one local pocket write, standing in for "the player caught them"; the normal D3 upload carries
+ * them to the host) and then waits 6 s. Returns 1 when nothing (more) is to be done, 0 while the setup is pending. Never active in normal play. */
+static int pcnetgame_museum_pockets_test_hook(void) {
+    static int s_st = 0; /* 0 unparsed, 1 armed, 2 placed (waiting), 3 done */
+    static uint32_t s_t = 0;
+    const char* e;
+    uint32_t now = pcnetgame_now_ms();
+    if (s_st == 3) {
+        return 1;
+    }
+    if (s_st == 0) {
+        e = pc_test_hook_getenv("AC_TEST_MUSEUM_POCKETS");
+        s_st = (e != NULL && e[0] != '\0') ? 1 : 3;
+        if (s_st == 3) {
+            return 1;
+        }
+    }
+    if (s_st == 1) {
+        const char* p;
+        if (!pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL || (uint32_t)(now - s_crec.adopt_ms) < 4000u) {
+            return 0;
+        }
+        p = pc_test_hook_getenv("AC_TEST_MUSEUM_POCKETS");
+        while (p != NULL && *p != '\0') {
+            unsigned long it = strtoul(p, NULL, 16);
+            int slot = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+            if (it == 0 || it > 0xFFFFu || slot < 0) {
+                break;
+            }
+            Now_Private->inventory.pockets[slot] = (mActor_name_t)it;
+            Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, slot, mPr_ITEM_COND_NORMAL);
+            printf("[NET][MUSEUM][TEST-ONLY] AC_TEST_MUSEUM_POCKETS: placed item 0x%04X into pocket slot %d (local test setup, NOT active in normal play)\n", (unsigned)it, slot);
+            p = strchr(p, ',');
+            p = (p != NULL) ? p + 1 : NULL;
+        }
+        s_t = now;
+        s_st = 2;
+        return 0;
+    }
+    if ((uint32_t)(now - s_t) < 6000u) {
+        return 0; /* the D3 upload carries the items first */
+    }
+    s_st = 3;
+    return 1;
+}
+
 static void pcnetgame_museum_warp_test_hook(void) {
     static int s_state = 0; /* 0 unparsed, 1 armed, 2 done */
     static int s_which = 0, s_delay = 3000;
@@ -39307,7 +39386,8 @@ static void pcnetgame_museum_warp_test_hook(void) {
         if (e == NULL) {
             return;
         }
-        s_which = strncmp(e, "painting", 8) == 0 ? 1 : strncmp(e, "fossil", 6) == 0 ? 2 : strncmp(e, "insect", 6) == 0 ? 3 : strncmp(e, "fish", 4) == 0 ? 4 : strncmp(e, "needlework", 10) == 0 ? 5 : 0;
+        s_which = strncmp(e, "painting", 8) == 0 ? 1 : strncmp(e, "fossil", 6) == 0 ? 2 : strncmp(e, "insect", 6) == 0 ? 3 : strncmp(e, "fish", 4) == 0 ? 4 : strncmp(e, "needlework", 10) == 0 ? 5
+                  : strncmp(e, "entrance", 8) == 0 ? 6 : 0; /* entrance: in front of Blathers' counter (guest museum donation real test) */
         if (s_which == 0) {
             return;
         }
@@ -39319,6 +39399,10 @@ static void pcnetgame_museum_warp_test_hook(void) {
     if (play == NULL || !pc_net_game_get_local_scene(&ls) || (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link != PC_NETGAME_LINK_READY)) {
         return;
     }
+    if (s_role == PC_NETGAME_ROLE_CLIENT && !pcnetgame_museum_pockets_test_hook()) {
+        s_t_elig = 0;
+        return; /* AC_TEST_MUSEUM_POCKETS: the items are placed (and uploaded) before the warp */
+    }
     pa = get_player_actor_withoutCheck(play);
     if ((int)ls.scene_id != SCENE_FG || pa == NULL || play->fb_wipe_mode != WIPE_MODE_NONE || !pcnetgame_is_real_player_actor(pa)) {
         s_t_elig = 0;
@@ -39329,12 +39413,13 @@ static void pcnetgame_museum_warp_test_hook(void) {
         s_t_elig = now ? now : 1;
     }
     if ((uint32_t)(now - s_t_elig) >= (uint32_t)s_delay) {
-        static const Door_data_c k_doors[5] = {
+        static const Door_data_c k_doors[6] = {
             { SCENE_MUSEUM_ROOM_PAINTING, 4, 0, 0, { 280, 0, 480 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_FOSSIL, 4, 0, 0, { 280, 0, 480 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_INSECT, 6, 0, 0, { 520, 0, 560 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_FISH, 2, 0, 0, { 120, 0, 560 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_NEEDLEWORK, mSc_DIRECT_NORTH, 0, 0, { 300, 0, 380 }, EMPTY_NO, 2, { 0, 0, 0 } }, /* Able Sisters */
+            { SCENE_MUSEUM_ENTRANCE, mSc_DIRECT_NORTH, 0, 0, { 240, 0, 200 }, EMPTY_NO, 2, { 0, 0, 0 } }, /* the entrance player start, facing Blathers */
         };
         Door_data_c in = k_doors[s_which - 1];
         Door_data_c* out = Common_GetPointer(structure_exit_door_data);
