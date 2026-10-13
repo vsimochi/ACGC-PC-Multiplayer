@@ -218,6 +218,7 @@ static void Needlework_Indoor_Actor_draw(ACTOR* actorx, GAME* game) {
 
 #ifdef TARGET_PC
 #include "pc_net_game.h"
+#include "pc_able_net.h"
 /* Multiplayer live refresh: the shared Able Sisters designs (Save_t.needlework.original_design[0..7]) travel as PAGE (msg 71) kind DESIGN;
  * an applied page (client: the host's canonical copy; host: a client's accepted write) changes the Save copy while this player stands in
  * the shop, but the mannequins / umbrellas draw the actor's private double-buffered copy made at ct. Re-copy a changed design through the
@@ -247,6 +248,18 @@ static void aNI_PcRefreshFromSave(NEEDLEWORK_INDOOR_ACTOR* actor) {
             printf("[NET][ABLE] umbrella %d redrawn from the shared design (live refresh)\n", i);
         }
     }
+    /* worker B: every design now drawn equals the Save -> the player SEES the adopted revision (a trade's page write is built on it) */
+    for (i = 0; i < mNW_TOTAL_DESIGN_NUM; i++) {
+        pc_able_buffer_synced(i);
+    }
+}
+
+/* worker B: the my_org slot a trade's Display request points at (talk: request_copy_*_proc(idx, &Now_Private->my_org[k])), else -1 */
+static int aNI_PcOrgIdx(const mNW_original_design_c* design) {
+    if (Now_Private != NULL && design >= &Now_Private->my_org[0] && design < &Now_Private->my_org[mPr_ORIGINAL_DESIGN_COUNT]) {
+        return (int)(design - &Now_Private->my_org[0]);
+    }
+    return -1;
 }
 #endif
 
@@ -257,27 +270,61 @@ static void Needlework_Indoor_Actor_move(ACTOR* actorx, GAME* game) {
 
 #ifdef TARGET_PC
     if (submenu->process_status == mSM_PROCESS_WAIT) {
+        int tk, td, to;
         aNI_PcRefreshFromSave(actor);
+        /* TEST-ONLY (AC_TEST_ABLE_TRADE, test-hook builds; always 0 otherwise): one trade requested through this actor's own clip procs, like Mable's talk */
+        if (pc_able_test_trade_poll(&tk, &td, &to) && Now_Private != NULL) {
+            if (tk == PC_ABLE_TRADE_EXCHANGE) {
+                (void)(td < mNW_CLOTH_DESIGN_NUM ? aNI_RequestExchangeCloth(td, to) : aNI_RequestExchangeUmb(td - mNW_CLOTH_DESIGN_NUM, to));
+            } else {
+                (void)(td < mNW_CLOTH_DESIGN_NUM ? aNI_RequestCopyClothData(td, &Now_Private->my_org[to & 7])
+                                                 : aNI_RequestCopyUmbData(td - mNW_CLOTH_DESIGN_NUM, &Now_Private->my_org[to & 7]));
+            }
+        }
     }
 #endif
     if (submenu->process_status == mSM_PROCESS_WAIT) {
         if (actor->clip.copy_cloth_data_requested == TRUE) {
+#ifdef TARGET_PC
+            pc_able_trade_begin(PC_ABLE_TRADE_DISPLAY, actor->clip.copy_cloth_data_idx & 3, aNI_PcOrgIdx(actor->clip.copy_cloth_data_design_p));
+#endif
             aNI_CopyClothData(actor->clip.copy_cloth_data_idx, actor->clip.copy_cloth_data_design_p, TRUE);
+#ifdef TARGET_PC
+            pc_able_trade_end(); /* worker B: a TRADE is journaled on a network client (pc_able_net.h); the live refresh / ct copies are not trades */
+#endif
             actor->clip.copy_cloth_data_requested = FALSE;
         }
 
         if (actor->clip.exchange_cloth_data_requested == TRUE) {
+#ifdef TARGET_PC
+            pc_able_trade_begin(PC_ABLE_TRADE_EXCHANGE, actor->clip.exchange_cloth_data_idx & 3, actor->clip.exchange_cloth_data_player_org_idx & 7);
+#endif
             aNI_ExchangeCloth(actor->clip.exchange_cloth_data_idx, actor->clip.exchange_cloth_data_player_org_idx, TRUE);
+#ifdef TARGET_PC
+            pc_able_trade_end(); /* worker B: a TRADE is journaled on a network client (pc_able_net.h); the live refresh / ct copies are not trades */
+#endif
             actor->clip.exchange_cloth_data_requested = FALSE;
         }
 
         if (actor->clip.copy_umb_data_requested == TRUE) {
+#ifdef TARGET_PC
+            pc_able_trade_begin(PC_ABLE_TRADE_DISPLAY, mNW_CLOTH_DESIGN_NUM + (actor->clip.copy_umb_data_idx & 3), aNI_PcOrgIdx(actor->clip.copy_umb_data_design_p));
+#endif
             aNI_CopyUmbData(actor->clip.copy_umb_data_idx, actor->clip.copy_umb_data_design_p, TRUE);
+#ifdef TARGET_PC
+            pc_able_trade_end(); /* worker B: a TRADE is journaled on a network client (pc_able_net.h); the live refresh / ct copies are not trades */
+#endif
             actor->clip.copy_umb_data_requested = FALSE;
         }
 
         if (actor->clip.exchange_umb_data_requested == TRUE) {
+#ifdef TARGET_PC
+            pc_able_trade_begin(PC_ABLE_TRADE_EXCHANGE, mNW_CLOTH_DESIGN_NUM + (actor->clip.exchange_umb_data_idx & 3), actor->clip.exchange_umb_data_player_org_idx & 7);
+#endif
             aNI_ExchangeUmb(actor->clip.exchange_umb_data_idx, actor->clip.exchange_umb_data_player_org_idx, TRUE);
+#ifdef TARGET_PC
+            pc_able_trade_end(); /* worker B: a TRADE is journaled on a network client (pc_able_net.h); the live refresh / ct copies are not trades */
+#endif
             actor->clip.exchange_umb_data_requested = FALSE;
         }
     }

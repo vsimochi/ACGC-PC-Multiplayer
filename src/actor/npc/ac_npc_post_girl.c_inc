@@ -92,7 +92,7 @@ int aPG_check_destination(Mail_c *mail){
             return (mMl_hunt_for_send_address(mail) == -1 && !pc_net_game_guest_address_known(&mail->header.recipient.personalID)) ? 1 : 0;
         }
         if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {
-            return 1;
+            return 0; /* worker B: the museum is always an address; the HOST runs the museum's side (MUSEUM_MAIL kind 19, aPG_client_mail_step) and answers MUSEUM_FULL */
         }
     }
 #endif
@@ -184,6 +184,7 @@ static int aPG_client_mail_step(GAME_PLAY *play) {
         return 2;
     case PC_NETGAME_MAIL_REJECT_PO_FULL:
     case PC_GUEST_MAIL_REJECT_LIMIT: /* guest mailbox: a guest's daily letter limit -- the "we can't take more letters" row (the letter stays) */
+    case PC_MUSEUM_MAIL_REJECT_FULL: /* worker B: the sender's museum record is full (30 fossils / results waiting) -- the same row, the letter and its gift stay */
         return 3;
     default:
         return 1;
@@ -439,7 +440,10 @@ void aPG_receive_menu_close_wait(NPC_POSTGIRL_ACTOR *postgirl, GAME_PLAY *play) 
             int dest;
 #ifdef TARGET_PC
             /* mail milestone 1: a client's letter to a PLAYER goes through the host (aPG_client_mail_step); every other recipient keeps the vanilla path */
-            const int client_mail = (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && play->submenu.mail.header.recipient.type == mMl_NAME_TYPE_PLAYER);
+            /* worker B: a letter WITH A GIFT to the museum takes the same host path (MUSEUM_MAIL kind 19; m_tag_ovl.c keeps it in its slot like a player letter) */
+            const int client_mail = (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT &&
+                                     (play->submenu.mail.header.recipient.type == mMl_NAME_TYPE_PLAYER ||
+                                      (play->submenu.mail.header.recipient.type == mMl_NAME_TYPE_MUSEUM && play->submenu.mail.present != EMPTY_NO && play->submenu.mail.present != RSV_NO)));
             dest = client_mail ? aPG_client_mail_step(play) : aPG_check_destination(&play->submenu.mail);
             if (dest < 0) {
                 return; /* neutral wait for the host's answer: no state change, no message */

@@ -9,6 +9,9 @@
 #include "m_name_table.h"
 #include "m_field_make.h"
 #include "libultra/libultra.h"
+#ifdef TARGET_PC
+extern int pc_net_game_role_is_client(void); /* pc_m_card.c: 1 for a network CLIENT (multiplayer house upgrades, worker C) */
+#endif
 #include "m_cockroach.h"
 #include "m_personal_id.h"
 #include "m_private.h"
@@ -450,8 +453,14 @@ extern void mHm_CheckRehouseOrder() {
     mHm_hs_c* home = Save_Get(homes);
     lbRTC_time_c* rtc_time = Common_GetPointer(time.rtc_time);
     int i;
+    int skip_houses = FALSE;
 
-    for (i = 0; i < PLAYER_NUM; i++) {
+#ifdef TARGET_PC
+    /* Multiplayer house upgrades (worker C): a network CLIENT's homes[] headers are the host's (house sync canon); the host builds every order (its load + its
+     * construction poll). A client's own construction at its boot would put the new wall / door markers into its copy of the floors ahead of the host. */
+    skip_houses = pc_net_game_role_is_client();
+#endif
+    for (i = 0; i < PLAYER_NUM && !skip_houses; i++) {
         if (mPr_NullCheckPersonalID(&home->ownerID) == FALSE) {
             if (home->outlook_pal != home->next_outlook_pal) {
                 home->outlook_pal = home->next_outlook_pal;
@@ -485,6 +494,58 @@ extern void mHm_CheckRehouseOrder() {
         Save_Get(private_data[i].state_flags) &= (~0x200); /* TODO: these need an enum/defines */
     }
 }
+
+#ifdef TARGET_PC
+/**
+ * @brief Multiplayer house upgrades (worker C): the construction of ONE house, for a long-running host (vanilla runs mHm_CheckRehouseOrder only at a
+ * game load). The per-house body of mHm_CheckRehouseOrder (same branches, same date test, same writes) WITHOUT the all-houses outlook_pal copy and
+ * WITHOUT the state_flags loop; a branch that would change nothing (a basement already built and announced, a statue already standing) is skipped so a
+ * repeated call is a no-op.
+ *
+ * @param home_no homes[] index (0..PLAYER_NUM-1)
+ * @param dry_run TRUE = only report what would happen
+ * @return 0 = nothing due, 1 = size change (+ wall / door markers of the main floor), 2 = basement, 3 = statue
+ **/
+extern int mHm_PC_RehouseOne(int home_no, int dry_run) {
+    mHm_hs_c* home;
+    lbRTC_time_c* rtc_time = Common_GetPointer(time.rtc_time);
+
+    if (home_no < 0 || home_no >= PLAYER_NUM) {
+        return 0;
+    }
+    home = Save_GetPointer(homes[home_no]);
+    if (mPr_NullCheckPersonalID(&home->ownerID) != FALSE || !CHECK_ORDER_DATE(home, rtc_time)) {
+        return 0;
+    }
+    if (home->size_info.size != home->size_info.next_size && home->size_info.next_size < mHm_HOMESIZE_STATUE) {
+        if (!dry_run) {
+            home->outlook_pal = home->ordered_outlook_pal;
+            home->next_outlook_pal = home->ordered_outlook_pal;
+            home->size_info.size = home->size_info.next_size;
+            home->size_info.renew = TRUE;
+            mHm_RehouseWallDoor(home, home->size_info.size);
+        }
+        return 1;
+    }
+    if (home->size_info.basement_ordered) {
+        if (home->flags.has_basement && home->size_info.renew) {
+            return 0; /* built, waiting for Nook's announcement (vanilla would only re-set the same two flags) */
+        }
+        if (!dry_run) {
+            mHm_SetBasement((u8)home_no);
+            home->size_info.renew = TRUE;
+        }
+        return 2;
+    }
+    if (home->size_info.statue_ordered == TRUE && home->size_info.next_size != mHm_HOMESIZE_STATUE) {
+        if (!dry_run) {
+            home->size_info.next_size = mHm_HOMESIZE_STATUE;
+        }
+        return 3;
+    }
+    return 0;
+}
+#endif
 
 /**
  * @brief Stores the player's current house size for later.

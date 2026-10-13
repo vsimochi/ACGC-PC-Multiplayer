@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import net_spike_lib as L  # noqa: E402
 import wire_baseline  # noqa: E402
-from test_guest_mailbox_src import read, strip_comments, func_body, ROOT, PC  # noqa: E402
+from test_guest_mailbox_src import read, strip_comments, func_body, ROOT, PC, git_show_pre_guest_mailbox  # noqa: E402
 
 
 def main():
@@ -31,7 +31,7 @@ def main():
     ck = lambda d, c: L.check(d, bool(c), results)  # noqa: E731
     c_raw = read("pc/src/pc_net_game.c")
     c = strip_comments(c_raw)
-    head_c = wire_baseline._git_show(ROOT, "pc/src/pc_net_game.c").replace("\r\n", "\n")
+    head_c = git_show_pre_guest_mailbox("pc/src/pc_net_game.c")  # the last commit WITHOUT the guest mailbox / guest letters (HEAD itself now has them)
     npc = read("src/game/m_npc.c")
     head_npc = wire_baseline._git_show(ROOT, "src/game/m_npc.c").replace("\r\n", "\n")
     ev = read("src/actor/ac_event_manager.c")
@@ -45,7 +45,8 @@ def main():
 
     # ------------------------------------------------------------------ I
     ck("I service 7 GUEST_DIR (324 = 4 + 16 x 20), the array bound 8, the size asserted against the blob max and sizeof(PersonalID_c)",
-       "#define PC_NETGAME_TS_GUESTDIR 7u" in c_raw and "#define PC_NETGAME_TS_NUM      8u" in c_raw and "#define PC_NETGAME_GUESTDIR_MAX   16u" in c_raw
+       "#define PC_NETGAME_TS_GUESTDIR 7u" in c_raw and "#define PC_NETGAME_TS_NUM      9u" in c_raw  # worker B re-pin: service 8 MUSEUM_DONORS raised the bound to 9
+       and "#define PC_NETGAME_GUESTDIR_MAX   16u" in c_raw
        and "_Static_assert(PC_NETGAME_TS_GUESTDIR_LEN == 324u && PC_NETGAME_TS_GUESTDIR_LEN <= PC_NETGAME_TS_BLOB_MAX && sizeof(PersonalID_c) == 20u," in c_raw
        and L.PC_NETGAME_TS_GUESTDIR == 7 and L.PC_NETGAME_TS_GUESTDIR_LEN == 324)
     b = func_body(c_raw, "pcnetgame_ts_build")
@@ -86,7 +87,8 @@ def main():
        and "pc_net_game_guest_address_list(name_p, room)" in mk and mk.index("pc_net_game_guest_address_list") < mk.index("mMsm_GetMuseumMailName(name_p);"))
     ck("J the post office girl (client): a guest of the directory is an address (the host re-checks); a museum letter with a gift is still refused (unchanged)",
        "return (mMl_hunt_for_send_address(mail) == -1 && !pc_net_game_guest_address_known(&mail->header.recipient.personalID)) ? 1 : 0;" in pg
-       and "if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {\n            return 1;" in pg)
+       # worker B re-pin: a museum letter with a gift is now a HOST transaction (MUSEUM_MAIL kind 19): the museum is always an address on a client (0)
+       and "if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {\n            return 0;" in pg)
     ck("J the post office girl (the HOST's own player): a letter to a guest is checked (0 / 2 = mailbox full) and delivered locally instead of the post office",
        "const int g = pc_net_game_host_guest_letter_check(mail);" in pg and "if (!client_mail && !pc_net_game_host_guest_letter_post(&play->submenu.mail))" in pg)
     hp = func_body(c_raw, "pc_net_game_host_guest_letter_post")

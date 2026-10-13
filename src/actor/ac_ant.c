@@ -4,6 +4,9 @@
 #include "m_player_lib.h"
 #include "m_rcp.h"
 #include "sys_matrix.h"
+#ifdef TARGET_PC
+#include "pc_wildlife_authority.h" /* multiplayer ants: pcwld_ant_caught_moved() */
+#endif
 
 enum {
     aANT_ACT_WAIT,
@@ -87,6 +90,11 @@ static void aANT_caught(ANT_ACTOR* ant, GAME* game) {
 
     ant->insect_actor = CLIP(insect_clip)->make_insect_proc(&insect_init, aINS_MAKE_EXIST);
     if (ant->insect_actor != NULL) {
+#ifdef TARGET_PC
+        /* Multiplayer ants (pc_wildlife_authority.c): the host-tracked entity follows the catch to the 9th-slot insect, so the ordinary
+         * (type 0) bug catch path finds it and asks the host (CATCH_REQUEST species ANT) instead of granting it locally. */
+        pcwld_ant_caught_moved(ant, ant->insect_actor);
+#endif
         if (mPlib_Change_item_net_catch_label((u32)ant->insect_actor, mPlayer_NET_CATCH_TYPE_INSECT)) {
             aANT_setupAction(ant, aANT_ACT_DISAPPEAR);
         }
@@ -155,6 +163,17 @@ static void aANT_actor_move(ACTOR* actorx, GAME* game) {
         Actor_world_to_eye(actorx, 0.0f);
     }
 }
+
+#ifdef TARGET_PC
+/* Multiplayer ants (pc_wildlife_authority.c): the host released this ant (another player caught it, its candy is gone): the vanilla fade. */
+void aANT_pc_disappear(ACTOR* actorx) {
+    ANT_ACTOR* ant = (ANT_ACTOR*)actorx;
+
+    if (ant->action == aANT_ACT_WAIT) {
+        aANT_setupAction(ant, aANT_ACT_DISAPPEAR);
+    }
+}
+#endif
 
 extern EVW_ANIME_DATA act_ant_evw_anime;
 extern Gfx act_antT_model[];

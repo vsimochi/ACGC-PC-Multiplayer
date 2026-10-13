@@ -10,6 +10,9 @@
 #include "m_room_type.h"
 #include "m_msg.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_museum_net.h" /* worker B: the name of the GUEST who donated a nibble-5 exhibit */
+#endif
 
 typedef struct {
     s16 x;
@@ -102,9 +105,18 @@ static void Museum_Fossil_Actor_move(ACTOR* actorx, GAME* game) {
 
             res = mRmTp_CheckTalkAble(&angle, &pos, aMF_fossil_data_table[i].direct, 42.5f, (GAME_PLAY*)game);
             if (res != FALSE) {
+#ifdef TARGET_PC
+                /* worker B: a guest's donation (nibble 5) the host attributed reads "donated by <guest>" (MSG_12191) instead of "a former resident" */
+                u8 pc_gname[PLAYER_NAME_LEN];
+                const int pc_guest = donator == mMmd_DONATOR_DELETED_PLAYER && pc_museum_guest_donor(i, pc_gname, NULL);
+                museum_fossil->msg_no = (donator == mMmd_DONATOR_NONE)
+                                            ? MSG_12193
+                                            : ((donator == mMmd_DONATOR_DELETED_PLAYER && !pc_guest) ? MSG_12192 : MSG_12191);
+#else
                 museum_fossil->msg_no = (donator == mMmd_DONATOR_NONE)
                                             ? MSG_12193
                                             : ((donator == mMmd_DONATOR_DELETED_PLAYER) ? MSG_12192 : MSG_12191);
+#endif
                 museum_fossil->target_angle = angle;
                 if (mDemo_Request(mDemo_TYPE_SPEAK, actorx, &aMF_SetTalkInfo)) {
                     if (mMmd_IS_DONATED(donator)) {
@@ -124,6 +136,11 @@ static void Museum_Fossil_Actor_move(ACTOR* actorx, GAME* game) {
                                 Save_Get(private_data[mMmd_DONATOR_PLR_IDX(donator)]).player_ID.player_name,
                                 PLAYER_NAME_LEN);
                         }
+#ifdef TARGET_PC
+                        else if (pc_guest) {
+                            mMsg_Set_free_str(mMsg_Get_base_window_p(), mMsg_FREE_STR0, pc_gname, PLAYER_NAME_LEN);
+                        }
+#endif
                     }
 
                     break;

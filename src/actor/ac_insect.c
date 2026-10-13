@@ -13,6 +13,7 @@
 #ifdef TARGET_PC
 #include "pc_wildlife_authority.h" /* World Ecology Wildlife Sync T4: pcwld_bug_controller_torn_down() --
                                        see aINS_actor_dt()'s own doc below. ADDITIVE only. */
+#include "pc_net_game.h"           /* multiplayer latent bugs: pc_net_game_wildlife_tool_action() (aINS_set_pl_act_tim) */
 #endif
 
 static aINS_CTRL_ACTOR* aINS_ctrlActor = NULL;
@@ -100,3 +101,19 @@ static void aINS_actor_dt(ACTOR* actorx, GAME* game) {
     aINS_ctrlActor = NULL;
 #endif
 }
+
+#ifdef TARGET_PC
+/* Multiplayer spirits (G2, pc_wildlife_authority.c): the HOST released the record of an uncaught spirit of acre (bx, bz) that has no live actor any
+ * more -- the move to another free acre vanilla's aINS_destruct() would have made (aINS_regist_set_block_table), done now. No-op outside the ghost
+ * event (no common area). */
+void aINS_pc_spirit_reregister(int bx, int bz) {
+    static ACTOR dummy; /* aINS_regist_set_block_table() reads only block_x / block_z (the acre the new one must differ from) */
+
+    if (mEv_get_common_area(mEv_EVENT_GHOST, 55) == NULL) {
+        return;
+    }
+    dummy.block_x = (s8)bx;
+    dummy.block_z = (s8)bz;
+    aINS_regist_set_block_table(&dummy);
+}
+#endif

@@ -3,6 +3,7 @@
 #include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated messages / choice strings */
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES (lifecycle hardening: the one place that knows the house count) */
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: Nook's announcement of the 5-minute closure */
+#include "pc_house_upgrade.h" /* house upgrades via Nook for resident clients (worker C): kind-20 transactions instead of local homes[] / loan writes */
 #include <string.h>
 /* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
  * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
@@ -1804,7 +1805,9 @@ enum {
     aNSC_PC_WK_ASK,         /* the job row is up: its choices come from pc_nook_work_row() */
     aNSC_PC_UP_ASK,         /* shop upgrade: the announcement is up, waiting for its acknowledgement choice */
     aNSC_PC_UP_BEGIN,       /* shop upgrade: start the closure (host: at once; client: the request) */
-    aNSC_PC_UP_PENDING      /* shop upgrade: the client's start request is in flight (the host's service 6 answers) */
+    aNSC_PC_UP_PENDING,     /* shop upgrade: the client's start request is in flight (the host's service 6 answers) */
+    aNSC_PC_HU_BEGIN,       /* house upgrade (worker C): the wait row is up, begin the REHOUSE talk-start op (retried while another transaction is unresolved) */
+    aNSC_PC_HU_PENDING      /* house upgrade: the kind-20 transaction is in flight (the wait row stays at its continue point) */
 };
 
 static int aNSC_pc_hs_state;
@@ -2041,6 +2044,117 @@ static void aNSC_pc_up_after_begin(NPC_SHOP_COMMON_ACTOR* shop_common, int r) {
     }
 }
 
+/* ---- House upgrades via Nook for a resident CLIENT (worker C, pc_house_upgrade.h) ----
+ * Every write of the vanilla rehouse dialogue (the size / roof order, the basement order, the statue order, the "built" acknowledgement with the next loan) is ONE host
+ * transaction (kind 20) instead of a local write: homes[] arrives from the host through house sync, the loan of an acknowledgement is set by the APPLIED apply. Two seams:
+ *   (a) the REHOUSE talk start (statue order / acknowledgement / the automatic basement of a Large house): the wait row PC_NOOK_MSG_UPG_WAIT is shown, the op runs
+ *       (aNSC_PC_HU_BEGIN / _PENDING), APPLIED continues with the vanilla row Nook would have said, a refusal with a PC row;
+ *   (b) the choices of the DONE_REHOUSE offer (roof colour = the size order, the basement): the vanilla message is LOCKED at its continue point while the op runs
+ *       (aNSC_pc_hu_choice_step); APPLIED unlocks it (the vanilla follow-up row), a refusal replaces the follow-up with a PC row.
+ * Without the capability (an old host / no house sync / a guest) the previous behaviour stays: the plain greeting (Batch G3). Host / solo: untouched. */
+static int aNSC_pc_hu_op;    /* the talk-start op (PC_HU_OP_*), 0 = none */
+static int aNSC_pc_hu_after; /* the vanilla row (aNSC_MSG_*) that follows an APPLIED talk-start op */
+static int aNSC_pc_hu_hold;  /* the choice seam: 0 idle, 2 the transaction is in flight (the vanilla message is locked) */
+static int aNSC_get_start_call_msg_no(ACTOR* actorx);
+
+static mHm_hs_c* aNSC_pc_hu_home(void) {
+    return &Save_Get(homes)[mHS_get_arrange_idx(Common_Get(player_no))];
+}
+
+/* The op a client's talk must run on the host FIRST (aNSC_set_talk_info_start_wait / the Large-without-basement case of aNSC_start_wait) and the vanilla row after it. 0 = none. */
+static int aNSC_pc_hu_talk_op(int* after) {
+    static const int built[3] = { aNSC_MSG_MEDIUM_BUILT, aNSC_MSG_LARGE_BUILT, aNSC_MSG_UPPER_BUILT };
+    mHm_hs_c* home = aNSC_pc_hu_home();
+    mHm_rmsz_c* size = &home->size_info;
+    if (Now_Private == NULL) {
+        return 0;
+    }
+    if (size->renew == TRUE) {
+        *after = size->basement_ordered ? aNSC_MSG_BASEMENT_BUILT : built[(size->size >= 1 && size->size <= 3) ? size->size - 1 : 0];
+        return PC_HU_OP_ACK_BUILT;
+    }
+    if (size->statue_ordered == TRUE && size->next_size == mHm_HOMESIZE_STATUE) {
+        *after = aNSC_MSG_STATUE_BUILT;
+        return PC_HU_OP_ACK_BUILT;
+    }
+    if (Now_Private->inventory.loan == 0 && size->size == mHm_HOMESIZE_UPPER && size->size == size->next_size && size->statue_ordered == FALSE) {
+        *after = aNSC_MSG_REHOUSE_STATUE;
+        return PC_HU_OP_ORDER_STATUE;
+    }
+    if (Now_Private->inventory.loan == 0 && size->size == mHm_HOMESIZE_LARGE && size->size == size->next_size && size->basement_ordered == FALSE &&
+        home->flags.has_basement == FALSE && size->pad_1 == FALSE) {
+        *after = aNSC_MSG_REHOUSE_BASEMENT; /* aNSC_start_wait's DONE_REHOUSE Large case: the basement is ordered without a choice */
+        return PC_HU_OP_ORDER_BASEMENT;
+    }
+    return 0;
+}
+
+static void aNSC_pc_set_talk_info_houseup(ACTOR* actorx) {
+    mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_UPG_WAIT));
+    ((NPC_SHOP_COMMON_ACTOR*)actorx)->next_action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT;
+}
+
+static int aNSC_pc_hu_fail_which(int reason, int sent) {
+    if (reason == PC_HU_REJECT_BUSY || reason == PC_HU_REJECT_CHANGED) {
+        return PC_NOOK_MSG_UPG_BUSY;
+    }
+    if (reason == 0 && sent) {
+        return PC_NOOK_MSG_UPG_LINKLOST;
+    }
+    return PC_NOOK_MSG_UPG_FAILED;
+}
+
+/* the talk-start op finished: APPLIED -> the vanilla row, else a refusal row (both end the conversation) */
+static void aNSC_pc_hu_talk_done(NPC_SHOP_COMMON_ACTOR* shop_common, int applied) {
+    if (applied) {
+        printf("[NET][HOUSEUP] nook dialogue: op %d APPLIED -> the vanilla row %d\n", aNSC_pc_hu_op, aNSC_pc_hu_after);
+        aNSC_Set_continue_msg_num(mMsg_Get_base_window_p(), shop_common, aNSC_get_msg_no(aNSC_pc_hu_after));
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+        aNSC_pc_hs_state = aNSC_PC_HS_END;
+    } else {
+        const int which = aNSC_pc_hu_fail_which(pc_house_upgrade_last_reason(), pc_house_upgrade_last_sent());
+        printf("[NET][HOUSEUP] nook dialogue: op %d not done (reason %d, sent %d) -> row %d\n", aNSC_pc_hu_op, pc_house_upgrade_last_reason(), pc_house_upgrade_last_sent(), which);
+        aNSC_pc_hs_end(shop_common, which, 0);
+    }
+}
+
+/* The choice seam (b). -1 = hold (the caller returns; the vanilla message stays locked at its continue point), 1 = APPLIED (the caller continues the vanilla flow without its
+ * local write), 0 = not done (a refusal row is the next message; the caller continues the vanilla flow without its local write). */
+static int aNSC_pc_hu_choice_step(NPC_SHOP_COMMON_ACTOR* shop_common, int op, int arg) {
+    mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
+    int r, which;
+    if (aNSC_pc_hu_hold == 0) {
+        r = pc_house_upgrade_begin(op, arg);
+        if (r < 0) {
+            mMsg_Set_LockContinue(msg_p); /* another transaction is unresolved: retried next frame, the message waits */
+            return -1;
+        }
+        if (r == 1) {
+            printf("[NET][HOUSEUP] nook dialogue: order op %d (arg %d) sent to the host; the message waits\n", op, arg);
+            mMsg_Set_LockContinue(msg_p);
+            aNSC_pc_hu_hold = 2;
+            return -1;
+        }
+        which = aNSC_pc_hu_fail_which(0, 0);
+    } else {
+        r = pc_house_upgrade_poll();
+        if (r == PC_NETGAME_TS_OP_PENDING) {
+            return -1;
+        }
+        aNSC_pc_hu_hold = 0;
+        if (r == PC_NETGAME_TS_OP_APPLIED) {
+            printf("[NET][HOUSEUP] nook dialogue: order op %d APPLIED -> the vanilla follow-up row\n", op);
+            mMsg_Unset_LockContinue(msg_p);
+            return 1;
+        }
+        which = aNSC_pc_hu_fail_which(pc_house_upgrade_last_reason(), pc_house_upgrade_last_sent());
+    }
+    printf("[NET][HOUSEUP] nook dialogue: order op %d not done (reason %d) -> row %d instead of the vanilla follow-up\n", op, pc_house_upgrade_last_reason(), which);
+    aNSC_Set_continue_msg_num(msg_p, shop_common, pc_nook_msg_id(which));
+    mMsg_Unset_LockContinue(msg_p);
+    return 0;
+}
+
 /* Yes. of the offer / the "Buy a house." choice: price, then the free houses. */
 static void aNSC_pc_hs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     int r = pc_net_game_house_purchase_precheck(-1);
@@ -2074,6 +2188,30 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
         pc_nook_house_rejoin_hold_touch(); /* heartbeat: the rejoin hold lives only while this proc runs (PENDING / END) */
     }
     switch (aNSC_pc_hs_state) {
+        case aNSC_PC_HU_BEGIN:
+            if (aNSC_pc_hu_op == 0) {
+                /* the house changed between the request and the talk: nothing to do, the plain greeting follows the wait row */
+                aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(aNSC_get_start_call_msg_no(actorx)));
+                aNSC_pc_hs_state = aNSC_PC_HS_END;
+                break;
+            }
+            r = pc_house_upgrade_begin(aNSC_pc_hu_op, 0);
+            if (r < 0) {
+                return; /* another transaction is unresolved: next frame */
+            }
+            if (r == 0) {
+                aNSC_pc_hu_talk_done(shop_common, 0); /* refused locally: nothing was sent */
+            } else {
+                aNSC_pc_hs_state = aNSC_PC_HU_PENDING;
+            }
+            break;
+        case aNSC_PC_HU_PENDING:
+            r = pc_house_upgrade_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                return;
+            }
+            aNSC_pc_hu_talk_done(shop_common, r == PC_NETGAME_TS_OP_APPLIED);
+            break;
         case aNSC_PC_UP_BEGIN:
             r = pc_shop_upgrade_begin();
             if (r == 3) {
@@ -2466,8 +2604,22 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         /* Batch G3: REHOUSE (loan/statue bookkeeping in aNSC_set_talk_info_start_wait) and DONE_REHOUSE (house
          * upgrade/basement/roof-colour order) write homes[] / Private_c.inventory.loan locally. For a client use
          * the plain greeting instead; TYPE_3 is identical to REHOUSE's else-branch (aNSC_get_start_call_msg_no,
-         * next_action SAY_HELLO_APPROACH) minus those writes. Host/solo unchanged. */
+         * next_action SAY_HELLO_APPROACH) minus those writes. Host/solo unchanged.
+         * House upgrades via Nook (worker C): with the host's kind-20 support (pc_house_upgrade_available) a resident client keeps the vanilla
+         * talk: a talk start that must write (statue order / "built" acknowledgement / the automatic basement) becomes PC_HOUSEUP (the host does
+         * it first), DONE_REHOUSE keeps its offer (its order choices go through the host: aNSC_pc_hu_choice_step), the rest is the greeting. */
+#ifdef aNSC_PC_HOUSE
+        int pc_after = 0;
+        aNSC_pc_hu_hold = 0; /* a new talk: no choice seam is in flight */
+        if (pc_house_upgrade_available() && (aNSC_pc_hu_op = aNSC_pc_hu_talk_op(&pc_after)) != 0) {
+            wait_type = aNSC_WAIT_TYPE_PC_HOUSEUP;
+            aNSC_pc_hu_after = pc_after;
+        } else if (!pc_house_upgrade_available() || wait_type == aNSC_WAIT_TYPE_REHOUSE) {
+            wait_type = aNSC_WAIT_TYPE_3;
+        }
+#else
         wait_type = aNSC_WAIT_TYPE_3;
+#endif
     }
 
 #ifdef aNSC_PC_HOUSE
@@ -2481,6 +2633,15 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
     }
 #endif
 
+#ifdef aNSC_PC_HOUSE
+    {
+        static int s_pc_last_wait_type = -1;
+        if (aNSC_PC_IS_CLIENT() && wait_type != s_pc_last_wait_type) {
+            s_pc_last_wait_type = wait_type;
+            printf("[NET][HOUSEUP] nook dialogue: client talk type now %d (0 rehouse, 1 done-rehouse offer, 3 greeting, 7 house upgrade talk start)\n", wait_type);
+        }
+    }
+#endif
     if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == TRUE && mDemo_Check_ListenAble() == FALSE) {
         switch (wait_type) {
             case aNSC_WAIT_TYPE_HRATALK:
@@ -2495,6 +2656,7 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
 #ifdef aNSC_PC_HOUSE
             case aNSC_WAIT_TYPE_PC_HOUSE:
             case aNSC_WAIT_TYPE_PC_UPGRADE:
+            case aNSC_WAIT_TYPE_PC_HOUSEUP:
                 action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT; /* a greeting that waits for a choice: same animation / position handling */
                 break;
 #endif
@@ -2532,6 +2694,9 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         } else if (wait_type == aNSC_WAIT_TYPE_PC_UPGRADE) {
             printf("[NET][SHOPUP] nook dialogue: the shop upgrade announcement is shown\n");
             aNSC_pc_hs_enter(shop_common, aNSC_PC_UP_ASK);
+        } else if (wait_type == aNSC_WAIT_TYPE_PC_HOUSEUP) {
+            printf("[NET][HOUSEUP] nook dialogue: talk start needs the host first: op %d (then vanilla row %d)\n", aNSC_pc_hu_op, aNSC_pc_hu_after);
+            aNSC_pc_hs_enter(shop_common, aNSC_PC_HU_BEGIN);
         }
 #endif
         return;
@@ -2560,6 +2725,9 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
             break;
         case aNSC_WAIT_TYPE_PC_UPGRADE:
             proc = aNSC_pc_set_talk_info_upgrade;
+            break;
+        case aNSC_WAIT_TYPE_PC_HOUSEUP:
+            proc = aNSC_pc_set_talk_info_houseup;
             break;
 #endif
     }
@@ -2621,6 +2789,16 @@ static void aNSC_check_col_chg_or_make_basement(NPC_SHOP_COMMON_ACTOR* shop_comm
                 action = aNSC_ACTION_CHECK_ROOF_COL_ORDER;
                 break;
             case mChoice_CHOICE1:
+#ifdef aNSC_PC_HOUSE
+                if (aNSC_PC_IS_CLIENT()) {
+                    /* worker C: the basement order is the host's (kind 20); the message waits at its continue point meanwhile */
+                    if (aNSC_pc_hu_choice_step(shop_common, PC_HU_OP_ORDER_BASEMENT, 0) < 0) {
+                        return;
+                    }
+                    action = aNSC_ACTION_SAY_HELLO_END_WAIT;
+                    break;
+                }
+#endif
                 aNSC_set_make_basement_info();
                 action = aNSC_ACTION_SAY_HELLO_END_WAIT;
                 break;
@@ -2647,6 +2825,15 @@ static void aNSC_check_roof_col_order(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_P
                 case mChoice_CHOICE1:
                 case mChoice_CHOICE2:
                     action = aNSC_ACTION_SAY_HELLO_END_WAIT;
+#ifdef aNSC_PC_HOUSE
+                    if (aNSC_PC_IS_CLIENT()) {
+                        /* worker C: the size + roof order is the host's (kind 20); the message waits at its continue point meanwhile */
+                        if (aNSC_pc_hu_choice_step(shop_common, PC_HU_OP_ORDER_SIZE, choice) < 0) {
+                            return;
+                        }
+                        break;
+                    }
+#endif
                     home->size_info.next_size += 1;
                     home->ordered_outlook_pal = choice;
                     aNSC_set_rehouse_order_date(home);
@@ -2672,6 +2859,15 @@ static void aNSC_check_roof_col_order2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_
             case mChoice_CHOICE1:
             case mChoice_CHOICE2:
                 action = aNSC_ACTION_SAY_HELLO_END_WAIT;
+#ifdef aNSC_PC_HOUSE
+                if (aNSC_PC_IS_CLIENT()) {
+                    /* worker C: the size + roof order (second colour page) is the host's (kind 20) */
+                    if (aNSC_pc_hu_choice_step(shop_common, PC_HU_OP_ORDER_SIZE, choice + unk * 3) < 0) {
+                        return;
+                    }
+                    break;
+                }
+#endif
                 home->size_info.next_size += 1;
                 home->ordered_outlook_pal = choice + unk * 3;
                 aNSC_set_rehouse_order_date(home);

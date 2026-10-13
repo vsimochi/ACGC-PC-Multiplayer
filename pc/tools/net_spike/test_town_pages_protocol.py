@@ -9,7 +9,7 @@ TIER: PROTOCOL TESTED against a REAL host process (`--host --bootstrap-resident 
   P4 a notice post write is applied and mirrored; invalid content (control byte, bad flag, bad length, bad index) is refused BAD and nothing changes
   P5 independent pages: writes to two different pages both apply
   P6 late join / reconnect: a NEW client is pushed the CURRENT canonical copies
-  P7 a guest cannot write (BAD / refused)
+  P7 a guest is pushed every page (worker B: it plays a never-persisted copy of THIS town) and may write DESIGN pages; its NOTICE write is refused BAD
   P8 host restart: the canonical content survives (the host save), a client joining the restarted host receives it
 Usage: python test_town_pages_protocol.py [--port 11890]
 """
@@ -197,12 +197,13 @@ def run(args, results, ip):
         clients.append(g)
         g.connect_and_ready(quiet=True)
         L.pump_sleep(1.0)
-        mg = g.inbox.mark()
-        write(g, DESIGN, 7, 1, design("GUEST"))
-        L.pump_sleep(1.0)
-        gp = pages(g)
+        gp = wait_pages(g)
         pushes = [v for v in gp.values() if v[1] == 0]
-        check("P7 a guest is never pushed a page (%d pushes), its write is refused BAD and not applied" % len(pushes), len(pushes) == 0 and any(x[1] & F_BAD for x in replies(g, DESIGN, 7, mg)) and not any(x[1] & F_APPLIED for x in replies(g, DESIGN, 7, mg)))
+        mg = g.inbox.mark()
+        write(g, NOTICE, 7, gp[(NOTICE, 7)][0], notice("guest"))
+        L.pump_sleep(1.0)
+        check("P7 a guest is pushed all 23 pages (%d pushes); its NOTICE write is refused BAD and not applied (design writes: test_able_trade_protocol.py)" % len(pushes),
+              len(gp) == 23 and len(pushes) >= 23 and any(x[1] & F_BAD for x in replies(g, NOTICE, 7, mg)) and not any(x[1] & F_APPLIED for x in replies(g, NOTICE, 7, mg)))
         # P8 persistence over a host restart
         for cl in list(clients):
             try:

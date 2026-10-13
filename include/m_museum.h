@@ -66,6 +66,11 @@ extern void mMsm_SendCompMail();
 typedef int (*mMsm_GUEST_SINK)(Mail_c* mail, void* ctx);
 extern int mMsm_MuseumComplete(void);
 extern int mMsm_GuestCompMailForSink(Private_c* gpriv, int complete, mMsm_GUEST_SINK sink, void* ctx);
+/* worker B (host, MUSEUM_MAIL kind 19 + the guest museum day pass): see m_museum.c */
+extern int mMsm_PC_MuseumMailRoom(Private_c* priv, mActor_name_t present);
+extern int mMsm_PC_MuseumMailFor(Private_c* priv, mActor_name_t present, int donor);
+extern int mMsm_PC_GuestMuseumDay(Private_c* gpriv, int order_info, mMsm_GUEST_SINK sink, void* ctx);
+extern void mMsm_PC_ResidentsResultPass(int order_info);
 #endif
 
 #ifdef __cplusplus

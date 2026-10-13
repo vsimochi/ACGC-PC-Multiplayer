@@ -95,6 +95,7 @@ GUARDS = {
     ("pc_net_game.c", "pcnetgame_room_enter_test_hook"): "TEST-ONLY env-armed hook (AC_TEST_ROOM_ENTER); the read follows the local scene classification; no exec gate (known low-risk gap, test builds only)",
     # (d) wildlife presentation: only reached with a live presentation actor (has_actor entries exist only inside a play scene) and pcfa_scene_is_town() for the trace.
     ("pc_wildlife_authority.c", "pcwld_client_rematerialize"): "reached only for an entity that has a presentation slot with a (culled) local actor; pl == NULL -> return",
+    ("pc_net_game.c", "pcnetgame_house_client_commit_tick"): "verbose-only diagnostic log argument (not code use): reached only when s_hcl.last_own_unsafe, which pcnetgame_local_house_unsafe() sets only under gamePT->exec == play_main; the same line already guards gamePT != NULL",
     ("pc_wildlife_authority.c", "pcwld_trace_positions"): "TRACE only (PC_WILDLIFE_TRACE logging): behind pcfa_scene_is_town(); the actor read is a log argument",
 }
 

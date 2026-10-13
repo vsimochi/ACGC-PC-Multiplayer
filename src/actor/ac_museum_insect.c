@@ -1,4 +1,8 @@
 #include "ac_museum_insect_priv.h"
+#ifdef TARGET_PC
+#include "pc_museum_net.h" /* worker B: guest donor names */
+#include "m_museum_display.h"
+#endif
 // clang-format off
 extern Gfx
     act_m_mu_monshiro1T_model,
@@ -707,6 +711,16 @@ int Museum_Insect_GetMsgNo(ACTOR* actorx) {
         mMsg_Set_free_str(mMsg_Get_base_window_p(), mMsg_FREE_STR0,
                           common_data.save.save.private_data[insect_caught_by - 1].player_ID.player_name, 8);
     }
+#ifdef TARGET_PC
+    {
+        /* worker B: a guest's attributed donation (nibble 5) reads like a resident's, with the guest's name */
+        u8 pc_gname[PLAYER_NAME_LEN];
+        if (insect_caught_by == mMmd_DONATOR_DELETED_PLAYER && pc_museum_guest_donor(pc_museum_exhibit_of_item((unsigned short)insect_no), pc_gname, NULL)) {
+            mMsg_Set_free_str(mMsg_Get_base_window_p(), mMsg_FREE_STR0, pc_gname, PLAYER_NAME_LEN);
+            insect_caught_by = 1; /* the "named donor" rows below */
+        }
+    }
+#endif
 
     if (actor->_2F7C < actor->_2F78 - 1) {
         if (insect_caught_by >= 1 && insect_caught_by <= 4) {

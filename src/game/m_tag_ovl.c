@@ -3762,7 +3762,9 @@ static void mTG_send_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     Submenu_Item_c* item_p = submenu->item_p;
 
 #ifdef TARGET_PC
-    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail->header.recipient.type == mMl_NAME_TYPE_PLAYER) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER ||
+                                                        (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO))) {
+        /* worker B: a letter WITH A GIFT to the museum is a host transaction too (MUSEUM_MAIL kind 19): it stays in its slot the same way */
         /* Mail milestone 1: a client's letter to a PLAYER is sent through a host transaction (post girl seam), and it must stay in its mail[] slot
          * (byte-identical, send font) until the host's APPLIED removes it: a pocket that empties here would upload an empty slot while the host
          * still has to read the letter from its mirror. The post girl dialogue works on the copy in submenu->mail (receive font, as vanilla). */

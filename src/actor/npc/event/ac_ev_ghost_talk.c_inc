@@ -492,6 +492,11 @@ static void aEGH_set_force_talk_info(ACTOR* actorx) {
       }
 
       ghost_common->flags |= mEv_GHOST_FLAG_ACTIVE;
+#ifdef TARGET_PC
+      /* multiplayer spirit hunt: the HOST decides where spirits spawn (from its own ghost common area); a client that accepted the Wisp's
+       * request tells it, so the hunt starts for the whole town (GHOST_HUNT, pc_net_game.c). No-op for a host / single player. */
+      pc_net_game_ghost_hunt_accepted();
+#endif
       break;
     }
 

@@ -34,9 +34,9 @@ def main():
     chain = re.search(r"static void aNSC_pc_map_chain_msg\(int msg_index\) \{(.*?)\n\}\n", nsc, re.S).group(1)
     ck("L9 chain is a no-op unless the flag is set, and consumes it (exactly once)", chain.strip().startswith("if (aNSC_pc_map_just_granted) {") and "aNSC_pc_map_just_granted = 0;" in chain)
     # the map line itself adds no generated row; the count grew to 35 later for dresser storage (PC_NOOK_MSG_DRESSER_REFUSED), not for the map line
-    ck("L10 the map line adds no new action / message id / enum entry (PC_NOOK_MSG_COUNT 39 = 34 + the dresser refusal row + the 4 shop upgrade rows appended after it)",
-       "#define PC_NOOK_MSG_COUNT 39" in rd("pc", "include", "pc_nook_house.h") and "PC_NOOK_MSG_DRESSER_REFUSED, /*" in rd("pc", "include", "pc_nook_house.h")
-       and "PC_NOOK_MSG_UPGRADE_DOOR      /*" in rd("pc", "include", "pc_nook_house.h"))
+    ck("L10 the map line adds no new action / message id / enum entry (PC_NOOK_MSG_COUNT 45 = 34 + the dresser refusal row + the 4 shop upgrade rows + the 2 guest post rows + the 4 house upgrade rows, all appended after it; the map line itself added none)",
+       "#define PC_NOOK_MSG_COUNT 45" in rd("pc", "include", "pc_nook_house.h") and "PC_NOOK_MSG_DRESSER_REFUSED, /*" in rd("pc", "include", "pc_nook_house.h")
+       and "PC_NOOK_MSG_UPGRADE_DOOR,     /*" in rd("pc", "include", "pc_nook_house.h") and "PC_NOOK_MSG_UPG_BUSY          /*" in rd("pc", "include", "pc_nook_house.h"))
     ck("L11 client flag describes the latest applied shop txn only (reset at the start of apply, set only inside the grant branch)",
        "s_map_granted_oneshot = 0; /* the map-line flag always describes" in ng and ng.count("s_map_granted_oneshot = 1;") == 1)
     ck("L12 exported test-hook state lives only in the single export includer", nsc.count("int aNSC_pc_map_oneshot_state(int* total)") == 1 and nsc.index("int aNSC_pc_map_oneshot_state") > nsc.index("#ifdef aNSC_PC_EXPORT_MAP_GRANT"))

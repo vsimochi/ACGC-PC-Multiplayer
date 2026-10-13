@@ -122,6 +122,12 @@ static void Player_actor_setup_main_Notice_net(ACTOR* actor, GAME* game) {
                            the exchange; otherwise the query returns NONE and the exchange grants a duplicate. */
                         pc_net_game_record_local_catch_denied(entity_id);
                         grant_handled = TRUE;
+                    } else if (entity_id == 0 && idx == aINS_INSECT_TYPE_ANT && pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+                        /* multiplayer ants: every ant of a multiplayer town is a host record whose entity follows the net catch
+                           (pcwld_ant_caught_moved, ac_ant.c). An ant without one (its record was released while it was in the net,
+                           a lost mapping) is refused instead of granted locally: the host never awarded it. */
+                        printf("[NET][WILDLIFE] untracked ant catch refused locally (no host record)\n");
+                        grant_handled = TRUE;
                     }
                     /* entity_id == 0 (no tracked local BUG presentation entry for this exact label -- e.g.
                        this bug predates T4 tracking, or an indoor round-trip invalidated the mapping, see

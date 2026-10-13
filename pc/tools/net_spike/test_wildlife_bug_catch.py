@@ -35,14 +35,10 @@ scheme where the coverage is directly analogous):
           (type 39 -- NOT WILDLIFE_SPAWN, type 37, which a late-joiner never receives for pre-existing
           entities either way, matching test_wildlife_catch.py's own TEST F fix) must never re-offer the
           already-caught entity_id.
-  TEST ANT (T4's explicit ant-exclusion guard): a real spawned ant (PC_WILDLIFE_KIND_BUG, species ==
-          aINS_INSECT_TYPE_ANT) DOES get a real entity_id and IS broadcast like any other wildlife record
-          (confirmed by inspection of pcwld_table_insert()/pcwld_shim_make_ant_proc(),
-          pc_wildlife_authority.c) -- so, unlike the original task brief's own worst-case assumption, this
-          IS constructible as a genuine protocol-level test: a CATCH_REQUEST claiming the ant's own real
-          species from within reach must still be REJECTED outright by
-          pcnetgame_validate_and_commit_catch()'s own explicit `rec.species == aINS_INSECT_TYPE_ANT` guard
-          (pc_net_game.c), and the ant must remain live afterward (no despawn).
+  TEST ANT (W-06, wildlife special cases): a real spawned ant (PC_WILDLIFE_KIND_BUG, species ==
+          aINS_INSECT_TYPE_ANT) gets a real entity_id and is broadcast like any other wildlife record; a
+          CATCH_REQUEST claiming the ant's own species from within reach is now ACCEPTED (item ITM_INSECT38)
+          with exactly one despawn. (Until W-06 an explicit ant guard rejected it: ants were never shown.)
   TEST EXCHANGE (H/I-style, mirrors test_wildlife_catch_exchange_gate.py): exercises the SAME
           s_catch_last_outcome state / pc_net_game_query_catch_outcome() query the putaway-NET
           exchange-screen gate (m_player_main_putaway_net.c_inc, T4's own mirror of the putaway-ROD fix)
@@ -122,6 +118,9 @@ KIND_BUG = 1
 # enum insect_type (ac_insect_h.h): aINS_INSECT_TYPE_ANT is index 38 of 40 (0..39), the second-to-last
 # entry before aINS_INSECT_TYPE_MOSQUITO (39) and aINS_INSECT_TYPE_NUM (40).
 AINS_INSECT_TYPE_ANT = 38
+# Not an "ordinary" catch target of these tests: the ant (its own TEST ANT), and the bagworm (35) / spider (37), which hang hidden in their tree until
+# somebody shakes it -- the host refuses a catch of one it still holds hidden (latent bugs, worker A); nobody can net one in vanilla either.
+NOT_ORDINARY = (AINS_INSECT_TYPE_ANT, 35, 37)
 
 # Same acre burst test_wildlife_catch.py/test_wildlife_catch_realgrant.py already use for fish --
 # pcwld_host_spawn_trigger() runs BOTH the fish and insect vanilla overlays synchronously for every acre
@@ -217,7 +216,7 @@ def force_spawn_bugs(client, tag):
             client.send_reliable(build_trigger(bx, bz))
             spawns.extend(collect_spawns(client, 0.15))
         spawns.extend(collect_spawns(client, 0.5))
-        if len([s for s in spawns if s["kind"] == KIND_BUG and s["species"] != AINS_INSECT_TYPE_ANT]) >= 2:
+        if len([s for s in spawns if s["kind"] == KIND_BUG and s["species"] not in NOT_ORDINARY]) >= 2:
             break
     bugs = [s for s in spawns if s["kind"] == KIND_BUG]
     print(f"[bug-catch] {tag}: forced spawn burst produced {len(spawns)} total spawn(s), {len(bugs)} BUG")
@@ -235,7 +234,7 @@ def force_spawn_one_ordinary_bug(client, tag, host_player=None):
             client.send_reliable(build_trigger(bx, bz))
             spawns = collect_spawns(client, 0.15)
             seen_bugs.update(s["entity_id"] for s in spawns if s["kind"] == KIND_BUG)
-            ordinary = [s for s in spawns if s["kind"] == KIND_BUG and s["species"] != AINS_INSECT_TYPE_ANT]
+            ordinary = [s for s in spawns if s["kind"] == KIND_BUG and s["species"] not in NOT_ORDINARY]
             if ordinary:
                 print(f"[bug-catch] {tag}: single-bug seed found entity {ordinary[0]['entity_id']} "
                       f"(species {ordinary[0]['species']}) at acre ({bx},{bz}); {len(seen_bugs) - 1} other bug record(s) exist")
@@ -248,7 +247,7 @@ def force_spawn_one_ordinary_bug(client, tag, host_player=None):
                     collect_despawns(client, 0.5)
                 return ordinary[0]
     spawns = collect_spawns(client, 0.5)
-    ordinary = [s for s in spawns if s["kind"] == KIND_BUG and s["species"] != AINS_INSECT_TYPE_ANT]
+    ordinary = [s for s in spawns if s["kind"] == KIND_BUG and s["species"] not in NOT_ORDINARY]
     return ordinary[0] if ordinary else None
 
 
@@ -300,7 +299,7 @@ def test_a(port, log_dir, results):
         seed.connect_and_ready()
         seed.drain_field_updates(timeout=0.3)
         bugs = force_spawn_bugs(seed, "seed")
-        ordinary = [b for b in bugs if b["species"] != AINS_INSECT_TYPE_ANT]
+        ordinary = [b for b in bugs if b["species"] not in NOT_ORDINARY]
         seed.close()
         check("TEST A: at least one real ordinary (non-ant) BUG spawn seeded on the host "
               "(RNG-dependent)", len(ordinary) > 0, results)
@@ -354,7 +353,7 @@ def test_b(port, log_dir, results):
         seed.drain_field_updates(timeout=0.3)
         bugs = force_spawn_bugs(seed, "seed")
         seed.close()
-        ordinary = [b for b in bugs if b["species"] != AINS_INSECT_TYPE_ANT]
+        ordinary = [b for b in bugs if b["species"] not in NOT_ORDINARY]
         check("TEST B: at least two real ordinary BUG spawns seeded on the host (RNG-dependent -- "
               "needed so the host's own self-catch and the client's own catch can land on two "
               "DIFFERENT entities)", len(ordinary) >= 2, results)
@@ -452,7 +451,7 @@ def test_protocol_suite(port, log_dir, results):
         a.drain_field_updates(timeout=0.3)
 
         bugs = force_spawn_bugs(a, "seed")
-        ordinary = [b for b in bugs if b["species"] != AINS_INSECT_TYPE_ANT]
+        ordinary = [b for b in bugs if b["species"] not in NOT_ORDINARY]
         ants = [b for b in bugs if b["species"] == AINS_INSECT_TYPE_ANT]
         check("protocol suite: at least one ordinary (non-ant) BUG spawn produced for testing "
               "(RNG-dependent)", len(ordinary) > 0, results)
@@ -553,17 +552,19 @@ def test_protocol_suite(port, log_dir, results):
               "T1 never gives them a local presentation actor)",
               len(ants) > 0, results)
         if ants:
+            # W-06 (wildlife special cases, worker A): ants are catchable now -- every process shows the ant actor and its net catch reaches the
+            # ordinary bug catch path; the host grants ITM_INSECT38 (0x2D26). Before that change this claim was rejected by an explicit ant guard.
             ant = ants[0]
             a.send_move_any(ant["x"], 0.0, ant["z"], reliable=True)
             time.sleep(0.3)
             send_catch(a, ant["entity_id"], generation, 9050, ant["species"])
             res = collect_catch_results(a, 0.5)
-            check("TEST ANT: a CATCH_REQUEST claiming an ant's own real species, from within reach, is "
-                  "still REJECTED by the explicit `rec.species == aINS_INSECT_TYPE_ANT` guard",
-                  len(res) == 1 and res[0]["accepted"] == 0, results)
-            despawns = collect_despawns(a, 0.2)
-            check("TEST ANT: no WILDLIFE_DESPAWN for the rejected ant claim (the ant remains live)",
-                  len(despawns) == 0, results)
+            check("TEST ANT: a CATCH_REQUEST claiming an ant's own real species, from within reach, is ACCEPTED "
+                  "(W-06: the old ant-exclusion guard is gone) with the ant item 0x2D26",
+                  len(res) == 1 and res[0]["accepted"] == 1 and res[0]["granted_item"] == 0x2D26, results)
+            despawns = collect_despawns(a, 0.3)
+            check("TEST ANT: exactly one WILDLIFE_DESPAWN for the caught ant",
+                  despawns.count(ant["entity_id"]) == 1, results)
         else:
             print("[bug-catch] TEST ANT: WARNING -- zero ants spawned this run (RNG-dependent); guard "
                   "not exercised this run, but confirmed present by source (pc_net_game.c: "
@@ -576,7 +577,7 @@ def test_protocol_suite(port, log_dir, results):
         print("[bug-catch] TEST C: two-client race on the SAME entity_id")
         more_bugs = force_spawn_bugs(a, "race-seed")
         race_candidates = [b for b in more_bugs
-                           if b["species"] != AINS_INSECT_TYPE_ANT and b["entity_id"] != e_caught_id]
+                           if b["species"] not in NOT_ORDINARY and b["entity_id"] != e_caught_id]
         check("TEST C: a fresh ordinary BUG entity is available for the race test (RNG-dependent)",
               len(race_candidates) > 0, results)
         if race_candidates:
@@ -963,7 +964,7 @@ def test_exchange_i(port, log_dir, results):
         seed.connect_and_ready()
         seed.drain_field_updates(timeout=0.3)
         bugs = force_spawn_bugs(seed, "seed")
-        ordinary = [b for b in bugs if b["species"] != AINS_INSECT_TYPE_ANT]
+        ordinary = [b for b in bugs if b["species"] not in NOT_ORDINARY]
         seed.close()
         check("EXCHANGE-I: at least one real ordinary BUG spawn seeded on the host (RNG-dependent)",
               len(ordinary) > 0, results)

@@ -144,6 +144,7 @@ enum aNSC_wait_type {
     aNSC_WAIT_TYPE_HRATALK,
     aNSC_WAIT_TYPE_PC_HOUSE, /* TARGET_PC only: the guest house offer (first greeting); never selected elsewhere */
     aNSC_WAIT_TYPE_PC_UPGRADE, /* TARGET_PC only: the multiplayer shop upgrade announcement (pc_shop_upgrade.h); never selected elsewhere */
+    aNSC_WAIT_TYPE_PC_HOUSEUP, /* TARGET_PC only: a resident CLIENT's REHOUSE talk start that needs the host (statue order / "built" acknowledgement / automatic basement order, pc_house_upgrade.h) */
 
     aNSC_WAIT_TYPE_NUM
 };

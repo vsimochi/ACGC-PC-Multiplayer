@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 41
+#define PC_NOOK_MSG_COUNT 45
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -55,7 +55,12 @@ enum {
     PC_NOOK_MSG_UPGRADE_DOOR,     /* the shop door while the shop is closed for the upgrade (the minutes left) */
     /* Guest mailbox (the post office girl; appended: every earlier id keeps its value): */
     PC_NOOK_MSG_POST_NOMAIL,      /* "Check my mail." with an empty guest mailbox: nothing is waiting (closing row) */
-    PC_NOOK_MSG_POST_DONE         /* after the guest's mailbox overlay closed: the letters left there stay at the post office (closing row) */
+    PC_NOOK_MSG_POST_DONE,        /* after the guest's mailbox overlay closed: the letters left there stay at the post office (closing row) */
+    /* House upgrades via Nook for resident clients (worker C, pc_house_upgrade.h; appended: every earlier id keeps its value): */
+    PC_NOOK_MSG_UPG_WAIT,         /* talk start while the host takes the statue order / the "built" acknowledgement / the automatic basement order: a greeting that waits (CONTINUE) */
+    PC_NOOK_MSG_UPG_FAILED,       /* the host refused (nothing changed): "come back later" (closing row) */
+    PC_NOOK_MSG_UPG_LINKLOST,     /* the link was lost in flight: the outcome is unknown (closing row) */
+    PC_NOOK_MSG_UPG_BUSY          /* the house is busy (HOUSE_BUSY) / the paperwork changed (HOUSE_CHANGED): ask again in a moment (closing row) */
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */

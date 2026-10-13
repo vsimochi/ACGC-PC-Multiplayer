@@ -135,6 +135,12 @@ extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with 
                                 mMl_clear_mail(&mTG_MAILBOX()[i]);""", """                                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) /* mail milestone 2: refused for a client (its marks were dropped earlier) */
 #endif
                                 mMl_clear_mail(&Common_Get(now_home)->mailbox[i]);"""),
+        # museum letters with a gift (worker B, deliberate re-pin): the client's mail-send proc keeps a letter WITH A GIFT to the museum in its slot like a player letter (MUSEUM_MAIL kind 19)
+        ("""    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER ||
+                                                        (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO))) {
+        /* worker B: a letter WITH A GIFT to the museum is a host transaction too (MUSEUM_MAIL kind 19): it stays in its slot the same way */
+""", """    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail->header.recipient.type == mMl_NAME_TYPE_PLAYER) {
+"""),
     ]
 
     def gm_undo(t):

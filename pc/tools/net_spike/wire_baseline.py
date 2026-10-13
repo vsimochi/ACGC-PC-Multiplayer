@@ -68,9 +68,10 @@ EXPECTED_MAX_MSG_ID = 76
 # range and may be present or absent while workers land: 77 TREE_DROP, 78 SHOP_PREVIEW, 79 / 80 ball, 81 BEE_SWARM, 82 bees spare,
 # 83 / 84 dresser storage, 85 SHOP_UPGRADE_REQ (the announced 5-minute shop upgrade, client -> host, 8 B; deliberate, no protocol bump).
 # Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
-SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86))
-SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*|ShopUpgradeReq)Msg"
-_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-5])\s*,?"
+SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
+# worker A (deliberate, no protocol bump): 86 WILDLIFE_TOOL_ACTION (client -> host, 8 B, latent bugs), 87 GHOST_HUNT (client -> host, 4 B, spirit hunt)
+SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*|ShopUpgradeReq|VillagerOutfit|WildlifeToolAction|GhostHunt)Msg|PCNetGameOutfitWire"  # worker B: VILLAGER_OUTFIT; worker A: 86 / 87
+_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|90)\s*,?"
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -191,7 +192,9 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              # batch A (A1): service 4 = HOST_CONFIG (authoritative wildlife mode), array bound 5, 8-byte blob
              # the announced shop upgrade (deliberate): service 6 = SHOP_UPGRADE (16-byte state blob), array bound 7; an old client ignores service 6
              # letters to guests (deliberate): service 7 = GUEST_DIR (324-byte directory blob), array bound 8; an old client ignores service 7
-             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      8u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             # worker B (deliberate): service 8 = MUSEUM_DONORS (284-byte guest donor names), array bound 9; an old client ignores service 8
+             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      9u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             "#define PC_NETGAME_TS_MDONORS  8u", "#define PC_NETGAME_TS_MDONORS_LEN (4u + 120u + PC_NETGAME_MDONORS_NAMES * 20u) /* 284 (worker B) */",
              "#define PC_NETGAME_TS_GUESTDIR 7u", "#define PC_NETGAME_TS_GUESTDIR_LEN (4u + PC_NETGAME_GUESTDIR_MAX * 20u) /* 324 */", "#define PC_NETGAME_GUESTDIR_MAX   16u",
              "#define PC_NETGAME_TS_UPGRADE  6u", "#define PC_NETGAME_TS_UPGRADE_LEN 16u",
              # events: service 5 = EVENT_STATE (214-byte decision-state blob), array bound 6
@@ -380,6 +383,15 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_DRESSER_DISABLED": '37',
     # guest mailbox (deliberate, v8 extended in place): reason 38 MAIL_LIMIT; MAILBOX_LETTER (56) house 0xFF = the guest's host-held mailbox (no layout change)
     "PC_NETGAME_TXN_REASON_MAIL_LIMIT": '38',
+    # house upgrades via Nook (worker C, deliberate, v8 extended in place): TXN_COMMIT kind 20 HOUSE_UPGRADE + reasons 45..47 (no new message, no layout change)
+    "PC_NETGAME_TXN_KIND_HOUSE_UPGRADE": '20',
+    "PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE": '45',
+    "PC_NETGAME_TXN_REASON_HOUSE_BUSY": '46',
+    "PC_NETGAME_TXN_REASON_HOUSE_CHANGED": '47',
+    # museum letters with a gift (worker B, deliberate, v8 extended in place): TXN_COMMIT kind 19 MUSEUM_MAIL + reasons 42 MUSEUM_FULL / 43 MUSEUM_MAIL_OFF (no new message, no layout change)
+    "PC_NETGAME_TXN_KIND_MUSEUM_MAIL": '19',
+    "PC_NETGAME_TXN_REASON_MUSEUM_FULL": '42',
+    "PC_NETGAME_TXN_REASON_MUSEUM_MAIL_OFF": '43',
     "PC_NETGAME_MBOX_HOUSE_GUEST": '0xFF',
     "PC_NETGAME_HOUSE_AUTO": '0xFF',
     "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',

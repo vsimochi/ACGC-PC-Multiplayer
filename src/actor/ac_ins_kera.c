@@ -509,3 +509,27 @@ static void aIKR_actor_move(ACTOR* actorx, GAME* game) {
         insect->action_proc(actorx, game);
     }
 }
+
+#ifdef TARGET_PC
+/* Multiplayer latent bugs (pc_wildlife_authority.c): 1 while the mole cricket is still in the ground. */
+int aIKR_pc_hidden(const ACTOR* actorx) {
+    return ((const aINS_INSECT_ACTOR*)actorx)->action == aIKR_ACT_HIDE;
+}
+
+/* Multiplayer latent bugs, CLIENT: the host's copy left the ground (another player dug it up): this copy comes out the way aIKR_hide() brings it
+ * out after a local dig. Returns TRUE when it did. */
+int aIKR_pc_follow_reveal(ACTOR* actorx, GAME* game, int host_action) {
+    aINS_INSECT_ACTOR* insect = (aINS_INSECT_ACTOR*)actorx;
+    int i;
+
+    if (insect->action != aIKR_ACT_HIDE || host_action == aIKR_ACT_HIDE || mPlib_Get_item_net_catch_label() == (u32)actorx) {
+        return FALSE;
+    }
+    aIKR_set_avoid_player_angl(actorx, game);
+    aIKR_setupAction(insect, aIKR_ACT_APPEAR, game);
+    for (i = 3; i < 6; i++) {
+        eEC_CLIP->effect_make_proc(eEC_EFFECT_DIG_MUD, actorx->world.position, 2, actorx->shape_info.rotation.y, game, RSV_NO, 0, 0x4000 | i);
+    }
+    return TRUE;
+}
+#endif

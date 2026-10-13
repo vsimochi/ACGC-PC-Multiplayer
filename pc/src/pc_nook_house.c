@@ -825,6 +825,46 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "Please come again!");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_UPG_WAIT: /* house upgrades (worker C): the talk start while the host answers; the actor sets the continue message (the vanilla row / a refusal row) */
+            nk_text(&b, "Ah, ");
+            nk_code(&b, NK_PLAYERNAME);
+            nk_text(&b, "! Hello, hello!");
+            nk_pause(&b, 8);
+            nk_text(&b, "\nJust a moment, let me\ncheck my records, hm...");
+            nk_code(&b, NK_BTN);
+            nk_code(&b, NK_FORCENEXT);
+            nk_code(&b, NK_CONTINUE);
+            break;
+        case PC_NOOK_MSG_UPG_FAILED:
+            nk_text(&b, "Hm, I'm afraid I can't");
+            nk_pause(&b, 6);
+            nk_text(&b, "\ntake care of that just now.");
+            nk_page(&b);
+            nk_text(&b, "Nothing has changed, hm.");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nPlease come back later!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_UPG_LINKLOST:
+            nk_text(&b, "Oh my, the line went quiet");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nin the middle of the\npaperwork.");
+            nk_page(&b);
+            nk_text(&b, "I cannot say whether it");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nwent through. Please ask\nme again in a bit, hm?");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_UPG_BUSY:
+            nk_text(&b, "Hm, my records for your");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nhouse are being updated\nright now.");
+            nk_page(&b);
+            nk_text(&b, "Please ask me again in");
+            nk_pause(&b, 6);
+            nk_text(&b, "\na moment, hm?");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_RESTOCK_DOOR:
             nk_text(&b, "Sorry, sorry!");
             nk_pause(&b, 8);

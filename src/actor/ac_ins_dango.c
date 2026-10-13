@@ -401,3 +401,22 @@ static void aIDG_actor_move(ACTOR* actor, GAME* game) {
         insect->action_proc(actor,game);
     }
 }
+
+#ifdef TARGET_PC
+/* Multiplayer latent bugs (pc_wildlife_authority.c): 1 while the pill bug is still under its rock. */
+int aIDG_pc_hidden(const ACTOR* actorx) {
+    return ((const aINS_INSECT_ACTOR*)actorx)->action == aIDG_ACTION_HIDE;
+}
+
+/* Multiplayer latent bugs, CLIENT: the host's copy came out from under the rock (another player hit it): this copy comes out the way aIDG_hide()
+ * lets it after a local rock hit. Returns TRUE when it did. */
+int aIDG_pc_follow_reveal(ACTOR* actorx, GAME* game, int host_action) {
+    aINS_INSECT_ACTOR* insect = (aINS_INSECT_ACTOR*)actorx;
+
+    if (insect->action != aIDG_ACTION_HIDE || host_action == aIDG_ACTION_HIDE || mPlib_Get_item_net_catch_label() == (u32)actorx) {
+        return FALSE;
+    }
+    aIDG_setupAction(insect, aIDG_ACTION_APPEAR, game);
+    return TRUE;
+}
+#endif

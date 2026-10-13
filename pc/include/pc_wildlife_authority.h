@@ -113,10 +113,9 @@ int pcwld_presentation_has(uint32_t entity_id);
  * position are a TRUST BOUNDARY on a client (received over the network) and are fully validated
  * here (range-checked; rejected with a log line and return 0, never a crash). A duplicate
  * entity_id (pcwld_presentation_has() already true) is a successful no-op (1) -- never replaces a
- * live actor. Ants (PC_WILDLIFE_KIND_BUG, aINS_INSECT_TYPE_ANT) are accepted but deliberately
- * produce NO actor (recorded as "handled" so a duplicate is still a no-op) -- see
- * pc_wildlife_authority.c's own doc for why ants can't safely share this same synchronous path in
- * T1. Never blocks; a local scene/clip that isn't ready yet (e.g. this process hasn't finished
+ * live actor. Ants (PC_WILDLIFE_KIND_BUG, aINS_INSECT_TYPE_ANT) get the separate mAc_PROFILE_ANT
+ * actor (W-06), only while their tile still holds candy / a spoiled turnip -- see
+ * pc_wildlife_authority.c's ANTS block. Never blocks; a local scene/clip that isn't ready yet (e.g. this process hasn't finished
  * loading the town) is treated as an ordinary, retryable-by-nothing failure (0), not a crash. */
 int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx, int bz, float x,
                               float y, float z);
@@ -464,6 +463,29 @@ void pcwld_client_bobber_event(uint32_t entity_id, int ev, int gyo_type, float x
 int pcwld_client_collect_bobber(PcWldBobber* out);
 /* 1 iff this CLIENT's fish actor is a stamped creature of the host (its AI must not decide wildlife outcomes). */
 int pcwld_fish_is_driven(const void* fish_actor);
+
+/* ================================================================================================
+ * Wildlife special cases: spirits, ants, latent bugs (see pc_wildlife_authority.c's own blocks)
+ * ================================================================================================ */
+/* TEST-ONLY (`hspawnbug`): an authoritative record of any kind / species at (x, z); returns the entity id, 0 on failure. */
+uint32_t pcwld_test_host_inject_kind(int kind, int species, float x, float z);
+/* LATENT BUGS. HOST: queue a remote player's tool use (aINS_PL_ACT_*, town unit coordinates) for the insects; 1 = queued. */
+int pcwld_host_queue_pl_action(int action, int ut_x, int ut_z);
+/* HOST, start of the insect controller tick (ac_insect_move.c_inc): the next queued remote tool use, 1 = there was one. */
+int pcwld_host_take_pl_action(int* action, int* ut_x, int* ut_z);
+/* HOST: 1 = a catch of this bug must be refused (the host's copy is still hidden and uncatchable). */
+int pcwld_host_bug_catch_blocked(uint32_t entity_id);
+/* COCKROACH: vanilla's spawn pose (aINS_Init_c.extra_data: 4 tree, 6 spoiled turnip, 0 otherwise) from the field tile under (x, z). */
+int pcwld_cockroach_extra_data(float x, float z);
+/* ANTS: the net caught the ant actor `ant`; its entity is tracked through the 9th-slot insect `insect` from now on (ac_ant.c). */
+void pcwld_ant_caught_moved(const void* ant, void* insect);
+/* SPIRITS. HOST: mark the entity as removed by a CATCH (called right before its despawn), so its actor does not move to another acre. */
+void pcwld_note_caught(uint32_t entity_id);
+/* SPIRITS. HOST, from aINS_destruct(): 1 = skip vanilla's move of this spirit to another acre (caught, or its record still lives). */
+int pcwld_spirit_keep_acre(const void* insect_actor);
+/* TEST-ONLY (the autopilot's `ghost on|off`): spirits act as if the ghost event ran (aIHD_actor_move's event check); 0 unless a test set it. */
+void pcwld_test_force_ghost_run(int on);
+int pcwld_test_ghost_run_forced(void);
 
 #ifdef __cplusplus
 }

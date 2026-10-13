@@ -5,6 +5,7 @@
 #include "m_msg.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#include "pc_museum_net.h" /* worker B: guest donor names (Blathers) */
 #endif
 
 enum {

@@ -89,6 +89,11 @@ def main():
     _ge = "    if (mPO_receipt_proc(&W, mPO_SENDTYPE_MAIL) != TRUE) {"
     guest_commit = hd_raw[hd_raw.index(_gs):hd_raw.index(_ge)] if _gs in hd_raw and _ge in hd_raw else ""
     hd_raw = hd_raw.replace(guest_commit, "") if guest_commit else hd_raw
+    # worker B (deliberate re-pin): kind 19 MUSEUM_MAIL shares the handler; its commit block (`if (museum) {` right after the sender is forced) is audited by
+    # test_able_museum_src.py / test_museum_mail_protocol.py and cut out here like the guest-recipient block
+    _ms, _me = "    if (museum) {\n        /* worker B: MUSEUM_MAIL commit.", _ge  # (the guest-recipient block was cut just above: the museum block now ends where the post-office path starts)
+    museum_commit = hd_raw[hd_raw.index(_ms):hd_raw.index(_me)] if _ms in hd_raw and _me in hd_raw else ""
+    hd_raw = hd_raw.replace(museum_commit, "") if museum_commit else hd_raw
     hd = strip_comments(hd_raw)
     x1b, x1e = c_raw.index("===== X1 BEGIN"), c_raw.index("===== X1 END")
     x1 = strip_comments(c_raw[x1b:x1e])
@@ -205,9 +210,10 @@ def main():
     # ------------------------------------------------------------------ H: host handler
     check("H the handler exists in its own MAIL HOST block and the dispatcher routes exactly kind 12 to it (after the town-service kinds, before the X1 handler)",
           "pcnetgame_handle_host_mail_txn(peer, &tc); /* mail milestone 1" in c_raw and c_raw.count("pcnetgame_handle_host_mail_txn(") == 2
-          and re.search(r"else if \(tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND\) \{\s*pcnetgame_handle_host_mail_txn\(peer, &tc\);", c_raw) is not None)
+          # worker B re-pin: kind 19 MUSEUM_MAIL (a letter with a gift to the museum) shares the handler
+          and re.search(r"else if \(tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND \|\| tc\.kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_MAIL\) \{[^\n]*\s*pcnetgame_handle_host_mail_txn\(peer, &tc\);", c_raw) is not None)
     order = ["s_host_peer_link[peer] != PC_NETGAME_LINK_READY", "PC_TXN_FAULT_IGNORE_COMMIT", "pcnetgame_rec_gate(peer, 0, 0)", "st->rec_state != PC_NETGAME_RECS_SYNCED",
-             "shape_ok = in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND", "pcnetgame_txn_nonce_fenced(", "pcnetgame_txn_journal_find(", "R->max_seq = t->txn_seq;",
+             "shape_ok = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || museum)", "pcnetgame_txn_nonce_fenced(",  # worker B re-pin: kind 19 "pcnetgame_txn_journal_find(", "R->max_seq = t->txn_seq;",
              "pcnetgame_rec_refresh_hostfields(idx, slot);", "t->base_epoch != slot->epoch", "pcnetgame_rec_validate_inventory(t->pre_pockets", "mPr_CheckCmpPersonalID(&Save_Get(homes[i]).ownerID",
              "pcnetgame_mail_be_hash(L) & 0xFFFFFFu", "mMl_check_send_mail((Mail_c*)L)", "pcnetgame_is_pocket_legal_item(L->present)", "L->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER",
              "mMl_hunt_for_send_address((Mail_c*)L)", "mMl_chk_mail_free_space(Save_Get(homes[rh]).mailbox", "mPO_count_mail(rh) >= HOME_MAILBOX_SIZE", "PC_TXN_FAULT_FAIL_WORLD",
@@ -237,7 +243,7 @@ def main():
     check("H a guest / extra player (a bound resident with NO house on the host) is refused with NO_DONOR_SLOT before anything else about the letter is read (source audited: no guest exists today)",
           in_order(hd, ["sh < 0", "PC_NETGAME_TXN_REASON_NO_DONOR_SLOT", "mMl_check_not_used_mail((Mail_c*)L) == TRUE"]))
     check("H a STALE_IMAGE (empty mirror slot / hash mismatch) triggers the paced stale push, like the base check: the client re-syncs from a full push",
-          hd.count("pcnetgame_rec_stale_push(") == 2 and "if (stale) {" in hd)
+          hd.count("pcnetgame_rec_stale_push(") == 2 and "if (stale) {" in hd and museum_commit.count("pcnetgame_rec_stale_push(") == 1)  # worker B: + the museum commit's guest push (cut block)
     check("H the gift travels inside the letter only: the handler never writes pockets / conds / wallet (no inventory write; the post-image sent is the mirror's unchanged one)",
           "pcnetgame_rec_txn_write_inventory(" not in hd and "inventory." not in hd.replace("t->pre_", "").replace("pcnetgame_rec_validate_inventory", ""))
     rej_ok = True
@@ -249,13 +255,14 @@ def main():
           "rejects PO_FULL with nothing mutated (mPO_receipt_check_mail mutates nothing for a PLAYER letter it refuses)",
           len(re.findall(r"pcnetgame_txn_reject\(", hd)) >= 10 and rej_ok)
     check("H faults: ignore_commit, fail_world and kill_peer_after_commit have exactly ONE site each in the mail handler (drop_result is the shared RESULT sender)",
-          sorted(re.findall(r"pcnetgame_txn_fault_fire\((PC_TXN_FAULT_\w+)\)", hd)) == ["PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"])
+          sorted(re.findall(r"pcnetgame_txn_fault_fire\((PC_TXN_FAULT_\w+)\)", hd)) == ["PC_TXN_FAULT_FAIL_WORLD", "PC_TXN_FAULT_IGNORE_COMMIT", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT"]
+          and museum_commit.count("PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT") == 1)  # worker B: the museum commit (cut block) has its own kill site
     wr = func_body(c_raw[x1b:x1e], "pcnetgame_rec_txn_write_mail")
     check("H the mail[] writer pcnetgame_rec_txn_write_mail (X1 block) is the ONLY writer of a mirrored mail[] slot outside the D3 merge: idx must pass pcnetgame_rec_txn_idx_ok (never the host's own resident), "
           "slot < 10, raw mMl_clear_mail / memcpy, four callers (the kind-12 handler with NULL, the kind-13 take handler with the host's letter -- its resident commit, its guest-mailbox commit and that "
           "commit's rollback when the guest file cannot be written: audited in test_mail2_src.py)",
           "pcnetgame_rec_txn_idx_ok(idx)" in wr and "mail_slot >= mPr_INVENTORY_MAIL_COUNT" in wr and "mMl_clear_mail(&r->mail[mail_slot]);" in wr
-          and c.count("pcnetgame_rec_txn_write_mail(") == 7 and hd.count("pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL)") == 1  # + the guest-recipient clear and its rollback (re-pin)
+          and c.count("pcnetgame_rec_txn_write_mail(") == 9 and hd.count("pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL)") == 1  # + the guest-recipient clear and its rollback (re-pin); worker B: + the MUSEUM_MAIL clear and its rollback
           and len(re.findall(r"(?:->|\.)mail\[[^\]]*\]\s*=[^=]", c)) == 0 and len(re.findall(r"mMl_clear_mail\(&r->mail", c)) == 1
           and "mMl_clear_mail(&Save_Get(private_data)" not in c and "Save_Get(private_data)[idx].mail" not in strip_comments(c_raw[d3b:d3e]).replace("&Save_Get(private_data)[idx].mail[t->slot]", ""))
     check("H the hash helper converts a ZEROED scratch Private_c holding one letter copy (no live record is touched); both sides use it",
@@ -287,7 +294,9 @@ def main():
           "it runs once per client poll next to the transaction tick",
           "#define PC_NETGAME_MAIL_CLEAN_TIMEOUT_MS 5000u" in c_raw and "PC_NETGAME_MAIL_CLEAN_TIMEOUT_MS" in tick
           and in_order(tick, ["PC_NETGAME_MAIL_CLEAN_TIMEOUT_MS", "!pcfa_save_ready()", "pcnetgame_owner_stamp_matches(&s_mail_op.owner)", "(pcnetgame_mail_be_hash(ml) & 0xFFFFFFu) != s_mail_op.h24",
-                              "s_crec.up_blocked", "!pcnetgame_mail_state_clean()", "s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;", "pcnetgame_txn_try_send()"])
+                              "s_crec.up_blocked", "!pcnetgame_mail_state_clean()",
+                              "s_ctxn.kind = ml->header.recipient.type == (u8)mMl_NAME_TYPE_MUSEUM ? (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL : (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;",  # worker B re-pin
+                              "pcnetgame_txn_try_send()"])
           and "pcnetgame_mail_tick(); /* mail milestone 1" in c_raw and c_raw.index("pcnetgame_txn_tick()) { /* X1b") < c_raw.index("pcnetgame_mail_tick(); /* mail milestone 1"))
     ts = func_body(xc_raw, "pcnetgame_txn_try_send")
     mcase = ts[ts.index("case PC_NETGAME_TXN_KIND_MAIL_SEND: {"):ts.index("case PC_NETGAME_TXN_KIND_MAIL_TAKE: {")]
@@ -295,7 +304,7 @@ def main():
           "would block the uploads forever), echoes the gift and fills aux_cond / aux_item from the stored hash",
           "pcnetgame_mail_be_hash(ml) & 0xFFFFFFu" in mcase and "pcnetgame_mail_state_clean()" in mcase and mcase.count("pcnetgame_txn_cancel_queued(") == 3
           and "item = (uint16_t)ml->present;" in mcase and "aux_cond = T->ts_aux;" in mcase and "aux_item = T->ts_aux_item;" in mcase
-          and re.search(r"T->kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND \|\| T->kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_TAKE;", ts) is not None)
+          and re.search(r"T->kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_SEND \|\| T->kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MAIL_TAKE \|\|\s*T->kind == \(uint8_t\)PC_NETGAME_TXN_KIND_MUSEUM_MAIL;", ts) is not None)  # worker B re-pin
     am = func_body(xc_raw, "pcnetgame_txn_apply_mail")
     check("C APPLIED of kind 12 (pcnetgame_txn_apply_mail): the sent letter leaves the slot ONLY here, and only if the slot still hashes to the sent letter (else kept + logged 'possible local divergence'); "
           "pockets / wallet are never touched; the D3 base moves forward only on the same session / epoch",
@@ -304,7 +313,8 @@ def main():
           and am.index("possible local divergence") < am.index("return 1;") < am.index("pcnetgame_crec_set_base("))
     aa = func_body(xc_raw, "pcnetgame_txn_apply_applied")
     check("C apply_applied routes kind 12 to apply_mail right after the owner stamp check, before the shop / pocket logic",
-          in_order(aa, ["pcnetgame_owner_stamp_matches(&T->owner)", "if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {", "return pcnetgame_txn_apply_mail(T, in);", "PC_NETGAME_TXN_KIND_SHOP_BUY"]))
+          in_order(aa, ["pcnetgame_owner_stamp_matches(&T->owner)", "if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {",
+                        "return pcnetgame_txn_apply_mail(T, in);", "PC_NETGAME_TXN_KIND_SHOP_BUY"]))  # worker B re-pin
     all_mail_writes = re.findall(r"mMl_clear_mail\(&Now_Private->mail\[[^\]]*\]\)|mMl_copy_mail\(&Now_Private->mail|Now_Private->mail\[[^\]]*\]\s*=[^=]", c)
     check("C PC_NETGAME-side client writes of Now_Private->mail[]: exactly ONE clear (apply_mail, APPLIED only); the only other writes are the TEST-ONLY hook's letter (mMl_init_mail / present) and the D3 adopt memcpy",
           len(re.findall(r"mMl_clear_mail\(&Now_Private->mail", c)) == 1 and "mMl_copy_mail(&Now_Private->mail" not in c
@@ -317,9 +327,11 @@ def main():
     check("C begin_send refuses unless READY + SYNCED + uploads not stopped, the slot holds a used send-font PLAYER-addressed letter, and no other operation / transaction is unresolved (-1); it never changes the letter",
           in_order(bs, ["s_role != PC_NETGAME_ROLE_CLIENT", "s_mail_op.active || s_ts_op.active || pcnetgame_txn_busy()", "s_crec.state != PC_NETGAME_CRS_SYNCED || s_crec.up_blocked",
                         "!mMl_check_send_mail((Mail_c*)ml)", "pcnetgame_capture_owner_stamp(&stamp)", "s_crec.next_check_ms = 0;"])
-          and "ml->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER" in bs and "mMl_clear_mail(" not in bs and "->mail[" not in strip_comments(bs).replace("Now_Private->mail[slot]", ""))
+          and "!(ml->header.recipient.type == (u8)mMl_NAME_TYPE_PLAYER ||" in bs and "ml->present != (mActor_name_t)EMPTY_NO && ml->present != (mActor_name_t)RSV_NO" in bs  # worker B re-pin: + a museum letter WITH a gift
+          and "mMl_clear_mail(" not in bs and "->mail[" not in strip_comments(bs).replace("Now_Private->mail[slot]", ""))
     check("C a REJECTED / refused result leaves the letter: resolve() only records done / outcome / reason; the result handler's REJECTED branch changes no inventory (kinds are shared with the shop / museum seams)",
-          "s_mail_op.done = 1;" in func_body(mc_raw, "pcnetgame_mail_op_resolve") and "if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {\n        pcnetgame_mail_op_resolve(request_id, applied);" in c_raw)
+          "s_mail_op.done = 1;" in func_body(mc_raw, "pcnetgame_mail_op_resolve")
+          and "if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {\n        pcnetgame_mail_op_resolve(request_id, applied);" in c_raw)  # worker B re-pin
     check("C session reset clears the operation (a link loss is a local refusal: the letter never left its slot) and pc_net_game_mail_poll() reports REJECTED then",
           "memset(&s_mail_op, 0, sizeof(s_mail_op));" in func_body(c_raw, "pcnetgame_reset_client_session_state") and "memset(&s_mail_op, 0, sizeof(s_mail_op));" in func_body(mc_raw, "pc_net_game_mail_poll"))
     # ---- seams
@@ -345,19 +357,22 @@ def main():
           and cw.index("if (!client_mail && !pc_net_game_host_guest_letter_post(") < cw.index("mPO_receipt_proc(&play->submenu.mail, mPO_SENDTYPE_MAIL);")
           and "if (!client_mail) /* a client's player letter never left its slot" in cw and cw.index("never left its slot") < cw.index("mMl_copy_mail(&Now_Private->mail[submenu_item->slot_no], &play->submenu.mail);")
           and "dest = aPG_check_destination(&play->submenu.mail);" in cw
-          and "s_aPG_client_mail_active = 0;" in ini and "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && play->submenu.mail.header.recipient.type == mMl_NAME_TYPE_PLAYER" in cw)
+          and "s_aPG_client_mail_active = 0;" in ini and "(pc_net_game_role() == PC_NETGAME_ROLE_CLIENT &&\n                                     (play->submenu.mail.header.recipient.type == mMl_NAME_TYPE_PLAYER ||" in cw)  # worker B re-pin: + museum with a gift
     sp = func_body(tag, "mTG_send_proc")
     check("C seam mTG_send_proc: a client's PLAYER letter is COPIED into submenu->mail (receive font there only) and stays in its pocket slot (no empty-slot upload); every other letter takes the unchanged vanilla "
           "font / copy / clear sequence",
-          "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail->header.recipient.type == mMl_NAME_TYPE_PLAYER" in sp and "submenu->mail.content.font = mMl_FONT_RECV;" in sp
+          "pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER ||" in sp and "submenu->mail.content.font = mMl_FONT_RECV;" in sp  # worker B re-pin
           and "mail->content.font = mMl_FONT_RECV;\n        mMl_copy_mail(&submenu->mail, mail);\n        mMl_clear_mail(mail);" in sp
           and sp.index("} else\n#endif") < sp.index("mMl_clear_mail(mail);"))
     check("C the API is declared in pc_net_game.h (begin / poll / last_reason, the three MAIL_REJECT codes equal the C reasons) and the post girl file includes it under TARGET_PC",
           all(x in h for x in ("int pc_net_game_mail_begin_send(int mail_slot);", "int pc_net_game_mail_poll(void);", "int pc_net_game_mail_last_reason(void);",
                                "#define PC_NETGAME_MAIL_REJECT_NO_SUCH_ADDRESS 23", "#define PC_NETGAME_MAIL_REJECT_MAILBOX_FULL    24", "#define PC_NETGAME_MAIL_REJECT_PO_FULL         25"))
           and '#ifdef TARGET_PC\n#include "pc_net_game.h"' in read("src/actor/npc/ac_npc_post_girl.c"))
-    check("C the museum seam is untouched: client MUSEUM gift refusal kept, no mMsm_ call anywhere in the mail host / client blocks (museum letters wait for M3)",
-          "mMsm_" not in mh and "mMsm_" not in mc and "mMsm_SendMuseumMail" not in c)
+    # worker B re-pin (museum letters with a gift, kind 19): the museum seam is no longer refused on a client; the host runs ONLY the explicit-record variants
+    # (mMsm_PC_MuseumMailRoom / mMsm_PC_MuseumMailFor on the sender's mirror record), never the vanilla mMsm_SendMuseumMail (Common now_private / player_no)
+    check("C the museum seam: a client's museum letter WITH a gift is a host transaction (kind 19); the mail host block calls only mMsm_PC_MuseumMail* (the sender's record), never mMsm_SendMuseumMail; the client blocks call no mMsm_",
+          "mMsm_PC_MuseumMailFor(mir, gift, donor)" in mh and "mMsm_PC_MuseumMailRoom(mir, L->present)" in mh and "mMsm_SendMuseumMail" not in c
+          and "mMsm_" not in mc.replace("mMsm_GetMuseumMailName(&m->header.recipient);", ""))  # the TEST-ONLY --mail-test-send=museum hook addresses its letter like the address book
 
     blocked = func_body(c_raw, "pcnetgame_txn_begin_blocked")
     check("C one pocket-transaction token: every request-side begin check (pickup / drop / bury / grants / catch / field actions / town services) uses pcnetgame_txn_begin_blocked() = s_ctxn busy OR a MAIL_SEND in AWAIT_CLEAN; "

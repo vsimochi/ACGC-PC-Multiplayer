@@ -635,3 +635,24 @@ static void aIMN_actor_move(ACTOR* actorx, GAME* game) {
         insect->action_proc(actorx, game);
     }
 }
+
+#ifdef TARGET_PC
+/* Multiplayer latent bugs (pc_wildlife_authority.c): 1 while the bagworm / spider is still hidden in its tree. */
+int aIMN_pc_hidden(const ACTOR* actorx) {
+    return ((const aINS_INSECT_ACTOR*)actorx)->action == aIMN_ACT_HIDE;
+}
+
+/* Multiplayer latent bugs, CLIENT: the host's copy dropped out of the tree (another player shook it): this copy drops the way aIMN_hide() lets it
+ * after a local shake. Only the start of the host's cycle (APPEAR / APPEAR_STOP) is followed: the hanging WAIT ends by climbing back into HIDE on
+ * each process's own timer, and following a late WAIT would drop this copy a second time. Returns TRUE when it did. */
+int aIMN_pc_follow_reveal(ACTOR* actorx, GAME* game, int host_action) {
+    aINS_INSECT_ACTOR* insect = (aINS_INSECT_ACTOR*)actorx;
+
+    if (insect->action != aIMN_ACT_HIDE || (host_action != aIMN_ACT_APPEAR && host_action != aIMN_ACT_APPEAR_STOP) ||
+        mPlib_Get_item_net_catch_label() == (u32)actorx || aIMN_check_cut_tree(actorx) == TRUE) {
+        return FALSE;
+    }
+    aIMN_setupAction(insect, aIMN_ACT_APPEAR, game);
+    return TRUE;
+}
+#endif

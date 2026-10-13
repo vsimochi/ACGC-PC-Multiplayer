@@ -102,7 +102,7 @@ def main():
     helper = md[k:md.index("\n}\n", k) + 3]
     ck("M the helper is TARGET_PC only (in the .c and the prototype in the .h)",
        md.rfind("#ifdef TARGET_PC", 0, k) > md.rfind("#endif", 0, k) and md.find("#endif", k) > k
-       and re.search(r"#ifdef TARGET_PC\nextern int mMmd_PC_RequestMuseumDisplayDonor\(mActor_name_t item, int donor\);[^\n]*\n#endif", mh) is not None)
+       and re.search(r"#ifdef TARGET_PC\nextern int mMmd_PC_RequestMuseumDisplayDonor\(mActor_name_t item, int donor\);[^\n]*\n(?:extern int mMmd_PC_\w+\([^\n]*\n)*#endif", mh) is not None)  # worker B re-pin: + the exhibit nibble helpers
     ck("M donor outside 1..5 is refused before anything is written",
        helper.index("if (donor < mMmd_DONATOR_PLAYER1 || donor > mMmd_DONATOR_DELETED_PLAYER) {\n    return FALSE;") < helper.index("_CLR("))
     ck("M the four vanilla category ranges, the 'not yet donated' test (!mMmd_IS_DONATED) and the vanilla CLR + SET macros with the explicit donor",

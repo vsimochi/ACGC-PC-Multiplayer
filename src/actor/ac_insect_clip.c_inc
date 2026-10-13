@@ -67,7 +67,13 @@ static void aINS_destruct(ACTOR* actorx, GAME* game) {
     switch (insect->type) {
         case aINS_INSECT_TYPE_SPIRIT:
             /* If we didn't catch the spirit, update it's location */
-            if ((ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
+            if ((ACTOR*)mPlib_Get_item_net_catch_label() != actorx
+#ifdef TARGET_PC
+                /* multiplayer G2 (pc_wildlife_authority.c): the HOST keeps the acre of a spirit another player caught, and of one whose record
+                 * still lives (it moves when the record is released) */
+                && !pcwld_spirit_keep_acre(actorx)
+#endif
+            ) {
                 aINS_regist_set_block_table(actorx);
             }
         /* fallthrough spirit -> firefly */
@@ -307,6 +313,13 @@ static void aINS_set_pl_act_tim(int action, int ut_x, int ut_z) {
     aINS_CLIP->pl_action = action;
     aINS_CLIP->pl_action_ut_x = ut_x;
     aINS_CLIP->pl_action_ut_z = ut_z;
+#ifdef TARGET_PC
+    if (action != aINS_PL_ACT_NONE) {
+        /* multiplayer latent bugs: a CLIENT also tells the host about its own tool use (shake / dig / rock hit), so the host's authoritative copy
+         * of a hidden bug comes out too; a no-op for a host / single player (pc_net_game.c) */
+        pc_net_game_wildlife_tool_action(action, ut_x, ut_z);
+    }
+#endif
 }
 
 static void aINS_init_dma_and_clip_area(aINS_CTRL_ACTOR* ctrl_actor) {

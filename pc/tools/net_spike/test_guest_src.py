@@ -167,7 +167,10 @@ def main():
               # returns -1 for a guest claim / a non-resident before the loop)
               "pcnetgame_pdata_host_tick", "pcnetgame_pdc_own_slot",
               # TEST-ONLY host hook (AC_TEST_MUSEUM_BITS; HEAD already had it, unpinned): slot >= PLAYER_NUM is refused before the subscript
-              "pcnetgame_museum_bits_test_hook"]
+              "pcnetgame_museum_bits_test_hook",
+              # dresser storage (kind 18, master sprint 2; at HEAD, never listed -- reviewed now): the host handlers range-check the bound slot first (query: idx < 0 || idx >= PLAYER_NUM; txn: idx < 0, and idx >= PLAYER_NUM = the guest refusal before the subscript),
+              # the migration refuses idx / h outside [0, PLAYER_NUM) before reading the resident PersonalID
+              "pcnetgame_dresser_migrate_resident", "pcnetgame_handle_host_dresser_query", "pcnetgame_handle_host_dresser_txn"]
     users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(private_data\)\[", c[a:b])})
     pinned = sorted(pinned)
     ck("A the functions that subscript Save_Get(private_data)[...] are exactly the %d reviewed ones (a new one needs a guest-safety review): %s" % (len(pinned), users),
@@ -189,6 +192,9 @@ def main():
                               # master sprint 2 (dresser storage, kind 18): the host handler indexes homes[sc.owner] only after the guest refusal (idx >= PLAYER_NUM) and `sc.owner >= PLAYER_NUM ||`, and requires its ownerID == the bound PersonalID
                               "pcnetgame_handle_host_dresser_txn",
                               "pcnetgame_dresser_room_warp_test_hook",  # TEST-ONLY client hook (AC_TEST_DRESSER_ROOM): the house index is found by a loop bounded by PLAYER_NUM matching the local ownerID
+                              # dresser storage helpers (at HEAD, never listed -- reviewed now): cell_ftr checks h in [0, PLAYER_NUM) itself; owner8 is only called after a range check of h by
+                              # every caller (send_info / peek_owner / commit_locked / on_house_commit / migrate / the query path through cell_ftr); the two TEST-ONLY hooks are env-armed, loop- / range-bounded (h < PLAYER_NUM)
+                              "pcnetgame_dresser_cell_ftr", "pcnetgame_dresser_owner8", "pcnetgame_dresser_test_hook", "pcnetgame_dresser_test_seed",
                               "pcnetgame_house_test_client_swap"]))  # TEST-ONLY client hook (HEAD already had it): the house index comes from pcnetgame_hcl_own_house() and is range checked  # lifecycle hardening: the residence allocator (pc_residence_check: range-checked house; pcres_house_free: bounds-checked) replaced the open-coded loops of promote_exec / precheck / free_list
     # reviewed guards of the furniture-sync / promote code that subscripts homes[] / private_data[] (a guest can never reach them with an out-of-range index)
     hcl_own = fb("pcnetgame_hcl_own_house")
@@ -375,7 +381,11 @@ def main():
                   "pcnetgame_handle_host_mail_take_txn", "pcnetgame_host_guest_remail_tick", "pcnetgame_guest_mail_test_hooks",
                   # letters to guests (deliberate re-pin): (9) a GUEST's letter to another guest (both files DURABLE before the APPLIED), (10) the event-letter finisher
                   # (written at once only for the museum letter, whose dedupe bits live in the same file; the other event letters ride the post-save write)
-                  "pcnetgame_handle_host_mail_txn", "pcnetgame_gev_finish"]))
+                  "pcnetgame_handle_host_mail_txn", "pcnetgame_gev_finish",
+                  # worker B (deliberate re-pin): (11) the guests' museum day pass when it changed records but delivered no letter (the letters themselves go through gev_finish)
+                  "pcnetgame_gmus_run",
+                  # shop upgrade x guest mailbox (worker C, reviewed): (12) the reopening leaflet put into each guest mailbox, HOST role only; the store is written once after the delivery loop
+                  "pcnetgame_shopup_guest_leaflets"]))
     give = fb("pc_net_game_dedicated_give")
     prom = fb("pcnetgame_promote_exec")  # the console command pc_net_game_dedicated_promote is a thin wrapper of it
     pord = ["s_guest_untrusted", "pcnetgame_guest_backup(g, bak_g", "pc_mp_promote_create("]

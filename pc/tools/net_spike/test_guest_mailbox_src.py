@@ -28,6 +28,14 @@ PC = os.path.abspath(os.path.join(HERE, "..", ".."))
 ROOT = os.path.abspath(os.path.join(PC, ".."))
 
 
+# The guest mailbox is now COMMITTED, so wire_baseline._git_show (HEAD) already contains it. "What an OLDER client does" must be judged against the last commit WITHOUT it:
+PRE_GUEST_MAILBOX_REF = "1adac30"  # "Guest museum donation, and Blathers dialogue race fix" (the commit before "Guest mailbox via the post office")
+
+
+def git_show_pre_guest_mailbox(rel):
+    return subprocess.run(["git", "-C", ROOT, "show", PRE_GUEST_MAILBOX_REF + ":" + rel], capture_output=True, check=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+
+
 def read(rel):
     with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as f:
         return f.read().replace("\r\n", "\n")
@@ -132,7 +140,7 @@ def main():
        "guest_box = m->house == (uint8_t)PC_NETGAME_MBOX_HOUSE_GUEST" in ap and "a guest mailbox letter, but this player is not a guest" in ap and "tgt = s_gmbox_view;" in ap
        and "pcnetgame_client_is_guest_player()) {" in ap and "return h >= 0 ? Save_Get(homes[h]).mailbox : NULL;" in func_body(c_raw, "pcnetgame_mbox_local_target"))
     ck("D an OLDER client refuses a house-0xFF slot harmlessly (HEAD's apply: house must equal the owned house; a guest owns none -> refused, the local homes[] untouched because h < 0)",
-       "if (h < 0 || (int)m->house != h) {" in wire_baseline._git_show(ROOT, "pc/src/pc_net_game.c") and "if (h >= 0) {\n        mMl_clear_mail(&Save_Get(homes[h]).mailbox[i]);" in wire_baseline._git_show(ROOT, "pc/src/pc_net_game.c"))
+       "if (h < 0 || (int)m->house != h) {" in git_show_pre_guest_mailbox("pc/src/pc_net_game.c") and "if (h >= 0) {\n        mMl_clear_mail(&Save_Get(homes[h]).mailbox[i]);" in git_show_pre_guest_mailbox("pc/src/pc_net_game.c"))
     uim = func_body(c_raw, "pc_ui_mailbox")
     ck("D THE helper pc_ui_mailbox(): the guest copy for a guest client, else Common_Get(now_home)->mailbox or NULL (now_home is never faked)",
        "return s_gmbox_view;" in uim and "Common_Get(now_home) != NULL ? Common_Get(now_home)->mailbox : NULL" in uim and "now_home) =" not in c and "Common_Set(now_home" not in c)
@@ -163,7 +171,7 @@ def main():
     ck("E the offer needs a READY guest whose post office mailbox the host FED (an older host / the switch off never feeds it: no row)",
        "return pcnetgame_client_guest_mailbox_usable() && Now_Private != NULL;" in func_body(c_raw, "pc_net_game_guest_mail_offer_available"))
     ck("E the text: 'Check my mail.' (<= 16 characters), two closing rows ending with MSGEND, inside the PC message table (COUNT 41); the patch inserts before the cancel choice",
-       'snprintf(tmp, sizeof(tmp), "Check my mail.");' in nk and "#define PC_NOOK_MSG_COUNT 41" in read("pc/include/pc_nook_house.h")
+       'snprintf(tmp, sizeof(tmp), "Check my mail.");' in nk and "#define PC_NOOK_MSG_COUNT 45" in read("pc/include/pc_nook_house.h")  # worker C: + the 4 house-upgrade rows (41..44)
        and "PC_NOOK_SEL_CHECK_MAIL" in func_body(nk, "nk_post_mail_patch") and "s_pm_choice = k - 1;" in func_body(nk, "nk_post_mail_patch"))
     ck("E the daily limit maps onto the post girl's 'can't take more' row (3), never 'no such address'", "case PC_GUEST_MAIL_REJECT_LIMIT:" in pg and "#define PC_GUEST_MAIL_REJECT_LIMIT 38" in gmh)
 

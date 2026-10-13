@@ -103,7 +103,10 @@ static void Player_actor_request_proc_index_fromPutaway_net(ACTOR* actor, GAME* 
                     : 0;
             int status = pc_net_game_query_catch_outcome(entity_id);
 
-            if (status == PC_NETGAME_CATCH_STATUS_REJECTED || status == PC_NETGAME_CATCH_STATUS_PENDING) {
+            if (status == PC_NETGAME_CATCH_STATUS_REJECTED || status == PC_NETGAME_CATCH_STATUS_PENDING ||
+                /* multiplayer ants: an untracked ant was refused in Notice_net (no host record): no exchange either */
+                (entity_id == 0 && label_check != 0 && ((aINS_INSECT_ACTOR*)label_check)->type == aINS_INSECT_TYPE_ANT &&
+                 pc_net_game_authoritative_wildlife_enabled() && pc_net_game_role() != PC_NETGAME_ROLE_NONE)) {
                 printf("[NET][WILDLIFE] client: putaway-net exchange screen grant suppressed for entity "
                        "%u (outcome=%d) -- forcing no-grant completion instead\n",
                        (unsigned)entity_id, status);

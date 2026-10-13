@@ -638,6 +638,17 @@ static void aNNW_talk_trade_close(NPC_NEEDLEWORK_ACTOR* actor, GAME_PLAY* play) 
     if (!submenu->open_flag) {
         Submenu_Item_c* sm_item_p = submenu->item_p;
 
+#ifdef TARGET_PC
+        /* worker B (pc_able_net.h): a network client trades (exchange / display) only while the shared designs are in sync with the host and no earlier trade is
+         * open; otherwise nothing is requested and Mable answers with the vanilla cancel line ("Oh, I see."). Take a copy (CLOSE3) only writes the character. */
+        if (sm_item_p->item == RSV_NO && (actor->talk_idx == aNNW_TALK_TRADE_CLOSE || actor->talk_idx == aNNW_TALK_TRADE_CLOSE2) && !pc_able_trade_gate()) {
+            mMsg_ChangeMsgData(msg_p, 0x2FF5);
+            mMsg_Set_ForceNext(msg_p);
+            mMsg_request_main_appear_wait_type1(msg_p);
+            aNNW_change_talk_proc(actor, aNNW_TALK_END_WAIT);
+            return;
+        }
+#endif
         if (sm_item_p->item == RSV_NO) {
             u16 org_idx;
             u32 change_idx;

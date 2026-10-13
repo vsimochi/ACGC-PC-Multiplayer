@@ -1237,6 +1237,15 @@ PC_NETGAME_TXN_REASON_EVNPC_DONE = 36
 PC_NETGAME_TXN_KIND_DRESSER = 18          # dresser storage (master sprint 2, worker 12)
 PC_NETGAME_TXN_REASON_DRESSER_DISABLED = 37
 PC_NETGAME_TXN_REASON_MAIL_LIMIT = 38      # guest mailbox: a guest's MAIL_SEND beyond its host-local daily limit (the letter stays)
+PC_NETGAME_TXN_KIND_HOUSE_UPGRADE = 20     # worker C: house upgrades via Nook (aux_cond = op 1..4, aux_item = roof palette, flags = the stale-header guard)
+PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE = 45
+PC_NETGAME_TXN_REASON_HOUSE_BUSY = 46
+PC_NETGAME_TXN_REASON_HOUSE_CHANGED = 47
+TXN_REASON_NAMES.update({45: "HOUSE_NOT_ELIGIBLE", 46: "HOUSE_BUSY", 47: "HOUSE_CHANGED"})
+PC_NETGAME_TXN_KIND_MUSEUM_MAIL = 19         # worker B: a letter with a gift addressed to the museum (MAIL_SEND machinery)
+PC_NETGAME_TXN_REASON_MUSEUM_FULL = 42
+PC_NETGAME_TXN_REASON_MUSEUM_MAIL_OFF = 43
+TXN_REASON_NAMES.update({42: "MUSEUM_FULL", 43: "MUSEUM_MAIL_OFF"})
 PC_NETGAME_MBOX_HOUSE_GUEST = 0xFF         # guest mailbox: MAILBOX_LETTER.house of the guest's host-held (post office) mailbox
 PC_NETGAME_HOUSE_AUTO = 0xFF
 PC_NETGAME_HOUSE_PRICE_DIRECT = 18400   # 1,000 down payment + 17,400 loan (mPlayer_DEBT0), wallet only

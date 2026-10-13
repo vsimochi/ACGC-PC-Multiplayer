@@ -1450,6 +1450,13 @@ int pc_net_game_request_catch_bug(uint32_t entity_id, int claimed_species, int l
  * case, exactly like fish's own entity_id == 0 fallback. */
 uint32_t pc_net_game_bug_entity_id_for_label(const void* label_actor, int insect_type);
 
+/* Multiplayer latent bugs: a READY CLIENT tells the host about its own tool use that informed the insects (aINS_PL_ACT_* at town unit ut_x, ut_z;
+ * called from aINS_set_pl_act_tim, ac_insect_clip.c_inc) -- WILDLIFE_TOOL_ACTION (86). No-op for a host / single player / a client not READY. */
+void pc_net_game_wildlife_tool_action(int action, int ut_x, int ut_z);
+/* Multiplayer spirit hunt: a READY CLIENT accepted the Wisp's request (ac_ev_ghost_talk.c_inc) -- GHOST_HUNT (87); the host starts the hunt in its
+ * own ghost event. No-op otherwise. */
+void pc_net_game_ghost_hunt_accepted(void);
+
 #define PC_NETGAME_CATCH_STATUS_NONE     0
 #define PC_NETGAME_CATCH_STATUS_PENDING  1
 #define PC_NETGAME_CATCH_STATUS_ACCEPTED 2

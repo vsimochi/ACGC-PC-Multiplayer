@@ -400,6 +400,19 @@ static void aINS_actor_move(ACTOR* actorx, GAME* game) {
     aINS_INSECT_ACTOR* insect = ctrl_actor->insect_actor;
     int i;
 
+#ifdef TARGET_PC
+    if (aINS_CLIP->pl_action == aINS_PL_ACT_NONE) {
+        /* multiplayer latent bugs: the HOST feeds one queued REMOTE tool use per tick into the same pl_action slot the local player's tool code
+         * fills, so the unmodified species programs reveal a bug another player dug up / shook down / knocked out (pc_wildlife_authority.c) */
+        int pact, put_x, put_z;
+        if (pcwld_host_take_pl_action(&pact, &put_x, &put_z)) {
+            aINS_CLIP->pl_action = pact;
+            aINS_CLIP->pl_action_ut_x = put_x;
+            aINS_CLIP->pl_action_ut_z = put_z;
+        }
+    }
+#endif
+
     for (i = 0; i < aINS_ACTOR_NUM; i++) {
         ACTOR* actorx = (ACTOR*)insect;
 

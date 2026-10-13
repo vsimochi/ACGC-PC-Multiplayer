@@ -277,6 +277,57 @@ extern int mMmd_PC_RequestMuseumDisplayDonor(mActor_name_t item, int donor) {
 
   return FALSE;
 }
+
+/* worker B (host): the donor nibble of exhibit `exhibit` in the attribution index space (fossil 0..24, art 25..39, insect 40..79, fish 80..119), -1 when out of range;
+ * and its setter (the guest -> resident promotion re-attributes a guest's nibble-5 exhibits to the new resident slot + 1). Same CLR + SET macros as the vanilla setters. */
+extern int mMmd_PC_ExhibitDonor(int exhibit) {
+  if (exhibit >= 0 && exhibit < mMmd_FOSSIL_NUM) {
+    return mMmd_FossilInfo(exhibit);
+  }
+  exhibit -= mMmd_FOSSIL_NUM;
+  if (exhibit >= 0 && exhibit < mMmd_ART_NUM) {
+    return mMmd_ArtInfo(exhibit);
+  }
+  exhibit -= mMmd_ART_NUM;
+  if (exhibit >= 0 && exhibit < mMmd_INSECT_NUM) {
+    return mMmd_InsectInfo(exhibit);
+  }
+  exhibit -= mMmd_INSECT_NUM;
+  if (exhibit >= 0 && exhibit < mMmd_FISH_NUM) {
+    return mMmd_FishInfo(exhibit);
+  }
+  return -1;
+}
+
+extern int mMmd_PC_SetExhibitDonor(int exhibit, int donor) {
+  if (donor < mMmd_DONATOR_NONE || donor > mMmd_DONATOR_DELETED_PLAYER) {
+    return FALSE;
+  }
+  if (exhibit >= 0 && exhibit < mMmd_FOSSIL_NUM) {
+    mMmd_FOSSIL_CLR(Save_Get(museum_display), exhibit);
+    mMmd_FOSSIL_SET(Save_Get(museum_display), exhibit, donor);
+    return TRUE;
+  }
+  exhibit -= mMmd_FOSSIL_NUM;
+  if (exhibit >= 0 && exhibit < mMmd_ART_NUM) {
+    mMmd_ART_CLR(Save_Get(museum_display), exhibit);
+    mMmd_ART_SET(Save_Get(museum_display), exhibit, donor);
+    return TRUE;
+  }
+  exhibit -= mMmd_ART_NUM;
+  if (exhibit >= 0 && exhibit < mMmd_INSECT_NUM) {
+    mMmd_INSECT_CLR(Save_Get(museum_display), exhibit);
+    mMmd_INSECT_SET(Save_Get(museum_display), exhibit, donor);
+    return TRUE;
+  }
+  exhibit -= mMmd_INSECT_NUM;
+  if (exhibit >= 0 && exhibit < mMmd_FISH_NUM) {
+    mMmd_FISH_CLR(Save_Get(museum_display), exhibit);
+    mMmd_FISH_SET(Save_Get(museum_display), exhibit, donor);
+    return TRUE;
+  }
+  return FALSE;
+}
 #endif
 
 typedef struct museum_display_fossil_data_s {

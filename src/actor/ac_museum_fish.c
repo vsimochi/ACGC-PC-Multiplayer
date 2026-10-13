@@ -1,4 +1,8 @@
 #include "ac_museum_fish_priv.h"
+#ifdef TARGET_PC
+#include "pc_museum_net.h" /* worker B: guest donor names */
+#include "m_museum_display.h"
+#endif
 
 // extern data
 // clang-format off
@@ -629,6 +633,16 @@ int Museum_Fish_GetMsgNo(MUSEUM_FISH_ACTOR* actor) {
         mMsg_Set_free_str(mMsg_Get_base_window_p(), 0,
                           common_data.save.save.private_data[fishInfo - 1].player_ID.player_name, 8);
     }
+#ifdef TARGET_PC
+    {
+        /* worker B: a guest's attributed donation (nibble 5) reads like a resident's, with the guest's name */
+        u8 pc_gname[PLAYER_NAME_LEN];
+        if (fishInfo == mMmd_DONATOR_DELETED_PLAYER && pc_museum_guest_donor(pc_museum_exhibit_of_item(fishName), pc_gname, NULL)) {
+            mMsg_Set_free_str(mMsg_Get_base_window_p(), 0, pc_gname, PLAYER_NAME_LEN);
+            fishInfo = 1; /* the "named donor" rows below */
+        }
+    }
+#endif
 
     if (actor->fishDisplayMsgIter < actor->numFishDisplayed - 1) {
         if (fishInfo >= 1 && fishInfo <= 4) {

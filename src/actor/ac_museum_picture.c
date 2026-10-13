@@ -10,6 +10,9 @@
 #include "m_room_type.h"
 #include "m_msg.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_museum_net.h" /* worker B: the name of the GUEST who donated a nibble-5 exhibit */
+#endif
 
 typedef struct {
     s16 x;
@@ -174,9 +177,18 @@ static void Museum_Picture_Actor_move(ACTOR* actorx, GAME* game) {
             int donator = mMmd_ArtInfo(i);
 
             if (aMP_CheckTalkAbleDist(&aMP_art_data_table[i].pos, game)) {
+#ifdef TARGET_PC
+                /* worker B: a guest's attributed donation (nibble 5) names the guest */
+                u8 pc_gname[PLAYER_NAME_LEN];
+                const int pc_guest = donator == mMmd_DONATOR_DELETED_PLAYER && pc_museum_guest_donor(mMmd_FOSSIL_NUM + i, pc_gname, NULL);
+                museum_picture->msg_no = (donator == mMmd_DONATOR_NONE)
+                                             ? MSG_12193
+                                             : ((donator == mMmd_DONATOR_DELETED_PLAYER && !pc_guest) ? MSG_12192 : MSG_12191);
+#else
                 museum_picture->msg_no = (donator == mMmd_DONATOR_NONE)
                                              ? MSG_12193
                                              : ((donator == mMmd_DONATOR_DELETED_PLAYER) ? MSG_12192 : MSG_12191);
+#endif
                 if (mDemo_Request(mDemo_TYPE_SPEAK, actorx, &aMP_SetTalkInfo) && mMmd_IS_DONATED(donator)) {
                     mActor_name_t item = (i >= 0 && i < mMmd_ART_NUM)
                                              ? (mActor_name_t)(FTR_START(FTR_SUM_ART01) + (mActor_name_t)(i << 2))
@@ -193,6 +205,11 @@ static void Museum_Picture_Actor_move(ACTOR* actorx, GAME* game) {
                                           Save_Get(private_data[mMmd_DONATOR_PLR_IDX(donator)]).player_ID.player_name,
                                           PLAYER_NAME_LEN);
                     }
+#ifdef TARGET_PC
+                    else if (pc_guest) {
+                        mMsg_Set_free_str(mMsg_Get_base_window_p(), mMsg_FREE_STR0, pc_gname, PLAYER_NAME_LEN);
+                    }
+#endif
                 }
             }
         }

@@ -101,8 +101,12 @@ def main():
     # two definitions exist (MAMEDANUKI variant first, Nook variant under #else): audit the last one
     sw = func_body(sc[sc.rfind("\nstatic void aNSC_start_wait("):], r"\nstatic void aNSC_start_wait\(NPC_SHOP_COMMON_ACTOR\* shop_common, GAME_PLAY\* play\) \{")
     gs = sw.find("if (aNSC_PC_IS_CLIENT() &&")
-    check("G3: start_wait diverts REHOUSE/DONE_REHOUSE to WAIT_TYPE_3 for a client",
-          gs >= 0 and "wait_type = aNSC_WAIT_TYPE_3;" in sw[gs:gs + 900], results)
+    # worker C (house upgrades via Nook): the divert is now conditional -- WITHOUT the host's kind-20 support (pc_house_upgrade_available: old host / no house sync / guest)
+    # REHOUSE / DONE_REHOUSE still become WAIT_TYPE_3; WITH it a talk start that must write becomes PC_HOUSEUP (the host writes) and DONE_REHOUSE keeps its offer (its order
+    # writes go through the host, audited in test_house_upgrade_src.py)
+    check("G3: start_wait diverts REHOUSE/DONE_REHOUSE to WAIT_TYPE_3 for a client without the house-upgrade capability (else PC_HOUSEUP / the host-backed offer)",
+          gs >= 0 and "wait_type = aNSC_WAIT_TYPE_3;" in sw[gs:gs + 2500] and "pc_house_upgrade_available()" in sw[gs:gs + 2500]
+          and "wait_type = aNSC_WAIT_TYPE_PC_HOUSEUP;" in sw[gs:gs + 2500], results)
     check("G3: divert precedes the action switch, the proc selection and the basement/order writes",
           0 <= gs < sw.find("switch (wait_type)") and gs < sw.find("proc = aNSC_set_talk_info_start_wait;")
           and gs < sw.find("aNSC_set_make_basement_info();"), results)

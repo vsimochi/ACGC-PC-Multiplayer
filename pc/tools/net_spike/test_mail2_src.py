@@ -204,7 +204,7 @@ def main():
     check("H the mirror mail[] has exactly three sanctioned writes outside the D3 merge, all through pcnetgame_rec_txn_write_mail (idx must pass pcnetgame_rec_txn_idx_ok = never the host's own resident, slot < 10): "
           "the kind-12 clear (NULL) and the kind-13 write (the host's letter, memcpy); no other statement assigns private_data[].mail[]",
           "pcnetgame_rec_txn_idx_ok(idx)" in wr and "mail_slot >= mPr_INVENTORY_MAIL_COUNT" in wr and "memcpy(&r->mail[mail_slot], letter, sizeof(Mail_c));" in wr
-          and c.count("pcnetgame_rec_txn_write_mail(") == 7 and hd.count("pcnetgame_rec_txn_write_mail(idx, dst, &W)") == 2  # letters to guests re-pin: + the kind-12 guest-recipient clear and its rollback (test_mail_src / test_guest_letters_src) and hd.count("pcnetgame_rec_txn_write_mail(idx, dst, &old_dst)") == 1
+          and c.count("pcnetgame_rec_txn_write_mail(") == 9 and hd.count("pcnetgame_rec_txn_write_mail(idx, dst, &W)") == 2  # worker B re-pin: + the kind-19 MUSEUM_MAIL clear and its rollback  # letters to guests re-pin: + the kind-12 guest-recipient clear and its rollback (test_mail_src / test_guest_letters_src) and hd.count("pcnetgame_rec_txn_write_mail(idx, dst, &old_dst)") == 1
           and len(re.findall(r"(?:->|\.)mail\[[^\]]*\]\s*=[^=]", c)) == 0
           and "mir->mail[dst]" in hd and not re.search(r"memcpy\(&Save_Get\(private_data\)", c))  # guest mailbox re-pin: resident commit, guest commit + its rollback
     hb_writes = re.findall(r"mMl_clear_mail\(&Save_Get\(homes\[[^\]]*\]\)\.mailbox\[[^\]]*\]\)|memcpy\(&Save_Get\(homes\[[^\]]*\]\)\.mailbox\[[^\]]*\]|mMl_clear_mail\(m\);", c)
@@ -256,8 +256,9 @@ def main():
     check("C try_send for kind 13: the shadow slot must still hold exactly the verified letter the operation began with and a local mail slot must be free (cancel, never wait); the destination travels in tag.flags, the gift "
           "echo from the stashed letter, the hash split into aux_cond / aux_item; the kind is a commit kind, a cancel resolves the operation as rejected",
           "pcnetgame_take_try_send_check(slot," in tcase and "pcnetgame_txn_cancel_queued(" in tcase and "flags = d;" in tcase and "item = (uint16_t)s_take_op.letter.present;" in tcase
-          and "aux_cond = T->ts_aux;" in tcase and "aux_item = T->ts_aux_item;" in tcase and "T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE;" in ts_
-          and "s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {" in func_body(xc_raw, "pcnetgame_txn_cancel_queued") and "pcnetgame_take_op_resolve(request_id, applied);" in c)
+          and "aux_cond = T->ts_aux;" in tcase and "aux_item = T->ts_aux_item;" in tcase and "T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE ||\n                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL;" in ts_  # worker B re-pin (kind 19)
+          and "s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE ||\n               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {" in func_body(xc_raw, "pcnetgame_txn_cancel_queued")
+          and "pcnetgame_take_op_resolve(request_id, applied);" in c)  # worker B re-pin (kind 19 joins the commit-kind / cancel lists)
     at = func_body(xc_raw, "pcnetgame_txn_apply_take")
     check("C APPLIED of kind 13 (pcnetgame_txn_apply_take): the letter written into mail[] is the COPY of the verified shadow letter taken at begin (hash re-checked against the tag; never the live shadow), into the "
           "preferred slot when still empty else the first free one; no slot -> return 0 WITHOUT advancing the D3 base (the next upload is STALE_BASE and the host push delivers the letter); pockets / wallet are never touched",

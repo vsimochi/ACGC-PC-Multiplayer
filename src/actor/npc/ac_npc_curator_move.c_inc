@@ -394,6 +394,25 @@ static int aCR_get_msg_no_after_talk() {
 #define aCR_IS_OWN_DONATION(donator) ((donator) == (Common_Get(player_no) + 1))
 #endif
 
+#ifdef TARGET_PC
+/* worker B (guest donor names, pc_museum_net.h): an exhibit with nibble 5 that the host attributed to a GUEST. The viewing guest's own donation takes the vanilla "you already
+ * gave me this" row (`own_row`), another guest's the "<name> already donated it" row (`named_row`, the name in FREE_STR0). Every one of these rows hands the item back (no
+ * transaction starts below row 16), so the choice only changes Blathers' words. -1 = no attribution (the vanilla "former resident" row stays). */
+static int aCR_pc_guest_row(mActor_name_t item, int donator, int own_row, int named_row) {
+    u8 name[PLAYER_NAME_LEN];
+    int self = 0;
+
+    if (donator != mMmd_DONATOR_DELETED_PLAYER || !pc_museum_guest_donor(pc_museum_exhibit_of_item((unsigned short)item), name, &self)) {
+        return -1;
+    }
+    if (self) {
+        return own_row;
+    }
+    mMsg_Set_free_str(mMsg_Get_base_window_p(), mMsg_FREE_STR0, name, PLAYER_NAME_LEN);
+    return named_row;
+}
+#endif
+
 static int aCR_get_idx_to_donate_fossil(mActor_name_t item) {
     int donator = aCR_GetFossilPartDonator(item);
 
@@ -420,6 +439,14 @@ static int aCR_get_idx_to_donate_fossil(mActor_name_t item) {
         }
 
         case mMmd_DONATOR_DELETED_PLAYER:
+#ifdef TARGET_PC
+            {
+                const int pc_r = aCR_pc_guest_row(item, donator, 4, 8);
+                if (pc_r >= 0) {
+                    return pc_r;
+                }
+            }
+#endif
             return 12;
     }
 
@@ -444,6 +471,14 @@ static int aCR_get_idx_to_donate_art(mActor_name_t item) {
         case mMmd_DONATOR_NONE:
             return 22 + RANDOM(3);
         case mMmd_DONATOR_DELETED_PLAYER:
+#ifdef TARGET_PC
+            {
+                const int pc_r = aCR_pc_guest_row(item, donator, 5, 9);
+                if (pc_r >= 0) {
+                    return pc_r;
+                }
+            }
+#endif
             return 13;
     }
 
@@ -471,6 +506,14 @@ static int aCR_get_idx_to_donate_insect(mActor_name_t item) {
 
             case mMmd_DONATOR_DELETED_PLAYER:
                 res = 15;
+#ifdef TARGET_PC
+                {
+                    const int pc_r = aCR_pc_guest_row(item, donator, 7, 11);
+                    if (pc_r >= 0) {
+                        res = pc_r;
+                    }
+                }
+#endif
                 break;
 
             default:
@@ -495,6 +538,14 @@ static int aCR_get_idx_to_donate_fish(mActor_name_t item) {
             return 27;
 
         case mMmd_DONATOR_DELETED_PLAYER:
+#ifdef TARGET_PC
+            {
+                const int pc_r = aCR_pc_guest_row(item, donator, 6, 10);
+                if (pc_r >= 0) {
+                    return pc_r;
+                }
+            }
+#endif
             return 14;
     }
 

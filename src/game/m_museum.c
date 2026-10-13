@@ -11,6 +11,10 @@
 #include "m_field_info.h"
 #include "m_random_field_h.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "m_museum_display.h"
+#include "pc_museum_net.h" /* worker B: the guest museum day pass hook */
+#endif
 
 static u8 l_museum_name_str[PLAYER_NAME_LEN] = {
     CHAR_M, CHAR_u, CHAR_s, CHAR_e, CHAR_u, CHAR_m, CHAR_SPACE, CHAR_SPACE
@@ -589,6 +593,9 @@ extern void mMsm_DepositFossil(u8 deposit_record, int fossil_count, u16* cancel_
 
     mMsm_SendResultMail();
     mMsm_SendInformationMail();
+#ifdef TARGET_PC
+    pc_net_game_museum_day_pass(fossil_count < mMsm_DEPOSIT_FOSSIL_MAX && send_order_info); /* worker B: the same pass for the town's GUESTS (host only; a no-op elsewhere) */
+#endif
 }
 
 static void mMsm_SetPrivateCompMail(Private_c* priv, int flag) {
@@ -662,6 +669,126 @@ extern int mMsm_GuestCompMailForSink(Private_c* gpriv, int complete, mMsm_GUEST_
     }
     gpriv->state_flags |= mPr_FLAG_MUSEUM_COMP_HANDBILL_SCHEDULED | mPr_FLAG_MUSEUM_COMP_HANDBILL_RECEIVED;
     return TRUE;
+}
+
+/* ---- worker B: museum letters with a gift from network players (HOST only; pc_net_game.c MUSEUM_MAIL, TXN kind 19) ----
+ * mMsm_SendMuseumMail finds the sender's record through Common now_private / private_data (a guest has none: its gift would vanish) and
+ * mMsm_SetRemailInfo credits a donation to Common_Get(player_no) (the HOST's own player). These two run the same rules for an EXPLICIT record
+ * and an explicit donor nibble (resident slot + 1, guest 5), with a READ-ONLY room check first so the host can refuse instead of dropping a gift. */
+extern int mMsm_PC_MuseumMailRoom(Private_c* priv, mActor_name_t present) {
+    if (priv == NULL || present == EMPTY_NO || present == RSV_NO) {
+        return FALSE;
+    }
+    if (present == ITM_FOSSIL) {
+        return priv->museum_record.stored_fossil_num < mMsm_REMAIL_SLOTS;
+    }
+    return mMsm_GetRemailFreeIdx(&priv->museum_record.remail_info) != -1;
+}
+
+/* Returns 0 = no room (nothing changed), 1 = a fossil stored for appraisal, else 2 + the remail kind (mMsm_REMAIL_KIND_*). */
+extern int mMsm_PC_MuseumMailFor(Private_c* priv, mActor_name_t present, int donor) {
+    mMsm_record_c* record;
+    int kind = mMsm_REMAIL_KIND_CANNOT_DONATE;
+    int free_idx;
+
+    if (!mMsm_PC_MuseumMailRoom(priv, present)) {
+        return 0;
+    }
+    record = &priv->museum_record;
+    if (present == ITM_FOSSIL) {
+        record->stored_fossil_num++;
+        return 1;
+    }
+    switch (mMmd_GetDisplayInfo(present)) {
+        case mMmd_DISPLAY_CAN_DONATE:
+            kind = mMmd_PC_RequestMuseumDisplayDonor(present, donor) ? mMsm_REMAIL_KIND_DONATED : mMsm_REMAIL_KIND_ALREADY_DONATED;
+            break;
+        case mMmd_DISPLAY_ALREADY_DONATED:
+            kind = mMsm_REMAIL_KIND_ALREADY_DONATED;
+            break;
+        default:
+            kind = mMsm_REMAIL_KIND_CANNOT_DONATE;
+            break;
+    }
+    free_idx = mMsm_GetRemailFreeIdx(&record->remail_info);
+    mMsm_Idx2SetRemailInfo(&record->remail_info, free_idx, kind, present);
+    record->remail_pending = TRUE;
+    return 2 + kind;
+}
+
+/* The vanilla day pass of the museum (mMsm_DepositFossil -> mMsm_SendResultMail + mMsm_SendInformationMail, mMsm_OrderInformationMail) for ONE guest record, with the letters
+ * handed to `sink` (the guest's host-held mailbox) instead of a house mailbox / the post office. Same letters, same limits (3 per pass), same order; a refused letter stops the
+ * pass for this guest (vanilla: a full mailbox + post office) and leaves its state for the next pass. Returns the number of letters delivered. */
+extern int mMsm_PC_GuestMuseumDay(Private_c* gpriv, int order_info, mMsm_GUEST_SINK sink, void* ctx) {
+    static int remail_no_table[mMsm_REMAIL_KIND_NUM - 1] = { 0x22D, 0x22B, 0x22C, 0x22E };
+    mMsm_record_c* record;
+    int sent = 0, full = FALSE, idx, land_len;
+
+    if (gpriv == NULL || sink == NULL || mPr_NullCheckPersonalID(&gpriv->player_ID) != FALSE) {
+        return 0;
+    }
+    record = &gpriv->museum_record;
+    if (order_info && mPr_CheckMuseumAddress(gpriv) == FALSE) {
+        record->send_info_mail = TRUE; /* mMsm_OrderInformationMail */
+    }
+    land_len = mMsg_Get_Length_String(Save_Get(land_info.name), LAND_NAME_SIZE);
+    if (record->contacted == TRUE) {
+        mMsm_remail_info_c* remail_info = &record->remail_info;
+        for (idx = 0; idx < mMsm_REMAIL_SLOTS && sent < mMsm_MAX_MAIL; idx++) {
+            const int remail_kind = mMsm_Idx2RemailKind(remail_info, idx);
+            mActor_name_t item, present = EMPTY_NO;
+            if (remail_kind <= mMsm_REMAIL_KIND_CLEAR || remail_kind >= mMsm_REMAIL_KIND_NUM) {
+                break;
+            }
+            mHandbill_Set_free_str(mHandbill_FREE_STR0, Save_Get(land_info.name), land_len);
+            item = remail_info->items[idx];
+            if (item != EMPTY_NO) {
+                mIN_copy_name_str(present_name, item);
+                mHandbill_Set_free_str(mHandbill_FREE_STR1, present_name, mIN_ITEM_NAME_LEN);
+                if (remail_kind != mMsm_REMAIL_KIND_DONATED) {
+                    present = item;
+                }
+            }
+            mMl_make_mail_to_player(&l_mmsm_mail, &gpriv->player_ID, present, ITM_PAPER24, l_museum_name_str, remail_no_table[remail_kind - 1], mMl_DATA2, 0);
+            if ((*sink)(&l_mmsm_mail, ctx) != TRUE) {
+                full = TRUE;
+                break;
+            }
+            mMsm_Idx2ClearRemailInfo(remail_info, idx);
+            sent++;
+        }
+        mMsm_PushRemailInfo(remail_info);
+        while (!full && sent < mMsm_MAX_MAIL && record->stored_fossil_num != 0) {
+            mActor_name_t fossil = EMPTY_NO;
+            mMsm_GetFossil(&fossil);
+            mHandbill_Set_free_str(mHandbill_FREE_STR0, Save_Get(land_info.name), land_len);
+            mMl_make_mail_to_player(&l_mmsm_mail, &gpriv->player_ID, fossil, ITM_PAPER24, l_museum_name_str, mMsm_GetFossilMailNo(fossil), mMl_DATA2, 0);
+            if ((*sink)(&l_mmsm_mail, ctx) != TRUE) {
+                full = TRUE;
+                break;
+            }
+            record->stored_fossil_num--;
+            sent++;
+        }
+    }
+    if (!full && mPr_CheckMuseumInfoMail(gpriv)) {
+        mMl_make_mail_to_player(&l_mmsm_mail, &gpriv->player_ID, EMPTY_NO, ITM_PAPER24, l_museum_name_str, mMl_MUSEUM_INFO_MAIL_NO, mMl_DATA2, 0);
+        if ((*sink)(&l_mmsm_mail, ctx) == TRUE) {
+            record->contacted = TRUE; /* the Museum entry of the address book (mPr_CheckMuseumAddress) */
+            record->send_info_mail = FALSE;
+            sent++;
+        }
+    }
+    return sent;
+}
+
+/* TEST-ONLY seam (pc_net_game.c, HOST, AC_TEST_MUSEUM_DAY): the residents' half of the day pass exactly as mMsm_DepositFossil runs it, without depositing fossils. */
+extern void mMsm_PC_ResidentsResultPass(int order_info) {
+    if (order_info) {
+        mMsm_OrderInformationMail();
+    }
+    mMsm_SendResultMail();
+    mMsm_SendInformationMail();
 }
 #endif
 

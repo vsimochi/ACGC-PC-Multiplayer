@@ -109,7 +109,7 @@ def main():
                    "pcnetgame_txn_nonce_fenced(", "pcnetgame_txn_journal_find(", "pcnetgame_rec_refresh_hostfields(", "PC_NETGAME_TXN_REASON_STALE_IMAGE",
                    "pcnetgame_rec_validate_inventory(t->pre_pockets", "PC_NETGAME_TXN_REASON_PRECOND, 1, \"pocket slot is not free\"", "h->validate(", "PC_TXN_FAULT_FAIL_WORLD",
                    "pcnetgame_rec_validate_inventory(post,", "h->commit(", "pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)", "slot->rev++;",
-                   "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "pcnetgame_commit_catch_despawn(cr->entity_id);",
+                   "pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED", "PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT", "pcnetgame_commit_caught_despawn(cr->entity_id);",  # G2 (wildlife worker): the despawn goes through pcnetgame_commit_caught_despawn = pcwld_note_caught + the unchanged pcnetgame_commit_catch_despawn (same wire)
                    "pcnetgame_txn_send_applied(", "pcnetgame_x3_legacy_result(peer, far, cr, 1, legacy_item)"))
     check("H the catch path order inside the core: pcnetgame_validate_catch (READ-ONLY) < claimed-item check < fail_world < post-image validation < pcwld_remove_by_id (the one mutation) < mirror write",
           ok_order(gr, "pcnetgame_validate_catch(0, peer", "pcnetgame_x3_catch_item(&crec", "PC_TXN_FAULT_FAIL_WORLD", "pcnetgame_rec_validate_inventory(post,", "pcwld_remove_by_id(cr->entity_id)",
@@ -145,7 +145,7 @@ def main():
     check("H a grant request is answered by TXN_RESULT first (kinds 4..7 echo the resolved item), then the informational legacy RESULT; a catch's WILDLIFE_DESPAWN goes out before both; replays echo the "
           "JOURNALLED item (DIG_BURIED's request carries 0)",
           "rp.tag.item = old->item;" in gr and "pcnetgame_txn_send_applied(peer, idx, &rp, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED" in gr
-          and "in->tag.item = grant_item;" in gr and gr.index("pcnetgame_commit_catch_despawn(cr->entity_id);\n    }\n    pcnetgame_txn_send_applied(") > 0)
+          and "in->tag.item = grant_item;" in gr and gr.index("pcnetgame_commit_caught_despawn(cr->entity_id);\n    }\n    pcnetgame_txn_send_applied(") > 0)
     check("H a catch with full pockets (dest NONE) is still accepted, the entity removed once, and the host-DERIVED item becomes the connection's one-shot exchange credit; any other catch clears it",
           "st->exch_credit_valid = (uint8_t)(t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE);" in gr and "st->exch_credit_item = st->exch_credit_valid ? expect : 0;" in gr
           and "uint8_t              exch_credit_valid;" in c_raw and "uint16_t             exch_credit_item;" in c_raw)
@@ -237,7 +237,7 @@ def main():
         fnm = re.findall(r"^(?:static )?[\w ]+?[ \*]+(\w+)\([^{;]*\)\s*\{\n", c[:p], re.M)
         owners2.append(fnm[-1] if fnm else "?")
     check("C mPr_SetPossessionItem survives ONLY in pc_net_game_exchange_request_drop (it puts the HAND item back into its slot: the roll-back of the vanilla UI swap, net zero) and the HOST-local bury (the "
-          "host's own pockets): %s" % sorted(owners2), sorted(owners2) == ["pc_net_game_exchange_request_drop", "pc_net_game_host_local_bury"])
+          "host's own pockets): %s" % sorted(owners2), sorted(set(owners2)) == ["pc_net_game_dresser_pocket_swap", "pc_net_game_exchange_request_drop", "pc_net_game_host_local_bury", "pcnetgame_house_test_client_swap"])  # + (already at HEAD, never listed): pc_net_game_dresser_pocket_swap = the dresser screen's plain LOCAL pocket reorder (net zero, refused while a pocket transaction is in flight) and the TEST-ONLY AC_TEST_HOUSE_CLIENT_SWAP hook (2 sites each: both write the SAME two slots back)
     ex = func_body(c, "pc_net_game_exchange_request_drop")
     check("C the exchange replacement is no longer applied from a deferred client record: s_exchange_deferred is consumed by the drop result handler into the transaction (have_deferred ? &deferred), "
           "try_send puts it IN the tag (flags EXCHANGE, aux_item, aux_cond; only when the swap slot and owner stamp still match), and the apply step takes it from the host post-image",

@@ -347,6 +347,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_tabfile.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dayclaims.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_store.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_museum_donors.c # worker B: museum_donors.dat (guest donor attribution)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_ui.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_layout.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_items.c

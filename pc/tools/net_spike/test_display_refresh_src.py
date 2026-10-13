@@ -79,10 +79,30 @@ clears = re.findall(r"(\w+)->_8C &= ~1;", INS_ALL)
 check("insect: the only _8C bit-1 clear is ari_alone_dt (ant pool, not privInsects)", clears == ["actor"] and "void ari_alone_dt(" in INS_ALL
       and "privInsects" not in body(INS_ALL, "void ari_alone_dt("))
 
+
+def _inside_test_hooks(src, marker):
+    """True when `marker` sits inside an open `#ifdef PC_NET_TEST_HOOKS` (preprocessor depth counted from the nearest such #ifdef before it).
+    The hook used to follow the #ifdef directly; since the museum-pockets test hook (worker B) shares the one block, it is no longer adjacent."""
+    at = src.find(marker)
+    start = src.rfind("#ifdef PC_NET_TEST_HOOKS", 0, at)
+    if at < 0 or start < 0:
+        return False
+    depth = 0
+    for line in src[start:at].splitlines():
+        t = line.strip()
+        if t.startswith("#if"):
+            depth += 1
+        elif t.startswith("#endif"):
+            depth -= 1
+            if depth == 0:
+                return False
+    return depth >= 1
+
+
 # ---- Able Sisters ----
 nr = body(NI, "static void aNI_PcRefreshFromSave(")
 nmove = body(NI, "static void Needlework_Indoor_Actor_move(")
-check("able: refresh called only while no menu is open", re.search(r"#ifdef TARGET_PC\s*if \(submenu->process_status == mSM_PROCESS_WAIT\) \{\s*aNI_PcRefreshFromSave\(actor\);", nmove) is not None)
+check("able: refresh called only while no menu is open", re.search(r"#ifdef TARGET_PC\s*if \(submenu->process_status == mSM_PROCESS_WAIT\) \{\s*(?:int [^;]*;\s*)?aNI_PcRefreshFromSave\(actor\);", nmove) is not None)
 check("able: no-op single-player and while a local request is pending",
       "ROLE_NONE" in nr and all(k in nr for k in ("copy_cloth_data_requested", "exchange_cloth_data_requested", "copy_umb_data_requested", "exchange_umb_data_requested")))
 check("able: uses the vanilla copy path without sound", "aNI_CopyClothData(i, save, FALSE)" in nr and "aNI_CopyUmbData(i, save, FALSE)" in nr)
@@ -96,7 +116,7 @@ for fn in ("static void aNI_CopyClothData(", "static void aNI_CopyUmbData("):
 # ---- test hook used by test_museum_refresh_real.py: test-hooks builds only, one-shot, goes through the game's own scene change ----
 hk = body(NG, "static void pcnetgame_museum_warp_test_hook(")
 check("hook: AC_TEST_MUSEUM_ROOM hook exists, inside PC_NET_TEST_HOOKS, env-gated (pc_test_hook_getenv)",
-      hk != "" and 'pc_test_hook_getenv("AC_TEST_MUSEUM_ROOM")' in hk and re.search(r"#ifdef PC_NET_TEST_HOOKS\s*static void pcnetgame_museum_warp_test_hook\(", NG) is not None)
+      hk != "" and 'pc_test_hook_getenv("AC_TEST_MUSEUM_ROOM")' in hk and _inside_test_hooks(NG, "static void pcnetgame_museum_warp_test_hook("))
 check("hook: uses the game's own goto_other_scene and fires once", "goto_other_scene(play, &in, FALSE)" in hk and "s_state = 2" in hk)
 check("hook: call site is compiled out without PC_NET_TEST_HOOKS", re.search(r"#ifdef PC_NET_TEST_HOOKS\s*pcnetgame_museum_warp_test_hook\(\);\s*#endif", NG) is not None)
 

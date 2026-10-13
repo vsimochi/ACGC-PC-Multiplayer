@@ -14,6 +14,9 @@
 #include "m_ledit_ovl.h"
 #include "m_bgm.h"
 #include "GBA2/gba2.h"
+#ifdef TARGET_PC
+#include "pc_able_net.h" /* worker B: the trade gate (talk inc) */
+#endif
 
 enum {
     aNNW_TALK_WHAT_HAPPEN_FIRST,

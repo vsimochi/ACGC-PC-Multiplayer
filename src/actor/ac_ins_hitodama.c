@@ -4,6 +4,9 @@
 #include "m_name_table.h"
 #include "m_common_data.h"
 #include "m_player_lib.h"
+#ifdef TARGET_PC
+#include "pc_wildlife_authority.h" /* pcwld_sim_is_client() */
+#endif
 
 enum {
     aIHD_ACTION_AVOID,
@@ -307,7 +310,13 @@ static void aIHD_actor_move(ACTOR* actorx, GAME* game) {
     if (label == (u32)actorx) {
         aIHD_setupAction(insect, aIHD_ACTION_LET_ESCAPE, game);
     } else {
-        if (mEv_check_status(mEv_EVENT_GHOST, mEv_STATUS_RUN) == FALSE) {
+        if (mEv_check_status(mEv_EVENT_GHOST, mEv_STATUS_RUN) == FALSE
+#ifdef TARGET_PC
+            /* multiplayer: a CLIENT shows the HOST's spirits; whether the ghost event still runs is the host's decision (its spirit escapes, its
+             * record is released, the despawn removes this copy) -- a client whose own event bookkeeping lags must not let it escape early */
+            && !pcwld_sim_is_client() && !pcwld_test_ghost_run_forced() /* TEST-ONLY: the autopilot's `ghost on` (always 0 in play) */
+#endif
+        ) {
             insect->insect_flags.bit_3 = TRUE;
         }
 

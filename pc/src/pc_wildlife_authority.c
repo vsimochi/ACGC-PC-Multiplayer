@@ -153,8 +153,21 @@
 #include <string.h>
 #include <math.h>
 #include "ac_uki.h" /* host-authoritative simulation: the remote bobber proxy is a UKI_ACTOR */
+#include "ac_ant.h"        /* ants: the separate mAc_PROFILE_ANT presentation actor */
+#include "m_field_info.h"  /* mFI_GetUnitFG(): ant candy tile, cockroach placement */
+#include "m_name_table.h"
 #include <stdio.h>
 #include <time.h>
+
+/* TARGET_PC hooks exported by the species programs (ac_ant.c, ac_insect.c, ac_ins_kera.c, ac_ins_mino.c, ac_ins_dango.c) */
+extern void aANT_pc_disappear(ACTOR* ant);
+extern void aINS_pc_spirit_reregister(int bx, int bz);
+extern int aIKR_pc_follow_reveal(ACTOR* actorx, GAME* game, int host_action);
+extern int aIMN_pc_follow_reveal(ACTOR* actorx, GAME* game, int host_action);
+extern int aIDG_pc_follow_reveal(ACTOR* actorx, GAME* game, int host_action);
+extern int aIKR_pc_hidden(const ACTOR* actorx);
+extern int aIMN_pc_hidden(const ACTOR* actorx);
+extern int aIDG_pc_hidden(const ACTOR* actorx);
 
 /* Conservative fixed capacity: PCFA_ACRE_NUM (30) addressable town acres, generously bounded to 4
  * concurrently-tracked wildlife records per acre. Vanilla itself caps concurrent LOCAL fish actors
@@ -185,6 +198,9 @@ typedef struct PcWildlifeSlot {
 } PcWildlifeSlot;
 
 static PcWildlifeSlot s_table[PCWLD_MAX_ENTITIES];
+
+static void pcwld_spirit_released(const PcWildlifeRecord* r); /* SPIRITS (G2): see its definition */
+static int pcwld_latent_hidden(const aINS_INSECT_ACTOR* in); /* LATENT BUGS: see its definition */
 
 /* Host-issued, monotonic within the running session. 0 is reserved (never issued, always means
  * "unknown/no entity") -- see pcwld_alloc_entity_id()'s wraparound handling below. */
@@ -227,6 +243,8 @@ typedef struct PcWildlifePresentationSlot {
     int      has_actor; /* 0 for a deferred species (currently: ants) recorded as "handled" with no
                             real actor -- see pcwld_presentation_create()'s own doc */
     uint8_t  despawned; /* the host announced the creature gone (WILDLIFE_DESPAWN): the entry is freed by pcwld_presentation_check_idle() as soon as its local actor is gone too */
+    uint8_t  ant_actor; /* ANTS: local_actor is the separate mAc_PROFILE_ANT actor (ANT_ACTOR*), not an insect pool slot; cleared when a net catch moves the entity to the 9th-slot insect */
+    uint8_t  caught;    /* HOST: the record was removed by a CATCH (not a release): a spirit's actor must not move to a new acre when it is destroyed (G2) */
     void*    local_actor; /* T4 (ordinary bug catching): PC_WILDLIFE_KIND_BUG only -- the exact
                               aINS_INSECT_ACTOR* pointer make_insect_proc() returned for this entity_id,
                               opaque here (void*) so this file's own kind-agnostic bookkeeping never
@@ -428,6 +446,7 @@ int pcwld_host_collect_unattended(int (*attended)(const PcWildlifeRecord*), floa
             printf("[NET][WILDLIFE] host: entity %u (kind %d species %d acre %d,%d) released -- no player in or near its acre for 12 s (its acre re-rolls on the next entry)\n",
                    (unsigned)s_table[i].rec.entity_id, s_table[i].rec.kind, s_table[i].rec.species, s_table[i].rec.bx, s_table[i].rec.bz);
             out_ids[n++] = s_table[i].rec.entity_id;
+            pcwld_spirit_released(&s_table[i].rec);
             memset(&s_table[i], 0, sizeof(s_table[i]));
         }
     }
@@ -672,13 +691,21 @@ int pcwld_host_spawn_trigger(int bx, int bz) {
 /* TEST-ONLY (the autopilot's `hspawn`): records a fish of `species` at (x, z) in the authoritative table, broadcasts its WILDLIFE_SPAWN and gives the host its own actor, exactly like a
  * spawn decision does -- but with a species the test chooses (a kaseki-program fish cannot be rolled on demand). Returns the entity id, 0 on failure. */
 uint32_t pcwld_test_host_inject(int species, float x, float z) {
+    return pcwld_test_host_inject_kind(PC_WILDLIFE_KIND_FISH, species, x, z);
+}
+
+/* TEST-ONLY (the autopilot's `hspawn` / `hspawnbug`): the same for any kind -- a bug of `species` (an ant, a spirit, a latent bug...) at (x, z), y 0 like a spawn decision. */
+uint32_t pcwld_test_host_inject_kind(int kind, int species, float x, float z) {
     uint32_t id;
     int i;
 
     if (!pcwld_sim_is_host() || gamePT == NULL || !pcfa_scene_is_town() || s_in_progress) {
         return 0;
     }
-    id = pcwld_table_insert(PC_WILDLIFE_KIND_FISH, species, (int)(x / 640.0f), (int)(z / 640.0f), x, 0.0f, z);
+    if (kind != PC_WILDLIFE_KIND_FISH && kind != PC_WILDLIFE_KIND_BUG) {
+        return 0;
+    }
+    id = pcwld_table_insert(kind, species, (int)(x / 640.0f), (int)(z / 640.0f), x, 0.0f, z);
     for (i = 0; i < s_pending_count; i++) {
         (void)pcwld_presentation_create(s_pending[i].entity_id, s_pending[i].kind, s_pending[i].species, s_pending[i].bx, s_pending[i].bz, s_pending[i].x, s_pending[i].y, s_pending[i].z);
     }
@@ -816,11 +843,69 @@ static int pcwld_position_component_sane(float v) {
 
 static int pcwld_bug_presentation_actor_still_alive(const PcWildlifePresentationSlot* slot);
 
-/* 1 iff the local actor of this presentation entry is still there. A deferred ant has no actor and is "handled" for good. */
-static int pcwld_presentation_actor_alive(const PcWildlifePresentationSlot* s) {
-    if (s->kind == PC_WILDLIFE_KIND_BUG && s->species == aINS_INSECT_TYPE_ANT) {
-        return 1; /* an ant never has an actor: it is "handled" for good */
+/* ---- ANTS (W-06) ----------------------------------------------------------------------------------------------------------------------
+ * Vanilla: aSOI_ins_make_sub() -> make_ant_proc queues ONE pending ant and the insect controller builds a separate mAc_PROFILE_ANT actor
+ * (aINS_check_birth_ant). An ant only lives on a candy / spoiled-turnip tile (aANT_wait: DISAPPEAR as soon as the tile holds neither), never
+ * moves, and is caught through the net with a 9th-slot insect of type ANT (aANT_caught). Here: the host keeps the shim's record; every process
+ * shows the ant by building that same actor directly (pcwld_presentation_create, the pc_bee_sync.c pattern); the host releases the record
+ * once a second when its tile no longer holds candy / a spoiled turnip (pcwld_host_ensure_actors); a net catch moves the entity from the ant
+ * actor to the 9th-slot insect (pcwld_ant_caught_moved, ac_ant.c) so the ordinary type 0 bug catch path sends CATCH_REQUEST(species 38). */
+static int pcwld_ant_tile_ok(float x, float z) {
+    xyz_t p;
+    mActor_name_t* fg;
+    p.x = x;
+    p.y = 0.0f;
+    p.z = z;
+    fg = mFI_GetUnitFG(p);
+    return fg != NULL && (*fg == ITM_FOOD_CANDY || *fg == ITM_KABU_SPOILED); /* aANT_wait's own rule */
+}
+
+/* COCKROACH placement from the tile under (x, z): byte-exact copy of aSOI_tree_check() + the 0x2F03 (ITM_KABU_SPOILED) test of
+ * aSOI_ins_set_insect_data() (ac_set_ovl_insect.c, file-static there; keep in sync BY HAND). 4 on a tree, 6 on a spoiled turnip, 0 otherwise. */
+int pcwld_cockroach_extra_data(float x, float z) {
+    xyz_t p;
+    mActor_name_t* fg;
+    mActor_name_t it;
+    p.x = x;
+    p.y = 0.0f;
+    p.z = z;
+    fg = mFI_GetUnitFG(p);
+    if (fg == NULL) {
+        return 0;
     }
+    it = *fg;
+    if (it == TREE || it == TREE_FTR || it == TREE_LIGHTS || it == TREE_BELLS || it == TREE_APPLE_FRUIT || it == TREE_ORANGE_FRUIT ||
+        it == TREE_PEACH_FRUIT || it == TREE_PEAR_FRUIT || it == TREE_CHERRY_FRUIT || it == TREE_1000BELLS || it == TREE_10000BELLS ||
+        it == TREE_30000BELLS || it == TREE_100BELLS || it == CEDAR_TREE || it == CEDAR_TREE_BELLS || it == CEDAR_TREE_FTR ||
+        it == CEDAR_TREE_LIGHTS || it == GOLD_TREE || it == GOLD_TREE_BELLS || it == GOLD_TREE_FTR || it == GOLD_TREE_SHOVEL) {
+        return 4;
+    }
+    if (it == (mActor_name_t)0x2F03) {
+        return 6;
+    }
+    return 0;
+}
+
+/* 1 iff `ant` is still a live mAc_PROFILE_ANT actor of this process's BG actor list (an ant has no pool slot / exist flag to read). */
+static int pcwld_ant_actor_alive(const void* ant) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    Actor_list* bg;
+    ACTOR* a;
+    int i;
+    if (ant == NULL || play == NULL || !pcfa_scene_is_town()) {
+        return 0;
+    }
+    bg = &play->actor_info.list[ACTOR_PART_BG];
+    for (i = 0, a = bg->actor; i < bg->num_actors && a != NULL; i++, a = a->next_actor) {
+        if ((const void*)a == ant) {
+            return a->id == mAc_PROFILE_ANT;
+        }
+    }
+    return 0;
+}
+
+/* 1 iff the local actor of this presentation entry is still there. */
+static int pcwld_presentation_actor_alive(const PcWildlifePresentationSlot* s) {
     if (!s->has_actor || !pcfa_scene_is_town()) {
         return 0; /* its actor was lost (pool slot reused, scene unloaded...) */
     }
@@ -832,7 +917,7 @@ static int pcwld_presentation_actor_alive(const PcWildlifePresentationSlot* s) {
 
 int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx, int bz, float x,
                               float y, float z) {
-    int slot;
+    int slot, k;
     aINS_Clip_c* insect_clip;
     aGYO_Clip_c* gyo_clip;
     void* local_actor_out = NULL; /* T4: see the PC_WILDLIFE_KIND_BUG branch below */
@@ -929,19 +1014,37 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
     }
 
     if (kind == PC_WILDLIFE_KIND_BUG && species == aINS_INSECT_TYPE_ANT) {
-        /* T1 SCOPE (see this file's own top-of-file doc): the REAL make_ant_proc only queues a
-         * pending spawn for later, separate consumption -- it does not synchronously produce an
-         * ACTOR* the way aGYO_make_gyoei()/aINS_make_insect() do, so it cannot safely share this
-         * call's shape yet. Recorded as "handled" (no actor) so a duplicate SPAWN for this id stays
-         * a no-op; deferred to a later special-case stage rather than attempted here. */
-        s_presentation[slot].active    = 1;
-        s_presentation[slot].entity_id = entity_id;
-        s_presentation[slot].kind      = kind;
-        s_presentation[slot].species   = species;
-        s_presentation[slot].has_actor = 0;
-        printf("[NET][WILDLIFE] presentation: entity %u species ANT DEFERRED (T1 does not "
-               "materialize ants -- see pc_wildlife_authority.c's own doc)\n",
-               (unsigned)entity_id);
+        /* ANTS (W-06): the separate mAc_PROFILE_ANT actor, built directly the way the insect controller's aINS_check_birth_ant() builds it from
+         * make_ant_proc's pending spawn (same position, same acre block, same params). Not built when the tile no longer holds candy / a spoiled
+         * turnip (aANT_actor_ct would only fade it out at once): the entry is then "handled" without an actor and the next replay looks again.
+         * Vanilla deletes an ant actor whose acre is not the local player's (aANT_actor_move): a process elsewhere loses it at once and gets it
+         * back from the host's acre replay when its player walks in. */
+        GAME_PLAY* aplay = (GAME_PLAY*)gamePT;
+        ACTOR* ant = NULL;
+        if (pcwld_ant_tile_ok(x, z)) {
+            ant = Actor_info_make_actor(&aplay->actor_info, (GAME*)aplay, mAc_PROFILE_ANT, x, y, z, 0, 0, 0, bx, bz, -1, EMPTY_NO, -1, -1, -1);
+            if (ant == NULL) {
+                pcwld_deferred_add(entity_id, kind, species, bx, bz, x, y, z); /* actor table / object bank not ready: retried once a second */
+                printf("[NET][WILDLIFE] presentation: entity %u (ant) local actor creation failed -- deferred\n", (unsigned)entity_id);
+                return 0;
+            }
+            for (k = 0; k < PCWLDP_MAX_LOCAL; k++) { /* a reused actor address: the older entry's ant is gone */
+                if (s_presentation[k].active && k != slot && s_presentation[k].has_actor && s_presentation[k].local_actor == (void*)ant) {
+                    s_presentation[k].local_actor = NULL;
+                    s_presentation[k].has_actor = 0;
+                }
+            }
+        }
+        s_presentation[slot].active      = 1;
+        s_presentation[slot].entity_id   = entity_id;
+        s_presentation[slot].kind        = kind;
+        s_presentation[slot].species     = species;
+        s_presentation[slot].has_actor   = (ant != NULL) ? 1 : 0;
+        s_presentation[slot].ant_actor   = (ant != NULL) ? 1 : 0;
+        s_presentation[slot].local_actor = (void*)ant;
+        pcwld_deferred_remove(entity_id);
+        printf("[NET][WILDLIFE] presentation: entity %u kind %d species %d (ANT) %s at acre(%d,%d) pos(%.1f,%.1f,%.1f) local_actor=%p\n", (unsigned)entity_id, kind, species,
+               ant != NULL ? "materialized locally" : "NOT shown (its tile holds no candy / spoiled turnip)", bx, bz, x, y, z, (void*)ant);
         return 1;
     }
 
@@ -987,6 +1090,12 @@ int pcwld_presentation_create(uint32_t entity_id, int kind, int species, int bx,
                  * and the WILDLIFE_SPAWN message) that is out of this narrow bugfix pass's scope --
                  * left as a documented gap rather than a rushed partial fix. */
                 init.extra_data  = aINS_INIT_NORMAL;
+                if (species == aINS_INSECT_TYPE_COCKROACH) {
+                    /* COCKROACH (no wire change): vanilla gives it 4 (on a tree) or 6 (on a spoiled turnip) from the field tile it spawned on
+                     * (aSOI_ins_set_insect_data, ac_set_ovl_insect.c); every process reads the same synced tile at the record position and applies
+                     * the same rule, so host and clients start the cockroach in the same pose. */
+                    init.extra_data = pcwld_cockroach_extra_data(x, z);
+                }
                 init.game        = (GAME*)gamePT;
                 created_actor    = insect_clip->make_insect_proc(&init, aINS_MAKE_NEW);
                 ok = created_actor != NULL;
@@ -1156,6 +1265,9 @@ static int pcwld_bug_presentation_actor_still_alive(const PcWildlifePresentation
            has_actor/local_actor for every bug slot anyway, so this branch is defensive only. */
         return 0;
     }
+    if (slot->ant_actor) {
+        return pcwld_ant_actor_alive(slot->local_actor); /* ANTS: a separate actor, not an insect pool slot */
+    }
     insect = (const aINS_INSECT_ACTOR*)slot->local_actor;
     return insect->exist_flag == TRUE && insect->type == slot->species;
 }
@@ -1169,10 +1281,15 @@ void pcwld_test_dump_presentation(void) {
         if (!s->active) {
             continue;
         }
-        if (s->kind == PC_WILDLIFE_KIND_BUG && s->has_actor && s->local_actor != NULL && pcfa_scene_is_town()) {
+        if (s->kind == PC_WILDLIFE_KIND_BUG && s->ant_actor && s->has_actor && s->local_actor != NULL && pcfa_scene_is_town()) {
+            const ACTOR* an = (const ACTOR*)s->local_actor;
+            const int alive = pcwld_ant_actor_alive(s->local_actor);
+            printf("[AUTO] pres entity %u ant actor %p alive=%d action=%d pos=(%.0f,%.0f)\n", (unsigned)s->entity_id, s->local_actor, alive, alive ? ((const ANT_ACTOR*)an)->action : -1,
+                   alive ? (double)an->world.position.x : 0.0, alive ? (double)an->world.position.z : 0.0);
+        } else if (s->kind == PC_WILDLIFE_KIND_BUG && s->has_actor && s->local_actor != NULL && pcfa_scene_is_town()) {
             const aINS_INSECT_ACTOR* in = (const aINS_INSECT_ACTOR*)s->local_actor;
-            printf("[AUTO] pres entity %u bug species %d actor %p exist=%d type=%d pos=(%.0f,%.0f)\n", (unsigned)s->entity_id, s->species, s->local_actor, in->exist_flag, in->type,
-                   (double)in->tools_actor.actor_class.world.position.x, (double)in->tools_actor.actor_class.world.position.z);
+            printf("[AUTO] pres entity %u bug species %d actor %p exist=%d type=%d action=%d drawn=%d pos=(%.0f,%.0f)\n", (unsigned)s->entity_id, s->species, s->local_actor, in->exist_flag, in->type,
+                   (int)in->action, (int)in->tools_actor.actor_class.drawn, (double)in->tools_actor.actor_class.world.position.x, (double)in->tools_actor.actor_class.world.position.z);
         } else {
             printf("[AUTO] pres entity %u kind %d species %d has_actor=%d alive=%d despawned=%d actors=%d\n", (unsigned)s->entity_id, s->kind, s->species, s->has_actor, pcwld_presentation_actor_alive(s), (int)s->despawned,
                    (s->kind == PC_WILDLIFE_KIND_FISH && pcfa_scene_is_town()) ? aGYO_pc_stamp_count((u32)s->entity_id) : 0);
@@ -1542,7 +1659,17 @@ int pcwld_bug_handle_wildlife_despawn(uint32_t entity_id) {
             continue;
         }
         if (!s_presentation[i].has_actor || s_presentation[i].local_actor == NULL) {
-            return 0; /* deferred (ant) or already invalidated -- nothing to touch */
+            return 0; /* not shown / already invalidated -- nothing to touch */
+        }
+        if (s_presentation[i].ant_actor) {
+            /* ANTS: the vanilla fade (aANT_disappear) unless THIS process's player has the ant in the net right now (then the catch flow owns it) */
+            if (!pcwld_ant_actor_alive(s_presentation[i].local_actor)) {
+                return 0;
+            }
+            if ((void*)(uintptr_t)mPlib_Get_item_net_catch_label() != s_presentation[i].local_actor) {
+                aANT_pc_disappear((ACTOR*)s_presentation[i].local_actor);
+            }
+            return 1;
         }
         insect = (aINS_INSECT_ACTOR*)s_presentation[i].local_actor;
         if (insect->exist_flag != TRUE || insect->type != s_presentation[i].species) {
@@ -1955,6 +2082,9 @@ int pcwld_host_collect_state(PcWldStateEntry* out, int max) {
             }
         } else {
             const aINS_INSECT_ACTOR* in;
+            if (r->species == aINS_INSECT_TYPE_ANT) {
+                continue; /* ANTS never move: no state to simulate (and their local actor is no insect) */
+            }
             ps = pcwld_find_presentation(r->entity_id);
             if (ps < 0 || !pcwld_bug_presentation_actor_still_alive(&s_presentation[ps])) {
                 continue;
@@ -1965,6 +2095,11 @@ int pcwld_host_collect_state(PcWldStateEntry* out, int max) {
             e->z = in->tools_actor.actor_class.world.position.z;
             e->angle = in->tools_actor.actor_class.shape_info.rotation.y;
             e->action = (uint8_t)in->action;
+            if (pcwld_latent_hidden(in)) {
+                n++; /* LATENT BUGS: a hidden one keeps its record position -- it is its hiding place (the tree / ground / rock UNIT its species program
+                        compares tool uses with); a hanging bagworm's drawn position drifts 25 units off it, and a re-created actor must hide in the same unit */
+                continue;
+            }
         }
         /* the record follows the creature: the catch reach check (pcnetgame_validate_catch) must measure against where it IS */
         s_table[i].rec.pos_x = e->x;
@@ -1995,6 +2130,14 @@ void pcwld_host_ensure_actors(int (*attended)(const PcWildlifeRecord*)) {
         }
         r = &s_table[i].rec;
         if (r->kind == PC_WILDLIFE_KIND_BUG && r->species == aINS_INSECT_TYPE_ANT) {
+            /* ANTS (W-06): no host actor is needed (an ant never moves, no WILDLIFE_STATE). The record lives exactly as long as its tile holds candy /
+             * a spoiled turnip -- aANT_wait()'s own rule, checked once a second here; then it is released (pcwld_host_collect_abandoned broadcasts the
+             * despawn, every ant fades) and the acre can roll again. */
+            if (!s_table[i].abandoned && !pcwld_ant_tile_ok(r->pos_x, r->pos_z)) {
+                s_table[i].abandoned = 1;
+                printf("[NET][WILDLIFE] host: ant entity %u -- its tile (%.0f,%.0f) no longer holds candy / a spoiled turnip: record released\n", (unsigned)r->entity_id, r->pos_x,
+                       r->pos_z);
+            }
             continue;
         }
         if (r->kind == PC_WILDLIFE_KIND_FISH) {
@@ -2053,6 +2196,7 @@ int pcwld_host_collect_abandoned(uint32_t* out_ids, int max) {
             printf("[NET][WILDLIFE] host: entity %u (kind %d species %d acre %d,%d) released -- its host actor could not be kept alive (5 re-creations in a row); its acre re-rolls on the next entry\n", (unsigned)s_table[i].rec.entity_id, s_table[i].rec.kind, s_table[i].rec.species, s_table[i].rec.bx,
                    s_table[i].rec.bz);
             out_ids[n++] = s_table[i].rec.entity_id;
+            pcwld_spirit_released(&s_table[i].rec);
             memset(&s_table[i], 0, sizeof(s_table[i]));
         }
     }
@@ -2201,6 +2345,186 @@ static void pcwld_ease_actor(ACTOR* a, const PcWldStateEntry* t, float k) {
     }
 }
 
+/* ================================================================================================
+ * LATENT BUGS (mole cricket in the ground, bagworm / spider in a tree, pill bug under a rock)
+ * ================================================================================================
+ * Vanilla reveals them from the LOCAL player's tool use only: the tool code calls aINS_CLIP->set_pl_act_tim_proc(action, ut_x, ut_z), the hidden
+ * insect compares it on the next insect-controller tick (aIKR_check_dig_hole_scoop / aIMN_check_shake_tree / aIDG_check_strike_stone) and the
+ * controller clears it at the end of that tick. The host never saw a remote player's tool use, so its (authoritative) copy stayed hidden.
+ *  - a client reports every local tool use to the host (WILDLIFE_TOOL_ACTION, pc_net_game.c) and still reveals its own copy at once (vanilla);
+ *  - the host queues the remote tool uses here and feeds one per tick into pl_action at the start of aINS_actor_move (pcwld_host_take_pl_action,
+ *    only when no local action is pending), so its unmodified species programs reveal the bug;
+ *  - the other clients follow the host's WILDLIFE_STATE.action: their copy leaves HIDE when the host's did (pcwld_latent_follow_host);
+ *  - the host refuses a catch of a latent bug that its own copy still holds hidden AND uncatchable (vanilla's own catch gate, insect_flags.bit_1). */
+#define PCWLD_PL_ACT_QUEUE 16
+typedef struct PcWldPlAct {
+    uint8_t act, ut_x, ut_z, _pad;
+} PcWldPlAct;
+static PcWldPlAct s_pl_act_q[PCWLD_PL_ACT_QUEUE];
+static int s_pl_act_head, s_pl_act_n;
+
+int pcwld_host_queue_pl_action(int action, int ut_x, int ut_z) {
+    PcWldPlAct* e;
+    if (!pcwld_sim_is_host() || action < aINS_PL_ACT_REFLECT_AXE || action > aINS_PL_ACT_SHAKE_TREE || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return 0;
+    }
+    if (s_pl_act_n >= PCWLD_PL_ACT_QUEUE) { /* full (cannot happen at human tool speed): the oldest is dropped */
+        s_pl_act_head = (s_pl_act_head + 1) % PCWLD_PL_ACT_QUEUE;
+        s_pl_act_n--;
+    }
+    e = &s_pl_act_q[(s_pl_act_head + s_pl_act_n) % PCWLD_PL_ACT_QUEUE];
+    e->act = (uint8_t)action;
+    e->ut_x = (uint8_t)ut_x;
+    e->ut_z = (uint8_t)ut_z;
+    s_pl_act_n++;
+    return 1;
+}
+
+int pcwld_host_take_pl_action(int* action, int* ut_x, int* ut_z) {
+    const PcWldPlAct* e;
+    if (s_pl_act_n <= 0) {
+        return 0;
+    }
+    if (!pcwld_sim_is_host()) {
+        s_pl_act_n = 0; /* a stale queue from an earlier hosting session never leaks into another role */
+        return 0;
+    }
+    e = &s_pl_act_q[s_pl_act_head];
+    *action = e->act;
+    *ut_x = e->ut_x;
+    *ut_z = e->ut_z;
+    s_pl_act_head = (s_pl_act_head + 1) % PCWLD_PL_ACT_QUEUE;
+    s_pl_act_n--;
+    printf("[NET][WILDLIFE] host: remote tool use action %d at ut(%d,%d) handed to the insects\n", *action, *ut_x, *ut_z);
+    return 1;
+}
+
+/* 1 iff `in` is a latent species still in its hiding place (its species program's HIDE action). */
+static int pcwld_latent_hidden(const aINS_INSECT_ACTOR* in) {
+    switch (in->type) {
+        case aINS_INSECT_TYPE_MOLE_CRICKET:
+            return aIKR_pc_hidden((const ACTOR*)in);
+        case aINS_INSECT_TYPE_BAGWORM:
+        case aINS_INSECT_TYPE_SPIDER:
+            return aIMN_pc_hidden((const ACTOR*)in);
+        case aINS_INSECT_TYPE_PILL_BUG:
+            return aIDG_pc_hidden((const ACTOR*)in);
+        default:
+            return 0;
+    }
+}
+
+static void pcwld_latent_follow_host(ACTOR* a, int species, int host_action) {
+    int revealed = 0;
+    switch (species) {
+        case aINS_INSECT_TYPE_MOLE_CRICKET:
+            revealed = aIKR_pc_follow_reveal(a, (GAME*)gamePT, host_action);
+            break;
+        case aINS_INSECT_TYPE_BAGWORM:
+        case aINS_INSECT_TYPE_SPIDER:
+            revealed = aIMN_pc_follow_reveal(a, (GAME*)gamePT, host_action);
+            break;
+        case aINS_INSECT_TYPE_PILL_BUG:
+            revealed = aIDG_pc_follow_reveal(a, (GAME*)gamePT, host_action);
+            break;
+        default:
+            return;
+    }
+    if (revealed) {
+        printf("[NET][WILDLIFE] client: latent bug species %d revealed -- the host's copy left its hiding place (host action %d)\n", species, host_action);
+    }
+}
+
+/* HOST: 1 = refuse a catch of this bug: the host's own copy is a latent bug still in its hiding place and vanilla gives it no catch range there
+ * (insect_flags.bit_1). A latent species that vanilla does let a net reach while hidden (bit_1 clear) is not refused. */
+int pcwld_host_bug_catch_blocked(uint32_t entity_id) {
+    const int ps = pcwld_find_presentation(entity_id);
+    const aINS_INSECT_ACTOR* in;
+    int hidden;
+    if (!pcwld_sim_is_host() || ps < 0 || s_presentation[ps].ant_actor || !pcwld_bug_presentation_actor_still_alive(&s_presentation[ps])) {
+        return 0;
+    }
+    in = (const aINS_INSECT_ACTOR*)s_presentation[ps].local_actor;
+    hidden = pcwld_latent_hidden(in);
+    return hidden && in->insect_flags.bit_1;
+}
+
+/* ================================================================================================
+ * ANTS: the net catch moves the entity from the ant actor to the 9th-slot insect (ac_ant.c aANT_caught, TARGET_PC)
+ * ================================================================================================ */
+void pcwld_ant_caught_moved(const void* ant, void* insect) {
+    int i;
+    if (ant == NULL || insect == NULL) {
+        return;
+    }
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        PcWildlifePresentationSlot* s = &s_presentation[i];
+        if (s->active && s->kind == PC_WILDLIFE_KIND_BUG && s->ant_actor && s->local_actor == ant) {
+            s->local_actor = insect;
+            s->ant_actor = 0;
+            printf("[NET][WILDLIFE] ant entity %u is in the net: tracked through its catch insect %p from now on\n", (unsigned)s->entity_id, insect);
+            return;
+        }
+    }
+}
+
+/* ================================================================================================
+ * SPIRITS (hitodama): G2 -- a caught spirit must not reappear elsewhere
+ * ================================================================================================
+ * Vanilla aINS_destruct() moves an uncaught spirit to a new random free acre of the ghost event's table (aINS_regist_set_block_table) unless the
+ * LOCAL player has it in the net. On the host a spirit another player caught, or one whose record still lives (its actor was culled and is re-created
+ * for whoever attends it), therefore came back in another acre and the set of five never shrank. The host now decides it per record:
+ *  - caught (any player, pcwld_note_caught before the despawn): the acre is not re-registered;
+ *  - the record still lives: not now -- when it is released (12 s unattended / ended / abandoned) and no host actor is left (pcwld_spirit_released);
+ *  - an untracked actor, or any client process: vanilla. */
+static int s_test_ghost_run = 0;
+void pcwld_test_force_ghost_run(int on) {
+    s_test_ghost_run = on ? 1 : 0;
+}
+int pcwld_test_ghost_run_forced(void) {
+    return s_test_ghost_run;
+}
+
+void pcwld_note_caught(uint32_t entity_id) {
+    const int ps = pcwld_find_presentation(entity_id);
+    if (ps >= 0) {
+        s_presentation[ps].caught = 1;
+    }
+}
+
+int pcwld_spirit_keep_acre(const void* insect_actor) {
+    int i;
+    if (!pcwld_sim_is_host() || insect_actor == NULL) {
+        return 0;
+    }
+    for (i = 0; i < PCWLDP_MAX_LOCAL; i++) {
+        const PcWildlifePresentationSlot* s = &s_presentation[i];
+        if (s->active && s->kind == PC_WILDLIFE_KIND_BUG && !s->ant_actor && s->local_actor == insect_actor) {
+            if (s->caught) {
+                printf("[NET][WILDLIFE] host: spirit entity %u was caught -- it does not move to another acre\n", (unsigned)s->entity_id);
+                return 1;
+            }
+            if (pcwld_find_slot_by_id(s->entity_id) >= 0) {
+                return 1; /* the record lives on: its acre moves when the record is released (pcwld_spirit_released) */
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static void pcwld_spirit_released(const PcWildlifeRecord* r) {
+    const int ps = (r != NULL) ? pcwld_find_presentation(r->entity_id) : -1;
+    if (r == NULL || r->kind != PC_WILDLIFE_KIND_BUG || r->species != aINS_INSECT_TYPE_SPIRIT || !pcwld_sim_is_host() || !pcfa_scene_is_town()) {
+        return;
+    }
+    if (ps >= 0 && pcwld_bug_presentation_actor_still_alive(&s_presentation[ps])) {
+        return; /* the despawn that follows destroys the live actor; its (vanilla) aINS_destruct moves the spirit */
+    }
+    printf("[NET][WILDLIFE] host: uncaught spirit entity %u released -- it moves to another acre (vanilla)\n", (unsigned)r->entity_id);
+    aINS_pc_spirit_reregister(r->bx, r->bz);
+}
+
 int pcwld_fish_is_driven(const void* fish_actor) {
     return pcwld_sim_is_client() && aGYO_pc_get_entity_id_stamp((ACTOR*)fish_actor) != 0;
 }
@@ -2242,6 +2566,7 @@ void pcwld_drive_insect(void* insect_actor) {
     if (entity == 0 || (t = pcwld_find_target(entity)) == NULL) {
         return;
     }
+    pcwld_latent_follow_host(a, (int)in->type, (int)t->e.action); /* LATENT BUGS: another player's tool use revealed it on the host */
     k = 0.25f * (float)gamePT->graph->dt_num_60fps_frames;
     pcwld_ease_actor(a, &t->e, k > 1.0f ? 1.0f : k);
 }

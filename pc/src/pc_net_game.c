@@ -196,7 +196,10 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_dayclaims.h"     /* capacity phase 7: per-character, per-day claims (K.K.) */
 #include "pc_keytab.h"        /* capacity phase 7: dynamic tables keyed by a character identity */
 #include "pc_tabfile.h"        /* capacity phase 7: the durable file of a keyed table (work_jobs.dat v3, v2 compatible) */
-#include "pc_interest.h"      /* capacity phase 5: MOVE relay tiers */
+#include "pc_able_net.h"       /* worker B: Able Sisters trade journal / villager outfits */
+#include "pc_museum_net.h"     /* worker B: museum letters with a gift, guest donor names */
+#include "pc_museum_donors.h"  /* worker B: the museum_donors.dat sidecar */
+#include "pc_interest.h"     /* capacity phase 5: MOVE relay tiers */
 #include "pc_roster.h"        /* capacity phase 5: roster deltas with retry */
 #include "pc_guest_admit.h" /* capacity phase 4: the pure guest admission rules (range, decision) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
@@ -566,6 +569,14 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_SHOP_UPGRADE_REQ      = 85, /* multiplayer shop upgrade (v8 unreleased: extended in place, NO version bump), client -> host ONLY, RELIABLE, 8 bytes: "Nook just announced upgrade
                                              * <gen> to my player inside the shop: close the shop". The answer is town service 6 (SHOP_UPGRADE). An old host ignores the unknown id (the dialogue
                                              * falls back after its timeout). See PCNetGameShopUpgradeReqMsg. */
+    PC_NETGAME_MSG_WILDLIFE_TOOL_ACTION  = 86, /* multiplayer latent bugs (v8 extended in place, NO version bump), client -> host ONLY, RELIABLE, 8 bytes: "my player's tool just
+                                             * informed the insects" (aINS_PL_ACT_* shake / dig / rock hit at town unit ut_x, ut_z). The host feeds it to its own insects so a hidden
+                                             * bug comes out there too. An old host ignores the unknown id. See PCNetGameWildlifeToolActionMsg. */
+    PC_NETGAME_MSG_GHOST_HUNT            = 87, /* multiplayer spirit hunt (v8 extended in place, NO version bump), client -> host ONLY, RELIABLE, 4 bytes: "my player accepted the Wisp's
+                                             * request". The host starts the hunt in its own ghost event (spirits then spawn for everybody). An old host ignores it. See PCNetGameGhostHuntMsg. */
+    PC_NETGAME_MSG_VILLAGER_OUTFIT       = 90, /* worker B (v8 extended in place, NO version bump), host -> every READY client, RELIABLE, 128 bytes: the town villagers' outfits as the HOST
+                                             * holds them (Save_t.animals[].cloth / cloth_original_id / umbrella_id, guarded by npc_id), sent on change and at READY. The client writes them into
+                                             * its local Save copy whenever that villager has no live actor (an actor writes its drawn outfit back at its save). An old client ignores the id. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -2632,6 +2643,24 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
 /* Guest mailbox: MAIL_SEND (12) is open to GUESTS (the letter is read from the guest mirror record; no sender house) within a host-local daily limit, MAIL_TAKE (13) takes a letter
  * of the guest's host-held mailbox (MAILBOX_LETTER house 0xFF), see "GUEST MAIL HOST". MAIL_LIMIT (38): a guest's letter beyond today's limit (nothing changes, the letter stays). */
 #define PC_NETGAME_TXN_REASON_MAIL_LIMIT 38u
+/* MUSEUM LETTERS WITH A GIFT (kind 19, worker B; the MAIL_SEND machinery and tag layout, NO new message id; "MAIL HOST" block). A resident OR a guest posts a letter addressed to the
+ * MUSEUM with a gift: tag as MAIL_SEND (slot, gift echo, h24 of the letter); the letter is read from the HOST's mirror of the sender. The host runs the museum's side of the letter
+ * (m_museum.c mMsm_PC_MuseumMailFor: a fossil is stored for appraisal, any other item is donated / recorded for return) on THAT sender's museum_record (resident: private_data[idx],
+ * guest: its guest record) with the sender's donor nibble (resident slot + 1, guest 5 + the museum_donors.dat attribution), clears the mirror slot, rev++, journal. The result /
+ * information letters follow the vanilla day pass (residents: the host's mMsm_DepositFossil; guests: the same pass into the guest mailbox, see "GUEST MUSEUM DAY").
+ * MUSEUM_FULL (42): the record has no room (30 stored fossils / 30 pending results: vanilla would drop the gift). MUSEUM_MAIL_OFF (43): AC_MP_MUSEUM_MAIL=0 on the host. 44 reserved. */
+#define PC_NETGAME_TXN_KIND_MUSEUM_MAIL 19u
+#define PC_NETGAME_TXN_REASON_MUSEUM_FULL     42u
+#define PC_NETGAME_TXN_REASON_MUSEUM_MAIL_OFF 43u
+/* HOUSE UPGRADES via Nook (kind 20, worker C; the same one-phase TXN_COMMIT machinery, NO new message id; pc_house_upgrade.h, "HOUSE UPGRADE" block at the end of this file).
+ * tag.aux_cond = op (1 ORDER_SIZE, 2 ORDER_BASEMENT, 3 ORDER_STATUE, 4 ACK_BUILT), tag.aux_item = ORDER_SIZE's roof palette (else 0), tag.flags = the stale-header guard
+ * (pc_house_upgrade_guard_bits of the client's copy), tag.dest NONE, tag.slot 0, tag.item 0. Residents only (a guest: PRECOND, not journaled).
+ * Reasons: HOUSE_NOT_ELIGIBLE (45) the vanilla preconditions fail on the HOST's data, HOUSE_BUSY (46) a house / record transfer of this player is in flight, HOUSE_CHANGED (47) the
+ * guard differs from the host's header; 48 is reserved for this block. */
+#define PC_NETGAME_TXN_KIND_HOUSE_UPGRADE 20u
+#define PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE 45u
+#define PC_NETGAME_TXN_REASON_HOUSE_BUSY         46u
+#define PC_NETGAME_TXN_REASON_HOUSE_CHANGED      47u
 #define PC_NETGAME_RESTOCK_PRICE         500u
 #define PC_NETGAME_RESTOCK_WAIT_MS       60000u
 #define PC_NETGAME_HOUSE_AUTO                 0xFFu
@@ -2702,7 +2731,10 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
                                      * 3 reserved zero bytes, then 16 x PersonalID_c (20 raw bytes each: the guest KEY = name, land name, player_id, land_id; little-endian PC image,
                                      * host == client build), the first `count` used (newest guest first), the rest zero. Only guests with a confirmed entry and record in the
                                      * host's CURRENT town; not built at all with AC_MP_GUEST_MAIL=0. An old client ignores the unknown service. */
-#define PC_NETGAME_TS_NUM      8u   /* array bound: services 1..7 named (index 0 unused), 8+ reserved */
+#define PC_NETGAME_TS_MDONORS  8u   /* worker B: MUSEUM_DONORS, which GUEST donated an exhibit whose donor nibble is 5 (host sidecar museum_donors.dat; NOT a save region). 284 bytes:
+                                     * u8 count (0..8), 3 reserved zero bytes, 120 x u8 name index per exhibit (fossil 0..24, art 25..39, insect 40..79, fish 80..119; 0xFF = none),
+                                     * then 8 x PersonalID_c (20 raw bytes: the guest KEY), the first `count` used, the rest zero. An old client ignores the unknown service. */
+#define PC_NETGAME_TS_NUM      9u   /* array bound: services 1..8 named (index 0 unused), 9+ reserved */
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
 #define PC_NETGAME_TS_MUSEUM_LEN 63u
@@ -2712,6 +2744,8 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_GUESTDIR_MAX   16u
 #define PC_NETGAME_TS_GUESTDIR_LEN (4u + PC_NETGAME_GUESTDIR_MAX * 20u) /* 324 */
 #define PC_NETGAME_TS_EVENT_LEN 214u /* 84 (mEv_special_c) + 100 (mEv_weekly_u) + 30 (decision fields of event_save_common + event_year) */
+#define PC_NETGAME_MDONORS_NAMES 8u
+#define PC_NETGAME_TS_MDONORS_LEN (4u + 120u + PC_NETGAME_MDONORS_NAMES * 20u) /* 284 (worker B) */
 typedef struct PCNetGameTownSvcStateMsg {
     uint8_t  msg_type;   /* PC_NETGAME_MSG_TOWN_SVC_STATE */
     uint8_t  service;    /* PC_NETGAME_TS_* */
@@ -3591,6 +3625,14 @@ static uint8_t                  s_ts_client_have[PC_NETGAME_TS_NUM];
 static PCNetGameTownSvcStateMsg s_ts_client_stash[PC_NETGAME_TS_NUM];
 static uint8_t                  s_ts_client_stash_valid[PC_NETGAME_TS_NUM];
 static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int applied);
+/* HOUSE UPGRADE block (worker C, defined at the end of this file): the client op (AWAIT_CLEAN -> kind 20), its resolve / apply, the host handler and the construction poll. */
+static int  pcnetgame_hu_awaiting(void);
+static void pcnetgame_hu_op_resolve(uint32_t request_id, int applied, uint8_t reason);
+static int  pcnetgame_txn_apply_house_upgrade(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in);
+static void pcnetgame_handle_host_house_upgrade_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in);
+static void pcnetgame_hu_client_tick(void);
+static void pcnetgame_hu_host_tick(uint32_t now);
+static void pcnetgame_hu_session_reset(void);
 
 static int pcnetgame_txn_busy(void) {
     return s_ctxn.state != PC_NETGAME_CTXN_FREE;
@@ -3608,7 +3650,7 @@ static int pcnetgame_txn_begin_blocked(void) {
     /* furniture sync: while this client's OWN house holds uncommitted edits (or its commit is in flight) no pocket transaction may begin: its pre-image
      * would carry the pockets of the unsent house edit into the host's record while the host's house still holds the furniture (a duplicate) */
     return s_ctxn.state != PC_NETGAME_CTXN_FREE || (s_mail_op.active && !s_mail_op.done) || (s_take_op.active && !s_take_op.done) ||
-           pcnetgame_house_client_txn_blocked();
+           pcnetgame_house_client_txn_blocked() || pcnetgame_hu_awaiting(); /* worker C: a house upgrade waiting for a clean record holds the token too */
 }
 
 static void pcnetgame_txn_begin(uint8_t kind, uint32_t request_id, uint8_t slot, uint16_t item,
@@ -5881,6 +5923,9 @@ static const char* pcnetgame_kind_tag(int kind) {
     if (kind == (int)PC_NETGAME_TXN_KIND_MAIL_SEND) {
         return "MAIL_SEND"; /* mail milestone 1 */
     }
+    if (kind == (int)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {
+        return "MUSEUM_MAIL"; /* worker B */
+    }
     if (kind == (int)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
         return "MAIL_TAKE"; /* mail milestone 2 */
     }
@@ -5898,6 +5943,9 @@ static const char* pcnetgame_kind_tag(int kind) {
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_DRESSER) {
         return "DRESSER";
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
+        return "HOUSE_UPGRADE"; /* worker C: house upgrades via Nook */
     }
     if (kind == (int)PC_NETGAME_INTERACT_KIND_DROP) {
         return "DROP";
@@ -6417,6 +6465,14 @@ static void pcnetgame_page_client_tick(void);
 static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg* in);
 static void pcnetgame_page_handle_client(const PCNetGamePageMsg* in);
 static void pcnetgame_page_client_reset(void);
+static void pcnetgame_outfit_handle_client(const uint8_t* data, uint16_t size); /* worker B: VILLAGER_OUTFIT (90) */
+/* worker B: the museum (MUSEUM GUESTS block) */
+static void pcnetgame_ts_build_mdonors(uint8_t* blob);
+static int  pcnetgame_ts_valid_mdonors_blob(const uint8_t* blob);
+static void pcnetgame_mdon_client_apply(const uint8_t* blob);
+static int  pcnetgame_museum_mail_on(void);
+static void pcnetgame_mdon_note(int g, mActor_name_t item);
+static int  pcnetgame_guest_of_idx(int idx); /* GUEST MAIL HOST block */
 static void pcnetgame_page_test_edit(void);
 static void pcnetgame_clear_errands_test_hook(void);
 
@@ -11381,6 +11437,133 @@ static void pcnetgame_commit_catch_despawn(uint32_t entity_id) {
     pcwld_handle_wildlife_despawn(entity_id);
 }
 
+/* ===== WILDLIFE SPECIAL CASES BEGIN (worker A: spirits, ants, latent bugs) =====
+ * The despawn of an entity removed by a CATCH (not a release): the host marks it caught first, so a caught spirit's actor does not move to another acre
+ * when it is destroyed (G2, pcwld_spirit_keep_acre). Same wire as every other despawn. */
+static void pcnetgame_commit_caught_despawn(uint32_t entity_id) {
+    pcwld_note_caught(entity_id);
+    pcnetgame_commit_catch_despawn(entity_id);
+}
+
+/* LATENT BUGS: client -> host, a local tool use that informed the insects (PC_NETGAME_MSG_WILDLIFE_TOOL_ACTION = 86). */
+typedef struct PCNetGameWildlifeToolActionMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_WILDLIFE_TOOL_ACTION */
+    uint8_t  action;   /* aINS_PL_ACT_REFLECT_AXE(1) / _REFLECT_SCOOP(2) / _DIG_SCOOP(3) / _SHAKE_TREE(4) */
+    uint8_t  ut_x;     /* town unit (mFI_Wpos2UtNum) of the tool target */
+    uint8_t  ut_z;
+    uint16_t seq;      /* diagnostics only (log correlation); never used for ordering or dedup */
+    uint16_t _rsv;     /* 0 */
+} PCNetGameWildlifeToolActionMsg;
+_Static_assert(sizeof(PCNetGameWildlifeToolActionMsg) == 8, "PCNetGameWildlifeToolActionMsg wire size drifted");
+
+/* SPIRIT HUNT: client -> host, "my player accepted the Wisp's request" (PC_NETGAME_MSG_GHOST_HUNT = 87). */
+typedef struct PCNetGameGhostHuntMsg {
+    uint8_t msg_type; /* PC_NETGAME_MSG_GHOST_HUNT */
+    uint8_t _rsv[3];  /* 0 */
+} PCNetGameGhostHuntMsg;
+_Static_assert(sizeof(PCNetGameGhostHuntMsg) == 4, "PCNetGameGhostHuntMsg wire size drifted");
+
+#define PC_NETGAME_WILDLIFE_TOOL_REACH 240.0f /* world units between the peer and the tool target tile (a tool reaches ~1 unit; latency slack) */
+
+/* HOST: validated (READY, in town, reach) remote tool use -> the insect queue (pc_wildlife_authority.c). Nothing is answered. */
+static void pcnetgame_handle_host_wildlife_tool_action(PCNetPeerId peer, const PCNetGameWildlifeToolActionMsg* in) {
+    float px = 0.0f, py = 0.0f, pz = 0.0f, tx, tz;
+
+    if (!pcnetgame_wildlife_auth_on() || peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (in->action < (uint8_t)aINS_PL_ACT_REFLECT_AXE || in->action > (uint8_t)aINS_PL_ACT_SHAKE_TREE || in->_rsv != 0) {
+        printf("[NET][WILDLIFE] host: peer %d WILDLIFE_TOOL_ACTION malformed (action %u) -- ignored\n", (int)peer, (unsigned)in->action);
+        return;
+    }
+    if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN) || !pcfa_scene_is_town()) {
+        return;
+    }
+    if (!pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz)) {
+        return;
+    }
+    tx = (float)in->ut_x * 40.0f + 20.0f; /* unit centre (mFI_UNIT_BASE_SIZE 40) */
+    tz = (float)in->ut_z * 40.0f + 20.0f;
+    if ((tx - px) * (tx - px) + (tz - pz) * (tz - pz) > PC_NETGAME_WILDLIFE_TOOL_REACH * PC_NETGAME_WILDLIFE_TOOL_REACH) {
+        printf("[NET][WILDLIFE] host: peer %d tool action %u at ut(%u,%u) out of reach of its player (%.0f,%.0f) -- ignored\n", (int)peer, (unsigned)in->action,
+               (unsigned)in->ut_x, (unsigned)in->ut_z, px, pz);
+        return;
+    }
+    if (pcwld_host_queue_pl_action((int)in->action, (int)in->ut_x, (int)in->ut_z)) {
+        printf("[NET][WILDLIFE] host: peer %d tool action %u at ut(%u,%u) queued for the insects (seq %u)\n", (int)peer, (unsigned)in->action, (unsigned)in->ut_x,
+               (unsigned)in->ut_z, (unsigned)in->seq);
+    }
+}
+
+/* HOST: a READY peer in the town accepted the Wisp's request: the hunt starts in the HOST's ghost event (the spawn decision reads only the host's
+ * common area). Only while the host's ghost event has its common area (the event runs); otherwise ignored and logged. */
+static void pcnetgame_handle_host_ghost_hunt(PCNetPeerId peer, const PCNetGameGhostHuntMsg* in) {
+    mEv_gst_common_c* gc;
+
+    (void)in;
+    if (!pcnetgame_wildlife_auth_on() || peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (!s_host_peer[peer].ctx_valid || !(s_host_peer[peer].ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN)) {
+        return;
+    }
+    gc = (mEv_gst_common_c*)mEv_get_common_area(mEv_EVENT_GHOST, 0x37);
+    if (gc == NULL) {
+        printf("[NET][WILDLIFE] host: peer %d accepted the Wisp's request but the host's ghost event is not running -- ignored\n", (int)peer);
+        return;
+    }
+    if ((gc->flags & mEv_GHOST_FLAG_ACTIVE) == 0) {
+        gc->flags |= mEv_GHOST_FLAG_ACTIVE;
+        printf("[NET][WILDLIFE] host: peer %d accepted the Wisp's request -- the spirit hunt is on for the whole town\n", (int)peer);
+    } else {
+        printf("[NET][WILDLIFE] host: peer %d accepted the Wisp's request -- the spirit hunt was already on\n", (int)peer);
+    }
+}
+
+/* CLIENT side of both (pc_net_game.h). Fire-and-forget: a lost tool action only leaves the host's copy hidden (the catch of a still-hidden
+ * uncatchable bug is then refused), never a duplicate. */
+void pc_net_game_wildlife_tool_action(int action, int ut_x, int ut_z) {
+    static uint16_t s_seq;
+    PCNetGameWildlifeToolActionMsg m;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcnetgame_wildlife_auth_on() || !pcfa_scene_is_town()) {
+        return;
+    }
+    if (action < aINS_PL_ACT_REFLECT_AXE || action > aINS_PL_ACT_SHAKE_TREE || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255) {
+        return;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_WILDLIFE_TOOL_ACTION;
+    m.action = (uint8_t)action;
+    m.ut_x = (uint8_t)ut_x;
+    m.ut_z = (uint8_t)ut_z;
+    m.seq = ++s_seq;
+    if (pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+        printf("[NET][WILDLIFE] client: tool action %d at ut(%d,%d) sent to the host (seq %u)\n", action, ut_x, ut_z, (unsigned)m.seq);
+    }
+}
+
+void pc_net_game_ghost_hunt_accepted(void) {
+    PCNetGameGhostHuntMsg m;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcnetgame_wildlife_auth_on()) {
+        return;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_GHOST_HUNT;
+    if (pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+        printf("[NET][WILDLIFE] client: accepted the Wisp's request -- told the host (spirit hunt)\n");
+    }
+}
+
+/* SPIRITS (G1): the catch of a spirit stacks onto the pocket that already holds SPIRIT(k-1) (mPlib_Get_space_putin_item_forHITODAMA, vanilla).
+ * 1 iff `pre` (that pocket's pre-image item, cond) may take `item`: pre SPIRIT0..SPIRIT3 with the normal condition and item == pre + 1. */
+static int pcnetgame_spirit_stack_ok(uint16_t pre, uint32_t pre_conds, int slot, uint16_t item) {
+    return pre >= (uint16_t)ITM_SPIRIT0 && pre < (uint16_t)ITM_SPIRIT4 && item == (uint16_t)(pre + 1) &&
+           mPr_GET_ITEM_COND(pre_conds, slot) == mPr_ITEM_COND_NORMAL;
+}
+/* ===== WILDLIFE SPECIAL CASES END ===== */
+
 /* Every read-only validation step for one CATCH claim, in sequence, stopping at the first failure, PLUS
  * the atomic accept-time removal itself -- see this function's own race-safety doc below. `is_host_local`
  * skips the PLAYER_CONTEXT/IN_TOWN/reach checks for the SAME reason every other is_host_local exemption
@@ -11419,20 +11602,20 @@ static int pcnetgame_validate_catch(int is_host_local, PCNetPeerId peer, uint32_
                      (pcwld_session_generation()'s own doc, pc_wildlife_authority.h) */
     }
     /* World Ecology Wildlife Sync T4: ordinary bug catching now shares this exact core with fish --
-     * see pc_net_game_request_catch_bug()'s own top-of-section doc. Ants (kind == BUG, species == ANT)
-     * are deliberately excluded: they are never materialized as a real local actor at all (pcwld_
-     * presentation_create()'s own doc) and have no ordinary net-catch path -- a T5-scoped special case,
-     * out of scope here. */
+     * see pc_net_game_request_catch_bug()'s own top-of-section doc. Ants are ordinary claims since the
+     * wildlife special-case stage (W-06): every process shows the ant actor and its net catch reaches this
+     * path through the 9th-slot insect (pcwld_ant_caught_moved). */
     if (rec.kind == PC_WILDLIFE_KIND_FISH) {
         if (!pcwld_fish_species_matches_claim(rec.species, claimed_species)) {
             return 0;
         }
     } else if (rec.kind == PC_WILDLIFE_KIND_BUG) {
-        if (rec.species == aINS_INSECT_TYPE_ANT) {
-            return 0;
-        }
         if (!pcwld_bug_species_matches_claim(rec.species, claimed_species)) {
             return 0;
+        }
+        if (pcwld_host_bug_catch_blocked(entity_id)) {
+            printf("[NET][WILDLIFE] host: catch of entity %u refused -- the host's copy of this latent bug is still hidden\n", (unsigned)entity_id);
+            return 0; /* LATENT BUGS: nobody revealed it on the host (a lost / out-of-reach tool action) */
         }
     } else {
         return 0; /* unknown kind -- defense in depth, should never happen (PC_WILDLIFE_KIND_NUM-bounded) */
@@ -17464,6 +17647,9 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_WORK_STALE_JOB: return "WORK_STALE_JOB";
         case PC_NETGAME_TXN_REASON_WORK_WALLET_FULL: return "WORK_WALLET_FULL";
         case PC_NETGAME_TXN_REASON_MAIL_LIMIT: return "MAIL_LIMIT";
+        case PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE: return "HOUSE_NOT_ELIGIBLE";
+        case PC_NETGAME_TXN_REASON_HOUSE_BUSY: return "HOUSE_BUSY";
+        case PC_NETGAME_TXN_REASON_HOUSE_CHANGED: return "HOUSE_CHANGED";
         default: return "?";
     }
 }
@@ -18041,7 +18227,7 @@ static mActor_name_t pcnetgame_x3_catch_item(const PcWildlifeRecord* rec, int cl
         if (rec->species == aINS_INSECT_TYPE_SPIRIT) {
             return (mActor_name_t)ITM_SPIRIT0;
         }
-        if (rec->species >= 0 && rec->species < aINS_INSECT_TYPE_NUM && rec->species != aINS_INSECT_TYPE_ANT) {
+        if (rec->species >= 0 && rec->species < aINS_INSECT_TYPE_NUM) { /* the ant included: ITM_INSECT38 (aIDG_actor_init) */
             return (mActor_name_t)(ITM_INSECT00 + rec->species);
         }
     }
@@ -18217,8 +18403,10 @@ static void pcnetgame_x3_grant(PCNetPeerId peer, PCNetGameTxnCommitMsg* in, uint
         return;
     }
 
-    /* 7. kind precondition on the PRE-image: the chosen slot must be free there (a catch with dest NONE has no slot) */
-    if (t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+    /* 7. kind precondition on the PRE-image: the chosen slot must be free there (a catch with dest NONE has no slot). SPIRITS (G1): a catch may
+     *    instead name the pocket that holds SPIRIT(k-1) with item SPIRIT(k) (vanilla stacks spirits); step 8 checks the record is a spirit. */
+    if (t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO &&
+        !(is_catch && pcnetgame_spirit_stack_ok(t->pre_pockets[t->slot], t->pre_conds, (int)t->slot, t->item))) {
         pcnetgame_x3_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, "pocket slot is not free", far, cr);
         return;
     }
@@ -18248,6 +18436,10 @@ static void pcnetgame_x3_grant(PCNetPeerId peer, PCNetGameTxnCommitMsg* in, uint
         fail = "catch validation failed (entity gone / stale generation / species / reach)";
     } else {
         expect = (uint16_t)pcnetgame_x3_catch_item(&crec, (int)cr->claimed_species);
+        if (crec.kind == PC_WILDLIFE_KIND_BUG && crec.species == aINS_INSECT_TYPE_SPIRIT && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET &&
+            t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+            expect = (uint16_t)(t->pre_pockets[t->slot] + 1); /* SPIRITS (G1): the stacked item (step 7 checked SPIRIT0..3 + normal condition) */
+        }
         if (expect == (uint16_t)EMPTY_NO || (t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->item != expect)) {
             fail = "claimed catch item does not match the host-derived item of the claimed species";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
@@ -18306,7 +18498,7 @@ static void pcnetgame_x3_grant(PCNetPeerId peer, PCNetGameTxnCommitMsg* in, uint
     if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
         printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the grant commit, no RESULT sent\n", (int)peer);
         if (is_catch) {
-            pcnetgame_commit_catch_despawn(cr->entity_id);
+            pcnetgame_commit_caught_despawn(cr->entity_id);
         } else {
             pcnetgame_host_flush_mask((uint32_t)1u << acre);
         }
@@ -18315,7 +18507,7 @@ static void pcnetgame_x3_grant(PCNetPeerId peer, PCNetGameTxnCommitMsg* in, uint
     }
     /* 13. a catch's WILDLIFE_DESPAWN broadcast goes out BEFORE the results (as before); then TXN_RESULT, then the legacy RESULT */
     if (is_catch) {
-        pcnetgame_commit_catch_despawn(cr->entity_id);
+        pcnetgame_commit_caught_despawn(cr->entity_id);
     }
     pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
     pcnetgame_x3_legacy_result(peer, far, cr, 1, legacy_item);
@@ -19652,7 +19844,7 @@ int pc_net_game_shop_restocking(void) {
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
            : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : svc == (int)PC_NETGAME_TS_UPGRADE ? "SHOP_UPGRADE"
-           : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : "?";
+           : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : svc == (int)PC_NETGAME_TS_MDONORS ? "MUSEUM_DONORS" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -19711,6 +19903,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
         }
         pcnetgame_ts_build_guestdir(blob); /* guest mailbox: who may be written to (a session state, not a save region) */
         *len = (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN;
+        return 1;
+    }
+    if (svc == (int)PC_NETGAME_TS_MDONORS) {
+        pcnetgame_ts_build_mdonors(blob); /* worker B: which guest donated which exhibit (host sidecar museum_donors.dat; not a save region) */
+        *len = (uint16_t)PC_NETGAME_TS_MDONORS_LEN;
         return 1;
     }
     return 0;
@@ -19772,6 +19969,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVENT);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_UPGRADE);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_GUESTDIR);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MDONORS); /* worker B */
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -19980,6 +20178,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_world_test_poke_event();
     pcnetgame_restock_host_tick(now);
     pcnetgame_shopup_host_tick(now); /* multiplayer shop upgrade: qualification, the closure timer, the renewal (inert with the feature off) */
+    pcnetgame_hu_host_tick(now);     /* worker C: house construction of a due Nook order on a long-running host */
     if ((uint32_t)(now - s_ts_next_check_ms) >= PC_NETGAME_TS_CHECK_MS || !s_ts_host[PC_NETGAME_TS_POLICE].valid) {
         s_ts_next_check_ms = now;
         pcnetgame_ts_refresh_all();
@@ -20665,6 +20864,9 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
             printf("[NET][TS] host: peer %d *** INTERNAL: mMmd_PC_RequestMuseumDisplayDonor refused after a passing check -- nothing mutated ***\n", (int)peer);
             pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_ALREADY_DONATED, 1, NULL, "museum commit refused");
             return;
+        }
+        if (idx >= PLAYER_NUM) {
+            pcnetgame_mdon_note(pcnetgame_guest_of_idx(idx), (mActor_name_t)t->item); /* worker B: remember WHICH guest gave it (museum_donors.dat) */
         }
     } else {
         Save_Get(police_box).keep_items[pidx] = (mActor_name_t)EMPTY_NO;
@@ -22584,6 +22786,7 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     int idx, shape_ok, sh = -1, rh = -1, k, po_slot = -1, stale = 0, gslot = -1, tg = -1, tg_slot = -1;
     const char* fail = NULL;
     uint8_t fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+    const int museum = in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL; /* worker B: a letter with a gift to the MUSEUM (kind 19), same machinery */
 
     /* 1. READY gate (parked / handshake peers are dropped silently, D3 rule) */
     if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
@@ -22623,9 +22826,13 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
         pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 0, NULL, "no mirror record for the bound slot");
         return;
     }
+    if (museum && !pcnetgame_museum_mail_on()) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_MUSEUM_MAIL_OFF, 0, NULL, "museum letters are switched off on this host (AC_MP_MUSEUM_MAIL=0)");
+        return;
+    }
 
     /* 3. shape */
-    shape_ok = in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND && in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 &&
+    shape_ok = (in->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || museum) && in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 &&
                t->flags == 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->slot < (uint8_t)mPr_INVENTORY_MAIL_COUNT;
     if (!shape_ok) {
         pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE, 0, NULL, "malformed MAIL_SEND TXN_COMMIT");
@@ -22723,6 +22930,16 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
         } else if (L->present != (mActor_name_t)EMPTY_NO && !pcnetgame_is_pocket_legal_item(L->present)) {
             fail = "the letter's gift is not an item that can exist in a pocket";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE;
+        } else if (museum) {
+            /* worker B: MUSEUM_MAIL -- the museum's side runs on THIS sender's record (resident: private_data[idx], guest: its guest record), never private_data[guest idx] */
+            if (L->header.recipient.type != (u8)mMl_NAME_TYPE_MUSEUM) {
+                fail = "a MUSEUM_MAIL letter that is not addressed to the museum";
+            } else if (L->present == (mActor_name_t)EMPTY_NO || L->present == (mActor_name_t)RSV_NO) {
+                fail = "a museum letter without a gift (it stays a local, vanilla letter)";
+            } else if (!mMsm_PC_MuseumMailRoom(mir, L->present)) {
+                fail = "the sender's museum record has no room (30 fossils waiting / 30 results pending): vanilla would drop the gift";
+                fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_MUSEUM_FULL;
+            }
         } else if (L->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER) {
             fail = "the recipient is not a player (villager letters keep MAIL_REQUEST; the museum waits for the museum milestone)";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
@@ -22782,6 +22999,61 @@ static void pcnetgame_handle_host_mail_txn(PCNetPeerId peer, const PCNetGameTxnC
     W.header.sender.type = (u8)mMl_NAME_TYPE_PLAYER;
     W.content.font = (u8)mMl_FONT_RECV;
     wh = pcnetgame_mail_be_hash(&W);
+    if (museum) {
+        /* worker B: MUSEUM_MAIL commit. The gift travels inside the letter: the letter leaves the sender's mirror slot and its gift becomes the museum's (a stored fossil /
+         * a donated exhibit / a pending return letter in the sender's museum_record). Durability: a GUEST's letter + museum_record live in its .gst file -> written NOW when the
+         * town save is not involved; a DONATION also changes Save_t.museum_display -> the guest file is written with the next host save (the post-save guest store write), so a
+         * host crash loses both halves together. A RESIDENT: everything is in Save_t (the next host save), exactly like MAIL_SEND. */
+        const int donor = pcnetgame_museum_donor_nibble(idx);
+        const mActor_name_t gift = L->present;
+        mMsm_record_c rec_before;
+        Mail_c old_src;
+        int mres;
+        memcpy(&old_src, L, sizeof(old_src));
+        memcpy(&rec_before, &mir->museum_record, sizeof(rec_before));
+        mres = mMsm_PC_MuseumMailFor(mir, gift, donor);
+        if (mres == 0) {
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_MUSEUM_FULL, 1, NULL, "INTERNAL: the museum refused after a passing room check");
+            return;
+        }
+        (void)pcnetgame_rec_txn_write_mail(idx, (int)t->slot, NULL);
+        slot->rev++;
+        slot->dirty_unsaved = 1;
+        if (gslot >= 0 && mres != 2 + mMsm_REMAIL_KIND_DONATED && !pcnetgame_guest_store_write("guest museum letter")) {
+            memcpy(&mir->museum_record, &rec_before, sizeof(rec_before));
+            (void)pcnetgame_rec_txn_write_mail(idx, (int)t->slot, &old_src);
+            slot->rev--;
+            printf("[NET][MUSEUM][MAIL] host: *** guest slot %d museum letter: the guest store could not be written -- undone (nothing changed) ***\n", gslot);
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BUSY, 1, NULL, "the guest store could not be written durably");
+            return;
+        }
+        if (mres == 2 + mMsm_REMAIL_KIND_DONATED && gslot >= 0) {
+            pcnetgame_mdon_note(gslot, gift); /* guest donor attribution (museum_donors.dat): the plaque names the guest */
+        }
+        R->last_pocket_rev = slot->rev;
+        pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+        printf("[NET][MUSEUM][MAIL] host: peer %d %s %d MUSEUM_MAIL slot %u gift 0x%04X -> %s (donor nibble %d) stored_fossils=%u remail_pending=%u letter_hash=0x%08X mirror_slot_cleared=1 committed [TXN]\n",
+               (int)peer, gslot >= 0 ? "guest record" : "resident", idx, (unsigned)t->slot, (unsigned)gift,
+               mres == 1 ? "FOSSIL stored for appraisal" : mres == 2 + mMsm_REMAIL_KIND_DONATED ? "DONATED" : mres == 2 + mMsm_REMAIL_KIND_ALREADY_DONATED ? "ALREADY_DONATED (returned by letter)"
+               : "CANNOT_DONATE (returned by letter)", donor, (unsigned)mir->museum_record.stored_fossil_num, (unsigned)mir->museum_record.remail_pending, (unsigned)wh);
+        if (pcnetgame_txn_fault_fire(PC_TXN_FAULT_KILL_PEER_AFTER_COMMIT)) {
+            printf("[NET][TXN][TEST-ONLY] kill_peer_after_commit: peer %d dropped AFTER the museum mail commit, no RESULT sent\n", (int)peer);
+            pcnetgame_host_drop_peer(peer);
+            return; /* FAULT: no result by design */
+        }
+        pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
+        if (mres == 2 + mMsm_REMAIL_KIND_DONATED) {
+            (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MUSEUM);
+            pcnetgame_host_ts_push_all(); /* every client's museum shows the new exhibit */
+        }
+        (void)pcnetgame_rec_refresh_hostfields(idx, slot); /* museum_record is host-owned: the client takes it with the next push */
+        if (gslot >= 0) {
+            pcnetgame_rec_stale_push(peer, idx, slot, now); /* a guest gets a full push (no PUSH_HOSTFIELDS for guest slots) */
+        } else if (st->rec_push_active) {
+            pcnetgame_rec_start_push(peer, idx, st->rec_push_kind);
+        }
+        return;
+    }
     if (tg >= 0) {
         /* guest mailbox: a letter TO A GUEST. Straight into the guest's host-held mailbox (the free slot found above; single-threaded, nothing changed since), the
          * sender's mirror slot cleared (the gift travels inside the letter, exactly like resident -> resident). Durability: a GUEST sender's slot and the recipient's
@@ -24096,6 +24368,323 @@ int pc_net_game_host_guest_letter_post(Mail_c* mail) {
     return 1;
 }
 /* ===== GUEST MAIL HOST (events) END ===== */
+
+/* ===== MUSEUM GUESTS BEGIN (worker B: museum letters for guests, guest donor attribution, MUSEUM_DONORS service 8; see pc_museum_net.h / pc_museum_donors.h) =====
+ * Switches (host environment, read once): AC_MP_MUSEUM_MAIL=0 refuses MUSEUM_MAIL (kind 19, MUSEUM_MAIL_OFF) and runs no guest museum pass; AC_MP_MUSEUM_DONORS=0 keeps no
+ * attribution (no museum_donors.dat writes, the service carries nothing: every guest exhibit reads "former resident" as before). Both default ON. */
+static int pcnetgame_env_on(const char* name, int* cache) {
+    if (*cache < 0) {
+        const char* e = getenv(name);
+        *cache = !(e != NULL && (strcmp(e, "0") == 0 || strcmp(e, "off") == 0 || strcmp(e, "OFF") == 0 || strcmp(e, "false") == 0));
+        printf("[NET][MUSEUM] %s is %s\n", name, *cache ? "ON" : "OFF");
+    }
+    return *cache;
+}
+static int pcnetgame_museum_mail_on(void) {
+    static int s_on = -1;
+    return pcnetgame_env_on("AC_MP_MUSEUM_MAIL", &s_on);
+}
+static int pcnetgame_mdon_on(void) {
+    static int s_on = -1;
+    return pcnetgame_env_on("AC_MP_MUSEUM_DONORS", &s_on);
+}
+
+int pc_museum_exhibit_of_item(unsigned short item) {
+    const mActor_name_t it = (mActor_name_t)item;
+    if (it >= FTR_START(FTR_DIN_TRIKERA_HEAD) && it <= FTR_END(FTR_DIN_TRILOBITE)) {
+        const int i = FTR_IDX_2_NO(it - FTR_START(FTR_DIN_TRIKERA_HEAD));
+        return (i >= 0 && i < mMmd_FOSSIL_NUM) ? i : -1;
+    }
+    if (it >= FTR_START(FTR_SUM_ART01) && it <= FTR_END(FTR_SUM_ART15)) {
+        const int i = FTR_IDX_2_NO(it - FTR_START(FTR_SUM_ART01));
+        return (i >= 0 && i < mMmd_ART_NUM) ? mMmd_FOSSIL_NUM + i : -1;
+    }
+    if (it >= ITM_INSECT00 && it < ITM_SPIRIT0) {
+        const int i = it - ITM_INSECT_START;
+        return (i >= 0 && i < mMmd_INSECT_NUM) ? mMmd_FOSSIL_NUM + mMmd_ART_NUM + i : -1;
+    }
+    if (it >= ITM_FISH00 && it <= ITM_FISH_END) {
+        const int i = it - ITM_FISH_START;
+        return (i >= 0 && i < mMmd_FISH_NUM) ? mMmd_FOSSIL_NUM + mMmd_ART_NUM + mMmd_INSECT_NUM + i : -1;
+    }
+    return -1;
+}
+
+/* ---- the host sidecar ---- */
+static PCMuseumDonors s_mdon;
+static int s_mdon_state = 0; /* 0 not loaded, 1 usable, -1 unusable (corrupt file kept untouched / no memory) */
+static uint32_t s_mdon_town = 0;
+static void pcnetgame_mdon_path(char* out, size_t cap) {
+    const char* wp = pc_server_work_path(); /* next to work_jobs.dat / dresser_store.dat (host dir: listen and dedicated server) */
+    const char* a = strrchr(wp, '/');
+    const char* b = strrchr(wp, '\\');
+    const char* sep = (a != NULL && (b == NULL || a > b)) ? a : b;
+    if (sep == NULL) {
+        snprintf(out, cap, "museum_donors.dat");
+    } else {
+        snprintf(out, cap, "%.*s/museum_donors.dat", (int)(sep - wp), wp);
+    }
+}
+static int pcnetgame_mdon_guest5(int exhibit, void* ctx) {
+    (void)ctx;
+    return mMmd_PC_ExhibitDonor(exhibit) == mMmd_DONATOR_DELETED_PLAYER;
+}
+static uint32_t pcnetgame_mdon_town_hash(void) {
+    return pc_mdon_town_hash(Save_Get(land_info).name, LAND_NAME_SIZE, (uint16_t)Save_Get(land_info).id);
+}
+static void pcnetgame_mdon_write(const char* why) {
+    char path[300];
+    pcnetgame_mdon_path(path, sizeof(path));
+    if (!pc_mdon_save(&s_mdon, path, s_mdon_town)) {
+        printf("[NET][MUSEUM][DONOR] host: *** museum_donors.dat could not be written (%s): the attribution lives in memory until the next write ***\n", why);
+    }
+}
+/* HOST: 1 when the attribution table is usable (lazy load once the town is known; orphans are dropped at the load). */
+static int pcnetgame_mdon_ready(void) {
+    if (s_role != PC_NETGAME_ROLE_HOST || !pcnetgame_mdon_on() || !s_host_world_ready) {
+        return 0;
+    }
+    if (s_mdon_state == 0) {
+        char path[300];
+        int other = 0, rc, dropped;
+        if (!pc_mdon_init(&s_mdon)) {
+            s_mdon_state = -1;
+            return 0;
+        }
+        s_mdon_town = pcnetgame_mdon_town_hash();
+        pcnetgame_mdon_path(path, sizeof(path));
+        rc = pc_mdon_load(&s_mdon, path, s_mdon_town, &other);
+        if (rc == PC_TABFILE_BAD) {
+            s_mdon_state = -1;
+            printf("[NET][MUSEUM][DONOR] host: *** %s is unreadable / corrupt: guest donor names are OFF this session and the file is left untouched ***\n", path);
+            return 0;
+        }
+        s_mdon_state = 1;
+        dropped = pc_mdon_prune(&s_mdon, pcnetgame_mdon_guest5, NULL);
+        printf("[NET][MUSEUM][DONOR] host: museum_donors.dat %s: %d attribution(s)%s, %d orphan(s) dropped\n", rc == PC_TABFILE_OK ? "loaded" : "absent (new)",
+               pc_mdon_count(&s_mdon), other ? " (the file belonged to another town: ignored)" : "", dropped);
+        if (dropped > 0) {
+            pcnetgame_mdon_write("orphans dropped at load");
+        }
+    }
+    return s_mdon_state == 1;
+}
+/* HOST: guest slot g's donation of `item` was just credited (nibble 5): remember who it was. */
+static void pcnetgame_mdon_note(int g, mActor_name_t item) {
+    const int e = pc_museum_exhibit_of_item((unsigned short)item);
+    if (e < 0 || g < 0 || g >= s_guest_cap || !s_guest[g].used || !pcnetgame_mdon_ready() || mMmd_PC_ExhibitDonor(e) != mMmd_DONATOR_DELETED_PLAYER) {
+        return;
+    }
+    (void)pc_mdon_prune(&s_mdon, pcnetgame_mdon_guest5, NULL);
+    if (!pc_mdon_set(&s_mdon, e, (const uint8_t*)&s_guest[g].key)) {
+        return;
+    }
+    pcnetgame_mdon_write("a guest donation");
+    printf("[NET][MUSEUM][DONOR] host: exhibit %d (item 0x%04X) attributed to guest slot %d '%.8s' (museum_donors.dat, %d attribution(s))\n", e, (unsigned)item, g,
+           (const char*)s_guest[g].key.player_name, pc_mdon_count(&s_mdon));
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MDONORS); /* the caller's service push (after its RESULT) carries it to every peer */
+}
+/* HOST (pc_m_card.c pc_mp_promote_create, inside the promotion and its rollback snapshot): every exhibit attributed to the promoted guest `gkey` whose nibble is still 5 becomes
+ * the new resident's (slot + 1). The sidecar entries are left alone: they are orphans once the nibble is not 5 (dropped by the next prune), and a rollback of the promotion
+ * restores the nibbles, which makes them valid again. Returns the number of exhibits re-attributed. */
+int pc_net_game_museum_promote(const void* gkey, int slot) {
+    uint8_t key[PC_MDON_KEY_LEN];
+    int e, n = 0;
+    if (gkey == NULL || slot < 0 || slot >= PLAYER_NUM || !pcnetgame_mdon_ready()) {
+        return 0;
+    }
+    for (e = 0; e < (int)PC_MDON_EXHIBITS; e++) {
+        if (pc_mdon_get(&s_mdon, e, key) && memcmp(key, gkey, PC_MDON_KEY_LEN) == 0 && mMmd_PC_ExhibitDonor(e) == mMmd_DONATOR_DELETED_PLAYER &&
+            mMmd_PC_SetExhibitDonor(e, slot + 1)) {
+            n++;
+        }
+    }
+    if (n > 0) {
+        printf("[NET][MUSEUM][DONOR] host: promotion: %d exhibit(s) of the guest are now credited to resident slot %d (donor nibble %d)\n", n, slot, slot + 1);
+    }
+    return n;
+}
+
+/* ---- MUSEUM_DONORS (town service 8) ---- */
+static void pcnetgame_ts_build_mdonors(uint8_t* blob) {
+    uint8_t key[PC_MDON_KEY_LEN];
+    int e, n = 0, k;
+    memset(blob, 0, PC_NETGAME_TS_MDONORS_LEN);
+    memset(blob + 4, 0xFF, 120);
+    if (!pcnetgame_mdon_ready()) {
+        return;
+    }
+    for (e = 0; e < (int)PC_MDON_EXHIBITS; e++) {
+        if (!pc_mdon_get(&s_mdon, e, key) || mMmd_PC_ExhibitDonor(e) != mMmd_DONATOR_DELETED_PLAYER) {
+            continue;
+        }
+        for (k = 0; k < n && memcmp(blob + 124 + 20 * k, key, 20) != 0; k++) {
+        }
+        if (k == n) {
+            if (n >= (int)PC_NETGAME_MDONORS_NAMES) {
+                continue; /* more than 8 distinct guests: the rest read "former resident" (documented limit) */
+            }
+            memcpy(blob + 124 + 20 * n, key, 20);
+            n++;
+        }
+        blob[4 + e] = (uint8_t)k;
+    }
+    blob[0] = (uint8_t)n;
+}
+static int pcnetgame_ts_valid_mdonors_blob(const uint8_t* blob) {
+    unsigned i, k;
+    if (blob[0] > PC_NETGAME_MDONORS_NAMES || blob[1] != 0 || blob[2] != 0 || blob[3] != 0) {
+        return 0;
+    }
+    for (i = 0; i < 120u; i++) {
+        if (blob[4 + i] != 0xFFu && blob[4 + i] >= blob[0]) {
+            return 0;
+        }
+    }
+    for (i = 0; i < PC_NETGAME_MDONORS_NAMES; i++) {
+        PersonalID_c pid;
+        memcpy(&pid, blob + 124 + 20 * i, 20);
+        if (i < blob[0]) {
+            if (mPr_NullCheckPersonalID(&pid) != FALSE || pid.player_name[0] == 0) {
+                return 0;
+            }
+        } else {
+            for (k = 0; k < 20u; k++) {
+                if (blob[124 + 20 * i + k] != 0) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}
+static uint8_t s_mdon_cblob[PC_NETGAME_TS_MDONORS_LEN]; /* CLIENT: the last MUSEUM_DONORS blob of this session */
+static void pcnetgame_mdon_client_apply(const uint8_t* blob) {
+    memcpy(s_mdon_cblob, blob, PC_NETGAME_TS_MDONORS_LEN);
+}
+int pc_museum_guest_donor(int exhibit, unsigned char* name_out, int* is_self) {
+    uint8_t key[PC_MDON_KEY_LEN];
+    if (is_self != NULL) {
+        *is_self = 0;
+    }
+    if (exhibit < 0 || exhibit >= (int)PC_MDON_EXHIBITS || mMmd_PC_ExhibitDonor(exhibit) != mMmd_DONATOR_DELETED_PLAYER) {
+        return 0; /* the attribution is only meaningful while the nibble is 5 */
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        if (!pcnetgame_mdon_ready() || !pc_mdon_get(&s_mdon, exhibit, key)) {
+            return 0;
+        }
+    } else if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        const uint8_t ix = s_mdon_cblob[4 + exhibit];
+        if (s_client_link != PC_NETGAME_LINK_READY || !s_ts_client_have[PC_NETGAME_TS_MDONORS] || ix == 0xFFu || ix >= s_mdon_cblob[0]) {
+            return 0;
+        }
+        memcpy(key, s_mdon_cblob + 124 + 20 * ix, PC_MDON_KEY_LEN);
+    } else {
+        return 0;
+    }
+    if (name_out != NULL) {
+        memcpy(name_out, ((const PersonalID_c*)key)->player_name, PLAYER_NAME_LEN);
+    }
+    if (is_self != NULL && Now_Private != NULL) {
+        *is_self = mPr_CheckCmpPersonalID((PersonalID_c*)key, &Now_Private->player_ID) == TRUE;
+    }
+    return 1;
+}
+
+/* ---- GUEST MUSEUM DAY: the museum's day pass for the town's GUESTS (results of their museum letters, appraised fossils, the information letter -> Museum address entry) ----
+ * m_museum.c mMsm_DepositFossil (the vanilla pass the HOST runs for its residents at the day change) calls pc_net_game_museum_day_pass(); the host tick then runs
+ * mMsm_PC_GuestMuseumDay for every guest that receives town letters (pcnetgame_guest_mail_target), with the letters handed to the guest's host-held mailbox (gev sink). The
+ * letters and the museum_record they consume live in the same .gst file: ONE durable write. A guest bound right now gets a full record push (museum_record is host-owned). */
+static uint8_t s_gmus_pend = 0, s_gmus_order = 0;
+void pc_net_game_museum_day_pass(int order_info) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    s_gmus_pend = 1;
+    s_gmus_order |= order_info ? 1u : 0u;
+    printf("[NET][MUSEUM][GUEST] host: museum day pass (order info letters: %d): the guests' pass follows\n", order_info ? 1 : 0);
+}
+static void pcnetgame_gmus_run(int order) {
+    PCNetGameGevCtx c;
+    int g, changed_any = 0;
+    if (!pcnetgame_museum_mail_on() || !pcnetgame_guest_mail_enabled()) {
+        return;
+    }
+    memset(&c, 0, sizeof(c));
+    c.why = "museum day pass";
+    for (g = 0; g < s_guest_cap; g++) {
+        Private_c* r;
+        uint32_t before;
+        int n;
+        if (!pcnetgame_guest_mail_target(g) || (r = pcnetgame_rec_priv_ptr(PLAYER_NUM + g)) == NULL) {
+            continue;
+        }
+        before = pcnetgame_fnv1a32(&r->museum_record, sizeof(r->museum_record));
+        n = mMsm_PC_GuestMuseumDay(r, order, pcnetgame_gev_sink, &c);
+        if (pcnetgame_fnv1a32(&r->museum_record, sizeof(r->museum_record)) != before) {
+            const int idx = PLAYER_NUM + g;
+            const int p = pcnetgame_host_peer_bound_to_guest(g, -1);
+            PCNetGameRecSlot* rs = pcnetgame_rec_slot(idx);
+            changed_any = 1;
+            if (rs != NULL) {
+                rs->dirty_unsaved = 1;
+                (void)pcnetgame_rec_refresh_hostfields(idx, rs);
+                if (p >= 0) {
+                    pcnetgame_rec_stale_push((PCNetPeerId)p, idx, rs, pcnetgame_now_ms());
+                }
+            }
+            printf("[NET][MUSEUM][GUEST] host: guest slot %d museum pass: %d letter(s), contacted=%u stored_fossils=%u\n", g, n, (unsigned)r->museum_record.contacted,
+                   (unsigned)r->museum_record.stored_fossil_num);
+        }
+    }
+    pcnetgame_gev_finish(&c, 1); /* the letters + the records they consumed: one durable guest store write */
+    if (changed_any && c.delivered == 0) {
+        (void)pcnetgame_guest_store_write("museum day pass (records only)");
+    }
+}
+static void pcnetgame_gmus_tick(void) {
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        return;
+    }
+#ifdef PC_NET_TEST_HOOKS
+    {   /* TEST-ONLY (AC_TEST_HOOKS=1, HOST): AC_TEST_MUSEUM_DAY=<period ms> -- the museum's day pass (residents: the vanilla result / information letters, guests: this pass) runs
+         * every period instead of only at the day change; AC_TEST_MUSEUM_DAY=file -- it runs once each time the file `ac_museum_day.txt` appears in the working directory
+         * (deleted when consumed), so a protocol test decides WHEN. Never active in normal play. */
+        static uint32_t s_next = 0;
+        const char* e = pc_test_hook_getenv("AC_TEST_MUSEUM_DAY");
+        const uint32_t now = pcnetgame_now_ms();
+        int fire = 0;
+        if (e != NULL && strcmp(e, "file") == 0) {
+            if ((int32_t)(now - s_next) >= 0) {
+                FILE* tf = fopen("ac_museum_day.txt", "rb");
+                s_next = now + 500u;
+                if (tf != NULL) {
+                    fclose(tf);
+                    remove("ac_museum_day.txt");
+                    fire = 1;
+                }
+            }
+        } else if (e != NULL && atoi(e) > 0 && (s_next == 0u || (int32_t)(now - s_next) >= 0)) {
+            s_next = now + (uint32_t)atoi(e);
+            fire = 1;
+        }
+        if (fire) {
+            printf("[NET][MUSEUM][TEST-ONLY] AC_TEST_MUSEUM_DAY: running the museum day pass now (NOT active in normal play)\n");
+            mMsm_PC_ResidentsResultPass(1);
+            s_gmus_pend = 1;
+            s_gmus_order = 1;
+        }
+    }
+#endif
+    if (s_gmus_pend) {
+        const int order = s_gmus_order;
+        s_gmus_pend = 0;
+        s_gmus_order = 0;
+        pcnetgame_gmus_run(order);
+    }
+}
+/* ===== MUSEUM GUESTS END ===== */
 
 /* furniture sync (Stage 1): the HOUSE CLIENT block below the D3 CLIENT block; the D3 / X1 code consults these gates */
 static void        pcnetgame_house_client_on_ready(void);
@@ -27147,12 +27736,13 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
         pcnetgame_client_send_confirm(s_ctxn.kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT, reason, s_ctxn.request_id);
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL ||
-               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE ||
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* town services: no reservation to release; the UI seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC ||
-               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER) {
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* guest-first town: nothing was sent, the seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
@@ -27179,10 +27769,11 @@ static int pcnetgame_txn_try_send(void) {
     const int is_commit_kind = (T->kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && T->kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) ||
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL ||
-                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE;
+                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE ||
+                               T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL;
     const int is_house = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
                          T->kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC ||
-                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER; /* guest-first town / shop restock: a TXN_COMMIT kind too (no pocket) */
+                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE; /* guest-first town / shop restock / house upgrade: a TXN_COMMIT kind too (no pocket) */
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -27273,6 +27864,7 @@ static int pcnetgame_txn_try_send(void) {
             aux_item = T->ts_aux_item; /* the slot mask */
             break;
         }
+        case PC_NETGAME_TXN_KIND_MUSEUM_MAIL: /* worker B: a letter to the museum, the same tag */
         case PC_NETGAME_TXN_KIND_MAIL_SEND: {
             /* mail milestone 1: the letter must still be exactly the one the post girl's operation began with, and the record must still be CLEAN
              * (uploads are deferred while this transaction is unresolved, so it stays clean; if it is not, a nudge from the lock-less window is over:
@@ -27339,6 +27931,14 @@ static int pcnetgame_txn_try_send(void) {
             aux_cond = T->ts_aux;
             aux_item = T->ts_aux_item;
             break;
+        case PC_NETGAME_TXN_KIND_HOUSE_UPGRADE: /* worker C: the op as aux_cond, the roof palette as aux_item, the stale-header guard as flags (no pocket, no item) */
+            dest = (uint8_t)PC_NETGAME_TXN_DEST_NONE;
+            slot = 0;
+            item = 0;
+            aux_cond = T->ts_aux;
+            aux_item = T->ts_aux_item;
+            flags = T->take_dst; /* the guard captured when the op began */
+            break;
         case PC_NETGAME_TXN_KIND_SHOP_RESTOCK: /* same shape: no pocket slot, no item, the price the player was shown as aux_item */
         case PC_NETGAME_TXN_KIND_HOUSE_PURCHASE:
             /* guest-first town: no pocket slot, no item; the requested house (or auto) travels as aux_cond, the price the player was shown as aux_item. The wallet is
@@ -27362,6 +27962,14 @@ static int pcnetgame_txn_try_send(void) {
             break;
         case PC_NETGAME_TXN_KIND_CATCH:
             free_idx = (T->item != 0) ? mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) : -1;
+            if (T->item > (uint16_t)ITM_SPIRIT0 && T->item <= (uint16_t)ITM_SPIRIT4) {
+                /* SPIRITS (G1): the notice seam already chose the stacked item SPIRIT(k) (mPlib_Get_space_putin_item_forHITODAMA): it goes into the
+                 * pocket holding SPIRIT(k-1), exactly like vanilla's Player_actor_putin_item -- not into a free one */
+                const int stack_idx = mPr_GetPossessionItemIdxWithCond(Now_Private, (mActor_name_t)(T->item - 1), mPr_ITEM_COND_NORMAL);
+                if (stack_idx >= 0) {
+                    free_idx = stack_idx;
+                }
+            }
             if (free_idx >= 0) {
                 dest = (uint8_t)PC_NETGAME_TXN_DEST_POCKET;
                 slot = (uint8_t)free_idx;
@@ -27948,8 +28556,8 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
                "truth at the next join)\n", (unsigned)T->request_id);
         return 0;
     }
-    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {
-        return pcnetgame_txn_apply_mail(T, in); /* mail milestone 1: the mail[] slot, never the pockets */
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {
+        return pcnetgame_txn_apply_mail(T, in); /* mail milestone 1: the mail[] slot, never the pockets (worker B: the museum letter too) */
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
         return pcnetgame_txn_apply_take(T, in); /* mail milestone 2: the letter goes into mail[dst], never the pockets */
@@ -27968,6 +28576,9 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE) {
         return pcnetgame_txn_apply_house(T, in); /* guest-first town: only the wallet changes (the pockets are untouched) */
+    }
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
+        return pcnetgame_txn_apply_house_upgrade(T, in); /* worker C: the loan of an ACK_BUILT (the header arrives through house sync) */
     }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
         return pcnetgame_txn_apply_shop(T, in); /* town services milestone 2: the shop's own post-image shape (bells, money bags, several slots) */
@@ -28025,7 +28636,10 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
                 ok = 0;
             }
         } else if (to_pocket) {
-            s = (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && np->inventory.pockets[t->slot] == (mActor_name_t)EMPTY_NO)
+            s = (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && (np->inventory.pockets[t->slot] == (mActor_name_t)EMPTY_NO ||
+                                                                /* SPIRITS (G1): the stacked spirit replaces SPIRIT(k-1) in its own pocket */
+                                                                (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH && gitem > (uint16_t)ITM_SPIRIT0 &&
+                                                                 gitem <= (uint16_t)ITM_SPIRIT4 && np->inventory.pockets[t->slot] == (mActor_name_t)(gitem - 1))))
                     ? (int)t->slot : mPr_GetPossessionItemIdx(np, (mActor_name_t)EMPTY_NO);
             if (s >= 0) {
                 np->inventory.pockets[s] = (mActor_name_t)gitem;
@@ -28294,12 +28908,16 @@ static void pcnetgame_run_txn_test_hook(void) {
  * is pending. The pocket changes ONLY in pcnetgame_txn_apply_applied() (host post-image); a REJECTED result changes nothing. */
 
 static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int applied) {
-    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {
+    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {
         pcnetgame_mail_op_resolve(request_id, applied); /* mail milestone 1: the post girl's operation, not a town-service op */
         return;
     }
     if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
         pcnetgame_take_op_resolve(request_id, applied); /* mail milestone 2: the mailbox overlay's take, not a town-service op */
+        return;
+    }
+    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
+        pcnetgame_hu_op_resolve(request_id, applied, applied ? (uint8_t)0 : s_ts_last_reason); /* worker C: the Nook house-upgrade op */
         return;
     }
     if (s_ts_op.active && s_ts_op.kind == kind && s_ts_op.request_id == request_id) {
@@ -28464,7 +29082,7 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     memcpy(&m, data, size);
     svc = (int)m.service;
     if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG &&
-        svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE && svc != (int)PC_NETGAME_TS_GUESTDIR) {
+        svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE && svc != (int)PC_NETGAME_TS_GUESTDIR && svc != (int)PC_NETGAME_TS_MDONORS) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
@@ -28473,7 +29091,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
              : (svc == (int)PC_NETGAME_TS_HOSTCFG) ? (uint16_t)PC_NETGAME_TS_HOSTCFG_LEN
              : (svc == (int)PC_NETGAME_TS_EVENT) ? (uint16_t)PC_NETGAME_TS_EVENT_LEN
              : (svc == (int)PC_NETGAME_TS_UPGRADE) ? (uint16_t)PC_NETGAME_TS_UPGRADE_LEN
-             : (svc == (int)PC_NETGAME_TS_GUESTDIR) ? (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_GUESTDIR) ? (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN
+             : (svc == (int)PC_NETGAME_TS_MDONORS) ? (uint16_t)PC_NETGAME_TS_MDONORS_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -28494,11 +29113,12 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
           : svc == (int)PC_NETGAME_TS_HOSTCFG ? pcnetgame_ts_valid_hostcfg_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_EVENT ? pcnetgame_ts_valid_event_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_UPGRADE ? pcnetgame_ts_valid_upgrade_blob(m.blob)
-          : svc == (int)PC_NETGAME_TS_GUESTDIR ? pcnetgame_ts_valid_guestdir_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_GUESTDIR ? pcnetgame_ts_valid_guestdir_blob(m.blob)
+          : svc == (int)PC_NETGAME_TS_MDONORS ? pcnetgame_ts_valid_mdonors_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
                svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
                : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : svc == (int)PC_NETGAME_TS_UPGRADE ? "shop upgrade"
-               : svc == (int)PC_NETGAME_TS_GUESTDIR ? "guest directory" : "museum");
+               : svc == (int)PC_NETGAME_TS_GUESTDIR ? "guest directory" : svc == (int)PC_NETGAME_TS_MDONORS ? "museum donors" : "museum");
         return;
     }
     if (svc == (int)PC_NETGAME_TS_UPGRADE) {
@@ -28510,6 +29130,14 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     }
     if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
         pcnetgame_ts_client_apply(&m); /* a session setting, not a save region: no usable save needed */
+        return;
+    }
+    if (svc == (int)PC_NETGAME_TS_MDONORS) {
+        pcnetgame_mdon_client_apply(m.blob); /* worker B: a session state, not a save region: no usable save needed */
+        s_ts_client_seq[svc] = m.seq;
+        s_ts_client_have[svc] = 1;
+        printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u: %u guest donor name(s)\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq,
+               (unsigned)m.digest, (unsigned)m.len, (unsigned)m.blob[0]);
         return;
     }
     if (svc == (int)PC_NETGAME_TS_GUESTDIR) {
@@ -29059,6 +29687,7 @@ static void pcnetgame_run_house_buy_test_hook(void) {}
  * write, so the guest can / cannot pay the house; the normal D3 upload carries it to the host mirror and the hook waits for a clean record), `warp` then takes the player into
  * Nook's shop (a scene change through the vanilla goto_other_scene with the shop's own door data) once it stands idle in the town. Fires once per process. */
 extern const char* g_pc_nook_test; /* pc_main.c (declared here, not in pc_platform.h, to keep the widely included header untouched) */
+#include "m_random_field_h.h" /* mRF_BLOCKKIND_SHOP (the `shopdoor` exit of the TEST-ONLY warp) */
 #ifdef PC_NET_TEST_HOOKS
 static void pcnetgame_run_nook_test_hook(void) {
     static int s_stage = 0; /* 0 wait synced, 1 wallet set (wait for the upload), 2 warp, 3 done */
@@ -29073,7 +29702,7 @@ static void pcnetgame_run_nook_test_hook(void) {
     }
     now = pcnetgame_now_ms();
     if (s_stage == 0) {
-        if (!pcnetgame_client_is_guest_player()) {
+        if (!pcnetgame_client_is_guest_player() && strstr(g_pc_nook_test, "resident") == NULL) { /* worker C: `resident` in SPEC lets a resident use the warp (house upgrade real test) */
             printf("[NET][HOUSE][TEST-ONLY] --nook-test: this client is not a guest -- hook gives up\n");
             s_stage = 3;
             return;
@@ -29128,6 +29757,23 @@ static void pcnetgame_run_nook_test_hook(void) {
             out->exit_position.x = pp->x;
             out->exit_position.y = pp->y;
             out->exit_position.z = pp->z;
+            if (strstr(g_pc_nook_test, "shopdoor") != NULL) {
+                /* worker C: `shopdoor` = the exit a real shop door writes, in front of the shop (aSHOP_rewrite_out_data: the structure position - 68.29 x, + 68.29 z): a player
+                 * shown out stands next to the shop, so its live structure actor exists during a renewal (the shop upgrade's client patch + reload path) */
+                int sbx = 0, sbz = 0, sac = -1, sst = -1, stl[32];
+                xyz_t sp;
+                if (mFI_BlockKind2BkNum(&sbx, &sbz, mRF_BLOCKKIND_SHOP) && aSL_PC_ShopFootprint(mSP_GetShopLevel(), &sac, &sst, stl, 32) > 0) {
+                    mFI_BkandUtNum2CenterWpos(&sp, sbx, sbz, sst & 0xF, (sst >> 4) & 0xF);
+                    sp.x -= 68.29f;
+                    sp.z += 68.29f;
+                    sp.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(sp, 0.0f);
+                    out->exit_position.x = (s16)sp.x;
+                    out->exit_position.y = (s16)sp.y;
+                    out->exit_position.z = (s16)sp.z;
+                    printf("[NET][HOUSE][TEST-ONLY] --nook-test shopdoor: the exit is in front of the shop (block %d,%d tile %d) at (%d,%d,%d)\n", sbx, sbz, sst,
+                           (int)out->exit_position.x, (int)out->exit_position.y, (int)out->exit_position.z);
+                }
+            }
         }
         mSP_SetTanukiShopStatus(); /* the real shop door does this right before the entry (aSHOP open_wait): Nook's greeting reads it */
         goto_other_scene(play, &s_door, FALSE);
@@ -30696,8 +31342,10 @@ int pc_net_game_mail_begin_send(int slot) {
         return 0; /* no host mirror to send from (record not synced yet / uploads stopped) */
     }
     ml = &Now_Private->mail[slot];
-    if (mMl_check_not_used_mail((Mail_c*)ml) == TRUE || !mMl_check_send_mail((Mail_c*)ml) || ml->header.recipient.type != (u8)mMl_NAME_TYPE_PLAYER) {
-        return 0;
+    if (mMl_check_not_used_mail((Mail_c*)ml) == TRUE || !mMl_check_send_mail((Mail_c*)ml) ||
+        !(ml->header.recipient.type == (u8)mMl_NAME_TYPE_PLAYER ||
+          (ml->header.recipient.type == (u8)mMl_NAME_TYPE_MUSEUM && ml->present != (mActor_name_t)EMPTY_NO && ml->present != (mActor_name_t)RSV_NO))) {
+        return 0; /* worker B: a letter WITH A GIFT to the museum goes through the host too (MUSEUM_MAIL, kind 19) */
     }
     if (!pcnetgame_capture_owner_stamp(&stamp)) {
         return 0;
@@ -30783,7 +31431,7 @@ static void pcnetgame_mail_tick(void) {
     s_mail_op.phase = 2;
     memset(&s_ctxn, 0, sizeof(s_ctxn));
     s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
-    s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;
+    s_ctxn.kind = ml->header.recipient.type == (u8)mMl_NAME_TYPE_MUSEUM ? (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL : (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND;
     s_ctxn.slot = s_mail_op.slot;
     s_ctxn.item = (uint16_t)ml->present;
     s_ctxn.ts_aux = (uint8_t)((s_mail_op.h24 >> 16) & 0xFFu);
@@ -30823,9 +31471,14 @@ static void pcnetgame_run_mail_test_hook(void) {
         if ((uint32_t)(now - s_crec.adopt_ms) < 4000u) {
             return;
         }
-        s_house = (int)strtol(spec, &end, 10);
-        s_gift = (end != NULL && strstr(end, "gift") != NULL);
-        if (s_house < 0 || s_house >= mHS_HOUSE_NUM || mPr_NullCheckPersonalID(&Save_Get(homes[s_house]).ownerID)) {
+        if (strncmp(spec, "museum", 6) == 0) {
+            s_house = -2; /* worker B: --mail-test-send=museum,gift -- a letter WITH A GIFT to the museum (MUSEUM_MAIL, kind 19) */
+            s_gift = strstr(spec, "gift") != NULL;
+        } else {
+            s_house = (int)strtol(spec, &end, 10);
+            s_gift = (end != NULL && strstr(end, "gift") != NULL);
+        }
+        if (s_house != -2 && (s_house < 0 || s_house >= mHS_HOUSE_NUM || mPr_NullCheckPersonalID(&Save_Get(homes[s_house]).ownerID))) {
             printf("[NET][MAIL][TEST-ONLY] --mail-test-send=%s: house %d does not exist / has no owner -- hook gives up\n", spec, s_house);
             s_stage = 5;
             return;
@@ -30838,7 +31491,11 @@ static void pcnetgame_run_mail_test_hook(void) {
         }
         m = &Now_Private->mail[s_slot];
         mMl_init_mail(m, &Now_Private->player_ID); /* send font, sender = the local player */
-        mMl_set_to_plname(m, &Save_Get(homes[s_house]).ownerID);
+        if (s_house == -2) {
+            mMsm_GetMuseumMailName(&m->header.recipient); /* the address book's Museum entry */
+        } else {
+            mMl_set_to_plname(m, &Save_Get(homes[s_house]).ownerID);
+        }
         for (i = 0; i < 32; i++) {
             m->content.body[i] = (u8)(0x30 + (i % 10)); /* a recognisable body */
         }
@@ -32808,6 +33465,18 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         pcnetgame_handle_host_shopup_req(peer, &ur); /* multiplayer shop upgrade: the first valid request starts the announced closure; the answer is service 6 */
         return;
     }
+    if (size == sizeof(PCNetGameWildlifeToolActionMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_WILDLIFE_TOOL_ACTION) {
+        PCNetGameWildlifeToolActionMsg wt;
+        memcpy(&wt, data, sizeof(wt));
+        pcnetgame_handle_host_wildlife_tool_action(peer, &wt); /* latent bugs: a remote tool use reaches the host's insects */
+        return;
+    }
+    if (size == sizeof(PCNetGameGhostHuntMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_GHOST_HUNT) {
+        PCNetGameGhostHuntMsg gh;
+        memcpy(&gh, data, sizeof(gh));
+        pcnetgame_handle_host_ghost_hunt(peer, &gh); /* spirit hunt: a client accepted the Wisp's request */
+        return;
+    }
 
     if (data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION) {
         /* M9-C: PLAYER_ACTION is host -> client only; a client never originates it. Dropped, never relayed. */
@@ -32875,6 +33544,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
             pcnetgame_handle_host_dresser_txn(peer, &tc); /* dresser storage (kind 18, agent 12): one-phase, write-ahead sidecar */
             return;
         }
+        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
+            pcnetgame_handle_host_house_upgrade_txn(peer, &tc); /* worker C: house upgrades via Nook (kind 20), one-phase, durable before APPLIED */
+            return;
+        }
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC) {
             pcnetgame_handle_host_ts_txn(peer, &tc); /* Nook's manual restock (kind 15) / Work Mode (kind 16): the same one-phase town-service handler */
             return;
@@ -32882,7 +33555,7 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
             tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL) {
             pcnetgame_handle_host_ts_txn(peer, &tc); /* town services: reservation-less one-phase kinds (museum, police, shop) */
-        } else if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND) {
+        } else if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) { /* worker B: kind 19 = a letter to the museum */
             pcnetgame_handle_host_mail_txn(peer, &tc); /* mail milestone 1: a client's letter to a player, read from the host's mirror */
         } else if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE) {
             pcnetgame_handle_host_mail_take_txn(peer, &tc); /* mail milestone 2: a client takes a letter of its house mailbox, read from the host's mailbox */
@@ -33653,6 +34326,11 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == 128u && data[0] == (uint8_t)PC_NETGAME_MSG_VILLAGER_OUTFIT) {
+        pcnetgame_outfit_handle_client(data, size); /* worker B: the host's villager outfits (the size is re-checked against the struct inside) */
+        return;
+    }
+
     if (size == sizeof(PCNetGameNpcLeaseMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_LEASE) {
         PCNetGameNpcLeaseMsg nl;
         if (s_client_link != PC_NETGAME_LINK_READY) return;
@@ -33964,6 +34642,7 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_ts_op, 0, sizeof(s_ts_op)); /* town services: the UI operation and the mirror's seq memory die with the session (the host's seq restarts per process) */
     s_ts_last_reason = 0;
     memset(&s_mail_op, 0, sizeof(s_mail_op)); /* mail milestone 1: the post girl's operation dies with the session (a local refusal) */
+    pcnetgame_hu_session_reset(); /* worker C: an unresolved house-upgrade op resolves as REJECTED (LINKLOST when it was sent); the old-host latch is per session */
     s_mail_last_reason = 0;
     memset(s_ts_client_seq, 0, sizeof(s_ts_client_seq));
     memset(&s_take_op, 0, sizeof(s_take_op)); /* mail milestone 2: the mailbox take dies with the session (a local refusal) ... */
@@ -34443,6 +35122,244 @@ static uint32_t s_pg_next_scan_ms;
 PCNG_PEER_TABLE(uint32_t, s_pg_wr_ms)
 PCNG_PEER_TABLE(uint32_t, s_pg_wr_n)
 
+/* ===== VILLAGER OUTFIT BEGIN (worker B: msg 90 VILLAGER_OUTFIT + the host-side Able Sisters trend reset; see the enum entry) =====
+ * Vanilla resets every villager wearing a shop design (cloth RSV_CLOTH + cloth_original_id, or umbrella 32 + n) when that design is traded away
+ * (aNNW_trend_delete_cloth / _umbrella), but only on the TRADING process; a client's Save.animals is not the town's. The HOST now runs the same rule when it
+ * applies a design page write from a client (its own player's trades keep the vanilla call), and mirrors the outfits of all 15 villagers to every READY client.
+ * A villager with a LIVE actor is skipped (host: the reset waits, client: the outfit waits): an NPC actor writes its drawn outfit back into Save.animals at its save
+ * (ac_npc_save.c_inc), which would undo the change; it is retried once a second until the actor is gone. AC_MP_GUEST_PAGES=0 keeps guests out of the pages (old rule). */
+typedef struct PCNetGameOutfitWire {
+    uint16_t npc_id;            /* identity guard: Save_t.animals[i].id.npc_id on the host (0 / EMPTY = free slot) */
+    uint16_t cloth;             /* Animal_c.cloth */
+    uint8_t  cloth_original_id; /* 0xFF or 0..3 */
+    uint8_t  umbrella_id;       /* 0xFF, 0..31 standard, 32.. shop designs */
+    uint16_t _rsv;
+} PCNetGameOutfitWire;
+typedef struct PCNetGameVillagerOutfitMsg {
+    uint8_t  msg_type; /* PC_NETGAME_MSG_VILLAGER_OUTFIT */
+    uint8_t  count;    /* ANIMAL_NUM_MAX */
+    uint16_t _rsv;
+    uint32_t seq;      /* host: strictly increasing per process */
+    PCNetGameOutfitWire v[ANIMAL_NUM_MAX];
+} PCNetGameVillagerOutfitMsg;
+_Static_assert(sizeof(PCNetGameOutfitWire) == 8 && ANIMAL_NUM_MAX == 15, "VILLAGER_OUTFIT entry size drifted");
+_Static_assert(sizeof(PCNetGameVillagerOutfitMsg) == 128, "VILLAGER_OUTFIT wire size drifted");
+static uint32_t s_outfit_seq, s_outfit_dig, s_outfit_next_ms;
+static uint8_t  s_outfit_trend_pend; /* host: design bits whose trend reset still waits for a live villager actor */
+static uint32_t s_outfit_trend_since;
+PCNG_PEER_TABLE(uint32_t, s_outfit_sent)
+static PCNetGameVillagerOutfitMsg s_outfit_rx; /* client: the last host table */
+static uint8_t s_outfit_have;
+
+static int pcnetgame_guest_pages_on(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("AC_MP_GUEST_PAGES");
+        s_on = !(e != NULL && (strcmp(e, "0") == 0 || strcmp(e, "off") == 0 || strcmp(e, "OFF") == 0));
+        printf("[NET][PAGE] guests get the town pages and may trade at the Able Sisters: %s (AC_MP_GUEST_PAGES%s%s)\n", s_on ? "ON" : "OFF", e != NULL ? "=" : " unset", e != NULL ? e : "");
+    }
+    return s_on;
+}
+/* 1 = a villager of that npc id has a live NPC actor in this process's current scene */
+static int pcnetgame_outfit_actor_live(uint16_t npc_id) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    if (play == NULL || !s_local_world_latched) {
+        return 1; /* unknown scene: treat as live (wait) */
+    }
+    return Actor_info_fgName_search(&play->actor_info, (mActor_name_t)npc_id, ACTOR_PART_NPC) != NULL;
+}
+/* HOST: the vanilla aNNW_trend_delete_cloth / _umbrella for shop design `design` (0..3 mannequin, 4..7 umbrella). 1 = done for every wearer. */
+static int pcnetgame_outfit_trend_apply(int design) {
+    Animal_c* a = Save_Get(animals);
+    int i, waiting = 0;
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        int hit;
+        if (mNpc_CheckFreeAnimalPersonalID(&a[i].id)) {
+            continue;
+        }
+        hit = design < mNW_CLOTH_DESIGN_NUM ? (a[i].cloth == RSV_CLOTH && (a[i].cloth_original_id & 3) == design)
+                                            : ((int)a[i].umbrella_id == UMBRELLA_NUM + ((design - mNW_CLOTH_DESIGN_NUM) & 3));
+        if (!hit) {
+            continue;
+        }
+        if (pcnetgame_outfit_actor_live((uint16_t)a[i].id.npc_id)) {
+            waiting++;
+            continue;
+        }
+        if (design < mNW_CLOTH_DESIGN_NUM) {
+            mNpc_SetDefAnimalCloth(&a[i]);
+        } else {
+            mNpc_SetDefAnimalUmbrella(&a[i]);
+        }
+        printf("[NET][OUTFIT] host: villager slot %d (npc 0x%04X) stopped wearing shop design %d (traded away): default %s restored\n", i, (unsigned)a[i].id.npc_id, design,
+               design < mNW_CLOTH_DESIGN_NUM ? "shirt" : "umbrella");
+    }
+    return waiting == 0;
+}
+static void pcnetgame_outfit_trend_reset(int design) {
+    if (s_role != PC_NETGAME_ROLE_HOST || design < 0 || design >= (int)mNW_TOTAL_DESIGN_NUM) {
+        return;
+    }
+    if (!pcnetgame_outfit_trend_apply(design)) {
+        s_outfit_trend_pend |= (uint8_t)(1u << design);
+        s_outfit_trend_since = pcnetgame_now_ms();
+        printf("[NET][OUTFIT] host: shop design %d trend reset waits for a villager actor on screen to unload\n", design);
+    }
+}
+static void pcnetgame_outfit_build(PCNetGameVillagerOutfitMsg* m) {
+    int i;
+    memset(m, 0, sizeof(*m));
+    m->msg_type = (uint8_t)PC_NETGAME_MSG_VILLAGER_OUTFIT;
+    m->count = (uint8_t)ANIMAL_NUM_MAX;
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        const Animal_c* a = &Save_Get(animals)[i];
+        if (mNpc_CheckFreeAnimalPersonalID((AnmPersonalID_c*)&a->id)) {
+            continue;
+        }
+        m->v[i].npc_id = (uint16_t)a->id.npc_id;
+        m->v[i].cloth = (uint16_t)a->cloth;
+        m->v[i].cloth_original_id = a->cloth_original_id;
+        m->v[i].umbrella_id = a->umbrella_id;
+    }
+}
+static void pcnetgame_outfit_host_tick(void) {
+    PCNetGameVillagerOutfitMsg m;
+    uint32_t now = pcnetgame_now_ms(), d;
+    int p, i;
+    if ((uint32_t)(now - s_outfit_next_ms) < 1000u) {
+        return;
+    }
+    s_outfit_next_ms = now;
+#ifdef PC_NET_TEST_HOOKS
+    {   /* TEST-ONLY (AC_TEST_HOOKS=1, HOST): AC_TEST_OUTFIT_SEED=<design 0..7> -- once, the first town villager WITHOUT a live actor starts wearing that shop design (the state a
+         * villager's greeting copy produces), so a protocol test can trade the design away and watch the host's trend reset. Never active in normal play. */
+        static int s_seed = 0;
+        const char* e;
+        if (s_seed == 0 && (e = pc_test_hook_getenv("AC_TEST_OUTFIT_SEED")) != NULL && atoi(e) >= 0 && atoi(e) < (int)mNW_TOTAL_DESIGN_NUM) {
+            const int dsg = atoi(e);
+            for (i = 0; i < ANIMAL_NUM_MAX && s_seed == 0; i++) {
+                Animal_c* a = &Save_Get(animals)[i];
+                if (!mNpc_CheckFreeAnimalPersonalID(&a->id) && !pcnetgame_outfit_actor_live((uint16_t)a->id.npc_id)) {
+                    if (dsg < mNW_CLOTH_DESIGN_NUM) {
+                        a->cloth = RSV_CLOTH;
+                        a->cloth_original_id = (u8)dsg;
+                    } else {
+                        a->umbrella_id = (u8)(UMBRELLA_NUM + (dsg - mNW_CLOTH_DESIGN_NUM));
+                    }
+                    s_seed = 1;
+                    printf("[NET][OUTFIT][TEST-ONLY] AC_TEST_OUTFIT_SEED: villager slot %d (npc 0x%04X) now wears shop design %d (NOT active in normal play)\n", i, (unsigned)a->id.npc_id, dsg);
+                }
+            }
+            if (s_seed == 0) {
+                s_seed = -1;
+                printf("[NET][OUTFIT][TEST-ONLY] AC_TEST_OUTFIT_SEED: no villager without a live actor\n");
+            }
+        }
+    }
+#endif
+    if (s_outfit_trend_pend != 0u) {
+        for (i = 0; i < (int)mNW_TOTAL_DESIGN_NUM; i++) {
+            if ((s_outfit_trend_pend & (1u << i)) != 0u && pcnetgame_outfit_trend_apply(i)) {
+                s_outfit_trend_pend &= (uint8_t)~(1u << i);
+            }
+        }
+        if (s_outfit_trend_pend != 0u && (uint32_t)(now - s_outfit_trend_since) >= 600000u) {
+            printf("[NET][OUTFIT] host: pending trend resets 0x%02X dropped after 10 minutes\n", (unsigned)s_outfit_trend_pend);
+            s_outfit_trend_pend = 0u;
+        }
+    }
+    pcnetgame_outfit_build(&m);
+    d = pcnetgame_fnv1a32(m.v, sizeof(m.v));
+    if (s_outfit_seq == 0u || d != s_outfit_dig) {
+        s_outfit_dig = d;
+        s_outfit_seq++;
+        printf("[NET][OUTFIT] host: villager outfits -> seq %u digest 0x%08X\n", (unsigned)s_outfit_seq, (unsigned)d);
+    }
+    m.seq = s_outfit_seq;
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !s_host_peer[p].bound_valid) {
+            s_outfit_sent[p] = 0u;
+            continue;
+        }
+        if (s_outfit_sent[p] != s_outfit_seq && pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+            s_outfit_sent[p] = s_outfit_seq;
+        }
+    }
+}
+static int pcnetgame_outfit_valid(const PCNetGameOutfitWire* w) {
+    if (w->npc_id == 0u) {
+        return 1; /* a free slot on the host: nothing to apply */
+    }
+    if (ITEM_NAME_GET_TYPE(w->npc_id) != NAME_TYPE_NPC || w->_rsv != 0u) {
+        return 0;
+    }
+    if (w->cloth == (uint16_t)RSV_CLOTH ? w->cloth_original_id > 3u : (!ITEM_IS_CLOTH((mActor_name_t)w->cloth) || w->cloth_original_id != 0xFFu)) {
+        return 0;
+    }
+    return w->umbrella_id == 0xFFu || w->umbrella_id < (uint8_t)(UMBRELLA_NUM + 8);
+}
+/* CLIENT: writes the host's outfits into the local Save copy for every villager without a live actor. */
+static void pcnetgame_outfit_client_apply(void) {
+    int i, n = 0, waiting = 0;
+    if (!s_outfit_have || !pcfa_save_ready()) {
+        return;
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        const PCNetGameOutfitWire* w = &s_outfit_rx.v[i];
+        Animal_c* a = &Save_Get(animals)[i];
+        if (w->npc_id == 0u || (uint16_t)a->id.npc_id != w->npc_id) {
+            continue;
+        }
+        if ((uint16_t)a->cloth == w->cloth && a->cloth_original_id == w->cloth_original_id && a->umbrella_id == w->umbrella_id) {
+            continue;
+        }
+        if (pcnetgame_outfit_actor_live(w->npc_id)) {
+            waiting++;
+            continue;
+        }
+        a->cloth = (mActor_name_t)w->cloth;
+        a->cloth_original_id = w->cloth_original_id;
+        a->umbrella_id = w->umbrella_id;
+        n++;
+    }
+    if (n > 0) {
+        printf("[NET][OUTFIT] client: %d villager outfit(s) taken from the host (seq %u)%s\n", n, (unsigned)s_outfit_rx.seq, waiting ? ", others wait for their actor to unload" : "");
+    }
+}
+static void pcnetgame_outfit_client_tick(void) {
+    static uint32_t next_ms;
+    const uint32_t now = pcnetgame_now_ms();
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || (uint32_t)(now - next_ms) < 1000u) {
+        return;
+    }
+    next_ms = now;
+    pcnetgame_outfit_client_apply();
+}
+static void pcnetgame_outfit_handle_client(const uint8_t* data, uint16_t size) {
+    PCNetGameVillagerOutfitMsg m;
+    int i;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || size != (uint16_t)sizeof(m)) {
+        return;
+    }
+    memcpy(&m, data, sizeof(m));
+    if (m.count != (uint8_t)ANIMAL_NUM_MAX || m._rsv != 0u || m.seq == 0u || (s_outfit_have && m.seq <= s_outfit_rx.seq)) {
+        return; /* stale / duplicate (forgotten at a reconnect: a new host process restarts at seq 1) */
+    }
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        if (!pcnetgame_outfit_valid(&m.v[i])) {
+            /* per entry: an outfit this build does not consider legal is NOT applied (that villager keeps its local outfit); the others still are */
+            printf("[NET][OUTFIT] client: VILLAGER_OUTFIT seq %u slot %d (npc 0x%04X cloth 0x%04X org 0x%02X umbrella 0x%02X) is not a legal outfit -- that slot is skipped\n",
+                   (unsigned)m.seq, i, (unsigned)m.v[i].npc_id, (unsigned)m.v[i].cloth, (unsigned)m.v[i].cloth_original_id, (unsigned)m.v[i].umbrella_id);
+            memset(&m.v[i], 0, sizeof(m.v[i]));
+        }
+    }
+    s_outfit_rx = m;
+    s_outfit_have = 1;
+    printf("[NET][OUTFIT] client: host villager outfits seq %u received\n", (unsigned)m.seq);
+    pcnetgame_outfit_client_apply();
+}
+/* ===== VILLAGER OUTFIT END ===== */
+
 static void pcnetgame_page_host_tick(void) {
     uint32_t now = pcnetgame_now_ms();
     unsigned i;
@@ -34451,6 +35368,8 @@ static void pcnetgame_page_host_tick(void) {
         return;
     }
     pcnetgame_page_test_edit();
+    pcnetgame_outfit_host_tick(); /* worker B: VILLAGER_OUTFIT (90) + pending trend resets */
+    pcnetgame_gmus_tick();        /* worker B: the guests' museum day pass */
     if ((uint32_t)(now - s_pg_next_scan_ms) >= 500u) {
         s_pg_next_scan_ms = now;
         for (i = 0; i < (unsigned)PCNG_PAGE_COUNT; i++) {
@@ -34469,7 +35388,8 @@ static void pcnetgame_page_host_tick(void) {
     }
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         int budget = 6;
-        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !s_host_peer[p].bound_valid || s_host_peer[p].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) /* a guest keeps its own town's pages */ {
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !s_host_peer[p].bound_valid ||
+            (s_host_peer[p].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && !pcnetgame_guest_pages_on())) /* worker B: a guest plays a never-persisted copy of THIS town: it gets the pages too (AC_MP_GUEST_PAGES=0: the old rule) */ {
             memset(s_pg_sent[p], 0, sizeof(s_pg_sent[p]));
             continue;
         }
@@ -34513,9 +35433,13 @@ static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg*
         s_pg_wr_n[peer] = 0;
     }
     idx = pcnetgame_rec_gate(peer, 0, 0);
-    if (idx < 0 || idx >= PLAYER_NUM || ++s_pg_wr_n[peer] > 20u || !pcnetgame_page_valid(in->kind, in->index, in->data, in->len)) {
+    /* worker B: a GUEST may trade at the Able Sisters like a vanilla visitor (DESIGN pages only; the notice board stays resident-only); same rate limit and content checks */
+    if (idx >= PLAYER_NUM && !(in->kind == PCNG_PAGE_DESIGN && pcnetgame_guest_pages_on() && pcnetgame_guest_of_idx(idx) >= 0)) {
+        idx = -1;
+    }
+    if (idx < 0 || ++s_pg_wr_n[peer] > 20u || !pcnetgame_page_valid(in->kind, in->index, in->data, in->len)) {
         printf("[NET][PAGE] host: peer %d write kind %u index %u REFUSED (%s)%s", (int)peer, (unsigned)in->kind, (unsigned)in->index,
-               (idx < 0 || idx >= PLAYER_NUM) ? "not a resident" : s_pg_wr_n[peer] > 20u ? "rate limited" : "invalid content", "\n");
+               idx < 0 ? "not a resident (a guest writes design pages only)" : s_pg_wr_n[peer] > 20u ? "rate limited" : "invalid content", "\n");
         pcnetgame_page_send(peer, in->kind, in->index, s_pg_rev[slot], (uint8_t)PCNG_PAGE_F_BAD, in->aux, cur, len);
         s_pg_sent[peer][slot] = s_pg_rev[slot];
         return;
@@ -34535,7 +35459,11 @@ static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg*
         memcpy(cur, in->data, len);
         s_pg_rev[slot]++;
         s_pg_dig[slot] = pcnetgame_page_digest(in->kind, in->index);
-        printf("[NET][PAGE] host: peer %d (resident %d) write kind %u index %u APPLIED -> rev %u%s", (int)peer, idx, (unsigned)in->kind, (unsigned)in->index, (unsigned)s_pg_rev[slot], "\n");
+        printf("[NET][PAGE] host: peer %d (%s %d) write kind %u index %u APPLIED -> rev %u%s", (int)peer, idx >= PLAYER_NUM ? "guest record" : "resident", idx, (unsigned)in->kind,
+               (unsigned)in->index, (unsigned)s_pg_rev[slot], "\n");
+        if (in->kind == PCNG_PAGE_DESIGN) {
+            pcnetgame_outfit_trend_reset((int)in->index); /* worker B: the vanilla trend reset of the trading process, done where the town's villagers live */
+        }
     }
     pcnetgame_page_send(peer, in->kind, in->index, s_pg_rev[slot], (uint8_t)PCNG_PAGE_F_APPLIED, in->aux, cur, len);
     s_pg_sent[peer][slot] = s_pg_rev[slot];
@@ -34548,10 +35476,220 @@ static uint32_t s_pgc_pend_dig[PCNG_PAGE_COUNT];   /* digest of the write in fli
 static uint32_t s_pgc_pend_ms[PCNG_PAGE_COUNT];
 static uint32_t s_pgc_next_ms;
 
+/* ===== ABLE TRADE JOURNAL BEGIN (worker B: Able Sisters trades on a CLIENT; no wire change, see pc_able_net.h) =====
+ * A trade at Mable (Exchange = aNI_ExchangeCloth/Umb: the player's my_org[k] and the shop design SWAP; Display = aNI_Copy*Data from my_org) writes the shared design page
+ * (PAGE kind DESIGN) AND, for an Exchange, the character's my_org[k]. The page write can come back STALE / BAD or be superseded by a host push; the page then takes the
+ * host's copy, so without this journal the player's own design (now only in the shop slot) would be gone. The journal keeps the before-image of the my_org slot and the
+ * revision the player actually SAW (s_pgc_seen: set only while the shop's double buffer equals the Save, i.e. what the mannequins show), settles on APPLIED and rolls the
+ * my_org slot back on STALE / BAD / a superseding push / a reconnect reset ('[NET][ABLE] trade rolled back'). A rollback only restores a slot that still holds what the
+ * trade put there. Uncertain outcomes (link loss) roll back: at worst the player keeps a COPY of a design that also reached the shop (designs are copyable), never a loss. */
+static uint32_t s_pgc_seen[mNW_TOTAL_DESIGN_NUM]; /* the canonical revision of each design page the shop actually displayed (0 = never seen) */
+static struct {
+    uint8_t  active, kind, design, org; /* kind: PC_ABLE_TRADE_*; design 0..7; org = my_org slot 0..7 or 0xFF (none) */
+    uint8_t  sent, began;               /* sent: the page write left; began: begin seen without its end */
+    uint32_t base_rev;                  /* the revision the write is built on (the SEEN revision) */
+    uint32_t design_after_dig;          /* digest of the shop design the trade wrote */
+    uint32_t began_ms;
+    mNW_original_design_c org_before, org_after;
+} s_able_txn;
+static unsigned pcnetgame_able_page_slot(unsigned design) { return (unsigned)mNtc_BOARD_POST_COUNT + design; }
+static const char* pcnetgame_able_kind_name(int k) { return k == PC_ABLE_TRADE_EXCHANGE ? "exchange" : k == PC_ABLE_TRADE_DISPLAY ? "display" : "?"; }
+/* Restores the my_org slot of the open trade (if it still holds what the trade put there) and closes the journal. */
+static void pcnetgame_able_rollback(const char* why) {
+    if (!s_able_txn.active) {
+        return;
+    }
+    if (s_able_txn.kind == PC_ABLE_TRADE_EXCHANGE && s_able_txn.org < 8u && Now_Private != NULL) {
+        mNW_original_design_c* o = &Now_Private->my_org[s_able_txn.org];
+        if (memcmp(o, &s_able_txn.org_after, sizeof(*o)) == 0) {
+            memcpy(o, &s_able_txn.org_before, sizeof(*o));
+            printf("[NET][ABLE] trade rolled back (%s): %s of design %u -- my_org[%u] restored to the player's own design\n", why,
+                   pcnetgame_able_kind_name(s_able_txn.kind), (unsigned)s_able_txn.design, (unsigned)s_able_txn.org);
+        } else {
+            printf("[NET][ABLE] trade rolled back (%s): %s of design %u -- my_org[%u] was changed since the trade, left as it is\n", why,
+                   pcnetgame_able_kind_name(s_able_txn.kind), (unsigned)s_able_txn.design, (unsigned)s_able_txn.org);
+        }
+    } else {
+        printf("[NET][ABLE] trade rolled back (%s): %s of design %u -- nothing of the character changed (the shop shows the host's copy)\n", why,
+               pcnetgame_able_kind_name(s_able_txn.kind), (unsigned)s_able_txn.design);
+    }
+    memset(&s_able_txn, 0, sizeof(s_able_txn));
+}
+static void pcnetgame_able_settle(uint32_t rev, const char* why) {
+    if (!s_able_txn.active) {
+        return;
+    }
+    printf("[NET][ABLE] trade settled (%s, rev %u): %s of design %u%s\n", why, (unsigned)rev, pcnetgame_able_kind_name(s_able_txn.kind), (unsigned)s_able_txn.design,
+           s_able_txn.kind == PC_ABLE_TRADE_EXCHANGE ? " -- the swap is final" : "");
+    memset(&s_able_txn, 0, sizeof(s_able_txn));
+}
+
+static const char* pcnetgame_able_gate_why(void) {
+    unsigned d;
+    const char* why = NULL;
+    if (s_client_link != PC_NETGAME_LINK_READY) {
+        why = "not connected (reconnecting / handshake)";
+    } else if (s_able_txn.active) {
+        why = "the previous trade is not settled yet";
+    } else {
+        for (d = 0; d < (unsigned)mNW_TOTAL_DESIGN_NUM && why == NULL; d++) {
+            const unsigned s = pcnetgame_able_page_slot(d);
+            if (s_pgc_rev[s] == 0u) {
+                why = "the shop's designs have not arrived from the host yet";
+            } else if (s_pgc_pend_dig[s] != 0u) {
+                why = "a design write is still in flight";
+            }
+        }
+    }
+    return why;
+}
+
+int pc_able_trade_gate(void) {
+    const char* why;
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return 1; /* solo / the host's own player: vanilla */
+    }
+    why = pcnetgame_able_gate_why();
+    if (why != NULL) {
+        printf("[NET][ABLE] trade refused before it started: %s (Mable: \"Oh, I see.\")\n", why);
+        return 0;
+    }
+    return 1;
+}
+
+void pc_able_buffer_synced(int design) {
+    unsigned s;
+    uint16_t len;
+    uint8_t* p;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || design < 0 || design >= (int)mNW_TOTAL_DESIGN_NUM) {
+        return;
+    }
+    s = pcnetgame_able_page_slot((unsigned)design);
+    p = pcnetgame_page_ptr(PCNG_PAGE_DESIGN, (unsigned)design, &len);
+    if (p != NULL && s_pgc_rev[s] != 0u && s_pgc_seen[design] != s_pgc_rev[s] && pcnetgame_fnv1a32(p, len) == s_pgc_dig[s]) {
+        s_pgc_seen[design] = s_pgc_rev[s]; /* the mannequin / umbrella shows exactly the canonical copy of this revision */
+    }
+}
+
+void pc_able_trade_begin(int kind, int design, int org) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || design < 0 || design >= (int)mNW_TOTAL_DESIGN_NUM || Now_Private == NULL) {
+        return;
+    }
+    if (s_able_txn.active) {
+        printf("[NET][ABLE] a new trade began while design %u's trade was open -- the open one is rolled back first\n", (unsigned)s_able_txn.design);
+        pcnetgame_able_rollback("superseded by a new trade");
+    }
+    memset(&s_able_txn, 0, sizeof(s_able_txn));
+    s_able_txn.kind = (uint8_t)kind;
+    s_able_txn.design = (uint8_t)design;
+    s_able_txn.org = (org >= 0 && org < 8) ? (uint8_t)org : 0xFFu;
+    s_able_txn.base_rev = s_pgc_seen[design] != 0u ? s_pgc_seen[design] : s_pgc_rev[pcnetgame_able_page_slot((unsigned)design)];
+    if (s_able_txn.org < 8u) {
+        memcpy(&s_able_txn.org_before, &Now_Private->my_org[s_able_txn.org], sizeof(mNW_original_design_c));
+    }
+    s_able_txn.began = 1;
+}
+
+void pc_able_trade_end(void) {
+    uint16_t len;
+    uint8_t* p;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || !s_able_txn.began || Now_Private == NULL) {
+        return;
+    }
+    s_able_txn.began = 0;
+    if (s_able_txn.org < 8u) {
+        memcpy(&s_able_txn.org_after, &Now_Private->my_org[s_able_txn.org], sizeof(mNW_original_design_c));
+    }
+    p = pcnetgame_page_ptr(PCNG_PAGE_DESIGN, s_able_txn.design, &len);
+    s_able_txn.design_after_dig = p != NULL ? pcnetgame_fnv1a32(p, len) : 0u;
+    s_able_txn.began_ms = pcnetgame_now_ms();
+    s_able_txn.active = 1;
+    printf("[NET][ABLE] trade journaled: %s of design %u with my_org[%d], built on the SEEN rev %u (adopted rev %u)\n", pcnetgame_able_kind_name(s_able_txn.kind),
+           (unsigned)s_able_txn.design, s_able_txn.org < 8u ? (int)s_able_txn.org : -1, (unsigned)s_able_txn.base_rev,
+           (unsigned)s_pgc_rev[pcnetgame_able_page_slot(s_able_txn.design)]);
+}
+/* TEST-ONLY (PC_NET_TEST_HOOKS + AC_TEST_HOOKS=1, CLIENT): AC_TEST_ABLE_TRADE=<x|d>,<design 0..7>,<my_org slot 0..7>[,stale] -- once the player has stood in the Able Sisters
+ * shop for 6 s with every design page adopted and SEEN, the shop actor (ac_needlework_indoor.c) issues ONE exchange (x) / display (d) request through its own clip procs
+ * (the path Mable's talk uses). `stale` makes the trade's base revision one older than the one displayed (a write the host must answer STALE: the rollback path). The
+ * digests of my_org[slot] before / after / after the outcome and of the shop design are logged for the harness. Never active in normal play. */
+static struct { int st, kind, design, org, stale, seen_active; uint32_t t0; uint32_t org_before, shop_before; } s_able_test;
+int pc_able_test_trade_poll(int* kind, int* design, int* org) {
+#ifdef PC_NET_TEST_HOOKS
+    uint16_t len;
+    uint8_t* sp;
+    uint32_t now;
+    if (s_able_test.st == 0) {
+        const char* e = pc_test_hook_getenv("AC_TEST_ABLE_TRADE");
+        char k = 0;
+        s_able_test.st = 3;
+        if (e != NULL && sscanf(e, "%c,%d,%d", &k, &s_able_test.design, &s_able_test.org) == 3 && (k == 'x' || k == 'd') && s_able_test.design >= 0 &&
+            s_able_test.design < (int)mNW_TOTAL_DESIGN_NUM && s_able_test.org >= 0 && s_able_test.org < 8) {
+            s_able_test.kind = k == 'x' ? PC_ABLE_TRADE_EXCHANGE : PC_ABLE_TRADE_DISPLAY;
+            s_able_test.stale = strstr(e, "stale") != NULL;
+            s_able_test.st = 1;
+        }
+    }
+    if (s_able_test.st != 1 || s_role != PC_NETGAME_ROLE_CLIENT || Now_Private == NULL || pcnetgame_able_gate_why() != NULL || s_pgc_seen[s_able_test.design] == 0u) {
+        s_able_test.t0 = 0;
+        return 0;
+    }
+    now = pcnetgame_now_ms();
+    if (s_able_test.t0 == 0u) {
+        s_able_test.t0 = now ? now : 1u;
+    }
+    if ((uint32_t)(now - s_able_test.t0) < 6000u) {
+        return 0;
+    }
+    s_able_test.st = 2;
+    sp = pcnetgame_page_ptr(PCNG_PAGE_DESIGN, (unsigned)s_able_test.design, &len);
+    s_able_test.org_before = pcnetgame_fnv1a32(&Now_Private->my_org[s_able_test.org], sizeof(mNW_original_design_c));
+    s_able_test.shop_before = sp != NULL ? pcnetgame_fnv1a32(sp, len) : 0u;
+    if (s_able_test.stale && s_pgc_seen[s_able_test.design] > 1u) {
+        s_pgc_seen[s_able_test.design]--;
+    }
+    printf("[NET][ABLE][TEST-ONLY] AC_TEST_ABLE_TRADE: requesting %s of design %d with my_org[%d] org_before=0x%08X shop_before=0x%08X seen_rev=%u%s\n",
+           pcnetgame_able_kind_name(s_able_test.kind), s_able_test.design, s_able_test.org, (unsigned)s_able_test.org_before, (unsigned)s_able_test.shop_before,
+           (unsigned)s_pgc_seen[s_able_test.design], s_able_test.stale ? " (stale base injected)" : "");
+    *kind = s_able_test.kind;
+    *design = s_able_test.design;
+    *org = s_able_test.org;
+    return 1;
+#else
+    (void)kind; (void)design; (void)org;
+    return 0;
+#endif
+}
+/* the outcome line of the test trade (client tick): once the journal is closed */
+static void pcnetgame_able_test_report(void) {
+#ifdef PC_NET_TEST_HOOKS
+    uint16_t len;
+    uint8_t* sp;
+    if (s_able_test.st != 2 || Now_Private == NULL) {
+        return;
+    }
+    if (s_able_txn.active || s_able_txn.began) {
+        s_able_test.seen_active = 1;
+        return;
+    }
+    if (!s_able_test.seen_active) {
+        return;
+    }
+    s_able_test.st = 3;
+    sp = pcnetgame_page_ptr(PCNG_PAGE_DESIGN, (unsigned)s_able_test.design, &len);
+    printf("[NET][ABLE][TEST-ONLY] AC_TEST_ABLE_TRADE outcome: my_org[%d]=0x%08X (before 0x%08X) shop design %d=0x%08X (before 0x%08X)\n", s_able_test.org,
+           (unsigned)pcnetgame_fnv1a32(&Now_Private->my_org[s_able_test.org], sizeof(mNW_original_design_c)), (unsigned)s_able_test.org_before, s_able_test.design,
+           sp != NULL ? (unsigned)pcnetgame_fnv1a32(sp, len) : 0u, (unsigned)s_able_test.shop_before);
+#endif
+}
+/* ===== ABLE TRADE JOURNAL END ===== */
+
 static void pcnetgame_page_client_reset(void) {
+    pcnetgame_able_rollback("reconnect reset: the outcome of the write is unknown"); /* ABLE: never lose the player's design over a link loss */
     memset(s_pgc_rev, 0, sizeof(s_pgc_rev));
     memset(s_pgc_dig, 0, sizeof(s_pgc_dig));
     memset(s_pgc_pend_dig, 0, sizeof(s_pgc_pend_dig));
+    memset(s_pgc_seen, 0, sizeof(s_pgc_seen));
+    s_outfit_have = 0; /* worker B: the next host's VILLAGER_OUTFIT seq starts over */
 }
 
 /* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_PAGE_EDIT=<kind>,<index> edits that page in THIS process's own Save once (client: after it adopted the host's copy; host: once its pages are baselined) --
@@ -34590,6 +35728,8 @@ static void pcnetgame_page_client_tick(void) {
     uint32_t now = pcnetgame_now_ms();
     unsigned i;
     pcnetgame_page_test_edit();
+    pcnetgame_outfit_client_tick(); /* worker B: villager outfits from the host (1 Hz, waits for live actors) */
+    pcnetgame_able_test_report();   /* worker B: TEST-ONLY outcome line of AC_TEST_ABLE_TRADE */
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL || (uint32_t)(now - s_pgc_next_ms) < 500u) {
         return;
     }
@@ -34607,13 +35747,23 @@ static void pcnetgame_page_client_tick(void) {
         d = pcnetgame_fnv1a32(cur, len);
         if (d == s_pgc_dig[i]) {
             s_pgc_pend_dig[i] = 0u;
+            if (s_able_txn.active && k == PCNG_PAGE_DESIGN && x == (unsigned)s_able_txn.design) {
+                pcnetgame_able_settle(s_pgc_rev[i], "the trade did not change the shared design"); /* ABLE: e.g. an exchange of two identical designs */
+            }
             continue;
         }
         if (s_pgc_pend_dig[i] == d && (uint32_t)(now - s_pgc_pend_ms[i]) < 3000u) {
             continue; /* the write is in flight */
         }
-        printf("[NET][PAGE] client: local edit of page kind %u index %u (built on rev %u) -> write sent to the host%s", k, x, (unsigned)s_pgc_rev[i], "\n");
-        pcnetgame_page_send(0, k, x, 0, (uint8_t)PCNG_PAGE_F_WRITE, s_pgc_rev[i], cur, len);
+        {
+            /* ABLE: a trade's write is built on the revision the player SAW in the shop, not on a newer one adopted while a menu deferred the redraw */
+            const uint32_t base = (s_able_txn.active && k == PCNG_PAGE_DESIGN && x == (unsigned)s_able_txn.design) ? s_able_txn.base_rev : s_pgc_rev[i];
+            printf("[NET][PAGE] client: local edit of page kind %u index %u (built on rev %u) -> write sent to the host%s", k, x, (unsigned)base, "\n");
+            pcnetgame_page_send(0, k, x, 0, (uint8_t)PCNG_PAGE_F_WRITE, base, cur, len);
+            if (base != s_pgc_rev[i]) {
+                printf("[NET][ABLE] trade write of design %u built on the seen rev %u (the adopted rev %u was never displayed)\n", x, (unsigned)base, (unsigned)s_pgc_rev[i]);
+            }
+        }
         s_pgc_pend_dig[i] = d;
         s_pgc_pend_ms[i] = now;
     }
@@ -34639,11 +35789,27 @@ static void pcnetgame_page_handle_client(const PCNetGamePageMsg* in) {
         s_pgc_dig[slot] = pcnetgame_fnv1a32(cur, len);
         s_pgc_pend_dig[slot] = 0u;
         printf("[NET][PAGE] client: my write of kind %u index %u was APPLIED (rev %u)%s", (unsigned)in->kind, (unsigned)in->index, (unsigned)in->rev, "\n");
+        if (s_able_txn.active && in->kind == PCNG_PAGE_DESIGN && in->index == s_able_txn.design) {
+            pcnetgame_able_settle(in->rev, "APPLIED");
+        }
         return;
+    }
+    if (s_able_txn.active && in->kind == PCNG_PAGE_DESIGN && in->index == s_able_txn.design) {
+        /* ABLE: any other copy of the traded page ends the trade: the host holds exactly what the trade wrote -> settled; anything else -> rolled back */
+        if (pcnetgame_fnv1a32(in->data, len) == s_able_txn.design_after_dig) {
+            pcnetgame_able_settle(in->rev, "the host's copy is the traded design");
+        } else {
+            pcnetgame_able_rollback((in->flags & PCNG_PAGE_F_BAD) ? "write REFUSED" : (in->flags & PCNG_PAGE_F_STALE) ? "write STALE"
+                                    : s_pgc_rev[slot] == 0u ? "superseded: (re)adopted the host's copy" : "superseded by a host push");
+        }
     }
     if ((in->flags & (PCNG_PAGE_F_STALE | PCNG_PAGE_F_BAD)) != 0u) {
         printf("[NET][PAGE] client: my write of kind %u index %u was %s: the HOST's copy (rev %u) wins, the local edit is dropped%s", (unsigned)in->kind, (unsigned)in->index,
                (in->flags & PCNG_PAGE_F_BAD) ? "REFUSED" : "STALE", (unsigned)in->rev, "\n");
+    } else if (s_pgc_rev[slot] != 0u && pcnetgame_fnv1a32(cur, len) != s_pgc_dig[slot] && memcmp(cur, in->data, len) != 0) {
+        /* a local edit that was not sent yet / is still in flight loses to a newer host copy: say so (never a silent overwrite) */
+        printf("[NET][PAGE] client: page kind %u index %u: the local edit (built on rev %u) is SUPERSEDED by the host's rev %u -- the host's copy wins%s", (unsigned)in->kind,
+               (unsigned)in->index, (unsigned)s_pgc_rev[slot], (unsigned)in->rev, "\n");
     } else if (s_pgc_rev[slot] == 0u) {
         printf("[NET][PAGE] client: adopted kind %u index %u rev %u%s", (unsigned)in->kind, (unsigned)in->index, (unsigned)in->rev, "\n");
     } else if (in->rev > s_pgc_rev[slot]) {
@@ -34745,6 +35911,7 @@ static void pcnetgame_client_tick(void) {
         return; /* the 60 s cap left the session (M2) */
     }
     pcnetgame_mail_tick(); /* mail milestone 1: AWAIT_CLEAN poll -> TXN_COMMIT kind 12 */
+    pcnetgame_hu_client_tick(); /* worker C: house upgrade AWAIT_CLEAN poll -> TXN_COMMIT kind 20 */
 
     if (!ready) {
         if (!s_client_paused) {
@@ -39811,6 +40978,84 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 printf("[AUTO] hspawn %d species %d entity %u\n", id, sp, (unsigned)hid);
             }
             s_ap.active = 0;
+        } else if (strcmp(cmd, "hspawnbug") == 0) { /* TEST-ONLY, host (worker A): hspawnbug SPECIES X Z -- an authoritative BUG record (38 ant, 40 spirit, 33 mole cricket, ...) */
+            int bsp = -1;
+            float fx = 0.0f, fz = 0.0f;
+            char d2[96];
+            uint32_t hid = 0;
+            if (sscanf(line, "%*d %*s %d %f %f", &bsp, &fx, &fz) == 3 && bsp >= 0 && bsp <= aINS_INSECT_TYPE_SPIRIT) {
+                hid = pcwld_test_host_inject_kind(PC_WILDLIFE_KIND_BUG, bsp, fx, fz);
+            }
+            snprintf(d2, sizeof(d2), "species %d entity %u", bsp, (unsigned)hid);
+            pcnetgame_ap_done(hid != 0 ? "ok" : "fail", d2);
+        } else if (strcmp(cmd, "pact") == 0) { /* TEST-ONLY (worker A): pact ACT UT_X UT_Z -- a tool use informs the insects (1 axe-rock 2 shovel-rock 3 dig 4 shake): host = the remote-tool queue, client = the local tool path (which also tells the host) */
+            int pa = 0, pux = 0, puz = 0, ok = 0;
+            char d2[96];
+            if (sscanf(line, "%*d %*s %d %d %d", &pa, &pux, &puz) == 3) {
+                if (s_role == PC_NETGAME_ROLE_HOST) {
+                    ok = pcwld_host_queue_pl_action(pa, pux, puz);
+                } else if (Common_Get(clip).insect_clip != NULL && Common_Get(clip).insect_clip->set_pl_act_tim_proc != NULL) {
+                    Common_Get(clip).insect_clip->set_pl_act_tim_proc(pa, pux, puz);
+                    ok = 1;
+                }
+            }
+            snprintf(d2, sizeof(d2), "action %d ut(%d,%d) role %d", pa, pux, puz, (int)s_role);
+            pcnetgame_ap_done(ok ? "ok" : "fail", d2);
+        } else if (strcmp(cmd, "ghost") == 0) { /* TEST-ONLY (worker A): ghost on BX,BZ ... | off | show -- the ghost event's spirit hunt of THIS process (RUN status, ACTIVE flag, the 5 spirit acres) */
+            char mode[8] = { 0 };
+            char d2[160];
+            int gi, gl, gn = 0;
+            mEv_gst_common_c* gc = (mEv_gst_common_c*)mEv_get_common_area(mEv_EVENT_GHOST, 0x37);
+            (void)sscanf(line, "%*d %*s %7s", mode);
+            if (strcmp(mode, "on") == 0) {
+                const char* p = strstr(line, " on");
+                if (gc == NULL) {
+                    gc = (mEv_gst_common_c*)mEv_reserve_common_area(mEv_EVENT_GHOST, 0x37);
+                }
+                if (gc != NULL) {
+                    for (gi = 0; gi < mEv_GHOST_HITODAMA_NUM; gi++) {
+                        gc->hitodama_block_data.block_x[gi] = 0xFF;
+                        gc->hitodama_block_data.block_z[gi] = 0xFF;
+                    }
+                    p = (p != NULL) ? p + 3 : "";
+                    while (gn < mEv_GHOST_HITODAMA_NUM && *p != 0) {
+                        int gbx = 0, gbz = 0, used = 0;
+                        if (sscanf(p, " %d,%d%n", &gbx, &gbz, &used) != 2) {
+                            break;
+                        }
+                        gc->hitodama_block_data.block_x[gn] = (u8)gbx;
+                        gc->hitodama_block_data.block_z[gn] = (u8)gbz;
+                        gn++;
+                        p += used;
+                    }
+                    gc->flags |= mEv_GHOST_FLAG_ACTIVE;
+                }
+                pcwld_test_force_ghost_run(1); /* the event manager recomputes the RUN status from the schedule: the spirits are told directly */
+            } else if (strcmp(mode, "off") == 0) {
+                if (gc != NULL) {
+                    gc->flags &= ~mEv_GHOST_FLAG_ACTIVE;
+                }
+                pcwld_test_force_ghost_run(0);
+            } else if (strcmp(mode, "run") == 0) {
+                pcwld_test_force_ghost_run(1); /* a CLIENT: only the forced RUN (its spirits are the host's) */
+            }
+            gl = snprintf(d2, sizeof(d2), "area=%d active=%d run=%d blocks=", gc != NULL, gc != NULL && (gc->flags & mEv_GHOST_FLAG_ACTIVE) != 0,
+                          (mEv_check_status(mEv_EVENT_GHOST, mEv_STATUS_RUN) || pcwld_test_ghost_run_forced()) ? 1 : 0);
+            for (gi = 0; gc != NULL && gi < mEv_GHOST_HITODAMA_NUM && gl < (int)sizeof(d2) - 12; gi++) {
+                gl += snprintf(d2 + gl, sizeof(d2) - (size_t)gl, "%d,%d;", (int)gc->hitodama_block_data.block_x[gi], (int)gc->hitodama_block_data.block_z[gi]);
+            }
+            pcnetgame_ap_done("ok", d2);
+        } else if (strcmp(cmd, "ghostaccept") == 0) { /* TEST-ONLY (worker A, client): the Wisp-acceptance seam (ac_ev_ghost_talk.c_inc) without the Wisp: tells the host */
+            pc_net_game_ghost_hunt_accepted();
+            pcnetgame_ap_done("ok", "sent");
+        } else if (strcmp(cmd, "pockets") == 0) { /* TEST-ONLY (worker A): the local player's 15 pocket items (hex) */
+            char d2[160];
+            int gi, gl = 0;
+            d2[0] = 0;
+            for (gi = 0; Now_Private != NULL && gi < mPr_POCKETS_SLOT_COUNT && gl < (int)sizeof(d2) - 8; gi++) {
+                gl += snprintf(d2 + gl, sizeof(d2) - (size_t)gl, "%04X ", (unsigned)Now_Private->inventory.pockets[gi]);
+            }
+            pcnetgame_ap_done("ok", d2);
         } else if (strcmp(cmd, "pspawn") == 0) { /* TEST-ONLY: pspawn ENTITY SPECIES X Z -- this client receives a (made-up) WILDLIFE_SPAWN of a fish: the real presentation path, which defers when the pool is full */
             unsigned long sp = 0;
             float fx = 0.0f, fz = 0.0f;
@@ -41385,7 +42630,7 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
         printf("[NET][WILDLIFE] host: local CATCH entity %u (species claim %d) accepted -- removed from "
                "authoritative table\n",
                (unsigned)entity_id, claimed_species);
-        pcnetgame_commit_catch_despawn(entity_id);
+        pcnetgame_commit_caught_despawn(entity_id);
     } else if (g_pc_verbose) {
         printf("[NET][WILDLIFE] host: local CATCH entity %u (species claim %d) rejected (likely lost a "
                "race to a peer's own simultaneous claim)\n",
@@ -43379,6 +44624,674 @@ void pc_net_game_dedicated_announce(int peer, int what) {
     }
 }
 
+/* ===== HOUSE UPGRADE BEGIN (worker C): house upgrades via Nook for resident clients (pc_house_upgrade.h; docs "House upgrades via Nook (residents)") =====
+ * HOST: the kind-20 handler (one synchronous call: gates -> shape -> journal -> base / pre-image -> idempotence -> busy -> guard -> vanilla preconditions on the HOST's
+ * header + mirror loan -> the write -> a DURABLE save (rolled back + FAULT when it fails) -> APPLIED -> the house canon refresh) and the CONSTRUCTION poll (1 Hz: a due order of a
+ * house nobody is in is built with mHm_PC_RehouseOne, saved durably and pushed). CLIENT: the op (AWAIT_CLEAN like MAIL_SEND, then the transaction on s_ctxn), its resolve,
+ * the APPLIED apply (only the loan of an ACK_BUILT; homes[] comes from the host's canon push), the old-host latch and a TEST-ONLY driver. */
+#include "pc_house_upgrade.h"
+extern int mHm_PC_RehouseOne(int home_no, int dry_run); /* src/game/m_home.c (TARGET_PC) */
+
+#define PCNG_HU_CLEAN_TIMEOUT_MS 5000u
+
+unsigned pc_house_upgrade_guard_bits(int size, int next_size, int has_basement, int renew, int basement_ordered, int statue_ordered) {
+    return ((unsigned)size & 7u) | (has_basement ? 0x08u : 0u) | (renew ? 0x10u : 0u) | (basement_ordered ? 0x20u : 0u) | (statue_ordered ? 0x40u : 0u) |
+           (next_size == size ? 0x80u : 0u);
+}
+
+unsigned pc_house_upgrade_loan_after_ack(int size, int basement_ordered) {
+    if (basement_ordered) {
+        return (unsigned)mPlayer_DEBT3; /* aNSC_LOAN_BASEMENT */
+    }
+    switch (size) {
+        case mHm_HOMESIZE_MEDIUM: return (unsigned)mPlayer_DEBT1; /* aNSC_LOAN_MEDIUM */
+        case mHm_HOMESIZE_LARGE:  return (unsigned)mPlayer_DEBT2; /* aNSC_LOAN_LARGE */
+        case mHm_HOMESIZE_UPPER:  return (unsigned)mPlayer_DEBT4; /* aNSC_LOAN_UPPER */
+        default:                  return 0u;
+    }
+}
+
+static unsigned pcnetgame_hu_guard_of(const mHm_hs_c* hs) {
+    return pc_house_upgrade_guard_bits((int)hs->size_info.size, (int)hs->size_info.next_size, (int)hs->flags.has_basement, (int)hs->size_info.renew,
+                                       (int)hs->size_info.basement_ordered, (int)hs->size_info.statue_ordered) & 0xFFu;
+}
+
+static const char* pcnetgame_hu_op_name(int op) {
+    return op == PC_HU_OP_ORDER_SIZE ? "ORDER_SIZE" : op == PC_HU_OP_ORDER_BASEMENT ? "ORDER_BASEMENT" : op == PC_HU_OP_ORDER_STATUE ? "ORDER_STATUE"
+           : op == PC_HU_OP_ACK_BUILT ? "ACK_BUILT" : "?";
+}
+
+static int pcnetgame_hu_date_today(const mHm_hs_c* hs) {
+    const lbRTC_time_c* now = &Common_Get(time.rtc_time);
+    return hs->size_info.upgrade_order_date.day == now->day && hs->size_info.upgrade_order_date.month == now->month && hs->size_info.upgrade_order_date.year == now->year;
+}
+
+static void pcnetgame_hu_set_date(mHm_hs_c* hs) { /* == aNSC_set_rehouse_order_date */
+    const lbRTC_time_c* now = &Common_Get(time.rtc_time);
+    hs->size_info.upgrade_order_date.year = now->year;
+    hs->size_info.upgrade_order_date.month = now->month;
+    hs->size_info.upgrade_order_date.day = now->day;
+}
+
+/* HOST: NULL when nothing of house h is in use, else why (the host's own player in / entering / leaving it, a READY player in a room of it, an owner commit of it in flight). */
+static const char* pcnetgame_hu_house_busy(int h) {
+    int p;
+    if (pcnetgame_local_house_unsafe(h)) {
+        return "the host's own player is in (or entering / leaving) the house, or no game scene is running";
+    }
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        PCNetPlayerScene sc;
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (s_host_peer[p].hup_open && !s_host_peer[p].hup_pd && (int)s_host_peer[p].hup_house == h) {
+            return "an owner commit of the house is in flight";
+        }
+        if (pc_remote_player_get_scene((PCNetPlayerId)p, &sc) && sc.valid && sc.kind == (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE && sc.scene_id != (uint8_t)SCENE_COTTAGE_MY &&
+            (int)sc.owner == h) {
+            return "a player is inside the house";
+        }
+    }
+    return NULL;
+}
+
+/* HOST: 1 when the op this request asks for is ALREADY reflected by the state (a resend after a host restart: the journal is gone, the state answers). Only asked when the
+ * guard no longer matches (the op changed the header). */
+static int pcnetgame_hu_already(int op, const PCNetGameTxnTag* t, const mHm_hs_c* hs, const Private_c* mir) {
+    const unsigned g = t->flags;
+    const int gsize = (int)(g & 7u);
+    switch (op) {
+        case PC_HU_OP_ORDER_SIZE:
+            return (int)hs->size_info.size == gsize && (int)hs->size_info.next_size == gsize + 1 && hs->ordered_outlook_pal == (u8)t->aux_item && pcnetgame_hu_date_today(hs);
+        case PC_HU_OP_ORDER_BASEMENT:
+            return (int)hs->size_info.size == gsize && hs->size_info.basement_ordered && pcnetgame_hu_date_today(hs);
+        case PC_HU_OP_ORDER_STATUE:
+            return (int)hs->size_info.size == gsize && hs->size_info.statue_ordered && pcnetgame_hu_date_today(hs);
+        case PC_HU_OP_ACK_BUILT:
+            if (g & 0x10u) { /* the renew announcement: renew cleared, the next loan set (pad_1 = "the last build was the basement") */
+                const int bas = (g & 0x20u) ? 1 : 0;
+                return (int)hs->size_info.size == gsize && !hs->size_info.renew && !hs->size_info.basement_ordered && (int)hs->size_info.pad_1 == bas &&
+                       mir->inventory.loan == (u32)pc_house_upgrade_loan_after_ack(gsize, bas);
+            }
+            return (g & 0x40u) && !hs->size_info.statue_ordered && hs->size_info.next_size == mHm_HOMESIZE_STATUE; /* the statue announcement */
+        default:
+            return 0;
+    }
+}
+
+/* HOST: the vanilla preconditions of `op` on the host's header + mirror loan (aNSC_start_wait / aNSC_set_talk_info_start_wait). NULL = eligible, else why. */
+static const char* pcnetgame_hu_precond(int op, const mHm_hs_c* hs, u32 loan) {
+    const mHm_rmsz_c* s = &hs->size_info;
+    switch (op) {
+        case PC_HU_OP_ORDER_SIZE:
+        case PC_HU_OP_ORDER_BASEMENT: /* aNSC_WAIT_TYPE_DONE_REHOUSE */
+            if (loan != 0 || s->renew || s->size >= mHm_HOMESIZE_UPPER || s->size != s->next_size || s->basement_ordered) {
+                return "an order needs no loan, nothing pending, a house below the Upper size (vanilla DONE_REHOUSE)";
+            }
+            if (op == PC_HU_OP_ORDER_SIZE && s->size == mHm_HOMESIZE_LARGE && !hs->flags.has_basement) {
+                return "a Large house without a basement is offered the basement only";
+            }
+            if (op == PC_HU_OP_ORDER_BASEMENT && (hs->flags.has_basement || (s->size != mHm_HOMESIZE_MEDIUM && s->size != mHm_HOMESIZE_LARGE))) {
+                return "a basement needs a Medium / Large house without one";
+            }
+            return NULL;
+        case PC_HU_OP_ORDER_STATUE:
+            if (loan != 0 || s->renew || s->size != mHm_HOMESIZE_UPPER || s->size != s->next_size || s->statue_ordered) {
+                return "a statue needs the loan paid off on an Upper house with nothing pending";
+            }
+            return NULL;
+        case PC_HU_OP_ACK_BUILT:
+            if (s->renew || (s->statue_ordered && s->next_size == mHm_HOMESIZE_STATUE)) {
+                return NULL;
+            }
+            return "nothing was built";
+        default:
+            return "unknown op";
+    }
+}
+
+/* HOST: the kind-20 handler. */
+static void pcnetgame_handle_host_house_upgrade_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
+    const PCNetGameTxnTag* t = &in->tag;
+    PCNetGameHostPeerState* st;
+    PCNetGameRecSlot* slot;
+    PCNetGameTxnResident* R;
+    const PCNetGameTxnLog* old;
+    Private_c* mir;
+    mHm_hs_c* hs;
+    uint8_t snap[offsetof(mHm_hs_c, floors)]; /* the header (0x00..0x37): every field an op writes */
+    u8 snap_statues;
+    u32 snap_loan, new_loan = 0, snap_rev, snap_lpr;
+    uint32_t hash;
+    unsigned guard;
+    int idx, h, shape_ok, loan_changed = 0;
+    const int op = (int)t->aux_cond;
+    const char* why;
+
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not READY: dropped silently (D3 rule) */
+    }
+    st = &s_host_peer[peer];
+    idx = pcnetgame_rec_gate(peer, 0, 0);
+    if (idx < 0) {
+        pcnetgame_txn_reject(peer, -1, NULL, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_NOT_BOUND, 0, NULL, "peer has no valid resident binding");
+        return;
+    }
+    slot = pcnetgame_rec_slot(idx);
+    if (idx >= PLAYER_NUM) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 0, NULL, "house upgrade: a guest owns no house");
+        return;
+    }
+    if (st->rec_state != PC_NETGAME_RECS_SYNCED || !s_host_world_ready) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0,
+                             st->rec_state != PC_NETGAME_RECS_SYNCED ? (uint8_t)PC_NETGAME_TXN_REASON_NOT_SYNCED : (uint8_t)PC_NETGAME_TXN_REASON_BUSY, 0, NULL,
+                             "resident record not SYNCED / host world not ready");
+        return;
+    }
+    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->slot == 0 && t->item == 0 &&
+               op >= PC_HU_OP_ORDER_SIZE && op <= PC_HU_OP_ACK_BUILT &&
+               (op == PC_HU_OP_ORDER_SIZE ? t->aux_item < (uint16_t)mHm_OUTLOOK_PAL_NUM : t->aux_item == 0);
+    if (!shape_ok) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE, 0, NULL, "malformed HOUSE_UPGRADE TXN_COMMIT");
+        pcnetgame_rec_violation(peer, "malformed HOUSE_UPGRADE TXN_COMMIT (BAD_SHAPE)");
+        return;
+    }
+    /* journal: fence, replay, conflict (identical rules to the other one-phase kinds) */
+    R = &s_txn_res[idx];
+    hash = pcnetgame_fnv1a32(in, sizeof(*in));
+    if (pcnetgame_txn_nonce_fenced(R, t->txn_nonce)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "nonce fenced");
+        return;
+    }
+    if (t->txn_nonce == R->nonce) {
+        old = pcnetgame_txn_journal_find(R, t->txn_nonce, t->txn_seq);
+        if (old != NULL) {
+            if (old->msg_hash != hash) {
+                pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_CONFLICT, 0, NULL, "same (nonce, seq) with different bytes");
+            } else if (old->outcome == (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED) {
+                pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED, "replay ");
+            } else {
+                pcnetgame_txn_send_result(peer, idx, in, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, old->reason, slot->epoch, slot->rev, 0, NULL, 0, 0, "replay ");
+            }
+            return;
+        }
+        if (t->txn_seq <= R->max_seq) {
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "seq at or below the fence");
+            return;
+        }
+    } else {
+        if (R->nonce != 0) {
+            memmove(&R->fenced[0], &R->fenced[1], sizeof(R->fenced) - sizeof(R->fenced[0]));
+            R->fenced[PC_NETGAME_TXN_FENCED_NUM - 1] = R->nonce;
+        }
+        R->nonce = t->txn_nonce;
+        R->head = 0;
+        R->n = 0;
+        R->max_seq = 0;
+    }
+    R->max_seq = t->txn_seq; /* from here on every outcome is journalled */
+
+    /* base + pre-image (the 64-byte pre-image convention of every TXN kind; ACK_BUILT writes the mirror loan) */
+    pcnetgame_rec_refresh_hostfields(idx, slot);
+    if (t->base_epoch != slot->epoch || t->base_rev < R->last_pocket_rev || t->base_rev > slot->rev) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_STALE_IMAGE, 1, NULL, "base (epoch, rev) is stale or from the future");
+        pcnetgame_rec_stale_push(peer, idx, slot, pcnetgame_now_ms());
+        return;
+    }
+    if (pcnetgame_rec_validate_inventory(t->pre_pockets, t->pre_conds, t->pre_wallet) != 0) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE, 1, NULL, "pre-image failed validation");
+        return;
+    }
+    mir = pcnetgame_rec_priv_ptr(idx);
+    h = (mir != NULL && pcnetgame_rec_txn_idx_ok(idx)) ? pcnetgame_mbox_house_of(&mir->player_ID) : -1;
+    if (h < 0 || h >= PLAYER_NUM) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE, 1, NULL, "house upgrade: the resident owns no house on this host");
+        return;
+    }
+    hs = Save_GetPointer(homes[h]);
+    guard = pcnetgame_hu_guard_of(hs);
+    if (guard != (unsigned)t->flags && pcnetgame_hu_already(op, t, hs, mir)) {
+        /* the state already carries exactly this op (a resend after a host restart lost the in-memory journal): answered, never executed twice */
+        pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+        printf("[NET][HOUSEUP] host: peer %d resident %d house %d %s already reflected by the house state -- APPLIED (REPLAYED), nothing changed\n", (int)peer, idx, h,
+               pcnetgame_hu_op_name(op));
+        pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED, "state ");
+        return;
+    }
+    if (st->hup_open || st->rec_push_active) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_HOUSE_BUSY, 1, NULL, "house upgrade: a house / record transfer of this player is in flight");
+        return;
+    }
+    if (guard != (unsigned)t->flags) {
+        printf("[NET][HOUSEUP] host: peer %d resident %d house %d %s: the client's header copy is stale (guard 0x%02X, host 0x%02X)\n", (int)peer, idx, h, pcnetgame_hu_op_name(op),
+               (unsigned)t->flags, guard);
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_HOUSE_CHANGED, 1, NULL, "house upgrade: stale house header (guard)");
+        pcnetgame_house_host_refresh(h, 1); /* make sure the newest header is on its way */
+        return;
+    }
+    why = pcnetgame_hu_precond(op, hs, mir->inventory.loan);
+    if (why != NULL) {
+        printf("[NET][HOUSEUP] host: peer %d resident %d house %d %s NOT ELIGIBLE: %s (size %d next %d renew %d bas_ord %d has_bas %d statue %d loan %u)\n", (int)peer, idx, h,
+               pcnetgame_hu_op_name(op), why, (int)hs->size_info.size, (int)hs->size_info.next_size, (int)hs->size_info.renew, (int)hs->size_info.basement_ordered,
+               (int)hs->flags.has_basement, (int)hs->size_info.statue_ordered, (unsigned)mir->inventory.loan);
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE, 1, NULL, why);
+        return;
+    }
+
+    /* THE write (vanilla's own field writes, on the host's header), then durable, else rolled back */
+    memcpy(snap, hs, sizeof(snap));
+    snap_statues = Save_Get(num_statues);
+    snap_loan = mir->inventory.loan;
+    switch (op) {
+        case PC_HU_OP_ORDER_SIZE: /* aNSC_check_roof_col_order / _order2 */
+            hs->size_info.next_size += 1;
+            hs->ordered_outlook_pal = (u8)t->aux_item;
+            pcnetgame_hu_set_date(hs);
+            break;
+        case PC_HU_OP_ORDER_BASEMENT: /* aNSC_set_make_basement_info */
+            hs->size_info.basement_ordered = TRUE;
+            pcnetgame_hu_set_date(hs);
+            break;
+        case PC_HU_OP_ORDER_STATUE: { /* aNSC_set_talk_info_start_wait: rank = the town's statue count, the count capped at 3 */
+            u8 n = Save_Get(num_statues);
+            hs->size_info.statue_ordered = TRUE;
+            hs->size_info.statue_rank = n;
+            n += 1;
+            if (n >= 4) {
+                n = 3;
+            }
+            Save_Get(num_statues) = n;
+            pcnetgame_hu_set_date(hs);
+            break;
+        }
+        default: /* ACK_BUILT (aNSC_set_talk_info_start_wait) */
+            if (hs->size_info.renew) {
+                const int bas = hs->size_info.basement_ordered ? 1 : 0;
+                hs->size_info.pad_1 = 0;
+                new_loan = (u32)pc_house_upgrade_loan_after_ack((int)hs->size_info.size, bas);
+                if (bas) {
+                    hs->size_info.basement_ordered = FALSE;
+                    hs->size_info.pad_1 = 1;
+                }
+                mir->inventory.loan = new_loan;
+                hs->size_info.renew = FALSE;
+                loan_changed = 1;
+            } else {
+                hs->size_info.statue_ordered = FALSE;
+            }
+            break;
+    }
+    snap_rev = slot->rev;
+    snap_lpr = R->last_pocket_rev;
+    if (loan_changed) {
+        /* the lineage moves BEFORE the durable save: the record sidecar written right after the GCI (pc_net_game_record_after_gci_save) then carries the new rev */
+        slot->rev++;
+        slot->dirty_unsaved = 1;
+        R->last_pocket_rev = slot->rev;
+    }
+    if (!pc_save_write_authoritative_durable()) {
+        memcpy(hs, snap, sizeof(snap));
+        Save_Get(num_statues) = snap_statues;
+        mir->inventory.loan = snap_loan;
+        slot->rev = snap_rev;
+        R->last_pocket_rev = snap_lpr;
+        printf("[NET][HOUSEUP] host: *** the durable save failed: %s of house %d undone, REJECTED FAULT ***\n", pcnetgame_hu_op_name(op), h);
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FAULT, 1, NULL, "house upgrade: the durable save failed");
+        return;
+    }
+    pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+    printf("[NET][HOUSEUP] host: peer %d resident %d house %d %s APPLIED [TXN]: size %d next %d renew %d bas_ord %d has_bas %d statue %d rank %d num_statues %d pal %d "
+           "date %04d-%02d-%02d loan %u%s (saved durably)\n", (int)peer, idx, h, pcnetgame_hu_op_name(op), (int)hs->size_info.size, (int)hs->size_info.next_size,
+           (int)hs->size_info.renew, (int)hs->size_info.basement_ordered, (int)hs->flags.has_basement, (int)hs->size_info.statue_ordered, (int)hs->size_info.statue_rank,
+           (int)Save_Get(num_statues), (int)hs->ordered_outlook_pal, (int)hs->size_info.upgrade_order_date.year, (int)hs->size_info.upgrade_order_date.month,
+           (int)hs->size_info.upgrade_order_date.day, (unsigned)mir->inventory.loan, loan_changed ? " (rev + 1)" : "");
+    if (g_pc_dedicated && op != PC_HU_OP_ACK_BUILT) {
+        pc_dedicated_say("Tom Nook took a house order from resident %d (house %d): %s.", idx, h,
+                         op == PC_HU_OP_ORDER_SIZE ? "a bigger house" : op == PC_HU_OP_ORDER_BASEMENT ? "a basement" : "a statue");
+    }
+    pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
+    (void)pcnetgame_house_host_refresh(h, 1); /* header only: nothing of the floors changed, safe while somebody is inside */
+}
+
+/* HOST, 1 Hz: the construction of a due order (vanilla: only at a game load). TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_REHOUSE_DUE=1 dates every order placed TODAY one year back
+ * (so it is due at once); never active in normal play. */
+static void pcnetgame_hu_host_tick(uint32_t now) {
+    static uint32_t s_next_ms = 0;
+    static uint32_t s_defer_log_ms[PLAYER_NUM];
+    static int s_due_hook = -1;
+    int h;
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready || (uint32_t)(now - s_next_ms) < 1000u) {
+        return;
+    }
+    s_next_ms = now;
+    if (s_due_hook < 0) {
+        const char* e = pc_test_hook_getenv("AC_TEST_REHOUSE_DUE");
+        s_due_hook = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    for (h = 0; h < PLAYER_NUM; h++) {
+        mHm_hs_c* hs = Save_GetPointer(homes[h]);
+        const char* busy;
+        int kind;
+        if (mPr_NullCheckPersonalID(&hs->ownerID) != FALSE) {
+            continue;
+        }
+        if (s_due_hook == 1 && pcnetgame_hu_date_today(hs) &&
+            ((hs->size_info.size != hs->size_info.next_size && hs->size_info.next_size < mHm_HOMESIZE_STATUE) ||
+             (hs->size_info.basement_ordered && !(hs->flags.has_basement && hs->size_info.renew)) ||
+             (hs->size_info.statue_ordered && hs->size_info.next_size != mHm_HOMESIZE_STATUE))) {
+            hs->size_info.upgrade_order_date.year = (u16)(hs->size_info.upgrade_order_date.year - 1u);
+            printf("[NET][HOUSEUP][TEST-ONLY] AC_TEST_REHOUSE_DUE: house %d's order is dated one year back (due now; NOT active in normal play)\n", h);
+        }
+        kind = mHm_PC_RehouseOne(h, 1);
+        if (kind == 0) {
+            continue;
+        }
+        busy = pcnetgame_hu_house_busy(h);
+        if (busy != NULL) {
+            if (s_defer_log_ms[h] == 0 || (uint32_t)(now - s_defer_log_ms[h]) >= 60000u) {
+                s_defer_log_ms[h] = now == 0 ? 1 : now;
+                printf("[NET][HOUSEUP] host: house %d construction is due (%s) but DEFERRED: %s\n", h, kind == 1 ? "size" : kind == 2 ? "basement" : "statue", busy);
+            }
+            continue;
+        }
+        s_defer_log_ms[h] = 0;
+        (void)mHm_PC_RehouseOne(h, 0);
+        printf("[NET][HOUSEUP] host: house %d CONSTRUCTED (%s): size %d next %d renew %d has_bas %d statue %d pal %d -- %s\n", h,
+               kind == 1 ? "size" : kind == 2 ? "basement" : "statue", (int)hs->size_info.size, (int)hs->size_info.next_size, (int)hs->size_info.renew,
+               (int)hs->flags.has_basement, (int)hs->size_info.statue_ordered, (int)hs->outlook_pal,
+               pc_save_write_authoritative_durable() ? "saved durably" : "NOT saved yet (no durable write possible now; the next save keeps it)");
+        if (g_pc_dedicated) {
+            pc_dedicated_say("House %d: Tom Nook's construction is finished (%s).", h, kind == 1 ? "a bigger house" : kind == 2 ? "a basement" : "a statue");
+        }
+        (void)pcnetgame_house_host_refresh(h, 1);
+    }
+}
+
+/* ---- CLIENT ---- (client-only state, never on the wire; deliberately not a PCNet* name: the wire audits pin every PCNet* struct) */
+typedef struct PcngHouseUpgradeOp {
+    uint8_t  active, done, outcome; /* outcome: 1 APPLIED, 2 REJECTED (valid once done) */
+    uint8_t  phase;                 /* 1 AWAIT_CLEAN, 2 transaction begun (s_ctxn) */
+    uint8_t  op, guard, reason;
+    uint16_t arg;
+    uint32_t request_id, started_ms;
+    PCNetGameOwnerStamp owner;
+} PcngHouseUpgradeOp;
+static PcngHouseUpgradeOp s_hu_op;
+static uint8_t       s_hu_last_reason, s_hu_last_sent;
+static int           s_hu_unsupported; /* 1 = the host answered kind 20 with BAD_SHAPE in this session (an old host): never sent again until the next session */
+
+static int pcnetgame_hu_awaiting(void) {
+    return s_hu_op.active && !s_hu_op.done && s_hu_op.phase == 1;
+}
+
+static void pcnetgame_hu_session_reset(void) {
+    if (s_hu_op.active && !s_hu_op.done) {
+        s_hu_op.done = 1;
+        s_hu_op.outcome = 2;
+        s_hu_op.reason = 0; /* a lost link (LINKLOST when it was sent) */
+    }
+    s_hu_unsupported = 0;
+}
+
+static void pcnetgame_hu_op_resolve(uint32_t request_id, int applied, uint8_t reason) {
+    if (!applied && reason == (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE && !s_hu_unsupported) {
+        s_hu_unsupported = 1;
+        printf("[NET][HOUSEUP] client: the host does not know HOUSE_UPGRADE (BAD_SHAPE): house upgrades stay off for this session (old host)\n");
+    }
+    if (s_hu_op.active && !s_hu_op.done && s_hu_op.request_id == request_id) {
+        s_hu_op.done = 1;
+        s_hu_op.outcome = applied ? 1 : 2;
+        s_hu_op.reason = applied ? 0 : reason;
+    }
+}
+
+int pc_house_upgrade_available(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && pcnetgame_hcl_active() && s_up.c_have && !s_hu_unsupported && Now_Private != NULL &&
+           !pcnetgame_client_is_guest_player() && pcnetgame_hcl_own_house() >= 0 && pcnetgame_hcl_own_house() < PLAYER_NUM && s_crec.state == PC_NETGAME_CRS_SYNCED &&
+           !s_crec.up_blocked;
+}
+
+int pc_house_upgrade_begin(int op, int arg) {
+    PCNetGameOwnerStamp stamp;
+    const mHm_hs_c* hs;
+    if (s_hu_op.active && s_hu_op.done) {
+        memset(&s_hu_op, 0, sizeof(s_hu_op)); /* the unconsumed result of an abandoned dialogue */
+    }
+    s_hu_last_reason = 0;
+    s_hu_last_sent = 0;
+    if (!pc_house_upgrade_available() || op < PC_HU_OP_ORDER_SIZE || op > PC_HU_OP_ACK_BUILT || arg < 0 || arg > 0xFFFF ||
+        (op == PC_HU_OP_ORDER_SIZE && arg >= (int)mHm_OUTLOOK_PAL_NUM)) {
+        return 0;
+    }
+    if (s_hu_op.active || pcnetgame_txn_begin_blocked() || s_ts_op.active || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return -1;
+    }
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        return 0;
+    }
+    hs = Save_GetPointer(homes[pcnetgame_hcl_own_house()]);
+    memset(&s_hu_op, 0, sizeof(s_hu_op));
+    s_hu_op.active = 1;
+    s_hu_op.phase = 1;
+    s_hu_op.op = (uint8_t)op;
+    s_hu_op.arg = (uint16_t)(op == PC_HU_OP_ORDER_SIZE ? arg : 0);
+    s_hu_op.guard = (uint8_t)pcnetgame_hu_guard_of(hs);
+    s_hu_op.request_id = s_ts_next_rid++;
+    s_hu_op.started_ms = pcnetgame_now_ms();
+    s_hu_op.owner = stamp;
+    s_crec.next_check_ms = 0; /* nudge: the dirty check (and its upload) runs on the next poll */
+    printf("[NET][HOUSEUP] client: begin %s request=%u arg=%u guard=0x%02X (house %d: size %d next %d renew %d bas_ord %d has_bas %d statue %d; loan %u) -- awaiting a clean record\n",
+           pcnetgame_hu_op_name(op), (unsigned)s_hu_op.request_id, (unsigned)s_hu_op.arg, (unsigned)s_hu_op.guard, pcnetgame_hcl_own_house(), (int)hs->size_info.size,
+           (int)hs->size_info.next_size, (int)hs->size_info.renew, (int)hs->size_info.basement_ordered, (int)hs->flags.has_basement, (int)hs->size_info.statue_ordered,
+           (unsigned)Now_Private->inventory.loan);
+    return 1;
+}
+
+int pc_house_upgrade_poll(void) {
+    int r;
+    if (!s_hu_op.active) {
+        return PC_NETGAME_TS_OP_REJECTED;
+    }
+    if (!s_hu_op.done) {
+        if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+            s_hu_last_reason = 0;
+            s_hu_last_sent = s_hu_op.phase >= 2 ? 1 : 0;
+            memset(&s_hu_op, 0, sizeof(s_hu_op));
+            return PC_NETGAME_TS_OP_REJECTED;
+        }
+        return PC_NETGAME_TS_OP_PENDING;
+    }
+    r = (s_hu_op.outcome == 1) ? PC_NETGAME_TS_OP_APPLIED : PC_NETGAME_TS_OP_REJECTED;
+    s_hu_last_reason = s_hu_op.reason;
+    s_hu_last_sent = s_hu_op.phase >= 2 ? 1 : 0;
+    memset(&s_hu_op, 0, sizeof(s_hu_op));
+    return r;
+}
+
+int pc_house_upgrade_last_reason(void) {
+    return (int)s_hu_last_reason;
+}
+
+int pc_house_upgrade_last_sent(void) {
+    return (int)s_hu_last_sent;
+}
+
+static void pcnetgame_hu_reject_local(const char* why) {
+    printf("[NET][HOUSEUP] client: %s request %u refused locally: %s -- nothing sent, nothing changed\n", pcnetgame_hu_op_name((int)s_hu_op.op), (unsigned)s_hu_op.request_id, why);
+    s_hu_op.done = 1;
+    s_hu_op.outcome = 2;
+    s_hu_op.reason = 0;
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, client): AC_TEST_HOUSE_UPGRADE_SEQ=<op>[:<arg>],... drives the REAL client path (pc_house_upgrade_begin / _poll -> AWAIT_CLEAN -> kind 20 ->
+ * TXN_RESULT -> the apply) without the Nook GUI, one op after the other: an ACK_BUILT (4) first waits (<= 120 s) until the house canon says something was built; op 9 pays the
+ * loan off locally (the post office's write; the D3 upload carries it). Never active in normal play. */
+#ifdef PC_NET_TEST_HOOKS
+static void pcnetgame_hu_test_hook(void) {
+    static int s_stage = -1, s_pos = 0, s_wait_logged = 0;
+    static uint32_t s_t0 = 0;
+    static int s_ops[8], s_args[8], s_n = 0;
+    const char* e;
+    uint32_t now;
+    int r;
+    if (s_stage == -1) {
+        const char* p;
+        s_stage = -2;
+        e = pc_test_hook_getenv("AC_TEST_HOUSE_UPGRADE_SEQ");
+        if (e == NULL) {
+            return;
+        }
+        for (p = e; *p != '\0' && s_n < 8;) {
+            char* q;
+            long op = strtol(p, &q, 10), arg = 0;
+            if (q == p) {
+                break;
+            }
+            if (*q == ':') {
+                arg = strtol(q + 1, &q, 10);
+            }
+            s_ops[s_n] = (int)op;
+            s_args[s_n] = (int)arg;
+            s_n++;
+            p = (*q == ',') ? q + 1 : q;
+        }
+        printf("[NET][HOUSEUP][TEST-ONLY] AC_TEST_HOUSE_UPGRADE_SEQ=%s: %d op(s) (NOT active in normal play)\n", e, s_n);
+        s_stage = 0;
+    }
+    if (s_stage < 0 || s_pos >= s_n || s_role != PC_NETGAME_ROLE_CLIENT || !pcnetgame_client_record_synced() || !pcfa_save_ready() || Now_Private == NULL) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_stage == 0) {
+        const int h = pcnetgame_hcl_own_house();
+        if (!pc_house_upgrade_available() || (uint32_t)(now - s_crec.adopt_ms) < 4000u || h < 0) {
+            return;
+        }
+        if (s_ops[s_pos] == 9) {
+            /* op 9 = the hook's one LOCAL test write: the loan is paid off (what the post office does); the D3 upload carries it, the next op's AWAIT_CLEAN waits for it */
+            printf("[NET][HOUSEUP][TEST-ONLY] op %d: the local loan %u is paid off (TEST-ONLY local write, NOT active in normal play)\n", s_pos, (unsigned)Now_Private->inventory.loan);
+            Now_Private->inventory.loan = 0;
+            s_crec.next_check_ms = 0;
+            s_pos++;
+            return;
+        }
+        if (s_ops[s_pos] == PC_HU_OP_ACK_BUILT) {
+            const mHm_hs_c* hs = Save_GetPointer(homes[h]);
+            if (!hs->size_info.renew && !(hs->size_info.statue_ordered && hs->size_info.next_size == mHm_HOMESIZE_STATUE)) {
+                if (s_t0 == 0) {
+                    s_t0 = now;
+                }
+                if (!s_wait_logged) {
+                    s_wait_logged = 1;
+                    printf("[NET][HOUSEUP][TEST-ONLY] waiting for the construction (the host's canon of house %d)\n", h);
+                }
+                if ((uint32_t)(now - s_t0) < 120000u) {
+                    return;
+                }
+            }
+        }
+        r = pc_house_upgrade_begin(s_ops[s_pos], s_args[s_pos]);
+        printf("[NET][HOUSEUP][TEST-ONLY] op %d (%s) arg %d begin -> %d\n", s_pos, pcnetgame_hu_op_name(s_ops[s_pos]), s_args[s_pos], r);
+        if (r == 1) {
+            s_stage = 1;
+        } else if (r == 0) {
+            s_pos++;
+        }
+        return;
+    }
+    r = pc_house_upgrade_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return;
+    }
+    {
+        const int h = pcnetgame_hcl_own_house();
+        const mHm_hs_c* hs = h >= 0 ? Save_GetPointer(homes[h]) : NULL;
+        printf("[NET][HOUSEUP][TEST-ONLY] op %d (%s) -> %s reason %d sent %d; local loan %u; local house size %d next %d renew %d statue %d\n", s_pos,
+               pcnetgame_hu_op_name(s_ops[s_pos]), r == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED", pc_house_upgrade_last_reason(), pc_house_upgrade_last_sent(),
+               (unsigned)Now_Private->inventory.loan, hs ? (int)hs->size_info.size : -1, hs ? (int)hs->size_info.next_size : -1, hs ? (int)hs->size_info.renew : -1,
+               hs ? (int)hs->size_info.statue_ordered : -1);
+    }
+    s_pos++;
+    s_stage = 0;
+    s_t0 = 0;
+    s_wait_logged = 0;
+}
+#endif
+
+static void pcnetgame_hu_client_tick(void) {
+    uint32_t now;
+#ifdef PC_NET_TEST_HOOKS
+    pcnetgame_hu_test_hook();
+    pcnetgame_clear_errands_test_hook(); /* TEST-ONLY AC_TEST_CLEAR_ERRANDS on a CLIENT too: a fixture resident still in the first job never gets Nook's rehouse talk */
+#endif
+    if (!s_hu_op.active || s_hu_op.done || s_hu_op.phase != 1) {
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return; /* pc_house_upgrade_poll() reports the lost link */
+    }
+    now = pcnetgame_now_ms();
+    if ((uint32_t)(now - s_hu_op.started_ms) >= PCNG_HU_CLEAN_TIMEOUT_MS) {
+        pcnetgame_hu_reject_local("the record did not become clean within the bounded wait");
+        return;
+    }
+    if (Now_Private == NULL || !pcfa_save_ready()) {
+        return;
+    }
+    if (!pcnetgame_owner_stamp_matches(&s_hu_op.owner)) {
+        pcnetgame_hu_reject_local("the local player / save changed");
+        return;
+    }
+    if (s_crec.up_blocked) {
+        pcnetgame_hu_reject_local("record uploads are stopped (the host refused an upload)");
+        return;
+    }
+    if (!pcnetgame_mail_state_clean() || pcnetgame_txn_busy() || (s_mail_op.active && !s_mail_op.done) || (s_take_op.active && !s_take_op.done) ||
+        pcnetgame_house_client_txn_blocked() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return;
+    }
+    printf("[NET][HOUSEUP] client: record is clean after %u ms -- beginning the %s transaction\n", (unsigned)(now - s_hu_op.started_ms), pcnetgame_hu_op_name((int)s_hu_op.op));
+    s_hu_op.phase = 2;
+    memset(&s_ctxn, 0, sizeof(s_ctxn));
+    s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
+    s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE;
+    s_ctxn.slot = 0;
+    s_ctxn.item = 0;
+    s_ctxn.ts_aux = s_hu_op.op;
+    s_ctxn.ts_aux_item = s_hu_op.arg;
+    s_ctxn.take_dst = s_hu_op.guard; /* travels as tag.flags (see pcnetgame_txn_try_send) */
+    s_ctxn.request_id = s_hu_op.request_id;
+    s_ctxn.owner = s_hu_op.owner;
+    s_ctxn.first_ms = now;
+    (void)pcnetgame_txn_try_send();
+}
+
+/* APPLIED: an ORDER_* changes nothing locally (the header comes with the house canon); an ACK_BUILT of a renew sets the local loan to the SAME deterministic value the host
+ * wrote into its mirror (from the guard the request carried), then the record base moves to the host's lineage point. */
+static int pcnetgame_txn_apply_house_upgrade(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+    const PCNetGameTxnTag* t = &T->tag;
+    const unsigned g = t->flags;
+    Private_c* np = Now_Private;
+    if (np == NULL) {
+        return 0;
+    }
+    if (t->aux_cond == (uint8_t)PC_HU_OP_ACK_BUILT && (g & 0x10u)) {
+        const u32 loan = (u32)pc_house_upgrade_loan_after_ack((int)(g & 7u), (g & 0x20u) ? 1 : 0);
+        printf("[NET][HOUSEUP] client: ACK_BUILT APPLIED%s -- the loan is now %u (was %u)\n", in->reason == (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED ? " (replayed)" : "",
+               (unsigned)loan, (unsigned)np->inventory.loan);
+        np->inventory.loan = loan;
+    } else {
+        printf("[NET][HOUSEUP] client: %s APPLIED%s -- the house header arrives with the host's house canon\n", pcnetgame_hu_op_name((int)t->aux_cond),
+               in->reason == (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED ? " (replayed)" : "");
+    }
+    if (in->host_session == s_crec.base_session && in->epoch == s_crec.base_epoch && in->rev > s_crec.base_rev) {
+        pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
+        s_crec.next_check_ms = 0;
+    }
+    return 1;
+}
+/* ===== HOUSE UPGRADE END ===== */
+
 /* ===== SHOP UPGRADE BEGIN: the announced 5-minute shop upgrade (multiplayer; pc_shop_upgrade.h, docs "Shop upgrade: announced 5-minute closure") =====
  * HOST: the state machine IDLE -> PENDING -> CLOSED -> RENEWING -> IDLE (see pc_shop_upgrade.h), its restart file (shop_upgrade.ini next to shop_restock.ini: written before the
  * closure is published, atomically replaced, removed after the renewal was saved), the renewal (the vanilla body: through a town reload when the host is in the town scene, directly
@@ -43393,6 +45306,10 @@ extern int aSL_PC_ShopFootprint(int level, int* acre, int* struct_tile, int* til
 extern int pc_town_shop_structure_patch(int level);   /* pc_m_card.c */
 extern int pc_town_same_position_reload(const char* why); /* pc_m_card.c */
 extern int pc_save_write_authoritative_durable(void);  /* pc_m_card.c */
+extern int pc_host_renewshop_reload_count(void);       /* pc_m_card.c (worker C): renewal reloads really issued */
+static int      s_shopup_armed_reloads = 0;            /* worker C: pc_host_renewshop_reload_count() when the current attempt was armed */
+static uint32_t s_shopup_wait_log_ms = 0;              /* worker C: the "renewal waits for the town reload" log throttle */
+static void pcnetgame_shopup_guest_leaflets(void);     /* worker C: the reopening leaflet for the guests (defined after pcnetgame_shopup_finish) */
 
 #define PCNG_SHOPUP_REQ_TIMEOUT_MS 5000u
 #define PCNG_SHOPUP_NOTICE_MS 8000u
@@ -43625,6 +45542,7 @@ static void pcnetgame_shopup_finish(const char* how) {
     s_up.event_armed_ms = 0;
     pcnetgame_shopup_publish_acre(level);
     mSP_SetRenewalChiraswhi_AppoDay(); /* the vanilla reopening leaflet (upgrading_today + the event off), at once instead of at the next town frame */
+    pcnetgame_shopup_guest_leaflets(); /* worker C: the same leaflet for the guests (no house mailbox: their host-held post office mailbox) */
     printf("[NET][SHOPUP] host: the shop was upgraded (%s): level %d (%s), the shop is OPEN again\n", how, level, pcnetgame_shopup_level_name(level));
     if (g_pc_dedicated) {
         pc_dedicated_say("Nook's shop was upgraded to %s and is open again.", pcnetgame_shopup_level_name(level));
@@ -43638,6 +45556,41 @@ static void pcnetgame_shopup_finish(const char* how) {
         pcnetgame_shopup_file_remove();
     } else {
         printf("[NET][SHOPUP] host: the renewed shop is NOT saved yet (no durable write possible now): shop_upgrade.ini is kept until the next start sees the new level\n");
+    }
+}
+
+/* worker C: the vanilla reopening leaflet (mSP_SetRenewalChiraswhi_AppoDay goes to every HOUSE mailbox, which reaches the residents through MAILBOX_LETTER) built the same way
+ * for every guest that receives town letters, into its host-held mailbox (house 0xFF on its client); the guest store is written at once. Once per upgrade (the finish runs once). */
+#include "m_handbill.h" /* mHandbill_Load_HandbillFromRom */
+static void pcnetgame_shopup_guest_leaflets(void) {
+    static const int idx_appoday[mSP_SHOP_TYPE_NUM] = { 0x1B, 0x1B, 0x1C, 0x1D }; /* == mSP_SetRenewalChiraswhi_AppoDay's table (by the new shop level) */
+    const int lvl = mSP_GetShopLevel();
+    int g, n = 0;
+    if (s_role != PC_NETGAME_ROLE_HOST || !pcnetgame_guest_mail_enabled()) {
+        return;
+    }
+    for (g = 0; g < s_guest_cap; g++) {
+        Mail_c leaflet;
+        int hb = 0;
+        if (!pcnetgame_guest_mail_target(g)) {
+            continue;
+        }
+        mMl_clear_mail(&leaflet);
+        mHandbill_Load_HandbillFromRom(leaflet.content.header, &hb, leaflet.content.footer, leaflet.content.body, idx_appoday[(lvl >= 0 && lvl < mSP_SHOP_TYPE_NUM) ? lvl : 0]);
+        leaflet.content.font = mMl_FONT_RECV;
+        leaflet.content.header_back_start = (u8)hb;
+        leaflet.content.mail_type = mMl_TYPE_SHOP_SALE_LEAFLET;
+        leaflet.content.paper_type = ITM_PAPER55;
+        mPr_CopyPersonalID(&leaflet.header.recipient.personalID, &s_guest[g].key);
+        leaflet.header.recipient.type = mMl_NAME_TYPE_PLAYER;
+        if (pcnetgame_guest_mbox_deliver(g, &leaflet, "the shop's reopening leaflet")) {
+            (void)pcnetgame_guest_mbox_refresh(g);
+            n++;
+        }
+    }
+    if (n > 0) {
+        printf("[NET][SHOPUP] host: the reopening leaflet went into %d guest mailbox(es)\n", n);
+        (void)pcnetgame_guest_store_write("shop upgrade leaflet");
     }
 }
 
@@ -43717,7 +45670,18 @@ static void pcnetgame_shopup_renew_tick(uint32_t now) {
     }
     scene = (int)play->scene_id;
     if (scene == SCENE_FG && pcfa_scene_is_town()) {
+        if (s_up.event_armed_ms != 0 && (uint32_t)(now - s_up.event_armed_ms) >= PCNG_SHOPUP_RELOAD_RETRY_MS && pc_host_renewshop_reload_count() == s_shopup_armed_reloads) {
+            /* worker C: no reload was issued yet for this attempt (the listen host's player is busy in a menu / talk, or a player is still inside a shop): that is
+             * waiting, not a failed attempt -- a busy host player must never cost the town its upgrade. Logged once a minute. */
+            if (s_shopup_wait_log_ms == 0 || (uint32_t)(now - s_shopup_wait_log_ms) >= 60000u) {
+                s_shopup_wait_log_ms = now | 1u;
+                printf("[NET][SHOPUP] host: the renewal waits for the town reload (the host player is busy / a player is inside a shop); attempt %d is still pending\n",
+                       s_up.reload_tries + 1);
+            }
+            return;
+        }
         if (s_up.event_armed_ms == 0 || (uint32_t)(now - s_up.event_armed_ms) >= PCNG_SHOPUP_RELOAD_RETRY_MS) {
+            s_shopup_armed_reloads = pc_host_renewshop_reload_count(); /* the reload counter at THIS arming: an attempt only counts once a reload was really issued */
             if (s_up.event_armed_ms != 0 && ++s_up.reload_tries >= PCNG_SHOPUP_RELOAD_TRIES) {
                 printf("[NET][SHOPUP] host: *** the renewal did not happen after %d town reload attempt(s): the shop REOPENS without the upgrade (it is not offered again in this host run) ***\n",
                        s_up.reload_tries);
@@ -43746,6 +45710,21 @@ static void pcnetgame_shopup_renew_tick(uint32_t now) {
         return; /* the host's own player is still inside (being shown out) */
     }
     /* the host's player is indoors elsewhere (a listen host in a house, the museum...): no live town actor exists, the save holds the town field */
+    {
+        /* worker C: like the in-town reload (pc_host_renewshop_poll), never while a player still stands inside a shop building (being shown out): the old interior must not
+         * meet the new shop level / lineup */
+        int p;
+        for (p = 0; p < pcnetgame_peer_span(); p++) {
+            PCNetPlayerScene psc;
+            if (s_host_peer_link[p] == PC_NETGAME_LINK_READY && pc_remote_player_get_scene((PCNetPlayerId)p, &psc) && psc.valid && pcnetgame_shopup_scene_is_shop((int)psc.scene_id)) {
+                if (s_shopup_wait_log_ms == 0 || (uint32_t)(now - s_shopup_wait_log_ms) >= 60000u) {
+                    s_shopup_wait_log_ms = now | 1u;
+                    printf("[NET][SHOPUP] host: the direct renewal waits: peer %d is still inside a shop building\n", p);
+                }
+                return;
+            }
+        }
+    }
     if (aSL_PC_RenewShopDirect()) {
         pcnetgame_shopup_finish("renewed directly on the save while the host player is not in the town");
     } else if (s_up.event_armed_ms == 0) {
@@ -43804,6 +45783,7 @@ static void pcnetgame_shopup_host_tick(uint32_t now) {
             if (g_pc_dedicated) {
                 pc_dedicated_say("The town qualifies for %s: Tom Nook announces the upgrade to the next player who talks to him.", pcnetgame_shopup_level_name(real));
             }
+            pcnetgame_shopup_notice_set(3, 0); /* worker C: the listen host's own player is told too (Nook only announces to whoever talks to him) */
             pcnetgame_shopup_publish_state();
         } else if (s_up.state == PC_SHOP_UPGRADE_PENDING && (!qualifies || real != s_up.target_level)) {
             printf("[NET][SHOPUP] host: the pending upgrade %u no longer applies (level %d, qualifying %d): IDLE\n", (unsigned)s_up.gen, level, real);
@@ -43937,7 +45917,9 @@ static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob) {
     if (!s_up.c_enabled) {
         return;
     }
-    if (s_up.c_state == PC_SHOP_UPGRADE_CLOSED && (prev_state != PC_SHOP_UPGRADE_CLOSED || prev_gen != s_up.c_gen)) {
+    if (s_up.c_state == PC_SHOP_UPGRADE_PENDING && (prev_state != PC_SHOP_UPGRADE_PENDING || prev_gen != s_up.c_gen)) {
+        pcnetgame_shopup_notice_set(3, 0); /* worker C: every player learns that Nook has news (only the one who talks to him hears the announcement) */
+    } else if (s_up.c_state == PC_SHOP_UPGRADE_CLOSED && (prev_state != PC_SHOP_UPGRADE_CLOSED || prev_gen != s_up.c_gen)) {
         pcnetgame_shopup_notice_set(1, (int)s_up.c_min_left);
     } else if (s_up.c_state == PC_SHOP_UPGRADE_IDLE && (prev_state == PC_SHOP_UPGRADE_CLOSED || prev_state == PC_SHOP_UPGRADE_RENEWING)) {
         pcnetgame_shopup_notice_set(2, 0);
@@ -44128,6 +46110,8 @@ int pc_shop_upgrade_notice(char* line, int cap) {
     if (s_up.notice_kind == 1) {
         const int m = s_up.notice_minutes < 1 ? 1 : s_up.notice_minutes;
         snprintf(line, (size_t)cap, "Nook's shop is closed for %d minute%s for an upgrade", m, m == 1 ? "" : "s");
+    } else if (s_up.notice_kind == 3) {
+        snprintf(line, (size_t)cap, "Tom Nook has news about his shop: go talk to him!"); /* worker C: PENDING */
     } else {
         snprintf(line, (size_t)cap, "Nook's shop has been upgraded and is open again!");
     }

@@ -35,6 +35,7 @@
 #include "lb_rtc.h"
 #include "game.h"
 #include "pc_net_game.h"
+#include "pc_museum_net.h" /* worker B: pc_net_game_museum_promote (guest donor re-attribution at promotion) */
 #include "pc_residence.h" /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES (lifecycle hardening) */
 #include "pc_session.h" /* M2: pc_session() = a STORE character (characters/<uuid>/character.ini) instead of a legacy guest profile file */
 #include "pc_guest_profile.h" /* Guests G3.2: PCGuestProfile / pc_guest_profile_load_or_create (the title-menu "Join as Guest" item) */
@@ -1691,6 +1692,7 @@ static struct {
     mFR_record_c fish[mFR_RECORD_NUM]; /* lifecycle hardening: fish records re-keyed defensively (rolled back with the rest) */
     PostOffice_c post_office;          /* guest mailbox: letters that did not fit the new house mailbox go to the post office (rolled back with the rest);
                                         * the house mailbox itself is part of `home` */
+    mMmd_info_c museum_display;        /* worker B: the guest's attributed exhibits (donor nibble 5) are re-credited to the new resident (rolled back with the rest) */
 } s_pc_promote_snap;
 
 void pc_mp_promote_rollback(void);
@@ -1926,6 +1928,7 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
     s_pc_promote_snap.island_animal = Save_Get(island).animal;
     memcpy(s_pc_promote_snap.fish, Save_Get(fishRecord), sizeof(s_pc_promote_snap.fish));
     s_pc_promote_snap.post_office = Save_Get(post_office);
+    s_pc_promote_snap.museum_display = Save_Get(museum_display); /* worker B */
 
     mPr_ClearPrivateInfo(priv);
     mPr_InitPrivateInfo(priv);
@@ -1998,6 +2001,9 @@ int pc_mp_promote_create(const void* guest_rec, const void* guest_key, int slot,
         printf("[PC] migrate: guest mailbox letters=%d -> house mailbox %d, post office %d, carried letters %d\n", moved, th, tp, tm);
         remapped += moved;
     }
+    /* worker B: the museum exhibits the host attributed to this guest (museum_donors.dat, donor nibble 5) are now the new resident's (nibble slot + 1): plaques and Blathers
+     * name the resident. Covered by the snapshot above (pc_mp_promote_rollback restores the 63 bytes). */
+    remapped += pc_net_game_museum_promote(gkey, slot);
     printf("[PC] M-F promote: resident slot %d created for '%.8s' (gender %d, face %d%s, player id 0x%04X), house %d assigned (arrangement 0x%02X), loan %u, pockets/wallet/bank carried over, %d PID-keyed / carried items migrated (see the [PC] migrate line)\n",
            slot, (const char*)priv->player_ID.player_name, (int)priv->gender, (int)priv->face, face_ok ? "" : " (the guest's face is worn by another resident: vanilla unique face kept)",
            (unsigned)priv->player_ID.player_id, house, (unsigned)Save_Get(house_arrangement), (unsigned)priv->inventory.loan, remapped);
@@ -2019,6 +2025,7 @@ void pc_mp_promote_rollback(void) {
     Save_Get(island).animal = s_pc_promote_snap.island_animal;
     memcpy(Save_Get(fishRecord), s_pc_promote_snap.fish, sizeof(s_pc_promote_snap.fish));
     Save_Get(post_office) = s_pc_promote_snap.post_office; /* guest mailbox: overflow letters handed to the post office */
+    Save_Get(museum_display) = s_pc_promote_snap.museum_display; /* worker B: re-attributed exhibits */
     memset(&s_pc_promote_snap, 0, sizeof(s_pc_promote_snap));
     printf("[PC] M-F promote: the in-memory change was ROLLED BACK\n");
 }
@@ -2631,6 +2638,11 @@ static int pc_server_generate_town(GAME_PLAY* play) {
  * the upgrade can really happen (a shop block exists, the qualifying level differs) and nobody is inside a shop building, the host does ONE same-position
  * SCENE_FG reload (the observer-init / G3.3 look-reload goto_other_scene path) so the vanilla actor ct performs the renewal. Idempotent: at most one reload
  * per renewal_time value (no loop if the renewal still does not happen). Never writes shop_level / renewal_time / the event itself. */
+static int s_pc_renewshop_reloads = 0; /* worker C: how many renewal reloads were really issued (the shop upgrade counts a failed attempt only after one) */
+int pc_host_renewshop_reload_count(void) {
+    return s_pc_renewshop_reloads;
+}
+
 static int pc_host_renewshop_scene_is_shop(int scene) {
     return scene == SCENE_SHOP0 || scene == SCENE_CONVENI || scene == SCENE_SUPER || scene == SCENE_DEPART || scene == SCENE_DEPART_2;
 }
@@ -2754,6 +2766,7 @@ static void pc_host_renewshop_poll(void) {
         l_key = renew_time;
         l_have_key = 1;
         l_verify = 1;
+        s_pc_renewshop_reloads++;
     }
 }
 
