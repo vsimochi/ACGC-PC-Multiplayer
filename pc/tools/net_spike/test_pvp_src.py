@@ -78,8 +78,8 @@ def main():
     check("W PCPvpHitMsg pinned: %s" % norm(hit),
           norm(hit) == "uint8_t msg_type; uint8_t attacker; uint8_t tool; uint8_t reaction; int16_t knock_angle; uint16_t seq; float knock_speed;")
     check("W size asserts 16 / 12", "_Static_assert(sizeof(PCPvpHitReqMsg) == 16," in ph and "_Static_assert(sizeof(PCPvpHitMsg) == 12," in ph)
-    check("W tool / reaction values pinned (axe 1, shovel 2, net 3; tumble 1, shock 2)",
-          "PC_PVP_TOOL_AXE = 1, PC_PVP_TOOL_SHOVEL = 2, PC_PVP_TOOL_NET = 3" in ph and "PC_PVP_REACT_TUMBLE = 1, PC_PVP_REACT_SHOCK = 2" in ph)
+    check("W tool / reaction values pinned (axe 1, shovel 2, net 3; tumble 1, shock 2, flinch 3)",
+          "PC_PVP_TOOL_AXE = 1, PC_PVP_TOOL_SHOVEL = 2, PC_PVP_TOOL_NET = 3" in ph and "PC_PVP_REACT_TUMBLE = 1, PC_PVP_REACT_SHOCK = 2, PC_PVP_REACT_FLINCH = 3" in ph)
     kinds = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_KIND_\w+\s+(\d+)u", gc)]
     reasons = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_REASON_\w+\s+(\d+)u", gc)]
     check("W no new TXN kind (max %s <= 20) / reason (max %s <= 47)" % (max(kinds) if kinds else None, max(reasons) if reasons else None),
@@ -110,9 +110,21 @@ def main():
     check("V the pre / post hooks run from the player's own move (Player_actor_move_other_func1)",
           re.search(r"static void Player_actor_move_other_func1\(ACTOR\* actor, GAME\* game\) \{\s*#ifdef TARGET_PC\s*Player_actor_pc_pvp_pre\(actor, game\);.*?Player_actor_change_proc_index\(actor, game\);\s*#ifdef TARGET_PC\s*Player_actor_pc_pvp_post\(actor, game\);", mof, re.S))
     pre = block(mp, "static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game) {", "\n}\n")
-    check("V the victim requests the REAL tumble / shock (start time 0) and passes the balloon state",
-          "Player_actor_request_main_tumble(game, mPlayer_REQUEST_PRIORITY_14)" in pre and "Player_actor_request_main_shock_all(game, 0.0f, face, FALSE, FALSE" in pre
+    check("V the victim requests the REAL tumble / shock (start time 0) / flinch (STUNG_MOSQUITO + the PvP label) and passes the balloon state",
+          "Player_actor_request_main_tumble(game, mPlayer_REQUEST_PRIORITY_14)" in pre
+          and "Player_actor_request_main_shock_all(game, 0.0f, actorx->shape_info.rotation.y, FALSE, FALSE" in pre
+          and "requested_main_index_data.stung_mosquito.label = PC_PVP_FLINCH_LABEL" in pre and "Player_actor_request_main_index(game, mPlayer_INDEX_STUNG_MOSQUITO" in pre
           and "mPlayer_ITEM_IS_BALLOON(player->item_kind)" in pre)
+    check("V SHOCK / FLINCH never turn the victim: the shock target angle is its OWN facing; the host angle (face) is unused",
+          "(void)face;" in pre and not re.search(r"shock_all\(game, 0\.0f, face", pre))
+    check("V the shovel SHOCK is held to PC_PVP_SHOCK_FRAMES (stronger than the flinch)", "player->main_data.shock.end_time = PC_PVP_SHOCK_FRAMES;" in mp
+          and "#define PC_PVP_SHOCK_FRAMES 84.0f" in ph)
+    smq = rd("src/game/m_player_main_stung_mosquito.c_inc")
+    check("V the PvP flinch ends in WAIT, never in the NOTICE_MOSQUITO dialogue",
+          re.search(r"#ifdef TARGET_PC\s*if \(stung_mosquito_p->label == PC_PVP_FLINCH_LABEL\) \{.*?Player_actor_request_main_wait_all\(game.*?return;\s*\}\s*#endif\s*Player_actor_request_main_notice_mosquito", smq, re.S))
+    check("V reactions per tool: axe TUMBLE, shovel SHOCK, net FLINCH (distinct states 11 / 99 / 107)",
+          "(m->tool == PC_PVP_TOOL_AXE) ? PC_PVP_REACT_TUMBLE : (m->tool == PC_PVP_TOOL_SHOVEL ? PC_PVP_REACT_SHOCK : PC_PVP_REACT_FLINCH)" in pcs
+          and "PC_PVP_IDX_STUNG_MOSQUITO = 107" in ph and "(int)PC_PVP_IDX_STUNG_MOSQUITO == (int)mPlayer_INDEX_STUNG_MOSQUITO" in gc)
     ok_fn = block(pcs, "int pc_pvp_victim_state_ok(int i) {", "\n}\n")
     cases = re.findall(r"case (PC_PVP_IDX_\w+):", ok_fn)
     check("V the allowlist is exactly WAIT / WALK / RUN / DASH / TURN_DASH / READY_NET / READY_WALK_NET (%s)" % cases,
@@ -134,8 +146,22 @@ def main():
         check("C no item / pocket / wallet / axe-wear / field write in %s (%s)" % (name, bad), not bad)
 
     # ---- R row
+    check("R the puppet FLINCH row (STUNG_MOSQUITO: MOSQUITO1 STOP) exists",
+          '[mPlayer_INDEX_STUNG_MOSQUITO] = PCROW_ITEM("stung_mosquito", mPlayer_ANIM_MOSQUITO1' in rp)
     check("R the puppet SHOCK row: GAAAN1 STOP -> chain GAAAN2",
           '[mPlayer_INDEX_SHOCK] = PCROW_ITEM("shock", mPlayer_ANIM_GAAAN1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1, mPlayer_ANIM_GAAAN2, PC_NETANG_RESET)' in rp)
+
+    # ---- F face / sound of the reactions on the other players' puppets (no wire change)
+    check("F the puppet face is derived from its own clip + frame (the vanilla eye / mouth tex-anim tables), not fixed to pattern 0",
+          "static void pc_remote_player_face_pattern(" in rp and "mPlib_Get_PlayerEyeTexAnimation_p(a0)" in rp and "mPlib_Get_PlayerMouthTexAnimation_p(a0)" in rp
+          and "pc_remote_player_face_pattern(self, &eye, &mouth);" in rp and "eye_tex_p = (u8*)appearance->face_tex + 0 * 0x100;" not in rp)
+    check("F the SHOCK GAAAN2 constant face (eye 6 / mouth 5) is reproduced",
+          re.search(r"case mPlayer_INDEX_SHOCK:\s*if \(a0 == mPlayer_ANIM_GAAAN2\) \{\s*ce = 6;\s*cm = 5;", rp))
+    check("F the puppet SHOCK row spawns the vanilla shock effect at frame 5 (its own SE 0x2D at the puppet)",
+          '{ PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_SHOCK, 5.0f, "shock", 0, PC_TFL_ATTR0 }' in rp)
+    check("F the puppet STUNG_MOSQUITO row plays the sting SE NA_SE_6A on entry, and the PvP flinch victim plays it locally",
+          '{ PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_6A, 0.0f, "flinch_6a", 0, 0 }' in rp and "sAdo_OngenTrgStart(NA_SE_6A, &actorx->world.position);" in mp)
+    check("F no new message id for the face / sound sync (max id still 92)", max(wire_baseline.c_message_ids_raw(gc), key=lambda x: x[1])[1] == 92)
 
     # ---- T misc
     check("T pc_pvp_authority.c is in the game build", "src/pc_pvp_authority.c" in cm)

@@ -9704,7 +9704,7 @@ _Static_assert((int)PC_PVP_IDX_SWING_AXE == (int)mPlayer_INDEX_SWING_AXE && (int
                (int)PC_PVP_IDX_SWING_NET == (int)mPlayer_INDEX_SWING_NET && (int)PC_PVP_IDX_PULL_NET == (int)mPlayer_INDEX_PULL_NET && (int)PC_PVP_IDX_STOP_NET == (int)mPlayer_INDEX_STOP_NET,
                "pvp: axe / net indexes");
 _Static_assert((int)PC_PVP_IDX_DIG_SCOOP == (int)mPlayer_INDEX_DIG_SCOOP && (int)PC_PVP_IDX_FILL_SCOOP == (int)mPlayer_INDEX_FILL_SCOOP &&
-               (int)PC_PVP_IDX_REFLECT_SCOOP == (int)mPlayer_INDEX_REFLECT_SCOOP && (int)PC_PVP_IDX_AIR_SCOOP == (int)mPlayer_INDEX_AIR_SCOOP && (int)PC_PVP_IDX_SHOCK == (int)mPlayer_INDEX_SHOCK,
+               (int)PC_PVP_IDX_REFLECT_SCOOP == (int)mPlayer_INDEX_REFLECT_SCOOP && (int)PC_PVP_IDX_AIR_SCOOP == (int)mPlayer_INDEX_AIR_SCOOP && (int)PC_PVP_IDX_SHOCK == (int)mPlayer_INDEX_SHOCK && (int)PC_PVP_IDX_STUNG_MOSQUITO == (int)mPlayer_INDEX_STUNG_MOSQUITO,
                "pvp: shovel / shock indexes");
 static PCPvpHost s_pvp_host;
 static PCPvpVictim s_pvp_victim;
@@ -9813,7 +9813,7 @@ static void pcnetgame_pvp_host_judge(int attacker, const PCPvpHitReqMsg* m) {
     }
     s_pvp_stat.accepted++;
     printf("[NET][PVP] host: hit by %d on %d tool %u seq %u accepted -> %s angle %d speed %.2f (hit seq %u)\n", attacker, (int)m->target, (unsigned)m->tool,
-           (unsigned)m->seq, hit.reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : "SHOCK", (int)hit.knock_angle, (double)hit.knock_speed, (unsigned)hit.seq);
+           (unsigned)m->seq, hit.reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : (hit.reaction == PC_PVP_REACT_FLINCH ? "FLINCH" : "SHOCK"), (int)hit.knock_angle, (double)hit.knock_speed, (unsigned)hit.seq);
     if ((int)m->target == PC_NETGAME_HOST_PLAYER_ID) {
         (void)pc_pvp_victim_offer(&s_pvp_victim, &hit, pcnetgame_now_ms()); /* the host's own player is the victim */
     } else {
@@ -9999,35 +9999,59 @@ int pc_net_game_pvp_victim_take(int main_index, int holding_balloon, int* reacti
     *knock_speed = (*reaction == PC_PVP_REACT_TUMBLE) ? m.knock_speed : 0.0f;
     *face_angle = (int16_t)(uint16_t)((uint16_t)m.knock_angle + 0x8000u); /* turn toward the attacker */
     printf("[NET][PVP] victim: hit seq %u from %u tool %u -> %s%s (main %d)\n", (unsigned)m.seq, (unsigned)m.attacker, (unsigned)m.tool,
-           *reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : "SHOCK", (*reaction != (int)m.reaction) ? " (balloon guard)" : "", main_index);
+           *reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : (*reaction == PC_PVP_REACT_FLINCH ? "FLINCH" : "SHOCK"), (*reaction != (int)m.reaction) ? " (balloon guard)" : "", main_index);
     return 1;
 }
 
-/* TEST-ONLY diagnostics (PC_NET_TEST_HOOKS): the victim's speed / position for 1.2 s after an applied reaction (every 4th frame) */
-void pc_net_game_pvp_trace(int main_index, float speed, const float pos[3]) {
+static const char* pcnetgame_pvp_react_name(int r) {
+    return r == PC_PVP_REACT_TUMBLE ? "TUMBLE" : (r == PC_PVP_REACT_FLINCH ? "FLINCH" : "SHOCK");
+}
+
+static struct {
+    int      active, reaction, index;
+    int16_t  facing0;
+    uint32_t t0;
+} s_pvp_react; /* the reaction state the victim is in: its length and the facing before / after (one log line when it ends) */
+
+/* every local player frame: the end of a reaction state (one line) + TEST-ONLY diagnostics (PC_NET_TEST_HOOKS): the victim's speed / position
+ * for 1.2 s after an applied reaction (every 4th frame) */
+void pc_net_game_pvp_trace(int main_index, float speed, const float pos[3], int16_t facing) {
+    if (s_pvp_react.active && main_index != s_pvp_react.index && !(s_pvp_react.index == mPlayer_INDEX_TUMBLE && main_index == mPlayer_INDEX_TUMBLE_GETUP)) {
+        s_pvp_react.active = 0;
+        printf("[NET][PVP] victim: %s ended after %u ms (main now %d), facing %d -> %d\n", pcnetgame_pvp_react_name(s_pvp_react.reaction),
+               (unsigned)(pcnetgame_now_ms() - s_pvp_react.t0), main_index, (int)s_pvp_react.facing0, (int)facing);
+    }
 #ifdef PC_NET_TEST_HOOKS
-    static uint32_t s_n = 0;
-    if (s_pvp_stat.measuring && (uint32_t)(pcnetgame_now_ms() - s_pvp_stat.t0) < 1200u && (s_n++ % 4u) == 0u) {
-        printf("[NET][PVP] victim trace: main %d speed %.3f pos %.1f %.1f %.1f\n", main_index, (double)speed, (double)pos[0], (double)pos[1], (double)pos[2]);
+    {
+        static uint32_t s_n = 0;
+        if (s_pvp_stat.measuring && (uint32_t)(pcnetgame_now_ms() - s_pvp_stat.t0) < 1200u && (s_n++ % 4u) == 0u) {
+            printf("[NET][PVP] victim trace: main %d speed %.3f pos %.1f %.1f %.1f facing %d\n", main_index, (double)speed, (double)pos[0], (double)pos[1],
+                   (double)pos[2], (int)facing);
+        }
     }
 #else
-    (void)main_index;
     (void)speed;
     (void)pos;
 #endif
 }
 
-void pc_net_game_pvp_victim_applied(int reaction, int entered, int main_index, const float pos[3]) {
+void pc_net_game_pvp_victim_applied(int reaction, int entered, int main_index, const float pos[3], int16_t facing) {
     if (entered) {
         s_pvp_stat.applied++;
         s_pvp_stat.measuring = 1;
         s_pvp_stat.x0 = pos[0];
         s_pvp_stat.z0 = pos[2];
         s_pvp_stat.t0 = pcnetgame_now_ms();
+        s_pvp_react.active = 1;
+        s_pvp_react.reaction = reaction;
+        s_pvp_react.index = main_index;
+        s_pvp_react.facing0 = facing;
+        s_pvp_react.t0 = s_pvp_stat.t0;
     }
-    printf("[NET][PVP] victim: %s %s (main %d at %.1f %.1f)\n", reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : "SHOCK", entered ? "entered" : "NOT entered (request refused)",
-           main_index, (double)pos[0], (double)pos[2]);
+    printf("[NET][PVP] victim: %s %s (main %d at %.1f %.1f facing %d)\n", pcnetgame_pvp_react_name(reaction), entered ? "entered" : "NOT entered (request refused)",
+           main_index, (double)pos[0], (double)pos[2], (int)facing);
 }
+
 
 /* ---- Tree-drop falling-item animation (PC_NETGAME_MSG_TREE_DROP, PRESENTATION ONLY) ----
  * host -> every READY client, RELIABLE, 12 bytes. Sent AFTER the authoritative tile write; the receiver (and the host itself) spawns a falling item

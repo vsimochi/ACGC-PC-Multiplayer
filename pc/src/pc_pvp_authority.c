@@ -28,7 +28,7 @@ int pc_pvp_req_msg_valid(const PCPvpHitReqMsg* m) {
 
 int pc_pvp_hit_msg_valid(const PCPvpHitMsg* m) {
     if (m == NULL || m->tool < PC_PVP_TOOL_AXE || m->tool > PC_PVP_TOOL_NET || m->attacker == 0xFFu ||
-        (m->reaction != PC_PVP_REACT_TUMBLE && m->reaction != PC_PVP_REACT_SHOCK)) {
+        (m->reaction != PC_PVP_REACT_TUMBLE && m->reaction != PC_PVP_REACT_SHOCK && m->reaction != PC_PVP_REACT_FLINCH)) {
         return 0;
     }
     return pcpvp_finite(m->knock_speed) && m->knock_speed >= 0.0f && m->knock_speed <= PC_PVP_KNOCK_MAX;
@@ -278,7 +278,7 @@ int pc_pvp_host_validate(PCPvpHost* h, int attacker, const PCPvpHitReqMsg* m, co
     out->msg_type = hit_msg_type;
     out->attacker = (uint8_t)attacker;
     out->tool = m->tool;
-    out->reaction = (m->tool == PC_PVP_TOOL_AXE) ? PC_PVP_REACT_TUMBLE : PC_PVP_REACT_SHOCK;
+    out->reaction = (m->tool == PC_PVP_TOOL_AXE) ? PC_PVP_REACT_TUMBLE : (m->tool == PC_PVP_TOOL_SHOVEL ? PC_PVP_REACT_SHOCK : PC_PVP_REACT_FLINCH);
     out->knock_angle = dir;
     out->knock_speed = (m->tool == PC_PVP_TOOL_AXE) ? PC_PVP_KNOCK_AXE : (m->tool == PC_PVP_TOOL_SHOVEL ? PC_PVP_KNOCK_SHOVEL : 0.0f);
     out->seq = ++h->hit_seq;

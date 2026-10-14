@@ -68,7 +68,7 @@ int main(void) {
     out.msg_type = 92; out.attacker = 8; out.tool = 1; out.reaction = 1; out.knock_speed = 3.5f;
     CHECK(pc_pvp_hit_msg_valid(&out));
     out.knock_speed = 9.0f; CHECK(!pc_pvp_hit_msg_valid(&out)); out.knock_speed = nanv; CHECK(!pc_pvp_hit_msg_valid(&out)); out.knock_speed = 1;
-    out.reaction = 3; CHECK(!pc_pvp_hit_msg_valid(&out)); out.reaction = 2; CHECK(pc_pvp_hit_msg_valid(&out));
+    out.reaction = 4; CHECK(!pc_pvp_hit_msg_valid(&out)); out.reaction = 3; CHECK(pc_pvp_hit_msg_valid(&out)); out.reaction = 2; CHECK(pc_pvp_hit_msg_valid(&out));
 
     /* tool classes */
     CHECK(pc_pvp_tool_of_index(37) == PC_PVP_TOOL_AXE && pc_pvp_tool_of_index(38) == PC_PVP_TOOL_AXE && pc_pvp_tool_of_index(39) == PC_PVP_TOOL_AXE);
@@ -160,13 +160,15 @@ int main(void) {
         CHECK(pc_pvp_host_validate(&h, 4, &m4, &av, &tv, t + PC_PVP_IMMUNE_MS + 10, 92, &out) == PC_PVP_REJ_NO_SWING);
         pc_pvp_host_note_motion(&h, 4, 46, t + PC_PVP_IMMUNE_MS + 10);
         CHECK(pc_pvp_host_validate(&h, 4, &m4, &av, &tv, t + PC_PVP_IMMUNE_MS + 10, 92, &out) == PC_PVP_OK);
-        CHECK(out.reaction == PC_PVP_REACT_SHOCK && out.knock_speed == 0.0f && out.tool == PC_PVP_TOOL_NET && out.attacker == 4);
+        CHECK(out.reaction == PC_PVP_REACT_FLINCH && out.knock_speed == 0.0f && out.tool == PC_PVP_TOOL_NET && out.attacker == 4); /* net: the short flinch */
     }
     /* shovel -> shock */
     t += 10000;
     pc_pvp_host_note_motion(&h, 3, 61, t);
     m = req(8, PC_PVP_TOOL_SHOVEL, 5, 1000, 1000, 0);
-    CHECK(pc_pvp_host_validate(&h, 3, &m, &av, &tv, t, 92, &out) == PC_PVP_OK && out.reaction == PC_PVP_REACT_SHOCK);
+    CHECK(pc_pvp_host_validate(&h, 3, &m, &av, &tv, t, 92, &out) == PC_PVP_OK && out.reaction == PC_PVP_REACT_SHOCK && out.knock_speed == 0.0f); /* shovel: the dismay shock */
+    CHECK(PC_PVP_REACT_FLINCH != PC_PVP_REACT_SHOCK && PC_PVP_IDX_STUNG_MOSQUITO != PC_PVP_IDX_SHOCK); /* shovel and net are distinct states */
+    CHECK(pc_pvp_victim_reaction(PC_PVP_REACT_FLINCH, 1) == PC_PVP_REACT_FLINCH);
     /* seq wraps */
     t += 10000;
     pc_pvp_host_note_motion(&h, 3, 37, t);

@@ -1894,9 +1894,11 @@ int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const x
  * move (Player_actor_move_other_func1), never from the network handler: a host-validated PVP_HIT is consumed only while the player is
  * in an allowlisted state (wait / walk / run / dash / turn dash / ready net / ready-walk net) and no demo runs; anything else (talk,
  * menus, fishing, doors, beds, chairs, cutscenes) is never interrupted and the hit expires. The REAL vanilla states are requested:
- * TUMBLE (static Player_actor_request_main_tumble, the dash trip; TUMBLE_GETUP follows on its own) or SHOCK (start time 0: GAAAN1 ->
- * GAAAN2). A held balloon turns a TUMBLE into a SHOCK (TUMBLE_GETUP would release it). Nothing here touches an item, the pockets,
- * the wallet or the axe wear. */
+ * axe: TUMBLE (static Player_actor_request_main_tumble, the dash trip; TUMBLE_GETUP follows on its own) + a slide away from the attacker;
+ * shovel: SHOCK (start time 0: GAAAN1 -> GAAAN2) with the target angle = the victim's OWN facing, so it plays in place without turning;
+ * net: FLINCH = STUNG_MOSQUITO (the short MOSQUITO1 arm slap) with the PC_PVP_FLINCH_LABEL, whose end goes back to WAIT instead of the
+ * vanilla NOTICE_MOSQUITO dialogue (m_player_main_stung_mosquito.c_inc, TARGET_PC); it never turns the player. A held balloon turns a
+ * TUMBLE into a SHOCK (TUMBLE_GETUP would release it). Nothing here touches an item, the pockets, the wallet or the axe wear. */
 static struct {
     int     reaction; /* 0 = nothing requested this frame */
     int16_t angle;
@@ -1922,17 +1924,24 @@ static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game) {
                                      &speed, &face)) {
         return;
     }
+    (void)face; /* the host's "toward the attacker" angle is NOT used: SHOCK / FLINCH play in place, in the victim's own facing */
     if (reaction == PC_PVP_REACT_TUMBLE) {
         ok = Player_actor_request_main_tumble(game, mPlayer_REQUEST_PRIORITY_14);
+    } else if (reaction == PC_PVP_REACT_FLINCH) {
+        ok = Player_actor_check_request_main_able(game, mPlayer_INDEX_STUNG_MOSQUITO, mPlayer_REQUEST_PRIORITY_14);
+        if (ok) {
+            player->requested_main_index_data.stung_mosquito.label = PC_PVP_FLINCH_LABEL;
+            Player_actor_request_main_index(game, mPlayer_INDEX_STUNG_MOSQUITO, mPlayer_REQUEST_PRIORITY_14);
+        }
     } else {
-        ok = Player_actor_request_main_shock_all(game, 0.0f, face, FALSE, FALSE, mPlayer_REQUEST_PRIORITY_14);
+        ok = Player_actor_request_main_shock_all(game, 0.0f, actorx->shape_info.rotation.y, FALSE, FALSE, mPlayer_REQUEST_PRIORITY_14);
     }
     if (!ok) {
         float pos[3];
         pos[0] = actorx->world.position.x;
         pos[1] = actorx->world.position.y;
         pos[2] = actorx->world.position.z;
-        pc_net_game_pvp_victim_applied(reaction, 0, player->now_main_index, pos);
+        pc_net_game_pvp_victim_applied(reaction, 0, player->now_main_index, pos, actorx->shape_info.rotation.y);
         return;
     }
     l_pc_pvp_req.reaction = reaction;
@@ -1949,7 +1958,8 @@ static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game) {
     pos[1] = actorx->world.position.y;
     pos[2] = actorx->world.position.z;
     if (l_pc_pvp_req.reaction != 0) {
-        const int want = (l_pc_pvp_req.reaction == PC_PVP_REACT_TUMBLE) ? mPlayer_INDEX_TUMBLE : mPlayer_INDEX_SHOCK;
+        const int want = (l_pc_pvp_req.reaction == PC_PVP_REACT_TUMBLE) ? mPlayer_INDEX_TUMBLE
+                         : (l_pc_pvp_req.reaction == PC_PVP_REACT_FLINCH ? mPlayer_INDEX_STUNG_MOSQUITO : mPlayer_INDEX_SHOCK);
         const int entered = player->changed_main_index && player->now_main_index == want;
         if (entered && l_pc_pvp_req.reaction == PC_PVP_REACT_TUMBLE && l_pc_pvp_req.speed > 0.0f) {
             /* knockback: the tumble keeps the actor speed (SetupSpeedF) and moves along world.angle.y. Vanilla brakes it by 0.175 per
@@ -1961,7 +1971,16 @@ static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game) {
             l_pc_pvp_knock.angle = l_pc_pvp_req.angle;
             actorx->shape_info.rotation.y = l_pc_pvp_req.angle;
         }
-        pc_net_game_pvp_victim_applied(l_pc_pvp_req.reaction, entered, player->now_main_index, pos);
+        if (entered && l_pc_pvp_req.reaction == PC_PVP_REACT_FLINCH) {
+            /* the sting SE a real mosquito plays (ac_ins_ka.c:238); the PvP flinch has no mosquito, so the victim plays it itself (puppets
+             * play the same SE from their STUNG_MOSQUITO row) */
+            sAdo_OngenTrgStart(NA_SE_6A, &actorx->world.position);
+        }
+        if (entered && l_pc_pvp_req.reaction == PC_PVP_REACT_SHOCK) {
+            /* the shovel's dismay is held longer than vanilla's 44 frames (GAAAN2 keeps looping): ~1.4 s, clearly stronger than the ~1 s net flinch */
+            player->main_data.shock.end_time = PC_PVP_SHOCK_FRAMES;
+        }
+        pc_net_game_pvp_victim_applied(l_pc_pvp_req.reaction, entered, player->now_main_index, pos, actorx->shape_info.rotation.y);
         l_pc_pvp_req.reaction = 0;
     }
     if (l_pc_pvp_knock.active) {
@@ -1973,7 +1992,19 @@ static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game) {
             l_pc_pvp_knock.elapsed += (f32)gamePT->graph->dt_num_60fps_frames;
         }
     }
-    pc_net_game_pvp_trace(player->now_main_index, actorx->speed, pos);
+    {
+        /* safety net for the PvP flinch: never more than ~3 s in STUNG_MOSQUITO (its end request normally returns to WAIT after the clip) */
+        static float s_flinch_frames = 0.0f;
+        if (player->now_main_index == mPlayer_INDEX_STUNG_MOSQUITO && player->main_data.stung_mosquito.label == PC_PVP_FLINCH_LABEL) {
+            s_flinch_frames += (f32)gamePT->graph->dt_num_60fps_frames;
+            if (s_flinch_frames > 180.0f) {
+                Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_26);
+            }
+        } else {
+            s_flinch_frames = 0.0f;
+        }
+    }
+    pc_net_game_pvp_trace(player->now_main_index, actorx->speed, pos, actorx->shape_info.rotation.y);
     if (!pc_host_observer_active() && !mEv_IsTitleDemo()) {
         pc_net_game_pvp_attacker_frame(player->now_main_index, player->changed_main_index ? 1 : 0,
                                        player->keyframe0.frame_control.current_frame, pos, actorx->shape_info.rotation.y);

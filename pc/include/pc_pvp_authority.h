@@ -20,14 +20,18 @@ extern "C" {
 
 /* ---- tools / reactions ---- */
 enum { PC_PVP_TOOL_AXE = 1, PC_PVP_TOOL_SHOVEL = 2, PC_PVP_TOOL_NET = 3 };
-enum { PC_PVP_REACT_TUMBLE = 1, PC_PVP_REACT_SHOCK = 2 };
+enum { PC_PVP_REACT_TUMBLE = 1, PC_PVP_REACT_SHOCK = 2, PC_PVP_REACT_FLINCH = 3 };
+/* axe -> TUMBLE (trip + slide away), shovel -> SHOCK (the GAAAN dismay, in place), net -> FLINCH (the short STUNG_MOSQUITO arm-slap clip, in place;
+ * the PvP entry skips the vanilla mosquito dialogue and returns to WAIT). SHOCK / FLINCH never turn the victim (it keeps its own facing). */
+#define PC_PVP_SHOCK_FRAMES 84.0f /* shovel SHOCK length in 60 fps frames (vanilla end_time = start + 44): GAAAN1 then GAAAN2 held, ~1.4 s */
+#define PC_PVP_FLINCH_LABEL 0x50565031u /* the stung_mosquito label of a PvP flinch (no mosquito actor has it): its end goes to WAIT, not NOTICE_MOSQUITO */
 
 /* vanilla mPlayer_INDEX_* values the logic needs (pc_net_game.c _Static_asserts each against include/m_player.h) */
 enum {
     PC_PVP_IDX_WAIT = 7, PC_PVP_IDX_WALK = 8, PC_PVP_IDX_RUN = 9, PC_PVP_IDX_DASH = 10, PC_PVP_IDX_TUMBLE = 11, PC_PVP_IDX_TUMBLE_GETUP = 12,
     PC_PVP_IDX_TURN_DASH = 13, PC_PVP_IDX_SWING_AXE = 37, PC_PVP_IDX_AIR_AXE = 38, PC_PVP_IDX_REFLECT_AXE = 39, PC_PVP_IDX_READY_NET = 42,
     PC_PVP_IDX_READY_WALK_NET = 43, PC_PVP_IDX_SWING_NET = 44, PC_PVP_IDX_PULL_NET = 45, PC_PVP_IDX_STOP_NET = 46, PC_PVP_IDX_DIG_SCOOP = 58,
-    PC_PVP_IDX_FILL_SCOOP = 59, PC_PVP_IDX_REFLECT_SCOOP = 60, PC_PVP_IDX_AIR_SCOOP = 61, PC_PVP_IDX_SHOCK = 99,
+    PC_PVP_IDX_FILL_SCOOP = 59, PC_PVP_IDX_REFLECT_SCOOP = 60, PC_PVP_IDX_AIR_SCOOP = 61, PC_PVP_IDX_SHOCK = 99, PC_PVP_IDX_STUNG_MOSQUITO = 107,
 };
 
 /* ---- tuning ---- */
@@ -191,9 +195,9 @@ int pc_pvp_attacker_next(PCPvpAttacker* a, uint32_t now_ms, uint16_t* seq_out);
 /* victim: once per local player frame BEFORE the request processing: 1 = apply now (reaction / angle / speed / the angle to face) */
 int  pc_net_game_pvp_victim_take(int main_index, int holding_balloon, int* reaction, int16_t* knock_angle, float* knock_speed, int16_t* face_angle);
 /* victim: the reaction state was entered (or not) after the request: logs the result, starts the knockback measurement */
-void pc_net_game_pvp_victim_applied(int reaction, int entered, int main_index, const float pos[3]);
+void pc_net_game_pvp_victim_applied(int reaction, int entered, int main_index, const float pos[3], int16_t facing);
 /* TEST-ONLY diagnostics (PC_NET_TEST_HOOKS builds): the victim's speed / position right after an applied reaction; a no-op otherwise */
-void pc_net_game_pvp_trace(int main_index, float speed, const float pos[3]);
+void pc_net_game_pvp_trace(int main_index, float speed, const float pos[3], int16_t facing);
 /* attacker: once per local player frame AFTER the request processing (axe / shovel contact detection). entered = a main index was
  * entered this frame (player->changed_main_index). */
 void pc_net_game_pvp_attacker_frame(int main_index, int entered, float frame, const float pos[3], int16_t facing);

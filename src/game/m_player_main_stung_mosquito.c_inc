@@ -73,6 +73,15 @@ static void Player_actor_request_proc_index_fromStung_mosquito(ACTOR* actorx, GA
         PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
         mPlayer_main_stung_mosquito_c* stung_mosquito_p = &player->main_data.stung_mosquito;
 
+#ifdef TARGET_PC
+        if (stung_mosquito_p->label == PC_PVP_FLINCH_LABEL) {
+            /* player-vs-player net FLINCH (pc_pvp_authority.h): only the short arm-slap clip; no mosquito, so no "I got bitten"
+             * dialogue (NOTICE_MOSQUITO) and no turn: straight back to WAIT. Same priority as vanilla's NOTICE_MOSQUITO request (26):
+             * this state never settles its own request priority, so a priority-1 WAIT would be refused and the player would stay here */
+            Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_26);
+            return;
+        }
+#endif
         Player_actor_request_main_notice_mosquito(game, stung_mosquito_p->label, mPlayer_REQUEST_PRIORITY_26);
     }
 }

@@ -330,9 +330,9 @@ def a0(check):
           "SetEffectHit_Dig_scoop" in get and "Player_actor_SetSound_Dig_scoop" in get)
     check("A0 vanilla tired: sound + DUST at frame 10 at feel_pos with RSV_NO, 0, 0",
           "Check_AnimationFrame(fc0_p, 10.0f)" in tired and "eEC_EFFECT_DUST, player->feel_pos" in tired)
-    check("A0 table rows: 11 new rows (7 shovel states + tired + struggle_pitfall + stung_bee + remove_grass) + the 15 of 6a",
+    check("A0 table rows: 11 new rows (7 shovel states + tired + struggle_pitfall + stung_bee + remove_grass) + the 15 of 6a + 2 PvP rows",
           len(re.findall(r"\{ mPlayer_INDEX_\w+, \d+, \{", code[code.index("static const PCToolRow s_tool_rows[]"):end]))
-          == 15 + 11)
+          == 15 + 11 + 2)  # + the 2 player-vs-player reaction rows (SHOCK, STUNG_MOSQUITO; test_pvp_src.py)
     # numeric ids in the table equal repository enums
     check("A0 repository ids: SCOOP1 0x11E, SCOOP_UMERU 0x120, KARABURI 0x43A, ITEM_HORIDASHI 0x57, ZASSOU_NUKU 0x15F",
           (NA["NA_SE_SCOOP1"], NA["NA_SE_SCOOP_UMERU"], NA["NA_SE_KARABURI"], NA["NA_SE_ITEM_HORIDASHI"],

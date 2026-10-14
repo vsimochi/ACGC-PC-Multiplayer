@@ -168,7 +168,9 @@ typedef struct PCRemotePlayerVisual {
     int                   held_class;          /* PC_HELD_* of held_kind */
     int                   diag_valid;          /* PC_PUPPET_DIAG: last logged raw item kind is diag_raw_kind */
     int                   diag_raw_kind;
-    int                   item_ready;          /* item_keyframe holds a valid net/rod skeleton instance */
+    int                   diag_face_eye;       /* last drawn eye / mouth pattern (face diag: a line on change only) */
+    int                   diag_face_mouth;
+    int                   item_ready;         /* item_keyframe holds a valid net/rod skeleton instance */
     int                   item_anim_idx;       /* mPlayer_ITEM_DATA_* currently bound on item_keyframe */
     cKF_SkeletonInfo_R_c  item_keyframe;       /* net / rod skeleton instance (puppet-owned) */
     s_xyz                 item_joint_data[8];  /* same sizes as PLAYER_ACTOR::item_joint_data / item_morph_data */
@@ -3825,6 +3827,16 @@ static const PCToolRow s_tool_rows[] = {
      *   feel_pos on the next draw (m_player_draw.c_inc:106-116, arg0 0, arg1 0). */
     { mPlayer_INDEX_STRUGGLE_PITFALL, 1, {
         { PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_ASE2, 0.0f, "pitfall_sweat", 0, PC_TFL_ATTR0 } } },
+    /* SHOCK 99 (player-vs-player shovel, bee / axe bounces): shock.c_inc:64-75 Set_FeelEffect_Shock sets draw_effect_idx = SHOCK + 1 at GAAAN1
+     *   frame 5; the draw callback spawns it at feel_pos (m_player_draw.c_inc:112-116, arg0 0, arg1 0); ef_shock.c:88-92 plays its SE 0x2D
+     *   itself at the effect (so the puppet's dismay is HEARD by everybody near it, positioned at the puppet). The row starts on GAAAN1. */
+    { mPlayer_INDEX_SHOCK, 1, {
+        { PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_SHOCK, 5.0f, "shock", 0, PC_TFL_ATTR0 } } },
+    /* STUNG_MOSQUITO 107 (player-vs-player net FLINCH, mosquito stings): the sting SE NA_SE_6A is played by the mosquito actor
+     *   (ac_ins_ka.c:238 aIKA_attack_init) of the stung player's own process, which nobody else has: the puppet plays it on entry. The PvP
+     *   flinch (no mosquito) plays the same SE locally (m_player.c Player_actor_pc_pvp_post). */
+    { mPlayer_INDEX_STUNG_MOSQUITO, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_6A, 0.0f, "flinch_6a", 0, 0 } } },
     /* STUNG_BEE 96: stung_bee.c_inc:37 HACHI_SASARERU on entry. */
     { mPlayer_INDEX_STUNG_BEE, 1, {
         { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_HACHI_SASARERU, 0.0f, "hachi_sasareru", 0, 0 } } },
@@ -4941,6 +4953,80 @@ static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
     pc_remote_player_collide_update(self, slot, game);
 }
 
+/* Facial expression of a puppet, derived from what it already mirrors (no wire field: MOVE carries no eye / mouth data). Vanilla
+ * sets the player's eye / mouth texture two ways: (1) Player_actor_set_tex_anime_pattern (m_player_common.c_inc:959-983): the
+ * per-frame eye / mouth index tables of the CLIP (mPlib_Get_PlayerEyeTexAnimation_p / _MouthTexAnimation_p, pure data) indexed
+ * by keyframe0's frame - 1: KOKERU (tumble), GAAAN1 (shock), MOSQUITO1 (flinch), and every other clip that has a table; the puppet
+ * plays the same clip on its own keyframe0, so the same lookup gives the same face. (2) constant patterns some states set for a
+ * clip without a table: SHOCK's GAAAN2 eye 6 / mouth 5 (shock.c_inc:117-130), NOTICE_MOSQUITO / TIRED 4 / 4, STRUGGLE_PITFALL eye 6,
+ * SWING_FAN eye 5, WAIT_BED eye 2. Anything else keeps the neutral pattern 0 (blinking is not reproduced). Read-only. */
+static void pc_remote_player_face_pattern(PCRemotePlayerActor* self, int* eye, int* mouth) {
+    PCRemotePlayerVisual* v = &self->visual;
+    const int a0 = v->current_anim_idx;
+    const float cur = v->keyframe0.frame_control.current_frame;
+    const float max = v->keyframe0.frame_control.max_frames;
+    u8* et = (a0 >= 0 && a0 < mPlayer_ANIM_NUM) ? mPlib_Get_PlayerEyeTexAnimation_p(a0) : NULL;
+    u8* mt = (a0 >= 0 && a0 < mPlayer_ANIM_NUM) ? mPlib_Get_PlayerMouthTexAnimation_p(a0) : NULL;
+    int e = 0, m = 0;
+
+    if (1.0f <= cur && cur <= max) {
+        const int p = (int)(cur - 1.0f);
+        if (et != NULL) {
+            e = et[p];
+        }
+        if (mt != NULL) {
+            m = mt[p];
+        }
+    }
+    if (v->row_active) {
+        int ce = -1, cm = -1;
+        switch (v->row_idx) {
+            case mPlayer_INDEX_SHOCK:
+                if (a0 == mPlayer_ANIM_GAAAN2) {
+                    ce = 6;
+                    cm = 5;
+                }
+                break;
+            case mPlayer_INDEX_NOTICE_MOSQUITO:
+            case mPlayer_INDEX_TIRED:
+                ce = 4;
+                cm = 4;
+                break;
+            case mPlayer_INDEX_STRUGGLE_PITFALL:
+                ce = 6;
+                break;
+            case mPlayer_INDEX_SWING_FAN:
+                ce = 5;
+                break;
+            case mPlayer_INDEX_WAIT_BED:
+                ce = 2;
+                break;
+            default:
+                break;
+        }
+        if (ce >= 0 && et == NULL) {
+            e = ce;
+        }
+        if (cm >= 0 && mt == NULL) {
+            m = cm;
+        }
+    }
+    if (e < 0 || e >= mPlayer_EYE_TEX_NUM) {
+        e = 0;
+    }
+    if (m < 0 || m >= mPlayer_MOUTH_TEX_NUM) {
+        m = 0;
+    }
+    if ((e != v->diag_face_eye || m != v->diag_face_mouth) && pc_remote_player_puppet_diag()) {
+        printf("[NET][PUPPET][DIAG] player %d face eye=%d mouth=%d anim0=%d row=%d frame=%.1f\n", (int)self->peer, e, m, a0,
+               v->row_active ? v->row_idx : -1, (double)cur);
+    }
+    v->diag_face_eye = e;
+    v->diag_face_mouth = m;
+    *eye = e;
+    *mouth = m;
+}
+
 static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
     GRAPH* graph = game->graph;
     PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
@@ -4994,8 +5080,12 @@ static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
      * first 0x100-byte eye slot / first mouth slot within appearance->face_tex) is simply "not
      * blinking, default mouth"; blink/mouth-pattern animation is not synchronized, same as Stage
      * 4A. */
-    eye_tex_p = (u8*)appearance->face_tex + 0 * 0x100;
-    mouth_tex_p = (u8*)appearance->face_tex + mPlayer_EYE_TEX_NUM * 0x100;
+    {
+        int eye = 0, mouth = 0;
+        pc_remote_player_face_pattern(self, &eye, &mouth);
+        eye_tex_p = (u8*)appearance->face_tex + eye * 0x100;
+        mouth_tex_p = (u8*)appearance->face_tex + (mPlayer_EYE_TEX_NUM + mouth) * 0x100;
+    }
 
     /* Reset RDP/RSP mode (texture/z/light/fog/prim) to a known baseline before emitting our own
      * commands -- the same call the real player's own Player_actor_draw_Normal() makes first. */

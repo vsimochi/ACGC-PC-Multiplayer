@@ -91,6 +91,32 @@ def setup(p, x, z, look_x, look_z):
     p.cmd("face %.1f %.1f" % (look_x, look_z), 20)
 
 
+def fx_checks(check, tag, procs, pid, row, sound_rx, face_required=True):
+    """the reaction's sound / effect and its facial expression reach the other players' puppets (PC_PUPPET_DIAG lines)"""
+    for name, proc, off in procs:
+        m = wait_rx(proc.log_text, r"\[NET\]\[PUPPET\]\[DIAG\] " + sound_rx, 8, off)
+        check("%s %s hears / sees the reaction at the puppet (%s)" % (tag, name, m.group(0) if m else None), m)
+        faces = re.findall(r"\[NET\]\[PUPPET\]\[DIAG\] player %s face eye=(\d+) mouth=(\d+) anim0=-?\d+ row=%d " % (pid, row), proc.log_text()[off:])
+        ok = any(e != "0" or mo != "0" for e, mo in faces)
+        if face_required:
+            check("%s %s: the puppet's face changes during the reaction (eye/mouth patterns %s)" % (tag, name, faces[:6]), ok)
+        else:
+            print("INFO - %s %s: puppet face patterns during the reaction %s" % (tag, name, faces[:6]))
+
+
+def facing_check(check, tag, proc, off, back_to=None):
+    """the victim's reaction ended and its facing is unchanged (within 1 degree): no turn toward the attacker"""
+    m = wait_rx(proc.log_text, r"\[NET\]\[PVP\] victim: \w+ ended after (\d+) ms \(main now (-?\d+)\), facing (-?\d+) -> (-?\d+)", 8, off)
+    if m is None:
+        check("%s reaction end line present" % tag, False)
+        return
+    a, b = int(m.group(3)), int(m.group(4))
+    d = abs(((b - a) + 32768) % 65536 - 32768)
+    check("%s played in place: facing %d -> %d (diff %d <= 182 = 1 deg), lasted %s ms, then main %s" % (tag, a, b, d, m.group(1), m.group(2)),
+          d <= 182 and (back_to is None or int(m.group(2)) == back_to))
+    return int(m.group(1))
+
+
 def equip(p, item, check, tag):
     a = p.cmd("equip %x" % item, 40)
     check("%s %s equips 0x%04X (%s)" % (tag, p.label, item, a), a is not None and " ok" in a)
@@ -125,7 +151,7 @@ def main():
         if not ok:
             return L.summary_and_exit_code(results)
         L.resolve_host_town("127.0.0.1", args.port)
-        a = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--bootstrap-resident", "1", "-debug"], env=dict(env_common, AC_TEST_AUTOPILOT="ac_auto_A.txt"),
+        a = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--bootstrap-resident", "1", "-debug"], env=dict(env_common, AC_TEST_AUTOPILOT="ac_auto_A.txt", PC_PUPPET_DIAG="1"),
                             log_path=os.path.join(HERE, "pvpreal_A.log"), bin_dir=BIN, label="pvpA").start()
         procs.append(a)
         check("client A in the field", a.boot_to_field(timeout=200, slot=1))
@@ -168,6 +194,7 @@ def main():
         check("P1 A's swing was a plain AIR_AXE (38) (states %s)" % ((ans or "").split("states ")[-1]), ",38," in "," + (ans or "").split("states ")[-1])
         m_b = wait_rx(b.log_text, r"\[NET\]\[PUPPET\]\[DIAG\] player 8 state main_index=11 [^\r\n]*row=tumble[^\r\n]*", 8, bo)
         check("P6 observer B sees the host's puppet tumble row (%s)" % (m_b.group(0) if m_b else None), m_b)
+        fx_checks(check, "P1 TUMBLE", [("B", b, bo), ("A (attacker)", a, ao)], 8, 11, r"player 8 tumble sound label=\d+")
         others = re.findall(r"client: PVP_HIT from", b.log_text()[bo:]) + re.findall(r"client: PVP_HIT from", a.log_text()[ao:])
         check("P1 nobody but the victim received a PVP_HIT (%d on A / B)" % len(others), not others)
         time.sleep(3.0)
@@ -188,36 +215,47 @@ def main():
         aid = m_acc.group(1) if m_acc else "-1"
         m_b = wait_rx(b.log_text, r"\[NET\]\[PUPPET\]\[DIAG\] player %s state main_index=11 [^\r\n]*row=tumble" % aid, 8, bo)
         check("P6 observer B sees A's puppet tumble row (%s)" % (m_b.group(0) if m_b else None), m_b)
+        fx_checks(check, "P2 TUMBLE", [("B", b, bo)], aid, 11, r"player %s tumble sound label=\d+" % aid)
         time.sleep(3.0)
 
-        # ---- P3 A shovel -> host
+        # ---- P3 A shovel -> host: SHOCK (99) in place; the host faces EAST (perpendicular to A), a turn toward A would be visible
         equip(A, ITM_SHOVEL, check, "P3")
-        setup(H, X, Z, X, Z - 100.0)
+        setup(H, X, Z, X + 100.0, Z)
         setup(A, X, Z - 30.0, X, Z)
         time.sleep(2.0)
         ho, ao, bo = len(host.log_text()), len(a.log_text()), len(b.log_text())
         A.cmd("swing", 30)
         m_att = wait_rx(a.log_text, r"\[NET\]\[PVP\] attacker: tool 2 contact on player 8[^\r\n]*", 6, ao)
-        m_ent = wait_rx(host.log_text, r"\[NET\]\[PVP\] victim: SHOCK entered[^\r\n]*", 6, ho)
-        check("P3 A's shovel hit the host: request (%s), host SHOCK (%s)" % (m_att.group(0) if m_att else a.log_text()[ao:][-300:], m_ent.group(0) if m_ent else None),
+        m_ent = wait_rx(host.log_text, r"\[NET\]\[PVP\] victim: SHOCK entered \(main 99 [^\r\n]*", 6, ho)
+        check("P3 A's shovel hit the host: request (%s), host SHOCK main 99 (%s)" % (m_att.group(0) if m_att else a.log_text()[ao:][-300:], m_ent.group(0) if m_ent else None),
               m_att and m_ent)
         check("P3 no dig was requested by A's shovel swing (no FIELD_ACTION dig line)", not re.search(r"dig|DIG_HOLE", a.log_text()[ao:].replace("dig_scoop", "")) or
               "request_dig" not in a.log_text()[ao:])
+        shock_ms = facing_check(check, "P3 SHOCK", host, ho)
         m_b = wait_rx(b.log_text, r"\[NET\]\[PUPPET\]\[DIAG\] player 8 state main_index=99 [^\r\n]*row=shock", 8, bo)
         check("P6 observer B sees the host's puppet shock row (%s)" % (m_b.group(0) if m_b else None), m_b)
+        fx_checks(check, "P3 SHOCK", [("B", b, bo), ("A (attacker)", a, ao)], 8, 99, r"player 8 cosmetic effect=shock frame=[\d.]+ .*?budget=ok")
         time.sleep(3.0)
 
-        # ---- P4 A net -> host
+        # ---- P4 A net -> host: FLINCH = STUNG_MOSQUITO (107), a DIFFERENT state, in place, back to WAIT (no mosquito dialogue)
         equip(A, ITM_NET, check, "P4")
-        setup(H, X, Z, X, Z - 100.0)
+        setup(H, X, Z, X + 100.0, Z)
         setup(A, X, Z - 30.0, X, Z)
         time.sleep(2.0)
-        ho, ao = len(host.log_text()), len(a.log_text())
+        ho, ao, bo = len(host.log_text()), len(a.log_text()), len(b.log_text())
         A.cmd("swing", 30)
         m_att = wait_rx(a.log_text, r"\[NET\]\[PVP\] attacker: tool 3 contact on player 8[^\r\n]*", 6, ao)
-        m_ent = wait_rx(host.log_text, r"\[NET\]\[PVP\] victim: SHOCK entered[^\r\n]*", 6, ho)
-        check("P4 A's net hit the host: request (%s), host SHOCK (%s)" % (m_att.group(0) if m_att else a.log_text()[ao:][-300:], m_ent.group(0) if m_ent else None),
+        m_ent = wait_rx(host.log_text, r"\[NET\]\[PVP\] victim: FLINCH entered \(main 107 [^\r\n]*", 6, ho)
+        check("P4 A's net hit the host: request (%s), host FLINCH main 107 (%s)" % (m_att.group(0) if m_att else a.log_text()[ao:][-300:], m_ent.group(0) if m_ent else None),
               m_att and m_ent)
+        flinch_ms = facing_check(check, "P4 FLINCH", host, ho, back_to=7)
+        check("P4 the shovel's SHOCK (%s ms) is the stronger / longer reaction than the net's FLINCH (%s ms)" % (shock_ms, flinch_ms),
+              shock_ms is not None and flinch_ms is not None and shock_ms > flinch_ms)
+        check("P4 the flinch never entered the mosquito dialogue (NOTICE_MOSQUITO 108)", "main now 108" not in host.log_text()[ho:])
+        m_b = wait_rx(b.log_text, r"\[NET\]\[PUPPET\]\[DIAG\] player 8 state main_index=107 [^\r\n]*row=stung_mosquito", 8, bo)
+        check("P6 observer B sees the host's puppet FLINCH row (stung_mosquito) (%s)" % (m_b.group(0) if m_b else None), m_b)
+        fx_checks(check, "P4 FLINCH", [("B", b, bo), ("A (attacker)", a, ao)], 8, 107, r"player 8 flinch_6a sound label=\d+ frame=[\d.]+ budget=ok")
+        check("P4 the victim (host) played the sting SE itself (log line)", "victim: FLINCH entered" in host.log_text()[ho:])
         time.sleep(3.0)
 
         # ---- P5 paused host is never interrupted
