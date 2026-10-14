@@ -357,6 +357,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_remote_player.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_bee_sync.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ball_authority.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_pvp_authority.c # player-vs-player tool hits (pure logic)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_field_authority.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_wildlife_authority.c
 )

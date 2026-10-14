@@ -11,6 +11,7 @@
 #ifdef TARGET_PC
 #include "pc_bswap.h"
 #include "pc_net_game.h" /* X1b: pc_net_game_client_pocket_locked() -- see mPlib_able_submenu_type1() */
+#include "pc_pvp_authority.h" /* player-vs-player: pc_pvp_puppet_near() -- see mPlib_Check_scoop_after() */
 #endif
 
 int g_mPlib_wade_disabled = FALSE;
@@ -3295,6 +3296,13 @@ extern int mPlib_Check_scoop_after(GAME* game, xyz_t* pos_p, mActor_name_t* item
 
                                 return mPlayer_INDEX_AIR_SCOOP;
                             }
+#ifdef TARGET_PC
+                            /* player-vs-player: another player's puppet counts like a villager (no hole is dug under a player);
+                             * the swing becomes the vanilla AIR_SCOOP and the hit itself is the host-validated PVP_HIT_REQ */
+                            if (pc_pvp_puppet_near(pos_p->x, pos_p->z, 39.0f)) {
+                                return mPlayer_INDEX_AIR_SCOOP;
+                            }
+#endif
 
                             hit_actor_p = mPlib_Search_exist_psnowman_inCircle_forScoop(game, pos_p, SQ(39.0f));
                             if (hit_actor_p != NULL) {

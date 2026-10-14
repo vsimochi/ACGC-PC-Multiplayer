@@ -78,6 +78,26 @@ static int Player_actor_HitBGCheck_Swing_net(ACTOR* actor, GAME* game, ACTOR** h
         if (Player_actor_Check_OBJtoLine_forItem_net(actor, hit_actor)) {
             return TRUE;
         }
+#ifdef TARGET_PC
+        {
+            /* player-vs-player: the puppet pipe is withheld from the collision table during SWING_NET, so another player is
+             * tested here against the net head segment. A hit (sent to the host as PVP_HIT_REQ) stops the swing exactly like a
+             * solid object: STOP_NET + the AMI_HIT sound (hit_actor stays NULL: no villager annoyance). */
+            float ns[3], ne[3], pp[3];
+            ns[0] = player->net_start_pos.x;
+            ns[1] = player->net_start_pos.y;
+            ns[2] = player->net_start_pos.z;
+            ne[0] = player->net_end_pos.x;
+            ne[1] = player->net_end_pos.y;
+            ne[2] = player->net_end_pos.z;
+            pp[0] = actor->world.position.x;
+            pp[1] = actor->world.position.y;
+            pp[2] = actor->world.position.z;
+            if (pc_net_game_pvp_net_hit(ns, ne, pp, actor->shape_info.rotation.y)) {
+                return TRUE;
+            }
+        }
+#endif
 
         line_check = mCoBG_LineCheck_RemoveFg(&pos, player->net_start_pos, player->net_end_pos, 0, 7);
 

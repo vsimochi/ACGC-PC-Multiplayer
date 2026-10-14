@@ -237,11 +237,17 @@ static void Player_actor_check_forward(ACTOR* actor, GAME* game) {
 }
 
 static void Player_actor_move_other_func1(ACTOR* actor, GAME* game) {
+#ifdef TARGET_PC
+    Player_actor_pc_pvp_pre(actor, game); /* player-vs-player: a host-validated hit requests TUMBLE / SHOCK (allowlisted states only) */
+#endif
     Player_actor_cancel_request_change_proc_index_by_A_btn(actor);
     Player_actor_request_main_change_from_submenu(actor, game);
     Player_actor_request_change_item(game);
     Player_actor_cancel_request_change_proc_index(actor);
     Player_actor_change_proc_index(actor, game);
+#ifdef TARGET_PC
+    Player_actor_pc_pvp_post(actor, game); /* player-vs-player: knockback of an entered TUMBLE + the attacker's axe / shovel contact test */
+#endif
     Player_actor_Reset_excute_cancel_wade(actor);
     Player_actor_Set_OldAngle(actor);
     Player_actor_Culc_player_frame_counter(actor);

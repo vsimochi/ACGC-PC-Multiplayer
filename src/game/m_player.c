@@ -35,6 +35,9 @@
 #include "pc_wildlife_authority.h" /* T8 audit fix (Bug 3): pcwld_should_suppress_local_wildlife() --
                                      * see m_player_main_notice_rod.c_inc / m_player_main_notice_net.c_inc's
                                      * own catch-interception seams. */
+#include "pc_pvp_authority.h" /* player-vs-player tool hits: puppet filter (axe), victim reaction + attacker contact hooks */
+static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game);
+static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game);
 #endif
 
 static int l_skip_other_func_set_wade = FALSE;
@@ -1885,5 +1888,95 @@ int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_name_t ite
  * Player_actor_ChangeFGNumber_Remove_grass() and its network seam) is the ordinary per-frame player update. */
 int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos) {
     return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
+}
+
+/* Player-vs-player tool hits (pc_pvp_authority.h): REACTIONS ONLY. The victim side runs here, from the local player's own per-frame
+ * move (Player_actor_move_other_func1), never from the network handler: a host-validated PVP_HIT is consumed only while the player is
+ * in an allowlisted state (wait / walk / run / dash / turn dash / ready net / ready-walk net) and no demo runs; anything else (talk,
+ * menus, fishing, doors, beds, chairs, cutscenes) is never interrupted and the hit expires. The REAL vanilla states are requested:
+ * TUMBLE (static Player_actor_request_main_tumble, the dash trip; TUMBLE_GETUP follows on its own) or SHOCK (start time 0: GAAAN1 ->
+ * GAAAN2). A held balloon turns a TUMBLE into a SHOCK (TUMBLE_GETUP would release it). Nothing here touches an item, the pockets,
+ * the wallet or the axe wear. */
+static struct {
+    int     reaction; /* 0 = nothing requested this frame */
+    int16_t angle;
+    float   speed;
+} l_pc_pvp_req;
+static struct {
+    int     active;
+    float   elapsed; /* 60 fps frames since the TUMBLE was entered */
+    float   speed;
+    int16_t angle;
+} l_pc_pvp_knock;
+
+static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    int reaction = 0;
+    int16_t angle = 0, face = 0;
+    float speed = 0.0f;
+    int ok;
+
+    l_pc_pvp_req.reaction = 0;
+    if (pc_host_observer_active() || mEv_IsTitleDemo() ||
+        !pc_net_game_pvp_victim_take(player->now_main_index, mPlayer_ITEM_IS_BALLOON(player->item_kind) ? 1 : 0, &reaction, &angle,
+                                     &speed, &face)) {
+        return;
+    }
+    if (reaction == PC_PVP_REACT_TUMBLE) {
+        ok = Player_actor_request_main_tumble(game, mPlayer_REQUEST_PRIORITY_14);
+    } else {
+        ok = Player_actor_request_main_shock_all(game, 0.0f, face, FALSE, FALSE, mPlayer_REQUEST_PRIORITY_14);
+    }
+    if (!ok) {
+        float pos[3];
+        pos[0] = actorx->world.position.x;
+        pos[1] = actorx->world.position.y;
+        pos[2] = actorx->world.position.z;
+        pc_net_game_pvp_victim_applied(reaction, 0, player->now_main_index, pos);
+        return;
+    }
+    l_pc_pvp_req.reaction = reaction;
+    l_pc_pvp_req.angle = angle;
+    l_pc_pvp_req.speed = speed;
+}
+
+static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    float pos[3];
+
+    (void)game;
+    pos[0] = actorx->world.position.x;
+    pos[1] = actorx->world.position.y;
+    pos[2] = actorx->world.position.z;
+    if (l_pc_pvp_req.reaction != 0) {
+        const int want = (l_pc_pvp_req.reaction == PC_PVP_REACT_TUMBLE) ? mPlayer_INDEX_TUMBLE : mPlayer_INDEX_SHOCK;
+        const int entered = player->changed_main_index && player->now_main_index == want;
+        if (entered && l_pc_pvp_req.reaction == PC_PVP_REACT_TUMBLE && l_pc_pvp_req.speed > 0.0f) {
+            /* knockback: the tumble keeps the actor speed (SetupSpeedF) and moves along world.angle.y. Vanilla brakes it by 0.175 per
+             * RENDER frame, so at a high frame rate its slide would be a few units: the speed is instead eased from the start value to 0
+             * over PC_PVP_KNOCK_FRAMES 60 fps frames (frame-rate independent, ~45 units), below. */
+            l_pc_pvp_knock.active = 1;
+            l_pc_pvp_knock.elapsed = 0.0f;
+            l_pc_pvp_knock.speed = l_pc_pvp_req.speed;
+            l_pc_pvp_knock.angle = l_pc_pvp_req.angle;
+            actorx->shape_info.rotation.y = l_pc_pvp_req.angle;
+        }
+        pc_net_game_pvp_victim_applied(l_pc_pvp_req.reaction, entered, player->now_main_index, pos);
+        l_pc_pvp_req.reaction = 0;
+    }
+    if (l_pc_pvp_knock.active) {
+        if (player->now_main_index != mPlayer_INDEX_TUMBLE || l_pc_pvp_knock.elapsed >= PC_PVP_KNOCK_FRAMES) {
+            l_pc_pvp_knock.active = 0; /* the vanilla braking finishes whatever is left */
+        } else {
+            actorx->speed = l_pc_pvp_knock.speed * (1.0f - l_pc_pvp_knock.elapsed / PC_PVP_KNOCK_FRAMES);
+            actorx->world.angle.y = l_pc_pvp_knock.angle;
+            l_pc_pvp_knock.elapsed += (f32)gamePT->graph->dt_num_60fps_frames;
+        }
+    }
+    pc_net_game_pvp_trace(player->now_main_index, actorx->speed, pos);
+    if (!pc_host_observer_active() && !mEv_IsTitleDemo()) {
+        pc_net_game_pvp_attacker_frame(player->now_main_index, player->changed_main_index ? 1 : 0,
+                                       player->keyframe0.frame_control.current_frame, pos, actorx->shape_info.rotation.y);
+    }
 }
 #endif

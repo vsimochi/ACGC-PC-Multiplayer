@@ -82,6 +82,7 @@
                      * pc_nes_fixnes.c) and compiles cleanly in the PC build. */
 
 #include "pc_puppet_pool.h" /* capacity phase 6: the slot pool */
+#include "pc_pvp_authority.h" /* player-vs-player tool hits: the read-only puppet queries defined here */
 #include <math.h> /* sqrtf() -- see the Stage 4B animation-speed formula in pc_remote_player_mv() */
 #include <string.h>
 #include <stdio.h>
@@ -1237,7 +1238,10 @@ static const PCStateRow s_state_rows[mPlayer_INDEX_NUM] = {
     [mPlayer_INDEX_NOTICE_BEE] = PCFB("notice_bee.c_inc:20-25: AnimationMove ROT_Y base rotation (ct_base) replaces the root rotation: not reproducible without per-frame AnimationMove_base"),
     /* REMOVE_GRASS 98 (m_player_main_remove_grass.c_inc:25-27): SetupItem_Base1(ZASSOU1) + Base2(ZASSOU1, item pose, 1, 1, 0.5, morph -6, STOP, PART_TABLE_PICK_UP (explicit, not the item's)). The frame-17 weed-pull presentation (grass_mud effect + zassou_nuku sound, only while the target tile still holds grass) is the Phase 6b tool table; the weed removal itself is a world change and stays host-authoritative. */
     [mPlayer_INDEX_REMOVE_GRASS] = PCROW_ITEM("remove_grass", mPlayer_ANIM_ZASSOU1, mPlayer_PART_TABLE_PICK_UP, PC_STOP, 0, -1, PC_NETANG_RESET),
-    [mPlayer_INDEX_SHOCK] = PCFB("shock.c_inc:34-36,84-114: WAIT1 for a REQUEST-dependent start_time (20/24/60 ticks, not synced) then GAAAN1 -> GAAAN2: time-driven phases the wire cannot reproduce"),
+    /* SHOCK 99 (m_player_main_shock.c_inc:19-38,84-115): WAIT1 until the request's start_time, then SetupItem_Base1(GAAAN1) + Base2(GAAAN1, item pose, 1, 1, 0.5, -5, STOP, part
+     * table from SetupItem); when GAAAN1 has stopped the state binds GAAAN2 the same way in REPEAT -> chain_anim GAAAN2. The start_time is not on the wire: the row is the
+     * start_time 0 form a player-vs-player hit requests (pc_pvp_authority.h); a bee / axe-bounce shock (start 20/24/60) just skips its short WAIT1 lead-in on the puppet. */
+    [mPlayer_INDEX_SHOCK] = PCROW_ITEM("shock", mPlayer_ANIM_GAAAN1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1, mPlayer_ANIM_GAAAN2, PC_NETANG_RESET),
     /* KNOCK_DOOR 100 (m_player_main_knock_door.c_inc:27-33): SetupItem_Base1(KNOCK1) + Base2(KNOCK1, item pose, 1, 1, 0.5, morph -5, STOP, part table from SetupItem), under ct_base ROT_Y|TRANS_XZ: the synced position is already the knock position, so ROOT_PIN. The sound at the knock frame is not reproduced. */
     [mPlayer_INDEX_KNOCK_DOOR] = PCROW_ITEM("knock_door", mPlayer_ANIM_KNOCK1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_ROOT_PIN, -1, PC_NETANG_RESET),
     [mPlayer_INDEX_CHANGE_CLOTH] = PCFB("change_cloth.c_inc:49-62: clip/speed by try_on_flag (MENU_CHANGE1 @1.0 vs ITAZURA1 @0.5), not synced"),
@@ -5422,6 +5426,67 @@ int pc_remote_player_host_npc_push(GAME* game, const ACTOR* npc, float npc_radiu
         contacts++;
     }
     return contacts;
+}
+
+/* ---- player-vs-player tool hits (pc_pvp_authority.h): read-only puppet queries ---- */
+extern int pc_net_game_pvp_test_off(void); /* pc_net_game.c: TEST-ONLY AC_TEST_PVP_OFF (0 in normal play) */
+
+int pc_pvp_is_puppet_actor(const void* actor) {
+    const ACTOR* a = (const ACTOR*)actor;
+    return a != NULL && a->mv_proc == pc_remote_player_mv && a->dw_proc == pc_remote_player_dw && !pc_net_game_pvp_test_off();
+}
+
+/* the pvp-eligible puppet of a slot: live, in the SAME town field as this process, visible, placed, not stale, no door row */
+static PCRemotePlayerActor* pc_remote_player_pvp_eligible(PCRemotePlayerSlot* slot, GAME_PLAY* play) {
+    PCRemotePlayerActor* self;
+    if (!slot->in_use || !pc_remote_player_actor_is_live(slot) || (uint64_t)(uintptr_t)slot->actor >= PC_LOWADDR_LIMIT) {
+        return NULL;
+    }
+    self = (PCRemotePlayerActor*)slot->actor;
+    if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized || slot->snap_req ||
+        pc_remote_player_body_hidden(self) ||
+        (self->visual.row_active && (self->visual.row_idx == (int)mPlayer_INDEX_KNOCK_DOOR || self->visual.row_idx == (int)mPlayer_INDEX_DOOR ||
+                                     self->visual.row_idx == (int)mPlayer_INDEX_OUTDOOR)) ||
+        (graph_dt_frame_time((GAME*)play) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+        return NULL;
+    }
+    return self;
+}
+
+int pc_pvp_puppet_targets(int* ids, float (*pos)[3], int max) {
+    GAME_PLAY* play;
+    int i, n = 0;
+    if (gamePT == NULL || gamePT->exec != play_main || ids == NULL || pos == NULL || max <= 0 || !s_pool_ready) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0 && n < max; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        PCRemotePlayerActor* self = (slot != NULL) ? pc_remote_player_pvp_eligible(slot, play) : NULL;
+        if (self == NULL) {
+            continue;
+        }
+        ids[n] = slot->peer_id;
+        pos[n][0] = self->actor_class.world.position.x;
+        pos[n][1] = self->actor_class.world.position.y;
+        pos[n][2] = self->actor_class.world.position.z;
+        n++;
+    }
+    return n;
+}
+
+int pc_pvp_puppet_near(float x, float z, float radius) {
+    int ids[64];
+    float pos[64][3];
+    const int n = pc_net_game_pvp_test_off() ? 0 : pc_pvp_puppet_targets(ids, pos, 64);
+    int i;
+    for (i = 0; i < n; i++) {
+        const float dx = pos[i][0] - x, dz = pos[i][2] - z;
+        if (dx * dx + dz * dz < radius * radius) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {

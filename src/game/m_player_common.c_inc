@@ -3212,7 +3212,13 @@ static int Player_actor_Check_axe_after(ACTOR* actorx, xyz_t* target_pos_p, mAct
     *fg_p = EMPTY_NO;
     *reflect_actor_pp = NULL;
 
-    if (Player_actor_Check_OBJtoLine_forItem_axe(actorx)) {
+    if (Player_actor_Check_OBJtoLine_forItem_axe(actorx)
+#ifdef TARGET_PC
+        /* player-vs-player tool hits: another player's puppet never reflects the axe (no recoil, no +3 wear); the swing
+         * goes on to the tree / air check and the hit itself is the host-validated PVP_HIT_REQ (pc_pvp_authority.h) */
+        && !pc_pvp_is_puppet_actor(player->item_axe_tris.collision_obj.collided_actor)
+#endif
+    ) {
         ClObjTris_c* axe_tris_p = &player->item_axe_tris;
         ClObjTrisElem_c* axe_tris_elem_p = axe_tris_p->elements;
         ClObjTrisElemAttr_c* axe_tris_elem_attr_p = &axe_tris_elem_p->attribute;

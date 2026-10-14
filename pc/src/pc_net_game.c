@@ -577,6 +577,11 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_VILLAGER_OUTFIT       = 90, /* worker B (v8 extended in place, NO version bump), host -> every READY client, RELIABLE, 128 bytes: the town villagers' outfits as the HOST
                                              * holds them (Save_t.animals[].cloth / cloth_original_id / umbrella_id, guarded by npc_id), sent on change and at READY. The client writes them into
                                              * its local Save copy whenever that villager has no live actor (an actor writes its drawn outfit back at its save). An old client ignores the id. */
+    PC_NETGAME_MSG_PVP_HIT_REQ           = 91, /* player-vs-player tool hits (v8 extended in place, NO version bump), client -> host ONLY, RELIABLE, 16 bytes: "my axe / shovel / net
+                                             * touched player T at its contact frame". The host validates (town field, recent swing in the MOVE stream, range, facing cone, rate, victim
+                                             * immunity, arrival protection) and answers the victim only with PVP_HIT. Reactions only. See PCPvpHitReqMsg / pc_pvp_authority.h. */
+    PC_NETGAME_MSG_PVP_HIT               = 92, /* host -> the VICTIM client only, RELIABLE, 12 bytes: tumble / shock + knockback angle. The victim applies it from its own player
+                                             * frame, only in an allowlisted state. Old peers ignore both ids. See PCPvpHitMsg. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -4918,6 +4923,8 @@ static void pcnetgame_mvprof_report(uint64_t now) {
     s_mvprof.t_start = now;
 }
 
+static void pcnetgame_pvp_note_move(int peer, const PCNetMoveSample* s); /* player-vs-player block (later in this file) */
+
 static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_wire) {
     PCNetMoveMsg msg = *in_wire; /* private copy: action_state may be zeroed below (never the position fields) */
     uint64_t prof_t0 = 0;
@@ -4945,6 +4952,7 @@ static void pcnetgame_handle_host_move(PCNetPeerId peer, const PCNetMoveMsg* in_
 
     pcnetgame_move_msg_to_sample(in, &sample);
     pc_remote_player_on_move((PCNetPlayerId)peer, &sample); /* the host's own view of this client */
+    pcnetgame_pvp_note_move((int)peer, &sample); /* player-vs-player: the time of the sender's latest swing state (PVP_HIT_REQ validation) */
 
     /* Relay to every OTHER ready client, tagging net_player_id with the TRUE originating peer id
      * -- never the client-supplied (and here, ignored) value -- and never back to the sender.
@@ -6813,6 +6821,10 @@ static void pcnetgame_reset_all_host_peer_state(PCNetPeerId peer) {
     {
         extern void pc_net_game_ball_peer_gone(int peer); /* worker-2 ball block (later in this file): fresh kick rate/seq for a reused slot */
         pc_net_game_ball_peer_gone((int)peer);
+        {
+            extern void pc_net_game_pvp_peer_gone(int peer); /* player-vs-player block: fresh rate / seq / arrival records for a reused slot */
+            pc_net_game_pvp_peer_gone((int)peer);
+        }
     }
     /* Stage 5A / 5B-1 / two-phase: clear the dedup records AND release any reservation they hold (the
      * reservation table is the set of PENDING records, so this is the single place a dead or reused
@@ -9673,6 +9685,348 @@ void pc_net_game_ball_client_kick(const float player_pos[3], float spd_x, float 
     }
     m.seq = seq;
     (void)pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+}
+
+/* ---- Player-vs-player tool hits (PC_NETGAME_MSG_PVP_HIT_REQ = 91, PC_NETGAME_MSG_PVP_HIT = 92; pc_pvp_authority.h) ----
+ * REACTIONS ONLY, always on (no host switch, no per-player opt-out), residents and guests alike, town field only. The attacker's own
+ * process detects the contact with its own geometry at the tool's contact frame (axe 15 / shovel 13 from the player hook in m_player.c,
+ * the net from Player_actor_HitBGCheck_Swing_net) against the visible puppets and sends PVP_HIT_REQ (a host's own player is validated
+ * locally by the same function). The host validates (pc_pvp_host_validate) and sends PVP_HIT to the victim only (or queues it for its own
+ * player). The victim consumes it from its own player frame (Player_actor_pc_pvp_pre) in an allowlisted state only. No item, pocket,
+ * wallet, axe-wear or field write anywhere in this block. */
+#include "pc_pvp_authority.h"
+#include "m_lib.h" /* _Game_play_isPause() */
+_Static_assert((int)PC_PVP_IDX_WAIT == (int)mPlayer_INDEX_WAIT && (int)PC_PVP_IDX_WALK == (int)mPlayer_INDEX_WALK && (int)PC_PVP_IDX_RUN == (int)mPlayer_INDEX_RUN &&
+               (int)PC_PVP_IDX_DASH == (int)mPlayer_INDEX_DASH && (int)PC_PVP_IDX_TUMBLE == (int)mPlayer_INDEX_TUMBLE && (int)PC_PVP_IDX_TUMBLE_GETUP == (int)mPlayer_INDEX_TUMBLE_GETUP &&
+               (int)PC_PVP_IDX_TURN_DASH == (int)mPlayer_INDEX_TURN_DASH, "pvp: locomotion indexes");
+_Static_assert((int)PC_PVP_IDX_SWING_AXE == (int)mPlayer_INDEX_SWING_AXE && (int)PC_PVP_IDX_AIR_AXE == (int)mPlayer_INDEX_AIR_AXE && (int)PC_PVP_IDX_REFLECT_AXE == (int)mPlayer_INDEX_REFLECT_AXE &&
+               (int)PC_PVP_IDX_READY_NET == (int)mPlayer_INDEX_READY_NET && (int)PC_PVP_IDX_READY_WALK_NET == (int)mPlayer_INDEX_READY_WALK_NET &&
+               (int)PC_PVP_IDX_SWING_NET == (int)mPlayer_INDEX_SWING_NET && (int)PC_PVP_IDX_PULL_NET == (int)mPlayer_INDEX_PULL_NET && (int)PC_PVP_IDX_STOP_NET == (int)mPlayer_INDEX_STOP_NET,
+               "pvp: axe / net indexes");
+_Static_assert((int)PC_PVP_IDX_DIG_SCOOP == (int)mPlayer_INDEX_DIG_SCOOP && (int)PC_PVP_IDX_FILL_SCOOP == (int)mPlayer_INDEX_FILL_SCOOP &&
+               (int)PC_PVP_IDX_REFLECT_SCOOP == (int)mPlayer_INDEX_REFLECT_SCOOP && (int)PC_PVP_IDX_AIR_SCOOP == (int)mPlayer_INDEX_AIR_SCOOP && (int)PC_PVP_IDX_SHOCK == (int)mPlayer_INDEX_SHOCK,
+               "pvp: shovel / shock indexes");
+static PCPvpHost s_pvp_host;
+static PCPvpVictim s_pvp_victim;
+static PCPvpAttacker s_pvp_atk;
+static int s_pvp_ready = 0;
+static int s_pvp_net_fired = 0;          /* this SWING_NET entry already hit a player (keep stopping, never resend) */
+static uint32_t s_pvp_log_budget = 96;   /* host reject log lines */
+static struct {
+    uint32_t sent, accepted, rejected, applied, dropped, refused;
+    int measuring;
+    float x0, z0;
+    uint32_t t0;
+} s_pvp_stat;
+
+static void pcnetgame_pvp_init(void) {
+    if (!s_pvp_ready) {
+        pc_pvp_host_reset(&s_pvp_host);
+        pc_pvp_victim_reset(&s_pvp_victim);
+        pc_pvp_attacker_reset(&s_pvp_atk);
+        s_pvp_ready = 1;
+    }
+}
+
+/* TEST-ONLY (PC_NET_TEST_HOOKS builds, AC_TEST_HOOKS=1 + AC_TEST_PVP_OFF=1): the whole feature off in this process, so a runtime test can show
+ * the vanilla behaviour (an axe reflecting off a puppet, a hole dug under one) with the same build. Never set in normal play: there is no
+ * player-facing or host switch. */
+int pc_net_game_pvp_test_off(void) {
+#ifdef PC_NET_TEST_HOOKS
+    static int s_off = -1;
+    if (s_off < 0) {
+        s_off = (pc_test_hook_getenv("AC_TEST_PVP_OFF") != NULL) ? 1 : 0;
+        if (s_off) {
+            printf("[NET][PVP] TEST-ONLY: player-vs-player hits are OFF in this process (AC_TEST_PVP_OFF)\n");
+        }
+    }
+    return s_off;
+#else
+    return 0;
+#endif
+}
+
+/* a session with a live town field on this process (host, or a READY client), never the hidden observer */
+static int pcnetgame_pvp_active(void) {
+    if (pc_net_game_pvp_test_off() || pc_host_observer_active() || !pcfa_scene_is_town()) {
+        return 0;
+    }
+    return s_role == PC_NETGAME_ROLE_HOST || (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY);
+}
+
+static void pcnetgame_pvp_note_move(int peer, const PCNetMoveSample* s) {
+    pcnetgame_pvp_init();
+    if (s != NULL && s->action_valid) {
+        pc_pvp_host_note_motion(&s_pvp_host, peer, (int)s->action_index, pcnetgame_now_ms());
+    }
+}
+
+void pc_net_game_pvp_peer_gone(int peer) {
+    pcnetgame_pvp_init();
+    pc_pvp_host_forget(&s_pvp_host, peer);
+}
+
+/* the host's view of one player (wire id) at validation time */
+static void pcnetgame_pvp_view(int player, PCPvpPlayerView* v) {
+    memset(v, 0, sizeof(*v));
+    if (player == PC_NETGAME_HOST_PLAYER_ID) {
+        PLAYER_ACTOR* pa;
+        if (s_role != PC_NETGAME_ROLE_HOST || pc_host_observer_active() || gamePT == NULL || gamePT->exec != play_main) {
+            return; /* the dedicated observer is never a target or an attacker */
+        }
+        pa = get_player_actor_withoutCheck((GAME_PLAY*)gamePT);
+        v->valid = 1;
+        v->in_town = pcfa_scene_is_town() ? 1 : 0;
+        if (pa != NULL) {
+            v->has_pos = 1;
+            v->x = pa->actor_class.world.position.x;
+            v->y = pa->actor_class.world.position.y;
+            v->z = pa->actor_class.world.position.z;
+        }
+        return;
+    }
+    if (player < 0 || player >= pcnetgame_peer_span() || s_host_peer_link[player] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    v->valid = 1;
+    v->in_town = pcnetgame_ball_peer_in_town(player) ? 1 : 0;
+    v->has_pos = pc_remote_player_get_last_position((PCNetPlayerId)player, &v->x, &v->y, &v->z) ? 1 : 0;
+}
+
+/* host: validate + deliver. attacker / target are wire ids (8 = the host's own player). */
+static void pcnetgame_pvp_host_judge(int attacker, const PCPvpHitReqMsg* m) {
+    PCPvpPlayerView av, tv;
+    PCPvpHitMsg hit;
+    int rc;
+    pcnetgame_pvp_init();
+    pcnetgame_pvp_view(attacker, &av);
+    pcnetgame_pvp_view((int)m->target, &tv);
+    rc = pc_pvp_host_validate(&s_pvp_host, attacker, m, &av, &tv, pcnetgame_now_ms(), (uint8_t)PC_NETGAME_MSG_PVP_HIT, &hit);
+    if (rc != PC_PVP_OK) {
+        s_pvp_stat.rejected++;
+        if (s_pvp_log_budget > 0) {
+            s_pvp_log_budget--;
+            printf("[NET][PVP] host: hit by %d on %d tool %u seq %u rejected (reason %d %s)\n", attacker, (int)m->target, (unsigned)m->tool, (unsigned)m->seq, rc,
+                   pc_pvp_reason_name(rc));
+        }
+        return;
+    }
+    s_pvp_stat.accepted++;
+    printf("[NET][PVP] host: hit by %d on %d tool %u seq %u accepted -> %s angle %d speed %.2f (hit seq %u)\n", attacker, (int)m->target, (unsigned)m->tool,
+           (unsigned)m->seq, hit.reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : "SHOCK", (int)hit.knock_angle, (double)hit.knock_speed, (unsigned)hit.seq);
+    if ((int)m->target == PC_NETGAME_HOST_PLAYER_ID) {
+        (void)pc_pvp_victim_offer(&s_pvp_victim, &hit, pcnetgame_now_ms()); /* the host's own player is the victim */
+    } else {
+        (void)pc_net_send((PCNetPeerId)m->target, PC_NET_RELIABLE, &hit, (uint16_t)sizeof(hit)); /* the victim ONLY */
+    }
+}
+
+static void pcnetgame_handle_host_pvp_req(PCNetPeerId peer, const PCPvpHitReqMsg* in) {
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY || pc_net_game_pvp_test_off()) {
+        return;
+    }
+    pcnetgame_pvp_host_judge((int)peer, in);
+}
+
+static void pcnetgame_handle_client_pvp_hit(const PCPvpHitMsg* in) {
+    pcnetgame_pvp_init();
+    if (s_client_link != PC_NETGAME_LINK_READY || !pcfa_scene_is_town()) {
+        return;
+    }
+    if (pc_pvp_victim_offer(&s_pvp_victim, in, pcnetgame_now_ms())) {
+        printf("[NET][PVP] client: PVP_HIT from %u tool %u reaction %u seq %u queued\n", (unsigned)in->attacker, (unsigned)in->tool, (unsigned)in->reaction,
+               (unsigned)in->seq);
+    }
+}
+
+/* host poll: scene / arrival tracking for every READY player and the host's own, and its own swing state */
+static void pcnetgame_pvp_host_tick(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    int i;
+    pcnetgame_pvp_init();
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            pc_pvp_host_note_scene(&s_pvp_host, i, pcnetgame_ball_peer_in_town(i), now);
+        }
+    }
+    if (!pc_host_observer_active() && gamePT != NULL && gamePT->exec == play_main) {
+        PLAYER_ACTOR* pa = get_player_actor_withoutCheck((GAME_PLAY*)gamePT);
+        pc_pvp_host_note_scene(&s_pvp_host, PC_NETGAME_HOST_PLAYER_ID, pcfa_scene_is_town(), now);
+        if (pa != NULL) {
+            pc_pvp_host_note_motion(&s_pvp_host, PC_NETGAME_HOST_PLAYER_ID, (int)pa->now_main_index, now);
+        }
+    }
+}
+
+/* attacker: one request (client) or a local judgement (host) */
+static int pcnetgame_pvp_attack(int target, int tool, const float pos[3], int16_t facing) {
+    PCPvpHitReqMsg m;
+    uint16_t seq;
+    if (!pc_pvp_attacker_next(&s_pvp_atk, pcnetgame_now_ms(), &seq)) {
+        s_pvp_stat.refused++;
+        return 0;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_PVP_HIT_REQ;
+    m.target = (uint8_t)target;
+    m.tool = (uint8_t)tool;
+    m.seq = seq;
+    m.facing = facing;
+    m.pos_x = pos[0];
+    m.pos_z = pos[2];
+    if (!pc_pvp_req_msg_valid(&m)) {
+        return 0;
+    }
+    s_pvp_stat.sent++;
+    printf("[NET][PVP] attacker: tool %d contact on player %d (seq %u, at %.1f %.1f facing %d)\n", tool, target, (unsigned)seq, (double)pos[0], (double)pos[2],
+           (int)facing);
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        pcnetgame_pvp_host_judge(PC_NETGAME_HOST_PLAYER_ID, &m); /* the host's own player: the same validation */
+    } else {
+        (void)pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+    }
+    return 1;
+}
+
+/* the nearest visible puppet the tool geometry touches; -1 none */
+static int pcnetgame_pvp_pick(int tool, const float pos[3], int16_t facing, const float* net_a, const float* net_b) {
+    int ids[64];
+    float tp[64][3];
+    const int n = pc_pvp_puppet_targets(ids, tp, 64);
+    int i, best = -1;
+    float bd = 1e30f;
+    for (i = 0; i < n; i++) {
+        int hit;
+        float dx, dz;
+        if (ids[i] < 0 || ids[i] >= 0xFF) {
+            continue;
+        }
+        if (tool == PC_PVP_TOOL_AXE) {
+            hit = pc_pvp_axe_hits(pos[0], pos[1], pos[2], facing, tp[i][0], tp[i][1], tp[i][2]);
+        } else if (tool == PC_PVP_TOOL_SHOVEL) {
+            hit = pc_pvp_shovel_hits(pos[0], pos[1], pos[2], facing, tp[i][0], tp[i][1], tp[i][2]);
+        } else {
+            hit = pc_pvp_net_hits(net_a, net_b, tp[i][0], tp[i][1], tp[i][2]);
+        }
+        dx = tp[i][0] - pos[0];
+        dz = tp[i][2] - pos[2];
+        if (hit && dx * dx + dz * dz < bd) {
+            bd = dx * dx + dz * dz;
+            best = ids[i];
+        }
+    }
+    return best;
+}
+
+void pc_net_game_pvp_attacker_frame(int main_index, int entered, float frame, const float pos[3], int16_t facing) {
+    pcnetgame_pvp_init();
+    if (entered) {
+        pc_pvp_attacker_on_entry(&s_pvp_atk, main_index);
+        if (main_index == mPlayer_INDEX_SWING_NET) {
+            s_pvp_net_fired = 0;
+        }
+    }
+    if (s_pvp_stat.measuring && (uint32_t)(pcnetgame_now_ms() - s_pvp_stat.t0) >= 2000u) { /* victim: the knockback distance, 2 s after the reaction */
+        const float dx = pos[0] - s_pvp_stat.x0, dz = pos[2] - s_pvp_stat.z0;
+        s_pvp_stat.measuring = 0;
+        printf("[NET][PVP] victim: knockback %.1f units (from %.1f %.1f to %.1f %.1f, main %d)\n", (double)sqrtf(dx * dx + dz * dz), (double)s_pvp_stat.x0,
+               (double)s_pvp_stat.z0, (double)pos[0], (double)pos[2], main_index);
+    }
+    if (!pcnetgame_pvp_active() || !pc_pvp_attacker_contact(&s_pvp_atk, main_index, frame)) {
+        return;
+    }
+    {
+        const int tool = pc_pvp_tool_of_index(main_index);
+        const int target = pcnetgame_pvp_pick(tool, pos, facing, NULL, NULL);
+        if (target < 0) {
+#ifdef PC_NET_TEST_HOOKS
+            printf("[NET][PVP] attacker: tool %d contact (main %d frame %.1f) touched no player\n", tool, main_index, (double)frame);
+#endif
+            return;
+        }
+        (void)pcnetgame_pvp_attack(target, tool, pos, facing);
+    }
+}
+
+int pc_net_game_pvp_net_hit(const float net_start[3], const float net_end[3], const float pos[3], int16_t facing) {
+    int target;
+    pcnetgame_pvp_init();
+    if (!pcnetgame_pvp_active()) {
+        return 0;
+    }
+    if (s_pvp_net_fired) {
+        return 1; /* already hit a player in this swing (the STOP_NET request may still be pending) */
+    }
+    target = pcnetgame_pvp_pick(PC_PVP_TOOL_NET, pos, facing, net_start, net_end);
+    if (target < 0 || !pcnetgame_pvp_attack(target, PC_PVP_TOOL_NET, pos, facing)) {
+        return 0;
+    }
+    s_pvp_net_fired = 1;
+    return 1;
+}
+
+int pc_net_game_pvp_victim_take(int main_index, int holding_balloon, int* reaction, int16_t* knock_angle, float* knock_speed, int16_t* face_angle) {
+    PCPvpHitMsg m;
+    int dropped = 0, block;
+    pcnetgame_pvp_init();
+    if (!s_pvp_victim.has_pending) {
+        return 0;
+    }
+    if (!pcnetgame_pvp_active()) {
+        s_pvp_victim.has_pending = 0; /* the session / the town field is gone */
+        return 0;
+    }
+    block = mDemo_CheckDemo() ? 1 : 0;
+    {
+        extern int g_pc_paused; /* pc_pause_menu.c: the Esc menu (a multiplayer host keeps its world running behind it) */
+        if (g_pc_paused) {
+            block = 1;
+        }
+    }
+    if (gamePT != NULL && gamePT->exec == play_main && (((GAME_PLAY*)gamePT)->submenu.open_flag || _Game_play_isPause((GAME_PLAY*)gamePT) == 1)) {
+        block = 1;
+    }
+    if (!pc_pvp_victim_take(&s_pvp_victim, pcnetgame_now_ms(), main_index, block, &m, &dropped)) {
+        if (dropped) {
+            s_pvp_stat.dropped++;
+            printf("[NET][PVP] victim: hit seq %u from %u dropped (busy: main %d, demo %d)\n", (unsigned)s_pvp_victim.pending.seq, (unsigned)s_pvp_victim.pending.attacker,
+                   main_index, block);
+        }
+        return 0;
+    }
+    *reaction = pc_pvp_victim_reaction((int)m.reaction, holding_balloon);
+    *knock_angle = m.knock_angle;
+    *knock_speed = (*reaction == PC_PVP_REACT_TUMBLE) ? m.knock_speed : 0.0f;
+    *face_angle = (int16_t)(uint16_t)((uint16_t)m.knock_angle + 0x8000u); /* turn toward the attacker */
+    printf("[NET][PVP] victim: hit seq %u from %u tool %u -> %s%s (main %d)\n", (unsigned)m.seq, (unsigned)m.attacker, (unsigned)m.tool,
+           *reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : "SHOCK", (*reaction != (int)m.reaction) ? " (balloon guard)" : "", main_index);
+    return 1;
+}
+
+/* TEST-ONLY diagnostics (PC_NET_TEST_HOOKS): the victim's speed / position for 1.2 s after an applied reaction (every 4th frame) */
+void pc_net_game_pvp_trace(int main_index, float speed, const float pos[3]) {
+#ifdef PC_NET_TEST_HOOKS
+    static uint32_t s_n = 0;
+    if (s_pvp_stat.measuring && (uint32_t)(pcnetgame_now_ms() - s_pvp_stat.t0) < 1200u && (s_n++ % 4u) == 0u) {
+        printf("[NET][PVP] victim trace: main %d speed %.3f pos %.1f %.1f %.1f\n", main_index, (double)speed, (double)pos[0], (double)pos[1], (double)pos[2]);
+    }
+#else
+    (void)main_index;
+    (void)speed;
+    (void)pos;
+#endif
+}
+
+void pc_net_game_pvp_victim_applied(int reaction, int entered, int main_index, const float pos[3]) {
+    if (entered) {
+        s_pvp_stat.applied++;
+        s_pvp_stat.measuring = 1;
+        s_pvp_stat.x0 = pos[0];
+        s_pvp_stat.z0 = pos[2];
+        s_pvp_stat.t0 = pcnetgame_now_ms();
+    }
+    printf("[NET][PVP] victim: %s %s (main %d at %.1f %.1f)\n", reaction == PC_PVP_REACT_TUMBLE ? "TUMBLE" : "SHOCK", entered ? "entered" : "NOT entered (request refused)",
+           main_index, (double)pos[0], (double)pos[2]);
 }
 
 /* ---- Tree-drop falling-item animation (PC_NETGAME_MSG_TREE_DROP, PRESENTATION ONLY) ----
@@ -33477,6 +33831,15 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         pcnetgame_handle_host_ghost_hunt(peer, &gh); /* spirit hunt: a client accepted the Wisp's request */
         return;
     }
+    if (size == sizeof(PCPvpHitReqMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT_REQ) {
+        PCPvpHitReqMsg pr;
+        memcpy(&pr, data, sizeof(pr));
+        pcnetgame_handle_host_pvp_req(peer, &pr); /* player-vs-player: validated, then PVP_HIT to the victim only */
+        return;
+    }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT || data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT_REQ) {
+        return; /* player-vs-player: a client never sends PVP_HIT; a wrong-size request is dropped */
+    }
 
     if (data[0] == (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION) {
         /* M9-C: PLAYER_ACTION is host -> client only; a client never originates it. Dropped, never relayed. */
@@ -34170,6 +34533,12 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCBallStateMsg bst;
         memcpy(&bst, data, sizeof(bst));
         pcnetgame_handle_client_ball_state(&bst); /* worker-2 ball: the host's authoritative ball snapshot */
+        return;
+    }
+    if (size == sizeof(PCPvpHitMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT) {
+        PCPvpHitMsg ph;
+        memcpy(&ph, data, sizeof(ph));
+        pcnetgame_handle_client_pvp_hit(&ph); /* player-vs-player: queued; applied from this player's own frame in an allowlisted state */
         return;
     }
     if (size == sizeof(PCNetGameDresserStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_DRESSER_STATE) {
@@ -38060,6 +38429,7 @@ void pc_net_game_poll(void) {
         pcnetgame_pdata_host_tick();  /* personal data sync (diary): page poll, PDATA_PUSH pump, commit deadline (shares the hup_* / hpush_* state of the house path) */
         pcnetgame_host_world_poll();
         pcnetgame_ball_host_tick(); /* worker-2 ball: BALL_STATE to READY clients in the town field */
+        pcnetgame_pvp_host_tick();  /* player-vs-player: arrival / scene tracking + the host's own swing state */
     } else {
         pcnetgame_rc_tick(); /* auto-reconnect: backoff / attempt window / stable reset */
         pcnetgame_client_tick();
@@ -41124,6 +41494,30 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             s_ap.active = 0;
         } else if (strcmp(cmd, "dpad") == 0) {
             s_ap.press_dpad = 6; /* frames */
+        } else if (strcmp(cmd, "face") == 0 && sscanf(line, "%*d %*s %f %f", &a, &b) == 2) { /* TEST-ONLY (pvp): face X Z -- a POSITIONING AID like tp: the player turns toward X,Z */
+            PLAYER_ACTOR* fpa = get_player_actor_withoutCheck((GAME_PLAY*)gamePT);
+            const int16_t fang = pc_pvp_angle_to(px, pz, a, b);
+            fpa->actor_class.shape_info.rotation.y = fang;
+            fpa->actor_class.world.angle.y = fang;
+            printf("[AUTO] done %d face ok angle %d toward (%.1f,%.1f)\n", id, (int)fang, (double)a, (double)b);
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "swing") == 0) { /* TEST-ONLY (pvp): swing -- one real A press with the equipped tool once the player stands (WAIT); answers after 3 s */
+            s_ap.stage = 0;
+        } else if (strcmp(cmd, "pvpstat") == 0) { /* TEST-ONLY (pvp): wallet, equipment, axe wear, a pocket digest, the main index and the pvp counters */
+            uint32_t ph = 0u; /* ORDER-INDEPENDENT digest of the pockets + the equipped item (the D-pad tool cycle may swap them) */
+            int pi2;
+            char d2[200];
+            for (pi2 = 0; Now_Private != NULL && pi2 < mPr_POCKETS_SLOT_COUNT; pi2++) {
+                ph += ((uint32_t)Now_Private->inventory.pockets[pi2] * 2654435761u) ^ 0x5bd1e995u;
+            }
+            if (Now_Private != NULL) {
+                ph += ((uint32_t)Now_Private->equipment * 2654435761u) ^ 0x5bd1e995u;
+            }
+            snprintf(d2, sizeof(d2), "wallet=%u equip=0x%04X axe_damage=%d pockets=%08X main=%d sent=%u accepted=%u rejected=%u applied=%u dropped=%u refused=%u",
+                     Now_Private != NULL ? (unsigned)Now_Private->inventory.wallet : 0u, Now_Private != NULL ? (unsigned)Now_Private->equipment : 0u,
+                     (int)Common_Get(axe_damage), (unsigned)ph, pcnetgame_ap_player_state(NULL), s_pvp_stat.sent, s_pvp_stat.accepted, s_pvp_stat.rejected,
+                     s_pvp_stat.applied, s_pvp_stat.dropped, s_pvp_stat.refused);
+            pcnetgame_ap_done("ok", d2);
         } else if (strcmp(cmd, "fish") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) {
             s_ap.golden = (strstr(line, "golden") != NULL); /* fish creature ENT with the real rod: equip, stand where the cast lands on it, cast, hook the bite */
             s_ap.entity = (uint32_t)ent;
@@ -41224,6 +41618,35 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
         }
         if ((uint32_t)(now - s_ap.stage_ms) > 8000u) {
             pcnetgame_ap_done("ok", "dig: A pressed, waited 8 s");
+        }
+        return 0;
+    }
+    if (strcmp(s_ap.cmd, "swing") == 0) { /* TEST-ONLY (pvp): stage 0 wait for a standing player (and 1.5 s after the command), 1 A held 120 ms, 2 report after 3 s */
+        static char s_seen[96];
+        static int s_last_mi = -2;
+        const int smi = pcnetgame_ap_player_state(NULL);
+        if (s_ap.stage == 0) {
+            if ((uint32_t)(now - s_ap.t0) > 1500u && smi == mPlayer_INDEX_WAIT) {
+                s_ap.a_until = now + 120u;
+                s_ap.stage = 1;
+                s_ap.stage_ms = now;
+                s_seen[0] = 0;
+                s_last_mi = -2;
+                printf("[AUTO] %d swing: pressing A (main_index %d, equipment 0x%04X)\n", s_ap.id, smi, (unsigned)Now_Private->equipment);
+            }
+            return 0;
+        }
+        if (smi != s_last_mi && strlen(s_seen) < sizeof(s_seen) - 6) { /* the main indexes the swing went through */
+            s_last_mi = smi;
+            snprintf(s_seen + strlen(s_seen), sizeof(s_seen) - strlen(s_seen), "%d,", smi);
+        }
+        if (s_ap.a_until != 0u && (int32_t)(s_ap.a_until - now) > 0) {
+            return 1u;
+        }
+        if ((uint32_t)(now - s_ap.stage_ms) > 3000u) {
+            char d2[160];
+            snprintf(d2, sizeof(d2), "swing: A pressed, waited 3 s (states %s axe_damage %d)", s_seen, (int)Common_Get(axe_damage));
+            pcnetgame_ap_done("ok", d2);
         }
         return 0;
     }
