@@ -87,8 +87,10 @@ def main():
        and "pc_net_game_guest_address_list(name_p, room)" in mk and mk.index("pc_net_game_guest_address_list") < mk.index("mMsm_GetMuseumMailName(name_p);"))
     ck("J the post office girl (client): a guest of the directory is an address (the host re-checks); a museum letter with a gift is still refused (unchanged)",
        "return (mMl_hunt_for_send_address(mail) == -1 && !pc_net_game_guest_address_known(&mail->header.recipient.personalID)) ? 1 : 0;" in pg
-       # worker B re-pin: a museum letter with a gift is now a HOST transaction (MUSEUM_MAIL kind 19): the museum is always an address on a client (0)
-       and "if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {\n            return 0;" in pg)
+       # worker B re-pin: a museum letter with a gift is now a HOST transaction (MUSEUM_MAIL kind 19); release 0.2.0 re-pin: only on a host that knows kind 19
+       # (town service 6 announced, no BAD_SHAPE latch), else the existing refusal row 1 (see test_old_host_compat_src.py)
+       and "if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {" in pg
+       and "return pc_net_game_museum_mail_available() ? 0 : 1;" in pg)
     ck("J the post office girl (the HOST's own player): a letter to a guest is checked (0 / 2 = mailbox full) and delivered locally instead of the post office",
        "const int g = pc_net_game_host_guest_letter_check(mail);" in pg and "if (!client_mail && !pc_net_game_host_guest_letter_post(&play->submenu.mail))" in pg)
     hp = func_body(c_raw, "pc_net_game_host_guest_letter_post")

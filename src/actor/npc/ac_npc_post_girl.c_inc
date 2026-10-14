@@ -92,7 +92,10 @@ int aPG_check_destination(Mail_c *mail){
             return (mMl_hunt_for_send_address(mail) == -1 && !pc_net_game_guest_address_known(&mail->header.recipient.personalID)) ? 1 : 0;
         }
         if (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO) {
-            return 0; /* worker B: the museum is always an address; the HOST runs the museum's side (MUSEUM_MAIL kind 19, aPG_client_mail_step) and answers MUSEUM_FULL */
+            /* worker B: the HOST runs the museum's side (MUSEUM_MAIL kind 19, aPG_client_mail_step) and answers MUSEUM_FULL. Old-host compatibility: a host
+             * that does not know kind 19 (0.1.1, or one that answered it BAD_SHAPE in this session) gets nothing: res 1 = the existing refusal row hands the
+             * letter and its gift back, as before worker B. */
+            return pc_net_game_museum_mail_available() ? 0 : 1;
         }
     }
 #endif

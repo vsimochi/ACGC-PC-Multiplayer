@@ -1,6 +1,6 @@
 # Launcher and auto-updater (`ACLauncher.exe`)
 
-Status: implemented and tested **offline** (local HTTP fixtures). **No official GitHub Release exists yet** (`/releases/latest` of `vsimochi/ACGC-PC-Multiplayer` answers 404 when checked), so nothing can be updated from GitHub until a maintainer publishes a package as described below.
+Status: implemented, tested offline (local HTTP fixtures) and used for the published releases of `vsimochi/ACGC-PC-Multiplayer` since Beta 0.1.0 (`/releases/latest` names the newest stable release). A release without a valid package is never installed (see below).
 
 ## For players
 

@@ -488,8 +488,8 @@ def main():
     check("6n the host gate uses the ONE pure function; build default 1 only under #ifdef PC_DRESSER_STORAGE_DEFAULT_ON; env override; the 4 log strings",
           'const char* e = getenv("AC_MP_DRESSER_STORAGE");' in hr and "if (!pc_dresser_feature_enabled_from_env(e, build_default)) {" in hr and
           "#ifdef PC_DRESSER_STORAGE_DEFAULT_ON\n        const int build_default = 1;" in hr and "#else\n        const int build_default = 0;" in hr and
-          "storage OFF (AC_MP_DRESSER_STORAGE=0)" in hr and "storage OFF (release default; AC_MP_DRESSER_STORAGE=1 enables)" in hr and
-          "storage ON (AC_MP_DRESSER_STORAGE=1)" in hr and "storage ON (dev-build default; AC_MP_DRESSER_STORAGE=0 disables)" in hr and
+          "storage OFF (AC_MP_DRESSER_STORAGE=0)" in hr and "storage OFF (build configured with PC_DRESSER_STORAGE_DEFAULT_ON=OFF; AC_MP_DRESSER_STORAGE=1 enables)" in hr and
+          "storage ON (AC_MP_DRESSER_STORAGE=1)" in hr and "storage ON (default; AC_MP_DRESSER_STORAGE=0 disables)" in hr and
           ng.count('getenv("AC_MP_DRESSER_STORAGE")') == 1 and
           "static inline int pc_dresser_feature_enabled_from_env(const char* env, int build_default) {" in dsh)
     import shutil as _sh, tempfile as _tf

@@ -20200,6 +20200,10 @@ static struct {
     int      notice_kind, notice_minutes;
     uint32_t notice_until;
 } s_up = { 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1 };
+/* Old-host compatibility (release 0.2.0): MUSEUM_MAIL (TXN kind 19) is sent only to a host that announced town service 6 (the capability proxy also used by
+ * HOUSE_UPGRADE kind 20: a 0.1.1 host never sends it) and never again in this session after the host answered kind 19 with BAD_SHAPE (a host that has
+ * service 6 but not kind 19). A 0.1.1 host counts every unknown-kind TXN_COMMIT as a record-protocol violation and closes the peer at the third. */
+static int s_mm_unsupported = 0;
 static void pcnetgame_ts_build_upgrade(uint8_t* blob);
 static int pcnetgame_ts_valid_upgrade_blob(const uint8_t* blob);
 static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob);
@@ -21434,14 +21438,14 @@ static int pcnetgame_dresser_host_ready(void) {
             if (e != NULL && strcmp(e, "0") == 0) {
                 printf("[NET][DRESSER] host: extra dresser storage OFF (AC_MP_DRESSER_STORAGE=0)\n");
             } else {
-                printf("[NET][DRESSER] host: extra dresser storage OFF (release default; AC_MP_DRESSER_STORAGE=1 enables)\n");
+                printf("[NET][DRESSER] host: extra dresser storage OFF (build configured with PC_DRESSER_STORAGE_DEFAULT_ON=OFF; AC_MP_DRESSER_STORAGE=1 enables)\n");
             }
             return 0;
         }
         if (e != NULL && strcmp(e, "1") == 0) {
             printf("[NET][DRESSER] host: extra dresser storage ON (AC_MP_DRESSER_STORAGE=1)\n");
         } else {
-            printf("[NET][DRESSER] host: extra dresser storage ON (dev-build default; AC_MP_DRESSER_STORAGE=0 disables)\n");
+            printf("[NET][DRESSER] host: extra dresser storage ON (default; AC_MP_DRESSER_STORAGE=0 disables)\n");
         }
         if (!pc_dresser_store_init(&s_dresser, PC_NETGAME_DRESSER_MAX_IDS)) {
             s_dresser_state = -1;
@@ -29286,6 +29290,10 @@ static void pcnetgame_run_txn_test_hook(void) {
  * is pending. The pocket changes ONLY in pcnetgame_txn_apply_applied() (host post-image); a REJECTED result changes nothing. */
 
 static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int applied) {
+    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL && !applied && s_ts_last_reason == (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE && !s_mm_unsupported) {
+        s_mm_unsupported = 1; /* old-host latch (see s_mm_unsupported): no further kind 19 in this session */
+        printf("[NET][MUSEUM][MAIL] client: the host does not know MUSEUM_MAIL (BAD_SHAPE): museum letters with a gift stay off for this session (old host)\n");
+    }
     if (kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL) {
         pcnetgame_mail_op_resolve(request_id, applied); /* mail milestone 1: the post girl's operation, not a town-service op */
         return;
@@ -31696,9 +31704,15 @@ static void pcnetgame_mail_reject_local(const char* why) {
     s_mail_op.reason = 0;
 }
 
+/* Old-host compatibility: 1 = this client may send a museum letter with a gift (MUSEUM_MAIL, kind 19) to its host: a READY client of a host that announced
+ * town service 6 and did not refuse kind 19 as unknown in this session. 0 = the post girl takes the existing refusal row (the letter and its gift stay). */
+int pc_net_game_museum_mail_available(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_up.c_have && !s_mm_unsupported;
+}
+
 /* Begins a MAIL_SEND of the letter in mail slot `slot` (a PLAYER-addressed, send-font letter). 1 = started (phase AWAIT_CLEAN), 0 = refused for good
  * (not a READY + SYNCED client, bad slot / letter): the caller takes its refusal path, -1 = busy (another operation / transaction is unresolved):
- * ask again next frame. Never changes the letter. */
+ * ask again next frame. Never changes the letter. A museum letter with a gift (kind 19) additionally needs pc_net_game_museum_mail_available(). */
 int pc_net_game_mail_begin_send(int slot) {
     PCNetGameOwnerStamp stamp;
     const Mail_c* ml;
@@ -31722,7 +31736,8 @@ int pc_net_game_mail_begin_send(int slot) {
     ml = &Now_Private->mail[slot];
     if (mMl_check_not_used_mail((Mail_c*)ml) == TRUE || !mMl_check_send_mail((Mail_c*)ml) ||
         !(ml->header.recipient.type == (u8)mMl_NAME_TYPE_PLAYER ||
-          (ml->header.recipient.type == (u8)mMl_NAME_TYPE_MUSEUM && ml->present != (mActor_name_t)EMPTY_NO && ml->present != (mActor_name_t)RSV_NO))) {
+          (ml->header.recipient.type == (u8)mMl_NAME_TYPE_MUSEUM && ml->present != (mActor_name_t)EMPTY_NO && ml->present != (mActor_name_t)RSV_NO &&
+           pc_net_game_museum_mail_available()))) { /* old-host compatibility: kind 19 only to a host that knows it */
         return 0; /* worker B: a letter WITH A GIFT to the museum goes through the host too (MUSEUM_MAIL, kind 19) */
     }
     if (!pcnetgame_capture_owner_stamp(&stamp)) {
@@ -35036,6 +35051,7 @@ static void pcnetgame_reset_client_session_state(void) {
     s_ts_last_reason = 0;
     memset(&s_mail_op, 0, sizeof(s_mail_op)); /* mail milestone 1: the post girl's operation dies with the session (a local refusal) */
     pcnetgame_hu_session_reset(); /* worker C: an unresolved house-upgrade op resolves as REJECTED (LINKLOST when it was sent); the old-host latch is per session */
+    s_mm_unsupported = 0;         /* old-host compatibility: the MUSEUM_MAIL latch is per session too */
     s_mail_last_reason = 0;
     memset(s_ts_client_seq, 0, sizeof(s_ts_client_seq));
     memset(&s_take_op, 0, sizeof(s_take_op)); /* mail milestone 2: the mailbox take dies with the session (a local refusal) ... */

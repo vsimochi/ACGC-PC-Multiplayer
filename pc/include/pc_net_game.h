@@ -774,6 +774,7 @@ int pc_net_game_ts_begin_house_purchase(int house_or_auto);
 #define PC_NETGAME_MAIL_REJECT_MAILBOX_FULL    24
 #define PC_NETGAME_MAIL_REJECT_PO_FULL         25
 int pc_net_game_mail_begin_send(int mail_slot);
+int pc_net_game_museum_mail_available(void); /* old-host compatibility: 1 = the host knows MUSEUM_MAIL (kind 19); 0 = the post girl refuses a museum gift letter locally */
 int pc_net_game_mail_poll(void);
 int pc_net_game_mail_last_reason(void);
 
