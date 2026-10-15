@@ -181,4 +181,45 @@ static inline int pcarr_join_decide(int link_handshake, int link_ready, int rost
     return n_stopped > 0 ? PCARR_JOIN_STOPPED : (n_riding > 0 ? PCARR_JOIN_RIDING : PCARR_JOIN_NONE);
 }
 
+/* ---- Hotfix 0.2.1: the arrival hold is BOUNDED ----
+ * 0.2.0 field reports: remote guests stayed parked at the train start (no train, no control) because the hold above had no end: over real latency the host's first world snapshot
+ * (roster_pending) or another player's first MOVE (unknown_slots) can take long or never complete. The hold is a nicety (joining another passenger's train), never a requirement, so:
+ *   - an 'unknown' slot (scene known, no MOVE yet) is only counted for PCARR_JOIN_UNKNOWN_WINDOW_MS after the link reached READY;
+ *   - the hold is released PCARR_JOIN_HOLD_READY_MS after READY, or PCARR_JOIN_HOLD_TOTAL_MS after the hold began (any link state), whichever comes first;
+ *     the arrival then starts with what is known (a known arrival is still joined, otherwise the normal arrival).
+ * Times are monotonic milliseconds measured by the caller (pc_net_game_now_ms on the client). A hold that ends normally before the limits is unchanged. */
+#define PCARR_JOIN_UNKNOWN_WINDOW_MS 3000u
+#define PCARR_JOIN_HOLD_READY_MS 4500u
+#define PCARR_JOIN_HOLD_TOTAL_MS 15000u
+#define PCARR_JOIN_HOLD_TRACE_MS 2000u /* the [JOIN] hold trace repeats this often while held */
+
+enum { PCARR_HOLD_KEEP = 0, PCARR_HOLD_TIMEOUT_READY = 1, PCARR_HOLD_TIMEOUT_TOTAL = 2 };
+
+/* 1 = an unknown slot still holds the joiner (READY not reached yet, or less than the window since READY) */
+static inline int pcarr_join_unknown_counts(int ready_seen, unsigned since_ready_ms) {
+    return !ready_seen || since_ready_ms < PCARR_JOIN_UNKNOWN_WINDOW_MS;
+}
+
+/* the hold limit: PCARR_HOLD_KEEP while within both limits, else which limit ended it (READY wins when both hold) */
+static inline int pcarr_join_hold_timeout(unsigned held_ms, int ready_seen, unsigned since_ready_ms) {
+    if (ready_seen && since_ready_ms >= PCARR_JOIN_HOLD_READY_MS) {
+        return PCARR_HOLD_TIMEOUT_READY;
+    }
+    if (held_ms >= PCARR_JOIN_HOLD_TOTAL_MS) {
+        return PCARR_HOLD_TIMEOUT_TOTAL;
+    }
+    return PCARR_HOLD_KEEP;
+}
+
+/* the bounded decision: `decided` from pcarr_join_decide; a timed-out hold starts the arrival with what is known */
+static inline int pcarr_join_decide_bounded(int decided, int timeout_reason, int n_stopped, int n_riding) {
+    if (decided >= 0) {
+        return decided;
+    }
+    if (timeout_reason == PCARR_HOLD_KEEP) {
+        return -1;
+    }
+    return n_stopped > 0 ? PCARR_JOIN_STOPPED : (n_riding > 0 ? PCARR_JOIN_RIDING : PCARR_JOIN_NONE);
+}
+
 #endif /* PC_REMOTE_ARRIVAL_LOGIC_H */

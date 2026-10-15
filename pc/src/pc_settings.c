@@ -29,6 +29,7 @@ PCSettings g_pc_settings = {
     .allow_new_guests = 1,
     .resident_tokens = 0,
     .show_ping = 0,
+    .client_log = 0,
     .town_serve = -1, /* -1 = AUTO: on for a --dedicated host (sanitized), off otherwise; an explicit off/on/full in settings.ini or --town-serve wins */
     .personal_sync = -1,
 };
@@ -116,7 +117,11 @@ static const char* DEFAULT_SETTINGS =
     "town_serve = auto\n"
     "\n"
     "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n"
-    "personal_sync = auto\n";
+    "personal_sync = auto\n"
+    "\n"
+    "[Debug]\n"
+    "# 1 = write this game's log (connection / join trace, [JOIN] lines) to client_log.txt next to AnimalCrossing.exe (appended, rotated at 4 MB) so it can be sent for a bug report; 0 = off (default)\n"
+    "client_log = 0\n";
 
 static const char* skip_ws(const char* s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -161,6 +166,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.borderless_acres = val;
     } else if (strcmp(key, "show_ping") == 0) {
         if (val == 0 || val == 1) g_pc_settings.show_ping = val;
+    } else if (strcmp(key, "client_log") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.client_log = val;
     } else if (strcmp(key, "nes_aspect") == 0) {
         if (val == 0 || val == 1) g_pc_settings.nes_aspect = val;
     } else if (strcmp(key, "master_volume") == 0) {
@@ -309,6 +316,10 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n");
     fprintf(f, "personal_sync = %s\n", g_pc_settings.personal_sync < 0 ? "auto" : g_pc_settings.personal_sync ? "on" : "off");
+    fprintf(f, "\n");
+    fprintf(f, "[Debug]\n");
+    fprintf(f, "# 1 = write this game's log (connection / join trace, [JOIN] lines) to client_log.txt next to AnimalCrossing.exe (appended, rotated at 4 MB) so it can be sent for a bug report; 0 = off (default)\n");
+    fprintf(f, "client_log = %d\n", g_pc_settings.client_log);
     fclose(f);
     printf("[Settings] Saved %s\n", SETTINGS_FILE);
 }

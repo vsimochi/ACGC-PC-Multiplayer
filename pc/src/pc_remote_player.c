@@ -5592,9 +5592,14 @@ int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
 /* Shared train arrival: see pc_remote_arrival_logic.h. Reads the per-slot canonical storage only (scene presence + the newest MOVE sample), never the puppet actors. */
 int pc_remote_arrival_join_query(int* join_class, float* train_x) {
     const double now = (gamePT != NULL) ? graph_dt_frame_time(gamePT) : 0.0;
-    static int s_logged_hold = 0;
+    /* Hotfix 0.2.1: the hold is bounded (pc_remote_arrival_logic.h PCARR_JOIN_*_MS). Its clock is the monotonic ms clock of the net layer; a hold not polled for > 1 s is a new hold
+     * (first_set polls every frame while it holds; a scene change in between starts over). */
+    static int s_hold_active = 0, s_hold_ready_seen = 0, s_hold_polls = 0;
+    static uint32_t s_hold_begin_ms = 0, s_hold_last_ms = 0, s_hold_ready_ms = 0, s_hold_trace_ms = 0;
+    const uint32_t now_ms = pc_net_game_now_ms();
     PCNetGameLinkState link;
-    int i, n_stopped = 0, n_riding = 0, unknown = 0, roster_pending, decided;
+    int i, n_stopped = 0, n_riding = 0, unknown = 0, others = 0, roster_pending, decided, timeout;
+    unsigned held_ms, since_ready_ms;
     float riding_x = 0.0f;
 
     *join_class = PCARR_JOIN_NONE;
@@ -5603,6 +5608,20 @@ int pc_remote_arrival_join_query(int* join_class, float* train_x) {
         return 1;
     }
     link = pc_net_game_client_link_state();
+    if (!s_hold_active || (uint32_t)(now_ms - s_hold_last_ms) > 1000u) {
+        s_hold_active = 1;
+        s_hold_ready_seen = 0;
+        s_hold_polls = 0;
+        s_hold_begin_ms = now_ms;
+        s_hold_trace_ms = now_ms - PCARR_JOIN_HOLD_TRACE_MS; /* the first held poll traces at once */
+    }
+    s_hold_last_ms = now_ms;
+    if (link == PC_NETGAME_LINK_READY && !s_hold_ready_seen) {
+        s_hold_ready_seen = 1;
+        s_hold_ready_ms = now_ms;
+    }
+    held_ms = (unsigned)(now_ms - s_hold_begin_ms);
+    since_ready_ms = s_hold_ready_seen ? (unsigned)(now_ms - s_hold_ready_ms) : 0u;
     for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
         const PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
         const PCRemoteMoveSnapshot* newest;
@@ -5612,10 +5631,13 @@ int pc_remote_arrival_join_query(int* join_class, float* train_x) {
         if (!slot->in_use || !slot->scene.valid || slot->scene.scene_id != (uint8_t)SCENE_FG || (slot->scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0) {
             continue;
         }
+        others++;
         since_scene = (now >= slot->scene_accept_frame) ? now - slot->scene_accept_frame : 0.0; /* the frame clock restarts with every GAME_PLAY */
         if (slot->snapshot_count == 0) {
-            if (since_scene <= PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
-                unknown++; /* its first MOVE is still on the way; bounded by the same silence gap the puppet code uses */
+            /* its first MOVE is still on the way; bounded by the same silence gap the puppet code uses AND (hotfix 0.2.1) by a wall-clock window after READY: the frame clock above
+             * restarts with every GAME_PLAY, so a scene accepted in an earlier GAME_PLAY read 'just accepted' for a long time */
+            if (since_scene <= PC_REMOTE_PLAYER_ACTION_GAP_FRAMES && pcarr_join_unknown_counts(s_hold_ready_seen, since_ready_ms)) {
+                unknown++;
             }
             continue;
         }
@@ -5636,15 +5658,34 @@ int pc_remote_arrival_join_query(int* join_class, float* train_x) {
         }
     }
     roster_pending = link == PC_NETGAME_LINK_READY && !pc_net_game_client_world_synced();
+    if (link == PC_NETGAME_LINK_READY && pc_net_game_test_arrival_roster_stall()) {
+        roster_pending = 1; /* TEST-ONLY (test builds + AC_TEST_HOOKS=1 + AC_TEST_ARRIVAL_ROSTER_STALL=1; always 0 otherwise): exercises the hold limit */
+    }
     decided = pcarr_join_decide(link == PC_NETGAME_LINK_HANDSHAKE, link == PC_NETGAME_LINK_READY, roster_pending, unknown, n_stopped, n_riding);
-    if (decided < 0) {
-        if (!s_logged_hold) {
-            s_logged_hold = 1;
+    timeout = decided < 0 ? pcarr_join_hold_timeout(held_ms, s_hold_ready_seen, since_ready_ms) : PCARR_HOLD_KEEP;
+    if (decided < 0 && timeout == PCARR_HOLD_KEEP) {
+        if (s_hold_polls == 0) {
             printf("[TRAIN] arrival join: the guest's arrival waits for the host's roster of who is arriving (link %s, %d state(s) not known yet)\n", link == PC_NETGAME_LINK_READY ? "READY" : "handshake", unknown);
+        }
+        s_hold_polls++;
+        if ((uint32_t)(now_ms - s_hold_trace_ms) >= PCARR_JOIN_HOLD_TRACE_MS) {
+            s_hold_trace_ms = now_ms;
+            pc_net_game_join_trace("arrival hold: held %u ms (link=%s, roster_pending=%d, unknown=%d, others=%d, stopped=%d, riding=%d, ready_for=%u ms)", held_ms,
+                                   link == PC_NETGAME_LINK_READY ? "READY" : link == PC_NETGAME_LINK_HANDSHAKE ? "HANDSHAKE" : "other", roster_pending, unknown, others, n_stopped,
+                                   n_riding, since_ready_ms);
         }
         return 0;
     }
-    s_logged_hold = 0;
+    if (decided < 0) {
+        decided = pcarr_join_decide_bounded(decided, timeout, n_stopped, n_riding);
+        printf("[TRAIN] arrival join: hold timed out after %u.%u s (%s; link=%s, roster_pending=%d, unknown=%d, others=%d) -> starting the arrival\n", held_ms / 1000u,
+               (held_ms % 1000u) / 100u, timeout == PCARR_HOLD_TIMEOUT_READY ? "4.5 s after READY" : "15 s in total",
+               link == PC_NETGAME_LINK_READY ? "READY" : link == PC_NETGAME_LINK_HANDSHAKE ? "HANDSHAKE" : "other", roster_pending, unknown, others);
+    }
+    pc_net_game_join_trace("arrival decided after %u ms held (%s): class %s (link=%s, roster_pending=%d, unknown=%d, others=%d, stopped=%d, riding=%d)", held_ms,
+                           timeout != PCARR_HOLD_KEEP ? "hold timed out" : s_hold_polls > 0 ? "roster known" : "at once", decided == PCARR_JOIN_STOPPED ? "STOPPED" : decided == PCARR_JOIN_RIDING ? "RIDING" : "NONE",
+                           link == PC_NETGAME_LINK_READY ? "READY" : link == PC_NETGAME_LINK_HANDSHAKE ? "HANDSHAKE" : "other", roster_pending, unknown, others, n_stopped, n_riding);
+    s_hold_active = 0;
     *join_class = decided;
     if (decided == PCARR_JOIN_RIDING) {
         *train_x = pcarr_join_train_x(riding_x);

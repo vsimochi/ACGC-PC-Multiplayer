@@ -375,9 +375,113 @@ void pc_platform_swap_buffers(void) {
     SDL_GL_SwapWindow(g_pc_window);
 }
 
+/* ---- Hotfix 0.2.1 diagnostics: settings.ini [Debug] client_log = 1 (or env AC_CLIENT_LOG=1) sends this process's stdout / stderr to client_log.txt next to the exe, appended,
+ * rotated to client_log.old.txt at PC_CLIENT_LOG_MAX_BYTES (checked at start and every 2 s). Default OFF; never for --dedicated (servers/<id>/logs holds its log). ---- */
+#define PC_CLIENT_LOG_MAX_BYTES (4L * 1024L * 1024L)
+static int s_client_log_on = 0;
+static char s_client_log_path[1024];
+static char s_client_log_old[1040];
+
+static int pc_client_log_wanted(void) {
+    const char* e = getenv("AC_CLIENT_LOG");
+    if (e != NULL && e[0] != '\0') {
+        return e[0] == '1';
+    }
+    return g_pc_settings.client_log == 1;
+}
+
+static long pc_client_log_size(const char* path) {
+    FILE* f = fopen(path, "rb");
+    long n;
+    if (f == NULL) {
+        return 0;
+    }
+    n = (fseek(f, 0, SEEK_END) == 0) ? ftell(f) : 0;
+    fclose(f);
+    return n < 0 ? 0 : n;
+}
+
+static int pc_client_log_open(void) {
+    if (s_client_log_on) { /* a rotation: close our handles first (an open file cannot be renamed on Windows) */
+        fflush(stdout);
+        fflush(stderr);
+#ifdef _WIN32
+        (void)freopen("NUL", "w", stdout);
+        (void)freopen("NUL", "w", stderr);
+#else
+        (void)freopen("/dev/null", "w", stdout);
+        (void)freopen("/dev/null", "w", stderr);
+#endif
+    }
+    if (pc_client_log_size(s_client_log_path) >= PC_CLIENT_LOG_MAX_BYTES) {
+        remove(s_client_log_old);
+        rename(s_client_log_path, s_client_log_old);
+    }
+    if (freopen(s_client_log_path, "a", stdout) == NULL) {
+        return 0;
+    }
+    (void)freopen(s_client_log_path, "a", stderr);
+    setvbuf(stdout, NULL, _IONBF, 0); /* a crash must not lose the last lines; file writes, not the slow console */
+    setvbuf(stderr, NULL, _IONBF, 0);
+    return 1;
+}
+
+static void pc_client_log_start(void) {
+    size_t n;
+    if (g_pc_dedicated || !pc_client_log_wanted()) {
+        return;
+    }
+    s_client_log_path[0] = '\0';
+#ifdef _WIN32
+    {
+        DWORD len = GetModuleFileNameA(NULL, s_client_log_path, (DWORD)sizeof(s_client_log_path));
+        char* slash;
+        if (len == 0 || len >= (DWORD)sizeof(s_client_log_path)) {
+            s_client_log_path[0] = '\0';
+        } else {
+            slash = strrchr(s_client_log_path, '\\');
+            if (slash == NULL) {
+                slash = strrchr(s_client_log_path, '/');
+            }
+            if (slash != NULL) {
+                slash[1] = '\0';
+            } else {
+                s_client_log_path[0] = '\0';
+            }
+        }
+    }
+#endif
+    n = strlen(s_client_log_path);
+    snprintf(s_client_log_path + n, sizeof(s_client_log_path) - n, "client_log.txt");
+    snprintf(s_client_log_old, sizeof(s_client_log_old), "%.*sclient_log.old.txt", (int)n, s_client_log_path);
+    if (!pc_client_log_open()) {
+        return;
+    }
+    s_client_log_on = 1;
+    {
+        time_t t = time(NULL);
+        printf("\n===== client_log: %s (settings.ini [Debug] client_log / AC_CLIENT_LOG) %s", s_client_log_path, ctime(&t));
+    }
+}
+
+static void pc_client_log_tick(void) {
+    static Uint32 next_ms = 0;
+    const Uint32 now = SDL_GetTicks();
+    if (!s_client_log_on || (Sint32)(now - next_ms) < 0) {
+        return;
+    }
+    next_ms = now + 2000u;
+    if (ftell(stdout) >= PC_CLIENT_LOG_MAX_BYTES) {
+        if (!pc_client_log_open()) { /* rotates: the full file becomes client_log.old.txt */
+            s_client_log_on = 0; /* could not reopen: stdout stays on NUL */
+        }
+    }
+}
+
 int pc_platform_poll_events(void) {
     SDL_Event event;
 
+    pc_client_log_tick();
     pc_typing_update();
 
     while (SDL_PollEvent(&event)) {
@@ -2556,6 +2660,7 @@ int main(int argc, char* argv[]) {
     pc_lowaddr_init(); /* no-op unless built with PC_LOW_ADDRESS_64 */
     SDL_SetMainReady();
     pc_settings_load();
+    pc_client_log_start(); /* hotfix 0.2.1: [Debug] client_log = 1 / AC_CLIENT_LOG=1 (default off) */
     if (g_pc_net_role == 1 && !g_pc_dedicated) {
         printf("[PC] host services: house sync %s (%s)\n", g_pc_house_sync ? "ON" : "off", s_house_sync_explicit ? "explicit option" : "default for every host; --no-house-sync disables");
     }

@@ -29,6 +29,7 @@ typedef struct {
     int resident_tokens;  /* HOST only (M-E): 0 = off (default, nothing minted / checked), 1 = tofu, 2 = required (see docs/multiplayer-guest-roadmap.md) */
     int personal_sync;    /* HOST only (personal data sync, diary): -1 = AUTO (default: on only while town_serve != off), 0 = off, 1 = on */
     int show_ping;        /* CLIENT only: 1 = show the round-trip time (ms) to the host while connected (default 0; F4 toggles it for the session) */
+    int client_log;       /* hotfix 0.2.1 diagnostics, [Debug] client_log: 1 = this process's stdout / stderr go to client_log.txt next to the exe (append, rotated at 4 MB); default 0. Env AC_CLIENT_LOG=1 too. Not for --dedicated (it has servers/<id>/logs). */
     int town_serve;       /* HOST only (M-B): serve the town to pre-boot --town-fetch clients: -1 = AUTO (default: on for a --dedicated host, off otherwise), 0 = OFF, 1 = a SANITIZED copy (M-G), 2 = the full GCI (every resident's private data) */
 } PCSettings;
 

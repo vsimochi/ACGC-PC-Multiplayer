@@ -14,6 +14,7 @@ static void aROD_change_player_demo_standing_train(GAME* game) {
 #include "m_train_control.h"
 #include "pc_remote_arrival_logic.h"
 extern int pc_remote_arrival_join_query(int* join_class, float* train_x); /* pc_remote_player.c */
+extern void pc_net_game_join_trace(const char* fmt, ...); /* pc_net_game.c: hotfix 0.2.1 [JOIN] stage trace */
 
 /* Shared train arrival: a GUEST that arrives while another player is still arriving JOINS that arrival instead of running an independent second one. The vanilla steps below are
  * unchanged; the guest only (1) learns first what the other players are doing (first_set is polled until the host's roster is in), (2) moves its own freshly started local train to the
@@ -100,6 +101,7 @@ static void aROD_walk_one_unit(ACTOR* actor, GAME* game) {
                 if (mPlib_request_main_wait_type3(game)) {
                     Camera2_request_main_normal(play, 0, 9);
                     printf("[TRAIN] local arrival finished: the player stands in the town\n");
+                    pc_net_game_join_trace("arrival: control released (the player stands in the town)");
                     Actor_delete(actor);
                 }
 #else
@@ -171,6 +173,12 @@ static void aROD_setupAction(ACTOR* actor, GAME* game, int idx) {
 
     ride_off->current_proc = process[idx];
     ride_off->current_action = idx;
+#ifdef TARGET_PC
+    {
+        static const char* const k_names[] = { "first set (parked at the train start)", "train birth wait", "riding the train", "getting off / Porter", "walking off the platform" };
+        pc_net_game_join_trace("arrival: train action %d (%s)", idx, (idx >= 0 && idx < 5) ? k_names[idx] : "?");
+    }
+#endif
     aROD_init_proc(actor, game, idx);
 }
 

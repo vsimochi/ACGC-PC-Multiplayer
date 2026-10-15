@@ -3895,6 +3895,7 @@ typedef struct PCNetGameHostPeerState {
     int                  snap_wildlife_begin_sent;
     int                  snap_next_wildlife_idx;
     int                  snap_wildlife_sent_count;
+    uint32_t             snap_started_ms; /* hotfix 0.2.1 [JOIN] trace: when the current snapshot started */
     /* D3 (protocol v8) host-mirrored resident record, per-peer state. Everything here is cleared by the one memset in
      * pcnetgame_reset_all_host_peer_state() (partial buffers: the big fixed s_host_rec_rx/_tx arrays are protected by
      * the masks/flags below, so a reset peer can never expose stale bytes). */
@@ -6167,6 +6168,32 @@ uint32_t pc_net_game_now_ms(void) {
     return pcnetgame_now_ms();
 }
 
+/* Hotfix 0.2.1 [JOIN] stage trace (see pc_net_game.h). The client's clock origin is its last transport-connect; the host passes its own prefix ("host: peer N ..."). */
+static uint32_t s_join_trace_t0_ms = 0;
+void pc_net_game_join_trace(const char* fmt, ...) {
+    char buf[320];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    printf("[JOIN] +%ums %s\n", (unsigned)(pcnetgame_now_ms() - s_join_trace_t0_ms), buf);
+}
+
+int pc_net_game_test_arrival_roster_stall(void) {
+#ifdef PC_NET_TEST_HOOKS
+    static int s_v = -1;
+    if (s_v < 0) {
+        s_v = pc_test_hook_getenv("AC_TEST_ARRIVAL_ROSTER_STALL") != NULL ? 1 : 0;
+        if (s_v) {
+            printf("[TRAIN][TEST-ONLY] AC_TEST_ARRIVAL_ROSTER_STALL: the arrival never sees the roster as known (NOT active in normal play)\n");
+        }
+    }
+    return s_v;
+#else
+    return 0;
+#endif
+}
+
 void pc_net_game_set_npc_talk_lease_probe(PCNetGameNpcTalkLeaseProbe fn) {
     s_client_talk_probe = fn;
 }
@@ -7505,6 +7532,10 @@ static void pcnetgame_host_start_snapshot(PCNetPeerId peer, const char* why) {
     if (st->snap_active && st->snap_stage == 0) {
         return; /* already queued and nothing of it sent yet: every block will be built later anyway */
     }
+    if (st->snap_active) {
+        pc_net_game_join_trace("host: peer %d snapshot epoch %u RESTARTED (%s)", (int)peer, (unsigned)st->snap_epoch, why);
+    }
+    st->snap_started_ms = pcnetgame_now_ms();
     st->snap_active = 1;
     st->snap_stage = 0;
     st->snap_next_acre = 0;
@@ -7518,6 +7549,21 @@ static void pcnetgame_host_start_snapshot(PCNetPeerId peer, const char* why) {
     st->snap_wildlife_sent_count = 0;
     st->snap_epoch = ++s_snapshot_epoch_counter;
     printf("[NET][WORLD] host: peer %d snapshot epoch %u queued (%s)\n", (int)peer, (unsigned)st->snap_epoch, why);
+    pc_net_game_join_trace("host: peer %d snapshot epoch %u begin (%s)", (int)peer, (unsigned)st->snap_epoch, why);
+}
+
+
+/* Hotfix 0.2.1: the join-time BULK pushes (town pages, villager outfits, mailbox letters) go to a peer only while its world snapshot is not under way and its reliable
+ * backlog is under half the window (PC_NET_RELIABLE_WINDOW / 2 = 32), re-checked before every message. Nothing is lost: each push keeps its
+ * own per-peer "sent" state and resends what is not marked sent on a later tick. Over real latency these pushes used to fill the window during the joiner's snapshot. */
+#define PC_NETGAME_JOIN_PUSH_BACKLOG_LIMIT (PC_NET_RELIABLE_WINDOW / 2)
+static int pcnetgame_host_join_push_ok(int p) {
+    int backlog;
+    if (p < 0 || p >= pcnetgame_peer_span() || s_host_peer_link[p] != PC_NETGAME_LINK_READY || s_host_peer[p].snap_active) {
+        return 0;
+    }
+    backlog = pc_net_reliable_backlog((PCNetPeerId)p);
+    return backlog >= 0 && backlog < PC_NETGAME_JOIN_PUSH_BACKLOG_LIMIT;
 }
 
 static void pcnetgame_host_resync_all(const char* why) {
@@ -8386,6 +8432,7 @@ static void pcnetgame_host_pump_snapshots(void) {
                 printf("[NET][WORLD] host: peer %d snapshot epoch %u sent (%d acres, world_seq %u) "
                        "known_tiles=%d unknown_tiles=%d\n", i, (unsigned)st->snap_epoch, st->snap_blocks_sent,
                        (unsigned)s_world_seq, known, PCFA_ACRE_NUM * PCFA_TILE_NUM - known);
+                pc_net_game_join_trace("host: peer %d snapshot epoch %u END sent after %u ms", i, (unsigned)st->snap_epoch, (unsigned)(pcnetgame_now_ms() - st->snap_started_ms));
             }
             sent++;
         }
@@ -13460,6 +13507,8 @@ static void pcnetgame_handle_client_snapshot_begin(const PCNetGameSnapshotBeginM
     if (in->grid != PC_NETGAME_GRID_TOWN) {
         return;
     }
+    pc_net_game_join_trace("client: world snapshot epoch %u %s", (unsigned)in->epoch,
+                           s_client_snap_active ? "RESTARTED by the host (the previous epoch was abandoned)" : "begin");
     s_client_snap_active = 1;
     s_client_snap_epoch = in->epoch;
     s_client_snap_blocks = 0;
@@ -13470,10 +13519,14 @@ static void pcnetgame_handle_client_snapshot_begin(const PCNetGameSnapshotBeginM
 
 static void pcnetgame_handle_client_snapshot_end(const PCNetGameSnapshotEndMsg* in) {
     if (in->grid != PC_NETGAME_GRID_TOWN || !s_client_snap_active || in->epoch != s_client_snap_epoch) {
+        if (in->grid == PC_NETGAME_GRID_TOWN) {
+            pc_net_game_join_trace("client: world snapshot END epoch %u ignored (current epoch %u, active %d)", (unsigned)in->epoch, (unsigned)s_client_snap_epoch, s_client_snap_active);
+        }
         return;
     }
     s_client_snap_active = 0;
     if (!pcnetgame_client_can_apply_world()) {
+        pc_net_game_join_trace("client: world snapshot END epoch %u ignored (local world not latched yet: a resync is requested)", (unsigned)in->epoch);
         return; /* blocks were discarded too; the resync fetches a complete one */
     }
     if (in->world_seq >= s_client_meta_seq) {
@@ -13507,6 +13560,9 @@ static void pcnetgame_handle_client_snapshot_end(const PCNetGameSnapshotEndMsg* 
     if (s_client_snap_blocks != (int)in->acre_count) {
         printf("[NET][WORLD] client: snapshot epoch %u ended with %d/%u blocks applied\n", (unsigned)in->epoch,
                s_client_snap_blocks, (unsigned)in->acre_count);
+    }
+    if (!s_client_world_synced) {
+        pc_net_game_join_trace("client: first world snapshot applied (epoch %u, %d acres): roster known", (unsigned)in->epoch, s_client_snap_blocks);
     }
     s_client_world_synced = 1;
     /* Per-tile detail (and its "(N more)" overflow lines) is DEBUG-ONLY; the summary below always prints. */
@@ -23762,7 +23818,7 @@ static void pcnetgame_host_guest_mbox_push(int p, int refresh) {
     }
     for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS && sent < PC_NETGAME_MBOX_PER_POLL; i++) {
         if (st->mbox_sent_seq[i] != s_guest_mbox[g].seq[i]) {
-            if (!pcnetgame_guest_mbox_send((PCNetPeerId)p, g, i)) {
+            if (!pcnetgame_host_join_push_ok(p) || !pcnetgame_guest_mbox_send((PCNetPeerId)p, g, i)) { /* hotfix 0.2.1: not during the joiner's snapshot */
                 break; /* the send window is full: retried on the next poll */
             }
             st->mbox_sent_seq[i] = s_guest_mbox[g].seq[i];
@@ -23813,7 +23869,7 @@ static void pcnetgame_host_mbox_tick(void) {
         for (i = 0; i < (int)PC_NETGAME_MBOX_SLOTS && sent < PC_NETGAME_MBOX_PER_POLL; i++) {
             const PCNetGameMboxHost* X = &s_mbox_host[idx][i];
             if (X->valid && st->mbox_sent_seq[i] != X->seq) {
-                if (!pcnetgame_mbox_send((PCNetPeerId)p, idx, i)) {
+                if (!pcnetgame_host_join_push_ok(p) || !pcnetgame_mbox_send((PCNetPeerId)p, idx, i)) { /* hotfix 0.2.1: not during the joiner's snapshot */
                     break; /* the send window is full: retried on the next poll */
                 }
                 st->mbox_sent_seq[i] = X->seq;
@@ -25755,6 +25811,8 @@ adopt_blocked_retry: /* the own-room reconcile below re-enters here with its own
                (unsigned)pk[0], (unsigned)pk[1], (unsigned)pk[2], (unsigned)pk[3], (unsigned)pk[4], (unsigned)pk[5], (unsigned)pk[6],
                (unsigned)pk[7], (unsigned)pk[8], (unsigned)pk[9], (unsigned)pk[10], (unsigned)pk[11], (unsigned)pk[12], (unsigned)pk[13],
                (unsigned)pk[14]);
+        pc_net_game_join_trace("client: record push adopted (rev %u, %s, wallet %u)", (unsigned)s_crec.st_rev,
+                               s_crec.st_kind == PC_NETGAME_REC_KIND_PUSH_HOSTFIELDS ? "HOSTFIELDS" : "FULL", (unsigned)Now_Private->inventory.wallet);
     }
     pcnetgame_crec_send_ack((uint8_t)PC_NETGAME_REC_ACK_APPLIED, 0, s_crec.st_xfer, s_crec.st_epoch, s_crec.st_rev,
                             s_crec.st_session);
@@ -34915,6 +34973,7 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         s_client_link = PC_NETGAME_LINK_READY;
         printf("[NET] client: handshake complete, town verified (assigned peer id %u) -> READY\n",
                (unsigned)in.assigned_peer_id);
+        pc_net_game_join_trace("client: READY (peer id %u)", (unsigned)in.assigned_peer_id);
         pcnetgame_client_note_membership(); /* M-C: membership.ini + servers.ini last_town (client-side metadata only) */
 
         {
@@ -35690,7 +35749,8 @@ static void pcnetgame_outfit_host_tick(void) {
             s_outfit_sent[p] = 0u;
             continue;
         }
-        if (s_outfit_sent[p] != s_outfit_seq && pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+        if (s_outfit_sent[p] != s_outfit_seq && pcnetgame_host_join_push_ok(p) /* hotfix 0.2.1: retried on the next 1 s tick */ &&
+            pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
             s_outfit_sent[p] = s_outfit_seq;
         }
     }
@@ -35807,6 +35867,9 @@ static void pcnetgame_page_host_tick(void) {
                 unsigned k, x;
                 uint16_t len;
                 uint8_t* d;
+                if (!pcnetgame_host_join_push_ok(p)) {
+                    break; /* hotfix 0.2.1: snapshot under way / backlog >= window/2: not marked sent, resumed on a later tick */
+                }
                 pcnetgame_page_of_slot(i, &k, &x);
                 d = pcnetgame_page_ptr(k, x, &len);
                 if (!pcnetgame_page_send((PCNetPeerId)p, k, x, s_pg_rev[i], 0, 0, d, len)) {
@@ -36301,6 +36364,7 @@ static void pcnetgame_client_tick(void) {
                 s_client_identity_sent = 1;
                 pcnetgame_format_town(&s_client_claimed_town, buf, sizeof(buf));
                 printf("[NET] client: save loaded -- sending identity (%s)\n", buf);
+                pc_net_game_join_trace("client: identity sent (%s)", pcnetgame_client_is_guest_player() ? "guest" : "resident / visitor");
             }
         } else {
             if (!s_client_identity_defer_logged) {
@@ -38429,6 +38493,8 @@ void pc_net_game_poll(void) {
                     s_client_link = PC_NETGAME_LINK_HANDSHAKE;
                     printf("[NET] client: transport-connected to host\n");
                     PC_LOG(PCL_NET, "client transport-connected to host\n");
+                    s_join_trace_t0_ms = pcnetgame_now_ms();
+                    pc_net_game_join_trace("client: transport connected (HANDSHAKE)");
                     /* Stage 4C-1 (ordering-race fix): appearance is NOT sent here any more. Sending
                      * it immediately alongside IDENTITY raced against the host's own IDENTITY
                      * processing -- if this process's APPEARANCE datagram was dequeued by the host

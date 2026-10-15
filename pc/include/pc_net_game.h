@@ -424,6 +424,12 @@ typedef int (*PCNetGameNpcTalkLeaseProbe)(int slot, uint16_t npc_id);
 void pc_net_game_set_npc_talk_lease_probe(PCNetGameNpcTalkLeaseProbe fn);
 /* Monotonic wall-clock milliseconds (same source the net layer uses; never 0). Test hook timing only. */
 uint32_t pc_net_game_now_ms(void);
+/* Hotfix 0.2.1 join diagnostics: prints one "[JOIN] +<ms since transport-connect> <text>" line to stdout (visible with --verbose or settings.ini client_log = 1).
+ * One-shot stage events only (plus the 2 s arrival-hold repeat): cheap. */
+void pc_net_game_join_trace(const char* fmt, ...);
+/* TEST-ONLY (hotfix 0.2.1): 1 iff a PC_NET_TEST_HOOKS build runs with AC_TEST_HOOKS=1 and AC_TEST_ARRIVAL_ROSTER_STALL=1 (the guest's arrival then never sees its roster as
+ * known, so only the hold limit releases it); always 0 in a release build / normal play. */
+int pc_net_game_test_arrival_roster_stall(void);
 /* M9-C: HOST only (0 on single-player/client): 1 iff at least one validated, unexpired client talk hold exists
  * for animal `slot` with this `npc_id`. Called every frame per villager by the host gate in ac_npc_move.c_inc. */
 int pc_net_game_host_npc_talk_held(int slot, int npc_id);

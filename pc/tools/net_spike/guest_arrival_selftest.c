@@ -174,6 +174,85 @@ int main(void) {
     check("J decide: another passenger riding -> JOIN riding; someone at the station -> JOIN stopped (wins over a riding one); never a wait for the arrival to end",
           pcarr_join_decide(0, 1, 0, 0, 0, 1) == PCARR_JOIN_RIDING && pcarr_join_decide(0, 1, 0, 0, 1, 0) == PCARR_JOIN_STOPPED && pcarr_join_decide(0, 1, 0, 0, 2, 1) == PCARR_JOIN_STOPPED);
 
+    /* ---- hotfix 0.2.1: the arrival hold is bounded ---- */
+    check("H thresholds: unknown window 3000 ms, 4500 ms after READY, 15000 ms in total, trace every 2000 ms",
+          PCARR_JOIN_UNKNOWN_WINDOW_MS == 3000u && PCARR_JOIN_HOLD_READY_MS == 4500u && PCARR_JOIN_HOLD_TOTAL_MS == 15000u && PCARR_JOIN_HOLD_TRACE_MS == 2000u);
+    check("H unknown slot counts before READY and during the first 3 s after it, never later",
+          pcarr_join_unknown_counts(0, 0u) && pcarr_join_unknown_counts(0, 99999u) && pcarr_join_unknown_counts(1, 0u) && pcarr_join_unknown_counts(1, 2999u) &&
+          !pcarr_join_unknown_counts(1, 3000u) && !pcarr_join_unknown_counts(1, 60000u));
+    check("H no timeout inside both limits (handshake 14.9 s, READY for 4.4 s)",
+          pcarr_join_hold_timeout(14999u, 0, 0u) == PCARR_HOLD_KEEP && pcarr_join_hold_timeout(10000u, 1, 4499u) == PCARR_HOLD_KEEP && pcarr_join_hold_timeout(0u, 1, 0u) == PCARR_HOLD_KEEP);
+    check("H READY limit: 4.5 s after READY ends the hold (even early in the total)",
+          pcarr_join_hold_timeout(4500u, 1, 4500u) == PCARR_HOLD_TIMEOUT_READY && pcarr_join_hold_timeout(20000u, 1, 4600u) == PCARR_HOLD_TIMEOUT_READY);
+    check("H total limit: 15 s held in total ends it whatever the link (handshake, or READY only recently)",
+          pcarr_join_hold_timeout(15000u, 0, 0u) == PCARR_HOLD_TIMEOUT_TOTAL && pcarr_join_hold_timeout(15000u, 1, 1000u) == PCARR_HOLD_TIMEOUT_TOTAL);
+    check("H bounded decide: a decided answer is never changed by the limits",
+          pcarr_join_decide_bounded(PCARR_JOIN_NONE, PCARR_HOLD_TIMEOUT_TOTAL, 3, 3) == PCARR_JOIN_NONE &&
+          pcarr_join_decide_bounded(PCARR_JOIN_RIDING, PCARR_HOLD_KEEP, 0, 0) == PCARR_JOIN_RIDING && pcarr_join_decide_bounded(PCARR_JOIN_STOPPED, PCARR_HOLD_KEEP, 0, 0) == PCARR_JOIN_STOPPED);
+    check("H bounded decide: undecided within the limits keeps holding (-1)", pcarr_join_decide_bounded(-1, PCARR_HOLD_KEEP, 1, 1) == -1);
+    check("H bounded decide: a timed-out hold starts the arrival with what is known (nobody -> NONE, a stopped one -> STOPPED, a riding one -> RIDING)",
+          pcarr_join_decide_bounded(-1, PCARR_HOLD_TIMEOUT_READY, 0, 0) == PCARR_JOIN_NONE && pcarr_join_decide_bounded(-1, PCARR_HOLD_TIMEOUT_TOTAL, 1, 1) == PCARR_JOIN_STOPPED &&
+          pcarr_join_decide_bounded(-1, PCARR_HOLD_TIMEOUT_READY, 0, 2) == PCARR_JOIN_RIDING);
+    {
+        /* the field case: link READY, the world snapshot never completes (roster_pending stays 1), one other player whose MOVE never arrives. Simulated 16 ms polls:
+         * the hold must end at 4.5 s after READY (READY reached 0.8 s into the hold), never earlier than the roster would have allowed, and exactly once. */
+        unsigned t, ready_at = 800u, released_at = 0u;
+        int released = 0, holds_after = 0;
+        for (t = 0u; t <= 20000u; t += 16u) {
+            const int ready = t >= ready_at;
+            const unsigned since_ready = ready ? t - ready_at : 0u;
+            const int unknown = pcarr_join_unknown_counts(ready, since_ready) ? 1 : 0;
+            const int d = pcarr_join_decide(!ready, ready, ready, unknown, 0, 0);
+            const int b = pcarr_join_decide_bounded(d, d < 0 ? pcarr_join_hold_timeout(t, ready, since_ready) : PCARR_HOLD_KEEP, 0, 0);
+            if (b >= 0 && !released) {
+                released = 1;
+                released_at = t;
+            } else if (b < 0 && released) {
+                holds_after++;
+            }
+        }
+        check("H sim: a stalled snapshot (roster never known) releases the parked guest 4.5 s after READY with the normal arrival", released && released_at >= ready_at + 4500u &&
+              released_at < ready_at + 4500u + 16u && holds_after == 0);
+    }
+    {
+        /* the intended behaviour is unchanged: the roster arrives 1.2 s after READY and the other player's first MOVE 0.4 s later (riding): decided then, as before */
+        unsigned t, ready_at = 300u, released_at = 0u;
+        int released = 0, cls = -1;
+        for (t = 0u; t <= 20000u && !released; t += 16u) {
+            const int ready = t >= ready_at;
+            const unsigned since_ready = ready ? t - ready_at : 0u;
+            const int roster = ready && since_ready < 1200u;
+            const int moved = ready && since_ready >= 1600u;
+            const int unknown = (!moved && pcarr_join_unknown_counts(ready, since_ready)) ? 1 : 0;
+            const int d = pcarr_join_decide(!ready, ready, roster, unknown, 0, moved ? 1 : 0);
+            const int b = pcarr_join_decide_bounded(d, d < 0 ? pcarr_join_hold_timeout(t, ready, since_ready) : PCARR_HOLD_KEEP, 0, moved ? 1 : 0);
+            if (b >= 0) {
+                released = 1;
+                released_at = t;
+                cls = b;
+            }
+        }
+        check("H sim: a quick roster still decides normally (JOIN riding once the other's MOVE is in, before any limit)",
+              released && cls == PCARR_JOIN_RIDING && released_at >= ready_at + 1600u && released_at < ready_at + 1600u + 32u);
+    }
+    {
+        /* a quiet other player (scene known, MOVE never arrives), roster known at once: held only for the 3 s unknown window, then the normal arrival */
+        unsigned t, ready_at = 0u, released_at = 0u;
+        int released = 0, cls = -1;
+        for (t = 0u; t <= 20000u && !released; t += 16u) {
+            const unsigned since_ready = t - ready_at;
+            const int unknown = pcarr_join_unknown_counts(1, since_ready) ? 1 : 0;
+            const int d = pcarr_join_decide(0, 1, 0, unknown, 0, 0);
+            const int b = pcarr_join_decide_bounded(d, d < 0 ? pcarr_join_hold_timeout(t, 1, since_ready) : PCARR_HOLD_KEEP, 0, 0);
+            if (b >= 0) {
+                released = 1;
+                released_at = t;
+                cls = b;
+            }
+        }
+        check("H sim: a quiet other player holds the joiner for the 3 s unknown window only", released && cls == PCARR_JOIN_NONE && released_at >= 3000u && released_at < 3016u);
+    }
+
     printf("RESULT passed=%d failed=%d\n", s_pass, s_fail);
     return s_fail ? 1 : 0;
 }

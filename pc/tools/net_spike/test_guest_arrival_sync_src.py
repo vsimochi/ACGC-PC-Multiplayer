@@ -217,7 +217,7 @@ def main():
     ck("T3: the train-demo main indexes are the contiguous DEMO_WALK, GETON_TRAIN, GETON_TRAIN_WAIT, GETOFF_TRAIN, STANDING_TRAIN of m_player.h",
        re.search(r"mPlayer_INDEX_DEMO_WALK,\s*mPlayer_INDEX_DEMO_GETON_TRAIN,\s*mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT,\s*mPlayer_INDEX_DEMO_GETOFF_TRAIN,\s*mPlayer_INDEX_DEMO_STANDING_TRAIN,", mp) is not None)
     hdr = open(os.path.join(PC, "include", "pc_remote_arrival_logic.h"), encoding="utf-8").read()
-    ck("header: pure and libc-free (no #include; ten static inline functions: decide, standing_should_evaluate, reason_is_transient, standing_settle, local_intro_arriving, demo_walk + the shared arrival's in_station_zone, join_class, join_train_x, join_decide)", "#include" not in hdr and hdr.count("static inline") == 10)
+    ck("header: pure and libc-free (no #include; thirteen static inline functions: decide, standing_should_evaluate, reason_is_transient, standing_settle, local_intro_arriving, demo_walk + the shared arrival's in_station_zone, join_class, join_train_x, join_decide + hotfix 0.2.1's join_unknown_counts, join_hold_timeout, join_decide_bounded)", "#include" not in hdr and hdr.count("static inline") == 13)
 
     # ---------------- no wire change ----------------
     ck("wire: pc_net_game.h / pc_net.h / pc_net.c / pc_net_game.c are byte-identical to the baseline", unchanged(["pc/include/pc_net_game.h", "pc/include/pc_net.h", "pc/src/pc_net.c", "pc/src/pc_net_game.c"]))
