@@ -88,10 +88,67 @@ void aECPD_menu_open_wait(EV_CARPETPEDDLER_ACTOR* peddler, GAME_PLAY* play) {
     }
 }
 
+#ifdef TARGET_PC
+/* Shared event NPCs (worker E): on a client Saharah's trade is a host claim (EVNPC_CLAIM op SAHARAH_TRADE): the host checks the price against ITS town counter, pays it
+ * from the pre-image, rolls the carpet with its RNG and replaces the handed-over carpet in one step. The talk waits here (the inventory has just closed); APPLIED = the
+ * new carpet is already in the slot (the hand-over demo then runs with it, aECPD_demo0_end_wait_init skips its local writes); refused = the carpet stays, a refusal row. */
+static int aECPD_pc_stage;
+static int aECPD_pc_applied;
+/* returns 1 while the claim is pending / when it took over this frame */
+static int aECPD_pc_trade(EV_CARPETPEDDLER_ACTOR* peddler, GAME_PLAY* play, Submenu_Item_c* submenu_item) {
+    mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
+    const mActor_name_t item = submenu_item->item;
+    const int slot = submenu_item->slot_no;
+    int r;
+    if (aECPD_pc_stage == 0) {
+        aECPD_pc_applied = FALSE;
+        if (item == EMPTY_NO || ITEM_NAME_GET_TYPE(item) != NAME_TYPE_ITEM1 || ITEM_NAME_GET_CAT(item) != ITEM1_CAT_CARPET ||
+            pc_evc_mode(PC_EVC_OP_SAHARAH_TRADE) != PC_EVC_MODE_CLAIM || slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT) {
+            return FALSE; /* the vanilla path (no carpet / host or solo / a host without the claim: the 0.2.1 local trade) */
+        }
+        if (Now_Private->inventory.pockets[slot] == EMPTY_NO) {
+            mPr_SetPossessionItem(Now_Private, slot, item, mPr_ITEM_COND_NORMAL); /* the inventory took it out: it is back until the host answered */
+        }
+        r = pc_evc_begin(PC_EVC_OP_SAHARAH_TRADE, slot, item, 0, (int)(peddler->price & 0xFFFF));
+        if (r < 0) {
+            return TRUE;
+        }
+        if (r == 0) {
+            goto refused;
+        }
+        aECPD_pc_stage = 1;
+        return TRUE;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return TRUE;
+    }
+    aECPD_pc_stage = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED && pc_evc_item() != EMPTY_NO) {
+        peddler->carpet = (mActor_name_t)pc_evc_item(); /* the HOST's carpet (already in the slot) */
+        aECPD_pc_applied = TRUE;
+        return FALSE; /* the vanilla hand-over demo continues */
+    }
+refused:
+    aECPD_pc_stage = 0;
+    printf("[NET][EVC] Saharah: the host refused the trade (reason %d) -> refusal row, the carpet stays\n", pc_evc_last_reason());
+    peddler->next_action = eECPD_ACTION_NONE;
+    mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_SAHARAH_TRADE, pc_evc_last_reason()));
+    peddler->setup_action(peddler, play, eECPD_ACTION_MSG_WIN_OPEN_WAIT);
+    mMsg_Unset_LockContinue(msg_p);
+    return TRUE;
+}
+#endif
+
 void aECPD_menu_close_wait(EV_CARPETPEDDLER_ACTOR* peddler, GAME_PLAY* play) {
     mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
     if (play->submenu.open_flag == FALSE) {
         Submenu_Item_c* submenu_item = play->submenu.item_p;
+#ifdef TARGET_PC
+        if (aECPD_pc_trade(peddler, play, submenu_item)) {
+            return;
+        }
+#endif
         if (submenu_item->item == EMPTY_NO) {
             peddler->next_action = eECPD_ACTION_NONE;
             mMsg_Set_continue_msg_num(msg_p, MSG_CARPETPEDDLER_START + 6);
@@ -215,6 +272,12 @@ void aECPD_menu_close_wait_init(EV_CARPETPEDDLER_ACTOR* peddler, GAME_PLAY* play
 
 void aECPD_demo0_end_wait_init(EV_CARPETPEDDLER_ACTOR* peddler, GAME_PLAY* play) {
     Submenu_Item_c* submenu_item = play->submenu.item_p;
+#ifdef TARGET_PC
+    if (aECPD_pc_applied) {
+        aECPD_pc_applied = FALSE;
+        return; /* the HOST did the trade (counter, carpet, Bells): its post-image is already in the pockets */
+    }
+#endif
     if (ITEM_NAME_GET_TYPE(submenu_item->item) == NAME_TYPE_ITEM1 &&
         ITEM_NAME_GET_CAT(submenu_item->item) == ITEM1_CAT_CARPET) {
 

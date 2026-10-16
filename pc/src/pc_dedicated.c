@@ -2,6 +2,7 @@
  * See pc_dedicated.h for the overview. Nothing in here runs unless g_pc_dedicated == 1 (the callers check it; most functions also check it). */
 #include "pc_platform.h"
 #include "pc_dedicated.h"
+#include "pc_day_roll.h" /* day rollover: the `day` console command */
 #include "pc_residence.h" /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES */
 #include "pc_host_observer.h"
 #include "pc_net_game.h"
@@ -1109,6 +1110,7 @@ static void pc_ded_cmd_help(void) {
            "  where [<player>|peer N]   last reported position (x, y, z, acre) of one / every connected player (the server has no player of its own)\n"
            "  net status|peers|resync   network role / transport counters / per-peer state; resync is reported unsupported (no general resync exists)\n"
            "  time get   the game clock (date, time, weekday)\n"
+           "  day [status] | day roll now   the day rollover: game date, renew / growth dates, state (idle / due / deferred: why), last roll; 'roll now' skips the wait for players in buildings\n"
            "  event list|status [name]   today's event schedule from the game's own tables (scheduled / active / running); start|stop|reset are refused with the reason\n"
            "  wildlife list|info <id>   the host's authoritative wildlife records; wildlife spawn fish <species> <x> <z> / despawn <id> need AC_TEST_HOOKS=1\n"
            "  test status|help   whether the test hooks are enabled and what they gate\n"
@@ -2200,6 +2202,10 @@ static void pc_ded_cmd_net(char* args) {
     pc_ded_flush();
 }
 
+static void pc_ded_out_line(const char* line) {
+    pc_ded_printf("%s\n", line);
+}
+
 static void pc_ded_cmd_time(char* args) {
     static const char* const wd[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
     args = pc_ded_skip_ws(args);
@@ -2475,6 +2481,9 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_net(args);
     } else if (strcmp(cmd, "time") == 0) {
         pc_ded_cmd_time(args);
+    } else if (strcmp(cmd, "day") == 0) {
+        pc_day_roll_console(args, pc_ded_out_line); /* day rollover (pc_day_roll.h) */
+        pc_ded_flush();
     } else if (strcmp(cmd, "event") == 0) {
         pc_ded_cmd_event(args);
     } else if (strcmp(cmd, "wildlife") == 0) {

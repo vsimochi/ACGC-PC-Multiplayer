@@ -82,9 +82,9 @@ def main():
           "PC_PVP_TOOL_AXE = 1, PC_PVP_TOOL_SHOVEL = 2, PC_PVP_TOOL_NET = 3" in ph and "PC_PVP_REACT_TUMBLE = 1, PC_PVP_REACT_SHOCK = 2, PC_PVP_REACT_FLINCH = 3" in ph)
     kinds = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_KIND_\w+\s+(\d+)u", gc)]
     reasons = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_REASON_\w+\s+(\d+)u", gc)]
-    check("W no new TXN kind (max %s <= 20) / reason (max %s <= 47)" % (max(kinds) if kinds else None, max(reasons) if reasons else None),
-          kinds and reasons and max(kinds) <= 20 and max(reasons) <= 47)
-    check("W town services unchanged (TS_NUM 9) and no PVP host-config flag", "#define PC_NETGAME_TS_NUM      9u" in gc and not re.search(r"HOSTCFG\w*PVP|PVP\w*HOSTCFG", gc))
+    check("W no new TXN kind for PvP (max %s <= 21: kind 21 is worker E's EVNPC_CLAIM) / reason (max %s <= 54: 50..54 are worker E's)" % (max(kinds) if kinds else None, max(reasons) if reasons else None),
+          kinds and reasons and max(kinds) <= 21 and max(reasons) <= 54)
+    check("W town services unchanged (TS_NUM 9) and no PVP host-config flag", "#define PC_NETGAME_TS_NUM      10u" in gc and not re.search(r"HOSTCFG\w*PVP|PVP\w*HOSTCFG", gc))
     check("W the PvP msg ids are dispatched host-side (91) and client-side (92) with exact sizes",
           "size == sizeof(PCPvpHitReqMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT_REQ" in gc and "size == sizeof(PCPvpHitMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT" in gc)
 

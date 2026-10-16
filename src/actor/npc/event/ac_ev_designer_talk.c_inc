@@ -103,6 +103,57 @@ static void aEDSN_close_umb_end_wait_talk_proc(EV_DESIGNER_ACTOR* designer, GAME
     }
 }
 
+#ifdef TARGET_PC
+/* Shared event NPCs (worker E): on a client Gracie's gift is a host claim (EVNPC_CLAIM op DESIGNER_GIFT: once per player, 3 per visit -- also no write past pids[3] --,
+ * the cloth rolled by the host for the minigame result 0 / 1 the client reports). The talk waits on the result page; APPLIED = the cloth is already in a free slot
+ * (the hand-over demo runs without a local grant / record); refused = a refusal row. A host without the claim: a polite refusal. */
+static int aEDSN_pc_stage;
+static int aEDSN_pc_applied;
+static int aEDSN_pc_result(EV_DESIGNER_ACTOR* designer, mMsg_Window_c* msg_p, int result) {
+    int mode, r, slot;
+    if (aEDSN_pc_stage == 0) {
+        aEDSN_pc_applied = FALSE;
+        mode = pc_evc_mode(PC_EVC_OP_DESIGNER_GIFT);
+        if (result == 2 || mode == PC_EVC_MODE_LOCAL) {
+            return FALSE;
+        }
+        slot = mPr_GetPossessionItemIdx(Now_Private, EMPTY_NO);
+        r = (mode == PC_EVC_MODE_CLAIM && slot >= 0) ? pc_evc_begin(PC_EVC_OP_DESIGNER_GIFT, slot, 0, 0, result) : 0;
+        if (r < 0) {
+            return TRUE;
+        }
+        if (r == 0) {
+            mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_DESIGNER_GIFT, mode == PC_EVC_MODE_REFUSE ? -1 : 0));
+            goto end;
+        }
+        aEDSN_pc_stage = 1;
+        return TRUE;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return TRUE;
+    }
+    aEDSN_pc_stage = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED && pc_evc_item() != EMPTY_NO) {
+        static int msg_idx[] = { 12, 14 };
+        designer->present = (mActor_name_t)pc_evc_item();
+        aEDSN_pc_applied = TRUE;
+        mEv_EventON(mEv_SPECL_DESIGNER_COMPLETE);
+        designer->npc_class.movement.mv_angl = designer->npc_class.actor_class.player_angle_y;
+        mMsg_Set_continue_msg_num(msg_p, aEDSN_get_msg_no(designer, msg_idx[result != 0]));
+        aEDSN_change_talk_proc(designer, aEDSN_TALK_DEMO_START_WAIT);
+        return TRUE;
+    }
+    printf("[NET][EVC] Gracie: the host refused the gift (reason %d) -> refusal row\n", pc_evc_last_reason());
+    mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_DESIGNER_GIFT, pc_evc_last_reason()));
+end:
+    mEv_set_status(mEv_EVENT_DESIGNER, mEv_STATUS_TALK);
+    mDemo_Set_talk_change_player(TRUE);
+    aEDSN_change_talk_proc(designer, aEDSN_TALK_END_WAIT);
+    return TRUE;
+}
+#endif
+
 static void aEDSN_check_result_talk_proc(EV_DESIGNER_ACTOR* designer, GAME* game) {
     static int msg_idx[] = { 12, 14, 16 };
     static int next_talk_proc_idx[] = { aEDSN_TALK_DEMO_START_WAIT, aEDSN_TALK_DEMO_START_WAIT, aEDSN_TALK_END_WAIT };
@@ -110,6 +161,11 @@ static void aEDSN_check_result_talk_proc(EV_DESIGNER_ACTOR* designer, GAME* game
 
     chase_angle(&designer->npc_class.actor_class.shape_info.rotation.y, designer->npc_class.actor_class.player_angle_y,
                 aNPC_dt_angle_step(0x800));
+#ifdef TARGET_PC
+    if ((aEDSN_pc_stage != 0 || mMsg_Check_MainNormalContinue(msg_p) == TRUE) && aEDSN_pc_result(designer, msg_p, designer->tmp_save_p->result)) {
+        return;
+    }
+#endif
     if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
         mEv_designer_c* ev_save_p = &Save_Get(event_save_data).special.event.designer;
         aEv_designer_c* tmp_save_p = designer->tmp_save_p;
@@ -142,6 +198,9 @@ static void aEDSN_demo_start_wait_talk_proc(EV_DESIGNER_ACTOR* designer, GAME* g
 
     if (order == 2) {
         aNPC_DEMO_GIVE_ITEM(designer->present, aHOI_REQUEST_PUTAWAY, TRUE);
+#ifdef TARGET_PC
+        if (!aEDSN_pc_applied) /* the HOST's post-image already holds the cloth */
+#endif
         mPr_SetFreePossessionItem(Now_Private, designer->present, mPr_ITEM_COND_NORMAL);
         mMsg_REQUEST_MAIN_DISAPPEAR_WAIT_TYPE1();
         aEDSN_change_talk_proc(designer, aEDSN_TALK_DEMO_END_WAIT);
@@ -151,6 +210,19 @@ static void aEDSN_demo_start_wait_talk_proc(EV_DESIGNER_ACTOR* designer, GAME* g
 static void aEDSN_demo_end_wait_talk_proc(EV_DESIGNER_ACTOR* designer, GAME* game) {
     chase_angle(&designer->npc_class.actor_class.shape_info.rotation.y, designer->npc_class.actor_class.player_angle_y,
                 aNPC_dt_angle_step(0x800));
+#ifdef TARGET_PC
+    if (aEDSN_pc_applied) {
+        mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
+        /* the HOST recorded the gift (its record reaches this client through service 5): only the end of the hand-over */
+        if (mMsg_Check_main_wait(msg_p) == TRUE && CLIP(handOverItem_clip)->master_actor == NULL) {
+            aEDSN_pc_applied = FALSE;
+            mMsg_REQUEST_MAIN_APPEAR_WAIT_TYPE1();
+            mDemo_Set_talk_change_player(TRUE);
+            aEDSN_change_talk_proc(designer, aEDSN_TALK_END_WAIT);
+        }
+        return;
+    }
+#endif
     if (aEDSN_check_present() == -1) {
         mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
 
@@ -158,9 +230,14 @@ static void aEDSN_demo_end_wait_talk_proc(EV_DESIGNER_ACTOR* designer, GAME* gam
             mEv_designer_c* ev_save_p = &Save_Get(event_save_data).special.event.designer;
             int idx = ev_save_p->used;
 
-            mPr_CopyPersonalID(&ev_save_p->pids[idx], &Now_Private->player_ID);
-            ev_save_p->gifted_cloths[idx] = designer->present;
-            ev_save_p->used++;
+#ifdef TARGET_PC
+            if (idx >= 0 && idx < mEv_DESGINER_NUM) /* worker E: never past pids[3] (vanilla writes out of bounds with a 4th player) */
+#endif
+            {
+                mPr_CopyPersonalID(&ev_save_p->pids[idx], &Now_Private->player_ID);
+                ev_save_p->gifted_cloths[idx] = designer->present;
+                ev_save_p->used++;
+            }
             mMsg_REQUEST_MAIN_APPEAR_WAIT_TYPE1();
             mDemo_Set_talk_change_player(TRUE);
             aEDSN_change_talk_proc(designer, aEDSN_TALK_END_WAIT);
@@ -280,6 +357,10 @@ static int aEDSN_talk_init(ACTOR* actorx, GAME* game) {
     EV_DESIGNER_ACTOR* designer = (EV_DESIGNER_ACTOR*)actorx;
 
     designer->npc_class.talk_info.talk_request_proc = (aNPC_TALK_REQUEST_PROC)none_proc1;
+#ifdef TARGET_PC
+    aEDSN_pc_stage = 0; /* a claim of an abandoned earlier talk is not continued */
+    aEDSN_pc_applied = FALSE;
+#endif
     mDemo_Set_ListenAble();
     return TRUE;
 }

@@ -12,6 +12,7 @@ The table (request -> 0.1.1 host behaviour -> how the new client stays safe):
   TXN kind 18 DRESSER   -> 0.1.1: unknown kind = BAD_SHAPE + violation  -> sent only after the host's DRESSER_STATE (83) enabled it (s_dresser_cli_enabled)
   TXN kind 19 MUSEUM_MAIL -> 0.1.1: unknown kind = BAD_SHAPE + violation -> sent only when the host announced town service 6, latched off after one BAD_SHAPE
   TXN kind 20 HOUSE_UPGRADE -> 0.1.1: unknown kind = BAD_SHAPE + violation -> same gate + latch (worker C)
+  TXN kind 21 EVNPC_CLAIM -> 0.1.1 / 0.2.x: unknown kind = BAD_SHAPE + violation -> sent only after the host's town service 9 said ON for the op, latched off after one BAD_SHAPE (worker E)
   TXN kind 12 MAIL_SEND by a GUEST -> 0.1.1: refused "guest has no house" BEFORE the shape check (no violation); resident shape unchanged
   TXN kind 13 MAIL_TAKE of the guest mailbox -> only offered when the host fed a guest mailbox (a 0.1.1 host never does)
   TXN kind 8 MUSEUM_DONATE by a guest -> same tag shape as 0.1.1 (aux 0, dest NONE): a semantic refusal (NO_DONOR_SLOT), never BAD_SHAPE
@@ -73,6 +74,10 @@ da = body(ng, "int pc_net_game_dresser_available(void) {")
 ck("K18 DRESSER: pc_net_game_dresser_available() needs s_dresser_cli_enabled, which only the host's DRESSER_STATE answer sets (a 0.1.1 host ignores the 84 probe)",
    "s_dresser_cli_enabled" in da and len(re.findall(r"s_dresser_cli_enabled = m->enabled != 0;", ng)) >= 1 and
    not re.search(r"s_dresser_cli_enabled = 1;", ng) and "if (!pc_net_game_dresser_available() ||" in body(ng, "int pc_net_game_dresser_begin(int op, int pool_slot, int pocket_slot, int item) {"))
+em = body(ng, "int pc_evc_mode(int op) {")
+ck("K21 EVNPC_CLAIM: pc_evc_mode() is CLAIM only with s_evc.have (set by a validated service 9 blob alone), the op bit and !s_evc.unsupported (latched on BAD_SHAPE); pc_evc_begin needs CLAIM",
+   "s_evc.have && !s_evc.unsupported" in em and "(s_evc.ops & (1u << op))" in em and "s_evc.unsupported = 1;" in ng and
+   "pc_evc_mode(op) != PC_EVC_MODE_CLAIM" in body(ng, "int pc_evc_begin(int op, int slot, int item, int flags, int aux_item) {"))
 gu = body(ng, "static int pcnetgame_client_guest_mailbox_usable(void) {")
 ck("K13 guest MAIL_TAKE / 'Check my mail.': only when the host fed a guest mailbox (s_mbox_host_fed && s_mbox_guest)", "s_mbox_host_fed && s_mbox_guest" in gu)
 

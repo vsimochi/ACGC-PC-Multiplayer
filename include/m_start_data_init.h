@@ -37,6 +37,8 @@ extern int mSDI_StartDataInitObserver(GAME* game);
 #ifdef TARGET_PC
 /* PC: a multiplayer GUEST's arrival init = the visitor (PAK) init minus mEv_SetGateway / return animal / goodbye mail (Guests G3.1, pc_m_card.c pc_guest_arrive()). */
 extern int mSDI_StartDataInitGuest(GAME* game);
+/* PC: the multiplayer HOST's day rollover = the boot init of a new day for the host's current binding (pc_day_roll_host.c via m_play.c play_init). */
+extern int mSDI_DayRollInit(GAME* game);
 #endif
 
 #ifdef __cplusplus

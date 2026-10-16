@@ -213,13 +213,13 @@ def main():
           "pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet) first and restamps last_pocket_rev (a client TXN built on the old base becomes STALE_IMAGE)",
           # master sprint 2 (dresser storage, kind 18): at most TWO more host-only callers, pcnetgame_handle_host_dresser_txn (its post-image write after the sidecar commit) and
           # pcnetgame_dresser_roll_forward (restart roll-forward); each must be gated by the own-resident / bound-index check before the write
-          wr_calls in (6, 7, 8) and wr_calls - 6 == sum(func_body(c, f).count("pcnetgame_rec_txn_write_inventory(") for f in ("pcnetgame_handle_host_dresser_txn", "pcnetgame_dresser_roll_forward"))
+          wr_calls in (6, 7, 8, 9) and wr_calls - 6 == sum(func_body(c, f).count("pcnetgame_rec_txn_write_inventory(") for f in ("pcnetgame_handle_host_dresser_txn", "pcnetgame_dresser_roll_forward", "pcnetgame_handle_host_evc_txn"))  # worker E: + the EVNPC_CLAIM handler (kind 21), gated by pcnetgame_rec_txn_idx_ok(idx) before its write
           and all(("pcnetgame_rec_txn_idx_ok(idx)" in func_body(c, f) or "idx >= PLAYER_NUM" in func_body(c, f)) for f in ("pcnetgame_handle_host_dresser_txn", "pcnetgame_dresser_roll_forward")
                   if "pcnetgame_rec_txn_write_inventory(" in func_body(c, f))
           and give.count("pcnetgame_rec_txn_write_inventory(") == 2 and "pcnetgame_rec_txn_idx_ok(idx)" in give
           and "pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet)" in give and "s_txn_res[idx].last_pocket_rev = slot->rev;" in give
           and give.index("pcnetgame_rec_txn_idx_ok(idx)") < give.index("pcnetgame_rec_validate_inventory(post, conds, rec->inventory.wallet)") < give.index("pcnetgame_rec_txn_write_inventory(")
-          and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)") == 2
+          and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)") == 2 + func_body(c, "pcnetgame_handle_host_evc_txn").count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet)")
           and c.count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)") == 1 + func_body(c, "pcnetgame_handle_host_dresser_txn").count("pcnetgame_rec_txn_write_inventory(idx, post, post_conds, t->pre_wallet)"))
     # MAP GRANT (shop milestone, already in the working tree before sprint 2): pcnetgame_shop_map_grant_idx is the ONE sanctioned maps[] writer of the X1 block (mPr_SetNewMap on the
     # resident's maps[] only: idempotent, no pocket / wallet / item, gated by pcnetgame_rec_txn_idx_ok first); the TEST-ONLY host hook around it only reads. Both are carved out of the
@@ -376,7 +376,7 @@ def main():
     _ctxn_clear_fns = ["pcnetgame_txn_cancel_queued", "pcnetgame_txn_begin", "pcnetgame_txn_begin_grant", "pcnetgame_handle_client_txn_result", "pcnetgame_ts_begin",
                        "pc_net_game_ts_begin_house_purchase", "pc_net_game_restock_begin", "pc_net_game_work_begin_op", "pc_net_game_evnpc_claim_begin", "pcnetgame_mail_tick",
                        "pc_net_game_mail_take_step", "pcnetgame_reset_client_session_state",
-                       "pcnetgame_hu_client_tick"]  # worker C: the house-upgrade op begins its kind-20 txn after AWAIT_CLEAN (like pcnetgame_mail_tick)
+                       "pcnetgame_hu_client_tick", "pc_evc_begin"]  # worker E: pc_evc_begin begins the kind-21 txn; worker C: the house-upgrade op begins its kind-20 txn after AWAIT_CLEAN (like pcnetgame_mail_tick)
     _ctxn_clear_fns += sorted(set(re.findall(r"((?:pc_net_game|pcnetgame)_dresser\w*)\(", c)))  # master sprint 2: a dresser-storage begin (kind 18) may begin a txn too
     check("C resend: every PC_NETGAME_TXN_RESEND_MS (2000 ms) the identical stored bytes, NO give-up while READY: the tick never frees/clears the state and never sends an ABORT; "
           "the only s_ctxn clears are the session reset, begin, cancel_queued (QUEUED only) and a matched result",

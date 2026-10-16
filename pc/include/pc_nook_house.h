@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 45
+#define PC_NOOK_MSG_COUNT 52
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -60,7 +60,15 @@ enum {
     PC_NOOK_MSG_UPG_WAIT,         /* talk start while the host takes the statue order / the "built" acknowledgement / the automatic basement order: a greeting that waits (CONTINUE) */
     PC_NOOK_MSG_UPG_FAILED,       /* the host refused (nothing changed): "come back later" (closing row) */
     PC_NOOK_MSG_UPG_LINKLOST,     /* the link was lost in flight: the outcome is unknown (closing row) */
-    PC_NOOK_MSG_UPG_BUSY          /* the house is busy (HOUSE_BUSY) / the paperwork changed (HOUSE_CHANGED): ask again in a moment (closing row) */
+    PC_NOOK_MSG_UPG_BUSY,         /* the house is busy (HOUSE_BUSY) / the paperwork changed (HOUSE_CHANGED): ask again in a moment (closing row) */
+    /* Shared event NPCs (worker E, pc_evnpc_shared.h; appended: every earlier id keeps its value). Spoken by the visitor; closing rows. */
+    PC_NOOK_MSG_EVC_SOLD,         /* SOLD_OUT 50 / NOT_AVAILABLE: the piece / the visit's quota is gone */
+    PC_NOOK_MSG_EVC_CLAIMED,      /* CLAIMED 51: this player already got something this visit */
+    PC_NOOK_MSG_EVC_FUNDS,        /* NO_FUNDS 19 */
+    PC_NOOK_MSG_EVC_FAILED,       /* any other refusal / a lost link (nothing is claimed as charged) */
+    PC_NOOK_MSG_EVC_OLDHOST,      /* a client of a host without the claim (0.2.x): refused locally, nothing sent */
+    PC_NOOK_MSG_EVC_WISP_DONE,    /* the Wisp: somebody already returned the spirits (CLAIMED 51 for op 5) */
+    PC_NOOK_MSG_EVC_NO_SPIRITS    /* the Wisp: NO_SPIRITS 54 */
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */

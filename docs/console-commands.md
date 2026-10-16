@@ -16,6 +16,9 @@ Syntax: `command [subcommand] [arguments]`, case-insensitive command word. Failu
 | `net status` / `net peers` | role, port, peers/ready, transport counters / per-peer table | no |
 | `net resync` | **UNSUPPORTED**: no general resync API exists; each system resyncs itself on connect | - |
 | `time get` | game date, time, weekday | no |
+| `day` / `day status` | day rollover (docs/multiplayer-guest-roadmap.md "Day rollover on a long-running host"): ON/OFF (`AC_MP_DAY_ROLL=0`), game date, last new-day init, last / next growth, state (idle / DUE / DEFERRED: why, how long / ROLLING), rolls this run + the last result | no (read-only) |
+| `day roll now` | a DUE roll skips the wait for players in "soft" buildings (museum, post office, police, other interiors); a shop / villager house / joining player still holds it; nothing due -> says so | no |
+| `day advance [hhmm]` | **TEST-ONLY**: moves the game clock to tomorrow hh:mm:05 (default 00:00) so the next frames run a real roll | **yes** |
 | `event list` / `event status [name]` | the game's event schedule for today (`scheduled-today`, `active-now`, RUN/ACTIVE/ERROR status) for the 119 event types | no |
 | `event start|stop|reset <name>` | **REFUSED** with the reason (see below) | - |
 | `wildlife list` / `wildlife info <id>` | the host's authoritative wildlife records | no |

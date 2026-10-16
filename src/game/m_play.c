@@ -485,6 +485,14 @@ extern void play_init(GAME* game) {
         my_malloc_current = &my_malloc_func;
     }
 
+#ifdef TARGET_PC
+    {
+        /* multiplayer HOST day rollover (pc_day_roll.h): when this load is the roll's own same-position town reload, the new day's boot init runs here
+         * (old actors gone, arena up, before the field build and any actor). A no-op for every other load, single player and clients. */
+        extern void pc_day_roll_play_init(void* play);
+        pc_day_roll_play_init(play);
+    }
+#endif
     mFM_FieldInit(play);
     VR_Box_ct(play);
     mMmd_MakeMuseumDisplayData();

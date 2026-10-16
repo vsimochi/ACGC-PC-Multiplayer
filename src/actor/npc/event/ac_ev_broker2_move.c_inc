@@ -430,12 +430,98 @@ static void aEBR2_sell_check(EV_BROKER2_ACTOR* broker2, GAME_PLAY* play) {
     }
 }
 
+#ifdef TARGET_PC
+/* Shared event NPCs (worker E): on a client the HOST sells Redd's piece (EVNPC_CLAIM op REDD_BUY: one buyer per piece, paid from the pre-image, the lineup cleared in the
+ * same step). The talk waits on this page until the host answered; APPLIED = the piece and the Bells are already the host's post-image (only the display is updated here),
+ * refused = a refusal row and nothing changes. Host / solo: the vanilla sale, plus a guard for a piece a client bought meanwhile. Returns 1 when this frame was handled. */
+static int aEBR2_pc_stage;
+static int aEBR2_pc_sell(EV_BROKER2_ACTOR* broker2, mMsg_Window_c* msg_p, const int* item_ux, const int* item_uz) {
+    mEv_broker_c* save_p = &Save_Get(event_save_data).special.event.broker;
+    const int item_idx = broker2->item_idx;
+    const mActor_name_t item = save_p->items[item_idx];
+    const int mode = pc_evc_mode(PC_EVC_OP_REDD_BUY);
+    int r;
+
+    if (mode == PC_EVC_MODE_LOCAL && aEBR2_pc_stage == 0) {
+        if (item == EMPTY_NO) {
+            mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_REDD_BUY, PC_EVC_REASON_SOLD_OUT)); /* sold to a client while this talk ran */
+            aEBR2_setupAction(broker2, aEBR2_ACTION_TALK_END_WAIT);
+            return TRUE;
+        }
+        return FALSE; /* the vanilla sale */
+    }
+    if (mode == PC_EVC_MODE_REFUSE && aEBR2_pc_stage == 0) {
+        mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_REDD_BUY, -1));
+        aEBR2_setupAction(broker2, aEBR2_ACTION_TALK_END_WAIT);
+        return TRUE;
+    }
+    if (aEBR2_pc_stage == 0) {
+        u32 sell_price = mSP_ItemNo2ItemPrice(item) * aEBR2_PRICE_MULT;
+        int slot;
+
+        if (item == EMPTY_NO) {
+            mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_REDD_BUY, PC_EVC_REASON_SOLD_OUT));
+            aEBR2_setupAction(broker2, aEBR2_ACTION_TALK_END_WAIT);
+            return TRUE;
+        }
+        if (!mSP_money_check(sell_price)) {
+            mMsg_Set_continue_msg_num(msg_p, 0x07A0); /* vanilla: not enough Bells (nothing sent) */
+            aEBR2_setupAction(broker2, aEBR2_ACTION_TALK_END_WAIT);
+            return TRUE;
+        }
+        slot = mPr_GetPossessionItemIdx(Now_Private, EMPTY_NO);
+        if (slot == -1) {
+            mMsg_Set_continue_msg_num(msg_p, 0x079F); /* vanilla: pockets full (nothing sent) */
+            aEBR2_setupAction(broker2, aEBR2_ACTION_TALK_END_WAIT);
+            return TRUE;
+        }
+        r = pc_evc_begin(PC_EVC_OP_REDD_BUY, slot, item, item_idx, (int)(sell_price & 0xFFFF));
+        if (r < 0) {
+            return TRUE; /* busy: retry next frame */
+        }
+        if (r == 0) {
+            mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_REDD_BUY, 0));
+            aEBR2_setupAction(broker2, aEBR2_ACTION_TALK_END_WAIT);
+            return TRUE;
+        }
+        aEBR2_pc_stage = 1;
+        return TRUE;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return TRUE;
+    }
+    aEBR2_pc_stage = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED && pc_evc_item() != EMPTY_NO) {
+        CLIP(broker_design_clip)->report_sales_proc(item_ux[item_idx], item_uz[item_idx]); /* the display (the lineup arrives from the host anyway) */
+        mMsg_Set_continue_msg_num(msg_p, 0x079E);
+        broker2->sell_flag = TRUE;
+    } else {
+        const int reason = pc_evc_last_reason();
+        printf("[NET][EVC] Redd: the host refused the sale (reason %d) -> refusal row\n", reason);
+        mMsg_Set_continue_msg_num(msg_p, reason == 19 ? 0x07A0 : pc_evc_refusal_msg(PC_EVC_OP_REDD_BUY, reason));
+    }
+    aEBR2_setupAction(broker2, aEBR2_ACTION_TALK_END_WAIT);
+    return TRUE;
+}
+#endif
+
 static void aEBR2_sell_after(EV_BROKER2_ACTOR* broker2, GAME_PLAY* play) {
     static int item_ux[] = {2, 4, 2};
     static int item_uz[] = {2, 2, 4};
     mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
-    
+
+#ifdef TARGET_PC
+    if (aEBR2_pc_stage != 0 && aEBR2_pc_sell(broker2, msg_p, item_ux, item_uz)) {
+        return; /* a claim in flight: keep polling even if the window state moved */
+    }
+#endif
     if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
+#ifdef TARGET_PC
+        if (aEBR2_pc_sell(broker2, msg_p, item_ux, item_uz)) {
+            return;
+        }
+#endif
         mEv_broker_c* save_p = &Save_Get(event_save_data).special.event.broker;
         int item_idx = broker2->item_idx;
         mActor_name_t item = save_p->items[item_idx];
@@ -523,6 +609,9 @@ static void aEBR2_say_hello_init(EV_BROKER2_ACTOR* broker2) {
     mEv_broker_common_c* common_p = &Common_Get(special_event_common).broker;
 
     mPr_CopyPersonalID(&common_p->entered_pid, &Now_Private->player_ID);
+#ifdef TARGET_PC
+    aEBR2_pc_stage = 0; /* a claim of an abandoned earlier talk is not continued */
+#endif
     aEBR2_set_msg_data(broker2);
     aEBR2_set_stop_spd(broker2);
 }

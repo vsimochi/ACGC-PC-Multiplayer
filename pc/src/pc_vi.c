@@ -110,6 +110,11 @@ void VIWaitForRetrace(void) {
         extern void pc_host_observer_poll(void);
         pc_host_observer_poll();
     }
+    /* Day rollover on a long-running HOST (pc_day_roll.h; a no-op unless HOST, AC_MP_DAY_ROLL=0 switches it off). */
+    {
+        extern void pc_day_roll_poll(void);
+        pc_day_roll_poll();
+    }
 
     /* Stage 0.5D: periodic authoritative-town save. Fires only while BOTH:
      *   - this process is the host (pc_net_game_role() == PC_NETGAME_ROLE_HOST) -- an M1 hardening
@@ -195,6 +200,17 @@ void VIWaitForRetrace(void) {
             /* Not ready (startup, scene transition, no bound resident, etc.) -- reset so the
              * "wait one interval" grace period re-applies whenever the world next becomes ready. */
             l_last_save_time = 0;
+        }
+
+        /* Day rollover: one authoritative save once a roll's reload settled (same writer and gates as the periodic save). */
+        {
+            extern int pc_day_roll_save_due(void);
+            extern void pc_day_roll_save_report(int ok);
+            if (pc_day_roll_save_due() && pc_net_game_role() == PC_NETGAME_ROLE_HOST && pc_net_game_dedicated_world_ready() && pcfa_save_ready()) {
+                int roll_save_ok = pc_save_write_authoritative();
+                l_last_save_time = vi_enter; /* the periodic cadence restarts from this save */
+                pc_day_roll_save_report(roll_save_ok);
+            }
         }
 
         /* --dedicated only: a console `save` request. Handled HERE (main thread, same function and gates as the periodic/early saves: HOST role, host

@@ -195,8 +195,9 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              # the announced shop upgrade (deliberate): service 6 = SHOP_UPGRADE (16-byte state blob), array bound 7; an old client ignores service 6
              # letters to guests (deliberate): service 7 = GUEST_DIR (324-byte directory blob), array bound 8; an old client ignores service 7
              # worker B (deliberate): service 8 = MUSEUM_DONORS (284-byte guest donor names), array bound 9; an old client ignores service 8
-             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      9u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
-             "#define PC_NETGAME_TS_MDONORS  8u", "#define PC_NETGAME_TS_MDONORS_LEN (4u + 120u + PC_NETGAME_MDONORS_NAMES * 20u) /* 284 (worker B) */",
+             # worker E (deliberate): service 9 = EVNPC_CAPS (8-byte shared event NPC capability), array bound 10; an old client ignores service 9
+             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      10u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             "#define PC_NETGAME_TS_MDONORS  8u", "#define PC_NETGAME_TS_EVNPC    9u", "#define PC_NETGAME_TS_EVNPC_LEN 8u", "#define PC_NETGAME_TS_MDONORS_LEN (4u + 120u + PC_NETGAME_MDONORS_NAMES * 20u) /* 284 (worker B) */",
              "#define PC_NETGAME_TS_GUESTDIR 7u", "#define PC_NETGAME_TS_GUESTDIR_LEN (4u + PC_NETGAME_GUESTDIR_MAX * 20u) /* 324 */", "#define PC_NETGAME_GUESTDIR_MAX   16u",
              "#define PC_NETGAME_TS_UPGRADE  6u", "#define PC_NETGAME_TS_UPGRADE_LEN 16u",
              # events: service 5 = EVENT_STATE (214-byte decision-state blob), array bound 6
@@ -394,6 +395,13 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_KIND_MUSEUM_MAIL": '19',
     "PC_NETGAME_TXN_REASON_MUSEUM_FULL": '42',
     "PC_NETGAME_TXN_REASON_MUSEUM_MAIL_OFF": '43',
+    # shared event NPCs (worker E, deliberate, v8 extended in place): TXN_COMMIT kind 21 EVNPC_CLAIM + reasons 50..54 (no new message, no layout change)
+    "PC_NETGAME_TXN_KIND_EVNPC_CLAIM": '21',
+    "PC_NETGAME_TXN_REASON_EVC_SOLD_OUT": '50',
+    "PC_NETGAME_TXN_REASON_EVC_CLAIMED": '51',
+    "PC_NETGAME_TXN_REASON_EVC_CHANGED": '52',
+    "PC_NETGAME_TXN_REASON_EVC_OFF": '53',
+    "PC_NETGAME_TXN_REASON_EVC_NO_SPIRITS": '54',
     "PC_NETGAME_MBOX_HOUSE_GUEST": '0xFF',
     "PC_NETGAME_HOUSE_AUTO": '0xFF',
     "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',

@@ -346,8 +346,11 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_keytab.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_tabfile.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dayclaims.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll.c      # day rollover on a long-running host (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll_host.c # day rollover: host integration (reload, play_init hook, console)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_store.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_museum_donors.c # worker B: museum_donors.dat (guest donor attribution)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_evnpc_shared.c # worker E: shared event NPC claims (pure logic)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_ui.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_layout.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_items.c
@@ -535,6 +538,7 @@ if(PC_TEST_HOOKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c
         ${DECOMP_ROOT}/src/game/m_choice.c
         ${DECOMP_ROOT}/src/actor/ac_my_room.c # dresser storage UI-drive hook (AC_TEST_DRESSER_UI)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll_host.c # day rollover: AC_TEST_DAY_ROLL_AT / console `day advance`
         PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS)
 endif()
 

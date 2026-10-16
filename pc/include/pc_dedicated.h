@@ -79,6 +79,7 @@ typedef struct PCNetGameDedicatedPeerInfo {
 int  pc_net_game_dedicated_world_ready(void);   /* HOST && s_host_world_ready */
 int  pc_net_game_dedicated_peer_slots(void);    /* number of transport slots to iterate (0 unless HOST) */
 int  pc_net_game_dedicated_peer_info(int slot, PCNetGameDedicatedPeerInfo* out); /* 1 iff the slot is not DISCONNECTED */
+void pc_net_game_host_day_roll_busy(int* joining, int* pending); /* day rollover: peers joining (handshake / snapshot) and PENDING pickup / drop / bury records */
 typedef struct PCNetGameDedicatedGuestAdmission {
     int configured;   /* max_guests */
     int effective;    /* min(max_guests, transport capacity) */

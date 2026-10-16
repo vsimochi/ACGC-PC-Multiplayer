@@ -71,12 +71,70 @@ static void aEART_menu_close_wait(EV_ARTIST_ACTOR* artist, GAME_PLAY* play) {
     }
 }
 
+#ifdef TARGET_PC
+/* Shared event NPCs (worker E): on a client Wendell's wallpaper is a host claim (EVNPC_CLAIM op ARTIST_TRADE: once per player, 3 per visit, rolled by the host, the fish
+ * replaced in the same step). The talk waits on this page; APPLIED = the wallpaper is already in the fish's slot (aEART_demo_start_wait_init skips its local writes);
+ * refused = the fish stays, a refusal row. A host without the claim: a polite refusal (a local gift could be repeated). Returns 1 when this frame was handled. */
+static int aEART_pc_stage;
+static int aEART_pc_applied;
+static int aEART_pc_trade(EV_ARTIST_ACTOR* artist, GAME_PLAY* play, mMsg_Window_c* msg_p, Submenu* submenu) {
+    const mActor_name_t item = submenu->item_p->item;
+    const int slot = submenu->item_p->slot_no;
+    int mode, r;
+    if (aEART_pc_stage == 0) {
+        aEART_pc_applied = FALSE;
+        mode = pc_evc_mode(PC_EVC_OP_ARTIST_TRADE);
+        if (item == EMPTY_NO || aEART_item_check(item) != aEART_ITEM_TYPE_FISH || mode == PC_EVC_MODE_LOCAL) {
+            return FALSE; /* vanilla (no fish / host or solo) */
+        }
+        if (mode == PC_EVC_MODE_REFUSE || slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT) {
+            mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_ARTIST_TRADE, -1));
+            (*artist->setupAction_proc)(artist, play, aEART_ACTION_TALK_END_WAIT);
+            return TRUE;
+        }
+        r = pc_evc_begin(PC_EVC_OP_ARTIST_TRADE, slot, item, 0, 0);
+        if (r < 0) {
+            return TRUE;
+        }
+        if (r == 0) {
+            mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_ARTIST_TRADE, 0));
+            (*artist->setupAction_proc)(artist, play, aEART_ACTION_TALK_END_WAIT);
+            return TRUE;
+        }
+        aEART_pc_stage = 1;
+        return TRUE;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return TRUE;
+    }
+    aEART_pc_stage = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED && pc_evc_item() != EMPTY_NO) {
+        artist->received_item = item;
+        artist->present = (mActor_name_t)pc_evc_item();
+        aEART_pc_applied = TRUE;
+        mMsg_Set_continue_msg_num(msg_p, 0x02F9);
+        (*artist->setupAction_proc)(artist, play, aEART_ACTION_DEMO_START_WAIT);
+    } else {
+        printf("[NET][EVC] Wendell: the host refused the trade (reason %d) -> refusal row, the fish stays\n", pc_evc_last_reason());
+        mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_ARTIST_TRADE, pc_evc_last_reason()));
+        (*artist->setupAction_proc)(artist, play, aEART_ACTION_TALK_END_WAIT);
+    }
+    return TRUE;
+}
+#endif
+
 static void aEART_msg_win_open_wait(EV_ARTIST_ACTOR* artist, GAME_PLAY* play) {
     static int msg_no[] = { 0x02F6, 0x02F9, 0x02F8, 0x02FC, 0x02F7 };
     static int next_act_idx[] = { aEART_ACTION_TALK_END_WAIT, aEART_ACTION_DEMO_START_WAIT, aEART_ACTION_TALK_END_WAIT, aEART_ACTION_REFUSE_DEMO_START_WAIT, aEART_ACTION_TALK_END_WAIT };
-    
+
     mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
 
+#ifdef TARGET_PC
+    if ((aEART_pc_stage != 0 || mMsg_Check_not_series_main_wait(msg_p) == TRUE) && aEART_pc_trade(artist, play, msg_p, &play->submenu)) {
+        return;
+    }
+#endif
     if (mMsg_Check_not_series_main_wait(msg_p) == TRUE) {
         Submenu* submenu = &play->submenu;
         mActor_name_t item = submenu->item_p->item;
@@ -156,6 +214,13 @@ static void aEART_demo_start_wait_init(EV_ARTIST_ACTOR* artist, GAME_PLAY* play)
     mEv_artist_c* ev_save_p = &Save_Get(event_save_data).special.event.artist;
     mActor_name_t present;
 
+#ifdef TARGET_PC
+    if (aEART_pc_applied) {
+        aEART_pc_applied = FALSE;
+        (void)item_p;
+        return; /* the HOST rolled, recorded and put the wallpaper into the fish's slot (artist->present is its item) */
+    }
+#endif
     mSP_SelectRandomItem_New(NULL, &present, 1, ev_save_p->walls, ev_save_p->used, mSP_KIND_WALLPAPER, mSP_LISTTYPE_EVENT, FALSE);
     artist->present = present;
     mPr_SetPossessionItem(Now_Private, item_p->slot_no, present, mPr_ITEM_COND_NORMAL);
@@ -227,6 +292,10 @@ static int aEART_talk_init(ACTOR* actorx, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     int action;
 
+#ifdef TARGET_PC
+    aEART_pc_stage = 0; /* a claim of an abandoned earlier talk is not continued */
+    aEART_pc_applied = FALSE;
+#endif
     if (aEART_check_present() == TRUE) {
         action = aEART_ACTION_TALK_END_WAIT;
     } else {

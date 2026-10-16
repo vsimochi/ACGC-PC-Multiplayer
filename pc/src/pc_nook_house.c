@@ -865,6 +865,49 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\na moment, hm?");
             nk_code(&b, NK_END);
             break;
+        /* worker E: shared event NPC refusals (the visitor speaks them; closing rows) */
+        case PC_NOOK_MSG_EVC_SOLD:
+            nk_text(&b, "Oh! Somebody else just");
+            nk_pause(&b, 6);
+            nk_text(&b, "\ngot that one, I'm afraid.\nIt's all gone now!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_EVC_CLAIMED:
+            nk_text(&b, "Hm? You already got");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nsomething from me on\nthis visit, you know!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_EVC_FUNDS:
+            nk_text(&b, "Hey now, you don't have");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nenough Bells for that.\nNo money, no deal!");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_EVC_FAILED:
+            nk_text(&b, "Hmm, something got in");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nthe way just now.\nLet's try that again later.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_EVC_OLDHOST:
+            nk_text(&b, "Sorry, I can't do that");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nfor you in this town\nright now.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_EVC_WISP_DONE:
+            nk_text(&b, "Oh! Somebody already");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nbrought my spirits back!\nKeep those, then.");
+            nk_code(&b, NK_END);
+            break;
+        case PC_NOOK_MSG_EVC_NO_SPIRITS:
+            nk_text(&b, "Hm? That's not all five");
+            nk_pause(&b, 6);
+            nk_text(&b, "\nof my spirits after all.\nPlease keep looking!");
+            nk_code(&b, NK_END);
+            break;
         case PC_NOOK_MSG_RESTOCK_DOOR:
             nk_text(&b, "Sorry, sorry!");
             nk_pause(&b, 8);

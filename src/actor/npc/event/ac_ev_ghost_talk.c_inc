@@ -341,6 +341,74 @@ static mActor_name_t aEGH_not_collect_get() {
   return mRmTp_FtrItemNo2Item1ItemNo(item, TRUE);
 }
 
+#ifdef TARGET_PC
+/* Shared event NPCs (worker E): the HOST rolls the Wisp's item reward with this same vanilla roll (Now_Private = the claimant's mirror record while it runs). */
+uint16_t aEGH_pc_host_roll_item(void) {
+  return (uint16_t)aEGH_not_collect_get();
+}
+
+/* On a client the spirits are turned in with ONE host claim (EVNPC_CLAIM op WISP_RETURN) made at the reward choice: the host checks the 5 spirit points of the pre-image,
+ * removes every spirit, grants the reward (weeds: the host's clear_grass; roof: the host's house header; item: rolled by the host into the spirit slot) and marks the
+ * spirits returned for the whole town. Until then nothing is deleted locally; a refusal keeps the spirits. aEGH_pc_stage: 0 idle, 1 pending; aEGH_pc_choice = the reward. */
+static int aEGH_pc_stage;
+static int aEGH_pc_applied;
+static int aEGH_pc_reward;
+
+static int aEGH_pc_claim_mode(void) {
+  return pc_evc_mode(PC_EVC_OP_WISP_RETURN);
+}
+
+/* 1 = handled this frame (pending / finished); the vanilla continuation for the choice runs in the caller when APPLIED */
+static int aEGH_pc_claim_step(EV_GHOST_ACTOR* ghost, int reward, int* applied) {
+  mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
+  int r, slot, i;
+  *applied = FALSE;
+  if (aEGH_pc_stage == 0) {
+    for (slot = -1, i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+      if (Now_Private->inventory.pockets[i] >= ITM_SPIRIT0 && Now_Private->inventory.pockets[i] <= ITM_SPIRIT4) {
+        slot = i;
+        break;
+      }
+    }
+    r = slot >= 0 ? pc_evc_begin(PC_EVC_OP_WISP_RETURN, slot, 0, 0, reward) : 0;
+    if (r < 0) {
+      return TRUE;
+    }
+    aEGH_pc_reward = reward;
+    mMsg_Set_LockContinue(msg_p); /* the page waits for the host */
+    if (r == 0) {
+      goto refused;
+    }
+    aEGH_pc_stage = 1;
+    return TRUE;
+  }
+  r = pc_net_game_ts_poll();
+  if (r == PC_NETGAME_TS_OP_PENDING) {
+    return TRUE;
+  }
+  aEGH_pc_stage = 0;
+  mMsg_Unset_LockContinue(msg_p);
+  if (r == PC_NETGAME_TS_OP_APPLIED) {
+    mEv_gst_c* ghost_data = (mEv_gst_c*)mEv_get_save_area(mEv_EVENT_GHOST, 54);
+    if (ghost_data != NULL) {
+      ghost_data->flags |= mEv_GHOST_FLAG_RETURNED_SPIRITS; /* the local copy says what the host decided */
+    }
+    *applied = TRUE;
+    return FALSE;
+  }
+refused:
+  aEGH_pc_stage = 0;
+  mMsg_Unset_LockContinue(msg_p);
+  printf("[NET][EVC] Wisp: the host refused the turn-in (reason %d) -> refusal row, the spirits stay\n", pc_evc_last_reason());
+  mMsg_Set_continue_msg_num(msg_p, pc_evc_refusal_msg(PC_EVC_OP_WISP_RETURN, pc_evc_last_reason()));
+  if (pc_evc_last_reason() != PC_EVC_REASON_CLAIMED) {
+    ghost->after_talk_think_act = 0; /* the Wisp stays (nobody returned its spirits) */
+  }
+  aEGH_change_talk_proc(ghost, aEGH_TALK_END_WAIT);
+  return TRUE;
+}
+#endif
+
 static void aEGH_give_me_wait(EV_GHOST_ACTOR* ghost, GAME_PLAY* play) {
   int order = mDemo_Get_OrderValue(mDemo_ORDER_NPC0, 9);
 
@@ -351,6 +419,9 @@ static void aEGH_give_me_wait(EV_GHOST_ACTOR* ghost, GAME_PLAY* play) {
       mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 9, 2);
       mMsg_Set_LockContinue(mMsg_Get_base_window_p());
       mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 1, 3);
+#ifdef TARGET_PC
+      if (aEGH_pc_claim_mode() == PC_EVC_MODE_LOCAL) /* a client keeps the spirits until the host took them (the reward choice claims them) */
+#endif
       aEGH_delete_hitodama();
       break;
     }
@@ -372,54 +443,81 @@ static void aEGH_select_wait(EV_GHOST_ACTOR* ghost, GAME_PLAY* play) {
   int order = mDemo_Get_OrderValue(mDemo_ORDER_NPC0, 9);
   mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
   mEv_gst_c* ghost_data = (mEv_gst_c*)mEv_get_save_area(mEv_EVENT_GHOST, 54);
+  int choice = -1;
 
+#ifdef TARGET_PC
+  if (aEGH_pc_stage != 0) {
+    int applied;
+    if (aEGH_pc_claim_step(ghost, aEGH_pc_reward, &applied) || !applied) {
+      return;
+    }
+    choice = aEGH_pc_reward == (int)PC_EVC_WISP_ITEM ? mChoice_CHOICE2 : mChoice_CHOICE0; /* APPLIED: the vanilla continuation of that choice */
+    aEGH_pc_applied = TRUE;
+  } else
+#endif
   if (order == 1 && mMsg_Check_MainNormalContinue(mMsg_Get_base_window_p())) {
     ghost->after_talk_think_act = 1;
-    ghost_data->flags |= mEv_GHOST_FLAG_RETURNED_SPIRITS;
     mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 9, 0);
+    choice = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
+#ifdef TARGET_PC
+    if (aEGH_pc_claim_mode() == PC_EVC_MODE_CLAIM) {
+      if (choice != mChoice_CHOICE1) { /* the roof claim follows the colour pick (aEGH_select_roof) */
+        int applied;
+        if (aEGH_pc_claim_step(ghost, choice == mChoice_CHOICE2 ? (int)PC_EVC_WISP_ITEM : (int)PC_EVC_WISP_WEEDS, &applied) || !applied) {
+          return;
+        }
+        aEGH_pc_applied = TRUE;
+      }
+    } else
+#endif
+    ghost_data->flags |= mEv_GHOST_FLAG_RETURNED_SPIRITS;
+  }
 
-    switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
-      case mChoice_CHOICE0: /* Clear weeds */
-      {
-        u32 num_weeds = mFI_GetItemNumField(GRASS_A, GRASS_C);
+  switch (choice) {
+    case mChoice_CHOICE0: /* Clear weeds */
+    {
+      u32 num_weeds = mFI_GetItemNumField(GRASS_A, GRASS_C);
 
-        if (num_weeds < 50) {
-          mMsg_Set_continue_msg_num(msg_p, 0x2EF1);
-        }
-        else if (num_weeds < 150) {
-          mMsg_Set_continue_msg_num(msg_p, 0x2EF2);
-        }
-        else if (num_weeds < 450) {
-          mMsg_Set_continue_msg_num(msg_p, 0x2EF3);
-        }
-        else if (num_weeds < 900) {
-          mMsg_Set_continue_msg_num(msg_p, 0x2EF4);
-        }
-        else {
-          mMsg_Set_continue_msg_num(msg_p, 0x2EF5);
-        }
-
-        aEGH_change_talk_proc(ghost, aEGH_TALK_CLEAR_GRASS);
-        break;
+      if (num_weeds < 50) {
+        mMsg_Set_continue_msg_num(msg_p, 0x2EF1);
+      }
+      else if (num_weeds < 150) {
+        mMsg_Set_continue_msg_num(msg_p, 0x2EF2);
+      }
+      else if (num_weeds < 450) {
+        mMsg_Set_continue_msg_num(msg_p, 0x2EF3);
+      }
+      else if (num_weeds < 900) {
+        mMsg_Set_continue_msg_num(msg_p, 0x2EF4);
+      }
+      else {
+        mMsg_Set_continue_msg_num(msg_p, 0x2EF5);
       }
 
-      case mChoice_CHOICE1:
-      {
-        aEGH_change_talk_proc(ghost, aEGH_TALK_SELECT_ROOF);
-        ghost->roof_pal = 0;
-        break;
-      }
+      aEGH_change_talk_proc(ghost, aEGH_TALK_CLEAR_GRASS);
+      break;
+    }
 
-      case mChoice_CHOICE2:
-      {
-        u8 name[mIN_ITEM_NAME_LEN];
+    case mChoice_CHOICE1:
+    {
+      aEGH_change_talk_proc(ghost, aEGH_TALK_SELECT_ROOF);
+      ghost->roof_pal = 0;
+      break;
+    }
 
-        aEGH_change_talk_proc(ghost, aEGH_TALK_GIVE_YOU_WAIT);
-        ghost->give_item = aEGH_not_collect_get();
-        mIN_copy_name_str(name, ghost->give_item);
-        mMsg_Set_item_str_art(msg_p, mMsg_ITEM_STR0, name, mIN_ITEM_NAME_LEN, mIN_get_item_article(ghost->give_item));
-        break;
-      }
+    case mChoice_CHOICE2:
+    {
+      u8 name[mIN_ITEM_NAME_LEN];
+
+      aEGH_change_talk_proc(ghost, aEGH_TALK_GIVE_YOU_WAIT);
+#ifdef TARGET_PC
+      ghost->give_item = aEGH_pc_applied ? (mActor_name_t)pc_evc_item() : aEGH_not_collect_get(); /* APPLIED: the HOST's roll, already in the pockets */
+#else
+      ghost->give_item = aEGH_not_collect_get();
+#endif
+      mIN_copy_name_str(name, ghost->give_item);
+      mMsg_Set_item_str_art(msg_p, mMsg_ITEM_STR0, name, mIN_ITEM_NAME_LEN, mIN_get_item_article(ghost->give_item));
+      break;
     }
   }
 }
@@ -429,6 +527,21 @@ static void aEGH_select_roof(EV_GHOST_ACTOR* ghost, GAME_PLAY* play) {
   int arrange_idx = mHS_get_arrange_idx(Common_Get(player_no));
   mHm_hs_c* home = Save_GetPointer(homes[arrange_idx]);
 
+#ifdef TARGET_PC
+  if (aEGH_pc_stage != 0) {
+    int applied;
+    if (aEGH_pc_claim_step(ghost, aEGH_pc_reward, &applied) || !applied) {
+      return;
+    }
+    /* APPLIED: the host painted the roof in ITS header (house sync brings it); the local copy says the same */
+    home->outlook_pal = ghost->roof_pal;
+    if ((Common_Get(now_private)->state_flags & mPr_FLAG_UPDATE_OUTLOOK_PENDING) == 0) {
+      home->next_outlook_pal = ghost->roof_pal;
+    }
+    aEGH_change_talk_proc(ghost, aEGH_TALK_END_WAIT);
+    return;
+  }
+#endif
   if (order == 1 && mMsg_Check_MainNormalContinue(mMsg_Get_base_window_p())) {
     int selected;
 
@@ -444,6 +557,13 @@ static void aEGH_select_roof(EV_GHOST_ACTOR* ghost, GAME_PLAY* play) {
     }
     else {
       ghost->roof_pal += (u8)selected;
+#ifdef TARGET_PC
+      if (aEGH_pc_claim_mode() == PC_EVC_MODE_CLAIM) {
+        int applied;
+        (void)aEGH_pc_claim_step(ghost, (int)PC_EVC_WISP_ROOF | ghost->roof_pal, &applied); /* pending: the APPLIED branch above finishes the pick */
+        return;
+      }
+#endif
       home->outlook_pal = ghost->roof_pal;
 
       /* Only update the 'next outlook' palette if the player doesn't have a coat of paint already scheduled */
@@ -463,6 +583,11 @@ static void aEGH_give_you_wait(EV_GHOST_ACTOR* ghost, GAME_PLAY* play) {
     mDemo_Set_OrderValue(mDemo_ORDER_NPC1, 0, ghost->give_item);
     mDemo_Set_OrderValue(mDemo_ORDER_NPC1, 1, 7);
     mDemo_Set_OrderValue(mDemo_ORDER_NPC1, 2, 0);
+#ifdef TARGET_PC
+    if (aEGH_pc_applied) {
+      aEGH_pc_applied = FALSE; /* the HOST already put the item into the pockets */
+    } else
+#endif
     mPr_SetFreePossessionItem(Common_Get(now_private), ghost->give_item, mPr_ITEM_COND_NORMAL);
     aEGH_change_talk_proc(ghost, aEGH_TALK_END_WAIT);
   }
@@ -562,9 +687,19 @@ static void aEGH_set_norm_talk_info(ACTOR* actorx) {
     msg_no = 0x2EE7 + RANDOM(5);
   }
   else if (hitodama_num >= mEv_GHOST_HITODAMA_NUM) {
+#ifdef TARGET_PC
+    if (aEGH_pc_claim_mode() == PC_EVC_MODE_REFUSE || (aEGH_pc_claim_mode() == PC_EVC_MODE_CLAIM && pc_evc_host_wisp_returned())) {
+      /* a host without the claim (a local turn-in could be repeated) / the host's Wisp already has its spirits: nothing is handed over */
+      mDemo_Set_msg_num(pc_evc_refusal_msg(PC_EVC_OP_WISP_RETURN, aEGH_pc_claim_mode() == PC_EVC_MODE_REFUSE ? -1 : PC_EVC_REASON_CLAIMED));
+      return;
+    }
+    aEGH_pc_stage = 0;
+    aEGH_pc_applied = FALSE;
+    if (aEGH_pc_claim_mode() == PC_EVC_MODE_LOCAL)
+#endif
+    Save_Get(event_save_common).ghost_day = 0;
     msg_no = 0x2EF0;
     aEGH_change_talk_proc(ghost, aEGH_TALK_GIVE_ME_WAIT);
-    Save_Get(event_save_common).ghost_day = 0;
   }
   else {
     msg_no = 0x2EEB + hitodama_num;
@@ -616,8 +751,8 @@ static int aEGH_talk_end_chk(ACTOR* actorx, GAME* game) {
 #ifdef TARGET_PC
       /* WEEDS: Save clear_grass is consumed by the HOST's daily growth (mAGrw_ClearGrass via mFM_PcFieldInitGrowth). A READY network client
        * skips that growth and never sends the flag, so setting it in the client's own Save only left a stray local flag (the reward was lost
-       * anyway). Only the host / single player (not host-authoritative) sets it. The reward earned on a client is NOT delivered: documented
-       * limitation (a host-side Wisp request would need its own message). */
+       * anyway). Only the host / single player (not host-authoritative) sets it. A client's reward is delivered by its WISP_RETURN claim (worker E:
+       * the host sets clear_grass in the same step it takes the spirits). */
       if (!pc_net_game_world_is_host_authoritative())
 #endif
       Save_Set(clear_grass, TRUE);

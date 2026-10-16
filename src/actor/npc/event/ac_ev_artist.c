@@ -4,6 +4,10 @@
 #include "m_player_lib.h"
 #include "m_msg.h"
 #include "libultra/libultra.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#include "pc_evnpc_shared.h" /* worker E: Wendell's wallpaper is a host claim (EVNPC_CLAIM op ARTIST_TRADE) */
+#endif
 
 enum {
     aEART_ACTION_SAY_HUNGRY,

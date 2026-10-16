@@ -718,4 +718,35 @@ extern int mSDI_StartDataInitGuest(GAME* game) {
 
     return res;
 }
+
+/* PC multiplayer HOST ONLY (day rollover on a long-running host, pc_day_roll_host.c; docs/multiplayer-guest-roadmap.md "Day rollover on a long-running host"):
+ * the boot init a vanilla "continue" runs for a new day, for the host's CURRENT binding, run by m_play.c play_init right before mFM_FieldInit of the roll's
+ * same-position SCENE_FG reload (the previous scene's actors are gone, the new zelda arena is up, no actor exists yet).
+ *   - a resident binding (player_no < PLAYER_NUM: a listen host): mSDI_StartInitFrom minus what only a title-screen continue does (scene_from_title_demo, the
+ *     RTC read -- play_init's mTM_time_init already read it -- and the "out travelling" decoy branch: a live resident is never away);
+ *   - any other binding (the dedicated observer, player_no == mPr_FOREIGNER): exactly the player-neutral PAK part of mSDI_StartDataInitObserver (no gateway,
+ *     return animal or goodbye flush);
+ * then mSDI_StartInitAfter(game, FALSE, mSDI_MALLOC_FLAG_ZELDA), the same call the boot makes. Never a new-town / new-player init; writes no private_data[]
+ * record other than the host's own bound resident (a listen host), exactly as its own continue would. Returns FALSE (nothing done) without a valid town save. */
+extern int mSDI_DayRollInit(GAME* game) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    Animal_c* animals = Save_Get(animals);
+    int player_no = Common_Get(player_no);
+
+    if (Common_Get(now_private) == NULL || mFRm_CheckSaveData() != TRUE) {
+        return FALSE;
+    }
+
+    mEv_UnSetGateway(); /* mSDI_StartInitBefore's first step (clears only this binding's own stale gateway flag) */
+    mFM_SetBlockKindLoadCombi(NULL);
+    mEv_init_force(&play->event);
+    mHsRm_GetHuusuiRoom(NULL, player_no);
+    mCkRh_DecideNowGokiFamilyCount(player_no);
+    mSP_ExchangeLineUp_InGame(NULL);
+    mNpc_SetRemoveAnimalNo(Save_GetPointer(remove_animal_idx), animals, -1);
+    mMkRm_MarkRoom(NULL);
+    mRmTp_SetDefaultLightSwitchData(2); // TODO: enum
+    mSDI_StartInitAfter(game, FALSE, mSDI_MALLOC_FLAG_ZELDA);
+    return TRUE;
+}
 #endif

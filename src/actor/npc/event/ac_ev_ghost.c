@@ -10,6 +10,7 @@
 #include "m_house.h"
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* WEEDS: pc_net_game_world_is_host_authoritative() -- see the Wisp talk proc's clear_grass note (ac_ev_ghost_talk.c_inc) */
+#include "pc_evnpc_shared.h" /* worker E: the spirit turn-in is a host claim (EVNPC_CLAIM op WISP_RETURN) */
 #endif
 
 enum {

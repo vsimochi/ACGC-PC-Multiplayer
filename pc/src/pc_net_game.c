@@ -151,6 +151,7 @@ static uint32_t s_ac_result_entity; /* TEST-ONLY auto-catch: the last catch outc
 static int      s_ac_result;        /* 1 accepted, 2 rejected */
 #endif
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the dialogue-side helpers defined near the house purchase seam */
+#include "pc_evnpc_shared.h" /* worker E: shared event NPC claims (kind 21, service 9) */
 #include "pc_guest_mail.h" /* guest mailbox: the overlay / post office girl seams (pc_ui_mailbox, pc_net_game_guest_mail_offer_available ...) */
 #include "pc_guest_event_due.h" /* guest mailbox: the vanilla mail-event date rule (birthday / Christmas letters for guests) */
 #include "m_museum.h"          /* guest mailbox: mMsm_MuseumComplete / mMsm_GuestCompMailForSink (the museum completion letter for guests) */
@@ -2666,6 +2667,17 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
 #define PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE 45u
 #define PC_NETGAME_TXN_REASON_HOUSE_BUSY         46u
 #define PC_NETGAME_TXN_REASON_HOUSE_CHANGED      47u
+/* SHARED EVENT NPCs (kind 21, worker E; the same one-phase TXN_COMMIT machinery, NO new message id; pc_evnpc_shared.h, "EVNPC SHARED" block at the end of this file).
+ * tag.aux_cond = op (PC_EVC_OP_*: 1 REDD_BUY, 2 SAHARAH_TRADE, 3 ARTIST_TRADE, 4 DESIGNER_GIFT, 5 WISP_RETURN); per op: REDD_BUY dest POCKET, slot = a free slot, item = the shown
+ * piece, flags = the lineup index, aux_item = the low 16 bits of the shown price; SAHARAH_TRADE dest POCKET, slot/item = the carpet handed over, aux_item = the shown price (low 16);
+ * ARTIST_TRADE dest POCKET, slot/item = the fish; DESIGNER_GIFT dest NONE, slot = a free slot, aux_item = the minigame result 0/1; WISP_RETURN dest NONE, slot = a spirit slot,
+ * aux_item = the reward (0 weeds, 0x100|palette roof, 2 item). Sent only to a host that announced TS service 9 (EVNPC_CAPS). Reasons 50..54 (pc_evnpc_shared.h). */
+#define PC_NETGAME_TXN_KIND_EVNPC_CLAIM 21u
+#define PC_NETGAME_TXN_REASON_EVC_SOLD_OUT   50u
+#define PC_NETGAME_TXN_REASON_EVC_CLAIMED    51u
+#define PC_NETGAME_TXN_REASON_EVC_CHANGED    52u
+#define PC_NETGAME_TXN_REASON_EVC_OFF        53u
+#define PC_NETGAME_TXN_REASON_EVC_NO_SPIRITS 54u
 #define PC_NETGAME_RESTOCK_PRICE         500u
 #define PC_NETGAME_RESTOCK_WAIT_MS       60000u
 #define PC_NETGAME_HOUSE_AUTO                 0xFFu
@@ -2739,7 +2751,11 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_TS_MDONORS  8u   /* worker B: MUSEUM_DONORS, which GUEST donated an exhibit whose donor nibble is 5 (host sidecar museum_donors.dat; NOT a save region). 284 bytes:
                                      * u8 count (0..8), 3 reserved zero bytes, 120 x u8 name index per exhibit (fossil 0..24, art 25..39, insect 40..79, fish 80..119; 0xFF = none),
                                      * then 8 x PersonalID_c (20 raw bytes: the guest KEY), the first `count` used, the rest zero. An old client ignores the unknown service. */
-#define PC_NETGAME_TS_NUM      9u   /* array bound: services 1..8 named (index 0 unused), 9+ reserved */
+#define PC_NETGAME_TS_EVNPC    9u   /* worker E: EVNPC_CAPS, the shared event NPC claims (pc_evnpc_shared.h; NOT a save region). 8 bytes: u8 version (1), u8 flags (bit 0 = kind 21
+                                     * claims are on), u8 wisp (bit 0 = the host's Wisp has its spirits back today), u8 0, u32 LE mask of the supported ops (bit = op). A client sends
+                                     * kind 21 only after this service said "on" for the op. An old client ignores the unknown service. */
+#define PC_NETGAME_TS_NUM      10u  /* array bound: services 1..9 named (index 0 unused), 10+ reserved */
+#define PC_NETGAME_TS_EVNPC_LEN 8u
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
 #define PC_NETGAME_TS_MUSEUM_LEN 63u
@@ -5949,6 +5965,9 @@ static const char* pcnetgame_kind_tag(int kind) {
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_EVNPC) {
         return "EVNPC";
+    }
+    if (kind == (int)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
+        return "EVNPC_CLAIM"; /* worker E: shared event NPCs */
     }
     if (kind == (int)PC_NETGAME_TXN_KIND_DRESSER) {
         return "DRESSER";
@@ -18084,6 +18103,11 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_HOUSE_NOT_ELIGIBLE: return "HOUSE_NOT_ELIGIBLE";
         case PC_NETGAME_TXN_REASON_HOUSE_BUSY: return "HOUSE_BUSY";
         case PC_NETGAME_TXN_REASON_HOUSE_CHANGED: return "HOUSE_CHANGED";
+        case PC_NETGAME_TXN_REASON_EVC_SOLD_OUT: return "EVC_SOLD_OUT"; /* worker E: shared event NPCs */
+        case PC_NETGAME_TXN_REASON_EVC_CLAIMED: return "EVC_CLAIMED";
+        case PC_NETGAME_TXN_REASON_EVC_CHANGED: return "EVC_CHANGED";
+        case PC_NETGAME_TXN_REASON_EVC_OFF: return "EVC_OFF";
+        case PC_NETGAME_TXN_REASON_EVC_NO_SPIRITS: return "EVC_NO_SPIRITS";
         default: return "?";
     }
 }
@@ -20260,6 +20284,16 @@ static struct {
  * HOUSE_UPGRADE kind 20: a 0.1.1 host never sends it) and never again in this session after the host answered kind 19 with BAD_SHAPE (a host that has
  * service 6 but not kind 19). A 0.1.1 host counts every unknown-kind TXN_COMMIT as a record-protocol violation and closes the peer at the third. */
 static int s_mm_unsupported = 0;
+/* worker E: the EVNPC SHARED block (end of this file): service 9, the kind 21 host handler, the client latch / apply / ticks */
+static void pcnetgame_evc_build_caps(uint8_t* blob);
+static void pcnetgame_evc_client_apply_caps(const uint8_t* blob);
+static void pcnetgame_handle_host_evc_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in);
+static int  pcnetgame_txn_apply_evc(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in);
+static int  pcnetgame_evc_try_send_check(PCNetGameClientTxn* T, uint8_t* dest, uint8_t* slot);
+static void pcnetgame_evc_op_resolve(int applied, uint8_t reason);
+static void pcnetgame_evc_session_reset(void);
+static void pcnetgame_evc_host_tick(void);
+static void pcnetgame_evc_client_tick(void);
 static void pcnetgame_ts_build_upgrade(uint8_t* blob);
 static int pcnetgame_ts_valid_upgrade_blob(const uint8_t* blob);
 static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob);
@@ -20282,7 +20316,7 @@ int pc_net_game_shop_restocking(void) {
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
            : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : svc == (int)PC_NETGAME_TS_UPGRADE ? "SHOP_UPGRADE"
-           : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : svc == (int)PC_NETGAME_TS_MDONORS ? "MUSEUM_DONORS" : "?";
+           : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : svc == (int)PC_NETGAME_TS_MDONORS ? "MUSEUM_DONORS" : svc == (int)PC_NETGAME_TS_EVNPC ? "EVNPC_CAPS" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -20348,6 +20382,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
         *len = (uint16_t)PC_NETGAME_TS_MDONORS_LEN;
         return 1;
     }
+    if (svc == (int)PC_NETGAME_TS_EVNPC) {
+        pcnetgame_evc_build_caps(blob); /* worker E: shared event NPC claims (a session state, not a save region) */
+        *len = (uint16_t)PC_NETGAME_TS_EVNPC_LEN;
+        return 1;
+    }
     return 0;
 }
 
@@ -20408,6 +20447,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_UPGRADE);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_GUESTDIR);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MDONORS); /* worker B */
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVNPC);   /* worker E */
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -20625,6 +20665,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_host_map_grant_test_hook();
     pcnetgame_clear_errands_test_hook();
     pcnetgame_evnpc_host_tick();
+    pcnetgame_evc_host_tick(); /* worker E: shared event NPCs (TEST-ONLY seed; the Wisp flag of service 9) */
     pcnetgame_npc_lease_host_tick();
     pcnetgame_page_host_tick();
     for (p = 0; p < pcnetgame_peer_span(); p++) {
@@ -28182,7 +28223,8 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* town services: no reservation to release; the UI seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC ||
-               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE ||
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* guest-first town: nothing was sent, the seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
@@ -28213,7 +28255,8 @@ static int pcnetgame_txn_try_send(void) {
                                T->kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_MAIL;
     const int is_house = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
                          T->kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC ||
-                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE; /* guest-first town / shop restock / house upgrade: a TXN_COMMIT kind too (no pocket) */
+                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE || /* guest-first town / shop restock / house upgrade: a TXN_COMMIT kind too (no pocket) */
+                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM; /* worker E: shared event NPCs */
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -28378,6 +28421,16 @@ static int pcnetgame_txn_try_send(void) {
             aux_cond = T->ts_aux;
             aux_item = T->ts_aux_item;
             flags = T->take_dst; /* the guard captured when the op began */
+            break;
+        case PC_NETGAME_TXN_KIND_EVNPC_CLAIM: /* worker E: the op as aux_cond, the lineup index as flags (take_dst), the op argument as aux_item; the slot re-checked now */
+            if (!pcnetgame_evc_try_send_check(T, &dest, &slot)) {
+                pcnetgame_txn_cancel_queued("the event NPC claim's pocket slot changed / no free slot", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
+                return -1;
+            }
+            item = T->item;
+            aux_cond = T->ts_aux;
+            aux_item = T->ts_aux_item;
+            flags = T->take_dst;
             break;
         case PC_NETGAME_TXN_KIND_SHOP_RESTOCK: /* same shape: no pocket slot, no item, the price the player was shown as aux_item */
         case PC_NETGAME_TXN_KIND_HOUSE_PURCHASE:
@@ -29017,6 +29070,9 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE) {
         return pcnetgame_txn_apply_house(T, in); /* guest-first town: only the wallet changes (the pockets are untouched) */
     }
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
+        return pcnetgame_txn_apply_evc(T, in); /* worker E: the host post-image of the event NPC claim (pockets, conditions, wallet) */
+    }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
         return pcnetgame_txn_apply_house_upgrade(T, in); /* worker C: the loan of an ACK_BUILT (the header arrives through house sync) */
     }
@@ -29364,6 +29420,9 @@ static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int appli
         pcnetgame_hu_op_resolve(request_id, applied, applied ? (uint8_t)0 : s_ts_last_reason); /* worker C: the Nook house-upgrade op */
         return;
     }
+    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
+        pcnetgame_evc_op_resolve(applied, applied ? (uint8_t)0 : s_ts_last_reason); /* worker E: the old-host latch; the op itself resolves below (s_ts_op) */
+    }
     if (s_ts_op.active && s_ts_op.kind == kind && s_ts_op.request_id == request_id) {
         s_ts_op.done = 1;
         s_ts_op.outcome = applied ? 1 : 2;
@@ -29526,7 +29585,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     memcpy(&m, data, size);
     svc = (int)m.service;
     if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG &&
-        svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE && svc != (int)PC_NETGAME_TS_GUESTDIR && svc != (int)PC_NETGAME_TS_MDONORS) {
+        svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE && svc != (int)PC_NETGAME_TS_GUESTDIR && svc != (int)PC_NETGAME_TS_MDONORS &&
+        svc != (int)PC_NETGAME_TS_EVNPC) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
@@ -29536,7 +29596,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
              : (svc == (int)PC_NETGAME_TS_EVENT) ? (uint16_t)PC_NETGAME_TS_EVENT_LEN
              : (svc == (int)PC_NETGAME_TS_UPGRADE) ? (uint16_t)PC_NETGAME_TS_UPGRADE_LEN
              : (svc == (int)PC_NETGAME_TS_GUESTDIR) ? (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN
-             : (svc == (int)PC_NETGAME_TS_MDONORS) ? (uint16_t)PC_NETGAME_TS_MDONORS_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_MDONORS) ? (uint16_t)PC_NETGAME_TS_MDONORS_LEN
+             : (svc == (int)PC_NETGAME_TS_EVNPC) ? (uint16_t)PC_NETGAME_TS_EVNPC_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -29558,7 +29619,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
           : svc == (int)PC_NETGAME_TS_EVENT ? pcnetgame_ts_valid_event_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_UPGRADE ? pcnetgame_ts_valid_upgrade_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_GUESTDIR ? pcnetgame_ts_valid_guestdir_blob(m.blob)
-          : svc == (int)PC_NETGAME_TS_MDONORS ? pcnetgame_ts_valid_mdonors_blob(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_MDONORS ? pcnetgame_ts_valid_mdonors_blob(m.blob)
+          : svc == (int)PC_NETGAME_TS_EVNPC ? pc_evc_caps_valid(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
                svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
                : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : svc == (int)PC_NETGAME_TS_UPGRADE ? "shop upgrade"
@@ -29574,6 +29636,13 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     }
     if (svc == (int)PC_NETGAME_TS_HOSTCFG) {
         pcnetgame_ts_client_apply(&m); /* a session setting, not a save region: no usable save needed */
+        return;
+    }
+    if (svc == (int)PC_NETGAME_TS_EVNPC) {
+        pcnetgame_evc_client_apply_caps(m.blob); /* worker E: a session state, not a save region: no usable save needed */
+        s_ts_client_seq[svc] = m.seq;
+        s_ts_client_have[svc] = 1;
+        printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq, (unsigned)m.digest, (unsigned)m.len);
         return;
     }
     if (svc == (int)PC_NETGAME_TS_MDONORS) {
@@ -34008,6 +34077,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
             pcnetgame_handle_host_house_upgrade_txn(peer, &tc); /* worker C: house upgrades via Nook (kind 20), one-phase, durable before APPLIED */
             return;
         }
+        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
+            pcnetgame_handle_host_evc_txn(peer, &tc); /* worker E: shared event NPCs (kind 21), one-phase */
+            return;
+        }
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC) {
             pcnetgame_handle_host_ts_txn(peer, &tc); /* Nook's manual restock (kind 15) / Work Mode (kind 16): the same one-phase town-service handler */
             return;
@@ -35111,6 +35184,7 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_mail_op, 0, sizeof(s_mail_op)); /* mail milestone 1: the post girl's operation dies with the session (a local refusal) */
     pcnetgame_hu_session_reset(); /* worker C: an unresolved house-upgrade op resolves as REJECTED (LINKLOST when it was sent); the old-host latch is per session */
     s_mm_unsupported = 0;         /* old-host compatibility: the MUSEUM_MAIL latch is per session too */
+    pcnetgame_evc_session_reset(); /* worker E: the service 9 capability and the kind 21 latch are per session */
     s_mail_last_reason = 0;
     memset(s_ts_client_seq, 0, sizeof(s_ts_client_seq));
     memset(&s_take_op, 0, sizeof(s_take_op)); /* mail milestone 2: the mailbox take dies with the session (a local refusal) ... */
@@ -36321,6 +36395,7 @@ static void pcnetgame_client_tick(void) {
     pcnetgame_evnpc_claim_test_hook();
     pcnetgame_dresser_client_tick(); /* dresser storage (agent 12): capability probe / pool snapshot (DRESSER_QUERY 84) */
     pcnetgame_evnpc_client_tick(); /* event NPC authority: match the host's table (no-op until the host sent one) */
+    pcnetgame_evc_client_tick();   /* worker E: shared event NPCs (Redd's display, the Wisp flag, the TEST-ONLY claim hook) */
     pcnetgame_page_client_tick();  /* town-shared pages: upload a local edit built on the adopted revision */
     pcnetgame_clear_errands_test_hook();
 
@@ -44056,6 +44131,31 @@ int pc_net_game_dedicated_peer_slots(void) {
     return s_role == PC_NETGAME_ROLE_HOST ? pcnetgame_peer_span() : 0;
 }
 
+/* Day rollover (pc_day_roll_host.c, worker R): what in the peer table must hold back a host day-roll reload. *joining = peers still in the handshake (not
+ * closing) or READY with a world snapshot under way; *pending = two-phase pickup / drop / bury records still PENDING (a reserved tile awaiting CONFIRM, not yet
+ * timed out). Read-only. 0 / 0 unless HOST. */
+void pc_net_game_host_day_roll_busy(int* joining, int* pending) {
+    uint32_t now = pcnetgame_now_ms();
+    int i, k;
+    *joining = 0;
+    *pending = 0;
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        if ((s_host_peer_link[i] == PC_NETGAME_LINK_HANDSHAKE && !s_host_peer[i].closing) ||
+            (s_host_peer_link[i] == PC_NETGAME_LINK_READY && s_host_peer[i].snap_active)) {
+            (*joining)++;
+        }
+        for (k = 0; k < 3; k++) {
+            const PCNetGameHostInteraction* it = pcnetgame_host_interaction((PCNetPeerId)i, s_host_reservation_kinds[k]);
+            if (it != NULL && it->phase == (uint8_t)PC_NETGAME_PHASE_PENDING && (uint32_t)(now - it->reserved_since_ms) < PC_NETGAME_CONFIRM_TIMEOUT_MS) {
+                (*pending)++;
+            }
+        }
+    }
+}
+
 /* PersonalID names are game font codes; the letters/digits/space used by the usual names are ASCII-compatible. Anything else prints as '?'. */
 static void pcnetgame_dedicated_ascii_name(const uint8_t* src, char* out) {
     int i, n = 0;
@@ -46672,3 +46772,856 @@ void pc_shop_upgrade_describe(char* out, int cap) {
     }
 }
 /* ===== SHOP UPGRADE END ===== */
+
+/* ===== EVNPC SHARED BEGIN (worker E): shared event NPC claims (TXN_COMMIT kind 21 EVNPC_CLAIM, TS service 9 EVNPC_CAPS; pc_evnpc_shared.h,
+ * docs/multiplayer-guest-roadmap.md "Shared event NPCs") =====
+ * HOST: pcnetgame_handle_host_evc_txn() decides every op on ITS copy of the visit (Save_t.event_save_data.special / the ghost save area), pays from the claimant's
+ * PRE-image (wallet + money bags, the SHOP_BUY payer), rolls with ITS RNG (the "uncollected" preference reads the claimant's MIRROR record), writes the post-image into
+ * the mirror and the visit record in ONE handler call, journals it (a resend replays, never re-executes) and pushes services 5 + 9 to every peer.
+ * CLIENT: pc_evc_mode() / pc_evc_begin() / pc_net_game_ts_poll() for the dialogue seams; kind 21 only after service 9 said "on" (old hosts never see it).
+ * Kill switch: AC_MP_EVENT_NPC=0 (host: service 9 "off" + kind 21 REJECTED EVC_OFF; client: the 0.2.1 local talk). */
+static int pcnetgame_evc_env_off(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("AC_MP_EVENT_NPC");
+        v = (e != NULL && e[0] == '0') ? 1 : 0;
+        if (v) {
+            printf("[NET][EVC] AC_MP_EVENT_NPC=0: shared event NPC claims are OFF in this process (the 0.2.1 local visitor talk)\n");
+        }
+    }
+    return v;
+}
+
+static int pcnetgame_evc_ymd_today(const lbRTC_ymd_c* y) {
+    return y->year == Common_Get(time.rtc_time).year && y->month == Common_Get(time.rtc_time).month && y->day == Common_Get(time.rtc_time).day;
+}
+
+/* HOST: the Wisp already has its spirits back TODAY (a flag of an earlier day is stale: the Wisp's own ct resets it the same way) */
+static int pcnetgame_evc_host_wisp_returned(void) {
+    mEv_gst_c* g;
+    if (Save_Get(event_save_common).ghost_event_type != mEv_EVENT_GHOST) {
+        return 0;
+    }
+    g = (mEv_gst_c*)mEv_get_save_area(mEv_EVENT_GHOST, 54);
+    return g != NULL && (g->flags & mEv_GHOST_FLAG_RETURNED_SPIRITS) != 0 && pcnetgame_evc_ymd_today(&g->renew_time);
+}
+
+static void pcnetgame_evc_build_caps(uint8_t* blob) {
+    pc_evc_caps_build(blob, !pcnetgame_evc_env_off(), pcnetgame_evc_host_wisp_returned(), PC_EVC_OPS_ALL);
+}
+
+static const char* pcnetgame_evc_op_name(int op) {
+    return op == PC_EVC_OP_REDD_BUY ? "REDD_BUY" : op == PC_EVC_OP_SAHARAH_TRADE ? "SAHARAH_TRADE" : op == PC_EVC_OP_ARTIST_TRADE ? "ARTIST_TRADE"
+           : op == PC_EVC_OP_DESIGNER_GIFT ? "DESIGNER_GIFT" : op == PC_EVC_OP_WISP_RETURN ? "WISP_RETURN" : "?";
+}
+
+/* HOST: the special visitor `kind` (mEv_SPNPC_*) of event type `type` (mEv_EVENT_*) is in town today (the dates the schedule wrote: SPECIAL1 start, SPECIAL2 end) */
+static int pcnetgame_evc_visit_on(uint32_t kind, int type) {
+    const mEv_save_common_data_c* c = &Save_Get(event_save_common);
+    const unsigned today = ((unsigned)Common_Get(time.rtc_time).month << 8) | (unsigned)Common_Get(time.rtc_time).day;
+    return Save_Get(event_save_data).special.kind == kind && (int)c->special_event.type == type &&
+           pc_evc_md_in_range(today, (unsigned)c->dates[mEv_SAVE_DATE_SPECIAL1], (unsigned)c->dates[mEv_SAVE_DATE_SPECIAL2]);
+}
+
+static int pcnetgame_evc_pid_in(const PersonalID_c* list, int n, const PersonalID_c* pid) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (mPr_CheckCmpPersonalID((PersonalID_c*)&list[i], (PersonalID_c*)pid) == TRUE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* the vanilla roll with the CLAIMANT's collect bits (Now_Private is the claimant's mirror for the roll only; single-threaded, restored at once) */
+static mActor_name_t pcnetgame_evc_roll(Private_c* mir, int kind, int list, mActor_name_t* excl, int n_excl) {
+    Private_c* keep = Now_Private;
+    mActor_name_t it = (mActor_name_t)EMPTY_NO;
+    if (mir != NULL) {
+        Common_Set(now_private, mir);
+    }
+    mSP_SelectRandomItem_New(NULL, &it, 1, excl, n_excl, kind, list, FALSE);
+    Common_Set(now_private, keep);
+    return it;
+}
+
+static int pcnetgame_evc_is_cat(uint16_t item, int cat) {
+    return ITEM_NAME_GET_TYPE(item) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT(item) == cat;
+}
+
+/* HOST: the host's own Wisp leaves (the visit is over for the town): its actor is deleted, the presence table removes it on every client */
+static void pcnetgame_evc_host_wisp_leave(void) {
+    GAME_PLAY* play;
+    Actor_list* list;
+    ACTOR* a;
+    int k;
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return;
+    }
+    play = (GAME_PLAY*)gamePT;
+    list = &play->actor_info.list[ACTOR_PART_NPC];
+    for (k = list->num_actors, a = list->actor; k > 0 && a != NULL; k--, a = a->next_actor) {
+        if (a->npc_id == SP_NPC_EV_GHOST) {
+            printf("[NET][EVC] host: the Wisp has its spirits back -- it leaves the town (actor deleted)\n");
+            Actor_delete(a);
+            break;
+        }
+    }
+}
+
+static void pcnetgame_handle_host_evc_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
+    const PCNetGameTxnTag* t = &in->tag;
+    const int op = (int)t->aux_cond;
+    PCNetGameHostPeerState* st;
+    PCNetGameRecSlot* slot;
+    PCNetGameTxnResident* R;
+    const PCNetGameTxnLog* old;
+    Private_c* mir;
+    mEv_special_c* sp = &Save_Get(event_save_data).special;
+    mEv_gst_c* ghost = NULL;
+    uint16_t post[mPr_POCKETS_SLOT_COUNT];
+    uint32_t post_conds, post_wallet, hash, price = 0;
+    mActor_name_t got = (mActor_name_t)EMPTY_NO;
+    const char* why = NULL;
+    uint8_t reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+    unsigned dest_code;
+    int idx, h = -1, n, pal = 0, stripped = 0, points = 0;
+
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not READY: dropped silently (D3 rule) */
+    }
+    st = &s_host_peer[peer];
+    idx = pcnetgame_rec_gate(peer, 0, 0);
+    if (idx < 0) {
+        pcnetgame_txn_reject(peer, -1, NULL, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_NOT_BOUND, 0, NULL, "peer has no valid resident binding");
+        return;
+    }
+    slot = pcnetgame_rec_slot(idx);
+    if (st->rec_state != PC_NETGAME_RECS_SYNCED || !s_host_world_ready) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0,
+                             st->rec_state != PC_NETGAME_RECS_SYNCED ? (uint8_t)PC_NETGAME_TXN_REASON_NOT_SYNCED : (uint8_t)PC_NETGAME_TXN_REASON_BUSY, 0, NULL,
+                             "resident record not SYNCED / host world not ready");
+        return;
+    }
+    dest_code = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET ? 1u : t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE ? 0u : 9u;
+    if (!(in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 &&
+          pc_evc_shape_ok(op, dest_code, t->slot, t->item, t->flags, t->aux_item, (unsigned)mPr_POCKETS_SLOT_COUNT))) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE, 0, NULL, "malformed EVNPC_CLAIM TXN_COMMIT");
+        pcnetgame_rec_violation(peer, "malformed EVNPC_CLAIM TXN_COMMIT (BAD_SHAPE)");
+        return;
+    }
+    /* journal: fence, replay, conflict (identical rules to the other one-phase kinds) */
+    R = &s_txn_res[idx];
+    hash = pcnetgame_fnv1a32(in, sizeof(*in));
+    if (pcnetgame_txn_nonce_fenced(R, t->txn_nonce)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "nonce fenced");
+        return;
+    }
+    if (t->txn_nonce == R->nonce) {
+        old = pcnetgame_txn_journal_find(R, t->txn_nonce, t->txn_seq);
+        if (old != NULL) {
+            if (old->msg_hash != hash) {
+                pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_CONFLICT, 0, NULL, "same (nonce, seq) with different bytes");
+            } else if (old->outcome == (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED) {
+                printf("[NET][EVC] host: peer %d replay of an applied %s (request %u): answered from the journal, nothing re-executed\n", (int)peer, pcnetgame_evc_op_name(op),
+                       (unsigned)in->request_id);
+                pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED, "replay ");
+            } else {
+                pcnetgame_txn_send_result(peer, idx, in, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, old->reason, slot->epoch, slot->rev, 0, NULL, 0, 0, "replay ");
+            }
+            return;
+        }
+        if (t->txn_seq <= R->max_seq) {
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "seq at or below the fence");
+            return;
+        }
+    } else {
+        if (R->nonce != 0) {
+            memmove(&R->fenced[0], &R->fenced[1], sizeof(R->fenced) - sizeof(R->fenced[0]));
+            R->fenced[PC_NETGAME_TXN_FENCED_NUM - 1] = R->nonce;
+        }
+        R->nonce = t->txn_nonce;
+        R->head = 0;
+        R->n = 0;
+        R->max_seq = 0;
+    }
+    R->max_seq = t->txn_seq; /* from here on every outcome is journalled */
+
+    /* base + pre-image */
+    pcnetgame_rec_refresh_hostfields(idx, slot);
+    if (t->base_epoch != slot->epoch || t->base_rev < R->last_pocket_rev || t->base_rev > slot->rev) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_STALE_IMAGE, 1, NULL, "base (epoch, rev) is stale or from the future");
+        pcnetgame_rec_stale_push(peer, idx, slot, pcnetgame_now_ms());
+        return;
+    }
+    if (pcnetgame_rec_validate_inventory(t->pre_pockets, t->pre_conds, t->pre_wallet) != 0) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE, 1, NULL, "pre-image failed validation");
+        return;
+    }
+    if (pcnetgame_evc_env_off()) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_EVC_OFF, 1, NULL, "shared event NPC claims are off on this host (AC_MP_EVENT_NPC=0)");
+        return;
+    }
+    mir = pcnetgame_rec_priv_ptr(idx);
+    if (mir == NULL || !pcnetgame_rec_txn_idx_ok(idx)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL, "no writable record for this player");
+        return;
+    }
+
+    /* the plan: READ-ONLY checks on the HOST's copy, the post-image in locals (nothing of the town is mutated here) */
+    memcpy(post, t->pre_pockets, sizeof(post));
+    post_conds = t->pre_conds;
+    post_wallet = t->pre_wallet;
+    switch (op) {
+        case PC_EVC_OP_REDD_BUY: {
+            mEv_broker_c* b = &sp->event.broker;
+            if (!pcnetgame_evc_visit_on((uint32_t)mEv_SPNPC_BROKER, mEv_EVENT_BROKER_SALE)) {
+                why = "Crazy Redd is not in town";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            } else if (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+                why = "pocket slot is not free";
+            } else if (b->used >= mEv_BROKER_ITEM_NUM || b->items[t->flags] == (mActor_name_t)EMPTY_NO) {
+                why = "that piece of Redd's lineup is already sold";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_SOLD_OUT;
+            } else if ((uint16_t)b->items[t->flags] != t->item) {
+                why = "the client's lineup differs from the host's";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_CHANGED;
+            } else {
+                price = (uint32_t)mSP_ItemNo2ItemPrice((mActor_name_t)t->item) * PC_EVC_REDD_MULT;
+                if (price == 0u || (price & 0xFFFFu) != (uint32_t)t->aux_item) {
+                    why = "the client's price differs from the host's";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_CHANGED;
+                } else if (!pcnetgame_shop_pay(post, &post_conds, &post_wallet, price)) {
+                    why = "the pre-image wallet (plus money bags) cannot pay Redd's price";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_FUNDS;
+                } else {
+                    got = (mActor_name_t)t->item;
+                }
+            }
+            break;
+        }
+        case PC_EVC_OP_SAHARAH_TRADE:
+            if (!pcnetgame_evc_visit_on((uint32_t)mEv_SPNPC_ARABIAN, mEv_EVENT_CARPET_PEDDLER)) {
+                why = "Saharah is not in town";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            } else if (t->pre_pockets[t->slot] != t->item || mPr_GET_ITEM_COND(t->pre_conds, t->slot) != mPr_ITEM_COND_NORMAL || !pcnetgame_evc_is_cat(t->item, ITEM1_CAT_CARPET)) {
+                why = "the pocket slot does not hold the carpet handed over";
+            } else {
+                price = pc_evc_saharah_price(sp->event.arabian.used);
+                if ((price & 0xFFFFu) != (uint32_t)t->aux_item) {
+                    why = "the client's price differs from the host's (the town's counter moved)";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_CHANGED;
+                } else if (!pcnetgame_shop_pay(post, &post_conds, &post_wallet, price)) {
+                    why = "the pre-image wallet (plus money bags) cannot pay Saharah's price";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_FUNDS;
+                } else if ((got = pcnetgame_evc_roll(mir, mSP_KIND_CARPET, mSP_LISTTYPE_EVENT, NULL, 0)) == (mActor_name_t)EMPTY_NO) {
+                    why = "no event carpet could be rolled";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+                }
+            }
+            break;
+        case PC_EVC_OP_ARTIST_TRADE: {
+            mEv_artist_c* a = &sp->event.artist;
+            n = a->used < mEv_ARTIST_ENTRY_SAVE_NUM ? (a->used < 0 ? 0 : a->used) : mEv_ARTIST_ENTRY_SAVE_NUM;
+            if (!pcnetgame_evc_visit_on((uint32_t)mEv_SPNPC_ARTIST, mEv_EVENT_ARTIST)) {
+                why = "Wendell is not in town";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            } else if (t->pre_pockets[t->slot] != t->item || mPr_GET_ITEM_COND(t->pre_conds, t->slot) != mPr_ITEM_COND_NORMAL || !pcnetgame_evc_is_cat(t->item, ITEM1_CAT_FISH)) {
+                why = "the pocket slot does not hold the fish handed over";
+            } else if (a->used > mEv_ARTIST_ENTRY_SAVE_NUM) {
+                why = "Wendell has given all his wallpapers of this visit";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_SOLD_OUT;
+            } else if (n > 0 && pcnetgame_evc_pid_in(a->pids, n, &mir->player_ID)) {
+                why = "this player already got Wendell's wallpaper of this visit";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_CLAIMED;
+            } else if ((got = pcnetgame_evc_roll(mir, mSP_KIND_WALLPAPER, mSP_LISTTYPE_EVENT, a->walls, n)) == (mActor_name_t)EMPTY_NO) {
+                why = "no event wallpaper could be rolled";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            }
+            break;
+        }
+        case PC_EVC_OP_DESIGNER_GIFT: {
+            mEv_designer_c* d = &sp->event.designer;
+            n = d->used < mEv_DESGINER_NUM ? (d->used < 0 ? 0 : d->used) : mEv_DESGINER_NUM;
+            if (!pcnetgame_evc_visit_on((uint32_t)mEv_SPNPC_DESIGNER, mEv_EVENT_DESIGNER)) {
+                why = "Gracie is not in town";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            } else if (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+                why = "pocket slot is not free";
+            } else if (n > 0 && pcnetgame_evc_pid_in(d->pids, n, &mir->player_ID)) {
+                why = "this player already got Gracie's gift of this visit";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_CLAIMED;
+            } else if (d->used >= mEv_DESGINER_NUM) {
+                why = "Gracie has given all her gifts of this visit (3)";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_SOLD_OUT;
+            } else if ((got = pcnetgame_evc_roll(mir, mSP_KIND_CLOTH, t->aux_item == 0 ? mSP_LISTTYPE_EVENT : mSP_LISTTYPE_COMMON, d->gifted_cloths, n)) ==
+                       (mActor_name_t)EMPTY_NO) {
+                why = "no cloth could be rolled";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            }
+            break;
+        }
+        case PC_EVC_OP_WISP_RETURN:
+            ghost = Save_Get(event_save_common).ghost_event_type == mEv_EVENT_GHOST ? (mEv_gst_c*)mEv_get_save_area(mEv_EVENT_GHOST, 54) : NULL;
+            points = pc_evc_spirit_points(t->pre_pockets, t->pre_conds, mPr_POCKETS_SLOT_COUNT, (uint16_t)ITM_SPIRIT0);
+            if (idx >= PLAYER_NUM) {
+                why = "the Wisp only takes spirits from residents (vanilla: no Wisp for a visitor)";
+            } else if (ghost == NULL) {
+                why = "the Wisp is not in town";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+            } else if (pcnetgame_evc_host_wisp_returned()) {
+                why = "somebody already returned the Wisp's spirits today";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_CLAIMED;
+            } else if (points < PC_EVC_SPIRIT_POINTS) {
+                why = "the pre-image does not hold 5 spirit points";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_EVC_NO_SPIRITS;
+            } else if (t->pre_pockets[t->slot] < (uint16_t)ITM_SPIRIT0 || t->pre_pockets[t->slot] > (uint16_t)ITM_SPIRIT4) {
+                why = "the claim's slot does not hold a spirit";
+            } else {
+                stripped = pc_evc_strip_spirits(post, &post_conds, mPr_POCKETS_SLOT_COUNT, (uint16_t)ITM_SPIRIT0, (uint16_t)EMPTY_NO);
+                if (t->aux_item >= PC_EVC_WISP_ROOF) {
+                    pal = (int)(t->aux_item - PC_EVC_WISP_ROOF);
+                    h = pcnetgame_mbox_house_of(&mir->player_ID);
+                    if (pal >= mSP_ROOF_COLOR_NUM || h < 0 || h >= PLAYER_NUM) {
+                        why = "the roof reward needs a house of this player on the host";
+                        h = -1;
+                    }
+                } else if (t->aux_item == PC_EVC_WISP_ITEM) {
+                    Private_c* keep = Now_Private;
+                    Common_Set(now_private, mir);
+                    got = (mActor_name_t)aEGH_pc_host_roll_item();
+                    Common_Set(now_private, keep);
+                    if (got == (mActor_name_t)EMPTY_NO) {
+                        why = "no item could be rolled";
+                        reason = (uint8_t)PC_NETGAME_TXN_REASON_NOT_AVAILABLE;
+                    }
+                }
+            }
+            break;
+        default:
+            why = "unknown op";
+            reason = (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE; /* cannot happen: the shape check above refused it */
+            break;
+    }
+    if (why != NULL) {
+        printf("[NET][EVC] host: peer %d %s %d %s REFUSED (%s): %s\n", (int)peer, idx >= PLAYER_NUM ? "guest record" : "resident", idx, pcnetgame_evc_op_name(op),
+               pcnetgame_txn_reason_name(reason), why);
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, reason, 1, NULL, why);
+        return; /* RESULT sent; nothing mutated (the claimant keeps its Bells and items) */
+    }
+    if (got != (mActor_name_t)EMPTY_NO) {
+        post[t->slot] = (uint16_t)got; /* the bought / traded / given item (the Wisp's item lands in the now empty spirit slot) */
+        post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+    }
+    if (pcnetgame_rec_validate_inventory(post, post_conds, post_wallet) != 0) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL, "post-image failed validation");
+        return;
+    }
+
+    /* THE commit: the visit record (vanilla's own writes) in the same step as the grant */
+    switch (op) {
+        case PC_EVC_OP_REDD_BUY: {
+            mEv_broker_c* b = &sp->event.broker;
+            b->items[t->flags] = (mActor_name_t)EMPTY_NO; /* aBD_ReportFtrSales */
+            if (b->used < mEv_BROKER_ITEM_NUM - 1) {      /* aEBR2_sell_after */
+                b->sold_items[b->used] = (mActor_name_t)t->item;
+                mPr_CopyPersonalID(&b->pid[b->used], &mir->player_ID);
+                b->used++;
+            } else {
+                lbRTC_TimeCopy(&b->end_time, Common_GetPointer(time.rtc_time));
+                b->used = mEv_BROKER_ITEM_NUM;
+            }
+            if (s_local_scene.valid && s_local_scene.scene_id == (uint8_t)SCENE_BROKER_SHOP) {
+                (void)aBD_PC_SyncDisplayWithLineup(); /* the HOST player stands in Redd's tent: the sold piece leaves the display */
+            }
+            break;
+        }
+        case PC_EVC_OP_SAHARAH_TRADE:
+            sp->event.arabian.used = (sp->event.arabian.used + 1 > PC_EVC_SAHARAH_MULT_CAP) ? PC_EVC_SAHARAH_MULT_CAP : sp->event.arabian.used + 1;
+            break;
+        case PC_EVC_OP_ARTIST_TRADE: {
+            mEv_artist_c* a = &sp->event.artist;
+            if (a->used >= mEv_ARTIST_ENTRY_SAVE_NUM) {
+                a->used = mEv_ARTIST_ENTRY_SAVE_NUM + 1; /* the third gift is not recorded (vanilla); used 3 = done for everybody */
+            } else {
+                mPr_CopyPersonalID(&a->pids[a->used], &mir->player_ID);
+                a->walls[a->used] = got;
+                a->used++;
+            }
+            break;
+        }
+        case PC_EVC_OP_DESIGNER_GIFT: {
+            mEv_designer_c* d = &sp->event.designer;
+            mPr_CopyPersonalID(&d->pids[d->used], &mir->player_ID); /* used < 3 was checked: no write past pids[3] (the vanilla overflow) */
+            d->gifted_cloths[d->used] = got;
+            d->used++;
+            break;
+        }
+        default: /* PC_EVC_OP_WISP_RETURN */
+            ghost->flags |= mEv_GHOST_FLAG_RETURNED_SPIRITS;
+            mTM_set_renew_time(&ghost->renew_time, Common_GetPointer(time.rtc_time));
+            Save_Get(event_save_common).ghost_day = 0;
+            if (t->aux_item == PC_EVC_WISP_WEEDS) {
+                Save_Set(clear_grass, TRUE); /* consumed by the host's daily growth (the reward a client earned is delivered now) */
+            } else if (h >= 0) {
+                mHm_hs_c* hs = Save_GetPointer(homes[h]);
+                hs->outlook_pal = (u8)pal;
+                if ((mir->state_flags & mPr_FLAG_UPDATE_OUTLOOK_PENDING) == 0) {
+                    hs->next_outlook_pal = (u8)pal;
+                }
+            }
+            pcnetgame_evc_host_wisp_leave();
+            break;
+    }
+    (void)pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet);
+    slot->rev++;
+    slot->dirty_unsaved = 1;
+    R->last_pocket_rev = slot->rev;
+    pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+    printf("[NET][EVC] host: peer %d %s %d %s APPLIED [TXN]: item 0x%04X -> pocket slot %u, price %u, wallet %u -> %u%s\n", (int)peer,
+           idx >= PLAYER_NUM ? "guest record" : "resident", idx, pcnetgame_evc_op_name(op), (unsigned)got, (unsigned)t->slot, (unsigned)price, (unsigned)t->pre_wallet,
+           (unsigned)post_wallet,
+           op != PC_EVC_OP_WISP_RETURN ? "" : t->aux_item == PC_EVC_WISP_WEEDS ? " (Wisp: weeds)" : t->aux_item == PC_EVC_WISP_ITEM ? " (Wisp: item)" : " (Wisp: roof)");
+    if (op == PC_EVC_OP_WISP_RETURN) {
+        printf("[NET][EVC] host: Wisp turn-in: %d spirit point(s) in %d slot(s) taken from resident %d, spirits returned for the town%s\n", points, stripped, idx,
+               h >= 0 ? " (roof of its house)" : "");
+    } else if (op == PC_EVC_OP_REDD_BUY) {
+        printf("[NET][EVC] host: Redd lineup now 0x%04X 0x%04X 0x%04X used %d\n", (unsigned)sp->event.broker.items[0], (unsigned)sp->event.broker.items[1],
+               (unsigned)sp->event.broker.items[2], sp->event.broker.used);
+    }
+    s_txn_svc_echo = 0;
+    pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVENT); /* the visit record (Redd's sold piece, the counters, ghost_day) reaches every peer */
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVNPC); /* the Wisp flag */
+    pcnetgame_host_ts_push_all();
+    if (h >= 0) {
+        (void)pcnetgame_house_host_refresh(h, 1); /* the Wisp's roof colour: header only */
+    }
+    if (st->rec_push_active) {
+        pcnetgame_rec_start_push(peer, idx, st->rec_push_kind); /* a push in flight carries the PRE-transaction pockets */
+    }
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, host): AC_TEST_EVNPC_SEED=redd|saharah|artist|designer|wisp|none puts the host's town into "that visitor is in town today, nothing given yet"
+ * (what the event schedule would have written), once the host world is ready. Redd's lineup is rolled like init_sp_broker (logged). Never active in normal play. */
+static void pcnetgame_evc_test_seed(void) {
+    static int done = 0;
+    const char* e;
+    mEv_save_common_data_c* c;
+    mEv_special_c* sp;
+    unsigned today;
+    int i;
+    if (done || (e = pc_test_hook_getenv("AC_TEST_EVNPC_SEED")) == NULL) {
+        return;
+    }
+    done = 1;
+    c = &Save_Get(event_save_common);
+    sp = &Save_Get(event_save_data).special;
+    today = ((unsigned)Common_Get(time.rtc_time).month << 8) | (unsigned)Common_Get(time.rtc_time).day;
+    if (strcmp(e, "wisp") == 0) {
+        mEv_gst_c* g;
+        c->ghost_event_type = (u8)mEv_EVENT_GHOST;
+        c->ghost_day = (u16)today;
+        if (mEv_get_save_area(mEv_EVENT_GHOST, 54) == NULL) {
+            (void)mEv_reserve_save_area(mEv_EVENT_GHOST, 54);
+        }
+        g = (mEv_gst_c*)mEv_get_save_area(mEv_EVENT_GHOST, 54);
+        if (g != NULL) {
+            g->flags = 0;
+            mTM_set_renew_time(&g->renew_time, Common_GetPointer(time.rtc_time));
+        }
+        printf("[NET][EVC][TEST-ONLY] host: seeded the Wisp (ghost event on today, save area %s, spirits not returned)\n", g != NULL ? "ready" : "MISSING");
+    } else if (strcmp(e, "none") == 0) {
+        sp->kind = 0xFFFFFFFFu;
+        c->special_event.type = 0;
+        c->ghost_event_type = (u8)mEv_EVENT_NUM;
+        printf("[NET][EVC][TEST-ONLY] host: seeded NO visitor\n");
+    } else {
+        uint32_t kind;
+        int type;
+        if (strcmp(e, "redd") == 0) {
+            kind = (uint32_t)mEv_SPNPC_BROKER;
+            type = mEv_EVENT_BROKER_SALE;
+        } else if (strcmp(e, "saharah") == 0) {
+            kind = (uint32_t)mEv_SPNPC_ARABIAN;
+            type = mEv_EVENT_CARPET_PEDDLER;
+        } else if (strcmp(e, "artist") == 0) {
+            kind = (uint32_t)mEv_SPNPC_ARTIST;
+            type = mEv_EVENT_ARTIST;
+        } else if (strcmp(e, "designer") == 0) {
+            kind = (uint32_t)mEv_SPNPC_DESIGNER;
+            type = mEv_EVENT_DESIGNER;
+        } else {
+            printf("[NET][EVC][TEST-ONLY] host: AC_TEST_EVNPC_SEED=%s is unknown (redd|saharah|artist|designer|wisp|none)\n", e);
+            return;
+        }
+        memset(&sp->event, 0, sizeof(sp->event));
+        sp->kind = kind;
+        lbRTC_TimeCopy(&sp->scheduled, Common_GetPointer(time.rtc_time));
+        c->special_event.type = (u8)type;
+        c->dates[mEv_SAVE_DATE_SPECIAL1] = (u16)today;
+        c->dates[mEv_SAVE_DATE_SPECIAL2] = (u16)today;
+        if (kind == (uint32_t)mEv_SPNPC_BROKER) {
+            for (i = 0; i < mEv_BROKER_ITEM_NUM; i++) {
+                sp->event.broker.items[i] = (mActor_name_t)EMPTY_NO;
+            }
+            for (i = 0; i < mEv_BROKER_ITEM_NUM; i++) {
+                mSP_SelectRandomItem_New(NULL, &sp->event.broker.items[i], 1, sp->event.broker.items, i, mSP_KIND_FURNITURE, mSP_LISTTYPE_COMMON, FALSE);
+            }
+            printf("[NET][EVC][TEST-ONLY] host: seeded Redd: lineup 0x%04X 0x%04X 0x%04X prices %u %u %u\n", (unsigned)sp->event.broker.items[0],
+                   (unsigned)sp->event.broker.items[1], (unsigned)sp->event.broker.items[2],
+                   (unsigned)(mSP_ItemNo2ItemPrice(sp->event.broker.items[0]) * PC_EVC_REDD_MULT), (unsigned)(mSP_ItemNo2ItemPrice(sp->event.broker.items[1]) * PC_EVC_REDD_MULT),
+                   (unsigned)(mSP_ItemNo2ItemPrice(sp->event.broker.items[2]) * PC_EVC_REDD_MULT));
+        } else {
+            printf("[NET][EVC][TEST-ONLY] host: seeded %s (kind 0x%08X type %d, today 0x%04X)\n", e, (unsigned)kind, type, today);
+        }
+    }
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVENT);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVNPC);
+}
+
+static void pcnetgame_evc_host_tick(void) {
+    static uint32_t next_ms = 0;
+    const uint32_t now = pcnetgame_now_ms();
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        return;
+    }
+    pcnetgame_evc_test_seed();
+    if ((uint32_t)(now - next_ms) >= 1000u) { /* the Wisp flag the host's OWN player sets (vanilla talk) or a new day clears reaches the clients within a second */
+        next_ms = now;
+        (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVNPC);
+    }
+}
+
+/* ---- CLIENT ---- */
+static struct {
+    int      have, on, wisp_returned, unsupported;
+    uint32_t ops;
+    uint16_t item; /* the item the last APPLIED claim put into its slot */
+} s_evc;
+
+static void pcnetgame_evc_session_reset(void) {
+    s_evc.have = 0;
+    s_evc.on = 0;
+    s_evc.wisp_returned = 0;
+    s_evc.unsupported = 0;
+    s_evc.ops = 0;
+}
+
+static void pcnetgame_evc_client_apply_caps(const uint8_t* blob) {
+    const int on = (int)(blob[1] & 1u), wr = (int)(blob[2] & 1u);
+    const uint32_t ops = (uint32_t)blob[4] | ((uint32_t)blob[5] << 8) | ((uint32_t)blob[6] << 16) | ((uint32_t)blob[7] << 24);
+    if (!s_evc.have || s_evc.on != on || s_evc.wisp_returned != wr || s_evc.ops != ops) {
+        printf("[NET][EVC] client: the host's shared event NPC claims are %s (ops 0x%02X); the host's Wisp %s\n", on ? "ON" : "OFF", (unsigned)ops,
+               wr ? "already has its spirits back" : "still waits for its spirits");
+    }
+    s_evc.have = 1;
+    s_evc.on = on;
+    s_evc.wisp_returned = wr;
+    s_evc.ops = ops;
+}
+
+static void pcnetgame_evc_op_resolve(int applied, uint8_t reason) {
+    if (!applied && reason == (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE && !s_evc.unsupported) {
+        s_evc.unsupported = 1; /* a host that announced service 9 but does not know this kind / op: no further kind 21 in this session */
+        printf("[NET][EVC] client: the host refused EVNPC_CLAIM as BAD_SHAPE: shared event NPC claims stay off for this session\n");
+    }
+}
+
+int pc_evc_mode(int op) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || Now_Private == NULL || pcnetgame_evc_env_off()) {
+        return PC_EVC_MODE_LOCAL;
+    }
+    if (s_evc.have && !s_evc.on) {
+        return PC_EVC_MODE_LOCAL; /* the host operator turned the claims off: the 0.2.1 behaviour, chosen on purpose */
+    }
+    if (s_evc.have && !s_evc.unsupported && op >= 1 && op <= PC_EVC_OP_MAX && (s_evc.ops & (1u << op)) != 0u) {
+        return PC_EVC_MODE_CLAIM;
+    }
+    return op == PC_EVC_OP_SAHARAH_TRADE ? PC_EVC_MODE_LOCAL : PC_EVC_MODE_REFUSE; /* an old host: only Saharah (no one-of-a-kind stock) keeps the local trade */
+}
+
+int pc_evc_item(void) {
+    return (int)s_evc.item;
+}
+
+int pc_evc_last_reason(void) {
+    return (int)s_ts_last_reason;
+}
+
+int pc_evc_host_wisp_returned(void) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_evc.have && s_evc.wisp_returned;
+}
+
+int pc_evc_refusal_msg(int op, int reason) {
+    int which;
+    switch (reason) {
+        case PC_EVC_REASON_SOLD_OUT:
+        case (int)PC_NETGAME_TXN_REASON_NOT_AVAILABLE:
+            which = PC_NOOK_MSG_EVC_SOLD;
+            break;
+        case PC_EVC_REASON_CLAIMED:
+            which = op == PC_EVC_OP_WISP_RETURN ? PC_NOOK_MSG_EVC_WISP_DONE : PC_NOOK_MSG_EVC_CLAIMED;
+            break;
+        case (int)PC_NETGAME_TXN_REASON_NO_FUNDS:
+            which = PC_NOOK_MSG_EVC_FUNDS;
+            break;
+        case PC_EVC_REASON_NO_SPIRITS:
+            which = PC_NOOK_MSG_EVC_NO_SPIRITS;
+            break;
+        case -1: /* the mode said REFUSE (a host without the claim) */
+            which = PC_NOOK_MSG_EVC_OLDHOST;
+            break;
+        default:
+            which = PC_NOOK_MSG_EVC_FAILED;
+            break;
+    }
+    return pc_nook_msg_id(which);
+}
+
+int pc_evc_begin(int op, int slot, int item, int flags, int aux_item) {
+    PCNetGameOwnerStamp stamp;
+    s_evc.item = (uint16_t)EMPTY_NO;
+    if (pc_evc_mode(op) != PC_EVC_MODE_CLAIM || s_client_link != PC_NETGAME_LINK_READY) {
+        s_ts_last_reason = 0;
+        return 0;
+    }
+    if (slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT || item < 0 || item > 0xFFFF || flags < 0 || flags > 0xFF || aux_item < 0 || aux_item > 0xFFFF ||
+        !pc_evc_shape_ok(op, (op == PC_EVC_OP_REDD_BUY || op == PC_EVC_OP_SAHARAH_TRADE || op == PC_EVC_OP_ARTIST_TRADE) ? 1u : 0u, (unsigned)slot, (unsigned)item,
+                         (unsigned)flags, (unsigned)aux_item, (unsigned)mPr_POCKETS_SLOT_COUNT)) {
+        printf("[NET][EVC] client: %s refused locally: the request would be malformed (item 0x%04X flags %d aux 0x%04X) -- nothing sent\n", pcnetgame_evc_op_name(op),
+               (unsigned)item, flags, (unsigned)aux_item);
+        s_ts_last_reason = 0; /* never a BAD_SHAPE (a record violation on the host) */
+        return 0;
+    }
+    if (s_ts_op.active && s_ts_op.done) {
+        memset(&s_ts_op, 0, sizeof(s_ts_op)); /* the unconsumed result of an abandoned dialogue */
+    }
+    if (s_ts_op.active || pcnetgame_txn_begin_blocked() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return -1;
+    }
+    s_ts_last_reason = 0;
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        return 0;
+    }
+    s_ts_op.active = 1;
+    s_ts_op.kind = (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM;
+    s_ts_op.slot = (uint8_t)slot;
+    s_ts_op.aux = (uint8_t)op;
+    s_ts_op.item = (uint16_t)item;
+    s_ts_op.aux_item = (uint16_t)aux_item;
+    s_ts_op.request_id = s_ts_next_rid++;
+    memset(&s_ctxn, 0, sizeof(s_ctxn));
+    s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
+    s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM;
+    s_ctxn.slot = (uint8_t)slot;
+    s_ctxn.item = (uint16_t)item;
+    s_ctxn.ts_aux = (uint8_t)op;
+    s_ctxn.ts_aux_item = (uint16_t)aux_item;
+    s_ctxn.take_dst = (uint8_t)flags;
+    s_ctxn.request_id = s_ts_op.request_id;
+    s_ctxn.owner = stamp;
+    s_ctxn.first_ms = pcnetgame_now_ms();
+    printf("[NET][EVC] client: begin %s request=%u slot=%d item=0x%04X flags=%d aux=0x%04X\n", pcnetgame_evc_op_name(op), (unsigned)s_ts_op.request_id, slot,
+           (unsigned)item, flags, (unsigned)aux_item);
+    (void)pcnetgame_txn_try_send();
+    return 1;
+}
+
+/* QUEUED -> SENT: the claim's slot as of THIS moment (a free slot for ops 1 / 4, the handed-over item for ops 2 / 3, a spirit for op 5) */
+static int pcnetgame_evc_try_send_check(PCNetGameClientTxn* T, uint8_t* dest, uint8_t* slot) {
+    const int op = (int)T->ts_aux;
+    int s = (int)T->slot, i;
+    if (Now_Private == NULL || s >= mPr_POCKETS_SLOT_COUNT) {
+        return 0;
+    }
+    switch (op) {
+        case PC_EVC_OP_REDD_BUY:
+        case PC_EVC_OP_DESIGNER_GIFT:
+            if (Now_Private->inventory.pockets[s] != (mActor_name_t)EMPTY_NO) {
+                s = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+            }
+            if (s < 0) {
+                return 0;
+            }
+            break;
+        case PC_EVC_OP_SAHARAH_TRADE:
+        case PC_EVC_OP_ARTIST_TRADE:
+            if (Now_Private->inventory.pockets[s] != (mActor_name_t)T->item) {
+                return 0;
+            }
+            break;
+        default:
+            if (Now_Private->inventory.pockets[s] < (mActor_name_t)ITM_SPIRIT0 || Now_Private->inventory.pockets[s] > (mActor_name_t)ITM_SPIRIT4) {
+                for (s = -1, i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+                    if (Now_Private->inventory.pockets[i] >= (mActor_name_t)ITM_SPIRIT0 && Now_Private->inventory.pockets[i] <= (mActor_name_t)ITM_SPIRIT4) {
+                        s = i;
+                        break;
+                    }
+                }
+                if (s < 0) {
+                    return 0;
+                }
+            }
+            break;
+    }
+    *slot = (uint8_t)s;
+    *dest = (op == PC_EVC_OP_REDD_BUY || op == PC_EVC_OP_SAHARAH_TRADE || op == PC_EVC_OP_ARTIST_TRADE) ? (uint8_t)PC_NETGAME_TXN_DEST_POCKET : (uint8_t)PC_NETGAME_TXN_DEST_NONE;
+    return 1;
+}
+
+/* APPLIED: the host's post-image (pockets, conditions, wallet). The wallet can only go down (a purchase) or stay; anything else is refused. */
+static int pcnetgame_txn_apply_evc(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+    const PCNetGameTxnTag* t = &T->tag;
+    Private_c* np = Now_Private;
+    int i, same = 1;
+    if (in->host_session == s_crec.base_session && in->epoch == s_crec.base_epoch && in->rev > s_crec.base_rev) {
+        pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
+        s_crec.next_check_ms = 0;
+    }
+    s_evc.item = (uint16_t)EMPTY_NO;
+    if (np == NULL || t->slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT || in->post_wallet > (uint32_t)mPr_WALLET_MAX || in->post_wallet > t->pre_wallet ||
+        pcnetgame_rec_validate_inventory(in->post_pockets, in->post_conds, in->post_wallet) != 0) {
+        printf("[NET][EVC] client: *** APPLIED claim for request %u carries an inconsistent post-image -- nothing applied ***\n", (unsigned)T->request_id);
+        return 0;
+    }
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if ((uint16_t)np->inventory.pockets[i] != t->pre_pockets[i]) {
+            same = 0;
+        }
+    }
+    if (np->inventory.item_conditions != t->pre_conds || np->inventory.wallet != t->pre_wallet) {
+        same = 0;
+    }
+    if (same) {
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            np->inventory.pockets[i] = (mActor_name_t)in->post_pockets[i];
+        }
+        np->inventory.item_conditions = in->post_conds;
+        np->inventory.wallet = in->post_wallet;
+    } else {
+        /* the delta of the transaction onto the CURRENT local inventory (only the slots the host changed; never a duplicate) */
+        const uint32_t paid = t->pre_wallet - in->post_wallet;
+        for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+            if (in->post_pockets[i] != t->pre_pockets[i] || mPr_GET_ITEM_COND(in->post_conds, i) != mPr_GET_ITEM_COND(t->pre_conds, i)) {
+                np->inventory.pockets[i] = (mActor_name_t)in->post_pockets[i];
+                np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, i, mPr_GET_ITEM_COND(in->post_conds, i));
+            }
+        }
+        np->inventory.wallet = np->inventory.wallet >= paid ? np->inventory.wallet - paid : 0u;
+    }
+    if (in->post_pockets[t->slot] != (uint16_t)EMPTY_NO && in->post_pockets[t->slot] != t->pre_pockets[t->slot]) {
+        s_evc.item = in->post_pockets[t->slot];
+        mPr_SetItemCollectBit((mActor_name_t)s_evc.item);
+    }
+    printf("[NET][EVC] client: %s APPLIED (request %u): slot %u item 0x%04X, wallet %u -> %u (%s)\n", pcnetgame_evc_op_name((int)t->aux_cond), (unsigned)T->request_id,
+           (unsigned)t->slot, (unsigned)s_evc.item, (unsigned)t->pre_wallet, (unsigned)in->post_wallet, same ? "host post-image" : "delta");
+    return 1;
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, client): AC_TEST_EVC_CLAIM=<op>[,<flags>[,<aux>]] sends ONE claim through the real API (pc_evc_begin / pc_net_game_ts_poll) once the record is
+ * synced and service 9 arrived: REDD_BUY takes lineup piece <flags> at the price of the LOCAL (mirrored) record; SAHARAH / ARTIST hand over the first carpet / fish; DESIGNER
+ * sends result <aux>; WISP uses <aux> as the reward. Never active in normal play. */
+static void pcnetgame_evc_claim_test_hook(void) {
+    static int stage = 0;
+    static int op, fl, aux;
+    const char* e;
+    int r, s = -1, item = 0, i;
+    if (stage == 2 || s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || s_crec.state != PC_NETGAME_CRS_SYNCED || Now_Private == NULL) {
+        return;
+    }
+    if (stage == 0) {
+        if ((e = pc_test_hook_getenv("AC_TEST_EVC_CLAIM")) == NULL) {
+            stage = 2;
+            return;
+        }
+        fl = 0;
+        aux = 0;
+        if (sscanf(e, "%d,%d,%i", &op, &fl, &aux) < 1) {
+            stage = 2;
+            return;
+        }
+        if ((uint32_t)(pcnetgame_now_ms() - s_crec.adopt_ms) < 3000u || (!s_evc.have && (uint32_t)(pcnetgame_now_ms() - s_crec.adopt_ms) < 10000u)) {
+            return; /* wait a moment after the adopt and for service 9 (an old host never sends it: then the claim is refused locally) */
+        }
+        switch (op) {
+            case PC_EVC_OP_REDD_BUY:
+                s = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+                item = (int)Save_Get(event_save_data).special.event.broker.items[fl >= 0 && fl < 3 ? fl : 0];
+                if ((e = pc_test_hook_getenv("AC_TEST_EVC_ITEM")) != NULL && strtol(e, NULL, 0) > 0) {
+                    item = (int)strtol(e, NULL, 0); /* TEST-ONLY: a client whose view of the lineup lags (the piece another client just bought) */
+                }
+                aux = (int)((mSP_ItemNo2ItemPrice((mActor_name_t)item) * PC_EVC_REDD_MULT) & 0xFFFFu);
+                break;
+            case PC_EVC_OP_SAHARAH_TRADE:
+            case PC_EVC_OP_ARTIST_TRADE:
+                for (i = 0; i < mPr_POCKETS_SLOT_COUNT && s < 0; i++) {
+                    if (pcnetgame_evc_is_cat((uint16_t)Now_Private->inventory.pockets[i], op == PC_EVC_OP_SAHARAH_TRADE ? ITEM1_CAT_CARPET : ITEM1_CAT_FISH)) {
+                        s = i;
+                    }
+                }
+                item = s >= 0 ? (int)Now_Private->inventory.pockets[s] : 0;
+                aux = op == PC_EVC_OP_SAHARAH_TRADE ? (int)(pc_evc_saharah_price(Save_Get(event_save_data).special.event.arabian.used) & 0xFFFFu) : 0;
+                fl = 0;
+                break;
+            case PC_EVC_OP_DESIGNER_GIFT:
+                s = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+                fl = 0;
+                break;
+            default:
+                for (i = 0; i < mPr_POCKETS_SLOT_COUNT && s < 0; i++) {
+                    if (Now_Private->inventory.pockets[i] >= (mActor_name_t)ITM_SPIRIT0 && Now_Private->inventory.pockets[i] <= (mActor_name_t)ITM_SPIRIT4) {
+                        s = i;
+                    }
+                }
+                fl = 0;
+                break;
+        }
+        if ((e = pc_test_hook_getenv("AC_TEST_EVC_WALLET")) != NULL && atoi(e) > 0 && atoi(e) <= (int)mPr_WALLET_MAX) {
+            Now_Private->inventory.wallet = (u32)atoi(e); /* TEST-ONLY local write: the claim's pre-image can pay (the D3 upload carries it) */
+        }
+        printf("[NET][EVC][TEST-ONLY] client: claim %s slot %d item 0x%04X flags %d aux 0x%04X, mode %d, wallet %u (NOT active in normal play)\n", pcnetgame_evc_op_name(op), s,
+               (unsigned)item, fl, (unsigned)aux, pc_evc_mode(op), (unsigned)Now_Private->inventory.wallet);
+        r = pc_evc_begin(op, s < 0 ? 0 : s, item, fl, aux);
+        if (r < 0) {
+            return;
+        }
+        stage = r == 0 ? 2 : 1;
+        if (r == 0) {
+            printf("[NET][EVC][TEST-ONLY] client: claim refused locally (mode %d)\n", pc_evc_mode(op));
+        }
+        return;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return;
+    }
+    stage = 2;
+    printf("[NET][EVC][TEST-ONLY] client: claim %s %s (reason %d, item 0x%04X), wallet now %u\n", pcnetgame_evc_op_name(op), r == PC_NETGAME_TS_OP_APPLIED ? "APPLIED" : "REJECTED",
+           pc_evc_last_reason(), (unsigned)s_evc.item, (unsigned)Now_Private->inventory.wallet);
+}
+
+static void pcnetgame_evc_client_tick(void) {
+    static uint32_t next_ms = 0;
+    const uint32_t now = pcnetgame_now_ms();
+    pcnetgame_evc_claim_test_hook();
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !pcfa_save_ready() || (uint32_t)(now - next_ms) < 500u) {
+        return;
+    }
+    next_ms = now;
+    if (s_evc.have && s_evc.wisp_returned && Save_Get(event_save_common).ghost_event_type == mEv_EVENT_GHOST) {
+        mEv_gst_c* g = (mEv_gst_c*)mEv_get_save_area(mEv_EVENT_GHOST, 54);
+        if (g != NULL && (!(g->flags & mEv_GHOST_FLAG_RETURNED_SPIRITS) || !pcnetgame_evc_ymd_today(&g->renew_time))) {
+            g->flags |= mEv_GHOST_FLAG_RETURNED_SPIRITS; /* a local Wisp (re-created from the host's table) leaves at once, like the host's */
+            mTM_set_renew_time(&g->renew_time, Common_GetPointer(time.rtc_time));
+            printf("[NET][EVC] client: the host's Wisp has its spirits back: the local ghost record says so too\n");
+        }
+    }
+    if (s_local_scene.valid && s_local_scene.scene_id == (uint8_t)SCENE_BROKER_SHOP) {
+        const int n = aBD_PC_SyncDisplayWithLineup(); /* pieces another player bought (service 5) leave this tent's display */
+        if (n > 0) {
+            printf("[NET][EVC] client: %d sold piece(s) taken off Redd's display (the host's lineup)\n", n);
+        }
+    }
+}
+/* ===== EVNPC SHARED END ===== */

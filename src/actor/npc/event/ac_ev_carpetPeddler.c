@@ -8,6 +8,10 @@
 #include "m_submenu.h"
 #include "m_font.h"
 #include "m_string_data.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#include "pc_evnpc_shared.h" /* worker E: Saharah's trade is a host claim (EVNPC_CLAIM op SAHARAH_TRADE) */
+#endif
 
 void aECPD_actor_ct(ACTOR* actorx, GAME* game);
 void aECPD_actor_dt(ACTOR* actorx, GAME* game);

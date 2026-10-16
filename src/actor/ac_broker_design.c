@@ -97,6 +97,37 @@ static mActor_name_t aBD_UnitNo2FtrNo(int ux, int uz) {
     return RSV_NO;
 }
 
+#ifdef TARGET_PC
+/* Shared event NPCs (worker E, pc_evnpc_shared.h): a piece another player bought (the host cleared it in the lineup; service 5 brought it here) leaves this tent's display
+ * the way aBD_ReportFtrSales removes a sold one; the lineup itself is not touched. Position i shows items[i] (aBD_SetFurnitureFg). Returns how many pieces were removed. */
+int aBD_PC_SyncDisplayWithLineup(void) {
+    static const int pos[3][2] = { { 2, 2 }, { 4, 2 }, { 2, 4 } };
+    mActor_name_t* items = Save_Get(event_save_data).special.event.broker.items;
+    mActor_name_t* fg_p;
+    int i, n = 0;
+
+    if (CLIP(broker_design_clip) == NULL || aMR_CLIP == NULL || !mEv_CheckEvent(mEv_SPNPC_BROKER)) {
+        return 0;
+    }
+    fg_p = mFI_BkNumtoUtFGTop(0, 0);
+    for (i = 0; i < 3; i++) {
+        mActor_name_t ftr = aBD_UnitNo2FtrNo(pos[i][0], pos[i][1]);
+        mActor_name_t sold_ftr;
+        int sold_ftrID;
+
+        if (items[i] == EMPTY_NO && ITEM_IS_FTR(ftr) &&
+            aMR_CLIP->unitNum2ftrItemNoftrId_proc(&sold_ftr, &sold_ftrID, pos[i][0], pos[i][1], mCoBG_LAYER0)) {
+            aMR_CLIP->ftrId2extinguishFtr_proc(sold_ftrID);
+            if (fg_p != NULL) {
+                fg_p[pos[i][0] + pos[i][1] * UT_X_NUM] = RSV_SHOP_SOLD_FTR;
+            }
+            n++;
+        }
+    }
+    return n;
+}
+#endif
+
 static int aBD_ReportFtrSales(int ux, int uz) {
     mActor_name_t ftr = aBD_UnitNo2FtrNo(ux, uz);
 

@@ -6,6 +6,10 @@
 #include "m_font.h"
 #include "m_melody.h"
 #include "m_bgm.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#include "pc_evnpc_shared.h" /* worker E: Redd's sale is a host claim (EVNPC_CLAIM op REDD_BUY) */
+#endif
 
 enum {
     aEBR2_ACTION_WAIT,
