@@ -7,7 +7,7 @@ TIER: SOURCE. Reads this tree's pc_net_game.c and the RELEASED v0.1.1 source (`g
 SKIPPED when git / the tag is not available). Runtime counterpart: test_museum_mail_oldhost_real.py (a real 0.2.0 client on the real 0.1.1 program).
 
 The table (request -> 0.1.1 host behaviour -> how the new client stays safe):
-  msg 77/78/79/80/81/84/85/86/87/91 (TREE_DROP, SHOP_PREVIEW, BALL_*, BEE_SWARM, DRESSER_QUERY, SHOP_UPGRADE_REQ, WILDLIFE_TOOL_ACTION, GHOST_HUNT, PVP_HIT_REQ)
+  msg 77/78/79/80/81/84/85/86/87/91/96 (TREE_DROP, SHOP_PREVIEW, BALL_*, BEE_SWARM, DRESSER_QUERY, SHOP_UPGRADE_REQ, WILDLIFE_TOOL_ACTION, GHOST_HUNT, PVP_HIT_REQ, ACTION_EXT)
       -> no branch in the 0.1.1 dispatcher: "malformed / short / unrecognized: ignore" (no violation)              -> nothing needed
   TXN kind 18 DRESSER   -> 0.1.1: unknown kind = BAD_SHAPE + violation  -> sent only after the host's DRESSER_STATE (83) enabled it (s_dresser_cli_enabled)
   TXN kind 19 MUSEUM_MAIL -> 0.1.1: unknown kind = BAD_SHAPE + violation -> sent only when the host announced town service 6, latched off after one BAD_SHAPE
@@ -93,12 +93,13 @@ else:
     ck("O1 the 0.1.1 host dispatcher ends with the silent 'unrecognized: ignore' fallthrough (no violation for an unknown message id)",
        hd.rstrip().endswith("/* malformed / short / unrecognized: ignore rather than misinterpret */") and "violation" not in hd.split("PC_NETGAME_MSG_TXN_COMMIT")[-1].split("pcnetgame_handle_host_txn_commit")[-1])
     new_ids = {"TREE_DROP": 77, "SHOP_PREVIEW": 78, "BALL_STATE": 79, "BALL_KICK_REQUEST": 80, "BEE_SWARM": 81, "DRESSER_STATE": 83, "DRESSER_QUERY": 84,
-               "SHOP_UPGRADE_REQ": 85, "WILDLIFE_TOOL_ACTION": 86, "GHOST_HUNT": 87, "VILLAGER_OUTFIT": 90, "PVP_HIT_REQ": 91, "PVP_HIT": 92}
+               "SHOP_UPGRADE_REQ": 85, "WILDLIFE_TOOL_ACTION": 86, "GHOST_HUNT": 87, "VILLAGER_OUTFIT": 90, "PVP_HIT_REQ": 91, "PVP_HIT": 92,
+               "ACTION_EXT": 96}  # worker P2 puppet ACTION_EXT (presentation only, see test_action_ext_src.py)
     enum_re = r"^\s*PC_NETGAME_MSG_(\w+)\s*=\s*(\d+)\s*,"
     old_ids = {k: int(v) for k, v in re.findall(enum_re, old, re.M)}
     cur_ids = {k: int(v) for k, v in re.findall(enum_re, ng, re.M)}
     rng = re.findall(r"data\[0\] >= \(uint8_t\)PC_NETGAME_MSG_(\w+) && data\[0\] <= \(uint8_t\)PC_NETGAME_MSG_(\w+)", hd)
-    ck("O2 the new ids 77-81, 83-87, 90-92 are unknown to 0.1.1 (its ids end at %s) and fall in none of its range branches %s" % (max(old_ids.values() or [0]), rng),
+    ck("O2 the new ids 77-81, 83-87, 90-92, 96 are unknown to 0.1.1 (its ids end at %s) and fall in none of its range branches %s" % (max(old_ids.values() or [0]), rng),
        all(cur_ids.get(k) == v for k, v in new_ids.items()) and old_ids and max(old_ids.values()) == 76 and not (set(new_ids.values()) & set(old_ids.values()))
        and all(old_ids[b] < 77 for _a, b in rng))
     tc = hd[hd.index("if (size == sizeof(PCNetGameTxnCommitMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_TXN_COMMIT) {"):]

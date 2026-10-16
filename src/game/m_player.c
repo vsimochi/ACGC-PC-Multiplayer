@@ -1890,6 +1890,35 @@ int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const x
     return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
 }
 
+/* PUPPET ACTION_EXT real-process verification (worker P2), TEST-ONLY: the only caller is pc_net_game.c's pcnetgame_aext_test_hook()
+ * (PC_NET_TEST_HOOKS builds + AC_TEST_HOOKS=1 + AC_TEST_AEXT_SCRIPT). Thin pass-throughs to the REAL, unmodified static request functions of
+ * the states whose clip ACTION_EXT carries; everything after the request is the ordinary per-frame player update.
+ * what: 1 LIE_BED at the current position facing angle 0 (arg 0 = left INBED_L1, 1 = right INBED_R1), 2 ROLL_BED (arg 0/1 = direction 1/2),
+ * 3 STANDUP_BED (direction 1, else 2 when 1 has no free spot), 4 RADIO_EXERCISE command arg at speed 0.5, 7 WAIT, 9 CHANGE_CLOTH try-on of
+ * the worn cloth (the same cloth: no change). */
+int PC_Test_AextRequest(GAME* game, int what, int arg) {
+    PLAYER_ACTOR* player = GET_PLAYER_ACTOR_GAME(game);
+
+    switch (what) {
+        case 1:
+            return Player_actor_request_main_lie_bed(game, mFI_MOVEDIR_DOWN, &player->actor_class.world.position, arg ? 2 : 1, 0,
+                                                     mPlayer_REQUEST_PRIORITY_19);
+        case 2:
+            return Player_actor_request_main_roll_bed(game, arg ? 2 : 1, mPlayer_REQUEST_PRIORITY_22); /* wait_bed.c_inc:87 */
+        case 3:
+            return Player_actor_request_main_standup_bed(game, 1, mPlayer_REQUEST_PRIORITY_22) || /* wait_bed.c_inc:89 */
+                   Player_actor_request_main_standup_bed(game, 2, mPlayer_REQUEST_PRIORITY_22);
+        case 4:
+            return Player_actor_request_main_radio_exercise_all(game, arg, 0.5f, mPlayer_REQUEST_PRIORITY_19);
+        case 7:
+            return Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_31);
+        case 9:
+            return mPlib_request_main_change_cloth_forNPC_type1(game, Now_Private->cloth.item, Now_Private->cloth.idx, TRUE);
+        default:
+            return 0;
+    }
+}
+
 /* Player-vs-player tool hits (pc_pvp_authority.h): REACTIONS ONLY. The victim side runs here, from the local player's own per-frame
  * move (Player_actor_move_other_func1), never from the network handler: a host-validated PVP_HIT is consumed only while the player is
  * in an allowlisted state (wait / walk / run / dash / turn dash / ready net / ready-walk net) and no demo runs; anything else (talk,

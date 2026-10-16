@@ -169,13 +169,17 @@ def main():
     ck("T3: the state-row table differs from the baseline in exactly DEMO_STANDING_TRAIN, DEMO_WALK and DEMO_GETOFF_TRAIN (%s) and has the same 121 indexes (at the T3 commit; "
        "the working tree still has those three rows as T3 made them and keeps every baseline index)" % changed_rows,
        changed_rows == ["DEMO_GETOFF_TRAIN", "DEMO_STANDING_TRAIN", "DEMO_WALK"] and sorted(rows3) == sorted(bro) and len(rows3) == 121
-       and all(rows.get(k) == rows3[k] for k in changed_rows) and set(bro) <= set(rows))
+       and all(rows.get(k) == rows3[k] for k in changed_rows if k != "DEMO_GETOFF_TRAIN") and set(bro) <= set(rows))  # P1 made DEMO_GETOFF_TRAIN a pinned row
     ck("T3: DEMO_STANDING_TRAIN is a filled row 'standing_train' with PC_ROWF_HIDE_BODY (REPEAT, the HIDE row mechanism)",
        rows.get("DEMO_STANDING_TRAIN") == ("PCROW", "standing_train")
        and re.search(r"\[mPlayer_INDEX_DEMO_STANDING_TRAIN\] = PCROW\(\"standing_train\", mPlayer_ANIM_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0\.5f, 1\.0f, PC_ROWF_HIDE_BODY,", rp))
-    ck("T3: DEMO_GETOFF_TRAIN stays a fallback (puppet rows never replay AnimationMove root motion: an OUTTRAIN1 row would double-apply the clip's translation) and says so; DEMO_GETON_TRAIN* unchanged",
-       rows.get("DEMO_GETOFF_TRAIN", ("", ""))[0] == "PCFB" and "deliberately NOT an OUTTRAIN1 row" in rp
-       and rows["DEMO_GETON_TRAIN"] == bro["DEMO_GETON_TRAIN"] and rows["DEMO_GETON_TRAIN_WAIT"] == bro["DEMO_GETON_TRAIN_WAIT"])
+    # P1 (puppet animation coverage) superseded the T3 'DEMO_GETOFF_TRAIN stays a fallback' decision: the generalized root pin (s_row_pin
+    # mask 7 = TRANS_XZ|TRANS_Y|ROT_Y, vanilla demo_get*_train.c_inc ct_base) removes the double-apply objection, so the train demos are rows
+    ck("T3 -> P1: DEMO_GETON_TRAIN / _WAIT / DEMO_GETOFF_TRAIN are rows; the ct_base ones are fully pinned (mask 7), so the clip's translation is never double-applied",
+       rows.get("DEMO_GETOFF_TRAIN") == ("PCROW", "getoff_train") and rows.get("DEMO_GETON_TRAIN") == ("PCROW", "geton_train")
+       and rows.get("DEMO_GETON_TRAIN_WAIT") == ("PCROW_BODY", "geton_train_wait")
+       and "[mPlayer_INDEX_DEMO_GETOFF_TRAIN] = { PC_PIN_XZ | PC_PIN_Y | PC_PIN_RY, 0 }" in rp
+       and "[mPlayer_INDEX_DEMO_GETON_TRAIN] = { PC_PIN_XZ | PC_PIN_Y | PC_PIN_RY, 0 }" in rp)
     ck("T3: DEMO_WALK stays a PCFB row; the fallback block maps it to WALK1 through pcarr_demo_walk_plays_walk (TARGET_PC), so the walk tempo formula applies",
        rows.get("DEMO_WALK", ("", ""))[0] == "PCFB"
        and re.search(r"#ifdef TARGET_PC\n[^\n]*\n[^\n]*\n[^\n]*\n\s+if \(pcarr_demo_walk_plays_walk\(self->cosmetic_action_valid, \(int\)self->cosmetic_action_index, \(int\)mPlayer_INDEX_DEMO_WALK,\n\s+self->cosmetic_move_state == PC_MOVE_STATE_OTHER\)\) \{\n\s+desired_anim_idx = mPlayer_ANIM_WALK1;\n\s+\}\n#endif", rp))

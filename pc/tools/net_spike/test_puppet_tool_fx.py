@@ -233,8 +233,10 @@ def a0(check):
           "UCHIWA 0x167, UMBRELLA_ROTATE 0x432, ROD_STROKE_SMALL 0x445)",
           (NA["NA_SE_TOOL_FURI"], NA["NA_SE_GASAGOSO"], NA["NA_SE_ROD_STROKE"], NA["NA_SE_UCHIWA"],
            NA["NA_SE_UMBRELLA_ROTATE"], NA["NA_SE_ROD_STROKE_SMALL"]) == (0x5A, 0x69, 0x109, 0x167, 0x432, 0x445))
-    check("A0 table rows: the 15 states this test exercises + the 11 Phase 6b rows (test_puppet_scoop_fx.py) + the 2 player-vs-player reaction rows (SHOCK, STUNG_MOSQUITO; test_pvp_src.py)",
-          blk.count("{ mPlayer_INDEX_") == len(CASES) + 11 + 2)
+    # P1 (puppet animation coverage) added 8 rows: PICKUP_FURNITURE, SITDOWN, STANDUP, TAKEOUT_ITEM, PUTIN_ITEM, THROW_MONEY, READY_PITFALL,
+    # KNOCK_DOOR (pinned by test_puppet_rows_batchA_src.py F1)
+    check("A0 table rows: the 15 states this test exercises + the 11 Phase 6b rows (test_puppet_scoop_fx.py) + the 2 player-vs-player reaction rows (SHOCK, STUNG_MOSQUITO; test_pvp_src.py) + the 8 P1 rows",
+          blk.count("{ mPlayer_INDEX_") == len(CASES) + 11 + 2 + 8)
 
 
 def t_all(port, log_dir, check):

@@ -583,6 +583,12 @@ typedef enum PCNetGameMsgType {
                                              * immunity, arrival protection) and answers the victim only with PVP_HIT. Reactions only. See PCPvpHitReqMsg / pc_pvp_authority.h. */
     PC_NETGAME_MSG_PVP_HIT               = 92, /* host -> the VICTIM client only, RELIABLE, 12 bytes: tumble / shock + knockback angle. The victim applies it from its own player
                                              * frame, only in an allowlisted state. Old peers ignore both ids. See PCPvpHitMsg. */
+    PC_NETGAME_MSG_ACTION_EXT            = 96, /* worker P2 puppet ACTION_EXT (v8 extended in place, NO version bump), owner -> host -> other READY peers in the owner's announced
+                                             * scene (id + owner), RELIABLE, 16 bytes: the exact clip of an allowlisted state (furniture / bed / talk reactions / trades / radio...),
+                                             * bound to the MOVE (main index, entry counter). PRESENTATION ONLY. An old peer ignores the id. See PCActionExtMsg / pc_action_ext.h. */
+    PC_NETGAME_MSG_BOBBER_VIEW          = 97, /* worker P3 (v8 extended in place, NO version bump), host -> READY peers in the angler's announced scene, UNRELIABLE <= 10 Hz while
+                                             * the bobber exists + one RELIABLE 'gone', 24 bytes: another player's bobber (the host relays its own bobber and the BOBBER_STATE it
+                                             * receives) so a puppet can draw it. PRESENTATION ONLY. An old peer ignores the id. See PCBobberViewMsg / pc_fishing_view.h. */
 } PCNetGameMsgType;
 
 typedef enum PCNetGameRejectReason {
@@ -816,9 +822,16 @@ typedef struct PCNetGameAppearanceMsg {
     uint16_t cloth_item;
     uint8_t  sunburn_rank;
     uint8_t  is_custom_design;
-    uint8_t  _reserved0[24];
+    uint8_t  _reserved0[24];       /* P1: [0] bit 0 = PC_NETGAME_APPEAR_FLAG_BEE_SWELL; everything else stays 0 */
     mNW_original_design_c design;  /* only meaningful when is_custom_design; zeroed otherwise */
 } PCNetGameAppearanceMsg;
+/* P1 (puppet animation coverage): the swollen face after a bee sting (Common player_bee_swell_flag, stung_bee.c_inc:77-82). Carried in the
+ * formerly always-zero _reserved0[0] (no size / id change): an old sender sends 0 = not swollen, an old receiver never reads it. The
+ * existing per-frame appearance change detection (pc_net_game_poll) resends the appearance when the flag changes. Inside the process
+ * (PCNetPlayerAppearance, whose header layout stays frozen) the flag rides bit 7 of sunburn_rank (a rank is 0..8): the wire sunburn_rank
+ * is always the clean rank. pc_remote_player.c uses the same bit (PC_REMOTE_APPEAR_SWELL_BIT). */
+#define PC_NETGAME_APPEAR_FLAG_BEE_SWELL 0x01u
+#define PC_NETGAME_APPEAR_SWELL_BIT 0x80u
 _Static_assert(sizeof(PCNetGameAppearanceMsg) == 576, "PCNetGameAppearanceMsg wire size drifted");
 /* The one message with real headroom risk: at 576 of 1024 bytes it is already over half the
  * transport ceiling, so e.g. adding a second embedded design record would silently exceed it. */
@@ -2179,6 +2192,12 @@ _Static_assert(sizeof(PCNetGameBobberEventMsg) == 24, "PCNetGameBobberEventMsg w
  *                  reconnects: receivers keep their per-origin last value until their own session resets); a client
  *                  accepts only (int16_t)(seq - last) > 0 (wrap-safe), so a duplicate/stale one is dropped. */
 #define PC_NETGAME_PLAYER_ACTION_KIND_PICKUP 1u
+/* worker P3: kind 2 CATCH (v8 extended in place, same 10-byte struct): the host ACCEPTED a catch of the origin player (the X3 catch transaction of a
+ * client, or the host's own local catch). item = the host-derived creature item (ITM_FISH* / trash / ITM_INSECT* / ITM_SPIRIT0), ut_x = ut_z = 0,
+ * flags = 0, seq = the same per-origin counter as PICKUP. Sent to the READY peers in the origin's scene (all READY peers when unknown) except the
+ * origin; the host presents it on its own puppet of a client origin. The receiver shows the creature on the puppet (NOTICE_NET / NOTICE_ROD /
+ * RELEASE_CREATURE); it never grants or changes anything. An older receiver ignores kind 2 (its kind != PICKUP check). */
+#define PC_NETGAME_PLAYER_ACTION_KIND_CATCH 2u
 typedef struct PCNetGamePlayerActionMsg {
     uint8_t  msg_type;      /* PC_NETGAME_MSG_PLAYER_ACTION */
     uint8_t  net_player_id; /* originating player id (host-assigned) */
@@ -4536,6 +4555,9 @@ static void pcnetgame_capture_local_appearance(PCNetPlayerAppearance* out) {
             out->is_custom_design = 1;
             memcpy(out->design_record, &Now_Private->my_org[org_idx & 7], sizeof(out->design_record));
         }
+        if (Common_Get(player_bee_swell_flag)) {
+            out->sunburn_rank |= (uint8_t)PC_NETGAME_APPEAR_SWELL_BIT; /* P1: the swollen face (read only), see the define */
+        }
     }
 }
 
@@ -4549,6 +4571,10 @@ static void pcnetgame_appearance_msg_to_state(const PCNetGameAppearanceMsg* in, 
     out->is_custom_design = in->is_custom_design;
     out->cloth_item = in->cloth_item;
     memcpy(out->design_record, &in->design, sizeof(out->design_record));
+    out->sunburn_rank = (uint8_t)(in->sunburn_rank & ~PC_NETGAME_APPEAR_SWELL_BIT); /* P1: the wire rank is clean ... */
+    if (in->_reserved0[0] & PC_NETGAME_APPEAR_FLAG_BEE_SWELL) {
+        out->sunburn_rank |= (uint8_t)PC_NETGAME_APPEAR_SWELL_BIT;                /* ... the flag byte carries the swell */
+    }
 }
 
 /* Stage 4C-1 (backfill/resend fix): the reverse of pcnetgame_appearance_msg_to_state() -- packs an
@@ -4570,6 +4596,10 @@ static void pcnetgame_pack_appearance_msg(PCNetGameAppearanceMsg* msg, uint8_t n
     msg->cloth_item = state->cloth_item;
     if (state->is_custom_design) {
         memcpy(&msg->design, state->design_record, sizeof(msg->design));
+    }
+    msg->sunburn_rank = (uint8_t)(state->sunburn_rank & ~PC_NETGAME_APPEAR_SWELL_BIT); /* P1: never the in-process swell bit */
+    if (state->sunburn_rank & PC_NETGAME_APPEAR_SWELL_BIT) {
+        msg->_reserved0[0] = (uint8_t)PC_NETGAME_APPEAR_FLAG_BEE_SWELL; /* P1 */
     }
 }
 
@@ -4787,6 +4817,32 @@ static void pcnetgame_sanitize_move_action(PCNetMoveMsg* msg, const char* side, 
     msg->action_state = 0;
 }
 
+/* P1 (puppet animation coverage): 1 for the vanilla states that run under cKF_SkeletonInfo_R_AnimationMove_ct_base with ROT_Y in the
+ * mask (m_player_main_*.c_inc; test_puppet_rows_batchA_src.py parses the masks back out and asserts this list): AnimationMove_base turns
+ * shape_info.rotation.y with the clip while world.angle.y holds the state's fixed target angle, and the puppet pins the clip's root
+ * rotation (pc_remote_player.c s_row_pin), so the true visual facing must be sent. Value change only. */
+static int pcnetgame_facing_rot_y_state(int idx) {
+    switch (idx) {
+        case mPlayer_INDEX_DOOR:                      /* 5 */
+        case mPlayer_INDEX_SITDOWN:                   /* 5 */
+        case mPlayer_INDEX_DEMO_GETON_TRAIN:          /* 7 */
+        case mPlayer_INDEX_DEMO_GETOFF_TRAIN:         /* 7 */
+        case mPlayer_INDEX_ROTATE_OCTAGON:            /* 5 */
+        case mPlayer_INDEX_THROW_MONEY:               /* 5 */
+        case mPlayer_INDEX_PRAY:                      /* 5 */
+        case mPlayer_INDEX_MAIL_JUMP:                 /* 5 */
+        case mPlayer_INDEX_NOTICE_BEE:                /* 4 */
+        case mPlayer_INDEX_KNOCK_DOOR:                /* 5 */
+        case mPlayer_INDEX_SWITCH_ON_LIGHTHOUSE:      /* 5 */
+        case mPlayer_INDEX_DEMO_GETON_BOAT:           /* 7 */
+        case mPlayer_INDEX_DEMO_GETOFF_BOAT_STANDUP:  /* 7 */
+        case mPlayer_INDEX_DEMO_GETOFF_BOAT:          /* 7 */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 /* Stage 3: read-only sample of the local player, for sending. Never writes to `local`. Caller
  * must have already verified pcnetgame_is_real_player_actor(local). */
 static void pcnetgame_sample_local_move(PLAYER_ACTOR* local, PCNetMoveMsg* msg) {
@@ -4818,9 +4874,9 @@ static void pcnetgame_sample_local_move(PLAYER_ACTOR* local, PCNetMoveMsg* msg) 
      * only changes behavior for TURN_DASH specifically. */
     /* Building interactions (docs/multiplayer-guest-roadmap.md): KNOCK_DOOR and DOOR are the same shape: the visual
      * facing (shape_info.rotation.y) is turned toward the door by cKF_SkeletonInfo_R_AnimationMove_base while
-     * world.angle.y holds the state's fixed target angle. Value change only, the wire format is unchanged. */
-    msg->facing_angle = (local->now_main_index == mPlayer_INDEX_TURN_DASH || local->now_main_index == mPlayer_INDEX_KNOCK_DOOR ||
-                         local->now_main_index == mPlayer_INDEX_DOOR)
+     * world.angle.y holds the state's fixed target angle. Value change only, the wire format is unchanged.
+     * P1 (puppet animation coverage): the same holds for EVERY state whose ct_base mask has ROT_Y (pcnetgame_facing_rot_y_state). */
+    msg->facing_angle = (local->now_main_index == mPlayer_INDEX_TURN_DASH || pcnetgame_facing_rot_y_state(local->now_main_index))
                             ? actor->shape_info.rotation.y
                             : actor->world.angle.y;
     msg->speed = actor->speed;
@@ -5292,6 +5348,90 @@ static void pcnetgame_host_emit_player_action(int origin, uint8_t kind, int ut_x
     }
 }
 
+/* ===== P3 FISHING VIEW BEGIN (worker P3): PLAYER_ACTION kind 2 CATCH, host emit + client receive. PRESENTATION ONLY. =====
+ * The host calls pcnetgame_fv_host_emit_catch() right after IT accepted a catch (pcnetgame_x3_grant's catch commit / the host's own local catch),
+ * with the host-derived item: nothing here validates, grants, removes or changes any wildlife / pocket / record state (that already happened). */
+#include "pc_fishing_view.h"
+_Static_assert((int)PC_NETGAME_MSG_BOBBER_VIEW == (int)PC_FV_MSG_BOBBER_VIEW, "BOBBER_VIEW id drifted (pc_fishing_view.h)");
+/* the BOBBER_VIEW glue (defined after pcnetgame_handle_host_bobber_state, P3 FISHING VIEW BOBBER block) */
+static void pcnetgame_fv_host_note_state(PCNetPeerId peer, const PCNetGameBobberStateMsg* in);
+static void pcnetgame_fv_host_tick(void);
+static void pcnetgame_fv_host_drop_peer(int peer);
+static void pcnetgame_handle_client_bobber_view(const PCBobberViewMsg* in);
+static uint16_t s_fv_local_catch_item; /* the host's own accepted catch: the item read before the commit (pc_net_game_host_local_wildlife_catch) */
+static int pcnetgame_fv_catch_item_ok(uint16_t item) {
+    return (item >= (uint16_t)ITM_FISH_START && item < (uint16_t)ITM_FISH_END) || (item >= (uint16_t)ITM_INSECT_START && item <= (uint16_t)ITM_SPIRIT0 + 3u) ||
+           item == (uint16_t)ITM_DUST0_EMPTY_CAN || item == (uint16_t)ITM_DUST1_BOOT || item == (uint16_t)ITM_DUST2_OLD_TIRE;
+}
+
+static void pcnetgame_fv_host_emit_catch(int origin, uint16_t item) {
+    PCNetGamePlayerActionMsg m;
+    PCNetPlayerScene osc;
+    int have_osc = 0;
+    int i, sent = 0;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || origin < 0 || origin >= pcnetgame_player_id_end() || !pcnetgame_fv_catch_item_ok(item)) {
+        return;
+    }
+    if (origin == (int)PC_NETGAME_HOST_PLAYER_ID) {
+        if (pc_host_observer_active()) {
+            return;
+        }
+        if (s_local_scene.valid) {
+            osc.scene_id = s_local_scene.scene_id;
+            have_osc = 1;
+        }
+    } else {
+        if (s_host_peer_link[origin] != PC_NETGAME_LINK_READY) {
+            return;
+        }
+        have_osc = pc_remote_player_get_scene((PCNetPlayerId)origin, &osc);
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_PLAYER_ACTION;
+    m.net_player_id = (uint8_t)origin;
+    m.kind = (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_CATCH;
+    m.item = item;
+    s_action_seq_out[origin] = (uint16_t)(s_action_seq_out[origin] + 1u);
+    m.seq = s_action_seq_out[origin];
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        PCNetPlayerScene sc;
+        if (i == origin || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (have_osc && pc_remote_player_get_scene((PCNetPlayerId)i, &sc) && sc.scene_id != osc.scene_id) {
+            continue; /* a peer in another scene never sees this puppet */
+        }
+        if (pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+            sent++;
+        }
+    }
+    if (origin != (int)PC_NETGAME_HOST_PLAYER_ID) {
+        pc_remote_player_on_catch(origin, item, m.seq); /* the host renders this client's puppet itself */
+    }
+    printf("[NET][ACTION] host: PLAYER_ACTION CATCH origin=%d item=0x%04X seq=%u relayed_to=%d\n", origin, (unsigned)item, (unsigned)m.seq, sent);
+}
+
+/* Client: a kind 2 CATCH (the caller already checked READY / origin range / "not about me"). */
+static void pcnetgame_fv_client_catch(const PCNetGamePlayerActionMsg* in) {
+    int origin = (int)in->net_player_id;
+
+    if (in->flags != 0 || in->ut_x != 0 || in->ut_z != 0 || !pcnetgame_fv_catch_item_ok(in->item)) {
+        if (pcnetgame_action_diag()) {
+            printf("[NET][ACTION][DIAG] client: ignored invalid PLAYER_ACTION CATCH (flags=0x%02X item=0x%04X)\n", (unsigned)in->flags, (unsigned)in->item);
+        }
+        return;
+    }
+    if (s_action_last_valid[origin] && (int16_t)(uint16_t)(in->seq - s_action_last_seq[origin]) <= 0) {
+        return; /* stale / duplicate (shares the per-origin seq with PICKUP) */
+    }
+    s_action_last_seq[origin] = in->seq;
+    s_action_last_valid[origin] = 1;
+    printf("[NET][ACTION] client: PLAYER_ACTION CATCH origin=%d item=0x%04X seq=%u\n", origin, (unsigned)in->item, (unsigned)in->seq);
+    pc_remote_player_on_catch(origin, in->item, in->seq);
+}
+/* ===== P3 FISHING VIEW END (PLAYER_ACTION kind 2) ===== */
+
 /* Client: the host's PLAYER_ACTION (about the host or a relayed peer). Presentation hint only. */
 static void pcnetgame_handle_client_player_action(const PCNetGamePlayerActionMsg* in) {
     int origin = (int)in->net_player_id;
@@ -5303,6 +5443,10 @@ static void pcnetgame_handle_client_player_action(const PCNetGamePlayerActionMsg
     if (origin >= PC_REMOTE_PLAYER_ID_LIMIT || /* 0xFF is "nobody" (see the SCENE handler) */
         (origin != (int)PC_NETGAME_HOST_PLAYER_ID && (PCNetPlayerId)origin == (PCNetPlayerId)s_client_assigned_peer_id)) {
         return; /* out of range, or "about me" (the originator plays its own visuals) */
+    }
+    if (in->kind == (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_CATCH) {
+        pcnetgame_fv_client_catch(in); /* worker P3: kind 2 CATCH (presentation only) */
+        return;
     }
     if (in->kind != (uint8_t)PC_NETGAME_PLAYER_ACTION_KIND_PICKUP || in->flags != 0 || in->item == 0u ||
         in->item == 0xFFFFu || !pcfa_town_ut_to_acre_tile((int)in->ut_x, (int)in->ut_z, &acre, NULL)) {
@@ -9525,6 +9669,283 @@ void pc_net_game_bee_swarm_send_local(int event, uint16_t seq, float x, float y,
         (void)pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
     }
 }
+
+/* ===== PUPPET ACTION_EXT BEGIN (worker P2; PC_NETGAME_MSG_ACTION_EXT = 96, PRESENTATION ONLY; pc_action_ext.h) =====
+ * Sender: pcnetgame_aext_tick() (once per pc_net_game_poll, after the MOVE send) samples the LOCAL player actor read-only -- now_main_index,
+ * the MOVE entry counter, animation0_idx / animation1_idx / part_table_idx, the keyframe0 frame control (mode / speed / current frame) and
+ * keyframe0.animation_enabled (the vanilla AnimationMove_ct_base root-pin flags) -- and lets the pure change detector decide when to send
+ * (entry of an allowlisted state, a clip change inside it, a STOP clip restart, a rate-limited speed retune). This is the ONE generic hook
+ * (no per-state edits in the vanilla .c_inc files): every allowlisted state sets its clip through Player_actor_InitAnimation_Base1/2, which
+ * writes exactly the fields sampled here. Routing like BEE_SWARM: client -> host (READY sender; the host stamps the transport slot and
+ * validates the message and the sender's announced scene) -> every OTHER READY peer whose announced scene id AND owner equal the sender's;
+ * a listen host's own player is relayed directly; the host presents a client's message on its own puppet. A receiver stores it per owner
+ * (pc_remote_player_on_action_ext) as a dynamic row bound to (main_index, entry_counter). Env PC_ACTION_EXT=0 disables sending. */
+#include "pc_action_ext.h"
+_Static_assert(PC_AEXT_ANIM_NUM == mPlayer_ANIM_NUM, "PC_AEXT_ANIM_NUM == mPlayer_ANIM_NUM");
+_Static_assert(PC_AEXT_PART_TABLE_NUM == mPlayer_PART_TABLE_NUM, "PC_AEXT_PART_TABLE_NUM == mPlayer_PART_TABLE_NUM");
+_Static_assert(PC_AEXT_EYE_NUM == mPlayer_EYE_TEX_NUM && PC_AEXT_MOUTH_NUM == mPlayer_MOUTH_TEX_NUM, "face bounds");
+_Static_assert(PC_AEXT_INDEX_NUM == mPlayer_INDEX_NUM, "PC_AEXT_INDEX_NUM == mPlayer_INDEX_NUM");
+_Static_assert(PC_AEXT_ANIM_GAAAN2 == mPlayer_ANIM_GAAAN2, "PC_AEXT_ANIM_GAAAN2");
+_Static_assert(PC_AEXT_MSG_ID == (unsigned)PC_NETGAME_MSG_ACTION_EXT, "ACTION_EXT id");
+_Static_assert((int)PC_AEXT_IDX_HOLD == (int)mPlayer_INDEX_HOLD && (int)PC_AEXT_IDX_ROTATE_FURNITURE == (int)mPlayer_INDEX_ROTATE_FURNITURE &&
+               (int)PC_AEXT_IDX_OPEN_FURNITURE == (int)mPlayer_INDEX_OPEN_FURNITURE && (int)PC_AEXT_IDX_WAIT_OPEN_FURNITURE == (int)mPlayer_INDEX_WAIT_OPEN_FURNITURE &&
+               (int)PC_AEXT_IDX_CLOSE_FURNITURE == (int)mPlayer_INDEX_CLOSE_FURNITURE && (int)PC_AEXT_IDX_LIE_BED == (int)mPlayer_INDEX_LIE_BED &&
+               (int)PC_AEXT_IDX_WAIT_BED == (int)mPlayer_INDEX_WAIT_BED && (int)PC_AEXT_IDX_ROLL_BED == (int)mPlayer_INDEX_ROLL_BED &&
+               (int)PC_AEXT_IDX_STANDUP_BED == (int)mPlayer_INDEX_STANDUP_BED && (int)PC_AEXT_IDX_PICKUP_JUMP == (int)mPlayer_INDEX_PICKUP_JUMP,
+               "ACTION_EXT furniture / bed indexes");
+_Static_assert((int)PC_AEXT_IDX_TALK == (int)mPlayer_INDEX_TALK && (int)PC_AEXT_IDX_RECIEVE_STRETCH == (int)mPlayer_INDEX_RECIEVE_STRETCH &&
+               (int)PC_AEXT_IDX_RECIEVE == (int)mPlayer_INDEX_RECIEVE && (int)PC_AEXT_IDX_RECIEVE_PUTAWAY == (int)mPlayer_INDEX_RECIEVE_PUTAWAY &&
+               (int)PC_AEXT_IDX_GIVE == (int)mPlayer_INDEX_GIVE && (int)PC_AEXT_IDX_GIVE_WAIT == (int)mPlayer_INDEX_GIVE_WAIT && (int)PC_AEXT_IDX_DEMO_WAIT == (int)mPlayer_INDEX_DEMO_WAIT &&
+               (int)PC_AEXT_IDX_WASH_CAR == (int)mPlayer_INDEX_WASH_CAR && (int)PC_AEXT_IDX_CHANGE_CLOTH == (int)mPlayer_INDEX_CHANGE_CLOTH &&
+               (int)PC_AEXT_IDX_RADIO_EXERCISE == (int)mPlayer_INDEX_RADIO_EXERCISE && (int)PC_AEXT_IDX_DEMO_GET_GOLDEN_ITEM == (int)mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM &&
+               (int)PC_AEXT_IDX_DEMO_GET_GOLDEN_ITEM2 == (int)mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM2,
+               "ACTION_EXT talk / event indexes");
+_Static_assert(cKF_ANIMATION_TRANS_XZ == 1 && cKF_ANIMATION_TRANS_Y == 2 && cKF_ANIMATION_ROT_Y == 4, "ACTION_EXT pin mask bits");
+
+static PCAextSender s_aext_snd;
+static uint32_t s_aext_log_n = 0; /* diag / reject log budget (a spamming peer cannot flood the log) */
+static struct {
+    uint32_t sent, relayed, host_rx, client_rx, rejected;
+} s_aext_stats;
+
+static int pcnetgame_aext_enabled(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("PC_ACTION_EXT");
+        s_on = (e != NULL && e[0] == '0') ? 0 : 1; /* ON by default */
+    }
+    return s_on;
+}
+
+static int pcnetgame_aext_log_ok(void) {
+    return (pcnetgame_action_diag() || g_pc_verbose) && s_aext_log_n++ < 400u;
+}
+
+static int pcnetgame_aext_same_scene(const PCNetPlayerScene* a, const PCNetPlayerScene* b) {
+    return a->valid && b->valid && a->scene_id == b->scene_id && a->owner == b->owner;
+}
+
+/* Host: relay to every OTHER READY peer in `origin`'s scene; present a client's message on the host's own puppet. */
+static void pcnetgame_aext_host_relay(int origin, const PCNetPlayerScene* sc, const PCActionExtMsg* in) {
+    PCActionExtMsg m = *in;
+    int i, n = 0;
+
+    m.net_player_id = (uint8_t)origin;
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        PCNetPlayerScene ps;
+        if (i != origin && s_host_peer_link[i] == PC_NETGAME_LINK_READY && pc_remote_player_get_scene((PCNetPlayerId)i, &ps) &&
+            pcnetgame_aext_same_scene(&ps, sc)) {
+            (void)pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+            n++;
+        }
+    }
+    s_aext_stats.relayed += (uint32_t)n;
+    if (origin != (int)PC_NETGAME_HOST_PLAYER_ID) {
+        pc_remote_player_on_action_ext(origin, &m);
+    }
+    if (pcnetgame_aext_log_ok()) {
+        printf("[NET][AEXT] host: from %d idx=%u ctr=%u anim0=%u anim1=%u pt=%u flags=0x%02X speed_q=%u frame=%u face=0x%02X seq=%u scene=%u owner=%u -> %d peer(s)\n",
+               origin, (unsigned)m.main_index, (unsigned)m.entry_counter, (unsigned)m.anim0, (unsigned)m.anim1, (unsigned)m.part_table,
+               (unsigned)m.flags, (unsigned)m.speed_q, (unsigned)m.start_frame, (unsigned)m.face, (unsigned)m.clip_seq, (unsigned)sc->scene_id,
+               (unsigned)sc->owner, n);
+    }
+}
+
+static void pcnetgame_handle_host_action_ext(PCNetPeerId peer, const PCActionExtMsg* in) {
+    PCNetPlayerScene sc;
+    const char* why = NULL;
+
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        why = "not READY";
+    } else if (!pc_aext_msg_ok(in)) {
+        why = "malformed";
+    } else if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) || !sc.valid) {
+        why = "no announced scene";
+    }
+    if (why != NULL) {
+        s_aext_stats.rejected++;
+        if (pcnetgame_aext_log_ok()) {
+            printf("[NET][AEXT] host: peer %d ACTION_EXT dropped (%s) idx=%u anim0=%u flags=0x%02X\n", (int)peer, why, (unsigned)in->main_index,
+                   (unsigned)in->anim0, (unsigned)in->flags);
+        }
+        return;
+    }
+    s_aext_stats.host_rx++;
+    pcnetgame_aext_host_relay((int)peer, &sc, in);
+}
+
+static void pcnetgame_handle_client_action_ext(const PCActionExtMsg* in) {
+    if (s_client_link != PC_NETGAME_LINK_READY || !pc_aext_msg_ok(in) ||
+        (in->net_player_id != (uint8_t)PC_NETGAME_HOST_PLAYER_ID && (PCNetPlayerId)in->net_player_id == (PCNetPlayerId)s_client_assigned_peer_id)) {
+        s_aext_stats.rejected++;
+        return; /* never present our own clip back; a malformed relay is ignored */
+    }
+    s_aext_stats.client_rx++;
+    pc_remote_player_on_action_ext((int)in->net_player_id, in);
+}
+
+#ifdef PC_NET_TEST_HOOKS
+#include "pc_test_hooks.h"
+#include "m_demo.h"
+/* defined in src/game/m_player.c (TARGET_PC, TEST-ONLY): thin pass-throughs to the REAL static request functions */
+extern int PC_Test_AextRequest(GAME* game, int what, int arg);
+/* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_AEXT_SCRIPT=talk|bed|radio|cloth drives the REAL vanilla states of the local player a few seconds after
+ * READY (the sender above then reports them like any real play): talk = DEMO_WAIT + demo orders 2 (GAAAN1 -> GAAAN2) and 0xFE (BIKU1) then WAIT;
+ * bed = LIE_BED (left, then right on the second pass) + ROLL_BED + STANDUP_BED; radio = RADIO_EXERCISE command 0; cloth = CHANGE_CLOTH try-on of
+ * the worn cloth (no change). Each step logs [NET][AEXT][TEST]. */
+static void pcnetgame_aext_test_hook(PLAYER_ACTOR* pl, double now) {
+    static const char* s_script = NULL;
+    static int s_init = 0, s_step = 0, s_pass = 0;
+    static double s_t = 0.0;
+    GAME* game = (GAME*)gamePT;
+    int idx = pl->now_main_index;
+
+    if (!s_init) {
+        s_init = 1;
+        s_script = pc_test_hook_getenv("AC_TEST_AEXT_SCRIPT");
+    }
+    if (s_script == NULL || s_step < 0) {
+        return;
+    }
+    if (s_step == 0) {
+        if ((s_role == PC_NETGAME_ROLE_CLIENT && s_client_link != PC_NETGAME_LINK_READY) || !s_local_scene.valid || idx != mPlayer_INDEX_WAIT) {
+            s_t = now;
+            return;
+        }
+        if (now - s_t < 240.0) {
+            return; /* 4 s of WAIT in a stable scene before the script starts */
+        }
+        {
+            const char* go = pc_test_hook_getenv("AC_TEST_AEXT_GO_FILE"); /* optional: the test starts every process's script at once */
+            FILE* gf;
+            if (go != NULL) {
+                if ((gf = fopen(go, "rb")) == NULL) {
+                    return;
+                }
+                fclose(gf);
+            }
+        }
+        s_step = 1;
+        s_t = now;
+        printf("[NET][AEXT][TEST] script %s start (scene %u owner %u)\n", s_script, (unsigned)s_local_scene.scene_id, (unsigned)s_local_scene.owner);
+    }
+#define AEXT_T(f) (now - s_t >= (f))
+#define AEXT_NEXT(msg_fmt, ...) do { s_step++; s_t = now; printf("[NET][AEXT][TEST] " msg_fmt "\n", ##__VA_ARGS__); } while (0)
+    if (strcmp(s_script, "talk") == 0) {
+        switch (s_step) {
+            case 1: AEXT_NEXT("demo_wait request=%d", mPlib_request_main_demo_wait_type1(game, FALSE, (void*)0x50324131)); break;
+            case 2: if (AEXT_T(90.0)) { mDemo_Set_OrderValue(mDemo_ORDER_PLAYER, 0, 2); AEXT_NEXT("demo order 2 (GAAAN1) in state %d", idx); } break;
+            case 3: if (AEXT_T(180.0)) { mDemo_Set_OrderValue(mDemo_ORDER_PLAYER, 0, 0xFE); AEXT_NEXT("demo order 0xFE (BIKU1) in state %d", idx); } break;
+            case 4: if (AEXT_T(120.0)) { AEXT_NEXT("wait request=%d (state %d)", PC_Test_AextRequest(game, 7, 0), idx); } break;
+            default: if (AEXT_T(60.0)) { printf("[NET][AEXT][TEST] script talk done (state %d)\n", idx); s_step = -1; } break;
+        }
+    } else if (strcmp(s_script, "bed") == 0) {
+        switch (s_step) {
+            case 1: AEXT_NEXT("lie_bed pass %d request=%d", s_pass, PC_Test_AextRequest(game, 1, s_pass)); break;
+            case 2: if (AEXT_T(120.0)) { AEXT_NEXT("roll_bed request=%d (state %d)", PC_Test_AextRequest(game, 2, s_pass), idx); } break;
+            case 3: if (AEXT_T(90.0)) { AEXT_NEXT("standup_bed request=%d (state %d)", PC_Test_AextRequest(game, 3, s_pass), idx); } break;
+            default:
+                if (AEXT_T(120.0) && (idx == mPlayer_INDEX_WAIT || AEXT_T(600.0))) {
+                    if (++s_pass < 2) {
+                        s_step = 1;
+                        s_t = now;
+                    } else {
+                        printf("[NET][AEXT][TEST] script bed done (state %d)\n", idx);
+                        s_step = -1;
+                    }
+                }
+                break;
+        }
+    } else if (strcmp(s_script, "radio") == 0) {
+        switch (s_step) {
+            case 1: AEXT_NEXT("radio_exercise request=%d", PC_Test_AextRequest(game, 4, 0)); break;
+            default: if (AEXT_T(300.0)) { printf("[NET][AEXT][TEST] script radio done (state %d)\n", idx); s_step = -1; } break;
+        }
+    } else if (strcmp(s_script, "cloth") == 0) {
+        switch (s_step) {
+            case 1: AEXT_NEXT("change_cloth request=%d", PC_Test_AextRequest(game, 9, 0)); break;
+            default: if (AEXT_T(200.0)) { printf("[NET][AEXT][TEST] script cloth done (state %d)\n", idx); s_step = -1; } break;
+        }
+    } else {
+        s_step = -1;
+    }
+#undef AEXT_T
+#undef AEXT_NEXT
+}
+#endif
+
+static void pcnetgame_aext_tick(void) {
+    PLAYER_ACTOR* pl;
+    PCAextSample smp;
+    PCActionExtMsg m;
+    double now;
+
+    if ((s_role != PC_NETGAME_ROLE_HOST && s_role != PC_NETGAME_ROLE_CLIENT) || gamePT == NULL || gamePT->exec != play_main ||
+        !s_local_scene.valid || !pcnetgame_aext_enabled()) {
+        s_aext_snd.have = 0;
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST ? pc_host_observer_active() : s_client_link != PC_NETGAME_LINK_READY) {
+        s_aext_snd.have = 0;
+        return;
+    }
+    pl = GET_PLAYER_ACTOR_NOW();
+    if (!pcnetgame_is_real_player_actor(pl)) {
+        s_aext_snd.have = 0;
+        return;
+    }
+    now = graph_dt_frame_time(gamePT);
+#ifdef PC_NET_TEST_HOOKS
+    pcnetgame_aext_test_hook(pl, now);
+#endif
+    memset(&smp, 0, sizeof(smp));
+    smp.main_index = pl->now_main_index;
+    smp.counter = (int)s_local_main_entry_counter;
+    smp.anim0 = pl->animation0_idx;
+    smp.anim1 = pl->animation1_idx;
+    smp.part_table = pl->part_table_idx;
+    smp.repeat = pl->keyframe0.frame_control.mode == cKF_FRAMECONTROL_REPEAT;
+    smp.pin = (int)(pl->keyframe0.animation_enabled & 7);
+    smp.speed = pl->keyframe0.frame_control.speed;
+    smp.frame = pl->keyframe0.frame_control.current_frame;
+    switch (smp.main_index) { /* read-only state details (pc_action_ext.h: variant / aux) */
+        case mPlayer_INDEX_RECIEVE_STRETCH:
+            smp.aux = (uint16_t)pl->main_data.recieve_stretch.item;
+            smp.variant = pl->main_data.recieve_stretch.surface_flag ? 1 : 0;
+            break;
+        case mPlayer_INDEX_RECIEVE:
+            smp.aux = (uint16_t)pl->main_data.recieve.item;
+            smp.variant = pl->main_data.recieve.surface_flag ? 1 : 0;
+            break;
+        case mPlayer_INDEX_GIVE:
+            smp.aux = (uint16_t)pl->main_data.give.item;
+            smp.variant = pl->main_data.give.surface_flag ? 1 : 0;
+            break;
+        case mPlayer_INDEX_WASH_CAR:
+            smp.variant = pl->main_data.wash_car.anime_idx;
+            break;
+        case mPlayer_INDEX_RADIO_EXERCISE:
+            smp.aux = (uint16_t)pl->main_data.radio_exercise.cmd;
+            break;
+        default:
+            break;
+    }
+    if (!pc_aext_sender_step(&s_aext_snd, &smp, now, &m)) {
+        return;
+    }
+    s_aext_stats.sent++;
+    if (pcnetgame_aext_log_ok()) {
+        printf("[NET][AEXT] send idx=%u ctr=%u anim0=%u anim1=%u pt=%u flags=0x%02X speed_q=%u frame=%u face=0x%02X variant=%u aux=%u seq=%u\n",
+               (unsigned)m.main_index, (unsigned)m.entry_counter, (unsigned)m.anim0, (unsigned)m.anim1, (unsigned)m.part_table, (unsigned)m.flags,
+               (unsigned)m.speed_q, (unsigned)m.start_frame, (unsigned)m.face, (unsigned)m.variant, (unsigned)m.aux, (unsigned)m.clip_seq);
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        pcnetgame_aext_host_relay((int)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene, &m);
+    } else {
+        (void)pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+    }
+}
+/* ===== PUPPET ACTION_EXT END ===== */
 
 /* ---- Soccer ball / basketball (PC_NETGAME_MSG_BALL_STATE = 79, PC_NETGAME_MSG_BALL_KICK_REQUEST = 80; worker-2 block) ----
  * The host owns the only simulated ball (its ac_ball.c actor in the town field; a dedicated host has one through its observer
@@ -18966,6 +19387,7 @@ static void pcnetgame_x3_grant(PCNetPeerId peer, PCNetGameTxnCommitMsg* in, uint
     /* 13. a catch's WILDLIFE_DESPAWN broadcast goes out BEFORE the results (as before); then TXN_RESULT, then the legacy RESULT */
     if (is_catch) {
         pcnetgame_commit_caught_despawn(cr->entity_id);
+        pcnetgame_fv_host_emit_catch((int)peer, expect); /* worker P3: PLAYER_ACTION kind 2 CATCH to the others (presentation only, after the commit) */
     }
     pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
     pcnetgame_x3_legacy_result(peer, far, cr, 1, legacy_item);
@@ -33967,6 +34389,16 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         pcnetgame_handle_host_bee_swarm(peer, &bs); /* presentation only (agent 11): relayed to the other READY peers in the sender's scene */
         return;
     }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_ACTION_EXT) { /* PUPPET ACTION_EXT (worker P2): presentation only, relayed within the sender's scene */
+        if (size == sizeof(PCActionExtMsg)) {
+            PCActionExtMsg ax;
+            memcpy(&ax, data, sizeof(ax));
+            pcnetgame_handle_host_action_ext(peer, &ax);
+        } else {
+            s_aext_stats.rejected++; /* wrong size: dropped (never a violation) */
+        }
+        return;
+    }
     if (size == sizeof(PCBallKickMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BALL_KICK_REQUEST) {
         PCBallKickMsg bk;
         memcpy(&bk, data, sizeof(bk));
@@ -34680,6 +35112,13 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         return;
     }
 
+    if (size == sizeof(PCBobberViewMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BOBBER_VIEW) {
+        PCBobberViewMsg bv; /* worker P3: another player's bobber (presentation only) */
+        memcpy(&bv, data, sizeof(bv));
+        pcnetgame_handle_client_bobber_view(&bv);
+        return;
+    }
+
     if (size == sizeof(PCNetGameTreeDropMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_TREE_DROP) {
         PCNetGameTreeDropMsg td;
         memcpy(&td, data, sizeof(td));
@@ -34697,6 +35136,12 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCNetGameBeeSwarmMsg bs;
         memcpy(&bs, data, sizeof(bs));
         pcnetgame_handle_client_bee_swarm(&bs); /* presentation only (agent 11): another player's bee swarm, relayed by the host */
+        return;
+    }
+    if (size == sizeof(PCActionExtMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ACTION_EXT) {
+        PCActionExtMsg ax;
+        memcpy(&ax, data, sizeof(ax));
+        pcnetgame_handle_client_action_ext(&ax); /* PUPPET ACTION_EXT (worker P2): another player's clip, relayed by the host */
         return;
     }
     if (size == sizeof(PCBallStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BALL_STATE) {
@@ -38535,6 +38980,7 @@ void pc_net_game_poll(void) {
                         s_host_peer_link[ev.peer] = PC_NETGAME_LINK_DISCONNECTED;
                         if (was_ready_peer) {
                             pcnetgame_host_peer_scene_gone(ev.peer); /* M9-A: clients drop the relayed scene */
+                            pcnetgame_fv_host_drop_peer((int)ev.peer); /* worker P3: its bobber view -> 'gone' */
                             PC_LOG(PCL_PLAYERS, "peer %d left a READY session (scene relay dropped)\n", (int)ev.peer);
                         }
                     }
@@ -38611,6 +39057,7 @@ void pc_net_game_poll(void) {
         pcnetgame_host_world_poll();
         pcnetgame_ball_host_tick(); /* worker-2 ball: BALL_STATE to READY clients in the town field */
         pcnetgame_pvp_host_tick();  /* player-vs-player: arrival / scene tracking + the host's own swing state */
+        pcnetgame_fv_host_tick();   /* worker P3: BOBBER_VIEW relay (the host's own bobber + the clients' BOBBER_STATE), presentation only */
     } else {
         pcnetgame_rc_tick(); /* auto-reconnect: backoff / attempt window / stable reset */
         pcnetgame_client_tick();
@@ -38673,6 +39120,7 @@ void pc_net_game_poll(void) {
             }
         }
     }
+    pcnetgame_aext_tick(); /* PUPPET ACTION_EXT (worker P2): the exact clip of an allowlisted local state, sent on change */
 
     if (gamePT != NULL &&
         graph_dt_period_elapsed(gamePT, &s_move_rate_log_accum, PC_NETGAME_MOVE_RATE_LOG_PERIOD_60FPS_FRAMES)) {
@@ -43224,6 +43672,15 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
         return 0; /* opt-in gate off -- caller falls through to plain vanilla behavior */
     }
 
+    {
+        /* worker P3: the creature item of this catch for the PLAYER_ACTION CATCH presentation, read BEFORE the commit removes the record
+         * (a read-only lookup; the accept decision below is unchanged and alone decides whether it is ever used). */
+        PcWildlifeRecord fv_rec;
+        s_fv_local_catch_item = pcwld_find_by_id(entity_id, &fv_rec) ? (uint16_t)pcnetgame_x3_catch_item(&fv_rec, claimed_species) : 0u;
+        if (s_fv_local_catch_item == (uint16_t)EMPTY_NO) {
+            s_fv_local_catch_item = 0u;
+        }
+    }
     accepted = pcnetgame_validate_and_commit_catch(1, (PCNetPeerId)0, entity_id, pcwld_session_generation(),
                                                    claimed_species);
 #ifdef PC_NET_TEST_HOOKS
@@ -43235,6 +43692,9 @@ int pc_net_game_host_local_wildlife_catch(uint32_t entity_id, int claimed_specie
                "authoritative table\n",
                (unsigned)entity_id, claimed_species);
         pcnetgame_commit_caught_despawn(entity_id);
+        if (s_fv_local_catch_item != 0u) {
+            pcnetgame_fv_host_emit_catch((int)PC_NETGAME_HOST_PLAYER_ID, s_fv_local_catch_item); /* worker P3: presentation only */
+        }
     } else if (g_pc_verbose) {
         printf("[NET][WILDLIFE] host: local CATCH entity %u (species claim %d) rejected (likely lost a "
                "race to a peer's own simultaneous claim)\n",
@@ -43677,7 +44137,160 @@ static void pcnetgame_handle_host_bobber_state(PCNetPeerId peer, const PCNetGame
     b.angle = in->angle;
     b.seq = in->seq;
     pcwld_host_set_bobber(&b);
+    pcnetgame_fv_host_note_state(peer, in); /* worker P3: the same state, read-only, for the BOBBER_VIEW relay (presentation only) */
 }
+
+/* ===== P3 FISHING VIEW BEGIN (worker P3): BOBBER_VIEW (id 97) host relay + client view. PRESENTATION ONLY. =====
+ * Host: after pcnetgame_handle_host_bobber_state() fed the fish AI proxy exactly as before, the same (already finite-checked) BOBBER_STATE is noted
+ * here (pc_fv_host_note: plausibility vs. the angler's last MOVE position, reorder guard, the angler's announced FIELD scene). The host's own bobber
+ * is sampled from its own uki actor (pcwld_client_collect_bobber, read-only). pcnetgame_fv_host_tick() sends at most one BOBBER_VIEW per angler per
+ * 100 ms to the READY peers whose announced scene is the angler's (never back to the angler), one RELIABLE 'gone' on reel-in / stale / disconnect /
+ * scene change, and feeds the host's own view of its client puppets directly (no network loop). Client: shape check + scene filter + seq into
+ * s_fv_view[]; the puppet draw reads it through pc_net_game_bobber_view_get(). No actor is created; nothing here writes wildlife / fish / catch /
+ * item state, and the fish AI never sees a view. */
+static PCFvHost s_fv_host;
+static PCFvView s_fv_view[PC_FV_ORIGINS];
+static uint32_t s_fv_host_next_own_ms;
+static unsigned s_fv_log_budget = 64;
+
+static void pcnetgame_fv_host_note_state(PCNetPeerId peer, const PCNetGameBobberStateMsg* in) {
+    PCFvSample s;
+    PCNetPlayerScene sc;
+    float pp[3];
+    int have_pp;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    memset(&s, 0, sizeof(s));
+    if (in->active && pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) && sc.kind == (uint8_t)PC_NETSCENE_KIND_FIELD) {
+        s.active = 1;
+        s.uki_status = in->uki_status;
+        s.gyo_status = in->gyo_status;
+        s.rod_type = in->rod_type;
+        s.scene_id = sc.scene_id;
+        s.x = in->x;
+        s.y = in->y;
+        s.z = in->z;
+        s.angle = in->angle;
+    }
+    have_pp = pc_remote_player_get_last_position((PCNetPlayerId)peer, &pp[0], &pp[1], &pp[2]);
+    if (!pc_fv_host_note(&s_fv_host, (int)peer, &s, have_pp ? pp : NULL, 1, in->seq, pcnetgame_now_ms()) && s.active && s_fv_log_budget > 0) {
+        s_fv_log_budget--;
+        printf("[NET][FISHVIEW] host: peer %d bobber not relayed (implausible or reordered: pos %.0f %.0f %.0f uki %u gyo %d seq %d)\n", (int)peer,
+               (double)in->x, (double)in->y, (double)in->z, (unsigned)in->uki_status, (int)in->gyo_status, (int)in->seq);
+    }
+}
+
+static void pcnetgame_fv_host_drop_peer(int peer) {
+    if (peer < 0 || peer >= PC_FV_ORIGINS) {
+        return;
+    }
+    pc_fv_host_drop(&s_fv_host, peer);
+    s_fv_view[peer].active = 0; /* the host's own puppet view of that angler */
+}
+
+static void pcnetgame_fv_host_tick(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    const int host_id = (int)PC_NETGAME_HOST_PLAYER_ID;
+    int origin, i;
+
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (!pc_host_observer_active() && (s_fv_host_next_own_ms == 0u || (int32_t)(now - s_fv_host_next_own_ms) >= 0)) {
+        PcWldBobber b;
+        PCFvSample s;
+
+        s_fv_host_next_own_ms = now + 50u; /* the host's own bobber: sampled at ~20 Hz, relayed at <= 10 Hz */
+        memset(&b, 0, sizeof(b));
+        memset(&s, 0, sizeof(s));
+        if (gamePT != NULL && gamePT->exec == play_main && s_local_scene.valid && s_local_scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD &&
+            pcwld_client_collect_bobber(&b)) {
+            s.active = 1;
+            s.uki_status = b.uki_status;
+            s.gyo_status = b.gyo_status;
+            s.rod_type = b.rod_type;
+            s.scene_id = s_local_scene.scene_id;
+            s.x = b.x;
+            s.y = b.y;
+            s.z = b.z;
+            s.angle = b.angle;
+        }
+        if (s.active || s_fv_host.o[host_id].have) {
+            (void)pc_fv_host_note(&s_fv_host, host_id, &s, NULL, 0, 0, now);
+        }
+    }
+    for (origin = 0; origin < PC_FV_ORIGINS; origin++) {
+        PCBobberViewMsg m;
+        int rel = 0, sent = 0;
+
+        if (origin != host_id && origin >= pcnetgame_peer_span()) {
+            continue;
+        }
+        if (!pc_fv_host_poll(&s_fv_host, origin, now, &m, &rel)) {
+            continue;
+        }
+        for (i = 0; i < pcnetgame_peer_span(); i++) {
+            PCNetPlayerScene sc;
+            if (i == origin || s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+                continue;
+            }
+            if (m.active && !(pc_remote_player_get_scene((PCNetPlayerId)i, &sc) && sc.scene_id == m.scene_id)) {
+                continue; /* an active view only to the angler's scene; a 'gone' to everybody (a peer may have just left that scene) */
+            }
+            if (pc_net_send((PCNetPeerId)i, rel ? PC_NET_RELIABLE : PC_NET_UNRELIABLE, &m, (uint16_t)sizeof(m))) {
+                sent++;
+            }
+        }
+        if (origin != host_id) {
+            (void)pc_fv_view_apply(&s_fv_view[origin], &m, s_local_scene.valid, s_local_scene.scene_id, now); /* the host's own puppet of that client */
+        }
+        if (!m.active || s_fv_host.o[origin].sent_active <= 3u || (s_fv_host.o[origin].sent_active % 50u) == 0u) {
+            printf("[NET][FISHVIEW] host: BOBBER_VIEW origin=%d active=%u scene=%u uki=%u gyo=%d pos=(%.0f,%.0f,%.0f) seq=%u relayed_to=%d (sent %u active / %u gone)\n",
+                   origin, (unsigned)m.active, (unsigned)m.scene_id, (unsigned)m.uki_status, (int)m.gyo_status, (double)m.x, (double)m.y, (double)m.z,
+                   (unsigned)m.seq, sent, (unsigned)s_fv_host.o[origin].sent_active, (unsigned)s_fv_host.o[origin].sent_gone);
+        }
+    }
+}
+
+static void pcnetgame_handle_client_bobber_view(const PCBobberViewMsg* in) {
+    const int origin = (int)in->origin;
+    PCFvView* v;
+    int was, ok;
+
+    if (s_client_link != PC_NETGAME_LINK_READY || origin >= PC_REMOTE_PLAYER_ID_LIMIT ||
+        (origin != (int)PC_NETGAME_HOST_PLAYER_ID && (PCNetPlayerId)origin == (PCNetPlayerId)s_client_assigned_peer_id)) {
+        return; /* out of range, or our own bobber (this process draws the real one) */
+    }
+    v = &s_fv_view[origin];
+    was = v->active;
+    ok = pc_fv_view_apply(v, in, s_local_scene.valid, s_local_scene.scene_id, pcnetgame_now_ms());
+    if (!ok) {
+        if (s_fv_log_budget > 0) {
+            s_fv_log_budget--;
+            printf("[NET][FISHVIEW] client: BOBBER_VIEW origin=%d ignored (malformed / stale seq %u)\n", origin, (unsigned)in->seq);
+        }
+    } else if (was != (int)v->active || v->applied <= 3u || (v->applied % 50u) == 0u) {
+        printf("[NET][FISHVIEW] client: BOBBER_VIEW origin=%d active=%u shown=%d scene=%u uki=%u gyo=%d pos=(%.0f,%.0f,%.0f) seq=%u (applied %u)\n", origin,
+               (unsigned)in->active, (int)v->active, (unsigned)in->scene_id, (unsigned)in->uki_status, (int)in->gyo_status, (double)in->x, (double)in->y,
+               (double)in->z, (unsigned)in->seq, (unsigned)v->applied);
+    }
+}
+
+int pc_net_game_bobber_view_get(int origin, PCFvSample* out, uint32_t* active_since_ms) {
+    if (origin < 0 || origin >= PC_FV_ORIGINS || s_role == PC_NETGAME_ROLE_NONE) {
+        return 0;
+    }
+    if (!pc_fv_view_get(&s_fv_view[origin], pcnetgame_now_ms(), out)) {
+        return 0;
+    }
+    if (active_since_ms != NULL) {
+        *active_since_ms = s_fv_view[origin].since_ms;
+    }
+    return 1;
+}
+/* ===== P3 FISHING VIEW END (BOBBER_VIEW) ===== */
 
 /* W-14: WILDLIFE_STATE is unreliable, so a datagram can arrive after a newer one; applying it would pull every driven creature BACK to an older position (a visible jump). The client keeps
  * the last applied seq and drops anything not newer (wrap-safe). It restarts from 0 at every wildlife snapshot (a join, a reconnect, a resync, a host restart all begin with one), so a

@@ -361,6 +361,8 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_bee_sync.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ball_authority.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_pvp_authority.c # player-vs-player tool hits (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_action_ext.c # worker P2: puppet ACTION_EXT (msg 96) sender detector / receiver store (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_fishing_view.c # worker P3: BOBBER_VIEW relay / view (pure logic)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_field_authority.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_wildlife_authority.c
 )

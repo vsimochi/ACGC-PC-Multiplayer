@@ -3,7 +3,7 @@
 Saharah / Wendell / Gracie / the Wisp, the wire ids, the old-host compatibility (a 0.2.1 client never meets kind 21; a new client never sends it to a 0.2.x / 0.1.1 host)
 and the kill switch. No game process.
 
-TIER: SOURCE. Reads this tree and `git show HEAD:pc/src/pc_net_game.c` (HEAD = release 0.2.1, the old host reference) and `git show v0.1.1:...` when available.
+TIER: SOURCE. Reads this tree and `git show d17cae66:pc/src/pc_net_game.c` (= release 0.2.1, the old host reference) and `git show v0.1.1:...` when available.
 Usage: python test_evnpc_shared_src.py
 """
 import os
@@ -119,11 +119,12 @@ ck("K4 kind 21 is only ever queued by pc_evc_begin, which needs CLAIM mode and r
    "pc_evc_mode(op) != PC_EVC_MODE_CLAIM" in bg and "!pc_evc_shape_ok(op," in bg)
 ck("K5 the host kill switch: service 9 says OFF and kind 21 is REJECTED EVC_OFF (journalled, no violation)",
    "pc_evc_caps_build(blob, !pcnetgame_evc_env_off()" in ng and "(uint8_t)PC_NETGAME_TXN_REASON_EVC_OFF, 1, NULL" in h and 'getenv("AC_MP_EVENT_NPC")' in ng)
-old = git_show("HEAD", "pc/src/pc_net_game.c")
+REL_021 = "d17cae66d9a7b4a30b0f3ea17f2a46ece4211d53"  # the 0.2.1 release commit (HEAD already contains the service 9 code)
+old = git_show(REL_021, "pc/src/pc_net_game.c")
 if "pcnetgame_handle_host_data" not in old:
-    print("SKIPPED - the 0.2.1 source (git HEAD) is not available: old-host checks not run")
+    print("SKIPPED - the 0.2.1 source (git d17cae6) is not available: old-host checks not run")
 else:
-    ck("O1 the 0.2.1 host (HEAD) never announces service 9 (no PC_NETGAME_TS_EVNPC): a new client never sends kind 21 to it",
+    ck("O1 the 0.2.1 host (release d17cae6) never announces service 9 (no PC_NETGAME_TS_EVNPC): a new client never sends kind 21 to it",
        "PC_NETGAME_TS_EVNPC" not in old and "#define PC_NETGAME_TS_NUM      9u" in old)
     ck("O2 a 0.2.1 CLIENT ignores the unknown service 9 ('reserved / unknown -- ignored') and never sends kind 21 itself",
        "reserved / unknown -- ignored" in old and "KIND_EVNPC_CLAIM" not in old)

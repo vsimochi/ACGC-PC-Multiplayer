@@ -49,8 +49,8 @@ MATRIX = [
     (52, "gold_rod", "any", "any"),
     (53, "shovel", "any", "any"),
     (54, "gold_shovel", "any", "any"),
-    (55, "deferred", None, 0),   # balloon
-    (63, "deferred", None, 0),   # pinwheel
+    (55, "balloon", "any", "any"),   # P1: balloon (item skeleton + sway)
+    (63, "pinwheel", "any", "any"),  # P1: pinwheel (item skeleton + spin)
     (71, "fan", "any", "any"),
     (78, "fan", "any", "any"),
     (-1, "none", None, 0),
@@ -195,6 +195,124 @@ def s1(port, log_dir, check):
         host.stop()
 
 
+def expected_model(kind):
+    """P1: the classification of EVERY item kind (pc_remote_player_held_class / _held_name), from include/m_player.h's ranges."""
+    if kind < 0:
+        return "none"
+    if kind <= 8:
+        return "gold_axe" if kind == 8 else "axe"
+    if kind <= 10:
+        return "gold_net" if kind == 10 else "net"
+    if kind <= 42:
+        return "umbrella"
+    if kind <= 50:
+        return "deferred"  # ORG (custom design) umbrellas: the design is not transmitted
+    if kind <= 52:
+        return "gold_rod" if kind == 52 else "rod"
+    if kind <= 54:
+        return "gold_shovel" if kind == 54 else "shovel"
+    if kind <= 62:
+        return "balloon"
+    if kind <= 70:
+        return "pinwheel"
+    if kind <= 78:
+        return "fan"
+    return "deferred"
+
+
+def s3(port, log_dir, check):
+    """P1: held= classification of all 79 item kinds (0..78) + none, one puppet, real host process (HOOK-DRIVEN, no visual check)."""
+    print("=" * 72 + "\n[S3] HOOK-DRIVEN: held item classification of all 79 kinds")
+    host = boot_host(port, ["--authoritative-wildlife"], "held_s3", log_dir)
+    if host is None:
+        check("S3 host reached field", False)
+        return
+    b = None
+    try:
+        off = len(host.log_text())
+        b = make_b(port)
+        pid = b.assigned_peer_id
+        st = Streamer(b)
+        st.send(-1, n=10)
+        check("S3 puppet visual initialised for B", wait_visual(host, off))
+        bad = []
+        for kind in list(range(79)) + [-1]:
+            off = len(host.log_text())
+            st.send(kind, IDLE, 0.0, seconds=0.6)
+            mo = host.wait_for_log(DIAG_RX % (pid, kind), 10.0, since_offset=off)
+            want = expected_model(kind)
+            ok = mo is not None and mo.group(1) == want
+            if ok and want in ("none", "deferred"):
+                ok = int(mo.group(2)) == -1 and int(mo.group(3)) == 0
+            elif ok:
+                ok = int(mo.group(2)) >= 0
+            if not ok:
+                bad.append((kind, want, None if mo is None else mo.groups()))
+        check("S3 every kind 0..78 (+ none) logs the expected held class (mismatches %s)" % bad[:8], not bad)
+        for kind, ms, sp in ((55, WALK, 2.0), (63, RUN, 4.0), (60, DASH, 7.0), (70, WALK, 2.0)):
+            st.send(kind, ms, sp, seconds=1.0)
+        check("S3 walking / running with balloons and pinwheels (sway / spin draw path) did not take the host down", host.alive())
+        clean(host, check, "S3")
+    finally:
+        if b is not None:
+            try:
+                b.close()
+            except Exception:
+                pass
+        host.stop()
+
+
+def s4(port, log_dir, check):
+    """P1: the bee-sting swollen face rides bit 0 of APPEARANCE._reserved0[0] (byte 8). PROTOCOL-TESTED: B announces it, the host's
+    puppet resolves it (diag line), a later client C gets B's appearance relayed / backfilled WITH the flag and a clean sunburn byte,
+    and an appearance without the flag switches it off again (old-peer compatible: the byte was always 0)."""
+    print("=" * 72 + "\n[S4] PROTOCOL/HOOK-DRIVEN: bee swell face flag in APPEARANCE")
+    host = boot_host(port, ["--authoritative-wildlife"], "held_s4", log_dir)
+    if host is None:
+        check("S4 host reached field", False)
+        return
+    b = c = None
+    try:
+        off = len(host.log_text())
+        b = L.FakeClient("B", "127.0.0.1", port)
+        b.connect_and_ready()
+        pid = b.assigned_peer_id
+        ap = bytearray(build_appearance(0, 1, 0x2401, sunburn_rank=3))
+        ap[8] = 0x01
+        b.send_reliable(bytes(ap))
+        st = Streamer(b)
+        st.send(-1, seconds=1.5)
+        check("S4 host puppet: 'bee swell face on' for B (sunburn rank stays 3)",
+              host.wait_for_log(r"\[NET\]\[REMOTE\]\[DIAG\] player %d: bee swell face on" % pid, 15.0, since_offset=off) is not None and
+              host.wait_for_log(r"player %d: appearance received \(gender=0 face=1 sunburn=3 " % pid, 5.0, since_offset=off) is not None)
+        c = L.FakeClient("C", "127.0.0.1", port)
+        c.connect_and_ready()
+        t0 = time.monotonic()
+        got = None
+        while time.monotonic() - t0 < 15.0 and got is None:
+            st.send(-1, n=2)
+            L.pump_sleep(0.1, c.hub)
+            for m in c.inbox.peek_all(L.p_msg_type(L.PC_NETGAME_MSG_APPEARANCE, (L.CH_RELIABLE,))):
+                if len(m.payload) > 8 and m.payload[1] == pid:
+                    got = bytes(m.payload)
+        check("S4 C receives B's appearance relayed with byte 8 bit 0 set and the clean sunburn byte 3 (got %s)" %
+              str(None if got is None else (got[6], got[8])), got is not None and got[8] & 1 == 1 and got[6] == 3)
+        off = len(host.log_text())
+        b.send_reliable(build_appearance(0, 1, 0x2401, sunburn_rank=3))
+        st.send(-1, seconds=1.5)
+        check("S4 an appearance without the flag switches the swollen face off",
+              host.wait_for_log(r"\[NET\]\[REMOTE\]\[DIAG\] player %d: bee swell face off" % pid, 15.0, since_offset=off) is not None)
+        clean(host, check, "S4")
+    finally:
+        for x in (b, c):
+            if x is not None:
+                try:
+                    x.close()
+                except Exception:
+                    pass
+        host.stop()
+
+
 def s2(port, log_dir, check):
     print("=" * 72 + "\n[S2] HOOK-DRIVEN: scene-generation recreate (host enters SHOP0 and returns) while B carries a net")
     host = boot_host(port, ["--scene-test-enter-shop", "--scene-test-leave-after", "900"], "held_s2", log_dir)
@@ -255,7 +373,7 @@ def main():
     log_dir = os.path.join(HERE, "logs", "m9c")
     os.makedirs(log_dir, exist_ok=True)
     check = lambda d, c: L.check(d, c, results)
-    for i, fn in enumerate((s1, s2)):
+    for i, fn in enumerate((s1, s2, s3, s4)):
         if args.only and args.only != fn.__name__:
             continue
         fn(args.port + i, log_dir, check)

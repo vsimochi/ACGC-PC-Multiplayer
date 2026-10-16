@@ -65,9 +65,12 @@ def main():
           'PCFB("scene transition' not in rp)
 
     start = func(rp, "static int pc_remote_player_row_start(")
-    check("row_start pins the root for ROOT_PIN rows (Set_base_shape_trs + TRANS_XZ|ROT_Y) and clears it otherwise",
-          "PC_ROWF_ROOT_PIN" in start and "cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(&v->keyframe0, 0.0f, 1000.0f, 0.0f, 0, 0, 0x4000)" in start and
-          "cKF_ANIMATION_TRANS_XZ | cKF_ANIMATION_ROT_Y" in start and "animation_enabled = 0" in start)
+    # P1: the pin mask / base z now come from the per-state table s_row_pin (DOOR / KNOCK_DOOR: TRANS_XZ|ROT_Y, z 0)
+    check("row_start pins the root for ROOT_PIN rows (Set_base_shape_trs + the s_row_pin mask) and clears it otherwise",
+          "PC_ROWF_ROOT_PIN" in start and "cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(&v->keyframe0, 0.0f, 1000.0f, (f32)s_row_pin[idx].base_z, 0, 0, 0x4000)" in start and
+          "animation_enabled = pin_mask" in start and "animation_enabled = 0" in start and
+          re.search(r"\[mPlayer_INDEX_DOOR\] = \{ PC_PIN_XZ \| PC_PIN_RY, 0 \}", rp) is not None and
+          re.search(r"\[mPlayer_INDEX_KNOCK_DOOR\] = \{ PC_PIN_XZ \| PC_PIN_RY, 0 \}", rp) is not None)
     check("row_release and bind_body clear the root pin",
           "animation_enabled = 0" in func(rp, "static void pc_remote_player_row_release(") and
           "animation_enabled = 0" in func(rp, "static void pc_remote_player_bind_body("))
@@ -96,7 +99,9 @@ def main():
           "SCENE_COTTAGE_MY" in shown and "SCENE_COTTAGE_NPC" in shown and "ls.scene_id == sid" in shown and "play->scene_id == sid" in shown and
           "ls.owner == slot->scene.owner" in shown and "PC_NETSCENE_KIND_OTHER_INTERIOR" in shown and "default:" in shown)
     check("the shown predicate is used ONLY in dw and collide_eval (shared-interior collision); fx, arrival train, door pick/wrapper stay field-only",
-          rp.count("pc_remote_player_scene_is_local_shown(") == 3 and "pc_remote_player_scene_is_local_shown(" in dw and
+          # 4 = definition + dw + collide_eval + pc_puppet_aext_snd (ACTION_EXT cue SOUND only: sounds are allowed in shared interiors by design)
+          rp.count("pc_remote_player_scene_is_local_shown(") == 4 and "pc_remote_player_scene_is_local_shown(" in dw and
+          "pc_remote_player_scene_is_local_shown(" in func(rp, "static void pc_puppet_aext_snd(") and
           "pc_remote_player_scene_is_local_shown(" in func(rp, "static const char* pc_remote_player_collide_eval(") and
           all("pc_remote_player_scene_is_local_shown" not in func(rp, sig) for sig in
               ("static void pc_remote_player_arrival_train_poll(",
@@ -121,9 +126,12 @@ def main():
           re.search(r"if \(just_placed\) \{[^}]*pos_snapped = 0;", mv, re.S) is not None)
     check("snap_req is reset when the slot/actor is recreated", rp.count("snap_req = 0") >= 4)
 
+    # P1 generalized the list to every ROT_Y ct_base state (pcnetgame_facing_rot_y_state); KNOCK_DOOR and DOOR are in it
+    rot = func(ng, "static int pcnetgame_facing_rot_y_state(")
     check("sender sends shape_info.rotation.y for TURN_DASH, KNOCK_DOOR and DOOR (value change only)",
-          re.search(r"msg->facing_angle\s*=\s*\(local->now_main_index == mPlayer_INDEX_TURN_DASH\s*\|\|\s*local->now_main_index == mPlayer_INDEX_KNOCK_DOOR\s*\|\|\s*"
-                    r"local->now_main_index == mPlayer_INDEX_DOOR\)\s*\?\s*actor->shape_info\.rotation\.y\s*:\s*actor->world\.angle\.y;", ng) is not None)
+          re.search(r"msg->facing_angle\s*=\s*\(local->now_main_index == mPlayer_INDEX_TURN_DASH\s*\|\|\s*pcnetgame_facing_rot_y_state\(local->now_main_index\)\)"
+                    r"\s*\?\s*actor->shape_info\.rotation\.y\s*:\s*actor->world\.angle\.y;", ng) is not None and
+          "case mPlayer_INDEX_KNOCK_DOOR:" in rot and "case mPlayer_INDEX_DOOR:" in rot)
 
     print("-" * 60)
     print("%s (%d failed)" % ("ALL PASSED" if not FAILS else "FAILED", len(FAILS)))

@@ -129,8 +129,8 @@ def main():
     ap.add_argument("--exe", default=DEFAULT_EXE)
     ap.add_argument("--s0", action="store_true", help="first run the vanilla (AC_TEST_PVP_OFF=1) axe-on-puppet check")
     args = ap.parse_args()
-    if not (17000 <= args.port <= 17999):
-        print("REFUSING: ports 17000-17999 only", file=sys.stderr)
+    if not (17000 <= args.port <= 17999 or 22000 <= args.port <= 22999):  # 22000-22999: the P1 worker's range
+        print("REFUSING: ports 17000-17999 or 22000-22999 only", file=sys.stderr)
         return 2
     results = []
     check = lambda d, c: L.check(d, bool(c), results)  # noqa: E731
