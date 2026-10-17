@@ -87,7 +87,26 @@ class Env:
         return False
 
     def client(self, tag):
-        return L.ClientProcess("127.0.0.1:%d" % self.port, extra_args=["--guest"], log_path=os.path.join(HERE, "guest_g3_real_%s.log" % tag), bin_dir=L.GAME_BIN_DIR, label=tag).start()
+        return L.ClientProcess("127.0.0.1:%d" % self.port, extra_args=["--guest"], log_path=os.path.join(HERE, "guest_g3_real_%s.log" % tag), bin_dir=L.GAME_BIN_DIR, label=tag,
+                               env={"AC_TEST_AUTOPILOT": "ac_auto_%s.txt" % tag}).start()
+
+
+def finish_arrival(proc, tag, timeout=150.0):
+    """Porter's welcome (train action 3) waits for the player's A: the TEST-ONLY autopilot ("mash 3", PADRead hook, no window focus) presses it until the arrival released control.
+    Every same-position reload (the G3.3 look reload too) waits for the end of the local arrival (pc_town_local_arrival_active): never cut the arrival (guest stuck on the tracks)."""
+    end, cid = time.monotonic() + timeout, 1
+    while time.monotonic() < end and proc.alive():
+        txt = proc.log_text()
+        if "arrival: control released" in txt:
+            return True
+        if re.search(r"arrival: train action [34] ", txt):
+            with open(os.path.join(L.GAME_BIN_DIR, "ac_auto_%s.txt" % tag), "w") as f:
+                f.write("%d mash 3\n" % cid)
+            cid += 1
+            L.pump_sleep(4.0)
+        else:
+            L.pump_sleep(1.0)
+    return "arrival: control released" in proc.log_text()
 
 
 def live_remote_slots(host_log):
@@ -187,6 +206,9 @@ def run(args, results, env):
     off_c = len(host.log_text())
     c2 = env.client("c2")
     m2 = c2.wait_for_log(ADOPT_RX, 150.0)
+    arr2 = finish_arrival(c2, "c2")
+    check("C the restarted guest's arrival finished (control released) BEFORE any look reload", arr2 and (c2.log_text().find("[NET][LOOK] same-position scene reload") < 0
+          or c2.log_text().find("[NET][LOOK] same-position scene reload") > c2.log_text().find("arrival: control released")))
     mreload = c2.wait_for_log(r"\[NET\]\[LOOK\] same-position scene reload \(SCENE_FG at -?\d+,-?\d+\)[^\n]*goto_other_scene res=1", 90.0)
     t2 = c2.log_text()
     hc = host.log_text()[off_c:]

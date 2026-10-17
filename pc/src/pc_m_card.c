@@ -2647,6 +2647,8 @@ static int pc_host_renewshop_scene_is_shop(int scene) {
     return scene == SCENE_SHOP0 || scene == SCENE_CONVENI || scene == SCENE_SUPER || scene == SCENE_DEPART || scene == SCENE_DEPART_2;
 }
 
+int pc_town_local_arrival_active(void); /* below: the local train arrival is running (every same-position reload waits for it) */
+
 static void pc_host_renewshop_poll(void) {
     static int l_have_key = 0;
     static lbRTC_time_c l_key; /* the renewal_time a reload was already issued for */
@@ -2740,6 +2742,9 @@ static void pc_host_renewshop_poll(void) {
     if (pl == NULL || play->submenu.process_status != mSM_PROCESS_WAIT ||
         (!pc_host_observer_active() && !mPlib_able_submenu_type1((GAME*)play))) {
         return; /* the host's own player is busy (menu / talk / action): wait */
+    }
+    if (pc_town_local_arrival_active()) {
+        return; /* a listen host's own train arrival is still running: never cut it with a reload (the player would stay on the tracks) */
     }
 #ifdef PC_NET_TEST_HOOKS
     if (l_hook_state == 2) {
@@ -2837,18 +2842,40 @@ int pc_town_shop_structure_npc(void) {
     return 0;
 }
 
-/* The same-position SCENE_FG reload of pc_host_renewshop_poll for any role (the shop upgrade's client refresh): only in the town scene, no transition, the local player idle (no menu,
- * no talk, no demo). 1 = the reload started, 0 = not now (retry later), -1 = not in the town scene (nothing to refresh). */
-int pc_town_same_position_reload(const char* why) {
+/* 1 = the LOCAL player's train arrival (RIDE_OFF_DEMO: train actions 0-4, parked at the train start / riding / getting off / walking off the platform) is pending or in
+ * progress, or the player is in any demo main state (train / boat / wade / demo walk / demo wait): a same-position reload now would rebuild the scene with the player on the
+ * tracks and the arrival demo gone (the 0.2.x "stuck on the train tracks" regression of the shop join sync). Every same-position reload waits for 0 (the arrival finished:
+ * "[JOIN] arrival: control released"). Read-only. */
+int pc_town_local_arrival_active(void) {
     GAME_PLAY* play;
-    PLAYER_ACTOR* pl;
-    Door_data_c door;
-    xyz_t pos;
-    int res;
+    int idx;
     if (gamePT == NULL || gamePT->exec != play_main) {
         return 0;
     }
     play = (GAME_PLAY*)gamePT;
+    if (Common_Get(demo_profiles[0]) == mAc_PROFILE_RIDE_OFF_DEMO || Common_Get(demo_profiles[1]) == mAc_PROFILE_RIDE_OFF_DEMO ||
+        Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL) {
+        return 1;
+    }
+    if (pc_host_observer_active() || !Common_Get(player_actor_exists) || GET_PLAYER_ACTOR_NOW() == NULL) {
+        return 0; /* the parked observer avatar is never "arriving" */
+    }
+    idx = mPlib_get_player_actor_main_index((GAME*)play);
+    return (idx >= mPlayer_INDEX_DEMO_WAIT && idx <= mPlayer_INDEX_DEMO_WADE) || (idx >= mPlayer_INDEX_DEMO_GETON_BOAT && idx <= mPlayer_INDEX_DEMO_GETOFF_BOAT);
+}
+
+/* The "safe moment" of every same-position SCENE_FG reload: 1 = now (town scene, no transition, the local player idle: no menu, no talk/message demo, no arrival / demo
+ * state), 0 = not now (retry later), 2 = not now: the local arrival is still running (pc_town_local_arrival_active), -1 = not in the town scene (nothing to refresh). */
+int pc_town_reload_moment(void) {
+    GAME_PLAY* play;
+    PLAYER_ACTOR* pl;
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (pc_town_local_arrival_active()) {
+        return 2;
+    }
     if (play->fb_wipe_mode != WIPE_MODE_NONE || play->fb_fade_type != FADE_TYPE_NONE || !Common_Get(player_actor_exists)) {
         return 0;
     }
@@ -2860,6 +2887,23 @@ int pc_town_same_position_reload(const char* why) {
         (!pc_host_observer_active() && !mPlib_able_submenu_type1((GAME*)play))) {
         return 0;
     }
+    return 1;
+}
+
+/* The same-position SCENE_FG reload of pc_host_renewshop_poll for any role (the shop upgrade's client refresh, the shop join sync, the day roll): only at the safe moment
+ * (pc_town_reload_moment: town scene, no transition, the local player idle, NEVER during the local train arrival). 1 = the reload started, 0 = not now (retry later), -1 = not in
+ * the town scene (nothing to refresh). */
+int pc_town_same_position_reload(const char* why) {
+    GAME_PLAY* play;
+    PLAYER_ACTOR* pl;
+    Door_data_c door;
+    xyz_t pos;
+    int res, m;
+    if ((m = pc_town_reload_moment()) != 1) {
+        return m == -1 ? -1 : 0; /* 2 (the arrival runs) = not now: the arrival is never cut by a reload */
+    }
+    play = (GAME_PLAY*)gamePT;
+    pl = GET_PLAYER_ACTOR_NOW();
     pos = pl->actor_class.world.position;
     memset(&door, 0, sizeof(door));
     door.next_scene_id = SCENE_FG;

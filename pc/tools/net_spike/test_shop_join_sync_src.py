@@ -12,6 +12,9 @@ was parked behind the client's live structure placeholder. Pins:
      same-position reload, bounded 10 min) with its own reason; reset per session in pcnetgame_shopup_client_reset().
   C2 the shared client tick: client role only (offline / host never run it), the join check first, the reload reason restored after use.
   M1 pc_m_card.c pc_town_shop_structure_npc(): exec-gated (gamePT->exec == play_main) and read-only.
+  A1-A9 the arrival gate (regression: the guest stuck on the train tracks): no same-position reload (shop join / shop refresh / day roll / host renewal / look reload)
+     while the local train arrival runs; the client refresh waits for the arrival to finish + 2 s idle in the town
+     ('[NET][SHOP] client: shop refresh deferred until the arrival finishes').
 Tier: SOURCE. Usage: python test_shop_join_sync_src.py
 """
 import os
@@ -84,13 +87,42 @@ def main():
        "if (pcfa_transient_kind(v) == PCFA_VALUE_STABLE && v != want) {\n        (void)pcfa_set_tile(ac, st, want);" in w
        and "pcfa_transient_kind(f) == PCFA_VALUE_STABLE" in w and "(void)pcfa_set_tile(ac, tl[i], (uint16_t)RSV_NO);" in w and "(void)pcfa_set_deposit(ac, tl[i], 0);" in w)
     ck("C7 a live actor reuses the shop upgrade's client refresh (re-tag + one reload) with its own reason",
-       "if (live != 0) {\n        s_shopup_refresh_why = \"the shop building differs from the host's\";\n        s_up.c_refresh_level = level;" in jt)
+       "if (live != 0) {\n        s_shopup_refresh_why = \"the shop building differs from the host's\";\n        s_shopup_refresh_is_join = 1;" in jt
+       and "s_up.c_refresh_level = level;" in jt)
     tick = body(ng, r"static void pcnetgame_shopup_client_tick\(void\) \{")
     ck("C8 the shared client tick: CLIENT role only, then the join check before the refresh",
        tick.index("if (s_role != PC_NETGAME_ROLE_CLIENT) {\n        return;\n    }") < tick.index("pcnetgame_shopjoin_client_tick();") < tick.index("if (s_up.c_refresh_level >= 0) {"))
     ck("C9 the reload uses the reason and restores the renewal reason after it started",
-       "(r = pc_town_same_position_reload(s_shopup_refresh_why)) != 0) {\n            s_up.c_refresh_level = -1;\n            s_shopup_refresh_why = \"the shop was upgraded\";" in tick
+       "(r = pc_town_same_position_reload(s_shopup_refresh_why)) != 0) {" in tick and "            s_up.c_refresh_level = -1;\n            s_shopup_refresh_why = \"the shop was upgraded\";" in tick
        and "bounded" in jt and "> 600000u" in tick)
+    # A1-A8: the arrival gate (regression "guest stuck on the train tracks": the join refresh reloaded the town at +7.4 s while the local train arrival ran).
+    ar = body(mc, r"int pc_town_local_arrival_active\(void\) \{")
+    ck("A1 pc_town_local_arrival_active: the pending RIDE_OFF_DEMO profile, the live RIDE_OFF_DEMO actor, or a demo main state (train / boat) = the arrival runs",
+       "Common_Get(demo_profiles[0]) == mAc_PROFILE_RIDE_OFF_DEMO" in ar and "Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL" in ar
+       and "idx >= mPlayer_INDEX_DEMO_WAIT && idx <= mPlayer_INDEX_DEMO_WADE" in ar and "gamePT->exec != play_main" in ar)
+    mo = body(mc, r"int pc_town_reload_moment\(void\) \{")
+    ck("A2 pc_town_reload_moment: the arrival (2) is checked first, then fade/wipe, town scene, menu, demo, able_submenu",
+       "if (pc_town_local_arrival_active()) {\n        return 2;" in mo and 0 <= mo.find("pc_town_local_arrival_active()") < mo.find("fb_wipe_mode")
+       and "mDemo_CheckDemo() != FALSE" in mo and "mSM_PROCESS_WAIT" in mo and "mPlib_able_submenu_type1" in mo and "return -1;" in mo)
+    rl = body(mc, r"int pc_town_same_position_reload\(const char\* why\) \{")
+    ck("A3 every pc_town_same_position_reload (shop refresh, shop join, day roll) refuses unless the safe moment: the arrival is never cut",
+       "if ((m = pc_town_reload_moment()) != 1) {\n        return m == -1 ? -1 : 0;" in rl and 0 <= rl.find("pc_town_reload_moment()") < rl.find("goto_other_scene"))
+    rn = body(mc, r"static void pc_host_renewshop_poll\(void\) \{")
+    lk = body(ng, r"static void pcnetgame_look_reload_poll\(void\) \{")
+    ck("A4 the other same-position reloads (host shop renewal, G3.3 look reload) wait for the arrival too",
+       0 <= rn.find("if (pc_town_local_arrival_active()) {") < rn.find("goto_other_scene") and 0 <= lk.find("if (pc_town_local_arrival_active()) {") < lk.find("goto_other_scene"))
+    ck("A5 the client refresh is gated by the arrival-finished moment BEFORE the reload, with the deferral log line",
+       0 <= tick.find("(r = pc_town_reload_moment()) == 2 || r == 0") < tick.find("pc_town_same_position_reload(")
+       and "[NET][SHOP] client: shop refresh deferred until the arrival finishes" in tick)
+    ck("A6 a settle of PC_SHOPUP_REFRESH_SETTLE_MS (2000 ms) continuously idle in the town after the arrival, restarted by any busy frame",
+       "#define PC_SHOPUP_REFRESH_SETTLE_MS 2000u" in ng and "s_shopup_safe_since = 0;" in tick
+       and 0 <= tick.find("(pcnetgame_now_ms() - s_shopup_safe_since) < PC_SHOPUP_REFRESH_SETTLE_MS") < tick.find("pc_town_same_position_reload("))
+    ck("A7 the reload / verify log the player's position (the real test checks it is not the train start)",
+       "[NET][SHOP] client: refresh reload at the player's position (%d,%d)" in tick and "(shop level %d), player at (%d,%d), live shop actor 0x%04X" in tick)
+    ck("A8 a reload never replays the arrival demo: it clears the demo profiles (no RIDE_OFF_DEMO restart at the tracks)",
+       rl.count("Common_Set(demo_profiles[0], mAc_PROFILE_NUM);") == 1)
+    ck("A9 the defer / settle state is reset per pending refresh and per session",
+       ng.count("s_shopup_defer_logged = 0;") >= 4 and "s_shopup_safe_since = 0;" in body(ng, r"static void pcnetgame_shopup_client_reset\(void\) \{"))
     rs = body(ng, r"static void pcnetgame_shopup_client_reset\(void\) \{")
     ck("C10 per session: reset in pcnetgame_shopup_client_reset(), which the client session reset calls",
        "s_shopjoin_done = 0;" in rs and "pcnetgame_shopup_client_reset(); /* the shop upgrade mirror is host-fed too" in ng)

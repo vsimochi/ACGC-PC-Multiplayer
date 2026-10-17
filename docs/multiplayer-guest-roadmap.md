@@ -1586,6 +1586,23 @@ Known limit: game logic that auto-writes a notice post locally on a client (day-
 
 **Limits.** No screenshot check of the building. Other structures behind live host placeholders (villager houses, mailboxes ...) never change level, so only the shop is learned; a client whose shop acre is loaded sees one black-fade reload after its arrival.
 
+**Regression fixed: the guest spawned on the train tracks and was stuck.** The check runs right after the first snapshot (about +6.7 s). That is while the guest's own train arrival (RIDE_OFF_DEMO, train actions 0-4) is still running. The refresh reload then fired at about +7.4 s, while the player was riding the train. `pc_town_same_position_reload` only checked `mDemo_CheckDemo()` / `mPlib_able_submenu_type1`, and both pass during the ride. The reload clears the demo profiles ("never replay the arrival"), so the scene was rebuilt with the player at their position on the tracks and no arrival demo left to finish: no train action 3/4, no "control released". Fix:
+- `pc_town_local_arrival_active()` (pc_m_card.c) returns 1 in any of these cases:
+  - a RIDE_OFF_DEMO profile is pending in `demo_profiles[]`;
+  - the RIDE_OFF_DEMO actor is alive (ACTOR_PART_CONTROL);
+  - the player is in a demo main state (DEMO_WAIT..DEMO_WADE, the boat demos). The parked observer avatar is exempt.
+- `pc_town_reload_moment()` is the shared "safe moment" check. It returns 2 while that arrival runs, 0 during a fade/wipe, menu, talk/demo or a busy player, -1 outside the town, and 1 otherwise.
+- Every same-position reload waits for the arrival to end. `pc_town_same_position_reload` (shop refresh, shop join, day roll) uses `pc_town_reload_moment()`; the host shop-renewal reload and the G3.3 look reload check `pc_town_local_arrival_active()` directly.
+- The client refresh in `pcnetgame_shopup_client_tick` logs once `[NET][SHOP] client: shop refresh deferred until the arrival finishes`. After `[JOIN] arrival: control released` it logs `the arrival finished: the shop refresh runs after 2000 ms idle in the town`. It then needs `PC_SHOPUP_REFRESH_SETTLE_MS` (2000 ms) of the safe moment without a break; any busy frame restarts the count. Only then does it do the ONE reload, with a black fade at the player's position (logged `refresh reload at the player's position (x,z)`).
+- The verify line now also prints the player's position and the live shop actor's npc_id, and checks once more 6 s later while the new actor is still loading (tile RSV_NO, no actor yet).
+- The check itself (field rewrite + re-tag) still runs at join time. It changes no scene state, and a mismatch with a live structure actor needs the reload anyway.
+- The 10-minute limit is unchanged. The kill switch `AC_MP_SHOP_JOIN_SYNC=0` is unchanged.
+
+Tests:
+- `test_shop_join_sync_src.py` 26/26 (A1-A9 arrival-gate pins).
+- `test_shop_join_sync_real.py`, run 2: 25/26. Fixture `bin_fixture4_sj_join`, port 35142. Porter's A is pressed by the TEST-ONLY autopilot `mash`. The log showed, in order: deferred during the arrival, train actions 3 -> 4, control released at +22.6 s, reload about 2 s later at (2220,840), and the player still at (2220,840) after the reload. The one FAIL was the old verify reading tile 0xFFFF 6 s after the reload: the new actor's bank was still loading. The guard log shows the teardown restored 0x5805. The verify now also prints the live actor's npc_id and the test accepts it; this was not re-run.
+- `test_guest_g3_real.py` 44/44. The G3.3 look reload now runs after "control released", also at (2220,840).
+
 ## Guest museum donation (host-authoritative, donor nibble 5)
 
 Status: **implemented, not committed** (protocol version 8 unchanged, no wire change). Guests (non-resident players with a guest record, record index `PLAYER_NUM + guest slot`) donate fossils,

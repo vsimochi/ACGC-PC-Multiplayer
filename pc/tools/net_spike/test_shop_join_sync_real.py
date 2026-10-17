@@ -8,7 +8,7 @@ shadow init, its live shop actor holds DUMMY_SHOPn / RSV_NO on the structure til
 (b) when the host value does arrive (a later FIELD_UPDATE / a host that knows it) it is PARKED behind the client's live structure actor placeholder, so the old
 building stays until the shop acre unloads. Which client shows which building depended on whether its shop acre was loaded at that moment.
 
-TIER: REAL PROCESSES (one disposable fixture pc\\build64\\bin_fixture4_shopb_join, exe of pc\\build64_w3), Samsung display + volume 1:
+TIER: REAL PROCESSES (one disposable fixture pc\\build64\\bin_fixture4_sj_join, exe of pc\\build64_w3), Samsung display + volume 1:
   P1 dedicated host (hidden observer) on the fixture town (Nook's Cranny, level 0): `shop-level-boost confirm` -> PENDING, `shop-upgrade start confirm` -> CLOSED
      (AC_TEST_SHOP_UPGRADE_SECONDS=20) -> renewed to Nook 'n' Go (level 1); `save`; the host town GCI has 0x5805 / level 1, the fixture's own save/card_a (the guest's
      LOCAL town copy) keeps 0x5804 / level 0 = the stale client save of the report.
@@ -17,8 +17,11 @@ TIER: REAL PROCESSES (one disposable fixture pc\\build64\\bin_fixture4_shopb_joi
   P3 a REAL guest client (--guest, its local save = the stale copy) joins: its log has '[NET][SHOP] client: shop building ...' once; either it matches the host
      (0x5805, the snapshot wrote the tile before the shop acre was built) or '!= host 0x5805: refreshing' followed by the re-tag + ONE same-position reload and the
      verify line 'after the town reload the local structure tile ... = 0x5805|0xF0F8 (shop level 1)'.
+  P4 (regression "the guest spawns on the train tracks and is stuck"): the guest's arrival runs to the end (train actions 3 + 4, '[JOIN] arrival: control released')
+     BEFORE any '[NET][SHOPUP] client: same-position SCENE_FG reload'; the refresh is deferred ('shop refresh deferred until the arrival finishes'); the player's
+     position at / after the reload is in the town (not the train start (1970,760)); the arrival is not restarted.
 NOT covered: what the windows LOOK like (no screenshot), a resident client (same client code path), AC_MP_SHOP_JOIN_SYNC=0 (pinned by test_shop_join_sync_src.py).
-Ports 32000-32499 only. Usage: python test_shop_join_sync_real.py [--port 32140]
+Ports 35000-35499 only. Usage: python test_shop_join_sync_real.py [--port 35140]
 """
 import argparse
 import os
@@ -37,7 +40,7 @@ os.environ["AC_TOWN_NO_MSGBOX"] = "1"
 import town_test_support as T  # noqa: E402
 import net_spike_lib as L  # noqa: E402
 
-FIX = "bin_fixture4_shopb_join"
+FIX = "bin_fixture4_sj_join"
 W3_EXE = os.path.join(T.PC, "build64_w3", "bin", "AnimalCrossing.exe")
 GCI_SAVE = 0x40 + 0x26000
 FG_OFF, SHOP_OFF = 0x137A8, 0x20340
@@ -83,10 +86,10 @@ def stop_host(h):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=32140)
+    ap.add_argument("--port", type=int, default=35140)
     args = ap.parse_args()
-    if not 32000 <= args.port <= 32499:
-        print("REFUSING: ports 32000-32499 only", file=sys.stderr)
+    if not 35000 <= args.port <= 35499:
+        print("REFUSING: ports 35000-35499 only", file=sys.stderr)
         return 2
     fx = os.path.join(T.BUILD64, FIX)
     if my_procs_running([fx]):
@@ -142,10 +145,22 @@ def main():
         ck("P2 PROTOCOL: a joining client's snapshot carries the host's structure tile 0x5805 (got %s)" % (tiles.get(ut) is not None and hex(tiles.get(ut))), tiles.get(ut) == 0x5805)
 
         # ---------------- P3: a REAL guest with the stale local save joins
-        gst = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--guest", "-debug"], log_path=T.log_path("shopjoin_guest.log"), bin_dir=fx, label="sjg").start()
+        gst = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--guest", "-debug"], log_path=T.log_path("shopjoin_guest.log"), bin_dir=fx, label="sjg",
+                              env={"AC_TEST_AUTOPILOT": "ac_auto_sjg.txt"}).start()
         ck("P3 guest READY", gst.wait_for_log(r"-> READY", 240.0) is not None)
         m = gst.wait_for_log(r"\[NET\]\[SHOP\] client: shop building (0x[0-9A-F]{4}) (matches|!= host (0x[0-9A-F]{4}): refreshing)", 120.0)
         ck("P3 the guest ran the shop building check (%s)" % (m and m.group(0)), m is not None)
+        # Porter's welcome (train action 3) waits for the player's A: the TEST-ONLY autopilot presses A ("mash 3", PADRead hook, no window focus) until control is released.
+        cr, end, cid = None, time.monotonic() + 150.0, 1
+        while cr is None and time.monotonic() < end and gst.exit_code() is None:
+            cr = re.search(r"\[JOIN\] \+\d+ms arrival: control released", gst.log_text())
+            if cr is None and re.search(r"arrival: train action [34] ", gst.log_text()):
+                with open(os.path.join(fx, "ac_auto_sjg.txt"), "w") as f:
+                    f.write("%d mash 3\n" % cid)
+                cid += 1
+                L.pump_sleep(4.0)
+            elif cr is None:
+                L.pump_sleep(1.0)
         if m is not None and m.group(2) == "matches":
             ck("P3 the guest's building is the host's Nook 'n' Go (snapshot wrote the tile before the shop acre was built)", m.group(1) == "0x5805")
             L.info("P3 the refresh path (re-tag + reload) was NOT exercised: the shop acre was not built from the stale tile in this run")
@@ -154,12 +169,37 @@ def main():
             if "live structure actor" in gst.log_text()[m.start():m.start() + 400]:
                 rl = gst.wait_for_log(r"same-position SCENE_FG reload \(the shop building differs from the host's\): res=1", 180.0)
                 ck("P3 ONE same-position reload refreshed the town", rl is not None)
-                vt = gst.wait_for_log(r"after the town reload the local structure tile acre \d+ tile \d+ = 0x([0-9A-F]{4}) \(shop level (\d+)\)", 30.0)
-                ck("P3 after the reload the structure is Nook 'n' Go (%s)" % (vt and vt.group(0)), vt is not None and vt.group(1) in ("5805", "F0F8") and vt.group(2) == "1")
+                vt = gst.wait_for_log(r"after the town reload the local structure tile acre \d+ tile \d+ = 0x([0-9A-F]{4}) \(shop level (\d+)\)[^\r\n]*live shop actor 0x([0-9A-F]{4})", 30.0)
+                # the tile is 0x5805 (acre not loaded) / 0xF0F8 (DUMMY_SHOP1 = the live Nook 'n' Go actor's init ran), or RSV_NO while the live actor (npc 0x5805) is still loading
+                ck("P3 after the reload the structure is Nook 'n' Go (%s)" % (vt and vt.group(0)), vt is not None and vt.group(2) == "1"
+                   and (vt.group(1) in ("5805", "F0F8") or vt.group(3) == "5805"))
             else:
                 L.info("P3 the shop acre was not loaded: the field tile was rewritten (the new shop is built when the acre loads)")
-        L.pump_sleep(6.0)
+        # ---------------- P4: the guest's own train arrival is never cut by the refresh reload (regression: the guest stuck on the train tracks)
+        cr = cr or gst.wait_for_log(r"\[JOIN\] \+\d+ms arrival: control released", 30.0)
+        ck("P4 the guest's arrival finished ('[JOIN] arrival: control released')", cr is not None)
+        L.pump_sleep(12.0)  # the deferred refresh: 2 s settle + the reload + the 6 s verify
         txt = gst.log_text()
+        jstart = txt.rfind("[JOIN] +0ms client: transport connected")
+        jt = txt[jstart if jstart >= 0 else 0:]
+        a3 = jt.find("arrival: train action 3 ")
+        a4 = jt.find("arrival: train action 4 ")
+        rel = jt.find("arrival: control released")
+        rld = jt.find("[NET][SHOPUP] client: same-position SCENE_FG reload")
+        ck("P4 train actions 3 (getting off) and 4 (walking off the platform) then 'control released', in order", 0 <= a3 < a4 < rel)
+        ck("P4 no same-position reload BEFORE the arrival finished (reload at %d, control released at %d)" % (rld, rel), rld < 0 or (rel >= 0 and rld > rel))
+        ck("P4 at most one train arrival in the session (the arrival was not restarted)", len(re.findall(r"arrival: train action 1 ", jt)) <= 1 and len(re.findall(r"arrival: control released", jt)) == 1)
+        if rld >= 0:
+            ck("P4 the join refresh was deferred until the arrival finished (log line)", "[NET][SHOP] client: shop refresh deferred until the arrival finishes" in jt
+               or jt.find("shop building 0x") > rel)
+            rp = re.search(r"\[NET\]\[SHOP\] client: refresh reload at the player's position \((-?\d+),(-?\d+)\)", jt)
+            vp = re.search(r"after the town reload the local structure tile .*player at \((-?\d+),(-?\d+)\)", jt)
+            for tag, mm in (("at the reload", rp), ("after the reload", vp)):
+                x, z = (int(mm.group(1)), int(mm.group(2))) if mm else (None, None)
+                far = mm is not None and ((x - 1970) ** 2 + (z - 760) ** 2) ** 0.5 > 120.0 and z >= 800
+                ck("P4 the player %s stands in the town, not at the train start (1970,760) on the tracks: (%s,%s)" % (tag, x, z), far)
+        else:
+            L.info("P4 no join refresh reload in this run (the building matched / the shop acre was not loaded): the arrival order is still checked")
         ck("P3 exactly one shop building check in the session", len(re.findall(r"\[NET\]\[SHOP\] client: shop building 0x", txt)) == 1)
         ck("P3 at most one join refresh reload", len(re.findall(r"reload \(the shop building differs from the host's\): res=1", txt)) <= 1)
         ck("P3 host + guest alive", h.exit_code() is None and gst.exit_code() is None)

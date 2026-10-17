@@ -26393,6 +26393,8 @@ static void pcnetgame_look_refresh_after_adopt(int old_gender, int old_face, con
     }
 }
 
+extern int pc_town_local_arrival_active(void); /* pc_m_card.c: the local train arrival is running (no same-position reload until it finished) */
+
 /* G3.3: the deferred same-position reload. One-shot: the pending flag is cleared on the first decision (done, or not applicable). */
 static void pcnetgame_look_reload_poll(void) {
     GAME_PLAY* play;
@@ -26415,6 +26417,9 @@ static void pcnetgame_look_reload_poll(void) {
     pl = GET_PLAYER_ACTOR_NOW();
     if (!pcnetgame_is_real_player_actor(pl) || !mPlib_able_submenu_type1((GAME*)play) || play->submenu.process_status != mSM_PROCESS_WAIT) {
         return; /* not idle yet: retry */
+    }
+    if (pc_town_local_arrival_active()) {
+        return; /* the local train arrival still runs: a reload now would leave the player on the tracks (retry after "control released") */
     }
     pos = pl->actor_class.world.position;
     memset(&door, 0, sizeof(door));
@@ -47645,6 +47650,7 @@ extern int aSL_PC_RenewShopDirect(void);
 extern int aSL_PC_ShopFootprint(int level, int* acre, int* struct_tile, int* tiles, int cap);
 extern int pc_town_shop_structure_patch(int level);   /* pc_m_card.c */
 extern int pc_town_same_position_reload(const char* why); /* pc_m_card.c */
+extern int pc_town_reload_moment(void);                  /* pc_m_card.c: 1 now, 0 not now, 2 the local arrival runs, -1 not in the town */
 extern int pc_save_write_authoritative_durable(void);  /* pc_m_card.c */
 extern int pc_host_renewshop_reload_count(void);       /* pc_m_card.c (worker C): renewal reloads really issued */
 static int      s_shopup_armed_reloads = 0;            /* worker C: pc_host_renewshop_reload_count() when the current attempt was armed */
@@ -48238,6 +48244,14 @@ static int pcnetgame_ts_valid_upgrade_blob(const uint8_t* blob) {
     return (blob[10] | (blob[11] << 8)) != 0 && (blob[0] == (uint8_t)PC_SHOP_UPGRADE_IDLE || blob[2] > blob[1]);
 }
 
+static const char* s_shopup_refresh_why = "the shop was upgraded"; /* the reason of the next client refresh reload */
+static int s_shopup_refresh_is_join = 0;  /* the pending refresh is the shop join sync's (log wording) */
+static uint32_t s_shopup_safe_since = 0;  /* the first frame of the current "idle in the town, the arrival finished" stretch (0 = not idle) */
+static int s_shopup_defer_logged = 0;     /* "deferred until the arrival finishes" was printed for the pending refresh */
+/* Every client refresh reload (shop join sync / shop reopening) waits until the local train arrival finished ("[JOIN] arrival: control released") and the player stood idle
+ * in the town this long (pc_town_reload_moment() == 1 continuously). */
+#define PC_SHOPUP_REFRESH_SETTLE_MS 2000u
+
 static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob) {
     const int prev_state = s_up.c_have ? s_up.c_state : -1;
     const uint32_t prev_gen = s_up.c_gen;
@@ -48265,6 +48279,10 @@ static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob) {
         pcnetgame_shopup_notice_set(2, 0);
         s_up.c_refresh_level = (s_up.c_target > prev_target) ? s_up.c_target : prev_target; /* IDLE carries the new level in from/target */
         s_up.c_refresh_since = pcnetgame_now_ms();
+        s_shopup_refresh_why = "the shop was upgraded";
+        s_shopup_refresh_is_join = 0;
+        s_shopup_safe_since = 0;
+        s_shopup_defer_logged = 0;
         printf("[NET][SHOPUP] client: the shop reopened at level %d: the town view is refreshed when the player is idle in the town\n", s_up.c_refresh_level);
     }
 }
@@ -48278,7 +48296,6 @@ static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob) {
  * footprint and a live actor is re-tagged + refreshed with ONE same-position reload (the shop upgrade's client refresh path). */
 extern int pc_town_shop_structure_npc(void); /* pc_m_card.c */
 static int s_shopjoin_done = 0;                                  /* CLIENT: the check ran in this session */
-static const char* s_shopup_refresh_why = "the shop was upgraded"; /* the reason of the next client refresh reload */
 
 static void pcnetgame_shopjoin_client_tick(void) {
     int level, ac = -1, st = -1, tl[32], n, i, live;
@@ -48323,6 +48340,9 @@ static void pcnetgame_shopjoin_client_tick(void) {
     pcfa_set_net_apply_active(0);
     if (live != 0) {
         s_shopup_refresh_why = "the shop building differs from the host's";
+        s_shopup_refresh_is_join = 1;
+        s_shopup_safe_since = 0;
+        s_shopup_defer_logged = 0;
         s_up.c_refresh_level = level; /* pcnetgame_shopup_client_tick: re-tag the live actor, then the same-position reload (bounded: 10 minutes, then the next town load) */
         s_up.c_refresh_since = pcnetgame_now_ms();
     }
@@ -48340,6 +48360,10 @@ static void pcnetgame_shopup_client_tick(void) {
         int r;
         if (s_client_link != PC_NETGAME_LINK_READY || (uint32_t)(pcnetgame_now_ms() - s_up.c_refresh_since) > 600000u) {
             s_up.c_refresh_level = -1; /* the session ended / waited 10 minutes: the next town load builds the shop from the field anyway */
+            s_shopup_refresh_why = "the shop was upgraded";
+            s_shopup_refresh_is_join = 0;
+            s_shopup_safe_since = 0;
+            s_shopup_defer_logged = 0;
         } else if (pc_town_shop_structure_patch(s_up.c_refresh_level) == 0) {
             int ac = -1, st = -1, tl[32];
             uint16_t v = 0;
@@ -48349,9 +48373,33 @@ static void pcnetgame_shopup_client_tick(void) {
             }
             printf("[NET][SHOPUP] client: no live shop structure actor (not in the town / the shop acre is not loaded): the new shop appears when it is loaded; "
                    "local structure tile acre %d tile %d = 0x%04X\n", ac, st, (unsigned)v);
+        } else if ((r = pc_town_reload_moment()) == 2 || r == 0) {
+            /* NOT NOW: the local train arrival still runs (a reload would rebuild the scene with the player on the tracks and the arrival demo gone: "stuck on the train
+             * tracks"), or the player is busy (menu / talk / message / fade / door / demo). The idle stretch restarts. */
+            s_shopup_safe_since = 0;
+            if (r == 2 && !s_shopup_defer_logged) {
+                s_shopup_defer_logged = 1;
+                printf("%s\n", s_shopup_refresh_is_join ? "[NET][SHOP] client: shop refresh deferred until the arrival finishes (the local train arrival is running)"
+                                                        : "[NET][SHOPUP] client: town refresh deferred until the arrival finishes (the local train arrival is running)");
+            }
+        } else if (r == 1 && s_shopup_safe_since == 0) {
+            s_shopup_safe_since = pcnetgame_now_ms() | 1u; /* the player has control, idle in the town: settle first */
+            if (s_shopup_defer_logged) {
+                printf("[NET][SHOP] client: the arrival finished: the shop refresh runs after %u ms idle in the town\n", (unsigned)PC_SHOPUP_REFRESH_SETTLE_MS);
+            }
+        } else if (r == 1 && (uint32_t)(pcnetgame_now_ms() - s_shopup_safe_since) < PC_SHOPUP_REFRESH_SETTLE_MS) {
+            /* settling */
         } else if ((r = pc_town_same_position_reload(s_shopup_refresh_why)) != 0) {
+            if (r == 1) {
+                PLAYER_ACTOR* rpl = GET_PLAYER_ACTOR_NOW();
+                printf("[NET][SHOP] client: refresh reload at the player's position (%d,%d)\n", rpl != NULL ? (int)rpl->actor_class.world.position.x : -1,
+                       rpl != NULL ? (int)rpl->actor_class.world.position.z : -1);
+            }
             s_up.c_refresh_level = -1;
             s_shopup_refresh_why = "the shop was upgraded";
+            s_shopup_refresh_is_join = 0;
+            s_shopup_safe_since = 0;
+            s_shopup_defer_logged = 0;
             s_up.c_verify_ms = pcnetgame_now_ms() + 6000u;
             if (s_up.c_verify_ms == 0) {
                 s_up.c_verify_ms = 1;
@@ -48365,7 +48413,22 @@ static void pcnetgame_shopup_client_tick(void) {
         if (aSL_PC_ShopFootprint(s_up.c_target, &ac, &st, tl, 32) > 0) {
             (void)pcfa_get_tile(ac, st, &v);
         }
-        printf("[NET][SHOPUP] client: after the town reload the local structure tile acre %d tile %d = 0x%04X (shop level %d)\n", ac, st, (unsigned)v, mSP_GetShopLevel());
+        {
+            PLAYER_ACTOR* vpl = (gamePT != NULL && gamePT->exec == play_main && Common_Get(player_actor_exists)) ? GET_PLAYER_ACTOR_NOW() : NULL;
+            /* the live structure actor = the building on screen (0 = none yet: RSV_NO 0xFFFF = the structure clip reserved the tile, the actor's init writes DUMMY_SHOPn later) */
+            printf("[NET][SHOPUP] client: after the town reload the local structure tile acre %d tile %d = 0x%04X (shop level %d), player at (%d,%d), live shop actor 0x%04X\n", ac,
+                   st, (unsigned)v, mSP_GetShopLevel(), vpl != NULL ? (int)vpl->actor_class.world.position.x : -1, vpl != NULL ? (int)vpl->actor_class.world.position.z : -1,
+                   (unsigned)pc_town_shop_structure_npc());
+        }
+        {
+            static int s_verify_rechecked = 0; /* one more look 6 s later while the new structure actor is not up yet (its bank still loading) */
+            if (v == (uint16_t)RSV_NO && pc_town_shop_structure_npc() == 0 && !s_verify_rechecked) {
+                s_verify_rechecked = 1;
+                s_up.c_verify_ms = (pcnetgame_now_ms() + 6000u) | 1u;
+            } else {
+                s_verify_rechecked = 0;
+            }
+        }
     }
 #ifdef PC_NET_TEST_HOOKS
     {
@@ -48390,6 +48453,8 @@ static void pcnetgame_shopup_client_reset(void) {
     s_up.c_enabled = 0;
     s_up.req_active = 0;
     s_shopjoin_done = 0; /* shop building on join: checked again after the next session's first snapshot + service 3 */
+    s_shopup_safe_since = 0;
+    s_shopup_defer_logged = 0;
 }
 
 /* ---- public API (pc_shop_upgrade.h) ---- */
