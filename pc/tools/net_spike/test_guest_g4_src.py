@@ -163,7 +163,7 @@ def main():
        and not any(re.search(r"typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", BASELINE, "HEAD")[1])
        and hdr_removed_code("pc/include/pc_net_game.h", BASELINE, "HEAD") == ["#define PC_NETGAME_HOST_PLAYER_ID ((PCNetPlayerId)PC_NET_MAX_PEERS)"]
        and "#define PC_NETGAME_HOST_WIRE_ID 8" in S.read("pc/include/pc_net_game.h") and "#define PC_NET_RESERVED_PEER_ID 8" in S.read("pc/include/pc_net.h")
-       and hdr_additions_only("pc/include/pc_net_game.h", "HEAD")[0] == 0
+       and hdr_removed_code("pc/include/pc_net_game.h", "HEAD") == []  # code lines only: an uncommitted trailing-comment extension (talk-lease probe doc) removes/re-adds a comment line
        and not any(re.search(r"typedef|\bstruct\b|\benum\b", l) for l in hdr_additions_only("pc/include/pc_net_game.h", "HEAD")[1])
        and S.read("pc/include/pc_net_game.h").count("const char* pc_net_game_join_message(int* is_warning);") == 1
        and numstat("pc/src/pc_net.c") == (0, 0) and numstat("pc/include/pc_net.h") == (0, 0) and numstat("pc/src/pc_remote_player.c") == (0, 0))

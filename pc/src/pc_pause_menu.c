@@ -9,6 +9,7 @@
 #include "pc_net_game.h" /* batch A (A3): pc_net_game_client_notice_visible() */
 #include "pc_dresser_ui.h" /* 6q: the dresser screen's "Move" target hint */
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure / reopening notice */
+#include "pc_outdoor_furniture.h" /* outdoor furniture C1: the refusal notice of Place / Rotate / Pick up / leaf drop */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -345,6 +346,7 @@ void pc_net_notice_draw(struct game_s* game) {
                                   : edit_notice == 9 ? "Old drawer items were moved to your pockets"      /* 6r: residual vanilla keep items */
                                   : edit_notice == 10 ? "Make room in your pockets for the old drawer items"
                                   : edit_notice == 11 ? "That item can't be stored in a dresser"         /* 6r: grab swap / put predicate */
+                                  : edit_notice == 12 ? "Asking the host for your stored items..."       /* direct open: the host's view is on the way */
                                                      : "Leave the house to resync",
                                   62.0f, 255, 200, 90, 255, 1.0f);
             if (edit_notice == 5) { /* dresser storage 6l: an extra-slot transaction refused because the room holds uncommitted edits */
@@ -359,6 +361,15 @@ void pc_net_notice_draw(struct game_s* game) {
         if (pc_shop_upgrade_notice(up_line, (int)sizeof(up_line))) {
             mFont_SetMatrix(game->graph, mFont_MODE_FONT);
             pc_menu_draw_centered(game, up_line, 46.0f, 255, 230, 140, 255, 1.0f);
+            mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+        }
+    }
+    {
+        /* Outdoor furniture C1: why a Place / Rotate / Pick up / furniture leaf drop was refused, ~4 s (drawn in addition to the other notices). */
+        const char* of_line = pc_net_game_ofurn_notice();
+        if (of_line != NULL) {
+            mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+            pc_menu_draw_centered(game, of_line, 30.0f, 255, 200, 90, 255, 1.0f);
             mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
         }
     }

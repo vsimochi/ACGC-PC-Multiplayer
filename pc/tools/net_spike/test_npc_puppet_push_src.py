@@ -110,6 +110,51 @@ for _ in range(200):
 check(x_npc > 200 and abs((nr + 20) - (x_npc - x_p) - v * (1 - frac_npc) / frac_npc) < 0.5, "model: walking puppet pushes the villager ahead (moved %.1f)" % x_npc)
 check(oc_split(50, HEAVY)[1] == 0.0, "HEAVY (e.g. greeting) villager not pushed")
 
+# ---- (3) client stale fallback: a villager the host does not simulate runs the local AI (pushable) ------------------
+cc = re.search(r"static int aNPC_pc_is_client_consumer\(.*?\n\}\n", mv, re.S).group(0)
+i_auth = cc.find("pc_net_game_world_is_host_authoritative()")
+i_idx = cc.find("aNPC_get_animal_idx(nactorx) < 0")
+i_fb = cc.find("aNPC_pc_stale_fallback_local(nactorx)")
+i_lease = cc.find("aNPC_pc_talk_lease_active(nactorx)")
+check(0 <= i_auth < i_idx < i_fb < i_lease, "fallback only for READY-client regular villagers (event NPCs excluded first), evaluated before the talk lease")
+check(re.search(r"aNPC_pc_stale_fallback_local\(nactorx\)\) \{[^}]*return FALSE;", cc, re.S) is not None, "fallback -> not a consumer")
+fb = re.search(r"static int aNPC_pc_stale_fallback_local\(.*?\n\}\n", mv, re.S)
+check(fb is not None, "aNPC_pc_stale_fallback_local exists")
+fbb = fb.group(0) if fb else ""
+check("hide_flg != FALSE" in fbb and "pc_net_game_npc_talk_busy(slot, npc_id)" in fbb, "must_hold: hidden villager / another player's conversation")
+check("pc_net_game_npc_client_local_ai(slot, npc_id, actor_new, must_hold)" in fbb and "frame_counter" in fbb, "evaluated once per frame, actor (re)creation detected")
+# the non-consumer path IS the vanilla path: position integration + host-side push + schedule/action/angle
+check(sb.find("if (aNPC_pc_is_client_consumer(nactorx))") < i_held and "aNPC_position_move(actorx);" in sb[i_push:], "fallback (non-consumer) path calls aNPC_position_move")
+ms = re.search(r"static void aNPC_actor_move_show\(.*?\n\}\n", mv, re.S).group(0)
+check("if (!pc_client_consumer && !pc_talk_held)" in ms and ms.find("aNPC_schedule_proc(nactorx, play);") > 0 and "aNPC_angle_calc(nactorx);" in ms,
+      "fallback runs schedule/action/angle")
+check(ms.find("if (!pc_client_consumer) {") < ms.find("aNPC_pc_host_sample_move(nactorx);"), "fallback samples its pose (client: relay to the host)")
+ng = rd("pc/src/pc_net_game.c")
+la = re.search(r"int pc_net_game_npc_client_local_ai\(.*?\n\}\n", ng, re.S)
+check(la is not None, "pc_net_game_npc_client_local_ai exists")
+lab = la.group(0) if la else ""
+check("s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY" in lab and "pcnetgame_npc_fallback_on()" in lab, "client READY only + kill switch")
+check("host silent for %u ms -> local AI" in lab and "-> host (after %u ms local)" in lab, "one log line per transition")
+check("snapshot_count = 0" in lab, "a stale ring is cleared when the actor is (re)created")
+hc = re.search(r"static void pcnetgame_handle_client_npc_move\([^;{]*\{.*?\n\}\n", ng, re.S).group(0)
+check("pc_npc_auth_on_sample(&s_npc_auth[in->slot]" in hc, "every accepted NPC_MOVE refreshes the slot (fresh stream keeps consumer mode)")
+au = rd("pc/include/pc_npc_authority.h")
+for k, v in (("PC_NPC_AUTH_STALE_MS", 2500), ("PC_NPC_AUTH_GRACE_MS", 4000), ("PC_NPC_AUTH_FRESH_SAMPLES", 5), ("PC_NPC_TALK_HOLD_CAP_MS", 120000)):
+    check(re.search(r"#define %s %du" % (k, v), au) is not None, "%s == %d" % (k, v))
+hp2 = re.search(r"static void pcnetgame_handle_host_npc_proxy_move\([^;{]*\{.*?\n\}\n", ng, re.S)
+check(hp2 is not None, "host relay handler exists")
+hpb = hp2.group(0) if hp2 else ""
+check("PC_NPC_HOST_ACTOR_ALIVE_MS" in hpb and "pc_npc_proxy_offer(" in hpb and "i != (int)peer" in hpb, "relay: only without a host actor, one owner, never echoed to the owner")
+check("npc_id does not match the host animal table" in hpb and "not in the town field" in hpb, "relay validated")
+sw = re.search(r"static void pcnetgame_host_talk_hold_sweep\([^;{]*\{.*?\n\}\n", ng, re.S).group(0)
+check("pc_npc_talk_hold_capped(h->begin_ms, now, pcnetgame_talk_hold_cap_ms())" in sw and "pc_peer_set_add(&h->capped, p)" in sw, "hold cap releases and blocks keepalives")
+nt = re.search(r"static void pcnetgame_handle_host_npc_talk\([^;{]*\{.*?\n\}\n", ng, re.S).group(0)
+check(nt.find("pc_peer_set_has(&h->capped, peer)") >= 0 and "refused until its END" in nt, "capped peer's keepalive BEGIN refused")
+ma = rd("src/game/m_actor.c")
+check("actor->part == ACTOR_PART_NPC && pc_host_observer_active()" in ma and "Actor_pc_observer_npc_player_dist(actor);" in ma, "observer: NPC player distance to the nearest real player")
+tk = rd("src/actor/npc/ac_npc_talk.c_inc")
+check("mDemo_IS_ACTOR_TALKING((ACTOR*)a)" in tk and "return 2;" in tk, "keepalive probe distinguishes a visible conversation from a stuck talk state")
+
 if fails:
     print("FAIL: " + " | ".join(fails)); sys.exit(1)
 print("PASS")

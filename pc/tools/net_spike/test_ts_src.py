@@ -122,7 +122,7 @@ def main():
     check("M push: READY peers only; sends only when ts_sent_seq != the table seq and records the seq only after the send was queued (a failed send is retried next poll)",
           "s_host_peer_link[peer] != PC_NETGAME_LINK_READY" in push and "st->ts_sent_seq[svc] != s_ts_host[svc].seq" in push
           and push.index("pcnetgame_ts_send_to_peer(peer, svc)") < push.index("st->ts_sent_seq[svc] = s_ts_host[svc].seq;")
-          and "ts_sent_seq" in c_raw[c_raw.index("} PCNetGameHostPeerState;") - 900:c_raw.index("} PCNetGameHostPeerState;")])
+          and "ts_sent_seq" in c_raw[c_raw.index("} PCNetGameHostPeerState;") - 2400:c_raw.index("} PCNetGameHostPeerState;")])
     check("M a late join / reconnect needs no extra hook: reset_all_host_peer_state memsets the peer state (ts_sent_seq = 0), so the next poll pushes every service",
           "memset(&s_host_peer[peer], 0, sizeof(s_host_peer[peer]));" in func_body(c, "pcnetgame_reset_all_host_peer_state"))
     check("M host_ts_tick is called from the host section of pc_net_game_poll (after the record tick)",
@@ -191,8 +191,8 @@ def main():
           "(uint16_t)Save_Get(police_box).keep_items[pidx] != t->item" in ts and "PC_NETGAME_TXN_REASON_NOT_AVAILABLE" in ts
           and ts.index("Save_Get(police_box).keep_items[pidx] = (mActor_name_t)EMPTY_NO;") < ts.index("mPB_copy_itemBuf(Save_Get(police_box).keep_items);"))
     check("H the TS handler is the ONLY writer of museum_display / police_box on the host: mMmd_PC_RequestMuseumDisplayDonor( exists once in pc_net_game.c (this handler; the vanilla mMmd_RequestMuseumDisplay( never), "
-          "mPB_keep_item( only in the host snowman path and the TEST-ONLY seed hook, mPB_copy_itemBuf( once",
-          c.count("mMmd_PC_RequestMuseumDisplayDonor(") == 1 and c.count("mMmd_RequestMuseumDisplay(") == 0 and c.count("mPB_copy_itemBuf(") == 1 and len(re.findall(r"\bmPB_keep_item\(\(mActor_name_t\)", c)) == 2
+          "mPB_keep_item( only in the host snowman path, the TEST-ONLY seed hook and the host console outdoor-furniture remove (lost and found, then a police TS refresh + push), mPB_copy_itemBuf( once",
+          c.count("mMmd_PC_RequestMuseumDisplayDonor(") == 1 and c.count("mMmd_RequestMuseumDisplay(") == 0 and c.count("mPB_copy_itemBuf(") == 1 and len(re.findall(r"\bmPB_keep_item\(\(mActor_name_t\)", c)) == 3
           and "mPB_keep_item(" in func_body(hblk_raw, "pcnetgame_ts_test_seed_police") and "g_pc_ts_test_seed_police" in func_body(hblk_raw, "pcnetgame_ts_test_seed_police"))
     check("H the host's OWN resident is never written: the post-image gate uses pcnetgame_rec_txn_idx_ok(idx) BEFORE the service commit (the host's own players use the vanilla local path)",
           "!pcnetgame_rec_txn_idx_ok(idx)" in ts and ts.index("!pcnetgame_rec_txn_idx_ok(idx)") < ts.index("mMmd_PC_RequestMuseumDisplayDonor("))

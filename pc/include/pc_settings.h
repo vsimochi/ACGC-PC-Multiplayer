@@ -30,6 +30,13 @@ typedef struct {
     int personal_sync;    /* HOST only (personal data sync, diary): -1 = AUTO (default: on only while town_serve != off), 0 = off, 1 = on */
     int show_ping;        /* CLIENT only: 1 = show the round-trip time (ms) to the host while connected (default 0; F4 toggles it for the session) */
     int client_log;       /* hotfix 0.2.1 diagnostics, [Debug] client_log: 1 = this process's stdout / stderr go to client_log.txt next to the exe (append, rotated at 4 MB); default 0. Env AC_CLIENT_LOG=1 too. Not for --dedicated (it has servers/<id>/logs). */
+    int ofurn_place;      /* HOST only (outdoor furniture C1): 1 (default) = residents may PLACE furniture outdoors (model + rotation + collision), 0 = the Place action is off */
+    int ofurn_leaf_drop;  /* HOST only (outdoor furniture C1): 1 (default) = the vanilla furniture LEAF drop outdoors is accepted, 0 = the host refuses it with a notice */
+    int ofurn_max_town;   /* HOST only (outdoor furniture C1): technical SAFETY ceiling of placed pieces per town (default 512, 1..1024; not a gameplay limit) */
+    int ofurn_max_acre;   /* HOST only (outdoor furniture C1): technical SAFETY ceiling of placed pieces per acre (default 128, 1..256) */
+    int menu_world_live;  /* [Network] menu_world_live: 1 (default) = in a multiplayer session the world keeps running behind the inventory / submenus / Esc menu (m_play.c); 0 = vanilla freeze. Env AC_MP_MENU_WORLD=0|1 wins */
+    int npc_fallback;     /* CLIENT: 1 (default) = a villager the host does not simulate (no NPC_MOVE for 2.5 s) runs the local vanilla AI instead of standing still (pc_npc_authority.h); env AC_MP_NPC_FALLBACK=0 too */
+    int npc_relay;        /* BOTH: 1 (default) = such a villager's pose is relayed through the host to the other players (NPC_PROXY_MOVE); env AC_MP_NPC_RELAY=0 too */
     int town_serve;       /* HOST only (M-B): serve the town to pre-boot --town-fetch clients: -1 = AUTO (default: on for a --dedicated host, off otherwise), 0 = OFF, 1 = a SANITIZED copy (M-G), 2 = the full GCI (every resident's private data) */
 } PCSettings;
 

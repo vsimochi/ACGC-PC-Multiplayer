@@ -91,8 +91,13 @@ def run_ui_direct(args, results, ip, rig):
     placement); the open demo's WAIT_MSG runs aMR_PcDresserDirectOpen.
       empty    : no extra item; the 27-slot screen opens DIRECTLY (no vanilla menu)
       occupied : one extra item (put-only round trip); the 27-slot screen opens directly and shows it
-      timeout  : the host ignores every SELECT (TEST-ONLY AC_TEST_DRESSER_IGNORE_SELECT): after 180 frames the VANILLA menu opens (fallback)
-      off      : the host feature is OFF (AC_MP_DRESSER_STORAGE=0): the vanilla menu opens at once, no direct-open line (byte-identical vanilla)"""
+      timeout  : the host ignores every SELECT (TEST-ONLY AC_TEST_DRESSER_IGNORE_SELECT): after the 3 s WALL-CLOCK cap the VANILLA menu opens (fallback,
+                 notice 6); the client runs UNCAPPED (--no-framelimit) so a frame-counted wait would fall back far earlier
+      off      : the host feature is OFF (AC_MP_DRESSER_STORAGE=0): the vanilla menu opens at once, no direct-open line (byte-identical vanilla)
+      reenter  : the user's bug: one extra item (put-only round trip), open + close, LEAVE the room, walk in again, A at once: the FIRST open of the new visit
+                 (selection + contents forgotten, a full SELECT -> STATE round trip) opens the 27-slot screen, never the vanilla menu (UNCAPPED client)
+      slow     : a SLOW host (TEST-ONLY AC_TEST_DRESSER_SELECT_DELAY_MS=1500) and an UNCAPPED client (--no-framelimit, fixture vsync = 0; the logged fps
+                 must be > 120): the direct open still succeeds after ~1.5 s, notice 12 ("Asking the host...") shown while waiting, exactly one 'adopted'"""
     check = rig.check
     variant = args.ui_direct
     residents = [i for i, _p, ex in L.read_test_save_residents() if ex and i != L.TEST_HOST_RESIDENT]
@@ -100,6 +105,8 @@ def run_ui_direct(args, results, ip, rig):
     host_env = {"AC_TEST_DRESSER_ANY_SCENE": "1"}
     if variant == "timeout":
         host_env["AC_TEST_DRESSER_IGNORE_SELECT"] = "1"
+    if variant == "slow":
+        host_env["AC_TEST_DRESSER_SELECT_DELAY_MS"] = "1500"
     if variant == "off":
         host_env["AC_MP_DRESSER_STORAGE"] = "0"
     saved = {k: os.environ.get(k) for k in host_env}
@@ -119,18 +126,27 @@ def run_ui_direct(args, results, ip, rig):
         env["AC_TEST_HCL_NO_INROOM_COMMIT"] = "1"
     if variant == "moved":
         env["AC_TEST_HCL_HOLD_MS"] = "9000"  # in-room commits held 12 s after the placement: A in between must meet the notice-4 refusal (cap 8 s from the first refusal)
-    if variant == "occupied":
+    if variant in ("occupied", "reenter"):
         env["AC_TEST_DRESSER_ROUNDTRIP"] = "put"
+    if variant == "reenter":
+        env["AC_TEST_DRESSER_UI_REENTER"] = "1"
     os.environ.update(env)
-    cl = rig.start_client("dresserdirect", args.port, residents[0], [])
+    # frame-rate independence: the timing variants run the client UNCAPPED (the user's settings: vsync 0, max_fps 0); the fixture's settings.ini has vsync = 0
+    uncapped = variant in ("timeout", "reenter", "slow")
+    cl = rig.start_client("dresserdirect", args.port, residents[0], ["--no-framelimit"] if uncapped else [])
     for k in env:
         os.environ.pop(k, None)
     check("real client booted into the field and connected", cl is not None)
     if cl is None:
         return
-    cl.wait_for_log(r"ui: leaving the room|direct: nothing opened|ui: SKIPPED", 480.0)
+    if variant == "reenter":
+        cl.wait_for_log(r"ui: reenter: second visit done|direct: nothing opened|ui: SKIPPED", 600.0)
+    else:
+        cl.wait_for_log(r"ui: leaving the room|direct: nothing opened|ui: SKIPPED", 480.0)
     L.pump_sleep(4.0)
     text, ht = cl.log_text(), host.log_text()
+    fps = [int(x) for x in re.findall(r"direct open: dresser 0x[0-9A-F]{4} .* -> 27-slot screen after \d+ frame\(s\), \d+ ms \(~(\d+) fps\)", text)]
+    fb = [(int(a), int(b)) for a, b in re.findall(r"direct open: no host view of dresser 0x[0-9A-F]{4} after (\d+) ms \((\d+) frames\)", text)]
     if variant in ("moved", "moved-stuck"):
         opens = re.findall(r"direct open: dresser 0x%04X \(floor 0 cell (\d+),(\d+)\) -> 27-slot screen" % CHEST, text)
         mm = re.search(r"moved: the chest now stands at cell (\d+),(\d+)", text)
@@ -160,9 +176,36 @@ def run_ui_direct(args, results, ip, rig):
         check("D-3 %s: the screen shows %d extra item(s)" % (variant, n), "direct: the 27-slot screen is OPEN (%d extra item(s))" % n in text)
     elif variant == "timeout":
         check("D-1 timeout: the host ignored the SELECT", "DRESSER_SELECT of peer" in ht and "ignored" in ht)
-        check("D-2 timeout: after 180 frames the VANILLA menu opened (fallback; the furniture stays usable)",
-              re.search(r"direct open: no host view of dresser 0x%04X after \d+ frames -> the vanilla menu \(fallback\)" % CHEST, text) is not None and
-              "direct: the VANILLA dresser menu opened" in text)
+        check("D-2 timeout: after the 3 s WALL-CLOCK cap (not a frame count) the VANILLA menu opened (fallback; the furniture stays usable) (%s)" % (fb,),
+              len(fb) == 1 and 3000 <= fb[0][0] < 4500 and "direct: the VANILLA dresser menu opened" in text)
+        check("D-2b timeout: the client really ran uncapped (%s frames in %s ms > 2 x 180)" % (fb[0][1] if fb else None, fb[0][0] if fb else None),
+              len(fb) == 1 and fb[0][1] > 360)
+        check("D-2c timeout: notice 12 while waiting, then notice 6 at the fallback",
+              "waiting for the host's view of the dresser (asking the host) -> notice 12" in text and "no host view of the dresser in time -> the vanilla menu -> notice 6" in text)
+    elif variant == "reenter":
+        opens = re.findall(r"direct: the 27-slot screen is OPEN \((\d+) extra item\(s\)\) after \d+ frames, (\d+) ms \(visit (\d+)\)", text)
+        m2 = re.search(r"ui: reenter: room visit (\d+) \(was (\d+)\)", text)
+        second = text[m2.start():] if m2 else ""
+        check("D-1 reenter: the first visit opened the 27-slot screen directly, the client left and walked in again (a NEW room visit) (%s; %s)" %
+              (opens, m2.group(0) if m2 else None), len(opens) >= 1 and m2 is not None and "room warp: re-armed" in text)
+        check("D-2 reenter: the FIRST open after re-entering opened the 27-slot screen showing the stored item (%s)" % (opens[1:],),
+              len(opens) == 2 and opens[1][0] == "1" and m2 is not None and opens[1][2] == m2.group(1))
+        check("D-3 reenter: no fallback / vanilla menu in either visit", "vanilla menu (fallback)" not in text and "the VANILLA dresser menu opened" not in text)
+        check("D-3b reenter: the second visit asked the host again (a new generation) and adopted its answer",
+              re.search(r"client: select dresser floor 0 .*\(gen \d+\)", second) is not None and " adopted" in second)
+        check("D-3c reenter: the client ran uncapped (fps %s)" % (fps,), len(fps) == 2 and min(fps) > 120)
+    elif variant == "slow":
+        m = re.search(r"direct open: dresser 0x%04X .* -> 27-slot screen after (\d+) frame\(s\), (\d+) ms \(~(\d+) fps\)" % CHEST, text)
+        check("D-1 slow: the host held the SELECT 1.5 s", "DRESSER_SELECT of peer" in ht and "delayed 1500 ms" in ht and "is answered now" in ht)
+        check("D-2 slow: the direct open still opened the 27-slot screen after the slow answer (%s)" % (m.group(0) if m else None),
+              m is not None and int(m.group(2)) >= 1400 and "direct: the 27-slot screen is OPEN (0 extra item(s))" in text)
+        check("D-3 slow: the client ran UNCAPPED (%s fps > 120, %s frames > 180: the old frame-counted wait would have fallen back)" %
+              (m.group(3) if m else None, m.group(1) if m else None), m is not None and int(m.group(3)) > 120 and int(m.group(1)) > 180)
+        check("D-4 slow: notice 12 ('Asking the host...') was shown while waiting; no fallback, no vanilla menu",
+              "waiting for the host's view of the dresser (asking the host) -> notice 12" in text and "vanilla menu (fallback)" not in text and
+              "the VANILLA dresser menu opened" not in text)
+        check("D-5 slow: exactly one 'adopted' for the one open (the slow answer was not discarded / re-asked)",
+              len(re.findall(r"\[NET\]\[DRESSER\] client: dresser floor \d+ layer \d+ cell \d+,\d+ \(gen \d+\) rev \d+ adopted", text)) == 1)
     else:
         check("D-1 off: the vanilla menu opened at once, no direct-open line (byte-identical vanilla)",
               "direct: the VANILLA dresser menu opened" in text and "direct open:" not in text)
@@ -878,7 +921,8 @@ def main():
     ap.add_argument("--ui-ftr", choices=("empty", "prefill"), default=None, help="6o: furniture put + take through the real 27-slot screen (pad)")
     ap.add_argument("--ui-keepguard", action="store_true", help="6l: the client commit guard reverts the move of a chest holding a CANONICAL keep item")
     ap.add_argument("--ui-store", action="store_true", help="6l: vanilla put, refused extra put (notice 5), commit, extra put, take both")
-    ap.add_argument("--ui-direct", choices=("empty", "occupied", "timeout", "off", "moved", "moved-stuck"), default=None, help="direct open of the 27-slot screen by A (6f; written, not run)")
+    ap.add_argument("--ui-direct", choices=("empty", "occupied", "timeout", "off", "moved", "moved-stuck", "reenter", "slow"), default=None,
+                    help="direct open of the 27-slot screen by A (6f; reenter / slow / timeout: frame-rate independence on an uncapped client)")
     ap.add_argument("--ui-gyroid", action="store_true", help="the gyroid-style overlay in dresser mode, driven by scripted pad input")
     ap.add_argument("--ui-edit", action="store_true", help="three own-room visits (put / take / put+take) each followed by a furniture edit and an asserted APPLIED house commit")
     ap.add_argument("--ui", action="store_true", help="drive the dresser UI states in the client's own room instead of the sender-only round trip")

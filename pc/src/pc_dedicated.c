@@ -20,6 +20,7 @@
 #include "m_item_name.h"  /* mIN_copy_name_str(): the game's own item name tables (filled from the ROM by pc_assets_init) */
 #include "m_shop.h"       /* `shop-level-boost`: mSP_PlusSales / thresholds */
 #include "pc_shop_upgrade.h" /* `shop-upgrade`: the announced 5-minute shop upgrade state */
+#include "pc_outdoor_furniture.h" /* `op` / `deop` / `ops` / `furniture`: the operator list and the placed furniture (pc_net_game.c) */
 
 #include <stdarg.h>
 #include <ctype.h>
@@ -1113,9 +1114,12 @@ static void pc_ded_cmd_help(void) {
            "  day [status] | day roll now   the day rollover: game date, renew / growth dates, state (idle / due / deferred: why), last roll; 'roll now' skips the wait for players in buildings\n"
            "  event list|status [name]   today's event schedule from the game's own tables (scheduled / active / running); start|stop|reset are refused with the reason\n"
            "  wildlife list|info <id>   the host's authoritative wildlife records; wildlife spawn fish <species> <x> <z> / despawn <id> need AC_TEST_HOOKS=1\n"
+           "  npc | npc free <slot>   villagers: who simulates each one (host actor / client relay / nobody), last movement sample, conversation hold, position + acre; free = release a stuck conversation hold\n"
            "  test status|help   whether the test hooks are enabled and what they gate\n"
            "  shop-level-boost [confirm]   add the sales still missing to the NEXT shop tier once (mSP_PlusSales); Nook then announces the upgrade (5-minute closure)\n"
            "  shop-upgrade   the announced shop upgrade: state (IDLE / PENDING / CLOSED / RENEWING), level, qualifying level, time left\n"
+           "  ops | op <player> | deop <player>   the operator list (servers/<id>/ops.ini; player = an online name / a resident / a guest of this town, or `peer N`; ambiguous names are refused)\n"
+           "  furniture list [acre] | remove <x> <z>|#<index> [delete] | clear acre <n>|player <name> [delete]   furniture PLACED outdoors (removed pieces go to the lost and found unless `delete`)\n"
            "  tp / bell   unsupported on the server (no local player; no host bell admin API) -- see docs/console-commands.md\n"
            "  stop     graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit\n");
     pc_ded_flush();
@@ -2503,6 +2507,22 @@ static void pc_ded_execute(char* line) {
         }
         pc_shop_upgrade_describe(line, (int)sizeof(line));
         pc_ded_printf("SHOP-UPGRADE: %s\n", line);
+        pc_ded_flush();
+    } else if (strcmp(cmd, "ops") == 0 || strcmp(cmd, "op") == 0 || strcmp(cmd, "deop") == 0) {
+        /* outdoor furniture C1 / admin: the operator list (identity = the authenticated binding key, never the display name alone) */
+        char msg[1600];
+        char* sel = pc_ded_skip_ws(args);
+        const int op = strcmp(cmd, "ops") == 0 ? 0 : strcmp(cmd, "op") == 0 ? 1 : 2;
+        const int r = pc_net_game_dedicated_ops(op, sel != NULL ? sel : "", msg, (int)sizeof(msg));
+        pc_ded_printf("[DEDICATED] %s: %s%s\n", cmd, r ? "" : "REFUSED: ", msg);
+        PC_LOG(PCL_GENERAL, "dedicated: %s %s -> %s\n", cmd, sel != NULL ? sel : "", r ? "done" : "refused");
+        pc_ded_flush();
+    } else if (strcmp(cmd, "furniture") == 0) {
+        pc_net_game_dedicated_furniture(args, pc_ded_out_line); /* outdoor furniture C1: placed pieces (list / remove / clear) */
+        pc_ded_flush();
+    } else if (strcmp(cmd, "npc") == 0) {
+        pc_net_game_dedicated_npc(args, pc_ded_out_line); /* villager authority / stale fallback status, `npc free <slot>` */
+        PC_LOG(PCL_GENERAL, "dedicated: npc %s\n", args != NULL ? args : "");
         pc_ded_flush();
     } else if (strcmp(cmd, "tp") == 0 || strcmp(cmd, "bell") == 0) {
         pc_ded_printf("%s UNSUPPORTED on the dedicated server: %s\n", cmd, strcmp(cmd, "tp") == 0 ? "it has no local player, and a remote player's movement is owned by that client (the host never moves it)" : "bells are per-player save data with no host-side admin API in this build; use `give` for items");

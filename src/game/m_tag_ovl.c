@@ -34,6 +34,7 @@
 #include "pc_dresser_ui.h"
 extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
 #include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest copy for a guest, else now_home's; NULL-guarded) */
+#include "pc_outdoor_furniture.h" /* outdoor furniture C1: the "Place" tag (mTG_TYPE_76 on PC) and the leaf-drop policy */
 #define mTG_MAILBOX() pc_ui_mailbox()
 #define mTG_MAILBOX_USABLE() pc_ui_mailbox_usable()
 #else
@@ -272,6 +273,11 @@ static void mTG_pc_dresser_grab_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info
 static mTG_tag_word_c mTG_tag_word_pc_grab = { /* 6r (B): dresser mode: grab a stored item / a pocket item and place it on any cell or pocket */
     "Grab            ",
     &mTG_pc_dresser_grab_proc,
+};
+static void mTG_pc_ofurn_place_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info);
+static mTG_tag_word_c mTG_tag_word_pc_place = { /* outdoor furniture C1: place the furniture in front of the player (the real model, rotated, solid) */
+    "Place           ",
+    &mTG_pc_ofurn_place_proc,
 };
 #endif
 
@@ -657,6 +663,16 @@ static mTG_tag_word_c* mTG_field_default_bury[] = {
     &mTG_tag_word_zimenniumeru,
     &mTG_tag_word_yameru,
 };
+
+#ifdef TARGET_PC
+/* outdoor furniture C1: a furniture item in the town field of a multiplayer session where this player may Place (mTG_TYPE_76, an unused vanilla slot) */
+static mTG_tag_word_c* mTG_pc_field_ftr[] = {
+    &mTG_tag_word_tukamu,
+    &mTG_tag_word_pc_place,
+    &mTG_tag_word_zimennioku,
+    &mTG_tag_word_yameru,
+};
+#endif
 
 static mTG_tag_word_c* mTG_field_letter[] = {
     &mTG_tag_word_tukamu,
@@ -1191,7 +1207,11 @@ static mTG_tag_data_c mTG_label_table[] = {
     { mTG_field_balloon, ARRAY_COUNT(mTG_field_balloon) },                   /* mTG_TYPE_FIELD_BALLOON */
     { mTG_tag_nw_select_change, ARRAY_COUNT(mTG_tag_nw_select_change) },     /* mTG_TYPE_TAG_NW_SELECT_CHANGE */
     { mTG_tag_nw_select_put, ARRAY_COUNT(mTG_tag_nw_select_put) },           /* mTG_TYPE_TAG_NW_SELECT_PUT */
+#ifdef TARGET_PC
+    { mTG_pc_field_ftr, ARRAY_COUNT(mTG_pc_field_ftr) },                     /* mTG_TYPE_76 (unused in vanilla): PC outdoor furniture Grab / Place / Drop / Quit */
+#else
     { NULL, 0 },                                                             /* mTG_TYPE_76 */
+#endif
     { mTG_tag_password_item, ARRAY_COUNT(mTG_tag_password_item) },           /* mTG_TYPE_TAG_PASSWORD_ITEM */
 };
 
@@ -4329,6 +4349,11 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
             mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_FAMI);
         }
 #ifdef TARGET_PC
+        else if (ITEM_IS_FTR(put_item) && Common_Get(field_type) == mFI_FIELDTYPE2_FG && menu_info->data0 != 13 && !pc_net_game_ofurn_leaf_drop_ok()) {
+            /* outdoor furniture C1: this host has outdoor_furniture_leaf_drop = 0 (a client: the host's announcement): furniture is not dropped as a leaf outside */
+            pc_net_game_ofurn_notice_text("Dropping furniture outside is off on this server");
+            mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        }
         else if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
             /* Stage 5B-1: a network client never runs the vanilla mutation below directly -- the
              * host is the authority on the shared field. This still lets vanilla's own,
@@ -4418,6 +4443,32 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         }
     }
 }
+
+#ifdef TARGET_PC
+/* outdoor furniture C1: "Place": the tile in front of the player, the piece facing the player (pc_outdoor_furniture.h). The host decides (a client: TXN_COMMIT kind 22;
+ * the pocket empties only on APPLIED); a refusal shows the vanilla "can't put that there" window plus a notice line saying why. The pickup-exchange screen (data0 13)
+ * keeps the vanilla drop. */
+static void mTG_pc_ofurn_place_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    ACTOR* player = GET_PLAYER_ACTOR_ACTOR(play);
+    mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
+    int idx = mTG_get_table_idx(tag);
+    mActor_name_t item = Now_Private->inventory.pockets[idx];
+    int ux, uz;
+
+    if (menu_info->data0 == 13 || player == NULL) {
+        mTG_field_put_proc(submenu, menu_info);
+        return;
+    }
+    pc_ofurn_front_tile(player->world.position.x, player->world.position.z, (int)player->shape_info.rotation.y, &ux, &uz);
+    if (pc_net_game_ofurn_place(idx, (int)item, ux, uz, pc_ofurn_rot_for_facing((int)player->shape_info.rotation.y))) {
+        mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+        mTG_close_window(submenu, menu_info, FALSE);
+    } else {
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+    }
+}
+#endif
 
 static void mTG_room_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     GAME_PLAY* play = (GAME_PLAY*)gamePT;
@@ -7438,6 +7489,15 @@ static int mTG_select_tag_decide_item_normal(Submenu* submenu, mActor_name_t ite
             ret_tag_type = mTG_TYPE_FIELD_PLANT_JOB;
         }
     }
+
+#ifdef TARGET_PC
+    /* outdoor furniture C1: a plain furniture item in the town field (no shovel menu) gets "Place" next to the vanilla "Drop" when this player may place (the listen
+     * host / a resident of a host that announced service 10); everyone else keeps the vanilla menu */
+    if (ret_tag_type == mTG_TYPE_FIELD_DEFAULT && (type == NAME_TYPE_FTR0 || type == NAME_TYPE_FTR1) && Common_Get(field_type) == mFI_FIELDTYPE2_FG &&
+        (item_cond & (mPr_ITEM_COND_PRESENT | mPr_ITEM_COND_QUEST)) == 0 && pc_net_game_ofurn_place_offer((int)item)) {
+        ret_tag_type = mTG_TYPE_76;
+    }
+#endif
 
     return ret_tag_type;
 }

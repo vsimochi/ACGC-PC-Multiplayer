@@ -44,7 +44,8 @@ HOST_ONLY = ("PCNetGameHostPeerState", "PCNetGameIdentityClass", "PCNetGameRecRa
              "PCNetRoomNpcLease",
              "PCNetWorkChar", "PCNetWorkJobDef", "PCNetWorkMirror",
              "PCNetGameGuestMbox", "PCNetGameGuestSinkCtx",
-             "PCNetGameGevBye", "PCNetGameGevCtx")  # letters to guests: the host's goodbye-letter queue entry / the event sink context (local, never on the wire)
+             "PCNetGameGevBye", "PCNetGameGevCtx",
+             "PCNetGameNpcTalkOut")  # villager stale fallback: the client keepalive record gained `misses` (local, never on the wire)  # letters to guests: the host's goodbye-letter queue entry / the event sink context (local, never on the wire)
              # guest mailbox (above):  # guest mailbox: the host's per-guest mailbox table entry / the villager-reply sink context (local, never on the wire)  # indoor villagers: the host's per-room pose lease (local, never on the wire)  # furniture sync: the host's canonical house copy / the client's house state (local, never on the wire)
 # Client-only (never on the wire) structs that a reviewed change DELETED: absent from the current tree is the only acceptable state
 # (it must not come back changed). X1b: the M9-D G2-3 committed-bury claim record, replaced by the host-transactional commit.
@@ -68,14 +69,15 @@ EXPECTED_MAX_MSG_ID = 76
 # range and may be present or absent while workers land: 77 TREE_DROP, 78 SHOP_PREVIEW, 79 / 80 ball, 81 BEE_SWARM, 82 bees spare,
 # 83 / 84 dresser storage, 85 SHOP_UPGRADE_REQ (the announced 5-minute shop upgrade, client -> host, 8 B; deliberate, no protocol bump).
 # Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
-SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
+SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98, 99)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
 # player-vs-player tool hits (deliberate, no protocol bump): 91 PVP_HIT_REQ (client -> host, 16 B), 92 PVP_HIT (host -> the victim only, 12 B); the
 # wire structs are PCPvpHitReqMsg / PCPvpHitMsg in pc/include/pc_pvp_authority.h (pinned by test_pvp_src.py, size _Static_asserts 16 / 12)
 # worker A (deliberate, no protocol bump): 86 WILDLIFE_TOOL_ACTION (client -> host, 8 B, latent bugs), 87 GHOST_HUNT (client -> host, 4 B, spirit hunt)
 # puppet fidelity sprint (deliberate, no protocol bump): 96 ACTION_EXT (worker P2: owner -> host -> same-scene READY peers, 16 B, PCActionExtMsg in
 # pc/include/pc_action_ext.h, pinned by test_action_ext_src.py), 97 BOBBER_VIEW (worker P3), 98 reserved for worker P1 (optional). 93-95 stay unused.
+# villager stale fallback (deliberate, no protocol bump): 99 NPC_PROXY_MOVE (client -> host ONLY, UNRELIABLE, 28 B = the PCNetGameNpcMoveMsg layout; the host relays it as NPC_MOVE).
 SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*|ShopUpgradeReq|VillagerOutfit|WildlifeToolAction|GhostHunt)Msg|PCNetGameOutfitWire"  # worker B: VILLAGER_OUTFIT; worker A: 86 / 87
-_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-8])\s*,?"
+_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-9])\s*,?"
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -198,7 +200,9 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              # letters to guests (deliberate): service 7 = GUEST_DIR (324-byte directory blob), array bound 8; an old client ignores service 7
              # worker B (deliberate): service 8 = MUSEUM_DONORS (284-byte guest donor names), array bound 9; an old client ignores service 8
              # worker E (deliberate): service 9 = EVNPC_CAPS (8-byte shared event NPC capability), array bound 10; an old client ignores service 9
-             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      10u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             # outdoor furniture C1 (deliberate): service 10 = OFURN_CAPS (8-byte capability blob), array bound 11; an old client ignores service 10
+             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      11u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             "#define PC_NETGAME_TS_OFURN_LEN 8u",
              "#define PC_NETGAME_TS_MDONORS  8u", "#define PC_NETGAME_TS_EVNPC    9u", "#define PC_NETGAME_TS_EVNPC_LEN 8u", "#define PC_NETGAME_TS_MDONORS_LEN (4u + 120u + PC_NETGAME_MDONORS_NAMES * 20u) /* 284 (worker B) */",
              "#define PC_NETGAME_TS_GUESTDIR 7u", "#define PC_NETGAME_TS_GUESTDIR_LEN (4u + PC_NETGAME_GUESTDIR_MAX * 20u) /* 324 */", "#define PC_NETGAME_GUESTDIR_MAX   16u",
              "#define PC_NETGAME_TS_UPGRADE  6u", "#define PC_NETGAME_TS_UPGRADE_LEN 16u",
@@ -404,6 +408,16 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_EVC_CHANGED": '52',
     "PC_NETGAME_TXN_REASON_EVC_OFF": '53',
     "PC_NETGAME_TXN_REASON_EVC_NO_SPIRITS": '54',
+    # outdoor furniture C1 (deliberate, v8 extended in place): TXN_COMMIT kind 22 OUTDOOR_FURNITURE + reasons 55..61 (no new commit message, no layout change;
+    # message 98 OUTDOOR_FURN is host -> client presentation / UI only, town service 10 OFURN_CAPS an 8-byte blob of the pinned TOWN_SVC_STATE)
+    "PC_NETGAME_TXN_KIND_OUTDOOR_FURN": '22',
+    "PC_NETGAME_TXN_REASON_OFURN_OFF": '55',
+    "PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED": '56',
+    "PC_NETGAME_TXN_REASON_OFURN_TOO_BIG": '57',
+    "PC_NETGAME_TXN_REASON_OFURN_BAD_TILE": '58',
+    "PC_NETGAME_TXN_REASON_OFURN_LIMIT": '59',
+    "PC_NETGAME_TXN_REASON_OFURN_RATE": '60',
+    "PC_NETGAME_TXN_REASON_OFURN_GONE": '61',
     "PC_NETGAME_MBOX_HOUSE_GUEST": '0xFF',
     "PC_NETGAME_HOUSE_AUTO": '0xFF',
     "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',

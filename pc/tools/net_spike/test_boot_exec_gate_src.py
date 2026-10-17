@@ -97,6 +97,13 @@ GUARDS = {
     ("pc_wildlife_authority.c", "pcwld_client_rematerialize"): "reached only for an entity that has a presentation slot with a (culled) local actor; pl == NULL -> return",
     ("pc_net_game.c", "pcnetgame_house_client_commit_tick"): "verbose-only diagnostic log argument (not code use): reached only when s_hcl.last_own_unsafe, which pcnetgame_local_house_unsafe() sets only under gamePT->exec == play_main; the same line already guards gamePT != NULL",
     ("pc_wildlife_authority.c", "pcwld_trace_positions"): "TRACE only (PC_WILDLIFE_TRACE logging): behind pcfa_scene_is_town(); the actor read is a log argument",
+    # Landed by the PvP / action-ext / outdoor-furniture / day-roll sprints (each reviewed, all exec-gated before use):
+    ("pc_day_roll_host.c", "pc_dr_gate_in"): "the actor read sits inside `if (gamePT != NULL && gamePT->exec == play_main) {`",
+    ("pc_net_game.c", "pcnetgame_aext_tick"): "the entry condition includes gamePT == NULL || gamePT->exec != play_main -> return, before the read",
+    ("pc_net_game.c", "pcnetgame_pvp_host_tick"): "the read is inside `!pc_host_observer_active() && gamePT != NULL && gamePT->exec == play_main`",
+    ("pc_net_game.c", "pcnetgame_pvp_view"): "early return unless HOST role, not observer and gamePT->exec == play_main, before the read",
+    ("pc_net_game.c", "pcnetgame_ofurn_local_tile"): "outdoor furniture: the read is followed by pcnetgame_is_real_player_actor(pl) (exec-gated) before any use",
+    ("pc_net_game.c", "pcnetgame_ofurn_test_hook"): "TEST-ONLY env-armed hook (AC_TEST_OFURN): gamePT != NULL && pcfa_scene_is_town(), and the read is followed by pcnetgame_is_real_player_actor(pl) (exec-gated)",
 }
 
 

@@ -100,7 +100,8 @@ def main():
     # The header may GAIN prototypes / #defines from the master-sprint workers landing in the same tree (dresser, ball, bees ...); the wire contract is: nothing REMOVED or changed, no new
     # typedef / struct / enum (wire_baseline above pins every HEAD typedef block and #define of the header).
     diff_h = subprocess.run(["git", "-C", ROOT, "diff", "-U0", "--ignore-cr-at-eol", "HEAD", "--", "pc/include/pc_net_game.h"], capture_output=True, timeout=60).stdout.decode("utf-8", "replace").splitlines()
-    rem_h = [l for l in diff_h if l.startswith("-") and not l.startswith("---")]
+    # a removed COMMENT line is tolerated (a doc comment extended in place re-adds its text as a longer line)
+    rem_h = [l for l in diff_h if l.startswith("-") and not l.startswith("---") and not l[1:].strip().startswith(("/*", "*", "//"))]
     add_h = [l[1:] for l in diff_h if l.startswith("+") and not l.startswith("+++")]
     ck("E pc_net_game.h only GAINED lines vs HEAD (nothing removed / changed; no added typedef / struct / enum): the wire header's contract is untouched",
        not rem_h and not any(re.search(r"typedef|\bstruct\b|\benum\b", l) for l in add_h if not l.strip().startswith(("/*", "*", "//"))))

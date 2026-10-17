@@ -130,10 +130,66 @@ def main():
     check("6f direct open: only owner / own house (no NPC house) / feature on / item storage / not edit-locked; vanilla otherwise",
           "if (!aMR_PcDresserOn() || !aMR_CheckRoomOwner(player_no, my_room) || Save_Get(scene_no) == SCENE_NPC_HOUSE || Save_Get(scene_no) == SCENE_COTTAGE_NPC ||" in do and
           "aMR_PcEditLocked() || !aMR_PcDresserIdent(my_room, ftr_actor, &floor, &ut_x, &ut_z, &item) || !aMR_pc_ftr_is_item_storage(item)) {\n        return FALSE;" in do)
-    check("6f direct open: waits for THIS dresser's host view (select first), opens the 27-slot screen, falls back to the vanilla menu after 180 frames",
-          "#define aMR_PC_DIRECT_OPEN_TIMEOUT 180" in mv and do.find("aMR_PcDresserSelectFtr(my_room, ftr_actor);") < do.find("pc_net_game_dresser_view_ready()") and
-          "my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_GYROID;" in do and "if (my_room->msg_timer <= aMR_PC_DIRECT_OPEN_TIMEOUT) {\n        return TRUE;" in do and
-          "-> the vanilla menu (fallback)" in do)
+    pm0 = open(os.path.join(ROOT, "pc", "src", "pc_pause_menu.c"), encoding="utf-8").read()
+    do_end = do.find("\n}\n")
+    do_b = do[:do_end]
+    check("6f direct open: waits for THIS dresser's host view (select first), opens the 27-slot screen, falls back to the vanilla menu at the WALL-CLOCK cap",
+          "#define aMR_PC_DIRECT_OPEN_TIMEOUT_MS 3000" in mv and do_b.find("aMR_PcDresserSelectFtr(my_room, ftr_actor);") < do_b.find("pc_net_game_dresser_view_ready()") and
+          "my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_GYROID;" in do_b and "if (waited < aMR_PC_DIRECT_OPEN_TIMEOUT_MS) {" in do_b and
+          "-> the vanilla menu (fallback)" in do_b)
+    # ---- frame-rate independence (the user's "first open after re-entering falls back to the vanilla menu" on an UNCAPPED client)
+    check("FR1 direct open is TIME-based: no frame constant (aMR_PC_DIRECT_OPEN_TIMEOUT / msg_timer compare) decides the fallback; the wait is "
+          "pc_net_game_now_ms() - t0 (signed), t0 restarts with each open demo (msg_timer <= 1) or another piece",
+          "#define aMR_PC_DIRECT_OPEN_TIMEOUT 180" not in mv and "aMR_PC_DIRECT_OPEN_TIMEOUT)" not in mv and
+          re.search(r"msg_timer\s*(<=|<|>|>=)\s*aMR_PC", do_b) is None and "now = pc_net_game_now_ms();" in do_b and
+          "waited = (int)(s32)(now - aMR_pc_direct_t0);" in do_b and
+          "if (my_room->msg_timer <= 1 || aMR_pc_direct_t0 == 0 || aMR_pc_direct_ftr != ftr_actor) {" in do_b)
+    check("FR2 direct open: notice 12 ('Asking the host...') after aMR_PC_DIRECT_OPEN_NOTICE_MS (500), cleared when the view arrives; notice 6 at the cap; "
+          "the pause menu draws notice 12",
+          "#define aMR_PC_DIRECT_OPEN_NOTICE_MS 500" in mv and "if (waited >= aMR_PC_DIRECT_OPEN_NOTICE_MS) {\n            pc_net_game_dresser_open_wait_notice(1);" in do_b and
+          "pc_net_game_dresser_open_wait_notice(0);" in do_b and "pc_net_game_dresser_open_wait_notice(2);" in do_b and
+          do_b.find("pc_net_game_dresser_open_wait_notice(2);") > do_b.find("-> the vanilla menu (fallback)") and
+          'edit_notice == 12 ? "Asking the host for your stored items..."' in pm0 and
+          'pcnetgame_dresser_refuse_notice(12, "direct open: waiting' in ng and 'pcnetgame_dresser_refuse_notice(6, "direct open: no host view' in ng)
+    check("FR3 direct open of an UNCOMMITTED dresser (row 5) is never silent: pc_net_game_dresser_direct_uncommitted logs + notice 4 (saving) / 2 (stopped), "
+          "then the vanilla menu",
+          "pc_net_game_dresser_direct_uncommitted(item, ut_x, ut_z);\n        return FALSE;" in do_b and
+          "void pc_net_game_dresser_direct_uncommitted(int ftr_item, int ut_x, int ut_z) {" in ng and
+          "its move is not committed (%s) -> the vanilla menu (notice %d)" in ng)
+    sf = mc[mc.find("static void aMR_PcDresserSelectFtr(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor) {"):]
+    sf = sf[:sf.find("\n}\n")]
+    check("FR4 the SELECT re-ask is TIME-based (3 s since the last SELECT, pc_net_game_now_ms), no per-frame counter",
+          "++waited" not in sf and "(s32)(pc_net_game_now_ms() - asked_ms) < 3000" in sf and "asked_ms = pc_net_game_now_ms() | 1u;" in sf)
+    sel = ng[ng.find("int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr_item) {"):]
+    sel = sel[:sel.find("\n}\n")]
+    check("FR5 a re-ask of the SAME piece in the same visit while unanswered KEEPS the generation (a slow answer is adopted, never discarded); any other "
+          "selection bumps it and forgets the view",
+          "reask = s_dresser_cli_gen != 0 && !pc_net_game_dresser_view_ready() && s_dresser_ask_visit == s_dresser_visit" in sel and
+          "if (!reask) {\n        s_dresser_cli_gen = (uint8_t)(s_dresser_cli_gen == 255 ? 1 : s_dresser_cli_gen + 1);\n        s_dresser_cli_valid = 0;" in sel and
+          "s_dresser_ask_key[4] = ftr_item & ~3;" in sel and ", re-ask: same generation" in sel)
+
+    def model_select(seq):
+        """model of the client gen logic: seq of ('ask', key, visit) / ('ans', gen); returns adopted gens"""
+        gen, valid, akey, avisit, adopted = 0, False, None, None, []
+        for ev in seq:
+            if ev[0] == "ask":
+                reask = gen != 0 and not valid and avisit == ev[2] and akey == ev[1]
+                if not reask:
+                    gen = 1 if gen == 255 else gen + 1
+                    valid, akey, avisit = False, ev[1], ev[2]
+            else:
+                if ev[1] == gen:
+                    valid = True
+                    adopted.append(ev[1])
+        return adopted
+    m_slow = model_select([("ask", "A", 1), ("ask", "A", 1), ("ans", 1), ("ans", 1)])
+    m_other = model_select([("ask", "A", 1), ("ask", "B", 1), ("ans", 1), ("ans", 2)])
+    m_visit = model_select([("ask", "A", 1), ("ask", "A", 2), ("ans", 1), ("ans", 2)])
+    check("FR6 model: slow answer + same-piece re-ask -> adopted (%s); another piece -> the old answer is ignored (%s); a new visit -> a new gen (%s)" %
+          (m_slow, m_other, m_visit), m_slow[:1] == [1] and m_other == [2] and m_visit == [2])
+    check("FR7 TEST-ONLY slow host AC_TEST_DRESSER_SELECT_DELAY_MS (PC_NET_TEST_HOOKS only): the SELECT is held and answered by the real handler later",
+          "AC_TEST_DRESSER_SELECT_DELAY_MS" in ng and "static void pcnetgame_dresser_delay_tick(void) {" in ng and
+          "#ifdef PC_NET_TEST_HOOKS\n        pcnetgame_dresser_delay_tick();" in ng)
     dm = mv[mv.find("static void aMR_SetFtrDemoMsg("):]
     check("6f direct open: called first in the open demo's WAIT_MSG (before the vanilla OWNER_* message choice)",
           0 <= dm.find("if (aMR_PcDresserDirectOpen(my_room, ftr_actor, player_no)) {") < dm.find("if (aMR_GetItemCountInFurniture(ftr_actor) <= 0) {"))
@@ -186,7 +242,9 @@ def main():
     check("6j open gate: before any open demo, an own item-storage piece whose cell is NOT in the host's canonical image is refused for now (notice 4); "
           "direct open never SELECTs an uncommitted cell (vanilla instead); the 8 s cap / stopped in-room commits fall back to the vanilla menu",
           0 <= jd.find("aMR_PcDresserOpenRefused(my_room, ftr_actor)) {") < jd.find("aMR_SetOpenFtrDemoData(my_room, ftr_actor, contact_info);") and
-          "pc_net_game_dresser_cell_committed(floor, ftr_actor->layer, ut_x, ut_z, item) == 0) {\n        return FALSE;" in mv and
+          "pc_net_game_dresser_cell_committed(floor, ftr_actor->layer, ut_x, ut_z, item) == 0) {" in do_b and
+          do_b.find("pc_net_game_dresser_direct_uncommitted(item, ut_x, ut_z);\n        return FALSE;") > do_b.find("pc_net_game_dresser_cell_committed(floor, ftr_actor->layer") and
+          do_b.find("pc_net_game_dresser_direct_uncommitted(item, ut_x, ut_z);") < do_b.find("aMR_PcDresserSelectFtr(my_room, ftr_actor);") and
           "if ((int32_t)(now - first_ms) >= 8000) {" in ng and "if (!s_hcl.room_base_valid || s_hcl.room_stopped || s_hcl.rollback) {" in ng and
           "return 4; /* \"The room is being saved\" */" in ng)
     # ---- 6l: 27-slot lock (the vanilla keep slots count too: host step 9b on the PRE-commit image, client guard, client gates) + truthful notices
@@ -252,7 +310,7 @@ def main():
           bb.count("s_dresser_block_kind = 5;") == 1 and 'why = "the room holds uncommitted edits";\n        s_dresser_block_kind = 5;' in bb and
           "if (edit_notice == 5) {" in pm)
     check("N8 the latest refusal wins: notice 3 (move_denied) and the open gate's notice 4 clear the refusal notice; room_edit_notice returns it first",
-          "s_dresser_refuse_ms = 0; /* 6l: the latest refusal wins */" in md and ng.count("s_dresser_refuse_ms = 0; /* 6l: the latest refusal wins */") == 3 and
+          "s_dresser_refuse_ms = 0; /* 6l: the latest refusal wins */" in md and ng.count("s_dresser_refuse_ms = 0; /* 6l: the latest refusal wins */") == 4 and
           rn.find("return s_dresser_refuse_kind;") < rn.find("return 4;") < rn.find("return 3;") and
           "(int32_t)(pcnetgame_now_ms() - s_dresser_refuse_ms) < 3000" in rn)  # signed: a stamp of now | 1 read in the same ms is shown, not expired
     # ---- same-millisecond notice ages: every stamp is now | 1 (up to 1 ms AHEAD of a read in the same ms); all four ages are SIGNED compares
@@ -311,9 +369,10 @@ def main():
     dui = open(os.path.join(ROOT, "pc", "src", "pc_dresser_ui.c"), encoding="utf-8").read()
     pl_ = body(dui, "int pc_dresser_ui_poll(void) {")
     check("6p deferral: ONLY a refusal of kind 5 (uncommitted room edits) defers (pending, notice 4); the poll retries begin until it is SENT or gives up after "
-          "PC_DRESSER_UI_DEFER_POLLS (REFUSED, nothing moved); closing the screen drops an unsent deferred op; every other refusal stays REFUSED",
+          "PC_DRESSER_UI_DEFER_MS of WALL-CLOCK (10 s; REFUSED, nothing moved); closing the screen drops an unsent deferred op; every other refusal stays REFUSED",
           "if (r < 0 && pc_net_game_dresser_last_block() == 5) {" in dui and "pc_net_game_saving_notice();" in dui and
-          "if (b < 0 && pc_net_game_dresser_last_block() == 5 && ++s_defer.polls < PC_DRESSER_UI_DEFER_POLLS) {" in pl_ and
+          "if (b < 0 && pc_net_game_dresser_last_block() == 5 && (int32_t)(pc_net_game_now_ms() - s_defer.t0) < PC_DRESSER_UI_DEFER_MS) {" in pl_ and
+          "#define PC_DRESSER_UI_DEFER_MS 10000" in dui and "s_defer.t0 = pc_net_game_now_ms() | 1u;" in dui and "PC_DRESSER_UI_DEFER_POLLS" not in dui and
           "return PC_DRESSER_UI_ACT_REFUSED;" in pl_ and "not sent: dropped (nothing moved)" in dui and
           dui.count("const int r = pc_dresser_ui_begin_or_defer(op, index, pocket, item);") == 1 and "s_dresser_last_block = k;" in ng and "s_dresser_last_block = 0;" in ng)
     hwf = body(open(os.path.join(ROOT, "src", "game", "m_haniwa_ovl.c"), encoding="utf-8").read(), "static void mHW_set_frame_dl(Submenu* submenu, GRAPH* graph, f32 pos_x, f32 pos_y) {")

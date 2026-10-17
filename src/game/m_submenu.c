@@ -67,9 +67,38 @@ static int mSM_pc_th_want_open(void) {
     return (unsigned)(now - s_pc_th_sm_t0) >= after_ms;
 }
 
+/* TEST-ONLY, any role (the autopilot command "submenu TYPE|close", pc_net_game.c, PC_NET_TEST_HOOKS builds with AC_TEST_AUTOPILOT;
+ * nothing else ever writes it): > 0 = open submenu TYPE (mSM_OVL_*) from free play at the next chance, -1 = close the open one through
+ * its overlay's own close path. Opens and closes log "[TEST][SUBMENU] <role> menu T OPEN|CLOSED pockets_sum=..." for the
+ * "world keeps running behind menus" tests (test_menu_world_live_real.py). Always 0 in normal play. */
+int g_pc_th_submenu_req = 0;
+static int s_pc_th_ap_type = 0; /* the menu the autopilot opened (0 = none) */
+
+static int mSM_pc_th_ap_close_dir(int type) {
+    switch (type) {
+        case mSM_OVL_INVENTORY:
+            return mSM_MOVE_OUT_RIGHT;
+        default:
+            return mSM_MOVE_OUT_TOP; /* map, notice board, calendar */
+    }
+}
+
+static const char* mSM_pc_th_role(void) {
+    return pc_net_game_role() == PC_NETGAME_ROLE_HOST ? "host" : pc_net_game_role() == PC_NETGAME_ROLE_CLIENT ? "client" : "single";
+}
+
 static void mSM_pc_th_play_tick(Submenu* submenu) {
     mSM_MenuInfo_c* mi;
 
+    if (g_pc_th_submenu_req == -1 && s_pc_th_ap_type != 0 && submenu->overlay != NULL &&
+        submenu->menu_type == s_pc_th_ap_type) {
+        mi = &submenu->overlay->menu_info[s_pc_th_ap_type];
+        if (mi->proc_status == mSM_OVL_PROC_PLAY) {
+            submenu->overlay->move_chg_base_proc(mi, mSM_pc_th_ap_close_dir(s_pc_th_ap_type));
+            g_pc_th_submenu_req = 0;
+            printf("[TEST][SUBMENU] %s menu %d close requested\n", mSM_pc_th_role(), s_pc_th_ap_type);
+        }
+    }
     if (s_pc_th_sm_stage != 1 || submenu->menu_type != mSM_OVL_INVENTORY || submenu->overlay == NULL ||
         (unsigned)(pc_net_game_now_ms() - s_pc_th_sm_t_open) < s_pc_th_sm_hold) {
         return;
@@ -176,6 +205,39 @@ extern int mSM_CHECK_LAST_FISH_GET(int idx) {
 extern int SubmenuArea_IsPlayer() {
     return SubmenuArea_visit == &SubmenuArea_dlftbl[mSM_DLF_PLAYER_ACTOR];
 }
+
+#if defined(TARGET_PC)
+/* "World behind menus" (m_play.c live draw): drawing the live world while a submenu is open runs the player's draw through
+ * Player_actor_draw_call (m_player_call.c), whose load_player() relinks the shared GameCube "submenu area" to the player code. That
+ * would unlink the open submenu (mSM_submenu_draw then draws nothing, and every SubmenuArea_IsPlayer() check would flip). On PC the
+ * area is pure bookkeeping (nothing is loaded), so the live world draw is bracketed by save / restore of exactly that bookkeeping. */
+static struct {
+    int valid;
+    mSM_dlftbl_c dlftbl[mSM_DLF_NUM];
+    mSM_dlftbl_c* visit;
+    char* overlay_address;
+    char* next_overlay_address;
+} s_pc_area_save;
+
+extern void mSM_pc_area_save(Submenu* submenu) {
+    bcopy(SubmenuArea_dlftbl, s_pc_area_save.dlftbl, sizeof(SubmenuArea_dlftbl));
+    s_pc_area_save.visit = SubmenuArea_visit;
+    s_pc_area_save.overlay_address = (char*)submenu->overlay_address;
+    s_pc_area_save.next_overlay_address = (char*)submenu->next_overlay_address;
+    s_pc_area_save.valid = 1;
+}
+
+extern void mSM_pc_area_restore(Submenu* submenu) {
+    if (!s_pc_area_save.valid) {
+        return;
+    }
+    bcopy(s_pc_area_save.dlftbl, SubmenuArea_dlftbl, sizeof(SubmenuArea_dlftbl));
+    SubmenuArea_visit = s_pc_area_save.visit;
+    submenu->overlay_address = s_pc_area_save.overlay_address;
+    submenu->next_overlay_address = s_pc_area_save.next_overlay_address;
+    s_pc_area_save.valid = 0;
+}
+#endif
 
 static void mSM_load_player_anime(GAME_PLAY* play) {
     // stubbed
@@ -349,6 +411,23 @@ extern void mSM_submenu_ctrl(GAME_PLAY* play) {
         printf("[TEST][SUBMENU] host inventory OPEN pockets_sum=%08X ready_peers=%d\n", mSM_pc_th_pocket_sum(),
                pc_net_game_host_ready_peer_count());
     }
+    if (!open_inventory && g_pc_th_submenu_req > 0 && Common_Get(reset_flag) == FALSE && submenu->start_refuse == FALSE &&
+        submenu->start_refuse_timer == 0 && mPlib_able_submenu_type1((GAME*)play)) {
+        int t = g_pc_th_submenu_req;
+
+        g_pc_th_submenu_req = 0;
+        s_pc_th_ap_type = t;
+        if (t == mSM_OVL_MAP) {
+            mSM_open_submenu(submenu, mSM_OVL_MAP, 1, 0); /* as the map button (mSM_check_open_map_new) */
+        } else if (t == mSM_OVL_CALENDAR) {
+            mSM_open_submenu(submenu, mSM_OVL_CALENDAR, 0, Common_Get(player_no)); /* as the room calendar */
+        } else {
+            mSM_open_submenu(submenu, t, 0, 0); /* inventory, notice board */
+        }
+        mSM_Reset_player_btn_type2(play);
+        printf("[TEST][SUBMENU] %s menu %d OPEN pockets_sum=%08X live=%d\n", mSM_pc_th_role(), t, mSM_pc_th_pocket_sum(),
+               pc_net_game_menu_world_live());
+    }
 #endif
 
     if (((open_inventory && Common_Get(reset_flag) == FALSE) ||
@@ -482,6 +561,10 @@ static void mSM_move_End(Submenu* submenu) {
     if (s_pc_th_sm_stage == 1 || s_pc_th_sm_stage == 2) {
         s_pc_th_sm_stage = 3;
         printf("[TEST][SUBMENU] host inventory CLOSED pockets_sum=%08X\n", mSM_pc_th_pocket_sum());
+    }
+    if (s_pc_th_ap_type != 0) {
+        printf("[TEST][SUBMENU] %s menu %d CLOSED pockets_sum=%08X\n", mSM_pc_th_role(), s_pc_th_ap_type, mSM_pc_th_pocket_sum());
+        s_pc_th_ap_type = 0;
     }
 #endif
 

@@ -404,6 +404,27 @@ void pc_gx_begin_frame(void) {
     pc_profiler_add_time(PC_PROF_TIMER_GX_BEGIN, prof_start);
 }
 
+/* Mid-frame depth clear (display-list tag PC_NOOP_CLEAR_DEPTH, emu64 dl_G_NOOP): the multiplayer "world behind the menu" draw
+ * (m_play.c) renders the live 3D world and then the submenu overlay in the same frame; vanilla drew the menu over a flat prerendered
+ * picture, i.e. over an EMPTY depth buffer, so the overlay's own 3D models (inventory player, catalog items) depth-test against
+ * nothing. This restores exactly that: pending batches are flushed first (they keep their depth), then only depth is cleared. */
+void pc_gx_clear_depth_now(void) {
+    GLboolean scissor;
+
+    pc_gx_draw_pending();
+    scissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissor) {
+        glDisable(GL_SCISSOR_TEST);
+    }
+    glDepthMask(GL_TRUE);
+    glClearDepth(g_gx.clear_depth);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    if (scissor) {
+        glEnable(GL_SCISSOR_TEST);
+    }
+    DIRTY(PC_GX_DIRTY_DEPTH); /* the depth mask was changed behind the dirty system */
+}
+
 void pc_gx_restore_after_nes(void) {
     /* NES emulator uses its own shader/VAO/state. Rebind the game's GL objects
      * and mark all GX state dirty so uniforms/textures get re-uploaded. */

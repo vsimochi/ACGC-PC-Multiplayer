@@ -3,7 +3,7 @@
 museum completion letter for guests (docs/multiplayer-guest-roadmap.md "Letters to guests").
 
 TIER: source audit + (--native) the pure date rule pc_guest_event_due.h compiled with gcc and run. No game process.
-  I  the GUEST DIRECTORY: TOWN_SVC_STATE service 7 (324 B, array bound 8), built from the guest table with the deliverability rule, not built with the switch off; the
+  I  the GUEST DIRECTORY: TOWN_SVC_STATE service 7 (324 B, array bound 11), built from the guest table with the deliverability rule, not built with the switch off; the
      client validates + keeps it (no save needed); HEAD's client ignores an unknown service (an older client is unaffected)
   J  the address book (one page: residents, guests, the museum last) and the post office girl (client: the directory is an address; the host's own player: local delivery)
   K  MAIL_SEND to a GUEST: the recipient rule, NO_SUCH_ADDRESS / self / MAILBOX_FULL / MAIL_LIMIT before any mutation, the guest sender's durable write before the journal with
@@ -44,8 +44,8 @@ def main():
     due = read("pc/include/pc_guest_event_due.h")
 
     # ------------------------------------------------------------------ I
-    ck("I service 7 GUEST_DIR (324 = 4 + 16 x 20), the array bound 8, the size asserted against the blob max and sizeof(PersonalID_c)",
-       "#define PC_NETGAME_TS_GUESTDIR 7u" in c_raw and "#define PC_NETGAME_TS_NUM      10u" in c_raw  # worker B re-pin: service 8 MUSEUM_DONORS raised the bound to 9
+    ck("I service 7 GUEST_DIR (324 = 4 + 16 x 20), the array bound 11, the size asserted against the blob max and sizeof(PersonalID_c)",
+       "#define PC_NETGAME_TS_GUESTDIR 7u" in c_raw and "#define PC_NETGAME_TS_NUM      11u" in c_raw  # worker B re-pin: service 8 MUSEUM_DONORS raised the bound to 9
        and "#define PC_NETGAME_GUESTDIR_MAX   16u" in c_raw
        and "_Static_assert(PC_NETGAME_TS_GUESTDIR_LEN == 324u && PC_NETGAME_TS_GUESTDIR_LEN <= PC_NETGAME_TS_BLOB_MAX && sizeof(PersonalID_c) == 20u," in c_raw
        and L.PC_NETGAME_TS_GUESTDIR == 7 and L.PC_NETGAME_TS_GUESTDIR_LEN == 324)

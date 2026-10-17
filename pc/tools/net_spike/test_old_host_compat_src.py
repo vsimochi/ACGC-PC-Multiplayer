@@ -78,6 +78,17 @@ em = body(ng, "int pc_evc_mode(int op) {")
 ck("K21 EVNPC_CLAIM: pc_evc_mode() is CLAIM only with s_evc.have (set by a validated service 9 blob alone), the op bit and !s_evc.unsupported (latched on BAD_SHAPE); pc_evc_begin needs CLAIM",
    "s_evc.have && !s_evc.unsupported" in em and "(s_evc.ops & (1u << op))" in em and "s_evc.unsupported = 1;" in ng and
    "pc_evc_mode(op) != PC_EVC_MODE_CLAIM" in body(ng, "int pc_evc_begin(int op, int slot, int item, int flags, int aux_item) {"))
+oc = body(ng, "static int pcnetgame_ofurn_client_can(uint8_t perm) {")
+ob = body(ng, "static int pcnetgame_ofurn_begin(int op, int slot, uint16_t item, int flags, int ux, int uz) {")
+ck("K22 OUTDOOR_FURNITURE: pcnetgame_ofurn_client_can() needs a validated service 10 (s_ofcl.have_caps), the host's PERMS (s_ofcl.have_perms + the right) and !s_ofcl.unsupported "
+   "(latched on BAD_SHAPE); every kind-22 begin (Place / Rotate / Pick up) passes it first; s_ctxn.kind 22 is only ever set in pcnetgame_ofurn_begin",
+   "s_ofcl.have_caps && !s_ofcl.unsupported && s_ofcl.have_perms" in oc and "(s_ofcl.perms & perm) != 0" in oc and "s_ofcl.unsupported = 1;" in ng and
+   ng.count("s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN;") == 1 and "s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN;" in ob and
+   all(body(ng, h).index("pcnetgame_ofurn_client_can(") < body(ng, h).index("pcnetgame_ofurn_begin(") for h in (
+       "int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int rot) {", "int pc_net_game_ofurn_rotate(int ut_x, int ut_z) {",
+       "int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {")) and ng.count("pcnetgame_ofurn_begin(PC_OFURN_OP_") == 3)
+ck("K22b the client applies service 10 only after the strict pc_ofurn_caps_valid() (an unknown flag / version: ignored, no Place) and message 98 only after pc_ofurn_msg_valid()",
+   "svc == (int)PC_NETGAME_TS_OFURN ? pc_ofurn_caps_valid(m.blob)" in ng and "if (!pc_ofurn_msg_valid(m)) {" in body(ng, "static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m) {"))
 gu = body(ng, "static int pcnetgame_client_guest_mailbox_usable(void) {")
 ck("K13 guest MAIL_TAKE / 'Check my mail.': only when the host fed a guest mailbox (s_mbox_host_fed && s_mbox_guest)", "s_mbox_host_fed && s_mbox_guest" in gu)
 
@@ -94,7 +105,8 @@ else:
        hd.rstrip().endswith("/* malformed / short / unrecognized: ignore rather than misinterpret */") and "violation" not in hd.split("PC_NETGAME_MSG_TXN_COMMIT")[-1].split("pcnetgame_handle_host_txn_commit")[-1])
     new_ids = {"TREE_DROP": 77, "SHOP_PREVIEW": 78, "BALL_STATE": 79, "BALL_KICK_REQUEST": 80, "BEE_SWARM": 81, "DRESSER_STATE": 83, "DRESSER_QUERY": 84,
                "SHOP_UPGRADE_REQ": 85, "WILDLIFE_TOOL_ACTION": 86, "GHOST_HUNT": 87, "VILLAGER_OUTFIT": 90, "PVP_HIT_REQ": 91, "PVP_HIT": 92,
-               "ACTION_EXT": 96}  # worker P2 puppet ACTION_EXT (presentation only, see test_action_ext_src.py)
+               "ACTION_EXT": 96,  # worker P2 puppet ACTION_EXT (presentation only, see test_action_ext_src.py)
+               "OUTDOOR_FURN": 98}  # outdoor furniture C1: host -> client only (a 0.1.1 / 0.2.x CLIENT ignores it: the client dispatcher's 'unrecognized: ignore')
     enum_re = r"^\s*PC_NETGAME_MSG_(\w+)\s*=\s*(\d+)\s*,"
     old_ids = {k: int(v) for k, v in re.findall(enum_re, old, re.M)}
     cur_ids = {k: int(v) for k, v in re.findall(enum_re, ng, re.M)}

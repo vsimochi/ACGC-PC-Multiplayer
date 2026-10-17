@@ -189,6 +189,7 @@ static int      s_ac_result;        /* 1 accepted, 2 rejected */
 #include "pc_mp_membership.h"  /* M2: pc_mp_membership_list() for the dedicated `members` command */
 #include "pc_guest_profile.h" /* guest profiles: pc_guest_token_path() = the selected profile's client token file (default save/mp/guest_token.dat) */
 #include "pc_server.h" /* dedicated server storage tree: servers/<id>/ (host-owned file paths) */
+#include "pc_npc_authority.h" /* villager authority range and stale fallback (client HOST/LOCAL mode, relay lease, talk hold cap) */
 static void pcnetgame_server_init_members(void); /* first launch of a dedicated server: creates residents/members.dat (defined with the members store) */
 #include "pc_mp_members.h" /* M-E: save/mp/members.dat resident credentials (pure storage module) */
 #include "pc_mp_guests.h"  /* guests: the legacy save/mp/guests.dat v2 format (migrated) + save/mp/guest_token.dat client token file (pure storage module) */
@@ -203,6 +204,8 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_interest.h"     /* capacity phase 5: MOVE relay tiers */
 #include "pc_roster.h"        /* capacity phase 5: roster deltas with retry */
 #include "pc_guest_admit.h" /* capacity phase 4: the pure guest admission rules (range, decision) */
+#include "pc_outdoor_furniture.h" /* outdoor furniture C1: kind 22, message 98, service 10 (pure logic) */
+#include "pc_ops.h"               /* the host's operator list (ops.ini) */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
 #include "m_player_lib.h" /* Stage 3: GET_PLAYER_ACTOR_NOW(), PLAYER_ACTOR, mPlayer_INDEX_*, and
@@ -589,7 +592,16 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_BOBBER_VIEW          = 97, /* worker P3 (v8 extended in place, NO version bump), host -> READY peers in the angler's announced scene, UNRELIABLE <= 10 Hz while
                                              * the bobber exists + one RELIABLE 'gone', 24 bytes: another player's bobber (the host relays its own bobber and the BOBBER_STATE it
                                              * receives) so a puppet can draw it. PRESENTATION ONLY. An old peer ignores the id. See PCBobberViewMsg / pc_fishing_view.h. */
+    PC_NETGAME_MSG_OUTDOOR_FURN         = 98, /* outdoor furniture C1 (v8 extended in place, NO version bump), host -> one READY client, RELIABLE, 268 bytes: the PLACED-furniture markers (a full
+                                             * list BEGIN / CHUNK* / END at join + reconnect, gated like the other join pushes; SET / DEL deltas on change) and the peer's rights (PERMS).
+                                             * PRESENTATION + UI only (the tiles themselves travel as FIELD_UPDATE). An old peer ignores the id. See PCOfurnMsg / pc_outdoor_furniture.h. */
+    PC_NETGAME_MSG_NPC_PROXY_MOVE       = 99, /* villager stale fallback relay (v8 extended in place, NO version bump), client -> host ONLY, UNRELIABLE, 28 bytes (the PCNetGameNpcMoveMsg
+                                             * layout with this msg_type), <= 10 Hz per villager: the pose of a villager the HOST does not simulate (no host actor, so no NPC_MOVE)
+                                             * that this client runs on its own vanilla AI (pc_npc_authority.h LOCAL mode). The host accepts ONE relay owner per villager while it has
+                                             * no actor of its own and re-sends the pose as an ordinary NPC_MOVE to every OTHER ready peer. An old host ignores the id. */
 } PCNetGameMsgType;
+_Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID, "OUTDOOR_FURN id drifted (pc_outdoor_furniture.h)");
+_Static_assert(sizeof(PCOfurnMsg) == 268 && sizeof(PCOfurnMsg) <= PC_NET_MAX_PAYLOAD, "PCOfurnMsg wire size drifted");
 
 typedef enum PCNetGameRejectReason {
     PC_NETGAME_REJECT_PROTOCOL_MISMATCH = 1, /* 8-byte PCNetGameRejectMsg (version-stable form) */
@@ -2697,6 +2709,24 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
 #define PC_NETGAME_TXN_REASON_EVC_CHANGED    52u
 #define PC_NETGAME_TXN_REASON_EVC_OFF        53u
 #define PC_NETGAME_TXN_REASON_EVC_NO_SPIRITS 54u
+/* OUTDOOR FURNITURE (kind 22, C1; the same one-phase TXN_COMMIT machinery, NO new commit message; pc_outdoor_furniture.h, "OUTDOOR FURNITURE" block at the end of this file).
+ * tag.aux_cond = op (PC_OFURN_OP_*: 1 PLACE, 2 ROTATE, 3 PICKUP), tag.aux_item = the tile (ut_z << 8 | ut_x), tag.flags = the rotation (PLACE / ROTATE: 0..3, PICKUP: 0);
+ * PLACE: dest NONE, slot = the pocket slot holding the item, item = the pocket item; ROTATE: dest NONE, slot 0, item = the tile value the client sees; PICKUP: dest POCKET,
+ * slot = a FREE pocket slot, item = the tile value the client sees (the post-image slot gets the base item, rotation 0). Sent only to a host that announced town
+ * service 10 (OFURN_CAPS) and only while message 98 PERMS grants the right. Reasons 55..61 (pc_outdoor_furniture.h). */
+#define PC_NETGAME_TXN_KIND_OUTDOOR_FURN 22u
+#define PC_NETGAME_TXN_REASON_OFURN_OFF         55u
+#define PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED 56u
+#define PC_NETGAME_TXN_REASON_OFURN_TOO_BIG     57u
+#define PC_NETGAME_TXN_REASON_OFURN_BAD_TILE    58u
+#define PC_NETGAME_TXN_REASON_OFURN_LIMIT       59u
+#define PC_NETGAME_TXN_REASON_OFURN_RATE        60u
+#define PC_NETGAME_TXN_REASON_OFURN_GONE        61u
+_Static_assert(PC_NETGAME_TXN_REASON_OFURN_OFF == PC_OFURN_REASON_OFF && PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED == PC_OFURN_REASON_NOT_ALLOWED &&
+                   PC_NETGAME_TXN_REASON_OFURN_TOO_BIG == PC_OFURN_REASON_TOO_BIG && PC_NETGAME_TXN_REASON_OFURN_BAD_TILE == PC_OFURN_REASON_BAD_TILE &&
+                   PC_NETGAME_TXN_REASON_OFURN_LIMIT == PC_OFURN_REASON_LIMIT && PC_NETGAME_TXN_REASON_OFURN_RATE == PC_OFURN_REASON_RATE &&
+                   PC_NETGAME_TXN_REASON_OFURN_GONE == PC_OFURN_REASON_GONE,
+               "the outdoor furniture reasons drifted (pc_outdoor_furniture.h)");
 #define PC_NETGAME_RESTOCK_PRICE         500u
 #define PC_NETGAME_RESTOCK_WAIT_MS       60000u
 #define PC_NETGAME_HOUSE_AUTO                 0xFFu
@@ -2773,7 +2803,10 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
 #define PC_NETGAME_TS_EVNPC    9u   /* worker E: EVNPC_CAPS, the shared event NPC claims (pc_evnpc_shared.h; NOT a save region). 8 bytes: u8 version (1), u8 flags (bit 0 = kind 21
                                      * claims are on), u8 wisp (bit 0 = the host's Wisp has its spirits back today), u8 0, u32 LE mask of the supported ops (bit = op). A client sends
                                      * kind 21 only after this service said "on" for the op. An old client ignores the unknown service. */
-#define PC_NETGAME_TS_NUM      10u  /* array bound: services 1..9 named (index 0 unused), 10+ reserved */
+#define PC_NETGAME_TS_OFURN   10u   /* outdoor furniture C1: OFURN_CAPS (pc_outdoor_furniture.h; NOT a save region). 8 bytes: u8 version (1), u8 flags (bit 0 = Place on, bit 1 = leaf drop on),
+                                     * u16 LE safety ceiling per town, u16 LE per acre, u16 0. A client sends kind 22 only after this service arrived. An old client ignores the unknown service. */
+#define PC_NETGAME_TS_NUM      11u  /* array bound: services 1..10 named (index 0 unused), 11+ reserved */
+#define PC_NETGAME_TS_OFURN_LEN 8u
 #define PC_NETGAME_TS_EVNPC_LEN 8u
 #define PC_NETGAME_TS_BLOB_MAX 340u
 #define PC_NETGAME_TS_POLICE_LEN 40u
@@ -3151,6 +3184,20 @@ static uint32_t         s_npc_move_send_counter = 0;           /* host-side: thi
                                                                  * per-send counter, shared across every
                                                                  * slot -- see PCNetGameNpcMoveMsg.frame's
                                                                  * doc comment above */
+/* Villager authority range and stale fallback (pc_npc_authority.h): client per-slot HOST/LOCAL mode, client relay send throttle, host relay
+ * lease + "my own actor is alive" stamps. */
+static PCNpcAuthSlot   s_npc_auth[ANIMAL_NUM_MAX];          /* client */
+static uint32_t        s_npc_proxy_tx_ms[ANIMAL_NUM_MAX];   /* client: last NPC_PROXY_MOVE sent */
+static uint32_t        s_npc_proxy_tx_frame;                /* client: per-process proxy sample counter */
+static PCNpcProxyLease s_npc_proxy_lease[ANIMAL_NUM_MAX];   /* host */
+static uint32_t        s_host_npc_actor_ms[ANIMAL_NUM_MAX]; /* host: last frame its own actor of the slot ran (0 = never) */
+static uint32_t        s_host_npc_sample_ms[ANIMAL_NUM_MAX];/* host: last NPC_MOVE it sent (own actor or relay) */
+static float           s_host_npc_last_pos[ANIMAL_NUM_MAX][3];
+static uint32_t        s_host_npc_relay_count[ANIMAL_NUM_MAX];
+static void pcnetgame_npc_log(const char* fmt, ...);        /* printf + servers/<id>/logs/server.log */
+static void pcnetgame_client_npc_proxy_send(int slot, uint16_t npc_id, float x, float y, float z, int16_t facing, uint8_t action);
+static void pcnetgame_host_npc_relay_tick(void);
+static void pcnetgame_handle_host_npc_proxy_move(PCNetPeerId peer, const PCNetGameNpcMoveMsg* in);
 
 /* N3 Channel B: host-side per-slot shadow of the last BROADCAST is_home/hide/forced_type/
  * forced_active, used by pc_net_game_notify_npc_state()'s dirty-check (see its own doc comment for
@@ -4009,6 +4056,14 @@ typedef struct PCNetGameHostPeerState {
     int                  bound_guest_slot;
     uint8_t              ext_valid;
     PCNetGameIdentityExtMsg ext;
+    /* outdoor furniture C1 (message 98): the placed-furniture list state of this peer (0 NEED / 1 PUSHING / 2 SYNCED), the list cursor and generation, the rights last
+     * sent and the kind-22 rate limiter. Cleared by the per-peer memset (a reconnect gets the whole list again). */
+    uint8_t              ofurn_state;
+    uint8_t              ofurn_perms_valid;
+    uint8_t              ofurn_perms;
+    uint16_t             ofurn_next;
+    uint32_t             ofurn_gen;
+    PCOfurnRate          ofurn_rate;
 } PCNetGameHostPeerState;
 PCNG_PEER_TABLE(PCNetGameHostPeerState, s_host_peer)
 
@@ -6110,6 +6165,9 @@ static const char* pcnetgame_kind_tag(int kind) {
     if (kind == (int)PC_NETGAME_TXN_KIND_EVNPC) {
         return "EVNPC";
     }
+    if (kind == (int)PC_NETGAME_TXN_KIND_OUTDOOR_FURN) {
+        return "OUTDOOR_FURNITURE"; /* outdoor furniture C1 */
+    }
     if (kind == (int)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
         return "EVNPC_CLAIM"; /* worker E: shared event NPCs */
     }
@@ -6283,6 +6341,8 @@ typedef struct PCNetGameNpcTalkHold {
     uint8_t  indoor;     /* Patch 8: the owner began inside the villager's house (so leaving the house ends it, and so does going outdoors) */
     uint8_t  host_owned; /* Patch 8: the HOST's own player owns the conversation (peer_mask is then 0: the host never holds its own villager) */
     uint32_t host_ms;    /* pcnetgame_now_ms() of the host player's last "still talking" call */
+    uint32_t begin_ms;   /* pcnetgame_now_ms() when the current client hold began (the hold cap counts from here; 0 = none) */
+    PCPeerSet capped;    /* peers whose hold hit the cap / was freed by the operator: their keepalive BEGINs are refused until their END */
 } PCNetGameNpcTalkHold;
 static PCNetGameNpcTalkHold s_host_talk_hold[ANIMAL_NUM_MAX];
 PCNG_PEER_TABLE(uint16_t, s_host_talk_last_seq)
@@ -6297,6 +6357,7 @@ static int      s_host_talk_reject_logs = 0;
  * END, by the session reset, and by a failed probe. */
 typedef struct PCNetGameNpcTalkOut {
     uint8_t  active;
+    uint8_t  misses;   /* consecutive keepalive probes that found the lease active but NO visible conversation (probe result 1) */
     uint16_t npc_id;
     uint32_t last_ms;
 } PCNetGameNpcTalkOut;
@@ -6371,6 +6432,21 @@ static uint32_t pcnetgame_talk_hold_timeout_ms(void) {
     return s_timeout;
 }
 
+/* Hold cap (pc_npc_authority.h): a client hold ends this long after it began, however often the client's keepalive repeats BEGIN. AC_MP_NPC_TALK_CAP_MS overrides (0 = no cap). */
+static uint32_t pcnetgame_talk_hold_cap_ms(void) {
+    static int s_init = 0;
+    static uint32_t s_cap = PC_NPC_TALK_HOLD_CAP_MS;
+    if (!s_init) {
+        const char* e = getenv("AC_MP_NPC_TALK_CAP_MS");
+        s_init = 1;
+        if (e != NULL && e[0] != 0) {
+            long v = atol(e);
+            s_cap = (v > 0) ? (uint32_t)v : 0u;
+        }
+    }
+    return s_cap;
+}
+
 /* Clear `peer`'s bit in every slot (and, when `reset_seq`, its sequence record). */
 static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* why, int reset_seq) {
     int slot;
@@ -6379,6 +6455,7 @@ static void pcnetgame_host_talk_hold_clear_peer(PCNetPeerId peer, const char* wh
     }
     for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
         PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
+        pc_peer_set_del(&h->capped, peer);
         if (pc_peer_set_has(&h->peer_mask, peer)) {
             pc_peer_set_del(&h->peer_mask, peer);
             if (pc_peer_set_empty(&h->peer_mask)) {
@@ -6414,11 +6491,48 @@ static void pcnetgame_host_talk_hold_sweep(void) {
             now = pcnetgame_now_ms();
         }
         if ((uint32_t)(now - h->last_ms) >= pcnetgame_talk_hold_timeout_ms()) {
-            printf("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X peers=0x%04X after %u ms\n", slot, (unsigned)h->npc_id,
-                   (unsigned)pc_peer_set_low32(&h->peer_mask), (unsigned)(now - h->last_ms));
+            pcnetgame_npc_log("[NPC][TALKNET] EXPIRE slot=%d npc=0x%04X peers=0x%04X after %u ms (no keepalive)", slot, (unsigned)h->npc_id,
+                              (unsigned)pc_peer_set_low32(&h->peer_mask), (unsigned)(now - h->last_ms));
             pc_peer_set_clear(&h->peer_mask);
+            h->begin_ms = 0;
+        } else if (pc_npc_talk_hold_capped(h->begin_ms, now, pcnetgame_talk_hold_cap_ms())) {
+            int p;
+            pcnetgame_npc_log("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X peers=0x%04X: hold cap %u ms reached (the conversation never ended); keepalives refused until END",
+                              slot, (unsigned)h->npc_id, (unsigned)pc_peer_set_low32(&h->peer_mask), (unsigned)pcnetgame_talk_hold_cap_ms());
+            for (p = 0; p < pcnetgame_peer_span(); p++) {
+                if (pc_peer_set_has(&h->peer_mask, p)) {
+                    pc_peer_set_add(&h->capped, p);
+                }
+            }
+            pc_peer_set_clear(&h->peer_mask);
+            h->begin_ms = 0;
         }
     }
+}
+
+/* Console `npc free <slot>`: release a villager's conversation hold now (the holders' keepalives are refused until their END, like the cap). 1 = something was released. */
+static int pcnetgame_host_talk_hold_free(int slot, char* msg, int msg_size) {
+    PCNetGameNpcTalkHold* h;
+    int p, had;
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        snprintf(msg, (size_t)msg_size, "slot out of range (0..%d)", ANIMAL_NUM_MAX - 1);
+        return 0;
+    }
+    h = &s_host_talk_hold[slot];
+    had = !pc_peer_set_empty(&h->peer_mask) || h->host_owned;
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        if (pc_peer_set_has(&h->peer_mask, p)) {
+            pc_peer_set_add(&h->capped, p);
+        }
+    }
+    snprintf(msg, (size_t)msg_size, "slot %d npc 0x%04X: %s", slot, (unsigned)h->npc_id, had ? "conversation hold released" : "no hold was active");
+    pc_peer_set_clear(&h->peer_mask);
+    h->host_owned = 0;
+    h->begin_ms = 0;
+    if (had) {
+        pcnetgame_npc_log("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X: freed by the operator (console `npc free`)", slot, (unsigned)h->npc_id);
+    }
+    return had;
 }
 
 static void pcnetgame_host_talk_reject(PCNetPeerId peer, const PCNetGameNpcTalkMsg* in, const char* reason) {
@@ -6452,6 +6566,10 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
 
     if (!begin) {
         /* END: idempotent; clears only THIS peer's bit; unknown slot/npc/peer is ignored. */
+        if (pc_peer_set_has(&h->capped, peer)) {
+            pc_peer_set_del(&h->capped, peer); /* the capped conversation really ended: the next BEGIN is a new one */
+            pcnetgame_npc_log("[NPC][TALKNET] END peer=%d slot=%u npc=0x%04X after a capped / freed hold", (int)peer, (unsigned)in->slot, (unsigned)in->npc_id);
+        }
         if (h->npc_id == in->npc_id && pc_peer_set_has(&h->peer_mask, peer)) {
             printf("[NPC][TALKNET] END peer=%d slot=%u npc=0x%04X\n", (int)peer, (unsigned)in->slot,
                    (unsigned)in->npc_id);
@@ -6484,6 +6602,10 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
             return;
         }
     }
+    if (pc_peer_set_has(&h->capped, peer)) {
+        pcnetgame_host_talk_reject(peer, in, "this peer's hold was capped / freed: refused until its END");
+        return;
+    }
     /* Distance validation intentionally skipped: the host NPC actor is not cheaply/safely resolvable from this
      * file by animal slot, and the last known peer position lags; slot+npc_id+town-scene are the guards. */
     if (!pc_peer_set_has(&h->peer_mask, peer) || h->npc_id != in->npc_id) { /* a keepalive repeat logs nothing */
@@ -6509,9 +6631,12 @@ static void pcnetgame_handle_host_npc_talk(PCNetPeerId peer, const PCNetGameNpcT
     }
     h->last_ms = pcnetgame_now_ms();
     if (!pc_peer_set_has(&h->peer_mask, peer)) {
+        if (pc_peer_set_empty(&h->peer_mask)) {
+            h->begin_ms = h->last_ms; /* the hold cap counts from the first BEGIN of this hold */
+        }
         pc_peer_set_add(&h->peer_mask, peer);
-        printf("[NPC][TALKNET] HOLD slot=%u npc=0x%04X peers=0x%04X\n", (unsigned)in->slot, (unsigned)in->npc_id,
-               (unsigned)pc_peer_set_low32(&h->peer_mask));
+        pcnetgame_npc_log("[NPC][TALKNET] HOLD slot=%u npc=0x%04X peers=0x%04X", (unsigned)in->slot, (unsigned)in->npc_id,
+                          (unsigned)pc_peer_set_low32(&h->peer_mask));
     }
 }
 
@@ -6779,6 +6904,9 @@ static void pcnetgame_host_talk_hold_scene_left(PCNetPeerId peer, const PCNetPla
     for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
         PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
         int still_ok = outdoors ? !h->indoor : (s->scene_id == (uint8_t)SCENE_NPC_HOUSE && s->owner == h->npc_id && h->indoor);
+        if (!still_ok && peer >= 0 && peer < pcnetgame_peer_span()) {
+            pc_peer_set_del(&h->capped, peer); /* a new scene is a new conversation context */
+        }
         if (peer >= 0 && peer < pcnetgame_peer_span() && pc_peer_set_has(&h->peer_mask, peer) && !still_ok) {
             pc_peer_set_del(&h->peer_mask, peer);
             printf("[NPC][TALKNET] RELEASE slot=%d npc=0x%04X (peer %d left the villager's surroundings)%s", slot, (unsigned)h->npc_id, (int)peer, "\n");
@@ -6811,6 +6939,54 @@ int pc_net_game_nearest_remote_player(float x, float z, float max_dist, float* o
         }
     }
     return best >= 0;
+}
+
+/* --host-observer: see pc_net_game.h. The remote players in the host's scene are gathered once per frame (graph_dt_frame_time), then each villager asks for its nearest one. */
+int pc_net_game_observer_npc_target(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z) {
+    static double s_frame = -1.0;
+    static int s_n = 0;
+    static float s_pos[PC_NETGAME_WIRE_ID_SPACE][3];
+    double fr;
+    float bd = max_dist * max_dist;
+    int i, best = -1;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || gamePT == NULL) {
+        return 0;
+    }
+    fr = graph_dt_frame_time(gamePT);
+    if (fr != s_frame) {
+        PCNetPlayerScene ls, ps;
+        int p;
+        s_frame = fr;
+        s_n = 0;
+        if (pc_net_game_get_local_scene(&ls)) {
+            for (p = 0; p < PC_REMOTE_PLAYER_ID_LIMIT && s_n < PC_NETGAME_WIRE_ID_SPACE; p++) {
+                float px, py, pz;
+                if (p == (int)PC_NETGAME_HOST_PLAYER_ID || !pc_remote_player_get_scene((PCNetPlayerId)p, &ps) || ps.scene_id != ls.scene_id || ps.owner != ls.owner ||
+                    !pc_remote_player_get_last_position((PCNetPlayerId)p, &px, &py, &pz)) {
+                    continue;
+                }
+                s_pos[s_n][0] = px;
+                s_pos[s_n][1] = py;
+                s_pos[s_n][2] = pz;
+                s_n++;
+            }
+        }
+    }
+    for (i = 0; i < s_n; i++) {
+        float d = (s_pos[i][0] - x) * (s_pos[i][0] - x) + (s_pos[i][2] - z) * (s_pos[i][2] - z);
+        if (d < bd) {
+            bd = d;
+            best = i;
+        }
+    }
+    if (best < 0) {
+        return 0;
+    }
+    *out_x = s_pos[best][0];
+    *out_y = s_pos[best][1];
+    *out_z = s_pos[best][2];
+    return 1;
 }
 
 /* host tick: send the owner table to every READY client when it changed and to a client that has not seen it */
@@ -6906,6 +7082,7 @@ int pc_net_game_notify_local_npc_talk(int slot, uint16_t npc_id, int begin) {
     if (slot >= 0 && slot < ANIMAL_NUM_MAX) {
         if (begin && ok) {
             s_client_talk_out[slot].active = 1;
+            s_client_talk_out[slot].misses = 0;
             s_client_talk_out[slot].npc_id = npc_id;
             s_client_talk_out[slot].last_ms = pcnetgame_now_ms();
         } else if (!begin) {
@@ -6938,9 +7115,25 @@ static void pcnetgame_client_talk_refresh_tick(void) {
         if ((uint32_t)(now - o->last_ms) < interval) {
             continue;
         }
-        if (s_client_talk_probe == NULL || !s_client_talk_probe(slot, o->npc_id)) {
-            o->active = 0; /* lease gone/unknown: stop refreshing (the END path or the host timeout releases) */
-            continue;
+        {
+            int pr = (s_client_talk_probe != NULL) ? s_client_talk_probe(slot, o->npc_id) : 0;
+            if (pr == 0) {
+                o->active = 0; /* lease gone/unknown: stop refreshing (the END path or the host timeout releases) */
+                continue;
+            }
+            if (pr == 1) { /* the villager's talk state is set but no conversation is visible (no talk demo, message window idle): a stuck talk state */
+                o->misses++;
+                if (o->misses >= PC_NPC_TALK_PROBE_MISSES) {
+                    pcnetgame_npc_log("[NPC][TALKNET] client: slot %d npc 0x%04X: no visible conversation for %u keepalives -> END (stuck talk state, hold released)", slot,
+                                      (unsigned)o->npc_id, (unsigned)o->misses);
+                    (void)pcnetgame_send_npc_talk(slot, o->npc_id, 0, 0);
+                    o->active = 0;
+                    o->misses = 0;
+                    continue;
+                }
+            } else {
+                o->misses = 0;
+            }
         }
         (void)pcnetgame_send_npc_talk(slot, o->npc_id, 1, 1);
         o->last_ms = now; /* also on a failed send: retry one interval later, never every poll */
@@ -7186,9 +7379,13 @@ static int pcnetgame_is_pickupable_field_item(mActor_name_t item) {
  * reach pickup validation's own money-bag lookup, which is guarded the same way). For non-ITEM1
  * types, mNT_get_itemTableNo() never returns mNT_ITEM_TYPE_BAG, so the money-bag test needs no
  * other type. */
+int pcnetgame_ofurn_pickup_gate(PCNetPeerId peer, int ut_x, int ut_z, uint16_t raw, uint16_t* granted); /* OUTDOOR FURNITURE block (end of this file) */
 static int pcnetgame_is_droppable_item(mActor_name_t item) {
     if (item == (mActor_name_t)EMPTY_NO || item == ITM_SIGNBOARD || item == (mActor_name_t)HONEYCOMB) {
         return 0;
+    }
+    if (ITEM_IS_FTR(item) && !pc_net_game_ofurn_leaf_drop_ok()) {
+        return 0; /* outdoor furniture C1: the host has outdoor_furniture_leaf_drop = 0 (a client: the host's announcement) -- the vanilla "can't place that" path */
     }
     if (mNT_check_unknown(item)) {
         return 0; /* ITEM1/FTR1 id outside the game's tables: never written into the shared field */
@@ -7346,6 +7543,15 @@ static int pcnetgame_validate_and_resolve_pickup(PCNetPeerId peer, uint8_t ut_x,
     }
 
     *out_granted_item = pcnetgame_resolve_pickup_item(raw_item);
+    {
+        /* outdoor furniture C1: a PLACED piece (marker + matching tile) is taken only by a resident / an operator (a guest / an old client of a guest: refused), and
+         * comes back with rotation 0; a leaf (no marker) is everybody's, unchanged */
+        uint16_t granted = (uint16_t)*out_granted_item;
+        if (!pcnetgame_ofurn_pickup_gate(peer, (int)ut_x, (int)ut_z, (uint16_t)raw_item, &granted)) {
+            return 0;
+        }
+        *out_granted_item = (mActor_name_t)granted;
+    }
     *out_raw_item = raw_item;
     *out_acre = acre;
     *out_tile = tile;
@@ -18529,6 +18735,13 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_EVC_CHANGED: return "EVC_CHANGED";
         case PC_NETGAME_TXN_REASON_EVC_OFF: return "EVC_OFF";
         case PC_NETGAME_TXN_REASON_EVC_NO_SPIRITS: return "EVC_NO_SPIRITS";
+        case PC_NETGAME_TXN_REASON_OFURN_OFF: return "OFURN_OFF"; /* outdoor furniture C1 */
+        case PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED: return "OFURN_NOT_ALLOWED";
+        case PC_NETGAME_TXN_REASON_OFURN_TOO_BIG: return "OFURN_TOO_BIG";
+        case PC_NETGAME_TXN_REASON_OFURN_BAD_TILE: return "OFURN_BAD_TILE";
+        case PC_NETGAME_TXN_REASON_OFURN_LIMIT: return "OFURN_LIMIT";
+        case PC_NETGAME_TXN_REASON_OFURN_RATE: return "OFURN_RATE";
+        case PC_NETGAME_TXN_REASON_OFURN_GONE: return "OFURN_GONE";
         default: return "?";
     }
 }
@@ -20716,6 +20929,17 @@ static void pcnetgame_evc_op_resolve(int applied, uint8_t reason);
 static void pcnetgame_evc_session_reset(void);
 static void pcnetgame_evc_host_tick(void);
 static void pcnetgame_evc_client_tick(void);
+/* outdoor furniture C1: the OUTDOOR FURNITURE block (end of this file): service 10, the kind 22 host handler, message 98, the client latch / apply / ticks */
+static void pcnetgame_ofurn_build_caps(uint8_t* blob);
+static void pcnetgame_ofurn_client_apply_caps(const uint8_t* blob);
+static void pcnetgame_handle_host_ofurn_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in);
+static int  pcnetgame_txn_apply_ofurn(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in);
+static int  pcnetgame_ofurn_try_send_check(PCNetGameClientTxn* T, uint8_t* dest, uint8_t* slot);
+static void pcnetgame_ofurn_op_resolve(int applied, uint8_t reason);
+static void pcnetgame_ofurn_session_reset(void);
+static void pcnetgame_ofurn_host_tick(void);
+static void pcnetgame_ofurn_client_tick(void);
+static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m);
 static void pcnetgame_ts_build_upgrade(uint8_t* blob);
 static int pcnetgame_ts_valid_upgrade_blob(const uint8_t* blob);
 static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob);
@@ -20738,7 +20962,8 @@ int pc_net_game_shop_restocking(void) {
 static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
            : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : svc == (int)PC_NETGAME_TS_UPGRADE ? "SHOP_UPGRADE"
-           : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : svc == (int)PC_NETGAME_TS_MDONORS ? "MUSEUM_DONORS" : svc == (int)PC_NETGAME_TS_EVNPC ? "EVNPC_CAPS" : "?";
+           : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : svc == (int)PC_NETGAME_TS_MDONORS ? "MUSEUM_DONORS" : svc == (int)PC_NETGAME_TS_EVNPC ? "EVNPC_CAPS"
+           : svc == (int)PC_NETGAME_TS_OFURN ? "OFURN_CAPS" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -20809,6 +21034,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
         *len = (uint16_t)PC_NETGAME_TS_EVNPC_LEN;
         return 1;
     }
+    if (svc == (int)PC_NETGAME_TS_OFURN) {
+        pcnetgame_ofurn_build_caps(blob); /* outdoor furniture C1: the host supports kind 22 (a session state, not a save region) */
+        *len = (uint16_t)PC_NETGAME_TS_OFURN_LEN;
+        return 1;
+    }
     return 0;
 }
 
@@ -20870,6 +21100,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_GUESTDIR);
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MDONORS); /* worker B */
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVNPC);   /* worker E */
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_OFURN);   /* outdoor furniture C1 */
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -21088,6 +21319,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_clear_errands_test_hook();
     pcnetgame_evnpc_host_tick();
     pcnetgame_evc_host_tick(); /* worker E: shared event NPCs (TEST-ONLY seed; the Wisp flag of service 9) */
+    pcnetgame_ofurn_host_tick(); /* outdoor furniture C1: the marker GC, the per-peer list / rights (message 98) */
     pcnetgame_npc_lease_host_tick();
     pcnetgame_page_host_tick();
     for (p = 0; p < pcnetgame_peer_span(); p++) {
@@ -22903,6 +23135,28 @@ static void pcnetgame_dresser_test_seed(void) {
 /* HOST: DRESSER_SELECT / QUERY. Answered only with the feature ON, for a READY peer bound to a RESIDENT. floor 0xFF = the capability probe (rate-limited); else the
  * dresser at (floor, layer, ut_x, ut_z) of the requester's OWN house must hold that furniture id in the HOST's house image: it becomes the peer's selection
  * (generation `gen`) and its STATE is sent. Anything else: the selection is cleared and nothing is answered (the client UI times out and shows no extra storage). */
+#ifdef PC_NET_TEST_HOOKS
+static PCNetGameDresserQueryMsg s_dresser_delay_q[PC_NETGAME_WIRE_ID_SPACE]; /* TEST-ONLY AC_TEST_DRESSER_SELECT_DELAY_MS: the held SELECT per peer (latest wins) */
+static uint32_t s_dresser_delay_due[PC_NETGAME_WIRE_ID_SPACE];
+static int s_dresser_delay_replay = 0;
+#endif
+static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGameDresserQueryMsg* q);
+#ifdef PC_NET_TEST_HOOKS
+/* TEST-ONLY host tick: answers the held SELECTs once due (the real handler, re-validated then). */
+static void pcnetgame_dresser_delay_tick(void) {
+    int p;
+    for (p = 0; p < PC_NETGAME_WIRE_ID_SPACE; p++) {
+        if (s_dresser_delay_due[p] != 0 && (int32_t)(pcnetgame_now_ms() - s_dresser_delay_due[p]) >= 0) {
+            const PCNetGameDresserQueryMsg q = s_dresser_delay_q[p];
+            s_dresser_delay_due[p] = 0;
+            printf("[NET][DRESSER][TEST-ONLY] host: the delayed DRESSER_SELECT of peer %d (gen %u) is answered now\n", p, (unsigned)q.gen);
+            s_dresser_delay_replay = 1;
+            pcnetgame_handle_host_dresser_query((PCNetPeerId)p, &q);
+            s_dresser_delay_replay = 0;
+        }
+    }
+}
+#endif
 static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGameDresserQueryMsg* q) {
     PCNetGameDresserSel* sel;
     uint8_t owner8[8];
@@ -22936,6 +23190,16 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
         pcnetgame_dresser_send_info(peer, pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID));
         return;
     }
+#ifdef PC_NET_TEST_HOOKS
+    if (!s_dresser_delay_replay && pc_test_hook_getenv("AC_TEST_DRESSER_SELECT_DELAY_MS") != NULL && atoi(pc_test_hook_getenv("AC_TEST_DRESSER_SELECT_DELAY_MS")) > 0) {
+        /* TEST-ONLY: a SLOW host (the user's case: busy with the exit commit): the SELECT is answered only after that many ms (pcnetgame_dresser_delay_tick) */
+        const int d = atoi(pc_test_hook_getenv("AC_TEST_DRESSER_SELECT_DELAY_MS"));
+        s_dresser_delay_q[peer] = *q;
+        s_dresser_delay_due[peer] = (pcnetgame_now_ms() + (uint32_t)d) | 1u;
+        printf("[NET][DRESSER][TEST-ONLY] host: DRESSER_SELECT of peer %d (gen %u) delayed %d ms\n", (int)peer, (unsigned)q->gen, d);
+        return;
+    }
+#endif
     memset(sel, 0, sizeof(*sel));
 #ifdef PC_NET_TEST_HOOKS
     if (pc_test_hook_getenv("AC_TEST_DRESSER_IGNORE_SELECT") != NULL) { /* TEST-ONLY: a host that never answers a SELECT (the client's direct-open timeout path) */
@@ -26954,6 +27218,10 @@ static int pcnetgame_hcl_live_room_house(int need_own_room) {
  * period is measured in GAME frames (gamePT->frame_counter, advances every frame, menus included). The clock kind is part of the quiet period: a switch between the
  * two modes restarts it (the counters never mix; the full quiet window is needed after the screen opens or closes). */
 static int s_hcl_q_dresser = 0;
+/* Frame-rate independence: the quiet window is ALSO at least PC_NETGAME_HCL_QUIET_MS of wall clock (30 frames = 0.5 s at 60 fps, but only 30 ms on an uncapped
+ * client, where a dt-scaled hand-over between two actions spans more frames). Identical at <= 60 fps (30 frames take >= 500 ms there). */
+#define PC_NETGAME_HCL_QUIET_MS 500
+static uint32_t s_hcl_q_ms = 0; /* pcnetgame_now_ms() | 1 when the current quiet period began */
 static uint32_t pcnetgame_hcl_quiet_clock(int dresser_screen) {
     return dresser_screen ? (uint32_t)gamePT->frame_counter : (uint32_t)((GAME_PLAY*)gamePT)->game_frame;
 }
@@ -26970,11 +27238,16 @@ static void pcnetgame_hcl_quiet_update(void) {
         s_hcl.q_house1 = h + 1;
         s_hcl_q_dresser = dm;
         s_hcl.q_gstart = pcnetgame_hcl_quiet_clock(dm);
+        s_hcl_q_ms = pcnetgame_now_ms() | 1u;
     }
 }
 
+/* the quiet period in game frames; 0 while it is shorter than PC_NETGAME_HCL_QUIET_MS of wall clock (so every ">= PC_NETGAME_HCL_QUIET_FRAMES" gate needs both) */
 static int pcnetgame_hcl_quiet_frames(int h) {
     if (s_hcl.q_house1 != h + 1 || gamePT == NULL || s_hcl_q_dresser != (aMR_pc_dresser_screen_settled() ? 1 : 0)) {
+        return 0;
+    }
+    if ((int32_t)(pcnetgame_now_ms() - s_hcl_q_ms) < PC_NETGAME_HCL_QUIET_MS) {
         return 0;
     }
     return (int)(pcnetgame_hcl_quiet_clock(s_hcl_q_dresser) - s_hcl.q_gstart);
@@ -28646,7 +28919,7 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC ||
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE ||
-               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
+               s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN) {
         s_ts_last_reason = 0;
         pcnetgame_ts_op_resolve(s_ctxn.kind, s_ctxn.request_id, 0); /* guest-first town: nothing was sent, the seam learns "rejected" */
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_CATCH) {
@@ -28678,7 +28951,8 @@ static int pcnetgame_txn_try_send(void) {
     const int is_house = T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_PURCHASE || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK ||
                          T->kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC ||
                          T->kind == (uint8_t)PC_NETGAME_TXN_KIND_DRESSER || T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE || /* guest-first town / shop restock / house upgrade: a TXN_COMMIT kind too (no pocket) */
-                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM; /* worker E: shared event NPCs */
+                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM || /* worker E: shared event NPCs */
+                         T->kind == (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN;  /* outdoor furniture C1 */
     int free_idx;
     if (T->state != PC_NETGAME_CTXN_QUEUED) {
         return 0;
@@ -28847,6 +29121,16 @@ static int pcnetgame_txn_try_send(void) {
         case PC_NETGAME_TXN_KIND_EVNPC_CLAIM: /* worker E: the op as aux_cond, the lineup index as flags (take_dst), the op argument as aux_item; the slot re-checked now */
             if (!pcnetgame_evc_try_send_check(T, &dest, &slot)) {
                 pcnetgame_txn_cancel_queued("the event NPC claim's pocket slot changed / no free slot", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
+                return -1;
+            }
+            item = T->item;
+            aux_cond = T->ts_aux;
+            aux_item = T->ts_aux_item;
+            flags = T->take_dst;
+            break;
+        case PC_NETGAME_TXN_KIND_OUTDOOR_FURN: /* outdoor furniture C1: the op as aux_cond, the tile as aux_item, the rotation as flags (take_dst); the slot re-checked now */
+            if (!pcnetgame_ofurn_try_send_check(T, &dest, &slot)) {
+                pcnetgame_txn_cancel_queued("the outdoor furniture op's pocket slot changed / no free slot", (uint8_t)PC_NETGAME_CONFIRM_REASON_SLOT_CHANGED);
                 return -1;
             }
             item = T->item;
@@ -29495,6 +29779,9 @@ static int pcnetgame_txn_apply_applied(const PCNetGameClientTxn* T, const PCNetG
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
         return pcnetgame_txn_apply_evc(T, in); /* worker E: the host post-image of the event NPC claim (pockets, conditions, wallet) */
     }
+    if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN) {
+        return pcnetgame_txn_apply_ofurn(T, in); /* outdoor furniture C1: the touched pocket slot (PLACE emptied / PICKUP the base item / ROTATE nothing) */
+    }
     if (T->kind == (uint8_t)PC_NETGAME_TXN_KIND_HOUSE_UPGRADE) {
         return pcnetgame_txn_apply_house_upgrade(T, in); /* worker C: the loan of an ACK_BUILT (the header arrives through house sync) */
     }
@@ -29845,6 +30132,10 @@ static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int appli
     if (kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
         pcnetgame_evc_op_resolve(applied, applied ? (uint8_t)0 : s_ts_last_reason); /* worker E: the old-host latch; the op itself resolves below (s_ts_op) */
     }
+    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN) {
+        pcnetgame_ofurn_op_resolve(applied, applied ? (uint8_t)0 : s_ts_last_reason); /* outdoor furniture C1: its own op state + the old-host latch + the notice */
+        return;
+    }
     if (s_ts_op.active && s_ts_op.kind == kind && s_ts_op.request_id == request_id) {
         s_ts_op.done = 1;
         s_ts_op.outcome = applied ? 1 : 2;
@@ -30008,7 +30299,7 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     svc = (int)m.service;
     if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG &&
         svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE && svc != (int)PC_NETGAME_TS_GUESTDIR && svc != (int)PC_NETGAME_TS_MDONORS &&
-        svc != (int)PC_NETGAME_TS_EVNPC) {
+        svc != (int)PC_NETGAME_TS_EVNPC && svc != (int)PC_NETGAME_TS_OFURN) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
@@ -30019,7 +30310,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
              : (svc == (int)PC_NETGAME_TS_UPGRADE) ? (uint16_t)PC_NETGAME_TS_UPGRADE_LEN
              : (svc == (int)PC_NETGAME_TS_GUESTDIR) ? (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN
              : (svc == (int)PC_NETGAME_TS_MDONORS) ? (uint16_t)PC_NETGAME_TS_MDONORS_LEN
-             : (svc == (int)PC_NETGAME_TS_EVNPC) ? (uint16_t)PC_NETGAME_TS_EVNPC_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_EVNPC) ? (uint16_t)PC_NETGAME_TS_EVNPC_LEN
+             : (svc == (int)PC_NETGAME_TS_OFURN) ? (uint16_t)PC_NETGAME_TS_OFURN_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -30042,7 +30334,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
           : svc == (int)PC_NETGAME_TS_UPGRADE ? pcnetgame_ts_valid_upgrade_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_GUESTDIR ? pcnetgame_ts_valid_guestdir_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_MDONORS ? pcnetgame_ts_valid_mdonors_blob(m.blob)
-          : svc == (int)PC_NETGAME_TS_EVNPC ? pc_evc_caps_valid(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_EVNPC ? pc_evc_caps_valid(m.blob)
+          : svc == (int)PC_NETGAME_TS_OFURN ? pc_ofurn_caps_valid(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
                svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
                : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : svc == (int)PC_NETGAME_TS_UPGRADE ? "shop upgrade"
@@ -30062,6 +30355,13 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     }
     if (svc == (int)PC_NETGAME_TS_EVNPC) {
         pcnetgame_evc_client_apply_caps(m.blob); /* worker E: a session state, not a save region: no usable save needed */
+        s_ts_client_seq[svc] = m.seq;
+        s_ts_client_have[svc] = 1;
+        printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq, (unsigned)m.digest, (unsigned)m.len);
+        return;
+    }
+    if (svc == (int)PC_NETGAME_TS_OFURN) {
+        pcnetgame_ofurn_client_apply_caps(m.blob); /* outdoor furniture C1: a session state, not a save region */
         s_ts_client_seq[svc] = m.seq;
         s_ts_client_have[svc] = 1;
         printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq, (unsigned)m.digest, (unsigned)m.len);
@@ -31730,15 +32030,30 @@ int pc_net_game_dresser_available(void) {
 }
 
 /* v2: select the dresser at (floor, layer, ut_x, ut_z) of the local player's own house (ftr_item = the furniture item at that cell). The host answers with its
- * STATE (pc_net_game_dresser_view_ready() turns 1); an invalid selection is never answered. Returns the new generation (1..255), 0 = not possible. */
+ * STATE (pc_net_game_dresser_view_ready() turns 1); an invalid selection is never answered. Returns the new generation (1..255), 0 = not possible.
+ * A RE-ASK of the same piece in the same room visit while its answer is still outstanding KEEPS the generation (the host re-selects it with the same gen), so a
+ * slow first answer (a host busy with the exit commit) is still adopted instead of being discarded as "the answer to an older selection". */
+static uint32_t s_dresser_ask_visit = 0;  /* the room visit of the outstanding selection */
+static int s_dresser_ask_key[5] = { -1, -1, -1, -1, -1 }; /* floor, layer, ut_x, ut_z, ftr_item & ~3 of the selection of s_dresser_cli_gen */
 int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr_item) {
     PCNetGameDresserQueryMsg q;
+    int reask;
     if (!pc_net_game_dresser_available() || floor < 0 || floor > 2 || layer < 0 || layer > 1 || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 || ftr_item <= 0 ||
         ftr_item > 0xFFFF) {
         return 0;
     }
-    s_dresser_cli_gen = (uint8_t)(s_dresser_cli_gen == 255 ? 1 : s_dresser_cli_gen + 1);
-    s_dresser_cli_valid = 0;
+    reask = s_dresser_cli_gen != 0 && !pc_net_game_dresser_view_ready() && s_dresser_ask_visit == s_dresser_visit && s_dresser_ask_key[0] == floor &&
+            s_dresser_ask_key[1] == layer && s_dresser_ask_key[2] == ut_x && s_dresser_ask_key[3] == ut_z && s_dresser_ask_key[4] == (ftr_item & ~3);
+    if (!reask) {
+        s_dresser_cli_gen = (uint8_t)(s_dresser_cli_gen == 255 ? 1 : s_dresser_cli_gen + 1);
+        s_dresser_cli_valid = 0;
+        s_dresser_ask_visit = s_dresser_visit;
+        s_dresser_ask_key[0] = floor;
+        s_dresser_ask_key[1] = layer;
+        s_dresser_ask_key[2] = ut_x;
+        s_dresser_ask_key[3] = ut_z;
+        s_dresser_ask_key[4] = ftr_item & ~3;
+    }
     memset(&q, 0, sizeof(q));
     q.msg_type = (uint8_t)PC_NETGAME_MSG_DRESSER_QUERY;
     q.floor = (uint8_t)floor;
@@ -31750,8 +32065,8 @@ int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr
     if (!pc_net_send(0, PC_NET_RELIABLE, &q, (uint16_t)sizeof(q))) {
         return 0;
     }
-    printf("[NET][DRESSER] client: select dresser floor %d layer %d cell %d,%d item 0x%04X (gen %u)\n", floor, layer, ut_x, ut_z, (unsigned)ftr_item,
-           (unsigned)s_dresser_cli_gen);
+    printf("[NET][DRESSER] client: select dresser floor %d layer %d cell %d,%d item 0x%04X (gen %u%s)\n", floor, layer, ut_x, ut_z, (unsigned)ftr_item,
+           (unsigned)s_dresser_cli_gen, reask ? ", re-ask: same generation" : "");
     return (int)s_dresser_cli_gen;
 }
 
@@ -31889,6 +32204,10 @@ static int pcnetgame_dresser_count_item(uint16_t item) {
 /* TEST-ONLY (AC_TEST_HOOKS=1 + AC_TEST_DRESSER_ROOM=1, client role): once the pool is available and the player stands idle in the field for 3 s, walks it into its OWN
  * house room through the game's own goto_other_scene with the door data of ac_my_house (aMHS_goto_next_pl_scene) and house_owner_name = its homes[] index, so the
  * scene announced to the host is the real "own room" (the host's owner check runs for real). Same mechanism as AC_TEST_MUSEUM_ROOM. Never active in normal play. */
+static int s_dresser_rewarp = 0; /* TEST-ONLY: the dresser UI hook asked for ONE more walk into the own room (AC_TEST_DRESSER_UI_REENTER) */
+void pc_net_game_test_dresser_rewarp(void) {
+    s_dresser_rewarp = 1;
+}
 static void pcnetgame_dresser_room_warp_test_hook(void) {
     static int s_state = 0; /* 0 unparsed, 1 armed, 2 done */
     static uint32_t s_t_elig = 0;
@@ -31900,6 +32219,12 @@ static void pcnetgame_dresser_room_warp_test_hook(void) {
     PLAYER_ACTOR* pa;
     uint32_t now;
     int h, size;
+    if (s_state == 2 && s_dresser_rewarp) {
+        s_dresser_rewarp = 0;
+        s_state = 1; /* re-armed: walk in again once the player stands in the field (the re-entry case: a new room visit) */
+        s_t_elig = 0;
+        printf("[NET][DRESSER][TEST-ONLY] room warp: re-armed (re-enter the own room)\n");
+    }
     if (s_state == 2) {
         return;
     }
@@ -34353,6 +34678,13 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (size == sizeof(PCNetGameNpcMoveMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_NPC_PROXY_MOVE) {
+        PCNetGameNpcMoveMsg pm;
+        memcpy(&pm, data, sizeof(pm));
+        pcnetgame_handle_host_npc_proxy_move(peer, &pm); /* villager stale fallback relay */
+        return;
+    }
+
     if (size == sizeof(PCNetGamePageMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PAGE) {
         PCNetGamePageMsg pg;
         memcpy(&pg, data, sizeof(pg));
@@ -34457,6 +34789,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN) {
+        return; /* outdoor furniture C1: OUTDOOR_FURN is host -> client only; a client never originates it. Dropped, never applied. */
+    }
+
     if (data[0] == (uint8_t)PC_NETGAME_MSG_MAILBOX_LETTER) {
         /* Mail milestone 2: MAILBOX_LETTER is host -> client only; a client never originates it. Dropped, never applied (the host's mailbox is only
          * ever written by the host's own code and by MAIL_TAKE). */
@@ -34511,6 +34847,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         }
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC_CLAIM) {
             pcnetgame_handle_host_evc_txn(peer, &tc); /* worker E: shared event NPCs (kind 21), one-phase */
+            return;
+        }
+        if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN) {
+            pcnetgame_handle_host_ofurn_txn(peer, &tc); /* outdoor furniture C1 (kind 22), one-phase, write-ahead sidecar */
             return;
         }
         if (tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_RESTOCK || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK || tc.kind == (uint8_t)PC_NETGAME_TXN_KIND_EVNPC) {
@@ -35156,6 +35496,12 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         pcnetgame_handle_client_pvp_hit(&ph); /* player-vs-player: queued; applied from this player's own frame in an allowlisted state */
         return;
     }
+    if (size == sizeof(PCOfurnMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN) {
+        PCOfurnMsg om;
+        memcpy(&om, data, sizeof(om));
+        pcnetgame_handle_client_ofurn(&om); /* outdoor furniture C1: the host's placed-furniture markers / my rights */
+        return;
+    }
     if (size == sizeof(PCNetGameDresserStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_DRESSER_STATE) {
         PCNetGameDresserStateMsg ds;
         memcpy(&ds, data, sizeof(ds));
@@ -35630,6 +35976,7 @@ static void pcnetgame_reset_client_session_state(void) {
     pcnetgame_hu_session_reset(); /* worker C: an unresolved house-upgrade op resolves as REJECTED (LINKLOST when it was sent); the old-host latch is per session */
     s_mm_unsupported = 0;         /* old-host compatibility: the MUSEUM_MAIL latch is per session too */
     pcnetgame_evc_session_reset(); /* worker E: the service 9 capability and the kind 21 latch are per session */
+    pcnetgame_ofurn_session_reset(); /* outdoor furniture C1: service 10, the marker mirror, my rights and the kind 22 latch are per session */
     s_mail_last_reason = 0;
     memset(s_ts_client_seq, 0, sizeof(s_ts_client_seq));
     memset(&s_take_op, 0, sizeof(s_take_op)); /* mail milestone 2: the mailbox take dies with the session (a local refusal) ... */
@@ -35725,6 +36072,8 @@ static void pcnetgame_reset_client_session_state(void) {
      * (see ITEM_NAME_GET_TYPE(...) != NAME_TYPE_NPC's use elsewhere in this file), and
      * snapshot_count/have_frame 0 already mean "no data yet" everywhere they're read. */
     memset(s_npc_move_slot, 0, sizeof(s_npc_move_slot));
+    memset(s_npc_auth, 0, sizeof(s_npc_auth)); /* stale fallback: HOST mode; the grace window starts at the first READY frame (grace_from_ms 0 = not started) */
+    memset(s_npc_proxy_tx_ms, 0, sizeof(s_npc_proxy_tx_ms));
 
     /* N3 Channel B: same reasoning as the NPC_MOVE ring reset just above -- a previous session's
      * slot-indexed is_home/hide/forced_type state must never survive into a fresh session where that
@@ -35770,6 +36119,12 @@ static void pcnetgame_reset_host_world_state(void) {
      * phase or a huge previous-session frame counter value in its very first log line. */
     memset(s_npc_move_send_accum, 0, sizeof(s_npc_move_send_accum));
     s_npc_move_send_counter = 0;
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        pc_npc_proxy_reset(&s_npc_proxy_lease[i]); /* stale fallback relay: no owner carries over */
+    }
+    memset(s_host_npc_actor_ms, 0, sizeof(s_host_npc_actor_ms));
+    memset(s_host_npc_sample_ms, 0, sizeof(s_host_npc_sample_ms));
+    memset(s_host_npc_relay_count, 0, sizeof(s_host_npc_relay_count));
 
     /* N3 Channel B: fresh hosting session starts every slot's dirty-check shadow and the shared
      * state_seq counter clean, so it never suppresses this session's genuinely-first broadcast for a
@@ -36841,6 +37196,7 @@ static void pcnetgame_client_tick(void) {
     pcnetgame_dresser_client_tick(); /* dresser storage (agent 12): capability probe / pool snapshot (DRESSER_QUERY 84) */
     pcnetgame_evnpc_client_tick(); /* event NPC authority: match the host's table (no-op until the host sent one) */
     pcnetgame_evc_client_tick();   /* worker E: shared event NPCs (Redd's display, the Wisp flag, the TEST-ONLY claim hook) */
+    pcnetgame_ofurn_client_tick(); /* outdoor furniture C1: the TEST-ONLY seam driver */
     pcnetgame_page_client_tick();  /* town-shared pages: upload a local edit built on the adopted revision */
     pcnetgame_clear_errands_test_hook();
 
@@ -38938,6 +39294,7 @@ void pc_net_game_poll(void) {
                handled, so a late CONFIRM / a competing request is judged against the up-to-date table. */
             pcnetgame_host_expire_reservations();
             pcnetgame_host_talk_hold_sweep(); /* M9-C: expire stale villager talk holds */
+            pcnetgame_host_npc_relay_tick();  /* stale fallback: release a silent villager relay owner */
             /* World Ecology Stage 1, Item 2: same "before this poll's events" placement -- a money-rock
                window that just expired must revert before a same-tile hit arriving this poll is judged. */
             pcnetgame_host_check_field_action_money_rock();
@@ -39058,6 +39415,9 @@ void pc_net_game_poll(void) {
         pcnetgame_ball_host_tick(); /* worker-2 ball: BALL_STATE to READY clients in the town field */
         pcnetgame_pvp_host_tick();  /* player-vs-player: arrival / scene tracking + the host's own swing state */
         pcnetgame_fv_host_tick();   /* worker P3: BOBBER_VIEW relay (the host's own bobber + the clients' BOBBER_STATE), presentation only */
+#ifdef PC_NET_TEST_HOOKS
+        pcnetgame_dresser_delay_tick(); /* TEST-ONLY AC_TEST_DRESSER_SELECT_DELAY_MS: a slow host's SELECT answers */
+#endif
     } else {
         pcnetgame_rc_tick(); /* auto-reconnect: backoff / attempt window / stable reset */
         pcnetgame_client_tick();
@@ -39483,6 +39843,17 @@ int pc_net_game_world_is_host_authoritative(void) {
     return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY;
 }
 
+int pc_net_game_menu_world_live(void) {
+    static int s_env = -2; /* -2 unread, -1 unset, 0 / 1 forced */
+    if (s_env == -2) {
+        const char* e = getenv("AC_MP_MENU_WORLD");
+        s_env = (e != NULL && e[0] != 0) ? (e[0] != '0') : -1;
+    }
+    if (s_env == 0 || (s_env < 0 && !g_pc_settings.menu_world_live)) return 0;
+    if (s_role == PC_NETGAME_ROLE_HOST) return pc_net_game_host_ready_peer_count() > 0;
+    return pc_net_game_world_is_host_authoritative();
+}
+
 int pc_net_game_get_local_player_context(PCNetPlayerContext* out) {
     if (out == NULL || !pcfa_save_ready()) {
         return 0;
@@ -39755,6 +40126,44 @@ void pc_net_game_dresser_ui_notice(int kind) {
     pcnetgame_dresser_refuse_notice(kind, "dresser screen notice");
 }
 
+/* Frame-rate independence: the DIRECT open of an own dresser waits (wall clock, ac_my_room_move.c_inc) for the host's view of it. mode 1 = still waiting after
+ * ~0.5 s: notice 12 "Asking the host for your stored items..." (raised + logged once, refreshed while the wait lasts); 0 = the view arrived: the line goes
+ * away at once (only if it is still the current notice); 2 = no view at the cap: the vanilla menu opens with notice 6 "Try again in a moment". */
+void pc_net_game_dresser_open_wait_notice(int mode) {
+    const int shown = s_dresser_refuse_ms != 0 && s_dresser_refuse_kind == 12 && (int32_t)(pcnetgame_now_ms() - s_dresser_refuse_ms) < 3000;
+    if (mode == 1) {
+        if (shown) {
+            s_dresser_refuse_ms = pcnetgame_now_ms() | 1u; /* refresh, no new log line */
+        } else {
+            pcnetgame_dresser_refuse_notice(12, "direct open: waiting for the host's view of the dresser (asking the host)");
+        }
+    } else if (mode == 2) {
+        pcnetgame_dresser_refuse_notice(6, "direct open: no host view of the dresser in time -> the vanilla menu");
+    } else if (shown) {
+        s_dresser_refuse_ms = 0;
+    }
+}
+
+/* 6j / row 5: the direct open met an own dresser whose cell is NOT committed (the open gate's 8 s cap, or in-room commits stopped / rolled back): the vanilla
+ * menu opens (the host would refuse its SELECT), never silently: one log line per open + notice 2 (only the room exit resolves it) or 4 (still saving). */
+void pc_net_game_dresser_direct_uncommitted(int ftr_item, int ut_x, int ut_z) {
+    static uint32_t last_ms = 0;
+    const uint32_t now = pcnetgame_now_ms();
+    const int stuck = s_hcl.room_stopped || s_hcl.rollback || !s_hcl.room_base_valid;
+    if (last_ms != 0 && (int32_t)(now - last_ms) < 1000) {
+        return; /* the same open (the caller runs once per frame until the vanilla menu is up) */
+    }
+    last_ms = now | 1u;
+    if (stuck) {
+        pcnetgame_dresser_refuse_notice(2, "direct open: the dresser's move cannot be committed before the room exit -> the vanilla menu");
+    } else {
+        s_dresser_saving_ms = now | 1u;
+        s_dresser_refuse_ms = 0; /* 6l: the latest refusal wins */
+    }
+    printf("[NET][DRESSER] client: direct open of the dresser 0x%04X at cell %d,%d: its move is not committed (%s) -> the vanilla menu (notice %d)\n",
+           (unsigned)(ftr_item & 0xFFFF), ut_x, ut_z, stuck ? "in-room commits stopped" : "still not committed after the open gate's cap", stuck ? 2 : 4);
+}
+
 /* 6p: notice 4 while an extra-slot put / take of the open dresser screen waits for the in-room commit of its vanilla-slot edits */
 void pc_net_game_saving_notice(void) {
     s_dresser_saving_ms = pcnetgame_now_ms() | 1u;
@@ -39806,6 +40215,11 @@ int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
         if (g_pc_verbose) {
             printf("[NET][PICKUP] not in the town scene -- pickup at (%d,%d) not sent\n", ut_x, ut_z);
         }
+        return 1;
+    }
+    if (pc_net_game_ofurn_placed_at(ut_x, ut_z) && !pc_net_game_ofurn_may_pickup()) {
+        /* outdoor furniture C1: a PLACED piece is not a guest's to take (the host refuses it too): a notice, nothing sent, nothing changed */
+        pc_ofurn_notice_set(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED), pcnetgame_now_ms());
         return 1;
     }
     if (s_pickup_pending.valid) {
@@ -41003,16 +41417,54 @@ void pc_net_game_notify_npc_move(int slot, uint16_t npc_id, float pos_x, float p
     PCNetGameNpcMoveMsg msg;
     int i;
 
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        /* stale fallback: a villager this client runs on its own AI (LOCAL mode) is reported to the host, which relays it to the other peers (PC_NETGAME_MSG_NPC_PROXY_MOVE) */
+        pcnetgame_client_npc_proxy_send(slot, npc_id, pos_x, pos_y, pos_z, facing_angle, action_type);
+        return;
+    }
     if (s_role != PC_NETGAME_ROLE_HOST) {
         return;
     }
     if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
         return; /* malformed input from the caller -- defensive */
     }
+    s_host_npc_actor_ms[slot] = pcnetgame_now_ms(); /* the host simulates this villager itself: a client relay for it is dropped */
+    if (s_npc_proxy_lease[slot].owner >= 0) {
+        pcnetgame_npc_log("[NET][NPC] host: slot %d is simulated by the host again -> relay from peer %d ended", slot, s_npc_proxy_lease[slot].owner);
+        pc_npc_proxy_reset(&s_npc_proxy_lease[slot]);
+    }
     if (pc_net_game_host_ready_peer_count() == 0) {
         return; /* nobody to send to -- skip the throttle tick too, so a peer that joins later gets
                  * this slot's very first sample promptly rather than mid-cycle */
     }
+#ifdef PC_NET_TEST_HOOKS
+    {   /* TEST-ONLY: AC_TEST_NPC_MUTE_FILE=<path>: while that file exists the host sends no NPC_MOVE (simulates villagers leaving the host's range: the stale fallback test) */
+        static int s_init = 0;
+        static const char* s_path = NULL;
+        static uint32_t s_next_ms = 0;
+        static int s_muted = 0;
+        uint32_t tnow = pcnetgame_now_ms();
+        if (!s_init) {
+            s_init = 1;
+            s_path = pc_test_hook_getenv("AC_TEST_NPC_MUTE_FILE");
+        }
+        if (s_path != NULL && (uint32_t)(tnow - s_next_ms) < 0x80000000u) {
+            FILE* mf = fopen(s_path, "rb");
+            int m = mf != NULL;
+            if (mf != NULL) {
+                fclose(mf);
+            }
+            if (m != s_muted) {
+                printf("[NET][NPC][TEST] host: NPC_MOVE %s (AC_TEST_NPC_MUTE_FILE)\n", m ? "MUTED" : "unmuted");
+            }
+            s_muted = m;
+            s_next_ms = tnow + 300u;
+        }
+        if (s_muted) {
+            return;
+        }
+    }
+#endif
     if (gamePT == NULL || !graph_dt_period_elapsed(gamePT, &s_npc_move_send_accum[slot],
                                                     PC_NETGAME_NPC_MOVE_SEND_PERIOD_60FPS_FRAMES)) {
         return; /* not this slot's turn yet */
@@ -41045,9 +41497,341 @@ void pc_net_game_notify_npc_move(int slot, uint16_t npc_id, float pos_x, float p
         }
     }
 
+    s_host_npc_sample_ms[slot] = pcnetgame_now_ms();
+    s_host_npc_last_pos[slot][0] = pos_x;
+    s_host_npc_last_pos[slot][1] = pos_y;
+    s_host_npc_last_pos[slot][2] = pos_z;
     for (i = 0; i < pcnetgame_peer_span(); i++) {
         if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
             pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
+        }
+    }
+}
+
+/* ---- Villager authority range and stale fallback (pc_npc_authority.h) ----
+ * The host only simulates (and streams) a villager while it has an ACTOR for it, i.e. near its own player: the NPC manager's scope and Actor_delete_check are centred on the host
+ * player's block, and the dedicated server's hidden observer stands still at its acre. Spawning host actors around every peer was judged unsafe (a villager's house entry / exit needs
+ * the house STRUCTURE actor, Actor_info_fgName_search in aNPC_request_house, and the structures' collision offsets are only written by structure actors that exist near the host
+ * player -- a far villager would wait at its door forever and walk through houses). So:
+ *   CLIENT: a villager whose stream is stale runs the vanilla local AI (LOCAL mode, see pc_npc_authority.h) -- this client has the structures around its own player loaded -- and
+ *           reports its pose (NPC_PROXY_MOVE, 10 Hz);
+ *   HOST:   relays ONE client's report per villager (the first; the lease lapses after 1.5 s of silence) to the other peers as an ordinary NPC_MOVE while the host has no actor of its
+ *           own for that villager, and writes the reported spot into its own villager list (so a host actor spawned later starts where the clients last saw it).
+ * Kill switches: AC_MP_NPC_FALLBACK=0 (or settings.ini [Network] npc_fallback = 0): the old "hold forever" behaviour; AC_MP_NPC_RELAY=0 (npc_relay = 0): no relay. */
+static int pcnetgame_env_switch(const char* name, int dflt) {
+    const char* e = getenv(name);
+    if (e == NULL || e[0] == 0) {
+        return dflt;
+    }
+    return e[0] != '0';
+}
+
+static int pcnetgame_npc_fallback_on(void) {
+    static int s_v = -1;
+    if (s_v < 0) {
+        s_v = pcnetgame_env_switch("AC_MP_NPC_FALLBACK", g_pc_settings.npc_fallback ? 1 : 0);
+        printf("[NET][NPC] villager stale fallback: %s (stale %u ms, grace %u ms, %u fresh samples to resync)\n", s_v ? "ON" : "OFF (AC_MP_NPC_FALLBACK=0 / npc_fallback = 0)",
+               (unsigned)PC_NPC_AUTH_STALE_MS, (unsigned)PC_NPC_AUTH_GRACE_MS, (unsigned)PC_NPC_AUTH_FRESH_SAMPLES);
+    }
+    return s_v;
+}
+
+static int pcnetgame_npc_relay_on(void) {
+    static int s_v = -1;
+    if (s_v < 0) {
+        s_v = pcnetgame_env_switch("AC_MP_NPC_RELAY", g_pc_settings.npc_relay ? 1 : 0);
+        printf("[NET][NPC] villager relay: %s\n", s_v ? "ON" : "OFF (AC_MP_NPC_RELAY=0 / npc_relay = 0)");
+    }
+    return s_v;
+}
+
+static void pcnetgame_npc_log(const char* fmt, ...) {
+    char buf[320];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    printf("%s\n", buf);
+    if (g_pc_dedicated) {
+        pc_server_log("%s", buf); /* the dedicated server's stdout is not server.log: the villager diagnostics belong there too */
+    }
+}
+
+static PCNpcAuthCfg pcnetgame_npc_auth_cfg(void) {
+    PCNpcAuthCfg c;
+    pc_npc_auth_default_cfg(&c);
+#ifdef PC_NET_TEST_HOOKS
+    {
+        const char* e = pc_test_hook_getenv("AC_TEST_NPC_STALE_MS");
+        if (e != NULL && atol(e) > 0) {
+            c.stale_ms = (uint32_t)atol(e);
+        }
+    }
+#endif
+    return c;
+}
+
+int pc_net_game_npc_client_local_ai(int slot, uint16_t npc_id, int actor_new, int must_hold) {
+    PCNpcAuthSlot* s;
+    PCNpcAuthCfg c;
+    uint32_t now;
+    int r;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || slot < 0 || slot >= ANIMAL_NUM_MAX || !pcnetgame_npc_fallback_on()) {
+        return 0;
+    }
+    s = &s_npc_auth[slot];
+    c = pcnetgame_npc_auth_cfg();
+    now = pcnetgame_now_ms();
+    if (s->grace_from_ms == 0) {
+        s->grace_from_ms = now; /* first READY frame of this session for the slot */
+    }
+    if (s_npc_move_slot[slot].have_frame && s_npc_move_slot[slot].cached_npc_id != npc_id) {
+        pc_npc_auth_forget(s); /* another occupant of the slot: pc_net_game_get_npc_move_pose() discards the ring itself */
+    }
+    if (actor_new) {
+        int was_local = s->local;
+        if (pc_npc_auth_on_actor_created(s, now, &c)) {
+            PCNetNpcMoveSlot* ns = &s_npc_move_slot[slot];
+            ns->snapshot_count = 0; /* never snap a brand-new actor to an old pose; the frame order is kept */
+            ns->snapshot_head = 0;
+            pcnetgame_npc_log("[NET][NPC] client: slot %d actor (re)created, newest host sample older than %u ms -> ring cleared, waiting %u ms for the host", slot,
+                              (unsigned)c.stale_ms, (unsigned)c.grace_ms);
+        } else if (was_local) {
+            pcnetgame_npc_log("[NET][NPC] client: slot %d actor (re)created -> host (grace %u ms)", slot, (unsigned)c.grace_ms);
+        }
+    }
+    r = pc_npc_auth_update(s, now, must_hold, &c);
+    if (r == PC_NPC_AUTH_TO_LOCAL) {
+        if (s->have) {
+            pcnetgame_npc_log("[NET][NPC] client: slot %d npc 0x%04X host silent for %u ms -> local AI", slot, (unsigned)npc_id, (unsigned)(now - s->last_recv_ms));
+        } else {
+            pcnetgame_npc_log("[NET][NPC] client: slot %d npc 0x%04X no host sample in %u ms -> local AI", slot, (unsigned)npc_id, (unsigned)(now - s->grace_from_ms));
+        }
+    } else if (r == PC_NPC_AUTH_TO_HOST) {
+        pcnetgame_npc_log("[NET][NPC] client: slot %d npc 0x%04X host stream back (%u fresh samples) -> host (after %u ms local)", slot, (unsigned)npc_id, (unsigned)s->fresh_run,
+                          (unsigned)(now - s->local_since_ms));
+    }
+    return s->local ? 1 : 0;
+}
+
+static void pcnetgame_client_npc_proxy_send(int slot, uint16_t npc_id, float x, float y, float z, int16_t facing, uint8_t action) {
+    PCNetGameNpcMoveMsg msg;
+    uint32_t now;
+
+    if (s_client_link != PC_NETGAME_LINK_READY || slot < 0 || slot >= ANIMAL_NUM_MAX || !s_npc_auth[slot].local || !pcnetgame_npc_relay_on() || !pcnetgame_pos_valid(x, y, z)) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_npc_proxy_tx_ms[slot] != 0 && (uint32_t)(now - s_npc_proxy_tx_ms[slot]) < PC_NPC_PROXY_SEND_MS) {
+        return;
+    }
+    s_npc_proxy_tx_ms[slot] = now;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = (uint8_t)PC_NETGAME_MSG_NPC_PROXY_MOVE;
+    msg.slot = (uint8_t)slot;
+    msg.action_type = action;
+    msg.npc_id = npc_id;
+    msg.frame = ++s_npc_proxy_tx_frame;
+    msg.pos_x = x;
+    msg.pos_y = y;
+    msg.pos_z = z;
+    msg.facing_angle = facing;
+    (void)pc_net_send(0, PC_NET_UNRELIABLE, &msg, (uint16_t)sizeof(msg));
+}
+
+/* Host: a client's pose of a villager the host does not simulate. Validated (READY, the host's animal table, the sender in the town field and within two acres of the
+ * villager, a sane position), one relay owner per villager, relayed as NPC_MOVE (the host's own frame counter, so the order across a host / relay hand-over stays monotonic). */
+static void pcnetgame_handle_host_npc_proxy_move(PCNetPeerId peer, const PCNetGameNpcMoveMsg* in) {
+    static int s_reject_logs = 0;
+    Animal_c* animal;
+    PCNetPlayerScene sc;
+    PCNetGameNpcMoveMsg out;
+    uint32_t now;
+    float px, py, pz;
+    int i, live, was_owner;
+    const char* why = NULL;
+
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY || !pcnetgame_npc_relay_on()) {
+        return;
+    }
+    if (in->slot >= ANIMAL_NUM_MAX) {
+        why = "slot out of range";
+    } else if (!pcnetgame_pos_valid(in->pos_x, in->pos_y, in->pos_z)) {
+        why = "invalid position";
+    } else {
+        animal = Save_GetPointer(animals[in->slot]);
+        if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC || (uint16_t)animal->id.npc_id != in->npc_id) {
+            why = "npc_id does not match the host animal table";
+        } else if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) ||
+                   !(sc.kind == (uint8_t)PC_NETSCENE_KIND_FIELD && (sc.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) != 0 && sc.scene_id == (uint8_t)SCENE_FG)) {
+            why = "the sender is not in the town field";
+        } else if (pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz) &&
+                   ((px - in->pos_x) * (px - in->pos_x) + (pz - in->pos_z) * (pz - in->pos_z)) > (2.0f * mFI_BK_WORLDSIZE_X_F) * (2.0f * mFI_BK_WORLDSIZE_X_F)) {
+            why = "the villager is more than two acres away from the sender";
+        }
+    }
+    if (why != NULL) {
+        if (s_reject_logs < 20) {
+            s_reject_logs++;
+            pcnetgame_npc_log("[NET][NPC] host: relay REJECT peer=%d slot=%u npc=0x%04X: %s", (int)peer, (unsigned)in->slot, (unsigned)in->npc_id, why);
+        }
+        return;
+    }
+    now = pcnetgame_now_ms();
+    live = s_host_npc_actor_ms[in->slot] != 0 && (uint32_t)(now - s_host_npc_actor_ms[in->slot]) < PC_NPC_HOST_ACTOR_ALIVE_MS;
+    was_owner = s_npc_proxy_lease[in->slot].owner;
+    if (!pc_npc_proxy_offer(&s_npc_proxy_lease[in->slot], (int)peer, now, live, PC_NPC_PROXY_LEASE_MS)) {
+        return; /* the host simulates it, or another peer is the relay owner */
+    }
+    if (was_owner != (int)peer) {
+        pcnetgame_npc_log("[NET][NPC] host: slot %u npc 0x%04X not simulated by the host -> relaying peer %d's villager (pos %.0f,%.0f)", (unsigned)in->slot, (unsigned)in->npc_id,
+                          (int)peer, (double)in->pos_x, (double)in->pos_z);
+    }
+    if (!Save_GetPointer(animals[in->slot])->is_home) { /* the host's own villager list follows, so a host actor spawned later starts where the clients saw the villager */
+        mNpc_NpcList_c* list = Common_GetPointer(npclist[in->slot]);
+        list->position.x = in->pos_x;
+        list->position.z = in->pos_z;
+    }
+    out = *in;
+    out.msg_type = (uint8_t)PC_NETGAME_MSG_NPC_MOVE;
+    out._reserved1 = 0;
+    out._reserved2 = 0;
+    out._reserved3 = 0;
+    out.frame = ++s_npc_move_send_counter;
+    s_host_npc_sample_ms[in->slot] = now;
+    s_host_npc_last_pos[in->slot][0] = in->pos_x;
+    s_host_npc_last_pos[in->slot][1] = in->pos_y;
+    s_host_npc_last_pos[in->slot][2] = in->pos_z;
+    s_host_npc_relay_count[in->slot]++;
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        if (i != (int)peer && s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+            pc_net_send((PCNetPeerId)i, PC_NET_UNRELIABLE, &out, (uint16_t)sizeof(out));
+        }
+    }
+}
+
+static int pcnetgame_host_talk_hold_free(int slot, char* msg, int msg_size); /* defined with the talk hold */
+
+/* Dedicated console `npc` / `npc free <slot>` (see pc_net_game.h). */
+void pc_net_game_dedicated_npc(const char* args, void (*out)(const char*)) {
+    char line[320];
+    int slot, shown = 0;
+    uint32_t now = pcnetgame_now_ms();
+
+    while (args != NULL && (*args == ' ' || *args == '\t')) {
+        args++;
+    }
+    if (args != NULL && strncmp(args, "free", 4) == 0 && (args[4] == ' ' || args[4] == '\t' || args[4] == 0)) {
+        char msg[160];
+        const char* a = args + 4;
+        char* endp = NULL;
+        long v;
+        while (*a == ' ' || *a == '\t') {
+            a++;
+        }
+        v = strtol(a, &endp, 10);
+        if (*a == 0 || endp == a) {
+            out("NPC: usage: npc free <slot>   (the slot numbers are listed by `npc`)");
+            return;
+        }
+        if (s_role != PC_NETGAME_ROLE_HOST) {
+            out("NPC: not hosting");
+            return;
+        }
+        (void)pcnetgame_host_talk_hold_free((int)v, msg, (int)sizeof(msg));
+        snprintf(line, sizeof(line), "NPC FREE: %s", msg);
+        out(line);
+        return;
+    }
+    if (args != NULL && *args != 0) {
+        out("NPC: usage: npc | npc free <slot>");
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        out("NPC: not hosting");
+        return;
+    }
+    snprintf(line, sizeof(line), "NPC: villager authority (host actor = the host simulates it; relay = a client simulates it and the host relays; neither = nobody near). fallback %s, relay %s, hold cap %u s",
+             pcnetgame_npc_fallback_on() ? "on" : "off", pcnetgame_npc_relay_on() ? "on" : "off", (unsigned)(pcnetgame_talk_hold_cap_ms() / 1000u));
+    out(line);
+    for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+        Animal_c* animal = Save_GetPointer(animals[slot]);
+        mNpc_NpcList_c* list = Common_GetPointer(npclist[slot]);
+        PCNetGameNpcTalkHold* h = &s_host_talk_hold[slot];
+        char actor_s[48], move_s[48], hold_s[96];
+        xyz_t pos;
+        int bx = -1, bz = -1;
+        int live = s_host_npc_actor_ms[slot] != 0 && (uint32_t)(now - s_host_npc_actor_ms[slot]) < PC_NPC_HOST_ACTOR_ALIVE_MS;
+        int fresh = s_host_npc_sample_ms[slot] != 0 && (uint32_t)(now - s_host_npc_sample_ms[slot]) < 2000u;
+
+        if (ITEM_NAME_GET_TYPE(animal->id.npc_id) != NAME_TYPE_NPC) {
+            continue;
+        }
+        shown++;
+        if (live) {
+            snprintf(actor_s, sizeof(actor_s), "host actor");
+        } else if (s_npc_proxy_lease[slot].owner >= 0) {
+            snprintf(actor_s, sizeof(actor_s), "relay peer %d", s_npc_proxy_lease[slot].owner);
+        } else {
+            snprintf(actor_s, sizeof(actor_s), "no actor%s", s_host_npc_actor_ms[slot] ? "" : " (never)");
+        }
+        if (s_host_npc_sample_ms[slot] != 0) {
+            snprintf(move_s, sizeof(move_s), "last NPC_MOVE %u ms ago", (unsigned)(now - s_host_npc_sample_ms[slot]));
+        } else {
+            snprintf(move_s, sizeof(move_s), "no NPC_MOVE sent");
+        }
+        if (h->host_owned && h->npc_id == (uint16_t)animal->id.npc_id) {
+            snprintf(hold_s, sizeof(hold_s), "talking with the host player");
+        } else if (!pc_peer_set_empty(&h->peer_mask) && h->npc_id == (uint16_t)animal->id.npc_id) {
+            snprintf(hold_s, sizeof(hold_s), "HELD by peers 0x%04X for %u s (keepalive %u s ago)", (unsigned)pc_peer_set_low32(&h->peer_mask),
+                     h->begin_ms ? (unsigned)((now - h->begin_ms) / 1000u) : 0u, (unsigned)((now - h->last_ms) / 1000u));
+        } else {
+            snprintf(hold_s, sizeof(hold_s), "no hold%s", pc_peer_set_empty(&h->capped) ? "" : " (capped peers wait for END)");
+        }
+        if (fresh) {
+            pos.x = s_host_npc_last_pos[slot][0];
+            pos.y = s_host_npc_last_pos[slot][1];
+            pos.z = s_host_npc_last_pos[slot][2];
+        } else {
+            pos = list->position;
+        }
+        (void)mFI_Wpos2BlockNum(&bx, &bz, pos);
+        snprintf(line, sizeof(line), "  slot %2d npc 0x%04X %-14s %s; %s; %s; pos (%.0f, %.0f) acre (%d,%d)%s", slot, (unsigned)animal->id.npc_id, actor_s, move_s, hold_s,
+                 animal->is_home ? "at home" : "outside", (double)pos.x, (double)pos.z, bx, bz, fresh ? "" : " [list]");
+        out(line);
+    }
+    if (shown == 0) {
+        out("  (no villagers)");
+    }
+    {
+        int ox = -1, oz = -1;
+        GAME_PLAY* play = (gamePT != NULL && gamePT->exec == play_main) ? (GAME_PLAY*)gamePT : NULL;
+        if (play != NULL) {
+            ox = play->block_table.block_x;
+            oz = play->block_table.block_z;
+        }
+        snprintf(line, sizeof(line), "  the host simulates villagers around acre (%d,%d) (its own player / observer) +-1; elsewhere the nearest client does. `npc free <slot>` releases a stuck conversation hold.", ox, oz);
+        out(line);
+    }
+}
+
+/* Host poll: a relay owner that went quiet / left is released (logged), so the next client in LOCAL mode can take over. */
+static void pcnetgame_host_npc_relay_tick(void) {
+    int slot;
+    uint32_t now = 0;
+    for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
+        PCNpcProxyLease* l = &s_npc_proxy_lease[slot];
+        if (l->owner < 0) {
+            continue;
+        }
+        if (now == 0) {
+            now = pcnetgame_now_ms();
+        }
+        if ((uint32_t)(now - l->last_ms) >= PC_NPC_PROXY_LEASE_MS || l->owner >= pcnetgame_peer_span() || s_host_peer_link[l->owner] != PC_NETGAME_LINK_READY) {
+            pcnetgame_npc_log("[NET][NPC] host: slot %d relay from peer %d ended (%s)", slot, l->owner,
+                              (l->owner < pcnetgame_peer_span() && s_host_peer_link[l->owner] == PC_NETGAME_LINK_READY) ? "silent" : "peer gone");
+            pc_npc_proxy_reset(l);
         }
     }
 }
@@ -41085,6 +41869,10 @@ static void pcnetgame_handle_client_npc_move(const PCNetGameNpcMoveMsg* in) {
     ns->last_accepted_frame = in->frame;
     ns->cached_npc_id = in->npc_id;
     ns->last_action_type = in->action_type;
+    {
+        PCNpcAuthCfg ac = pcnetgame_npc_auth_cfg();
+        pc_npc_auth_on_sample(&s_npc_auth[in->slot], pcnetgame_now_ms(), &ac); /* stale fallback: the stream is alive */
+    }
 
     if (gamePT == NULL) {
         return; /* no frame-time source to timestamp this sample with -- drop rather than mistimestamp
@@ -41845,6 +42633,18 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 pc_pause_menu_toggle();
             }
             printf("[AUTO] pause %d paused=%d ready_peers=%d\n", id, g_pc_paused, pc_net_game_host_ready_peer_count());
+            s_ap.active = 0;
+        } else if (strcmp(cmd, "submenu") == 0) { /* TEST-ONLY: submenu inv|map|notice|calendar|N|close -- open (from free play) / close a submenu through m_submenu.c's test hook (any role) */
+            extern int g_pc_th_submenu_req; /* m_submenu.c */
+            extern int g_pc_paused;
+            char what[16] = {0};
+            int t = 0;
+            if (sscanf(line, "%*d %*s %15s", what) == 1) {
+                t = strcmp(what, "inv") == 0 ? mSM_OVL_INVENTORY : strcmp(what, "map") == 0 ? mSM_OVL_MAP : strcmp(what, "notice") == 0 ? mSM_OVL_NOTICE
+                  : strcmp(what, "calendar") == 0 ? mSM_OVL_CALENDAR : strcmp(what, "close") == 0 ? -1 : atoi(what);
+            }
+            g_pc_th_submenu_req = t;
+            printf("[AUTO] submenu %d req=%d live=%d paused=%d\n", id, t, pc_net_game_menu_world_live(), g_pc_paused);
             s_ap.active = 0;
         } else if (strcmp(cmd, "ppos") == 0) { /* TEST-ONLY (worker 7): the local player's world x y z */
             PLAYER_ACTOR* ppa = get_player_actor_withoutCheck((GAME_PLAY*)gamePT);
@@ -43026,6 +43826,7 @@ void pc_net_game_notify_npc_state(int slot, uint16_t npc_id, uint8_t is_home, ui
     if (slot < 0 || slot >= ANIMAL_NUM_MAX) {
         return; /* malformed input from the caller -- defensive */
     }
+    s_host_npc_actor_ms[slot] = pcnetgame_now_ms(); /* every frame of a live host villager actor, hidden or not (console `npc`, relay gate) */
 
     is_home = is_home ? 1 : 0;
     hide = hide ? 1 : 0;
@@ -48238,3 +49039,1659 @@ static void pcnetgame_evc_client_tick(void) {
     }
 }
 /* ===== EVNPC SHARED END ===== */
+
+/* ===== OUTDOOR FURNITURE BEGIN (stage C1: TXN_COMMIT kind 22 OUTDOOR_FURNITURE, message 98 OUTDOOR_FURN, town service 10 OFURN_CAPS; the OPERATOR LIST;
+ * pc_outdoor_furniture.h / pc_ops.h, docs/multiplayer-guest-roadmap.md "Outdoor furniture (C1) and the operator list") =====
+ * SOURCE OF TRUTH: the town tile holds the furniture id | rotation (synced + saved like any tile; an old client sees a leaf). The HOST keeps the PLACED markers in
+ * s_ofh (sidecar outdoor_furniture.dat next to work_jobs.dat); a marker lives only while its tile holds exactly base | rot (GC every 500 ms: sweeps, pickups, structures).
+ * ORDER (crash safety): the sidecar is saved BEFORE the tile changes (write-ahead). A crash between the two leaves either a marker whose tile does not match (GC drops it:
+ * the piece is a leaf / not there, nothing duplicated) or, for a pickup, the item still on the tile as a leaf (the pocket mirror was not saved either).
+ * Rights: PLACE = a RESIDENT binding (guests: NOT_ALLOWED); ROTATE / PICKUP of a placed piece = a resident, an OPERATOR (ops.ini) or the host's own player; the vanilla
+ * PICKUP_REQUEST of a placed tile is refused for anybody else (a guest / an old client), a leaf (no marker) stays everybody's.
+ * Kill switch: AC_MP_OUTDOOR_FURNITURE=0 (host: service 10 says Place OFF, kind 22 REJECTED OFURN_OFF; client: no Place / Rotate, the renderer still draws the host's list). */
+
+/* ---------------------------------------------------------------- HOST ---------------------------------------------------------------- */
+static PCOfurnTable s_ofh;
+static int          s_ofh_state = 0; /* 0 = not loaded, 1 = loaded (usable), -1 = the sidecar is corrupt: Place is refused (FAULT) until the file is repaired / removed */
+static uint32_t     s_ofh_gc_ms = 0;
+static PCOpsList    s_ops;
+static int          s_ops_state = 0; /* 0 = not loaded, 1 = loaded */
+static uint32_t     s_ops_gen = 1;
+
+static int pcnetgame_ofurn_env_off(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("AC_MP_OUTDOOR_FURNITURE");
+        v = (e != NULL && e[0] == '0') ? 1 : 0;
+        if (v) {
+            printf("[NET][OFURN] AC_MP_OUTDOOR_FURNITURE=0: placing furniture outdoors is OFF in this process (the vanilla leaf drop is unchanged)\n");
+        }
+    }
+    return v;
+}
+
+static int pcnetgame_ofurn_place_on(void) {
+    return !pcnetgame_ofurn_env_off() && g_pc_settings.ofurn_place != 0;
+}
+
+static int pcnetgame_ofurn_leaf_on(void) {
+    return g_pc_settings.ofurn_leaf_drop != 0;
+}
+
+static int pcnetgame_ofurn_max_town(void) {
+    const int v = g_pc_settings.ofurn_max_town;
+    return v < 1 ? PC_OFURN_TOWN_MAX_DEFAULT : (v > PC_OFURN_TABLE_CAP ? PC_OFURN_TABLE_CAP : v);
+}
+
+static int pcnetgame_ofurn_max_acre(void) {
+    const int v = g_pc_settings.ofurn_max_acre;
+    return v < 1 ? PC_OFURN_ACRE_MAX_DEFAULT : (v > 256 ? 256 : v);
+}
+
+/* a host file next to work_jobs.dat (servers/<id>/ on a dedicated server, save/mp/ on a listen host); the parent directories are created */
+static void pcnetgame_ofurn_host_path(char* out, size_t cap, const char* name) {
+    const char* wp = pc_server_work_path();
+    const char* a = strrchr(wp, '/');
+    const char* b = strrchr(wp, '\\');
+    const char* sep = (a != NULL && (b == NULL || a > b)) ? a : b;
+    char dir[300];
+    size_t i;
+    if (sep == NULL) {
+        snprintf(out, cap, "%s", name);
+        return;
+    }
+    snprintf(out, cap, "%.*s/%s", (int)(sep - wp), wp, name);
+    snprintf(dir, sizeof(dir), "%s", out);
+    for (i = 1; dir[i] != 0; i++) {
+        if (dir[i] == '/' || dir[i] == '\\') {
+            char c = dir[i];
+            dir[i] = 0;
+#ifdef _WIN32
+            _mkdir(dir);
+#else
+            mkdir(dir, 0755);
+#endif
+            dir[i] = c;
+        }
+    }
+}
+
+/* the canonical identity key (the membership layer's form): name[8] + town[8] + player_id BE + land_id BE */
+static void pcnetgame_pid_key(const PersonalID_c* p, uint8_t key[PC_OPS_KEY_LEN]) {
+    memcpy(key, p->player_name, PC_NETGAME_NAME_LEN);
+    memcpy(key + 8, p->land_name, PC_NETGAME_LAND_LEN);
+    key[16] = (uint8_t)(p->player_id >> 8);
+    key[17] = (uint8_t)p->player_id;
+    key[18] = (uint8_t)(p->land_id >> 8);
+    key[19] = (uint8_t)p->land_id;
+}
+
+static void pcnetgame_ops_ensure(void) {
+    char path[320];
+    int bad = 0, rc;
+    if (s_ops_state != 0) {
+        return;
+    }
+    pcnetgame_ofurn_host_path(path, sizeof(path), "ops.ini");
+    rc = pc_ops_load(path, &s_ops, &bad);
+    s_ops_state = 1;
+    s_ops_gen++;
+    printf("[NET][OPS] host: operator list %s: %s, %d operator(s)%s\n", path, rc == PC_OPS_OK ? "loaded" : rc == PC_OPS_MISSING ? "none yet" : "UNREADABLE (empty list)",
+           s_ops.n, bad > 0 ? " (some lines were skipped)" : "");
+}
+
+static int pcnetgame_ops_save(void) {
+    char path[320];
+    pcnetgame_ofurn_host_path(path, sizeof(path), "ops.ini");
+    s_ops_gen++;
+    if (!pc_ops_save(path, &s_ops)) {
+        printf("[NET][OPS] host: *** writing %s FAILED (the change is active in memory only) ***\n", path);
+        return 0;
+    }
+    return 1;
+}
+
+/* the authenticated identity of a READY peer: 1 = bound (kind PC_OPS_KIND_*, key, ASCII name) */
+static int pcnetgame_peer_identity(PCNetPeerId peer, int* kind, uint8_t key[PC_OPS_KEY_LEN], char* name) {
+    const PCNetGameHostPeerState* st;
+    if (s_role != PC_NETGAME_ROLE_HOST || peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    st = &s_host_peer[peer];
+    if (!st->bound_valid) {
+        return 0;
+    }
+    *kind = st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST ? PC_OPS_KIND_GUEST : PC_OPS_KIND_RESIDENT;
+    pcnetgame_pid_key(&st->bound_pid, key);
+    if (name != NULL) {
+        pcnetgame_dedicated_ascii_name(st->bound_pid.player_name, name);
+    }
+    return 1;
+}
+
+/* THE reusable operator check (more admin features will use it): 1 = the bound identity of this READY peer is in ops.ini. The listen host's own player is implicitly
+ * an operator (pcnetgame_local_is_op); a dedicated server has no player of its own. */
+int pcnetgame_player_is_op(PCNetPeerId peer) {
+    int kind;
+    uint8_t key[PC_OPS_KEY_LEN];
+    if (!pcnetgame_peer_identity(peer, &kind, key, NULL)) {
+        return 0;
+    }
+    pcnetgame_ops_ensure();
+    return pc_ops_find(&s_ops, kind, key) >= 0;
+}
+
+int pc_net_game_peer_is_op(int peer) {
+    return pcnetgame_player_is_op((PCNetPeerId)peer);
+}
+
+static int pcnetgame_local_is_op(void) {
+    return s_role == PC_NETGAME_ROLE_HOST && !g_pc_dedicated;
+}
+
+static int pcnetgame_ofurn_peer_is_resident(PCNetPeerId peer) {
+    return peer >= 0 && peer < pcnetgame_peer_span() && s_host_peer_link[peer] == PC_NETGAME_LINK_READY && s_host_peer[peer].bound_valid &&
+           s_host_peer[peer].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT;
+}
+
+static int pcnetgame_ofurn_peer_may_pickup(PCNetPeerId peer) {
+    return pcnetgame_ofurn_peer_is_resident(peer) || pcnetgame_player_is_op(peer);
+}
+
+static uint8_t pcnetgame_ofurn_peer_perms(PCNetPeerId peer) {
+    uint8_t f = 0;
+    if (pcnetgame_ofurn_peer_is_resident(peer) && pcnetgame_ofurn_place_on()) {
+        f |= (uint8_t)PC_OFURN_PERM_PLACE;
+    }
+    if (pcnetgame_ofurn_peer_may_pickup(peer)) {
+        f |= (uint8_t)PC_OFURN_PERM_PICKUP;
+    }
+    if (pcnetgame_player_is_op(peer)) {
+        f |= (uint8_t)PC_OFURN_PERM_OP;
+    }
+    if (pcnetgame_ofurn_leaf_on()) {
+        f |= (uint8_t)PC_OFURN_PERM_LEAF_DROP;
+    }
+    return f;
+}
+
+static void pcnetgame_ofurn_build_caps(uint8_t* blob) {
+    pc_ofurn_caps_build(blob, pcnetgame_ofurn_place_on(), pcnetgame_ofurn_leaf_on(), pcnetgame_ofurn_max_town(), pcnetgame_ofurn_max_acre());
+}
+
+static const char* pcnetgame_ofurn_op_name(int op) {
+    return op == PC_OFURN_OP_PLACE ? "PLACE" : op == PC_OFURN_OP_ROTATE ? "ROTATE" : op == PC_OFURN_OP_PICKUP ? "PICKUP" : "?";
+}
+
+/* HOST: the marker table, loaded lazily once the host world is ready (the sidecar may hold markers of tiles the town save no longer matches: the GC drops them) */
+static int pcnetgame_ofurn_host_ready(void) {
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        return 0;
+    }
+    if (s_ofh_state == 0) {
+        char path[320];
+        int dropped = 0, rc;
+        pcnetgame_ofurn_host_path(path, sizeof(path), "outdoor_furniture.dat");
+        rc = pc_ofurn_load(path, &s_ofh, &dropped);
+        if (rc == PC_OFURN_FILE_BAD) {
+            s_ofh_state = -1;
+            pc_ofurn_table_init(&s_ofh);
+            printf("[NET][OFURN] host: *** %s is CORRUPT: placed furniture stays as LEAVES and Place is refused until the file is repaired or removed ***\n", path);
+        } else {
+            s_ofh_state = 1;
+            if (s_ofh.gen == 0u) {
+                s_ofh.gen = 1u;
+            }
+            printf("[NET][OFURN] host: %s %s: %d placed piece(s)%s; Place %s, leaf drop %s, safety ceiling %d per town / %d per acre\n", path,
+                   rc == PC_OFURN_FILE_OK ? "loaded" : "none yet", s_ofh.n, dropped > 0 ? " (invalid records skipped)" : "", pcnetgame_ofurn_place_on() ? "ON" : "OFF",
+                   pcnetgame_ofurn_leaf_on() ? "ON" : "OFF", pcnetgame_ofurn_max_town(), pcnetgame_ofurn_max_acre());
+        }
+        pcnetgame_ops_ensure();
+    }
+    return s_ofh_state == 1;
+}
+
+static int pcnetgame_ofurn_host_save(void) {
+    char path[320];
+    pcnetgame_ofurn_host_path(path, sizeof(path), "outdoor_furniture.dat");
+    if (!pc_ofurn_save(path, &s_ofh)) {
+        printf("[NET][OFURN] host: *** saving %s FAILED ***\n", path);
+        return 0;
+    }
+    return 1;
+}
+
+/* ---- the per-peer list / delta / perms traffic (message 98) ---- */
+#define PCNG_OFURN_NEED    0u
+#define PCNG_OFURN_PUSHING 1u
+#define PCNG_OFURN_SYNCED  2u
+
+static void pcnetgame_ofurn_entry(PCOfurnWireEntry* e, const PCOfurnMarker* m) {
+    e->ut_x = m->ut_x;
+    e->ut_z = m->ut_z;
+    e->item = pc_ofurn_tile_value(m);
+    e->placed_time = m->placed_time;
+}
+
+static int pcnetgame_ofurn_send(PCNetPeerId peer, PCOfurnMsg* m) {
+    m->msg_type = (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN;
+    return pc_net_send(peer, PC_NET_RELIABLE, m, (uint16_t)sizeof(*m)) ? 1 : 0;
+}
+
+/* a change of the host table: SYNCED peers get the delta, a peer mid-list restarts its list (its BEGIN gen no longer matches) */
+static void pcnetgame_ofurn_broadcast(uint8_t kind, const PCOfurnMarker* mk) {
+    int p;
+    PCOfurnMsg m;
+    memset(&m, 0, sizeof(m));
+    m.kind = kind;
+    m.count = 1;
+    m.gen = s_ofh.gen;
+    m.total = (uint32_t)s_ofh.n;
+    pcnetgame_ofurn_entry(&m.e[0], mk);
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        PCNetGameHostPeerState* st = &s_host_peer[p];
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (st->ofurn_state == PCNG_OFURN_SYNCED) {
+            if (!pcnetgame_ofurn_send((PCNetPeerId)p, &m)) {
+                st->ofurn_state = PCNG_OFURN_NEED; /* window full: the whole list follows later (nothing is lost) */
+            }
+        } else if (st->ofurn_state == PCNG_OFURN_PUSHING) {
+            st->ofurn_state = PCNG_OFURN_NEED;
+        }
+    }
+    printf("[NET][OFURN] host: %s tile (%u,%u) item 0x%04X (%d placed piece(s))\n", kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)mk->ut_x, (unsigned)mk->ut_z,
+           (unsigned)pc_ofurn_tile_value(mk), s_ofh.n);
+}
+
+static void pcnetgame_ofurn_host_pump_peer(PCNetPeerId peer) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    int sent = 0;
+    if (s_host_peer_link[peer] != PC_NETGAME_LINK_READY || !st->bound_valid) {
+        return;
+    }
+    if (!st->ofurn_perms_valid || st->ofurn_perms != pcnetgame_ofurn_peer_perms(peer)) {
+        PCOfurnMsg m;
+        memset(&m, 0, sizeof(m));
+        m.kind = PC_OFURN_MK_PERMS;
+        m.flags = pcnetgame_ofurn_peer_perms(peer);
+        m.gen = s_ops_gen;
+        if (pcnetgame_ofurn_send(peer, &m)) {
+            st->ofurn_perms_valid = 1;
+            st->ofurn_perms = m.flags;
+            printf("[NET][OFURN] host: peer %d rights: place=%d pickup=%d op=%d leaf_drop=%d\n", (int)peer, (m.flags & PC_OFURN_PERM_PLACE) != 0,
+                   (m.flags & PC_OFURN_PERM_PICKUP) != 0, (m.flags & PC_OFURN_PERM_OP) != 0, (m.flags & PC_OFURN_PERM_LEAF_DROP) != 0);
+        }
+    }
+    while (sent < 3 && pcnetgame_host_join_push_ok((int)peer)) { /* the 0.2.1 join gate: no snapshot under way, reliable backlog < 32 */
+        PCOfurnMsg m;
+        memset(&m, 0, sizeof(m));
+        if (st->ofurn_state == PCNG_OFURN_NEED) {
+            m.kind = PC_OFURN_MK_BEGIN;
+            m.gen = s_ofh.gen;
+            m.total = (uint32_t)s_ofh.n;
+            if (!pcnetgame_ofurn_send(peer, &m)) {
+                return;
+            }
+            st->ofurn_state = PCNG_OFURN_PUSHING;
+            st->ofurn_gen = s_ofh.gen;
+            st->ofurn_next = 0;
+        } else if (st->ofurn_state == PCNG_OFURN_PUSHING) {
+            if (st->ofurn_gen != s_ofh.gen) {
+                st->ofurn_state = PCNG_OFURN_NEED; /* changed mid-list: start over (deltas are only for SYNCED peers) */
+                continue;
+            }
+            if ((int)st->ofurn_next < s_ofh.n) {
+                int i;
+                m.kind = PC_OFURN_MK_CHUNK;
+                m.gen = s_ofh.gen;
+                m.total = (uint32_t)s_ofh.n;
+                for (i = 0; i < PC_OFURN_MSG_ENTRIES && (int)st->ofurn_next + i < s_ofh.n; i++) {
+                    pcnetgame_ofurn_entry(&m.e[i], &s_ofh.m[st->ofurn_next + i]);
+                }
+                m.count = (uint8_t)i;
+                if (!pcnetgame_ofurn_send(peer, &m)) {
+                    return;
+                }
+                st->ofurn_next = (uint16_t)(st->ofurn_next + i);
+            } else {
+                m.kind = PC_OFURN_MK_END;
+                m.gen = s_ofh.gen;
+                m.total = (uint32_t)s_ofh.n;
+                if (!pcnetgame_ofurn_send(peer, &m)) {
+                    return;
+                }
+                st->ofurn_state = PCNG_OFURN_SYNCED;
+                printf("[NET][OFURN] host: peer %d has the placed-furniture list (%d piece(s), gen %u)\n", (int)peer, s_ofh.n, (unsigned)s_ofh.gen);
+                return;
+            }
+        } else {
+            return;
+        }
+        sent++;
+    }
+}
+
+/* GC: a marker whose tile no longer holds exactly base | rot is dropped (a police-box sweep, a vanilla pickup, a new structure, a host-side write) */
+static void pcnetgame_ofurn_host_gc(void) {
+    int i, removed = 0;
+    for (i = s_ofh.n - 1; i >= 0; i--) {
+        int acre, tile;
+        uint16_t v = 0;
+        const PCOfurnMarker mk = s_ofh.m[i];
+        if (!pcfa_town_ut_to_acre_tile(mk.ut_x, mk.ut_z, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) || v != pc_ofurn_tile_value(&mk)) {
+            (void)pc_ofurn_remove_at(&s_ofh, i);
+            printf("[NET][OFURN] host: GC tile (%u,%u): it holds 0x%04X now, not the placed 0x%04X -- marker dropped\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)v,
+                   (unsigned)pc_ofurn_tile_value(&mk));
+            pcnetgame_ofurn_broadcast(PC_OFURN_MK_DEL, &mk);
+            removed++;
+        }
+    }
+    if (removed > 0) {
+        (void)pcnetgame_ofurn_host_save();
+    }
+}
+
+static void pcnetgame_ofurn_test_seed(void); /* TEST-ONLY, below */
+
+static void pcnetgame_ofurn_host_tick(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    int p;
+    if (!pcnetgame_ofurn_host_ready() && s_ofh_state != -1) {
+        return;
+    }
+    if (s_ofh_state == 1 && pcfa_save_ready() && (uint32_t)(now - s_ofh_gc_ms) >= 500u) {
+        s_ofh_gc_ms = now;
+        pcnetgame_ofurn_host_gc();
+        pcnetgame_ofurn_test_seed();
+    }
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        pcnetgame_ofurn_host_pump_peer((PCNetPeerId)p);
+    }
+    pcnetgame_ofurn_client_tick(); /* the TEST-ONLY seam driver also runs for the listen host's own player */
+}
+
+/* ---- validation (READ-ONLY): 0 = placeable, else a PC_NETGAME_TXN_REASON_* and *why ---- */
+static int pcnetgame_ofurn_is_structure(uint16_t v) {
+    return v >= 0xF000u; /* DUMMY_* structure placeholders, RSV_SIGNBOARD, RSV_NO (house / building footprints) */
+}
+
+/* the TILE rules of a placement (no player, no item): 0 = placeable, else a reason + *why */
+static uint8_t pcnetgame_ofurn_tile_rules(int ux, int uz, const char** why) {
+    int acre, tile, dx, dz;
+    uint16_t v = 0;
+    xyz_t center;
+    if (!pcfa_scene_is_town() || !pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile)) {
+        *why = "not a town tile (or the host's town collision is not loaded)";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0 || pcfa_get_deposit(acre, tile) != 0 || !pcfa_get_tile(acre, tile, &v) || v != (uint16_t)EMPTY_NO) {
+        *why = "the tile is not empty (an item, a buried item or a reservation)";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+    }
+    if (!mFI_UtNum2CenterWpos(&center, ux, uz) || !mCoBG_CheckPlace(center)) {
+        *why = "the ground there takes no item (water, cliff edge, bridge)";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+    }
+    for (dz = -1; dz <= 1; dz++) {
+        for (dx = -1; dx <= 1; dx++) {
+            int a2, t2;
+            uint16_t nv = 0;
+            if ((dx != 0 || dz != 0) && pcfa_town_ut_to_acre_tile(ux + dx, uz + dz, &a2, &t2) && pcfa_get_tile(a2, t2, &nv) && pcnetgame_ofurn_is_structure(nv)) {
+                *why = "next to a building / door";
+                return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+            }
+        }
+    }
+    return 0;
+}
+
+static uint8_t pcnetgame_ofurn_check_place(int ux, int uz, uint16_t item, int player_ux, int player_uz, const char** why) {
+    int cap;
+    uint8_t r;
+    if (!pcnetgame_ofurn_place_on()) {
+        *why = "the Place action is off on this host";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_OFF;
+    }
+    if (s_ofh_state != 1) {
+        *why = "the placed-furniture sidecar is not usable";
+        return (uint8_t)PC_NETGAME_TXN_REASON_FAULT;
+    }
+    if (!pc_ofurn_is_ftr(item) || mNT_check_unknown((mActor_name_t)item)) {
+        *why = "not a furniture item";
+        return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+    }
+    if (aMR_PC_FtrItemShape((int)item) != PC_OFURN_SHAPE_1X1) {
+        *why = "the furniture is not 1x1";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_TOO_BIG;
+    }
+    if (!pc_ofurn_reach_ok(player_ux, player_uz, ux, uz)) {
+        *why = "the tile is not next to the player";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+    }
+    if ((r = pcnetgame_ofurn_tile_rules(ux, uz, why)) != 0) {
+        return r;
+    }
+    cap = pc_ofurn_caps_check(&s_ofh, pc_ofurn_acre_of(ux, uz), pcnetgame_ofurn_max_town(), pcnetgame_ofurn_max_acre());
+    if (cap != 0) {
+        *why = cap == 1 ? "the town's safety ceiling of placed furniture is reached" : "the acre's safety ceiling of placed furniture is reached";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_LIMIT;
+    }
+    return 0;
+}
+
+/* the placed piece at (ux, uz) that the client claims to see (`item` = base | rot): its marker index, or -1 + *reason */
+static int pcnetgame_ofurn_check_existing(int ux, int uz, uint16_t item, uint8_t* reason, const char** why) {
+    int acre, tile, idx;
+    uint16_t v = 0;
+    idx = pc_ofurn_find(&s_ofh, ux, uz);
+    if (idx < 0 || !pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) || v != pc_ofurn_tile_value(&s_ofh.m[idx])) {
+        *why = "no placed furniture on that tile";
+        *reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_GONE;
+        return -1;
+    }
+    if (v != item) {
+        *why = "the placed furniture changed (another player rotated / replaced it)";
+        *reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_GONE;
+        return -1;
+    }
+    if (pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
+        *why = "the tile is reserved by another player's pickup";
+        *reason = (uint8_t)PC_NETGAME_TXN_REASON_BUSY;
+        return -1;
+    }
+    return idx;
+}
+
+/* ---- the commits (shared by kind 22 and the listen host's own player); 1 = done, 0 = FAULT (nothing changed) ---- */
+static int pcnetgame_ofurn_commit_place(int ux, int uz, uint16_t item, int rot, int placer_kind, const uint8_t* key, const char* name) {
+    PCOfurnMarker mk;
+    int acre, tile, idx;
+    memset(&mk, 0, sizeof(mk));
+    mk.ut_x = (uint8_t)ux;
+    mk.ut_z = (uint8_t)uz;
+    mk.rot = (uint8_t)(rot & 3);
+    mk.base = pc_ofurn_base(item);
+    mk.placer_kind = (uint8_t)placer_kind;
+    mk.placed_time = (uint32_t)time(NULL);
+    if (key != NULL) {
+        memcpy(mk.placer_key, key, PC_OFURN_KEY_LEN);
+    }
+    snprintf(mk.placer_name, sizeof(mk.placer_name), "%s", name != NULL ? name : "");
+    if (!pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile) || !pc_ofurn_add(&s_ofh, &mk)) {
+        return 0;
+    }
+    if (!pcnetgame_ofurn_host_save()) { /* write-ahead: the sidecar first */
+        idx = pc_ofurn_find(&s_ofh, ux, uz);
+        (void)pc_ofurn_remove_at(&s_ofh, idx);
+        return 0;
+    }
+    if (!pcfa_set_tile(acre, tile, pc_ofurn_tile_value(&mk))) {
+        idx = pc_ofurn_find(&s_ofh, ux, uz);
+        (void)pc_ofurn_remove_at(&s_ofh, idx);
+        (void)pcnetgame_ofurn_host_save();
+        return 0;
+    }
+    pcnetgame_host_flush_mask((uint32_t)1u << acre); /* FIELD_UPDATE to every READY peer (an old client: a leaf) */
+    pcnetgame_ofurn_broadcast(PC_OFURN_MK_SET, &mk);
+    return 1;
+}
+
+static int pcnetgame_ofurn_commit_rotate(int idx, int rot) {
+    PCOfurnMarker before = s_ofh.m[idx];
+    int acre, tile;
+    if (!pcfa_town_ut_to_acre_tile(before.ut_x, before.ut_z, &acre, &tile)) {
+        return 0;
+    }
+    s_ofh.m[idx].rot = (uint8_t)(rot & 3);
+    s_ofh.gen++;
+    if (!pcnetgame_ofurn_host_save() || !pcfa_set_tile(acre, tile, pc_ofurn_tile_value(&s_ofh.m[idx]))) {
+        s_ofh.m[idx] = before;
+        s_ofh.gen++;
+        (void)pcnetgame_ofurn_host_save();
+        return 0;
+    }
+    pcnetgame_host_flush_mask((uint32_t)1u << acre);
+    pcnetgame_ofurn_broadcast(PC_OFURN_MK_SET, &s_ofh.m[idx]);
+    return 1;
+}
+
+/* removes the placed piece (marker + tile); the item itself is the caller's (a pocket / the lost and found / deleted) */
+static int pcnetgame_ofurn_commit_remove(int idx) {
+    const PCOfurnMarker mk = s_ofh.m[idx];
+    int acre, tile;
+    if (!pcfa_town_ut_to_acre_tile(mk.ut_x, mk.ut_z, &acre, &tile)) {
+        return 0;
+    }
+    (void)pc_ofurn_remove_at(&s_ofh, idx);
+    if (!pcnetgame_ofurn_host_save()) {
+        (void)pc_ofurn_add(&s_ofh, &mk);
+        return 0;
+    }
+    if (!pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO)) {
+        (void)pc_ofurn_add(&s_ofh, &mk);
+        (void)pcnetgame_ofurn_host_save();
+        return 0;
+    }
+    pcnetgame_host_flush_mask((uint32_t)1u << acre);
+    pcnetgame_ofurn_broadcast(PC_OFURN_MK_DEL, &mk);
+    return 1;
+}
+
+/* ---- the vanilla pickup / drop gates (called from pcnetgame_validate_and_resolve_pickup / pcnetgame_is_droppable_item) ---- */
+int pcnetgame_ofurn_pickup_gate(PCNetPeerId peer, int ut_x, int ut_z, uint16_t raw, uint16_t* granted) {
+    int idx;
+    if (s_role != PC_NETGAME_ROLE_HOST || s_ofh_state != 1 || !pc_ofurn_is_ftr(raw)) {
+        return 1; /* no marker possible: the vanilla leaf rule */
+    }
+    idx = pc_ofurn_find(&s_ofh, ut_x, ut_z);
+    if (idx < 0 || pc_ofurn_tile_value(&s_ofh.m[idx]) != raw) {
+        return 1; /* a leaf: everybody's */
+    }
+    if (!pcnetgame_ofurn_peer_may_pickup(peer)) {
+        printf("[NET][OFURN] host: peer %d vanilla pickup of the PLACED piece at (%d,%d) REFUSED: guests (and old clients of guests) may not take placed furniture\n", (int)peer, ut_x,
+               ut_z);
+        return 0;
+    }
+    *granted = pc_ofurn_base(raw); /* a placed piece comes back with rotation 0 (the marker is GC'd once the tile is empty) */
+    return 1;
+}
+
+int pc_net_game_ofurn_leaf_drop_ok(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return pcnetgame_ofurn_leaf_on();
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        extern int pcnetgame_ofurn_client_leaf_ok(void);
+        return pcnetgame_ofurn_client_leaf_ok();
+    }
+    return 1;
+}
+
+/* ---- kind 22 ---- */
+static void pcnetgame_handle_host_ofurn_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {
+    const PCNetGameTxnTag* t = &in->tag;
+    const int op = (int)t->aux_cond;
+    const int ux = (int)(t->aux_item & 0xFFu), uz = (int)((t->aux_item >> 8) & 0xFFu);
+    PCNetGameHostPeerState* st;
+    PCNetGameRecSlot* slot;
+    PCNetGameTxnResident* R;
+    const PCNetGameTxnLog* old;
+    uint16_t post[mPr_POCKETS_SLOT_COUNT];
+    uint32_t post_conds, post_wallet, hash;
+    const char* why = NULL;
+    uint8_t reason = 0;
+    unsigned dest_code;
+    int idx, midx = -1, kind = 0, pux, puz;
+    uint8_t key[PC_OPS_KEY_LEN];
+    char name[PC_OPS_NAME_MAX];
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return; /* not READY: dropped silently (D3 rule) */
+    }
+    st = &s_host_peer[peer];
+    idx = pcnetgame_rec_gate(peer, 0, 0);
+    if (idx < 0) {
+        pcnetgame_txn_reject(peer, -1, NULL, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_NOT_BOUND, 0, NULL, "peer has no valid binding");
+        return;
+    }
+    slot = pcnetgame_rec_slot(idx);
+    if (st->rec_state != PC_NETGAME_RECS_SYNCED || !s_host_world_ready) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0,
+                             st->rec_state != PC_NETGAME_RECS_SYNCED ? (uint8_t)PC_NETGAME_TXN_REASON_NOT_SYNCED : (uint8_t)PC_NETGAME_TXN_REASON_BUSY, 0, NULL,
+                             "record not SYNCED / host world not ready");
+        return;
+    }
+    dest_code = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET ? 1u : t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE ? 0u : 9u;
+    if (!(in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 &&
+          pc_ofurn_shape_ok(op, dest_code, t->slot, t->item, t->flags, t->aux_item, (unsigned)mPr_POCKETS_SLOT_COUNT))) {
+        pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE, 0, NULL, "malformed OUTDOOR_FURNITURE TXN_COMMIT");
+        pcnetgame_rec_violation(peer, "malformed OUTDOOR_FURNITURE TXN_COMMIT (BAD_SHAPE)");
+        return;
+    }
+    /* journal: fence, replay, conflict (identical rules to the other one-phase kinds) */
+    R = &s_txn_res[idx];
+    hash = pcnetgame_fnv1a32(in, sizeof(*in));
+    if (pcnetgame_txn_nonce_fenced(R, t->txn_nonce)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "nonce fenced");
+        return;
+    }
+    if (t->txn_nonce == R->nonce) {
+        old = pcnetgame_txn_journal_find(R, t->txn_nonce, t->txn_seq);
+        if (old != NULL) {
+            if (old->msg_hash != hash) {
+                pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_CONFLICT, 0, NULL, "same (nonce, seq) with different bytes");
+            } else if (old->outcome == (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED) {
+                printf("[NET][OFURN] host: peer %d replay of an applied %s (request %u): answered from the journal, nothing re-executed\n", (int)peer, pcnetgame_ofurn_op_name(op),
+                       (unsigned)in->request_id);
+                pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED, "replay ");
+            } else {
+                pcnetgame_txn_send_result(peer, idx, in, (uint8_t)PC_NETGAME_TXN_OUTCOME_REJECTED, old->reason, slot->epoch, slot->rev, 0, NULL, 0, 0, "replay ");
+            }
+            return;
+        }
+        if (t->txn_seq <= R->max_seq) {
+            pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FENCED, 0, NULL, "seq at or below the fence");
+            return;
+        }
+    } else {
+        if (R->nonce != 0) {
+            memmove(&R->fenced[0], &R->fenced[1], sizeof(R->fenced) - sizeof(R->fenced[0]));
+            R->fenced[PC_NETGAME_TXN_FENCED_NUM - 1] = R->nonce;
+        }
+        R->nonce = t->txn_nonce;
+        R->head = 0;
+        R->n = 0;
+        R->max_seq = 0;
+    }
+    R->max_seq = t->txn_seq; /* from here on every outcome is journalled */
+
+    pcnetgame_rec_refresh_hostfields(idx, slot);
+    if (t->base_epoch != slot->epoch || t->base_rev < R->last_pocket_rev || t->base_rev > slot->rev) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_STALE_IMAGE, 1, NULL, "base (epoch, rev) is stale or from the future");
+        pcnetgame_rec_stale_push(peer, idx, slot, pcnetgame_now_ms());
+        return;
+    }
+    if (pcnetgame_rec_validate_inventory(t->pre_pockets, t->pre_conds, t->pre_wallet) != 0) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_BAD_IMAGE, 1, NULL, "pre-image failed validation");
+        return;
+    }
+    if (!pcnetgame_rec_txn_idx_ok(idx)) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL, "no writable record for this player");
+        return;
+    }
+    (void)pcnetgame_ofurn_host_ready();
+    memcpy(post, t->pre_pockets, sizeof(post));
+    post_conds = t->pre_conds;
+    post_wallet = t->pre_wallet;
+    (void)pcnetgame_peer_identity(peer, &kind, key, name);
+    /* the requester's tile from ITS last synced position (never a client claim) */
+    if (!st->ctx_valid || !(st->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN) || !pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz) ||
+        !pcnetgame_pos_valid(px, py, pz)) {
+        why = "the player is not (known to be) in the town";
+        reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+    }
+    pux = (int)(px / mFI_UT_WORLDSIZE_X_F);
+    puz = (int)(pz / mFI_UT_WORLDSIZE_Z_F);
+    if (why == NULL && !pc_ofurn_rate_ok(&st->ofurn_rate, pcnetgame_now_ms(), 200u, 120)) { /* generous: 5 ops a second at most, 120 a minute */
+        why = "rate limited";
+        reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_RATE;
+    }
+    if (why == NULL) {
+        switch (op) {
+            case PC_OFURN_OP_PLACE:
+                if (!pcnetgame_ofurn_peer_is_resident(peer)) {
+                    why = "only residents may place furniture outdoors";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED;
+                } else if (t->pre_pockets[t->slot] != t->item || mPr_GET_ITEM_COND(t->pre_conds, t->slot) != mPr_ITEM_COND_NORMAL) {
+                    why = "the pocket slot does not hold that furniture (or it is wrapped / a quest item)";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+                } else if ((reason = pcnetgame_ofurn_check_place(ux, uz, t->item, pux, puz, &why)) == 0) {
+                    post[t->slot] = (uint16_t)EMPTY_NO;
+                    post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+                }
+                break;
+            case PC_OFURN_OP_ROTATE:
+            case PC_OFURN_OP_PICKUP:
+                if (!pcnetgame_ofurn_peer_may_pickup(peer)) {
+                    why = "only residents and operators may pick up / rotate placed furniture";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED;
+                } else if (s_ofh_state != 1) {
+                    why = "the placed-furniture sidecar is not usable";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_FAULT;
+                } else if ((midx = pcnetgame_ofurn_check_existing(ux, uz, t->item, &reason, &why)) < 0) {
+                    /* why / reason set */
+                } else if (!pc_ofurn_reach_ok(pux, puz, ux, uz)) {
+                    why = "the piece is not next to the player";
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+                } else if (op == PC_OFURN_OP_PICKUP) {
+                    if (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+                        why = "the destination pocket slot is not free";
+                        reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_ROOM;
+                    } else {
+                        post[t->slot] = pc_ofurn_base(t->item); /* back with rotation 0 */
+                        post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+                    }
+                }
+                break;
+            default:
+                why = "unknown op";
+                reason = (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE;
+                break;
+        }
+    }
+    if (why != NULL) {
+        printf("[NET][OFURN] host: peer %d %s %d %s at (%d,%d) item 0x%04X REFUSED (%s): %s\n", (int)peer, idx >= PLAYER_NUM ? "guest" : "resident", idx,
+               pcnetgame_ofurn_op_name(op), ux, uz, (unsigned)t->item, pcnetgame_txn_reason_name(reason), why);
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, reason, 1, NULL, why);
+        return; /* RESULT sent; nothing mutated */
+    }
+    if (pcnetgame_rec_validate_inventory(post, post_conds, post_wallet) != 0) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL, "post-image failed validation");
+        return;
+    }
+    /* THE commit: world + marker (write-ahead sidecar) + the pocket mirror in one handler call */
+    if (!(op == PC_OFURN_OP_PLACE ? pcnetgame_ofurn_commit_place(ux, uz, t->item, (int)t->flags, kind == PC_OPS_KIND_GUEST ? PC_OFURN_PLACER_GUEST : PC_OFURN_PLACER_RESIDENT, key, name)
+          : op == PC_OFURN_OP_ROTATE ? pcnetgame_ofurn_commit_rotate(midx, (int)t->flags)
+                                     : pcnetgame_ofurn_commit_remove(midx))) {
+        pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FAULT, 1, NULL, "the sidecar / tile write failed (nothing changed)");
+        return;
+    }
+    if (op != PC_OFURN_OP_ROTATE) {
+        (void)pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet);
+        slot->rev++;
+        slot->dirty_unsaved = 1;
+        R->last_pocket_rev = slot->rev;
+    }
+    pcnetgame_txn_journal_add(R, in, hash, (uint8_t)PC_NETGAME_TXN_OUTCOME_APPLIED, (uint8_t)PC_NETGAME_TXN_REASON_NONE, slot->rev);
+    printf("[NET][OFURN] host: peer %d %s %d \"%s\" %s APPLIED [TXN]: tile (%d,%d) item 0x%04X rot %u, pocket slot %u -> 0x%04X (%d placed piece(s))\n", (int)peer,
+           idx >= PLAYER_NUM ? "guest" : "resident", idx, name, pcnetgame_ofurn_op_name(op), ux, uz, (unsigned)t->item, (unsigned)t->flags, (unsigned)t->slot,
+           (unsigned)post[t->slot], s_ofh.n);
+    pcnetgame_txn_send_applied(peer, idx, in, slot, (uint8_t)PC_NETGAME_TXN_REASON_NONE, "");
+    if (st->rec_push_active) {
+        pcnetgame_rec_start_push(peer, idx, st->rec_push_kind); /* a push in flight carries the PRE-transaction pockets */
+    }
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, host; never active in normal play), once the host world is ready and the host is in the town:
+ *   AC_TEST_OFURN_SEED=<item>[,<rot>]  writes ONE placed piece (marker + tile) as the HOST player on the first placeable tile (the tile rules of a placement, scanned from
+ *                                      the middle of the town) whose south neighbour is placeable too (a client can stand there); logs "seeded placed piece at (x,z)".
+ *   AC_TEST_OFURN_LEAF=<item>          writes a furniture LEAF (a tile value, NO marker) on the next such tile; logs "seeded leaf at (x,z)".
+ *   AC_TEST_OFURN_GC_MS=<ms>           <ms> after the seed, writes EMPTY over the seeded placed tile behind the system's back (the GC must drop the marker).
+ *   AC_TEST_OPS=<name>                 makes the first online player with that name an operator through the console's own code (pc_net_game_dedicated_ops). */
+static int pcnetgame_ofurn_test_find_tile(int skip_ux, int skip_uz, int* out_ux, int* out_uz) {
+    int ux, uz;
+    const char* why;
+    for (uz = 40; uz < 100; uz++) {
+        for (ux = 30; ux < 85; ux++) {
+            if ((ux == skip_ux && (uz == skip_uz || uz == skip_uz + 1 || uz == skip_uz - 1)) || pcnetgame_ofurn_tile_rules(ux, uz, &why) != 0 ||
+                pcnetgame_ofurn_tile_rules(ux, uz + 1, &why) != 0 || pcnetgame_ofurn_tile_rules(ux + 1, uz, &why) != 0) {
+                continue;
+            }
+            *out_ux = ux;
+            *out_uz = uz;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pcnetgame_ofurn_test_seed(void) {
+    static int done = 0, done_gc = 0, done_ops = 0;
+    static int sx = -100, sz = -100;
+    static uint32_t seed_ms = 0;
+    const char* e;
+    if (!pcfa_scene_is_town()) {
+        return;
+    }
+    if (!done && pc_test_hook_getenv("AC_TEST_OFURN_SEED_NEAR") != NULL && (e = pc_test_hook_getenv("AC_TEST_OFURN_SEED")) != NULL) {
+        /* AC_TEST_OFURN_SEED_NEAR=1: the piece goes NEXT TO the first READY in-town peer (a real client then draws it and registers its collision) */
+        int p, item = 0, rot = 0;
+        if (sscanf(e, "%i,%d", &item, &rot) < 1) {
+            done = 1;
+            return;
+        }
+        for (p = 0; p < pcnetgame_peer_span() && !done; p++) {
+            float px, py, pz;
+            const PCNetGameHostPeerState* st = &s_host_peer[p];
+            if (s_host_peer_link[p] == PC_NETGAME_LINK_READY && st->rec_state == PC_NETGAME_RECS_SYNCED && st->ctx_valid && (st->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN) &&
+                pc_remote_player_get_last_position((PCNetPlayerId)p, &px, &py, &pz) && pcnetgame_pos_valid(px, py, pz)) {
+                const int pux = (int)(px / mFI_UT_WORLDSIZE_X_F), puz = (int)(pz / mFI_UT_WORLDSIZE_Z_F);
+                const char* why;
+                int rad, dx, dz;
+                /* the nearest placeable tile (rings 1..8) whose south neighbour is free to stand on (the real client walks / is put there) */
+                for (rad = 1; rad <= 8 && !done; rad++) {
+                    for (dz = -rad; dz <= rad && !done; dz++) {
+                        for (dx = -rad; dx <= rad && !done; dx++) {
+                            const int tx = pux + dx, tz = puz + dz;
+                            if ((dx != -rad && dx != rad && dz != -rad && dz != rad) || pcnetgame_ofurn_tile_rules(tx, tz, &why) != 0 ||
+                                pcnetgame_ofurn_tile_rules(tx, tz + 1, &why) != 0) {
+                                continue;
+                            }
+                            done = 1;
+                            seed_ms = pcnetgame_now_ms();
+                            sx = tx;
+                            sz = tz;
+                            printf("[NET][OFURN][TEST-ONLY] host: seeded placed piece at (%d,%d) item 0x%04X rot %d -> %s (next to peer %d at (%d,%d))\n", sx, sz, (unsigned)item,
+                                   rot & 3, pcnetgame_ofurn_commit_place(sx, sz, (uint16_t)item, rot & 3, PC_OFURN_PLACER_HOST, NULL, "test-seed") ? "placed" : "FAILED", p, pux,
+                                   puz);
+                        }
+                    }
+                }
+                if (!done) {
+                    static uint32_t warn_ms = 0;
+                    if ((uint32_t)(pcnetgame_now_ms() - warn_ms) >= 5000u) {
+                        warn_ms = pcnetgame_now_ms();
+                        printf("[NET][OFURN][TEST-ONLY] host: no placeable tile near peer %d at (%d,%d) yet\n", p, pux, puz);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if (!done) {
+        done = 1;
+        seed_ms = pcnetgame_now_ms();
+        if ((e = pc_test_hook_getenv("AC_TEST_OFURN_SEED")) != NULL) {
+            int item = 0, rot = 0;
+            if (sscanf(e, "%i,%d", &item, &rot) >= 1 && pcnetgame_ofurn_test_find_tile(-100, -100, &sx, &sz)) {
+                printf("[NET][OFURN][TEST-ONLY] host: seeded placed piece at (%d,%d) item 0x%04X rot %d -> %s\n", sx, sz, (unsigned)item, rot & 3,
+                       pcnetgame_ofurn_commit_place(sx, sz, (uint16_t)item, rot & 3, PC_OFURN_PLACER_HOST, NULL, "test-seed") ? "placed" : "FAILED");
+            } else {
+                printf("[NET][OFURN][TEST-ONLY] host: AC_TEST_OFURN_SEED=%s: no placeable tile found -- not seeded\n", e);
+            }
+        }
+        if ((e = pc_test_hook_getenv("AC_TEST_OFURN_LEAF")) != NULL) {
+            int item = 0, lx, lz, acre, tile;
+            if (sscanf(e, "%i", &item) == 1 && pcnetgame_ofurn_test_find_tile(sx, sz, &lx, &lz) && pcfa_town_ut_to_acre_tile(lx, lz, &acre, &tile) &&
+                pcfa_set_tile(acre, tile, (uint16_t)item)) {
+                pcnetgame_host_flush_mask((uint32_t)1u << acre);
+                printf("[NET][OFURN][TEST-ONLY] host: seeded leaf at (%d,%d) item 0x%04X (no marker)\n", lx, lz, (unsigned)item);
+            }
+        }
+    }
+    if (!done_gc && sx >= 0 && (e = pc_test_hook_getenv("AC_TEST_OFURN_GC_MS")) != NULL && (uint32_t)(pcnetgame_now_ms() - seed_ms) >= (uint32_t)strtoul(e, NULL, 0)) {
+        int acre, tile;
+        done_gc = 1;
+        if (pcfa_town_ut_to_acre_tile(sx, sz, &acre, &tile) && pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO)) {
+            pcnetgame_host_flush_mask((uint32_t)1u << acre);
+            printf("[NET][OFURN][TEST-ONLY] host: overwrote the seeded tile (%d,%d) with EMPTY behind the system's back (the GC must drop its marker)\n", sx, sz);
+        }
+    }
+    if (!done_ops && (e = pc_test_hook_getenv("AC_TEST_OPS")) != NULL) {
+        int p, kind;
+        uint8_t key[PC_OPS_KEY_LEN];
+        char nm[PC_OPS_NAME_MAX], msg[300];
+        for (p = 0; p < pcnetgame_peer_span(); p++) {
+            if (pcnetgame_peer_identity((PCNetPeerId)p, &kind, key, nm) && pcnetgame_dedicated_ieq(nm, e)) {
+                done_ops = 1;
+                (void)pc_net_game_dedicated_ops(1, e, msg, (int)sizeof(msg));
+                printf("[NET][OPS][TEST-ONLY] host: op %s -> %s\n", e, msg);
+                break;
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- CLIENT ---------------------------------------------------------------- */
+static PCOfurnTable s_ofc;
+static PCOfurnTable s_ofc_stage;
+static struct {
+    int      staging;
+    uint32_t stage_gen, stage_total;
+    int      have_caps, place_on, leaf_on, max_town, max_acre;
+    int      have_perms;
+    uint8_t  perms;
+    int      unsupported;     /* the host refused kind 22 as BAD_SHAPE: never again this session */
+    int      op_active;       /* a kind 22 op is in flight (s_ctxn) */
+    int      op;
+    uint32_t op_rid;
+    int      last_outcome;    /* TEST-ONLY observation: 1 APPLIED, 2 REJECTED */
+    uint8_t  last_reason;
+} s_ofcl;
+
+int pcnetgame_ofurn_client_leaf_ok(void) {
+    if (s_ofcl.have_perms) {
+        return (s_ofcl.perms & PC_OFURN_PERM_LEAF_DROP) != 0;
+    }
+    return s_ofcl.have_caps ? s_ofcl.leaf_on : 1; /* an old host: the vanilla leaf drop */
+}
+
+static void pcnetgame_ofurn_session_reset(void) {
+    pc_ofurn_table_init(&s_ofc);
+    pc_ofurn_table_init(&s_ofc_stage);
+    memset(&s_ofcl, 0, sizeof(s_ofcl));
+}
+
+static void pcnetgame_ofurn_client_apply_caps(const uint8_t* blob) {
+    const int place = (blob[1] & 1u) != 0, leaf = (blob[1] & 2u) != 0;
+    const int mt = (int)blob[2] | ((int)blob[3] << 8), ma = (int)blob[4] | ((int)blob[5] << 8);
+    if (!s_ofcl.have_caps || s_ofcl.place_on != place || s_ofcl.leaf_on != leaf || s_ofcl.max_town != mt || s_ofcl.max_acre != ma) {
+        printf("[NET][OFURN] client: the host supports outdoor furniture: Place %s, leaf drop %s, safety ceiling %d per town / %d per acre\n", place ? "ON" : "OFF",
+               leaf ? "ON" : "OFF", mt, ma);
+    }
+    s_ofcl.have_caps = 1;
+    s_ofcl.place_on = place;
+    s_ofcl.leaf_on = leaf;
+    s_ofcl.max_town = mt;
+    s_ofcl.max_acre = ma;
+}
+
+static void pcnetgame_ofurn_apply_entries(PCOfurnTable* t, const PCOfurnMsg* m, int del) {
+    int i;
+    for (i = 0; i < (int)m->count; i++) {
+        if (del) {
+            const int k = pc_ofurn_find(t, m->e[i].ut_x, m->e[i].ut_z);
+            if (k >= 0) {
+                (void)pc_ofurn_remove_at(t, k);
+            }
+        } else {
+            PCOfurnMarker mk;
+            memset(&mk, 0, sizeof(mk));
+            mk.ut_x = m->e[i].ut_x;
+            mk.ut_z = m->e[i].ut_z;
+            mk.base = pc_ofurn_base(m->e[i].item);
+            mk.rot = (uint8_t)(m->e[i].item & 3u);
+            mk.placed_time = m->e[i].placed_time;
+            (void)pc_ofurn_add(t, &mk);
+        }
+    }
+}
+
+static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (!pc_ofurn_msg_valid(m)) {
+        printf("[NET][OFURN] client: malformed OUTDOOR_FURN (kind %u count %u) -- ignored\n", (unsigned)m->kind, (unsigned)m->count);
+        return;
+    }
+    switch (m->kind) {
+        case PC_OFURN_MK_BEGIN:
+            pc_ofurn_table_init(&s_ofc_stage);
+            s_ofcl.staging = 1;
+            s_ofcl.stage_gen = m->gen;
+            s_ofcl.stage_total = m->total;
+            break;
+        case PC_OFURN_MK_CHUNK:
+            if (s_ofcl.staging && m->gen == s_ofcl.stage_gen) {
+                pcnetgame_ofurn_apply_entries(&s_ofc_stage, m, 0);
+            }
+            break;
+        case PC_OFURN_MK_END:
+            if (s_ofcl.staging && m->gen == s_ofcl.stage_gen) {
+                memcpy(&s_ofc, &s_ofc_stage, sizeof(s_ofc));
+                s_ofc.gen++;
+                s_ofcl.staging = 0;
+                printf("[NET][OFURN] client: placed-furniture list: %d piece(s) (host gen %u, announced %u)\n", s_ofc.n, (unsigned)m->gen, (unsigned)s_ofcl.stage_total);
+            }
+            break;
+        case PC_OFURN_MK_SET:
+        case PC_OFURN_MK_DEL:
+            pcnetgame_ofurn_apply_entries(&s_ofc, m, m->kind == PC_OFURN_MK_DEL);
+            if (s_ofcl.staging) {
+                pcnetgame_ofurn_apply_entries(&s_ofc_stage, m, m->kind == PC_OFURN_MK_DEL);
+            }
+            printf("[NET][OFURN] client: %s tile (%u,%u) item 0x%04X (%d placed piece(s) known)\n", m->kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)m->e[0].ut_x,
+                   (unsigned)m->e[0].ut_z, (unsigned)m->e[0].item, s_ofc.n);
+            break;
+        default: /* PERMS */
+            if (!s_ofcl.have_perms || s_ofcl.perms != m->flags) {
+                printf("[NET][OFURN] client: my rights: place=%d pickup=%d op=%d leaf_drop=%d\n", (m->flags & PC_OFURN_PERM_PLACE) != 0, (m->flags & PC_OFURN_PERM_PICKUP) != 0,
+                       (m->flags & PC_OFURN_PERM_OP) != 0, (m->flags & PC_OFURN_PERM_LEAF_DROP) != 0);
+            }
+            s_ofcl.have_perms = 1;
+            s_ofcl.perms = m->flags;
+            break;
+    }
+}
+
+static int pcnetgame_ofurn_client_can(uint8_t perm) {
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_ofcl.have_caps && !s_ofcl.unsupported && s_ofcl.have_perms &&
+           (s_ofcl.perms & perm) != 0 && !pcnetgame_ofurn_env_off();
+}
+
+/* begins ONE kind 22 op (1 = queued / sent, 0 = refused locally, -1 = busy) */
+static int pcnetgame_ofurn_begin(int op, int slot, uint16_t item, int flags, int ux, int uz) {
+    PCNetGameOwnerStamp stamp;
+    if (!pc_ofurn_shape_ok(op, op == PC_OFURN_OP_PICKUP ? 1u : 0u, (unsigned)slot, (unsigned)item, (unsigned)flags, ((unsigned)uz << 8) | (unsigned)ux,
+                           (unsigned)mPr_POCKETS_SLOT_COUNT)) {
+        printf("[NET][OFURN] client: %s refused locally: the request would be malformed (tile (%d,%d) item 0x%04X) -- nothing sent\n", pcnetgame_ofurn_op_name(op), ux, uz,
+               (unsigned)item);
+        return 0; /* never a BAD_SHAPE (a record violation on the host) */
+    }
+    if (s_ofcl.op_active || pcnetgame_txn_begin_blocked() || s_pickup_pending.valid || s_drop_pending.valid || s_bury_pending.valid) {
+        return -1;
+    }
+    if (!pcnetgame_capture_owner_stamp(&stamp)) {
+        return 0;
+    }
+    memset(&s_ctxn, 0, sizeof(s_ctxn));
+    s_ctxn.state = PC_NETGAME_CTXN_QUEUED;
+    s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN;
+    s_ctxn.slot = (uint8_t)slot;
+    s_ctxn.item = item;
+    s_ctxn.ts_aux = (uint8_t)op;
+    s_ctxn.ts_aux_item = (uint16_t)(((unsigned)uz << 8) | (unsigned)ux);
+    s_ctxn.take_dst = (uint8_t)flags;
+    s_ctxn.ut_x = (uint8_t)ux;
+    s_ctxn.ut_z = (uint8_t)uz;
+    s_ctxn.request_id = s_ts_next_rid++;
+    s_ctxn.owner = stamp;
+    s_ctxn.first_ms = pcnetgame_now_ms();
+    s_ofcl.op_active = 1;
+    s_ofcl.op = op;
+    s_ofcl.op_rid = s_ctxn.request_id;
+    printf("[NET][OFURN] client: begin %s request=%u tile (%d,%d) slot=%d item=0x%04X flags=%d\n", pcnetgame_ofurn_op_name(op), (unsigned)s_ctxn.request_id, ux, uz, slot,
+           (unsigned)item, flags);
+    (void)pcnetgame_txn_try_send();
+    return 1;
+}
+
+/* QUEUED -> SENT: PLACE: the slot still holds the item; PICKUP: a free slot of THIS moment */
+static int pcnetgame_ofurn_try_send_check(PCNetGameClientTxn* T, uint8_t* dest, uint8_t* slot) {
+    const int op = (int)T->ts_aux;
+    int s = (int)T->slot;
+    if (Now_Private == NULL || s >= mPr_POCKETS_SLOT_COUNT) {
+        return 0;
+    }
+    if (op == PC_OFURN_OP_PLACE) {
+        if (Now_Private->inventory.pockets[s] != (mActor_name_t)T->item) {
+            return 0;
+        }
+        *dest = (uint8_t)PC_NETGAME_TXN_DEST_NONE;
+    } else if (op == PC_OFURN_OP_PICKUP) {
+        if (Now_Private->inventory.pockets[s] != (mActor_name_t)EMPTY_NO) {
+            s = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+        }
+        if (s < 0) {
+            return 0;
+        }
+        *dest = (uint8_t)PC_NETGAME_TXN_DEST_POCKET;
+    } else {
+        s = 0;
+        *dest = (uint8_t)PC_NETGAME_TXN_DEST_NONE;
+    }
+    *slot = (uint8_t)s;
+    return 1;
+}
+
+/* APPLIED: the host's post-image of the touched slot (PLACE: emptied, PICKUP: the base item, ROTATE: nothing) */
+static int pcnetgame_txn_apply_ofurn(const PCNetGameClientTxn* T, const PCNetGameTxnResultMsg* in) {
+    const PCNetGameTxnTag* t = &T->tag;
+    const int op = (int)t->aux_cond;
+    Private_c* np = Now_Private;
+    int s;
+    if (in->host_session == s_crec.base_session && in->epoch == s_crec.base_epoch && in->rev > s_crec.base_rev) {
+        pcnetgame_crec_set_base(in->epoch, in->rev, in->host_session, in->cdig);
+        s_crec.next_check_ms = 0;
+    }
+    if (np == NULL || t->slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT) {
+        return 0;
+    }
+    if (op == PC_OFURN_OP_PLACE) {
+        if (in->post_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+            printf("[NET][OFURN] client: *** APPLIED PLACE carries an inconsistent post-image -- nothing applied ***\n");
+            return 0;
+        }
+        s = (np->inventory.pockets[t->slot] == (mActor_name_t)t->item) ? (int)t->slot : mPr_GetPossessionItemIdx(np, (mActor_name_t)t->item);
+        if (s >= 0) {
+            np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;
+            np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_NORMAL);
+        }
+    } else if (op == PC_OFURN_OP_PICKUP) {
+        const uint16_t got = in->post_pockets[t->slot];
+        if (got != pc_ofurn_base(t->item)) {
+            printf("[NET][OFURN] client: *** APPLIED PICKUP carries an inconsistent post-image -- nothing applied ***\n");
+            return 0;
+        }
+        s = (np->inventory.pockets[t->slot] == (mActor_name_t)EMPTY_NO) ? (int)t->slot : mPr_GetPossessionItemIdx(np, (mActor_name_t)EMPTY_NO);
+        if (s < 0) {
+            s = (int)t->slot; /* the host's slot wins (never a duplicate) */
+        }
+        np->inventory.pockets[s] = (mActor_name_t)got;
+        np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_NORMAL);
+        mPr_SetItemCollectBit((mActor_name_t)got);
+    }
+    printf("[NET][OFURN] client: %s APPLIED (request %u): tile (%u,%u) item 0x%04X\n", pcnetgame_ofurn_op_name(op), (unsigned)T->request_id, (unsigned)T->ut_x, (unsigned)T->ut_z,
+           (unsigned)t->item);
+    return 1;
+}
+
+static void pcnetgame_ofurn_op_resolve(int applied, uint8_t reason) {
+    s_ofcl.op_active = 0;
+    s_ofcl.last_outcome = applied ? 1 : 2;
+    s_ofcl.last_reason = applied ? 0 : reason;
+    if (!applied && reason == (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE && !s_ofcl.unsupported) {
+        s_ofcl.unsupported = 1; /* a host that announced service 10 but does not know this op: no further kind 22 in this session */
+        printf("[NET][OFURN] client: the host refused OUTDOOR_FURNITURE as BAD_SHAPE: Place / Rotate stay off for this session\n");
+    }
+    if (!applied) {
+        pc_ofurn_notice_set(pc_ofurn_reason_text(reason), pcnetgame_now_ms());
+    }
+}
+
+const char* pc_net_game_ofurn_notice(void) {
+    return pc_ofurn_notice_get(pcnetgame_now_ms());
+}
+
+static void pcnetgame_ofurn_notice(const char* text) {
+    pc_ofurn_notice_set(text, pcnetgame_now_ms());
+}
+
+void pc_net_game_ofurn_notice_text(const char* text) {
+    pcnetgame_ofurn_notice(text);
+}
+
+/* ---------------------------------------------------------------- seams ---------------------------------------------------------------- */
+const PCOfurnTable* pc_net_game_ofurn_view(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return s_ofh_state == 1 ? &s_ofh : NULL;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY) {
+        return &s_ofc;
+    }
+    return NULL;
+}
+
+uint32_t pc_net_game_ofurn_view_gen(void) {
+    const PCOfurnTable* t = pc_net_game_ofurn_view();
+    return t != NULL ? t->gen : 0u;
+}
+
+int pc_net_game_ofurn_may_pickup(void) {
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return 1;
+    }
+    return pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PICKUP);
+}
+
+int pc_net_game_ofurn_place_offer(int item) {
+    if (!pc_ofurn_is_ftr((uint16_t)item) || !pcfa_scene_is_town()) {
+        return 0; /* the town field only (never the island, a room, a shop) */
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return !g_pc_dedicated && pcnetgame_ofurn_place_on() && s_ofh_state == 1;
+    }
+    return pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PLACE);
+}
+
+/* the local player's tile (the listen host's own reach check) */
+static int pcnetgame_ofurn_local_tile(int* ux, int* uz) {
+    PLAYER_ACTOR* pl = GET_PLAYER_ACTOR_NOW();
+    if (!pcnetgame_is_real_player_actor(pl)) {
+        return 0;
+    }
+    *ux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F);
+    *uz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
+    return 1;
+}
+
+static void pcnetgame_ofurn_local_identity(uint8_t key[PC_OPS_KEY_LEN], char* name) {
+    memset(key, 0, PC_OPS_KEY_LEN);
+    name[0] = '\0';
+    if (Now_Private != NULL) {
+        pcnetgame_pid_key(&Now_Private->player_ID, key);
+        pcnetgame_dedicated_ascii_name(Now_Private->player_ID.player_name, name);
+    }
+}
+
+int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int rot) {
+    if (pocket_slot < 0 || pocket_slot >= mPr_POCKETS_SLOT_COUNT || Now_Private == NULL) {
+        return 0;
+    }
+    if (aMR_PC_FtrItemShape(item) != PC_OFURN_SHAPE_1X1) {
+        pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_TOO_BIG));
+        return 0; /* refused locally: never a round trip for a 2x1 / 2x2 piece */
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        uint8_t key[PC_OPS_KEY_LEN];
+        char name[PC_OPS_NAME_MAX];
+        const char* why = NULL;
+        int pux, puz;
+        uint8_t reason;
+        if (!pcnetgame_ofurn_host_ready() || !pcnetgame_ofurn_local_tile(&pux, &puz)) {
+            pcnetgame_ofurn_notice(pc_ofurn_reason_text(0));
+            return 0;
+        }
+        reason = pcnetgame_ofurn_check_place(ut_x, ut_z, (uint16_t)item, pux, puz, &why);
+        if (reason != 0 || Now_Private->inventory.pockets[pocket_slot] != (mActor_name_t)item) {
+            printf("[NET][OFURN] host: own player PLACE at (%d,%d) item 0x%04X refused (%s): %s\n", ut_x, ut_z, (unsigned)item, pcnetgame_txn_reason_name(reason),
+                   why != NULL ? why : "the pocket changed");
+            pcnetgame_ofurn_notice(pc_ofurn_reason_text(reason));
+            return 0;
+        }
+        pcnetgame_ofurn_local_identity(key, name);
+        if (!pcnetgame_ofurn_commit_place(ut_x, ut_z, (uint16_t)item, rot, PC_OFURN_PLACER_HOST, key, name)) {
+            pcnetgame_ofurn_notice(pc_ofurn_reason_text(0));
+            return 0;
+        }
+        mPr_SetPossessionItem(Now_Private, pocket_slot, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+        printf("[NET][OFURN] host: own player \"%s\" PLACE APPLIED: tile (%d,%d) item 0x%04X rot %d\n", name, ut_x, ut_z, (unsigned)item, rot);
+        return 1;
+    }
+    if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PLACE)) {
+        pcnetgame_ofurn_notice(pc_ofurn_reason_text(s_ofcl.have_perms && !(s_ofcl.perms & PC_OFURN_PERM_PLACE) ? PC_OFURN_REASON_NOT_ALLOWED : PC_OFURN_REASON_OFF));
+        return 0;
+    }
+    return pcnetgame_ofurn_begin(PC_OFURN_OP_PLACE, pocket_slot, (uint16_t)item, rot & 3, ut_x, ut_z) == 1;
+}
+
+/* the placed piece at (ux, uz) in the VIEW whose tile still holds it (renderer / A / B seams) */
+static int pcnetgame_ofurn_view_at(int ux, int uz, uint16_t* value) {
+    const PCOfurnTable* t = pc_net_game_ofurn_view();
+    int k, acre, tile;
+    uint16_t v = 0;
+    if (t == NULL || (k = pc_ofurn_find(t, ux, uz)) < 0 || !pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) ||
+        v != pc_ofurn_tile_value(&t->m[k])) {
+        return 0;
+    }
+    *value = v;
+    return 1;
+}
+
+int pc_net_game_ofurn_placed_at(int ut_x, int ut_z) {
+    uint16_t v;
+    return pcnetgame_ofurn_view_at(ut_x, ut_z, &v);
+}
+
+int pc_net_game_ofurn_rotate(int ut_x, int ut_z) {
+    uint16_t v = 0;
+    int rot;
+    if (!pcnetgame_ofurn_view_at(ut_x, ut_z, &v)) {
+        return 0;
+    }
+    rot = ((int)(v & 3u) + 1) & 3; /* +90 degrees (clockwise seen from above) */
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        const int idx = pc_ofurn_find(&s_ofh, ut_x, ut_z);
+        if (idx < 0 || !pcnetgame_ofurn_commit_rotate(idx, rot)) {
+            pcnetgame_ofurn_notice(pc_ofurn_reason_text(0));
+            return 1;
+        }
+        printf("[NET][OFURN] host: own player ROTATE APPLIED: tile (%d,%d) rot %d\n", ut_x, ut_z, rot);
+        return 1;
+    }
+    if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PICKUP)) {
+        pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED));
+        return 1; /* consumed: a guest's A press does nothing else on a placed piece */
+    }
+    (void)pcnetgame_ofurn_begin(PC_OFURN_OP_ROTATE, 0, v, rot, ut_x, ut_z);
+    return 1;
+}
+
+int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {
+    uint16_t v = 0;
+    int s;
+    if (!pcnetgame_ofurn_view_at(ut_x, ut_z, &v) || Now_Private == NULL) {
+        return 0;
+    }
+    s = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        const int idx = pc_ofurn_find(&s_ofh, ut_x, ut_z);
+        if (s < 0) {
+            pcnetgame_ofurn_notice(pc_ofurn_reason_text(22));
+            return 1;
+        }
+        if (idx < 0 || !pcnetgame_ofurn_commit_remove(idx)) {
+            pcnetgame_ofurn_notice(pc_ofurn_reason_text(0));
+            return 1;
+        }
+        mPr_SetPossessionItem(Now_Private, s, pc_ofurn_base(v), mPr_ITEM_COND_NORMAL);
+        printf("[NET][OFURN] host: own player PICKUP APPLIED: tile (%d,%d) item 0x%04X -> pocket slot %d\n", ut_x, ut_z, (unsigned)pc_ofurn_base(v), s);
+        return 1;
+    }
+    if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PICKUP)) {
+        pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED));
+        return 1; /* consumed: a guest never takes a placed piece (the host would refuse the vanilla pickup too) */
+    }
+    if (s < 0) {
+        pcnetgame_ofurn_notice(pc_ofurn_reason_text(22));
+        return 1;
+    }
+    (void)pcnetgame_ofurn_begin(PC_OFURN_OP_PICKUP, s, v, 0, ut_x, ut_z);
+    return 1;
+}
+
+/* TEST-ONLY (AC_TEST_HOOKS=1, client or listen host; never active in normal play): AC_TEST_OFURN=place|cycle|rotpick drives the REAL seams once the record is synced,
+ * the rights arrived and the town is loaded:
+ *   place   = pc_net_game_ofurn_place() with the first 1x1 furniture of the pockets on the front tile (what the tag menu's "Place" calls);
+ *   cycle   = place, then pc_net_game_ofurn_rotate(), then pc_net_game_ofurn_pickup() on that tile, 3 s apart;
+ *   rotpick = turn to the placed piece next to the player and press A, then B through pc_ofurn_front_press() (the wait-state input seam). */
+extern int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger);
+static void pcnetgame_ofurn_test_hook(void) {
+    static int stage = 0;
+    static uint32_t t0 = 0;
+    static int ux = -1, uz = -1, face = 0;
+    const char* e;
+    PLAYER_ACTOR* pl;
+    uint32_t now;
+    if (stage >= 9 || (e = pc_test_hook_getenv("AC_TEST_OFURN")) == NULL || gamePT == NULL || !pcfa_scene_is_town()) {
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT && (s_client_link != PC_NETGAME_LINK_READY || s_crec.state != PC_NETGAME_CRS_SYNCED || !s_ofcl.have_perms)) {
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_NONE || s_ofcl.op_active || pcnetgame_txn_busy()) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (t0 == 0u) {
+        t0 = now;
+        return;
+    }
+    if ((uint32_t)(now - t0) < (stage == 0 ? 6000u : 3000u)) {
+        return;
+    }
+    pl = GET_PLAYER_ACTOR_NOW();
+    if (!pcnetgame_is_real_player_actor(pl) || Now_Private == NULL) {
+        return;
+    }
+    t0 = now;
+    if (strcmp(e, "rotpick") == 0) {
+        const int pux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F), puz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
+        if (stage == 0) {
+            /* the nearest placed piece of the view within 10 tiles: the local player is put on the tile SOUTH of it (TEST-ONLY local write, like --txn-test-pickup-drop),
+             * facing north; the press follows 2 s later (the host has the new position by then) */
+            const PCOfurnTable* vt = pc_net_game_ofurn_view();
+            int k, best = -1, bd = 1 << 30;
+            xyz_t c;
+            for (k = 0; vt != NULL && k < vt->n; k++) {
+                const int dx = (int)vt->m[k].ut_x - pux, dz = (int)vt->m[k].ut_z - puz;
+                if (dx * dx + dz * dz < bd && dx * dx + dz * dz <= 100 && pc_net_game_ofurn_placed_at(vt->m[k].ut_x, vt->m[k].ut_z)) {
+                    bd = dx * dx + dz * dz;
+                    best = k;
+                }
+            }
+            if (best < 0 || !mFI_UtNum2CenterWpos(&c, vt->m[best].ut_x, vt->m[best].ut_z + 1)) {
+                return; /* no placed piece near the player yet (the list / FIELD_UPDATE may still be on the way) */
+            }
+            ux = vt->m[best].ut_x;
+            uz = vt->m[best].ut_z;
+            face = 0x8000; /* north (-z): the piece is the front tile */
+            pl->actor_class.world.position.x = c.x;
+            pl->actor_class.world.position.z = c.z;
+            pl->actor_class.shape_info.rotation.y = (s16)face;
+            printf("[NET][OFURN][TEST-ONLY] rotpick: the placed piece at (%d,%d): the local player put on (%d,%d) facing it (NOT active in normal play)\n", ux, uz, ux, uz + 1);
+            stage = 1;
+            return;
+        }
+        if (stage == 1) {
+            pl->actor_class.shape_info.rotation.y = (s16)face; /* TEST-ONLY: face the piece like a player would */
+            printf("[NET][OFURN][TEST-ONLY] rotpick: A -> %d\n", pc_ofurn_front_press(gamePT, 1, 0));
+            stage = 2;
+            return;
+        }
+        pl->actor_class.shape_info.rotation.y = (s16)face;
+        printf("[NET][OFURN][TEST-ONLY] rotpick: B -> %d (last outcome %d reason %u)\n", pc_ofurn_front_press(gamePT, 0, 1), s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+        stage = 9;
+        return;
+    }
+    if (stage == 0) {
+        int s, found = -1;
+        for (s = 0; s < mPr_POCKETS_SLOT_COUNT && found < 0; s++) {
+            const mActor_name_t it = Now_Private->inventory.pockets[s];
+            if (pc_ofurn_is_ftr((uint16_t)it) && aMR_PC_FtrItemShape((int)it) == PC_OFURN_SHAPE_1X1 &&
+                mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, s) == mPr_ITEM_COND_NORMAL) {
+                found = s;
+            }
+        }
+        pc_ofurn_front_tile(pl->actor_class.world.position.x, pl->actor_class.world.position.z, (int)pl->actor_class.shape_info.rotation.y, &ux, &uz);
+        printf("[NET][OFURN][TEST-ONLY] place: pocket slot %d item 0x%04X at the front tile (%d,%d) rot %d (NOT active in normal play)\n", found,
+               found >= 0 ? (unsigned)Now_Private->inventory.pockets[found] : 0u, ux, uz, pc_ofurn_rot_for_facing((int)pl->actor_class.shape_info.rotation.y));
+        if (found >= 0) {
+            printf("[NET][OFURN][TEST-ONLY] place -> %d\n",
+                   pc_net_game_ofurn_place(found, (int)Now_Private->inventory.pockets[found], ux, uz, pc_ofurn_rot_for_facing((int)pl->actor_class.shape_info.rotation.y)));
+        }
+        stage = (strcmp(e, "cycle") == 0) ? 1 : 9;
+        return;
+    }
+    if (stage == 1) {
+        printf("[NET][OFURN][TEST-ONLY] rotate (%d,%d) -> %d (last outcome %d reason %u)\n", ux, uz, pc_net_game_ofurn_rotate(ux, uz), s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+        stage = 2;
+        return;
+    }
+    printf("[NET][OFURN][TEST-ONLY] pickup (%d,%d) -> %d (last outcome %d reason %u)\n", ux, uz, pc_net_game_ofurn_pickup(ux, uz), s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+    stage = 9;
+}
+
+static void pcnetgame_ofurn_client_tick(void) {
+    pcnetgame_ofurn_test_hook();
+}
+
+/* ---------------------------------------------------------------- dedicated console ---------------------------------------------------------------- */
+typedef struct PcngOpsCand {
+    int     kind;
+    uint8_t key[PC_OPS_KEY_LEN];
+    char    name[PC_OPS_NAME_MAX];
+    char    where[48];
+} PcngOpsCand;
+
+static int pcnetgame_ops_cand_add(PcngOpsCand* c, int n, int cap, int kind, const uint8_t* key, const char* name, const char* where) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (c[i].kind == kind && memcmp(c[i].key, key, PC_OPS_KEY_LEN) == 0) {
+            return n; /* the same identity seen online and in the tables */
+        }
+    }
+    if (n >= cap) {
+        return n;
+    }
+    c[n].kind = kind;
+    memcpy(c[n].key, key, PC_OPS_KEY_LEN);
+    snprintf(c[n].name, sizeof(c[n].name), "%s", name);
+    snprintf(c[n].where, sizeof(c[n].where), "%s", where);
+    return n + 1;
+}
+
+/* every identity whose name matches `sel` (case-insensitive): online bound peers, the save's residents, this town's guests; or exactly `peer N` */
+static int pcnetgame_ops_resolve(const char* sel, PcngOpsCand* c, int cap) {
+    int n = 0, i;
+    char nm[24], where[48];
+    uint8_t key[PC_OPS_KEY_LEN];
+    if (strncmp(sel, "peer ", 5) == 0) {
+        int kind;
+        const int p = atoi(sel + 5);
+        if (pcnetgame_peer_identity((PCNetPeerId)p, &kind, key, nm)) {
+            snprintf(where, sizeof(where), "online, peer %d", p);
+            n = pcnetgame_ops_cand_add(c, n, cap, kind, key, nm, where);
+        }
+        return n;
+    }
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        int kind;
+        if (pcnetgame_peer_identity((PCNetPeerId)i, &kind, key, nm) && pcnetgame_dedicated_ieq(nm, sel)) {
+            snprintf(where, sizeof(where), "online, peer %d", i);
+            n = pcnetgame_ops_cand_add(c, n, cap, kind, key, nm, where);
+        }
+    }
+    for (i = 0; i < PLAYER_NUM; i++) {
+        PersonalID_c* p = &Save_Get(private_data)[i].player_ID;
+        if (mPr_NullCheckPersonalID(p) == FALSE) {
+            pcnetgame_dedicated_ascii_name(p->player_name, nm);
+            if (pcnetgame_dedicated_ieq(nm, sel)) {
+                pcnetgame_pid_key(p, key);
+                snprintf(where, sizeof(where), "resident slot %d", i);
+                n = pcnetgame_ops_cand_add(c, n, cap, PC_OPS_KIND_RESIDENT, key, nm, where);
+            }
+        }
+    }
+    for (i = 0; s_guest_store_loaded && i < s_guest_cap; i++) {
+        if (s_guest[i].used && pcnetgame_town_equal(&s_guest[i].town, &s_host_town)) {
+            pcnetgame_dedicated_ascii_name(s_guest[i].key.player_name, nm);
+            if (pcnetgame_dedicated_ieq(nm, sel)) {
+                pcnetgame_pid_key(&s_guest[i].key, key);
+                snprintf(where, sizeof(where), "guest slot %d", i);
+                n = pcnetgame_ops_cand_add(c, n, cap, PC_OPS_KIND_GUEST, key, nm, where);
+            }
+        }
+    }
+    return n;
+}
+
+/* op 0 = list, 1 = op, 2 = deop. 1 = done, 0 = refused (msg says why). */
+int pc_net_game_dedicated_ops(int op, const char* sel, char* msg, int cap) {
+    PcngOpsCand c[8];
+    int n, r, i;
+    size_t used = 0;
+    if (msg == NULL || cap <= 0) {
+        return 0;
+    }
+    msg[0] = '\0';
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        snprintf(msg, (size_t)cap, "the server is not a ready host yet");
+        return 0;
+    }
+    pcnetgame_ops_ensure();
+    if (op == 0) {
+        used += (size_t)snprintf(msg, (size_t)cap, "%d operator(s)%s", s_ops.n, s_ops.n ? ":" : " (a listen host's own player is always one; add with `op <player>`)");
+        for (i = 0; i < s_ops.n && used + 96 < (size_t)cap; i++) {
+            int p, online = -1;
+            for (p = 0; p < pcnetgame_peer_span(); p++) {
+                int kind;
+                uint8_t key[PC_OPS_KEY_LEN];
+                if (pcnetgame_peer_identity((PCNetPeerId)p, &kind, key, NULL) && kind == (int)s_ops.e[i].kind && memcmp(key, s_ops.e[i].key, PC_OPS_KEY_LEN) == 0) {
+                    online = p;
+                }
+            }
+            used += (size_t)snprintf(msg + used, (size_t)cap - used, "\n  %d: %s \"%s\"%s", i, pc_ops_kind_name(s_ops.e[i].kind), s_ops.e[i].name,
+                                     online >= 0 ? " (online)" : "");
+        }
+        return 1;
+    }
+    if (sel == NULL || sel[0] == '\0') {
+        snprintf(msg, (size_t)cap, "usage: %s <player name | peer N>", op == 1 ? "op" : "deop");
+        return 0;
+    }
+    n = pcnetgame_ops_resolve(sel, c, 8);
+    if (n == 0) {
+        /* deop of a name only the list knows (e.g. a guest of another town / a removed resident) */
+        if (op == 2) {
+            for (i = 0; i < s_ops.n; i++) {
+                if (pcnetgame_dedicated_ieq(s_ops.e[i].name, sel)) {
+                    const PCOpsEntry e = s_ops.e[i];
+                    (void)pc_ops_remove(&s_ops, e.kind, e.key);
+                    (void)pcnetgame_ops_save();
+                    snprintf(msg, (size_t)cap, "\"%s\" (%s, by its listed name) is no longer an operator", e.name, pc_ops_kind_name(e.kind));
+                    return 1;
+                }
+            }
+        }
+        snprintf(msg, (size_t)cap, "no player named \"%s\" (online, resident or guest of this town; see `players`, `residents`, `guests`)", sel);
+        return 0;
+    }
+    if (n > 1) {
+        used = (size_t)snprintf(msg, (size_t)cap, "REFUSED: \"%s\" is ambiguous (%d players have that name):", sel, n);
+        for (i = 0; i < n && used + 64 < (size_t)cap; i++) {
+            used += (size_t)snprintf(msg + used, (size_t)cap - used, " [%s %s]", pc_ops_kind_name(c[i].kind), c[i].where);
+        }
+        if (used + 40 < (size_t)cap) {
+            snprintf(msg + used, (size_t)cap - used, " -- use `peer N` while that player is online");
+        }
+        return 0;
+    }
+    if (op == 1) {
+        r = pc_ops_add(&s_ops, c[0].kind, c[0].key, c[0].name);
+        if (r < 0) {
+            snprintf(msg, (size_t)cap, "REFUSED: the operator list is full (%d)", PC_OPS_MAX);
+            return 0;
+        }
+        if (r == 1) {
+            (void)pcnetgame_ops_save();
+        }
+        snprintf(msg, (size_t)cap, "\"%s\" (%s, %s) %s", c[0].name, pc_ops_kind_name(c[0].kind), c[0].where, r == 1 ? "is now an operator" : "was already an operator");
+        return 1;
+    }
+    r = pc_ops_remove(&s_ops, c[0].kind, c[0].key);
+    if (r == 1) {
+        (void)pcnetgame_ops_save();
+    }
+    snprintf(msg, (size_t)cap, "\"%s\" (%s, %s) %s", c[0].name, pc_ops_kind_name(c[0].kind), c[0].where, r == 1 ? "is no longer an operator" : "was not an operator");
+    return 1;
+}
+
+static void pcnetgame_ofurn_list_line(int i, void (*out)(const char*)) {
+    const PCOfurnMarker* m = &s_ofh.m[i];
+    char line[200], when[32];
+    time_t tt = (time_t)m->placed_time;
+    struct tm* tmv = localtime(&tt);
+    static const char* rn[4] = { "S", "E", "N", "W" };
+    if (tmv != NULL) {
+        strftime(when, sizeof(when), "%Y-%m-%d %H:%M", tmv);
+    } else {
+        snprintf(when, sizeof(when), "?");
+    }
+    snprintf(line, sizeof(line), "  #%d: tile (%u,%u) acre %d: item 0x%04X rot %s, placed by %s \"%s\" at %s", i, (unsigned)m->ut_x, (unsigned)m->ut_z,
+             pc_ofurn_acre_of(m->ut_x, m->ut_z), (unsigned)m->base, rn[m->rot & 3],
+             m->placer_kind == PC_OFURN_PLACER_GUEST ? "guest" : m->placer_kind == PC_OFURN_PLACER_HOST ? "host" : "resident", m->placer_name, when);
+    out(line);
+}
+
+/* removes marker i: to the town's lost and found (police box) unless `del`; 1 = done */
+static int pcnetgame_ofurn_console_remove(int i, int del, void (*out)(const char*)) {
+    const PCOfurnMarker mk = s_ofh.m[i];
+    char line[160];
+    if (!pcnetgame_ofurn_commit_remove(i)) {
+        snprintf(line, sizeof(line), "FURNITURE REMOVE FAILED: tile (%u,%u): the sidecar / tile write failed (nothing changed)", (unsigned)mk.ut_x, (unsigned)mk.ut_z);
+        out(line);
+        return 0;
+    }
+    if (!del) {
+        mPB_keep_item((mActor_name_t)mk.base);
+        (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_POLICE);
+        pcnetgame_host_ts_push_all();
+    }
+    snprintf(line, sizeof(line), "  removed tile (%u,%u) item 0x%04X (placed by \"%s\"): %s", (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)mk.base, mk.placer_name,
+             del ? "DELETED" : "moved to the lost and found");
+    out(line);
+    return 1;
+}
+
+/* `furniture list [acre]` | `furniture remove <x> <z>|<#index> [delete]` | `furniture clear acre <n>|player <name> [delete]` */
+void pc_net_game_dedicated_furniture(const char* args, void (*out)(const char*)) {
+    char sub[16] = "", a1[64] = "", a2[64] = "", a3[16] = "", line[200];
+    int i, n = 0, del;
+    if (out == NULL) {
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_HOST || !pcnetgame_ofurn_host_ready()) {
+        out(s_ofh_state == -1 ? "FURNITURE FAILED: outdoor_furniture.dat is corrupt (see the log)" : "FURNITURE FAILED: the server is not a ready host yet");
+        return;
+    }
+    (void)sscanf(args != NULL ? args : "", "%15s %63s %63s %15s", sub, a1, a2, a3);
+    if (sub[0] == '\0' || strcmp(sub, "list") == 0) {
+        const int acre = a1[0] != '\0' ? atoi(a1) : -1;
+        snprintf(line, sizeof(line), "[DEDICATED] placed furniture: %d piece(s) (safety ceiling %d per town / %d per acre; Place %s, leaf drop %s)%s", s_ofh.n,
+                 pcnetgame_ofurn_max_town(), pcnetgame_ofurn_max_acre(), pcnetgame_ofurn_place_on() ? "ON" : "OFF", pcnetgame_ofurn_leaf_on() ? "ON" : "OFF",
+                 acre >= 0 ? " -- this acre only" : "");
+        out(line);
+        for (i = 0; i < s_ofh.n; i++) {
+            if (acre < 0 || pc_ofurn_acre_of(s_ofh.m[i].ut_x, s_ofh.m[i].ut_z) == acre) {
+                pcnetgame_ofurn_list_line(i, out);
+                n++;
+            }
+        }
+        if (acre >= 0) {
+            snprintf(line, sizeof(line), "  (%d in acre %d)", n, acre);
+            out(line);
+        }
+        return;
+    }
+    if (strcmp(sub, "remove") == 0) {
+        int k = -1;
+        if (a1[0] == '#' || (a2[0] == '\0' || strcmp(a2, "delete") == 0)) {
+            k = atoi(a1[0] == '#' ? a1 + 1 : a1);
+            del = strcmp(a2, "delete") == 0;
+            if (k < 0 || k >= s_ofh.n) {
+                out("FURNITURE REMOVE FAILED: no placed piece with that index (see `furniture list`)");
+                return;
+            }
+        } else {
+            k = pc_ofurn_find(&s_ofh, atoi(a1), atoi(a2));
+            del = strcmp(a3, "delete") == 0;
+            if (k < 0) {
+                out("FURNITURE REMOVE FAILED: no placed piece on that tile (x z are town units; see `furniture list`)");
+                return;
+            }
+        }
+        (void)pcnetgame_ofurn_console_remove(k, del, out);
+        return;
+    }
+    if (strcmp(sub, "clear") == 0 && (strcmp(a1, "acre") == 0 || strcmp(a1, "player") == 0) && a2[0] != '\0') {
+        const int by_acre = strcmp(a1, "acre") == 0;
+        const int acre = atoi(a2);
+        del = strcmp(a3, "delete") == 0;
+        for (i = s_ofh.n - 1; i >= 0; i--) {
+            const int hit = by_acre ? pc_ofurn_acre_of(s_ofh.m[i].ut_x, s_ofh.m[i].ut_z) == acre : pcnetgame_dedicated_ieq(s_ofh.m[i].placer_name, a2);
+            if (hit && pcnetgame_ofurn_console_remove(i, del, out)) {
+                n++;
+            }
+        }
+        snprintf(line, sizeof(line), "[DEDICATED] furniture clear %s %s: %d piece(s) removed%s", a1, a2, n, del ? " (deleted)" : " (to the lost and found)");
+        out(line);
+        return;
+    }
+    out("FURNITURE usage: furniture list [acre] | furniture remove <x> <z> [delete] | furniture remove #<index> [delete] | furniture clear acre <n>|player <name> [delete]");
+}
+/* ===== OUTDOOR FURNITURE END ===== */

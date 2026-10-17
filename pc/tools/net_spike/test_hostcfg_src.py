@@ -44,8 +44,8 @@ def main():
     cs = strip_comments(c)
 
     # ------------------------------------------------------------------ A1 wire
-    check("A1 wire: service 4 HOST_CONFIG, array bound 9, 8-byte blob and the fit assert exist in C; python lib == C; the message struct / size asserts are untouched (352 B)",
-          "#define PC_NETGAME_TS_HOSTCFG  4u" in c and "#define PC_NETGAME_TS_NUM      10u" in c and "#define PC_NETGAME_TS_HOSTCFG_LEN 8u" in c
+    check("A1 wire: service 4 HOST_CONFIG, array bound 11, 8-byte blob and the fit assert exist in C; python lib == C; the message struct / size asserts are untouched (352 B)",
+          "#define PC_NETGAME_TS_HOSTCFG  4u" in c and "#define PC_NETGAME_TS_NUM      11u" in c and "#define PC_NETGAME_TS_HOSTCFG_LEN 8u" in c
           and "PC_NETGAME_TS_HOSTCFG_LEN <= PC_NETGAME_TS_BLOB_MAX" in c and "_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352," in c
           and "PC_NETGAME_TS_HOSTCFG = 4 " in lib and "PC_NETGAME_TS_HOSTCFG_LEN = 8" in lib and L.PC_NETGAME_TS_HOSTCFG == 4 and L.PC_NETGAME_TS_HOSTCFG_LEN == 8)
     check("A1 wire: the wire_baseline pins cover the new constants (TS_C_PINS + lib pins) and its self-test mutations for them exist",
@@ -59,7 +59,7 @@ def main():
           "svc == (int)PC_NETGAME_TS_HOSTCFG" in build and "memset(blob, 0, PC_NETGAME_TS_HOSTCFG_LEN);" in build and "blob[0] = pcnetgame_wildlife_auth_on() ? 1u : 0u;" in build
           and "pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);" in func_body(c, "pcnetgame_ts_refresh_all"))
     check("A1 host: the tick push loop covers service 4 (retry on a failed send / change), and HOST_CONFIG is pushed at READY BEFORE pcnetgame_host_start_snapshot",
-          "svc < (int)PC_NETGAME_TS_NUM; svc++" in func_body(c, "pcnetgame_host_ts_push_peer")  # the loop bound is the service array bound (9: services 1..8, 6 = the shop upgrade, 7 = the guest directory, 8 = Able/museum)
+          "svc < (int)PC_NETGAME_TS_NUM; svc++" in func_body(c, "pcnetgame_host_ts_push_peer")  # the loop bound is the service array bound (11: services 1..10, 6 = the shop upgrade, 7 = the guest directory, 8 = Able/museum)
           and c.count("pcnetgame_host_ts_push_hostcfg(peer);") == 1
           and c.index("pcnetgame_host_ts_push_hostcfg(peer);") < c.index('pcnetgame_host_start_snapshot(peer, "joined");')
           and c.index("pc_roster_join(&s_roster_scn, (int)peer);") < c.index("pcnetgame_host_ts_push_hostcfg(peer);")  # capacity phase 5: the scene roster is a delta marked at READY

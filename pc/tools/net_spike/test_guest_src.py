@@ -170,7 +170,9 @@ def main():
               "pcnetgame_museum_bits_test_hook",
               # dresser storage (kind 18, master sprint 2; at HEAD, never listed -- reviewed now): the host handlers range-check the bound slot first (query: idx < 0 || idx >= PLAYER_NUM; txn: idx < 0, and idx >= PLAYER_NUM = the guest refusal before the subscript),
               # the migration refuses idx / h outside [0, PLAYER_NUM) before reading the resident PersonalID
-              "pcnetgame_dresser_migrate_resident", "pcnetgame_handle_host_dresser_query", "pcnetgame_handle_host_dresser_txn"]
+              "pcnetgame_dresser_migrate_resident", "pcnetgame_handle_host_dresser_query", "pcnetgame_handle_host_dresser_txn",
+              # dedicated operator list (op / deop selector resolver; host console only): loop bounded by PLAYER_NUM, never reachable with a guest slot
+              "pcnetgame_ops_resolve"]
     users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(private_data\)\[", c[a:b])})
     pinned = sorted(pinned)
     ck("A the functions that subscript Save_Get(private_data)[...] are exactly the %d reviewed ones (a new one needs a guest-safety review): %s" % (len(pinned), users),

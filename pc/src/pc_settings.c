@@ -32,6 +32,13 @@ PCSettings g_pc_settings = {
     .client_log = 0,
     .town_serve = -1, /* -1 = AUTO: on for a --dedicated host (sanitized), off otherwise; an explicit off/on/full in settings.ini or --town-serve wins */
     .personal_sync = -1,
+    .ofurn_place = 1,
+    .ofurn_leaf_drop = 1,
+    .ofurn_max_town = 512,
+    .ofurn_max_acre = 128,
+    .menu_world_live = 1,
+    .npc_fallback = 1,
+    .npc_relay = 1,
 };
 
 int g_pc_max_guests_override = 0;
@@ -106,6 +113,12 @@ static const char* DEFAULT_SETTINGS =
     "# Host only: 1 (default) = the host relays other players' movement at a lower rate to players who are far away or in another scene (never to zero), 0 = full rate to everyone\n"
     "interest_management = 1\n"
     "\n"
+    "# 1 (default) = a villager the host is not simulating (far from the host) walks on this game's own villager AI instead of standing still, 0 = it waits for the host\n"
+    "npc_fallback = 1\n"
+    "\n"
+    "# 1 (default) = such a villager is relayed through the host so every player near it sees the same villager, 0 = off\n"
+    "npc_relay = 1\n"
+    "\n"
     "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n"
     "allow_new_guests = 1\n"
     "\n"
@@ -118,6 +131,16 @@ static const char* DEFAULT_SETTINGS =
     "\n"
     "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n"
     "personal_sync = auto\n"
+    "\n"
+    "# Host and client: 1 (default) = in a multiplayer session the world keeps running behind the inventory, the other menus and the Esc menu (other players, villagers, bugs, fish, weather, effects); 0 = the menu freezes the world like single player\n"
+    "menu_world_live = 1\n"
+    "\n"
+    "# Host only: outdoor furniture (C1). outdoor_furniture_place: 1 (default) = residents may PLACE furniture outside (the real model, rotated, solid), 0 = off. outdoor_furniture_leaf_drop: 1 (default) = anyone may still DROP furniture as a leaf (vanilla), 0 = the host refuses furniture leaf drops outside\n"
+    "outdoor_furniture_place = 1\n"
+    "outdoor_furniture_leaf_drop = 1\n"
+    "# Host only: technical SAFETY ceilings of placed furniture (they only protect the renderer / collision / save; not a gameplay limit): per town (1-1024, default 512) and per acre (1-256, default 128)\n"
+    "outdoor_furniture_max_town = 512\n"
+    "outdoor_furniture_max_acre = 128\n"
     "\n"
     "[Debug]\n"
     "# 1 = write this game's log (connection / join trace, [JOIN] lines) to client_log.txt next to AnimalCrossing.exe (appended, rotated at 4 MB) so it can be sent for a bug report; 0 = off (default)\n"
@@ -180,6 +203,10 @@ static void apply_setting(const char* key, const char* value) {
         { int mg; if (pc_guest_admit_parse(value, &mg)) g_pc_settings.max_guests = mg; } /* strict 1..254: malformed / out of range = ignored (default kept) */
     } else if (strcmp(key, "interest_management") == 0) {
         if (val == 0 || val == 1) g_pc_settings.interest_management = val;
+    } else if (strcmp(key, "npc_fallback") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.npc_fallback = val;
+    } else if (strcmp(key, "npc_relay") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.npc_relay = val;
     } else if (strcmp(key, "guest_memory_mb") == 0) {
         if (val >= 1 && val <= 1048576) g_pc_settings.guest_memory_mb = val;
     } else if (strcmp(key, "max_peers") == 0) {
@@ -201,6 +228,16 @@ static void apply_setting(const char* key, const char* value) {
         if (strcmp(value, "auto") == 0) g_pc_settings.personal_sync = -1;
         else if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) g_pc_settings.personal_sync = 1;
         else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.personal_sync = 0;
+    } else if (strcmp(key, "menu_world_live") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.menu_world_live = val;
+    } else if (strcmp(key, "outdoor_furniture_place") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.ofurn_place = val;
+    } else if (strcmp(key, "outdoor_furniture_leaf_drop") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.ofurn_leaf_drop = val;
+    } else if (strcmp(key, "outdoor_furniture_max_town") == 0) {
+        if (val >= 1 && val <= 1024) g_pc_settings.ofurn_max_town = val;
+    } else if (strcmp(key, "outdoor_furniture_max_acre") == 0) {
+        if (val >= 1 && val <= 256) g_pc_settings.ofurn_max_acre = val;
     }
 }
 
@@ -304,6 +341,12 @@ void pc_settings_save(void) {
     fprintf(f, "guest_memory_mb = %d\n", g_pc_settings.guest_memory_mb);
     fprintf(f, "interest_management = %d\n", g_pc_settings.interest_management);
     fprintf(f, "\n");
+    fprintf(f, "# 1 (default) = a villager the host is not simulating (far from the host) walks on this game's own villager AI instead of standing still, 0 = it waits for the host\n");
+    fprintf(f, "npc_fallback = %d\n", g_pc_settings.npc_fallback);
+    fprintf(f, "\n");
+    fprintf(f, "# 1 (default) = such a villager is relayed through the host so every player near it sees the same villager, 0 = off\n");
+    fprintf(f, "npc_relay = %d\n", g_pc_settings.npc_relay);
+    fprintf(f, "\n");
     fprintf(f, "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n");
     fprintf(f, "allow_new_guests = %d\n", g_pc_settings.allow_new_guests);
     fprintf(f, "\n");
@@ -316,6 +359,15 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n");
     fprintf(f, "personal_sync = %s\n", g_pc_settings.personal_sync < 0 ? "auto" : g_pc_settings.personal_sync ? "on" : "off");
+    fprintf(f, "\n");
+    fprintf(f, "# Host and client: 1 (default) = in a multiplayer session the world keeps running behind the inventory, the other menus and the Esc menu; 0 = the menu freezes the world like single player\n");
+    fprintf(f, "menu_world_live = %d\n", g_pc_settings.menu_world_live);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: outdoor furniture (C1): Place (residents: the real model, rotated, solid) on/off, the vanilla leaf Drop of furniture on/off, and the technical SAFETY ceilings (not a gameplay limit)\n");
+    fprintf(f, "outdoor_furniture_place = %d\n", g_pc_settings.ofurn_place);
+    fprintf(f, "outdoor_furniture_leaf_drop = %d\n", g_pc_settings.ofurn_leaf_drop);
+    fprintf(f, "outdoor_furniture_max_town = %d\n", g_pc_settings.ofurn_max_town);
+    fprintf(f, "outdoor_furniture_max_acre = %d\n", g_pc_settings.ofurn_max_acre);
     fprintf(f, "\n");
     fprintf(f, "[Debug]\n");
     fprintf(f, "# 1 = write this game's log (connection / join trace, [JOIN] lines) to client_log.txt next to AnimalCrossing.exe (appended, rotated at 4 MB) so it can be sent for a bug report; 0 = off (default)\n");

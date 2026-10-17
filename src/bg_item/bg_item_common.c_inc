@@ -1,6 +1,11 @@
 #ifdef TARGET_PC
 #include "pc_net_game.h" /* Stage 5B-3: pc_net_game_notify_local_drop_landing() -- see this file's
                            * two bIT_actor_drop_move_fly*() landing sites, below. */
+/* outdoor furniture C1 (pc/src/pc_ofurn_draw.c): placed pieces drawn as models from the field-item actor (draw / presentation tick / teardown) */
+extern int pc_ofurn_hide_leaf(int ut_x, int ut_z, int item);
+extern void pc_ofurn_bgitem_move(GAME_PLAY* play);
+extern void pc_ofurn_bgitem_draw(GAME_PLAY* play);
+extern void pc_ofurn_bgitem_destruct(void);
 #endif
 
 static void bit_cmn_single_drawS(GAME* game, bg_item_common_info_c* common_info, mActor_name_t fg_item, xyz_t* pos,
@@ -2690,6 +2695,12 @@ static void bg_item_common_classifyitemDataTable(const GAME_PLAY* const play, bg
                         }
                     }
 
+#ifdef TARGET_PC
+                    /* outdoor furniture C1 (pc/src/pc_ofurn_draw.c): a PLACED piece is drawn as its model, not as the leaf (town field only; a leaf without a marker is unchanged) */
+                    if (flag && *fg_p != EMPTY_NO && ITEM_IS_FTR(*fg_p) && pc_ofurn_hide_leaf(base_ut_x + ut_x, base_ut_z + ut_z, *fg_p)) {
+                        flag = FALSE;
+                    }
+#endif
                     if (flag) {
                         int type = type_data.type;
                         int before_start;
@@ -2904,6 +2915,9 @@ static void bg_item_common_renew_draw_and_crs_data_perfect(GAME_PLAY* play, bg_i
 }
 
 static void bg_item_common_destruct(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common) {
+#ifdef TARGET_PC
+    pc_ofurn_bgitem_destruct(); /* outdoor furniture C1: the placed-piece models and their collision leave with the field-item actor */
+#endif
     bIT_actor_drop_destruct(&common->drop_info);
     bIT_actor_drop_destruct(&common->fruit_drop_info);
     bIT_actor_hole_effect_destruct(common->hole);
@@ -3031,6 +3045,9 @@ static void bg_item_common_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c
             bg_item_common_draw_check(play, common, actorx, draw_tbl);
         }
     }
+#ifdef TARGET_PC
+    pc_ofurn_bgitem_move(play); /* outdoor furniture C1: which placed pieces are drawn, their collision (no furniture behaviour code) */
+#endif
 }
 
 static int bIT_actor_pit_entry_del(bg_item_pit_c* pit, int param_2, int param_3, xyz_t* pos,
@@ -3282,6 +3299,9 @@ static void bg_item_common_draw(GAME_PLAY* play, bg_item_common_c* common, bg_it
     bIT_actor_fade_draw(game, &common->common_info, common->fade);
 
     bit_draw_ta_clr(game);
+#ifdef TARGET_PC
+    pc_ofurn_bgitem_draw(play); /* outdoor furniture C1: the placed pieces' models (their own render state, after the field items) */
+#endif
 }
 
 static void bg_item_common_construct(GAME* game, bg_item_common_c* common) {

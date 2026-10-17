@@ -718,6 +718,48 @@ static void aNPC_pc_talk_lease_log(NPC_ACTOR* nactorx, int consumer_eligible) {
     (void)consumer_eligible;
 }
 
+/* Villager authority range and stale fallback (pc_npc_authority.h, pc_net_game.c). The host streams a villager (NPC_MOVE) only while it has an actor for it,
+ * i.e. near its own player -- for a dedicated server only around its hidden observer's acre. A villager the host does not simulate used to be held here at its
+ * spawn / last pose forever, and was unpushable (a consumer never integrates the local collision push). Now, when the slot's stream is stale (no sample for
+ * 2.5 s, or none within 4 s of the actor's creation / the session start), this villager runs the unmodified single-player AI + physics on this client (the
+ * same path a talk lease already uses: schedule/action/angle/aNPC_position_move all run, so pushing works), and pc_net_game.c reports its pose to the host,
+ * which relays it to the other players. A fresh host stream (5 consecutive samples) switches it back; the first host pose is a hard set (a snap).
+ * Never while the villager is hidden in its house (nothing to move; the host's NPC_STATE stays authoritative) or another player owns its conversation.
+ * Evaluated once per frame per villager; AC_MP_NPC_FALLBACK=0 restores the old "hold" behaviour. Local AI consumes the client's own qrand() stream (never
+ * synchronized with the host's in the first place) and may set this client's local is_home; neither is ever sent to the host. */
+static int aNPC_pc_stale_fallback_local(NPC_ACTOR* nactorx) {
+    static NPC_ACTOR* s_actor[ANIMAL_NUM_MAX];
+    static u32 s_frame[ANIMAL_NUM_MAX];
+    static u8 s_val[ANIMAL_NUM_MAX];
+    static u32 s_any_frame, s_any_prev_frame;
+    int slot = aNPC_get_animal_idx(nactorx);
+    u32 frame;
+    int actor_new;
+    int must_hold;
+    u16 npc_id;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || gamePT == NULL) {
+        return FALSE;
+    }
+    frame = gamePT->frame_counter;
+    if (s_actor[slot] == nactorx && s_frame[slot] == frame) {
+        return s_val[slot];
+    }
+    if (frame != s_any_frame) {
+        s_any_prev_frame = s_any_frame;
+        s_any_frame = frame;
+    }
+    /* a new actor: another address, or the same address after this slot alone missed > 1 s of frames while the other villagers kept running (a re-created actor in
+     * reused memory; a frozen world -- submenu -- stops every villager, so it is not mistaken for one) */
+    actor_new = s_actor[slot] != nactorx || ((u32)(frame - s_frame[slot]) > 60u && (u32)(frame - s_any_prev_frame) <= 2u);
+    npc_id = (u16)nactorx->npc_info.animal->id.npc_id;
+    must_hold = nactorx->condition_info.hide_flg != FALSE || pc_net_game_npc_talk_busy(slot, npc_id);
+    s_actor[slot] = nactorx;
+    s_frame[slot] = frame;
+    s_val[slot] = (u8)(pc_net_game_npc_client_local_ai(slot, npc_id, actor_new, must_hold) ? TRUE : FALSE);
+    return s_val[slot];
+}
+
 /* N2 villager movement sync.
  *
  * TRUE iff this NPC_ACTOR is a regular, Save_t.animals[]-backed villager (aNPC_get_animal_idx()
@@ -735,6 +777,9 @@ static int aNPC_pc_is_client_consumer(NPC_ACTOR* nactorx) {
     }
     if (aNPC_get_animal_idx(nactorx) < 0) {
         return FALSE;
+    }
+    if (aNPC_pc_stale_fallback_local(nactorx)) { /* evaluated first: it is stateful (actor creation, hysteresis) and must see every frame */
+        return FALSE; /* the host does not simulate this villager: vanilla local AI + physics -- see aNPC_pc_stale_fallback_local() */
     }
     if (aNPC_pc_talk_lease_active(nactorx)) {
         return FALSE; /* local talk interaction in progress -- see aNPC_pc_talk_lease_active() */

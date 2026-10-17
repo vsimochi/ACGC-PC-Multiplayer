@@ -4420,6 +4420,10 @@ void emu64::dl_G_NOOP() {
                 g_pc_widescreen_stretch = 2; /* pillarbox mode for UI */
                 break;
             }
+            if (this->gfx.words.w1 == PC_NOOP_CLEAR_DEPTH) {
+                pc_gx_clear_depth_now(); /* multiplayer menu over the live world (m_play.c) */
+                break;
+            }
 #endif
             if (this->gfx.words.w1 == 0) {
                 EMU64_LOG("gsDPNoOp(),");

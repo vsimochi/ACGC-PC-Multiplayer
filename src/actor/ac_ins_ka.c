@@ -183,7 +183,15 @@ static void aIKA_attack_wait(ACTOR* actorx, GAME* game) {
             if (mPlib_Check_stung_mosquito(actorx)) {
                 aIKA_setupAction(insect, aIKA_ACTION_ATTACK, game);
             } else {
-                mPlib_request_main_stung_mosquito_type1(actorx);
+#ifdef TARGET_PC
+                /* multiplayer "world behind menus" (m_play.c): the bugs keep flying while a submenu is open, but the frozen local player
+                 * is never stung from inside a menu (the request would be queued for the moment it closes): keep hovering */
+                extern int g_pc_submenu_world_tick;
+                if (!g_pc_submenu_world_tick)
+#endif
+                {
+                    mPlib_request_main_stung_mosquito_type1(actorx);
+                }
                 insect->timer = aIKA_ATTACK_TIME;
             }
         }

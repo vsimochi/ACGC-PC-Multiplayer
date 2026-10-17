@@ -79,7 +79,7 @@ def main():
        head != "" and func(ng, "pcnetgame_host_send_out_list") == func(head, "pcnetgame_host_send_out_list"))
     strip = lambda t: "\n".join(l for l in t.split("\n") if "pc_net_game_join_trace" not in l)  # noqa: E731
     ck("0.2.0 kept: the snapshot pump equals HEAD apart from the [JOIN] END trace line",
-       strip(func(ng, "pcnetgame_host_pump_snapshots")) == func(head, "pcnetgame_host_pump_snapshots"))
+       strip(func(ng, "pcnetgame_host_pump_snapshots")) == strip(func(head, "pcnetgame_host_pump_snapshots")))  # HEAD may already carry the trace line (committed)
     ss = func(ng, "pcnetgame_host_start_snapshot")
     ck("0.2.0 kept: start_snapshot restarts mid-snapshot as before (no deferral / owed state anywhere)",
        "snap_restart_owed" not in ng and "snap_owed_acres" not in ng and "start_snapshot_ex" not in ng and "st->snap_active = 1;" in ss)

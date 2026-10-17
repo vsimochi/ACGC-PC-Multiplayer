@@ -145,7 +145,7 @@ def main():
     check("H a grant request is answered by TXN_RESULT first (kinds 4..7 echo the resolved item), then the informational legacy RESULT; a catch's WILDLIFE_DESPAWN goes out before both; replays echo the "
           "JOURNALLED item (DIG_BURIED's request carries 0)",
           "rp.tag.item = old->item;" in gr and "pcnetgame_txn_send_applied(peer, idx, &rp, slot, (uint8_t)PC_NETGAME_TXN_REASON_REPLAYED" in gr
-          and "in->tag.item = grant_item;" in gr and gr.index("pcnetgame_commit_caught_despawn(cr->entity_id);\n    }\n    pcnetgame_txn_send_applied(") > 0)
+          and "in->tag.item = grant_item;" in gr and re.search(r"pcnetgame_commit_caught_despawn\(cr->entity_id\);\s*pcnetgame_fv_host_emit_catch\(\(int\)peer, expect\);\s*\}\s*pcnetgame_txn_send_applied\(", gr) is not None)
     check("H a catch with full pockets (dest NONE) is still accepted, the entity removed once, and the host-DERIVED item becomes the connection's one-shot exchange credit; any other catch clears it",
           "st->exch_credit_valid = (uint8_t)(t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE);" in gr and "st->exch_credit_item = st->exch_credit_valid ? expect : 0;" in gr
           and "uint8_t              exch_credit_valid;" in c_raw and "uint16_t             exch_credit_item;" in c_raw)
@@ -237,7 +237,7 @@ def main():
         fnm = re.findall(r"^(?:static )?[\w ]+?[ \*]+(\w+)\([^{;]*\)\s*\{\n", c[:p], re.M)
         owners2.append(fnm[-1] if fnm else "?")
     check("C mPr_SetPossessionItem survives ONLY in pc_net_game_exchange_request_drop (it puts the HAND item back into its slot: the roll-back of the vanilla UI swap, net zero) and the HOST-local bury (the "
-          "host's own pockets): %s" % sorted(owners2), sorted(set(owners2)) == ["pc_net_game_dresser_pocket_swap", "pc_net_game_exchange_request_drop", "pc_net_game_host_local_bury", "pcnetgame_house_test_client_swap"])  # + (already at HEAD, never listed): pc_net_game_dresser_pocket_swap = the dresser screen's plain LOCAL pocket reorder (net zero, refused while a pocket transaction is in flight) and the TEST-ONLY AC_TEST_HOUSE_CLIENT_SWAP hook (2 sites each: both write the SAME two slots back)
+          "host's own pockets): %s" % sorted(owners2), sorted(set(owners2)) == ["pc_net_game_dresser_pocket_swap", "pc_net_game_exchange_request_drop", "pc_net_game_host_local_bury", "pc_net_game_ofurn_pickup", "pc_net_game_ofurn_place", "pcnetgame_house_test_client_swap"])  # + outdoor furniture (reviewed: pc_net_game_ofurn_place / _pickup write ONLY under s_role == HOST, the host's own pocket after commit_place / commit_remove succeeded; a client goes through the host txn); (already at HEAD, never listed): pc_net_game_dresser_pocket_swap = the dresser screen's plain LOCAL pocket reorder (net zero, refused while a pocket transaction is in flight) and the TEST-ONLY AC_TEST_HOUSE_CLIENT_SWAP hook (2 sites each: both write the SAME two slots back)
     ex = func_body(c, "pc_net_game_exchange_request_drop")
     check("C the exchange replacement is no longer applied from a deferred client record: s_exchange_deferred is consumed by the drop result handler into the transaction (have_deferred ? &deferred), "
           "try_send puts it IN the tag (flags EXCHANGE, aux_item, aux_cond; only when the swap slot and owner stamp still match), and the apply step takes it from the host post-image",

@@ -19,7 +19,7 @@ from test_w9_shop_real import T, L
 
 results = []
 ck = lambda d, c: L.check(d, bool(c), results)  # noqa: E731
-SHOWN = r"\[NET\]\[RESTOCK\] shop (restocking|restocked while talking): the player was shown out \(waited (\d+) frames([^)]*)\)"
+SHOWN = r"\[NET\]\[RESTOCK\] shop (restocking|restocked while talking): the player was shown out \(waited (\d+) (?:frames|ms)([^)]*)\)"
 
 
 def main():

@@ -3118,6 +3118,12 @@ static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRe
     if (_Game_play_isPause(play) == 1 || main_index == mPlayer_INDEX_SWING_AXE || main_index == mPlayer_INDEX_SWING_NET) {
         return "hold";
     }
+    {
+        extern int g_pc_submenu_world_tick; /* m_actor.c: set while m_play.c ticks this puppet with a submenu open (no OC pass runs) */
+        if (g_pc_submenu_world_tick) {
+            return "hold";
+        }
+    }
     if (self->collide_hold > 0) {
         self->collide_hold--;
         return "hold";
@@ -6839,6 +6845,12 @@ extern int pc_net_game_pvp_test_off(void); /* pc_net_game.c: TEST-ONLY AC_TEST_P
 int pc_pvp_is_puppet_actor(const void* actor) {
     const ACTOR* a = (const ACTOR*)actor;
     return a != NULL && a->mv_proc == pc_remote_player_mv && a->dw_proc == pc_remote_player_dw && !pc_net_game_pvp_test_off();
+}
+
+/* "world behind menus" (m_play.c Game_play_pc_submenu_live_tick): 1 iff ACTOR is a live remote-player puppet (no pvp test gate) */
+int pc_remote_player_is_puppet_actor(const void* actor) {
+    const ACTOR* a = (const ACTOR*)actor;
+    return a != NULL && a->mv_proc == pc_remote_player_mv && a->dw_proc == pc_remote_player_dw;
 }
 
 /* the pvp-eligible puppet of a slot: live, in the SAME town field as this process, visible, placed, not stale, no door row */

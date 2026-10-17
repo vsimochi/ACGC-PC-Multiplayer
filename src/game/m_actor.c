@@ -23,6 +23,30 @@
 #include "m_common_data.h"
 #ifdef TARGET_PC
 #include "pc_platform.h"
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() -- see Actor_pc_observer_npc_player_dist() */
+extern int pc_net_game_observer_npc_target(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z); /* pc_net_game.c */
+
+/* --host-observer (dedicated server): the "player" is a hidden, input-less observer standing still at its acre. Measuring the villagers' player distance /
+ * angle to it made the villagers around it greet / chase / force-call an empty spot (and every talk demo is refused for the observer, m_demo.c), so they
+ * never idled normally. A villager (or other NPC) measures to the NEAREST REAL remote player instead (one acre at most), or sees no player at all. */
+static void Actor_pc_observer_npc_player_dist(ACTOR* actor) {
+    float tx, ty, tz;
+    if (pc_net_game_observer_npc_target(actor->world.position.x, actor->world.position.z, mFI_BK_WORLDSIZE_X_F, &tx, &ty, &tz)) {
+        xyz_t t;
+        t.x = tx;
+        t.y = ty;
+        t.z = tz;
+        actor->player_distance_xz = search_position_distanceXZ(&actor->world.position, &t);
+        actor->player_distance_y = ty - actor->world.position.y;
+        actor->player_distance = actor->player_distance_xz * actor->player_distance_xz + actor->player_distance_y * actor->player_distance_y;
+        actor->player_angle_y = search_position_angleY(&actor->world.position, &t);
+    } else {
+        actor->player_distance_xz = 10000.0f; /* nobody near: far away, straight ahead (no turn-to-player) */
+        actor->player_distance_y = 0.0f;
+        actor->player_distance = actor->player_distance_xz * actor->player_distance_xz;
+        actor->player_angle_y = actor->world.angle.y;
+    }
+}
 #endif
 
 #ifdef MUST_MATCH
@@ -514,6 +538,11 @@ extern void Actor_info_call_actor(GAME_PLAY* play, Actor_info* actor_info) {
                                              actor->player_distance_y * actor->player_distance_y;
                     actor->player_angle_y =
                         search_position_angleY(&actor->world.position, &player_actor->actor_class.world.position);
+#ifdef TARGET_PC
+                    if (actor->part == ACTOR_PART_NPC && pc_host_observer_active()) {
+                        Actor_pc_observer_npc_player_dist(actor);
+                    }
+#endif
                     actor->state_bitfield &= ~ACTOR_STATE_24;
 
                     if ((actor->state_bitfield & (ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_CULL)) ||

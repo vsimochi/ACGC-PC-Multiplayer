@@ -17,7 +17,10 @@ def main():
     ck("T1 the eject waits while a message window is visible", "mMsg_Check_MainHide(mMsg_Get_base_window_p()) == FALSE" in f)
     ck("T1 the eject still waits for demo / submenu-able", "mDemo_CheckDemo() != FALSE" in f and "mPlib_able_submenu_type1(game) == FALSE" in f)
     m = re.search(r"#define aSI_PC_EJECT_HARD_CAP (\d+)", si)
-    ck("T1 the stuck-state hard cap is far beyond the 60 s restock (>= 18000 frames)", m and int(m.group(1)) >= 18000)
+    ck("T1 the stuck-state hard cap is far beyond the 60 s restock (>= 300000 ms, WALL-CLOCK)", m and int(m.group(1)) >= 300000)
+    ck("T1 frame-rate independence: the grace (500 ms) and the cap are wall-clock (pc_net_game_now_ms), no per-frame counter decides the eject",
+       "#define aSI_PC_EJECT_GRACE_MS 500" in si and "aSI_pc_eject_wait++" not in f and "aSI_pc_eject_wait = (int)(s32)(now - aSI_pc_eject_t0);" in f and
+       "if (aSI_pc_eject_wait < aSI_PC_EJECT_GRACE_MS) {" in f and "aSI_pc_eject_wait < 30" not in f)
     ck("T1 a busy player is forced ONLY while still restocking AND past the hard cap", "if (busy && (!restocking || aSI_pc_eject_wait < aSI_PC_EJECT_HARD_CAP)) {" in f
        # the held branch may carry a log-only diagnostic (printf, no state write) but must still end in `return;` before any exit / latch clear
        and re.search(r"if \(busy && \(!restocking \|\| aSI_pc_eject_wait < aSI_PC_EJECT_HARD_CAP\)\) \{(?:(?!goto_other_scene|aSI_pc_eject_pending = 0)[^}]|\{[^}]*\})*?\n        return;\n    \}", f) is not None)

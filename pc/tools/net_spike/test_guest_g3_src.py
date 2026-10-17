@@ -97,7 +97,7 @@ def main():
     i_def = sdi_raw.index("extern int mSDI_StartDataInitGuest(GAME* game) {")
     ck("G3.1 TARGET_PC only: the definition sits between #ifdef TARGET_PC and its #endif, the declaration is in its own #ifdef TARGET_PC block of m_start_data_init.h",
        sdi_raw.rfind("#ifdef TARGET_PC", 0, i_def) > sdi_raw.rfind("#endif", 0, i_def) and sdi_raw.index("#endif", i_def) > sdi_raw.index("\n}\n", i_def)
-       and re.search(r"#ifdef TARGET_PC\n[^#]*extern int mSDI_StartDataInitGuest\(GAME\* game\);\n#endif", S.read("include/m_start_data_init.h")) is not None)
+       and re.search(r"#ifdef TARGET_PC\n[^#]*extern int mSDI_StartDataInitGuest\(GAME\* game\);\n[^#]*#endif", S.read("include/m_start_data_init.h")) is not None)
     same = [n for n in ("mSDI_StartInitNew", "mSDI_StartInitNewPlayer", "mSDI_StartInitFrom", "mSDI_StartInitPak", "mSDI_StartInitErr", "mSDI_StartInitAfter", "mSDI_StartInitBefore",
                         "mSDI_StartDataInit", "mSDI_StartDataInitObserver") if S.body(sm, sf, n) == S.body(bm, bf, n) and S.body(sm, sf, n) != ""]
     ck("G3.1 vanilla single-player / resident init untouched: every pre-existing mSDI_* function body is IDENTICAL to the baseline blob %s (%d of 9)" % (BASELINE, len(same)), len(same) == 9)

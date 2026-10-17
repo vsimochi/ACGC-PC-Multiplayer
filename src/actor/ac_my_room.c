@@ -2898,3 +2898,180 @@ extern void aMR_SameFurnitureSwitchOFF(u16 ftr_name) {
         used++;
     }
 }
+
+#ifdef TARGET_PC
+/* ===== OUTDOOR FURNITURE (C1, pc/src/pc_ofurn_draw.c): ONE furniture model drawn WITHOUT the My_Room actor =====
+ * The catalog draws every furniture with its profile, a private FTR_ACTOR and a private dma bank (m_catalog_ovl.c mCL_furniture_init / mCL_furniture_draw); these four
+ * functions do the same for a piece placed OUTDOORS: ct = the profile's dma_proc into the caller's bank + the rig + the vtable ct_proc (the catalog's calls), draw = a trimmed
+ * aMR_DrawOneFurniture (light, texture, palette, kankyo map, the registered model, the skeleton, the vtable draw_proc with NO room actor -- the catalog passes NULL too),
+ * dt = the vtable dt_proc. NEVER the move_proc (the furniture behaviour: my_room_clip, music, drawers, sitting), never l_aMR_work, never the room's banks.
+ * Profiles whose vtable has a dt_proc (the 10 structure models that zelda_malloc a palette in ct) are drawn WITHOUT their vtable (aMR_PC_StandaloneDrawable() == 0 when
+ * nothing else is drawable: the caller then keeps the vanilla leaf). */
+#include "pc_outdoor_furniture.h"
+_Static_assert(aFTR_SHAPE_TYPEA == PC_OFURN_SHAPE_1X1, "PC_OFURN_SHAPE_1X1 must equal aFTR_SHAPE_TYPEA");
+
+static aFTR_PROFILE* aMR_PC_ProfileOfItem(int item) {
+    int idx;
+    if (!ITEM_IS_FTR((mActor_name_t)item)) {
+        return NULL;
+    }
+    idx = mRmTp_FtrItemNo2FtrIdx((mActor_name_t)item);
+    if (idx < 0 || idx >= FTR_NUM || furniture_quality[idx] == NULL) {
+        return NULL;
+    }
+    return furniture_quality[idx];
+}
+
+static int aMR_PC_UseVtable(const aFTR_PROFILE* profile) {
+    return profile->vtable != NULL && profile->vtable->dt_proc == NULL;
+}
+
+int aMR_PC_FtrItemShape(int item) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    return profile != NULL ? (int)profile->shape : -1;
+}
+
+int aMR_PC_StandaloneDrawable(int item) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    if (profile == NULL) {
+        return 0;
+    }
+    return profile->opaque0 != NULL || profile->opaque1 != NULL || profile->translucent0 != NULL || profile->translucent1 != NULL || profile->rig != NULL ||
+           (aMR_PC_UseVtable(profile) && profile->vtable->draw_proc != NULL);
+}
+
+/* bank: >= 0x800 bytes owned by the caller (aMR_FTR_BANK_SIZE); pos: the tile centre on the ground. 1 = constructed. */
+int aMR_PC_StandaloneCt(FTR_ACTOR* ftr_actor, int item, const xyz_t* pos, u8* bank) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    const int angle = FTR_GET_ROTATION((mActor_name_t)item);
+    if (profile == NULL || ftr_actor == NULL || bank == NULL || pos == NULL) {
+        return 0;
+    }
+    bzero(ftr_actor, sizeof(FTR_ACTOR));
+    bzero(bank, aMR_FTR_BANK_SIZE);
+    ftr_actor->ctr_type = aFTR_CTR_TYPE_GAME_PLAY;
+    ftr_actor->name = (u16)mRmTp_FtrItemNo2FtrIdx((mActor_name_t)item);
+    ftr_actor->state = aFTR_STATE_STOP;
+    ftr_actor->layer = mCoBG_LAYER0;
+    ftr_actor->angle_y = aMR_angle_table[angle];
+    ftr_actor->angle_y_target = ftr_actor->angle_y;
+    ftr_actor->s_angle_y = RAD2SHORT_ANGLE2(DEG2RAD(ftr_actor->angle_y));
+    ftr_actor->shape_type = profile->shape;
+    ftr_actor->original_shape_type = profile->shape;
+    ftr_actor->position = *pos;
+    ftr_actor->last_position = *pos;
+    ftr_actor->scale.x = ftr_actor->scale.y = ftr_actor->scale.z = 1.0f;
+    ftr_actor->collision_scale = 1.0f;
+    ftr_actor->switch_bit = TRUE;
+    ftr_actor->haniwa_step = -1;
+    if (aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_TOGGLE) ||
+        aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_START_DISABLED)) {
+        ftr_actor->switch_bit = FALSE; /* the placed-flag default of aMR_SetSwitchStepData */
+    }
+    ftr_actor->move_bg_idx = -1;
+    if (profile->vtable != NULL && profile->vtable->dma_proc != NULL) {
+        profile->vtable->dma_proc((mActor_name_t)item, bank); /* data only (textures / palettes into the bank), like the catalog */
+    }
+    if (profile->rig != NULL) {
+        cKF_SkeletonInfo_R_ct(&ftr_actor->keyframe, profile->rig->skeleton, profile->rig->animation, ftr_actor->joint, ftr_actor->morph);
+        cKF_SkeletonInfo_R_init_standard_repeat(&ftr_actor->keyframe, profile->rig->animation, NULL);
+        cKF_SkeletonInfo_R_play(&ftr_actor->keyframe);
+        ftr_actor->keyframe.frame_control.speed = 0.5f;
+    }
+    if (aMR_PC_UseVtable(profile) && profile->vtable->ct_proc != NULL) {
+        profile->vtable->ct_proc(ftr_actor, bank);
+    }
+    return 1;
+}
+
+/* the presentation tick: the skeleton / texture animation only (what the catalog advances); never a move_proc */
+void aMR_PC_StandaloneAnimate(FTR_ACTOR* ftr_actor) {
+    aFTR_PROFILE* profile = ftr_actor != NULL ? aMR_GetFurnitureProfile(ftr_actor->name) : NULL;
+    if (profile == NULL) {
+        return;
+    }
+    if (ftr_actor->keyframe.skeleton != NULL && ftr_actor->keyframe.animation != NULL) {
+        cKF_SkeletonInfo_R_play(&ftr_actor->keyframe);
+    }
+}
+
+void aMR_PC_StandaloneDraw(FTR_ACTOR* ftr_actor, GAME* game, u8* bank) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    aFTR_PROFILE* profile;
+    xyz_t ftr_scale;
+    f32 scale;
+    int alpha_edge;
+    if (ftr_actor == NULL || game == NULL || bank == NULL) {
+        return;
+    }
+    profile = aMR_GetFurnitureProfile(ftr_actor->name);
+    if (profile == NULL || profile == &iam_dummy) {
+        return;
+    }
+    ftr_scale = ftr_actor->scale;
+    scale = profile->scale;
+    alpha_edge = aMR_GetAlphaEdge(ftr_actor->name);
+
+    OPEN_DISP(game->graph);
+    gDPSetTexEdgeAlpha(NEXT_POLY_OPA_DISP, alpha_edge);
+    gDPSetTexEdgeAlpha(NEXT_POLY_XLU_DISP, alpha_edge);
+    if (aMR_DrawDolphinMode(ftr_actor->name)) {
+        gDPSetTextureAdjustMode(NEXT_POLY_OPA_DISP, G_TA_DOLPHIN);
+        gDPSetTextureAdjustMode(NEXT_POLY_XLU_DISP, G_TA_DOLPHIN);
+    }
+    CLOSE_DISP(game->graph);
+
+    _texture_z_light_fog_prim_xlu(game->graph);
+    _texture_z_light_fog_prim(game->graph);
+    aMR_FurnitureLightSet(ftr_actor, play);
+    aMR_LoadTexture(profile, game);
+    aMR_LoadPallet(profile, game);
+    aMR_SetKankyoMapping(ftr_actor, play);
+
+    Matrix_translate(ftr_actor->position.x, ftr_actor->position.y, ftr_actor->position.z, MTX_LOAD);
+    Matrix_RotateY(ftr_actor->s_angle_y, MTX_MULT);
+    Matrix_translate(ftr_actor->base_position.x, ftr_actor->base_position.y, ftr_actor->base_position.z, MTX_MULT);
+    Matrix_scale(ftr_scale.x, ftr_scale.y, ftr_scale.z, MTX_MULT);
+    Matrix_scale(scale, scale, scale, MTX_MULT);
+
+    aMR_SetLoopTextureAnime(ftr_actor, profile, game);
+    aMR_DrawRegistModel(profile, game);
+    aMR_DrawSkelShape(ftr_actor, profile, game);
+    if (aMR_PC_UseVtable(profile) && profile->vtable->draw_proc != NULL) {
+        OPEN_DISP(game->graph);
+        gSPMatrix(NEXT_POLY_OPA_DISP, _Matrix_to_Mtx_new(game->graph), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        gSPMatrix(NEXT_POLY_XLU_DISP, _Matrix_to_Mtx_new(game->graph), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        CLOSE_DISP(game->graph);
+        profile->vtable->draw_proc(ftr_actor, NULL, game, bank); /* NULL room actor: exactly the catalog's call */
+    }
+
+    OPEN_DISP(game->graph);
+    gDPSetTexEdgeAlpha(NEXT_POLY_OPA_DISP, 144);
+    gDPSetTexEdgeAlpha(NEXT_POLY_XLU_DISP, 144);
+    gDPSetTextureAdjustMode(NEXT_POLY_OPA_DISP, G_TA_N64);
+    gDPSetTextureAdjustMode(NEXT_POLY_XLU_DISP, G_TA_N64);
+    CLOSE_DISP(game->graph);
+}
+
+void aMR_PC_StandaloneDt(FTR_ACTOR* ftr_actor, u8* bank) {
+    aFTR_PROFILE* profile = ftr_actor != NULL ? aMR_GetFurnitureProfile(ftr_actor->name) : NULL;
+    (void)bank;
+    if (profile == NULL) {
+        return;
+    }
+    /* aMR_PC_UseVtable() profiles have no dt_proc by definition: nothing was allocated by a ct_proc we ran */
+    bzero(ftr_actor, sizeof(FTR_ACTOR));
+}
+
+int aMR_PC_StandaloneBankSize(void) {
+    return aMR_FTR_BANK_SIZE;
+}
+
+int aMR_PC_StandaloneMoveBgType(int item) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    if (profile == NULL || aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_NO_COLLISION)) {
+        return -1; /* no collision (vanilla: NO_COLLISION furniture is walkable in a room too) */
+    }
+    return (int)profile->move_bg_type;
+}
+#endif /* TARGET_PC (outdoor furniture) */

@@ -274,7 +274,7 @@ def main():
     check("S8 PCNetGameHostPeerState changed only by appended host-only fields (no wire struct)",
           "PCNetGameHostPeerState" in cur and cur["PCNetGameHostPeerState"].startswith(old["PCNetGameHostPeerState"][:200]))
     hdr_removed = [l for l in git("diff", "-U0", "HEAD", "--", "pc/include/pc_net_game.h").split("\n")
-                   if l.startswith("-") and not l.startswith("---")]
+                   if l.startswith("-") and not l.startswith("---") and not l[1:].strip().startswith(("/*", "*", "//"))]  # comment lines extended in place are not removed declarations
     check("S8 pc_net_game.h differs from HEAD only by ADDED lines plus the protocol-version define (removed: %s)" % hdr_removed,
           all(("PC_NETGAME_PROTOCOL_VERSION" in l or "unreleased v7, so no further bump" in l) for l in hdr_removed))
     lib = read(os.path.join(HERE, "net_spike_lib.py"))

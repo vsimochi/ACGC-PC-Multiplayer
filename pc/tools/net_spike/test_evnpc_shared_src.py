@@ -56,7 +56,7 @@ cm = rd(PC, "CMakeLists.txt")
 # ---- W: wire ids (the allocation of this worker) ----
 ck("W1 TXN kind 21 EVNPC_CLAIM and reasons 50..54", "#define PC_NETGAME_TXN_KIND_EVNPC_CLAIM 21u" in ng and all(
     "#define PC_NETGAME_TXN_REASON_EVC_%s" % n in ng for n in ("SOLD_OUT   50u", "CLAIMED    51u", "CHANGED    52u", "OFF        53u", "NO_SPIRITS 54u")))
-ck("W2 TS service 9 EVNPC_CAPS (8 bytes) and PC_NETGAME_TS_NUM 10", "#define PC_NETGAME_TS_EVNPC    9u" in ng and "#define PC_NETGAME_TS_NUM      10u" in ng and
+ck("W2 TS service 9 EVNPC_CAPS (8 bytes) and PC_NETGAME_TS_NUM 10 (11 since outdoor furniture C1 added service 10 OFURN_CAPS)", "#define PC_NETGAME_TS_EVNPC    9u" in ng and ("#define PC_NETGAME_TS_NUM      10u" in ng or "#define PC_NETGAME_TS_NUM      11u" in ng) and
    "#define PC_NETGAME_TS_EVNPC_LEN 8u" in ng)
 ck("W3 no new message id (94 / 95 stay unused: the claim rides TXN_COMMIT / TXN_RESULT / TOWN_SVC_STATE)", not re.search(r"PC_NETGAME_MSG_\w+\s*=\s*9[45]\s*,", ng))
 ck("W4 the header reasons equal the wire reasons, the op numbers are 1..5", "#define PC_EVC_REASON_SOLD_OUT   50" in hdr and "#define PC_EVC_REASON_NO_SPIRITS 54" in hdr

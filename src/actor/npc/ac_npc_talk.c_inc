@@ -678,7 +678,15 @@ static int aNPC_pc_lease_probe(int slot, uint16_t npc_id) {
     if (a == NULL || a->npc_info.animal == NULL || (uint16_t)a->npc_info.animal->id.npc_id != npc_id) {
         return 0;
     }
-    return aNPC_pc_lease_active_now(a);
+    if (!aNPC_pc_lease_active_now(a)) {
+        return 0;
+    }
+    /* 2 = a conversation is visible (this villager's talk / speak demo, or the message window is open), 1 = only the talk state is set: a stuck talk
+     * state -- after 3 such keepalives the net layer ends the hold itself (pc_net_game.c, hold cap) */
+    if (mDemo_IS_ACTOR_TALKING((ACTOR*)a) || !mMsg_Check_MainHide(mMsg_Get_base_window_p())) {
+        return 2;
+    }
+    return 1;
 }
 
 static void aNPC_pc_lease_update(NPC_ACTOR* nactorx) {

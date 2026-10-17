@@ -378,6 +378,11 @@ int pc_net_game_get_host_identity(PCNetGameIdentity* out);
  * pc_net_game_role() == PC_NETGAME_ROLE_CLIENT to know that a host will take over. */
 int pc_net_game_world_is_host_authoritative(void);
 
+/* "World keeps running behind menus" (m_play.c, docs/multiplayer-guest-roadmap.md): 1 iff this process is in a live multiplayer
+ * session (a HOST with >= 1 READY peer, or a READY client) AND the feature is on (settings.ini [Network] menu_world_live, default 1;
+ * env AC_MP_MENU_WORLD=0|1 wins). 0 for single player, an unconnected client, a host with nobody READY: vanilla menu freeze. */
+int pc_net_game_menu_world_live(void);
+
 /* Protocol v2: the latest PLAYER_CONTEXT for a network player, for future host-side resolvers.
  * Host: PC_NETGAME_HOST_PLAYER_ID -> the host's own live local context; a READY peer id -> the last
  * context that peer sent (0 if it has not sent one yet). Any role: returns 0 for anything else, and
@@ -419,9 +424,20 @@ int pc_net_game_notify_local_npc_home_exit(int slot, uint16_t npc_id);
 int pc_net_game_host_take_npc_home_exit(int slot, uint16_t npc_id);
 /* M9-C keepalive: while a BEGIN is outstanding pc_net_game_poll() re-sends it (fresh seq, same message) every 10 s
  * (PC_NPC_TALKHOLD_REFRESH_MS, test only; 0 disables) iff this probe -- registered by the NPC code -- still reports
- * the local talk lease active for (slot, npc_id). A NULL probe or a 0 result stops the refreshes for that slot. */
+ * the local talk lease active for (slot, npc_id). A NULL probe or a 0 result stops the refreshes for that slot.
+ * Result 2 = the lease is active AND a conversation is visible (talk demo of that villager / message window not idle); 1 = the lease is active but no
+ * conversation is visible (a stuck talk state): after PC_NPC_TALK_PROBE_MISSES (3) such keepalives in a row the client sends END itself. */
 typedef int (*PCNetGameNpcTalkLeaseProbe)(int slot, uint16_t npc_id);
 void pc_net_game_set_npc_talk_lease_probe(PCNetGameNpcTalkLeaseProbe fn);
+/* Villager stale fallback (pc_npc_authority.h), READY client only: 1 = run the vanilla local AI for this villager (the host stream is stale: the host
+ * does not simulate it), 0 = mirror the host's NPC_MOVE. actor_new = this is the first frame of a (re)created actor of the slot; must_hold vetoes the
+ * switch to local AI (the villager is hidden in its house / another player owns its conversation). Logs one line per transition. */
+int pc_net_game_npc_client_local_ai(int slot, uint16_t npc_id, int actor_new, int must_hold);
+/* Dedicated console `npc` / `npc free <slot>` (host): per-villager authority status, release a stuck conversation hold. */
+void pc_net_game_dedicated_npc(const char* args, void (*out)(const char*));
+/* --host-observer: the nearest READY remote player (any wire id) in the host's own scene within max_dist; 0 = none. The villager AI measures its
+ * "player" distance / angle to this instead of the hidden observer (m_actor.c). */
+int pc_net_game_observer_npc_target(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z);
 /* Monotonic wall-clock milliseconds (same source the net layer uses; never 0). Test hook timing only. */
 uint32_t pc_net_game_now_ms(void);
 /* Hotfix 0.2.1 join diagnostics: prints one "[JOIN] +<ms since transport-connect> <text>" line to stdout (visible with --verbose or settings.ini client_log = 1).
@@ -710,6 +726,8 @@ int pc_net_game_dresser_last_block(void); /* 6p: notice kind of the latest refus
 int  pc_net_game_dresser_pocket_storable(int slot); /* 6r: pocket holds a NORMAL storable item */
 int  pc_net_game_dresser_pocket_swap(int a, int b);  /* 6r: the plain local pocket move / swap of the grab (1 = done) */
 void pc_net_game_dresser_ui_notice(int kind); /* 6q: a dresser-screen notice (8 = the last 3 slots can only be taken out) */
+void pc_net_game_dresser_open_wait_notice(int mode); /* direct open (wall clock): 1 waiting -> notice 12 "Asking the host...", 0 view arrived (clear), 2 gave up -> notice 6 */
+void pc_net_game_dresser_direct_uncommitted(int ftr_item, int ut_x, int ut_z); /* direct open of an uncommitted dresser: log + notice 4 / 2, then the vanilla menu */
 void pc_net_game_saving_notice(void);     /* 6p: notice 4 ("The room is being saved...") for ~3 s */
 void pc_net_game_dresser_move_wait(int uncommitted); /* 6l: move lock with an UNKNOWN state: notice 4 (cell not committed) / 6 (asking the host) / 2 */
 int pc_net_game_dresser_keep_lock(int floor, int layer, int ut_x, int ut_z, int ftr_item, int live_keep); /* 6l 27-slot lock: 0 free, 1 live keep items, 2 canonical keep items */

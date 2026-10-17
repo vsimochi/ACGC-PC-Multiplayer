@@ -2,7 +2,7 @@
 """test_events_src.py - SOURCE AUDIT of the host-authoritative town EVENTS / special VISITORS (no game process; tier: SOURCE AUDITED):
 TOWN_SVC_STATE service 5 = EVENT_STATE, the host's event DECISION state mirrored to clients, plus the client gates of the local event roll.
 
-  E1  wire: service 5, array bound 9, 214-byte blob (84 special + 100 weekly + 30 core) fits one message; python lib == C; wire_baseline pins
+  E1  wire: service 5, array bound 11, 214-byte blob (84 special + 100 weekly + 30 core) fits one message; python lib == C; wire_baseline pins
   E2  host: the blob is built from the host's own Save_t, EXCLUDING every client-local field; digest-polled and pushed like the other services
   E3  client: strict validation order, content validator, apply writes ONLY the mirrored fields (never the excluded ones), never persisted
   E4  gates: init_special_event / init_weekly_event (the only RANDOM / local-player-id seeded decisions of m_event.c) and the event manager's special-event
@@ -44,14 +44,14 @@ def main():
     cs = strip_comments(c)
 
     # ------------------------------------------------------------------ E1 wire
-    check("E1 wire: service 5 EVENT, array bound 9, 214-byte blob (84 + 100 + 30) with the layout assert and the fit-in-one-message assert exist in C",
-          "#define PC_NETGAME_TS_EVENT    5u" in c and "#define PC_NETGAME_TS_NUM      10u" in c and "#define PC_NETGAME_TS_EVENT_LEN 214u" in c
+    check("E1 wire: service 5 EVENT, array bound 11, 214-byte blob (84 + 100 + 30) with the layout assert and the fit-in-one-message assert exist in C",
+          "#define PC_NETGAME_TS_EVENT    5u" in c and "#define PC_NETGAME_TS_NUM      11u" in c and "#define PC_NETGAME_TS_EVENT_LEN 214u" in c
           and "sizeof(mEv_special_c) == 84u && sizeof(mEv_weekly_u) == 100u && PC_NETGAME_TS_EVENT_LEN == 84u + 100u + 30u" in c
           and "PC_NETGAME_TS_EVENT_LEN <= PC_NETGAME_TS_BLOB_MAX" in c and "_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352," in c)
-    check("E1 python lib == C (service 5, len 214, still <= the 340-byte blob maximum), wire_baseline pins the constants and the array bound 9 deliberately",
+    check("E1 python lib == C (service 5, len 214, still <= the 340-byte blob maximum), wire_baseline pins the constants and the array bound 11 deliberately",
           L.PC_NETGAME_TS_EVENT == 5 and L.PC_NETGAME_TS_EVENT_LEN == 214 and L.PC_NETGAME_TS_EVENT_LEN <= L.PC_NETGAME_TS_BLOB_MAX
           and "PC_NETGAME_TS_EVENT = 5 " in lib and "PC_NETGAME_TS_EVENT_LEN = 214" in lib
-          and '"#define PC_NETGAME_TS_EVENT    5u"' in wb and '"#define PC_NETGAME_TS_NUM      10u"' in wb and '"PC_NETGAME_TS_EVENT": \'5\'' in wb
+          and '"#define PC_NETGAME_TS_EVENT    5u"' in wb and '"#define PC_NETGAME_TS_NUM      11u"' in wb and '"PC_NETGAME_TS_EVENT": \'5\'' in wb
           and '"PC_NETGAME_TS_EVENT_LEN": \'214\'' in wb and '"event service id"' in wb and '"event blob len"' in wb)
     check("E1 offsets: special at 0, weekly at 84, core at 184 (the three region constants)",
           "#define PCNG_EV_OFF_SPECIAL 0u" in c and "#define PCNG_EV_OFF_WEEKLY  84u" in c and "#define PCNG_EV_OFF_CORE    184u" in c)

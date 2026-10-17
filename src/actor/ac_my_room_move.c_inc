@@ -2837,31 +2837,63 @@ static void aMR_PreparePlayerAction(ACTOR* actorx, GAME* game) {
 /* DIRECT OPEN (user requirement, docs/dresser-storage-redesign-plan.md 6f): A on the OWNER's item-storage furniture (drawers / wardrobe / closet) in the own
  * house, with the feature available and the room not edit-locked, opens the 27-slot screen directly (no intermediate vanilla menu). Called every frame of the
  * open demo's WAIT_MSG (my_room->msg_timer counts them): selects the piece on the host and waits for ITS view; TRUE = handled this frame (opened or still
- * waiting). After aMR_PC_DIRECT_OPEN_TIMEOUT frames without the view (slow / refusing / disconnected host) FALSE = the unchanged vanilla message flow, so the
- * furniture never becomes unusable. Visitors, NPC houses, other furniture, a disabled feature: FALSE at once (vanilla). */
-#define aMR_PC_DIRECT_OPEN_TIMEOUT 180
+ * waiting). The wait is WALL-CLOCK (pc_net_game_now_ms): the client may render uncapped (hundreds of frames per second; a frame count of 180 was 0.2 s there,
+ * which made the first open of a room visit fall back to the vanilla menu whenever the host answered a little late). After aMR_PC_DIRECT_OPEN_NOTICE_MS the
+ * player sees "Asking the host..." (notice 12); after aMR_PC_DIRECT_OPEN_TIMEOUT_MS without the view (slow / refusing / disconnected host) FALSE = the unchanged
+ * vanilla message flow (+ notice 6 "Try again in a moment"), so the furniture never becomes unusable. Visitors, NPC houses, other furniture, a disabled feature:
+ * FALSE at once (vanilla). */
+#define aMR_PC_DIRECT_OPEN_TIMEOUT_MS 3000
+#define aMR_PC_DIRECT_OPEN_NOTICE_MS 500
+static u32 aMR_pc_direct_t0 = 0;               /* pc_net_game_now_ms() | 1 of the first wait frame of the current open demo (0 = none) */
+static FTR_ACTOR* aMR_pc_direct_ftr = NULL;     /* the piece that wait belongs to */
+static int aMR_pc_direct_noticed = FALSE;       /* notice 12 was raised during this wait */
 static int aMR_PcDresserDirectOpen(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor, u32 player_no) {
-    int floor, ut_x, ut_z, item;
+    int floor, ut_x, ut_z, item, waited;
+    u32 now;
 
     if (!aMR_PcDresserOn() || !aMR_CheckRoomOwner(player_no, my_room) || Save_Get(scene_no) == SCENE_NPC_HOUSE || Save_Get(scene_no) == SCENE_COTTAGE_NPC ||
         aMR_PcEditLocked() || !aMR_PcDresserIdent(my_room, ftr_actor, &floor, &ut_x, &ut_z, &item) || !aMR_pc_ftr_is_item_storage(item)) {
         return FALSE;
     }
     if (pc_net_game_dresser_cell_committed(floor, ftr_actor->layer, ut_x, ut_z, item) == 0) {
-        return FALSE; /* 6j: the open gate let an UNCOMMITTED dresser open (cap / in-room commits impossible): the host would refuse its SELECT -> vanilla menu now */
+        /* 6j: the open gate let an UNCOMMITTED dresser open (its 8 s cap / in-room commits impossible): the host would refuse its SELECT -> vanilla menu now,
+         * never silently: logged + notice 4 ("The room is being saved...") or 2 ("Leave the house to resync") */
+        pc_net_game_dresser_direct_uncommitted(item, ut_x, ut_z);
+        return FALSE;
     }
-    aMR_PcDresserSelectFtr(my_room, ftr_actor); /* no-op while this piece's selection is pending / answered; re-asked after ~3 s */
+    now = pc_net_game_now_ms();
+    if (my_room->msg_timer <= 1 || aMR_pc_direct_t0 == 0 || aMR_pc_direct_ftr != ftr_actor) {
+        aMR_pc_direct_t0 = now | 1u; /* a new open demo: its wait starts now */
+        aMR_pc_direct_ftr = ftr_actor;
+        aMR_pc_direct_noticed = FALSE;
+    }
+    waited = (int)(s32)(now - aMR_pc_direct_t0); /* signed: t0 = now | 1 may be 1 ms AHEAD of now */
+    if (waited < 0) {
+        waited = 0;
+    }
+    aMR_PcDresserSelectFtr(my_room, ftr_actor); /* no-op while this piece's selection is pending / answered; re-asked (same generation) after ~3 s */
     if (pc_net_game_dresser_view_ready()) {
-        printf("[NET][DRESSER] direct open: dresser 0x%04X (floor %d cell %d,%d) -> 27-slot screen after %d frame(s)\n", (unsigned)item, floor, ut_x, ut_z,
-               my_room->msg_timer);
+        printf("[NET][DRESSER] direct open: dresser 0x%04X (floor %d cell %d,%d) -> 27-slot screen after %d frame(s), %d ms (~%d fps)\n", (unsigned)item, floor, ut_x,
+               ut_z, my_room->msg_timer, waited, waited > 0 ? (int)((my_room->msg_timer * 1000) / waited) : 0);
+        if (aMR_pc_direct_noticed) {
+            pc_net_game_dresser_open_wait_notice(0); /* the "asking" line goes away with the screen */
+        }
+        aMR_pc_direct_t0 = 0;
         aMR_pc_dresser_page = 0;
         my_room->requested_msg_type = aMR_MSG_STATE_PC_DRESSER_GYROID; /* no message window is open: the gyroid overlay opens and closes the piece itself */
         return TRUE;
     }
-    if (my_room->msg_timer <= aMR_PC_DIRECT_OPEN_TIMEOUT) {
+    if (waited < aMR_PC_DIRECT_OPEN_TIMEOUT_MS) {
+        if (waited >= aMR_PC_DIRECT_OPEN_NOTICE_MS) {
+            pc_net_game_dresser_open_wait_notice(1); /* notice 12 "Asking the host..." (logged once per raise, refreshed every frame) */
+            aMR_pc_direct_noticed = TRUE;
+        }
         return TRUE; /* the host view of THIS dresser is on the way */
     }
-    printf("[NET][DRESSER] direct open: no host view of dresser 0x%04X after %d frames -> the vanilla menu (fallback)\n", (unsigned)item, my_room->msg_timer);
+    printf("[NET][DRESSER] direct open: no host view of dresser 0x%04X after %d ms (%d frames) -> the vanilla menu (fallback)\n", (unsigned)item, waited,
+           my_room->msg_timer);
+    pc_net_game_dresser_open_wait_notice(2); /* notice 6 "Try again in a moment": the extra storage did not load this time */
+    aMR_pc_direct_t0 = 0;
     return FALSE;
 }
 

@@ -25,11 +25,20 @@ Syntax: `command [subcommand] [arguments]`, case-insensitive command word. Failu
 | `wildlife spawn fish <species> <x> <z>` | one authoritative fish through the host's own injection path (`pcwld_test_host_inject`); species `seabass snapper coelacanth jellyfish knifejaw whale salmon2` or a number; coordinates must be inside the town | **yes** |
 | `wildlife despawn <id>` | releases the record (clients despawn it) | **yes** |
 | `wildlife spawn bug`, `wildlife sync` | **UNSUPPORTED** (no host bug-injection path; sync is automatic) | - |
+| `npc` | villagers (docs/multiplayer-guest-roadmap.md "Villager authority range and stale fallback"): per slot who simulates it (`host actor` / `relay peer N` = a client runs it and the host relays it / `no actor`), the last NPC_MOVE age, the conversation hold (peers, age, keepalive age, capped peers), at home / outside, position + acre (`[list]` = the host's villager list, no live sample) | no (read-only) |
+| `npc free <slot>` | releases a stuck conversation hold of that villager now; the holder's keepalives are refused until its END | no |
 | `test status` / `test help` | whether hooks are enabled / what they gate | no |
+| `ops` | the operator list (`servers\<id>\ops.ini`): kind (resident / guest), name, `(online)` | no (read-only) |
+| `op <player>` / `deop <player>` | make / unmake an OPERATOR (like Minecraft ops). `<player>` = the name of an online player, of a resident of the save or of a guest of this town (case-insensitive), or `peer N`. The identity stored is the authenticated binding key (name + town + player id + land id; a guest: its guest key), never the name alone; a name that matches two identities is REFUSED as ambiguous (use `peer N`). An online player's rights change at once. Operators may pick up / rotate placed furniture (more admin features will use the same check). `deop` also accepts a name only the list still knows. | no |
+| `furniture list [acre]` | furniture PLACED outdoors (docs/multiplayer-guest-roadmap.md "Outdoor furniture (C1) and the operator list"): index, tile (town units), acre, item, rotation S/E/N/W, placer kind + name, time; the safety ceilings and the Place / leaf-drop switches | no (read-only) |
+| `furniture remove <x> <z> [delete]` / `furniture remove #<index> [delete]` | removes ONE placed piece: the tile becomes empty and the item goes to the town's lost and found (police box), or is deleted with `delete` | no |
+| `furniture clear acre <n> [delete]` / `furniture clear player <name> [delete]` | removes every placed piece of an acre (0..29 = az * 5 + ax) / of a placer (by the name stored at placement) | no |
 | `tp ...` | **UNSUPPORTED** on the server | - |
 | `bell ...` | **UNSUPPORTED** on the server | - |
 
-Examples: `where Yubel`, `where peer 0`, `event status halloween`, `wildlife spawn fish seabass 2794 1404`, `wildlife despawn 3`.
+Examples: `where Yubel`, `where peer 0`, `event status halloween`, `wildlife spawn fish seabass 2794 1404`, `wildlife despawn 3`, `op Bella`, `op peer 2`, `ops`, `furniture list 12`, `furniture remove 41 57`, `furniture clear player Bella delete`.
+
+A listen host (no `--dedicated`) has no console: its own player is implicitly an operator, and `ops.ini` lives in `save\mp\` (edit it while the host is stopped: `op = resident|guest <40 hex digits> <name>`).
 
 ## The console window
 
@@ -46,4 +55,4 @@ Started by hand (double-click, `Start Server.bat`, a shell) the server opens its
 - **`bell`**: bells are per-player save data and there is no host-side admin API; `give` covers items.
 - **`net resync`**: see above.
 
-Tests: `pc/tools/net_spike/test_devconsole_real.py` (real dedicated host process; hooks disabled and enabled).
+Tests: `pc/tools/net_spike/test_devconsole_real.py` (real dedicated host process; hooks disabled and enabled); `test_ofurn_console_protocol.py` (`ops` / `op` / `deop` / `furniture` against a real dedicated host with FakeClients).

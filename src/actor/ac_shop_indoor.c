@@ -472,15 +472,23 @@ static void Shop_Indoor_Actor_draw(ACTOR* actorx, GAME* game) {
  * is idle (not talking, no inventory / menu open).
  * A restock seen while inside LATCHES the exit (aSI_pc_eject_pending): a player still talking to Nook when the 60 s restock ends is shown out once the talk is over (the floor
  * display shows the old catalog), never in the middle of it. The forced exit of a busy player (a stuck state) applies only while the shop is STILL closed and only after
- * aSI_PC_EJECT_HARD_CAP frames of waiting (far beyond the 60 s restock); a busy player is never forced out once the restock is over. Reset when a shop room is built. */
+ * aSI_PC_EJECT_HARD_CAP ms of waiting (far beyond the 60 s restock); a busy player is never forced out once the restock is over. Reset when a shop room is built.
+ * Frame-rate independence: the grace and the cap are WALL-CLOCK (pc_net_game_now_ms); they used to count rendered frames (18000 = 5 min only at 60 fps, 18 s on an
+ * uncapped client, which could force a player out in the middle of a Nook talk). */
 extern int pc_net_game_shop_restocking(void);
+extern u32 pc_net_game_now_ms(void);
 /* Multiplayer shop upgrade (pc_shop_upgrade.h): the announced 5-minute closure shows everyone out the same way (the announcing player once Nook's talk is over). */
 extern int pc_shop_upgrade_closed(void);
-#define aSI_PC_EJECT_HARD_CAP 18000
-static int aSI_pc_eject_wait = 0;
+#define aSI_PC_EJECT_HARD_CAP 300000 /* ms (5 min) */
+#define aSI_PC_EJECT_GRACE_MS 500    /* "half a second of grace" */
+static int aSI_pc_eject_wait = 0; /* ms since the latch was first seen outside a wipe */
+static u32 aSI_pc_eject_t0 = 0;   /* pc_net_game_now_ms() | 1 of that moment (0 = not started) */
+static u32 aSI_pc_eject_log_ms = 0;
 static int aSI_pc_eject_pending = 0;
 static void aSI_pc_restock_eject_reset(void) {
     aSI_pc_eject_wait = 0;
+    aSI_pc_eject_t0 = 0;
+    aSI_pc_eject_log_ms = 0;
     aSI_pc_eject_pending = 0;
 }
 static void aSI_pc_restock_eject(GAME* game) {
@@ -493,22 +501,34 @@ static void aSI_pc_restock_eject(GAME* game) {
     }
     if (!aSI_pc_eject_pending) {
         aSI_pc_eject_wait = 0;
+        aSI_pc_eject_t0 = 0;
+        aSI_pc_eject_log_ms = 0;
         return;
     }
     if (play->fb_wipe_mode != WIPE_MODE_NONE) {
         return;
     }
-    aSI_pc_eject_wait++;
-    if (aSI_pc_eject_wait < 30) {
+    {
+        const u32 now = pc_net_game_now_ms();
+        if (aSI_pc_eject_t0 == 0) {
+            aSI_pc_eject_t0 = now | 1u;
+        }
+        aSI_pc_eject_wait = (int)(s32)(now - aSI_pc_eject_t0); /* signed: t0 = now | 1 may be 1 ms ahead */
+        if (aSI_pc_eject_wait < 0) {
+            aSI_pc_eject_wait = 0;
+        }
+    }
+    if (aSI_pc_eject_wait < aSI_PC_EJECT_GRACE_MS) {
         return;
     }
     /* never cut a Nook conversation: a visible message window (any talk / choice / purchase dialogue), a demo or a non-idle player holds the exit */
     busy = mPlib_able_submenu_type1(game) == FALSE || mDemo_CheckDemo() != FALSE || mMsg_Check_MainHide(mMsg_Get_base_window_p()) == FALSE;
     if (busy && (!restocking || aSI_pc_eject_wait < aSI_PC_EJECT_HARD_CAP)) {
-        /* log only: the first held frame of a latch, then every 300 frames with --verbose (g_pc_verbose precedent) */
+        /* log only: the first held frame of a latch, then every 5 s with --verbose (g_pc_verbose precedent) */
         extern int g_pc_verbose;
-        if (aSI_pc_eject_wait == 30 || (g_pc_verbose && (aSI_pc_eject_wait % 300) == 0)) {
-            printf("[NET][RESTOCK] exit held: demo=%d type=%d able=%d msg_hidden=%d restocking=%d waited=%d\n", (int)mDemo_CheckDemo(), (int)mDemo_CheckDemoType(),
+        if (aSI_pc_eject_log_ms == 0 || (g_pc_verbose && (s32)(pc_net_game_now_ms() - aSI_pc_eject_log_ms) >= 5000)) {
+            aSI_pc_eject_log_ms = pc_net_game_now_ms() | 1u;
+            printf("[NET][RESTOCK] exit held: demo=%d type=%d able=%d msg_hidden=%d restocking=%d waited=%d ms\n", (int)mDemo_CheckDemo(), (int)mDemo_CheckDemoType(),
                    (int)mPlib_able_submenu_type1(game), (int)mMsg_Check_MainHide(mMsg_Get_base_window_p()), restocking, aSI_pc_eject_wait);
         }
         return;
@@ -517,12 +537,14 @@ static void aSI_pc_restock_eject(GAME* game) {
         return; /* no valid way out was recorded (a door always writes it): never warp into scene 0; keep waiting */
     }
     if (goto_other_scene(play, Common_GetPointer(structure_exit_door_data), FALSE)) {
-        printf("[NET][RESTOCK] shop %s: the player was shown out (waited %d frames%s)\n",
+        printf("[NET][RESTOCK] shop %s: the player was shown out (waited %d ms%s)\n",
                !restocking ? "restocked while talking" : pc_shop_upgrade_closed() ? "closed for the upgrade" : "restocking", aSI_pc_eject_wait,
                busy ? ", FORCED after the hard cap" : "");
         aSI_pc_eject_pending = 0;
     }
     aSI_pc_eject_wait = 0;
+    aSI_pc_eject_t0 = 0;
+    aSI_pc_eject_log_ms = 0;
 }
 #endif
 

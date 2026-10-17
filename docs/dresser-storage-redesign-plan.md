@@ -312,7 +312,7 @@ Not the cause:
 Then:
 - Select the piece and stay in WAIT_MSG until `pc_net_game_dresser_view_ready()`, then request PC_DRESSER_GYROID.
 - If no answer within about 180 frames (host slow, refused or disconnected), fall back to the unchanged vanilla OWNER_* message, so the dresser is
-  never unusable.
+  never unusable. (Superseded by 6x: the wait is 3 s of wall clock, not frames.)
 
 Unchanged: visitors, NPC houses, other furniture, the edit-lock path, host checks, and close/commit.
 
@@ -402,7 +402,7 @@ New pure module `pc/src/pc_dresser_layout.c`, `pc/include/pc_dresser_layout.h`.
      closes the piece like vanilla.
   3. Otherwise wait in WAIT_MSG.
   4. After `aMR_PC_DIRECT_OPEN_TIMEOUT` (180 frames) with no view (slow, refusing or disconnected host), fall back to the vanilla OWNER_* message
-     flow, which is unchanged.
+     flow, which is unchanged. (Superseded by 6x: `aMR_PC_DIRECT_OPEN_TIMEOUT_MS` = 3000 ms of wall clock.)
 
 ### 3. Item types
 New pure module `pc/src/pc_dresser_items.c` (item-id rules, macros of `m_name_table.h` only). It is ONE predicate:
@@ -1205,6 +1205,44 @@ a duplicate. This happens on every client, old clients included.
 - **Panel.** The interior as rendered is winT's inner tan (env 215,185,155) blended at its own alpha over the flat tan layers, which gives exactly
   215,185,155. The opaque panel uses the same macros (`MHW_PC_DRESSER_TAN_*`), so the interior and the panel are the same colour.
 - **Not visually verified.** A screenshot of the new build is needed.
+
+## 6x. The first open after re-entering the house showed the vanilla menu (frame-rate bug, fixed 2026-10-16; source + harness verified, real run blocked)
+
+- **Symptom (user).** After leaving and re-entering the house, the FIRST A on a dresser showed the vanilla 3-slot menu with no notice; the second A worked.
+- **Root cause (confirmed in the source).** The user's client runs uncapped (`settings.ini` vsync = 0, max_fps = 0; only a dedicated server is forced to
+  60 Hz, `pc_main.c`). The direct-open wait counted RENDERED frames: `#define aMR_PC_DIRECT_OPEN_TIMEOUT 180` compared with `my_room->msg_timer`, which
+  `aMR_SetFtrDemoMsg` increments once per frame. That is 3 s at 60 fps but 0.2 to 0.4 s at the user's frame rate. A new room visit forgets the selection
+  and the contents, so the first open needs a full SELECT -> STATE round trip. The host was busy applying the exit commit, the answer missed the
+  window, and the code fell back silently. The SELECT re-ask (`++waited < 180` in `aMR_PcDresserSelectFtr`) was frame-counted too. Each re-ask bumped the
+  generation, and a STATE for an older generation is ignored, so a slow answer was thrown away and the wait started again.
+- **Fix.**
+  - The direct-open wait is wall clock (`pc_net_game_now_ms()`). `aMR_PC_DIRECT_OPEN_TIMEOUT_MS` is 3000 ms. The start time resets with every open
+    demo (`msg_timer <= 1`) and whenever a different piece is opened.
+  - After `aMR_PC_DIRECT_OPEN_NOTICE_MS` (500 ms) the new notice 12 shows: "Asking the host for your stored items...". It is cleared when the view
+    arrives.
+  - At the cap the vanilla menu opens with notice 6 ("Try again in a moment"), so the furniture stays usable when the host is down.
+  - The SELECT re-ask is wall clock: 3 s after the last SELECT.
+  - A re-ask of the same piece in the same visit, while it is still unanswered, keeps the generation (`pc_net_game_dresser_select`, logged as
+    "re-ask: same generation"). A slow answer is adopted instead of discarded. Any other selection, or a new visit, still bumps the generation.
+  - Row 5: the direct open of an UNCOMMITTED dresser (the open gate's 8 s cap, or in-room commits stopped) is no longer silent.
+    `pc_net_game_dresser_direct_uncommitted` logs one line and shows notice 4 (still saving) or 2 (only the room exit resolves it), then the vanilla
+    menu opens.
+- **Not done (optional item 3).** No SELECT is sent early on room entry. The host keeps ONE selection per peer, so a prefetch would have to guess the
+  piece. With the wall-clock wait and the kept generation, the first press already succeeds; it only costs one round trip.
+- **Same bug class elsewhere (audit, see the roadmap note "Frame-rate independence of PC waits").** These are now wall clock too:
+  - `PC_DRESSER_UI_DEFER_MS` = 10000 (was 600 polls).
+  - The shop restock eject grace (500 ms) and hard cap (`aSI_PC_EJECT_HARD_CAP` = 300000 ms, was 18000 frames).
+  - The in-room commit quiet window: `PC_NETGAME_HCL_QUIET_FRAMES` 30 AND `PC_NETGAME_HCL_QUIET_MS` 500.
+- **TEST-ONLY.**
+  - `AC_TEST_DRESSER_SELECT_DELAY_MS` on the host holds a SELECT for that many ms; the real handler answers it later.
+  - `AC_TEST_DRESSER_UI_REENTER` on the client: the "direct" hook leaves, walks in again and opens again.
+  - The "direct" hook's own give-ups are wall clock.
+- **Tests.**
+  - `test_dresser_ui_source.py` FR1-FR7. FR1 pins that no frame constant decides the direct-open fallback; FR6 models the generation logic.
+  - `test_house_sync_src.py`: the quiet-window ms check.
+  - `test_shop_restock_talk_src.py`: the eject grace and cap are wall clock.
+  - `test_dresser_real.py --ui-direct reenter | slow | timeout` (written; the client runs uncapped with `--no-framelimit`). These are NOT RUN yet: the
+    Samsung display was not connected.
 
 ## 7. Stage 6 (NOT done, backlog): full move / swap support (Option B)
 

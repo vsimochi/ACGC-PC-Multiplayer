@@ -451,6 +451,10 @@ void pc_platform_update_window_size(void);
 #define PC_NOOP_WIDESCREEN_STRETCH     0xAC5701u
 #define PC_NOOP_WIDESCREEN_STRETCH_OFF 0xAC5700u
 extern int g_pc_widescreen_stretch;
+/* Multiplayer "world behind the menu" (m_play.c): clear ONLY the depth buffer at this point of the display list (emu64 ->
+ * pc_gx_clear_depth_now), so the submenu overlay drawn over the live world depth-tests against an empty buffer as over vanilla's prbuf. */
+#define PC_NOOP_CLEAR_DEPTH            0xAC5702u
+void pc_gx_clear_depth_now(void);
 
 /* --- Functions --- */
 void pc_platform_init(void);

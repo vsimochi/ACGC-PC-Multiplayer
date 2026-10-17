@@ -330,20 +330,21 @@ static int aMR_PcDresserMoveLocked(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor,
 /* Selects the opened dresser on the host (v2): its STATE (the extra items) arrives shortly; the menus read pc_net_game_dresser_item() only when it did. */
 static void aMR_PcDresserSelectFtr(MY_ROOM_ACTOR* my_room, FTR_ACTOR* ftr_actor) {
     static int last[5] = { -1, -1, -1, -1, -1 };
-    static int waited = 0;
+    static u32 asked_ms = 0; /* WALL-CLOCK time of the last SELECT (the caller runs every rendered frame: a frame count is 0.2 s on an uncapped client) */
     static unsigned int last_visit = 0;
     int floor, ut_x, ut_z, item;
     if (last_visit != pc_net_game_dresser_visit()) { /* a new room visit: every dresser is asked again (the move lock needs THIS visit's answer) */
         last_visit = pc_net_game_dresser_visit();
         last[0] = last[1] = last[2] = last[3] = last[4] = -1;
-        waited = 0;
+        asked_ms = 0;
     }
     if (pc_net_game_dresser_available() && aMR_PcDresserIdent(my_room, ftr_actor, &floor, &ut_x, &ut_z, &item)) {
         if (last[0] == floor && last[1] == ftr_actor->layer && last[2] == ut_x && last[3] == ut_z && last[4] == item &&
-            (pc_net_game_dresser_view_ready() || ++waited < 180)) {
-            return; /* already selected / its answer is on the way (this function runs every frame of the open-wait); re-asked after ~3 s without an answer */
+            (pc_net_game_dresser_view_ready() || (s32)(pc_net_game_now_ms() - asked_ms) < 3000)) {
+            return; /* already selected / its answer is on the way (this function runs every frame of the open-wait); re-asked after 3 s without an answer
+                     * (the re-ask of the SAME piece keeps its generation, pc_net_game_dresser_select: a slow first answer is still adopted) */
         }
-        waited = 0;
+        asked_ms = pc_net_game_now_ms() | 1u;
         if (pc_net_game_dresser_select(floor, ftr_actor->layer, ut_x, ut_z, item) != 0) {
             last[0] = floor;
             last[1] = ftr_actor->layer;
@@ -2278,6 +2279,11 @@ static int aMR_PcLockKeep(FTR_ACTOR* ftr, int put) {
 static int s_store_v = 0, s_store_f = 0, s_store_vs = -1, s_store_fs = -1; /* TEST-ONLY 6l "store" */
 static int s_moved_done = 0; /* TEST-ONLY "moved": the pickup + placement happened (the second open is the check) */
 static int s_moved_tries = 0;
+static u32 s_direct_t0 = 0; /* TEST-ONLY "direct": pc_net_game_now_ms() | 1 when stage 20 began (its waits are wall-clock) */
+static int s_reenter_state = 0; /* TEST-ONLY AC_TEST_DRESSER_UI_REENTER: 0 off / not yet, 1 left the room once (re-warp armed), 2 re-entered (second visit), 3 done */
+static unsigned int s_reenter_visit = 0;
+static int s_ui_reselect = FALSE; /* TEST-ONLY reenter: pick the dresser actor of the new visit again */
+extern void pc_net_game_test_dresser_rewarp(void);
 static void aMR_PcDresserLockTest(MY_ROOM_ACTOR* my_room, ACTOR* actorx, int* stage) {
     static int frames = 0;
     static unsigned denied0 = 0;
@@ -2370,33 +2376,38 @@ static void aMR_PcDresserLockTest(MY_ROOM_ACTOR* my_room, ACTOR* actorx, int* st
             *stage = (pc_net_game_dresser_count() == 0) ? 40 : 3;
             return;
         case 20: /* "direct": A in front of the chest through the real pad path: the 27-slot screen opens directly, or the vanilla menu (fallback) */
+            if (frames == 0) {
+                s_direct_t0 = pc_net_game_now_ms() | 1u; /* the hook's own waits are WALL-CLOCK too (the rig may run the client uncapped) */
+            }
             if (frames < 40) {
                 (void)aMR_PcLockPlace(my_room, ftr, 1);
             }
             pc_net_game_test_set_lock_pad((frames >= 40 && frames < 44) ? 1u : 0u);
             frames++;
             if (pc_dresser_ui_active()) {
-                printf("[NET][DRESSER][TEST-ONLY] direct: the 27-slot screen is OPEN (%d extra item(s)) after %d frames\n", pc_net_game_dresser_count(), frames);
+                printf("[NET][DRESSER][TEST-ONLY] direct: the 27-slot screen is OPEN (%d extra item(s)) after %d frames, %d ms (visit %u)\n", pc_net_game_dresser_count(),
+                       frames, (int)(s32)(pc_net_game_now_ms() - s_direct_t0), pc_net_game_dresser_visit());
                 pc_net_game_test_set_lock_pad(0x100u | 8u); /* B pulses while the overlay runs (this hook is not called then) */
                 frames = 0;
                 *stage = 21;
                 return;
             }
             if (my_room->msg_type >= aMR_MSG_STATE_OWNER_NO_ITEM && my_room->msg_type <= aMR_MSG_STATE_OWNER_WHICH_PUT_OUT3) {
-                printf("[NET][DRESSER][TEST-ONLY] direct: the VANILLA dresser menu opened (msg state %d) after %d frames\n", (int)my_room->msg_type, frames);
+                printf("[NET][DRESSER][TEST-ONLY] direct: the VANILLA dresser menu opened (msg state %d) after %d frames, %d ms (visit %u)\n", (int)my_room->msg_type, frames,
+                       (int)(s32)(pc_net_game_now_ms() - s_direct_t0), pc_net_game_dresser_visit());
                 pc_net_game_test_set_lock_pad(0x100u | 8u);
                 frames = 0;
                 *stage = 21;
                 return;
             }
-            if (s_moved_done && frames > 120 && s_moved_tries < 40) { /* "moved": the open was refused for now (notice 4): try again until it opens */
+            if (s_moved_done && (s32)(pc_net_game_now_ms() - s_direct_t0) > 2000 && s_moved_tries < 40) { /* "moved": the open was refused for now (notice 4): try again until it opens */
                 s_moved_tries++;
                 printf("[NET][DRESSER][TEST-ONLY] moved: nothing opened (try %d, notice %d) -- A again\n", s_moved_tries, pc_net_game_room_edit_notice());
                 pc_net_game_test_set_lock_pad(0u);
                 frames = 0;
                 return;
             }
-            if (frames > 600) {
+            if ((s32)(pc_net_game_now_ms() - s_direct_t0) > 12000 && frames > 600) { /* well past the 3 s direct-open cap at any frame rate */
                 printf("[NET][DRESSER][TEST-ONLY] direct: nothing opened (A not taken as an open, msg %d demo %d)\n", (int)my_room->msg_type, (int)my_room->demo_flag);
                 pc_net_game_test_set_lock_pad(0u);
                 frames = 0;
@@ -2902,6 +2913,14 @@ static void aMR_PcDresserUiTestHook(ACTOR* actorx) {
     Private_c* priv = Common_Get(now_private);
     int i, c;
 
+    if (stage == 3 && s_reenter_state == 1 && pc_net_game_dresser_visit() != s_reenter_visit) {
+        /* AC_TEST_DRESSER_UI_REENTER: the SECOND room visit (a new visit forgets the selection + contents): the same direct open again, A as soon as allowed */
+        printf("[NET][DRESSER][TEST-ONLY] ui: reenter: room visit %u (was %u) -> the direct open again, A at once\n", pc_net_game_dresser_visit(), s_reenter_visit);
+        s_reenter_state = 2;
+        s_ui_reselect = TRUE;
+        frames = 0;
+        stage = 0;
+    }
     if (stage == 3 || priv == NULL) {
         return;
     }
@@ -2932,6 +2951,10 @@ static void aMR_PcDresserUiTestHook(ACTOR* actorx) {
         {
             /* v2: select a real furniture of the own room first (the first used actor whose identity resolves) and wait for its STATE */
             static int selected_ftr = -1;
+            if (s_ui_reselect) {
+                selected_ftr = -1; /* reenter: this visit's furniture actors are new */
+                s_ui_reselect = FALSE;
+            }
             if (selected_ftr < 0) {
                 const char* want_e = pc_test_hook_getenv("AC_TEST_DRESSER_UI_FTR"); /* optional: the furniture item (hex) to use as the dresser */
                 const int want = want_e != NULL ? (int)strtol(want_e, NULL, 16) : -1;
@@ -3120,6 +3143,15 @@ static void aMR_PcDresserUiTestHook(ACTOR* actorx) {
         if (goto_other_scene((GAME_PLAY*)gamePT, Common_GetPointer(structure_exit_door_data), FALSE) == 1) {
             pc_net_game_dresser_test_left_room(); /* the house-edit test hook (AC_TEST_HOUSE_CLIENT_SWAP) may run now */
             stage = 3;
+            if (s_reenter_state == 0 && pc_test_hook_getenv("AC_TEST_DRESSER_UI_REENTER") != NULL) {
+                s_reenter_state = 1; /* walk in once more (pc_net_game.c room warp): the first open of the NEXT visit is the check */
+                s_reenter_visit = pc_net_game_dresser_visit();
+                pc_net_game_test_dresser_rewarp();
+                printf("[NET][DRESSER][TEST-ONLY] ui: reenter: left the room after visit %u, walking in again\n", s_reenter_visit);
+            } else if (s_reenter_state == 2) {
+                s_reenter_state = 3;
+                printf("[NET][DRESSER][TEST-ONLY] ui: reenter: second visit done\n");
+            }
         } else {
             frames = 0;
         }

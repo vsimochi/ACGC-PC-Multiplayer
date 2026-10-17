@@ -138,7 +138,7 @@ def main():
     check("S bounded and paced: the digest poll is every PC_NETGAME_MBOX_CHECK_MS (500), at most PC_NETGAME_MBOX_PER_POLL (4) messages per peer per host poll, a failed send is retried next poll (sent seq not advanced), "
           "a (re)binding resets the per-peer sent seqs; the per-peer state is part of the memset-per-connection peer state",
           "#define PC_NETGAME_MBOX_CHECK_MS 500u" in c_raw and "#define PC_NETGAME_MBOX_PER_POLL 4" in c_raw and "sent < PC_NETGAME_MBOX_PER_POLL" in tk
-          and in_order(tk, ["if (!pcnetgame_mbox_send(", "break;", "st->mbox_sent_seq[i] = X->seq;"]) and "st->mbox_res_plus1 != idx + 1" in tk and "memset(st->mbox_sent_seq, 0" in tk
+          and in_order(tk, ["if (!pcnetgame_host_join_push_ok(p) || !pcnetgame_mbox_send(", "break;", "st->mbox_sent_seq[i] = X->seq;"]) and "st->mbox_res_plus1 != idx + 1" in tk and "memset(st->mbox_sent_seq, 0" in tk
           and "uint32_t             mbox_sent_seq[PC_NETGAME_MBOX_SLOTS];" in c_raw and "int                  mbox_res_plus1;" in c_raw)
     sd = func_body(m2h_raw, "pcnetgame_mbox_send")
     gsd = func_body(m2h_raw, "pcnetgame_guest_mbox_send")

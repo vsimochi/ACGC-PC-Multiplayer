@@ -251,6 +251,12 @@ def main():
                              "pl->requested_main_index_changed", "mPlayer_INDEX_WAIT", "mPlayer_INDEX_WALK", "mPlayer_INDEX_RUN", "mPlayer_INDEX_DASH", "aMR_pc_room_quiet()",
                              "need_own_room && Common_Get(field_type) != mFI_FIELDTYPE2_PLAYER_ROOM"))
        and num(c, "PC_NETGAME_HCL_QUIET_FRAMES") == 30 and "->game_frame" in func_body(c, "pcnetgame_hcl_quiet_clock") and "pcnetgame_hcl_quiet_clock(s_hcl_q_dresser)" in func_body(c, "pcnetgame_hcl_quiet_frames") and "pcnetgame_hcl_quiet_update();\n    pcnetgame_hcl_room_track();" in func_body(c, "pcnetgame_house_client_tick"))
+    qf = func_body(c, "pcnetgame_hcl_quiet_frames")
+    ck("L frame-rate independence: the quiet window also needs >= PC_NETGAME_HCL_QUIET_MS (500) of WALL CLOCK (an uncapped client's 30 frames are 30 ms); the ms start "
+       "restarts with every new quiet period",
+       num(c, "PC_NETGAME_HCL_QUIET_MS") == 500 and "if ((int32_t)(pcnetgame_now_ms() - s_hcl_q_ms) < PC_NETGAME_HCL_QUIET_MS) {\n        return 0;" in qf and
+       qf.find("PC_NETGAME_HCL_QUIET_MS") < qf.find("return (int)(pcnetgame_hcl_quiet_clock(") and
+       "s_hcl.q_gstart = pcnetgame_hcl_quiet_clock(dm);\n        s_hcl_q_ms = pcnetgame_now_ms() | 1u;" in func_body(c, "pcnetgame_hcl_quiet_update"))
     ik = strip_comments(func_body(c, "pcnetgame_hcl_inroom_ok"))
     ck("L an in-room commit needs: a baseline captured at room entry, no refusal this visit, no rollback, no commit in flight, the OWN room quiescent NOW (live_room_house(1)) and for >= 30 frames; the dirty test is the snapshot digest vs canon",
        all(k in ik for k in ("!s_hcl.room_base_valid || s_hcl.room_stopped || s_hcl.rollback || s_hcl.c_active", "pcnetgame_hcl_live_room_house(1) != h", "pcnetgame_hcl_quiet_frames(h) >= PC_NETGAME_HCL_QUIET_FRAMES"))

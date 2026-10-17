@@ -14,6 +14,7 @@ static int s_pending = 0;
 /* 6p: an op deferred until the in-room commit of this screen's room edits landed (op 1 put / 2 take / 3 move / 4 swap, 0 = none) */
 static struct {
     int op, index, pocket, item, polls;
+    uint32_t t0; /* pc_net_game_now_ms() | 1 when the op was deferred (the give-up is wall-clock) */
 } s_defer;
 /* 6r (B): the item carried by "Grab" (nothing changes until it is placed: the carry is a view state only) */
 static struct {
@@ -86,7 +87,9 @@ int pc_dresser_ui_slot_item(int col) {
 static PCDresserVanillaTakeFn s_take_fn = NULL;
 static PCDresserVanillaPutFn s_put_fn = NULL;
 
-#define PC_DRESSER_UI_DEFER_POLLS 600 /* ~10 s of overlay frames */
+/* Frame-rate independence: the deferred op gives up after PC_DRESSER_UI_DEFER_MS of WALL-CLOCK (it used to be 600 polls = 10 s only at 60 fps, 0.6 s on an
+ * uncapped client, which refused the op while the room commit was still on its way). The poll count is kept for the log only. */
+#define PC_DRESSER_UI_DEFER_MS 10000
 
 /* 1 = sent, 2 = deferred (waits for the in-room commit; pending), 0 = refused */
 static int pc_dresser_ui_begin_or_defer(int op, int index, int pocket, int item) {
@@ -100,6 +103,7 @@ static int pc_dresser_ui_begin_or_defer(int op, int index, int pocket, int item)
         s_defer.pocket = pocket;
         s_defer.item = item;
         s_defer.polls = 0;
+        s_defer.t0 = pc_net_game_now_ms() | 1u;
         pc_net_game_saving_notice();
         printf("[NET][DRESSER] gyroid overlay: %s of 0x%04X WAITS for the in-room commit of this screen's vanilla-slot edits (notice 4)\n", pc_dresser_ui_op_name(op),
                (unsigned)item);
@@ -260,7 +264,8 @@ int pc_dresser_ui_poll(void) {
             s_defer.op = 0;
             return PC_DRESSER_UI_ACT_PENDING;
         }
-        if (b < 0 && pc_net_game_dresser_last_block() == 5 && ++s_defer.polls < PC_DRESSER_UI_DEFER_POLLS) {
+        ++s_defer.polls;
+        if (b < 0 && pc_net_game_dresser_last_block() == 5 && (int32_t)(pc_net_game_now_ms() - s_defer.t0) < PC_DRESSER_UI_DEFER_MS) {
             pc_net_game_saving_notice();
             return PC_DRESSER_UI_ACT_PENDING;
         }

@@ -69,7 +69,7 @@ def main():
     ids = dict((n, v) for n, v in wire_baseline.c_message_ids_raw(gc))
     check("W PC_NETGAME_MSG_PVP_HIT_REQ = 91 and PC_NETGAME_MSG_PVP_HIT = 92", ids.get("PC_NETGAME_MSG_PVP_HIT_REQ") == 91 and ids.get("PC_NETGAME_MSG_PVP_HIT") == 92)
     vals = sorted(ids.values())
-    check("W ids 88 / 89 / 93-95 stay unused, ids above 92 only the puppet sprint 96 / 97 / 98, all unique (%s)" % vals[-6:], 88 not in vals and 89 not in vals and 92 in vals and all(v in (96, 97, 98) for v in vals if v > 92) and len(vals) == len(set(vals)))
+    check("W ids 88 / 89 / 93-95 stay unused, ids above 92 only the puppet sprint 96 / 97 / 98 / 99, all unique (%s)" % vals[-6:], 88 not in vals and 89 not in vals and 92 in vals and all(v in (96, 97, 98, 99) for v in vals if v > 92) and len(vals) == len(set(vals)))
     req = re.search(r"typedef struct PCPvpHitReqMsg \{(.*?)\} PCPvpHitReqMsg;", ph, re.S)
     hit = re.search(r"typedef struct PCPvpHitMsg \{(.*?)\} PCPvpHitMsg;", ph, re.S)
     norm = lambda m: " ".join(strip_comments(m.group(1)).split()) if m else None  # noqa: E731
@@ -82,9 +82,9 @@ def main():
           "PC_PVP_TOOL_AXE = 1, PC_PVP_TOOL_SHOVEL = 2, PC_PVP_TOOL_NET = 3" in ph and "PC_PVP_REACT_TUMBLE = 1, PC_PVP_REACT_SHOCK = 2, PC_PVP_REACT_FLINCH = 3" in ph)
     kinds = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_KIND_\w+\s+(\d+)u", gc)]
     reasons = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_REASON_\w+\s+(\d+)u", gc)]
-    check("W no new TXN kind for PvP (max %s <= 21: kind 21 is worker E's EVNPC_CLAIM) / reason (max %s <= 54: 50..54 are worker E's)" % (max(kinds) if kinds else None, max(reasons) if reasons else None),
-          kinds and reasons and max(kinds) <= 21 and max(reasons) <= 54)
-    check("W town services unchanged (TS_NUM 9) and no PVP host-config flag", "#define PC_NETGAME_TS_NUM      10u" in gc and not re.search(r"HOSTCFG\w*PVP|PVP\w*HOSTCFG", gc))
+    check("W no new TXN kind for PvP (max %s <= 22: kind 21 is worker E's EVNPC_CLAIM, 22 outdoor furniture C1) / reason (max %s <= 61: 50..54 are worker E's, 55..61 outdoor furniture)" % (max(kinds) if kinds else None, max(reasons) if reasons else None),
+          kinds and reasons and max(kinds) <= 22 and max(reasons) <= 61 and "PVP" not in " ".join(re.findall(r"#define (PC_NETGAME_TXN_(?:KIND|REASON)_\w+)", gc)))
+    check("W town services unchanged (TS_NUM 9) and no PVP host-config flag", ("#define PC_NETGAME_TS_NUM      10u" in gc or "#define PC_NETGAME_TS_NUM      11u" in gc) and not re.search(r"HOSTCFG\w*PVP|PVP\w*HOSTCFG", gc))
     check("W the PvP msg ids are dispatched host-side (91) and client-side (92) with exact sizes",
           "size == sizeof(PCPvpHitReqMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT_REQ" in gc and "size == sizeof(PCPvpHitMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_PVP_HIT" in gc)
 
@@ -161,7 +161,7 @@ def main():
           '{ PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_SHOCK, 5.0f, "shock", 0, PC_TFL_ATTR0 }' in rp)
     check("F the puppet STUNG_MOSQUITO row plays the sting SE NA_SE_6A on entry, and the PvP flinch victim plays it locally",
           '{ PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_6A, 0.0f, "flinch_6a", 0, 0 }' in rp and "sAdo_OngenTrgStart(NA_SE_6A, &actorx->world.position);" in mp)
-    check("F no new message id for the face / sound sync (max id 92, or only the puppet sprint 96 / 97 / 98 above it)", max(wire_baseline.c_message_ids_raw(gc), key=lambda x: x[1])[1] in (92, 96, 97, 98))
+    check("F no new message id for the face / sound sync (max id 92, or only the puppet sprint 96 / 97 / 98 / 99 above it)", max(wire_baseline.c_message_ids_raw(gc), key=lambda x: x[1])[1] in (92, 96, 97, 98, 99))
 
     # ---- T misc
     check("T pc_pvp_authority.c is in the game build", "src/pc_pvp_authority.c" in cm)

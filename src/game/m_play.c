@@ -521,8 +521,10 @@ extern void play_init(GAME* game) {
 static int Game_play_pc_host_paused_live(void) {
     extern int g_pc_paused;
     extern int pc_net_game_host_ready_peer_count(void);
+    extern int pc_net_game_menu_world_live(void);
 
-    return g_pc_paused && pc_net_game_host_ready_peer_count() > 0;
+    /* "world behind menus": a READY CLIENT's Esc menu keeps its world running too (pc_net_game_menu_world_live), with the same guard */
+    return g_pc_paused && (pc_net_game_host_ready_peer_count() > 0 || pc_net_game_menu_world_live());
 }
 
 /* Submenu world hold (multiplayer HOST with >= 1 READY client, process_status != WAIT). Vanilla freezes every actor while a
@@ -556,23 +558,94 @@ static int Game_play_pc_actor_total(GAME_PLAY* play) {
     return n;
 }
 
+/* "World keeps running behind menus" (pc_net_game_menu_world_live(): a HOST with >= 1 READY peer or a READY CLIENT, setting
+ * menu_world_live / env AC_MP_MENU_WORLD, default ON; single player and an unconnected process never get here = vanilla freeze).
+ * Besides the villagers above (host F2; on a client the same real move proc, which there only CONSUMES the host's NPC_MOVE /
+ * NPC_STATE: no schedule / action AI, no RNG), a WHITELIST of network-driven or purely presentational actors runs its own move
+ * proc while a free-play submenu is open, with the same g_pc_submenu_world_tick protection (no actor creation, no exchange bank,
+ * deletes deferred, OC registrations dropped):
+ *   - remote-player puppets (pc_remote_player.c: interpolation / animation / cosmetics; the collider is held while the flag is set)
+ *   - the effect control (eEC: visual effects only), the weather (particles, env SE; a client never rolls the weather), the insect
+ *     control (bugs; the mosquito sting request is suppressed while the flag is set, ac_ins_ka.c) and the fish control (gyoei).
+ * Everything else stays frozen exactly as vanilla: the LOCAL player (its menu state machine owns it), the NPC control actor and
+ * shop / event NPCs, BG items, bees, the ball, structures, the set manager (no new spawns), the camera. See the roadmap section. */
+static int s_pc_submenu_puppet_ticks = 0;
+static int s_pc_submenu_ctl_ticks = 0;
+
+static void Game_play_pc_submenu_tick_actor(GAME_PLAY* play, ACTOR* a) {
+    extern int g_pc_submenu_world_tick;
+    PLAYER_ACTOR* pl = GET_PLAYER_ACTOR(play);
+    int oc_num = play->collision_check.collider_num;
+
+    /* exactly the per-actor prologue / epilogue of Actor_info_call_actor (m_actor.c) */
+    xyz_t_move(&a->last_world_position, &a->world.position);
+    if (pl != NULL) {
+        a->player_distance_xz = search_position_distanceXZ(&a->world.position, &pl->actor_class.world.position);
+        a->player_distance_y = pl->actor_class.world.position.y - a->world.position.y;
+        a->player_distance = a->player_distance_xz * a->player_distance_xz + a->player_distance_y * a->player_distance_y;
+        a->player_angle_y = search_position_angleY(&a->world.position, &pl->actor_class.world.position);
+    }
+    a->state_bitfield &= ~ACTOR_STATE_24;
+    g_pc_submenu_world_tick = 1;
+    (*a->mv_proc)(a, (GAME*)play);
+    g_pc_submenu_world_tick = 0;
+    if (play->collision_check.collider_num > oc_num) {
+        play->collision_check.collider_num = oc_num;
+    }
+    CollisionCheck_Status_Clear(&a->status_data);
+}
+
+static void Game_play_pc_submenu_live_tick(GAME_PLAY* play) {
+    extern int pc_remote_player_is_puppet_actor(const void* actor);
+    ACTOR* a;
+
+    for (a = play->actor_info.list[ACTOR_PART_UNUSED].actor; a != NULL; a = a->next_actor) {
+        if (a->ct_proc == NULL && a->mv_proc != NULL && pc_remote_player_is_puppet_actor(a)) {
+            Game_play_pc_submenu_tick_actor(play, a);
+            s_pc_submenu_puppet_ticks++;
+        }
+    }
+    for (a = play->actor_info.list[ACTOR_PART_CONTROL].actor; a != NULL; a = a->next_actor) {
+        if (a->ct_proc != NULL || a->mv_proc == NULL ||
+            (a->state_bitfield & (ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_CULL)) == 0) {
+            continue; /* not constructed / being deleted / would not move this frame in Actor_info_call_actor either */
+        }
+        if (a->id == mAc_PROFILE_EFFECT_CONTROL || a->id == mAc_PROFILE_WEATHER || a->id == mAc_PROFILE_INSECT ||
+            a->id == mAc_PROFILE_GYOEI) {
+            Game_play_pc_submenu_tick_actor(play, a);
+            s_pc_submenu_ctl_ticks++;
+        }
+    }
+}
+
+/* the live draw / live tick condition of a submenu that is open from FREE PLAY: the menu is fully up, no scene transition, no
+ * conversation or scripted demo owns the world (a shop / Nook / talk-opened menu keeps the vanilla freeze and the snapshot). */
+static int Game_play_pc_submenu_free_play(GAME_PLAY* play) {
+    return play->fb_fade_type == FADE_TYPE_NONE && play->fb_wipe_mode == WIPE_MODE_NONE && mDemo_Get_talk_actor() == NULL &&
+           mMsg_Check_main_hide(mMsg_Get_base_window_p()) == TRUE;
+}
+
 static void Game_play_pc_submenu_world_hold(GAME_PLAY* play) {
     Actor_list* list;
     ACTOR* a;
     int k, slot;
     int tick_ok;
+    int host = pc_net_game_host_ready_peer_count() > 0;
+    int live = pc_net_game_menu_world_live();
 
-    if (pc_net_game_host_ready_peer_count() <= 0) {
+    if (!host && !live) {
         return;
     }
     if (s_pc_submenu_hold_frames++ == 0) {
         s_pc_submenu_hold_actors0 = Game_play_pc_actor_total(play);
         s_pc_submenu_tick_count = 0;
+        s_pc_submenu_puppet_ticks = 0;
+        s_pc_submenu_ctl_ticks = 0;
         s_pc_submenu_bank_idx0 = play->object_exchange.bank_idx;
         g_pc_submenu_tick_refused_make = 0;
         g_pc_submenu_tick_deferred_delete = 0;
-        printf("[NET][SUBMENU] host submenu world hold BEGIN menu_type=%d actors=%d\n", (int)play->submenu.menu_type,
-               s_pc_submenu_hold_actors0);
+        printf("[NET][SUBMENU] %s submenu world hold BEGIN menu_type=%d actors=%d live=%d\n", host ? "host" : "client",
+               (int)play->submenu.menu_type, s_pc_submenu_hold_actors0, live);
     }
     /* F2 gate: the real villager tick runs only while the submenu itself is fully open (PLAY: not while it is being
      * linked/prerendered/torn down), outside any conversation (no talk actor, message window hidden: a submenu opened
@@ -598,8 +671,9 @@ static void Game_play_pc_submenu_world_hold(GAME_PLAY* play) {
             continue; /* not a resident villager (shopkeepers, event NPCs, ...) */
         }
         n = (NPC_ACTOR*)a;
-        if (n->npc_info.animal != Save_GetPointer(animals[slot]) || n->condition_info.hide_flg) {
-            continue; /* identity guard (a villager actor always points at its own Animal_c) / hidden: not sampled by N2 either */
+        if (n->npc_info.animal != Save_GetPointer(animals[slot]) || (host && n->condition_info.hide_flg)) {
+            continue; /* identity guard (a villager actor always points at its own Animal_c) / hidden: not sampled by N2 either
+                       * (a CLIENT's hidden villager still ticks: its move only applies the host's NPC_STATE, e.g. leaving the house) */
         }
         if (tick_ok && a->ct_proc == NULL && !mDemo_IS_ACTOR_TALKING(a) &&
             n->condition_info.talk_condition == aNPC_TALK_TYPE_NONE &&
@@ -633,6 +707,9 @@ static void Game_play_pc_submenu_world_hold(GAME_PLAY* play) {
             s_pc_submenu_tick_count++;
             continue;
         }
+        if (!host) {
+            continue; /* a client has no NPC_MOVE stream to keep alive: an untickable villager simply holds its pose */
+        }
         act = n->condition_info.action;
         if (act >= aNPC_ACTION_TYPE_WALK && act <= aNPC_ACTION_TYPE_WALK_AI) {
             act = (u8)(aNPC_ACTION_TYPE_WAIT + (act - aNPC_ACTION_TYPE_WALK));
@@ -642,17 +719,50 @@ static void Game_play_pc_submenu_world_hold(GAME_PLAY* play) {
         pc_net_game_notify_npc_move(slot, (uint16_t)n->npc_info.animal->id.npc_id, a->world.position.x,
                                     a->world.position.y, a->world.position.z, a->world.angle.y, act);
     }
+    if (live && play->submenu.process_status == mSM_PROCESS_PLAY && Game_play_pc_submenu_free_play(play)) {
+        Game_play_pc_submenu_live_tick(play); /* puppets + the whitelisted control actors (any scene, not only the town field) */
+    }
 }
 
 static void Game_play_pc_submenu_world_hold_end(GAME_PLAY* play) {
     if (s_pc_submenu_hold_frames != 0) {
-        printf("[NET][SUBMENU] host submenu world hold END frames=%d actors_open=%d actors_close=%d ticks=%d "
-               "refused_make=%u deferred_delete=%u bank_idx_open=%d bank_idx_close=%d\n",
-               s_pc_submenu_hold_frames, s_pc_submenu_hold_actors0, Game_play_pc_actor_total(play),
-               s_pc_submenu_tick_count, g_pc_submenu_tick_refused_make, g_pc_submenu_tick_deferred_delete,
-               s_pc_submenu_bank_idx0, play->object_exchange.bank_idx);
+        printf("[NET][SUBMENU] %s submenu world hold END frames=%d actors_open=%d actors_close=%d ticks=%d "
+               "refused_make=%u deferred_delete=%u bank_idx_open=%d bank_idx_close=%d puppet_ticks=%d ctl_ticks=%d\n",
+               pc_net_game_role() == PC_NETGAME_ROLE_HOST ? "host" : "client", s_pc_submenu_hold_frames,
+               s_pc_submenu_hold_actors0, Game_play_pc_actor_total(play), s_pc_submenu_tick_count,
+               g_pc_submenu_tick_refused_make, g_pc_submenu_tick_deferred_delete, s_pc_submenu_bank_idx0,
+               play->object_exchange.bank_idx, s_pc_submenu_puppet_ticks, s_pc_submenu_ctl_ticks);
         s_pc_submenu_hold_frames = 0;
     }
+}
+
+/* "World behind menus", the DRAW half. Vanilla draws a submenu over ONE prerendered picture of the scene (prbuf, copied from the
+ * EFB on the menu's PRERENDER_INIT frame; on the GameCube the menu overlay was loaded over the player actor's code and the object
+ * banks, so the world could not even be drawn). On PC nothing is overlaid (statically linked, no *_ovl.c writes object_exchange),
+ * so in a live multiplayer session a submenu opened from free play draws the LIVE world every frame instead of prbuf
+ * (makeBumpTexture), and Game_play_draw moves the menu's own display lists (POLY_OPA + POLY_XLU) behind the world's (they are
+ * called from LIGHT_DISP, after the world's POLY_XLU; FONT / OVERLAY still come after, as in vanilla) and clears the depth buffer
+ * first (PC_NOOP_CLEAR_DEPTH) so the menu sees the empty depth buffer it saw over prbuf. Decided ONCE per menu, on its first
+ * PRERENDER_DONE frame (latched until the menu is gone), so a peer leaving mid-menu never flips back to a stale snapshot. A menu
+ * opened from a conversation / demo, single player and an unconnected process keep the vanilla snapshot byte-identically. */
+static int s_pc_menu_live_draw = -1; /* -1 undecided (no menu up), 0 vanilla prbuf, 1 live world */
+extern void mSM_pc_area_save(Submenu* submenu);    /* m_submenu.c: the player's draw (load_player) must not unlink the open menu */
+extern void mSM_pc_area_restore(Submenu* submenu);
+
+static void Game_play_pc_menu_live_draw_update(GAME_PLAY* play) {
+    if (play->submenu.mode != mSM_MODE_PRERENDER_DONE) {
+        s_pc_menu_live_draw = -1;
+        return;
+    }
+    if (s_pc_menu_live_draw < 0) {
+        s_pc_menu_live_draw = (pc_net_game_menu_world_live() && Game_play_pc_submenu_free_play(play)) ? 1 : 0;
+        printf("[NET][SUBMENU] menu_type=%d draw=%s\n", (int)play->submenu.menu_type,
+               s_pc_menu_live_draw ? "live-world" : "vanilla-snapshot");
+    }
+}
+
+static int Game_play_pc_menu_live_draw(GAME_PLAY* play) {
+    return s_pc_menu_live_draw == 1 && play->submenu.mode == mSM_MODE_PRERENDER_DONE;
 }
 #endif
 
@@ -725,7 +835,9 @@ static void Game_play_move(GAME* game) {
         /* Multiplayer HOST with at least one READY client: the Esc menu must not freeze everyone else's world (host-authoritative villagers, wildlife, puppets, time). The menu
          * still blocks the host's own input (padmgr zeroes the pads and pc_main swallows the keys while g_pc_paused), so the local player simply stands idle. Single player and
          * a host with nobody connected (pc_net_game_host_ready_peer_count() == 0) keep the vanilla full freeze. */
-        if (g_pc_paused && pc_net_game_host_ready_peer_count() == 0) return;
+        /* "world behind menus": a READY CLIENT (pc_net_game_menu_world_live, default on) keeps its world running behind the Esc menu the same way;
+         * its pads are zeroed too, so its own player stands idle while puppets, the host-driven villagers, bugs, fish and weather go on. */
+        if (g_pc_paused && pc_net_game_host_ready_peer_count() == 0 && !pc_net_game_menu_world_live()) return;
     }
 #endif
 
@@ -770,6 +882,11 @@ static void Game_play_move(GAME* game) {
         Balloon_move(play);
         mEnv_ManagePointLight(play, &play->kankyo, &play->global_light);
     }
+#ifdef TARGET_PC
+    else if (pc_net_game_menu_world_live()) {
+        evw_anime_add_scroll_phase(&play->game); /* "world behind menus": water / texture scrolling keeps flowing behind the live-drawn menu (a phase counter only) */
+    }
+#endif
 
     game->doing_point = 0;
     game->doing_point_specific = 0x93;
@@ -907,8 +1024,15 @@ static int makeBumpTexture(GAME_PLAY* play, GRAPH* graph1, GRAPH* graph2) {
     } else if (play->submenu.mode >= mSM_MODE_NUM) {
         play->submenu.mode = mSM_MODE_IDLE;
     }
+#ifdef TARGET_PC
+    Game_play_pc_menu_live_draw_update(play);
+#endif
 
-    if (play->submenu.mode == mSM_MODE_PRERENDER_DONE) {
+    if (play->submenu.mode == mSM_MODE_PRERENDER_DONE
+#ifdef TARGET_PC
+        && !Game_play_pc_menu_live_draw(play) /* live multiplayer world: fall through to the normal world draw below */
+#endif
+    ) {
         poly = NOW_POLY_OPA_DISP;
 
 #ifdef TARGET_PC
@@ -937,7 +1061,17 @@ static int makeBumpTexture(GAME_PLAY* play, GRAPH* graph1, GRAPH* graph2) {
 
     if ((GETREG(HREG, 80) != 10) || (GETREG(HREG, 85) != 0)) {
         PC_DIAG(3, "makeBumpTexture: before Actor_info_draw_actor\n");
-        Actor_info_draw_actor(play, &play->actor_info);
+#ifdef TARGET_PC
+        if (Game_play_pc_menu_live_draw(play)) {
+            /* the player's draw relinks the GameCube "submenu area" to the player code (load_player): keep the open menu linked */
+            mSM_pc_area_save(&play->submenu);
+            Actor_info_draw_actor(play, &play->actor_info);
+            mSM_pc_area_restore(&play->submenu);
+        } else
+#endif
+        {
+            Actor_info_draw_actor(play, &play->actor_info);
+        }
         PC_DIAG(3, "makeBumpTexture: Actor draw done, Camera2...\n");
         Camera2_draw(play);
         mMsg_Draw((GAME*)play);
@@ -1010,7 +1144,46 @@ static void Game_play_draw(GAME_PLAY* play) {
             PC_DIAG(3, "Game_play_draw: bump done, drawing\n");
             watch_my_step_draw(play);
             banti_draw(play);
-            mSM_submenu_draw(&play->submenu, (GAME*)play);
+#ifdef TARGET_PC
+            if (Game_play_pc_menu_live_draw(play)) {
+                /* live world behind the menu: the menu's POLY_OPA / POLY_XLU commands are written into sub-lists inside those buffers
+                 * (skipped there by a branch, the gfxopen / gfxclose idiom makeBumpTexture uses for the fades) and CALLED from
+                 * LIGHT_DISP, i.e. after the whole world incl. its translucent pass; the sub-list starts with the depth clear. */
+                Gfx* opa0;
+                Gfx* xlu0;
+                Gfx* g;
+
+                OPEN_DISP(graph);
+                opa0 = NOW_POLY_OPA_DISP;
+                xlu0 = NOW_POLY_XLU_DISP;
+                g = gfxopen(opa0);
+                gSPDisplayList(NOW_LIGHT_DISP++, g);
+                gDPPipeSync(g++);
+                gDPNoOpTag(g++, PC_NOOP_CLEAR_DEPTH);
+                gDPNoOpTag(g++, PC_NOOP_WIDESCREEN_STRETCH_OFF); /* the menu UI gets its 4:3 correction, as after the prbuf rect */
+                SET_POLY_OPA_DISP(g);
+                g = gfxopen(xlu0);
+                gSPDisplayList(NOW_LIGHT_DISP++, g);
+                SET_POLY_XLU_DISP(g);
+                CLOSE_DISP(graph);
+
+                mSM_submenu_draw(&play->submenu, (GAME*)play);
+
+                OPEN_DISP(graph);
+                g = NOW_POLY_OPA_DISP;
+                gSPEndDisplayList(g++);
+                gfxclose(opa0, g);
+                SET_POLY_OPA_DISP(g);
+                g = NOW_POLY_XLU_DISP;
+                gSPEndDisplayList(g++);
+                gfxclose(xlu0, g);
+                SET_POLY_XLU_DISP(g);
+                CLOSE_DISP(graph);
+            } else
+#endif
+            {
+                mSM_submenu_draw(&play->submenu, (GAME*)play);
+            }
         }
     }
     if (zurumode_flag != 0) {
