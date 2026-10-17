@@ -101,9 +101,9 @@ def main():
        not re.search(r"\b(mSP_|Kabu_|Common_Get|Save_Get|Now_Private|mPr_Set|printf\s*\(\s*\"\[NET)", strip_comments(logic).split("int pc_sell_logic_selftest")[0]))
 
     # ---------------- W: no wire change
-    ck("W1 no new transaction kind / reason / town service: the last kind is still 22 (OUTDOOR_FURN), the last reason 61, PC_NETGAME_TS_NUM 11; no SELL_MULTI",
+    ck("W1 no new transaction kind / reason / town service: the last kind is still 22 (OUTDOOR_FURN), the last reason 62, PC_NETGAME_TS_NUM 11; no SELL_MULTI",
        "#define PC_NETGAME_TXN_KIND_OUTDOOR_FURN 22u" in ng and not re.search(r"#define PC_NETGAME_TXN_KIND_\w+\s+23u", ng) and "SELL_MULTI" not in ng
-       and not re.search(r"#define PC_NETGAME_TXN_REASON_\w+\s+6[2-9]u", ng) and re.search(r"#define PC_NETGAME_TS_NUM\s+11u", ng))
+       and not re.search(r"#define PC_NETGAME_TXN_REASON_\w+\s+6[3-9]u", ng) and re.search(r"#define PC_NETGAME_TS_NUM\s+11u", ng))
     shape = ng[ng.index("} else if (is_sell) {\n            shape_ok ="):][:400]
     ck("W2 the host's SHOP_SELL shape already accepts any slot mask of mixed items (only the primary slot's bit and bits 0..14 are required) and values EVERY masked slot (all or nothing)",
        "(t->aux_item & 0x8000u) == 0" in shape and "(t->aux_item & (1u << t->slot)) != 0" in shape

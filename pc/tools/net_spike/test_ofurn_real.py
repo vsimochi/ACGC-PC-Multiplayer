@@ -33,7 +33,7 @@ import test_txn_real_client as RC  # noqa: E402
 ITEM = 0x1064  # iam_sum_blue_lowchest01: a 2x1 DRESSER (aFTR_SHAPE_TYPEB_0, storage interaction)
 SCRIPT = "grab,pull,push,left,right,release"
 STARTED = []
-ENV_KEYS = ("AC_TEST_OFURN_SEED", "AC_TEST_OFURN_SEED_NEAR", "AC_TEST_OFURN_DRAWCYCLE", "AC_TEST_OFURN", "AC_TEST_OFURN_GRAB", "PC_PUPPET_DIAG")
+ENV_KEYS = ("AC_TEST_OFURN_SEED", "AC_TEST_OFURN_SEED_NEAR", "AC_TEST_OFURN_DRAWCYCLE", "AC_TEST_OFURN", "AC_TEST_OFURN_GRAB", "PC_PUPPET_DIAG", "AC_MP_DRESSER_STORAGE")
 
 
 def _run(args, rig):
@@ -110,13 +110,79 @@ def _run(args, rig):
     check("G8 host and client alive", host.alive() and a.alive())
 
 
+def _run_storage(args, rig):
+    """C3 (--storage): the outdoor STORAGE of a placed dresser + the place / pickup presentation, REAL host (observer) + REAL client (AC_TEST_OFURN=storage):
+      S1 the host seeded the 2x1 dresser next to the client; the client's renderer BIRTHED it (the 102 SET -> '[NET][OFURN] place anim contact')
+      S2 the client announced outdoor storage from the 102 CAPS; an A TAP (the real wait-state seam + HOLD) opened the 27-slot screen ('OPENED after N ms')
+      S3 a PUT through the screen's own call: the host APPLIED the outdoor kind 18; the screen closed (scripted B)
+      S4 a PUSH north: the host re-keyed the storage; the A tap at the new origin reopened it with the item (the contents followed the piece)
+      S5 B while it holds the item: REFUSED 62 (OFURN_NOT_EMPTY), the piece came back
+      S6 the item taken out; B again: the PICKUP_FURNITURE state (32) on the client, the host APPLIED the pickup, the client's shrink ended ('pickup anim contact'),
+         the OBSERVER (host) saw the client's puppet in main index 32
+      S7 the dresser placed again from the pocket: the local leaf flight + the birth after the host's SET
+      S8 host and client alive"""
+    check = rig.check
+    residents = [i for i, _p, ex in L.read_test_save_residents() if ex and i != L.TEST_HOST_RESIDENT]
+    check("fixture has a non-host resident (slots %s)" % residents, len(residents) >= 1)
+    if not residents:
+        return
+    os.environ["AC_TEST_OFURN_SEED"] = "0x%04X,0" % ITEM
+    os.environ["AC_TEST_OFURN_SEED_NEAR"] = "1"
+    os.environ["AC_MP_DRESSER_STORAGE"] = "1"  # pc/build64_w3's cache still says PC_DRESSER_STORAGE_DEFAULT_ON=OFF
+    os.environ["PC_PUPPET_DIAG"] = "1"
+    os.environ.pop("AC_TEST_OFURN", None)
+    host = rig.start_host("of3real", args.port, [])
+    check("host reached genuine field-ready state", host is not None)
+    if host is None:
+        return
+    STARTED.append(host)
+    L.resolve_host_town("127.0.0.1", args.port)
+    os.environ.pop("PC_PUPPET_DIAG", None)
+    os.environ["AC_TEST_OFURN"] = "storage"
+    a = rig.start_client("of3realA", args.port, residents[0], [])
+    check("real client booted into the field and connected", a is not None)
+    if a is None:
+        return
+    STARTED.append(a)
+    m = host.wait_for_log(r"seeded placed piece at \((\d+),(\d+)\) item 0x%04X rot 0 -> placed \(next to peer (\d+)" % ITEM, 120.0)
+    check("S1 the host placed a 2x1 dresser next to the real client", m is not None)
+    if m is None:
+        return
+    ux, uz, peer = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    b1 = a.wait_for_log(r"\[NET\]\[OFURN\] place anim contact: tile \(%d,%d\) item 0x%04X" % (ux, uz, ITEM), 90.0)
+    check("S1 the client's renderer showed the vanilla BIRTH of the newly placed piece (place anim contact)", b1 is not None)
+    c3 = a.wait_for_log(r"the host supports outdoor furniture C3: outdoor storage ON", 30.0)
+    op = a.wait_for_log(r"\[OFURN\]\[STORAGE\] outdoor storage of \(%d,%d\) OPENED after (\d+) ms" % (ux, uz), 120.0)
+    check("S2 outdoor storage announced (102 CAPS) and the A TAP opened the 27-slot screen", c3 is not None and op is not None)
+    hp = host.wait_for_log(r"\[NET\]\[DRESSER\] host: peer %d resident \d+ PUT item=0x[0-9A-F]{4} pocket=\d+ pool slot=\d+" % peer, 60.0)
+    cl = a.wait_for_log(r"\[NET\]\[OFURN\]\[TEST-ONLY\] storage: the screen closed", 60.0)
+    check("S3 a PUT through the screen: the host APPLIED the outdoor kind 18; the screen closed (B)", hp is not None and cl is not None)
+    rk = host.wait_for_log(r"outdoor storage of ftr 0x%04X re-keyed \(%d,%d\) -> \(%d,%d\) with the piece \(1 item" % (ITEM, ux, uz, ux, uz - 1), 60.0)
+    ro = a.wait_for_log(r"storage: screen open at \(%d,%d\) with 1 item\(s\)" % (ux, uz - 1), 90.0)
+    check("S4 PUSH north: the host re-keyed the storage; the reopened screen at the new origin holds the item", rk is not None and ro is not None)
+    ne = a.wait_for_log(r"storage: the non-empty pickup: outcome 2 reason 62", 90.0)
+    check("S5 B while it holds the item: REFUSED 62 OFURN_NOT_EMPTY (and the piece came back)", ne is not None and "[OFURN][PICK] pickup of" in a.log_text())
+    pk = host.wait_for_log(r"PICKUP APPLIED \[TXN\]: tile \(%d,%d\) item 0x%04X" % (ux, uz - 1, ITEM), 150.0)
+    ct = a.wait_for_log(r"\[NET\]\[OFURN\] pickup anim contact: tile \(%d,%d\)" % (ux, uz - 1), 30.0)
+    st32 = "PICKUP_FURNITURE (32) requested" in a.log_text()
+    L.pump_sleep(2.0)
+    pd = re.findall(r"\[NET\]\[PUPPET\]\[DIAG\] player %d state main_index=(\d+)" % peer, host.log_text())
+    check("S6 the empty pickup: state 32 on the client, the host APPLIED it, the shrink ended (pickup anim contact)", pk is not None and ct is not None and st32)
+    check("S6 the OBSERVER (host) saw the client's puppet in PICKUP_FURNITURE 32 (main indexes %s)" % sorted(set(pd)), "32" in pd)
+    lf = a.wait_for_log(r"\[NET\]\[OFURN\] place anim: the leaf of 0x%04X flies to \(%d,%d\)" % (ITEM, ux, uz - 1), 60.0)
+    b2 = a.wait_for_log(r"\[NET\]\[OFURN\] place anim contact: tile \(%d,%d\) item 0x%04X" % (ux, uz - 1, ITEM), 30.0)
+    check("S7 the dresser placed again from the pocket: the leaf flight, then the birth once the host's SET is in", lf is not None and b2 is not None)
+    check("S8 host and client alive", host.alive() and a.alive())
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=38700)
+    ap.add_argument("--port", type=int, default=39300)
     ap.add_argument("--drawcycle", action="store_true")
+    ap.add_argument("--storage", action="store_true", help="C3: outdoor storage + the place / pickup presentation")
     args = ap.parse_args()
-    if not (38000 <= args.port <= 38999):
-        print("ports 38000-38999 only", file=sys.stderr)
+    if not (39000 <= args.port <= 39499):
+        print("ports 39000-39499 only", file=sys.stderr)
         return 2
     L.require_test_bin_dir()
     if not os.path.basename(os.path.normpath(L.GAME_BIN_DIR)).startswith("bin_fixture4_of"):
@@ -128,7 +194,7 @@ def main():
     shutil.copytree(save_dir, snap_dir)
     rig = RC.Rig(args.port, results, save_dir, snap_dir)
     try:
-        _run(args, rig)
+        (_run_storage if args.storage else _run)(args, rig)
     finally:
         for p in STARTED:  # only the processes THIS test started
             try:

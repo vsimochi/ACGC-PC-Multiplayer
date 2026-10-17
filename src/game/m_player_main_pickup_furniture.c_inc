@@ -35,12 +35,21 @@ static void Player_actor_setup_main_Pickup_furniture(ACTOR* actorx, GAME* game) 
     main_pickup_furniture_p->item = item;
 
     Player_actor_SetupItem_Base1(actorx, mPlayer_ANIM_PICKUP1, -5.0f, &anim1_idx, &part_table_idx);
+#ifdef TARGET_PC
+    if (Common_Get(clip).my_room_clip == NULL) {
+        /* outdoor furniture C3 (pc_ofurn_draw.c, the town field: vanilla never enters this state outdoors): the animation only. The item reaches the pocket through the
+         * host's kind 22 PICKUP (the post-image), never here; no exchange menu afterwards. */
+        main_pickup_furniture_p->exchange_flag = FALSE;
+    } else
+#endif
+    {
     Player_actor_putin_furniture(game, slot_idx, item);
 
     if (slot_idx >= 0 || ITEM_IS_MYMANNIQUIN(item) || ITEM_IS_MYUMBRELLA(item)) {
         main_pickup_furniture_p->exchange_flag = FALSE;
     } else {
         main_pickup_furniture_p->exchange_flag = TRUE;
+    }
     }
 
     Player_actor_InitAnimation_Base2(actorx, game, mPlayer_ANIM_PICKUP1, anim1_idx, 1.0f, 1.0f, 0.5f, 0.0f,
@@ -99,6 +108,11 @@ static void Player_actor_Set_Item_Pickup_furniture(ACTOR* actorx) {
     xyz_t* left_hand_pos_p = &player->left_hand_pos;
     xyz_t* item_ofs_p = &main_pickup_furniture_p->item_offset;
 
+#ifdef TARGET_PC
+    if (Common_Get(clip).my_room_clip == NULL) {
+        return; /* outdoor furniture C3: no room leaf (the vanilla code dereferences my_room_clip here); the piece itself shrinks (pc_ofurn_draw.c) */
+    }
+#endif
     if (cur_frame <= 10.0f) {
         if (Common_Get(clip).my_room_clip->ftr2leaf_proc()) {
             Common_Get(clip).my_room_clip->leaf_start_pos_proc(item_pos_p);
@@ -196,3 +210,14 @@ static void Player_actor_main_Pickup_furniture(ACTOR* actorx, GAME* game) {
     Player_actor_Item_main(actorx, game);
     Player_actor_request_proc_index_fromPickup_furniture(actorx, game, end_flag);
 }
+
+#ifdef TARGET_PC
+/* outdoor furniture C3 (pc_ofurn_draw.c): the vanilla PICKUP_FURNITURE state (32: the PICKUP1 clip, ITEM_GET at frame 10, GASAGOSO at 20) for a B pickup of a piece
+ * PLACED in the town field. Only outdoors (no My_Room actor): the setup above then skips the pocket put-in and the exchange. 1 = requested. */
+int mPlib_PC_request_pickup_furniture_outdoor(GAME* game, mActor_name_t item, const xyz_t* item_pos) {
+    if (game == NULL || item_pos == NULL || Common_Get(clip).my_room_clip != NULL) {
+        return FALSE;
+    }
+    return Player_actor_request_main_pickup_furniture(game, -1, item, item_pos);
+}
+#endif

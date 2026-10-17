@@ -30,6 +30,7 @@ PCSettings g_pc_settings = {
     .resident_tokens = 0,
     .show_ping = 0,
     .emotes = 1,
+    .handover_anim = 1,
     .client_log = 0,
     .town_serve = -1, /* -1 = AUTO: on for a --dedicated host (sanitized), off otherwise; an explicit off/on/full in settings.ini or --town-serve wins */
     .personal_sync = -1,
@@ -96,6 +97,9 @@ static const char* DEFAULT_SETTINGS =
     "\n"
     "# Emote wheel: hold F (keybindings.ini Emote) or D-pad Up on a controller, point at an emote, release: 0 = off, 1 = on (default)\n"
     "emotes = 1\n"
+    "\n"
+    "# Multiplayer hand-over animations (Nook's Work Mode, villagers giving / taking items): 0 = off (the item just changes pockets), 1 = on (default)\n"
+    "handover_anim = 1\n"
     "\n"
     "[Audio]\n"
     "# Master output volume as a percentage (0-100)\n"
@@ -198,6 +202,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.borderless_acres = val;
     } else if (strcmp(key, "emotes") == 0) {
         if (val == 0 || val == 1) g_pc_settings.emotes = val;
+    } else if (strcmp(key, "handover_anim") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.handover_anim = val;
     } else if (strcmp(key, "show_ping") == 0) {
         if (val == 0 || val == 1) g_pc_settings.show_ping = val;
     } else if (strcmp(key, "client_log") == 0) {
@@ -338,6 +344,9 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Emote wheel: hold F (keybindings.ini Emote) or D-pad Up on a controller, point at an emote, release: 0 = off, 1 = on (default)\n");
     fprintf(f, "emotes = %d\n", g_pc_settings.emotes);
+    fprintf(f, "\n");
+    fprintf(f, "# Multiplayer hand-over animations (Nook's Work Mode, villagers giving / taking items): 0 = off (the item just changes pockets), 1 = on (default)\n");
+    fprintf(f, "handover_anim = %d\n", g_pc_settings.handover_anim);
     fprintf(f, "\n");
     fprintf(f, "[Audio]\n");
     fprintf(f, "# Master output volume as a percentage (0-100)\n");

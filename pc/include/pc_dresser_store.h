@@ -123,6 +123,22 @@ int  pc_dresser_store_restore(PCDresserStore* s, const PCDresserRec* rec);
  * [12..13] base furniture id (rotation bits masked, little endian), [14..15] 0 ---- */
 #define PC_DRESSER_KEY_PREFIX 10 /* owner + floor + layer: the scope of the orphan re-attach search */
 void pc_dresser_key_make(uint8_t key[PC_DRESSER_KEY_LEN], const uint8_t owner8[8], int floor, int layer, int ut_x, int ut_z, uint16_t ftr_base);
+/* ---- C3: OUTDOOR storage (a storage piece PLACED in the town field, docs/multiplayer-guest-roadmap.md "Outdoor furniture C3"). The SAME 16-byte key, no format
+ * change: [0..7] = the TOWN sentinel "TOWN\xFC" "OFU" (no house owner digest: one shared store per placed piece, every resident may use it), [8] = floor 0xFC (no real
+ * floor: house floors are 0..2, 0xFD the v1 legacy overflow, 0xFF the probe), [9] = layer 0, [10] / [11] = the piece's ORIGIN tile in town unit coordinates
+ * (16..95 / 16..111: fits a byte), [12..13] = the base furniture id (rotation masked: a ROTATE keeps the key; a MOVE re-keys), [14..15] = 0. The house code never
+ * touches these records (every house scan filters by the house owner digest). ---- */
+#define PC_DRESSER_OUTDOOR_FLOOR 0xFCu
+void pc_dresser_town_owner8(uint8_t out8[8]);
+void pc_dresser_key_outdoor(uint8_t key[PC_DRESSER_KEY_LEN], int ut_x, int ut_z, uint16_t ftr_item); /* ftr_item: the rotation bits are masked here */
+int  pc_dresser_key_is_outdoor(const uint8_t key[PC_DRESSER_KEY_LEN]);                                /* 1 = sentinel owner + floor 0xFC + layer 0 */
+/* C3: apply() for a SHARED (outdoor) record: identical, except that the RECORD-level nonce fence is not used (several residents -- several client nonces -- take
+ * turns at one outdoor piece; the record fence would FENCE the first resident as soon as a second one used it). The caller fences per IDENTITY (the host's
+ * per-resident transaction journal); the record journal still replays a journalled (nonce, seq) and answers CONFLICT for other bytes, also after a restart. */
+int  pc_dresser_store_apply_shared(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_LEN], const PCDresserTxn* t, PCDresserResult* out);
+/* C3: removes the record of `key` when it holds NO item and is not orphaned (an outdoor piece that was picked up empty / moved away): keeps the 256-record table
+ * free. 1 = removed, 0 = absent / not empty / orphaned (never drops an item). */
+int  pc_dresser_store_drop_empty(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_LEN]);
 /* A v1 (per-resident) file at `path` is renamed ONCE to <path>.v1.bak (or <path>.v1.bak-<tag> when that backup already exists; `tag` = a caller
  * timestamp); never deleted (the plain .v1.bak is the lazy migration source, see below; a timestamped one is never migrated). 1 = backed up, 0 = nothing to do (absent / already v2 / not ours), -1 = the rename failed (the caller disables the feature). */
 int  pc_dresser_store_backup_v1(const char* path, unsigned long tag);

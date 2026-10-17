@@ -556,6 +556,76 @@ int main(int argc, char** argv) {
         remove(b2);
         remove(b3);
     }
+    { /* ---- C3: the OUTDOOR key + the shared-record apply + drop_empty ---- */
+        PCDresserStore o;
+        uint8_t k0[PC_DRESSER_KEY_LEN], k0r[PC_DRESSER_KEY_LEN], k1[PC_DRESSER_KEY_LEN], own[8], hk[PC_DRESSER_KEY_LEN];
+        char p3[640];
+        pc_dresser_key_outdoor(k0, 40, 57, 0x1064);
+        pc_dresser_key_outdoor(k0r, 40, 57, 0x1067); /* the same piece rotated: rotation masked -> the SAME key */
+        pc_dresser_key_outdoor(k1, 40, 56, 0x1064);  /* the piece moved one tile north: a different key */
+        pc_dresser_town_owner8(own);
+        CHECK(memcmp(k0, k0r, PC_DRESSER_KEY_LEN) == 0);
+        CHECK(memcmp(k0, k1, PC_DRESSER_KEY_LEN) != 0);
+        CHECK(pc_dresser_key_is_outdoor(k0) && k0[8] == 0xFC && k0[9] == 0 && k0[10] == 40 && k0[11] == 57 && k0[12] == 0x64 && k0[13] == 0x10 && k0[14] == 0 &&
+              k0[15] == 0 && memcmp(k0, own, 8) == 0);
+        pc_dresser_key_outdoor(k1, 95, 111, 0x3FFF);
+        CHECK(k1[10] == 95 && k1[11] == 111 && k1[12] == 0xFC && k1[13] == 0x3F); /* the town corner fits a byte; rotation masked */
+        pc_dresser_key_outdoor(k1, 40, 56, 0x1064);
+        pc_dresser_key_make(hk, own, 0, 0, 40, 57, 0x1064); /* a HOUSE key never equals / is never taken for an outdoor key (floor 0) */
+        CHECK(!pc_dresser_key_is_outdoor(hk) && !pc_dresser_key_is_outdoor(ka));
+        CHECK(pc_dresser_store_init(&o, 8));
+        /* two residents (two nonces) take turns at one shared piece: nobody is FENCED by the other one */
+        t = txn(0xA1, 1, PC_DRESSER_OP_PUT, 0, 0x2A01);
+        CHECK(pc_dresser_store_apply_shared(&o, k0, &t, &r) && r.outcome == PC_DRESSER_OUT_APPLIED);
+        t = txn(0xB2, 1, PC_DRESSER_OP_PUT, 1, 0x2A02);
+        CHECK(pc_dresser_store_apply_shared(&o, k0, &t, &r) && r.outcome == PC_DRESSER_OUT_APPLIED);
+        t = txn(0xA1, 2, PC_DRESSER_OP_TAKE, 1, 0x2A02); /* A again (its nonce would be FENCED by the record fence of the house apply) */
+        CHECK(pc_dresser_store_apply_shared(&o, k0, &t, &r) && r.outcome == PC_DRESSER_OUT_APPLIED);
+        CHECK(pc_dresser_store_apply_shared(&o, k0, &t, &r) && r.reason == PC_DRESSER_R_REPLAYED); /* the record journal still replays */
+        t.msg_hash ^= 1u;
+        CHECK(pc_dresser_store_apply_shared(&o, k0, &t, &r) && r.reason == PC_DRESSER_R_CONFLICT);
+        rec = pc_dresser_store_find(&o, k0);
+        CHECK(rec != NULL && rec->items[0] == 0x2A01 && rec->items[1] == 0 && rec->rev == 3);
+        /* the same sequence with the HOUSE apply fences A (why the shared apply exists) */
+        pc_dresser_key_make(hk, own, 0, 0, 1, 1, 0x1064);
+        t = txn(0xA1, 1, PC_DRESSER_OP_PUT, 0, 0x2A01);
+        CHECK(pc_dresser_store_apply(&o, hk, &t, &r) && r.outcome == PC_DRESSER_OUT_APPLIED);
+        t = txn(0xB2, 1, PC_DRESSER_OP_PUT, 1, 0x2A02);
+        CHECK(pc_dresser_store_apply(&o, hk, &t, &r) && r.outcome == PC_DRESSER_OUT_APPLIED);
+        t = txn(0xA1, 2, PC_DRESSER_OP_PUT, 2, 0x2A03);
+        CHECK(pc_dresser_store_apply(&o, hk, &t, &r) && r.reason == PC_DRESSER_R_FENCED);
+        /* MOVE of the piece: re-key keeps the contents; ROTATE: same key */
+        CHECK(pc_dresser_store_rekey(&o, k0, k1) == 1 && pc_dresser_store_find(&o, k0) == NULL && pc_dresser_store_find(&o, k1)->items[0] == 0x2A01);
+        pc_dresser_key_outdoor(k0, 40, 57, 0x1064);
+        CHECK(pc_dresser_store_rekey(&o, k1, k0) == 1 && pc_dresser_store_used(pc_dresser_store_find(&o, k0)) == 1);
+        /* orphan + re-attach by id (the outdoor prefix): an orphan of the same id is found, a different id is not */
+        CHECK(pc_dresser_store_set_orphan(&o, k0, 1) == 1);
+        {
+            uint8_t pre[PC_DRESSER_KEY_PREFIX];
+            memcpy(pre, k0, PC_DRESSER_KEY_PREFIX);
+            CHECK(pc_dresser_store_find_orphan(&o, pre, 0x1064) == pc_dresser_store_find(&o, k0));
+            CHECK(pc_dresser_store_find_orphan(&o, pre, 0x1068) == NULL);
+        }
+        /* drop_empty never drops an item / an orphan */
+        CHECK(pc_dresser_store_drop_empty(&o, k0) == 0);
+        CHECK(pc_dresser_store_set_orphan(&o, k0, 0) == 1);
+        CHECK(pc_dresser_store_drop_empty(&o, k0) == 0); /* still 1 item */
+        t = txn(0xA1, 3, PC_DRESSER_OP_TAKE, 0, 0x2A01);
+        CHECK(pc_dresser_store_apply_shared(&o, k0, &t, &r) && r.outcome == PC_DRESSER_OUT_APPLIED);
+        CHECK(pc_dresser_store_drop_empty(&o, k0) == 1 && pc_dresser_store_find(&o, k0) == NULL);
+        CHECK(pc_dresser_store_drop_empty(&o, k0) == 0);
+        /* persisted like every record (no format change: v3) */
+        t = txn(0xA1, 4, PC_DRESSER_OP_PUT, 3, 0x2A05);
+        CHECK(pc_dresser_store_apply_shared(&o, k1, &t, &r) && r.outcome == PC_DRESSER_OUT_APPLIED);
+        snprintf(p3, sizeof(p3), "%s/dresser_outdoor_test.dat", argc > 1 ? argv[1] : ".");
+        remove(p3);
+        CHECK(pc_dresser_store_save(&o, p3) == 1);
+        pc_dresser_store_free(&o);
+        CHECK(pc_dresser_store_init(&o, 8) && pc_dresser_store_load(&o, p3) == 1 && pc_dresser_store_find(&o, k1) != NULL &&
+              pc_dresser_store_find(&o, k1)->items[3] == 0x2A05 && pc_dresser_key_is_outdoor(pc_dresser_store_find(&o, k1)->key));
+        pc_dresser_store_free(&o);
+        remove(p3);
+    }
     printf("dresser_store_selftest: %s (%d failures)\n", s_fail == 0 ? "PASS" : "FAIL", s_fail);
     return s_fail == 0 ? 0 : 1;
 }

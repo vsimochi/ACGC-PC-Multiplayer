@@ -5,6 +5,7 @@
 #endif
 #include "pc_outdoor_furniture.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -546,10 +547,59 @@ const char* pc_ofurn_reason_text(int reason) {
         case PC_OFURN_REASON_LIMIT: return "This town has too much furniture outside";
         case PC_OFURN_REASON_RATE: return "Slow down a little";
         case PC_OFURN_REASON_GONE: return "That furniture is no longer there";
+        case PC_OFURN_REASON_NOT_EMPTY: return "Take the stored items out first";
         case 22: return "Your pockets are full"; /* NO_ROOM */
         case 9: return "You can't do that right now"; /* PRECOND */
         default: return "That didn't work - try again";
     }
+}
+
+/* ---- C3: the open tap + the vanilla birth / bye curves (pure) ---- */
+int pc_ofurn_tap_opens(uint32_t held_ms, int stepped, int is_storage) {
+    return is_storage && !stepped && held_ms < PC_OFURN_TAP_MS;
+}
+
+void pc_ofurn_birth_init(PCOfurnBirth* b) {
+    memset(b, 0, sizeof(*b));
+    b->mod = 0.5f;   /* aMR_SetFirstScale */
+    b->step = 6000;
+}
+
+int pc_ofurn_birth_step(PCOfurnBirth* b, float dt, float* sxz, float* sy) {
+    const short prev = (short)b->counter_f;
+    short now;
+    float s;
+    if (b->done) {
+        *sxz = *sy = 1.0f;
+        return 0;
+    }
+    b->counter_f += (float)b->step * dt;
+    while (b->counter_f >= 32768.0f) {
+        b->counter_f -= 65536.0f;
+    }
+    while (b->counter_f < -32768.0f) {
+        b->counter_f += 65536.0f;
+    }
+    b->frames += dt;
+    now = (short)b->counter_f;
+    s = sinf((float)now * (3.14159265f / 32768.0f)) * b->mod;
+    *sxz = 1.0f - s;
+    *sy = 1.0f + s;
+    if (prev < 0 && now >= 0) { /* aMR_FtrBirth: the (upward) zero crossing */
+        b->mod *= 0.4f;
+        b->step += 1500;
+    }
+    if (fabsf(b->mod) < 0.02f || b->frames > 240.0f) {
+        b->done = 1;
+        *sxz = *sy = 1.0f;
+        return 0;
+    }
+    return 1;
+}
+
+float pc_ofurn_bye_scale(float frames) {
+    const float s = 1.0f - frames * 0.08333333333f;
+    return s < 0.25f ? 0.0f : (s > 1.0f ? 1.0f : s);
 }
 
 /* ---- native selftest ---- */
@@ -845,7 +895,35 @@ int pc_ofurn_selftest(void) {
        "rate limit: the gap and the rolling minute");
     pc_ofurn_notice_set("hello", 5000);
     ck(pc_ofurn_notice_get(5100) != NULL && pc_ofurn_notice_get(9100) == NULL, "notice expires");
-    for (i = 55; i <= 61; i++) {
+    /* C3: the open tap, the birth wobble, the bye shrink */
+    ck(pc_ofurn_tap_opens(100, 0, 1) && !pc_ofurn_tap_opens(100, 1, 1) && !pc_ofurn_tap_opens(100, 0, 0) && !pc_ofurn_tap_opens(PC_OFURN_TAP_MS, 0, 1) &&
+           pc_ofurn_tap_opens(PC_OFURN_TAP_MS - 1, 0, 1),
+       "C3 tap: storage + no step + released before 14 frames (233 ms)");
+    {
+        PCOfurnBirth b;
+        float sxz = 0.0f, sy = 0.0f, maxy = 0.0f, minxz = 2.0f;
+        int n = 0;
+        pc_ofurn_birth_init(&b);
+        while (pc_ofurn_birth_step(&b, 1.0f, &sxz, &sy) && n < 1000) {
+            n++;
+            maxy = sy > maxy ? sy : maxy;
+            minxz = sxz < minxz ? sxz : minxz;
+            ck(fabsf((sy - 1.0f) + (sxz - 1.0f)) < 1e-4f, "C3 birth: the volume-keeping squash (sy - 1 == 1 - sxz)");
+        }
+        ck(n > 20 && n < 60 && sxz == 1.0f && sy == 1.0f && b.done, "C3 birth: ends at scale 1 after ~33 frames (4 wobbles at 60 Hz)");
+        ck(maxy > 1.45f && maxy <= 1.5f && minxz < 0.55f, "C3 birth: the first stretch peaks at 1 + 0.5");
+        pc_ofurn_birth_init(&b);
+        n = 0;
+        while (pc_ofurn_birth_step(&b, 4.0f, &sxz, &sy) && n < 1000) { /* 15 fps: the same curve in fewer, larger steps */
+            n++;
+        }
+        ck(n > 3 && n < 20 && b.frames > 20.0f && b.frames < 70.0f, "C3 birth: frame-rate independent (dt-scaled)");
+    }
+    ck(pc_ofurn_bye_scale(0.0f) == 1.0f && pc_ofurn_bye_scale(6.0f) > 0.49f && pc_ofurn_bye_scale(6.0f) < 0.51f && pc_ofurn_bye_scale(9.1f) == 0.0f &&
+           pc_ofurn_bye_scale(100.0f) == 0.0f,
+       "C3 bye: -1/12 a frame, 0 below 0.25 (gone after 9 frames)");
+    ck(strcmp(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_EMPTY), "Take the stored items out first") == 0, "C3 reason 62 text");
+    for (i = 55; i <= 62; i++) {
         const char* t = pc_ofurn_reason_text(i);
         size_t k;
         int ascii = t != NULL && t[0] != '\0';

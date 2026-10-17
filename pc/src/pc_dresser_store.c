@@ -273,7 +273,17 @@ static int reject(PCDresserResult* out, const PCDresserRec* r, const PCDresserTx
     return 1;
 }
 
+static int apply_impl(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_LEN], const PCDresserTxn* t, PCDresserResult* out, int shared);
+
 int pc_dresser_store_apply(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_LEN], const PCDresserTxn* t, PCDresserResult* out) {
+    return apply_impl(s, key, t, out, 0);
+}
+
+int pc_dresser_store_apply_shared(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_LEN], const PCDresserTxn* t, PCDresserResult* out) {
+    return apply_impl(s, key, t, out, 1);
+}
+
+static int apply_impl(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_LEN], const PCDresserTxn* t, PCDresserResult* out, int shared) {
     PCDresserRec* r;
     const PCDresserJrnl* old;
     int slot, i;
@@ -308,11 +318,15 @@ int pc_dresser_store_apply(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_L
         out->rev = old->rev;
         return 1;
     }
-    /* 2. fencing: superseded nonces and evicted / skipped-back seqs never execute */
-    if (nonce_fenced(r, t->nonce) || (t->nonce == r->nonce && t->seq <= r->max_seq)) {
+    /* 2. fencing: superseded nonces and evicted / skipped-back seqs never execute (C3 shared records: the caller fences per identity; a second resident's nonce
+     *    must not fence the first one's at a shared outdoor piece) */
+    if (!shared && (nonce_fenced(r, t->nonce) || (t->nonce == r->nonce && t->seq <= r->max_seq))) {
         return reject(out, r, t, PC_DRESSER_R_FENCED);
     }
-    if (t->nonce != r->nonce) {
+    if (shared) {
+        r->nonce = t->nonce; /* informational only for a shared record (the last client served) */
+        r->max_seq = t->seq;
+    } else if (t->nonce != r->nonce) {
         if (r->nonce != 0u) {
             memmove(&r->fenced[1], &r->fenced[0], sizeof(r->fenced[0]) * (PC_DRESSER_FENCED_NUM - 1));
             r->fenced[0] = r->nonce;
@@ -393,6 +407,33 @@ void pc_dresser_key_make(uint8_t key[PC_DRESSER_KEY_LEN], const uint8_t owner8[8
     key[11] = (uint8_t)ut_z;
     key[12] = (uint8_t)(ftr_base & 0xFFu);
     key[13] = (uint8_t)(ftr_base >> 8);
+}
+
+/* C3: the outdoor (town) key: see pc_dresser_store.h */
+static const uint8_t s_town_owner8[8] = { 'T', 'O', 'W', 'N', 0xFCu, 'O', 'F', 'U' };
+
+void pc_dresser_town_owner8(uint8_t out8[8]) {
+    memcpy(out8, s_town_owner8, 8);
+}
+
+void pc_dresser_key_outdoor(uint8_t key[PC_DRESSER_KEY_LEN], int ut_x, int ut_z, uint16_t ftr_item) {
+    pc_dresser_key_make(key, s_town_owner8, (int)PC_DRESSER_OUTDOOR_FLOOR, 0, ut_x, ut_z, (uint16_t)(ftr_item & ~3u));
+}
+
+int pc_dresser_key_is_outdoor(const uint8_t key[PC_DRESSER_KEY_LEN]) {
+    return key != NULL && memcmp(key, s_town_owner8, 8) == 0 && key[8] == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR && key[9] == 0u;
+}
+
+int pc_dresser_store_drop_empty(PCDresserStore* s, const uint8_t key[PC_DRESSER_KEY_LEN]) {
+    const PCDresserRec* r = pc_dresser_store_find(s, key);
+    if (r == NULL || r->orphan || pc_dresser_store_used(r) != 0) {
+        return 0;
+    }
+    if (!pc_keytab_remove(&s->tab, key)) {
+        return 0;
+    }
+    s->dirty = 1;
+    return 1;
 }
 
 int pc_dresser_store_backup_v1(const char* path, unsigned long tag) {

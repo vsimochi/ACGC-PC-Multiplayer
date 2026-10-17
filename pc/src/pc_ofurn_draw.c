@@ -33,12 +33,16 @@
 #include "ac_furniture.h"
 #include "ef_effect_control.h"
 #include "audio.h"
+#include "m_submenu.h"   /* C3: the outdoor storage screen (the inventory in HANIWA_ENTRUST mode = the gyroid overlay in dresser mode) */
+#include "pc_dresser_ui.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* m_player_main_pickup_furniture.c_inc (TARGET_PC): the vanilla PICKUP_FURNITURE state for an outdoor piece (C3) */
+extern int  mPlib_PC_request_pickup_furniture_outdoor(GAME* game, mActor_name_t item, const xyz_t* item_pos);
 /* ac_my_room.c (TARGET_PC block) */
 extern int  aMR_PC_StandaloneCt(FTR_ACTOR* ftr_actor, int item, const xyz_t* pos, u8* bank);
 extern void aMR_PC_StandaloneAnimate(FTR_ACTOR* ftr_actor);
@@ -65,6 +69,12 @@ typedef struct PCOfurnSlot {
     xyz_t    from;
     s16      from_angle;
     uint32_t t0, dur;
+    /* C3: the vanilla place / pickup presentation (aMR_ReserveFurniture + aMR_FtrBirth / aMR_FtrBye) */
+    int          anim;      /* 0 none, 1 birth wait (scale 0), 2 birth wobble, 3 bye shrink, 4 gone (scale 0) */
+    uint32_t     anim_t0;   /* anim 1: when the birth starts (ms) */
+    PCOfurnBirth birth;
+    float        bye_frames;
+    int          dying;     /* the marker is gone: released when the bye ends */
     FTR_ACTOR ftr;
     u8       bank[PC_OFURN_BANK] __attribute__((aligned(32)));
 } PCOfurnSlot;
@@ -105,7 +115,35 @@ static struct {
     /* TEST-ONLY input override (AC_TEST_OFURN_GRAB) */
     int           test_on, test_a;
     float         test_x, test_y;
+    int           stepped;     /* C3: a push / pull / rotate was tried during this grab (then releasing A never opens the storage) */
 } s_grab;
+
+/* ---- C3: the presentation notes (pc_ofurn_anim_note), the open path (A tap on a storage piece), the local pickup ---- */
+#define PC_OFURN_NOTES          16
+#define PC_OFURN_NOTE_TTL_MS    5000u
+#define PC_OFURN_BIRTH_WAIT_MS  767u  /* aMR_ReserveFurniture: 46 frames from the Place to the birth */
+#define PC_OFURN_OPEN_NOTICE_MS 500u  /* as the indoor direct open (aMR_PC_DIRECT_OPEN_NOTICE_MS / _TIMEOUT_MS) */
+#define PC_OFURN_OPEN_TIMEOUT_MS 3000u
+typedef struct PCOfurnAnimNote {
+    int      valid, kind, local, leaf_done;
+    uint8_t  ux, uz;
+    uint16_t base;
+    uint32_t t0;
+} PCOfurnAnimNote;
+static PCOfurnAnimNote s_note[PC_OFURN_NOTES];
+static struct {
+    int           phase; /* 0 none, 1 waiting for the host's view (SELECT sent), 2 the storage screen requested / open, 3 closed (a transaction may still resolve) */
+    PCOfurnMarker mk;
+    uint32_t      t0;
+    int           noticed, reasked;
+    xyz_t         pos;
+} s_open;
+static struct {
+    int      active;
+    uint32_t serial, t0;
+    uint8_t  ux, uz;
+    uint16_t item;
+} s_pick;
 
 static int pc_ofurn_draw_enabled(void) {
     if (s_bank_ok < 0) {
@@ -159,6 +197,173 @@ static void pc_ofurn_release_all(const char* why) {
     pc_ofurn_slot_release(&s_test_slot, NULL);
 }
 
+/* ================================================================ C3: the place / pickup presentation ================================================================ */
+void pc_ofurn_anim_note(int kind, int ut_x, int ut_z, int item, int local) {
+    const uint32_t now = pc_net_game_now_ms();
+    const uint16_t base = pc_ofurn_base((uint16_t)item);
+    int i, k = -1;
+    uint32_t oldest = 0;
+    for (i = 0; i < PC_OFURN_NOTES; i++) {
+        PCOfurnAnimNote* n = &s_note[i];
+        if (n->valid && (uint32_t)(now - n->t0) > PC_OFURN_NOTE_TTL_MS) {
+            n->valid = 0;
+        }
+        if (n->valid && n->kind == kind && n->ux == (uint8_t)ut_x && n->uz == (uint8_t)ut_z && n->base == base) {
+            return; /* the older note wins (the local placer's own note comes before the host's SET) */
+        }
+    }
+    for (i = 0; i < PC_OFURN_NOTES; i++) {
+        if (!s_note[i].valid) {
+            k = i;
+            break;
+        }
+        if (k < 0 || (uint32_t)(now - s_note[i].t0) > oldest) {
+            oldest = (uint32_t)(now - s_note[i].t0);
+            k = i;
+        }
+    }
+    memset(&s_note[k], 0, sizeof(s_note[k]));
+    s_note[k].valid = 1;
+    s_note[k].kind = kind;
+    s_note[k].local = local;
+    s_note[k].ux = (uint8_t)ut_x;
+    s_note[k].uz = (uint8_t)ut_z;
+    s_note[k].base = base;
+    s_note[k].t0 = now;
+}
+
+static PCOfurnAnimNote* pc_ofurn_note_find(int kind, int ux, int uz, uint16_t item) {
+    const uint32_t now = pc_net_game_now_ms();
+    const uint16_t base = pc_ofurn_base(item);
+    int i;
+    for (i = 0; i < PC_OFURN_NOTES; i++) {
+        PCOfurnAnimNote* n = &s_note[i];
+        if (n->valid && n->kind == kind && n->ux == (uint8_t)ux && n->uz == (uint8_t)uz && n->base == base && (uint32_t)(now - n->t0) <= PC_OFURN_NOTE_TTL_MS) {
+            return n;
+        }
+    }
+    return NULL;
+}
+
+/* the local placer's leaf (eEC_EFFECT_KAGU_HAPPA: from the player to the piece, the leaf icon of the item, as aMR_SetReserveFurniture one frame after the Place) */
+static void pc_ofurn_notes_tick(GAME* game) {
+    int i;
+    for (i = 0; i < PC_OFURN_NOTES; i++) {
+        PCOfurnAnimNote* n = &s_note[i];
+        xyz_t pos;
+        const int fp = pc_ofurn_fp_from_shape(aMR_PC_FtrItemShape((int)n->base));
+        if (!n->valid || !n->local || n->leaf_done || n->kind != PC_OFURN_ANIM_BIRTH) {
+            continue;
+        }
+        n->leaf_done = 1;
+        if (fp >= 0 && eEC_CLIP != NULL && pc_ofurn_model_pose(fp, (int)n->ux, (int)n->uz, &pos)) {
+            eEC_CLIP->effect_make_proc(eEC_EFFECT_KAGU_HAPPA, pos, 2, 0, game, RSV_NO, (s16)aMR_PC_ItemIconNo((int)n->base), 0);
+            printf("[NET][OFURN] place anim: the leaf of 0x%04X flies to (%u,%u)\n", (unsigned)n->base, (unsigned)n->ux, (unsigned)n->uz);
+        }
+    }
+}
+
+/* aMR_GetDust4Position / aMR_GetDustAngle on the footprint's box: pair 0 = corners 0 + 2, pair 1 = corners 1 + 3, pair 2 = the centre (the pickup puff) */
+static void pc_ofurn_slot_dust(PCOfurnSlot* s, GAME* game, int pair) {
+    int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], n, i;
+    float x0 = 1e9f, z0 = 1e9f, x1 = -1e9f, z1 = -1e9f, cx, cz;
+    xyz_t p[4], c;
+    static const s16 ang[4] = { (s16)-0x6000, (s16)0x6000, (s16)0x2000, (s16)-0x4000 }; /* (-,-) (+,-) (+,+) (-,+) */
+    if (eEC_CLIP == NULL) {
+        return;
+    }
+    n = pc_ofurn_fp_cells((int)s->shape, (int)(s->item & 3u), (int)s->ux, (int)s->uz, xs, zs);
+    for (i = 0; i < n; i++) {
+        x0 = (float)xs[i] * mFI_UT_WORLDSIZE_X_F < x0 ? (float)xs[i] * mFI_UT_WORLDSIZE_X_F : x0;
+        z0 = (float)zs[i] * mFI_UT_WORLDSIZE_Z_F < z0 ? (float)zs[i] * mFI_UT_WORLDSIZE_Z_F : z0;
+        x1 = (float)(xs[i] + 1) * mFI_UT_WORLDSIZE_X_F > x1 ? (float)(xs[i] + 1) * mFI_UT_WORLDSIZE_X_F : x1;
+        z1 = (float)(zs[i] + 1) * mFI_UT_WORLDSIZE_Z_F > z1 ? (float)(zs[i] + 1) * mFI_UT_WORLDSIZE_Z_F : z1;
+    }
+    if (n == 0) {
+        return;
+    }
+    cx = (x0 + x1) * 0.5f;
+    cz = (z0 + z1) * 0.5f;
+    c.x = cx;
+    c.y = s->target.y;
+    c.z = cz;
+    if (pair == 2) {
+        eEC_CLIP->effect_make_proc(eEC_EFFECT_DUST, c, 2, 0, game, RSV_NO, 0, 4); /* aMR_FtrBye */
+        return;
+    }
+    p[0].x = cx + (x0 - cx) * 0.6f, p[0].z = z0 + 3.5f;
+    p[1].x = cx + (x1 - cx) * 0.6f, p[1].z = z0 + 3.5f;
+    p[2].x = cx + (x1 - cx) * 0.6f, p[2].z = z1 + 3.5f;
+    p[3].x = cx + (x0 - cx) * 0.6f, p[3].z = z1 + 3.5f;
+    for (i = 0; i < 4; i++) {
+        p[i].y = s->target.y;
+    }
+    for (i = pair; i < 4; i += 2) {
+        eEC_CLIP->effect_make_proc(eEC_EFFECT_DUST, p[i], 2, ang[i], game, RSV_NO, 0, 4);
+    }
+}
+
+/* the scale of this frame (and the birth sound / dust / the contact logs) */
+static void pc_ofurn_slot_anim(PCOfurnSlot* s, GAME* game, uint32_t now, float dt) {
+    float sxz = 1.0f, sy = 1.0f;
+    switch (s->anim) {
+        case 1:
+            if ((int32_t)(now - s->anim_t0) < 0) {
+                sxz = sy = 0.0f; /* BIRTH_WAIT: not drawn yet (the leaf is on its way) */
+                break;
+            }
+            s->anim = 2;
+            pc_ofurn_birth_init(&s->birth);
+            sAdo_OngenTrgStart(NA_SE_ITEM_HORIDASHI, &s->target); /* aMR_BirthWait -> BIRTH */
+            printf("[NET][OFURN] place anim contact: tile (%u,%u) item 0x%04X: the birth starts\n", (unsigned)s->ux, (unsigned)s->uz, (unsigned)s->item);
+            /* fall through */
+        case 2: {
+            const float f0 = s->birth.frames;
+            if (!pc_ofurn_birth_step(&s->birth, dt, &sxz, &sy)) {
+                s->anim = 0;
+            }
+            if (f0 < 2.0f && s->birth.frames >= 2.0f) {
+                pc_ofurn_slot_dust(s, game, 0);
+            }
+            if (f0 < 6.0f && s->birth.frames >= 6.0f) {
+                pc_ofurn_slot_dust(s, game, 1);
+            }
+            break;
+        }
+        case 3: {
+            const float f0 = s->bye_frames;
+            s->bye_frames += dt;
+            sxz = sy = pc_ofurn_bye_scale(s->bye_frames);
+            if (f0 < 2.0f && s->bye_frames >= 2.0f) {
+                pc_ofurn_slot_dust(s, game, 2);
+            }
+            if (sxz == 0.0f) {
+                s->anim = 4;
+                printf("[NET][OFURN] pickup anim contact: tile (%u,%u) item 0x%04X: the piece is gone\n", (unsigned)s->ux, (unsigned)s->uz, (unsigned)s->item);
+            }
+            break;
+        }
+        case 4:
+            sxz = sy = 0.0f;
+            break;
+        default:
+            break;
+    }
+    s->ftr.scale.x = sxz;
+    s->ftr.scale.y = sy;
+    s->ftr.scale.z = sxz;
+}
+
+static PCOfurnSlot* pc_ofurn_slot_at(int ux, int uz) {
+    int i;
+    for (i = 0; i < PC_OFURN_SLOTS; i++) {
+        if (s_slot[i].used && !s_slot[i].dying && s_slot[i].ux == (uint8_t)ux && s_slot[i].uz == (uint8_t)uz) {
+            return &s_slot[i];
+        }
+    }
+    return NULL;
+}
+
 static int pc_ofurn_slot_ct(PCOfurnSlot* s, const PCOfurnMarker* m, uint16_t item) {
     xyz_t pos;
     float fx, fz;
@@ -188,6 +393,17 @@ static int pc_ofurn_slot_ct(PCOfurnSlot* s, const PCOfurnMarker* m, uint16_t ite
         s->from_angle = pc_ofurn_rot_angle(frot);
         s->t0 = pc_net_game_now_ms() - age;
         s->dur = (fx == pos.x && fz == pos.z) ? PC_OFURN_TURN_MS : PC_OFURN_SLIDE_MS;
+    }
+    {
+        /* C3: a piece that was just PLACED (a note from the Place / the host's SET): the vanilla birth -- the local placer's piece 46 frames after its Place (the
+         * leaf flight), another player's piece at once -- instead of popping in */
+        PCOfurnAnimNote* n = pc_ofurn_note_find(PC_OFURN_ANIM_BIRTH, (int)m->ut_x, (int)m->ut_z, item);
+        if (n != NULL && !s->sliding) {
+            s->anim = 1;
+            s->anim_t0 = n->t0 + (n->local ? PC_OFURN_BIRTH_WAIT_MS : 0u);
+            s->ftr.scale.x = s->ftr.scale.y = s->ftr.scale.z = 0.0f;
+            n->valid = 0;
+        }
     }
     return 1;
 }
@@ -284,6 +500,12 @@ void pc_ofurn_bgitem_move(GAME_PLAY* play) {
         pc_ofurn_release_all(NULL);
         s_grab.active = 0;
         s_grab.pres = 0;
+        if (s_open.phase != 0) {
+            if (s_open.phase >= 2 && pc_dresser_ui_active() && !pc_dresser_ui_basket() && !pc_dresser_ui_pending()) {
+                pc_dresser_ui_end(); /* C3: left the town with the outdoor storage screen state still set */
+            }
+            s_open.phase = 0;
+        }
         return;
     }
     if (play != s_play_seen) {
@@ -301,6 +523,7 @@ void pc_ofurn_bgitem_move(GAME_PLAY* play) {
     now = pc_net_game_now_ms();
     pc_ofurn_draw_test_cycle(play, px, pz);
     pc_ofurn_grab_tick(play);
+    pc_ofurn_notes_tick((GAME*)play); /* C3: the local placer's leaf flight */
     t = pc_net_game_ofurn_view();
     if (t == NULL) {
         pc_ofurn_release_all("no view");
@@ -343,14 +566,31 @@ void pc_ofurn_bgitem_move(GAME_PLAY* play) {
         /* release what is no longer wanted / changed */
         for (i = 0; i < PC_OFURN_SLOTS; i++) {
             int keep = 0, j;
-            if (!s_slot[i].used) {
-                continue;
+            if (!s_slot[i].used || s_slot[i].dying) {
+                continue; /* C3: a dying slot (the pickup shrink) is released by the pose loop when its bye ends */
             }
             for (j = 0; j < n_want && !keep; j++) {
                 keep = t->m[want_k[j]].ut_x == s_slot[i].ux && t->m[want_k[j]].ut_z == s_slot[i].uz && want_item[j] == s_slot[i].item &&
                        t->m[want_k[j]].shape == s_slot[i].shape;
             }
             if (!keep) {
+                PCOfurnAnimNote* bye = pc_ofurn_note_find(PC_OFURN_ANIM_BYE, (int)s_slot[i].ux, (int)s_slot[i].uz, s_slot[i].item);
+                if (s_slot[i].anim == 3 || s_slot[i].anim == 4 || bye != NULL) {
+                    /* C3: picked up (our own B, or the host's DEL): the vanilla shrink + dust first, then the release */
+                    if (s_slot[i].anim != 3 && s_slot[i].anim != 4) {
+                        s_slot[i].anim = 3;
+                        s_slot[i].bye_frames = 0.0f;
+                    }
+                    if (bye != NULL) {
+                        bye->valid = 0;
+                    }
+                    s_slot[i].dying = 1;
+                    if (s_slot[i].collide_idx >= 0) {
+                        mCoBG_CrossOffMoveBg(s_slot[i].collide_idx);
+                    }
+                    s_slot[i].collide_idx = -2; /* no new box while it shrinks */
+                    continue;
+                }
                 pc_ofurn_slot_release(&s_slot[i], "gone / moved / changed / out of range");
             }
         }
@@ -359,7 +599,7 @@ void pc_ofurn_bgitem_move(GAME_PLAY* play) {
             int have = 0, free_i = -1;
             const PCOfurnMarker* m = &t->m[want_k[k]];
             for (i = 0; i < PC_OFURN_SLOTS; i++) {
-                if (s_slot[i].used && s_slot[i].ux == m->ut_x && s_slot[i].uz == m->ut_z) {
+                if (s_slot[i].used && !s_slot[i].dying && s_slot[i].ux == m->ut_x && s_slot[i].uz == m->ut_z) {
                     have = 1;
                     break;
                 }
@@ -384,6 +624,11 @@ void pc_ofurn_bgitem_move(GAME_PLAY* play) {
             continue;
         }
         pc_ofurn_slot_pose(s, now);
+        pc_ofurn_slot_anim(s, (GAME*)play, now, (float)((GAME*)play)->graph->dt_num_60fps_frames); /* C3: birth / bye scale */
+        if (s->dying && s->anim != 3) {
+            pc_ofurn_slot_release(s, "picked up (the shrink ended)");
+            continue;
+        }
         aMR_PC_StandaloneAnimate(&s->ftr);
         dx = s->ftr.position.x - px;
         dz = s->ftr.position.z - pz;
@@ -438,11 +683,21 @@ void pc_ofurn_bgitem_destruct(void) {
     pc_ofurn_release_all(NULL);
     s_play_seen = NULL;
     memset(&s_grab, 0, sizeof(s_grab));
+    if (s_open.phase >= 2 && pc_dresser_ui_active() && !pc_dresser_ui_basket()) {
+        pc_dresser_ui_end(); /* C3: the scene went away under an open outdoor storage screen */
+    }
+    memset(&s_open, 0, sizeof(s_open));
+    memset(&s_pick, 0, sizeof(s_pick));
 }
 
 /* ================================================================ C2: the GRAB driver ================================================================ */
 
+static uint32_t s_test_tap_up_ms = 0; /* TEST-ONLY: the synthetic A of a scripted "tap" goes up at this time */
 static int pc_ofurn_a_held(void) {
+    if (s_grab.test_on && s_test_tap_up_ms != 0u && (int32_t)(pc_net_game_now_ms() - s_test_tap_up_ms) >= 0) {
+        s_test_tap_up_ms = 0;
+        s_grab.test_a = 0;
+    }
     return s_grab.test_on ? s_grab.test_a : chkButton(BUTTON_A) != 0;
 }
 
@@ -535,6 +790,136 @@ static void pc_ofurn_pres_rollback(void) {
     s_grab.p_dur = 150u;
 }
 
+/* ---- C3: the local pickup's outcome: a refusal (e.g. 62 "Take the stored items out first") brings the shrunk piece back with the birth wobble ---- */
+static void pc_ofurn_pick_tick(void) {
+    int reason = 0, oc;
+    PCOfurnSlot* s;
+    if (!s_pick.active) {
+        return;
+    }
+    oc = pc_net_game_ofurn_op_outcome(s_pick.serial, &reason);
+    if (oc == 0 && (uint32_t)(pc_net_game_now_ms() - s_pick.t0) < 8000u) {
+        return;
+    }
+    s_pick.active = 0;
+    if (oc == 1) {
+        printf("[OFURN][PICK] pickup of (%u,%u) APPLIED by the host (the item is in the pocket)\n", (unsigned)s_pick.ux, (unsigned)s_pick.uz);
+        return;
+    }
+    s = pc_ofurn_slot_at((int)s_pick.ux, (int)s_pick.uz);
+    printf("[OFURN][PICK] pickup of (%u,%u) REFUSED (reason %d): the piece comes back\n", (unsigned)s_pick.ux, (unsigned)s_pick.uz, reason);
+    if (s != NULL && (s->anim == 3 || s->anim == 4)) {
+        s->anim = 2;
+        pc_ofurn_birth_init(&s->birth);
+    }
+}
+
+/* ---- C3: the OPEN path of a placed storage piece (A tap; the gyroid-style 27-slot screen of the indoor direct open, without the My_Room actor) ---- */
+static void pc_ofurn_open_request(const PCOfurnMarker* mk) {
+    const char* why = NULL;
+    PLAYER_ACTOR* pl;
+    int gen;
+    if (s_open.phase != 0) {
+        return;
+    }
+    if (!pc_net_game_ofurn_storage_open_ok(&why)) {
+        printf("[OFURN][STORAGE] A tap on the storage piece at (%u,%u): not offered (%s)\n", (unsigned)mk->ut_x, (unsigned)mk->ut_z, why != NULL ? why : "no multiplayer");
+        if (why != NULL) {
+            pc_net_game_ofurn_notice_text(why);
+        }
+        return;
+    }
+    gen = pc_net_game_ofurn_storage_select((int)mk->ut_x, (int)mk->ut_z, (int)pc_ofurn_tile_value(mk));
+    if (gen == 0) {
+        pc_net_game_ofurn_notice_text("Try again in a moment");
+        return;
+    }
+    memset(&s_open, 0, sizeof(s_open));
+    s_open.phase = 1;
+    s_open.mk = *mk;
+    s_open.t0 = pc_net_game_now_ms() | 1u;
+    pl = gamePT != NULL ? GET_PLAYER_ACTOR((GAME_PLAY*)gamePT) : NULL;
+    if (pl != NULL) {
+        s_open.pos = pl->actor_class.world.position;
+    }
+    printf("[OFURN][STORAGE] A tap on the storage piece at (%u,%u) item 0x%04X: asking the host for its storage (gen %d)\n", (unsigned)mk->ut_x, (unsigned)mk->ut_z,
+           (unsigned)pc_ofurn_tile_value(mk), gen);
+}
+
+static void pc_ofurn_open_cancel(const char* why) {
+    if (s_open.noticed) {
+        pc_net_game_dresser_open_wait_notice(0);
+    }
+    printf("[OFURN][STORAGE] open of (%u,%u) cancelled: %s\n", (unsigned)s_open.mk.ut_x, (unsigned)s_open.mk.ut_z, why);
+    s_open.phase = 0;
+}
+
+static void pc_ofurn_open_tick(GAME_PLAY* play) {
+    PLAYER_ACTOR* pl;
+    uint32_t waited;
+    if (s_open.phase == 0 || play == NULL) {
+        return;
+    }
+    pl = GET_PLAYER_ACTOR(play);
+    waited = pc_net_game_now_ms() - s_open.t0;
+    if (s_open.phase == 1) {
+        float dx, dz;
+        if (pl == NULL) {
+            pc_ofurn_open_cancel("no player");
+            return;
+        }
+        dx = pl->actor_class.world.position.x - s_open.pos.x;
+        dz = pl->actor_class.world.position.z - s_open.pos.z;
+        if (dx * dx + dz * dz > 30.0f * 30.0f) {
+            pc_ofurn_open_cancel("the player walked away");
+            return;
+        }
+        if (pc_net_game_dresser_view_ready() && play->submenu.process_status == mSM_PROCESS_WAIT && play->submenu.menu_type == mSM_OVL_NONE &&
+            mPlib_able_submenu_type1((GAME*)play)) {
+            unsigned short van[PC_DRESSER_UI_VANILLA];
+            memset(van, 0, sizeof(van)); /* outdoors there are no vanilla keep slots: all 27 cells are the host's */
+            if (s_open.noticed) {
+                pc_net_game_dresser_open_wait_notice(0);
+            }
+            pc_dresser_ui_begin(van);
+            pc_dresser_ui_set_vanilla_ops(NULL, NULL);
+            mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0); /* data1 0: never read in dresser mode */
+            s_open.phase = 2;
+            printf("[OFURN][STORAGE] outdoor storage of (%u,%u) OPENED after %u ms: the 27-slot screen (%d item(s))\n", (unsigned)s_open.mk.ut_x, (unsigned)s_open.mk.ut_z,
+                   (unsigned)waited, pc_net_game_dresser_count());
+            return;
+        }
+        if (waited >= PC_OFURN_OPEN_TIMEOUT_MS) {
+            printf("[OFURN][STORAGE] no host view of the outdoor storage at (%u,%u) after %u ms\n", (unsigned)s_open.mk.ut_x, (unsigned)s_open.mk.ut_z, (unsigned)waited);
+            pc_net_game_dresser_open_wait_notice(2); /* "Try again in a moment" */
+            s_open.phase = 0;
+            return;
+        }
+        if (waited >= PC_OFURN_OPEN_TIMEOUT_MS / 2u && !s_open.reasked) {
+            s_open.reasked = 1;
+            (void)pc_net_game_ofurn_storage_select((int)s_open.mk.ut_x, (int)s_open.mk.ut_z, (int)pc_ofurn_tile_value(&s_open.mk)); /* the same generation */
+        }
+        if (waited >= PC_OFURN_OPEN_NOTICE_MS) {
+            pc_net_game_dresser_open_wait_notice(1); /* notice 12 "Asking the host..." */
+            s_open.noticed = 1;
+        }
+        return;
+    }
+    if (s_open.phase == 2) {
+        if (play->submenu.menu_type != mSM_OVL_NONE || play->submenu.process_status != mSM_PROCESS_WAIT) {
+            return; /* the screen is up (the actors are paused while it is; this runs again once it closed) */
+        }
+        s_open.phase = 3;
+    }
+    if (pc_dresser_ui_pending()) {
+        (void)pc_dresser_ui_poll(); /* closed while a host transaction is in flight: it resolves first */
+        return;
+    }
+    pc_dresser_ui_end();
+    printf("[OFURN][STORAGE] outdoor storage of (%u,%u) closed (%d item(s) inside)\n", (unsigned)s_open.mk.ut_x, (unsigned)s_open.mk.ut_z, pc_net_game_dresser_count());
+    s_open.phase = 0;
+}
+
 /* the per-frame part (from the field-item actor): the op outcome, the end of a presentation, a grab the player state left */
 static void pc_ofurn_grab_tick(GAME_PLAY* play) {
     const uint32_t now = pc_net_game_now_ms();
@@ -574,6 +959,8 @@ static void pc_ofurn_grab_tick(GAME_PLAY* play) {
             pc_ofurn_grab_end("the player left the hold state");
         }
     }
+    pc_ofurn_pick_tick();
+    pc_ofurn_open_tick(play);
 }
 
 /* A in front of a placed piece (the wait state): grab it. 1 = consumed */
@@ -614,6 +1001,7 @@ static int pc_ofurn_grab_try(GAME* game, PLAYER_ACTOR* pl, int ux, int uz) {
     s_grab.start_ms = pc_net_game_now_ms();
     s_grab.seen_state = 0;
     s_grab.release = 0;
+    s_grab.stepped = 0;
     printf("[OFURN][GRAB] grabbed the piece at (%u,%u) item 0x%04X fp %u facing %d%s\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)pc_ofurn_tile_value(&mk),
            (unsigned)mk.shape, face, rotate_only ? " (a C1 host: rotate only)" : "");
     return 1;
@@ -625,6 +1013,7 @@ static int pc_ofurn_grab_step_move(GAME* game, PLAYER_ACTOR* pl, int pull, xyz_t
     const int pux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F), puz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
     PCOfurnMarker to = s_grab.mk;
     s_grab.test_x = s_grab.test_y = 0.0f; /* TEST-ONLY input: one step per scripted step */
+    s_grab.stepped = 1; /* C3: a moving grab never opens the storage */
     if (s_grab.rotate_only || !pc_ofurn_move_geometry((int)s_grab.mk.shape, (int)s_grab.mk.rot, (int)s_grab.mk.ut_x, (int)s_grab.mk.ut_z, dir, pull, pux, puz, &nox, &noz,
                                                        &fx, &fz) ||
         !pc_net_game_ofurn_cells_free(&s_grab.mk, (int)s_grab.mk.rot, nox, noz)) {
@@ -686,6 +1075,7 @@ static int pc_ofurn_grab_step_rotate(GAME* game, PLAYER_ACTOR* pl, int left) {
     const int pux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F), puz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
     s_grab.allow_rot = 0;
     s_grab.test_x = s_grab.test_y = 0.0f; /* TEST-ONLY input: one step per scripted step */
+    s_grab.stepped = 1; /* C3 */
     if (pc_ofurn_fp_covers((int)s_grab.mk.shape, nrot, (int)s_grab.mk.ut_x, (int)s_grab.mk.ut_z, pux, puz) ||
         !pc_net_game_ofurn_cells_free(&s_grab.mk, nrot, (int)s_grab.mk.ut_x, (int)s_grab.mk.ut_z)) {
         /* vanilla aMR_RotatePermission: never into the player's own cell, never onto an occupied one */
@@ -743,7 +1133,14 @@ int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no) {
         return 0;
     }
     if (!pc_ofurn_a_held()) {
-        pc_ofurn_grab_end("A released");
+        /* C3: the vanilla open gesture (aMR_ManageMoveBottun): A released before 14 frames without a step = a TAP: a storage piece opens */
+        const uint32_t held = pc_net_game_now_ms() - s_grab.start_ms;
+        const PCOfurnMarker tapped = s_grab.mk;
+        const int opens = s_grab.op == 0 && pc_ofurn_tap_opens(held, s_grab.stepped, pc_net_game_ofurn_is_storage((int)pc_ofurn_tile_value(&tapped)));
+        pc_ofurn_grab_end(opens ? "A tapped (open)" : "A released");
+        if (opens) {
+            pc_ofurn_open_request(&tapped);
+        }
         return 0;
     }
     if (s_grab.op == 0) {
@@ -806,8 +1203,36 @@ int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger) {
     if (!pc_net_game_ofurn_placed_at(ux, uz)) {
         return 0;
     }
-    r = a_trigger ? pc_ofurn_grab_try(game, pl, ux, uz) : pc_net_game_ofurn_pickup(ux, uz);
-    printf("[OFURN][INPUT] %s in front of the placed piece at (%d,%d) -> %s\n", a_trigger ? "A (grab)" : "B (pick up)", ux, uz, r ? "handled" : "not handled");
+    if (!a_trigger && s_open.phase != 0) {
+        return 1; /* C3: the storage of a piece is being opened: B does nothing else meanwhile */
+    }
+    if (!a_trigger) {
+        PCOfurnMarker mk;
+        const int have = pc_net_game_ofurn_marker_at(ux, uz, &mk);
+        r = pc_net_game_ofurn_pickup(ux, uz);
+        if (r == 2 && have) {
+            /* C3: the vanilla pickup presentation (aMR_PreparePickingUpFurniture + PICKUP_FURNITURE): the piece shrinks with a dust puff while the player plays the
+             * PICKUP1 clip (state 32); the item lands in the pocket with the host's APPLIED; a refusal brings the piece back (pc_ofurn_pick_tick) */
+            PCOfurnSlot* s = pc_ofurn_slot_at((int)mk.ut_x, (int)mk.ut_z);
+            xyz_t pos;
+            if (s != NULL && s->anim != 3 && s->anim != 4) {
+                s->anim = 3;
+                s->bye_frames = 0.0f;
+            }
+            pos = s != NULL ? s->target : pl->actor_class.world.position;
+            printf("[OFURN][PICK] B pickup of (%u,%u) item 0x%04X begun: player state %s\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)pc_ofurn_tile_value(&mk),
+                   mPlib_PC_request_pickup_furniture_outdoor(game, (mActor_name_t)mk.base, &pos) ? "PICKUP_FURNITURE (32) requested" : "unchanged (request refused)");
+            s_pick.active = 1;
+            s_pick.serial = pc_net_game_ofurn_op_serial();
+            s_pick.t0 = pc_net_game_now_ms();
+            s_pick.ux = mk.ut_x;
+            s_pick.uz = mk.ut_z;
+            s_pick.item = mk.base;
+        }
+    } else {
+        r = pc_ofurn_grab_try(game, pl, ux, uz);
+    }
+    printf("[OFURN][INPUT] %s in front of the placed piece at (%d,%d) -> %s\n", a_trigger ? "A (grab / tap = open)" : "B (pick up)", ux, uz, r ? "handled" : "not handled");
     return r;
 }
 
@@ -834,6 +1259,11 @@ int pc_ofurn_test_grab_input(const char* script, int step) {
         }
         if (strcmp(tok, "release") == 0) {
             s_grab.test_a = 0;
+            return 1;
+        }
+        if (strcmp(tok, "tap") == 0) { /* C3: A down now, up again after 80 ms (the open gesture of a storage piece) */
+            s_grab.test_a = 1;
+            s_test_tap_up_ms = (pc_net_game_now_ms() + 80u) | 1u;
             return 1;
         }
         s_grab.test_a = 1;

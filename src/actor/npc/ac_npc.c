@@ -19,6 +19,7 @@
 #include "pc_net_game.h" /* N2 villager movement sync -- pc_net_game_world_is_host_authoritative(),
                            * pc_net_game_notify_npc_move(), pc_net_game_get_npc_move_pose(). See
                            * ac_npc_move.c_inc's aNPC_actor_move_show()/aNPC_actor_move_show_before(). */
+#include "pc_handover.h" /* hand-over animations: the client's report of a villager hand-over, the host's held-villager clip steps */
 #endif
 
 extern aNPC_draw_data_c npc_draw_data_tbl[];

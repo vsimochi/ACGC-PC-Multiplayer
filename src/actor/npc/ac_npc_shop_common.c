@@ -5,6 +5,7 @@
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: Nook's announcement of the 5-minute closure */
 #include "pc_house_upgrade.h" /* house upgrades via Nook for resident clients (worker C): kind-20 transactions instead of local homes[] / loan writes */
 #include "pc_sell_ui.h" /* Nook bulk sell basket: the sell menu opens the basket screen in a multiplayer session (client + listen host) */
+#include "pc_handover.h" /* hand-over animations: Nook's Work Mode hand-overs + another player's hand-over seen on this process's keeper */
 #include <string.h>
 /* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
  * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
@@ -1808,7 +1809,8 @@ enum {
     aNSC_PC_UP_BEGIN,       /* shop upgrade: start the closure (host: at once; client: the request) */
     aNSC_PC_UP_PENDING,     /* shop upgrade: the client's start request is in flight (the host's service 6 answers) */
     aNSC_PC_HU_BEGIN,       /* house upgrade (worker C): the wait row is up, begin the REHOUSE talk-start op (retried while another transaction is unresolved) */
-    aNSC_PC_HU_PENDING      /* house upgrade: the kind-20 transaction is in flight (the wait row stays at its continue point) */
+    aNSC_PC_HU_PENDING,     /* house upgrade: the kind-20 transaction is in flight (the wait row stays at its continue point) */
+    aNSC_PC_HO_RUN          /* hand-over animations (pc_handover.h): a Work Mode hand-over plays (the job row is locked at its end), then END */
 };
 
 static int aNSC_pc_hs_state;
@@ -1972,6 +1974,168 @@ static void aNSC_pc_wk_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     aNSC_pc_hs_state = aNSC_PC_WK_OP_BEGIN; /* the first page text stays up until the host answers */
 }
 
+/* ---- Hand-over animations (pc_handover.h, ON by default; AC_MP_HANDOVER_ANIM=0 / [Gameplay] handover_anim = 0 = the old instant pocket change) ----
+ * An APPLIED (or, for the host's own player, done) TAKE_PARCEL / DELIVER plays the vanilla hand-over while the job row waits at its end (the message is locked, as in vanilla):
+ * TAKE_PARCEL = Nook takes the parcel out and holds it to the player (the handOverItem actor with Nook as master: TRANSFER1 -> TRANS_WAIT1, exactly
+ * aNSC_present_balloon_trans_takeout), the player's RECIEVE_WAIT / STRETCH / RECIEVE / PUTAWAY states take it; DELIVER = the player holds the item out
+ * (mPlib_request_main_give_type1: GIVE / GIVE_WAIT), Nook reaches for it and puts it away (GET1 -> GET_PULL1 -> GET_PUTAWAY1, the handOverItem master change exactly as
+ * aNPC_act_get). Presentation only: the pockets already hold the host's post-image (nothing is written here); a refusal plays nothing; every step has a time cap after which
+ * the row is unlocked (the dialogue never hangs). The other players in the shop see Nook do it (message 103, pc_net_game_handover_local). */
+static int aNSC_pc_ho_n, aNSC_pc_ho_idx, aNSC_pc_ho_step;
+static int aNSC_pc_ho_kind[2], aNSC_pc_ho_item[2];
+static f32 aNSC_pc_ho_frames;
+
+static void aNSC_pc_ho_anim(NPC_SHOP_COMMON_ACTOR* shop_common, int anim) {
+    CLIP(npc_clip)->animation_init_proc((ACTOR*)shop_common, anim, TRUE);
+}
+
+static void aNSC_pc_ho_plan(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int item_obj = aNSC_pc_wk_view.obj_item, item_carried = aNSC_pc_wk_view.carried_item;
+    aNSC_pc_ho_n = pc_handover_enabled() ? pc_ho_work_plan(aNSC_pc_wk_op, 1, item_obj, item_carried, 0, 0, aNSC_pc_ho_kind, aNSC_pc_ho_item) : 0;
+    if (aNSC_pc_ho_n <= 0) {
+        return;
+    }
+    aNSC_pc_ho_idx = 0;
+    aNSC_pc_ho_step = 0;
+    aNSC_pc_ho_frames = 0.0f;
+    mMsg_Set_LockContinue(mMsg_Get_base_window_p()); /* the job row waits at its end until the hand-over is over */
+    aNSC_pc_hs_state = aNSC_PC_HO_RUN;
+    printf("[NET][HANDOVER] nook work: op %d -> %s item 0x%04X\n", aNSC_pc_wk_op, aNSC_pc_ho_kind[0] == PC_HO_KIND_NPC_GIVES ? "Nook -> player" : "player -> Nook",
+           (unsigned)aNSC_pc_ho_item[0]);
+}
+
+/* one frame of the Nook hand-over; TRUE = over (done or abandoned) */
+static int aNSC_pc_ho_tick(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    ACTOR* actorx = (ACTOR*)shop_common;
+    aHOI_Clip_c* hoi = CLIP(handOverItem_clip);
+    mActor_name_t item = (mActor_name_t)aNSC_pc_ho_item[aNSC_pc_ho_idx];
+    int fish = ITEM_IS_FISH(item) == TRUE;
+    int stopped = shop_common->npc_class.draw.main_animation_state == cKF_STATE_STOPPED;
+    f32 cap = 240.0f;
+    const char* why = NULL;
+
+    aNSC_pc_ho_frames += (f32)gamePT->graph->dt_num_60fps_frames;
+    if (hoi == NULL) {
+        why = "no hand-over actor";
+    } else {
+        mMsg_Set_LockContinue(mMsg_Get_base_window_p());
+        switch (aNSC_pc_ho_step) {
+            case 0: /* start */
+                if (hoi->master_actor != NULL) {
+                    break; /* another hand-over is still finishing */
+                }
+                if (aNSC_pc_ho_kind[aNSC_pc_ho_idx] == PC_HO_KIND_NPC_GIVES) {
+                    ACTOR* it = hoi->birth_proc(item, aHOI_REQUEST_PUTAWAY, aHOI_NOT_PRESENT, actorx);
+                    if (it == NULL) {
+                        why = "the hand-over actor refused the birth (no talk actors)";
+                        break;
+                    }
+                    hoi->chg_request_mode_proc(actorx, aHOI_REQUEST_TRANSFER);
+                    shop_common->npc_class.left_hand.item_actor_p = it;
+                    shop_common->npc_class.head.lock_flag = TRUE;
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_TRANSFER_F1 : aNPC_ANIM_TRANSFER1);
+                    sAdo_OngenTrgStart(NA_SE_GASAGOSO, &actorx->world.position);
+                    pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)actorx->npc_id, PC_HO_KIND_NPC_GIVES, (int)item, fish);
+                    aNSC_pc_ho_step = 1;
+                } else {
+                    mPlib_request_main_give_type1(gamePT, item, aHOI_REQUEST_PUTAWAY, FALSE, FALSE); /* the player holds the item out */
+                    aNSC_pc_ho_step = 10;
+                }
+                aNSC_pc_ho_frames = 0.0f;
+                break;
+            case 1: /* Nook holds it out (TRANSFER1 ends) */
+                if (stopped && aNSC_pc_ho_frames >= 8.0f && hoi->master_actor == actorx) {
+                    hoi->chg_request_mode_proc(actorx, aHOI_REQUEST_TRANS_WAIT); /* the player's RECIEVE_WAIT starts from here (aHOI_actor_move) */
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_TRANS_WAIT_F1 : aNPC_ANIM_TRANS_WAIT1);
+                    aNSC_pc_ho_step = 2;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 2: /* waiting for the player to take it */
+                cap = 600.0f;
+                if (hoi->master_actor != actorx) {
+                    shop_common->npc_class.left_hand.item_actor_p = NULL;
+                    shop_common->npc_class.head.lock_flag = FALSE;
+                    aNSC_set_animation(shop_common, shop_common->action);
+                    aNSC_pc_ho_step = 3;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 3: /* the player puts it away */
+                cap = 600.0f;
+                if (hoi->master_actor == NULL && !mPlib_check_player_actor_main_index_RecieveMove(gamePT)) {
+                    aNSC_pc_ho_step = 99;
+                }
+                break;
+            case 10: /* the player holds it out (GIVE -> GIVE_WAIT sets TRANS_WAIT) */
+                if (hoi->request_mode == aHOI_REQUEST_TRANS_WAIT && hoi->master_actor != NULL && hoi->master_actor != actorx) {
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_GET_F1 : aNPC_ANIM_GET1);
+                    pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)actorx->npc_id, PC_HO_KIND_NPC_TAKES, (int)item, fish);
+                    aNSC_pc_ho_step = 11;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 11: /* Nook reaches for it (GET1 ends): the item changes hands */
+                if (stopped && aNSC_pc_ho_frames >= 8.0f) {
+                    ACTOR* it = hoi->chg_master_proc(actorx);
+                    if (it == NULL) {
+                        why = "the hand-over actor refused the master change";
+                        break;
+                    }
+                    hoi->chg_request_mode_proc(actorx, aHOI_REQUEST_GET_PULL);
+                    shop_common->npc_class.left_hand.item_actor_p = it;
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_GET_PULL_F1 : aNPC_ANIM_GET_PULL1);
+                    aNSC_pc_ho_step = 12;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 12: /* pulled in: put it away */
+                if (stopped && aNSC_pc_ho_frames >= 8.0f) {
+                    hoi->chg_request_mode_proc(actorx, hoi->player_after_mode);
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_GET_PUTAWAY_F1 : aNPC_ANIM_GET_PUTAWAY1);
+                    sAdo_OngenTrgStart(NA_SE_GASAGOSO, &actorx->world.position);
+                    aNSC_pc_ho_step = 13;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 13:
+                if (stopped && aNSC_pc_ho_frames >= 8.0f) {
+                    shop_common->npc_class.left_hand.item_actor_p = NULL;
+                    aNSC_set_animation(shop_common, shop_common->action);
+                    aNSC_pc_ho_step = 14;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 14:
+                if (hoi->master_actor == NULL) {
+                    aNSC_pc_ho_step = 99;
+                }
+                break;
+            default:
+                break;
+        }
+        if (why == NULL && aNSC_pc_ho_step != 99 && aNSC_pc_ho_frames >= cap) {
+            why = "TIMEOUT";
+        }
+    }
+    if (why == NULL && aNSC_pc_ho_step != 99) {
+        return FALSE;
+    }
+    printf("[NET][HANDOVER] nook work: hand-over %d/%d item 0x%04X %s%s\n", aNSC_pc_ho_idx + 1, aNSC_pc_ho_n, (unsigned)item, why == NULL ? "done" : "abandoned: ",
+           why == NULL ? "" : why);
+    if (why != NULL) {
+        shop_common->npc_class.left_hand.item_actor_p = NULL;
+        shop_common->npc_class.head.lock_flag = FALSE;
+        aNSC_set_animation(shop_common, shop_common->action);
+    } else if (++aNSC_pc_ho_idx < aNSC_pc_ho_n) {
+        aNSC_pc_ho_step = 0;
+        aNSC_pc_ho_frames = 0.0f;
+        return FALSE;
+    }
+    mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+    return TRUE;
+}
+
 /* the op finished (APPLIED, or done at once for the host's own player) */
 static void aNSC_pc_wk_done(NPC_SHOP_COMMON_ACTOR* shop_common) {
     PCWorkView v;
@@ -1984,12 +2148,14 @@ static void aNSC_pc_wk_done(NPC_SHOP_COMMON_ACTOR* shop_common) {
                 aNSC_pc_wk_view = v;
             }
             aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_PARCEL);
+            aNSC_pc_ho_plan(shop_common); /* hand-over animations: Nook hands the parcel over (the state becomes HO_RUN, then END) */
             break;
         case PC_WORK_OP_LEAVE:
             aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_LEFT);
             break;
         default: /* DELIVER / REPORT: the Nook reward was paid (the row shows the reward of the job that was on screen) */
             aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_DONE);
+            aNSC_pc_ho_plan(shop_common); /* hand-over animations: DELIVER = the player hands the item to Nook (REPORT has no item: nothing) */
             break;
     }
 }
@@ -2234,6 +2400,11 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
             break;
         case aNSC_PC_WK_OP_PENDING:
             aNSC_pc_wk_pending(shop_common);
+            break;
+        case aNSC_PC_HO_RUN:
+            if (aNSC_pc_ho_tick(shop_common)) {
+                aNSC_pc_hs_state = aNSC_PC_HS_END; /* the end row (already set as the continue message) follows */
+            }
             break;
         case aNSC_PC_RS_BEGIN:
             r = pc_net_game_restock_begin();
@@ -2906,6 +3077,9 @@ static void aNSC_present_balloon_trans_takeout(NPC_SHOP_COMMON_ACTOR* shop_commo
             CLIP(handOverItem_clip)->chg_request_mode_proc((ACTOR*)shop_common, aHOI_REQUEST_TRANSFER);
 
             shop_common->npc_class.left_hand.item_actor_p = res;
+#ifdef TARGET_PC
+            pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)actorx->npc_id, PC_HO_KIND_NPC_GIVES, ITM_BALLOON_START, FALSE); /* the other shoppers see it */
+#endif
         }
     }
 
@@ -3899,6 +4073,9 @@ static void aNSC_pc_present_trans_takeout(NPC_SHOP_COMMON_ACTOR* shop_common, GA
         if (actor) {
             CLIP(handOverItem_clip)->chg_request_mode_proc((ACTOR*)shop_common, 0x1);
             shop_common->npc_class.left_hand.item_actor_p = actor;
+#ifdef TARGET_PC
+            pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)((ACTOR*)shop_common)->npc_id, PC_HO_KIND_NPC_GIVES, (int)shop_common->password.item, FALSE); /* the other shoppers see it */
+#endif
         }
     }
     if (shop_common->npc_class.draw.main_animation_state == cKF_STATE_STOPPED) {
@@ -3922,7 +4099,43 @@ static void aNSC_pc_present_end_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PL
     }
 }
 
+#ifdef TARGET_PC
+/* hand-over animations (pc_handover.h): ANOTHER player's hand-over with the keeper of this shop (message 103, relayed by the host): the idle keeper here plays the same clips
+ * once (no item in hand: the item actor belongs to that player's own process). TRUE = a clip of it is showing (the idle decision waits). */
+static int aNSC_pc_ho_observer(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+    static int s_last = PC_HO_ST_NONE;
+    static const s16 anim_n[] = { aNPC_ANIM_WAIT1, aNPC_ANIM_TRANSFER1, aNPC_ANIM_TRANS_WAIT1, aNPC_ANIM_GET1, aNPC_ANIM_GET_PULL1, aNPC_ANIM_GET_PUTAWAY1 };
+    static const s16 anim_f[] = { aNPC_ANIM_WAIT1, aNPC_ANIM_TRANSFER_F1, aNPC_ANIM_TRANS_WAIT_F1, aNPC_ANIM_GET_F1, aNPC_ANIM_GET_PULL_F1, aNPC_ANIM_GET_PUTAWAY_F1 };
+    ACTOR* actorx = (ACTOR*)shop_common;
+    int changed = 0, fish = 0;
+    int st = pc_net_game_shop_handover_step((int)(u16)actorx->npc_id, shop_common->npc_class.draw.main_animation_state == cKF_STATE_STOPPED,
+                                            (f32)gamePT->graph->dt_num_60fps_frames, &changed, &fish);
+
+    if (st == PC_HO_ST_NONE || st == PC_HO_ST_DONE) {
+        if (s_last != PC_HO_ST_NONE) {
+            aNSC_setupAction(shop_common, play, shop_common->action); /* back to the idle action (its clip and its speed) */
+            s_last = PC_HO_ST_NONE;
+        }
+        return FALSE;
+    }
+    aNSC_set_stop_spd(shop_common); /* a keeper walking after his player stops for it */
+    if (st != s_last) {
+        CLIP(npc_clip)->animation_init_proc(actorx, fish ? anim_f[st] : anim_n[st], TRUE);
+        if (st == PC_HO_ST_TRANSFER || st == PC_HO_ST_GET_PUTAWAY) {
+            sAdo_OngenTrgStart(NA_SE_GASAGOSO, &actorx->world.position);
+        }
+        s_last = st;
+    }
+    return TRUE;
+}
+#endif
+
 static void aNSC_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (aNSC_pc_ho_observer(shop_common, play)) {
+        return;
+    }
+#endif
     if (aNSC_message_ctrl(shop_common, play) != TRUE) {
         int act = aNSC_decide_next_move_act(shop_common, play);
         if (act != shop_common->action) {
@@ -3934,6 +4147,11 @@ static void aNSC_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
 }
 
 static void aNSC_walk_pl_other_zone(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (aNSC_pc_ho_observer(shop_common, play)) {
+        return; /* hand-over animations: another player's hand-over with this keeper is showing */
+    }
+#endif
     if (aNSC_message_ctrl(shop_common, play) != TRUE) {
         int act = aNSC_decide_next_move_act(shop_common, play);
         if (act != shop_common->action) {
@@ -3946,6 +4164,11 @@ static void aNSC_walk_pl_other_zone(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
 
 static void aNSC_turn(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     ACTOR* actorx = (ACTOR*)shop_common;
+#ifdef TARGET_PC
+    if (aNSC_pc_ho_observer(shop_common, play)) {
+        return; /* hand-over animations: another player's hand-over with this keeper is showing */
+    }
+#endif
     if (aNSC_message_ctrl(shop_common, play) != TRUE) {
         if (GET_PLAYER_ACTOR(play)) {
             s16 player_angle = shop_common->player_angle;

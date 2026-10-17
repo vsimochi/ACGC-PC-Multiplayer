@@ -3073,6 +3073,11 @@ int aMR_PC_StandaloneBankSize(void) {
     return aMR_FTR_BANK_SIZE;
 }
 
+/* C3: the furniture leaf icon of an item (what the room's place effect eEC_EFFECT_KAGU_HAPPA shows, aMR_SetReserveFurniture) */
+int aMR_PC_ItemIconNo(int item) {
+    return aMR_ItemNo2IconNo((mActor_name_t)item);
+}
+
 int aMR_PC_StandaloneMoveBgType(int item) {
     aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
     if (profile == NULL || aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_NO_COLLISION)) {

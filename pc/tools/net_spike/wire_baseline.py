@@ -69,7 +69,7 @@ EXPECTED_MAX_MSG_ID = 76
 # range and may be present or absent while workers land: 77 TREE_DROP, 78 SHOP_PREVIEW, 79 / 80 ball, 81 BEE_SWARM, 82 bees spare,
 # 83 / 84 dresser storage, 85 SHOP_UPGRADE_REQ (the announced 5-minute shop upgrade, client -> host, 8 B; deliberate, no protocol bump).
 # Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
-SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98, 99) + (100, 101) + (102,)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
+SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98, 99) + (100, 101) + (102,) + (103,)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
 # player-vs-player tool hits (deliberate, no protocol bump): 91 PVP_HIT_REQ (client -> host, 16 B), 92 PVP_HIT (host -> the victim only, 12 B); the
 # wire structs are PCPvpHitReqMsg / PCPvpHitMsg in pc/include/pc_pvp_authority.h (pinned by test_pvp_src.py, size _Static_asserts 16 / 12)
 # worker A (deliberate, no protocol bump): 86 WILDLIFE_TOOL_ACTION (client -> host, 8 B, latent bugs), 87 GHOST_HUNT (client -> host, 4 B, spirit hunt)
@@ -80,8 +80,10 @@ SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 
 # PCChatSendMsg / PCChatMsg in pc/include/pc_chat.h (pinned by test_chat_src.py, size _Static_asserts 68 / 80).
 # outdoor furniture C2 (deliberate, no protocol bump): 102 OUTDOOR_FURN2 (host -> one READY client, RELIABLE, 268 B = the PCOfurnMsg layout of 98: CAPS + the list of
 # every placed piece incl. multi-tile + SET / DEL / MOVE deltas); 98 keeps the C1 layout and carries 1x1 pieces only (pinned by test_ofurn_src.py / test_old_host_compat_src.py).
+# hand-over animations (deliberate, no protocol bump): 103 HANDOVER (villager: client -> host ONLY; shop keeper: owner -> host -> same-scene READY peers; RELIABLE, 16 B,
+# PCHandoverMsg in pc/include/pc_handover.h, pinned by test_handover_src.py).
 SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*|ShopUpgradeReq|VillagerOutfit|WildlifeToolAction|GhostHunt)Msg|PCNetGameOutfitWire"  # worker B: VILLAGER_OUTFIT; worker A: 86 / 87
-_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-9]|10[0-2])\s*,?"
+_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-9]|10[0-3])\s*,?"
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).
@@ -422,6 +424,9 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TXN_REASON_OFURN_LIMIT": '59',
     "PC_NETGAME_TXN_REASON_OFURN_RATE": '60',
     "PC_NETGAME_TXN_REASON_OFURN_GONE": '61',
+    # outdoor furniture C3 (deliberate, v8 extended in place): reason 62 OFURN_NOT_EMPTY (a PICKUP of a placed storage piece whose outdoor storage holds items);
+    # outdoor storage rides the existing DRESSER_SELECT 84 (floor 0xFC) / DRESSER_STATE 83 / kind 18 and the 102 CAPS `total` field: no new id, no layout change
+    "PC_NETGAME_TXN_REASON_OFURN_NOT_EMPTY": '62',
     "PC_NETGAME_MBOX_HOUSE_GUEST": '0xFF',
     "PC_NETGAME_HOUSE_AUTO": '0xFF',
     "PC_NETGAME_HOUSE_PRICE_DIRECT": '18400',

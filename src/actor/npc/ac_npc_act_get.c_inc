@@ -100,6 +100,11 @@ static void aNPC_act_get_chg_step(NPC_ACTOR* nactorx, u8 step) {
     }
 
     aNPC_setupAction(nactorx, next_act_idx);
+#if defined(TARGET_PC) && !defined(aNPC_NPC2)
+    if (step == aNPC_ACT_GET_STEP_GET && nactorx->action.idx == aNPC_ACT_GET) {
+        aNPC_pc_handover_note(nactorx, PC_HO_KIND_NPC_TAKES, CLIP(handOverItem_clip)->item); /* hand-over animations: the other players see it (pc_handover.h) */
+    }
+#endif
 }
 
 static void aNPC_act_get_move(NPC_ACTOR* nactorx, GAME_PLAY* play) {

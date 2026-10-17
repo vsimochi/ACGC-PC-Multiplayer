@@ -129,7 +129,8 @@ else:
                "ACTION_EXT": 96,  # worker P2 puppet ACTION_EXT (presentation only, see test_action_ext_src.py)
                "OUTDOOR_FURN": 98,  # outdoor furniture C1: host -> client only (a 0.1.1 / 0.2.x CLIENT ignores it: the client dispatcher's 'unrecognized: ignore')
                "CHAT_SEND": 100, "CHAT_MSG": 101,  # text chat (worker CH)
-               "OUTDOOR_FURN2": 102}  # outdoor furniture C2: host -> client only (an old client ignores it, O8 / O9)  # text chat (worker CH): C -> H (gated by CAPS, see K100) / H -> C (an old client's silent ignore, O8)
+               "OUTDOOR_FURN2": 102,  # outdoor furniture C2: host -> client only (an old client ignores it, O8 / O9)  # text chat (worker CH): C -> H (gated by CAPS, see K100) / H -> C (an old client's silent ignore, O8)
+               "HANDOVER": 103}  # hand-over animations: C -> H (villager) / H -> C (shop keeper relay): an old host / client ignores it (O1 / O8)
     enum_re = r"^\s*PC_NETGAME_MSG_(\w+)\s*=\s*(\d+)\s*,"
     old_ids = {k: int(v) for k, v in re.findall(enum_re, old, re.M)}
     cur_ids = {k: int(v) for k, v in re.findall(enum_re, ng, re.M)}
@@ -175,6 +176,14 @@ else:
        "case PC_OFURN_OP_PICKUP:" in v030o and "PC_OFURN_OP_MOVE" not in v030o and "malformed OUTDOOR_FURNITURE TXN_COMMIT (BAD_SHAPE)" in v030)
     ck("O11 a 0.3.0 host loads only sidecar version 1 (a v2 file is refused as corrupt, never misread as 1x1 markers)",
        "hdr[1] != PC_OFURN_FILE_VERSION" in v030o)
+    # C3 (outdoor storage): no new id; the outdoor SELECT is message 84 with floor 0xFC, reason 62 a new value of the existing TXN_RESULT reason byte
+    cf3 = body(v030, "static uint16_t pcnetgame_dresser_cell_ftr(int h, int floor, int layer, int ut_x, int ut_z) {")
+    ck("O12 a 0.3.0 HOST never answers an outdoor SELECT (floor 0xFC is no house floor: its cell lookup returns 0 -> 'refused', no STATE); a C3 client sends one only after "
+       "the C3 bit of the 102 CAPS (which a 0.3.0 host never sends)",
+       "floor >= mHm_ROOM_NUM" in cf3 and "not a furniture of that id in its own house" in v030 and not re.search(r"PC_NETGAME_MSG_\w+\s*=\s*102", v030))
+    ck("O13 a 0.3.0 CLIENT never sends floor 0xFC (its select takes floors 0..2) and shows reason 62 with its generic refusal line (pc_ofurn_reason_text default)",
+       "floor < 0 || floor > 2" in body(v030, "int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr_item) {")
+       and 'default: return "That didn\'t work - try again";' in v030o)
 
 print("-" * 60)
 n = sum(1 for _d, ok in results if ok)

@@ -19,6 +19,7 @@
 #ifdef TARGET_PC
 #include "pc_bswap.h"
 #include "pc_net_game.h" /* indoor villager sync -- pc_net_game_room_npc_sample()/_follow() */
+#include "pc_handover.h" /* hand-over animations: an in-room hand-over of another player's talk is shown (ac_npc2_move.c_inc) */
 #endif
 
 #define aNPC_UNIT_RIGHT (1 << 0)

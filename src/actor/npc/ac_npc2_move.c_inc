@@ -334,8 +334,8 @@ static int aNPC_pc_room_follow(NPC_ACTOR* nactorx, ACTOR* actorx, GAME_PLAY* pla
     actorx->world.angle.y = angle;
     actorx->speed = 0.0f;
     desired = (act < aNPC_ACTION_TYPE_NUM) ? act : (u8)(moving ? aNPC_ACTION_TYPE_WALK : aNPC_ACTION_TYPE_WAIT);
-    if (other_talking) {
-        desired = aNPC_ACTION_TYPE_WAIT; /* another player is talking to it: it stands there, facing as the talker's process has it */
+    if (other_talking && !(pc_handover_enabled() && desired >= aNPC_ACTION_TYPE_TRANS_MOVE && desired <= aNPC_ACTION_TYPE_ESTIMATE_F)) {
+        desired = aNPC_ACTION_TYPE_WAIT; /* another player is talking to it: it stands there, facing as the talker's process has it (a hand-over of that talk is shown: pc_handover.h) */
     }
     if (nactorx->condition_info.action != desired) {
         aNPC_setupAction(nactorx, desired);

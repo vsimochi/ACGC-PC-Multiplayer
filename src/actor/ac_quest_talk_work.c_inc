@@ -3,17 +3,28 @@
  * A villager the character's current job points at (pc_net_game_work_villager_pending) takes this talk kind instead of the normal one: the villager's usual hello plays, and while it
  * is on screen the matching work transaction is sent to the HOST (op 5 = the villager hands over the item of a FETCH job, op 6 = the parcel of a DELIVER job is handed to its
  * recipient and the optional tip is paid). When the host answers, the continue message of the hello becomes the matching generated row (pc_nook_house.c) and the conversation ends
- * with it. Nothing here decides anything: the pocket / wallet change is the host's post-image (pcnetgame_txn_apply_work) and a refusal shows "I do not know what this is about". */
+ * with it. Nothing here decides anything: the pocket / wallet change is the host's post-image (pcnetgame_txn_apply_work) and a refusal shows "I do not know what this is about".
+ * Hand-over animations (pc_handover.h, ON by default): an APPLIED op then plays the VANILLA hand-over while the hello waits at its end (the message is locked, as in vanilla):
+ * op 5 = the villager hands the item to the player (the quest manager's own "npc takeout" demo order -> aNPC_ACT_TRANS -> the player's RECIEVE states), op 6 = the player hands
+ * the parcel over (mPlib_request_main_give_type1 -> GIVE / GIVE_WAIT -> the villager's aNPC_ACT_GET), then an ITEM tip comes back the same way as op 5. Presentation only: the
+ * pockets already hold the host's post-image; a refusal plays nothing; a hand-over that does not start / end in time is abandoned (the message is unlocked). */
 enum {
     aQMgr_WORK_STEP_START,
     aQMgr_WORK_STEP_BEGIN,
     aQMgr_WORK_STEP_PENDING,
-    aQMgr_WORK_STEP_FINISH
+    aQMgr_WORK_STEP_FINISH,
+    aQMgr_WORK_STEP_HAND
 };
 
 static int l_work_op;
 static int l_work_npc;
 static PCWorkView l_work_view;
+static int l_work_ho_n, l_work_ho_idx, l_work_ho_started, l_work_ho_ordered;
+static int l_work_ho_kind[2], l_work_ho_item[2];
+static PCHoWait l_work_ho_wait;
+
+static int aQMgr_talk_common_set_npc_takeout(mActor_name_t item); /* ac_quest_manager.c */
+static int aQMgr_set_npc_putaway(void);                           /* ac_quest_manager.c */
 
 static void aQMgr_work_show(QUEST_MANAGER_ACTOR* manager, int ok) {
     int msg = ok ? (l_work_op == PC_WORK_OP_VILLAGER_GIVE ? PC_NOOK_MSG_WORK_V_GIVE : PC_NOOK_MSG_WORK_V_RECEIVE) : PC_NOOK_MSG_WORK_V_FAIL;
@@ -22,6 +33,64 @@ static void aQMgr_work_show(QUEST_MANAGER_ACTOR* manager, int ok) {
     manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
     manager->talk_step = aQMgr_WORK_STEP_FINISH;
     printf("[NET][WORK] villager talk: npc 0x%04X op %d %s -> row %d\n", l_work_npc, l_work_op, ok ? "APPLIED" : "refused", msg);
+    l_work_ho_n = pc_handover_enabled() ? pc_ho_work_plan(l_work_op, ok, l_work_view.obj_item, l_work_view.carried_item, l_work_view.tip_kind, (int)l_work_view.tip_value,
+                                                          l_work_ho_kind, l_work_ho_item)
+                                        : 0;
+    if (l_work_ho_n > 0) {
+        l_work_ho_idx = 0;
+        l_work_ho_started = FALSE;
+        mMsg_Set_LockContinue(mMsg_Get_base_window_p()); /* the hello waits at its end until the hand-over is over (vanilla: aHOI_birth_proc locks it too) */
+        manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+        manager->talk_step = aQMgr_WORK_STEP_HAND;
+    }
+}
+
+/* one frame of the Work Mode hand-over(s); TRUE = all of them are over */
+static int aQMgr_work_hand(void) {
+    aHOI_Clip_c* hoi = CLIP(handOverItem_clip);
+    int kind = l_work_ho_kind[l_work_ho_idx];
+    mActor_name_t item = (mActor_name_t)l_work_ho_item[l_work_ho_idx];
+    int r;
+
+    if (hoi == NULL) {
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return TRUE;
+    }
+    if (!l_work_ho_started) {
+        if (hoi->master_actor != NULL) {
+            return FALSE; /* a previous hand-over is still finishing */
+        }
+        if (kind == PC_HO_KIND_NPC_GIVES) {
+            aQMgr_talk_common_set_npc_takeout(item); /* the vanilla order: the villager takes the item out and holds it to the player (aNPC_ACT_TRANS) */
+        } else {
+            mPlib_request_main_give_type1(gamePT, item, aHOI_REQUEST_PUTAWAY, FALSE, FALSE); /* the player holds the parcel out (GIVE) */
+        }
+        pc_ho_wait_start(&l_work_ho_wait);
+        l_work_ho_started = TRUE;
+        l_work_ho_ordered = FALSE;
+        printf("[NET][HANDOVER] work villager talk: npc 0x%04X hand-over %d/%d %s item 0x%04X started\n", l_work_npc, l_work_ho_idx + 1, l_work_ho_n,
+               kind == PC_HO_KIND_NPC_GIVES ? "villager -> player" : "player -> villager", (unsigned)item);
+    }
+    mMsg_Set_LockContinue(mMsg_Get_base_window_p());
+    if (kind == PC_HO_KIND_NPC_TAKES && !l_work_ho_ordered && hoi->request_mode == aHOI_REQUEST_TRANS_WAIT) {
+        l_work_ho_ordered = aQMgr_set_npc_putaway(); /* the player holds it out: the villager takes it (the vanilla order: aNPC_ACT_GET) */
+    }
+    r = pc_ho_wait_tick(&l_work_ho_wait, hoi->master_actor != NULL, mPlib_check_player_actor_main_index_RecieveMove(gamePT),
+                        (float)gamePT->graph->dt_num_60fps_frames);
+    if (r == PC_HO_WAIT_RUNNING) {
+        return FALSE;
+    }
+    printf("[NET][HANDOVER] work villager talk: npc 0x%04X hand-over %d/%d %s\n", l_work_npc, l_work_ho_idx + 1, l_work_ho_n,
+           r == PC_HO_WAIT_DONE ? "done" : "TIMEOUT (abandoned, the message is unlocked)");
+    if (r == PC_HO_WAIT_TIMEOUT) {
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 3, 0); /* an order nobody took */
+    }
+    l_work_ho_started = FALSE;
+    if (++l_work_ho_idx < l_work_ho_n && r == PC_HO_WAIT_DONE) {
+        return FALSE;
+    }
+    mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+    return TRUE;
 }
 
 extern void aQMgr_talk_work_init(QUEST_MANAGER_ACTOR* manager) {
@@ -32,6 +101,7 @@ extern void aQMgr_talk_work_init(QUEST_MANAGER_ACTOR* manager) {
             Animal_c* animal = (client != NULL && client->part == ACTOR_PART_NPC) ? ((NPC_ACTOR*)client)->npc_info.animal : NULL;
             l_work_op = 0;
             l_work_npc = animal != NULL ? (int)animal->id.npc_id : 0;
+            l_work_ho_n = 0;
             if (animal == NULL || !pc_net_game_work_villager_pending(l_work_npc, &l_work_op) || !pc_net_game_work_view(&l_work_view)) {
                 (*manager->talk_common_proc)(manager, aQMgr_TALK_COMMON_CHANGE_TALK_NORMAL); /* nothing to do any more: the villager's normal talk */
                 manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
@@ -60,6 +130,14 @@ extern void aQMgr_talk_work_init(QUEST_MANAGER_ACTOR* manager) {
                 manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
             } else {
                 aQMgr_work_show(manager, r == PC_NETGAME_TS_OP_APPLIED);
+            }
+            break;
+        case aQMgr_WORK_STEP_HAND:
+            if (aQMgr_work_hand()) {
+                manager->talk_step = aQMgr_WORK_STEP_FINISH; /* the hello continues to the row as before */
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+            } else {
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
             }
             break;
         default: /* FINISH: the generated row ends the conversation by itself */

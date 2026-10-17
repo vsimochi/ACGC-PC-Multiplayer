@@ -65,6 +65,11 @@ static void aNPC_act_trans_chg_step(NPC_ACTOR* nactorx, u8 step) {
     nactorx->movement.demo_move_timer = timer;
     nactorx->action.step = step;
     aNPC_setupAction(nactorx, act_idx[step]);
+#if defined(TARGET_PC) && !defined(aNPC_NPC2)
+    if (step == aNPC_ACT_TRANS_STEP_TRANS || step == aNPC_ACT_TRANS_STEP_TRANS_F) {
+        aNPC_pc_handover_note(nactorx, PC_HO_KIND_NPC_GIVES, nactorx->left_hand.item); /* hand-over animations: the other players see it (pc_handover.h) */
+    }
+#endif
 }
 
 static void aNPC_act_trans_set_arg_data(NPC_ACTOR* nactorx) {

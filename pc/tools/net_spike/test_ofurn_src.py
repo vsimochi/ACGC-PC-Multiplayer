@@ -181,10 +181,67 @@ ck("C2P1 the player's HOLD / ROTATE states ask the PC outdoor judge only when th
    and "Common_Get(clip).my_room_clip != NULL ? Common_Get(clip).my_room_clip->judge_player_action_proc : pc_ofurn_grab_judge;" in hr)
 gj = body(dr, "int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no) {")
 ck("C2P2 the outdoor judge answers 0 without an outdoor grab / for another ftr_no, releases on A up, 16-frame push / pull timers, rotation re-armed by a neutral stick",
-   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end("A released");' in gj and "s_grab.push_t > 16.0f" in gj and "s_grab.pull_t > 16.0f" in gj
-   and "s_grab.allow_rot = 1;" in gj)
+   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end(opens ? "A tapped (open)" : "A released");' in gj and "s_grab.push_t > 16.0f" in gj
+   and "s_grab.pull_t > 16.0f" in gj and "s_grab.allow_rot = 1;" in gj)
+fp = body(dr, "int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger) {")
 ck("C2P3 the grab enters the REAL hold state (mPlib_request_main_hold_type1); A in front = grab, B = pick up (vanilla: B picks furniture up)",
-   "mPlib_request_main_hold_type1(game, PCOG_FTR_NO, (face + 2) & 3, &pos)" in dr and "a_trigger ? pc_ofurn_grab_try(game, pl, ux, uz) : pc_net_game_ofurn_pickup(ux, uz)" in dr)
+   "mPlib_request_main_hold_type1(game, PCOG_FTR_NO, (face + 2) & 3, &pos)" in dr and "r = pc_net_game_ofurn_pickup(ux, uz);" in fp and "r = pc_ofurn_grab_try(game, pl, ux, uz);" in fp)
+
+# ---- C3: outdoor storage + the place / pickup animations
+dsh = rd(PC, "include", "pc_dresser_store.h")
+dsc = rd(PC, "src", "pc_dresser_store.c")
+pf = rd(ROOT, "src", "game", "m_player_main_pickup_furniture.c_inc")
+hq = body(ng, "static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGameDresserQueryMsg* q) {")
+hdt = body(ng, "static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {")
+ck("C3K1 the outdoor key is the SAME 16-byte dresser key (no sidecar format change: PCDresserRec v3 616 B): town sentinel owner, floor 0xFC, layer 0, the origin, the base id",
+   "#define PC_DRESSER_OUTDOOR_FLOOR 0xFCu" in dsh and "#define PC_DRESSER_VERSION    3u" in dsh and "sizeof(PCDresserRec) == 616" in dsc
+   and "pc_dresser_key_make(key, s_town_owner8, (int)PC_DRESSER_OUTDOOR_FLOOR, 0, ut_x, ut_z, (uint16_t)(ftr_item & ~3u));" in dsc)
+ck("C3K2 shared records are applied without the RECORD-level nonce fence (several residents at one piece); house records keep it",
+   "if (!shared && (nonce_fenced(r, t->nonce)" in dsc and "outdoor ? pc_dresser_store_apply_shared(&s_dresser, key, &dt, &res) : pc_dresser_store_apply(&s_dresser, key, &dt, &res)" in hdt)
+ck("C3W1 no new message id / no layout change: an outdoor SELECT is message 84 with floor 0xFC (8 bytes asserted), validated against the LIVE marker + a resident next to it",
+   "sizeof(PCNetGameDresserQueryMsg) == 8" in ng and "if (q->floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR) {" in hq and "pcnetgame_ofurn_storage_select_ok(peer, (int)q->ut_x, (int)q->ut_z, base, &why)" in hq
+   and all(x in blk for x in ("pcnetgame_ofurn_peer_is_resident(peer)", "pcnetgame_ofurn_tiles_match(&s_ofh.m[k], NULL, NULL, NULL)", "PC_NETGAME_CTX_FLAG_IN_TOWN",
+                              "*why = \"the requester is not next to the piece\";")))
+ck("C3W2 the capability is the 102 CAPS `total` bit 0 (a C2 client reads only count + flags of CAPS); a C3 client never sends floor 0xFC to a host without it",
+   "m.total = pcnetgame_ofurn_c3_flags();" in blk and "s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE;" in blk and "(s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) == 0u" in blk
+   and "return m->count == 0 && (m->flags & ~PC_OFURN_C2_ALL) == 0u;" in pof)
+ck("C3W3 kind 18 for an outdoor key: the house scene / owner check skipped, the marker + nearness re-verified at every commit, journal replay over the town prefix",
+   "if (!any_scene && !outdoor) {" in hdt and "pcnetgame_ofurn_storage_select_ok(peer, (int)sel->ut_x, (int)sel->ut_z, sel->ftr_base, &why);" in hdt
+   and "pcnetgame_dresser_peek_town(&dt, &res)" in hdt)
+ck("C3H1 reason 62 OFURN_NOT_EMPTY: kind 22 PICKUP, the host's own pickup and a vanilla PICKUP_REQUEST (a 0.3.0 client) of a non-empty storage piece are refused",
+   "#define PC_NETGAME_TXN_REASON_OFURN_NOT_EMPTY   62u" in ng and "reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_NOT_EMPTY;" in ht
+   and "pcnetgame_ofurn_storage_count(&s_ofh.m[idx]) > 0" in body(ng, "int pcnetgame_ofurn_pickup_gate(PCNetPeerId peer, int ut_x, int ut_z, uint16_t raw, uint16_t* granted) {")
+   and "pc_ofurn_reason_text(PC_OFURN_REASON_NOT_EMPTY)" in body(ng, "int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {"))
+rs = body(ng, "static int pcnetgame_ofurn_commit_reshape(int idx, int rot, int nox, int noz) {")
+ck("C3H2 a MOVE re-keys the storage BEFORE the marker / tiles (write-ahead, undone on a failure); a ROTATE keeps the key (rotation masked); a conflicting destination is BAD_TILE",
+   rs.index("pcnetgame_ofurn_storage_rekey(&before, nox, noz)") < rs.index("pcnetgame_ofurn_host_save()") and "pcnetgame_ofurn_storage_rekey(&after, (int)before.ut_x, (int)before.ut_z);" in rs
+   and "pcnetgame_ofurn_storage_dst_ok(mk, *nox, *noz)" in body(ng, "static uint8_t pcnetgame_ofurn_check_move(int idx, int dir, int pull, int pux, int puz, int* nox, int* noz, const char** why) {"))
+sw = body(ng, "static void pcnetgame_ofurn_storage_sweep(void) {")
+ck("C3H3 a record whose piece is gone is ORPHANED (items kept), an empty one dropped; never with an unusable marker table; re-attach on PLACE / SELECT by id",
+   "if (s_ofh_state != 1 || s_dresser_state != 1) {" in sw and "pc_dresser_store_set_orphan(&s_dresser, key, 1);" in sw and "pc_dresser_store_drop_empty(&s_dresser, key)" in sw
+   and "pcnetgame_ofurn_storage_reattach(&mk);" in body(ng, "static int pcnetgame_ofurn_commit_place(int ux, int uz, uint16_t item, int rot, int placer_kind, const uint8_t* key, const char* name) {")
+   and "pcnetgame_ofurn_storage_sweep(); /* C3" in body(ng, "static void pcnetgame_ofurn_host_tick(void) {"))
+cr = body(ng, "static int pcnetgame_ofurn_console_remove(int i, int del, void (*out)(const char*)) {")
+ck("C3H4 the console: `furniture remove` / `clear` of a storage piece holding items is REFUSED unless `delete` (then the storage is orphaned, never lost)",
+   "if (stored > 0 && !del) {" in cr and "FURNITURE REMOVE REFUSED" in cr and "pcnetgame_ofurn_storage_sweep(); /* orphaned now" in cr)
+ck("C3H5 switches: outdoor storage needs the dresser feature (AC_MP_DRESSER_STORAGE) and outdoor furniture not killed (AC_MP_OUTDOOR_FURNITURE=0)",
+   "return !pcnetgame_ofurn_env_off() && pcnetgame_dresser_host_ready();" in blk)
+ck("C3C1 the open gesture = the vanilla one: A grabs, a release before 14 frames (233 ms) without a step opens a storage piece; a step sets `stepped`",
+   "#define PC_OFURN_TAP_MS 233u" in hdr and "return is_storage && !stepped && held_ms < PC_OFURN_TAP_MS;" in pof and "pc_ofurn_open_request(&tapped);" in gj
+   and dr.count("s_grab.stepped = 1;") == 2)
+ot = body(dr, "static void pc_ofurn_open_tick(GAME_PLAY* play) {")
+ck("C3C2 the open path: SELECT floor 0xFC, wall-clock wait (notice 12 after 500 ms, 3 s cap, one re-ask), then the gyroid overlay in dresser mode from the field; close -> pending poll -> end",
+   "pc_net_game_dresser_view_ready()" in ot and "pc_dresser_ui_begin(van);" in ot and "mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0);" in ot
+   and "pc_net_game_dresser_open_wait_notice(1);" in ot and "PC_OFURN_OPEN_TIMEOUT_MS" in ot and "pc_dresser_ui_poll();" in ot and "pc_dresser_ui_end();" in ot)
+ck("C3A1 PLACE: the vanilla KAGU_HAPPA leaf (item icon) for the local placer, the 46-frame wait, then the birth wobble (pure curve) + ITEM_HORIDASHI + dust x4 (aMR_FtrBirth)",
+   "eEC_EFFECT_KAGU_HAPPA" in dr and "aMR_PC_ItemIconNo(" in dr and "#define PC_OFURN_BIRTH_WAIT_MS  767u" in dr and "NA_SE_ITEM_HORIDASHI" in dr
+   and "pc_ofurn_birth_step(&s->birth, dt, &sxz, &sy)" in dr and "eEC_EFFECT_DUST" in dr and "[NET][OFURN] place anim contact" in dr)
+ck("C3A2 PICKUP: the vanilla PICKUP_FURNITURE state 32 (outdoors: no pocket put-in, no exchange, no room leaf) + the bye shrink; a refusal brings the piece back",
+   "int mPlib_PC_request_pickup_furniture_outdoor(GAME* game, mActor_name_t item, const xyz_t* item_pos) {" in pf and "if (Common_Get(clip).my_room_clip == NULL) {" in pf
+   and pf.count("#ifdef TARGET_PC") >= 3 and "pc_ofurn_bye_scale(s->bye_frames)" in dr and "[NET][OFURN] pickup anim contact" in dr and "s->anim = 2;\n        pc_ofurn_birth_init(&s->birth);" in dr)
+ck("C3A3 observers: the 102 SET / DEL (98 with a C1 host; the listen host's own broadcast) queue the birth / bye of that piece",
+   blk.count("pc_ofurn_anim_note(m->kind == PC_OFURN_MK_SET ? PC_OFURN_ANIM_BIRTH : PC_OFURN_ANIM_BYE") == 2
+   and "pc_ofurn_anim_note(kind == PC_OFURN_MK_SET ? PC_OFURN_ANIM_BIRTH : PC_OFURN_ANIM_BYE" in bc)
 ck("C2P4 a refused step snaps the model back (rollback) with the vanilla bubu puff / a notice; no furniture behaviour code outdoors (no move_proc, no my_room_clip)",
    "pc_ofurn_pres_rollback();" in dr and "eEC_EFFECT_BUBU" in dr and "move_proc" not in dr_code and "my_room_clip" not in dr_code)
 ck("C2P5 the renderer draws at the footprint's model position (2x2 on the shared corner) and slides remote moves (102 MOVE)",
@@ -195,6 +252,9 @@ rm = rd(ROOT, "docs", "multiplayer-guest-roadmap.md")
 cc = rd(ROOT, "docs", "console-commands.md")
 td = rd(ROOT, "TODO.md")
 ck("DOC2 the roadmap has the C2 design section", "Outdoor furniture C2" in rm)
+ck("DOC3 the roadmap has the C3 section (storage + animations, the controls table), TODO.md lists C3, console-commands.md documents the storage refusal of `furniture remove`",
+   "## Outdoor furniture C3: storage and place/pickup animations" in rm and "A **tap** (released < 233 ms" in rm and "Outdoor furniture C3" in td
+   and "A storage piece whose outdoor storage holds items is REFUSED" in cc)
 ck("DOC the roadmap has the C1 design section, console-commands.md documents ops / op / deop / furniture, TODO.md (repo root) lists C1 + what C2 / C3 still need",
    "Outdoor furniture (C1) and the operator list" in rm and "`op <player>`" in cc and "`furniture list" in cc and "Outdoor furniture" in td)
 

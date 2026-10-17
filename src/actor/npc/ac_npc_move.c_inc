@@ -1497,6 +1497,53 @@ static void aNPC_actor_move_show_after(ACTOR* actorx, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* HOST, hand-over animations (pc_handover.h): a client talking to this (talk-held) villager reported a hand-over (message 103); play the matching
+ * action types here so NPC_MOVE's action_type shows them to every other client. Presentation only; the previous action is restored at the end. */
+static void aNPC_pc_host_handover_tick(NPC_ACTOR* nactorx, GAME* game) {
+    static const u8 act_n[] = { aNPC_ACTION_TYPE_WAIT, aNPC_ACTION_TYPE_TRANSFER, aNPC_ACTION_TYPE_TRANSFER_WAIT, aNPC_ACTION_TYPE_GET, aNPC_ACTION_TYPE_GET_PULL, aNPC_ACTION_TYPE_GET_PUTAWAY };
+    static const u8 act_f[] = { aNPC_ACTION_TYPE_WAIT, aNPC_ACTION_TYPE_TRANSFER_F, aNPC_ACTION_TYPE_TRANSFER_F_WAIT, aNPC_ACTION_TYPE_GET_F, aNPC_ACTION_TYPE_GET_PULL_F, aNPC_ACTION_TYPE_GET_PUTAWAY_F };
+    static u8 s_saved[ANIMAL_NUM_MAX];
+    static u8 s_saved_valid[ANIMAL_NUM_MAX];
+    int slot = aNPC_get_animal_idx(nactorx);
+    int changed = 0, fish = 0, st;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    st = pc_net_game_host_handover_step(slot, (int)nactorx->npc_info.animal->id.npc_id, nactorx->draw.main_animation_state == cKF_STATE_STOPPED,
+                                        (float)game->graph->dt_num_60fps_frames, &changed, &fish);
+    if (st == PC_HO_ST_NONE) {
+        return;
+    }
+    if (st == PC_HO_ST_DONE) {
+        if (s_saved_valid[slot]) {
+            aNPC_setupAction(nactorx, s_saved[slot]);
+            s_saved_valid[slot] = FALSE;
+        }
+        return;
+    }
+    if (!s_saved_valid[slot]) {
+        s_saved[slot] = nactorx->condition_info.action;
+        s_saved_valid[slot] = TRUE;
+    }
+    if (changed || nactorx->condition_info.action != (fish ? act_f[st] : act_n[st])) {
+        aNPC_setupAction(nactorx, fish ? act_f[st] : act_n[st]);
+    }
+}
+
+/* every role, hand-over animations: this (town) villager starts a VANILLA hand-over with the local player (aNPC_ACT_TRANS / aNPC_ACT_GET, any talk:
+ * gifts, trades, quests, Work Mode). A READY client reports it to the host (message 103) so the other players see the villager do it. */
+static void aNPC_pc_handover_note(NPC_ACTOR* nactorx, int kind, mActor_name_t item) {
+    int slot = aNPC_get_animal_idx(nactorx);
+
+    if (slot < 0 || nactorx->npc_info.animal == NULL || item == EMPTY_NO) {
+        return;
+    }
+    pc_net_game_handover_local(PC_HO_CLASS_VILLAGER, slot, (int)nactorx->npc_info.animal->id.npc_id, kind, (int)item, ITEM_IS_FISH(item) == TRUE);
+}
+#endif
+
 static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
@@ -1547,6 +1594,11 @@ static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
     {
         aNPC_angle_calc(nactorx);
     }
+#ifdef TARGET_PC
+    if (pc_talk_held) {
+        aNPC_pc_host_handover_tick(nactorx, game); /* hand-over animations: a client's hand-over with this held villager, shown through NPC_MOVE */
+    }
+#endif
     aNPC_calc_fatigue(nactorx, play);
     aNPC_actor_move_show_after(actorx, game);
 

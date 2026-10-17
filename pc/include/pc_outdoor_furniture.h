@@ -36,6 +36,31 @@ extern "C" {
 #define PC_OFURN_REASON_LIMIT       59 /* the technical safety ceiling (outdoor_furniture_max_town / _max_acre) */
 #define PC_OFURN_REASON_RATE        60 /* anti-spam rate limit (generous) */
 #define PC_OFURN_REASON_GONE        61 /* the placed piece is no longer there / changed (ROTATE / PICKUP) */
+#define PC_OFURN_REASON_NOT_EMPTY   62 /* C3: a PICKUP of a placed STORAGE piece whose outdoor storage still holds items ("Take the stored items out first") */
+
+/* ---- C3: outdoor storage + the place / pickup animations (docs/multiplayer-guest-roadmap.md "Outdoor furniture C3") ----
+ * The host announces outdoor storage in the 102 CAPS message's `total` field (a C2 client checks only count + flags of a CAPS message, so the field was free):
+ * bit 0 = a placed storage piece can be opened (DRESSER_SELECT floor 0xFC; pc_dresser_store.h). A C3 client never sends an outdoor SELECT to a host without it. */
+#define PC_OFURN_C3_STORAGE 0x01u
+/* the open gesture (the vanilla one: ac_my_room_move.c_inc aMR_ManageMoveBottun): A grabs at once; releasing A before the switch timer reached 14 (60 Hz) frames
+ * without a push / pull / rotate step = the TAP that opens a storage piece; held longer = a plain grab. Wall clock here (the PC renders uncapped). */
+#define PC_OFURN_TAP_MS 233u
+int pc_ofurn_tap_opens(uint32_t held_ms, int stepped, int is_storage); /* 1 = this A release opens the storage */
+/* the vanilla furniture BIRTH (aMR_FtrBirth, ac_my_room_move.c_inc): a squash-and-stretch wobble: counter += step * dt (binangle), scale_y = 1 + sin(counter) * mod,
+ * scale_xz = 1 - sin(counter) * mod; at every half-turn mod *= 0.4 and step += 1500; done when |mod| < 0.02 (starts: mod 0.5, step 6000). The BIRTH starts after the
+ * reserve wait of 46 frames (aMR_ReserveFurniture). Dust at 2 and 6 frames into the birth. */
+#define PC_OFURN_BIRTH_WAIT_FRAMES 46
+typedef struct PCOfurnBirth {
+    float counter_f; /* binangle accumulator (-32768..32768) */
+    float mod;
+    int   step;
+    float frames;    /* 60 Hz frames since the birth started */
+    int   done;
+} PCOfurnBirth;
+void pc_ofurn_birth_init(PCOfurnBirth* b);
+int  pc_ofurn_birth_step(PCOfurnBirth* b, float dt, float* sxz, float* sy); /* advances by dt 60 Hz frames; 1 = still wobbling, 0 = done (scale 1) */
+/* the vanilla furniture BYE (aMR_FtrBye): scale -= 1/12 a frame; below 0.25 it is 0 (gone). frames = 60 Hz frames since the pickup started. */
+float pc_ofurn_bye_scale(float frames);
 
 /* ---- safety ceiling (NOT a gameplay limit: protects the renderer / collision / save), configurable in settings.ini [Network] ---- */
 #define PC_OFURN_TOWN_MAX_DEFAULT 512
@@ -226,6 +251,14 @@ int      pc_net_game_ofurn_rotate_to(int ut_x, int ut_z, int rot);              
 int      pc_net_game_ofurn_move(int ut_x, int ut_z, int dir, int pull);                  /* 1 begun / done, 0 refused, -1 busy */
 uint32_t pc_net_game_ofurn_op_serial(void);                                              /* the handle of the op begun last */
 int      pc_net_game_ofurn_op_outcome(uint32_t serial, int* reason);                     /* 0 pending, 1 applied, 2 refused / superseded */
+/* ---- C3 seams ---- */
+#define PC_OFURN_ANIM_BIRTH 1 /* a piece appeared (PLACE / SET): the vanilla birth (local placer: the leaf flight first, the birth 46 frames after the Place) */
+#define PC_OFURN_ANIM_BYE   2 /* a piece was taken (PICKUP / DEL): the vanilla shrink */
+void pc_ofurn_anim_note(int kind, int ut_x, int ut_z, int item, int local);    /* pc_ofurn_draw.c: queue a presentation of the piece at that ORIGIN */
+int  pc_net_game_ofurn_is_storage(int item);                                    /* the vanilla item-storage profile (drawers / wardrobes / closets / chests) */
+int  pc_net_game_ofurn_storage_open_ok(const char** why);                       /* 1 = may open outdoor storage now; 0 = no (*why = the notice, NULL = silent) */
+int  pc_net_game_ofurn_storage_select(int ut_x, int ut_z, int item);            /* DRESSER_SELECT floor 0xFC of the piece's origin: the generation, 0 = not sent */
+int  aMR_PC_ItemIconNo(int item);                                               /* ac_my_room.c: the furniture leaf icon of an item (the KAGU_HAPPA effect) */
 /* a recent MOVE of the piece now at (ux, uz) holding item: its old model pose (consumed); the renderer slides the new model from there */
 int      pc_net_game_ofurn_take_slide(int ut_x, int ut_z, int item, float* x, float* z, int* rot, uint32_t* age_ms);
 /* the notice line to draw now (NULL = none) / show a line (~4 s) */

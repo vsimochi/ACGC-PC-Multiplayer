@@ -17,6 +17,7 @@
 #ifdef TARGET_PC
 #include "pc_net_game.h"
 #include "pc_nook_house.h" /* Nook Work Mode: the villager side of the errands + the generated rows */
+#include "pc_handover.h" /* hand-over animations: the Work Mode villager hands the item over / takes the parcel with the vanilla animation */
 #endif
 
 enum {

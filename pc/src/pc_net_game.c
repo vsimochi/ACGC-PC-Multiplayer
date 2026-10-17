@@ -612,6 +612,10 @@ typedef enum PCNetGameMsgType {
                                              * 98 with this id): CAPS (the host's C2 support: multi-tile + MOVE) then the list of ALL placed pieces (1x1 and multi-tile) + SET /
                                              * DEL / MOVE deltas. 98 keeps carrying the 1x1 pieces only (the 0.3.0 client's view). An old client ignores the id. See
                                              * pc_outdoor_furniture.h. */
+    PC_NETGAME_MSG_HANDOVER             = 103, /* hand-over animations (v8 extended in place, NO version bump), RELIABLE, 16 bytes: "an NPC near my player just started handing an item to
+                                             * me / taking one from me". VILLAGER: client -> host ONLY (the host plays the clip steps on its talk-held villager; NPC_MOVE's
+                                             * action_type carries them to every other client). SHOP keeper: owner -> host -> every OTHER READY peer in the owner's announced
+                                             * scene (their idle keeper plays the clip once). PRESENTATION ONLY. Old peers ignore the id. See PCHandoverMsg / pc_handover.h. */
 } PCNetGameMsgType;
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID, "OUTDOOR_FURN id drifted (pc_outdoor_furniture.h)");
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN2 == (int)PC_OFURN_MSG2_ID, "OUTDOOR_FURN2 id drifted (pc_outdoor_furniture.h)");
@@ -2736,6 +2740,8 @@ _Static_assert(PC_NETGAME_PDATA_DIARY_SIZE == (uint32_t)PC_M_CARD_DIARY_SLOT_SIZ
 #define PC_NETGAME_TXN_REASON_OFURN_LIMIT       59u
 #define PC_NETGAME_TXN_REASON_OFURN_RATE        60u
 #define PC_NETGAME_TXN_REASON_OFURN_GONE        61u
+#define PC_NETGAME_TXN_REASON_OFURN_NOT_EMPTY   62u /* C3: a PICKUP of a placed storage piece whose outdoor storage holds items */
+_Static_assert(PC_NETGAME_TXN_REASON_OFURN_NOT_EMPTY == PC_OFURN_REASON_NOT_EMPTY, "the C3 outdoor furniture reason drifted (pc_outdoor_furniture.h)");
 _Static_assert(PC_NETGAME_TXN_REASON_OFURN_OFF == PC_OFURN_REASON_OFF && PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED == PC_OFURN_REASON_NOT_ALLOWED &&
                    PC_NETGAME_TXN_REASON_OFURN_TOO_BIG == PC_OFURN_REASON_TOO_BIG && PC_NETGAME_TXN_REASON_OFURN_BAD_TILE == PC_OFURN_REASON_BAD_TILE &&
                    PC_NETGAME_TXN_REASON_OFURN_LIMIT == PC_OFURN_REASON_LIMIT && PC_NETGAME_TXN_REASON_OFURN_RATE == PC_OFURN_REASON_RATE &&
@@ -10282,6 +10288,229 @@ static void pcnetgame_aext_tick(void) {
     }
 }
 /* ===== PUPPET ACTION_EXT END ===== */
+
+/* ===== HAND-OVER ANIMATIONS BEGIN (PC_NETGAME_MSG_HANDOVER = 103, PRESENTATION ONLY; pc_handover.h) =====
+ * The LOCAL hand-over is the vanilla machinery (handOverItem actor, the NPC's TRANS / GET actions, the player's states 66-71); the seams that start it
+ * live in the actor code (ac_quest_talk_work.c_inc, ac_npc_shop_common.c) and report it here through pc_net_game_handover_local():
+ *   VILLAGER: a READY client sends 103 to the host; the host (which holds that villager still for the client's conversation) plays the clip steps on
+ *             ITS actor (ac_npc_move.c_inc aNPC_pc_host_handover_tick -> pc_net_game_host_handover_step), so NPC_MOVE's action_type shows them to
+ *             every other client. The host checks: READY sender, well-formed, rate, the sender holds that villager's talk lease (same npc_id).
+ *   SHOP:     the owner's 103 goes to the host, which relays it to every OTHER READY peer in the owner's announced scene (and shows it itself when its
+ *             own player stands in that scene); there an idle keeper with that npc_id plays the steps once (pc_net_game_shop_handover_step).
+ * Nothing here touches pockets, wallets, jobs or the dialogue. */
+#include "pc_handover.h"
+_Static_assert(PC_HO_MSG_ID == (unsigned)PC_NETGAME_MSG_HANDOVER, "HANDOVER id");
+_Static_assert(sizeof(PCHandoverMsg) == 16 && sizeof(PCHandoverMsg) <= PC_NET_MAX_PAYLOAD, "PCHandoverMsg wire size drifted");
+
+static uint16_t s_ho_seq = 0;
+static uint32_t s_ho_log_n = 0;
+static PCHoRate s_ho_rate[256];                    /* host: per wire id 0..255 (presentation-only rate limit; a reused id simply inherits a short window) */
+static PCHoScript s_ho_host_script[ANIMAL_NUM_MAX]; /* host: the clip script of each talk-held villager */
+static uint32_t s_ho_host_script_ms[ANIMAL_NUM_MAX];
+static PCHoScript s_ho_shop_script;                 /* every process: the one shop keeper script (an observer's view) */
+static uint32_t s_ho_shop_script_ms = 0;
+static struct {
+    uint32_t local, sent, host_rx, relayed, client_rx, rejected, host_scripts, shop_scripts;
+} s_ho_stats;
+
+int pc_handover_enabled(void) {
+    static int s_env = -1;
+    if (s_env < 0) {
+        const char* e = getenv("AC_MP_HANDOVER_ANIM");
+        s_env = (e != NULL && e[0] == '0') ? 0 : 1; /* ON by default */
+    }
+    return s_env && g_pc_settings.handover_anim;
+}
+
+static int pcnetgame_ho_log_ok(void) {
+    return s_ho_log_n++ < 300u;
+}
+
+static const char* pcnetgame_ho_kind_name(int kind) {
+    return kind == PC_HO_KIND_NPC_GIVES ? "NPC_GIVES" : kind == PC_HO_KIND_NPC_TAKES ? "NPC_TAKES" : "?";
+}
+
+static void pcnetgame_ho_shop_start(const PCHandoverMsg* m, const char* who) {
+    if (s_ho_shop_script.active) {
+        return; /* one keeper animation at a time */
+    }
+    pc_ho_script_start(&s_ho_shop_script, (int)m->kind, m->npc_id, (m->flags & PC_HO_FL_FISH) != 0);
+    s_ho_shop_script_ms = pcnetgame_now_ms();
+    s_ho_stats.shop_scripts++;
+    if (pcnetgame_ho_log_ok()) {
+        printf("[NET][HANDOVER] %s: shop keeper 0x%04X plays %s of item 0x%04X for player %u (observer view)\n", who, (unsigned)m->npc_id, pcnetgame_ho_kind_name(m->kind),
+               (unsigned)m->item, (unsigned)m->origin);
+    }
+}
+
+/* HOST: relay a SHOP message to every OTHER READY peer in `sc` (origin stamped); show it on the host's own keeper when its player stands there. */
+static void pcnetgame_ho_host_relay_shop(int origin, const PCNetPlayerScene* sc, const PCHandoverMsg* in) {
+    PCHandoverMsg m = *in;
+    int i, n = 0;
+    m.origin = (uint8_t)origin;
+    for (i = 0; i < pcnetgame_peer_span(); i++) {
+        PCNetPlayerScene ps;
+        if (i != origin && s_host_peer_link[i] == PC_NETGAME_LINK_READY && pc_remote_player_get_scene((PCNetPlayerId)i, &ps) && pcnetgame_aext_same_scene(&ps, sc)) {
+            (void)pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+            n++;
+        }
+    }
+    s_ho_stats.relayed += (uint32_t)n;
+    if (origin != (int)PC_NETGAME_HOST_PLAYER_ID && !pc_host_observer_active() && pcnetgame_aext_same_scene(&s_local_scene, sc)) {
+        pcnetgame_ho_shop_start(&m, "host");
+    }
+    if (pcnetgame_ho_log_ok()) {
+        printf("[NET][HANDOVER] host: shop hand-over from %d (%s item 0x%04X keeper 0x%04X scene %u) -> %d peer(s)\n", origin, pcnetgame_ho_kind_name(m.kind), (unsigned)m.item,
+               (unsigned)m.npc_id, (unsigned)sc->scene_id, n);
+    }
+}
+
+void pc_net_game_handover_local(int npc_class, int slot, int npc_id, int kind, int item, int fish) {
+    PCHandoverMsg m;
+    s_ho_stats.local++;
+    if (pcnetgame_ho_log_ok()) {
+        printf("[NET][HANDOVER] local: %s %s npc 0x%04X slot %d item 0x%04X%s (role %d)\n", npc_class == PC_HO_CLASS_SHOP ? "shop keeper" : "villager", pcnetgame_ho_kind_name(kind),
+               (unsigned)(npc_id & 0xFFFF), slot, (unsigned)(item & 0xFFFF), fish ? " fish" : "", (int)s_role);
+    }
+    if (!pc_handover_enabled() || !s_local_scene.valid) {
+        return;
+    }
+    memset(&m, 0, sizeof(m));
+    m.msg_type = (uint8_t)PC_NETGAME_MSG_HANDOVER;
+    m.kind = (uint8_t)kind;
+    m.npc_class = (uint8_t)npc_class;
+    m.slot = (uint8_t)(npc_class == PC_HO_CLASS_SHOP ? PC_HO_SLOT_NONE : slot);
+    m.npc_id = (uint16_t)npc_id;
+    m.item = (uint16_t)item;
+    m.flags = (uint8_t)(fish ? PC_HO_FL_FISH : 0);
+    m.seq = ++s_ho_seq;
+    if (!pc_ho_msg_ok(&m, ANIMAL_NUM_MAX)) {
+        return;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY) {
+        if (pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m))) {
+            s_ho_stats.sent++;
+        }
+    } else if (s_role == PC_NETGAME_ROLE_HOST && npc_class == PC_HO_CLASS_SHOP && !pc_host_observer_active()) {
+        pcnetgame_ho_host_relay_shop((int)PC_NETGAME_HOST_PLAYER_ID, &s_local_scene, &m); /* the host's own player: its keeper runs the vanilla clips itself */
+    }
+    /* a host's own VILLAGER hand-over: its villager runs the vanilla actions, NPC_MOVE already carries them */
+}
+
+static void pcnetgame_handle_host_handover(PCNetPeerId peer, const PCHandoverMsg* in) {
+    PCNetPlayerScene sc;
+    const char* why = NULL;
+    if (peer < 0 || peer >= pcnetgame_peer_span() || peer > 255 || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        why = "not READY";
+    } else if (!pc_handover_enabled()) {
+        why = "hand-over animations are off on this host";
+    } else if (!pc_ho_msg_ok(in, ANIMAL_NUM_MAX)) {
+        why = "malformed";
+    } else if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) || !sc.valid) {
+        why = "no announced scene";
+    } else if (!pc_ho_rate_ok(&s_ho_rate[peer], pcnetgame_now_ms())) {
+        why = "rate";
+    } else if (in->npc_class == PC_HO_CLASS_VILLAGER) {
+        const PCNetGameNpcTalkHold* h = &s_host_talk_hold[in->slot];
+        Animal_c* a = &Save_Get(animals)[in->slot];
+        if (mNpc_CheckFreeAnimalInfo(a) || (uint16_t)a->id.npc_id != in->npc_id) {
+            why = "no such villager in that slot";
+        } else if (h->npc_id != in->npc_id || !pc_peer_set_has(&h->peer_mask, (int)peer)) {
+            why = "the sender does not hold that villager's conversation";
+        }
+    }
+    if (why != NULL) {
+        s_ho_stats.rejected++;
+        if (pcnetgame_ho_log_ok()) {
+            printf("[NET][HANDOVER] host: peer %d hand-over dropped (%s) class=%u slot=%u npc=0x%04X kind=%u\n", (int)peer, why, (unsigned)in->npc_class, (unsigned)in->slot,
+                   (unsigned)in->npc_id, (unsigned)in->kind);
+        }
+        return;
+    }
+    s_ho_stats.host_rx++;
+    if (in->npc_class == PC_HO_CLASS_SHOP) {
+        pcnetgame_ho_host_relay_shop((int)peer, &sc, in);
+        return;
+    }
+    pc_ho_script_start(&s_ho_host_script[in->slot], (int)in->kind, in->npc_id, (in->flags & PC_HO_FL_FISH) != 0);
+    s_ho_host_script_ms[in->slot] = pcnetgame_now_ms();
+    s_ho_stats.host_scripts++;
+    if (pcnetgame_ho_log_ok()) {
+        printf("[NET][HANDOVER] host: peer %d villager slot %u npc 0x%04X %s item 0x%04X -> the held villager plays it (NPC_MOVE action_type)\n", (int)peer, (unsigned)in->slot,
+               (unsigned)in->npc_id, pcnetgame_ho_kind_name(in->kind), (unsigned)in->item);
+    }
+}
+
+static void pcnetgame_handle_client_handover(const PCHandoverMsg* in) {
+    if (s_client_link != PC_NETGAME_LINK_READY || !pc_handover_enabled() || !pc_ho_msg_ok(in, ANIMAL_NUM_MAX) || in->npc_class != PC_HO_CLASS_SHOP ||
+        (in->origin != (uint8_t)PC_NETGAME_HOST_PLAYER_ID && (PCNetPlayerId)in->origin == (PCNetPlayerId)s_client_assigned_peer_id)) {
+        s_ho_stats.rejected++;
+        return; /* a villager message never comes back from the host; never our own hand-over */
+    }
+    s_ho_stats.client_rx++;
+    pcnetgame_ho_shop_start(in, "client");
+}
+
+static int pcnetgame_ho_tick_script(PCHoScript* s, uint32_t start_ms, int clip_stopped, float dt, int* changed, int* fish) {
+    int st;
+    *changed = 0;
+    *fish = s->fish;
+    if (!s->active) {
+        return PC_HO_ST_NONE;
+    }
+    if ((uint32_t)(pcnetgame_now_ms() - start_ms) > 15000u) { /* nobody ticked it (no actor): drop */
+        s->active = 0;
+        *changed = 1;
+        return PC_HO_ST_DONE;
+    }
+    st = pc_ho_script_tick(s, clip_stopped, dt, changed);
+    return st;
+}
+
+int pc_net_game_host_handover_step(int slot, int npc_id, int clip_stopped, float dt, int* changed, int* fish) {
+    PCHoScript* s;
+    int st;
+    *changed = 0;
+    *fish = 0;
+    if (s_role != PC_NETGAME_ROLE_HOST || slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return PC_HO_ST_NONE;
+    }
+    s = &s_ho_host_script[slot];
+    if (!s->active) {
+        return PC_HO_ST_NONE;
+    }
+    if ((int)s->npc_id != npc_id || !pc_net_game_host_npc_talk_held(slot, npc_id)) {
+        s->active = 0; /* the hold ended (or the slot changed hands): the villager's own code takes over again */
+        *changed = 1;
+        return PC_HO_ST_DONE;
+    }
+    st = pcnetgame_ho_tick_script(s, s_ho_host_script_ms[slot], clip_stopped, dt, changed, fish);
+    if (*changed && pcnetgame_ho_log_ok()) {
+        printf("[NET][HANDOVER] host: villager slot %d npc 0x%04X clip step %d%s\n", slot, (unsigned)npc_id, st, st == PC_HO_ST_DONE ? " (done: the previous action is restored)" : "");
+    }
+    return st;
+}
+
+int pc_net_game_shop_handover_step(int npc_id, int clip_stopped, float dt, int* changed, int* fish) {
+    int st;
+    *changed = 0;
+    *fish = 0;
+    if (!s_ho_shop_script.active) {
+        return PC_HO_ST_NONE;
+    }
+    if ((int)s_ho_shop_script.npc_id != npc_id) {
+        if ((uint32_t)(pcnetgame_now_ms() - s_ho_shop_script_ms) > 3000u) {
+            s_ho_shop_script.active = 0; /* no idle keeper with that id here */
+        }
+        return PC_HO_ST_NONE;
+    }
+    st = pcnetgame_ho_tick_script(&s_ho_shop_script, s_ho_shop_script_ms, clip_stopped, dt, changed, fish);
+    if (*changed && pcnetgame_ho_log_ok()) {
+        printf("[NET][HANDOVER] shop keeper 0x%04X clip step %d%s\n", (unsigned)npc_id, st, st == PC_HO_ST_DONE ? " (done)" : "");
+    }
+    return st;
+}
+/* ===== HAND-OVER ANIMATIONS END ===== */
 
 /* ---- Soccer ball / basketball (PC_NETGAME_MSG_BALL_STATE = 79, PC_NETGAME_MSG_BALL_KICK_REQUEST = 80; worker-2 block) ----
  * The host owns the only simulated ball (its ac_ball.c actor in the town field; a dedicated host has one through its observer
@@ -18874,6 +19103,7 @@ static const char* pcnetgame_txn_reason_name(uint8_t r) {
         case PC_NETGAME_TXN_REASON_OFURN_LIMIT: return "OFURN_LIMIT";
         case PC_NETGAME_TXN_REASON_OFURN_RATE: return "OFURN_RATE";
         case PC_NETGAME_TXN_REASON_OFURN_GONE: return "OFURN_GONE";
+        case PC_NETGAME_TXN_REASON_OFURN_NOT_EMPTY: return "OFURN_NOT_EMPTY";
         default: return "?";
     }
 }
@@ -22395,6 +22625,9 @@ static int pcnetgame_dresser_host_ready(void) {
 }
 
 extern int aMR_pc_ftr_is_item_storage(int ftr_item); /* ac_my_room.c: the vanilla DRAWERS / WARDROBE / CLOSET profile predicate */
+/* C3 outdoor storage (OUTDOOR FURNITURE block, end of this file): 1 = (ut_x, ut_z) is the origin of a live placed storage piece of `base` and the READY resident
+ * `peer` stands in the town next to it (*why = the refusal) */
+static int pcnetgame_ofurn_storage_select_ok(PCNetPeerId peer, int ut_x, int ut_z, uint16_t base, const char** why);
 
 /* v2 identity: the owner digest (8 bytes) of house h's owner PersonalID (two independent FNV-1a 32 over the whole PersonalID). */
 static void pcnetgame_dresser_owner8(int h, uint8_t out8[8]) {
@@ -22413,6 +22646,13 @@ static int pcnetgame_dresser_peek_owner(int h, const PCDresserTxn* dt, PCDresser
     }
     pcnetgame_dresser_owner8(h, owner8);
     return pc_dresser_store_peek_prefix(&s_dresser, owner8, 8, dt, res);
+}
+
+/* C3: a journalled (nonce, seq) of ANY outdoor storage record (a retry without a current selection, e.g. right after a host restart). 1 = found. */
+static int pcnetgame_dresser_peek_town(const PCDresserTxn* dt, PCDresserResult* res) {
+    uint8_t pre[PC_DRESSER_KEY_LEN];
+    pc_dresser_key_outdoor(pre, 0, 0, 0); /* only the first PC_DRESSER_KEY_PREFIX bytes (sentinel owner, floor 0xFC, layer 0) are compared */
+    return pc_dresser_store_peek_prefix(&s_dresser, pre, PC_DRESSER_KEY_PREFIX, dt, res);
 }
 
 /* The furniture id at (floor, layer, ut_x, ut_z) of the HOST's image of house h (0 = none / out of range / no such floor). */
@@ -22640,7 +22880,7 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
     PCDresserResult res;
     PCDresserRec snap;
     const PCDresserRec* cur;
-    int idx, shape_ok, had_rec, have_sel = 0;
+    int idx, shape_ok, had_rec, have_sel = 0, outdoor = 0;
     const int op = (int)t->aux_cond;
     char path[260];
 
@@ -22686,9 +22926,17 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
     {
         const PCNetGameDresserSel* sel = &s_dresser_sel[peer];
         /* the selection must belong to THIS resident (a peer id reused by another player never inherits it) and still name a dresser of its own house */
-        have_sel = sel->valid && sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) &&
-                   (int)sel->house == pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID) &&
-                   pcnetgame_dresser_cell_ftr((int)sel->house, sel->floor, sel->layer, sel->ut_x, sel->ut_z) == sel->ftr_base;
+        outdoor = sel->valid && sel->floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR;
+        if (outdoor) {
+            /* C3: an OUTDOOR storage piece: its marker still live at the selected origin (a move re-keys + needs a new SELECT) and the requester next to it in town */
+            const char* why = NULL;
+            have_sel = sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) &&
+                       pcnetgame_ofurn_storage_select_ok(peer, (int)sel->ut_x, (int)sel->ut_z, sel->ftr_base, &why);
+        } else {
+            have_sel = sel->valid && sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) &&
+                       (int)sel->house == pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID) &&
+                       pcnetgame_dresser_cell_ftr((int)sel->house, sel->floor, sel->layer, sel->ut_x, sel->ut_z) == sel->ftr_base;
+        }
         if (have_sel) {
             memcpy(key, sel->key, sizeof(key));
             pcnetgame_dresser_roll_forward(idx, slot, key);
@@ -22729,7 +22977,8 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
         }
     }
     if (have_sel ? pc_dresser_store_peek(&s_dresser, key, &dt, &res)
-                 : pcnetgame_dresser_peek_owner(pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID), &dt, &res)) {
+                 : (pcnetgame_dresser_peek_owner(pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID), &dt, &res) ||
+                    pcnetgame_dresser_peek_town(&dt, &res))) {
         /* journalled in the sidecar (a retry across a host restart, or after the in-memory ring evicted it): answered, never executed again. Without a current
          * selection (a retry right after a host restart) every dresser of the requester's house is searched. */
         if (res.outcome == PC_DRESSER_OUT_APPLIED) {
@@ -22781,7 +23030,8 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
 #ifdef PC_NET_TEST_HOOKS
         any_scene = pc_test_hook_getenv("AC_TEST_DRESSER_ANY_SCENE") != NULL; /* TEST-ONLY (AC_TEST_HOOKS=1): lets the client autopilot (standing in town) drive the real sender */
 #endif
-        if (!any_scene) {
+        /* C3: an OUTDOOR piece: the town + next-to-the-piece check ran with have_sel (pcnetgame_ofurn_storage_select_ok); no house, no owner (shared town storage) */
+        if (!any_scene && !outdoor) {
     if (!pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) || !sc.valid || sc.kind != (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE) {
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL, "dresser storage: the requester is not in a player house");
         return;
@@ -22835,7 +23085,7 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
         memset(&snap, 0, sizeof(snap));
         memcpy(snap.key, key, sizeof(snap.key));
     }
-    if (!pc_dresser_store_apply(&s_dresser, key, &dt, &res)) {
+    if (!(outdoor ? pc_dresser_store_apply_shared(&s_dresser, key, &dt, &res) : pc_dresser_store_apply(&s_dresser, key, &dt, &res))) { /* C3: a shared outdoor record */
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FAULT, 1, NULL, "dresser store full / fault");
         return;
     }
@@ -23343,8 +23593,33 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
         return;
     }
 #endif
-    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
     base = (uint16_t)(q->ftr_item & ~3u);
+    if (q->floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR) {
+        /* C3: a storage piece PLACED in the town field (pc_dresser_store.h outdoor key): the requester is a RESIDENT (above) in the town next to the piece, whose
+         * marker (origin + base id) is live in the outdoor furniture table and whose profile is item storage. One shared store per piece (no house owner). */
+        const char* why = NULL;
+        if (q->gen == 0 || q->layer != 0 || base == 0u || !pcnetgame_ofurn_storage_select_ok(peer, (int)q->ut_x, (int)q->ut_z, base, &why)) {
+            printf("[NET][DRESSER] host: peer %d resident %d OUTDOOR DRESSER_SELECT refused (tile %u,%u item 0x%04X gen %u): %s\n", (int)peer, idx, (unsigned)q->ut_x,
+                   (unsigned)q->ut_z, (unsigned)q->ftr_item, (unsigned)q->gen, why != NULL ? why : "malformed");
+            return;
+        }
+        sel->valid = 1;
+        sel->_r = (uint8_t)(idx + 1);
+        sel->gen = q->gen;
+        sel->house = 0xFFu; /* no house */
+        sel->floor = q->floor;
+        sel->layer = 0;
+        sel->ut_x = q->ut_x;
+        sel->ut_z = q->ut_z;
+        sel->ftr_base = base;
+        pc_dresser_key_outdoor(sel->key, (int)q->ut_x, (int)q->ut_z, base);
+        pcnetgame_dresser_roll_forward(idx, pcnetgame_rec_slot(idx), sel->key);
+        printf("[NET][DRESSER] host: peer %d resident %d selected the OUTDOOR storage at tile %u,%u ftr 0x%04X (gen %u, %d item(s))\n", (int)peer, idx, (unsigned)q->ut_x,
+               (unsigned)q->ut_z, (unsigned)base, (unsigned)q->gen, pc_dresser_store_used(pc_dresser_store_find(&s_dresser, sel->key)));
+        pcnetgame_dresser_send_state(peer, sel->key);
+        return;
+    }
+    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
     if (h < 0 || q->gen == 0 || base == 0u || pcnetgame_dresser_cell_ftr(h, q->floor, q->layer, q->ut_x, q->ut_z) != base) {
         printf("[NET][DRESSER] host: peer %d resident %d DRESSER_SELECT refused (house %d floor %u layer %u cell %u,%u item 0x%04X gen %u): not a furniture of that id in its own house\n",
                (int)peer, idx, h, (unsigned)q->floor, (unsigned)q->layer, (unsigned)q->ut_x, (unsigned)q->ut_z, (unsigned)q->ftr_item, (unsigned)q->gen);
@@ -23498,7 +23773,9 @@ static void pcnetgame_handle_client_dresser_state(const PCNetGameDresserStateMsg
         printf("[NET][DRESSER] client: the host offers dresser storage (enabled=%u)\n", (unsigned)m->enabled);
         return;
     }
-    pcnetgame_dresser_cache_put(m);
+    if (m->floor != (uint8_t)PC_DRESSER_OUTDOOR_FLOOR) {
+        pcnetgame_dresser_cache_put(m); /* the house move lock cache (C3: an outdoor piece's lock is the host's pickup refusal) */
+    }
     if (m->gen == 0 || m->gen != s_dresser_cli_gen) {
         return; /* information only, or the answer to an older selection */
     }
@@ -31169,6 +31446,36 @@ static void pcnetgame_run_nook_test_hook(void) {}
  * REPORT reward (and a Bells tip) overflows the wallet into a 30000 money bag: the client's real post<pre apply path. Mode 2 additionally puts a foreign item into a free local pocket
  * right after the REPORT request left, so the client's local state no longer equals the request's pre-image and the DELTA branch of pcnetgame_txn_apply_work runs. Every step logs
  * "[WORKREWARD][TEST-ONLY]" with the conserved total (wallet + 30000 per money bag in the pockets). Never active in normal play. */
+/* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_HANDOVER_FRUIT=1, client role; test_handover_real.py): ONE local test write 9 s after the record was adopted: the town's native fruit
+ * (Save_Get(fruit), the job objective of a FRUIT Work Mode job) into the first free pocket from 4 on, unless one is already there; the normal D3 upload carries it to the host,
+ * so the real Nook dialogue can hand it in (DELIVER: the player -> Nook hand-over). Never active in normal play. */
+static void pcnetgame_run_handover_fruit_test_hook(void) {
+    static int s_done = 0;
+    int i, free_slot = -1;
+    mActor_name_t fruit;
+    if (s_done || pc_test_hook_getenv("AC_TEST_HANDOVER_FRUIT") == NULL || s_role != PC_NETGAME_ROLE_CLIENT || !pcnetgame_client_record_synced() || !pcfa_save_ready() ||
+        Now_Private == NULL || pc_net_game_client_pocket_locked() || (uint32_t)(pcnetgame_now_ms() - s_crec.adopt_ms) < 9000u) {
+        return;
+    }
+    s_done = 1;
+    fruit = Save_Get(fruit);
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if (Now_Private->inventory.pockets[i] == fruit) {
+            printf("[HANDOVER][TEST-ONLY] the town fruit 0x%04X is already in pocket %d\n", (unsigned)fruit, i);
+            return;
+        }
+        if (i >= 4 && free_slot < 0 && Now_Private->inventory.pockets[i] == (mActor_name_t)EMPTY_NO) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < 0) {
+        printf("[HANDOVER][TEST-ONLY] no free pocket for the town fruit 0x%04X\n", (unsigned)fruit);
+        return;
+    }
+    mPr_SetPossessionItem(Now_Private, free_slot, fruit, mPr_ITEM_COND_NORMAL);
+    printf("[HANDOVER][TEST-ONLY] the town fruit 0x%04X put into local pocket %d (the hook's one local test write; the D3 upload carries it)\n", (unsigned)fruit, free_slot);
+}
+
 static unsigned pcnetgame_work_reward_total(unsigned* bags) {
     unsigned n = 0;
     int i;
@@ -32182,8 +32489,9 @@ static int s_dresser_ask_key[5] = { -1, -1, -1, -1, -1 }; /* floor, layer, ut_x,
 int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr_item) {
     PCNetGameDresserQueryMsg q;
     int reask;
-    if (!pc_net_game_dresser_available() || floor < 0 || floor > 2 || layer < 0 || layer > 1 || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 || ftr_item <= 0 ||
-        ftr_item > 0xFFFF) {
+    if (!pc_net_game_dresser_available() || floor < 0 || (floor > 2 && floor != (int)PC_DRESSER_OUTDOOR_FLOOR) || layer < 0 || layer > 1 ||
+        (floor == (int)PC_DRESSER_OUTDOOR_FLOOR && layer != 0) || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 || ftr_item <= 0 ||
+        ftr_item > 0xFFFF) { /* C3: floor 0xFC = an outdoor storage piece (ut = its origin in town units; sent only to a host whose 102 CAPS announced it) */
         return 0;
     }
     reask = s_dresser_cli_gen != 0 && !pc_net_game_dresser_view_ready() && s_dresser_ask_visit == s_dresser_visit && s_dresser_ask_key[0] == floor &&
@@ -32552,8 +32860,12 @@ static void pcnetgame_dresser_test_hook(void) {
 #include "m_hand_ovl.h"
 #include "m_tag_ovl.h"
 static unsigned s_test_lock_pad; /* TEST-ONLY (defined with the "lock" refusal test, below) */
+static int s_test_ofurn_close; /* TEST-ONLY (C3 AC_TEST_OFURN=storage): pulse B while the dresser screen is up (closes the outdoor storage screen; self-limiting) */
 unsigned pc_net_game_test_dresser_pad(void) {
 #ifdef PC_NET_TEST_HOOKS
+    if (s_test_ofurn_close && pc_dresser_ui_active()) {
+        return (gamePT != NULL && ((uint32_t)gamePT->frame_counter % 30u) < 3u) ? 8u : 0u;
+    }
     if (s_test_lock_pad != 0u) {
         if ((s_test_lock_pad & 0x100u) != 0u) { /* PULSE mode: the low bits for 3 of every 30 game frames (a menu is open: the room hook does not run then) */
             return (gamePT != NULL && ((uint32_t)gamePT->frame_counter % 30u) < 3u) ? (s_test_lock_pad & 0xFFu) : 0u;
@@ -34895,6 +35207,16 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         }
         return;
     }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) { /* HAND-OVER ANIMATIONS: presentation only (villager: the host's held actor; shop: relayed within the sender's scene) */
+        if (size == sizeof(PCHandoverMsg)) {
+            PCHandoverMsg ho;
+            memcpy(&ho, data, sizeof(ho));
+            pcnetgame_handle_host_handover(peer, &ho);
+        } else {
+            s_ho_stats.rejected++; /* wrong size: dropped (never a violation) */
+        }
+        return;
+    }
     if (size == sizeof(PCBallKickMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BALL_KICK_REQUEST) {
         PCBallKickMsg bk;
         memcpy(&bk, data, sizeof(bk));
@@ -35650,6 +35972,12 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCActionExtMsg ax;
         memcpy(&ax, data, sizeof(ax));
         pcnetgame_handle_client_action_ext(&ax); /* PUPPET ACTION_EXT (worker P2): another player's clip, relayed by the host */
+        return;
+    }
+    if (size == sizeof(PCHandoverMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) {
+        PCHandoverMsg ho;
+        memcpy(&ho, data, sizeof(ho));
+        pcnetgame_handle_client_handover(&ho); /* HAND-OVER ANIMATIONS: another player's hand-over with this shop's keeper, relayed by the host */
         return;
     }
     if (size == sizeof(PCBallStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BALL_STATE) {
@@ -40016,6 +40344,7 @@ void pc_net_game_poll(void) {
 #ifdef PC_NET_TEST_HOOKS
     pcnetgame_run_shop_preview_test_hook(); /* AC_TEST_SHOP_PREVIEW_SELF (default OFF) */
     pcnetgame_run_work_reward_test_hook(); /* AC_TEST_WORK_REWARD=1|2 (client role, default OFF) */
+    pcnetgame_run_handover_fruit_test_hook(); /* AC_TEST_HANDOVER_FRUIT=1 (client role, default OFF): the town fruit for the real hand-over test */
 #endif
     pcnetgame_run_mail_test_hook(); /* mail milestone: --mail-test-send=<house>[,gift] (client role, default OFF) */
     pcnetgame_mail_test_force_delivery(); /* mail milestone: --mail-test-force-delivery (host role, default OFF) */
@@ -42844,7 +43173,8 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                 line[0] = 0;
             }
             fclose(f);
-            if (sscanf(line, "%d %15s %f", &id, cmd, &a) != 3 || (strcmp(cmd, "mash") != 0 && strcmp(cmd, "mashc") != 0 && strcmp(cmd, "mashf") != 0 && strcmp(cmd, "mashm") != 0)) {
+            if (sscanf(line, "%d %15s %f", &id, cmd, &a) != 3 || (strcmp(cmd, "mash") != 0 && strcmp(cmd, "mashc") != 0 && strcmp(cmd, "mashf") != 0 && strcmp(cmd, "mashm") != 0 &&
+                                                                  strcmp(cmd, "mashw") != 0)) {
                 return 0; /* not a mash: left in the file for the town path */
             }
             remove(s_ap_file);
@@ -42899,7 +43229,12 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             }
             return (((now - s_ap.t0) / 250u) & 1u) ? 1u : 0u;
         }
-        if (s_ap.active && (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashc") == 0 || strcmp(s_ap.cmd, "mashf") == 0)) {
+        if (s_ap.active && (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashc") == 0 || strcmp(s_ap.cmd, "mashf") == 0 || strcmp(s_ap.cmd, "mashw") == 0)) {
+            if (strcmp(s_ap.cmd, "mashw") == 0 && mChoice_check_main_normal(mChoice_Get_base_window_p())) {
+                /* "mashw" (hand-over real test): Nook's first page with the Work Mode choice -> that choice (CHOICE3, "I'd like to work" / "Check my job"); any other choice -> the FIRST */
+                mChoice_c* ch = mChoice_Get_base_window_p();
+                ch->selected_choice_idx = (pc_nook_first_page_work() && ch->data.choice_num > 3) ? 3 : 0;
+            }
             if (strcmp(s_ap.cmd, "mashf") == 0 && mChoice_check_main_normal(mChoice_Get_base_window_p())) {
                 /* "mashf": answer every choice with its FIRST option (Blathers: "donate" / "yes, more") */
                 mChoice_Get_base_window_p()->selected_choice_idx = 0;
@@ -49521,6 +49856,13 @@ static uint32_t     s_ofh_gc_ms = 0;
 static PCOpsList    s_ops;
 static int          s_ops_state = 0; /* 0 = not loaded, 1 = loaded */
 static uint32_t     s_ops_gen = 1;
+/* C3 (outdoor storage + the place / pickup animations; the "C3" sections below) */
+static uint32_t pcnetgame_ofurn_c3_flags(void);
+static int      pcnetgame_ofurn_storage_count(const PCOfurnMarker* mk);
+static int      pcnetgame_ofurn_storage_dst_ok(const PCOfurnMarker* mk, int nox, int noz);
+static int      pcnetgame_ofurn_storage_rekey(const PCOfurnMarker* from, int nox, int noz);
+static void     pcnetgame_ofurn_storage_reattach(const PCOfurnMarker* mk);
+static void     pcnetgame_ofurn_storage_sweep(void);
 
 static int pcnetgame_ofurn_env_off(void) {
     static int v = -1;
@@ -49808,6 +50150,9 @@ static void pcnetgame_ofurn_broadcast(uint8_t kind, const PCOfurnMarker* mk) {
         pcnetgame_ofurn_send_delta(0, kind, mk, NULL);
     }
     pcnetgame_ofurn_send_delta(1, kind, mk, NULL);
+    if (!g_pc_dedicated) { /* C3: the listen host's own renderer shows the place / pickup presentation too */
+        pc_ofurn_anim_note(kind == PC_OFURN_MK_SET ? PC_OFURN_ANIM_BIRTH : PC_OFURN_ANIM_BYE, (int)mk->ut_x, (int)mk->ut_z, (int)pc_ofurn_tile_value(mk), 0);
+    }
     printf("[NET][OFURN] host: %s tile (%u,%u) item 0x%04X shape %u (%d placed piece(s))\n", kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)mk->ut_x, (unsigned)mk->ut_z,
            (unsigned)pc_ofurn_tile_value(mk), (unsigned)mk->shape, s_ofh.n);
 }
@@ -49844,6 +50189,7 @@ static void pcnetgame_ofurn_host_pump_peer2(PCNetPeerId peer) {
         m.kind = PC_OFURN_MK_CAPS;
         m.flags = (uint8_t)PC_OFURN_C2_ALL;
         m.gen = s_ofh.gen;
+        m.total = pcnetgame_ofurn_c3_flags(); /* C3: PC_OFURN_C3_* (a C2 client never reads `total` of a CAPS message) */
         if (!pcnetgame_ofurn_send2(peer, &m)) {
             return;
         }
@@ -50091,6 +50437,7 @@ static void pcnetgame_ofurn_host_tick(void) {
     if (s_ofh_state == 1 && pcfa_save_ready() && (uint32_t)(now - s_ofh_gc_ms) >= 500u) {
         s_ofh_gc_ms = now;
         pcnetgame_ofurn_host_gc();
+        pcnetgame_ofurn_storage_sweep(); /* C3: an outdoor storage record whose piece is gone: orphaned (kept), an empty one dropped */
         pcnetgame_ofurn_test_seed();
     }
     for (p = 0; p < pcnetgame_peer_span(); p++) {
@@ -50292,6 +50639,7 @@ static int pcnetgame_ofurn_commit_place(int ux, int uz, uint16_t item, int rot, 
     }
     pcnetgame_host_flush_mask(mask); /* FIELD_UPDATE to every READY peer (an old client: a leaf on the origin, invisible filler on the other cells) */
     pcnetgame_ofurn_broadcast(PC_OFURN_MK_SET, &mk);
+    pcnetgame_ofurn_storage_reattach(&mk); /* C3: an orphaned outdoor storage of this furniture id comes back in the new piece */
     return 1;
 }
 
@@ -50306,12 +50654,17 @@ static int pcnetgame_ofurn_commit_reshape(int idx, int rot, int nox, int noz) {
     if (!pc_ofurn_fp_in_town((int)after.shape, (int)after.rot, nox, noz) || pc_ofurn_fp_overlaps(&s_ofh, (int)after.shape, (int)after.rot, nox, noz, idx)) {
         return 0;
     }
+    /* C3: a MOVE of a storage piece re-keys its outdoor storage to the new origin FIRST (the dresser sidecar is saved; a ROTATE keeps the key: rotation masked) */
+    if (!pcnetgame_ofurn_storage_rekey(&before, nox, noz)) {
+        return 0;
+    }
     s_ofh.m[idx] = after;
     s_ofh.gen++;
     if (!pcnetgame_ofurn_host_save() || !pcnetgame_ofurn_write_cells(&before, &after, &mask)) {
         s_ofh.m[idx] = before;
         s_ofh.gen++;
         (void)pcnetgame_ofurn_host_save();
+        (void)pcnetgame_ofurn_storage_rekey(&after, (int)before.ut_x, (int)before.ut_z); /* the storage back to the old origin */
         return 0;
     }
     pcnetgame_host_flush_mask(mask);
@@ -50362,11 +50715,208 @@ static uint8_t pcnetgame_ofurn_check_move(int idx, int dir, int pull, int pux, i
     int i, fx, fz;
     for (i = 0; i < 5; i++) {
         if (pc_ofurn_move_geometry((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, dir, pull, pux + ring[i][0], puz + ring[i][1], nox, noz, &fx, &fz)) {
+            if (!pcnetgame_ofurn_storage_dst_ok(mk, *nox, *noz)) {
+                *why = "the new origin still holds the (orphaned) stored items of another piece"; /* C3: never merged */
+                return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+            }
             return pcnetgame_ofurn_check_reshape(idx, (int)mk->rot, *nox, *noz, why);
         }
     }
     *why = pull ? "the player is not in front of the piece (pull)" : "the player is not behind the piece (push)";
     return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+}
+
+/* ---- C3: OUTDOOR STORAGE (host). A placed item-storage piece (aMR_pc_ftr_is_item_storage: drawers / wardrobes / closets / chests / low chests) has ONE shared
+ * 27-slot store in dresser_store.dat under the outdoor key (pc_dresser_store.h: town sentinel, floor 0xFC, the ORIGIN tile, the base id). Rules: a MOVE re-keys it
+ * (write-ahead: the dresser sidecar first), a ROTATE keeps it, a PICKUP (kind 22, the host's own player, a vanilla leaf pickup, the console without `delete`) is
+ * refused while it holds items, and a record whose piece is gone (GC, a console `delete`, a pickup while the storage feature was off) is ORPHANED, never deleted:
+ * the next piece of that furniture id placed / opened outdoors gets it back (the indoor re-attach-by-id rule). ---- */
+static int pcnetgame_ofurn_is_storage_item(uint16_t item) {
+    return pc_ofurn_is_ftr(item) && aMR_pc_ftr_is_item_storage((int)item);
+}
+
+/* 1 = outdoor storage is offered: the dresser storage feature on (AC_MP_DRESSER_STORAGE) and outdoor furniture not killed (AC_MP_OUTDOOR_FURNITURE=0) */
+static int pcnetgame_ofurn_storage_on(void) {
+    return !pcnetgame_ofurn_env_off() && pcnetgame_dresser_host_ready();
+}
+
+static uint32_t pcnetgame_ofurn_c3_flags(void) {
+    return pcnetgame_ofurn_storage_on() ? (uint32_t)PC_OFURN_C3_STORAGE : 0u;
+}
+
+static int pcnetgame_ofurn_storage_count(const PCOfurnMarker* mk) {
+    uint8_t key[PC_DRESSER_KEY_LEN];
+    if (mk == NULL || !pcnetgame_ofurn_is_storage_item(mk->base) || !pcnetgame_dresser_host_ready()) {
+        return 0;
+    }
+    pc_dresser_key_outdoor(key, (int)mk->ut_x, (int)mk->ut_z, mk->base);
+    return pc_dresser_store_used(pc_dresser_store_find(&s_dresser, key));
+}
+
+static int pcnetgame_ofurn_storage_save(const char* what) {
+    char path[260];
+    pcnetgame_dresser_path(path, sizeof(path));
+    if (!pc_dresser_store_save(&s_dresser, path)) {
+        printf("[NET][OFURN] host: *** outdoor storage: the dresser sidecar could not be saved (%s) ***\n", what);
+        return 0;
+    }
+    return 1;
+}
+
+/* 1 = a MOVE of mk to the new origin may re-key its storage (the destination key holds no other piece's items / orphan) */
+static int pcnetgame_ofurn_storage_dst_ok(const PCOfurnMarker* mk, int nox, int noz) {
+    uint8_t k1[PC_DRESSER_KEY_LEN];
+    const PCDresserRec* d;
+    if (!pcnetgame_ofurn_is_storage_item(mk->base) || !pcnetgame_dresser_host_ready() || (nox == (int)mk->ut_x && noz == (int)mk->ut_z)) {
+        return 1;
+    }
+    pc_dresser_key_outdoor(k1, nox, noz, mk->base);
+    d = pc_dresser_store_find(&s_dresser, k1);
+    return d == NULL || (!d->orphan && pc_dresser_store_used(d) == 0);
+}
+
+/* re-keys the storage of piece `from` to the origin (nox, noz), saved. 1 = done or nothing to do (no storage piece / no record / same origin / the feature off),
+ * 0 = refused / the save failed (nothing changed) */
+static int pcnetgame_ofurn_storage_rekey(const PCOfurnMarker* from, int nox, int noz) {
+    uint8_t k0[PC_DRESSER_KEY_LEN], k1[PC_DRESSER_KEY_LEN];
+    int n;
+    if (!pcnetgame_ofurn_is_storage_item(from->base) || !pcnetgame_dresser_host_ready() || (nox == (int)from->ut_x && noz == (int)from->ut_z)) {
+        return 1;
+    }
+    pc_dresser_key_outdoor(k0, (int)from->ut_x, (int)from->ut_z, from->base);
+    pc_dresser_key_outdoor(k1, nox, noz, from->base);
+    if (pc_dresser_store_find(&s_dresser, k0) == NULL) {
+        return 1; /* never opened: nothing stored */
+    }
+    n = pc_dresser_store_used(pc_dresser_store_find(&s_dresser, k0));
+    if (!pc_dresser_store_rekey(&s_dresser, k0, k1)) {
+        printf("[NET][OFURN] host: outdoor storage of (%u,%u) ftr 0x%04X: re-key to (%d,%d) REFUSED (the destination holds other items)\n", (unsigned)from->ut_x,
+               (unsigned)from->ut_z, (unsigned)from->base, nox, noz);
+        return 0;
+    }
+    if (!pcnetgame_ofurn_storage_save("move re-key")) {
+        (void)pc_dresser_store_rekey(&s_dresser, k1, k0);
+        return 0;
+    }
+    printf("[NET][OFURN] host: outdoor storage of ftr 0x%04X re-keyed (%u,%u) -> (%d,%d) with the piece (%d item(s) follow it)\n", (unsigned)from->base, (unsigned)from->ut_x,
+           (unsigned)from->ut_z, nox, noz, n);
+    return 1;
+}
+
+/* a placed / opened storage piece without a record of its own: the lowest-cell ORPHANED outdoor record of the same furniture id moves into it (saved) */
+static void pcnetgame_ofurn_storage_reattach(const PCOfurnMarker* mk) {
+    uint8_t key[PC_DRESSER_KEY_LEN], from[PC_DRESSER_KEY_LEN];
+    const PCDresserRec* cur;
+    const PCDresserRec* orf;
+    int n;
+    if (!pcnetgame_ofurn_is_storage_item(mk->base) || !pcnetgame_dresser_host_ready()) {
+        return;
+    }
+    pc_dresser_key_outdoor(key, (int)mk->ut_x, (int)mk->ut_z, mk->base);
+    cur = pc_dresser_store_find(&s_dresser, key);
+    if (cur != NULL && (cur->orphan || pc_dresser_store_used(cur) > 0)) {
+        if (cur->orphan) {
+            (void)pc_dresser_store_set_orphan(&s_dresser, key, 0); /* its own piece is back on its origin */
+            (void)pcnetgame_ofurn_storage_save("orphan cleared");
+            printf("[NET][OFURN] host: outdoor storage at (%u,%u) ftr 0x%04X: its piece is back -- no longer an orphan (%d item(s))\n", (unsigned)mk->ut_x,
+                   (unsigned)mk->ut_z, (unsigned)mk->base, pc_dresser_store_used(cur));
+        }
+        return;
+    }
+    orf = pc_dresser_store_find_orphan(&s_dresser, key, mk->base); /* the outdoor prefix (sentinel owner + floor 0xFC + layer 0) */
+    if (orf == NULL) {
+        return;
+    }
+    memcpy(from, orf->key, sizeof(from));
+    n = pc_dresser_store_used(orf);
+    if (!pc_dresser_store_rekey(&s_dresser, from, key)) {
+        return;
+    }
+    if (!pcnetgame_ofurn_storage_save("orphan re-attach")) {
+        (void)pc_dresser_store_rekey(&s_dresser, key, from);
+        (void)pc_dresser_store_set_orphan(&s_dresser, from, 1);
+        return;
+    }
+    printf("[NET][OFURN] host: outdoor storage RE-ATTACHED: the orphaned storage of ftr 0x%04X from (%u,%u) (%d item(s)) is now in the piece at (%u,%u)\n", (unsigned)mk->base,
+           (unsigned)from[10], (unsigned)from[11], n, (unsigned)mk->ut_x, (unsigned)mk->ut_z);
+}
+
+/* every 500 ms after the GC: an outdoor record whose piece (marker at its origin with its base id) is gone is ORPHANED when it holds items, DROPPED when empty */
+static void pcnetgame_ofurn_storage_sweep(void) {
+    int i, n, changed = 0;
+    if (s_ofh_state != 1 || s_dresser_state != 1) {
+        return; /* never with an unusable marker table (it would orphan everything); the store loads lazily on first use */
+    }
+    n = pc_keytab_count(&s_dresser.tab);
+    for (i = 0; i < n; i++) {
+        const PCDresserRec* r = (const PCDresserRec*)pc_keytab_at(&s_dresser.tab, i);
+        uint8_t key[PC_DRESSER_KEY_LEN];
+        uint16_t base;
+        int k, used;
+        if (r == NULL || !pc_dresser_key_is_outdoor(r->key) || r->orphan) {
+            continue;
+        }
+        memcpy(key, r->key, sizeof(key));
+        base = (uint16_t)(key[12] | (key[13] << 8));
+        k = pc_ofurn_find(&s_ofh, (int)key[10], (int)key[11]);
+        if (k >= 0 && s_ofh.m[k].base == base) {
+            continue; /* its piece is there */
+        }
+        used = pc_dresser_store_used(r);
+        if (used == 0) {
+            if (pc_dresser_store_drop_empty(&s_dresser, key)) {
+                changed = 1;
+                n--;
+                i--; /* the table was compacted: the last record moved into slot i */
+            }
+            continue;
+        }
+        (void)pc_dresser_store_set_orphan(&s_dresser, key, 1);
+        changed = 1;
+        printf("[NET][OFURN] host: outdoor storage at (%u,%u) ftr 0x%04X lost its piece with %d item(s): kept as an ORPHAN (the next piece of that id placed outdoors gets "
+               "them back)\n", (unsigned)key[10], (unsigned)key[11], (unsigned)base, used);
+    }
+    if (changed) {
+        (void)pcnetgame_ofurn_storage_save("sweep");
+    }
+}
+
+static int pcnetgame_ofurn_storage_select_ok(PCNetPeerId peer, int ut_x, int ut_z, uint16_t base, const char** why) {
+    const PCNetGameHostPeerState* st;
+    int k, xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], nc, i, near = 0, pux, puz;
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    if (!pcnetgame_ofurn_storage_on() || !pcnetgame_ofurn_host_ready()) {
+        *why = "outdoor storage is off on this host";
+        return 0;
+    }
+    if (!pcnetgame_ofurn_peer_is_resident(peer)) {
+        *why = "only residents can use storage outside";
+        return 0;
+    }
+    k = pc_ofurn_find(&s_ofh, ut_x, ut_z);
+    if (k < 0 || s_ofh.m[k].base != (uint16_t)(base & ~3u) || !pcnetgame_ofurn_is_storage_item(s_ofh.m[k].base) || !pcnetgame_ofurn_tiles_match(&s_ofh.m[k], NULL, NULL, NULL)) {
+        *why = "no placed storage piece of that id has its origin on that tile";
+        return 0;
+    }
+    st = &s_host_peer[peer];
+    if (!st->ctx_valid || !(st->ctx.flags & PC_NETGAME_CTX_FLAG_IN_TOWN) || !pc_remote_player_get_last_position((PCNetPlayerId)peer, &px, &py, &pz) ||
+        !pcnetgame_pos_valid(px, py, pz)) {
+        *why = "the requester is not (known to be) in the town";
+        return 0;
+    }
+    pux = (int)(px / mFI_UT_WORLDSIZE_X_F);
+    puz = (int)(pz / mFI_UT_WORLDSIZE_Z_F);
+    nc = pc_ofurn_marker_cells(&s_ofh.m[k], xs, zs);
+    for (i = 0; i < nc; i++) {
+        const int dx = xs[i] - pux, dz = zs[i] - puz;
+        near |= dx >= -2 && dx <= 2 && dz >= -2 && dz <= 2; /* next to the piece (one tile of position lag tolerated) */
+    }
+    if (!near) {
+        *why = "the requester is not next to the piece";
+        return 0;
+    }
+    pcnetgame_ofurn_storage_reattach(&s_ofh.m[k]); /* a piece whose storage was orphaned (e.g. a crash between the two sidecar saves of a move) gets it back */
+    return 1;
 }
 
 /* ---- the vanilla pickup / drop gates (called from pcnetgame_validate_and_resolve_pickup / pcnetgame_is_droppable_item) ---- */
@@ -50382,6 +50932,12 @@ int pcnetgame_ofurn_pickup_gate(PCNetPeerId peer, int ut_x, int ut_z, uint16_t r
     if (!pcnetgame_ofurn_peer_may_pickup(peer)) {
         printf("[NET][OFURN] host: peer %d vanilla pickup of the PLACED piece at (%d,%d) REFUSED: guests (and old clients of guests) may not take placed furniture\n", (int)peer, ut_x,
                ut_z);
+        return 0;
+    }
+    if (pcnetgame_ofurn_storage_count(&s_ofh.m[idx]) > 0) {
+        /* C3: a 0.3.0 client's vanilla pickup of the origin LEAF of a storage piece that still holds items (its storage would be orphaned): refused for anybody */
+        printf("[NET][OFURN] host: peer %d vanilla pickup of the PLACED storage piece at (%d,%d) REFUSED: its outdoor storage holds %d item(s)\n", (int)peer, ut_x, ut_z,
+               pcnetgame_ofurn_storage_count(&s_ofh.m[idx]));
         return 0;
     }
     *granted = pc_ofurn_base(raw); /* a placed piece comes back with rotation 0 (the marker is GC'd once the tile is empty) */
@@ -50550,7 +51106,10 @@ static void pcnetgame_handle_host_ofurn_txn(PCNetPeerId peer, const PCNetGameTxn
                 } else if (op == PC_OFURN_OP_ROTATE) {
                     reason = pcnetgame_ofurn_check_reshape(midx, (int)t->flags, ux, uz, &why); /* C2: a 2x1 swings its second half into one new cell */
                 } else if (op == PC_OFURN_OP_PICKUP) {
-                    if (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+                    if (pcnetgame_ofurn_storage_count(&s_ofh.m[midx]) > 0) {
+                        why = "the piece's outdoor storage still holds items (take them out first)"; /* C3 */
+                        reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_NOT_EMPTY;
+                    } else if (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
                         why = "the destination pocket slot is not free";
                         reason = (uint8_t)PC_NETGAME_TXN_REASON_NO_ROOM;
                     } else {
@@ -50765,6 +51324,7 @@ static struct {
     uint32_t stage2_gen;
     uint32_t op_serial;       /* +1 per begun op (the grab driver's handle) */
     uint32_t done_serial;     /* the serial of the last resolved op */
+    uint32_t c3_flags;        /* C3: PC_OFURN_C3_* from the 102 CAPS `total` field (0 = a C2 / C1 host) */
 } s_ofcl;
 static PCOfurnTable s_ofc2, s_ofc2_stage;
 
@@ -50885,6 +51445,10 @@ static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m) {
             }
             s_ofcl.have_c2 = 1;
             s_ofcl.c2_flags = m->flags;
+            if (s_ofcl.c3_flags != (m->total & PC_OFURN_C3_STORAGE)) {
+                printf("[NET][OFURN] client: the host supports outdoor furniture C3: outdoor storage %s\n", (m->total & PC_OFURN_C3_STORAGE) ? "ON" : "OFF");
+            }
+            s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE; /* C3: unknown higher bits ignored (a later host may add features) */
             break;
         case PC_OFURN_MK_BEGIN:
             pc_ofurn_table_init(&s_ofc2_stage);
@@ -50928,6 +51492,9 @@ static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m) {
             pcnetgame_ofurn_apply_entries(&s_ofc2, m, m->kind == PC_OFURN_MK_DEL);
             if (s_ofcl.staging2) {
                 pcnetgame_ofurn_apply_entries(&s_ofc2_stage, m, m->kind == PC_OFURN_MK_DEL);
+            }
+            if (m->count >= 1) { /* C3: the renderer's place (birth) / pickup (bye) presentation of that piece */
+                pc_ofurn_anim_note(m->kind == PC_OFURN_MK_SET ? PC_OFURN_ANIM_BIRTH : PC_OFURN_ANIM_BYE, (int)m->e[0].ut_x, (int)m->e[0].ut_z, (int)m->e[0].item, 0);
             }
             printf("[NET][OFURN] client: C2 %s tile (%u,%u) item 0x%04X (%d placed piece(s) known)\n", m->kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)m->e[0].ut_x,
                    (unsigned)m->e[0].ut_z, (unsigned)m->e[0].item, s_ofc2.n);
@@ -50973,6 +51540,9 @@ static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m) {
             pcnetgame_ofurn_apply_entries(&s_ofc, m, m->kind == PC_OFURN_MK_DEL);
             if (s_ofcl.staging) {
                 pcnetgame_ofurn_apply_entries(&s_ofc_stage, m, m->kind == PC_OFURN_MK_DEL);
+            }
+            if (!s_ofcl.have_c2 && m->count >= 1) { /* C3: a C1 host (no 102): the 98 deltas drive the place / pickup presentation */
+                pc_ofurn_anim_note(m->kind == PC_OFURN_MK_SET ? PC_OFURN_ANIM_BIRTH : PC_OFURN_ANIM_BYE, (int)m->e[0].ut_x, (int)m->e[0].ut_z, (int)m->e[0].item, 0);
             }
             printf("[NET][OFURN] client: %s tile (%u,%u) item 0x%04X (%d placed piece(s) known)\n", m->kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)m->e[0].ut_x,
                    (unsigned)m->e[0].ut_z, (unsigned)m->e[0].item, s_ofc.n);
@@ -51219,6 +51789,7 @@ int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int r
             return 0;
         }
         pcnetgame_ofurn_local_identity(key, name);
+        pc_ofurn_anim_note(PC_OFURN_ANIM_BIRTH, ut_x, ut_z, item, 1); /* C3: the vanilla place presentation (leaf flight, then the birth); before the SET of the commit */
         if (!pcnetgame_ofurn_commit_place(ut_x, ut_z, (uint16_t)item, rot, PC_OFURN_PLACER_HOST, key, name)) {
             pcnetgame_ofurn_notice(pc_ofurn_reason_text(0));
             return 0;
@@ -51231,7 +51802,11 @@ int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int r
         pcnetgame_ofurn_notice(pc_ofurn_reason_text(s_ofcl.have_perms && !(s_ofcl.perms & PC_OFURN_PERM_PLACE) ? PC_OFURN_REASON_NOT_ALLOWED : PC_OFURN_REASON_OFF));
         return 0;
     }
-    return pcnetgame_ofurn_begin(PC_OFURN_OP_PLACE, pocket_slot, (uint16_t)item, rot & 3, ut_x, ut_z) == 1;
+    if (pcnetgame_ofurn_begin(PC_OFURN_OP_PLACE, pocket_slot, (uint16_t)item, rot & 3, ut_x, ut_z) != 1) {
+        return 0;
+    }
+    pc_ofurn_anim_note(PC_OFURN_ANIM_BIRTH, ut_x, ut_z, item, 1); /* C3: optimistic: the leaf flies now; the model is born when the host's SET is in + 46 frames */
+    return 1;
 }
 
 /* the placed piece covering (ux, uz) in the VIEW whose ORIGIN tile still holds it (renderer / grab / B seams): its marker index, *value = the origin tile value.
@@ -51408,6 +51983,11 @@ int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {
     s = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
     if (s_role == PC_NETGAME_ROLE_HOST) {
         const int idx = pc_ofurn_find(&s_ofh, ut_x, ut_z);
+        if (idx >= 0 && pcnetgame_ofurn_storage_count(&s_ofh.m[idx]) > 0) {
+            pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_EMPTY)); /* C3: as the kind 22 rule */
+            printf("[NET][OFURN] host: own player PICKUP at (%d,%d) refused: its outdoor storage holds items\n", ut_x, ut_z);
+            return 1;
+        }
         if (s < 0) {
             pcnetgame_ofurn_notice(pc_ofurn_reason_text(22));
             return 1;
@@ -51418,7 +51998,7 @@ int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {
         }
         mPr_SetPossessionItem(Now_Private, s, pc_ofurn_base(v), mPr_ITEM_COND_NORMAL);
         printf("[NET][OFURN] host: own player PICKUP APPLIED: tile (%d,%d) item 0x%04X -> pocket slot %d\n", ut_x, ut_z, (unsigned)pc_ofurn_base(v), s);
-        return 1;
+        return 2; /* C3: 2 = the pickup was done / begun (the caller plays the pickup animation) */
     }
     if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PICKUP)) {
         pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED));
@@ -51428,8 +52008,37 @@ int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {
         pcnetgame_ofurn_notice(pc_ofurn_reason_text(22));
         return 1;
     }
-    (void)pcnetgame_ofurn_begin(PC_OFURN_OP_PICKUP, s, v, 0, ut_x, ut_z);
+    return pcnetgame_ofurn_begin(PC_OFURN_OP_PICKUP, s, v, 0, ut_x, ut_z) == 1 ? 2 : 1; /* C3: 2 = begun (the caller plays the pickup animation) */
+}
+
+/* ---- C3: the outdoor storage seams (pc_ofurn_draw.c: the A-tap open path) ---- */
+int pc_net_game_ofurn_is_storage(int item) {
+    return item > 0 && item <= 0xFFFF && pcnetgame_ofurn_is_storage_item((uint16_t)item);
+}
+
+int pc_net_game_ofurn_storage_open_ok(const char** why) {
+    *why = NULL;
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        *why = "Storage outside is for connected residents"; /* the listen host's own player has no host-side extra storage (indoors neither) */
+        return 0;
+    }
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return 0;
+    }
+    if (!s_ofcl.have_c2 || (s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) == 0u || pcnetgame_ofurn_env_off()) {
+        *why = "This server can't open storage outside"; /* a C1 / C2 host, or the storage feature off there: never an outdoor SELECT */
+        return 0;
+    }
+    if (!pc_net_game_dresser_available()) {
+        /* the host answers the dresser probe for RESIDENTS only: a guest's probe stays unanswered */
+        *why = pcnetgame_client_is_guest_player() ? "Only residents can use storage outside" : "Try again in a moment";
+        return 0;
+    }
     return 1;
+}
+
+int pc_net_game_ofurn_storage_select(int ut_x, int ut_z, int item) {
+    return pc_net_game_dresser_select((int)PC_DRESSER_OUTDOOR_FLOOR, 0, ut_x, ut_z, item);
 }
 
 
@@ -51468,6 +52077,147 @@ static void pcnetgame_ofurn_test_hook(void) {
         return;
     }
     t0 = now;
+    if (strcmp(e, "storage") == 0) {
+        /* C3 TEST-ONLY: AC_TEST_OFURN=storage (CLIENT): the REAL open path of a placed storage piece (the A TAP through the wait-state seam + the outdoor storage screen),
+         * a PUT through the screen's own call (pc_dresser_ui_put), the screen closed with a scripted B (the dresser pad seam), a MOVE (push north, the grab driver's
+         * call), the re-open at the new origin (the contents followed), a B pickup while it holds the item (refused 62), the item taken out, the B pickup again
+         * (APPLIED: the pickup animation). One step every 3 s. */
+        extern int pc_ofurn_test_grab_input(const char* script, int step);
+        static int st = 0, tries = 0, sux = -1, suz = -1;
+        int i;
+        if (s_role != PC_NETGAME_ROLE_CLIENT) {
+            return;
+        }
+        if (st == 0) {
+            const PCOfurnTable* vt = pc_net_game_ofurn_view();
+            const int pux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F), puz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
+            int k, best = -1, bd = 1 << 30;
+            xyz_t c;
+            for (k = 0; vt != NULL && k < vt->n; k++) {
+                const int dx = (int)vt->m[k].ut_x - pux, dz = (int)vt->m[k].ut_z - puz;
+                if (dx * dx + dz * dz < bd && dx * dx + dz * dz <= 100 && pc_net_game_ofurn_is_storage((int)vt->m[k].base) &&
+                    pc_net_game_ofurn_placed_at(vt->m[k].ut_x, vt->m[k].ut_z)) {
+                    bd = dx * dx + dz * dz;
+                    best = k;
+                }
+            }
+            if (best < 0 || !mFI_UtNum2CenterWpos(&c, vt->m[best].ut_x, vt->m[best].ut_z + 1) || !s_ofcl.have_c2) {
+                return;
+            }
+            sux = vt->m[best].ut_x;
+            suz = vt->m[best].ut_z;
+            pl->actor_class.world.position.x = c.x;
+            pl->actor_class.world.position.z = c.z;
+            pl->actor_class.shape_info.rotation.y = (s16)0x8000;
+            printf("[NET][OFURN][TEST-ONLY] storage: the placed storage piece at (%d,%d): the local player put on (%d,%d) facing it; outdoor storage offered by the host: %d "
+                   "(NOT active in normal play)\n", sux, suz, sux, suz + 1, (s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) != 0u);
+            st = 1;
+            return;
+        }
+        pl->actor_class.shape_info.rotation.y = (s16)0x8000; /* TEST-ONLY: face the piece like a player would */
+        switch (st) {
+            case 1: case 7: case 13: /* the A TAP (grab, release after 80 ms) */
+                (void)pc_ofurn_test_grab_input("tap", 0);
+                printf("[NET][OFURN][TEST-ONLY] storage: A tap -> %d\n", pc_ofurn_front_press(gamePT, 1, 0));
+                tries = 0;
+                st++;
+                return;
+            case 2: case 8: case 14: /* the screen must be open */
+                if (!pc_dresser_ui_active()) {
+                    if (++tries >= 4) {
+                        printf("[NET][OFURN][TEST-ONLY] storage: the outdoor storage screen did NOT open (step %d)\n", st);
+                        st = 99;
+                    }
+                    return;
+                }
+                printf("[NET][OFURN][TEST-ONLY] storage: screen open at (%d,%d) with %d item(s)\n", sux, suz, pc_net_game_dresser_count());
+                if (st == 2) {
+                    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+                        const int it = pc_net_game_dresser_pocket_item(i);
+                        if (it != 0 && pc_net_game_dresser_item_storable(it)) {
+                            printf("[NET][OFURN][TEST-ONLY] storage: PUT pocket %d item 0x%04X -> %d\n", i, (unsigned)it, pc_dresser_ui_put(i));
+                            break;
+                        }
+                    }
+                } else if (st == 14) {
+                    for (i = 0; i < PC_DRESSER_SLOTS; i++) {
+                        if (pc_net_game_dresser_item(i) != 0) {
+                            printf("[NET][OFURN][TEST-ONLY] storage: TAKE cell %d item 0x%04X -> %d\n", i, (unsigned)pc_net_game_dresser_item(i), pc_dresser_ui_take(i));
+                            break;
+                        }
+                    }
+                }
+                st++;
+                return;
+            case 3: case 9: case 15: /* the transaction resolved: close the screen (scripted B) */
+                if (pc_dresser_ui_pending()) {
+                    (void)pc_dresser_ui_poll();
+                    return;
+                }
+                printf("[NET][OFURN][TEST-ONLY] storage: %d item(s) in the outdoor storage now; closing the screen (B)\n", pc_net_game_dresser_count());
+                s_test_ofurn_close = 1;
+                st++;
+                return;
+            case 4: case 10: case 16:
+                if (pc_dresser_ui_active()) {
+                    return;
+                }
+                s_test_ofurn_close = 0;
+                printf("[NET][OFURN][TEST-ONLY] storage: the screen closed\n");
+                st++;
+                return;
+            case 5: /* MOVE: push north (the player stands south of the piece) */
+                printf("[NET][OFURN][TEST-ONLY] storage: push (%d,%d) north -> %d\n", sux, suz, pc_net_game_ofurn_move(sux, suz, 2, 0));
+                st = 6;
+                return;
+            case 6: {
+                xyz_t c;
+                printf("[NET][OFURN][TEST-ONLY] storage: push outcome %d reason %u\n", s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+                suz -= s_ofcl.last_outcome == 1 ? 1 : 0;
+                if (mFI_UtNum2CenterWpos(&c, sux, suz + 1)) {
+                    pl->actor_class.world.position.x = c.x;
+                    pl->actor_class.world.position.z = c.z;
+                }
+                st = 7;
+                return;
+            }
+            case 11: /* B while the storage holds the item: refused (62) */
+                printf("[NET][OFURN][TEST-ONLY] storage: B pickup while it holds items -> %d\n", pc_ofurn_front_press(gamePT, 0, 1));
+                st = 12;
+                return;
+            case 12:
+                printf("[NET][OFURN][TEST-ONLY] storage: the non-empty pickup: outcome %d reason %u\n", s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+                st = 13;
+                return;
+            case 17: /* empty again: B picks it up (the pickup animation) */
+                printf("[NET][OFURN][TEST-ONLY] storage: B pickup of the empty piece -> %d\n", pc_ofurn_front_press(gamePT, 0, 1));
+                st = 18;
+                return;
+            case 18:
+                printf("[NET][OFURN][TEST-ONLY] storage: the empty pickup: outcome %d reason %u\n", s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+                st = 19;
+                return;
+            case 19: { /* PLACE it again from the pocket on the same tile (the tag menu's call): the local place presentation (leaf flight + birth) */
+                int ftx, ftz;
+                pc_ofurn_front_tile(pl->actor_class.world.position.x, pl->actor_class.world.position.z, (int)pl->actor_class.shape_info.rotation.y, &ftx, &ftz);
+                for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+                    if (pc_net_game_ofurn_is_storage((int)Now_Private->inventory.pockets[i])) {
+                        printf("[NET][OFURN][TEST-ONLY] storage: PLACE pocket %d item 0x%04X at (%d,%d) -> %d\n", i, (unsigned)Now_Private->inventory.pockets[i], ftx, ftz,
+                               pc_net_game_ofurn_place(i, (int)Now_Private->inventory.pockets[i], ftx, ftz, pc_ofurn_rot_for_facing((int)pl->actor_class.shape_info.rotation.y)));
+                        break;
+                    }
+                }
+                st = 20;
+                return;
+            }
+            case 20:
+                printf("[NET][OFURN][TEST-ONLY] storage: done: the place: outcome %d reason %u\n", s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+                st = 99;
+                return;
+            default:
+                return;
+        }
+    }
     if (strcmp(e, "grab") == 0 && stage >= 1) {
         /* C2 TEST-ONLY: AC_TEST_OFURN=grab: the REAL grab through the wait-state seam + the hold / push / pull / rotate states, with the driver's synthetic A / stick
          * (AC_TEST_OFURN_GRAB = the step script, default "grab,pull,push,left,right,release"; one step every 3 s) */
@@ -51732,13 +52482,26 @@ static void pcnetgame_ofurn_list_line(int i, void (*out)(const char*)) {
     snprintf(line, sizeof(line), "  #%d: tile (%u,%u) acre %d: item 0x%04X %s rot %s, placed by %s \"%s\" at %s", i, (unsigned)m->ut_x, (unsigned)m->ut_z,
              pc_ofurn_acre_of(m->ut_x, m->ut_z), (unsigned)m->base, m->shape < PC_OFURN_FP_NUM ? sn[m->shape] : "?", rn[m->rot & 3],
              m->placer_kind == PC_OFURN_PLACER_GUEST ? "guest" : m->placer_kind == PC_OFURN_PLACER_HOST ? "host" : "resident", m->placer_name, when);
+    if (pcnetgame_ofurn_storage_count(m) > 0) {
+        const size_t L0 = strlen(line);
+        snprintf(line + L0, sizeof(line) - L0, " [storage: %d item(s)]", pcnetgame_ofurn_storage_count(m)); /* C3 */
+    }
     out(line);
 }
 
 /* removes marker i: to the town's lost and found (police box) unless `del`; 1 = done */
 static int pcnetgame_ofurn_console_remove(int i, int del, void (*out)(const char*)) {
     const PCOfurnMarker mk = s_ofh.m[i];
-    char line[160];
+    char line[200];
+    const int stored = pcnetgame_ofurn_storage_count(&mk);
+    if (stored > 0 && !del) {
+        /* C3: a storage piece holding items is not sent to the lost and found (its items would be stranded): refused; `delete` removes the piece and ORPHANS the
+         * storage (kept in dresser_store.dat; the next piece of that id placed outdoors gets it back) */
+        snprintf(line, sizeof(line), "FURNITURE REMOVE REFUSED: tile (%u,%u) item 0x%04X: its outdoor storage holds %d item(s) (take them out, or `delete` to keep them orphaned)",
+                 (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)mk.base, stored);
+        out(line);
+        return 0;
+    }
     if (!pcnetgame_ofurn_commit_remove(i)) {
         snprintf(line, sizeof(line), "FURNITURE REMOVE FAILED: tile (%u,%u): the sidecar / tile write failed (nothing changed)", (unsigned)mk.ut_x, (unsigned)mk.ut_z);
         out(line);
@@ -51749,9 +52512,12 @@ static int pcnetgame_ofurn_console_remove(int i, int del, void (*out)(const char
         (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_POLICE);
         pcnetgame_host_ts_push_all();
     }
-    snprintf(line, sizeof(line), "  removed tile (%u,%u) item 0x%04X (placed by \"%s\"): %s", (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)mk.base, mk.placer_name,
-             del ? "DELETED" : "moved to the lost and found");
+    snprintf(line, sizeof(line), "  removed tile (%u,%u) item 0x%04X (placed by \"%s\"): %s%s", (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)mk.base, mk.placer_name,
+             del ? "DELETED" : "moved to the lost and found", stored > 0 ? " (its stored items are kept as an orphan)" : "");
     out(line);
+    if (stored > 0) {
+        pcnetgame_ofurn_storage_sweep(); /* orphaned now (not 500 ms later) */
+    }
     return 1;
 }
 
