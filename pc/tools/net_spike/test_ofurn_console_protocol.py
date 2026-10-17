@@ -126,7 +126,7 @@ def phase_fu(h, ck, run, c2, names):
     (ux, uz), *_r = pl
     out = say(h, "furniture list")
     ck("FU2 `furniture list`: 1 piece, its tile, item, rotation E, placer name and time",
-       "placed furniture: 1 piece" in out and re.search(r"#0: tile \(%d,%d\) acre \d+: item 0x%04X rot E, placed by resident \"%s\" at \d{4}-\d\d-\d\d \d\d:\d\d" %
+       "placed furniture: 1 piece" in out and re.search(r"#0: tile \(%d,%d\) acre \d+: item 0x%04X 1x1 rot E, placed by resident \"%s\" at \d{4}-\d\d-\d\d \d\d:\d\d" %
                                                        (ux, uz, one, re.escape(names[2])), out) is not None)
     acre = L.town_ut_to_acre_tile(ux, uz)[0]
     out = say(h, "furniture list %d" % acre)

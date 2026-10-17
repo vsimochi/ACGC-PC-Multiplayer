@@ -608,8 +608,13 @@ typedef enum PCNetGameMsgType {
     PC_NETGAME_MSG_CHAT_MSG             = 101, /* host -> READY clients, RELIABLE, 80 bytes: a validated line (to the speaker's announced scene + the speaker's echo), a server announcement
                                              * (`say`, everyone), a notice for one player, or the CAPS announcement. PRESENTATION ONLY (bubble + chat log). An old client ignores the id.
                                              * See PCChatMsg / pc_chat.h. */
+    PC_NETGAME_MSG_OUTDOOR_FURN2        = 102, /* outdoor furniture C2 (v8 extended in place, NO version bump), host -> one READY client, RELIABLE, 268 bytes (the PCOfurnMsg layout of
+                                             * 98 with this id): CAPS (the host's C2 support: multi-tile + MOVE) then the list of ALL placed pieces (1x1 and multi-tile) + SET /
+                                             * DEL / MOVE deltas. 98 keeps carrying the 1x1 pieces only (the 0.3.0 client's view). An old client ignores the id. See
+                                             * pc_outdoor_furniture.h. */
 } PCNetGameMsgType;
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID, "OUTDOOR_FURN id drifted (pc_outdoor_furniture.h)");
+_Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN2 == (int)PC_OFURN_MSG2_ID, "OUTDOOR_FURN2 id drifted (pc_outdoor_furniture.h)");
 _Static_assert(sizeof(PCOfurnMsg) == 268 && sizeof(PCOfurnMsg) <= PC_NET_MAX_PAYLOAD, "PCOfurnMsg wire size drifted");
 
 typedef enum PCNetGameRejectReason {
@@ -4074,6 +4079,11 @@ typedef struct PCNetGameHostPeerState {
     uint16_t             ofurn_next;
     uint32_t             ofurn_gen;
     PCOfurnRate          ofurn_rate;
+    /* outdoor furniture C2 (message 102 OUTDOOR_FURN2): CAPS sent, the list state / cursor / generation of the ALL-pieces list (cleared by the per-peer memset) */
+    uint8_t              ofurn2_caps_sent;
+    uint8_t              ofurn2_state;
+    uint16_t             ofurn2_next;
+    uint32_t             ofurn2_gen;
 } PCNetGameHostPeerState;
 PCNG_PEER_TABLE(PCNetGameHostPeerState, s_host_peer)
 
@@ -12523,7 +12533,8 @@ static void pcnetgame_handle_host_snowman_build_request(PCNetPeerId peer, const 
         pcnetgame_host_resolve_snowman_tile_overlay(acre, tile, &value);
 
         if ((value >= (uint16_t)SNOWMAN0 && value <= (uint16_t)SNOWMAN8) || value == (uint16_t)RSV_NO ||
-            value == (uint16_t)RSV_WALL_NO || pcfa_is_transient_value(value) ||
+            value == (uint16_t)RSV_WALL_NO || value == (uint16_t)PC_OFURN_FILLER /* outdoor furniture C2: a cell of a placed multi-tile piece */ ||
+            pcfa_is_transient_value(value) ||
             ITEM_NAME_GET_TYPE((mActor_name_t)value) == NAME_TYPE_STRUCT ||
             ITEM_NAME_GET_TYPE((mActor_name_t)value) == NAME_TYPE_PROPS ||
             pcnetgame_host_tile_reserved_by(acre, tile) >= 0) {
@@ -21061,6 +21072,7 @@ static void pcnetgame_ofurn_session_reset(void);
 static void pcnetgame_ofurn_host_tick(void);
 static void pcnetgame_ofurn_client_tick(void);
 static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m);
+static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m); /* outdoor furniture C2 (message 102) */
 /* text chat (worker CH): the CHAT block (end of this file) */
 static void pcnetgame_chat_host_tick(void);
 static void pcnetgame_chat_client_tick(void);
@@ -34941,8 +34953,8 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         return;
     }
 
-    if (data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN) {
-        return; /* outdoor furniture C1: OUTDOOR_FURN is host -> client only; a client never originates it. Dropped, never applied. */
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN || data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN2) {
+        return; /* outdoor furniture C1 / C2: OUTDOOR_FURN / OUTDOOR_FURN2 are host -> client only; a client never originates them. Dropped, never applied. */
     }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_CHAT_SEND || data[0] == (uint8_t)PC_NETGAME_MSG_CHAT_MSG) {
         pcnetgame_handle_host_chat(peer, data, size); /* text chat (worker CH): CHAT_SEND validated + relayed in the speaker's scene; a client-originated CHAT_MSG is dropped */
@@ -35656,6 +35668,12 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCOfurnMsg om;
         memcpy(&om, data, sizeof(om));
         pcnetgame_handle_client_ofurn(&om); /* outdoor furniture C1: the host's placed-furniture markers / my rights */
+        return;
+    }
+    if (size == sizeof(PCOfurnMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN2) {
+        PCOfurnMsg om;
+        memcpy(&om, data, sizeof(om));
+        pcnetgame_handle_client_ofurn2(&om); /* outdoor furniture C2: the host's CAPS + the list of ALL placed pieces (multi-tile too) + deltas */
         return;
     }
     if (size >= 1 && data[0] == (uint8_t)PC_NETGAME_MSG_CHAT_MSG) {
@@ -49666,7 +49684,7 @@ static void pcnetgame_ofurn_build_caps(uint8_t* blob) {
 }
 
 static const char* pcnetgame_ofurn_op_name(int op) {
-    return op == PC_OFURN_OP_PLACE ? "PLACE" : op == PC_OFURN_OP_ROTATE ? "ROTATE" : op == PC_OFURN_OP_PICKUP ? "PICKUP" : "?";
+    return op == PC_OFURN_OP_PLACE ? "PLACE" : op == PC_OFURN_OP_ROTATE ? "ROTATE" : op == PC_OFURN_OP_PICKUP ? "PICKUP" : op == PC_OFURN_OP_MOVE ? "MOVE" : "?";
 }
 
 /* HOST: the marker table, loaded lazily once the host world is ready (the sidecar may hold markers of tiles the town save no longer matches: the GC drops them) */
@@ -49675,10 +49693,24 @@ static int pcnetgame_ofurn_host_ready(void) {
         return 0;
     }
     if (s_ofh_state == 0) {
-        char path[320];
-        int dropped = 0, rc;
+        char path[320], bak[340];
+        int dropped = 0, rc, ver = 0;
         pcnetgame_ofurn_host_path(path, sizeof(path), "outdoor_furniture.dat");
-        rc = pc_ofurn_load(path, &s_ofh, &dropped);
+        rc = pc_ofurn_load(path, &s_ofh, &dropped, &ver);
+        if (rc == PC_OFURN_FILE_OK && ver == (int)PC_OFURN_FILE_VERSION_C1) {
+            /* C2: a 0.3.0 (v1) sidecar: 1x1 markers, converted losslessly; the original is kept as <path>.v1.bak (never overwritten) and the file rewritten as v2 */
+            FILE* exists;
+            snprintf(bak, sizeof(bak), "%s.v1.bak", path);
+            exists = fopen(bak, "rb");
+            if (exists != NULL) {
+                fclose(exists);
+            }
+            printf("[NET][OFURN] host: %s is a version 1 (0.3.0) sidecar: %d piece(s) converted to version 2 (%s %s)\n", path, s_ofh.n,
+                   exists != NULL ? "backup already present:" : (pc_ofurn_copy_file(path, bak) ? "backup" : "*** backup FAILED ***"), bak);
+            if (!pc_ofurn_save(path, &s_ofh)) {
+                printf("[NET][OFURN] host: *** rewriting %s as version 2 FAILED (the next save retries) ***\n", path);
+            }
+        }
         if (rc == PC_OFURN_FILE_BAD) {
             s_ofh_state = -1;
             pc_ofurn_table_init(&s_ofh);
@@ -49724,31 +49756,142 @@ static int pcnetgame_ofurn_send(PCNetPeerId peer, PCOfurnMsg* m) {
     return pc_net_send(peer, PC_NET_RELIABLE, m, (uint16_t)sizeof(*m)) ? 1 : 0;
 }
 
-/* a change of the host table: SYNCED peers get the delta, a peer mid-list restarts its list (its BEGIN gen no longer matches) */
-static void pcnetgame_ofurn_broadcast(uint8_t kind, const PCOfurnMarker* mk) {
+static void pcnetgame_ofurn_note_slide(const PCOfurnWireEntry* from, const PCOfurnWireEntry* to, int fp); /* client section below */
+
+static int pcnetgame_ofurn_send2(PCNetPeerId peer, PCOfurnMsg* m) {
+    m->msg_type = (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN2;
+    return pc_net_send(peer, PC_NET_RELIABLE, m, (uint16_t)sizeof(*m)) ? 1 : 0;
+}
+
+/* C2: the 1x1 pieces (the only ones message 98 -- the 0.3.0 client's list -- carries) */
+static int pcnetgame_ofurn_count_1x1(void) {
+    int i, n = 0;
+    for (i = 0; i < s_ofh.n; i++) {
+        n += s_ofh.m[i].shape == (uint8_t)PC_OFURN_FP_1X1;
+    }
+    return n;
+}
+
+/* one delta on one channel (2 = message 98, the 1x1 list; 102 = message 102, every piece) to every READY peer: SYNCED peers get it, a peer mid-list restarts its
+ * list (its BEGIN gen no longer matches), a full window restarts the whole list later (nothing is lost) */
+static void pcnetgame_ofurn_send_delta(int ch102, uint8_t kind, const PCOfurnMarker* a, const PCOfurnMarker* b) {
     int p;
     PCOfurnMsg m;
     memset(&m, 0, sizeof(m));
     m.kind = kind;
-    m.count = 1;
+    m.count = (uint8_t)(b != NULL ? 2 : 1);
     m.gen = s_ofh.gen;
-    m.total = (uint32_t)s_ofh.n;
-    pcnetgame_ofurn_entry(&m.e[0], mk);
+    m.total = (uint32_t)(ch102 ? s_ofh.n : pcnetgame_ofurn_count_1x1());
+    pcnetgame_ofurn_entry(&m.e[0], a);
+    if (b != NULL) {
+        pcnetgame_ofurn_entry(&m.e[1], b);
+    }
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
+        uint8_t* state = ch102 ? &st->ofurn2_state : &st->ofurn_state;
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY) {
             continue;
         }
-        if (st->ofurn_state == PCNG_OFURN_SYNCED) {
-            if (!pcnetgame_ofurn_send((PCNetPeerId)p, &m)) {
-                st->ofurn_state = PCNG_OFURN_NEED; /* window full: the whole list follows later (nothing is lost) */
+        if (*state == PCNG_OFURN_SYNCED) {
+            if (!(ch102 ? pcnetgame_ofurn_send2((PCNetPeerId)p, &m) : pcnetgame_ofurn_send((PCNetPeerId)p, &m))) {
+                *state = PCNG_OFURN_NEED;
             }
-        } else if (st->ofurn_state == PCNG_OFURN_PUSHING) {
-            st->ofurn_state = PCNG_OFURN_NEED;
+        } else if (*state == PCNG_OFURN_PUSHING) {
+            *state = PCNG_OFURN_NEED;
         }
     }
-    printf("[NET][OFURN] host: %s tile (%u,%u) item 0x%04X (%d placed piece(s))\n", kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)mk->ut_x, (unsigned)mk->ut_z,
-           (unsigned)pc_ofurn_tile_value(mk), s_ofh.n);
+}
+
+/* a change of the host table: SET / DEL of one marker (98: 1x1 pieces only -- a 0.3.0 client never learns a multi-tile marker, it sees a leaf + invisible filler) */
+static void pcnetgame_ofurn_broadcast(uint8_t kind, const PCOfurnMarker* mk) {
+    if (mk->shape == (uint8_t)PC_OFURN_FP_1X1) {
+        pcnetgame_ofurn_send_delta(0, kind, mk, NULL);
+    }
+    pcnetgame_ofurn_send_delta(1, kind, mk, NULL);
+    printf("[NET][OFURN] host: %s tile (%u,%u) item 0x%04X shape %u (%d placed piece(s))\n", kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)mk->ut_x, (unsigned)mk->ut_z,
+           (unsigned)pc_ofurn_tile_value(mk), (unsigned)mk->shape, s_ofh.n);
+}
+
+/* C2: a MOVE / ROTATE of one piece: 102 MOVE (old -> new, the clients slide / turn the model); 98 (1x1 only): DEL old + SET new, or SET when the origin stayed */
+static void pcnetgame_ofurn_broadcast_move(const PCOfurnMarker* before, const PCOfurnMarker* after) {
+    if (after->shape == (uint8_t)PC_OFURN_FP_1X1) {
+        if (before->ut_x != after->ut_x || before->ut_z != after->ut_z) {
+            pcnetgame_ofurn_send_delta(0, (uint8_t)PC_OFURN_MK_DEL, before, NULL);
+        }
+        pcnetgame_ofurn_send_delta(0, (uint8_t)PC_OFURN_MK_SET, after, NULL);
+    }
+    pcnetgame_ofurn_send_delta(1, (uint8_t)PC_OFURN_MK_MOVE, before, after);
+    {
+        PCOfurnWireEntry a, b; /* the listen host's own renderer slides the model too */
+        pcnetgame_ofurn_entry(&a, before);
+        pcnetgame_ofurn_entry(&b, after);
+        pcnetgame_ofurn_note_slide(&a, &b, (int)after->shape);
+    }
+    printf("[NET][OFURN] host: MOVE (%u,%u) 0x%04X -> (%u,%u) 0x%04X shape %u\n", (unsigned)before->ut_x, (unsigned)before->ut_z, (unsigned)pc_ofurn_tile_value(before),
+           (unsigned)after->ut_x, (unsigned)after->ut_z, (unsigned)pc_ofurn_tile_value(after), (unsigned)after->shape);
+}
+
+/* C2: CAPS + the list of EVERY piece on message 102 (the same join gate as 98) */
+static void pcnetgame_ofurn_host_pump_peer2(PCNetPeerId peer) {
+    PCNetGameHostPeerState* st = &s_host_peer[peer];
+    int sent = 0;
+    if (s_host_peer_link[peer] != PC_NETGAME_LINK_READY || !st->bound_valid || !st->ofurn_perms_valid) {
+        return; /* after the 98 PERMS (the client has the C1 state first) */
+    }
+    if (!st->ofurn2_caps_sent) {
+        PCOfurnMsg m;
+        memset(&m, 0, sizeof(m));
+        m.kind = PC_OFURN_MK_CAPS;
+        m.flags = (uint8_t)PC_OFURN_C2_ALL;
+        m.gen = s_ofh.gen;
+        if (!pcnetgame_ofurn_send2(peer, &m)) {
+            return;
+        }
+        st->ofurn2_caps_sent = 1;
+    }
+    while (sent < 3 && pcnetgame_host_join_push_ok((int)peer)) {
+        PCOfurnMsg m;
+        memset(&m, 0, sizeof(m));
+        m.gen = s_ofh.gen;
+        m.total = (uint32_t)s_ofh.n;
+        if (st->ofurn2_state == PCNG_OFURN_NEED) {
+            m.kind = PC_OFURN_MK_BEGIN;
+            if (!pcnetgame_ofurn_send2(peer, &m)) {
+                return;
+            }
+            st->ofurn2_state = PCNG_OFURN_PUSHING;
+            st->ofurn2_gen = s_ofh.gen;
+            st->ofurn2_next = 0;
+        } else if (st->ofurn2_state == PCNG_OFURN_PUSHING) {
+            if (st->ofurn2_gen != s_ofh.gen) {
+                st->ofurn2_state = PCNG_OFURN_NEED;
+                continue;
+            }
+            if ((int)st->ofurn2_next < s_ofh.n) {
+                int i;
+                m.kind = PC_OFURN_MK_CHUNK;
+                for (i = 0; i < PC_OFURN_MSG_ENTRIES && (int)st->ofurn2_next + i < s_ofh.n; i++) {
+                    pcnetgame_ofurn_entry(&m.e[i], &s_ofh.m[st->ofurn2_next + i]);
+                }
+                m.count = (uint8_t)i;
+                if (!pcnetgame_ofurn_send2(peer, &m)) {
+                    return;
+                }
+                st->ofurn2_next = (uint16_t)(st->ofurn2_next + i);
+            } else {
+                m.kind = PC_OFURN_MK_END;
+                if (!pcnetgame_ofurn_send2(peer, &m)) {
+                    return;
+                }
+                st->ofurn2_state = PCNG_OFURN_SYNCED;
+                printf("[NET][OFURN] host: peer %d has the C2 list of every placed piece (%d piece(s), gen %u)\n", (int)peer, s_ofh.n, (unsigned)s_ofh.gen);
+                return;
+            }
+        } else {
+            return;
+        }
+        sent++;
+    }
 }
 
 static void pcnetgame_ofurn_host_pump_peer(PCNetPeerId peer) {
@@ -49776,7 +49919,7 @@ static void pcnetgame_ofurn_host_pump_peer(PCNetPeerId peer) {
         if (st->ofurn_state == PCNG_OFURN_NEED) {
             m.kind = PC_OFURN_MK_BEGIN;
             m.gen = s_ofh.gen;
-            m.total = (uint32_t)s_ofh.n;
+            m.total = (uint32_t)pcnetgame_ofurn_count_1x1();
             if (!pcnetgame_ofurn_send(peer, &m)) {
                 return;
             }
@@ -49789,22 +49932,25 @@ static void pcnetgame_ofurn_host_pump_peer(PCNetPeerId peer) {
                 continue;
             }
             if ((int)st->ofurn_next < s_ofh.n) {
-                int i;
+                int i, k = 0;
                 m.kind = PC_OFURN_MK_CHUNK;
                 m.gen = s_ofh.gen;
-                m.total = (uint32_t)s_ofh.n;
-                for (i = 0; i < PC_OFURN_MSG_ENTRIES && (int)st->ofurn_next + i < s_ofh.n; i++) {
-                    pcnetgame_ofurn_entry(&m.e[i], &s_ofh.m[st->ofurn_next + i]);
+                m.total = (uint32_t)pcnetgame_ofurn_count_1x1();
+                /* C2: 98 carries the 1x1 pieces only (a 0.3.0 client would draw a multi-tile entry as a 1x1 model); the cursor walks the whole table */
+                for (i = 0; k < PC_OFURN_MSG_ENTRIES && (int)st->ofurn_next + i < s_ofh.n; i++) {
+                    if (s_ofh.m[st->ofurn_next + i].shape == (uint8_t)PC_OFURN_FP_1X1) {
+                        pcnetgame_ofurn_entry(&m.e[k++], &s_ofh.m[st->ofurn_next + i]);
+                    }
                 }
-                m.count = (uint8_t)i;
-                if (!pcnetgame_ofurn_send(peer, &m)) {
+                m.count = (uint8_t)k;
+                if (k > 0 && !pcnetgame_ofurn_send(peer, &m)) {
                     return;
                 }
                 st->ofurn_next = (uint16_t)(st->ofurn_next + i);
             } else {
                 m.kind = PC_OFURN_MK_END;
                 m.gen = s_ofh.gen;
-                m.total = (uint32_t)s_ofh.n;
+                m.total = (uint32_t)pcnetgame_ofurn_count_1x1();
                 if (!pcnetgame_ofurn_send(peer, &m)) {
                     return;
                 }
@@ -49819,23 +49965,118 @@ static void pcnetgame_ofurn_host_pump_peer(PCNetPeerId peer) {
     }
 }
 
-/* GC: a marker whose tile no longer holds exactly base | rot is dropped (a police-box sweep, a vanilla pickup, a new structure, a host-side write) */
-static void pcnetgame_ofurn_host_gc(void) {
-    int i, removed = 0;
-    for (i = s_ofh.n - 1; i >= 0; i--) {
+/* C2: the footprint class of a furniture item (its profile's aFTR shape), -1 = unknown */
+static int pcnetgame_ofurn_item_fp(uint16_t item) {
+    return pc_ofurn_fp_from_shape(aMR_PC_FtrItemShape((int)item));
+}
+
+/* C2: the value cell i (0 = the origin) of a marker must hold */
+static uint16_t pcnetgame_ofurn_cell_value(const PCOfurnMarker* mk, int i) {
+    return i == 0 ? pc_ofurn_tile_value(mk) : (uint16_t)PC_OFURN_FILLER;
+}
+
+/* 1 = every footprint cell holds the marker's value (origin: id | rot, the others: the filler); *bad_x / *bad_z / *bad_v = the first cell that does not */
+static int pcnetgame_ofurn_tiles_match(const PCOfurnMarker* mk, int* bad_x, int* bad_z, uint16_t* bad_v) {
+    int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], n, i;
+    n = pc_ofurn_marker_cells(mk, xs, zs);
+    if (n == 0) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
         int acre, tile;
         uint16_t v = 0;
+        if (!pcfa_town_ut_to_acre_tile(xs[i], zs[i], &acre, &tile) || !pcfa_get_tile(acre, tile, &v) || v != pcnetgame_ofurn_cell_value(mk, i)) {
+            if (bad_x != NULL) {
+                *bad_x = xs[i];
+                *bad_z = zs[i];
+                *bad_v = v;
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* C2: writes a footprint change in one go: every cell of `before` (NULL = none) that `after` (NULL = none) does not cover becomes EMPTY, every cell of `after` gets its
+ * value. On a failed write every touched tile gets its old value back. 1 = done; *mask = the touched acres (for the FIELD_UPDATE flush). */
+static int pcnetgame_ofurn_write_cells(const PCOfurnMarker* before, const PCOfurnMarker* after, uint32_t* mask) {
+    int xs[2 * PC_OFURN_FP_MAX_CELLS], zs[2 * PC_OFURN_FP_MAX_CELLS], acre[2 * PC_OFURN_FP_MAX_CELLS], tile[2 * PC_OFURN_FP_MAX_CELLS];
+    uint16_t want[2 * PC_OFURN_FP_MAX_CELLS], old[2 * PC_OFURN_FP_MAX_CELLS];
+    int bx[PC_OFURN_FP_MAX_CELLS], bz[PC_OFURN_FP_MAX_CELLS], ax[PC_OFURN_FP_MAX_CELLS], az[PC_OFURN_FP_MAX_CELLS];
+    int nb = 0, na = 0, n = 0, i, j;
+    *mask = 0;
+    if (before != NULL) {
+        nb = pc_ofurn_marker_cells(before, bx, bz);
+    }
+    if (after != NULL) {
+        na = pc_ofurn_marker_cells(after, ax, az);
+    }
+    for (i = 0; i < nb; i++) {
+        int kept = 0;
+        for (j = 0; j < na; j++) {
+            kept |= ax[j] == bx[i] && az[j] == bz[i];
+        }
+        if (!kept) {
+            xs[n] = bx[i];
+            zs[n] = bz[i];
+            want[n++] = (uint16_t)EMPTY_NO;
+        }
+    }
+    for (j = 0; j < na; j++) {
+        xs[n] = ax[j];
+        zs[n] = az[j];
+        want[n++] = pcnetgame_ofurn_cell_value(after, j);
+    }
+    for (i = 0; i < n; i++) {
+        if (!pcfa_town_ut_to_acre_tile(xs[i], zs[i], &acre[i], &tile[i]) || !pcfa_get_tile(acre[i], tile[i], &old[i])) {
+            return 0; /* nothing written yet */
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (!pcfa_set_tile(acre[i], tile[i], want[i])) {
+            for (j = 0; j < i; j++) {
+                (void)pcfa_set_tile(acre[j], tile[j], old[j]);
+            }
+            return 0;
+        }
+        *mask |= (uint32_t)1u << acre[i];
+    }
+    return 1;
+}
+
+/* GC: a marker whose footprint no longer holds exactly its values is dropped (a police-box sweep / a vanilla pickup of the origin, a new structure, a host-side write
+ * over ANY cell). The cells that still hold the filler are cleared (no vanilla code ever clears RSV_FE1F on the field); a surviving origin stays a leaf (never lost). */
+static void pcnetgame_ofurn_host_gc(void) {
+    int i, removed = 0;
+    uint32_t mask = 0;
+    for (i = s_ofh.n - 1; i >= 0; i--) {
+        int bx = 0, bz = 0;
+        uint16_t bv = 0;
         const PCOfurnMarker mk = s_ofh.m[i];
-        if (!pcfa_town_ut_to_acre_tile(mk.ut_x, mk.ut_z, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) || v != pc_ofurn_tile_value(&mk)) {
+        if (!pcnetgame_ofurn_tiles_match(&mk, &bx, &bz, &bv)) {
+            int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], n, k, cleared = 0;
             (void)pc_ofurn_remove_at(&s_ofh, i);
-            printf("[NET][OFURN] host: GC tile (%u,%u): it holds 0x%04X now, not the placed 0x%04X -- marker dropped\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)v,
-                   (unsigned)pc_ofurn_tile_value(&mk));
+            n = pc_ofurn_marker_cells(&mk, xs, zs);
+            for (k = 1; k < n; k++) {
+                int acre, tile;
+                uint16_t v = 0;
+                if (pcfa_town_ut_to_acre_tile(xs[k], zs[k], &acre, &tile) && pcfa_get_tile(acre, tile, &v) && v == (uint16_t)PC_OFURN_FILLER &&
+                    pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO)) {
+                    mask |= (uint32_t)1u << acre;
+                    cleared++;
+                }
+            }
+            printf("[NET][OFURN] host: GC tile (%u,%u) shape %u: cell (%d,%d) holds 0x%04X now, not the placed piece -- marker dropped, %d filler cell(s) cleared\n",
+                   (unsigned)mk.ut_x, (unsigned)mk.ut_z, (unsigned)mk.shape, bx, bz, (unsigned)bv, cleared);
             pcnetgame_ofurn_broadcast(PC_OFURN_MK_DEL, &mk);
             removed++;
         }
     }
     if (removed > 0) {
         (void)pcnetgame_ofurn_host_save();
+    }
+    if (mask != 0u) {
+        pcnetgame_host_flush_mask(mask);
     }
 }
 
@@ -49854,13 +50095,17 @@ static void pcnetgame_ofurn_host_tick(void) {
     }
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         pcnetgame_ofurn_host_pump_peer((PCNetPeerId)p);
+        if (s_ofh_state == 1) {
+            pcnetgame_ofurn_host_pump_peer2((PCNetPeerId)p); /* C2: message 102 */
+        }
     }
     pcnetgame_ofurn_client_tick(); /* the TEST-ONLY seam driver also runs for the listen host's own player */
 }
 
 /* ---- validation (READ-ONLY): 0 = placeable, else a PC_NETGAME_TXN_REASON_* and *why ---- */
 static int pcnetgame_ofurn_is_structure(uint16_t v) {
-    return v >= 0xF000u; /* DUMMY_* structure placeholders, RSV_SIGNBOARD, RSV_NO (house / building footprints) */
+    /* DUMMY_* structure placeholders, RSV_SIGNBOARD, RSV_NO (house / building footprints); never the C2 filler of a placed piece (furniture may stand side by side) */
+    return v >= 0xF000u && v != (uint16_t)PC_OFURN_FILLER;
 }
 
 /* the TILE rules of a placement (no player, no item): 0 = placeable, else a reason + *why */
@@ -49893,9 +50138,69 @@ static uint8_t pcnetgame_ofurn_tile_rules(int ux, int uz, const char** why) {
     return 0;
 }
 
-static uint8_t pcnetgame_ofurn_check_place(int ux, int uz, uint16_t item, int player_ux, int player_uz, const char** why) {
+/* C2: the tile rules for the given cells of a footprint + one ground height (|dy| <= 4 against the first cell centre of `ref`: no piece across a cliff / slope step);
+ * 0 = placeable */
+static uint8_t pcnetgame_ofurn_cells_rules(const int* xs, const int* zs, int n, int ref_x, int ref_z, const char** why) {
+    xyz_t c0, c;
+    int i;
+    uint8_t r;
+    if (!mFI_UtNum2CenterWpos(&c0, ref_x, ref_z)) {
+        *why = "not a town tile";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+    }
+    c0.y = mCoBG_GetBgY_OnlyCenter_FromWpos(c0, 0.0f); /* the static ground only: a placed piece's own move-bg box (height 100) must not count */
+    for (i = 0; i < n; i++) {
+        if ((r = pcnetgame_ofurn_tile_rules(xs[i], zs[i], why)) != 0) {
+            return r;
+        }
+        if (!mFI_UtNum2CenterWpos(&c, xs[i], zs[i])) {
+            *why = "not a town tile";
+            return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+        }
+        c.y = mCoBG_GetBgY_OnlyCenter_FromWpos(c, 0.0f);
+        if (fabsf(c.y - c0.y) > 4.0f) {
+            *why = "the ground under the piece is not flat (different heights)";
+            return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+        }
+    }
+    return 0;
+}
+
+static uint8_t pcnetgame_ofurn_check_place(int ux, int uz, uint16_t item, int rot_in, int player_ux, int player_uz, const char** why) {
     int cap;
     uint8_t r;
+    const int fp = pcnetgame_ofurn_item_fp(item);
+    if (fp != PC_OFURN_FP_1X1) {
+        int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], n;
+        const int rot = rot_in & 3;
+        /* C2: multi-tile pieces (2x1 / 2x2): every cell follows the tile rules, flat ground, the player next to the footprint */
+        if (!pcnetgame_ofurn_place_on()) {
+            *why = "the Place action is off on this host";
+            return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_OFF;
+        }
+        if (s_ofh_state != 1) {
+            *why = "the placed-furniture sidecar is not usable";
+            return (uint8_t)PC_NETGAME_TXN_REASON_FAULT;
+        }
+        if (!pc_ofurn_is_ftr(item) || mNT_check_unknown((mActor_name_t)item) || fp < 0) {
+            *why = "not a furniture item (or an unknown shape)";
+            return (uint8_t)(fp < 0 && pc_ofurn_is_ftr(item) ? PC_NETGAME_TXN_REASON_OFURN_TOO_BIG : PC_NETGAME_TXN_REASON_PRECOND);
+        }
+        n = pc_ofurn_fp_cells(fp, rot, ux, uz, xs, zs);
+        if (!pc_ofurn_fp_in_town(fp, rot, ux, uz) || !pc_ofurn_fp_reach_ok(fp, rot, ux, uz, player_ux, player_uz)) {
+            *why = "the piece would leave the town / is not next to the player";
+            return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+        }
+        if ((r = pcnetgame_ofurn_cells_rules(xs, zs, n, ux, uz, why)) != 0) {
+            return r;
+        }
+        cap = pc_ofurn_caps_check(&s_ofh, pc_ofurn_acre_of(ux, uz), pcnetgame_ofurn_max_town(), pcnetgame_ofurn_max_acre());
+        if (cap != 0) {
+            *why = cap == 1 ? "the town's safety ceiling of placed furniture is reached" : "the acre's safety ceiling of placed furniture is reached";
+            return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_LIMIT;
+        }
+        return 0;
+    }
     if (!pcnetgame_ofurn_place_on()) {
         *why = "the Place action is off on this host";
         return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_OFF;
@@ -49932,8 +50237,9 @@ static int pcnetgame_ofurn_check_existing(int ux, int uz, uint16_t item, uint8_t
     int acre, tile, idx;
     uint16_t v = 0;
     idx = pc_ofurn_find(&s_ofh, ux, uz);
-    if (idx < 0 || !pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) || v != pc_ofurn_tile_value(&s_ofh.m[idx])) {
-        *why = "no placed furniture on that tile";
+    if (idx < 0 || !pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) || v != pc_ofurn_tile_value(&s_ofh.m[idx]) ||
+        !pcnetgame_ofurn_tiles_match(&s_ofh.m[idx], NULL, NULL, NULL)) {
+        *why = "no placed furniture on that tile (its origin / footprint changed)";
         *reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_GONE;
         return -1;
     }
@@ -49950,22 +50256,27 @@ static int pcnetgame_ofurn_check_existing(int ux, int uz, uint16_t item, uint8_t
     return idx;
 }
 
-/* ---- the commits (shared by kind 22 and the listen host's own player); 1 = done, 0 = FAULT (nothing changed) ---- */
+/* ---- the commits (shared by kind 22 and the listen host's own player); 1 = done, 0 = FAULT (nothing changed) ----
+ * C2: every commit writes the whole footprint (origin = id | rot, the other cells = PC_OFURN_FILLER) through pcnetgame_ofurn_write_cells (all or nothing), the
+ * sidecar first (write-ahead); MOVE / ROTATE are one reshape: the marker gets its new origin / rotation, the cells the old footprint leaves become EMPTY. */
 static int pcnetgame_ofurn_commit_place(int ux, int uz, uint16_t item, int rot, int placer_kind, const uint8_t* key, const char* name) {
     PCOfurnMarker mk;
-    int acre, tile, idx;
+    int idx;
+    uint32_t mask = 0;
+    const int fp = pcnetgame_ofurn_item_fp(item);
     memset(&mk, 0, sizeof(mk));
     mk.ut_x = (uint8_t)ux;
     mk.ut_z = (uint8_t)uz;
     mk.rot = (uint8_t)(rot & 3);
     mk.base = pc_ofurn_base(item);
+    mk.shape = (uint8_t)(fp < 0 ? PC_OFURN_FP_1X1 : fp);
     mk.placer_kind = (uint8_t)placer_kind;
     mk.placed_time = (uint32_t)time(NULL);
     if (key != NULL) {
         memcpy(mk.placer_key, key, PC_OFURN_KEY_LEN);
     }
     snprintf(mk.placer_name, sizeof(mk.placer_name), "%s", name != NULL ? name : "");
-    if (!pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile) || !pc_ofurn_add(&s_ofh, &mk)) {
+    if (fp < 0 || !pc_ofurn_fp_in_town(fp, rot & 3, ux, uz) || pc_ofurn_fp_overlaps(&s_ofh, fp, rot & 3, ux, uz, -1) || !pc_ofurn_add(&s_ofh, &mk)) {
         return 0;
     }
     if (!pcnetgame_ofurn_host_save()) { /* write-ahead: the sidecar first */
@@ -49973,56 +50284,89 @@ static int pcnetgame_ofurn_commit_place(int ux, int uz, uint16_t item, int rot, 
         (void)pc_ofurn_remove_at(&s_ofh, idx);
         return 0;
     }
-    if (!pcfa_set_tile(acre, tile, pc_ofurn_tile_value(&mk))) {
+    if (!pcnetgame_ofurn_write_cells(NULL, &mk, &mask)) {
         idx = pc_ofurn_find(&s_ofh, ux, uz);
         (void)pc_ofurn_remove_at(&s_ofh, idx);
         (void)pcnetgame_ofurn_host_save();
         return 0;
     }
-    pcnetgame_host_flush_mask((uint32_t)1u << acre); /* FIELD_UPDATE to every READY peer (an old client: a leaf) */
+    pcnetgame_host_flush_mask(mask); /* FIELD_UPDATE to every READY peer (an old client: a leaf on the origin, invisible filler on the other cells) */
     pcnetgame_ofurn_broadcast(PC_OFURN_MK_SET, &mk);
     return 1;
 }
 
-static int pcnetgame_ofurn_commit_rotate(int idx, int rot) {
-    PCOfurnMarker before = s_ofh.m[idx];
-    int acre, tile;
-    if (!pcfa_town_ut_to_acre_tile(before.ut_x, before.ut_z, &acre, &tile)) {
+/* C2: the one reshape of a placed piece: a new rotation (ROTATE) and / or a new origin (MOVE). The caller validated the new cells. */
+static int pcnetgame_ofurn_commit_reshape(int idx, int rot, int nox, int noz) {
+    const PCOfurnMarker before = s_ofh.m[idx];
+    PCOfurnMarker after = before;
+    uint32_t mask = 0;
+    after.rot = (uint8_t)(rot & 3);
+    after.ut_x = (uint8_t)nox;
+    after.ut_z = (uint8_t)noz;
+    if (!pc_ofurn_fp_in_town((int)after.shape, (int)after.rot, nox, noz) || pc_ofurn_fp_overlaps(&s_ofh, (int)after.shape, (int)after.rot, nox, noz, idx)) {
         return 0;
     }
-    s_ofh.m[idx].rot = (uint8_t)(rot & 3);
+    s_ofh.m[idx] = after;
     s_ofh.gen++;
-    if (!pcnetgame_ofurn_host_save() || !pcfa_set_tile(acre, tile, pc_ofurn_tile_value(&s_ofh.m[idx]))) {
+    if (!pcnetgame_ofurn_host_save() || !pcnetgame_ofurn_write_cells(&before, &after, &mask)) {
         s_ofh.m[idx] = before;
         s_ofh.gen++;
         (void)pcnetgame_ofurn_host_save();
         return 0;
     }
-    pcnetgame_host_flush_mask((uint32_t)1u << acre);
-    pcnetgame_ofurn_broadcast(PC_OFURN_MK_SET, &s_ofh.m[idx]);
+    pcnetgame_host_flush_mask(mask);
+    pcnetgame_ofurn_broadcast_move(&before, &after);
     return 1;
 }
 
-/* removes the placed piece (marker + tile); the item itself is the caller's (a pocket / the lost and found / deleted) */
+static int pcnetgame_ofurn_commit_rotate(int idx, int rot) {
+    return pcnetgame_ofurn_commit_reshape(idx, rot, (int)s_ofh.m[idx].ut_x, (int)s_ofh.m[idx].ut_z);
+}
+
+/* removes the placed piece (marker + every footprint cell); the item itself is the caller's (a pocket / the lost and found / deleted) */
 static int pcnetgame_ofurn_commit_remove(int idx) {
     const PCOfurnMarker mk = s_ofh.m[idx];
-    int acre, tile;
-    if (!pcfa_town_ut_to_acre_tile(mk.ut_x, mk.ut_z, &acre, &tile)) {
-        return 0;
-    }
+    uint32_t mask = 0;
     (void)pc_ofurn_remove_at(&s_ofh, idx);
     if (!pcnetgame_ofurn_host_save()) {
         (void)pc_ofurn_add(&s_ofh, &mk);
         return 0;
     }
-    if (!pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO)) {
+    if (!pcnetgame_ofurn_write_cells(&mk, NULL, &mask)) {
         (void)pc_ofurn_add(&s_ofh, &mk);
         (void)pcnetgame_ofurn_host_save();
         return 0;
     }
-    pcnetgame_host_flush_mask((uint32_t)1u << acre);
+    pcnetgame_host_flush_mask(mask);
     pcnetgame_ofurn_broadcast(PC_OFURN_MK_DEL, &mk);
     return 1;
+}
+
+/* C2: the validation of a ROTATE (2x1: the cell the second half swings into) / MOVE (the cells the shifted footprint newly covers); 0 = legal */
+static uint8_t pcnetgame_ofurn_check_reshape(int idx, int rot, int nox, int noz, const char** why) {
+    const PCOfurnMarker* mk = &s_ofh.m[idx];
+    int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], n;
+    if (!pc_ofurn_fp_in_town((int)mk->shape, rot & 3, nox, noz)) {
+        *why = "the piece would leave the town";
+        return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+    }
+    n = pc_ofurn_fp_new_cells((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, rot & 3, nox, noz, xs, zs);
+    return n == 0 ? 0 : pcnetgame_ofurn_cells_rules(xs, zs, n, (int)mk->ut_x, (int)mk->ut_z, why);
+}
+
+/* C2: a MOVE request: the new origin from the piece, the direction and the requester's side (the host's copy of the position may lag one step: the 4 orthogonal
+ * neighbours are tried too -- never a diagonal, which would let a player beside the piece push it); 0 = legal + *nox / *noz */
+static uint8_t pcnetgame_ofurn_check_move(int idx, int dir, int pull, int pux, int puz, int* nox, int* noz, const char** why) {
+    static const int ring[5][2] = { { 0, 0 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+    const PCOfurnMarker* mk = &s_ofh.m[idx];
+    int i, fx, fz;
+    for (i = 0; i < 5; i++) {
+        if (pc_ofurn_move_geometry((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, dir, pull, pux + ring[i][0], puz + ring[i][1], nox, noz, &fx, &fz)) {
+            return pcnetgame_ofurn_check_reshape(idx, (int)mk->rot, *nox, *noz, why);
+        }
+    }
+    *why = pull ? "the player is not in front of the piece (pull)" : "the player is not behind the piece (push)";
+    return (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
 }
 
 /* ---- the vanilla pickup / drop gates (called from pcnetgame_validate_and_resolve_pickup / pcnetgame_is_droppable_item) ---- */
@@ -50069,7 +50413,7 @@ static void pcnetgame_handle_host_ofurn_txn(PCNetPeerId peer, const PCNetGameTxn
     const char* why = NULL;
     uint8_t reason = 0;
     unsigned dest_code;
-    int idx, midx = -1, kind = 0, pux, puz;
+    int idx, midx = -1, kind = 0, pux, puz, move_x = 0, move_z = 0;
     uint8_t key[PC_OPS_KEY_LEN];
     char name[PC_OPS_NAME_MAX];
     float px = 0.0f, py = 0.0f, pz = 0.0f;
@@ -50161,7 +50505,8 @@ static void pcnetgame_handle_host_ofurn_txn(PCNetPeerId peer, const PCNetGameTxn
     }
     pux = (int)(px / mFI_UT_WORLDSIZE_X_F);
     puz = (int)(pz / mFI_UT_WORLDSIZE_Z_F);
-    if (why == NULL && !pc_ofurn_rate_ok(&st->ofurn_rate, pcnetgame_now_ms(), 200u, 120)) { /* generous: 5 ops a second at most, 120 a minute */
+    if (why == NULL && !pc_ofurn_rate_ok(&st->ofurn_rate, pcnetgame_now_ms(), 150u, 240)) { /* generous: ~6 ops a second at most, 240 a minute (C2: a push / pull step
+                                                                                         * takes ~0.8 s, so continuous pushing stays far below) */
         why = "rate limited";
         reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_RATE;
     }
@@ -50174,24 +50519,36 @@ static void pcnetgame_handle_host_ofurn_txn(PCNetPeerId peer, const PCNetGameTxn
                 } else if (t->pre_pockets[t->slot] != t->item || mPr_GET_ITEM_COND(t->pre_conds, t->slot) != mPr_ITEM_COND_NORMAL) {
                     why = "the pocket slot does not hold that furniture (or it is wrapped / a quest item)";
                     reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
-                } else if ((reason = pcnetgame_ofurn_check_place(ux, uz, t->item, pux, puz, &why)) == 0) {
+                } else if ((reason = pcnetgame_ofurn_check_place(ux, uz, t->item, (int)t->flags, pux, puz, &why)) == 0) {
                     post[t->slot] = (uint16_t)EMPTY_NO;
                     post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
                 }
                 break;
             case PC_OFURN_OP_ROTATE:
             case PC_OFURN_OP_PICKUP:
+            case PC_OFURN_OP_MOVE:
                 if (!pcnetgame_ofurn_peer_may_pickup(peer)) {
-                    why = "only residents and operators may pick up / rotate placed furniture";
+                    why = "only residents and operators may move / pick up / rotate placed furniture";
                     reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_NOT_ALLOWED;
                 } else if (s_ofh_state != 1) {
                     why = "the placed-furniture sidecar is not usable";
                     reason = (uint8_t)PC_NETGAME_TXN_REASON_FAULT;
                 } else if ((midx = pcnetgame_ofurn_check_existing(ux, uz, t->item, &reason, &why)) < 0) {
                     /* why / reason set */
-                } else if (!pc_ofurn_reach_ok(pux, puz, ux, uz)) {
+                } else if (op == PC_OFURN_OP_MOVE) {
+                    /* C2: one tile, the player's side checked against the footprint, every newly covered cell follows the placement rules */
+                    reason = pcnetgame_ofurn_check_move(midx, (int)(t->flags & 3u), (t->flags & PC_OFURN_MOVE_PULL) != 0, pux, puz, &move_x, &move_z, &why);
+                } else if (!pc_ofurn_fp_reach_ok((int)s_ofh.m[midx].shape, (int)s_ofh.m[midx].rot, ux, uz, pux, puz) &&
+                           !pc_ofurn_fp_reach_ok((int)s_ofh.m[midx].shape, (int)s_ofh.m[midx].rot, ux, uz, pux + (pux < ux ? 1 : -1), puz) &&
+                           !pc_ofurn_fp_reach_ok((int)s_ofh.m[midx].shape, (int)s_ofh.m[midx].rot, ux, uz, pux, puz + (puz < uz ? 1 : -1))) {
+                    /* next to any cell of the footprint (one tile of lag towards the piece tolerated: the player may just have pushed / pulled) */
                     why = "the piece is not next to the player";
                     reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+                } else if (op == PC_OFURN_OP_ROTATE && pc_ofurn_fp_covers((int)s_ofh.m[midx].shape, (int)t->flags, ux, uz, pux, puz)) {
+                    why = "the piece would turn onto the player"; /* vanilla aMR_RotatePermission */
+                    reason = (uint8_t)PC_NETGAME_TXN_REASON_OFURN_BAD_TILE;
+                } else if (op == PC_OFURN_OP_ROTATE) {
+                    reason = pcnetgame_ofurn_check_reshape(midx, (int)t->flags, ux, uz, &why); /* C2: a 2x1 swings its second half into one new cell */
                 } else if (op == PC_OFURN_OP_PICKUP) {
                     if (t->pre_pockets[t->slot] != (uint16_t)EMPTY_NO) {
                         why = "the destination pocket slot is not free";
@@ -50221,11 +50578,12 @@ static void pcnetgame_handle_host_ofurn_txn(PCNetPeerId peer, const PCNetGameTxn
     /* THE commit: world + marker (write-ahead sidecar) + the pocket mirror in one handler call */
     if (!(op == PC_OFURN_OP_PLACE ? pcnetgame_ofurn_commit_place(ux, uz, t->item, (int)t->flags, kind == PC_OPS_KIND_GUEST ? PC_OFURN_PLACER_GUEST : PC_OFURN_PLACER_RESIDENT, key, name)
           : op == PC_OFURN_OP_ROTATE ? pcnetgame_ofurn_commit_rotate(midx, (int)t->flags)
+          : op == PC_OFURN_OP_MOVE   ? pcnetgame_ofurn_commit_reshape(midx, (int)s_ofh.m[midx].rot, move_x, move_z)
                                      : pcnetgame_ofurn_commit_remove(midx))) {
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FAULT, 1, NULL, "the sidecar / tile write failed (nothing changed)");
         return;
     }
-    if (op != PC_OFURN_OP_ROTATE) {
+    if (op == PC_OFURN_OP_PLACE || op == PC_OFURN_OP_PICKUP) {
         (void)pcnetgame_rec_txn_write_inventory(idx, post, post_conds, post_wallet);
         slot->rev++;
         slot->dirty_unsaved = 1;
@@ -50264,6 +50622,18 @@ static int pcnetgame_ofurn_test_find_tile(int skip_ux, int skip_uz, int* out_ux,
     return 0;
 }
 
+/* TEST-ONLY: every footprint cell of `item` at rotation `rot` on (tx, tz) follows the placement rules, and the tile south of it (where a player stands) is no cell */
+static int pcnetgame_ofurn_test_cells_ok(int tx, int tz, int item, int rot) {
+    int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], n;
+    const char* why;
+    const int fp = pcnetgame_ofurn_item_fp((uint16_t)item);
+    if (fp < 0 || !pc_ofurn_fp_in_town(fp, rot & 3, tx, tz)) {
+        return 0;
+    }
+    n = pc_ofurn_fp_cells(fp, rot & 3, tx, tz, xs, zs);
+    return pcnetgame_ofurn_cells_rules(xs, zs, n, tx, tz, &why) == 0;
+}
+
 static void pcnetgame_ofurn_test_seed(void) {
     static int done = 0, done_gc = 0, done_ops = 0;
     static int sx = -100, sz = -100;
@@ -50292,8 +50662,9 @@ static void pcnetgame_ofurn_test_seed(void) {
                     for (dz = -rad; dz <= rad && !done; dz++) {
                         for (dx = -rad; dx <= rad && !done; dx++) {
                             const int tx = pux + dx, tz = puz + dz;
-                            if ((dx != -rad && dx != rad && dz != -rad && dz != rad) || pcnetgame_ofurn_tile_rules(tx, tz, &why) != 0 ||
-                                pcnetgame_ofurn_tile_rules(tx, tz + 1, &why) != 0) {
+                            if ((dx != -rad && dx != rad && dz != -rad && dz != rad) || !pcnetgame_ofurn_test_cells_ok(tx, tz, item, rot) ||
+                                pcnetgame_ofurn_tile_rules(tx, tz + 1, &why) != 0 || pcnetgame_ofurn_tile_rules(tx, tz + 2, &why) != 0) {
+                                /* (C2: two free tiles south: the real client stands on the first and can pull the piece onto it) */
                                 continue;
                             }
                             done = 1;
@@ -50322,7 +50693,7 @@ static void pcnetgame_ofurn_test_seed(void) {
         seed_ms = pcnetgame_now_ms();
         if ((e = pc_test_hook_getenv("AC_TEST_OFURN_SEED")) != NULL) {
             int item = 0, rot = 0;
-            if (sscanf(e, "%i,%d", &item, &rot) >= 1 && pcnetgame_ofurn_test_find_tile(-100, -100, &sx, &sz)) {
+            if (sscanf(e, "%i,%d", &item, &rot) >= 1 && pcnetgame_ofurn_test_find_tile(-100, -100, &sx, &sz) && pcnetgame_ofurn_test_cells_ok(sx, sz, item, rot)) {
                 printf("[NET][OFURN][TEST-ONLY] host: seeded placed piece at (%d,%d) item 0x%04X rot %d -> %s\n", sx, sz, (unsigned)item, rot & 3,
                        pcnetgame_ofurn_commit_place(sx, sz, (uint16_t)item, rot & 3, PC_OFURN_PLACER_HOST, NULL, "test-seed") ? "placed" : "FAILED");
             } else {
@@ -50339,11 +50710,21 @@ static void pcnetgame_ofurn_test_seed(void) {
         }
     }
     if (!done_gc && sx >= 0 && (e = pc_test_hook_getenv("AC_TEST_OFURN_GC_MS")) != NULL && (uint32_t)(pcnetgame_now_ms() - seed_ms) >= (uint32_t)strtoul(e, NULL, 0)) {
-        int acre, tile;
+        int acre, tile, gx = sx, gz = sz;
+        const int k = pc_ofurn_find(&s_ofh, sx, sz);
         done_gc = 1;
-        if (pcfa_town_ut_to_acre_tile(sx, sz, &acre, &tile) && pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO)) {
+        if (pc_test_hook_getenv("AC_TEST_OFURN_GC_CELL") != NULL && k >= 0) {
+            /* C2: overwrite a FILLER cell (the second cell of a multi-tile piece) instead of the origin: the GC must drop the marker and clear the other filler cells */
+            int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS];
+            if (pc_ofurn_marker_cells(&s_ofh.m[k], xs, zs) > 1) {
+                gx = xs[1];
+                gz = zs[1];
+            }
+        }
+        if (pcfa_town_ut_to_acre_tile(gx, gz, &acre, &tile) && pcfa_set_tile(acre, tile, (uint16_t)EMPTY_NO)) {
             pcnetgame_host_flush_mask((uint32_t)1u << acre);
-            printf("[NET][OFURN][TEST-ONLY] host: overwrote the seeded tile (%d,%d) with EMPTY behind the system's back (the GC must drop its marker)\n", sx, sz);
+            printf("[NET][OFURN][TEST-ONLY] host: overwrote the seeded tile (%d,%d) cell (%d,%d) with EMPTY behind the system's back (the GC must drop its marker)\n", sx, sz,
+                   gx, gz);
         }
     }
     if (!done_ops && (e = pc_test_hook_getenv("AC_TEST_OPS")) != NULL) {
@@ -50376,7 +50757,16 @@ static struct {
     uint32_t op_rid;
     int      last_outcome;    /* TEST-ONLY observation: 1 APPLIED, 2 REJECTED */
     uint8_t  last_reason;
+    /* C2 (message 102) */
+    int      have_c2;         /* the host's 102 CAPS arrived */
+    uint8_t  c2_flags;        /* PC_OFURN_C2_* */
+    int      have_list2;      /* a 102 list END arrived: s_ofc2 is the view */
+    int      staging2;
+    uint32_t stage2_gen;
+    uint32_t op_serial;       /* +1 per begun op (the grab driver's handle) */
+    uint32_t done_serial;     /* the serial of the last resolved op */
 } s_ofcl;
+static PCOfurnTable s_ofc2, s_ofc2_stage;
 
 int pcnetgame_ofurn_client_leaf_ok(void) {
     if (s_ofcl.have_perms) {
@@ -50388,6 +50778,8 @@ int pcnetgame_ofurn_client_leaf_ok(void) {
 static void pcnetgame_ofurn_session_reset(void) {
     pc_ofurn_table_init(&s_ofc);
     pc_ofurn_table_init(&s_ofc_stage);
+    pc_ofurn_table_init(&s_ofc2);
+    pc_ofurn_table_init(&s_ofc2_stage);
     memset(&s_ofcl, 0, sizeof(s_ofcl));
 }
 
@@ -50421,9 +50813,131 @@ static void pcnetgame_ofurn_apply_entries(PCOfurnTable* t, const PCOfurnMsg* m, 
             mk.base = pc_ofurn_base(m->e[i].item);
             mk.rot = (uint8_t)(m->e[i].item & 3u);
             mk.placed_time = m->e[i].placed_time;
+            if (m->msg_type == (uint8_t)PC_OFURN_MSG2_ID) {
+                /* C2: the footprint from the item's furniture profile (never sent); 98 entries are 1x1 by definition */
+                const int fp = pcnetgame_ofurn_item_fp(m->e[i].item);
+                mk.shape = (uint8_t)(fp < 0 ? PC_OFURN_FP_1X1 : fp);
+            }
             (void)pc_ofurn_add(t, &mk);
         }
     }
+}
+
+/* C2: the client's slide / turn record of a piece another player (or the host) moved: the renderer starts the model of the new origin at the old pose */
+static struct {
+    int      valid;
+    uint8_t  to_x, to_z;
+    uint16_t to_item;
+    float    from_x, from_z;
+    int      from_rot;
+    uint32_t t0;
+} s_ofurn_slide[8];
+
+static void pcnetgame_ofurn_note_slide(const PCOfurnWireEntry* from, const PCOfurnWireEntry* to, int fp) {
+    int i, k = 0;
+    for (i = 0; i < 8; i++) {
+        if (!s_ofurn_slide[i].valid || (uint32_t)(pcnetgame_now_ms() - s_ofurn_slide[i].t0) > 3000u) {
+            k = i;
+            break;
+        }
+    }
+    s_ofurn_slide[k].valid = 1;
+    s_ofurn_slide[k].to_x = to->ut_x;
+    s_ofurn_slide[k].to_z = to->ut_z;
+    s_ofurn_slide[k].to_item = to->item;
+    pc_ofurn_fp_model_pos(fp, (int)from->ut_x, (int)from->ut_z, &s_ofurn_slide[k].from_x, &s_ofurn_slide[k].from_z);
+    s_ofurn_slide[k].from_rot = (int)(from->item & 3u);
+    s_ofurn_slide[k].t0 = pcnetgame_now_ms();
+}
+
+/* 1 = the model of (ux, uz) holding `item` should start at the old pose (*x, *z, *rot) of a recent MOVE (consumed); ms = its age */
+int pc_net_game_ofurn_take_slide(int ux, int uz, int item, float* x, float* z, int* rot, uint32_t* age_ms) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (s_ofurn_slide[i].valid && s_ofurn_slide[i].to_x == ux && s_ofurn_slide[i].to_z == uz && s_ofurn_slide[i].to_item == (uint16_t)item) {
+            s_ofurn_slide[i].valid = 0;
+            *age_ms = pcnetgame_now_ms() - s_ofurn_slide[i].t0;
+            if (*age_ms > 1500u) {
+                return 0;
+            }
+            *x = s_ofurn_slide[i].from_x;
+            *z = s_ofurn_slide[i].from_z;
+            *rot = s_ofurn_slide[i].from_rot;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (!pc_ofurn_msg2_valid(m)) {
+        printf("[NET][OFURN] client: malformed OUTDOOR_FURN2 (kind %u count %u) -- ignored\n", (unsigned)m->kind, (unsigned)m->count);
+        return;
+    }
+    switch (m->kind) {
+        case PC_OFURN_MK_CAPS:
+            if (!s_ofcl.have_c2 || s_ofcl.c2_flags != m->flags) {
+                printf("[NET][OFURN] client: the host supports outdoor furniture C2: multi-tile %s, move (grab / push / pull) %s\n", (m->flags & PC_OFURN_C2_MULTI) ? "ON" : "OFF",
+                       (m->flags & PC_OFURN_C2_MOVE) ? "ON" : "OFF");
+            }
+            s_ofcl.have_c2 = 1;
+            s_ofcl.c2_flags = m->flags;
+            break;
+        case PC_OFURN_MK_BEGIN:
+            pc_ofurn_table_init(&s_ofc2_stage);
+            s_ofcl.staging2 = 1;
+            s_ofcl.stage2_gen = m->gen;
+            break;
+        case PC_OFURN_MK_CHUNK:
+            if (s_ofcl.staging2 && m->gen == s_ofcl.stage2_gen) {
+                pcnetgame_ofurn_apply_entries(&s_ofc2_stage, m, 0);
+            }
+            break;
+        case PC_OFURN_MK_END:
+            if (s_ofcl.staging2 && m->gen == s_ofcl.stage2_gen) {
+                const uint32_t g = s_ofc2.gen;
+                memcpy(&s_ofc2, &s_ofc2_stage, sizeof(s_ofc2));
+                s_ofc2.gen = g + 1u;
+                s_ofcl.staging2 = 0;
+                s_ofcl.have_list2 = 1;
+                printf("[NET][OFURN] client: C2 list of every placed piece: %d piece(s) (host gen %u)\n", s_ofc2.n, (unsigned)m->gen);
+            }
+            break;
+        case PC_OFURN_MK_MOVE: {
+            /* e[0] = the old origin, e[1] = the new origin + item: one marker, re-keyed (DEL old + SET new) */
+            PCOfurnMsg d = *m, s = *m;
+            const int fp = pcnetgame_ofurn_item_fp(m->e[1].item);
+            d.count = 1;
+            s.count = 1;
+            s.e[0] = m->e[1];
+            pcnetgame_ofurn_apply_entries(&s_ofc2, &d, 1);
+            pcnetgame_ofurn_apply_entries(&s_ofc2, &s, 0);
+            if (s_ofcl.staging2) {
+                pcnetgame_ofurn_apply_entries(&s_ofc2_stage, &d, 1);
+                pcnetgame_ofurn_apply_entries(&s_ofc2_stage, &s, 0);
+            }
+            pcnetgame_ofurn_note_slide(&m->e[0], &m->e[1], fp < 0 ? PC_OFURN_FP_1X1 : fp);
+            printf("[NET][OFURN] client: MOVE (%u,%u) 0x%04X -> (%u,%u) 0x%04X\n", (unsigned)m->e[0].ut_x, (unsigned)m->e[0].ut_z, (unsigned)m->e[0].item,
+                   (unsigned)m->e[1].ut_x, (unsigned)m->e[1].ut_z, (unsigned)m->e[1].item);
+            break;
+        }
+        default: /* SET / DEL */
+            pcnetgame_ofurn_apply_entries(&s_ofc2, m, m->kind == PC_OFURN_MK_DEL);
+            if (s_ofcl.staging2) {
+                pcnetgame_ofurn_apply_entries(&s_ofc2_stage, m, m->kind == PC_OFURN_MK_DEL);
+            }
+            printf("[NET][OFURN] client: C2 %s tile (%u,%u) item 0x%04X (%d placed piece(s) known)\n", m->kind == PC_OFURN_MK_SET ? "SET" : "DEL", (unsigned)m->e[0].ut_x,
+                   (unsigned)m->e[0].ut_z, (unsigned)m->e[0].item, s_ofc2.n);
+            break;
+    }
+}
+
+/* C2: 1 = the host announced this C2 feature (and this client may use it: the C1 latch / kill switch) */
+static int pcnetgame_ofurn_client_c2(uint8_t feature) {
+    return s_ofcl.have_c2 && (s_ofcl.c2_flags & feature) != 0 && !s_ofcl.unsupported;
 }
 
 static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m) {
@@ -50510,6 +51024,7 @@ static int pcnetgame_ofurn_begin(int op, int slot, uint16_t item, int flags, int
     s_ofcl.op_active = 1;
     s_ofcl.op = op;
     s_ofcl.op_rid = s_ctxn.request_id;
+    s_ofcl.op_serial++;
     printf("[NET][OFURN] client: begin %s request=%u tile (%d,%d) slot=%d item=0x%04X flags=%d\n", pcnetgame_ofurn_op_name(op), (unsigned)s_ctxn.request_id, ux, uz, slot,
            (unsigned)item, flags);
     (void)pcnetgame_txn_try_send();
@@ -50590,6 +51105,7 @@ static void pcnetgame_ofurn_op_resolve(int applied, uint8_t reason) {
     s_ofcl.op_active = 0;
     s_ofcl.last_outcome = applied ? 1 : 2;
     s_ofcl.last_reason = applied ? 0 : reason;
+    s_ofcl.done_serial = s_ofcl.op_serial;
     if (!applied && reason == (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE && !s_ofcl.unsupported) {
         s_ofcl.unsupported = 1; /* a host that announced service 10 but does not know this op: no further kind 22 in this session */
         printf("[NET][OFURN] client: the host refused OUTDOOR_FURNITURE as BAD_SHAPE: Place / Rotate stay off for this session\n");
@@ -50617,7 +51133,7 @@ const PCOfurnTable* pc_net_game_ofurn_view(void) {
         return s_ofh_state == 1 ? &s_ofh : NULL;
     }
     if (s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY) {
-        return &s_ofc;
+        return s_ofcl.have_list2 ? &s_ofc2 : &s_ofc; /* C2: the 102 list (every piece) once it arrived; a C1 host: the 98 list (1x1) */
     }
     return NULL;
 }
@@ -50665,12 +51181,25 @@ static void pcnetgame_ofurn_local_identity(uint8_t key[PC_OPS_KEY_LEN], char* na
 }
 
 int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int rot) {
+    const int fp = pcnetgame_ofurn_item_fp((uint16_t)item);
     if (pocket_slot < 0 || pocket_slot >= mPr_POCKETS_SLOT_COUNT || Now_Private == NULL) {
         return 0;
     }
-    if (aMR_PC_FtrItemShape(item) != PC_OFURN_SHAPE_1X1) {
+    if (fp < 0 || (fp != PC_OFURN_FP_1X1 && s_role == PC_NETGAME_ROLE_CLIENT && !pcnetgame_ofurn_client_c2((uint8_t)PC_OFURN_C2_MULTI))) {
         pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_TOO_BIG));
-        return 0; /* refused locally: never a round trip for a 2x1 / 2x2 piece */
+        return 0; /* refused locally: a C1 host (0.3.0) takes 1x1 pieces only -- never a round trip */
+    }
+    if (fp == PC_OFURN_FP_2X2) {
+        /* C2: a 2x2 grows +x / +z from its origin: in front of a player facing north / west the origin moves one more tile away so the square stands wholly in front */
+        int pux, puz;
+        if (pcnetgame_ofurn_local_tile(&pux, &puz)) {
+            if (ut_z - puz == -1) {
+                ut_z--;
+            }
+            if (ut_x - pux == -1) {
+                ut_x--;
+            }
+        }
     }
     if (s_role == PC_NETGAME_ROLE_HOST) {
         uint8_t key[PC_OPS_KEY_LEN];
@@ -50682,7 +51211,7 @@ int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int r
             pcnetgame_ofurn_notice(pc_ofurn_reason_text(0));
             return 0;
         }
-        reason = pcnetgame_ofurn_check_place(ut_x, ut_z, (uint16_t)item, pux, puz, &why);
+        reason = pcnetgame_ofurn_check_place(ut_x, ut_z, (uint16_t)item, rot, pux, puz, &why);
         if (reason != 0 || Now_Private->inventory.pockets[pocket_slot] != (mActor_name_t)item) {
             printf("[NET][OFURN] host: own player PLACE at (%d,%d) item 0x%04X refused (%s): %s\n", ut_x, ut_z, (unsigned)item, pcnetgame_txn_reason_name(reason),
                    why != NULL ? why : "the pocket changed");
@@ -50695,7 +51224,7 @@ int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int r
             return 0;
         }
         mPr_SetPossessionItem(Now_Private, pocket_slot, EMPTY_NO, mPr_ITEM_COND_NORMAL);
-        printf("[NET][OFURN] host: own player \"%s\" PLACE APPLIED: tile (%d,%d) item 0x%04X rot %d\n", name, ut_x, ut_z, (unsigned)item, rot);
+        printf("[NET][OFURN] host: own player \"%s\" PLACE APPLIED: tile (%d,%d) item 0x%04X rot %d shape %d\n", name, ut_x, ut_z, (unsigned)item, rot, fp);
         return 1;
     }
     if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PLACE)) {
@@ -50705,17 +51234,22 @@ int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int r
     return pcnetgame_ofurn_begin(PC_OFURN_OP_PLACE, pocket_slot, (uint16_t)item, rot & 3, ut_x, ut_z) == 1;
 }
 
-/* the placed piece at (ux, uz) in the VIEW whose tile still holds it (renderer / A / B seams) */
-static int pcnetgame_ofurn_view_at(int ux, int uz, uint16_t* value) {
+/* the placed piece covering (ux, uz) in the VIEW whose ORIGIN tile still holds it (renderer / grab / B seams): its marker index, *value = the origin tile value.
+ * C2: any footprint cell finds the piece (a filler cell in front of the player is the piece). */
+static int pcnetgame_ofurn_view_find(int ux, int uz, uint16_t* value) {
     const PCOfurnTable* t = pc_net_game_ofurn_view();
     int k, acre, tile;
     uint16_t v = 0;
-    if (t == NULL || (k = pc_ofurn_find(t, ux, uz)) < 0 || !pcfa_town_ut_to_acre_tile(ux, uz, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) ||
+    if (t == NULL || (k = pc_ofurn_find_cell(t, ux, uz)) < 0 || !pcfa_town_ut_to_acre_tile(t->m[k].ut_x, t->m[k].ut_z, &acre, &tile) || !pcfa_get_tile(acre, tile, &v) ||
         v != pc_ofurn_tile_value(&t->m[k])) {
-        return 0;
+        return -1;
     }
     *value = v;
-    return 1;
+    return k;
+}
+
+static int pcnetgame_ofurn_view_at(int ux, int uz, uint16_t* value) {
+    return pcnetgame_ofurn_view_find(ux, uz, value) >= 0;
 }
 
 int pc_net_game_ofurn_placed_at(int ut_x, int ut_z) {
@@ -50723,36 +51257,154 @@ int pc_net_game_ofurn_placed_at(int ut_x, int ut_z) {
     return pcnetgame_ofurn_view_at(ut_x, ut_z, &v);
 }
 
-int pc_net_game_ofurn_rotate(int ut_x, int ut_z) {
-    uint16_t v = 0;
-    int rot;
-    if (!pcnetgame_ofurn_view_at(ut_x, ut_z, &v)) {
+/* C2: the marker of the placed piece covering (ux, uz) (a copy; 1 = found) */
+int pc_net_game_ofurn_marker_at(int ut_x, int ut_z, PCOfurnMarker* out) {
+    uint16_t v;
+    const int k = pcnetgame_ofurn_view_find(ut_x, ut_z, &v);
+    if (k < 0) {
         return 0;
     }
-    rot = ((int)(v & 3u) + 1) & 3; /* +90 degrees (clockwise seen from above) */
-    if (s_role == PC_NETGAME_ROLE_HOST) {
-        const int idx = pc_ofurn_find(&s_ofh, ut_x, ut_z);
-        if (idx < 0 || !pcnetgame_ofurn_commit_rotate(idx, rot)) {
-            pcnetgame_ofurn_notice(pc_ofurn_reason_text(0));
-            return 1;
+    *out = pc_net_game_ofurn_view()->m[k];
+    return 1;
+}
+
+/* C2: 1 = the cells this piece would newly cover (a rotation to `rot` / a move to (nox, noz)) look free in THIS process's town field (the host decides; this only spares
+ * a round trip and gives the vanilla "won't budge" at once) */
+int pc_net_game_ofurn_cells_free(const PCOfurnMarker* mk, int rot, int nox, int noz) {
+    int xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], n, i;
+    const char* why = NULL;
+    const PCOfurnTable* t = pc_net_game_ofurn_view();
+    if (!pc_ofurn_fp_in_town((int)mk->shape, rot & 3, nox, noz)) {
+        return 0;
+    }
+    n = pc_ofurn_fp_new_cells((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, rot & 3, nox, noz, xs, zs);
+    for (i = 0; i < n; i++) {
+        if (t != NULL && pc_ofurn_find_cell(t, xs[i], zs[i]) >= 0) {
+            return 0;
         }
-        printf("[NET][OFURN] host: own player ROTATE APPLIED: tile (%d,%d) rot %d\n", ut_x, ut_z, rot);
+    }
+    return n == 0 || pcnetgame_ofurn_cells_rules(xs, zs, n, (int)mk->ut_x, (int)mk->ut_z, &why) == 0;
+}
+
+/* C2: 1 = this process may grab / move / rotate placed pieces (client: the host's PERMS + C2 MOVE; a C1 host still rotates 1x1 pieces: *rotate_only = 1) */
+int pc_net_game_ofurn_may_move(int* rotate_only) {
+    *rotate_only = 0;
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return pcnetgame_ofurn_host_ready();
+    }
+    if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PICKUP)) {
+        return 0;
+    }
+    *rotate_only = !pcnetgame_ofurn_client_c2((uint8_t)PC_OFURN_C2_MOVE);
+    return 1;
+}
+
+/* C2: the outcome of the op begun as `serial` (pc_net_game_ofurn_op_serial() right after the begin): 0 pending, 1 applied, 2 refused (*reason) */
+uint32_t pc_net_game_ofurn_op_serial(void) {
+    return s_ofcl.op_serial;
+}
+
+int pc_net_game_ofurn_op_outcome(uint32_t serial, int* reason) {
+    *reason = 0;
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return 1; /* the listen host commits synchronously */
+    }
+    if (serial == 0u || serial != s_ofcl.op_serial) {
+        return 2; /* superseded / the session was reset */
+    }
+    if (s_ofcl.op_active) {
+        return 0;
+    }
+    if (s_ofcl.done_serial != serial) {
+        return 2;
+    }
+    *reason = (int)s_ofcl.last_reason;
+    return s_ofcl.last_outcome == 1 ? 1 : 2;
+}
+
+/* C2: ROTATE to an explicit rotation (the grab driver: +-90 degrees). 1 = begun / done, 0 = refused (the notice says why), -1 = busy */
+int pc_net_game_ofurn_rotate_to(int ut_x, int ut_z, int rot) {
+    uint16_t v = 0;
+    const int k = pcnetgame_ofurn_view_find(ut_x, ut_z, &v);
+    PCOfurnMarker mk;
+    if (k < 0) {
+        return 0;
+    }
+    mk = pc_net_game_ofurn_view()->m[k];
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        const char* why = NULL;
+        const int idx = pc_ofurn_find(&s_ofh, mk.ut_x, mk.ut_z);
+        uint8_t reason = idx < 0 ? (uint8_t)PC_NETGAME_TXN_REASON_OFURN_GONE : pcnetgame_ofurn_check_reshape(idx, rot, (int)mk.ut_x, (int)mk.ut_z, &why);
+        if (reason != 0 || !pcnetgame_ofurn_commit_rotate(idx, rot)) {
+            printf("[NET][OFURN] host: own player ROTATE (%u,%u) -> rot %d refused: %s\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, rot, why != NULL ? why : "write failed");
+            return 0;
+        }
+        printf("[NET][OFURN] host: own player ROTATE APPLIED: tile (%u,%u) rot %d\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, rot & 3);
         return 1;
     }
     if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PICKUP)) {
         pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED));
-        return 1; /* consumed: a guest's A press does nothing else on a placed piece */
+        return 0;
     }
-    (void)pcnetgame_ofurn_begin(PC_OFURN_OP_ROTATE, 0, v, rot, ut_x, ut_z);
+    if (mk.shape != (uint8_t)PC_OFURN_FP_1X1 && !pcnetgame_ofurn_client_c2((uint8_t)PC_OFURN_C2_MULTI)) {
+        return 0;
+    }
+    return pcnetgame_ofurn_begin(PC_OFURN_OP_ROTATE, 0, v, rot & 3, (int)mk.ut_x, (int)mk.ut_z);
+}
+
+int pc_net_game_ofurn_rotate(int ut_x, int ut_z) {
+    uint16_t v = 0;
+    if (!pcnetgame_ofurn_view_at(ut_x, ut_z, &v)) {
+        return 0;
+    }
+    (void)pc_net_game_ofurn_rotate_to(ut_x, ut_z, ((int)(v & 3u) + 1) & 3); /* +90 degrees (clockwise seen from above) */
     return 1;
+}
+
+/* C2: MOVE the piece covering (ux, uz) one tile in `dir` (0 S, 1 E, 2 N, 3 W), pushed or pulled by the local player. 1 = begun / done, 0 = refused, -1 = busy */
+int pc_net_game_ofurn_move(int ut_x, int ut_z, int dir, int pull) {
+    uint16_t v = 0;
+    const int k = pcnetgame_ofurn_view_find(ut_x, ut_z, &v);
+    PCOfurnMarker mk;
+    int pux, puz;
+    if (k < 0 || !pcnetgame_ofurn_local_tile(&pux, &puz)) {
+        return 0;
+    }
+    mk = pc_net_game_ofurn_view()->m[k];
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        const char* why = NULL;
+        int nox = 0, noz = 0;
+        const int idx = pc_ofurn_find(&s_ofh, mk.ut_x, mk.ut_z);
+        uint8_t reason = idx < 0 ? (uint8_t)PC_NETGAME_TXN_REASON_OFURN_GONE : pcnetgame_ofurn_check_move(idx, dir & 3, pull != 0, pux, puz, &nox, &noz, &why);
+        if (reason != 0 || !pcnetgame_ofurn_commit_reshape(idx, (int)mk.rot, nox, noz)) {
+            printf("[NET][OFURN] host: own player MOVE (%u,%u) dir %d %s refused: %s\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, dir & 3, pull ? "pull" : "push",
+                   why != NULL ? why : "write failed");
+            return 0;
+        }
+        printf("[NET][OFURN] host: own player MOVE APPLIED: (%u,%u) -> (%d,%d) %s\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z, nox, noz, pull ? "pull" : "push");
+        return 1;
+    }
+    if (!pcnetgame_ofurn_client_can((uint8_t)PC_OFURN_PERM_PICKUP)) {
+        pcnetgame_ofurn_notice(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED));
+        return 0;
+    }
+    if (!pcnetgame_ofurn_client_c2((uint8_t)PC_OFURN_C2_MOVE)) {
+        return 0; /* a C1 host (0.3.0) does not know op 4: never sent (it would count a BAD_SHAPE violation) */
+    }
+    return pcnetgame_ofurn_begin(PC_OFURN_OP_MOVE, 0, v, (dir & 3) | (pull ? (int)PC_OFURN_MOVE_PULL : 0), (int)mk.ut_x, (int)mk.ut_z);
 }
 
 int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {
     uint16_t v = 0;
     int s;
-    if (!pcnetgame_ofurn_view_at(ut_x, ut_z, &v) || Now_Private == NULL) {
+    PCOfurnMarker mk;
+    const int k = pcnetgame_ofurn_view_find(ut_x, ut_z, &v);
+    if (k < 0 || Now_Private == NULL) {
         return 0;
     }
+    mk = pc_net_game_ofurn_view()->m[k];
+    ut_x = (int)mk.ut_x; /* C2: the ORIGIN of the piece (the B press may face a filler cell) */
+    ut_z = (int)mk.ut_z;
     s = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO);
     if (s_role == PC_NETGAME_ROLE_HOST) {
         const int idx = pc_ofurn_find(&s_ofh, ut_x, ut_z);
@@ -50779,6 +51431,7 @@ int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {
     (void)pcnetgame_ofurn_begin(PC_OFURN_OP_PICKUP, s, v, 0, ut_x, ut_z);
     return 1;
 }
+
 
 /* TEST-ONLY (AC_TEST_HOOKS=1, client or listen host; never active in normal play): AC_TEST_OFURN=place|cycle|rotpick drives the REAL seams once the record is synced,
  * the rights arrived and the town is loaded:
@@ -50815,7 +51468,33 @@ static void pcnetgame_ofurn_test_hook(void) {
         return;
     }
     t0 = now;
-    if (strcmp(e, "rotpick") == 0) {
+    if (strcmp(e, "grab") == 0 && stage >= 1) {
+        /* C2 TEST-ONLY: AC_TEST_OFURN=grab: the REAL grab through the wait-state seam + the hold / push / pull / rotate states, with the driver's synthetic A / stick
+         * (AC_TEST_OFURN_GRAB = the step script, default "grab,pull,push,left,right,release"; one step every 3 s) */
+        extern int pc_ofurn_test_grab_input(const char* script, int step);
+        extern int pc_ofurn_test_grab_active(void);
+        const char* script = pc_test_hook_getenv("AC_TEST_OFURN_GRAB") != NULL ? pc_test_hook_getenv("AC_TEST_OFURN_GRAB") : "grab,pull,push,left,right,release";
+        if (stage == 1) {
+            pl->actor_class.shape_info.rotation.y = (s16)face;
+            (void)pc_ofurn_test_grab_input(script, 0);
+            printf("[NET][OFURN][TEST-ONLY] grab: A -> %d (grab active %d)\n", pc_ofurn_front_press(gamePT, 1, 0), pc_ofurn_test_grab_active());
+            stage = 2;
+            return;
+        }
+        if (!pc_ofurn_test_grab_input(script, stage - 1)) {
+            /* the grab is over: B in front of the piece picks it up (the vanilla way: B, not grabbing) */
+            pl->actor_class.shape_info.rotation.y = (s16)face;
+            printf("[NET][OFURN][TEST-ONLY] grab: script done (grab active %d, last outcome %d reason %u); B -> %d\n", pc_ofurn_test_grab_active(), s_ofcl.last_outcome,
+                   (unsigned)s_ofcl.last_reason, pc_ofurn_front_press(gamePT, 0, 1));
+            stage = 9;
+            return;
+        }
+        printf("[NET][OFURN][TEST-ONLY] grab: step %d of \"%s\" (player state %d, grab active %d, last outcome %d reason %u)\n", stage - 1, script,
+               mPlib_get_player_actor_main_index(gamePT), pc_ofurn_test_grab_active(), s_ofcl.last_outcome, (unsigned)s_ofcl.last_reason);
+        stage++;
+        return;
+    }
+    if (strcmp(e, "rotpick") == 0 || strcmp(e, "grab") == 0) {
         const int pux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F), puz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
         if (stage == 0) {
             /* the nearest placed piece of the view within 10 tiles: the local player is put on the tile SOUTH of it (TEST-ONLY local write, like --txn-test-pickup-drop),
@@ -50858,7 +51537,8 @@ static void pcnetgame_ofurn_test_hook(void) {
         int s, found = -1;
         for (s = 0; s < mPr_POCKETS_SLOT_COUNT && found < 0; s++) {
             const mActor_name_t it = Now_Private->inventory.pockets[s];
-            if (pc_ofurn_is_ftr((uint16_t)it) && aMR_PC_FtrItemShape((int)it) == PC_OFURN_SHAPE_1X1 &&
+            const int want_multi = pc_test_hook_getenv("AC_TEST_OFURN_MULTI") != NULL; /* C2: the first MULTI-tile furniture of the pockets instead */
+            if (pc_ofurn_is_ftr((uint16_t)it) && ((aMR_PC_FtrItemShape((int)it) == PC_OFURN_SHAPE_1X1) != want_multi) && pcnetgame_ofurn_item_fp((uint16_t)it) >= 0 &&
                 mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, s) == mPr_ITEM_COND_NORMAL) {
                 found = s;
             }
@@ -51048,8 +51728,9 @@ static void pcnetgame_ofurn_list_line(int i, void (*out)(const char*)) {
     } else {
         snprintf(when, sizeof(when), "?");
     }
-    snprintf(line, sizeof(line), "  #%d: tile (%u,%u) acre %d: item 0x%04X rot %s, placed by %s \"%s\" at %s", i, (unsigned)m->ut_x, (unsigned)m->ut_z,
-             pc_ofurn_acre_of(m->ut_x, m->ut_z), (unsigned)m->base, rn[m->rot & 3],
+    static const char* sn[PC_OFURN_FP_NUM] = { "1x1", "2x1", "2x2" };
+    snprintf(line, sizeof(line), "  #%d: tile (%u,%u) acre %d: item 0x%04X %s rot %s, placed by %s \"%s\" at %s", i, (unsigned)m->ut_x, (unsigned)m->ut_z,
+             pc_ofurn_acre_of(m->ut_x, m->ut_z), (unsigned)m->base, m->shape < PC_OFURN_FP_NUM ? sn[m->shape] : "?", rn[m->rot & 3],
              m->placer_kind == PC_OFURN_PLACER_GUEST ? "guest" : m->placer_kind == PC_OFURN_PLACER_HOST ? "host" : "resident", m->placer_name, when);
     out(line);
 }

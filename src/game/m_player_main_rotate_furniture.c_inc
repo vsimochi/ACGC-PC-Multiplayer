@@ -90,10 +90,20 @@ static void Player_actor_BGcheck_rotate_furniture(ACTOR* actor) {
 
 static void Player_actor_request_proc_index_fromRotate_furniture(ACTOR* actor, GAME* game) {
     PLAYER_ACTOR* player = (PLAYER_ACTOR*)actor;
+#ifdef TARGET_PC
+    /* outdoor furniture C2: the PC outdoor driver judges a rotation of a placed piece when there is no My_Room actor (see m_player_main_hold.c_inc) */
+    extern int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no);
+    aMR_JUDGE_PLAYER_ACTION_PROC judge_proc =
+        Common_Get(clip).my_room_clip != NULL ? Common_Get(clip).my_room_clip->judge_player_action_proc : pc_ofurn_grab_judge;
 
+    if (judge_proc != NULL) {
+        int ftr_no = player->main_data.rotate_furniture.ftr_no;
+        int judge = judge_proc(NULL, NULL, ftr_no);
+#else
     if (Common_Get(clip).my_room_clip != NULL) {
         int ftr_no = player->main_data.rotate_furniture.ftr_no;
         int judge = Common_Get(clip).my_room_clip->judge_player_action_proc(NULL, NULL, ftr_no);
+#endif
 
         if (judge != player->main_data.rotate_furniture.rotate_type) {
             int index = Player_actor_Get_Index_fromAngle(actor->world.angle.y);

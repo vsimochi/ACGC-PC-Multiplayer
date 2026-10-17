@@ -87,8 +87,18 @@ ck("K22 OUTDOOR_FURNITURE: pcnetgame_ofurn_client_can() needs a validated servic
    "s_ofcl.have_caps && !s_ofcl.unsupported && s_ofcl.have_perms" in oc and "(s_ofcl.perms & perm) != 0" in oc and "s_ofcl.unsupported = 1;" in ng and
    ng.count("s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN;") == 1 and "s_ctxn.kind = (uint8_t)PC_NETGAME_TXN_KIND_OUTDOOR_FURN;" in ob and
    all(body(ng, h).index("pcnetgame_ofurn_client_can(") < body(ng, h).index("pcnetgame_ofurn_begin(") for h in (
-       "int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int rot) {", "int pc_net_game_ofurn_rotate(int ut_x, int ut_z) {",
-       "int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {")) and ng.count("pcnetgame_ofurn_begin(PC_OFURN_OP_") == 3)
+       "int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int rot) {", "int pc_net_game_ofurn_rotate_to(int ut_x, int ut_z, int rot) {",
+       "int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {", "int pc_net_game_ofurn_move(int ut_x, int ut_z, int dir, int pull) {")) and
+   ng.count("pcnetgame_ofurn_begin(PC_OFURN_OP_") == 4 and "pc_net_game_ofurn_rotate_to(ut_x, ut_z," in body(ng, "int pc_net_game_ofurn_rotate(int ut_x, int ut_z) {"))
+mv = body(ng, "int pc_net_game_ofurn_move(int ut_x, int ut_z, int dir, int pull) {")
+pl = body(ng, "int pc_net_game_ofurn_place(int pocket_slot, int item, int ut_x, int ut_z, int rot) {")
+ck("K22c C2 (outdoor furniture): op 4 MOVE and a multi-tile PLACE are sent only after the host's message 102 CAPS (pcnetgame_ofurn_client_c2: have_c2 + the flag + "
+   "!unsupported); a 0.3.0 host never sends 102, so it never sees op 4 (its pc_ofurn_shape_ok -> BAD_SHAPE + violation) or a multi-tile PLACE",
+   mv.index("pcnetgame_ofurn_client_c2((uint8_t)PC_OFURN_C2_MOVE)") < mv.index("pcnetgame_ofurn_begin(PC_OFURN_OP_MOVE") and
+   pl.index("pcnetgame_ofurn_client_c2((uint8_t)PC_OFURN_C2_MULTI)") < pl.index("pcnetgame_ofurn_begin(") and
+   "s_ofcl.have_c2 = 1;" in body(ng, "static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m) {") and
+   body(ng, "static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m) {").index("pc_ofurn_msg2_valid(m)") <
+   body(ng, "static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m) {").index("s_ofcl.have_c2 = 1;"))
 ck("K22b the client applies service 10 only after the strict pc_ofurn_caps_valid() (an unknown flag / version: ignored, no Place) and message 98 only after pc_ofurn_msg_valid()",
    "svc == (int)PC_NETGAME_TS_OFURN ? pc_ofurn_caps_valid(m.blob)" in ng and "if (!pc_ofurn_msg_valid(m)) {" in body(ng, "static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m) {"))
 ca = body(ng, "int pc_net_game_chat_available(const char** why) {")
@@ -118,7 +128,8 @@ else:
                "SHOP_UPGRADE_REQ": 85, "WILDLIFE_TOOL_ACTION": 86, "GHOST_HUNT": 87, "VILLAGER_OUTFIT": 90, "PVP_HIT_REQ": 91, "PVP_HIT": 92,
                "ACTION_EXT": 96,  # worker P2 puppet ACTION_EXT (presentation only, see test_action_ext_src.py)
                "OUTDOOR_FURN": 98,  # outdoor furniture C1: host -> client only (a 0.1.1 / 0.2.x CLIENT ignores it: the client dispatcher's 'unrecognized: ignore')
-               "CHAT_SEND": 100, "CHAT_MSG": 101}  # text chat (worker CH): C -> H (gated by CAPS, see K100) / H -> C (an old client's silent ignore, O8)
+               "CHAT_SEND": 100, "CHAT_MSG": 101,  # text chat (worker CH)
+               "OUTDOOR_FURN2": 102}  # outdoor furniture C2: host -> client only (an old client ignores it, O8 / O9)  # text chat (worker CH): C -> H (gated by CAPS, see K100) / H -> C (an old client's silent ignore, O8)
     enum_re = r"^\s*PC_NETGAME_MSG_(\w+)\s*=\s*(\d+)\s*,"
     old_ids = {k: int(v) for k, v in re.findall(enum_re, old, re.M)}
     cur_ids = {k: int(v) for k, v in re.findall(enum_re, ng, re.M)}
@@ -145,6 +156,25 @@ else:
        "shape_ok = t->aux_item == 0 && t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0;" in ots)
     ck("O7 a stacked-spirit CATCH (dest POCKET, a slot, item != 0) passes the 0.1.1 grant shape (a refusal there is semantic, no violation)",
        "(t->dest == (uint8_t)PC_NETGAME_TXN_DEST_POCKET && t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != 0)" in old)
+
+# ---- the released 0.3.0 (outdoor furniture C1) peers
+try:
+    v030 = subprocess.run(["git", "-C", ROOT, "show", "v0.3.0:pc/src/pc_net_game.c"], capture_output=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+    v030o = subprocess.run(["git", "-C", ROOT, "show", "v0.3.0:pc/src/pc_outdoor_furniture.c"], capture_output=True, timeout=60).stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+except (OSError, subprocess.SubprocessError):
+    v030 = v030o = ""
+if "pcnetgame_handle_client_ofurn" not in v030:
+    print("SKIPPED - the v0.3.0 source is not available: 0.3.0 checks not run")
+else:
+    cd3 = body(v030, "static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {")
+    ck("O9 a 0.3.0 CLIENT takes message 98 only at exactly 268 bytes, refuses an unknown 98 kind / PERMS bit whole (pc_ofurn_msg_valid), has no id 102 and ends with "
+       "'unrecognized: ignore' (so 102 is dropped silently and 98 must stay the C1 layout: C2 adds no 98 kind / bit)",
+       "if (size == sizeof(PCOfurnMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN) {" in cd3 and "m->kind > PC_OFURN_MK_PERMS" in v030o and
+       "PC_OFURN_PERM_LEAF_DROP)) != 0u)" in v030o and not re.search(r"PC_NETGAME_MSG_\w+\s*=\s*102", v030) and cd3.rstrip().endswith("/* malformed/short/unrecognized: ignore */"))
+    ck("O10 a 0.3.0 HOST refuses kind 22 op 4 as BAD_SHAPE (+ a violation): hence the 102 CAPS gate of K22c",
+       "case PC_OFURN_OP_PICKUP:" in v030o and "PC_OFURN_OP_MOVE" not in v030o and "malformed OUTDOOR_FURNITURE TXN_COMMIT (BAD_SHAPE)" in v030)
+    ck("O11 a 0.3.0 host loads only sidecar version 1 (a v2 file is refused as corrupt, never misread as 1x1 markers)",
+       "hdr[1] != PC_OFURN_FILE_VERSION" in v030o)
 
 print("-" * 60)
 n = sum(1 for _d, ok in results if ok)

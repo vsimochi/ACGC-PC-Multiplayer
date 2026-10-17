@@ -23,7 +23,10 @@ extern "C" {
 #define PC_OFURN_OP_PLACE  1 /* dest NONE, slot = the pocket slot holding the item, item = the pocket item, flags = rotation 0..3, aux_item = tile (ut_z << 8 | ut_x) */
 #define PC_OFURN_OP_ROTATE 2 /* dest NONE, slot 0, item = the tile value the client sees, flags = the NEW rotation, aux_item = tile */
 #define PC_OFURN_OP_PICKUP 3 /* dest POCKET, slot = a FREE pocket slot, item = the tile value the client sees, flags 0, aux_item = tile */
-#define PC_OFURN_OP_MAX    3
+#define PC_OFURN_OP_MOVE   4 /* C2: dest NONE, slot 0, item = the tile value the client sees, flags = direction 0..3 (S/E/N/W the piece moves) | PC_OFURN_MOVE_PULL,
+                              * aux_item = the ORIGIN tile; the piece moves ONE tile (sent only to a host that announced C2 on message 102) */
+#define PC_OFURN_OP_MAX    4
+#define PC_OFURN_MOVE_PULL 0x04u /* flags bit of MOVE: the player pulls (walks backwards, away from the piece); 0 = push */
 
 /* ---- reasons (PC_NETGAME_TXN_REASON_* 55..61, allocated to this block) ---- */
 #define PC_OFURN_REASON_OFF         55 /* the host has the Place action off (AC_MP_OUTDOOR_FURNITURE=0 / outdoor_furniture_place = 0) */
@@ -47,12 +50,27 @@ extern "C" {
 #define PC_OFURN_KEY_LEN  20
 #define PC_OFURN_NAME_MAX 20
 
+/* ---- C2 footprints (multi-tile furniture). The cells follow the INDOOR engine exactly (ac_my_room.c aMR_SetInfoFurnitureTable / aMR_GetTypeBPlaceInfo with
+ * shape_type = l_typeB0_table[rot]): 1x1 = the origin; 2x1 = the origin + one cell: rot 0 (TYPEB_0) +x, rot 1 (TYPEB_90) -z, rot 2 (TYPEB_180) -x, rot 3 (TYPEB_270)
+ * +z (the second cell swings around the origin when the piece rotates); 2x2 = origin, +x, +z, +x+z for every rotation. The MODEL position is the one of
+ * aMR_UnitNumber2Position: the origin cell centre (1x1, 2x1), the shared corner of the 4 cells (2x2). The ORIGIN tile holds the item id | rotation (an old client:
+ * a leaf), the other cells hold PC_OFURN_FILLER. ---- */
+#define PC_OFURN_FP_1X1      0
+#define PC_OFURN_FP_2X1      1
+#define PC_OFURN_FP_2X2      2
+#define PC_OFURN_FP_NUM      3
+#define PC_OFURN_FP_MAX_CELLS 4
+/* the extra (non-origin) footprint cells of a placed multi-tile piece: RSV_FE1F (m_name_table.h), a STABLE value for the field diff (pc_field_authority.c: never
+ * withheld, unlike RSV_NO), never pickable / droppable-onto / buryable, drawn as nothing (see the C2 doc for the vanilla evidence) */
+#define PC_OFURN_FILLER      0xFE1Fu
+
 typedef struct PCOfurnMarker {
-    uint8_t  ut_x, ut_z;    /* town-scene unit coordinates (16..95, 16..111) */
+    uint8_t  ut_x, ut_z;    /* town-scene unit coordinates (16..95, 16..111) of the ORIGIN cell */
     uint8_t  rot;           /* 0..3 = S / E / N / W (== the item's low 2 bits) */
     uint8_t  placer_kind;   /* PC_OFURN_PLACER_* (0 = unknown, a client mirror) */
     uint16_t base;          /* furniture item id with the rotation bits cleared */
-    uint16_t _rsv;
+    uint8_t  shape;         /* C2: PC_OFURN_FP_* (sidecar v1 records hold 0 here = 1x1: the v1 -> v2 conversion is the identity) */
+    uint8_t  flags;         /* C2: 0 (reserved) */
     uint32_t placed_time;   /* unix seconds (host clock) */
     uint8_t  placer_key[PC_OFURN_KEY_LEN];
     char     placer_name[PC_OFURN_NAME_MAX];
@@ -77,12 +95,36 @@ uint16_t pc_ofurn_base(uint16_t item);
 /* 0 ok, 1 = the town ceiling, 2 = the acre ceiling */
 int      pc_ofurn_caps_check(const PCOfurnTable* t, int acre, int max_town, int max_acre);
 
-/* ---- sidecar (outdoor_furniture.dat): u32 magic 'OFUR', u32 version 1, u32 count, count x 52-byte markers, u32 FNV-1a of everything before it; atomic tmp -> rename ---- */
+/* ---- C2 footprint geometry (pure) ---- */
+int  pc_ofurn_fp_from_shape(int aftr_shape);   /* aFTR_SHAPE_TYPEB_* (0..3) -> 2X1, TYPEA (4) -> 1X1, TYPEC (5) -> 2X2, else -1 */
+int  pc_ofurn_fp_cells(int fp, int rot, int ox, int oz, int* xs, int* zs); /* the cells (origin first); returns the count (1 / 2 / 4), 0 = bad fp */
+int  pc_ofurn_marker_cells(const PCOfurnMarker* m, int* xs, int* zs);
+int  pc_ofurn_fp_covers(int fp, int rot, int ox, int oz, int x, int z);
+int  pc_ofurn_fp_in_town(int fp, int rot, int ox, int oz);                /* 1 = every cell is a town FG tile (pc_ofurn_acre_of >= 0) */
+int  pc_ofurn_find_cell(const PCOfurnTable* t, int x, int z);             /* the marker whose footprint covers (x, z), or -1 */
+int  pc_ofurn_fp_overlaps(const PCOfurnTable* t, int fp, int rot, int ox, int oz, int skip_idx); /* 1 = a cell is covered by another marker (skip_idx excluded) */
+void pc_ofurn_fp_model_pos(int fp, int ox, int oz, float* wx, float* wz); /* the model position (aMR_UnitNumber2Position) */
+int  pc_ofurn_fp_reach_ok(int fp, int rot, int ox, int oz, int pux, int puz); /* 1 = the player tile is an 8-neighbour of a cell and on none of them */
+void pc_ofurn_dir_delta(int dir, int* dx, int* dz);                       /* 0 S (+z), 1 E (+x), 2 N (-z), 3 W (-x) */
+/* MOVE geometry: the new origin of a one-tile move and the player's follow tile; 1 = legal shape (the player is orthogonally next to the footprint on the right side:
+ * PUSH = behind the piece (the move goes away from the player), PULL = in front of it (the player steps back to *fx, *fz, which must not be a new cell)) */
+int  pc_ofurn_move_geometry(int fp, int rot, int ox, int oz, int dir, int pull, int pux, int puz, int* nox, int* noz, int* fx, int* fz);
+/* the 1 / 2 / 4 cells of the NEW footprint that the OLD one does not cover (the cells a MOVE / ROTATE must validate); returns the count */
+int  pc_ofurn_fp_new_cells(int fp, int rot0, int ox0, int oz0, int rot1, int ox1, int oz1, int* xs, int* zs);
+
+/* ---- sidecar (outdoor_furniture.dat): u32 magic 'OFUR', u32 version, u32 count, count x 52-byte markers, u32 FNV-1a of everything before it; atomic tmp -> rename.
+ * Version 1 (C1, 0.3.0): 1x1 only, PCOfurnMarker.shape/flags were a zero u16. Version 2 (C2): the same 52-byte record with shape / flags meaningful. The loader takes
+ * both (v1 records are 1x1 = shape 0: lossless); the host then keeps a <path>.v1.bak copy and rewrites the file as v2. A 0.3.0 host refuses a v2 file as corrupt
+ * (its placed pieces stay leaves, Place is refused) -- never misreads a multi-tile marker as a 1x1 one. ---- */
 #define PC_OFURN_FILE_MAGIC   0x5255464Fu /* "OFUR" little endian */
-#define PC_OFURN_FILE_VERSION 1u
+#define PC_OFURN_FILE_VERSION 2u
+#define PC_OFURN_FILE_VERSION_C1 1u
 enum { PC_OFURN_FILE_BAD = -1, PC_OFURN_FILE_MISSING = 0, PC_OFURN_FILE_OK = 1 };
-int pc_ofurn_save(const char* path, const PCOfurnTable* t);           /* 1 = written + renamed, 0 = failed (old file untouched) */
-int pc_ofurn_load(const char* path, PCOfurnTable* t, int* dropped);   /* PC_OFURN_FILE_*; *dropped = records refused (bad tile / not furniture / duplicates) */
+int pc_ofurn_save(const char* path, const PCOfurnTable* t);           /* 1 = written (v2) + renamed, 0 = failed (old file untouched) */
+/* PC_OFURN_FILE_*; *dropped = records refused (bad tile / not furniture / bad shape / a footprint outside the town / overlapping footprints); *version = the file's
+ * version (1 or 2) on OK */
+int pc_ofurn_load(const char* path, PCOfurnTable* t, int* dropped, int* version);
+int pc_ofurn_copy_file(const char* from, const char* to);             /* 1 = copied (the .v1.bak of a converted sidecar) */
 
 /* ---- message 98 OUTDOOR_FURN (host -> client, RELIABLE, fixed 268 bytes) ---- */
 #define PC_OFURN_MSG_ID      98u
@@ -112,6 +154,22 @@ typedef struct PCOfurnMsg {
     PCOfurnWireEntry e[PC_OFURN_MSG_ENTRIES];
 } PCOfurnMsg;
 int pc_ofurn_msg_valid(const PCOfurnMsg* m); /* structural check of a received message */
+
+/* ---- C2: message 102 OUTDOOR_FURN2 (host -> one READY client, RELIABLE, the SAME 268-byte PCOfurnMsg layout with msg_type 102). Why a new id and not new kinds /
+ * flags in 98: a 0.3.0 client takes 98 only at exactly 268 bytes and its pc_ofurn_msg_valid() refuses any unknown kind / PERMS bit (the message is dropped whole),
+ * and it would draw a multi-tile entry as a 1x1 model on the origin with a 1x1 collision. So 98 keeps carrying the 1x1 pieces ONLY (unchanged for 0.3.0 clients: a
+ * multi-tile piece is a plain leaf on its origin + invisible filler tiles for them), and 102 carries EVERY piece (1x1 too) for C2 clients, which use the 102 list as
+ * their view once the host's CAPS arrived (the 98 list stays the view of a C1 host). A 0.3.0 client ignores id 102 (the dispatcher's 'unrecognized: ignore').
+ * Kinds: BEGIN / CHUNK / END / SET / DEL as in 98; 7 CAPS (count 0, flags = PC_OFURN_C2_*; sent first, at join, before the list: a client sends MOVE / a multi-tile
+ * PLACE only after it); 8 MOVE (count 2: e[0] = the old origin, e[1] = the new origin + item: a one-tile move or a rotation of the same piece, so the client keeps
+ * the model and slides it). The shape of an entry is derived from its item (the furniture profile), never sent. ---- */
+#define PC_OFURN_MSG2_ID  102u
+#define PC_OFURN_MK_CAPS  7
+#define PC_OFURN_MK_MOVE  8
+#define PC_OFURN_C2_MULTI 0x01u /* multi-tile placement (2x1 / 2x2) */
+#define PC_OFURN_C2_MOVE  0x02u /* kind 22 op 4 MOVE (grab / push / pull) */
+#define PC_OFURN_C2_ALL   (PC_OFURN_C2_MULTI | PC_OFURN_C2_MOVE)
+int pc_ofurn_msg2_valid(const PCOfurnMsg* m);
 
 /* ---- town service 10 OFURN_CAPS (8 bytes): u8 version 1, u8 flags (bit 0 Place on, bit 1 leaf drop on), u16 LE max_town, u16 LE max_acre, u16 0 ---- */
 #define PC_OFURN_CAPS_LEN     8u
@@ -158,8 +216,18 @@ int  pc_net_game_ofurn_may_pickup(void);
 int  pc_net_game_ofurn_leaf_drop_ok(void);
 /* B in front of a placed piece: pick it up (1 = handled: the vanilla pickup is skipped this frame) */
 int  pc_net_game_ofurn_pickup(int ut_x, int ut_z);
-/* 1 = (ut_x, ut_z) holds a placed piece the VIEW knows and its tile still holds it */
+/* 1 = (ut_x, ut_z) is a cell of a placed piece the VIEW knows and its origin tile still holds it (C2: any footprint cell) */
 int  pc_net_game_ofurn_placed_at(int ut_x, int ut_z);
+/* ---- C2 seams (grab / push / pull / rotate, pc_ofurn_draw.c) ---- */
+int      pc_net_game_ofurn_marker_at(int ut_x, int ut_z, PCOfurnMarker* out);           /* the view's marker covering the cell (1 = found) */
+int      pc_net_game_ofurn_cells_free(const PCOfurnMarker* mk, int rot, int nox, int noz); /* local pre-check of a rotate / move (the host decides) */
+int      pc_net_game_ofurn_may_move(int* rotate_only);                                   /* 1 = may grab; *rotate_only = 1 against a C1 host */
+int      pc_net_game_ofurn_rotate_to(int ut_x, int ut_z, int rot);                       /* 1 begun / done, 0 refused, -1 busy */
+int      pc_net_game_ofurn_move(int ut_x, int ut_z, int dir, int pull);                  /* 1 begun / done, 0 refused, -1 busy */
+uint32_t pc_net_game_ofurn_op_serial(void);                                              /* the handle of the op begun last */
+int      pc_net_game_ofurn_op_outcome(uint32_t serial, int* reason);                     /* 0 pending, 1 applied, 2 refused / superseded */
+/* a recent MOVE of the piece now at (ux, uz) holding item: its old model pose (consumed); the renderer slides the new model from there */
+int      pc_net_game_ofurn_take_slide(int ut_x, int ut_z, int item, float* x, float* z, int* rot, uint32_t* age_ms);
 /* the notice line to draw now (NULL = none) / show a line (~4 s) */
 const char* pc_net_game_ofurn_notice(void);
 void        pc_net_game_ofurn_notice_text(const char* text);

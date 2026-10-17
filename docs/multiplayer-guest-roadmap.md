@@ -2064,7 +2064,7 @@ Two actions on a furniture item outdoors (town field only, never the island / a 
 
 **Client (PC only, `pc/src/pc_ofurn_draw.c`, nothing of it writes a tile / deposit / house / pocket):** from the field-item actor (bg_item_common.c_inc hooks: move / draw / destruct) in the town field: for every placed piece of the VIEW (host: its table; client: the message-98 mirror) within 24 tiles whose tile still holds it, ONE private FTR_ACTOR + 2 KB dma bank (up to 160 models, nearest first) built by `aMR_PC_StandaloneCt` (ac_my_room.c TARGET_PC block: the catalog's construction -- dma_proc, the rig, the vtable ct_proc -- and a trimmed `aMR_DrawOneFurniture`: light, texture, palette, kankyo map, registered model, skeleton, vtable draw_proc with a NULL room actor like the catalog); NEVER a move_proc (no behaviour: no my_room_clip, music, drawers, lights, sitting) and never the room's banks. Profiles whose vtable has a `dt_proc` (the 10 structure models that zelda_malloc a palette) are not run through their vtable; when nothing else is drawable the vanilla leaf stays. The vanilla leaf of a drawn piece is not drawn (`pc_ofurn_hide_leaf` in `bg_item_common_classifyitemDataTable`; a view change requests the FG redraw). Collision: `mCoBG_RegistMoveBg` with the profile's move-bg type, height 100, for the up to 24 pieces within 4 tiles of the local player (the registry holds 64 for the whole scene); a new play scene forgets the indices (`mCoBG_InitMoveBgData`). Diagnostics: `[OFURN][DRAW] model built / released`, `[OFURN][COL] collision registered`, `[OFURN][INPUT]`, a status line every ~30 s.
 
-**UI (minimal):** the inventory tag menu of a plain furniture item in the town field gets **Grab / Place / Drop / Quit** (PC: the unused vanilla tag slot `mTG_TYPE_76`) when this player may place (a resident of a host with service 10 + PERMS place, or the listen host); otherwise (guests, old hosts, a shovel menu) the vanilla menu. Standing still in front of a placed piece: **A = Rotate**, **B = Pick up** (the wait-state seam of `m_player_main_wait.c_inc`; the vanilla shake / pickup of that frame are skipped, otherwise unchanged). Refusals show one notice line for ~4 s (`pc_net_notice_draw`, plain ASCII). No interactions with placed pieces (sit / lie / lights / dressers / music) in C1.
+**UI (minimal):** the inventory tag menu of a plain furniture item in the town field gets **Grab / Place / Drop / Quit** (PC: the unused vanilla tag slot `mTG_TYPE_76`) when this player may place (a resident of a host with service 10 + PERMS place, or the listen host); otherwise (guests, old hosts, a shovel menu) the vanilla menu. Standing still in front of a placed piece: **A = Rotate**, **B = Pick up** (C2 replaced A with the vanilla grab / push / pull / rotate, see "Outdoor furniture C2"; the wait-state seam of `m_player_main_wait.c_inc`; the vanilla shake / pickup of that frame are skipped, otherwise unchanged). Refusals show one notice line for ~4 s (`pc_net_notice_draw`, plain ASCII). No interactions with placed pieces (sit / lie / lights / dressers / music) in C1.
 
 **Operator list.** `ops.ini` next to the server's other files (`servers\<id>\ops.ini`, a listen host `save\mp\ops.ini`; versioned text, atomic write, tolerant parser: unknown keys / malformed lines are skipped): `op = resident|guest <40 hex digits> <name>`. The key is the authenticated identity the host binds a connection to (resident: the save's PersonalID = name + town name + player id + land id; guest: its guest key), never a display name alone. `pcnetgame_player_is_op(peer)` / `pc_net_game_peer_is_op()` is the reusable host check; the listen host's own player is implicitly an operator. Console (`--dedicated`): `ops`, `op <player>`, `deop <player>` (online name / a resident / a guest of this town / `peer N`; a name with two identities is refused as ambiguous -- the host already refuses a second guest with a used name, so this is rare), and `furniture list [acre]`, `furniture remove <x> <z>|#<index> [delete]`, `furniture clear acre <n>|player <name> [delete]` (removed pieces go to the town's lost and found via `mPB_keep_item` unless `delete`). See docs/console-commands.md.
 
@@ -2073,6 +2073,131 @@ Two actions on a furniture item outdoors (town field only, never the island / a 
 **Evidence.** Native: `test_ofurn_native.py` (pc_ofurn_selftest + pc_ops_selftest, -Wall -Wextra -Werror). Source: `test_ofurn_src.py`, `test_old_host_compat_src.py` K22. Protocol (real listen host + FakeClients): `test_ofurn_protocol.py` MAIN / GC / OFF / LEAF / CAP / RS. Console (real dedicated host + FakeClients): `test_ofurn_console_protocol.py`. Real game (real host + real client, Samsung, volume 1): `test_ofurn_real.py` (the client draws the model, registers the collision, A rotates and B picks it up through the real input seam; the model of all 1266 furniture ids built / drawn / torn down on host and client without a crash).
 
 **Not in C1 (C2 / C3):** multi-tile (2x1 / 2x2) placement (footprint reservation of 2-4 tiles, rotation of the footprint, the marker spanning tiles), furniture interactions outdoors (sit, lie, lights / toggles, music players, storage) -- that needs a behaviour host without the My_Room actor; villager path-finding around placed pieces (villagers collide with the box but do not plan around it); a placement preview / ghost model and a proper menu instead of A / B; the dresser / storage contents of a placed piece; placing on the island / in front of buildings with a door model; per-acre limits as a gameplay option; an operator UI in the game for a listen host (it has no console); a visual (image) check of the models.
+
+## Outdoor furniture C2: multi-tile pieces and grab / push / pull / rotate
+
+**Status: implemented, not committed; harness + real-game automated evidence (below); BLOCKED: manual verification required.**
+
+**User report:** "with furniture being placed outside, the grab and pull and rotate aren't properly coded in. Also I can't place down dressers / wardrobes / etc."
+
+**Why dressers could not be placed (two causes):**
+
+1. **The renderer refused their model.** C1 (`ac_my_room.c` `aMR_PC_UseVtable`) ran a profile's vtable only when it had NO `dt_proc`, to keep away the 10 structure models whose `ct_proc` zelda_mallocs a palette. But 123 of the 208 furniture vtables carry an EMPTY `dt_proc`, among them every dresser / wardrobe / closet (their model is the skeleton their `ct_proc` builds; the profile has no display list). With the vtable skipped, nothing was drawable and the placed piece stayed a vanilla leaf. In the real run before the fix the client log showed `0 model(s) drawn` for the dresser. **Fix:** every vtable runs and `aMR_PC_StandaloneDt` calls the `dt_proc`, so a `ct_proc` allocation is always freed. All 18 non-empty `dt_proc` bodies were checked: `zelda_free(pal_p)`, `switch_bit` copies, and a haniwa `sAdo_RhythmStop` of a rhythm that was never started. Real run 2 built, drew and tore down all 1266 furniture models on host and client without a crash.
+2. **Multi-tile pieces were refused** `OFURN_TOO_BIG` (57), on the client before any round trip and again on the host. Counts by furniture id: 1081 are 1x1, 130 are 2x1 (`aFTR_SHAPE_TYPEB_0`) and 55 are 2x2 (`TYPEC`). Storage pieces: 35 ids, of which 26 are 1x1 (hit by cause 1) and 9 are 2x1 low chests (cause 2). Nothing else excluded storage furniture; there was no class or profile check.
+
+**Footprint design (pure, `pc_outdoor_furniture.c`; native selftest):**
+
+- **Cells** follow the indoor engine exactly (`aMR_SetInfoFurnitureTable`, `aMR_GetTypeBPlaceInfo`, `shape_type = l_typeB0_table[rot]`):
+  - 1x1: the origin.
+  - 2x1: the origin plus one cell, which by rotation is +x (rot 0, `TYPEB_0`), -z (rot 1), -x (rot 2) or +z (rot 3). The second cell swings around the origin when the piece rotates.
+  - 2x2: origin, +x, +z and +x+z, for every rotation.
+- **Model position** (`aMR_UnitNumber2Position`): the origin cell centre for 1x1 and 2x1, the shared corner of the 4 cells for 2x2. The y is the STATIC ground (`mCoBG_GetBgY_OnlyCenter_FromWpos`); `GetBgY_AngleS` would include the piece's own move-bg box, which is 100 units high. That bug blocked every move in real run 2.
+- **Collision** is the profile's own `move_bg_type` with the angle, the same call as indoors. The TYPEB / TYPEC boxes (60 / 40-unit extents) cover the footprint.
+- **Field tiles:**
+  - The ORIGIN holds `id | rot`: an old client sees one leaf.
+  - Every other cell holds **`RSV_FE1F`**, the vanilla room filler for exactly this job (`ac_my_room_move.c_inc` `aMR_SetFurniture2FG`). Evidence that it is safe:
+    - STABLE for the field diff (`pcfa_transient_kind`). `RSV_NO` is AMBIGUOUS and is withheld while the host is in town, so a dedicated server's clients would never get it.
+    - Never drawn by `bIT_individual_draw_check` (only types below WARP are drawn).
+    - No collision column.
+    - Blocks drops (`m_tag_ovl.c` needs `EMPTY_NO`), weeds and spawns (`m_all_grow_ovl.c` needs `EMPTY_NO`), digs (`pcnetgame_fa_validate_adapter_dig_hole`: EMPTY or a plant) and pickups (not a pickupable class).
+    - Ignored by the police-box sweep, which takes only FTR / ITEM1 values. A second furniture id as filler would duplicate the piece there and on old clients.
+    - The snowman build now refuses it too.
+  - No vanilla code clears `FE1F` on the field, so the host GC does.
+- **Marker:** the sidecar marker holds the origin, the shape (`PCOfurnMarker.shape`, the former zero `_rsv`) and the rotation. The host never trusts a filler value alone: a marker is valid only while EVERY cell holds its value.
+- **GC (every 500 ms):** when ANY cell changes (a sweep, a 0.3.0 client's vanilla pickup of the origin leaf, a structure, any host write), the marker is dropped, the cells still holding `FE1F` are cleared, and the surviving origin stays a leaf (never lost).
+- **Writes:** every write of a footprint is all-or-nothing (`pcnetgame_ofurn_write_cells`: read every old value, write, restore on a failure), always after the write-ahead sidecar save.
+- **Placement (host):** every cell passes the C1 tile rules (empty, deposit 0, not reserved, `mCoBG_CheckPlace`, no structure neighbour; the filler is not a structure), and the ground is flat (|dy| <= 4 on the static ground). The footprint stays in the town FG, the player stands next to it and not on it, and the C1 ceilings apply (one marker per piece).
+  - Placing from the tag menu puts the origin on the front tile with the piece facing the player. A 2x2 in front of a player facing north or west moves its origin one tile further so the square stands wholly in front.
+
+**Grab / push / pull / rotate (the vanilla scheme, `pc_ofurn_draw.c` driver):**
+
+The indoor driver lives in the My_Room actor. The player states HOLD (19), PUSH (20), PULL (21) and ROTATE_FURNITURE (22) are generic. HOLD and ROTATE poll `my_room_clip->judge_player_action_proc` every frame; PUSH and PULL play their clip and re-request HOLD. Outdoors `my_room_clip` is NULL, so `m_player_main_hold.c_inc` and `m_player_main_rotate_furniture.c_inc` (TARGET_PC only, vanilla unchanged in `#else`) ask `pc_ofurn_grab_judge` instead, with the same return codes: 0 release, 1 hold, 2 push, 3 pull (wpos0 / wpos1 = the player's end), 4 rotate right, 5 rotate left. Without an outdoor grab it answers 0. No furniture behaviour code runs outdoors (no `move_proc`, no `my_room_clip`).
+
+| Input (as indoors) | What happens |
+|---|---|
+| **A** in front of a placed piece (WAIT state) | Grab: `mPlib_request_main_hold_type1`. The player snaps to its tile centre facing the piece: the real HOLD state and the HOLD_WAIT1 clip |
+| Hold A, stick **full towards** the piece for 16 frames | PUSH one tile: the PUSH1 clip, the piece slides with the player |
+| Hold A, stick **full away** for 16 frames | PULL one tile: the PULL1 clip, the player steps back. The tile behind must be walkable: empty, a dropped item or a leaf |
+| Hold A, stick **full sideways** (re-armed by a neutral stick) | ROTATE 90 degrees: the player's left = LTURN1 (+90), right = RTURN1 (-90). Never into the player's own cell or an occupied cell |
+| Release A | Let go (back to WAIT) |
+| **B** in front (not grabbing) | Pick up. In vanilla B picks furniture up and A never does; B while holding does nothing, as indoors |
+
+- **Feedback:** a step blocked locally, or refused by the host, gives the vanilla `eEC_EFFECT_BUBU` puff and no retry until the stick leaves that direction (`aMR_SetBubu`).
+- **Sounds:** `NA_SE_STONECOIN_DRAG` for a move (outdoors there is no room floor for `sAdo_FloorTrgStart`) and `NA_SE_ROTATE` for a turn.
+- **One step at a time:** each step is ONE host transaction, and the next waits for the answer.
+- **Optimistic presentation:** the model slides (800 ms, the clip length) or turns (270 ms) at once. On APPLIED the view catches up (FIELD_UPDATE + 102 MOVE). On a refusal the model snaps back in 150 ms with the notice "It won't budge"; a refused move also lets go, because the player already stepped.
+- **Other players** see the vanilla PUSH / PULL rows of the puppet. HOLD and ROTATE come through ACTION_EXT, which has no scene gating (verified in the real run: the observer saw 19, 20, 21 and 22). The model slides from its old pose (`pc_net_game_ofurn_take_slide`).
+- **Rights:** as C1. Move and rotate need the PICKUP right (residents, operators, the host); guests get NOT_ALLOWED.
+- **The C1 shortcut** (A = rotate +90 in the wait state) is replaced by the grab. B = pick up stays (vanilla).
+
+**Wire (protocol v8 extended in place, no version bump):**
+
+- **kind 22 op 4 MOVE** (new):
+  - Tag: dest NONE, slot 0, `item` = the origin tile value the client sees, `flags` = direction (0 S / 1 E / 2 N / 3 W, where the PIECE moves) | 4 PULL, `aux_item` = the ORIGIN.
+  - Host checks:
+    - the PICKUP right;
+    - the marker with ALL cells matching;
+    - the player's side: PUSH stands behind the piece, PULL in front, orthogonally adjacent. The host's copy of the position may lag one step: the 4 orthogonal neighbours are tried, never a diagonal;
+    - every newly covered cell passes the placement rules.
+  - Journal, replay (REPLAYED) and rate limit as the other ops. The rate limit is now 150 ms / 240 a minute for all ops.
+- **op 2 ROTATE:** now also validates the swing cell of a 2x1 and refuses a turn onto the requester's tile.
+- **op 1 PLACE:** accepts 2x1 / 2x2. `OFURN_TOO_BIG` is now only for an unknown shape.
+- **Message 102 OUTDOOR_FURN2** (new id; host to one READY client, RELIABLE, the same 268-byte `PCOfurnMsg` layout):
+  - Kinds: 7 CAPS (`flags` 1 multi-tile, 2 move; sent first at join), the list of EVERY piece (BEGIN / CHUNK / END), SET / DEL, and 8 MOVE (e[0] = the old origin, e[1] = the new origin + item, for moves and rotations).
+  - The footprint is derived from the item's profile and is never sent.
+  - **Why a new id and not new 98 kinds or bits:** a 0.3.0 client takes 98 only at exactly 268 bytes, and its `pc_ofurn_msg_valid` drops the whole message for an unknown kind or PERMS bit. It would also draw a multi-tile entry as a 1x1 model on the origin. So **98 is unchanged and carries 1x1 pieces only**. A 0.3.0 client sees a multi-tile piece as one leaf on its origin plus invisible filler, and ignores id 102 (its dispatcher's "unrecognized: ignore", pinned against the v0.3.0 tag in `test_old_host_compat_src.py` O9).
+  - A C2 client uses the 102 list as its view once it has arrived.
+- **Old hosts:** a client sends op 4 or a multi-tile PLACE only after the 102 CAPS. A 0.3.0 host never sends 102, and it would answer op 4 with BAD_SHAPE plus a violation (O10). Against a 0.3.0 host a C2 client still grabs 1x1 pieces and can only rotate them; a push or pull gets "won't budge".
+- **Service 10 / PERMS / reasons:** unchanged (no new bit; a 0.3.0 client would refuse one).
+
+**Sidecar `outdoor_furniture.dat` version 2:**
+
+- The same 52-byte record; `shape` (u8) and `flags` (u8, 0) replace the zero u16.
+- A version 1 (0.3.0) file loads losslessly: its records are 1x1 and byte-identical. The host keeps `outdoor_furniture.dat.v1.bak` (never overwritten) and rewrites the file as v2 (log `is a version 1 (0.3.0) sidecar: N piece(s) converted to version 2`).
+- The loader drops overlapping footprints, footprints leaving the town and unknown shapes.
+- **Downgrade:** a 0.3.0 host refuses a v2 file as corrupt (O11). Its pieces stay leaves, the `FE1F` cells stay as invisible blocked tiles, and Place is refused until the file is removed. Restore the `.v1.bak` to go back.
+
+**Storage outdoors (S3): NOT implemented.** Dressers, wardrobes and closets are placeable, movable, rotatable and pickable like any piece, and draw-only. Making their storage usable outdoors needs:
+
+- **A key in the dresser store:** owner = a town sentinel, floor 0xFC, layer 0, ut = the town origin, plus the furniture id with the rotation masked.
+- **The open path:** an outdoor "open" interaction (the vanilla HOLD codes 6 / 7 / 8 = `open_furniture`, which today needs `my_room_clip` for the door animation), or a PC UI entry from the grab.
+- **The host re-keys the store entry on every MOVE**, the same logic as a house move. ROTATE keeps the key because the id is masked.
+- **PICKUP is refused while the store holds items** (the indoor rule: move / rotate allowed, pickup blocked). The vanilla pickup gate and the console `furniture remove` / `clear` need the same check, or must send the contents to the lost and found.
+- **GC:** losing the marker while it holds items must move them to the lost and found, never drop them.
+- **The 0.3.0 client's vanilla pickup of the origin leaf** must be refused while the store is non-empty.
+- Protocol tests for all of the above.
+
+This was too big to do safely in this pass, so it was left out whole.
+
+**Switches:** as C1 (`AC_MP_OUTDOOR_FURNITURE=0`, `settings.ini [Network] outdoor_furniture_*`). C2 is always on when Place is on.
+
+**Evidence:**
+
+| Test | What it covers | Result |
+|---|---|---|
+| `test_ofurn_native.py` | `pc_ofurn_selftest` incl. the C2 footprint / rotation / move geometry / v1->v2 / 102 checks | PASS |
+| `test_ofurn_src.py` | C2 audits C2W1-4, C2H1-4, C2P1-5, D1-D3 | 47/47 |
+| `test_old_host_compat_src.py` | K22c, O9-O11 against the v0.3.0 tag | 25/25 |
+| `wire_baseline.py` | id 102 documented | PASS |
+| `test_ofurn_c2_protocol.py` (real listen host + FakeClients) | MAIN: 2x1 dresser + 2x2 table placement, every cell checked, rotation swing, blocked swing / push BAD_TILE, push / replay / wrong side / guest / pull, pickup clears all cells, a 0.3.0-style vanilla pickup + GC of the fillers, no violation, 98 stays C1. GC: a filler overwritten. V1: conversion + `.v1.bak`. RS: restart | 46/46 (MAIN 30, GC 4, V1 5, RS 7) |
+| `test_ofurn_real.py` (real host + real client, Samsung, volume 1) | see below | 3 runs |
+
+The three real runs:
+
+- **Run 1** found cause 1 of the dresser bug: the model was never built.
+- **Run 2** (after the vtable fix, with the full model draw cycle: 1266 models, no crash) found the move-bg height bug: every step was blocked locally.
+- **Run 3:** 17/17. The 2x1 dresser was drawn with collision, grabbed in HOLD 19, then pulled, pushed and rotated twice (all APPLIED by the host). The observer's puppet showed 19 / 20 / 21 / 22 and its model slid. B picked the piece up.
+
+The C1 `test_ofurn_protocol.py` K1 / P3 now expect multi-tile placement (not re-run in this pass: its ports are outside the current port range).
+
+**Known limits / risks:**
+
+- The grab directions assume the town camera looks north (stick up = -z), as vanilla outdoors.
+- The pull "walkable" check refuses flowers and other ITEM0 values (conservative).
+- Remote players are not checked against a moved piece's new cells; the collision pushes them out.
+- On a client the 102 MOVE and the FIELD_UPDATE normally arrive in the same frame. If they do not, the moved piece may show its leaf for a moment.
+- A multi-tile piece's filler cells block a 0.3.0 client's drops with the vanilla "can't place" message, without a reason shown.
+- The pocket check for picking up a dresser does not count the (outdoor-empty) storage.
 
 ## Frame-rate independence of PC waits
 

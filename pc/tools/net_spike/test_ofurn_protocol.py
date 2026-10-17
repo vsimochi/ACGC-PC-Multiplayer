@@ -3,7 +3,7 @@
 OUTDOOR_FURN (list at join, SET / DEL deltas, PERMS), town service 10 OFURN_CAPS, the vanilla pickup gate of a placed piece, the leaf-drop policy, the safety ceiling,
 the marker GC, the sidecar across a host restart.
 
-TIER: PROTOCOL TESTED against a REAL listen host (scripted resident / guest FakeClients, the harness of test_ts_protocol.py). Run on a DISPOSABLE fixture copy
+TIER: PROTOCOL TESTED against a REAL listen host (C2 changed K1 / P3: multi-tile placement is now accepted, see test_ofurn_c2_protocol.py) (scripted resident / guest FakeClients, the harness of test_ts_protocol.py). Run on a DISPOSABLE fixture copy
 (NET_SPIKE_GAME_BIN=<abs path of pc\\build64\\bin_fixture4_of_<name>>). Ports 25000-25999 only.
   MAIN  CAPS (service 10: v1, Place + leaf on, 512 / 128), PERMS (resident 0x0B, guest 0x08), the join list; a 1x1 id and a too-big id are classified by the host
         (TOO_BIG 57 before any tile rule); PLACE APPLIED (conservation: only the slot empties; the tile = id | rot; SET delta to the others), replay REPLAYED (one commit),
@@ -175,7 +175,7 @@ def classify_ids(run, c):
             big = item
         elif is_rej(r, BAD_TILE) and one is None:
             one = item
-    return one, big
+    return one, (big if big is not None else 0x1064)  # C2: nothing is TOO_BIG any more; 0x1064 = a 2x1 dresser (iam_sum_blue_lowchest01)
 
 
 def place_somewhere(run, c, item, rot=2, cands=None, skip=()):
@@ -218,7 +218,7 @@ def phase_main(run):
     ck("SEED the host wrote a furniture LEAF (no marker) for the leaf pickup check", seeded is not None)
 
     one, big = classify_ids(run, a)
-    ck("K1 the host classified a 1x1 furniture id (BAD_TILE out of reach) and a multi-tile id (TOO_BIG 57, 'too big to place outside') -- %s / %s" %
+    ck("K1 the host classified a 1x1 furniture id (BAD_TILE out of reach) -- %s (C2: multi-tile ids are placeable, %s is the 2x1 dresser)" %
        (hex(one) if one else None, hex(big) if big else None), one is not None and big is not None)
     if one is None:
         return
@@ -242,7 +242,7 @@ def phase_main(run):
     s2 = free_slot(pre_with(a))
     stand_south_of(a, ux, uz)
     _x, r = of_txn(run, a, PLACE, D_NONE, s2, big, 0, ux + 1, uz, pre=pre_with(a, {s2: big}))
-    ck("P3 a multi-tile piece is TOO_BIG (57) -- it stays in the pocket (can still be dropped as a leaf)", is_rej(r, TOO_BIG))
+    ck("P3 (C2) a multi-tile piece is no longer TOO_BIG (57): the host validates its footprint (multi-tile placement: test_ofurn_c2_protocol.py)", not is_rej(r, TOO_BIG))
     sg = free_slot(pre_with(g))
     stand_south_of(g, ux + 2, uz)
     _x, r = of_txn(run, g, PLACE, D_NONE, sg, one, 0, ux + 2, uz, pre=pre_with(g, {sg: one}))

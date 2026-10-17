@@ -2922,8 +2922,12 @@ static aFTR_PROFILE* aMR_PC_ProfileOfItem(int item) {
     return furniture_quality[idx];
 }
 
+/* C2 fix: C1 ran a vtable only when it had NO dt_proc, to keep the 10 structure models (whose ct_proc zelda_mallocs a palette) away. But 123 vtables carry an EMPTY
+ * dt_proc -- among them every dresser / wardrobe / closet (their model is the skeleton their ct_proc builds) -- so those pieces had nothing drawable and stayed LEAVES
+ * outdoors ("I can't place down dressers"). Every vtable is used now and aMR_PC_StandaloneDt runs the dt_proc, so a ct_proc allocation is always freed (the 18
+ * non-empty dt_procs: zelda_free(pal_p), switch_bit copies, a haniwa sAdo_RhythmStop of a rhythm that was never started). */
 static int aMR_PC_UseVtable(const aFTR_PROFILE* profile) {
-    return profile->vtable != NULL && profile->vtable->dt_proc == NULL;
+    return profile->vtable != NULL;
 }
 
 int aMR_PC_FtrItemShape(int item) {
@@ -2956,7 +2960,8 @@ int aMR_PC_StandaloneCt(FTR_ACTOR* ftr_actor, int item, const xyz_t* pos, u8* ba
     ftr_actor->angle_y = aMR_angle_table[angle];
     ftr_actor->angle_y_target = ftr_actor->angle_y;
     ftr_actor->s_angle_y = RAD2SHORT_ANGLE2(DEG2RAD(ftr_actor->angle_y));
-    ftr_actor->shape_type = profile->shape;
+    /* C2: a 2x1 piece's current shape is its rotation's TYPEB_* (aMR_SetFurnitureType); pos is the model position of the footprint (pc_ofurn_fp_model_pos) */
+    ftr_actor->shape_type = profile->shape == aFTR_SHAPE_TYPEB_0 ? l_typeB0_table[angle] : profile->shape;
     ftr_actor->original_shape_type = profile->shape;
     ftr_actor->position = *pos;
     ftr_actor->last_position = *pos;
@@ -3055,11 +3060,12 @@ void aMR_PC_StandaloneDraw(FTR_ACTOR* ftr_actor, GAME* game, u8* bank) {
 
 void aMR_PC_StandaloneDt(FTR_ACTOR* ftr_actor, u8* bank) {
     aFTR_PROFILE* profile = ftr_actor != NULL ? aMR_GetFurnitureProfile(ftr_actor->name) : NULL;
-    (void)bank;
     if (profile == NULL) {
         return;
     }
-    /* aMR_PC_UseVtable() profiles have no dt_proc by definition: nothing was allocated by a ct_proc we ran */
+    if (aMR_PC_UseVtable(profile) && profile->vtable->dt_proc != NULL && bank != NULL) {
+        profile->vtable->dt_proc(ftr_actor, bank); /* C2: balances the ct_proc we ran (e.g. the structure models' zelda_malloc'd palette) */
+    }
     bzero(ftr_actor, sizeof(FTR_ACTOR));
 }
 

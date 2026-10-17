@@ -92,8 +92,17 @@ static void Player_actor_BGcheck_Hold(ACTOR* actor) {
 
 static void Player_actor_request_proc_index_fromHold(ACTOR* actor, GAME* game) {
     PLAYER_ACTOR* player = (PLAYER_ACTOR*)actor;
+#ifdef TARGET_PC
+    /* outdoor furniture C2 (pc/src/pc_ofurn_draw.c): in the town field there is no My_Room actor (my_room_clip NULL); a grab of a PLACED piece is judged by the PC
+     * outdoor driver with the same return codes (0 release, 1 hold, 2 push, 3 pull, 4 / 5 rotate). Without an outdoor grab it answers 0 (back to wait). */
+    extern int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no);
+    aMR_JUDGE_PLAYER_ACTION_PROC judge_proc =
+        Common_Get(clip).my_room_clip != NULL ? Common_Get(clip).my_room_clip->judge_player_action_proc : pc_ofurn_grab_judge;
 
+    if (judge_proc != NULL) {
+#else
     if (Common_Get(clip).my_room_clip != NULL) {
+#endif
         int state;
         xyz_t wpos0;
         xyz_t wpos1;
@@ -103,7 +112,11 @@ static void Player_actor_request_proc_index_fromHold(ACTOR* actor, GAME* game) {
         s16 angle;
 
         ftr_no = player->main_data.hold.ftr_no;
+#ifdef TARGET_PC
+        state = judge_proc(&wpos0, &wpos1, ftr_no);
+#else
         state = Common_Get(clip).my_room_clip->judge_player_action_proc(&wpos0, &wpos1, ftr_no);
+#endif
         angle = player->main_data.hold.angle_y;
         pos = &player->main_data.hold.player_pos;
         switch (state) {
