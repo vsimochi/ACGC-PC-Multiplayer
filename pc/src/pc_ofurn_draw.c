@@ -815,6 +815,24 @@ static void pc_ofurn_pick_tick(void) {
 }
 
 /* ---- C3: the OPEN path of a placed storage piece (A tap; the gyroid-style 27-slot screen of the indoor direct open, without the My_Room actor) ---- */
+/* C3b: 1 = the player stands in the FRONT row of the piece (the side its doors / drawers face: direction rot) and faces it (direction (rot + 2) & 3, the
+ * quantised facing exactly; the host re-checks with a lag tolerance). From behind or beside it nothing opens (the indoor open needs contact FRONT too). */
+static int pc_ofurn_open_from_front(const PLAYER_ACTOR* pl, const PCOfurnMarker* mk) {
+    int pux, puz, ok;
+    if (pl == NULL || mk == NULL) {
+        return 0;
+    }
+    pux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F);
+    puz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
+    ok = pc_ofurn_fp_in_front((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, pux, puz, 1) &&
+         pc_ofurn_dir4((int)pl->actor_class.shape_info.rotation.y) == (((int)mk->rot + 2) & 3);
+    if (!ok) {
+        printf("[OFURN][STORAGE] the storage piece at (%u,%u) rot %u: the player at (%d,%d) facing %d is not in front of it -- no open\n", (unsigned)mk->ut_x,
+               (unsigned)mk->ut_z, (unsigned)mk->rot, pux, puz, pc_ofurn_dir4((int)pl->actor_class.shape_info.rotation.y));
+    }
+    return ok;
+}
+
 static void pc_ofurn_open_request(const PCOfurnMarker* mk) {
     const char* why = NULL;
     PLAYER_ACTOR* pl;
@@ -973,6 +991,11 @@ static int pc_ofurn_grab_try(GAME* game, PLAYER_ACTOR* pl, int ux, int uz) {
         return 0;
     }
     if (!pc_net_game_ofurn_may_move(&rotate_only)) {
+        /* C3b: a guest cannot grab, but it OPENS a storage piece from its front (on the press: there is no grab for a tap to end) */
+        if (pc_net_game_ofurn_is_storage((int)pc_ofurn_tile_value(&mk)) && pc_ofurn_open_from_front(pl, &mk)) {
+            pc_ofurn_open_request(&mk);
+            return 1;
+        }
         pc_net_game_ofurn_notice_text(pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED));
         return 1; /* consumed: a guest's A press does nothing else on a placed piece */
     }
@@ -1136,8 +1159,9 @@ int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no) {
         /* C3: the vanilla open gesture (aMR_ManageMoveBottun): A released before 14 frames without a step = a TAP: a storage piece opens */
         const uint32_t held = pc_net_game_now_ms() - s_grab.start_ms;
         const PCOfurnMarker tapped = s_grab.mk;
-        const int opens = s_grab.op == 0 && pc_ofurn_tap_opens(held, s_grab.stepped, pc_net_game_ofurn_is_storage((int)pc_ofurn_tile_value(&tapped)));
-        pc_ofurn_grab_end(opens ? "A tapped (open)" : "A released");
+        const int tap = s_grab.op == 0 && pc_ofurn_tap_opens(held, s_grab.stepped, pc_net_game_ofurn_is_storage((int)pc_ofurn_tile_value(&tapped)));
+        const int opens = tap && pc_ofurn_open_from_front(pl, &tapped); /* C3b: from behind / the side a tap is only a short grab */
+        pc_ofurn_grab_end(opens ? "A tapped (open)" : tap ? "A tapped (not in front of the piece: no open)" : "A released");
         if (opens) {
             pc_ofurn_open_request(&tapped);
         }

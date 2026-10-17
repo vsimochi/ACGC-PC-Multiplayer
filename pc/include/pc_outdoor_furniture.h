@@ -46,6 +46,12 @@ extern "C" {
  * without a push / pull / rotate step = the TAP that opens a storage piece; held longer = a plain grab. Wall clock here (the PC renders uncapped). */
 #define PC_OFURN_TAP_MS 233u
 int pc_ofurn_tap_opens(uint32_t held_ms, int stepped, int is_storage); /* 1 = this A release opens the storage */
+/* C3 FRONT rule (the indoor open needs contact_direction == FRONT, ac_my_room_action.c_inc aMR_JudgeDemoStart): a piece of rotation `rot` faces direction rot
+ * (0 S +z, 1 E +x, 2 N -z, 3 W -x; placement gives rot = (player facing + 2) & 3: the piece faces the player who placed it). The front ROW = the tiles one step
+ * along that direction from every footprint cell that are not cells themselves (the whole width: 1 tile of a 1x1, 2 of a 2x1 / 2x2). The opener stands there
+ * (or up to max_depth tiles further out: the host's lag tolerance) and faces the piece: facing direction (rot + 2) & 3. */
+int pc_ofurn_fp_in_front(int fp, int rot, int ox, int oz, int pux, int puz, int max_depth); /* 1 = the player tile is in front of the piece (depth 1..max_depth) */
+int pc_ofurn_faces_piece(int rot, int angle_s16, int tol_s16); /* 1 = the facing is within tol_s16 (binangle) of (rot + 2) & 3, i.e. towards the piece's front */
 /* the vanilla furniture BIRTH (aMR_FtrBirth, ac_my_room_move.c_inc): a squash-and-stretch wobble: counter += step * dt (binangle), scale_y = 1 + sin(counter) * mod,
  * scale_xz = 1 - sin(counter) * mod; at every half-turn mod *= 0.4 and step += 1500; done when |mod| < 0.02 (starts: mod 0.5, step 6000). The BIRTH starts after the
  * reserve wait of 46 frames (aMR_ReserveFurniture). Dust at 2 and 6 frames into the birth. */

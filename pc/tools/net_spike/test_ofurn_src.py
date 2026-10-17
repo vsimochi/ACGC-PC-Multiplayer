@@ -181,7 +181,8 @@ ck("C2P1 the player's HOLD / ROTATE states ask the PC outdoor judge only when th
    and "Common_Get(clip).my_room_clip != NULL ? Common_Get(clip).my_room_clip->judge_player_action_proc : pc_ofurn_grab_judge;" in hr)
 gj = body(dr, "int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no) {")
 ck("C2P2 the outdoor judge answers 0 without an outdoor grab / for another ftr_no, releases on A up, 16-frame push / pull timers, rotation re-armed by a neutral stick",
-   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end(opens ? "A tapped (open)" : "A released");' in gj and "s_grab.push_t > 16.0f" in gj
+   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end(opens ? "A tapped (open)" : tap ? "A tapped (not in front of the piece: no open)" : "A released");' in gj
+   and "s_grab.push_t > 16.0f" in gj
    and "s_grab.pull_t > 16.0f" in gj and "s_grab.allow_rot = 1;" in gj)
 fp = body(dr, "int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger) {")
 ck("C2P3 the grab enters the REAL hold state (mPlib_request_main_hold_type1); A in front = grab, B = pick up (vanilla: B picks furniture up)",
@@ -198,10 +199,38 @@ ck("C3K1 the outdoor key is the SAME 16-byte dresser key (no sidecar format chan
    and "pc_dresser_key_make(key, s_town_owner8, (int)PC_DRESSER_OUTDOOR_FLOOR, 0, ut_x, ut_z, (uint16_t)(ftr_item & ~3u));" in dsc)
 ck("C3K2 shared records are applied without the RECORD-level nonce fence (several residents at one piece); house records keep it",
    "if (!shared && (nonce_fenced(r, t->nonce)" in dsc and "outdoor ? pc_dresser_store_apply_shared(&s_dresser, key, &dt, &res) : pc_dresser_store_apply(&s_dresser, key, &dt, &res)" in hdt)
-ck("C3W1 no new message id / no layout change: an outdoor SELECT is message 84 with floor 0xFC (8 bytes asserted), validated against the LIVE marker + a resident next to it",
+sok = body(ng, "static int pcnetgame_ofurn_storage_select_ok(PCNetPeerId peer, int ut_x, int ut_z, uint16_t base, const char** why) {")
+ck("C3W1 no new message id / no layout change: an outdoor SELECT is message 84 with floor 0xFC (8 bytes asserted), validated against the LIVE marker + a bound player next to it",
    "sizeof(PCNetGameDresserQueryMsg) == 8" in ng and "if (q->floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR) {" in hq and "pcnetgame_ofurn_storage_select_ok(peer, (int)q->ut_x, (int)q->ut_z, base, &why)" in hq
-   and all(x in blk for x in ("pcnetgame_ofurn_peer_is_resident(peer)", "pcnetgame_ofurn_tiles_match(&s_ofh.m[k], NULL, NULL, NULL)", "PC_NETGAME_CTX_FLAG_IN_TOWN",
+   and all(x in sok for x in ("!s_host_peer[peer].bound_valid", "pcnetgame_ofurn_tiles_match(&s_ofh.m[k], NULL, NULL, NULL)", "PC_NETGAME_CTX_FLAG_IN_TOWN",
                               "*why = \"the requester is not next to the piece\";")))
+# ---- C3b: guests open outdoor storage; the open works only from the FRONT of the piece
+ck("C3G1 a GUEST may probe + select OUTDOOR storage only (a house floor stays refused before any private_data[] subscript); its probe is answered only when outdoor storage is offered",
+   "if (idx < 0 || (idx >= PLAYER_NUM && q->floor != (uint8_t)PC_NETGAME_DRESSER_PROBE && q->floor != (uint8_t)PC_DRESSER_OUTDOOR_FLOOR)) {" in hq
+   and hq.index("if (idx >= PLAYER_NUM) {") < hq.index("pcnetgame_dresser_migrate_resident(idx, pcnetgame_mbox_house_of(") and "if (pcnetgame_ofurn_c3_flags() != 0u) {" in hq
+   and "pcnetgame_ofurn_peer_is_resident(peer)" not in sok)
+ck("C3G2 kind 18 of a GUEST: only with its own current OUTDOOR selection (else the guest refusal before any subscript); the house branch / owner peek never run for a guest slot",
+   "s_dresser_sel[peer].floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR &&" in hdt and "s_dresser_sel[peer]._r == (uint8_t)(idx + 1)" in hdt
+   and hdt.index("pcnetgame_txn_reject_guest_no_house(") < hdt.index("Save_Get(private_data)[idx]")
+   and "have_sel = idx < PLAYER_NUM && sel->valid" in hdt and "(idx < PLAYER_NUM && pcnetgame_dresser_peek_owner(" in hdt)
+rf = body(ng, "static void pcnetgame_dresser_roll_forward(int idx, PCNetGameRecSlot* slot, const uint8_t key[PC_DRESSER_KEY_LEN]) {")
+dk = body(ng, "static uint32_t pcnetgame_dresser_pocket_dig_k(int idx, const uint8_t key[PC_DRESSER_KEY_LEN], const uint16_t* pockets, uint32_t conds, uint32_t wallet) {")
+ck("C3G3 the shared-record journal digests are salted by the requester's PersonalID (outdoor keys only; house digests unchanged), so the restart roll-forward (now also for a "
+   "guest slot of an outdoor record) never hands one player's pocket side to another with equal pockets",
+   "pc_dresser_key_is_outdoor(key)" in dk and "&p->player_ID" in dk and rf.count("pcnetgame_dresser_pocket_dig_k(idx, key,") == 2
+   and "(idx >= PLAYER_NUM && !pc_dresser_key_is_outdoor(key))" in rf and "dt.pre_pocket_dig = pcnetgame_dresser_pocket_dig_k(idx, key," in hdt
+   and "dt.post_pocket_dig = pcnetgame_dresser_pocket_dig_k(idx, key," in hdt)
+gt = body(dr, "static int pc_ofurn_grab_try(GAME* game, PLAYER_ACTOR* pl, int ux, int uz) {")
+ff = body(dr, "static int pc_ofurn_open_from_front(const PLAYER_ACTOR* pl, const PCOfurnMarker* mk) {")
+ck("C3F1 the FRONT rule (pure): the front row = one step along `rot` from every cell (the whole width), facing (rot + 2) & 3; the host re-checks it at every SELECT / commit "
+   "(depth 2, facing +-67.5 deg), the client asks only from the row facing it exactly; a guest's A opens from the front (no grab), else the C1 notice",
+   "int pc_ofurn_fp_in_front(int fp, int rot, int ox, int oz, int pux, int puz, int max_depth) {" in pof and "pc_ofurn_dir_delta(rot & 3, &dx, &dz);" in pof
+   and "const int want = ((rot + 2) & 3) << 14;" in pof
+   and "pc_ofurn_fp_in_front((int)s_ofh.m[k].shape, (int)s_ofh.m[k].rot, (int)s_ofh.m[k].ut_x, (int)s_ofh.m[k].ut_z, pux, puz, 2)" in sok
+   and "pc_ofurn_faces_piece((int)s_ofh.m[k].rot, (int)face, 0x3000)" in sok
+   and "pc_ofurn_fp_in_front((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, pux, puz, 1)" in ff and "== (((int)mk->rot + 2) & 3)" in ff
+   and "const int opens = tap && pc_ofurn_open_from_front(pl, &tapped);" in gj
+   and gt.index("pc_ofurn_open_from_front(pl, &mk)") < gt.index("pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED)") < gt.index("mPlib_request_main_hold_type1("))
 ck("C3W2 the capability is the 102 CAPS `total` bit 0 (a C2 client reads only count + flags of CAPS); a C3 client never sends floor 0xFC to a host without it",
    "m.total = pcnetgame_ofurn_c3_flags();" in blk and "s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE;" in blk and "(s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) == 0u" in blk
    and "return m->count == 0 && (m->flags & ~PC_OFURN_C2_ALL) == 0u;" in pof)

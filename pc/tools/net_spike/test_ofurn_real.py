@@ -33,7 +33,8 @@ import test_txn_real_client as RC  # noqa: E402
 ITEM = 0x1064  # iam_sum_blue_lowchest01: a 2x1 DRESSER (aFTR_SHAPE_TYPEB_0, storage interaction)
 SCRIPT = "grab,pull,push,left,right,release"
 STARTED = []
-ENV_KEYS = ("AC_TEST_OFURN_SEED", "AC_TEST_OFURN_SEED_NEAR", "AC_TEST_OFURN_DRAWCYCLE", "AC_TEST_OFURN", "AC_TEST_OFURN_GRAB", "PC_PUPPET_DIAG", "AC_MP_DRESSER_STORAGE")
+ENV_KEYS = ("AC_TEST_OFURN_SEED", "AC_TEST_OFURN_SEED_NEAR", "AC_TEST_OFURN_DRAWCYCLE", "AC_TEST_OFURN", "AC_TEST_OFURN_GRAB", "PC_PUPPET_DIAG", "AC_MP_DRESSER_STORAGE",
+            "AC_TEST_MUSEUM_POCKETS")
 
 
 def _run(args, rig):
@@ -152,8 +153,11 @@ def _run_storage(args, rig):
     b1 = a.wait_for_log(r"\[NET\]\[OFURN\] place anim contact: tile \(%d,%d\) item 0x%04X" % (ux, uz, ITEM), 90.0)
     check("S1 the client's renderer showed the vanilla BIRTH of the newly placed piece (place anim contact)", b1 is not None)
     c3 = a.wait_for_log(r"the host supports outdoor furniture C3: outdoor storage ON", 30.0)
+    bk = a.wait_for_log(r"storage: BACK tap result: the screen is (\w+)", 120.0)
+    check("S2b C3b front rule: the A TAP from BEHIND the piece was a short grab and opened nothing (no outdoor SELECT sent)",
+          bk is not None and bk.group(1) == "closed" and "is not in front of it -- no open" in a.log_text() and "A tapped (not in front of the piece: no open)" in a.log_text())
     op = a.wait_for_log(r"\[OFURN\]\[STORAGE\] outdoor storage of \(%d,%d\) OPENED after (\d+) ms" % (ux, uz), 120.0)
-    check("S2 outdoor storage announced (102 CAPS) and the A TAP opened the 27-slot screen", c3 is not None and op is not None)
+    check("S2 outdoor storage announced (102 CAPS) and the A TAP from the FRONT opened the 27-slot screen", c3 is not None and op is not None)
     hp = host.wait_for_log(r"\[NET\]\[DRESSER\] host: peer %d resident \d+ PUT item=0x[0-9A-F]{4} pocket=\d+ pool slot=\d+" % peer, 60.0)
     cl = a.wait_for_log(r"\[NET\]\[OFURN\]\[TEST-ONLY\] storage: the screen closed", 60.0)
     check("S3 a PUT through the screen: the host APPLIED the outdoor kind 18; the screen closed (B)", hp is not None and cl is not None)
@@ -175,11 +179,66 @@ def _run_storage(args, rig):
     check("S8 host and client alive", host.alive() and a.alive())
 
 
+GUEST_FISH = 0x2300  # a fish (storable in a dresser) the TEST-ONLY AC_TEST_MUSEUM_POCKETS hook puts into the guest's pocket
+
+
+def _run_storage_guest(args, rig):
+    """C3b (--storage-guest): a REAL `--guest` client opens the outdoor storage of a placed dresser (AC_TEST_OFURN=storage_guest):
+      U1 the host seeded the 2x1 dresser next to the guest
+      U2 the A press from BEHIND opened nothing (the front rule; a guest gets the C1 notice), the A press from the FRONT opened the 27-slot screen
+      U3 the guest PUT its fish (host: outdoor kind 18 APPLIED for the guest slot), reopened it with the item, TOOK it back (APPLIED)
+      U4 B on the piece is refused for the guest (no pickup right), the piece stays; host and client alive"""
+    check = rig.check
+    save_dir = os.path.join(L.GAME_BIN_DIR, RC.SAVE_DIR_REL)
+    ini = os.path.join(save_dir, "mp", "guest.ini")
+    os.makedirs(os.path.dirname(ini), exist_ok=True)
+    with open(ini, "wb") as f:
+        f.write(b"# test profile\nname = Wendel\ngender = 0\nface = 2\nhome_town = Farvale\nplayer_id = 0x4D29\nland_id = 24113\n")
+    os.environ["AC_TEST_OFURN_SEED"] = "0x%04X,0" % ITEM
+    os.environ["AC_TEST_OFURN_SEED_NEAR"] = "1"
+    os.environ["AC_MP_DRESSER_STORAGE"] = "1"  # pc/build64_w3's cache still says PC_DRESSER_STORAGE_DEFAULT_ON=OFF
+    os.environ.pop("AC_TEST_OFURN", None)
+    host = rig.start_host("of3guest", args.port, [])
+    check("host reached genuine field-ready state", host is not None)
+    if host is None:
+        return
+    STARTED.append(host)
+    L.resolve_host_town("127.0.0.1", args.port)
+    os.environ["AC_TEST_OFURN"] = "storage_guest"
+    os.environ["AC_TEST_MUSEUM_POCKETS"] = "%04X" % GUEST_FISH
+    g = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--guest"], log_path=os.path.join(HERE, "txn_real_of3guestG.log"), bin_dir=L.GAME_BIN_DIR,
+                        label="of3guestG").start()
+    STARTED.append(g)
+    m = host.wait_for_log(r"seeded placed piece at \((\d+),(\d+)\) item 0x%04X rot 0 -> placed \(next to peer (\d+)" % ITEM, 300.0)
+    check("U1 the host placed a 2x1 dresser next to the real GUEST client", m is not None)
+    if m is None:
+        return
+    ux, uz, peer = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    bk = g.wait_for_log(r"storage: BACK tap result: the screen is (\w+)", 180.0)
+    gt = g.log_text()
+    check("U2 the guest's A from BEHIND opened nothing (front rule) and showed the residents-only notice instead of a grab",
+          bk is not None and bk.group(1) == "closed" and "is not in front of it -- no open" in gt and "[OFURN][GRAB] grabbed" not in gt)
+    op = g.wait_for_log(r"\[OFURN\]\[STORAGE\] outdoor storage of \(%d,%d\) OPENED after (\d+) ms" % (ux, uz), 120.0)
+    hs = host.wait_for_log(r"\[NET\]\[DRESSER\] host: peer %d resident (\d+) selected the OUTDOOR storage at tile %d,%d" % (peer, ux, uz), 10.0)
+    check("U2 the guest's A from the FRONT opened the 27-slot screen (host: the guest slot selected the outdoor storage)", op is not None and hs is not None and int(hs.group(1)) >= 4)
+    hp = host.wait_for_log(r"\[NET\]\[DRESSER\] host: peer %d resident \d+ PUT item=0x%04X pocket=\d+ pool slot=\d+ .*committed \[TXN\]" % (peer, GUEST_FISH), 90.0)
+    ro = g.wait_for_log(r"storage: screen open at \(%d,%d\) with 1 item\(s\)" % (ux, uz), 90.0)
+    ht = host.wait_for_log(r"\[NET\]\[DRESSER\] host: peer %d resident \d+ TAKE item=0x%04X pocket=\d+ pool slot=\d+ .*committed \[TXN\]" % (peer, GUEST_FISH), 120.0)
+    check("U3 the guest PUT its fish (APPLIED), the reopened screen showed it, and it TOOK it back (APPLIED)", hp is not None and ro is not None and ht is not None)
+    dn = g.wait_for_log(r"storage \(guest\): done", 120.0)
+    gt = g.log_text()
+    check("U4 B on the piece is refused locally for a guest (no pickup right): no PICKUP reached the host; the piece is still placed",
+          dn is not None and "PICKUP APPLIED [TXN]: tile (%d,%d)" % (ux, uz) not in host.log_text() and "a guest has no house" not in host.log_text())
+    _ = gt
+    check("U5 host and guest client alive", host.alive() and g.alive())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=39300)
     ap.add_argument("--drawcycle", action="store_true")
     ap.add_argument("--storage", action="store_true", help="C3: outdoor storage + the place / pickup presentation")
+    ap.add_argument("--storage-guest", action="store_true", help="C3b: a real --guest client opens / uses the outdoor storage (front rule too)")
     args = ap.parse_args()
     if not (39000 <= args.port <= 39499):
         print("ports 39000-39499 only", file=sys.stderr)
@@ -194,7 +253,7 @@ def main():
     shutil.copytree(save_dir, snap_dir)
     rig = RC.Rig(args.port, results, save_dir, snap_dir)
     try:
-        (_run_storage if args.storage else _run)(args, rig)
+        (_run_storage_guest if args.storage_guest else _run_storage if args.storage else _run)(args, rig)
     finally:
         for p in STARTED:  # only the processes THIS test started
             try:

@@ -5,9 +5,11 @@ re-key on MOVE, the pickup refusal NOT_EMPTY 62, the orphan / re-attach, restart
 TIER: PROTOCOL TESTED against a REAL listen host (scripted resident / guest FakeClients, the harness of test_ofurn_c2_protocol.py / test_dresser_storage_protocol.py).
 Run on a DISPOSABLE fixture copy (NET_SPIKE_GAME_BIN=<abs path of pc\\build64\\bin_fixture4_of3_<name>>). Ports 39000-39499 only.
   MAIN  102 CAPS total bit 0 (outdoor storage) at join; a resident places the 2x1 DRESSER (0x1064); SELECT floor 0xFC of its origin -> STATE (floor 0xFC, origin, gen,
-        empty); a SELECT by a GUEST, of a wrong tile, of a non-storage piece, from far away -> no answer; PUT x2 with the outdoor selection -> APPLIED (pocket emptied,
+        empty); C3b: a GUEST's SELECT from the front -> answered; a SELECT of a wrong tile, of a non-storage piece, from far away, from BEHIND / either SIDE
+        (resident and guest), in the front row facing away -> no answer, the other front tile / two tiles out -> answered; PUT x2 with the outdoor selection -> APPLIED (pocket emptied,
         STATE lists them), the identical resend REPLAYED; a SECOND resident selects the same piece, sees both items, PUTs one; the first resident PUTs again (shared
-        record: nobody FENCED); ROTATE -> the same key (the items stay); MOVE (push north) -> the host re-keys the storage, the old origin has no storage, the new one
+        record: nobody FENCED); C3b: the GUEST sees the 4 items, PUTs its own (REPLAYED on resend), a resident PUT + TAKE after it (nobody FENCED), the guest TAKEs
+        its item back, a stale generation is PRECOND, the guest's ROTATE / PICKUP stay NOT_ALLOWED 56; ROTATE -> the same key (the items stay); MOVE (push north) -> the host re-keys the storage, the old origin has no storage, the new one
         has all 4 items; kind 22 PICKUP -> REJECTED 62 OFURN_NOT_EMPTY (cells unchanged); a resident's VANILLA pickup of the origin leaf (what a 0.3.0 client does)
         -> refused, nothing changes; TAKE everything back -> conservation (pockets + storage); PICKUP -> APPLIED; no record-protocol violation
   GC    a seeded dresser with 1 stored item whose origin is overwritten behind the system's back: the GC drops the marker, the storage is kept as an ORPHAN (log); a
@@ -47,6 +49,7 @@ OUTDOOR = 0xFC
 DRESSER = C2.DRESSER_2X1  # 0x1064, a 2x1 storage piece
 ONE_1X1 = C2.ONE_1X1      # 0x1320, not a storage piece
 ITEMS = [0x2401, 0x2402, 0x2403, 0x2404]
+GUEST_ITEM, RES_ITEM = 0x2405, 0x2406  # C3b: the guest's own item / a resident's item stored and taken after the guest
 S, E, N, W = 0, 1, 2, 3
 
 
@@ -114,11 +117,32 @@ def phase_main(run):
     ck("S1 SELECT floor 0xFC of the origin -> STATE (floor 0xFC, the origin, gen 1, the base id, empty)",
        st is not None and st["ut_x"] == ux and st["ut_z"] == uz and st["ftr"] == DRESSER and st["enabled"] == 1 and not any(st["items"]))
     C2.stand(g, ux, uz + 1, N)
-    ck("S2 a GUEST's outdoor SELECT is never answered (residents only)", select(g, ux, uz, 7, DRESSER, 2.0) is None)
+    stg = select(g, ux, uz, 7, DRESSER)
+    ck("S2 C3b: a GUEST's outdoor SELECT from the front is answered (the same shared, empty storage)", stg is not None and stg["ut_x"] == ux and not any(stg["items"]))
     ck("S3 a SELECT of the second (filler) cell / a wrong id is not answered", select(a, ux + 1, uz, 2, DRESSER, 2.0) is None and select(a, ux, uz, 3, 0x1068, 2.0) is None)
     C2.stand(a, ux, uz + 8, N)
     ck("S4 a SELECT from 7 tiles away is not answered (next to the piece only)", select(a, ux, uz, 4, DRESSER, 2.0) is None and
        re.search(r"OUTDOOR DRESSER_SELECT refused .*not next to the piece", run.log()) is not None)
+    # ---- C3b front rule: the 2x1 rot 0 = cells (ux, uz) + (ux + 1, uz), its front faces +z (south): only the row (ux..ux+1, uz+1) facing north opens
+    off_f = len(run.log())
+    C2.stand(a, ux + 1, uz - 1, S)
+    back_a = select(a, ux, uz, 20, DRESSER, 2.0)
+    C2.stand(g, ux, uz - 1, S)
+    back_g = select(g, ux, uz, 21, DRESSER, 2.0)
+    C2.stand(a, ux - 1, uz, E)
+    side_w = select(a, ux, uz, 22, DRESSER, 2.0)
+    C2.stand(a, ux + 2, uz, W)
+    side_e = select(a, ux, uz, 23, DRESSER, 2.0)
+    ck("F1 from BEHIND (resident and guest) and from either SIDE, facing the piece: never answered (the host's front rule, logged)",
+       back_a is None and back_g is None and side_w is None and side_e is None and
+       run.n_log(r"OUTDOOR DRESSER_SELECT refused .*not in front of the piece", off_f) >= 4)
+    C2.stand(a, ux + 1, uz + 1, S)
+    ck("F2 in the front row but facing AWAY from the piece: not answered", select(a, ux, uz, 24, DRESSER, 2.0) is None)
+    C2.stand(a, ux + 1, uz + 1, N)
+    f3 = select(a, ux, uz, 25, DRESSER)
+    C2.stand(a, ux, uz + 2, N)
+    f4 = select(a, ux, uz, 26, DRESSER)
+    ck("F3 the second front tile (ux + 1, uz + 1) facing north is answered (the whole width), and so is two tiles out (the host's lag tolerance)", f3 is not None and f4 is not None)
     C2.stand(a, ux, uz + 1, N)
     st = select(a, ux, uz, 5, DRESSER)
     pre0 = OF.pre_with(a)
@@ -133,14 +157,46 @@ def phase_main(run):
     b = run.ready("B", run.r2)
     b.wait_record_synced(30.0)
     probe(b)
-    C2.stand(b, ux - 1, uz, E)
+    C2.stand(b, ux + 1, uz + 1, N)
     stb = select(b, ux, uz, 1, DRESSER)
-    ck("SH1 a SECOND resident selects the same piece: the same shared storage (both items)", stb is not None and sorted(x for x in stb["items"] if x) == sorted(ITEMS[:2]))
+    ck("SH1 a SECOND resident selects the same piece (from the other front tile): the same shared storage (both items)",
+       stb is not None and sorted(x for x in stb["items"] if x) == sorted(ITEMS[:2]))
     _s, rb = put(run, b, ITEMS[2], 1)
     ck("SH2 ... and PUTs a third item: APPLIED", rb is not None and rb.outcome == APPLIED)
     st = select(a, ux, uz, 7, DRESSER)
     _s, ra = put(run, a, ITEMS[3], 7)
     ck("SH3 the first resident PUTs again after the second one: APPLIED (shared record: not FENCED)", ra is not None and ra.outcome == APPLIED)
+    # ---- C3b: a GUEST uses the shared storage like a resident (PUT / replay / TAKE), but still never moves / rotates / picks up the piece
+    off_g = len(run.log())
+    C2.stand(g, ux, uz + 1, N)
+    stg = select(g, ux, uz, 8, DRESSER)
+    ck("GU1 the guest's SELECT shows the residents' 4 items", stg is not None and sorted(x for x in stg["items"] if x) == sorted(ITEMS))
+    gs, rg = put(run, g, GUEST_ITEM, 8)
+    ck("GU2 the guest PUTs an item: APPLIED (its pocket emptied in the post-image)", rg is not None and rg.outcome == APPLIED and GUEST_ITEM not in list(rg.post_pockets))
+    g.resend_txn(gs)
+    rr = g.wait_txn_result(gs.seq, 4.0, nth=2)
+    ck("GU3 the guest's identical resend is APPLIED/REPLAYED (journalled per identity)", rr is not None and rr.outcome == APPLIED and rr.reason == R["REPLAYED"])
+    stg = select(g, ux, uz, 9, DRESSER)
+    ck("GU4 the shared STATE now holds 5 items", stg is not None and len([x for x in stg["items"] if x]) == 5 and GUEST_ITEM in stg["items"])
+    select(a, ux, uz, 10, DRESSER)
+    _s, ra = put(run, a, RES_ITEM, 10)
+    st = select(a, ux, uz, 12, DRESSER)
+    rt = None
+    if ra is not None and ra.outcome == APPLIED and st is not None and RES_ITEM in st["items"]:
+        _s, rt = take(run, a, RES_ITEM, st["items"].index(RES_ITEM), 12)
+    ck("GU5 a resident PUT + TAKE after the guest: APPLIED (nobody FENCED by the other identity)", ra is not None and ra.outcome == APPLIED and rt is not None and rt.outcome == APPLIED)
+    stg = select(g, ux, uz, 11, DRESSER)
+    _s, rgt = take(run, g, GUEST_ITEM, stg["items"].index(GUEST_ITEM) if stg and GUEST_ITEM in stg["items"] else 0, 11)
+    ck("GU6 the guest TAKEs its item back: APPLIED (the item in its post-image), the storage holds the residents' 4 again",
+       rgt is not None and rgt.outcome == APPLIED and GUEST_ITEM in list(rgt.post_pockets))
+    _s, rs = dtxn(run, g, OP_TAKE, OF.free_slot(OF.pre_with(g)), ITEMS[0], 0, None, 99)
+    ck("GU7 a guest commit with a stale selection generation: REJECTED PRECOND (journalled, nothing changes)", rs is not None and rs.outcome != APPLIED and rs.reason == R["PRECOND"])
+    _x, rgr = C2.txn(run, g, ROTATE, D_NONE, 0, DRESSER, 1, ux, uz)
+    sg3 = OF.free_slot(OF.pre_with(g))
+    _x, rgp = C2.txn(run, g, PICKUP, D_POCKET, sg3, DRESSER, 0, ux, uz)
+    ck("GU8 the guest still may not ROTATE / PICK UP the placed piece: NOT_ALLOWED 56 (C1), the cells unchanged",
+       OF.is_rej(rgr, 56) and OF.is_rej(rgp, 56) and OF.tile_val(a, ux, uz) == DRESSER)
+    ck("GU9 no guest refusal 'a guest has no house' for its outdoor kind 18", run.n_log(r"a guest has no house", off_g) == 0)
     # ---- ROTATE keeps the key
     _x, r = C2.txn(run, a, ROTATE, D_NONE, 0, DRESSER, 1, ux, uz)
     _x, r2 = C2.txn(run, a, ROTATE, D_NONE, 0, DRESSER | 1, 0, ux, uz)

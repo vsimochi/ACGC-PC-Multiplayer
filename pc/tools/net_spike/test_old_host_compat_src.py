@@ -184,6 +184,15 @@ else:
     ck("O13 a 0.3.0 CLIENT never sends floor 0xFC (its select takes floors 0..2) and shows reason 62 with its generic refusal line (pc_ofurn_reason_text default)",
        "floor < 0 || floor > 2" in body(v030, "int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr_item) {")
        and 'default: return "That didn\'t work - try again";' in v030o)
+    # C3b (guests open outdoor storage, front rule): no wire change; an older host simply never answers a guest's dresser probe
+    oq = body(v030, "static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGameDresserQueryMsg* q) {")
+    sel = body(ng, "int pc_net_game_dresser_select(int floor, int layer, int ut_x, int ut_z, int ftr_item) {")
+    beg = body(ng, "int pc_net_game_dresser_begin(int op, int pool_slot, int pocket_slot, int item) {")
+    ook = body(ng, "int pc_net_game_ofurn_storage_open_ok(const char** why) {")
+    ck("O14 a GUEST client of this build on an older host (0.3.0 / the first C3 build answer the dresser probe of residents only: `idx >= PLAYER_NUM` returns) never sends an "
+       "outdoor SELECT or a kind 18 (both need pc_net_game_dresser_available() = the probe answered) and says 'Only residents can use storage outside' once the probe gave up",
+       "if (idx < 0 || idx >= PLAYER_NUM) {" in oq and "if (!pc_net_game_dresser_available() ||" in sel and "if (!pc_net_game_dresser_available() ||" in beg
+       and '(pcnetgame_client_is_guest_player() && s_dresser_probe_gave_up) ? "Only residents can use storage outside"' in ook)
 
 print("-" * 60)
 n = sum(1 for _d, ok in results if ok)

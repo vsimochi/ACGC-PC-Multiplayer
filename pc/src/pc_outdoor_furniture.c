@@ -559,6 +559,26 @@ int pc_ofurn_tap_opens(uint32_t held_ms, int stepped, int is_storage) {
     return is_storage && !stepped && held_ms < PC_OFURN_TAP_MS;
 }
 
+int pc_ofurn_fp_in_front(int fp, int rot, int ox, int oz, int pux, int puz, int max_depth) {
+    int dx, dz, k;
+    if (pc_ofurn_fp_covers(fp, rot, ox, oz, pux, puz)) {
+        return 0; /* standing on the piece (an unknown shape covers nothing: never in front) */
+    }
+    pc_ofurn_dir_delta(rot & 3, &dx, &dz); /* the direction the front faces */
+    for (k = 1; k <= max_depth; k++) {
+        if (pc_ofurn_fp_covers(fp, rot, ox, oz, pux - k * dx, puz - k * dz)) {
+            return 1; /* k tiles straight out from a cell, on the front side */
+        }
+    }
+    return 0;
+}
+
+int pc_ofurn_faces_piece(int rot, int angle_s16, int tol_s16) {
+    const int want = ((rot + 2) & 3) << 14; /* the binangle of direction (rot + 2) & 3 (pc_ofurn_dir4: 0 S, 0x4000 E, 0x8000 N, 0xC000 W) */
+    const int diff = (int)(short)(unsigned short)(((unsigned)angle_s16 - (unsigned)want) & 0xFFFFu);
+    return diff >= -tol_s16 && diff <= tol_s16;
+}
+
 void pc_ofurn_birth_init(PCOfurnBirth* b) {
     memset(b, 0, sizeof(*b));
     b->mod = 0.5f;   /* aMR_SetFirstScale */
@@ -899,6 +919,27 @@ int pc_ofurn_selftest(void) {
     ck(pc_ofurn_tap_opens(100, 0, 1) && !pc_ofurn_tap_opens(100, 1, 1) && !pc_ofurn_tap_opens(100, 0, 0) && !pc_ofurn_tap_opens(PC_OFURN_TAP_MS, 0, 1) &&
            pc_ofurn_tap_opens(PC_OFURN_TAP_MS - 1, 0, 1),
        "C3 tap: storage + no step + released before 14 frames (233 ms)");
+    /* C3 front rule: a 2x1 rot 0 at (20,30) = cells (20,30) + (21,30), front +z: the front row is (20,31) + (21,31) */
+    ck(pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 20, 31, 1) && pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 21, 31, 1) &&
+           !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 20, 29, 2) && !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 21, 29, 2) &&
+           !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 19, 30, 2) && !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 22, 30, 2) &&
+           !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 19, 31, 2) && !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 20, 30, 2) &&
+           !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 20, 32, 1) && pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 0, 20, 30, 20, 32, 2),
+       "C3 front: 2x1 rot 0 -- the whole +z row opens; behind, the sides, a diagonal, the piece itself never; depth 2 only with the host tolerance");
+    /* rot 1 (front +x): cells (20,30) + (20,29); rot 2 (front -z): (20,30) + (19,30); rot 3 (front -x): (20,30) + (20,31) */
+    ck(pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 1, 20, 30, 21, 30, 1) && pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 1, 20, 30, 21, 29, 1) &&
+           !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 1, 20, 30, 19, 30, 1) && !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 1, 20, 30, 20, 31, 1) &&
+           pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 2, 20, 30, 19, 29, 1) && !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 2, 20, 30, 20, 31, 1) &&
+           pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 3, 20, 30, 19, 31, 1) && !pc_ofurn_fp_in_front(PC_OFURN_FP_2X1, 3, 20, 30, 21, 30, 1) &&
+           pc_ofurn_fp_in_front(PC_OFURN_FP_1X1, 0, 20, 30, 20, 31, 1) && !pc_ofurn_fp_in_front(PC_OFURN_FP_1X1, 0, 20, 30, 20, 29, 1) &&
+           !pc_ofurn_fp_in_front(PC_OFURN_FP_1X1, 0, 20, 30, 21, 30, 1) && pc_ofurn_fp_in_front(PC_OFURN_FP_2X2, 2, 20, 30, 21, 29, 1) &&
+           !pc_ofurn_fp_in_front(PC_OFURN_FP_2X2, 2, 20, 30, 21, 32, 1) && !pc_ofurn_fp_in_front(-1, 0, 20, 30, 20, 31, 1),
+       "C3 front: every rotation (the front follows the rotation), 1x1, 2x2, an unknown shape");
+    ck(pc_ofurn_faces_piece(0, (int)(short)0x8000, 0x2000) && pc_ofurn_faces_piece(0, 0x7000, 0x2000) && !pc_ofurn_faces_piece(0, 0, 0x2000) &&
+           !pc_ofurn_faces_piece(0, 0x4000, 0x2000) && pc_ofurn_faces_piece(1, (int)(short)0xC000, 0x2000) && pc_ofurn_faces_piece(2, 0, 0x2000) &&
+           pc_ofurn_faces_piece(3, 0x4000, 0x2000) && !pc_ofurn_faces_piece(3, (int)(short)0xC000, 0x3000) && pc_ofurn_faces_piece(2, (int)(short)0xD000, 0x3000) &&
+           !pc_ofurn_faces_piece(2, (int)(short)0xC000, 0x3000),
+       "C3 front: facing the piece = (rot + 2) & 3 within the tolerance (rot 0 = face north)");
     {
         PCOfurnBirth b;
         float sxz = 0.0f, sy = 0.0f, maxy = 0.0f, minxz = 2.0f;

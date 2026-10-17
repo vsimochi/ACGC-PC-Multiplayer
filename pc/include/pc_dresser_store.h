@@ -124,7 +124,7 @@ int  pc_dresser_store_restore(PCDresserStore* s, const PCDresserRec* rec);
 #define PC_DRESSER_KEY_PREFIX 10 /* owner + floor + layer: the scope of the orphan re-attach search */
 void pc_dresser_key_make(uint8_t key[PC_DRESSER_KEY_LEN], const uint8_t owner8[8], int floor, int layer, int ut_x, int ut_z, uint16_t ftr_base);
 /* ---- C3: OUTDOOR storage (a storage piece PLACED in the town field, docs/multiplayer-guest-roadmap.md "Outdoor furniture C3"). The SAME 16-byte key, no format
- * change: [0..7] = the TOWN sentinel "TOWN\xFC" "OFU" (no house owner digest: one shared store per placed piece, every resident may use it), [8] = floor 0xFC (no real
+ * change: [0..7] = the TOWN sentinel "TOWN\xFC" "OFU" (no house owner digest: one shared store per placed piece, every resident and guest may use it), [8] = floor 0xFC (no real
  * floor: house floors are 0..2, 0xFD the v1 legacy overflow, 0xFF the probe), [9] = layer 0, [10] / [11] = the piece's ORIGIN tile in town unit coordinates
  * (16..95 / 16..111: fits a byte), [12..13] = the base furniture id (rotation masked: a ROTATE keeps the key; a MOVE re-keys), [14..15] = 0. The house code never
  * touches these records (every house scan filters by the house owner digest). ---- */

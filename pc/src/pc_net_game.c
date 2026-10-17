@@ -22625,9 +22625,10 @@ static int pcnetgame_dresser_host_ready(void) {
 }
 
 extern int aMR_pc_ftr_is_item_storage(int ftr_item); /* ac_my_room.c: the vanilla DRAWERS / WARDROBE / CLOSET profile predicate */
-/* C3 outdoor storage (OUTDOOR FURNITURE block, end of this file): 1 = (ut_x, ut_z) is the origin of a live placed storage piece of `base` and the READY resident
- * `peer` stands in the town next to it (*why = the refusal) */
+/* C3 outdoor storage (OUTDOOR FURNITURE block, end of this file): 1 = (ut_x, ut_z) is the origin of a live placed storage piece of `base` and the READY bound
+ * peer (resident or guest, C3b) stands in the town in FRONT of it, facing it (*why = the refusal) */
 static int pcnetgame_ofurn_storage_select_ok(PCNetPeerId peer, int ut_x, int ut_z, uint16_t base, const char** why);
+static uint32_t pcnetgame_ofurn_c3_flags(void); /* PC_OFURN_C3_STORAGE when outdoor storage is offered (a guest's dresser probe is answered then) */
 
 /* v2 identity: the owner digest (8 bytes) of house h's owner PersonalID (two independent FNV-1a 32 over the whole PersonalID). */
 static void pcnetgame_dresser_owner8(int h, uint8_t out8[8]) {
@@ -22763,6 +22764,18 @@ static uint32_t pcnetgame_dresser_pocket_dig(const uint16_t* pockets, uint32_t c
     return pcnetgame_fnv1a32_update(h, &wallet, sizeof(wallet));
 }
 
+/* C3b: the journalled pocket digests of a SHARED outdoor record are salted with the record's PersonalID (resident or guest): several identities journal into one
+ * record, and the restart roll-forward must never hand one player's journalled pocket side to another whose pockets happen to match (two fresh guests: empty
+ * pockets, 0 bells). House records keep the plain digest (their persisted journals stay valid). */
+static uint32_t pcnetgame_dresser_pocket_dig_k(int idx, const uint8_t key[PC_DRESSER_KEY_LEN], const uint16_t* pockets, uint32_t conds, uint32_t wallet) {
+    uint32_t h = pcnetgame_dresser_pocket_dig(pockets, conds, wallet);
+    const Private_c* p = pcnetgame_rec_priv_ptr(idx);
+    if (key != NULL && pc_dresser_key_is_outdoor(key) && p != NULL) {
+        h = pcnetgame_fnv1a32_update(h, &p->player_ID, sizeof(p->player_ID));
+    }
+    return h;
+}
+
 /* What the 24 EXTRA slots accept (pc_dresser_items.c, the ONE shared predicate: host commit check, client STATE check, UI predicate, put-in tag): ordinary items,
  * fish / insects (no Wisp spirit), furniture in pocket form; never turnips, knife and fork, exercise cards, unknown ids or other id types. The pocket
  * CONDITION (NORMAL only: no wrapped present, no work parcel) is checked separately. */
@@ -22812,8 +22825,8 @@ static void pcnetgame_dresser_roll_forward(int idx, PCNetGameRecSlot* slot, cons
     int i;
     /* v2: checked for each selected dresser, but ONLY while no transaction of this resident has been processed in this host process (a later pocket change could
      * make the mirror match an old pre-image by coincidence: never roll forward then) */
-    if (idx < 0 || idx >= PLAYER_NUM || s_txn_res[idx].nonce != 0u) {
-        return;
+    if (idx < 0 || idx >= pcnetgame_rec_slots() || (idx >= PLAYER_NUM && !pc_dresser_key_is_outdoor(key)) || s_txn_res[idx].nonce != 0u) {
+        return; /* C3b: a guest slot only for an outdoor record (a guest has no house) */
     }
     j = pc_dresser_store_last_applied(&s_dresser, key);
     r = pc_dresser_store_find(&s_dresser, key);
@@ -22826,7 +22839,7 @@ static void pcnetgame_dresser_roll_forward(int idx, PCNetGameRecSlot* slot, cons
     }
     conds = p->inventory.item_conditions;
     wallet = p->inventory.wallet;
-    dig = pcnetgame_dresser_pocket_dig(pk, conds, wallet);
+    dig = pcnetgame_dresser_pocket_dig_k(idx, key, pk, conds, wallet); /* C3b: salted by identity for a shared outdoor record */
     if (dig == j->post_pocket_dig) {
         return; /* the mirror already has the post-image */
     }
@@ -22854,7 +22867,7 @@ static void pcnetgame_dresser_roll_forward(int idx, PCNetGameRecSlot* slot, cons
         pk[j->pocket] = j->item;
         conds = mPr_SET_ITEM_COND(conds, j->pocket, mPr_ITEM_COND_NORMAL);
     }
-    if (pcnetgame_dresser_pocket_dig(pk, conds, wallet) != j->post_pocket_dig) {
+    if (pcnetgame_dresser_pocket_dig_k(idx, key, pk, conds, wallet) != j->post_pocket_dig) {
         printf("[NET][DRESSER] host: resident %d roll-forward: rebuilt post-image does not match the journal (seq %u) -- left alone\n", idx, (unsigned)j->seq);
         return;
     }
@@ -22898,8 +22911,10 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
         pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_DRESSER_DISABLED, 0, NULL, "dresser storage is off on this host");
         return;
     }
-    if (idx >= PLAYER_NUM) {
-        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "dresser storage: a guest has no house");
+    if (idx >= PLAYER_NUM && !(peer < PC_NETGAME_WIRE_ID_SPACE && s_dresser_sel[peer].valid && s_dresser_sel[peer].floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR &&
+                               s_dresser_sel[peer]._r == (uint8_t)(idx + 1))) {
+        /* C3b: a guest uses only the shared OUTDOOR storage (its own current outdoor selection; re-checked below like a resident's); never a house dresser */
+        pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "dresser storage: a guest has no house (and no outdoor storage selected)");
         return;
     }
     if (st->rec_state != PC_NETGAME_RECS_SYNCED || !s_host_world_ready) {
@@ -22933,7 +22948,7 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
             have_sel = sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) &&
                        pcnetgame_ofurn_storage_select_ok(peer, (int)sel->ut_x, (int)sel->ut_z, sel->ftr_base, &why);
         } else {
-            have_sel = sel->valid && sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) &&
+            have_sel = idx < PLAYER_NUM && sel->valid && sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) && /* never a guest (above) */
                        (int)sel->house == pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID) &&
                        pcnetgame_dresser_cell_ftr((int)sel->house, sel->floor, sel->layer, sel->ut_x, sel->ut_z) == sel->ftr_base;
         }
@@ -22977,8 +22992,8 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
         }
     }
     if (have_sel ? pc_dresser_store_peek(&s_dresser, key, &dt, &res)
-                 : (pcnetgame_dresser_peek_owner(pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID), &dt, &res) ||
-                    pcnetgame_dresser_peek_town(&dt, &res))) {
+                 : ((idx < PLAYER_NUM && pcnetgame_dresser_peek_owner(pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID), &dt, &res)) ||
+                    pcnetgame_dresser_peek_town(&dt, &res))) { /* C3b: a guest has no house: the town prefix only */
         /* journalled in the sidecar (a retry across a host restart, or after the in-memory ring evicted it): answered, never executed again. Without a current
          * selection (a retry right after a host restart) every dresser of the requester's house is searched. */
         if (res.outcome == PC_DRESSER_OUT_APPLIED) {
@@ -23073,8 +23088,8 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
     if (op != (int)PC_NETGAME_DRESSER_OP_MOVE) {
         post_conds = mPr_SET_ITEM_COND(post_conds, t->slot, mPr_ITEM_COND_NORMAL);
     }
-    dt.pre_pocket_dig = pcnetgame_dresser_pocket_dig(t->pre_pockets, t->pre_conds, t->pre_wallet);
-    dt.post_pocket_dig = pcnetgame_dresser_pocket_dig(post, post_conds, t->pre_wallet);
+    dt.pre_pocket_dig = pcnetgame_dresser_pocket_dig_k(idx, key, t->pre_pockets, t->pre_conds, t->pre_wallet); /* C3b: salted by identity when outdoor */
+    dt.post_pocket_dig = pcnetgame_dresser_pocket_dig_k(idx, key, post, post_conds, t->pre_wallet);
 
     /* WRITE-AHEAD: pool + persisted journal first, durable, then the pocket mirror */
     cur = pc_dresser_store_find(&s_dresser, key);
@@ -23561,8 +23576,8 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
         return; /* feature off: behave exactly like an old host */
     }
     idx = pcnetgame_rec_gate(peer, 0, 0);
-    if (idx < 0 || idx >= PLAYER_NUM) {
-        return;
+    if (idx < 0 || (idx >= PLAYER_NUM && q->floor != (uint8_t)PC_NETGAME_DRESSER_PROBE && q->floor != (uint8_t)PC_DRESSER_OUTDOOR_FLOOR)) {
+        return; /* C3b: a guest may probe and select OUTDOOR storage only (it has no house) */
     }
     sel = &s_dresser_sel[peer];
     if (q->floor == (uint8_t)PC_NETGAME_DRESSER_PROBE) {
@@ -23571,6 +23586,14 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
             return;
         }
         s_dresser_query_ms[peer] = now | 1u;
+        if (idx >= PLAYER_NUM) {
+            /* C3b: a GUEST's probe is answered when the host offers OUTDOOR storage (the client needs the answer before it may select); no house: no migration,
+             * no house info */
+            if (pcnetgame_ofurn_c3_flags() != 0u) {
+                pcnetgame_dresser_send_state(peer, NULL);
+            }
+            return;
+        }
         pcnetgame_dresser_migrate_resident(idx, pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID)); /* v1 -> v2, once, when the house is known */
         pcnetgame_dresser_send_state(peer, NULL);
         pcnetgame_dresser_send_info(peer, pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID));
@@ -50885,12 +50908,13 @@ static int pcnetgame_ofurn_storage_select_ok(PCNetPeerId peer, int ut_x, int ut_
     const PCNetGameHostPeerState* st;
     int k, xs[PC_OFURN_FP_MAX_CELLS], zs[PC_OFURN_FP_MAX_CELLS], nc, i, near = 0, pux, puz;
     float px = 0.0f, py = 0.0f, pz = 0.0f;
+    int16_t face = 0;
     if (!pcnetgame_ofurn_storage_on() || !pcnetgame_ofurn_host_ready()) {
         *why = "outdoor storage is off on this host";
         return 0;
     }
-    if (!pcnetgame_ofurn_peer_is_resident(peer)) {
-        *why = "only residents can use storage outside";
+    if (peer < 0 || peer >= pcnetgame_peer_span() || s_host_peer_link[peer] != PC_NETGAME_LINK_READY || !s_host_peer[peer].bound_valid) {
+        *why = "the requester has no bound identity"; /* C3b: residents AND guests open outdoor storage (shared town store); moving / picking up stays residents' */
         return 0;
     }
     k = pc_ofurn_find(&s_ofh, ut_x, ut_z);
@@ -50913,6 +50937,13 @@ static int pcnetgame_ofurn_storage_select_ok(PCNetPeerId peer, int ut_x, int ut_
     }
     if (!near) {
         *why = "the requester is not next to the piece";
+        return 0;
+    }
+    /* C3b: only from the FRONT (the indoor open needs contact_direction FRONT): the requester's tile in the front row of the piece's rotation (up to 2 tiles out: the
+     * position lag) and its facing within 67.5 degrees of the piece (the client asks only when standing in the row facing it exactly) */
+    if (!pc_ofurn_fp_in_front((int)s_ofh.m[k].shape, (int)s_ofh.m[k].rot, (int)s_ofh.m[k].ut_x, (int)s_ofh.m[k].ut_z, pux, puz, 2) ||
+        (pc_remote_player_get_last_facing_angle((PCNetPlayerId)peer, &face) && !pc_ofurn_faces_piece((int)s_ofh.m[k].rot, (int)face, 0x3000))) {
+        *why = "the requester is not in front of the piece (behind / beside it, or not facing it)";
         return 0;
     }
     pcnetgame_ofurn_storage_reattach(&s_ofh.m[k]); /* a piece whose storage was orphaned (e.g. a crash between the two sidecar saves of a move) gets it back */
@@ -52030,8 +52061,9 @@ int pc_net_game_ofurn_storage_open_ok(const char** why) {
         return 0;
     }
     if (!pc_net_game_dresser_available()) {
-        /* the host answers the dresser probe for RESIDENTS only: a guest's probe stays unanswered */
-        *why = pcnetgame_client_is_guest_player() ? "Only residents can use storage outside" : "Try again in a moment";
+        /* C3b: a host of this build answers a guest's dresser probe when it offers outdoor storage; an older C3 host answers residents only (the probe stays
+         * unanswered: s_dresser_probe_gave_up) */
+        *why = (pcnetgame_client_is_guest_player() && s_dresser_probe_gave_up) ? "Only residents can use storage outside" : "Try again in a moment";
         return 0;
     }
     return 1;
@@ -52077,7 +52109,11 @@ static void pcnetgame_ofurn_test_hook(void) {
         return;
     }
     t0 = now;
-    if (strcmp(e, "storage") == 0) {
+    if (strcmp(e, "storage") == 0 || strcmp(e, "storage_guest") == 0) {
+        /* C3b: every run first taps from BEHIND the piece (must not open: the front rule), then from the front. storage_guest = a GUEST client: it opens on the A
+         * press (no grab), PUTs / TAKEs like a resident, and skips the push, the place and (refused locally for a guest) relies on B being refused. The guest's pocket
+         * item comes from AC_TEST_MUSEUM_POCKETS (uploaded before the first step). */
+        const int guest_run = e[7] == '_';
         /* C3 TEST-ONLY: AC_TEST_OFURN=storage (CLIENT): the REAL open path of a placed storage piece (the A TAP through the wait-state seam + the outdoor storage screen),
          * a PUT through the screen's own call (pc_dresser_ui_put), the screen closed with a scripted B (the dresser pad seam), a MOVE (push north, the grab driver's
          * call), the re-open at the new origin (the contents followed), a B pickup while it holds the item (refused 62), the item taken out, the B pickup again
@@ -52101,21 +52137,51 @@ static void pcnetgame_ofurn_test_hook(void) {
                     best = k;
                 }
             }
-            if (best < 0 || !mFI_UtNum2CenterWpos(&c, vt->m[best].ut_x, vt->m[best].ut_z + 1) || !s_ofcl.have_c2) {
+            if (best < 0 || !mFI_UtNum2CenterWpos(&c, vt->m[best].ut_x, vt->m[best].ut_z - 1) || !s_ofcl.have_c2 || !pcnetgame_museum_pockets_test_hook()) {
                 return;
             }
             sux = vt->m[best].ut_x;
             suz = vt->m[best].ut_z;
             pl->actor_class.world.position.x = c.x;
             pl->actor_class.world.position.z = c.z;
-            pl->actor_class.shape_info.rotation.y = (s16)0x8000;
-            printf("[NET][OFURN][TEST-ONLY] storage: the placed storage piece at (%d,%d): the local player put on (%d,%d) facing it; outdoor storage offered by the host: %d "
-                   "(NOT active in normal play)\n", sux, suz, sux, suz + 1, (s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) != 0u);
-            st = 1;
+            pl->actor_class.shape_info.rotation.y = 0;
+            printf("[NET][OFURN][TEST-ONLY] storage%s: the placed storage piece at (%d,%d) rot %u: the local player put BEHIND it on (%d,%d) facing it; outdoor storage "
+                   "offered by the host: %d (NOT active in normal play)\n", guest_run ? " (guest)" : "", sux, suz, (unsigned)vt->m[best].rot, sux, suz - 1,
+                   (s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) != 0u);
+            st = 30;
             return;
         }
-        pl->actor_class.shape_info.rotation.y = (s16)0x8000; /* TEST-ONLY: face the piece like a player would */
+        pl->actor_class.shape_info.rotation.y = (st == 30 || st == 31) ? (s16)0 : (s16)0x8000; /* TEST-ONLY: face the piece like a player would (from behind: south) */
+        if (guest_run && (st == 5 || st == 6)) {
+            st = 7; /* a guest cannot push */
+        }
+        if (guest_run && st == 19) {
+            printf("[NET][OFURN][TEST-ONLY] storage (guest): done (a guest does not place)\n");
+            st = 99;
+            return;
+        }
         switch (st) {
+            case 30: /* C3b: the A TAP from BEHIND the piece: nothing may open (a resident: a short grab; a guest: the notice) */
+                (void)pc_ofurn_test_grab_input("tap", 0);
+                printf("[NET][OFURN][TEST-ONLY] storage: BACK A tap -> %d\n", pc_ofurn_front_press(gamePT, 1, 0));
+                st = 31;
+                return;
+            case 31: {
+                xyz_t c;
+                printf("[NET][OFURN][TEST-ONLY] storage: BACK tap result: the screen is %s\n", pc_dresser_ui_active() ? "OPEN (front rule violated)" : "closed (front rule)");
+                if (pc_dresser_ui_active()) {
+                    st = 99;
+                    return;
+                }
+                if (mFI_UtNum2CenterWpos(&c, sux, suz + 1)) {
+                    pl->actor_class.world.position.x = c.x;
+                    pl->actor_class.world.position.z = c.z;
+                }
+                pl->actor_class.shape_info.rotation.y = (s16)0x8000;
+                printf("[NET][OFURN][TEST-ONLY] storage: the local player put in FRONT of the piece on (%d,%d) facing it\n", sux, suz + 1);
+                st = 1;
+                return;
+            }
             case 1: case 7: case 13: /* the A TAP (grab, release after 80 ms) */
                 (void)pc_ofurn_test_grab_input("tap", 0);
                 printf("[NET][OFURN][TEST-ONLY] storage: A tap -> %d\n", pc_ofurn_front_press(gamePT, 1, 0));

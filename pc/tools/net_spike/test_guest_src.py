@@ -168,7 +168,7 @@ def main():
               "pcnetgame_pdata_host_tick", "pcnetgame_pdc_own_slot",
               # TEST-ONLY host hook (AC_TEST_MUSEUM_BITS; HEAD already had it, unpinned): slot >= PLAYER_NUM is refused before the subscript
               "pcnetgame_museum_bits_test_hook",
-              # dresser storage (kind 18, master sprint 2; at HEAD, never listed -- reviewed now): the host handlers range-check the bound slot first (query: idx < 0 || idx >= PLAYER_NUM; txn: idx < 0, and idx >= PLAYER_NUM = the guest refusal before the subscript),
+              # dresser storage (kind 18, master sprint 2; at HEAD, never listed -- reviewed now): the host handlers range-check the bound slot first (query: idx < 0, a guest only for the probe / an OUTDOOR floor, its probe returns before the subscript; txn: idx < 0, and idx >= PLAYER_NUM without an outdoor selection = the guest refusal before the subscript, the house branch / owner peek guarded `idx < PLAYER_NUM`: C3b),
               # the migration refuses idx / h outside [0, PLAYER_NUM) before reading the resident PersonalID
               "pcnetgame_dresser_migrate_resident", "pcnetgame_handle_host_dresser_query", "pcnetgame_handle_host_dresser_txn",
               # dedicated operator list (op / deop selector resolver; host console only): loop bounded by PLAYER_NUM, never reachable with a guest slot
