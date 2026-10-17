@@ -27,6 +27,7 @@
 #include "pc_relaunch.h" /* M-C: pc_relaunch_forward_capture() */
 #include "pc_session.h" /* M2: characters / town memberships: --character, --characters, --character-import-profile */
 #include "pc_log.h"
+#include "pc_version.h" /* the startup version line */
 #include "pc_rng_domains_selftest.h"
 #include "m_kankyo.h"
 
@@ -2685,6 +2686,12 @@ int main(int argc, char* argv[]) {
         setvbuf(stdout, NULL, _IONBF, 0);
         setvbuf(stderr, NULL, _IONBF, 0);
         pc_dedicated_note_stdout_console(); /* the game's own stdout / stderr stay on the console (--verbose / -debug* / PC_LOG / profiling) */
+    }
+    /* The version (pc_version.h), once at startup, every role: through PC_LOG when GENERAL is on (log file / console), else the plain stdout line. */
+    if (g_pc_log_mask & PCL_GENERAL) {
+        PC_LOG(PCL_GENERAL, "Animal Crossing PC Multiplayer v%s\n", PC_VERSION_STRING);
+    } else {
+        printf("[GENERAL] Animal Crossing PC Multiplayer v%s\n", PC_VERSION_STRING);
     }
     if (g_pc_dedicated) {
         pc_dedicated_startup(g_pc_net_port); /* "[DEDICATED] ..." startup line + the stdin command reader (only enqueues; drained on the main thread) */

@@ -11,6 +11,8 @@
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure / reopening notice */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: the refusal notice of Place / Rotate / Pick up / leaf drop */
 #include "pc_sell_ui.h" /* Nook bulk sell basket: the refusal notice of the basket screen */
+#include "pc_version.h" /* the title screen's version corner (pc_version_corner_draw) */
+#include "pc_dedicated.h" /* g_pc_dedicated */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -322,6 +324,39 @@ static void pc_net_ping_draw(struct game_s* game) {
     mFont_SetMatrix(game->graph, mFont_MODE_FONT);
     pc_menu_draw_left(game, line, SCREEN_WIDTH_F - (f32)pc_text_width(line) * 0.75f - 8.0f, 4.0f, last_ok ? 200 : 170, last_ok ? 255 : 170, last_ok ? 200 : 170, 230, 0.75f);
     mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+}
+
+/* The game version in the bottom-right corner of the title screen (pc_version.h; called by ac_animal_logo.c's title menu draw, inside its font phase, and
+ * nowhere else: never in game). Small, translucent white over a dark 1.5-pixel outline so it reads on any title background. Placed against the RIGHT EDGE
+ * OF THE WINDOW: on a window wider than 4:3 the aspect-corrected font space shows x < 0 / x > 320 (as pc_chat_ui.c's chat_visible_x; the text is not inside
+ * PC_NOOP_WIDESCREEN_STRETCH tags. g_pc_widescreen_stretch is NOT read here: it is emu64's render-time state of the previous display list, not a setting);
+ * the margin and the outline are given in WINDOW pixels (converted with the window height: 240 font rows = g_pc_window_h).
+ * overlay_open: the Play Online / Options overlay is up; its hint line (y 218, centered) can reach the corner of a 4:3 window, so then the text is only
+ * drawn when the window is wide enough for the corner to lie outside 0..320. */
+void pc_version_corner_draw(struct game_s* game, int overlay_open) {
+    static const char text[] = "v" PC_VERSION_STRING;
+    const f32 scale = 0.6f;
+    f32 right = SCREEN_WIDTH_F, px = 1.0f, w, x, y, o;
+    if (g_pc_dedicated || game == NULL || game->graph == NULL) return;
+    if (g_pc_window_w > 0 && g_pc_window_h > 0) {
+        const f32 win = (f32)g_pc_window_w / (f32)g_pc_window_h;
+        const f32 gc = 4.0f / 3.0f;
+        px = SCREEN_HEIGHT_F / (f32)g_pc_window_h; /* one window pixel in font units */
+        if (win > gc + 0.01f) {
+            right = 160.0f + 160.0f * win / gc;
+        }
+    }
+    w = (f32)pc_text_width(text) * scale;
+    if (overlay_open && right - w - 8.0f * px < SCREEN_WIDTH_F) return;
+    x = right - w - 8.0f * px;
+    y = SCREEN_HEIGHT_F - (f32)mFont_TEX_CHAR_HEIGHT_F32 * scale - 6.0f * px;
+    o = 1.5f * px;
+    if (o < 0.25f) o = 0.25f;
+    pc_text_draw(game, text, x - o, y, 0, 0, 0, 150, scale);
+    pc_text_draw(game, text, x + o, y, 0, 0, 0, 150, scale);
+    pc_text_draw(game, text, x, y - o, 0, 0, 0, 150, scale);
+    pc_text_draw(game, text, x, y + o, 0, 0, 0, 150, scale);
+    pc_text_draw(game, text, x, y, 255, 255, 255, 200, scale);
 }
 
 void pc_net_notice_draw(struct game_s* game) {

@@ -2,6 +2,7 @@
  * See pc_dedicated.h for the overview. Nothing in here runs unless g_pc_dedicated == 1 (the callers check it; most functions also check it). */
 #include "pc_platform.h"
 #include "pc_dedicated.h"
+#include "pc_version.h" /* the version in the startup line and in `status` */
 #include "pc_day_roll.h" /* day rollover: the `day` console command */
 #include "pc_residence.h" /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES */
 #include "pc_host_observer.h"
@@ -857,7 +858,7 @@ void pc_dedicated_startup(uint16_t port) {
         return;
     }
     s_port = port;
-    pc_dedicated_say("dedicated server starting: role=host port=%u observer=on (--host-observer init reused) console=on", (unsigned)port);
+    pc_dedicated_say("dedicated server starting: role=host port=%u observer=on (--host-observer init reused) console=on version=%s", (unsigned)port, PC_VERSION_STRING);
     PC_LOG(PCL_GENERAL, "dedicated mode: port=%u observer=on console=on\n", (unsigned)port);
     s_stdin_started = pc_ded_start_stdin_thread();
 #ifdef _WIN32
@@ -1162,6 +1163,7 @@ static void pc_ded_cmd_status(void) {
     }
     pc_ded_printf("[DEDICATED] status\n");
     pc_ded_printf("  dedicated: yes\n");
+    pc_ded_printf("  version: %s\n", PC_VERSION_STRING); /* pc_version.h */
     pc_ded_printf("  server: %s (%s), town dir %s\n", pc_server_id(), pc_server_dir(), pc_server_town_dir());
     pc_ded_printf("  observer: active=%s ready=%s\n", pc_host_observer_active() ? "yes" : "no", pc_host_observer_ready() ? "yes" : "no");
     pc_ded_printf("  network: role=%s listening_port=%u\n", pc_ded_role_name(), (unsigned)s_port);

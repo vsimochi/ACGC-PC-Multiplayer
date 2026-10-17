@@ -26,6 +26,7 @@
 #include "pc_settings_menu.h"
 #include "pc_play_online_menu.h"
 #include "pc_menu_util.h"
+#include "pc_pause_menu.h" /* pc_version_corner_draw: the version in the title screen's bottom-right corner */
 #include "main.h"
 #include <stdio.h>
 #include <string.h>
@@ -981,6 +982,9 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
       actor->pc_options_open = 0;
     }
   }
+
+  /* The game version (pc_version.h) in the bottom-right corner: the title screen / main menu only (pc_pause_menu.c). */
+  pc_version_corner_draw(game, actor->pc_options_open || pc_play_online_menu_active());
 }
 #endif
 

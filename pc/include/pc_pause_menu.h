@@ -30,6 +30,10 @@ void pc_pause_menu_draw(struct game_s* game);
  * path and call site as the pause overlay. No-op while the pause overlay is up or when the notice is hidden. */
 void pc_net_notice_draw(struct game_s* game);
 
+/* "v" PC_VERSION_STRING (pc_version.h) in the bottom-right corner of the window. ONLY the title screen calls it (ac_animal_logo.c, inside its font phase);
+ * overlay_open = the Play Online / Options overlay is up (skipped where its hint line could reach the corner). No-op for --dedicated. */
+void pc_version_corner_draw(struct game_s* game, int overlay_open);
+
 #ifdef __cplusplus
 }
 #endif
