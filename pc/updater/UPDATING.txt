@@ -1,5 +1,5 @@
 Animal Crossing Multiplayer - how updating works (user guide)
-Full guide: docs\updater.md (first-install bundle) or https://github.com/vsimochi/ACGC-PC-Multiplayer/blob/v0.2.1/docs/updater.md
+Full guide: docs\updater.md (first-install bundle) or https://github.com/vsimochi/ACGC-PC-Multiplayer/blob/v0.3.0/docs/updater.md
 
 START THE GAME WITH ACLauncher.exe (not AnimalCrossing.exe). It checks GitHub for the latest stable release, then starts the game.
 - No newer version: the game starts.
