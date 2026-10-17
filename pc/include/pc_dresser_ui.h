@@ -22,6 +22,12 @@ enum { PC_DRESSER_UI_SLOT_NONE = 0, PC_DRESSER_UI_SLOT_VANILLA = 1, PC_DRESSER_U
 void pc_dresser_ui_begin(const unsigned short vanilla[PC_DRESSER_UI_VANILLA]); /* enter dresser mode (page 1) with a copy of the vanilla keep slots */
 void pc_dresser_ui_end(void);
 int  pc_dresser_ui_active(void);
+/* Nook bulk sell basket (pc_sell_ui.h): the SAME screen in BASKET mode. pc_dresser_ui_active() is 1 as well (window, cells, icons, hand, tags, the scripted test
+ * pad all stay the dresser screen's); the grid is 5 x 3 (one cell per pocket), cells show the staged pockets, take / put STAGE locally (pc_sell_ui_take / _put:
+ * nothing is sent, nothing changes in the pockets), staged pockets are hidden in the pocket grid, there is no Grab. begin_basket() leaves any dresser state;
+ * pc_dresser_ui_begin() / _end() leave basket mode. */
+void pc_dresser_ui_begin_basket(void);
+int  pc_dresser_ui_basket(void);
 void pc_dresser_ui_set_vanilla(const unsigned short vanilla[PC_DRESSER_UI_VANILLA]);
 /* The kind of grid slot `col` (0..26, row-major 9 x 3) and its index (6r): every cell is host slot `col` (EXTRA); the vanilla keep slots have no cell. */
 int  pc_dresser_ui_slot(int col, int* index);

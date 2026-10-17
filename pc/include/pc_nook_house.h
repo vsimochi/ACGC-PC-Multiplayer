@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 52
+#define PC_NOOK_MSG_COUNT 53
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -68,7 +68,9 @@ enum {
     PC_NOOK_MSG_EVC_FAILED,       /* any other refusal / a lost link (nothing is claimed as charged) */
     PC_NOOK_MSG_EVC_OLDHOST,      /* a client of a host without the claim (0.2.x): refused locally, nothing sent */
     PC_NOOK_MSG_EVC_WISP_DONE,    /* the Wisp: somebody already returned the spirits (CLAIMED 51 for op 5) */
-    PC_NOOK_MSG_EVC_NO_SPIRITS    /* the Wisp: NO_SPIRITS 54 */
+    PC_NOOK_MSG_EVC_NO_SPIRITS,   /* the Wisp: NO_SPIRITS 54 */
+    /* Nook bulk sell basket (pc_sell_ui.h; appended: every earlier id keeps its value): */
+    PC_NOOK_MSG_SELL_BASKET       /* the quote of a closed basket: "That's N items ... X Bells for the lot" Yes./No. (read by aNSC_buy_check like the vanilla offer) */
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */
@@ -151,6 +153,8 @@ int pc_nook_sel_build(int id, unsigned char* dst16);
  * confirm: the house the player chose (0..3) or -1 = any. */
 void pc_nook_house_set_pick(const int* houses, int n);
 void pc_nook_house_set_confirm(int house_or_auto);
+/* Nook bulk sell basket: the count and the (advisory) total of PC_NOOK_MSG_SELL_BASKET (set by the actor right before it selects the message). */
+void pc_nook_house_set_sell(int count, unsigned total);
 /* The dynamic values of the Work Mode rows (set by the actor before it selects PC_NOOK_MSG_WORK_*): the job view and the villager name bytes. */
 void pc_nook_house_set_work_view(const PCWorkView* v, const unsigned char* villager_name8);
 /* The choices of the job row (PC_NOOK_WACT_*), shared by the message builder and the actor so both agree on what choice k means; returns the count (2..3). */

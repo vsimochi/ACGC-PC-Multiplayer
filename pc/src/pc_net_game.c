@@ -249,6 +249,8 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "m_police_box.h"   /* World Ecology: snowmen -- mPB_keep_item(), mirroring m_police_box.c:76-94's
                             * own ITEM1/FTR-only lost-and-found classification for a displaced tile item */
 #include "m_kabu_manager.h" /* Town services milestone 2 (shop): Kabu_get_price() -- the sale value of a turnip bundle (SHOP_SELL) */
+#include "pc_sell_logic.h"  /* Nook bulk sell basket: THE shared "what Nook buys" predicate + sale value (SHOP_SELL validation == the basket screen) */
+#include "pc_sell_ui.h"     /* Nook bulk sell basket: pc_sell_ui_test_tick() (TEST-ONLY real-game basket test driver) */
 #include "ac_shop_design.h" /* Town services milestone 2 (shop): aSD_PC_SyncDisplayWithStock() -- redraw the shop floor from the stock */
 
 #include <stdarg.h>
@@ -21575,30 +21577,27 @@ static int pcnetgame_shop_pay(uint16_t* pockets, uint32_t* conds, uint32_t* wall
 }
 
 /* The sale value of ONE pocket item (vanilla aNSC_buy_check_init: turnips Kabu_get_price() * bundle size, spoiled turnips 0, everything else
- * price / SELL_BUY_RATIO; 0 = worthless, accepted for free). Returns 0 and sets *why for an item Nook never buys. */
+ * price / SELL_BUY_RATIO; 0 = worthless, accepted for free). Returns 0 and sets *why for an item Nook never buys.
+ * Nook bulk sell basket: the refusal is THE shared predicate pc_sell_refusal() (pc_sell_logic.c) that the basket screen of every client / the listen host uses too:
+ * the vanilla sell filter (mSM_check_item_for_sell: NORMAL condition, no money bag / exercise card / knife and fork / Wisp spirit), a quest item, a turnip bundle
+ * on Sunday, stationery (network rule), an unknown id. The value is pc_sell_unit_value() with the HOST's prices. */
+_Static_assert(PC_SELL_RATIO == PC_NETGAME_SHOP_SELL_RATIO && PC_SELL_COND_NORMAL == mPr_ITEM_COND_NORMAL && PC_SELL_COND_PRESENT == mPr_ITEM_COND_PRESENT &&
+                   PC_SELL_COND_QUEST == mPr_ITEM_COND_QUEST && PC_SELL_BASKET_CELLS == mPr_POCKETS_SLOT_COUNT,
+               "pc_sell_logic.h constants drifted from the game's");
 static int pcnetgame_shop_sell_unit(uint16_t item, uint8_t cond, uint32_t* unit, const char** why) {
-    static const uint32_t kabu_sum[4] = { 10u, 50u, 100u, 0u };
+    const int ref = pc_sell_refusal((unsigned)item, (int)cond, Common_Get(time).rtc_time.weekday == lbRTC_SUNDAY);
     *unit = 0;
-    if (cond == (uint8_t)mPr_ITEM_COND_QUEST) {
-        *why = "a quest item is never bought";
+    if (ref != PC_SELL_OK) {
+        *why = ref == PC_SELL_REF_QUEST ? "a quest item is never bought"
+             : ref == PC_SELL_REF_PAPER ? "stationery stacks are not sold through the network seam (deferred)"
+             : ref == PC_SELL_REF_TURNIP_SUNDAY ? "Nook does not buy turnips on Sunday"
+             : ref == PC_SELL_REF_PRESENT ? "a wrapped present is never bought (vanilla sell filter)"
+             : ref == PC_SELL_REF_MONEY ? "a money bag is never bought (vanilla sell filter)"
+             : ref == PC_SELL_REF_SPECIAL ? "an exercise card / the knife and fork / a Wisp spirit is never bought (vanilla sell filter)"
+                                          : "not a sellable pocket item";
         return 0;
     }
-    if (ITEM_IS_PAPER((mActor_name_t)item)) {
-        *why = "stationery stacks are not sold through the network seam (deferred)";
-        return 0;
-    }
-    if (ITEM_NAME_GET_TYPE((mActor_name_t)item) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT((mActor_name_t)item) == ITEM1_CAT_KABU) {
-        if (item == (uint16_t)ITM_KABU_SPOILED) {
-            return 1; /* 0 bells: Nook takes it off the player's hands */
-        }
-        if (Common_Get(time).rtc_time.weekday == lbRTC_SUNDAY) {
-            *why = "Nook does not buy turnips on Sunday";
-            return 0;
-        }
-        *unit = (uint32_t)Kabu_get_price() * kabu_sum[(uint16_t)(item - (uint16_t)ITM_KABU_START) & 3u];
-        return 1;
-    }
-    *unit = mSP_ItemNo2ItemPrice((mActor_name_t)item) / PC_NETGAME_SHOP_SELL_RATIO;
+    *unit = (uint32_t)pc_sell_unit_value((unsigned)item, (unsigned)mSP_ItemNo2ItemPrice((mActor_name_t)item), (unsigned)Kabu_get_price()); /* spoiled turnips: 0 bells, taken off the hands */
     return 1;
 }
 
@@ -39889,6 +39888,7 @@ void pc_net_game_poll(void) {
     pcnetgame_mbox_client_tick(); /* mail milestone 2: stashed MAILBOX_LETTERs, and the shadow revert */
     pcnetgame_run_ts_test_hook();
     pcnetgame_run_shop_test_hook(); /* shop milestone: --shop-test-buy / --shop-test-sell (client role, default OFF) */
+    pc_sell_ui_test_tick(); /* Nook bulk sell basket: AC_TEST_SELL_BASKET (TEST-ONLY real-game basket test, client role, default OFF; pc_sell_ui.c) */
     pcnetgame_run_house_buy_test_hook(); /* guest-first town: --house-buy-test H|auto (client role, default OFF) */
     pcnetgame_run_nook_test_hook(); /* guest Nook dialogue (M4): --nook-test SPEC (client role, default OFF) */
 #ifdef PC_NET_TEST_HOOKS

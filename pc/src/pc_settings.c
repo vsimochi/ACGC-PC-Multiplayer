@@ -40,6 +40,7 @@ PCSettings g_pc_settings = {
     .npc_fallback = 1,
     .npc_relay = 1,
     .chat = 1,
+    .bulk_sell = 1,
 };
 
 int g_pc_max_guests_override = 0;
@@ -236,6 +237,8 @@ static void apply_setting(const char* key, const char* value) {
         else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.personal_sync = 0;
     } else if (strcmp(key, "menu_world_live") == 0) {
         if (val == 0 || val == 1) g_pc_settings.menu_world_live = val;
+    } else if (strcmp(key, "bulk_sell") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.bulk_sell = val;
     } else if (strcmp(key, "outdoor_furniture_place") == 0) {
         if (val == 0 || val == 1) g_pc_settings.ofurn_place = val;
     } else if (strcmp(key, "outdoor_furniture_leaf_drop") == 0) {
@@ -371,6 +374,9 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Host and client: 1 (default) = in a multiplayer session the world keeps running behind the inventory, the other menus and the Esc menu; 0 = the menu freezes the world like single player\n");
     fprintf(f, "menu_world_live = %d\n", g_pc_settings.menu_world_live);
+    fprintf(f, "\n");
+    fprintf(f, "# Host and client: 1 (default) = in a multiplayer session Nook's \"I want to sell\" opens the sell basket (put several mixed items in, Nook quotes the count and the total); 0 = the vanilla picker\n");
+    fprintf(f, "bulk_sell = %d\n", g_pc_settings.bulk_sell);
     fprintf(f, "\n");
     fprintf(f, "# Host only: outdoor furniture (C1): Place (residents: the real model, rotated, solid) on/off, the vanilla leaf Drop of furniture on/off, and the technical SAFETY ceilings (not a gameplay limit)\n");
     fprintf(f, "outdoor_furniture_place = %d\n", g_pc_settings.ofurn_place);

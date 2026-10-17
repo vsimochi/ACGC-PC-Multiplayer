@@ -162,7 +162,7 @@ ck("S8 the client apply checks the post-image (legal, wallet only down) and appl
 # ---- M: the refusal rows ----
 rows = ("EVC_SOLD", "EVC_CLAIMED", "EVC_FUNDS", "EVC_FAILED", "EVC_OLDHOST", "EVC_WISP_DONE", "EVC_NO_SPIRITS")
 ck("M1 seven appended refusal rows (PC_NOOK_MSG_COUNT 52), each built in pc_nook_house.c (the charset selftest covers them)",
-   "#define PC_NOOK_MSG_COUNT 52" in nkh and all("PC_NOOK_MSG_%s" % r in nkh and "case PC_NOOK_MSG_%s:" % r in nk for r in rows))
+   "#define PC_NOOK_MSG_COUNT 53" in nkh and all("PC_NOOK_MSG_%s" % r in nkh and "case PC_NOOK_MSG_%s:" % r in nk for r in rows))
 
 print("-" * 60)
 n = sum(1 for _d, ok in results if ok)

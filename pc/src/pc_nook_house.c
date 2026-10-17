@@ -10,6 +10,7 @@
 #include "m_msg_data.h"
 #include "m_name_table.h" /* ITM_FOOD_*: the Work Mode objective names */
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure length / minutes left in Nook's rows and the door row */
+#include "pc_sell_logic.h"   /* Nook bulk sell basket: pc_sell_format_bells (the quote row) */
 
 /* control code bytes (tools/msg_tool.py COMMANDS / CONT_SIZES; include/m_font.h mFont_CONT_CODE_*) */
 #define NK_CC 0x7F
@@ -108,6 +109,26 @@ static void nk_choice(NkBuf* b, const int* ids, int n) {
     nk_byte(b, 0);
     nk_byte(b, 1);
     nk_code(b, NK_CONTINUE);
+}
+
+/* Nook bulk sell basket: the vanilla-shaped choice tail WITHOUT the "choice made" demo order (aNSC_buy_check reads the choice itself, like the vanilla sell offer;
+ * the order value 9 is what aNSC_buy_after_service waits for after a sale, so the quote must not set it) */
+static void nk_choice_plain(NkBuf* b, const int* ids, int n) {
+    nk_code(b, n == 2 ? NK_SEL2 : n == 3 ? NK_SEL3 : n == 4 ? NK_SEL4 : n == 5 ? NK_SEL5 : NK_SEL6);
+    nk_ids(b, ids, n);
+    nk_code(b, NK_SELNOB);
+    nk_code(b, NK_BTN);
+    nk_code(b, NK_OPENCHOICE);
+    nk_code(b, NK_FORCENEXT);
+    nk_code(b, NK_CONTINUE);
+}
+
+static int s_sell_count = 0;
+static unsigned s_sell_total = 0;
+
+void pc_nook_house_set_sell(int count, unsigned total) {
+    s_sell_count = count;
+    s_sell_total = total;
 }
 
 static void nk_price(char* out, size_t cap) {
@@ -908,6 +929,28 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\nof my spirits after all.\nPlease keep looking!");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_SELL_BASKET: { /* Nook bulk sell basket: the quote of the closed basket (count + total), Yes. = sell everything, No. = back to "anything else?" */
+            char bells[24];
+            nk_text(&b, "Let me see here...");
+            nk_pause(&b, 6);
+            snprintf(tmp, sizeof(tmp), "\nThat's %d item%s in all.", s_sell_count, s_sell_count == 1 ? "" : "s");
+            nk_text(&b, tmp);
+            nk_page(&b);
+            if (s_sell_total == 0u) {
+                nk_text(&b, "I can't pay anything for");
+                nk_pause(&b, 6);
+                nk_text(&b, s_sell_count == 1 ? "\nthat, but I'll take it\noff your hands. All right?" : "\nthese, but I'll take them\noff your hands. All right?");
+            } else {
+                nk_text(&b, "I'll give you");
+                nk_pause(&b, 6);
+                snprintf(tmp, sizeof(tmp), "\n%s Bells for\n%s. Deal?", pc_sell_format_bells(bells, sizeof(bells), s_sell_total), s_sell_count == 1 ? "it" : "the lot");
+                nk_text(&b, tmp);
+            }
+            ids[0] = NK_SEL_YES;
+            ids[1] = NK_SEL_NO;
+            nk_choice_plain(&b, ids, 2);
+            break;
+        }
         case PC_NOOK_MSG_RESTOCK_DOOR:
             nk_text(&b, "Sorry, sorry!");
             nk_pause(&b, 8);
@@ -1102,6 +1145,30 @@ int pc_nook_house_selftest(void) {
     int which, i, bad = 0, h4[PC_RESIDENCE_HOUSES] = { 0, 1, 2, 3 };
     pc_nook_house_set_pick(h4, PC_RESIDENCE_HOUSES);
     pc_nook_house_set_confirm(2);
+    {   /* Nook bulk sell basket: the quote in its three shapes (one item, a free lot, the largest plausible total) stays in the charset and builds */
+        static const int sc[3] = { 1, 4, 15 };
+        static const unsigned st[3] = { 250u, 0u, 990005u };
+        int k;
+        for (k = 0; k < 3; k++) {
+            int n, j;
+            pc_nook_house_set_sell(sc[k], st[k]);
+            n = pc_nook_msg_build(MSG_MAX + PC_NOOK_MSG_SELL_BASKET, buf, sizeof(buf));
+            if (n < 2 || buf[n - 2] != NK_CC || buf[n - 1] != NK_CONTINUE) {
+                printf("[NOOK] selftest: sell basket quote %d did not build\n", k);
+                bad++;
+            }
+            for (j = 0; j < n; j++) {
+                if (buf[j] == NK_CC) {
+                    const int code = buf[j + 1];
+                    j += (code == NK_PAUSE) ? 2 : (code == NK_SEL2) ? 5 : 1;
+                } else if (!nk_char_ok(buf[j]) && buf[j] != NK_NEWLINE) {
+                    printf("[NOOK] selftest: sell basket quote %d byte %d = 0x%02X is outside the charset\n", k, j, buf[j]);
+                    bad++;
+                }
+            }
+        }
+        pc_nook_house_set_sell(3, 1200u);
+    }
     {
         PCWorkView v;
         unsigned char nm[8] = {'B', 'o', 'b', ' ', ' ', ' ', ' ', ' '};

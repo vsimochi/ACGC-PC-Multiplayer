@@ -35,7 +35,7 @@ def main():
     ck("L9 chain is a no-op unless the flag is set, and consumes it (exactly once)", chain.strip().startswith("if (aNSC_pc_map_just_granted) {") and "aNSC_pc_map_just_granted = 0;" in chain)
     # the map line itself adds no generated row; the count grew to 35 later for dresser storage (PC_NOOK_MSG_DRESSER_REFUSED), not for the map line
     ck("L10 the map line adds no new action / message id / enum entry (PC_NOOK_MSG_COUNT 45 = 34 + the dresser refusal row + the 4 shop upgrade rows + the 2 guest post rows + the 4 house upgrade rows, all appended after it; the map line itself added none)",
-       "#define PC_NOOK_MSG_COUNT 52" in rd("pc", "include", "pc_nook_house.h") and "PC_NOOK_MSG_DRESSER_REFUSED, /*" in rd("pc", "include", "pc_nook_house.h")
+       "#define PC_NOOK_MSG_COUNT 53" in rd("pc", "include", "pc_nook_house.h") and "PC_NOOK_MSG_DRESSER_REFUSED, /*" in rd("pc", "include", "pc_nook_house.h")
        and "PC_NOOK_MSG_UPGRADE_DOOR,     /*" in rd("pc", "include", "pc_nook_house.h") and "PC_NOOK_MSG_UPG_BUSY,         /*" in rd("pc", "include", "pc_nook_house.h"))  # worker E appended 7 event NPC rows after it (52)
     ck("L11 client flag describes the latest applied shop txn only (reset at the start of apply, set only inside the grant branch)",
        "s_map_granted_oneshot = 0; /* the map-line flag always describes" in ng and ng.count("s_map_granted_oneshot = 1;") == 1)

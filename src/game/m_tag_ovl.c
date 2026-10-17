@@ -35,6 +35,7 @@
 extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
 #include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest copy for a guest, else now_home's; NULL-guarded) */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: the "Place" tag (mTG_TYPE_76 on PC) and the leaf-drop policy */
+#include "pc_sell_ui.h" /* Nook bulk sell basket: the basket mode of the dresser screen (5 x 3 grid, Add to Basket / Take Back, refusal notice) */
 #define mTG_MAILBOX() pc_ui_mailbox()
 #define mTG_MAILBOX_USABLE() pc_ui_mailbox_usable()
 #else
@@ -175,8 +176,14 @@ static mTG_tag_data_table_c mTG_table_data[] = {
 static s16 mTG_pc_dresser_col_pos[9] = { -106, -84, -62, -40, -18, 4, 26, 48, 70 };
 static s16 mTG_pc_dresser_line_pos[3] = { 82, 60, 38 }; /* = pc_dresser_layout_row_y(): the enlarged window's inner rectangle y 26..94 */
 static mTG_tag_data_table_c mTG_pc_dresser_table = { 9, 3, mTG_pc_dresser_col_pos, mTG_pc_dresser_line_pos };
+/* Nook bulk sell basket: the SAME window / rows, a 5 x 3 grid in the LEFT five columns (one cell per pocket); the right part of the window shows the count / total
+ * (m_haniwa_ovl.c mHW_pc_basket_summary) */
+static mTG_tag_data_table_c mTG_pc_basket_table = { 5, 3, mTG_pc_dresser_col_pos, mTG_pc_dresser_line_pos };
 
 static mTG_tag_data_table_c* mTG_pc_table(int table) {
+    if (table == mTG_TABLE_HANIWA && pc_dresser_ui_basket()) {
+        return &mTG_pc_basket_table;
+    }
     if (table == mTG_TABLE_HANIWA && pc_dresser_ui_active()) {
         return &mTG_pc_dresser_table;
     }
@@ -939,6 +946,23 @@ static mTG_tag_word_c* mTG_pc_dresser_get_item[] = { /* 6r (B): the dresser scre
 static mTG_tag_word_c* mTG_pc_dresser_putin_item[] = { /* 6r (B): a pocket item in the dresser screen: Put Away / Grab / Quit */
     &mTG_tag_word_korewoireru,
     &mTG_tag_word_pc_grab,
+    &mTG_tag_word_yameru,
+};
+/* Nook bulk sell basket: the same procs (mTG_putin_proc / mTG_get_proc -> pc_dresser_ui_put / _take -> the local staging of pc_sell_ui.c), basket words, no Grab */
+static mTG_tag_word_c mTG_tag_word_pc_basket_in = {
+    "Add to Basket   ",
+    &mTG_putin_proc,
+};
+static mTG_tag_word_c mTG_tag_word_pc_basket_out = {
+    "Take Back       ",
+    &mTG_get_proc,
+};
+static mTG_tag_word_c* mTG_pc_basket_putin_item[] = { /* a sellable pocket item in the basket screen */
+    &mTG_tag_word_pc_basket_in,
+    &mTG_tag_word_yameru,
+};
+static mTG_tag_word_c* mTG_pc_basket_get_item[] = { /* a basket cell */
+    &mTG_tag_word_pc_basket_out,
     &mTG_tag_word_yameru,
 };
 #endif
@@ -2125,6 +2149,11 @@ static void mTG_init_tag_data_set_itemNo(mActor_name_t* itemNo, Mail_c** mail_pp
         case mTG_TABLE_ITEM:
             *itemNo = Now_Private->inventory.pockets[idx];
             *itemCond = mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, idx);
+#ifdef TARGET_PC
+            if (pc_dresser_ui_basket() && pc_sell_ui_pocket_hidden(idx)) {
+                *itemNo = EMPTY_NO; /* Nook bulk sell basket: the pocket is shown in its basket cell (no name tag on the now empty-looking pocket) */
+            }
+#endif
             break;
         case mTG_TABLE_PLAYER:
             *itemNo = Now_Private->equipment;
@@ -7015,7 +7044,7 @@ static int mTG_move_cursol_between_table_haniwa(mTG_tag_c* tag, u32 trigger) {
             return TRUE;
         }
         if ((trigger & BUTTON_CUP) != 0 && tag->table == mTG_TABLE_ITEM) {
-            for (i = 1; i < 9; i++) {
+            for (i = 1; i < mTG_pc_table(mTG_TABLE_HANIWA)->col_num; i++) { /* 9 dresser columns, 5 basket columns */
                 if (ABS(mTG_pc_dresser_col_pos[i] - pocket_x[tag->tag_col]) < ABS(mTG_pc_dresser_col_pos[best] - pocket_x[tag->tag_col])) {
                     best = i;
                 }
@@ -7518,6 +7547,11 @@ static int mTG_select_tag_decide_item(Submenu* submenu, mSM_MenuInfo_c* menu_inf
             sAdo_SysTrgStart(act == PC_DRESSER_UI_ACT_REFUSED ? MONO(NA_SE_3) : NA_SE_32);
             return mTG_TYPE_NONE;
         }
+        if (pc_dresser_ui_basket()) { /* Nook bulk sell basket: a sellable pocket offers "Add to Basket" / "Quit"; a pocket already in the basket shows nothing */
+            mTG_label_table[mTG_TYPE_PUTIN_ITEM].words = mTG_pc_basket_putin_item;
+            mTG_label_table[mTG_TYPE_PUTIN_ITEM].lines = ARRAY_COUNT(mTG_pc_basket_putin_item);
+            return (item != EMPTY_NO && pc_sell_ui_pocket_offer(idx)) ? mTG_TYPE_PUTIN_ITEM : mTG_TYPE_NONE;
+        }
         mTG_label_table[mTG_TYPE_PUTIN_ITEM].words = mTG_pc_dresser_putin_item;
         mTG_label_table[mTG_TYPE_PUTIN_ITEM].lines = ARRAY_COUNT(mTG_pc_dresser_putin_item);
         return (!pc_dresser_ui_pending() && item != EMPTY_NO && pc_net_game_dresser_pocket_item(idx) != 0) ? mTG_TYPE_PUTIN_ITEM : mTG_TYPE_NONE;
@@ -7738,6 +7772,11 @@ static int mTG_select_tag_decide_haniwa(Submenu* submenu, mSM_MenuInfo_c* menu_i
             const int act = pc_dresser_ui_place(0, mTG_get_table_idx(tag));
             sAdo_SysTrgStart(act == PC_DRESSER_UI_ACT_REFUSED ? MONO(NA_SE_3) : NA_SE_32);
             return mTG_TYPE_NONE;
+        }
+        if (pc_dresser_ui_basket()) { /* Nook bulk sell basket: a filled cell offers "Take Back" / "Quit" */
+            mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_pc_basket_get_item;
+            mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].lines = ARRAY_COUNT(mTG_pc_basket_get_item);
+            return pc_dresser_ui_slot_item(mTG_get_table_idx(tag)) != 0 ? mTG_TYPE_HANIWA_GET_ITEM : mTG_TYPE_NONE;
         }
         mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_pc_dresser_get_item;
         mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].lines = ARRAY_COUNT(mTG_pc_dresser_get_item);
@@ -8325,6 +8364,12 @@ static void mTG_move_decide(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag
     };
 
     if (!mTG_check_move_proc(submenu, tag)) {
+#ifdef TARGET_PC
+        if (pc_dresser_ui_basket() && tag->table == mTG_TABLE_ITEM) {
+            pc_sell_ui_refuse_pocket(mTG_get_table_idx(tag)); /* Nook bulk sell basket: a greyed pocket says WHY Nook won't buy it (a notice, nothing changes) */
+            pc_dresser_ui_note_input();
+        }
+#endif
         sAdo_SysTrgStart(MONO(NA_SE_A));
         return;
     }

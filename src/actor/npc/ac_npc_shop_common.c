@@ -4,6 +4,7 @@
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES (lifecycle hardening: the one place that knows the house count) */
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: Nook's announcement of the 5-minute closure */
 #include "pc_house_upgrade.h" /* house upgrades via Nook for resident clients (worker C): kind-20 transactions instead of local homes[] / loan writes */
+#include "pc_sell_ui.h" /* Nook bulk sell basket: the sell menu opens the basket screen in a multiplayer session (client + listen host) */
 #include <string.h>
 /* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
  * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
@@ -3106,6 +3107,11 @@ static void aNSC_buy_menu_open_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
 
 static void aNSC_buy_menu_close_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     if (play->submenu.open_flag == FALSE) {
+#ifdef TARGET_PC
+        if (pc_sell_ui_active()) {
+            (void)pc_sell_ui_close(&play->submenu); /* Nook bulk sell basket: the staged items become the vanilla selection (item_p[], selected_item_num) */
+        }
+#endif
         aNSC_setupAction(shop_common, play, shop_common->action + 1);
     }
 }
@@ -3138,6 +3144,21 @@ static void aNSC_msg_win_open_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
             }
 #endif
         }
+#ifdef TARGET_PC
+        if (pc_sell_ui_take_from_basket() && item != EMPTY_NO && action != aNSC_CHECK_BUY_REFUSE_QUEST_COND) {
+            /* Nook bulk sell basket: the closed basket is ONE multi-item sale (also for a single item: never the "all of these?" offer). counter = the count
+             * (aNSC_check_buy_item_plural), the quote row says the count and the total (the same price / 4 + turnip values aNSC_buy_check_init computes) and
+             * asks Yes. / No.; aNSC_buy_check reads that choice exactly like the vanilla offer (Yes = the vanilla / network sale of every selected slot). */
+            (void)aNSC_check_buy_item_plural(shop_common, submenu);
+            pc_nook_house_set_sell(pc_sell_ui_last_count(), pc_sell_ui_last_total());
+            msg_no = pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET);
+            printf("[NET][SELL] nook dialogue: basket quote %d item(s) %u Bells (message 0x%04X)\n", pc_sell_ui_last_count(), pc_sell_ui_last_total(), msg_no);
+            aNSC_Set_continue_msg_num(msg_p, shop_common, msg_no);
+            mMsg_Set_ForceNext(msg_p);
+            aNSC_setupAction(shop_common, play, aNSC_ACTION_BUY_CHECK);
+            return;
+        }
+#endif
         if (action == aNSC_CHECK_BUY_OFFER_BUY_ALL) {
 #ifdef aNSC_MAMEDANUKI
             msg_no = 0x173D;
@@ -3202,6 +3223,15 @@ static void aNSC_buy_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) 
         aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
         aNSC_setupAction(shop_common, play, next_act_idx[next]);
         return;
+    }
+#endif
+#ifdef TARGET_PC
+    if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET) && mMsg_Check_MainNormalContinue(msg_p) &&
+        mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE1) {
+        pc_sell_ui_keep_next(); /* Nook bulk sell basket: "No." -> "anything else?"; the basket keeps its contents if the player opens it again */
+    }
+    if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET)) {
+        num = n2; /* the basket quote is read exactly like the vanilla multi-item offer (aNSC_MSG_BUY_MANY_OFFER) */
     }
 #endif
     if (num == n1 || num == n2 || num == n3) {
@@ -4066,6 +4096,17 @@ static void aNSC_buy_menu_open_wait_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAM
 }
 
 static void aNSC_buy_menu_close_wait_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (pc_sell_ui_enabled()) {
+        /* Nook bulk sell basket: the sell picker is the basket screen (the dresser screen in basket mode: the inventory in HANIWA_ENTRUST mode opens the gyroid
+         * overlay; data1 = 0 is never read in basket mode). Nothing changes in the pockets while it is open; its close fills the vanilla multi-item selection
+         * (aNSC_buy_menu_close_wait -> pc_sell_ui_close), which the rest of this state machine already knows (vanilla X-mark "Sell all"). */
+        pc_sell_ui_open();
+        mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0x0);
+        shop_common->next_action = 0x13;
+        return;
+    }
+#endif
     mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, 0x5, 0x0);
     shop_common->next_action = 0x13;
 }

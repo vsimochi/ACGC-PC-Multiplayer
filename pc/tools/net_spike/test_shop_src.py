@@ -54,6 +54,7 @@ def main():
     c_noup = strip_comments(c_raw[:ub] + c_raw[ue:])
     shop_region_raw = c_raw[c_raw.index("---- SHOP (service 3): host helpers"):he]
     shop_region = strip_comments(shop_region_raw)
+    sell_logic = strip_comments(read("pc/src/pc_sell_logic.c"))  # Nook bulk sell basket: the shared sell predicate / value
     ts_raw = func_body(shop_region_raw, "pcnetgame_handle_host_ts_txn")
     ts = strip_comments(ts_raw)
 
@@ -123,10 +124,14 @@ def main():
           and "ITEM_IS_PAINT(item)" in shop_region and "mSP_TANUKI_SHOP_STATUS_EVENT || status == mSP_TANUKI_SHOP_STATUS_FUKUBIKI" in shop_region)
     check("H the host's price / value are NEVER taken from the message: 'shop_price = mSP_ItemNo2ItemPrice(item)' and the sale value is summed from the PRE-image items by pcnetgame_shop_sell_unit (price / ratio, Kabu_get_price for turnips)",
           "shop_price = mSP_ItemNo2ItemPrice(item);" in ts and not re.search(r"shop_price\s*=\s*[^;]*(?:aux_item|t->)", ts)
-          and "mSP_ItemNo2ItemPrice((mActor_name_t)item) / PC_NETGAME_SHOP_SELL_RATIO" in shop_region and "Kabu_get_price()" in shop_region)
-    check("H the sale rules: stationery + quest conditions + Sunday turnips -> NOT_SELLABLE; a spoiled turnip / worthless item is value 0; bag overflow follows vanilla (WALLET_MAX, 30000 bags, bags <= empty + sold slots else NO_ROOM)",
-          all(x in shop_region for x in ("ITEM_IS_PAPER((mActor_name_t)item)", "mPr_ITEM_COND_QUEST", "lbRTC_SUNDAY", "ITM_KABU_SPOILED", "bags > empty + n", "PC_NETGAME_TXN_REASON_NO_ROOM", "ITM_MONEY_30000",
-                                  "bells >= (uint32_t)mPr_WALLET_MAX", "PC_NETGAME_TXN_REASON_NOT_SELLABLE")))
+          and "pc_sell_unit_value((unsigned)item, (unsigned)mSP_ItemNo2ItemPrice((mActor_name_t)item), (unsigned)Kabu_get_price())" in shop_region
+          and "return item_price / PC_SELL_RATIO;" in sell_logic and "kabu_price * kabu_sum[" in sell_logic)  # Nook bulk sell basket: the value is the shared pc_sell_unit_value()
+    check("H the sale rules (Nook bulk sell basket: THE shared predicate pc_sell_refusal() of pc_sell_logic.c, the same the basket screen uses): stationery + quest / present conditions + "
+          "money bags / cards / knife and fork / Wisp spirits + Sunday turnips + unknown ids -> NOT_SELLABLE; a spoiled turnip / worthless item is value 0; bag overflow follows vanilla "
+          "(WALLET_MAX, 30000 bags, bags <= empty + sold slots else NO_ROOM)",
+          all(x in shop_region for x in ("pc_sell_refusal((unsigned)item, (int)cond, Common_Get(time).rtc_time.weekday == lbRTC_SUNDAY)", "bags > empty + n", "PC_NETGAME_TXN_REASON_NO_ROOM",
+                                         "ITM_MONEY_30000", "bells >= (uint32_t)mPr_WALLET_MAX", "PC_NETGAME_TXN_REASON_NOT_SELLABLE"))
+          and all(x in sell_logic for x in ("ITEM_IS_PAPER(it)", "cond == PC_SELL_COND_QUEST", "ITEM1_CAT_MONEY", "ITM_KNIFE_AND_FORK", "ITEM_IS_WISP(it)", "it != ITM_KABU_SPOILED && is_sunday")))
     check("H payment = vanilla mSP_money_check + mSP_get_sell_price on the PRE-image: wallet first, then money bags 100 / 1000 / 10000 / 30000 lowest slot first, change to the wallet",
           all(x in func_body(shop_region_raw, "pcnetgame_shop_pay") for x in ("ITM_MONEY_100", "ITM_MONEY_1000", "ITM_MONEY_10000", "ITM_MONEY_30000", "feasible", "*wallet = money - amount")))
     check("H the shop mutations exist ONLY in the handler: mSP_PlusSales( 3x in the handler (restock fee, buy price, sale value / 2) + 1x in the host's own pc_net_game_restock_begin (restock fee, host-only path), mSP_ShopSaleReport( once, nothing else in pc_net_game.c writes the shop stock / sales_sum",

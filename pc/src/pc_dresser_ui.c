@@ -7,8 +7,10 @@
 #include "pc_net_game.h"
 #include "pc_dresser_layout.h"
 #include "pc_dresser_items.h"
+#include "pc_sell_ui.h" /* Nook bulk sell basket: BASKET mode of this screen delegates the grid contents / take / put to the local staging */
 
 static int s_active = 0;
+static int s_basket = 0; /* Nook bulk sell basket: the screen shows the sell basket (see pc_dresser_ui.h) */
 static unsigned short s_vanilla[PC_DRESSER_UI_VANILLA];
 static int s_pending = 0;
 /* 6p: an op deferred until the in-room commit of this screen's room edits landed (op 1 put / 2 take / 3 move / 4 swap, 0 = none) */
@@ -27,13 +29,28 @@ static const char* pc_dresser_ui_op_name(int op) {
 
 void pc_dresser_ui_begin(const unsigned short vanilla[PC_DRESSER_UI_VANILLA]) {
     s_active = 1;
+    s_basket = 0;
     memset(&s_carry, 0, sizeof(s_carry));
     pc_dresser_ui_set_vanilla(vanilla);
+}
+
+void pc_dresser_ui_begin_basket(void) {
+    s_active = 1;
+    s_basket = 1;
+    s_pending = 0;
+    s_defer.op = 0;
+    memset(&s_carry, 0, sizeof(s_carry));
+    memset(s_vanilla, 0, sizeof(s_vanilla));
+}
+
+int pc_dresser_ui_basket(void) {
+    return s_active && s_basket;
 }
 
 void pc_dresser_ui_end(void) {
     (void)pc_dresser_layout_end(); /* the enlarged gyroid window back to its pristine vertices (no-op when not remapped) */
     s_active = 0; /* a transaction still in flight resolves in the transaction layer (the pockets follow the host post-image) */
+    s_basket = 0;
     if (s_carry.active) { /* 6r: closing while carrying = cancel (nothing was changed by the grab) */
         printf("[NET][DRESSER] gyroid overlay: closed while carrying 0x%04X: grab cancelled (nothing moved)\n", (unsigned)s_carry.item);
     }
@@ -80,6 +97,9 @@ int pc_dresser_ui_col(int kind, int index) {
 
 int pc_dresser_ui_slot_item(int col) {
     int index = 0;
+    if (s_basket) {
+        return s_active ? pc_sell_ui_cell_item(col) : 0; /* the staged pocket of that basket cell (0 = empty cell / beyond the 15 cells) */
+    }
     return pc_dresser_ui_slot(col, &index) == PC_DRESSER_UI_SLOT_EXTRA ? pc_net_game_dresser_item(index) : 0;
 }
 
@@ -136,6 +156,9 @@ int pc_dresser_ui_pending(void) {
 int pc_dresser_ui_take(int col) {
     int index = 0, item, pocket;
     char what[96];
+    if (s_basket) {
+        return s_active ? pc_sell_ui_take(col) : PC_DRESSER_UI_ACT_REFUSED; /* "Take back": local staging only */
+    }
     if (!s_active || s_pending || pc_dresser_ui_slot(col, &index) != PC_DRESSER_UI_SLOT_EXTRA || (item = pc_net_game_dresser_item(index)) == 0) {
         return PC_DRESSER_UI_ACT_REFUSED;
     }
@@ -150,6 +173,9 @@ int pc_dresser_ui_take(int col) {
 int pc_dresser_ui_put(int pocket_slot) {
     const int item = pc_net_game_dresser_pocket_item(pocket_slot);
     char what[96];
+    if (s_basket) {
+        return s_active ? pc_sell_ui_put(pocket_slot) : PC_DRESSER_UI_ACT_REFUSED; /* "Add to Basket": local staging only */
+    }
     if (!s_active || s_pending || item == 0 || !pc_net_game_dresser_item_storable(item)) {
         return PC_DRESSER_UI_ACT_REFUSED;
     }
@@ -166,7 +192,7 @@ int pc_dresser_ui_put(int pocket_slot) {
  * sides); pocket<->pocket is the plain local pocket swap (vanilla inventory behaviour). ---- */
 int pc_dresser_ui_grab(int from_pocket, int index) {
     const int item = from_pocket ? pc_net_game_dresser_pocket_item(index) : pc_dresser_ui_slot_item(index);
-    if (!s_active || s_pending || item == 0) {
+    if (!s_active || s_pending || item == 0 || s_basket) { /* the basket has no Grab */
         return 0;
     }
     s_carry.active = 1;
@@ -182,6 +208,9 @@ int pc_dresser_ui_carry_item(void) {
 }
 
 int pc_dresser_ui_carry_hides(int from_pocket, int index) {
+    if (s_active && s_basket) {
+        return from_pocket && pc_sell_ui_pocket_hidden(index); /* a pocket in the basket is drawn in its basket cell only (view only: the pocket is unchanged) */
+    }
     return s_active && s_carry.active && (s_carry.from_pocket != 0) == (from_pocket != 0) && s_carry.index == index;
 }
 

@@ -119,7 +119,7 @@ ck("dialogue: paint stays refused on a client (deferred: a bells purchase + next
 
 # ---- rows
 ck("rows: PC_NOOK_MSG_UPG_WAIT / _FAILED / _LINKLOST / _BUSY appended (count 45), the wait row ends with BTN FORCENEXT CONTINUE, the others with MSGEND",
-   "#define PC_NOOK_MSG_COUNT 52" in nhh and "PC_NOOK_MSG_UPG_BUSY,         /*" in nhh  # worker E appended 7 rows after it
+   "#define PC_NOOK_MSG_COUNT 53" in nhh and "PC_NOOK_MSG_UPG_BUSY,         /*" in nhh  # worker E appended 7 rows after it; the sell basket quote row (52) after them
    and "nk_code(&b, NK_BTN);\n            nk_code(&b, NK_FORCENEXT);\n            nk_code(&b, NK_CONTINUE);" in nh[nh.index("case PC_NOOK_MSG_UPG_WAIT:"):nh.index("case PC_NOOK_MSG_UPG_FAILED:")])
 
 # ---- shop follow-ups

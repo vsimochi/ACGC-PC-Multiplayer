@@ -39,6 +39,7 @@ typedef struct {
     int npc_relay;        /* BOTH: 1 (default) = such a villager's pose is relayed through the host to the other players (NPC_PROXY_MOVE); env AC_MP_NPC_RELAY=0 too */
     int town_serve;       /* HOST only (M-B): serve the town to pre-boot --town-fetch clients: -1 = AUTO (default: on for a --dedicated host, off otherwise), 0 = OFF, 1 = a SANITIZED copy (M-G), 2 = the full GCI (every resident's private data) */
     int chat;             /* [Network] chat (worker CH): 1 (default) = the multiplayer text chat (host: serve it; client: the chat key + bubbles), 0 = off. Env AC_MP_CHAT=0 too */
+    int bulk_sell;        /* [Network] bulk_sell (Nook bulk sell basket, pc_sell_ui.h): 1 (default) = in a multiplayer session Nook's "sell" opens the basket screen, 0 = the vanilla picker. Env AC_MP_BULK_SELL=0 too */
 } PCSettings;
 
 extern PCSettings g_pc_settings;

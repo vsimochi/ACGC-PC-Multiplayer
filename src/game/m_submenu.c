@@ -72,6 +72,7 @@ static int mSM_pc_th_want_open(void) {
  * its overlay's own close path. Opens and closes log "[TEST][SUBMENU] <role> menu T OPEN|CLOSED pockets_sum=..." for the
  * "world keeps running behind menus" tests (test_menu_world_live_real.py). Always 0 in normal play. */
 int g_pc_th_submenu_req = 0;
+int g_pc_th_submenu_data0 = 0; /* TEST-ONLY (Nook bulk sell basket real test, pc_sell_ui.c): data0 of the next test open (0 = the default), consumed by it */
 static int s_pc_th_ap_type = 0; /* the menu the autopilot opened (0 = none) */
 
 static int mSM_pc_th_ap_close_dir(int type) {
@@ -422,7 +423,8 @@ extern void mSM_submenu_ctrl(GAME_PLAY* play) {
         } else if (t == mSM_OVL_CALENDAR) {
             mSM_open_submenu(submenu, mSM_OVL_CALENDAR, 0, Common_Get(player_no)); /* as the room calendar */
         } else {
-            mSM_open_submenu(submenu, t, 0, 0); /* inventory, notice board */
+            mSM_open_submenu(submenu, t, g_pc_th_submenu_data0, 0); /* inventory, notice board (data0 0; the sell basket test: HANIWA_ENTRUST) */
+            g_pc_th_submenu_data0 = 0;
         }
         mSM_Reset_player_btn_type2(play);
         printf("[TEST][SUBMENU] %s menu %d OPEN pockets_sum=%08X live=%d\n", mSM_pc_th_role(), t, mSM_pc_th_pocket_sum(),

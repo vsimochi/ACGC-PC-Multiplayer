@@ -13,6 +13,9 @@
 #include "pc_dresser_ui.h" /* dresser mode: the overlay shows the opened dresser's 27 slots on one 9 x 3 grid (never the save's gyroid) */
 #include "pc_dresser_layout.h" /* the 9-slice enlargement of the gyroid window in dresser mode */
 #include <stdlib.h> /* 6t: getenv (AC_DRESSER_DEBUG_GRID) */
+#include "pc_sell_ui.h"    /* Nook bulk sell basket: the count / total summary of the basket mode */
+#include "pc_sell_logic.h" /* PC_SELL_BASKET_COLS */
+#include <string.h>
 #endif
 
 static mHW_Ovl_c haniwa_ovl_data;
@@ -393,12 +396,18 @@ static void mHW_pc_dresser_frame(Gfx** gfxp) {
 
         for (i = 0; i < 4; i++) {
             const int right = (i >= 2);
+            /* Nook bulk sell basket: 5 cells (the left five dresser columns, x -117..-7; one cell per pocket) instead of 9 */
+            const int ncols = pc_dresser_ui_basket() ? PC_SELL_BASKET_COLS : PC_DRESSER_UI_COLS;
 
             v[i] = tpl[i];
-            v[i].v.ob[0] = (s16)(right ? -18 + 99 : -18 - 99); /* 9 cells x 22 = 198, centred on the window (x -126..90) */
+            if (ncols == PC_DRESSER_UI_COLS) {
+                v[i].v.ob[0] = (s16)(right ? -18 + 99 : -18 - 99); /* 9 cells x 22 = 198, centred on the window (x -126..90) */
+            } else {
+                v[i].v.ob[0] = (s16)(right ? -117 + 22 * ncols : -117); /* the cell centres -106 .. -18 (m_tag_ovl.c mTG_pc_basket_table) */
+            }
             v[i].v.ob[1] = (s16)(row_y[r] + ((i & 1) ? -11.0f : 11.0f));
-            if (right) { /* 9 cells of texture instead of 4 */
-                v[i].v.tc[0] = (s16)(tpl[0].v.tc[0] + ((tpl[2].v.tc[0] - tpl[0].v.tc[0]) * PC_DRESSER_UI_COLS) / 4);
+            if (right) { /* 9 (5) cells of texture instead of 4 */
+                v[i].v.tc[0] = (s16)(tpl[0].v.tc[0] + ((tpl[2].v.tc[0] - tpl[0].v.tc[0]) * ncols) / 4);
             }
         }
     }
@@ -574,6 +583,31 @@ static void mHW_set_message(Submenu* submenu, GAME* game, mSM_MenuInfo_c* menu_i
     // clang-format on
 }
 
+#ifdef TARGET_PC
+/* Nook bulk sell basket: the summary right of the 5 x 3 grid (window x 6..84 inside the inner rectangle): "N items" / the advisory total / "Bells" (the client's own
+ * prices: the host's total is authoritative and is what Nook quotes after the close). Drawn like the gyroid's dialogue line (mHW_set_message: window x, y -> screen
+ * 160 + pos_x + x, 120 - (pos_y + y)). */
+static void mHW_pc_basket_summary(Submenu* submenu, GAME* game, mSM_MenuInfo_c* menu_info) {
+    char line[3][24];
+    u8 str[24];
+    static const f32 wy[3] = { 90.0f, 70.0f, 50.0f };
+    int k, n, len;
+
+    (void)pc_sell_ui_header(line[0], sizeof(line[0]), line[1], sizeof(line[1]), line[2], sizeof(line[2]));
+    submenu->overlay->set_char_matrix_proc(game->graph);
+    for (k = 0; k < 3; k++) {
+        len = (int)strlen(line[k]);
+        for (n = 0; n < len && n < (int)sizeof(str); n++) {
+            str[n] = (u8)line[k][n]; /* letters, digits, space and ',' only: the game's charset is ASCII for these */
+        }
+        if (len > 0) {
+            mFont_SetLineStrings(game, str, n, 160.0f + menu_info->position[0] + 6.0f, 120.0f - (menu_info->position[1] + wy[k]), 45, 50, 0, 255, FALSE, TRUE, 0.875f,
+                                 0.875f, mFont_MODE_POLY);
+        }
+    }
+}
+#endif
+
 static void mHW_set_dl(mSM_MenuInfo_c* menu_info, Submenu* submenu, GAME* game) {
     GRAPH* graph = game->graph;
     f32 pos_x = menu_info->position[0];
@@ -581,6 +615,11 @@ static void mHW_set_dl(mSM_MenuInfo_c* menu_info, Submenu* submenu, GAME* game) 
 
     mHW_set_frame_dl(submenu, graph, pos_x, pos_y);
     mHW_set_item(submenu, graph, menu_info, pos_x, pos_y);
+#ifdef TARGET_PC
+    if (pc_dresser_ui_basket()) {
+        mHW_pc_basket_summary(submenu, game, menu_info);
+    }
+#endif
 #ifdef TARGET_PC
     if (!pc_dresser_ui_active()) /* dresser mode: no gyroid portrait */
 #endif
@@ -644,6 +683,9 @@ extern void mHW_haniwa_ovl_construct(Submenu* submenu) {
     Submenu_Overlay_c* ovl = submenu->overlay;
     mHW_Ovl_c* haniwa_ovl = ovl->haniwa_ovl;
 
+#ifdef TARGET_PC
+    pc_sell_ui_overlay_constructed(); /* Nook bulk sell basket: a basket whose conversation ended without collecting it is dropped here (never shown on a gyroid) */
+#endif
     if (haniwa_ovl == NULL) {
         mem_clear((u8*)&haniwa_ovl_data, sizeof(haniwa_ovl_data), 0);
         ovl->haniwa_ovl = &haniwa_ovl_data;
@@ -660,6 +702,7 @@ extern void mHW_haniwa_ovl_construct(Submenu* submenu) {
 extern void mHW_haniwa_ovl_destruct(Submenu* submenu) {
 #ifdef TARGET_PC
     (void)pc_dresser_layout_end(); /* the overlay goes away: the gyroid window table back to its pristine bytes (no-op when not remapped) */
+    pc_sell_ui_overlay_destroyed();  /* Nook bulk sell basket: the screen closed (the Nook seam collects it next) */
 #endif
     submenu->overlay->haniwa_ovl = NULL;
 }

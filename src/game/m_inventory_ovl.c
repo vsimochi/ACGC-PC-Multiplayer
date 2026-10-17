@@ -1,6 +1,7 @@
 #include "m_inventory_ovl.h"
 #ifdef TARGET_PC
 #include "pc_dresser_ui.h" /* 6s: dresser-mode backdrop / grabbed-item origin */
+#include "pc_sell_ui.h" /* Nook bulk sell basket: which pockets Nook buys (the rest is greyed) */
 #endif
 
 #include "m_player_lib.h"
@@ -2074,6 +2075,11 @@ static void mIV_inventory_ovl_init(Submenu* submenu, mSM_MenuInfo_c* menu_info, 
 
         default: {
             inv_ovl->selectable_item_bitfield = mSM_check_open_inventory_itemlist(menu_info->data0, menu_info->data1);
+#ifdef TARGET_PC
+            if (menu_info->data0 == mSM_IV_OPEN_HANIWA_ENTRUST && pc_dresser_ui_basket()) {
+                inv_ovl->selectable_item_bitfield = pc_sell_ui_selectable_mask(); /* Nook bulk sell basket: what Nook buys (pc_sell_refusal); the rest is greyed */
+            }
+#endif
 
             if (menu_info->data0 == mSM_IV_OPEN_NORMAL || menu_info->data0 == mSM_IV_OPEN_EXCHANGE) {
                 inv_ovl->selectable_mail_bitfield = 0xFFFF;

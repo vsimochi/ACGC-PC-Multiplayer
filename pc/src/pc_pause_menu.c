@@ -10,6 +10,7 @@
 #include "pc_dresser_ui.h" /* 6q: the dresser screen's "Move" target hint */
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure / reopening notice */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: the refusal notice of Place / Rotate / Pick up / leaf drop */
+#include "pc_sell_ui.h" /* Nook bulk sell basket: the refusal notice of the basket screen */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -370,6 +371,16 @@ void pc_net_notice_draw(struct game_s* game) {
         if (of_line != NULL) {
             mFont_SetMatrix(game->graph, mFont_MODE_FONT);
             pc_menu_draw_centered(game, of_line, 30.0f, 255, 200, 90, 255, 1.0f);
+            mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+        }
+    }
+    {
+        /* Nook bulk sell basket: why a pocket item cannot go into the basket ("Nook won't buy that"), ~3 s (drawn in addition to the other notices). At the BOTTOM of
+         * the screen: the top lines would cross the basket window (real-run screenshot sell_basket_open.png). */
+        const char* sell_line = pc_sell_ui_notice();
+        if (sell_line != NULL) {
+            mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+            pc_menu_draw_centered(game, sell_line, 216.0f, 255, 200, 90, 255, 1.0f);
             mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
         }
     }
