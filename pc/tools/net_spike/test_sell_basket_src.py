@@ -8,7 +8,9 @@
   C  conservation: the basket is a LOCAL staging view: pc_sell_ui.c / the basket branches of pc_dresser_ui.c never write a pocket / the wallet / send anything (outside
      the TEST-ONLY setup write); the pockets change only by the host's APPLIED post-image (client) or the vanilla local sale (listen host)
   N  the Nook seam: the sell menu opens the basket (HANIWA_ENTRUST + basket mode) only when pc_sell_ui_enabled(); its close fills the vanilla multi-item selection; the
-     quote row (count + total, Yes / No) is read by aNSC_buy_check like the vanilla offer; "No" keeps the basket; the vanilla picker stays for single player / off
+     quote row (count + total, Yes / No) is read by aNSC_buy_check like the vanilla offer; Yes / No clear the basket; the vanilla picker stays for single player / off
+  B  B = CANCEL (an empty selection: the vanilla sell-cancel row + "anything else?"), an explicit Sell button (cursor column 5) / Start confirms (blocked while empty),
+     the basket is NEVER remembered (every open starts empty; cleared at cancel / confirmed close / Yes / No / talk end / scene change / link loss / stale guard)
   U  the screen: 5 x 3 grid in the dresser window, "Add to Basket" / "Take Back" tags, no Grab, staged pockets hidden + nameless, greyed pockets refused with a notice,
      the inventory's selectable mask = the predicate, the summary lines, the stale-basket guard at the overlay construct
   K  switches: [Network] bulk_sell (default 1, parsed, written), env AC_MP_BULK_SELL=0, session roles only; the TEST-ONLY hook is default-off and compiled only with
@@ -114,9 +116,9 @@ def main():
     ui_prod = re.sub(r"#ifdef PC_NET_TEST_HOOKS.*?#endif", "", strip_comments(ui), flags=re.S)
     ck("C1 pc_sell_ui.c (outside the TEST-ONLY hook) never writes a pocket, a condition or the wallet",
        not re.search(r"inventory\.(pockets\[[^\]]*\]|wallet|item_conditions)\s*=[^=]", ui_prod) and "mPr_SetPossessionItem" not in ui_prod and "mPr_SetFreePossessionItem" not in ui_prod)
-    ck("C2 the basket branches of the dresser screen only stage locally (take / put / slot item / hidden pockets delegate to pc_sell_ui; no Grab in the basket)",
-       "return s_active ? pc_sell_ui_take(col) : PC_DRESSER_UI_ACT_REFUSED;" in dui and "return s_active ? pc_sell_ui_put(pocket_slot) : PC_DRESSER_UI_ACT_REFUSED;" in dui
-       and "return s_active ? pc_sell_ui_cell_item(col) : 0;" in dui and "return from_pocket && pc_sell_ui_pocket_hidden(index);" in dui and "s_pending || item == 0 || s_basket)" in dui)
+    ck("C2 the basket branches of the dresser screen only stage locally (take / put / slot item / hidden pockets delegate to pc_sell_ui, the grid index = the 6 x 3 cursor table index; no Grab in the basket)",
+       "return s_active ? pc_sell_ui_take(pc_sell_ui_table_cell(col)) : PC_DRESSER_UI_ACT_REFUSED;" in dui and "return s_active ? pc_sell_ui_put(pocket_slot) : PC_DRESSER_UI_ACT_REFUSED;" in dui
+       and "return s_active ? pc_sell_ui_index_item(col) : 0;" in dui and "return from_pocket && pc_sell_ui_pocket_hidden(index);" in dui and "s_pending || item == 0 || s_basket)" in dui)
     ck("C3 the close writes ONLY the vanilla selection (Submenu item_p / selected_item_num) and leaves basket mode",
        all(x in func_body(ui, "int pc_sell_ui_close(") for x in ("it[k].item = (mActor_name_t)items[k];", "it[k].slot_no = slots[k];", "submenu->selected_item_num = n;", "pc_dresser_ui_end();")))
 
@@ -133,18 +135,57 @@ def main():
        and "pc_nook_house_set_sell(pc_sell_ui_last_count(), pc_sell_ui_last_total());" in mw and "msg_no = pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET);" in mw
        and "aNSC_setupAction(shop_common, play, aNSC_ACTION_BUY_CHECK);" in mw)
     bc = func_body(nsc, "static void aNSC_buy_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {")
-    ck("N4 aNSC_buy_check reads the quote's Yes / No like the vanilla offer (the sale / the network seam unchanged); No keeps the basket for the next open",
-       "if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET)) {\n        num = n2;" in bc and "pc_sell_ui_keep_next();" in bc and "mChoice_CHOICE1" in bc
+    ck("N4 aNSC_buy_check reads the quote's Yes / No like the vanilla offer (the sale / the network seam unchanged); Yes AND No clear the basket state (nothing remembered)",
+       "if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET)) {\n        num = n2;" in bc and "pc_sell_ui_keep_next" not in nsc and "pc_sell_ui_keep_next" not in ui + ui_h
+       and re.search(r"== mChoice_CHOICE0 \|\| mChoice_Get_ChoseNum\(mChoice_Get_base_window_p\(\)\) == mChoice_CHOICE1\)\) \{[^}]*pc_sell_ui_reset\(", bc, re.S)
        and "next = aNSC_pc_sell_prepare(shop_common, play) ? aNSC_pc_sell_step() : aNSC_BUY_OUTCOME_CANCEL;" in bc)
+    # ---------------- B: B = cancel, an explicit Sell button confirms, never remembered
+    cl = func_body(ui, "int pc_sell_ui_close(")
+    cancel = cl[cl.find("if (!s_confirmed) {"):cl.find("s_confirmed = 0;\n    pc_sell_ui_pockets(")]
+    ck("B1 the close WITHOUT the Sell button (B / Shift, Y) = CANCEL: an EMPTY vanilla selection (item EMPTY_NO, selected_item_num 0), the basket cleared, no one-shot, returns 0",
+       "if (!s_confirmed) {" in cl and "it[k].item = (mActor_name_t)EMPTY_NO;" in cancel and "submenu->selected_item_num = 0;" in cancel
+       and "pc_sell_basket_clear(&s_basket);" in cancel and "s_from_basket = 0;" in cancel and "return 0;" in cancel and "pc_dresser_ui_end();" in cancel
+       and "pc_net_game_ts_begin" not in cancel)
+    mw2 = func_body(nsc, "static void aNSC_msg_win_open_wait(")
+    ck("B2 an empty selection takes the VANILLA sell-cancel path (aNSC_CHECK_BUY_NONE_SELECTED -> aNSC_MSG_SELL_CANCEL -> BUY_CONTINUE_CHECK = his 'anything else?' choice), logged; no new Nook row",
+       "action = aNSC_CHECK_BUY_NONE_SELECTED;" in mw2 and "aNSC_MSG_SELL_CANCEL," in mw2 and "aNSC_ACTION_BUY_CONTINUE_CHECK," in mw2
+       and "if (action == aNSC_CHECK_BUY_NONE_SELECTED && pc_sell_ui_enabled()) {" in mw2 and "the vanilla sell-cancel row 0x%04X" in mw2
+       and "#define PC_NOOK_MSG_COUNT 53" in nkh)
+    op2 = func_body(ui, "void pc_sell_ui_open(")
+    ck("B3 never remembered: every open starts EMPTY (pc_sell_basket_clear, no prune of an old basket), the confirmed close empties the basket after building the selection",
+       "pc_sell_basket_clear(&s_basket);" in op2 and "prune" not in op2 and "s_confirmed = 0;" in op2
+       and cl.rstrip().endswith("pc_sell_basket_clear(&s_basket); /* the selection now lives in the vanilla Submenu list only: the basket itself is never remembered (the next open is EMPTY) */\n    return n;\n}"))
+    tick = func_body(ui, "void pc_sell_ui_tick(")
+    qend = func_body(nsc, "static void aNSC_request_Q_end_wait(")
+    ck("B4 the state is cleared at: Yes / No (N4), the end of the conversation, a scene change, a client link that is not READY, the stale-basket guard; the tick runs in pc_net_game_poll",
+       'pc_sell_ui_reset("the conversation ended");' in qend and 'pc_sell_ui_reset("scene change");' in tick and "pc_net_game_client_link_state() != PC_NETGAME_LINK_READY" in tick
+       and 'pc_sell_ui_reset("stale basket at the overlay construct");' in func_body(ui, "void pc_sell_ui_overlay_constructed(") and "pc_sell_ui_tick();" in ng
+       and all(x in func_body(ui, "void pc_sell_ui_reset(") for x in ("pc_sell_basket_clear(&s_basket);", "s_confirmed = 0;", "s_from_basket = 0;", "s_last_count = 0;")))
+    cf = func_body(ui, "int pc_sell_ui_confirm(")
+    mb = func_body(tg, "static void mTG_move_base(")
+    ck("B5 the explicit confirm: A on the Sell button (cursor column 5) or Start = pc_sell_ui_confirm() -> the screen's own close (mTG_move_cancel); an empty basket is blocked (notice + refusal sound); B is never a confirm",
+       "if (n == 0) {" in cf and "s_confirmed = 1;" in cf and "pc_sell_ui_set_notice(" in cf
+       and "if (pc_dresser_ui_basket() && (trigger & BUTTON_B) == 0 &&" in mb and "(trigger & BUTTON_START) != 0" in mb
+       and "pc_sell_ui_table_is_button(mTG_get_table_idx(tag))" in mb and "if (pc_sell_ui_confirm()) {\n            mTG_move_cancel(submenu, menu_info, tag);" in mb
+       and mb.index("pc_sell_ui_confirm()") < mb.index("if (trigger & (BUTTON_B | BUTTON_START | BUTTON_Y)) {"))
+    ck("B6 the cursor table: 6 x 3 (the 5 basket columns + the Sell button column at x 42), up from the pockets never lands on the button; the mapping is the pure pc_sell_table_cell (native selftest)",
+       "static s16 mTG_pc_basket_col_pos[PC_SELL_TABLE_COLS] = { -106, -84, -62, -40, -18, 42 };" in tg
+       and "static mTG_tag_data_table_c mTG_pc_basket_table = { PC_SELL_TABLE_COLS, 3, mTG_pc_basket_col_pos, mTG_pc_dresser_line_pos };" in tg
+       and "const int up_cols = pc_dresser_ui_basket() ? PC_SELL_BASKET_COLS : mTG_pc_table(mTG_TABLE_HANIWA)->col_num;" in tg
+       and "#define PC_SELL_TABLE_COLS 6" in logic_h and "#define PC_SELL_BUTTON_COL 5" in logic_h and "int pc_sell_table_cell(int idx) {" in logic
+       and "pc_sell_table_cell(16) == 14" in logic)
+    ck("B7 the button is drawn (green / grey panel right of the grid, 'Sell' + count + total) and the bottom hint names the controls (a notice takes its place)",
+       "const int on = pc_sell_ui_can_confirm();" in hw and "mHW_pc_basket_button_v" in hw and 'memcpy(line[0], "Sell", 5);' in hw
+       and '"A: Add or Take Back    Sell: A on Sell or Start    B: Cancel"' in ui and "const char* sell_hint = pc_sell_ui_hint();" in pm)
     ck("N5 the quote row: appended LAST (index 52, count 53), Yes. / No., built without the 'choice made' demo order (aNSC_buy_after_service waits for that order after a sale)",
        "#define PC_NOOK_MSG_COUNT 53" in nkh and re.search(r"PC_NOOK_MSG_SELL_BASKET\s+/\*", nkh) and "case PC_NOOK_MSG_SELL_BASKET:" in nk
        and "nk_choice_plain(&b, ids, 2);" in nk and "NK_DEMO_NPC0" not in func_body(nk, "static void nk_choice_plain(")
        and "That's %d item%s in all." in nk and "pc_sell_format_bells(bells, sizeof(bells), s_sell_total)" in nk)
 
     # ---------------- U: the screen
-    ck("U1 the basket grid: a 5 x 3 table in the dresser window (the left five dresser columns), cursor up from the pockets limited to its columns",
-       "static mTG_tag_data_table_c mTG_pc_basket_table = { 5, 3, mTG_pc_dresser_col_pos, mTG_pc_dresser_line_pos };" in tg
-       and "if (table == mTG_TABLE_HANIWA && pc_dresser_ui_basket()) {" in tg and "i < mTG_pc_table(mTG_TABLE_HANIWA)->col_num; i++" in tg)
+    ck("U1 the basket grid: a 5 x 3 grid in the dresser window (the left five dresser columns, + the Sell button column: B6), cursor up from the pockets limited to the grid",
+       "static mTG_tag_data_table_c mTG_pc_basket_table = { PC_SELL_TABLE_COLS, 3, mTG_pc_basket_col_pos, mTG_pc_dresser_line_pos };" in tg
+       and "if (table == mTG_TABLE_HANIWA && pc_dresser_ui_basket()) {" in tg and "for (i = 1; i < up_cols; i++)" in tg)
     ck("U2 the tags: a sellable pocket -> 'Add to Basket' / Quit (mTG_putin_proc), a cell -> 'Take Back' / Quit (mTG_get_proc); a staged pocket offers nothing and has no name tag",
        '"Add to Basket   "' in tg and '"Take Back       "' in tg and "pc_sell_ui_pocket_offer(idx)) ? mTG_TYPE_PUTIN_ITEM : mTG_TYPE_NONE;" in tg
        and "mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_pc_basket_get_item;" in tg and "pc_dresser_ui_basket() && pc_sell_ui_pocket_hidden(idx)" in tg)
@@ -154,7 +195,7 @@ def main():
        "inv_ovl->selectable_item_bitfield = pc_sell_ui_selectable_mask();" in iv and "pc_dresser_ui_carry_hides(1, i)" in iv)
     ck("U5 the window: the dresser's flat solid panel and cells (5 cells per row in basket mode) + the summary lines ('N items' / total / 'Bells') right of the grid",
        "const int ncols = pc_dresser_ui_basket() ? PC_SELL_BASKET_COLS : PC_DRESSER_UI_COLS;" in hw and "mHW_pc_basket_summary(submenu, game, menu_info);" in hw
-       and "pc_sell_ui_header(line[0]" in hw)
+       and "pc_sell_ui_header(line[1]" in hw)
     ck("U6 a basket never collected (its conversation ended) is dropped at the next gyroid overlay construct (never shown on a real gyroid / dresser)",
        "pc_sell_ui_overlay_constructed();" in hw and "pc_sell_ui_overlay_destroyed();" in hw and "if (s_open && s_destroyed) {" in ui and "s_basket = 0;" in func_body(dui, "void pc_dresser_ui_begin("))
 

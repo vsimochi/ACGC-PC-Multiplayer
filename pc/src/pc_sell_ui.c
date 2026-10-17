@@ -34,7 +34,7 @@ _Static_assert(PC_SELL_COND_NORMAL == mPr_ITEM_COND_NORMAL && PC_SELL_COND_PRESE
 
 static PCSellBasket s_basket;
 static int s_open = 0;         /* the Nook seam opened the basket screen and has not collected it yet */
-static int s_keep_next = 0;    /* the next open keeps the staged items (Nook's "No") */
+static int s_confirmed = 0;    /* the player pressed the Sell button (or Start) on a non-empty basket: the close hands it to Nook; any other close = CANCEL */
 static int s_destroyed = 0;    /* the gyroid overlay was destroyed since the open (a later construct with s_open still set = a stale basket) */
 static int s_from_basket = 0;  /* one-shot for the Nook dialogue: the selection came from the basket */
 static int s_last_count = 0;
@@ -95,36 +95,77 @@ int pc_sell_ui_enabled(void) {
 }
 
 void pc_sell_ui_open(void) {
-    unsigned short pockets[mPr_POCKETS_SLOT_COUNT];
-    int conds[mPr_POCKETS_SLOT_COUNT];
-    int dropped = 0, i, n_ok = 0;
-    if (!s_keep_next) {
-        pc_sell_basket_clear(&s_basket);
-    } else {
-        pc_sell_ui_pockets(pockets, conds);
-        dropped = pc_sell_basket_prune(&s_basket, pockets, conds, pc_sell_ui_sunday());
-    }
+    int i, n_ok = 0;
+    pc_sell_basket_clear(&s_basket); /* never remembered: every open starts EMPTY (user feedback: the basket must not refill itself) */
     for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
         n_ok += pc_sell_ui_refusal_of(i) == PC_SELL_OK;
     }
-    s_keep_next = 0;
     s_open = 1;
+    s_confirmed = 0;
     s_destroyed = 0;
     s_from_basket = 0;
+    s_last_count = 0;
+    s_last_total = 0u;
     pc_dresser_ui_begin_basket();
     if (n_ok == 0) {
         pc_sell_ui_set_notice("Nook won't buy anything you're carrying");
     }
-    printf("[NET][SELL] basket screen OPEN (role %s): %d item(s) kept from before (%d dropped), %d sellable pocket(s)\n",
-           pc_net_game_role() == PC_NETGAME_ROLE_HOST ? "host" : "client", pc_sell_basket_count(&s_basket), dropped, n_ok);
-}
-
-void pc_sell_ui_keep_next(void) {
-    s_keep_next = 1;
+    printf("[NET][SELL] basket screen OPEN (role %s): EMPTY basket, %d sellable pocket(s)\n", pc_net_game_role() == PC_NETGAME_ROLE_HOST ? "host" : "client", n_ok);
 }
 
 int pc_sell_ui_active(void) {
     return s_open && pc_dresser_ui_basket();
+}
+
+int pc_sell_ui_confirm(void) {
+    const int n = pc_sell_basket_count(&s_basket);
+    if (!s_open || !pc_dresser_ui_basket()) {
+        return 0;
+    }
+    if (n == 0) {
+        pc_sell_ui_set_notice("Put something in the basket first");
+        printf("[NET][SELL] basket: Sell pressed on an EMPTY basket: blocked (nothing happens)\n");
+        return 0;
+    }
+    s_confirmed = 1;
+    printf("[NET][SELL] basket: Sell CONFIRMED: %d item(s) mask=0x%04X advisory %u Bells -> the screen closes, Nook quotes\n", n, pc_sell_basket_mask(&s_basket), pc_sell_ui_total());
+    return 1;
+}
+
+int pc_sell_ui_can_confirm(void) {
+    return s_open && pc_sell_basket_count(&s_basket) > 0;
+}
+
+int pc_sell_ui_table_cell(int idx) {
+    return pc_sell_table_cell(idx);
+}
+
+int pc_sell_ui_table_is_button(int idx) {
+    return pc_sell_table_is_button(idx);
+}
+
+void pc_sell_ui_reset(const char* why) {
+    const int had = pc_sell_basket_count(&s_basket) > 0 || s_confirmed || s_from_basket || s_last_count != 0;
+    pc_sell_basket_clear(&s_basket);
+    s_confirmed = 0;
+    s_from_basket = 0;
+    s_last_count = 0;
+    s_last_total = 0u;
+    if (had) {
+        printf("[NET][SELL] basket state CLEARED (%s): nothing staged, nothing remembered\n", why != NULL ? why : "?");
+    }
+}
+
+void pc_sell_ui_tick(void) {
+    static int last_scene = -1;
+    const int scene = (int)Save_Get(scene_no);
+    if (last_scene >= 0 && scene != last_scene) {
+        pc_sell_ui_reset("scene change");
+    }
+    last_scene = scene;
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && pc_net_game_client_link_state() != PC_NETGAME_LINK_READY) {
+        pc_sell_ui_reset("host link not ready / lost");
+    }
 }
 
 int pc_sell_ui_close(void* submenu_p) {
@@ -136,6 +177,28 @@ int pc_sell_ui_close(void* submenu_p) {
     if (!s_open) {
         return 0;
     }
+    if (!s_confirmed) {
+        /* B (Shift) / Y / any close without the Sell button = CANCEL: the basket is emptied (the staged items were only shown in it: the pockets never changed),
+         * and Nook reads an EMPTY selection = the vanilla "nothing selected" path of the sell picker (aNSC_MSG_SELL_CANCEL, then his "anything else?" choice) */
+        const int had = pc_sell_basket_count(&s_basket);
+        if (submenu != NULL && submenu->item_p != NULL) {
+            Submenu_Item_c* it = submenu->item_p;
+            for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+                it[k].item = (mActor_name_t)EMPTY_NO;
+                it[k].slot_no = mPr_POCKETS_SLOT_COUNT;
+            }
+            submenu->selected_item_num = 0;
+        }
+        pc_sell_basket_clear(&s_basket);
+        s_from_basket = 0;
+        s_last_count = 0;
+        s_last_total = 0u;
+        s_open = 0;
+        pc_dresser_ui_end();
+        printf("[NET][SELL] basket screen CANCELLED (B): %d staged item(s) dropped, basket cleared, nothing sold -> Nook's vanilla sell-cancel row\n", had);
+        return 0;
+    }
+    s_confirmed = 0;
     pc_sell_ui_pockets(pockets, conds);
     dropped = pc_sell_basket_prune(&s_basket, pockets, conds, pc_sell_ui_sunday()); /* nothing can change while the screen is open; a defensive re-check */
     n = pc_sell_basket_selection(&s_basket, items, slots, PC_SELL_BASKET_CELLS);
@@ -158,6 +221,7 @@ int pc_sell_ui_close(void* submenu_p) {
     pc_dresser_ui_end();
     printf("[NET][SELL] basket screen CLOSED: %d item(s) mask=0x%04X advisory total %u Bells (%d dropped)%s\n", n, pc_sell_basket_mask(&s_basket), s_last_total, dropped,
            n > 0 ? " -> Nook's quote" : " -> nothing to sell");
+    pc_sell_basket_clear(&s_basket); /* the selection now lives in the vanilla Submenu list only: the basket itself is never remembered (the next open is EMPTY) */
     return n;
 }
 
@@ -173,6 +237,10 @@ int pc_sell_ui_last_count(void) {
 
 unsigned pc_sell_ui_last_total(void) {
     return s_last_total;
+}
+
+int pc_sell_ui_index_item(int idx) {
+    return pc_sell_ui_cell_item(pc_sell_table_cell(idx));
 }
 
 int pc_sell_ui_cell_item(int cell) {
@@ -269,10 +337,15 @@ const char* pc_sell_ui_notice(void) {
     return s_notice;
 }
 
+const char* pc_sell_ui_hint(void) {
+    return pc_sell_ui_active() ? "A: Add or Take Back    Sell: A on Sell or Start    B: Cancel" : NULL;
+}
+
 void pc_sell_ui_overlay_constructed(void) {
     if (s_open && s_destroyed) {
         printf("[NET][SELL] a basket that was never collected (its conversation ended) is dropped: nothing was sold, nothing changed\n");
         s_open = 0;
+        pc_sell_ui_reset("stale basket at the overlay construct");
         if (pc_dresser_ui_basket()) {
             pc_dresser_ui_end();
         }
@@ -289,8 +362,8 @@ void pc_sell_ui_overlay_destroyed(void) {
  * PC_NET_TEST_HOOKS builds, AC_TEST_HOOKS=1 + AC_TEST_SELL_BASKET=1, CLIENT role, never in normal play; every line "[NET][SELL][TEST-ONLY]". (0) once READY + synced:
  * the ONE local test write puts a fish, an insect and a peach into pockets 0..2 and a 1,000 Bells bag into pocket 3 (items already there move to free pockets),
  * the D3 upload carries it (5 s); (1) the REAL basket screen opens (m_submenu.c's test open, inventory in HANIWA_ENTRUST mode, basket mode) and the scripted pad of
- * the dresser screen (AC_TEST_DRESSER_GYROID + _STEPS, pc_pad.c) plays the real cursor / A / B: pockets 0..2 "Add to Basket", A on the bag (refused + notice), B
- * closes; (2) the selection the Nook seam would read is built by pc_sell_ui_close() and sold exactly like aNSC_pc_sell_prepare / aNSC_pc_sell_step (ONE SHOP_SELL with
+ * the dresser screen (AC_TEST_DRESSER_GYROID + _STEPS, pc_pad.c) plays the real cursor / A / B: pockets 0..2 "Add to Basket", A on the bag (refused + notice), A on
+ * the Sell button confirms (B would CANCEL: nothing to sell); (2) the selection the Nook seam would read is built by pc_sell_ui_close() and sold exactly like aNSC_pc_sell_prepare / aNSC_pc_sell_step (ONE SHOP_SELL with
  * the slot mask); the pockets / wallet must not change before APPLIED; (3) the final pockets / wallet are reported. */
 #ifdef PC_NET_TEST_HOOKS
 extern int g_pc_th_submenu_req;    /* m_submenu.c (TEST-ONLY) */
@@ -470,8 +543,8 @@ void pc_sell_ui_test_tick(void) {
             for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
                 changed |= snap[i] != (unsigned short)Now_Private->inventory.pockets[i];
             }
-            if (changed || (uint32_t)(now - t0) > 60000u) {
-                printf("[NET][SELL][TEST-ONLY] basket test (nook): pockets / wallet %s\n", changed ? "changed (the host's post-image)" : "UNCHANGED after 60 s");
+            if (changed || (uint32_t)(now - t0) > 240000u) { /* the cancel / reopen / No / reopen / Yes flow of the real test: 240 s */
+                printf("[NET][SELL][TEST-ONLY] basket test (nook): pockets / wallet %s\n", changed ? "changed (the host's post-image)" : "UNCHANGED after 240 s");
                 t0 = now;
                 stage = 24;
             }

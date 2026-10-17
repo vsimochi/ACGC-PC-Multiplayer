@@ -331,6 +331,7 @@ static int mHW_pc_dresser_debug_grid(void) {
     return v;
 }
 static Vtx mHW_pc_dresser_panel_v[4]; /* 6u / 6v: the solid panel (inner rectangle) */
+static Vtx mHW_pc_basket_button_v[4]; /* Nook bulk sell basket: the "Sell" button panel */
 extern Gfx hni_win_w13_model[];
 
 /* 6w: the window interior's flat tan = hni_nwin2_winT's env colour (215,185,155): the border pieces' inner tan, the w-layers and the panel all use it */
@@ -418,6 +419,29 @@ static void mHW_pc_dresser_frame(Gfx** gfxp) {
     gSP2Triangles(gfx++, 0, 1, 2, 0, 1, 3, 2, 0);
     gSP2Triangles(gfx++, 4, 5, 6, 0, 5, 7, 6, 0);
     gSP2Triangles(gfx++, 8, 9, 10, 0, 9, 11, 10, 0);
+    if (pc_dresser_ui_basket()) {
+        /* Nook bulk sell basket: the "Sell" button = one flat panel right of the grid (window x 2..82, y 28..92; the cursor's column 5 points at x 42), green while
+         * the basket holds something, grey (blocked) while it is empty; its label + the count / total are drawn by mHW_pc_basket_summary */
+        const int on = pc_sell_ui_can_confirm();
+        for (i = 0; i < 4; i++) {
+            Vtx* d = &mHW_pc_basket_button_v[i];
+            *d = tpl[i];
+            d->v.ob[0] = (s16)((i >= 2) ? 82 : 2);
+            d->v.ob[1] = (s16)((i & 1) ? 28 : 92);
+        }
+        gDPPipeSync(gfx++);
+        gDPSetRenderMode(gfx++, G_RM_OPA_SURF, G_RM_OPA_SURF2);
+        gDPSetCombineMode(gfx++, G_CC_PRIMITIVE, G_CC_PRIMITIVE);
+        gSPVertex(gfx++, mHW_pc_basket_button_v, 4, 0);
+        if (on) {
+            gDPSetPrimColor(gfx++, 0, 0, 150, 200, 110, 255);
+        } else {
+            gDPSetPrimColor(gfx++, 0, 0, 190, 180, 165, 255);
+        }
+        gSP2Triangles(gfx++, 0, 1, 2, 0, 1, 3, 2, 0);
+        gDPPipeSync(gfx++);
+        gDPSetRenderMode(gfx++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
+    }
     if (mHW_pc_dresser_debug_grid()) { /* 6t: RED marks = the drawn cell centres (x -106 + 22 c, y 82 / 60 / 38), through the window's own transform */
         int c, k;
         gDPPipeSync(gfx++);
@@ -588,20 +612,24 @@ static void mHW_set_message(Submenu* submenu, GAME* game, mSM_MenuInfo_c* menu_i
  * prices: the host's total is authoritative and is what Nook quotes after the close). Drawn like the gyroid's dialogue line (mHW_set_message: window x, y -> screen
  * 160 + pos_x + x, 120 - (pos_y + y)). */
 static void mHW_pc_basket_summary(Submenu* submenu, GAME* game, mSM_MenuInfo_c* menu_info) {
-    char line[3][24];
+    char line[4][24];
     u8 str[24];
-    static const f32 wy[3] = { 90.0f, 70.0f, 50.0f };
+    static const f32 wy[4] = { 90.0f, 74.0f, 58.0f, 42.0f }; /* line 0 = the button label, 1..3 = the count / the total / "Bells" */
+    const int on = pc_sell_ui_can_confirm();
     int k, n, len;
 
-    (void)pc_sell_ui_header(line[0], sizeof(line[0]), line[1], sizeof(line[1]), line[2], sizeof(line[2]));
+    memcpy(line[0], "Sell", 5);
+    (void)pc_sell_ui_header(line[1], sizeof(line[1]), line[2], sizeof(line[2]), line[3], sizeof(line[3]));
     submenu->overlay->set_char_matrix_proc(game->graph);
-    for (k = 0; k < 3; k++) {
+    for (k = 0; k < 4; k++) {
         len = (int)strlen(line[k]);
         for (n = 0; n < len && n < (int)sizeof(str); n++) {
             str[n] = (u8)line[k][n]; /* letters, digits, space and ',' only: the game's charset is ASCII for these */
         }
         if (len > 0) {
-            mFont_SetLineStrings(game, str, n, 160.0f + menu_info->position[0] + 6.0f, 120.0f - (menu_info->position[1] + wy[k]), 45, 50, 0, 255, FALSE, TRUE, 0.875f,
+            /* the label is dark on the green button, greyed while the basket is empty (the button is blocked) */
+            const int r = (k == 0 && !on) ? 120 : 45, g = (k == 0 && !on) ? 115 : 50, b = (k == 0 && !on) ? 105 : 0;
+            mFont_SetLineStrings(game, str, n, 160.0f + menu_info->position[0] + 8.0f, 120.0f - (menu_info->position[1] + wy[k]), r, g, b, 255, FALSE, TRUE, 0.875f,
                                  0.875f, mFont_MODE_POLY);
         }
     }

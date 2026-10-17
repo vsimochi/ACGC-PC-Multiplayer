@@ -32558,6 +32558,7 @@ unsigned pc_net_game_test_dresser_pad(void) {
     static int enabled = -1, step = 0;
     static unsigned seq0 = 0;
     static int released = 0;
+    static int was_active = 0; /* the screen was open since the last close (the barrier step 1024, below) */
     static uint32_t f0 = 0, f_step = 0; /* GAME FRAMES (the test window runs at a low, variable frame rate: wall-clock presses were missed) */
     int n;
     uint32_t frame;
@@ -32581,8 +32582,27 @@ unsigned pc_net_game_test_dresser_pad(void) {
         return 0;
     }
     if (!pc_dresser_ui_active()) {
+        /* step 1024 = a BARRIER (Nook bulk sell basket real test: one step list spans several opens of the screen): when the screen closes, every step still
+         * pending up to the next barrier is skipped (a spare B / a fallback press never leaks into the next open); while the screen is open a barrier waits */
+        if (was_active) {
+            int k;
+            was_active = 0;
+            for (k = step; k < n; k++) {
+                if (k_steps[k] == 1024u) {
+                    printf("[NET][DRESSER][TEST-ONLY] gyroid pad: the screen closed: steps %d..%d skipped to the barrier\n", step + 1, k + 1);
+                    step = k + 1;
+                    f_step = 0;
+                    released = 0;
+                    break;
+                }
+            }
+        }
         f0 = 0;
         return 0;
+    }
+    was_active = 1;
+    if (k_steps[step] == 1024u) {
+        return 0; /* a barrier: wait for the screen to close */
     }
     frame = (uint32_t)gamePT->frame_counter | 1u;
     if (f0 == 0) {
@@ -39971,6 +39991,7 @@ void pc_net_game_poll(void) {
     pcnetgame_mbox_client_tick(); /* mail milestone 2: stashed MAILBOX_LETTERs, and the shadow revert */
     pcnetgame_run_ts_test_hook();
     pcnetgame_run_shop_test_hook(); /* shop milestone: --shop-test-buy / --shop-test-sell (client role, default OFF) */
+    pc_sell_ui_tick(); /* Nook bulk sell basket: the staged / remembered state is cleared at a scene change or when a client's link is not READY */
     pc_sell_ui_test_tick(); /* Nook bulk sell basket: AC_TEST_SELL_BASKET (TEST-ONLY real-game basket test, client role, default OFF; pc_sell_ui.c) */
     pcnetgame_run_house_buy_test_hook(); /* guest-first town: --house-buy-test H|auto (client role, default OFF) */
     pcnetgame_run_nook_test_hook(); /* guest Nook dialogue (M4): --nook-test SPEC (client role, default OFF) */

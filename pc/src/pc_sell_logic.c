@@ -199,6 +199,20 @@ int pc_sell_basket_selection(const PCSellBasket* b, unsigned short* items, unsig
     return n;
 }
 
+int pc_sell_table_cell(int idx) {
+    int col, row;
+    if (idx < 0 || idx >= PC_SELL_TABLE_COLS * PC_SELL_BASKET_ROWS) {
+        return -1;
+    }
+    col = idx % PC_SELL_TABLE_COLS;
+    row = idx / PC_SELL_TABLE_COLS;
+    return col < PC_SELL_BASKET_COLS ? row * PC_SELL_BASKET_COLS + col : -1;
+}
+
+int pc_sell_table_is_button(int idx) {
+    return idx >= 0 && idx < PC_SELL_TABLE_COLS * PC_SELL_BASKET_ROWS && idx % PC_SELL_TABLE_COLS == PC_SELL_BUTTON_COL;
+}
+
 /* ---------------- native selftest ---------------- */
 #define PC_SELL_I1(cat, idx) ((unsigned)(0x2000u | ((unsigned)(cat) << 8) | (unsigned)(idx)))
 
@@ -322,6 +336,25 @@ int pc_sell_logic_selftest(void) {
     SELL_CHECK(pc_sell_basket_prune(&b, pockets, conds, 1) == 2 && pc_sell_basket_count(&b) == 1 && pc_sell_basket_cell_of(&b, 2) == 0); /* + Sunday drops the turnips */
     conds[2] = PC_SELL_COND_QUEST;
     SELL_CHECK(pc_sell_basket_prune(&b, pockets, conds, 0) == 1 && pc_sell_basket_count(&b) == 0);
+    /* the cursor table: 6 x 3, columns 0..4 = the 15 cells in row order, column 5 (every row) = the Sell button, nothing outside */
+    {
+        int seen[PC_SELL_BASKET_CELLS], buttons = 0;
+        memset(seen, 0, sizeof(seen));
+        for (i = 0; i < PC_SELL_TABLE_COLS * PC_SELL_BASKET_ROWS; i++) {
+            const int c = pc_sell_table_cell(i);
+            SELL_CHECK((c < 0) == (pc_sell_table_is_button(i) != 0));
+            if (c >= 0 && c < PC_SELL_BASKET_CELLS) {
+                seen[c]++;
+            }
+            buttons += pc_sell_table_is_button(i);
+        }
+        for (i = 0; i < PC_SELL_BASKET_CELLS; i++) {
+            SELL_CHECK(seen[i] == 1);
+        }
+        SELL_CHECK(buttons == PC_SELL_BASKET_ROWS && pc_sell_table_cell(0) == 0 && pc_sell_table_cell(4) == 4 && pc_sell_table_cell(6) == 5 && pc_sell_table_cell(16) == 14);
+        SELL_CHECK(pc_sell_table_is_button(5) && pc_sell_table_is_button(11) && pc_sell_table_is_button(17) && !pc_sell_table_is_button(4) && !pc_sell_table_is_button(23));
+        SELL_CHECK(pc_sell_table_cell(-1) == -1 && pc_sell_table_cell(18) == -1 && pc_sell_table_cell(26) == -1 && !pc_sell_table_is_button(-1));
+    }
     printf("[SELL] selftest: %s (%d refusal cases, %d failures)\n", fail == 0 ? "PASS" : "FAIL", n, fail);
 #undef SELL_CHECK
     return fail == 0 ? 0 : 1;

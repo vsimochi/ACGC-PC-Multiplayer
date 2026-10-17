@@ -36,6 +36,7 @@ extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with 
 #include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest copy for a guest, else now_home's; NULL-guarded) */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: the "Place" tag (mTG_TYPE_76 on PC) and the leaf-drop policy */
 #include "pc_sell_ui.h" /* Nook bulk sell basket: the basket mode of the dresser screen (5 x 3 grid, Add to Basket / Take Back, refusal notice) */
+#include "pc_sell_logic.h" /* Nook bulk sell basket: PC_SELL_TABLE_COLS / PC_SELL_BASKET_COLS (the cursor table with the Sell button column) */
 #define mTG_MAILBOX() pc_ui_mailbox()
 #define mTG_MAILBOX_USABLE() pc_ui_mailbox_usable()
 #else
@@ -176,9 +177,11 @@ static mTG_tag_data_table_c mTG_table_data[] = {
 static s16 mTG_pc_dresser_col_pos[9] = { -106, -84, -62, -40, -18, 4, 26, 48, 70 };
 static s16 mTG_pc_dresser_line_pos[3] = { 82, 60, 38 }; /* = pc_dresser_layout_row_y(): the enlarged window's inner rectangle y 26..94 */
 static mTG_tag_data_table_c mTG_pc_dresser_table = { 9, 3, mTG_pc_dresser_col_pos, mTG_pc_dresser_line_pos };
-/* Nook bulk sell basket: the SAME window / rows, a 5 x 3 grid in the LEFT five columns (one cell per pocket); the right part of the window shows the count / total
- * (m_haniwa_ovl.c mHW_pc_basket_summary) */
-static mTG_tag_data_table_c mTG_pc_basket_table = { 5, 3, mTG_pc_dresser_col_pos, mTG_pc_dresser_line_pos };
+/* Nook bulk sell basket: the SAME window / rows, a 5 x 3 grid in the LEFT five columns (one cell per pocket); the right part of the window is the "Sell" button
+ * with the count / total (m_haniwa_ovl.c mHW_pc_basket_summary): cursor column 5 (PC_SELL_BUTTON_COL, every row) = the button (x 42 = the button panel's centre).
+ * Table index = col + row * 6; pc_sell_ui_table_cell() maps it to the basket cell. */
+static s16 mTG_pc_basket_col_pos[PC_SELL_TABLE_COLS] = { -106, -84, -62, -40, -18, 42 };
+static mTG_tag_data_table_c mTG_pc_basket_table = { PC_SELL_TABLE_COLS, 3, mTG_pc_basket_col_pos, mTG_pc_dresser_line_pos };
 
 static mTG_tag_data_table_c* mTG_pc_table(int table) {
     if (table == mTG_TABLE_HANIWA && pc_dresser_ui_basket()) {
@@ -7029,12 +7032,15 @@ static int mTG_move_cursol_between_table_haniwa(mTG_tag_c* tag, u32 trigger) {
      * nearest column by position; left / right stop at the grid edge (one page: no paging) */
     if (pc_dresser_ui_active()) {
         static const s16 pocket_x[5] = { -77, -53, -29, -5, 19 }; /* mTG_item_col_pos */
+        const s16* grid_x = mTG_pc_table(mTG_TABLE_HANIWA)->col_pos; /* the dresser's 9 columns / the basket's 5 + the Sell button */
+        /* up from the pockets lands on a grid column (never on the basket's Sell button: it is reached with right from column 4) */
+        const int up_cols = pc_dresser_ui_basket() ? PC_SELL_BASKET_COLS : mTG_pc_table(mTG_TABLE_HANIWA)->col_num;
         int i;
         int best = 0;
 
         if ((trigger & BUTTON_CDOWN) != 0 && tag->table == mTG_TABLE_HANIWA) {
             for (i = 1; i < 5; i++) {
-                if (ABS(pocket_x[i] - mTG_pc_dresser_col_pos[tag->tag_col]) < ABS(pocket_x[best] - mTG_pc_dresser_col_pos[tag->tag_col])) {
+                if (ABS(pocket_x[i] - grid_x[tag->tag_col]) < ABS(pocket_x[best] - grid_x[tag->tag_col])) {
                     best = i;
                 }
             }
@@ -7044,8 +7050,8 @@ static int mTG_move_cursol_between_table_haniwa(mTG_tag_c* tag, u32 trigger) {
             return TRUE;
         }
         if ((trigger & BUTTON_CUP) != 0 && tag->table == mTG_TABLE_ITEM) {
-            for (i = 1; i < mTG_pc_table(mTG_TABLE_HANIWA)->col_num; i++) { /* 9 dresser columns, 5 basket columns */
-                if (ABS(mTG_pc_dresser_col_pos[i] - pocket_x[tag->tag_col]) < ABS(mTG_pc_dresser_col_pos[best] - pocket_x[tag->tag_col])) {
+            for (i = 1; i < up_cols; i++) { /* 9 dresser columns, 5 basket columns */
+                if (ABS(grid_x[i] - pocket_x[tag->tag_col]) < ABS(grid_x[best] - pocket_x[tag->tag_col])) {
                     best = i;
                 }
             }
@@ -8495,6 +8501,18 @@ static void mTG_move_base(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
     /* dresser mode: L / R do nothing (one page; vanilla L = catch into the hand, R = change window: neither applies to the dresser grid) */
     if (pc_dresser_ui_active() && menu_info->menu_type == mSM_OVL_HANIWA && (trigger & (BUTTON_B | BUTTON_START | BUTTON_Y | BUTTON_A)) == 0 &&
         (trigger & (BUTTON_L | BUTTON_R)) != 0) {
+        return;
+    }
+    /* Nook bulk sell basket: A on the "Sell" button (cursor column 5) or Start (Enter) = CONFIRM: the screen closes through the SAME path as B (mTG_move_cancel)
+     * but marked confirmed, so Nook quotes the basket; an empty basket blocks it (notice + the refusal sound). B / Y stay CANCEL (pc_sell_ui_close: basket cleared). */
+    if (pc_dresser_ui_basket() && (trigger & BUTTON_B) == 0 &&
+        ((trigger & BUTTON_START) != 0 || ((trigger & BUTTON_A) != 0 && tag->table == mTG_TABLE_HANIWA && pc_sell_ui_table_is_button(mTG_get_table_idx(tag))))) {
+        pc_dresser_ui_note_input();
+        if (pc_sell_ui_confirm()) {
+            mTG_move_cancel(submenu, menu_info, tag); /* the screen's own close (its sound included) */
+        } else {
+            sAdo_SysTrgStart(MONO(NA_SE_A));
+        }
         return;
     }
 #endif

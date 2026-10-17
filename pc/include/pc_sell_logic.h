@@ -20,6 +20,10 @@ extern "C" {
 #define PC_SELL_BASKET_CELLS 15 /* one cell per pocket slot (mPr_POCKETS_SLOT_COUNT): every pocket can be sold at once */
 #define PC_SELL_BASKET_COLS 5   /* the basket grid on screen: 5 x 3, like the pockets */
 #define PC_SELL_BASKET_ROWS 3
+/* the CURSOR table of the basket screen (m_tag_ovl.c mTG_pc_basket_table): the 5 basket columns + one more column = the "Sell" button (every row of column 5 is
+ * the button, drawn as one tall panel right of the grid). Table index = col + row * PC_SELL_TABLE_COLS; pc_sell_table_cell() maps it to the basket cell. */
+#define PC_SELL_TABLE_COLS 6
+#define PC_SELL_BUTTON_COL 5
 #define PC_SELL_RATIO 4         /* == SELL_BUY_RATIO (include/ac_npc_shop_common.h) == PC_NETGAME_SHOP_SELL_RATIO */
 
 /* the pocket condition values (== mPr_ITEM_COND_*, include/m_private.h; pinned by a static assert in pc_sell_ui.c) */
@@ -66,6 +70,9 @@ unsigned pc_sell_basket_mask(const PCSellBasket* b);            /* bit i = pocke
 int  pc_sell_basket_prune(PCSellBasket* b, const unsigned short* pockets, const int* conds, int is_sunday);
 /* the selection the Nook dialogue reads (the vanilla Submenu item list): the basket's (item, slot) pairs in CELL order, compacted; returns the count */
 int  pc_sell_basket_selection(const PCSellBasket* b, unsigned short* items, unsigned char* slots, int cap);
+/* the cursor table of the basket screen: table index -> basket cell 0..14 (-1 = the Sell button or outside the 6 x 3 table) / 1 = that index is the Sell button */
+int  pc_sell_table_cell(int idx);
+int  pc_sell_table_is_button(int idx);
 
 /* the native selftest: 0 = PASS (prints "[SELL] selftest: PASS") */
 int pc_sell_logic_selftest(void);

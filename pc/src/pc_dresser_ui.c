@@ -98,7 +98,7 @@ int pc_dresser_ui_col(int kind, int index) {
 int pc_dresser_ui_slot_item(int col) {
     int index = 0;
     if (s_basket) {
-        return s_active ? pc_sell_ui_cell_item(col) : 0; /* the staged pocket of that basket cell (0 = empty cell / beyond the 15 cells) */
+        return s_active ? pc_sell_ui_index_item(col) : 0; /* `col` = the 6 x 3 cursor table index: the staged pocket of that basket cell (0 = empty / the Sell button / beyond) */
     }
     return pc_dresser_ui_slot(col, &index) == PC_DRESSER_UI_SLOT_EXTRA ? pc_net_game_dresser_item(index) : 0;
 }
@@ -157,7 +157,7 @@ int pc_dresser_ui_take(int col) {
     int index = 0, item, pocket;
     char what[96];
     if (s_basket) {
-        return s_active ? pc_sell_ui_take(col) : PC_DRESSER_UI_ACT_REFUSED; /* "Take back": local staging only */
+        return s_active ? pc_sell_ui_take(pc_sell_ui_table_cell(col)) : PC_DRESSER_UI_ACT_REFUSED; /* "Take back": local staging only (cursor table index -> cell) */
     }
     if (!s_active || s_pending || pc_dresser_ui_slot(col, &index) != PC_DRESSER_UI_SLOT_EXTRA || (item = pc_net_game_dresser_item(index)) == 0) {
         return PC_DRESSER_UI_ACT_REFUSED;

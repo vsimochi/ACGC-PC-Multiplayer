@@ -3086,6 +3086,9 @@ static void aNSC_request_Q_end_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
     ACTOR* actorx = (ACTOR*)shop_common;
     if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == FALSE && mDemo_Check(mDemo_TYPE_TALK, actorx) == FALSE) {
         shop_common->sell_item = EMPTY_NO;
+#ifdef TARGET_PC
+        pc_sell_ui_reset("the conversation ended"); /* Nook bulk sell basket: nothing survives the talk */
+#endif
         aNSC_setupAction(shop_common, play, aNSC_ACTION_WAIT);
     }
 }
@@ -3168,6 +3171,12 @@ static void aNSC_msg_win_open_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
         } else {
             msg_no = aNSC_get_msg_no(msg_no_table[action]);
         }
+#ifdef TARGET_PC
+        if (action == aNSC_CHECK_BUY_NONE_SELECTED && pc_sell_ui_enabled()) {
+            /* Nook bulk sell basket: B (or an empty basket) = the vanilla cancel of the sell picker: aNSC_MSG_SELL_CANCEL, then his "anything else?" choice */
+            printf("[NET][SELL] nook dialogue: nothing selected (the basket was cancelled) -> the vanilla sell-cancel row 0x%04X\n", msg_no);
+        }
+#endif
         aNSC_Set_continue_msg_num(msg_p, shop_common, msg_no);
         mMsg_Set_ForceNext(msg_p);
         aNSC_setupAction(shop_common, play, next_act_idx[action]);
@@ -3227,8 +3236,10 @@ static void aNSC_buy_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) 
 #endif
 #ifdef TARGET_PC
     if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET) && mMsg_Check_MainNormalContinue(msg_p) &&
-        mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE1) {
-        pc_sell_ui_keep_next(); /* Nook bulk sell basket: "No." -> "anything else?"; the basket keeps its contents if the player opens it again */
+        (mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE0 || mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE1)) {
+        /* Nook bulk sell basket: Yes. (the sale reads the vanilla Submenu selection, not the basket) or No. (the vanilla sell-cancel row + "anything else?"):
+         * nothing of the basket is remembered either way (the next open is EMPTY) */
+        pc_sell_ui_reset(mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE0 ? "Nook's quote: Yes" : "Nook's quote: No");
     }
     if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET)) {
         num = n2; /* the basket quote is read exactly like the vanilla multi-item offer (aNSC_MSG_BUY_MANY_OFFER) */

@@ -378,9 +378,14 @@ void pc_net_notice_draw(struct game_s* game) {
         /* Nook bulk sell basket: why a pocket item cannot go into the basket ("Nook won't buy that"), ~3 s (drawn in addition to the other notices). At the BOTTOM of
          * the screen: the top lines would cross the basket window (real-run screenshot sell_basket_open.png). */
         const char* sell_line = pc_sell_ui_notice();
+        const char* sell_hint = pc_sell_ui_hint(); /* the controls line while the basket screen is open; a notice takes its place for ~3 s */
         if (sell_line != NULL) {
             mFont_SetMatrix(game->graph, mFont_MODE_FONT);
             pc_menu_draw_centered(game, sell_line, 216.0f, 255, 200, 90, 255, 1.0f);
+            mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+        } else if (sell_hint != NULL) {
+            mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+            pc_menu_draw_centered(game, sell_hint, 218.0f, 255, 255, 255, 230, 0.75f);
             mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
         }
     }

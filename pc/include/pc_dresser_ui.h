@@ -24,7 +24,8 @@ void pc_dresser_ui_end(void);
 int  pc_dresser_ui_active(void);
 /* Nook bulk sell basket (pc_sell_ui.h): the SAME screen in BASKET mode. pc_dresser_ui_active() is 1 as well (window, cells, icons, hand, tags, the scripted test
  * pad all stay the dresser screen's); the grid is 5 x 3 (one cell per pocket), cells show the staged pockets, take / put STAGE locally (pc_sell_ui_take / _put:
- * nothing is sent, nothing changes in the pockets), staged pockets are hidden in the pocket grid, there is no Grab. begin_basket() leaves any dresser state;
+ * nothing is sent, nothing changes in the pockets), staged pockets are hidden in the pocket grid, there is no Grab. In basket mode the grid index of slot_item() /
+ * take() is the 6 x 3 CURSOR table index (column 5 = the Sell button, pc_sell_ui_table_cell). begin_basket() leaves any dresser state;
  * pc_dresser_ui_begin() / _end() leave basket mode. */
 void pc_dresser_ui_begin_basket(void);
 int  pc_dresser_ui_basket(void);

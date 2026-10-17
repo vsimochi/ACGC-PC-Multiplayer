@@ -360,8 +360,89 @@ void pc_platform_update_window_size(void) {
     if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
 }
 
+#ifdef PC_NET_TEST_HOOKS
+/* TEST-ONLY (PC_NET_TEST_HOOKS builds + AC_TEST_HOOKS=1 + AC_TEST_FRAME_DUMP=<path prefix>; never in normal play): an in-game frame grab for the real tests while
+ * the test window is covered by other windows (a PrintWindow capture then returns a stale frame). A test writes the file "<prefix>.req" holding a name; the next
+ * presented frame (the back buffer, read before the swap) is written to "<prefix>_<name>.bmp" (24-bit, bottom-up) and the request is deleted. */
+static void pc_test_frame_dump(void) {
+    static int on = -1;
+    static unsigned poll = 0;
+    static char prefix[512];
+    char req[600], name[64], out[700];
+    FILE* f;
+    if (on < 0) {
+        const char* e = pc_test_hook_getenv("AC_TEST_FRAME_DUMP");
+        on = e != NULL && e[0] != 0;
+        if (on) {
+            snprintf(prefix, sizeof(prefix), "%s", e);
+        }
+    }
+    if (!on || (++poll % 10u) != 0u) {
+        return;
+    }
+    snprintf(req, sizeof(req), "%s.req", prefix);
+    if ((f = fopen(req, "rb")) == NULL) {
+        return;
+    }
+    name[0] = 0;
+    if (fgets(name, sizeof(name), f) == NULL) {
+        name[0] = 0;
+    }
+    fclose(f);
+    remove(req);
+    {
+        size_t k;
+        for (k = 0; name[k] != 0; k++) {
+            if (!((name[k] >= 'a' && name[k] <= 'z') || (name[k] >= 'A' && name[k] <= 'Z') || (name[k] >= '0' && name[k] <= '9') || name[k] == '_')) {
+                name[k] = 0;
+                break;
+            }
+        }
+    }
+    {
+        const int w = g_pc_window_w, h = g_pc_window_h;
+        const int stride = (w * 3 + 3) & ~3;
+        unsigned char* rgba = (unsigned char*)malloc((size_t)w * (size_t)h * 4u);
+        unsigned char* row = (unsigned char*)malloc((size_t)stride);
+        if (rgba != NULL && row != NULL && w > 0 && h > 0) {
+            unsigned char hdr[54];
+            const unsigned size = 54u + (unsigned)stride * (unsigned)h;
+            int x, y;
+            glReadBuffer(GL_BACK);
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+            memset(hdr, 0, sizeof(hdr));
+            hdr[0] = 'B'; hdr[1] = 'M';
+            hdr[2] = (unsigned char)size; hdr[3] = (unsigned char)(size >> 8); hdr[4] = (unsigned char)(size >> 16); hdr[5] = (unsigned char)(size >> 24);
+            hdr[10] = 54; hdr[14] = 40;
+            hdr[18] = (unsigned char)w; hdr[19] = (unsigned char)(w >> 8); hdr[22] = (unsigned char)h; hdr[23] = (unsigned char)(h >> 8);
+            hdr[26] = 1; hdr[28] = 24;
+            snprintf(out, sizeof(out), "%s_%s.bmp", prefix, name[0] ? name : "frame");
+            if ((f = fopen(out, "wb")) != NULL) {
+                fwrite(hdr, 1, sizeof(hdr), f);
+                for (y = 0; y < h; y++) { /* glReadPixels is bottom-up = the BMP row order */
+                    memset(row, 0, (size_t)stride);
+                    for (x = 0; x < w; x++) {
+                        row[x * 3 + 0] = rgba[(y * w + x) * 4 + 2];
+                        row[x * 3 + 1] = rgba[(y * w + x) * 4 + 1];
+                        row[x * 3 + 2] = rgba[(y * w + x) * 4 + 0];
+                    }
+                    fwrite(row, 1, (size_t)stride, f);
+                }
+                fclose(f);
+                printf("[TEST-ONLY] frame dump %dx%d -> %s\n", w, h, out);
+            }
+        }
+        free(rgba);
+        free(row);
+    }
+}
+#endif
+
 void pc_platform_swap_buffers(void) {
     pc_gx_draw_pending();
+#ifdef PC_NET_TEST_HOOKS
+    pc_test_frame_dump();
+#endif
     SDL_GL_SwapWindow(g_pc_window);
 }
 
