@@ -33,6 +33,9 @@ Syntax: `command [subcommand] [arguments]`, case-insensitive command word. Failu
 | `furniture list [acre]` | furniture PLACED outdoors (docs/multiplayer-guest-roadmap.md "Outdoor furniture (C1) and the operator list"): index, tile (town units), acre, item, rotation S/E/N/W, placer kind + name, time; the safety ceilings and the Place / leaf-drop switches | no (read-only) |
 | `furniture remove <x> <z> [delete]` / `furniture remove #<index> [delete]` | removes ONE placed piece: the tile becomes empty and the item goes to the town's lost and found (police box), or is deleted with `delete` | no |
 | `furniture clear acre <n> [delete]` / `furniture clear player <name> [delete]` | removes every placed piece of an acre (0..29 = az * 5 + ax) / of a placer (by the name stored at placement) | no |
+| `say <text>` | a server announcement: every connected player sees it in the chat log as `Server: <text>` (up to 60 characters of the game font; other characters become `?`); logged `[CHAT] [server]: <text>` | no |
+| `mutes` / `mute <player>` / `unmute <player>` | the chat mute list (`servers\<id>\mutes.ini`, the same identity keys and name / `peer N` resolution as `op`; ambiguous names are refused). A muted player's lines reach nobody (they get "You are muted on this server."); an online player is told at once. `unmute` also accepts a name only the list still knows | no |
+| `chat [on\|off]` | the text chat: state + counters (relayed, dropped for rate / muted / malformed / off), or switch it for this session (every client is told at once; `settings.ini` `[Network] chat = 0\|1` sets the start value). Every line players send is logged as `[CHAT] name: text` (console + `server.log`) | no |
 | `tp ...` | **UNSUPPORTED** on the server | - |
 | `bell ...` | **UNSUPPORTED** on the server | - |
 

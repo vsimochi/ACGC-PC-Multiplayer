@@ -55,6 +55,7 @@ BOOL PADInit(void) {
 #include "pc_tool_wheel.h"
 #include "pc_net_game.h"
 #include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
+#include "pc_chat.h"             /* chat (worker CH): pc_chat_pad_block */
 
 u32 PADRead(PADStatus* status) {
     memset(status, 0, sizeof(PADStatus) * 4);
@@ -204,6 +205,13 @@ u32 PADRead(PADStatus* status) {
         if (df & 128u) stickY = (s8)STICK_MAGNITUDE; /* cursor up */
         if (df & 256u) buttons |= PAD_BUTTON_START;
         if (df & 512u) buttons |= PAD_TRIGGER_Z;
+    }
+    if (pc_chat_pad_block()) { /* chat (worker CH): the chat line is open (its letters are text), or the Enter / Esc that closed it is still held: the local pad reads neutral */
+        buttons = 0;
+        stickX = stickY = cstickX = cstickY = 0;
+        wheel_kb = wheel_pad = 0;
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
     }
     pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
 

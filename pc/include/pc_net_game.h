@@ -440,6 +440,10 @@ void pc_net_game_dedicated_npc(const char* args, void (*out)(const char*));
 int pc_net_game_observer_npc_target(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z);
 /* Monotonic wall-clock milliseconds (same source the net layer uses; never 0). Test hook timing only. */
 uint32_t pc_net_game_now_ms(void);
+/* Notice board latency (worker BB): the town notice board was just written in THIS process's save (m_notice.c mNtc_notice_write: a post, the full-board
+ * shift, an automatic notice). The next page tick scans the pages at once instead of waiting for its periodic scan (client: the write goes to the host on
+ * the next frame; host: the new revision is pushed on the next frame). Safe in every role / single player (no-op). */
+void pc_net_game_pages_dirty(void);
 /* Hotfix 0.2.1 join diagnostics: prints one "[JOIN] +<ms since transport-connect> <text>" line to stdout (visible with --verbose or settings.ini client_log = 1).
  * One-shot stage events only (plus the 2 s arrival-hold repeat): cheap. */
 void pc_net_game_join_trace(const char* fmt, ...);
@@ -510,6 +514,19 @@ int pc_net_game_client_world_synced(void);
  * (e.g. the field changed underneath the client): the request is simply sent and rejected/aborted with
  * no inventory change, exactly like any other stale/invalid pickup attempt already is. */
 int pc_net_game_request_pickup(int ut_x, int ut_z, int item);
+
+/* Full-pocket pickup (worker PK): 1 iff this process is a network CLIENT whose pockets have no EMPTY slot and `item` is NOT a money
+ * bag the wallet can take whole -- i.e. pc_net_game_request_pickup() would send nothing. The outdoor pickup check
+ * (Player_actor_CheckAndRequest_main_pickup_all, m_player_common.c_inc) then plays the vanilla "pockets full" refusal
+ * (Player_actor_Request_main_refuse_pickup_all) instead of a pickup animation that only pretends: the item stays on the ground.
+ * A client never runs the vanilla swap menu (pickup_exchange) for a shared field item and never stacks a ticket / paper into an
+ * existing stack (the host grants into a plain free slot), so the test is a plain EMPTY_NO one. 0 for single-player / host. Read-only. */
+int pc_net_game_client_pickup_no_room(int item);
+
+/* Full-pocket pickup: 1 exactly once after the host-transactional pickup of THIS client was given up because the wallet and the
+ * pockets had no room any more (the Bug 3 abort / the queued TXN cancel, reason POCKETS_FULL) within the last 3 s; the pickup
+ * animation's end (m_player_main_pickup.c_inc) then plays the vanilla "pockets full" refusal. Consumed by the call. 0 otherwise. */
+int pc_net_game_take_pickup_full_refusal(void);
 
 /* Client only: 1 iff this client is a resident (not a guest) standing in the room of its OWN player house
  * (scene is a player-house room, room number == its own homes[] index, field_type PLAYER_ROOM). The room

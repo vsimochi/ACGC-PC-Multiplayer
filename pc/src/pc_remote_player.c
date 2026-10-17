@@ -5480,6 +5480,198 @@ static void pc_puppet_aext_tilt(PCRemotePlayerActor* self, PCAextPuppet* pp, int
     }
 }
 
+/* ===== PUPPET CLOTH CHANGE BEGIN (worker CL; receiver only, no wire) =====
+ * Root cause of "other players do not see me change clothes": equipping a shirt from the inventory never puts the real player actor into
+ * mPlayer_INDEX_CHANGE_CLOTH (101). m_hand_ovl.c:532-545 / :786-800 write Now_Private->cloth and swap the texture at the drop, and
+ * m_tag_ovl.c:7991-7993 (also :5873 wear-my-design) only animate the MENU DOLL (mIV_ANIM_CHANGE = MENU_CHANGE1 @1.0 + NA_SE_WEAR,
+ * m_inventory_ovl.c:394-411 / :493-505 / :556-561). 101 is only requested by NPCs (shop try-on, needlework, Halloween), so the ACTION_EXT
+ * sender (which samples the real actor) never sees the menu change and the puppet just snapped to the new shirt (APPEARANCE).
+ * Fix: a received APPEARANCE whose clothing differs from the shown one is HELD (raw fields updated at once for relay / backfill, the render
+ * buffers keep the old shirt) and presented on the puppet:
+ *  - the owner is in 101 (its ACTION_EXT row plays MENU_CHANGE1 / ITAZURA1 with the KIGAE / wear / HALLOWEEN cues): the new shirt is
+ *    resolved when the puppet's clip crosses the vanilla texture frame (change_cloth.c_inc:109-128: 36 for MENU_CHANGE1, 18 for ITAZURA1);
+ *  - otherwise (the menu path) a synthesized clip like the menu doll: MENU_CHANGE1, frame 1, speed 1.0, STOP, morph -5, normal part table,
+ *    with the in-world change-cloth cues at frame 16 (wear sound + KIGAE, change_cloth.c_inc:93-106) and the shirt swap at frame 36 (the
+ *    vanilla texture frame; the menu itself writes Now_Private->cloth at doll frame 36, m_hand_ovl.c:533-545, so the APPEARANCE reaches us
+ *    ~36 frames after the owner's drop and this whole clip lags the owner's doll by that much). It is bound to the puppet's MOVE pair: it ends at the clip end, when the pair changes (the owner walks off /
+ *    enters another state), when any row takes over, or after a safety timeout;
+ *  - not shown / hidden / moving / no clip: the shirt is resolved at once (moving: with the puff + sound where the gates allow).
+ * The hold always ends within PC_CLOTH_HOLD_FRAMES (pc_remote_player_poll() releases an expired or actor-less hold). Env
+ * PC_PUPPET_CLOTH_ANIM=0 restores the instant swap. */
+#define PC_CLOTH_HOLD_FRAMES   150.0 /* longest delay of a new shirt (an unshown puppet / a 101 row that never came) */
+#define PC_CLOTH_MENU_CUE      16.0f /* synthesized clip: wear + KIGAE (change_cloth.c_inc:101-104) */
+#define PC_CLOTH_MENU_SWAP     36.0f /* ... and the shirt swap (change_cloth.c_inc:113-127; the menu writes Now_Private->cloth at doll frame 36 too, m_hand_ovl.c:533-545) */
+typedef struct PCClothChg {
+    int         hold;      /* 1 = slot->appearance holds a new outfit not yet resolved (pending_resolve stays set) */
+    double      deadline;  /* graph_dt_frame_time() bound of the hold */
+    int         playing;   /* the synthesized clip owns the body */
+    const void* actor;     /* the puppet the clip was bound on */
+    int         idx, ctr;  /* the MOVE pair it is bound to */
+    float       last_cur;
+    int         have_last;
+    uint32_t    held, menu_clips, state101, instant, timeouts;
+} PCClothChg;
+static PCClothChg s_cloth_chg[PC_PUPPET_ID_LIMIT];
+static uint32_t s_cloth_log_n = 0;
+static const PCAextCue s_cloth_menu_cues[2] = {
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_SND, NA_SE_WEAR, "menu_cloth_wear" },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "menu_cloth_kigae" },
+};
+
+static int pc_puppet_cloth_enabled(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("PC_PUPPET_CLOTH_ANIM");
+        s_on = (e != NULL && e[0] == '0') ? 0 : 1; /* ON by default */
+    }
+    return s_on;
+}
+
+static void pc_puppet_cloth_log(int id, const char* what, const char* why, float frame) {
+    if (s_cloth_log_n++ < 200u) { /* a rare, human-triggered event: always logged, budgeted */
+        printf("[NET][REMOTE] player %d: cloth change %s (%s) frame=%.1f\n", id, what, why, (double)frame);
+    }
+}
+
+/* Ends a hold: the new outfit is resolved into the render buffers now. */
+static void pc_puppet_cloth_release(PCRemotePlayerSlot* slot, int id, const char* why, float frame) {
+    PCClothChg* cc;
+
+    if (id < 0 || id >= PC_PUPPET_ID_LIMIT) {
+        return;
+    }
+    cc = &s_cloth_chg[id];
+    if (!cc->hold) {
+        return;
+    }
+    cc->hold = 0;
+    if (slot != NULL && slot->appearance.valid && slot->appearance.pending_resolve) {
+        pc_remote_player_apply_appearance(slot);
+    }
+    pc_puppet_cloth_log(id, "shirt swapped", why, frame);
+}
+
+/* 1 = the clothing of `a` differs from the stored raw appearance (catalog item, design flag, or the custom design pixels). */
+static int pc_puppet_cloth_differs(const PCRemotePlayerAppearance* cur, const PCNetPlayerAppearance* a) {
+    if (cur->cloth_item != a->cloth_item || (cur->is_custom_design ? 1 : 0) != (a->is_custom_design ? 1 : 0)) {
+        return 1;
+    }
+    return a->is_custom_design && memcmp(&cur->design, a->design_record, sizeof(cur->design)) != 0;
+}
+
+/* Called from pc_puppet_aext_apply() after the dynamic-row decision. Returns 1 while the synthesized menu clip owns the body clips. */
+static int pc_puppet_cloth_step(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, PCAextPuppet* pp, int valid, int idx,
+                                int ctr, double now) {
+    PCRemotePlayerVisual* v = &self->visual;
+    int id = (int)self->peer;
+    PCClothChg* cc = &s_cloth_chg[id];
+    float cur = v->keyframe0.frame_control.current_frame;
+
+    if (cc->actor != (const void*)self) { /* a (re)created puppet: nothing of a clip on the old actor is bound here */
+        cc->actor = (const void*)self;
+        cc->playing = 0;
+    }
+    if (cc->playing) {
+        int ended = cur >= v->keyframe0.frame_control.end_frame - 0.01f;
+        int stop = ended || pp->v.on || v->row_active || !valid || idx != cc->idx || ctr != cc->ctr || slot->snap_req ||
+                   now > cc->deadline + 120.0 || now < cc->deadline - PC_CLOTH_HOLD_FRAMES - 1.0;
+
+        if (!stop) {
+            if (cc->have_last && pc_puppet_frame_crossed(cc->last_cur, cur, v->keyframe0.frame_control.max_frames, PC_CLOTH_MENU_CUE)) {
+                pc_puppet_aext_snd(self, slot, game, &s_cloth_menu_cues[0], cur);
+                pc_puppet_aext_fx(self, slot, game, &s_cloth_menu_cues[1], cur);
+            }
+            if (cc->have_last && cc->hold && pc_puppet_frame_crossed(cc->last_cur, cur, v->keyframe0.frame_control.max_frames, PC_CLOTH_MENU_SWAP)) {
+                pc_puppet_cloth_release(slot, id, "menu_clip", cur);
+            }
+            cc->last_cur = cur;
+            cc->have_last = 1;
+            return 1;
+        }
+        cc->playing = 0;
+        if (!pp->v.on && !v->row_active) { /* same release rebind as an ACTION_EXT end */
+            v->current_anim_idx = -1;
+            v->current_anim1_idx = -1;
+            v->current_part_table = -1;
+            v->keyframe0.animation_enabled = 0;
+            v->rebind_from_row = 1;
+        }
+        if (pc_remote_player_puppet_diag()) {
+            printf("[NET][PUPPET][DIAG] player %d cloth_menu end (%s) frame=%.1f pair %d/%d\n", id, ended ? "clip_end" : "interrupted",
+                   (double)cur, idx, ctr);
+        }
+        pc_puppet_cloth_release(slot, id, ended ? "menu_clip_end" : "menu_clip_interrupted", cur);
+        return 0;
+    }
+    if (!cc->hold) {
+        return 0;
+    }
+    if (now > cc->deadline || now < cc->deadline - PC_CLOTH_HOLD_FRAMES - 1.0 || !slot->resolved_appearance.ready) {
+        cc->timeouts++;
+        pc_puppet_cloth_release(slot, id, "timeout", cur);
+        return 0;
+    }
+    if (pp->v.on && (int)pp->cur.main_index == mPlayer_INDEX_CHANGE_CLOTH) {
+        /* the owner's real 101 row: swap at the vanilla texture frame of its clip */
+        float swap = ((int)pp->cur.anim0 == mPlayer_ANIM_ITAZURA1) ? 18.0f : 36.0f;
+        if (cur + 0.5f >= swap || cur >= v->keyframe0.frame_control.end_frame - 0.01f) {
+            cc->state101++;
+            pc_puppet_cloth_release(slot, id, "state101", cur);
+        }
+        return 0;
+    }
+    {
+        int newest_idx = -1;
+        if (slot->snapshot_count > 0) {
+            const PCRemoteMoveSnapshot* s =
+                &slot->snapshots[(slot->snapshot_head + PC_REMOTE_PLAYER_SNAPSHOT_COUNT - 1) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+            newest_idx = s->action_valid ? (int)s->action_index : -1;
+        }
+        if ((valid && idx == mPlayer_INDEX_CHANGE_CLOTH) || newest_idx == mPlayer_INDEX_CHANGE_CLOTH) {
+            return 0; /* the owner is (about to be shown) in 101: its ACTION_EXT row presents the change (bounded by the deadline) */
+        }
+    }
+    {
+        GAME_PLAY* play = (GAME_PLAY*)game;
+        int shown = pc_remote_player_scene_is_local_shown(slot, play) && !slot->snap_req && slot->snapshot_count > 0 &&
+                    !pc_remote_player_body_hidden(self) && v->initialized;
+        int standing = self->cosmetic_move_state == PC_MOVE_STATE_IDLE || self->cosmetic_move_state == PC_MOVE_STATE_OTHER;
+
+        if (!shown) {
+            cc->instant++;
+            pc_puppet_cloth_release(slot, id, "not_shown", cur);
+            return 0;
+        }
+        if (!standing || !valid || v->row_active || pp->v.on || mPlib_Get_Pointer_Animation(mPlayer_ANIM_MENU_CHANGE1) == NULL) {
+            cc->instant++;
+            pc_puppet_aext_snd(self, slot, game, &s_cloth_menu_cues[0], cur);
+            pc_puppet_aext_fx(self, slot, game, &s_cloth_menu_cues[1], cur);
+            pc_puppet_cloth_release(slot, id, standing ? "busy" : "moving", cur);
+            return 0;
+        }
+        /* the menu doll's clip (m_inventory_ovl.c:394-400: MENU_CHANGE1, frame 1, speed 1.0, STOP) on the puppet */
+        pc_remote_player_bind_body(v, mPlayer_ANIM_MENU_CHANGE1, mPlayer_ANIM_MENU_CHANGE1, 1.0f, 1.0f, cKF_FRAMECONTROL_STOP, PC_FALLBACK_MORPH, 0);
+        if (v->current_part_table != mPlayer_PART_TABLE_NORMAL) {
+            mPlib_DMA_player_Part_Table(v->part_table, mPlayer_PART_TABLE_NORMAL);
+            v->current_part_table = mPlayer_PART_TABLE_NORMAL;
+        }
+        cc->playing = 1;
+        cc->idx = idx;
+        cc->ctr = ctr;
+        cc->have_last = 0;
+        cc->last_cur = 1.0f;
+        cc->menu_clips++;
+        if (pc_remote_player_puppet_diag()) {
+            printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=cloth_menu anim0=%d anim1=%d part_table=%d mode=stop "
+                   "speed=1.00 frame=1\n",
+                   id, idx, ctr, (int)mPlayer_ANIM_MENU_CHANGE1, (int)mPlayer_ANIM_MENU_CHANGE1, (int)mPlayer_PART_TABLE_NORMAL);
+        }
+        pc_puppet_cloth_log(id, "menu clip started", "menu", 1.0f);
+        return 1;
+    }
+}
+/* ===== PUPPET CLOTH CHANGE END ===== */
+
 /* Called from pc_remote_player_mv after pc_remote_player_row_pre. Returns 1 while the dynamic row owns the body clips this frame. */
 static int pc_puppet_aext_apply(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now) {
     PCRemotePlayerVisual* v = &self->visual;
@@ -5501,6 +5693,7 @@ static int pc_puppet_aext_apply(PCRemotePlayerActor* self, PCRemotePlayerSlot* s
         pp->tilt_on = 0;
     }
     if (slot->snapshot_count == 0 || slot->snap_req) {
+        s_cloth_chg[(int)self->peer].playing = 0; /* CL: a scene snap drops the synthesized cloth clip (the fallback rebinds; the hold expires) */
         pc_puppet_aext_tilt(self, pp, 0, -1);
         return 0; /* no fresh MOVE pair yet (same rule as the static rows) */
     }
@@ -5585,6 +5778,9 @@ static int pc_puppet_aext_apply(PCRemotePlayerActor* self, PCRemotePlayerSlot* s
         pc_puppet_aext_cues(self, slot, game, pp, 0);
     }
     pc_puppet_aext_tilt(self, pp, valid, idx);
+    if (pc_puppet_cloth_enabled() && pc_puppet_cloth_step(self, slot, game, pp, valid, idx, ctr, now)) {
+        return 1; /* PUPPET CLOTH CHANGE (CL): the synthesized menu change clip owns the body clips */
+    }
     return pp->v.on;
 }
 
@@ -6652,10 +6848,18 @@ int pc_remote_player_on_action(PCNetPlayerId player_id, int kind, int ut_x, int 
 
 void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAppearance* appearance) {
     PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
+    PCClothChg* cc;
+    int cloth_new;
 
     if (slot == NULL || appearance == NULL) {
         return;
     }
+    /* PUPPET CLOTH CHANGE (CL): a clothing change of a shown outfit is held for the puppet's change animation (see the block above) */
+    cc = ((int)player_id >= 0 && (int)player_id < PC_PUPPET_ID_LIMIT) ? &s_cloth_chg[(int)player_id] : NULL;
+    if (cc != NULL && !slot->appearance.valid) {
+        cc->hold = 0; /* a new occupant of this id: its first appearance is never animated */
+    }
+    cloth_new = slot->appearance.valid && slot->resolved_appearance.ready && pc_puppet_cloth_differs(&slot->appearance, appearance);
 
     /* Deliberately no `slot->in_use` gate here, matching pc_remote_player_on_move()'s own
      * lazy-discovery pattern above: appearance is tracked independently of the handshake/movement
@@ -6681,7 +6885,16 @@ void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAp
      * doc comment. */
     slot->appearance.pending_resolve = 1;
 
-    pc_remote_player_apply_appearance(slot);
+    if (cc != NULL && cloth_new && !cc->hold && pc_puppet_cloth_enabled() && gamePT != NULL && gamePT->exec == play_main &&
+        slot->in_use && slot->actor != NULL) {
+        cc->hold = 1;
+        cc->deadline = graph_dt_frame_time(gamePT) + PC_CLOTH_HOLD_FRAMES;
+        cc->held++;
+        pc_puppet_cloth_log((int)player_id, "held for the change animation", "appearance", 0.0f);
+    }
+    if (cc == NULL || !cc->hold) {
+        pc_remote_player_apply_appearance(slot);
+    } /* else: resolved by pc_puppet_cloth_step() at the change frame, or by pc_remote_player_poll() when the hold expires */
 
     printf("[NET][REMOTE][DIAG] player %d: appearance received (gender=%d face=%d sunburn=%d cloth_item=%d %s)\n",
            (int)player_id, (int)appearance->gender, (int)appearance->face, (int)slot->appearance.sunburn_rank,
@@ -7032,6 +7245,19 @@ int pc_remote_player_puppet_state(PCNetPlayerId player_id) {
     return pc_remote_player_actor_is_live(slot) ? 2 : 1;
 }
 
+/* ===== CHAT (worker CH) BEGIN: the drawn (interpolated) world position of a live puppet, for the speech bubble above it. Read-only. ===== */
+int pc_remote_player_get_draw_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    if (slot == NULL || !slot->in_use || !pc_remote_player_actor_is_live(slot) || (uint64_t)(uintptr_t)slot->actor >= PC_LOWADDR_LIMIT) {
+        return 0;
+    }
+    *out_x = slot->actor->world.position.x;
+    *out_y = slot->actor->world.position.y;
+    *out_z = slot->actor->world.position.z;
+    return 1;
+}
+/* ===== CHAT (worker CH) END ===== */
+
 /* Stage 5A: see the doc comment in pc_remote_player.h. Reads the NEWEST entry of the same
  * snapshot ring pc_remote_player_interpolate() already consumes for rendering -- `snapshot_head`
  * is "the index the NEXT snapshot will be written to" (see its own field doc above), so the most
@@ -7162,7 +7388,14 @@ void pc_remote_player_poll(void) {
          * `ready` may still be 1 from an earlier, unrelated successful resolution. gamePT is
          * already confirmed non-NULL by this function's own check above, so this call is
          * guaranteed to actually resolve (and clear pending_resolve) rather than defer again. */
-        if (slot->appearance.valid && slot->appearance.pending_resolve) {
+        if (i >= 0 && i < PC_PUPPET_ID_LIMIT && s_cloth_chg[i].hold) { /* PUPPET CLOTH CHANGE (CL): an expired / actor-less hold resolves now */
+            double t = graph_dt_frame_time(gamePT);
+            if (slot->actor == NULL || !slot->in_use || t > s_cloth_chg[i].deadline || t < s_cloth_chg[i].deadline - PC_CLOTH_HOLD_FRAMES - 1.0) {
+                s_cloth_chg[i].timeouts++;
+                pc_puppet_cloth_release(slot, i, slot->actor == NULL ? "no_actor" : "timeout", 0.0f);
+            }
+        }
+        if (slot->appearance.valid && slot->appearance.pending_resolve && !(i >= 0 && i < PC_PUPPET_ID_LIMIT && s_cloth_chg[i].hold)) {
             pc_remote_player_apply_appearance(slot);
         }
 

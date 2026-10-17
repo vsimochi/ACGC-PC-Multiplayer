@@ -296,6 +296,24 @@ static int aPOL2_ts_waiting = FALSE;
 static mActor_name_t aPOL2_ts_item = EMPTY_NO;
 static int aPOL2_ts_idx = -1;
 static int aPOL2_ts_slot = -1;
+
+/* Multi-claim fix: the lost-and-found slot to claim. The host verifies (slot, expected item) and compacts its list after every claim when
+ * its own player is not in the police box, so the slot the player pointed at may hold another item by the time "yes" is chosen (the
+ * mirror of an earlier claim / another player's claim arrived meanwhile). The same item value elsewhere in the CURRENT mirror is the same
+ * claim (identical items are interchangeable); if it is gone, the pointed slot is sent and the host refuses it (NOT_AVAILABLE -> 0x0781). */
+static int aPOL2_pc_locate_claim(int idx, mActor_name_t item) {
+    int i;
+
+    if (idx >= 0 && idx < mPB_POLICE_BOX_ITEM_STORAGE_COUNT && Save_Get(police_box).keep_items[idx] == item) {
+        return idx;
+    }
+    for (i = 0; i < mPB_POLICE_BOX_ITEM_STORAGE_COUNT; i++) {
+        if (Save_Get(police_box).keep_items[i] == item) {
+            return i;
+        }
+    }
+    return idx;
+}
 #endif
 
 static void aPOL2_message_ctrl(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
@@ -465,6 +483,21 @@ static void aPOL2_turn(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
 static void aPOL2_check_answer(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
     mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
 
+#ifdef TARGET_PC
+    /* Multi-claim fix (belt and braces behind the message lock below): a claim still pending while the window is no longer at its continue
+     * point is resolved here, and the officer always returns to TALK_END_WAIT -> WAIT, so the NEXT item can be claimed in the same visit. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && aPOL2_ts_waiting && mMsg_Check_MainNormalContinue(msg_p) != TRUE) {
+        if (pc_net_game_ts_poll() == PC_NETGAME_TS_OP_PENDING) {
+            return;
+        }
+        aPOL2_ts_waiting = FALSE;
+        mMsg_Unset_LockContinue(msg_p);
+        actor->item_idx = -1;
+        aPOL2_setupAction(actor, aPOL2_ACT_TALK_END_WAIT);
+        return;
+    }
+#endif
+
     if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
         switch (mChoice_GET_CHOSENUM()) {
             case mChoice_CHOICE0: {
@@ -491,20 +524,29 @@ static void aPOL2_check_answer(NPC_POLICE2_ACTOR* actor, GAME_PLAY* play) {
                             int ts_begin;
 
                             aPOL2_ts_slot = free_slot;
+                            aPOL2_ts_idx = aPOL2_pc_locate_claim(aPOL2_ts_idx, aPOL2_ts_item);
                             ts_begin = pc_net_game_ts_begin_police_claim(free_slot, aPOL2_ts_idx, (int)aPOL2_ts_item);
                             if (ts_begin < 0) {
-                                return; /* another pocket transaction is unresolved: ask again next frame */
+                                mMsg_Set_LockContinue(msg_p); /* another pocket transaction is unresolved: ask again next frame, the message waits */
+                                return;
                             }
                             aPOL2_ts_waiting = (ts_begin > 0) ? TRUE : FALSE;
+                            if (aPOL2_ts_waiting) {
+                                /* Multi-claim fix: hold the message at its continue point until the host answers. Without the lock the
+                                 * window ran on to the next message while the claim was pending, this state never saw the continue point
+                                 * again and the officer stayed in CHECK_ANSWER (no more claims until the building was re-entered). */
+                                mMsg_Set_LockContinue(msg_p);
+                            }
                         }
                     }
                     if (aPOL2_ts_waiting) {
                         ts_res = pc_net_game_ts_poll();
                         if (ts_res == PC_NETGAME_TS_OP_PENDING) {
-                            return; /* waiting for the host: no state change, no stuck UI */
+                            return; /* waiting for the host: no state change, the message stays locked */
                         }
                         aPOL2_ts_waiting = FALSE;
                     }
+                    mMsg_Unset_LockContinue(msg_p);
                     if (ts_res == PC_NETGAME_TS_OP_APPLIED) {
                         claimed_remote = TRUE;
                         idx = 0; /* not -1: take the "here you go" branch below (the pocket is already filled by the host post-image) */

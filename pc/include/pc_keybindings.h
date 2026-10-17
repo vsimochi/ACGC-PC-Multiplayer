@@ -58,6 +58,9 @@ typedef struct {
 
     /* PC radial tool wheel: hold to open (mouse selects), release to equip */
     PCInputCode wheel;
+
+    /* multiplayer chat: press to open the chat line (pc_chat_ui.c; free play only) */
+    PCInputCode chat;
 } PCKeybindings;
 
 /* Gamepad button bindings. Sticks are hardwired to the analog sticks

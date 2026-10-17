@@ -67,6 +67,8 @@ GUARDS = {
     ("pc_net_game.c", "pcnetgame_run_bug_catch_test_trigger_client"): "pcnetgame_is_real_player_actor(local) right after the read (now exec-gated)",
     ("pc_net_game.c", "pcnetgame_run_bug_despawn_label_race_diag"): "pcnetgame_is_real_player_actor(local) right after the read (now exec-gated)",
     ("pc_net_game.c", "pc_net_game_poll"): "explicit gamePT->exec == play_main in the movement-send condition (+ is_real_player_actor)",
+    ("pc_chat_ui.c", "pc_chat_can_open"): "text chat: returns 0 unless gamePT != NULL && gamePT->exec == play_main (first condition) before the read",
+    ("pc_chat_ui.c", "chat_speaker_anchor"): "text chat: only called from chat_draw_bubbles, which returns unless game == gamePT && exec == play_main; the read is NULL-checked",
     ("pc_remote_player.c", "pc_remote_player_poll"): "entry gate: gamePT == NULL || gamePT->exec != play_main -> return",
     # Sites that already existed at HEAD 1c67a1a (or earlier working-tree milestones) but were never listed (this audit failed on the clean baseline). Each was reviewed:
     # (a) pc_m_card.c: the title / Rover scene helpers all begin with `gamePT == NULL || gamePT->exec != play_main` -> return (A7 below verifies it textually).

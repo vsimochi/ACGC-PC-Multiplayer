@@ -82,6 +82,7 @@ Keyboard bindings are customizable via `keybindings.ini` (next to the executable
 | Q / E | L / R triggers |
 | Z | Z trigger |
 | I / J / K / L | D-pad (up/left/down/right) |
+| T | Multiplayer chat: type a line (up to 60 characters), Enter sends it (a speech bubble above you + the chat log), Esc cancels (`Chat` in keybindings.ini) |
 
 ### Gamepad
 

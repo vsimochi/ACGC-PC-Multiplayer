@@ -289,6 +289,15 @@ static void Player_actor_request_proc_index_fromPickup(ACTOR* actorx, GAME* game
         } else {
             Player_actor_SettleRequestMainIndexPriority(actorx);
 
+#ifdef TARGET_PC
+            /* Full-pocket pickup: the host-transactional pickup of this client was given up because nothing had room any more
+             * (pc_net_game.c: the item stays on the ground): end in the vanilla 'pockets full' refusal, not a silent pretend. */
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && pc_net_game_take_pickup_full_refusal()) {
+                Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_1);
+                Player_actor_Request_main_refuse_pickup_all(game, FALSE);
+                return;
+            }
+#endif
             if (main_pickup_p->item == ITM_GOLDEN_SHOVEL && mPlib_Check_golden_item_get_demo_end(3) == FALSE) {
                 Player_actor_request_main_demo_get_golden_item_all(game, 3, mPlayer_REQUEST_PRIORITY_34);
             } else {

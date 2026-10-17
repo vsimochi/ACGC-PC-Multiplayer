@@ -11,6 +11,7 @@
 #include "pc_assets.h"
 #include "pc_disc.h"
 #include "pc_typing.h"
+#include "pc_chat.h" /* chat (worker CH): the chat line owns the keyboard while it is open */
 #include "pc_pause_menu.h"
 #include "pc_settings_menu.h"
 #include "pc_profiler.h"
@@ -39,7 +40,7 @@ SDL_Window*   g_pc_window = NULL;
 SDL_GLContext  g_pc_gl_context = NULL;
 atomic_int    g_pc_running = 1;
 int           g_pc_frame_limit_override = -1;
-int           g_pc_speedhack_enabled = 0;
+int           g_pc_speedhack_enabled = 0; /* the F3 10x game-speed toggle was REMOVED (user request: it sped the whole game up); nothing sets this any more, it stays 0 */
 int           g_pc_verbose = 0;
 int           g_pc_time_override = -1; /* -1=system clock, 0-23=override hour */
 int           g_pc_min_override = -1; /* -1=system clock, 0-59=override minute */
@@ -335,17 +336,6 @@ void pc_platform_init(void) {
 
 extern void PADCleanup(void);
 
-static void pc_speedhack_toggle(void) {
-    g_pc_speedhack_enabled = !g_pc_speedhack_enabled;
-    if (g_pc_window != NULL) {
-        SDL_SetWindowTitle(g_pc_window, g_pc_speedhack_enabled ? "Animal Crossing [5x]" : PC_WINDOW_TITLE);
-    }
-
-    if (g_pc_verbose) {
-        printf("[PC] speedhack %s\n", g_pc_speedhack_enabled ? "5x" : "off");
-    }
-}
-
 void pc_platform_shutdown(void) {
     pc_audio_shutdown();
     pc_audio_mq_shutdown();
@@ -506,15 +496,15 @@ int pc_platform_poll_events(void) {
                     pc_settings_menu_handle_capture_event(&event);
                     break;
                 }
+                if (!g_pc_paused && pc_chat_handle_event(&event)) {
+                    break; /* chat (worker CH): the chat key opened the line, or the open line owns the keyboard (Enter / Esc / Backspace / text) */
+                }
                 if (event.key.keysym.sym == SDLK_F4 && !event.key.repeat) {
                     g_pc_settings.show_ping = !g_pc_settings.show_ping;
                     printf("[PC] ping counter %s (F4)\n", g_pc_settings.show_ping ? "on" : "off"); /* session-only; settings.ini show_ping sets the start value */
                     break;
                 }
-                if (event.key.keysym.sym == SDLK_F3 && !event.key.repeat) {
-                    pc_speedhack_toggle();
-                    break;
-                }
+                /* (F3 is intentionally unbound: its old 10x speed toggle was removed.) */
                 if (event.key.keysym.sym == SDLK_ESCAPE && !event.key.repeat) {
                     if (g_pc_paused) {
                         pc_pause_menu_handle_event(&event);
@@ -567,6 +557,7 @@ int pc_platform_poll_events(void) {
                     break;
                 }
                 if (g_pc_paused) break;
+                if (pc_chat_handle_event(&event)) break; /* chat (worker CH): text typed into the open chat line */
                 pc_typing_handle_event(&event);
                 break;
         }

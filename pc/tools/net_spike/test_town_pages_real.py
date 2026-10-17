@@ -40,6 +40,17 @@ def run(args, results, ip, rig):
     check("G2 the client logged its write as APPLIED", cl.wait_for_log(r"\[NET\]\[PAGE\] client: my write of kind 2 index 1 was APPLIED", 30.0) is not None)
     check("G3 the HOST's own edit bumped the notice revision", host.wait_for_log(r"\[NET\]\[PAGE\] host: page kind 1 index 5 changed on the host -> rev \d+", 60.0) is not None)
     check("G3 the real client ADOPTED the host's new copy", cl.wait_for_log(r"\[NET\]\[PAGE\] client: page kind 1 index 5 updated from the host -> rev \d+", 60.0) is not None)
+    # notice board latency (worker BB): the latency lines a slow board is diagnosed with
+    m = cl.wait_for_log(r"\[NET\]\[PAGE\] board action took (\d+) ms \(design page write kind 2 index 1: local edit -> host APPLIED; upload wait (\d+) ms, round trip (\d+) ms\)", 10.0)
+    if m is not None:
+        print("G4 LATENCY client design edit -> APPLIED %s ms (upload wait %s ms = the periodic scan, round trip %s ms)" % (m.group(1), m.group(2), m.group(3)))
+    check("G4 the client logged '[NET][PAGE] board action took N ms' for its write; upload wait <= 300 ms (periodic scan 250 ms, was 500)",
+          m is not None and int(m.group(2)) <= 300 and int(m.group(1)) < 2000)
+    m = host.wait_for_log(r"\[NET\]\[PAGE\] host: pushed \d+ changed page\(s\) to peer \d+, (\d+) ms after the change", 10.0)
+    if m is not None:
+        print("G5 LATENCY host notice edit (dirty hook, as a real post) -> pushed to the client %s ms after the change" % m.group(1))
+    check("G5 the host logged its live push latency; the host's own notice edit was pushed <= 100 ms after the change (dirty hook, no 500 ms scan)",
+          m is not None and int(m.group(1)) <= 100)
     check("host and client alive", host.alive() and cl.alive())
     cl.stop()
     host.stop()

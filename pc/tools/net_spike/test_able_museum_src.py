@@ -51,7 +51,8 @@ ck("A6 a rollback only restores a slot that still holds what the trade put there
 ck("A7 a non-trade local edit lost to a newer host copy is logged SUPERSEDED (never silent)", "is SUPERSEDED by the host's rev" in ng)
 ck("A8 guests: pushed every page; DESIGN writes allowed (rate limit + content checks unchanged), notice board resident-only",
    "!pcnetgame_guest_pages_on())) /* worker B" in ng and "in->kind == PCNG_PAGE_DESIGN && pcnetgame_guest_pages_on() && pcnetgame_guest_of_idx(idx) >= 0" in ng
-   and "++s_pg_wr_n[peer] > 20u || !pcnetgame_page_valid(" in ng)
+   and "++s_pg_wr_n[peer] > PC_NETGAME_PAGE_HOST_WR_LIMIT || !pcnetgame_page_valid(" in ng
+   and "#define PC_NETGAME_PAGE_HOST_WR_LIMIT 20u" in ng) # notice board latency work: the host's 20 writes / s limit is now a named constant (same value, same refusal)
 ck("A9 host trend reset on an APPLIED design write; skipped while the villager's actor is live", "pcnetgame_outfit_trend_reset((int)in->index);" in ng
    and "if (pcnetgame_outfit_actor_live((uint16_t)a[i].id.npc_id)) {" in ng)
 ck("A10 the client applies outfits only to villagers without a live actor (the actor writes its drawn outfit back at its save)",

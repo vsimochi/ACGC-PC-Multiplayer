@@ -150,6 +150,8 @@ int  pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out);
 /* --dedicated console (`players`): read-only state of this player's puppet. 0 = no puppet slot, 1 = tracked but the actor is not created yet
  * (pending), 2 = the actor is live in the current GAME_PLAY. Safe for an out-of-range player_id (0). */
 int  pc_remote_player_puppet_state(PCNetPlayerId player_id);
+/* chat (worker CH): the current drawn world position of this player's LIVE puppet (the chat bubble anchor). 0 = no live puppet. Read-only. */
+int  pc_remote_player_get_draw_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z);
 
 /* Shared train arrival (pc_remote_arrival_logic.h): the local guest about to start the vanilla ride-off asks what the OTHER players are doing. 0 = not decidable yet (the caller keeps
  * its demo parked this frame and asks again); 1 = decided: *join_class = PCARR_JOIN_NONE (start the normal arrival) / RIDING / STOPPED, *train_x = the train x to start at for RIDING.

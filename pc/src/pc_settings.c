@@ -39,6 +39,7 @@ PCSettings g_pc_settings = {
     .menu_world_live = 1,
     .npc_fallback = 1,
     .npc_relay = 1,
+    .chat = 1,
 };
 
 int g_pc_max_guests_override = 0;
@@ -118,6 +119,9 @@ static const char* DEFAULT_SETTINGS =
     "\n"
     "# 1 (default) = such a villager is relayed through the host so every player near it sees the same villager, 0 = off\n"
     "npc_relay = 1\n"
+    "\n"
+    "# 1 (default) = the multiplayer text chat: press T (keybindings.ini Chat) to type, Enter sends, a bubble shows above you (host: 0 turns it off for everyone)\n"
+    "chat = 1\n"
     "\n"
     "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n"
     "allow_new_guests = 1\n"
@@ -207,6 +211,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.npc_fallback = val;
     } else if (strcmp(key, "npc_relay") == 0) {
         if (val == 0 || val == 1) g_pc_settings.npc_relay = val;
+    } else if (strcmp(key, "chat") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.chat = val;
     } else if (strcmp(key, "guest_memory_mb") == 0) {
         if (val >= 1 && val <= 1048576) g_pc_settings.guest_memory_mb = val;
     } else if (strcmp(key, "max_peers") == 0) {
@@ -346,6 +352,9 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# 1 (default) = such a villager is relayed through the host so every player near it sees the same villager, 0 = off\n");
     fprintf(f, "npc_relay = %d\n", g_pc_settings.npc_relay);
+    fprintf(f, "\n");
+    fprintf(f, "# 1 (default) = the multiplayer text chat: press T (keybindings.ini Chat) to type, Enter sends, a bubble shows above you (host: 0 turns it off for everyone)\n");
+    fprintf(f, "chat = %d\n", g_pc_settings.chat);
     fprintf(f, "\n");
     fprintf(f, "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n");
     fprintf(f, "allow_new_guests = %d\n", g_pc_settings.allow_new_guests);

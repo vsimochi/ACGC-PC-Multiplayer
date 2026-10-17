@@ -354,6 +354,8 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_outdoor_furniture.c # outdoor furniture C1 (pure logic: markers, sidecar, message 98 / service 10 shapes)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ops.c          # the host's operator list ops.ini (pure logic)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ofurn_draw.c   # outdoor furniture C1: renderer + collision + A / B seams (game side)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_chat.c         # multiplayer text chat (pure logic: charset, wrap, rate, store, mutes.ini)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_chat_ui.c      # multiplayer text chat: input line, bubbles, chat log (game side)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_ui.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_layout.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_items.c

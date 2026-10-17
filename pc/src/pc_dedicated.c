@@ -21,6 +21,7 @@
 #include "m_shop.h"       /* `shop-level-boost`: mSP_PlusSales / thresholds */
 #include "pc_shop_upgrade.h" /* `shop-upgrade`: the announced 5-minute shop upgrade state */
 #include "pc_outdoor_furniture.h" /* `op` / `deop` / `ops` / `furniture`: the operator list and the placed furniture (pc_net_game.c) */
+#include "pc_chat.h" /* `say` / `mute` / `unmute` / `mutes` / `chat`: the text chat (pc_net_game.c CHAT block) */
 
 #include <stdarg.h>
 #include <ctype.h>
@@ -1120,6 +1121,9 @@ static void pc_ded_cmd_help(void) {
            "  shop-upgrade   the announced shop upgrade: state (IDLE / PENDING / CLOSED / RENEWING), level, qualifying level, time left\n"
            "  ops | op <player> | deop <player>   the operator list (servers/<id>/ops.ini; player = an online name / a resident / a guest of this town, or `peer N`; ambiguous names are refused)\n"
            "  furniture list [acre] | remove <x> <z>|#<index> [delete] | clear acre <n>|player <name> [delete]   furniture PLACED outdoors (removed pieces go to the lost and found unless `delete`)\n"
+           "  say <text>   a server announcement in every player's chat log (up to 60 characters)\n"
+           "  mutes | mute <player> | unmute <player>   the chat mute list (servers/<id>/mutes.ini; player = an online name / a resident / a guest of this town, or `peer N`)\n"
+           "  chat [on|off]   the text chat: status / switch it for this session (settings.ini [Network] chat sets the start value); every line is logged as [CHAT] name: text\n"
            "  tp / bell   unsupported on the server (no local player; no host bell admin API) -- see docs/console-commands.md\n"
            "  stop     graceful shutdown (final save, close networking and platform, exit 0); aliases: quit, exit\n");
     pc_ded_flush();
@@ -2519,6 +2523,10 @@ static void pc_ded_execute(char* line) {
         pc_ded_flush();
     } else if (strcmp(cmd, "furniture") == 0) {
         pc_net_game_dedicated_furniture(args, pc_ded_out_line); /* outdoor furniture C1: placed pieces (list / remove / clear) */
+        pc_ded_flush();
+    } else if (strcmp(cmd, "say") == 0 || strcmp(cmd, "mute") == 0 || strcmp(cmd, "unmute") == 0 || strcmp(cmd, "mutes") == 0 || strcmp(cmd, "chat") == 0) {
+        pc_net_game_dedicated_chat(cmd, args, pc_ded_out_line); /* text chat: announcement / mute list / the switch (the text is never interpreted) */
+        PC_LOG(PCL_GENERAL, "dedicated: %s\n", cmd);
         pc_ded_flush();
     } else if (strcmp(cmd, "npc") == 0) {
         pc_net_game_dedicated_npc(args, pc_ded_out_line); /* villager authority / stale fallback status, `npc free <slot>` */

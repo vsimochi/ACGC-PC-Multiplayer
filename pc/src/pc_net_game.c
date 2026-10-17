@@ -206,6 +206,7 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_guest_admit.h" /* capacity phase 4: the pure guest admission rules (range, decision) */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: kind 22, message 98, service 10 (pure logic) */
 #include "pc_ops.h"               /* the host's operator list (ops.ini) */
+#include "pc_chat.h"              /* text chat (worker CH): messages 100 / 101, the "CHAT" block at the end of this file */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
 #include "m_player_lib.h" /* Stage 3: GET_PLAYER_ACTOR_NOW(), PLAYER_ACTOR, mPlayer_INDEX_*, and
@@ -599,6 +600,12 @@ typedef enum PCNetGameMsgType {
                                              * layout with this msg_type), <= 10 Hz per villager: the pose of a villager the HOST does not simulate (no host actor, so no NPC_MOVE)
                                              * that this client runs on its own vanilla AI (pc_npc_authority.h LOCAL mode). The host accepts ONE relay owner per villager while it has
                                              * no actor of its own and re-sends the pose as an ordinary NPC_MOVE to every OTHER ready peer. An old host ignores the id. */
+    PC_NETGAME_MSG_CHAT_SEND            = 100, /* text chat (worker CH, v8 extended in place, NO version bump), client -> host ONLY, RELIABLE, 68 bytes: one typed line (font codes, 1..60);
+                                             * the host validates (READY + bound, shape, charset, rate, mute list, the chat switch) and relays it as CHAT_MSG. Sent only after the host's
+                                             * CHAT_MSG CAPS ON. An old host ignores the id. See PCChatSendMsg / pc_chat.h ("CHAT" block at the end of this file). */
+    PC_NETGAME_MSG_CHAT_MSG             = 101, /* host -> READY clients, RELIABLE, 80 bytes: a validated line (to the speaker's announced scene + the speaker's echo), a server announcement
+                                             * (`say`, everyone), a notice for one player, or the CAPS announcement. PRESENTATION ONLY (bubble + chat log). An old client ignores the id.
+                                             * See PCChatMsg / pc_chat.h. */
 } PCNetGameMsgType;
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID, "OUTDOOR_FURN id drifted (pc_outdoor_furniture.h)");
 _Static_assert(sizeof(PCOfurnMsg) == 268 && sizeof(PCOfurnMsg) <= PC_NET_MAX_PAYLOAD, "PCOfurnMsg wire size drifted");
@@ -3381,6 +3388,7 @@ typedef struct PCNetGamePickupPending {
 } PCNetGamePickupPending;
 static PCNetGamePickupPending s_pickup_pending;
 static uint32_t               s_next_pickup_request_id = 1;
+static uint32_t               s_pickup_full_refusal_ms; /* full-pocket pickup: when (now | 1) a pickup was given up for POCKETS_FULL (pc_net_game_take_pickup_full_refusal) */
 
 /* ~500ms: generous relative to a LAN round-trip (movement/appearance already prove typical
  * latency is well under this), but short enough that a genuinely lost request/result is retried
@@ -9995,7 +10003,7 @@ static void pcnetgame_handle_client_action_ext(const PCActionExtMsg* in) {
 #include "m_demo.h"
 /* defined in src/game/m_player.c (TARGET_PC, TEST-ONLY): thin pass-throughs to the REAL static request functions */
 extern int PC_Test_AextRequest(GAME* game, int what, int arg);
-/* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_AEXT_SCRIPT=talk|bed|radio|cloth drives the REAL vanilla states of the local player a few seconds after
+/* TEST-ONLY (AC_TEST_HOOKS=1): AC_TEST_AEXT_SCRIPT=talk|bed|radio|cloth|clothes drives the REAL vanilla states of the local player a few seconds after
  * READY (the sender above then reports them like any real play): talk = DEMO_WAIT + demo orders 2 (GAAAN1 -> GAAAN2) and 0xFE (BIKU1) then WAIT;
  * bed = LIE_BED (left, then right on the second pass) + ROLL_BED + STANDUP_BED; radio = RADIO_EXERCISE command 0; cloth = CHANGE_CLOTH try-on of
  * the worn cloth (no change). Each step logs [NET][AEXT][TEST]. */
@@ -10071,6 +10079,38 @@ static void pcnetgame_aext_test_hook(PLAYER_ACTOR* pl, double now) {
         switch (s_step) {
             case 1: AEXT_NEXT("change_cloth request=%d", PC_Test_AextRequest(game, 9, 0)); break;
             default: if (AEXT_T(200.0)) { printf("[NET][AEXT][TEST] script cloth done (state %d)\n", idx); s_step = -1; } break;
+        }
+    } else if (strcmp(s_script, "clothes") == 0) {
+        /* worker CL: (1) the INVENTORY path: exactly the menu's writes at its doll frame 36 (m_hand_ovl.c:535-545: Now_Private->cloth +
+         * mPlib_change_player_cloth; the real actor never enters 101), (2) the 101 path with a real change (Halloween request, try_on FALSE:
+         * ITAZURA1, Now_Private written by the state at frame 18), (3) WAIT, (4) the menu path again back to the original outfit. */
+        static mPr_cloth_c s_orig;
+        mActor_name_t alt = (mActor_name_t)(ITM_CLOTH_START + ((Now_Private->cloth.item == ITM_CLOTH_START + 5) ? 6 : 5));
+        mActor_name_t alt2 = (mActor_name_t)(ITM_CLOTH_START + ((Now_Private->cloth.item == ITM_CLOTH_START + 9) ? 10 : 9));
+        switch (s_step) {
+            case 1:
+                s_orig = Now_Private->cloth;
+                Now_Private->cloth.item = alt;
+                Now_Private->cloth.idx = (u16)(alt - ITM_CLOTH_START);
+                mPlib_change_player_cloth(game, Now_Private->cloth.idx);
+                AEXT_NEXT("menu cloth item=0x%04X idx=%u (orig 0x%04X/%u, state %d)", (unsigned)alt, (unsigned)Now_Private->cloth.idx,
+                          (unsigned)s_orig.item, (unsigned)s_orig.idx, idx);
+                break;
+            case 2:
+                if (AEXT_T(300.0)) {
+                    AEXT_NEXT("cloth101 item=0x%04X request=%d", (unsigned)alt2,
+                              mPlib_request_main_change_cloth_forNPC_type1(game, alt2, (u16)(alt2 - ITM_CLOTH_START), FALSE));
+                }
+                break;
+            case 3: if (AEXT_T(200.0)) { AEXT_NEXT("wait request=%d (state %d, cloth 0x%04X)", PC_Test_AextRequest(game, 7, 0), idx, (unsigned)Now_Private->cloth.item); } break;
+            case 4:
+                if (AEXT_T(120.0)) {
+                    Now_Private->cloth = s_orig;
+                    mPlib_change_player_cloth(game, Now_Private->cloth.idx);
+                    AEXT_NEXT("menu cloth restore item=0x%04X idx=%u (state %d)", (unsigned)s_orig.item, (unsigned)s_orig.idx, idx);
+                }
+                break;
+            default: if (AEXT_T(300.0)) { printf("[NET][AEXT][TEST] script clothes done (state %d)\n", idx); s_step = -1; } break;
         }
     } else {
         s_step = -1;
@@ -13233,6 +13273,7 @@ static void pcnetgame_handle_client_pickup_result(const PCNetGamePickupResultMsg
                (unsigned)in->request_id, (unsigned)in->granted_item);
         pcnetgame_client_send_confirm(kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT,
                                       (uint8_t)PC_NETGAME_CONFIRM_REASON_POCKETS_FULL, in->request_id);
+        s_pickup_full_refusal_ms = pcnetgame_now_ms() | 1u; /* full-pocket pickup: the pickup animation ends in the vanilla refusal */
         return;
     }
     if (pcnetgame_txn_busy()) {
@@ -20940,6 +20981,11 @@ static void pcnetgame_ofurn_session_reset(void);
 static void pcnetgame_ofurn_host_tick(void);
 static void pcnetgame_ofurn_client_tick(void);
 static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m);
+/* text chat (worker CH): the CHAT block (end of this file) */
+static void pcnetgame_chat_host_tick(void);
+static void pcnetgame_chat_client_tick(void);
+static void pcnetgame_handle_host_chat(PCNetPeerId peer, const uint8_t* data, uint16_t size);
+static void pcnetgame_handle_client_chat(const uint8_t* data, uint16_t size);
 static void pcnetgame_ts_build_upgrade(uint8_t* blob);
 static int pcnetgame_ts_valid_upgrade_blob(const uint8_t* blob);
 static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob);
@@ -21320,6 +21366,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_evnpc_host_tick();
     pcnetgame_evc_host_tick(); /* worker E: shared event NPCs (TEST-ONLY seed; the Wisp flag of service 9) */
     pcnetgame_ofurn_host_tick(); /* outdoor furniture C1: the marker GC, the per-peer list / rights (message 98) */
+    pcnetgame_chat_host_tick();  /* text chat (worker CH): the CAPS announcement per READY peer (message 101), the TEST-ONLY send hook */
     pcnetgame_npc_lease_host_tick();
     pcnetgame_page_host_tick();
     for (p = 0; p < pcnetgame_peer_span(); p++) {
@@ -28910,6 +28957,9 @@ static void pcnetgame_txn_cancel_queued(const char* why, uint8_t reason) {
            pcnetgame_kind_tag((int)s_ctxn.kind), (unsigned)s_ctxn.request_id, why);
     if (s_ctxn.kind >= (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && s_ctxn.kind <= (uint8_t)PC_NETGAME_INTERACT_KIND_BURY) {
         pcnetgame_client_send_confirm(s_ctxn.kind, (uint8_t)PC_NETGAME_CONFIRM_ABORT, reason, s_ctxn.request_id);
+        if (s_ctxn.kind == (uint8_t)PC_NETGAME_INTERACT_KIND_PICKUP && reason == (uint8_t)PC_NETGAME_CONFIRM_REASON_POCKETS_FULL) {
+            s_pickup_full_refusal_ms = pcnetgame_now_ms() | 1u; /* full-pocket pickup: the pickup animation ends in the vanilla refusal */
+        }
     } else if (s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MUSEUM_DONATE || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_POLICE_CLAIM ||
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_BUY || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_SHOP_SELL ||
                s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_SEND || s_ctxn.kind == (uint8_t)PC_NETGAME_TXN_KIND_MAIL_TAKE ||
@@ -34792,6 +34842,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     if (data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN) {
         return; /* outdoor furniture C1: OUTDOOR_FURN is host -> client only; a client never originates it. Dropped, never applied. */
     }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_CHAT_SEND || data[0] == (uint8_t)PC_NETGAME_MSG_CHAT_MSG) {
+        pcnetgame_handle_host_chat(peer, data, size); /* text chat (worker CH): CHAT_SEND validated + relayed in the speaker's scene; a client-originated CHAT_MSG is dropped */
+        return;
+    }
 
     if (data[0] == (uint8_t)PC_NETGAME_MSG_MAILBOX_LETTER) {
         /* Mail milestone 2: MAILBOX_LETTER is host -> client only; a client never originates it. Dropped, never applied (the host's mailbox is only
@@ -35500,6 +35554,10 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCOfurnMsg om;
         memcpy(&om, data, sizeof(om));
         pcnetgame_handle_client_ofurn(&om); /* outdoor furniture C1: the host's placed-furniture markers / my rights */
+        return;
+    }
+    if (size >= 1 && data[0] == (uint8_t)PC_NETGAME_MSG_CHAT_MSG) {
+        pcnetgame_handle_client_chat(data, size); /* text chat (worker CH): a validated line / announcement / notice / the CAPS announcement (presentation only) */
         return;
     }
     if (size == sizeof(PCNetGameDresserStateMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_DRESSER_STATE) {
@@ -36463,6 +36521,15 @@ PCNG_PEER_TABLE2(uint32_t, s_pg_sent, PCNG_PAGE_COUNT)    /* host: the revision 
 static uint32_t s_pg_next_scan_ms;
 PCNG_PEER_TABLE(uint32_t, s_pg_wr_ms)
 PCNG_PEER_TABLE(uint32_t, s_pg_wr_n)
+/* Notice board latency (worker BB): the periodic page scan (host: its own edits -> new revision; client: local edits -> WRITE) ran every 500 ms, so a post waited
+ * 0..500 ms (avg 250) before it even left the client. A notice board write now marks the pages dirty (pc_net_game_pages_dirty, m_notice.c) and is scanned on
+ * the next frame; the periodic scan stays as the fallback for the other page writers (Able Sisters designs) at 250 ms (23 FNV digests of <= 544 B: trivial).
+ * The client caps its own uploads at PC_NETGAME_PAGE_CLIENT_WR_BUDGET per second, under the host's 20 writes / s refusal limit (a full board shifts all 15
+ * posts in one write: 15 page writes), the rest go on the next scan, so a burst can never be refused BAD and lose the post. */
+#define PC_NETGAME_PAGE_SCAN_MS 250u
+#define PC_NETGAME_PAGE_HOST_WR_LIMIT 20u
+#define PC_NETGAME_PAGE_CLIENT_WR_BUDGET 16u
+static uint32_t s_pg_chg_ms[PCNG_PAGE_COUNT]; /* host: when the current revision was made (latency log of the live pushes) */
 
 /* ===== VILLAGER OUTFIT BEGIN (worker B: msg 90 VILLAGER_OUTFIT + the host-side Able Sisters trend reset; see the enum entry) =====
  * Vanilla resets every villager wearing a shop design (cloth RSV_CLOTH + cloth_original_id, or umbrella 32 + n) when that design is traded away
@@ -36713,7 +36780,7 @@ static void pcnetgame_page_host_tick(void) {
     pcnetgame_page_test_edit();
     pcnetgame_outfit_host_tick(); /* worker B: VILLAGER_OUTFIT (90) + pending trend resets */
     pcnetgame_gmus_tick();        /* worker B: the guests' museum day pass */
-    if ((uint32_t)(now - s_pg_next_scan_ms) >= 500u) {
+    if ((uint32_t)(now - s_pg_next_scan_ms) >= PC_NETGAME_PAGE_SCAN_MS) { /* BB: was 500 ms; a notice board write forces this scan on the next frame */
         s_pg_next_scan_ms = now;
         for (i = 0; i < (unsigned)PCNG_PAGE_COUNT; i++) {
             unsigned k, x;
@@ -36726,11 +36793,14 @@ static void pcnetgame_page_host_tick(void) {
                 }
                 s_pg_rev[i]++;
                 s_pg_dig[i] = d;
+                s_pg_chg_ms[i] = now;
             }
         }
     }
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         int budget = 6;
+        unsigned live_n = 0u; /* BB: live updates (the peer had an older revision) pushed to this peer on this tick, for the latency line */
+        uint32_t live_max_ms = 0u;
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !s_host_peer[p].bound_valid ||
             (s_host_peer[p].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && !pcnetgame_guest_pages_on())) /* worker B: a guest plays a never-persisted copy of THIS town: it gets the pages too (AC_MP_GUEST_PAGES=0: the old rule) */ {
             memset(s_pg_sent[p], 0, sizeof(s_pg_sent[p]));
@@ -36749,9 +36819,17 @@ static void pcnetgame_page_host_tick(void) {
                 if (!pcnetgame_page_send((PCNetPeerId)p, k, x, s_pg_rev[i], 0, 0, d, len)) {
                     break; /* F-01: the reliable window is full -- do not record the page as sent, try again on the next tick */
                 }
+                if (s_pg_sent[p][i] != 0u && s_pg_chg_ms[i] != 0u) {
+                    const uint32_t age = (uint32_t)(now - s_pg_chg_ms[i]);
+                    live_n++;
+                    live_max_ms = age > live_max_ms ? age : live_max_ms;
+                }
                 s_pg_sent[p][i] = s_pg_rev[i];
                 budget--;
             }
+        }
+        if (live_n != 0u) {
+            printf("[NET][PAGE] host: pushed %u changed page(s) to peer %d, %u ms after the change (oldest)\n", live_n, p, (unsigned)live_max_ms);
         }
     }
 }
@@ -36783,9 +36861,9 @@ static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg*
     if (idx >= PLAYER_NUM && !(in->kind == PCNG_PAGE_DESIGN && pcnetgame_guest_pages_on() && pcnetgame_guest_of_idx(idx) >= 0)) {
         idx = -1;
     }
-    if (idx < 0 || ++s_pg_wr_n[peer] > 20u || !pcnetgame_page_valid(in->kind, in->index, in->data, in->len)) {
+    if (idx < 0 || ++s_pg_wr_n[peer] > PC_NETGAME_PAGE_HOST_WR_LIMIT || !pcnetgame_page_valid(in->kind, in->index, in->data, in->len)) {
         printf("[NET][PAGE] host: peer %d write kind %u index %u REFUSED (%s)%s", (int)peer, (unsigned)in->kind, (unsigned)in->index,
-               idx < 0 ? "not a resident (a guest writes design pages only)" : s_pg_wr_n[peer] > 20u ? "rate limited" : "invalid content", "\n");
+               idx < 0 ? "not a resident (a guest writes design pages only)" : s_pg_wr_n[peer] > PC_NETGAME_PAGE_HOST_WR_LIMIT ? "rate limited" : "invalid content", "\n");
         pcnetgame_page_send(peer, in->kind, in->index, s_pg_rev[slot], (uint8_t)PCNG_PAGE_F_BAD, in->aux, cur, len);
         s_pg_sent[peer][slot] = s_pg_rev[slot];
         return;
@@ -36805,6 +36883,7 @@ static void pcnetgame_page_handle_host(PCNetPeerId peer, const PCNetGamePageMsg*
         memcpy(cur, in->data, len);
         s_pg_rev[slot]++;
         s_pg_dig[slot] = pcnetgame_page_digest(in->kind, in->index);
+        s_pg_chg_ms[slot] = now; /* BB: the other peers get it on the next page tick (next frame); latency logged there */
         printf("[NET][PAGE] host: peer %d (%s %d) write kind %u index %u APPLIED -> rev %u%s", (int)peer, idx >= PLAYER_NUM ? "guest record" : "resident", idx, (unsigned)in->kind,
                (unsigned)in->index, (unsigned)s_pg_rev[slot], "\n");
         if (in->kind == PCNG_PAGE_DESIGN) {
@@ -36821,6 +36900,19 @@ static uint32_t s_pgc_dig[PCNG_PAGE_COUNT];        /* digest of that canonical c
 static uint32_t s_pgc_pend_dig[PCNG_PAGE_COUNT];   /* digest of the write in flight (0 = none) */
 static uint32_t s_pgc_pend_ms[PCNG_PAGE_COUNT];
 static uint32_t s_pgc_next_ms;
+static uint32_t s_pgc_dirty_ms;                    /* BB: when the notice board was last written locally (0 = no unsent board edit): the latency line's start */
+static uint32_t s_pgc_edit_ms[PCNG_PAGE_COUNT];    /* BB: when the write in flight was first seen locally */
+static uint32_t s_pgc_wr_win_ms, s_pgc_wr_n;      /* BB: the client's own upload budget window (PC_NETGAME_PAGE_CLIENT_WR_BUDGET per second) */
+
+void pc_net_game_pages_dirty(void) {
+    const uint32_t now = pcnetgame_now_ms();
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        s_pg_next_scan_ms = now - PC_NETGAME_PAGE_SCAN_MS; /* scanned (new revision, pushed) on the next page tick */
+    } else if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        s_pgc_next_ms = now - PC_NETGAME_PAGE_SCAN_MS;     /* uploaded on the next page tick */
+        s_pgc_dirty_ms = now ? now : 1u;
+    }
+}
 
 /* ===== ABLE TRADE JOURNAL BEGIN (worker B: Able Sisters trades on a CLIENT; no wire change, see pc_able_net.h) =====
  * A trade at Mable (Exchange = aNI_ExchangeCloth/Umb: the player's my_org[k] and the shop design SWAP; Display = aNI_Copy*Data from my_org) writes the shared design page
@@ -37067,6 +37159,9 @@ static void pcnetgame_page_test_edit(void) {
     }
     done = 1;
     p[0] = (uint8_t)(p[0] == 0x41u ? 0x42u : 0x41u);
+    if (k == PCNG_PAGE_NOTICE) {
+        pc_net_game_pages_dirty(); /* BB: what mNtc_notice_write does after a real post (design edits keep the periodic-scan path) */
+    }
     printf("[NET][PAGE][TEST-ONLY] edited page kind %u index %u in this process's save%s", k, x, "\n");
 }
 
@@ -37076,10 +37171,14 @@ static void pcnetgame_page_client_tick(void) {
     pcnetgame_page_test_edit();
     pcnetgame_outfit_client_tick(); /* worker B: villager outfits from the host (1 Hz, waits for live actors) */
     pcnetgame_able_test_report();   /* worker B: TEST-ONLY outcome line of AC_TEST_ABLE_TRADE */
-    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL || (uint32_t)(now - s_pgc_next_ms) < 500u) {
-        return;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || gamePT == NULL || (uint32_t)(now - s_pgc_next_ms) < PC_NETGAME_PAGE_SCAN_MS) {
+        return; /* BB: was 500 ms; pc_net_game_pages_dirty (a notice board write) makes the next tick scan at once */
     }
     s_pgc_next_ms = now;
+    if ((uint32_t)(now - s_pgc_wr_win_ms) >= 1000u) {
+        s_pgc_wr_win_ms = now;
+        s_pgc_wr_n = 0u;
+    }
     for (i = 0; i < (unsigned)PCNG_PAGE_COUNT; i++) {
         unsigned k, x;
         uint32_t d;
@@ -37101,17 +37200,29 @@ static void pcnetgame_page_client_tick(void) {
         if (s_pgc_pend_dig[i] == d && (uint32_t)(now - s_pgc_pend_ms[i]) < 3000u) {
             continue; /* the write is in flight */
         }
+        if (s_pgc_wr_n >= PC_NETGAME_PAGE_CLIENT_WR_BUDGET) {
+            continue; /* BB: over this second's upload budget (host refuses > 20 / s): sent by a later scan, never refused */
+        }
         {
             /* ABLE: a trade's write is built on the revision the player SAW in the shop, not on a newer one adopted while a menu deferred the redraw */
             const uint32_t base = (s_able_txn.active && k == PCNG_PAGE_DESIGN && x == (unsigned)s_able_txn.design) ? s_able_txn.base_rev : s_pgc_rev[i];
+            if (!pcnetgame_page_send(0, k, x, 0, (uint8_t)PCNG_PAGE_F_WRITE, base, cur, len)) {
+                continue; /* BB: reliable window full: not in flight, retried on the next scan (was: a 3 s in-flight wait for a write that never left) */
+            }
             printf("[NET][PAGE] client: local edit of page kind %u index %u (built on rev %u) -> write sent to the host%s", k, x, (unsigned)base, "\n");
-            pcnetgame_page_send(0, k, x, 0, (uint8_t)PCNG_PAGE_F_WRITE, base, cur, len);
             if (base != s_pgc_rev[i]) {
                 printf("[NET][ABLE] trade write of design %u built on the seen rev %u (the adopted rev %u was never displayed)\n", x, (unsigned)base, (unsigned)s_pgc_rev[i]);
             }
         }
+        s_pgc_wr_n++;
+        if (s_pgc_pend_dig[i] == 0u) {
+            s_pgc_edit_ms[i] = (k == PCNG_PAGE_NOTICE && s_pgc_dirty_ms != 0u) ? s_pgc_dirty_ms : now; /* BB: latency line start (the board write, else this scan) */
+        }
         s_pgc_pend_dig[i] = d;
         s_pgc_pend_ms[i] = now;
+    }
+    if (s_pgc_wr_n < PC_NETGAME_PAGE_CLIENT_WR_BUDGET) {
+        s_pgc_dirty_ms = 0u; /* every board page that changed is in flight now */
     }
 }
 
@@ -37135,6 +37246,12 @@ static void pcnetgame_page_handle_client(const PCNetGamePageMsg* in) {
         s_pgc_dig[slot] = pcnetgame_fnv1a32(cur, len);
         s_pgc_pend_dig[slot] = 0u;
         printf("[NET][PAGE] client: my write of kind %u index %u was APPLIED (rev %u)%s", (unsigned)in->kind, (unsigned)in->index, (unsigned)in->rev, "\n");
+        {
+            const uint32_t now = pcnetgame_now_ms();
+            printf("[NET][PAGE] board action took %u ms (%s kind %u index %u: local edit -> host APPLIED; upload wait %u ms, round trip %u ms)\n",
+                   (unsigned)(now - s_pgc_edit_ms[slot]), in->kind == PCNG_PAGE_NOTICE ? "notice post write" : "design page write", (unsigned)in->kind,
+                   (unsigned)in->index, (unsigned)(s_pgc_pend_ms[slot] - s_pgc_edit_ms[slot]), (unsigned)(now - s_pgc_pend_ms[slot]));
+        }
         if (s_able_txn.active && in->kind == PCNG_PAGE_DESIGN && in->index == s_able_txn.design) {
             pcnetgame_able_settle(in->rev, "APPLIED");
         }
@@ -37197,6 +37314,7 @@ static void pcnetgame_client_tick(void) {
     pcnetgame_evnpc_client_tick(); /* event NPC authority: match the host's table (no-op until the host sent one) */
     pcnetgame_evc_client_tick();   /* worker E: shared event NPCs (Redd's display, the Wisp flag, the TEST-ONLY claim hook) */
     pcnetgame_ofurn_client_tick(); /* outdoor furniture C1: the TEST-ONLY seam driver */
+    pcnetgame_chat_client_tick();  /* text chat (worker CH): the per-session CAPS state, the TEST-ONLY send hook */
     pcnetgame_page_client_tick();  /* town-shared pages: upload a local edit built on the adopted revision */
     pcnetgame_clear_errands_test_hook();
 
@@ -40186,6 +40304,32 @@ int pc_net_game_room_edit_notice(void) {
     return s_client_link != PC_NETGAME_LINK_READY ? 1 : 2;
 }
 
+/* Full-pocket pickup (see pc_net_game.h): the same room test pc_net_game_request_pickup() applies below, run BEFORE the pickup starts. */
+int pc_net_game_client_pickup_no_room(int item) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || Now_Private == NULL) {
+        return 0;
+    }
+    if (mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) >= 0) {
+        return 0;
+    }
+#ifdef PC_ENHANCEMENTS
+    {
+        u32 bells = mPr_GetAmountForMoneyItem((mActor_name_t)item);
+        if (bells > 0 && Now_Private->inventory.wallet <= mPr_WALLET_MAX && bells <= (mPr_WALLET_MAX - Now_Private->inventory.wallet)) {
+            return 0; /* a money bag the wallet takes whole: the pickup is still tried (no pocket needed) */
+        }
+    }
+#endif
+    printf("[NET][PICKUP] pockets full: item 0x%04X is not picked up -- the vanilla 'pockets full' refusal, the item stays on the ground\n", (unsigned)(item & 0xFFFF));
+    return 1;
+}
+
+int pc_net_game_take_pickup_full_refusal(void) {
+    const uint32_t t = s_pickup_full_refusal_ms;
+    s_pickup_full_refusal_ms = 0;
+    return t != 0 && (uint32_t)(pcnetgame_now_ms() - t) < 3000u;
+}
+
 int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
     PCNetGamePickupRequestMsg msg;
     PCNetGameOwnerStamp stamp;
@@ -40259,6 +40403,7 @@ int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
 #endif
         if (!wallet_might_fit) {
             printf("[NET][PICKUP] pockets full -- pickup at (%d,%d) not sent (the item stays in the world)\n", ut_x, ut_z);
+            s_pickup_full_refusal_ms = pcnetgame_now_ms() | 1u; /* full-pocket pickup: the animation (if one started) ends in the vanilla refusal */
             return 1;
         }
         printf("[NET][PICKUP] pockets full but item=0x%04X may still fit the wallet -- pickup at (%d,%d) sent anyway; the "
@@ -40266,6 +40411,7 @@ int pc_net_game_request_pickup(int ut_x, int ut_z, int item) {
                (unsigned)item, ut_x, ut_z);
     }
 
+    s_pickup_full_refusal_ms = 0; /* full-pocket pickup: a refusal belongs to the pickup it was raised for, never to this new one */
     s_pickup_pending.valid = 1;
     s_pickup_pending.request_id = s_next_pickup_request_id++;
     s_pickup_pending.owner = stamp;
@@ -42262,6 +42408,28 @@ static void pcnetgame_goto_test_hook(void) {
         return;
     }
     remove("ac_goto.txt");
+    if (kind == 'k') {
+        /* "k <n>" (worker PK police multi-claim real test): park 30 units SOUTH of the centre of the police box floor unit that shows lost-and-found entry n (RSV_POLICE_ITEM_0 + n),
+         * facing north: Player_actor_check_forward reads the unit 20 units ahead (item_in_front), i.e. 10 units inside the item's unit */
+        mActor_name_t* fg = mFI_BkNumtoUtFGTop(0, 0);
+        int u;
+        for (u = 0; fg != NULL && u < UT_TOTAL_NUM; u++) {
+            if (fg[u] == (mActor_name_t)(RSV_POLICE_ITEM_0 + slot)) {
+                xyz_t cw;
+                mFI_UtNum2CenterWpos(&cw, u % UT_X_NUM, u / UT_X_NUM);
+                pa->actor_class.world.position.x = cw.x;
+                pa->actor_class.world.position.z = cw.z + 30.0f;
+                pa->actor_class.shape_info.rotation.y = (s16)0x8000;
+                pa->actor_class.world.angle.y = pa->actor_class.shape_info.rotation.y;
+                printf("[NET][TEST-ONLY] goto k %d: lost-and-found unit (%d,%d) holds 0x%04X; player parked at (%.1f, %.1f) facing north\n", slot, u % UT_X_NUM, u / UT_X_NUM,
+                       (unsigned)Save_Get(police_box).keep_items[slot % mPB_POLICE_BOX_ITEM_STORAGE_COUNT], (double)pa->actor_class.world.position.x,
+                       (double)pa->actor_class.world.position.z);
+                return;
+            }
+        }
+        printf("[NET][TEST-ONLY] goto k %d: no lost-and-found unit in this scene\n", slot);
+        return;
+    }
     if (kind == 'v') {
         t = Actor_info_fgName_search(&play->actor_info, Save_Get(animals)[slot].id.npc_id, ACTOR_PART_NPC);
     } else if (kind == 'g') {
@@ -42692,7 +42860,7 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             }
             printf("%s\n", out); /* one write: the test reads the log while it is being written */
             s_ap.active = 0;
-        } else if (strcmp(cmd, "mash") == 0 && sscanf(line, "%*d %*s %f", &a) == 1) { /* press A about twice a second for `a` seconds (dismisses the catch dialogue) */
+        } else if ((strcmp(cmd, "mash") == 0 || strcmp(cmd, "mashb") == 0) && sscanf(line, "%*d %*s %f", &a) == 1) { /* press A (mashb: B, the pickup button; worker PK) about twice a second for `a` seconds */
             s_ap.tx = a * 1000.0f;
         } else if (strcmp(cmd, "killfish") == 0 && sscanf(line, "%*d %*s %lu", &ent) == 1) { /* TEST-ONLY: destroys this process's actor of fish ENT the way vanilla's cull does (deferred destroy flag) */
             ACTOR* kf = NULL;
@@ -42875,6 +43043,18 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             const int gave = mPr_SetFreePossessionItem(Now_Private, (mActor_name_t)ent, mPr_ITEM_COND_NORMAL);
             printf("[AUTO] give %d item 0x%04lX %s\n", id, ent, gave ? "put in a pocket" : "no free pocket");
             s_ap.active = 0;
+        } else if (strcmp(cmd, "take") == 0 && sscanf(line, "%*d %*s %lx", &ent) == 1) { /* the reverse POSITIONING AID (worker PK): take item ENT (hex) out of the LAST pocket holding it */
+            int ti, tslot = -1;
+            for (ti = 0; ti < mPr_POCKETS_SLOT_COUNT; ti++) {
+                if (Now_Private->inventory.pockets[ti] == (mActor_name_t)ent) {
+                    tslot = ti;
+                }
+            }
+            if (tslot >= 0) {
+                mPr_SetPossessionItem(Now_Private, tslot, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+            }
+            printf("[AUTO] give %d item 0x%04lX %s\n", id, ent, tslot >= 0 ? "taken out of a pocket" : "not in the pockets");
+            s_ap.active = 0;
         } else if (strcmp(cmd, "place") == 0) { /* TEST-ONLY: place ITEM_HEX UT_X UT_Z (tile units: world / 40) -- put an item on a town ground tile through the field-authority API (a deterministic fixture, e.g. candy for the ant spawn rule) */
             unsigned long it = 0;
             int ux = 0, uz = 0, acre = 0, tile = 0, okp = 0;
@@ -42980,12 +43160,12 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
         pcnetgame_ap_done("fail", d2);
         return 0;
     }
-    if (strcmp(s_ap.cmd, "mash") == 0) {
+    if (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashb") == 0) {
         if ((float)(now - s_ap.t0) >= s_ap.tx) {
             pcnetgame_ap_done("ok", "");
             return 0;
         }
-        return (((now - s_ap.t0) / 250u) & 1u) ? 1u : 0u;
+        return (((now - s_ap.t0) / 250u) & 1u) ? (s_ap.cmd[4] == 'b' ? 4u : 1u) : 0u;
     }
     if (strcmp(s_ap.cmd, "equip") == 0) {
         if (Now_Private->equipment == (mActor_name_t)s_ap.entity) {
@@ -43651,7 +43831,7 @@ static void pcnetgame_museum_warp_test_hook(void) {
             return;
         }
         s_which = strncmp(e, "painting", 8) == 0 ? 1 : strncmp(e, "fossil", 6) == 0 ? 2 : strncmp(e, "insect", 6) == 0 ? 3 : strncmp(e, "fish", 4) == 0 ? 4 : strncmp(e, "needlework", 10) == 0 ? 5
-                  : strncmp(e, "entrance", 8) == 0 ? 6 : strncmp(e, "postoffice", 10) == 0 ? 7 : 0; /* entrance: in front of Blathers' counter (guest museum donation real test); postoffice: the
+                  : strncmp(e, "entrance", 8) == 0 ? 6 : strncmp(e, "postoffice", 10) == 0 ? 7 : strncmp(e, "police", 6) == 0 ? 8 : 0; /* police: the police box (worker PK multi-claim real test); entrance: in front of Blathers' counter (guest museum donation real test); postoffice: the
                                                                                                       * post office (guest mailbox real test), with the vanilla post office door data */
         if (s_which == 0) {
             return;
@@ -43678,7 +43858,7 @@ static void pcnetgame_museum_warp_test_hook(void) {
         s_t_elig = now ? now : 1;
     }
     if ((uint32_t)(now - s_t_elig) >= (uint32_t)s_delay) {
-        static const Door_data_c k_doors[7] = {
+        static const Door_data_c k_doors[8] = {
             { SCENE_MUSEUM_ROOM_PAINTING, 4, 0, 0, { 280, 0, 480 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_FOSSIL, 4, 0, 0, { 280, 0, 480 }, EMPTY_NO, 2, { 0, 0, 0 } },
             { SCENE_MUSEUM_ROOM_INSECT, 6, 0, 0, { 520, 0, 560 }, EMPTY_NO, 2, { 0, 0, 0 } },
@@ -43686,6 +43866,7 @@ static void pcnetgame_museum_warp_test_hook(void) {
             { SCENE_NEEDLEWORK, mSc_DIRECT_NORTH, 0, 0, { 300, 0, 380 }, EMPTY_NO, 2, { 0, 0, 0 } }, /* Able Sisters */
             { SCENE_MUSEUM_ENTRANCE, mSc_DIRECT_NORTH, 0, 0, { 240, 0, 200 }, EMPTY_NO, 2, { 0, 0, 0 } }, /* the entrance player start, facing Blathers */
             { SCENE_POST_OFFICE, 4, 0, 0, { 160, 0, 300 }, EMPTY_NO, 1, { 0, 0, 0 } }, /* the vanilla post office door data (ac_post_office_move.c_inc) */
+            { SCENE_POLICE_BOX, mSc_DIRECT_NORTH, 0, 0, { 200, 0, 380 }, EMPTY_NO, 1, { 0, 0, 0 } }, /* the vanilla police box door data (ac_police_box.c) */
         };
         Door_data_c in = k_doors[s_which - 1];
         Door_data_c* out = Common_GetPointer(structure_exit_door_data);
@@ -50695,3 +50876,541 @@ void pc_net_game_dedicated_furniture(const char* args, void (*out)(const char*))
     out("FURNITURE usage: furniture list [acre] | furniture remove <x> <z> [delete] | furniture remove #<index> [delete] | furniture clear acre <n>|player <name> [delete]");
 }
 /* ===== OUTDOOR FURNITURE END ===== */
+
+/* ===== CHAT BEGIN (worker CH: messages 100 CHAT_SEND / 101 CHAT_MSG, pc_chat.h; PRESENTATION ONLY) =====
+ * Host: a READY + bound peer's CHAT_SEND is validated (size, type, length 1..60, every byte a chat font code, zero tail), rate limited (burst 3, one per 0.7 s),
+ * checked against the mute list (mutes.ini next to ops.ini, identity keys like the operator list) and the chat switch (settings.ini [Network] chat, env AC_MP_CHAT=0,
+ * console `chat on|off`), sanitized, logged ("[CHAT] name: text") and relayed as CHAT_MSG to every READY peer whose announced scene (id AND owner) equals the speaker's,
+ * plus the speaker itself (its echo). The listen host presents it when its own player is in that scene; its own player's lines take the same path locally.
+ * Every READY peer gets one CAPS (+ON) message, again when the switch changes; a client sends CHAT_SEND only after CAPS ON (an old host never announces it).
+ * Nothing here reads or writes items, bells, the world or the save; the text is never interpreted. */
+_Static_assert((int)PC_NETGAME_MSG_CHAT_SEND == PC_CHAT_MSG_SEND && (int)PC_NETGAME_MSG_CHAT_MSG == PC_CHAT_MSG_MSG, "chat message ids drifted (pc_chat.h)");
+_Static_assert(sizeof(PCChatSendMsg) == 68 && sizeof(PCChatMsg) == 80 && sizeof(PCChatMsg) <= PC_NET_MAX_PAYLOAD, "chat wire sizes");
+_Static_assert(PC_CHAT_NAME_LEN == PC_NETGAME_NAME_LEN && PC_OPS_KEY_LEN == 20, "chat name / identity key sizes");
+
+typedef struct PcngChatPeer {
+    uint8_t    caps_sent;
+    uint8_t    caps_on_sent;
+    PCChatRate rate;
+    uint32_t   notice_ms;
+} PcngChatPeer;
+static PcngChatPeer s_chat_peer[PC_NETGAME_WIRE_ID_SPACE];
+static int          s_chat_host_on = -1;  /* host: the session switch (-1 = not read yet: settings.ini / env) */
+static PCChatRate   s_chat_local_rate;    /* the listen host's own player (the same limit as a client) */
+static PCOpsList    s_chat_mutes;
+static int          s_chat_mutes_state = 0;
+static int          s_chat_cli_caps = 0;  /* client: 0 = no CAPS yet (old host), 1 = on, 2 = off */
+static uint16_t     s_chat_seq = 0;
+static struct {
+    uint32_t rx, relayed, bad, rate, muted, off;
+} s_chat_stats;
+
+int pc_net_game_chat_enabled_local(void) {
+    static int env = -2;
+    if (env == -2) {
+        const char* e = getenv("AC_MP_CHAT");
+        env = (e != NULL && e[0] == '0' && e[1] == '\0') ? 0 : 1;
+        if (!env) {
+            printf("[NET][CHAT] chat disabled by AC_MP_CHAT=0\n");
+        }
+    }
+    return env && g_pc_settings.chat;
+}
+
+static int pcnetgame_chat_host_on(void) {
+    if (s_chat_host_on < 0) {
+        s_chat_host_on = pc_net_game_chat_enabled_local();
+    }
+    return s_chat_host_on;
+}
+
+static void pcnetgame_chat_mutes_ensure(void) {
+    char path[320];
+    int bad = 0, rc;
+    if (s_chat_mutes_state != 0) {
+        return;
+    }
+    pcnetgame_ofurn_host_path(path, sizeof(path), "mutes.ini");
+    rc = pc_chat_mutes_load(path, &s_chat_mutes, &bad);
+    s_chat_mutes_state = 1;
+    printf("[NET][CHAT] host: mute list %s: %s, %d muted%s\n", path, rc == PC_OPS_OK ? "loaded" : rc == PC_OPS_MISSING ? "none yet" : "UNREADABLE (empty list)", s_chat_mutes.n,
+           bad > 0 ? " (some lines were skipped)" : "");
+}
+
+static int pcnetgame_chat_mutes_save(void) {
+    char path[320];
+    pcnetgame_ofurn_host_path(path, sizeof(path), "mutes.ini");
+    if (!pc_chat_mutes_save(path, &s_chat_mutes)) {
+        printf("[NET][CHAT] host: *** writing %s FAILED (the change is active in memory only) ***\n", path);
+        return 0;
+    }
+    return 1;
+}
+
+static int pcnetgame_chat_peer_muted(PCNetPeerId peer) {
+    int kind;
+    uint8_t key[PC_OPS_KEY_LEN];
+    if (!pcnetgame_peer_identity(peer, &kind, key, NULL)) {
+        return 0;
+    }
+    pcnetgame_chat_mutes_ensure();
+    return pc_ops_find(&s_chat_mutes, kind, key) >= 0;
+}
+
+static void pcnetgame_chat_local_name(uint8_t name[PC_CHAT_NAME_LEN]) {
+    Private_c* pr = Common_Get(now_private);
+    if (pr != NULL) {
+        memcpy(name, pr->player_ID.player_name, PC_CHAT_NAME_LEN);
+    } else {
+        memset(name, 32, PC_CHAT_NAME_LEN);
+    }
+}
+
+static int pcnetgame_chat_scene_of(int origin, PCNetPlayerScene* sc) {
+    if (origin == (int)PC_NETGAME_HOST_PLAYER_ID) {
+        if (!s_local_scene.valid || pc_host_observer_active() || g_pc_dedicated) {
+            return 0;
+        }
+        *sc = s_local_scene;
+        return 1;
+    }
+    return pc_remote_player_get_scene((PCNetPlayerId)origin, sc) && sc->valid;
+}
+
+static void pcnetgame_chat_build(PCChatMsg* m, int origin, uint8_t flags, uint8_t scene_id, const uint8_t* name, const uint8_t* text, int len, uint16_t seq) {
+    memset(m, 0, sizeof(*m));
+    m->msg_type = (uint8_t)PC_NETGAME_MSG_CHAT_MSG;
+    m->origin = (uint8_t)origin;
+    m->flags = flags;
+    m->len = (uint8_t)len;
+    m->seq = seq;
+    m->scene_id = scene_id;
+    if (name != NULL) {
+        memcpy(m->name, name, PC_CHAT_NAME_LEN);
+    }
+    if (len > 0) {
+        memcpy(m->text, text, (size_t)len);
+    }
+}
+
+static void pcnetgame_chat_send_caps(PCNetPeerId peer, int on) {
+    PCChatMsg m;
+    pcnetgame_chat_build(&m, PC_CHAT_ORIGIN_SERVER, (uint8_t)(PC_CHAT_F_CAPS | (on ? PC_CHAT_F_ON : 0u)), 0, NULL, NULL, 0, 0);
+    (void)pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+}
+
+/* a host notice line for one peer only, at most one per 2 s */
+static void pcnetgame_chat_notice(PCNetPeerId peer, const char* ascii) {
+    PCChatMsg m;
+    uint8_t codes[PC_CHAT_MAX_LEN];
+    const uint32_t now = pcnetgame_now_ms();
+    int n;
+    if (peer < 0 || peer >= PC_NETGAME_WIRE_ID_SPACE || (s_chat_peer[peer].notice_ms != 0 && (uint32_t)(now - s_chat_peer[peer].notice_ms) < 2000u)) {
+        return;
+    }
+    s_chat_peer[peer].notice_ms = now | 1u;
+    n = pc_chat_from_utf8(ascii, codes, PC_CHAT_MAX_LEN);
+    pcnetgame_chat_build(&m, PC_CHAT_ORIGIN_SERVER, PC_CHAT_F_NOTICE, 0, NULL, codes, n, 0);
+    (void)pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+}
+
+static void pcnetgame_chat_log_line(const char* who, const uint8_t* text, int len, const char* detail) {
+    char u[200];
+    pc_chat_to_utf8(text, len, u, (int)sizeof(u));
+    if (g_pc_dedicated) {
+        pc_dedicated_say("[CHAT] %s: %s", who, u); /* the console + servers/<id>/logs/server.log (moderation) */
+    } else {
+        printf("[CHAT] %s: %s\n", who, u);
+    }
+    printf("[NET][CHAT] host: %s\n", detail);
+}
+
+/* origin = a READY peer or PC_NETGAME_HOST_PLAYER_ID (the listen host's own player); text already sanitized */
+static void pcnetgame_chat_host_relay(int origin, const uint8_t name[PC_CHAT_NAME_LEN], const uint8_t* text, int len, uint16_t seq) {
+    PCNetPlayerScene ssc;
+    PCChatMsg m;
+    char nm[40], detail[160];
+    const int have = pcnetgame_chat_scene_of(origin, &ssc);
+    int i, n = 0, presented = 0;
+    pcnetgame_chat_build(&m, origin, 0, have ? ssc.scene_id : 0, name, text, len, seq);
+    for (i = 0; i < pcnetgame_peer_span() && i < PC_NETGAME_WIRE_ID_SPACE; i++) {
+        PCNetPlayerScene sc;
+        if (s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+            continue;
+        }
+        if (i == origin) {
+            (void)pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m)); /* the speaker's echo: it shows the host-validated text */
+            continue;
+        }
+        if (have && pc_remote_player_get_scene((PCNetPlayerId)i, &sc) && sc.valid && sc.scene_id == ssc.scene_id && sc.owner == ssc.owner) {
+            (void)pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+            n++;
+        }
+    }
+    if (!g_pc_dedicated && !pc_host_observer_active() && pc_net_game_chat_enabled_local()) {
+        if (origin == (int)PC_NETGAME_HOST_PLAYER_ID) {
+            pc_chat_on_line(origin, 1, 0, name, text, len);
+            presented = 1;
+        } else if (have && s_local_scene.valid && s_local_scene.scene_id == ssc.scene_id && s_local_scene.owner == ssc.owner) {
+            pc_chat_on_line(origin, 0, 0, name, text, len);
+            presented = 1;
+        }
+    }
+    s_chat_stats.relayed++;
+    pc_chat_name_to_utf8(name, nm, (int)sizeof(nm));
+    snprintf(detail, sizeof(detail), "chat from %d (\"%s\", seq %u, scene %s%u owner %u, len %d) -> %d peer(s) + echo%s", origin, nm, (unsigned)seq, have ? "" : "unknown ",
+             have ? (unsigned)ssc.scene_id : 0u, have ? (unsigned)ssc.owner : 0u, len, n, presented ? " + host screen" : "");
+    pcnetgame_chat_log_line(nm, text, len, detail);
+}
+
+static void pcnetgame_handle_host_chat(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
+    PCChatSendMsg m;
+    uint8_t clean[PC_CHAT_MAX_LEN];
+    int n;
+    if (peer < 0 || peer >= pcnetgame_peer_span() || peer >= PC_NETGAME_WIRE_ID_SPACE || s_host_peer_link[peer] != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (data[0] != (uint8_t)PC_NETGAME_MSG_CHAT_SEND) {
+        return; /* CHAT_MSG is host -> client only: a client never originates it. Dropped, never relayed. */
+    }
+    s_chat_stats.rx++;
+    if (size != sizeof(m) || !s_host_peer[peer].bound_valid) {
+        s_chat_stats.bad++;
+        printf("[NET][CHAT] host: peer %d CHAT_SEND dropped (%s)\n", (int)peer, size != sizeof(m) ? "wrong size" : "no bound identity");
+        return;
+    }
+    memcpy(&m, data, sizeof(m));
+    if (!pc_chat_send_valid(&m)) {
+        s_chat_stats.bad++;
+        printf("[NET][CHAT] host: peer %d CHAT_SEND dropped (malformed: len %u)\n", (int)peer, (unsigned)m.len);
+        return;
+    }
+    if (!pcnetgame_chat_host_on()) {
+        s_chat_stats.off++;
+        printf("[NET][CHAT] host: peer %d CHAT_SEND dropped (chat is off)\n", (int)peer);
+        pcnetgame_chat_notice(peer, "Chat is turned off on this server.");
+        return;
+    }
+    if (!pc_chat_rate_take(&s_chat_peer[peer].rate, pcnetgame_now_ms())) {
+        s_chat_stats.rate++;
+        printf("[NET][CHAT] host: peer %d CHAT_SEND dropped (rate limit)\n", (int)peer);
+        pcnetgame_chat_notice(peer, "You are sending messages too fast.");
+        return;
+    }
+    if (pcnetgame_chat_peer_muted(peer)) {
+        s_chat_stats.muted++;
+        printf("[NET][CHAT] host: peer %d CHAT_SEND dropped (muted)\n", (int)peer);
+        pcnetgame_chat_notice(peer, "You are muted on this server.");
+        return;
+    }
+    n = pc_chat_sanitize(m.text, m.len, clean);
+    if (n <= 0) {
+        s_chat_stats.bad++;
+        printf("[NET][CHAT] host: peer %d CHAT_SEND dropped (blank)\n", (int)peer);
+        return;
+    }
+    pcnetgame_chat_host_relay((int)peer, s_host_peer[peer].bound_pid.player_name, clean, n, m.seq);
+}
+
+static void pcnetgame_handle_client_chat(const uint8_t* data, uint16_t size) {
+    PCChatMsg m;
+    uint8_t clean[PC_CHAT_MAX_LEN];
+    int n, self;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY) {
+        return;
+    }
+    if (size != sizeof(m)) {
+        printf("[NET][CHAT] client: CHAT_MSG dropped (wrong size %u)\n", (unsigned)size);
+        return;
+    }
+    memcpy(&m, data, sizeof(m));
+    if (!pc_chat_msg_valid(&m)) {
+        printf("[NET][CHAT] client: CHAT_MSG dropped (malformed)\n");
+        return;
+    }
+    if (m.flags & PC_CHAT_F_CAPS) {
+        const int now_on = (m.flags & PC_CHAT_F_ON) ? 1 : 2;
+        if (now_on != s_chat_cli_caps) {
+            printf("[NET][CHAT] client: the host announced chat %s\n", now_on == 1 ? "ON" : "OFF");
+        }
+        s_chat_cli_caps = now_on;
+        return;
+    }
+    if (!pc_net_game_chat_enabled_local()) {
+        return; /* this player turned the chat off: nothing is shown */
+    }
+    n = pc_chat_sanitize(m.text, m.len, clean);
+    if (n <= 0) {
+        return;
+    }
+    if (m.flags & (PC_CHAT_F_SERVER | PC_CHAT_F_NOTICE)) {
+        pc_chat_on_line(-1, 0, (uint8_t)(m.flags & (PC_CHAT_F_SERVER | PC_CHAT_F_NOTICE)), m.name, clean, n);
+        return;
+    }
+    self = m.origin == (uint8_t)s_client_assigned_peer_id;
+    pc_chat_on_line((int)m.origin, self, 0, m.name, clean, n);
+}
+
+int pc_net_game_chat_available(const char** why) {
+    if (why != NULL) {
+        *why = NULL;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        if (g_pc_dedicated || pc_host_observer_active()) {
+            return 0;
+        }
+        if (!pc_net_game_chat_enabled_local() || !pcnetgame_chat_host_on()) {
+            if (why != NULL) *why = "Chat is turned off (settings.ini chat = 0)";
+            return 0;
+        }
+        return 1;
+    }
+    if (s_role == PC_NETGAME_ROLE_CLIENT) {
+        if (!pc_net_game_chat_enabled_local()) {
+            if (why != NULL) *why = "Chat is turned off (settings.ini chat = 0)";
+            return 0;
+        }
+        if (s_client_link != PC_NETGAME_LINK_READY) {
+            if (why != NULL) *why = "Not connected to the host";
+            return 0;
+        }
+        if (s_chat_cli_caps == 1) {
+            return 1;
+        }
+        if (why != NULL) *why = s_chat_cli_caps == 2 ? "Chat is turned off on this server" : "Chat is not available on this server";
+        return 0;
+    }
+    return 0;
+}
+
+int pc_net_game_chat_send(const uint8_t* codes, int len) {
+    uint8_t clean[PC_CHAT_MAX_LEN];
+    const int n = pc_chat_sanitize(codes, len, clean);
+    if (n <= 0 || !pc_net_game_chat_available(NULL)) {
+        return 0;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        uint8_t name[PC_CHAT_NAME_LEN];
+        if (!pc_chat_rate_take(&s_chat_local_rate, pcnetgame_now_ms())) {
+            pc_chat_local_notice("You are sending messages too fast.");
+            return 0;
+        }
+        pcnetgame_chat_local_name(name);
+        pcnetgame_chat_host_relay((int)PC_NETGAME_HOST_PLAYER_ID, name, clean, n, ++s_chat_seq);
+        return 1;
+    }
+    {
+        PCChatSendMsg m;
+        memset(&m, 0, sizeof(m));
+        m.msg_type = (uint8_t)PC_NETGAME_MSG_CHAT_SEND;
+        m.len = (uint8_t)n;
+        m.seq = ++s_chat_seq;
+        memcpy(m.text, clean, (size_t)n);
+        (void)pc_net_send(0, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+        printf("[NET][CHAT] client: CHAT_SEND seq %u len %d\n", (unsigned)m.seq, n);
+        return 1;
+    }
+}
+
+/* TEST-ONLY (PC_NET_TEST_HOOKS builds, AC_TEST_HOOKS=1 + AC_TEST_CHAT_SEND=<text>; optional AC_TEST_CHAT_SEND_DELAY_MS, default 3000): once the chat is available
+ * (a listen host: and at least one peer is READY) and the player has been in free play for DELAY ms, the text goes through the REAL send path
+ * (pc_chat_submit_utf8 -> pc_net_game_chat_send), exactly what Enter on the chat line does. Never active in normal play. */
+static void pcnetgame_chat_test_hook(void) {
+    static int done = 0;
+    static uint32_t ok_since = 0, delay = 3000u;
+    const char* e;
+    uint32_t now;
+    int i, peers = 0;
+    pc_chat_test_type_tick(); /* AC_TEST_CHAT_TYPE: the keyboard-path variant (pc_chat_ui.c) */
+    if (done) {
+        return;
+    }
+    if ((e = pc_test_hook_getenv("AC_TEST_CHAT_SEND")) == NULL || e[0] == '\0') {
+        done = 1;
+        return;
+    }
+    if (ok_since == 0) {
+        const char* d = pc_test_hook_getenv("AC_TEST_CHAT_SEND_DELAY_MS");
+        if (d != NULL && atoi(d) > 0) {
+            delay = (uint32_t)atoi(d);
+        }
+    }
+    for (i = 0; s_role == PC_NETGAME_ROLE_HOST && i < pcnetgame_peer_span(); i++) {
+        PCNetPlayerScene sc;
+        peers += s_host_peer_link[i] == PC_NETGAME_LINK_READY && s_local_scene.valid && pc_remote_player_get_scene((PCNetPlayerId)i, &sc) && sc.valid &&
+                 sc.scene_id == s_local_scene.scene_id && sc.owner == s_local_scene.owner; /* a listen host waits for a READY peer in its own scene */
+    }
+    if (!pc_net_game_chat_available(NULL) || !pc_chat_can_open() || (s_role == PC_NETGAME_ROLE_HOST && peers == 0)) {
+        ok_since = 0;
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (ok_since == 0) {
+        ok_since = now | 1u;
+        return;
+    }
+    if ((uint32_t)(now - ok_since) < delay) {
+        return;
+    }
+    done = 1;
+    printf("[CHAT][TEST] AC_TEST_CHAT_SEND through the real send path: %s\n", pc_chat_submit_utf8(e) ? "sent" : "REFUSED");
+}
+
+static void pcnetgame_chat_host_tick(void) {
+    const int on = pcnetgame_chat_host_on();
+    int i;
+    for (i = 0; i < pcnetgame_peer_span() && i < PC_NETGAME_WIRE_ID_SPACE; i++) {
+        if (s_host_peer_link[i] != PC_NETGAME_LINK_READY) {
+            if (s_chat_peer[i].caps_sent || s_chat_peer[i].rate.init) {
+                memset(&s_chat_peer[i], 0, sizeof(s_chat_peer[i])); /* a new session in this slot starts fresh */
+            }
+            continue;
+        }
+        if (!s_chat_peer[i].caps_sent || s_chat_peer[i].caps_on_sent != (uint8_t)on) {
+            pcnetgame_chat_send_caps((PCNetPeerId)i, on);
+            s_chat_peer[i].caps_sent = 1;
+            s_chat_peer[i].caps_on_sent = (uint8_t)on;
+        }
+    }
+    pcnetgame_chat_test_hook();
+}
+
+static void pcnetgame_chat_client_tick(void) {
+    if (s_client_link != PC_NETGAME_LINK_READY) {
+        if (s_chat_cli_caps != 0) {
+            s_chat_cli_caps = 0; /* per session: the next host announces again (or never: an old host) */
+            pc_chat_reset_session();
+        }
+        return;
+    }
+    pcnetgame_chat_test_hook();
+}
+
+/* console (pc_dedicated.c): `say <text>` | `mute <player>` | `unmute <player>` | `mutes` | `chat [on|off]` */
+void pc_net_game_dedicated_chat(const char* cmd, const char* args, void (*out)(const char*)) {
+    char line[400];
+    const char* a = args != NULL ? args : "";
+    while (*a == ' ' || *a == '\t') {
+        a++;
+    }
+    if (out == NULL) {
+        return;
+    }
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready) {
+        out("CHAT FAILED: the server is not a ready host yet");
+        return;
+    }
+    if (strcmp(cmd, "say") == 0) {
+        uint8_t codes[PC_CHAT_MAX_LEN], clean[PC_CHAT_MAX_LEN];
+        PCChatMsg m;
+        int n = pc_chat_from_utf8(a, codes, PC_CHAT_MAX_LEN), i, k = 0;
+        n = pc_chat_sanitize(codes, n, clean);
+        if (n <= 0) {
+            out("SAY usage: say <text> (up to 60 characters; shown to every player as a server announcement)");
+            return;
+        }
+        pcnetgame_chat_build(&m, PC_CHAT_ORIGIN_SERVER, PC_CHAT_F_SERVER, 0, NULL, clean, n, ++s_chat_seq);
+        for (i = 0; i < pcnetgame_peer_span() && i < PC_NETGAME_WIRE_ID_SPACE; i++) {
+            if (s_host_peer_link[i] == PC_NETGAME_LINK_READY) {
+                (void)pc_net_send((PCNetPeerId)i, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m));
+                k++;
+            }
+        }
+        if (!g_pc_dedicated && !pc_host_observer_active() && pc_net_game_chat_enabled_local()) {
+            static const uint8_t none[PC_CHAT_NAME_LEN] = { 0 };
+            pc_chat_on_line(-1, 0, PC_CHAT_F_SERVER, none, clean, n);
+        }
+        snprintf(line, sizeof(line), "announcement to %d player(s)", k);
+        pcnetgame_chat_log_line("[server]", clean, n, line);
+        snprintf(line, sizeof(line), "[DEDICATED] say: sent to %d player(s)%s", k, n < (int)strlen(a) ? " (shortened / unsupported characters replaced)" : "");
+        out(line);
+        return;
+    }
+    if (strcmp(cmd, "chat") == 0) {
+        if (strcmp(a, "on") == 0 || strcmp(a, "off") == 0) {
+            s_chat_host_on = strcmp(a, "on") == 0;
+            printf("[NET][CHAT] host: chat switched %s by the console\n", s_chat_host_on ? "ON" : "OFF"); /* the CAPS change reaches every READY peer at the next tick */
+        } else if (a[0] != '\0') {
+            out("CHAT usage: chat [on|off] (this session; settings.ini [Network] chat = 0|1 sets the start value)");
+            return;
+        }
+        snprintf(line, sizeof(line), "[DEDICATED] chat: %s (%d muted; messages relayed %u, dropped: rate %u, muted %u, malformed %u, off %u)", pcnetgame_chat_host_on() ? "ON" : "OFF",
+                 (pcnetgame_chat_mutes_ensure(), s_chat_mutes.n), (unsigned)s_chat_stats.relayed, (unsigned)s_chat_stats.rate, (unsigned)s_chat_stats.muted,
+                 (unsigned)s_chat_stats.bad, (unsigned)s_chat_stats.off);
+        out(line);
+        return;
+    }
+    pcnetgame_chat_mutes_ensure();
+    if (strcmp(cmd, "mutes") == 0) {
+        int i;
+        snprintf(line, sizeof(line), "[DEDICATED] mutes: %d muted player(s)%s", s_chat_mutes.n, s_chat_mutes.n ? ":" : " (add with `mute <player>`)");
+        out(line);
+        for (i = 0; i < s_chat_mutes.n; i++) {
+            snprintf(line, sizeof(line), "  %d: %s \"%s\"", i, pc_ops_kind_name(s_chat_mutes.e[i].kind), s_chat_mutes.e[i].name);
+            out(line);
+        }
+        return;
+    }
+    if (strcmp(cmd, "mute") == 0 || strcmp(cmd, "unmute") == 0) {
+        const int mute = strcmp(cmd, "mute") == 0;
+        PcngOpsCand c[8];
+        int n, r, i, p;
+        if (a[0] == '\0') {
+            snprintf(line, sizeof(line), "%s usage: %s <player name | peer N>", mute ? "MUTE" : "UNMUTE", cmd);
+            out(line);
+            return;
+        }
+        n = pcnetgame_ops_resolve(a, c, 8);
+        if (n == 0 && !mute) {
+            for (i = 0; i < s_chat_mutes.n; i++) {
+                if (pcnetgame_dedicated_ieq(s_chat_mutes.e[i].name, a)) {
+                    const PCOpsEntry e = s_chat_mutes.e[i];
+                    (void)pc_ops_remove(&s_chat_mutes, e.kind, e.key);
+                    (void)pcnetgame_chat_mutes_save();
+                    snprintf(line, sizeof(line), "[DEDICATED] unmute: \"%s\" (%s, by its listed name) is no longer muted", e.name, pc_ops_kind_name(e.kind));
+                    out(line);
+                    return;
+                }
+            }
+        }
+        if (n == 0) {
+            snprintf(line, sizeof(line), "%s REFUSED: no player named \"%s\" (online, resident or guest of this town; see `players`, `residents`, `guests`)", mute ? "MUTE" : "UNMUTE", a);
+            out(line);
+            return;
+        }
+        if (n > 1) {
+            size_t used = (size_t)snprintf(line, sizeof(line), "%s REFUSED: \"%s\" is ambiguous (%d players have that name):", mute ? "MUTE" : "UNMUTE", a, n);
+            for (i = 0; i < n && used + 64 < sizeof(line); i++) {
+                used += (size_t)snprintf(line + used, sizeof(line) - used, " [%s %s]", pc_ops_kind_name(c[i].kind), c[i].where);
+            }
+            if (used + 40 < sizeof(line)) {
+                snprintf(line + used, sizeof(line) - used, " -- use `peer N` while that player is online");
+            }
+            out(line);
+            return;
+        }
+        r = mute ? pc_ops_add(&s_chat_mutes, c[0].kind, c[0].key, c[0].name) : pc_ops_remove(&s_chat_mutes, c[0].kind, c[0].key);
+        if (r < 0) {
+            out("MUTE REFUSED: the mute list is full");
+            return;
+        }
+        if (r == 1) {
+            (void)pcnetgame_chat_mutes_save();
+        }
+        for (p = 0; r == 1 && p < pcnetgame_peer_span() && p < PC_NETGAME_WIRE_ID_SPACE; p++) {
+            int kind;
+            uint8_t key[PC_OPS_KEY_LEN];
+            if (pcnetgame_peer_identity((PCNetPeerId)p, &kind, key, NULL) && kind == c[0].kind && memcmp(key, c[0].key, PC_OPS_KEY_LEN) == 0) {
+                s_chat_peer[p].notice_ms = 0;
+                pcnetgame_chat_notice((PCNetPeerId)p, mute ? "You were muted by the server." : "You are no longer muted.");
+            }
+        }
+        snprintf(line, sizeof(line), "[DEDICATED] %s: \"%s\" (%s, %s) %s", cmd, c[0].name, pc_ops_kind_name(c[0].kind), c[0].where,
+                 mute ? (r == 1 ? "is now muted" : "was already muted") : (r == 1 ? "is no longer muted" : "was not muted"));
+        out(line);
+        printf("[NET][CHAT] host: %s \"%s\" (%s) -> %s\n", cmd, c[0].name, pc_ops_kind_name(c[0].kind), r == 1 ? "changed" : "unchanged");
+        return;
+    }
+    out("CHAT: unknown chat command");
+}
+/* ===== CHAT END ===== */

@@ -10,14 +10,43 @@
 #include "sys_matrix.h"
 #include "libc/math.h"
 
+#ifdef TARGET_PC
+#include <stdio.h>
+#include "pc_net_game.h"
+#endif
+
 static mNT_Ovl_c notice_ovl_data;
 
+/* Notice board latency (worker BB): add_calc (m_lib.c) ALREADY converts its easing rate (1 - (1 - rate)^dt) and both step limits (* dt)
+ * to the frame's dt. This wrapper used to convert them a SECOND time, so the page turn / slide-to-write / slide-back-to-read eased
+ * with dt^2: exactly vanilla at 60 fps, but 2x slower at 120 fps, 4x at 240, ~16x at 1000 fps (an uncapped client, max_fps = 0:
+ * a single page turn took ~3 s instead of ~0.18 s and the board ignores input while a page moves). Same fix as mCD_add_calc_dt. */
 static f32 mNT_add_calc_dt(f32* value, f32 target, f32 rate, f32 max_step, f32 min_step) {
-    f32 dt = (f32)gamePT->graph->dt_num_60fps_frames;
-    f32 dt_rate = 1.0f - powf(1.0f - rate, dt);
-
-    return add_calc(value, target, dt_rate, max_step * dt, min_step * dt);
+    return add_calc(value, target, rate, max_step, min_step);
 }
+
+#ifdef TARGET_PC
+/* '[NET][PAGE] board action took N ms (...)': wall-clock duration of each board UI action, so a slow board can be diagnosed from client_log.txt */
+static u32 s_mNT_pc_t0;
+static const char* s_mNT_pc_what;
+static void mNT_pc_action_begin(const char* what) {
+    s_mNT_pc_t0 = pc_net_game_now_ms();
+    s_mNT_pc_what = what;
+}
+static void mNT_pc_action_end(void) {
+    if (s_mNT_pc_what != NULL) {
+        f32 dt = (f32)gamePT->graph->dt_num_60fps_frames;
+        printf("[NET][PAGE] board action took %u ms (%s, ~%d fps)\n", (unsigned)(pc_net_game_now_ms() - s_mNT_pc_t0), s_mNT_pc_what,
+               dt > 0.0f ? (int)(60.0f / dt + 0.5f) : 0);
+        s_mNT_pc_what = NULL;
+    }
+}
+#define mNT_PC_BEGIN(what) mNT_pc_action_begin(what)
+#define mNT_PC_END() mNT_pc_action_end()
+#else
+#define mNT_PC_BEGIN(what) ((void)0)
+#define mNT_PC_END() ((void)0)
+#endif
 
 extern u8 kei_win_st1_tex_rgb_ia8[];
 extern u8 kei_win_st2_tex_rgb_ia8[];
@@ -121,7 +150,23 @@ static void mNT_roll_control(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     }
 }
 
+static void mNT_roll_control2_step(mSM_MenuInfo_c* menu_info);
+
 static void mNT_roll_control2(mSM_MenuInfo_c* menu_info) {
+#ifdef TARGET_PC
+    /* the scroll back after editing is a per-frame (60 Hz) ramp in vanilla: run it once per elapsed 60 Hz tick so it takes the same wall time at any fps */
+    static float s_accum = 0.0f;
+    int ticks = graph_dt_60hz_ticks(gamePT, &s_accum);
+
+    while (ticks-- > 0) {
+        mNT_roll_control2_step(menu_info);
+    }
+#else
+    mNT_roll_control2_step(menu_info);
+#endif
+}
+
+static void mNT_roll_control2_step(mSM_MenuInfo_c* menu_info) {
     f32 next_pos = menu_info->position[1] - menu_info->speed[1];
 
     if (menu_info->speed[1] < 1.0f) {
@@ -166,6 +211,7 @@ static void mNT_Play_page_read(Submenu* submenu, mSM_MenuInfo_c* menu_info, mNT_
                (stick_area == mED_STICK_AREA_TOP || chkTrigger(BUTTON_CUP))) {
         move_page = (notice_ovl->page_count - notice_ovl->now_page) - 1;
     } else if (chkTrigger(BUTTON_A)) {
+        mNT_PC_BEGIN("slide to the new post page");
         notice_ovl->mode = mNT_PLAY_PAGE_TO_WRITE;
         notice_ovl->now_page = mNtc_BOARD_POST_COUNT;
         menu_info->position[0] = 320.0f;
@@ -175,11 +221,13 @@ static void mNT_Play_page_read(Submenu* submenu, mSM_MenuInfo_c* menu_info, mNT_
         mSM_open_submenu_new2(submenu, mSM_OVL_EDITOR, mED_TYPE_NOTICE, 32, notice_ovl->post.message,
                               sizeof(notice_ovl->post.message));
     } else if ((chkTrigger(BUTTON_B) | chkTrigger(BUTTON_START))) {
+        mNT_PC_BEGIN("close");
         (*submenu->overlay->move_chg_base_proc)(menu_info, mSM_MOVE_OUT_TOP);
         sAdo_SysTrgStart(0x17D);
     }
 
     if (move_page != 0) {
+        mNT_PC_BEGIN(ABS(move_page) == 1 ? "page turn" : "page jump");
 
         move_time = ABS(move_page);
         notice_ovl->mode = mNT_PLAY_PAGE_MOVE;
@@ -244,6 +292,7 @@ static void mNT_Play_page_move(Submenu* submenu, mSM_MenuInfo_c* menu_info, mNT_
             menu_info->position[0] = 0.0f;
             notice_ovl->disp_page = notice_ovl->now_page;
             notice_ovl->mode = mNT_PLAY_PAGE_READ;
+            mNT_PC_END();
         } else {
             sAdo_SysTrgStart(0x5F);
             notice_ovl->disp_page = notice_ovl->now_page;
@@ -283,6 +332,7 @@ static void mNT_Play_page_to_write(Submenu* submenu, mSM_MenuInfo_c* menu_info, 
 
     if (page_stopped && control_stopped) {
         menu_info->proc_status = mSM_OVL_PROC_WAIT;
+        mNT_PC_END();
     }
 }
 
@@ -310,6 +360,7 @@ static void mNT_Play_page_to_read(Submenu* submenu, mSM_MenuInfo_c* menu_info, m
 
     if (page_stopped && control_stopped) {
         notice_ovl->mode = mNT_PLAY_PAGE_READ;
+        mNT_PC_END();
     }
 }
 
@@ -326,6 +377,11 @@ static void mNT_move_Play(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 
     mNT_Ovl_c* notice_ovl = submenu->overlay->notice_ovl;
 
+#ifdef TARGET_PC
+    if (s_mNT_pc_what != NULL && s_mNT_pc_t0 != 0u && notice_ovl->mode == mNT_PLAY_PAGE_READ && s_mNT_pc_what[0] == 'o') {
+        mNT_PC_END(); /* "open (board slid in)": the first PLAY frame */
+    }
+#endif
     (*move_proc[notice_ovl->mode])(submenu, menu_info, notice_ovl);
 }
 
@@ -347,7 +403,9 @@ static void mNT_move_Obey(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     mNT_roll_control2(menu_info);
     if (editEndChk_menu->proc_status == mSM_OVL_PROC_MOVE && editEndChk_menu->next_proc_status == mSM_OVL_PROC_END) {
         if (editEndChk_menu->data1 == 0) {
+            mNT_PC_BEGIN("post written to the board (the town page sync sends it on the next frame)");
             mNtc_notice_write(&notice_ovl->post);
+            mNT_PC_END();
             (*submenu->overlay->move_chg_base_proc)(menu_info, mSM_MOVE_OUT_TOP);
             mNT_finish_notice_first_job();
         } else if (editEndChk_menu->data1 == 1) {
@@ -355,6 +413,7 @@ static void mNT_move_Obey(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                                   sizeof(notice_ovl->post.message));
             menu_info->proc_status = mSM_OVL_PROC_PLAY;
         } else {
+            mNT_PC_BEGIN("slide back to reading");
             menu_info->proc_status = mSM_OVL_PROC_PLAY;
             notice_ovl->mode = mNT_PLAY_PAGE_TO_READ;
             notice_ovl->now_page = notice_ovl->page_count - 1;
@@ -707,6 +766,7 @@ static void mNT_notice_ovl_init(Submenu* submenu) {
     (*submenu->overlay->move_chg_base_proc)(menu_info, mSM_MOVE_IN_TOP);
     sAdo_SysTrgStart(0x17C);
     mNT_set_init_data(submenu->overlay->notice_ovl, menu_info);
+    mNT_PC_BEGIN("open (board slid in)");
     submenu->overlay->notice_ovl->stick_area = mED_STICK_AREA_CENTER;
     mBGMPsComp_pause(3);
 }
@@ -725,5 +785,6 @@ extern void mNT_notice_ovl_construct(Submenu* submenu) {
 }
 
 extern void mNT_notice_ovl_destruct(Submenu* submenu) {
+    mNT_PC_END(); /* "close" */
     submenu->overlay->notice_ovl = NULL;
 }

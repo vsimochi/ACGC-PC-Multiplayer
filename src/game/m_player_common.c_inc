@@ -7811,6 +7811,15 @@ static int Player_actor_CheckAndRequest_main_pickup_all(GAME* game) {
                             return TRUE;
                         }
                     } else {
+#ifdef TARGET_PC
+                        /* Full-pocket pickup: a network client never gets the vanilla swap menu for a shared field item (the pickup seam
+                         * forces exchange_flag off) and the host is never asked when nothing could receive the item, so a pickup animation
+                         * here would only pretend. Play the vanilla 'pockets full' refusal instead: no animation, the item stays. */
+                        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_own_room_local() &&
+                            pc_net_game_client_pickup_no_room(changed_item)) {
+                            Player_actor_Request_main_refuse_pickup_all(game, FALSE);
+                        } else
+#endif
                         if (slot_idx >= 0 || can_exchange) {
                             if (Player_actor_request_main_pickup(game, changed_item, &target_pos, &item_pos, slot_idx,
                                                                  item_is_signboard)) {

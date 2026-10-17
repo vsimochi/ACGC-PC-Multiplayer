@@ -9,6 +9,8 @@ SKIPPED when git / the tag is not available). Runtime counterpart: test_museum_m
 The table (request -> 0.1.1 host behaviour -> how the new client stays safe):
   msg 77/78/79/80/81/84/85/86/87/91/96 (TREE_DROP, SHOP_PREVIEW, BALL_*, BEE_SWARM, DRESSER_QUERY, SHOP_UPGRADE_REQ, WILDLIFE_TOOL_ACTION, GHOST_HUNT, PVP_HIT_REQ, ACTION_EXT)
       -> no branch in the 0.1.1 dispatcher: "malformed / short / unrecognized: ignore" (no violation)              -> nothing needed
+  msg 100 CHAT_SEND (text chat) -> the same silent ignore on an old host; the new client also never sends it there: CHAT_SEND only after the host's CHAT_MSG CAPS ON
+      (an old host never announces it: "Chat is not available on this server"); msg 101 CHAT_MSG on an OLD CLIENT -> its client dispatcher's silent ignore
   TXN kind 18 DRESSER   -> 0.1.1: unknown kind = BAD_SHAPE + violation  -> sent only after the host's DRESSER_STATE (83) enabled it (s_dresser_cli_enabled)
   TXN kind 19 MUSEUM_MAIL -> 0.1.1: unknown kind = BAD_SHAPE + violation -> sent only when the host announced town service 6, latched off after one BAD_SHAPE
   TXN kind 20 HOUSE_UPGRADE -> 0.1.1: unknown kind = BAD_SHAPE + violation -> same gate + latch (worker C)
@@ -89,6 +91,15 @@ ck("K22 OUTDOOR_FURNITURE: pcnetgame_ofurn_client_can() needs a validated servic
        "int pc_net_game_ofurn_pickup(int ut_x, int ut_z) {")) and ng.count("pcnetgame_ofurn_begin(PC_OFURN_OP_") == 3)
 ck("K22b the client applies service 10 only after the strict pc_ofurn_caps_valid() (an unknown flag / version: ignored, no Place) and message 98 only after pc_ofurn_msg_valid()",
    "svc == (int)PC_NETGAME_TS_OFURN ? pc_ofurn_caps_valid(m.blob)" in ng and "if (!pc_ofurn_msg_valid(m)) {" in body(ng, "static void pcnetgame_handle_client_ofurn(const PCOfurnMsg* m) {"))
+ca = body(ng, "int pc_net_game_chat_available(const char** why) {")
+cs = body(ng, "int pc_net_game_chat_send(const uint8_t* codes, int len) {")
+cc = body(ng, "static void pcnetgame_handle_client_chat(const uint8_t* data, uint16_t size) {")
+ck("K100 CHAT_SEND: a client sends it only when pc_net_game_chat_available() (READY + s_chat_cli_caps == 1); s_chat_cli_caps becomes 1 only from a validated CHAT_MSG CAPS+ON "
+   "(pc_chat_msg_valid first) and is reset per session; CHAT_SEND is built nowhere else",
+   "s_chat_cli_caps == 1" in ca and "s_client_link != PC_NETGAME_LINK_READY" in ca and "!pc_net_game_chat_available(NULL)" in cs and
+   cc.index("pc_chat_msg_valid(&m)") < cc.index("s_chat_cli_caps = now_on;") and "(m.flags & PC_CHAT_F_ON) ? 1 : 2" in cc and
+   ng.count("m.msg_type = (uint8_t)PC_NETGAME_MSG_CHAT_SEND;") == 1 and "m.msg_type = (uint8_t)PC_NETGAME_MSG_CHAT_SEND;" in cs and
+   "s_chat_cli_caps = 0;" in body(ng, "static void pcnetgame_chat_client_tick(void) {"))
 gu = body(ng, "static int pcnetgame_client_guest_mailbox_usable(void) {")
 ck("K13 guest MAIL_TAKE / 'Check my mail.': only when the host fed a guest mailbox (s_mbox_host_fed && s_mbox_guest)", "s_mbox_host_fed && s_mbox_guest" in gu)
 
@@ -106,11 +117,15 @@ else:
     new_ids = {"TREE_DROP": 77, "SHOP_PREVIEW": 78, "BALL_STATE": 79, "BALL_KICK_REQUEST": 80, "BEE_SWARM": 81, "DRESSER_STATE": 83, "DRESSER_QUERY": 84,
                "SHOP_UPGRADE_REQ": 85, "WILDLIFE_TOOL_ACTION": 86, "GHOST_HUNT": 87, "VILLAGER_OUTFIT": 90, "PVP_HIT_REQ": 91, "PVP_HIT": 92,
                "ACTION_EXT": 96,  # worker P2 puppet ACTION_EXT (presentation only, see test_action_ext_src.py)
-               "OUTDOOR_FURN": 98}  # outdoor furniture C1: host -> client only (a 0.1.1 / 0.2.x CLIENT ignores it: the client dispatcher's 'unrecognized: ignore')
+               "OUTDOOR_FURN": 98,  # outdoor furniture C1: host -> client only (a 0.1.1 / 0.2.x CLIENT ignores it: the client dispatcher's 'unrecognized: ignore')
+               "CHAT_SEND": 100, "CHAT_MSG": 101}  # text chat (worker CH): C -> H (gated by CAPS, see K100) / H -> C (an old client's silent ignore, O8)
     enum_re = r"^\s*PC_NETGAME_MSG_(\w+)\s*=\s*(\d+)\s*,"
     old_ids = {k: int(v) for k, v in re.findall(enum_re, old, re.M)}
     cur_ids = {k: int(v) for k, v in re.findall(enum_re, ng, re.M)}
     rng = re.findall(r"data\[0\] >= \(uint8_t\)PC_NETGAME_MSG_(\w+) && data\[0\] <= \(uint8_t\)PC_NETGAME_MSG_(\w+)", hd)
+    cd = body(old, "static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {")
+    ck("O8 the 0.1.1 CLIENT dispatcher ends with the silent 'unrecognized: ignore' (an old client drops CHAT_MSG 101 / the CAPS announcement without a reaction)",
+       cd.rstrip().endswith("/* malformed/short/unrecognized: ignore */") and not re.search(r"PC_NETGAME_MSG_\w+\s*=\s*10[01]", old))
     ck("O2 the new ids 77-81, 83-87, 90-92, 96 are unknown to 0.1.1 (its ids end at %s) and fall in none of its range branches %s" % (max(old_ids.values() or [0]), rng),
        all(cur_ids.get(k) == v for k, v in new_ids.items()) and old_ids and max(old_ids.values()) == 76 and not (set(new_ids.values()) & set(old_ids.values()))
        and all(old_ids[b] < 77 for _a, b in rng))

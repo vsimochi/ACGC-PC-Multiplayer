@@ -38,6 +38,7 @@ typedef struct {
     int npc_fallback;     /* CLIENT: 1 (default) = a villager the host does not simulate (no NPC_MOVE for 2.5 s) runs the local vanilla AI instead of standing still (pc_npc_authority.h); env AC_MP_NPC_FALLBACK=0 too */
     int npc_relay;        /* BOTH: 1 (default) = such a villager's pose is relayed through the host to the other players (NPC_PROXY_MOVE); env AC_MP_NPC_RELAY=0 too */
     int town_serve;       /* HOST only (M-B): serve the town to pre-boot --town-fetch clients: -1 = AUTO (default: on for a --dedicated host, off otherwise), 0 = OFF, 1 = a SANITIZED copy (M-G), 2 = the full GCI (every resident's private data) */
+    int chat;             /* [Network] chat (worker CH): 1 (default) = the multiplayer text chat (host: serve it; client: the chat key + bubbles), 0 = off. Env AC_MP_CHAT=0 too */
 } PCSettings;
 
 extern PCSettings g_pc_settings;

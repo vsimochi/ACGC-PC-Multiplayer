@@ -99,9 +99,12 @@ def main():
           "SCENE_COTTAGE_MY" in shown and "SCENE_COTTAGE_NPC" in shown and "ls.scene_id == sid" in shown and "play->scene_id == sid" in shown and
           "ls.owner == slot->scene.owner" in shown and "PC_NETSCENE_KIND_OTHER_INTERIOR" in shown and "default:" in shown)
     check("the shown predicate is used ONLY in dw and collide_eval (shared-interior collision); fx, arrival train, door pick/wrapper stay field-only",
-          # 4 = definition + dw + collide_eval + pc_puppet_aext_snd (ACTION_EXT cue SOUND only: sounds are allowed in shared interiors by design)
-          rp.count("pc_remote_player_scene_is_local_shown(") == 4 and "pc_remote_player_scene_is_local_shown(" in dw and
+          # 5 = definition + dw + collide_eval + pc_puppet_aext_snd (ACTION_EXT cue SOUND only: sounds are allowed in shared interiors by design)
+          #   + pc_puppet_cloth_step (clothes-change anim: a local 'shown' flag only picks present-vs-instant-release of the puppet's own change cue; it drives puppet
+          #   draw/sound cues and puppet-local counters, never game state)
+          rp.count("pc_remote_player_scene_is_local_shown(") == 5 and "pc_remote_player_scene_is_local_shown(" in dw and
           "pc_remote_player_scene_is_local_shown(" in func(rp, "static void pc_puppet_aext_snd(") and
+          "pc_remote_player_scene_is_local_shown(" in func(rp, "static int pc_puppet_cloth_step(") and
           "pc_remote_player_scene_is_local_shown(" in func(rp, "static const char* pc_remote_player_collide_eval(") and
           all("pc_remote_player_scene_is_local_shown" not in func(rp, sig) for sig in
               ("static void pc_remote_player_arrival_train_poll(",

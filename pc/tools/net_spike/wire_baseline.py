@@ -69,15 +69,17 @@ EXPECTED_MAX_MSG_ID = 76
 # range and may be present or absent while workers land: 77 TREE_DROP, 78 SHOP_PREVIEW, 79 / 80 ball, 81 BEE_SWARM, 82 bees spare,
 # 83 / 84 dresser storage, 85 SHOP_UPGRADE_REQ (the announced 5-minute shop upgrade, client -> host, 8 B; deliberate, no protocol bump).
 # Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
-SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98, 99)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
+SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98, 99) + (100, 101)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
 # player-vs-player tool hits (deliberate, no protocol bump): 91 PVP_HIT_REQ (client -> host, 16 B), 92 PVP_HIT (host -> the victim only, 12 B); the
 # wire structs are PCPvpHitReqMsg / PCPvpHitMsg in pc/include/pc_pvp_authority.h (pinned by test_pvp_src.py, size _Static_asserts 16 / 12)
 # worker A (deliberate, no protocol bump): 86 WILDLIFE_TOOL_ACTION (client -> host, 8 B, latent bugs), 87 GHOST_HUNT (client -> host, 4 B, spirit hunt)
 # puppet fidelity sprint (deliberate, no protocol bump): 96 ACTION_EXT (worker P2: owner -> host -> same-scene READY peers, 16 B, PCActionExtMsg in
 # pc/include/pc_action_ext.h, pinned by test_action_ext_src.py), 97 BOBBER_VIEW (worker P3), 98 reserved for worker P1 (optional). 93-95 stay unused.
 # villager stale fallback (deliberate, no protocol bump): 99 NPC_PROXY_MOVE (client -> host ONLY, UNRELIABLE, 28 B = the PCNetGameNpcMoveMsg layout; the host relays it as NPC_MOVE).
+# text chat (worker CH, deliberate, no protocol bump): 100 CHAT_SEND (client -> host ONLY, RELIABLE, 68 B), 101 CHAT_MSG (host -> clients, RELIABLE, 80 B); the wire structs are
+# PCChatSendMsg / PCChatMsg in pc/include/pc_chat.h (pinned by test_chat_src.py, size _Static_asserts 68 / 80).
 SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*|ShopUpgradeReq|VillagerOutfit|WildlifeToolAction|GhostHunt)Msg|PCNetGameOutfitWire"  # worker B: VILLAGER_OUTFIT; worker A: 86 / 87
-_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-9])\s*,?"
+_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-9]|10[01])\s*,?"
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).

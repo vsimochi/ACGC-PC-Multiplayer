@@ -304,7 +304,8 @@ Keyboard mapping:
 - **Space** = A, **LShift** = B, **Enter** = Start
 - **IJKL** = D-pad
 - **Q/E** = L/R triggers, **Z** = Z trigger
-- **F3** = toggle frame limiter
+- **F4** = toggle the ping counter
+- (F3 does nothing: the old 10x game-speed toggle was removed; `max_fps`/`vsync` in `settings.ini` and `--framelimit N` only change the render rate, the game logic stays at its 60 Hz dt-driven speed)
 - **ESC** = quit
 
 SDL2 gamepad with hotplug, analog sticks (deadzone 500), triggers, D-pad, and rumble.

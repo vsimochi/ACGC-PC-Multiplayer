@@ -31,6 +31,7 @@
 #include "pc_platform.h"
 #include "pc_pause_menu.h"
 #include "pc_tool_wheel.h"
+#include "pc_chat.h"
 #include "pc_profiler.h"
 /* Local extern matching the atomic_int definition in pc/src/pc_main.c (see pc_platform.h for the
  * full rationale). This TARGET_PC-only block above already includes pc_platform.h (for other PC
@@ -399,6 +400,7 @@ static void graph_main(GRAPH* this, GAME* game) {
 #ifdef TARGET_PC
     pc_pause_menu_draw(game);
     pc_tool_wheel_draw(game); /* PC radial tool menu (local UI only) */
+    pc_chat_draw(game);       /* multiplayer chat: speech bubbles, the chat log, the input line (presentation only) */
     pc_net_notice_draw(game); /* batch A (A3): CLIENT "not connected" notice (no-op for host / solo / READY / paused) */
 #endif
     GRAPH_SET_DOING_POINT(this, GAME_MAIN_FINISHED);

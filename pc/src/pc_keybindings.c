@@ -32,6 +32,9 @@ static const PCKeybindings s_kb_defaults = {
 
     /* radial tool wheel (hold) */
     .wheel = SDL_SCANCODE_G,
+
+    /* multiplayer chat line (press) */
+    .chat = SDL_SCANCODE_T,
 };
 
 /* Back/Select is reserved for opening the PC pause menu, so it is not a
@@ -87,6 +90,7 @@ static const KeybindEntry s_entries[] = {
     KB_ENTRY("DPad_Left",    dpad_left),
     KB_ENTRY("DPad_Right",   dpad_right),
     KB_ENTRY("Wheel",        wheel),
+    KB_ENTRY("Chat",         chat),
 };
 
 #define NUM_ENTRIES (sizeof(s_entries) / sizeof(s_entries[0]))

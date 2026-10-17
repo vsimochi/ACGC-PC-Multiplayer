@@ -11,6 +11,8 @@ TIER: PROTOCOL TESTED against a REAL host process (`--host --bootstrap-resident 
   P6 late join / reconnect: a NEW client is pushed the CURRENT canonical copies
   P7 a guest is pushed every page (worker B: it plays a never-persisted copy of THIS town) and may write DESIGN pages; its NOTICE write is refused BAD
   P8 host restart: the canonical content survives (the host save), a client joining the restarted host receives it
+  P9 (notice board latency) write -> APPLIED and write -> the OTHER client's push, wall time on the FakeClients' clock (printed 'P9 LATENCY'), < 300 ms on loopback;
+     P9b a full-board shift burst (14 notice writes at once) is never rate-refused and fully mirrored
 Usage: python test_town_pages_protocol.py [--port 11890]
 """
 import argparse
@@ -180,6 +182,43 @@ def run(args, results, ip):
         write(b, DESIGN, 6, rb_, design("IND6"))
         pa5, pb6 = wait_rev(b, ka, ra_ + 1), wait_rev(a, kb, rb_ + 1)
         check("P5 two writes to two different pages BOTH applied and cross-mirrored", pa5 and pb6 and pa5[3] == design("IND5") and pb6[3] == design("IND6"))
+        # P9 (worker BB, notice board latency): wall time write -> the writer's APPLIED and write -> the OTHER client's push, measured on the FakeClients' receive clock
+        lat_ack, lat_push = [], []
+        kl = (DESIGN, 7)
+        rl = pages(a)[kl][0]
+        for n in range(6):
+            data = design("LAT%d" % n)
+            ma, mb = a.inbox.mark(), b.inbox.mark()
+            t0 = time.monotonic()
+            write(a, DESIGN, 7, rl, data)
+            L.DEFAULT_HUB.wait_until(lambda: any(m.payload[HDR:HDR + DESIGN_LEN] == data for m in b.inbox.peek_all(is_page, since=mb)) and
+                                     any(m.payload[3] & F_APPLIED for m in a.inbox.peek_all(is_page, since=ma)), 5.0)
+            ack = [m.t for m in a.inbox.peek_all(is_page, since=ma) if m.payload[3] & F_APPLIED]
+            push = [m.t for m in b.inbox.peek_all(is_page, since=mb) if m.payload[HDR:HDR + DESIGN_LEN] == data]
+            if ack and push:
+                lat_ack.append((ack[0] - t0) * 1000.0)
+                lat_push.append((push[0] - t0) * 1000.0)
+            rl += 1
+            L.pump_sleep(0.1)
+        if lat_push:
+            print("P9 LATENCY write->APPLIED ms: %s | write->other client's push ms: %s" % (["%.0f" % x for x in lat_ack], ["%.0f" % x for x in lat_push]))
+        check("P9 6/6 writes reached the writer (APPLIED) and the other client (push); max write->push %.0f ms (< 300 ms on loopback: no periodic-scan wait on the host)"
+              % (max(lat_push) if lat_push else -1), len(lat_push) == 6 and max(lat_push) < 300.0)
+        # P9b a full-board shift: one write per notice post at once (14 here: notice 3 is kept for P6 / P8) -- under the host's 20 writes / s limit, all applied and mirrored
+        L.pump_sleep(1.1)  # a fresh 1 s rate window on the host
+        cur = pages(a)
+        burst = {i: notice("shift%02d" % i) for i in range(15) if i != 3}
+        ma, mb = a.inbox.mark(), b.inbox.mark()
+        t0 = time.monotonic()
+        for i, data in burst.items():
+            write(a, NOTICE, i, cur[(NOTICE, i)][0], data)
+        L.DEFAULT_HUB.wait_until(lambda: len({m.payload[2] for m in b.inbox.peek_all(is_page, since=mb) if m.payload[1] == NOTICE and burst.get(m.payload[2]) == m.payload[HDR:HDR + NOTICE_LEN]}) == len(burst), 8.0)
+        got_b = [m for m in b.inbox.peek_all(is_page, since=mb) if m.payload[1] == NOTICE and burst.get(m.payload[2]) == m.payload[HDR:HDR + NOTICE_LEN]]
+        refused = [m for m in a.inbox.peek_all(is_page, since=ma) if m.payload[3] & F_BAD]
+        last = (max(m.t for m in got_b) - t0) * 1000.0 if got_b else -1
+        print("P9b LATENCY full-board burst of %d writes: the other client had all of them after %.0f ms" % (len(burst), last))
+        check("P9b a %d-page board shift: none refused (%d), all mirrored to the other client (%d pages, last after %.0f ms)" % (len(burst), len(refused), len({m.payload[2] for m in got_b}), last),
+              not refused and len({m.payload[2] for m in got_b}) == len(burst))
         # P6 late join
         c = mk("C", residents[2])
         pc_ = wait_pages(c)

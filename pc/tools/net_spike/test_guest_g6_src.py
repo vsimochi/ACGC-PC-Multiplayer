@@ -115,7 +115,7 @@ def main():
        "not-connected notice unchanged; graph_main still calls it every frame (title + in game) under TARGET_PC",
        nd.index("pc_net_game_join_message(&join_warning)") < nd.index("pc_net_game_client_notice_visible()") and "pc_net_join_message_draw(game, join_msg, join_warning);" in nd
        and "Cannot join the host:" in pm and "Waiting for the host:" in pm and "Not connected to the host" in pm
-       and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n(?:    pc_tool_wheel_draw\(game\);[^\n]*\n)?    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None and numstat("src/graph.c") == (0, 0))  # (the PC radial tool menu draw now sits between the two)
+       and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n(?:    pc_tool_wheel_draw\(game\);[^\n]*\n)?(?:    pc_chat_draw\(game\);[^\n]*\n)?    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None and numstat("src/graph.c") == (0, 0))  # (the PC radial tool menu draw and the multiplayer chat draw (pc_chat_draw: bubbles / log / input line, presentation only; no-op while paused / no graph) now sit between the two)
     ck("A the declaration is in pc_net_game.h next to the existing notice accessor", S.read("pc/include/pc_net_game.h").count("const char* pc_net_game_join_message(int* is_warning);") == 1)
 
     # ------------------------------------------------------------------ B

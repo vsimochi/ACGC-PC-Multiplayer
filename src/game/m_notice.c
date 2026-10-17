@@ -254,6 +254,9 @@ extern void mNtc_notice_write(mNtc_board_post_c* new_post) {
         /* space available, write to lowest unused slot */
         mem_copy((u8*)(Save_Get(noticeboard) + write_num), (u8*)new_post, sizeof(mNtc_board_post_c));
     }
+#ifdef TARGET_PC
+    pc_net_game_pages_dirty(); /* notice board latency: the town page sync uploads / pushes the change on the next frame (no periodic-scan wait) */
+#endif
 }
 
 static int mNtc_set_landname_string(u8* buf) {
