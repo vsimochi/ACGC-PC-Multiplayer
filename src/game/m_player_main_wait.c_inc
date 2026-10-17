@@ -120,12 +120,24 @@ static void Player_actor_request_proc_index_fromWait(ACTOR* actor, GAME* game) {
     Player_actor_CheckAndRequest_main_radio_exercise_all(game, mPlayer_REQUEST_PRIORITY_0);
 }
 
+#ifdef TARGET_PC
+/* EMOTE WHEEL overlay (m_player_pc_emote.c_inc, included right after this file): 1 while an emote clip plays inside WAIT */
+static int Player_actor_pc_emote_Culc(ACTOR* actorx, GAME* game);
+static int Player_actor_pc_emote_face(ACTOR* actorx);
+#endif
+
 static void Player_actor_main_Wait(ACTOR* actor, GAME* game) {
     Player_actor_Set_RadioExerciseCommand_Wait(actor, game);
     Player_actor_Movement_Wait(actor);
     Player_actor_Reinput_force_position_angle(actor, game);
+#ifdef TARGET_PC
+    if (!Player_actor_pc_emote_Culc(actor, game)) /* emote overlay: its clip + cues instead of the WAIT1 idle */
+#endif
     Player_actor_CulcAnimation_Wait(actor);
     Player_actor_recover_lean_angle(actor);
+#ifdef TARGET_PC
+    if (!Player_actor_pc_emote_face(actor)) /* emote overlay: the clip's face */
+#endif
     Player_actor_set_eye_pattern_normal(actor);
     Player_actor_ObjCheck_Wait(actor, game);
     Player_actor_BGcheck_Wait(actor);

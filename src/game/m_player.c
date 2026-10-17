@@ -405,6 +405,9 @@ static int Player_actor_request_main_demo_getoff_boat_all(GAME* game, const xyz_
 #include "../src/game/m_player_main_return_outdoor.c_inc"
 #include "../src/game/m_player_main_return_outdoor2.c_inc"
 #include "../src/game/m_player_main_wait.c_inc"
+#ifdef TARGET_PC
+#include "../src/game/m_player_pc_emote.c_inc" /* EMOTE WHEEL: the emote overlay inside WAIT (pc/include/pc_emote.h) */
+#endif
 #include "../src/game/m_player_main_walk.c_inc"
 #include "../src/game/m_player_main_run.c_inc"
 #include "../src/game/m_player_main_dash.c_inc"
@@ -1336,6 +1339,7 @@ static int Player_actor_change_main_index(ACTOR* actorx, GAME* game) {
          * same index is entered again (repeated swing/dig/pickup), which now_main_index alone cannot show. Only bumps
          * a 4-bit counter in pc_net_game.c that the MOVE sampler sends along with now_main_index; changes nothing here. */
         pc_net_game_note_player_main_entry(player->now_main_index);
+        Player_actor_pc_emote_on_main_entry(actorx, game); /* EMOTE WHEEL: a state entry ends the emote overlay */
 #endif
         Player_actor_change_main_index_other_func2(actorx, game); //
         return TRUE;
@@ -1789,6 +1793,9 @@ extern void Player_actor_move(ACTOR* actorx, GAME* game) {
 
 #ifdef PC_ENHANCEMENTS
     Player_actor_check_and_switch_tool(game);
+#endif
+#ifdef TARGET_PC
+    Player_actor_pc_emote_check(actorx, game); /* EMOTE WHEEL: the wheel's request (m_player_pc_emote.c_inc) */
 #endif
 }
 

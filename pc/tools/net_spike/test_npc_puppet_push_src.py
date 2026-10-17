@@ -87,8 +87,24 @@ mv = rd("src/actor/npc/ac_npc_move.c_inc")
 hp = re.search(r"static void aNPC_pc_host_puppet_push\(.*?\n\}\n", mv, re.S)
 check(hp is not None, "aNPC_pc_host_puppet_push exists")
 hb = hp.group(0) if hp else ""
-check(hb.find("pc_net_game_role() != PC_NETGAME_ROLE_HOST") >= 0 and hb.find("PC_NETGAME_ROLE_HOST") < hb.find("pc_remote_player_host_npc_push(game"),
-      "host-role gate precedes any work (single-player no-op)")
+check(hb.find("!pc_net_game_npc_puppet_push_ok(aNPC_get_animal_idx(nactorx))") >= 0 and
+      hb.find("pc_net_game_npc_puppet_push_ok") < hb.find("pc_remote_player_host_npc_push(game"),
+      "push gate (host / client-run villager) precedes any work (single-player no-op)")
+# (4) villager push by every player: the client running a villager (relay owner) integrates the other players' puppet push
+ng0 = rd("pc/src/pc_net_game.c")
+po = re.search(r"int pc_net_game_npc_puppet_push_ok\(int slot\) \{.*?\n\}\n", ng0.replace("\r\n", "\n"), re.S)
+check(po is not None, "pc_net_game_npc_puppet_push_ok exists")
+pob = po.group(0) if po else ""
+check("s_role == PC_NETGAME_ROLE_HOST" in pob and "s_client_link == PC_NETGAME_LINK_READY" in pob and "s_npc_auth[slot].local" in pob, "host, or a READY client in LOCAL mode only")
+check("pc_npc_puppet_push_applies(" in pob and "pcnetgame_npc_push_fix_on()" in pob, "pure rule + kill switch")
+check('pcnetgame_env_switch("AC_MP_NPC_PUSH_FIX", 1)' in ng0, "AC_MP_NPC_PUSH_FIX, ON by default")
+check(pob.find("if (!is_host && !local)") >= 0 and pob.find("if (!is_host && !local)") < pob.find("pcnetgame_npc_push_fix_on()"),
+      "single player / consumer return before any work")
+au0 = rd("pc/include/pc_npc_authority.h")
+pa = re.search(r"static inline int pc_npc_puppet_push_applies\(.*?\n\}\n", au0, re.S)
+check(pa is not None and "if (is_host)" in pa.group(0) and "is_ready_client && slot_local && fix_on" in pa.group(0), "pure push rule shape")
+# a push never changes the relay owner: the lease is only taken in the relay handler (exclusive first sender, lapse after silence)
+check(ng0.count("pc_npc_proxy_offer(") == 1, "the relay lease has exactly one taker (no push-claim path)")
 check("talk_condition != aNPC_TALK_TYPE_NONE" in hb and "aNPC_ACT_TALK" in hb, "talking villager not pushed")
 sb = re.search(r"static void aNPC_actor_move_show_before\(.*?\n\}\n", mv, re.S).group(0)
 i_held = sb.find("aNPC_pc_host_held_position_move(actorx)")

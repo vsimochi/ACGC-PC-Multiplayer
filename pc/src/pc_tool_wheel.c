@@ -3,6 +3,7 @@
 #include "pc_menu_util.h"
 #include "pc_pause_menu.h"
 #include "pc_text_draw.h"
+#include "pc_emote_wheel.h"
 #include "m_common_data.h"
 #include "m_play.h"
 #include "m_event.h"
@@ -38,7 +39,7 @@ static int        s_suppress_c;    /* pad opener: the right stick stays consumed
 /* the same gates Player_actor_check_and_switch_tool applies, evaluated early so the wheel never opens where an equip is impossible */
 static int wheel_can_use(void) {
     GAME_PLAY* play = (GAME_PLAY*)gamePT;
-    if (play == NULL || g_pc_paused) {
+    if (play == NULL || g_pc_paused || pc_emote_wheel_is_open()) { /* the emote wheel is up: one wheel at a time */
         return 0;
     }
     if (mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELDTYPE2_FG) {

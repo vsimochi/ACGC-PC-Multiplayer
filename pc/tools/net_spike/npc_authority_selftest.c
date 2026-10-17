@@ -128,6 +128,50 @@ int main(void) {
     CHECK(!pc_npc_talk_hold_capped(1000, 900000, 0));                     /* cap disabled */
     CHECK(pc_npc_talk_hold_capped(0xFFFFFF00u, 0xFFFFFF00u + 120000u, PC_NPC_TALK_HOLD_CAP_MS)); /* wrap */
 
+    /* 12. villager push by every player: who integrates the REMOTE players' (puppets') push (is_host, is_ready_client, slot_local, fix_on) */
+    CHECK(pc_npc_puppet_push_applies(1, 0, 0, 0) == 1);  /* host: always (it simulates the villager), the client kill switch does not apply */
+    CHECK(pc_npc_puppet_push_applies(1, 0, 0, 1) == 1);
+    CHECK(pc_npc_puppet_push_applies(0, 1, 1, 1) == 1);  /* client running the villager (relay owner): the non-owner's puppet pushes it here */
+    CHECK(pc_npc_puppet_push_applies(0, 1, 1, 0) == 0);  /* AC_MP_NPC_PUSH_FIX=0: the old rule (only the owner's own player) */
+    CHECK(pc_npc_puppet_push_applies(0, 1, 0, 1) == 0);  /* consumer (HOST mode): the stream's pose, never integrated */
+    CHECK(pc_npc_puppet_push_applies(0, 0, 1, 1) == 0);  /* not READY */
+    CHECK(pc_npc_puppet_push_applies(0, 0, 0, 1) == 0);  /* single player: no puppets */
+    /* scenario: resident R and guest G near a far villager; G became the relay owner (first sender). R's slot: a fresh relayed stream -> HOST mode (consumer).
+     * R pushes: the push is integrated on G (G's slot is LOCAL), R sees it through the relay. The ownership does NOT change (no flapping) and R stays a consumer. */
+    {
+        PCNpcAuthSlot r, g;
+        PCNpcProxyLease l;
+        uint32_t tt;
+        int r_local_seen = 0, owner_changes = 0, last_owner;
+        pc_npc_auth_reset(&r, 1000); /* R's actor appeared later (its grace window still runs when G's relay starts) */
+        pc_npc_auth_reset(&g, 0);
+        pc_npc_proxy_reset(&l);
+        CHECK(pc_npc_auth_update(&g, 4000, 0, &c) == PC_NPC_AUTH_TO_LOCAL); /* nobody streams: G goes local first and offers */
+        CHECK(pc_npc_proxy_offer(&l, 1, 4000, 0, PC_NPC_PROXY_LEASE_MS) == 1 && l.owner == 1);
+        last_owner = l.owner;
+        for (tt = 4000; tt < 30000; tt += 16) {
+            if ((tt / 16) % 6 == 0) { /* G reports ~10 Hz; the host relays to R */
+                if (pc_npc_proxy_offer(&l, 1, tt, 0, PC_NPC_PROXY_LEASE_MS)) {
+                    pc_npc_auth_on_sample(&r, tt, &c);
+                }
+            }
+            if (r.local && pc_npc_proxy_offer(&l, 0, tt, 0, PC_NPC_PROXY_LEASE_MS)) { /* R in LOCAL would offer too: always refused while G reports */
+                owner_changes += 100;
+            }
+            (void)pc_npc_auth_update(&r, tt, 0, &c);
+            (void)pc_npc_auth_update(&g, tt, 0, &c);
+            r_local_seen |= r.local;
+            if (l.owner != last_owner) {
+                owner_changes++;
+                last_owner = l.owner;
+            }
+        }
+        CHECK(!r_local_seen && !r.local); /* R stays a consumer of G's relay all along: its own push would be discarded ... */
+        CHECK(g.local && owner_changes == 0); /* ... G keeps the relay, no ownership flapping */
+        CHECK(pc_npc_puppet_push_applies(0, 1, g.local, 1) == 1 && pc_npc_puppet_push_applies(0, 1, r.local, 1) == 0); /* ... so R's push is integrated on G */
+        CHECK(pc_npc_puppet_push_applies(0, 1, g.local, 0) == 0); /* the reported bug with the fix off: nobody integrates R's push */
+    }
+
     printf("npc_authority_selftest: %d checks, %d failed\n", s_n, s_fail);
     return s_fail ? 1 : 0;
 }

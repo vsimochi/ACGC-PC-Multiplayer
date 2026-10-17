@@ -9,6 +9,7 @@
 #include "pc_keybindings.h"
 #include "pc_pause_menu.h"
 #include "pc_tool_wheel.h"
+#include "pc_emote_wheel.h"
 #include "pc_typing.h"
 #include "pc_text_draw.h"
 #include "pc_play_online_menu.h"
@@ -69,7 +70,7 @@ int pc_chat_typing(void) {
 
 int pc_chat_can_open(void) {
     GAME_PLAY* play = (GAME_PLAY*)gamePT;
-    if (gamePT == NULL || gamePT->exec != play_main || g_pc_paused || pc_tool_wheel_is_open() || pc_host_observer_active() || pc_play_online_menu_text_active()) {
+    if (gamePT == NULL || gamePT->exec != play_main || g_pc_paused || pc_tool_wheel_is_open() || pc_emote_wheel_is_open() || pc_host_observer_active() || pc_play_online_menu_text_active()) {
         return 0;
     }
     if (g_pc_typing_mode && g_pc_editor_active) {

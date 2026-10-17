@@ -28,6 +28,7 @@ typedef struct {
     int allow_new_guests; /* HOST only (M-D): 1 = a NEW guest key may be admitted (default), 0 = only guests already known to guests.dat; a new key is refused (SERVER_FULL) */
     int resident_tokens;  /* HOST only (M-E): 0 = off (default, nothing minted / checked), 1 = tofu, 2 = required (see docs/multiplayer-guest-roadmap.md) */
     int personal_sync;    /* HOST only (personal data sync, diary): -1 = AUTO (default: on only while town_serve != off), 0 = off, 1 = on */
+    int emotes;           /* [Gameplay] emotes: 1 (default) = the emote wheel (F / pad D-pad Up held, pc_emote_wheel.c), 0 = off. Env AC_EMOTES=0 too */
     int show_ping;        /* CLIENT only: 1 = show the round-trip time (ms) to the host while connected (default 0; F4 toggles it for the session) */
     int client_log;       /* hotfix 0.2.1 diagnostics, [Debug] client_log: 1 = this process's stdout / stderr go to client_log.txt next to the exe (append, rotated at 4 MB); default 0. Env AC_CLIENT_LOG=1 too. Not for --dedicated (it has servers/<id>/logs). */
     int ofurn_place;      /* HOST only (outdoor furniture C1): 1 (default) = residents may PLACE furniture outdoors (model + rotation + collision), 0 = the Place action is off */

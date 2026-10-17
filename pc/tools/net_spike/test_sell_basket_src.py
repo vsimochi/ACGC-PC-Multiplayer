@@ -166,7 +166,7 @@ def main():
        ".bulk_sell = 1," in st and 'strcmp(key, "bulk_sell") == 0' in st and 'fprintf(f, "bulk_sell = %d\\n", g_pc_settings.bulk_sell);' in st and "int bulk_sell;" in sth)
     ck("K3 the real-game test hook is TEST-ONLY: compiled only with PC_NET_TEST_HOOKS (pc_sell_ui.c is in that CMake list), runtime-gated by AC_TEST_SELL_BASKET, client role",
        '#ifdef PC_NET_TEST_HOOKS' in func_body(ui, "void pc_sell_ui_test_tick(") and 'pc_test_hook_getenv("AC_TEST_SELL_BASKET")' in ui
-       and re.search(r"src/pc_sell_ui\.c # Nook bulk sell basket: AC_TEST_SELL_BASKET[^\n]*\n\s*PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS", cm)
+       and re.search(r"src/pc_sell_ui\.c # Nook bulk sell basket: AC_TEST_SELL_BASKET[^\n]*\n(?:\s*\$\{[^\n]*\n)*\s*PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS", cm)
        and "int g_pc_th_submenu_data0 = 0;" in sm and "pc_sell_ui_test_tick();" in ng)
     ck("K4 both new sources are built (CMake PC_SOURCES)", "src/pc_sell_logic.c" in cm and "src/pc_sell_ui.c      # Nook bulk sell basket" in cm and "#ifndef PC_SELL_UI_H" in ui_h)
 

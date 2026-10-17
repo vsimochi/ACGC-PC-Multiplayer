@@ -1410,7 +1410,7 @@ static void aNPC_actor_move_hide(ACTOR* actorx, GAME* game) {
 extern int pc_remote_player_host_npc_push(GAME* game, const ACTOR* npc, float npc_radius, float npc_offset, float npc_height,
                                           int npc_pipe_flags0, float* out_dx, float* out_dz); /* pc_remote_player.c */
 
-/* HOST only: remote players (puppets) push synchronized villagers. The puppet's OC pipe pairs only with the local player, so
+/* HOST (and a client running the villager on its own AI, see the gate below): remote players (puppets) push synchronized villagers. The puppet's OC pipe pairs only with the local player, so
  * without this a client walking into a villager never moved it on the host, and the client's own local push is overwritten by
  * the host pose every frame (the villager acted as an unmovable wall). Adds to collision_vec exactly what the vanilla OC pass
  * would add for a real player pipe at each eligible puppet (pc_remote_player_host_npc_push); aNPC_position_move() then applies
@@ -1421,7 +1421,10 @@ static void aNPC_pc_host_puppet_push(NPC_ACTOR* nactorx, GAME* game) {
     float dx, dz;
     int n;
 
-    if (pc_net_game_role() != PC_NETGAME_ROLE_HOST || nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0) {
+    /* HOST: every villager it simulates. CLIENT: a villager it runs itself (stale fallback LOCAL mode = the relay owner): the other clients' puppets push it here and
+     * the result reaches them through the relay, so every player can push a client-run villager, not only its relay owner (pc_npc_puppet_push_applies,
+     * kill switch AC_MP_NPC_PUSH_FIX=0). A consumer client never (its pose is the stream's); single player never. */
+    if (nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0 || !pc_net_game_npc_puppet_push_ok(aNPC_get_animal_idx(nactorx))) {
         return;
     }
     if (nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK ||
@@ -1437,6 +1440,7 @@ static void aNPC_pc_host_puppet_push(NPC_ACTOR* nactorx, GAME* game) {
     }
     nactorx->actor_class.status_data.collision_vec.x += dx;
     nactorx->actor_class.status_data.collision_vec.z += dz;
+    pc_net_game_npc_note_remote_push(aNPC_get_animal_idx(nactorx), n, nactorx->actor_class.world.position.x, nactorx->actor_class.world.position.z); /* client only */
     if (s_diag < 0) {
         const char* e = getenv("PC_NPC_PUSH_DIAG");
         s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
@@ -1467,7 +1471,7 @@ static void aNPC_actor_move_show_before(ACTOR* actorx, GAME* game) {
 #endif
     {
 #ifdef TARGET_PC
-        aNPC_pc_host_puppet_push(nactorx, game); /* HOST only: remote players push villagers (no-op otherwise) */
+        aNPC_pc_host_puppet_push(nactorx, game); /* HOST, or the client running this villager (relay owner): remote players push villagers (no-op otherwise) */
 #endif
         aNPC_position_move(actorx);
     }

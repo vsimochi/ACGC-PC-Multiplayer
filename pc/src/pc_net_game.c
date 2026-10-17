@@ -4851,6 +4851,34 @@ void pc_net_game_note_player_main_entry(int new_index) {
     s_local_main_entry_counter = (uint8_t)((s_local_main_entry_counter + 1u) & PC_NETGAME_ACTION_COUNTER_MASK);
 }
 
+/* ===== EMOTE WHEEL BEGIN (pc_emote.h; NO wire change) =====
+ * While the local emote overlay plays inside WAIT (src/game/m_player_pc_emote.c_inc), the MOVE action_state and the ACTION_EXT sampler report
+ * the state as DEMO_WAIT (74); the overlay bumps the entry counter above at its start and its end, so (74, counter) is a fresh pair that
+ * ends with the emote. ACTION_EXT already carries any clip < 157 for DEMO_WAIT (pc_action_ext.c allowlist); the emote id goes into `variant`
+ * and its constant face into `face`. Only the reported index changes: MOVE move_state keeps the real class (WAIT -> IDLE), and nothing
+ * local (PvP, insects, collision) reads this value. In the train-station zone the real index is sent (pc_emote_wire_index): a DEMO_WAIT
+ * there reads as "the arrival train stands at the station" to a joining guest (pc_remote_arrival_logic.h pcarr_join_class). */
+#include "pc_emote.h"
+static int pcnetgame_emote_wire_index(const PLAYER_ACTOR* local, int* emote_id, uint8_t* face) {
+    int id = 0;
+    uint8_t f = PC_EMOTE_FACE_NONE;
+    const int active = pc_emote_net_active(&id, &f);
+    int idx;
+
+    if (!active) {
+        return local->now_main_index;
+    }
+    idx = pc_emote_wire_index(local->now_main_index, active,
+                              pc_emote_station_zone(Save_Get(scene_no) == SCENE_FG, local->actor_class.world.position.x,
+                                                    local->actor_class.world.position.z));
+    if (idx == mPlayer_INDEX_DEMO_WAIT && emote_id != NULL && face != NULL) {
+        *emote_id = id;
+        *face = f;
+    }
+    return idx;
+}
+/* ===== EMOTE WHEEL END ===== */
+
 static uint16_t pcnetgame_encode_action_state(int now_main_index, uint8_t counter) {
     if (now_main_index < 0 || now_main_index > (int)PC_NETGAME_ACTION_INDEX_MASK || now_main_index >= mPlayer_INDEX_NUM) {
         return 0;
@@ -4921,7 +4949,7 @@ static void pcnetgame_sample_local_move(PLAYER_ACTOR* local, PCNetMoveMsg* msg) 
     msg->item_kind = (int8_t)local->item_kind;
     /* Protocol v7: the exact vanilla main index + the entry counter (see pc_net_game_note_player_main_entry()). An
      * out-of-range index (cannot happen for a live player actor) is sent as 0 = "no action info". */
-    msg->action_state = pcnetgame_encode_action_state(local->now_main_index, s_local_main_entry_counter);
+    msg->action_state = pcnetgame_encode_action_state(pcnetgame_emote_wire_index(local, NULL, NULL), s_local_main_entry_counter); /* EMOTE WHEEL: DEMO_WAIT while an emote plays */
     msg->frame = ++s_local_move_send_counter;
     msg->pos_x = actor->world.position.x;
     msg->pos_y = actor->world.position.y;
@@ -7954,6 +7982,46 @@ static void pcnetgame_host_resync_all(const char* why) {
     }
 }
 
+/* Shop building on join (docs "Shop building on join"; kill switch AC_MP_SHOP_JOIN_SYNC=0): ON by default. */
+static int pcnetgame_shop_join_sync_enabled(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("AC_MP_SHOP_JOIN_SYNC");
+        s_on = !(e != NULL && strcmp(e, "0") == 0);
+        printf("[NET][SHOP] shop building on join: %s\n", s_on ? "ON" : "OFF (AC_MP_SHOP_JOIN_SYNC=0)");
+    }
+    return s_on;
+}
+
+/* Shop building on join, HOST: a host standing in the town at the shadow init (the dedicated observer is parked next to the station, the shop acre is loaded) has its
+ * live shop structure actor's placeholder (DUMMY_SHOPn / RSV_NO) on the structure tile and RSV_NO on the ground-cleaned footprint: both were "unknown" (valid=0), so a
+ * joining client kept the structure tile of ITS OWN (stale) save and saw the old shop. The authoritative values are known without the field: the structure tile is
+ * SHOP0 + the host's shop level (exactly what pcnetgame_shopup_publish_acre sends after a renewal), the footprint RSV_NO is persistent fill (aSL_GroundClean). */
+static void pcnetgame_host_shadow_learn_shop(void) {
+    int tiles[32], n, i, acre = -1, st = -1;
+    uint16_t items[PCFA_TILE_NUM], deposit[PCFA_DEPOSIT_ROWS];
+    const int level = mSP_GetShopLevel();
+    if (!pcnetgame_shop_join_sync_enabled() || (n = aSL_PC_ShopFootprint(level, &acre, &st, tiles, 32)) <= 0 || acre < 0 || acre >= PCFA_ACRE_NUM || st < 0 ||
+        st >= PCFA_TILE_NUM || !pcfa_read_acre(acre, items, deposit)) {
+        return;
+    }
+    if (pcfa_transient_kind(items[st]) != PCFA_VALUE_STABLE) {
+        s_shadow_items[acre][st] = (uint16_t)(SHOP0 + level);
+        pcnetgame_set_dep_bit(s_shadow_deposit[acre], st, pcnetgame_dep_bit(deposit, st));
+        pcnetgame_set_dep_bit(s_shadow_known[acre], st, 1);
+        printf("[NET][SHOP] host: shadow: the shop structure tile acre %d tile %d is 0x%04X (live placeholder 0x%04X): a joining client gets the host's building\n", acre, st,
+               (unsigned)(SHOP0 + level), (unsigned)items[st]);
+    }
+    for (i = 0; i < n; i++) {
+        const int t = tiles[i];
+        if (t >= 0 && t < PCFA_TILE_NUM && items[t] == (uint16_t)RSV_NO && !pcnetgame_dep_bit(s_shadow_known[acre], t)) {
+            s_shadow_items[acre][t] = (uint16_t)RSV_NO;
+            pcnetgame_set_dep_bit(s_shadow_deposit[acre], t, pcnetgame_dep_bit(deposit, t));
+            pcnetgame_set_dep_bit(s_shadow_known[acre], t, 1);
+        }
+    }
+}
+
 /* (Re)initializes the committed shadow from the persistent field. A tile whose value is not STABLE
  * right now has NO known stable value (known bit 0 -> sent as valid=0, never invented): TRANSIENT
  * values (DUMMY_* structure placeholders while the host is in town, pitfall/money-seed values) wait
@@ -7977,6 +8045,7 @@ static void pcnetgame_host_init_shadow(void) {
             }
         }
     }
+    pcnetgame_host_shadow_learn_shop(); /* shop building on join: the structure tile / footprint behind a live host shop actor */
     (void)pcfa_take_dirty_acres(); /* bits accumulated before the session: the snapshot covers them */
     pcnetgame_capture_renew_time(&s_host_meta_renew);
     s_host_meta_valid = 1;
@@ -10147,7 +10216,16 @@ static void pcnetgame_aext_tick(void) {
     pcnetgame_aext_test_hook(pl, now);
 #endif
     memset(&smp, 0, sizeof(smp));
-    smp.main_index = pl->now_main_index;
+    {
+        int emote_id = 0;
+        uint8_t emote_face = PC_EMOTE_FACE_NONE;
+        smp.main_index = pcnetgame_emote_wire_index(pl, &emote_id, &emote_face); /* EMOTE WHEEL: DEMO_WAIT + the emote id / face while one plays */
+        if (emote_id != 0) {
+            smp.variant = emote_id;
+            smp.face_set = 1;
+            smp.face = emote_face;
+        }
+    }
     smp.counter = (int)s_local_main_entry_counter;
     smp.anim0 = pl->animation0_idx;
     smp.anim1 = pl->animation1_idx;
@@ -41761,6 +41839,43 @@ int pc_net_game_npc_client_local_ai(int slot, uint16_t npc_id, int actor_new, in
     return s->local ? 1 : 0;
 }
 
+/* Villager push by every player: kill switch AC_MP_NPC_PUSH_FIX=0 (the old rule: only the host integrated remote players' pushes, so a villager run by a
+ * client relay could only be pushed by that relay owner). */
+static int pcnetgame_npc_push_fix_on(void) {
+    static int s_v = -1;
+    if (s_v < 0) {
+        s_v = pcnetgame_env_switch("AC_MP_NPC_PUSH_FIX", 1);
+        printf("[NET][NPC] villager push by remote players on a client-run villager: %s\n", s_v ? "ON" : "OFF (AC_MP_NPC_PUSH_FIX=0: only the relay owner can push it)");
+    }
+    return s_v;
+}
+
+int pc_net_game_npc_puppet_push_ok(int slot) {
+    int is_host = s_role == PC_NETGAME_ROLE_HOST;
+    int ready_client = s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY;
+    int local = ready_client && slot >= 0 && slot < ANIMAL_NUM_MAX && s_npc_auth[slot].local && pcnetgame_npc_fallback_on();
+
+    if (!is_host && !local) {
+        return 0; /* single player / consumer: no work, the kill switch is not even read */
+    }
+    return pc_npc_puppet_push_applies(is_host, ready_client, local, is_host ? 1 : pcnetgame_npc_push_fix_on());
+}
+
+/* A remote player's puppet pushed a villager this client runs (diagnostics: one line per slot per 5 s of contact at most). */
+void pc_net_game_npc_note_remote_push(int slot, int contacts, float x, float z) {
+    static uint32_t s_log_ms[ANIMAL_NUM_MAX];
+    uint32_t now;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || slot < 0 || slot >= ANIMAL_NUM_MAX) {
+        return;
+    }
+    now = pcnetgame_now_ms();
+    if (s_log_ms[slot] != 0 && (uint32_t)(now - s_log_ms[slot]) < 5000u) {
+        return;
+    }
+    s_log_ms[slot] = now;
+    printf("[NET][NPC] client: slot %d (local AI, relayed) pushed by %d remote player(s) at (%.0f,%.0f)\n", slot, contacts, (double)x, (double)z);
+}
+
 static void pcnetgame_client_npc_proxy_send(int slot, uint16_t npc_id, float x, float y, float z, int16_t facing, uint8_t action) {
     PCNetGameNpcMoveMsg msg;
     uint32_t now;
@@ -41898,7 +42013,7 @@ void pc_net_game_dedicated_npc(const char* args, void (*out)(const char*)) {
         out("NPC: not hosting");
         return;
     }
-    snprintf(line, sizeof(line), "NPC: villager authority (host actor = the host simulates it; relay = a client simulates it and the host relays; neither = nobody near). fallback %s, relay %s, hold cap %u s",
+    snprintf(line, sizeof(line), "NPC: villager authority (host actor = the host simulates it; relay = a client simulates it and the host relays; neither = nobody near). fallback %s, relay %s, hold cap %u s; every player pushes a relayed villager (on the owner's client: the clients' AC_MP_NPC_PUSH_FIX)",
              pcnetgame_npc_fallback_on() ? "on" : "off", pcnetgame_npc_relay_on() ? "on" : "off", (unsigned)(pcnetgame_talk_hold_cap_ms() / 1000u));
     out(line);
     for (slot = 0; slot < ANIMAL_NUM_MAX; slot++) {
@@ -41918,7 +42033,8 @@ void pc_net_game_dedicated_npc(const char* args, void (*out)(const char*)) {
         if (live) {
             snprintf(actor_s, sizeof(actor_s), "host actor");
         } else if (s_npc_proxy_lease[slot].owner >= 0) {
-            snprintf(actor_s, sizeof(actor_s), "relay peer %d", s_npc_proxy_lease[slot].owner);
+            snprintf(actor_s, sizeof(actor_s), "relay peer %d for %u s", s_npc_proxy_lease[slot].owner,
+                     s_npc_proxy_lease[slot].since_ms ? (unsigned)((now - s_npc_proxy_lease[slot].since_ms) / 1000u) : 0u);
         } else {
             snprintf(actor_s, sizeof(actor_s), "no actor%s", s_host_npc_actor_ms[slot] ? "" : " (never)");
         }
@@ -48153,12 +48269,73 @@ static void pcnetgame_ts_client_apply_upgrade(const uint8_t* blob) {
     }
 }
 
+/* ===== SHOP JOIN SYNC (docs "Shop building on join"; kill switch AC_MP_SHOP_JOIN_SYNC=0) =====
+ * A client joins with ITS OWN save (a resident's local copy, a guest's stale copy), whose shop structure tile / level may be older than the host's (the host renewed the
+ * shop since). The town scene (and its shop structure actor, built from that stale tile) exists before the snapshot lands; the host's structure tile is then PARKED behind
+ * the live actor's placeholder (DUMMY_SHOPn / RSV_NO) and the old building stays until the shop acre unloads, or never arrives at all (an older host without the shadow
+ * fix sends it valid=0). So once per session, when the first snapshot AND the host's Shop_c (service 3) are applied, the client compares the building it shows (the live
+ * structure actor's npc_id, else the local structure tile) with SHOP0 + the host's level: on a mismatch the local field gets the host's structure tile + ground-cleaned
+ * footprint and a live actor is re-tagged + refreshed with ONE same-position reload (the shop upgrade's client refresh path). */
+extern int pc_town_shop_structure_npc(void); /* pc_m_card.c */
+static int s_shopjoin_done = 0;                                  /* CLIENT: the check ran in this session */
+static const char* s_shopup_refresh_why = "the shop was upgraded"; /* the reason of the next client refresh reload */
+
+static void pcnetgame_shopjoin_client_tick(void) {
+    int level, ac = -1, st = -1, tl[32], n, i, live;
+    uint16_t v = 0, want, built;
+    if (s_shopjoin_done || s_client_link != PC_NETGAME_LINK_READY || !s_client_world_synced || !s_ts_client_have[PC_NETGAME_TS_SHOP] || !s_local_world_latched ||
+        s_up.c_refresh_level >= 0) {
+        return;
+    }
+    if (!pcnetgame_shop_join_sync_enabled()) {
+        s_shopjoin_done = 1;
+        return;
+    }
+    level = mSP_GetShopLevel();
+    want = (uint16_t)(SHOP0 + level);
+    live = pc_town_shop_structure_npc();
+    if (live == 0 && (gamePT == NULL || gamePT->exec != play_main)) {
+        return; /* a scene change is running (a structure actor may own the tile without being listed): decide in the town / indoor scene that follows */
+    }
+    s_shopjoin_done = 1;
+    if ((n = aSL_PC_ShopFootprint(level, &ac, &st, tl, 32)) <= 0 || ac < 0 || ac >= PCFA_ACRE_NUM || st < 0 || st >= PCFA_TILE_NUM || !pcfa_get_tile(ac, st, &v)) {
+        printf("[NET][SHOP] client: shop building check: no shop structure tile in the local field (nothing to compare)\n");
+        return;
+    }
+    built = live != 0 ? (uint16_t)live : v;
+    if (built == want) {
+        printf("[NET][SHOP] client: shop building 0x%04X matches the host's shop level %d (acre %d tile %d = 0x%04X)\n", (unsigned)built, level, ac, st, (unsigned)v);
+        return;
+    }
+    printf("[NET][SHOP] client: shop building 0x%04X != host 0x%04X: refreshing (host shop level %d, local structure tile acre %d tile %d = 0x%04X, %s)\n", (unsigned)built,
+           (unsigned)want, level, ac, st, (unsigned)v, live != 0 ? "live structure actor: re-tag + one same-position reload" : "the shop acre is not loaded: the field tile is rewritten");
+    pcfa_set_net_apply_active(1);
+    if (pcfa_transient_kind(v) == PCFA_VALUE_STABLE && v != want) {
+        (void)pcfa_set_tile(ac, st, want);
+    }
+    for (i = 0; i < n; i++) {
+        uint16_t f = 0;
+        if (tl[i] != st && pcfa_get_tile(ac, tl[i], &f) && pcfa_transient_kind(f) == PCFA_VALUE_STABLE) {
+            (void)pcfa_set_tile(ac, tl[i], (uint16_t)RSV_NO); /* the host's aSL_GroundClean fill under the new building (display only: the host keeps the items) */
+            (void)pcfa_set_deposit(ac, tl[i], 0);
+        }
+    }
+    pcfa_set_net_apply_active(0);
+    if (live != 0) {
+        s_shopup_refresh_why = "the shop building differs from the host's";
+        s_up.c_refresh_level = level; /* pcnetgame_shopup_client_tick: re-tag the live actor, then the same-position reload (bounded: 10 minutes, then the next town load) */
+        s_up.c_refresh_since = pcnetgame_now_ms();
+    }
+}
+/* ===== SHOP JOIN SYNC END ===== */
+
 /* CLIENT, every frame: the town refresh after a reopening (the live shop structure actor restores the NEW tile, then a same-position reload builds the new shop), and the TEST-ONLY
  * client start hook. */
 static void pcnetgame_shopup_client_tick(void) {
     if (s_role != PC_NETGAME_ROLE_CLIENT) {
         return;
     }
+    pcnetgame_shopjoin_client_tick(); /* shop building on join: once per session, after the first snapshot + service 3 */
     if (s_up.c_refresh_level >= 0) {
         int r;
         if (s_client_link != PC_NETGAME_LINK_READY || (uint32_t)(pcnetgame_now_ms() - s_up.c_refresh_since) > 600000u) {
@@ -48172,8 +48349,9 @@ static void pcnetgame_shopup_client_tick(void) {
             }
             printf("[NET][SHOPUP] client: no live shop structure actor (not in the town / the shop acre is not loaded): the new shop appears when it is loaded; "
                    "local structure tile acre %d tile %d = 0x%04X\n", ac, st, (unsigned)v);
-        } else if ((r = pc_town_same_position_reload("the shop was upgraded")) != 0) {
+        } else if ((r = pc_town_same_position_reload(s_shopup_refresh_why)) != 0) {
             s_up.c_refresh_level = -1;
+            s_shopup_refresh_why = "the shop was upgraded";
             s_up.c_verify_ms = pcnetgame_now_ms() + 6000u;
             if (s_up.c_verify_ms == 0) {
                 s_up.c_verify_ms = 1;
@@ -48211,6 +48389,7 @@ static void pcnetgame_shopup_client_reset(void) {
     s_up.c_state = 0;
     s_up.c_enabled = 0;
     s_up.req_active = 0;
+    s_shopjoin_done = 0; /* shop building on join: checked again after the next session's first snapshot + service 3 */
 }
 
 /* ---- public API (pc_shop_upgrade.h) ---- */

@@ -68,6 +68,8 @@ GUARDS = {
     ("pc_net_game.c", "pcnetgame_run_bug_despawn_label_race_diag"): "pcnetgame_is_real_player_actor(local) right after the read (now exec-gated)",
     ("pc_net_game.c", "pc_net_game_poll"): "explicit gamePT->exec == play_main in the movement-send condition (+ is_real_player_actor)",
     ("pc_chat_ui.c", "pc_chat_can_open"): "text chat: returns 0 unless gamePT != NULL && gamePT->exec == play_main (first condition) before the read",
+    ("pc_emote_wheel.c", "pc_emote_test_tick"): "emote wheel TEST-ONLY script: returns unless gamePT != NULL && gamePT->exec == play_main before any read; the reads are NULL-checked",
+    ("pc_sell_ui.c", "pc_sell_ui_test_tick"): "Nook sell basket TEST-ONLY script (PC_NET_TEST_HOOKS + AC_TEST_SELL_BASKET): runs only for a READY client with the world synced and play != NULL; the actor read (stage 20, Nook mode) is NULL-checked (pa == NULL returns) and guarded by mDemo_CheckDemo",
     ("pc_chat_ui.c", "chat_speaker_anchor"): "text chat: only called from chat_draw_bubbles, which returns unless game == gamePT && exec == play_main; the read is NULL-checked",
     ("pc_remote_player.c", "pc_remote_player_poll"): "entry gate: gamePT == NULL || gamePT->exec != play_main -> return",
     # Sites that already existed at HEAD 1c67a1a (or earlier working-tree milestones) but were never listed (this audit failed on the clean baseline). Each was reviewed:

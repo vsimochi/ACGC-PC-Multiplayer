@@ -163,4 +163,59 @@ check("emu64 handles PC_NOOP_CLEAR_DEPTH -> pc_gx_clear_depth_now (flush first, 
       and gxc.index("pc_gx_draw_pending();") < gxc.index("glClear(") and "GL_COLOR_BUFFER_BIT" not in gxc)
 check("input still suppressed while paused (client Esc too: padmgr is role-blind)", "int suppress = g_pc_paused;" in PAD)
 check("TEST-ONLY autopilot submenu request: one writer in the autopilot, default 0", "int g_pc_th_submenu_req = 0;" in SM and NG.count("g_pc_th_submenu_req = t;") == 1)
+
+# ---- "cosmetic world reactions behind menus" (tree sway, falling drops, ground refresh) ----
+def body(text, sig):
+    s = text[text.index(sig):]
+    return re.sub(r"/\*.*?\*/", "", s[:s.index("\n}\n") + 2], flags=re.S)  # code only (comments cite calls by name)
+
+
+WRITE_RX = r"mFI_SetFG\w*\(|mFI_UtNumtoFGSet\w*\(|mFI_Wpos2Deposit\w*\(|mFI_UtNum2Deposit\w*\(|pcfa_set_\w+\(|pcfa_write_acre\(|Actor_info_make_actor\(|Actor_delete\("
+check("cosmetic tick is called from the live tick only (same live / free-play / PLAY gate)", lt.count("Game_play_pc_submenu_cosmetic_tick(play);") == 1 and MP.count("Game_play_pc_submenu_cosmetic_tick(play);") == 1)
+ct = body(MP, "static void Game_play_pc_submenu_cosmetic_tick(GAME_PLAY* play) {")
+check("cosmetic tick: only EffectBG in ACTOR_PART_EFFECT and the field-item actors in ACTOR_PART_ITEM",
+      set(re.findall(r"ACTOR_PART_\w+", ct)) == {"ACTOR_PART_EFFECT", "ACTOR_PART_ITEM"} and set(re.findall(r"a->id == (mAc_PROFILE_\w+)", ct)) ==
+      {"mAc_PROFILE_EFFECTBG", "mAc_PROFILE_BGITEM", "mAc_PROFILE_BGCHERRYITEM", "mAc_PROFILE_BGWINTERITEM", "mAc_PROFILE_BGXMASITEM"})
+check("cosmetic tick: through the guarded tick helper (flag set, OC dropped), constructed + vanilla move-while-culled rule",
+      ct.count("Game_play_pc_submenu_tick_actor(play, a);") == 2 and ct.count("a->ct_proc == NULL && a->mv_proc != NULL") == 2 and ct.count("(ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_CULL)) != 0") == 2)
+check("cosmetic tick: no direct field / actor / bank / OC calls", not re.search(WRITE_RX + r"|mSc_\w+\(|CollisionCheck_(OC|clear|setOC)\(", ct))
+check("cosmetic tick: town map (Save fg + deposit) hashed before and after, a change is counted and logged",
+      "u32 h0 = Game_play_pc_town_map_hash();" in ct and "if (Game_play_pc_town_map_hash() != h0) {" in ct and "s_pc_menu_cos_field_changed++;" in ct
+      and "Save_GetPointer(fg)" in MP and "Save_GetPointer(deposit)" in MP)
+check("hold END reports the cosmetic counters (field_changed_cos)", "[NET][MENU] cosmetic reactions END efbg_ticks=%d" in MP and "field_changed_cos=%d" in MP)
+BC = (ROOT / "src/bg_item/bg_item_common.c_inc").read_text(encoding="utf-8", errors="replace")
+cm2 = body(BC, "static void bg_item_common_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common) {")
+check("bg_item move: the menu tick takes the FILTERED pass and returns before the vanilla pass", re.search(
+    r"#ifdef TARGET_PC\s*\{\s*extern int g_pc_submenu_world_tick;[^\n]*\s*if \(g_pc_submenu_world_tick\) \{\s*bg_item_common_pc_menu_cosmetic_move\(play, actorx, common, ticks\);\s*return;\s*\}\s*\}\s*#endif\s*bIT_actor_drop_move\(&common->drop_info, ticks\);", cm2) is not None)
+fm = body(BC, "static void bg_item_common_pc_menu_cosmetic_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common, int ticks) {")
+dm = body(BC, "static void bIT_pc_menu_drop_move(bg_item_drop_table_c* drop_info) {")
+check("filtered pass: no hole / pit / money-rock / outdoor-furniture / unfiltered drop pass",
+      not re.search(r"bIT_actor_hole_effect_move|bIT_actor_pit_move|bIT_actor_ten_coin_move|pc_ofurn_bgitem_move|bIT_actor_drop_move\(", fm))
+check("filtered pass: no direct field write / actor creation", not re.search(WRITE_RX, fm + dm))
+check("filtered drops: only presentation fly drops (flag 0x4, no hole flag 0x8, not the honeycomb, no layer / wait pending)",
+      "drop->move_proc == &bIT_actor_drop_move_fly && (drop->flags & 4) != 0 && (drop->flags & 8) == 0 &&" in dm and "drop->fg_item != HONEYCOMB && drop->layer <= 0 && drop->wait_counter <= 0" in dm)
+fly = body(BC, "static void bIT_actor_drop_move_fly(bg_item_drop_c* drop) {")
+check("evidence: the fly drop's only tile write is under (flags & 4) == 0; its other exits are the hole (0x8) and honeycomb states",
+      fly.count("mFI_SetFG_common(") == 1 and re.search(r"if \(\(drop->flags & 4\) == 0\) \{\s*mFI_SetFG_common\(drop->fg_item, drop->target_position, TRUE\);", fly) is not None
+      and "if ((drop->flags & 8)) {" in fly and "drop->fg_item == HONEYCOMB" in fly and not re.search(r"Actor_info_make_actor\(|Actor_delete\(", fly))
+em = body(BC, "static int bIT_actor_drop_entry_main(bg_item_drop_table_c* drop_info, bg_item_drop_c* src_drop) {")
+check("evidence: the hole flag 0x8 is only ever set on a drop WITHOUT flag 0x4", re.search(r"if \(\(drop->flags & 4\) == 0\) \{\s*if \(\(drop->target_pos_fg_item >= HOLE_START.*?drop->flags \|= 8;", em, re.S) is not None)
+BI = (ROOT / "src/bg_item/bg_item.c").read_text(encoding="utf-8", errors="replace")
+check("evidence: TREE_DROP presentation drops carry flag 0x4", "drop.flags = (ITEM_IS_FTR(fg_item) ? 0x200 : 0x100) | 0x4;" in BI)
+check("filtered refresh: only update_fg pending (no born item / wade / cut-tree reset), vanilla refresh with flags 1",
+      re.search(r"if \(mFI_FGisUpDate\(\) == TRUE\) \{\s*if \(mFI_ItemisBorn\(\) != TRUE && !mFI_CheckPlayerWade\(mFI_WADE_END\) && Common_Get\(remove_cut_tree_info_bitfield\) == 0\) \{\s*bg_item_common_renew_draw_and_crs_data_perfect\(play, common, 1\);", fm) is not None)
+rf = "".join(body(BC, s) for s in ("static void bg_item_common_renew_draw_and_crs_data_perfect(", "static void bg_item_common_chg_draw_tbl_perfect(",
+                                    "static void bg_item_common_set_draw_tbl(", "static void bg_item_common_classifyitemDataTable(", "static void bg_shin_effect_being_check(",
+                                    "static int bIT_actor_shin_effect_check(", "static void bIT_actor_shin_effect_entry(", "static int bIT_actor_shin_effect_move(",
+                                    "static void bIT_actor_fade_move(", "static void bg_item_common_draw_check(", "static void bg_item_common_culling_check_loop("))
+check("evidence: the refresh / shine / fade / culling code writes no tile and creates no actor", not re.search(WRITE_RX, rf))
+tt = body(BC, "static void m_GetCItTable_TreeTblChk(")
+check("evidence: the refresh's only block-state writes (hole / beecomb clear) need remove_cut_tree_info_bitfield, which the gate requires 0",
+      re.search(r"if \(\(remove_cut_tree_info_bitfield & \(1 << i\)\) != 0\) \{.*?mFI_ClearHoleBlock\(bx, bz\);\s*mFI_ClearBeecomb\(bx, bz\);", tt, re.S) is not None and not re.search(WRITE_RX, tt))
+EB = (ROOT / "src/actor/ac_effectbg.c").read_text(encoding="utf-8", errors="replace")
+eb = "".join(body(EB, s) for s in ("static void Effectbg_actor_move(", "static void EffectBG_object_move(", "static int EffectBG_object_timer_step(",
+                                    "static void EffectBG_Make_Leafs(", "static void EffectBG_object_ct(", "static void Make_EffectBG(", "static int EfbgBgitemTreeCheck("))
+check("evidence: EffectBG (tree sway / chop) writes no tile and creates no actor (leaves via the effect control only)", not re.search(WRITE_RX, eb) and "eEC_CLIP->effect_make_proc(" in eb)
+ec = (ROOT / "src/effect/ef_effect_control.c").read_text(encoding="utf-8", errors="replace")
+check("evidence: the effect control creates no actor", "Actor_info_make_actor(" not in ec)
 sys.exit(1 if fails else 0)

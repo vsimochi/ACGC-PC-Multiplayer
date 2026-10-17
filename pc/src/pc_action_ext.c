@@ -108,7 +108,7 @@ int pc_aext_sender_step(PCAextSender* s, const PCAextSample* smp, double now, PC
                         (smp->repeat ? PC_AEXT_FL_REPEAT : 0u));
     m.speed_q = pc_aext_speed_q(smp->speed);
     m.start_frame = pc_aext_u8_clamp(smp->frame);
-    m.face = pc_aext_face_rule(smp->main_index, smp->anim0);
+    m.face = smp->face_set ? smp->face : pc_aext_face_rule(smp->main_index, smp->anim0);
     m.variant = (uint8_t)(smp->variant & 0xFF);
     m.aux = smp->aux;
 

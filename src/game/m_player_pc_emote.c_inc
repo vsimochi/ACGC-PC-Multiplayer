@@ -1,0 +1,350 @@
+/* m_player_pc_emote.c_inc - EMOTE WHEEL: the local emote overlay (TARGET_PC only; included into m_player.c right after
+ * m_player_main_wait.c_inc, so the vanilla static helpers are reachable). See pc/include/pc_emote.h for the model.
+ *
+ * NO new main index: the emote plays INSIDE the vanilla WAIT state. Player_actor_main_Wait (m_player_main_wait.c_inc, TARGET_PC block)
+ * asks Player_actor_pc_emote_Culc / _face first; while the overlay is active they play the emote clip (bound with the vanilla
+ * Player_actor_SetupItem_Base1 + Player_actor_InitAnimation_Base2, STOP, morph -5: a held tool keeps its upper-body item pose) and its face,
+ * and fire the keyframe cues; everything else of WAIT runs unchanged (braking, collision, BG check, the held item, and
+ * Player_actor_request_proc_index_fromWait: any stick / tool / A / B action leaves WAIT as usual, which ends the overlay through
+ * Player_actor_pc_emote_on_main_entry, called from Player_actor_change_main_index). A button press that starts nothing also ends it.
+ * When a clip emote ends inside WAIT, the vanilla WAIT1 pose is restored exactly like Player_actor_setup_main_Wait.
+ * "Shocked" requests the vanilla SHOCK state (Player_actor_request_main_shock_all, as the player-vs-player shovel hit does).
+ * Writes: only this player's animation / face / effects and pc_emote_net_set + the MOVE entry counter. NEVER the inventory, the equipment
+ * (a full-body emote with a tool in hand is refused, the tool is not stowed), the world or any save data. */
+#include "pc_emote.h"
+#include "pc_emote_wheel.h"
+#include "pc_tool_wheel.h"
+#include "pc_chat.h"
+extern int g_pc_paused; /* pc_pause_menu.h (not included here: it pulls SDL.h into the game code) */
+
+_Static_assert(PC_EMOTE_ANIM_WAIT1 == mPlayer_ANIM_WAIT1 && PC_EMOTE_ANIM_MENU_CHANGE1 == mPlayer_ANIM_MENU_CHANGE1 &&
+                   PC_EMOTE_ANIM_TIRED1 == mPlayer_ANIM_TIRED1 && PC_EMOTE_ANIM_BIKU1 == mPlayer_ANIM_BIKU1 &&
+                   PC_EMOTE_ANIM_ITAZURA1 == mPlayer_ANIM_ITAZURA1 && PC_EMOTE_ANIM_YATTA1 == mPlayer_ANIM_YATTA1 &&
+                   PC_EMOTE_ANIM_TAISOU1 == mPlayer_ANIM_TAISOU1 && PC_EMOTE_ANIM_TAISOU1 + 11 == mPlayer_ANIM_TAISOU7_2 &&
+                   PC_EMOTE_ANIM_OMAIRI_US1 == mPlayer_ANIM_OMAIRI_US1 && PC_EMOTE_ANIM_NUM == mPlayer_ANIM_NUM,
+               "pc_emote.h clip ids match include/m_player.h");
+_Static_assert(PC_EMOTE_IDX_WAIT == mPlayer_INDEX_WAIT && PC_EMOTE_IDX_DASH == mPlayer_INDEX_DASH && PC_EMOTE_IDX_DEMO_WAIT == mPlayer_INDEX_DEMO_WAIT,
+               "pc_emote.h main indices match include/m_player.h");
+
+enum { PCEM_CUE_FX = 0, PCEM_CUE_FXC, PCEM_CUE_SND_ARAIIKI, PCEM_CUE_SND_WEAR };
+typedef struct {
+    u8          emote;
+    s16         anim;
+    f32         frame; /* 0 = when the emote starts (its first step), else the keyframe0 frame crossed (every step of that clip) */
+    u8          kind;
+    u16         id;    /* eEC_EFFECT_* for the effect kinds */
+    const char* name;
+} PCEmoteCueL;
+/* The marks villagers show for emotions (ef_effect_control.h) + the vanilla cues of the borrowed clips: tired.c_inc:26-35 (frame 10 araiiki +
+ * DUST), change_cloth.c_inc:65-68 (HALLOWEEN at the ITAZURA1 start) and :97-106 (wear + KIGAE at MENU_CHANGE1 frame 16). The receivers'
+ * rows are pc_remote_player.c s_aext_cues (keyed on DEMO_WAIT + clip + the emote id in `variant`). Continuous effects (SIAWASE_HANA, ASE2:
+ * set_continious_env_proc) are killed when the emote ends. */
+static const PCEmoteCueL l_pc_emote_cues[] = {
+    { PC_EMOTE_HOORAY, mPlayer_ANIM_YATTA1, 0.0f, PCEM_CUE_FXC, eEC_EFFECT_SIAWASE_HANA, "hooray_flowers" },
+    { PC_EMOTE_SURPRISED, mPlayer_ANIM_BIKU1, 0.0f, PCEM_CUE_FX, eEC_EFFECT_KANTANHU, "surprised_mark" },
+    { PC_EMOTE_PHEW, mPlayer_ANIM_TIRED1, 0.0f, PCEM_CUE_FXC, eEC_EFFECT_ASE2, "phew_sweat" },
+    { PC_EMOTE_PHEW, mPlayer_ANIM_TIRED1, 10.0f, PCEM_CUE_SND_ARAIIKI, 0, "phew_araiiki" },
+    { PC_EMOTE_PHEW, mPlayer_ANIM_TIRED1, 10.0f, PCEM_CUE_FX, eEC_EFFECT_DUST, "phew_dust" },
+    { PC_EMOTE_BOO, mPlayer_ANIM_ITAZURA1, 0.0f, PCEM_CUE_FX, eEC_EFFECT_HALLOWEEN, "boo_smoke" },
+    { PC_EMOTE_TWIRL, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PCEM_CUE_SND_WEAR, 0, "twirl_wear" },
+    { PC_EMOTE_TWIRL, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PCEM_CUE_FX, eEC_EFFECT_KIGAE, "twirl_sparkle" },
+};
+
+#define PCEM_PENDING_MS 700u /* a choice made while walking / running waits this long for WAIT */
+
+static struct {
+    PCEmoteSeq seq;
+    int        pending;      /* emote id waiting for WAIT */
+    u32        pending_ms;
+    u32        last_start_ms;
+    int        started_once;
+    u32        fxc_mask;     /* bit i = continuous cue i spawned */
+    int        mouth_set;
+    u32        starts, ends, refused;
+} l_pc_emote;
+
+static int Player_actor_pc_emote_build_gate(PCEmoteGateIn* in) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    PLAYER_ACTOR* player;
+    Private_c* priv = Common_Get(now_private);
+    u32 now = pc_emote_now_ms();
+
+    memset(in, 0, sizeof(*in));
+    in->enabled = pc_emote_enabled();
+    in->paused = g_pc_paused;
+    in->observer = pc_host_observer_active();
+    in->chat_open = pc_chat_typing();
+    in->tool_wheel = pc_tool_wheel_is_open();
+    in->since_last_ms = l_pc_emote.started_once ? (u32)(now - l_pc_emote.last_start_ms) : 0xFFFFFFFFu;
+    if (play == NULL || gamePT->exec != play_main) {
+        in->no_player = 1;
+        return 0;
+    }
+    in->title_demo = mEv_CheckTitleDemo() != mEv_TITLEDEMO_NONE;
+    in->transition = play->fb_wipe_mode != 0;
+    in->menu_open = play->submenu.start_refuse || play->submenu.current_menu_type != mSM_OVL_NONE || play->submenu.menu_type != mSM_OVL_NONE ||
+                    play->submenu.process_status != mSM_PROCESS_WAIT;
+    in->msg_or_demo = mDemo_CheckDemo() != FALSE || !mMsg_Check_MainHide(mMsg_Get_base_window_p());
+    player = GET_PLAYER_ACTOR_NOW();
+    if (player == NULL || !Common_Get(player_actor_exists)) {
+        in->no_player = 1;
+        return 0;
+    }
+    in->main_index = player->now_main_index;
+    in->demo_mode = Player_actor_Check_is_demo_mode(player->now_main_index) != 0 || Player_actor_Check_is_demo_mode(player->requested_main_index) != 0;
+    in->on_ground = player->actor_class.bg_collision_check.result.on_ground ? 1 : 0;
+    in->in_water = player->actor_class.bg_collision_check.result.is_in_water ? 1 : 0;
+    in->hands_empty = priv != NULL && priv->equipment == EMPTY_NO;
+    return 1;
+}
+
+int pc_emote_player_gate(int id) {
+    PCEmoteGateIn in;
+
+    Player_actor_pc_emote_build_gate(&in);
+    return pc_emote_gate(&in, id);
+}
+
+int pc_emote_player_busy(void) {
+    return l_pc_emote.seq.active || l_pc_emote.pending != 0;
+}
+
+static void Player_actor_pc_emote_kill_fx(void) {
+    size_t i;
+
+    if (l_pc_emote.fxc_mask != 0 && eEC_CLIP != NULL && eEC_CLIP->effect_kill_proc != NULL) {
+        for (i = 0; i < sizeof(l_pc_emote_cues) / sizeof(l_pc_emote_cues[0]); i++) {
+            if (l_pc_emote.fxc_mask & (1u << i)) {
+                eEC_CLIP->effect_kill_proc(l_pc_emote_cues[i].id, RSV_NO); /* as the vanilla pitfall sweat kill (struggle_pitfall.c_inc:27) */
+            }
+        }
+    }
+    l_pc_emote.fxc_mask = 0;
+}
+
+static void Player_actor_pc_emote_fire(ACTOR* actorx, GAME* game, int i) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    const PCEmoteCueL* c = &l_pc_emote_cues[i];
+
+    switch (c->kind) {
+        case PCEM_CUE_SND_ARAIIKI:
+            Player_actor_sound_araiiki(actorx);
+            break;
+        case PCEM_CUE_SND_WEAR:
+            Player_actor_sound_wear(actorx);
+            break;
+        default:
+            if (eEC_CLIP != NULL && eEC_CLIP->effect_make_proc != NULL) {
+                eEC_CLIP->effect_make_proc(c->id, player->feel_pos, 2, actorx->shape_info.rotation.y, game, RSV_NO, 0, 0);
+                if (c->kind == PCEM_CUE_FXC) {
+                    l_pc_emote.fxc_mask |= 1u << i;
+                }
+            }
+            break;
+    }
+    printf("[EMOTE] cue %s (frame %.1f)\n", c->name, (double)player->keyframe0.frame_control.current_frame);
+}
+
+/* start cues (frame 0) when the emote starts; frame cues every frame the clip crosses them */
+static void Player_actor_pc_emote_cues(ACTOR* actorx, GAME* game, int at_start) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    size_t i;
+
+    for (i = 0; i < sizeof(l_pc_emote_cues) / sizeof(l_pc_emote_cues[0]); i++) {
+        const PCEmoteCueL* c = &l_pc_emote_cues[i];
+
+        if ((int)c->emote != l_pc_emote.seq.id || (int)c->anim != player->animation0_idx) {
+            continue;
+        }
+        if (c->frame <= 0.0f ? at_start : (!at_start && Player_actor_Check_AnimationFrame(&player->keyframe0.frame_control, c->frame))) {
+            Player_actor_pc_emote_fire(actorx, game, (int)i);
+        }
+    }
+}
+
+static void Player_actor_pc_emote_bind_step(ACTOR* actorx, GAME* game) {
+    const PCEmoteDef* d = pc_emote_def(l_pc_emote.seq.id);
+    const PCEmoteStep* st = &d->steps[l_pc_emote.seq.step];
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    int keep_req = player->requested_main_index;
+    int anim1_idx, part_table_idx;
+
+    /* SetupItem_Base1 reads the item kind allowed in player->requested_main_index: evaluate it for the state we are in (WAIT), the request
+     * slot itself is left as it was */
+    player->requested_main_index = mPlayer_INDEX_WAIT;
+    Player_actor_SetupItem_Base1(actorx, st->anim, -5.0f, &anim1_idx, &part_table_idx);
+    player->requested_main_index = keep_req;
+    Player_actor_InitAnimation_Base2(actorx, game, st->anim, anim1_idx, 1.0f, 1.0f, st->speed, -5.0f, cKF_FRAMECONTROL_STOP, part_table_idx);
+}
+
+/* restore = the player stays in WAIT: the vanilla WAIT1 pose comes back (Player_actor_setup_main_Wait) and the entry counter is bumped so the
+ * receivers see a fresh (WAIT, counter) pair; a state change (on_main_entry) already did both. */
+static void Player_actor_pc_emote_finish(ACTOR* actorx, GAME* game, int reason, int restore) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    int id = l_pc_emote.seq.id;
+
+    pc_emote_seq_stop(&l_pc_emote.seq, reason);
+    Player_actor_pc_emote_kill_fx();
+    pc_emote_net_set(0, 0, PC_EMOTE_FACE_NONE);
+    l_pc_emote.ends++;
+    if (restore) {
+        int anim1_idx, part_table_idx;
+        int keep_req = player->requested_main_index;
+
+        player->requested_main_index = mPlayer_INDEX_WAIT; /* as in bind_step */
+        Player_actor_SetupItem_Base1(actorx, mPlayer_ANIM_WAIT1, -5.0f, &anim1_idx, &part_table_idx);
+        player->requested_main_index = keep_req;
+        Player_actor_InitAnimation_Base1(actorx, game, mPlayer_ANIM_WAIT1, anim1_idx, 1.0f, 1.0f, 0.5f, -5.0f, part_table_idx);
+        Player_actor_set_eye_pattern(actorx, 0);
+        Player_actor_set_mouth_pattern(actorx, 0);
+        pc_net_game_note_player_main_entry(mPlayer_INDEX_WAIT);
+    } else if (l_pc_emote.mouth_set) {
+        Player_actor_set_mouth_pattern(actorx, 0);
+    }
+    l_pc_emote.mouth_set = 0;
+    printf("[EMOTE] end id=%d (%s) reason=%s state=%d\n", id, pc_emote_def(id) != NULL ? pc_emote_def(id)->name : "?", pc_emote_end_name(reason),
+           player->now_main_index);
+}
+
+static void Player_actor_pc_emote_start(ACTOR* actorx, GAME* game, int id) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    const PCEmoteDef* d = pc_emote_def(id);
+
+    if (l_pc_emote.seq.active) {
+        Player_actor_pc_emote_finish(actorx, game, PC_EMOTE_END_INPUT, 0); /* replaced: the new clip binds below */
+    }
+    if (!pc_emote_seq_begin(&l_pc_emote.seq, id)) {
+        return;
+    }
+    l_pc_emote.last_start_ms = pc_emote_now_ms();
+    l_pc_emote.started_once = 1;
+    l_pc_emote.starts++;
+    Player_actor_pc_emote_bind_step(actorx, game);
+    pc_net_game_note_player_main_entry(mPlayer_INDEX_DEMO_WAIT); /* a fresh (DEMO_WAIT, counter) pair for the receivers */
+    pc_emote_net_set(1, id, d->face);
+    printf("[EMOTE] start id=%d (%s) anim0=%d anim1=%d part_table=%d item_kind=%d\n", id, d->name, player->animation0_idx, player->animation1_idx,
+           player->part_table_idx, player->item_kind);
+    Player_actor_pc_emote_cues(actorx, game, 1);
+}
+
+/* m_player_main_wait.c_inc: replaces Player_actor_CulcAnimation_Wait while the overlay plays. 1 = handled. */
+static int Player_actor_pc_emote_Culc(ACTOR* actorx, GAME* game) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    f32 last_frame;
+    int ended, input, t;
+    f32 dt_ms;
+
+    if (!l_pc_emote.seq.active) {
+        return FALSE;
+    }
+    if (player->now_main_index != mPlayer_INDEX_WAIT) { /* defensive: the main-entry hook ends it on every state change */
+        Player_actor_pc_emote_finish(actorx, game, PC_EMOTE_END_STATE, 0);
+        return FALSE;
+    }
+    ended = Player_actor_CulcAnimation_Base2(actorx, &last_frame);
+    input = (getTrigger() & (BUTTON_A | BUTTON_B | BUTTON_X | BUTTON_Y | BUTTON_Z | BUTTON_L | BUTTON_R | BUTTON_START | BUTTON_DUP | BUTTON_DDOWN |
+                             BUTTON_DLEFT | BUTTON_DRIGHT)) != 0 ||
+            Player_actor_GetController_move_percentX() || Player_actor_GetController_move_percentY();
+    dt_ms = (f32)(game->graph->dt_num_60fps_frames * (1000.0 / 60.0));
+    if (!ended && !input) {
+        Player_actor_pc_emote_cues(actorx, game, 0);
+    }
+    t = pc_emote_seq_tick(&l_pc_emote.seq, ended, dt_ms, input);
+    if (t == PC_EMOTE_T_NEXT) {
+        Player_actor_pc_emote_bind_step(actorx, game);
+        printf("[EMOTE] step id=%d step=%d anim0=%d\n", l_pc_emote.seq.id, l_pc_emote.seq.step, player->animation0_idx);
+    } else if (t == PC_EMOTE_T_END) {
+        l_pc_emote.seq.active = 1; /* finish() records the reason the sequencer chose */
+        Player_actor_pc_emote_finish(actorx, game, l_pc_emote.seq.end_reason, TRUE);
+    }
+    return TRUE;
+}
+
+/* m_player_main_wait.c_inc: replaces Player_actor_set_eye_pattern_normal while the overlay plays. 1 = handled. */
+static int Player_actor_pc_emote_face(ACTOR* actorx) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    const PCEmoteDef* d;
+    int a0 = player->animation0_idx;
+    int has_eye, has_mouth;
+
+    if (!l_pc_emote.seq.active || (d = pc_emote_def(l_pc_emote.seq.id)) == NULL) {
+        return FALSE;
+    }
+    has_eye = mPlib_Get_PlayerEyeTexAnimation_p(a0) != NULL;
+    has_mouth = mPlib_Get_PlayerMouthTexAnimation_p(a0) != NULL;
+    if (has_eye || has_mouth) {
+        Player_actor_set_tex_anime_pattern(actorx); /* the clip's own eye / mouth tables */
+    }
+    if (!has_eye) {
+        if (d->face != PC_EMOTE_FACE_NONE) {
+            Player_actor_set_eye_pattern(actorx, (int)(d->face >> 4));
+        } else {
+            Player_actor_set_eye_pattern_normal(actorx); /* blinking, like the vanilla pray / radio exercise states */
+        }
+    }
+    if (!has_mouth && d->face != PC_EMOTE_FACE_NONE) {
+        Player_actor_set_mouth_pattern(actorx, (int)(d->face & 0x0F)); /* Phew: the tired mouth 4 (tired.c_inc:14) */
+        l_pc_emote.mouth_set = 1;
+    }
+    return TRUE;
+}
+
+/* Player_actor_change_main_index (TARGET_PC): the local player entered a (new) state: the overlay ends (the new state set its own clip). */
+static void Player_actor_pc_emote_on_main_entry(ACTOR* actorx, GAME* game) {
+    if (l_pc_emote.seq.active) {
+        Player_actor_pc_emote_finish(actorx, game, PC_EMOTE_END_STATE, 0);
+    }
+}
+
+/* Player_actor_move (TARGET_PC), after the state's main and the tool switch: the wheel's request + the pending start. */
+static void Player_actor_pc_emote_check(ACTOR* actorx, GAME* game) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    int req = pc_emote_wheel_take_request();
+    u32 now = pc_emote_now_ms();
+
+    if (req != 0) {
+        int r = pc_emote_player_gate(req);
+        const PCEmoteDef* d = pc_emote_def(req);
+
+        if (r != PC_EMOTE_OK || d == NULL) {
+            l_pc_emote.refused++;
+            printf("[EMOTE] refused id=%d reason=%s state=%d\n", req, pc_emote_reason_name(r), player->now_main_index);
+        } else if (d->kind == PC_EMOTE_KIND_SHOCK) {
+            /* the vanilla SHOCK reaction (start time 0: GAAAN1 -> GAAAN2, in place: the target angle is the own facing); back to WAIT by itself */
+            int ok = Player_actor_request_main_shock_all(game, 0.0f, actorx->shape_info.rotation.y, FALSE, FALSE, mPlayer_REQUEST_PRIORITY_14);
+            if (ok) {
+                l_pc_emote.last_start_ms = now;
+                l_pc_emote.started_once = 1;
+                l_pc_emote.starts++;
+                if (l_pc_emote.seq.active) {
+                    Player_actor_pc_emote_finish(actorx, game, PC_EMOTE_END_INPUT, 0);
+                }
+            }
+            printf("[EMOTE] start id=%d (%s) vanilla SHOCK request=%d\n", req, d->name, ok);
+        } else if (player->now_main_index == mPlayer_INDEX_WAIT) {
+            l_pc_emote.pending = 0;
+            Player_actor_pc_emote_start(actorx, game, req);
+        } else {
+            l_pc_emote.pending = req; /* walking / running: starts once the player stands (WAIT) */
+            l_pc_emote.pending_ms = now;
+            printf("[EMOTE] pending id=%d (state %d)\n", req, player->now_main_index);
+        }
+    }
+    if (l_pc_emote.pending != 0) {
+        if ((u32)(now - l_pc_emote.pending_ms) > PCEM_PENDING_MS) {
+            printf("[EMOTE] pending id=%d dropped (state %d)\n", l_pc_emote.pending, player->now_main_index);
+            l_pc_emote.pending = 0;
+        } else if (player->now_main_index == mPlayer_INDEX_WAIT) {
+            int id = l_pc_emote.pending;
+            int r;
+
+            l_pc_emote.pending = 0;
+            r = pc_emote_player_gate(id);
+            if (r == PC_EMOTE_OK || r == PC_EMOTE_R_COOLDOWN) { /* the cooldown was checked when it was chosen */
+                Player_actor_pc_emote_start(actorx, game, id);
+            } else {
+                printf("[EMOTE] pending id=%d refused reason=%s\n", id, pc_emote_reason_name(r));
+            }
+        }
+    }
+}

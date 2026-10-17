@@ -53,6 +53,7 @@ BOOL PADInit(void) {
 }
 
 #include "pc_tool_wheel.h"
+#include "pc_emote_wheel.h"
 #include "pc_net_game.h"
 #include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
 #include "pc_chat.h"             /* chat (worker CH): pc_chat_pad_block */
@@ -64,6 +65,7 @@ u32 PADRead(PADStatus* status) {
     int mouse_x = 0, mouse_y = 0;
     u32 mouse = SDL_GetMouseState(&mouse_x, &mouse_y);
     int wheel_kb = 0, wheel_pad = 0, wheel_rx = 0, wheel_ry = 0;
+    int emote_kb = 0, emote_pad = 0; /* EMOTE WHEEL (pc_emote_wheel.c): the held Emote key / pad button */
     u16 buttons = 0;
     s8 stickX = 0, stickY = 0;
     s8 cstickX = 0, cstickY = 0;
@@ -100,6 +102,7 @@ u32 PADRead(PADStatus* status) {
         if (INPUT_PRESSED(kb->cstick_right)) cstickX += STICK_MAGNITUDE;
 
         wheel_kb = INPUT_PRESSED(kb->wheel) ? 1 : 0;
+        emote_kb = INPUT_PRESSED(kb->emote) ? 1 : 0;
 
         /* D-pad */
         if (INPUT_PRESSED(kb->dpad_up))    buttons |= PAD_BUTTON_UP;
@@ -160,6 +163,7 @@ u32 PADRead(PADStatus* status) {
         s16 rx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX);
         s16 ry = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY);
         wheel_pad = pad_code_pressed(pb->wheel) ? 1 : 0;
+        emote_pad = pad_code_pressed(pb->emote) ? 1 : 0;
         wheel_rx = rx;
         wheel_ry = ry;
         if (abs(rx) > cstick_dz) {
@@ -181,6 +185,7 @@ u32 PADRead(PADStatus* status) {
      * already cleared wheel_kb above (the whole keyboard mapping is skipped). The controller wheel button is not a letter and is untouched. */
     if (pc_play_online_menu_text_blocking()) {
         wheel_kb = 0;
+        emote_kb = 0;
     }
 
     { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_AUTOPILOT=1): an automated test plays through the real game code; 0 / zero stick otherwise */
@@ -210,12 +215,21 @@ u32 PADRead(PADStatus* status) {
         buttons = 0;
         stickX = stickY = cstickX = cstickY = 0;
         wheel_kb = wheel_pad = 0;
+        emote_kb = emote_pad = 0;
         status[0].triggerLeft = 0;
         status[0].triggerRight = 0;
     }
     pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
 
     if (pc_tool_wheel_is_open()) { /* the analog L/R triggers must not leak into the game while the wheel is up either */
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
+    }
+    /* EMOTE WHEEL (pc_emote_wheel.c): same contract as the tool wheel (the two exclude each other); its opener, D-pad Up on the pad by
+     * default, never reaches the game while the wheel is up */
+    pc_emote_wheel_input(emote_kb, emote_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons,
+                         &stickX, &stickY, &cstickX, &cstickY);
+    if (pc_emote_wheel_is_open()) {
         status[0].triggerLeft = 0;
         status[0].triggerRight = 0;
     }

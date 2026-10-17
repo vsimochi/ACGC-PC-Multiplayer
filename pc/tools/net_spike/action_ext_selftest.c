@@ -230,6 +230,45 @@ int main(void) {
     }
     CHECK(n == 4);
 
+    /* ---- E: EMOTE WHEEL (pc_emote.h): the emote overlay is sent as DEMO_WAIT with the emote id in `variant` and its face via face_set */
+    {
+        PCAextSample s = smp(PC_AEXT_IDX_DEMO_WAIT, 6, 97, 1.0f, 0.5f, 0); /* Phew: TIRED1, STOP */
+        pc_aext_sender_reset(&snd);
+        s.variant = 5;
+        s.face_set = 1;
+        s.face = 0x44;
+        CHECK(pc_aext_sender_step(&snd, &s, 1000.0, &out) == 1);
+        CHECK(out.main_index == PC_AEXT_IDX_DEMO_WAIT && out.anim0 == 97 && out.variant == 5 && out.face == 0x44 && pc_aext_msg_ok(&out));
+        /* without face_set the rule applies (a real scripted DEMO_WAIT keeps face NONE / the GAAAN2 rule) */
+        s = smp(PC_AEXT_IDX_DEMO_WAIT, 7, 128, 1.0f, 0.5f, 0);
+        s.variant = 1;
+        CHECK(pc_aext_sender_step(&snd, &s, 1001.0, &out) == 1 && out.face == PC_AEXT_FACE_NONE && out.variant == 1 && pc_aext_msg_ok(&out));
+        /* Exercise: a clip change inside the same pair sends again (TAISOU1 -> TAISOU2_1) */
+        s = smp(PC_AEXT_IDX_DEMO_WAIT, 8, 144, 1.0f, 0.5f, 0);
+        s.variant = 8;
+        CHECK(pc_aext_sender_step(&snd, &s, 1002.0, &out) == 1 && out.anim0 == 144);
+        s.anim0 = s.anim1 = 145;
+        CHECK(pc_aext_sender_step(&snd, &s, 1003.0, &out) == 1 && out.anim0 == 145 && out.variant == 8);
+        /* every emote id / clip passes the receiver validation (variant is not range-checked: old peers accept it too) */
+        m = good();
+        m.main_index = PC_AEXT_IDX_DEMO_WAIT;
+        for (i = 0; i < 256; i++) {
+            m.variant = (uint8_t)i;
+            CHECK(pc_aext_msg_ok(&m));
+        }
+        m.variant = 7; m.anim0 = m.anim1 = 156; m.face = 0x44;
+        CHECK(pc_aext_msg_ok(&m));
+        /* a stored emote row binds to its (74, counter) pair and ends with it */
+        pc_aext_store_reset(&st);
+        memset(&v, 0, sizeof(v));
+        m.entry_counter = 9; m.clip_seq = 1;
+        pc_aext_store_put(&st, &m, 2000.0);
+        d = pc_aext_decide(&st, &v, 1, PC_AEXT_IDX_DEMO_WAIT, 9, 2001.0, &rec);
+        CHECK(d == PC_AEXT_D_START && rec->m.variant == 7);
+        d = pc_aext_decide(&st, &v, 1, 7, 10, 2002.0, &rec); /* back to WAIT with a fresh counter */
+        CHECK(d == PC_AEXT_D_END);
+    }
+
     printf("%d/%d checks passed\n", s_n - s_fail, s_n);
     return s_fail ? 1 : 0;
 }

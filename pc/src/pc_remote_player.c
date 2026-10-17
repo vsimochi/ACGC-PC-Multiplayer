@@ -5306,32 +5306,44 @@ static int pc_remote_player_scene_snap_resolve(PCRemotePlayerSlot* slot, double 
  * game: writes only this puppet's own visual, its shape rotation and positional one-shot sounds / effects. */
 #include "pc_action_ext.h"
 
-enum { PC_AEXT_CUE_SND = 0, PC_AEXT_CUE_FX = 1 };
+enum { PC_AEXT_CUE_SND = 0, PC_AEXT_CUE_FX = 1, PC_AEXT_CUE_FXC = 2 /* EMOTE WHEEL: a continuous effect, killed when the row ends */ };
 typedef struct PCAextCue {
     uint8_t     idx;   /* mPlayer_INDEX_* */
     s16         anim0; /* -1 = any clip of the state */
     float       frame; /* 0 = at the clip start (not when adopted late), else the keyframe0 frame crossed */
     uint8_t     kind;
-    u16         id;    /* NA_SE_* / eEC_EFFECT_* */
+    u16         id;    /* NA_SE_* / eEC_EFFECT_* (PC_TID_ARAIIKI: the owner's gendered breath) */
     const char* name;
+    uint8_t     variant; /* EMOTE WHEEL: 0 = any message; else only a message with this `variant` (the emote id of a DEMO_WAIT emote row) */
 } PCAextCue;
 /* Sources: lie_bed.c_inc:91 sound_JUMP at setup, :109-114 BED_IN at frame 20; roll_bed.c_inc:80 BED_NEGAERI at setup; standup_bed.c_inc:131
  * BED_OUT at setup, :138-143 LANDING at frame 23; give.c_inc:78 / recieve_putaway.c_inc:48 GASAGOSO at setup; talk.c_inc:76-83 (also
  * demo_wait.c_inc:73-80) SHOCK at GAAAN1 frame 5 (drawn at feel_pos); change_cloth.c_inc:65-68 HALLOWEEN at the ITAZURA1 setup, :94-106
  * wear sound + KIGAE at MENU_CHANGE1 frame 16. */
 static const PCAextCue s_aext_cues[] = {
-    { mPlayer_INDEX_LIE_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_JUMP, "bed_jump" },
-    { mPlayer_INDEX_LIE_BED, -1, 20.0f, PC_AEXT_CUE_SND, NA_SE_BED_IN, "bed_in" },
-    { mPlayer_INDEX_ROLL_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_BED_NEGAERI, "bed_negaeri" },
-    { mPlayer_INDEX_STANDUP_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_BED_OUT, "bed_out" },
-    { mPlayer_INDEX_STANDUP_BED, -1, 23.0f, PC_AEXT_CUE_SND, NA_SE_LANDING, "bed_landing" },
-    { mPlayer_INDEX_RECIEVE_PUTAWAY, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_GASAGOSO, "putaway_gasagoso" },
-    { mPlayer_INDEX_GIVE, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_GASAGOSO, "give_gasagoso" },
-    { mPlayer_INDEX_TALK, mPlayer_ANIM_GAAAN1, 5.0f, PC_AEXT_CUE_FX, eEC_EFFECT_SHOCK, "talk_shock" },
-    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_GAAAN1, 5.0f, PC_AEXT_CUE_FX, eEC_EFFECT_SHOCK, "demo_shock" },
-    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_ITAZURA1, 0.0f, PC_AEXT_CUE_FX, eEC_EFFECT_HALLOWEEN, "cloth_halloween" },
-    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_SND, NA_SE_WEAR, "cloth_wear" },
-    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "cloth_kigae" },
+    { mPlayer_INDEX_LIE_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_JUMP, "bed_jump", 0 },
+    { mPlayer_INDEX_LIE_BED, -1, 20.0f, PC_AEXT_CUE_SND, NA_SE_BED_IN, "bed_in", 0 },
+    { mPlayer_INDEX_ROLL_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_BED_NEGAERI, "bed_negaeri", 0 },
+    { mPlayer_INDEX_STANDUP_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_BED_OUT, "bed_out", 0 },
+    { mPlayer_INDEX_STANDUP_BED, -1, 23.0f, PC_AEXT_CUE_SND, NA_SE_LANDING, "bed_landing", 0 },
+    { mPlayer_INDEX_RECIEVE_PUTAWAY, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_GASAGOSO, "putaway_gasagoso", 0 },
+    { mPlayer_INDEX_GIVE, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_GASAGOSO, "give_gasagoso", 0 },
+    { mPlayer_INDEX_TALK, mPlayer_ANIM_GAAAN1, 5.0f, PC_AEXT_CUE_FX, eEC_EFFECT_SHOCK, "talk_shock", 0 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_GAAAN1, 5.0f, PC_AEXT_CUE_FX, eEC_EFFECT_SHOCK, "demo_shock", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_ITAZURA1, 0.0f, PC_AEXT_CUE_FX, eEC_EFFECT_HALLOWEEN, "cloth_halloween", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_SND, NA_SE_WEAR, "cloth_wear", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "cloth_kigae", 0 },
+    /* EMOTE WHEEL (pc_emote.h): the emote overlay is reported as DEMO_WAIT with the emote id in `variant` (1 Hooray .. 8 Exercise); these rows
+     * mirror the sender's cues (src/game/m_player_pc_emote.c_inc l_pc_emote_cues): the marks villagers show (SIAWASE_HANA flowers,
+     * KANTANHU '!', ASE2 sweat) and the vanilla cues of the borrowed clips (tired.c_inc:26-35, change_cloth.c_inc:65-68 / :97-106). */
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_YATTA1, 0.0f, PC_AEXT_CUE_FXC, eEC_EFFECT_SIAWASE_HANA, "emote_hooray_flowers", 1 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_BIKU1, 0.0f, PC_AEXT_CUE_FX, eEC_EFFECT_KANTANHU, "emote_surprised_mark", 3 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_TIRED1, 0.0f, PC_AEXT_CUE_FXC, eEC_EFFECT_ASE2, "emote_phew_sweat", 5 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_TIRED1, 10.0f, PC_AEXT_CUE_SND, PC_TID_ARAIIKI, "emote_phew_araiiki", 5 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_TIRED1, 10.0f, PC_AEXT_CUE_FX, eEC_EFFECT_DUST, "emote_phew_dust", 5 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_ITAZURA1, 0.0f, PC_AEXT_CUE_FX, eEC_EFFECT_HALLOWEEN, "emote_boo_smoke", 6 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_SND, NA_SE_WEAR, "emote_twirl_wear", 7 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "emote_twirl_sparkle", 7 },
 };
 _Static_assert(sizeof(s_aext_cues) / sizeof(s_aext_cues[0]) <= 32, "cue bitmask is 32 bits");
 
@@ -5341,6 +5353,7 @@ typedef struct PCAextPuppet {
     const void*    actor;     /* the puppet actor the view belongs to (re-created actor = fresh view) */
     PCActionExtMsg cur;       /* the applied message */
     uint32_t       cue_done;
+    uint32_t       fxc_live;  /* EMOTE WHEEL: bit i = continuous cue i spawned on this puppet (killed when the row's pair ends) */
     float          last_cur;
     int            have_last;
     int            tilt_on;   /* this overlay wrote shape_info.rotation.x (bed): restored to 0 once the bed states end */
@@ -5393,7 +5406,11 @@ static void pc_puppet_aext_snd(PCRemotePlayerActor* self, PCRemotePlayerSlot* sl
         }
     }
     if (why == NULL) {
-        sAdo_OngenTrgStart(c->id, &pos);
+        u16 snd = c->id;
+        if (snd == PC_TID_ARAIIKI) { /* EMOTE WHEEL (Phew): the owner's gendered breath, as the TIRED tool row */
+            snd = (slot->appearance.gender == mPr_SEX_MALE) ? (u16)NA_SE_ARAIIKI_BOY : (u16)NA_SE_ARAIIKI_GIRL;
+        }
+        sAdo_OngenTrgStart(snd, &pos);
         slot->cos_stats.sounds++;
         pc_puppet_fx_diag(self, c->name, c->name, cur, (int)c->id, "ok");
     } else {
@@ -5427,8 +5444,12 @@ static void pc_puppet_aext_cues(PCRemotePlayerActor* self, PCRemotePlayerSlot* s
         uint32_t bit = 1u << i;
         int fire;
 
-        if ((int)c->idx != (int)pp->cur.main_index || (c->anim0 >= 0 && (int)c->anim0 != (int)pp->cur.anim0) || (pp->cue_done & bit)) {
+        if ((int)c->idx != (int)pp->cur.main_index || (c->anim0 >= 0 && (int)c->anim0 != (int)pp->cur.anim0) || (pp->cue_done & bit) ||
+            (c->variant != 0u && c->variant != pp->cur.variant)) {
             continue;
+        }
+        if (c->kind == PC_AEXT_CUE_FXC && (pp->fxc_live & bit)) {
+            continue; /* EMOTE WHEEL: still alive from an earlier clip of the same row (Phew's second breath) */
         }
         if (c->frame <= 0.0f) {
             fire = at_start && pp->cur.start_frame <= 3u; /* an entry cue never replays when the clip was adopted late */
@@ -5442,11 +5463,34 @@ static void pc_puppet_aext_cues(PCRemotePlayerActor* self, PCRemotePlayerSlot* s
         if (c->kind == PC_AEXT_CUE_SND) {
             pc_puppet_aext_snd(self, slot, game, c, cur);
         } else {
+            const int before = slot->cos_stats.spawned;
             pc_puppet_aext_fx(self, slot, game, c, cur);
+            if (c->kind == PC_AEXT_CUE_FXC && slot->cos_stats.spawned != before) {
+                pp->fxc_live |= bit;
+            }
         }
     }
     pp->last_cur = cur;
     pp->have_last = 1;
+}
+
+/* EMOTE WHEEL: kill this puppet's continuous emote effects (SIAWASE_HANA flowers / ASE2 sweat), spawned with its own item_name (only its own
+ * die, never the local player's RSV_NO ones; the vanilla emotion effects end the same way: effect_kill_proc). */
+static void pc_puppet_aext_fxc_kill(PCRemotePlayerActor* self, PCAextPuppet* pp, const char* why) {
+    size_t i;
+
+    if (pp->fxc_live == 0u) {
+        return;
+    }
+    for (i = 0; i < sizeof(s_aext_cues) / sizeof(s_aext_cues[0]); i++) {
+        if ((pp->fxc_live & (1u << i)) && eEC_CLIP != NULL && eEC_CLIP->effect_kill_proc != NULL) {
+            eEC_CLIP->effect_kill_proc(s_aext_cues[i].id, (u16)(PC_PUPPET_FX_ITEM_NAME_BASE + (u32)self->peer));
+            if (pc_remote_player_puppet_diag()) {
+                printf("[NET][PUPPET][DIAG] player %d cosmetic effect kill %s reason=%s\n", (int)self->peer, s_aext_cues[i].name, why);
+            }
+        }
+    }
+    pp->fxc_live = 0u;
 }
 
 /* Bed tilt (vanilla shape rotation of the bed states; the puppet's mv rewrites rotation.y = world.angle.y every frame, rotation.x is ours):
@@ -5514,8 +5558,8 @@ typedef struct PCClothChg {
 static PCClothChg s_cloth_chg[PC_PUPPET_ID_LIMIT];
 static uint32_t s_cloth_log_n = 0;
 static const PCAextCue s_cloth_menu_cues[2] = {
-    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_SND, NA_SE_WEAR, "menu_cloth_wear" },
-    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "menu_cloth_kigae" },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_SND, NA_SE_WEAR, "menu_cloth_wear", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "menu_cloth_kigae", 0 },
 };
 
 static int pc_puppet_cloth_enabled(void) {
@@ -5691,6 +5735,7 @@ static int pc_puppet_aext_apply(PCRemotePlayerActor* self, PCRemotePlayerSlot* s
         memset(&pp->v, 0, sizeof(pp->v));
         pp->actor = (const void*)self;
         pp->tilt_on = 0;
+        pp->fxc_live = 0u; /* EMOTE WHEEL: the old actor's effects went with its scene */
     }
     if (slot->snapshot_count == 0 || slot->snap_req) {
         s_cloth_chg[(int)self->peer].playing = 0; /* CL: a scene snap drops the synthesized cloth clip (the fallback rebinds; the hold expires) */
@@ -5700,6 +5745,7 @@ static int pc_puppet_aext_apply(PCRemotePlayerActor* self, PCRemotePlayerSlot* s
     d = pc_aext_decide(&pp->st, &pp->v, valid, idx, ctr, now, &rec);
     if (d == PC_AEXT_D_END) {
         pp->ends++;
+        pc_puppet_aext_fxc_kill(self, pp, "row_end"); /* EMOTE WHEEL */
         if (!v->row_active) { /* a static row started by the new pair already bound its own clips */
             v->current_anim_idx = -1; /* the fallback block rebinds both layers + the part table next */
             v->current_anim1_idx = -1;
@@ -5750,6 +5796,9 @@ static int pc_puppet_aext_apply(PCRemotePlayerActor* self, PCRemotePlayerSlot* s
                       idx_m == mPlayer_INDEX_CLOSE_FURNITURE) ? 200.0f : 0.0f;
             cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(&v->keyframe0, 0.0f, 1000.0f, bz, 0, 0, 0x4000);
             v->keyframe0.animation_enabled = pin;
+        }
+        if (pp->cur.main_index != rec->m.main_index || pp->cur.entry_counter != rec->m.entry_counter || pp->cur.variant != rec->m.variant) {
+            pc_puppet_aext_fxc_kill(self, pp, "new_row"); /* EMOTE WHEEL: a new pair (another emote) */
         }
         pp->cur = rec->m;
         pp->cue_done = 0;

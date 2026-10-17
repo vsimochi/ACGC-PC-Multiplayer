@@ -3011,6 +3011,73 @@ static void bg_item_common_draw_check(GAME_PLAY* play, bg_item_common_c* common,
     }
 }
 
+#ifdef TARGET_PC
+/* "Cosmetic world reactions behind menus" (multiplayer only; m_play.c Game_play_pc_submenu_live_tick ticks this actor while a
+ * free-play submenu is open in a live session, with g_pc_submenu_world_tick set). A FILTERED pass of bg_item_common_move that
+ * keeps only what is pure presentation and never writes the town map:
+ *   - drops: ONLY "presentation" fly drops (flag 0x4 = the landing never calls mFI_SetFG_common, no hole flag 0x8, not the
+ *     honeycomb, whose wait state moves the bee actor): the TREE_DROP falling fruit / bells / furniture (pc_bg_item_present_tree_drop)
+ *     and the fly-away items of bIT_actor_fly_entry. Every other drop (a plant drop, an ordinary drop that writes its tile on
+ *     landing, a buried-into-hole drop) is HELD exactly as vanilla holds it and resumes when the menu closes.
+ *   - the shine-spot glow (eEC effects only) and the fade-out alpha of a removed item (its tile was written at entry).
+ *   - the draw-table refresh when ONLY update_fg is pending (a tile changed by the host / tile sync: tree -> stump, an item
+ *     dropped or picked up, a hole, a weed pulled): a read of the live grid into this actor's own draw tables (vanilla's own
+ *     refresh path); it is skipped while born_item / a wade / remove_cut_tree_info_bitfield is pending (those touch the hole /
+ *     beecomb block state: they wait for the menu to close).
+ * HELD (vanilla freeze): the dig / bury hole effects (they write the tile when they finish), pitfalls (they grab the player), the
+ * money-rock coin window (gameplay timer + reset write), outdoor-furniture models / collision (pc_ofurn_bgitem_move registers
+ * move-bg collision). */
+extern unsigned g_pc_menu_cos_drop_ticks;   /* m_play.c */
+extern unsigned g_pc_menu_cos_drop_held;
+extern unsigned g_pc_menu_cos_redraws;
+extern unsigned g_pc_menu_cos_redraw_held;
+
+static void bIT_pc_menu_drop_move(bg_item_drop_table_c* drop_info) {
+    bg_item_drop_c* drop = drop_info->drop_p;
+    int i;
+
+    for (i = 0; i < drop_info->count; i++, drop++) {
+        if (drop->move_proc == NULL) {
+            continue;
+        }
+        if (drop->move_proc == &bIT_actor_drop_move_fly && (drop->flags & 4) != 0 && (drop->flags & 8) == 0 &&
+            drop->fg_item != HONEYCOMB && drop->layer <= 0 && drop->wait_counter <= 0) {
+            xyz_t_move(&drop->offset, &ZeroVec);
+            drop->move_proc(drop);
+            g_pc_menu_cos_drop_ticks++;
+        } else {
+            g_pc_menu_cos_drop_held++;
+        }
+    }
+}
+
+static void bg_item_common_pc_menu_cosmetic_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common, int ticks) {
+    bg_item_draw_table_c* draw_tbl;
+    int i;
+
+    bIT_pc_menu_drop_move(&common->drop_info);
+    bIT_pc_menu_drop_move(&common->fruit_drop_info);
+    bIT_actor_shin_effect_move((GAME*)play, common->shin);
+    bIT_actor_fade_move((GAME*)play, common->fade, ticks);
+
+    if (mFI_FGisUpDate() == TRUE) {
+        if (mFI_ItemisBorn() != TRUE && !mFI_CheckPlayerWade(mFI_WADE_END) && Common_Get(remove_cut_tree_info_bitfield) == 0) {
+            bg_item_common_renew_draw_and_crs_data_perfect(play, common, 1);
+            g_pc_menu_cos_redraws++;
+        } else {
+            g_pc_menu_cos_redraw_held++;
+        }
+    }
+
+    draw_tbl = common->draw_table;
+    for (i = 0; i < mFM_VISIBLE_BLOCK_NUM; i++, draw_tbl++) {
+        if (draw_tbl->draw_flag == TRUE) {
+            bg_item_common_draw_check(play, common, actorx, draw_tbl);
+        }
+    }
+}
+#endif
+
 static void bg_item_common_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common) {
     static f32 logic_accum = 0.0f;
     int flags;
@@ -3018,6 +3085,16 @@ static void bg_item_common_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c
     int ticks = graph_dt_60hz_ticks((GAME*)play, &logic_accum);
     bg_item_draw_table_c* draw_tbl;
 
+#ifdef TARGET_PC
+    {
+        extern int g_pc_submenu_world_tick; /* m_actor.c: set only while m_play.c ticks this actor behind an open submenu */
+
+        if (g_pc_submenu_world_tick) {
+            bg_item_common_pc_menu_cosmetic_move(play, actorx, common, ticks);
+            return;
+        }
+    }
+#endif
     bIT_actor_drop_move(&common->drop_info, ticks);
     bIT_actor_drop_move(&common->fruit_drop_info, ticks);
     bIT_actor_hole_effect_move((GAME*)play, common->hole, ticks);

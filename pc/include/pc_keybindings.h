@@ -61,6 +61,9 @@ typedef struct {
 
     /* multiplayer chat: press to open the chat line (pc_chat_ui.c; free play only) */
     PCInputCode chat;
+
+    /* PC emote wheel: hold to open (mouse selects), release to play (pc_emote_wheel.c) */
+    PCInputCode emote;
 } PCKeybindings;
 
 /* Gamepad button bindings. Sticks are hardwired to the analog sticks
@@ -81,6 +84,10 @@ typedef struct {
 
     /* PC radial tool wheel: hold to open (right stick selects), release to equip */
     PCPadCode wheel;
+
+    /* PC emote wheel: hold to open (right stick selects), release to play. Default D-pad Up, which free play does not use
+     * (only choice menus read it): it may share D-pad Up with the D-Pad Up binding (the settings menu allows that one pair) */
+    PCPadCode emote;
 } PCPadBindings;
 
 extern PCKeybindings  g_pc_keybindings;

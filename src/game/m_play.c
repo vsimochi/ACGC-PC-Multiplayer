@@ -568,7 +568,8 @@ static int Game_play_pc_actor_total(GAME_PLAY* play) {
  *   - the effect control (eEC: visual effects only), the weather (particles, env SE; a client never rolls the weather), the insect
  *     control (bugs; the mosquito sting request is suppressed while the flag is set, ac_ins_ka.c) and the fish control (gyoei).
  * Everything else stays frozen exactly as vanilla: the LOCAL player (its menu state machine owns it), the NPC control actor and
- * shop / event NPCs, BG items, bees, the ball, structures, the set manager (no new spawns), the camera. See the roadmap section. */
+ * shop / event NPCs, BG items (only their FILTERED cosmetic pass runs, see Game_play_pc_submenu_cosmetic_tick), bees, the ball,
+ * structures, the set manager (no new spawns), the camera. See the roadmap section. */
 static int s_pc_submenu_puppet_ticks = 0;
 static int s_pc_submenu_ctl_ticks = 0;
 
@@ -595,6 +596,95 @@ static void Game_play_pc_submenu_tick_actor(GAME_PLAY* play, ACTOR* a) {
     CollisionCheck_Status_Clear(&a->status_data);
 }
 
+/* "Cosmetic world reactions behind menus" (same live session / free-play gate as the whitelist above): what another player does to
+ * the town while THIS player's submenu is open plays live instead of after the menu closes:
+ *   - the EffectBG actor (ac_effectbg.c, ACTOR_PART_EFFECT): the tree-shake sway a puppet starts (pc_remote_player.c ->
+ *     make_effect_bg_proc) and the chop / fall animations: a 3-slot keyframe pool, leaves through the effect control, sounds; it only
+ *     READS the grid (EfbgBgitemTreeCheck) and the ground height, creates no actor.
+ *   - the field-item actor (bg_item / cherry / winter / xmas variants, ACTOR_PART_ITEM) through its FILTERED pass
+ *     (bg_item_common.c_inc bg_item_common_pc_menu_cosmetic_move, selected by g_pc_submenu_world_tick): presentation drops (TREE_DROP
+ *     falling fruit / bells / furniture, flag 0x4 = no tile write), the shine glow, item fade-outs and the draw-table refresh of tiles
+ *     the host / tile sync changed (stump, dropped / picked-up items, holes, pulled weeds). Holes being dug / filled, pitfalls, the
+ *     money-rock coin window, every drop that writes a tile and the outdoor-furniture collision stay frozen.
+ * Proof hooks: a hash of the town map (Save fg + deposit) is taken around this pass; any change is counted (field_changed_cos in the
+ * hold END line, expected 0) and logged. Bees, the ball, structures and the local player stay frozen (they chase / push / talk to
+ * the local player or write the map). */
+unsigned g_pc_menu_cos_drop_ticks = 0;   /* bg_item_common.c_inc: presentation drops moved during a menu */
+unsigned g_pc_menu_cos_drop_held = 0;    /* ... other drops held (vanilla freeze) */
+unsigned g_pc_menu_cos_redraws = 0;      /* ... draw-table refreshes of changed tiles */
+unsigned g_pc_menu_cos_redraw_held = 0;  /* ... refreshes postponed (born item / wade / cut-tree reset pending) */
+static int s_pc_menu_cos_efbg_ticks = 0;
+static int s_pc_menu_cos_efbg_active = 0; /* frames on which >= 1 EffectBG slot (a tree sway / chop) was animating */
+static int s_pc_menu_cos_bgitem_ticks = 0;
+static int s_pc_menu_cos_field_changed = 0;
+static int s_pc_menu_cos_logged = 0; /* bit 0 tree reaction, bit 1 drop, bit 2 refresh, bit 3 field change */
+
+static u32 Game_play_pc_town_map_hash(void) {
+    const u8* p = (const u8*)Save_GetPointer(fg);
+    const u8* d = (const u8*)Save_GetPointer(deposit);
+    u32 h = 2166136261u;
+    u32 i;
+
+    for (i = 0; i < (u32)sizeof(Save_Get(fg)); i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    for (i = 0; i < (u32)sizeof(Save_Get(deposit)); i++) {
+        h = (h ^ d[i]) * 16777619u;
+    }
+    return h;
+}
+
+static void Game_play_pc_submenu_cosmetic_tick(GAME_PLAY* play) {
+    extern int Effectbg_pc_count_active(void); /* ac_effectbg.c (read-only pool view) */
+    ACTOR* a;
+    u32 h0 = Game_play_pc_town_map_hash();
+    unsigned drops0 = g_pc_menu_cos_drop_ticks;
+    unsigned redraw0 = g_pc_menu_cos_redraws;
+
+    for (a = play->actor_info.list[ACTOR_PART_EFFECT].actor; a != NULL; a = a->next_actor) {
+        if (a->id == mAc_PROFILE_EFFECTBG && a->ct_proc == NULL && a->mv_proc != NULL &&
+            (a->state_bitfield & (ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_CULL)) != 0) {
+            int act = Effectbg_pc_count_active();
+
+            if (act > 0) {
+                s_pc_menu_cos_efbg_active++;
+                if (!(s_pc_menu_cos_logged & 1)) {
+                    s_pc_menu_cos_logged |= 1;
+                    printf("[NET][MENU] tree reaction during menu: EffectBG animating slots=%d menu_type=%d\n", act,
+                           (int)play->submenu.menu_type);
+                }
+            }
+            Game_play_pc_submenu_tick_actor(play, a);
+            s_pc_menu_cos_efbg_ticks++;
+        }
+    }
+    for (a = play->actor_info.list[ACTOR_PART_ITEM].actor; a != NULL; a = a->next_actor) {
+        if ((a->id == mAc_PROFILE_BGITEM || a->id == mAc_PROFILE_BGCHERRYITEM || a->id == mAc_PROFILE_BGWINTERITEM ||
+             a->id == mAc_PROFILE_BGXMASITEM) &&
+            a->ct_proc == NULL && a->mv_proc != NULL &&
+            (a->state_bitfield & (ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_CULL)) != 0) {
+            Game_play_pc_submenu_tick_actor(play, a); /* -> bg_item_common_pc_menu_cosmetic_move (the flag is set) */
+            s_pc_menu_cos_bgitem_ticks++;
+        }
+    }
+    if (g_pc_menu_cos_drop_ticks != drops0 && !(s_pc_menu_cos_logged & 2)) {
+        s_pc_menu_cos_logged |= 2;
+        printf("[NET][MENU] tree reaction during menu: item drop presentation animating (drop_ticks=%u)\n", g_pc_menu_cos_drop_ticks);
+    }
+    if (g_pc_menu_cos_redraws != redraw0 && !(s_pc_menu_cos_logged & 4)) {
+        s_pc_menu_cos_logged |= 4;
+        printf("[NET][MENU] tree reaction during menu: ground items redrawn from the updated field (redraws=%u)\n",
+               g_pc_menu_cos_redraws);
+    }
+    if (Game_play_pc_town_map_hash() != h0) {
+        s_pc_menu_cos_field_changed++;
+        if (!(s_pc_menu_cos_logged & 8)) {
+            s_pc_menu_cos_logged |= 8;
+            printf("[NET][MENU] WARNING: the town map changed inside the cosmetic menu tick\n");
+        }
+    }
+}
+
 static void Game_play_pc_submenu_live_tick(GAME_PLAY* play) {
     extern int pc_remote_player_is_puppet_actor(const void* actor);
     ACTOR* a;
@@ -616,6 +706,7 @@ static void Game_play_pc_submenu_live_tick(GAME_PLAY* play) {
             s_pc_submenu_ctl_ticks++;
         }
     }
+    Game_play_pc_submenu_cosmetic_tick(play);
 }
 
 /* the live draw / live tick condition of a submenu that is open from FREE PLAY: the menu is fully up, no scene transition, no
@@ -641,6 +732,9 @@ static void Game_play_pc_submenu_world_hold(GAME_PLAY* play) {
         s_pc_submenu_tick_count = 0;
         s_pc_submenu_puppet_ticks = 0;
         s_pc_submenu_ctl_ticks = 0;
+        g_pc_menu_cos_drop_ticks = g_pc_menu_cos_drop_held = g_pc_menu_cos_redraws = g_pc_menu_cos_redraw_held = 0;
+        s_pc_menu_cos_efbg_ticks = s_pc_menu_cos_efbg_active = s_pc_menu_cos_bgitem_ticks = 0;
+        s_pc_menu_cos_field_changed = s_pc_menu_cos_logged = 0;
         s_pc_submenu_bank_idx0 = play->object_exchange.bank_idx;
         g_pc_submenu_tick_refused_make = 0;
         g_pc_submenu_tick_deferred_delete = 0;
@@ -732,6 +826,10 @@ static void Game_play_pc_submenu_world_hold_end(GAME_PLAY* play) {
                s_pc_submenu_hold_actors0, Game_play_pc_actor_total(play), s_pc_submenu_tick_count,
                g_pc_submenu_tick_refused_make, g_pc_submenu_tick_deferred_delete, s_pc_submenu_bank_idx0,
                play->object_exchange.bank_idx, s_pc_submenu_puppet_ticks, s_pc_submenu_ctl_ticks);
+        printf("[NET][MENU] cosmetic reactions END efbg_ticks=%d efbg_active_frames=%d bgitem_ticks=%d drop_ticks=%u drop_held=%u "
+               "redraws=%u redraw_held=%u field_changed_cos=%d\n",
+               s_pc_menu_cos_efbg_ticks, s_pc_menu_cos_efbg_active, s_pc_menu_cos_bgitem_ticks, g_pc_menu_cos_drop_ticks,
+               g_pc_menu_cos_drop_held, g_pc_menu_cos_redraws, g_pc_menu_cos_redraw_held, s_pc_menu_cos_field_changed);
         s_pc_submenu_hold_frames = 0;
     }
 }

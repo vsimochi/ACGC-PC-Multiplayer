@@ -328,6 +328,8 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_profiler.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_pause_menu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_tool_wheel.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_emote.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_emote_wheel.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_settings_menu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_menu_util.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_text_draw.c
@@ -549,6 +551,7 @@ if(PC_TEST_HOOKS)
         ${DECOMP_ROOT}/src/actor/ac_my_room.c # dresser storage UI-drive hook (AC_TEST_DRESSER_UI)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll_host.c # day rollover: AC_TEST_DAY_ROLL_AT / console `day advance`
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_sell_ui.c # Nook bulk sell basket: AC_TEST_SELL_BASKET (real-game basket test)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_emote_wheel.c # emote wheel: AC_TEST_EMOTE_SCRIPT (real-game emote test)
         PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS)
 endif()
 

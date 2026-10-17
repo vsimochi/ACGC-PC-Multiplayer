@@ -154,6 +154,20 @@ static inline int pc_npc_proxy_offer(PCNpcProxyLease* l, int peer, uint32_t now,
     return 1;
 }
 
+/* ---- villager push by every player (relay owner or not) ----
+ * A villager the host does not simulate is run by ONE client (the relay owner, LOCAL mode); every other client is a consumer of the relayed stream and its own collision
+ * push is never integrated, so only the owner could push it (the user's report: "the guest can push the stationary villager, the resident cannot": the guest was the relay
+ * owner). The remote players' puppets do not pair with villagers in the OC pass (pc_remote_player.c pipe flags), so the push of a REMOTE player is added explicitly
+ * (pc_remote_player_host_npc_push): on the HOST for a villager it simulates (as before), and now also on a READY CLIENT for a villager it runs itself (LOCAL mode): the owner
+ * integrates the non-owner's puppet push and the result reaches the pusher through the relay. Ownership never changes because of a push (no flapping, the exclusive owner
+ * stays). A consumer (HOST mode) never integrates it (its pose is the stream's); single player never (no puppets). fix_on = AC_MP_NPC_PUSH_FIX (default 1). */
+static inline int pc_npc_puppet_push_applies(int is_host, int is_ready_client, int slot_local, int fix_on) {
+    if (is_host) {
+        return 1;
+    }
+    return is_ready_client && slot_local && fix_on;
+}
+
 /* ---- host: the conversation hold cap ----
  * A client talk hold keeps the villager still on the host. Its BEGIN keepalive arrives every 10 s for as long as the client says it is still talking, so a stuck local talk state used
  * to keep the villager frozen (and unpushable) for everyone forever. The hold is now capped at cap_ms after it BEGAN; a capped peer cannot re-take the hold with keepalives until it

@@ -66,7 +66,8 @@ typedef struct PCActionExtMsg {
     uint8_t  speed_q;       /* |keyframe0 frame speed| * 32, saturated at 255 (0.5 = 16) */
     uint8_t  start_frame;   /* the owner's keyframe0 current frame when sampled (floor, 0..255) */
     uint8_t  face;          /* eye << 4 | mouth (eye < 8, mouth < 6), PC_AEXT_FACE_NONE = none */
-    uint8_t  variant;       /* state detail (trades: the surface flag; wash car: the WASH cycle index; else 0) */
+    uint8_t  variant;       /* state detail (trades: the surface flag; wash car: the WASH cycle index; DEMO_WAIT: the emote id 1..8 of the
+                             * emote overlay (pc_emote.h), 0 = a real scripted DEMO_WAIT; else 0) */
     uint16_t aux;           /* trades: the item id (GIVE / RECIEVE_STRETCH / RECIEVE); radio: the command; else 0 */
     uint8_t  clip_seq;      /* per-owner clip instance counter: a new value = (re)start the clip, the same value = retune only */
     uint8_t  rsv;           /* 0 */
@@ -92,6 +93,8 @@ typedef struct PCAextSample {
     float    speed, frame;         /* keyframe0 frame control speed / current frame */
     int      variant;
     uint16_t aux;
+    int      face_set;             /* 1 = send `face` instead of pc_aext_face_rule (the emote overlay: its constant face, pc_emote.h) */
+    uint8_t  face;
 } PCAextSample;
 
 typedef struct PCAextSender {

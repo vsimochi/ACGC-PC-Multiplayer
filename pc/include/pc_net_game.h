@@ -433,6 +433,12 @@ void pc_net_game_set_npc_talk_lease_probe(PCNetGameNpcTalkLeaseProbe fn);
  * does not simulate it), 0 = mirror the host's NPC_MOVE. actor_new = this is the first frame of a (re)created actor of the slot; must_hold vetoes the
  * switch to local AI (the villager is hidden in its house / another player owns its conversation). Logs one line per transition. */
 int pc_net_game_npc_client_local_ai(int slot, uint16_t npc_id, int actor_new, int must_hold);
+/* Villager push by every player (pc_npc_authority.h pc_npc_puppet_push_applies): 1 = this process integrates the REMOTE players' (puppets') push into
+ * this villager this frame: the HOST always; a READY CLIENT only while it runs the villager itself (stale fallback LOCAL mode, i.e. it is / will be
+ * the relay owner) and AC_MP_NPC_PUSH_FIX is not 0. 0 = single player, or a client mirroring the stream. */
+int pc_net_game_npc_puppet_push_ok(int slot);
+/* Client diagnostics: a remote player's puppet pushed a villager this client runs (rate-limited log line). No-op on a host. */
+void pc_net_game_npc_note_remote_push(int slot, int contacts, float x, float z);
 /* Dedicated console `npc` / `npc free <slot>` (host): per-villager authority status, release a stuck conversation hold. */
 void pc_net_game_dedicated_npc(const char* args, void (*out)(const char*));
 /* --host-observer: the nearest READY remote player (any wire id) in the host's own scene within max_dist; 0 = none. The villager AI measures its

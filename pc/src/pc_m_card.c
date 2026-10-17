@@ -2817,6 +2817,26 @@ int pc_town_shop_structure_unit(int* bx, int* bz, int* tile) {
     return 0;
 }
 
+/* Shop building on join (multiplayer, pc_net_game.c "SHOP JOIN SYNC"): the npc_id (SHOP0..SHOP3) of the live shop structure actor = the building the town scene
+ * actually shows, or 0 when none is alive (not in the town scene / the shop acre is not loaded). Read-only. */
+int pc_town_shop_structure_npc(void) {
+    GAME_PLAY* play;
+    ACTOR* actor;
+    int part;
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    for (part = 0; part < ACTOR_PART_NUM; part++) {
+        for (actor = play->actor_info.list[part].actor; actor != NULL; actor = actor->next_actor) {
+            if (actor->npc_id >= SHOP0 && actor->npc_id <= SHOP3) {
+                return (int)actor->npc_id;
+            }
+        }
+    }
+    return 0;
+}
+
 /* The same-position SCENE_FG reload of pc_host_renewshop_poll for any role (the shop upgrade's client refresh): only in the town scene, no transition, the local player idle (no menu,
  * no talk, no demo). 1 = the reload started, 0 = not now (retry later), -1 = not in the town scene (nothing to refresh). */
 int pc_town_same_position_reload(const char* why) {

@@ -143,7 +143,7 @@ def main():
           and "mFont_SetMatrix(game->graph, mFont_MODE_FONT);" in dr and "mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);" in dr
           and "void pc_net_notice_draw(struct game_s* game);" in pmh
           and gr.index("pc_pause_menu_draw(game);") < gr.index("pc_net_notice_draw(game);") and gr.count("pc_net_notice_draw(game);") == 1
-          and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n(?:    pc_tool_wheel_draw\(game\);[^\n]*\n)?(?:    pc_chat_draw\(game\);[^\n]*\n)?    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None)  # (the PC radial tool menu draw and the multiplayer chat draw (pc_chat_draw, presentation only; no-op while paused / no graph) may sit between the two)
+          and re.search(r"#ifdef TARGET_PC\n    pc_pause_menu_draw\(game\);\n(?:    pc_tool_wheel_draw\(game\);[^\n]*\n)?(?:    pc_emote_wheel_draw\(game\);[^\n]*\n)?(?:    pc_chat_draw\(game\);[^\n]*\n)?    pc_net_notice_draw\(game\);[^\n]*\n#endif", gr) is not None)  # (the PC radial tool menu draw and the multiplayer chat draw (pc_chat_draw, presentation only; no-op while paused / no graph) may sit between the two)
     return L.summary_and_exit_code(results)
 
 

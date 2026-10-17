@@ -18,7 +18,7 @@ check("pcfa_set_tile" not in h and "mFI_SetFG" not in h, "presentation path neve
 p = b[b.index("int pc_bg_item_present_tree_drop("):]
 p = p[:p.index(chr(10) + "}")]
 check("0x4" in p and "mFI_SetFG_common" not in p, "drop actor flagged no-landing-write; no SetFG")
-check("pc_bg_item_present_tree_drop" not in c, "not in the 4x-included common file")
+check("pc_bg_item_present_tree_drop" not in re.sub(r"/\*.*?\*/|//[^\n]*", "", c, flags=re.S), "not in the 4x-included common file (code; a doc comment mention is fine)")
 h2 = n[n.index("static void pcnetgame_handle_client_tree_drop"):n.index("static void pcnetgame_host_tree_drop_broadcast")]
 check("HONEYCOMB" in h2 and "mNT_check_unknown" in h2, "client rejects honeycomb/unknown item")
 check(h2.count("pcfa_town_ut_to_acre_tile") == 2 and "> 2" in h2, "client bounds both tiles + tree/drop proximity")

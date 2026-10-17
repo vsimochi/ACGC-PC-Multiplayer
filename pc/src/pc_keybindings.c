@@ -35,6 +35,9 @@ static const PCKeybindings s_kb_defaults = {
 
     /* multiplayer chat line (press) */
     .chat = SDL_SCANCODE_T,
+
+    /* emote wheel (hold) */
+    .emote = SDL_SCANCODE_F,
 };
 
 /* Back/Select is reserved for opening the PC pause menu, so it is not a
@@ -53,6 +56,7 @@ static const PCPadBindings s_pad_defaults = {
     .dpad_left  = SDL_CONTROLLER_BUTTON_DPAD_LEFT,
     .dpad_right = SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
     .wheel      = SDL_CONTROLLER_BUTTON_LEFTSHOULDER, /* radial tool wheel (hold) */
+    .emote      = SDL_CONTROLLER_BUTTON_DPAD_UP,      /* emote wheel (hold; D-pad Up is unused in free play) */
 };
 
 PCKeybindings g_pc_keybindings;
@@ -91,6 +95,7 @@ static const KeybindEntry s_entries[] = {
     KB_ENTRY("DPad_Right",   dpad_right),
     KB_ENTRY("Wheel",        wheel),
     KB_ENTRY("Chat",         chat),
+    KB_ENTRY("Emote",        emote),
 };
 
 #define NUM_ENTRIES (sizeof(s_entries) / sizeof(s_entries[0]))
@@ -112,6 +117,7 @@ static const KeybindEntry s_pad_entries[] = {
     PAD_ENTRY("Pad_DPad_Left",  dpad_left),
     PAD_ENTRY("Pad_DPad_Right", dpad_right),
     PAD_ENTRY("Pad_Wheel",      wheel),
+    PAD_ENTRY("Pad_Emote",      emote),
 };
 
 #define NUM_PAD_ENTRIES (sizeof(s_pad_entries) / sizeof(s_pad_entries[0]))
@@ -292,6 +298,7 @@ void pc_keybindings_save(void) {
         if (i == 7)  fprintf(f, "\n# Main Stick\n");
         if (i == 11) fprintf(f, "\n# C-Stick (Camera)\n");
         if (i == 15) fprintf(f, "\n# D-Pad\n");
+        if (i == 19) fprintf(f, "\n# PC actions: Wheel = tool wheel (hold), Chat (press), Emote = emote wheel (hold)\n");
     }
 
     fprintf(f, "\n[Gamepad]\n");
@@ -300,6 +307,7 @@ void pc_keybindings_save(void) {
     fprintf(f, "#   dpup, dpdown, dpleft, dpright. Use 'none' to unbind.\n");
     fprintf(f, "# Sticks are fixed: left stick = movement, right stick = C-stick.\n");
     fprintf(f, "# The Back/Select button is reserved: it opens the pause menu.\n");
+    fprintf(f, "# Pad_Wheel (tool wheel) and Pad_Emote (emote wheel) are held, the right stick selects; Pad_Emote may share dpup with Pad_DPad_Up.\n");
 
     for (int i = 0; i < (int)NUM_PAD_ENTRIES; i++) {
         PCPadCode code = *(PCPadCode*)((char*)&g_pc_padbindings + s_pad_entries[i].offset);

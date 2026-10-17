@@ -141,6 +141,11 @@ static const BindRow s_bind_rows[] = {
     BROW("D-Pad Down",  dpad_down,  dpad_down),
     BROW("D-Pad Left",  dpad_left,  dpad_left),
     BROW("D-Pad Right", dpad_right, dpad_right),
+    /* PC actions (keybindings.ini Wheel / Chat / Emote, Pad_Wheel / Pad_Emote): the tool wheel and the emote wheel are HELD (the mouse /
+     * the right stick selects, release confirms); chat is keyboard only (its line is typed) */
+    BROW("Tool Wheel",  wheel,      wheel),
+    BROW_K("Chat",      chat,       "-"),
+    BROW("Emote Wheel", emote,      emote),
 };
 #define BIND_ROW_COUNT    ((int)(sizeof(s_bind_rows) / sizeof(s_bind_rows[0])))
 #define BIND_VISIBLE      9
@@ -174,12 +179,21 @@ static void bind_assign_kb(int row, PCInputCode code) {
     *dst = code;
 }
 
+/* The one deliberately shared pad pair: the emote wheel (held, free play only) and the D-Pad Up button (read only by choice menus, unused
+ * in free play) may both be D-pad Up, the default. Every other pad conflict swaps as usual. */
+static int bind_pad_shared_ok(int a, int b) {
+    const int emote_off = (int)offsetof(PCPadBindings, emote), up_off = (int)offsetof(PCPadBindings, dpad_up);
+    const int pa = s_bind_rows[a].pad_off, pb = s_bind_rows[b].pad_off;
+    return (pa == emote_off && pb == up_off) || (pa == up_off && pb == emote_off);
+}
+
 static void bind_assign_pad(int row, PCPadCode code) {
     PCPadCode* dst = bind_pad_slot(row);
     if (!dst) return;
     if (code >= 0) {
         for (int i = 0; i < BIND_ROW_COUNT; i++) {
             if (i == row) continue;
+            if (bind_pad_shared_ok(row, i)) continue;
             PCPadCode* other = bind_pad_slot(i);
             if (other && *other == code) { *other = *dst; break; }
         }

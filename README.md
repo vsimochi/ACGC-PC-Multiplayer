@@ -83,10 +83,16 @@ Keyboard bindings are customizable via `keybindings.ini` (next to the executable
 | Z | Z trigger |
 | I / J / K / L | D-pad (up/left/down/right) |
 | T | Multiplayer chat: type a line (up to 60 characters), Enter sends it (a speech bubble above you + the chat log), Esc cancels (`Chat` in keybindings.ini) |
+| G (hold) | Tool wheel: point with the mouse, release to equip (`Wheel`) |
+| F (hold) | Emote wheel: point with the mouse at an emote (Hooray, Shocked, Surprised, Pray, Phew, Boo!, Twirl, Exercise), release to play it; other players see it (`Emote`) |
+
+Every key above (including Chat, the tool wheel and the emote wheel) can also be rebound in-game: Esc menu > Settings > Controls > Keybindings (keyboard and controller columns; saved to keybindings.ini).
 
 ### Gamepad
 
-SDL2 game controllers are supported with automatic hotplug detection. Button mapping follows the standard GameCube layout.
+SDL2 game controllers are supported with automatic hotplug detection. Button mapping follows the standard GameCube layout. Extra PC actions: hold **LB** for the tool wheel and hold **D-pad Up** for the emote wheel (the right stick picks, release confirms; `Pad_Wheel` / `Pad_Emote`, rebindable in the Keybindings menu).
+
+Emotes play while you stand or walk on foot (not seated, wading, in a door, a conversation, a menu or the chat line). Hooray, Twirl and Exercise need empty hands; the others keep the tool in your hand. Any movement or button press stops an emote. Turn the wheel off with `settings.ini [Gameplay] emotes = 0` (or env `AC_EMOTES=0`).
 
 ## Command Line Options
 
