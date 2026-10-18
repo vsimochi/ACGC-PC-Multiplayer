@@ -52384,6 +52384,12 @@ int pc_net_game_ofurn_storage_select(int ut_x, int ut_z, int item) {
  *   cycle   = place, then pc_net_game_ofurn_rotate(), then pc_net_game_ofurn_pickup() on that tile, 3 s apart;
  *   rotpick = turn to the placed piece next to the player and press A, then B through pc_ofurn_front_press() (the wait-state input seam). */
 extern int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger);
+#ifndef PC_NET_TEST_HOOKS
+/* release builds (PC_TEST_HOOKS=OFF) do not compile the museum pockets hook; the ofurn hook below is inert there anyway (pc_test_hook_getenv returns NULL) */
+static int pcnetgame_museum_pockets_test_hook(void) {
+    return 1;
+}
+#endif
 static void pcnetgame_ofurn_test_hook(void) {
     static int stage = 0;
     static uint32_t t0 = 0;
