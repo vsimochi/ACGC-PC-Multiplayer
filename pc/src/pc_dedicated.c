@@ -1122,6 +1122,7 @@ static void pc_ded_cmd_help(void) {
            "  shop-upgrade   the announced shop upgrade: state (IDLE / PENDING / CLOSED / RENEWING), level, qualifying level, time left\n"
            "  ops | op <player> | deop <player>   the operator list (servers/<id>/ops.ini; player = an online name / a resident / a guest of this town, or `peer N`; ambiguous names are refused)\n"
            "  furniture list [acre] | remove <x> <z>|#<index> [delete] | clear acre <n>|player <name> [delete]   furniture PLACED outdoors (removed pieces go to the lost and found unless `delete`)\n"
+           "  roommates [list] | remove <guest> confirm | clear <guest> confirm | owner <x> <z> <resident>   guests sharing a resident's house (servers/<id>/roommates.ini)\n"
            "  say <text>   a server announcement in every player's chat log (up to 60 characters)\n"
            "  mutes | mute <player> | unmute <player>   the chat mute list (servers/<id>/mutes.ini; player = an online name / a resident / a guest of this town, or `peer N`)\n"
            "  chat [on|off]   the text chat: status / switch it for this session (settings.ini [Network] chat sets the start value); every line is logged as [CHAT] name: text\n"
@@ -2525,6 +2526,9 @@ static void pc_ded_execute(char* line) {
         pc_ded_flush();
     } else if (strcmp(cmd, "furniture") == 0) {
         pc_net_game_dedicated_furniture(args, pc_ded_out_line); /* outdoor furniture C1: placed pieces (list / remove / clear) */
+        pc_ded_flush();
+    } else if (strcmp(cmd, "roommates") == 0) {
+        pc_net_game_dedicated_roommates(args, pc_ded_out_line); /* roommates / move-in: list / remove / clear / the holder of a gyroid */
         pc_ded_flush();
     } else if (strcmp(cmd, "say") == 0 || strcmp(cmd, "mute") == 0 || strcmp(cmd, "unmute") == 0 || strcmp(cmd, "mutes") == 0 || strcmp(cmd, "chat") == 0) {
         pc_net_game_dedicated_chat(cmd, args, pc_ded_out_line); /* text chat: announcement / mute list / the switch (the text is never interpreted) */

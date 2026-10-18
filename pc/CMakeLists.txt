@@ -355,6 +355,8 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_evnpc_shared.c # worker E: shared event NPC claims (pure logic)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_outdoor_furniture.c # outdoor furniture C1 (pure logic: markers, sidecar, message 98 / service 10 shapes)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ops.c          # the host's operator list ops.ini (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_roommates.c    # roommates / move-in: roommates.ini + message 104 shapes (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_room_ui.c      # roommates / move-in: the gyroid's menu (PC overlay)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ofurn_draw.c   # outdoor furniture C1: renderer + collision + A / B seams (game side)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_chat.c         # multiplayer text chat (pure logic: charset, wrap, rate, store, mutes.ini)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_chat_ui.c      # multiplayer text chat: input line, bubbles, chat log (game side)
@@ -552,6 +554,7 @@ if(PC_TEST_HOOKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll_host.c # day rollover: AC_TEST_DAY_ROLL_AT / console `day advance`
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_sell_ui.c # Nook bulk sell basket: AC_TEST_SELL_BASKET (real-game basket test)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_emote_wheel.c # emote wheel: AC_TEST_EMOTE_SCRIPT (real-game emote test)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_room_ui.c # roommates: AC_TEST_ROOM_UI (the gyroid menu driven like a player in the real-game test)
         PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS)
 endif()
 

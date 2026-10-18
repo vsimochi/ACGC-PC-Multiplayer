@@ -42,6 +42,9 @@ extern "C" {
  * The host announces outdoor storage in the 102 CAPS message's `total` field (a C2 client checks only count + flags of a CAPS message, so the field was free):
  * bit 0 = a placed storage piece can be opened (DRESSER_SELECT floor 0xFC; pc_dresser_store.h). A C3 client never sends an outdoor SELECT to a host without it. */
 #define PC_OFURN_C3_STORAGE 0x01u
+/* roommates / move-in (pc_roommates.h): bit 1 of the same field = the host speaks message 104 ROOMMATE (the gyroid menu). A client sends 104 only after it; an
+ * older client masks the field with PC_OFURN_C3_STORAGE only. */
+#define PC_OFURN_C4_ROOMMATES 0x02u
 /* the open gesture (the vanilla one: ac_my_room_move.c_inc aMR_ManageMoveBottun): A grabs at once; releasing A before the switch timer reached 14 (60 Hz) frames
  * without a push / pull / rotate step = the TAP that opens a storage piece; held longer = a plain grab. Wall clock here (the PC renders uncapped). */
 #define PC_OFURN_TAP_MS 233u
@@ -276,6 +279,7 @@ int  pc_net_game_peer_is_op(int peer);
 int  pc_net_game_dedicated_ops(int op, const char* sel, char* msg, int cap);
 /* dedicated console: `furniture list [acre]` / `furniture remove ...` / `furniture clear ...` (one call per output line) */
 void pc_net_game_dedicated_furniture(const char* args, void (*out)(const char*));
+void pc_net_game_dedicated_roommates(const char* args, void (*out)(const char*)); /* roommates / move-in (pc_roommates.h): the console command */
 
 /* ---- ac_my_room.c (TARGET_PC): one furniture model WITHOUT the room actor (catalog-style; never the move_proc) ---- */
 #define PC_OFURN_SHAPE_1X1 4 /* == aFTR_SHAPE_TYPEA (asserted in ac_my_room.c) */

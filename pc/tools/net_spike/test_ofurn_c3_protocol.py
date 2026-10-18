@@ -94,7 +94,7 @@ def take(run, c, item, pool_slot, gen):
 
 def caps_total(c):
     t = [tot for k, _n, _f, _g, tot, _e in C2.of2_msgs(c) if k == C2.MK_CAPS]
-    return t[-1] if t else None
+    return (t[-1] & 1) if t else None  # bit 0 = C3 outdoor storage (bit 1 = roommates, test_roommates_protocol.py)
 
 
 def phase_main(run):

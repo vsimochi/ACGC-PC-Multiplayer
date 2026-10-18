@@ -69,7 +69,7 @@ def main():
     ids = dict((n, v) for n, v in wire_baseline.c_message_ids_raw(gc))
     check("W PC_NETGAME_MSG_PVP_HIT_REQ = 91 and PC_NETGAME_MSG_PVP_HIT = 92", ids.get("PC_NETGAME_MSG_PVP_HIT_REQ") == 91 and ids.get("PC_NETGAME_MSG_PVP_HIT") == 92)
     vals = sorted(ids.values())
-    check("W ids 88 / 89 / 93-95 stay unused, ids above 92 only the puppet sprint 96 / 97 / 98 / 99 and the text chat 100 CHAT_SEND / 101 CHAT_MSG (pc_chat.h), all unique (%s)" % vals[-6:], 88 not in vals and 89 not in vals and 92 in vals and all(v in (96, 97, 98, 99, 100, 101, 102, 103) for v in vals if v > 92) and len(vals) == len(set(vals)))
+    check("W ids 88 / 89 / 93-95 stay unused, ids above 92 only the puppet sprint 96 / 97 / 98 / 99 and the text chat 100 CHAT_SEND / 101 CHAT_MSG (pc_chat.h), all unique (%s)" % vals[-6:], 88 not in vals and 89 not in vals and 92 in vals and all(v in (96, 97, 98, 99, 100, 101, 102, 103, 104) for v in vals if v > 92) and len(vals) == len(set(vals)))
     req = re.search(r"typedef struct PCPvpHitReqMsg \{(.*?)\} PCPvpHitReqMsg;", ph, re.S)
     hit = re.search(r"typedef struct PCPvpHitMsg \{(.*?)\} PCPvpHitMsg;", ph, re.S)
     norm = lambda m: " ".join(strip_comments(m.group(1)).split()) if m else None  # noqa: E731
@@ -161,7 +161,7 @@ def main():
           '{ PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_SHOCK, 5.0f, "shock", 0, PC_TFL_ATTR0 }' in rp)
     check("F the puppet STUNG_MOSQUITO row plays the sting SE NA_SE_6A on entry, and the PvP flinch victim plays it locally",
           '{ PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_6A, 0.0f, "flinch_6a", 0, 0 }' in rp and "sAdo_OngenTrgStart(NA_SE_6A, &actorx->world.position);" in mp)
-    check("F no new message id for the face / sound sync (max id 92, or only the puppet sprint 96 / 97 / 98 / 99 and the text chat 100 / 101 above it)", max(wire_baseline.c_message_ids_raw(gc), key=lambda x: x[1])[1] in (92, 96, 97, 98, 99, 100, 101, 102, 103))
+    check("F no new message id for the face / sound sync (max id 92, or only the puppet sprint 96 / 97 / 98 / 99 and the text chat 100 / 101 above it)", max(wire_baseline.c_message_ids_raw(gc), key=lambda x: x[1])[1] in (92, 96, 97, 98, 99, 100, 101, 102, 103, 104))
 
     # ---- T misc
     check("T pc_pvp_authority.c is in the game build", "src/pc_pvp_authority.c" in cm)

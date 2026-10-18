@@ -181,7 +181,7 @@ ck("C2P1 the player's HOLD / ROTATE states ask the PC outdoor judge only when th
    and "Common_Get(clip).my_room_clip != NULL ? Common_Get(clip).my_room_clip->judge_player_action_proc : pc_ofurn_grab_judge;" in hr)
 gj = body(dr, "int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no) {")
 ck("C2P2 the outdoor judge answers 0 without an outdoor grab / for another ftr_no, releases on A up, 16-frame push / pull timers, rotation re-armed by a neutral stick",
-   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end(opens ? "A tapped (open)" : tap ? "A tapped (not in front of the piece: no open)" : "A released");' in gj
+   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end(opens ? (gyroid ? "A tapped (the gyroid\'s move-in menu)" : "A tapped (open)") : tap ? "A tapped (not in front of the piece: no open)" : "A released");' in gj  # roommates: a tapped gyroid opens its menu
    and "s_grab.push_t > 16.0f" in gj
    and "s_grab.pull_t > 16.0f" in gj and "s_grab.allow_rot = 1;" in gj)
 fp = body(dr, "int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger) {")
@@ -229,10 +229,10 @@ ck("C3F1 the FRONT rule (pure): the front row = one step along `rot` from every 
    and "pc_ofurn_fp_in_front((int)s_ofh.m[k].shape, (int)s_ofh.m[k].rot, (int)s_ofh.m[k].ut_x, (int)s_ofh.m[k].ut_z, pux, puz, 2)" in sok
    and "pc_ofurn_faces_piece((int)s_ofh.m[k].rot, (int)face, 0x3000)" in sok
    and "pc_ofurn_fp_in_front((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, pux, puz, 1)" in ff and "== (((int)mk->rot + 2) & 3)" in ff
-   and "const int opens = tap && pc_ofurn_open_from_front(pl, &tapped);" in gj
+   and "const int opens = tap && (gyroid || pc_ofurn_open_from_front(pl, &tapped));" in gj  # roommates: a gyroid's menu opens from any side
    and gt.index("pc_ofurn_open_from_front(pl, &mk)") < gt.index("pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED)") < gt.index("mPlib_request_main_hold_type1("))
 ck("C3W2 the capability is the 102 CAPS `total` bit 0 (a C2 client reads only count + flags of CAPS); a C3 client never sends floor 0xFC to a host without it",
-   "m.total = pcnetgame_ofurn_c3_flags();" in blk and "s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE;" in blk and "(s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) == 0u" in blk
+   "m.total = pcnetgame_ofurn_c3_flags() | pcnetgame_room_caps_bit();" in blk and "s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE;" in blk  # roommates: bit 1 of the same field and "(s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) == 0u" in blk
    and "return m->count == 0 && (m->flags & ~PC_OFURN_C2_ALL) == 0u;" in pof)
 ck("C3W3 kind 18 for an outdoor key: the house scene / owner check skipped, the marker + nearness re-verified at every commit, journal replay over the town prefix",
    "if (!any_scene && !outdoor) {" in hdt and "pcnetgame_ofurn_storage_select_ok(peer, (int)sel->ut_x, (int)sel->ut_z, sel->ftr_base, &why);" in hdt

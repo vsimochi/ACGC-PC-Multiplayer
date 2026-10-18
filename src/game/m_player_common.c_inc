@@ -7019,6 +7019,13 @@ static int Player_actor_Check_NecessaryDoorKnock(ACTOR* actorx) {
                         return TRUE;
                     }
                 } else {
+#ifdef TARGET_PC
+                    /* roommates (pc_room_ui.h): a guest walks into the house it shares like the holder does (no knock) */
+                    extern int pc_net_game_room_house_entry(int house);
+                    if (pc_net_game_room_house_entry(arrange_idx) > 0) {
+                        return FALSE;
+                    }
+#endif
                     return TRUE;
                 }
             }

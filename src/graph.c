@@ -32,6 +32,7 @@
 #include "pc_pause_menu.h"
 #include "pc_tool_wheel.h"
 #include "pc_emote_wheel.h"
+#include "pc_room_ui.h"
 #include "pc_chat.h"
 #include "pc_profiler.h"
 /* Local extern matching the atomic_int definition in pc/src/pc_main.c (see pc_platform.h for the
@@ -402,6 +403,7 @@ static void graph_main(GRAPH* this, GAME* game) {
     pc_pause_menu_draw(game);
     pc_tool_wheel_draw(game); /* PC radial tool menu (local UI only) */
     pc_emote_wheel_draw(game); /* PC emote wheel (local UI; the emote itself is shown to the others, pc_emote.h) */
+    pc_room_ui_draw(game);     /* roommates: the gyroid's move-in menu (local UI) */
     pc_chat_draw(game);       /* multiplayer chat: speech bubbles, the chat log, the input line (presentation only) */
     pc_net_notice_draw(game); /* batch A (A3): CLIENT "not connected" notice (no-op for host / solo / READY / paused) */
 #endif

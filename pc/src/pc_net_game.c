@@ -206,6 +206,7 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_guest_admit.h" /* capacity phase 4: the pure guest admission rules (range, decision) */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: kind 22, message 98, service 10 (pure logic) */
 #include "pc_ops.h"               /* the host's operator list (ops.ini) */
+#include "pc_roommates.h"         /* roommates / move-in: message 104, roommates.ini (pure) */
 #include "pc_chat.h"              /* text chat (worker CH): messages 100 / 101, the "CHAT" block at the end of this file */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
@@ -616,8 +617,21 @@ typedef enum PCNetGameMsgType {
                                              * me / taking one from me". VILLAGER: client -> host ONLY (the host plays the clip steps on its talk-held villager; NPC_MOVE's
                                              * action_type carries them to every other client). SHOP keeper: owner -> host -> every OTHER READY peer in the owner's announced
                                              * scene (their idle keeper plays the clip once). PRESENTATION ONLY. Old peers ignore the id. See PCHandoverMsg / pc_handover.h. */
+    PC_NETGAME_MSG_ROOMMATE             = 104, /* roommates / move-in (v8 extended in place, NO version bump), RELIABLE, 300 bytes (PCRoomMsg, pc_roommates.h): client -> host
+                                             * QUERY / REQUEST / CANCEL / ACCEPT / DENY / REMOVE / LEAVE at a placed gyroid (sent only after the 102 CAPS bit
+                                             * PC_OFURN_C4_ROOMMATES); host -> client INFO / RESULT / STATUS / NOTICE. A malformed one is dropped (never a violation).
+                                             * An old peer ignores the id. See the ROOMMATES block (pc_net_game_roommates.c_inc). */
 } PCNetGameMsgType;
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID, "OUTDOOR_FURN id drifted (pc_outdoor_furniture.h)");
+/* ROOMMATES (pc_net_game_roommates.c_inc, included at the end of this file) */
+static void     pcnetgame_room_host_tick(void);
+static void     pcnetgame_room_client_tick(void);
+static uint32_t pcnetgame_room_caps_bit(void);
+static void     pcnetgame_room_client_caps(uint32_t total);
+static int      pcnetgame_room_peer_house(PCNetPeerId peer);
+static int      pcnetgame_room_peer_is_roommate(PCNetPeerId peer);
+static void     pcnetgame_handle_host_roommate(PCNetPeerId peer, const uint8_t* data, uint16_t size);
+static void     pcnetgame_handle_client_roommate(const uint8_t* data, uint16_t size);
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN2 == (int)PC_OFURN_MSG2_ID, "OUTDOOR_FURN2 id drifted (pc_outdoor_furniture.h)");
 _Static_assert(sizeof(PCOfurnMsg) == 268 && sizeof(PCOfurnMsg) <= PC_NET_MAX_PAYLOAD, "PCOfurnMsg wire size drifted");
 
@@ -17648,7 +17662,8 @@ static void pcnetgame_house_pump_push(PCNetPeerId peer) {
         if (!st->hpush_active) {
             int h;
             for (h = 0; h < PC_NETGAME_HOUSE_NUM; h++) {
-                if (s_hh[h].valid && pcnetgame_house_owned(h) && st->hsent_seq[h] != s_hh[h].seq) {
+                if (s_hh[h].valid && pcnetgame_house_owned(h) && st->hsent_seq[h] != s_hh[h].seq &&
+                    (st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST || pcnetgame_room_peer_house(peer) == h)) { /* a roommate guest: its shared house only */
                     break;
                 }
             }
@@ -17734,8 +17749,9 @@ static void pcnetgame_house_host_tick(void) {
     }
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
-        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid || st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST) {
-            continue; /* a guest never sees (or edits) a house */
+        if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid ||
+            (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && !pcnetgame_room_peer_is_roommate((PCNetPeerId)p))) {
+            continue; /* a guest never sees (or edits) a house -- except a ROOMMATE: it SEES its shared house (pushes of that house only, never an upload) */
         }
         if (st->hup_open && (uint32_t)(now - st->hup_started_ms) >= PC_NETGAME_HOUSE_UPLOAD_TIMEOUT_MS) {
             printf("[NET][HOUSE] host: peer %d open OWNER_COMMIT xfer %u timed out -- discarded, nothing applied\n", p, (unsigned)st->hup_xfer);
@@ -21688,6 +21704,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_evnpc_host_tick();
     pcnetgame_evc_host_tick(); /* worker E: shared event NPCs (TEST-ONLY seed; the Wisp flag of service 9) */
     pcnetgame_ofurn_host_tick(); /* outdoor furniture C1: the marker GC, the per-peer list / rights (message 98) */
+    pcnetgame_room_host_tick();  /* roommates: relations, per-peer STATUS / notices (message 104), housekeeping */
     pcnetgame_chat_host_tick();  /* text chat (worker CH): the CAPS announcement per READY peer (message 101), the TEST-ONLY send hook */
     pcnetgame_npc_lease_host_tick();
     pcnetgame_page_host_tick();
@@ -35230,6 +35247,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
         }
         return;
     }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_ROOMMATE) { /* ROOMMATES: a request at a placed gyroid (validated, rate limited; never a violation) */
+        pcnetgame_handle_host_roommate(peer, data, size);
+        return;
+    }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) { /* HAND-OVER ANIMATIONS: presentation only (villager: the host's held actor; shop: relayed within the sender's scene) */
         if (size == sizeof(PCHandoverMsg)) {
             PCHandoverMsg ho;
@@ -35995,6 +36016,10 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         PCActionExtMsg ax;
         memcpy(&ax, data, sizeof(ax));
         pcnetgame_handle_client_action_ext(&ax); /* PUPPET ACTION_EXT (worker P2): another player's clip, relayed by the host */
+        return;
+    }
+    if (size == sizeof(PCRoomMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ROOMMATE) {
+        pcnetgame_handle_client_roommate(data, size); /* ROOMMATES: the host's answer / STATUS / NOTICE */
         return;
     }
     if (size == sizeof(PCHandoverMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) {
@@ -37887,6 +37912,7 @@ static void pcnetgame_client_tick(void) {
 
     pcnetgame_crec_tick(); /* D3: HELLO / push adoption / upload triggers */
     pcnetgame_house_client_tick(); /* furniture sync: push receive / commit watchdogs / stash writer */
+    pcnetgame_room_client_tick();  /* roommates: "welcome home", shown out of a house it no longer shares */
     pcnetgame_pdata_client_tick(); /* personal data sync: push receive / stash writer / commit trigger / watchdogs */
 
     if (s_client_need_resync) {
@@ -50020,7 +50046,7 @@ static int pcnetgame_local_is_op(void) {
 
 static int pcnetgame_ofurn_peer_is_resident(PCNetPeerId peer) {
     return peer >= 0 && peer < pcnetgame_peer_span() && s_host_peer_link[peer] == PC_NETGAME_LINK_READY && s_host_peer[peer].bound_valid &&
-           s_host_peer[peer].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT;
+           (s_host_peer[peer].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT || pcnetgame_room_peer_is_roommate(peer)); /* roommates: a resident's rights outdoors */
 }
 
 static int pcnetgame_ofurn_peer_may_pickup(PCNetPeerId peer) {
@@ -50212,7 +50238,7 @@ static void pcnetgame_ofurn_host_pump_peer2(PCNetPeerId peer) {
         m.kind = PC_OFURN_MK_CAPS;
         m.flags = (uint8_t)PC_OFURN_C2_ALL;
         m.gen = s_ofh.gen;
-        m.total = pcnetgame_ofurn_c3_flags(); /* C3: PC_OFURN_C3_* (a C2 client never reads `total` of a CAPS message) */
+        m.total = pcnetgame_ofurn_c3_flags() | pcnetgame_room_caps_bit(); /* C3: PC_OFURN_C3_* (a C2 client never reads `total` of a CAPS message); roommates: C4 */
         if (!pcnetgame_ofurn_send2(peer, &m)) {
             return;
         }
@@ -51480,6 +51506,7 @@ static void pcnetgame_handle_client_ofurn2(const PCOfurnMsg* m) {
                 printf("[NET][OFURN] client: the host supports outdoor furniture C3: outdoor storage %s\n", (m->total & PC_OFURN_C3_STORAGE) ? "ON" : "OFF");
             }
             s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE; /* C3: unknown higher bits ignored (a later host may add features) */
+            pcnetgame_room_client_caps(m->total);             /* roommates: bit PC_OFURN_C4_ROOMMATES */
             break;
         case PC_OFURN_MK_BEGIN:
             pc_ofurn_table_init(&s_ofc2_stage);
@@ -53192,3 +53219,5 @@ void pc_net_game_dedicated_chat(const char* cmd, const char* args, void (*out)(c
     out("CHAT: unknown chat command");
 }
 /* ===== CHAT END ===== */
+
+#include "pc_net_game_roommates.c_inc" /* ROOMMATES / MOVE-IN (message 104): the host relations, the client seam, the console */

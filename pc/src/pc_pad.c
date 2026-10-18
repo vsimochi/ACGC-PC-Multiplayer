@@ -54,6 +54,7 @@ BOOL PADInit(void) {
 
 #include "pc_tool_wheel.h"
 #include "pc_emote_wheel.h"
+#include "pc_room_ui.h"          /* roommates: the gyroid's move-in menu */
 #include "pc_net_game.h"
 #include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
 #include "pc_chat.h"             /* chat (worker CH): pc_chat_pad_block */
@@ -230,6 +231,12 @@ u32 PADRead(PADStatus* status) {
     pc_emote_wheel_input(emote_kb, emote_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons,
                          &stickX, &stickY, &cstickX, &cstickY);
     if (pc_emote_wheel_is_open()) {
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
+    }
+    /* ROOMMATES (pc_room_ui.c): the gyroid's move-in menu owns the pad while it is open (the player stands still) */
+    pc_room_ui_input(&buttons, &stickX, &stickY, &cstickX, &cstickY);
+    if (pc_room_ui_is_open()) {
         status[0].triggerLeft = 0;
         status[0].triggerRight = 0;
     }

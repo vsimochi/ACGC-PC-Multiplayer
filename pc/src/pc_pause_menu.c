@@ -11,6 +11,7 @@
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure / reopening notice */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: the refusal notice of Place / Rotate / Pick up / leaf drop */
 #include "pc_sell_ui.h" /* Nook bulk sell basket: the refusal notice of the basket screen */
+#include "pc_room_ui.h" /* roommates: the move-in notice line */
 #include "pc_version.h" /* the title screen's version corner (pc_version_corner_draw) */
 #include "pc_dedicated.h" /* g_pc_dedicated */
 
@@ -397,6 +398,15 @@ void pc_net_notice_draw(struct game_s* game) {
         if (pc_shop_upgrade_notice(up_line, (int)sizeof(up_line))) {
             mFont_SetMatrix(game->graph, mFont_MODE_FONT);
             pc_menu_draw_centered(game, up_line, 46.0f, 255, 230, 140, 255, 1.0f);
+            mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+        }
+    }
+    {
+        /* Roommates: a move-in request / decision / "welcome home" line, ~6 s (pc_room_ui.c) */
+        const char* rm_line = pc_room_ui_notice_get();
+        if (rm_line != NULL) {
+            mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+            pc_menu_draw_centered(game, rm_line, 94.0f, 200, 255, 200, 255, 1.0f);
             mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
         }
     }
