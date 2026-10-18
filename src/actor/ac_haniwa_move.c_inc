@@ -234,8 +234,9 @@ static void aHNW_dance(HANIWA_ACTOR* haniwa, GAME* game) {
             aHNW_setupAction(haniwa, game, next_act_idx[msg_idx]);
         } else if (aHNW_check_house_door(actorx, (GAME_PLAY*)game) == FALSE) {
 #ifdef TARGET_PC
-            /* roommates (pc_room_ui.c): a GUEST's / the house OWNER's A at this gyroid opens the move-in menu (its "Talk to the gyroid" row comes back here); every
-             * other player, solo play, an older host: the vanilla conversation */
+            /* roommates (pc_room_ui.c): a GUEST's / the house OWNER's A at this gyroid first asks the host what the player may do here (a moment: 1 = still
+             * waiting, no talk yet); the answer ARMS this conversation (pc_room_dlg.c adds the move-in choice to the gyroid's own menu) and the vanilla talk
+             * then starts by itself. Every other player, solo play, an older host, no answer: the vanilla conversation, untouched */
             extern int pc_room_gyroid_intercept(void* actor, int house);
             if (pc_room_gyroid_intercept(actorx, (int)haniwa->house_idx)) {
                 return;
@@ -281,7 +282,19 @@ static void aHNW_talk_with_master(HANIWA_ACTOR* haniwa, GAME* game) {
     if (mDemo_Get_OrderValue(mDemo_ORDER_NPC0, 9) && mMsg_Check_MainNormalContinue(msg_win) == TRUE) {
         int action = -1;
 
+#ifdef TARGET_PC
+        /* roommates (pc_room_ui.c): an armed menu has one more choice ("Roommates" / "Move-in requests", before End): -1 = that one (the move-in rows), the
+         * vanilla choices keep their meaning (the ones after it are renumbered back) */
+        extern int pc_room_gyroid_menu_pick(void* actor, int chosen);
+        const int pc_chosen = pc_room_gyroid_menu_pick(haniwa, (int)mChoice_GET_CHOSENUM());
+
+        if (pc_chosen < 0) {
+            action = aHNW_ACTION_PC_ROOM;
+        }
+        switch (pc_chosen) {
+#else
         switch (mChoice_GET_CHOSENUM()) {
+#endif
             case mChoice_CHOICE0: {
                 action = aHNW_ACTION_SAVE_CHECK;
                 break;
@@ -414,7 +427,18 @@ static void aHNW_talk_with_guest(HANIWA_ACTOR* haniwa, GAME* game) {
         if (mMsg_Check_MainNormalContinue(msg_win) == TRUE) {
             int action = -1;
 
+#ifdef TARGET_PC
+            /* roommates (pc_room_ui.c): the armed guest menu has "Ask to move in" / "Withdraw request" / "Move out" before Leave: -1 = that one */
+            extern int pc_room_gyroid_menu_pick(void* actor, int chosen);
+            const int pc_chosen = pc_room_gyroid_menu_pick(haniwa, (int)mChoice_GET_CHOSENUM());
+
+            if (pc_chosen < 0) {
+                action = aHNW_ACTION_PC_ROOM;
+            }
+            switch (pc_chosen) {
+#else
             switch (mChoice_GET_CHOSENUM()) {
+#endif
                 case mChoice_CHOICE0: {
                     if (aHNW_check_keep_item(haniwa) == FALSE) {
                         mMsg_Set_continue_msg_num(msg_win, 0x092C);
@@ -618,6 +642,25 @@ static void aHNW_door_open_timer(HANIWA_ACTOR* haniwa, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* roommates / move-in (pc_room_ui.c): the move-in rows of this conversation (the request, the holder's list, the confirms, the host's answer); the controller ends
+ * the talk (1) or hands the holder back to the gyroid's menu (2) */
+static void aHNW_pc_room(HANIWA_ACTOR* haniwa, GAME* game) {
+    extern int pc_room_gyroid_dialog(void* actor, int house);
+
+    switch (pc_room_gyroid_dialog(haniwa, (int)haniwa->house_idx)) {
+        case 1:
+            aHNW_setupAction(haniwa, game, aHNW_ACTION_TALK_END_WAIT);
+            break;
+        case 2:
+            aHNW_setupAction(haniwa, game, aHNW_ACTION_TALK_WITH_MASTER);
+            break;
+        default:
+            break;
+    }
+}
+#endif
+
 static void aHNW_menu_open_wait_init(HANIWA_ACTOR* haniwa, GAME* game) {
     mMsg_REQUEST_MAIN_DISAPPEAR_WAIT_TYPE1();
 }
@@ -664,6 +707,9 @@ static void aHNW_init_proc(HANIWA_ACTOR* actor, GAME* game, int action) {
         &aHNW_pl_approach_door_init,
         (HANIWA_PROC)&none_proc1,
         (HANIWA_PROC)&none_proc1,
+#ifdef TARGET_PC
+        (HANIWA_PROC)&none_proc1, /* aHNW_ACTION_PC_ROOM */
+#endif
     };
     // clang-format on
 
@@ -689,6 +735,9 @@ static void aHNW_setupAction(HANIWA_ACTOR* haniwa, GAME* game, int action) {
         &aHNW_pl_approach_door,
         &aHNW_door_open_wait,
         &aHNW_door_open_timer,
+#ifdef TARGET_PC
+        &aHNW_pc_room,
+#endif
     };
 
     int house_idx = haniwa->house_idx;
@@ -776,6 +825,13 @@ static void aHNW_actor_move(ACTOR* actor, GAME* game) {
 
     haniwa->common_actor_class.anime.state = cKF_SkeletonInfo_R_play(keyframe);
     (*haniwa->action_proc)(haniwa, game);
+#ifdef TARGET_PC
+    {
+        /* roommates (pc_room_ui.c): the armed move-in conversation ends with this gyroid's talk (disarm, whatever way the talk ended) */
+        extern void pc_room_gyroid_frame(void* actor, int house, int act);
+        pc_room_gyroid_frame(actor, (int)haniwa->house_idx, (int)haniwa->common_actor_class.act);
+    }
+#endif
     aHNW_common_process(actor, game);
     CollisionCheck_Uty_ActorWorldPosSetPipeC(actor, &haniwa->common_actor_class.col_pipe);
     CollisionCheck_setOC(game, &play->collision_check, &haniwa->common_actor_class.col_pipe.collision_obj);

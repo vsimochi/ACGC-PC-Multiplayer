@@ -50,6 +50,9 @@ enum haniwa_action {
     aHNW_ACTION_PL_APPROACH_DOOR,
     aHNW_ACTION_DOOR_OPEN_WAIT,
     aHNW_ACTION_DOOR_OPEN_TIMER,
+#ifdef TARGET_PC
+    aHNW_ACTION_PC_ROOM, /* roommates / move-in (pc_room_ui.c): the move-in rows of this conversation */
+#endif
 
     aHNW_ACTION_NUM
 };

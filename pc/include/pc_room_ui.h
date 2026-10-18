@@ -1,5 +1,5 @@
-/* pc_room_ui.h - ROOMMATES / MOVE-IN: the gyroid menu (a small PC overlay) and the client seam of message 104 (pc_net_game.c, block "ROOMMATES").
- * docs/multiplayer-guest-roadmap.md "Roommates / move-in". The pure rules / wire layout are pc_roommates.h. */
+/* pc_room_ui.h - ROOMMATES / MOVE-IN: the move-in dialogue inside the vanilla gyroid conversation (pc_room_ui.c; its rows: pc_room_dlg.h) and the client seam
+ * of message 104 (pc_net_game.c, block "ROOMMATES"). docs/multiplayer-guest-roadmap.md "Roommates / move-in". The pure rules / wire layout are pc_roommates.h. */
 #ifndef PC_ROOM_UI_H
 #define PC_ROOM_UI_H
 
@@ -11,19 +11,18 @@
 extern "C" {
 #endif
 
-struct game_s;
-
-/* ---- the gyroid menu (pc_room_ui.c) ---- */
-void pc_room_ui_open(int house, void* gyroid_actor);     /* A at the gyroid of house h (pc_room_gyroid_intercept): asks the host, then shows the menu */
-int  pc_room_gyroid_intercept(void* actor, int house);   /* ac_haniwa_move.c_inc aHNW_dance: 1 = the menu took this A (the vanilla talk request is skipped) */
+/* ---- the gyroid conversation (pc_room_ui.c; called by ac_haniwa_move.c_inc / ac_haniwa.c, TARGET_PC) ---- */
+int  pc_room_gyroid_intercept(void* actor, int house);   /* aHNW_dance: 1 = a GUEST's / the OWNER's A here waits for the host's INFO (no talk yet); 0 = talk (vanilla) */
+int  pc_room_gyroid_menu_pick(void* actor, int chosen);  /* talk_with_master / talk_with_guest: -1 = the inserted move-in choice, else the vanilla choice index */
+int  pc_room_gyroid_dialog(void* actor, int house);      /* the actor's PC_ROOM action, every frame: 0 = stay, 1 = the talk ends, 2 = back to the holder's menu */
+void pc_room_gyroid_frame(void* actor, int house, int act); /* every frame of every gyroid: disarms when its armed talk ended */
 void pc_room_gyroid_gone(void* actor);                   /* ac_haniwa.c dt */
 void pc_room_ui_test_press(void);                        /* TEST-ONLY: the next talk-position frame at a gyroid counts as an A press */
+unsigned pc_room_ui_test_pad(void);                      /* TEST-ONLY (AC_TEST_ROOM_UI, PADRead): 1 A, 2 D-pad down, 4 D-pad up; 0 otherwise (always 0 in normal play) */
 int  pc_room_music_box_house(void);                      /* m_common_data.h GetRoomMusicBox (TARGET_PC): a roommate's shared house */
-int  pc_room_ui_is_open(void);
-void pc_room_ui_input(unsigned short* buttons, signed char* stick_x, signed char* stick_y, signed char* cstick_x, signed char* cstick_y); /* PADRead (pc_pad.c) */
-void pc_room_ui_draw(struct game_s* game);                /* graph.c, after the emote wheel */
-void pc_room_ui_notice_set(const char* text);            /* a one-line notice (~6 s) */
-const char* pc_room_ui_notice_get(void);                 /* pc_net_notice_draw: NULL = none */
+int  pc_room_ui_is_open(void);                           /* 1 = a gyroid move-in conversation is under way (asking the host / armed) */
+void pc_room_ui_notice_set(const char* text);            /* queues a one-line notice (each ~5 s, in order: none overwrites another) */
+const char* pc_room_ui_notice_get(void);                 /* pc_net_notice_draw: the line to draw now, NULL = none */
 
 /* ---- the network seam (pc_net_game.c) ---- */
 int      pc_net_game_room_on(void);                       /* 1 = this process may use the gyroid menu (a READY client of a host with roommates, or a listen host) */

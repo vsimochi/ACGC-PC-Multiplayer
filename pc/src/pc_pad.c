@@ -54,7 +54,7 @@ BOOL PADInit(void) {
 
 #include "pc_tool_wheel.h"
 #include "pc_emote_wheel.h"
-#include "pc_room_ui.h"          /* roommates: the gyroid's move-in menu */
+#include "pc_room_ui.h"          /* roommates: TEST-ONLY pad of the gyroid's move-in dialogue */
 #include "pc_net_game.h"
 #include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
 #include "pc_chat.h"             /* chat (worker CH): pc_chat_pad_block */
@@ -234,11 +234,11 @@ u32 PADRead(PADStatus* status) {
         status[0].triggerLeft = 0;
         status[0].triggerRight = 0;
     }
-    /* ROOMMATES (pc_room_ui.c): the gyroid's move-in menu owns the pad while it is open (the player stands still) */
-    pc_room_ui_input(&buttons, &stickX, &stickY, &cstickX, &cstickY);
-    if (pc_room_ui_is_open()) {
-        status[0].triggerLeft = 0;
-        status[0].triggerRight = 0;
+    { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_ROOM_UI): the gyroid's move-in choice windows answered like a player (pc_room_ui.c); 0 otherwise (never in normal play) */
+        const unsigned rf = pc_room_ui_test_pad();
+        if (rf & 1u) buttons |= PAD_BUTTON_A;
+        if (rf & 2u) buttons |= PAD_BUTTON_DOWN;
+        if (rf & 4u) buttons |= PAD_BUTTON_UP;
     }
 
     if (pc_host_observer_active()) {

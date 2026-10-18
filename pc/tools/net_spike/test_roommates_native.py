@@ -2,7 +2,8 @@
 """test_roommates_native.py - ROOMMATES / MOVE-IN: compiles the PURE logic (pc/src/pc_roommates.c; no game state) alone with -Wall -Wextra -Werror and runs
 pc_room_selftest() (request / cancel / accept / deny / remove / leave rules, one open request and one house per guest, 4 roommates + 4 requests per holder, the
 10-minute cooldown, owner gone, drop guest, the GC of tombstones, the roommates.ini round trip + the tolerant parser, the message 104 validator, the notice charset),
-plus a save / load round trip through a real file (atomic write, .bak generation, the .bak fallback when the main file is missing).
+plus a save / load round trip through a real file (atomic write, .bak generation, the .bak fallback when the main file is missing), and pc/src/pc_room_dlg.c (the
+gyroid's move-in rows: charset, endings, every refusal reason; the patch of the vanilla gyroid menus 0x0925 / 0x0929 byte for byte; unarmed / foreign lists untouched).
 
 TIER: NATIVE (no game process). Usage: python test_roommates_native.py
 """
@@ -55,8 +56,19 @@ int main(int argc, char** argv) {
 '''
 
 
+DLG_MAIN = r'''
+#include <stdio.h>
+#include "pc_room_dlg.h"
+int main(void) {
+    int b = pc_room_dlg_selftest();
+    printf("[ROOM][DLG] selftest: %s (%d)\n", b ? "FAIL" : "PASS", b);
+    return b;
+}
+'''
+
+
 def main():
-    cc = shutil.which("cc") or shutil.which("gcc") or r"C:\msys64\ucrt64\bin\cc.exe"
+    cc =shutil.which("cc") or shutil.which("gcc") or r"C:\msys64\ucrt64\bin\cc.exe"
     if not os.path.isfile(cc) and shutil.which(cc) is None:
         cc = r"C:\msys64\ucrt64\bin\cc.exe"
     work = tempfile.mkdtemp(prefix="room_native_")
@@ -81,7 +93,21 @@ def main():
         ok2 = "[ROOM] file checks: PASS" in r.stdout and r.returncode == 0
         print(("PASS" if ok1 else "FAIL") + " - N2 pc_room_selftest(): every pure check passes")
         print(("PASS" if ok2 else "FAIL") + " - N3 roommates.ini save / load / .bak generation / .bak fallback, roommate_homes.ini round trip")
-        ok_all = ok_build and ok1 and ok2
+        dlg_c = os.path.join(work, "dlg.c")
+        dlg_exe = os.path.join(work, "dlg_selftest.exe")
+        with open(dlg_c, "w") as f:
+            f.write(DLG_MAIN)
+        d = subprocess.run([cc, "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I" + os.path.join(PC, "include"), dlg_c, os.path.join(PC, "src", "pc_room_dlg.c"), "-o", dlg_exe],
+                           capture_output=True, text=True, cwd=work, env=env)
+        ok3 = d.returncode == 0
+        if ok3:
+            dr = subprocess.run([dlg_exe], capture_output=True, text=True, cwd=work, timeout=60, env=env)
+            print(dr.stdout.rstrip())
+            ok3 = dr.returncode == 0 and "[ROOM][DLG] selftest: PASS" in dr.stdout
+        else:
+            print(d.stdout + d.stderr)
+        print(("PASS" if ok3 else "FAIL") + " - N4 pc_room_dlg.c compiles alone (-Wall -Wextra -Werror, no game header) and pc_room_dlg_selftest() passes (rows + the gyroid menu patch)")
+        ok_all = ok_build and ok1 and ok2 and ok3
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print("-" * 60)

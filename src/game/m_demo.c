@@ -743,11 +743,11 @@ static int wait_emsg2_end() {
 
 static f32 weight_of_talk_position(ACTOR* actor);
 #ifdef TARGET_PC
-/* roommates (pc_room_ui.c): the vanilla talk-position test of an actor (the player close enough, facing it); the gyroid's PC menu opens only when a talk would */
+/* roommates (pc_room_ui.c): the vanilla talk-position test of an actor (the player close enough, facing it); the gyroid asks the host first only when a talk would start */
 int mDemo_PC_TalkPositionOk(ACTOR* actor) {
     return actor != NULL && GET_PLAYER_ACTOR_NOW() != NULL && weight_of_talk_position(actor) >= 0.0f;
 }
-extern void* g_pc_demo_force_talk_actor; /* pc_room_ui.c: "Talk to the gyroid" chose this actor's conversation (one shot, no new A press) */
+extern void* g_pc_demo_force_talk_actor; /* pc_room_ui.c: the gyroid's talk starts once the host answered the A (one shot, no new A press) */
 #endif
 
 static f32 weight_of_talk_position(ACTOR* actor) {

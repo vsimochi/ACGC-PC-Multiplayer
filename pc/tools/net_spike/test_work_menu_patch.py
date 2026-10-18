@@ -28,7 +28,7 @@ def main():
     rsp = "@" + os.path.join(BUILD, "CMakeFiles", "ac_pc.dir", "includes_C.rsp")
     out = os.path.join(os.environ.get("TEMP", "."), "work_menu_harness.exe")
     cmd = [cc] + defines + [rsp, "-std=gnu11", "-O1", "-fno-strict-aliasing", "-fwrapv", "-Dnullptr=NULL", "-I" + os.path.join(PC, "include"), os.path.join(HERE, "work_menu_harness.c"),
-                            os.path.join(PC, "src", "pc_nook_house.c"), os.path.join(PC, "src", "pc_sell_logic.c"), "-o", out]  # + the sell basket quote formatter
+                            os.path.join(PC, "src", "pc_nook_house.c"), os.path.join(PC, "src", "pc_sell_logic.c"), os.path.join(PC, "src", "pc_room_dlg.c"), "-o", out]  # + the sell basket quote formatter + the gyroid's move-in rows (roommates)
     env = dict(os.environ, PATH=os.path.dirname(cc) + os.pathsep + os.environ.get("PATH", ""))
     r = subprocess.run(cmd, cwd=BUILD, capture_output=True, text=True, env=env)
     ck("the harness compiled (%s)" % (r.stderr.strip().splitlines()[-1] if r.returncode and r.stderr.strip() else "ok"), r.returncode == 0)

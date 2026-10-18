@@ -82,7 +82,7 @@ static void aHNW_actor_dt(ACTOR* actor, GAME* game) {
 #ifdef TARGET_PC
     { mActor_name_t* fgp = mFI_GetUnitFG(actor->world.position); pc_net_game_gyroid_diag("dt", NULL, actor, actor->npc_id, actor->world.position.x, actor->world.position.z, actor->block_x, actor->block_z, fgp != NULL ? (unsigned)*fgp : 0xFFFEu); }
     {
-        extern void pc_room_gyroid_gone(void* actor); /* roommates (pc_room_ui.c): forget this actor (the menu's "Talk to the gyroid" pointer) */
+        extern void pc_room_gyroid_gone(void* actor); /* roommates (pc_room_ui.c): forget this actor (an armed move-in conversation of this gyroid ends) */
         pc_room_gyroid_gone(actor);
     }
 #endif

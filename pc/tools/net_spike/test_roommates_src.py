@@ -8,8 +8,9 @@ TIER: SOURCE AUDIT (+ the native selftest of pc_roommates.c). Usage: python test
      roommates.ini written BEFORE the answer and undone on a
      failed write, the guest-table housekeeping only while the guest store is trusted, no private_data[] / homes[] subscript by a guest index
   R  rights: the house push to a guest = its shared house only, the outdoor-furniture resident rights include a roommate
-  C  client: no knock for the shared house, every other guest visit unchanged (no door gate); the show-out after a demotion; the menu (pad, draw, notice line); the house
-     gyroid's talk seam + the forced vanilla talk ("Talk to the gyroid")
+  C  client: no knock for the shared house, every other guest visit unchanged (no door gate); the show-out after a demotion; the move-in dialogue INSIDE the vanilla
+     gyroid conversation (no overlay: generated message rows, the gyroid's own menu + one choice, vanilla Yes / No windows, names via free string 10); the queued
+     notice line at the top
   E  editing the shared house (host commit authorisation + rollback, grace / freeze, client own house / set_field_type / lock, music box, dressers), the spawn at the door,
      no "Welcome home"
   S  switches + test hooks: settings.ini roommates / AC_MP_ROOMMATES=0, the TEST-ONLY hooks gated by PC_NET_TEST_HOOKS + AC_TEST_HOOKS
@@ -49,6 +50,10 @@ rh = rd(PC, "include", "pc_roommates.h")
 rc = rd(PC, "src", "pc_roommates.c")
 uh = rd(PC, "include", "pc_room_ui.h")
 uc = rd(PC, "src", "pc_room_ui.c")
+dlh = rd(PC, "include", "pc_room_dlg.h")
+dlc = rd(PC, "src", "pc_room_dlg.c")
+nk = rd(PC, "src", "pc_nook_house.c")
+hh = rd(ROOT, "include", "ac_haniwa.h")
 od = rd(PC, "src", "pc_ofurn_draw.c")
 ofh = rd(PC, "include", "pc_outdoor_furniture.h")
 pad = rd(PC, "src", "pc_pad.c")
@@ -89,7 +94,7 @@ ck("W6 dispatch: host by id (the handler checks the size), client by exact size 
    and "s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || size != sizeof(PCRoomMsg)" in body(ri, "static void pcnetgame_handle_client_roommate("))
 ck("W7 the block is included once at the end of pc_net_game.c; the pure module + the UI are built (CMake)",
    ng.count('#include "pc_net_game_roommates.c_inc"') == 1 and ng.rstrip().endswith('#include "pc_net_game_roommates.c_inc" /* ROOMMATES / MOVE-IN (message 104): the host relations, the client seam, the console */')
-   and "src/pc_roommates.c" in cm and "src/pc_room_ui.c" in cm)
+   and "src/pc_roommates.c" in cm and "src/pc_room_ui.c" in cm and "src/pc_room_dlg.c" in cm)
 
 # ---- H
 h = body(ri, "static void pcnetgame_room_handle(int peer, const PCRoomMsg* in) {")
@@ -139,20 +144,52 @@ ck("C4 the show-out after a demotion: no wipe / fade, no message / submenu (a de
    and "(mDemo_CheckDemo() != FALSE && (uint32_t)(pcnetgame_now_ms() - s_rmc.eject_t0) < PCNG_ROOM_EJECT_DEMO_MS)" in ct
    and "Common_Get(structure_exit_door_data).next_scene_id == 0 || Common_Get(structure_exit_door_data).next_scene_id == play->scene_id" in ct
    and "goto_other_scene(play, Common_GetPointer(structure_exit_door_data), TRUE)" in ct and "aMR_SaveWaltzTempo2();" in ct and "mBGMPsComp_make_ps_wipe(0x195);" in ct)
-ui_in = body(uc, "void pc_room_ui_input(")
-ck("C5 the menu owns the pad while open (buttons / sticks zeroed), is called in PADRead after the emote wheel and drawn after it; the notice line at y 94",
-   "*buttons = 0;\n    *stick_x = *stick_y = 0;\n    *cstick_x = *cstick_y = 0;" in ui_in and "pc_room_ui_input(&buttons, &stickX, &stickY, &cstickX, &cstickY);" in pad
-   and pad.index("pc_emote_wheel_input(") < pad.index("pc_room_ui_input(") and "    pc_room_ui_draw(game);" in gr and gr.index("pc_emote_wheel_draw(game);") < gr.index("pc_room_ui_draw(game);")
-   and "pc_menu_draw_centered(game, rm_line, 94.0f," in pm)
+ck("C5 NO overlay: the move-in UI is the vanilla gyroid conversation (no pad hook but the TEST-ONLY one, no draw hook, no PC menu drawing in pc_room_ui.c); the rows are "
+   "generated message rows in the idiomatic place (pc_room_dlg.c behind pc_nook_msg_build / pc_nook_sel_build / pc_nook_msg_patch, ids after the Nook rows, MSG_MAX asserted), "
+   "the names through free string 10, the Yes / No windows the vanilla choice tail",
+   "pc_room_ui_input" not in pad + uc + uh and "pc_room_ui_draw" not in gr + uc + uh and "pc_menu_" not in uc and "pc_text_draw" not in uc
+   and "const unsigned rf = pc_room_ui_test_pad();" in pad and "unsigned pc_room_ui_test_pad(void) {\n    return 0;\n}" in uc
+   and "if (pc_room_dlg_msg_id_valid(id)) {\n        return pc_room_dlg_build_id(id, dst, cap);" in nk and "if (pc_room_dlg_sel_id_valid(id)) {\n        return pc_room_dlg_sel_build_id(id, dst16);" in nk
+   and "const int rn = pc_room_dlg_msg_patch(index, data, len, cap);" in nk and "|| pc_room_dlg_msg_id_valid(id);" in nk and "|| pc_room_dlg_sel_id_valid(id);" in nk
+   and "_Static_assert(PC_ROOM_DLG_MSG_MAX == MSG_MAX," in nk and "PC_ROOM_DLG_MSG_OFS >= PC_NOOK_MSG_COUNT && PC_ROOM_DLG_SEL_OFS >= PC_NOOK_SEL_COUNT" in nk
+   and "rd_code(b, RD_FREE10);" in dlc and "#define RD_FREE10 0x36" in dlc and "mMsg_Set_free_str(mMsg_Get_base_window_p(), mMsg_FREE_STR10, nm, PC_ROOM_NAME_LEN);" in uc
+   and "bad += pc_room_dlg_selftest();" in nk and '#include "m_' not in dlc)
 hn = rd(ROOT, "src", "actor", "ac_haniwa_move.c_inc")
 dm = rd(ROOT, "src", "game", "m_demo.c")
 gi = body(uc, "int pc_room_gyroid_intercept(void* actor, int house) {")
-ck("C6 every decision asks Yes / No with No preselected; the HOUSE gyroid's talk seam (aHNW_dance) asks the PC menu first: a guest or the house owner, an A press in the vanilla "
-   "talk position, the host offering roommates; any other resident / off = the vanilla talk. The menu's 'Talk to the gyroid' row starts the vanilla conversation (one-shot forced pick)",
-   "s_csel = 0; /* \"No\" first" in uc and "if (pc_room_gyroid_intercept(actorx, (int)haniwa->house_idx)) {\n                return;\n            }\n#endif\n            mDemo_Request(mDemo_TYPE_TALK, actorx, &aHNW_set_talk_info_dance);" in hn
+pk = body(uc, "int pc_room_gyroid_menu_pick(void* actor, int chosen) {")
+ck("C6 the gyroid seams: A by a guest / the house owner in the vanilla talk position asks the host FIRST (QUERY; no talk while it answers, 1.5 s at most, then the vanilla "
+   "talk unarmed); the INFO arms the conversation and the vanilla talk starts by the one-shot forced pick; the gyroid's own menus (owner 0x0925 / 0927 / 0930 / 0933 / 0936, guest "
+   "0x0929) get ONE choice before End / Leave only while armed and only when their choice list is exactly the vanilla one; talk_with_master / talk_with_guest renumber "
+   "the vanilla choices back (the vanilla switch kept under #else) and the inserted one enters aHNW_ACTION_PC_ROOM (TARGET_PC, appended); any other resident / off = vanilla",
+   "if (pc_room_gyroid_intercept(actorx, (int)haniwa->house_idx)) {\n                return;\n            }\n#endif\n            mDemo_Request(mDemo_TYPE_TALK, actorx, &aHNW_set_talk_info_dance);" in hn
    and "if (!guest && !owner) {\n        return 0;" in gi and "mDemo_PC_TalkPositionOk((ACTOR*)actor)" in gi and "!pc_net_game_room_on()" in gi
+   and "s_seq = pc_net_game_room_send(PC_ROOM_OP_QUERY, house, NULL);" in gi and "PC_ROOM_QUERY_TIMEOUT_MS" in gi and "return rui_start_talk(actor, NULL);" in gi
+   and "g_pc_demo_force_talk_actor = actor; /* m_demo.c: picked without a new A press */" in uc
    and "(void*)request->actor == g_pc_demo_force_talk_actor" in dm and "g_pc_demo_force_talk_actor = NULL; /* one shot */" in dm
-   and "pc_room_gyroid" not in od and "rui_add(ROW_TALK, -1, \"Talk to the gyroid\");" in uc)
+   and hn.count("const int pc_chosen = pc_room_gyroid_menu_pick(haniwa, (int)mChoice_GET_CHOSENUM());") == 2 and hn.count("#else\n        switch (mChoice_GET_CHOSENUM()) {\n#endif") == 1
+   and hn.count("#else\n            switch (mChoice_GET_CHOSENUM()) {\n#endif") == 1 and hn.count("action = aHNW_ACTION_PC_ROOM;") == 2
+   and "#ifdef TARGET_PC\n    aHNW_ACTION_PC_ROOM," in hh and hh.index("aHNW_ACTION_PC_ROOM") > hh.index("aHNW_ACTION_DOOR_OPEN_TIMER")
+   and "#ifdef TARGET_PC\n        &aHNW_pc_room,\n#endif" in hn and "pc_room_gyroid_frame(actor, (int)haniwa->house_idx, (int)haniwa->common_actor_class.act);" in hn
+   and "return chosen > c ? chosen - 1 : chosen;" in pk and "s_cphase != RC_ARMED || actor == NULL || actor != s_actor || c < 0" in pk
+   and "index == PC_ROOM_VMSG_OWNER_FIRST || index == PC_ROOM_VMSG_OWNER_AGAIN || index == 0x0930 || index == 0x0933 || index == 0x0936" in dlc
+   and "if (s_arm_mode != PC_ROOM_DLG_ARM_OWNER || rd_find_sel(data, len, ids, &n) < 0 || n != 4) {" in dlc
+   and "n != 2 || ids[0] != k_guest_ids[0] || ids[1] != k_guest_ids[1]" in dlc and "pc_room_gyroid" not in od and "Talk to the gyroid" not in uc + hn)
+dg = body(uc, "int pc_room_gyroid_dialog(void* actor, int house) {")
+ck("C6b the move-in rows: a decision always goes through a vanilla choice window first (guest Yes / No; holder 'Let them in.' / 'Turn them down.' / 'Decide later.', "
+   "'Ask to move out' then a Yes / No confirm); the host's answer is waited for behind 'Processing request...' (5 s, then 'could not reach the records'); the talk ending "
+   "any way disarms (pc_room_gyroid_frame)",
+   "rui_ask(PC_ROOM_DLG_OWNER_RM_CONFIRM);" in dg and "rui_send(PC_ROOM_OP_REMOVE, s_info.e[s_steps[s_step]].key);" in dg[dg.index("case PC_ROOM_DLG_OWNER_RM_CONFIRM:"):]
+   and "rui_send(c == 0 ? PC_ROOM_OP_ACCEPT : PC_ROOM_OP_DENY, s_info.e[s_steps[s_step]].key);" in dg and "return rui_next_step(); /* Decide later. */" in dg
+   and "(int32_t)(rui_now() - s_t0) >= (int32_t)PC_ROOM_OP_TIMEOUT_MS" in dg and "(uint32_t)(rui_now()" not in uc and "rui_answered(0, PC_ROOM_DLG_REASON_LINK)" in dg
+   and "case PC_ROOM_DLG_WAIT:" in dlc and "rd_code(&b, RD_FORCENEXT); /* stops here" in dlc
+   and 'rui_reset(s_talk_seen ? "the talk ended" : "the talk did not start");' in uc)
+ng_ = body(uc, "const char* pc_room_ui_notice_get(void) {")
+ck("C8 the notice line: a FIFO of host NOTICE lines (each ~5 s; a new line never overwrites the one on screen), drawn at the TOP (y 46, 58 under the shop upgrade line): "
+   "clear of the player, the message window and the clock",
+   "s_nq_head = (s_nq_head + 1) % PC_ROOM_NOTICE_QUEUE;" in ng_ and "return s_nq[s_nq_head];" in ng_ and "#define PC_ROOM_NOTICE_QUEUE     6" in uc
+   and "pc_menu_draw_centered(game, rm_line, pc_shop_upgrade_notice(up_probe, (int)sizeof(up_probe)) ? 58.0f : 46.0f," in pm
+   and "pc_room_ui_is_open() ? 168.0f" not in pm)
 ck("C7 nothing in the UI / client seam writes game state (no pocket / wallet / house / save write)",
    not re.search(r"(inventory|pockets|wallet|homes\[[^\]]*\]\.[a-z_]+\s*=|Save_Set)", uc) and not re.search(r"\binventory\b|\bwallet\b", ri))
 

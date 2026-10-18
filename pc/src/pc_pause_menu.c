@@ -402,11 +402,13 @@ void pc_net_notice_draw(struct game_s* game) {
         }
     }
     {
-        /* Roommates: a move-in request / decision / "welcome home" line, ~6 s (pc_room_ui.c) */
+        /* Roommates: the other side's news (a request arrived, accepted, turned down, moved out), one queued line at a time, ~5 s each (pc_room_ui.c). At the TOP
+         * of the screen: clear of the player (94 crossed the character), the vanilla message window and the clock (bottom); below the shop upgrade line when that one shows */
         const char* rm_line = pc_room_ui_notice_get();
         if (rm_line != NULL) {
+            char up_probe[8];
             mFont_SetMatrix(game->graph, mFont_MODE_FONT);
-            pc_menu_draw_centered(game, rm_line, 94.0f, 200, 255, 200, 255, 1.0f);
+            pc_menu_draw_centered(game, rm_line, pc_shop_upgrade_notice(up_probe, (int)sizeof(up_probe)) ? 58.0f : 46.0f, 200, 255, 200, 255, 1.0f);
             mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
         }
     }

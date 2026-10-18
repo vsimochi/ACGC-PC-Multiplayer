@@ -11,6 +11,10 @@
 #include "m_name_table.h" /* ITM_FOOD_*: the Work Mode objective names */
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure length / minutes left in Nook's rows and the door row */
 #include "pc_sell_logic.h"   /* Nook bulk sell basket: pc_sell_format_bells (the quote row) */
+#include "pc_room_dlg.h"     /* roommates / move-in: the gyroid's move-in rows + its menu patch (pc_room_dlg.c) */
+
+_Static_assert(PC_ROOM_DLG_MSG_MAX == MSG_MAX, "pc_room_dlg.h keeps its own copy of MSG_MAX");
+_Static_assert(PC_ROOM_DLG_MSG_OFS >= PC_NOOK_MSG_COUNT && PC_ROOM_DLG_SEL_OFS >= PC_NOOK_SEL_COUNT, "the roommate rows follow the Nook rows");
 
 /* control code bytes (tools/msg_tool.py COMMANDS / CONT_SIZES; include/m_font.h mFont_CONT_CODE_*) */
 #define NK_CC 0x7F
@@ -206,11 +210,11 @@ static void nk_minutes(char* out, size_t cap, int m) {
 }
 
 int pc_nook_msg_id_valid(int id) {
-    return id >= MSG_MAX && id < MSG_MAX + PC_NOOK_MSG_COUNT;
+    return (id >= MSG_MAX && id < MSG_MAX + PC_NOOK_MSG_COUNT) || pc_room_dlg_msg_id_valid(id); /* + the gyroid's move-in rows (pc_room_dlg.c) */
 }
 
 int pc_nook_sel_id_valid(int id) {
-    return id >= PC_NOOK_SEL_BASE && id < PC_NOOK_SEL_COUNT_END;
+    return (id >= PC_NOOK_SEL_BASE && id < PC_NOOK_SEL_COUNT_END) || pc_room_dlg_sel_id_valid(id);
 }
 
 void pc_nook_house_set_pick(const int* houses, int n) {
@@ -434,6 +438,12 @@ static int nk_post_mail_patch(unsigned char* data, int len, int cap) {
 int pc_nook_msg_patch(int index, unsigned char* data, int len, int cap) {
     PCWorkView v;
     int i, id;
+    {   /* roommates / move-in: while a gyroid conversation is armed (pc_room_ui.c), the gyroid's own menus get the move-in choice (pc_room_dlg.c) */
+        const int rn = pc_room_dlg_msg_patch(index, data, len, cap);
+        if (rn > 0) {
+            return rn;
+        }
+    }
     if (s_pm_arm_idx >= 0 && index == s_pm_arm_idx) {
         const int n = nk_post_mail_patch(data, len, cap);
         if (n > 0) {
@@ -494,6 +504,9 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
     NkBuf b;
     char price[16], tmp[96];
     int ids[6], n, i;
+    if (pc_room_dlg_msg_id_valid(id)) {
+        return pc_room_dlg_build_id(id, dst, cap); /* roommates / move-in: the gyroid's rows */
+    }
     if (!pc_nook_msg_id_valid(id) || dst == NULL) {
         return 0;
     }
@@ -1079,6 +1092,9 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
 int pc_nook_sel_build(int id, unsigned char* dst16) {
     char tmp[32];
     int i, len;
+    if (pc_room_dlg_sel_id_valid(id)) {
+        return pc_room_dlg_sel_build_id(id, dst16); /* roommates / move-in: "Roommates", "Ask to move in" ... */
+    }
     if (!pc_nook_sel_id_valid(id) || dst16 == NULL) {
         return 0;
     }
@@ -1279,5 +1295,6 @@ int pc_nook_house_selftest(void) {
         }
         s_map_arm_idx = saved;
     }
+    bad += pc_room_dlg_selftest(); /* roommates / move-in: the gyroid's rows (charset, ends) and its menu patch */
     return bad;
 }
