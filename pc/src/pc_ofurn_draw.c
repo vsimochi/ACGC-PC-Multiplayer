@@ -35,7 +35,6 @@
 #include "audio.h"
 #include "m_submenu.h"   /* C3: the outdoor storage screen (the inventory in HANIWA_ENTRUST mode = the gyroid overlay in dresser mode) */
 #include "pc_dresser_ui.h"
-#include "pc_room_ui.h"   /* roommates: the gyroid's move-in menu */
 
 #include <math.h>
 #include <stdio.h>
@@ -992,12 +991,6 @@ static int pc_ofurn_grab_try(GAME* game, PLAYER_ACTOR* pl, int ux, int uz) {
         return 0;
     }
     if (!pc_net_game_ofurn_may_move(&rotate_only)) {
-        /* roommates: a guest's A at a placed GYROID opens the move-in menu (pc_room_ui.c; the host decides what it offers) */
-        if (pc_net_game_room_is_gyroid((int)pc_ofurn_tile_value(&mk)) && pc_net_game_room_on()) {
-            printf("[OFURN][ROOM] A at the gyroid at (%u,%u): the move-in menu\n", (unsigned)mk.ut_x, (unsigned)mk.ut_z);
-            pc_room_ui_open((int)mk.ut_x, (int)mk.ut_z, (int)pc_ofurn_tile_value(&mk));
-            return 1;
-        }
         /* C3b: a guest cannot grab, but it OPENS a storage piece from its front (on the press: there is no grab for a tap to end) */
         if (pc_net_game_ofurn_is_storage((int)pc_ofurn_tile_value(&mk)) && pc_ofurn_open_from_front(pl, &mk)) {
             pc_ofurn_open_request(&mk);
@@ -1166,13 +1159,10 @@ int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no) {
         /* C3: the vanilla open gesture (aMR_ManageMoveBottun): A released before 14 frames without a step = a TAP: a storage piece opens */
         const uint32_t held = pc_net_game_now_ms() - s_grab.start_ms;
         const PCOfurnMarker tapped = s_grab.mk;
-        const int gyroid = pc_net_game_room_is_gyroid((int)pc_ofurn_tile_value(&tapped)) && pc_net_game_room_on(); /* roommates: a tapped gyroid = its menu */
-        const int tap = s_grab.op == 0 && pc_ofurn_tap_opens(held, s_grab.stepped, gyroid || pc_net_game_ofurn_is_storage((int)pc_ofurn_tile_value(&tapped)));
-        const int opens = tap && (gyroid || pc_ofurn_open_from_front(pl, &tapped)); /* C3b: from behind / the side a tap is only a short grab */
-        pc_ofurn_grab_end(opens ? (gyroid ? "A tapped (the gyroid's move-in menu)" : "A tapped (open)") : tap ? "A tapped (not in front of the piece: no open)" : "A released");
-        if (opens && gyroid) {
-            pc_room_ui_open((int)tapped.ut_x, (int)tapped.ut_z, (int)pc_ofurn_tile_value(&tapped));
-        } else if (opens) {
+        const int tap = s_grab.op == 0 && pc_ofurn_tap_opens(held, s_grab.stepped, pc_net_game_ofurn_is_storage((int)pc_ofurn_tile_value(&tapped)));
+        const int opens = tap && pc_ofurn_open_from_front(pl, &tapped); /* C3b: from behind / the side a tap is only a short grab */
+        pc_ofurn_grab_end(opens ? "A tapped (open)" : tap ? "A tapped (not in front of the piece: no open)" : "A released");
+        if (opens) {
             pc_ofurn_open_request(&tapped);
         }
         return 0;

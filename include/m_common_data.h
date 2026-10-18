@@ -366,9 +366,18 @@ extern common_data_t common_data;
 #define Get_Island() (Save_Get(island))
 #define Get_Island_Villager() (Get_Island().animal)
 
+#ifdef TARGET_PC
+/* roommates (pc_room_ui.c): the house whose music box the room shows: the local player's own house, or, for a GUEST editing a shared house, THAT house (the vanilla
+ * arrangement says house 0 for player_no 4) */
+extern int pc_room_music_box_house(void);
+#define GetRoomMusicBox() (Save_Get(scene_no) == SCENE_COTTAGE_MY \
+                             ? Save_Get(island).cottage.music_box \
+                             : Save_Get(homes[pc_room_music_box_house()]).music_box)
+#else
 #define GetRoomMusicBox() (Save_Get(scene_no) == SCENE_COTTAGE_MY \
                              ? Save_Get(island).cottage.music_box \
                              : Save_Get(homes[mHS_get_arrange_idx(Common_Get(player_no))]).music_box)
+#endif
 #define ChkMusicBox(box, n) (((box)[((n) / 32) & 1] >> ((n) & 31)) & 1)
 #define SetMusicBox(box, n) ((box)[((n) / 32) & 1] |= (1 << ((n) & 31)))
 #define ClrMusicBox(box, n) ((box)[((n) / 32) & 1] &= ~(u32)(1 << ((n) & 31)))

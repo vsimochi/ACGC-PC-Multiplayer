@@ -170,7 +170,10 @@ def main():
               "pcnetgame_museum_bits_test_hook",
               # dresser storage (kind 18, master sprint 2; at HEAD, never listed -- reviewed now): the host handlers range-check the bound slot first (query: idx < 0, a guest only for the probe / an OUTDOOR floor, its probe returns before the subscript; txn: idx < 0, and idx >= PLAYER_NUM without an outdoor selection = the guest refusal before the subscript, the house branch / owner peek guarded `idx < PLAYER_NUM`: C3b),
               # the migration refuses idx / h outside [0, PLAYER_NUM) before reading the resident PersonalID
-              "pcnetgame_dresser_migrate_resident", "pcnetgame_handle_host_dresser_query", "pcnetgame_handle_host_dresser_txn",
+              "pcnetgame_dresser_migrate_resident", "pcnetgame_handle_host_dresser_query",
+              # roommates (reviewed): the ONE house lookup of a bound slot (a resident: its own house, idx range-checked < PLAYER_NUM before the subscript; a guest: its shared
+              # house from the roommate relation, no subscript); the dresser txn handler now goes through it (no direct subscript any more)
+              "pcnetgame_edit_house_of",
               # dedicated operator list (op / deop selector resolver; host console only): loop bounded by PLAYER_NUM, never reachable with a guest slot
               "pcnetgame_ops_resolve"]
     users = sorted({n for a, b, n in funcs if re.search(r"Save_Get\(private_data\)\[", c[a:b])})
@@ -217,7 +220,7 @@ def main():
     ck("A furniture sync / promote guards: hcl_own_house returns nothing for a guest (`Now_Private == NULL || s_client_guest_claim_sent`), live_apply range-checks the house index "
        "(`h < 0 || h >= PC_NETGAME_HOUSE_NUM`), promote_parse_index accepts only a single digit below PC_RESIDENCE_HOUSES (`sel[0] < (char)('0' + PC_RESIDENCE_HOUSES)`), pc_mp_promote_create range-checks the house "
        "(`house < 0 || house >= PC_RESIDENCE_HOUSES`), and the only callers of pc_net_game_dedicated_promote( / pc_net_game_dedicated_give( outside pc_net_game.c are in pc_dedicated.c",
-       "Now_Private == NULL || s_client_guest_claim_sent" in hcl_own and "h < 0 || h >= PC_NETGAME_HOUSE_NUM" in fb("pcnetgame_hcl_live_apply")
+       "if (Now_Private == NULL) {" in hcl_own and "if (s_client_guest_claim_sent) {\n        return pcnetgame_room_client_edit_house();" in hcl_own and "h < 0 || h >= PC_NETGAME_HOUSE_NUM" in fb("pcnetgame_hcl_live_apply")
        and "sel[0] >= '0' && sel[0] < (char)('0' + PC_RESIDENCE_HOUSES)" in prm_idx and prm_idx != ""
        and "house < 0 || house >= PC_RESIDENCE_HOUSES" in body(mc_raw, mc_fn, "pc_mp_promote_create")
        and other_c_callers("pc_net_game_dedicated_promote") == ["pc_dedicated.c"] and other_c_callers("pc_net_game_dedicated_give") == ["pc_dedicated.c"])

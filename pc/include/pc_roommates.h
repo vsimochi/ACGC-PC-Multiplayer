@@ -1,8 +1,10 @@
 /* pc_roommates.h - ROOMMATES / MOVE-IN (docs/multiplayer-guest-roadmap.md "Roommates / move-in"), pure logic (no game state; native selftest pc_room_selftest()).
  *
- * A GUEST (a player without a resident slot: player_no >= 4, its own .gst record) asks a resident to move in at that resident's GYROID placed outdoors. The resident (the
- * MAIN house holder) accepts or denies the request at the same gyroid and can later remove the roommate again. A roommate keeps its OWN identity, pockets, wallet and
- * record; only the house is shared (it may enter the holder's house, see the live room and use its dresser storage). Nothing here touches the town save.
+ * A GUEST (a player without a resident slot: player_no >= 4, its own .gst record) asks a resident to move in at the GYROID THAT COMES WITH THE RESIDENT'S HOUSE (the
+ * vanilla save gyroid beside each player house). The resident who owns that house (the MAIN house holder) accepts or denies at the same gyroid and can later remove the
+ * roommate again. A roommate keeps its OWN identity, pockets, wallet and record; only the house is shared: it edits the house like the holder (furniture, dressers,
+ * the music box), starts at its door when it joins, and walks in without knocking. House upgrades and the house mail stay the holder's. Nothing here touches the
+ * town save.
  *
  * Identities are the 20-byte canonical keys of the membership layer (player_name[8] + land_name[8] + player_id BE + land_id BE): the resident's PersonalID (the house
  * holder) and the guest key (the guest's HOME PersonalID that guests.dat binds a connection to).
@@ -15,7 +17,7 @@
  * Unknown keys / malformed lines are skipped (counted); a later version is read as far as it is understood (extra trailing fields are ignored).
  *
  * Message 104 ROOMMATE (PCRoomMsg, fixed 300 bytes, RELIABLE; protocol v8 extended in place): client -> host requests (QUERY / REQUEST / CANCEL / ACCEPT / DENY / REMOVE /
- * LEAVE, always naming the gyroid's origin tile + tile value), host -> client answers (INFO / RESULT) and pushes (STATUS: "you are a roommate of house h", NOTICE: the other
+ * LEAVE, always naming the HOUSE of the gyroid (`house` 0..3; ut / item 0)), host -> client answers (INFO / RESULT) and pushes (STATUS: "you are a roommate of house h", NOTICE: the other
  * party's decision, also delivered at the next join when it happened offline). A client sends 104 only after the host's 102 CAPS carried PC_OFURN_C4_ROOMMATES. */
 #ifndef PC_ROOMMATES_H
 #define PC_ROOMMATES_H
@@ -56,9 +58,9 @@ extern "C" {
 /* results of the table operations (also the RESULT codes of message 104) */
 #define PC_ROOM_R_OK                0
 #define PC_ROOM_R_BAD               1  /* malformed request */
-#define PC_ROOM_R_NOT_GYROID        2  /* no live placed gyroid at that tile / the requester is not next to it */
-#define PC_ROOM_R_NOT_OWNER         3  /* the requester does not hold this gyroid */
-#define PC_ROOM_R_NO_HOUSE          4  /* the gyroid's holder has no house (or nobody holds it) */
+#define PC_ROOM_R_NOT_GYROID        2  /* the requester is not next to that house's gyroid (in the town) */
+#define PC_ROOM_R_NOT_OWNER         3  /* the requester does not own this gyroid's house */
+#define PC_ROOM_R_NO_HOUSE          4  /* nobody owns this gyroid's house */
 #define PC_ROOM_R_PENDING_ELSEWHERE 5  /* the guest already has an open request with another holder */
 #define PC_ROOM_R_ROOMMATE_ELSEWHERE 6 /* the guest already shares another house */
 #define PC_ROOM_R_ALREADY           7  /* already asked / already a roommate here */
@@ -163,16 +165,39 @@ typedef struct PCRoomMsg {
     uint8_t  result;   /* PC_ROOM_R_* (host messages), 0 from a client */
     uint8_t  count;    /* entries used (<= 8) */
     uint8_t  ut_x, ut_z;
-    uint16_t item;     /* the gyroid: origin tile + the tile value the client sees (host messages: echoed, STATUS / NOTICE: 0) */
+    uint16_t item;     /* 0 (reserved; the gyroid is named by `house`) */
     uint32_t seq;      /* the client's request serial (echoed by INFO / RESULT; 0 in pushes) */
     uint8_t  role;     /* INFO / STATUS: PC_ROOM_ROLE_* */
-    uint8_t  house;    /* STATUS: the shared house 0..3 (0xFF = none) */
+    uint8_t  house;    /* client: the house whose gyroid it talks to (0..3); INFO: that house; STATUS: the shared house 0..3 (0xFF = none) */
     uint8_t  aux;      /* RESULT: the op answered; NOTICE: the note */
     uint8_t  flags;    /* 0 */
     uint8_t  owner_name[PC_ROOM_NAME_LEN];
     uint8_t  owner_key[PC_ROOM_KEY_LEN];
     PCRoomWireEntry e[PC_ROOM_MSG_ENTRIES];
 } PCRoomMsg; /* 300 bytes */
+
+/* ---- the CLIENT's memory of its shared houses (save/mp/roommate_homes.ini): a roommate that joins again starts at the door of the house it shares (like a
+ * resident) instead of the station. One line per (guest, town): `home = <guest key: 40 hex> <holder key: 40 hex> <house 0..3>`. The holder key carries the town
+ * (land name + land id), so one guest has at most one line per town. Written when the host's STATUS changes; checked against the reloaded town at the arrival. */
+#define PC_ROOM_HOMES_MAX 32
+#define PC_ROOM_HOMES_PATH "save/mp/roommate_homes.ini"
+typedef struct PCRoomHome {
+    uint8_t guest[PC_ROOM_KEY_LEN];
+    uint8_t holder[PC_ROOM_KEY_LEN];
+    uint8_t house;
+} PCRoomHome;
+typedef struct PCRoomHomes {
+    int        n;
+    PCRoomHome e[PC_ROOM_HOMES_MAX];
+} PCRoomHomes;
+int pc_room_homes_load(const char* path, PCRoomHomes* t);        /* PC_ROOM_FILE_*; an unreadable / missing file = an empty table */
+int pc_room_homes_save(const char* path, const PCRoomHomes* t);  /* 1 = written (atomic) */
+/* sets the guest's house in the holder's town (house 0..3), or removes it (house < 0); returns 1 when the table changed */
+int pc_room_homes_set(PCRoomHomes* t, const uint8_t guest[PC_ROOM_KEY_LEN], const uint8_t holder[PC_ROOM_KEY_LEN], int house);
+int pc_room_homes_find(const PCRoomHomes* t, const uint8_t guest[PC_ROOM_KEY_LEN], int from); /* the next entry of that guest at or after `from`, -1 none */
+
+/* the vanilla house gyroids (the "save gyroid" beside each player house, ACTOR_PROP_HANIWA0..3) stand at fixed spots of the player-house acre: town units */
+extern const uint8_t pc_room_gyroid_ut[4][2];
 
 /* 1 = a well-formed message of the given direction (from_client: ops 1..7, the reserved fields 0, count 0 except ACCEPT / DENY / REMOVE = 1;
  * host: ops 16..19, count <= 8, result <= R_MAX, role <= ROLE_MAX, entry states PENDING / ROOMMATE, rsv 0) */

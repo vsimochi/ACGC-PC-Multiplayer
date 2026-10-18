@@ -4,11 +4,14 @@
 TIER: SOURCE AUDIT (+ the native selftest of pc_roommates.c). Usage: python test_roommates_src.py
   W  wire: id 104 = PC_ROOM_MSG_ID (static assert), 300 bytes, no new TXN kind / reason / town service, the capability is bit 1 of the 102 CAPS `total`,
      a client sends 104 only after it, old peers: the host drops a malformed 104 without a violation, the client ignores it unless READY
-  H  host: requests validated (shape, READY + bound, rate 8 / 2 s, a live gyroid + the requester next to it), roommates.ini written BEFORE the answer and undone on a
+  H  host: requests validated (shape, READY + bound, rate 8 / 2 s, the requester next to the gyroid that comes with house h; the holder = homes[h]'s owner),
+     roommates.ini written BEFORE the answer and undone on a
      failed write, the guest-table housekeeping only while the guest store is trusted, no private_data[] / homes[] subscript by a guest index
-  R  rights: the house push to a guest = its shared house only, the outdoor-furniture resident rights include a roommate, the house COMMIT gate is unchanged
-  C  client: the door hooks (no knock for the shared house, a shut door for every other house of a guest) are TARGET_PC additions only; the show-out after a demotion
-     waits for an idle player and uses the exit data of the door; the menu consumes the pad while open and is drawn after the emote wheel; the notice line
+  R  rights: the house push to a guest = its shared house only, the outdoor-furniture resident rights include a roommate
+  C  client: no knock for the shared house, every other guest visit unchanged (no door gate); the show-out after a demotion; the menu (pad, draw, notice line); the house
+     gyroid's talk seam + the forced vanilla talk ("Talk to the gyroid")
+  E  editing the shared house (host commit authorisation + rollback, grace / freeze, client own house / set_field_type / lock, music box, dressers), the spawn at the door,
+     no "Welcome home"
   S  switches + test hooks: settings.ini roommates / AC_MP_ROOMMATES=0, the TEST-ONLY hooks gated by PC_NET_TEST_HOOKS + AC_TEST_HOOKS
 """
 import os
@@ -71,7 +74,7 @@ ck("W3 the capability: PC_OFURN_C4_ROOMMATES = bit 1 of the 102 CAPS total (C3 s
    and "m.total = pcnetgame_ofurn_c3_flags() | pcnetgame_room_caps_bit();" in ng and "pcnetgame_room_client_caps(m->total);" in ng
    and "const int on = (total & PC_OFURN_C4_ROOMMATES) != 0;" in ri and "s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE;" in ng)
 on = body(ri, "int pc_net_game_room_on(void) {")
-snd = body(ri, "uint32_t pc_net_game_room_send(int op, int ut_x, int ut_z, int item, const uint8_t* guest_key) {")
+snd = body(ri, "uint32_t pc_net_game_room_send(int op, int house, const uint8_t* guest_key) {")
 ck("W4 a client sends 104 only while READY and after the host's capability bit (an old host never sees 104); every message is validated before it is sent",
    "return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_rmc.caps;" in on and "if (!pc_net_game_room_on()" in snd
    and "if (!pc_room_msg_valid(&m, 1)) {" in snd and snd.index("pc_room_msg_valid(&m, 1)") < snd.index("pc_net_send(0, PC_NET_RELIABLE, &m"))
@@ -90,9 +93,12 @@ ck("W7 the block is included once at the end of pc_net_game.c; the pure module +
 
 # ---- H
 h = body(ri, "static void pcnetgame_room_handle(int peer, const PCRoomMsg* in) {")
-ck("H1 every request needs a live placed gyroid at that tile with that value (all cells match) and the requester next to it (the host's copy of its position, in town)",
-   "(mi = pcnetgame_room_gyroid_at((int)in->ut_x, (int)in->ut_z, (int)in->item)) < 0 || !pcnetgame_room_actor_near(peer, (int)in->ut_x, (int)in->ut_z)" in h
-   and "pcnetgame_ofurn_tiles_match(&s_ofh.m[mi], &bx, &bz, &bv)" in ri and "PC_NETGAME_CTX_FLAG_IN_TOWN" in body(ri, "static int pcnetgame_room_actor_near("))
+ck("H1 the gyroid is the one that COMES WITH house h (fixed spots of the player-house acre); every request needs the requester next to it in town (the host's copy of "
+   "its position); a client names it by its house only (tile / item must be 0)",
+   "house < 0 || house >= PLAYER_NUM || !pcnetgame_room_actor_near(peer, (int)pc_room_gyroid_ut[house][0], (int)pc_room_gyroid_ut[house][1])" in h
+   and "const uint8_t pc_room_gyroid_ut[4][2] = { { 51, 37 }, { 60, 37 }, { 51, 44 }, { 60, 44 } };" in rc and "PC_NETGAME_CTX_FLAG_IN_TOWN" in body(ri, "static int pcnetgame_room_actor_near(")
+   and "if (m->ut_x != 0 || m->ut_z != 0 || m->item != 0) {" in rc and "m->house > 3" in rc
+   and "pc_ofurn_find" not in ri and "placer" not in ri)  # no placed-furniture gyroid / placer ownership any more
 ck("H2 roommates.ini is written BEFORE the RESULT goes out; a failed write restores the table (FAULT, nothing changed)",
    "if (r == PC_ROOM_R_OK && !pcnetgame_room_host_save()) {" in h and "memcpy(&s_rmh, &undo, sizeof(s_rmh)); /* nothing changed */" in h
    and h.index("pcnetgame_room_host_save()") < h.rindex("pcnetgame_room_reply_send(peer, &out);"))
@@ -104,15 +110,14 @@ ck("H4 housekeeping never prunes against an unknown guest table (UNTRUSTED / not
    and "pcnetgame_room_host_ensure() < 0 && in->op != PC_ROOM_OP_QUERY" in h)
 ck("H5 no guest index ever subscripts private_data[] / homes[] (the block indexes them only with resident loops 0..3 or a homes[] index from the save)",
    not re.search(r"private_data\)\[(?:idx|peer|g|slot)\]", ri) and not re.search(r"homes\[(?:idx|peer|g)\]", ri))
-ck("H6 an unheld gyroid is claimed only by a RESIDENT with a house (the placer fields rewritten + the sidecar saved, undone on a failed save)",
-   "if (kind == PC_OPS_KIND_RESIDENT && pcnetgame_room_house_of_key(me) >= 0 && pcnetgame_room_claim(mi, me," in ri
-   and "if (!pcnetgame_ofurn_host_save()) {\n        *mk = before;" in body(ri, "static int pcnetgame_room_claim("))
+ck("H6 the holder is ALWAYS the resident who owns homes[h] (the buyer): no claim, no console owner",
+   "pcnetgame_mbox_house_of(pid) == h" in body(ri, "static int pcnetgame_room_holder(int h,") and "pcnetgame_room_claim" not in ri and 'strcmp(sub, "owner")' not in ri)
 
 # ---- R
-ck("R1 the house push: a guest peer only while it is a ROOMMATE, and only its shared house; the commit gate (idx >= PLAYER_NUM -> NOT_OWNER) is untouched",
-   "(st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && !pcnetgame_room_peer_is_roommate((PCNetPeerId)p))" in ng
-   and "(st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST || pcnetgame_room_peer_house(peer) == h)" in ng
-   and ng.count("idx >= PLAYER_NUM") >= 2 and "NOT_OWNER" in body(ng, "static void pcnetgame_house_handle_begin("))
+ck("R1 the house push: a guest peer only while it is a ROOMMATE (or in its demotion grace), and only its shared house",
+   "(st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && pcnetgame_room_peer_commit_house((PCNetPeerId)p) < 0)" in ng
+   and "(st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST || pcnetgame_room_peer_commit_house(peer) == h)" in ng
+   and "NOT_OWNER" in body(ng, "static void pcnetgame_house_handle_begin("))
 ck("R2 outdoor furniture: a roommate has a resident's rights (PERMS re-sent when they change); a new roommate gets its shared house pushed at once",
    "(s_host_peer[peer].bound_class == (uint8_t)PC_NETGAME_REC_CLASS_RESIDENT || pcnetgame_room_peer_is_roommate(peer))" in ng
    and "s_host_peer[p].hsent_seq[house] = 0;" in h)
@@ -122,11 +127,11 @@ ck("C1 the knock: a TARGET_PC block in the foreigner branch only; a roommate of 
    "#ifdef TARGET_PC\n                    /* roommates (pc_room_ui.h): a guest walks into the house it shares like the holder does (no knock) */\n"
    "                    extern int pc_net_game_room_house_entry(int house);\n                    if (pc_net_game_room_house_entry(arrange_idx) > 0) {\n"
    "                        return FALSE;\n                    }\n#endif\n                    return TRUE;" in pcm)
-ck("C2 the door: a TARGET_PC block before `res = TRUE`; a guest of a roommates host that does not live there gets a shut door + the notice",
-   "if (pc_net_game_room_house_entry(my_house->action & 3) < 0) {\n                    pc_net_game_room_door_refused();\n                    return FALSE;\n                }\n#endif\n                res = TRUE;" in mh)
+ck("C2 the door: NO roommate gate: every guest enters (and knocks at) other people's houses exactly as before roommates (ac_my_house_move.c_inc is the pre-roommates file)",
+   "pc_net_game_room" not in mh and "door_refused" not in ri + uh and subprocess.run(["git", "-C", ROOT, "diff", "--quiet", "30b152f", "--", "src/actor/ac_my_house_move.c_inc"]).returncode == 0)
 he = body(ri, "int pc_net_game_room_house_entry(int house) {")
 ck("C3 the entry rule is a READY client of a roommates host, a guest player, house 0..3; a roommate only when the local house h is held by the STATUS holder",
-   "!s_rmc.caps" in he and "!pcnetgame_client_is_guest_player()" in he and "return pcnetgame_room_client_lives_in(house) ? 1 : -1;" in he
+   "!s_rmc.caps" in he and "!pcnetgame_client_is_guest_player()" in he and "return pcnetgame_room_client_lives_in(house) ? 1 : 0;" in he
    and "return mPr_CheckCmpPersonalID(&Save_Get(homes[h]).ownerID, &p) == TRUE;" in body(ri, "static int pcnetgame_room_client_lives_in(int h) {"))
 ct = body(ri, "static void pcnetgame_room_client_tick(void) {")
 ck("C4 the show-out after a demotion: no wipe / fade, no message / submenu (a demo holds it 10 s at most), a valid exit door (never scene 0 / the same scene), then the vanilla walk-out calls",
@@ -139,11 +144,64 @@ ck("C5 the menu owns the pad while open (buttons / sticks zeroed), is called in 
    "*buttons = 0;\n    *stick_x = *stick_y = 0;\n    *cstick_x = *cstick_y = 0;" in ui_in and "pc_room_ui_input(&buttons, &stickX, &stickY, &cstickX, &cstickY);" in pad
    and pad.index("pc_emote_wheel_input(") < pad.index("pc_room_ui_input(") and "    pc_room_ui_draw(game);" in gr and gr.index("pc_emote_wheel_draw(game);") < gr.index("pc_room_ui_draw(game);")
    and "pc_menu_draw_centered(game, rm_line, 94.0f," in pm)
-ck("C6 every decision asks Yes / No with No preselected; the gyroid menu is opened from the A seam (guest: the press, resident: the tap) only when the host offers it",
-   "s_csel = 0; /* \"No\" first" in uc and "pc_net_game_room_is_gyroid((int)pc_ofurn_tile_value(&mk)) && pc_net_game_room_on()" in od
-   and "pc_room_ui_open((int)tapped.ut_x, (int)tapped.ut_z, (int)pc_ofurn_tile_value(&tapped));" in od)
+hn = rd(ROOT, "src", "actor", "ac_haniwa_move.c_inc")
+dm = rd(ROOT, "src", "game", "m_demo.c")
+gi = body(uc, "int pc_room_gyroid_intercept(void* actor, int house) {")
+ck("C6 every decision asks Yes / No with No preselected; the HOUSE gyroid's talk seam (aHNW_dance) asks the PC menu first: a guest or the house owner, an A press in the vanilla "
+   "talk position, the host offering roommates; any other resident / off = the vanilla talk. The menu's 'Talk to the gyroid' row starts the vanilla conversation (one-shot forced pick)",
+   "s_csel = 0; /* \"No\" first" in uc and "if (pc_room_gyroid_intercept(actorx, (int)haniwa->house_idx)) {\n                return;\n            }\n#endif\n            mDemo_Request(mDemo_TYPE_TALK, actorx, &aHNW_set_talk_info_dance);" in hn
+   and "if (!guest && !owner) {\n        return 0;" in gi and "mDemo_PC_TalkPositionOk((ACTOR*)actor)" in gi and "!pc_net_game_room_on()" in gi
+   and "(void*)request->actor == g_pc_demo_force_talk_actor" in dm and "g_pc_demo_force_talk_actor = NULL; /* one shot */" in dm
+   and "pc_room_gyroid" not in od and "rui_add(ROW_TALK, -1, \"Talk to the gyroid\");" in uc)
 ck("C7 nothing in the UI / client seam writes game state (no pocket / wallet / house / save write)",
    not re.search(r"(inventory|pockets|wallet|homes\[[^\]]*\]\.[a-z_]+\s*=|Save_Set)", uc) and not re.search(r"\binventory\b|\bwallet\b", ri))
+
+# ---- E: editing the shared house
+pc_ = body(ng, "static void pcnetgame_house_process_commit(PCNetPeerId peer) {")
+hb_ = body(ng, "static void pcnetgame_house_handle_begin(PCNetPeerId peer, const PCNetGameHouseBeginMsg* in) {")
+rj_ = body(ng, "static void pcnetgame_house_reject(PCNetPeerId peer, int idx, int h, uint8_t status, uint16_t detail, uint32_t xfer) {")
+ck("E1 host: a ROOMMATE's OWNER_COMMIT of its shared house is authorised like the owner's (house from the relation, never from the message), conservation over the house + "
+   "the guest MIRROR record; a guest without the right is NOT_OWNER and rolled back (a FULL record push)",
+   "if (idx >= PLAYER_NUM && pcnetgame_room_peer_commit_house(peer) < 0) {" in pc_ and "pcnetgame_room_peer_commit_house(peer); /* roommates: the shared house */" in pc_
+   and "pcnetgame_house_count_record(s_hs_cnt_old, pcnetgame_rec_priv_ptr(idx));" in pc_ and "Save_Get(private_data)[idx]]" not in pc_
+   and "if (idx >= PLAYER_NUM && pcnetgame_room_peer_commit_house(peer) < 0) {" in hb_ and "pcnetgame_house_reject(peer, idx, -1, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER" in hb_
+   and "(status != (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER || idx >= PLAYER_NUM)" in rj_)
+cg = body(ri, "static int pcnetgame_room_peer_commit_house(PCNetPeerId peer) {")
+ck("E2 demotion: the host keeps accepting the demoted roommate's LAST in-room commit (a grace that lasts while it stands in that house, then 2 min) so its pockets and the "
+   "house stay one consistent pair; the client locks every NEW edit at once (frozen) and ends the freeze only when the pair settled",
+   "PCNG_ROOM_GRACE_MS" in ri and "sc.kind == (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE && (int)sc.owner == s_rmp[peer].grace_house" in cg
+   and "rp->grace_house = rp->house;" in ri and "s_rmc.frozen_house == sh" in body(ri, "static int pcnetgame_room_client_room_unconfirmed(void) {")
+   and "pcnetgame_room_client_pair_settled(s_rmc.frozen_house)" in ri and "!s_hcl.c_active && !s_hcl.rollback && !pcnetgame_hcl_dirty(h) && !s_crec.st_valid" in ri)
+ho = body(ng, "static int pcnetgame_hcl_own_house(void) {")
+el = body(ng, "int pc_net_game_client_room_edit_locked(void) {")
+ak = body(ng, "static void pcnetgame_hcl_handle_ack(")
+fm = rd(ROOT, "src", "game", "m_field_make.c")
+ck("E3 client: the shared house is the guest's 'own' house for the sync (commit pipeline, upload deferral, quit flush); the room is the guest's own room for the vanilla "
+   "editing gates (set_field_type PLAYER_ROOM) only while the host confirmed it AND the sync is usable; an unconfirmed / frozen / sync-less room is locked; a guest's NOT_OWNER "
+   "is a rollback, never 'sync disabled'",
+   "return pcnetgame_room_client_edit_house();" in ho and "if (pcnetgame_room_client_room_unconfirmed()) {\n        return 1;" in el and "return pcnetgame_client_is_guest_player();" in el
+   and "pc_net_game_house_sync_active() &&" in body(ri, "int pc_net_game_room_edit_room(int house) {")
+   and "if (mFI_GET_TYPE(field_id) == mFI_FIELD_PLAYER0_ROOM && pc_net_game_room_edit_room((int)mFI_GET_PLAYER_ROOM_NO(field_id))) {\n                house_owner_id = field_id;" in fm
+   and "if (pcnetgame_client_is_guest_player()) {" in ak[ak.index("case PC_NETGAME_HOUSE_ACK_NOT_OWNER:"):])
+cd = rd(ROOT, "include", "m_common_data.h")
+mc = rd(ROOT, "src", "actor", "ac_my_room_msg_ctrl.c_inc")
+ck("E4 the music box of the room: the shared house for a guest (GetRoomMusicBox + the three msg_ctrl reads), the vanilla arrangement for everybody else",
+   "Save_Get(homes[pc_room_music_box_house()]).music_box)" in cd and mc.count("music_box = Save_Get(homes[pc_room_music_box_house()]).music_box;") == 3
+   and "return mHS_get_arrange_idx(Common_Get(player_no));" in body(uc, "int pc_room_music_box_house(void) {"))
+dq = body(ng, "static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGameDresserQueryMsg* q) {")
+dtx = body(ng, "static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameTxnCommitMsg* in) {")
+ck("E5 dressers: a roommate selects / uses the dressers of the shared house (the store keyed by the HOLDER's house: one store for both), the dresser records of a house with "
+   "a roommate are SHARED records (fenced per identity), a guest's pocket digests are salted, the holder's v1 migration / overflow claim never run for a guest",
+   "h = pcnetgame_edit_house_of(peer, idx);" in dq and "if (idx < PLAYER_NUM) {\n        pcnetgame_dresser_migrate_resident(idx, h);" in dq
+   and "pcnetgame_room_peer_house(peer) != (int)sc.owner" in dtx and "pcnetgame_room_house_shared((int)s_dresser_sel[peer].house)" in dtx
+   and "pcnetgame_dresser_owner8(h, owner8);" in dq)
+mcard = rd(PC, "src", "pc_m_card.c")
+ck("E6 spawn: a roommate's arrival starts at the door of the house it shares (the vanilla 'at home' door: exit_type 1 / extra 1, HOUSE0 + h, no RIDE_OFF_DEMO) when "
+   "save/mp/roommate_homes.ini names it and the reloaded town's house h is still held by that resident; else the station; the client writes the file from the host's STATUS",
+   "} else if ((roommate_house = pc_guest_roommate_house(&home)) >= 0) {" in mcard and "door_data->door_actor_name = HOUSE0 + (h & 3);" in mcard
+   and "mPr_CheckCmpPersonalID(&Save_Get(homes[e->house]).ownerID, &holder) == TRUE" in mcard and "pcnetgame_room_client_remember(h, m.owner_key);" in ri
+   and "idx == mPlayer_INDEX_OUTDOOR;" in mcard)
+ck("E7 no 'Welcome home' notice anywhere", "Welcome home" not in ri + uc + ng)
 
 # ---- S
 ck("S1 switches: settings.ini [Network] roommates (default 1, read + written), env AC_MP_ROOMMATES=0 (host: no bit + RESULT OFF; client: no menu)",

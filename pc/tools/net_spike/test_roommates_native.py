@@ -38,6 +38,17 @@ int main(int argc, char** argv) {
     if (pc_room_load(bak, &u, &bad, &fb) != PC_ROOM_FILE_OK || u.n != 1 || u.e[0].state != PC_ROOM_ST_PENDING) { printf("FAIL .bak holds the previous generation\n"); fails++; }
     remove(path);
     if (pc_room_load(path, &u, &bad, &fb) != PC_ROOM_FILE_OK || fb != 1 || u.n != 1) { printf("FAIL .bak fallback\n"); fails++; }
+    {
+        PCRoomHomes hs, hl;
+        char hp[540];
+        snprintf(hp, sizeof(hp), "%s/roommate_homes.ini", argv[1]);
+        memset(&hs, 0, sizeof(hs));
+        pc_room_homes_set(&hs, g, o, 2);
+        if (!pc_room_homes_save(hp, &hs) || pc_room_homes_load(hp, &hl) != PC_ROOM_FILE_OK || hl.n != 1 || hl.e[0].house != 2 || memcmp(hl.e[0].holder, o, 20) != 0) {
+            printf("FAIL roommate_homes.ini round trip\n");
+            fails++;
+        }
+    }
     printf("[ROOM] file checks: %s\n", fails ? "FAIL" : "PASS");
     return fails;
 }
@@ -69,7 +80,7 @@ def main():
         ok1 = "[ROOM] selftest: PASS" in r.stdout
         ok2 = "[ROOM] file checks: PASS" in r.stdout and r.returncode == 0
         print(("PASS" if ok1 else "FAIL") + " - N2 pc_room_selftest(): every pure check passes")
-        print(("PASS" if ok2 else "FAIL") + " - N3 roommates.ini save / load / .bak generation / .bak fallback")
+        print(("PASS" if ok2 else "FAIL") + " - N3 roommates.ini save / load / .bak generation / .bak fallback, roommate_homes.ini round trip")
         ok_all = ok_build and ok1 and ok2
     finally:
         shutil.rmtree(work, ignore_errors=True)

@@ -741,6 +741,15 @@ static int wait_emsg2_end() {
     return res;
 }
 
+static f32 weight_of_talk_position(ACTOR* actor);
+#ifdef TARGET_PC
+/* roommates (pc_room_ui.c): the vanilla talk-position test of an actor (the player close enough, facing it); the gyroid's PC menu opens only when a talk would */
+int mDemo_PC_TalkPositionOk(ACTOR* actor) {
+    return actor != NULL && GET_PLAYER_ACTOR_NOW() != NULL && weight_of_talk_position(actor) >= 0.0f;
+}
+extern void* g_pc_demo_force_talk_actor; /* pc_room_ui.c: "Talk to the gyroid" chose this actor's conversation (one shot, no new A press) */
+#endif
+
 static f32 weight_of_talk_position(ACTOR* actor) {
     PLAYER_ACTOR* player = GET_PLAYER_ACTOR_NOW();
     f32 actor_talk_dist;
@@ -836,7 +845,14 @@ static int choice_demo_sub() {
              (demo->request_save.type != mDemo_TYPE_NONE || type >= demo->priority_type)) &&
             (*check_func[type])() != FALSE) {
             if (type == mDemo_TYPE_TALK) {
+#ifdef TARGET_PC
+                if ((chkTrigger(BUTTON_A) || (request->actor != NULL && (void*)request->actor == g_pc_demo_force_talk_actor)) && request->talk_weight > max_talk_weight) {
+                    if ((void*)request->actor == g_pc_demo_force_talk_actor) {
+                        g_pc_demo_force_talk_actor = NULL; /* one shot */
+                    }
+#else
                 if (chkTrigger(BUTTON_A) && request->talk_weight > max_talk_weight) {
+#endif
                     idx = i;
                     max_talk_weight = request->talk_weight;
                 }

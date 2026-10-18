@@ -25,7 +25,7 @@
 #define PC_ROOM_UI_MAX_ROWS       10
 
 enum { RUI_CLOSED = 0, RUI_WAIT, RUI_LIST, RUI_DECIDE, RUI_CONFIRM, RUI_BUSY };
-enum { ROW_CLOSE = 1, ROW_ASK, ROW_WITHDRAW, ROW_MOVE_OUT, ROW_REQUEST, ROW_REMOVE, ROW_INFO };
+enum { ROW_CLOSE = 1, ROW_ASK, ROW_WITHDRAW, ROW_MOVE_OUT, ROW_REQUEST, ROW_REMOVE, ROW_INFO, ROW_TALK };
 
 typedef struct {
     int     kind;
@@ -34,7 +34,10 @@ typedef struct {
 } RuiRow;
 
 static int       s_phase;
-static int       s_ux, s_uz, s_item;
+static int       s_house = -1;         /* the house whose gyroid the menu belongs to */
+static void*     s_gyroid_actor;       /* that gyroid's actor (only compared, never dereferenced here) */
+static uint32_t  s_bypass_ms;          /* "Talk to the gyroid": the vanilla conversation of s_gyroid_actor starts instead of this menu */
+void*            g_pc_demo_force_talk_actor; /* m_demo.c choice_demo_sub: this actor's TALK request is chosen without a new A press (one shot) */
 static uint32_t  s_seq, s_t0;
 static int       s_busy_op;
 static uint8_t   s_busy_key[PC_ROOM_KEY_LEN];
@@ -159,6 +162,7 @@ static void rui_build_rows(void) {
             snprintf(s_sub, sizeof(s_sub), "%s", s_info.result != 0 ? pc_room_result_text((int)s_info.result) : "Nobody lives with this gyroid");
             break;
     }
+    rui_add(ROW_TALK, -1, "Talk to the gyroid"); /* the vanilla gyroid (save, items for sale, the message board / buy, leave) */
     rui_add(ROW_CLOSE, -1, "Close");
     if (s_sel >= s_nrows) {
         s_sel = s_nrows - 1;
@@ -168,30 +172,29 @@ static void rui_build_rows(void) {
     }
 }
 
-void pc_room_ui_open(int ut_x, int ut_z, int item) {
+void pc_room_ui_open(int house, void* gyroid_actor) {
     uint32_t seq;
-    if (s_phase != RUI_CLOSED || !pc_net_game_room_on()) {
+    if (s_phase != RUI_CLOSED || !pc_net_game_room_on() || house < 0 || house > 3) {
         return;
     }
-    seq = pc_net_game_room_send(PC_ROOM_OP_QUERY, ut_x, ut_z, item, NULL);
+    seq = pc_net_game_room_send(PC_ROOM_OP_QUERY, house, NULL);
     if (seq == 0) {
         pc_room_ui_notice_set("Try again in a moment");
         return;
     }
-    s_ux = ut_x;
-    s_uz = ut_z;
-    s_item = item;
+    s_house = house;
+    s_gyroid_actor = gyroid_actor;
     s_seq = seq;
     s_t0 = rui_now();
     s_sel = 0;
     s_requeried = 0;
     s_requery_ms = 0;
     s_phase = RUI_WAIT;
-    printf("[ROOM][UI] gyroid at (%d,%d) item 0x%04X: asking the host (seq %u)\n", ut_x, ut_z, (unsigned)item, (unsigned)seq);
+    printf("[ROOM][UI] the gyroid of house %d: asking the host (seq %u)\n", house, (unsigned)seq);
 }
 
 static void rui_send(int op, const uint8_t* key, const char* name) {
-    const uint32_t seq = pc_net_game_room_send(op, s_ux, s_uz, s_item, key);
+    const uint32_t seq = pc_net_game_room_send(op, s_house, key);
     if (seq == 0) {
         pc_room_ui_notice_set("Try again in a moment");
         rui_close("send refused");
@@ -233,6 +236,12 @@ static void rui_choose_row(void) {
     rui_name(s_info.owner_name, owner, sizeof(owner));
     switch (r->kind) {
         case ROW_CLOSE: rui_close("Close"); return;
+        case ROW_TALK:
+            /* the vanilla conversation of this gyroid starts on the next frame (pc_room_gyroid_intercept lets it through, m_demo.c picks it without a new A) */
+            s_bypass_ms = rui_now() | 1u;
+            g_pc_demo_force_talk_actor = s_gyroid_actor;
+            rui_close("Talk to the gyroid");
+            return;
         case ROW_ASK:
             s_confirm_op = PC_ROOM_OP_REQUEST;
             snprintf(s_confirm_text, sizeof(s_confirm_text), "Ask %s if you can move in?", owner);
@@ -374,7 +383,7 @@ static void rui_tick(void) {
                 printf("[ROOM][UI] RESULT op %u -> %u (%s)\n", (unsigned)m.aux, (unsigned)m.result, pc_room_result_text((int)m.result));
                 rui_result_notice(s_busy_op, (int)m.result);
                 if (m.result == PC_ROOM_R_OK && s_info.role == PC_ROOM_ROLE_OWNER) {
-                    const uint32_t seq = pc_net_game_room_send(PC_ROOM_OP_QUERY, s_ux, s_uz, s_item, NULL); /* the holder's list refreshes */
+                    const uint32_t seq = pc_net_game_room_send(PC_ROOM_OP_QUERY, s_house, NULL); /* the holder's list refreshes */
                     if (seq != 0) {
                         s_seq = seq;
                         s_t0 = rui_now();
@@ -387,7 +396,7 @@ static void rui_tick(void) {
             return;
         }
         if (s_requery_ms != 0 && (uint32_t)(rui_now() - s_requery_ms) >= 700u) {
-            const uint32_t seq = pc_net_game_room_send(PC_ROOM_OP_QUERY, s_ux, s_uz, s_item, NULL);
+            const uint32_t seq = pc_net_game_room_send(PC_ROOM_OP_QUERY, s_house, NULL);
             s_requery_ms = 0;
             if (seq != 0) {
                 s_seq = seq;
@@ -515,4 +524,77 @@ void pc_room_ui_draw(struct game_s* game) {
         pc_menu_draw_two_choice(game, "No", "Yes", s_csel, 130.0f);
     }
     mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+}
+
+/* ---- the gyroid that comes with each house (ac_haniwa_move.c_inc aHNW_dance, TARGET_PC) ---- */
+#include "m_controller.h"
+#include "m_demo.h"
+#include "m_private.h"
+#include "m_msg.h"
+extern int mDemo_PC_TalkPositionOk(ACTOR* actor);
+static int s_test_force_a; /* TEST-ONLY (pc_room_ui_test_press): the next talk-position frame counts as an A press */
+
+void pc_room_ui_test_press(void) {
+    s_test_force_a = 1;
+}
+
+/* 1 = this frame's A at house h's gyroid opened the move-in menu (or the menu is open): the vanilla talk request is skipped. A GUEST always gets the menu (its
+ * "Talk to the gyroid" row is the vanilla guest conversation), the house OWNER too (the row is the vanilla save / sale / board conversation); every other resident
+ * talks to the gyroid the vanilla way. Off (solo, an older host, the link down): 0 = vanilla. */
+int pc_room_gyroid_intercept(void* actor, int house) {
+    int guest, owner, a;
+    if (s_phase != RUI_CLOSED) {
+        return 1;
+    }
+    if (s_bypass_ms != 0) {
+        if (actor == s_gyroid_actor && (uint32_t)(rui_now() - s_bypass_ms) < 2000u) {
+            return 0; /* "Talk to the gyroid": the vanilla conversation starts now */
+        }
+        s_bypass_ms = 0;
+        g_pc_demo_force_talk_actor = NULL;
+    }
+    if (actor == NULL || house < 0 || house > 3 || !pc_net_game_room_on() || Now_Private == NULL) {
+        return 0;
+    }
+    guest = (int)Common_Get(player_no) >= PLAYER_NUM;
+    owner = !guest && mPr_NullCheckPersonalID(&Save_Get(homes[house]).ownerID) == FALSE &&
+            mPr_CheckCmpPersonalID(&Save_Get(homes[house]).ownerID, &Now_Private->player_ID) == TRUE;
+    if (!guest && !owner) {
+        return 0;
+    }
+    a = chkTrigger(BUTTON_A) || s_test_force_a;
+    if (s_test_force_a) {
+        static uint32_t diag_ms;
+        if (diag_ms == 0 || (uint32_t)(rui_now() - diag_ms) >= 1000u) {
+            diag_ms = rui_now() | 1u;
+            printf("[ROOM][UI][TEST-ONLY] gyroid of house %d: armed A; demo %d talk position %d (distance %.1f)\n", house, (int)mDemo_CheckDemo(),
+                   mDemo_PC_TalkPositionOk((ACTOR*)actor), (double)((ACTOR*)actor)->player_distance_xz);
+        }
+    }
+    if (!a || mMsg_Check_MainHide(mMsg_Get_base_window_p()) == FALSE || !mDemo_PC_TalkPositionOk((ACTOR*)actor)) { /* no message window open; the vanilla talk position */
+        return 0;
+    }
+    s_test_force_a = 0;
+    printf("[ROOM][UI] A at the gyroid of house %d (%s): the move-in menu\n", house, guest ? "a guest" : "its owner");
+    pc_room_ui_open(house, actor);
+    return s_phase != RUI_CLOSED;
+}
+
+#include "m_field_info.h"
+#include "m_house.h"
+int pc_room_music_box_house(void) {
+    if (Common_Get(player_no) >= PLAYER_NUM && mFI_GET_TYPE(mFI_GetFieldId()) == mFI_FIELD_PLAYER0_ROOM) {
+        return (int)mFI_GET_PLAYER_ROOM_NO(mFI_GetFieldId());
+    }
+    return mHS_get_arrange_idx(Common_Get(player_no));
+}
+
+void pc_room_gyroid_gone(void* actor) {
+    if (actor != NULL && actor == s_gyroid_actor) {
+        s_gyroid_actor = NULL;
+        s_bypass_ms = 0;
+    }
+    if (actor != NULL && actor == g_pc_demo_force_talk_actor) {
+        g_pc_demo_force_talk_actor = NULL;
+    }
 }

@@ -1145,6 +1145,16 @@ static void set_field_type() {
         house_owner_id = mFI_FIELD_PLAYER0_ROOM + mHS_get_arrange_idx(Common_Get(player_no));
     } else {
         house_owner_id = RSV_NO;
+#ifdef TARGET_PC
+        {
+            /* roommates (pc_room_ui.h): a GUEST that shares this player house edits it like its owner (furniture, dressers, music box, wallpaper / carpet); the host
+             * authorises the same commits (pc_net_game_roommates.c_inc) */
+            extern int pc_net_game_room_edit_room(int house);
+            if (mFI_GET_TYPE(field_id) == mFI_FIELD_PLAYER0_ROOM && pc_net_game_room_edit_room((int)mFI_GET_PLAYER_ROOM_NO(field_id))) {
+                house_owner_id = field_id;
+            }
+        }
+#endif
     }
 
     if (field_id == mFI_FIELD_FG) {

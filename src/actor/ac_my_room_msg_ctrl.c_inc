@@ -59,6 +59,12 @@ static int aMR_GetMusicCountInMusicBox(void) {
         u32* music_box = Save_Get(scene_no) == SCENE_COTTAGE_MY
                              ? Save_Get(island).cottage.music_box
                              : Save_Get(homes[mHS_get_arrange_idx(Common_Get(player_no))]).music_box;
+#ifdef TARGET_PC
+        /* roommates (pc_room_ui.c): a GUEST editing a shared house uses THAT house's music box (the arrangement says house 0 for player_no 4) */
+        if (Save_Get(scene_no) != SCENE_COTTAGE_MY) {
+            music_box = Save_Get(homes[pc_room_music_box_house()]).music_box;
+        }
+#endif
 
         if (((music_box[(i / 32) & 1] >> (i & 31)) & 1) == 1) {
             count++;
@@ -72,6 +78,12 @@ static void aMR_MemoryMusicBoxStatus(MY_ROOM_ACTOR* my_room) {
     u32* music_box = Save_Get(scene_no) == SCENE_COTTAGE_MY
                          ? Save_Get(island).cottage.music_box
                          : Save_Get(homes[mHS_get_arrange_idx(Common_Get(player_no))]).music_box;
+#ifdef TARGET_PC
+    /* roommates (pc_room_ui.c): a GUEST editing a shared house uses THAT house's music box (the arrangement says house 0 for player_no 4) */
+    if (Save_Get(scene_no) != SCENE_COTTAGE_MY) {
+        music_box = Save_Get(homes[pc_room_music_box_house()]).music_box;
+    }
+#endif
     int i;
 
     for (i = 0; i < 2; i++) {
@@ -980,6 +992,12 @@ static void aMR_DeleteDirectedMD(ACTOR* actorx) {
                 u32* music_box = Save_Get(scene_no) == SCENE_COTTAGE_MY
                                      ? Save_Get(island).cottage.music_box
                                      : Save_Get(homes[mHS_get_arrange_idx(Common_Get(player_no))]).music_box;
+#ifdef TARGET_PC
+                /* roommates (pc_room_ui.c): a GUEST editing a shared house uses THAT house's music box (the arrangement says house 0 for player_no 4) */
+                if (Save_Get(scene_no) != SCENE_COTTAGE_MY) {
+                    music_box = Save_Get(homes[pc_room_music_box_house()]).music_box;
+                }
+#endif
 
                 if (((music_box[(md_idx / 32) & 1] >> (md_idx & 31)) & 1) == 0) {
                     if (ftr_actor->switch_bit == TRUE) {

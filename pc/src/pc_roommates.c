@@ -24,8 +24,8 @@ const char* pc_room_result_text(int r) {
         case PC_ROOM_R_OK: return "Done";
         case PC_ROOM_R_BAD: return "That didn't work";
         case PC_ROOM_R_NOT_GYROID: return "Stand next to the gyroid";
-        case PC_ROOM_R_NOT_OWNER: return "That isn't your gyroid";
-        case PC_ROOM_R_NO_HOUSE: return "This gyroid has no house holder";
+        case PC_ROOM_R_NOT_OWNER: return "That isn't your house";
+        case PC_ROOM_R_NO_HOUSE: return "Nobody lives in this house yet";
         case PC_ROOM_R_PENDING_ELSEWHERE: return "You already asked someone else";
         case PC_ROOM_R_ROOMMATE_ELSEWHERE: return "You already live in another house";
         case PC_ROOM_R_ALREADY: return "Already done";
@@ -544,6 +544,121 @@ int pc_room_save(const char* path, const PCRoomTable* t) {
     return 1;
 }
 
+/* ---- the vanilla house gyroids (ACTOR_PROP_HANIWA0..3: the player-house acre, scene block (3,2); measured (2060,1500) (2420,1500) (2060,1780) (2420,1780)) ---- */
+const uint8_t pc_room_gyroid_ut[4][2] = { { 51, 37 }, { 60, 37 }, { 51, 44 }, { 60, 44 } };
+
+/* ---- the client's shared-house memory (save/mp/roommate_homes.ini) ---- */
+static int homes_same_town(const uint8_t* a, const uint8_t* b) {
+    return memcmp(a + 8, b + 8, 8) == 0 && a[18] == b[18] && a[19] == b[19]; /* land name + land id of the holder key */
+}
+
+int pc_room_homes_find(const PCRoomHomes* t, const uint8_t guest[PC_ROOM_KEY_LEN], int from) {
+    int i;
+    for (i = from < 0 ? 0 : from; i < t->n; i++) {
+        if (memcmp(t->e[i].guest, guest, PC_ROOM_KEY_LEN) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int pc_room_homes_set(PCRoomHomes* t, const uint8_t guest[PC_ROOM_KEY_LEN], const uint8_t holder[PC_ROOM_KEY_LEN], int house) {
+    int i;
+    for (i = 0; i < t->n; i++) {
+        if (memcmp(t->e[i].guest, guest, PC_ROOM_KEY_LEN) == 0 && homes_same_town(t->e[i].holder, holder)) {
+            if (house < 0) {
+                memmove(&t->e[i], &t->e[i + 1], (size_t)(t->n - i - 1) * sizeof(t->e[0]));
+                t->n--;
+                return 1;
+            }
+            if (t->e[i].house == (uint8_t)house && memcmp(t->e[i].holder, holder, PC_ROOM_KEY_LEN) == 0) {
+                return 0;
+            }
+            memcpy(t->e[i].holder, holder, PC_ROOM_KEY_LEN);
+            t->e[i].house = (uint8_t)house;
+            return 1;
+        }
+    }
+    if (house < 0 || house > 3) {
+        return 0;
+    }
+    if (t->n >= PC_ROOM_HOMES_MAX) {
+        memmove(&t->e[0], &t->e[1], (size_t)(t->n - 1) * sizeof(t->e[0])); /* the oldest line goes */
+        t->n--;
+    }
+    memcpy(t->e[t->n].guest, guest, PC_ROOM_KEY_LEN);
+    memcpy(t->e[t->n].holder, holder, PC_ROOM_KEY_LEN);
+    t->e[t->n].house = (uint8_t)house;
+    t->n++;
+    return 1;
+}
+
+int pc_room_homes_load(const char* path, PCRoomHomes* t) {
+    FILE* f;
+    char line[256];
+    memset(t, 0, sizeof(*t));
+    if (path == NULL || (f = fopen(path, "rb")) == NULL) {
+        return PC_ROOM_FILE_MISSING;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        const char* v = line;
+        PCRoomHome e;
+        uint32_t h;
+        while (*v == ' ' || *v == '\t') {
+            v++;
+        }
+        if (strncmp(v, "home", 4) != 0) {
+            continue;
+        }
+        v += 4;
+        while (*v == ' ' || *v == '\t' || *v == '=') {
+            v++;
+        }
+        memset(&e, 0, sizeof(e));
+        if (!room_hex_tok(&v, e.guest, PC_ROOM_KEY_LEN) || !room_hex_tok(&v, e.holder, PC_ROOM_KEY_LEN)) {
+            continue;
+        }
+        if (*v < '0' || *v > '3') {
+            continue;
+        }
+        h = (uint32_t)(*v - '0');
+        (void)pc_room_homes_set(t, e.guest, e.holder, (int)h);
+    }
+    fclose(f);
+    return PC_ROOM_FILE_OK;
+}
+
+int pc_room_homes_save(const char* path, const PCRoomHomes* t) {
+    char tmp[600];
+    FILE* f;
+    int i, ok = 1;
+    if (path == NULL || strlen(path) + 5 > sizeof(tmp)) {
+        return 0;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (f == NULL) {
+        return 0;
+    }
+    fprintf(f, "# roommate_homes.ini - the houses this PC's guests share (written by the game from the host's answer; a joining roommate starts at that door)\n");
+    fprintf(f, "# home = <guest key> <house holder key> <house 0..3>\nversion = 1\n");
+    for (i = 0; i < t->n; i++) {
+        char g[2 * PC_ROOM_KEY_LEN + 1], o[2 * PC_ROOM_KEY_LEN + 1];
+        room_hex(g, t->e[i].guest, PC_ROOM_KEY_LEN);
+        room_hex(o, t->e[i].holder, PC_ROOM_KEY_LEN);
+        if (fprintf(f, "home = %s %s %u\n", g, o, (unsigned)t->e[i].house) < 0) {
+            ok = 0;
+        }
+    }
+    ok = (fflush(f) == 0) && ok;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok || !room_move(tmp, path)) {
+        remove(tmp);
+        return 0;
+    }
+    return 1;
+}
+
 /* ---- message 104 ---- */
 int pc_room_msg_valid(const PCRoomMsg* m, int from_client) {
     int i;
@@ -553,12 +668,12 @@ int pc_room_msg_valid(const PCRoomMsg* m, int from_client) {
     if (from_client) {
         const int needs_one = m->op == PC_ROOM_OP_ACCEPT || m->op == PC_ROOM_OP_DENY || m->op == PC_ROOM_OP_REMOVE;
         static const uint8_t zero[sizeof(m->owner_name) + sizeof(m->owner_key)] = {0};
-        if (m->op < PC_ROOM_OP_QUERY || m->op > PC_ROOM_OP_CLIENT_MAX || m->result != 0 || m->role != 0 || m->house != 0 || m->aux != 0 ||
+        if (m->op < PC_ROOM_OP_QUERY || m->op > PC_ROOM_OP_CLIENT_MAX || m->result != 0 || m->role != 0 || m->house > 3 || m->aux != 0 ||
             m->count != (uint8_t)(needs_one ? 1 : 0) || memcmp(m->owner_name, zero, sizeof(m->owner_name)) != 0 || memcmp(m->owner_key, zero, sizeof(m->owner_key)) != 0) {
             return 0;
         }
-        if (m->ut_x < 16 || m->ut_x > 95 || m->ut_z < 16 || m->ut_z > 111 || m->item == 0) {
-            return 0;
+        if (m->ut_x != 0 || m->ut_z != 0 || m->item != 0) {
+            return 0; /* the gyroid is named by its house */
         }
         for (i = 0; i < PC_ROOM_MSG_ENTRIES; i++) {
             const PCRoomWireEntry* e = &m->e[i];
@@ -682,9 +797,7 @@ int pc_room_selftest(void) {
         memset(&m, 0, sizeof(m));
         m.msg_type = PC_ROOM_MSG_ID;
         m.op = PC_ROOM_OP_QUERY;
-        m.ut_x = 40;
-        m.ut_z = 50;
-        m.item = 0x15B0;
+        m.house = 2;
         room_ck(pc_room_msg_valid(&m, 1), "client QUERY valid");
         room_ck(!pc_room_msg_valid(&m, 0), "a client op is not a host message");
         m.count = 1;
@@ -695,9 +808,12 @@ int pc_room_selftest(void) {
         m.e[1].name[0] = 1;
         room_ck(!pc_room_msg_valid(&m, 1), "a used unused entry refused");
         m.e[1].name[0] = 0;
-        m.ut_x = 5;
-        room_ck(!pc_room_msg_valid(&m, 1), "a tile out of the town refused");
+        m.house = 4;
+        room_ck(!pc_room_msg_valid(&m, 1), "house 4 refused");
+        m.house = 1;
         m.ut_x = 40;
+        room_ck(!pc_room_msg_valid(&m, 1), "a tile from a client refused (the gyroid is named by its house)");
+        m.ut_x = 0;
         m.op = 9;
         room_ck(!pc_room_msg_valid(&m, 1), "unknown client op refused");
         memset(&m, 0, sizeof(m));
@@ -720,6 +836,24 @@ int pc_room_selftest(void) {
         m.role = 0;
         m.flags = 1;
         room_ck(!pc_room_msg_valid(&m, 0), "flags must be 0");
+    }
+    {
+        PCRoomHomes hs;
+        uint8_t other_town[PC_ROOM_KEY_LEN], same_town[PC_ROOM_KEY_LEN];
+        memset(&hs, 0, sizeof(hs));
+        memcpy(same_town, o1, PC_ROOM_KEY_LEN);
+        same_town[0] ^= 0x21; /* another resident (name) of the same town */
+        same_town[16] ^= 0x21;
+        memcpy(other_town, o1, PC_ROOM_KEY_LEN);
+        other_town[19] ^= 0x5A; /* another land id */
+        room_ck(pc_room_homes_set(&hs, g[0], o1, 2) == 1 && hs.n == 1 && hs.e[0].house == 2, "homes: set");
+        room_ck(pc_room_homes_set(&hs, g[0], o1, 2) == 0, "homes: the same again = no change");
+        room_ck(pc_room_homes_set(&hs, g[0], same_town, 3) == 1 && hs.n == 1 && hs.e[0].house == 3 && memcmp(hs.e[0].holder, same_town, 20) == 0, "homes: another holder of the SAME town replaces");
+        room_ck(pc_room_homes_set(&hs, g[0], other_town, 1) == 1 && hs.n == 2, "homes: another town is another line");
+        room_ck(pc_room_homes_find(&hs, g[0], 0) == 0 && pc_room_homes_find(&hs, g[0], 1) == 1 && pc_room_homes_find(&hs, g[1], 0) == -1, "homes: find");
+        room_ck(pc_room_homes_set(&hs, g[0], o1, -1) == 1 && hs.n == 1 && memcmp(hs.e[0].holder, other_town, 20) == 0, "homes: remove (by town)");
+        room_ck(pc_room_homes_set(&hs, g[0], o1, 7) == 0 && hs.n == 1, "homes: house 7 refused");
+        room_ck(pc_room_gyroid_ut[1][0] == 60 && pc_room_gyroid_ut[2][1] == 44, "the house gyroid table");
     }
     for (i = 0; i <= PC_ROOM_R_MAX; i++) {
         const char* s = pc_room_result_text(i);

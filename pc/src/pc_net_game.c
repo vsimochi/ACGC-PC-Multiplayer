@@ -630,6 +630,11 @@ static uint32_t pcnetgame_room_caps_bit(void);
 static void     pcnetgame_room_client_caps(uint32_t total);
 static int      pcnetgame_room_peer_house(PCNetPeerId peer);
 static int      pcnetgame_room_peer_is_roommate(PCNetPeerId peer);
+static int      pcnetgame_room_peer_commit_house(PCNetPeerId peer); /* the shared house a roommate may still COMMIT (incl. the demotion grace), -1 none */
+static int      pcnetgame_room_house_shared(int h);                 /* 1 = house h has at least one roommate (its dresser records are shared) */
+static int      pcnetgame_room_client_edit_house(void);             /* client: the house this GUEST may edit as a roommate (incl. the demotion freeze), -1 none */
+static int      pcnetgame_room_client_room_unconfirmed(void);       /* client: a guest in a PLAYER_ROOM-typed room whose rights are not (or no longer) confirmed */
+static int      pcnetgame_client_is_guest_player(void);            /* (defined with the guest client code) */
 static void     pcnetgame_handle_host_roommate(PCNetPeerId peer, const uint8_t* data, uint16_t size);
 static void     pcnetgame_handle_client_roommate(const uint8_t* data, uint16_t size);
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN2 == (int)PC_OFURN_MSG2_ID, "OUTDOOR_FURN2 id drifted (pc_outdoor_furniture.h)");
@@ -15233,6 +15238,14 @@ static int pcnetgame_mbox_house_of(const PersonalID_c* pid) {
     return -1;
 }
 
+/* ROOMMATES: the house a bound record slot may EDIT: a resident its own house, a guest the house it shares as a roommate (pc_net_game_roommates.c_inc); -1 = none */
+static int pcnetgame_edit_house_of(PCNetPeerId peer, int idx) {
+    if (idx >= 0 && idx < PLAYER_NUM) {
+        return pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
+    }
+    return idx >= PLAYER_NUM ? pcnetgame_room_peer_house(peer) : -1;
+}
+
 /* ---- D3-0 (c): the single ownership table over the canonical BE image (== native byte offsets: pc_save_bswap swaps
  * each field in place, so a field sits at the same offset in both images). Verified against include/m_private.h. ----
  * IMMUTABLE: player_ID 0x0000 (0x14 B), exists 0x1086 (1 B): must equal the host value or the upload is INVALID_FIELD.
@@ -16915,9 +16928,12 @@ static void pcnetgame_house_reject(PCNetPeerId peer, int idx, int h, uint8_t sta
         printf("[NET][HOUSE] host: peer %d OWNER_COMMIT xfer %u house %d REJECTED %s (detail 0x%04X)\n", (int)peer, (unsigned)xfer, h, pcnetgame_house_status_name(status),
                (unsigned)detail);
     }
-    if (status != (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY && status != (uint8_t)PC_NETGAME_HOUSE_ACK_RATE_LIMITED && status != (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER &&
-        h >= 0 && h < PC_NETGAME_HOUSE_NUM && slot != NULL) {
-        st->hsent_seq[h] = 0;
+    if (status != (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY && status != (uint8_t)PC_NETGAME_HOUSE_ACK_RATE_LIMITED &&
+        (status != (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER || idx >= PLAYER_NUM) && /* roommates: a demoted roommate's late commit is rolled back */
+        ((h >= 0 && h < PC_NETGAME_HOUSE_NUM) || idx >= PLAYER_NUM) && slot != NULL) {
+        if (h >= 0 && h < PC_NETGAME_HOUSE_NUM) {
+            st->hsent_seq[h] = 0;
+        }
         st->rec_last_stale_push_ms = 0;
         pcnetgame_rec_stale_push(peer, idx, slot, pcnetgame_now_ms());
     }
@@ -16953,11 +16969,13 @@ static void pcnetgame_house_process_commit(PCNetPeerId peer) {
     if (idx < 0) {
         return;
     }
-    if (idx >= PLAYER_NUM) { /* a guest owns no house: refused BEFORE any homes[] index is formed */
-        pcnetgame_house_reject(peer, -1, -1, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, xfer);
+    if (idx >= PLAYER_NUM && pcnetgame_room_peer_commit_house(peer) < 0) {
+        /* a guest owns no house: refused BEFORE any homes[] index is formed. Roommates: a guest that no longer shares the house it commits gets the host's record
+         * pushed back (its uncommitted in-room pickups / placements are rolled back, never duplicated or lost) */
+        pcnetgame_house_reject(peer, idx, -1, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, xfer);
         return;
     }
-    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
+    h = idx < PLAYER_NUM ? pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID) : pcnetgame_room_peer_commit_house(peer); /* roommates: the shared house */
     if (h < 0) {
         pcnetgame_house_reject(peer, idx, -1, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, xfer);
         return;
@@ -17065,7 +17083,7 @@ static void pcnetgame_house_process_commit(PCNetPeerId peer) {
     memset(s_hs_cnt_old, 0, sizeof(s_hs_cnt_old));
     memset(s_hs_cnt_new, 0, sizeof(s_hs_cnt_new));
     pcnetgame_house_count_image(s_hs_cnt_old, cur);
-    pcnetgame_house_count_record(s_hs_cnt_old, &Save_Get(private_data)[idx]);
+    pcnetgame_house_count_record(s_hs_cnt_old, pcnetgame_rec_priv_ptr(idx)); /* roommates: a guest committer's record is its guest mirror */
     pcnetgame_house_count_image(s_hs_cnt_new, nimg);
     pcnetgame_house_count_record(s_hs_cnt_new, &s_rec_scratch_b);
     if (!pcnetgame_house_conserved(s_hs_cnt_old, s_hs_cnt_new, diff, &ndiff)) {
@@ -17132,12 +17150,14 @@ static void pcnetgame_house_handle_begin(PCNetPeerId peer, const PCNetGameHouseB
     st->hup_got_mask = 0;
     st->hup_refused_valid = 0;
     st->hup_last_xfer = in->xfer_id;
-    if (idx >= PLAYER_NUM) { /* a guest: refused before any homes[] index exists */
+    if (idx >= PLAYER_NUM && pcnetgame_room_peer_commit_house(peer) < 0) { /* a guest: refused before any homes[] index exists (roommates: unless it shares a house) */
         pcnetgame_house_refuse_xfer(st, in->xfer_id);
-        pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, in->xfer_id, 0, 0, 0);
+        /* roommates: through the reject path, so a demoted roommate's late commit is rolled back (the host's record pushed back: its pockets never keep an item the
+         * house still has) */
+        pcnetgame_house_reject(peer, idx, -1, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, in->xfer_id);
         return;
     }
-    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
+    h = idx < PLAYER_NUM ? pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID) : pcnetgame_room_peer_commit_house(peer);
     if (h < 0) {
         pcnetgame_house_refuse_xfer(st, in->xfer_id);
         pcnetgame_house_send_ack(peer, (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER, 0, in->xfer_id, 0, 0, 0);
@@ -17663,7 +17683,7 @@ static void pcnetgame_house_pump_push(PCNetPeerId peer) {
             int h;
             for (h = 0; h < PC_NETGAME_HOUSE_NUM; h++) {
                 if (s_hh[h].valid && pcnetgame_house_owned(h) && st->hsent_seq[h] != s_hh[h].seq &&
-                    (st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST || pcnetgame_room_peer_house(peer) == h)) { /* a roommate guest: its shared house only */
+                    (st->bound_class != (uint8_t)PC_NETGAME_REC_CLASS_GUEST || pcnetgame_room_peer_commit_house(peer) == h)) { /* a roommate guest: its shared house only */
                     break;
                 }
             }
@@ -17750,7 +17770,7 @@ static void pcnetgame_house_host_tick(void) {
     for (p = 0; p < pcnetgame_peer_span(); p++) {
         PCNetGameHostPeerState* st = &s_host_peer[p];
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !st->bound_valid ||
-            (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && !pcnetgame_room_peer_is_roommate((PCNetPeerId)p))) {
+            (st->bound_class == (uint8_t)PC_NETGAME_REC_CLASS_GUEST && pcnetgame_room_peer_commit_house((PCNetPeerId)p) < 0)) {
             continue; /* a guest never sees (or edits) a house -- except a ROOMMATE: it SEES its shared house (pushes of that house only, never an upload) */
         }
         if (st->hup_open && (uint32_t)(now - st->hup_started_ms) >= PC_NETGAME_HOUSE_UPLOAD_TIMEOUT_MS) {
@@ -22787,7 +22807,7 @@ static uint32_t pcnetgame_dresser_pocket_dig(const uint16_t* pockets, uint32_t c
 static uint32_t pcnetgame_dresser_pocket_dig_k(int idx, const uint8_t key[PC_DRESSER_KEY_LEN], const uint16_t* pockets, uint32_t conds, uint32_t wallet) {
     uint32_t h = pcnetgame_dresser_pocket_dig(pockets, conds, wallet);
     const Private_c* p = pcnetgame_rec_priv_ptr(idx);
-    if (key != NULL && pc_dresser_key_is_outdoor(key) && p != NULL) {
+    if (key != NULL && (pc_dresser_key_is_outdoor(key) || idx >= PLAYER_NUM) && p != NULL) { /* roommates: a guest's house-dresser digests are salted too */
         h = pcnetgame_fnv1a32_update(h, &p->player_ID, sizeof(p->player_ID));
     }
     return h;
@@ -22842,8 +22862,8 @@ static void pcnetgame_dresser_roll_forward(int idx, PCNetGameRecSlot* slot, cons
     int i;
     /* v2: checked for each selected dresser, but ONLY while no transaction of this resident has been processed in this host process (a later pocket change could
      * make the mirror match an old pre-image by coincidence: never roll forward then) */
-    if (idx < 0 || idx >= pcnetgame_rec_slots() || (idx >= PLAYER_NUM && !pc_dresser_key_is_outdoor(key)) || s_txn_res[idx].nonce != 0u) {
-        return; /* C3b: a guest slot only for an outdoor record (a guest has no house) */
+    if (idx < 0 || idx >= pcnetgame_rec_slots() || s_txn_res[idx].nonce != 0u) {
+        return; /* C3b: a guest slot for an outdoor record; roommates: also for a dresser of the shared house (salted digests: never another identity's entry) */
     }
     j = pc_dresser_store_last_applied(&s_dresser, key);
     r = pc_dresser_store_find(&s_dresser, key);
@@ -22928,8 +22948,9 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
         pcnetgame_txn_reject(peer, idx, slot, in, 0, (uint8_t)PC_NETGAME_TXN_REASON_DRESSER_DISABLED, 0, NULL, "dresser storage is off on this host");
         return;
     }
-    if (idx >= PLAYER_NUM && !(peer < PC_NETGAME_WIRE_ID_SPACE && s_dresser_sel[peer].valid && s_dresser_sel[peer].floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR &&
-                               s_dresser_sel[peer]._r == (uint8_t)(idx + 1))) {
+    if (idx >= PLAYER_NUM && !(peer < PC_NETGAME_WIRE_ID_SPACE && s_dresser_sel[peer].valid && s_dresser_sel[peer]._r == (uint8_t)(idx + 1) &&
+                               (s_dresser_sel[peer].floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR || /* roommates: a dresser of the shared house */
+                                ((int)s_dresser_sel[peer].house == pcnetgame_room_peer_house(peer) && s_dresser_sel[peer].house < (uint8_t)PLAYER_NUM)))) {
         /* C3b: a guest uses only the shared OUTDOOR storage (its own current outdoor selection; re-checked below like a resident's); never a house dresser */
         pcnetgame_txn_reject_guest_no_house(peer, idx, slot, in, "dresser storage: a guest has no house (and no outdoor storage selected)");
         return;
@@ -22965,8 +22986,8 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
             have_sel = sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) &&
                        pcnetgame_ofurn_storage_select_ok(peer, (int)sel->ut_x, (int)sel->ut_z, sel->ftr_base, &why);
         } else {
-            have_sel = idx < PLAYER_NUM && sel->valid && sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) && /* never a guest (above) */
-                       (int)sel->house == pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID) &&
+            have_sel = sel->valid && sel->gen == t->flags && sel->ftr_base != 0u && sel->_r == (uint8_t)(idx + 1) && sel->house < (uint8_t)PLAYER_NUM &&
+                       (int)sel->house == pcnetgame_edit_house_of(peer, idx) && /* roommates: a guest's shared house */
                        pcnetgame_dresser_cell_ftr((int)sel->house, sel->floor, sel->layer, sel->ut_x, sel->ut_z) == sel->ftr_base;
         }
         if (have_sel) {
@@ -23009,7 +23030,7 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
         }
     }
     if (have_sel ? pc_dresser_store_peek(&s_dresser, key, &dt, &res)
-                 : ((idx < PLAYER_NUM && pcnetgame_dresser_peek_owner(pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID), &dt, &res)) ||
+                 : ((pcnetgame_edit_house_of(peer, idx) >= 0 && pcnetgame_dresser_peek_owner(pcnetgame_edit_house_of(peer, idx), &dt, &res)) ||
                     pcnetgame_dresser_peek_town(&dt, &res))) { /* C3b: a guest has no house: the town prefix only */
         /* journalled in the sidecar (a retry across a host restart, or after the in-memory ring evicted it): answered, never executed again. Without a current
          * selection (a retry right after a host restart) every dresser of the requester's house is searched. */
@@ -23070,7 +23091,7 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
     }
     /* ownership: only the OWNER's dresser (vanilla aMR_CheckRoomOwner); a player room announces house_owner_name = the homes[] index. The island cottage is not offered. */
     if (sc.scene_id == (uint8_t)SCENE_COTTAGE_MY || sc.owner >= (uint16_t)PLAYER_NUM ||
-        mPr_CheckCmpPersonalID(&Save_Get(homes[sc.owner]).ownerID, &st->bound_pid) != TRUE) {
+        (mPr_CheckCmpPersonalID(&Save_Get(homes[sc.owner]).ownerID, &st->bound_pid) != TRUE && pcnetgame_room_peer_house(peer) != (int)sc.owner)) { /* roommates */
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_PRECOND, 1, NULL, "dresser storage: the requester is not in its OWN house");
         return;
     }
@@ -23117,7 +23138,9 @@ static void pcnetgame_handle_host_dresser_txn(PCNetPeerId peer, const PCNetGameT
         memset(&snap, 0, sizeof(snap));
         memcpy(snap.key, key, sizeof(snap.key));
     }
-    if (!(outdoor ? pc_dresser_store_apply_shared(&s_dresser, key, &dt, &res) : pc_dresser_store_apply(&s_dresser, key, &dt, &res))) { /* C3: a shared outdoor record */
+    /* C3: a shared outdoor record; roommates: the dressers of a house with a roommate are shared too (holder and roommates fence per identity, s_txn_res) */
+    if (!((outdoor || pcnetgame_room_house_shared((int)s_dresser_sel[peer].house)) ? pc_dresser_store_apply_shared(&s_dresser, key, &dt, &res)
+                                                                                     : pc_dresser_store_apply(&s_dresser, key, &dt, &res))) {
         pcnetgame_txn_reject(peer, idx, slot, in, hash, (uint8_t)PC_NETGAME_TXN_REASON_FAULT, 1, NULL, "dresser store full / fault");
         return;
     }
@@ -23593,8 +23616,9 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
         return; /* feature off: behave exactly like an old host */
     }
     idx = pcnetgame_rec_gate(peer, 0, 0);
-    if (idx < 0 || (idx >= PLAYER_NUM && q->floor != (uint8_t)PC_NETGAME_DRESSER_PROBE && q->floor != (uint8_t)PC_DRESSER_OUTDOOR_FLOOR)) {
-        return; /* C3b: a guest may probe and select OUTDOOR storage only (it has no house) */
+    if (idx < 0 || (idx >= PLAYER_NUM && q->floor != (uint8_t)PC_NETGAME_DRESSER_PROBE && q->floor != (uint8_t)PC_DRESSER_OUTDOOR_FLOOR &&
+                    pcnetgame_room_peer_house(peer) < 0)) {
+        return; /* C3b: a guest may probe and select OUTDOOR storage only (it has no house) -- roommates: and the dressers of the house it shares */
     }
     sel = &s_dresser_sel[peer];
     if (q->floor == (uint8_t)PC_NETGAME_DRESSER_PROBE) {
@@ -23605,9 +23629,13 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
         s_dresser_query_ms[peer] = now | 1u;
         if (idx >= PLAYER_NUM) {
             /* C3b: a GUEST's probe is answered when the host offers OUTDOOR storage (the client needs the answer before it may select); no house: no migration,
-             * no house info */
-            if (pcnetgame_ofurn_c3_flags() != 0u) {
+             * no house info. Roommates: a guest sharing a house is answered too, with that house's info (no v1 migration: that is the holder's) */
+            const int rh = pcnetgame_room_peer_house(peer);
+            if (pcnetgame_ofurn_c3_flags() != 0u || rh >= 0) {
                 pcnetgame_dresser_send_state(peer, NULL);
+            }
+            if (rh >= 0) {
+                pcnetgame_dresser_send_info(peer, rh);
             }
             return;
         }
@@ -23659,7 +23687,7 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
         pcnetgame_dresser_send_state(peer, sel->key);
         return;
     }
-    h = pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID);
+    h = pcnetgame_edit_house_of(peer, idx); /* roommates: a guest's shared house (the store stays keyed by the HOLDER's house: one store for both) */
     if (h < 0 || q->gen == 0 || base == 0u || pcnetgame_dresser_cell_ftr(h, q->floor, q->layer, q->ut_x, q->ut_z) != base) {
         printf("[NET][DRESSER] host: peer %d resident %d DRESSER_SELECT refused (house %d floor %u layer %u cell %u,%u item 0x%04X gen %u): not a furniture of that id in its own house\n",
                (int)peer, idx, h, (unsigned)q->floor, (unsigned)q->layer, (unsigned)q->ut_x, (unsigned)q->ut_z, (unsigned)q->ftr_item, (unsigned)q->gen);
@@ -23676,9 +23704,13 @@ static void pcnetgame_handle_host_dresser_query(PCNetPeerId peer, const PCNetGam
     sel->ut_z = q->ut_z;
     sel->ftr_base = base;
     pc_dresser_key_make(sel->key, owner8, q->floor, q->layer, q->ut_x, q->ut_z, base);
-    pcnetgame_dresser_migrate_resident(idx, h);
+    if (idx < PLAYER_NUM) {
+        pcnetgame_dresser_migrate_resident(idx, h); /* the holder's own v1 pool / overflow: never a roommate's */
+    }
     pcnetgame_dresser_roll_forward(idx, pcnetgame_rec_slot(idx), sel->key);
-    (void)pcnetgame_dresser_claim_overflow(idx, sel->key);
+    if (idx < PLAYER_NUM) {
+        (void)pcnetgame_dresser_claim_overflow(idx, sel->key);
+    }
     printf("[NET][DRESSER] host: peer %d resident %d selected dresser house %d floor %u layer %u cell %u,%u ftr 0x%04X (gen %u, %d item(s))\n", (int)peer, idx, h, (unsigned)q->floor,
            (unsigned)q->layer, (unsigned)q->ut_x, (unsigned)q->ut_z, (unsigned)base, (unsigned)q->gen, pc_dresser_store_used(pc_dresser_store_find(&s_dresser, sel->key)));
     pcnetgame_dresser_send_state(peer, sel->key);
@@ -27570,8 +27602,11 @@ static int pcnetgame_hcl_active(void) {
 
 /* The homes[] index of this client's own house, -1 = none (a guest, a resident without a house, no save loaded). */
 static int pcnetgame_hcl_own_house(void) {
-    if (Now_Private == NULL || s_client_guest_claim_sent) {
+    if (Now_Private == NULL) {
         return -1;
+    }
+    if (s_client_guest_claim_sent) {
+        return pcnetgame_room_client_edit_house(); /* roommates: a guest edits the house it shares exactly like its owner (the host authorises the same) */
     }
     return pcnetgame_mbox_house_of(&Now_Private->player_ID);
 }
@@ -28651,6 +28686,16 @@ static void pcnetgame_hcl_handle_ack(const PCNetGameHouseAckMsg* a) {
             s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_RATE_MS;
             return;
         case PC_NETGAME_HOUSE_ACK_NOT_OWNER:
+            if (pcnetgame_client_is_guest_player()) {
+                /* roommates: the guest no longer shares this house: like any refusal, house + pockets are rolled back by the host's pushes (sync stays ON: a guest must
+                 * never edit or upload without it) */
+                s_hcl.rollback = 1;
+                s_hcl.room_stopped = 1;
+                s_hcl.retry_not_before_ms = now + PC_NETGAME_HCL_RETRY_REJECT_MS;
+                printf("[NET][HOUSE] client: OWNER_COMMIT xfer %u NOT_OWNER (no longer a roommate of house %d): house + pockets are rolled back by the host's pushes\n",
+                       (unsigned)a->xfer_id, h);
+                return;
+            }
             s_hcl.disabled = 1;
             printf("[NET][HOUSE] client: *** the host answered NOT_OWNER: furniture sync is DISABLED for this session (the host does not treat this player as the owner of house %d) ***\n", h);
             return;
@@ -29175,6 +29220,19 @@ static void pcnetgame_house_client_tick(void) {
         }
     }
     h = pcnetgame_hcl_own_house();
+    {
+        static int s_prev_own = -2;
+        if (h != s_prev_own) {
+            if (s_prev_own != -2 && h >= 0 && pcnetgame_client_is_guest_player()) {
+                /* roommates: the house became this guest's in the middle of the session: the push of it may already be here (received as a visitor) */
+                s_hcl.since_ms = now;
+                s_hcl.known = s_hcl.last_valid[h];
+                s_hcl.room_base_valid = 0;
+                printf("[NET][HOUSE] client: house %d is now this guest's to edit (roommate): push %s\n", h, s_hcl.known ? "already received" : "awaited");
+            }
+            s_prev_own = h;
+        }
+    }
     if (h >= 0) {
         s_hcl.last_own_unsafe = pcnetgame_local_house_unsafe(h);
         if (!s_hcl.known && (uint32_t)(now - s_hcl.since_ms) >= 20000u) {
@@ -40531,6 +40589,9 @@ int pc_net_game_client_own_room_local(void) {
 }
 
 int pc_net_game_client_room_edit_locked(void) {
+    if (pcnetgame_room_client_room_unconfirmed()) {
+        return 1; /* roommates: a guest whose rights over this room are not confirmed (yet / any more): no edit may happen locally */
+    }
     if (s_role != PC_NETGAME_ROLE_CLIENT || !s_hcp.sync_last || !pc_net_game_client_own_room_local()) {
         return 0;
     }
@@ -40538,7 +40599,9 @@ int pc_net_game_client_room_edit_locked(void) {
         return 1;
     }
     if (s_hcl.disabled) {
-        return 0; /* no usable CANON_PUSH within 20 s: this session fell back to the pre-furniture-sync behaviour (the taint, if any, is handled above) */
+        /* no usable CANON_PUSH within 20 s: this session fell back to the pre-furniture-sync behaviour (the taint, if any, is handled above). Roommates: a GUEST never
+         * edits without the sync (its edits would never reach the host) */
+        return pcnetgame_client_is_guest_player();
     }
     return !s_hcl.known || s_crec.state != PC_NETGAME_CRS_SYNCED;
 }

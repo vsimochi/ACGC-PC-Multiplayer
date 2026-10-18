@@ -1122,7 +1122,7 @@ static void pc_ded_cmd_help(void) {
            "  shop-upgrade   the announced shop upgrade: state (IDLE / PENDING / CLOSED / RENEWING), level, qualifying level, time left\n"
            "  ops | op <player> | deop <player>   the operator list (servers/<id>/ops.ini; player = an online name / a resident / a guest of this town, or `peer N`; ambiguous names are refused)\n"
            "  furniture list [acre] | remove <x> <z>|#<index> [delete] | clear acre <n>|player <name> [delete]   furniture PLACED outdoors (removed pieces go to the lost and found unless `delete`)\n"
-           "  roommates [list] | remove <guest> confirm | clear <guest> confirm | owner <x> <z> <resident>   guests sharing a resident's house (servers/<id>/roommates.ini)\n"
+           "  roommates [list] | remove <guest> confirm | clear <guest> confirm   guests sharing a resident's house (servers/<id>/roommates.ini)\n"
            "  say <text>   a server announcement in every player's chat log (up to 60 characters)\n"
            "  mutes | mute <player> | unmute <player>   the chat mute list (servers/<id>/mutes.ini; player = an online name / a resident / a guest of this town, or `peer N`)\n"
            "  chat [on|off]   the text chat: status / switch it for this session (settings.ini [Network] chat sets the start value); every line is logged as [CHAT] name: text\n"

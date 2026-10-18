@@ -184,15 +184,6 @@ static int aMHS_check_player_sub(STRUCTURE_ACTOR* my_house, GAME_PLAY* play) {
             if (Common_Get(reset_flag)) {
                 Common_Set(reset_type, 1);
             } else {
-#ifdef TARGET_PC
-                /* roommates (pc_room_ui.h): on a host with roommates a GUEST goes only into the house it shares; every other door stays shut (a notice says why) */
-                extern int pc_net_game_room_house_entry(int house);
-                extern void pc_net_game_room_door_refused(void);
-                if (pc_net_game_room_house_entry(my_house->action & 3) < 0) {
-                    pc_net_game_room_door_refused();
-                    return FALSE;
-                }
-#endif
                 res = TRUE;
             }
         }

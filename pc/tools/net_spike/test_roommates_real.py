@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """test_roommates_real.py - ROOMMATES / MOVE-IN with a REAL guest client: REAL listen host + REAL `--guest` client game process + a scripted resident (FakeClient A).
 
-TIER: REAL HOST + REAL GUEST CLIENT (Samsung display, volume 1). The gyroid is seeded next to the guest by the host (AC_TEST_OFURN_SEED=0x15B0 + _SEED_NEAR); the guest
-presses A at it through the REAL wait-state seam (TEST-ONLY AC_TEST_ROOM_GYROID: the player is put south of it facing it) and the REAL gyroid menu is driven by
-AC_TEST_ROOM_UI (row picks like a player: "Ask to move in", then "Yes"). Resident A (scripted) holds the gyroid (it claims it at its first QUERY) and decides.
+TIER: REAL HOST + REAL GUEST CLIENT (Samsung display, volume 1). The gyroid is the one that COMES WITH resident A's house (house 1: the vanilla save gyroid beside the
+door). The guest is put in front of it (TEST-ONLY AC_TEST_ROOM_GYROID=1) and the gyroid's REAL talk seam (ac_haniwa_move.c_inc -> pc_room_gyroid_intercept, the vanilla
+talk-position test) opens the REAL menu, driven by AC_TEST_ROOM_UI ("Ask to move in", "Yes"). Resident A (scripted) holds house 1 and decides.
 Disposable fixture pc\\build64\\bin_fixture4_room_real (a fresh copy of bin_fixture4 + the pc\\build64_w3 exe). Ports 41800-41899.
-  U1 the host seeded the gyroid next to the guest; A claimed it (QUERY = OWNER)
-  U2 the guest's A opened the move-in menu (the host answered its QUERY: role CAN_REQUEST), the scripted picks asked, the host stored the REQUEST
-  U3 A accepts: the real client logged STATUS roommate of A's house, the "accepted" notice and received house pushes of that house
-  U4 the guest walked into the shared house (TEST-ONLY warp through goto_other_scene; the door rule says "lives here" = 1) and got "Welcome home"
-  U5 A removes the guest: the real client got STATUS "not a roommate" and was SHOWN OUT of the house (back in the town)
-  U6 host and guest alive
-NOT asserted: what the menu / notices look like on screen (no image comparison), the real door walk (the warp replaces it), the knock skip (source audited).
+  U1 A at its house's gyroid -> OWNER
+  U2 the guest's A at the house gyroid opened the move-in menu (INFO role CAN_REQUEST) and asked: the host stored the REQUEST
+  U3 A accepts: the real client's STATUS roommate of house 1, the notice, save/mp/roommate_homes.ini remembers the house
+  U4 the ROOMMATE edits the shared house through the REAL client commit pipeline (TEST-ONLY AC_TEST_HOUSE_CLIENT_SWAP: a furniture move in the local save of house 1, committed
+     by the client's own house sync as its 'own' house): the host APPLIED an OWNER_COMMIT of house 1 for the GUEST record
+  U5 the guest process is restarted: it ARRIVES AT THE DOOR of house 1 (no train / station), STATUS roommate again
+  U6 it walks into house 1 (TEST-ONLY warp): its own room (field_type PLAYER_ROOM: editable), in-room commits armed
+  U7 A removes it: STATUS 'not a roommate', the room is frozen (locked), it is SHOWN OUT, the freeze ends once its last commit settled
+  U8 host and guest alive
+NOT asserted: what the menu / notices look like on screen, the real door walk (the warp replaces it), hand edits inside the room (the vanilla editing gates are source audited).
 """
 import argparse
 import os
 import re
 import shutil
-import struct
 import sys
 import time
 
@@ -31,8 +33,7 @@ import town_test_support as T  # noqa: E402
 FIXTURE = "bin_fixture4_room_real"
 W3_EXE = os.path.join(T.PC, "build64_w3", "bin", "AnimalCrossing.exe")
 os.environ["NET_SPIKE_GAME_BIN"] = os.path.join(T.BUILD64, FIXTURE)
-GYROID = 0x15B0
-ENV_KEYS = ("AC_TEST_OFURN_SEED", "AC_TEST_OFURN_SEED_NEAR", "AC_TEST_ROOM_GYROID", "AC_TEST_ROOM_GYROID_REPEAT", "AC_TEST_ROOM_UI", "AC_TEST_ROOM_ENTER")
+ENV_KEYS = ("AC_TEST_GYROID_DIAG", "AC_TEST_ROOM_GYROID", "AC_TEST_ROOM_GYROID_REPEAT", "AC_TEST_ROOM_UI", "AC_TEST_ROOM_ENTER", "AC_TEST_HOUSE_CLIENT_SWAP")
 STARTED = []
 
 
@@ -59,25 +60,18 @@ def main():
     a = None
     try:
         residents = [i for i, _p, ex in L.read_test_save_residents() if ex and i != L.TEST_HOST_RESIDENT]
-        ini = os.path.join(save_dir, "mp", "guest.ini")
-        os.makedirs(os.path.dirname(ini), exist_ok=True)
-        os.environ["AC_TEST_OFURN_SEED"] = "0x%04X,0" % GYROID
-        os.environ["AC_TEST_OFURN_SEED_NEAR"] = "1"
-        host = rig.start_host("room_real", args.port, [])
+        house = residents[0]  # house i belongs to resident i in this fixture
+        host = rig.start_host("room_real", args.port, ["--house-sync"])
         check("host reached genuine field-ready state", host is not None)
         if host is None:
             return L.summary_and_exit_code(results)
         STARTED.append(host)
+        ini = os.path.join(save_dir, "mp", "guest.ini")
+        os.makedirs(os.path.dirname(ini), exist_ok=True)
         with open(ini, "wb") as f:  # (after start_host: it restores the save snapshot)
             f.write(b"# test profile\nname = Mover\ngender = 1\nface = 3\nhome_town = Farvale\nplayer_id = 0x4D31\nland_id = 24117\n")
+        homes = os.path.join(L.GAME_BIN_DIR, "save", "mp", "roommate_homes.ini")
         L.resolve_host_town("127.0.0.1", args.port)
-        os.environ["AC_TEST_ROOM_GYROID"] = "1"
-        os.environ["AC_TEST_ROOM_GYROID_REPEAT"] = "1"
-        os.environ["AC_TEST_ROOM_UI"] = "ask,yes"
-        os.environ["AC_TEST_ROOM_ENTER"] = "1"
-        g = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--guest"], log_path=os.path.join(HERE, "room_real_guest.log"), bin_dir=L.GAME_BIN_DIR,
-                            label="roomG").start()
-        STARTED.append(g)
 
         def pump_until(fn, timeout):
             end = time.time() + timeout
@@ -88,49 +82,70 @@ def main():
                 L.pump_sleep(0.3) if a is not None else time.sleep(0.3)
             return fn()
 
-        m = pump_until(lambda: re.search(r"seeded placed piece at \((\d+),(\d+)\) item 0x%04X rot 0 -> placed \(next to peer (\d+)" % GYROID, host.log_text()), 300.0)
-        check("U1 the host seeded the gyroid next to the real guest", m is not None)
-        if m is None:
-            return L.summary_and_exit_code(results)
-        ux, uz = int(m.group(1)), int(m.group(2))
-        a = L.FakeClient("A", "127.0.0.1", args.port, player=L.resident_player(residents[0]))
-        a.rec_resident_idx = residents[0]
+        a = L.FakeClient("A", "127.0.0.1", args.port, player=L.resident_player(house))
+        a.rec_resident_idx = house
         a.connect_and_ready(quiet=True)
-        OF.stand_south_of(a, ux - 1, uz)
-        r = RP.ask(a, RP.QUERY, ux, uz)
-        check("U1 resident A claimed the gyroid (QUERY -> OWNER, house %s)" % (r and r["house"]), r is not None and r["op"] == RP.INFO and r["role"] == RP.ROLE_OWNER)
-        house = r["house"] if r else None
-        req = pump_until(lambda: re.search(r"\[NET\]\[ROOM\] host: peer \d+ \"[^\"]*\" REQUEST: guest \"Mover", host.log_text()), 240.0)
+        RP.at_gyroid(OF, a, house)
+        r = RP.ask(a, RP.QUERY, house)
+        check("U1 resident A at its house's gyroid -> OWNER (house %d)" % house, r is not None and r["op"] == RP.INFO and r["role"] == RP.ROLE_OWNER)
+
+        os.environ["AC_TEST_ROOM_GYROID"] = str(house)
+        os.environ["AC_TEST_GYROID_DIAG"] = "1"
+        os.environ["AC_TEST_ROOM_GYROID_REPEAT"] = "1"
+        os.environ["AC_TEST_ROOM_UI"] = "ask,yes"
+        os.environ["AC_TEST_HOUSE_CLIENT_SWAP"] = "0,17,18"
+        g = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--guest"], log_path=os.path.join(HERE, "room_real_guest.log"), bin_dir=L.GAME_BIN_DIR,
+                            label="roomG").start()
+        STARTED.append(g)
+        req = pump_until(lambda: re.search(r"\[NET\]\[ROOM\] host: peer \d+ \"Mover\" REQUEST: guest \"Mover", host.log_text()), 300.0)
         gt = g.log_text()
-        check("U2 the guest's A at the gyroid opened the move-in menu (role CAN_REQUEST) and the scripted picks asked: the host stored the REQUEST",
-              req is not None and re.search(r"\[ROOM\]\[UI\] INFO role 2 ", gt) is not None and "[ROOM][UI][TEST-ONLY] pick 2 'yes'" in gt)
+        check("U2 the guest's A at the house gyroid opened the move-in menu (role CAN_REQUEST) and asked: the host stored the REQUEST",
+              req is not None and "[ROOM][UI] A at the gyroid of house %d (a guest)" % house in gt and re.search(r"\[ROOM\]\[UI\] INFO role 2 ", gt) and "pick 2 'yes'" in gt)
         k = None
-        r = RP.ask(a, RP.QUERY, ux, uz)
+        RP.at_gyroid(OF, a, house)
+        r = RP.ask(a, RP.QUERY, house)
         for e in (r["e"] if r else []):
             if e[0] == RP.ST_PENDING and e[2].rstrip(b" \x00") == b"Mover":
                 k = e[3]
         check("U3 A's list shows the real guest's request", k is not None)
         if k is None:
             return L.summary_and_exit_code(results)
-        r = RP.ask(a, RP.ACCEPT, ux, uz, key=k)
+        r = RP.ask(a, RP.ACCEPT, house, key=k)
         check("U3 A accepts -> OK", r is not None and r["result"] == RP.R_OK)
-        st = pump_until(lambda: re.search(r"\[NET\]\[ROOM\] client: STATUS: roommate of house (\d)", g.log_text()), 30.0)
-        check("U3 the real guest got STATUS roommate of A's house (%s)" % (st and st.group(1)), st is not None and int(st.group(1)) == house)
-        nt = pump_until(lambda: "let you move in. Welcome home!" in g.log_text(), 30.0)
-        check("U3 ... and the 'accepted' notice line", nt)
-        en = pump_until(lambda: re.search(r"\[NET\]\[ROOM\]\[TEST-ONLY\] enter: walking into the shared house %d .*door entry 1\)" % house, g.log_text()), 90.0)
-        wh = pump_until(lambda: "[NET][ROOM] client: entered the shared house %d" % house in g.log_text(), 60.0)
-        check("U4 the guest walked into the shared house (the door rule: lives here = 1) and got 'Welcome home'", en is not None and wh and "notice: Welcome home" in g.log_text())
-        hp = re.findall(r"\[NET\]\[HOUSE\][^\n]*client[^\n]*house (\d)", g.log_text())
-        print("INFO - client house-sync lines naming a house: %s" % sorted(set(hp)))
+        st = pump_until(lambda: re.search(r"\[NET\]\[ROOM\] client: STATUS: roommate of house (\d) \(the local town's house \d holder matches", g.log_text()), 30.0)
+        check("U3 the real guest got STATUS roommate of house %d (holder keys match)" % house, st is not None and int(st.group(1)) == house)
+        check("U3 ... the 'accepted' notice and roommate_homes.ini remembers the house",
+              pump_until(lambda: "let you move in" in g.log_text() and "remembers the shared house" in g.log_text(), 30.0) and os.path.isfile(homes))
+        cm = pump_until(lambda: re.search(r"OWNER_COMMIT xfer \d+ house %d APPLIED \(house seq \d+, resident ([4-9])" % house, host.log_text()), 90.0)
+        check("U4 the ROOMMATE's own house sync committed its edit of house %d (TEST-ONLY swap): the host APPLIED it for the GUEST record (slot %s)" % (house, cm and cm.group(1)),
+              cm is not None and "is now this guest's to edit (roommate)" in g.log_text())
+
+        # ---- restart: the roommate arrives at the house door
+        g.stop()
+        L.pump_sleep(3.0)
+        for k2 in ("AC_TEST_ROOM_GYROID", "AC_TEST_ROOM_GYROID_REPEAT", "AC_TEST_ROOM_UI", "AC_TEST_HOUSE_CLIENT_SWAP"):
+            os.environ.pop(k2, None)
+        os.environ["AC_TEST_ROOM_ENTER"] = "1"
+        g = L.ClientProcess("127.0.0.1:%d" % args.port, extra_args=["--guest"], log_path=os.path.join(HERE, "room_real_guest2.log"), bin_dir=L.GAME_BIN_DIR,
+                            label="roomG2").start()
+        STARTED.append(g)
+        ar = pump_until(lambda: re.search(r"arriving at the door of the house it shares as a roommate \(SCENE_FG\), house (\d)", g.log_text()), 240.0)
+        check("U5 the restarted roommate ARRIVES AT THE DOOR of house %d (no train) (%s)" % (house, ar and ar.group(1)), ar is not None and int(ar.group(1)) == house)
+        check("U5 ... and gets STATUS roommate again", pump_until(lambda: "client: STATUS: roommate of house %d" % house in g.log_text(), 120.0))
+        en = pump_until(lambda: re.search(r"\[NET\]\[ROOM\] client: entered the shared house %d \(its own room" % house, g.log_text()), 120.0)
+        check("U6 it walked into house %d as its OWN room (field_type PLAYER_ROOM: editable like the holder's)" % house, en is not None)
+        arm = pump_until(lambda: re.search(r"entered own house %d: in-room commits" % house, g.log_text()), 30.0)
+        check("U6 ... the in-room owner pipeline runs for it (%s)" % (arm and arm.group(0)), arm is not None)
         L.pump_sleep(4.0)
-        OF.stand_south_of(a, ux - 1, uz)
-        r = RP.ask(a, RP.REMOVE, ux, uz, key=k)
-        check("U5 A removes the guest -> OK", r is not None and r["result"] == RP.R_OK)
-        sn = pump_until(lambda: "[NET][ROOM] client: STATUS: not a roommate" in g.log_text(), 30.0)
-        so = pump_until(lambda: re.search(r"\[NET\]\[ROOM\] client: shown out of house %d" % house, g.log_text()), 60.0)
-        check("U5 the real guest got STATUS 'not a roommate' and was SHOWN OUT of the house", sn and so is not None)
-        check("U6 host and guest alive", host.alive() and g.alive())
+        RP.at_gyroid(OF, a, house)
+        r = RP.ask(a, RP.REMOVE, house, key=k)
+        check("U7 A removes the guest -> OK", r is not None and r["result"] == RP.R_OK)
+        fz = pump_until(lambda: "demoted while inside house %d" % house in g.log_text(), 30.0)
+        so = pump_until(lambda: re.search(r"\[NET\]\[ROOM\] client: shown out of house %d" % house, g.log_text()), 90.0)
+        check("U7 the real guest was frozen (room locked) and SHOWN OUT of house %d" % house, fz and so is not None)
+        fe = pump_until(lambda: re.search(r"the freeze of house %d ended \(left the house, ([^)]*)\)" % house, g.log_text()), 120.0)
+        check("U7 the freeze ended once the last commit settled (%s)" % (fe and fe.group(1)), fe is not None and "settled" in fe.group(1) and "cap" not in fe.group(1))
+        check("U8 host and guest alive", host.alive() and g.alive())
     finally:
         if a is not None:
             try:

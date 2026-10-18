@@ -181,7 +181,7 @@ ck("C2P1 the player's HOLD / ROTATE states ask the PC outdoor judge only when th
    and "Common_Get(clip).my_room_clip != NULL ? Common_Get(clip).my_room_clip->judge_player_action_proc : pc_ofurn_grab_judge;" in hr)
 gj = body(dr, "int pc_ofurn_grab_judge(xyz_t* wpos0, xyz_t* wpos1, int ftr_no) {")
 ck("C2P2 the outdoor judge answers 0 without an outdoor grab / for another ftr_no, releases on A up, 16-frame push / pull timers, rotation re-armed by a neutral stick",
-   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end(opens ? (gyroid ? "A tapped (the gyroid\'s move-in menu)" : "A tapped (open)") : tap ? "A tapped (not in front of the piece: no open)" : "A released");' in gj  # roommates: a tapped gyroid opens its menu
+   "if (!s_grab.active || ftr_no != PCOG_FTR_NO" in gj and 'pc_ofurn_grab_end(opens ? "A tapped (open)" : tap ? "A tapped (not in front of the piece: no open)" : "A released");' in gj
    and "s_grab.push_t > 16.0f" in gj
    and "s_grab.pull_t > 16.0f" in gj and "s_grab.allow_rot = 1;" in gj)
 fp = body(dr, "int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger) {")
@@ -198,7 +198,8 @@ ck("C3K1 the outdoor key is the SAME 16-byte dresser key (no sidecar format chan
    "#define PC_DRESSER_OUTDOOR_FLOOR 0xFCu" in dsh and "#define PC_DRESSER_VERSION    3u" in dsh and "sizeof(PCDresserRec) == 616" in dsc
    and "pc_dresser_key_make(key, s_town_owner8, (int)PC_DRESSER_OUTDOOR_FLOOR, 0, ut_x, ut_z, (uint16_t)(ftr_item & ~3u));" in dsc)
 ck("C3K2 shared records are applied without the RECORD-level nonce fence (several residents at one piece); house records keep it",
-   "if (!shared && (nonce_fenced(r, t->nonce)" in dsc and "outdoor ? pc_dresser_store_apply_shared(&s_dresser, key, &dt, &res) : pc_dresser_store_apply(&s_dresser, key, &dt, &res)" in hdt)
+   "if (!shared && (nonce_fenced(r, t->nonce)" in dsc and "(outdoor || pcnetgame_room_house_shared((int)s_dresser_sel[peer].house)) ? pc_dresser_store_apply_shared(&s_dresser, key, &dt, &res)" in hdt
+   and ": pc_dresser_store_apply(&s_dresser, key, &dt, &res)" in hdt)  # roommates: a house with a roommate shares its dresser records too
 sok = body(ng, "static int pcnetgame_ofurn_storage_select_ok(PCNetPeerId peer, int ut_x, int ut_z, uint16_t base, const char** why) {")
 ck("C3W1 no new message id / no layout change: an outdoor SELECT is message 84 with floor 0xFC (8 bytes asserted), validated against the LIVE marker + a bound player next to it",
    "sizeof(PCNetGameDresserQueryMsg) == 8" in ng and "if (q->floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR) {" in hq and "pcnetgame_ofurn_storage_select_ok(peer, (int)q->ut_x, (int)q->ut_z, base, &why)" in hq
@@ -206,19 +207,20 @@ ck("C3W1 no new message id / no layout change: an outdoor SELECT is message 84 w
                               "*why = \"the requester is not next to the piece\";")))
 # ---- C3b: guests open outdoor storage; the open works only from the FRONT of the piece
 ck("C3G1 a GUEST may probe + select OUTDOOR storage only (a house floor stays refused before any private_data[] subscript); its probe is answered only when outdoor storage is offered",
-   "if (idx < 0 || (idx >= PLAYER_NUM && q->floor != (uint8_t)PC_NETGAME_DRESSER_PROBE && q->floor != (uint8_t)PC_DRESSER_OUTDOOR_FLOOR)) {" in hq
-   and hq.index("if (idx >= PLAYER_NUM) {") < hq.index("pcnetgame_dresser_migrate_resident(idx, pcnetgame_mbox_house_of(") and "if (pcnetgame_ofurn_c3_flags() != 0u) {" in hq
+   "if (idx < 0 || (idx >= PLAYER_NUM && q->floor != (uint8_t)PC_NETGAME_DRESSER_PROBE && q->floor != (uint8_t)PC_DRESSER_OUTDOOR_FLOOR &&" in hq
+   and "pcnetgame_room_peer_house(peer) < 0)) {" in hq  # roommates: a guest sharing a house may select its dressers
+   and hq.index("if (idx >= PLAYER_NUM) {") < hq.index("pcnetgame_dresser_migrate_resident(idx, pcnetgame_mbox_house_of(") and "if (pcnetgame_ofurn_c3_flags() != 0u || rh >= 0) {" in hq
    and "pcnetgame_ofurn_peer_is_resident(peer)" not in sok)
 ck("C3G2 kind 18 of a GUEST: only with its own current OUTDOOR selection (else the guest refusal before any subscript); the house branch / owner peek never run for a guest slot",
-   "s_dresser_sel[peer].floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR &&" in hdt and "s_dresser_sel[peer]._r == (uint8_t)(idx + 1)" in hdt
-   and hdt.index("pcnetgame_txn_reject_guest_no_house(") < hdt.index("Save_Get(private_data)[idx]")
-   and "have_sel = idx < PLAYER_NUM && sel->valid" in hdt and "(idx < PLAYER_NUM && pcnetgame_dresser_peek_owner(" in hdt)
+   "(s_dresser_sel[peer].floor == (uint8_t)PC_DRESSER_OUTDOOR_FLOOR ||" in hdt and "s_dresser_sel[peer]._r == (uint8_t)(idx + 1)" in hdt
+   and "Save_Get(private_data)[idx]" not in hdt  # roommates: every house of the requester comes from pcnetgame_edit_house_of (a guest: its shared house)
+   and "(int)sel->house == pcnetgame_edit_house_of(peer, idx)" in hdt and "pcnetgame_dresser_peek_owner(pcnetgame_edit_house_of(peer, idx), &dt, &res)" in hdt)
 rf = body(ng, "static void pcnetgame_dresser_roll_forward(int idx, PCNetGameRecSlot* slot, const uint8_t key[PC_DRESSER_KEY_LEN]) {")
 dk = body(ng, "static uint32_t pcnetgame_dresser_pocket_dig_k(int idx, const uint8_t key[PC_DRESSER_KEY_LEN], const uint16_t* pockets, uint32_t conds, uint32_t wallet) {")
 ck("C3G3 the shared-record journal digests are salted by the requester's PersonalID (outdoor keys only; house digests unchanged), so the restart roll-forward (now also for a "
    "guest slot of an outdoor record) never hands one player's pocket side to another with equal pockets",
-   "pc_dresser_key_is_outdoor(key)" in dk and "&p->player_ID" in dk and rf.count("pcnetgame_dresser_pocket_dig_k(idx, key,") == 2
-   and "(idx >= PLAYER_NUM && !pc_dresser_key_is_outdoor(key))" in rf and "dt.pre_pocket_dig = pcnetgame_dresser_pocket_dig_k(idx, key," in hdt
+   "(pc_dresser_key_is_outdoor(key) || idx >= PLAYER_NUM)" in dk and "&p->player_ID" in dk and rf.count("pcnetgame_dresser_pocket_dig_k(idx, key,") == 2
+   and "s_txn_res[idx].nonce != 0u" in rf and "dt.pre_pocket_dig = pcnetgame_dresser_pocket_dig_k(idx, key," in hdt  # roommates: a guest's house-dresser digests are salted too
    and "dt.post_pocket_dig = pcnetgame_dresser_pocket_dig_k(idx, key," in hdt)
 gt = body(dr, "static int pc_ofurn_grab_try(GAME* game, PLAYER_ACTOR* pl, int ux, int uz) {")
 ff = body(dr, "static int pc_ofurn_open_from_front(const PLAYER_ACTOR* pl, const PCOfurnMarker* mk) {")
@@ -229,10 +231,10 @@ ck("C3F1 the FRONT rule (pure): the front row = one step along `rot` from every 
    and "pc_ofurn_fp_in_front((int)s_ofh.m[k].shape, (int)s_ofh.m[k].rot, (int)s_ofh.m[k].ut_x, (int)s_ofh.m[k].ut_z, pux, puz, 2)" in sok
    and "pc_ofurn_faces_piece((int)s_ofh.m[k].rot, (int)face, 0x3000)" in sok
    and "pc_ofurn_fp_in_front((int)mk->shape, (int)mk->rot, (int)mk->ut_x, (int)mk->ut_z, pux, puz, 1)" in ff and "== (((int)mk->rot + 2) & 3)" in ff
-   and "const int opens = tap && (gyroid || pc_ofurn_open_from_front(pl, &tapped));" in gj  # roommates: a gyroid's menu opens from any side
+   and "const int opens = tap && pc_ofurn_open_from_front(pl, &tapped);" in gj
    and gt.index("pc_ofurn_open_from_front(pl, &mk)") < gt.index("pc_ofurn_reason_text(PC_OFURN_REASON_NOT_ALLOWED)") < gt.index("mPlib_request_main_hold_type1("))
 ck("C3W2 the capability is the 102 CAPS `total` bit 0 (a C2 client reads only count + flags of CAPS); a C3 client never sends floor 0xFC to a host without it",
-   "m.total = pcnetgame_ofurn_c3_flags() | pcnetgame_room_caps_bit();" in blk and "s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE;" in blk  # roommates: bit 1 of the same field and "(s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) == 0u" in blk
+   "m.total = pcnetgame_ofurn_c3_flags() | pcnetgame_room_caps_bit();" in blk and "s_ofcl.c3_flags = m->total & PC_OFURN_C3_STORAGE;" in blk and "(s_ofcl.c3_flags & PC_OFURN_C3_STORAGE) == 0u" in blk  # (roommates: bit 1 of the same field)
    and "return m->count == 0 && (m->flags & ~PC_OFURN_C2_ALL) == 0u;" in pof)
 ck("C3W3 kind 18 for an outdoor key: the house scene / owner check skipped, the marker + nearness re-verified at every commit, journal replay over the town prefix",
    "if (!any_scene && !outdoor) {" in hdt and "pcnetgame_ofurn_storage_select_ok(peer, (int)sel->ut_x, (int)sel->ut_z, sel->ftr_base, &why);" in hdt

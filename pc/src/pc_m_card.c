@@ -68,6 +68,7 @@
 #include <dolphin/os.h>  /* OSReport */
 #include "pc_town_cache.h"  /* M-A: pc_card_a_dir() / pc_gci_path() / pc_gci_tmp_path() (runtime Card-A dir); M-B: PCTownId, CRC32 */
 #include "pc_town_sanitize.h" /* M-G: sanitized town transfer image (pure module) + the templates built below */
+#include "pc_roommates.h"   /* roommates: save/mp/roommate_homes.ini (a roommate starts at the door of the house it shares) */
 
 /* --- Path constants --- */
 #define PC_CARD_B_DIR     "save/card_b"
@@ -2070,6 +2071,56 @@ int pc_guest_creation_name_ok(const u8* game_name) {
     return pc_guest_profile_name_from_game(game_name, nm);
 }
 
+/* Roommates (pc_roommates.h): the house this guest shares in the town just reloaded, -1 = none. The client remembered it from the host's STATUS
+ * (save/mp/roommate_homes.ini); it counts only when that house of THIS save is still held by the same resident (else the station, as for every guest). */
+static int pc_guest_roommate_house(const PersonalID_c* home) {
+    static PCRoomHomes t;
+    uint8_t me[PC_ROOM_KEY_LEN];
+    int i;
+    memcpy(me, home->player_name, 8);
+    memcpy(me + 8, home->land_name, 8);
+    me[16] = (uint8_t)(home->player_id >> 8);
+    me[17] = (uint8_t)home->player_id;
+    me[18] = (uint8_t)(home->land_id >> 8);
+    me[19] = (uint8_t)home->land_id;
+    if (pc_room_homes_load(PC_ROOM_HOMES_PATH, &t) != PC_ROOM_FILE_OK) {
+        return -1;
+    }
+    for (i = pc_room_homes_find(&t, me, 0); i >= 0; i = pc_room_homes_find(&t, me, i + 1)) {
+        PersonalID_c holder;
+        const PCRoomHome* e = &t.e[i];
+        if (e->house > 3) {
+            continue;
+        }
+        memset(&holder, 0, sizeof(holder));
+        memcpy(holder.player_name, e->holder, 8);
+        memcpy(holder.land_name, e->holder + 8, 8);
+        holder.player_id = (u16)((e->holder[16] << 8) | e->holder[17]);
+        holder.land_id = (u16)((e->holder[18] << 8) | e->holder[19]);
+        if (mPr_CheckCmpPersonalID(&Save_Get(homes[e->house]).ownerID, &holder) == TRUE) {
+            return (int)e->house;
+        }
+    }
+    return -1;
+}
+
+/* Roommates: the door of house h, exactly the vanilla Start / continue "at home" door (aNPS2_make_door_data type HOME, aNRST_think_door): SCENE_FG in front of the
+ * house, exit_type 1 + extra_data 1 = the start-of-day walk out of the door (GO_OUT_S1), the house actor opens its door. h is given (never the player_no). */
+static void pc_guest_house_door(Door_data_c* door_data, int h) {
+    static const s16 homeX[] = { 2128, 2352, 2128, 2352 };
+    static const s16 homeZ[] = { 1488, 1488, 1768, 1768 };
+    static const u8 drt[] = { mSc_DIRECT_SOUTH_EAST, mSc_DIRECT_SOUTH_WEST, mSc_DIRECT_SOUTH_EAST, mSc_DIRECT_SOUTH_WEST };
+    door_data->next_scene_id = SCENE_FG;
+    door_data->exit_type = 1;
+    door_data->extra_data = 1;
+    door_data->exit_position.x = homeX[h & 3];
+    door_data->exit_position.y = 0;
+    door_data->exit_position.z = homeZ[h & 3];
+    door_data->exit_orientation = drt[h & 3];
+    door_data->door_actor_name = HOUSE0 + (h & 3);
+    door_data->wipe_type = WIPE_TYPE_FADE_BLACK;
+}
+
 /* The station arrival door: SCENE_FG at (1979, 760), exactly aNPS2_make_door_data's station entry; the caller adds RIDE_OFF_DEMO + the circle wipe. */
 static void pc_guest_station_door(Door_data_c* door_data) {
     door_data->next_scene_id = SCENE_FG;
@@ -2097,6 +2148,7 @@ static void pc_guest_station_door(Door_data_c* door_data) {
  * It NEVER arms pc_save_ready (a guest process can write no save at all), never writes or indexes Save_t's private_data[] / homes[] except the read-only name
  * check, runs no new-town / new-player init and allocates no house. */
 static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t errcap) {
+    int roommate_house = -1; /* roommates: the house this guest shares (it starts at its door) */
     PersonalID_c home;
     Private_c* pass;
     Private_c* prev_private;
@@ -2201,12 +2253,20 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
         door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
         OSReport("[PC] %s: FIRST-RUN guest creation: profile file %s does not exist yet -> the real Rover scene (SCENE_START_DEMO2) creates it\n", tag,
                  pc_guest_profile_selected_path());
+    } else if ((roommate_house = pc_guest_roommate_house(&home)) >= 0) {
+        /* roommates: a guest that shares a house arrives like a resident: out of that house's door (no train, no station) */
+        pc_guest_house_door(&door_data, roommate_house);
+        Common_Set(demo_profiles[0], mAc_PROFILE_NUM);
+        Common_Set(demo_profiles[1], mAc_PROFILE_NUM);
     } else {
         pc_guest_station_door(&door_data);
         Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
         Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
     }
     scene_res = goto_other_scene(play, &door_data, TRUE);
+    if (scene_res == TRUE && roommate_house >= 0) {
+        Common_Get(transition).wipe_type = WIPE_TYPE_TRIFORCE;
+    }
     if (scene_res != TRUE) {
         Common_Set(demo_profiles[0], mAc_PROFILE_NUM);
         Common_Set(now_private, prev_private);
@@ -2215,8 +2275,10 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
         snprintf(err, errcap, "FAILED: goto_other_scene to %s failed (res=%d)", create ? "SCENE_START_DEMO2 (Rover)" : "SCENE_FG (station)", scene_res);
         return 0;
     }
-    OSReport("[PC] %s: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the %s\n", tag,
-             (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id, create ? "Rover scene (SCENE_START_DEMO2)" : "station (SCENE_FG)");
+    OSReport("[PC] %s: guest '%.8s' (home land id 0x%04X, player id 0x%04X) bound as a foreigner, arriving at the %s%s\n", tag,
+             (const char*)home.player_name, (unsigned)home.land_id, (unsigned)home.player_id,
+             create ? "Rover scene (SCENE_START_DEMO2)" : roommate_house >= 0 ? "door of the house it shares as a roommate (SCENE_FG), house " : "station (SCENE_FG)",
+             roommate_house >= 0 ? (roommate_house == 0 ? "0" : roommate_house == 1 ? "1" : roommate_house == 2 ? "2" : "3") : "");
     return 1;
 }
 
@@ -2861,7 +2923,8 @@ int pc_town_local_arrival_active(void) {
         return 0; /* the parked observer avatar is never "arriving" */
     }
     idx = mPlib_get_player_actor_main_index((GAME*)play);
-    return (idx >= mPlayer_INDEX_DEMO_WAIT && idx <= mPlayer_INDEX_DEMO_WADE) || (idx >= mPlayer_INDEX_DEMO_GETON_BOAT && idx <= mPlayer_INDEX_DEMO_GETOFF_BOAT);
+    return (idx >= mPlayer_INDEX_DEMO_WAIT && idx <= mPlayer_INDEX_DEMO_WADE) || (idx >= mPlayer_INDEX_DEMO_GETON_BOAT && idx <= mPlayer_INDEX_DEMO_GETOFF_BOAT) ||
+           idx == mPlayer_INDEX_OUTDOOR; /* roommates: a guest walking out of the house it shares (the arrival at the door) */
 }
 
 /* The "safe moment" of every same-position SCENE_FG reload: 1 = now (town scene, no transition, the local player idle: no menu, no talk/message demo, no arrival / demo

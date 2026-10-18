@@ -233,6 +233,14 @@ static void aHNW_dance(HANIWA_ACTOR* haniwa, GAME* game) {
             mDemo_Set_ListenAble();
             aHNW_setupAction(haniwa, game, next_act_idx[msg_idx]);
         } else if (aHNW_check_house_door(actorx, (GAME_PLAY*)game) == FALSE) {
+#ifdef TARGET_PC
+            /* roommates (pc_room_ui.c): a GUEST's / the house OWNER's A at this gyroid opens the move-in menu (its "Talk to the gyroid" row comes back here); every
+             * other player, solo play, an older host: the vanilla conversation */
+            extern int pc_room_gyroid_intercept(void* actor, int house);
+            if (pc_room_gyroid_intercept(actorx, (int)haniwa->house_idx)) {
+                return;
+            }
+#endif
             mDemo_Request(mDemo_TYPE_TALK, actorx, &aHNW_set_talk_info_dance);
         }
     }

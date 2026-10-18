@@ -19,8 +19,8 @@ _Static_assert(PC_ROOM_KEY_LEN == PC_OPS_KEY_LEN, "ROOMMATE key = the ops key");
 #define PCNG_ROOM_NOTE_DELAY_MS 8000u /* notices wait until the joining player is past its arrival */
 #define PCNG_ROOM_GC_MS        5000u
 #define PCNG_ROOM_NEAR_TILES   2
+#define PCNG_ROOM_GRACE_MS     120000u /* a demoted roommate still commits its last in-room edits for 2 min (no NEW edit: its client locks the room) */
 #define PCNG_ROOM_EJECT_DEMO_MS 10000u /* a demo (no message window) holds the show-out at most this long */
-#define PCNG_ROOM_EJECT_ANY    4 /* the client leaves whatever player house it stands in */
 
 static int pcnetgame_room_env_off(void) {
     static int v = -1;
@@ -34,10 +34,6 @@ static int pcnetgame_room_env_off(void) {
     return v;
 }
 
-int pc_net_game_room_is_gyroid(int item) {
-    const int base = item & ~3;
-    return item > 0 && item <= 0xFFFF && IS_ITEM_HANIWA((mActor_name_t)base) && IS_ITEM_HANIWA((mActor_name_t)(base | 3));
-}
 
 static void pcnetgame_room_hex(const uint8_t* k, int n, char* out) {
     static const char d[] = "0123456789abcdef";
@@ -68,6 +64,8 @@ typedef struct {
     uint32_t last_req_ms;
     uint32_t rate_t0;
     uint32_t rate_n;
+    int      grace_house; /* demoted while it may have stood inside: its last in-room commit of this house is still accepted until grace_t0 + PCNG_ROOM_GRACE_MS */
+    uint32_t grace_t0;
 } PCNgRoomPeer;
 static PCNgRoomPeer s_rmp[PCNG_ROOM_PEERS];
 static PCNgRoomPeer s_rm_local; /* the listen host's own player (a resident; never a guest) */
@@ -177,6 +175,54 @@ static int pcnetgame_room_peer_is_roommate(PCNetPeerId peer) {
     return pcnetgame_room_peer_house(peer) >= 0;
 }
 
+static uint32_t pcnetgame_room_grace_ms(void) {
+#ifdef PC_NET_TEST_HOOKS
+    const char* e = pc_test_hook_getenv("AC_TEST_ROOM_GRACE_MS"); /* TEST-ONLY: a short demotion grace (the protocol test of the late-commit rollback) */
+    if (e != NULL && atoi(e) > 0) {
+        return (uint32_t)atoi(e);
+    }
+#endif
+    return PCNG_ROOM_GRACE_MS;
+}
+
+/* the house a roommate peer may still COMMIT: its shared house, or (after a demotion while it stood inside) that house during the grace that lets its last in-room
+ * edits reach the host as one consistent (house, pockets) pair; its client refuses every NEW edit at once (pc_net_game_client_room_edit_locked) */
+static int pcnetgame_room_peer_commit_house(PCNetPeerId peer) {
+    const int h = pcnetgame_room_peer_house(peer);
+    if (h >= 0) {
+        return h;
+    }
+    if (peer < 0 || peer >= PCNG_ROOM_PEERS || !s_rmp[peer].active || s_rmp[peer].grace_house < 0) {
+        return -1;
+    }
+    {
+        PCNetPlayerScene sc;
+        if (pc_remote_player_get_scene((PCNetPlayerId)peer, &sc) && sc.valid && sc.kind == (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE && (int)sc.owner == s_rmp[peer].grace_house) {
+            s_rmp[peer].grace_t0 = pcnetgame_now_ms() | 1u; /* still inside: its exit commit has not even started */
+        }
+    }
+    if ((uint32_t)(pcnetgame_now_ms() - s_rmp[peer].grace_t0) >= pcnetgame_room_grace_ms()) {
+        printf("[NET][ROOM] host: peer %d's commit grace for house %d is over\n", (int)peer, s_rmp[peer].grace_house);
+        s_rmp[peer].grace_house = -1;
+        return -1;
+    }
+    return s_rmp[peer].grace_house;
+}
+
+/* 1 = house h has at least one roommate whose holder is h's owner (the dresser records of h are then applied as SHARED records) */
+static int pcnetgame_room_house_shared(int h) {
+    int i;
+    if (h < 0 || h >= PLAYER_NUM || s_rmh_state != 1) {
+        return 0;
+    }
+    for (i = 0; i < s_rmh.n; i++) {
+        if (s_rmh.e[i].state == PC_ROOM_ST_ROOMMATE && pcnetgame_room_house_of_key(s_rmh.e[i].owner_key) == h) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* the requester: a READY bound peer, or (peer < 0) the listen host's own player. kind / key / raw name (8 bytes). */
 static int pcnetgame_room_actor(int peer, int* kind, uint8_t key[PC_ROOM_KEY_LEN], uint8_t name8[PC_ROOM_NAME_LEN]) {
     if (peer < 0) {
@@ -218,79 +264,37 @@ static int pcnetgame_room_actor_near(int peer, int ux, int uz) {
     return pux >= ux - PCNG_ROOM_NEAR_TILES && pux <= ux + PCNG_ROOM_NEAR_TILES && puz >= uz - PCNG_ROOM_NEAR_TILES && puz <= uz + PCNG_ROOM_NEAR_TILES;
 }
 
-/* the live placed gyroid at (ux, uz) holding `item`: its marker index, -1 = none */
-static int pcnetgame_room_gyroid_at(int ux, int uz, int item) {
-    const int mi = pc_ofurn_find(&s_ofh, ux, uz);
-    int bx, bz;
-    uint16_t bv;
-    if (mi < 0 || !pc_net_game_room_is_gyroid((int)pc_ofurn_tile_value(&s_ofh.m[mi])) || pc_ofurn_tile_value(&s_ofh.m[mi]) != (uint16_t)item ||
-        !pcnetgame_ofurn_tiles_match(&s_ofh.m[mi], &bx, &bz, &bv)) {
-        return -1;
-    }
-    return mi;
-}
-
-/* the holder of marker mi: 1 = a resident with a house (key / name / house) */
-static int pcnetgame_room_holder(int mi, uint8_t key[PC_ROOM_KEY_LEN], uint8_t name8[PC_ROOM_NAME_LEN], int* house) {
-    const PCOfurnMarker* mk = &s_ofh.m[mi];
-    int ri, h;
-    if (mk->placer_kind != (uint8_t)PC_OFURN_PLACER_RESIDENT && mk->placer_kind != (uint8_t)PC_OFURN_PLACER_HOST) {
+/* the owner (the house holder) of house h: 1 = a resident owns it (its key / raw name). The holder is ALWAYS the resident whose PersonalID owns homes[h] (the buyer). */
+static int pcnetgame_room_holder(int h, uint8_t key[PC_ROOM_KEY_LEN], uint8_t name8[PC_ROOM_NAME_LEN]) {
+    int ri;
+    if (h < 0 || h >= PLAYER_NUM) {
         return 0;
     }
-    ri = pcnetgame_room_resident_of_key(mk->placer_key);
-    if (ri < 0 || (h = pcnetgame_mbox_house_of(&Save_Get(private_data)[ri].player_ID)) < 0) {
-        return 0;
+    for (ri = 0; ri < PLAYER_NUM; ri++) {
+        const PersonalID_c* pid = &Save_Get(private_data)[ri].player_ID;
+        if (mPr_NullCheckPersonalID((PersonalID_c*)pid) == FALSE && pcnetgame_mbox_house_of(pid) == h) {
+            pcnetgame_pid_key(pid, key);
+            memcpy(name8, pid->player_name, PC_ROOM_NAME_LEN);
+            return 1;
+        }
     }
-    memcpy(key, mk->placer_key, PC_ROOM_KEY_LEN);
-    memcpy(name8, Save_Get(private_data)[ri].player_ID.player_name, PC_ROOM_NAME_LEN);
-    *house = h;
-    return 1;
-}
-
-/* an unheld gyroid is claimed by the first resident with a house that opens its menu (or the console): the placer fields become that resident */
-static int pcnetgame_room_claim(int mi, const uint8_t key[PC_ROOM_KEY_LEN], const char* why) {
-    PCOfurnMarker* mk = &s_ofh.m[mi];
-    PCOfurnMarker before = *mk;
-    char name[24] = "", hex[41];
-    const int ri = pcnetgame_room_resident_of_key(key);
-    if (ri < 0 || pcnetgame_mbox_house_of(&Save_Get(private_data)[ri].player_ID) < 0) {
-        return 0;
-    }
-    pcnetgame_room_ascii8(Save_Get(private_data)[ri].player_ID.player_name, name);
-    mk->placer_kind = (uint8_t)PC_OFURN_PLACER_RESIDENT;
-    memcpy(mk->placer_key, key, PC_OFURN_KEY_LEN);
-    memset(mk->placer_name, 0, sizeof(mk->placer_name));
-    snprintf(mk->placer_name, sizeof(mk->placer_name), "%s", name);
-    s_ofh.gen++;
-    if (!pcnetgame_ofurn_host_save()) {
-        *mk = before;
-        return 0;
-    }
-    pcnetgame_room_hex(key, PC_ROOM_KEY_LEN, hex);
-    printf("[NET][ROOM] host: the gyroid at (%u,%u) is now held by resident %d \"%s\" (%s; was placer kind %u \"%s\")\n", (unsigned)mk->ut_x, (unsigned)mk->ut_z, ri, name, why,
-           (unsigned)before.placer_kind, before.placer_name);
-    return 1;
+    return 0;
 }
 
 static void pcnetgame_room_reply_send(int peer, PCRoomMsg* m);
 
-static void pcnetgame_room_fill_info(int peer, int kind, const uint8_t* me, int mi, PCRoomMsg* out) {
+static void pcnetgame_room_fill_info(int peer, int kind, const uint8_t* me, int house, PCRoomMsg* out) {
     uint8_t hkey[PC_ROOM_KEY_LEN], hname[PC_ROOM_NAME_LEN];
-    int house = -1, i, n = 0;
+    int i, n = 0;
     out->op = PC_ROOM_OP_INFO;
-    out->house = 0xFF;
-    if (!pcnetgame_room_holder(mi, hkey, hname, &house)) {
-        if (kind == PC_OPS_KIND_RESIDENT && pcnetgame_room_house_of_key(me) >= 0 && pcnetgame_room_claim(mi, me, "first resident at an unheld gyroid")) {
-            (void)pcnetgame_room_holder(mi, hkey, hname, &house);
-        } else {
-            out->role = PC_ROOM_ROLE_NONE;
-            out->result = (uint8_t)PC_ROOM_R_NO_HOUSE;
-            return;
-        }
+    out->house = (uint8_t)house;
+    if (!pcnetgame_room_holder(house, hkey, hname)) {
+        out->role = PC_ROOM_ROLE_NONE;
+        out->result = (uint8_t)PC_ROOM_R_NO_HOUSE;
+        return;
     }
     memcpy(out->owner_key, hkey, PC_ROOM_KEY_LEN);
     memcpy(out->owner_name, hname, PC_ROOM_NAME_LEN);
-    out->house = (uint8_t)house;
     if (memcmp(me, hkey, PC_ROOM_KEY_LEN) == 0) {
         out->role = PC_ROOM_ROLE_OWNER;
         for (i = 0; i < s_rmh.n && n < PC_ROOM_MSG_ENTRIES; i++) {
@@ -342,18 +346,16 @@ static void pcnetgame_room_fill_info(int peer, int kind, const uint8_t* me, int 
 /* THE handler (a READY peer, or peer -1 = the listen host's own player): `in` is a validated client message; the answer is sent (peer) or queued (local) */
 static void pcnetgame_room_handle(int peer, const PCRoomMsg* in) {
     PCRoomMsg out;
-    int kind = 0, mi, r = PC_ROOM_R_OK, house = -1;
+    int kind = 0, r = PC_ROOM_R_OK;
+    const int house = (int)in->house;
     uint8_t me[PC_ROOM_KEY_LEN], my_name[PC_ROOM_NAME_LEN], hkey[PC_ROOM_KEY_LEN], hname[PC_ROOM_NAME_LEN];
     char mys[24], hs[24], gs[24];
     const uint32_t now_s = (uint32_t)time(NULL);
     static PCRoomTable undo;
     memset(&out, 0, sizeof(out));
     out.msg_type = (uint8_t)PC_ROOM_MSG_ID;
-    out.ut_x = in->ut_x;
-    out.ut_z = in->ut_z;
-    out.item = in->item;
     out.seq = in->seq;
-    out.house = 0xFF;
+    out.house = in->house;
     if (!pcnetgame_room_actor(peer, &kind, me, my_name)) {
         return;
     }
@@ -362,15 +364,15 @@ static void pcnetgame_room_handle(int peer, const PCRoomMsg* in) {
         r = PC_ROOM_R_OFF;
     } else if (pcnetgame_room_host_ensure() < 0 && in->op != PC_ROOM_OP_QUERY) {
         r = PC_ROOM_R_BUSY;
-    } else if ((mi = pcnetgame_room_gyroid_at((int)in->ut_x, (int)in->ut_z, (int)in->item)) < 0 || !pcnetgame_room_actor_near(peer, (int)in->ut_x, (int)in->ut_z)) {
-        r = PC_ROOM_R_NOT_GYROID;
+    } else if (house < 0 || house >= PLAYER_NUM || !pcnetgame_room_actor_near(peer, (int)pc_room_gyroid_ut[house][0], (int)pc_room_gyroid_ut[house][1])) {
+        r = PC_ROOM_R_NOT_GYROID; /* the gyroid that comes with house h stands at a fixed spot of the player-house acre */
     } else if (in->op == PC_ROOM_OP_QUERY) {
-        pcnetgame_room_fill_info(peer, kind, me, mi, &out);
-        printf("[NET][ROOM] host: %s %d \"%s\" QUERY gyroid (%u,%u) -> role %u (%u entries, result %u)\n", peer < 0 ? "host player" : "peer", peer, mys, (unsigned)in->ut_x,
-               (unsigned)in->ut_z, (unsigned)out.role, (unsigned)out.count, (unsigned)out.result);
+        pcnetgame_room_fill_info(peer, kind, me, house, &out);
+        printf("[NET][ROOM] host: %s %d \"%s\" QUERY the gyroid of house %d -> role %u (%u entries, result %u)\n", peer < 0 ? "host player" : "peer", peer, mys, house,
+               (unsigned)out.role, (unsigned)out.count, (unsigned)out.result);
         pcnetgame_room_reply_send(peer, &out);
         return;
-    } else if (!pcnetgame_room_holder(mi, hkey, hname, &house)) {
+    } else if (!pcnetgame_room_holder(house, hkey, hname)) {
         r = PC_ROOM_R_NO_HOUSE;
     } else {
         memcpy(&undo, &s_rmh, sizeof(undo));
@@ -443,8 +445,8 @@ static void pcnetgame_room_handle(int peer, const PCRoomMsg* in) {
     out.aux = in->op;
     out.result = (uint8_t)r;
     if (r != PC_ROOM_R_OK) {
-        printf("[NET][ROOM] host: %s %d \"%s\" op %u at (%u,%u) REFUSED: %s (%d)\n", peer < 0 ? "host player" : "peer", peer, mys, (unsigned)in->op, (unsigned)in->ut_x,
-               (unsigned)in->ut_z, pc_room_result_text(r), r);
+        printf("[NET][ROOM] host: %s %d \"%s\" op %u at the gyroid of house %d REFUSED: %s (%d)\n", peer < 0 ? "host player" : "peer", peer, mys, (unsigned)in->op,
+               house, pc_room_result_text(r), r);
     }
     pcnetgame_room_reply_send(peer, &out);
 }
@@ -508,7 +510,7 @@ static void pcnetgame_room_note_text(int note, const uint8_t* name8, int count, 
     char nm[24];
     pcnetgame_room_ascii8(name8, nm);
     switch (note) {
-        case PC_ROOM_GN_ACCEPTED: snprintf(out, cap, "%s let you move in. Welcome home!", nm); break;
+        case PC_ROOM_GN_ACCEPTED: snprintf(out, cap, "%s let you move in", nm); break;
         case PC_ROOM_GN_DENIED: snprintf(out, cap, "%s turned down your move-in request", nm); break;
         case PC_ROOM_GN_REMOVED: snprintf(out, cap, "%s asked you to move out", nm); break;
         case PC_ROOM_GN_HOUSE_GONE: snprintf(out, cap, "%s no longer has a house", nm); break;
@@ -667,12 +669,19 @@ static void pcnetgame_room_host_tick(void) {
             rp->ready_ms = now | 1u;
             rp->status_sent = -2;
             rp->house = -1;
+            rp->grace_house = -1;
         }
         if (kind == PC_OPS_KIND_GUEST) {
             int ei = -1;
             const int h = s_rmh_state == 1 ? pcnetgame_room_guest_house(key, &ei) : -1;
             if (h != rp->house) {
                 printf("[NET][ROOM] host: peer %d (guest) %s house %d\n", p, h >= 0 ? "now shares" : "no longer shares", h >= 0 ? h : rp->house);
+                if (rp->house >= 0 && h != rp->house) {
+                    rp->grace_house = rp->house; /* its last in-room edits still reach the host (one consistent pair), never a new one */
+                    rp->grace_t0 = now | 1u;
+                } else if (h >= 0) {
+                    rp->grace_house = -1;
+                }
             }
             rp->house = h;
             if (rp->status_sent != h) {
@@ -712,15 +721,45 @@ static struct {
     uint8_t  owner_key[PC_ROOM_KEY_LEN];
     uint8_t  owner_name[PC_ROOM_NAME_LEN];
     int      eject_house;   /* -1 = none: shown out of this house once safe */
+    int      frozen_house;  /* demoted while inside: still "its" house for the commit pipeline (the last in-room edits reach the host), every NEW edit locked */
+    uint32_t frozen_left_ms; /* when the player left that house (the freeze ends PCNG_ROOM_FROZEN_TAIL_MS later) */
     uint32_t eject_t0;
-    int      welcomed;      /* the "Welcome home" of this visit was shown */
+    int      welcomed;      /* the entry into the shared house of this visit was logged */
     uint32_t door_notice_ms;
-} s_rmc = { 0, 0, 0, -1, { 0 }, { 0 }, -1, 0, 0, 0 };
+} s_rmc = { 0, 0, 0, -1, { 0 }, { 0 }, -1, -1, 0, 0, 0, 0 };
 
 #ifdef PC_NET_TEST_HOOKS
 static void pcnetgame_room_test_hooks(void);
 #endif
 static int pcnetgame_room_client_lives_in(int h);
+static int pcnetgame_room_client_scene_house(GAME_PLAY* play);
+
+/* the client's memory of its shared house (save/mp/roommate_homes.ini, pc_roommates.h): the next arrival of this guest in this town starts at that door */
+static void pcnetgame_room_client_remember(int h, const uint8_t holder[PC_ROOM_KEY_LEN]) {
+    static PCRoomHomes t;
+    uint8_t me[PC_ROOM_KEY_LEN];
+    int changed = 0, i;
+    if (Now_Private == NULL || !pcnetgame_client_is_guest_player()) {
+        return;
+    }
+    pcnetgame_pid_key(&Now_Private->player_ID, me);
+    (void)pc_room_homes_load(PC_ROOM_HOMES_PATH, &t);
+    if (h >= 0) {
+        changed = pc_room_homes_set(&t, me, holder, h);
+    } else {
+        for (i = 0; i < PLAYER_NUM; i++) { /* not a roommate here: forget this town (any of its house owners names the town) */
+            uint8_t k[PC_ROOM_KEY_LEN];
+            if (mPr_NullCheckPersonalID(&Save_Get(homes[i]).ownerID) == FALSE) {
+                pcnetgame_pid_key(&Save_Get(homes[i]).ownerID, k);
+                changed |= pc_room_homes_set(&t, me, k, -1);
+            }
+        }
+    }
+    if (changed) {
+        printf("[NET][ROOM] client: %s %s\n", PC_ROOM_HOMES_PATH, pc_room_homes_save(PC_ROOM_HOMES_PATH, &t) ? (h >= 0 ? "remembers the shared house" : "forgot this town's house")
+                                                                                                     : "*** could not be written ***");
+    }
+}
 
 static void pcnetgame_room_client_caps(uint32_t total) {
     const int on = (total & PC_OFURN_C4_ROOMMATES) != 0;
@@ -740,17 +779,15 @@ int pc_net_game_room_on(void) {
     return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_rmc.caps;
 }
 
-uint32_t pc_net_game_room_send(int op, int ut_x, int ut_z, int item, const uint8_t* guest_key) {
+uint32_t pc_net_game_room_send(int op, int house, const uint8_t* guest_key) {
     PCRoomMsg m;
-    if (!pc_net_game_room_on() || op < PC_ROOM_OP_QUERY || op > PC_ROOM_OP_CLIENT_MAX) {
+    if (!pc_net_game_room_on() || op < PC_ROOM_OP_QUERY || op > PC_ROOM_OP_CLIENT_MAX || house < 0 || house > 3) {
         return 0;
     }
     memset(&m, 0, sizeof(m));
     m.msg_type = (uint8_t)PC_ROOM_MSG_ID;
     m.op = (uint8_t)op;
-    m.ut_x = (uint8_t)ut_x;
-    m.ut_z = (uint8_t)ut_z;
-    m.item = (uint16_t)item;
+    m.house = (uint8_t)house;
     m.seq = ++s_rmc.seq;
     if (m.seq == 0) {
         m.seq = ++s_rmc.seq;
@@ -763,7 +800,7 @@ uint32_t pc_net_game_room_send(int op, int ut_x, int ut_z, int item, const uint8
         memcpy(m.e[0].key, guest_key, PC_ROOM_KEY_LEN);
     }
     if (!pc_room_msg_valid(&m, 1)) {
-        printf("[NET][ROOM] client: op %d at (%d,%d) would be malformed -- not sent\n", op, ut_x, ut_z);
+        printf("[NET][ROOM] client: op %d at the gyroid of house %d would be malformed -- not sent\n", op, house);
         return 0;
     }
     s_rm_reply_have = 0;
@@ -804,10 +841,20 @@ static void pcnetgame_handle_client_roommate(const uint8_t* data, uint16_t size)
             break;
         case PC_ROOM_OP_STATUS: {
             const int h = (m.role == PC_ROOM_ROLE_ROOMMATE && m.house <= 3) ? (int)m.house : -1;
-            if (h < 0) {
-                /* demoted / moved out (or a guest that does not live anywhere joining inside a house): leave the house it stands in, if any */
-                s_rmc.eject_house = PCNG_ROOM_EJECT_ANY;
+            if (s_rmc.status_valid && s_rmc.house >= 0 && h != s_rmc.house) {
+                /* demoted / moved out: leave THAT house if inside (any other guest visit is the vanilla one, never cut short); while inside, the house stays "its"
+                 * house for the commit pipeline (FROZEN: no new edit, the last in-room edits still reach the host in the host's grace) */
+                s_rmc.eject_house = s_rmc.house;
                 s_rmc.eject_t0 = 0;
+                s_rmc.frozen_house = (gamePT != NULL && gamePT->exec == play_main &&
+                                      pcnetgame_room_client_scene_house((GAME_PLAY*)gamePT) == s_rmc.house) ? s_rmc.house : -1;
+                s_rmc.frozen_left_ms = 0;
+                if (s_rmc.frozen_house >= 0) {
+                    printf("[NET][ROOM] client: demoted while inside house %d: the room is locked, the last edits are committed on the way out\n", s_rmc.frozen_house);
+                }
+            }
+            if (h >= 0) {
+                s_rmc.frozen_house = -1;
             }
             if (h >= 0) {
                 s_rmc.eject_house = -1;
@@ -816,6 +863,7 @@ static void pcnetgame_handle_client_roommate(const uint8_t* data, uint16_t size)
             }
             s_rmc.house = h;
             s_rmc.status_valid = 1;
+            pcnetgame_room_client_remember(h, m.owner_key);
             if (h >= 0) {
                 char hk[41], lk[41];
                 uint8_t k[PC_ROOM_KEY_LEN];
@@ -855,21 +903,56 @@ static int pcnetgame_room_client_lives_in(int h) {
     return mPr_CheckCmpPersonalID(&Save_Get(homes[h]).ownerID, &p) == TRUE;
 }
 
+#define PCNG_ROOM_FROZEN_TAIL_MS 180000u /* a cap: after a demoted roommate left the house its exit commit settles (APPLIED, or refused + rolled back) long before */
+
+/* 1 = no house commit of h in flight, no rollback pending, the local copy of h equals canon and no record upload is staged: the (house, pockets) pair settled */
+static int pcnetgame_room_client_pair_settled(int h) {
+    return h < 0 || (!s_hcl.c_active && !s_hcl.rollback && !pcnetgame_hcl_dirty(h) && !s_crec.st_valid);
+}
+
+/* the house this GUEST client may edit as a roommate: the house it shares (STATUS + the local town agrees), or, after a demotion while it stood inside, that house
+ * until its exit commit settled (every NEW edit is locked meanwhile: pcnetgame_room_client_room_unconfirmed). -1 = none */
+static int pcnetgame_room_client_edit_house(void) {
+    if (s_role != PC_NETGAME_ROLE_CLIENT || pcnetgame_room_env_off()) {
+        return -1;
+    }
+    if (s_rmc.caps && s_rmc.status_valid && s_rmc.house >= 0 && pcnetgame_room_client_lives_in(s_rmc.house)) {
+        return s_rmc.house;
+    }
+    return s_rmc.frozen_house;
+}
+
+/* 1 = a GUEST stands in a player-house room that the vanilla code treats as editable (field_type PLAYER_ROOM: it entered as a roommate) but its rights are not
+ * confirmed now (link down, demoted = frozen, the STATUS not (yet) naming this house): every edit is refused (pc_net_game_client_room_edit_locked) */
+static int pcnetgame_room_client_room_unconfirmed(void) {
+    GAME_PLAY* play;
+    int sh;
+    if (s_role != PC_NETGAME_ROLE_CLIENT || gamePT == NULL || gamePT->exec != play_main || !pcnetgame_client_is_guest_player()) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    if (!mSc_IS_SCENE_PLAYER_HOUSE_ROOM((int)play->scene_id) || Common_Get(field_type) != mFI_FIELDTYPE2_PLAYER_ROOM) {
+        return 0;
+    }
+    sh = (int)Common_Get(house_owner_name) & 3;
+    return s_client_link != PC_NETGAME_LINK_READY || s_rmc.frozen_house == sh || pcnetgame_room_client_edit_house() != sh;
+}
+
+/* vanilla set_field_type (m_field_make.c, TARGET_PC): 1 = the local GUEST shares house h, so its room is the guest's own room (field_type PLAYER_ROOM: furniture,
+ * dressers, the music box, wallpaper / carpet editable like the holder's) */
+int pc_net_game_room_edit_room(int house) {
+    return pcnetgame_client_is_guest_player() && house >= 0 && house < PLAYER_NUM && s_client_link == PC_NETGAME_LINK_READY && pc_net_game_house_sync_active() &&
+           s_rmc.frozen_house < 0 && pcnetgame_room_client_edit_house() == house;
+}
+
 int pc_net_game_room_house_entry(int house) {
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !s_rmc.caps || pcnetgame_room_env_off() || !pcnetgame_client_is_guest_player() ||
         house < 0 || house >= PLAYER_NUM) {
         return 0;
     }
-    return pcnetgame_room_client_lives_in(house) ? 1 : -1;
+    return pcnetgame_room_client_lives_in(house) ? 1 : 0;
 }
 
-void pc_net_game_room_door_refused(void) {
-    const uint32_t now = pcnetgame_now_ms();
-    if (s_rmc.door_notice_ms == 0 || (uint32_t)(now - s_rmc.door_notice_ms) >= 3000u) {
-        s_rmc.door_notice_ms = now | 1u;
-        pc_room_ui_notice_set("Only the people who live here can go in");
-    }
-}
 
 /* the house scene the local player stands in (any floor), -1 = not a player house */
 static int pcnetgame_room_client_scene_house(GAME_PLAY* play) {
@@ -901,11 +984,22 @@ static void pcnetgame_room_client_tick(void) {
     }
     play = (GAME_PLAY*)gamePT;
     sh = pcnetgame_room_client_scene_house(play);
+    if (s_rmc.frozen_house >= 0 && sh != s_rmc.frozen_house && play->fb_wipe_mode == WIPE_MODE_NONE) {
+        if (s_rmc.frozen_left_ms == 0) {
+            s_rmc.frozen_left_ms = pcnetgame_now_ms() | 1u;
+        } else if ((uint32_t)(pcnetgame_now_ms() - s_rmc.frozen_left_ms) >= 2000u && (pcnetgame_room_client_pair_settled(s_rmc.frozen_house) ||
+                                                                                      (uint32_t)(pcnetgame_now_ms() - s_rmc.frozen_left_ms) >= PCNG_ROOM_FROZEN_TAIL_MS)) {
+            /* the last in-room edits were committed (or refused and rolled back): the house is no longer this guest's */
+            printf("[NET][ROOM] client: the freeze of house %d ended (left the house, %s)\n", s_rmc.frozen_house,
+                   pcnetgame_room_client_pair_settled(s_rmc.frozen_house) ? "the last commit settled" : "*** the cap: the pair did not settle ***");
+            s_rmc.frozen_house = -1;
+        }
+    }
     if (sh >= 0 && sh == s_rmc.house && pcnetgame_room_client_lives_in(sh) && play->fb_wipe_mode == WIPE_MODE_NONE && play->fb_fade_type == FADE_TYPE_NONE) {
         if (!s_rmc.welcomed) {
             s_rmc.welcomed = 1;
-            pc_room_ui_notice_set("Welcome home");
-            printf("[NET][ROOM] client: entered the shared house %d\n", sh);
+            printf("[NET][ROOM] client: entered the shared house %d (%s)\n", sh,
+                   Common_Get(field_type) == mFI_FIELDTYPE2_PLAYER_ROOM ? "its own room: editable like the holder's" : "as a visitor: the sync was not usable at the scene load");
         }
     } else if (sh < 0) {
         s_rmc.welcomed = 0;
@@ -913,7 +1007,7 @@ static void pcnetgame_room_client_tick(void) {
     if (s_rmc.eject_house < 0) {
         return;
     }
-    if (sh < 0 || (s_rmc.eject_house != PCNG_ROOM_EJECT_ANY && sh != s_rmc.eject_house)) {
+    if (sh < 0 || sh != s_rmc.eject_house) {
         if (sh < 0 && play->fb_wipe_mode == WIPE_MODE_NONE) {
             s_rmc.eject_house = -1; /* not inside: nothing to do */
         }
@@ -954,13 +1048,11 @@ static void pcnetgame_room_client_tick(void) {
 
 #ifdef PC_NET_TEST_HOOKS
 /* TEST-ONLY (PC_NET_TEST_HOOKS build + AC_TEST_HOOKS=1; never active in normal play):
- *   AC_TEST_ROOM_GYROID=1 (client): once READY + SYNCED with the host's roommates bit, the local player is put on the tile SOUTH of the nearest placed gyroid of the
- *     view (within 10 tiles) facing it and the REAL wait-state seam pc_ofurn_front_press() gets an A (a guest: the press; a resident: a tap). The menu is then
- *     driven by AC_TEST_ROOM_UI (pc_room_ui.c). Re-armed every 20 s while AC_TEST_ROOM_GYROID_REPEAT=1 (several menu visits in one run).
+ *   AC_TEST_ROOM_GYROID=<h> (client): once READY + SYNCED with the host's roommates bit, the local player is put one tile SOUTH of the gyroid of house h facing it
+ *     and the next frame the gyroid's REAL talk seam (ac_haniwa_move.c_inc -> pc_room_gyroid_intercept, with the vanilla talk-position test) counts as an A press.
+ *     The menu is then driven by AC_TEST_ROOM_UI (pc_room_ui.c). Re-armed every 20 s while AC_TEST_ROOM_GYROID_REPEAT=1 (several menu visits in one run).
  *   AC_TEST_ROOM_ENTER=1 (client): once this guest shares a house (STATUS) and stands idle in the town for 3 s, it walks into that house through goto_other_scene
  *     with the exit data a door writes (the house door itself is not walked to). */
-extern int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger);
-extern int pc_ofurn_test_grab_input(const char* script, int step);
 static void pcnetgame_room_test_hooks(void) {
     static uint32_t gy_t0 = 0, gy_last = 0, en_t0 = 0;
     static int gy_done = 0, en_done_house = -1;
@@ -976,38 +1068,41 @@ static void pcnetgame_room_test_hooks(void) {
     }
     if (pc_test_hook_getenv("AC_TEST_ROOM_GYROID") != NULL && s_rmc.caps && s_rmc.house < 0 && s_crec.state == PC_NETGAME_CRS_SYNCED && pcfa_scene_is_town() && !pc_room_ui_is_open() &&
         play->fb_wipe_mode == WIPE_MODE_NONE && (!gy_done || (pc_test_hook_getenv("AC_TEST_ROOM_GYROID_REPEAT") != NULL && (uint32_t)(now - gy_last) >= 20000u))) {
-        const PCOfurnTable* vt = pc_net_game_ofurn_view();
-        const int pux = (int)(pl->actor_class.world.position.x / mFI_UT_WORLDSIZE_X_F), puz = (int)(pl->actor_class.world.position.z / mFI_UT_WORLDSIZE_Z_F);
-        int k, best = -1, bd = 1 << 30;
-        xyz_t c;
+        const int h = atoi(pc_test_hook_getenv("AC_TEST_ROOM_GYROID")) & 3;
         if (gy_t0 == 0) {
             gy_t0 = now | 1u;
         }
         if ((uint32_t)(now - gy_t0) < 6000u) {
             return;
         }
-        for (k = 0; vt != NULL && k < vt->n; k++) {
-            const int dx = (int)vt->m[k].ut_x - pux, dz = (int)vt->m[k].ut_z - puz;
-            if (dx * dx + dz * dz < bd && dx * dx + dz * dz <= 100 && pc_net_game_room_is_gyroid((int)pc_ofurn_tile_value(&vt->m[k]))) {
-                bd = dx * dx + dz * dz;
-                best = k;
-            }
-        }
-        if (best < 0 || !mFI_UtNum2CenterWpos(&c, vt->m[best].ut_x, vt->m[best].ut_z + 1)) {
-            return;
-        }
-        pl->actor_class.world.position.x = c.x;
-        pl->actor_class.world.position.z = c.z;
-        pl->actor_class.shape_info.rotation.y = (s16)0x8000; /* facing north = the gyroid */
         {
-            int rot_only = 0;
-            const int mover = pc_net_game_ofurn_may_move(&rot_only);
-            if (mover) {
-                (void)pc_ofurn_test_grab_input("tap", 0);
+            /* first a same-town scene change that puts the player just south of the gyroid (a teleport alone may be held by a demo / arrival state and leaves the
+             * gyroid's acre unloaded); the press follows in the next visit of this hook */
+            static int gy_warped = 0;
+            if (!gy_warped) {
+                Door_data_c dd;
+                memset(&dd, 0, sizeof(dd));
+                dd.next_scene_id = SCENE_FG;
+                dd.exit_orientation = mSc_DIRECT_NORTH;
+                dd.exit_position.x = (s16)(pc_room_gyroid_ut[h][0] * 40 + 20);
+                dd.exit_position.z = (s16)(pc_room_gyroid_ut[h][1] * 40 + 20 + 38);
+                dd.door_actor_name = EMPTY_NO;
+                dd.wipe_type = WIPE_TYPE_FADE_BLACK;
+                if (goto_other_scene(play, &dd, FALSE) == 1) {
+                    gy_warped = 1;
+                    gy_t0 = now | 1u; /* the press 6 s later */
+                    printf("[NET][ROOM][TEST-ONLY] gyroid: warping in front of the gyroid of house %d (NOT active in normal play)\n", h);
+                }
+                return;
             }
-            printf("[NET][ROOM][TEST-ONLY] gyroid: the local player put south of the gyroid at (%u,%u) facing it; A (%s) -> %d (NOT active in normal play)\n",
-                   (unsigned)vt->m[best].ut_x, (unsigned)vt->m[best].ut_z, mover ? "tap" : "press", pc_ofurn_front_press(gamePT, 1, 0));
         }
+        /* the gyroid of house h stands on the centre of its tile; the player one tile SOUTH of it, facing north (talk distance 43) */
+        pl->actor_class.world.position.x = (float)pc_room_gyroid_ut[h][0] * mFI_UT_WORLDSIZE_X_F + 20.0f;
+        pl->actor_class.world.position.z = (float)pc_room_gyroid_ut[h][1] * mFI_UT_WORLDSIZE_Z_F + 20.0f + 38.0f;
+        pl->actor_class.shape_info.rotation.y = (s16)0x8000;
+        pl->actor_class.world.angle.y = (s16)0x8000;
+        pc_room_ui_test_press();
+        printf("[NET][ROOM][TEST-ONLY] gyroid: the local player put in front of the gyroid of house %d facing it; A armed (NOT active in normal play)\n", h);
         gy_done = 1;
         gy_last = now;
     }
@@ -1130,38 +1225,7 @@ void pc_net_game_dedicated_roommates(const char* args, void (*out)(const char*))
         out(line);
         return;
     }
-    if (strcmp(sub, "owner") == 0 && a1[0] != '\0' && a2[0] != '\0' && a3[0] != '\0') {
-        const int mi = pc_ofurn_find(&s_ofh, atoi(a1), atoi(a2));
-        int ri = -1;
-        uint8_t key[PC_ROOM_KEY_LEN];
-        if (mi < 0 || !pc_net_game_room_is_gyroid((int)pc_ofurn_tile_value(&s_ofh.m[mi]))) {
-            out("ROOMMATES OWNER FAILED: no placed gyroid on that tile (x z are town units; see `furniture list`)");
-            return;
-        }
-        if (a3[0] >= '0' && a3[0] <= '3' && a3[1] == '\0') {
-            ri = a3[0] - '0';
-        } else {
-            for (i = 0; i < PLAYER_NUM; i++) {
-                char nm[24];
-                pcnetgame_room_ascii8(Save_Get(private_data)[i].player_ID.player_name, nm);
-                if (mPr_NullCheckPersonalID(&Save_Get(private_data)[i].player_ID) == FALSE && pcnetgame_dedicated_ieq(nm, a3)) {
-                    ri = i;
-                }
-            }
-        }
-        if (ri < 0 || mPr_NullCheckPersonalID(&Save_Get(private_data)[ri].player_ID) == TRUE) {
-            out("ROOMMATES OWNER FAILED: no such resident (slot 0-3 or a resident name)");
-            return;
-        }
-        pcnetgame_pid_key(&Save_Get(private_data)[ri].player_ID, key);
-        if (!pcnetgame_room_claim(mi, key, "console")) {
-            out("ROOMMATES OWNER FAILED: that resident has no house, or outdoor_furniture.dat could not be written");
-            return;
-        }
-        out("[DEDICATED] roommates owner: the gyroid now belongs to that resident");
-        return;
-    }
-    out("ROOMMATES usage: roommates [list] | roommates remove <guest name> confirm | roommates clear <guest name> confirm | roommates owner <x> <z> <resident slot|name>");
+    out("ROOMMATES usage: roommates [list] | roommates remove <guest name> confirm | roommates clear <guest name> confirm");
 }
 
 /* ---- TEST-ONLY counters (the protocol test reads the log) ---- */

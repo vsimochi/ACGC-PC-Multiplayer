@@ -91,12 +91,12 @@ def main():
     hb = func_body(c, "pcnetgame_house_handle_begin")
     pc = func_body(c, "pcnetgame_house_process_commit")
     ok, miss = in_order(hb, ["pcnetgame_rec_gate(peer, in->xfer_id, 0)", "if (!g_pc_house_sync)", "PC_NETGAME_HOUSE_KIND_CANON_PUSH", "unknown kind", "strictly increasing",
-                             "if (idx >= PLAYER_NUM) {", "pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID)", "in->house != (uint8_t)h", "in->rsv != 0 || in->rsv2 != 0",
+                             "if (idx >= PLAYER_NUM && pcnetgame_room_peer_commit_house(peer) < 0) {", "pcnetgame_mbox_house_of(&Save_Get(private_data)[idx].player_ID)", "in->house != (uint8_t)h", "in->rsv != 0 || in->rsv2 != 0",
                              "PC_NETGAME_HOUSE_COMMIT_CHUNKS", "st->hup_open = 1;"])
     ck("H BEGIN handler order: gate, house sync on, misdirected CANON_PUSH dropped, unknown kind refused (+ violation), xfer increasing, GUEST -> NOT_OWNER BEFORE any homes[] / house index, house of the sender, claim checked, reserved, shape, open (missing: %s)" % miss, ok)
     ck("H the guest refusal uses the guest-slot test idx >= PLAYER_NUM (idx comes only from pcnetgame_rec_gate) and sends NOT_OWNER; the house index is derived from the BOUND record, never from the message",
-       "PC_NETGAME_HOUSE_ACK_NOT_OWNER" in hb[hb.index("if (idx >= PLAYER_NUM) {"):hb.index("pcnetgame_mbox_house_of(")] and "in->house" not in hb[:hb.index("in->house != (uint8_t)h")])
-    ok, miss = in_order(pc, ["pcnetgame_rec_gate(peer, xfer, 0)", "if (idx >= PLAYER_NUM) {", "pcnetgame_mbox_house_of(", "PC_NETGAME_HOUSE_ACK_BAD_SHAPE", "PC_NETGAME_HOUSE_ACK_BUSY",
+       "PC_NETGAME_HOUSE_ACK_NOT_OWNER" in hb[hb.index("if (idx >= PLAYER_NUM && pcnetgame_room_peer_commit_house(peer) < 0) {"):hb.index("pcnetgame_mbox_house_of(")] and "in->house" not in hb[:hb.index("in->house != (uint8_t)h")])
+    ok, miss = in_order(pc, ["pcnetgame_rec_gate(peer, xfer, 0)", "if (idx >= PLAYER_NUM && pcnetgame_room_peer_commit_house(peer) < 0) {", "pcnetgame_mbox_house_of(", "PC_NETGAME_HOUSE_ACK_BAD_SHAPE", "PC_NETGAME_HOUSE_ACK_BUSY",
                             "PC_NETGAME_HOUSE_ACK_BAD_DIGEST", "pcnetgame_local_house_unsafe(h)", "PC_NETGAME_HOUSE_ACK_RATE_LIMITED", "pcnetgame_rec_refresh_hostfields(idx, slot)",
                             "PC_NETGAME_HOUSE_ACK_STALE", "pcnetgame_rec_validate_fields(", "PC_NETGAME_HOUSE_ACK_INVALID_CELL", "pcnetgame_is_pocket_legal_item(nv)",
                             "pcnetgame_house_count_image(s_hs_cnt_old", "pcnetgame_house_conserved(", "PC_NETGAME_HOUSE_ACK_CONSERVATION", "pcnetgame_house_import_native(nimg",
@@ -131,7 +131,8 @@ def main():
        and "fl[0x8A1] < (u8)WALL_NUM" in func_body(c, "pcnetgame_house_count_image"))
     rj = func_body(c, "pcnetgame_house_reject")
     ck("H every rejection except BUSY / RATE_LIMITED / NOT_OWNER rolls the owner back: the house is owed again (hsent_seq cleared) and a FULL record push is queued; nothing was changed before",
-       "status != (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY && status != (uint8_t)PC_NETGAME_HOUSE_ACK_RATE_LIMITED && status != (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER" in rj
+       "status != (uint8_t)PC_NETGAME_HOUSE_ACK_BUSY && status != (uint8_t)PC_NETGAME_HOUSE_ACK_RATE_LIMITED &&" in rj
+       and "(status != (uint8_t)PC_NETGAME_HOUSE_ACK_NOT_OWNER || idx >= PLAYER_NUM)" in rj  # roommates: a guest's NOT_OWNER (a demoted roommate's late commit) rolls back too
        and "st->hsent_seq[h] = 0;" in rj and "pcnetgame_rec_stale_push(peer, idx, slot, pcnetgame_now_ms());" in rj)
     ht = func_body(c, "pcnetgame_house_host_tick")
     ck("H host tick: only with --house-sync + HOST role + world ready; guests are never pushed to; an open commit older than 5 s is discarded (nothing applied); the push pump is paced",
@@ -190,7 +191,7 @@ def main():
        and "b.rec_epoch = s_crec.base_epoch;" in pm and "b.rec_rev = s_crec.base_rev;" in pm and "pcnetgame_fnv1a32(s_hcl_tx, PC_NETGAME_HOUSE_COMMIT_SIZE)" in pm)
     ak = func_body(c, "pcnetgame_hcl_handle_ack")
     ck("G APPLIED moves the record base (pcnetgame_crec_set_base) and canon together; every refusal except BUSY / RATE_LIMITED / NOT_OWNER arms the rollback; NOT_OWNER disables the session; BUSY / RATE_LIMITED retry",
-       "pcnetgame_crec_set_base(a->epoch, a->rev, a->host_session," in ak and "s_hcp.canon_seq[h] = a->house_seq;" in ak and ak.count("s_hcl.rollback = 1;") == 2 and "s_hcl.disabled = 1;" in ak
+       "pcnetgame_crec_set_base(a->epoch, a->rev, a->host_session," in ak and "s_hcp.canon_seq[h] = a->house_seq;" in ak and ak.count("s_hcl.rollback = 1;") == 3 and "s_hcl.disabled = 1;" in ak and "if (pcnetgame_client_is_guest_player()) {" in ak
        and "PC_NETGAME_HCL_RETRY_BUSY_MS" in ak and "PC_NETGAME_HCL_RETRY_RATE_MS" in ak)
     qf = func_body(c, "pc_net_game_client_record_quit_flush")
     ck("G quit flush: the house flush runs first; when the player was inside its own house (or the house was never synced) the plain record flush is SKIPPED (it would upload the pockets of an unsent house edit alone)",
@@ -266,7 +267,7 @@ def main():
        and "aMR_pc_export_home(&s_hcl_cur, h, &fl)" in lw)
     ck("L client pre-check: before any in-room send the host's conservation rule is applied to (snapshot + pockets) vs the baseline pair captured at room entry / moved by each APPLIED; a mismatch stops in-room commits for the visit and sends nothing; the baseline moves only on APPLIED",
        cm.index("pcnetgame_house_conserved(s_hcl_cnt_base, s_hcl_cnt_new") < cm.index("pcnetgame_hcl_start_commit(h, now, in_room);") and "s_hcl.room_stopped = 1;" in cm
-       and "if (s_hcl.c_inroom) {\n                memcpy(s_hcl_cnt_base, s_hcl_cnt_new" in ak and ak.count("s_hcl.room_stopped = 1;") == 2)
+       and "if (s_hcl.c_inroom) {\n                memcpy(s_hcl_cnt_base, s_hcl_cnt_new" in ak and ak.count("s_hcl.room_stopped = 1;") == 3)  # roommates: a guest's NOT_OWNER stops the room like a refusal
     ck("L after a STALE / refusal in-room commits stop (room_stopped) until the owner leaves; the FULL adoption / stash restore stay blocked inside the room (unchanged adopt_blocker / on_full_adopt unsafe gates)",
        "pcnetgame_local_house_unsafe(h)" in fa and "staged_is_full && pcnetgame_local_house_unsafe(h)" in func_body(c, "pcnetgame_house_client_adopt_blocker")
        and "|| s_hcl.c_active || pcnetgame_local_house_unsafe(h) || pcnetgame_hcl_dirty(h);" in tg + func_body(c, "pcnetgame_house_client_upload_deferred") and "s_hcl.room_base_valid = 0;" in func_body(c, "pcnetgame_hcl_room_track"))
