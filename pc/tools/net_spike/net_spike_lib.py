@@ -1232,6 +1232,10 @@ PC_NETGAME_TXN_KIND_WORK = 16             # Nook Work Mode job transaction
 PC_NETGAME_TXN_REASON_WORK_NO_JOB = 33
 PC_NETGAME_TXN_REASON_WORK_STALE_JOB = 34
 PC_NETGAME_TXN_REASON_WORK_WALLET_FULL = 35
+PC_WORK_OP_URGE = 8                        # Nook Work Mode v2 (pc_work_logic.h): Check job -> "No." (the host may add the urgent bonus once)
+PC_WORK_OP_QUIT = 9                        # Work v2: quit with the job's QUEST item in the pockets (removed in the same step)
+PC_WORK_OP_VILLAGER_COMPLETE = 10          # Work v2: the parcel handed to its villager completes + pays the job (reward + tip) in one step
+PC_WORK_TXN_FLAG_V2 = 0x01                 # Work v2: tag.flags of a WORK op from a v2 client (only to a host whose service 11 said on)
 PC_NETGAME_TXN_KIND_EVNPC = 17            # event NPC reward
 PC_NETGAME_TXN_REASON_EVNPC_DONE = 36
 PC_NETGAME_TXN_KIND_DRESSER = 18          # dresser storage (master sprint 2, worker 12)
@@ -1290,6 +1294,8 @@ PC_NETGAME_TS_EVENT = 5        # events: the host's event DECISION state (subset
 PC_NETGAME_TS_EVENT_LEN = 214
 PC_NETGAME_TS_GUESTDIR = 7     # guest mailbox: the GUEST DIRECTORY, blob = u8 count (0..16) + 3 zero bytes + 16 x 20-byte PersonalID (raw LE PC image), unused entries zero
 PC_NETGAME_TS_GUESTDIR_LEN = 324  # 4 + 16 x 20
+PC_NETGAME_TS_WORK = 11        # Nook Work Mode v2: WORK_CAPS, blob = u8 version (1) + u8 flags (bit 0 = Work v2 on) + 6 zero bytes
+PC_NETGAME_TS_WORK_LEN = 8
 TOWN_SVC_STATE_FMT = "<BBHII"  # 12-byte header (msg_type, service, len, seq, digest); the blob (len bytes) follows
 # --- Mail milestone 2 (same v8, extended IN PLACE): MAILBOX_LETTER (id 56, host -> the OWNING client only, RELIABLE, 316 B): ONE slot of the host-held house
 # mailbox as its 298 canonical BE bytes (or an "empty" indication, flags bit 0), per-(resident, slot) seq, FNV-1a32 of the 298 bytes. ---

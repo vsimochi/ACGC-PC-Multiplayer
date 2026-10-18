@@ -6,6 +6,7 @@
 #include "pc_house_upgrade.h" /* house upgrades via Nook for resident clients (worker C): kind-20 transactions instead of local homes[] / loan writes */
 #include "pc_sell_ui.h" /* Nook bulk sell basket: the sell menu opens the basket screen in a multiplayer session (client + listen host) */
 #include "pc_handover.h" /* hand-over animations: Nook's Work Mode hand-overs + another player's hand-over seen on this process's keeper */
+#include "pc_work_logic.h" /* Nook Work Mode v2: the Check job choices (pc_work_v2_row) */
 #include <string.h>
 /* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
  * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
@@ -1915,7 +1916,9 @@ enum {
     aNSC_PC_UP_PENDING,     /* shop upgrade: the client's start request is in flight (the host's service 6 answers) */
     aNSC_PC_HU_BEGIN,       /* house upgrade (worker C): the wait row is up, begin the REHOUSE talk-start op (retried while another transaction is unresolved) */
     aNSC_PC_HU_PENDING,     /* house upgrade: the kind-20 transaction is in flight (the wait row stays at its continue point) */
-    aNSC_PC_HO_RUN          /* hand-over animations (pc_handover.h): a Work Mode hand-over plays (the job row is locked at its end), then END */
+    aNSC_PC_HO_RUN,         /* hand-over animations (pc_handover.h): a Work Mode hand-over plays (the job row is locked at its end), then END */
+    aNSC_PC_WK2_ASK,        /* Work v2: the Check job row is up ("did you bring ...?"): its choices come from pc_work_v2_row() */
+    aNSC_PC_WK2_ROWWAIT     /* Work v2: a row was selected; once it is ON SCREEN the hand-over starts (it plays while the row is read), then the next row */
 };
 
 static int aNSC_pc_hs_state;
@@ -2017,6 +2020,8 @@ static void aNSC_pc_rs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, 
  * (ac_quest_manager.c). The HOST owns the job, the validation and every payment; nothing here is authoritative. */
 static int aNSC_pc_wk_op;
 static PCWorkView aNSC_pc_wk_view; /* the job as the row on screen shows it (also the reward text of the closing row) */
+static int aNSC_pc_wk2, aNSC_pc_wk2_after;                                            /* Work v2 (defined with its block below) */
+static void aNSC_pc_wk2_check(NPC_SHOP_COMMON_ACTOR* shop_common, const PCWorkView* v); /* Work v2: the Check job row */
 
 static void aNSC_pc_wk_set_row(NPC_SHOP_COMMON_ACTOR* shop_common, int which) {
     unsigned char nm[8];
@@ -2066,6 +2071,12 @@ static void aNSC_pc_wk_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
     PCWorkView v;
     printf("[NET][WORK] nook dialogue: the Work Mode choice of the first page was taken\n");
     memset(&aNSC_pc_wk_view, 0, sizeof(aNSC_pc_wk_view));
+    aNSC_pc_wk2 = pc_net_game_work_v2();
+    aNSC_pc_wk2_after = -1;
+    if (aNSC_pc_wk2 && pc_net_game_work_offer_available() && pc_net_game_work_view(&v) && v.state == PC_WORK_STATE_ACTIVE && v.mode_on) {
+        aNSC_pc_wk2_check(shop_common, &v); /* Work v2: "Check job" */
+        return;
+    }
     if (!pc_net_game_work_offer_available()) {
         aNSC_pc_wk_op = PC_WORK_OP_ENTER;
         aNSC_pc_wk_fail_row(shop_common, PC_NETGAME_TS_REJECT_PRECOND, 1);
@@ -2241,9 +2252,149 @@ static int aNSC_pc_ho_tick(NPC_SHOP_COMMON_ACTOR* shop_common) {
     return TRUE;
 }
 
+/* ---- Nook Work Mode v2 (pc_work_logic.h; only with pc_net_game_work_v2(): the host announced it, the switch is on) ----
+ * "Give me a job" (no job): ENTER -> the assignment row (FRUIT / FETCH), or for a delivery TAKE_PARCEL at once -> "here is <item> for <villager>" while Nook hands
+ * it over -> the pay row. "Check job" (an active job): "did you bring <item> from <villager>?" with [Here it is! / I'll take it. / I delivered it.] No. / Quit job:
+ * No. = URGE (the HOST decides: "take your time" or "this is urgent" + a bonus, once); Quit job = QUIT (the job's item goes back to Nook while he says so) or LEAVE
+ * (nothing to give back). Every hand-over plays WHILE its row is read: the row is selected, and once it is on screen (pc_nook_wk2_serial changed) the vanilla
+ * hand-over starts; the row waits at its end for it, then the closing row follows. Nothing here is authoritative. */
+static int aNSC_pc_wk2;                 /* the running Work Mode flow is the v2 one */
+static int aNSC_pc_wk2_has;             /* the has-item bit of the Check job row on screen (its choices) */
+static int aNSC_pc_wk2_ho_op, aNSC_pc_wk2_next, aNSC_pc_wk2_frames, aNSC_pc_wk2_after = -1;
+static unsigned aNSC_pc_wk2_serial0;
+
+static void aNSC_pc_wk2_prep(const PCWorkView* v, unsigned bonus) {
+    unsigned char nm[8], it[16];
+    int art = 0;
+    memset(nm, ' ', sizeof(nm));
+    (void)pc_net_game_work_villager_name(v->target_villager, nm);
+    pc_nook_house_set_work_view(v, nm);
+    pc_net_game_work_item_name(v->job_type == PC_WORK_JOB_DELIVER_VILLAGER && v->carried_item != 0 ? v->carried_item : v->obj_item, it, &art);
+    pc_nook_house_set_work_item(it, art);
+    pc_nook_house_set_wk2_extra(bonus, aNSC_pc_wk2_has);
+}
+
+/* a closing row (MSGEND) */
+static void aNSC_pc_wk2_end(NPC_SHOP_COMMON_ACTOR* shop_common, int variant) {
+    aNSC_pc_wk2_prep(&aNSC_pc_wk_view, 0u);
+    pc_nook_house_set_wk2(variant, PC_WK2_V_NONE);
+    printf("[NET][WORK] nook dialogue v2: row %d\n", variant);
+    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_WK2, 0);
+}
+
+/* row1 (a hand-over plays while it is read) + row2 (closing) */
+static void aNSC_pc_wk2_row_ho(NPC_SHOP_COMMON_ACTOR* shop_common, int row1, int row2, int ho_op) {
+    aNSC_pc_wk2_prep(&aNSC_pc_wk_view, 0u);
+    pc_nook_house_set_wk2(row1, row2);
+    aNSC_pc_wk2_serial0 = pc_nook_wk2_serial();
+    aNSC_pc_wk2_ho_op = ho_op;
+    aNSC_pc_wk2_next = row2;
+    aNSC_pc_wk2_frames = 0;
+    printf("[NET][WORK] nook dialogue v2: row %d (hand-over of op %d while it is read), then row %d\n", row1, ho_op, row2);
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_WK2);
+    aNSC_pc_hs_state = aNSC_PC_WK2_ROWWAIT;
+}
+
+/* one frame of ROWWAIT: the row came on screen -> start its hand-over (or, without one, continue to the closing row) */
+static void aNSC_pc_wk2_rowwait(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int n = 0;
+    if (pc_nook_wk2_serial() == aNSC_pc_wk2_serial0 && ++aNSC_pc_wk2_frames < 1800) {
+        return; /* the previous row is still being read */
+    }
+    if (pc_nook_wk2_serial() != aNSC_pc_wk2_serial0 && pc_handover_enabled()) {
+        n = pc_ho_work_plan(aNSC_pc_wk2_ho_op, 1, aNSC_pc_wk_view.obj_item, aNSC_pc_wk_view.carried_item, 0, 0, aNSC_pc_ho_kind, aNSC_pc_ho_item);
+    }
+    if (n <= 0) {
+        aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_WK2_NEXT, 0);
+        return;
+    }
+    aNSC_pc_ho_n = n;
+    aNSC_pc_ho_idx = 0;
+    aNSC_pc_ho_step = 0;
+    aNSC_pc_ho_frames = 0.0f;
+    aNSC_pc_wk2_after = PC_NOOK_MSG_WK2_NEXT;
+    mMsg_Set_LockContinue(mMsg_Get_base_window_p()); /* the row waits at its end until the hand-over is over */
+    aNSC_pc_hs_state = aNSC_PC_HO_RUN;
+    printf("[NET][HANDOVER] nook work v2: op %d -> %s item 0x%04X while the row is read\n", aNSC_pc_wk2_ho_op,
+           aNSC_pc_ho_kind[0] == PC_HO_KIND_NPC_GIVES ? "Nook -> player" : "player -> Nook", (unsigned)aNSC_pc_ho_item[0]);
+}
+
+/* the Check job row */
+static void aNSC_pc_wk2_check(NPC_SHOP_COMMON_ACTOR* shop_common, const PCWorkView* v) {
+    aNSC_pc_wk_view = *v;
+    aNSC_pc_wk2_has = pc_net_game_work_has_item(v);
+    aNSC_pc_wk2_prep(v, 0u);
+    pc_nook_house_set_wk2(PC_WK2_V_CHECK, PC_WK2_V_NONE);
+    printf("[NET][WORK] nook dialogue v2: Check job: job %u type %d step %d item 0x%04X villager 0x%04X reward %u has_item %d urged %d\n", v->job_id, v->job_type, v->obj_state,
+           (unsigned)v->obj_item, (unsigned)v->target_villager, v->reward, aNSC_pc_wk2_has, v->urged);
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_WK2);
+    aNSC_pc_hs_state = aNSC_PC_WK2_ASK;
+}
+
+/* a v2 op finished (APPLIED, or done at once for the host's own player) */
+static void aNSC_pc_wk2_done(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    PCWorkView v;
+    const PCWorkView before = aNSC_pc_wk_view;
+    int have = pc_net_game_work_view(&v);
+    switch (aNSC_pc_wk_op) {
+        case PC_WORK_OP_ENTER:
+            if (!have || v.state != PC_WORK_STATE_ACTIVE) {
+                aNSC_pc_wk_fail_row(shop_common, PC_NETGAME_TS_REJECT_WORK_NO_JOB, 1);
+                break;
+            }
+            aNSC_pc_wk_view = v;
+            if (v.job_type == PC_WORK_JOB_DELIVER_VILLAGER && v.obj_state == PC_WORK_OBJ_START) {
+                if (pc_net_game_work_has_item(&v)) {
+                    aNSC_pc_wk_op = PC_WORK_OP_TAKE_PARCEL; /* the delivery item is handed over right with the job */
+                    aNSC_pc_hs_state = aNSC_PC_WK_OP_BEGIN;
+                } else {
+                    aNSC_pc_wk2_end(shop_common, PC_WK2_V_NOROOM);
+                }
+                break;
+            }
+            aNSC_pc_wk2_end(shop_common, PC_WK2_V_ASSIGN);
+            break;
+        case PC_WORK_OP_TAKE_PARCEL:
+            if (have) {
+                aNSC_pc_wk_view = v;
+            }
+            aNSC_pc_wk2_row_ho(shop_common, PC_WK2_V_PARCEL, PC_WK2_V_PARCEL_PAY, PC_WORK_OP_TAKE_PARCEL);
+            break;
+        case PC_WORK_OP_DELIVER:
+            aNSC_pc_wk2_row_ho(shop_common, PC_WK2_V_THANKS, PC_WK2_V_PAID, PC_WORK_OP_DELIVER); /* the reward of the job that was on screen */
+            break;
+        case PC_WORK_OP_REPORT:
+            aNSC_pc_wk2_end(shop_common, PC_WK2_V_PAID);
+            break;
+        case PC_WORK_OP_URGE:
+            if (have) {
+                aNSC_pc_wk_view = v;
+            }
+            if (have && v.urged && v.reward > before.reward) {
+                aNSC_pc_wk2_prep(&aNSC_pc_wk_view, v.reward - before.reward);
+                pc_nook_house_set_wk2(PC_WK2_V_URGENT, PC_WK2_V_NONE);
+                printf("[NET][WORK] nook dialogue v2: the job is urgent: +%u Bells, %u in all\n", v.reward - before.reward, v.reward);
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_WK2, 0);
+            } else {
+                aNSC_pc_wk2_end(shop_common, (have && v.urged) ? PC_WK2_V_HURRY : PC_WK2_V_RELAX);
+            }
+            break;
+        case PC_WORK_OP_QUIT:
+            aNSC_pc_wk2_row_ho(shop_common, PC_WK2_V_TAKEBACK, PC_WK2_V_QUIT, PC_WORK_OP_QUIT); /* Nook takes the job's item back while he says so */
+            break;
+        default: /* LEAVE */
+            aNSC_pc_wk2_end(shop_common, PC_WK2_V_QUIT);
+            break;
+    }
+}
+
 /* the op finished (APPLIED, or done at once for the host's own player) */
 static void aNSC_pc_wk_done(NPC_SHOP_COMMON_ACTOR* shop_common) {
     PCWorkView v;
+    if (aNSC_pc_wk2) {
+        aNSC_pc_wk2_done(shop_common); /* Work v2: its own rows */
+        return;
+    }
     switch (aNSC_pc_wk_op) {
         case PC_WORK_OP_ENTER:
             aNSC_pc_wk_show_job(shop_common);
@@ -2269,6 +2420,11 @@ static void aNSC_pc_wk_begin(NPC_SHOP_COMMON_ACTOR* shop_common) {
     int r = pc_net_game_work_begin_op(aNSC_pc_wk_op, 0);
     if (r < 0) {
         return; /* another transaction is unresolved: next frame */
+    }
+    if (r == 0 && aNSC_pc_wk2 && aNSC_pc_wk_op == PC_WORK_OP_QUIT) {
+        printf("[NET][WORK] nook dialogue v2: the job's item is not in the pockets any more: quitting without it (LEAVE)\n");
+        aNSC_pc_wk_op = PC_WORK_OP_LEAVE; /* nothing to give back (the item was lost / never taken): the plain quit, next frame */
+        return;
     }
     if (r == 0) {
         aNSC_pc_wk_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 0); /* refused locally: nothing was sent */
@@ -2509,7 +2665,14 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
         case aNSC_PC_HO_RUN:
             if (aNSC_pc_ho_tick(shop_common)) {
                 aNSC_pc_hs_state = aNSC_PC_HS_END; /* the end row (already set as the continue message) follows */
+                if (aNSC_pc_wk2_after >= 0) {
+                    aNSC_pc_hs_set_msg(shop_common, aNSC_pc_wk2_after); /* Work v2: the hand-over played while its row was read: now the closing row */
+                    aNSC_pc_wk2_after = -1;
+                }
             }
+            break;
+        case aNSC_PC_WK2_ROWWAIT:
+            aNSC_pc_wk2_rowwait(shop_common);
             break;
         case aNSC_PC_RS_BEGIN:
             r = pc_net_game_restock_begin();
@@ -2539,6 +2702,7 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
             break;
         case aNSC_PC_UP_ASK:
         case aNSC_PC_WK_ASK:
+        case aNSC_PC_WK2_ASK:
         case aNSC_PC_RS_ASK:
         case aNSC_PC_HS_ASK_INTRO:
         case aNSC_PC_HS_ASK_PICK:
@@ -2547,7 +2711,20 @@ static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pl
                 return;
             }
             k = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
-            if (aNSC_pc_hs_state == aNSC_PC_UP_ASK) {
+            if (aNSC_pc_hs_state == aNSC_PC_WK2_ASK) {
+                int acts[4];
+                const int n = pc_work_v2_row(aNSC_pc_wk_view.job_type, aNSC_pc_wk_view.obj_state, aNSC_pc_wk2_has, acts, 4);
+                const int act = (k >= 0 && k < n) ? acts[k] : PC_WORK_ACT_LATER;
+                aNSC_pc_wk_op = act == PC_WORK_ACT_HAND ? PC_WORK_OP_DELIVER : act == PC_WORK_ACT_TAKE ? PC_WORK_OP_TAKE_PARCEL : act == PC_WORK_ACT_REPORT ? PC_WORK_OP_REPORT
+                              : act == PC_WORK_ACT_NO ? PC_WORK_OP_URGE
+                              : act == PC_WORK_ACT_QUIT ? (aNSC_pc_wk_view.obj_state == PC_WORK_OBJ_CARRYING ? PC_WORK_OP_QUIT : PC_WORK_OP_LEAVE) : 0;
+                printf("[NET][WORK] nook dialogue v2: Check job choice %d -> action %d (op %d)\n", k, act, aNSC_pc_wk_op);
+                if (aNSC_pc_wk_op == 0) {
+                    aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_LATER);
+                } else {
+                    aNSC_pc_hs_state = aNSC_PC_WK_OP_BEGIN; /* the row stays up until the host answers */
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_UP_ASK) {
                 printf("[NET][SHOPUP] nook dialogue: the announcement was acknowledged (choice %d): starting the closure\n", k);
                 aNSC_pc_hs_state = aNSC_PC_UP_BEGIN; /* every choice is an acknowledgement: the upgrade is Nook's decision */
             } else if (aNSC_pc_hs_state == aNSC_PC_WK_ASK) {

@@ -9,7 +9,7 @@
  * The shop actor (ac_npc_shop_common.c) drives the dialogue (state machine aNSC_pc_house_proc); this file knows nothing about it except the few values it must print.
  * Charset: letters, digits, space and ! ' , - . ? : only (the font has no arbitrary punctuation; '/' draws a music note). pc_nook_house_selftest() checks every byte. */
 
-#define PC_NOOK_MSG_COUNT 53
+#define PC_NOOK_MSG_COUNT 55
 enum {
     PC_NOOK_MSG_INTRO = 0, /* first talk: greeting + "would you like a house?" Yes./No. (the answer is read by the actor) */
     PC_NOOK_MSG_OTHER,     /* the guest variant of the "Other things" submenu (vanilla message + a 4th choice "Buy a house.") */
@@ -70,7 +70,11 @@ enum {
     PC_NOOK_MSG_EVC_WISP_DONE,    /* the Wisp: somebody already returned the spirits (CLAIMED 51 for op 5) */
     PC_NOOK_MSG_EVC_NO_SPIRITS,   /* the Wisp: NO_SPIRITS 54 */
     /* Nook bulk sell basket (pc_sell_ui.h; appended: every earlier id keeps its value): */
-    PC_NOOK_MSG_SELL_BASKET       /* the quote of a closed basket: "That's N items ... X Bells for the lot" Yes./No. (read by aNSC_buy_check like the vanilla offer) */
+    PC_NOOK_MSG_SELL_BASKET,      /* the quote of a closed basket: "That's N items ... X Bells for the lot" Yes./No. (read by aNSC_buy_check like the vanilla offer) */
+    /* Nook Work Mode v2 (pc_work_logic.h; appended: every earlier id keeps its value). Two generated rows whose TEXT is a variant (PC_WK2_V_*) chosen by the actor
+     * right before it selects them (pc_nook_house_set_wk2): WK2 = the row on screen now, WK2_NEXT = the row after it (a hand-over plays while WK2 is read). */
+    PC_NOOK_MSG_WK2,
+    PC_NOOK_MSG_WK2_NEXT
 };
 
 #define PC_NOOK_SEL_BASE 607 /* == mChoice_SELECT_STR_NUM: the first reserved choice string id */
@@ -79,6 +83,10 @@ enum { PC_NOOK_SEL_BUY_HOUSE = PC_NOOK_SEL_BASE, PC_NOOK_SEL_HOUSE1, PC_NOOK_SEL
        PC_NOOK_SEL_UP_GREAT,     /* shop upgrade announcement: "Sounds great!" */
        PC_NOOK_SEL_UP_OK,        /* shop upgrade announcement: "All right." */
        PC_NOOK_SEL_CHECK_MAIL,   /* guest mailbox: the post office girl's "Check my mail." (appended) */
+       PC_NOOK_SEL_GIVE_JOB,     /* Work v2: "Give me a job" (the first page, no job) */
+       PC_NOOK_SEL_CHECK_JOB,    /* Work v2: "Check job" (the first page, an active job) */
+       PC_NOOK_SEL_QUIT_JOB,     /* Work v2: "Quit job" */
+       PC_NOOK_SEL_TAKE_IT,      /* Work v2: "I'll take it" (a parcel that did not fit the pockets at the assignment) */
        PC_NOOK_SEL_COUNT_END };
 /* one choice string per house: a different PC_RESIDENCE_HOUSES needs more PC_NOOK_SEL_HOUSEn entries (and Nook's choice paging beyond 6 choices; see the roadmap) */
 _Static_assert(PC_NOOK_SEL_ANY_HOUSE - PC_NOOK_SEL_HOUSE1 == 4, "one PC_NOOK_SEL_HOUSEn per house (PC_RESIDENCE_HOUSES)");
@@ -107,7 +115,11 @@ int pc_net_game_restock_begin(void);
 int pc_net_game_restock_price(void);
 int pc_net_game_shop_restocking(void);
 /* Nook Work Mode (pc_net_game.c). The character's job as the host last told us (host role: its own table). */
-enum { PC_WORK_OP_ENTER = 1, PC_WORK_OP_DELIVER = 2, PC_WORK_OP_LEAVE = 3, PC_WORK_OP_TAKE_PARCEL = 4, PC_WORK_OP_VILLAGER_GIVE = 5, PC_WORK_OP_VILLAGER_RECEIVE = 6, PC_WORK_OP_REPORT = 7 };
+enum { PC_WORK_OP_ENTER = 1, PC_WORK_OP_DELIVER = 2, PC_WORK_OP_LEAVE = 3, PC_WORK_OP_TAKE_PARCEL = 4, PC_WORK_OP_VILLAGER_GIVE = 5, PC_WORK_OP_VILLAGER_RECEIVE = 6, PC_WORK_OP_REPORT = 7,
+       /* Work v2 (pc_work_logic.h; only with the host's service 11 bit): */
+       PC_WORK_OP_URGE = 8, PC_WORK_OP_QUIT = 9, PC_WORK_OP_VILLAGER_COMPLETE = 10 };
+#define PC_WORK_OP_MAX_V1 7
+#define PC_WORK_OP_MAX_V2 10
 enum { PC_WORK_STATE_NONE = 0, PC_WORK_STATE_ACTIVE = 1 };
 enum { PC_WORK_JOB_NONE = 0, PC_WORK_JOB_FRUIT = 1, PC_WORK_JOB_FETCH_VILLAGER = 2, PC_WORK_JOB_DELIVER_VILLAGER = 3, PC_WORK_JOB_MAX = 3 };
 enum { PC_WORK_OBJ_START = 0, PC_WORK_OBJ_CARRYING = 1, PC_WORK_OBJ_DELIVERED = 2 };
@@ -116,6 +128,7 @@ typedef struct PCWorkView {
     int      mode_on, state /* 0 none, 1 active */, job_type /* 1 fruit, 2 fetch from a villager, 3 deliver to a villager */, obj_state /* 0 start, 1 carrying, 2 delivered */, tip_kind;
     unsigned job_id, reward, jobs_done, tip_value;
     int      obj_item, carried_item, target_villager /* npc_id */;
+    int      v2_job /* a Work v2 job */, urged /* the urgent bonus was added */, auto_done /* the last job was completed at the villager */;
 } PCWorkView;
 /* offer_available: the host's own player (world ready) or a READY client. view: 1 = filled, 0 = unknown yet. begin_op(op, npc): op 1 ENTER, 2 DELIVER, 3 LEAVE (quit), 4 TAKE_PARCEL, 5
  * VILLAGER_GIVE, 6 VILLAGER_RECEIVE (npc = the villager's npc_id), 7 REPORT; HOST role runs the host rules at once and returns 3 (done) or 0 (refused, pc_net_game_ts_last_reject_reason());
@@ -127,6 +140,13 @@ int pc_net_game_work_begin_op(int op, int npc);
 int pc_net_game_work_begin(int op);
 int pc_net_game_work_villager_pending(int npc, int* op);
 int pc_net_game_work_villager_name(int npc, unsigned char* out8);
+/* Work v2 (pc_work_logic.h): v2() = 1 when the v2 dialogue / ops are used (host role: its own switch; client: READY + the host's service 11 bit + the local switch);
+ * has_item(v) = the pockets hold what the job's next Nook step needs (FRUIT: the fruit; FETCH carrying: the QUEST item; DELIVER start: a free pocket);
+ * item_name(item, out16, &article) = the game's own item name (16 bytes, space padded) + its mIN_ARTICLE_*; notice(text) = one local line in the chat log. */
+int pc_net_game_work_v2(void);
+int pc_net_game_work_has_item(const PCWorkView* v);
+void pc_net_game_work_item_name(int item, unsigned char* out16, int* article);
+void pc_net_game_work_notice(const char* ascii);
 
 /* The in-process rejoin of the promoted guest (pc_main.c pc_main_play_online_poll) WAITS while the Nook congratulation row is still being read: the shop sets the hold when it
  * shows the row and clears it when the conversation ended; pc_nook_house_rejoin_hold() (polled once per frame by the rejoin) returns 1 while the hold is on. */
@@ -160,6 +180,34 @@ void pc_nook_house_set_work_view(const PCWorkView* v, const unsigned char* villa
 /* The choices of the job row (PC_NOOK_WACT_*), shared by the message builder and the actor so both agree on what choice k means; returns the count (2..3). */
 enum { PC_NOOK_WACT_HAND = 0, PC_NOOK_WACT_LATER, PC_NOOK_WACT_QUIT, PC_NOOK_WACT_TAKE, PC_NOOK_WACT_REPORT };
 int pc_nook_work_row(const PCWorkView* v, int* acts, int cap);
+/* Work v2 rows (PC_NOOK_MSG_WK2 / _NEXT): the variant of each (PC_WK2_V_*), the item name bytes of the job (16, space padded, + mIN_ARTICLE_*), the urgent bonus
+ * shown by PC_WK2_V_URGENT, the "has the item" bit of the Check job row (pc_work_v2_row). serial() counts the builds of PC_NOOK_MSG_WK2 / WK2_NEXT: an actor that
+ * selects a row records it first and knows the row is ON SCREEN when it changed (the hand-over then plays while it is read). */
+enum {
+    PC_WK2_V_NONE = 0,
+    PC_WK2_V_ASSIGN,      /* Nook: the new FRUIT / FETCH job (closing row) */
+    PC_WK2_V_PARCEL,      /* Nook: the new DELIVER job: "here is <item> for <villager>" (Nook hands it over while it is read; continues) */
+    PC_WK2_V_PARCEL_PAY,  /* Nook: after PARCEL: the pay comes when it is delivered (closing row) */
+    PC_WK2_V_NOROOM,      /* Nook: the new DELIVER job but no free pocket: make room, then Check job (closing row) */
+    PC_WK2_V_CHECK,       /* Nook: "did you bring <item> from <villager>?" + the pc_work_v2_row() choices */
+    PC_WK2_V_RELAX,       /* Nook, "No.": take your time, it is not urgent (closing row) */
+    PC_WK2_V_URGENT,      /* Nook, "No.": it IS urgent, the bonus is added (closing row) */
+    PC_WK2_V_HURRY,       /* Nook, "No." again on an urgent job (closing row) */
+    PC_WK2_V_TAKEBACK,    /* Nook, "Quit job" with the item in the pockets: he takes it back while it is read (continues) */
+    PC_WK2_V_QUIT,        /* Nook: the job is quit (closing row) */
+    PC_WK2_V_THANKS,      /* Nook: the item is handed in, the player hands it over while it is read (continues) */
+    PC_WK2_V_PAID,        /* Nook: the reward was paid (closing row) */
+    PC_WK2_V_VGIVE,       /* villager (FETCH): "Nook sent you for <item>? Here you go!" (the villager hands it over while it is read; continues) */
+    PC_WK2_V_VGIVE_BYE,   /* villager: "tell him I said hello" (closing row) */
+    PC_WK2_V_VRECV,       /* villager (DELIVER): "<item> from Tom Nook? For me?" (the player hands it over while it is read; continues) */
+    PC_WK2_V_VRECV_TIP,   /* villager, old step (op 6): thank you + the job's old-style tip (closing row; Nook pays at REPORT) */
+    PC_WK2_V_VDONE,       /* villager, auto-complete (op 10): the tip + Nook's pay, job done (closing row) */
+    PC_WK2_V_COUNT
+};
+void pc_nook_house_set_wk2(int variant, int next_variant);
+void pc_nook_house_set_work_item(const unsigned char* name16, int article);
+void pc_nook_house_set_wk2_extra(unsigned bonus, int has_item);
+unsigned pc_nook_wk2_serial(void);
 /* The FIRST PAGE of Nook's talk (vanilla message 0x1092): adds "I'd like to work" (no job) / "Check my job" (active job) as a choice before the last one, decided from the
  * authoritative job state at the moment the message is loaded. Returns the new length (0 = not patched). pc_nook_first_page_work() = 1 when the message on screen carries the
  * extra choice (the actor then reads choice 3 as Work Mode). */

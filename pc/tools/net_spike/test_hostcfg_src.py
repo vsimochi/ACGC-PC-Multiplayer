@@ -45,7 +45,7 @@ def main():
 
     # ------------------------------------------------------------------ A1 wire
     check("A1 wire: service 4 HOST_CONFIG, array bound 11, 8-byte blob and the fit assert exist in C; python lib == C; the message struct / size asserts are untouched (352 B)",
-          "#define PC_NETGAME_TS_HOSTCFG  4u" in c and "#define PC_NETGAME_TS_NUM      11u" in c and "#define PC_NETGAME_TS_HOSTCFG_LEN 8u" in c
+          "#define PC_NETGAME_TS_HOSTCFG  4u" in c and "#define PC_NETGAME_TS_NUM      12u" in c and "#define PC_NETGAME_TS_HOSTCFG_LEN 8u" in c
           and "PC_NETGAME_TS_HOSTCFG_LEN <= PC_NETGAME_TS_BLOB_MAX" in c and "_Static_assert(sizeof(PCNetGameTownSvcStateMsg) == 352," in c
           and "PC_NETGAME_TS_HOSTCFG = 4 " in lib and "PC_NETGAME_TS_HOSTCFG_LEN = 8" in lib and L.PC_NETGAME_TS_HOSTCFG == 4 and L.PC_NETGAME_TS_HOSTCFG_LEN == 8)
     check("A1 wire: the wire_baseline pins cover the new constants (TS_C_PINS + lib pins) and its self-test mutations for them exist",

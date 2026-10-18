@@ -383,7 +383,8 @@ void pc_sell_ui_test_tick(void) {
     int i, r;
     if (enabled < 0) {
         const char* e = pc_test_hook_getenv("AC_TEST_SELL_BASKET");
-        enabled = e == NULL ? 0 : (e[0] == '2' ? 2 : 1); /* 2 = the NOOK mode (test_sell_basket_real.py R4): the basket is opened by Nook's real dialogue */
+        enabled = e == NULL ? 0 : (e[0] == '2' ? 2 : e[0] == '3' ? 3 : 1); /* 2 = the NOOK mode (test_sell_basket_real.py R4): the basket is opened by Nook's real dialogue;
+                                                                              * 3 = only the placement in front of Nook, no pocket writes (test_work_v2_real.py) */
     }
     if (!enabled || stage >= 90 || pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || pc_net_game_client_link_state() != PC_NETGAME_LINK_READY || Now_Private == NULL ||
         play == NULL) {
@@ -399,6 +400,11 @@ void pc_sell_ui_test_tick(void) {
             return;
         }
         if ((uint32_t)(now - t0) < 8000u) {
+            return;
+        }
+        if (enabled == 3) {
+            t0 = now;
+            stage = 1; /* placement only: the pockets stay as they are */
             return;
         }
         {
@@ -451,7 +457,7 @@ void pc_sell_ui_test_tick(void) {
             snap[i] = (unsigned short)Now_Private->inventory.pockets[i];
         }
         wallet0 = Now_Private->inventory.wallet;
-        if (enabled == 2) {
+        if (enabled == 2 || enabled == 3) {
             t0 = now;
             stage = 20; /* the NOOK mode: Nook's own dialogue opens the basket */
             return;

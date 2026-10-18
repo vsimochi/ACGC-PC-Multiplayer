@@ -15,6 +15,7 @@ The table (request -> 0.1.1 host behaviour -> how the new client stays safe):
   TXN kind 19 MUSEUM_MAIL -> 0.1.1: unknown kind = BAD_SHAPE + violation -> sent only when the host announced town service 6, latched off after one BAD_SHAPE
   TXN kind 20 HOUSE_UPGRADE -> 0.1.1: unknown kind = BAD_SHAPE + violation -> same gate + latch (worker C)
   TXN kind 21 EVNPC_CLAIM -> 0.1.1 / 0.2.x: unknown kind = BAD_SHAPE + violation -> sent only after the host's town service 9 said ON for the op, latched off after one BAD_SHAPE (worker E)
+  TXN kind 16 WORK ops 8..10 / tag.flags 1 (Nook Work Mode v2) -> 0.1.1 .. 0.4.0: BAD_SHAPE + violation -> sent only after the host's town service 11 said ON, latched off after one BAD_SHAPE
   TXN kind 12 MAIL_SEND by a GUEST -> 0.1.1: refused "guest has no house" BEFORE the shape check (no violation); resident shape unchanged
   TXN kind 13 MAIL_TAKE of the guest mailbox -> only offered when the host fed a guest mailbox (a 0.1.1 host never does)
   TXN kind 8 MUSEUM_DONATE by a guest -> same tag shape as 0.1.1 (aux 0, dest NONE): a semantic refusal (NO_DONOR_SLOT), never BAD_SHAPE
@@ -112,6 +113,13 @@ ck("K100 CHAT_SEND: a client sends it only when pc_net_game_chat_available() (RE
    "s_chat_cli_caps = 0;" in body(ng, "static void pcnetgame_chat_client_tick(void) {"))
 gu = body(ng, "static int pcnetgame_client_guest_mailbox_usable(void) {")
 ck("K13 guest MAIL_TAKE / 'Check my mail.': only when the host fed a guest mailbox (s_mbox_host_fed && s_mbox_guest)", "s_mbox_host_fed && s_mbox_guest" in gu)
+wv = body(ng, "int pc_net_game_work_v2(void) {")
+wb = body(ng, "int pc_net_game_work_begin_op(int op, int npc) {")
+ck("K16 Work v2 (TXN kind 16 ops 8..10 + tag.flags bit 0): sent only when pc_net_game_work_v2() -- READY + the host's town service 11 WORK_CAPS with bit 0 (an old host "
+   "never sends service 11; its WORK shape refuses ops > 7 / flags != 0 as BAD_SHAPE + violation) -- and latched off after one BAD_SHAPE; WORK_STATE flag bits 1..3 go only to a peer "
+   "that sent a v2-flagged op (an OLD CLIENT refuses a WORK_STATE with unknown flag bits) and service 11 is unknown to an old client (ignored)",
+   "s_ts_client_have[PC_NETGAME_TS_WORK] && s_work_caps_on && !s_work_v2_refused" in wv and "op > (pc_net_game_work_v2() ? PC_WORK_OP_MAX_V2 : PC_WORK_OP_MAX_V1)" in wb
+   and "s_ctxn.take_dst = (uint8_t)(pc_net_game_work_v2() ? PC_WORK_TXN_FLAG_V2 : 0u);" in wb and "s_host_peer[peer].work_v2" in ng and "s_work_v2_refused = 1;" in ng)
 
 # ---- the released 0.1.1 host
 try:

@@ -103,7 +103,7 @@ def main():
     # ---------------- W: no wire change
     ck("W1 no new transaction kind / reason / town service: the last kind is still 22 (OUTDOOR_FURN), the last reason 62, PC_NETGAME_TS_NUM 11; no SELL_MULTI",
        "#define PC_NETGAME_TXN_KIND_OUTDOOR_FURN 22u" in ng and not re.search(r"#define PC_NETGAME_TXN_KIND_\w+\s+23u", ng) and "SELL_MULTI" not in ng
-       and not re.search(r"#define PC_NETGAME_TXN_REASON_\w+\s+6[3-9]u", ng) and re.search(r"#define PC_NETGAME_TS_NUM\s+11u", ng))
+       and not re.search(r"#define PC_NETGAME_TXN_REASON_\w+\s+6[3-9]u", ng) and re.search(r"#define PC_NETGAME_TS_NUM\s+12u", ng))
     shape = ng[ng.index("} else if (is_sell) {\n            shape_ok ="):][:400]
     ck("W2 the host's SHOP_SELL shape already accepts any slot mask of mixed items (only the primary slot's bit and bits 0..14 are required) and values EVERY masked slot (all or nothing)",
        "(t->aux_item & 0x8000u) == 0" in shape and "(t->aux_item & (1u << t->slot)) != 0" in shape
@@ -150,7 +150,7 @@ def main():
     ck("B2 an empty selection takes the VANILLA sell-cancel path (aNSC_CHECK_BUY_NONE_SELECTED -> aNSC_MSG_SELL_CANCEL -> BUY_CONTINUE_CHECK = his 'anything else?' choice), logged; no new Nook row",
        "action = aNSC_CHECK_BUY_NONE_SELECTED;" in mw2 and "aNSC_MSG_SELL_CANCEL," in mw2 and "aNSC_ACTION_BUY_CONTINUE_CHECK," in mw2
        and "if (action == aNSC_CHECK_BUY_NONE_SELECTED && pc_sell_ui_enabled()) {" in mw2 and "the vanilla sell-cancel row 0x%04X" in mw2
-       and "#define PC_NOOK_MSG_COUNT 53" in nkh)
+       and "#define PC_NOOK_MSG_COUNT 55" in nkh)
     op2 = func_body(ui, "void pc_sell_ui_open(")
     ck("B3 never remembered: every open starts EMPTY (pc_sell_basket_clear, no prune of an old basket), the confirmed close empties the basket after building the selection",
        "pc_sell_basket_clear(&s_basket);" in op2 and "prune" not in op2 and "s_confirmed = 0;" in op2
@@ -177,8 +177,8 @@ def main():
     ck("B7 the button is drawn (green / grey panel right of the grid, 'Sell' + count + total) and the bottom hint names the controls (a notice takes its place)",
        "const int on = pc_sell_ui_can_confirm();" in hw and "mHW_pc_basket_button_v" in hw and 'memcpy(line[0], "Sell", 5);' in hw
        and '"A: Add or Take Back    Sell: A on Sell or Start    B: Cancel"' in ui and "const char* sell_hint = pc_sell_ui_hint();" in pm)
-    ck("N5 the quote row: appended LAST (index 52, count 53), Yes. / No., built without the 'choice made' demo order (aNSC_buy_after_service waits for that order after a sale)",
-       "#define PC_NOOK_MSG_COUNT 53" in nkh and re.search(r"PC_NOOK_MSG_SELL_BASKET\s+/\*", nkh) and "case PC_NOOK_MSG_SELL_BASKET:" in nk
+    ck("N5 the quote row: index 52 (appended after the earlier rows; Work v2 appended its 2 rows after it: count 55), Yes. / No., built without the 'choice made' demo order (aNSC_buy_after_service waits for that order after a sale)",
+       "#define PC_NOOK_MSG_COUNT 55" in nkh and re.search(r"PC_NOOK_MSG_SELL_BASKET,?\s+/\*", nkh) and "case PC_NOOK_MSG_SELL_BASKET:" in nk
        and "nk_choice_plain(&b, ids, 2);" in nk and "NK_DEMO_NPC0" not in func_body(nk, "static void nk_choice_plain(")
        and "That's %d item%s in all." in nk and "pc_sell_format_bells(bells, sizeof(bells), s_sell_total)" in nk)
 

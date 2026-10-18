@@ -7,9 +7,11 @@
 static int g_offer = 1;
 static PCWorkView g_view;
 static int g_view_known = 1;
+static int g_v2 = 0; /* Work v2: the host announced it (service 11) */
 
 int pc_net_game_work_offer_available(void) { return g_offer; }
 int pc_net_game_work_view(PCWorkView* v) { *v = g_view; return g_view_known; }
+int pc_net_game_work_v2(void) { return g_v2; }
 int pc_net_game_house_purchase_price(void) { return 18400; }
 int pc_shop_upgrade_minutes_total(void) { return 5; } /* the shop upgrade rows (pc_shop_upgrade.h) */
 int pc_shop_upgrade_minutes_left(void) { return 3; }
@@ -45,7 +47,7 @@ static int run(const char* what, int idx) {
 
 int main(void) {
     int bad = 0;
-    printf("CONST SEL_WORK=%d SEL_JOB=%d\n", PC_NOOK_SEL_WORK, PC_NOOK_SEL_JOB);
+    printf("CONST SEL_WORK=%d SEL_JOB=%d SEL_GIVE=%d SEL_CHECK=%d\n", PC_NOOK_SEL_WORK, PC_NOOK_SEL_JOB, PC_NOOK_SEL_GIVE_JOB, PC_NOOK_SEL_CHECK_JOB);
     memset(&g_view, 0, sizeof(g_view));
     g_offer = 0;
     bad += run("offline", 0x1092);            /* solo / not connected: the vanilla page, untouched */
@@ -60,6 +62,13 @@ int main(void) {
     g_view_known = 0;
     bad += run("unknownyet", 0x1092);         /* nothing received yet: treated as no job (ENTER resumes an existing one) */
     bad += run("othermsg", 0x1093);           /* any other message is never touched */
+    g_view_known = 1;
+    g_v2 = 1;                                 /* Work v2 host: "Give me a job" / "Check job" */
+    g_view.state = 0;
+    bad += run("v2nojob", 0x1092);
+    g_view.state = 1;
+    bad += run("v2activejob", 0x1092);
+    g_v2 = 0;
     printf("selftest=%d\n", pc_nook_house_selftest());
     return bad;
 }

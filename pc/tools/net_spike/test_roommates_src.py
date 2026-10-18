@@ -73,7 +73,7 @@ ck("W1 PC_NETGAME_MSG_ROOMMATE = 104 in the enum, asserted equal to PC_ROOM_MSG_
 kinds = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_KIND_\w+\s+(\d+)u", ng)]
 reasons = [int(v) for v in re.findall(r"#define PC_NETGAME_TXN_REASON_\w+\s+(\d+)u", ng)]
 ck("W2 no new TXN kind (max %d = 22), reason (max %d = 62) or town service (TS_NUM 11)" % (max(kinds), max(reasons)),
-   max(kinds) == 22 and max(reasons) == 62 and "#define PC_NETGAME_TS_NUM      11u" in ng and "ROOMMATE" not in " ".join(re.findall(r"#define (PC_NETGAME_TXN_\w+)", ng)))
+   max(kinds) == 22 and max(reasons) == 62 and "#define PC_NETGAME_TS_NUM      12u" in ng and "ROOMMATE" not in " ".join(re.findall(r"#define (PC_NETGAME_TXN_\w+)", ng)))
 ck("W3 the capability: PC_OFURN_C4_ROOMMATES = bit 1 of the 102 CAPS total (C3 storage keeps bit 0); the host ORs it in, the client reads it with its own mask",
    "#define PC_OFURN_C4_ROOMMATES 0x02u" in ofh and "#define PC_OFURN_C3_STORAGE 0x01u" in ofh
    and "m.total = pcnetgame_ofurn_c3_flags() | pcnetgame_room_caps_bit();" in ng and "pcnetgame_room_client_caps(m->total);" in ng

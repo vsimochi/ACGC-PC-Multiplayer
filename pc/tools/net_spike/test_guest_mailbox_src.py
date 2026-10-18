@@ -171,7 +171,7 @@ def main():
     ck("E the offer needs a READY guest whose post office mailbox the host FED (an older host / the switch off never feeds it: no row)",
        "return pcnetgame_client_guest_mailbox_usable() && Now_Private != NULL;" in func_body(c_raw, "pc_net_game_guest_mail_offer_available"))
     ck("E the text: 'Check my mail.' (<= 16 characters), two closing rows ending with MSGEND, inside the PC message table (COUNT 41); the patch inserts before the cancel choice",
-       'snprintf(tmp, sizeof(tmp), "Check my mail.");' in nk and "#define PC_NOOK_MSG_COUNT 53" in read("pc/include/pc_nook_house.h")  # worker C: + the 4 house-upgrade rows (41..44); worker E: + the 7 event NPC rows (45..51)  # + the Nook bulk sell basket quote row (52)
+       'snprintf(tmp, sizeof(tmp), "Check my mail.");' in nk and "#define PC_NOOK_MSG_COUNT 55" in read("pc/include/pc_nook_house.h")  # worker C: + the 4 house-upgrade rows (41..44); worker E: + the 7 event NPC rows (45..51)  # + the Nook bulk sell basket quote row (52)
        and "PC_NOOK_SEL_CHECK_MAIL" in func_body(nk, "nk_post_mail_patch") and "s_pm_choice = k - 1;" in func_body(nk, "nk_post_mail_patch"))
     ck("E the daily limit maps onto the post girl's 'can't take more' row (3), never 'no such address'", "case PC_GUEST_MAIL_REJECT_LIMIT:" in pg and "#define PC_GUEST_MAIL_REJECT_LIMIT 38" in gmh)
 

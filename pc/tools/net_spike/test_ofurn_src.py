@@ -44,7 +44,7 @@ blk = ng[ng.index("/* ===== OUTDOOR FURNITURE BEGIN"):ng.index("/* ===== OUTDOOR
 # ---- wire / dispatch
 ck("W1 kind 22 / message 98 / service 10 / reasons 55..61 defined and asserted against pc_outdoor_furniture.h",
    "#define PC_NETGAME_TXN_KIND_OUTDOOR_FURN 22u" in ng and "PC_NETGAME_MSG_OUTDOOR_FURN         = 98," in ng and "#define PC_NETGAME_TS_OFURN   10u" in ng
-   and "#define PC_NETGAME_TS_NUM      11u" in ng and "PC_NETGAME_TXN_REASON_OFURN_GONE == PC_OFURN_REASON_GONE" in ng and "(int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID" in ng)
+   and "#define PC_NETGAME_TS_NUM      12u" in ng and "PC_NETGAME_TXN_REASON_OFURN_GONE == PC_OFURN_REASON_GONE" in ng and "(int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID" in ng)
 hd = body(ng, "static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, uint16_t size) {") if "static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, uint16_t size) {" in ng else ng
 ck("W2 the host routes kind 22 to its own one-phase handler and drops a client-originated message 98",
    "pcnetgame_handle_host_ofurn_txn(peer, &tc);" in ng and "if (data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN || data[0] == (uint8_t)PC_NETGAME_MSG_OUTDOOR_FURN2) {\n        return;" in ng)

@@ -209,8 +209,9 @@ TS_C_PINS = ("#define PC_NETGAME_TS_POLICE   1u", "#define PC_NETGAME_TS_MUSEUM 
              # worker B (deliberate): service 8 = MUSEUM_DONORS (284-byte guest donor names), array bound 9; an old client ignores service 8
              # worker E (deliberate): service 9 = EVNPC_CAPS (8-byte shared event NPC capability), array bound 10; an old client ignores service 9
              # outdoor furniture C1 (deliberate): service 10 = OFURN_CAPS (8-byte capability blob), array bound 11; an old client ignores service 10
-             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      11u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
-             "#define PC_NETGAME_TS_OFURN_LEN 8u",
+             # Nook Work Mode v2 (deliberate, no protocol bump): service 11 = WORK_CAPS (8-byte capability blob, pc_work_logic.h), array bound 12; an old client ignores service 11
+             "#define PC_NETGAME_TS_HOSTCFG  4u", "#define PC_NETGAME_TS_NUM      12u", "#define PC_NETGAME_TS_HOSTCFG_LEN 8u",
+             "#define PC_NETGAME_TS_OFURN_LEN 8u", "#define PC_NETGAME_TS_WORK    11u", "#define PC_NETGAME_TS_WORK_LEN 8u",
              "#define PC_NETGAME_TS_MDONORS  8u", "#define PC_NETGAME_TS_EVNPC    9u", "#define PC_NETGAME_TS_EVNPC_LEN 8u", "#define PC_NETGAME_TS_MDONORS_LEN (4u + 120u + PC_NETGAME_MDONORS_NAMES * 20u) /* 284 (worker B) */",
              "#define PC_NETGAME_TS_GUESTDIR 7u", "#define PC_NETGAME_TS_GUESTDIR_LEN (4u + PC_NETGAME_GUESTDIR_MAX * 20u) /* 324 */", "#define PC_NETGAME_GUESTDIR_MAX   16u",
              "#define PC_NETGAME_TS_UPGRADE  6u", "#define PC_NETGAME_TS_UPGRADE_LEN 16u",
@@ -475,6 +476,8 @@ V8_LIB_PINNED = {
     "PC_NETGAME_TS_EVENT_LEN": '214',
     "PC_NETGAME_TS_GUESTDIR": '7',     # letters to guests (deliberate): the GUEST DIRECTORY service
     "PC_NETGAME_TS_GUESTDIR_LEN": '324',
+    "PC_NETGAME_TS_WORK": '11',        # Nook Work Mode v2 (deliberate): the WORK_CAPS service
+    "PC_NETGAME_TS_WORK_LEN": '8',
     "PC_NETGAME_TS_BLOB_MAX": '340',
     "PC_NETGAME_TS_POLICE_LEN": '40',
     "PC_NETGAME_TS_MUSEUM_LEN": '63',

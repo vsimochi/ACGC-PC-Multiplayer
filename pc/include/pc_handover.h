@@ -157,7 +157,9 @@ static inline int pc_ho_rate_ok(PCHoRate* r, uint32_t now_ms) {
  * op numbers = PC_WORK_OP_* (pc_nook_house.h): 2 DELIVER (player -> Nook: the objective), 4 TAKE_PARCEL (Nook -> player: the parcel),
  * 5 VILLAGER_GIVE (villager -> player: the fetched item), 6 VILLAGER_RECEIVE (player -> villager: the parcel, then an ITEM tip villager -> player).
  * ENTER / LEAVE / REPORT move no item by hand (REPORT pays Bells into the wallet, as vanilla Nook's payments do). tip_kind 2 = an item tip
- * (PC_WORK_TIP_ITEM). Returns the number of steps (0..2); kinds[i] = PC_HO_KIND_*, items[i] = the item. A step with no item is dropped. */
+ * (PC_WORK_TIP_ITEM). Work v2 (pc_work_logic.h): 9 QUIT (player -> Nook: the job's item goes back; carried_item, else obj_item), 10 VILLAGER_COMPLETE (player ->
+ * villager: the parcel; the tip and Nook's pay are Bells, no hand-over); 8 URGE moves nothing.
+ * Returns the number of steps (0..2); kinds[i] = PC_HO_KIND_*, items[i] = the item. A step with no item is dropped. */
 static inline int pc_ho_work_plan(int op, int applied, int obj_item, int carried_item, int tip_kind, int tip_value, int* kinds, int* items) {
     int n = 0;
     if (!applied) {
@@ -171,6 +173,10 @@ static inline int pc_ho_work_plan(int op, int applied, int obj_item, int carried
             if (carried_item != 0) { kinds[n] = PC_HO_KIND_NPC_TAKES; items[n++] = carried_item; }
             if (tip_kind == 2 && tip_value != 0) { kinds[n] = PC_HO_KIND_NPC_GIVES; items[n++] = tip_value; }
             break;
+        case 9:
+            if (carried_item != 0 || obj_item != 0) { kinds[n] = PC_HO_KIND_NPC_TAKES; items[n++] = carried_item != 0 ? carried_item : obj_item; }
+            break;
+        case 10: if (carried_item != 0) { kinds[n] = PC_HO_KIND_NPC_TAKES; items[n++] = carried_item; } break;
         default: break;
     }
     return n;

@@ -45,7 +45,7 @@ def main():
 
     # ------------------------------------------------------------------ I
     ck("I service 7 GUEST_DIR (324 = 4 + 16 x 20), the array bound 11, the size asserted against the blob max and sizeof(PersonalID_c)",
-       "#define PC_NETGAME_TS_GUESTDIR 7u" in c_raw and "#define PC_NETGAME_TS_NUM      11u" in c_raw  # worker B re-pin: service 8 MUSEUM_DONORS raised the bound to 9
+       "#define PC_NETGAME_TS_GUESTDIR 7u" in c_raw and "#define PC_NETGAME_TS_NUM      12u" in c_raw  # worker B re-pin: service 8 MUSEUM_DONORS raised the bound to 9
        and "#define PC_NETGAME_GUESTDIR_MAX   16u" in c_raw
        and "_Static_assert(PC_NETGAME_TS_GUESTDIR_LEN == 324u && PC_NETGAME_TS_GUESTDIR_LEN <= PC_NETGAME_TS_BLOB_MAX && sizeof(PersonalID_c) == 20u," in c_raw
        and L.PC_NETGAME_TS_GUESTDIR == 7 and L.PC_NETGAME_TS_GUESTDIR_LEN == 324)

@@ -151,6 +151,8 @@ static uint32_t s_ac_result_entity; /* TEST-ONLY auto-catch: the last catch outc
 static int      s_ac_result;        /* 1 accepted, 2 rejected */
 #endif
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the dialogue-side helpers defined near the house purchase seam */
+#include "pc_work_logic.h" /* Nook Work Mode v2: ops 8..10, WORK_STATE flags, service 11, the urgent / tip rolls (pure) */
+#include "m_item_name.h"   /* Nook Work Mode v2: the game's item names in the job rows (mIN_copy_name_str) */
 #include "pc_evnpc_shared.h" /* worker E: shared event NPC claims (kind 21, service 9) */
 #include "pc_guest_mail.h" /* guest mailbox: the overlay / post office girl seams (pc_ui_mailbox, pc_net_game_guest_mail_offer_available ...) */
 #include "pc_guest_event_due.h" /* guest mailbox: the vanilla mail-event date rule (birthday / Christmas letters for guests) */
@@ -545,7 +547,8 @@ typedef enum PCNetGameMsgType {
                                              * standing in its own house (SCENE_NPC_HOUSE, owner = the villager's npc_id), sampled by the room's pose holder (any in-room player process) -> host, which
                                              * validates that the sender announced exactly that room and holds the room lease, then relays it to every OTHER in-room READY peer. An old peer drops it. */
     PC_NETGAME_MSG_WORK_STATE            = 68, /* Nook Work Mode (v8 unreleased: extended in place, NO version bump), host -> the ONE requesting client, RELIABLE, 36 bytes. The character's job
-                                             * exactly as the host's work table holds it, sent at READY + SYNCED (connect, reconnect) and right BEFORE the TXN_RESULT of every WORK op (any outcome). 36 bytes. The client mirrors it; it never decides. */
+                                             * exactly as the host's work table holds it, sent at READY + SYNCED (connect, reconnect) and right BEFORE the TXN_RESULT of every WORK op (any outcome). 36 bytes. The client mirrors it; it never decides.
+                                             * Work v2: flags bits 1..3 (PC_WORK_SF_*: v2 job, urged, auto-completed) ONLY to a peer that sent a v2-flagged WORK op this session (an old client refuses them). */
     PC_NETGAME_MSG_EVNPC_STATE           = 69, /* Event NPC authority (v8 unreleased: extended in place, NO version bump), host -> every READY client, RELIABLE, 104 bytes. The event NPCs (Gulliver,
                                              * K.K., the Wisp, the peddlers...) the HOST has in its town: npc id, world position, facing; sent on change and at READY. A client creates / removes its
                                              * local actors to match and never creates one on its own. An old peer drops it. */
@@ -2844,7 +2847,11 @@ _Static_assert(sizeof(PCNetGameTxnResultMsg) <= PC_NET_MAX_PAYLOAD,
                                      * kind 21 only after this service said "on" for the op. An old client ignores the unknown service. */
 #define PC_NETGAME_TS_OFURN   10u   /* outdoor furniture C1: OFURN_CAPS (pc_outdoor_furniture.h; NOT a save region). 8 bytes: u8 version (1), u8 flags (bit 0 = Place on, bit 1 = leaf drop on),
                                      * u16 LE safety ceiling per town, u16 LE per acre, u16 0. A client sends kind 22 only after this service arrived. An old client ignores the unknown service. */
-#define PC_NETGAME_TS_NUM      11u  /* array bound: services 1..10 named (index 0 unused), 11+ reserved */
+#define PC_NETGAME_TS_WORK    11u   /* Nook Work Mode v2: WORK_CAPS (pc_work_logic.h; NOT a save region). 8 bytes: u8 version (1), u8 flags (bit 0 = the host runs Work v2: ops 8..10, the
+                                     * v2 tag flag), 6 reserved zero bytes. A client uses Work v2 only after this arrived with bit 0. An old client ignores the unknown service. */
+#define PC_NETGAME_TS_NUM      12u  /* array bound: services 1..11 named (index 0 unused), 12+ reserved */
+#define PC_NETGAME_TS_WORK_LEN 8u
+_Static_assert(PC_NETGAME_TS_WORK_LEN == PC_WORK_CAPS_LEN, "the WORK_CAPS blob length drifted from pc_work_logic.h");
 #define PC_NETGAME_TS_OFURN_LEN 8u
 #define PC_NETGAME_TS_EVNPC_LEN 8u
 #define PC_NETGAME_TS_BLOB_MAX 340u
@@ -3976,6 +3983,7 @@ typedef struct PCNetGameHostPeerState {
     int                  bound_resident_idx;
     PersonalID_c         bound_pid; /* the host's saved PersonalID of that resident AT BIND TIME (re-validation) */
     int                  work_sent; /* Nook Work Mode: the job state was sent to this peer since its record became SYNCED */
+    int                  work_v2;   /* Nook Work Mode v2: this peer sent a v2-flagged WORK op in this session (only then WORK_STATE carries flag bits 1..3) */
     uint32_t             nlease_seq; /* Patch 8: the NPC_LEASE seq this peer has received (0 = none yet) */
     uint32_t             evnpc_seq; /* event NPC authority: the EVNPC_STATE seq this peer has received (0 = none yet) */
     int                  ctx_player_no_warned; /* PLAYER_CONTEXT player_no mismatch warned once per connection */
@@ -20802,12 +20810,13 @@ typedef struct PCNetWorkChar {
     uint8_t      obj_state;      /* PC_WORK_OBJ_* */
     uint8_t      tip_kind;       /* PC_WORK_TIP_* */
     uint8_t      tip_paid;
-    uint8_t      _pad;
+    uint8_t      wflags;         /* Work v2 (PC_WORK_WF_*): a v2 job, the urgent bonus added, completed at the villager. 0 in every older file (the old pad byte) = a v1 job */
 } PCNetWorkChar;
 _Static_assert(sizeof(PCNetWorkChar) == 56, "PCNetWorkChar persisted layout drifted");
 
 static int pcnetgame_work_op_has_slot(uint8_t op) {
-    return op == PC_WORK_OP_DELIVER || op == PC_WORK_OP_TAKE_PARCEL || op == PC_WORK_OP_VILLAGER_GIVE || op == PC_WORK_OP_VILLAGER_RECEIVE;
+    return op == PC_WORK_OP_DELIVER || op == PC_WORK_OP_TAKE_PARCEL || op == PC_WORK_OP_VILLAGER_GIVE || op == PC_WORK_OP_VILLAGER_RECEIVE || op == PC_WORK_OP_QUIT ||
+           op == PC_WORK_OP_VILLAGER_COMPLETE; /* Work v2: QUIT returns the job's item, VILLAGER_COMPLETE hands the parcel over */
 }
 
 /* Capacity phase 7: the work table is DYNAMIC. It was a fixed array of PC_WORK_MAX_CHARS (64) records, one per CHARACTER ever to use Work Mode, residents and guests alike: the 65th
@@ -20958,6 +20967,87 @@ static uint16_t pcnetgame_work_tip_item(uint32_t h) {
     return pool[h % (uint32_t)(sizeof(pool) / sizeof(pool[0]))];
 }
 
+/* ---- Nook Work Mode v2 (pc_work_logic.h) ----
+ * Switch (host and client): AC_MP_WORK_V2=0 or settings.ini [Gameplay] work_v2 = 0 = the previous Work Mode (no service 11 bit, ops 8..10 / the v2 tag flag refused
+ * exactly as before). A job created by a v2 ENTER (tag.flags bit 0) is a v2 job: its errand item comes from the varied pools below (chosen by the host from the job
+ * id), its villager tip is decided at the payout from the friendship of that villager with the character. Older jobs (wflags 0, the stationery ones) keep their rules. */
+static int pcnetgame_work_v2_on(void) {
+    static int s_env = -1;
+    if (s_env < 0) {
+        const char* e = getenv("AC_MP_WORK_V2");
+        s_env = (e != NULL && e[0] == '0') ? 0 : 1; /* ON by default */
+    }
+    return s_env && g_pc_settings.work_v2;
+}
+
+static int s_work_req_v2 = 0; /* the op being planned / committed came with the v2 tag flag (set by both callers right before the plan) */
+
+/* The varied errand items (v2 jobs). FETCH = what a villager has for Nook (fruit, sweets, small furniture, clothes, umbrellas, rugs, wallpaper, stationery);
+ * DELIVER = what Nook sends to a villager (small furniture, a cake, clothes, umbrellas, rugs, wallpaper, sweets, stationery). Every entry is an ordinary single
+ * pocket item (never a tool, a bug / fish (museum), money, a ticket or a gyroid); it travels as a vanilla QUEST item, so it cannot be sold / used / dropped while
+ * the job runs, and the job removes it when it ends (delivered, handed in or quit). */
+static const uint16_t s_work_v2_fetch_pool[] = {
+    (uint16_t)ITM_FOOD_APPLE, (uint16_t)ITM_FOOD_CHERRY, (uint16_t)ITM_FOOD_PEAR, (uint16_t)ITM_FOOD_PEACH, (uint16_t)ITM_FOOD_ORANGE, (uint16_t)ITM_FOOD_COCONUT,
+    (uint16_t)ITM_FOOD_CANDY, (uint16_t)FTR_START(FTR_SUM_BDCAKE01), (uint16_t)FTR_START(FTR_SUM_DOLL01), (uint16_t)FTR_START(FTR_SUM_GLOBE01),
+    (uint16_t)FTR_START(FTR_SUM_PL_POTHOS), (uint16_t)FTR_START(FTR_SUM_UWA_VASE01), (uint16_t)FTR_START(FTR_SUM_RADIO01), (uint16_t)FTR_START(FTR_KON_REDCLOCK),
+    (uint16_t)(ITM_CLOTH_START + 17), (uint16_t)(ITM_CLOTH_START + 88), (uint16_t)(ITM_UMBRELLA_START + 6), (uint16_t)(ITM_CARPET_START + 15),
+    (uint16_t)(ITM_WALL_START + 20), (uint16_t)(ITM_PAPER_START + 5)
+};
+static const uint16_t s_work_v2_parcel_pool[] = {
+    (uint16_t)FTR_START(FTR_SUM_BDCAKE01), (uint16_t)FTR_START(FTR_SUM_DOLL02), (uint16_t)FTR_START(FTR_SUM_GLOBE01), (uint16_t)FTR_START(FTR_SUM_PL_POTHOS),
+    (uint16_t)FTR_START(FTR_SUM_UWA_VASE02), (uint16_t)FTR_START(FTR_SUM_RADIO02), (uint16_t)FTR_START(FTR_KON_AMECLOCK), (uint16_t)FTR_START(FTR_SUM_UWA_CUP01),
+    (uint16_t)(ITM_CLOTH_START + 3), (uint16_t)(ITM_CLOTH_START + 42), (uint16_t)(ITM_CLOTH_START + 120), (uint16_t)(ITM_UMBRELLA_START + 1),
+    (uint16_t)(ITM_UMBRELLA_START + 12), (uint16_t)(ITM_CARPET_START + 2), (uint16_t)(ITM_WALL_START + 4), (uint16_t)ITM_FOOD_CANDY, (uint16_t)(ITM_PAPER_START + 21)
+};
+
+static uint16_t pcnetgame_work_v2_item(int type, uint32_t job_id) {
+    if (type == PC_WORK_JOB_FETCH_VILLAGER) {
+        return pc_work_v2_pick(s_work_v2_fetch_pool, (int)(sizeof(s_work_v2_fetch_pool) / sizeof(s_work_v2_fetch_pool[0])), job_id);
+    }
+    return pc_work_v2_pick(s_work_v2_parcel_pool, (int)(sizeof(s_work_v2_parcel_pool) / sizeof(s_work_v2_parcel_pool[0])), job_id);
+}
+
+/* the friendship (Anmmem_c.friendship) of villager `npc` with character `pid` in the HOST's town; 0 = no memory of the character / no such villager */
+static int pcnetgame_work_friendship(const PersonalID_c* pid, uint16_t npc) {
+    int i, mi;
+    for (i = 0; i < ANIMAL_NUM_MAX; i++) {
+        Animal_c* a = &Save_Get(animals)[i];
+        if (mNpc_CheckFreeAnimalInfo(a) == FALSE && (uint16_t)a->id.npc_id == npc) {
+            mi = mNpc_GetAnimalMemoryIdx((PersonalID_c*)pid, a->memories, ANIMAL_MEMORY_NUM);
+            return mi >= 0 ? (int)a->memories[mi].friendship : 0;
+        }
+    }
+    return 0;
+}
+
+/* the v2 villager tip of this job right now (pc_work_v2_tip: 50..300 + 2 per friendship point) */
+static uint32_t pcnetgame_work_v2_tip_of(const PCNetWorkChar* w) {
+    return pc_work_v2_tip(w->job_id, pcnetgame_work_friendship(&w->key, w->target_villager));
+}
+
+/* the job is urgent (pc_work_v2_urgent); TEST-ONLY AC_TEST_WORK_URGENT=1 / 0 (AC_TEST_HOOKS=1) forces it */
+static int pcnetgame_work_urgent(const PCNetWorkChar* w) {
+    const char* e = pc_test_hook_getenv("AC_TEST_WORK_URGENT");
+    if (e != NULL && (e[0] == '0' || e[0] == '1')) {
+        return e[0] == '1';
+    }
+    return pc_work_v2_urgent(w->job_id);
+}
+
+static void pcnetgame_work_log_item(const char* what, uint16_t item) {
+    u8 nm[mIN_ITEM_NAME_LEN + 1];
+    int i;
+    memset(nm, 0, sizeof(nm));
+    mIN_copy_name_str(nm, (mActor_name_t)item);
+    for (i = 0; i < mIN_ITEM_NAME_LEN; i++) {
+        if (nm[i] < 0x20 || nm[i] > 0x7E) {
+            nm[i] = '?';
+        }
+    }
+    nm[mIN_ITEM_NAME_LEN] = 0;
+    printf("[NET][WORK] host: %s item 0x%04X = \"%s\" (article %d)\n", what, (unsigned)item, (const char*)nm, mIN_get_item_article((mActor_name_t)item));
+}
+
 /* ENTER: Work Mode on; a character without an active job receives a new one (an existing active job is kept: ENTER is idempotent). */
 static void pcnetgame_work_enter(PCNetWorkChar* w) {
     uint16_t vill[ANIMAL_NUM_MAX];
@@ -20965,6 +21055,20 @@ static void pcnetgame_work_enter(PCNetWorkChar* w) {
     int nv, type;
     const char* force;
     w->mode_on = 1;
+    {   /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_WORK_POOL_DUMP=1): the game names of every Work v2 pool item, once (the real test shows them in its report) */
+        static int s_pool_dumped = 0;
+        const char* pd = pc_test_hook_getenv("AC_TEST_WORK_POOL_DUMP");
+        if (!s_pool_dumped && pd != NULL && pd[0] == '1') {
+            size_t k;
+            s_pool_dumped = 1;
+            for (k = 0; k < sizeof(s_work_v2_fetch_pool) / sizeof(s_work_v2_fetch_pool[0]); k++) {
+                pcnetgame_work_log_item("pool FETCH", s_work_v2_fetch_pool[k]);
+            }
+            for (k = 0; k < sizeof(s_work_v2_parcel_pool) / sizeof(s_work_v2_parcel_pool[0]); k++) {
+                pcnetgame_work_log_item("pool DELIVER", s_work_v2_parcel_pool[k]);
+            }
+        }
+    }
     if (w->state == PC_WORK_STATE_ACTIVE) {
         return;
     }
@@ -21000,6 +21104,7 @@ static void pcnetgame_work_enter(PCNetWorkChar* w) {
     }
     w->state = PC_WORK_STATE_ACTIVE;
     w->job_id = s_work_next_job_id;
+    w->wflags = (uint8_t)(s_work_req_v2 ? PC_WORK_WF_V2 : 0u); /* Work v2: a job of a v2 ENTER (also clears URGED / AUTO of the previous job) */
     w->job_type = (uint8_t)type;
     w->obj_count = 1;
     w->obj_state = PC_WORK_OBJ_START;
@@ -21013,11 +21118,26 @@ static void pcnetgame_work_enter(PCNetWorkChar* w) {
         w->obj_item = pcnetgame_work_town_fruit();
     } else {
         w->target_villager = vill[(h >> 8) % (uint32_t)nv];
-        w->obj_item = pcnetgame_work_errand_item(h >> 12);
+        {   /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_WORK_VILLAGER=1): the villager of the town save slot written in ac_work_villager.txt (the real test picks one its client has loaded) */
+            const char* fv = pc_test_hook_getenv("AC_TEST_WORK_VILLAGER");
+            FILE* vf;
+            int vs = -1;
+            if (fv != NULL && fv[0] == '1' && (vf = fopen("ac_work_villager.txt", "rb")) != NULL) {
+                if (fscanf(vf, "%d", &vs) != 1) {
+                    vs = -1;
+                }
+                fclose(vf);
+                if (vs >= 0 && vs < ANIMAL_NUM_MAX && mNpc_CheckFreeAnimalInfo(&Save_Get(animals)[vs]) == FALSE) {
+                    w->target_villager = (uint16_t)Save_Get(animals)[vs].id.npc_id;
+                    printf("[NET][WORK][TEST-ONLY] host: the job's villager forced to slot %d (0x%04X)\n", vs, (unsigned)w->target_villager);
+                }
+            }
+        }
+        w->obj_item = (w->wflags & PC_WORK_WF_V2) ? pcnetgame_work_v2_item(type, w->job_id) : pcnetgame_work_errand_item(h >> 12); /* v2: the varied pools; v1: stationery */
         w->reward += 100u;
         if (type == PC_WORK_JOB_DELIVER_VILLAGER) {
             w->carried_item = w->obj_item;
-            switch ((h >> 9) % 3u) { /* the optional villager tip: none / Bells / an item */
+            switch ((w->wflags & PC_WORK_WF_V2) ? 0u : (h >> 9) % 3u) { /* the optional villager tip: none / Bells / an item (v2: none here, decided at the delivery) */
                 case 1:
                     w->tip_kind = PC_WORK_TIP_BELLS;
                     w->tip_value = 100u + ((h >> 14) & 3u) * 50u;
@@ -21033,6 +21153,10 @@ static void pcnetgame_work_enter(PCNetWorkChar* w) {
     }
     printf("[NET][WORK] host: new job %u type %d: item 0x%04X villager 0x%04X reward %u tip kind %u value %u (town fruit in the save: 0x%04X)\n", (unsigned)w->job_id, type, (unsigned)w->obj_item,
            (unsigned)w->target_villager, (unsigned)w->reward, (unsigned)w->tip_kind, (unsigned)w->tip_value, (unsigned)Save_Get(fruit));
+    if (w->wflags & PC_WORK_WF_V2) {
+        printf("[NET][WORK] host: job %u is a v2 job (urgent if asked: %d, bonus %u)\n", (unsigned)w->job_id, pcnetgame_work_urgent(w), (unsigned)pc_work_v2_urgent_bonus(w->job_id));
+        pcnetgame_work_log_item("v2 job", w->obj_item);
+    }
 }
 
 /* LEAVE: quit the job and leave Work Mode. An active job is abandoned (never paid, never resumed); items already in the pockets stay there. */
@@ -21063,7 +21187,8 @@ static uint8_t pcnetgame_work_plan(const PCNetWorkChar* w, const PCNetGameTxnTag
         *why = "the character has no active job (not in work mode, never started, abandoned, or already completed and paid)";
         return (uint8_t)PC_NETGAME_TXN_REASON_WORK_NO_JOB;
     }
-    if ((op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_TAKE_PARCEL || op == (uint8_t)PC_WORK_OP_REPORT) && (uint16_t)(w->job_id & 0xFFFFu) != t->aux_item) {
+    if ((op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_TAKE_PARCEL || op == (uint8_t)PC_WORK_OP_REPORT || op == (uint8_t)PC_WORK_OP_URGE || op == (uint8_t)PC_WORK_OP_QUIT) &&
+        (uint16_t)(w->job_id & 0xFFFFu) != t->aux_item) {
         *why = "the request names another job than the character's current one (stale / replayed)";
         return (uint8_t)PC_NETGAME_TXN_REASON_WORK_STALE_JOB;
     }
@@ -21132,7 +21257,47 @@ static uint8_t pcnetgame_work_plan(const PCNetWorkChar* w, const PCNetGameTxnTag
                 }
             } else if (w->tip_kind == PC_WORK_TIP_ITEM) {
                 post[t->slot] = (uint16_t)w->tip_value; /* the tip takes the place of the handed-over parcel */
+            } else if ((w->wflags & PC_WORK_WF_V2) != 0) {
+                /* a v2 job handed over by the old step (op 6): the v2 Bells tip, decided NOW from the friendship; the same overflow rule as the Bells tip above */
+                const uint32_t v2tip = pcnetgame_work_v2_tip_of(w);
+                const uint32_t bells2 = *post_wallet + v2tip;
+                if (bells2 < (uint32_t)mPr_WALLET_MAX) {
+                    add = v2tip;
+                    *paid = add;
+                } else if (post[t->slot] == (uint16_t)EMPTY_NO && bells2 - 30000u < (uint32_t)mPr_WALLET_MAX) {
+                    post[t->slot] = (uint16_t)ITM_MONEY_30000;
+                    *post_wallet = bells2 - 30000u;
+                    *paid = v2tip;
+                }
             }
+            break;
+        case PC_WORK_OP_URGE: /* Work v2, Check job -> "No.": nothing moves; the commit decides whether the job is urgent (bonus added once) */
+            break;
+        case PC_WORK_OP_QUIT: /* Work v2: quit while the job's QUEST item is in the pockets: the item goes back in the SAME step */
+            if (w->obj_state != PC_WORK_OBJ_CARRYING || !((w->job_type == PC_WORK_JOB_FETCH_VILLAGER && t->item == w->obj_item) ||
+                                                         (w->job_type == PC_WORK_JOB_DELIVER_VILLAGER && t->item == w->carried_item))) {
+                *why = "the character does not carry this job's item (quit without an item is LEAVE)";
+                return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
+            if (mPr_GET_ITEM_COND(*post_conds, t->slot) != mPr_ITEM_COND_QUEST) {
+                *why = "the returned item is not the job's item (an ordinary copy of the same item is never taken)";
+                return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
+            post[t->slot] = (uint16_t)EMPTY_NO;
+            *post_conds = mPr_SET_ITEM_COND(*post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+            break;
+        case PC_WORK_OP_VILLAGER_COMPLETE: /* Work v2: the parcel handed to its villager COMPLETES the job: item out, Nook's reward + the villager's tip in, ONE step */
+            if (w->job_type != PC_WORK_JOB_DELIVER_VILLAGER || w->obj_state != PC_WORK_OBJ_CARRYING || t->aux_item != w->target_villager || t->item != w->carried_item) {
+                *why = "this villager is not the recipient of this character's parcel";
+                return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
+            if (mPr_GET_ITEM_COND(*post_conds, t->slot) != mPr_ITEM_COND_QUEST) {
+                *why = "the handed-over item is not the job's parcel (an ordinary copy of the same item does not count)";
+                return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+            }
+            post[t->slot] = (uint16_t)EMPTY_NO;
+            *post_conds = mPr_SET_ITEM_COND(*post_conds, t->slot, mPr_ITEM_COND_NORMAL);
+            add = w->reward + pcnetgame_work_v2_tip_of(w); /* < 2000 (reward <= 1000 with the urgent bonus, tip <= 550): one money bag always suffices */
             break;
         default:
             *why = "unknown work op";
@@ -21143,8 +21308,9 @@ static uint8_t pcnetgame_work_plan(const PCNetWorkChar* w, const PCNetGameTxnTag
          * exactly (reward <= 700 < 30000 and wallet <= mPr_WALLET_MAX, so one bag always suffices). DELIVER: the bag goes into the slot the handed-in item vacated; REPORT: into the
          * FIRST free pocket of the pre-image (the client validator finds the same slot). No free pocket: refused, the job is unchanged, nothing is lost. */
         int bag = -1, k;
-        if ((op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_REPORT) && add < 30000u && *post_wallet <= (uint32_t)mPr_WALLET_MAX) {
-            if (op == (uint8_t)PC_WORK_OP_DELIVER) {
+        if ((op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_REPORT || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) && add < 30000u &&
+            *post_wallet <= (uint32_t)mPr_WALLET_MAX) {
+            if (op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) { /* the slot the handed-in item vacated */
                 bag = (post[t->slot] == (uint16_t)EMPTY_NO) ? (int)t->slot : -1;
             } else {
                 for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
@@ -21166,7 +21332,7 @@ static uint8_t pcnetgame_work_plan(const PCNetWorkChar* w, const PCNetGameTxnTag
         return 0;
     }
     *post_wallet += add;
-    if (op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_REPORT) {
+    if (op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_REPORT || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) {
         *paid = add;
     }
     return 0;
@@ -21191,18 +21357,53 @@ static void pcnetgame_work_commit(PCNetWorkChar* w, uint8_t op, uint32_t paid) {
             break;
         case PC_WORK_OP_VILLAGER_RECEIVE:
             w->obj_state = PC_WORK_OBJ_DELIVERED;
+            if ((w->wflags & PC_WORK_WF_V2) != 0 && w->tip_kind == PC_WORK_TIP_NONE) {
+                w->tip_kind = PC_WORK_TIP_BELLS; /* the v2 tip the plan decided (shown by the villager's row; REPORT then pays Nook's reward only) */
+                w->tip_value = pcnetgame_work_v2_tip_of(w);
+            }
             w->tip_paid = (uint8_t)((w->tip_kind != PC_WORK_TIP_BELLS || paid > 0u) ? 1u : 0u); /* a Bells tip counts as paid only when the plan actually paid it */
             break;
+        case PC_WORK_OP_URGE:
+            if ((w->wflags & PC_WORK_WF_URGED) == 0 && pcnetgame_work_urgent(w)) {
+                const uint32_t bonus = pc_work_v2_urgent_bonus(w->job_id);
+                w->reward += bonus;
+                w->wflags |= (uint8_t)PC_WORK_WF_URGED;
+                printf("[NET][WORK] host: job %u is URGENT: bonus %u added once, reward now %u\n", (unsigned)w->job_id, (unsigned)bonus, (unsigned)w->reward);
+            } else {
+                printf("[NET][WORK] host: job %u asked about: %s (reward %u)\n", (unsigned)w->job_id, (w->wflags & PC_WORK_WF_URGED) ? "already urgent, no second bonus" : "not urgent",
+                       (unsigned)w->reward);
+            }
+            break;
+        case PC_WORK_OP_QUIT:
+            printf("[NET][WORK] host: job %u quit: its item went back in the same step\n", (unsigned)w->job_id);
+            pcnetgame_work_abandon(w);
+            break;
+        case PC_WORK_OP_VILLAGER_COMPLETE: {
+            const uint32_t tip = pcnetgame_work_v2_tip_of(w);
+            printf("[NET][WORK] host: job %u completed at villager 0x%04X: reward %u + tip %u (friendship %d) = %u paid\n", (unsigned)w->job_id, (unsigned)w->target_villager,
+                   (unsigned)w->reward, (unsigned)tip, pcnetgame_work_friendship(&w->key, w->target_villager), (unsigned)paid);
+            w->tip_kind = PC_WORK_TIP_BELLS;
+            w->tip_value = tip;
+            w->tip_paid = 1;
+            w->obj_state = PC_WORK_OBJ_DELIVERED;
+            w->wflags |= (uint8_t)PC_WORK_WF_AUTO;
+            pcnetgame_work_commit_deliver(w); /* retired + tombstoned in the SAME step the reward + tip were paid */
+            break;
+        }
         default:
             break;
     }
 }
 
-static void pcnetgame_work_pack_state(PCNetGameWorkStateMsg* m, const PCNetWorkChar* w, uint32_t request_id) {
+static void pcnetgame_work_pack_state(PCNetGameWorkStateMsg* m, const PCNetWorkChar* w, uint32_t request_id, int ext) {
     memset(m, 0, sizeof(*m));
     m->msg_type = (uint8_t)PC_NETGAME_MSG_WORK_STATE;
     if (w != NULL) {
         m->flags = (uint8_t)(w->mode_on ? 1u : 0u);
+        if (ext) { /* Work v2 bits: only for a peer that proved it knows them (an old client drops a WORK_STATE with unknown flag bits) */
+            m->flags |= (uint8_t)(((w->wflags & PC_WORK_WF_V2) ? PC_WORK_SF_JOB_V2 : 0u) | ((w->wflags & PC_WORK_WF_URGED) ? PC_WORK_SF_URGED : 0u) |
+                                  ((w->wflags & PC_WORK_WF_AUTO) ? PC_WORK_SF_AUTO : 0u));
+        }
         m->state = w->state;
         m->job_type = w->job_type;
         m->job_id = w->job_id;
@@ -21221,7 +21422,7 @@ static void pcnetgame_work_pack_state(PCNetGameWorkStateMsg* m, const PCNetWorkC
 
 static int pcnetgame_work_send_state(PCNetPeerId peer, const PersonalID_c* key, uint32_t request_id) {
     PCNetGameWorkStateMsg m;
-    pcnetgame_work_pack_state(&m, pcnetgame_work_find(key, 0), request_id);
+    pcnetgame_work_pack_state(&m, pcnetgame_work_find(key, 0), request_id, peer >= 0 && peer < pcnetgame_peer_span() && s_host_peer[peer].work_v2);
     return pc_net_send(peer, PC_NET_RELIABLE, &m, (uint16_t)sizeof(m)); /* 0 = refused (window full / peer gone) */
 }
 /* ===== WORK HOST END ===== */
@@ -21581,7 +21782,7 @@ static const char* pcnetgame_ts_name(int svc) {
     return svc == (int)PC_NETGAME_TS_POLICE ? "POLICE" : svc == (int)PC_NETGAME_TS_MUSEUM ? "MUSEUM" : svc == (int)PC_NETGAME_TS_SHOP ? "SHOP"
            : svc == (int)PC_NETGAME_TS_HOSTCFG ? "HOSTCFG" : svc == (int)PC_NETGAME_TS_EVENT ? "EVENT" : svc == (int)PC_NETGAME_TS_UPGRADE ? "SHOP_UPGRADE"
            : svc == (int)PC_NETGAME_TS_GUESTDIR ? "GUEST_DIR" : svc == (int)PC_NETGAME_TS_MDONORS ? "MUSEUM_DONORS" : svc == (int)PC_NETGAME_TS_EVNPC ? "EVNPC_CAPS"
-           : svc == (int)PC_NETGAME_TS_OFURN ? "OFURN_CAPS" : "?";
+           : svc == (int)PC_NETGAME_TS_OFURN ? "OFURN_CAPS" : svc == (int)PC_NETGAME_TS_WORK ? "WORK_CAPS" : "?";
 }
 
 /* Reads the host's own copy of one service into `blob` (little-endian u16 for the police items). 0 = not a mirrored service. */
@@ -21657,6 +21858,11 @@ static int pcnetgame_ts_build(int svc, uint8_t* blob, uint16_t* len) {
         *len = (uint16_t)PC_NETGAME_TS_OFURN_LEN;
         return 1;
     }
+    if (svc == (int)PC_NETGAME_TS_WORK) {
+        pc_work_caps_build(blob, pcnetgame_work_v2_on()); /* Nook Work Mode v2: the host's switch (a session state, not a save region) */
+        *len = (uint16_t)PC_NETGAME_TS_WORK_LEN;
+        return 1;
+    }
     return 0;
 }
 
@@ -21719,6 +21925,7 @@ static void pcnetgame_ts_refresh_all(void) {
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_MDONORS); /* worker B */
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_EVNPC);   /* worker E */
     (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_OFURN);   /* outdoor furniture C1 */
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_WORK);    /* Nook Work Mode v2 */
 }
 
 /* Sends the current blob of `svc` to one peer: header + len bytes. 1 = queued. */
@@ -21948,6 +22155,9 @@ static void pcnetgame_host_ts_tick(void) {
         /* Nook Work Mode: the character's job state reaches the peer as soon as its record is SYNCED (connect, reconnect, a new session), so Nook's menu is right before any op */
         if (s_host_peer_link[p] != PC_NETGAME_LINK_READY || !wst->bound_valid || wst->rec_state != PC_NETGAME_RECS_SYNCED) {
             wst->work_sent = 0;
+            if (s_host_peer_link[p] != PC_NETGAME_LINK_READY) {
+                wst->work_v2 = 0; /* the v2 latch is per session */
+            }
         } else if (!wst->work_sent) {
             wst->work_sent = pcnetgame_work_send_state((PCNetPeerId)p, &wst->bound_pid, 0) ? 1 : 0; /* F-01: stays 0 (retried next tick) when the send was refused */
         }
@@ -22313,7 +22523,8 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
     }
 
     /* 3. shape */
-    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 && (t->flags == 0 || is_buy) && /* SHOP_BUY: flags = the catalog generation the buyer saw (0 = unclaimed) */
+    shape_ok = in->_rsv0 == 0 && t->_rsv0 == 0 && t->txn_nonce != 0 && t->txn_seq != 0 &&
+               (t->flags == 0 || is_buy || (is_work && t->flags == (uint8_t)PC_WORK_TXN_FLAG_V2 && pcnetgame_work_v2_on())) && /* SHOP_BUY: flags = the catalog generation the buyer saw (0 = unclaimed); WORK: the v2 flag */
                (is_restock ? (t->slot == 0 && t->item == 0)
                                                                : is_evnpc ? (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item == 0)
                                                                : is_work ? (pcnetgame_work_op_has_slot(t->aux_cond) ? (t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT && t->item != (uint16_t)EMPTY_NO)
@@ -22324,9 +22535,14 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
             shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE &&
                        ((t->aux_cond == (uint8_t)PC_EVNPC_OP_GULLIVER_GIFT && t->aux_item == 0) || (t->aux_cond == (uint8_t)PC_EVNPC_OP_KK_SONG && t->aux_item <= 0x36u)); /* the 55 songs; the random song of K.K. (0x37..) is no item */
         } else if (is_work) {
-            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond >= (uint8_t)PC_WORK_OP_ENTER && t->aux_cond <= (uint8_t)PC_WORK_OP_REPORT &&
-                       (((pcnetgame_work_op_has_slot(t->aux_cond) || t->aux_cond == (uint8_t)PC_WORK_OP_REPORT) && t->aux_item != 0) ||
+            shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond >= (uint8_t)PC_WORK_OP_ENTER &&
+                       t->aux_cond <= (uint8_t)(pcnetgame_work_v2_on() ? PC_WORK_OP_MAX_V2 : PC_WORK_OP_MAX_V1) && /* Work v2 (ops 8..10) only with the switch on */
+                       (((pcnetgame_work_op_has_slot(t->aux_cond) || t->aux_cond == (uint8_t)PC_WORK_OP_REPORT || t->aux_cond == (uint8_t)PC_WORK_OP_URGE) && t->aux_item != 0) ||
                         ((t->aux_cond == (uint8_t)PC_WORK_OP_ENTER || t->aux_cond == (uint8_t)PC_WORK_OP_LEAVE) && t->aux_item == 0));
+            if (shape_ok && t->flags == (uint8_t)PC_WORK_TXN_FLAG_V2 && !st->work_v2) {
+                st->work_v2 = 1; /* this peer knows Work v2: its WORK_STATE carries the v2 flag bits from now on (this session) */
+                printf("[NET][WORK] host: peer %d uses Work v2 (WORK_STATE flag bits enabled for it)\n", (int)peer);
+            }
         } else if (is_restock) {
             shape_ok = t->dest == (uint8_t)PC_NETGAME_TXN_DEST_NONE && t->aux_cond == 0 && t->aux_item != 0;
         } else if (is_donate) {
@@ -22449,6 +22665,7 @@ static void pcnetgame_handle_host_ts_txn(PCNetPeerId peer, const PCNetGameTxnCom
             fail = "the host work table is full";
             fail_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
         } else {
+            s_work_req_v2 = (t->flags == (uint8_t)PC_WORK_TXN_FLAG_V2); /* the v2 request flag (ENTER: a v2 job), read by the plan and the commit below */
             fail_reason = pcnetgame_work_plan(work, t, post, &post_conds, &post_wallet, &work_reward, &fail);
             if (fail_reason == 0) {
                 fail = NULL;
@@ -29842,6 +30059,7 @@ static int pcnetgame_txn_try_send(void) {
             item = T->item;
             aux_cond = T->ts_aux;
             aux_item = T->ts_aux_item;
+            flags = T->take_dst; /* Work v2: PC_WORK_TXN_FLAG_V2 (0 to an old host / with the switch off) */
             break;
         case PC_NETGAME_TXN_KIND_HOUSE_UPGRADE: /* worker C: the op as aux_cond, the roof palette as aux_item, the stale-header guard as flags (no pocket, no item) */
             dest = (uint8_t)PC_NETGAME_TXN_DEST_NONE;
@@ -30264,20 +30482,23 @@ static int pcnetgame_txn_apply_house(const PCNetGameClientTxn* T, const PCNetGam
 
 /* ---- Nook Work Mode, client half 1: the mirror of the character's job (written ONLY by the host's WORK_STATE) and the APPLIED apply ---- */
 typedef struct PCNetWorkMirror {
-    uint8_t  valid, mode_on, state, job_type, obj_state, tip_kind;
+    uint8_t  valid, mode_on, state, job_type, obj_state, tip_kind, flags /* WORK_STATE flags (PC_WORK_SF_*) */;
     uint32_t job_id, reward, jobs_done, last_rewarded, tip_value;
     uint16_t obj_item, carried_item, target_villager;
     uint32_t last_request_id;
 } PCNetWorkMirror;
 static PCNetWorkMirror s_work_c;
+static int s_work_caps_on = 0;     /* CLIENT: the host's service 11 (WORK_CAPS) said Work v2 is on, this session */
+static int s_work_v2_refused = 0;  /* CLIENT: the host answered a v2 WORK op with BAD_SHAPE (it turned the switch off): the old dialogue for the rest of the session */
 
 static void pcnetgame_handle_client_work_state(const PCNetGameWorkStateMsg* in) {
-    if (s_client_link != PC_NETGAME_LINK_READY || in->state > (uint8_t)PC_WORK_STATE_ACTIVE || in->job_type > (uint8_t)PC_WORK_JOB_MAX || (in->flags & ~1u) != 0 ||
+    if (s_client_link != PC_NETGAME_LINK_READY || in->state > (uint8_t)PC_WORK_STATE_ACTIVE || in->job_type > (uint8_t)PC_WORK_JOB_MAX || (in->flags & ~(uint8_t)PC_WORK_SF_ALL) != 0 ||
         in->obj_state > (uint8_t)PC_WORK_OBJ_DELIVERED || in->tip_kind > (uint8_t)PC_WORK_TIP_ITEM) {
         return;
     }
     s_work_c.valid = 1;
     s_work_c.mode_on = (uint8_t)(in->flags & 1u);
+    s_work_c.flags = in->flags; /* Work v2: bits 1..3 (v2 job / urged / completed at the villager), sent only once this client used a v2 op */
     s_work_c.state = in->state;
     s_work_c.job_type = in->job_type;
     s_work_c.obj_state = in->obj_state;
@@ -30297,6 +30518,7 @@ static void pcnetgame_handle_client_work_state(const PCNetGameWorkStateMsg* in) 
 }
 
 static uint16_t s_work_leave_item;                                  /* the delivery item of the job a pending LEAVE abandons (0 = none): see pcnetgame_work_release_leftover() */
+static int s_ctxn_work_v2_sent;                                      /* Work v2: the last WORK op this client began carried the v2 flag / a v2 op */
 static void pcnetgame_work_release_leftover(uint16_t item);         /* defined in the WORK CLIENT section */
 
 /* APPLIED of a WORK op. ENTER / LEAVE change nothing locally (the job lives on the host and arrives as WORK_STATE). The item ops and the payments take the HOST's post-image
@@ -30305,7 +30527,7 @@ static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGame
     const PCNetGameTxnTag* t = &T->tag;
     Private_c* np = Now_Private;
     const uint8_t op = t->aux_cond;
-    const int removes = (op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE);
+    const int removes = (op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE || op == (uint8_t)PC_WORK_OP_QUIT || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE);
     const int grants = (op == (uint8_t)PC_WORK_OP_TAKE_PARCEL || op == (uint8_t)PC_WORK_OP_VILLAGER_GIVE);
     int i, same = 1, s = -1, bs = -1;
     uint32_t paid;
@@ -30322,7 +30544,7 @@ static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGame
                     break;
                 }
             }
-        } else if ((op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE || op == (uint8_t)PC_WORK_OP_DELIVER) && t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT &&
+        } else if ((op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE || op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) && t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT &&
                    in->post_pockets[t->slot] == (uint16_t)ITM_MONEY_30000) {
             bs = (int)t->slot;
         }
@@ -30337,7 +30559,8 @@ static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGame
     }
     if (np == NULL || (op != (uint8_t)PC_WORK_OP_REPORT && t->slot >= (uint8_t)mPr_POCKETS_SLOT_COUNT) || in->post_wallet > (uint32_t)mPr_WALLET_MAX ||
         (in->post_wallet < t->pre_wallet && !(bs >= 0 && t->pre_wallet - in->post_wallet < 30000u)) || /* the Bells-tip / reward overflow: wallet + a 30000 bag in slot bs */
-        (removes && op == (uint8_t)PC_WORK_OP_DELIVER && in->post_pockets[t->slot] != (uint16_t)EMPTY_NO && bs < 0) ||
+        (removes && (op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) && in->post_pockets[t->slot] != (uint16_t)EMPTY_NO && bs < 0) ||
+        (op == (uint8_t)PC_WORK_OP_QUIT && (in->post_pockets[t->slot] != (uint16_t)EMPTY_NO || in->post_wallet != t->pre_wallet)) || /* Work v2 QUIT: the item goes, nothing is paid */
         (grants && in->post_pockets[t->slot] != t->item)) {
         printf("[NET][WORK] client: *** APPLIED work op %u for request %u carries an inconsistent post-image -- nothing applied (the host record is the truth) ***\n", (unsigned)op,
                (unsigned)T->request_id);
@@ -30367,7 +30590,8 @@ static int pcnetgame_txn_apply_work(const PCNetGameClientTxn* T, const PCNetGame
             if (s >= 0) {
                 np->inventory.pockets[s] = (mActor_name_t)EMPTY_NO;
                 np->inventory.item_conditions = mPr_SET_ITEM_COND(np->inventory.item_conditions, s, mPr_ITEM_COND_NORMAL);
-                if ((op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE || (op == (uint8_t)PC_WORK_OP_DELIVER && bs >= 0)) && in->post_pockets[t->slot] != (uint16_t)EMPTY_NO) {
+                if ((op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE || ((op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) && bs >= 0)) &&
+                    in->post_pockets[t->slot] != (uint16_t)EMPTY_NO) {
                     np->inventory.pockets[s] = (mActor_name_t)in->post_pockets[t->slot]; /* the villager's tip item / the overflow bag takes its place */
                 }
             }
@@ -30869,6 +31093,10 @@ static void pcnetgame_ts_op_resolve(uint8_t kind, uint32_t request_id, int appli
         pcnetgame_ofurn_op_resolve(applied, applied ? (uint8_t)0 : s_ts_last_reason); /* outdoor furniture C1: its own op state + the old-host latch + the notice */
         return;
     }
+    if (kind == (uint8_t)PC_NETGAME_TXN_KIND_WORK && !applied && s_ts_last_reason == (uint8_t)PC_NETGAME_TXN_REASON_BAD_SHAPE && s_ctxn_work_v2_sent && !s_work_v2_refused) {
+        s_work_v2_refused = 1; /* the host refused a v2 WORK op as malformed (its switch went off): the old dialogue for the rest of this session */
+        printf("[NET][WORK] client: the host refused a Work v2 op (BAD_SHAPE): the previous Work Mode for the rest of this session\n");
+    }
     if (s_ts_op.active && s_ts_op.kind == kind && s_ts_op.request_id == request_id) {
         s_ts_op.done = 1;
         s_ts_op.outcome = applied ? 1 : 2;
@@ -31032,7 +31260,7 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     svc = (int)m.service;
     if (svc != (int)PC_NETGAME_TS_POLICE && svc != (int)PC_NETGAME_TS_MUSEUM && svc != (int)PC_NETGAME_TS_SHOP && svc != (int)PC_NETGAME_TS_HOSTCFG &&
         svc != (int)PC_NETGAME_TS_EVENT && svc != (int)PC_NETGAME_TS_UPGRADE && svc != (int)PC_NETGAME_TS_GUESTDIR && svc != (int)PC_NETGAME_TS_MDONORS &&
-        svc != (int)PC_NETGAME_TS_EVNPC && svc != (int)PC_NETGAME_TS_OFURN) {
+        svc != (int)PC_NETGAME_TS_EVNPC && svc != (int)PC_NETGAME_TS_OFURN && svc != (int)PC_NETGAME_TS_WORK) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d is reserved / unknown -- ignored\n", svc);
         return;
     }
@@ -31044,7 +31272,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
              : (svc == (int)PC_NETGAME_TS_GUESTDIR) ? (uint16_t)PC_NETGAME_TS_GUESTDIR_LEN
              : (svc == (int)PC_NETGAME_TS_MDONORS) ? (uint16_t)PC_NETGAME_TS_MDONORS_LEN
              : (svc == (int)PC_NETGAME_TS_EVNPC) ? (uint16_t)PC_NETGAME_TS_EVNPC_LEN
-             : (svc == (int)PC_NETGAME_TS_OFURN) ? (uint16_t)PC_NETGAME_TS_OFURN_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
+             : (svc == (int)PC_NETGAME_TS_OFURN) ? (uint16_t)PC_NETGAME_TS_OFURN_LEN
+             : (svc == (int)PC_NETGAME_TS_WORK) ? (uint16_t)PC_NETGAME_TS_WORK_LEN : (uint16_t)PC_NETGAME_TS_MUSEUM_LEN;
     if (m.len != expect || size != (uint16_t)(offsetof(PCNetGameTownSvcStateMsg, blob) + m.len)) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d refused: len %u (expected %u), message size %u\n", svc, (unsigned)m.len, (unsigned)expect,
                (unsigned)size);
@@ -31068,7 +31297,8 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
           : svc == (int)PC_NETGAME_TS_GUESTDIR ? pcnetgame_ts_valid_guestdir_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_MDONORS ? pcnetgame_ts_valid_mdonors_blob(m.blob)
           : svc == (int)PC_NETGAME_TS_EVNPC ? pc_evc_caps_valid(m.blob)
-          : svc == (int)PC_NETGAME_TS_OFURN ? pc_ofurn_caps_valid(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
+          : svc == (int)PC_NETGAME_TS_OFURN ? pc_ofurn_caps_valid(m.blob)
+          : svc == (int)PC_NETGAME_TS_WORK ? pc_work_caps_valid(m.blob) : pcnetgame_ts_valid_museum_blob(m.blob))) {
         printf("[NET][TS] client: TOWN_SVC_STATE service %d seq %u refused: the blob content is not a legal %s state\n", svc, (unsigned)m.seq,
                svc == (int)PC_NETGAME_TS_POLICE ? "lost-and-found" : svc == (int)PC_NETGAME_TS_SHOP ? "shop"
                : svc == (int)PC_NETGAME_TS_HOSTCFG ? "host config" : svc == (int)PC_NETGAME_TS_EVENT ? "event" : svc == (int)PC_NETGAME_TS_UPGRADE ? "shop upgrade"
@@ -31088,6 +31318,16 @@ static void pcnetgame_handle_client_town_svc(const uint8_t* data, uint16_t size)
     }
     if (svc == (int)PC_NETGAME_TS_EVNPC) {
         pcnetgame_evc_client_apply_caps(m.blob); /* worker E: a session state, not a save region: no usable save needed */
+        s_ts_client_seq[svc] = m.seq;
+        s_ts_client_have[svc] = 1;
+        printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq, (unsigned)m.digest, (unsigned)m.len);
+        return;
+    }
+    if (svc == (int)PC_NETGAME_TS_WORK) {
+        if (s_work_caps_on != (int)(m.blob[1] & 1u) || !s_ts_client_have[svc]) {
+            printf("[NET][WORK] client: the host's Work Mode v2 is %s (this client's own switch: %s)\n", (m.blob[1] & 1u) ? "ON" : "OFF", pcnetgame_work_v2_on() ? "on" : "off");
+        }
+        s_work_caps_on = (int)(m.blob[1] & 1u); /* Nook Work Mode v2: a session state, not a save region */
         s_ts_client_seq[svc] = m.seq;
         s_ts_client_have[svc] = 1;
         printf("[NET][TS] client: applied service %d (%s) seq %u digest 0x%08X len %u\n", svc, pcnetgame_ts_name(svc), (unsigned)m.seq, (unsigned)m.digest, (unsigned)m.len);
@@ -32294,6 +32534,9 @@ int pc_net_game_work_view(PCWorkView* v) {
         v->obj_item = (int)w->obj_item;
         v->carried_item = (int)w->carried_item;
         v->target_villager = (int)w->target_villager;
+        v->v2_job = (w->wflags & PC_WORK_WF_V2) ? 1 : 0;
+        v->urged = (w->wflags & PC_WORK_WF_URGED) ? 1 : 0;
+        v->auto_done = (w->wflags & PC_WORK_WF_AUTO) ? 1 : 0;
         return 1;
     }
     if (s_role != PC_NETGAME_ROLE_CLIENT || s_client_link != PC_NETGAME_LINK_READY || !s_work_c.valid) {
@@ -32311,7 +32554,39 @@ int pc_net_game_work_view(PCWorkView* v) {
     v->obj_item = (int)s_work_c.obj_item;
     v->carried_item = (int)s_work_c.carried_item;
     v->target_villager = (int)s_work_c.target_villager;
+    v->v2_job = (s_work_c.flags & PC_WORK_SF_JOB_V2) ? 1 : 0;
+    v->urged = (s_work_c.flags & PC_WORK_SF_URGED) ? 1 : 0;
+    v->auto_done = (s_work_c.flags & PC_WORK_SF_AUTO) ? 1 : 0;
     return 1;
+}
+
+/* Work v2 (pc_work_logic.h): the host's own player follows its own switch; a client additionally needs the host's service 11 bit (an old host never sends it) */
+int pc_net_game_work_v2(void) {
+    if (!pcnetgame_work_v2_on()) {
+        return 0;
+    }
+    if (s_role == PC_NETGAME_ROLE_HOST) {
+        return s_host_world_ready && Now_Private != NULL;
+    }
+    return s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY && s_ts_client_have[PC_NETGAME_TS_WORK] && s_work_caps_on && !s_work_v2_refused;
+}
+
+void pc_net_game_work_item_name(int item, unsigned char* out16, int* article) {
+    u8 nm[mIN_ITEM_NAME_LEN];
+    memset(out16, ' ', 16);
+    *article = 0;
+    if (item <= 0 || item == (int)EMPTY_NO) {
+        return;
+    }
+    memset(nm, ' ', sizeof(nm));
+    mIN_copy_name_str(nm, (mActor_name_t)item);
+    memcpy(out16, nm, 16 < mIN_ITEM_NAME_LEN ? 16 : mIN_ITEM_NAME_LEN);
+    *article = mIN_get_item_article((mActor_name_t)item);
+}
+
+void pc_net_game_work_notice(const char* ascii) {
+    printf("[NET][WORK] notice: %s\n", ascii);
+    pc_chat_local_notice(ascii);
 }
 
 /* the first pocket slot holding `item` (EMPTY_NO = a free slot) with the condition `cond` (-1 = any condition), or -1. The delivery / fetch hand-ins pass mPr_ITEM_COND_QUEST: an ordinary
@@ -32327,6 +32602,22 @@ static int pcnetgame_work_find_pocket(uint16_t item, int cond) {
         }
     }
     return -1;
+}
+
+int pc_net_game_work_has_item(const PCWorkView* v) {
+    if (v == NULL || v->state != PC_WORK_STATE_ACTIVE) {
+        return 0;
+    }
+    if (v->job_type == PC_WORK_JOB_FRUIT) {
+        return pcnetgame_work_find_pocket((uint16_t)v->obj_item, -1) >= 0; /* the player's own ordinary fruit */
+    }
+    if (v->job_type == PC_WORK_JOB_FETCH_VILLAGER) {
+        return v->obj_state == PC_WORK_OBJ_CARRYING && pcnetgame_work_find_pocket((uint16_t)v->obj_item, mPr_ITEM_COND_QUEST) >= 0;
+    }
+    if (v->job_type == PC_WORK_JOB_DELIVER_VILLAGER && v->obj_state == PC_WORK_OBJ_START) {
+        return pcnetgame_work_find_pocket((uint16_t)EMPTY_NO, -1) >= 0; /* room for the parcel */
+    }
+    return 0;
 }
 
 /* The pocket item a job has handed out and not yet taken back (a QUEST copy sits in the pockets), 0 = none. */
@@ -32364,7 +32655,7 @@ int pc_net_game_work_villager_pending(int npc, int* op) {
         return 1;
     }
     if (v.job_type == PC_WORK_JOB_DELIVER_VILLAGER && v.obj_state == PC_WORK_OBJ_CARRYING && pcnetgame_work_find_pocket((uint16_t)v.carried_item, mPr_ITEM_COND_QUEST) >= 0) {
-        *op = PC_WORK_OP_VILLAGER_RECEIVE;
+        *op = pc_net_game_work_v2() ? PC_WORK_OP_VILLAGER_COMPLETE : PC_WORK_OP_VILLAGER_RECEIVE; /* Work v2: the hand-over completes (and pays) the job */
         return 1;
     }
     return 0;
@@ -32405,8 +32696,19 @@ static uint8_t pcnetgame_work_build(int op, int npc, uint8_t* slot, uint16_t* it
             *aux_item = (uint16_t)npc;
             break;
         case PC_WORK_OP_REPORT:
+        case PC_WORK_OP_URGE: /* Work v2: no item, the job id */
             *aux_item = (uint16_t)(v.job_id & 0xFFFFu);
             return 0;
+        case PC_WORK_OP_QUIT: /* Work v2: the job's QUEST item goes back (none in the pockets: the dialogue uses LEAVE) */
+            *item = pcnetgame_work_carry_item(v.job_type, v.obj_state, (uint16_t)v.obj_item, (uint16_t)v.carried_item);
+            s = (*item != 0) ? pcnetgame_work_find_pocket(*item, mPr_ITEM_COND_QUEST) : -1;
+            *aux_item = (uint16_t)(v.job_id & 0xFFFFu);
+            break;
+        case PC_WORK_OP_VILLAGER_COMPLETE: /* Work v2: the parcel to its villager */
+            s = pcnetgame_work_find_pocket((uint16_t)v.carried_item, mPr_ITEM_COND_QUEST);
+            *item = (uint16_t)v.carried_item;
+            *aux_item = (uint16_t)npc;
+            break;
         default:
             return (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
     }
@@ -32447,6 +32749,8 @@ static int pcnetgame_work_host_local(int op, int npc) {
     }
     post_conds = Now_Private->inventory.item_conditions;
     post_wallet = Now_Private->inventory.wallet;
+    s_work_req_v2 = pc_net_game_work_v2(); /* the host's own player: a v2 job when the host runs Work v2 */
+    t.flags = (uint8_t)(s_work_req_v2 ? PC_WORK_TXN_FLAG_V2 : 0u);
     reason = pcnetgame_work_plan(w, &t, post, &post_conds, &post_wallet, &paid, &why);
     if (reason != 0) {
         printf("[NET][WORK] host: the host player's work op %d is refused: %s\n", op, why);
@@ -32472,8 +32776,8 @@ int pc_net_game_work_begin_op(int op, int npc) {
     const uint8_t kind = (uint8_t)PC_NETGAME_TXN_KIND_WORK;
     uint8_t slot = 0, reason;
     uint16_t item = 0, aux = 0;
-    if (!pc_net_game_work_offer_available() || op < PC_WORK_OP_ENTER || op > PC_WORK_OP_REPORT) {
-        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND;
+    if (!pc_net_game_work_offer_available() || op < PC_WORK_OP_ENTER || op > (pc_net_game_work_v2() ? PC_WORK_OP_MAX_V2 : PC_WORK_OP_MAX_V1)) {
+        s_ts_last_reason = (uint8_t)PC_NETGAME_TXN_REASON_PRECOND; /* a v2 op (8..10) is never sent to an old host / with the switch off */
         return 0;
     }
     if (s_role == PC_NETGAME_ROLE_HOST) {
@@ -32517,7 +32821,10 @@ int pc_net_game_work_begin_op(int op, int npc) {
     s_ctxn.request_id = s_ts_op.request_id;
     s_ctxn.owner = stamp;
     s_ctxn.first_ms = pcnetgame_now_ms();
-    printf("[NET][WORK] client: begin WORK op=%d request=%u slot=%u item=0x%04X aux=0x%04X\n", op, (unsigned)s_ts_op.request_id, (unsigned)slot, (unsigned)item, (unsigned)aux);
+    s_ctxn.take_dst = (uint8_t)(pc_net_game_work_v2() ? PC_WORK_TXN_FLAG_V2 : 0u); /* Work v2: travels as tag.flags (pcnetgame_txn_try_send) */
+    s_ctxn_work_v2_sent = s_ctxn.take_dst != 0;
+    printf("[NET][WORK] client: begin WORK op=%d request=%u slot=%u item=0x%04X aux=0x%04X%s\n", op, (unsigned)s_ts_op.request_id, (unsigned)slot, (unsigned)item, (unsigned)aux,
+           s_ctxn.take_dst ? " (v2)" : "");
     (void)pcnetgame_txn_try_send();
     return 1;
 }
@@ -36796,6 +37103,8 @@ static void pcnetgame_reset_client_session_state(void) {
     memset(&s_evnpc_client, 0, sizeof(s_evnpc_client)); /* event NPC authority: the host's table dies with the session */
     s_evnpc_client_valid = 0;
     memset(&s_work_c, 0, sizeof(s_work_c));  /* Nook Work Mode: the mirror of the job dies with the session (the host record is the truth and comes back with the next op) */
+    s_work_caps_on = 0;    /* Work v2: service 11 comes again at READY */
+    s_work_v2_refused = 0;
     memset(&s_ts_op, 0, sizeof(s_ts_op)); /* town services: the UI operation and the mirror's seq memory die with the session (the host's seq restarts per process) */
     s_ts_last_reason = 0;
     memset(&s_mail_op, 0, sizeof(s_mail_op)); /* mail milestone 1: the post girl's operation dies with the session (a local refusal) */
@@ -43218,6 +43527,40 @@ static void pcnetgame_goto_test_hook(void) {
         kind = 0;
     }
     fclose(f);
+    if (kind == 'w') {
+        /* "w 0" (Work v2 real test): park in front of the villager of the character's CURRENT job (the job state the host sent) */
+        PCWorkView wv;
+        int k2;
+        slot = -1;
+        if (pc_net_game_work_view(&wv) && wv.target_villager > 0) {
+            for (k2 = 0; k2 < ANIMAL_NUM_MAX; k2++) {
+                if ((int)Save_Get(animals)[k2].id.npc_id == wv.target_villager) {
+                    slot = k2;
+                }
+            }
+        }
+        if (slot < 0) {
+            remove("ac_goto.txt");
+            printf("[NET][TEST-ONLY] goto w: the current job names no villager of this town\n");
+            return;
+        }
+        printf("[NET][TEST-ONLY] goto w: the job's villager 0x%04X is slot %d\n", (unsigned)wv.target_villager, slot);
+        kind = 'v';
+        pa = get_player_actor_withoutCheck(play);
+        if (pa != NULL && play->fb_wipe_mode == WIPE_MODE_NONE && Actor_info_fgName_search(&play->actor_info, Save_Get(animals)[slot].id.npc_id, ACTOR_PART_NPC) == NULL) {
+            /* not loaded here: park in front of its house first (its acre and the ones around it load), the next "w" finds it */
+            const Anmhome_c* hm = &Save_Get(animals)[slot].home_info;
+            xyz_t hp;
+            mFI_BkandUtNum2CenterWpos(&hp, hm->block_x, hm->block_z, hm->ut_x, hm->ut_z);
+            pa->actor_class.world.position.x = hp.x;
+            pa->actor_class.world.position.z = hp.z + 80.0f;
+            pa->actor_class.world.position.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(pa->actor_class.world.position, 0.0f);
+            remove("ac_goto.txt");
+            printf("[NET][TEST-ONLY] goto w: villager slot %d not in this scene: parked in front of its house (block %d,%d) at (%.1f, %.1f)\n", slot, hm->block_x, hm->block_z,
+                   (double)pa->actor_class.world.position.x, (double)pa->actor_class.world.position.z);
+            return;
+        }
+    }
     pa = get_player_actor_withoutCheck(play);
     if (pa == NULL || slot < 0 || (kind != 'c' && kind != 'g' && slot >= ANIMAL_NUM_MAX) || play->fb_wipe_mode != WIPE_MODE_NONE) { /* 'c' / 'g': slot = the distance in front of Blathers / the post girl */
         return;
@@ -43500,7 +43843,7 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             }
             fclose(f);
             if (sscanf(line, "%d %15s %f", &id, cmd, &a) != 3 || (strcmp(cmd, "mash") != 0 && strcmp(cmd, "mashc") != 0 && strcmp(cmd, "mashf") != 0 && strcmp(cmd, "mashm") != 0 &&
-                                                                  strcmp(cmd, "mashw") != 0)) {
+                                                                  strcmp(cmd, "mashw") != 0 && strncmp(cmd, "mashj", 5) != 0)) {
                 return 0; /* not a mash: left in the file for the town path */
             }
             remove(s_ap_file);
@@ -43555,7 +43898,30 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
             }
             return (((now - s_ap.t0) / 250u) & 1u) ? 1u : 0u;
         }
-        if (s_ap.active && (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashc") == 0 || strcmp(s_ap.cmd, "mashf") == 0 || strcmp(s_ap.cmd, "mashw") == 0)) {
+        if (s_ap.active && (strcmp(s_ap.cmd, "mash") == 0 || strcmp(s_ap.cmd, "mashc") == 0 || strcmp(s_ap.cmd, "mashf") == 0 || strcmp(s_ap.cmd, "mashw") == 0 ||
+                            strncmp(s_ap.cmd, "mashj", 5) == 0)) {
+            static int s_mj_hold = 0, s_mj_logged = 0;
+            s_mj_hold = 0;
+            if (strncmp(s_ap.cmd, "mashj", 5) == 0 && mChoice_check_main_normal(mChoice_Get_base_window_p())) {
+                /* "mashj<k>[h]" (Work v2 real test): Nook's first page (0x1092) -> the Work Mode choice (CHOICE3); any other choice window -> choice k (clamped).
+                 * With the suffix 'h' no A is pressed while a non-first-page choice window is up (the test takes its screenshot, then confirms with mashj<k>). */
+                mChoice_c* ch = mChoice_Get_base_window_p();
+                const int k3 = atoi(s_ap.cmd + 5);
+                const int first = mMsg_Get_msg_num(mMsg_Get_base_window_p()) == 0x1092 && pc_nook_first_page_work() && ch->data.choice_num > 3;
+                if (first) {
+                    ch->selected_choice_idx = 3;
+                } else if (ch->data.choice_num > 0) {
+                    ch->selected_choice_idx = k3 < ch->data.choice_num ? k3 : ch->data.choice_num - 1;
+                    s_mj_hold = strchr(s_ap.cmd + 5, 'h') != NULL;
+                }
+                if (!s_mj_logged) {
+                    s_mj_logged = 1;
+                    printf("[AUTO] mashj %d choice window: n=%d sel=%d msg=0x%04X first=%d\n", s_ap.id, ch->data.choice_num, ch->selected_choice_idx,
+                           (unsigned)mMsg_Get_msg_num(mMsg_Get_base_window_p()), first);
+                }
+            } else {
+                s_mj_logged = 0;
+            }
             if (strcmp(s_ap.cmd, "mashw") == 0 && mChoice_check_main_normal(mChoice_Get_base_window_p())) {
                 /* "mashw" (hand-over real test): Nook's first page with the Work Mode choice -> that choice (CHOICE3, "I'd like to work" / "Check my job"); any other choice -> the FIRST */
                 mChoice_c* ch = mChoice_Get_base_window_p();
@@ -43577,6 +43943,9 @@ unsigned pc_net_game_test_autopilot_pad(signed char* sx, signed char* sy) {
                        mMsg_Get_base_window_p()->main_index);
                 pcnetgame_ap_done("ok", "indoors");
                 return 0;
+            }
+            if (s_mj_hold) {
+                return 0; /* mashj<k>h: hold the choice window for the screenshot */
             }
             return (((now - s_ap.t0) / 250u) & 1u) ? 1u : 0u;
         }

@@ -12,6 +12,7 @@
 #include "pc_shop_upgrade.h" /* multiplayer shop upgrade: the closure length / minutes left in Nook's rows and the door row */
 #include "pc_sell_logic.h"   /* Nook bulk sell basket: pc_sell_format_bells (the quote row) */
 #include "pc_room_dlg.h"     /* roommates / move-in: the gyroid's move-in rows + its menu patch (pc_room_dlg.c) */
+#include "pc_work_logic.h"   /* Nook Work Mode v2: the Check job choices (pc_work_v2_row) */
 
 _Static_assert(PC_ROOM_DLG_MSG_MAX == MSG_MAX, "pc_room_dlg.h keeps its own copy of MSG_MAX");
 _Static_assert(PC_ROOM_DLG_MSG_OFS >= PC_NOOK_MSG_COUNT && PC_ROOM_DLG_SEL_OFS >= PC_NOOK_SEL_COUNT, "the roommate rows follow the Nook rows");
@@ -294,6 +295,286 @@ int pc_nook_first_page_work(void) {
     return s_first_page_work;
 }
 
+/* ---- Nook Work Mode v2 rows (PC_NOOK_MSG_WK2 / WK2_NEXT, variants PC_WK2_V_*; see pc_nook_house.h / pc_work_logic.h) ---- */
+static int s_wk2_var = PC_WK2_V_NONE, s_wk2_next_var = PC_WK2_V_NONE;
+static unsigned char s_wk_item[16];
+static int s_wk_item_set = 0, s_wk_item_art = 0;
+static unsigned s_wk2_bonus = 0, s_wk2_serial = 0;
+static int s_wk2_has = 0;
+
+void pc_nook_house_set_wk2(int variant, int next_variant) {
+    s_wk2_var = variant;
+    s_wk2_next_var = next_variant;
+}
+
+void pc_nook_house_set_work_item(const unsigned char* name16, int article) {
+    if (name16 == NULL) {
+        s_wk_item_set = 0;
+        return;
+    }
+    memcpy(s_wk_item, name16, sizeof(s_wk_item));
+    s_wk_item_art = article;
+    s_wk_item_set = 1;
+}
+
+void pc_nook_house_set_wk2_extra(unsigned bonus, int has_item) {
+    s_wk2_bonus = bonus;
+    s_wk2_has = has_item ? 1 : 0;
+}
+
+unsigned pc_nook_wk2_serial(void) {
+    return s_wk2_serial;
+}
+
+/* the job's item with its article ("a peach", "an orange", "some ..."): the game's own name bytes when the actor set them, else the old fixed names */
+static void nk_wk2_item(NkBuf* b) {
+    int n = 16, i;
+    while (n > 0 && (s_wk_item[n - 1] == ' ' || s_wk_item[n - 1] == 0)) {
+        n--;
+    }
+    if (!s_wk_item_set || n == 0) {
+        nk_text(b, nk_work_item_name(s_wk_view.job_type == PC_WORK_JOB_DELIVER_VILLAGER && s_wk_view.carried_item != 0 ? s_wk_view.carried_item : s_wk_view.obj_item));
+        return;
+    }
+    switch (s_wk_item_art) { /* mIN_ARTICLE_*: 0 none, 1 a, 2 an, 3 the, 4 some */
+        case 1: nk_text(b, "a "); break;
+        case 2: nk_text(b, "an "); break;
+        case 3: nk_text(b, "the "); break;
+        case 4: nk_text(b, "some "); break;
+        default: break;
+    }
+    for (i = 0; i < n; i++) {
+        nk_byte(b, s_wk_item[i]);
+    }
+}
+
+static void nk_wk2_bells(NkBuf* b, unsigned v) {
+    char t[24];
+    nk_text(b, pc_sell_format_bells(t, sizeof(t), v));
+    nk_text(b, " Bells");
+}
+
+/* one v2 row; every variant ends with MSGEND, MSGCONTINUE or the choice tail (CHECK) */
+static void nk_wk2_build(NkBuf* b, int variant) {
+    int ids[4], acts[4], n, i;
+    switch (variant) {
+        case PC_WK2_V_ASSIGN:
+            nk_text(b, "Work, hm? Splendid!");
+            nk_pause(b, 6);
+            if (s_wk_view.job_type == PC_WORK_JOB_FETCH_VILLAGER) {
+                nk_text(b, "\n");
+                nk_work_name(b);
+                nk_text(b, " has\n");
+                nk_wk2_item(b);
+                nk_text(b, " for me.");
+                nk_page(b);
+                nk_text(b, "Please go and get it,");
+                nk_pause(b, 6);
+                nk_text(b, "\nthen bring it to me here.");
+            } else {
+                nk_text(b, "\nPlease bring me\n");
+                nk_wk2_item(b);
+                nk_text(b, ",");
+                nk_page(b);
+                nk_text(b, "a fruit from this town.");
+            }
+            nk_page(b);
+            nk_text(b, "I'll pay ");
+            nk_wk2_bells(b, s_wk_view.reward);
+            nk_text(b, " for it!");
+            nk_pause(b, 6);
+            nk_text(b, "\nAsk me with Check job\nwhen you're back, hm?");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_PARCEL:
+            nk_text(b, "Work, hm? Splendid!");
+            nk_pause(b, 6);
+            nk_text(b, "\nHere you are:\n");
+            nk_wk2_item(b);
+            nk_text(b, ".");
+            nk_page(b);
+            nk_text(b, "It's a delivery for ");
+            nk_work_name(b);
+            nk_text(b, ".");
+            nk_code(b, NK_CONTINUE);
+            break;
+        case PC_WK2_V_PARCEL_PAY:
+            nk_text(b, "Please take it over, hm?");
+            nk_pause(b, 6);
+            nk_text(b, "\nYou get ");
+            nk_wk2_bells(b, s_wk_view.reward);
+            nk_text(b, " the\nmoment it is delivered!");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_NOROOM:
+            nk_text(b, "Work, hm? Splendid!");
+            nk_pause(b, 6);
+            nk_text(b, "\nI have a delivery for\n");
+            nk_work_name(b);
+            nk_text(b, ", but your pockets\nare full!");
+            nk_page(b);
+            nk_text(b, "Make some room, then ask");
+            nk_pause(b, 6);
+            nk_text(b, "\nme with Check job, hm?");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_CHECK:
+            n = pc_work_v2_row(s_wk_view.job_type, s_wk_view.obj_state, s_wk2_has, acts, 4);
+            nk_text(b, "About your job, hm?");
+            nk_pause(b, 6);
+            nk_text(b, "\nIt pays ");
+            nk_wk2_bells(b, s_wk_view.reward);
+            nk_text(b, ".");
+            nk_page(b);
+            if (s_wk_view.job_type == PC_WORK_JOB_FRUIT) {
+                nk_text(b, "Did you bring me\n");
+                nk_wk2_item(b);
+                nk_text(b, ", hm?");
+            } else if (s_wk_view.job_type == PC_WORK_JOB_FETCH_VILLAGER) {
+                nk_text(b, "Did you bring\n");
+                nk_wk2_item(b);
+                nk_text(b, " from\n");
+                nk_work_name(b);
+                nk_text(b, ", hm?");
+            } else if (s_wk_view.obj_state == PC_WORK_OBJ_START) {
+                nk_text(b, "I still have\n");
+                nk_wk2_item(b);
+                nk_text(b, " for\n");
+                nk_work_name(b);
+                nk_text(b, ". Can you take it now?");
+            } else if (s_wk_view.obj_state == PC_WORK_OBJ_CARRYING) {
+                nk_text(b, "Did you deliver\n");
+                nk_wk2_item(b);
+                nk_text(b, " to\n");
+                nk_work_name(b);
+                nk_text(b, ", hm?");
+            } else {
+                nk_text(b, "You delivered it to\n");
+                nk_work_name(b);
+                nk_text(b, "? Excellent!\nShall I pay you now?");
+            }
+            for (i = 0; i < n; i++) {
+                ids[i] = acts[i] == PC_WORK_ACT_HAND ? PC_NOOK_SEL_WORK_HERE : acts[i] == PC_WORK_ACT_TAKE ? PC_NOOK_SEL_TAKE_IT : acts[i] == PC_WORK_ACT_REPORT ? PC_NOOK_SEL_WORK_REPORT
+                         : acts[i] == PC_WORK_ACT_QUIT ? PC_NOOK_SEL_QUIT_JOB : acts[i] == PC_WORK_ACT_NO ? NK_SEL_NO : PC_NOOK_SEL_WORK_LATER;
+            }
+            nk_choice(b, ids, n);
+            break;
+        case PC_WK2_V_RELAX:
+            nk_text(b, "Oh, that's all right.");
+            nk_pause(b, 6);
+            nk_text(b, "\nTake your time, hm.\nIt isn't urgent.");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_URGENT:
+            nk_text(b, "Hm! Actually, this one is");
+            nk_pause(b, 6);
+            nk_text(b, "\nurgent, hm! I really need\nit soon.");
+            nk_page(b);
+            nk_text(b, "I'll add ");
+            nk_wk2_bells(b, s_wk2_bonus);
+            nk_text(b, " for");
+            nk_pause(b, 6);
+            nk_text(b, "\nthe hurry: ");
+            nk_wk2_bells(b, s_wk_view.reward);
+            nk_text(b, "\nin all!");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_HURRY:
+            nk_text(b, "Please hurry, hm!");
+            nk_pause(b, 6);
+            nk_text(b, "\nIt's urgent, and ");
+            nk_wk2_bells(b, s_wk_view.reward);
+            nk_text(b, "\nare waiting for you!");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_TAKEBACK:
+            nk_text(b, "All right, hm.");
+            nk_pause(b, 6);
+            nk_text(b, "\nThen I'll take back\n");
+            nk_wk2_item(b);
+            nk_text(b, ".");
+            nk_code(b, NK_CONTINUE);
+            break;
+        case PC_WK2_V_QUIT:
+            nk_text(b, "No more work for now.");
+            nk_pause(b, 6);
+            nk_text(b, "\nCome back any time for\na new job, hm!");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_THANKS:
+            nk_text(b, "Ah, splendid!");
+            nk_pause(b, 6);
+            nk_text(b, "\nJust what I needed:\n");
+            nk_wk2_item(b);
+            nk_text(b, "!");
+            nk_code(b, NK_CONTINUE);
+            break;
+        case PC_WK2_V_PAID:
+            nk_text(b, "Here are your ");
+            nk_wk2_bells(b, s_wk_view.reward);
+            nk_text(b, ".");
+            nk_pause(b, 6);
+            nk_text(b, "\nCome back any time for\nmore work, hm!");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_VGIVE:
+            nk_text(b, "Oh, Tom Nook sent you?");
+            nk_pause(b, 6);
+            nk_text(b, "\nHere you go:\n");
+            nk_wk2_item(b);
+            nk_text(b, "!");
+            nk_code(b, NK_CONTINUE);
+            break;
+        case PC_WK2_V_VGIVE_BYE:
+            nk_text(b, "Please tell him I said");
+            nk_pause(b, 6);
+            nk_text(b, "\nhello!");
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_VRECV:
+            nk_text(b, "Oh! Is that for me?");
+            nk_pause(b, 6);
+            nk_text(b, "\n");
+            nk_wk2_item(b);
+            nk_text(b, "\nfrom Tom Nook!");
+            nk_code(b, NK_CONTINUE);
+            break;
+        case PC_WK2_V_VRECV_TIP:
+            nk_text(b, "Thank you!");
+            if (s_wk_view.tip_kind == PC_WORK_TIP_BELLS && s_wk_view.tip_value != 0) {
+                nk_pause(b, 6);
+                nk_text(b, "\nHere are ");
+                nk_wk2_bells(b, s_wk_view.tip_value);
+                nk_text(b, "\nfor your trouble.");
+            } else if (s_wk_view.tip_kind == PC_WORK_TIP_ITEM) {
+                nk_pause(b, 6);
+                nk_text(b, "\nPlease take ");
+                nk_text(b, nk_work_item_name((int)s_wk_view.tip_value));
+                nk_text(b, "\nfor your trouble.");
+            }
+            nk_code(b, NK_END);
+            break;
+        case PC_WK2_V_VDONE:
+            nk_text(b, "Thank you so much!");
+            nk_pause(b, 6);
+            nk_text(b, "\nHere, ");
+            nk_wk2_bells(b, s_wk_view.tip_value);
+            nk_text(b, " as a\ntip for bringing it.");
+            nk_page(b);
+            nk_text(b, "Tom Nook asked me to pay");
+            nk_pause(b, 6);
+            nk_text(b, "\nyou for the job too:\n");
+            nk_wk2_bells(b, s_wk_view.reward);
+            nk_text(b, ". Job done!");
+            nk_code(b, NK_END);
+            break;
+        default:
+            nk_text(b, "Hm?");
+            nk_code(b, NK_END);
+            break;
+    }
+}
+
 /* ---- MAP LINE (see pc_nook_house.h): one extra page appended to the armed vanilla thanks message ---- */
 static int s_map_arm_idx = -1;
 static int s_map_patched = 0;
@@ -489,6 +770,9 @@ int pc_nook_msg_patch(int index, unsigned char* data, int len, int cap) {
     for (i = 0; i + 11 < len; i++) {
         if (data[i] == NK_CC && data[i + 1] == NK_SEL4) {
             id = (pc_net_game_work_view(&v) && v.state == PC_WORK_STATE_ACTIVE) ? PC_NOOK_SEL_JOB : PC_NOOK_SEL_WORK;
+            if (pc_net_game_work_v2()) {
+                id = (id == PC_NOOK_SEL_JOB) ? PC_NOOK_SEL_CHECK_JOB : PC_NOOK_SEL_GIVE_JOB; /* Work v2: "Give me a job" / "Check job" (an old host keeps the old labels) */
+            }
             memmove(&data[i + 10], &data[i + 8], (size_t)(len - (i + 8))); /* the last (cancel) id and everything after move 2 bytes up ... */
             data[i + 1] = NK_SEL5;
             data[i + 8] = (unsigned char)((id >> 8) & 0xFF); /* ... and the work / job choice takes the 4th place (index 3) */
@@ -1083,6 +1367,14 @@ int pc_nook_msg_build(int id, unsigned char* dst, int cap) {
             nk_text(&b, "\nright now.\nThank you very much!");
             nk_code(&b, NK_END);
             break;
+        case PC_NOOK_MSG_WK2: /* Nook Work Mode v2: the variant the actor selected (the serial tells it the row is on screen now) */
+            s_wk2_serial++;
+            nk_wk2_build(&b, s_wk2_var);
+            break;
+        case PC_NOOK_MSG_WK2_NEXT:
+            s_wk2_serial++;
+            nk_wk2_build(&b, s_wk2_next_var);
+            break;
         default:
             return 0;
     }
@@ -1140,6 +1432,18 @@ int pc_nook_sel_build(int id, unsigned char* dst16) {
             break;
         case PC_NOOK_SEL_CHECK_MAIL:
             snprintf(tmp, sizeof(tmp), "Check my mail."); /* guest mailbox: the post office girl */
+            break;
+        case PC_NOOK_SEL_GIVE_JOB:
+            snprintf(tmp, sizeof(tmp), "Give me a job"); /* Work v2: the first page, no job */
+            break;
+        case PC_NOOK_SEL_CHECK_JOB:
+            snprintf(tmp, sizeof(tmp), "Check job"); /* Work v2: the first page, an active job */
+            break;
+        case PC_NOOK_SEL_QUIT_JOB:
+            snprintf(tmp, sizeof(tmp), "Quit job");
+            break;
+        case PC_NOOK_SEL_TAKE_IT:
+            snprintf(tmp, sizeof(tmp), "I'll take it.");
             break;
         default:
             snprintf(tmp, sizeof(tmp), "House %d.", id - PC_NOOK_SEL_HOUSE1 + 1);
@@ -1212,6 +1516,57 @@ int pc_nook_house_selftest(void) {
             }
         }
         pc_nook_house_set_work_view(&v, nm);
+    }
+    {   /* Work v2: every variant x job type x step x has-item, with and without the game's item name, builds, ends right and stays in the charset */
+        PCWorkView v;
+        unsigned char nm[8] = {'B', 'o', 'b', ' ', ' ', ' ', ' ', ' '};
+        unsigned char it[16] = {'w', 'o', 'o', 'd', 'e', 'n', ' ', 'c', 'h', 'a', 'i', 'r', ' ', ' ', ' ', ' '};
+        int var, jt, os, has, named, j;
+        memset(&v, 0, sizeof(v));
+        v.state = 1;
+        v.mode_on = 1;
+        v.reward = 1250;
+        v.tip_value = 330;
+        v.obj_item = ITM_FOOD_PEACH;
+        v.carried_item = ITM_PAPER_START + 3;
+        for (var = PC_WK2_V_NONE; var < PC_WK2_V_COUNT; var++) {
+            for (jt = PC_WORK_JOB_FRUIT; jt <= PC_WORK_JOB_DELIVER_VILLAGER; jt++) {
+                for (os = 0; os <= 2; os++) {
+                    for (has = 0; has <= 1; has++) {
+                        for (named = 0; named <= 1; named++) {
+                            int which2, nb;
+                            v.job_type = jt;
+                            v.obj_state = os;
+                            v.tip_kind = (os == 2) ? PC_WORK_TIP_ITEM : PC_WORK_TIP_BELLS;
+                            pc_nook_house_set_work_view(&v, nm);
+                            pc_nook_house_set_work_item(named ? it : NULL, 1);
+                            pc_nook_house_set_wk2_extra(150u, has);
+                            for (which2 = PC_NOOK_MSG_WK2; which2 <= PC_NOOK_MSG_WK2_NEXT; which2++) {
+                                pc_nook_house_set_wk2(var, var);
+                                nb = pc_nook_msg_build(MSG_MAX + which2, buf, sizeof(buf));
+                                if (nb < 2 || !(buf[nb - 2] == NK_CC && (buf[nb - 1] == NK_END || buf[nb - 1] == NK_CONTINUE))) {
+                                    printf("[NOOK] selftest: work v2 variant %d (type %d step %d) did not build\n", var, jt, os);
+                                    bad++;
+                                    continue;
+                                }
+                                for (j = 0; j < nb; j++) {
+                                    if (buf[j] == NK_CC) {
+                                        const int code = buf[j + 1];
+                                        j += (code == NK_PAUSE) ? 2 : (code == NK_DEMO_NPC0) ? 4 : (code == NK_SEL2) ? 5 : (code == NK_SEL3) ? 7 : (code == NK_SEL4) ? 9 : 1;
+                                    } else if (!nk_char_ok(buf[j]) && buf[j] != NK_NEWLINE) {
+                                        printf("[NOOK] selftest: work v2 variant %d byte %d = 0x%02X is outside the charset\n", var, j, buf[j]);
+                                        bad++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pc_nook_house_set_work_item(NULL, 0);
+        pc_nook_house_set_wk2(PC_WK2_V_NONE, PC_WK2_V_NONE);
+        pc_nook_house_set_wk2_extra(0u, 0);
     }
     for (which = 0; which < PC_NOOK_MSG_COUNT; which++) {
         int n = pc_nook_msg_build(MSG_MAX + which, buf, sizeof(buf)), last_ok;

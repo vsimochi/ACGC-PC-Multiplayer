@@ -31,6 +31,7 @@ PCSettings g_pc_settings = {
     .show_ping = 0,
     .emotes = 1,
     .handover_anim = 1,
+    .work_v2 = 1,
     .shop_nook_sync = 1,
     .client_log = 0,
     .town_serve = -1, /* -1 = AUTO: on for a --dedicated host (sanitized), off otherwise; an explicit off/on/full in settings.ini or --town-serve wins */
@@ -102,6 +103,9 @@ static const char* DEFAULT_SETTINGS =
     "\n"
     "# Multiplayer hand-over animations (Nook's Work Mode, villagers giving / taking items): 0 = off (the item just changes pockets), 1 = on (default)\n"
     "handover_anim = 1\n"
+    "\n"
+    "# Multiplayer Nook Work Mode v2 (Check job, urgent jobs, quitting returns the item, villager tips, deliveries paid at the villager): 0 = the previous Work Mode, 1 = on (default)\n"
+    "work_v2 = 1\n"
     "\n"
     "# Multiplayer shops: 1 (default) = Nook (and Timmy / Tommy) follow the player of the shop who is nearest to them, the same on every game; 0 = each game's Nook follows its own player\n"
     "shop_nook_sync = 1\n"
@@ -209,6 +213,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.emotes = val;
     } else if (strcmp(key, "handover_anim") == 0) {
         if (val == 0 || val == 1) g_pc_settings.handover_anim = val;
+    } else if (strcmp(key, "work_v2") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.work_v2 = val;
     } else if (strcmp(key, "shop_nook_sync") == 0) {
         if (val == 0 || val == 1) g_pc_settings.shop_nook_sync = val;
     } else if (strcmp(key, "show_ping") == 0) {
@@ -356,6 +362,9 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Multiplayer hand-over animations (Nook's Work Mode, villagers giving / taking items): 0 = off (the item just changes pockets), 1 = on (default)\n");
     fprintf(f, "handover_anim = %d\n", g_pc_settings.handover_anim);
+    fprintf(f, "\n");
+    fprintf(f, "# Multiplayer Nook Work Mode v2 (Check job, urgent jobs, quitting returns the item, villager tips, deliveries paid at the villager): 0 = the previous Work Mode, 1 = on (default)\n");
+    fprintf(f, "work_v2 = %d\n", g_pc_settings.work_v2);
     fprintf(f, "\n");
     fprintf(f, "# Multiplayer shops: 1 (default) = Nook (and Timmy / Tommy) follow the player of the shop who is nearest to them, the same on every game; 0 = each game's Nook follows its own player\n");
     fprintf(f, "shop_nook_sync = %d\n", g_pc_settings.shop_nook_sync);

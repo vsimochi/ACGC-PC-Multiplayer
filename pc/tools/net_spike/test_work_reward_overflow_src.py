@@ -60,8 +60,9 @@ ck("max generated reward (%d) < 30000: one bag always suffices" % REWARD_MAX, RE
 # ---- plan ----
 ov = plan[plan.find("if (add != 0 && *post_wallet + add > (uint32_t)mPr_WALLET_MAX)"):]
 ck("plan: overflow block exists", bool(ov) and "ITM_MONEY_30000" in ov)
-ck("plan: only DELIVER / REPORT use the reward-overflow bag",
-   "(op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_REPORT) && add < 30000u" in ov)
+ck("plan: only DELIVER / REPORT (and the Work v2 VILLAGER_COMPLETE, whose bag goes into the vacated slot like DELIVER) use the reward-overflow bag",
+   "(op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_REPORT || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) && add < 30000u" in ov
+   and "if (op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) { /* the slot the handed-in item vacated */" in ov)
 ck("plan: DELIVER bag goes into the vacated t->slot", "bag = (post[t->slot] == (uint16_t)EMPTY_NO) ? (int)t->slot : -1;" in ov)
 ck("plan: REPORT bag goes into the first free pocket", re.search(r"for \(k = 0; k < mPr_POCKETS_SLOT_COUNT; k\+\+\) \{\s*if \(post\[k\] == \(uint16_t\)EMPTY_NO\) \{\s*bag = k;\s*break;", ov) is not None)
 ck("plan: no free pocket -> still WORK_WALLET_FULL (nothing lost)",
@@ -78,8 +79,8 @@ ck("host path: refusal returns before commit (journalled outcome, retries never 
 # ---- client validator ----
 ck("apply: bag slot computed for REPORT from the first free pre-image pocket",
    re.search(r"if \(t->pre_pockets\[i\] == \(uint16_t\)EMPTY_NO\) \{\s*bs = \(in->post_pockets\[i\] == \(uint16_t\)ITM_MONEY_30000\) \? i : -1;", apply_) is not None)
-ck("apply: bag slot for VILLAGER_RECEIVE / DELIVER is t->slot",
-   "(op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE || op == (uint8_t)PC_WORK_OP_DELIVER) && t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT" in apply_)
+ck("apply: bag slot for VILLAGER_RECEIVE / DELIVER / (Work v2) VILLAGER_COMPLETE is t->slot",
+   "(op == (uint8_t)PC_WORK_OP_VILLAGER_RECEIVE || op == (uint8_t)PC_WORK_OP_DELIVER || op == (uint8_t)PC_WORK_OP_VILLAGER_COMPLETE) && t->slot < (uint8_t)mPr_POCKETS_SLOT_COUNT" in apply_)
 ck("apply: post < pre accepted only with a bag and dec < 30000",
    "(in->post_wallet < t->pre_wallet && !(bs >= 0 && t->pre_wallet - in->post_wallet < 30000u))" in apply_)
 ck("apply: DELIVER non-empty slot only allowed with the overflow bag",

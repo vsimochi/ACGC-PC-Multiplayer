@@ -34,7 +34,7 @@ cm = rd("pc", "CMakeLists.txt")
 ck("W1 message id 90 VILLAGER_OUTFIT, 128-byte struct pinned", "PC_NETGAME_MSG_VILLAGER_OUTFIT       = 90," in ng and "sizeof(PCNetGameVillagerOutfitMsg) == 128" in ng)
 ck("W2 TXN kind 19 MUSEUM_MAIL, reasons 42 MUSEUM_FULL / 43 MUSEUM_MAIL_OFF", "#define PC_NETGAME_TXN_KIND_MUSEUM_MAIL 19u" in ng and "#define PC_NETGAME_TXN_REASON_MUSEUM_FULL     42u" in ng
    and "#define PC_NETGAME_TXN_REASON_MUSEUM_MAIL_OFF 43u" in ng)
-ck("W3 town service 8 MUSEUM_DONORS (284 B), PC_NETGAME_TS_NUM 11", "#define PC_NETGAME_TS_MDONORS  8u" in ng and "#define PC_NETGAME_TS_NUM      11u" in ng
+ck("W3 town service 8 MUSEUM_DONORS (284 B), PC_NETGAME_TS_NUM 11", "#define PC_NETGAME_TS_MDONORS  8u" in ng and "#define PC_NETGAME_TS_NUM      12u" in ng
    and "#define PC_NETGAME_TS_MDONORS_LEN (4u + 120u + PC_NETGAME_MDONORS_NAMES * 20u) /* 284" in ng)
 ck("W4 no other id of this worker collides (kind 20 / reasons 45..47 belong to worker C)", "#define PC_NETGAME_TXN_KIND_HOUSE_UPGRADE 20u" in ng)
 

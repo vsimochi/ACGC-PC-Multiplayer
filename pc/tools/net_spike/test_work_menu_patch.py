@@ -38,8 +38,8 @@ def main():
     p = subprocess.run([out], capture_output=True, text=True, env=env)
     txt = p.stdout
     print(txt)
-    m = re.search(r"CONST SEL_WORK=(\d+) SEL_JOB=(\d+)", txt)
-    sel_work, sel_job = int(m.group(1)), int(m.group(2))
+    m = re.search(r"CONST SEL_WORK=(\d+) SEL_JOB=(\d+) SEL_GIVE=(\d+) SEL_CHECK=(\d+)", txt)
+    sel_work, sel_job, sel_give, sel_check = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
     ck("the two labels are different generated choice strings", sel_work != sel_job)
 
     def row(name):
@@ -55,6 +55,9 @@ def main():
     ck("job state not known yet: 'I'd like to work' (ENTER resumes an existing job)", ("ids=10,452,9,%d,11" % sel_work) in row("unknownyet"))
     ck("the text and the tail of the vanilla message are byte for byte unchanged after the patch (only the choice list grew)", "tail_ok=1" in nj and "tail_ok=1" in aj)
     ck("any other message id is never touched", "patched=0" in row("othermsg"))
+    ck("Work v2 host (service 11): no job -> 'Give me a job', an active job -> 'Check job' in the same 4th place, the tail unchanged",
+       ("ids=10,452,9,%d,11" % sel_give) in row("v2nojob") and ("ids=10,452,9,%d,11" % sel_check) in row("v2activejob") and "tail_ok=1" in row("v2activejob")
+       and len({sel_work, sel_job, sel_give, sel_check}) == 4)
     ck("the PC message selftest (every generated row builds, charset, endings; every job type x step) passes", "selftest=0" in txt)
     return L.summary_and_exit_code(results)
 
