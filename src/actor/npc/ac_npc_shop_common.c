@@ -705,6 +705,92 @@ static void aNSC_set_buy_sum_str(mActor_name_t item, u32 p2) {
     mMsg_Set_free_str(mMsg_Get_base_window_p(), 8, buff, 0x10);
 }
 
+#ifdef TARGET_PC
+/* SHOP KEEPER TARGET SYNC (pc_shop_keeper_target.h, pc_net_game_shop_keeper_target): in a multiplayer shop the keeper's IDLE actions (wait / turn /
+ * walk to the player's zone) follow the player of the shop the shared picker chooses (the nearest, with hysteresis; a talking one first) instead of
+ * this process' own player, so every game shows the same Nook. Only the angle, the zone, the distance and the safe-zone position those actions read
+ * are swapped; a talk demo with the local player, the sales, the hand-overs and every other action keep vanilla (the local player). Keyed by npc_id
+ * (Timmy and Tommy are two actors of one include). Kill switch: AC_MP_SHOP_NOOK_SYNC=0 / settings.ini shop_nook_sync = 0. */
+typedef struct {
+    mActor_name_t npc_id;
+    s16 on;
+    xyz_t pos;
+    f32 dist;
+} aNSC_pc_tgt_c;
+static aNSC_pc_tgt_c aNSC_pc_tgt[2];
+static ACTOR aNSC_pc_tgt_actor_dummy; /* only world.position is read by the safe-zone checks */
+
+static aNSC_pc_tgt_c* aNSC_pc_tgt_of(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    mActor_name_t id = ((ACTOR*)shop_common)->npc_id;
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (aNSC_pc_tgt[i].npc_id == id) {
+            return &aNSC_pc_tgt[i];
+        }
+    }
+    for (i = 0; i < 2; i++) {
+        if (aNSC_pc_tgt[i].npc_id == 0) {
+            break;
+        }
+    }
+    if (i >= 2) {
+        i = 0;
+    }
+    memset(&aNSC_pc_tgt[i], 0, sizeof(aNSC_pc_tgt[i]));
+    aNSC_pc_tgt[i].npc_id = id;
+    return &aNSC_pc_tgt[i];
+}
+
+static int aNSC_pc_idle_action(int action) {
+    return action == aNSC_ACTION_WAIT || action == aNSC_ACTION_0x3e_WAIT || action == aNSC_ACTION_WALK_PL_OTHER_ZONE || action == aNSC_ACTION_0x40_WAIT ||
+           action == aNSC_ACTION_0x41_WALK_PL_OTHER_ZONE || action == aNSC_ACTION_TURN;
+}
+
+/* once per frame, before the action (from aNSC_set_zone_data) */
+static void aNSC_pc_retarget(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    ACTOR* actorx = (ACTOR*)shop_common;
+    aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+    int local_talk = mDemo_Get_talk_actor() == actorx || mDemo_Check(mDemo_TYPE_SPEAK, actorx) == TRUE || mDemo_Check(mDemo_TYPE_TALK, actorx) == TRUE;
+    int apply = !local_talk && aNSC_pc_idle_action(shop_common->action);
+    float x, y, z, d;
+
+    t->on = FALSE;
+    if (pc_net_game_shop_keeper_target(actorx, (int)(u16)actorx->npc_id, actorx->world.position.x, actorx->world.position.z,
+                                       (f32)gamePT->graph->dt_num_60fps_frames, local_talk, apply, &x, &y, &z, &d) && apply) {
+        t->on = TRUE;
+        t->pos.x = x;
+        t->pos.y = y;
+        t->pos.z = z;
+        t->dist = d;
+    }
+}
+
+static int aNSC_pc_tgt_on(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    return aNSC_pc_tgt_of(shop_common)->on;
+}
+
+/* the distance the idle decision measures: the shared target's, else vanilla's local player */
+static f32 aNSC_pc_player_dist(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+    return t->on ? t->dist : shop_common->npc_class.actor_class.player_distance_xz;
+}
+
+/* the "player" the safe-zone checks read (world.position only) */
+static ACTOR* aNSC_pc_player_for_zone(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* player) {
+    aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+    if (!t->on) {
+        return player;
+    }
+    aNSC_pc_tgt_actor_dummy.world.position = t->pos;
+    return &aNSC_pc_tgt_actor_dummy;
+}
+#define aNSC_PC_PLAYER_DIST(sc) aNSC_pc_player_dist(sc)
+#define aNSC_PC_ZONE_PLAYER(sc, pl) aNSC_pc_player_for_zone((sc), (pl))
+#else
+#define aNSC_PC_PLAYER_DIST(sc) ((sc)->npc_class.actor_class.player_distance_xz)
+#define aNSC_PC_ZONE_PLAYER(sc, pl) (pl)
+#endif
+
 #ifndef aNSC_MAMEDANUKI
 static int aNSC_decide_next_move_act(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     int res;
@@ -716,14 +802,14 @@ static int aNSC_decide_next_move_act(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PL
         if (player == NULL) {
             return shop_common->action;
         }
-        if (aNSC_check_safe_zone(shop_common, player) == TRUE) {
+        if (aNSC_check_safe_zone(shop_common, aNSC_PC_ZONE_PLAYER(shop_common, player)) == TRUE) {
             return aNSC_ACTION_WAIT;
         } else {
-            if (shop_common->npc_class.actor_class.player_distance_xz < aNSC_PLAYER_DISTANCE ||
+            if (aNSC_PC_PLAYER_DIST(shop_common) < aNSC_PLAYER_DISTANCE ||
                 shop_common->talk_start_tim == 0) {
                 return aNSC_ACTION_WAIT;
             } else {
-                f32 player_distance_xz = shop_common->npc_class.actor_class.player_distance_xz;
+                f32 player_distance_xz = aNSC_PC_PLAYER_DIST(shop_common);
                 if (shop_common->player_zone != shop_common->zone) {
                     if (shop_common->action != aNSC_ACTION_WALK_PL_OTHER_ZONE &&
                         shop_common->action != aNSC_ACTION_0x41_WALK_PL_OTHER_ZONE) {
@@ -761,10 +847,10 @@ static int aNSC_decide_next_move_act(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PL
                (ClObj_DID_COLLIDE(shop_common->npc_class.collision.pipe.collision_obj) ||
                 shop_common->action == aNSC_ACTION_WAIT)) {
         res = aNSC_ACTION_WAIT;
-    } else if (player->world.position.z < 120.0f && (shop_common->zone == 2 || shop_common->zone == 3)) {
+    } else if (aNSC_PC_ZONE_PLAYER(shop_common, player)->world.position.z < 120.0f && (shop_common->zone == 2 || shop_common->zone == 3)) {
         res = aNSC_ACTION_WAIT;
     } else {
-        f32 dist = shop_common->npc_class.actor_class.player_distance_xz;
+        f32 dist = aNSC_PC_PLAYER_DIST(shop_common);
 
         if (dist < 80.0f || shop_common->talk_start_tim == 0) {
             res = aNSC_ACTION_WAIT;
@@ -801,6 +887,12 @@ static void aNSC_set_zone_data(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* a2) {
     if (a2 != NULL) {
         shop_common->player_zone = aNSC_get_zone(a2->world.position);
     }
+#ifdef TARGET_PC
+    aNSC_pc_retarget(shop_common); /* SHOP KEEPER TARGET SYNC: the zone of the shared target */
+    if (aNSC_pc_tgt_on(shop_common)) {
+        shop_common->player_zone = aNSC_get_zone(aNSC_pc_tgt_of(shop_common)->pos);
+    }
+#endif
 }
 #else
 static void aNSC_set_zone_data(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* a2) {
@@ -810,11 +902,24 @@ static void aNSC_set_zone_data(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* a2) {
     if (a2 != NULL) {
         shop_common->player_zone = aNSC_get_zone(shop_common, a2->world.position);
     }
+#ifdef TARGET_PC
+    aNSC_pc_retarget(shop_common); /* SHOP KEEPER TARGET SYNC: the zone of the shared target */
+    if (aNSC_pc_tgt_on(shop_common)) {
+        shop_common->player_zone = aNSC_get_zone(shop_common, aNSC_pc_tgt_of(shop_common)->pos);
+    }
+#endif
 }
 #endif
 
 static void aNSC_set_player_angl(NPC_SHOP_COMMON_ACTOR* shop_common) {
     shop_common->player_angle = shop_common->npc_class.actor_class.player_angle_y;
+#ifdef TARGET_PC
+    if (aNSC_pc_tgt_on(shop_common)) { /* SHOP KEEPER TARGET SYNC: turn toward the shared target */
+        xyz_t* p = &shop_common->npc_class.actor_class.world.position;
+        aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+        shop_common->player_angle = atans_table(t->pos.z - p->z, t->pos.x - p->x);
+    }
+#endif
 }
 
 static int aNSC_money_check(u32 amount) {

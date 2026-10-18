@@ -472,6 +472,17 @@ int pc_net_game_host_npc_talk_edge(int slot, uint16_t npc_id, int begin);
 int pc_net_game_npc_talk_owner_pos(int slot, float* out_x, float* out_z);
 /* Idle look-at: the nearest OTHER player (a remote puppet in the same scene as this process) within `max_dist` of (x, z): 1 + its position. */
 int pc_net_game_nearest_remote_player(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z);
+/* SHOP KEEPER TARGET SYNC (pc_shop_keeper_target.h, no wire): the shared target of the shop keeper actor `keeper` (Nook / Timmy / Tommy, npc_id for logs) at
+ * (kx, kz) for this frame, picked among every player of this shop scene (this process' own player + the puppets of the same scene). local_talk = the
+ * keeper is in a talk demo with the LOCAL player (vanilla: always that player); apply = the keeper is in an idle / follow action and will use the result.
+ * 1 = the target is ANOTHER player: *out_x/y/z its position, *out_d its xz distance (the caller aims at it instead of the local player); 0 = the local
+ * player (or the feature is off / no session): the caller keeps vanilla. dt = 60 fps frames of this frame. */
+int pc_net_game_shop_keeper_target(const void* keeper, int npc_id, float kx, float kz, float dt, int local_talk, int apply, float* out_x, float* out_y, float* out_z,
+                                   float* out_d);
+/* the keeper's head look for this frame (ac_npc_head.c_inc): 1 = look at (*x, *y, *z) (another player), 2 = the local player (vanilla look, no remote look-at),
+ * 0 = not a synced keeper this frame (the generic idle look-at). */
+int pc_net_game_shop_keeper_head(const void* keeper, float* out_x, float* out_y, float* out_z);
+int pc_net_game_shop_nook_sync_enabled(void); /* AC_MP_SHOP_NOOK_SYNC (env, 0 = off) && settings.ini [Gameplay] shop_nook_sync (default 1) */
 
 /* This process's own town identity (see PCNetGameTownIdentity). 0 if no gameplay save is loaded
  * (the value would be meaningless -- e.g. the title-demo town). */

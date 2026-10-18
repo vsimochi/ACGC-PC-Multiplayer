@@ -7014,6 +7014,220 @@ int pc_net_game_nearest_remote_player(float x, float z, float max_dist, float* o
     return best >= 0;
 }
 
+/* ===== SHOP KEEPER TARGET SYNC BEGIN (pc_shop_keeper_target.h; no wire) =====
+ * Every process' own keeper (Nook / Timmy / Tommy) aims at the player of the shop the shared picker chooses: same candidates (own player + same-scene
+ * puppets, by wire id), same rules, so every game shows the same target up to the puppet delay (hysteresis absorbs it). The keeper code
+ * (ac_npc_shop_common.c) only swaps the angle / zone / distance it follows in its idle actions; talks, sales and hand-overs stay vanilla. */
+#include "pc_shop_keeper_target.h"
+#include "sys_math.h" /* atans_table() (TEST-ONLY facing log / placement) */
+#define PCNG_SKT_SLOTS 4
+static struct {
+    const void* keeper;
+    int         npc_id;
+    uint32_t    ms;
+    PCSktState  st;
+    int         head;     /* 0 none, 1 remote (pos), 2 local */
+    float       hx, hy, hz;
+} s_skt[PCNG_SKT_SLOTS];
+static uint32_t s_skt_log_n = 0;
+
+int pc_net_game_shop_nook_sync_enabled(void) {
+    static int s_env = -1;
+    if (s_env < 0) {
+        const char* e = getenv("AC_MP_SHOP_NOOK_SYNC");
+        s_env = (e != NULL && e[0] == '0') ? 0 : 1; /* ON by default */
+    }
+    return s_env && g_pc_settings.shop_nook_sync;
+}
+
+static int pcnetgame_skt_talk_index(int mi) {
+    return mi >= mPlayer_INDEX_TALK && mi <= mPlayer_INDEX_GIVE_WAIT; /* the conversation + hand-over states */
+}
+
+#ifdef PC_NET_TEST_HOOKS
+/* TEST-ONLY (AC_TEST_HOOKS=1 + AC_TEST_NOOK_SYNC=<file>, never in normal play): the real shop test positions this process' player relative to the keeper
+ * (file line `<id> tpk DX DZ`: the player is parked at keeper + (DX, DZ), facing him; a positioning aid like the autopilot's town "tp") and reads twice a
+ * second which target this keeper follows and how far its facing is from each player of the shop (da = keeper facing - direction to that player). */
+static void pcnetgame_skt_test_hook(const ACTOR* keeper, PLAYER_ACTOR* pl, int pick, const PCSktCand* cand, int n) {
+    static int s_en = -1;
+    static char s_file[160];
+    static uint32_t s_next_poll = 0u, s_next_log = 0u;
+    const uint32_t now = pcnetgame_now_ms();
+    int i;
+    if (s_en < 0) {
+        const char* e = pc_test_hook_getenv("AC_TEST_NOOK_SYNC");
+        s_en = (e != NULL && e[0] != 0) ? 1 : 0;
+        if (s_en) {
+            snprintf(s_file, sizeof(s_file), "%s", e);
+        }
+    }
+    if (!s_en || keeper == NULL) {
+        return;
+    }
+    if ((int32_t)(now - s_next_poll) >= 0) {
+        FILE* f;
+        s_next_poll = now + 250u;
+        if ((f = fopen(s_file, "rb")) != NULL) {
+            char line[128], cmd[16] = { 0 };
+            int id = 0;
+            float dx = 0.0f, dz = 0.0f;
+            line[0] = 0;
+            if (fgets(line, sizeof(line), f) == NULL) {
+                line[0] = 0;
+            }
+            fclose(f);
+            remove(s_file);
+            if (sscanf(line, "%d %15s %f %f", &id, cmd, &dx, &dz) == 4 && strcmp(cmd, "tpk") == 0 && pcnetgame_is_real_player_actor(pl)) {
+                pl->actor_class.world.position.x = keeper->world.position.x + dx;
+                pl->actor_class.world.position.z = keeper->world.position.z + dz;
+                pl->actor_class.shape_info.rotation.y = atans_table(-dz, -dx);
+                pl->actor_class.world.angle.y = pl->actor_class.shape_info.rotation.y;
+                printf("[NET][NOOKSYNC][TEST-ONLY] tpk %d done: keeper 0x%04X at (%.1f,%.1f), the player parked at (%.1f,%.1f)\n", id, (unsigned)(u16)keeper->npc_id,
+                       (double)keeper->world.position.x, (double)keeper->world.position.z, (double)pl->actor_class.world.position.x, (double)pl->actor_class.world.position.z);
+            } else {
+                printf("[NET][NOOKSYNC][TEST-ONLY] ignored command line: %s\n", line);
+            }
+        }
+    }
+    if ((int32_t)(now - s_next_log) >= 0) {
+        char buf[320];
+        int len = 0;
+        s_next_log = now + 500u;
+        buf[0] = 0;
+        for (i = 0; i < n && len < (int)sizeof(buf) - 48; i++) {
+            const float ddx = cand[i].x - keeper->world.position.x, ddz = cand[i].z - keeper->world.position.z;
+            const int da = (int)(s16)(keeper->shape_info.rotation.y - atans_table(ddz, ddx));
+            len += snprintf(buf + len, sizeof(buf) - (size_t)len, " p%d:d=%.0f,da=%d%s", cand[i].id, (double)sqrtf(ddx * ddx + ddz * ddz), da, cand[i].talking ? ",talk" : "");
+        }
+        printf("[NET][NOOKSYNC][TEST-ONLY] keeper 0x%04X at (%.1f,%.1f) rot=%d target=%d%s\n", (unsigned)(u16)keeper->npc_id, (double)keeper->world.position.x,
+               (double)keeper->world.position.z, (int)keeper->shape_info.rotation.y, pick, buf);
+    }
+}
+#endif
+
+int pc_net_game_shop_keeper_target(const void* keeper, int npc_id, float kx, float kz, float dt, int local_talk, int apply, float* out_x, float* out_y, float* out_z,
+                                   float* out_d) {
+    PCSktCand cand[PC_SKT_MAX_CAND];
+    float cy[PC_SKT_MAX_CAND];
+    PCNetPlayerScene ls, ps;
+    PLAYER_ACTOR* pl;
+    int n = 0, p, i, slot = -1, local_id, pick, prev;
+    const uint32_t now = pcnetgame_now_ms();
+
+    if (keeper == NULL || !pc_net_game_shop_nook_sync_enabled() || gamePT == NULL ||
+        (s_role != PC_NETGAME_ROLE_HOST && !(s_role == PC_NETGAME_ROLE_CLIENT && s_client_link == PC_NETGAME_LINK_READY)) || !pc_net_game_get_local_scene(&ls)) {
+        return 0;
+    }
+    for (i = 0; i < PCNG_SKT_SLOTS; i++) {
+        if (s_skt[i].keeper == keeper && (uint32_t)(now - s_skt[i].ms) < 2000u) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) { /* a new keeper (or one not seen for 2 s: a new visit): the oldest slot, a fresh state */
+        uint32_t oldest = 0u;
+        for (i = 0; i < PCNG_SKT_SLOTS; i++) {
+            const uint32_t age = (uint32_t)(now - s_skt[i].ms);
+            if (s_skt[i].keeper == NULL) {
+                slot = i;
+                break;
+            }
+            if (slot < 0 || age > oldest) {
+                slot = i;
+                oldest = age;
+            }
+        }
+        memset(&s_skt[slot], 0, sizeof(s_skt[slot]));
+        s_skt[slot].keeper = keeper;
+        pc_skt_reset(&s_skt[slot].st);
+    }
+    s_skt[slot].npc_id = npc_id;
+    s_skt[slot].ms = now;
+    s_skt[slot].head = 0;
+    local_id = (s_role == PC_NETGAME_ROLE_HOST) ? (int)PC_NETGAME_HOST_PLAYER_ID : (int)s_client_assigned_peer_id;
+    pl = get_player_actor_withoutCheck((GAME_PLAY*)gamePT);
+    if (!pc_host_observer_active() && pcnetgame_is_real_player_actor(pl)) { /* the hidden server observer is no shopper */
+        cand[n].id = local_id;
+        cand[n].x = pl->actor_class.world.position.x;
+        cand[n].z = pl->actor_class.world.position.z;
+        cand[n].talking = local_talk || pcnetgame_skt_talk_index((int)pl->now_main_index);
+        cy[n] = pl->actor_class.world.position.y;
+        n++;
+    }
+    for (p = 0; p < PC_REMOTE_PLAYER_ID_LIMIT && n < PC_SKT_MAX_CAND; p++) {
+        float px, py, pz;
+        uint8_t ms = 0, ai = 0;
+        if (p == local_id || !pc_remote_player_get_scene((PCNetPlayerId)p, &ps) || ps.scene_id != ls.scene_id || ps.owner != ls.owner ||
+            !pc_remote_player_get_last_position((PCNetPlayerId)p, &px, &py, &pz)) {
+            continue;
+        }
+        (void)pc_remote_player_get_last_motion((PCNetPlayerId)p, &ms, &ai);
+        cand[n].id = p;
+        cand[n].x = px;
+        cand[n].z = pz;
+        cand[n].talking = pcnetgame_skt_talk_index((int)ai);
+        cy[n] = py;
+        n++;
+    }
+    prev = s_skt[slot].st.cur;
+    if (local_talk) { /* vanilla: the keeper talks to this process' own player */
+        pick = local_id;
+        s_skt[slot].st.cur = local_id;
+        s_skt[slot].st.chal = PC_SKT_NONE;
+        s_skt[slot].st.chal_frames = 0.0f;
+    } else {
+        pick = pc_skt_pick(&s_skt[slot].st, kx, kz, cand, n, dt);
+    }
+    if (pick != prev && s_skt_log_n++ < 400u) {
+        printf("[NET][NOOKSYNC] keeper 0x%04X target %d -> %d (%s; %d player(s) in the shop, local %d)\n", (unsigned)(npc_id & 0xFFFF), prev, pick,
+               local_talk ? "local talk" : s_skt[slot].st.cur_talk ? "talking player" : "nearest", n, local_id);
+    }
+#ifdef PC_NET_TEST_HOOKS
+    pcnetgame_skt_test_hook((const ACTOR*)keeper, pl, pick, cand, n);
+#endif
+    if (pick == PC_SKT_NONE || pick == local_id) {
+        s_skt[slot].head = (apply && pick == local_id) ? 2 : 0;
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (cand[i].id == pick) {
+            const float dx = cand[i].x - kx, dz = cand[i].z - kz;
+            *out_x = cand[i].x;
+            *out_y = cy[i];
+            *out_z = cand[i].z;
+            *out_d = sqrtf(dx * dx + dz * dz);
+            if (apply) {
+                s_skt[slot].head = 1;
+                s_skt[slot].hx = cand[i].x;
+                s_skt[slot].hy = cy[i] + 20.0f;
+                s_skt[slot].hz = cand[i].z;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int pc_net_game_shop_keeper_head(const void* keeper, float* out_x, float* out_y, float* out_z) {
+    int i;
+    const uint32_t now = pcnetgame_now_ms();
+    if (keeper == NULL) {
+        return 0;
+    }
+    for (i = 0; i < PCNG_SKT_SLOTS; i++) {
+        if (s_skt[i].keeper == keeper && (uint32_t)(now - s_skt[i].ms) < 250u && s_skt[i].head != 0) {
+            if (s_skt[i].head == 1) {
+                *out_x = s_skt[i].hx;
+                *out_y = s_skt[i].hy;
+                *out_z = s_skt[i].hz;
+            }
+            return s_skt[i].head;
+        }
+    }
+    return 0;
+}
+/* ===== SHOP KEEPER TARGET SYNC END ===== */
+
 /* --host-observer: see pc_net_game.h. The remote players in the host's scene are gathered once per frame (graph_dt_frame_time), then each villager asks for its nearest one. */
 int pc_net_game_observer_npc_target(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z) {
     static double s_frame = -1.0;

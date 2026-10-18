@@ -30,6 +30,7 @@ typedef struct {
     int personal_sync;    /* HOST only (personal data sync, diary): -1 = AUTO (default: on only while town_serve != off), 0 = off, 1 = on */
     int emotes;           /* [Gameplay] emotes: 1 (default) = the emote wheel (F / pad D-pad Up held, pc_emote_wheel.c), 0 = off. Env AC_EMOTES=0 too */
     int handover_anim;    /* [Gameplay] handover_anim: 1 (default) = multiplayer hand-overs (Nook Work Mode, villager gives / takes) play the vanilla animation (pc_handover.h), 0 = the instant pocket change. Env AC_MP_HANDOVER_ANIM=0 too */
+    int shop_nook_sync;   /* [Gameplay] shop_nook_sync: 1 (default) = in a multiplayer shop Nook (and Timmy / Tommy) follows the NEAREST player of that shop on every game (pc_shop_keeper_target.h), 0 = vanilla (each game's keeper follows its own player). Env AC_MP_SHOP_NOOK_SYNC=0 too */
     int show_ping;        /* CLIENT only: 1 = show the round-trip time (ms) to the host while connected (default 0; F4 toggles it for the session) */
     int client_log;       /* hotfix 0.2.1 diagnostics, [Debug] client_log: 1 = this process's stdout / stderr go to client_log.txt next to the exe (append, rotated at 4 MB); default 0. Env AC_CLIENT_LOG=1 too. Not for --dedicated (it has servers/<id>/logs). */
     int ofurn_place;      /* HOST only (outdoor furniture C1): 1 (default) = residents may PLACE furniture outdoors (model + rotation + collision), 0 = the Place action is off */

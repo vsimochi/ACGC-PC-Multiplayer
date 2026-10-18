@@ -112,7 +112,23 @@ static void aNPC_look_target(NPC_ACTOR* nactorx, GAME_PLAY* play) {
     }
 
 #ifdef TARGET_PC
-    if (nactorx->palActor == NULL && prio == 1) { /* Patch 8: idle look-at -- the NEAREST player; a remote player nearer than the local one wins (a head angle is local presentation, nothing is networked) */
+    int pc_sk = 0;
+    if (nactorx->palActor == NULL && prio == 1) { /* SHOP KEEPER TARGET SYNC: a shop keeper looks at the shared target its idle actions follow (pc_net_game_shop_keeper_target) */
+        float sx, sy, sz;
+        pc_sk = pc_net_game_shop_keeper_head(nactorx, &sx, &sy, &sz);
+        if (pc_sk == 1) {
+            xyz_t at;
+            at.x = sx;
+            at.y = sy;
+            at.z = sz;
+            if (aNPC_check_look_range(nactorx, &at) == TRUE) {
+                aNPC_set_head_request(nactorx, prio, aNPC_HEAD_TARGET_POS, NULL, &at);
+            }
+            target = NULL;
+        }
+        /* pc_sk == 2: the local player is the target -- vanilla's look (target) stays, no nearer-puppet look-at below */
+    }
+    if (pc_sk == 0 && nactorx->palActor == NULL && prio == 1) { /* Patch 8: idle look-at -- the NEAREST player; a remote player nearer than the local one wins (a head angle is local presentation, nothing is networked) */
         float rx, ry, rz;
         f32 local_d = (target != NULL) ? nactorx->actor_class.player_distance_xz : 1e9f;
         if (local_d > 24.0f && pc_net_game_nearest_remote_player(nactorx->actor_class.world.position.x, nactorx->actor_class.world.position.z, 120.0f, &rx, &ry, &rz)) {
