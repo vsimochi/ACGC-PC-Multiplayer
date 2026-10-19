@@ -69,7 +69,7 @@ EXPECTED_MAX_MSG_ID = 76
 # range and may be present or absent while workers land: 77 TREE_DROP, 78 SHOP_PREVIEW, 79 / 80 ball, 81 BEE_SWARM, 82 bees spare,
 # 83 / 84 dresser storage, 85 SHOP_UPGRADE_REQ (the announced 5-minute shop upgrade, client -> host, 8 B; deliberate, no protocol bump).
 # Any id outside 1..76 and outside this range, or a duplicate, fails the audit.
-SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98, 99) + (100, 101) + (102,) + (103,) + (104,)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
+SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 87) + (91, 92) + (96, 97, 98, 99) + (100, 101) + (102,) + (103,) + (104,) + (105,)  # worker B (deliberate, no protocol bump): 90 VILLAGER_OUTFIT (host -> client, 128 B)
 # player-vs-player tool hits (deliberate, no protocol bump): 91 PVP_HIT_REQ (client -> host, 16 B), 92 PVP_HIT (host -> the victim only, 12 B); the
 # wire structs are PCPvpHitReqMsg / PCPvpHitMsg in pc/include/pc_pvp_authority.h (pinned by test_pvp_src.py, size _Static_asserts 16 / 12)
 # worker A (deliberate, no protocol bump): 86 WILDLIFE_TOOL_ACTION (client -> host, 8 B, latent bugs), 87 GHOST_HUNT (client -> host, 4 B, spirit hunt)
@@ -84,8 +84,10 @@ SPRINT_EXTRA_MSG_IDS = tuple(range(EXPECTED_MAX_MSG_ID + 1, 86)) + (90,) + (86, 
 # PCHandoverMsg in pc/include/pc_handover.h, pinned by test_handover_src.py).
 # roommates / move-in (deliberate, no protocol bump): 104 ROOMMATE (client -> host requests at a placed gyroid, sent only after the 102 CAPS bit C4; host -> client
 # INFO / RESULT / STATUS / NOTICE; RELIABLE, 300 B, PCRoomMsg in pc/include/pc_roommates.h, pinned by test_roommates_src.py).
+# synced arrival train (deliberate, no protocol bump): 105 ARRIVAL_TRAIN (host -> every READY client STATE = the arrival timeline; client -> host REQUEST /
+# STEPPED_OFF / WELCOMED / ABORT, sent only after the host's STATE; RELIABLE, 48 B, PCArrTrainMsg in pc/include/pc_arrival_train.h, pinned by test_arrival_train_src.py).
 SPRINT_EXTRA_STRUCT_RE = r"PCNetGame(?:TreeDrop|ShopPreview|Ball\w*|Bee\w*|Dresser\w*|ShopUpgradeReq|VillagerOutfit|WildlifeToolAction|GhostHunt)Msg|PCNetGameOutfitWire"  # worker B: VILLAGER_OUTFIT; worker A: 86 / 87
-_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-9]|10[0-4])\s*,?"
+_SPRINT_ENUM_RE = r"PC_NETGAME_MSG_\w+\s*=\s*(?:7[7-9]|8[0-7]|9[0-2]|9[6-9]|10[0-5])\s*,?"
 
 # The ONE source of truth for "what protocol version must the tree speak" (tests import this; net_spike_lib.PROTOCOL_VERSION
 # is audited against it).

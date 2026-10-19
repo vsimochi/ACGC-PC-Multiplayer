@@ -61,9 +61,78 @@ static void aSTM_look_player(NPC_STATION_MASTER_ACTOR* actor, GAME_PLAY* play) {
     }
 }
 
+#ifdef TARGET_PC
+/* Synced arrival train (pc_arrival_train.h): Porter at the SAME place on every process. Vanilla: on the arriving player's process Porter stands at
+ * his home spot by the train door (turned to it) and walks one unit right after the welcome; everywhere else he idles one unit right of it. While
+ * the host's timeline presents a train that is coming in / stopped or still has a passenger to welcome, an idle Porter (think 8 / 9) here walks
+ * to the door spot, faces the passenger stepping off (else the train door) and walks back one unit right afterwards. The local arrival
+ * (a ride-off demo actor) keeps the vanilla behaviour. Returns TRUE when it requested an action (the vanilla idle request is then skipped). */
+static int s_aSTM_pc_at_door = FALSE;
+static int aSTM_pc_arrival_presence(NPC_STATION_MASTER_ACTOR* actor, GAME_PLAY* play) {
+    ACTOR* ax = (ACTOR*)actor;
+    PCATView v;
+    f32 door_x = ax->home.position.x;
+    f32 home_z = ax->home.position.z;
+    f32 fx = 2180.0f, fz = 790.0f; /* the caboose door (the passenger lands at 2180, 820) */
+    int want;
+    int k;
+
+    if ((actor->think_idx != aSTM_THINK_8 && actor->think_idx != aSTM_THINK_9) ||
+        Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL || mDemo_Check(mDemo_TYPE_TALK, ax) || mDemo_Check(mDemo_TYPE_SPEAK, ax)) {
+        return FALSE;
+    }
+    want = pc_arrtrain_view(&v) && pcat_porter_at_door(&v);
+    if (want) {
+        if (!s_aSTM_pc_at_door) {
+            s_aSTM_pc_at_door = TRUE;
+            printf("[TRAIN][SYNC] Porter: to the train door (home %.0f, %.0f) for train %u\n", (double)door_x, (double)home_z, (unsigned)v.id);
+        }
+        if (fabsf(ax->world.position.x - door_x) > 3.0f || fabsf(ax->world.position.z - home_z) > 3.0f) {
+            actor->npc_class.condition_info.demo_flg = aNPC_COND_DEMO_SKIP_FORWARD_CHECK | aNPC_COND_DEMO_SKIP_OBJ_COL_CHECK;
+            return aSTM_set_request_act(actor, 4, aNPC_ACT_WALK, aNPC_ACT_TYPE_TO_POINT, aNPC_ACT_OBJ_DEFAULT, (s16)door_x, (s16)home_z);
+        }
+        for (k = 0; k < v.n; k++) { /* the passenger being welcomed: face it */
+            if (v.pstate[k] == PCAT_PS_OFF) {
+                float px, pz;
+                if (pc_arrtrain_passenger_pos((int)v.peer[k], &px, &pz)) {
+                    fx = px;
+                    fz = pz;
+                }
+                break;
+            }
+            if (v.pstate[k] == PCAT_PS_RIDING) {
+                break;
+            }
+        }
+        {
+            s16 want_y = atans_table(fz - ax->world.position.z, fx - ax->world.position.x);
+            s16 diff = DIFF_SHORT_ANGLE(want_y, ax->shape_info.rotation.y);
+            if (ABS(diff) > DEG2SHORT_ANGLE2(12.0f)) {
+                actor->npc_class.condition_info.demo_flg |= aNPC_COND_DEMO_SKIP_FOOTSTEPS;
+                return aSTM_set_request_act(actor, 4, aNPC_ACT_TURN2, aNPC_ACT_TYPE_TO_POINT, aNPC_ACT_OBJ_DEFAULT, (s16)fx, (s16)fz);
+            }
+        }
+        return aSTM_set_request_act(actor, 4, aNPC_ACT_WAIT, aNPC_ACT_TYPE_DEFAULT, aNPC_ACT_OBJ_DEFAULT, 0, 0);
+    }
+    if (s_aSTM_pc_at_door) {
+        if (fabsf(ax->world.position.x - (door_x + mFI_UT_WORLDSIZE_X_F)) > 3.0f) {
+            actor->npc_class.condition_info.demo_flg = aNPC_COND_DEMO_SKIP_FORWARD_CHECK | aNPC_COND_DEMO_SKIP_OBJ_COL_CHECK;
+            return aSTM_set_request_act(actor, 4, aNPC_ACT_WALK, aNPC_ACT_TYPE_TO_POINT, aNPC_ACT_OBJ_DEFAULT, (s16)(door_x + mFI_UT_WORLDSIZE_X_F), (s16)home_z);
+        }
+        s_aSTM_pc_at_door = FALSE;
+        actor->npc_class.condition_info.demo_flg = 0;
+        printf("[TRAIN][SYNC] Porter: back at his place (%.0f, %.0f)\n", (double)ax->world.position.x, (double)ax->world.position.z);
+    }
+    return FALSE;
+}
+#endif
+
 static void aSTM_talk_wait(NPC_STATION_MASTER_ACTOR* actor, GAME_PLAY* play) {
     ACTOR* playerx = GET_PLAYER_ACTOR_ACTOR(play);
 
+#ifdef TARGET_PC
+    if (!aSTM_pc_arrival_presence(actor, play)) /* synced arrival train: Porter at the train door like on the arriving player's process */
+#endif
     aSTM_look_player(actor, play);
 
     if (actor->happening_sound == BGM_INTRO_ARRIVE || actor->happening_sound == BGM_INTRO_NEW_TOWN) {

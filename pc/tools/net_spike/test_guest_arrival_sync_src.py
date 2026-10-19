@@ -87,6 +87,12 @@ def main():
             fs, _fr, fu = T.strip_target_pc(T.func(tc, fn))
             ck("diff: mTRC_trainSet is byte-identical to the baseline outside its TARGET_PC diagnostics", not fu and T.nonblank(fs) == T.nonblank(T.func(tcb, fn)))
             continue
+        if fn == "mTRC_move":  # the synced arrival train adds ONE TARGET_PC-guarded call (mTRC_pc_sync_tick) before the vanilla schedule; everything else must be byte-identical
+            fs, fr, fu = T.strip_target_pc(T.func(tc, fn))
+            bs, br, _bu = T.strip_target_pc(T.func(tcb, fn))
+            ck("diff: mTRC_move is byte-identical to the baseline outside its TARGET_PC regions (the synced arrival train adds only mTRC_pc_sync_tick)",
+               not fu and T.nonblank(fs) == T.nonblank(bs) and "mTRC_pc_sync_tick(play);" in "\n".join(fr))
+            continue
         ck("diff: %s is byte-identical to the baseline" % fn, T.func(tc, fn) != "" and T.func(tc, fn) == T.func(tcb, fn))
     ck("vanilla player / train / ride-off / station master decomp files are untouched (git diff vs %s)" % BASELINE,
        unchanged(["src/game/m_player.c", "src/game/m_player_lib.c", "src/game/m_player_common.c_inc", "src/game/m_player_main_demo_standing_train.c_inc",

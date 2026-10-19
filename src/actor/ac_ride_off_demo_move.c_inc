@@ -13,6 +13,7 @@ static void aROD_change_player_demo_standing_train(GAME* game) {
 #ifdef TARGET_PC
 #include "m_train_control.h"
 #include "pc_remote_arrival_logic.h"
+#include "pc_arrival_train.h" /* synced arrival train: the host's seat / timeline (pc_arrtrain_*) */
 extern int pc_remote_arrival_join_query(int* join_class, float* train_x); /* pc_remote_player.c */
 extern void pc_net_game_join_trace(const char* fmt, ...); /* pc_net_game.c: hotfix 0.2.1 [JOIN] stage trace */
 
@@ -22,12 +23,25 @@ extern void pc_net_game_join_trace(const char* fmt, ...); /* pc_net_game.c: hotf
 static int s_aROD_join_class = PCARR_JOIN_NONE;
 static float s_aROD_join_x = 0.0f;
 static int s_aROD_join_pending = 0;
+/* Synced arrival train (pc_arrival_train.h): with a host that runs the arrival timeline, the arrival asks the host for a seat first (held at the train start
+ * until the seat's train starts), the local train is then the timeline's (m_train_control.c mTRC_pc_sync_tick: no own train request), the passenger steps
+ * off only on its turn (mTRC_pc_local_may_get_off) and reports stepping off / the end of Porter's welcome. Without it: the previous behaviour below. */
+static int s_aROD_synced = 0;
 #endif
 
 static void aROD_first_set(ACTOR* actor, GAME* game) {
 #ifdef TARGET_PC
     s_aROD_join_pending = 0;
-    if (Common_Get(player_no) == mPr_FOREIGNER) {
+    s_aROD_synced = pc_arrtrain_arrival_query();
+    if (s_aROD_synced < 0) {
+        if (mPlib_get_player_actor_main_index(game) != mPlayer_INDEX_DEMO_WAIT) {
+            mPlib_request_main_demo_wait_type1(game, FALSE, NULL); /* parked at the station start, no control, until the host's seat / its train starts (bounded) */
+        }
+        return;
+    }
+    if (s_aROD_synced) {
+        /* no legacy join: the passenger dx is the seat's (mTRC_pc_sync_tick) */
+    } else if (Common_Get(player_no) == mPr_FOREIGNER) {
         if (!pc_remote_arrival_join_query(&s_aROD_join_class, &s_aROD_join_x)) {
             if (mPlib_get_player_actor_main_index(game) != mPlayer_INDEX_DEMO_WAIT) {
                 mPlib_request_main_demo_wait_type1(game, FALSE, NULL); /* parked at the station start, no control, until the roster of the others is known */
@@ -37,6 +51,9 @@ static void aROD_first_set(ACTOR* actor, GAME* game) {
         s_aROD_join_pending = s_aROD_join_class != PCARR_JOIN_NONE;
         mTRC_pc_join_arrival(PCARR_JOIN_NONE, 0.0f); /* resets the passenger offset; a join is applied once the local train exists (train_birth_wait) */
     }
+#endif
+#ifdef TARGET_PC
+    if (!s_aROD_synced) /* synced: the timeline already started the local train (mTRC_pc_sync_tick) */
 #endif
     Common_Set(train_coming_flag, 3);
     aROD_change_player_demo_standing_train(game);
@@ -69,7 +86,11 @@ static void aROD_ride_train(ACTOR* actor, GAME* game) {
 
     aROD_change_player_demo_standing_train(game);
 
+#ifdef TARGET_PC
+    if (train->action == 5 && mTRC_pc_local_may_get_off()) { /* synced: only on this passenger's turn, from the door spot ("the next one off") */
+#else
     if (train->action == 5) {
+#endif
         aROD_setupAction(actor, game, 3);
     }
 }
@@ -147,12 +168,18 @@ static void aROD_ride_off_player_init(ACTOR* actor, GAME* game) {
 
     train->arg0 = FALSE;
     mPlib_request_main_demo_getoff_train_type1(game);
+#ifdef TARGET_PC
+    pc_arrtrain_local_progress(PCAT_OP_STEPPED_OFF); /* synced arrival train: the next passenger moves up to the door */
+#endif
     ride_off->_188 = 0;
     mCoBG_SetAttribute(enter_pos, mCoBG_ATTRIBUTE_STONE);
 }
 
 static void aROD_walk_one_unit_init(ACTOR* actor, GAME* game) {
     mPlib_request_main_demo_walk_type1(game, 2220.0f, 840.0f, 2.5f, 0);
+#ifdef TARGET_PC
+    pc_arrtrain_local_progress(PCAT_OP_WELCOMED); /* synced arrival train: Porter's welcome is over, the next passenger may step off */
+#endif
 }
 
 static void aROD_init_proc(ACTOR* actor, GAME* game, int idx) {

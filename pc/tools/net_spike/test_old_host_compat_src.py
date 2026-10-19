@@ -139,6 +139,7 @@ else:
                "CHAT_SEND": 100, "CHAT_MSG": 101,  # text chat (worker CH)
                "OUTDOOR_FURN2": 102,  # outdoor furniture C2: host -> client only (an old client ignores it, O8 / O9)  # text chat (worker CH): C -> H (gated by CAPS, see K100) / H -> C (an old client's silent ignore, O8)
                "HANDOVER": 103,  # hand-over animations: see below
+               "ARRIVAL_TRAIN": 105,  # synced arrival train: C -> H only after the host's STATE (an old host never sends one, so never sees it) / H -> C (an old client ignores it, O8)
                "ROOMMATE": 104}  # roommates: C -> H only after the 102 CAPS bit C4 (an old host never sees it) / H -> C (an old client ignores it, O8); hand-over animations: C -> H (villager) / H -> C (shop keeper relay): an old host / client ignores it (O1 / O8)
     enum_re = r"^\s*PC_NETGAME_MSG_(\w+)\s*=\s*(\d+)\s*,"
     old_ids = {k: int(v) for k, v in re.findall(enum_re, old, re.M)}

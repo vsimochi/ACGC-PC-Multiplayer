@@ -13,6 +13,9 @@
 #ifdef TARGET_PC
 #include "pc_nook_house.h" /* the generated Porter message that replaces the vanilla "go back to your village" offer */
 #endif
+#ifdef TARGET_PC
+#include "pc_arrival_train.h" /* synced arrival train: Porter at the train door on every process (aSTM_pc_arrival_presence) */
+#endif
 
 enum {
     aSTM_THINK_GET_OFF_WAIT,

@@ -209,6 +209,7 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: kind 22, message 98, service 10 (pure logic) */
 #include "pc_ops.h"               /* the host's operator list (ops.ini) */
 #include "pc_roommates.h"         /* roommates / move-in: message 104, roommates.ini (pure) */
+#include "pc_arrival_train.h"     /* synced arrival train: message 105, the host's arrival timeline (pure) */
 #include "pc_chat.h"              /* text chat (worker CH): messages 100 / 101, the "CHAT" block at the end of this file */
 #include "pc_settings.h"   /* Guests G4: g_pc_settings.max_guests / g_pc_max_guests_override (host-side guest cap) */
 #include "m_personal_id.h"
@@ -624,7 +625,18 @@ typedef enum PCNetGameMsgType {
                                              * QUERY / REQUEST / CANCEL / ACCEPT / DENY / REMOVE / LEAVE at a placed gyroid (sent only after the 102 CAPS bit
                                              * PC_OFURN_C4_ROOMMATES); host -> client INFO / RESULT / STATUS / NOTICE. A malformed one is dropped (never a violation).
                                              * An old peer ignores the id. See the ROOMMATES block (pc_net_game_roommates.c_inc). */
+    PC_NETGAME_MSG_ARRIVAL_TRAIN        = 105, /* synced arrival train (v8 extended in place, NO version bump), RELIABLE, 48 bytes (PCArrTrainMsg, pc_arrival_train.h): host -> every
+                                             * READY client STATE (the arrival timeline: trains, seats, ages; at READY, on change, every 3 s while a train exists); client -> host
+                                             * REQUEST / STEPPED_OFF / WELCOMED / ABORT (sent only after the host's STATE arrived). PRESENTATION ONLY. An old peer ignores the
+                                             * id. Kill switch AC_MP_TRAIN_SYNC=0. See the SYNCED ARRIVAL TRAIN block (pc_net_game_arrtrain.c_inc). */
 } PCNetGameMsgType;
+_Static_assert((int)PC_NETGAME_MSG_ARRIVAL_TRAIN == (int)PCAT_MSG_ID, "ARRIVAL_TRAIN id drifted (pc_arrival_train.h)");
+/* SYNCED ARRIVAL TRAIN (pc_net_game_arrtrain.c_inc, included at the end of this file) */
+static void pcnetgame_arrtrain_host_on_ready(PCNetPeerId peer);
+static void pcnetgame_arrtrain_host_tick(void);
+static void pcnetgame_arrtrain_client_reset(void);
+static void pcnetgame_handle_host_arrtrain(PCNetPeerId peer, const uint8_t* data, uint16_t size);
+static void pcnetgame_handle_client_arrtrain(const uint8_t* data, uint16_t size);
 _Static_assert((int)PC_NETGAME_MSG_OUTDOOR_FURN == (int)PC_OFURN_MSG_ID, "OUTDOOR_FURN id drifted (pc_outdoor_furniture.h)");
 /* ROOMMATES (pc_net_game_roommates.c_inc, included at the end of this file) */
 static void     pcnetgame_room_host_tick(void);
@@ -22146,6 +22158,7 @@ static void pcnetgame_host_ts_tick(void) {
     pcnetgame_evc_host_tick(); /* worker E: shared event NPCs (TEST-ONLY seed; the Wisp flag of service 9) */
     pcnetgame_ofurn_host_tick(); /* outdoor furniture C1: the marker GC, the per-peer list / rights (message 98) */
     pcnetgame_room_host_tick();  /* roommates: relations, per-peer STATUS / notices (message 104), housekeeping */
+    pcnetgame_arrtrain_host_tick(); /* synced arrival train: timeouts, the depart decision, the STATE broadcast (message 105) */
     pcnetgame_chat_host_tick();  /* text chat (worker CH): the CAPS announcement per READY peer (message 101), the TEST-ONLY send hook */
     pcnetgame_npc_lease_host_tick();
     pcnetgame_page_host_tick();
@@ -35073,6 +35086,7 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
 
     /* v2: bootstrap the client's world (initial connect, late join and reconnect all land here). */
     pcnetgame_host_ts_push_hostcfg(peer); /* batch A (A1): the wildlife mode is announced BEFORE any snapshot message */
+    pcnetgame_arrtrain_host_on_ready(peer); /* synced arrival train: the timeline (and the capability) BEFORE the snapshot the guest's arrival waits for */
     pcnetgame_host_start_snapshot(peer, "joined");
     pcnetgame_host_rec_on_ready(peer); /* D3: AWAIT_HELLO */
 }
@@ -35828,6 +35842,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_ROOMMATE) { /* ROOMMATES: a request at a placed gyroid (validated, rate limited; never a violation) */
         pcnetgame_handle_host_roommate(peer, data, size);
+        return;
+    }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_ARRIVAL_TRAIN) { /* SYNCED ARRIVAL TRAIN: a passenger's seat request / progress (validated; never a violation) */
+        pcnetgame_handle_host_arrtrain(peer, data, size);
         return;
     }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) { /* HAND-OVER ANIMATIONS: presentation only (villager: the host's held actor; shop: relayed within the sender's scene) */
@@ -36601,6 +36619,10 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
         pcnetgame_handle_client_roommate(data, size); /* ROOMMATES: the host's answer / STATUS / NOTICE */
         return;
     }
+    if (size == sizeof(PCArrTrainMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ARRIVAL_TRAIN) {
+        pcnetgame_handle_client_arrtrain(data, size); /* SYNCED ARRIVAL TRAIN: the host's arrival timeline */
+        return;
+    }
     if (size == sizeof(PCHandoverMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) {
         PCHandoverMsg ho;
         memcpy(&ho, data, sizeof(ho));
@@ -37090,6 +37112,7 @@ static void pcnetgame_reset_client_session_state(void) {
     s_client_identity_defer_logged = 0;
     memset(&s_client_claimed_town, 0, sizeof(s_client_claimed_town));
     s_client_assigned_peer_id = 0;
+    pcnetgame_arrtrain_client_reset(); /* synced arrival train: the capability and the timeline are per session */
 
     memset(&s_pickup_pending, 0, sizeof(s_pickup_pending));
     s_next_pickup_request_id = 1;
@@ -53872,4 +53895,5 @@ void pc_net_game_dedicated_chat(const char* cmd, const char* args, void (*out)(c
 }
 /* ===== CHAT END ===== */
 
+#include "pc_net_game_arrtrain.c_inc" /* SYNCED ARRIVAL TRAIN (message 105): the host's arrival timeline, the client's copy, the game-facing API */
 #include "pc_net_game_roommates.c_inc" /* ROOMMATES / MOVE-IN (message 104): the host relations, the client seam, the console */

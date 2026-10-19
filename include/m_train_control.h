@@ -47,6 +47,10 @@ extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town
  * (pc_remote_arrival_logic.h), train_x for RIDING. Idempotent per arrival; sets the extra x offset of the joiner's passenger spot (mTRC_pc_passenger_dx). */
 extern void mTRC_pc_join_arrival(int join_class, float train_x);
 extern float mTRC_pc_passenger_dx(void);
+/* Synced arrival train (pc_arrival_train.h): 1 = the local passenger may step off now (always 1 when the local train is not the synced one) */
+extern int mTRC_pc_local_may_get_off(void);
+/* 1 = the local train is the host's synced timeline train */
+extern int mTRC_pc_synced_driving(void);
 #endif
 
 #ifdef __cplusplus
