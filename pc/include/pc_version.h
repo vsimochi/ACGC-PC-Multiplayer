@@ -14,7 +14,7 @@
 #define PC_VERSION_MAJOR 0
 #define PC_VERSION_MINOR 4
 #define PC_VERSION_PATCH 1
-#define PC_VERSION_DEV   1
+#define PC_VERSION_DEV   0
 
 #define PC_VERSION_STR_(x) #x
 #define PC_VERSION_XSTR(x) PC_VERSION_STR_(x)

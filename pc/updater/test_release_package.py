@@ -160,9 +160,23 @@ def main():
         alltext = {n: z.read(n).decode("utf-8", "replace") for z in (zu, zf) for n in z.namelist() if n.lower().endswith((".txt", ".md"))}
         draft = sorted(n for n, t in alltext.items() if re.search(r"DRAFT|not published|TODO:|FIXME|lorem ipsum", t))
         check("P2p no packaged text contains draft wording (DRAFT, 'not published', TODO / FIXME; the lower-case word is legitimate in the GitHub-draft sense): %s" % draft, not draft)
-        check("P2q RELEASE_NOTES.txt (identical in both zips) documents the console, the startup update check, same-PC hosting and the one-time manual step for 0.1.0 installations, and says nothing updates the launcher / starter",
-              zf.read("RELEASE_NOTES.txt") == zu.read("RELEASE_NOTES.txt") and all(x in notes for x in ("Dedicated server console", "startup update check", "Host and play on the same PC", "One-time step for existing 0.1.0 installations", "ACLauncher.exe", "Start Server.bat", "server_starter.ps1",
-              "Nothing updates the launcher or the server starter", "Never copy `server_config.ini`")) and ("Beta " + ver) in notes.splitlines()[0])
+        # P2q: the release notes are the short player-facing docs/release-notes-<ver>.md (the launcher / starter / one-time-step details are checked by P2r on
+        # UPDATING.txt / INSTALL.txt / SERVER_SETUP.txt): both zips carry the SAME bytes, equal to the source file, naming Beta <ver>, the unofficial-project note,
+        # and non-empty Install / Update / Changelog sections.
+        src_notes = os.path.join(HERE, "..", "..", "docs", "release-notes-%s.md" % ver)
+        src_bytes = open(src_notes, "rb").read() if os.path.exists(src_notes) else None
+        sections = {}
+        cur = None
+        for line in notes.splitlines():
+            if line.startswith("## "):
+                cur = line[3:].strip().lower()
+                sections[cur] = []
+            elif cur is not None and line.strip():
+                sections[cur].append(line)
+        check("P2q RELEASE_NOTES.txt (identical in both zips) = docs/release-notes-%s.md byte for byte, first line names Beta %s, says 'unofficial fan project', and has non-empty Install / Update / Changelog sections (changelog: bullet list)" % (ver, ver),
+              zf.read("RELEASE_NOTES.txt") == zu.read("RELEASE_NOTES.txt") and src_bytes is not None and src_bytes == zu.read("RELEASE_NOTES.txt") and notes.strip() != ""
+              and ("Beta " + ver) in notes.splitlines()[0] and "unofficial fan project" in notes.lower()
+              and all(sections.get(s) for s in ("install", "update", "changelog")) and any(l.lstrip().startswith("- ") for l in sections.get("changelog", [])))
         upd, inst2, setup = zu.read("UPDATING.txt").decode(), zf.read("INSTALL.txt").decode(), zf.read("SERVER_SETUP.txt").decode()
         check("P2r UPDATING.txt / INSTALL.txt / SERVER_SETUP.txt: the updater does not update ACLauncher.exe, Start Server.bat or server_starter.ps1; the one-time copy step names the four files and never server_config.ini",
               "NOT UPDATED BY THE UPDATER" in upd and "ONE-TIME STEP" in upd and "Nothing updates the launcher or the starter on its own" in upd and "NEW INSTALL OR UPGRADE" in inst2 and "do NOT update ACLauncher.exe itself" in inst2
